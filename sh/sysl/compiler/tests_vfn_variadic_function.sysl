@@ -1,0 +1,660 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A **sysl** function that takes a `...`, and the forms its body reads the tail with
+// (`reference/ffi.md § Variadic functions`): `va_list`, `va_start`, `va_arg` and `va_end`, which are
+// C's, with the one difference that `va_arg` takes the type it reads from the context (or from a
+// type argument written on it) rather than as a second argument.
+//
+// These are ABI primitives, so the tests that matter are the ones that really run: whether a value
+// comes back out at the width it went in at is not something the IR can be read for.
+//
+// **Every string quoted here was read out of the reference compiler (0.0.155)**, whose
+// `VariadicFunctionTests` these are; the IR lines are its `emit-llvm`.
+
+private var vfn_library_cache: Buf[Program] = buf()
+private var vfn_library_read: bool = false
+
+private vfn_library() -> Buf[Program]
+    if vfn_library_read then return vfn_library_cache
+
+    vfn_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> vfn_library_cache = units
+
+    vfn_library_cache
+end vfn_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private vfn_ready() -> bool
+    if vfn_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end vfn_ready
+
+private vfn_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program prints, and whether it came back with a success status.
+private vfn_run(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-vfn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end vfn_run
+
+private vfn_ran(text: string) -> string = vfn_run(text).0
+
+// Everything a source has to say for itself, taken through the lowering.
+private vfn_err(text: string) -> string
+    val root = make_temp_dir("sysl-vfn").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vfn_err
+
+// The LLVM text of a program that must compile.
+private vfn_ir(text: string) -> string
+    val root = make_temp_dir("sysl-vfn").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vfn_ir
+
+// A function that sums `n` `int`s out of its tail -- the smallest complete variadic body.
+private vfn_sum() -> string = "sum(n: int, ...) -> int\n" +
+                              "    var ap: va_list\n" +
+                              "    va_start(ap)\n" +
+                              "    var total = 0\n" +
+                              "    for i in 0..<n\n" +
+                              "        var v: int = va_arg(ap)\n" +
+                              "        total += v\n" +
+                              "    va_end(ap)\n" +
+                              "    total\n" +
+                              "end sum\n"
+
+// ---- the declaration -----------------------------------------------------------------------------
+
+@test("carries the ellipsis into the definition")
+vfn_carries_the_ellipsis()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_ir(vfn_sum() + "print(sum(1, 5))\n"), "define i32 @sum(i32 %n.param, ...)"))
+
+@test("a call names the callee's whole function type, as for any variadic")
+vfn_a_call_names_the_whole_type()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_ir(vfn_sum() + "print(sum(2, 5, 6))\n"), "call i32 (i32, ...) @sum(i32 2, i32 5, i32 6)"))
+
+@test("the tail walk lowers to LLVM's own two intrinsics and its one instruction")
+vfn_the_walk_lowers_to_the_intrinsics()
+    if !vfn_ready() then return
+
+    val out = vfn_ir(vfn_sum() + "print(sum(1, 5))\n")
+
+    assert(vfn_says(out, "declare void @llvm.va_start.p0(ptr)"))
+    assert(vfn_says(out, "declare void @llvm.va_end.p0(ptr)"))
+    assert(vfn_says(out, " = va_arg ptr %ap.addr, i32\n"))
+end vfn_the_walk_lowers_to_the_intrinsics
+
+// A program with no variadic body of its own must not carry the declarations for one.
+@test("a program that walks no tail declares neither intrinsic")
+vfn_no_walk_declares_neither()
+    if !vfn_ready() then return
+
+    val out = vfn_ir("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p))\n")
+
+    assert(!vfn_says(out, "did not compile"))
+    assert(!vfn_says(out, "@llvm.va_start"))
+    assert(!vfn_says(out, "@llvm.va_end"))
+end vfn_no_walk_declares_neither
+
+@test("a non-variadic function is unchanged")
+vfn_a_non_variadic_function_is_unchanged()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_ir("f(n: int) -> int = n + 1\nprint(f(1))\n"), "define i32 @f(i32 %n.param)"))
+
+// ---- reading the tail ----------------------------------------------------------------------------
+
+@test("reaches every argument, in order")
+vfn_reaches_every_argument()
+    if !vfn_ready() then return
+
+    assert_eq(vfn_ran(vfn_sum() + "print(sum(3, 10, 20, 30))\n"), "60\n")
+
+@test("works for one argument and for many")
+vfn_one_and_many()
+    if !vfn_ready() then return
+
+    assert_eq(vfn_ran(vfn_sum() + "print(sum(1, 7), sum(5, 1, 2, 3, 4, 5))\n"), "7 15\n")
+
+// A variadic call with an empty tail is legal, and a body that reads none of it must not walk off
+// the end of anything.
+@test("an empty tail is not read at all")
+vfn_an_empty_tail()
+    if !vfn_ready() then return
+
+    assert_eq(vfn_ran(vfn_sum() + "print(sum(0))\n"), "0\n")
+
+@test("each type comes back at the width it went in at")
+vfn_each_type_at_its_width()
+    if !vfn_ready() then return
+
+    val src = "show(n: int, ...)\n" +
+              "    var ap: va_list\n" +
+              "    va_start(ap)\n" +
+              "    var i: int  = va_arg(ap)\n" +
+              "    var d: real = va_arg(ap)\n" +
+              "    var c: char = va_arg(ap)\n" +
+              "    var l: long = va_arg(ap)\n" +
+              "    va_end(ap)\n" +
+              "    print(i, d, c, l)\n" +
+              "end show\n" +
+              "show(4, 42, 2.5, 'A', 9000000000i64)\n"
+
+    assert_eq(vfn_ran(src), "42 2.5 A 9000000000\n")
+end vfn_each_type_at_its_width
+
+// A compound assignment's own place and a parameter the value is heading for both say which type is
+// being read, so the extra statement is owed only where the surrounding expression says nothing.
+@test("the type may come from a compound assignment's place, or from a parameter")
+vfn_type_from_compound_place_or_parameter()
+    if !vfn_ready() then return
+
+    val src = "take(x: int) -> int = x * 2\n" +
+              "\n" +
+              "sum(n: int, ...) -> int\n" +
+              "    var ap: va_list\n" +
+              "    va_start(ap)\n" +
+              "    var total = 0\n" +
+              "    for i in 0..<n\n" +
+              "        total += va_arg(ap)\n" +
+              "    var extra = take(va_arg(ap))\n" +
+              "    va_end(ap)\n" +
+              "    total + extra\n" +
+              "end sum\n" +
+              "\n" +
+              "print(sum(2, 10, 20, 7))\n"
+
+    assert_eq(vfn_ran(src), "44\n")
+end vfn_type_from_compound_place_or_parameter
+
+// The promotions are the caller's, so a narrow argument arrives widened and the callee reads it at
+// the promoted width.
+@test("a narrow argument is read at the width it was promoted to")
+vfn_a_narrow_argument_is_promoted()
+    if !vfn_ready() then return
+
+    assert_eq(vfn_ran(vfn_sum() + "var a: u8 = 200\nvar b: i8 = -5\nprint(sum(2, a, b))\n"), "195\n")
+
+@test("a raw pointer survives the round trip")
+vfn_a_raw_pointer_survives()
+    if !vfn_ready() then return
+
+    val src = "deref(n: int, ...) -> int\n" +
+              "    var ap: va_list\n" +
+              "    va_start(ap)\n" +
+              "    var p: *int = va_arg(ap)\n" +
+              "    va_end(ap)\n" +
+              "    *p\n" +
+              "end deref\n" +
+              "var x = 41\n" +
+              "print(deref(1, &x) + 1)\n"
+
+    assert_eq(vfn_ran(src), "42\n")
+end vfn_a_raw_pointer_survives
+
+// What a caller may write into a tail, the callee may name: a C library's callback setter is the
+// case it exists for.
+@test("a function address survives the round trip, and is callable at the other end")
+vfn_a_function_address_survives()
+    if !vfn_ready() then return
+
+    val src = "doubler(n: int) -> int = n * 2\n" +
+              "apply(x: int, ...) -> int\n" +
+              "    var ap: va_list\n" +
+              "    va_start(ap)\n" +
+              "    var f: *extern(int) -> int = va_arg(ap)\n" +
+              "    va_end(ap)\n" +
+              "    f(x)\n" +
+              "end apply\n" +
+              "print(apply(21, &doubler))\n"
+
+    assert_eq(vfn_ran(src), "42\n")
+end vfn_a_function_address_survives
+
+@test("and reads back as an address, which is the same value")
+vfn_reads_back_as_an_address()
+    if !vfn_ready() then return
+
+    val src = "doubler(n: int) -> int = n * 2\n" +
+              "address(n: int, ...) -> usize\n" +
+              "    var ap: va_list\n" +
+              "    va_start(ap)\n" +
+              "    var a: usize = va_arg(ap)\n" +
+              "    va_end(ap)\n" +
+              "    a\n" +
+              "end address\n" +
+              "print(address(1, &doubler) == usize(&doubler))\n"
+
+    assert_eq(vfn_ran(src), "true\n")
+end vfn_reads_back_as_an_address
+
+@test("a variadic function calls and is called like any other")
+vfn_calls_and_is_called()
+    if !vfn_ready() then return
+
+    assert_eq(vfn_ran(vfn_sum() + "twice(n: int) -> int = sum(2, n, n)\nprint(twice(21))\n"), "42\n")
+
+@test("reading the tail twice over needs a fresh walk each time")
+vfn_reading_twice_needs_a_fresh_walk()
+    if !vfn_ready() then return
+
+    val src = "total(n: int, ...) -> int\n" +
+              "    var acc = 0\n" +
+              "    var pass = 0\n" +
+              "    while pass < 2\n" +
+              "        var ap: va_list\n" +
+              "        va_start(ap)\n" +
+              "        for i in 0..<n\n" +
+              "            var v: int = va_arg(ap)\n" +
+              "            acc += v\n" +
+              "        va_end(ap)\n" +
+              "        pass += 1\n" +
+              "    acc\n" +
+              "end total\n" +
+              "print(total(3, 1, 2, 3))\n"
+
+    assert_eq(vfn_ran(src), "12\n")
+end vfn_reading_twice_needs_a_fresh_walk
+
+@test("a variadic call in a loop neither leaks nor drifts")
+vfn_a_call_in_a_loop()
+    if !vfn_ready() then return
+
+    // 2·(1+2+3+4).
+    assert_eq(vfn_ran(vfn_sum() + "var acc = 0\nfor i in 1..4\n    acc += sum(2, i, i)\nprint(acc)\n"), "20\n")
+
+// ---- shapes a variadic function may take ---------------------------------------------------------
+
+@test("several named parameters may precede the tail")
+vfn_several_named_parameters()
+    if !vfn_ready() then return
+
+    val src = "between(lo: int, hi: int, n: int, ...) -> int\n" +
+              "    var ap: va_list\n" +
+              "    va_start(ap)\n" +
+              "    var found = 0\n" +
+              "    for i in 0..<n\n" +
+              "        var v: int = va_arg(ap)\n" +
+              "        if lo <= v && v <= hi then found += 1\n" +
+              "    va_end(ap)\n" +
+              "    found\n" +
+              "end between\n" +
+              "print(between(10, 20, 5, 5, 10, 15, 20, 25))\n"
+
+    assert_eq(vfn_ran(src), "3\n")
+end vfn_several_named_parameters
+
+// Nothing obliges a body to read the whole tail, and C's does not either.
+@test("a body may read fewer arguments than were passed")
+vfn_read_fewer_than_passed()
+    if !vfn_ready() then return
+
+    val src = "head(n: int, ...) -> int\n" +
+              "    var ap: va_list\n" +
+              "    va_start(ap)\n" +
+              "    var v: int = va_arg(ap)\n" +
+              "    va_end(ap)\n" +
+              "    v\n" +
+              "end head\n" +
+              "print(head(3, 7, 8, 9))\n"
+
+    assert_eq(vfn_ran(src), "7\n")
+end vfn_read_fewer_than_passed
+
+// Each instantiation is its own definition, so each gets its own ellipsis.
+@test("a generic function may be variadic")
+vfn_a_generic_function_may_be_variadic()
+    if !vfn_ready() then return
+
+    val src = "first[T](tag: T, n: int, ...) -> int\n" +
+              "    var ap: va_list\n" +
+              "    va_start(ap)\n" +
+              "    var v: int = va_arg(ap)\n" +
+              "    va_end(ap)\n" +
+              "    v + n\n" +
+              "end first\n" +
+              "print(first(\"tag\", 1, 41), first(2.5, 2, 40))\n"
+    val out = vfn_ir(src)
+
+    assert(vfn_says(out, "define i32 @first.string({ ptr, ptr, i64 } %tag.param, i32 %n.param, ...) {"))
+    assert(vfn_says(out, "define i32 @first.real(double %tag.param, i32 %n.param, ...) {"))
+
+    // Exactly two instantiations are defined, and each line above carries its own ellipsis.
+    var defines = 0
+    var rest = out
+
+    loop
+        rest.index_of("\ndefine i32 @first.") match
+            None -> break
+            Some(at) ->
+                defines += 1
+                rest = rest[at + 1..<rest.len]
+
+    assert_eq(defines, 2)
+    assert_eq(vfn_ran(src), "42 42\n")
+end vfn_a_generic_function_may_be_variadic
+
+// A nested function states its own signature, so a `...` on one is its own tail -- the environment
+// holds the first parameter slot, and the tail anchors after what the program wrote.
+@test("a nested function may be variadic, and still reach what it captured")
+vfn_a_nested_function_may_be_variadic()
+    if !vfn_ready() then return
+
+    val src = "outer(base: int) -> int\n" +
+              "    inner(n: int, ...) -> int\n" +
+              "        var ap: va_list\n" +
+              "        va_start(ap)\n" +
+              "        var t = 0\n" +
+              "        for i in 0..<n\n" +
+              "            var v: int = va_arg(ap)\n" +
+              "            t += v\n" +
+              "        va_end(ap)\n" +
+              "        t + base\n" +
+              "    end inner\n" +
+              "    inner(2, 1, 2) + inner(0)\n" +
+              "end outer\n" +
+              "print(outer(10))\n"
+
+    assert_eq(vfn_ran(src), "23\n")
+end vfn_a_nested_function_may_be_variadic
+
+@test("and it needs something named before the ellipsis like any other")
+vfn_a_nested_one_needs_a_named_parameter()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err("outer() -> int\n    inner(...) -> int = 1\n    inner(1)\nend outer\nprint(outer())\n"),
+                    "'inner' needs at least one named parameter before '...'"))
+
+@test("a variadic function may recurse")
+vfn_may_recurse()
+    if !vfn_ready() then return
+
+    val src = "countdown(n: int, ...) -> int\n" +
+              "    if n <= 0 then 0 else n + countdown(n - 1, n)\n" +
+              "end countdown\n" +
+              "print(countdown(4, 0))\n"
+
+    assert_eq(vfn_ran(src), "10\n")
+end vfn_may_recurse
+
+@test("a variadic function may declare that it does not return")
+vfn_may_declare_never()
+    if !vfn_ready() then return
+
+    val src = "stop(code: int, ...) -> never\n" +
+              "    print(\"stopping\")\n" +
+              "    exit(code)\n" +
+              "end stop\n" +
+              "stop(3, 1, 2)\n" +
+              "print(\"unreachable\")\n"
+    val out = vfn_ir(src)
+
+    assert(vfn_says(out, "define void @stop(i32 %code.param, ...)"))
+    assert(vfn_says(out, "call void (i32, ...) @stop("))
+    assert(vfn_says(out, "  unreachable\n"))
+
+    val ran = vfn_run(src)
+
+    assert(!ran.1)
+    assert(vfn_says(ran.0, "stopping"))
+    assert(!vfn_says(ran.0, "unreachable"))
+end vfn_may_declare_never
+
+// ---- the calling side is the extern's rule -------------------------------------------------------
+
+@test("the declared parameters are still checked")
+vfn_declared_parameters_are_checked()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err(vfn_sum() + "print(sum(\"three\", 1))\n"), "'n' of 'sum' is int, but string was given"))
+
+@test("the declared parameters are still required")
+vfn_declared_parameters_are_required()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err(vfn_sum() + "print(sum())\n"),
+                    "takes at least 1 argument, but 0 arguments were given"))
+
+// A method's tail is the same floor: the named parameters before it are still owed.
+@test("a variadic method's declared parameters are still required")
+vfn_a_variadic_method_still_requires_its_parameters()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err("struct S\n    x: int\n    f(self, n: int, ...) -> int = n\nprint(S(1).f())\n"),
+                    "takes at least 1 argument, but 0 arguments were given"))
+
+// A sysl callee's tail refuses an aggregate for a reason of its own: it is the callee's own walk that
+// would have to read the value back.
+@test("the tail carries only what a walk over it can read back")
+vfn_the_tail_carries_only_registers()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err(vfn_sum() + "print(sum(1, \"one\"))\n"),
+                    "a string cannot be passed to a sysl function's '...' — a walk over the tail reads " +
+                    "back one register at a time and an aggregate is not one, where a foreign callee " +
+                    "takes it because C says which registers it arrives in"))
+
+@test("an ellipsis needs a named parameter before it")
+vfn_an_ellipsis_needs_a_named_parameter()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err("f(...) -> int = 1\nprint(f(1))\n"), "'f' needs at least one named parameter before '...'"))
+
+// ---- the forms refuse what they cannot mean ------------------------------------------------------
+
+@test("va_start needs a function that has a tail")
+vfn_va_start_needs_a_tail()
+    if !vfn_ready() then return
+
+    val src = "f(n: int) -> int\n    var ap: va_list\n    va_start(ap)\n    n\nend f\nprint(f(1))\n"
+
+    assert(vfn_says(vfn_err(src), "'va_start' is only allowed in a function declared with '...' — there is no tail here"))
+
+@test("each form needs a va_list")
+vfn_each_form_needs_a_va_list()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err(vfn_sum() + "var x = 1\nva_end(x)\n"), "'va_end' needs a va_list, not int"))
+
+@test("each form needs exactly one")
+vfn_each_form_needs_exactly_one()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err("f(n: int, ...)\n    var ap: va_list\n    va_start(ap, n)\nf(1)\n"),
+                    "'va_start' takes exactly one argument, the va_list it walks"))
+
+// A place, because the walk advances the list rather than reading a copy of it.
+@test("each form needs something with an address")
+vfn_each_form_needs_an_address()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err("f(n: int, ...)\n    va_start(1)\nf(1)\n"), "'va_start' needs a va_list, not int"))
+
+// The spelling a reader tries first is the spelling, and it reads the type it is given rather than
+// the one the context supplies.
+@test("va_arg reads a type argument written on it")
+vfn_va_arg_reads_a_type_argument()
+    if !vfn_ready() then return
+
+    val src = "f(n: int, ...) -> int\n" +
+              "    var ap: va_list\n" +
+              "    va_start(ap)\n" +
+              "    var t = 0\n" +
+              "    for i in 0..<n\n" +
+              "        t += va_arg[int](ap)\n" +
+              "    va_end(ap)\n" +
+              "    t\n" +
+              "end f\n" +
+              "print(f(1, 2))\n"
+
+    assert_eq(vfn_ran(src), "2\n")
+end vfn_va_arg_reads_a_type_argument
+
+@test("and neither does any other form the compiler resolves by name")
+vfn_no_other_form_takes_type_arguments()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err("print[int](5)\n"), "'print' takes no type arguments"))
+    assert(vfn_says(vfn_err("f(n: int, ...)\n    var ap: va_list\n    va_start[int](ap)\nf(1)\n"),
+                    "'va_start' takes no type arguments"))
+end vfn_no_other_form_takes_type_arguments
+
+// A local of that name is an ordinary indexed value.
+@test("while a local of the same name is indexed as any other value is")
+vfn_a_local_named_va_arg()
+    if !vfn_ready() then return
+
+    assert_eq(vfn_ran("var va_arg = [10, 20, 30]\nprint(va_arg[1])\n"), "20\n")
+
+@test("va_arg needs to know what it is reading")
+vfn_va_arg_needs_a_type()
+    if !vfn_ready() then return
+
+    val src = "f(n: int, ...)\n    var ap: va_list\n    va_start(ap)\n    print(va_arg(ap))\nend f\nf(1, 2)\n"
+
+    assert(vfn_says(vfn_err(src),
+                    "'va_arg' reads the next argument as some type, and nothing here says which — " +
+                    "annotate the variable it is read into"))
+end vfn_va_arg_needs_a_type
+
+// C's commonest varargs mistake: asking for the type as written rather than as promoted.
+@test("va_arg refuses a type narrower than the promotions produce")
+vfn_va_arg_refuses_a_narrow_type()
+    if !vfn_ready() then return
+
+    val head = "f(n: int, ...)\n    var ap: va_list\n    va_start(ap)\n    var v: "
+    val tail = " = va_arg(ap)\n    print(v)\nend f\nf(1, 2)\n"
+
+    assert(vfn_says(vfn_err(head + "u8" + tail),
+                    "a variadic argument is promoted to at least 32 bits, so it cannot be read as byte — " +
+                    "read it as 'uint' and convert"))
+    assert(vfn_says(vfn_err(head + "f32" + tail),
+                    "a variadic argument is promoted to double, so it cannot be read as f32 — " +
+                    "read it as 'real' and convert"))
+end vfn_va_arg_refuses_a_narrow_type
+
+@test("va_arg refuses a type varargs never carried")
+vfn_va_arg_refuses_a_string()
+    if !vfn_ready() then return
+
+    val src = "f(n: int, ...)\n    var ap: va_list\n    va_start(ap)\n    var v: string = va_arg(ap)\n" +
+              "    print(v)\nend f\nf(1, 2)\n"
+
+    assert(vfn_says(vfn_err(src),
+                    "a variadic argument cannot be read as string — it may be an integer, a real, a char, " +
+                    "a raw pointer, or the address of a function"))
+end vfn_va_arg_refuses_a_string
+
+// ---- where a va_list may and may not stand -------------------------------------------------------
+
+@test("a bare va_list parameter names the spelling that works")
+vfn_a_bare_va_list_parameter()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err("f(ap: va_list) -> int = 1\nprint(1)\n"),
+                    "a va_list is a parameter as '*va_list', not as 'va_list' — a parameter is a by-value " +
+                    "binding, and a copy of a walk advances nothing 'f''s caller can see, so the walk is " +
+                    "handed over by address and the call writes '&ap'"))
+end vfn_a_bare_va_list_parameter
+
+@test("a va_list cannot be returned")
+vfn_a_va_list_cannot_be_returned()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err("f(n: int, ...) -> va_list\n    var ap: va_list\n    ap\nend f\nprint(1)\n"),
+                    "a va_list cannot be returned from 'f' — the type names the storage a walk lives in, " +
+                    "and there is no value of it to hand back"))
+end vfn_a_va_list_cannot_be_returned
+
+// An `extern` transcribes a C header, so C's own spelling is what it is written in.
+@test("an extern is written in C's spellings, and takes either")
+vfn_an_extern_takes_either()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_ir("extern vprintf(fmt: *u8, ap: va_list) -> i32\nvar p: *u8 = null\nprint(vprintf(p, null))\n"),
+                    "declare i32 @vprintf(ptr, ptr)"))
+    assert(vfn_says(vfn_ir("extern vsomething(ap: *va_list) -> i32\nprint(vsomething(null))\n"),
+                    "declare i32 @vsomething(ptr)"))
+end vfn_an_extern_takes_either
+
+@test("an extern may hand back the address of one, but not one")
+vfn_an_extern_hands_back_an_address()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_ir("extern current() -> *va_list\nprint(current() == null)\n"), "declare ptr @current()"))
+    assert(vfn_says(vfn_err("extern current() -> va_list\nprint(1)\n"),
+                    "a va_list cannot be returned from 'current' — the type names the storage a walk " +
+                    "lives in, and there is no value of it to hand back"))
+end vfn_an_extern_hands_back_an_address
+
+@test("and it is not something to print")
+vfn_not_something_to_print()
+    if !vfn_ready() then return
+
+    assert(vfn_says(vfn_err("f(n: int, ...)\n    var ap: va_list\n    print(ap)\nf(1)\n"),
+                    "cannot print a va_list value — it does not implement 'sysl.Display'"))
