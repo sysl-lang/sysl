@@ -1,0 +1,573 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{split, Search}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// What the raw-pointer mode does as a program runs (`reference/memory.md`): taking an address,
+// reading and writing through it, the one level of automatic dereference on a field, the recursive
+// types a pointer field makes possible, a run of values reached through a bare `*T`, and `p - q`
+// counting the elements between two addresses.
+//
+// **Every output, every refusal and every line of LLVM quoted here was read out of the reference
+// compiler (0.0.155)**, whose `PointerRunTests` these are.
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private prn_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return false
+        Ok(_) -> ()
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end prn_ready
+
+// **What a program PRINTS and what it EXITS with**, from a fresh build. A program that did not build
+// answers `-1` and the refusal, so a build failure cannot read as a program that stopped.
+private prn_ran(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-pointer-run").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> out.status match
+            Exited(code) -> (out.text, code)
+            _ -> (out.text, -2)
+end prn_ran
+
+private prn_prints(text: string, expected: string)
+    if !prn_ready() then return
+
+    val ran = prn_ran(text)
+
+    assert_eq(ran.0, expected)
+    assert_eq(ran.1, 0)
+
+// Everything a source has to say for itself, taken the whole way through the lowering; the LLVM text
+// where it had nothing to say.
+private prn_lowered(text: string) -> (string, string)
+    val root = make_temp_dir("sysl-pointer-run").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> (failure_text(why), "")
+        Ok(made) -> if made.report.is_empty() then ("", made.text) else (analysis_report(made.report), "")
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end prn_lowered
+
+// A refusal is its whole first line and its position; the `-->` line carries the temporary
+// directory, so the position is read from the end of it. The caret's WIDTH is not asserted: this
+// compiler underlines a node's extent where the reference underlines its anchor.
+private prn_refused(text: string, message: string, at: string)
+    if !prn_ready() then return
+
+    val said = prn_lowered(text).0
+
+    assert(said.starts_with(s"error: $message\n"), said)
+    assert(said.contains(s"main.sysl:$at\n"), said)
+
+private prn_main(text: string) -> string
+    val out = prn_lowered(text)
+
+    assert_eq(out.0, "")
+
+    val texts = func_texts(out.1)
+
+    for i in 0..<texts.len()
+        if texts.at(i).0 == "main" then return texts.at(i).1
+
+    "no definition of 'main'"
+end prn_main
+
+private prn_count(text: string, needle: string) -> int
+    var n = 0
+
+    for line in split(text, "\n")
+        if line.contains(needle) then n += 1
+
+    n
+
+// ---- reading and writing through an address ----
+
+@test("a pointer reads and writes the variable it points at")
+prn_a_pointer_reads_and_writes_the_variable_it_points_at()
+    prn_prints(raw"""
+        var n = 10
+        var p = &n
+        print(*p)
+        *p = 42
+        print(n)
+        """, "10\n42\n")
+
+@test("a pointer follows its target rather than copying it")
+prn_a_pointer_follows_its_target_rather_than_copying_it()
+    prn_prints(raw"""
+        var n = 1
+        var p = &n
+        n = 2
+        print(*p)
+        *p = 3
+        print(n)
+        """, "2\n3\n")
+
+@test("a pointer to a pointer reaches through both levels")
+prn_a_pointer_to_a_pointer_reaches_through_both_levels()
+    prn_prints(raw"""
+        var n = 1
+        var p = &n
+        var pp = &p
+        **pp = 5
+        print(n, **pp)
+        """, "5 5\n")
+
+@test("a function mutates its caller's variable through a pointer")
+prn_a_function_mutates_its_callers_variable_through_a_pointer()
+    prn_prints(raw"""
+        bump(p: *int)
+            *p += 1
+        var n = 41
+        bump(&n)
+        print(n)
+        """, "42\n")
+
+@test("increment and compound assignment work through a dereference")
+prn_increment_and_compound_assignment_work_through_a_dereference()
+    prn_prints(raw"""
+        var n = 10
+        var p = &n
+        *p += 5
+        print(*p)
+        print((*p)++)
+        print(n)
+        """, "15\n15\n16\n")
+
+@test("a field is selected through a pointer without writing the dereference")
+prn_a_field_is_selected_through_a_pointer_without_writing_the_dereference()
+    prn_prints(raw"""
+        struct Point
+            x: int
+            y: int
+        var pt = Point(3, 4)
+        var p = &pt
+        print(p.x, p.y)
+        p.x = 30
+        print(pt.x)
+        """, "3 4\n30\n")
+
+@test("a pointer to a field addresses that field alone")
+prn_a_pointer_to_a_field_addresses_that_field_alone()
+    prn_prints(raw"""
+        struct Point
+            x: int
+            y: int
+        var pt = Point(3, 4)
+        var py = &pt.y
+        *py = 40
+        print(pt.x, pt.y)
+        """, "3 40\n")
+
+@test("a struct may point at its own type")
+prn_a_struct_may_point_at_its_own_type()
+    prn_prints(raw"""
+        struct Node
+            value: int
+            next: *Node
+        var c = Node(3, null)
+        var b = Node(2, &c)
+        var a = Node(1, &b)
+        var walk = &a
+        var sum = 0
+        while walk != null do
+            sum += walk.value
+            walk = walk.next
+        print(sum)
+        """, "6\n")
+
+@test("a write reaches through two links of a list")
+prn_a_write_reaches_through_two_links_of_a_list()
+    prn_prints(raw"""
+        struct Node
+            value: int
+            next: *Node
+        var b = Node(2, null)
+        var a = Node(1, &b)
+        a.next.value = 20
+        print(b.value)
+        """, "20\n")
+
+@test("null compares equal to null and unequal to an address")
+prn_null_compares_equal_to_null_and_unequal_to_an_address()
+    prn_prints(raw"""
+        var n = 1
+        var p = &n
+        var q: *int = null
+        print(p == null, q == null, p != null)
+        """, "false true true\n")
+
+@test("two pointers to the same variable compare equal")
+prn_two_pointers_to_the_same_variable_compare_equal()
+    prn_prints(raw"""
+        var n = 1
+        var m = 1
+        var p = &n
+        var q = &n
+        print(p == q, p == &m)
+        """, "true false\n")
+
+@test("a pointer parameter of a generic function takes its argument's type")
+prn_a_pointer_parameter_of_a_generic_function_takes_its_arguments_type()
+    prn_prints(raw"""
+        peek[T](p: *T) -> T = *p
+        var n = 7
+        var r = 1.5
+        print(peek(&n), peek(&r))
+        """, "7 1.5\n")
+
+@test("booleans compare for equality")
+prn_booleans_compare_for_equality()
+    prn_prints(raw"""
+        var a = true
+        var b = false
+        print(a == a, a == b, a != b)
+        """, "true false true\n")
+
+// ---- a counted reference ----
+
+// The pointer modes are in `Eq` with ADDRESS equality, so two references to objects holding the same
+// thing are not equal: a reference is an identity.
+@test("compares by address rather than by what it holds")
+prn_compares_by_address_rather_than_by_what_it_holds()
+    prn_prints(raw"""
+        struct Cell
+            n: int
+        var a: &Cell = Cell(4)
+        var b: &Cell = Cell(4)
+        var also = a
+        print(a == a, a == b, a == also, a != b)
+        """, "true false true true\n")
+
+@test("carries that identity through a generic 'Eq' bound")
+prn_carries_that_identity_through_a_generic_eq_bound()
+    prn_prints(raw"""
+        struct Cell
+            n: int
+        same[T: Eq](a: T, b: T) -> bool = a == b
+        var a: &Cell = Cell(4)
+        var b: &Cell = Cell(4)
+        print(same(a, a), same(a, b))
+        """, "true false\n")
+
+@test("has equality and no ordering")
+prn_has_equality_and_no_ordering()
+    prn_refused(raw"""
+        struct Cell
+            n: int
+        var a: &Cell = Cell(1)
+        var b: &Cell = Cell(2)
+        print(a < b)
+        """, "'<' is not defined for &Cell", "5:7")
+
+@test("is lent to a raw pointer by taking the address of what it points at")
+prn_is_lent_to_a_raw_pointer_by_taking_the_address_of_what_it_points_at()
+    prn_prints(raw"""
+        struct Cell
+            n: int
+        peek(p: *Cell) -> int = p.n
+        var c: &Cell = Cell(7)
+        print(peek(&*c))
+        """, "7\n")
+
+// The lent pointer is the box's payload, not a copy of it, so a write through it is seen by
+// everything else holding the reference.
+@test("lends a pointer that writes through to the shared value")
+prn_lends_a_pointer_that_writes_through_to_the_shared_value()
+    prn_prints(raw"""
+        struct Cell
+            n: int
+        bump(p: *Cell) = p.n += 1
+        var c: &Cell = Cell(7)
+        var also = c
+        bump(&*c)
+        bump(&*c)
+        print(c.n, also.n)
+        """, "9 9\n")
+
+// The lend takes no count, so the reference is released on its own schedule and the loop neither
+// leaks nor frees twice.
+@test("is not retained by the lending, so the count is unaffected")
+prn_is_not_retained_by_the_lending_so_the_count_is_unaffected()
+    prn_prints(raw"""
+        struct Cell
+            n: int
+        peek(p: *Cell) -> int = p.n
+        var total = 0
+        var i = 0
+        while i < 200000
+            var c: &Cell = Cell(3)
+            total += peek(&*c)
+            i++
+        print(total)
+        """, "600000\n")
+
+@test("is not accepted where a raw pointer is wanted without the lend being written")
+prn_is_not_accepted_where_a_raw_pointer_is_wanted_without_the_lend_being_written()
+    prn_refused(raw"""
+        struct Cell
+            n: int
+        peek(p: *Cell) -> int = p.n
+        var c: &Cell = Cell(7)
+        print(peek(c))
+        """, "'p' of 'peek' is *Cell, but &Cell was given", "5:12")
+
+// ---- a run of values reached through a raw pointer, unchecked ----
+
+@test("the subscript reads what C's reads")
+prn_the_subscript_reads_what_cs_reads()
+    prn_prints(raw"""
+        var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+        var p = &a[0]
+        print(p[0usize], p[2usize], p[3usize])
+        """, "1 3 4\n")
+
+@test("and writes through to the storage it names")
+prn_and_writes_through_to_the_storage_it_names()
+    prn_prints(raw"""
+        var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+        var p = &a[0]
+        p[1usize] = 99u8
+        print(a[1], p[1usize])
+        """, "99 99\n")
+
+// The stride is the pointee's size, so a pointer into a table of structs walks it.
+@test("a pointer to a struct strides by the struct")
+prn_a_pointer_to_a_struct_strides_by_the_struct()
+    prn_prints(raw"""
+        struct C
+            n: int
+            m: int
+        var cs: [3]C = [C(1, 2), C(3, 4), C(5, 6)]
+        var q = &cs[0]
+        q[0usize].n = 77
+        print(q[2usize].n, q[1usize].m, cs[0].n)
+        """, "5 4 77\n")
+
+@test("and a pointer to a pointer indexes twice")
+prn_and_a_pointer_to_a_pointer_indexes_twice()
+    prn_prints(raw"""
+        go()
+            var a: [2]u8 = [1u8, 2u8]
+            var b: [2]u8 = [3u8, 4u8]
+            var t: [2]*u8 = [&a[0], &b[0]]
+            var pp = &t[0]
+            print(pp[1usize][0usize], pp[0usize][1usize])
+        end go
+        go()
+        """, "3 2\n")
+
+// A `val` fixes the address, not what is at it -- C's `T *const p`.
+@test("a 'val' pointer still writes through, since what it fixes is the address")
+prn_a_val_pointer_still_writes_through_since_what_it_fixes_is_the_address()
+    prn_prints(raw"""
+        go()
+            var a: [2]u8 = [1u8, 2u8]
+            val vp = &a[0]
+            vp[0usize] = 9u8
+            print(a[0])
+        end go
+        go()
+        """, "9\n")
+
+@test("a view of a region is taken by writing where it ends")
+prn_a_view_of_a_region_is_taken_by_writing_where_it_ends()
+    prn_prints(raw"""
+        var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+        var p = &a[0]
+        var v = p[1..<3]
+        print(v.len, v[0usize], v[1usize])
+        """, "2 2 3\n")
+
+// A C function's `*u8`, a length it reported separately, and the bytes read back as text.
+@test("which is what makes a buffer a C function filled readable at all")
+prn_which_is_what_makes_a_buffer_a_c_function_filled_readable_at_all()
+    prn_prints(raw"""
+        import sysl.text.from_utf8_unchecked
+        extern "strlen" c_strlen(p: *u8) -> usize
+        extern "getenv" c_getenv(n: *u8) -> *u8
+        var home = c_getenv(c"HOME")
+        var n = c_strlen(home)
+        var bytes = home[0..<n]
+        var s = from_utf8_unchecked(bytes)
+        print(n == bytes.len, s.len == n, home[0usize] == 47u8)
+        """, "true true true\n")
+
+// ---- the check is what the pointer's type decides ----
+
+// Both subscripts are written alike and lower differently: a `*T` gets a bare `getelementptr`, a
+// `*[N]T` keeps the comparison. A checked `p[2]` would emit a second comparison identical to the one
+// `q[2]` emits, so exactly one is the whole assertion.
+@test("a subscript on a '*T' emits no check, and one on a '*[N]T' still does")
+prn_a_subscript_on_a_ptr_emits_no_check_and_one_on_a_ptr_array_still_does()
+    if !prn_ready() then return
+
+    val main = prn_main(raw"""
+        var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+        var p = &a[0]
+        var q = &a
+        print(p[2usize], q[2usize])
+        """)
+
+    assert_eq(prn_count(main, "icmp ult i64 2, 4"), 1)
+
+@test("a pointer to an array views and slices with its length checked")
+prn_a_pointer_to_an_array_views_and_slices_with_its_length_checked()
+    prn_prints(raw"""
+        var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+        var p = &a
+        print(p[..].len, p[1..<3].len, p[..][2])
+        """, "4 2 3\n")
+
+@test("a view of a '*T' must say where it ends")
+prn_a_view_of_a_ptr_must_say_where_it_ends()
+    prn_refused(raw"""
+        var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+        var p = &a[0]
+        print(p[..].len)
+        """, "a *byte carries no length, so a view of one needs its end written — 'p[0..<n]' with the number of elements that are really there", "3:8")
+
+@test("and an open high end is the same complaint")
+prn_and_an_open_high_end_is_the_same_complaint()
+    prn_refused(raw"""
+        var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+        var p = &a[0]
+        print(p[1..].len)
+        """, "a *byte carries no length, so a view of one needs its end written — 'p[0..<n]' with the number of elements that are really there", "3:8")
+
+// A view of a `*T` region has nothing to keep alive, so its owner word is null.
+@test("a view of a region owns nothing, because there is nothing to own")
+prn_a_view_of_a_region_owns_nothing_because_there_is_nothing_to_own()
+    if !prn_ready() then return
+
+    val out = prn_lowered(raw"""
+        view(p: *u8, n: usize) -> []u8 = p[0..<n]
+        var a: [4]u8 = [1u8, 2u8, 3u8, 4u8]
+        print(view(&a[0], 2usize).len)
+        """)
+
+    assert_eq(out.0, "")
+    assert(out.1.contains("insertvalue { ptr, ptr, i64 } zeroinitializer, ptr null, 0"), out.1)
+
+// ---- two pointers subtract, counting the elements between them ----
+
+@test("a byte pointer gives the count, and the other way round gives its negative")
+prn_a_byte_pointer_gives_the_count_and_the_other_way_round_gives_its_negative()
+    prn_prints("var a: [8]u8\nvar p = &a[0]\nvar q = &a[3]\nprint(q - p, p - q)", "3 -3\n")
+
+@test("the same pointer is no distance at all")
+prn_the_same_pointer_is_no_distance_at_all()
+    prn_prints("var a: [8]u8\nvar p = &a[2]\nprint(p - p)", "0\n")
+
+// A stride of 4 and one of 16, where counting bytes would give 12 and 64 instead of 3 and 4.
+@test("a wider pointee strides by its own size")
+prn_a_wider_pointee_strides_by_its_own_size()
+    prn_prints("var a: [8]u32\nprint(&a[3] - &a[0])", "3\n")
+
+@test("and so does a struct, by the size of the struct")
+prn_and_so_does_a_struct_by_the_size_of_the_struct()
+    prn_prints(raw"""
+        struct C
+            n: int
+            m: int
+        var cs: [8]C
+        print(&cs[5] - &cs[1])
+        """, "4\n")
+
+@test("a pointer to a pointer counts pointers")
+prn_a_pointer_to_a_pointer_counts_pointers()
+    prn_prints("var t: [4]*u8\nprint(&t[3] - &t[1])", "2\n")
+
+@test("it is the inverse of indexing")
+prn_it_is_the_inverse_of_indexing()
+    prn_prints(raw"""
+        var a: [8]u32
+        var p = &a[0]
+        var n = 5usize
+        print(&p[n] - p == isize(n))
+        """, "true\n")
+
+// `memchr` hands back an interior pointer, the difference turns it into an index, and the index cuts
+// the run of bytes.
+@test("which is what makes memchr usable at all")
+prn_which_is_what_makes_memchr_usable_at_all()
+    prn_prints(raw"""
+        import sysl.text.from_utf8_unchecked
+        extern memchr(p: *u8, c: int, n: usize) -> *u8
+        var buf: [8]u8 = [65u8, 66u8, 10u8, 67u8, 0u8, 0u8, 0u8, 0u8]
+        var hit = memchr(&buf[0], 10, 8usize)
+        if hit == null
+            print("absent")
+        else
+            var at = usize(hit - &buf[0])
+            print(at, from_utf8_unchecked(buf[0..<at]))
+        """, "2 AB\n")
+
+@test("and reports the absence of what it looked for, without a difference to take")
+prn_and_reports_the_absence_of_what_it_looked_for_without_a_difference_to_take()
+    prn_prints(raw"""
+        extern memchr(p: *u8, c: int, n: usize) -> *u8
+        var buf: [4]u8 = [65u8, 66u8, 67u8, 68u8]
+        print(memchr(&buf[0], 10, 4usize) == null)
+        """, "true\n")
+
+@test("a one-byte pointee needs no divide, and a wider one does")
+prn_a_one_byte_pointee_needs_no_divide_and_a_wider_one_does()
+    if !prn_ready() then return
+
+    val narrow = prn_main("var a: [8]u8\nprint(&a[3] - &a[0])")
+    val wide = prn_main("var a: [8]u32\nprint(&a[3] - &a[0])")
+
+    assert(narrow.contains("ptrtoint"), narrow)
+    assert(!narrow.contains("sdiv"), narrow)
+    assert(wide.contains("sdiv i64"), wide)
+
+// ---- what it is not ----
+
+@test("two pointers to different types")
+prn_two_pointers_to_different_types()
+    prn_refused("var a: [4]u8\nvar b: [4]u32\nprint(&a[0] - &b[0])\n", "'-' needs matching types, got *byte and *uint", "3:15")
+
+@test("a pointer and an integer, offsetting being '&p[n]'")
+prn_a_pointer_and_an_integer_offsetting_being_ref_p_n()
+    prn_refused("var a: [8]u8\nprint(&a[0] - 1)\n", "'-' needs matching types, got *byte and int", "2:15")
+
+@test("two pointers added, there being no address to name")
+prn_two_pointers_added_there_being_no_address_to_name()
+    prn_refused("var a: [8]u8\nprint(&a[0] + &a[1])\n", "operator '+' is not defined for *byte", "2:7")
+
+@test("a counted reference, which is not a raw pointer")
+prn_a_counted_reference_which_is_not_a_raw_pointer()
+    prn_refused("struct P\n    x: int\nvar a: &P = P(1)\nvar b: &P = P(2)\nprint(a - b)\n", "operator '-' is not defined for &P", "5:7")
