@@ -485,6 +485,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     cx.func_name = d.name
     cx.ret_ty = Some(ret)
     cx.ret_is_list = written.is_some() && is_result_list(written.unwrap())
+    cx.result_chain = cx.ret_is_list
 
     val split = contract_length(d.body)
     val contract = analyze_contract(cx, span, d.body, split, ret)
@@ -497,7 +498,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     // **Anchored at the declaration, not at the statement that yields**, as the reference anchors it:
     // the mistake is the signature and the body disagreeing, and the signature is where it is read.
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
-        cx.fault(span, body_disagreement(name, ret, body.ty))
+        cx.fault(span, body_disagreement(name, ret, body.ty, cx.ret_is_list))
 
     a.tables.homes.put(name, scope)
 
@@ -703,6 +704,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     cx.func_name = d.name
     cx.ret_ty = Some(ret)
     cx.ret_is_list = written_result_list(d.ret_type)
+    cx.result_chain = cx.ret_is_list
 
     val split = contract_length(d.body)
 
@@ -911,6 +913,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     cx.func_name = name
     cx.ret_ty = Some(ret)
     cx.ret_is_list = written_result_list(d.ret_type)
+    cx.result_chain = cx.ret_is_list
     // An instantiation of a variadic generic is as variadic as the declaration, so its body may
     // open the tail.
     cx.in_variadic = d.variadic
@@ -922,7 +925,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     val span = body_span(rest, span_zero())
 
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
-        cx.fault(span, body_disagreement(declared_key(a, cx.scope, d), ret, body.ty))
+        cx.fault(span, body_disagreement(declared_key(a, cx.scope, d), ret, body.ty, cx.ret_is_list))
 
     // **An instantiation whose name carries a closure's is internal on the same ground the closure
     // itself is.** `sysl.time$resolve.$closure4` is a symbol only the unit that lowered that closure
@@ -955,15 +958,25 @@ end declared_key
 // **A `where` predicate and a struct `invariant` are lowered to functions the reader never wrote**,
 // so the mistake in one is reported as what they did write -- a condition that is not a `bool` --
 // rather than as a return type nothing in the source names.
-body_disagreement(name: string, ret: Type, got: Type) -> string
+//
+// **A result list is quoted as it was written** -- `int, int`, not the tuple it lays out as -- since
+// the declaration is what the reader is being pointed at.
+body_disagreement(name: string, ret: Type, got: Type, listed: bool) -> string
     if name.ends_with("$pred") then
         return s"a 'where' predicate must be a 'bool', but this one is ${type_show(got)}"
 
     if name.ends_with("$inv") then
         return s"an 'invariant' must be a 'bool', but this one is ${type_show(got)}"
 
-    s"function '$name' should return ${type_show(ret)}, but its body yields ${type_show(got)}"
+    val declared = if listed then as_written_results(ret) else ret
+
+    s"function '$name' should return ${type_show(declared)}, but its body yields ${type_show(got)}"
 end body_disagreement
+
+// The tuple a result list lays out as, given back its written shape for a diagnostic.
+private as_written_results(t: Type) -> Type = t match
+    Struct(parts) -> Results(parts)
+    _ -> t
 
 // A block with nothing in it, for a function whose signature never resolved.
 private empty_block() -> TBlock = TBlock(buf(), None, Unit)

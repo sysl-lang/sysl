@@ -1,0 +1,262 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, replace_all}
+
+// The reference's `ResultListTests`: `-> int, int`, several results as a property of the signature
+// (`reference/declarations.md § Several results`).
+//
+// There is no carrier: the several things travel from callee to caller and are taken apart there, so
+// a result list may stand in exactly three places -- a binding, an assignment, and a value produced as
+// the function's own result. The refusals are the cases that matter, since a form that quietly built
+// a tuple would pass every case that only checked the values arrived.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.157)** by
+// handing the installed `sysl` the same program. Positions are the reference's `line:column`; the
+// extent a caret underlines is the open span divergence and is not asserted.
+
+// What a program does: what it printed, and whether it exited zero. A failure to build is its
+// message and a non-zero exit.
+private rlx_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-rlx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end rlx_outcome
+
+// The program runs to the end and prints exactly this. Returns at once without the library.
+private rlx_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = rlx_outcome(text)
+
+    assert(out.1, s"it did not exit zero: ${out.0}")
+    assert_eq(out.0, want)
+end rlx_prints
+
+// The build is refused with this message, anchored at this `line:column` of `main.sysl`.
+private rlx_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val said = rlx_outcome(text).0
+
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+end rlx_refused
+
+// A body, wrapped in a function the program calls -- the reference suite's `fn`.
+private rlx_fn(body: string) -> string = "demo()\n    " + replace_all(body, "\n", "\n    ") + "\nend demo\ndemo()\n"
+
+private rlx_divmod() -> string = "divmod(a: int, b: int) -> int, int\n    a / b, a % b\n"
+
+// What every place that may not hold a result list is refused with.
+private rlx_held() -> string =
+    "this yields 2 results, and one value is wanted here — a result list is taken apart by a " +
+    "binding or an assignment that names every one of them"
+
+// -- a function may declare several results --------------------------------------------------------
+
+@test("and a binding takes them apart")
+rlx_a_binding_takes_them_apart() = rlx_prints(rlx_divmod() + "var q, r = divmod(17, 5)\nprint(q, r)\n", "3 2\n")
+
+@test("an assignment writes them into places that already exist")
+rlx_an_assignment_writes_them() =
+    rlx_prints(rlx_divmod() + rlx_fn("var a = 0\nvar b = 0\na, b = divmod(9, 2)\nprint(a, b)"), "4 1\n")
+
+@test("there may be more than two")
+rlx_more_than_two() =
+    rlx_prints("civil(d: int) -> int, int, int = d / 400, (d / 30) % 12, d % 30\n" +
+               "var y, m, day = civil(20520)\nprint(y, m, day)\n", "51 0 0\n")
+
+@test("the results need not have the same type")
+rlx_not_the_same_type() =
+    rlx_prints("pick(c: bool) -> int, string = if c then 1 else 0, if c then \"yes\" else \"no\"\n" +
+               "var n, s = pick(true)\nprint(n, s)\n", "1 yes\n")
+
+@test("a 'return' hands them back too")
+rlx_a_return_hands_them_back() =
+    rlx_prints("signs(n: int) -> int, int\n    return n, -n\nend signs\nvar a, b = signs(3)\nprint(a, b)\n",
+               "3 -3\n")
+
+// The third place: a value produced *as* the function's result, which is what a branch and a nested
+// block are -- so the permission has to reach them.
+@test("and each branch of a body may produce its own")
+rlx_each_branch_produces_its_own() =
+    rlx_prints("pick(c: bool) -> int, string\n    if c then\n        1, \"yes\"\n    else\n        0, \"no\"\n" +
+               "end pick\nvar n, s = pick(false)\nprint(n, s)\n", "0 no\n")
+
+@test("a function may forward another's whole list")
+rlx_forward_a_whole_list() =
+    rlx_prints("pick(c: bool) -> int, string = if c then 1 else 0, if c then \"yes\" else \"no\"\n" +
+               "forward(c: bool) -> int, string = pick(c)\nvar n, s = forward(true)\nprint(n, s)\n", "1 yes\n")
+
+// -- where it may be written -----------------------------------------------------------------------
+
+@test("a method declares one")
+rlx_a_method_declares_one() =
+    rlx_prints("struct Box\n    n: int\n    both(self) -> int, int = self.n, self.n * 2\nend Box\n" +
+               "var x, y = Box(5).both()\nprint(x, y)\n", "5 10\n")
+
+@test("a trait declares one, and an implementation supplies it")
+rlx_a_trait_declares_one() =
+    rlx_prints("struct Box\n    n: int\ntrait Pairish\n    parts(self) -> int, int\nimpl Pairish for Box\n" +
+               "    parts(self) -> int, int\n        return self.n, -self.n\n    end parts\n" +
+               "var p, q = Box(5).parts()\nprint(p, q)\n", "5 -5\n")
+
+@test("a generic function declares one over its own parameters")
+rlx_a_generic_declares_one() =
+    rlx_prints("both[T](a: T, b: T) -> T, T = a, b\nvar u, v = both(\"a\", \"b\")\nprint(u, v)\n", "a b\n")
+
+// A result list is a property of a *signature*, so the places that ask for a type cannot reach one.
+@test("a field cannot be declared as one")
+rlx_a_field_cannot() = rlx_refused("struct S\n    f: int, int\n", "dedent expected", "2:11")
+
+@test("and neither can an 'extern' result, which is an ABI question")
+rlx_an_extern_cannot() = rlx_refused("extern g() -> int, int\n", "newline expected", "1:18")
+
+// -- nothing may hold one --------------------------------------------------------------------------
+
+@test("not an argument")
+rlx_not_an_argument() = rlx_refused(rlx_divmod() + "print(divmod(7, 2))\n", rlx_held(), "3:7")
+
+@test("not a variable of the tuple type its parts lay out as")
+rlx_not_a_tuple_variable() =
+    rlx_refused(rlx_divmod() + rlx_fn("var p: (int, int) = divmod(7, 2)"), rlx_held(), "4:25")
+
+@test("not a part of something larger")
+rlx_not_a_part() = rlx_refused(rlx_divmod() + rlx_fn("var a = [divmod(7, 2)]"), rlx_held(), "4:14")
+
+@test("and not an operand")
+rlx_not_an_operand() =
+    rlx_refused(rlx_divmod() + rlx_fn("var a = divmod(7, 2) == divmod(7, 2)"), rlx_held(), "4:13")
+
+// The permission covers one expression and nothing inside it.
+@test("the permission does not reach inside the expression it was given for")
+rlx_not_inside_the_expression() =
+    rlx_refused("wrap(a: int, b: int) -> int, int = a, b\ntake(n: int) -> int, int = n, n\n" +
+                rlx_fn("var x, y = wrap(take(1), 2)"), rlx_held(), "4:21")
+
+// -- there is no partial take ----------------------------------------------------------------------
+
+@test("a single binding may not take the first of several")
+rlx_no_first_of_several() = rlx_refused(rlx_divmod() + rlx_fn("var a = divmod(7, 2)"), rlx_held(), "4:13")
+
+@test("a binding that names too few is refused in the callee's terms")
+rlx_names_too_few() =
+    rlx_refused("three() -> int, int, int = 1, 2, 3\n" + rlx_fn("var a, b = three()"),
+                "this binding names 2 things, and this yields 3 results", "3:16")
+
+@test("and one that names too many is refused the same way")
+rlx_names_too_many() =
+    rlx_refused(rlx_divmod() + rlx_fn("var a, b, c = divmod(7, 2)"),
+                "this binding names 3 things, and this yields 2 results", "4:19")
+
+// -- the callee's own side -------------------------------------------------------------------------
+
+@test("a body that yields one value where several were declared is refused in the words written")
+rlx_one_value_for_several() =
+    rlx_refused("f() -> int, int = 1\nprint(1)\n", "function 'f' should return int, int, but its body yields int",
+                "1:1")
+
+@test("too many values are counted against the declaration")
+rlx_too_many_values() =
+    rlx_refused("f() -> int, int = 1, 2, 3\nprint(1)\n", "this function yields 2 results, but 3 values were given",
+                "1:19")
+
+@test("each value is checked against the result it is heading for")
+rlx_each_value_checked() =
+    rlx_refused("f() -> int, int = 1, \"x\"\nprint(1)\n", "this result is declared int, but the value is string",
+                "1:22")
+
+@test("a comma list in a function that declares one result says which is wrong")
+rlx_one_result_declared() =
+    rlx_refused("f() -> int = 1, 2\nprint(1)\n",
+                "several values separated by commas are a function's result list, and this function " +
+                "declares one result — write the values it wants, or declare a result list", "1:14")
+
+// Parentheses here would build the carrier the form says never exists.
+@test("and the parentheses are refused where they would build a carrier")
+rlx_no_parenthesised_carrier() =
+    rlx_refused("f() -> int, int = (1, 2)\nprint(1)\n",
+                "this function yields 2 results rather than a tuple — write the values without the parentheses",
+                "1:19")
+
+// The same refusal reaches a `return` and a branch the function's value is made of.
+@test("and so are a returned tuple and a branch's")
+rlx_no_carrier_returned_or_branched()
+    val said = "this function yields 2 results rather than a tuple — write the values without the parentheses"
+
+    rlx_refused("f() -> int, int\n    return (1, 2)\nend f\nprint(1)\n", said, "2:12")
+    rlx_refused("f(c: bool) -> int, int\n    if c then\n        (1, 2)\n    else\n        3, 4\nend f\nprint(1)\n",
+                said, "3:9")
+end rlx_no_carrier_returned_or_branched
+
+// A tuple written as a binding's value inside such a body is that binding's, not the function's:
+// `reference/declarations.md § Several results` names the trailing expression and `return` as what
+// supplies them. The reference (0.0.157) refuses this one too, matching the result TYPE rather than
+// the position.
+@test("but a tuple that is a binding's value inside the body is the binding's")
+rlx_a_bindings_tuple_is_its_own() =
+    rlx_prints("f(c: bool) -> int, int\n    val p: (int, int) = if c then\n        (1, 2)\n    else\n" +
+               "        (3, 4)\n    p.0, p.1\nend f\nvar a, b = f(true)\nprint(a, b)\n", "1 2\n")
+
+// -- beside a tuple, at the same binding -----------------------------------------------------------
+
+@test("the same spelling takes a result list and a tuple apart")
+rlx_one_spelling_for_both() =
+    rlx_prints("asList(n: int) -> int, int = n, n * 2\nasTuple(n: int) -> (int, int) = (n, n * 2)\n" +
+               "var a, b = asList(3)\nvar c, d = asTuple(3)\nprint(a, b, c, d)\n", "3 6 3 6\n")
+
+// The one place they differ: a tuple is a value and may be held, a result list is not.
+@test("and only the tuple may be held")
+rlx_only_the_tuple_is_held()
+    rlx_prints("asTuple(n: int) -> (int, int) = (n, n * 2)\nvar p = asTuple(3)\nprint(p.0, p.1)\n", "3 6\n")
+    rlx_refused("asList(n: int) -> int, int = n, n * 2\n" + rlx_fn("var p = asList(3)"), rlx_held(), "3:13")
+
+// -- the values it carries -------------------------------------------------------------------------
+
+@test("a counted result survives the journey")
+rlx_a_counted_result_survives() =
+    rlx_prints("labels(n: int) -> string, string = \"a\" + str(n), \"b\" + str(n)\n" +
+               rlx_fn("var i = 0\nwhile i < 20000\n    var s, t = labels(i)\n    i += 1\nprint(\"done\")"), "done\n")
+
+@test("a 'unit' result takes no room, as it does anywhere else")
+rlx_a_unit_result() = rlx_prints("f() -> unit, int = (), 2\nvar u, n = f()\nprint(n)\n", "2\n")
+
+@test("and a result that never arrives is not a result")
+rlx_never_is_not_a_result() =
+    rlx_refused("f() -> never, int = exit(1), 2\nprint(1)\n",
+                "'never' is the type of an expression that does not finish, so it can only be a result type", "1:8")
+
+// -- a comma that is not this form goes on meaning what it meant -----------------------------------
+
+@test("an inline branch at the end of a line does not take the comma after it")
+rlx_inline_branch_at_line_end() =
+    rlx_prints("pick(c: bool) -> int, string = if c then 1 else 0, if c then \"yes\" else \"no\"\n" +
+               "var n, s = pick(true)\nprint(n, s)\n", "1 yes\n")
+
+@test("an inline branch inside an argument list keeps its neighbours")
+rlx_inline_branch_in_arguments() =
+    rlx_prints("pick(c: bool, a: int, b: int) -> int = if c then a else b\n" +
+               "print(pick(true, if false then 1 else 2, 3))\n", "2\n")
+
+@test("a call's arguments are still its arguments")
+rlx_call_arguments_stay() = rlx_prints("print(1, if true then 2 else 3, 4)\n", "1 2 4\n")
