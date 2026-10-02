@@ -1,0 +1,743 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Inline assembly (`reference/inline-assembly.md`): which arm a processor selects, what the
+// constraint string comes out as, and which programs are refused for a machine that is not this one
+// -- the reference's `InlineAssemblyTests`.
+//
+// A target is a value, so every one of these questions is answered on one laptop by reading the text
+// a named machine lowers a program to. **Every message, position and line of LLVM text here was read
+// out of the reference compiler** (0.0.158) on the same input, with `emit-llvm --no-std-lib --target
+// <machine>`.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private var ias_library_names: Buf[string] = buf()
+private var ias_library_units: Buf[Buf[Program]] = buf()
+
+// The library as one machine reads it, read once per machine.
+private ias_library(t: Target) -> Buf[Program]
+    for i in 0..<ias_library_names.len()
+        if ias_library_names.at(i) == t.name then return ias_library_units.at(i)
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    ias_library_names.push(t.name)
+    ias_library_units.push(out)
+    out
+end ias_library
+
+private ias_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+// The program's own errors, leaving out anything the library had to say.
+private ias_own(said: Buf[Placed]) -> Buf[Placed]
+    var out: Buf[Placed] = buf()
+    val errs = errors_of(said)
+
+    for i in 0..<errs.len()
+        if !errs.at(i).src.name.starts_with("library/") then out.push(errs.at(i))
+
+    out
+end ias_own
+
+// What a compilation came to on a machine: the whole report it was refused with, or nothing and its
+// LLVM text.
+private ias_build(text: string, machine: string) -> (string, string)
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+    val library = ias_library(t)
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return (parsed.report.at(0).message, "")
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), true)
+    val early = ias_own(done.reported)
+
+    if !early.is_empty() then return (analysis_report(early), "")
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = ias_own(done.an.diagnostics())
+
+    if !late.is_empty() then return (analysis_report(late), "")
+
+    val kept = prune(strip_tests(whole), own)
+
+    ("", ir_print_module(codegen_with_gaps(kept, t, pr).0))
+end ias_build
+
+// The LLVM text a machine lowers a program to; a refusal fails the test, saying what it was.
+private ias_ir(machine: string, text: string) -> string
+    val b = ias_build(text, machine)
+
+    assert(b.0 == "", s"expected the program to compile for $machine, and it was refused:\n${b.0}")
+    b.1
+
+// What a machine refuses a program with, and nothing where it is accepted.
+private ias_err(machine: string, text: string) -> string = ias_build(text, machine).0
+
+private ias_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+private ias_never_says(text: string, part: string) =
+    assert(!text.contains(part), s"expected no '$part' in:\n$text")
+
+// That a report is this one diagnostic at this position, and says nothing else.
+private ias_refused(report: string, message: string, line: int, col: int)
+    val head = s"error: $message\n --> main.sysl:$line:$col\n"
+
+    assert(report.starts_with(head), s"expected the report to begin\n$head\nand it is\n$report")
+    assert_eq(report.count_of("error: "), 1)
+
+private val ias_intel: string = "x86_64-linux"
+private val ias_arm: string = "aarch64-macos"
+private val ias_risc: string = "riscv64-freestanding"
+
+// -- selecting an arm -----------------------------------------------------------------------------
+
+@test("each processor takes its own instructions and carries none of the others")
+ias_each_processor_takes_its_own()
+    if !ias_ready() then return
+
+    val src = raw"""
+        halt()
+            asm
+                [x86_64]  "hlt"
+                [aarch64] "wfi"
+                [thumb, riscv64, riscv32, craft, wasm32] "wfi"
+
+        halt()
+        """
+    val intel = ias_ir(ias_intel, src)
+    val arm = ias_ir(ias_arm, src)
+
+    ias_says(intel, "define void @halt() {\nentry:\n  call void asm sideeffect \"hlt\", \"~{memory},~{cc}\"()\n")
+    ias_never_says(intel, "wfi")
+    ias_says(arm, "define void @halt() {\nentry:\n  call void asm sideeffect \"wfi\", \"~{memory},~{cc}\"()\n")
+    ias_never_says(arm, "hlt")
+end ias_each_processor_takes_its_own
+
+@test("an arm may answer for several processors at once")
+ias_an_arm_for_several_processors()
+    if !ias_ready() then return
+
+    val src = raw"""
+        barrier()
+            asm
+                [aarch64, riscv64] "nop"
+                [x86_64, thumb, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        barrier()
+        """
+
+    ias_says(ias_ir(ias_arm, src), "call void asm sideeffect \"nop\", \"~{memory},~{cc}\"()")
+    ias_says(ias_ir(ias_risc, src), "call void asm sideeffect \"nop\", \"~{memory},~{cc}\"()")
+end ias_an_arm_for_several_processors
+
+@test("an arm with nothing under it emits nothing, and is not an error")
+ias_an_empty_arm_emits_nothing()
+    if !ias_ready() then return
+
+    val src = raw"""
+        barrier()
+            asm
+                [x86_64]
+                [aarch64] "dmb ish"
+                [riscv64] "fence rw, rw"
+                [riscv32] "fence rw, rw"
+                [thumb]   "dmb ish"
+                [craft, wasm32] unavailable "not this test's business"
+
+        barrier()
+        """
+
+    ias_says(ias_ir(ias_intel, src), "define void @barrier() {\nentry:\n  ret void\n}\n")
+    ias_never_says(ias_ir(ias_intel, src), "asm sideeffect")
+    ias_says(ias_ir(ias_arm, src), "call void asm sideeffect \"dmb ish\", \"~{memory},~{cc}\"()")
+end ias_an_empty_arm_emits_nothing
+
+@test("several instructions are joined into one block, in the order written")
+ias_several_instructions_are_one_block()
+    if !ias_ready() then return
+
+    val src = raw"""
+        twice()
+            asm
+                [x86_64]
+                    "nop"
+                    "cli"
+                    "sti"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        twice()
+        """
+
+    ias_says(ias_ir(ias_intel, src), "call void asm sideeffect \"nop\\0Acli\\0Asti\", \"~{memory},~{cc}\"()")
+end ias_several_instructions_are_one_block
+
+// -- covering every processor ---------------------------------------------------------------------
+
+@test("a missing arm is an error on a build for a processor that has one")
+ias_a_missing_arm_is_an_error()
+    if !ias_ready() then return
+
+    ias_refused(ias_err(ias_intel, raw"""
+        halt()
+            asm
+                [x86_64] "hlt"
+
+        halt()
+        """), "this assembly has no arm for 'aarch64', 'riscv64', 'riscv32', 'thumb', 'wasm32' or " +
+              "'craft'. Every processor needs an answer, so that one without instructions is found " +
+              "here rather than by whoever first builds for it — write the instructions, write an " +
+              "empty arm if none are needed there, or write 'unavailable' with the reason there is " +
+              "nothing to write", 2, 5)
+end ias_a_missing_arm_is_an_error
+
+@test("'unavailable' covers a processor, so the ones with an answer still build")
+ias_unavailable_covers_a_processor()
+    if !ias_ready() then return
+
+    ias_says(ias_ir(ias_intel, raw"""
+        port_out()
+            asm
+                [x86_64] "outb %al, %dx"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "port I/O is x86-only; devices are reached through memory"
+
+        port_out()
+        """), "call void asm sideeffect \"outb %al, %dx\", \"~{memory},~{cc}\"()")
+end ias_unavailable_covers_a_processor
+
+@test("and carries its reason to the processor that has none")
+ias_unavailable_carries_its_reason()
+    if !ias_ready() then return
+
+    ias_refused(ias_err(ias_arm, raw"""
+        port_out()
+            asm
+                [x86_64] "outb %al, %dx"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "port I/O is x86-only; devices are reached through memory"
+
+        port_out()
+        """), "this operation has no answer on aarch64: port I/O is x86-only; devices are reached " +
+              "through memory", 4, 9)
+end ias_unavailable_carries_its_reason
+
+@test("a processor nobody has heard of is a mistake, not a machine")
+ias_an_unknown_processor_is_a_mistake()
+    if !ias_ready() then return
+
+    ias_refused(ias_err(ias_intel, raw"""
+        f()
+            asm
+                [powerpc] "nop"
+                [x86_64, aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """), "'powerpc' is not a processor — 'aarch64', 'x86_64', 'riscv64', 'riscv32', 'thumb', " +
+              "'wasm32', 'x86', 'craft' is what there is", 3, 9)
+end ias_an_unknown_processor_is_a_mistake
+
+@test("two arms cannot claim the same processor")
+ias_two_arms_for_one_processor()
+    if !ias_ready() then return
+
+    ias_refused(ias_err(ias_intel, raw"""
+        f()
+            asm
+                [x86_64] "nop"
+                [x86_64] "cli"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """), "'x86_64' already has an arm above this one, so there is no saying which of them " +
+              "answers for it", 4, 9)
+end ias_two_arms_for_one_processor
+
+// `x86` is a processor because `x86-linux` is in the registry, and no arm is owed for it because no
+// target can be built for it.
+@test("a processor no target can be built for is not one an arm is owed")
+ias_no_arm_is_owed_to_an_unbuildable_processor()
+    if !ias_ready() then return
+
+    ias_says(ias_ir(ias_intel, raw"""
+        f()
+            asm
+                [aarch64] "nop"
+                [x86_64] "nop"
+                [thumb] "nop"
+                [riscv64] "nop"
+                [riscv32] "nop"
+                [craft] "nop"
+                [wasm32] "nop"
+
+        f()
+        """), "define void @f() {\nentry:\n  call void asm sideeffect \"nop\", \"~{memory},~{cc}\"()\n")
+end ias_no_arm_is_owed_to_an_unbuildable_processor
+
+// -- operands -------------------------------------------------------------------------------------
+
+@test("an input is loaded before the block and passed as a register operand")
+ias_an_input_is_loaded_before_the_block()
+    if !ias_ready() then return
+
+    ias_says(ias_ir(ias_intel, raw"""
+        use(n: int)
+            asm
+                [x86_64]
+                    "nop {n}"
+                    in n : reg
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        use(7)
+        """), "define void @use(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  call void asm sideeffect \"nop $0\", \"r,~{memory},~{cc}\"(i32 %t1)\n" +
+              "  ret void\n" +
+              "}\n")
+end ias_an_input_is_loaded_before_the_block
+
+@test("an output is stored back into the variable it names")
+ias_an_output_is_stored_back()
+    if !ias_ready() then return
+
+    ias_says(ias_ir(ias_intel, raw"""
+        read_reg() -> int
+            var v: int = 0
+            asm
+                [x86_64]
+                    "mov $7, {v}"
+                    out v : reg
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+            v
+
+        print(read_reg())
+        """), "define i32 @read_reg() {\n" +
+              "entry:\n" +
+              "  %v.addr = alloca i32\n" +
+              "  store i32 0, ptr %v.addr\n" +
+              "  %t1 = call i32 asm sideeffect \"mov $$7, $0\", \"=r,~{memory},~{cc}\"()\n" +
+              "  store i32 %t1, ptr %v.addr\n" +
+              "  %t2 = load i32, ptr %v.addr\n" +
+              "  ret i32 %t2\n" +
+              "}\n")
+end ias_an_output_is_stored_back
+
+@test("a named machine register is written into the constraint as that register")
+ias_a_named_register_is_its_constraint()
+    if !ias_ready() then return
+
+    ias_says(ias_ir(ias_intel, raw"""
+        out_byte(port: u16, value: u8)
+            asm
+                [x86_64]
+                    "outb {value}, {port}"
+                    in port : "dx"
+                    in value : "al"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        out_byte(0x3f8u16, 65u8)
+        """), "  %t1 = load i16, ptr %port.addr\n" +
+              "  %t2 = load i8, ptr %value.addr\n" +
+              "  call void asm sideeffect \"outb $1, $0\", \"{dx},{al},~{memory},~{cc}\"(i16 %t1, i8 %t2)\n")
+end ias_a_named_register_is_its_constraint
+
+@test("outputs are numbered before inputs, which is the order LLVM reads them in")
+ias_outputs_are_numbered_first()
+    if !ias_ready() then return
+
+    ias_says(ias_ir(ias_intel, raw"""
+        both(n: int) -> int
+            var v: int = 0
+            asm
+                [x86_64]
+                    "mov {n}, {v}"
+                    out v : reg
+                    in n : reg
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+            v
+
+        print(both(3))
+        """), "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = call i32 asm sideeffect \"mov $1, $0\", \"=r,r,~{memory},~{cc}\"(i32 %t1)\n" +
+              "  store i32 %t2, ptr %v.addr\n")
+end ias_outputs_are_numbered_first
+
+@test("a clobbered register joins the constraint before the two that are always there")
+ias_a_clobber_joins_the_constraint()
+    if !ias_ready() then return
+
+    ias_says(ias_ir(ias_intel, raw"""
+        f()
+            asm
+                [x86_64]
+                    "nop"
+                    clobbers "rax", "rdx"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """), "call void asm sideeffect \"nop\", \"~{rax},~{rdx},~{memory},~{cc}\"()")
+end ias_a_clobber_joins_the_constraint
+
+@test("an operand naming nothing is an undefined name")
+ias_an_operand_naming_nothing()
+    if !ias_ready() then return
+
+    ias_refused(ias_err(ias_intel, raw"""
+        f()
+            asm
+                [x86_64]
+                    "nop {ghost}"
+                    in ghost : reg
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """), "undefined name 'ghost'. An assembly operand names a variable that already exists — " +
+              "an expression needs somewhere to be evaluated to, so bind one first", 5, 13)
+end ias_an_operand_naming_nothing
+
+@test("a placeholder no operand declares is refused before it reaches the assembler")
+ias_an_undeclared_placeholder()
+    if !ias_ready() then return
+
+    ias_refused(ias_err(ias_intel, raw"""
+        f(n: int)
+            asm
+                [x86_64]
+                    "nop {m}"
+                    in n : reg
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f(1)
+        """), "'{m}' names an operand this assembly does not declare. Add 'in m : reg' or 'out m : " +
+              "reg', or write the brace as part of an instruction some other way", 3, 9)
+end ias_an_undeclared_placeholder
+
+@test("reading and writing one variable is refused, because it is two registers")
+ias_reading_and_writing_one_variable()
+    if !ias_ready() then return
+
+    ias_refused(ias_err(ias_intel, raw"""
+        f()
+            var n: int = 1
+            asm
+                [x86_64]
+                    "add {n}, {n}"
+                    in n : reg
+                    out n : reg
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """), "'n' is both read and written here, which is two operands and so possibly two " +
+              "registers — the instructions would read one and write another. A single operand " +
+              "that does both is not something this language has yet", 7, 13)
+end ias_reading_and_writing_one_variable
+
+@test("a 'val' cannot be written by the instructions")
+ias_a_val_cannot_be_written()
+    if !ias_ready() then return
+
+    ias_refused(ias_err(ias_intel, raw"""
+        f()
+            val n = 1
+            asm
+                [x86_64]
+                    "mov $0, {n}"
+                    out n : reg
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """), "'n' cannot be written by this assembly, because it is a 'val'. Declare it 'var' if " +
+              "the instructions are meant to set it", 6, 13)
+end ias_a_val_cannot_be_written
+
+@test("a float has no register class yet, and the diagnostic says so in those terms")
+ias_a_float_has_no_register_class()
+    if !ias_ready() then return
+
+    ias_refused(ias_err(ias_intel, raw"""
+        f()
+            var x: f64 = 1.0
+            asm
+                [x86_64]
+                    "nop {x}"
+                    in x : reg
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """), "'x' is a floating-point value, and there is no floating register class yet — only " +
+              "'reg', which is the general-purpose one. Move the value through an integer of the " +
+              "same width, or through memory", 6, 13)
+end ias_a_float_has_no_register_class
+
+// -- what the compiler owns -----------------------------------------------------------------------
+
+// Doubled in the emitted template, because `$` is LLVM's operand marker -- and written once in the
+// sysl source, which is the whole point of the compiler owning the escape.
+@test("a dollar the program wrote survives as one, rather than being doubled in the source")
+ias_a_dollar_survives_as_one()
+    if !ias_ready() then return
+
+    ias_says(ias_ir(ias_intel, raw"""
+        f()
+            asm
+                [x86_64] "movq $1, %rsi"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """), "call void asm sideeffect \"movq $$1, %rsi\", \"~{memory},~{cc}\"()")
+end ias_a_dollar_survives_as_one
+
+@test("a doubled brace is a literal one, so a register list can be written")
+ias_a_doubled_brace_is_a_literal_one()
+    if !ias_ready() then return
+
+    ias_says(ias_ir(ias_arm, raw"""
+        f()
+            asm
+                [aarch64] "push {{r0, r1}}"
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """), "call void asm sideeffect \"push {r0, r1}\", \"~{memory},~{cc}\"()")
+end ias_a_doubled_brace_is_a_literal_one
+
+// Two emitted blocks, which is what collides -- calling one function twice emits its block once and
+// would prove nothing. Each site has to end up with a label of its own.
+@test("a label is renamed per expansion, so two blocks do not define one symbol twice")
+ias_a_label_is_renamed_per_expansion()
+    if !ias_ready() then return
+
+    val out = ias_ir(ias_intel, raw"""
+        spin()
+            asm
+                [x86_64]
+                    "spot: nop"
+                    "jmp spot"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        wait()
+            asm
+                [x86_64]
+                    "spot: nop"
+                    "jmp spot"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        spin()
+        wait()
+        """)
+
+    ias_says(out, "call void asm sideeffect \"spot.1: nop\\0Ajmp spot.1\", \"~{memory},~{cc}\"()")
+    ias_says(out, "call void asm sideeffect \"spot.2: nop\\0Ajmp spot.2\", \"~{memory},~{cc}\"()")
+    ias_never_says(out, "\"spot: nop")
+end ias_a_label_is_renamed_per_expansion
+
+private ias_lines(a: string, b: string, c: string = "", d: string = "") -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(a)
+    out.push(b)
+
+    if c != "" then out.push(c)
+
+    if d != "" then out.push(d)
+
+    out
+end ias_lines
+
+private ias_renamed(lines: Buf[string], want: Buf[string])
+    val got = uniquify_labels(lines, 7)
+
+    assert_eq(got.len(), want.len())
+
+    for i in 0..<want.len()
+        assert_eq(got.at(i), want.at(i))
+end ias_renamed
+
+// Which occurrences count as whole ones, asked of the renaming itself, since a program cannot easily
+// be made to contain every neighbouring case at once.
+@test("a label that only looks like another is left alone")
+ias_a_lookalike_label_is_left_alone()
+    ias_renamed(ias_lines("spot: nop", "jmp spot"), ias_lines("spot.7: nop", "jmp spot.7"))
+
+    // A longer name merely starting with the label, and one merely ending with it.
+    ias_renamed(ias_lines("spot: nop", "jmp spotless", "jmp respot"),
+                ias_lines("spot.7: nop", "jmp spotless", "jmp respot"))
+
+    // The characters that continue a name are `[A-Za-z0-9_.$]`, so each of them guards an
+    // occurrence -- including the dot and the dollar, which begin ordinary label names.
+    ias_renamed(ias_lines("spot: nop", "jmp spot.other", "jmp x$spot", "jmp spot_2"),
+                ias_lines("spot.7: nop", "jmp spot.other", "jmp x$spot", "jmp spot_2"))
+
+    // A separator that is not one of them does not guard it: two references on one line both move.
+    ias_renamed(ias_lines("spot: nop", "jmp spot, spot"), ias_lines("spot.7: nop", "jmp spot.7, spot.7"))
+end ias_a_lookalike_label_is_left_alone
+
+// `spot` is a prefix of `spot2`, and the rename of `spot` inserts a dot -- which is a name character.
+// Getting this wrong turns `spot2` into `spot.7 2` or renames it twice.
+@test("two labels sharing a prefix are renamed apart")
+ias_two_labels_sharing_a_prefix()
+    ias_renamed(ias_lines("spot: nop", "spot2: nop", "jmp spot", "jmp spot2"),
+                ias_lines("spot.7: nop", "spot2.7: nop", "jmp spot.7", "jmp spot2.7"))
+
+@test("an operand named twice in one template is one operand, at one number")
+ias_an_operand_named_twice_is_one()
+    if !ias_ready() then return
+
+    val out = ias_ir(ias_intel, raw"""
+        f(n: int)
+            asm
+                [x86_64]
+                    "add {n}, {n}"
+                    in n : reg
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f(2)
+        """)
+
+    ias_says(out, "define void @f(i32 %n.param) {\n" +
+                  "entry:\n" +
+                  "  %n.addr = alloca i32\n" +
+                  "  store i32 %n.param, ptr %n.addr\n" +
+                  "  %t1 = load i32, ptr %n.addr\n" +
+                  "  call void asm sideeffect \"add $0, $0\", \"r,~{memory},~{cc}\"(i32 %t1)\n" +
+                  "  ret void\n" +
+                  "}\n")
+    // One load, not two: the operand is passed once however often it is named.
+    assert_eq(out.count_of("load i32, ptr %n.addr"), 1)
+end ias_an_operand_named_twice_is_one
+
+// -- where assembly may not go --------------------------------------------------------------------
+
+// Not a check the analyzer makes -- `asm` is a statement and `require` takes an expression, so there
+// is no way to write one inside the other.
+@test("a contract condition cannot hold assembly, because a condition is an expression")
+ias_a_contract_cannot_hold_assembly()
+    if !ias_ready() then return
+
+    assert_eq(ias_err(ias_intel, raw"""
+        f(n: int) -> int
+            require asm
+                [x86_64] "nop"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+            n
+
+        print(f(1))
+        """), "dedent expected")
+end ias_a_contract_cannot_hold_assembly
+
+@test("assembly beside a contract is ordinary, and compiles")
+ias_assembly_beside_a_contract()
+    if !ias_ready() then return
+
+    ias_says(ias_ir(ias_intel, raw"""
+        f(n: int) -> int
+            require n > 0
+            asm
+                [x86_64] "nop"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+            n
+
+        print(f(1))
+        """), "require.ok1:\n" +
+              "  call void asm sideeffect \"nop\", \"~{memory},~{cc}\"()\n" +
+              "  %t3 = load i32, ptr %n.addr\n" +
+              "  ret i32 %t3\n")
+end ias_assembly_beside_a_contract
+
+@test("a function declared '-> never' with an assembly body is taken at its word")
+ias_never_with_an_assembly_body()
+    if !ias_ready() then return
+
+    val out = ias_ir(ias_intel, raw"""
+        stop() -> never
+            asm
+                [x86_64]
+                    "cli"
+                    "1: hlt"
+                    "jmp 1b"
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        stop()
+        """)
+
+    ias_says(out, "call void asm sideeffect \"cli\\0A1: hlt\\0Ajmp 1b\", \"~{memory},~{cc}\"()")
+    ias_says(out, "  call void @stop()\n  unreachable\n")
+end ias_never_with_an_assembly_body
+
+// `-> never` is checked where the compiler can see the body; it is only assembly it cannot see into.
+@test("and the promise is real, so a body that plainly returns is still refused")
+ias_a_never_body_that_returns_is_refused()
+    if !ias_ready() then return
+
+    ias_refused(ias_err(ias_intel, raw"""
+        stop() -> never
+            1
+
+        stop()
+        """), "function 'stop' should return never, but its body yields int", 1, 1)
+end ias_a_never_body_that_returns_is_refused
+
+// -- the words the construct spends ---------------------------------------------------------------
+
+@test("'out', 'reg' and 'clobbers' are still ordinary names elsewhere")
+ias_the_words_are_ordinary_names()
+    if !ias_ready() then return
+
+    ias_says(ias_ir(ias_arm, raw"""
+        f() -> int
+            var out = 1
+            var reg = 2
+            var clobbers = 3
+            var unavailable = 4
+            var asm = 5
+            out + reg + clobbers + unavailable + asm
+
+        print(f())
+        """), "  %t8 = load i32, ptr %asm.addr\n  %t9 = add i32 %t7, %t8\n  ret i32 %t9\n")
+end ias_the_words_are_ordinary_names
+
+@test("and inside an assembly block, in a position that is not theirs")
+ias_the_words_inside_a_block()
+    if !ias_ready() then return
+
+    ias_says(ias_ir(ias_intel, raw"""
+        f()
+            var out: int = 1
+            asm
+                [x86_64]
+                    "nop {out}"
+                    in out : reg
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """), "  %t1 = load i32, ptr %out.addr\n" +
+              "  call void asm sideeffect \"nop $0\", \"r,~{memory},~{cc}\"(i32 %t1)\n")
+end ias_the_words_inside_a_block
