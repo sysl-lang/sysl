@@ -1037,7 +1037,35 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
         val h = d.hook.unwrap()
 
         runner_signature(a, scope, h.span, d, hook_word(h.kind))
+        second_hook(a, scope, h, key)
 end hoist_func
+
+// **A module writes at most one hook of each kind**: two would both have to run at the same moment,
+// and nothing decides in which order -- not a detail a program could work around, since what a setup
+// leaves behind is what the test finds. The second is refused, and the message names the first,
+// because "where is the other one" is the reader's question. A question about the MODULE rather than
+// the declaration, so it is asked of every function already hoisted, which is declaration order.
+private second_hook(a: &Analysis, scope: Scope, h: HookAttr, key: string)
+    for i in 0..<a.tables.funcs.len()
+        val other_key = a.tables.funcs.key_at(i)
+        val other = a.tables.funcs.at(i)
+
+        if other_key != key && module_of(other_key) == scope.module_name && other.decl.hook.is_some()
+            val first = other.decl.hook.unwrap()
+
+            if first.kind == h.kind
+                val line = other.scope.src.locate(first.span.start).line
+                val named = s"'${module_show(scope.module_name)}'"
+                val owner = if scope.module_name == ModuleRoot then "this one" else named
+
+                a.fault(scope, h.span, s"a module writes at most one '@${hook_word(h.kind)}', and " +
+                        s"$owner already has one — '${module_bare(other_key)}' at " +
+                        s"${other.scope.src.name}:$line, and now '${module_bare(key)}'. Both would " +
+                        "run at the same moment, and nothing says in which order; write one hook " +
+                        "and have it call what it needs")
+                return
+            end if
+end second_hook
 
 // What a `@test` -- and each of the four hooks, held to the same rules for the same reason -- has to
 // look like, checked at the declaration.

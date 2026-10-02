@@ -571,8 +571,10 @@ private resolve_signatures(a: &Analysis)
         val enums = a.tables.enum_insts.len()
         val constrained = a.tables.constrained_insts.len()
 
-        resolve_func_signature(a, f.scope, f.decl.tparams, f.decl.bounds, f.decl.tvalues,
-                               f.decl.tpacks, f.decl.params, f.decl.ret_type)
+        val result = resolve_func_signature(a, f.scope, f.decl.tparams, f.decl.bounds, f.decl.tvalues,
+                                            f.decl.tpacks, f.decl.params, f.decl.ret_type)
+
+        if !generic then runner_result(a, f, result)
 
         if generic
             a.release(trial)
@@ -693,7 +695,8 @@ end stand_in
 
 private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string],
                                bounds: Buf[NamedBounds], tvalues: Buf[TypeBinding],
-                               tpacks: Buf[string], params: Buf[Param], ret: Option[TypeRef])
+                               tpacks: Buf[string], params: Buf[Param],
+                               ret: Option[TypeRef]) -> Option[Type]
     // The parameters stand in for themselves **carrying what the declaration asked of them**, which
     // is what lets a signature name a projection off one: `S::Token` is answerable exactly where `S`
     // is bounded by a trait declaring a `Token`.
@@ -702,7 +705,32 @@ private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string],
     for i in 0..<params.len()
         resolve_type(a, scope, params.at(i).typ, subst)
 
-    if ret.is_some() then resolve_result(a, scope, ret.unwrap(), subst)
+    if ret.is_some() then Some(resolve_result(a, scope, ret.unwrap(), subst)) else None
+end resolve_func_signature
+
+// **A `@test` or a hook returns nothing**: the runner reads its verdict off whether it came back, so
+// a value returned beside that is one nothing is going to read. Asked of the RESOLVED result rather
+// than of the syntax, so that `-> unit` is the same as writing none and a result reached through an
+// alias is refused with the rest -- and so the message can name what the function actually returns.
+// Reported at the attribute, as the other runner rules are.
+private runner_result(a: &Analysis, f: Func, result: Option[Type])
+    if result.is_none() || no_value(result.unwrap()) then return
+
+    val shown = type_show(result.unwrap())
+
+    if f.decl.test.is_some()
+        a.fault(f.scope, f.decl.test.unwrap().span,
+                s"a '@test' function returns nothing, and '${f.decl.name}' returns '$shown' — a " +
+                "test's result is whether it came back, so there is nothing to read a value with")
+
+    if f.decl.hook.is_some()
+        val h = f.decl.hook.unwrap()
+
+        a.fault(f.scope, h.span,
+                s"a '@${hook_word(h.kind)}' function returns nothing, and '${f.decl.name}' returns " +
+                s"'$shown' — a hook is called for what it does rather than for what it answers, so " +
+                "there is nothing to read a value with")
+end runner_result
 
 // **Only a concrete member of a concrete type keeps what its signature makes real**, the rule the
 // free functions above follow and for the same reason: a member of a trait, a member of a generic
