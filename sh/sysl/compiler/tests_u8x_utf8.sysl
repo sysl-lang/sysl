@@ -1,0 +1,552 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, replace_all, split}
+
+// The reference's `Utf8Tests`: `sysl.text.from_utf8`, the validator a `[]u8` goes through to become a
+// `string`, held to the Unicode well-formedness table row by row (Table 3-7) -- so an overlong form,
+// a surrogate and a value past 10FFFF are each refused at the SECOND byte, where a decoder that
+// assembles a codepoint and then range-checks it accepts exactly the wrong half of every boundary.
+// Beside it, the one distinction `Utf8Error` carries past the offset: whether the input merely
+// ENDED in the middle of a sequence, which more bytes would fix, or holds one no continuation could
+// rescue. Then `from_utf8_unchecked`, the raw-tier `str_cast` under it, and what a program that never
+// decodes pays for any of this.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.156)** by
+// handing the installed `sysl` the same program. A decoded string's expectation is built from
+// codepoint numbers, most of the interesting ones -- U+0000, U+007F, U+FFFF, U+10FFFF -- not printing.
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private u8x_ready() -> bool
+    if xvr_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end u8x_ready
+
+// The validator is `sysl.text`'s, so every program here asks for it, written once so that no case is
+// about the import.
+private u8x_importing() -> string = "import sysl.text.from_utf8\n\n"
+
+// What a program built from one file does: what it printed, and whether it exited zero. A failure to
+// build is its message and a non-zero exit.
+private u8x_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-u8x").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", u8x_importing() + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text, out.status.ok())
+end u8x_outcome
+
+// A program prints exactly this and exits cleanly.
+private u8x_prints(text: string, want: string)
+    val out = u8x_outcome(text)
+
+    assert_eq(out.0, want)
+    assert(out.1, s"it did not exit cleanly, having printed: ${out.0}")
+
+// Everything a source has to say for itself, taken through the lowering.
+private u8x_err(text: string) -> string
+    val root = make_temp_dir("sysl-u8x").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, u8x_importing() + text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end u8x_err
+
+// A program is refused with this message, anchored at this `line:column` of `main.sysl`.
+private u8x_refused(text: string, message: string, at: string)
+    val said = u8x_err(text)
+
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+// `"C3 A9"` as the array literal holding those bytes.
+private u8x_literal(hex: string) -> string =
+    if hex.is_empty() then "[]" else "[0x" + replace_all(hex, " ", "u8, 0x") + "u8]"
+
+// What `from_utf8` makes of a run of bytes: the text it decoded to, or the failure as `!offset` for
+// a sequence that is wrong and `~offset` for one that is merely unfinished.
+private u8x_decode(hex: string) -> string
+    val program = "var b: []u8 = " + u8x_literal(hex) + "\n" +
+        "var r = from_utf8(b)\n" +
+        "if r.is_ok() then\n" +
+        "    print(\"ok:\" + r.unwrap())\n" +
+        "else\n" +
+        "    var e = r.unwrap_err()\n" +
+        "    print((if e.truncated then \"~\" else \"!\") + str(e.offset))\n"
+
+    val out = u8x_outcome(program)
+
+    if !out.1 then return s"it did not exit cleanly: ${out.0}"
+
+    if out.0.ends_with("\n") then out.0[0..<out.0.len - 1] else out.0
+end u8x_decode
+
+// The success form, so an expectation reads as the codepoints it is about.
+private u8x_ok(cps: []const u32) -> string
+    var s = "ok:"
+
+    for c in cps
+        s = s + str(char(c))
+
+    s
+
+// -- well-formed bytes become a string --------------------------------------------------------------
+
+@test("ascii")
+u8x_ascii()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("68 65 6C 6C 6F"), "ok:hello")
+
+@test("two, three, and four byte sequences")
+u8x_two_three_and_four_byte_sequences()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("C3 A9"), u8x_ok([0xe9]))
+    assert_eq(u8x_decode("E2 82 AC"), u8x_ok([0x20ac]))
+    assert_eq(u8x_decode("F0 9D 84 9E"), u8x_ok([0x1d11e]))
+
+@test("nothing at all is a string too")
+u8x_nothing_at_all_is_a_string_too()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode(""), "ok:")
+
+// A `string` carries its length, so a NUL is an ordinary byte in it.
+@test("an interior NUL is a byte like any other")
+u8x_an_interior_nul_is_a_byte_like_any_other()
+    if !u8x_ready() then return
+
+    u8x_prints(raw"""
+        var b: []u8 = [0x61u8, 0x00u8, 0x62u8]
+        print(from_utf8(b).unwrap().len)
+        """, "3\n")
+
+@test("the widths mixed together")
+u8x_the_widths_mixed_together()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("41 C3 A9 E2 82 AC F0 9D 84 9E 5A"), u8x_ok([0x41, 0xe9, 0x20ac, 0x1d11e, 0x5a]))
+
+// The first and last codepoint each width encodes. A validator built the other way -- decode, then
+// check the number -- gets all eight of these right and still fails the pairs further down.
+@test("the first and last codepoint of every width")
+u8x_the_first_and_last_codepoint_of_every_width()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("00"), u8x_ok([0x0]))
+    assert_eq(u8x_decode("7F"), u8x_ok([0x7f]))
+    assert_eq(u8x_decode("C2 80"), u8x_ok([0x80]))
+    assert_eq(u8x_decode("DF BF"), u8x_ok([0x7ff]))
+    assert_eq(u8x_decode("E0 A0 80"), u8x_ok([0x800]))
+    assert_eq(u8x_decode("EF BF BF"), u8x_ok([0xffff]))
+    assert_eq(u8x_decode("F0 90 80 80"), u8x_ok([0x10000]))
+    assert_eq(u8x_decode("F4 8F BF BF"), u8x_ok([0x10ffff]))
+end u8x_the_first_and_last_codepoint_of_every_width
+
+@test("both sides of the surrogate hole")
+u8x_both_sides_of_the_surrogate_hole()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("ED 9F BF"), u8x_ok([0xd7ff]))
+    assert_eq(u8x_decode("EE 80 80"), u8x_ok([0xe000]))
+
+// -- a byte that can never appear anywhere ----------------------------------------------------------
+
+// `C0` and `C1` could only ever begin an overlong two-byte form, so they are illegal as bytes rather
+// than as sequences.
+@test("C0 and C1 are not lead bytes")
+u8x_c0_and_c1_are_not_lead_bytes()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("C0 80"), "!0")
+    assert_eq(u8x_decode("C1 BF"), "!0")
+
+@test("F5 through FF are past the last codepoint")
+u8x_f5_through_ff_are_past_the_last_codepoint()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("F5 80 80 80"), "!0")
+    assert_eq(u8x_decode("F8 80"), "!0")
+    assert_eq(u8x_decode("FE"), "!0")
+    assert_eq(u8x_decode("FF"), "!0")
+
+@test("a continuation byte with no lead")
+u8x_a_continuation_byte_with_no_lead()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("80"), "!0")
+    assert_eq(u8x_decode("BF"), "!0")
+    assert_eq(u8x_decode("41 80"), "!1")
+
+// -- the second byte decides, and the boundaries are exact ------------------------------------------
+
+@test("E0 rules out the overlong three-byte forms")
+u8x_e0_rules_out_the_overlong_three_byte_forms()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("E0 9F BF"), "!0")
+    assert_eq(u8x_decode("E0 A0 80"), u8x_ok([0x800]))
+
+@test("ED rules out the surrogates")
+u8x_ed_rules_out_the_surrogates()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("ED 9F BF"), u8x_ok([0xd7ff]))
+    assert_eq(u8x_decode("ED A0 80"), "!0")
+    assert_eq(u8x_decode("ED BF BF"), "!0")
+
+@test("F0 rules out the overlong four-byte forms")
+u8x_f0_rules_out_the_overlong_four_byte_forms()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("F0 8F BF BF"), "!0")
+    assert_eq(u8x_decode("F0 90 80 80"), u8x_ok([0x10000]))
+
+@test("F4 rules out everything past 10FFFF")
+u8x_f4_rules_out_everything_past_10ffff()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("F4 8F BF BF"), u8x_ok([0x10ffff]))
+    assert_eq(u8x_decode("F4 90 80 80"), "!0")
+
+@test("and the ordinary rows still take the full range")
+u8x_and_the_ordinary_rows_still_take_the_full_range()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("E1 80 80"), u8x_ok([0x1000]))
+    assert_eq(u8x_decode("EC BF BF"), u8x_ok([0xcfff]))
+    assert_eq(u8x_decode("F1 80 80 80"), u8x_ok([0x40000]))
+    assert_eq(u8x_decode("F3 BF BF BF"), u8x_ok([0xfffff]))
+
+// -- a continuation that is not one -----------------------------------------------------------------
+
+@test("in each position of each width")
+u8x_in_each_position_of_each_width()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("C3 28"), "!0")
+    assert_eq(u8x_decode("E2 28 AC"), "!0")
+    assert_eq(u8x_decode("E2 82 28"), "!0")
+    assert_eq(u8x_decode("F0 9D 84 28"), "!0")
+
+// Two sequences concatenated with a byte lost between them: the common real-world case.
+@test("a lead byte where a continuation belongs")
+u8x_a_lead_byte_where_a_continuation_belongs()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("E2 C3 A9"), "!0")
+    assert_eq(u8x_decode("F0 9D C3 A9"), "!0")
+
+// -- the input that merely ran out ------------------------------------------------------------------
+
+@test("one byte short, at each width")
+u8x_one_byte_short_at_each_width()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("C3"), "~0")
+    assert_eq(u8x_decode("E2 82"), "~0")
+    assert_eq(u8x_decode("F0 9D 84"), "~0")
+
+@test("a lead byte and nothing else")
+u8x_a_lead_byte_and_nothing_else()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("E2"), "~0")
+    assert_eq(u8x_decode("F0"), "~0")
+
+@test("after text that was fine")
+u8x_after_text_that_was_fine()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("68 69 E2 82"), "~2")
+
+// -- unfinished is told from unfixable --------------------------------------------------------------
+
+// Both inputs of each pair are two bytes of a three- or four-byte sequence; a reader of a stream
+// should wait for more on one and give up on the other.
+@test("E0 80 is wrong; E0 A0 is unfinished")
+u8x_e0_80_is_wrong_e0_a0_is_unfinished()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("E0 80"), "!0")
+    assert_eq(u8x_decode("E0 A0"), "~0")
+
+@test("F4 90 is wrong; F4 8F is unfinished")
+u8x_f4_90_is_wrong_f4_8f_is_unfinished()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("F4 90"), "!0")
+    assert_eq(u8x_decode("F4 8F"), "~0")
+
+@test("ED A0 is wrong; ED 9F is unfinished")
+u8x_ed_a0_is_wrong_ed_9f_is_unfinished()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("ED A0"), "!0")
+    assert_eq(u8x_decode("ED 9F"), "~0")
+
+// -- the offset names the byte the bad sequence starts at -------------------------------------------
+
+@test("counted in bytes, not in characters")
+u8x_counted_in_bytes_not_in_characters()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("C3 A9 E2 82 AC FF"), "!5")
+
+@test("after ascii")
+u8x_after_ascii()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("61 62 63 C3 28"), "!3")
+
+// The first fault is the one reported.
+@test("the first fault, not the last")
+u8x_the_first_fault_not_the_last()
+    if !u8x_ready() then return
+
+    assert_eq(u8x_decode("41 FF 42 FE"), "!1")
+
+// -- a decoded string is a string like any other ----------------------------------------------------
+
+@test("it compares, orders, and concatenates against a literal")
+u8x_it_compares_orders_and_concatenates()
+    if !u8x_ready() then return
+
+    u8x_prints(raw"""
+        var b: []u8 = [0xE2u8, 0x82u8, 0xACu8, 0x41u8]
+        var s = from_utf8(b).unwrap()
+        print(s.len, s == "€A", s < "€B", s + "!")
+        """, "4 true true €A!\n")
+
+// Every `string` is well-formed, so feeding one's own bytes back through the validator cannot fail.
+@test("its own bytes revalidate, and to the same string")
+u8x_its_own_bytes_revalidate()
+    if !u8x_ready() then return
+
+    u8x_prints(raw"""
+        var b: []u8 = [0xE2u8, 0x82u8, 0xACu8, 0x41u8]
+        var s = from_utf8(b).unwrap()
+        var again = from_utf8(s.bytes)
+        print(again.is_ok(), again.unwrap() == s)
+        """, "true true\n")
+
+@test("a substring on a character boundary is taken")
+u8x_a_substring_on_a_character_boundary_is_taken()
+    if !u8x_ready() then return
+
+    u8x_prints(raw"""
+        var b: []u8 = [0xE2u8, 0x82u8, 0xACu8, 0x41u8]
+        print(from_utf8(b).unwrap()[3..<4])
+        """, "A\n")
+
+// A substring that would cut a sequence in half traps, exactly as it does for a literal: the
+// reference's program prints nothing and exits 133.
+@test("and one that cuts a sequence in half traps")
+u8x_and_one_that_cuts_a_sequence_in_half_traps()
+    if !u8x_ready() then return
+
+    val out = u8x_outcome(raw"""
+        var b: []u8 = [0xE2u8, 0x82u8, 0xACu8, 0x41u8]
+        print(from_utf8(b).unwrap()[0..<2])
+        """)
+
+    assert(!out.1, s"it exited cleanly, having printed: ${out.0}")
+    assert_eq(out.0, "")
+
+// -- the unchecked conversion -----------------------------------------------------------------------
+
+private u8x_unchecked() -> string = "import sysl.text.from_utf8_unchecked\n"
+
+@test("bytes straight through")
+u8x_bytes_straight_through()
+    if !u8x_ready() then return
+
+    u8x_prints(u8x_unchecked() + raw"""
+        var b: []u8 = [0x68u8, 0x69u8]
+        print(from_utf8_unchecked(b))
+        """, "hi\n")
+
+// It copies rather than viewing: a `[]u8` can be written through afterwards.
+@test("the string it makes does not follow later writes to the bytes")
+u8x_does_not_follow_later_writes()
+    if !u8x_ready() then return
+
+    u8x_prints(u8x_unchecked() + raw"""
+        var b: []u8 = [0x68u8, 0x69u8]
+        var s = from_utf8_unchecked(b)
+        b[0] = 0x4Au8
+        print(s, from_utf8_unchecked(b))
+        """, "hi Ji\n")
+
+@test("and so it may outlive the array it read")
+u8x_and_so_it_may_outlive_the_array_it_read()
+    if !u8x_ready() then return
+
+    u8x_prints(u8x_unchecked() + raw"""
+        name() -> string
+            var a: [3]u8 = [0x61u8, 0x62u8, 0x63u8]
+            from_utf8_unchecked(a[..])
+        print(name())
+        """, "abc\n")
+
+@test("nothing is checked, which is the whole of what it is for")
+u8x_nothing_is_checked()
+    if !u8x_ready() then return
+
+    u8x_prints(u8x_unchecked() + raw"""
+        var b: []u8 = [0xFFu8, 0xFEu8]
+        print(from_utf8_unchecked(b).len)
+        """, "2\n")
+
+@test("an array of bytes is taken as it is, needing no '[..]'")
+u8x_an_array_of_bytes_is_taken_as_it_is()
+    if !u8x_ready() then return
+
+    u8x_prints(u8x_unchecked() + raw"""
+        var a: [3]u8 = [0x61u8, 0x62u8, 0x63u8]
+        print(from_utf8_unchecked(a))
+        """, "abc\n")
+
+// A function, so the wrong argument is an ordinary parameter mismatch.
+@test("a string is not bytes")
+u8x_a_string_is_not_bytes()
+    if !u8x_ready() then return
+
+    u8x_refused(u8x_unchecked() + "print(from_utf8_unchecked(\"hi\"))\n",
+                "'b' of 'sysl.text.from_utf8_unchecked' is []const byte, but string was given", "4:27")
+
+@test("and it must be imported, being a member of a module like any other")
+u8x_and_it_must_be_imported()
+    if !u8x_ready() then return
+
+    u8x_refused("var b: []u8 = [0x68u8, 0x69u8]\nprint(from_utf8_unchecked(b))\n",
+                "undefined function 'from_utf8_unchecked'", "4:7")
+
+// -- the raw-tier form underneath -------------------------------------------------------------------
+
+@test("takes bytes and nothing else")
+u8x_takes_bytes_and_nothing_else()
+    if !u8x_ready() then return
+
+    u8x_refused("print(str_cast(\"hi\"))\n",
+                "'str_cast' makes a string out of bytes, and this value is already a string", "3:7")
+    u8x_refused("print(str_cast(5))\n", "'str_cast' takes a []u8, but the value has type int", "3:7")
+
+@test("one value, no more and no fewer")
+u8x_one_value_no_more_and_no_fewer()
+    if !u8x_ready() then return
+
+    u8x_refused("print(str_cast())\n", "'str_cast' takes exactly one value, the bytes to take as a string",
+                "3:7")
+    u8x_refused("var b: []u8 = [0x61u8]\nprint(str_cast(b, b))\n",
+                "'str_cast' takes exactly one value, the bytes to take as a string", "4:7")
+
+// A form belongs to no module, so an import naming one says so rather than that the name is missing.
+@test("an import naming a form says which situation the reader is in")
+u8x_an_import_naming_a_form()
+    if !u8x_ready() then return
+
+    u8x_refused("import sysl.text.str_cast\nprint(1)\n",
+                "'str_cast' is a built-in form rather than a member of any module — it is in scope " +
+                    "everywhere and needs no import", "3:1")
+
+// The edges of that refusal, each read out of the reference (0.0.156): a braced list anchors at the
+// form's own name, a rename changes nothing, an atomic is a form too, and a word that is not a form
+// keeps the plain complaint.
+@test("an import naming a form is told so in a braced list, under a rename, and for an atomic")
+u8x_an_import_naming_a_form_every_spelling()
+    if !u8x_ready() then return
+
+    val said = "is a built-in form rather than a member of any module — it is in scope everywhere and " +
+        "needs no import"
+
+    u8x_refused("import sysl.text.{split, str_cast}\nprint(1)\n", s"'str_cast' $said", "3:26")
+    u8x_refused("import sysl.text.str_cast as sc\nprint(1)\n", s"'str_cast' $said", "3:1")
+    u8x_refused("import sysl.str_cast\nprint(1)\n", s"'str_cast' $said", "3:1")
+    u8x_refused("import sysl.text.atomic_load\nprint(1)\n", s"'atomic_load' $said", "3:1")
+    u8x_refused("import sysl.text.va_copy\nprint(1)\n", s"'va_copy' $said", "3:1")
+    u8x_refused("import sysl.text.char\nprint(1)\n", "'sysl.text' declares no 'char' — there is no 'sysl.text.char'",
+                "3:1")
+end u8x_an_import_naming_a_form_every_spelling
+
+// -- the error path ---------------------------------------------------------------------------------
+
+@test("the safe form wants bytes too")
+u8x_the_safe_form_wants_bytes_too()
+    if !u8x_ready() then return
+
+    u8x_refused("print(from_utf8(\"hi\").is_ok())\n",
+                "'b' of 'sysl.text.from_utf8' is []const byte, but string was given", "3:17")
+
+// -- what it costs a program that never decodes -----------------------------------------------------
+
+// The text `print(1)` lowers to, with no import of the validator.
+private u8x_print_one() -> string
+    val root = make_temp_dir("sysl-u8x").unwrap()
+    val src = s"$root/main.sysl"
+
+    write_text(src, "print(1)\n").unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> "refused: " + failure_text(why)
+        Ok(made) -> made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end u8x_print_one
+
+// Neither the validator nor anything it reaches is emitted for a program that does not call it; the
+// reference's own text for `print(1)` (0.0.156) names neither symbol.
+@test("the validator is not emitted")
+u8x_the_validator_is_not_emitted()
+    if !u8x_ready() then return
+
+    val out = u8x_print_one()
+
+    assert(!out.starts_with("refused: "), out)
+    assert(!out.contains("@sysl.text$from_utf8("), "the validator was emitted")
+    assert(!out.contains("@sysl.str.from_bytes"), "the string builder was emitted")
+
+// A non-generic library type is laid out where it is declared, so the cost is one type line -- the
+// reference's is `%struct.sysl.text$Utf8Error = type { i64, i1 }`.
+@test("its error type costs exactly one line of layout")
+u8x_its_error_type_costs_one_line_of_layout()
+    if !u8x_ready() then return
+
+    var n = 0
+
+    for line in split(u8x_print_one(), "\n")
+        if line.starts_with("%struct.sysl.text$Utf8Error") then n += 1
+
+    assert_eq(n, 1)
