@@ -1,0 +1,376 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Every place a value can come to have a constrained subtype, and the check that meets it there
+// (`reference/errors.md § Where a constraint is checked`). A value comes to have the type wherever it
+// flows into a slot the type is written on, so the sites are the slots -- a binding, an assignment, a
+// parameter, a result, a field, an element, a payload, a part -- plus the operations that produce one
+// of their own accord.
+//
+// Each site is written twice, once with a value the range accepts and once with the neighbouring
+// value it does not, because a site with no check passes the first and only the second can tell.
+//
+// **Every output and diagnostic quoted here was read out of the reference compiler**, whose
+// `SubtypeProduceSiteTests` these are.
+
+private var sps_library_cache: Buf[Program] = buf()
+private var sps_library_read: bool = false
+
+private sps_library() -> Buf[Program]
+    if sps_library_read then return sps_library_cache
+
+    sps_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> sps_library_cache = units
+
+    sps_library_cache
+end sps_library
+
+private sps_ready() -> bool
+    if sps_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+private sps_can_run() -> bool
+    if !sps_ready() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end sps_can_run
+
+// What the compiler says about a one-file program, or nothing.
+private sps_err(text: string) -> string
+    val root = make_temp_dir("sysl-subtype-produce").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end sps_err
+
+// What a one-file program does: what it printed, and whether it exited zero.
+private sps_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-subtype-produce").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end sps_outcome
+
+// **What a program PRINTS**, where it runs to the end.
+private sps_ran(text: string) -> string
+    val out = sps_outcome(text)
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+
+// Whether a program that BUILT stopped short of exiting zero -- a check that failed.
+private sps_exits(text: string) -> bool
+    val out = sps_outcome(text)
+
+    !out.1 && !out.0.contains("error:")
+
+private sps_age() -> string = "type Age = int within 0..150\n"
+private sps_slot() -> string = "type Slot = new u8 within 0..<200\n"
+private sps_p() -> string = sps_age() + "struct P\n    age: Age\n    tag: int\n"
+
+// -- a value flowing into a slot the subtype is written on --------------------------------------------
+
+@test("produce site: a local's initializer")
+sps_a_locals_initializer()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var a: Age = 30\nprint(a)"), "30\n")
+    assert(sps_exits(sps_age() + "var a: Age = 200\nprint(a)"))
+
+@test("produce site: a later assignment to it")
+sps_a_later_assignment_to_it()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var a: Age = 30\na = 40\nprint(a)"), "40\n")
+    assert(sps_exits(sps_age() + "var a: Age = 30\na = 200\nprint(a)"))
+
+@test("produce site: one arm of a multi-assignment")
+sps_one_arm_of_a_multi_assignment()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var a: Age = 1\nvar b: Age = 2\na, b = 30, 40\nprint(a, b)"), "30 40\n")
+    assert(sps_exits(sps_age() + "var a: Age = 1\nvar b: Age = 2\na, b = 30, 200\nprint(a, b)"))
+
+@test("produce site: a module-level variable, written before anything runs")
+sps_a_module_level_variable()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var g: Age = 30\nprint(g)"), "30\n")
+    assert(sps_exits(sps_age() + "var g: Age = 200\nprint(g)"))
+
+@test("produce site: an argument at a call")
+sps_an_argument_at_a_call()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "f(a: Age) -> int\n    int(a)\nprint(f(30))"), "30\n")
+    assert(sps_exits(sps_age() + "f(a: Age) -> int\n    int(a)\nprint(f(200))"))
+
+@test("produce site: a function's result")
+sps_a_functions_result()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "g(n: int) -> Age\n    n\nprint(g(30))"), "30\n")
+    assert(sps_exits(sps_age() + "g(n: int) -> Age\n    n\nprint(g(200))"))
+
+@test("produce site: an explicit cast")
+sps_an_explicit_cast()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "print(Age(30))"), "30\n")
+    assert(sps_exits(sps_age() + "print(Age(200))"))
+
+@test("produce site: a write through a pointer")
+sps_a_write_through_a_pointer()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var a: Age = 1\nvar p = &a\n*p = 30\nprint(a)"), "30\n")
+    assert(sps_exits(sps_age() + "var a: Age = 1\nvar p = &a\n*p = 200\nprint(a)"))
+
+// -- a value flowing into a slot inside something else ------------------------------------------------
+
+@test("produce site: a field named by the positional constructor")
+sps_a_field_named_by_the_positional_constructor()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_p() + "var p = P(30, 1)\nprint(p.age)"), "30\n")
+    assert(sps_exits(sps_p() + "var p = P(200, 1)\nprint(p.age)"))
+
+@test("produce site: a field written later")
+sps_a_field_written_later()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_p() + "var p = P(30, 1)\np.age = 40\nprint(p.age)"), "40\n")
+    assert(sps_exits(sps_p() + "var p = P(30, 1)\np.age = 200\nprint(p.age)"))
+
+@test("produce site: a field reached through a pointer")
+sps_a_field_reached_through_a_pointer()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_p() + "var p = P(30, 1)\nvar q = &p\nq.age = 40\nprint(p.age)"), "40\n")
+    assert(sps_exits(sps_p() + "var p = P(30, 1)\nvar q = &p\nq.age = 200\nprint(p.age)"))
+
+@test("produce site: an element of an array literal")
+sps_an_element_of_an_array_literal()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var xs: [2]Age = [30, 40]\nprint(xs[0], xs[1])"), "30 40\n")
+    assert(sps_exits(sps_age() + "var xs: [2]Age = [30, 200]\nprint(xs[0], xs[1])"))
+
+@test("produce site: an element written by index")
+sps_an_element_written_by_index()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var xs: [2]Age = [1, 2]\nxs[0] = 30\nprint(xs[0])"), "30\n")
+    assert(sps_exits(sps_age() + "var xs: [2]Age = [1, 2]\nxs[0] = 200\nprint(xs[0])"))
+
+@test("produce site: an element written through a view of that array")
+sps_an_element_written_through_a_view()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var xs: [2]Age = [1, 2]\nvar v = xs[..]\nv[0] = 30\nprint(xs[0])"), "30\n")
+    assert(sps_exits(sps_age() + "var xs: [2]Age = [1, 2]\nvar v = xs[..]\nv[0] = 200\nprint(xs[0])"))
+
+@test("produce site: a part of a tuple")
+sps_a_part_of_a_tuple()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var t: (Age, int) = (30, 1)\nprint(t.0)"), "30\n")
+    assert(sps_exits(sps_age() + "var t: (Age, int) = (200, 1)\nprint(t.0)"))
+
+@test("produce site: a part written later")
+sps_a_part_written_later()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var t: (Age, int) = (30, 1)\nt.0 = 40\nprint(t.0)"), "40\n")
+    assert(sps_exits(sps_age() + "var t: (Age, int) = (30, 1)\nt.0 = 200\nprint(t.0)"))
+
+private sps_payload(v: string) -> string =
+    sps_age() + s"var o: Option[Age] = Some($v)\no match\n    Some(v) -> print(v)\n    None -> print(0)\n"
+
+@test("produce site: the payload of an enum variant")
+sps_the_payload_of_an_enum_variant()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_payload("30")), "30\n")
+    assert(sps_exits(sps_payload("200")))
+
+// A generic container's element type is a type *argument*, so the slot the value lands in is written
+// `T` and only the instantiation says it is constrained. The check has to follow the argument, not the
+// spelling.
+@test("produce site: an item pushed into a container instantiated at the subtype")
+sps_an_item_pushed_into_a_container()
+    if !sps_can_run() then return
+
+    val holding = "import sysl.buf.*\n\n" + sps_age()
+
+    assert_eq(sps_ran(holding + "var b: Buf[Age] = buf()\nb.push(30)\nprint(b[0])"), "30\n")
+    assert(sps_exits(holding + "var b: Buf[Age] = buf()\nb.push(200)\nprint(b[0])"))
+
+// -- a value flowing out of a body whose result type is the subtype -----------------------------------
+
+@test("produce site: a closure's")
+sps_a_closures()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var f: &Fn(int) -> Age = x -> x\nprint(f(30))"), "30\n")
+    assert(sps_exits(sps_age() + "var f: &Fn(int) -> Age = x -> x\nprint(f(200))"))
+
+private sps_nested(v: string) -> string =
+    sps_age() + s"outer(n: int) -> int\n    inner(x: int) -> Age\n        x\n    int(inner(n))\nprint(outer($v))\n"
+
+@test("produce site: a nested function's")
+sps_a_nested_functions()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_nested("30")), "30\n")
+    assert(sps_exits(sps_nested("200")))
+
+private sps_through_trait(v: string) -> string =
+    sps_age() + "trait Aged\n    age(self) -> Age\nstruct P\n    n: int\n" +
+        s"impl Aged for P\n    age(self) -> Age\n        self.n\nvar p = P($v)\nprint(p.age())\n"
+
+@test("produce site: a method's, reached through the trait it implements")
+sps_a_methods_reached_through_the_trait()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_through_trait("30")), "30\n")
+    assert(sps_exits(sps_through_trait("200")))
+
+// -- a value the subtype's own operations produce -----------------------------------------------------
+
+// Only a derived subtype has an operation whose result is one (`reference/errors.md § A derivation
+// inherits its base's behaviour and may replace none of it`); the other two compute and store in one
+// step. `tests_subtype_operator.sysl` is where these are worked out.
+@test("produce site: arithmetic on a derived subtype")
+sps_arithmetic_on_a_derived_subtype()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_slot() + "print(Slot(100) + Slot(50))"), "150\n")
+    assert(sps_exits(sps_slot() + "print(Slot(199) + Slot(1))"))
+
+@test("produce site: a compound assignment")
+sps_a_compound_assignment()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var a: Age = 30\na += 10\nprint(a)"), "40\n")
+    assert(sps_exits(sps_age() + "var a: Age = 30\na += 200\nprint(a)"))
+
+@test("produce site: an increment")
+sps_an_increment()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var a: Age = 30\na++\nprint(a)"), "31\n")
+    assert(sps_exits(sps_age() + "var a: Age = 150\na++\nprint(a)"))
+
+// -- a value already of the type is passed along, not produced again ----------------------------------
+
+// These pin that the sites above are the ones that matter, not that nothing else may ever be checked:
+// a compiler that checked here anyway would still pass.
+@test("produce site: reading one and printing it")
+sps_reading_one_and_printing_it()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var a: Age = 30\nvar b = a\nprint(b)"), "30\n")
+
+@test("produce site: handing one to a parameter of the same type")
+sps_handing_one_to_a_parameter_of_the_same_type()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "f(a: Age) -> Age\n    a\nvar a: Age = 30\nprint(f(a))"), "30\n")
+
+@test("produce site: using one as its base, which needs no cast")
+sps_using_one_as_its_base()
+    if !sps_can_run() then return
+
+    assert_eq(sps_ran(sps_age() + "var a: Age = 30\nvar n: int = a\nprint(n + 1)"), "31\n")
+
+// Passing one to a *different* subtype over the same base is a produce site again, which is what keeps
+// a wider type from leaking into a narrower one.
+@test("produce site: but a different subtype over the same base is checked again")
+sps_a_different_subtype_is_checked_again()
+    if !sps_can_run() then return
+
+    val both = sps_age() + "type Small = int within 0..10\nnarrow(a: Age) -> Small\n    a\n"
+
+    assert_eq(sps_ran(both + "print(narrow(Age(5)))"), "5\n")
+    assert(sps_exits(both + "print(narrow(Age(100)))"))
+
+// -- a slot with no written value is refused rather than zeroed ---------------------------------------
+
+// A constrained subtype has no zero value, whether or not its range contains one, so a declaration
+// with no initializer is refused and there is nothing to check. The rule is the type's, not the
+// range's: widening or narrowing a range never changes whether a declaration elsewhere compiles.
+@test("produce site: a subtype whose range excludes zero has no zero value")
+sps_a_range_excluding_zero_has_no_zero_value()
+    if !sps_ready() then return
+
+    val said = sps_err("type Tens = u8 within 10..20\nvar a: Tens")
+
+    assert(said.contains("Tens has no zero value, so 'a' needs an initial value"), said)
+
+@test("produce site: nor does one whose range contains it")
+sps_nor_does_one_whose_range_contains_it()
+    if !sps_ready() then return
+
+    val said = sps_err("type Small = u8 within 0..20\nvar a: Small")
+
+    assert(said.contains("Small has no zero value, so 'a' needs an initial value"), said)
+
+@test("produce site: and the refusal reaches through a struct, whose zero is its fields'")
+sps_the_refusal_reaches_through_a_struct()
+    if !sps_ready() then return
+
+    val said = sps_err("type Tens = u8 within 10..20\nstruct P\n    a: Tens\nvar p: P")
+
+    assert(said.contains("P has no zero value, so 'p' needs an initial value"), said)
+
+@test("produce site: an array of them is refused for the same reason")
+sps_an_array_of_them_is_refused()
+    if !sps_ready() then return
+
+    val said = sps_err("type Tens = u8 within 10..20\nvar xs: [2]Tens")
+
+    assert(said.contains("[2]Tens has no zero value, so 'xs' needs an initial value"), said)
