@@ -320,8 +320,9 @@ private nested_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
         // the variable itself -- one dereference further, and a place, which is what lets a nested
         // function assign to it.
         val reached = stored match
-            Ptr(pointee) -> (inner.bind(captured.at(i), *pointee), TExpr(span, TDeref(field, *pointee)))
-            _ -> (inner.bind(captured.at(i), stored), field)
+            Ptr(pointee) ->
+                (bind_capture(cx, inner, captured.at(i), *pointee), TExpr(span, TDeref(field, *pointee)))
+            _ -> (bind_capture(cx, inner, captured.at(i), stored), field)
 
         // A by-name parameter of the frame is one in the nested function too: a read calls it.
         if reads_by_name(cx, captured.at(i)) then inner.by_name.push(reached.0)
@@ -357,6 +358,17 @@ private nested_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     TFunc(span, fname, params, ret, block, d.variadic, contract.0, contract.1, contract.2, true,
           None, false, contract.3, false, false, None, None, None, None, no_marks(), inner.owner)
 end nested_body
+
+// Binds a capture in the nested function's own scope under the promise the frame made about it: the
+// environment reaches the variable itself, so a `val` (or a pattern's binding) is written once here
+// exactly as it is in the frame, and a write to it is refused in the frame's words.
+private bind_capture(cx: &Analyzer, inner: &Analyzer, name: string, ty: Type) -> string
+    val local = cx.lookup(name)
+
+    if local.is_some() && local.unwrap().from_pattern then return inner.bind_pattern(name, ty)
+    if local.is_some() && local.unwrap().read_only then return inner.bind_read_only(name, ty)
+
+    inner.bind(name, ty)
 
 // A group with nothing in it, which is what a closure has: it is one body and not a block of them.
 no_siblings() -> Buf[(string, &Nested)] = buf()
