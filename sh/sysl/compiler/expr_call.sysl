@@ -465,7 +465,7 @@ type_args_at_selection(cx: &Analyzer, span: Span, head: (string, string), targ_e
 
         targs.push(t)
 
-    reinstantiate(cx.an, head.0, targs) match
+    reinstantiate_at(cx.an, cx.scope, span, head.0, targs) match
         Enum(d) ->
             val v = d.variant(sel)
 
@@ -839,7 +839,12 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
                 return bad_expr(span)
             end if
 
-        reinstantiate(cx.an, key, targs) match
+        // Built at arguments the program never spelled, so their bounds are asked here, at the
+        // constructor. A position that expects this very struct has asked them where its type was
+        // written, and asking again would say one mistake twice.
+        val at = if named_targs.is_empty() && expects_struct(expected, key) then span_zero() else span
+
+        reinstantiate_at(cx.an, cx.scope, at, key, targs) match
             Struct(d) -> inst = Some(Struct(d))
             _ -> return bad_expr(span)
     end if
@@ -890,6 +895,11 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
             checked_new(cx, span, TExpr(span, TStructNew(d, ts)), d)
         _ -> bad_expr(span)
 end struct_call
+
+// Whether the position expects an instantiation of the struct declared under `key`.
+private expects_struct(expected: Option[Type], key: string) -> bool = expected match
+    Some(Struct(d)) -> d.base == key
+    _ -> false
 
 // Which written value fills which field. The rule is the parameter list's, read over a record: a
 // name chooses its slot, everything else takes the next one, and a field is filled once.
@@ -1332,7 +1342,7 @@ private variant_instance(cx: &Analyzer, span: Span, named_at: Span, key: string,
             return VsSaid
         end if
 
-    reinstantiate(cx.an, key, targs) match
+    reinstantiate_at(cx.an, cx.scope, named_at, key, targs) match
         Enum(d) ->
             val v = d.variant(vd.name)
 
@@ -1487,7 +1497,7 @@ private applied_variant(cx: &Analyzer, receiver: Expr, member: string) -> Varian
 
                 targs.push(t)
 
-            reinstantiate(cx.an, key.unwrap(), targs) match
+            reinstantiate_at(cx.an, cx.scope, receiver.span, key.unwrap(), targs) match
                 Enum(d) -> d.variant(member) match
                     Some(v) -> VsFound(Enum(d), v)
                     None -> VsNone
