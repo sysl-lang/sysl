@@ -1,0 +1,629 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// **`--link-path`, `--include-path` and `-D` end to end**: a library that is really on the disk,
+// really outside the toolchain's search path, and really linked against. `tests_search_paths.sysl`
+// asserts the command line these flags make; this file asserts that the command line works, which
+// is a different claim -- only a link proves clang agreed with a `-L`.
+//
+// **Each case is written as a pair**: the failure without the flag is half the test, since a flag
+// that reached a command line clang would have accepted anyway proves nothing.
+//
+// Every message and output here was read off the reference (0.0.158) run over the same trees. Where
+// the reference's `build-lib` takes `-o` and writes an artifact, this compiler's takes none and says
+// `checked <root>` (`tests_lbl_build_lib.sysl`); the requirement it is asked is the same. The two
+// `prove` cases wait for that command, which this compiler does not have.
+
+// -- the probe library ----------------------------------------------------------------------------
+
+// A probe library can be built only where there is a clang and an llvm-ar, as well as the library.
+private spx_ready() -> bool = lbr_ready() && find_ar(None).is_ok()
+
+// A C library at a path nothing searches: a header, an archive, and no relationship to any directory
+// clang was built knowing about. Answers the directory holding both, the header's and the archive's.
+//
+// `42` rather than `1`, so a link that resolved the wrong symbol produces a different number rather
+// than a plausible one. The header's macro lets a `c const` block reach it as well as a `.c` file.
+private spx_probe() -> (string, string, string)
+    val root = lbr_temp("sysl-spx-probe")
+    val include = s"$root/include"
+    val lib = s"$root/lib"
+
+    make_dir_all(include).unwrap()
+    make_dir_all(lib).unwrap()
+    write_text(s"$include/probe.h", "#define PROBE_WIDTH 41\nint probe_answer(void);\n").unwrap()
+    write_text(s"$lib/probe.c", "#include <probe.h>\nint probe_answer(void) { return 42; }\n").unwrap()
+
+    val compiled = capture("clang", ["-c", s"-I$include", s"$lib/probe.c", "-o", s"$lib/probe.o"],
+        "", [], true).unwrap()
+
+    assert(compiled.status.ok(), s"the probe library did not compile: ${compiled.text}")
+
+    var members: Buf[string] = buf()
+
+    members.push(s"$lib/probe.o")
+    archive(find_ar(None).unwrap(), members, s"$lib/libprobe.a").unwrap()
+    (root, include, lib)
+end spx_probe
+
+// A program reaching the probe library by `@link` alone -- no C of its own, so the only thing that
+// can fail is finding `libprobe.a`.
+private spx_calling() -> string =
+    lbr_program("@link(\"probe\")\n\nextern \"probe_answer\" c_answer() -> int\n\nprint(c_answer())\n")
+
+// The module every project below shares: a sysl surface over a shim that includes the probe's header.
+private spx_shim_module(name: string) -> string =
+    s"module m\n@link(\"probe\")\n\nextern \"shim_$name\" c_$name() -> int\n\n$name() -> int = c_$name()\n"
+
+private spx_doubling_c() -> string =
+    "#include <probe.h>\nint shim_doubled(void) { return probe_answer() * 2; }\n"
+
+// The manifest of a package saying out loud which headers its C includes.
+private spx_manifest() -> string =
+    "package { name = \"declared\" }\nrequires {\n" +
+    "  headers { probe = \"the probe library's headers, wherever this machine keeps them\" }\n}\n"
+
+private spx_note() -> string = "the probe library's headers, wherever this machine keeps them"
+
+// The refusal a build stops on where nothing answered the requirement, naming `who` declared it.
+private spx_refusal(who: string) -> string =
+    s"error: $who needs the 'probe' headers and nothing supplied them — ${spx_note()}. Say where " +
+    "they are with '--include-path probe=<dir>'"
+
+// A project whose carried C includes the probe's header and calls into it, so the build needs both
+// the include path and the link path and fails at whichever is missing.
+private spx_doubling() -> string
+    var files = lbr_two("main.sysl", "print(m.doubled())\n", "m/m.sysl", spx_shim_module("doubled"))
+
+    files.push(("m/shim.c", spx_doubling_c()))
+    lbr_tree(files)
+end spx_doubling
+
+// A project whose carried C refuses to compile until the host says what it is configured with --
+// the shape of every real SDK header, written small.
+private spx_configured() -> string
+    var files = lbr_two("main.sysl", "print(m.scaled())\n", "m/m.sysl", spx_shim_module("scaled"))
+
+    files.push(("m/shim.c",
+        "#include <probe.h>\n#ifndef PROBE_SCALE\n#error the host project has to say what scale it " +
+        "builds at\n#endif\nint shim_scaled(void) { return probe_answer() * PROBE_SCALE; }\n"))
+    lbr_tree(files)
+end spx_configured
+
+// The doubling shim again, with a `package.hocon` saying which headers its C includes. `main` names
+// whether it is a project (with a program) or a library (without one).
+private spx_declaring(main: bool) -> string
+    var files = lbr_two("package.hocon", spx_manifest(), "m/m.sysl", spx_shim_module("doubled"))
+
+    files.push(("m/shim.c", spx_doubling_c()))
+
+    if main then files.push(("main.sysl", "print(m.doubled())\n"))
+
+    lbr_tree(files)
+end spx_declaring
+
+// The same declaring project, plus a `@test` to collect and a `c const` block, so the header is
+// wanted by the *analysis* and not only by the C compilation.
+private spx_declaring_with_tests() -> string
+    var files = lbr_two("package.hocon", spx_manifest(), "main.sysl", "print(m.doubled())\n")
+
+    files.push(("m/m.sysl",
+        "module m\n@link(\"probe\")\n@include(\"probe.h\")\n\nc const\n    WIDTH: int = \"PROBE_WIDTH\"\n\n" +
+        "extern \"shim_doubled\" c_doubled() -> int\n\ndoubled() -> int = c_doubled()\n" +
+        "width() -> int = WIDTH\n"))
+    files.push(("m/shim.c", spx_doubling_c()))
+    files.push(("m/tests.sysl",
+        "module m\n@tests\n\n@test\nthe_header_reached_both_halves()\n" +
+        "    assert_eq(width(), 41, \"the c const block was compiled against the header\")\n" +
+        "    assert_eq(doubled(), 84, \"and the shim was too, and linked\")\n"))
+    lbr_tree(files)
+end spx_declaring_with_tests
+
+// A project whose only need of a header is a `c const` block -- no shim, so every failure is the
+// probe's.
+private spx_measuring() -> string = lbr_tree(lbr_two(
+    "main.sysl", "print(m.width())\n",
+    "m/m.sysl", "module m\n@include(\"probe.h\")\n\nc const\n    WIDTH: int = \"PROBE_WIDTH\"\n\nwidth() -> int = WIDTH\n"))
+
+// What the program a command line builds prints, or what stopped it: `args` with `-o` added.
+private spx_ran(args: []string) -> string
+    val out_dir = lbr_temp("sysl-spx-exe")
+    var full: Buf[string] = buf()
+
+    for a in args
+        full.push(a)
+
+    full.push("-o")
+    full.push(s"$out_dir/program")
+
+    val said = lbr_cli(full.view())
+
+    if said.0 != Fine
+        lbr_drop([out_dir])
+        return s"refused: ${said.1}"
+
+    val answer = capture(s"$out_dir/program", [], "", [], true) match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    lbr_drop([out_dir])
+    answer
+end spx_ran
+
+// -- a library outside the toolchain's search path ------------------------------------------------
+
+@test("cannot be linked against without being pointed at, which is the whole gap")
+spx_unlinked_without_a_path()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val prog = spx_calling()
+    val said = lbr_cli(["sysl", "run", prog])
+
+    assert_eq(said.0, Failed, said.1)
+    assert(said.1.contains("library 'probe' not found"), said.1)
+    lbr_drop([probe.0, prog])
+end spx_unlinked_without_a_path
+
+@test("and links once --link-path names where it is")
+spx_links_with_a_path()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val prog = spx_calling()
+
+    assert_eq(spx_ran(["sysl", "build", prog, "--link-path", probe.2]), "42\n")
+    lbr_drop([probe.0, prog])
+end spx_links_with_a_path
+
+// A directory that holds nothing is not an error -- clang searches it and moves on -- so the one
+// that does hold the library still has to be reached.
+@test("is found among several paths rather than only as the first")
+spx_found_among_several()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val prog = spx_calling()
+    val empty = lbr_temp("sysl-spx-empty")
+
+    assert_eq(spx_ran(["sysl", "build", prog, "--link-path", empty, "--link-path", probe.2]), "42\n")
+    lbr_drop([probe.0, prog, empty])
+end spx_found_among_several
+
+// -- a header outside the toolchain's search path -------------------------------------------------
+
+@test("stops the build at the include, before anything reaches a linker")
+spx_stops_at_the_include()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val app = spx_doubling()
+    val said = lbr_cli(["sysl", "run", app])
+
+    assert_eq(said.0, Failed, said.1)
+    assert(said.1.contains("fatal error: 'probe.h' file not found"), said.1)
+    lbr_drop([probe.0, app])
+end spx_stops_at_the_include
+
+// Given only where the library is, the build gets no further: the header is still not found.
+@test("and --link-path alone does not answer it")
+spx_link_path_alone_is_not_enough()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val app = spx_doubling()
+    val said = lbr_cli(["sysl", "run", app, "--link-path", probe.2])
+
+    assert_eq(said.0, Failed, said.1)
+    assert(said.1.contains("fatal error: 'probe.h' file not found"), said.1)
+    lbr_drop([probe.0, app])
+end spx_link_path_alone_is_not_enough
+
+// 84 rather than 42: the shim compiled against the real header and the archive resolved the
+// function it calls, so neither half can be missing.
+@test("and the two together build a binding that could not be built at all before")
+spx_both_paths_build_the_binding()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val app = spx_doubling()
+
+    assert_eq(spx_ran(["sysl", "build", app, "--link-path", probe.2, "--include-path", probe.1]), "84\n")
+    lbr_drop([probe.0, app])
+end spx_both_paths_build_the_binding
+
+// -- a header that configures itself with a macro -------------------------------------------------
+
+// Every path is right and the build still stops, inside the header's own `#error`.
+@test("stops the build even with every path it asked for")
+spx_a_configuring_header_stops_the_build()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val app = spx_configured()
+    val said = lbr_cli(["sysl", "run", app, "--link-path", probe.2, "--include-path", probe.1])
+
+    assert_eq(said.0, Failed, said.1)
+    assert(said.1.contains("error: the host project has to say what scale it builds at"), said.1)
+    lbr_drop([probe.0, app])
+end spx_a_configuring_header_stops_the_build
+
+// 126: the macro reached the shim as a *value* and not merely as a defined name.
+@test("and builds once --define supplies what the header wanted")
+spx_a_define_answers_the_header()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val app = spx_configured()
+
+    assert_eq(spx_ran(["sysl", "build", app, "--link-path", probe.2, "--include-path", probe.1,
+                       "--define", "PROBE_SCALE=3"]), "126\n")
+    lbr_drop([probe.0, app])
+end spx_a_define_answers_the_header
+
+// -- as written on a command line -----------------------------------------------------------------
+
+// Reads a command line's where-it-is flags afresh, answering how many of them were taken.
+private spx_parsed(args: []string) -> int
+    reset_search_paths()
+
+    var i: usize = 0
+    var took_any = 0
+
+    while i < args.len
+        val took = took_search_flag(args, i)
+
+        if took <= 0
+            i += 1
+        else
+            took_any += 1
+            i += usize(took)
+
+    took_any
+end spx_parsed
+
+@test("all three are repeatable, and keep the order given")
+spx_the_flags_repeat_in_order()
+    val took = spx_parsed(["run", "p.sysl", "--link-path", "/one", "--link-path", "/two",
+                           "--include-path", "/inc", "--define", "A", "--define", "B=2"])
+
+    assert_eq(took, 5)
+    assert_eq(join(link_search_flags().view(), " "), "-L/one -L/two")
+    assert_eq(join(include_flags().view(), " "), "-I/inc")
+    assert_eq(join(define_flags().view(), " "), "-DA -DB=2")
+    reset_search_paths()
+end spx_the_flags_repeat_in_order
+
+// `-D` is what a C build system already writes.
+@test("and --define has clang's own short spelling")
+spx_define_has_the_short_spelling()
+    assert_eq(spx_parsed(["run", "p.sysl", "-D", "NDEBUG"]), 1)
+    assert_eq(join(define_flags().view(), " "), "-DNDEBUG")
+    reset_search_paths()
+end spx_define_has_the_short_spelling
+
+@test("and a build that names none of them carries none")
+spx_no_flags_carry_nothing()
+    assert_eq(spx_parsed(["run", "p.sysl"]), 0)
+    assert(link_search_flags().is_empty(), "no link path")
+    assert(include_flags().is_empty(), "no include path")
+    assert(define_flags().is_empty(), "no define")
+    reset_search_paths()
+end spx_no_flags_carry_nothing
+
+// The named form is the same flag, so the directory reaches the C compiler exactly as a bare one does.
+@test("a named --include-path is both a path and an answer")
+spx_a_named_include_is_both()
+    assert_eq(spx_parsed(["run", "p.sysl", "--include-path", "lwip=/sdk/lwip/include"]), 1)
+    assert_eq(join(include_flags().view(), " "), "-I/sdk/lwip/include")
+    assert(supplied_include("lwip"), "the name answers a requirement")
+    reset_search_paths()
+end spx_a_named_include_is_both
+
+@test("and a bare one is only a path")
+spx_a_bare_include_is_only_a_path()
+    assert_eq(spx_parsed(["run", "p.sysl", "--include-path", "/opt/homebrew/include"]), 1)
+    assert_eq(join(include_flags().view(), " "), "-I/opt/homebrew/include")
+    assert(!supplied_include("/opt/homebrew/include"), "a directory answers nothing")
+    assert(!supplied_include("opt"), "nor does any part of one")
+    reset_search_paths()
+end spx_a_bare_include_is_only_a_path
+
+// -- the named --include-path form ----------------------------------------------------------------
+
+// The pair a spelling splits into, as one string, or `None`.
+private spx_split(text: string) -> string = named_include(text) match
+    Some(pair) -> s"${pair.0} -> ${pair.1}"
+    None -> "None"
+
+@test("takes a name and a directory")
+spx_named_takes_a_name_and_a_directory()
+    assert_eq(spx_split("lwip=/sdk/include"), "lwip -> /sdk/include")
+
+@test("allows the punctuation a package name uses")
+spx_named_allows_package_punctuation()
+    assert_eq(spx_split("pico-sdk_2=/x"), "pico-sdk_2 -> /x")
+
+// A `.pc` name is not the package author's to choose, so the split reads the wider spelling.
+@test("allows the dot and the '+' a pkg-config module name may hold")
+spx_named_allows_pkg_config_punctuation()
+    assert_eq(spx_split("yaml-0.1=/x"), "yaml-0.1 -> /x")
+    assert_eq(spx_split("glib-2.0=/x"), "glib-2.0 -> /x")
+    assert_eq(spx_split("gtk+-3.0=/x"), "gtk+-3.0 -> /x")
+
+// A relative directory starts with a dot and a name may not, so these are still paths.
+@test("is not a name where a dot begins it, which is what a relative directory does")
+spx_named_not_where_a_dot_begins()
+    assert_eq(spx_split("./x=y"), "None")
+    assert_eq(spx_split(".=y"), "None")
+
+// The path is the rest of the string, so a directory holding an `=` arrives whole.
+@test("splits at the first '=' and keeps the rest")
+spx_named_splits_at_the_first_equals()
+    assert_eq(spx_split("lwip=/sdk/a=b/include"), "lwip -> /sdk/a=b/include")
+
+@test("is not a name where there is no '='")
+spx_named_not_without_an_equals()
+    assert_eq(spx_split("/opt/homebrew/include"), "None")
+
+@test("is not a name where what precedes the '=' could not be one")
+spx_named_not_where_the_name_could_not_be_one()
+    assert_eq(spx_split("/opt/x=y"), "None")
+    assert_eq(spx_split("../x=y"), "None")
+    assert_eq(spx_split("2fast=y"), "None")
+    assert_eq(spx_split("=y"), "None")
+
+// Taking it as a directory is the reading that fails where the reader can see it.
+@test("is not a name where nothing follows the '='")
+spx_named_not_where_nothing_follows()
+    assert_eq(spx_split("lwip="), "None")
+
+// -- a package that declares the headers it needs -------------------------------------------------
+
+// The build stops naming the requirement, the reason and the flag, before clang has run at all.
+@test("is refused by name rather than by a header the reader has never heard of")
+spx_a_declaration_is_refused_by_name()
+    if !lbr_ready() then return
+
+    val app = spx_declaring(true)
+    val said = lbr_cli(["sysl", "build", app])
+
+    assert_eq(said.0, Failed, said.1)
+    assert_eq(said.1, spx_refusal("this project"))
+    lbr_drop([app])
+end spx_a_declaration_is_refused_by_name
+
+// A bare path compiles the C perfectly well and is deliberately not an answer.
+@test("is not answered by a bare --include-path")
+spx_a_bare_path_is_no_answer()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val app = spx_declaring(true)
+    val said = lbr_cli(["sysl", "build", app, "--include-path", probe.1])
+
+    assert_eq(said.0, Failed, said.1)
+    assert_eq(said.1, spx_refusal("this project"))
+    lbr_drop([probe.0, app])
+end spx_a_bare_path_is_no_answer
+
+@test("and builds once the named form answers it")
+spx_the_named_form_answers_a_declaration()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val app = spx_declaring(true)
+
+    assert_eq(spx_ran(["sysl", "build", app, "--link-path", probe.2, "--include-path",
+                       s"probe=${probe.1}"]), "84\n")
+    lbr_drop([probe.0, app])
+end spx_the_named_form_answers_a_declaration
+
+// A `c const` block over the declared header wants the path in the analysis, and `sysl test` is how
+// a package's own suite runs -- two reasons to want it, reached by a different call from `build`'s.
+@test("and the named form carries a 'c const' block through 'sysl test' as well")
+spx_the_named_form_reaches_a_test_build()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val app = spx_declaring_with_tests()
+    val said = lbr_cli(["sysl", "test", app, "--link-path", probe.2, "--include-path", s"probe=${probe.1}"])
+
+    assert_eq(said.0, Fine, said.1)
+    assert(said.1.contains("ok    the_header_reached_both_halves"), said.1)
+    assert(said.1.contains("1 passed, 0 failed"), said.1)
+    lbr_drop([probe.0, app])
+end spx_the_named_form_reaches_a_test_build
+
+@test("and that same tree is refused when nothing supplies the headers")
+spx_a_test_build_is_refused_without_the_headers()
+    if !lbr_ready() then return
+
+    val app = spx_declaring_with_tests()
+    val said = lbr_cli(["sysl", "test", app])
+
+    assert_eq(said.0, Failed, said.1)
+    assert_eq(said.1, spx_refusal("this project"))
+    lbr_drop([app])
+end spx_a_test_build_is_refused_without_the_headers
+
+// A command that compiles no C has nothing unmet.
+@test("and does not hold up a command that compiles no C")
+spx_emit_llvm_is_not_held_up()
+    if !lbr_ready() then return
+
+    val app = spx_declaring(true)
+    val said = lbr_cli(["sysl", "emit-llvm", app])
+
+    assert_eq(said.0, Fine, said.1)
+    lbr_drop([app])
+end spx_emit_llvm_is_not_held_up
+
+// -- a declaring package reached as a --lib source root -------------------------------------------
+
+// The declaring package as a library, and a consumer of it in a directory of its own.
+private spx_library_and_consumer() -> (string, string)
+    val lib = spx_declaring(false)
+    val consumer = lbr_program("print(m.doubled())\n")
+
+    (lib, consumer)
+end spx_library_and_consumer
+
+@test("is refused by name rather than by a header the reader has never heard of (a --lib root)")
+spx_a_roots_declaration_is_refused_by_name()
+    if !lbr_ready() then return
+
+    val pair = spx_library_and_consumer()
+    val said = lbr_cli(["sysl", "build", pair.1, "--lib", pair.0])
+
+    assert_eq(said.0, Failed, said.1)
+    assert_eq(said.1, spx_refusal(pair.0))
+    assert(!said.1.contains("probe.h"), "clang was never asked")
+    lbr_drop([pair.0, pair.1])
+end spx_a_roots_declaration_is_refused_by_name
+
+// The root is named as the reader wrote it.
+@test("naming the root the way it was given")
+spx_a_root_is_named_as_given()
+    if !lbr_ready() then return
+
+    val pair = spx_library_and_consumer()
+    val said = lbr_cli(["sysl", "build", pair.1, "--lib", pair.0])
+
+    assert(said.1.starts_with(s"error: ${pair.0} needs"), said.1)
+    lbr_drop([pair.0, pair.1])
+end spx_a_root_is_named_as_given
+
+@test("and builds once the named form answers it (a --lib root)")
+spx_the_named_form_answers_a_root()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val pair = spx_library_and_consumer()
+
+    assert_eq(spx_ran(["sysl", "build", pair.1, "--lib", pair.0, "--link-path", probe.2,
+                       "--include-path", s"probe=${probe.1}"]), "84\n")
+    lbr_drop([probe.0, pair.0, pair.1])
+end spx_the_named_form_answers_a_root
+
+// Most of what `--lib` is for: a source root that is not a package goes on building as it did.
+@test("while a source root with no manifest is unaffected")
+spx_a_plain_root_is_unaffected()
+    if !lbr_ready() then return
+
+    val root = lbr_tree(lbr_one("m/m.sysl", "module m\n\ndoubled() -> int = 21 * 4\n"))
+    val consumer = lbr_program("print(m.doubled())\n")
+
+    assert_eq(spx_ran(["sysl", "build", consumer, "--lib", root]), "84\n")
+    lbr_drop([root, consumer])
+end spx_a_plain_root_is_unaffected
+
+// -- a declaring package checked as a library -----------------------------------------------------
+
+// The road a package is packaged by asks the same question of its own manifest.
+@test("is refused by name rather than by a header the reader has never heard of (build-lib)")
+spx_build_lib_is_refused_by_name()
+    if !lbr_ready() then return
+
+    val lib = spx_declaring(false)
+    val said = lbr_cli(["sysl", "build-lib", lib])
+
+    assert_eq(said.0, Failed, said.1)
+    assert_eq(said.1, spx_refusal("this project"))
+    lbr_drop([lib])
+end spx_build_lib_is_refused_by_name
+
+@test("is not answered by a bare --include-path, as on every other command")
+spx_build_lib_bare_path_is_no_answer()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val lib = spx_declaring(false)
+    val said = lbr_cli(["sysl", "build-lib", lib, "--include-path", probe.1])
+
+    assert_eq(said.0, Failed, said.1)
+    assert_eq(said.1, spx_refusal("this project"))
+    lbr_drop([probe.0, lib])
+end spx_build_lib_bare_path_is_no_answer
+
+// The reference writes the artifact here (`-o`); this compiler's `build-lib` writes none and says so.
+@test("and writes the artifact once the named form answers it")
+spx_build_lib_named_form_answers()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val lib = spx_declaring(false)
+    val said = lbr_cli(["sysl", "build-lib", lib, "--include-path", s"probe=${probe.1}"])
+
+    assert_eq(said.0, Fine, said.1)
+    assert_eq(said.1, s"checked $lib")
+    lbr_drop([probe.0, lib])
+end spx_build_lib_named_form_answers
+
+// Its own manifest and nothing else: a `--lib` root's C is not compiled by this command.
+@test("while a declaring --lib source root is not charged to it, whose C this never compiles")
+spx_build_lib_does_not_charge_a_root()
+    if !lbr_ready() then return
+
+    val lib = spx_declaring(false)
+    val root = lbr_tree(lbr_one("c/c.sysl", "module c\n\nask() -> int = m.doubled()\n"))
+    val said = lbr_cli(["sysl", "build-lib", root, "--lib", lib])
+
+    assert_eq(said.0, Fine, said.1)
+    assert_eq(said.1, s"checked $root")
+    lbr_drop([lib, root])
+end spx_build_lib_does_not_charge_a_root
+
+// -- a command that never links still reads the headers -------------------------------------------
+
+@test("emit-llvm cannot find it unaided, which is the failure that was reported")
+spx_emit_llvm_needs_the_header()
+    if !lbr_ready() then return
+
+    val app = spx_measuring()
+    val said = lbr_cli(["sysl", "emit-llvm", app])
+
+    assert_eq(said.0, Failed, said.1)
+    assert(said.1.starts_with("error: the C compiler refused this file's 'c const' block:"), said.1)
+    assert(said.1.contains("fatal error: 'probe.h' file not found"), said.1)
+    lbr_drop([app])
+end spx_emit_llvm_needs_the_header
+
+// 41 is the header's own number, so an IR returning it is one the C compiler really produced.
+@test("and emits the constant once --include-path names where it is")
+spx_emit_llvm_measures_with_the_path()
+    if !spx_ready() then return
+
+    val probe = spx_probe()
+    val app = spx_measuring()
+    val said = lbr_cli(["sysl", "emit-llvm", app, "--include-path", probe.1])
+
+    assert_eq(said.0, Fine, said.1)
+    assert(said.1.contains("define i32 @m$width() {\nentry:\n  ret i32 41\n}"), said.1)
+    lbr_drop([probe.0, app])
+end spx_emit_llvm_measures_with_the_path
+
+@test(ignore: "needs the 'prove' command, which this compiler does not have")
+spx_prove_needs_the_header()
+    val app = spx_measuring()
+    val said = lbr_cli(["sysl", "prove", app])
+
+    assert_eq(said.0, Failed, said.1)
+    assert(said.1.contains("fatal error: 'probe.h' file not found"), said.1)
+    lbr_drop([app])
+end spx_prove_needs_the_header
+
+@test(ignore: "needs the 'prove' command, which this compiler does not have")
+spx_prove_reads_the_path()
+    val probe = spx_probe()
+    val app = spx_measuring()
+    val said = lbr_cli(["sysl", "prove", app, "--include-path", probe.1])
+
+    assert(!said.1.contains("probe.h"), said.1)
+    lbr_drop([probe.0, app])
+end spx_prove_reads_the_path
