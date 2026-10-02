@@ -83,31 +83,163 @@ private tbk_total() -> string = raw"""
 
 // -- what the parser builds -----------------------------------------------------------------------
 
+// The statements of `emit-ast --no-spans`, between the program's `body:` line and its `module:`
+// line. Every expected tree below is the reference's own output for the same file.
+private tbk_tree(text: string) -> string
+    val shown = emit_ast(parse(source_of("t.sysl", text)).program, false)
+    val head = "Program\n  body: \n"
+
+    if !shown.starts_with(head) then return shown
+
+    shown.index_of("\n  module:") match
+        Some(i) -> shown[head.len..<i + 1]
+        None -> shown
+
 @test("a block after an argument list is appended to it")
 tbk_after_an_argument_list()
+    assert_eq(tbk_tree("f(7):\n    1\n"),
+        "    - ExprStmt\n" +
+        "        expr: Call\n" +
+        "          callee: Ident\n" +
+        "            name: \"f\"\n" +
+        "          args: \n" +
+        "            - IntLit\n" +
+        "                value: 7\n" +
+        "                suffix: None\n" +
+        "            - BlockArg\n" +
+        "                body: \n" +
+        "                  - ExprStmt\n" +
+        "                      expr: IntLit\n" +
+        "                        value: 1\n" +
+        "                        suffix: None\n")
     assert_eq(pf("f(7):\n    1\n"), "(call f 7 (blockarg 1))")
 
 @test("a block after a method call is appended to that call")
 tbk_after_a_method_call()
+    assert_eq(tbk_tree("x.f(7):\n    1\n"),
+        "    - ExprStmt\n" +
+        "        expr: Call\n" +
+        "          callee: Field\n" +
+        "            receiver: Ident\n" +
+        "              name: \"x\"\n" +
+        "            name: \"f\"\n" +
+        "          args: \n" +
+        "            - IntLit\n" +
+        "                value: 7\n" +
+        "                suffix: None\n" +
+        "            - BlockArg\n" +
+        "                body: \n" +
+        "                  - ExprStmt\n" +
+        "                      expr: IntLit\n" +
+        "                        value: 1\n" +
+        "                        suffix: None\n")
     assert_eq(pf("x.f(7):\n    1\n"), "(call (field x f) 7 (blockarg 1))")
 
 @test("a block may hold a block")
 tbk_a_block_holds_a_block()
+    assert_eq(tbk_tree("outer:\n    inner:\n        1\n"),
+        "    - ExprStmt\n" +
+        "        expr: Call\n" +
+        "          callee: Ident\n" +
+        "            name: \"outer\"\n" +
+        "          args: \n" +
+        "            - BlockArg\n" +
+        "                body: \n" +
+        "                  - ExprStmt\n" +
+        "                      expr: Call\n" +
+        "                        callee: Ident\n" +
+        "                          name: \"inner\"\n" +
+        "                        args: \n" +
+        "                          - BlockArg\n" +
+        "                              body: \n" +
+        "                                - ExprStmt\n" +
+        "                                    expr: IntLit\n" +
+        "                                      value: 1\n" +
+        "                                      suffix: None\n")
     assert_eq(pf("outer:\n    inner:\n        1\n"), "(call outer (blockarg (call inner (blockarg 1))))")
 
 @test("a block on the right of a binding")
 tbk_on_the_right_of_a_binding()
+    assert_eq(tbk_tree("val v = f:\n    1\n"),
+        "    - ValDecl\n" +
+        "        name: \"v\"\n" +
+        "        typ: None\n" +
+        "        value: Call\n" +
+        "          callee: Ident\n" +
+        "            name: \"f\"\n" +
+        "          args: \n" +
+        "            - BlockArg\n" +
+        "                body: \n" +
+        "                  - ExprStmt\n" +
+        "                      expr: IntLit\n" +
+        "                        value: 1\n" +
+        "                        suffix: None\n" +
+        "        vis: Public\n" +
+        "        align: None\n" +
+        "        section: None\n")
     assert_eq(pf("val v = f:\n    1\n"), "(val v (call f (blockarg 1)))")
 
 // The one other place the language writes a colon after something the expression grammar could
 // have read. The trailing block commits to nothing until the indent is there.
 @test("'should_trap:' is not a block")
 tbk_should_trap_is_not_a_block()
+    assert_eq(tbk_tree("@test(\"it traps\", should_trap: \"out of range\")\nf()\n    print(1)\n"),
+        "    - FuncDecl\n" +
+        "        name: \"f\"\n" +
+        "        tparams: []\n" +
+        "        params: []\n" +
+        "        retType: None\n" +
+        "        body: \n" +
+        "          - ExprStmt\n" +
+        "              expr: Call\n" +
+        "                callee: Ident\n" +
+        "                  name: \"print\"\n" +
+        "                args: \n" +
+        "                  - IntLit\n" +
+        "                      value: 1\n" +
+        "                      suffix: None\n" +
+        "        bounds: {}\n" +
+        "        variadic: false\n" +
+        "        vis: Public\n" +
+        "        tdefaults: {}\n" +
+        "        tvalues: {}\n" +
+        "        tpacks: []\n" +
+        "        test: TestAttr\n" +
+        "          display: \"it traps\"\n" +
+        "          shouldTrap: true\n" +
+        "          expected: \"out of range\"\n" +
+        "          ignored: None\n" +
+        "        hook: None\n" +
+        "        conv: None\n" +
+        "        tailrec: false\n" +
+        "        pure: false\n" +
+        "        ghost: false\n" +
+        "        reads: None\n" +
+        "        writes: None\n" +
+        "        exported: None\n" +
+        "        section: None\n" +
+        "        crossing: []\n" +
+        "        needs: []\n" +
+        "        noinline: false\n" +
+        "        cold: false\n" +
+        "        inline: false\n")
     assert_eq(pf("@test(\"it traps\", should_trap: \"out of range\")\nf()\n    print(1)\n"),
               "(fn @test(\"it traps\")@should_trap(\"out of range\") f () (call print 1))")
 
 @test("an annotation's colon is not a block either")
 tbk_an_annotation_is_not_a_block()
+    assert_eq(tbk_tree("val x: int = 5\n"),
+        "    - ValDecl\n" +
+        "        name: \"x\"\n" +
+        "        typ: NamedType\n" +
+        "          name: \"int\"\n" +
+        "          args: []\n" +
+        "        value: IntLit\n" +
+        "          value: 5\n" +
+        "          suffix: None\n" +
+        "        vis: Public\n" +
+        "        align: None\n" +
+        "        section: None\n")
     assert_eq(pf("val x: int = 5\n"), "(val x : int 5)")
 
 // A bracket suspends the off-side rule until it closes, so there is no indent inside one for a
