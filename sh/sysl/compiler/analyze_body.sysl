@@ -489,11 +489,12 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
 
     // A function owing no value is where statement position starts: its body block is the outermost
     // one written for effect, and every `if` and `match` that ends it inherits that.
+    val before = cx.an.complaints()
     val body = body_block(cx, rest, ret)
 
     // **Anchored at the declaration, not at the statement that yields**, as the reference anchors it:
     // the mistake is the signature and the body disagreeing, and the signature is where it is read.
-    if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
+    if ret != Unit && body.result.is_some() && disagree(body.ty, ret) && said_nothing_since(cx, before) then
         cx.fault(span, body_disagreement(name, ret, body.ty))
 
     a.tables.homes.put(name, scope)
@@ -899,10 +900,11 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     val split = contract_length(d.body)
     val contract = analyze_contract(cx, decl_anchor(d), d.body, split, ret)
     val rest = statements_from(d.body, split)
+    val before = cx.an.complaints()
     val body = body_block(cx, rest, ret)
     val span = body_span(rest, span_zero())
 
-    if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
+    if ret != Unit && body.result.is_some() && disagree(body.ty, ret) && said_nothing_since(cx, before) then
         cx.fault(span, body_disagreement(declared_key(a, cx.scope, d), ret, body.ty))
 
     // **An instantiation whose name carries a closure's is internal on the same ground the closure
@@ -953,21 +955,21 @@ private empty_block() -> TBlock = TBlock(buf(), None, Unit)
 // statement position with what it comes to discarded.
 //
 // **A body is a recovery region**, so the first refusal in its trailing expression is the one it is
-// told about (`Analysis.open_region`). **A body that gave up comes to `Unknown`**, which agrees with
-// every signature: what it yields is a consequence of the refusal already told, so a second complaint
-// that it disagrees with the declaration is noise the reference does not make.
+// told about (`Analysis.open_region`).
 body_block(cx: &Analyzer, rest: Buf[Stmt], ret: Type) -> TBlock
     val outer = cx.an.open_region()
     val block = if ret == Unit then type_value_block(cx, rest, None, true)
     else type_value_block(cx, rest, Some(ret), false)
-    val gave_up = cx.an.poison.is_some()
 
     cx.an.close_region(outer)
-
-    if gave_up then return TBlock(block.stmts, block.result, Unknown)
-
     block
 end body_block
+
+// Whether a body disagreeing with its declaration is worth saying: **not where reading the body
+// already refused something**, since what it yields is then a consequence of that refusal and the
+// reference tells only the refusal (`f() -> int = 3 match` with arms of two types is one complaint
+// about the arms, not a second about the signature). `before` is `complaints()` ahead of the body.
+said_nothing_since(cx: &Analyzer, before: usize) -> bool = cx.an.complaints() == before
 
 // What a function hands back: the tuple a result list lays out as, and `unit` where none was
 // written.
