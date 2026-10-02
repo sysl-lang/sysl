@@ -46,7 +46,7 @@ module_of(key: string) -> string = module_split(key).0
 // it always did. **A call that already wrote the module (`m.use()`) is quoted from the key too**, so
 // the module is not put in front a second time.
 qualified_callee(key: string, written: string) -> string =
-    if module_of(key) == "" then written else readable_keys(key)
+    if module_of(key) == "" then written else readable_name(key)
 
 // The name half of a key.
 module_bare(key: string) -> string = module_split(key).1
@@ -120,33 +120,13 @@ overload_plain(key: string) -> string
 end overload_plain
 
 // The qualified name a file wrote, which is what a diagnostic says when it names a declaration.
-qualified_name(key: string) -> string = readable_keys(spelled_key(key))
+qualified_name(key: string) -> string = readable_name(spelled_key(key))
 
-// A diagnostic's text with every declaration key in it written as the qualified name a reader
-// would write: `m$P.get` is `m.P.get`, `m$hid.private1` is `m.hid`, `m$f.2` is `m.f`.
-//
-// **This is the one place a message is made readable, so no refusal has to remember to.** A key
-// is whatever a table was keyed by, and dozens of refusals interpolate one straight into their text;
-// doing it here means a key cannot reach a reader however the message was put together. What counts
-// as a key is a run of name characters with a module in front of a `$` -- so `'$'`, a `$name`
-// placeholder and `'..$n'` are left as they were written. A `$24` is a `$` the name itself held, and
-// reads as one again. A root-module name has no module to show and prints bare, which it already is.
-//
-// **A TYPE is quoted through `type_show`, which has already dotted the key** -- `m.Log.private1`,
-// `m.Box[m.Log.private1]` -- so a private slot is taken out of every dotted run too, `$` or none.
-// `type_show` itself keeps the slot, being what `emit-typed` prints and the reference's own
-// rendering: the rule lives here, at the one boundary every diagnostic crosses, rather than in a
-// mode of the printer that forty refusals would each have to ask for. A slot is never the first
-// segment of a run, and text with neither a `$` nor a `.private` in it is not touched at all.
-readable_keys(message: string) -> string
-    val bytes = message.bytes
-    var marked = false
-
-    for k in 0..<bytes.len
-        if bytes[k] == u8('$') || slot_at(bytes, k) then marked = true
-
-    if !marked then return message
-
+// One key, standing alone, written as the qualified name a reader would write: `m$P.get` is
+// `m.P.get`, `m$hid.private1` is `m.hid`, `m$f.2` is `m.f`, and a `$24` is a `$` the name itself
+// held, read as one again. A root-module name has no module to show and prints bare.
+readable_name(key: string) -> string
+    val bytes = key.bytes
     var out: Buf[u8] = buf()
     var i: usize = 0
 
@@ -165,7 +145,110 @@ readable_keys(message: string) -> string
         i = j
 
     from_utf8_unchecked(out.view())
+end readable_name
+
+// A diagnostic's text with every declaration key it quotes written as the qualified name a reader
+// would write (`readable_name`).
+//
+// **This is the one place a message is made readable, so no refusal has to remember to.** A key
+// is whatever a table was keyed by, and dozens of refusals interpolate one straight into their text;
+// doing it here means a key cannot reach a reader however the message was put together. **What
+// counts as a key is narrow on purpose, and is the reference's**: a WHOLE span between two single
+// quotes that is a module path -- name segments joined by dots -- then the separator and a letter or
+// an underscore. So `'$'`, `'$name'`, `'a b$c'`, an unclosed `'m$use` and text outside quotes are
+// left as written, and so is `'m$24x'`, whose `$24` is a guard mark rather than a name's first
+// character.
+//
+// **A TYPE is quoted through `type_show`, which has already dotted the key** -- `m.Log.private1`,
+// `m.Box[m.Log.private1]` -- so a private slot is taken out of every dotted run too, quoted or not.
+// `type_show` itself keeps the slot, being what `emit-typed` prints and the reference's own
+// rendering: the rule lives here, at the one boundary every diagnostic crosses, rather than in a
+// mode of the printer that forty refusals would each have to ask for. A slot is never the first
+// segment of a run, and text with neither a `$` nor a `.private` in it is not touched at all.
+readable_keys(message: string) -> string
+    val bytes = message.bytes
+    var marked = false
+
+    for k in 0..<bytes.len
+        if bytes[k] == u8('$') || slot_at(bytes, k) then marked = true
+
+    if !marked then return message
+
+    var keyed: Buf[u8] = buf()
+    var i: usize = 0
+
+    while i < bytes.len
+        val close = if bytes[i] == u8('\'') then closing_quote(bytes, i + 1) else -1
+
+        if close > isize(i) && quoted_key(bytes[i + 1..<usize(close)])
+            keyed.push(u8('\''))
+
+            for b in readable_name(from_utf8_unchecked(bytes[i + 1..<usize(close)])).bytes
+                keyed.push(b)
+
+            keyed.push(u8('\''))
+            i = usize(close) + 1
+        else
+            keyed.push(bytes[i])
+            i += 1
+
+    val text = keyed.view()
+    var out: Buf[u8] = buf()
+    var k: usize = 0
+
+    while k < text.len
+        if !key_byte(text[k])
+            out.push(text[k])
+            k += 1
+            continue
+
+        var j = k
+
+        while j < text.len && key_byte(text[j])
+            j += 1
+
+        for b in drop_private_slots(from_utf8_unchecked(text[k..<j])).bytes
+            out.push(b)
+
+        k = j
+
+    from_utf8_unchecked(out.view())
 end readable_keys
+
+// The next `'` at or after `from`, or -1.
+private closing_quote(bytes: []const u8, from: usize) -> isize
+    for k in from..<bytes.len
+        if bytes[k] == u8('\'') then return isize(k)
+
+    -1
+end closing_quote
+
+// Whether a quoted span is a key: a module path, the separator, and a name after it.
+private quoted_key(s: []const u8) -> bool
+    var at: isize = -1
+
+    for k in 0..<s.len
+        if s[k] == u8('\n') then return false
+        if at < 0 && s[k] == u8('$') then at = isize(k)
+
+    if at <= 0 || usize(at) >= s.len - 1 || !name_start(s[usize(at) + 1]) then return false
+
+    var start = true
+
+    for k in 0..<usize(at)
+        if s[k] == u8('.')
+            if start then return false
+
+            start = true
+        else if start
+            if !name_start(s[k]) then return false
+
+            start = false
+        else if !name_start(s[k]) && !c_digit(s[k])
+            return false
+
+    !start
+end quoted_key
 
 // One run of name characters, written into `out` as a reader would spell it.
 private push_readable(out: *Buf[u8], run: []const u8)
