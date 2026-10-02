@@ -1,0 +1,374 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.str_builder
+
+// What an `impl` matching a **shape** may and may not say. A shape is one key, exactly as a generic
+// type's name is, so most of these are that fact seen from different angles -- a block that fixed
+// part of what it matched, or a second block for what one already covers. A shape and a type of that
+// shape written out in full are two implementations for one type, so whichever is written second is
+// refused unless it says `override`.
+//
+// Then the coherence rule (`reference/traits.md § Where an impl may live`): an `impl` lives where its
+// trait is declared or where a type named in its subject is. And the two views of a slice, which
+// share the one shape key, so a block written for `[]T` is made real at a read-only receiver too and
+// a body that writes through `self` is refused there.
+//
+// **Every expected list is the reference's complete output for that program (0.0.158)**, every
+// diagnostic of it, in source order; these are its `ImplShapeErrorTests`.
+
+private isx_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+// Every diagnostic a one-file program earns, one message to a line in source order.
+private isx_diags(text: string) -> string
+    val root = make_temp_dir("sysl-isx").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    var b = str_builder()
+
+    emit_llvm_text(src, None) match
+        Err(why) -> b.push(s"refused: ${why.message}")
+        Ok(made) ->
+            val ordered = in_source_order(made.report)
+
+            for i in 0..<ordered.len()
+                if i > 0 then b.push("\n")
+
+                b.push(if ordered.at(i).is_error() then "error: " else "warning: ")
+                b.push(ordered.at(i).diag.message)
+
+    remove_dir_all(root).unwrap_or(())
+    b.finish()
+end isx_diags
+
+// What a program prints, or why it did not build or run.
+private isx_run(text: string) -> string
+    if !clang_available() then return "skipped"
+
+    val root = make_temp_dir("sysl-isx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end isx_run
+
+private isx_ran(text: string, expected: string)
+    val got = isx_run(text)
+
+    if got != "skipped" then assert_eq(got, expected)
+
+private isx_show() -> string = "trait Show\n    show(self) -> string\n"
+
+private isx_other() -> string = "trait Other\n    show(self) -> int\n"
+
+private isx_bump(body: string, tail: string) -> string =
+    "trait Bump\n    bump(self)\nimpl[T] Bump for []T\n    bump(self)\n        " + body +
+    "\nvar a = [1, 2, 3]\n" + tail
+
+// -- the subject is the shape applied to the block's parameters ---------------------------------------
+
+@test("impl shape error: so an element fixed to one type is refused")
+isx_an_element_fixed_to_one_type_is_refused()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl[T] Show for []int\n    show(self) -> string = \"b\"\n"),
+              "error: 'int' fixes the element type, and an 'impl' with type parameters covers every " +
+              "slice — write one of the block's own parameters here")
+
+@test("impl shape error: and so is a shape nested inside the subject")
+isx_a_nested_shape_is_refused()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl[T] Show for [][]T\n    show(self) -> string = \"b\"\n"),
+              "error: '[]T' fixes the element type, and an 'impl' with type parameters covers every " +
+              "slice — write one of the block's own parameters here")
+
+@test("impl shape error: every declared parameter appearing in it")
+isx_every_declared_parameter_appears()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl[T, U] Show for []T\n    show(self) -> string = \"b\"\n"),
+              "error: 'U' is declared by this 'impl' but does not appear in '[]T', so nothing would " +
+              "ever fix it")
+
+@test("impl shape error: and the subject being a shape rather than a bare parameter")
+isx_the_subject_is_not_a_bare_parameter()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl[T] Show for T\n    show(self) -> string = \"b\"\n"),
+              "error: 'T' is a type parameter of this 'impl', so it stands for every type at once — " +
+              "an 'impl' says how one kind of type behaves. A bound the compiler closes is the " +
+              "exception, since it names a family rather than every type")
+
+@test("impl shape error: a built-in has no shape to match")
+isx_a_builtin_has_no_shape()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl[T] Show for int\n    show(self) -> string = \"b\"\n"),
+              "error: 'int' takes no type arguments, so an 'impl' for it has nothing to be generic over")
+
+@test("impl shape error: and a memory mode is refused as the mode it is")
+isx_a_memory_mode_is_refused_as_a_mode()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl[T] Show for *T\n    show(self) -> string = \"b\"\n"),
+              "error: '*T' is a way of holding a T rather than a type of its own — write the 'impl' " +
+              "for T, which a member call reaches through one '*' to find")
+
+@test("impl shape error: two blocks for one shape collide like two for one generic type")
+isx_two_blocks_for_one_shape_collide()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl[T] Show for []T\n    show(self) -> string = \"b\"\n" +
+                        "impl[U] Show for []U\n    show(self) -> string = \"c\"\n"),
+              "error: '[]U' already implements 'Show'")
+
+// -- a shape and a type of it written out in full are two implementations for one type ---------------
+
+@test("impl shape error: so the shape is refused after the type")
+isx_the_shape_after_the_type()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl Show for []int\n    show(self) -> string = \"a\"\n" +
+                        "impl[T] Show for []T\n    show(self) -> string = \"b\"\n"),
+              "error: '[]int' already implements 'Show', and this 'impl' would implement it for " +
+              "every slice — including that one")
+
+@test("impl shape error: and the type after the shape")
+isx_the_type_after_the_shape()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl[T] Show for []T\n    show(self) -> string = \"b\"\n" +
+                        "impl Show for []int\n    show(self) -> string = \"a\"\n"),
+              "error: every slice already implements 'Show', so '[]int' has an implementation and " +
+              "cannot be given a second one — write 'override impl' to say that replacing it for " +
+              "this one type is what was meant")
+
+@test("impl shape error: and an array of the block's length is the same collision")
+isx_an_array_of_the_length_collides()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl[T] Show for [2]T\n    show(self) -> string = \"b\"\n" +
+                        "impl Show for [2]int\n    show(self) -> string = \"a\"\n"),
+              "error: every array of 2 already implements 'Show', so '[2]int' has an implementation " +
+              "and cannot be given a second one — write 'override impl' to say that replacing it " +
+              "for this one type is what was meant")
+
+// -- a type's members are one namespace, and the shape's are in it ------------------------------------
+
+@test("impl shape error: so a shape may not give a name a written implementation already used")
+isx_a_shape_may_not_reuse_a_written_name()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + isx_other() + "impl Other for []int\n    show(self) -> int = 1\n" +
+                        "impl[T] Show for []T\n    show(self) -> string = \"b\"\n"),
+              "error: '[]int' already has a member named 'show', and this 'impl' would give every " +
+              "slice one — a call on a '[]int' could mean either")
+
+@test("impl shape error: nor a written implementation one the shape already gave")
+isx_a_written_block_may_not_reuse_a_shape_name()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + isx_other() + "impl[T] Show for []T\n    show(self) -> string = \"b\"\n" +
+                        "impl Other for []int\n    show(self) -> int = 1\n"),
+              "error: every slice already has a member named 'show', so '[]int' cannot declare one " +
+              "of its own")
+
+// -- conformance is checked with the parameters standing in for themselves ----------------------------
+
+@test("impl shape error: so a missing member is reported against the shape")
+isx_a_missing_member_against_the_shape()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl[T] Show for []T\n"),
+              "error: '[]T' does not implement 'Show': method 'show' is missing")
+
+@test("impl shape error: and 'Self' matches the subject written out")
+isx_self_matches_the_subject()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags("trait Dup\n    dup(self) -> Self\nimpl[T] Dup for []T\n" +
+                        "    dup(self) -> []int = self\n"),
+              "error: method 'dup' returns []int, but trait 'Dup' declares []T")
+
+@test("impl shape error: and the body is checked at its definition, against the bounds alone")
+isx_the_body_is_checked_against_the_bounds()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl[T] Show for []T\n    show(self) -> string = str(self[0])\n"),
+              "error: 'str' needs 'T: sysl.Display'")
+
+// -- the block's bounds decide which slices conform ---------------------------------------------------
+
+@test("impl shape error: so print names the condition rather than an 'impl' that would be refused")
+isx_print_names_the_condition()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags("struct Row[T]\n    v: T\nimpl[T: Display] Display for Row[T]\n" +
+                        "    display(self, out: *Writer, fmt: FormatSpec) = out.write(\"x\".bytes)\n" +
+                        "struct P\n    v: int\nprint(Row(P(1)))\n"),
+              "error: cannot print a Row[P] value — the 'impl' that covers it asks 'sysl.Display' of " +
+              "P, which does not implement it")
+
+private isx_conditional() -> string =
+    isx_show() + "impl[T: Show] Show for []T\n    show(self) -> string = self[0].show()\n" +
+    "struct P\n    v: int\n"
+
+@test("impl shape error: a bound refuses an element that does not conform")
+isx_a_bound_refuses_the_element()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_conditional() + "tell[S: Show](x: S) -> string = x.show()\n" +
+                        "var a = [P(1)]\nprint(tell(a[0..]))\n"),
+              "error: 'tell' requires its type parameter 'S' to implement 'Show', but []P does not — " +
+              "the 'impl' that covers it asks 'Show' of P, which does not implement it")
+
+@test("impl shape error: and an erasure does too")
+isx_an_erasure_refuses_the_element()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_show() + "impl[T: Show] Show for [1]T\n" +
+                        "    show(self) -> string = self[0].show()\nstruct P\n    v: int\n" +
+                        "var a: &[1]P = [P(1)]\nvar o: &Show = a\nprint(o.show())\n"),
+              "error: a &Show needs a type that implements 'Show', and [1]P does not — the 'impl' " +
+              "that covers it asks 'Show' of P, which does not implement it")
+
+// -- an 'impl' with no home ---------------------------------------------------------------------------
+
+private isx_homeless(trait_name: string, subject: string) -> string =
+    "error: an 'impl' may be written only in the module that declares the trait or in one that " +
+    s"declares a type the block names, and '$trait_name' is the library's while nothing in " +
+    s"'$subject' is declared outside the library — so this one has no home. A trait of your own, or " +
+    "a type of your own in what it is written for or in the trait's arguments, gives it one"
+
+@test("impl shape error: a foreign trait for a foreign type is refused")
+isx_a_foreign_trait_for_a_foreign_type()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags("impl[T: Hash] Hash for Option[T]\n    hash(self) -> u64 = 1u64\nprint(1)\n"),
+              isx_homeless("sysl.Hash", "sysl.Option"))
+
+@test("impl shape error: a built-in is foreign too, so the library's traits are out of reach for it")
+isx_a_builtin_is_foreign()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags("impl Iterate for int\n    type Item = int\n" +
+                        "    next(*self) -> Option[int] = None\nprint(1)\n"),
+              isx_homeless("sysl.Iterate", "int"))
+
+@test("impl shape error: and so is a slice, whose element settles nothing when it is a built-in too")
+isx_a_slice_of_a_builtin_is_foreign()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags("impl Hash for []int\n    hash(self) -> u64 = 1u64\nprint(1)\n"),
+              isx_homeless("sysl.Hash", "[]int"))
+
+@test("impl shape error: a shape over the library's own trait has no home either")
+isx_a_shape_over_a_library_trait()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags("impl[T: Hash] Hash for []T\n    hash(self) -> u64 = 1u64\nprint(1)\n"),
+              isx_homeless("sysl.Hash", "[]T"))
+
+@test("impl shape error: a tuple is the library's, so a foreign trait for one is the ordinary case")
+isx_a_tuple_is_the_library_s()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags("impl Iterate for (int, string)\n    type Item = int\n" +
+                        "    next(*self) -> Option[int] = None\nprint(1)\n"),
+              isx_homeless("sysl.Iterate", "(int, string)"))
+
+// -- an 'impl' the rule leaves alone ------------------------------------------------------------------
+
+@test("impl shape error: the trait is the program's own, so any type may be given it")
+isx_the_program_s_own_trait()
+    if !isx_ready() then return
+
+    isx_ran(isx_show() + "impl Show for []int\n    show(self) -> string = str(self.len)\n" +
+            "var a = [1, 2, 3]\nprint(a[0..].show())\n", "3\n")
+
+@test("impl shape error: and a type of the program's own inside the subject is enough")
+isx_a_type_of_its_own_inside_the_subject()
+    if !isx_ready() then return
+
+    isx_ran("struct P\n    v: int\noverride impl Display for []P\n" +
+            "    display(self, out: *Writer, fmt: FormatSpec) = display_int(i64(self.len), out, fmt)\n" +
+            "var a = [P(1), P(2)]\nprint(a[0..])\n", "2\n")
+
+@test("impl shape error: however deeply it is buried")
+isx_however_deeply_buried()
+    if !isx_ready() then return
+
+    // The reference's case reads the LLVM text for `@main`; running it says the same and more.
+    isx_ran("struct P\n    v: int\noverride impl Display for [][]P\n" +
+            "    display(self, out: *Writer, fmt: FormatSpec) = display_int(i64(self.len), out, fmt)\n" +
+            "print(1)\n", "1\n")
+
+@test("impl shape error: and the library writes what nothing else has a home for")
+isx_the_library_writes_the_rest()
+    if !isx_ready() then return
+
+    isx_ran("var t = (1, \"a\")\nvar u = (1, \"a\")\nprint(t == u)\n", "true\n")
+
+// -- a shape block and the two views ------------------------------------------------------------------
+
+private isx_read_only_bump() -> string =
+    isx_bump("self[0] = self[0]", "val c: []const int = a[..]\nc.bump()\n")
+
+private isx_read_only_refusal() -> string =
+    "error: this element belongs to a '[]const int', which views elements it may not write, so " +
+    "there is nothing to assign through. Elements you may write are elements of your own: copy them " +
+    "into a '[]int' first — and this body is the block written for '[]T', made real at the read-only " +
+    "view because that is what the receiver was. A member writing through 'self' is one only a '[]T' " +
+    "can be given, so what has to change is the call on the '[]const T'"
+
+@test("impl shape error: a body that writes through 'self' is refused on the read-only view")
+isx_a_writing_body_on_the_read_only_view()
+    if !isx_ready() then return
+
+    assert_eq(isx_diags(isx_read_only_bump()), isx_read_only_refusal())
+
+@test("impl shape error: and says which of the block's two instances this body is")
+isx_says_which_instance()
+    if !isx_ready() then return
+
+    assert(isx_diags(isx_read_only_bump()).contains("made real at the read-only view"))
+
+@test("impl shape error: while the same block writes freely when the receiver may be written")
+isx_the_same_block_writes_freely()
+    if !isx_ready() then return
+
+    isx_ran(isx_bump("self[0] = 9", "a[..].bump()\nprint(a[0])\n"), "9\n")
+
+@test("impl shape error: and a block written for '[]const T' reaches a read-only view as it always did")
+isx_a_const_block_reaches_the_read_only_view()
+    if !isx_ready() then return
+
+    isx_ran("trait Total\n    total(self) -> usize\nimpl[T] Total for []const T\n" +
+            "    total(self) -> usize = self.len\nvar s = \"hello\"\nprint(s.bytes.total())\n", "5\n")

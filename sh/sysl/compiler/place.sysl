@@ -15,6 +15,16 @@ import sysl.text.Search
 //
 // `whole` is the statement doing the writing, and **a refused write is reported at it**: what is
 // wrong is the assignment, and the target on its own is a perfectly good expression to read.
+// What a refusal to write through a read-only view adds when the body being read is a slice shape
+// block made real at the read-only view -- empty everywhere else, so it is appended without asking.
+// The refusal lands on a line whose author wrote `[]T` and never typed a `const`, and the one thing
+// that line cannot show is the receiver at the call, which is the whole explanation.
+const_self_note(cx: &Analyzer) -> string =
+    if !cx.an.tables.members.const_self.has(cx.func_name) then ""
+    else " — and this body is the block written for '[]T', made real at the read-only view " +
+         "because that is what the receiver was. A member writing through 'self' is one only a " +
+         "'[]T' can be given, so what has to change is the call on the '[]const T'"
+
 analyze_place(cx: &Analyzer, target: Expr, what: string, whole: Span) -> TExpr =
     require_place(cx, type_expr_bare(cx, target), target, what, true, Some(whole))
 
@@ -70,7 +80,8 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool,
                          s"'${type_show(texpr_type(recv))}', which views elements it may not " +
                          "write, so there is nothing to assign through. Elements you may write " +
                          "are elements of your own: copy them into a " +
-                         s"'[]${type_show(element(texpr_type(recv)).unwrap_or(Unknown))}' first")
+                         s"'[]${type_show(element(texpr_type(recv)).unwrap_or(Unknown))}' first" +
+                         const_self_note(cx))
                 return t
             end if
         _ -> ()
