@@ -1,0 +1,332 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The reference's `PatternBindingTests`: `val (a, b) = …`, a binding that takes a value apart by
+// pattern (`reference/types.md § Tuples`, `reference/patterns.md § Struct patterns`).
+//
+// The comma form says how MANY things to bind and a pattern says the SHAPE, so what is asserted first
+// is what the comma form cannot do: reach inside a nested tuple, skip a part, take a struct apart by
+// field name or by position. The second half is the refusals -- a binding has no other arm to take,
+// so a pattern that could fail to match cannot stand in one.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.156)** by
+// handing the installed `sysl` the same program. Positions are the reference's `line:column`; the
+// extent a caret underlines is the open span divergence and is not asserted.
+
+// What a program does: what it printed, and whether it exited zero. A failure to build is its
+// message and a non-zero exit.
+private pbd_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-pbd").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end pbd_outcome
+
+// The program runs to the end and prints exactly this. Returns at once without the library.
+private pbd_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = pbd_outcome(text)
+
+    assert(out.1, s"it did not exit zero: ${out.0}")
+    assert_eq(out.0, want)
+end pbd_prints
+
+// The build is refused with this message, anchored at this `line:column` of `main.sysl`.
+private pbd_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val said = pbd_outcome(text).0
+
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+end pbd_refused
+
+private pbd_point() -> string = "struct Point\n    x: int\n    y: int\n\n"
+
+private pbd_point3() -> string = "struct Point\n    x: int\n    y: int\n    z: int\n\n"
+
+private pbd_size() -> string = "struct Size\n    w: int\n    h: int\n\n"
+
+private pbd_shape() -> string = "enum Shape\n    Circle(r: int)\n    Square(s: int)\n\n"
+
+private pbd_pair() -> string = "struct Pair\n    both: (int, int)\n\n"
+
+private pbd_tests_value() -> string =
+    "a binding cannot test a value — this pattern matches only some values, and a binding has no " +
+    "other arm to take when it does not match"
+
+private pbd_chooses() -> string =
+    "a binding cannot choose among variants — this pattern matches one of several shapes, and a " +
+    "binding has no other arm to take when the value has another"
+
+// -- a tuple, taken apart -------------------------------------------------------------------------
+
+@test("two names")
+pbd_two_names() = pbd_prints("show() =\n    val p = (3, 4)\n    val (a, b) = p\n    print(a, b)\n\nshow()\n", "3 4\n")
+
+@test("straight from a call, with no name in between")
+pbd_straight_from_a_call() =
+    pbd_prints("origin() -> (int, int) = (7, 9)\n\nshow() =\n    val (x, y) = origin()\n    print(x, y)\n\nshow()\n",
+               "7 9\n")
+
+@test("parts of different types")
+pbd_parts_of_different_types() =
+    pbd_prints("show() =\n    val (n, s, f) = (1, \"one\", true)\n    print(n, s, f)\n\nshow()\n", "1 one true\n")
+
+@test("a nested tuple, which the comma form cannot reach")
+pbd_a_nested_tuple() =
+    pbd_prints("show() =\n    val ((a, b), c) = ((1, 2), 3)\n    print(a, b, c)\n\nshow()\n", "1 2 3\n")
+
+@test("nested on both sides, to any depth")
+pbd_nested_to_any_depth() =
+    pbd_prints("show() =\n    val ((a, (b, c)), (d, e)) = ((1, (2, 3)), (4, 5))\n    print(a, b, c, d, e)\n\nshow()\n",
+               "1 2 3 4 5\n")
+
+@test("a wildcard binds nothing and skips its part")
+pbd_a_wildcard_skips_its_part() =
+    pbd_prints("show() =\n    val (a, _, c) = (1, 2, 3)\n    print(a, c)\n\nshow()\n", "1 3\n")
+
+@test("a wildcard nested inside")
+pbd_a_wildcard_nested_inside() =
+    pbd_prints("show() =\n    val ((_, b), _) = ((1, 2), 3)\n    print(b)\n\nshow()\n", "2\n")
+
+// -- var makes the parts assignable ---------------------------------------------------------------
+
+@test("and val does not")
+pbd_var_parts_are_assignable() =
+    pbd_prints("show() =\n    var (a, b) = (3, 4)\n    a = a + 10\n    b = b + 20\n    print(a, b)\n\nshow()\n",
+               "13 24\n")
+
+@test("a val part is refused an assignment")
+pbd_a_val_part_is_refused() =
+    pbd_refused("show() =\n    val (a, b) = (3, 4)\n    a = 1\n\nshow()\n",
+                "a 'val' is written once, so assignment has nothing to write through", "3:5")
+
+// The value is one expression and the parts are reads of one temporary, so a call on the right runs
+// once however many names the pattern binds.
+@test("the value is produced once, however many parts are bound")
+pbd_the_value_is_produced_once() =
+    pbd_prints("make() -> (int, int, int) =\n    print(\"side\")\n    (1, 2, 3)\n\n" +
+               "show() =\n    val (a, b, c) = make()\n    print(a, b, c)\n\nshow()\n",
+               "side\n1 2 3\n")
+
+// -- a struct, taken apart by field name ----------------------------------------------------------
+
+@test("every field")
+pbd_every_field() =
+    pbd_prints(pbd_point() + "show() =\n    val Point{x, y} = Point(3, 4)\n    print(x, y)\n\nshow()\n", "3 4\n")
+
+// Unlisted fields bind nothing: a binding has no exhaustiveness to discharge.
+@test("only the fields it names")
+pbd_only_the_fields_it_names() =
+    pbd_prints(pbd_point3() + "show() =\n    val Point{y} = Point(1, 2, 3)\n    print(y)\n\nshow()\n", "2\n")
+
+@test("fields in an order of its own")
+pbd_fields_in_an_order_of_its_own() =
+    pbd_prints(pbd_point() + "show() =\n    val Point{y, x} = Point(3, 4)\n    print(x, y)\n\nshow()\n", "3 4\n")
+
+@test("a field renamed to a sub-pattern, and a struct nested in one")
+pbd_a_field_renamed_to_a_sub_pattern() =
+    pbd_prints(pbd_point() + "struct Line\n    a: Point\n    b: Point\n\n" +
+               "show() =\n    val Line{a: Point{x, y}, b: Point{x: bx}} = Line(Point(1, 2), Point(3, 4))\n" +
+               "    print(x, y, bx)\n\nshow()\n",
+               "1 2 3\n")
+
+@test("a struct inside a tuple, and a tuple inside a struct")
+pbd_a_struct_inside_a_tuple() =
+    pbd_prints(pbd_pair() + pbd_point() +
+               "show() =\n    val (Point{x, y}, n) = (Point(1, 2), 3)\n    val Pair{both: (a, b)} = Pair((4, 5))\n" +
+               "    print(x, y, n, a, b)\n\nshow()\n",
+               "1 2 3 4 5\n")
+
+@test("var makes the named fields assignable")
+pbd_var_makes_the_named_fields_assignable() =
+    pbd_prints(pbd_point() + "show() =\n    var Point{x, y} = Point(3, 4)\n    x = x + 10\n    print(x, y)\n\nshow()\n",
+               "13 4\n")
+
+@test("a counted field is retained by the read")
+pbd_a_counted_field_is_retained() =
+    pbd_prints("struct Inner\n    n: int\n\nstruct Outer\n    cell: &Inner\n\n" +
+               "make() -> Outer =\n    val c: &Inner = Inner(7)\n    Outer(c)\n\n" +
+               "show() =\n    val Outer{cell} = make()\n    print(cell.n)\n\nshow()\n",
+               "7\n")
+
+// -- a struct, taken apart by position ------------------------------------------------------------
+
+@test("every field, in declaration order")
+pbd_every_field_in_declaration_order() =
+    pbd_prints(pbd_point() + "show() =\n    val Point(x, y) = Point(3, 4)\n    print(x, y)\n\nshow()\n", "3 4\n")
+
+@test("nested in a tuple, and with a tuple nested in it")
+pbd_positional_nested_in_a_tuple() =
+    pbd_prints(pbd_pair() + pbd_point() +
+               "show() =\n    val (Point(x, y), n) = (Point(1, 2), 3)\n    val Pair((a, b)) = Pair((4, 5))\n" +
+               "    print(x, y, n, a, b)\n\nshow()\n",
+               "1 2 3 4 5\n")
+
+@test("a wildcard skips a field it does not want")
+pbd_a_wildcard_skips_a_field() =
+    pbd_prints(pbd_point3() + "show() =\n    val Point(_, y, _) = Point(1, 2, 3)\n    print(y)\n\nshow()\n", "2\n")
+
+@test("var makes the bound fields assignable")
+pbd_var_makes_the_bound_fields_assignable() =
+    pbd_prints(pbd_point() + "show() =\n    var Point(x, y) = Point(3, 4)\n    x = x + 10\n    print(x, y)\n\nshow()\n",
+               "13 4\n")
+
+@test("the value is evaluated exactly once")
+pbd_the_value_is_evaluated_exactly_once() =
+    pbd_prints(pbd_point() + "made(n: *int) -> Point =\n    *n = *n + 1\n    Point(1, 2)\n\n" +
+               "show() =\n    var calls = 0\n    val Point(x, y) = made(&calls)\n    print(x, y, calls)\n\nshow()\n",
+               "1 2 1\n")
+
+// Unlike the named form, this one accounts for every field, so a struct that grew one reports the
+// pattern that stopped covering it.
+@test("a sub-pattern per field, and not fewer")
+pbd_a_sub_pattern_per_field() =
+    pbd_refused(pbd_point3() + "show() =\n    val Point(x, y) = Point(1, 2, 3)\n    print(x)\n\nshow()\n",
+                "struct 'Point' has 3 fields, but 2 sub-patterns were given", "7:5")
+
+// The reference suite has a case of this name under each form, the positional and the named; the map
+// keys a row by name, so this one test answers both.
+@test("a struct name that is not the value's")
+pbd_a_struct_name_that_is_not_the_values()
+    pbd_refused(pbd_point() + pbd_size() + "show() =\n    val Size(w, h) = Point(3, 4)\n    print(w)\n\nshow()\n",
+                "'Size(…)' does not match a Point value", "10:5")
+    pbd_refused(pbd_point() + pbd_size() + "show() =\n    val Size{w, h} = Point(3, 4)\n    print(w)\n\nshow()\n",
+                "'Size{…}' does not match a Point value", "10:5")
+end pbd_a_struct_name_that_is_not_the_values
+
+// -- what a struct binding will not accept --------------------------------------------------------
+
+@test("a field the struct does not have")
+pbd_a_field_the_struct_does_not_have() =
+    pbd_refused(pbd_point() + "show() =\n    val Point{x, w} = Point(3, 4)\n    print(x)\n\nshow()\n",
+                "struct 'Point' has no field 'w'", "6:5")
+
+// `{x, x}` is a duplicate on both counts, and the name check is the one that fires.
+@test("one field named twice binds one name twice")
+pbd_one_field_named_twice() =
+    pbd_refused(pbd_point() + "show() =\n    val Point{x, x} = Point(3, 4)\n    print(x)\n\nshow()\n",
+                "'x' is named twice in one binding", "6:5")
+
+// Renaming the second leaves the names distinct, so only the field check can catch it.
+@test("the same field twice under two names is still the same field twice")
+pbd_the_same_field_twice_under_two_names() =
+    pbd_refused(pbd_point() + "show() =\n    val Point{x: a, x: b} = Point(3, 4)\n    print(a, b)\n\nshow()\n",
+                "field 'x' is matched more than once", "6:5")
+
+@test("a value that is not a struct at all")
+pbd_a_value_that_is_not_a_struct() =
+    pbd_refused(pbd_point() + "show() =\n    val Point{x, y} = 5\n    print(x)\n\nshow()\n",
+                "'Point{…}' matches a struct, but the value is int", "6:5")
+
+// An enum has several shapes, so naming one of them is a test rather than a description.
+@test("a variant, which is still a choice among shapes")
+pbd_a_variant_is_still_a_choice() =
+    pbd_refused(pbd_shape() + "show() =\n    val Circle(r) = Circle(1)\n    print(r)\n\nshow()\n", pbd_chooses(), "6:5")
+
+// -- the edges ------------------------------------------------------------------------------------
+
+// The value is held in a temporary and the parts are read out of it, so a counted part has to be
+// retained by the read or it would be freed with the temporary.
+@test("a counted part outlives the temporary the value was held in")
+pbd_a_counted_part_outlives_the_temporary() =
+    pbd_prints("struct Cell\n    n: int\n\nmake() -> (&Cell, &Cell) =\n    val a: &Cell = Cell(1)\n" +
+               "    val b: &Cell = Cell(2)\n    (a, b)\n\nshow() =\n    val (a, b) = make()\n    print(a.n, b.n)\n\nshow()\n",
+               "1 2\n")
+
+@test("a binding in a loop body runs once per iteration")
+pbd_a_binding_in_a_loop_body() =
+    pbd_prints("show() =\n    var i = 0\n    while i < 3 do\n        val (a, b) = (i, i * 2)\n        print(a, b)\n" +
+               "        i = i + 1\n\nshow()\n",
+               "0 0\n1 2\n2 4\n")
+
+// The right side is produced before any name is bound: `a` is the outer one.
+@test("the value still means the enclosing scope's names")
+pbd_the_value_means_the_enclosing_names() =
+    pbd_prints("show() =\n    val a = 10\n    val (a2, b) = (a, a + 1)\n    print(a2, b)\n\nshow()\n", "10 11\n")
+
+@test("a pattern that binds nothing at all is still a binding")
+pbd_a_pattern_that_binds_nothing() =
+    pbd_prints("show() =\n    val (_, _) = (1, 2)\n    print(\"done\")\n\nshow()\n", "done\n")
+
+@test("a one-part pattern is not a tuple")
+pbd_a_one_part_pattern() =
+    pbd_refused("show() =\n    val (a) = 1\n    print(a)\n\nshow()\n",
+                "a tuple pattern matches two or more parts — one part is not a tuple", "2:13")
+
+// -- what a binding will not accept ---------------------------------------------------------------
+
+@test("a literal, which matches only some values")
+pbd_a_literal() = pbd_refused("show() =\n    val (1, b) = (1, 2)\n    print(b)\n\nshow()\n", pbd_tests_value(), "2:5")
+
+@test("a range, for the same reason")
+pbd_a_range() = pbd_refused("show() =\n    val (1..3, b) = (1, 2)\n    print(b)\n\nshow()\n", pbd_tests_value(), "2:5")
+
+@test("a variant, which is a choice among shapes")
+pbd_a_variant() =
+    pbd_refused(pbd_shape() + "show() =\n    val (Circle(r), b) = (Circle(1), 2)\n    print(r, b)\n\nshow()\n",
+                pbd_chooses(), "6:5")
+
+@test("more parts than the tuple has")
+pbd_more_parts() =
+    pbd_refused("show() =\n    val (a, b, c) = (1, 2)\n    print(a)\n\nshow()\n",
+                "this pattern takes 3 parts, and a (int, int) has 2 parts to give it", "2:5")
+
+@test("fewer parts than the tuple has")
+pbd_fewer_parts() =
+    pbd_refused("show() =\n    val (a, b) = (1, 2, 3)\n    print(a)\n\nshow()\n",
+                "this pattern takes 2 parts, and a (int, int, int) has 3 parts to give it", "2:5")
+
+@test("a value that is not a tuple at all")
+pbd_a_value_that_is_not_a_tuple() =
+    pbd_refused("show() =\n    val (a, b) = 5\n    print(a)\n\nshow()\n",
+                "one int is not something to take apart — only a tuple is", "2:5")
+
+@test("one name used twice")
+pbd_one_name_used_twice() =
+    pbd_refused("show() =\n    val (a, a) = (1, 2)\n    print(a)\n\nshow()\n", "'a' is named twice in one binding", "2:5")
+
+// The parts have nowhere to carry a type, so this is a local form. Alone in its file, the `static`
+// is refused first for having no body to opt out of.
+@test("a module-level val, whose parts have nowhere to state a type")
+pbd_a_module_level_val()
+    val text = "static val (a, b) = (1, 2)\n"
+
+    pbd_refused(text, "'static' says a declaration belongs to the module rather than to the body of the file " +
+                "the program starts in — and this file has no such body, so everything it declares is the " +
+                "module's already", "1:1")
+
+    if xvr_no_library() then return
+
+    // The reference prints this one with no position.
+    val said = pbd_outcome(text).0
+
+    assert(said.contains("error: a module-level 'val' states its type, and a binding written as a pattern has " +
+                         "nowhere to write one — take the value apart inside a function, or declare the parts " +
+                         "separately\n"), said)
+end pbd_a_module_level_val
+
+@test("while the plain form at the top of a program is an ordinary local")
+pbd_the_plain_form_at_the_top() = pbd_prints("val (a, b) = (1, 2)\nprint(a, b)\n", "1 2\n")
