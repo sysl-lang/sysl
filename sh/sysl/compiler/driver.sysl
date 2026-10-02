@@ -421,6 +421,8 @@ emit_llvm_text(path: string, named_target: Option[string],
 
     val promotions = post_analysis_checks(done.an, whole, program.own)
 
+    explain_promotions(promotions, program.own, done.an)
+
     // The tests go next, and they go **after** the analysis rather than instead of it: a `@test`
     // that does not compile is an error in a build that would never have run it, which is what makes
     // it safe to leave one beside the code it tests. Pruning is then the last thing that happens to
@@ -452,6 +454,25 @@ emit_llvm_text(path: string, named_target: Option[string],
     Ok(Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1,
               link_required(program.units)))
 end emit_llvm_text
+
+// What `--explain-escapes` reports about the program's own files: one line per array the escape
+// analysis moved to the heap. A program that failed to compile reports nothing, since it was never
+// going to allocate anything.
+private explain_promotions(pr: Promotions, own: Buf[string], an: &Analysis)
+    if !errors_of(an.diagnostics()).is_empty() then return
+
+    var lines: Buf[string] = buf()
+
+    for i in 0..<pr.notes.len()
+        val file = pr.notes.at(i).0
+
+        for j in 0..<own.len()
+            if own.at(j) == file
+                lines.push(pr.notes.at(i).1)
+                break
+
+    explain_escapes(lines)
+end explain_promotions
 
 // The machine a command line asked for: the one it named, the manifest's default, or this host --
 // with the floor the manifest states checked before anything is read.
@@ -965,6 +986,9 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
     // be asking about a program that is not being built.
     val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
     val promotions = post_analysis_checks(done.an, whole, program.own)
+
+    explain_promotions(promotions, program.own, done.an)
+
     val kept = prune(strip_tests(whole), program.own)
     val lowered = codegen_with_gaps(kept, t, promotions)
 
@@ -1043,9 +1067,12 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
 
     val key = run_cache_key_for("run", path, named_target, level, cc)
 
+    // A cached build was compiled without the question being asked, so one that wants the report
+    // compiles again.
     key match
         Some(one) -> run_cache_hit(one) match
-            Some(built) -> return started(built, args, None).map_err(said)
+            Some(built) ->
+                if !explaining() then return started(built, args, None).map_err(said)
             None -> ()
         None -> ()
 

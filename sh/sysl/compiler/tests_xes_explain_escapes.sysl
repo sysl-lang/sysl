@@ -1,0 +1,143 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// `--explain-escapes` at the command line, which is how a person asks "why did this allocate?".
+//
+// **Every line quoted was read out of the reference** (`sysl` 0.0.155) on the same programs: each
+// promoted array is one line on the way to the build, `file:line:col: 'name' is promoted to the
+// heap, because this view of it is returned`; a build that promoted nothing says `no arrays were
+// promoted to the heap`; a program that does not compile says only its error; and the flag is one
+// every command that compiles a program takes.
+
+// What one command line came to: the status the shell hears and each line the command said. The
+// program is written to a directory of its own, named by its file, and the directory is removed.
+// `None` without the library.
+private xes_run(command: string, text: string, flag: bool) -> Option[(int, Buf[string], string)]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-xes").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val file = s"$root/main.sysl"
+    val args = if flag then ["sysl", command, "--explain-escapes", file] else ["sysl", command, file]
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    Some((code, lines, file))
+end xes_run
+
+private xes_note(file: string, where: string, name: string) -> string =
+    s"$file:$where: '$name' is promoted to the heap, because this view of it is returned"
+
+@test("one promoted array is one line, and it is the first thing said")
+xes_one_promotion_is_one_line()
+    xes_run("emit-llvm", raw"""
+        first() -> []u8
+            var buf: [8]u8
+            buf[0..<3]
+        print(first().len)
+        """, true) match
+        None -> ()
+        Some((code, lines, file)) ->
+            assert_eq(code, Fine)
+            assert_eq(lines.at(0), xes_note(file, "3:8", "buf"))
+            assert(lines.at(1).starts_with("target triple"), lines.at(1))
+end xes_one_promotion_is_one_line
+
+@test("two promoted arrays are two lines, in source order")
+xes_two_promotions_are_two_lines()
+    xes_run("emit-llvm", raw"""
+        first() -> []u8
+            var buf: [8]u8
+            buf[0..<3]
+        second() -> []int
+            var nums: [4]int
+            nums[..]
+        print(first().len + second().len)
+        """, true) match
+        None -> ()
+        Some((code, lines, file)) ->
+            assert_eq(code, Fine)
+            assert_eq(lines.at(0), xes_note(file, "3:8", "buf"))
+            assert_eq(lines.at(1), xes_note(file, "6:9", "nums"))
+            assert(lines.at(2).starts_with("target triple"), lines.at(2))
+end xes_two_promotions_are_two_lines
+
+@test("a program that promotes nothing says so")
+xes_nothing_promoted_says_so()
+    xes_run("emit-llvm", raw"""
+        use() -> int
+            var buf: [4]int
+            buf[0usize]
+        print(use())
+        """, true) match
+        None -> ()
+        Some((code, lines, _)) ->
+            assert_eq(code, Fine)
+            assert_eq(lines.at(0), "no arrays were promoted to the heap")
+            assert(lines.at(1).starts_with("target triple"), lines.at(1))
+end xes_nothing_promoted_says_so
+
+@test("without the flag nothing is explained")
+xes_no_flag_no_notes()
+    xes_run("emit-llvm", raw"""
+        first() -> []u8
+            var buf: [8]u8
+            buf[0..<3]
+        print(first().len)
+        """, false) match
+        None -> ()
+        Some((code, lines, _)) ->
+            assert_eq(code, Fine)
+            assert(lines.at(0).starts_with("target triple"), lines.at(0))
+end xes_no_flag_no_notes
+
+@test("a build says why before it says where it wrote")
+xes_a_build_explains_before_it_wrote()
+    if !clang_available() then return
+
+    xes_run("build", raw"""
+        first() -> []u8
+            var buf: [8]u8
+            buf[0..<3]
+        print(first().len)
+        """, true) match
+        None -> ()
+        Some((code, lines, file)) ->
+            assert_eq(code, Fine)
+            assert_eq(lines.len(), 2)
+            assert_eq(lines.at(0), xes_note(file, "3:8", "buf"))
+            assert(lines.at(1).starts_with("wrote "), lines.at(1))
+end xes_a_build_explains_before_it_wrote
+
+@test("a program that does not compile says its error and no note")
+xes_an_error_says_no_notes()
+    xes_run("emit-llvm", raw"""
+        first() -> []u8
+            var buf: [8]u8
+            buf[0..<3]
+        print(first().len + undefined_name)
+        """, true) match
+        None -> ()
+        Some((code, lines, _)) ->
+            assert_eq(code, Failed)
+            assert_eq(lines.len(), 1)
+            assert(lines.at(0).starts_with("error: undefined name 'undefined_name'"), lines.at(0))
+end xes_an_error_says_no_notes
+
+@test("the flag is on the usage line of the commands that compile")
+xes_the_flag_is_in_the_usage()
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build"], (line) -> sink.push(line))
+
+    assert_eq(code, Misused)
+    assert(lines.at(0).contains("[--explain-escapes]"), lines.at(0))
+end xes_the_flag_is_in_the_usage
