@@ -1,0 +1,394 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `invariant` and `variant` at the head of a loop body, and `variant` in a function's contract block
+// (`reference/verification.md § invariant and variant on a loop`, `§ variant on a function`).
+//
+// Both clauses really run, so most of what is here is a pair: a program the clause lets through and
+// the neighbouring one it stops. Two cases would pass a wrong implementation and are the point of
+// the suite: a loop nested inside another (a measure armed once per call rather than once per entry)
+// and a `@tailrec` self call (a check the jump would skip).
+//
+// **Every output and diagnostic quoted here was read out of the reference compiler (0.0.157)**, whose
+// `LoopContractTests` these are. A failed clause is silent there: the program stops on a trap and
+// prints nothing.
+
+private var lcx_library_cache: Buf[Program] = buf()
+private var lcx_library_read: bool = false
+
+private lcx_library() -> Buf[Program]
+    if lcx_library_read then return lcx_library_cache
+
+    lcx_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> lcx_library_cache = units
+
+    lcx_library_cache
+end lcx_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private lcx_ready() -> bool
+    if lcx_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end lcx_ready
+
+// Builds a program and runs it, answering what it printed and whether it exited cleanly -- or why
+// it could not be built.
+private lcx_build_run(text: string) -> Result[(string, bool), string]
+    val root = make_temp_dir("sysl-loop-contract").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return Err(failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> Err("the program that was built could not be run")
+        Ok(out) -> Ok((out.text + out.err.unwrap_or(""), out.status.ok()))
+end lcx_build_run
+
+// **What a program PRINTS**, where it runs to the end.
+private lcx_ran(text: string) -> string
+    lcx_build_run(text) match
+        Err(why) -> s"it did not build: $why"
+        Ok((out, clean)) -> if clean then out else s"it did not exit zero: $out"
+
+// **That a program that BUILT stopped itself, saying nothing** -- which is all a failed clause does.
+// Answers what is wrong, or the empty string.
+private lcx_traps(text: string) -> string
+    lcx_build_run(text) match
+        Err(why) -> s"it did not build: $why"
+        Ok((out, clean)) ->
+            if clean then return s"it exited cleanly: $out"
+
+            if out != "" then return s"it stopped, but said: $out"
+
+            ""
+end lcx_traps
+
+// **That a program is REFUSED**, with this message, anchored at this `line:column` of `main.sysl`.
+private lcx_refused(text: string, message: string, at: string)
+    lcx_build_run(text) match
+        Ok((out, _)) -> assert(false, s"it built and ran, saying: $out")
+        Err(said) ->
+            assert(said.contains(s"error: $message\n --> "), said)
+            assert(said.contains(s"/main.sysl:$at\n"), said)
+end lcx_refused
+
+private lcx_invariant_misplaced() -> string =
+    "an 'invariant' belongs at the head of a loop's body — it is a condition that holds on every " +
+    "entry to that body, and one written after some of the work has already been done is not that. " +
+    "A condition over a struct's fields is written in the struct, and one over a function's " +
+    "arguments is a 'require'"
+
+private lcx_variant_misplaced() -> string =
+    "a 'variant' belongs at the head of a loop's body, where it is what decreases from one " +
+    "iteration to the next, or in a function's contract block, where it is what decreases at each " +
+    "recursive call"
+
+// ---- a loop invariant ----
+
+@test("a loop invariant holds and the loop runs")
+lcx_invariant_holds()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("sum_to(n: int) -> int\n    var i = 0\n    var s = 0\n\n    while i < n\n" +
+                      "        invariant i >= 0 && i <= n\n        s += i\n        i += 1\n\n    s\n\n" +
+                      "print(sum_to(5))\n"), "10\n")
+
+// The same loop with the bound one too tight: `i` reaches 4 and the clause says it is below 4, so
+// the last entry to the body is the one that stops it.
+@test("a loop invariant that fails stops the program")
+lcx_invariant_fails()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_traps("sum_to(n: int) -> int\n    var i = 0\n    var s = 0\n\n    while i < n\n" +
+                        "        invariant i < 4\n        s += i\n        i += 1\n\n    s\n\n" +
+                        "print(sum_to(5))\n"), "")
+
+// Checked on **entry to the body**, so a loop whose condition is false from the start never checks
+// it -- a clause that also ran at the loop's own entry would trap here.
+@test("a loop invariant is not checked when the body never runs")
+lcx_invariant_not_checked_when_body_never_runs()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("f() -> int\n    var i = 10\n\n    while i < 5\n        invariant false\n" +
+                      "        i += 1\n\n    i\n\nprint(f())\n"), "10\n")
+
+@test("several loop invariants are all checked")
+lcx_several_invariants_all_checked()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_traps("f() -> int\n    var i = 0\n\n    while i < 3\n        invariant i >= 0\n" +
+                        "        invariant i < 2\n        i += 1\n\n    i\n\nprint(f())\n"), "")
+
+@test("a loop invariant carries a message like every other clause")
+lcx_invariant_carries_a_message()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("f() -> int\n    var i = 0\n\n    while i < 2\n" +
+                      "        invariant i >= 0, \"the index never goes backwards\"\n        i += 1\n\n" +
+                      "    i\n\nprint(f())\n"), "2\n")
+
+@test("a loop invariant must be a bool")
+lcx_invariant_must_be_bool()
+    if !lcx_ready() then return
+
+    lcx_refused("f() -> int\n    var i = 0\n\n    while i < 2\n        invariant i + 1\n        i += 1\n\n" +
+                "    i\n", "condition must be bool, got int", "5:9")
+
+// ---- a loop variant ----
+
+@test("a loop variant decreases and the loop runs")
+lcx_variant_decreases()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("f(n: int) -> int\n    var i = 0\n\n    while i < n\n        variant n - i\n" +
+                      "        i += 1\n\n    i\n\nprint(f(4))\n"), "4\n")
+
+// Without the clause this program never terminates, so the clause is the only reason there is a
+// result to assert.
+@test("a loop variant stops a loop that stops making progress")
+lcx_variant_stops_no_progress()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_traps("f() -> int\n    var i = 0\n\n    while i < 10\n        variant 10 - i\n" +
+                        "        if i == 3 then i -= 1\n        else i += 1\n\n    i\n\nprint(f())\n"), "")
+
+// Strictly decreasing: a measure that merely fails to increase is not enough.
+@test("a loop variant that stands still is refused")
+lcx_variant_standing_still()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_traps("f() -> int\n    var i = 0\n    var k = 0\n\n    while i < 3\n        variant k\n" +
+                        "        i += 1\n\n    i\n\nprint(f())\n"), "")
+
+// THE case a wrong implementation passes: the inner loop is entered three times and its measure
+// starts at 3 each time. A flag armed once per *call* would compare the second entry's first measure
+// (3) against the first entry's last (1) and trap on a loop that decreases perfectly well.
+@test("a loop variant is armed once per entry to the loop, not once per call")
+lcx_variant_armed_per_entry()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("nested() -> int\n    var t = 0\n    var i = 0\n\n    while i < 3\n" +
+                      "        variant 3 - i\n        var j = 0\n\n        while j < 3\n" +
+                      "            variant 3 - j\n            t += 1\n            j += 1\n\n" +
+                      "        i += 1\n\n    t\n\nprint(nested())\n"), "9\n")
+
+@test("an unsigned loop measure compares unsigned")
+lcx_unsigned_measure()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("f(n: usize) -> usize\n    var i = 0usize\n\n    while i < n\n        variant n - i\n" +
+                      "        i += 1usize\n\n    i\n\nprint(f(3usize))\n"), "3\n")
+
+@test("a loop variant must be an integer")
+lcx_loop_variant_must_be_integer()
+    if !lcx_ready() then return
+
+    lcx_refused("f() -> int\n    var i = 0\n\n    while i < 2\n        variant true\n        i += 1\n\n" +
+                "    i\n", "a 'variant' is an integer measure, not bool", "5:9")
+
+@test("one loop declares one variant")
+lcx_one_loop_declares_one()
+    if !lcx_ready() then return
+
+    lcx_refused("f() -> int\n    var i = 0\n\n    while i < 2\n        variant 2 - i\n        variant 3 - i\n" +
+                "        i += 1\n\n    i\n",
+                "a loop declares one 'variant' — a measure is the thing that decreases, and two of " +
+                "them say nothing about which", "6:9")
+
+// ---- the clauses reach every loop form ----
+
+@test("the loop clauses reach a counted for")
+lcx_counted_for()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("f(n: int) -> int\n    var s = 0\n\n    for i in 0..<n\n        invariant i >= 0\n" +
+                      "        variant n - i\n        s += i\n\n    s\n\nprint(f(4))\n"), "6\n")
+
+@test("the loop clauses reach a three-clause for")
+lcx_three_clause_for()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("f() -> int\n    var s = 0\n\n    for var i = 0; i < 4; i++\n        variant 4 - i\n" +
+                      "        s += i\n\n    s\n\nprint(f())\n"), "6\n")
+
+@test("the loop clauses reach a loop, where the measure is what ends it")
+lcx_plain_loop()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("f() -> int\n    var i = 0\n\n    loop\n        variant 3 - i\n        i += 1\n" +
+                      "        if i == 3 then break\n\n    i\n\nprint(f())\n"), "3\n")
+
+@test("the loop clauses reach a do-while")
+lcx_do_while()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("f() -> int\n    var i = 0\n\n    do\n        variant 3 - i\n        i += 1\n" +
+                      "    while i < 3\n\n    i\n\nprint(f())\n"), "3\n")
+
+@test("the loop clauses reach a for over an array")
+lcx_for_over_array()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("f(a: [4]int) -> int\n    var s = 0\n    var seen = 0\n\n    for x in a\n" +
+                      "        invariant seen <= 4\n        s += x\n        seen += 1\n\n    s\n\n" +
+                      "var a = [1, 2, 3, 4]\nprint(f(a))\n"), "10\n")
+
+// ---- a function's variant ----
+
+@test("a function's variant decreases at each recursive call")
+lcx_function_variant_decreases()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("gcd(a: int, b: int) -> int\n    require b >= 0\n    variant b\n" +
+                      "    if b == 0 then a\n    else gcd(b, a % b)\n\nprint(gcd(48, 18))\n"), "6\n")
+
+// The recursion does terminate -- it stops at 100 -- so what stops this program is the clause and
+// not the stack.
+@test("a function's variant stops a recursion whose measure grows")
+lcx_function_variant_stops_growth()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_traps("grow(n: int) -> int\n    variant n\n    if n > 100 then n\n    else grow(n + 1)\n\n" +
+                        "print(grow(1))\n"), "")
+
+// A `variant` is checked *before* the call, so it survives the jump a tail call becomes; a check
+// emitted only on the ordinary call path would be skipped here entirely.
+@test("a function's variant survives the tail-call transform")
+lcx_variant_survives_tailrec()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("@tailrec\nwalk(n: int, acc: int) -> int\n    variant n\n    if n == 0 then acc\n" +
+                      "    else walk(n - 1, acc + n)\n\nprint(walk(4, 0))\n"), "10\n")
+
+@test("a function's variant catches a tail self-call that does not decrease")
+lcx_variant_catches_tail_call()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_traps("@tailrec\nwalk(n: int, acc: int) -> int\n    variant n\n    if acc > 50 then acc\n" +
+                        "    else walk(n + 1, acc + n)\n\nprint(walk(1, 0))\n"), "")
+
+// The measure is over the arguments the call supplies, so a computed argument is measured computed.
+@test("a function's variant measures the argument the call supplies")
+lcx_variant_measures_the_argument()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("down(n: int) -> int\n    variant n\n    if n <= 0 then 0\n" +
+                      "    else down(n / 2 - 1) + 1\n\nprint(down(9))\n"), "2\n")
+
+@test("a function's variant reads its parameters and nothing else")
+lcx_variant_reads_parameters_only()
+    if !lcx_ready() then return
+
+    lcx_refused("f(n: int) -> int\n    variant k\n    var k = 3\n    n\n", "undefined name 'k'", "2:13")
+
+@test("a function's variant must be an integer")
+lcx_function_variant_must_be_integer()
+    if !lcx_ready() then return
+
+    lcx_refused("f(n: int) -> int\n    variant n > 0\n    n\n", "a 'variant' is an integer measure, not bool",
+                "2:5")
+
+@test("one function declares one variant")
+lcx_one_function_declares_one()
+    if !lcx_ready() then return
+
+    lcx_refused("f(n: int, m: int) -> int\n    variant n\n    variant m\n    n\n",
+                "a function declares one 'variant' — a measure is the thing that decreases, and two " +
+                "of them say nothing about which", "3:5")
+
+@test("a closure declares no variant, and neither does a function nested in another")
+lcx_nested_function_declares_none()
+    if !lcx_ready() then return
+
+    lcx_refused("outer() -> int\n    inner(n: int) -> int\n        variant n\n        if n <= 0 then 0\n" +
+                "        else inner(n - 1) + 1\n\n    inner(3)\n",
+                "a 'variant' is a top-level function's — the measure is checked where a call to the " +
+                "same body is written, and neither a closure, which is reached through 'Fn', nor a " +
+                "function nested in another, whose calls carry a captured environment, is reached " +
+                "that way", "3:9")
+
+@test("a function with a variant and no recursive call simply carries it")
+lcx_variant_without_recursion()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("f(n: int) -> int\n    variant n\n    n * 2\n\nprint(f(21))\n"), "42\n")
+
+// ---- where a clause may stand ----
+
+@test("an invariant after a statement in a loop body is refused")
+lcx_invariant_after_a_statement()
+    if !lcx_ready() then return
+
+    lcx_refused("f() -> int\n    var i = 0\n\n    while i < 2\n        i += 1\n        invariant i > 0\n\n" +
+                "    i\n", lcx_invariant_misplaced(), "6:9")
+
+@test("an invariant in a function's contract block is refused, and named as a require")
+lcx_invariant_in_a_contract_block()
+    if !lcx_ready() then return
+
+    lcx_refused("f(n: int) -> int\n    invariant n > 0\n    n\n", lcx_invariant_misplaced(), "2:5")
+
+@test("a variant after a statement in a loop body is refused")
+lcx_variant_after_a_statement()
+    if !lcx_ready() then return
+
+    lcx_refused("f() -> int\n    var i = 0\n\n    while i < 2\n        i += 1\n        variant 2 - i\n\n" +
+                "    i\n", lcx_variant_misplaced(), "6:9")
+
+@test("an invariant in a plain block is refused")
+lcx_invariant_in_a_plain_block()
+    if !lcx_ready() then return
+
+    lcx_refused("f() -> int\n    if true then\n        invariant true\n        1\n    else 2\n",
+                lcx_invariant_misplaced(), "3:9")
+
+// ---- the words stay ordinary identifiers ----
+
+@test("a value may be called 'invariant'")
+lcx_a_value_called_invariant()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("f() -> int\n    var invariant = 7\n    invariant + 1\n\nprint(f())\n"), "8\n")
+
+@test("a value may be called 'variant'")
+lcx_a_value_called_variant()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_ran("f() -> int\n    var variant = 41\n    variant + 1\n\nprint(f())\n"), "42\n")
+
+@test("a struct's own 'invariant' clause is untouched by the loop clauses")
+lcx_struct_invariant_untouched()
+    if !lcx_ready() then return
+
+    assert_eq(lcx_traps("struct Span\n    lo: int\n    hi: int\n\n    invariant lo <= hi\n\n" +
+                        "print(Span(5, 1).lo)\n"), "")
