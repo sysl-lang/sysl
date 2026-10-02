@@ -1,0 +1,125 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A dependency whose manifest label is the very name of the module it holds -- `zstd { path = … }`
+// over a package whose module is `zstd`. A `path` dependency's canonical prefix is its label, so its
+// module is filed as `zstd.zstd`, and the head `zstd` then BEGINS a module: read alone it seemed to
+// lead somewhere as written and came back unchanged, so `zstd.tag()` was an undefined name. The
+// whole path is what is read through the package layer, as the reference reads it.
+//
+// Every expected output was read off the reference (0.0.155) run over the same trees.
+
+private pdl_ready() -> bool = std_root().is_ok() && clang_available()
+
+private pdl_temp() -> string = absolute_path(make_temp_dir("sysl-pdl").unwrap())
+
+private pdl_manifest(name: string, deps: string) -> string =
+    s"package { name = \"$name\", version = \"1.0.0\" }\n" +
+    (if deps.is_empty() then "" else s"dependencies { $deps }\n")
+
+// A package on disk holding one module, `module_name`, whose source is `text`.
+private pdl_package(dir: string, module_name: string, text: string)
+    make_dir_all(s"$dir/$module_name").unwrap()
+    write_text(s"$dir/package.hocon", pdl_manifest(module_name, "")).unwrap()
+    write_text(s"$dir/$module_name/$module_name.sysl", s"module $module_name\n\n$text\n").unwrap()
+
+// A program at its own root whose manifest names `deps`.
+private pdl_app(root: string, deps: string, program: string)
+    make_dir_all(root).unwrap()
+    write_text(s"$root/package.hocon", pdl_manifest("app", deps)).unwrap()
+    write_text(s"$root/main.sysl", program).unwrap()
+
+// What the program built from `root` prints, or what stopped it.
+private pdl_run(root: string) -> string
+    val out_dir = pdl_temp()
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end pdl_run
+
+private pdl_zstd() -> string =
+    "tag() -> string = \"compressed\"\n\nstruct Level\n    n: int\n\nenum Mode\n    Fast\n    Slow\n\n" +
+    "val answer: int = 42\nconst width: int = 7"
+
+@test("a path dependency labelled with its own module's name is reached by that name")
+pdl_a_label_naming_its_module_is_reachable()
+    if !pdl_ready() then return
+
+    val root = pdl_temp()
+
+    pdl_package(s"$root/dep", "zstd", pdl_zstd())
+    pdl_app(s"$root/app", s"zstd { path = \"$root/dep\" }", "print(zstd.tag())\n")
+
+    assert_eq(pdl_run(s"$root/app"), "compressed\n")
+    remove_dir_all(root).unwrap_or(())
+
+// Every form a module path is read through: a call, a constructor, a value, a constant, and a variant
+// both through its enum and through the module alone.
+@test("and every form reached through it reads the package, not the bare label")
+pdl_every_form_through_a_label_naming_its_module()
+    if !pdl_ready() then return
+
+    val root = pdl_temp()
+
+    pdl_package(s"$root/dep", "zstd", pdl_zstd())
+    pdl_app(s"$root/app", s"zstd { path = \"$root/dep\" }",
+            "val l = zstd.Level(3)\nval m = zstd.Mode.Slow\nprint(zstd.tag())\nprint(l.n)\n" +
+            "print(zstd.answer)\nprint(zstd.width)\nprint(m == zstd.Slow)\n")
+
+    assert_eq(pdl_run(s"$root/app"), "compressed\n3\n42\n7\ntrue\n")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a path dependency whose label is not its module's name is still reached by the module")
+pdl_a_label_unlike_its_module_still_reads_the_module()
+    if !pdl_ready() then return
+
+    val root = pdl_temp()
+
+    pdl_package(s"$root/dep", "engine", "tag() -> string = \"eng\"")
+    pdl_app(s"$root/app", s"e { path = \"$root/dep\" }", "print(engine.tag())\n")
+
+    assert_eq(pdl_run(s"$root/app"), "eng\n")
+    remove_dir_all(root).unwrap_or(())
+
+// The label names the package and the module names the code, so a label spelled like a DIFFERENT
+// module of nothing is no reading of its own.
+@test("and one labelled with another word reaches its module, not the label")
+pdl_a_label_spelled_otherwise_is_not_a_module()
+    if !pdl_ready() then return
+
+    val root = pdl_temp()
+
+    pdl_package(s"$root/dep", "zstd", pdl_zstd())
+    pdl_app(s"$root/app", s"z { path = \"$root/dep\" }", "print(zstd.tag())\n")
+
+    assert_eq(pdl_run(s"$root/app"), "compressed\n")
+    remove_dir_all(root).unwrap_or(())
+
+// A coordinate's canonical prefix is the coordinate, which begins no name a file writes, so this was
+// never the defect's shape -- held here so the two kinds of dependency stay one reading.
+@test("a coordinate dependency named after its module is reached by that name too")
+pdl_a_coordinate_named_after_its_module()
+    if !pdl_ready() then return
+
+    val root = pdl_temp()
+    val dir = s"$root/app/vendor/github.com/e/zstd/@v1.0.0"
+
+    pdl_package(dir, "zstd", pdl_zstd())
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+    write_text(s"$root/app/package.hocon",
+               pdl_manifest("app", "zstd { git = \"github.com/e/zstd\", version = \"1.0.0\" }")).unwrap()
+    write_text(s"$root/app/main.sysl", "print(zstd.tag())\n").unwrap()
+
+    assert_eq(pdl_run(s"$root/app"), "compressed\n")
+    remove_dir_all(root).unwrap_or(())
