@@ -1,0 +1,181 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// `sysl add` -- reading what was typed, and rewriting the manifest.
+//
+// **The rewrite is what these are mostly about, and the property under test is what is NOT changed.**
+// A manifest in this org is about three fifths comment, so the failure worth catching is a rewrite
+// that quietly took somebody's paragraph out, or re-laid-out a block to fit a longer name.
+//
+// Nothing here touches a network: reading the spec, picking the newest tag and the rewrite are text in
+// and text out. **Every manifest and every refusal below was read off the installed `sysl add`** (0.0.153),
+// run in a scratch project holding the same `package.hocon`.
+
+private tlc_manifest() -> string =
+    "// Why this project takes what it takes, which is the part a reprint would eat.\n" +
+    "\n" +
+    "package {\n" +
+    "  name    = \"demo\"\n" +
+    "  version = \"0.1.0\"\n" +
+    "}\n" +
+    "\n" +
+    "dependencies {\n" +
+    "  sdl3       { git = \"github.com/sysl-lang/sdl3\",       version = \"0.3.1\" }\n" +
+    "  sdl3-ttf   { git = \"github.com/sysl-lang/sdl3-ttf\",   version = \"0.3.0\" }\n" +
+    "}\n" +
+    "\n" +
+    "requires {\n" +
+    "  os = true\n" +
+    "}\n"
+
+private tlc_with_png() -> string =
+    add_dependency(tlc_manifest(), "png", "github.com/sysl-lang/png", "0.1.0").unwrap()
+
+private tlc_tags(a: string, b: string, c: string, d: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for t in [a, b, c, d]
+        if t != "" then out.push(t)
+
+    out
+end tlc_tags
+
+private tlc_newest(tags: Buf[string]) -> string = newest_release(tags) match
+    Some(v) -> release_shown(v)
+    None -> "none"
+
+// -- what was typed ---------------------------------------------------------------------------------
+
+@test("a bare coordinate asks for the newest version")
+tlc_a_bare_coordinate()
+    val asked = read_add_spec("github.com/sysl-lang/sdl3").unwrap()
+
+    assert_eq(asked.coordinate, "github.com/sysl-lang/sdl3")
+    assert(asked.version.is_none(), "a bare coordinate pinned a version")
+    assert_eq(asked.label, "sdl3")
+end tlc_a_bare_coordinate
+
+// Both spellings arrive from people reading the same repository page, so the `v` is taken and dropped
+// rather than refused.
+@test("a pinned one takes its version, with or without the tag's 'v'")
+tlc_a_pinned_coordinate()
+    assert_eq(read_add_spec("github.com/sysl-lang/sdl3@0.3.1").unwrap().version.unwrap(), "0.3.1")
+    assert_eq(read_add_spec("github.com/sysl-lang/sdl3@v0.3.1").unwrap().version.unwrap(), "0.3.1")
+end tlc_a_pinned_coordinate
+
+@test("a URL is refused, and the refusal says what to write")
+tlc_a_url_is_refused()
+    assert_eq(read_add_spec("https://github.com/sysl-lang/sdl3").unwrap_err(),
+              "'https://github.com/sysl-lang/sdl3' is a URL — a coordinate is an identity, so it " +
+              "carries no scheme: github.com/sysl-lang/sdl3")
+end tlc_a_url_is_refused
+
+@test("so is a version that is not one")
+tlc_a_version_that_is_not_one()
+    assert_eq(read_add_spec("github.com/sysl-lang/sdl3@newest").unwrap_err(),
+              "'newest' is not a version — a version is three numbers, as in '1.4.2'")
+end tlc_a_version_that_is_not_one
+
+// The label is what an import line will say, so a major-version suffix is not part of it.
+@test("the entry is named for the repository, not for its major version")
+tlc_the_label_is_the_repository()
+    assert_eq(label_of("github.com/edadma/json"), "json")
+    assert_eq(label_of("github.com/edadma/json/v2"), "json")
+end tlc_the_label_is_the_repository
+
+// -- which version is newest ------------------------------------------------------------------------
+
+@test("the highest release tag wins, and ordering is numeric rather than lexical")
+tlc_the_highest_tag_wins()
+    assert_eq(tlc_newest(tlc_tags("v0.9.0", "v0.10.0", "v0.2.0", "")), "0.10.0")
+end tlc_the_highest_tag_wins
+
+// Repositories carry tags that are not versions, and none of them is something a manifest can pin --
+// so they are passed over rather than refused.
+@test("a tag that is not a version is passed over")
+tlc_a_tag_that_is_not_a_version()
+    assert_eq(tlc_newest(tlc_tags("latest", "nightly", "v1.2.3", "v2.0.0-rc1")), "1.2.3")
+end tlc_a_tag_that_is_not_a_version
+
+@test("and a repository with no version tag has no answer")
+tlc_no_version_tag()
+    assert_eq(tlc_newest(tlc_tags("latest", "main", "", "")), "none")
+end tlc_no_version_tag
+
+// -- rewriting the manifest -------------------------------------------------------------------------
+
+@test("the entry goes in, lined up with its siblings")
+tlc_the_entry_lines_up()
+    assert(tlc_with_png().contains(
+               "\n  png        { git = \"github.com/sysl-lang/png\", version = \"0.1.0\" }\n"),
+           tlc_with_png())
+end tlc_the_entry_lines_up
+
+// The whole reason the rewrite is textual, asserted as an equality on the whole file -- so a rewrite
+// that moved a blank line or re-indented the `package` block fails here too.
+@test("and nothing else in the file moves")
+tlc_nothing_else_moves()
+    assert_eq(tlc_with_png(),
+              "// Why this project takes what it takes, which is the part a reprint would eat.\n" +
+              "\n" +
+              "package {\n" +
+              "  name    = \"demo\"\n" +
+              "  version = \"0.1.0\"\n" +
+              "}\n" +
+              "\n" +
+              "dependencies {\n" +
+              "  sdl3       { git = \"github.com/sysl-lang/sdl3\",       version = \"0.3.1\" }\n" +
+              "  sdl3-ttf   { git = \"github.com/sysl-lang/sdl3-ttf\",   version = \"0.3.0\" }\n" +
+              "  png        { git = \"github.com/sysl-lang/png\", version = \"0.1.0\" }\n" +
+              "}\n" +
+              "\n" +
+              "requires {\n" +
+              "  os = true\n" +
+              "}\n")
+end tlc_nothing_else_moves
+
+@test("a name already there is refused rather than added twice")
+tlc_a_name_already_there()
+    assert_eq(add_dependency(tlc_manifest(), "sdl3", "github.com/sysl-lang/sdl3", "0.4.0").unwrap_err(),
+              "'sdl3' is already a dependency of this project — change its version in " +
+              "package.hocon, or remove the entry and add it again")
+end tlc_a_name_already_there
+
+// A project that takes nothing yet is the case somebody meets first, and there is no block to put
+// anything in.
+@test("a project with no dependencies block gets one")
+tlc_a_block_is_made()
+    assert_eq(add_dependency("package {\n  name = \"demo\"\n}\n", "png", "github.com/sysl-lang/png",
+                             "0.1.0").unwrap(),
+              "package {\n  name = \"demo\"\n}\n\ndependencies {\n" +
+              "  png { git = \"github.com/sysl-lang/png\", version = \"0.1.0\" }\n}\n")
+end tlc_a_block_is_made
+
+// A `}` inside a comment or a string closes nothing, and a brace counter that did not know the
+// difference would stop in the middle of a sentence and write the entry there.
+@test("a brace inside a comment or a string does not end the block")
+tlc_a_brace_in_a_comment()
+    val tricky = "dependencies {\n  // a closing brace } in a sentence\n" +
+        "  gc { git = \"github.com/sysl-lang/gc\", version = \"0.2.2\" }\n}\n"
+
+    assert_eq(add_dependency(tricky, "png", "github.com/sysl-lang/png", "0.1.0").unwrap(),
+              "dependencies {\n  // a closing brace } in a sentence\n" +
+              "  gc { git = \"github.com/sysl-lang/gc\", version = \"0.2.2\" }\n" +
+              "  png { git = \"github.com/sysl-lang/png\", version = \"0.1.0\" }\n}\n")
+end tlc_a_brace_in_a_comment
+
+// The result has to still be a manifest, which is what the command checks before writing -- so the
+// rewrite is asserted against the reader rather than against the eye.
+@test("and what comes out still reads as a manifest")
+tlc_the_result_reads()
+    val read = read_manifest(tlc_with_png()).unwrap()
+    var labels: Buf[string] = buf()
+
+    for i in 0..<read.dependencies.len()
+        labels.push(read.dependencies.at(i).label)
+
+    assert(holds_string(labels, "png"), s"the rewritten manifest has ${labels.len()} dependencies")
+end tlc_the_result_reads
