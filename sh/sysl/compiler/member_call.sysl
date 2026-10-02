@@ -355,11 +355,11 @@ private receiving_member(cx: &Analyzer, span: Span, key: string, name: string,
     None
 end receiving_member
 
-// Whether a subject's own type arguments meet what its declaration asks of them, asked without a
-// word: where they do not, the refusal was made where the arguments were written or settled.
+// Whether a subject's own type arguments meet what its declaration asks of them.
 //
-// A parameter standing in for itself is answered by its own bounds where it was written, so an
-// argument list holding one is not asked again here.
+// A parameter standing in for itself promises what its own bounds say, so `Scored.of(x)` in a body
+// whose `T` was never bounded by `Rank` is refused at the call and the member is not made real at
+// that `T`; a type merely built over one is left to the body read at a type.
 private subject_bounds_met(cx: &Analyzer, span: Span, ty: Type) -> bool
     val applied = repr(ty) match
         Struct(d) -> Some((d.base, d.targs))
@@ -369,9 +369,14 @@ private subject_bounds_met(cx: &Analyzer, span: Span, ty: Type) -> bool
     if applied.is_none() || applied.unwrap().1.is_empty() then return true
 
     val targs = applied.unwrap().1
+    var stand_in = false
 
     for i in 0..<targs.len()
-        if targs.at(i) == Unknown || mentions_abstract(targs.at(i)) then return true
+        if targs.at(i) == Unknown then return true
+
+        targs.at(i) match
+            Abstract(_, _) -> stand_in = true
+            other -> if mentions_abstract(other) then return true
 
     val declared = cx.an.tables.types.get(applied.unwrap().0)
 
@@ -385,11 +390,22 @@ private subject_bounds_met(cx: &Analyzer, span: Span, ty: Type) -> bool
     if shape.is_none() || shape.unwrap().1.is_empty() then return true
 
     val mark = cx.an.complaints()
+    val kept = cx.an.kept.len()
     val met = check_param_bounds(cx.an, declared.unwrap().scope, span, applied.unwrap().0,
                                  shape.unwrap().0, shape.unwrap().1, targs, buf(), "type parameter",
                                  cx.scope)
 
-    cx.an.restore_complaints(mark)
+    // **A concrete argument is asked without a word** -- the refusal was made where it was written
+    // or settled, and a written `Scored[int]` resolves to nothing the call could be read at. **A
+    // parameter standing in for itself is told at the call as well**, the caller's signature having
+    // kept the type it refused: `keep[T](x: T) -> Scored[T] = Scored.of(x)` is refused at both, as
+    // the reference refuses it. Said once at one place either way, a refusal already made there
+    // being one the analysis does not repeat.
+    if !stand_in
+        cx.an.restore_complaints(mark)
+        cx.an.kept.truncate(kept)
+    end if
+
     met
 end subject_bounds_met
 

@@ -80,10 +80,29 @@ end agn_report
 // The program is refused with exactly this message, first, at this line and column of `main.sysl`.
 private agn_refused(main: string, message: string, at: string)
     val out = agn_report(main)
+    // The first diagnostic alone, which is where the location has to be.
+    val first = out.index_of("\n\n") match
+        Some(n) -> out[0..<n]
+        None -> out
 
     assert(out.starts_with(s"error: $message\n "), s"expected 'error: $message' first, got: $out")
-    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+    assert(first.index_of(s"/main.sysl:$at\n").is_some(), s"expected it first at main.sysl:$at, got: $out")
 end agn_refused
+
+// Everything the program was refused with, as `line:column` locations in order.
+private agn_places(main: string) -> string
+    val lines = lines_of(agn_report(main))
+    var out = ""
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        line.index_of("/main.sysl:") match
+            Some(n) -> out = out + line[n + 11..<line.len] + " "
+            None -> ()
+
+    out
+end agn_places
 
 private agn_prints(main: string, expected: string)
     val out = agn_ran(main)
@@ -148,17 +167,23 @@ agn_one_of_several_named()
 agn_argument_misses_bound()
     if agn_skip() then return
 
-    agn_refused(agn_rank() + "struct Scored[T: Rank]\n    n: int\n    of(x: T) -> Scored[T] = Scored(x.rank())\n" +
-                "print(Scored.of(3).n)",
-                "'Scored' requires its type parameter 'T' to implement 'Rank', but int does not", "6:14")
+    val main = agn_rank() + "struct Scored[T: Rank]\n    n: int\n    of(x: T) -> Scored[T] = Scored(x.rank())\n" +
+               "print(Scored.of(3).n)"
+
+    agn_refused(main, "'Scored' requires its type parameter 'T' to implement 'Rank', but int does not", "6:14")
+
+    // Once, at the call: the member is not made real at an instantiation already refused.
+    assert(agn_places(main) == "6:14 ", s"expected one refusal, got: ${agn_report(main)}")
 
 @test("an instantiation inferred from the expected type is held to the type's bound too")
 agn_expected_type_misses_bound()
     if agn_skip() then return
 
-    agn_refused(agn_rank() + "struct Scored[T: Rank]\n    n: int\n    zero() -> Scored[T] = Scored(0)\n" +
-                "var s: Scored[int] = Scored.zero()",
-                "'Scored' requires its type parameter 'T' to implement 'Rank', but int does not", "6:8")
+    val main = agn_rank() + "struct Scored[T: Rank]\n    n: int\n    zero() -> Scored[T] = Scored(0)\n" +
+               "var s: Scored[int] = Scored.zero()"
+
+    agn_refused(main, "'Scored' requires its type parameter 'T' to implement 'Rank', but int does not", "6:8")
+    assert(agn_places(main) == "6:8 ", s"expected one refusal, got: ${agn_report(main)}")
 
 @test("an argument disagreeing with the type parameter the other one fixed is reported")
 agn_argument_disagrees()
@@ -191,6 +216,12 @@ agn_render_unbounded()
     agn_refused("struct Box[T]\n    v: T\n    describe(x: T) -> string = str(x)",
                 "'str' needs 'T: sysl.Display'", "3:32")
 
+@test("an interpolation hole over an unbounded parameter names 'str' as the form that needs the bound")
+agn_interpolation_names_str()
+    if agn_skip() then return
+
+    agn_refused("f[T](x: T) -> string = s\"a${x}\"", "'str' needs 'T: sysl.Display'", "1:24")
+
 @test("an operator on an unbounded parameter in an associated function names the bound")
 agn_operator_unbounded()
     if agn_skip() then return
@@ -211,10 +242,25 @@ agn_bound_licenses_its_own()
 agn_caller_unbounded()
     if agn_skip() then return
 
-    agn_refused(agn_rank() + "struct Scored[T: Rank]\n    n: int\n    of(x: T) -> Scored[T] = Scored(0)\n" +
-                "keep[T](x: T) -> Scored[T] = Scored.of(x)",
-                "'Scored' requires its type parameter 'T' to implement 'Rank', but 'T' is not bounded by it",
+    val main = agn_rank() + "struct Scored[T: Rank]\n    n: int\n    of(x: T) -> Scored[T] = Scored(0)\n" +
+               "keep[T](x: T) -> Scored[T] = Scored.of(x)"
+
+    agn_refused(main, "'Scored' requires its type parameter 'T' to implement 'Rank', but 'T' is not bounded by it",
                 "6:18")
+
+    // At the signature and at the call, and nowhere inside the member the call would have reached.
+    assert(agn_places(main) == "6:18 6:37 ", s"expected the signature and the call, got: ${agn_report(main)}")
+
+@test("a type refused at its written application is not refused again where a value of it is built")
+agn_refused_application_said_once()
+    if agn_skip() then return
+
+    val main = agn_rank() + "struct Scored[T: Rank]\n    n: int\n    of(x: T) -> Scored[T] = Scored(0)\n" +
+               "keep[T](x: T) -> int\n    var s: Scored[T] = Scored(0)\n    s.n"
+
+    agn_refused(main, "'Scored' requires its type parameter 'T' to implement 'Rank', but 'T' is not bounded by it",
+                "7:12")
+    assert(agn_places(main) == "7:12 ", s"expected one refusal, got: ${agn_report(main)}")
 
 // -- there has to be a name to reach it through ---------------------------------------------------
 
@@ -286,6 +332,27 @@ agn_property_through_type()
 
     agn_refused("struct Box[T]\n    v: T\n    size -> int = 1\nprint(Box.size())",
                 "'size' is a property of 'Box' — read it on a value, as 'value.size'", "4:11")
+
+@test("a method reached through a non-generic type's name says to use a value")
+agn_method_through_plain_type()
+    if agn_skip() then return
+
+    agn_refused("struct Box\n    v: int\n    get(self) -> int = self.v\nprint(Box.get())",
+                "'get' is an instance method of 'Box' — call it on a value, not the type", "4:11")
+
+@test("a property reached through a non-generic type's name says to read it on a value")
+agn_property_through_plain_type()
+    if agn_skip() then return
+
+    agn_refused("struct Box\n    v: int\n    size -> int = 1\nprint(Box.size())",
+                "'size' is a property of 'Box' — read it on a value, as 'value.size'", "4:11")
+
+@test("an argument disagreeing with a non-generic associated function's parameter names the callee alone")
+agn_plain_argument_disagrees()
+    if agn_skip() then return
+
+    agn_refused("struct Box\n    v: int\n    of(x: int) -> Box = Box(x)\nprint(Box.of(\"s\").v)",
+                "'x' of 'Box.of' is int, but string was given", "4:14")
 
 @test("an associated function the type does not declare is reported against the type")
 agn_undeclared_associated()
