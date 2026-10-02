@@ -1,0 +1,477 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A name may stand for several functions and every use of it still names exactly one**
+// (`reference/declarations.md § Overloading`). Checked by running wherever it can be: each
+// declaration answers differently, so a call reaching the wrong one prints the wrong thing rather
+// than failing to compile.
+//
+// The refusals divide in two. A pair no call could tell apart is refused **at the declaration**,
+// since the mistake is in the pair; a use that fits none or several is refused **at the use**.
+//
+// **Every output and every message here was read out of the reference compiler** (0.0.156), whose
+// `OverloadTests` these are, by handing the installed `sysl` the same program.
+
+private ovl_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end ovl_ready
+
+// A tree holding these files, each at its path below a fresh root.
+private ovl_tree(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-ovl").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    root
+end ovl_tree
+
+// What a program of these files prints, or what stopped it.
+private ovl_ran_files(files: []const (string, string)) -> string
+    val root = ovl_tree(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ovl_ran_files
+
+private ovl_ran(text: string) -> string = ovl_ran_files([("main.sysl", text)])
+
+// The whole report a one-file program is refused with, rendered the way a reader sees it.
+private ovl_err(text: string) -> string
+    val root = ovl_tree([("main.sysl", text)])
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ovl_err
+
+// The LLVM text of a one-file program that must compile.
+private ovl_ir(text: string) -> string
+    val root = ovl_tree([("main.sysl", text)])
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ovl_ir
+
+// A refusal carries this message, anchored at this `line:column` of `main.sysl`.
+private ovl_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+// How many errors a report holds.
+private ovl_errors(said: string) -> usize = ("\n" + said).count_of("\nerror: ")
+
+// -- a name may be declared more than once -------------------------------------------------------------
+
+@test("and a call chooses by how many arguments it passes")
+ovl_chooses_by_count()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("paint(x: int) -> string = s\"one $x\"\n" +
+                      "paint(x: int, y: int) -> string = s\"two $x $y\"\n\n" +
+                      "print(paint(1))\nprint(paint(1, 2))\n"), "one 1\ntwo 1 2\n")
+end ovl_chooses_by_count
+
+@test("or by what type they are")
+ovl_chooses_by_type()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("show(x: int) -> string = s\"int $x\"\n" +
+                      "show(x: string) -> string = s\"str $x\"\n" +
+                      "show(x: bool) -> string = s\"bool $x\"\n\n" +
+                      "print(show(1))\nprint(show(\"a\"))\nprint(show(true))\n"),
+              "int 1\nstr a\nbool true\n")
+end ovl_chooses_by_type
+
+@test("including two widths of one number, told apart by the literal's own type")
+ovl_two_widths()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("width(x: int) -> string = \"int\"\nwidth(x: i64) -> string = \"i64\"\n\n" +
+                      "print(width(1))\nprint(width(1i64))\n"), "int\ni64\n")
+end ovl_two_widths
+
+@test("and there may be more than two of them")
+ovl_more_than_two()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("at(a: int) -> string = \"1\"\nat(a: int, b: int) -> string = \"2\"\n" +
+                      "at(a: int, b: int, c: int) -> string = \"3\"\n\n" +
+                      "print(at(1) + at(1, 2) + at(1, 2, 3))\n"), "123\n")
+end ovl_more_than_two
+
+@test("across the files of one module, which is where a name lives")
+ovl_across_files()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran_files([("main.sysl", "print(m.pick(1))\nprint(m.pick(\"a\"))\n"),
+                             ("m/a.sysl", "module m\n\npick(x: int) -> string = \"int\"\n"),
+                             ("m/b.sysl", "module m\n\npick(x: string) -> string = \"str\"\n")]),
+              "int\nstr\n")
+end ovl_across_files
+
+@test("while a name declared once is unchanged, defaults and all")
+ovl_declared_once()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("only(a: int, b: int = 10) -> int = a + b\n" +
+                      "print(str(only(1)), str(only(1, 2)))\n"), "11 3\n")
+end ovl_declared_once
+
+// -- an address is of one of them, read off the type the context wants -------------------------------
+
+@test("which the expected type settles")
+ovl_address_by_expected()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("add(a: int) -> int = a + 1\nadd(a: int, b: int) -> int = a + b\n\n" +
+                      "val one: *extern(int) -> int = &add\n" +
+                      "val two: *extern(int, int) -> int = &add\n\n" +
+                      "print(str(one(41)), str(two(6, 7)))\n"), "42 13\n")
+end ovl_address_by_expected
+
+@test("whichever order they were declared in")
+ovl_address_either_order()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("add(a: int, b: int) -> int = a + b\nadd(a: int) -> int = a + 1\n\n" +
+                      "val one: *extern(int) -> int = &add\nprint(str(one(41)))\n"), "42\n")
+end ovl_address_either_order
+
+@test("and with no expected type to read, it says so rather than choosing")
+ovl_address_with_nothing_expected()
+    if !ovl_ready() then return
+
+    ovl_refused(ovl_err("add(a: int) -> int = a + 1\nadd(a: int, b: int) -> int = a + b\n\n" +
+                        "var f = &add\n"),
+                "'add' names 2 functions, and an address is of one of them — which is read off the " +
+                "type the context wants, and there is none here. Annotate what this address is being " +
+                "stored in or passed as", "4:9")
+end ovl_address_with_nothing_expected
+
+// Same arity on both, so only the parameter's type can have decided it -- taking the first candidate
+// reaches `tag(s: string)` and fails.
+@test("a bare name used as a callable chooses the same way")
+ovl_bare_name_as_callable()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("tag(s: string) -> int = 99\ntag(a: int) -> int = a + 1\n\n" +
+                      "apply(f: int -> int, x: int) -> int = f(x)\n\n" +
+                      "print(str(apply(tag, 41)))\n"), "42\n")
+end ovl_bare_name_as_callable
+
+// -- a refused declaration is still there for a call of the name to find ------------------------------
+
+// Each refusal is asked again with a call below it: the refusal is what comes out, and the only thing
+// that does. The quoted source line is asserted so the call's absence says something about the
+// diagnostics rather than about a message carrying no source at all.
+
+@test("a sysl function refused for overloading an 'extern'")
+ovl_refused_sysl_beside_extern()
+    if !ovl_ready() then return
+
+    val said = ovl_err("extern \"abs\" bump(a: int) -> int\nbump(a: long) -> long = a\nprint(bump(3))\n")
+
+    ovl_refused(said, "'bump' is already declared as an 'extern', which this would overload — what " +
+                "tells overloads of an 'extern' apart is the symbol each names, and a sysl function " +
+                "declares no symbol", "2:1")
+    assert(said.contains("bump(a: long) -> long = a"), said)
+    assert(!said.contains("print(bump(3))"), said)
+end ovl_refused_sysl_beside_extern
+
+@test("an 'extern' refused for overloading a sysl function")
+ovl_refused_extern_beside_sysl()
+    if !ovl_ready() then return
+
+    val said = ovl_err("bump(a: long) -> long = a\nextern \"abs\" bump(a: int) -> int\nprint(bump(3))\n")
+
+    ovl_refused(said, "'bump' is already declared as a function, so this 'extern' would overload it " +
+                "— what tells overloads of an 'extern' apart is the symbol each names, and a sysl " +
+                "function declares no symbol", "2:1")
+    assert(said.contains("extern \"abs\" bump(a: int) -> int"), said)
+    assert(!said.contains("print(bump(3))"), said)
+end ovl_refused_extern_beside_sysl
+
+@test("an 'extern' refused for naming a symbol another of the name has")
+ovl_refused_extern_one_symbol()
+    if !ovl_ready() then return
+
+    val said = ovl_err("extern \"abs\" bump(a: int) -> int\nextern \"abs\" bump(a: long) -> long\n" +
+                       "print(bump(3))\n")
+
+    ovl_refused(said, "'bump' is already declared as an 'extern' for the symbol 'abs' — two " +
+                "declarations of one name are two functions, and one C function cannot be two. " +
+                "Overloads of an 'extern' are told apart by the symbol each names, so give this one " +
+                "a symbol of its own or take its address and 'ptr_cast' it where the other signature " +
+                "is wanted", "2:1")
+    assert(said.contains("extern \"abs\" bump(a: long) -> long"), said)
+    assert(!said.contains("print(bump(3))"), said)
+end ovl_refused_extern_one_symbol
+
+@test("a function refused for differing from another only in what it returns")
+ovl_refused_result_only_then_called()
+    if !ovl_ready() then return
+
+    val said = ovl_err("bump(a: int) -> int = a\nbump(a: int) -> long = 1\nprint(bump(3))\n")
+
+    ovl_refused(said, "function 'bump' is already declared — which declaration a call means is " +
+                "decided by its arguments and never by what it returns, so two that differ only in " +
+                "the result have no call that tells them apart", "2:1")
+    assert(said.contains("bump(a: int) -> long = 1"), said)
+    assert(!said.contains("print(bump(3))"), said)
+end ovl_refused_result_only_then_called
+
+// -- a pair no call could tell apart is refused where it is written ------------------------------------
+
+@test("so two differing only in what they return are refused")
+ovl_differing_only_in_result()
+    if !ovl_ready() then return
+
+    ovl_refused(ovl_err("h(x: int) -> string = \"s\"\nh(x: int) -> int = 1\n"),
+                "function 'h' is already declared — which declaration a call means is decided by its " +
+                "arguments and never by what it returns, so two that differ only in the result have " +
+                "no call that tells them apart", "2:1")
+end ovl_differing_only_in_result
+
+// Somebody who wrote one function twice is not owed a paragraph about overloading.
+@test("while an outright duplicate is told it is one, with nothing about overloads")
+ovl_outright_duplicate()
+    if !ovl_ready() then return
+
+    val said = ovl_err("h(x: int) -> string = \"a\"\nh(x: int) -> string = \"b\"\n")
+
+    ovl_refused(said, "function 'h' is already declared", "2:1")
+    assert(!said.contains("what it returns"), said)
+end ovl_outright_duplicate
+
+@test("as are two whose difference is behind a default")
+ovl_difference_behind_a_default()
+    if !ovl_ready() then return
+
+    ovl_refused(ovl_err("g(x: int) -> string = \"one\"\ng(x: int, y: int = 0) -> string = \"two\"\n"),
+                "'g' is already declared with parameters this one could not be told from — a call " +
+                "passing 1 argument would fit both, and which declaration a call means is decided by " +
+                "its arguments and never by what it returns. Two declarations of one name have to " +
+                "differ in a way a call site can show", "2:1")
+end ovl_difference_behind_a_default
+
+@test("though a default is fine where the overlap has different types")
+ovl_default_over_different_types()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("g(x: int) -> string = \"one\"\n" +
+                      "g(x: string, y: int = 0) -> string = s\"two $y\"\n\n" +
+                      "print(g(1), g(\"a\"), g(\"a\", 5))\n"), "one two 0 two 5\n")
+end ovl_default_over_different_types
+
+// -- a use that fits none or several is refused where it is written ------------------------------------
+
+// An argument already refused where it was made fits no parameter, so every candidate fails and the
+// roster would list declarations that plainly take the call as written. Nothing is said.
+@test("and not at all, when an argument was already refused upstream")
+ovl_poisoned_argument_overloaded()
+    if !ovl_ready() then return
+
+    val said = ovl_err("k(x: int) -> string = \"a\"\nk(x: int, y: int) -> string = \"b\"\n" +
+                       "val bad = nope\nprint(k(bad))\n")
+
+    ovl_refused(said, "undefined name 'nope'", "3:11")
+    assert(!said.contains("takes these arguments"), said)
+end ovl_poisoned_argument_overloaded
+
+@test("as a call to a name declared once has always been")
+ovl_poisoned_argument_declared_once()
+    if !ovl_ready() then return
+
+    val said = ovl_err("k(x: int) -> string = \"a\"\nval bad = nope\nprint(k(bad))\n")
+
+    ovl_refused(said, "undefined name 'nope'", "2:11")
+    assert_eq(ovl_errors(said), 1)
+end ovl_poisoned_argument_declared_once
+
+// The second declaration is keyed `paint.2` so the tables stay one declaration per key; a message
+// naming it that would name something the source does not contain.
+@test("and the compiler's spelling of an overload never reaches a reader")
+ovl_internal_key_never_shown()
+    if !ovl_ready() then return
+
+    val said = ovl_err("paint(x: int) -> string = \"a\"\npaint(x: string) -> string = \"b\"\n" +
+                       "print(paint(1.5))\n")
+
+    ovl_refused(said, "no 'paint' takes these arguments — the declarations of that name are:\n" +
+                "    paint(x: int)\n    paint(x: string)", "3:7")
+    assert(!said.contains("paint.2"), said)
+end ovl_internal_key_never_shown
+
+// -- a generic declaration takes its place among the candidates ----------------------------------------
+
+// `v` is a `[]int`, which `g[T]` takes as written and `g(s: []const int)` takes only by giving up the
+// ability to write -- so the generic one is the exact one.
+@test("and wins where it fits as written and the ordinary one needs a view")
+ovl_generic_exact_beats_a_view()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("g(s: []const int) -> string = \"const\"\ng[T](x: T) -> string = \"generic\"\n\n" +
+                      "var a = [1, 2, 3]\nval v: []int = a[..]\nprint(g(v))\n"), "generic\n")
+end ovl_generic_exact_beats_a_view
+
+@test("whatever the conversion is — an erasure decides the same way")
+ovl_generic_exact_beats_an_erasure()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("p(x: &Display) -> string = \"erased\"\np[T](x: T) -> string = \"generic\"\n\n" +
+                      "print(p(1))\n"), "generic\n")
+end ovl_generic_exact_beats_an_erasure
+
+@test("including a const-generic candidate against a slice parameter")
+ovl_const_generic_beats_a_slice()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("pick(s: []const int) -> string = \"slice\"\n" +
+                      "pick[const N: usize](a: [N]int) -> string = \"array\"\n\n" +
+                      "var a = [1, 2, 3]\nprint(pick(a))\n"), "array\n")
+end ovl_const_generic_beats_a_slice
+
+@test("while an ordinary declaration beats it where both are exact")
+ovl_ordinary_beats_generic_when_both_exact()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("f(x: int) -> string = \"plain\"\nf[T](x: T) -> string = \"generic\"\n\n" +
+                      "print(f(0))\n"), "plain\n")
+end ovl_ordinary_beats_generic_when_both_exact
+
+// `i64` is not exact at a bare `1`, and must not be reached by being the only other ordinary one.
+@test("and the literal's own type still decides among the ordinary ones")
+ovl_literal_decides_beside_a_generic()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("width(x: int) -> string = \"int\"\nwidth(x: i64) -> string = \"i64\"\n" +
+                      "width[T](x: T) -> string = \"generic\"\n\n" +
+                      "print(width(1))\nprint(width(1i64))\n"), "int\ni64\n")
+end ovl_literal_decides_beside_a_generic
+
+@test("and it is still chosen where it is the only candidate that fits")
+ovl_generic_the_only_fit()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("q(x: int) -> string = \"int\"\nq[T](x: T) -> string = \"generic\"\n\n" +
+                      "print(q(\"a\"))\n"), "generic\n")
+end ovl_generic_the_only_fit
+
+// Nothing is exact at an array argument -- the view is a conversion both candidates need -- and the
+// two fitted at one signature, so the ordinary one is chosen at a slice and at an array alike.
+@test("and an ordinary declaration wins through a conversion both candidates took")
+ovl_ordinary_wins_through_a_shared_conversion()
+    if !ovl_ready() then return
+
+    assert_eq(ovl_ran("g(x: []u8) -> string = \"plain\"\ng[T](x: []T) -> string = \"generic\"\n\n" +
+                      "var a: [3]u8 = [1, 2, 3]\nval v: []u8 = a[..]\n\nprint(g(v))\nprint(g(a))\n"),
+              "plain\nplain\n")
+end ovl_ordinary_wins_through_a_shared_conversion
+
+// `[]const int` and `[]int` are two routes out of one array, and choosing between them would rank one
+// conversion above another.
+@test("while two fitted at DIFFERENT types are still ambiguous")
+ovl_different_fitted_types_are_ambiguous()
+    if !ovl_ready() then return
+
+    ovl_refused(ovl_err("h(x: []const int) -> string = \"const\"\nh[T](x: []T) -> string = \"generic\"\n\n" +
+                        "var a = [1, 2, 3]\n\nprint(h(a))\n"),
+                "'h' is ambiguous here — 2 of its declarations take these arguments:\n" +
+                "    h(x: []const int)\n    h(x: []T)\n" +
+                "Annotate an argument, or name the type a literal is meant at", "6:7")
+end ovl_different_fitted_types_are_ambiguous
+
+// -- exports, a library, and `main` --------------------------------------------------------------------
+
+// C has no overloading, so an overload set has at most one member that may take its own name as a
+// symbol -- and the refusal is that one, at each `@export`, never `pick.2` and never a second report
+// of the same pair as two definitions of one symbol.
+@test("an overload exported under its own name is refused, and not by accident")
+ovl_export_under_own_name()
+    if !ovl_ready() then return
+
+    val said = ovl_err("@export\npick(a: int) -> int = a + 1\n\n@export\npick(a: int, b: int) -> int = a + b\n")
+    val message = "'pick' is declared more than once, and C has no overloading — two exports of one " +
+                  "name would be two definitions of one symbol. Give each export a symbol of its " +
+                  "own, '@export(\"...\")'"
+
+    ovl_refused(said, message, "1:1")
+    ovl_refused(said, message, "4:1")
+    assert_eq(ovl_errors(said), 2)
+    assert(!said.contains("pick.2"), said)
+end ovl_export_under_own_name
+
+@test("though each may be exported under a symbol of its own")
+ovl_export_under_symbols_of_their_own()
+    if !ovl_ready() then return
+
+    val text = ovl_ir("@export(\"pick_one\")\npick(a: int) -> int = a + 1\n\n" +
+                      "@export(\"pick_two\")\npick(a: int, b: int) -> int = a + b\n")
+
+    assert(text.contains("@pick_one("), text)
+    assert(text.contains("@pick_two("), text)
+end ovl_export_under_symbols_of_their_own
+
+// A library is compiled apart and its declarations hoisted again by whoever builds against it, so
+// this is what says the set is rebuilt rather than collapsed to one declaration.
+@test("an overload set survives being built into a library and linked against")
+ovl_survives_a_library()
+    if !ovl_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/lib.sysl", "module demo\n\nscale(n: int) -> string = s\"one $n\"\n" +
+                               "scale(n: int, by: int) -> string = s\"two ${n * by}\"\n"))
+    val prog = lbr_program("print(demo.scale(3))\nprint(demo.scale(3, 4))\n")
+
+    assert_eq(lbr_run(prog, [lib]), "one 3\ntwo 12\n")
+    lbr_drop([lib, prog])
+end ovl_survives_a_library
+
+// Nothing calls `main`, so there is no call site to choose between two, and a second would be filed
+// under a key of its own and silently never run.
+@test("'main' does not overload, since a program has one beginning")
+ovl_main_does_not_overload()
+    if !ovl_ready() then return
+
+    ovl_refused(ovl_err("main()\n    print(\"one\")\n\nmain(args: []string)\n    print(\"two\")\n"),
+                "'main' is where a program starts, so there is one — a second declaration of it " +
+                "would overload the name, and a program has one beginning rather than a set of them",
+                "4:1")
+end ovl_main_does_not_overload
