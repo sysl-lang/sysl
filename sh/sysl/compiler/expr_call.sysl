@@ -2154,7 +2154,7 @@ end arity_phrase
 // the whole of it. Anywhere else the empty parameter is NAMED: a reader looking at a defaulted list,
 // or at arguments that chose their own slots, cannot tell from a count which one was left out.
 arity_refusal(subject: string, params: Buf[Param], args: Buf[Expr], slots: Buf[Option[Expr]],
-              named_seen: bool, extra: usize) -> string
+              named_seen: bool, extra: usize, variadic: bool) -> string
     var optional = false
     var missing_at: int = -1
 
@@ -2168,7 +2168,11 @@ arity_refusal(subject: string, params: Buf[Param], args: Buf[Expr], slots: Buf[O
         return s"$subject was given no value for '${params.at(usize(missing_at)).name}', and that " +
                "parameter declares no default"
 
-    s"$subject ${arity_phrase(params)}, but ${supplied_phrase(args.len(), "argument")}"
+    // A variadic tail takes any number after the named parameters, so only a floor can be missed.
+    val takes = if variadic then s"takes at least ${quantity(params.len(), "argument")}"
+    else arity_phrase(params)
+
+    s"$subject $takes, but ${supplied_phrase(args.len(), "argument")}"
 end arity_refusal
 
 name_list(params: Buf[Param]) -> string
@@ -2344,7 +2348,7 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
             ts.set(i, TExpr(slots.at(i).unwrap().span, TVaPass(ts.at(i))))
 
     for i in slots.len()..<args.len()
-        ts.push(variadic_extra(cx, args.at(i)))
+        ts.push(variadic_extra(cx, args.at(i), true))
 
     val ret = declared_result(cx, scope, d.ret_type)
 
@@ -2357,7 +2361,14 @@ end extern_call
 // the widening happens here, in the tree: an integer narrower than 32 bits becomes a 32-bit one of
 // its own signedness, and every floating width narrower than `real` becomes a `real`, both
 // sixteen-bit formats included.
-variadic_extra(cx: &Analyzer, a: Expr) -> TExpr
+//
+// **There is no declared parameter to check it against, so what stands in for one is the rule C
+// imposes at the call**: an integer, a float, a `char`, a raw pointer or the address of a function
+// crosses anywhere. An aggregate crosses to a FOREIGN callee, whose compiler classifies it exactly
+// as a declared parameter of its type, and not to a sysl one, whose walk over the tail reads back
+// one register at a time. Everything else -- a `&T`'s count, a `bool`, a simple enum, `unit`, a
+// `never` -- has no C spelling to arrive as.
+variadic_extra(cx: &Analyzer, a: Expr, foreign: bool = false) -> TExpr
     val t = type_expr_bare(cx, a)
     val ty = texpr_type(t)
 
@@ -2365,8 +2376,47 @@ variadic_extra(cx: &Analyzer, a: Expr) -> TExpr
         Integer(bits, signed, _) ->
             if bits < 32 then TExpr(a.span, TCast(t, Integer(32, signed, false))) else t
         Floating(bits, _) -> if bits < 64 then TExpr(a.span, TCast(t, real_type())) else t
-        _ -> t
+        Char -> t
+        Ptr(_) -> t
+        CFn(_, _) -> t
+        // Already told, or settled where the instantiation reads the body again at a real type.
+        Unknown -> t
+        Abstract(_, _) -> t
+        other ->
+            if tail_scalar(other) then return t
+
+            if tail_aggregate(other) && foreign then return t
+
+            if tail_aggregate(other) then
+                return cx.err(t.span, s"a ${type_show(other)} cannot be passed to a sysl function's '...' — " +
+                              "a walk over the tail reads back one register at a time and an aggregate is " +
+                              "not one, where a foreign callee takes it because C says which registers it " +
+                              "arrives in")
+
+            cx.err(t.span, s"a ${type_show(other)} cannot be passed to '...' — a variadic argument must " +
+                   "be an integer, a float, a char, a raw pointer, or the address of a function")
 end variadic_extra
+
+// A named subtype or a qualifier over one of the scalars a tail carries crosses as its base does.
+private tail_scalar(t: Type) -> bool = underlying(t) match
+    Integer(_, _, _) -> true
+    Floating(_, _) -> true
+    Char -> true
+    Ptr(_) -> true
+    CFn(_, _) -> true
+    _ -> false
+
+// Whether a tail argument is an aggregate as the C convention classifies one: `cabi.sysl`'s
+// `c_aggregate` without the layout, which analysis does not have.
+private tail_aggregate(t: Type) -> bool = underlying(t) match
+    Struct(_) -> true
+    Array(_, _) -> true
+    Slice(_, _) -> true
+    Str -> true
+    VaList -> true
+    Enum(d) -> !d.simple
+    Weak(inner) -> is_trait(*inner)
+    p -> erased(p)
 
 // The file an `extern` was written in, which is where the types in its signature mean what they
 // meant.
@@ -2415,7 +2465,7 @@ end call_through
 declared_result(cx: &Analyzer, scope: Scope, written: Option[TypeRef]) -> Type
     if written.is_none() then return Unit
 
-    resolve_type(cx.an, scope, written.unwrap(), no_bindings())
+    resolve_result(cx.an, scope, written.unwrap(), no_bindings())
 end declared_result
 
 // -- `?` -------------------------------------------------------------------------------------------

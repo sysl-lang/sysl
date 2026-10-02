@@ -44,6 +44,15 @@ rebind(subst: *Buf[Binding], name: string, ty: Type)
 
     subst.push(Binding(name, ty))
 
+// The type a written RESULT means -- a function's, a member's, an `extern`'s or a `*extern`'s. It
+// is the one position `never` may stand in, saying the call does not come back; everywhere else
+// `resolve_type` refuses it, there being no value of it to hold, pass or point at.
+resolve_result(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Type = *t.kind match
+    NamedType(name, args) ->
+        if name == "never" && args.is_empty() && bound_type(subst, name).is_none() then Never
+        else resolve_type(a, scope, t, subst)
+    _ -> resolve_type(a, scope, t, subst)
+
 // The type a written one means.
 resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Type = *t.kind match
     NamedType(name, args) -> resolve_named(a, scope, t.span, name, args, subst, "")
@@ -69,7 +78,7 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     TupleType(parts, results) -> resolve_tuple(a, scope, parts, results, subst)
     PackType(name) -> bound_type(subst, name).unwrap_or(Pack(buf()))
     CFnType(params, ret) ->
-        CFn(resolve_list(a, scope, params, subst), resolve_type(a, scope, ret, subst))
+        CFn(resolve_list(a, scope, params, subst), resolve_result(a, scope, ret, subst))
     FnType(params, ret, bare) -> resolve_unboxed_callable(a, scope, t, params, ret, bare, subst)
     // A `some` result that reached resolution is one written where the inference behind it has
     // nothing to read: a type position already refused it at the parse, so what arrives here is a
@@ -804,7 +813,12 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
         // paid for.
         if stood_for.is_some() then return substituted(a, scope, span, stood_for.unwrap())
 
-    if name == "never" then return Never
+    if name == "never"
+        a.fault(scope, span, "'never' is the type of an expression that does not finish, so it can " +
+                "only be a result type")
+        return Unknown
+    end if
+
     // `Self` is bound by a trait or an `impl`; anywhere else it names nothing, and says why.
     if name == "Self"
         val bound = bound_type(subst, "Self")
