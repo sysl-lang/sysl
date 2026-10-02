@@ -1,0 +1,614 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// Two of the reference's suites, ported together: `AmpConstructionTests` -- `&` in front of something
+// that has no address (a construction, a call result, a literal, an arithmetic result) writes it into
+// a hidden local of the scope the `&` stands in (`reference/memory.md § Addressing a value`) -- and
+// `AtPatternTests` -- `n @ pat`, a pattern that matches and names what it matched
+// (`reference/patterns.md § The pattern forms`).
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.153)** by
+// handing the installed `sysl run` the same program. The harness is `tests_xvr_extern_var.sysl`'s:
+// `xvr_ran` builds and runs a tree, and answers with the build's refusal where there is one.
+
+// A refusal carries this message, anchored at this `line:column` of `main.sysl`.
+private amp_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> "), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+private amp_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+private amp_shapes() -> string = raw"""
+    trait Shape
+        area(self) -> int
+    end Shape
+
+    struct Rect
+        w: int
+    end Rect
+
+    impl Shape for Rect
+        area(self) -> int = self.w
+
+    """
+
+private amp_shape() -> string = raw"""
+    enum Shape
+        Circle(r: int)
+        Rect(w: int, h: int)
+    """
+
+// -- a value with no address gets one -------------------------------------------------------------
+
+@test("'&' gives a construction a slot")
+amp_a_construction()
+    assert_eq(amp_ran(amp_shapes() + raw"""
+        var s: *Shape = &Rect(2)
+
+        print(s.area())
+        """), "2\n")
+
+// `Rect(2)` and `make()` are the same node -- a call -- which is why the rule is about any rvalue.
+@test("'&' gives a call result a slot")
+amp_a_call_result()
+    assert_eq(amp_ran(amp_shapes() + raw"""
+        make() -> Rect = Rect(3)
+
+        var s: *Shape = &make()
+
+        print(s.area())
+        """), "3\n")
+
+@test("'&' gives a literal a slot")
+amp_a_literal()
+    assert_eq(amp_ran(raw"""
+        var p: *int = &1
+
+        print(*p)
+        """), "1\n")
+
+@test("'&' gives an arithmetic result a slot")
+amp_an_arithmetic_result()
+    assert_eq(amp_ran(raw"""
+        val a = 3
+        val b = 4
+
+        var p: *int = &(a + b)
+
+        print(*p)
+        """), "7\n")
+
+@test("a plain '*T' of the value's own type, with no trait object in sight")
+amp_a_plain_pointer_of_its_own_type()
+    assert_eq(amp_ran(amp_shapes() + raw"""
+        var s: *Rect = &Rect(4)
+
+        print(s.w)
+        """), "4\n")
+
+// -- the storage is a real slot -------------------------------------------------------------------
+
+// If this were a copy handed out to be read, the write would go somewhere nothing reads back.
+@test("writing through the slot's pointer and reading it back")
+amp_writing_through_the_pointer()
+    assert_eq(amp_ran(raw"""
+        var p: *int = &1
+
+        *p = 9
+
+        print(*p)
+        """), "9\n")
+
+@test("two in one statement are two slots")
+amp_two_in_one_statement()
+    assert_eq(amp_ran(raw"""
+        add(a: *int, b: *int) -> int = *a + *b
+
+        print(add(&1, &2))
+        """), "3\n")
+
+@test("the operand of '&' is evaluated exactly once")
+amp_the_operand_is_evaluated_once()
+    assert_eq(amp_ran(raw"""
+        var calls = 0
+
+        next() -> int
+            calls += 1
+            7
+
+        var p: *int = &next()
+
+        print(*p)
+        print(*p)
+        print(calls)
+        """), "7\n7\n1\n")
+
+// The slot belongs to the frame, so a loop reuses one, holding each iteration's value while it runs.
+@test("a loop writes the same slot each time round")
+amp_a_loop_writes_the_same_slot()
+    assert_eq(amp_ran(raw"""
+        sum(p: *int) -> int = *p
+
+        var t = 0
+
+        for i in 0..<4
+            t += sum(&(i * 2))
+
+        print(t)
+        """), "12\n")
+
+// -- a value that owns something is owned by the slot ---------------------------------------------
+
+@test("a string in a slot outlives the statement that made it")
+amp_a_string_outlives_its_statement()
+    assert_eq(amp_ran(raw"""
+        owner(p: *string) -> usize = p.len
+
+        var p: *string = &("ab" + "cd")
+
+        print(*p)
+        print(owner(p))
+        """), "abcd\n4\n")
+
+@test("a struct holding a string, in a slot")
+amp_a_struct_holding_one()
+    assert_eq(amp_ran(raw"""
+        struct Named
+            name: string
+        end Named
+
+        var p: *Named = &Named("bob")
+
+        print(p.name)
+        """), "bob\n")
+
+// The release has to land on a path the store dominates: a short-circuited operand never stores.
+@test("a slot in an operand the program short-circuits past")
+amp_an_operand_short_circuited_past()
+    assert_eq(amp_ran(raw"""
+        struct Named
+            name: string
+        end Named
+
+        wide(p: *Named) -> bool = p.name.len > 0
+
+        val no = false
+
+        if no && wide(&Named("never")) then print("yes") else print("no")
+
+        print("done")
+        """), "no\ndone\n")
+
+@test("a slot made in a loop, round after round")
+amp_one_made_in_a_loop()
+    assert_eq(amp_ran(raw"""
+        struct Named
+            name: string
+        end Named
+
+        width(p: *Named) -> usize = p.name.len
+
+        var t: usize = 0
+
+        for i in 0..<8
+            t += width(&Named("abc"))
+
+        print(t)
+        """), "24\n")
+
+// -- what the pointer is afterwards ---------------------------------------------------------------
+
+@test("a slot's pointer is an ordinary '*T', so a branch's slot is that branch's")
+amp_a_branchs_slot_is_that_branchs()
+    assert_eq(amp_ran(amp_shapes() + raw"""
+        val big = true
+
+        var s: *Shape = if big then &Rect(5) else &Rect(1)
+
+        print(s.area())
+        """), "5\n")
+
+@test("taking the address of a place is unchanged")
+amp_the_address_of_a_place_is_unchanged()
+    assert_eq(amp_ran(amp_shapes() + raw"""
+        var r = Rect(6)
+        var s: *Shape = &r
+
+        print(s.area())
+        """), "6\n")
+
+// A `val` has an address but not a writable one, so it is refused rather than copied into a slot.
+@test("'&' of a 'val' is still refused rather than copied into a slot")
+amp_a_val_is_still_refused()
+    amp_refused(amp_ran("val v = 3\nvar p: *int = &v\n\nprint(*p)\n"),
+                "a 'val' is written once, so '&' has nothing to write through", "2:15")
+
+// -- a name asks for that thing's address, and is not given a copy --------------------------------
+
+private amp_temp() -> string = raw"""
+    struct Temp
+        c: int
+
+        f -> int = self.c * 9 / 5 + 32
+    end Temp
+
+    var t = Temp(0)
+    """
+
+@test("'&' of a property is refused, where a field of the same shape is not")
+amp_a_property_is_refused()
+    amp_refused(amp_ran(amp_temp() + "var p = &t.f\n\nprint(*p)\n"),
+                "'&' needs a variable, a field, an element, or a dereference — something with an address",
+                "8:9")
+    assert_eq(amp_ran(amp_temp() + "var p = &t.c\n\nprint(*p)\n"), "0\n")
+
+@test("'&' of a constant is refused, where the literal it stands for is not")
+amp_a_constant_is_refused()
+    amp_refused(amp_ran("const cap: int = 8\n\nvar p = &cap\n\nprint(*p)\n"),
+                "'&' needs a variable, a field, an element, or a dereference — something with an address",
+                "3:9")
+    assert_eq(amp_ran("var p = &8\n\nprint(*p)\n"), "8\n")
+
+// -- module storage has no scope to hold one ------------------------------------------------------
+
+@test("'&' of a value in a module initializer is refused")
+amp_an_initializer_is_refused()
+    amp_refused(amp_ran(raw"""
+        struct Rect
+            w: int
+        end Rect
+
+        static var p: *Rect = &Rect(2)
+
+        print(p.w)
+        """),
+        "'&' in front of a value writes it into a hidden local of the scope the '&' stands in, and " +
+        "module storage has no such scope — the slot would belong to the initializer's own frame, " +
+        "which is gone by the program's first statement. Give the value a name that lasts the run: " +
+        "declare it beside this one, and take the address of that",
+        "5:23")
+
+@test("and the module-level name it asks for instead works")
+amp_the_name_it_asks_for_works()
+    assert_eq(amp_ran(raw"""
+        struct Rect
+            w: int
+        end Rect
+
+        static var r: Rect = Rect(2)
+        static var p: *Rect = &r
+
+        print(p.w)
+        """), "2\n")
+
+// -- the two meanings of '&' ----------------------------------------------------------------------
+
+@test("an address is refused where a counted reference is wanted")
+amp_an_address_is_refused_for_a_box()
+    val said = amp_ran(amp_shapes() + raw"""
+        var s: &Shape = &Rect(2)
+
+        print(s.area())
+        """)
+
+    assert(said.contains("error: '&' in front of a value takes its address, and the '&' in &Shape is a " +
+                         "counted box — the two are different things, and an address is not a way of " +
+                         "making a box. Drop the operator: a value read into a &Shape is put in one " +
+                         "where it stands\n"), said)
+    assert(said.contains("/main.sysl:12:17\n"), said)
+end amp_an_address_is_refused_for_a_box
+
+@test("and the spelling the refusal names compiles")
+amp_the_spelling_it_names_compiles()
+    assert_eq(amp_ran(amp_shapes() + raw"""
+        var s: &Shape = Rect(2)
+
+        print(s.area())
+        """), "2\n")
+
+private amp_boxed_area() -> string = raw"""
+    trait Shape
+        area(&self) -> int
+    end Shape
+
+    struct Rect
+        w: int
+    end Rect
+
+    impl Shape for Rect
+        area(&self) -> int = self.w
+
+    """
+
+// What `&self` is missing is the count, not an address, so the message names the binding.
+@test("'&self' asks for a box, and says so")
+amp_amp_self_asks_for_a_box()
+    val said = amp_ran(amp_boxed_area() + "print(Rect(3).area())\n")
+
+    assert(said.contains("error: '&self' needs a counted reference, and this receiver is a Rect on the " +
+                         "stack — a '&self' method may keep hold of what it is called on, so what it " +
+                         "wants is a share of a box rather than an address. Bind the value into one " +
+                         "and call it on that: 'var r: &Rect = …'\n"), said)
+    assert(said.contains("/main.sysl:12:15\n"), said)
+
+// The edges of the three refusals above, each read out of the reference on the same program.
+private amp_rect_ref_self() -> string = "struct Rect\n    w: int\n    area(&self) -> int = self.w\n"
+
+private amp_amp_self_refusal(shown: string) -> string =
+    s"'&self' needs a counted reference, and this receiver is a $shown on the stack — a '&self' " +
+    "method may keep hold of what it is called on, so what it wants is a share of a box rather than " +
+    s"an address. Bind the value into one and call it on that: 'var r: &$shown = …'"
+
+@test("'&self' refuses a local, a pointer and a field reached through a box alike")
+amp_amp_self_refuses_every_unboxed_receiver()
+    amp_refused(amp_ran(amp_rect_ref_self() + "var r = Rect(1)\nprint(r.area())\n"),
+                amp_amp_self_refusal("Rect"), "5:9")
+    amp_refused(amp_ran(amp_rect_ref_self() + "var r = Rect(1)\nvar p = &r\nprint(p.area())\n"),
+                amp_amp_self_refusal("*Rect"), "6:9")
+    amp_refused(amp_ran(amp_rect_ref_self() + "struct H\n    r: Rect\nvar h: &H = H(Rect(1))\n" +
+                        "print(h.r.area())\n"),
+                amp_amp_self_refusal("Rect"), "7:11")
+
+@test("while a field that is itself a box is a receiver '&self' takes")
+amp_amp_self_takes_a_boxed_field()
+    assert_eq(amp_ran(amp_rect_ref_self() + "struct H\n    r: &Rect\nvar h = H(Rect(4))\nprint(h.r.area())\n"),
+              "4\n")
+
+private amp_box_refusal(box: string) -> string =
+    s"'&' in front of a value takes its address, and the '&' in $box is a counted box — the two are " +
+    s"different things, and an address is not a way of making a box. Drop the operator: a value " +
+    s"read into a $box is put in one where it stands"
+
+@test("an address is refused at a box whether it is of a place, a literal or an argument")
+amp_an_address_is_refused_at_every_box()
+    amp_refused(amp_ran("struct Rect\n    w: int\nvar r = Rect(1)\nvar s: &Rect = &r\nprint(s.w)\n"),
+                amp_box_refusal("&Rect"), "4:16")
+    amp_refused(amp_ran("var q: &int = &1\nprint(*q)\n"), amp_box_refusal("&int"), "1:15")
+    amp_refused(amp_ran("take(r: &int) -> int = *r\nprint(take(&(1 + 2)))\n"), amp_box_refusal("&int"),
+                "2:12")
+
+private amp_storage_refusal() -> string =
+    "'&' in front of a value writes it into a hidden local of the scope the '&' stands in, and " +
+    "module storage has no such scope — the slot would belong to the initializer's own frame, " +
+    "which is gone by the program's first statement. Give the value a name that lasts the run: " +
+    "declare it beside this one, and take the address of that"
+
+@test("module storage refuses a slot for an arithmetic result, and in a 'static val' too")
+amp_module_storage_refuses_every_slot()
+    amp_refused(amp_ran("struct Rect\n    w: int\nstatic var p: *int = &(1 + 2)\nprint(*p)\n"),
+                amp_storage_refusal(), "3:22")
+    amp_refused(amp_ran("struct Rect\n    w: int\nmk() -> Rect = Rect(1)\nstatic val p: *Rect = &mk()\n" +
+                        "print(p.w)\n"),
+                amp_storage_refusal(), "4:23")
+
+@test("and the binding the '&self' refusal names compiles")
+amp_the_binding_it_names_compiles()
+    assert_eq(amp_ran(amp_boxed_area() + "var r: &Rect = Rect(3)\n\nprint(r.area())\n"), "3\n")
+
+// -- '@': the whole value and its parts, in one pattern -------------------------------------------
+
+@test("an arm names what it destructured")
+amp_at_an_arm_names_what_it_destructured()
+    assert_eq(amp_ran(amp_shape() + raw"""
+        area(s: Shape) -> int
+            s match
+                Circle(r) -> r * r * 3
+                Rect(w, h) -> w * h
+
+        describe(s: Shape) -> string
+            s match
+                c @ Circle(r) -> "circle r=" + str(r) + " area=" + str(area(c))
+                other -> "other area=" + str(area(other))
+
+        print(describe(Circle(2)))
+        """), "circle r=2 area=12\n")
+
+@test("a struct pattern binds the whole beside its fields")
+amp_at_a_struct_pattern_binds_the_whole()
+    assert_eq(amp_ran(raw"""
+        struct Point
+            x: int
+            y: int
+
+        sum(p: Point) -> int = p.x + p.y
+
+        var p = Point(3, 4)
+
+        p match
+            whole @ Point{x, y} -> print(x, y, sum(whole))
+        """), "3 4 7\n")
+
+@test("and it nests, each level naming its own value")
+amp_at_it_nests()
+    assert_eq(amp_ran(raw"""
+        enum Wrap
+            Val(n: int)
+            Two(a: int, b: int)
+        enum Outer
+            One(w: Wrap)
+
+        inner_n(w: Wrap) -> int
+            w match
+                Val(n) -> n
+                Two(a, b) -> a + b
+
+        var o = One(Val(7))
+
+        o match
+            whole @ One(part @ Val(n)) -> print(n, inner_n(part), inner_n(part) + n)
+            One(other) -> print(inner_n(other))
+        """), "7 7 14\n")
+
+@test("a literal may be named too, which is where a guard would otherwise repeat it")
+amp_at_a_literal_may_be_named()
+    assert_eq(amp_ran(raw"""
+        classify(n: int) -> string
+            n match
+                z @ 0 -> "zero:" + str(z)
+                s @ 1..3 -> "small:" + str(s)
+                big -> "big:" + str(big)
+
+        print(classify(0), classify(2), classify(9))
+        """), "zero:0 small:2 big:9\n")
+
+@test("a named arm still counts as covering its variant")
+amp_at_a_named_arm_still_covers()
+    assert_eq(amp_ran(amp_shape() + raw"""
+        name(s: Shape) -> string
+            s match
+                c @ Circle(_) -> "c"
+                r @ Rect(_, _) -> "r"
+
+        print(name(Circle(1)), name(Rect(2, 3)))
+        """), "c r\n")
+
+private amp_only_circle(arm: string) -> string =
+    amp_shape() + s"name(s: Shape) -> string\n    s match\n        $arm -> \"c\"\nprint(name(Circle(1)))"
+
+@test("and a match that leaves one out is still refused when the rest are named, in a program")
+amp_at_a_match_that_leaves_one_out()
+    amp_refused(amp_ran(amp_only_circle("c @ Circle(_)")),
+                "match on 'Shape' is not exhaustive; missing Rect (add an 'else' arm)", "5:5")
+
+// -- what the chapter claims about it -------------------------------------------------------------
+
+// "a named arm covers what its sub-pattern covers": the witness has to be the same one, at the same place.
+@test("the witness an inexhaustive match reports is unchanged by naming an arm")
+amp_at_the_witness_is_unchanged()
+    val said = "match on 'Shape' is not exhaustive; missing Rect (add an 'else' arm)"
+
+    amp_refused(amp_ran(amp_only_circle("Circle(_)")), said, "5:5")
+    amp_refused(amp_ran(amp_only_circle("c @ Circle(_)")), said, "5:5")
+
+private amp_both_named() -> string = amp_shape() + raw"""
+    name(s: Shape) -> string
+        s match
+            c @ Circle(_) -> "c"
+            r @ Rect(_, _) -> "r"
+    """
+
+@test("a fully named match needs no else, exactly as the unnamed one does not")
+amp_at_a_fully_named_match_needs_no_else()
+    assert_eq(amp_ran(amp_both_named() + "print(name(Rect(1, 2)))"), "r\n")
+
+// A wrapper treated as always-true would take the first arm and print `c`.
+@test("a named arm that does not match falls through")
+amp_at_a_named_arm_falls_through()
+    assert_eq(amp_ran(amp_both_named() + "print(name(Rect(1, 2)), name(Circle(1)))"), "r c\n")
+
+@test("and so does a named literal arm")
+amp_at_so_does_a_named_literal_arm()
+    assert_eq(amp_ran(raw"""
+        which(n: int) -> string
+            n match
+                z @ 0 -> "zero"
+                o @ 1 -> "one"
+                other -> "many"
+        print(which(1), which(0), which(7))
+        """), "one zero many\n")
+
+// Two shares of one object: if either binding released without having retained, this reads freed memory.
+@test("a reference named at two depths keeps its count")
+amp_at_a_reference_named_at_two_depths()
+    assert_eq(amp_ran(raw"""
+        struct Node
+            v: int
+        enum Holder
+            One(n: &Node)
+
+        var h: Holder = One(Node(7))
+
+        h match
+            whole @ One(inner) -> print(inner.v)
+
+        h match
+            One(again) -> print(again.v)
+        """), "7\n7\n")
+
+// -- where else a pattern is read -----------------------------------------------------------------
+
+@test("an 'is' test binds the whole value into the branch it guards")
+amp_at_an_is_test_binds_the_whole()
+    assert_eq(amp_ran(amp_shape() + raw"""
+        var s: Shape = Circle(5)
+
+        if s is c @ Circle(r) then print("yes", r) else print("no")
+        """), "yes 5\n")
+
+@test("a 'var' binding names the whole and the parts")
+amp_at_a_var_binding_names_the_whole()
+    assert_eq(amp_ran(raw"""
+        struct Point
+            x: int
+            y: int
+
+        var p = Point(3, 4)
+        var whole @ Point{x, y} = p
+
+        print(whole.x, x, y)
+        """), "3 3 4\n")
+
+@test("while a refutable inner pattern is refused there, exactly as it is without the name")
+amp_at_a_refutable_inner_pattern_is_refused()
+    amp_refused(amp_ran(amp_shape() + "var s: Shape = Circle(1)\nvar c @ Circle(r) = s"),
+                "a binding cannot choose among variants — this pattern matches one of several shapes, " +
+                "and a binding has no other arm to take when the value has another", "5:1")
+
+// -- what it refuses ------------------------------------------------------------------------------
+
+private amp_one_arm(start: string, arm: string) -> string =
+    amp_shape() + s"var s: Shape = $start\ns match\n    $arm -> print(v)\n    else print(0)"
+
+@test("a qualified name cannot be bound")
+amp_at_a_qualified_name_cannot_be_bound()
+    amp_refused(amp_ran(amp_shape() + "var s: Shape = Circle(1)\ns match\n    m.x @ Circle(r) -> print(r)\n" +
+                        "    else print(0)"),
+                "'m.x' has a dot in it, and what a binding introduces is a local — write a name a " +
+                "program can declare", "6:9")
+
+private amp_twice() -> string =
+    "'v' is bound twice in one pattern, and the second would quietly stand for a different part of " +
+    "the value — rename it, or compare the two in a guard"
+
+@test("a name bound twice in one pattern is refused")
+amp_at_a_name_bound_twice()
+    amp_refused(amp_ran(amp_one_arm("Circle(1)", "v @ Circle(v)")), amp_twice(), "6:5")
+
+@test("including the plain case the '@' form has nothing to do with")
+amp_at_including_the_plain_case()
+    amp_refused(amp_ran(amp_one_arm("Rect(1, 2)", "Rect(v, v)")), amp_twice(), "6:5")
+
+// The repeat is reported from the binding site, which for an `is` test is the test itself.
+@test("a name bound twice in an 'is' pattern is reported from the test")
+amp_at_bound_twice_in_an_is_test()
+    amp_refused(amp_ran(amp_shape() + "var s: Shape = Rect(1, 2)\nif s is Rect(v, v) then print(v) else print(0)\n"),
+                amp_twice(), "5:4")
+
+@test("while two alternatives naming one thing are refused for the other reason")
+amp_at_two_alternatives_naming_one_thing()
+    amp_refused(amp_ran(amp_one_arm("Circle(1)", "Circle(v) | Rect(v, _)")),
+                "alternative patterns joined by '|' cannot bind a name", "6:5")
+
+@test("and a name reused in another arm is ordinary")
+amp_at_a_name_reused_in_another_arm()
+    assert_eq(amp_ran(amp_shape() + raw"""
+        var s: Shape = Rect(3, 4)
+        s match
+            Circle(v) -> print(v)
+            Rect(v, _) -> print(v)
+        """), "3\n")
+
+// The two `@`s do not compete: an annotation's is a prefix above a declaration, a pattern's is infix.
+@test("the annotation sigil and the pattern sigil in one program")
+amp_at_the_annotation_and_the_pattern_sigil()
+    assert_eq(amp_ran(amp_shape() + raw"""
+        @tailrec
+        count(s: Shape, n: int) -> int
+            s match
+                c @ Circle(r) -> if n <= 0 then r else count(c, n - 1)
+                Rect(w, h) -> w * h
+
+        print(count(Circle(9), 3))
+        """), "9\n")
