@@ -1049,13 +1049,15 @@ end statements_from
 //
 // **A `variant` is a top-level function's** (`measured`): its measure is checked where a call to the
 // same body is written, which a closure, reached through `Fn`, and a nested function, whose calls
-// carry an environment, never are. There each clause is refused where it stands and read no further.
+// carry an environment, never are. There each clause is refused where it stands and read no further,
+// every such clause being told before the body after them is given up.
 analyze_contract(cx: &Analyzer, at: Span, body: Buf[Stmt], upto: usize, ret: Type,
                  measured: bool = true) -> (Buf[TClause], Buf[TClause], Buf[TExpr], Option[TExpr])
     var requires: Buf[TClause] = buf()
     var ensures: Buf[TClause] = buf()
     var olds: Buf[TExpr] = buf()
     var measure: Option[TExpr] = None
+    var misplaced = false
 
     for i in 0..<upto
         val c = body.at(i)
@@ -1079,9 +1081,14 @@ analyze_contract(cx: &Analyzer, at: Span, body: Buf[Stmt], upto: usize, ret: Typ
             // holding the parameters alone, so a name from the body is undefined here.
             Variant(e) ->
                 if measured then measure = function_measure(cx, c.span, e, measure)
-                else cx.fault(c.span, unmeasured_variant())
+                else
+                    cx.an.fault_in_place(cx.scope, c.span, unmeasured_variant())
+                    misplaced = true
 
             _ -> ()
+
+    // Every misplaced clause has been told, and the body after them is not read for more.
+    if misplaced then cx.an.poison_quietly()
 
     (requires, ensures, olds, measure)
 end analyze_contract
