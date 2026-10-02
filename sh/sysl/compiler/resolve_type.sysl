@@ -227,9 +227,17 @@ end resolve_vector
 private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Expr], elem: TypeRef,
                       read_only: bool, subst: Buf[Binding]) -> Type
     // A fixed array HOLDS its elements and a slice POINTS at them, which is the whole of why one is
-    // an indirection and the other is not.
-    if length.is_none() then
-        return Slice(under_indirection(a, () -> resolve_qualified(a, scope, elem, subst)), read_only)
+    // an indirection and the other is not. A view of `unit` points at nothing, so it is refused
+    // where it is written -- a substitution included, which is how `Buf[unit]` is refused at `elems`.
+    if length.is_none()
+        val pointee = under_indirection(a, () -> resolve_qualified(a, scope, elem, subst))
+
+        pointee match
+            Unit -> a.fault(scope, span, "unit occupies no storage, so there is nothing for a slice to point at")
+            _ -> ()
+
+        return Slice(pointee, read_only)
+    end if
 
     val written = length.unwrap()
 
