@@ -1,0 +1,345 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Three parser suites of the reference compiler, ported: `ArrayParserTests` (the two array type
+// spellings, the literal, the subscript in its element and range forms, a declaration with no
+// initializer), `AssignmentParserTests` (the place on the left, precedence and associativity, and
+// which control-flow forms may sit on the right), and `BlockInBracketsTests` (a `match` or a `->`
+// opens its block inside brackets too, and a bracket pair otherwise still suspends layout).
+//
+// Every tree here was checked against the reference's `emit-ast --no-spans` (0.0.153), and every
+// refusal, position and output was read out of the same compiler on the same input.
+
+// -- arrays: the types ------------------------------------------------------------------------------
+
+@test("a fixed array names its length")
+aps_a_fixed_array_names_its_length()
+    assert_eq(pf("var a: [4]int = x\n"), "(var a : (array 4 int) x)")
+
+@test("a slice omits it")
+aps_a_slice_omits_it()
+    assert_eq(pf("var a: []u8 = x\n"), "(var a : (array _ u8) x)")
+
+@test("a generic type argument is still a type application, not an array")
+aps_a_generic_argument_is_a_type_application()
+    assert_eq(pf("var a: Box[int] = x\n"), "(var a : (Box int) x)")
+
+@test("a type with no initializer is a zero-valued declaration")
+aps_a_type_with_no_initializer()
+    assert_eq(pf("var buf: [64]u8\n"), "(var buf : (array 64 u8))")
+
+// -- arrays: the expressions ------------------------------------------------------------------------
+
+@test("an array literal lists its elements")
+aps_an_array_literal_lists_its_elements()
+    assert_eq(pe("[1, 2, 3]"), "(array 1 2 3)")
+
+@test("an empty literal is legal to write")
+aps_an_empty_literal_is_legal()
+    assert_eq(pe("[]"), "(array)")
+
+@test("a subscript is a postfix tail, so it chains")
+aps_a_subscript_chains()
+    assert_eq(pe("a[1][2]"), "(index (index a 1) 2)")
+
+@test("a range subscript is a slice")
+aps_a_range_subscript_is_a_slice()
+    assert_eq(pe("a[1..3]"), "(index a (.. 1 3))")
+
+@test("an exclusive range subscript")
+aps_an_exclusive_range_subscript()
+    assert_eq(pe("a[1..<3]"), "(index a (..< 1 3))")
+
+// -- assignment: the place on the left --------------------------------------------------------------
+
+@test("a bare name")
+aps_a_bare_name()
+    assert_eq(pe("a = b"), "(= a b)")
+
+@test("a field")
+aps_a_field()
+    assert_eq(pe("a.b = c"), "(= (field a b) c)")
+
+@test("a nested field")
+aps_a_nested_field()
+    assert_eq(pe("a.b.c = d"), "(= (field (field a b) c) d)")
+
+@test("an index")
+aps_an_index()
+    assert_eq(pe("a[i] = c"), "(= (index a i) c)")
+
+@test("a nested index")
+aps_a_nested_index()
+    assert_eq(pe("a[i][j] = c"), "(= (index (index a i) j) c)")
+
+@test("a dereference")
+aps_a_dereference()
+    assert_eq(pe("*p = c"), "(= (* p) c)")
+
+@test("a place under a compound operator")
+aps_a_place_under_a_compound_operator()
+    assert_eq(pe("s.n += 1"), "(+= (field s n) 1)")
+    assert_eq(pe("a[i] *= 2"), "(*= (index a i) 2)")
+
+// -- assignment: precedence and associativity -------------------------------------------------------
+
+@test("a compound then a plain assignment nest to the right")
+aps_a_compound_then_a_plain_nest_right()
+    assert_eq(pe("a += b = c"), "(+= a (= b c))")
+
+@test("assignment is looser than || on the right")
+aps_assignment_is_looser_than_or_on_the_right()
+    assert_eq(pe("a = b || c"), "(= a (|| b c))")
+
+@test("assignment is looser than || on the left")
+aps_assignment_is_looser_than_or_on_the_left()
+    assert_eq(pe("a || b = c"), "(= (|| a b) c)")
+
+// -- assignment: control flow on the right ----------------------------------------------------------
+
+@test("an inline if")
+aps_an_inline_if()
+    assert_eq(pe("x = if c then 1 else 2"), "(= x (if c (then 1) (else 2)))")
+
+@test("an inline if under every compound operator")
+aps_an_inline_if_under_every_compound_operator()
+    for op in ["+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="]
+        assert_eq(pe(s"x ${op} if c then 1 else 2"), s"(${op} x (if c (then 1) (else 2)))")
+
+@test("an if with no else")
+aps_an_if_with_no_else()
+    assert_eq(pe("x = if c then 1"), "(= x (if c (then 1)))")
+
+@test("a place on the left and control flow on the right")
+aps_a_place_left_and_control_flow_right()
+    assert_eq(pe("obj.field = if c then 1 else 2"), "(= (field obj field) (if c (then 1) (else 2)))")
+
+@test("a block match under a plain assignment")
+aps_a_block_match_under_a_plain_assignment()
+    assert_eq(pf("x = y match\n    1 -> 10\n    else 20"), "(= x (match y (arm 1 -> 10) (arm _ -> 20)))")
+
+@test("a block match under a compound assignment")
+aps_a_block_match_under_a_compound_assignment()
+    assert_eq(pf("total += y match\n    1 -> 10\n    else 20"),
+        "(+= total (match y (arm 1 -> 10) (arm _ -> 20)))")
+
+@test("a while loop")
+aps_a_while_loop()
+    assert_eq(pe("x = while c do 1"), "(= x (while c 1))")
+
+@test("a for loop")
+aps_a_for_loop()
+    assert_eq(pe("x = for k in xs do 1"), "(= x (for k xs 1))")
+
+@test("a labeled loop")
+aps_a_labeled_loop()
+    assert_eq(pe("x = 'scan while c do 1"), "(= x (while 'scan c 1))")
+
+@test("control flow threads through right-associative assignment")
+aps_control_flow_threads_through_assignment()
+    assert_eq(pe("a = b = if c then 1 else 2"), "(= a (= b (if c (then 1) (else 2))))")
+
+// -- assignment: control flow where delimiters bound it ---------------------------------------------
+
+@test("inside an index")
+aps_inside_an_index()
+    assert_eq(pe("a[if c then 0 else 1]"), "(index a (if c (then 0) (else 1)))")
+
+@test("as a call argument")
+aps_as_a_call_argument()
+    assert_eq(pe("f(if c then 1 else 2)"), "(call f (if c (then 1) (else 2)))")
+
+@test("inside parentheses as an operand")
+aps_inside_parentheses_as_an_operand()
+    assert_eq(pe("(if c then 1 else 2) + 1"), "(+ (if c (then 1) (else 2)) 1)")
+
+// -- assignment: control flow is not a bare operand -------------------------------------------------
+
+@test("not the right operand of arithmetic")
+aps_not_the_right_operand_of_arithmetic()
+    assert_eq(pf_err("var z = 1 + if c then 2 else 3\n"), "expression expected")
+    assert_eq(pf_at("var z = 1 + if c then 2 else 3\n"), "1:13")
+    assert_eq(pf_err("var z = 1 * if c then 2 else 3\n"), "expression expected")
+    assert_eq(pf_at("var z = 1 * if c then 2 else 3\n"), "1:13")
+
+// The reference refuses this at the same column in the words "'..' expected" -- what it says of any
+// comparison whose right operand is missing (`a < )` too), its range operand's last alternative
+// being the one that reports. The claim ported is the refusal and where it is.
+@test("not the right operand of a comparison")
+aps_not_the_right_operand_of_a_comparison()
+    assert(pf_err("var z = a < if c then 1 else 2\n") != "", "a comparison's operand is not a bare 'if'")
+    assert_eq(pf_at("var z = a < if c then 1 else 2\n"), "1:13")
+
+@test("not the operand of a prefix operator")
+aps_not_the_operand_of_a_prefix_operator()
+    assert_eq(pf_err("var z = !if c then true else false\n"), "expression expected")
+    assert_eq(pf_at("var z = !if c then true else false\n"), "1:10")
+    assert_eq(pf_err("var z = -if c then 1 else 2\n"), "expression expected")
+    assert_eq(pf_at("var z = -if c then 1 else 2\n"), "1:10")
+
+// -- assignment: an ordinary right-hand side --------------------------------------------------------
+
+@test("an arithmetic expression keeps its precedence")
+aps_an_arithmetic_right_keeps_its_precedence()
+    assert_eq(pe("x = a + b * c"), "(= x (+ a (* b c)))")
+
+@test("a comparison")
+aps_a_comparison()
+    assert_eq(pe("x = a < b"), "(= x (cmp a < b))")
+
+@test("a postfix try")
+aps_a_postfix_try()
+    assert_eq(pe("x = a?"), "(= x (try a))")
+
+// -- a block opened inside brackets: whole programs -------------------------------------------------
+
+private aps_can_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end aps_can_run
+
+// What a one-file program prints, or what its build said, marked so the two cannot be confused.
+private aps_out(text: string) -> string
+    val root = make_temp_dir("sysl-aps").unwrap()
+
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", text).unwrap()
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return "!" + said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "!the program that was built could not be run"
+        Ok(out) -> out.text
+end aps_out
+
+@test("the case the workaround was written for")
+aps_the_case_the_workaround_was_written_for()
+    if !aps_can_run() then return
+
+    val src = "name(n: int)\n    print(n match\n        0 -> \"none\"\n        1 -> \"one\"\n        else \"many\")\n\n" +
+        "name(0)\nname(1)\nname(7)\n"
+
+    assert_eq(aps_out(src), "none\none\nmany\n")
+
+@test("and an argument may follow it")
+aps_and_an_argument_may_follow_it()
+    if !aps_can_run() then return
+
+    val src = "pair(a: string, b: string) = print(a + \"/\" + b)\n\nf(n: int) =\n    pair(n match\n" +
+        "        0 -> \"zero\"\n        else \"other\", \"tail\")\n\nf(0)\nf(3)\n"
+
+    assert_eq(aps_out(src), "zero/tail\nother/tail\n")
+
+@test("a parenthesized sub-expression is the same case")
+aps_a_parenthesized_sub_expression()
+    if !aps_can_run() then return
+
+    val src = "f(n: int) =\n    val s = \"<\" + (n match\n        0 -> \"zero\"\n        else \"other\") + \">\"\n\n" +
+        "    print(s)\n\nf(0)\n"
+
+    assert_eq(aps_out(src), "<zero>\n")
+
+@test("and so is an array literal, which is a bracket of the other kind")
+aps_and_so_is_an_array_literal()
+    if !aps_can_run() then return
+
+    val src = "f(n: int) -> []string\n    [n match\n        0 -> \"a\"\n        else \"b\", \"tail\"]\n\n" +
+        "print(f(0)[0], f(0)[1])\n"
+
+    assert_eq(aps_out(src), "a tail\n")
+
+@test("a body of several statements, which had nowhere to go before")
+aps_a_body_of_several_statements()
+    if !aps_can_run() then return
+
+    val src = "apply(f: int -> int, n: int) -> int = f(n)\n\nprint(apply((x) ->\n    val doubled = x * 2\n\n" +
+        "    doubled + 1, 5))\n"
+
+    assert_eq(aps_out(src), "11\n")
+
+@test("a closure whose body is itself a match")
+aps_a_closure_whose_body_is_a_match()
+    if !aps_can_run() then return
+
+    val src = "apply(f: int -> string, n: int) -> string = f(n)\n\nprint(apply((x) -> x match\n" +
+        "    0 -> \"zero\"\n    else \"other\", 4))\n"
+
+    assert_eq(aps_out(src), "other\n")
+
+@test("an argument list with no block in it is joined exactly as before")
+aps_an_argument_list_with_no_block_is_joined()
+    if !aps_can_run() then return
+
+    val src = "add(a: int, b: int, c: int) -> int = a + b + c\n\nprint(add(1,\n        2,\n    3))\n"
+
+    assert_eq(aps_out(src), "6\n")
+
+@test("a trailing block is still not written inside brackets")
+aps_a_trailing_block_is_not_written_inside_brackets()
+    val src = "total(xs: []int) -> int = xs[0]\n\nprint(total:\n    1\n    2)\n"
+
+    assert_eq(pf_err(src), "identifier expected")
+    assert_eq(pf_at(src), "4:5")
+
+// The rule behind the case above: a list opening on `name:` is a parameter list, so what is refused
+// is the type that should have followed the colon -- and only the FIRST entry decides, a later
+// `name:` being refused at its colon as a call's, the reference's same two answers.
+@test("a list opening on a name and a colon is read as parameters")
+aps_a_list_opening_on_a_name_and_colon_is_parameters()
+    assert_eq(pf_err("print(total: 1 2)\n"), "identifier expected")
+    assert_eq(pf_at("print(total: 1 2)\n"), "1:14")
+    assert_eq(pf_err("f(x:\n    1)\n"), "identifier expected")
+    assert_eq(pf_at("f(x:\n    1)\n"), "2:5")
+    assert_eq(pf_err("f(a, b: 1)\n"), "')' expected")
+    assert_eq(pf_at("f(a, b: 1)\n"), "1:7")
+
+@test("a function type may not be broken immediately after its arrow")
+aps_a_function_type_broken_after_its_arrow()
+    val src = "apply(f: int ->\n    int, n: int) -> int = f(n)\n\nprint(apply((x) -> x + 1, 5))\n"
+
+    assert_eq(pf_err(src), "identifier expected")
+    assert_eq(pf_at(src), "1:16")
+
+@test("and breaking it before the arrow, or at a comma, still joins")
+aps_breaking_it_before_the_arrow_still_joins()
+    if !aps_can_run() then return
+
+    assert_eq(aps_out("apply(f: int\n    -> int, n: int) -> int = f(n)\n\nprint(apply((x) -> x + 1, 5))\n"), "6\n")
+    assert_eq(aps_out("apply(f: int -> int,\n    n: int) -> int = f(n)\n\nprint(apply((x) -> x + 1, 5))\n"), "6\n")
+
+@test("a one-line match as an argument is unchanged")
+aps_a_one_line_match_as_an_argument()
+    if !aps_can_run() then return
+
+    assert_eq(aps_out("f(n: int) = print(if n == 0 then \"zero\" else \"other\")\n\nf(0)\n"), "zero\n")
+
+@test("a block outside any bracket is the one it always was")
+aps_a_block_outside_any_bracket()
+    if !aps_can_run() then return
+
+    val src = "f(n: int) =\n    val s = n match\n        0 -> \"zero\"\n        else \"other\"\n\n    print(s)\n\nf(0)\n"
+
+    assert_eq(aps_out(src), "zero\n")
