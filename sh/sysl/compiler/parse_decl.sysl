@@ -82,12 +82,20 @@ parse_binding_name(p: *Parser, what: string) -> string
     w
 end parse_binding_name
 
-// One parameter of a declaration.
-parse_param(p: *Parser, what: string) -> Param
+// One parameter of a declaration, or a struct's field. **A field is storage and not a call**, so it
+// takes neither form a call site gives meaning to -- a `...T` tail or a by-name `-> T` -- and either
+// is refused by the type it is read as.
+parse_param(p: *Parser, what: string, field: bool = false) -> Param
     val start = p.here()
     val name = parse_param_name(p, what)
 
     p.expect_kw(":")
+
+    if field
+        val typ = parse_type(p)
+
+        return Param(start.to(p.just_taken()), name, typ, Public, None, false, false)
+    end if
 
     // `xs: ...T` collects the rest of the call, which is a read-only slice of whatever was passed.
     if p.accept_kw("...")
@@ -132,7 +140,7 @@ end parse_func_param
 // A struct's field, which declares no default: what an unwritten field gets is decided by the
 // constructor that builds the value, not by the field.
 parse_field_param(p: *Parser) -> Param
-    val param = parse_param(p, "a parameter's name or a field's")
+    val param = parse_param(p, "a parameter's name or a field's", true)
 
     if p.accept_kw("=")
         p.fault(param.span, "a field declares no default — what an unwritten field gets is decided by the constructor that builds the value, not by the field")

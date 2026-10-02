@@ -470,8 +470,11 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     for i in 0..<d.params.len()
         val p = d.params.at(i)
         val ty = resolve_type(a, scope, p.typ, no_bindings())
+        val unique = cx.bind(p.name, ty)
 
-        params.push((cx.bind(p.name, ty), ty))
+        if p.by_name then cx.by_name.push(unique)
+
+        params.push((unique, ty))
 
     // **A function that declares no result hands nothing back**, so its body is read with nothing
     // expected and the value it comes to is discarded -- which is why `probe() = 42` is a `unit`
@@ -507,6 +510,13 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
           frame_symbols(cx, span, name, d.writes, "writes"),
           exported_symbol(d), d.section, d.marks, cx.owner)
 end analyze_body
+
+// Whether the declaration wrote the parameter `name` by name (`x: -> T`).
+private written_by_name(d: FuncDecl, name: string) -> bool
+    for i in 0..<d.params.len()
+        if d.params.at(i).name == name && d.params.at(i).by_name then return true
+
+    false
 
 // The module that declared `name`, which is the module whose compilation owns its definition.
 //
@@ -681,7 +691,9 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     for i in 0..<d.params.len()
         val p = d.params.at(i)
 
-        cx.bind(p.name, resolve_type(a, scope, p.typ, subst))
+        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst))
+
+        if p.by_name then cx.by_name.push(unique)
 
     var ret = Unit
 
@@ -760,7 +772,9 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
     for i in 0..<d.params.len()
         val p = d.params.at(i)
 
-        cx.bind(p.name, resolve_type(a, scope, p.typ, subst))
+        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst))
+
+        if p.by_name then cx.by_name.push(unique)
 
     cx.func_name = d.name
     cx.ret_ty = Some(Unknown)
@@ -884,8 +898,13 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
 
     for i in 0..<sig.unwrap().params.len()
         val p = sig.unwrap().params.at(i)
+        val unique = cx.bind(p.0, p.1)
 
-        params.push((cx.bind(p.0, p.1), p.1))
+        // Matched by written name rather than by position: the instantiation's list is not always
+        // the declaration's unchanged.
+        if written_by_name(d, p.0) then cx.by_name.push(unique)
+
+        params.push((unique, p.1))
 
     val ret = sig.unwrap().ret
 

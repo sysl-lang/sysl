@@ -72,8 +72,30 @@ bind_params(cx: &Analyzer, span: Span, subject: string, params: Buf[Param], vari
         return None
     end if
 
-    Some(slots)
+    Some(thunked(params, slots))
 end bind_params
+
+// An argument at a by-name parameter (`x: -> T`) becomes the closure `() -> arg`, so it is not
+// evaluated where it is written and the body evaluates it at each use. It runs after binding, the
+// one point at which a parameter and its argument are known to be a pair, so an argument placed by
+// name is thunked exactly as a positional one is. **A trailing block is already the closure** a
+// callable parameter reads it as, so wrapping it would put a second one around it.
+private thunked(params: Buf[Param], slots: Buf[Option[Expr]]) -> Buf[Option[Expr]]
+    var out: Buf[Option[Expr]] = buf()
+
+    for i in 0..<slots.len()
+        val slot = slots.at(i)
+
+        out.push(slot match
+            Some(a) if i < params.len() && params.at(i).by_name && !is_block(a) ->
+                var body: Buf[Stmt] = buf()
+
+                body.push(stmt(a.span, ExprStmt(a)))
+                Some(expr(a.span, Lambda(buf(), body, false)))
+            _ -> slot)
+
+    out
+end thunked
 
 // A variant's payload fields, which a call may name as it names a function's parameters: the
 // arguments put back into the order the fields were declared in. **A field nothing filled is NAMED**,
