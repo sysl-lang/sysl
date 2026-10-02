@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.text.from_utf8_unchecked
+import sysl.text.{from_utf8_unchecked, Search}
 
 // Which package a file came from, and what the module paths it writes mean.
 //
@@ -171,14 +171,44 @@ end reaches_module
 // as written; failing that it is offered to the packages the file's own manifest named. A path
 // that leads nowhere under any of them is handed back as written, so the caller's diagnostic
 // quotes what was there rather than a rewriting of it.
+//
+// **A path that only BEGINS a module as written yields to a mount that makes it one.** A `path`
+// dependency's canonical prefix is its label, so `zstd { path = … }` holding module `zstd` files it
+// as `zstd.zstd`, and `zstd` as written is then the head of a name no file writes. Where the
+// manifest's mount reads the same path as a module outright, that module is what `import zstd`,
+// `import zstd.*` and `import zstd.{tag}` name; a path that is itself a module keeps its own reading.
 in_package(a: &Analysis, pkg: Packaging, written: string) -> string
     val own = own_package(a, pkg, written)
 
     if own.is_some() then return own.unwrap()
-    if reaches_module(a, written) then return written
 
-    mounted(pkg, written).unwrap_or(written)
+    val through = mounted(pkg, written)
+
+    if reaches_module(a, written)
+        val prefix_only = !a.tables.has_module(written)
+
+        if prefix_only && through.is_some() && a.tables.has_module(through.unwrap()) then return through.unwrap()
+
+        return written
+
+    through.unwrap_or(written)
 end in_package
+
+// The module a written `head.name` reaches its `name` through, asked of the WHOLE path.
+//
+// **Asking `in_package` of the head alone answers the wrong question where a `path` dependency's
+// label is its own module's name.** Such a package's canonical prefix is the label, so `zstd { path =
+// … }` holding module `zstd` files it as `zstd.zstd` -- and the head `zstd` then *begins* a module,
+// reads as leading somewhere as written, and comes back unchanged, naming nothing that declares
+// `tag`. The whole path `zstd.tag` leads nowhere as written and falls through to the manifest's
+// mount, which is what the reference reads (`throughModule` hands `inPackage` the whole chain).
+module_in_package(a: &Analysis, pkg: Packaging, head: string, name: string) -> string
+    val whole = in_package(a, pkg, s"$head.$name")
+    val tail = s".$name"
+
+    if whole.ends_with(tail) then whole[0..<whole.bytes.len - tail.bytes.len]
+    else in_package(a, pkg, head)
+end module_in_package
 
 // What a written path's leading segment means in the **package the file itself belongs to**.
 //

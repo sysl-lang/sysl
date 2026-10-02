@@ -63,6 +63,10 @@ struct Graph
     claims: Buf[Claim]
     sums: Sums
     sums_changed: bool
+
+    // The features each package has enabled, keyed as `ResolvedPackage.canonical` is -- the root's
+    // under the empty name. A package missing from it has enabled nothing (`enabled_of`).
+    features: Buf[(string, Buf[string])]
 end Graph
 
 // What the selecting pass carries: the version floors, who asked for them, the manifests read so
@@ -74,6 +78,10 @@ struct ResolveState
     locals: Buf[ReadPackage]
     sums: Sums
     changed: bool
+
+    // What this round takes as enabled, which decides which optional dependencies each manifest is
+    // read with (`pruned_manifest`). A package no round has reached has nothing turned on.
+    enabled: Buf[(string, Buf[string])]
 end ResolveState
 
 // A manifest that has been read, and where it was read from. The coordinate is the empty string for
@@ -91,10 +99,50 @@ end ReadPackage
 // `cache` is passed in rather than found here so that a test can resolve a whole graph without
 // writing into the machine's own package cache -- the same reason the manifest reader takes text
 // rather than a path.
-resolve_graph(root: string, written: &Manifest, sums: Sums,
-              cache: string) -> Result[Graph, string]
+//
+// **Which features are on is a fixpoint over whole resolutions** (`features.sysl`): a round resolves
+// against what the previous one enabled, works out what that graph's consumers ask for, and the climb
+// stops at the first round that changes nothing. The comparison is over the enabled sets rather than
+// over the packages, because the case it exists for is a feature turned on in a package that was
+// already in the graph -- the same packages, different source. `testing` is `sysl test`'s, which turns
+// on every feature the root declares where the request said nothing.
+resolve_graph(root: string, written: &Manifest, sums: Sums, cache: string,
+              request: FeatureRequest = no_feature_request(),
+              testing: bool = false) -> Result[Graph, string]
     val config = resolving_local_paths(written, root)
-    var state = ResolveState(buf(), buf(), buf(), buf(), sums, false)
+    val root_set = root_enabled(config, request, testing)?
+    var enabled: Buf[(string, Buf[string])] = buf()
+
+    enabled.push(("", root_set))
+
+    var rounds = 0
+
+    loop
+        var built = resolve_once(root, config, sums, cache, enabled)?
+        var next = enabled_from(built.packages)?
+
+        next.push(("", root_set))
+
+        if same_enabled(next, enabled)
+            built.features = enabled
+            return Ok(built)
+        end if
+
+        if rounds >= FeatureRounds
+            return Err(s"resolving which features are enabled did not settle after $FeatureRounds " +
+                "rounds — a feature turning on a dependency whose own features turn on another is " +
+                "expected, and this many of them in a row is not")
+        end if
+
+        enabled = next
+        rounds += 1
+end resolve_graph
+
+// One round: the whole resolution, against one round's idea of what is enabled.
+private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string,
+                     enabled: Buf[(string, Buf[string])]) -> Result[Graph, string]
+    val config = pruned_manifest(written, enabled, "")
+    var state = ResolveState(buf(), buf(), buf(), buf(), sums, false, enabled)
 
     read_locals(config.dependencies, &state, cache)?
     demanding(&state, root_asker(config), config.dependencies)
@@ -135,8 +183,8 @@ resolve_graph(root: string, written: &Manifest, sums: Sums,
         packages.push(p)
 
     check_floors(packages)?
-    Ok(Graph(packages, state.claims, state.sums, state.changed))
-end resolve_graph
+    Ok(Graph(packages, state.claims, state.sums, state.changed, enabled))
+end resolve_once
 
 // What the root calls itself when it is the one asking, since it has no coordinate to be named by.
 //
@@ -265,7 +313,8 @@ private read_locals(deps: &Buf[Dependency], state: *ResolveState,
         if already_local(*state, dep) then continue
 
         val got = fetch_ensure(dep, state.sums, cache)?
-        val theirs = manifest_of_package(got.root)?
+        val theirs = pruned_manifest(manifest_of_package(got.root)?, state.enabled,
+                                     dependency_canonical(dep))
 
         for j in 0..<theirs.dependencies.len()
             if !is_git_dependency(theirs.dependencies.at(j))
@@ -337,7 +386,8 @@ private select_versions(state: *ResolveState, cache: string) -> Result[unit, str
         val version = next.unwrap().1
         val dep = plain_dependency(coordinate, Git(coordinate, version), None)
         val got = fetch_ensure(dep, state.sums, cache)?
-        val theirs = manifest_of_package(got.root)?
+        val theirs = pruned_manifest(manifest_of_package(got.root)?, state.enabled,
+                                     canonical_prefix(coordinate))
 
         for j in 0..<theirs.dependencies.len()
             if !is_git_dependency(theirs.dependencies.at(j))
@@ -800,16 +850,34 @@ struct PackageSources
     units: Buf[Program]
     root_mounts: Buf[(string, string)]
     roots: Buf[string]
+
+    // The `#if` symbols the project's own enabled features define, for its own files.
+    root_features: Buf[string]
 end PackageSources
 
 // A project that depends on nothing, which is what an empty `dependencies` block means.
-no_package_sources() -> PackageSources = PackageSources(buf(), buf(), buf())
+no_package_sources() -> PackageSources = PackageSources(buf(), buf(), buf(), buf())
 
 // The graph resolved, fetched and read, for one project at one machine, each dependency's modules
 // under the canonical prefix its coordinate gives them -- for every command, `emit-typed` included,
 // so that a package has the same name wherever the program is asked about.
+//
+// **Each package's files are gated by its own features**: a symbol is a fact about the package whose
+// manifest declared it, so the root's `feature_x` is invisible in a dependency and a dependency's in
+// the root.
 package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources, Failure]
-    if !wants_graph(m) then return Ok(no_package_sources())
+    if !wants_graph(m)
+        // No graph, but the project's own features still decide which of its lines are compiled.
+        val mine = root_enabled(resolving_local_paths(m, root), current_feature_request(),
+                                feature_testing()) match
+            Err(why) -> return Err(said(Refusal(why)))
+            Ok(got) -> got
+
+        var none = no_package_sources()
+
+        none.root_features = feature_symbols(mine)
+        return Ok(none)
+    end if
 
     val graph = resolved_graph(root, m)?
     var out = no_package_sources()
@@ -819,6 +887,7 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
 
         if is_root_package(p)
             out.root_mounts = p.imports
+            out.root_features = feature_symbols(enabled_of(graph.features, ""))
             continue
 
         out.roots.push(p.root)
@@ -835,9 +904,10 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
         // mean whatever *its* manifest bound -- which is what makes a package's source read the
         // same whoever depends on it.
         val theirs = Packaging(p.canonical, p.imports, true)
+        val gated = feature_symbols(enabled_of(graph.features, p.canonical))
 
         for j in 0..<found.len()
-            val parsed = parse(found.at(j).src, t)
+            val parsed = parse(found.at(j).src, t, gated)
 
             if !parsed.ok() then return Err(Reported(parse_report(parsed)))
 
@@ -864,7 +934,7 @@ resolved_graph(root: string, m: &Manifest) -> Result[Graph, Refusal]
         Err(why) -> return Err(Refusal(why))
         Ok(got) -> got
 
-    val graph = resolve_graph(root, m, sums, cache) match
+    val graph = resolve_graph(root, m, sums, cache, current_feature_request(), feature_testing()) match
         Err(why) -> return Err(Refusal(why))
         Ok(got) -> got
 

@@ -1,0 +1,705 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// A package's **features** and its **dev_dependencies** (`reference/packages.md § Dependencies`,
+// `§ Dependencies a test alone needs`): the three flags at the seam a shell types them, which
+// features of which package are on across a whole graph, what an enabled feature does to the lines a
+// package's files compile, and the check that keeps a dev dependency out of what a consumer compiles.
+//
+// Ported from the reference's `FeatureCliTests`, `FeatureResolveTests`, `FeatureGateTests` and
+// `DevDependencyTests`. Every refusal quoted here was read off the reference (0.0.154) run over the
+// same trees. A packaged graph is laid out in the project's `vendor/` tree with its hash beside it,
+// as a fetch would have left it, so nothing reaches the network.
+
+// -- the command line ------------------------------------------------------------------------------
+
+// What one command line came to: the status the shell hears and every line the driver said. The
+// request it parsed is left in place for the case to read, and cleared by `fea_done`.
+private fea_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end fea_cli
+
+// The features the last command line asked for, comma-joined.
+private fea_asked() -> string = join(current_feature_request().features.view(), ",")
+
+// Clears what a command line left, so no later build in this process inherits it.
+private fea_done()
+    reset_feature_request()
+    reset_search_paths()
+
+@test("--features parses into the request, on a command that resolves a graph")
+fea_features_parses()
+    fea_cli(["sysl", "build", "/does/not/exist", "--features", "server"])
+    assert_eq(fea_asked(), "server")
+    fea_done()
+
+@test("and a comma-separated value splits into several")
+fea_features_comma_splits()
+    fea_cli(["sysl", "build", "/does/not/exist", "--features", "server,tls"])
+    assert_eq(fea_asked(), "server,tls")
+    fea_done()
+
+@test("and the flag given more than once accumulates rather than overwriting")
+fea_features_accumulate()
+    fea_cli(["sysl", "build", "/does/not/exist", "--features", "server", "--features", "tls"])
+    assert_eq(fea_asked(), "server,tls")
+    fea_done()
+
+@test("and the two forms combine: repeated, each itself comma-separated")
+fea_features_combine()
+    fea_cli(["sysl", "build", "/does/not/exist", "--features", "a,b", "--features", "c,d"])
+    assert_eq(fea_asked(), "a,b,c,d")
+    fea_done()
+
+// The reference's list also has `deps` and `vendor`, which are not commands of this compiler; these
+// four are every command here that resolves a graph.
+@test("--features parses on every command that resolves a graph")
+fea_features_on_every_graph_command()
+    for command in ["run", "build", "build-c", "test"]
+        val said = fea_cli(["sysl", command, "/does/not/exist", "--features", "x"])
+
+        assert(said.0 != Misused, s"'$command --features x' did not parse")
+        assert_eq(fea_asked(), "x")
+        fea_done()
+
+// `build-lib` resolves no graph, and `emit-header` compiles no project's request; the reference's
+// second command here is `weave`, which this compiler does not have.
+@test("and is refused on a command that resolves no graph, exactly as an unknown option is")
+fea_features_refused_without_a_graph()
+    val unknown = fea_cli(["sysl", "build-lib", "/does/not/exist", "--no-such-option"])
+
+    assert_eq(fea_cli(["sysl", "build-lib", "/does/not/exist", "--features", "x"]).0, unknown.0)
+    assert_eq(unknown.0, Misused)
+    assert_eq(fea_cli(["sysl", "emit-header", "/does/not/exist", "--features", "x"]).0, Misused)
+    fea_done()
+
+@test("--no-default-features parses into the request")
+fea_no_default_parses()
+    fea_cli(["sysl", "build", "/does/not/exist", "--no-default-features"])
+    assert(current_feature_request().no_default, "no-default-features was not read")
+    fea_done()
+
+@test("and is refused on a command that resolves no graph")
+fea_no_default_refused_without_a_graph()
+    assert_eq(fea_cli(["sysl", "build-lib", "/does/not/exist", "--no-default-features"]).0, Misused)
+    fea_done()
+
+@test("--all-features parses into the request")
+fea_all_parses()
+    fea_cli(["sysl", "build", "/does/not/exist", "--all-features"])
+    assert(current_feature_request().all, "all-features was not read")
+    fea_done()
+
+@test("and --all-features is refused on a command that resolves no graph")
+fea_all_refused_without_a_graph()
+    assert_eq(fea_cli(["sysl", "build-lib", "/does/not/exist", "--all-features"]).0, Misused)
+    fea_done()
+
+private fea_conflict() -> string =
+    "error: --all-features says every feature the manifest declares is wanted, and " +
+    "--features/--no-default-features each say something narrower about the same set — a " +
+    "compilation cannot ask for both"
+
+// The check runs before the manifest is read, so a path naming nothing real still reaches it.
+@test("--all-features beside --features is refused, since the two say different things about the same set")
+fea_all_with_features_refused()
+    val said = fea_cli(["sysl", "build", "/does/not/exist", "--all-features", "--features", "server"])
+
+    assert(said.0 != Fine, "the conflict was built")
+    assert_eq(said.1, fea_conflict())
+    fea_done()
+
+@test("and the same refusal reaches --no-default-features")
+fea_all_with_no_default_refused()
+    val said = fea_cli(["sysl", "build", "/does/not/exist", "--all-features", "--no-default-features"])
+
+    assert(said.0 != Fine, "the conflict was built")
+    assert_eq(said.1, fea_conflict())
+    fea_done()
+
+@test("but --all-features alone is not a conflict with itself")
+fea_all_alone_is_no_conflict()
+    fea_cli(["sysl", "build", "/does/not/exist", "--all-features"])
+    assert(current_feature_request().all, "all-features was not read")
+    assert(feature_conflict().is_none(), "--all-features alone was refused")
+    fea_done()
+
+@test("the usage text names all three flags")
+fea_usage_names_the_flags()
+    val said = fea_cli(["sysl", "--help"])
+
+    assert(said.1.index_of("--features").is_some(), "no --features")
+    assert(said.1.index_of("--no-default-features").is_some(), "no --no-default-features")
+    assert(said.1.index_of("--all-features").is_some(), "no --all-features")
+    fea_done()
+
+// -- which features are on, across a graph ---------------------------------------------------------
+
+private fea_temp() -> string = absolute_path(make_temp_dir("sysl-fea").unwrap())
+
+private fea_entry(label: string, coordinate: string, extra: string) -> string =
+    s"$label { git = \"$coordinate\", version = \"1.0.0\"" +
+    (if extra.is_empty() then "" else s", $extra") + " }"
+
+private fea_manifest(name: string, version: string, deps: string, feats: string) -> string =
+    s"package { name = \"$name\", version = \"$version\" }\n" +
+    (if deps.is_empty() then "" else s"dependencies { $deps }\n") +
+    (if feats.is_empty() then "" else s"features { $feats }\n")
+
+// A package at a coordinate in the project's `vendor/` tree, holding one module named after it, as a
+// fetch would have left it.
+private fea_publish(root: string, coordinate: string, module_name: string, deps: string, feats: string)
+    val dir = s"$root/vendor/$coordinate/@v1.0.0"
+
+    make_dir_all(s"$dir/$module_name").unwrap()
+    write_text(s"$dir/package.hocon", fea_manifest(module_name, "1.0.0", deps, feats)).unwrap()
+    write_text(s"$dir/$module_name/$module_name.sysl", s"module $module_name\n").unwrap()
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+end fea_publish
+
+// `tiny`, and a `buf` whose features each turn it on.
+private fea_with_buf(root: string)
+    fea_publish(root, "github.com/e/tiny", "tiny", "", "")
+    fea_publish(root, "github.com/e/buf", "buf",
+                fea_entry("tiny", "github.com/e/tiny", "optional = true"),
+                "default = [tiny], x = [tiny], y = [tiny]")
+end fea_with_buf
+
+private fea_request(named: []string, no_default: bool, all: bool) -> FeatureRequest
+    var out: Buf[string] = buf()
+
+    for n in named
+        out.push(n)
+
+    FeatureRequest(out, no_default, all)
+end fea_request
+
+private fea_resolved(root: string, deps: string, feats: string, r: FeatureRequest,
+                     testing: bool) -> Result[Graph, string] =
+    resolve_graph(root, read_manifest(fea_manifest("app", "0.1.0", deps, feats)).unwrap(),
+                  empty_sums(), s"$root/vendor", r, testing)
+
+private fea_graph(root: string, deps: string, feats: string, r: FeatureRequest) -> Graph =
+    fea_resolved(root, deps, feats, r, false).unwrap()
+
+// Every package the graph holds but the root, by canonical name, sorted and comma-joined.
+private fea_selected(g: Graph) -> string
+    var names: Buf[string] = buf()
+
+    for i in 0..<g.packages.len()
+        if !is_root_package(g.packages.at(i)) then names.push(g.packages.at(i).canonical)
+
+    join(sorted_labels(names).view(), ",")
+end fea_selected
+
+// What one package of the graph has enabled, sorted and comma-joined.
+private fea_on(g: Graph, canonical: string) -> string =
+    join(sorted_labels(enabled_of(g.features, canonical)).view(), ",")
+
+private fea_silent() -> FeatureRequest = no_feature_request()
+
+// Nothing asked for `server`, so `extra` is not fetched at all.
+@test("nothing enables it, so it is not there")
+fea_nothing_enables_it()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/extra", "extra", "", "")
+
+    val g = fea_graph(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
+                      "server = [extra]", fea_silent())
+
+    assert_eq(fea_selected(g), "")
+    assert_eq(fea_on(g, ""), "")
+    remove_dir_all(root).unwrap_or(())
+
+// `default` is an ordinary feature that happens to be the one asking for nothing gets.
+@test("default turns it on")
+fea_default_turns_it_on()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/extra", "extra", "", "")
+
+    val g = fea_graph(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
+                      "default = [extra]", fea_silent())
+
+    assert_eq(fea_selected(g), "github.com.e.extra")
+    assert_eq(fea_on(g, ""), "default")
+    remove_dir_all(root).unwrap_or(())
+
+@test("no-default-features takes the same one away")
+fea_no_default_takes_it_away()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/extra", "extra", "", "")
+
+    val g = fea_graph(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
+                      "default = [extra]", fea_request([], true, false))
+
+    assert_eq(fea_selected(g), "")
+    assert_eq(fea_on(g, ""), "")
+    remove_dir_all(root).unwrap_or(())
+
+@test("asking for it by name adds it")
+fea_asking_by_name_adds_it()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/extra", "extra", "", "")
+
+    val g = fea_graph(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
+                      "server = [extra]", fea_request(["server"], false, false))
+
+    assert_eq(fea_selected(g), "github.com.e.extra")
+    assert_eq(fea_on(g, ""), "server")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a feature implying a feature reaches what the second one names")
+fea_a_feature_implying_a_feature()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/extra", "extra", "", "")
+
+    val g = fea_graph(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
+                      "default = [server], server = [extra]", fea_silent())
+
+    assert_eq(fea_selected(g), "github.com.e.extra")
+    assert_eq(fea_on(g, ""), "default,server")
+    remove_dir_all(root).unwrap_or(())
+
+@test("all-features turns on every one the manifest declares")
+fea_all_features_turns_on_every_one()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/extra", "extra", "", "")
+
+    val g = fea_graph(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
+                      "server = [extra], client = [server]", fea_request([], false, true))
+
+    assert_eq(fea_selected(g), "github.com.e.extra")
+    assert_eq(fea_on(g, ""), "client,server")
+    remove_dir_all(root).unwrap_or(())
+
+// The ordinary gate compiles what the ordinary build compiles, so gated code would otherwise be code
+// the suite never sees.
+@test("sysl test on the root enables all of them")
+fea_test_enables_all_of_them()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/extra", "extra", "", "")
+
+    val g = fea_resolved(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
+                         "server = [extra]", fea_silent(), true).unwrap()
+
+    assert_eq(fea_on(g, ""), "server")
+    remove_dir_all(root).unwrap_or(())
+
+// ...unless the caller said what it wanted, in which case that is the configuration under test.
+@test("an explicit request under test is not widened")
+fea_an_explicit_request_under_test()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/extra", "extra", "", "")
+
+    val g = fea_resolved(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
+                         "default = [extra], server = [extra]", fea_request([], true, false),
+                         true).unwrap()
+
+    assert_eq(fea_on(g, ""), "")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a dependency gets the union of what its consumers asked for: two consumers, two features")
+fea_two_consumers_two_features()
+    val root = fea_temp()
+
+    fea_with_buf(root)
+    fea_publish(root, "github.com/e/a", "a",
+                fea_entry("buf", "github.com/e/buf", "features = [x], default_features = false"), "")
+    fea_publish(root, "github.com/e/b", "b",
+                fea_entry("buf", "github.com/e/buf", "features = [y], default_features = false"), "")
+
+    val g = fea_graph(root, fea_entry("a", "github.com/e/a", "") + ", " +
+                      fea_entry("b", "github.com/e/b", ""), "", fea_silent())
+
+    assert_eq(fea_on(g, "github.com.e.buf"), "x,y")
+    remove_dir_all(root).unwrap_or(())
+
+// One consumer turning `default` off says what *it* does not need; it does not take the feature away
+// from a sibling that took the package the ordinary way.
+@test("one consumer turning default off does not drop it")
+fea_one_consumer_turning_default_off()
+    val root = fea_temp()
+
+    fea_with_buf(root)
+    fea_publish(root, "github.com/e/a", "a",
+                fea_entry("buf", "github.com/e/buf", "features = [x], default_features = false"), "")
+    fea_publish(root, "github.com/e/b", "b", fea_entry("buf", "github.com/e/buf", ""), "")
+
+    val g = fea_graph(root, fea_entry("a", "github.com/e/a", "") + ", " +
+                      fea_entry("b", "github.com/e/b", ""), "", fea_silent())
+
+    assert_eq(fea_on(g, "github.com.e.buf"), "default,x")
+    remove_dir_all(root).unwrap_or(())
+
+@test("every consumer turning it off does drop it")
+fea_every_consumer_turning_it_off()
+    val root = fea_temp()
+
+    fea_with_buf(root)
+    fea_publish(root, "github.com/e/a", "a",
+                fea_entry("buf", "github.com/e/buf", "features = [x], default_features = false"), "")
+
+    val g = fea_graph(root, fea_entry("a", "github.com/e/a", ""), "", fea_silent())
+
+    assert_eq(fea_on(g, "github.com.e.buf"), "x")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a request has to name a feature that package declares: the refusal names the consumer, the dependency and the feature")
+fea_the_refusal_names_the_consumer()
+    val root = fea_temp()
+
+    fea_with_buf(root)
+    fea_publish(root, "github.com/e/a", "a", fea_entry("buf", "github.com/e/buf", "features = [nope]"), "")
+
+    assert_eq(fea_resolved(root, fea_entry("a", "github.com/e/a", ""), "", fea_silent(), false).unwrap_err(),
+              "github.com.e.a asks 'buf' for the feature 'nope', which 'github.com.e.buf' does not " +
+              "declare — a consumer may only ask for a feature that package's own manifest names. " +
+              "It declares 'default', 'x', 'y'")
+    remove_dir_all(root).unwrap_or(())
+
+@test("and so does the root's own request")
+fea_and_so_does_the_roots_own_request()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/extra", "extra", "", "")
+
+    assert_eq(fea_resolved(root, fea_entry("extra", "github.com/e/extra", "optional = true"),
+                           "server = [extra]", fea_request(["srever"], false, false), false).unwrap_err(),
+              "this project has no feature 'srever' — a feature has to be declared in package.hocon's " +
+              "'features' block before it can be asked for. It declares 'server'")
+    remove_dir_all(root).unwrap_or(())
+
+// The case the resolution has to be a fixpoint for: turning a feature on brings a package into the
+// graph, and *that* package is a consumer whose own request enables something one pass had already
+// settled.
+@test("enabling a feature brings a consumer whose own request enables another")
+fea_enabling_a_feature_brings_a_consumer()
+    val root = fea_temp()
+
+    fea_with_buf(root)
+    fea_publish(root, "github.com/e/a", "a",
+                fea_entry("buf", "github.com/e/buf", "features = [y], default_features = false"), "")
+
+    val deps = fea_entry("a", "github.com/e/a", "optional = true") + ", " +
+               fea_entry("buf", "github.com/e/buf", "default_features = false")
+    val off = fea_graph(root, deps, "server = [a]", fea_silent())
+    val on = fea_graph(root, deps, "server = [a]", fea_request(["server"], false, false))
+
+    assert_eq(fea_on(off, "github.com.e.buf"), "")
+    assert_eq(fea_on(on, "github.com.e.buf"), "y")
+
+    // `tiny` is buf's own optional dependency, reachable only once `y` is on -- a fact about buf that
+    // nothing knew when the round that put `a` in the graph resolved it.
+    assert_eq(fea_selected(off), "github.com.e.buf")
+    assert_eq(fea_selected(on), "github.com.e.a,github.com.e.buf,github.com.e.tiny")
+    remove_dir_all(root).unwrap_or(())
+
+// A bare member names the FEATURE of that name where one is declared, so `server`'s `lmdb` is the
+// feature `lmdb` and its own list is followed -- `zstd` comes on with it.
+@test("a feature member naming a feature chains into that feature even where a dependency shares its label")
+fea_a_member_naming_a_feature_chains()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/lmdb", "lmdb", "", "")
+    fea_publish(root, "github.com/e/zstd", "zstd", "", "")
+
+    val g = fea_graph(root, fea_entry("lmdb", "github.com/e/lmdb", "optional = true") + ", " +
+                      fea_entry("zstd", "github.com/e/zstd", "optional = true"),
+                      "server = [lmdb], lmdb = [zstd]", fea_request(["server"], false, false))
+
+    assert_eq(fea_on(g, ""), "lmdb,server")
+    assert_eq(fea_selected(g), "github.com.e.lmdb,github.com.e.zstd")
+    remove_dir_all(root).unwrap_or(())
+
+// Every member of `default` is a feature, and each of those turns its own dependency on through a
+// self-reference: all seven features on AND all six dependencies in the graph.
+@test("a default naming features that each turn on their own like-named dependency enables both")
+fea_a_default_naming_like_named_features()
+    val root = fea_temp()
+    var deps: Buf[string] = buf()
+
+    for label in ["redis", "lmdb", "zstd", "brotli", "nghttp2", "libwebp"]
+        fea_publish(root, s"github.com/e/$label", label, "", "")
+        deps.push(fea_entry(label, s"github.com/e/$label", "optional = true"))
+
+    val g = fea_graph(root, join(deps.view(), ", "),
+                      "default = [http2, redis, lmdb, zstd, brotli, webp], redis = [redis], " +
+                      "lmdb = [lmdb], zstd = [zstd], brotli = [brotli], http2 = [nghttp2], " +
+                      "webp = [libwebp]", fea_silent())
+
+    assert_eq(fea_on(g, ""), "brotli,default,http2,lmdb,redis,webp,zstd")
+    assert_eq(fea_selected(g), "github.com.e.brotli,github.com.e.libwebp,github.com.e.lmdb," +
+                               "github.com.e.nghttp2,github.com.e.redis,github.com.e.zstd")
+    remove_dir_all(root).unwrap_or(())
+
+// The self-reference on its own: the feature is on, its dependency is on, and nothing read it as a
+// feature turning itself on.
+@test("a feature whose only member is its own like-named dependency turns that dependency on")
+fea_a_self_named_feature_turns_its_dependency_on()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/lmdb", "lmdb", "", "")
+
+    val g = fea_graph(root, fea_entry("lmdb", "github.com/e/lmdb", "optional = true"),
+                      "lmdb = [lmdb]", fea_request(["lmdb"], false, false))
+
+    assert_eq(fea_on(g, ""), "lmdb")
+    assert_eq(fea_selected(g), "github.com.e.lmdb")
+    remove_dir_all(root).unwrap_or(())
+
+// `dep:X` names the dependency wherever it is written, so it turns the dependency on WITHOUT enabling
+// the feature that shares its name.
+@test("a 'dep:' member turns the dependency on and leaves the like-named feature off")
+fea_a_dep_member_leaves_the_feature_off()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/lmdb", "lmdb", "", "")
+    fea_publish(root, "github.com/e/zstd", "zstd", "", "")
+
+    val g = fea_graph(root, fea_entry("lmdb", "github.com/e/lmdb", "optional = true") + ", " +
+                      fea_entry("zstd", "github.com/e/zstd", "optional = true"),
+                      "server = [\"dep:lmdb\"], lmdb = [zstd]", fea_request(["server"], false, false))
+
+    assert_eq(fea_on(g, ""), "server")
+    assert_eq(fea_selected(g), "github.com.e.lmdb")
+    remove_dir_all(root).unwrap_or(())
+
+// -- what an enabled feature does to the source ----------------------------------------------------
+
+private fea_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A project with a manifest of its own and one program file at its root.
+private fea_app(config: string, program: string) -> string
+    val root = fea_temp()
+
+    write_text(s"$root/package.hocon", config).unwrap()
+    write_text(s"$root/main.sysl", program).unwrap()
+    root
+end fea_app
+
+// A package on disk holding one module, whose manifest is whatever the case needs.
+private fea_dependency(module_name: string, text: string, feats: string) -> string
+    val root = fea_temp()
+
+    make_dir_all(s"$root/$module_name").unwrap()
+    write_text(s"$root/package.hocon", fea_manifest(module_name, "1.0.0", "", feats)).unwrap()
+    write_text(s"$root/$module_name/$module_name.sysl", s"module $module_name\n\n$text\n").unwrap()
+    root
+end fea_dependency
+
+private fea_saying(deps: string, feats: string) -> string = fea_manifest("app", "0.1.0", deps, feats)
+
+// What the program a build of `root` makes prints, or what stopped it. Built under a silent request,
+// as `sysl run <root>` builds it.
+private fea_run(root: string) -> string
+    reset_feature_request()
+
+    val out_dir = fea_temp()
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+    said
+end fea_run
+
+private fea_two_blocks() -> string =
+    "#if feature_a\nprint(\"a\")\n#endif\n#if feature_b\nprint(\"b\")\n#endif\nprint(\"end\")\n"
+
+@test("the enabled one's block is compiled in and the declared one nobody turned on is not")
+fea_the_enabled_block_is_compiled_in()
+    if !fea_ready() then return
+
+    assert_eq(fea_run(fea_app(fea_saying("", "default = [a], a = [], b = []"), fea_two_blocks())),
+              "a\nend\n")
+
+// Freedom to disagree: the same program against a manifest whose `default` turns on `b` instead.
+@test("and turning the other one on instead swaps which block is there")
+fea_turning_the_other_one_on_swaps()
+    if !fea_ready() then return
+
+    assert_eq(fea_run(fea_app(fea_saying("", "default = [b], a = [], b = []"), fea_two_blocks())),
+              "b\nend\n")
+
+// The lines are gone before anything reads them, rather than present and unreached.
+@test("a gated-out block is not compiled at all, so what it names need not exist")
+fea_a_gated_out_block_is_not_compiled()
+    if !fea_ready() then return
+
+    val program = "#if feature_b\nprint(nothing_declares_this())\n#endif\nprint(\"built\")\n"
+
+    assert_eq(fea_run(fea_app(fea_saying("", "default = [a], a = [], b = []"), program)), "built\n")
+
+    val refused = fea_run(fea_app(fea_saying("", "default = [b], a = [], b = []"), program))
+
+    assert(refused.index_of("undefined function 'nothing_declares_this'").is_some(), refused)
+
+@test("what a consumer asked for is a symbol in the package it asked of")
+fea_a_consumers_request_is_a_symbol_there()
+    if !fea_ready() then return
+
+    val text = "#if feature_fast\ntag() -> string = \"fast\"\n#else\ntag() -> string = \"plain\"\n#endif"
+    val dep = fea_dependency("engine", text, "fast = []")
+
+    assert_eq(fea_run(fea_app(fea_saying(s"e { path = \"$dep\", features = [fast] }", ""),
+                              "print(engine.tag())\n")), "fast\n")
+    assert_eq(fea_run(fea_app(fea_saying(s"e { path = \"$dep\" }", ""), "print(engine.tag())\n")),
+              "plain\n")
+    remove_dir_all(dep).unwrap_or(())
+
+// Both directions of the isolation in one program: the root's own file sees `feature_x` and the
+// dependency's file, gated on the same word, does not.
+@test("and the root's features are invisible in it, as its are in the root")
+fea_the_roots_features_are_invisible_in_a_dependency()
+    if !fea_ready() then return
+
+    val dep = fea_dependency("engine",
+        "#if feature_x\ntag() -> string = \"engine saw x\"\n#else\ntag() -> string = \"engine did not see x\"\n#endif",
+        "")
+    val program = "#if feature_x\nprint(\"root sees x\")\n#endif\nprint(engine.tag())\n"
+
+    assert_eq(fea_run(fea_app(fea_saying(s"e { path = \"$dep\" }", "default = [x], x = []"), program)),
+              "root sees x\nengine did not see x\n")
+    remove_dir_all(dep).unwrap_or(())
+
+private fea_zstd_program() -> string =
+    "#if feature_zstd\nprint(zstd.tag())\n#else\nprint(\"no zstd in this build\")\n#endif\n"
+
+// Both halves have to land: the dependency in the graph, AND `feature_zstd` defined so the gated body
+// is compiled.
+@test("a feature named after the dependency it turns on brings the dependency in AND defines its gate symbol")
+fea_a_like_named_feature_brings_both()
+    if !fea_ready() then return
+
+    val dep = fea_dependency("zstd", "tag() -> string = \"compressed\"", "")
+
+    assert_eq(fea_run(fea_app(fea_saying(s"zstd { path = \"$dep\", optional = true }",
+                                         "default = [zstd], zstd = [zstd]"), fea_zstd_program())),
+              "compressed\n")
+    remove_dir_all(dep).unwrap_or(())
+
+@test("and leaves both out where default turns it off")
+fea_a_like_named_feature_left_off()
+    if !fea_ready() then return
+
+    val dep = fea_dependency("zstd", "tag() -> string = \"compressed\"", "")
+
+    assert_eq(fea_run(fea_app(fea_saying(s"zstd { path = \"$dep\", optional = true }",
+                                         "default = [], zstd = [zstd]"), fea_zstd_program())),
+              "no zstd in this build\n")
+    remove_dir_all(dep).unwrap_or(())
+
+// -- dev_dependencies ------------------------------------------------------------------------------
+
+// The path a file writes, which is the module rather than the coordinate.
+private fea_dev() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("sh.sysl.quickjs")
+    out
+end fea_dev
+
+private fea_unit(name: string, text: string) -> Program = parse(source_of(name, text)).program
+
+private fea_units(a: Program) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    out.push(a)
+    out
+end fea_units
+
+private fea_pair(a: Program, b: Program) -> Buf[Program]
+    var out = fea_units(a)
+
+    out.push(b)
+    out
+end fea_pair
+
+private fea_refused(units: Buf[Program]) -> Buf[Diagnostic] = check_dev_imports(units, fea_dev()) match
+    Err(found) -> found
+    Ok(_) -> buf()
+
+private fea_allowed(units: Buf[Program]) -> bool = check_dev_imports(units, fea_dev()).is_ok()
+
+private fea_dev_message() -> string =
+    "'sh.sysl.quickjs' comes from 'sh.sysl.quickjs', which this project declares in " +
+    "'dev_dependencies' — that is not fetched for anything depending on this project, so only a " +
+    "'@tests' file or a '@test' function may import it. Move the import into the tests, or declare " +
+    "the package in 'dependencies' if the library itself needs it"
+
+@test("an ordinary module may not import a dev dependency")
+fea_dev_an_ordinary_module_may_not()
+    val found = fea_refused(fea_units(fea_unit("lib.sysl", "module p\n\nimport sh.sysl.quickjs\n")))
+
+    assert_eq(found.len(), 1)
+    assert_eq(found.at(0).message, fea_dev_message())
+
+// Both answers are reasonable and only the author knows which: move the import, or promote it.
+@test("is told both ways out")
+fea_dev_is_told_both_ways_out()
+    val message = fea_refused(fea_units(fea_unit("lib.sysl", "module p\n\nimport sh.sysl.quickjs\n"))).at(0).message
+
+    assert(message.index_of("'@tests' file").is_some(), message)
+    assert(message.index_of("'dependencies'").is_some(), message)
+
+@test("is refused for a module NAMED BELOW the package too")
+fea_dev_a_module_below()
+    assert(check_dev_imports(buf(), fea_dev()).is_ok(), "nothing was refused for nothing")
+    assert_eq(fea_refused(fea_units(fea_unit("lib.sysl",
+        "module p\n\nimport sh.sysl.quickjs.engine\n"))).len(), 1)
+
+// A prefix match on the string alone would catch this, and it is a different package.
+@test("is not refused for a package whose name merely starts the same way")
+fea_dev_a_package_starting_the_same_way()
+    assert(fea_allowed(fea_units(fea_unit("lib.sysl", "module p\n\nimport sh.sysl.quickjson\n"))),
+           "a different package was refused")
+
+@test("may import anything else")
+fea_dev_may_import_anything_else()
+    assert(fea_allowed(fea_units(fea_unit("lib.sysl", "module p\n\nimport sysl.buf.Buf\n"))),
+           "an ordinary import was refused")
+
+// The whole file is scaffolding, gone for every consumer, so there is nothing left to refuse.
+@test("a '@tests' file may import a dev dependency")
+fea_dev_a_tests_file_may()
+    assert(fea_allowed(fea_units(fea_unit("tests.sysl", "module p\n@tests\n\nimport sh.sysl.quickjs\n"))),
+           "a @tests file was refused")
+
+@test("does not excuse an ordinary file beside it")
+fea_dev_a_tests_file_excuses_nothing_beside_it()
+    assert_eq(fea_refused(fea_pair(fea_unit("tests.sysl", "module p\n@tests\n\nimport sh.sysl.quickjs\n"),
+                                   fea_unit("lib.sysl", "module p\n\nimport sh.sysl.quickjs\n"))).len(), 1)
+
+// The ordinary case, and the one that must cost nothing: almost no project has a dev block.
+@test("with nothing declared the check says nothing at all")
+fea_dev_with_nothing_declared()
+    assert(check_dev_imports(fea_units(fea_unit("lib.sysl", "module p\n\nimport sh.sysl.quickjs\n")),
+                             buf()).is_ok(), "an empty dev set refused an import")
+
+@test("every offending file is named")
+fea_dev_every_offending_file_is_named()
+    assert_eq(fea_refused(fea_pair(fea_unit("a.sysl", "module p\n\nimport sh.sysl.quickjs\n"),
+                                   fea_unit("b.sysl", "module p\n\nimport sh.sysl.quickjs\n"))).len(), 2)

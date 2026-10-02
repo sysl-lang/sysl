@@ -1,0 +1,400 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, split, Search}
+
+// Which features of which package are on, worked out across the whole dependency graph
+// (`reference/packages.md § Dependencies`).
+//
+// A feature is a name for a set of optional dependencies and of other features, so what is enabled
+// decides what is fetched -- and what is fetched brings consumers whose own requests decide what else
+// is enabled. **Unification is a union, and that is what makes it a fixpoint**: a package reached by
+// two consumers gets the features both of them asked for, because each is building against a surface
+// it believes is there. So enabling a feature can pull an optional dependency into the graph, that
+// dependency is a consumer with requests of its own, and those can enable a feature somewhere an
+// earlier round had already settled. The resolver runs again against what the previous round
+// enabled until a round changes nothing (`resolve_graph`). Every round can only add, which is why it
+// ends; the bound in `FeatureRounds` is what makes a defect in that reasoning fail loudly instead of
+// spinning.
+//
+// An enabled feature reaches the source as a `#if` symbol, `feature_<name>`, in the files of the
+// package whose manifest declared it and nowhere else (`conditional.sysl`).
+
+// What the caller asked the root project for, before anything is resolved.
+//
+// Three fields rather than one list because they answer three questions and a caller may say any
+// combination: `features` adds, `no_default` takes away the one a package ships with, and `all`
+// says whatever the manifest declares is wanted. One list could not tell *I asked for nothing* from
+// *I asked for none of them*, which is exactly the distinction `default` turns on.
+struct FeatureRequest
+    features: Buf[string]
+    no_default: bool
+    all: bool
+end FeatureRequest
+
+// A request that says nothing, which is what a command given none of the three flags makes.
+no_feature_request() -> FeatureRequest = FeatureRequest(buf(), false, false)
+
+// Whether the caller said nothing at all, which is what lets `sysl test` decide for itself: gated
+// code the ordinary gate never compiles is gated code nobody is testing, so a silent test run turns
+// every feature on -- but somebody who named a configuration is asking to test that one.
+request_silent(r: &FeatureRequest) -> bool = r.features.is_empty() && !r.no_default && !r.all
+
+// How many rounds the climb may take before it gives up and says so. A round is spent only when the
+// previous one's answer changed the next, so the count is bounded by how deep a feature turning on a
+// dependency that turns on a feature goes, not by the size of the graph.
+val FeatureRounds: int = 64
+
+// -- the command line ------------------------------------------------------------------------------
+
+// **The request is module storage, written once by the command that parsed the flags**, for the
+// reason `search_paths.sysl` gives for its own: what it has to reach is every resolution a build
+// makes -- the compilation, the C walk, the run cache's key -- and threading it would put a parameter
+// on every one of them.
+private var fr_features: Buf[string] = buf()
+private var fr_no_default: bool = false
+private var fr_all: bool = false
+
+// Whether this command is `sysl test`, which widens a silent request to every feature the root
+// declares.
+private var fr_testing: bool = false
+
+// What a command line that named none of the flags asks for. Called before each command's own flags
+// are read, so one process running two commands never inherits the first's request.
+reset_feature_request()
+    fr_features = buf()
+    fr_no_default = false
+    fr_all = false
+    fr_testing = false
+end reset_feature_request
+
+// The request as the flags left it.
+current_feature_request() -> FeatureRequest
+    var named: Buf[string] = buf()
+
+    for i in 0..<fr_features.len()
+        named.push(fr_features.at(i))
+
+    FeatureRequest(named, fr_no_default, fr_all)
+end current_feature_request
+
+// Whether the command resolving a graph is `sysl test`.
+feature_testing() -> bool = fr_testing
+
+// Said by `sysl test` before it builds anything.
+set_feature_testing() = fr_testing = true
+
+// One argument, where it is one of the three feature flags -- which only the commands that resolve a
+// package graph take. The answer is how many arguments were taken, `0` for `--features` with no
+// operand, and `-1` for an argument that is none of them.
+//
+// **`--features` accumulates and splits on commas**, so `--features a,b --features c` is three.
+took_feature_flag(args: []string, i: usize) -> int
+    val arg = args[i]
+
+    if arg == "--features"
+        if i + 1 >= args.len then return 0
+
+        for part in split(args[i + 1], ",")
+            val one = part.trim()
+
+            if !one.is_empty() then fr_features.push(one)
+
+        return 2
+    end if
+
+    if arg == "--no-default-features"
+        fr_no_default = true
+        return 1
+    end if
+
+    if arg == "--all-features"
+        fr_all = true
+        return 1
+    end if
+
+    -1
+end took_feature_flag
+
+// The flags as a usage line writes them.
+feature_flags() -> string = "[--features <list>] [--no-default-features] [--all-features]"
+
+// The refusal for a request that says two different things about one set, before any manifest is
+// read -- so a path naming nothing real still reaches it.
+feature_conflict() -> Option[string]
+    if !fr_all || (fr_features.is_empty() && !fr_no_default) then return None
+
+    Some("--all-features says every feature the manifest declares is wanted, and " +
+         "--features/--no-default-features each say something narrower about the same set — a " +
+         "compilation cannot ask for both")
+end feature_conflict
+
+// The request as one part of the run cache's key: two builds of one tree under two requests are two
+// programs.
+feature_request_part() -> string =
+    s"features:${join(fr_features.view(), ",")};no-default:$fr_no_default;all:$fr_all;test:$fr_testing"
+
+// -- resolution ------------------------------------------------------------------------------------
+
+// The features a package's own manifest turns on from what was asked, following feature-to-feature
+// edges. Only names the manifest declares survive: an asked-for name no feature is declared for drops
+// out, and a member naming a dependency rather than a feature is read back by `active_dependencies`.
+feature_closure(declared: &Buf[(string, Buf[string])], asked: &Buf[string],
+                deps: &Buf[Dependency]) -> Buf[string]
+    var seen: Buf[string] = buf()
+    var queue: Buf[string] = buf()
+
+    for i in 0..<asked.len()
+        queue.push(asked.at(i))
+
+    var at: usize = 0
+
+    while at < queue.len()
+        val name = queue.at(at)
+
+        at += 1
+
+        if holds_string(seen, name) || !feature_named(declared, name) then continue
+
+        seen.push(name)
+
+        val next = implied_features(declared, deps, name)
+
+        for j in 0..<next.len()
+            queue.push(next.at(j))
+
+    seen
+end feature_closure
+
+// The root project's own enabled set, from what the caller asked for.
+//
+// `default` is an ordinary feature that happens to be the one asking for nothing gets, so it joins
+// the asked-for list rather than having a branch of its own -- and a manifest declaring no `default`
+// has nothing to add, which is why an absent one is not an error while a misspelled request is.
+root_enabled(m: &Manifest, r: &FeatureRequest, testing: bool) -> Result[Buf[string], string]
+    if r.all || (testing && request_silent(r)) then return Ok(declared_features(m))
+
+    for i in 0..<r.features.len()
+        val asked = r.features.at(i)
+
+        if !feature_named(m.features, asked)
+            val declared = declared_features(m)
+            val tail = if declared.is_empty() then ", and this manifest declares none"
+            else s". It declares ${quoted_names(declared)}"
+
+            return Err(s"this project has no feature '$asked' — a feature has to be declared in " +
+                       s"$ManifestName's 'features' block before it can be asked for$tail")
+
+    var asked: Buf[string] = buf()
+
+    for i in 0..<r.features.len()
+        asked.push(r.features.at(i))
+
+    if !r.no_default then asked.push("default")
+
+    Ok(feature_closure(m.features, asked, m.dependencies))
+end root_enabled
+
+// Every feature a manifest declares, in the order it wrote them.
+private declared_features(m: &Manifest) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<m.features.len()
+        out.push(m.features.at(i).0)
+
+    out
+end declared_features
+
+private quoted_names(names: Buf[string]) -> string
+    var parts: Buf[string] = buf()
+
+    for i in 0..<names.len()
+        parts.push(s"'${names.at(i)}'")
+
+    join(parts.view(), ", ")
+end quoted_names
+
+// The dependencies of one package that are in the graph, given what that package has enabled: every
+// entry that is not `optional`, and an optional one exactly where an enabled feature names its label.
+// A member written `dep:X` reaches the dependency `X`, so the prefix comes off before labels are
+// matched.
+//
+// **The filtering happens before anything is fetched**, so an optional dependency nothing turned on is
+// not downloaded, not asked for the libraries its manifest requires, and adds nothing to the link line
+// -- which is the whole of what `optional` is for.
+active_dependencies(m: &Manifest, enabled: &Buf[string]) -> Buf[Dependency]
+    var turned_on: Buf[string] = buf()
+
+    for i in 0..<m.features.len()
+        if !holds_string(*enabled, m.features.at(i).0) then continue
+
+        val members = m.features.at(i).1
+
+        for j in 0..<members.len()
+            val member = members.at(j)
+
+            turned_on.push(if member.starts_with("dep:") then member[4..<member.len] else member)
+
+    var out: Buf[Dependency] = buf()
+
+    for i in 0..<m.dependencies.len()
+        val dep = m.dependencies.at(i)
+
+        if !dep.optional || holds_string(turned_on, dep.label) then out.push(dep)
+
+    out
+end active_dependencies
+
+// A manifest as one round reads it: the optional dependencies nothing has turned on removed. Pruning
+// at the read rather than at each use keeps the rest of the resolution ignorant of features --
+// selection, the import tables and the collision rule all go on asking a manifest what it depends on.
+pruned_manifest(m: &Manifest, enabled: &Buf[(string, Buf[string])], canonical: string) -> Manifest
+    var out = *m
+
+    out.dependencies = active_dependencies(m, enabled_of(enabled, canonical))
+    out
+end pruned_manifest
+
+// The features one package has enabled, or none where nothing has reached it.
+enabled_of(enabled: &Buf[(string, Buf[string])], canonical: string) -> Buf[string]
+    for i in 0..<enabled.len()
+        if enabled.at(i).0 == canonical then return enabled.at(i).1
+
+    buf()
+end enabled_of
+
+// What every dependency in a resolved graph has enabled, from the requests its consumers wrote: the
+// union of the features each consumer named, plus `default` unless **every** consumer turned it off.
+// One consumer writing `default_features = false` says what *it* does not need, and does not get to
+// take a feature away from a sibling that asked for the package the ordinary way.
+//
+// The root is left out: what it has enabled is the caller's answer rather than anybody's request.
+enabled_from(packages: &Buf[ResolvedPackage]) -> Result[Buf[(string, Buf[string])], string]
+    var out: Buf[(string, Buf[string])] = buf()
+
+    for t in 0..<packages.len()
+        val target = packages.at(t)
+
+        if is_root_package(target) then continue
+
+        var named: Buf[string] = buf()
+        var wants_default = false
+        var asked_at_all = false
+
+        for p in 0..<packages.len()
+            val consumer = packages.at(p)
+            val deps = consumer.manifest.dependencies
+
+            for d in 0..<deps.len()
+                val dep = deps.at(d)
+
+                if dependency_canonical(dep) != target.canonical then continue
+
+                asked_at_all = true
+
+                if dep.default_features then wants_default = true
+
+                for f in 0..<dep.features.len()
+                    val feature = dep.features.at(f)
+
+                    if !feature_named(target.manifest.features, feature)
+                        return Err(no_such_feature(consumer_named(consumer), dep, feature,
+                                                   declared_features(target.manifest)))
+
+                    named.push(feature)
+
+        if !asked_at_all then continue
+
+        if wants_default then named.push("default")
+
+        out.push((target.canonical, feature_closure(target.manifest.features, named,
+                                                     target.manifest.dependencies)))
+
+    Ok(out)
+end enabled_from
+
+// How a consumer is named in a refusal: a dependency by its canonical prefix, the root by itself.
+private consumer_named(p: &ResolvedPackage) -> string =
+    if is_root_package(p) then "this project" else p.canonical
+
+private no_such_feature(who: string, dep: &Dependency, feature: string, declared: Buf[string]) -> string
+    val tail = if declared.is_empty() then ", and it declares none"
+    else s". It declares ${quoted_names(declared)}"
+
+    s"$who asks '${dep.label}' for the feature '$feature', which '${dependency_canonical(dep)}' does " +
+        s"not declare — a consumer may only ask for a feature that package's own manifest names$tail"
+end no_such_feature
+
+// Whether two rounds enabled the same thing. A package absent from one side has enabled nothing,
+// and order within a set does not matter.
+same_enabled(a: &Buf[(string, Buf[string])], b: &Buf[(string, Buf[string])]) -> bool =
+    enabled_within(a, b) && enabled_within(b, a)
+
+private enabled_within(a: &Buf[(string, Buf[string])], b: &Buf[(string, Buf[string])]) -> bool
+    for i in 0..<a.len()
+        val theirs = enabled_of(b, a.at(i).0)
+        val mine = a.at(i).1
+
+        if theirs.len() != mine.len() then return false
+
+        for j in 0..<mine.len()
+            if !holds_string(theirs, mine.at(j)) then return false
+
+    true
+end enabled_within
+
+// The `#if` symbols a package's enabled features define.
+feature_symbols(enabled: &Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<enabled.len()
+        out.push(feature_symbol(enabled.at(i)))
+
+    out
+end feature_symbols
+
+// -- dev_dependencies ------------------------------------------------------------------------------
+
+// Refuses a `dev_dependencies` package imported from source a consumer would compile
+// (`reference/packages.md § Dependencies a test alone needs`).
+//
+// **The question is asked of what survives the test strip**: a `@tests` file is gone for every
+// consumer, so its imports are not looked at, and an import inside a `@test` function is a block
+// import this does not read either. `dev` holds the module paths **as a file writes them** -- the
+// mount or the module, never the coordinate, which is no module path at all. A path matches a dev
+// module that it is, or that it names something below; a package whose name merely starts the same
+// way is a different package.
+check_dev_imports(units: &Buf[Program], dev: &Buf[string]) -> Result[unit, Buf[Diagnostic]]
+    if dev.is_empty() then return Ok(())
+
+    var found: Buf[Diagnostic] = buf()
+
+    for u in 0..<units.len()
+        val unit = units.at(u)
+
+        if unit.test_only then continue
+
+        for s in 0..<unit.body.len()
+            val st = unit.body.at(s)
+
+            *st.kind match
+                ImportDecl(d) ->
+                    val shown = joined(d.path, ".")
+
+                    for k in 0..<dev.len()
+                        val named = dev.at(k)
+
+                        if shown == named || shown.starts_with(named + ".")
+                            found.push(error(st.span, dev_import_refusal(shown, named)))
+                            break
+                _ -> ()
+
+    if found.is_empty() then Ok(()) else Err(found)
+end check_dev_imports
+
+dev_import_refusal(shown: string, named: string) -> string =
+    s"'$shown' comes from '$named', which this project declares in 'dev_dependencies' — that is " +
+    "not fetched for anything depending on this project, so only a '@tests' file or a '@test' " +
+    "function may import it. Move the import into the tests, or declare the package in " +
+    "'dependencies' if the library itself needs it"
