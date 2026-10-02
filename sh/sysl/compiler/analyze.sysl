@@ -584,11 +584,30 @@ private resolve_signatures(a: &Analysis)
         val key = a.tables.externs.key_at(i)
         val d = a.tables.externs.get(key).unwrap()
         val scope = scope_of_key(a, key)
+        var vector_said = false
 
         for j in 0..<d.params.len()
-            resolve_type(a, scope, d.params.at(j).typ, no_bindings())
+            val p = d.params.at(j)
+            val t = resolve_type(a, scope, p.typ, no_bindings())
 
-        if d.ret_type.is_some() then resolve_result(a, scope, d.ret_type.unwrap(), no_bindings())
+            if !vector_said && is_vector(t)
+                extern_vector_fault(a, key, s"'${p.name}' of the 'extern' '${d.name}' is ${type_show(t)}, " +
+                                    "and how a vector reaches a C function differs by target and by " +
+                                    "what the other side was compiled for — so sysl will not guess at " +
+                                    s"one. Pass the lanes through memory, as a '*${lane_shown(t)}'")
+                vector_said = true
+            end if
+
+        if d.ret_type.is_some()
+            val t = resolve_result(a, scope, d.ret_type.unwrap(), no_bindings())
+
+            if !vector_said && is_vector(t) then
+                extern_vector_fault(a, key, s"the 'extern' '${d.name}' returns ${type_show(t)}, and how " +
+                                    "a vector comes back from a C function differs by target and by " +
+                                    "what the other side was compiled for — so sysl will not guess at " +
+                                    s"one. Have it write the lanes through a '*${lane_shown(t)}' the " +
+                                    "caller supplies")
+        end if
 
     // **Module storage is deliberately absent from this, and its written type is resolved where the
     // storage itself is read.** Resolving it here would make every type a module's storage names
@@ -626,6 +645,18 @@ private resolve_signatures(a: &Analysis)
 end resolve_signatures
 
 // The terms a declaration's own file set up, which is where its signature is read.
+// How a vector crosses to C differs by target and by what the other side was compiled for, so an
+// `extern` taking or answering one is refused at its declaration rather than declared at a guess.
+private extern_vector_fault(a: &Analysis, key: string, message: string)
+    val home = a.tables.extern_scopes.get(key).unwrap()
+
+    a.fault(home.scope, home.span, message)
+
+// The type a vector's lanes are, as a diagnostic shows it.
+private lane_shown(t: Type) -> string = t match
+    Vector(_, elem) -> type_show(*elem)
+    _ -> type_show(t)
+
 private scope_of_key(a: &Analysis, key: string) -> Scope
     val decl = a.tables.types.get(key)
 

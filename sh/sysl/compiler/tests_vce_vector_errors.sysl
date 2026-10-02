@@ -1,0 +1,411 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// What a vector refuses, and what the reader is told instead (`reference/vectors.md`) -- the
+// reference's `VectorErrorTests`. A vector looks enough like an array that the differences -- a
+// fixed lane count, no `if` over lanes, a constant index -- read as omissions until the message says
+// why they are not.
+//
+// **Every message here was read out of the reference compiler (0.0.155)** by handing it the same
+// source, and each is taken the whole way the reference's `err` takes it: through the lowering, so a
+// refusal at the C boundary is one of these too.
+
+// The first thing the compilation said contains `want`; otherwise the test fails showing all of it.
+private vce_says(text: string, want: string)
+    val said = enm_err(text)
+
+    assert(said.contains(want), s"expected it to say: $want\nit said: $said")
+
+// -- the type as written ---------------------------------------------------------------------------
+
+@test("a lane count is part of the type, so the empty spelling is refused")
+vce_the_empty_lane_count()
+    if !enm_ready() then return
+
+    vce_says("val v: <>f32 = [1.0]\n",
+             "a vector's lane count is part of its type, so '<>f32' has no meaning — a slice drops " +
+                 "its length because it carries one at run time, and a register's width is settled " +
+                 "when the code is generated; write '<4>f32' for four lanes")
+
+@test("no lanes at all")
+vce_no_lanes_at_all()
+    if !enm_ready() then return
+
+    vce_says("val v: <0>f32 = []\n",
+             "a vector of no lanes holds nothing and computes nothing — an array may be empty " +
+                 "because it is storage, and a register cannot be")
+
+@test("a lane is a scalar")
+vce_a_lane_is_a_scalar()
+    if !enm_ready() then return
+
+    vce_says("struct P\n    x: int\n\nf() -> unit\n    var v: <4>P\n",
+             "a vector's lanes are scalars, and P is not one — an integer, a float, 'bool' or " +
+                 "'char' may be a lane, and an aggregate has no lane-wise arithmetic to give")
+
+@test("a lane may not be a view")
+vce_a_lane_may_not_be_a_view()
+    if !enm_ready() then return
+
+    vce_says("f() -> unit\n    var v: <4>[]int\n",
+             "a vector's lanes are scalars, and []int is not one — an integer, a float, 'bool' or " +
+                 "'char' may be a lane")
+
+// The qualifier goes on the outside: the reader has written something with a meaning, and it is
+// not the one they wanted.
+@test("a volatile lane is refused, and the spelling that works is named")
+vce_a_volatile_lane()
+    if !enm_ready() then return
+
+    vce_says("f() -> unit\n    var v: <4>volatile u32\n",
+             "a vector's lanes are scalars, and volatile uint is not one — an integer, a float, " +
+                 "'bool' or 'char' may be a lane")
+
+@test("a lane count must be constant")
+vce_a_lane_count_must_be_constant()
+    if !enm_ready() then return
+
+    vce_says("f(n: usize) -> unit\n    var v: <n>f32\n",
+             "a vector's lane count must be a constant — a literal, or a 'const' naming one")
+
+// -- construction ----------------------------------------------------------------------------------
+
+@test("a literal that does not fill the lanes")
+vce_a_literal_short_of_the_lanes()
+    if !enm_ready() then return
+
+    vce_says("val v: <4>f32 = [1.0, 2.0]\n",
+             "<4>f32 has 4 lanes and this literal has 2 — a vector's width is part of its type, so " +
+                 "the two have to agree")
+
+@test("a literal with too many")
+vce_a_literal_with_too_many()
+    if !enm_ready() then return
+
+    vce_says("val v: <2>f32 = [1.0, 2.0, 3.0]\n",
+             "<2>f32 has 2 lanes and this literal has 3 — a vector's width is part of its type, so " +
+                 "the two have to agree")
+
+// -- arithmetic ------------------------------------------------------------------------------------
+
+@test("two widths do not compute together")
+vce_two_widths_do_not_compute()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\n" +
+                 "val b: <8>f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]\n" +
+                 "f() -> unit\n    val c = a + b\n",
+             "'+' needs matching types, got <4>f32 and <8>f32")
+
+@test("two lane types do not compute together")
+vce_two_lane_types_do_not_compute()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nval b: <4>i32 = [1, 2, 3, 4]\n" +
+                 "f() -> unit\n    val c = a + b\n",
+             "'+' needs matching types, got <4>f32 and <4>int")
+
+// The reason is in the message because it is not guessable: it is about what a trap can and cannot
+// be per lane.
+@test("integer division is refused, with the reason")
+vce_integer_division()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>i32 = [10, 20, 30, 40]\nf() -> unit\n    val b = a / a\n",
+             "'/' is not defined on <4>int — integer division traps per lane and a register traps " +
+                 "as a whole, so divide the lanes in a loop over an array")
+
+@test("integer remainder likewise")
+vce_integer_remainder()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>i32 = [10, 20, 30, 40]\nf() -> unit\n    val b = a % a\n",
+             "'%' is not defined on <4>int — integer division traps per lane and a register traps " +
+                 "as a whole, so divide the lanes in a loop over an array")
+
+@test("a mask has the bitwise operators and not the arithmetic ones")
+vce_a_mask_has_no_arithmetic()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>i32 = [1, 2, 3, 4]\nf() -> unit\n    val m = (a < 3) + (a < 2)\n",
+             "operator '+' is not defined for <4>bool")
+
+// -- comparison ------------------------------------------------------------------------------------
+
+// A chain reads as though it short-circuits, and nothing lane-wise does.
+@test("a chain has no lane-wise form")
+vce_a_chain_has_no_lane_wise_form()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>i32 = [1, 2, 3, 4]\nf() -> unit\n    val m = 1 < a < 4\n",
+             "a comparison chain joins its links with '&&', which short-circuits and so has no " +
+                 "lane-wise form — compare two vectors at a time and combine the masks with '&'")
+
+@test("two widths do not compare")
+vce_two_widths_do_not_compare()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nval b: <2>f32 = [1.0, 2.0]\n" +
+                 "f() -> unit\n    val m = a < b\n",
+             "cannot compare <4>f32 with <2>f32")
+
+// -- lanes -----------------------------------------------------------------------------------------
+
+@test("a computed index is refused, and the array that answers is named")
+vce_a_computed_index()
+    if !enm_ready() then return
+
+    vce_says("f(i: usize) -> f32\n    val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\n    return v[i]\n",
+             "a lane index is part of the instruction that reads it, so it has to be a constant — " +
+                 "a literal, or a 'const' naming one. To index <4>f32 by a computed number, keep " +
+                 "the values in a '[4]f32'")
+
+@test("an index past the last lane")
+vce_an_index_past_the_last_lane()
+    if !enm_ready() then return
+
+    vce_says("val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(v[4])\n",
+             "<4>f32 has lanes 0 to 3, and this is 4")
+
+@test("an index that is not an integer at all")
+vce_an_index_that_is_not_an_integer()
+    if !enm_ready() then return
+
+    vce_says("val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(v[\"x\"])\n",
+             "an index must be an integer, not string")
+
+// -- the C boundary --------------------------------------------------------------------------------
+
+// A vector's register and alignment differ by target and by which extensions the other side was
+// compiled for, so emitting the `declare` anyway would make a corrupt call rather than a link error.
+
+@test("a vector parameter on an extern")
+vce_a_vector_parameter_on_an_extern()
+    if !enm_ready() then return
+
+    vce_says("extern \"libc_thing\" g(v: <4>f32) -> unit\n",
+             "'v' of the 'extern' 'g' is <4>f32, and how a vector reaches a C function differs by " +
+                 "target and by what the other side was compiled for — so sysl will not guess at " +
+                 "one. Pass the lanes through memory, as a '*f32'")
+
+@test("a vector result from an extern")
+vce_a_vector_result_from_an_extern()
+    if !enm_ready() then return
+
+    vce_says("extern \"libc_thing\" g() -> <4>f32\n",
+             "the 'extern' 'g' returns <4>f32, and how a vector comes back from a C function " +
+                 "differs by target and by what the other side was compiled for — so sysl will not " +
+                 "guess at one. Have it write the lanes through a '*f32' the caller supplies")
+
+@test("an exported function may not take one either")
+vce_an_exported_function_takes_no_vector()
+    if !enm_ready() then return
+
+    vce_says("@export\nf(v: <4>f32) -> f32 = v[0]\n",
+             "is <4>f32, which C has no way to spell — an exported function takes an integer, a " +
+                 "float, a 'bool', a 'char', a pointer, a function pointer, a simple enum, or a " +
+                 "struct built out of those.")
+
+// -- the methods -----------------------------------------------------------------------------------
+
+@test("select is a mask's, and a vector of numbers is told so")
+vce_select_is_a_masks()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nf() -> unit\n    val b = a.select(a, a)\n",
+             "'select' chooses between two vectors lane by lane, so it is read off a mask — the " +
+                 "'<4>bool' a comparison yields, as in '(a < b).select(a, b)'. <4>f32 is not one")
+
+@test("select takes two vectors")
+vce_select_takes_two_vectors()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nf() -> unit\n    val b = (a < 2.0).select(a)\n",
+             "'select' takes the two vectors to choose between — 'm.select(whenTrue, whenFalse)', " +
+                 "and 1 argument was given")
+
+@test("select's two sides are one type")
+vce_selects_two_sides_are_one_type()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nval b: <4>i32 = [1, 2, 3, 4]\n" +
+                 "f() -> unit\n    val c = (a < 2.0).select(a, b)\n",
+             "'select' chooses between two vectors of one type, and this pair is <4>f32 and <4>int")
+
+// A mask of four cannot choose between registers of eight -- the one place the widths of two
+// independent types have to agree.
+@test("a mask chooses at its own width")
+vce_a_mask_chooses_at_its_own_width()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\n" +
+                 "val b: <8>f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]\n" +
+                 "f() -> unit\n    val c = (a < 2.0).select(b, b)\n",
+             "a <4>bool chooses between 4 lanes, and <8>f32 has 8")
+
+@test("any is a mask's, and a vector of numbers is told so")
+vce_any_is_a_masks()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(a.any())\n",
+             "'any' asks whether any lane is true, so it is read off a mask — the '<4>bool' a " +
+                 "comparison yields. <4>f32 is not one")
+
+@test("sum is not a mask's, and a mask is told what it reduces with")
+vce_sum_is_not_a_masks()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint((a < 2.0).sum())\n",
+             "'sum' adds or orders its lanes, and a mask's are 'bool' — 'any()' and 'all()' are " +
+                 "what a <4>bool reduces with")
+
+@test("a reduction takes no arguments")
+vce_a_reduction_takes_no_arguments()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(a.sum(1.0))\n",
+             "'sum' takes no arguments — it reduces the <4>f32 it is read off")
+
+// A name that is not one of the six falls through to the ordinary member complaint rather than
+// being answered with a list of what a vector does have.
+@test("an unknown method is the ordinary complaint")
+vce_an_unknown_method()
+    if !enm_ready() then return
+
+    vce_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(a.reverse())\n",
+             "type '<4>f32' has no method 'reverse'")
+
+// -- load and store --------------------------------------------------------------------------------
+
+// A load has nothing to read its width off, so the message names where the width belongs rather
+// than guessing one -- guessing would make a kernel silently take the wrong run.
+private vce_no_width() -> string =
+    "'load' answers a vector, and how many lanes it takes is the vector type's to say — nothing " +
+        "here says which. Write it where the value is bound: 'val v: <4>f32 = xs.load(i)'"
+
+@test("a load with nothing to take its width from names where the width belongs")
+vce_a_load_with_nothing_to_take_its_width_from()
+    if !enm_ready() then return
+
+    vce_says("var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]\nprint(xs.load(0)[0])\n", vce_no_width())
+
+// Two loads beside each other are two questions and no answers.
+@test("two loads beside each other still say nothing about the width")
+vce_two_loads_beside_each_other()
+    if !enm_ready() then return
+
+    vce_says("f(xs: []const f32, ys: []const f32) -> f32\n    val r = xs.load(0) * ys.load(0)\n" +
+                 "    r[0]\n\nvar a: [4]f32\nvar b: [4]f32\nprint(f(a[..], b[..]))\n",
+             vce_no_width())
+
+// Nor does a literal, which is the tier below -- it is waiting to be told the same thing.
+@test("nor does a bare literal beside one, with nothing asked of the expression")
+vce_nor_a_bare_literal_beside_one()
+    if !enm_ready() then return
+
+    vce_says("f(xs: []const f32) -> f32\n    val r = xs.load(0) * 2.0\n    r[0]\n\n" +
+                 "var a: [4]f32\nprint(f(a[..]))\n",
+             vce_no_width())
+
+// A run of any width would type-check, so there is genuinely no answer to infer.
+@test("a store's own value does not settle a load's width")
+vce_a_stores_value_does_not_settle_a_load()
+    if !enm_ready() then return
+
+    vce_says("f(xs: []const f32, out: []f32)\n    out.store(0, xs.load(0))\n\n" +
+                 "var a: [4]f32\nvar b: [4]f32\nf(a[..], b[..])\n",
+             vce_no_width())
+
+@test("a load wanted at a scalar type says so")
+vce_a_load_wanted_at_a_scalar()
+    if !enm_ready() then return
+
+    vce_says("var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]\nval v: f32 = xs.load(0)\nprint(v)\n",
+             "'load' answers a vector, and f32 is what is wanted here")
+
+@test("the lane type is the element's")
+vce_the_lane_type_is_the_elements()
+    if !enm_ready() then return
+
+    vce_says("var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]\nval v: <4>int = xs.load(0)\nprint(v[0])\n",
+             "a run of [4]f32 is a run of f32, and <4>int holds int")
+
+@test("a store takes a vector rather than a scalar")
+vce_a_store_takes_a_vector()
+    if !enm_ready() then return
+
+    vce_says("var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]\nxs.store(0, 1.0)\n",
+             "'store' writes a vector's lanes, and real is not one — 'val v: <4>f32 = …' is what a " +
+                 "run of [4]f32 is stored from")
+
+@test("the arity is named with the form that has it right")
+vce_the_arity_is_named_with_the_form()
+    if !enm_ready() then return
+
+    vce_says("var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]\nval v: <4>f32 = xs.load()\nprint(v[0])\n",
+             "'load' takes 1 argument — 'xs.load(i)', and 0 arguments were given")
+
+// The store's writability is the subscript's, asked of a run: whatever refuses `xs[i] = v` refuses
+// this, in the same words.
+@test("a read-only view has nothing to store through")
+vce_a_read_only_view_has_nothing_to_store_through()
+    if !enm_ready() then return
+
+    vce_says("f(xs: []const f32)\n    val v: <4>f32 = [0.0, 0.0, 0.0, 0.0]\n    xs.store(0, v)\n\n" +
+                 "var a: [4]f32\nf(a[..])\n",
+             "this run belongs to a '[]const f32', which views elements it may not write, so there " +
+                 "is nothing to store through. Lanes you may write are elements of your own: copy " +
+                 "them into a '[]f32' first")
+
+@test("a 'val' array has nothing to store through")
+vce_a_val_array_has_nothing_to_store_through()
+    if !enm_ready() then return
+
+    vce_says("val xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]\nval v: <4>f32 = [0.0, 0.0, 0.0, 0.0]\n" +
+                 "xs.store(0, v)\n",
+             "a 'val' is written once, so 'store' has nothing to write through")
+
+// Dropping the qualifier is what the naive reading does, and what it produces is a program that
+// reads a device once where it said it would read it four times.
+@test("a run of volatile elements is refused rather than quietly widened")
+vce_a_run_of_volatile_elements()
+    if !enm_ready() then return
+
+    vce_says("f(xs: []volatile f32)\n    val v: <4>f32 = xs.load(0)\n    print(v[0])\n\n" +
+                 "var a: [4]f32\nf(a[..])\n",
+             "a run of 'volatile f32' is one access per element and a vector reaches memory once, " +
+                 "so the qualifier cannot be kept — read the elements one at a time, or hold them " +
+                 "in a '[]f32' where a whole register is what the program means to move")
+
+@test("a '*T' has no length for a run to be checked against")
+vce_a_pointer_has_no_length()
+    if !enm_ready() then return
+
+    vce_says("var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]\nval p = &xs[0]\nval v: <4>f32 = p.load(0)\n" +
+                 "print(v[0])\n",
+             "a '*f32' carries no length, so a run of its elements has nothing to be checked " +
+                 "against — take a slice of them first, with 'p[0..<n]'")
+
+@test("a string is a view of UTF-8 and says where the bytes are")
+vce_a_string_is_a_view_of_utf8()
+    if !enm_ready() then return
+
+    vce_says("val s = \"hello world\"\nval v: <4>u8 = s.load(0)\nprint(v[0])\n",
+             "a string is a view of UTF-8 rather than of lanes — 's.bytes.load(i)' says that a run " +
+                 "of bytes is what is wanted, and is what a '<N>u8' is a run of")
+
+@test("a string has nothing to store into")
+vce_a_string_has_nothing_to_store_into()
+    if !enm_ready() then return
+
+    vce_says("val s = \"hello world\"\nval v: <4>u8 = [0u8, 0u8, 0u8, 0u8]\ns.store(0, v)\n",
+             "a string is immutable, so there is nothing to write lanes into")
+
+@test("the index is an integer")
+vce_the_index_is_an_integer()
+    if !enm_ready() then return
+
+    vce_says("var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]\nval v: <4>f32 = xs.load(\"two\")\nprint(v[0])\n",
+             "the index a run starts at must be an integer, not string")

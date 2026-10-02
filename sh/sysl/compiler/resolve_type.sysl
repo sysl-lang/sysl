@@ -230,8 +230,67 @@ private resolve_vector(a: &Analysis, scope: Scope, span: Span, lanes: Expr, elem
                        subst: Buf[Binding]) -> Type
     if length_is_type_param(a, scope, span, lanes, subst) then return Unknown
 
-    Vector(int(const_extent(a, scope, span, lanes, subst)), resolve_qualified(a, scope, elem, subst))
+    // The count is settled when the code is generated, so it has to fold, and to something: an
+    // array may be empty because it is storage, and a register cannot be.
+    val refusals = a.const_refusals
+
+    if !folds_to_extent(a, scope, span, lanes, subst)
+        if const_refused_since(a, refusals)
+            val inner = analyzer_for(a, scope)
+
+            inner.subst = subst
+            const_int(inner, lanes)
+            return Unknown
+        end if
+
+        // A count over a value parameter stands at zero for the walk of the generic body itself,
+        // as an array's length does; each instantiation reads it again with the value bound.
+        if awaits_instantiation(a, scope, lanes, subst) then
+            return Vector(0, resolve_qualified(a, scope, elem, subst))
+
+        a.fault(scope, span, "a vector's lane count must be a constant — a literal, or a 'const' naming one")
+        return Unknown
+    end if
+
+    val n = const_extent(a, scope, span, lanes, subst)
+
+    // A count naming a value parameter folds to zero on the generic body's own walk, the parameter
+    // standing in as a zero there, and is not that mistake. That stand-in cannot be told from an
+    // instantiation made at zero, so such a count is not asked at all.
+    if n == 0 && !names_value_param(lanes, subst)
+        a.fault(scope, span, "a vector of no lanes holds nothing and computes nothing — an array may " +
+                "be empty because it is storage, and a register cannot be")
+        return Unknown
+    end if
+
+    val lane = resolve_qualified(a, scope, elem, subst)
+
+    if !is_lane(lane)
+        a.fault(scope, span, s"a vector's lanes are scalars, and ${type_show(lane)} is not one — an " +
+                "integer, a float, 'bool' or 'char' may be a lane, and an aggregate has no lane-wise " +
+                "arithmetic to give")
+        return Unknown
+    end if
+
+    Vector(int(n), lane)
 end resolve_vector
+
+// Whether a written count reads a name bound to a value parameter's argument.
+private names_value_param(e: Expr, subst: Buf[Binding]) -> bool = *e.kind match
+    Ident(n) -> bound_type(subst, n) match
+        Some(ConstArg(_, _)) -> true
+        _ -> false
+    Unary(_, operand) -> names_value_param(operand, subst)
+    Binary(_, l, r) -> names_value_param(l, subst) || names_value_param(r, subst)
+    _ -> false
+
+// Whether a written lane type may be one: `can_be_lane`, or a type not settled yet. A qualifier is
+// refused here rather than peeled -- `<4>volatile u32` is the qualifier on the wrong side.
+private is_lane(t: Type) -> bool = t match
+    Abstract(_, _) -> true
+    Unknown -> true
+    Volatile(_) -> false
+    _ -> can_be_lane(t)
 
 private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Expr], elem: TypeRef,
                       read_only: bool, subst: Buf[Binding]) -> Type
