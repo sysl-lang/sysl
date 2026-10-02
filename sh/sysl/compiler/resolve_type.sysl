@@ -1416,14 +1416,25 @@ end filled_targs
 // is registered if it cannot.
 //
 // A bound is resolved in the declaration's terms and the refusal belongs to the file that wrote the
-// application. **Only a settled argument list is asked**: a parameter standing in for itself is
-// answered by its own bounds, where the body it stands in is read at a type.
+// application. **Only a settled argument list is asked**, and a type parameter standing in for itself
+// is settled: it promises exactly what its own bounds say, so `keep[T](x: T) -> Scored[T]` over a
+// `Scored[T: Rank]` is refused where it is written -- the caller has to ask at least what the type
+// asks. A type merely built over one (`Scored[Box[T]]`) is left to the body that is read at a type.
+//
+// **A type made real at no written place is not asked** -- `reinstantiate` substituting through a
+// type already resolved, whose application was held to these bounds where it was written. Asked again
+// there, the refusal lands at the top of the file and says one mistake twice.
 private applied_bounds(a: &Analysis, scope: Scope, span: Span, key: string, home: Scope,
                        tparams: Buf[string], bounds: Buf[NamedBounds], targs: Buf[Type])
     if bounds.is_empty() || tparams.len() != targs.len() then return
+    if span.start == 0 && span.end == 0 then return
 
     for i in 0..<targs.len()
-        if targs.at(i) == Unknown || mentions_abstract(targs.at(i)) then return
+        if targs.at(i) == Unknown then return
+
+        targs.at(i) match
+            Abstract(_, _) -> ()
+            other -> if mentions_abstract(other) then return
 
     if a.tables.members.hoisted then
         check_param_bounds(a, home, span, key, tparams, bounds, targs, buf(), "type parameter", scope)
