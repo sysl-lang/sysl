@@ -1,0 +1,658 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Nested functions (`reference/declarations.md`) -- a closure with a name, and the two halves of its
+// rule: every name in a block is in scope throughout it, and what may be captured is settled where
+// the group is written. A nested function's environment holds the ADDRESS of each capture, so a write
+// reaches the variable itself, where a closure's copy would not.
+//
+// **Every output, exit status, message and location here was read out of the reference compiler**
+// (0.0.156) on the same program. A trap is the status 133 the shell reports for one.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private nfn_root(main: string) -> string
+    val root = make_temp_dir("sysl-nfn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end nfn_root
+
+// What the program does: what it printed and the status it left with, as a shell reports one. A
+// failure to build is its message and `-1`, which no program exits with.
+private nfn_outcome(main: string) -> (string, int)
+    val root = nfn_root(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end nfn_outcome
+
+// The program prints exactly this and leaves with this status -- both, so that a build that failed
+// cannot pass for a program that stopped. Returns at once without the library.
+private nfn_leaves(main: string, want: string, code: int)
+    if xvr_no_library() then return
+
+    val out = nfn_outcome(main)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, code)
+
+private nfn_prints(main: string, want: string) = nfn_leaves(main, want, 0)
+
+// Everything the analysis said about the program, or its LLVM text where it said nothing.
+private nfn_said(main: string) -> string
+    val root = nfn_root(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end nfn_said
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private nfn_refused(main: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val out = nfn_said(main)
+
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end nfn_refused
+
+private nfn_reach() -> string = ("reaches its own nested functions and its own captures and no " +
+    "further — a top-level function is what several bodies share")
+
+// -- a function may stand inside a function body --------------------------------------------------
+
+@test("a nested function is called by the name it was given")
+nfn_called_by_its_name() = nfn_prints(raw"""
+    outer(n: int) -> int
+        inner(k: int) -> int
+            k * 2
+
+        inner(n) + 1
+
+    print(outer(5))
+    """, "11\n")
+
+@test("the '= expr' short form works for a nested function too")
+nfn_the_short_form() = nfn_prints(raw"""
+    outer(n: int) -> int
+        inner(k: int) -> int = k * 2
+
+        inner(n)
+
+    print(outer(5))
+    """, "10\n")
+
+@test("a nested function yielding nothing is written with no result")
+nfn_one_yielding_nothing() = nfn_prints(raw"""
+    shout(n: int)
+        say(k: int)
+            print("k", k)
+
+        for i in 0..<n do say(i)
+
+    shout(2)
+    """, "k 0\nk 1\n")
+
+@test("a nested function takes no arguments as readily as several")
+nfn_no_arguments_or_several() = nfn_prints(raw"""
+    outer() -> int
+        zero() -> int = 0
+        three(a: int, b: int, c: int) -> int = a + b + c
+
+        zero() + three(1, 2, 3)
+
+    print(outer())
+    """, "6\n")
+
+// -- what the name buys ---------------------------------------------------------------------------
+
+@test("a nested function's name is in scope in its own body, so it recurses")
+nfn_recursion() = nfn_prints(raw"""
+    fact(n: int) -> int
+        go(k: int) -> int
+            if k <= 1 then 1 else k * go(k - 1)
+
+        go(n)
+
+    print(fact(5))
+    """, "120\n")
+
+@test("two nested functions recurse mutually, whichever order they are written in")
+nfn_mutual_recursion() = nfn_prints(raw"""
+    parity(n: int) -> string
+        is_even(k: int) -> bool
+            if k == 0 then true else is_odd(k - 1)
+
+        is_odd(k: int) -> bool
+            if k == 0 then false else is_even(k - 1)
+
+        if is_even(n) then "even" else "odd"
+
+    print(parity(7), parity(8))
+    """, "odd even\n")
+
+@test("a nested function's types are written, so nothing has to infer what it takes")
+nfn_written_types() = nfn_prints(raw"""
+    outer() -> int
+        widen(k: u8) -> i64 = i64(k) * 2i64
+
+        int(widen(21u8))
+
+    print(outer())
+    """, "42\n")
+
+// -- capture reaches the enclosing variable, not a copy of it -------------------------------------
+
+@test("a nested function reads the block's locals and its function's parameters")
+nfn_reads_locals_and_parameters() = nfn_prints(raw"""
+    outer(n: int) -> int
+        var extra = 10
+
+        inner(k: int) -> int = k + n + extra
+
+        inner(1)
+
+    print(outer(2))
+    """, "13\n")
+
+// A by-value capture would accumulate into a copy and print 0.
+@test("a nested function's write reaches the variable itself")
+nfn_a_write_reaches_the_variable() = nfn_prints(raw"""
+    sum_to(n: int) -> int
+        var total = 0
+
+        add(k: int)
+            total = total + k
+
+        for i in 1..n do add(i)
+
+        total
+
+    print(sum_to(4))
+    """, "10\n")
+
+@test("two nested functions write to one variable and both are seen")
+nfn_two_writers() = nfn_prints(raw"""
+    counted() -> int
+        var n = 0
+
+        up()
+            n = n + 10
+
+        down()
+            n = n - 1
+
+        up()
+        up()
+        down()
+        n
+
+    print(counted())
+    """, "19\n")
+
+@test("a 'val' captured into a nested function is still written once")
+nfn_a_val_is_still_written_once() = nfn_refused(raw"""
+    outer() -> int
+        val fixed = 5
+
+        change()
+            fixed = 6
+
+        change()
+        fixed
+    """, "a 'val' is written once, so assignment has nothing to write through", "5:9")
+
+@test("a counted reference is reached by a nested function, not retained a second time")
+nfn_a_counted_reference() = nfn_prints(raw"""
+    struct Node
+        v: int
+
+    outer() -> int
+        var node: &Node = Node(9)
+
+        read() -> int = node.v
+
+        read() + read()
+
+    print(outer())
+    """, "18\n")
+
+@test("the chapter's own example: a quicksort of three nested functions")
+nfn_the_quicksort() = nfn_prints(raw"""
+    sort(xs: []int)
+        swap(i: usize, j: usize)
+            var t = xs[i]
+            xs[i] = xs[j]
+            xs[j] = t
+
+        part(lo: usize, hi: usize) -> usize
+            var pivot = xs[lo]
+            var i = lo
+            var j = hi
+
+            loop
+                while xs[i] < pivot do i = i + 1
+                while xs[j] > pivot do j = j - 1
+                if i >= j then break j
+                swap(i, j)
+                i = i + 1
+                j = j - 1
+
+        quick(lo: usize, hi: usize)
+            if lo < hi
+                var p = part(lo, hi)
+                quick(lo, p)
+                quick(p + 1usize, hi)
+
+        if xs.len > 0 then quick(0usize, xs.len - 1)
+
+    var a = [5, 3, 9, 1, 7, 2, 8]
+
+    sort(a[..])
+
+    for v in a do print(v)
+    """, "1\n2\n3\n5\n7\n8\n9\n")
+
+// -- where one may stand, and where it may not ----------------------------------------------------
+
+@test("a block inside the body is its own block, with its own group of nested functions")
+nfn_a_block_has_its_own_group() = nfn_prints(raw"""
+    loops(n: int) -> int
+        var total = 0
+
+        for i in 0..<n
+            step(k: int)
+                total = total + k
+
+            step(i)
+
+        total
+
+    print(loops(5))
+    """, "10\n")
+
+@test("one nested function may contain another, and the inner reads the outer's parameters")
+nfn_one_inside_another() = nfn_prints(raw"""
+    deep(n: int) -> int
+        mid(a: int) -> int
+            innermost(b: int) -> int = b + n
+
+            innermost(a) * 2
+
+        mid(n)
+
+    print(deep(3))
+    """, "12\n")
+
+@test("a nested function shadows a top-level function of the same name")
+nfn_shadows_a_top_level_function() = nfn_prints(raw"""
+    twice(x: int) -> int = x * 2
+
+    shadowed() -> int
+        twice(x: int) -> int = x * 3
+
+        twice(5)
+
+    print(shadowed(), twice(5))
+    """, "15 10\n")
+
+@test("a call above the whole group is told where the group begins")
+nfn_a_call_above_the_group() = nfn_refused(raw"""
+    outer() -> int
+        var n = go(1)
+
+        go(k: int) -> int = k + 1
+
+        n
+    """, "'go' is declared below this call — the nested functions of a block share an environment " +
+         "formed where the first of them is written, so they may be called from there on", "2:13")
+
+@test("a visibility modifier on a nested function has nothing to restrict")
+nfn_no_visibility_modifier() = nfn_refused(raw"""
+    outer() -> int
+        private inner() -> int = 1
+
+        inner()
+    """, "'inner' is declared inside a function body, so nothing outside can name it and there is " +
+         "nothing for a visibility modifier to restrict", "2:5")
+
+@test("a nested function cannot be generic, since nothing outside would supply the arguments")
+nfn_not_generic() = nfn_refused(raw"""
+    outer() -> int
+        id[T](x: T) -> T = x
+
+        id(1)
+    """, "'id' is declared inside a function body and cannot be generic — the type arguments would " +
+         "have nowhere to come from, since nothing outside the body calls it", "2:5")
+
+@test("two nested functions of one name in one block collide")
+nfn_two_of_one_name_collide() = nfn_refused(raw"""
+    outer() -> int
+        go() -> int = 1
+        go() -> int = 2
+
+        go()
+    """, "'go' is already declared in this block", "2:5")
+
+@test("a struct or an enum inside a function body is still refused: top-level only")
+nfn_a_struct_is_top_level_only() = nfn_refused(raw"""
+    outer() -> int
+        struct P
+            x: int
+
+        1
+    """, "structs, enums, traits, impls, externs, and types may only be declared at the top level",
+    "2:5")
+
+// -- it is called where it is written, and is not a value -----------------------------------------
+
+@test("passing a nested function names what to write instead")
+nfn_passing_one() = nfn_refused(raw"""
+    apply(f: int -> int, x: int) -> int = f(x)
+
+    outer() -> int
+        inner(k: int) -> int = k * 2
+
+        apply(inner, 5)
+    """, "'inner' is a nested function, so it is called where it is written rather than passed — " +
+         "its environment is the frame it was declared in, and a callable value is a way of " +
+         "carrying it out. Something that has to be passed is a closure of its own: " +
+         "'var inner = x -> …'", "6:11")
+
+@test("a closure written beside a nested function does not reach it")
+nfn_a_closure_beside_one() = nfn_refused(raw"""
+    apply(f: int -> int, x: int) -> int = f(x)
+
+    outer() -> int
+        inner(k: int) -> int = k * 2
+
+        apply(x -> inner(x), 5)
+    """, "'inner' is a nested function of the body around this one, which " + nfn_reach(), "6:16")
+
+@test("a nested function does not reach the group of the body around it")
+nfn_not_the_group_around() = nfn_refused(raw"""
+    outer() -> int
+        helper(k: int) -> int = k + 1
+
+        mid() -> int
+            inner() -> int = helper(1)
+
+            inner()
+
+        mid()
+    """, "'helper' is a nested function of the body around this one, which " + nfn_reach(), "5:26")
+
+@test("the arity check names the nested function a program wrote")
+nfn_the_arity_check() = nfn_refused(raw"""
+    outer() -> int
+        go(a: int, b: int) -> int = a + b
+
+        go(1)
+    """, "'go' takes 2 arguments, but 1 argument was given", "4:5")
+
+// -- the edge cases -------------------------------------------------------------------------------
+
+@test("a group inside an 'if' branch, and another inside its 'else'")
+nfn_groups_in_both_branches() = nfn_prints(raw"""
+    branchy(n: int) -> int
+        if n > 0
+            pos(k: int) -> int = k * 2
+
+            pos(n)
+        else
+            neg(k: int) -> int = k * 3
+
+            neg(n)
+
+    print(branchy(4), branchy(-4))
+    """, "8 -12\n")
+
+@test("three nested functions recurse three ways")
+nfn_three_way_recursion() = nfn_prints(raw"""
+    three(n: int) -> string
+        a(k: int) -> string = if k == 0 then "a" else b(k - 1)
+        b(k: int) -> string = if k == 0 then "b" else c(k - 1)
+        c(k: int) -> string = if k == 0 then "c" else a(k - 1)
+
+        a(n)
+
+    print(three(0), three(1), three(2), three(3))
+    """, "a b c a\n")
+
+private nfn_guarded() -> string = raw"""
+    guarded(n: int) -> int
+        go(k: int) -> int
+            require k > 0, "positive"
+            k * 2
+
+        go(n)
+
+    """
+
+@test("a nested function carries contract clauses of its own")
+nfn_contract_clauses() = nfn_prints(nfn_guarded() + "print(guarded(3))\n", "6\n")
+
+@test("and a broken one stops the program")
+nfn_a_broken_contract_stops() = nfn_leaves(nfn_guarded() + "print(guarded(-1))\n", "", 133)
+
+@test("a nested function writes through a captured reference")
+nfn_writes_through_a_reference() = nfn_prints(raw"""
+    struct Cell
+        v: int
+
+    viaref() -> int
+        var c: &Cell = Cell(1)
+
+        inc()
+            c.v = c.v + 5
+
+        inc()
+        inc()
+        c.v
+
+    print(viaref())
+    """, "11\n")
+
+// The nested function reaches the variable and the closure took a copy when it was formed, so the
+// second `bump` moves one and not the other. Either rule applied to both would give 16 or 6 for both.
+@test("a nested function and a closure in one block capture the same name differently")
+nfn_nested_and_closure_differ() = nfn_prints(raw"""
+    mixed(n: int) -> int
+        var total = n
+
+        bump(k: int)
+            total = total + k
+
+        bump(1)
+
+        var f: &Fn(int) -> int = k -> k + total
+
+        bump(10)
+        print(total)
+        f(0)
+
+    print(mixed(5))
+    """, "16\n6\n")
+
+@test("a capture written below the group is read, and reads what its initializer left")
+nfn_a_capture_written_below() = nfn_prints(raw"""
+    good() -> int
+        go() -> int = later
+
+        var later = 1
+
+        go()
+
+    print(good())
+    """, "1\n")
+
+@test("a binding made after the group's first function is still one it can read")
+nfn_a_binding_after_the_first() = nfn_prints(raw"""
+    var counted = 0
+
+    bump(k: int)
+        counted += k
+    end bump
+
+    val data: [3]int = [1, 2, 3]
+
+    read() -> int = data[0]
+
+    bump(1)
+    print(read())
+    print(counted)
+    """, "1\n1\n")
+
+// A copy would accumulate and print 0.
+@test("and a write reaches the later binding itself, not a copy of it")
+nfn_a_write_reaches_the_later_binding() = nfn_prints(raw"""
+    add(k: int)
+        total = total + k
+
+    var total = 0
+
+    add(3)
+    add(4)
+    print(total)
+    """, "7\n")
+
+// Every block is its own group, so a loop body gets a fresh environment per iteration.
+@test("a group inside a loop body waits on that iteration's own binding")
+nfn_a_group_in_a_loop_body() = nfn_prints(raw"""
+    var grand = 0
+
+    for i in 0..<3
+        step(k: int)
+            acc = acc + k
+
+        var acc = 0
+
+        step(i)
+        step(i)
+        grand = grand + acc
+
+    print(grand)
+    """, "6\n")
+
+// One environment serves the whole group, so until it is built there is nothing to pass to ANY of
+// them -- `bump` reads nothing that is waiting and is refused anyway.
+private nfn_early() -> string = raw"""
+    var counted = 0
+
+    bump(k: int)
+        counted += k
+    end bump
+
+    read() -> int = data[0]
+
+    bump(1)
+
+    val data: [3]int = [1, 2, 3]
+
+    print(read())
+    """
+
+private nfn_early_said() -> string = if xvr_no_library() then "" else nfn_said(nfn_early())
+
+@test("calling one before the binding it waits on is refused, naming the binding that is not ready")
+nfn_early_names_the_binding() = nfn_refused(nfn_early(),
+    "'bump' cannot be called here — the nested functions of this block share one environment, " +
+    "and it is not built until everything they read is bound. 'data' is bound below this call: " +
+    "move the call below it, or move it above the functions", "9:1")
+
+@test("and saying it is the shared environment that is waiting")
+nfn_early_says_the_environment_waits()
+    val said = nfn_early_said()
+
+    if said.is_empty() then return
+
+    assert(said.contains("share one environment"), said)
+
+@test("and offering the two moves that fix it")
+nfn_early_offers_two_moves()
+    val said = nfn_early_said()
+
+    if said.is_empty() then return
+
+    assert(said.contains("move the call below it"), said)
+    assert(said.contains("move it above the functions"), said)
+
+@test("including for a function that does not itself read it")
+nfn_early_includes_a_non_reader()
+    val said = nfn_early_said()
+
+    if said.is_empty() then return
+
+    assert(said.contains("'bump' cannot be called here"), said)
+
+@test("moving the binding above the group is one of the two fixes the message names")
+nfn_moving_the_binding_above() = nfn_prints(raw"""
+    var counted = 0
+    val data: [3]int = [1, 2, 3]
+
+    bump(k: int)
+        counted += k
+    end bump
+
+    read() -> int = data[0]
+
+    bump(1)
+    print(read())
+    print(counted)
+    """, "1\n1\n")
+
+@test("and 'static' is the other, since module storage is bound before any statement runs")
+nfn_static_is_the_other_fix() = nfn_prints(raw"""
+    var counted = 0
+
+    bump(k: int)
+        counted += k
+    end bump
+
+    static val data: [3]int = [1, 2, 3]
+
+    read() -> int = data[0]
+
+    bump(1)
+    print(read())
+    print(counted)
+    """, "1\n1\n")
+
+// The environment is a struct like any other, and one over no names is empty.
+@test("a group that captures nothing carries nothing")
+nfn_a_group_over_nothing()
+    if xvr_no_library() then return
+
+    val out = nfn_said(raw"""
+        outer(n: int) -> int
+            inner(k: int) -> int = k * 2
+
+            inner(n)
+
+        print(outer(5))
+        """)
+
+    assert(out.contains("%struct.$env0 = type {  }"), out)
