@@ -5,19 +5,26 @@ import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{capture, Status}
-import sysl.text.{join, Search}
+import sysl.text.{join, replace_all, Search}
 
 // **What a module requires is what it SHIPS** (`reference/modules.md § A declaration may name what
 // reaching it needs`, `§ A '@tests' file states its own capabilities`). A declaration that wrote
-// `@needs(os)` charges the capability to whoever reaches it, so what its body reaches says nothing
-// about its module; and a `@tests` file is dropped by every build but a test run, so its imports and
-// bodies say nothing about the module either. Both used to count toward the module's requirement,
-// which refused a program at the import of a module it reached only through a declaration that
-// needed nothing.
+// `@needs(...)` charges what it names to whoever reaches it, so for those capabilities what its body
+// reaches says nothing about its module; and a `@tests` file is dropped by every build but a test
+// run, so its imports and bodies say nothing about the module either. Both used to count toward the
+// module's requirement, which refused a program at the import of a module it reached only through a
+// declaration that needed nothing.
 //
-// Each compilation is the standard module, a library handed over under the names it was written with
-// (what a `--lib` root arrives as), and the program's own files, analyzed for this machine with the
-// capabilities named taken away -- what a config turning them off produces.
+// The reference's `DeclCapabilityTests` (*a '@needs' body is charged to its callers, not to its
+// module*), `TargetCapabilityTests` (*a '@needs(os)' body on a machine with no os is its callers'
+// question*, *a library's '@tests' file costs a program that links the library nothing*) and
+// `NeedsScopeCliTests`, ported. **Every sentence quoted was read out of the reference.** A body
+// covers what its annotation NAMES: `sysl.fs` reaches the POSIX modules under it on every hosted
+// target, so the declarations here say `@needs(posix)`, which implies `os`.
+//
+// The in-process compilations are the standard module, a library handed over under the names it was
+// written with (what a `--lib` root arrives as), and the program's own files, analyzed for this
+// machine with the capabilities named taken away -- what a config turning them off produces.
 
 private var nsc_std_cache: Buf[Program] = buf()
 private var nsc_std_read: bool = false
@@ -78,103 +85,167 @@ end nsc_reported
 
 private nsc_said(xs: Buf[string]) -> string = join(xs.view(), "\n")
 
+// Whether there is a diagnostic, and every one is the refusal of a call reaching `who`. The
+// declaration check walks once per capability, so a `@needs(posix)` declaration reached from a module
+// without `os` is refused once for each; what must not be there is anything that is not the call's.
+private nsc_only_at_the_call(xs: Buf[string], who: string) -> bool
+    if xs.is_empty() then return false
+
+    for i in 0..<xs.len()
+        if !xs.at(i).contains(s"main.sysl: this reaches '$who', which needs ") then return false
+
+    true
+end nsc_only_at_the_call
+
 private val nsc_nothing: [](string, string) = []
+private val nsc_no_os: [2]string = ["os", "posix"]
 
-// The module of the report: one declaration that needs an operating system and reaches one, and one
-// that needs nothing.
+// The module of the report: one declaration that needs POSIX and reaches it, and one that needs
+// nothing.
 private val nsc_sys: string =
-    "module sys\n\n@needs(os)\nnow() -> bool = sysl.fs.exists(\"/\")\n\nplain() -> int = 3\n"
+    "module sys\n\n@needs(posix)\nnow() -> bool = sysl.fs.exists(\"/\")\n\nplain() -> int = 3\n"
 
-// The same, with a declaration that wrote nothing calling the one that needs an operating system.
-private val nsc_sys_relay: string =
-    "module sys\n\n@needs(os)\nnow() -> bool = sysl.fs.exists(\"/\")\n\n" +
-    "later() -> bool = now()\n\nplain() -> int = 3\n"
+// The same, with a declaration that wrote nothing calling the one that did.
+private val nsc_relay: string =
+    "module sys\n\n@needs(posix)\nnow() -> bool = sysl.fs.exists(\"/\")\n\n" +
+    "relay() -> bool = now()\n\nplain() -> int = 3\n"
 
 // A library module whose shipping file reaches nothing, and whose `@tests` file reaches `sysl.fs`.
-private val nsc_thing: string = "module thing\n\nn() -> int = 3\n"
-private val nsc_thing_tests: string =
-    "module thing\n@tests\n\nimport sysl.fs.exists\n\n@test\nchecks() = assert(!exists(\"/nonexistent\"))\n"
+private val nsc_notes: string = "module notes\n\nrender() -> int = 5\n"
+private val nsc_notes_tests: string =
+    "module notes\n@tests\n\nimport sysl.fs.exists\n\n@test\nreads_a_fixture() =\n    assert(exists(\"/\"))\n"
 
-private nsc_needs_refusal(why: string) -> string =
-    s"main.sysl: this reaches 'sys.now', which needs 'os', and $why"
+private val nsc_call_no_os: string =
+    "main.sysl: this reaches 'sys.now', which needs 'os', and this module declared '@no_os'"
 
-private nsc_not_provided() -> string =
-    s"'${host_target().name}' does not provide it — a target's capabilities are what " +
-    "'package.hocon' declares, so either this reference cannot be made on this machine or the " +
-    "config is understating it"
+private val nsc_plain_no_os: string = "@no_os\n\nimport sys.plain\n\nprint(plain())\n"
 
-// -- a `@needs` declaration's body is charged to its callers, not to its module --------------------
+// -- a `@needs` body is charged to its callers, not to its module ----------------------------------
 
-@test("a module reached only through a declaration needing nothing does not require what a '@needs' body reaches")
-nsc_needs_body_is_not_the_modules()
-    if nsc_no_std() then return
-
-    val got = nsc_reported([], nsc_nothing,
-                           [("sys/a.sysl", nsc_sys), ("main.sysl", "@no_os\n\nimport sys.plain\n\nprint(plain())\n")])
-
-    assert(got.is_empty(), nsc_said(got))
-
-@test("and a call of the '@needs' declaration is refused there, with nothing said about the module")
-nsc_needs_call_is_the_one_refusal()
+@test("calling the '@needs' declaration from a module that gave os up is refused at the call only")
+nsc_call_refused_at_the_call_only()
     if nsc_no_std() then return
 
     val got = nsc_reported([], nsc_nothing,
                            [("sys/a.sysl", nsc_sys), ("main.sysl", "@no_os\n\nimport sys.now\n\nprint(now())\n")])
 
-    assert_eq(nsc_said(got), nsc_needs_refusal("this module declared '@no_os'"))
+    assert(nsc_said(got).contains(nsc_call_no_os), nsc_said(got))
+    assert(!nsc_said(got).contains("which requires 'os'"), nsc_said(got))
+    assert(nsc_only_at_the_call(got, "sys.now"), nsc_said(got))
+end nsc_call_refused_at_the_call_only
 
-@test("on a target with no operating system the module is reached freely, the body being the declaration's")
-nsc_target_needs_body_is_not_the_modules()
+// `reference/modules.md`: "It is **transitive**, because reaching is". A function that said nothing
+// and calls one that did passes the need on to its callers, at their call.
+@test("an unannotated function calling it passes the need on to its callers, at their call")
+nsc_unannotated_caller_passes_it_on()
     if nsc_no_std() then return
 
-    val got = nsc_reported(["os"], nsc_nothing,
+    val got = nsc_reported([], nsc_nothing,
+                           [("sys/a.sysl", nsc_relay), ("main.sysl", "@no_os\n\nimport sys.relay\n\nprint(relay())\n")])
+
+    assert(nsc_said(got).contains(nsc_call_no_os), nsc_said(got))
+    assert(!nsc_said(got).contains("which requires 'os'"), nsc_said(got))
+    assert(nsc_only_at_the_call(got, "sys.now"), nsc_said(got))
+end nsc_unannotated_caller_passes_it_on
+
+// The floor stays the floor: a body that did NOT say it needs `os` and reaches `sysl.fs` makes its
+// module require it, as before.
+@test("an unannotated body that reaches sysl.fs still costs the whole module")
+nsc_unannotated_body_costs_the_module()
+    if nsc_no_std() then return
+
+    val got = nsc_reported([], nsc_nothing,
+                           [("sys/a.sysl", "module sys\n\nnow() -> bool = sysl.fs.exists(\"/\")\n\nplain() -> int = 3\n"),
+                            ("main.sysl", nsc_plain_no_os)])
+
+    assert(nsc_said(got).contains("main.sysl: this reaches 'sys', which requires 'os', and this " +
+                                  "module declared 'no os'"), nsc_said(got))
+end nsc_unannotated_body_costs_the_module
+
+// What a declaration covers is what it NAMES: `@needs(heap)` says nothing about `os`.
+@test("a body covers only what its own annotation names")
+nsc_a_body_covers_only_what_it_names()
+    if nsc_no_std() then return
+
+    val got = nsc_reported([], nsc_nothing,
+                           [("sys/a.sysl", "module sys\n\n@needs(heap)\nnow() -> bool = sysl.fs.exists(\"/\")\n\n" +
+                                           "plain() -> int = 3\n"),
+                            ("main.sysl", nsc_plain_no_os)])
+
+    assert(nsc_said(got).contains("main.sysl: this reaches 'sys', which requires 'os'"), nsc_said(got))
+end nsc_a_body_covers_only_what_it_names
+
+// -- the same with the machine taking os away, which is a board program's case ----------------------
+
+@test("on a machine with no os a program importing the declaration beside a '@needs' one is accepted")
+nsc_target_import_beside_is_accepted()
+    if nsc_no_std() then return
+
+    val got = nsc_reported(nsc_no_os, nsc_nothing,
                            [("sys/a.sysl", nsc_sys), ("main.sysl", "import sys.plain\n\nprint(plain())\n")])
 
     assert(got.is_empty(), nsc_said(got))
 
-@test("and a call of the '@needs' declaration is refused for the machine, at the call alone")
-nsc_target_needs_call_is_the_one_refusal()
+// The body reaching a declaration that is itself `@needs(os)` -- `sysl.cpu_count` -- is the other
+// mechanism, the declaration check, which asked the body's module and refused it there.
+@test("including where the '@needs' body reaches another '@needs(os)' declaration")
+nsc_target_body_reaching_a_needs_declaration()
     if nsc_no_std() then return
 
-    val got = nsc_reported(["os"], nsc_nothing,
+    val got = nsc_reported(nsc_no_os, nsc_nothing,
+                           [("sys/a.sysl", "module sys\n\n@needs(os)\ncores() -> usize = sysl.cpu_count()\n\n" +
+                                           "plain() -> int = 3\n"),
+                            ("main.sysl", "import sys.plain\n\nprint(plain())\n")])
+
+    assert(got.is_empty(), nsc_said(got))
+
+@test("and calling it on a machine with no os is refused at the call only, naming the machine")
+nsc_target_call_refused_at_the_call_only()
+    if nsc_no_std() then return
+
+    val got = nsc_reported(nsc_no_os, nsc_nothing,
                            [("sys/a.sysl", nsc_sys), ("main.sysl", "import sys.now\n\nprint(now())\n")])
 
-    assert_eq(nsc_said(got), nsc_needs_refusal(nsc_not_provided()))
+    assert(nsc_said(got).contains(
+        s"main.sysl: this reaches 'sys.now', which needs 'os', and '${host_target().name}' does not " +
+        "provide it — a target's capabilities are what 'package.hocon' declares, so either this " +
+        "reference cannot be made on this machine or the config is understating it"), nsc_said(got))
+    assert(!nsc_said(got).contains("which requires 'os'"), nsc_said(got))
+    assert(nsc_only_at_the_call(got, "sys.now"), nsc_said(got))
+end nsc_target_call_refused_at_the_call_only
 
-@test("a declaration that wrote nothing and calls a '@needs' one is refused where it is reached")
-nsc_unannotated_caller_is_charged_at_its_call()
+// -- a `@tests` file costs a program that links its module nothing ---------------------------------
+
+@test("a library's '@tests' file costs a program on a machine with no os nothing")
+nsc_tests_file_on_a_machine_with_no_os()
     if nsc_no_std() then return
 
-    val plain = nsc_reported([], nsc_nothing,
-                             [("sys/a.sysl", nsc_sys_relay), ("main.sysl", "@no_os\n\nimport sys.plain\n\nprint(plain())\n")])
-    val later = nsc_reported([], nsc_nothing,
-                             [("sys/a.sysl", nsc_sys_relay), ("main.sysl", "@no_os\n\nimport sys.later\n\nprint(later())\n")])
-
-    assert(plain.is_empty(), nsc_said(plain))
-    assert_eq(nsc_said(later), nsc_needs_refusal("this module declared '@no_os'"))
-end nsc_unannotated_caller_is_charged_at_its_call
-
-// -- a `@tests` file says nothing about what its module ships --------------------------------------
-
-@test("a library whose '@tests' file reaches 'sysl.fs' is usable from a program on a machine with no operating system")
-nsc_tests_file_is_not_the_modules_on_a_target()
-    if nsc_no_std() then return
-
-    val got = nsc_reported(["os"], [("thing/a.sysl", nsc_thing), ("thing/tests.sysl", nsc_thing_tests)],
-                           [("main.sysl", "import thing.n\n\nprint(n())\n")])
+    val got = nsc_reported(nsc_no_os, [("notes/notes.sysl", nsc_notes), ("notes/notes_tests.sysl", nsc_notes_tests)],
+                           [("main.sysl", "import notes.render\n\nprint(render())\n")])
 
     assert(got.is_empty(), nsc_said(got))
 
-@test("and from a program that gave the operating system up")
-nsc_tests_file_is_not_the_modules_under_a_clause()
+@test("nor one in a module that gave os up")
+nsc_tests_file_under_a_clause()
     if nsc_no_std() then return
 
-    val got = nsc_reported([], [("thing/a.sysl", nsc_thing), ("thing/tests.sysl", nsc_thing_tests)],
-                           [("main.sysl", "@no_os\n\nimport thing.n\n\nprint(n())\n")])
+    val got = nsc_reported([], [("notes/notes.sysl", nsc_notes), ("notes/notes_tests.sysl", nsc_notes_tests)],
+                           [("main.sysl", "@no_os\n\nimport notes.render\n\nprint(render())\n")])
 
     assert(got.is_empty(), nsc_said(got))
 
-// -- the whole program, through the command line ---------------------------------------------------
+@test("while the same import in a shipping file is still the module's")
+nsc_shipping_import_is_still_the_modules()
+    if nsc_no_std() then return
+
+    val got = nsc_reported(nsc_no_os,
+                           [("notes/notes.sysl", "module notes\n\nimport sysl.fs.exists\n\n" +
+                                                 "render() -> int = if exists(\"/\") then 5 else 0\n")],
+                           [("main.sysl", "import notes.render\n\nprint(render())\n")])
+
+    assert(nsc_said(got).contains("main.sysl: this reaches 'notes', which requires 'os'"), nsc_said(got))
+
+// -- whole programs, through the command line ------------------------------------------------------
 
 private nsc_ready() -> bool = !nsc_no_std() && clang_available()
 
@@ -186,71 +257,139 @@ private nsc_cli(args: []string) -> (int, string)
     (code, join(lines.view(), "\n"))
 end nsc_cli
 
-// A project of the report's module and a `main.sysl`, with a manifest where one is given.
-private nsc_project(main: string, config: string) -> string
+// A project of the given files, each written below a fresh root.
+private nsc_tree(files: [](string, string)) -> string
     val root = absolute_path(make_temp_dir("sysl-nsc-").unwrap())
 
-    make_dir_all(s"$root/sys").unwrap()
-    write_text(s"$root/sys/a.sysl", nsc_sys).unwrap()
-    write_text(s"$root/main.sysl", main).unwrap()
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val cut = at.last_index_of("/")
 
-    if config != "" then write_text(s"$root/package.hocon", config).unwrap()
+        if cut.is_some() then make_dir_all(at[0..<cut.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
 
     root
-end nsc_project
+end nsc_tree
 
-private val nsc_freestanding: string =
-    "package {\n  name = \"p\"\n  version = \"0.0.1\"\n}\n\n" +
-    "targets {\n  thumbv6m-freestanding {\n    capabilities { os = false }\n  }\n}\n"
-
-@test("the report's program builds and prints 3")
-nsc_the_report_builds_and_runs()
-    if !nsc_ready() then return
-
-    val root = nsc_project("@no_os\n\nimport sys.plain\n\nprint(plain())\n", "")
+// What a project prints once built and run, or why it did not.
+private nsc_ran(files: [](string, string)) -> string
+    val root = nsc_tree(files)
     val built = nsc_cli(["sysl", "build", root, "-o", s"$root/out"])
 
-    assert_eq(built.0, Fine, built.1)
+    if built.0 != Fine
+        remove_dir_all(root).unwrap_or(())
+        return s"did not build: ${built.1}"
 
     val ran = capture(s"$root/out", [], "", [], true)
 
     remove_dir_all(root).unwrap_or(())
 
     ran match
-        Err(_) -> assert(false, "the program that was built could not be run")
+        Err(_) -> "the program that was built could not be run"
         Ok(o) -> o.status match
-            Status.Exited(code) ->
-                assert_eq(code, 0)
-                assert_eq(o.text, "3\n")
-            _ -> assert(false, "the program did not exit")
-end nsc_the_report_builds_and_runs
+            Status.Exited(code) -> if code == 0 then o.text else s"exited $code: ${o.text}"
+            _ -> "the program did not exit"
+end nsc_ran
 
-@test("an archive for a machine whose config gives up the operating system builds, reaching the module")
-nsc_freestanding_archive_builds()
+// What a project's build said, where it was refused.
+private nsc_refused(files: [](string, string)) -> string
+    val root = nsc_tree(files)
+    val built = nsc_cli(["sysl", "build", root, "-o", s"$root/out"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    if built.0 == Fine then "it built" else replace_all(built.1, root, "<root>")
+end nsc_refused
+
+@test("so a module that gave os up imports the declaration beside a '@needs' one, and it runs")
+nsc_the_report_runs()
     if !nsc_ready() then return
 
-    val root = nsc_project("import sys.plain\n\n@export(\"main\")\nentry() -> int = plain()\n",
-                           nsc_freestanding)
-    val got = nsc_cli(["sysl", "build-c", root, "--target", "thumbv6m-freestanding"])
+    assert_eq(nsc_ran([("sys/a.sysl", nsc_sys), ("main.sysl", nsc_plain_no_os)]), "3\n")
+
+@test("the call's refusal is at the call, and not at the import")
+nsc_the_call_is_where_it_is_refused()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("sys/a.sysl", nsc_sys), ("main.sysl", "@no_os\n\nimport sys.now\n\nprint(now())\n")])
+
+    assert(said.contains("this reaches 'sys.now', which needs 'os', and this module declared '@no_os'"), said)
+    assert(said.contains("<root>/main.sysl:5:7"), said)
+    assert(!said.contains("which requires 'os'"), said)
+end nsc_the_call_is_where_it_is_refused
+
+@test("the module of an unannotated caller is importable for the rest, and the caller runs where os is had")
+nsc_unannotated_caller_runs()
+    if !nsc_ready() then return
+
+    assert_eq(nsc_ran([("sys/a.sysl", nsc_relay), ("main.sysl", nsc_plain_no_os)]), "3\n")
+    assert_eq(nsc_ran([("sys/a.sysl", nsc_relay), ("main.sysl", "import sys.relay\n\nprint(relay())\n")]),
+              "true\n")
+end nsc_unannotated_caller_runs
+
+@test("a closure written inside a '@needs' body is covered with it")
+nsc_a_closure_inside_is_covered()
+    if !nsc_ready() then return
+
+    val sys = "module sys\n\n@needs(posix)\nnow() -> bool\n    val ask = (p: string) -> sysl.fs.exists(p)\n" +
+              "    ask(\"/\")\n\nplain() -> int = 3\n"
+
+    assert_eq(nsc_ran([("sys/a.sysl", sys), ("main.sysl", nsc_plain_no_os)]), "3\n")
+end nsc_a_closure_inside_is_covered
+
+// A board with no operating system, said the way a project says it.
+private val nsc_board: string =
+    "targets {\n  default = \"thumbv6m-freestanding\"\n" +
+    "  thumbv6m-freestanding { capabilities { os = false, posix = false } }\n}\n"
+
+@test("a board program's own module holding a '@needs' declaration is importable for the rest")
+nsc_board_imports_beside()
+    if !nsc_ready() then return
+
+    val root = nsc_tree([("sys/a.sysl", nsc_sys), ("package.hocon", nsc_board),
+                         ("main.sysl", "import sys.plain\n\nprint(plain())\n")])
+    val got = nsc_cli(["sysl", "emit-llvm", root])
 
     remove_dir_all(root).unwrap_or(())
     assert_eq(got.0, Fine, got.1)
-end nsc_freestanding_archive_builds
+    assert(got.1.contains("define"), got.1)
+end nsc_board_imports_beside
 
-@test("and one calling the '@needs' declaration is refused at the call, naming the machine")
-nsc_freestanding_archive_refuses_the_call()
+@test("and calling it is refused at the call only, naming the machine")
+nsc_board_call_refused()
     if !nsc_ready() then return
 
-    val root = nsc_project("import sys.now\n\n@export(\"main\")\nentry() -> bool = now()\n",
-                           nsc_freestanding)
-    val got = nsc_cli(["sysl", "build-c", root, "--target", "thumbv6m-freestanding"])
+    val said = nsc_refused([("sys/a.sysl", nsc_sys), ("package.hocon", nsc_board),
+                            ("main.sysl", "import sys.now\n\nprint(now())\n")])
+
+    assert(said.contains("this reaches 'sys.now', which needs 'os', and 'thumbv6m-freestanding' does not " +
+                         "provide it"), said)
+    assert(said.contains("<root>/main.sysl:3:7"), said)
+    assert(!said.contains("which requires 'os'"), said)
+end nsc_board_call_refused
+
+@test("a library whose '@tests' file reads the filesystem is linked by a board program that only renders")
+nsc_board_links_the_library()
+    if !nsc_ready() then return
+
+    val lib = nsc_tree([("notes/notes.sysl", nsc_notes), ("notes/notes_tests.sysl", nsc_notes_tests)])
+    val root = nsc_tree([("package.hocon", nsc_board), ("main.sysl", "import notes.render\n\nprint(render())\n")])
+    val got = nsc_cli(["sysl", "emit-llvm", root, "--lib", lib])
 
     remove_dir_all(root).unwrap_or(())
-    assert_eq(got.0, Failed)
-    assert(got.1.contains("error: this reaches 'sys.now', which needs 'os', and " +
-                          "'thumbv6m-freestanding' does not provide it — a target's capabilities " +
-                          "are what 'package.hocon' declares, so either this reference cannot be " +
-                          "made on this machine or the config is understating it\n"), got.1)
-    assert(got.1.contains(s"$root/main.sysl:4:19"), got.1)
-    assert(!got.1.contains("which requires"), got.1)
-end nsc_freestanding_archive_refuses_the_call
+    remove_dir_all(lib).unwrap_or(())
+    assert_eq(got.0, Fine, got.1)
+    assert(got.1.contains("define"), got.1)
+end nsc_board_links_the_library
+
+@test("and the library still runs that file under its own 'sysl test' on a machine with an os")
+nsc_the_library_still_tests()
+    if !nsc_ready() then return
+
+    val lib = nsc_tree([("notes/notes.sysl", nsc_notes), ("notes/notes_tests.sysl", nsc_notes_tests)])
+    val got = nsc_cli(["sysl", "test", lib])
+
+    remove_dir_all(lib).unwrap_or(())
+    assert(got.1.contains("1 passed"), got.1)
+end nsc_the_library_still_tests
