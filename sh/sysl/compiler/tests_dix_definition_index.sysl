@@ -1,0 +1,51 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// The definition index's own machinery, beside the reference's cases in `tests_fdd_fetch_deps.sysl`.
+
+// An analysis a build makes has no index, which is the whole of what the index costs a build: every
+// recording site asks this and does nothing more.
+@test("dix: a build's analysis carries no index")
+dix_a_build_carries_no_index()
+    assert(analysis_for(host_target()).index.is_none())
+
+// A body is read more than once -- a generic at its definition and per instantiation -- so the same
+// reference arrives several times over and is kept once.
+@test("dix: one reference noted twice is kept once")
+dix_noted_twice_kept_once()
+    val ix = definition_index()
+    val src = source_of("t.sysl", "var x = 1\nprint(x)\n")
+
+    ix.note(src, Span(16, 17), src, Span(0, 9), "x")
+    ix.note(src, Span(16, 17), src, Span(0, 9), "x")
+
+    assert_eq(ix.references.len(), 1)
+    assert_eq(s"${ix.references.at(0).at}>${ix.references.at(0).declared_at}", "2:7>1:1")
+end dix_noted_twice_kept_once
+
+// Two bodies each binding a name of one spelling: the unique name is the same in both, and each
+// use still reaches its own binding -- what a table keyed by the unique name would get wrong.
+@test("dix: two functions' parameters of one name each reach their own")
+dix_two_functions_one_parameter_name()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-dix-index").unwrap()
+
+    write_text(s"$root/t.sysl", "f(n: int) -> int = n\ng(n: int) -> int = n + 1\nprint(f(1), g(2))\n").unwrap()
+
+    val ix = indexed_file(s"$root/t.sysl").unwrap()
+    var out = ""
+
+    for i in 0..<ix.references.len()
+        val r = ix.references.at(i)
+
+        if r.at_file.ends_with("/t.sysl") && r.name == "n" then
+            out = s"$out ${r.at}>${r.declared_at}"
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(out, " 1:20>1:1 2:20>2:1")
+end dix_two_functions_one_parameter_name

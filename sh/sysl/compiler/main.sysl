@@ -58,6 +58,7 @@ run_cli(args: []string, say: string -> unit) -> int
         "run" -> run_command(args, say)
         "test" -> test_command(args, say)
         "add" -> add_command(args, say)
+        "deps" -> deps_command(args, say)
         "doc" -> doc_command(args, say)
         other ->
             say(s"sysl: `${other}` is not a command this compiler can carry out yet")
@@ -952,6 +953,37 @@ end add_command
 
 private add_usage() -> string = "usage: sysl add <coordinate>[@<version>] [<path>]"
 
+// `sysl deps <path>` -- the graph the project resolves to, and who asked for each version.
+//
+// **It is a question about a particular project, so the path is required**, and it stops above the
+// target: nothing in it asks anything of a machine, so a project pinned to one this machine cannot
+// build for is still inspectable.
+private deps_command(args: []string, say: string -> unit) -> int
+    if args.len != 3
+        say(deps_usage())
+        return Misused
+
+    val root = args[2]
+
+    val m = manifest_of_package(root) match
+        Err(why) ->
+            say(s"error: $why")
+            return Failed
+        Ok(got) -> got
+
+    resolved_graph(root, m) match
+        Err(refusal) ->
+            say(s"error: ${refusal.message}")
+            Failed
+        Ok(g) ->
+            val text = deps_listing(m, g)
+
+            say(text[0..<text.len - 1])
+            Fine
+end deps_command
+
+private deps_usage() -> string = "usage: sysl deps <path>"
+
 usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <file> | " +
     "emit-typed [--no-spans] [--tables] [--target <name>] <path> | " +
     "emit-llvm [--target <name>] [-O<level>] <path> | " +
@@ -960,7 +992,7 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     "[--lto thin|full] <path> | emit-header [--target <name>] <path> | " +
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
     "test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
-    "add <coordinate>[@<version>] [<path>] | " +
+    "add <coordinate>[@<version>] [<path>] | deps <path> | " +
     "doc [-o <dir>] [-t <title>] [-n <note>] [-w <n>] [-V <version>] [--private] [--check] [<dir>]\n" +
     "build, build-c, run and test, which resolve a package graph, also take " + feature_flags() +
     ": a feature of the root project to turn on beside 'default', comma-separated and repeatable; " +

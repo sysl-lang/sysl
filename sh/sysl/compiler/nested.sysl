@@ -30,6 +30,9 @@ struct Nested
     env: TExpr
     variadic: bool
     params: Buf[Param]
+
+    // Where the declaration was written, which only the definition index reads.
+    declared: Span
 end Nested
 
 // Whether a name is one of the nested functions this body may see -- one of the block's own, or one
@@ -137,8 +140,8 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
     for i in 0..<group.len()
         val d = group.at(i)
 
-        inside.push((d.name, Nested(lowered.at(i), inner_self, d.variadic, d.params)))
-        cx.nested.push((d.name, Nested(lowered.at(i), here, d.variadic, d.params)))
+        inside.push((d.name, Nested(lowered.at(i), inner_self, d.variadic, d.params, d.at)))
+        cx.nested.push((d.name, Nested(lowered.at(i), here, d.variadic, d.params, d.at)))
 
     for i in 0..<group.len()
         cx.an.closure_funcs.push(nested_body(cx, span, st, lowered.at(i), captured, group.at(i),
@@ -385,6 +388,8 @@ end named_sibling
 // `f(a)` where `f` is one of the block's nested functions: a call on the receiver the body already
 // has, with the arguments a reader wrote after it.
 call_nested(cx: &Analyzer, span: Span, n: &Nested, written: string, args: Buf[Expr]) -> TExpr
+    note_reference(cx, span, cx.scope.src, n.declared, written)
+
     val sig = cx.an.tables.members.func_insts.get(n.fname)
 
     if sig.is_none() then return bad_expr(span)
