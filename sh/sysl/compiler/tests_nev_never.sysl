@@ -1,0 +1,429 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// The bottom type, and the `extern` declarations whose `exit` is its usual source.
+//
+// `never` stands where any type was asked for, and the other direction is what these pin: nowhere a
+// *value* is needed will it do, there being no values of it. So it is refused everywhere but a
+// result type, and a diverging expression is refused everywhere a value has to arrive. A diverging
+// alternative is set aside before the others are joined, and the rules that were there before stay
+// exactly as strict. Then the externs: one function namespace, a checked signature, and a variadic
+// tail that carries only what C's varargs can.
+//
+// **Every message and location here was read out of the reference compiler** (0.0.155) on the same
+// program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private nev_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+
+// What `emit-llvm` prints for the program, or what the build had to say about it.
+private nev_ir(main: string) -> string
+    val root = make_temp_dir("sysl-nev").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private nev_refused(main: string, message: string, at: string)
+    val out = nev_ir(main)
+
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+
+// The program compiles, and its text holds this line.
+private nev_holds(main: string, line: string)
+    val out = nev_ir(main)
+
+    assert(out.index_of(line).is_some(), s"expected '$line' in the emitted text, got: $out")
+
+private val nev_result_only = "'never' is the type of an expression that does not finish, so it can only be a result type"
+
+private val nev_tail_takes = "a variadic argument must be an integer, a float, a char, a raw pointer, or the address of a function"
+
+// -- never is only a result type ------------------------------------------------------------------
+
+@test("never is not a variable's type")
+nev_not_a_variables_type()
+    if nev_skip() then return
+
+    nev_refused("var x: never = exit(1)", nev_result_only, "1:8")
+
+@test("never is not a parameter's type")
+nev_not_a_parameters_type()
+    if nev_skip() then return
+
+    nev_refused("f(x: never) -> int = 1\nprint(f(exit(1)))", nev_result_only, "1:6")
+
+@test("never is not a struct field's type")
+nev_not_a_fields_type()
+    if nev_skip() then return
+
+    nev_refused("struct S\n    x: never\nprint(1)", nev_result_only, "2:8")
+
+@test("never is not a variant payload's type")
+nev_not_a_payloads_type()
+    if nev_skip() then return
+
+    nev_refused("enum E\n    V(x: never)\nprint(1)", nev_result_only, "2:10")
+
+@test("never is not a type argument")
+nev_not_a_type_argument()
+    if nev_skip() then return
+
+    nev_refused("var o: Option[never] = None", nev_result_only, "1:15")
+
+@test("never is not an element type")
+nev_not_an_element_type()
+    if nev_skip() then return
+
+    nev_refused("var a: [4]never\nprint(1)", nev_result_only, "1:11")
+
+@test("never is not behind a reference")
+nev_not_behind_a_reference()
+    if nev_skip() then return
+
+    nev_refused("f(x: &never) -> int = 1\nprint(1)", nev_result_only, "1:7")
+
+@test("nothing else may take the name 'never'")
+nev_nothing_else_may_take_the_name()
+    if nev_skip() then return
+
+    nev_refused("struct never\n    x: int\nprint(1)", "type 'never' is already declared", "1:1")
+    nev_refused("enum never\n    A\nprint(1)", "type 'never' is already declared", "1:1")
+
+// -- a diverging expression is not a value --------------------------------------------------------
+
+@test("a diverging expression cannot be bound")
+nev_cannot_be_bound()
+    if nev_skip() then return
+
+    nev_refused("var x = exit(1)", "cannot bind 'x' to an expression that never returns", "1:1")
+
+@test("a diverging expression cannot be printed")
+nev_cannot_be_printed()
+    if nev_skip() then return
+
+    nev_refused("print(exit(1))", "cannot print a never value — it does not implement 'sysl.Display'", "1:1")
+
+@test("a diverging expression cannot fill an array")
+nev_cannot_fill_an_array()
+    if nev_skip() then return
+
+    nev_refused("var a = [exit(1)]", "an array cannot hold never values", "1:9")
+
+@test("a diverging expression cannot be assigned")
+nev_cannot_be_assigned()
+    if nev_skip() then return
+
+    nev_refused("var x = 1\nx = exit(1)", "cannot assign never to 'x' of type int", "2:1")
+
+@test("a diverging expression cannot be made into a string")
+nev_cannot_be_made_into_a_string()
+    if nev_skip() then return
+
+    nev_refused("print(str(exit(1)))", "cannot make a string of a never value — it does not implement 'sysl.Display'", "1:7")
+
+@test("a diverging expression cannot be compared")
+nev_cannot_be_compared()
+    if nev_skip() then return
+
+    nev_refused("print(exit(1) == exit(2))", "'==' is not defined for never", "1:7")
+
+@test("a diverging expression cannot be a condition")
+nev_cannot_be_a_condition()
+    if nev_skip() then return
+
+    nev_refused("if exit(1) then print(1)", "condition must be bool, got never", "1:1")
+
+// -- a function declared 'never' must not finish --------------------------------------------------
+
+@test("a 'never' function whose body falls through is rejected")
+nev_a_body_that_falls_through()
+    if nev_skip() then return
+
+    nev_refused("f() -> never\n    print(1)\nf()", "function 'f' should return never, but its body yields unit", "1:1")
+
+@test("a 'never' function whose body yields a value is rejected")
+nev_a_body_that_yields_a_value()
+    if nev_skip() then return
+
+    nev_refused("f() -> never = 1\nf()", "function 'f' should return never, but its body yields int", "1:1")
+
+@test("a 'never' function handing off to something that does not return is accepted")
+nev_handing_off_is_accepted()
+    if nev_skip() then return
+
+    nev_holds("f() -> never = exit(1)\nf()", "define void @f()")
+
+// -- the join is no more permissive than it was ---------------------------------------------------
+
+@test("two match arms that yield different values still conflict beside a diverging one")
+nev_two_arms_still_conflict()
+    if nev_skip() then return
+
+    nev_refused(raw"""
+        f(n: int) -> int = n match
+            1 -> 1
+            2 -> exit(1)
+            else "no"
+        print(f(1))
+        """, "match arms have different types: int and string", "1:20")
+
+@test("two if branches that yield different values still conflict")
+nev_two_branches_still_conflict()
+    if nev_skip() then return
+
+    nev_refused("var x = if true then 1 else \"no\"", "if branches have different types: int and string", "1:9")
+
+@test("a match with a diverging arm must still be exhaustive")
+nev_a_diverging_arm_is_still_exhaustive()
+    if nev_skip() then return
+
+    nev_refused(raw"""
+        f(n: int) -> int = n match
+            1 -> 1
+            2 -> exit(1)
+        print(f(1))
+        """, "a 'match' that yields a value must be exhaustive — add an 'else' arm", "1:20")
+
+@test("a value-carrying break still needs an else to meet it")
+nev_a_value_break_still_needs_an_else()
+    if nev_skip() then return
+
+    nev_refused(raw"""
+        f() -> int
+            var i = 0
+            while i < 3
+                break 7
+        print(f())
+        """, "this loop breaks with a int but has no 'else' to give a value when it finishes normally — add an 'else'", "3:5")
+
+@test("a returning branch still checks the value it returns")
+nev_a_returning_branch_is_still_checked()
+    if nev_skip() then return
+
+    nev_refused("f() -> int\n    var x = if true then 1 else return \"no\"\n    x", "return type mismatch: expected int, got string", "2:33")
+
+@test("a continuing branch still needs a loop to continue")
+nev_a_continuing_branch_needs_a_loop()
+    if nev_skip() then return
+
+    nev_refused("f() -> int\n    var x = if true then 1 else continue\n    x", "'continue' is only allowed inside a loop", "2:33")
+
+@test("a value branch beside a unit one is still a statement")
+nev_a_value_branch_beside_a_unit_one()
+    if nev_skip() then return
+
+    nev_holds("var n = 0\nif true then n = 1 else print(2)\nprint(n)", "define i32 @main(")
+
+// -- externs --------------------------------------------------------------------------------------
+
+// An extern shares the one function namespace with everything else in its module: a second
+// declaration of the name is the ordinary duplicate, after the extern's own account of why.
+@test("an extern shares the function namespace")
+nev_an_extern_shares_the_namespace()
+    if nev_skip() then return
+
+    val main = "f() -> int = 1\nextern f() -> int\nprint(1)"
+
+    nev_refused(main, "'f' is already declared as a function, so this 'extern' would overload it — what tells overloads of an 'extern' apart is the symbol each names, and a sysl function declares no symbol", "2:1")
+    assert(nev_ir(main).index_of("error: function 'f' is already declared\n").is_some(), "expected the ordinary duplicate too")
+
+// The library's `exit` is `sysl.exit` and a program's own is its own; both name the symbol `exit`,
+// which an extern cannot qualify, so the two have to share a single `declare`.
+@test("a program may declare its own 'exit', and the two share one declaration")
+nev_a_program_may_declare_its_own_exit()
+    if nev_skip() then return
+
+    val out = nev_ir("extern exit(code: int) -> never\nprint(1)\nexit(0)")
+    var declared = 0
+
+    for line in out.split("\n") do if line.starts_with("declare void @exit(") then declared += 1
+    assert_eq(declared, 1)
+
+@test("two externs cannot share a name")
+nev_two_externs_cannot_share_a_name()
+    if nev_skip() then return
+
+    val main = "extern f() -> int\nextern f() -> int\nprint(1)"
+
+    nev_refused(main, "'f' is already declared as an 'extern' for the symbol 'f' — two declarations of one name are two functions, and one C function cannot be two. Overloads of an 'extern' are told apart by the symbol each names, so give this one a symbol of its own or take its address and 'ptr_cast' it where the other signature is wanted", "2:1")
+    assert(nev_ir(main).index_of("error: function 'f' is already declared\n").is_some(), "expected the ordinary duplicate too")
+
+@test("an extern and a function cannot share a name")
+nev_an_extern_and_a_function_cannot_share_a_name()
+    if nev_skip() then return
+
+    nev_refused("extern f() -> int\nf() -> int = 1\nprint(1)", "'f' is already declared as an 'extern', which this would overload — what tells overloads of an 'extern' apart is the symbol each names, and a sysl function declares no symbol", "2:1")
+
+@test("an extern is checked against its declared signature")
+nev_an_extern_is_checked_against_its_signature()
+    if nev_skip() then return
+
+    nev_refused("extern f(n: int) -> int\nprint(f(true))", "'n' of 'f' is int, but bool was given", "2:9")
+
+@test("an extern's arity is checked like any other call")
+nev_an_externs_arity_is_checked()
+    if nev_skip() then return
+
+    nev_refused("extern f(n: int) -> int\nprint(f(1, 2))", "function 'f' takes 1 argument, but 2 arguments were given", "2:7")
+
+@test("an extern's parameter types still have to resolve")
+nev_an_externs_parameter_types_resolve()
+    if nev_skip() then return
+
+    nev_refused("extern f(n: Bogus) -> int\nprint(1)", "unknown type 'Bogus'", "1:13")
+
+@test("an extern may not be declared inside a function")
+nev_an_extern_only_at_the_top_level()
+    if nev_skip() then return
+
+    nev_refused("f() -> int\n    extern g() -> int\n    1", "structs, enums, traits, impls, externs, and types may only be declared at the top level", "2:5")
+
+// -- a variadic tail ------------------------------------------------------------------------------
+
+@test("a variadic tail needs a named parameter before it")
+nev_a_tail_needs_a_named_parameter()
+    if nev_skip() then return
+
+    nev_refused("extern f(...) -> int\nprint(f(1))", "'f' needs at least one named parameter before '...'", "1:1")
+
+@test("a variadic tail does not excuse the named parameters")
+nev_a_tail_does_not_excuse_the_named_ones()
+    if nev_skip() then return
+
+    nev_refused("extern printf(fmt: *u8, ...) -> int\nprint(printf())", "function 'printf' takes at least 1 argument, but 0 arguments were given", "2:7")
+
+@test("a variadic tail still checks the named parameters it does have")
+nev_a_tail_still_checks_the_named_ones()
+    if nev_skip() then return
+
+    nev_refused("extern printf(fmt: *u8, ...) -> int\nprint(printf(1, 2))", "'fmt' of 'printf' is *byte, but int was given", "2:14")
+
+// C allows a struct in a variadic tail and says which registers it arrives in, so every aggregate
+// crosses, under the classification a declared parameter of its type gets.
+@test("a variadic tail carries a string, a struct, a slice — every aggregate")
+nev_a_tail_carries_every_aggregate()
+    if nev_skip() then return
+
+    nev_holds("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, \"hi\"))", "declare i32 @printf(ptr, ...)")
+
+    nev_holds(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        struct Point
+            x: int
+            y: int
+        var p: *u8 = null
+        print(printf(p, Point(1, 2)))
+        """, "declare i32 @printf(ptr, ...)")
+
+    nev_holds(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        var a: [3]int = [1, 2, 3]
+        var p: *u8 = null
+        print(printf(p, a))
+        """, "declare i32 @printf(ptr, ...)")
+
+// What a tail argument cannot carry is a `&T`'s count.
+@test("a variadic tail carries no reference")
+nev_a_tail_carries_no_reference()
+    if nev_skip() then return
+
+    nev_refused(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        struct Inner
+            v: int
+        var p: *u8 = null
+        var r: &Inner = Inner(1)
+        print(printf(p, r))
+        """, s"a &Inner cannot be passed to '...' — $nev_tail_takes", "6:17")
+
+// Registering a callback through a variadic setter is the ordinary way a C library takes one.
+@test("a variadic tail carries the address of a function")
+nev_a_tail_carries_a_function_address()
+    if nev_skip() then return
+
+    nev_holds(raw"""
+        extern setopt(h: *u8, opt: int, ...) -> int
+        cb(p: *u8, n: usize) -> usize = n
+        var h: *u8 = null
+        print(setopt(h, 1, &cb))
+        """, "declare i32 @setopt(ptr, i32, ...)")
+
+@test("a sysl variadic callee takes the address of a function, since it is one register")
+nev_a_sysl_tail_takes_a_function_address()
+    if nev_skip() then return
+
+    nev_holds(raw"""
+        f(n: int, ...) -> int = n
+        cb(p: *u8) -> unit = ()
+        print(f(1, &cb))
+        """, "define i32 @f(i32 %n.param, ...)")
+
+// A simple enum is an integer wearing a name, where a data enum is an aggregate like any other.
+@test("a variadic tail carries no simple enum, though it carries a data one")
+nev_a_tail_carries_a_data_enum_only()
+    if nev_skip() then return
+
+    nev_refused(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        enum Color
+            Red
+            Green
+        var p: *u8 = null
+        print(printf(p, Red))
+        """, s"a Color cannot be passed to '...' — $nev_tail_takes", "6:17")
+
+    nev_holds(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        enum Shape
+            Circle(r: int)
+            Square(s: int)
+        var p: *u8 = null
+        print(printf(p, Circle(2)))
+        """, "declare i32 @printf(ptr, ...)")
+
+// sysl has no conversion that promotes a `bool` to `int`, so there is nothing to promote it with.
+@test("a variadic tail carries no bool")
+nev_a_tail_carries_no_bool()
+    if nev_skip() then return
+
+    nev_refused("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, true))", s"a bool cannot be passed to '...' — $nev_tail_takes", "3:17")
+
+@test("a variadic tail carries no unit, and nothing that never arrives")
+nev_a_tail_carries_no_unit_and_no_never()
+    if nev_skip() then return
+
+    nev_refused("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, ()))", s"a unit cannot be passed to '...' — $nev_tail_takes", "3:17")
+    nev_refused("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, exit(1)))", s"a never cannot be passed to '...' — $nev_tail_takes", "3:17")
+
+@test("a variadic tail's refusal says what it would have taken")
+nev_a_tail_says_what_it_would_take()
+    if nev_skip() then return
+
+    val out = nev_ir("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, true))")
+
+    assert(out.index_of("must be an integer, a float, a char, a raw pointer, or the address of a function").is_some(), out)
+
+// A sysl function's arity is fixed, so an extra argument to one is the ordinary arity error.
+@test("a variadic tail belongs to the extern that declared it, not to every call")
+nev_a_tail_belongs_to_its_extern()
+    if nev_skip() then return
+
+    nev_refused("extern printf(fmt: *u8, ...) -> int\nf(n: int) -> int = n\nprint(f(1, 2))", "function 'f' takes 1 argument, but 2 arguments were given", "3:7")
