@@ -511,7 +511,14 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
         val stands_for = bound_type(cx.subst, name)
 
         if stands_for.is_some() then
-            return convert_call(cx, span, name, stands_for.unwrap(), args)
+            val to = stands_for.unwrap()
+
+            // A subtype that checks anything is made the way its own name makes it.
+            to match
+                Constrained(d) -> if !name_only(d) then return into_subtype(cx, span, to, name, args)
+                _ -> ()
+
+            return convert_call(cx, span, name, to, args)
     end if
 
     // **A variant the position asked for outright claims the name**, before a type of that name is
@@ -1168,8 +1175,14 @@ private constrained_call(cx: &Analyzer, span: Span, key: string, written: string
     if inst.is_none() then
         return cx.err(span, s"'$written' is an alias, and an alias is not something that is called")
 
-    val target = inst.unwrap()
+    into_subtype(cx, span, inst.unwrap(), written, args)
+end constrained_call
 
+// A value made into a subtype: converted to its base where it is not already that, then checked
+// against what the subtype states. A type parameter standing for a subtype comes here too, so
+// `T(n)` at `Small` checks the range exactly as `Small(n)` written out does.
+private into_subtype(cx: &Analyzer, span: Span, target: Type, written: string,
+                     args: Buf[Expr]) -> TExpr
     if args.len() != 1 then
         return cx.err(span, s"a '$written' conversion takes exactly one value")
 
@@ -1184,7 +1197,7 @@ private constrained_call(cx: &Analyzer, span: Span, key: string, written: string
 
             TExpr(span, TConstrainedCheck(t, target))
         _ -> bad_expr(span)
-end constrained_call
+end into_subtype
 
 // A variant with what it carries.
 private variant_call(cx: &Analyzer, span: Span, en: Type, v: EnumVariant,

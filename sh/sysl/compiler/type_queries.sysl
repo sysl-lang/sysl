@@ -140,10 +140,69 @@ end variants_volatile
 
 // How a value of this type is *stored*: a named subtype that is only a name is its base, and a
 // qualifier is not part of the representation.
+//
+// **Below the top only a NAME is taken off**: a `*Size` agrees with a `*u64` where `Size` is a
+// measured `c type` of `u64`, and a `*Small` does not agree with a `*u64`, because a write through the
+// one is checked and a write through the other is not.
 repr(t: Type) -> Type = t match
     Constrained(d) -> if d.derived then t else repr(d.base)
     Volatile(inner) -> repr(*inner)
+    _ -> nameless(t)
+
+// Whether a named subtype is **only a name** -- not derived, and carrying no range and no predicate.
+// A measured `c type` is one, and so is an exported plain alias: both keep a name so a C header can
+// spell it, and are otherwise the type they stand for.
+name_only(d: &ConstrainedType) -> bool =
+    !d.derived && d.lo.is_none() && d.hi.is_none() && d.pred_fn.is_none()
+
+// A type with every name-only subtype in it replaced by its base, at any depth. **This is the
+// identity such a name has wherever types are checked** -- agreement (through `repr`) and the key an
+// instantiation is filed under -- so `Buf[Size]` and `Buf[u64]` are one instantiation and `*Size` is
+// a `*u64`. A named type is not entered: its arguments were made nameless when it was instantiated.
+nameless(t: Type) -> Type = if !holds_name_only(t) then t else stripped_names(t)
+
+// Whether there is anything for `nameless` to take off, so the common case allocates nothing.
+private holds_name_only(t: Type) -> bool = t match
+    Constrained(d) -> name_only(d)
+    Ptr(inner) -> holds_name_only(*inner)
+    Ref(inner, _) -> holds_name_only(*inner)
+    Weak(inner) -> holds_name_only(*inner)
+    Array(_, elem) -> holds_name_only(*elem)
+    Vector(_, elem) -> holds_name_only(*elem)
+    Slice(elem, _) -> holds_name_only(*elem)
+    Volatile(inner) -> holds_name_only(*inner)
+    CFn(ps, r) -> any_name_only(ps) || holds_name_only(*r)
+    Pack(es) -> any_name_only(es)
+    _ -> false
+
+private any_name_only(ts: Buf[Type]) -> bool
+    for i in 0..<ts.len()
+        if holds_name_only(ts.at(i)) then return true
+
+    false
+end any_name_only
+
+private stripped_names(t: Type) -> Type = t match
+    Constrained(d) -> if name_only(d) then nameless(d.base) else t
+    Ptr(inner) -> Ptr(nameless(*inner))
+    Ref(inner, sync) -> Ref(nameless(*inner), sync)
+    Weak(inner) -> Weak(nameless(*inner))
+    Array(n, elem) -> Array(n, nameless(*elem))
+    Vector(n, elem) -> Vector(n, nameless(*elem))
+    Slice(elem, ro) -> Slice(nameless(*elem), ro)
+    Volatile(inner) -> Volatile(nameless(*inner))
+    CFn(ps, r) -> CFn(nameless_all(ps), nameless(*r))
+    Pack(es) -> Pack(nameless_all(es))
     _ -> t
+
+nameless_all(ts: Buf[Type]) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for i in 0..<ts.len()
+        out.push(nameless(ts.at(i)))
+
+    out
+end nameless_all
 
 // The whole of the peeling: every named subtype and every qualifier taken off, whether or not the
 // subtype was a type of its own.

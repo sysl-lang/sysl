@@ -1,0 +1,978 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, parse_int_base}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `c type` -- the sysl type a C typedef turns out to be (`reference/ffi.md § A library may carry
+// C`), the reference's `CTypeTests`; with `CEnumWidthTests` (how wide a package's C makes an enum)
+// and `CNarrowScalarTests` (a scalar narrower than a register crossing to C and back, run).
+//
+// **Every assertion that says how wide something is reads that width from the C compiler as well**,
+// in the same probe, and asserts the two agree: a test saying `size_t` is `u64` against a literal
+// `u64` would be the transcription this feature exists to abolish. The oracle for a signedness is
+// C's own `((T)-1) < 0` and for a width C's own `sizeof(T)`.
+//
+// **Every string quoted here was read out of the reference compiler** (0.0.153) on the same input.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private cty_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end cty_ready
+
+private cty_refuses(said: string, part: string) =
+    assert(said.index_of(part).is_some(), s"expected '$part', got: $said")
+
+// Builds what `entry` names and runs it: what it printed, or why it did not.
+private cty_build_run(root: string, entry: string) -> string
+    val exe = s"$root/built"
+
+    build_native_program(entry, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end cty_build_run
+
+private cty_root_with(text: string) -> string
+    val root = make_temp_dir("sysl-ctype").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end cty_root_with
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private cty_ran(text: string) -> string
+    val root = cty_root_with(text)
+
+    cty_build_run(root, s"$root/main.sysl")
+
+// What the lowering answers for a tree: its LLVM text, or everything it had to say instead.
+private cty_lowered(where: string, target: Option[string]) -> (string, string) =
+    emit_llvm_text(where, target) match
+        Err(why) -> ("", failure_text(why))
+        Ok(made) -> if made.report.is_empty() then (made.text, "") else ("", analysis_report(made.report))
+
+// Everything one file has to say for itself, taken through the lowering.
+private cty_err(text: string) -> string
+    val root = cty_root_with(text)
+    val out = cty_lowered(s"$root/main.sysl", None).1
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cty_err
+
+// The LLVM text of one file on a machine, or a note saying why there is none.
+private cty_ir_for(text: string, target: Option[string]) -> string
+    val root = cty_root_with(text)
+    val out = cty_lowered(s"$root/main.sysl", target)
+
+    remove_dir_all(root).unwrap_or(())
+
+    if out.1 != "" then s"refused: ${out.1}" else out.0
+end cty_ir_for
+
+// A tree of the module `ticks` in a directory of its own beside the beginning.
+private cty_tree(module_text: string, main_text: string) -> string
+    val root = make_temp_dir("sysl-ctype").unwrap()
+
+    make_dir_all(s"$root/ticks").unwrap()
+    write_text(s"$root/ticks/ticks.sysl", module_text).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+    root
+end cty_tree
+
+// **What C says about a type, and what sysl made of it**: the width, the signedness, and the name of
+// the integer the typedef lowered to -- all three out of one probe, so that a case can assert they
+// agree instead of asserting a number. `dir` is where the probe file sits, for a header beside it.
+private cty_measured(c: string, header: Option[string], dir: Option[string], name: string) -> (int, bool, string)
+    val include = header match
+        Some(h) -> s"@include(\"$h\")\n"
+        None -> ""
+
+    val text = s"$include\nc const\n    WIDTH: usize = \"sizeof($c)\"\n" +
+               s"    SIGNED: i32 = \"((($c)-1) < 0)\"\n\nc type\n    $name = \"$c\"\n"
+
+    val file = dir match
+        Some(d) -> s"$d/probe.sysl"
+        None -> "probe.sysl"
+
+    val parsed = parse(source_of(file, text))
+
+    assert(parsed.ok(), s"the probe source did not parse: $text")
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val t = host_target()
+    val a = analysis_for(t)
+    val lowered = c_probe_lower(a, units, t)
+    var width = -1
+    var signed = false
+    var resolved = ""
+
+    for i in 0..<lowered.len()
+        val body = lowered.at(i).body
+
+        for j in 0..<body.len()
+            *body.at(j).kind match
+                ConstDecl(n, _, value, _) -> *value.kind match
+                    IntLit(digits, base, _) ->
+                        val v = parse_int_base(digits, base).unwrap_or(-1)
+
+                        if n == "WIDTH" then width = v
+                        if n == "SIGNED" then signed = v != 0
+                    _ -> ()
+                TypeDecl(d) -> if d.from_c && d.name == name then *d.base.kind match
+                    NamedType(b, _) -> resolved = b
+                    _ -> ()
+                _ -> ()
+
+    assert(width > 0, s"'$c' was not measured")
+    (width, signed, resolved)
+end cty_measured
+
+private cty_agrees(c: string, header: Option[string]) -> (string, string)
+    val m = cty_measured(c, header, None, "T")
+
+    (m.2, s"${if m.1 then "i" else "u"}${m.0 * 8}")
+
+// -- the block parses -----------------------------------------------------------------------------
+
+@test("as its types, each a name and a C type in quotes")
+cty_the_block_parses_as_its_types()
+    assert_eq(pf("c type\n    Tick = \"TickType_t\"\n    Stack = \"configSTACK_DEPTH_TYPE\"\n"),
+              "(ctype (Tick \"TickType_t\") (Stack \"configSTACK_DEPTH_TYPE\"))")
+
+// The modifier is written on the header and governs the lines under it, exactly as a `c const`
+// block's does -- it is the one place there is to write one.
+@test("and a visibility on the header reaches every type in it")
+cty_a_visibility_on_the_header_reaches_every_type()
+    assert_eq(pf("private c type\n    Tick = \"TickType_t\"\n"), "(ctype (private Tick \"TickType_t\"))")
+
+@test("a block with nothing under it is refused with the form")
+cty_an_empty_block_is_refused_with_the_form()
+    val parsed = parse(source_of("test.sysl", "c type\n"))
+
+    assert(!parsed.ok())
+    assert_eq(parsed.report.at(0).message,
+              "'c type' is followed by its types, indented under it, each a name and a C type name " +
+              "in quotes: 'Tick = \"TickType_t\"'")
+
+// -- the type is the one the C compiler describes -------------------------------------------------
+//
+// Measured twice over in one probe: what sysl resolved the typedef to, against what C says its width
+// and its signedness are.
+
+@test("'char' resolves to the integer C's own 'sizeof' and sign test describe")
+cty_char_resolves_to_what_c_describes()
+    if !cty_ready() then return
+
+    val got = cty_agrees("char", None)
+
+    assert_eq(got.0, got.1)
+    assert_eq(got.0, "i8")
+
+@test("'unsigned long' resolves to the integer C's own 'sizeof' and sign test describe")
+cty_unsigned_long_resolves_to_what_c_describes()
+    if !cty_ready() then return
+
+    val got = cty_agrees("unsigned long", None)
+
+    assert_eq(got.0, got.1)
+    assert_eq(got.0, "u64")
+
+@test("'short' resolves to the integer C's own 'sizeof' and sign test describe")
+cty_short_resolves_to_what_c_describes()
+    if !cty_ready() then return
+
+    val got = cty_agrees("short", None)
+
+    assert_eq(got.0, got.1)
+    assert_eq(got.0, "i16")
+
+@test("'long long' resolves to the integer C's own 'sizeof' and sign test describe")
+cty_long_long_resolves_to_what_c_describes()
+    if !cty_ready() then return
+
+    val got = cty_agrees("long long", None)
+
+    assert_eq(got.0, got.1)
+    assert_eq(got.0, "i64")
+
+@test("'size_t' resolves to the integer C's own 'sizeof' and sign test describe")
+cty_size_t_resolves_to_what_c_describes()
+    if !cty_ready() then return
+
+    val got = cty_agrees("size_t", Some("<stddef.h>"))
+
+    assert_eq(got.0, got.1)
+    assert_eq(got.0, "u64")
+
+@test("'int_least16_t' resolves to the integer C's own 'sizeof' and sign test describe")
+cty_int_least16_t_resolves_to_what_c_describes()
+    if !cty_ready() then return
+
+    val got = cty_agrees("int_least16_t", Some("<stdint.h>"))
+
+    assert_eq(got.0, got.1)
+    assert_eq(got.0, "i16")
+
+@test("'wchar_t' resolves to the integer C's own 'sizeof' and sign test describe")
+cty_wchar_t_resolves_to_what_c_describes()
+    if !cty_ready() then return
+
+    val got = cty_agrees("wchar_t", Some("<stddef.h>"))
+
+    assert_eq(got.0, got.1)
+    assert_eq(got.0, "i32")
+
+// -- a measured type is used as the integer it is -------------------------------------------------
+//
+// A typedef is a second name for one integer and nothing else, so a value flows both ways with no
+// cast -- which is what makes an `extern` written against one an ordinary declaration.
+
+@test("a signed one takes a negative value")
+cty_a_signed_one_takes_a_negative_value()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran("c type\n    S = \"signed char\"\n\nval x: S = -1\n\nprint(str(x))\n"), "-1\n")
+
+@test("and arithmetic on it needs no cast, because it is that integer")
+cty_arithmetic_on_it_needs_no_cast()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(raw"""
+        @include("<stddef.h>")
+
+        c type
+            Size = "size_t"
+
+        var total: Size = 0
+
+        for i in 0..<4
+            total += 2
+
+        print(str(total))
+        """), "8\n")
+
+// `Buf[Size]` beside `Buf[u64]` is one instantiation, and a `*Size` is a `*u64` -- where `size_t` is
+// 64 bits, which is every host this suite runs on.
+@test("and inside a generic's arguments and behind a pointer, it is still that integer")
+cty_inside_a_generic_and_behind_a_pointer()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(raw"""
+        @include("<stddef.h>")
+
+        import sysl.buf.{Buf, buf}
+
+        c type
+            Size = "size_t"
+
+        first(p: *Size) -> Size = p[0]
+
+        main()
+            var a: Buf[Size] = buf()
+            a.push(1)
+            var b: Buf[u64] = buf()
+            b.push(2)
+            val p: *Size = &b.elems[0]
+            val q: *u64 = &a.elems[0]
+            print(first(p) + a.at(0), first(q) + b.at(0))
+        """), "3 3\n")
+
+// **The same claim at every depth the type can be written at** -- an array, a slice, a value moved
+// between two spellings of one instantiation, an `Option` -- each quoted from the reference's run.
+@test("a measured type is its integer inside an array, a slice, a Buf and an Option")
+cty_a_measured_type_is_its_integer_at_every_depth()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(raw"""
+        @include("<stddef.h>")
+
+        c type
+            Size = "size_t"
+
+        main()
+            var b: [1]u64 = [2]
+            val p: *Size = &b[0]
+            val q: *u64 = p
+            var x: [1]Size = [3]
+            val y: [1]u64 = x
+            val s: []Size = x[..]
+            val t: []u64 = s
+            print(q[0], y[0], t[0])
+        """), "2 3 3\n")
+
+    assert_eq(cty_ran(raw"""
+        @include("<stddef.h>")
+
+        import sysl.buf.{Buf, buf}
+
+        c type
+            Size = "size_t"
+
+        main()
+            var a: Buf[Size] = buf()
+            a.push(1)
+            val b: Buf[u64] = a
+            val o: Option[Size] = Some(3)
+            val o2: Option[u64] = o
+            print(b.at(0), o2.unwrap())
+        """), "1 3\n")
+end cty_a_measured_type_is_its_integer_at_every_depth
+
+// **Only a NAME is taken off below the top.** A ranged subtype checks what is written through it, so
+// a pointer to one is not a pointer to its base; and a different integer is still a different one,
+// the instantiation named by the integer the `c type` turned out to be.
+@test("a ranged subtype behind a pointer is still its own, and another integer is still refused")
+cty_only_a_name_is_taken_off_below_the_top()
+    if !cty_ready() then return
+
+    cty_refuses(cty_err("type Small = u64 within 0..10\n\nfirst(p: *Small) -> Small = p[0]\n\nmain()\n" +
+                        "    var b: [1]u64 = [2]\n    val p: *Small = &b[0]\n    print(first(p))\n"),
+                "cannot initialize 'p': declared *Small but the value is *ulong")
+
+    val said = cty_err(raw"""
+        @include("<stddef.h>")
+
+        import sysl.buf.{Buf, buf}
+
+        c type
+            Size = "size_t"
+
+        main()
+            var a: Buf[Size] = buf()
+            val b: Buf[u32] = a
+            val p: *Size = null
+            val q: *u32 = p
+            print(1)
+        """)
+
+    cty_refuses(said, "cannot initialize 'b': declared sysl.buf.Buf[uint] but the value is sysl.buf.Buf[ulong]")
+    cty_refuses(said, "cannot initialize 'q': declared *uint but the value is *Size")
+end cty_only_a_name_is_taken_off_below_the_top
+
+// The width reaches a signature, where getting it wrong is not a size mismatch anything can see.
+@test("and it may be a parameter of an extern, which is what it exists for")
+cty_it_may_be_a_parameter_of_an_extern()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(raw"""
+        @include("<string.h>")
+
+        c const
+            W: usize = "sizeof(size_t)"
+
+        c type
+            Size = "size_t"
+
+        @assert(sizeof(Size) == W, "a 'c type' must be as wide as C says the typedef is")
+
+        extern "strlen" c_strlen(s: *u8) -> Size
+
+        print(str(sizeof(Size) == W))
+        """), "true\n")
+
+// A `c type` is the one transparent subtype carrying no `within` range at all, so asking its maximum
+// asks about the integer it turned out to be.
+@test("and its maximum is the maximum of the integer C said it is")
+cty_its_maximum_is_the_measured_integers()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(raw"""
+        @include("<stddef.h>")
+
+        c const
+            W: usize = "sizeof(size_t)"
+
+        c type
+            Size = "size_t"
+
+        print(str(u128(Size::Max) == (1u128 << u128(W * 8)) - 1), str(Size::Min == 0))
+        """), "true true\n")
+
+@test("and a generic solved from it answers the same bound")
+cty_a_generic_solved_from_it_answers_the_same_bound()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(raw"""
+        @include("<stddef.h>")
+
+        c const
+            W: usize = "sizeof(size_t)"
+
+        c type
+            Size = "size_t"
+
+        widest[T]() -> T = T::Max
+
+        val m: Size = widest()
+
+        print(str(u128(m) == (1u128 << u128(W * 8)) - 1))
+        """), "true\n")
+
+// The header spells the integer rather than the C name it came from: the typedef was measured for
+// THIS target, and re-spelling it would hand the consumer a name whose width their own headers
+// decide again.
+@test("and an exported function spells it in its header as the integer it is")
+cty_an_export_spells_it_as_the_integer()
+    if !cty_ready() then return
+
+    val m = cty_measured("size_t", Some("<stddef.h>"), None, "T")
+    val root = make_temp_dir("sysl-ctype").unwrap()
+
+    make_dir_all(s"$root/demo").unwrap()
+    write_text(s"$root/demo/demo.sysl",
+               "module demo\n@include(\"<stddef.h>\")\n\nc type\n    Size = \"size_t\"\n\n" +
+               "@export\ntake(n: Size) -> Size = n\n").unwrap()
+
+    val said = c_header_of(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(text) -> text
+
+    remove_dir_all(root).unwrap_or(())
+
+    cty_refuses(said, s"${if m.1 then "" else "u"}int${m.0 * 8}_t take(")
+    cty_refuses(said, "uint64_t take(uint64_t n);")
+end cty_an_export_spells_it_as_the_integer
+
+// A value computed in sysl reaches the type through the type's own name, the only spelling that can
+// be portable: `u64(n)` would be this machine's answer written into the program.
+@test("and a value computed in sysl converts into it under its own name")
+cty_a_computed_value_converts_under_its_own_name()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(raw"""
+        @include("<stddef.h>")
+
+        c type
+            Size = "size_t"
+
+        take(n: Size) -> Size = n
+
+        var xs: [3]u32 = [0, 0, 0]
+
+        print(str(take(Size(xs.len)) + Size(sizeof(u32))))
+        """), "7\n")
+
+// The conversion is WRITTEN: a `usize` sliding into one unannounced would be a narrowing that is
+// silent here and lossy under a 16-bit typedef.
+@test("while an unwritten one is still refused")
+cty_an_unwritten_conversion_is_refused()
+    if !cty_ready() then return
+
+    val said = cty_err(raw"""
+        @include("<stddef.h>")
+
+        c type
+            Size = "size_t"
+
+        take(n: Size) -> Size = n
+
+        var n: usize = 3
+
+        print(str(take(n)))
+        """)
+
+    cty_refuses(said, "'n' of 'take' is Size, but usize was given")
+
+// `_Bool` is the one answer that is not an integer and is still resolved, because sysl's `bool` is
+// what C means by it.
+@test("and a C '_Bool' arrives as sysl's 'bool'")
+cty_a_c_bool_arrives_as_bool()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran("c type\n    Flag = \"_Bool\"\n\nval yes: Flag = true\n\nprint(str(yes))\n"), "true\n")
+
+// -- the answer is the target's rather than the host's --------------------------------------------
+//
+// Nothing runs, so nothing here could have been right by accident: `long` is eight bytes on this
+// machine and four on the 32-bit ones, and the array the type sizes says which the compiler believed.
+
+private cty_long_array() -> string = "c type\n    Long = \"long\"\n\nvar xs: [1]Long = [0]\n\nprint(str(xs.len))\n"
+
+@test("aarch64-macos lays the array out as i64")
+cty_aarch64_macos_lays_the_array_out_as_i64()
+    if !cty_ready() then return
+
+    cty_refuses(cty_ir_for(cty_long_array(), Some("aarch64-macos")), "%xs.addr = alloca [1 x i64]")
+
+@test("thumbv7em-freestanding lays the array out as i32")
+cty_thumbv7em_lays_the_array_out_as_i32()
+    if !cty_ready() then return
+
+    val t = target_named("thumbv7em-freestanding").unwrap()
+
+    if find_clang(t, None).is_err()
+        print("skipped: no clang here has a back end for thumbv7em-freestanding")
+        return
+    end if
+
+    cty_refuses(cty_ir_for(cty_long_array(), Some("thumbv7em-freestanding")),
+                "%xs.addr = alloca [1 x i32]")
+end cty_thumbv7em_lays_the_array_out_as_i32
+
+// -- a typedef out of a header beside the module ---------------------------------------------------
+
+// An enum is the shape whose signedness nobody can predict -- C leaves it to the implementation,
+// which is the reason to ask.
+@test("including an enum, whose signedness is the C compiler's choice")
+cty_an_enum_typedef_beside_the_module()
+    if !cty_ready() then return
+
+    val dir = make_temp_dir("sysl-ctype-pkg").unwrap()
+
+    make_dir_all(dir).unwrap()
+    write_text(s"$dir/levels.h", "typedef enum { LOW, HIGH } level_t;\n" +
+                                 "typedef enum { COLD = -1, HOT = 1 } trend_t;\n").unwrap()
+
+    val level = cty_measured("level_t", Some("levels.h"), Some(dir), "Level")
+    val trend = cty_measured("trend_t", Some("levels.h"), Some(dir), "Trend")
+
+    remove_dir_all(dir).unwrap_or(())
+
+    assert_eq(level.2, s"${if level.1 then "i" else "u"}${level.0 * 8}")
+    assert_eq(trend.2, s"${if trend.1 then "i" else "u"}${trend.0 * 8}")
+
+    // What the reference's own run of the same header printed for the two.
+    assert_eq(level.2, "u32")
+    assert_eq(trend.2, "i32")
+end cty_an_enum_typedef_beside_the_module
+
+// One file, one probe -- a `c const` block and a `c type` block are one question put to the C
+// compiler; what is asserted is that both answers come back from the file that wrote them.
+@test("a file writing both blocks is measured once")
+cty_a_file_writing_both_blocks()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(raw"""
+        @include("<limits.h>")
+
+        c const
+            BITS: u32 = "CHAR_BIT"
+
+        c type
+            Small = "short"
+
+        val x: Small = 3
+
+        print(str(BITS) + " " + str(x))
+        """), "8 3\n")
+
+// -- the edges ------------------------------------------------------------------------------------
+
+// Two blocks are consumed in order rather than looked up by name, so a bug here hands one line
+// another line's answer, which compiles and is wrong. The two widths differ so a swap is visible.
+@test("two blocks in one file each keep their own answer")
+cty_two_blocks_keep_their_own_answers()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran("c type\n    Wide = \"long long\"\n\nc type\n    Narrow = \"signed char\"\n\n" +
+                      "print(str(sizeof(Wide) > sizeof(Narrow)))\n"), "true\n")
+
+@test("a 'c type' before a 'c const' is measured as readily as one after it")
+cty_a_c_type_before_a_c_const()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(raw"""
+        @include("<limits.h>")
+
+        c type
+            Small = "short"
+
+        c const
+            BITS: u32 = "CHAR_BIT"
+
+        val x: Small = 3
+
+        print(str(BITS) + " " + str(x))
+        """), "8 3\n")
+
+private cty_ticks() -> string = "module ticks\n@include(\"<stddef.h>\")\n\nc type\n    Size = \"size_t\"\n"
+
+// A module is written across files, and a binding puts its typedefs in one of them; a type that
+// existed only in the file that measured it would make the block useless for that arrangement.
+@test("a type measured in one file of a module is a type in the next file, by the qualified path")
+cty_a_measured_type_by_the_qualified_path()
+    if !cty_ready() then return
+
+    val root = cty_tree(cty_ticks(), "val n: ticks.Size = 41\n\nprint(str(n + 1))\n")
+
+    assert_eq(cty_build_run(root, root), "42\n")
+
+@test("a type measured in one file of a module is a type in the next file, and by an import")
+cty_a_measured_type_by_an_import()
+    if !cty_ready() then return
+
+    val root = cty_tree(cty_ticks(), "import ticks.Size\n\nval n: Size = 41\n\nprint(str(n + 1))\n")
+
+    assert_eq(cty_build_run(root, root), "42\n")
+
+// The visibility written on the header is the ordinary one, enforced where every other declaration's
+// is -- the block does not invent a rule of its own.
+@test("a 'private' one does not leave its file")
+cty_a_private_one_does_not_leave_its_file()
+    if !cty_ready() then return
+
+    val root = cty_tree("module ticks\n@include(\"<stddef.h>\")\n\nprivate c type\n    Size = \"size_t\"\n",
+                        "val n: ticks.Size = 1\n\nprint(str(n))\n")
+    val said = cty_lowered(root, None).1
+
+    remove_dir_all(root).unwrap_or(())
+
+    cty_refuses(said, "is private to")
+    cty_refuses(said, "ticks.sysl', the file that declares it")
+end cty_a_private_one_does_not_leave_its_file
+
+// A measured type shares the type namespace, which makes a collision with a struct the duplicate it
+// is. **The reference's own input carries no `<stddef.h>`**, so there it is refused by C before the
+// collision is reached; the second half supplies the header and asserts the duplicate itself.
+@test("a name a struct already has is refused")
+cty_a_name_a_struct_has_is_refused()
+    if !cty_ready() then return
+
+    val said = cty_err("struct Size\n    n: usize\n\nc type\n    Size = \"size_t\"\n\nprint(1)\n")
+
+    assert(said != "", "the program compiled")
+    cty_refuses(said, "the C compiler refused this file's 'c type' block:")
+
+    val dup = cty_err("@include(\"<stddef.h>\")\n\nstruct Size\n    n: usize\n\n" +
+                      "c type\n    Size = \"size_t\"\n\nprint(1)\n")
+
+    cty_refuses(dup, "type 'Size' is already declared")
+end cty_a_name_a_struct_has_is_refused
+
+// -- a library ships the measured type rather than the C name --------------------------------------
+//
+// The reference writes a library's source into its `.syslib` and reads it back; this compiler's
+// artifact carries no tree (CLAUDE.md § Not built). What the artifact case rests on is the lowering
+// -- a measured type becomes an ordinary type declaration naming a sysl integer, which is all a codec
+// would ever have to carry -- and that is asserted here directly.
+@test("the artifact carries a type declaration naming a sysl integer")
+cty_the_artifact_carries_a_sysl_integer()
+    if !cty_ready() then return
+
+    val parsed = parse(source_of("demo/lib.sysl", "module demo\n@include(\"<stddef.h>\")\n\n" +
+                                                  "c type\n    Size = \"size_t\"\n\nzero() -> Size = 0\n"))
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val t = host_target()
+    val lowered = c_probe_lower(analysis_for(t), units, t)
+    var bases: Buf[string] = buf()
+
+    for i in 0..<lowered.len()
+        val body = lowered.at(i).body
+
+        for j in 0..<body.len()
+            *body.at(j).kind match
+                TypeDecl(d) -> if d.from_c && d.name == "Size" then *d.base.kind match
+                    NamedType(b, _) -> bases.push(b)
+                    _ -> ()
+                _ -> ()
+
+    assert_eq(bases.len(), 1)
+    assert(bases.at(0).starts_with("u"), bases.at(0))
+end cty_the_artifact_carries_a_sysl_integer
+
+// -- what it refuses ------------------------------------------------------------------------------
+//
+// A pointer, a float, a struct and an array all reach `_Generic`'s `default` arm, which is what makes
+// the refusal a sysl diagnostic naming the type rather than a C error naming a file nobody wrote.
+
+private cty_not_an_integer(c: string) -> string =
+    s"the C compiler says '$c' is not an integer type, and a 'c type' names an integer — what comes " +
+    "back from one is a width and a signedness, which a float, a pointer, a struct or an array has " +
+    "not got. An address is written '*T', a float by name, and a struct arrives as an 'opaque struct'"
+
+@test("'double', which is not an integer and has an answer of its own in sysl")
+cty_double_is_not_an_integer()
+    if !cty_ready() then return
+
+    cty_refuses(cty_err("c type\n    T = \"double\"\n\nprint(1)\n"), cty_not_an_integer("double"))
+
+@test("'void *', which is not an integer and has an answer of its own in sysl")
+cty_a_pointer_is_not_an_integer()
+    if !cty_ready() then return
+
+    cty_refuses(cty_err("c type\n    T = \"void *\"\n\nprint(1)\n"), cty_not_an_integer("void *"))
+
+@test("'struct { int a; }', which is not an integer and has an answer of its own in sysl")
+cty_a_struct_is_not_an_integer()
+    if !cty_ready() then return
+
+    cty_refuses(cty_err("c type\n    T = \"struct { int a; }\"\n\nprint(1)\n"),
+                cty_not_an_integer("struct { int a; }"))
+
+@test("a C type that does not exist, in the C compiler's own words")
+cty_a_c_type_that_does_not_exist()
+    if !cty_ready() then return
+
+    val said = cty_err("c type\n    T = \"no_such_type_at_all_t\"\n\nprint(1)\n")
+
+    cty_refuses(said, "the C compiler refused this file's 'c type' block:")
+    cty_refuses(said, "error: unknown type name 'no_such_type_at_all_t'")
+
+@test("a header that is not there")
+cty_a_header_that_is_not_there()
+    if !cty_ready() then return
+
+    val said = cty_err("@include(\"no_such_header_at_all.h\")\n\nc type\n    T = \"int\"\n\nprint(1)\n")
+
+    cty_refuses(said, "the C compiler refused this file's 'c type' block:")
+    cty_refuses(said, "fatal error: 'no_such_header_at_all.h' file not found")
+
+@test("an unsigned type still refuses a negative value, since it is that integer")
+cty_an_unsigned_type_refuses_a_negative_value()
+    if !cty_ready() then return
+
+    cty_refuses(cty_err("c type\n    U = \"unsigned char\"\n\nval x: U = -1\n\nprint(str(x))\n"),
+                "the literal -1 does not fit byte")
+
+@test("a block inside a body, which has no file's headers to be compiled against")
+cty_a_block_inside_a_body()
+    if !cty_ready() then return
+
+    cty_refuses(cty_err("f() -> int\n    c type\n        T = \"int\"\n    1\n\nprint(str(f()))\n"),
+                "a 'c type' block is declared at the top level of a file — the C in it is compiled " +
+                "against that file's '@include' headers, and what it declares is a type, which is a " +
+                "module member rather than something a body can hold")
+
+@test("and a name declared twice is refused as the duplicate it is")
+cty_a_name_declared_twice()
+    if !cty_ready() then return
+
+    cty_refuses(cty_err("c type\n    T = \"int\"\n\nc type\n    T = \"long\"\n\nprint(1)\n"),
+                "type 'T' is already declared")
+
+// The duplicate's words are the reference's for every kind of type declaration: "type" for all of
+// them but a trait, which says "the name".
+@test("a second declaration of a type name is told in the reference's words, whatever it declares")
+cty_a_duplicate_type_name_in_the_references_words()
+    if !cty_ready() then return
+
+    cty_refuses(cty_err("struct T\n    n: int\n\ntype T = u32\n\nprint(1)\n"), "error: type 'T' is already declared")
+    cty_refuses(cty_err("type T = u32\n\ntype T = u32 within 0..3\n\nprint(1)\n"),
+                "error: type 'T' is already declared")
+    cty_refuses(cty_err("struct T\n    n: int\n\ntrait T\n    f(self) -> int\n\nprint(1)\n"),
+                "error: the name 'T' is already declared")
+end cty_a_duplicate_type_name_in_the_references_words
+
+// `c type` declares a scalar whose width the C compiler answered for, and `type` with no constraint
+// declares no type at all: spelled almost identically, they mean different things.
+@test("while a hand-written alias with no constraint is now a transparent alias")
+cty_a_hand_written_alias_is_transparent()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran("type Tick = u32\n\nval x: Tick = 3\n\nprint(str(x))\n"), "3\n")
+
+// A compilation with no block never asks for a clang; this is that claim for the `c type` half,
+// asserted the reference's way -- the units come back as they went in.
+@test("a file with neither block leaves its units untouched")
+cty_a_file_with_neither_block_is_untouched()
+    val parsed = parse(source_of("test.sysl", "print(1)\n"))
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val before = show_stmts(parsed.program.body)
+    val t = host_target()
+    val a = analysis_for(t)
+    val lowered = c_probe_lower(a, units, t)
+
+    assert_eq(lowered.len(), 1)
+    assert_eq(show_stmts(lowered.at(0).body), before)
+    assert(a.found.is_empty())
+end cty_a_file_with_neither_block_is_untouched
+
+// -- CEnumWidthTests: how wide a package's C makes an enum ----------------------------------------
+//
+// **A `_Static_assert` is the whole apparatus**: an object file records the field sizes it produced
+// and not the rule it produced them by, so the size is asserted inside the translation unit while
+// the compiler still has the answer. **Each case is a pair** -- the width the target does NOT use is
+// asserted to be refused, since a probe that would have compiled either way proves nothing.
+
+private cty_enum_compiles(target_name: string, width: int) -> Option[bool]
+    val t = target_named(target_name).unwrap()
+
+    val cc = find_clang(t, None) match
+        Err(_) -> return None
+        Ok(found) -> found
+
+    val root = make_temp_dir("sysl-enum").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/probe.c", s"enum E { A = 1 };\n" +
+               s"_Static_assert(sizeof(enum E) == $width, \"the enum is not this wide\");\n" +
+               "int use(void) { return A; }\n").unwrap()
+
+    val done = compile_c(cc, s"$root/probe.c", s"$root/probe.o", t, "1", no_probe())
+
+    remove_dir_all(root).unwrap_or(())
+    Some(done.is_ok())
+end cty_enum_compiles
+
+private cty_enum_width(target_name: string, width: int, expected: bool)
+    cty_enum_compiles(target_name, width) match
+        None -> print(s"skipped: no clang for $target_name")
+        Some(ok) -> assert_eq(ok, expected)
+
+// AAPCS says an enumerated type is the smallest containing type, and GNU's `arm-none-eabi` defaults
+// to `-fshort-enums`; clang on the same triple defaults the other way.
+@test("AAPCS asks bare-metal ARM for the smallest type that holds the values")
+cty_aapcs_asks_for_the_smallest_type()
+    cty_enum_width("thumb-freestanding-softfp", 1, true)
+
+@test("and its hard-float sibling agrees, the width being no business of the float convention")
+cty_the_hard_float_sibling_agrees()
+    cty_enum_width("thumb-freestanding", 1, true)
+
+@test("the same source asserting four bytes is refused there, which is what makes those tests tests")
+cty_four_bytes_is_refused_on_bare_arm()
+    cty_enum_width("thumb-freestanding-softfp", 4, false)
+
+// Everywhere else an `int` is what the platform's own compilers produce.
+@test("everywhere else an enum is an int")
+cty_everywhere_else_an_enum_is_an_int()
+    cty_enum_width(host_target().name, 4, true)
+
+@test("and asserting one byte there is refused")
+cty_one_byte_is_refused_on_the_host()
+    cty_enum_width(host_target().name, 1, false)
+
+// -- CNarrowScalarTests: a narrow scalar crossing to C and back, run ------------------------------
+//
+// A program that really calls a C function really compiled beside it, so that the agreement with
+// clang is about behaviour and not only about two `declare` lines matching. `999` is the C saying it
+// saw something other than what was meant.
+
+// A project whose module carries the C it calls, and a `main.sysl` that prints the result.
+private cty_ran_project(sysl_text: string, c_text: string) -> string
+    val root = make_temp_dir("sysl-narrow").unwrap()
+
+    make_dir_all(s"$root/p").unwrap()
+    write_text(s"$root/main.sysl", "print(p.check())\n").unwrap()
+    write_text(s"$root/p/p.sysl", s"module p\n\n$sysl_text").unwrap()
+    write_text(s"$root/p/probe.c", c_text).unwrap()
+
+    cty_build_run(root, root)
+end cty_ran_project
+
+// The reported case, in its reported shape: a `u8` from a six-arm `match`, in a function that also
+// takes a slice it never reads, reaching a C function that tests it against zero. clang, promised a
+// widened argument, compares the whole register rather than masking it first.
+@test("even from a match whose arms partly coincide with the discriminants")
+cty_a_u8_from_a_match_arrives_as_written()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran_project(raw"""
+        extern "probe_a" probe_a(d: *u8, lk: int, ln: i64, lp: *u8, ll: usize, req: u8, out: *i64) -> int
+
+        enum Six
+            A
+            B
+            C
+            D
+            E
+            F
+
+        call(lb: []const u8, t: Six) -> int
+            var v: i64 = 0
+            val req: u8 = t match
+                A -> 0
+                B -> 1
+                C -> 2
+                D -> 3
+                E -> 4
+                F -> 0
+
+            probe_a(null, 0, 0, null, 0, req, &v)
+        end call
+
+        check() -> int = call([], Six.A)
+        """, raw"""
+        #include <stdint.h>
+        #include <stddef.h>
+
+        int probe_a(unsigned char *d, int lk, int64_t ln, const uint8_t *lp, size_t ll,
+                    uint8_t req, int64_t *out) {
+            *out = 1;
+            return req == 0 ? 0 : 999;
+        }
+        """), "0\n")
+
+// Top bits dirty by construction rather than by whatever was left in the register.
+@test("and from a value narrowed out of a wider one")
+cty_a_u8_narrowed_from_a_wider_one()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran_project(raw"""
+        extern "probe_low" probe_low(v: u8) -> int
+
+        check() -> int
+            val wide: u32 = 0xABCD0007
+            probe_low(u8(wide))
+        end check
+        """, "#include <stdint.h>\n\nint probe_low(uint8_t v) { return v == 7 ? 0 : 999; }\n"), "0\n")
+
+// Widening a RESULT is the callee's, so a sysl function C calls owes it. A `bool` matters most: `i1`
+// is one bit in a register whose other bits are undefined, and a C caller reading `_Bool` was
+// promised they are zero.
+@test("an exported function returning a bool")
+cty_an_export_returning_a_bool()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran_project("@export(\"probe_yes\")\nyes() -> bool = true\n\n" +
+                              "extern \"probe_ask\" ask() -> int\n\ncheck() -> int = ask()\n",
+                              "#include <stdbool.h>\n\nbool probe_yes(void);\n\n" +
+                              "int probe_ask(void) { return probe_yes() ? 0 : 999; }\n"), "0\n")
+
+@test("an exported function returning a u8")
+cty_an_export_returning_a_u8()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran_project("@export(\"probe_byte\")\nbyte() -> u8 = 7\n\n" +
+                              "extern \"probe_ask\" ask() -> int\n\ncheck() -> int = ask()\n",
+                              "#include <stdint.h>\n\nuint8_t probe_byte(void);\n\n" +
+                              "int probe_ask(void) { return probe_byte() == 7 ? 0 : 999; }\n"), "0\n")
+
+// A callback, the shape a C library actually reaches back through: nothing marks the function as
+// exported, so a rule written in terms of `@export` alone would have missed it.
+@test("a sysl function whose address C was handed")
+cty_a_sysl_function_whose_address_c_was_handed()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran_project("extern \"probe_call\" probe_call(f: *extern(u8) -> bool) -> int\n\n" +
+                              "odd(v: u8) -> bool = v % 2 == 1\n\ncheck() -> int = probe_call(&odd)\n",
+                              "#include <stdint.h>\n#include <stdbool.h>\n\n" +
+                              "int probe_call(bool (*f)(uint8_t)) { return f(7) && !f(8) ? 0 : 999; }\n"),
+              "0\n")
