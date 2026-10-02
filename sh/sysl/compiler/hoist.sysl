@@ -689,6 +689,7 @@ private hoist_extern(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
     if d.link.is_some() then check_foreign_symbol(a, scope, span, d.link.unwrap(), true)
 
     check_signature_rules(a, scope, span, d.name, d.params, d.ret_type, d.variadic, true)
+    check_never_params(a, scope, buf(), d.params)
 end hoist_extern
 
 // The symbol an `extern` resolves to has to be one a linker can: letters, digits, `_`, `.` and `$`,
@@ -733,6 +734,20 @@ private check_signature_rules(a: &Analysis, scope: Scope, span: Span, name: stri
 
     check_va_list_positions(a, scope, name, params, ret, foreign)
 end check_signature_rules
+
+// A parameter written as `never` is refused at the declaration (`reference/types.md § unit and
+// never`): no argument could ever arrive in it, so the function could never be called. Asked of the
+// signature as written, since a parameter's type is resolved at each call and a function nothing
+// calls would never hear it. A type parameter of that spelling is an ordinary parameter.
+check_never_params(a: &Analysis, scope: Scope, tparams: Buf[string], params: Buf[Param])
+    var bound = no_bindings()
+
+    for i in 0..<tparams.len()
+        bound.push(Binding(tparams.at(i), Abstract(tparams.at(i), buf())))
+
+    for i in 0..<params.len()
+        if never_written(params.at(i).typ, bound) then a.fault(scope, params.at(i).typ.span, never_refusal())
+end check_never_params
 
 // A name spread as a pack has to have been DECLARED as one, and a pack may only be written as the
 // whole of a tuple (`reference/generics.md § A parameter may stand for a list of types`) -- asked
@@ -1004,6 +1019,7 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
     a.tables.funcs.put(key, Func(d, span, scope))
     record_access(a, scope, span, key, d.vis)
     check_signature_rules(a, scope, span, d.name, d.params, d.ret_type, d.variadic, false)
+    check_never_params(a, scope, d.tparams, d.params)
     check_pack_spellings(a, scope, span, d.tparams, d.tpacks, d.tvalues, d.params, d.ret_type)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)

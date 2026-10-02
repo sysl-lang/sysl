@@ -1260,6 +1260,12 @@ refused_field(cx: &Analyzer, span: Span, shown: string, fields: Buf[(string, Typ
             return Some(cx.err(given.at(i).span, s"'${fields.at(i).0}' of '$shown' is " +
                                s"${type_show(fields.at(i).1)}, but ${type_show(got)} was given"))
 
+        // A field is held to what a parameter is: one inferred from a diverging argument would be
+        // a slot of a type that has no values.
+        if fields.at(i).1 == Never then
+            return Some(cx.err(given.at(i).span, s"cannot pass an expression that never returns as " +
+                               s"'${fields.at(i).0}' of '$shown'"))
+
     None
 end refused_field
 
@@ -1988,7 +1994,7 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
     // so each argument is analyzed at whatever type it has and passed as C's promotions leave it.
     if f.decl.variadic
         for i in slots.len()..<args.len()
-            ts.push(variadic_extra(cx, args.at(i)))
+            ts.push(variadic_extra(cx, args.at(i), false))
 
     // **`@crossing` says a parameter hands what it is given to another domain**, so the rule about
     // what may cross is asked at the CALL: the argument is the thing that could have been written
@@ -2039,6 +2045,17 @@ refused_argument(cx: &Analyzer, span: Span, shown: string, params: Buf[Param],
                 if disagree(got, wants.at(i)) then
                     return Some(cx.err(e.span, s"'${params.at(i).name}' of $shown is " +
                                        s"${type_show(wants.at(i))}, but ${type_show(got)} was given"))
+
+                // **`never` cannot be a parameter, and inference is the one place it could become
+                // one**: a generic parameter takes whatever its argument is, and an expression that
+                // never arrives is the one thing a slot must not be concluded from. A written
+                // parameter is untouched -- the call is dead code, and the slot still has a layout.
+                if wants.at(i) == Never
+                    if !report then return Some(cx.err(e.span, "argument disagrees"))
+
+                    return Some(cx.err(e.span, s"cannot pass an expression that never returns as " +
+                                       s"'${params.at(i).name}' of $shown"))
+                end if
             None -> ()
 
     None
@@ -2377,7 +2394,7 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
             ts.set(i, TExpr(slots.at(i).unwrap().span, TVaPass(ts.at(i))))
 
     for i in slots.len()..<args.len()
-        ts.push(variadic_extra(cx, args.at(i)))
+        ts.push(variadic_extra(cx, args.at(i), true))
 
     val ret = declared_result(cx, scope, d.ret_type)
 
@@ -2390,7 +2407,14 @@ end extern_call
 // the widening happens here, in the tree: an integer narrower than 32 bits becomes a 32-bit one of
 // its own signedness, and every floating width narrower than `real` becomes a `real`, both
 // sixteen-bit formats included.
-variadic_extra(cx: &Analyzer, a: Expr) -> TExpr
+//
+// **What else may ride the tail is what C can read back from one**: a char, a raw pointer and a C
+// function's address travel as the register they are. An aggregate crosses to a FOREIGN callee,
+// under the classification a declared parameter of its type gets, and not to a sysl one, whose
+// walk over the tail reads one register at a time. Everything else -- a `bool`, a `unit` that
+// would pass nothing and shift every argument behind it, a `never`, a counted reference -- is
+// refused (`reference/ffi.md § Variadic functions`).
+variadic_extra(cx: &Analyzer, a: Expr, foreign: bool) -> TExpr
     val t = type_expr_bare(cx, a)
     val ty = texpr_type(t)
 
@@ -2398,7 +2422,22 @@ variadic_extra(cx: &Analyzer, a: Expr) -> TExpr
         Integer(bits, signed, _) ->
             if bits < 32 then TExpr(a.span, TCast(t, Integer(32, signed, false))) else t
         Floating(bits, _) -> if bits < 64 then TExpr(a.span, TCast(t, real_type())) else t
-        _ -> t
+        Char -> t
+        Ptr(_) -> t
+        CFn(_, _) -> t
+        Unknown -> t
+        Abstract(_, _) -> t
+        other ->
+            if c_aggregate(cx.an.tables.layout, other)
+                if foreign then return t
+
+                return cx.err(t.span, s"a ${type_show(other)} cannot be passed to a sysl function's '...' " +
+                              "— a walk over the tail reads back one register at a time and an aggregate " +
+                              "is not one, where a foreign callee takes it because C says which " +
+                              "registers it arrives in")
+
+            cx.err(t.span, s"a ${type_show(other)} cannot be passed to '...' — a variadic argument " +
+                   "must be an integer, a float, a char, a raw pointer, or the address of a function")
 end variadic_extra
 
 // The file an `extern` was written in, which is where the types in its signature mean what they

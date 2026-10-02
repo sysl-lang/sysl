@@ -49,9 +49,11 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     NamedType(name, args) -> resolve_named(a, scope, t.span, name, args, subst, "")
     // **A hop is what makes a cycle finite**, so the four forms that point rather than hold are
     // counted -- and the count is what a type reached again is judged against.
-    PtrType(inner) -> resolve_ptr(a, scope, inner, subst)
+    PtrType(inner) -> resolve_ptr(a, scope, t.span, inner, subst)
     RefType(inner, sync) -> resolve_ref(a, scope, t.span, inner, sync, subst)
-    WeakType(inner) -> Weak(under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "weak")))
+    WeakType(inner) ->
+        Weak(addressable(a, scope, t.span,
+                         under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "weak")), "'weak'"))
     // Everywhere but a field, an element and a pointee, what is being named is a **value** -- what a
     // binding holds, what a parameter receives, what a call hands back -- and a value read out of a
     // volatile place is an ordinary value, so there is nothing left for the qualifier to say.
@@ -104,10 +106,43 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
 // registers, reached through an address the program was handed.
 resolve_qualified(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Type = *t.kind match
     VolatileType(inner) ->
-        val ty = resolve_type(a, scope, inner, subst)
+        val ty = value_type(a, scope, inner, subst)
 
         if volatile_admits(a, scope, t.span, ty) then Volatile(ty) else Unknown
-    _ -> resolve_type(a, scope, t, subst)
+    _ -> value_type(a, scope, t, subst)
+
+// A type written where a VALUE of it is held -- a field, an element, a pointee, a type argument, a
+// part of a tuple. **`never` is refused in every one of them**: it is the type of an expression
+// that does not finish, so it has no values at all and a slot of it could never be given one. It
+// stands only as a result -- a function's, a member's, an `extern`'s, a C function pointer's --
+// which those positions read for themselves (`reference/types.md § unit and never`). A type
+// parameter of that spelling is a parameter like any other.
+value_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Type
+    if !never_written(t, subst) then return resolve_type(a, scope, t, subst)
+
+    refuse_never(a, scope, t.span)
+end value_type
+
+// Whether a written type is the bare `never`, rather than a parameter that happens to be named so.
+never_written(t: TypeRef, subst: Buf[Binding]) -> bool = *t.kind match
+    NamedType(name, args) -> name == "never" && args.is_empty() && bound_type(subst, name).is_none()
+    _ -> false
+
+private refuse_never(a: &Analysis, scope: Scope, span: Span) -> Type
+    a.fault(scope, span, never_refusal())
+    Unknown
+
+never_refusal() -> string =
+    "'never' is the type of an expression that does not finish, so it can only be a result type"
+
+// **`unit` is zero-sized and still has no address**: a field, a parameter or a binding of it needs
+// none, but a `&T`, a `*T`, a slice and an array all reach what they hold through one, and there is
+// nothing there to reach. `what` names the form, quoted as the refusal quotes it.
+private addressable(a: &Analysis, scope: Scope, span: Span, t: Type, what: string) -> Type = t match
+    Unit ->
+        a.fault(scope, span, s"unit occupies no storage, so there is nothing for $what to point at")
+        Unknown
+    _ -> t
 
 // Whether a `volatile` may qualify this type. The qualifier promises exactly the one load or the one
 // store the source wrote, so it means something only where an access is one instruction; a register
@@ -184,7 +219,8 @@ private volatile_constrains(t: Type) -> bool = t match
 // where a value is erased into one, and that is where it is asked.
 private resolve_ref(a: &Analysis, scope: Scope, span: Span, inner: TypeRef, sync: bool,
                     subst: Buf[Binding]) -> Type
-    val ty = under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "&"))
+    val ty = addressable(a, scope, span, under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "&")),
+                         "'&'")
 
     if check_object_written(a, scope, inner, ty, "&", subst) then return Unknown
 
@@ -198,8 +234,9 @@ private resolve_ref(a: &Analysis, scope: Scope, span: Span, inner: TypeRef, sync
 end resolve_ref
 
 // `*T` — and where `T` is a trait, a raw object, asked about as the counted one is.
-private resolve_ptr(a: &Analysis, scope: Scope, inner: TypeRef, subst: Buf[Binding]) -> Type
-    val ty = under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "*"))
+private resolve_ptr(a: &Analysis, scope: Scope, span: Span, inner: TypeRef, subst: Buf[Binding]) -> Type
+    val ty = addressable(a, scope, span, under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "*")),
+                         "'*'")
 
     if check_object_written(a, scope, inner, ty, "*", subst) then return Unknown
 
@@ -211,7 +248,7 @@ resolve_list(a: &Analysis, scope: Scope, ts: Buf[TypeRef], subst: Buf[Binding]) 
     var out: Buf[Type] = buf()
 
     for i in 0..<ts.len()
-        out.push(resolve_type(a, scope, ts.at(i), subst))
+        out.push(value_type(a, scope, ts.at(i), subst))
 
     out
 end resolve_list
@@ -229,7 +266,8 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
     // A fixed array HOLDS its elements and a slice POINTS at them, which is the whole of why one is
     // an indirection and the other is not.
     if length.is_none() then
-        return Slice(under_indirection(a, () -> resolve_qualified(a, scope, elem, subst)), read_only)
+        return Slice(addressable(a, scope, span, under_indirection(a, () -> resolve_qualified(a, scope, elem, subst)),
+                                 "a slice"), read_only)
 
     val written = length.unwrap()
 
@@ -276,7 +314,7 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
         return Unknown
     end if
 
-    Array(int(const_extent(a, scope, span, written, subst)), e)
+    Array(int(const_extent(a, scope, span, written, subst)), addressable(a, scope, span, e, "an array"))
 end resolve_array
 
 // Whether a written length is a bare name standing for a **type** -- `[T]int` where `T` is a type
@@ -616,7 +654,9 @@ private resolve_pointee(a: &Analysis, scope: Scope, inner: TypeRef, subst: Buf[B
     *inner.kind match
         FnType(params, ret, _) -> resolve_fn_trait(a, scope, inner.span, params, ret, false, subst)
         // A name behind a mode is the one place a trait may be what it names.
-        NamedType(name, args) -> resolve_named(a, scope, inner.span, name, args, subst, sigil)
+        NamedType(name, args) ->
+            if never_written(inner, subst) then refuse_never(a, scope, inner.span)
+            else resolve_named(a, scope, inner.span, name, args, subst, sigil)
         _ -> if sigil == "*" then resolve_qualified(a, scope, inner, subst) else resolve_type(a, scope, inner, subst)
 
 // **A callable is not a type: it is a trait**, and a trait stands where a type does only behind a
@@ -650,7 +690,7 @@ private resolve_fn_trait(a: &Analysis, scope: Scope, span: Span, params: Buf[Typ
 
     var args = resolve_list(a, scope, params, subst)
 
-    args.push(resolve_type(a, scope, ret, subst))
+    args.push(value_type(a, scope, ret, subst))
 
     // **A bare arrow is a parameter's form and nothing else**, and by the time a type is resolved
     // every parameter that wrote one has been rewritten into the bound it is sugar for — so an arrow
@@ -864,7 +904,7 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
         for i in 0..<args.len()
             *args.at(i).kind match
                 AssocArgType(bound, inner) ->
-                    named.push((bound, resolve_type(a, scope, inner, subst)))
+                    named.push((bound, value_type(a, scope, inner, subst)))
                 _ -> positional.push(args.at(i))
 
         return object_of(a, scope, span, name, key.unwrap(), d.unwrap(),
@@ -1006,7 +1046,7 @@ private read_args_for(a: &Analysis, scope: Scope, span: Span, key: string, args:
                     a.fault(scope, span, "a value stands here, and this argument is a type — a value " +
                             "argument belongs where the declaration wrote 'const', and nowhere else")
                     return None
-                _ -> out.push(resolve_type(a, scope, arg, subst))
+                _ -> out.push(value_type(a, scope, arg, subst))
         end if
 
     Some(out)
@@ -1584,7 +1624,7 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
         var fields: Buf[(string, Type)] = buf()
 
         for j in 0..<v.fields.len()
-            fields.push((v.fields.at(j).name, resolve_type(a, home, v.fields.at(j).typ, subst)))
+            fields.push((v.fields.at(j).name, value_type(a, home, v.fields.at(j).typ, subst)))
 
         var tag = next_tag
 

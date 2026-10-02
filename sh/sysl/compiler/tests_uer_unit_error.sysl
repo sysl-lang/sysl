@@ -1,0 +1,431 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The reference's `UnitErrorTests`: `unit` is the language's zero-sized type
+// (`reference/types.md § unit and never`), so a field, a parameter, a type argument or a binding of
+// it is legal and costs nothing -- the field is skipped, the parameter is dropped from the emitted
+// signature, the binding is not a slot -- while `&unit`, `*unit`, a slice or an array of it, and the
+// operations that would have to invent a value (`str`, `==`, a variadic tail) stay refused. `never`
+// is untouched throughout: it has no values at all, so it stands only as a result.
+//
+// **Every output, every diagnostic and every `line:col` here was read out of the reference compiler
+// (0.0.156)** by handing the installed `sysl` the same program.
+
+// What a program does: what it printed, and whether it exited zero. A failure to build is its
+// message and a non-zero exit.
+private uer_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-uer").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end uer_outcome
+
+// The program runs to the end and prints exactly this. Returns at once without the library.
+private uer_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = uer_outcome(text)
+
+    assert(out.1, s"it did not exit zero: ${out.0}")
+    assert_eq(out.0, want)
+end uer_prints
+
+// What the compiler says about a program, or the text it lowers to where it says nothing.
+private uer_emit(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-uer").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> (why.message, false)
+        Ok(made) ->
+            if !made.report.is_empty() then (analysis_report(made.report), false)
+            else (made.text, true)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end uer_emit
+
+// The text a program lowers to holds each of these lines.
+private uer_ir_has(text: string, wants: []string)
+    if xvr_no_library() then return
+
+    val out = uer_emit(text)
+
+    assert(out.1, s"did not compile: ${out.0}")
+
+    for w in wants
+        assert(out.0.contains(w), s"no '$w' in:\n${out.0}")
+end uer_ir_has
+
+// The program is refused with exactly one complaint: this message, anchored at this `line:col`.
+private uer_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val out = uer_emit(text)
+
+    assert(!out.1, s"it compiled: ${out.0}")
+    assert(out.0.contains(s"error: $message\n --> "), out.0)
+    assert(out.0.contains(s"main.sysl:$at\n"), out.0)
+    assert_eq(uer_count(out.0, "error: "), 1, out.0)
+end uer_refused
+
+// How many times a piece of text occurs.
+private uer_count(said: string, part: string) -> int
+    var rest = said
+    var n = 0
+
+    loop
+        rest.index_of(part) match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + part.bytes.len..<rest.bytes.len]
+
+    n
+end uer_count
+
+private uer_never() -> string =
+    "'never' is the type of an expression that does not finish, so it can only be a result type"
+
+private uer_variadic(shown: string) -> string =
+    s"a $shown cannot be passed to '...' — a variadic argument must be an integer, a float, a char, " +
+    "a raw pointer, or the address of a function"
+
+// -- unit is zero-sized, so it may be held ----------------------------------------------------------
+
+@test("as a variable's type, which takes no slot")
+uer_as_a_variable() = uer_prints("var x: unit = ()\nprint(str(1))", "1\n")
+
+// The parameter is in the signature the analyzer checks and absent from the one LLVM sees.
+@test("as a parameter's type, which the emitted signature then does not mention")
+uer_as_a_parameter() =
+    uer_ir_has("f(x: unit, n: int) -> int = n\nprint(f((), 2))", ["define i32 @f(i32 %n.param)"])
+
+@test("as an extern parameter's type, for the same reason")
+uer_as_an_extern_parameter() =
+    uer_ir_has("extern e(x: unit, n: int) -> int\nprint(e((), 1))", ["declare i32 @e(i32)"])
+
+// The field is skipped and the ones behind it shift up, which is the whole of the layout rule.
+@test("as a struct field's type, skipped in the layout")
+uer_as_a_field()
+    if xvr_no_library() then return
+
+    val out = uer_emit("struct S\n    a: unit\n    b: int\nvar s = S((), 7)\nprint(s.b)")
+
+    assert(out.1, out.0)
+    assert(out.0.contains("%struct.S = type { i32 }"), out.0)
+    assert(out.0.contains("extractvalue %struct.S"), out.0)
+    assert(!out.0.contains("%struct.S = type { i32, i32 }"), out.0)
+end uer_as_a_field
+
+@test("as a variant payload's type")
+uer_as_a_payload() =
+    uer_prints("enum E\n    V(a: unit, b: int)\nend E\nvar e = V((), 3)\ne match\n    V(a, b) -> print(str(b))",
+               "3\n")
+
+@test("as a type argument — which is the point of the whole rule")
+uer_as_a_type_argument() = uer_prints(raw"""
+    f(n: int) -> Result[unit, int]
+        if n < 0 then return Err(n)
+        Ok(())
+    end f
+    f(1) match
+        Ok(u) -> print("ok")
+        Err(e) -> print(str(e))
+    """, "ok\n")
+
+@test("and '?' chains through one, carrying the failure and yielding nothing on success")
+uer_question_mark_chains() = uer_prints(raw"""
+    step(n: int) -> Result[unit, int]
+        if n < 0 then return Err(n)
+        print(str(n))
+        Ok(())
+    end step
+    both() -> Result[unit, int]
+        step(1)?
+        step(-2)?
+        step(3)?
+        Ok(())
+    end both
+    both() match
+        Ok(u) -> print("ok")
+        Err(e) -> print(str(e))
+    """, "1\n-2\n")
+
+private uer_sink() -> string = raw"""
+    trait Sink[T]
+        put(self, x: T) -> int
+    struct A
+        n: int
+    impl Sink[unit] for A
+        put(self, x: unit) -> int = self.n
+    """
+
+@test("as a generic trait's argument")
+uer_as_a_trait_argument() = uer_prints(uer_sink() + "var a = A(4)\nprint(a.put(()))\n", "4\n")
+
+// Through a trait object the adapter and the implementation have to agree about which parameters
+// exist, and the dropped one is dropped on both sides.
+@test("as a trait object's method parameter")
+uer_through_an_object() = uer_prints(uer_sink() + "var s: &Sink[unit] = A(9)\nprint(s.put(()))\n", "9\n")
+
+// -- a zero-sized field is skipped wherever a layout is built ---------------------------------------
+
+@test("leaving the fields behind it at the indices they actually occupy")
+uer_fields_behind_it() = uer_prints(raw"""
+    struct S
+        a: int
+        b: unit
+        c: int
+    var s = S(1, (), 2)
+    print(str(s.a))
+    print(str(s.c))
+    """, "1\n2\n")
+
+@test("including where a reference sits behind it, which the ownership walk has to find")
+uer_a_reference_behind_it() = uer_prints(raw"""
+    struct Inner
+        v: int
+    struct S
+        a: unit
+        b: &Inner
+    mk(n: int) -> int
+        var s = S((), Inner(n))
+        s.b.v
+    end mk
+    var total = 0
+    for i in 0..<1000 do total += mk(i % 3)
+    print(str(total))
+    """, "999\n")
+
+@test("and a written one is assignable, which does nothing at all")
+uer_assigned() = uer_prints("struct S\n    a: unit\n    b: int\nvar s = S((), 1)\ns.a = ()\nprint(str(s.b))", "1\n")
+
+// Nothing is written, but the walk *to* the place is still owed: it is why the expression was
+// written where it was.
+@test("while the receiver chain of such an assignment still runs")
+uer_receiver_chain_runs() = uer_prints(raw"""
+    struct S
+        a: unit
+        b: int
+    side() -> usize
+        print("side")
+        0
+    end side
+    var xs = [S((), 1), S((), 2)]
+    xs[side()].a = ()
+    print(str(xs[0].b))
+    """, "side\n1\n")
+
+@test("and a struct carrying one still passes by value, both ways")
+uer_by_value() = uer_prints(raw"""
+    struct S
+        a: unit
+        b: int
+    bump(s: S) -> S = S((), s.b + 1)
+    print(str(bump(S((), 4)).b))
+    """, "5\n")
+
+// -- it is its own zero value ------------------------------------------------------------------------
+
+@test("so a declaration with no initializer is legal")
+uer_no_initializer() = uer_prints("var x: unit\nprint(str(1))", "1\n")
+
+@test("and a struct does not lose its zero by gaining a field that costs nothing")
+uer_struct_keeps_its_zero() = uer_prints("struct S\n    a: unit\n    b: int\nvar s: S\nprint(str(s.b))", "0\n")
+
+// -- a struct of nothing but zero-sized fields is still a type ---------------------------------------
+
+@test("with an empty layout")
+uer_empty_layout() = uer_ir_has("struct S\n    a: unit\nvar s = S(())\nprint(1)", ["%struct.S = type {  }"])
+
+@test("and an address a reference may point at")
+uer_still_addressable() =
+    uer_prints("struct S\n    a: unit\nholds(e: &S) -> int = 1\nvar e: &S = S(())\nprint(str(holds(e)))", "1\n")
+
+// -- a unit value arrives, and occupies nothing ------------------------------------------------------
+
+@test("so binding one is legal and emits no slot")
+uer_binding_one() = uer_prints("var x = print(1)\nprint(2)", "1\n2\n")
+
+@test("and so is passing one to a generic parameter")
+uer_to_a_generic_parameter() = uer_prints("f[T](x: T) -> int = 1\nprint(f(print(2)))", "2\n1\n")
+
+@test("into a generic struct's field")
+uer_into_a_generic_field() = uer_prints("struct Box[T]\n    v: T\nvar b = Box(print(1))\nprint(2)", "1\n2\n")
+
+@test("into a generic variant's payload")
+uer_into_a_generic_payload() =
+    uer_prints("enum Box[T]\n    Full(v: T)\nend Box\nvar b = Full(print(1))\nprint(2)", "1\n2\n")
+
+// Order is still owed even where nothing is passed: the argument's effect is the reason it was
+// written at all.
+@test("and an argument's effect happens in the order it was written")
+uer_effects_in_order() =
+    uer_prints("f(a: unit, n: int, b: unit) -> int = n\nprint(f(print(1), 2, print(3)))", "1\n3\n2\n")
+
+// -- what is still refused, and not because of a layout ----------------------------------------------
+
+@test("a reference or a pointer to nothing")
+uer_no_reference_or_pointer()
+    uer_refused("f(x: *unit) -> int = 1\nprint(1)",
+                "unit occupies no storage, so there is nothing for '*' to point at", "1:6")
+    uer_refused("f(x: &unit) -> int = 1\nprint(1)",
+                "unit occupies no storage, so there is nothing for '&' to point at", "1:6")
+    uer_refused("f(x: weak unit) -> int = 1\nprint(1)",
+                "unit occupies no storage, so there is nothing for 'weak' to point at", "1:6")
+end uer_no_reference_or_pointer
+
+// Not because the elements would share an address -- a fieldless struct's do, and an array of those
+// is admitted. It is that `unit` is the type the compiler DROPS: an array of it would have nothing
+// to be an array of. The deepest array is the one refused, its element being the `unit`.
+@test("an array or a slice of it, however deep")
+uer_no_array_or_slice()
+    uer_refused("f(a: [4]unit) -> int = 1\nprint(1)",
+                "unit occupies no storage, so there is nothing for an array to point at", "1:6")
+    uer_refused("f(a: []unit) -> int = 1\nprint(1)",
+                "unit occupies no storage, so there is nothing for a slice to point at", "1:6")
+    uer_refused("f(a: [2][3]unit) -> int = 1\nprint(1)",
+                "unit occupies no storage, so there is nothing for an array to point at", "1:9")
+end uer_no_array_or_slice
+
+@test("filling an array with one")
+uer_no_array_of_units() = uer_refused("var a = [print(1)]", "an array cannot hold unit values", "1:9")
+
+@test("assigning one where a value belongs")
+uer_no_assigning_one() = uer_refused("var x = 1\nx = print(2)", "cannot assign unit to 'x' of type int", "2:1")
+
+@test("making a string of one")
+uer_no_string_of_one() =
+    uer_refused("print(str(print(1)))",
+                "cannot make a string of a unit value — it does not implement 'sysl.Display'", "1:7")
+
+@test("comparing two")
+uer_no_comparing_two() = uer_refused("print(print(1) == print(2))", "'==' is not defined for unit", "1:7")
+
+// A C variadic counts what it was handed at run time, so an argument that is not passed would
+// silently shift everything after it.
+@test("riding a variadic tail")
+uer_no_variadic_unit() =
+    uer_refused("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p, ()))",
+                uer_variadic("unit"), "3:17")
+
+// The rule the unit case is one instance of: a tail carries what C reads back from a register, an
+// aggregate crosses to a foreign callee only, and everything else is refused by its own name.
+@test("a variadic tail takes a register's worth, and an aggregate only to a foreign callee")
+uer_variadic_tail_rule()
+    val head = "struct P\n    a: int\ntype Small = int within 0..10\nenum C\n    R\n    G\n" +
+               "extern printf(fmt: *u8, ...) -> int\nsv(n: int, ...) -> int = n\nvar p: *u8 = null\n" +
+               "val s: Small = 3\nval q: &P = P(1)\n"
+
+    uer_refused(head + "print(printf(p, true))", uer_variadic("bool"), "12:17")
+    uer_refused(head + "print(printf(p, s))", uer_variadic("Small"), "12:17")
+    uer_refused(head + "print(printf(p, G))", uer_variadic("C"), "12:17")
+    uer_refused(head + "print(printf(p, q))", uer_variadic("&P"), "12:17")
+    uer_refused(head + "print(sv(1, exit(1)))", uer_variadic("never"), "12:13")
+    uer_refused(head + "print(sv(1, \"x\"))",
+                "a string cannot be passed to a sysl function's '...' — a walk over the tail reads back " +
+                "one register at a time and an aggregate is not one, where a foreign callee takes it " +
+                "because C says which registers it arrives in", "12:13")
+    uer_ir_has(head + "print(printf(p, P(1), \"x\", 'c', u8(1), 1.5f32))", ["call i32 (ptr, ...) @printf"])
+end uer_variadic_tail_rule
+
+// -- never is untouched ------------------------------------------------------------------------------
+
+@test("a diverging argument still cannot fix a generic parameter")
+uer_never_fixes_no_parameter()
+    uer_refused("f[T](x: T) -> int = 1\nprint(f(exit(1)))",
+                "cannot pass an expression that never returns as 'x' of 'f'", "2:9")
+    uer_refused("struct Box[T]\n    v: T\nvar b = Box(exit(1))",
+                "cannot pass an expression that never returns as 'v' of 'Box[never]'", "3:13")
+    uer_refused("enum Box[T]\n    Full(v: T)\nend Box\nvar b = Full(exit(1))",
+                "cannot pass an expression that never returns as 'v' of 'Full'", "4:14")
+end uer_never_fixes_no_parameter
+
+@test("and it still cannot be bound")
+uer_never_bound()
+    uer_refused("var x = exit(1)", "cannot bind 'x' to an expression that never returns", "1:1")
+    uer_refused("f()\n    val y = exit(1)\nf()", "cannot bind 'y' to an expression that never returns", "2:5")
+end uer_never_bound
+
+@test("nor be a field, a parameter, or a type argument")
+uer_never_only_a_result()
+    uer_refused("struct S\n    x: never\nprint(1)", uer_never(), "2:8")
+    uer_refused("f(x: never) -> int = 1\nprint(1)", uer_never(), "1:6")
+    uer_refused("var o: Option[never] = None", uer_never(), "1:15")
+    uer_refused("g(p: *never) -> int = 1\nprint(1)", uer_never(), "1:7")
+    uer_refused("h(x: int, y: never) -> int = 1\nprint(1)", uer_never(), "1:14")
+    uer_refused("k(f: &Fn() -> never) -> int = 1\nprint(1)", uer_never(), "1:15")
+    uer_refused("f()\n    val y: never = exit(1)\nf()", uer_never(), "2:12")
+end uer_never_only_a_result
+
+// Only where the parameter BECAME valueless. A written one still has a layout, and the call is
+// simply dead code -- which is what makes a guard clause in argument position legal.
+@test("but a written parameter still takes a diverging argument")
+uer_written_parameter_takes_never() =
+    uer_ir_has("f(x: int) -> int = 1\nprint(f(exit(1)))", ["define i32 @f(i32 %x.param)"])
+
+// -- what a result may still be ----------------------------------------------------------------------
+
+@test("a function's")
+uer_a_functions_result() = uer_ir_has("f() -> unit = print(1)\nf()", ["define void @f()"])
+
+@test("a method's")
+uer_a_methods_result() =
+    uer_ir_has("struct A\n    n: int\n    bump(self) -> unit = print(self.n)\nvar a = A(1)\na.bump()",
+               ["define void @A.bump(%struct.A %self.param)"])
+
+@test("a trait method's, dispatched through an object")
+uer_a_trait_methods_result() = uer_ir_has(raw"""
+    trait Show
+        show(self) -> unit
+    struct A
+        n: int
+    impl Show for A
+        show(self) -> unit = print(self.n)
+    var s: &Show = A(7)
+    s.show()
+    """, ["@vt.ref.Show.A"])
+
+@test("an extern's")
+uer_an_externs_result() = uer_ir_has("extern e() -> unit\ne()", ["declare void @e()"])
+
+@test("and writing it changes nothing about leaving it off")
+uer_written_unit_result_is_the_default()
+    if xvr_no_library() then return
+
+    val written = uer_emit("f() -> unit = print(1)\nf()")
+    val left_off = uer_emit("f()\n    print(1)\nf()")
+
+    assert(written.1, written.0)
+    assert_eq(written.0, left_off.0)
+end uer_written_unit_result_is_the_default
+
+// `never` is still every result's to write, including a C function pointer's.
+@test("never stands as a result, a C function pointer's included")
+uer_never_as_a_result() =
+    uer_ir_has("stop() -> never = exit(1)\nvar c: *extern() -> never = null\nif c == null then print(1) else stop()",
+               ["define void @stop()"])

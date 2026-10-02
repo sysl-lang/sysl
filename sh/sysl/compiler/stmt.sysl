@@ -611,7 +611,7 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
     // One refusal per declaration, as the reference's first one ends the statement.
     if section.is_none() then no_thread_local(cx, span, name, thread_local)
 
-    val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
+    val declared = typ.map(w -> value_type(cx.an, cx.scope, w, cx.subst))
 
     if init.is_none()
         if declared.is_none()
@@ -632,7 +632,7 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
     val ti = type_expr(cx, init.unwrap(), declared)
     val decl_ty = settled_binding_type(declared, ti)
 
-    check_binding(cx, span, init.unwrap().span, name, declared, decl_ty, ti)
+    check_binding(cx, span, name, declared, decl_ty, ti)
     one(TVarDecl(cx.bind(name, decl_ty), decl_ty, ti, boundary(cx, name, align)))
 end var_decl
 
@@ -640,11 +640,11 @@ private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], 
                  align: Option[Expr], section: Option[string]) -> Buf[TStmt]
     no_section(cx, span, name, section)
 
-    val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
+    val declared = typ.map(w -> value_type(cx.an, cx.scope, w, cx.subst))
     val ti = type_expr(cx, value, declared)
     val decl_ty = settled_binding_type(declared, ti)
 
-    check_binding(cx, span, value.span, name, declared, decl_ty, ti)
+    check_binding(cx, span, name, declared, decl_ty, ti)
     one(TVarDecl(cx.bind_read_only(name, decl_ty), decl_ty, ti, boundary(cx, name, align)))
 end val_decl
 
@@ -659,12 +659,12 @@ end settled_binding_type
 // the code after it is unreachable, so the declaration is a mistake rather than a clever way to
 // spell divergence.
 //
-// A disagreement is the declaration's and is reported at the statement, as the reference does: the
-// value is not wrong on its own, only against the type written beside the name.
-private check_binding(cx: &Analyzer, at: Span, span: Span, name: string, declared: Option[Type],
-                      decl_ty: Type, ti: TExpr)
+// Both refusals are the declaration's and are reported at the statement, as the reference does: the
+// value is not wrong on its own, only as the thing a name is bound to.
+private check_binding(cx: &Analyzer, at: Span, name: string, declared: Option[Type], decl_ty: Type,
+                      ti: TExpr)
     if texpr_type(ti) == Never then
-        cx.fault(span, s"cannot bind '$name' to an expression that never returns")
+        cx.fault(at, s"cannot bind '$name' to an expression that never returns")
 
     if declared.is_some() && disagree(texpr_type(ti), decl_ty) then
         cx.fault(at, s"cannot initialize '$name': declared ${type_show(decl_ty)} but the value " +
