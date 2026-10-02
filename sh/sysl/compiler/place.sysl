@@ -234,6 +234,37 @@ private holds_an_address(t: Type) -> bool = repr(t) match
     Ptr(_) -> true
     _ -> false
 
+// The `&sync` box an array lives inside, where a view of it would be a view into that box: the walk
+// out of the array goes through fields and an array's own elements and stops at the first box it
+// meets, which answers only when it is a `&sync` one. A view takes and gives back its share of the
+// box the ordinary way while another domain changes the same count atomically, so such an array may
+// be read by index or walked, never sliced (`reference/arrays.md § What is still refused`).
+sync_box_around(base: TExpr) -> Option[Type]
+    if !owns_its_elements(texpr_type(base)) then return None
+
+    *base.kind match
+        TField(recv, _, _) -> box_or_further(recv)
+        TIndex(recv, _, _) -> if owns_its_elements(texpr_type(recv)) then box_or_further(recv) else None
+        TDeref(operand, _) -> sync_box(texpr_type(operand))
+        _ -> None
+end sync_box_around
+
+private box_or_further(recv: TExpr) -> Option[Type]
+    val ty = texpr_type(recv)
+
+    if holds_an_address(ty) then return sync_box(ty)
+
+    *recv.kind match
+        TField(inner, _, _) -> box_or_further(inner)
+        TIndex(inner, _, _) -> if owns_its_elements(texpr_type(inner)) then box_or_further(inner) else None
+        TDeref(operand, _) -> sync_box(texpr_type(operand))
+        _ -> None
+end box_or_further
+
+private sync_box(t: Type) -> Option[Type] = repr(t) match
+    Ref(_, sync) -> if sync then Some(t) else None
+    _ -> None
+
 // Whether this type's elements are its own storage, which an array's and a vector's are and a
 // slice's are not.
 private owns_its_elements(t: Type) -> bool = repr(t) match
