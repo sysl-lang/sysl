@@ -1,0 +1,437 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `_` where a closure's parameter would be named (`reference/expressions.md § _ — a parameter with the
+// name left out`).
+//
+// The feature is one operand and a boundary rule, and the boundary is the whole of it: a placeholder
+// compiles under either reading of where its closure ends, so a test that only shows the closure works
+// shows nothing about the part that was designed. Every test here that names a boundary has the reading
+// it is *not* beside it.
+//
+// **Every string quoted here was read out of the reference compiler** (0.0.157), whose
+// `PlaceholderTests` these are.
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private phx_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end phx_ready
+
+// Takes a closure and calls it, which is what gives the placeholder a type to infer from.
+private phx_apply() -> string = "apply(f: int -> int, x: int) -> int = f(x)\n"
+
+private phx_pair() -> string = "pair(f: (int, int) -> int, a: int, b: int) -> int = f(a, b)\n"
+
+private phx_sub() -> string = "sub(a: int, b: int) -> int = a - b\n\n"
+
+private phx_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program PRINTS, which is the one claim nothing short of building and running it makes.
+private phx_ran(text: string) -> string
+    val root = make_temp_dir("sysl-placeholder").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end phx_ran
+
+// Everything a source has to say for itself, taken through the lowering as the reference's `err` is.
+private phx_err(text: string) -> string
+    val root = make_temp_dir("sysl-placeholder").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end phx_err
+
+// -- a placeholder is the parameter of the closure it stands in ------------------------------------
+
+@test("one occurrence is one parameter")
+phx_one_occurrence_is_one_parameter()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + "print(apply(_ + 1, 5))\n"), "6\n")
+
+// Two occurrences are two parameters rather than one used twice, so the answer has to depend on the
+// order: `_ + _` on (7, 2) is 9 either way.
+@test("two occurrences are two parameters, left to right")
+phx_two_occurrences_are_two_parameters()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_pair() + "print(pair(_ - _, 7, 2))\n"), "5\n")
+
+@test("a closure that wants its argument twice is still written with the arrow")
+phx_an_argument_twice_is_the_arrow()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + "print(apply(x -> x * x, 6))\n"), "36\n")
+
+@test("an operator reaches out through the placeholder, so a prefix one is inside the body")
+phx_a_prefix_operator_is_inside_the_body()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + "print(apply(-_, 5))\n"), "-5\n")
+
+@test("field selection is inside the body")
+phx_field_selection_is_inside_the_body()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        struct Row
+            stamp: int
+
+        take(f: Row -> int, r: Row) -> int = f(r)
+
+        print(take(_.stamp, Row(41)))
+        """), "41\n")
+
+@test("a method call on it is inside the body, the receiver position being no boundary")
+phx_a_method_call_is_inside_the_body()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        struct Row
+            stamp: int
+
+            doubled(self) -> int = self.stamp * 2
+
+        take(f: Row -> int, r: Row) -> int = f(r)
+
+        print(take(_.doubled(), Row(21)))
+        """), "42\n")
+
+// A subscript does not end the closure, so the array is captured and the placeholder is the index.
+@test("a subscript is inside the body, and the array around it is captured")
+phx_a_subscript_is_inside_the_body()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + raw"""
+        val table: [4]int = [10, 20, 30, 40]
+
+        print(apply(table[_], 2))
+        """), "30\n")
+
+// -- a bare '_' at an argument is absorbed by the call it is an argument of ------------------------
+
+@test("the first argument left open")
+phx_the_first_argument_left_open()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + phx_sub() + "print(apply(sub(_, 3), 10))\n"), "7\n")
+
+// The discriminating half of the pair: the hole on the other side gives the other answer.
+@test("the second argument left open")
+phx_the_second_argument_left_open()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + phx_sub() + "print(apply(sub(3, _), 10))\n"), "-7\n")
+
+@test("both left open, in the order they were written")
+phx_both_left_open()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_pair() + phx_sub() + "print(pair(sub(_, _), 7, 2))\n"), "5\n")
+
+@test("a named argument leaves its own parameter open, not the one in that position")
+phx_a_named_argument_leaves_its_own_parameter_open()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + phx_sub() + "print(apply(sub(b = _, a = 3), 10))\n"), "-7\n")
+
+// -- the three boundaries, each with the reading it is not -----------------------------------------
+
+// An argument ends the closure, so `apply` is handed one rather than the whole call becoming one —
+// under the other reading `print` would be handed a closure it could not take.
+@test("a call argument ends it, so the callee is handed the closure")
+phx_a_call_argument_ends_it()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + "print(apply(_ + 1, 5))\n"), "6\n")
+
+// `_ + 1 * 2` is `x -> x + 2`, not `(x -> x + 1) * 2`.
+@test("an operator does not, so precedence alone decides the body")
+phx_an_operator_does_not_end_it()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + "print(apply(_ + 1 * 2, 5))\n"), "7\n")
+
+// The group closes the closure at the `)`, leaving it an operand of `*` where nothing says what it
+// takes — so the refusal naming the placeholder IS the evidence that the parentheses were obeyed.
+@test("a parenthesized group does, which is how the operator reading is overridden")
+phx_a_group_ends_it()
+    if !phx_ready() then return
+
+    assert(phx_says(phx_err(phx_apply() + "print(apply((_ + 1) * 2, 5))\n"),
+        "this '_' has no type here — nothing says what the closure it stands in takes"))
+
+@test("a statement-level expression ends it, so a binding may hold one")
+phx_a_statement_ends_it()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        var g: &Fn(int) -> int = _ * 3
+        print(g(14))
+        """), "42\n")
+
+@test("a closure's own body ends it, so an arrow over a placeholder yields a closure")
+phx_a_closure_body_ends_it()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        outer(f: int -> &Fn(int) -> int, a: int, b: int) -> int = f(a)(b)
+
+        print(outer(x -> _ + x, 40, 2))
+        """), "42\n")
+
+// -- what it does not reach, said as the diagnostic a reader gets ----------------------------------
+
+// The advice to annotate would name a parameter the compiler made up, which the program cannot write.
+@test("a binding with nothing to infer from is refused, and is not told to annotate the made-up name")
+phx_a_binding_with_nothing_to_infer_from()
+    if !phx_ready() then return
+
+    val out = phx_err("var h = _ * 3\n")
+
+    assert(phx_says(out, "this '_' has no type here"))
+    assert(phx_says(out, "write that closure with a named parameter"))
+    assert(!phx_says(out, raw"$ph"))
+
+@test("while a written parameter is still told to annotate itself, by name")
+phx_a_written_parameter_is_named()
+    if !phx_ready() then return
+
+    assert(phx_says(phx_err("var h = x -> x * 3\n"), "'x' has no type here"))
+
+// An array element is inside the body, so an array OF closures needs the group.
+@test("an array element is inside the body, so an array OF closures needs the group")
+phx_an_array_element_is_inside_the_body()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        var fs: [1]&Fn(int) -> int = [(_ + 1)]
+        print(fs[0](41))
+        """), "42\n")
+
+// -- '_' in a pattern is untouched, the two never standing in one position -------------------------
+
+@test("a match arm's wildcard is still a wildcard")
+phx_a_match_wildcard_is_still_a_wildcard()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        classify(n: int) -> string
+            n match
+                0 -> "zero"
+                _ -> "other"
+
+        print(classify(0), classify(7))
+        """), "zero other\n")
+
+@test("one file may use both meanings without either noticing")
+phx_one_file_may_use_both_meanings()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + raw"""
+        classify(n: int) -> int
+            n match
+                0 -> 100
+                _ -> n
+
+        print(apply(classify(_), 7), classify(0))
+        """), "7 100\n")
+
+// The sharpest version: one statement whose scrutinee is a placeholder and whose last arm is a
+// wildcard, so a production that took the other's token breaks here.
+@test("even in one statement, whose scrutinee is a placeholder and whose last arm is a wildcard")
+phx_both_meanings_in_one_statement()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        var f: &Fn(int) -> int = _ match
+            0 -> 100
+            _ -> 7
+
+        print(f(0), f(5))
+        """), "100 7\n")
+
+// -- a lifted closure is the one the arrow would have produced -------------------------------------
+
+// Nothing new reaches any later pass, so a placeholder closure inside a generic body survives the tree
+// a library artifact carries.
+@test("including through the tree a library artifact carries")
+phx_through_a_generic_body()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        twice[T](f: T -> T, x: T) -> T = f(f(x))
+
+        print(twice(_ + 1, 5))
+        print(twice(_ + "!", "hi"))
+        """), "7\nhi!!\n")
+
+@test("it captures what an arrow there would have captured")
+phx_it_captures_what_an_arrow_would()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + raw"""
+        val base: int = 100
+
+        print(apply(_ + base, 5))
+        """), "105\n")
+
+// A returned closure is the escaping representation, a different mechanism from every test above.
+@test("including the escaping representation, where the closure outlives the body that made it")
+phx_the_escaping_representation()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        adder(n: int) -> &Fn(int) -> int = _ + n
+
+        var add40 = adder(40)
+        print(add40(2))
+        """), "42\n")
+
+// A default is read at the type its own parameter declares, so a placeholder there stands for what the
+// parameter takes; the arrow form beside it says the rule is the default's and not the placeholder's.
+@test("a default parameter value, where the parameter's own type says what it stands for")
+phx_a_default_parameter_value()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        go(x: int, f: int -> int = _ * 2) -> int = f(x)
+        print(go(21))
+        """), "42\n")
+
+@test("which is the arrow form's answer there too, so the rule is the default's and not the placeholder's")
+phx_the_arrow_form_in_a_default()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        go(x: int, f: int -> int = y -> y * 2) -> int = f(x)
+        print(go(21))
+        """), "42\n")
+
+@test("though an argument that is written out still reaches the parameter")
+phx_a_written_argument_still_reaches_it()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        go(x: int, f: int -> int) -> int = f(x)
+        print(go(21, _ * 2))
+        """), "42\n")
+
+// A nested function is the one place a callable is not a closure literal.
+@test("and inside a nested function's body")
+phx_inside_a_nested_function()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + raw"""
+        outer(x: int) -> int
+            inner(n: int) -> int = apply(_ + n, x)
+            inner(2)
+
+        print(outer(40))
+        """), "42\n")
+
+// -- the edge cases, each of which compiles under a rule that is not the one written ---------------
+
+// Two placeholders belonging to different closures, because an inner argument closed one of them.
+@test("two closures in one expression, each taking the placeholder nearest it")
+phx_two_closures_in_one_expression()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + "print(apply(_ + apply(_ * 10, 3), 5))\n"), "35\n")
+
+@test("a partial application is bound before it is called, a literal callee being refused")
+phx_a_partial_application_is_bound()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_sub() + raw"""
+        var take3: &Fn(int) -> int = sub(_, 3)
+        print(take3(10))
+        """), "7\n")
+
+// The arrow form is refused identically, which says this is a literal callee's limit and not
+// anything the placeholder introduced.
+@test("calling one where it stands is refused, as calling any closure literal is")
+phx_calling_one_where_it_stands()
+    if !phx_ready() then return
+
+    val placeholder = phx_err("sub(a: int, b: int) -> int = a - b\nprint(sub(_, 3)(10))\n")
+    val arrow = phx_err("sub(a: int, b: int) -> int = a - b\nprint((x -> sub(x, 3))(10))\n")
+
+    assert(phx_says(placeholder, "must be a name, or something whose type says it is callable"))
+    assert(phx_says(arrow, "must be a name, or something whose type says it is callable"))
+
+// The parentheses that delimit a tuple are the ones that end the closure.
+@test("a tuple in parentheses is lifted whole, not part by part")
+phx_a_tuple_is_lifted_whole()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(raw"""
+        take(f: int -> (int, int), x: int) -> int
+            val t = f(x)
+            t.0 + t.1
+
+        print(take((_ + 1, 2), 39))
+        """), "42\n")
+
+// A hole is its own little source with its own parser, so it is a boundary.
+@test("an interpolation hole is a boundary, so a placeholder cannot close over the whole string")
+phx_an_interpolation_hole_is_a_boundary()
+    if !phx_ready() then return
+
+    assert(phx_says(phx_err(raw"""
+        print(s"${_ + 1}")
+        """), "this '_' has no type here"))
+
+// Without the boundary the two placeholders would be numbered from zero independently and the lift
+// would build a parameter list naming one thing twice.
+@test("a placeholder outside a string is unaffected by a hole in the same expression")
+phx_a_placeholder_outside_a_hole()
+    if !phx_ready() then return
+
+    assert_eq(phx_ran(phx_apply() + raw"""
+        print(apply(_ + 1, 5), s"${2 + 2}")
+        """), "6 4\n")
+
+@test("a placeholder alone as a statement is refused rather than crashing")
+phx_a_placeholder_alone_is_refused()
+    if !phx_ready() then return
+
+    assert(phx_says(phx_err("_\n"), "this '_' has no type here"))
