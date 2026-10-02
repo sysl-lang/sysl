@@ -18,9 +18,9 @@ import sysl.text.{join, replace_all, Search}
 // The reference's `DeclCapabilityTests` (*a '@needs' body is charged to its callers, not to its
 // module*), `TargetCapabilityTests` (*a '@needs(os)' body on a machine with no os is its callers'
 // question*, *a library's '@tests' file costs a program that links the library nothing*) and
-// `NeedsScopeCliTests`, ported. **Every sentence quoted was read out of the reference.** A body
-// covers what its annotation NAMES: `sysl.fs` reaches the POSIX modules under it on every hosted
-// target, so the declarations here say `@needs(posix)`, which implies `os`.
+// `NeedsScopeCliTests`, ported, with the reference's *sysl.fs requires 'os' and not 'posix'* cases
+// beside them. **Every sentence quoted was read out of the reference.** A body covers what its
+// annotation NAMES, and `sysl.fs` requires `os` alone, so `@needs(os)` covers it.
 //
 // The in-process compilations are the standard module, a library handed over under the names it was
 // written with (what a `--lib` root arrives as), and the program's own files, analyzed for this
@@ -100,14 +100,14 @@ end nsc_only_at_the_call
 private val nsc_nothing: [](string, string) = []
 private val nsc_no_os: [2]string = ["os", "posix"]
 
-// The module of the report: one declaration that needs POSIX and reaches it, and one that needs
-// nothing.
+// The module of the report: one declaration that needs an operating system and reaches one, and one
+// that needs nothing.
 private val nsc_sys: string =
-    "module sys\n\n@needs(posix)\nnow() -> bool = sysl.fs.exists(\"/\")\n\nplain() -> int = 3\n"
+    "module sys\n\n@needs(os)\nnow() -> bool = sysl.fs.exists(\"/\")\n\nplain() -> int = 3\n"
 
 // The same, with a declaration that wrote nothing calling the one that did.
 private val nsc_relay: string =
-    "module sys\n\n@needs(posix)\nnow() -> bool = sysl.fs.exists(\"/\")\n\n" +
+    "module sys\n\n@needs(os)\nnow() -> bool = sysl.fs.exists(\"/\")\n\n" +
     "relay() -> bool = now()\n\nplain() -> int = 3\n"
 
 // A library module whose shipping file reaches nothing, and whose `@tests` file reaches `sysl.fs`.
@@ -332,7 +332,7 @@ end nsc_unannotated_caller_runs
 nsc_a_closure_inside_is_covered()
     if !nsc_ready() then return
 
-    val sys = "module sys\n\n@needs(posix)\nnow() -> bool\n    val ask = (p: string) -> sysl.fs.exists(p)\n" +
+    val sys = "module sys\n\n@needs(os)\nnow() -> bool\n    val ask = (p: string) -> sysl.fs.exists(p)\n" +
               "    ask(\"/\")\n\nplain() -> int = 3\n"
 
     assert_eq(nsc_ran([("sys/a.sysl", sys), ("main.sysl", nsc_plain_no_os)]), "3\n")
@@ -393,3 +393,85 @@ nsc_the_library_still_tests()
     remove_dir_all(lib).unwrap_or(())
     assert_eq(got.0, Fine, got.1)
 end nsc_the_library_still_tests
+
+// -- sysl.fs requires 'os' and not 'posix' ---------------------------------------------------------
+
+// `sysl.fs` is an operating system's filesystem, not POSIX's: its `publish` once imported
+// `sysl.posix.rand` for its entropy, which made every program reaching the filesystem require
+// `posix` as well. The fix is in the library, so these hold against a library carrying it.
+
+@test("so a program that gave posix up still reads the filesystem")
+nsc_no_posix_reads_the_filesystem()
+    if !nsc_ready() then return
+
+    assert_eq(nsc_ran([("main.sysl", "@no_posix\n\nprint(sysl.fs.exists(\"/\"))\n")]), "true\n")
+
+@test("and publishes through it, which is the part that draws entropy")
+nsc_no_posix_publishes()
+    if !nsc_ready() then return
+
+    val main = "@no_posix\n\nimport sysl.fs.{make_temp_dir, read_text, write_text_atomic}\n" +
+               "import sysl.path.join\n\nval at = join(make_temp_dir(\"pub\").unwrap(), \"x\")\n\n" +
+               "write_text_atomic(at, \"hi\").unwrap()\nprint(read_text(at).unwrap())\n"
+
+    assert_eq(nsc_ran([("main.sysl", main)]), "hi\n")
+end nsc_no_posix_publishes
+
+@test("while a program that gave os up is still refused at the reference, for 'os'")
+nsc_no_os_still_refused_for_os()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("main.sysl", "@no_os\n\nprint(sysl.fs.exists(\"/\"))\n")])
+
+    assert(said.contains("this reaches 'sysl.fs', which requires 'os', and this module declared 'no os'"), said)
+    assert(!said.contains("posix"), said)
+end nsc_no_os_still_refused_for_os
+
+@test("sysl.fs on a machine with an os that is not POSIX is reached, publishing included")
+nsc_not_posix_machine_reaches_sysl_fs()
+    if nsc_no_std() then return
+
+    val got = nsc_reported(["posix"], nsc_nothing,
+                           [("main.sysl", "import sysl.fs.write_text_atomic\n\nprint(sysl.fs.exists(\"/\"))\n" +
+                                          "print(write_text_atomic(\"/nonexistent/x\", \"\").is_ok())\n")])
+
+    assert(got.is_empty(), nsc_said(got))
+end nsc_not_posix_machine_reaches_sysl_fs
+
+@test("while the POSIX module it once imported is still refused there")
+nsc_not_posix_machine_refuses_posix_rand()
+    if nsc_no_std() then return
+
+    val got = nsc_reported(["posix"], nsc_nothing,
+                           [("main.sysl", "print(sysl.posix.rand.seed_from_os().is_some())\n")])
+
+    assert(nsc_said(got).contains("main.sysl: this reaches 'sysl.posix.rand', which requires 'posix'"), nsc_said(got))
+end nsc_not_posix_machine_refuses_posix_rand
+
+private val nsc_not_posix: string = "capabilities { os = true, posix = false }\n"
+
+@test("a project whose machine has an os that is not POSIX reaches sysl.fs")
+nsc_not_posix_project_reaches_sysl_fs()
+    if !nsc_ready() then return
+
+    val main = "import sysl.fs.{make_temp_dir, read_text, write_text}\nimport sysl.path.join\n\n" +
+               "val at = join(make_temp_dir(\"pub\").unwrap(), \"x\")\n\n" +
+               "write_text(at, \"hi\").unwrap()\nprint(read_text(at).unwrap())\n"
+
+    assert_eq(nsc_ran([("package.hocon", nsc_not_posix), ("main.sysl", main)]), "hi\n")
+end nsc_not_posix_project_reaches_sysl_fs
+
+// Publishing names its pending file partly from the wall clock, and the host's clock is
+// `sysl.posix.time`, which a machine without POSIX does not link -- so the link names the seam left
+// unsupplied, never a capability refusal of `sysl.fs`.
+@test("and publishing through it asks the project for a clock")
+nsc_not_posix_project_publishing_asks_for_a_clock()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("package.hocon", nsc_not_posix),
+                            ("main.sysl", "import sysl.fs.write_text_atomic\n\nprint(write_text_atomic(\"/nonexistent/x\", \"\").is_ok())\n")])
+
+    assert(said != "it built", said)
+    assert(said.contains("sysl_wall_us"), said)
+    assert(!said.contains("which requires 'posix'"), said)
+end nsc_not_posix_project_publishing_asks_for_a_clock
