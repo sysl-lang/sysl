@@ -1,0 +1,526 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, Search}
+
+// Where a diagnostic points, what it names, and what a node's span covers -- the reference's
+// `DiagnosticNameTests`, `DiagnosticPositionTests` and the rest of its `DiagnosticTests`.
+//
+// **Every message and every position here was read out of the reference compiler** (`sysl 0.0.154`),
+// by handing the installed `sysl` the same source and quoting what came back. One difference is
+// deliberate: the reference names a declaration by its bare name (`'use'`, `'P.get'`) and this
+// compiler by its qualified one (`'m.use'`, `'m.P.get'`), so where a message names a module's
+// declaration the qualification is the one change made to the quoted text.
+
+private var dgn_library_cache: Buf[Program] = buf()
+private var dgn_library_read: bool = false
+
+private dgn_library() -> Buf[Program]
+    if dgn_library_read then return dgn_library_cache
+
+    dgn_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> dgn_library_cache = units
+
+    dgn_library_cache
+end dgn_library
+
+private dgn_no_library() -> bool
+    if dgn_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end dgn_no_library
+
+// The whole report the files of one program are refused with, rendered the way a reader sees it.
+// A file that does not parse answers with the parser's own report, since nothing after it ran.
+private dgn_err(files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+    val library = dgn_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok()
+            val said = parsed.report.render(parsed.src)
+
+            return if said.ends_with("\n") then said[0..<said.bytes.len - 1] else said
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end dgn_err
+
+private dgn_rendered(text: string) -> string = dgn_err([("t.sysl", text)])
+
+// The first line of a report: the message itself, without the source excerpt under it.
+private dgn_headline(files: []const (string, string)) -> string
+    val all = lines_of(dgn_err(files))
+
+    if all.is_empty() then "" else all.at(0)
+
+// The `-->` line of the first diagnostic a program is refused with, as `<line>:<col>`.
+private dgn_location(text: string) -> string
+    val all = lines_of(dgn_rendered(text))
+    val marker = "--> t.sysl:"
+
+    for i in 0..<all.len()
+        all.at(i).index_of(marker) match
+            None -> ()
+            Some(at) -> return all.at(i)[at + marker.bytes.len..<all.at(i).bytes.len]
+
+    s"no position in: ${dgn_rendered(text)}"
+end dgn_location
+
+// The untyped tree of one file with every node's span, as `sysl emit-ast` prints it.
+private dgn_tree(name: string, text: string) -> string = emit_ast(parse(source_of(name, text)).program, true)
+
+// Whether the tree holds a node line `<tag> <span>` directly followed by a line holding `below`.
+private dgn_has_node(tree: string, tag: string, span: string, below: string) -> bool
+    val all = lines_of(tree)
+
+    for i in 0..<all.len() - 1
+        if all.at(i).ends_with(s"$tag $span") && all.at(i + 1).contains(below) then return true
+
+    false
+end dgn_has_node
+
+// -- a module file's declarations are named as they are written ----------------------------------
+
+@test("a module file's function is named by its qualified name")
+dgn_a_function()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_headline([("main.sysl", "print(1)"), ("m/m.sysl", "module m\nuse() -> string = 1\n")]),
+              "error: function 'm.use' should return string, but its body yields int")
+
+@test("a private function is named the same way")
+dgn_a_private_function()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_headline([("main.sysl", "print(1)"),
+                            ("m/m.sysl", "module m\nprivate hid() -> string = 2\n")]),
+              "error: function 'm.hid' should return string, but its body yields int")
+
+// A private declaration of a spelling another file of the module declares publicly is filed under a
+// slot of its own, `m$hid.private1`, and the slot is the compiler's, not the reader's.
+@test("a private function that shadows a sibling file's public one is named without its slot")
+dgn_a_private_function_that_shadows_a_sibling()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_headline([("main.sysl", "print(1)"),
+                            ("m/one.sysl", "module m\nhid() -> int = 1\n"),
+                            ("m/two.sysl", "module m\nprivate hid() -> string = 2\n")]),
+              "error: function 'm.hid' should return string, but its body yields int")
+
+@test("a method is named through its type")
+dgn_a_method()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_headline([("main.sysl", "print(1)"),
+                            ("m/m.sysl", "module m\nstruct P\n    x: int\n\n    get(self) -> string = self.x\n")]),
+              "error: function 'm.P.get' should return string, but its body yields int")
+
+@test("a type a method call is refused on is named the same way")
+dgn_a_type_a_method_call_is_refused_on()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_headline([("main.sysl", "print(1)"),
+                            ("m/m.sysl", "module m\nstruct P\n    x: int\n\nf() -> int = P(1).nope()\n")]),
+              "error: type 'm.P' has no method 'nope'")
+
+@test("a generic function marked '@export' is named the same way")
+dgn_a_generic_function_marked_export()
+    if dgn_no_library() then return
+
+    val said = dgn_headline([("main.sysl", "print(1)"), ("m/m.sysl", "module m\n@export\ngen[T](x: T) -> T = x\n")])
+
+    assert(said.starts_with("error: an exported symbol is one function at one signature, so 'm.gen' " +
+                            "cannot be generic"), said)
+
+// -- the library's declarations are named the same way --------------------------------------------
+
+@test("an argument of a generic method's instantiation names the library's method")
+dgn_an_argument_of_a_generic_methods_instantiation()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_headline([("t.sysl", "import sysl.buf.{Buf, buf}\nvar b: Buf[int] = buf()\nb.push(\"x\")")]),
+              "error: 'v' of 'sysl.buf.Buf.push.int' is int, but string was given")
+
+@test("an argument of a method names the library's method")
+dgn_an_argument_of_a_method()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_headline([("t.sysl", "import sysl.text.str_builder\nvar b = str_builder()\nvar k: int = 42\nb.push_int(k)")]),
+              "error: 'n' of 'sysl.text.StrBuilder.push_int' is long, but int was given")
+
+@test("a property called as a method names the library's type")
+dgn_a_property_called_as_a_method()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_headline([("t.sysl", "import sysl.text.str_builder\nvar b = str_builder()\nb.push(\"hello\")\nprint(b.len())")]),
+              "error: 'len' is a property of 'sysl.text.StrBuilder' — read it as 'value.len', without '()'")
+
+@test("a method a library type does not have names the type")
+dgn_a_method_a_type_does_not_have()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_headline([("t.sysl", "import sysl.fs.open\nvar f = open(\"/tmp/x.txt\")\nf.close()")]),
+              "error: type 'sysl.Result' has no method 'close'")
+
+@test("the root module's declarations were never keyed with a module, and read the same")
+dgn_the_root_modules_declarations_read_the_same()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_headline([("t.sysl", "use() -> string = 1\nprint(1)")]),
+              "error: function 'use' should return string, but its body yields int")
+
+// -- reading a message back ------------------------------------------------------------------------
+
+@test("reading a message back takes the compiler's segments off a quoted key")
+dgn_reading_takes_the_compilers_segments_off()
+    assert_eq(readable_keys("'m$use' and 'a.b$P.get' and 'm$hid.private1' and 'm$pick.private1.1'"),
+              "'m.use' and 'a.b.P.get' and 'm.hid' and 'm.pick'")
+
+@test("reading a message back reads back a '$' a quoted name contributed")
+dgn_reading_reads_back_a_dollar()
+    assert_eq(readable_keys("'m$price$24total'"), "'m.price$total'")
+
+// The reference also leaves `'a b$c'` alone, reading a key only where a whole quoted span is one;
+// `readable_keys` reads any run of name characters with a module in front of a `$`, quoted or not,
+// so that one is read here as `'a b.c'` -- a divergence in what counts as a key, not asserted.
+@test("reading a message back leaves alone what is not a key",
+      ignore: "readable_keys reads unquoted runs and a '$24' guard mark as a key ('m$24x' becomes 'm$x', 'a b$c' becomes 'a b.c'); the reference reads only a whole quoted span whose segment after '$' starts with a letter")
+dgn_reading_leaves_alone_what_is_not_a_key()
+    val untouched = ["expected a name or '{' after '$'",
+                     "'$name' is an interpolation",
+                     "'m.use' is spelled with its module",
+                     "'price 24$' is not a module path",
+                     "'m$' names nothing after the separator",
+                     "'m$24x' begins with a guard mark, not a name",
+                     "an unclosed 'm$use"]
+
+    for i in 0..<untouched.len
+        assert_eq(readable_keys(untouched[i]), untouched[i])
+end dgn_reading_leaves_alone_what_is_not_a_key
+
+@test("a diagnostic carries the readable name as data, not only in what it renders")
+dgn_a_diagnostic_carries_the_readable_name()
+    val one = placed_error(source_of("t.sysl", "x\n"), Span(0, 1), "function 'm$use' is wrong")
+
+    assert_eq(one.diag.message, "function 'm.use' is wrong")
+
+// -- a message naming a member points at the member -----------------------------------------------
+
+@test("a receiver that may not be written through is pointed at by its method's name")
+dgn_a_receiver_that_may_not_be_written_through()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_location("struct C\n    n: int\n\n    bump(*self) = self.n += 1\nend C\n\nval c: C = C(0)\nc.bump()"),
+              "8:3")
+
+@test("a field that is not there is pointed at by its name")
+dgn_a_field_that_is_not_there()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_location("struct S\n    n: int\nend S\n\nvar s = S(1)\nprint(s.missing)"), "6:9")
+
+@test("and a method that is not there")
+dgn_a_method_that_is_not_there()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_location("var n = 1\nprint(n.nope())"), "2:9")
+
+@test("an index of the wrong type is pointed at where it was written between the brackets")
+dgn_an_index_of_the_wrong_type()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_location("var a = [1, 2, 3]\nprint(a[\"x\"])"), "2:9")
+
+// -- a binary operator's mismatch points at the operand that is wrong ------------------------------
+
+@test("a binary operator's mismatch points at the right operand, not the start of the expression")
+dgn_the_right_operand()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_location("print(1 + \"x\")"), "1:11")
+
+@test("wherever that operand was written")
+dgn_wherever_that_operand_was_written()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_location("print(1     +     \"x\")"), "1:19")
+
+@test("and through a compound assignment, at the value")
+dgn_through_a_compound_assignment()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_location("var n = 1\nn += \"x\""), "2:6")
+
+// The message is about the operator and the type it was applied to rather than about one operand, so
+// the caret stays where the expression begins.
+@test("an operator that the type does not have is pointed at where the expression begins")
+dgn_an_operator_the_type_does_not_have()
+    if dgn_no_library() then return
+
+    val out = dgn_rendered("var a = [1, 2, 3]\nprint(a * a)")
+
+    assert(out.starts_with("error: operator '*' is not defined for [3]int\n --> t.sysl:2:7\n"), out)
+
+// -- a literal keyword is complained about where it is written ------------------------------------
+
+@test("the second 'true' in a file")
+dgn_the_second_true()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_location("val ok = true\nprint(1 + true)"), "2:11")
+
+@test("the second 'null'")
+dgn_the_second_null()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_location("var p: *int = null\nprint(1 + null)"), "2:11")
+
+@test("the second '()'")
+dgn_the_second_unit()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_location("val ok = ()\nprint(1 + ())"), "2:11")
+
+@test("the second 'self', in another method")
+dgn_the_second_self()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_location("struct S\n    n: int\n\n    a(self) -> int = self.n\n    b(self) -> int = 1 + self\n"),
+              "5:26")
+
+// -- rendering -------------------------------------------------------------------------------------
+
+@test("the caret is indented with tabs where the line has tabs, so it lands under the column",
+      ignore: "the caret line copies the quoted line's tabs -- sh.sysl.parsing's Diagnostic.render pads by display width instead, a change to the parsing package")
+dgn_the_caret_is_indented_with_tabs()
+    assert_eq(dgn_rendered("a\tb\n"),
+              "error: newline expected\n --> t.sysl:1:3\n  |\n1 | a\tb\n  |  \t^")
+
+@test("a message with no position at all is rendered without one",
+      ignore: "the CLI's refusal of an unreadable build path prints two lines here where the reference prints one 'sysl: error: cannot read …' line")
+dgn_a_message_with_no_position()
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["build", "/nonexistent-dgn/x.sysl"], (line) -> sink.push(line))
+
+    val said = join(lines.view(), "\n")
+
+    assert(code != 0, said)
+    assert_eq(lines.len(), 1)
+    assert(said.index_of("error: ").is_some(), said)
+    assert(said.index_of("-->").is_none(), said)
+end dgn_a_message_with_no_position
+
+// -- an offset becomes a line and a column ---------------------------------------------------------
+
+// An offset is a `usize` here, so there is no place before the beginning to ask about; the nearest
+// one there is answers what the reference answers for `-1`.
+@test("an offset before the beginning answers line one, column one")
+dgn_an_offset_before_the_beginning()
+    assert_eq(source_of("t.sysl", "ab\ncde\n\nf").locate(0), Loc(1, 1))
+
+// -- where the caret lands -------------------------------------------------------------------------
+
+@test("on the opening parenthesis of a tuple argument, not on its first element")
+dgn_on_the_opening_parenthesis_of_a_tuple()
+    if dgn_no_library() then return
+
+    val out = dgn_rendered("zip_len(x: (int, int), y: (int, int)) -> int = x.0 + y.0\nprint(zip_len((1, 2), (3, 4, 5)))\n")
+
+    assert(out.contains("'y' of 'zip_len' is (int, int), but (int, int, int) was given"), out)
+    assert(out.contains("--> t.sysl:2:23"), out)
+
+@test("on the outer parenthesis of a nested tuple argument")
+dgn_on_the_outer_parenthesis_of_a_nested_tuple()
+    if dgn_no_library() then return
+
+    val out = dgn_rendered("f(p: ((int, int), int)) -> int = p.1\nprint(f(((1, 2, 3), 4)))\n")
+
+    assert(out.contains("'p' of 'f' is ((int, int), int), but ((int, int, int), int) was given"), out)
+    assert(out.contains("--> t.sysl:2:9"), out)
+
+@test("on the opening bracket of an array literal argument")
+dgn_on_the_opening_bracket_of_an_array()
+    if dgn_no_library() then return
+
+    assert(dgn_rendered("f(xs: [2]int) -> int = xs[0]\nprint(f([1, 2, 3]))\n").contains("--> t.sysl:2:9"))
+
+@test("on the expression inside a parenthesised argument, not on the parenthesis")
+dgn_on_the_expression_inside_parentheses()
+    if dgn_no_library() then return
+
+    assert(dgn_rendered("add(a: int, b: int) -> int = a + b\nprint(add(1, (\"two\")))\n").contains("--> t.sysl:2:15"))
+
+// -- carried rather than rendered ------------------------------------------------------------------
+
+@test("the rendered report is exactly what the command line prints")
+dgn_the_rendered_report_is_what_the_command_line_prints()
+    if dgn_no_library() then return
+
+    assert_eq(dgn_rendered("var a = nope1\nvar b = nope2\nprint(p.zed)\n"),
+              "error: undefined name 'nope1'\n --> t.sysl:1:9\n  |\n1 | var a = nope1\n  |         ^^^^^\n\n" +
+              "error: undefined name 'nope2'\n --> t.sysl:2:9\n  |\n2 | var b = nope2\n  |         ^^^^^\n\n" +
+              "error: undefined name 'p'\n --> t.sysl:3:7\n  |\n3 | print(p.zed)\n  |       ^")
+
+@test("and so it is for a parse error, which comes from a different stage entirely")
+dgn_and_so_it_is_for_a_parse_error()
+    assert_eq(dgn_rendered("var a = 1\nvar = 5\n"),
+              "error: identifier expected\n --> t.sysl:2:5\n  |\n2 | var = 5\n  |     ^")
+
+@test("source order is by file, then line, then column")
+dgn_source_order()
+    val a = source_of("a.sysl", "xx\nxx\n")
+    val b = source_of("b.sysl", "xx\n")
+    var all: Buf[Placed] = buf()
+
+    all.push(placed_error(b, Span(0, 1), "b:1:1"))
+    all.push(placed_error(a, Span(3, 4), "a:2:1"))
+    all.push(placed_error(a, Span(1, 2), "a:1:2"))
+    all.push(placed_error(a, Span(0, 1), "a:1:1"))
+
+    val ordered = in_source_order(all)
+    var got: Buf[string] = buf()
+
+    for i in 0..<ordered.len()
+        got.push(ordered.at(i).diag.message)
+
+    assert_eq(join(got.view(), ","), "a:1:1,a:1:2,a:2:1,b:1:1")
+end dgn_source_order
+
+// -- a node carries the extent it was parsed from --------------------------------------------------
+
+@test("an identifier spans from its first character to just past its last")
+dgn_an_identifier_spans_itself()
+    assert(dgn_has_node(dgn_tree("t.sysl", "var x = 1\nprint(alpha)\n"), "Ident", "2:7-2:12", "\"alpha\""))
+
+@test("a string literal spans its quotes too, so the span is what was written")
+dgn_a_string_literal_spans_its_quotes()
+    assert(dgn_has_node(dgn_tree("t.sysl", "print(\"two\")\n"), "StrLit", "1:7-1:12", "\"two\""))
+
+@test("a text block ends on a later line than it starts")
+dgn_a_text_block_ends_later()
+    assert(dgn_has_node(dgn_tree("t.sysl", "var t = \"\"\"\nspanning\n\"\"\"\nprint(t)\n"),
+                        "StrLit", "1:9-3:4", "spanning"))
+
+@test("a call spans from its callee to its closing bracket")
+dgn_a_call_spans_to_its_bracket()
+    assert(dgn_has_node(dgn_tree("t.sysl", "var x = 1\nprint(alpha)\n"), "expr: Call", "2:1-2:13", "callee: Ident"))
+
+@test("a binary operation spans both its operands and the operator between them")
+dgn_a_binary_operation_spans_both_operands()
+    assert(dgn_has_node(dgn_tree("t.sysl", "var x = 1 + 2\n"), "init: Binary", "1:9-1:14", "\"+\""))
+
+@test("and each operand keeps its own, though a dozen rules passed it through")
+dgn_each_operand_keeps_its_own()
+    assert(dgn_has_node(dgn_tree("t.sysl", "var x = 1 + 2\n"), "left: IntLit", "1:9-1:10", "1"))
+
+@test("a binding spans from its keyword to the end of what it was given")
+dgn_a_binding_spans_to_its_value()
+    assert(dgn_has_node(dgn_tree("t.sysl", "var x = 1 + 2\n"), "- VarDecl", "1:1-1:14", "x"))
+
+@test("a construct written over two lines ends on the second of them")
+dgn_a_construct_over_two_lines()
+    assert(dgn_has_node(dgn_tree("t.sysl", "var x = (1 +\n    2)\n"), "- VarDecl", "1:1-2:7", "x"))
+
+@test("a node whose last token is the file's last token ends where the token does")
+dgn_a_node_ending_the_file()
+    assert(dgn_has_node(dgn_tree("t.sysl", "print(alpha)"), "expr: Call", "1:1-1:13", "callee: Ident"))
+
+@test("a call covers the whole of itself")
+dgn_a_call_covers_the_whole_of_itself()
+    assert(dgn_has_node(dgn_tree("t.sysl", "var x = 1\nprint(alpha)\n"), "expr: Call", "2:1-2:13", "callee: Ident"))
+
+// -- a span is widened, never shortened ------------------------------------------------------------
+//
+// Over `abcdef\n\nx\n`: the span is `bc`, columns 2 to 4 of line 1. A node's span is joined with
+// the span from its start to the end it is offered (`to`, the smallest span covering both), and for
+// a rule that consumed nothing that end is a place before the span began.
+
+private dgn_widened(upto: usize) -> string
+    val src = source_of("t.sysl", "abcdef\n\nx\n")
+    val got = Span(1, 3).to(Span(1, upto))
+
+    s"${src.locate(got.start)}-${src.locate(got.end)}"
+
+@test("a span is widened out to a later column on the same line")
+dgn_widened_to_a_later_column()
+    assert_eq(dgn_widened(5), "1:2-1:6")
+
+@test("a span is widened out to a later line")
+dgn_widened_to_a_later_line()
+    assert_eq(dgn_widened(8), "1:2-3:1")
+
+@test("and not back to an earlier one, which is what a rule that consumed nothing offers")
+dgn_not_back_to_an_earlier_column()
+    assert_eq(dgn_widened(1), "1:2-1:4")
+    assert_eq(dgn_widened(2), "1:2-1:4")
+
+@test("nor back to an earlier line")
+dgn_nor_back_to_an_earlier_line()
+    assert_eq(dgn_widened(0), "1:2-1:4")
+
+@test("an end it already has costs nothing and changes nothing")
+dgn_an_end_it_already_has()
+    assert_eq(dgn_widened(3), "1:2-1:4")
+
+// -- positions and structural equality -------------------------------------------------------------
+
+// A position is offsets into the text, not a property of the file, so the same text parses to the
+// same tree wherever it was read from -- spans and all.
+@test("two parses of the same text from different files compare equal")
+dgn_two_parses_compare_equal()
+    assert_eq(dgn_body("a.sysl"), dgn_body("b.sysl"))
+
+// The tree a file parses to, spans and all, without the line naming the file it came from.
+private dgn_body(name: string) -> string
+    val all = lines_of(dgn_tree(name, "var x = 1 + 2"))
+    var kept: Buf[string] = buf()
+
+    for i in 0..<all.len()
+        if !all.at(i).trim().starts_with("source:") then kept.push(all.at(i))
+
+    join(kept.view(), "\n")
+end dgn_body
+
+@test("even though each tree really does carry its own file's positions")
+dgn_each_tree_carries_its_own_file()
+    assert_eq(parse(source_of("a.sysl", "var x = 1 + 2")).program.src.name, "a.sysl")
+    assert_eq(parse(source_of("b.sysl", "var x = 1 + 2")).program.src.name, "b.sysl")
+
+// -- the reference's two-position model ------------------------------------------------------------
+
+@test("a call still points a diagnostic at its callee, as an anchor apart from its extent",
+      ignore: "a node's diagnostic anchor separate from its extent (CLAUDE.md § Open divergences, the spans)")
+dgn_a_call_anchors_at_its_callee()
+    assert(dgn_has_node(dgn_tree("t.sysl", "var x = 1\nprint(alpha)\n"), "expr: Call", "2:1-2:6", "callee: Ident"))
+
+@test("a field selection points at the member and covers the receiver too",
+      ignore: "a node's diagnostic anchor separate from its extent (CLAUDE.md § Open divergences, the spans)")
+dgn_a_field_selection_anchor_and_extent()
+    assert(dgn_has_node(dgn_tree("t.sysl", "var p = 1\nprint(p.missing)\n"), "Field", "2:7-2:16", "p"))
+
+@test("a node with no extent of its own falls back to where it points",
+      ignore: "a node's diagnostic anchor separate from its extent (CLAUDE.md § Open divergences, the spans)")
+dgn_a_node_with_no_extent_falls_back()
+    assert(false)
