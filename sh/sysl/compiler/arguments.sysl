@@ -72,8 +72,45 @@ bind_params(cx: &Analyzer, span: Span, subject: string, params: Buf[Param], vari
         return None
     end if
 
+    if !block_reads(cx, params, slots, report) then return None
+
     Some(thunked(params, slots))
 end bind_params
+
+// **Which reading a trailing block gets is read off the parameter AS WRITTEN**: an array of its lines
+// at a collection, a closure over them at a callable (a by-name parameter being one, and a bare arrow
+// having become a call-bounded type parameter by now). A parameter that is neither is refused here,
+// naming it, rather than left to a type mismatch about a closure the reader never wrote.
+private block_reads(cx: &Analyzer, params: Buf[Param], slots: Buf[Option[Expr]], report: bool) -> bool
+    for i in 0..<slots.len()
+        if i >= params.len() then break
+
+        slots.at(i) match
+            Some(a) if is_block(a) ->
+                val p = params.at(i)
+
+                if !p.by_name && !block_fits(p.typ)
+                    cx.fault(a.span, if !report then "a block at neither" else
+                             s"a trailing block stands at '${p.name}', which is a '${type_text(p.typ)}' — " +
+                             "a block fills a collection parameter as an array of its lines, or a " +
+                             "callable parameter as a closure over them, and this is neither")
+                    return false
+                end if
+            _ -> ()
+
+    true
+end block_reads
+
+private block_fits(t: TypeRef) -> bool = *t.kind match
+    RefType(inner, _) -> block_fits(inner)
+    PtrType(inner) -> block_fits(inner)
+    WeakType(inner) -> block_fits(inner)
+    VolatileType(inner) -> block_fits(inner)
+    ArrayType(_, _, _) -> true
+    FnType(_, _, _) -> true
+    CFnType(_, _) -> true
+    NamedType(name, _) -> is_call_bound(name)
+    _ -> false
 
 // An argument at a by-name parameter (`x: -> T`) becomes the closure `() -> arg`, so it is not
 // evaluated where it is written and the body evaluates it at each use. It runs after binding, the
@@ -213,7 +250,17 @@ private place_by_name(cx: &Analyzer, subject: string, names: Buf[string], args: 
         for i in 0..<slots.len()
             if free < 0 && slots.at(i).is_none() then free = int(i)
 
-        if free < 0 then extra += 1 else slots.set(usize(free), Some(args.at(n)))
+        // With every parameter already written -- or only a variadic's tail left, which stands at
+        // no parameter -- there is nothing to read the block against.
+        if free < 0
+            cx.fault(args.at(n).span, if !report then "no parameter for the block" else
+                     "there is no parameter for this trailing block to stand at — a block fills the " +
+                     "parameter its position gives it, exactly as an argument written in the " +
+                     "parentheses does")
+            return None
+        end if
+
+        slots.set(usize(free), Some(args.at(n)))
     end if
 
     Some(extra)
