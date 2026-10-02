@@ -1,0 +1,562 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The raw tier at run time (`reference/memory.md § Reinterpreting storage`): what a type's storage
+// costs, as a program is told it by `sizeof` and `alignof`, and reading an address as a pointer to
+// something else. The three operations exist for one customer between them -- an allocator carves
+// bytes, hands back a typed pointer, and has to know how wide the thing it points at is -- so the
+// file ends with that program rather than only with the pieces.
+//
+// `tests_layout.sysl` asks the compiler's own model the same questions; these ask a PROGRAM, which
+// is the claim the reference chapters make.
+//
+// **Every string quoted here was read out of the reference compiler (0.0.157)**, whose
+// `RawStorageRunTests` these are.
+
+private var rsx_library_cache: Buf[Program] = buf()
+private var rsx_library_read: bool = false
+
+private rsx_library() -> Buf[Program]
+    if rsx_library_read then return rsx_library_cache
+
+    rsx_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> rsx_library_cache = units
+
+    rsx_library_cache
+end rsx_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private rsx_ready() -> bool
+    if rsx_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end rsx_ready
+
+private rsx_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program PRINTS.
+private rsx_ran(text: string) -> string
+    val root = make_temp_dir("sysl-raw-storage").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end rsx_ran
+
+// Everything a source has to say for itself, taken through the lowering.
+private rsx_err(text: string) -> string
+    val root = make_temp_dir("sysl-raw-storage").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rsx_err
+
+// ---- the address of a function is an address -------------------------------------------------
+
+@test("'usize' reads one, and it is the same number 'ptr_cast' gives")
+rsx_usize_reads_a_function_address()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        f(n: int) -> int = n
+        val a = usize(&f)
+        val b: *u8 = ptr_cast(&f)
+        print(a == usize(b), a != 0)
+        """), "true true\n")
+
+@test("a fixed width is refused, exactly as it is for a data pointer")
+rsx_a_function_address_refuses_a_fixed_width()
+    if !rsx_ready() then return
+
+    val said = rsx_err("f(n: int) -> int = n\nprint(u32(&f))\n")
+
+    assert(rsx_says(said, "is read as 'usize' or 'isize'"), said)
+
+// ---- 'sizeof' answers what the compiler already measures --------------------------------------
+
+@test("scalars are their own width")
+rsx_scalars_are_their_own_width()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("print(sizeof(u8), sizeof(int), sizeof(i64), sizeof(real), sizeof(bool), sizeof(char))\n"),
+        "1 4 8 8 1 4\n")
+
+@test("an address is eight bytes whatever it points at")
+rsx_an_address_is_eight_bytes()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("struct Node\n    v: int\nprint(sizeof(*u8), sizeof(*Node), sizeof(&Node))\n"), "8 8 8\n")
+
+@test("an array is its elements end to end, and is also the stride")
+rsx_an_array_is_its_elements_end_to_end()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("print(sizeof([16]u8), sizeof([16]int), sizeof([0]int))\n"), "16 64 0\n")
+
+@test("a slice and a string are three words, as this chapter says they are")
+rsx_a_slice_and_a_string_are_three_words()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("print(sizeof([]int), sizeof(string))\n"), "24 24\n")
+
+@test("a struct is laid out in declaration order, padding included")
+rsx_a_struct_is_laid_out_in_declaration_order()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        struct Node
+            value: int
+            next: *Node
+        struct Packed
+            a: u8
+            b: u8
+        print(sizeof(Node), sizeof(Packed))
+        """), "16 2\n")
+
+@test("the order is the programmer's, so two of the same fields can cost differently")
+rsx_the_order_is_the_programmers()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        struct Loose
+            a: u8
+            b: i64
+            c: u8
+        struct Tight
+            b: i64
+            a: u8
+            c: u8
+        print(sizeof(Loose), sizeof(Tight))
+        """), "24 16\n")
+
+@test("a tuple lays out as the struct it is")
+rsx_a_tuple_lays_out_as_a_struct()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("print(sizeof((int, real)), sizeof((u8, u8)))\n"), "16 2\n")
+
+@test("'alignof' answers the other half")
+rsx_alignof_answers_the_other_half()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        struct Node
+            value: int
+            next: *Node
+        print(alignof(u8), alignof(int), alignof(real), alignof(*u8), alignof(Node), alignof([16]u8))
+        """), "1 4 8 8 8 1\n")
+
+// ---- what the reference claims about storage, now that a program can ask ----------------------
+
+// `reference/types.md § Structs`
+@test("fields are laid out in declaration order and never reordered")
+rsx_fields_are_never_reordered()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        struct Ordered
+            a: u8
+            b: i64
+        var o = Ordered(1u8, 2)
+        print(sizeof(Ordered) == 16, usize(&o.b) - usize(&o.a))
+        """), "true 8\n")
+
+@test("`03` — a data enum's payload is one region, so four variants of one scalar are one scalar wide")
+rsx_a_data_enum_payload_is_one_region()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        enum Step
+            Wait(ticks: int)
+            Move(by: int)
+            Tick(n: int)
+            Flag(f: u8)
+        print(sizeof(Step))
+        """), "8\n")
+
+// A niche is not read out of the reference yet, so the tag costs a word of its own.
+@test("an Option of a reference is sixteen bytes, which is the tag width it wants to narrow")
+rsx_an_option_of_a_reference_is_sixteen_bytes()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("struct Node\n    v: int\nprint(sizeof(Option[&Node]))\n"), "16\n")
+
+@test("`03` — a pointer to a trait is two words, since it carries the table too")
+rsx_a_pointer_to_a_trait_is_two_words()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        trait Shape
+            area(self) -> int
+        print(sizeof(*Shape), sizeof(&Shape), alignof(*Shape))
+        """), "16 16 8\n")
+
+@test("`03` — a weak reference is an address like the other two, and the same width")
+rsx_a_weak_reference_is_an_address()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("struct Node\n    v: int\nprint(sizeof(weak Node), alignof(weak Node))\n"), "8 8\n")
+
+// `reference/types.md § Integers are an open family`
+@test("an odd width costs what LLVM makes it cost, not its bit count over eight")
+rsx_an_odd_width_costs_what_llvm_makes_it_cost()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("print(sizeof(u12), alignof(u12), sizeof(u96), alignof(u96))\n"), "2 2 16 16\n")
+
+// `reference/errors.md § What the type's own name offers: :: attributes`
+@test("a constrained subtype is laid out as the type it constrains")
+rsx_a_constrained_subtype_is_laid_out_as_its_base()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        type Age = int within 0..150
+        print(sizeof(Age) == sizeof(int), alignof(Age) == alignof(int))
+        """), "true true\n")
+
+// `reference/types.md § Tuples`. An array of them is a different question, refused outright.
+@test("a zero-sized type occupies nothing, and is still aligned to something")
+rsx_a_zero_sized_type_occupies_nothing()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("print(sizeof(unit), alignof(unit))\n"), "0 1\n")
+
+@test("a struct field that occupies nothing changes neither measurement")
+rsx_a_field_that_occupies_nothing()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        struct WithNothing
+            a: int
+            n: unit
+            b: int
+        print(sizeof(WithNothing), alignof(WithNothing))
+        """), "8 4\n")
+
+// ---- both are compile-time constants, so they stand where a constant is required -------------
+
+@test("in a 'const'")
+rsx_sizeof_in_a_const()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("struct Node\n    v: int\n    n: *Node\nconst BLOCK: usize = sizeof(Node)\nprint(BLOCK)\n"),
+        "16\n")
+
+@test("in an array bound, arithmetic included")
+rsx_sizeof_in_an_array_bound()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        struct Node
+            v: int
+            n: *Node
+        var slab: [sizeof(Node) * 4]u8 = [0u8; sizeof(Node) * 4]
+        print(slab.len)
+        """), "64\n")
+
+@test("in a 'require'")
+rsx_sizeof_in_a_require()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("check(n: int)\n    require sizeof(int) == 4\n    print(n)\ncheck(7)\n"), "7\n")
+
+// ---- a type parameter may be asked, and answers per instantiation -----------------------------
+
+@test("a type parameter may be asked, and answers per instantiation")
+rsx_a_type_parameter_may_be_asked()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        width[T](x: T) -> usize
+            sizeof(T)
+        struct Node
+            v: int
+            n: *Node
+        var node = Node(1, null)
+        print(width(3u8), width(3.0), width(&node), width(node))
+        """), "1 8 8 16\n")
+
+// A body is analyzed once per instantiation with its parameters bound to real types, so a length
+// measuring one is a constant everywhere code is generated; the single walk over the generic body
+// itself stands the array at length zero and compiles nothing from it.
+@test("and is sized per instantiation, not once")
+rsx_a_bound_is_sized_per_instantiation()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        buflen[T](x: T) -> int
+            var buf: [sizeof(T) * 3 + 1]u8
+            int(buf.len)
+        struct P
+            x: int
+            y: int
+        var a: u8 = 1
+        var b: u32 = 1
+        var c: u128 = 1
+        var p = P(1, 2)
+        print(buflen(a), buflen(b), buflen(c), buflen(p))
+        """), "4 13 49 25\n")
+
+// Writing to the last element is what proves the array is that long.
+@test("and the storage it names is real, to its last element")
+rsx_a_measured_bound_names_real_storage()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        ends[T](x: T) -> int
+            var buf: [sizeof(T) * 3 + 1]u8
+            var i = 0usize
+            while i < buf.len
+                buf[i] = u8(65 + int(i) % 26)
+                i += 1usize
+            int(buf[0]) + int(buf[buf.len - 1usize])
+        var a: u8 = 1
+        var b: u32 = 1
+        print(ends(a), ends(b))
+        """), "133 142\n")
+
+// A repeat count is a bound too: the declaration and the initializer of one array must agree about
+// whether its length exists.
+@test("and the fill that initializes such an array measures the same parameter")
+rsx_a_fill_measures_the_same_parameter()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        cap[T](x: T) -> usize
+            val buf: [sizeof(T)]u8 = [0; sizeof(T)]
+            buf.len
+        var a: u8 = 1
+        var b: u32 = 1
+        print(cap(a), cap(b))
+        """), "1 4\n")
+
+@test("and 'alignof' reaches it by the same route")
+rsx_alignof_in_a_bound_measures_a_parameter()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        pad[T](x: T) -> int
+            var buf: [alignof(T) * 2]u8
+            int(buf.len)
+        var a: u8 = 1
+        var b: u64 = 1
+        print(pad(a), pad(b))
+        """), "2 16\n")
+
+// A length measuring a parameter does not fold YET, while a length over a variable never will; only
+// the second is a mistake, and it has to stay one.
+@test("while a length that is merely not constant is still refused")
+rsx_a_length_that_is_not_constant_is_refused()
+    if !rsx_ready() then return
+
+    val said = rsx_err(raw"""
+        f[T](x: T, n: usize) -> int
+            var buf: [n]u8
+            int(buf.len)
+        var a: u8 = 1
+        print(f(a, 4usize))
+        """)
+
+    assert(rsx_says(said, "an array length must be a constant"), said)
+
+// ---- an address is read as a number, and the number back as an address -----------------------
+
+@test("the round trip is the identity")
+rsx_the_address_round_trip_is_the_identity()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        var arena: [64]u8 = [0u8; 64]
+        var p: *u8 = &arena[8]
+        var n = usize(p)
+        var q: *u8 = ptr_cast(n)
+        print(q == p)
+        """), "true\n")
+
+@test("the number is an address, so a difference of addresses counts bytes")
+rsx_a_difference_of_addresses_counts_bytes()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("var arena: [64]u8 = [0u8; 64]\nprint(usize(&arena[8]) - usize(&arena[0]))\n"), "8\n")
+
+@test("'isize' takes one too")
+rsx_isize_takes_an_address()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("var arena: [8]u8 = [0u8; 8]\nprint(isize(&arena[0]) > 0)\n"), "true\n")
+
+// ---- a pointer read as another pointee reaches the same storage -------------------------------
+
+@test("a write through the reinterpreted pointer lands in the bytes it came from")
+rsx_a_reinterpreted_write_lands_in_the_bytes()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        struct Pair
+            a: u8
+            b: u8
+        var arena: [8]u8 = [0u8; 8]
+        var pair: *Pair = ptr_cast(&arena[0])
+        pair.a = 3u8
+        pair.b = 9u8
+        print(arena[0], arena[1], arena[2])
+        """), "3 9 0\n")
+
+@test("and the reinterpretation is reversible")
+rsx_the_reinterpretation_is_reversible()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        struct Pair
+            a: u8
+            b: u8
+        var arena: [8]u8 = [0u8; 8]
+        var pair: *Pair = ptr_cast(&arena[0])
+        var back: *u8 = ptr_cast(pair)
+        back[1] = 5u8
+        print(pair.b)
+        """), "5\n")
+
+@test("a result position supplies the target as a binding does")
+rsx_a_result_position_supplies_the_target()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        struct Node
+            v: int
+            n: *Node
+        head(p: *u8) -> *Node
+            ptr_cast(p)
+        var arena: [32]u8 = [0u8; 32]
+        var node = head(&arena[0])
+        node.v = 11
+        node.n = null
+        print(node.v, node.n == null)
+        """), "11 true\n")
+
+@test("so does a field's declared type")
+rsx_a_field_type_supplies_the_target()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        struct Node
+            v: int
+            n: *Node
+        struct Slab
+            first: *Node
+        var arena: [32]u8 = [0u8; 32]
+        var s = Slab(ptr_cast(&arena[0]))
+        s.first.v = 4
+        print(s.first.v)
+        """), "4\n")
+
+// ---- the arithmetic an allocator walks with ---------------------------------------------------
+
+@test("a write through a raw pointer at a literal index")
+rsx_a_write_at_a_literal_index()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran("var arena: [64]u8 = [0u8; 64]\nvar p: *u8 = &arena[0]\np[16] = 9u8\nprint(arena[16])\n"),
+        "9\n")
+
+@test("an element address at a computed index")
+rsx_an_element_address_at_a_computed_index()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        var arena: [64]u8 = [0u8; 64]
+        var i = 32
+        var q: *u8 = &arena[i]
+        *q = 5u8
+        print(arena[32])
+        """), "5\n")
+
+@test("a bare pointer advanced inside a function that never sees the array")
+rsx_a_bare_pointer_advanced_in_a_function()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        at(p: *u8, i: int) -> *u8
+            &p[i]
+        var arena: [64]u8 = [0u8; 64]
+        var q = at(&arena[0], 40)
+        *q = 3u8
+        print(arena[40])
+        """), "3\n")
+
+// The program the section exists for: a slab carved out of a fixed array, generic in what it holds,
+// with the free list threaded through the free blocks' own storage. `sizeof(T)` sizes the block,
+// `&p[i]` finds it, and `ptr_cast` hands back something typed at each end.
+@test("a generic slab allocator, which needs all three")
+rsx_a_generic_slab_allocator()
+    if !rsx_ready() then return
+
+    assert_eq(rsx_ran(raw"""
+        struct Node
+            value: int
+            next: *Node
+
+        carve[T](p: *u8, i: usize) -> *T
+            ptr_cast(&p[i * sizeof(T)])
+
+        var arena: [128]u8 = [0u8; 128]
+        var base: *u8 = &arena[0]
+
+        // Thread a free list through the blocks themselves, back to front.
+        var free: *Node = null
+        var i = 0
+        while i < 4 do
+            var block: *Node = carve(base, usize(3 - i))
+            block.value = 3 - i
+            block.next = free
+            free = block
+            i += 1
+
+        // Walking it visits the blocks in the order they were pushed.
+        var walk = free
+        while walk != null do
+            print(walk.value, usize(walk) - usize(base))
+            walk = walk.next
+        """), "0 0\n1 16\n2 32\n3 48\n")
