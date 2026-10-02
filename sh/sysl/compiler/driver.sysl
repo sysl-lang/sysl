@@ -421,7 +421,7 @@ emit_llvm_text(path: string, named_target: Option[string],
 
     val promotions = post_analysis_checks(done.an, whole, program.own)
 
-    explain_promotions(promotions, program.own, done.an)
+    explain_promotions(promotions, program, done.an)
 
     // The tests go next, and they go **after** the analysis rather than instead of it: a `@test`
     // that does not compile is an error in a build that would never have run it, which is what makes
@@ -458,16 +458,25 @@ end emit_llvm_text
 // What `--explain-escapes` reports about the program's own files: one line per array the escape
 // analysis moved to the heap. A program that failed to compile reports nothing, since it was never
 // going to allocate anything.
-private explain_promotions(pr: Promotions, own: Buf[string], an: &Analysis)
+private explain_promotions(pr: Promotions, program: Compilation, an: &Analysis)
     if !errors_of(an.diagnostics()).is_empty() then return
+
+    // The files of the modules the program declared, which is what a note is about.
+    var files: Buf[string] = buf()
+
+    for i in 0..<program.units.len()
+        val unit = program.units.at(i)
+
+        for j in 0..<program.own.len()
+            if program.own.at(j) == module_written(unit)
+                files.push(unit.src.name)
+                break
 
     var lines: Buf[string] = buf()
 
     for i in 0..<pr.notes.len()
-        val file = pr.notes.at(i).0
-
-        for j in 0..<own.len()
-            if own.at(j) == file
+        for j in 0..<files.len()
+            if files.at(j) == pr.notes.at(i).0
                 lines.push(pr.notes.at(i).1)
                 break
 
@@ -987,7 +996,7 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
     val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
     val promotions = post_analysis_checks(done.an, whole, program.own)
 
-    explain_promotions(promotions, program.own, done.an)
+    explain_promotions(promotions, program, done.an)
 
     val kept = prune(strip_tests(whole), program.own)
     val lowered = codegen_with_gaps(kept, t, promotions)
