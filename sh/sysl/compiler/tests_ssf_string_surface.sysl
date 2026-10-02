@@ -1,0 +1,412 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The reference's `StringSurfaceTests`: the operations of `reference/strings.md` that make new
+// bytes — `s.copy()`, `string(c)`, `StrBuilder` and `cstring(s)`. Every one of them allocates,
+// which is also what decides their spellings: `copy` and `finish` take parentheses because they walk
+// the bytes, where `len` beside them reads a word already there; `string(c)` is a conversion because
+// a `char` has exactly one encoding, where `str(x)` is a rendering because a number has several.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.157)** by
+// handing the installed `sysl` the same program. The harness is `tests_xvr_extern_var.sysl`'s:
+// `xvr_ran` builds and runs a program and answers with the build's refusal where there is one.
+
+// `StrBuilder`, `cstring` and `CString` are `sysl.text`'s, so a program that makes new bytes asks
+// for the module; it is written once here, since what these tests are about is the bytes.
+private ssf_ran(text: string) -> string = xvr_ran([("main.sysl", "import sysl.text.*\n\n" + text)])
+
+// The same without the import, for the one test whose subject is what a bare name means.
+private ssf_ran_bare(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+// A refusal holding this message.
+private ssf_refused(text: string, message: string)
+    val said = ssf_ran(text)
+
+    assert(said.contains(s"error: $message"), said)
+
+// -- a string copies out of the buffer it was sharing ---------------------------------------------
+
+@test("the copy reads the same bytes")
+ssf_copy_reads_the_same_bytes()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran("var s = \"hello\"\nvar t = s[0..<3usize]\nprint(t.copy(), t.copy().len, t.copy() == t)\n"),
+              "hel 3 true\n")
+
+// The parent is a heap string, freed the moment nothing holds it, so a copy that had kept a view of
+// its bytes would read whatever the allocations after it left behind.
+@test("and it no longer holds the buffer it came from")
+ssf_copy_no_longer_holds_the_buffer()
+    if xvr_no_library() then return
+
+    val text = "grab() -> string\n" +
+               "    var whole = \"0123456789\" + \"0123456789\"\n" +
+               "    whole[3..<5usize].copy()\n" +
+               "end grab\n" +
+               "var kept = grab()\n" +
+               "var i = 0\n" +
+               "while i < 200000\n" +
+               "    var junk = \"0123456789\" + \"0123456789\"\n" +
+               "    if junk.len != 20usize then exit(1)\n" +
+               "    i += 1\n" +
+               "print(kept, kept.len)\n"
+
+    assert_eq(ssf_ran(text), "34 2\n")
+end ssf_copy_no_longer_holds_the_buffer
+
+@test("an empty string copies to an empty string")
+ssf_copy_empty()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran("print(\"\".copy().len)\n"), "0\n")
+
+// A literal's bytes are immortal and its owner word is null, so the copy is the first version of
+// those bytes that anything counts.
+@test("a literal copies too, and the copy owns what the literal did not")
+ssf_copy_literal()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran("var c = \"abc\".copy()\nprint(c, c.len)\n"), "abc 3\n")
+
+// -- and it is a method, because it costs something -----------------------------------------------
+
+@test("read without parentheses it says so")
+ssf_copy_without_parentheses()
+    if xvr_no_library() then return
+
+    ssf_refused("var x = \"a\".copy\n",
+                "'copy' is a method of 'string' — call it with 'copy()', since it allocates and copies " +
+                "the bytes rather than naming what is already there")
+
+@test("it takes nothing, since what it copies is what it was read off")
+ssf_copy_takes_nothing()
+    if xvr_no_library() then return
+
+    ssf_refused("var x = \"a\".copy(1)\n", "'copy' takes no arguments — it copies the string it is read off")
+
+// A compiler-provided member is reached ahead of the member table, so an `impl` may not declare one
+// of the same name — it would be registered and never found.
+@test("and an 'impl' may not declare one of the same name")
+ssf_copy_impl_may_not_declare_it()
+    if xvr_no_library() then return
+
+    ssf_refused("trait Show\n    show(self) -> int\nimpl Show for string\n    copy(self) -> int = 1\n" +
+                "    show(self) -> int = 2\nprint(1)\n",
+                "trait 'Show' declares no method 'copy', so this 'impl' cannot define it")
+
+// An unbounded parameter permits only what every type supports, and no trait declares `copy`.
+@test("a type parameter cannot reach it, and no bound would help")
+ssf_copy_type_parameter()
+    if xvr_no_library() then return
+
+    ssf_refused("f[T](x: T) = x.copy()\nprint(1)\n",
+                "no trait declares a method 'copy', so no bound on 'T' could license this call")
+
+// -- a char converts to the string that spells it -------------------------------------------------
+
+@test("one scalar value becomes its UTF-8")
+ssf_char_becomes_utf8()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran("print(string('A'), string('\\u{2603}'))\n"), "A ☃\n")
+
+// The four codepoint ranges are the four byte lengths.
+@test("and the byte length is the encoding's, not one")
+ssf_char_byte_length()
+    if xvr_no_library() then return
+
+    val text = "print(string('\\u{7f}').len, string('\\u{80}').len, string('\\u{7ff}').len)\n" +
+               "print(string('\\u{800}').len, string('\\u{ffff}').len, string('\\u{10000}').len)\n" +
+               "print(string('\\u{10ffff}').len)\n"
+
+    assert_eq(ssf_ran(text), "1 2 2\n3 3 4\n4\n")
+end ssf_char_byte_length
+
+// A `string` carries a length rather than a terminator, so NUL is an ordinary byte.
+@test("including the null character, which is one byte and not the end of anything")
+ssf_char_null()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran("print(string('\\u{0}').len)\n"), "1\n")
+
+@test("and it agrees with 'str' of the same char")
+ssf_char_agrees_with_str()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran("print(string('\\u{10ffff}') == str('\\u{10ffff}'), string('q') == str('q'))\n"),
+              "true true\n")
+
+@test("a value that is not a char is sent to the form that renders")
+ssf_string_of_int()
+    if xvr_no_library() then return
+
+    ssf_refused("var x = string(5)\n",
+                "a 'string' conversion encodes a char, and int is not one — 'str(x)' renders a value as text")
+
+@test("a real too, since a number has a rendering rather than an encoding")
+ssf_string_of_real()
+    if xvr_no_library() then return
+
+    ssf_refused("var x = string(3.0)\n",
+                "a 'string' conversion encodes a char, and real is not one — 'str(x)' renders a value as text")
+
+@test("bytes are sent to the form that validates them")
+ssf_string_of_bytes()
+    if xvr_no_library() then return
+
+    ssf_refused("var b: []u8 = [104u8, 105u8]\nvar x = string(b)\n",
+                "a 'string' conversion encodes a char — bytes are already text or are not, so " +
+                "'sysl.text.from_utf8(b)' is what says which")
+
+@test("and a string is told it is already one")
+ssf_string_of_string()
+    if xvr_no_library() then return
+
+    ssf_refused("var x = string(\"a\")\n", "a 'string' conversion encodes a char, and this value is already a string")
+
+@test("it takes exactly one value")
+ssf_string_of_nothing()
+    if xvr_no_library() then return
+
+    ssf_refused("var x = string()\n", "a 'string' conversion takes exactly one value")
+
+// -- a builder appends without rebuilding what it already has -------------------------------------
+
+@test("strings and chars go in, one string comes out")
+ssf_builder_strings_and_chars()
+    if xvr_no_library() then return
+
+    val text = "var b = str_builder()\nb.push(\"he\")\nb.push_char('l')\nb.push(\"lo \")\n" +
+               "b.push(str(42))\nprint(b.finish(), b.len, b.is_empty)\n"
+
+    assert_eq(ssf_ran(text), "hello 42 8 false\n")
+
+@test("a fresh one is empty, and so is what it finishes to")
+ssf_builder_fresh()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran("var b = str_builder()\nprint(b.len, b.is_empty, b.finish().len)\n"), "0 true 0\n")
+
+// `finish` copies rather than views, so what it handed back is not disturbed by a later push.
+@test("and what it hands back does not change when the builder does")
+ssf_builder_finish_copies()
+    if xvr_no_library() then return
+
+    val text = "var b = str_builder()\nb.push(\"abc\")\nvar first = b.finish()\nb.push(\"def\")\n" +
+               "print(first, first.len, b.finish(), b.len)\n"
+
+    assert_eq(ssf_ran(text), "abc 3 abcdef 6\n")
+
+@test("clearing empties it without disturbing what it already handed out")
+ssf_builder_clear()
+    if xvr_no_library() then return
+
+    val text = "var b = str_builder()\nb.push(\"abc\")\nvar first = b.finish()\nb.clear()\n" +
+               "b.push(\"z\")\nprint(first, b.finish(), b.len)\n"
+
+    assert_eq(ssf_ran(text), "abc z 1\n")
+
+@test("it grows past its initial capacity as often as it needs to")
+ssf_builder_grows()
+    if xvr_no_library() then return
+
+    val text = "var b = str_builder()\nvar k = 0\nwhile k < 1000\n    b.push(\"ab\")\n    k += 1\n" +
+               "print(b.len, b.finish().len)\n"
+
+    assert_eq(ssf_ran(text), "2000 2000\n")
+
+// `push_char` encodes into the buffer directly, so the two encoders are checked against each other.
+@test("and a pushed char is encoded exactly as 'string(c)' encodes it")
+ssf_builder_push_char_encodes()
+    if xvr_no_library() then return
+
+    val text = "var b = str_builder()\n" +
+               "b.push_char('\\u{0}')\nb.push_char('\\u{7f}')\nb.push_char('\\u{80}')\nb.push_char('\\u{7ff}')\n" +
+               "b.push_char('\\u{800}')\nb.push_char('\\u{ffff}')\nb.push_char('\\u{10000}')\n" +
+               "b.push_char('\\u{10ffff}')\n" +
+               "var joined = string('\\u{0}') + string('\\u{7f}') + string('\\u{80}') + string('\\u{7ff}')\n" +
+               "var rest = string('\\u{800}') + string('\\u{ffff}') + string('\\u{10000}') + string('\\u{10ffff}')\n" +
+               "print(b.len, b.finish() == joined + rest)\n"
+
+    assert_eq(ssf_ran(text), "20 true\n")
+end ssf_builder_push_char_encodes
+
+@test("and what comes out walks as characters")
+ssf_builder_walks_as_characters()
+    if xvr_no_library() then return
+
+    val text = "var b = str_builder()\nb.push(\"a\")\nb.push_char('\\u{2603}')\nb.push(\"z\")\n" +
+               "var n = 0\nfor c in b.finish().chars do n += 1\nprint(n, b.len)\n"
+
+    assert_eq(ssf_ran(text), "3 5\n")
+
+// -- a builder renders numbers straight into its buffer -------------------------------------------
+
+@test("an integer reads the same as 'str' would have rendered it")
+ssf_builder_push_int()
+    if xvr_no_library() then return
+
+    val text = "var b = str_builder()\nb.push_int(0)\nb.push_char(' ')\nb.push_int(-42)\n" +
+               "b.push_char(' ')\nb.push_int(9223372036854775807)\nprint(b.finish())\n"
+
+    assert_eq(ssf_ran(text), "0 -42 9223372036854775807\n")
+
+// The most negative value, whose magnitude does not fit — the case a digit loop that negates first
+// gets wrong.
+@test("including the value whose magnitude will not fit")
+ssf_builder_push_int_minimum()
+    if xvr_no_library() then return
+
+    val text = "var m: long = -9223372036854775807 - 1\nvar b = str_builder()\nb.push_int(m)\n" +
+               "print(b.finish(), b.finish() == str(m))\n"
+
+    assert_eq(ssf_ran(text), "-9223372036854775808 true\n")
+
+@test("an unsigned value reads at its own width, not as a signed one")
+ssf_builder_push_uint()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran("var b = str_builder()\nb.push_uint(18446744073709551615)\nprint(b.finish())\n"),
+              "18446744073709551615\n")
+
+@test("a float agrees with what 'str' and 'print' give the same value")
+ssf_builder_push_real()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran("var b = str_builder()\nb.push_real(2.5)\nprint(b.finish(), b.finish() == str(2.5))\n"),
+              "2.5 true\n")
+
+@test("a bool is the same two words 'str' renders")
+ssf_builder_push_bool()
+    if xvr_no_library() then return
+
+    val text = "var b = str_builder()\nb.push_bool(true)\nb.push_char(' ')\nb.push_bool(false)\n" +
+               "print(b.finish(), b.finish() == str(true) + \" \" + str(false))\n"
+
+    assert_eq(ssf_ran(text), "true false true\n")
+
+@test("the whole set agrees with the same values pushed through 'str'")
+ssf_builder_cheap_equals_dear()
+    if xvr_no_library() then return
+
+    val text = "var n: long = -7\n" +
+               "var cheap = str_builder()\ncheap.push_int(n)\ncheap.push_real(0.5)\ncheap.push_bool(true)\n" +
+               "var dear = str_builder()\ndear.push(str(n))\ndear.push(str(0.5))\ndear.push(str(true))\n" +
+               "print(cheap.finish() == dear.finish(), cheap.finish())\n"
+
+    assert_eq(ssf_ran(text), "true -70.5true\n")
+
+@test("a builder started with room behaves like any other")
+ssf_builder_with_capacity()
+    if xvr_no_library() then return
+
+    val text = "var b = str_builder_with_capacity(64usize)\nprint(b.len, b.is_empty)\nb.push(\"hello\")\n" +
+               "b.push_int(1)\nprint(b.finish(), b.len)\n"
+
+    assert_eq(ssf_ran(text), "0 true\nhello1 6\n")
+
+@test("and a capacity smaller than the text is not a limit")
+ssf_builder_small_capacity()
+    if xvr_no_library() then return
+
+    val text = "var b = str_builder_with_capacity(2usize)\nvar k = 0\nwhile k < 100\n    b.push(\"xy\")\n" +
+               "    k += 1\nprint(b.len, b.finish().len)\n"
+
+    assert_eq(ssf_ran(text), "200 200\n")
+
+// -- a string copies into the shape C reads -------------------------------------------------------
+
+private const ssf_strlen: string = "extern \"strlen\" c_strlen(p: *u8) -> usize\n"
+
+@test("the copy is NUL-terminated, and C finds the same length sysl does")
+ssf_cstring_terminated()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran(ssf_strlen + "var cs = cstring(\"abc\")\nprint(cs.len, c_strlen(cs.ptr))\n"), "3 3\n")
+
+@test("an empty string still gets its terminator")
+ssf_cstring_empty()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran(ssf_strlen + "var cs = cstring(\"\")\nprint(cs.len, c_strlen(cs.ptr))\n"), "0 0\n")
+
+// A sysl string may hold a NUL as an ordinary byte and C cannot see past one: both answers are
+// right, and they disagree.
+@test("and an interior NUL is where the two notions of length part company")
+ssf_cstring_interior_nul()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran(ssf_strlen + "var cs = cstring(\"a\\0b\")\nprint(cs.len, c_strlen(cs.ptr))\n"), "3 1\n")
+
+@test("the bytes reach C intact")
+ssf_cstring_reaches_c()
+    if xvr_no_library() then return
+
+    val text = "extern \"puts\" c_puts(p: *u8) -> int\nvar cs = cstring(\"hi \" + \"there\")\n" +
+               "var n = c_puts(cs.ptr)\nprint(cs.len)\n"
+
+    assert_eq(ssf_ran(text), "hi there\n8\n")
+
+@test("and it keeps its bytes for as long as it is held")
+ssf_cstring_keeps_its_bytes()
+    if xvr_no_library() then return
+
+    val text = ssf_strlen +
+               "make() -> CString = cstring(\"0123456789\")\n" +
+               "var kept = make()\n" +
+               "var i = 0\n" +
+               "while i < 200000\n" +
+               "    var junk = cstring(\"0123456789\")\n" +
+               "    if junk.len != 10usize then exit(1)\n" +
+               "    i += 1\n" +
+               "print(kept.len, c_strlen(kept.ptr))\n"
+
+    assert_eq(ssf_ran(text), "10 10\n")
+end ssf_cstring_keeps_its_bytes
+
+// -- what the new surface does not quietly become -------------------------------------------------
+
+@test("a library type is not a home for a program's 'impl' of a library trait")
+ssf_no_home_for_library_impl()
+    if xvr_no_library() then return
+
+    ssf_refused("impl Display for CString\n" +
+                "    display(self, out: *Writer, fmt: FormatSpec) = display_str(\"x\", out, fmt)\n" +
+                "print(1)\n",
+                "an 'impl' may be written only in the module that declares the trait or in one that " +
+                "declares a type the block names, and 'sysl.Display' is the library's while nothing in " +
+                "'sysl.text.CString' is declared outside the library — so this one has no home. A trait " +
+                "of your own, or a type of your own in what it is written for or in the trait's " +
+                "arguments, gives it one")
+
+// Written without the import, since the point is what a bare word means once a program has claimed it.
+@test("and a program's own is its own, while the library's stays reachable by its path")
+ssf_program_own_cstring()
+    if xvr_no_library() then return
+
+    assert_eq(ssf_ran_bare("cstring(s: string) -> int = 1\n\nprint(cstring(\"a\"), sysl.text.cstring(\"abc\").len)\n"),
+              "1 3\n")
+
+// A builder that took bytes would be `from_utf8_unchecked` with a longer name.
+@test("a builder takes text rather than bytes")
+ssf_builder_takes_text()
+    if xvr_no_library() then return
+
+    ssf_refused("var b = str_builder()\nvar raw: []u8 = [104u8]\nb.push(raw)\n",
+                "'s' of 'StrBuilder.push' is string, but []byte was given")
+
+// A library declaration nothing calls is neither analyzed nor emitted; a non-generic type's layout
+// is the documented exception, being instantiated where it is declared.
+@test("and a program that uses none of it carries no code for it")
+ssf_quiet_program_carries_none()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", "print(1)\n")])
+
+    assert(!ir.contains("@sysl.text$cstring("), ir)
+    assert(!ir.contains("@sysl.text$str_builder("), ir)
+    assert(!ir.contains("@sysl.text$StrBuilder."), ir)
+    assert(ir.contains("%struct.sysl.text$StrBuilder = type"), ir)
+end ssf_quiet_program_carries_none
