@@ -37,8 +37,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     // one its caller is holding for the length of the call (`borrowing.sysl`). The slot is written
     // either way, because the body addresses it like any other local.
     val found = tail_calls_of(f)
-    val owns = owning(f, e.address_taken.has(f.name), !found.is_empty())
-    val in_place = lends_self(f, e.quiet.has(f.name), e.address_taken.has(f.name), !found.is_empty())
+    val owns = owning(f, e.address_taken.has(f.name), !found.is_empty(), e.inert.has(f.name))
 
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep, so
     // it takes no slot and the emitted signature does not mention it.
@@ -49,15 +48,17 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
             val ty = p.1
             val owned = owns.has(p.0)
 
-            // A large `self` this body only reads, in a body that writes nothing outside its frames
-            // (`lends_self`), is read where the caller's storage lies: nothing can change it while
-            // this runs, so a copy would be indistinguishable from the original and costs a frame
-            // the size of the receiver. The slot's name is kept, as the address it arrived at.
-            if p.0 == "self" && in_place && !owned && e.layout.indirect(ty)
+            // A large one nothing but reading reaches is read where it arrived (`reads_in_place`):
+            // the slot *is* the caller's storage, and only a name for it is made here.
+            if e.in_place.has(f.name + "\n" + p.0)
                 var idx: Buf[IrArg] = buf()
 
                 idx.push(ir_arg(l_i32(), VInt(from_int(0))))
-                e.prologue.push(InGep(VReg("self.addr"), LInt(8), VReg("self.param"), idx))
+                emit(e, InGep(VReg(s"${p.0}.addr"), LInt(8), VReg(s"${p.0}.param"), idx))
+
+                if owned then retain_at(e, ty, VReg(s"${p.0}.addr"))
+                if owned then own_slot(e, p.0, ty)
+
                 continue
 
             alloca(e, VReg(s"${p.0}.addr"), lty(e, ty))

@@ -782,9 +782,9 @@ end dispatch_value
 // One operand of a dispatched operator, in the form the callee receives it: itself where it is a
 // first-class value, and the address of a slot holding it where it is not.
 //
-// The slot is staging and nothing more -- the callee copies out of it at entry and takes its own
-// count there, exactly as it does for an argument whose address the caller already had, so nothing
-// here owns anything and nothing releases it.
+// The slot is staging and nothing more -- a fresh slot nothing else can name, so it is storage the
+// call cannot change, which is all a callee reading its parameter in place needs (`indirect_arg`).
+// It holds a count of nothing, so nothing here releases it.
 private operand_arg(e: *Emit, ty: Type, v: Val) -> IrArg
     if !e.layout.indirect(ty) then return ir_arg(lty(e, ty), v)
 
@@ -1112,7 +1112,7 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
                                 VGlobal(symbol_of(e, name)), args, ty)
 
     var arg_vals: Buf[IrArg] = buf()
-    val staged = staged_args(e, args, &arg_vals, lends_to(e, name))
+    val staged = staged_args(e, args, &arg_vals, e.inert.has(name))
 
     // A call the compiler can see is a call to the same body checks that the measure has gone down.
     // It sits before the call rather than inside the callee, which is what lets it be made out of
@@ -1182,6 +1182,26 @@ arg_value(e: *Emit, a: TExpr, out: *Buf[IrArg])
     else if !zero_sized(ty) then out.push(ir_arg(lty(e, ty), v))
 end arg_value
 
+// The address a large argument crosses at: storage nothing can change for the length of the call.
+//
+// **This is the whole of the by-value promise for a value that crosses in memory**, because the
+// callee reads its parameter where it lies rather than copying it in (`reads_in_place`). Where
+// `still` -- a temporary, a local nobody else can name, or a callee that can write nothing at all --
+// the argument's own storage already is that, and it goes over as it stands. Anything else is a
+// place a call is free to change while the callee is still reading it, so it is staged into a slot
+// of this frame's first: the snapshot `self` promises, with a count taken for what it refers to and
+// given back, at its address, with the scope.
+indirect_arg(e: *Emit, a: TExpr, still: bool) -> Val
+    if still then return address(e, a)
+
+    val ty = texpr_type(a)
+    val slot = alloca(e, fresh_reg(e), lty(e, ty))
+
+    gen_into(e, slot, a)
+    own_at(e, slot, ty)
+    slot
+end indirect_arg
+
 // One argument evaluated, with the caller's side of the convention discharged (`borrowing.sysl`):
 // the callee reads it through a count somebody holds for the length of the call, and where that is
 // not already this frame -- a field, a global, a local whose address got out -- a count is taken
@@ -1191,17 +1211,11 @@ end arg_value
 // written with counts taken and released where the scope holding it ends.
 private guaranteed_arg(e: *Emit, a: TExpr, callee_inert: bool) -> Val
     val ty = texpr_type(a)
-    val guarantee = contains_counted(ty) && !callee_inert && !held(e, a)
+    val still = callee_inert || held(e, a)
+    val guarantee = contains_counted(ty) && !still
 
-    if e.layout.indirect(ty)
-        if !guarantee then return address(e, a)
+    if e.layout.indirect(ty) then return indirect_arg(e, a, still)
 
-        val slot = alloca(e, fresh_reg(e), lty(e, ty))
-
-        gen_into(e, slot, a)
-        own_at(e, slot, ty)
-        return slot
-    end if
 
     val v = gen_expr(e, a)
 

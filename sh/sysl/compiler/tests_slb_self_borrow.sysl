@@ -5,18 +5,24 @@ import sysl.text.{Search, str_builder}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
-// A large `self` taken by value, read where the caller's storage lies (`borrowing.sysl`'s
-// `quiet_callees` and `lends_self`).
+// A large by-value parameter -- a `self` of kilobytes, most of all -- is read where the caller put
+// it, and copied only where a copy could be told apart from the original (`borrowing.sysl`'s
+// `inert_callees` and `reads_in_place`, `emit_expr.sysl`'s `indirect_arg`).
 //
-// `self` is documented as a copy, and a copy of a 4 KB receiver is a 4 KB frame -- twice over where a
-// `*self` method calls a `self` one, the caller snapshotting the receiver and the callee copying the
-// snapshot. On a board with a 4 KB stack that is the whole stack. **Where nothing could tell the copy
-// from the original it is not made**: the callee writes nothing outside its own frames (so nothing
-// can change the caller's storage while it runs), and it never writes, addresses or views `self`.
+// `reference/declarations.md`'s receiver table says `self` hands a method a copy, and that is a
+// promise about what the method can OBSERVE: nothing done to the caller's value while it runs reaches
+// it, and nothing it does to its own reaches the caller. A copy of bytes at every entry was one way
+// to keep it, and on a board it was the stack. What keeps it now is split along the call:
 //
-// **The tests come in two halves**: the copies that are gone, and the copies that are still there
-// because a program could see them -- a method that writes its `self`, one that views it, and one
-// that writes the caller's storage through an alias, directly or through something it calls.
+//   - **the caller** hands over storage nothing can change for the length of the call -- a
+//     temporary, a local nobody else can name, or a snapshot it stages -- and needs no snapshot at
+//     all where the callee can write nothing, which is asked over the whole program;
+//   - **the callee** reads that storage in place, and keeps a copy of its own only where it changes
+//     the parameter, views an array inside it, jumps to its own entry, or may be called from outside;
+//   - **a staged snapshot is given back at its address**, not loaded as one aggregate value.
+//
+// Ported from the reference's `ReceiverInPlaceTests` (bootstrap a0221b5d), whose programs and
+// expected strings these are; the `slb_` tests after them are this compiler's own.
 
 private slb_ready() -> bool
     if std_root().is_err()
@@ -94,8 +100,8 @@ private slb_prints(text: string, expected: string)
             assert(out.status.ok(), "the program printed what was expected and did not exit cleanly")
 end slb_prints
 
-// The shape that cost musicbox its stack: a `*self` method calling a `self` one calling another.
-private slb_repro() -> string = raw"""
+// The musicbox shape: a `*self` method asking a `self` one, which asks another.
+private rip_big() -> string = raw"""
     struct Big
         notes: []const u32
         n: usize
@@ -117,111 +123,335 @@ private slb_repro() -> string = raw"""
     print(b.step())
     """
 
-// -- the copies that are gone ----------------------------------------------------------------------
-
-@test("a large self is read where it lies: the callee copies nothing in at entry")
-slb_the_callee_copies_nothing()
+@test("a self method that only reads its receiver makes no copy of it")
+rip_a_reading_self_makes_no_copy()
     if !slb_ready() then return
 
-    val out = slb_ir(slb_repro())
+    val out = slb_ir(rip_big())
 
-    for name in ["Big.busy", "Big.more"]
-        val body = slb_body(out, name)
+    for name in ["Big.more", "Big.busy"]
+        val f = slb_body(out, name)
 
-        assert(body.contains("%self.addr = getelementptr i8, ptr %self.param, i32 0"), body)
-        assert(!body.contains("alloca %struct.Big"), body)
-        assert(!body.contains("@llvm.memcpy"), body)
-end slb_the_callee_copies_nothing
+        assert(f.contains("%self.addr = getelementptr i8, ptr %self.param, i32 0"), f)
+        assert(!f.contains("llvm.memcpy"), f)
+        assert(!f.contains("alloca %struct.Big"), f)
+end rip_a_reading_self_makes_no_copy
 
-@test("a large self is read where it lies: a *self method lends its receiver with no snapshot and no count")
-slb_the_caller_lends_its_receiver()
+@test("a *self method asking a self method that can write nothing hands over its own receiver")
+rip_an_inert_callee_is_handed_the_receiver()
     if !slb_ready() then return
 
-    val body = slb_body(slb_ir(slb_repro()), "Big.step")
+    val step = slb_body(slb_ir(rip_big()), "Big.step")
 
-    assert(body.contains("call zeroext i1 @Big.more(ptr %t"), body)
-    assert(!body.contains("alloca %struct.Big"), body)
-    assert(!body.contains("@llvm.memcpy"), body)
-    assert(!body.contains("@arc.copy_at.Big"), body)
-    assert(!body.contains("@arc.dispose"), body)
-end slb_the_caller_lends_its_receiver
+    assert(!step.contains("llvm.memcpy"), step)
+    assert(!step.contains("alloca %struct.Big"), step)
+    assert(!step.contains("arc.copy_at"), step)
+    assert(!step.contains("arc.dispose"), step)
+end rip_an_inert_callee_is_handed_the_receiver
 
-@test("a large self is read where it lies: and a large slot is let go of at its address")
-slb_a_large_slot_is_released_at_its_address()
-    if !slb_ready() then return
+@test("and the program still answers what it did")
+rip_the_program_still_answers()
+    slb_prints(rip_big(), "true\n")
 
-    val out = slb_ir(slb_repro())
-
-    assert(out.contains("define private void @arc.dispose_at.Big(ptr %p)"), out)
-    assert(out.contains("call void @arc.dispose_at.Big(ptr %b.addr)"), out)
-    assert(!out.contains("load %struct.Big"), out)
-    assert(!out.contains("@arc.dispose.Big("), out)
-end slb_a_large_slot_is_released_at_its_address
-
-@test("a large self is read where it lies: and the program still says what it said")
-slb_the_repro_runs()
-    slb_prints(slb_repro(), "true\n")
-
-// -- the copies a program could see, which stay ----------------------------------------------------
-
-private slb_guards() -> string = raw"""
+// `more` prints, so it is not inert and the receiver -- a place behind `*self` -- is staged. What is
+// asserted is how the staged copy is given back: at its address, never as a 4 KB value.
+private rip_printing_more() -> string = raw"""
     struct Big
-        n: int
-        table: [256]u32
+        notes: []const u32
+        n: usize
+        table: [1024]u32
 
-        bump(self) -> int
+        busy(self) -> usize
+            var c: usize = 0
+            for k in 0..<1024
+                if self.table[k] != 0 then c += 1
+            c
+
+        more(self) -> bool
+            print("more")
+            self.n < self.notes.len
+
+        step(*self) -> bool
             self.n += 1
-            self.n
+            self.more()
 
-        scribble(self) -> u32
-            var v = self.table[..]
-            v[0] = 9
-            self.table[0]
-
-        watch(self, p: *Big) -> u32
-            val before = self.table[0]
-            p.table[0] = 7
-            before + self.table[0]
-
-        later(self, p: *Big) -> u32
-            poke(p)
-            self.table[0]
-
-    poke(p: *Big)
-        p.table[0] = 5
-
-    var b = Big(1, [0; 256])
-    print(b.bump(), b.n)
-    print(b.scribble(), b.table[0])
-    print(b.watch(&b), b.table[0])
-    b.table[0] = 0
-    print(b.later(&b), b.table[0])
+    var b = Big([1, 2, 3], 0, [0; 1024])
+    print(b.step())
     """
 
-@test("a self a program could tell from the original is still a copy: what each method sees")
-slb_the_observable_copies_still_copy()
-    slb_prints(slb_guards(), "2 1\n9 0\n0 7\n0 5\n")
-
-@test("a self a program could tell from the original is still a copy: written, viewed, or reached through an alias")
-slb_each_observable_copy_is_made()
+@test("a staged receiver is given back at its address")
+rip_a_staged_receiver_is_given_back_at_its_address()
     if !slb_ready() then return
 
-    val out = slb_ir(slb_guards())
+    val src = rip_printing_more()
+    val out = slb_ir(src)
+    val step = slb_body(out, "Big.step")
 
-    for name in ["Big.bump", "Big.scribble", "Big.watch", "Big.later"]
-        val body = slb_body(out, name)
+    assert(step.contains("@arc.dispose_at.Big(ptr"), step)
+    assert(!step.contains("load %struct.Big"), step)
+    assert(!out.contains("@arc.dispose.Big(%struct.Big"), out)
+    slb_prints(src, "more\ntrue\n")
+end rip_a_staged_receiver_is_given_back_at_its_address
 
-        assert(body.contains("%self.addr = alloca %struct.Big"), body)
-        assert(body.contains("@llvm.memcpy.p0.p0.i64(ptr align 4 %self.addr, ptr align 4 %self.param"),
-               body)
-end slb_each_observable_copy_is_made
+// -- the receiver is still a copy wherever a copy can be seen ----------------------------------------
 
-// -- the counts ------------------------------------------------------------------------------------
+// `&b` lets the caller's storage out, so the receiver is a snapshot staged by the caller: the write
+// through `p` lands in `b` and not in what the method is reading.
+@test("the receiver is still a copy wherever a copy can be seen: a write through an alias in the middle of the call")
+rip_a_write_through_an_alias()
+    slb_prints(raw"""
+        struct Big
+            n: int
+            table: [1024]u32
+
+            snap(self, p: *Big) -> int
+                val before = self.n
+                p.n += 1
+                before * 100 + self.n
+
+        var b = Big(1, [0; 1024])
+        print(b.snap(&b))
+        print(b.n)
+        """, "101\n2\n")
+
+@test("the receiver is still a copy wherever a copy can be seen: a write made by a function the method calls")
+rip_a_write_by_a_callee()
+    slb_prints(raw"""
+        struct Big
+            n: int
+            table: [1024]u32
+
+            look(self, p: *Big) -> int
+                val before = self.n
+                bump(p)
+                before * 100 + self.n
+
+        bump(p: *Big) = p.n += 1
+
+        var b = Big(3, [0; 1024])
+        print(b.look(&b))
+        print(b.n)
+        """, "303\n4\n")
+
+// A method writing its own receiver writes its copy, so it keeps one: the slot is an `alloca` filled
+// at entry, and the caller's value is untouched afterwards.
+@test("the receiver is still a copy wherever a copy can be seen: a method that changes its own receiver")
+rip_a_method_that_changes_its_receiver()
+    if !slb_ready() then return
+
+    val src = raw"""
+        struct Big
+            n: int
+            table: [1024]u32
+
+            bumped(self) -> int
+                self.n += 1
+                self.n
+
+        var b = Big(1, [0; 1024])
+        print(b.bumped())
+        print(b.n)
+        """
+
+    val f = slb_body(slb_ir(src), "Big.bumped")
+
+    assert(f.contains("llvm.memcpy"), f)
+    slb_prints(src, "2\n1\n")
+end rip_a_method_that_changes_its_receiver
+
+// Through a trait object the data word is the object itself, which the call may change; the adapter
+// stages the snapshot a direct caller would have.
+@test("the receiver is still a copy wherever a copy can be seen: a receiver reached through a trait object")
+rip_a_receiver_through_a_trait_object()
+    slb_prints(raw"""
+        trait Peek
+            peek(self, p: *Big) -> int
+
+        struct Big
+            n: int
+            table: [1024]u32
+
+        impl Peek for Big
+            peek(self, p: *Big) -> int
+                val before = self.n
+                p.n += 1
+                before * 100 + self.n
+
+        var b = Big(1, [0; 1024])
+        val o: *Peek = &b
+        print(o.peek(&b))
+        print(b.n)
+        """, "101\n2\n")
+
+// -- what a receiver refers to is counted exactly once -----------------------------------------------
+
+private rip_node() -> string = raw"""
+    struct Node
+        v: int
+    impl Drop for Node
+        drop(self) = print("dropped", self.v)
+
+    struct Big
+        r: &Node
+        table: [1024]u32
+
+        read(self) -> int = self.r.v + first(self)
+
+        swap(self, p: *Big) -> int
+            p.r = Node(9)
+            self.r.v
+
+    first(b: Big) -> int = int(b.table[0])
+    """
+
+// Every node built is dropped once, whether the receiver was read in place or staged.
+@test("what a receiver refers to is counted exactly once: a counted receiver read in a loop, many times over")
+rip_a_counted_receiver_in_a_loop()
+    slb_prints(rip_node() + raw"""
+        for i in 0..<3
+            var b = Big(Node(i), [0; 1024])
+            var sum = 0
+            for _ in 0..<100 do sum += b.read()
+            print(sum)
+        """, "0\ndropped 0\n100\ndropped 1\n200\ndropped 2\n")
+
+// The write frees the node the caller's `b.r` held, and the snapshot's own count is what keeps the
+// receiver's copy of it readable for the rest of the call.
+@test("what a receiver refers to is counted exactly once: a receiver whose field the call replaces")
+rip_a_receiver_whose_field_is_replaced()
+    slb_prints(rip_node() + raw"""
+        var b = Big(Node(1), [0; 1024])
+        print(b.swap(&b))
+        print(b.r.v)
+        """, "1\n9\ndropped 1\ndropped 9\n")
+
+// -- a body that calls only functions that can write nothing can write nothing either -------------
+
+private rip_holder() -> string = raw"""
+    struct Node
+        v: int
+    struct Holder
+        r: &Node
+    inner(h: Holder) -> int = h.r.v
+    """
+
+@test("a body that calls only functions that can write nothing can write nothing either: and takes no count for what it is passed")
+rip_an_inert_caller_takes_no_count()
+    if !slb_ready() then return
+
+    val src = rip_holder() + raw"""
+        outer(h: Holder) -> int
+            var t = 0
+            t += inner(h)
+            t
+        var n: &Node = Node(1)
+        print(outer(Holder(n)))
+        """
+
+    val f = slb_body(slb_ir(src), "outer")
+
+    assert(!f.contains("@arc.copy.Holder(%struct.Holder %h.param)"), f)
+    slb_prints(src, "1\n")
+end rip_an_inert_caller_takes_no_count
+
+@test("a body that calls only functions that can write nothing can write nothing either: however the calls recurse")
+rip_inert_however_the_calls_recurse()
+    if !slb_ready() then return
+
+    val src = rip_holder() + raw"""
+        depth(h: Holder, k: int) -> int = if k == 0 then inner(h) else depth(h, k - 1) + 0
+        var n: &Node = Node(4)
+        print(depth(Holder(n), 3))
+        """
+
+    val f = slb_body(slb_ir(src), "depth")
+
+    assert(!f.contains("@arc.copy.Holder(%struct.Holder %h.param)"), f)
+    slb_prints(src, "4\n")
+end rip_inert_however_the_calls_recurse
+
+// A write to the parameter's own slot would give back the caller's count, so it is not a write to
+// the function's own storage and the count is still taken.
+@test("a body that calls only functions that can write nothing can write nothing either: but not one that writes its parameter")
+rip_not_one_that_writes_its_parameter()
+    if !slb_ready() then return
+
+    val src = rip_holder() + raw"""
+        outer(h: Holder) -> int
+            h = Holder(Node(2))
+            inner(h)
+        var n: &Node = Node(1)
+        print(outer(Holder(n)))
+        """
+
+    val f = slb_body(slb_ir(src), "outer")
+
+    assert(f.contains("@arc.copy.Holder(%struct.Holder %h.param)"), f)
+    slb_prints(src, "2\n")
+end rip_not_one_that_writes_its_parameter
+
+// -- this compiler's own ---------------------------------------------------------------------------
+
+// A writable view of an array inside `self` is a way to write `self` that `rebound` does not see: the
+// write goes through the view, not through a place rooted at the parameter. Read in place, it would
+// land in the caller's `b`, which nobody else names, so the caller hands `b` over unstaged.
+@test("a view of an array inside the receiver keeps the copy, since a write through it would reach the caller")
+slb_a_viewed_receiver_keeps_its_copy()
+    if !slb_ready() then return
+
+    val src = raw"""
+        struct Big
+            n: int
+            table: [256]u32
+
+            scribble(self) -> u32
+                var v = self.table[..]
+                v[0] = 9
+                self.table[0]
+
+        var b = Big(1, [0; 256])
+        print(b.scribble(), b.table[0])
+        """
+
+    val f = slb_body(slb_ir(src), "Big.scribble")
+
+    assert(f.contains("%self.addr = alloca %struct.Big"), f)
+    assert(f.contains("llvm.memcpy"), f)
+    slb_prints(src, "9 0\n")
+end slb_a_viewed_receiver_keeps_its_copy
+
+// A slice the body declared is its own local, and its elements are not: a write through one is a
+// write to somebody else's memory, so the body is not inert and a caller does not lend it a place.
+@test("a write through a local slice is not a write to the function's own storage")
+slb_a_write_through_a_local_slice_is_not_inert()
+    if !slb_ready() then return
+
+    val src = raw"""
+        struct Big
+            n: int
+            table: [256]u32
+
+        poke(b: Big, out: []u32) -> u32
+            var o = out
+            o[0] = 7
+            b.table[0]
+
+        caller(p: *Big) -> u32 = poke(*p, p.table[..])
+
+        var b = Big(1, [0; 256])
+        print(caller(&b), b.table[0])
+        """
+
+    val f = slb_body(slb_ir(src), "caller")
+
+    assert(f.contains("@llvm.memcpy"), f)
+    slb_prints(src, "0 7\n")
+end slb_a_write_through_a_local_slice_is_not_inert
 
 // A receiver holding a string, a box with a destructor and a slice, lent a thousand times through a
 // `*self` method, read in place, and copied by a method that rebinds a field. A count lost is a
 // destructor run early or twice; one too many is a destructor that never runs.
-@test("a large self is read where it lies: and every count it holds comes back exactly once")
+@test("every count a large receiver holds comes back exactly once, read in place, staged and copied")
 slb_the_counts_balance()
     slb_prints(raw"""
         struct Probe
