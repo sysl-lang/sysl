@@ -1,0 +1,83 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// The standard library supplying a seam it declares (`reference/ffi.md § A module may supply another
+// module's extern`).
+//
+// `sysl.time` declares `sysl_wall_us` and `sysl.posix.time` defines it, under an `@export` nothing in
+// any program names. The library's functions are held back until something calls one, and nothing
+// calls a supplier -- so a compilation taking the library as source analyzed the declaration and never
+// the definition, and a `build-c` archive went out with `sysl_wall_us` undefined: every `sysl.log`
+// call failed at the consumer's link. `prune`'s walk keeps an export answering a reached `extern` as a
+// root, but only one the analysis put in the program; this is what puts it there.
+//
+// **The library's supplier is the fallback, never a rival.** Where the program or a package it was
+// handed exports the same symbol -- a board's clock, compiled from source beside the library -- that
+// definition is the one that answers, and the library's is not reached.
+//
+// **And only a supplier whose module this machine can run.** The library is analyzed whole on every
+// target, and nothing reaches a supplier for `check_gated_modules` to ask about, so its module's
+// environment clause is asked here -- of what the project's manifest leaves the machine AND of what
+// the target has at all, since a manifest defaults every capability to provided and a bare board is
+// not POSIX whatever its manifest omitted to say. A machine without POSIX gets no POSIX clock, and
+// the link names the seam it left for the board to answer.
+
+// A library function exporting a symbol: the key its body is held under, the symbol, and its module.
+struct SeamSupplier
+    key: string
+    symbol: string
+    module_name: string
+
+// What a compilation's units say about seams: the library's candidate suppliers, and the symbols
+// something outside the library already exports.
+struct SeamSupply
+    suppliers: Buf[SeamSupplier]
+    elsewhere: Buf[string]
+
+    // A library function exporting `symbol`, held under `key`.
+    offer(*self, key: string, symbol: string, module_name: string) =
+        self.suppliers.push(SeamSupplier(key, symbol, module_name))
+
+    // A symbol a function outside the library exports.
+    claim(*self, symbol: string) = self.elsewhere.push(symbol)
+end SeamSupply
+
+seam_supply() -> SeamSupply = SeamSupply(buf(), buf())
+
+// Marks as reached every library supplier answering an `extern` the program has reached so far. The
+// held bodies are then taken like any other reached name, and typing one may reach more.
+reach_seam_suppliers(a: &Analysis, s: SeamSupply)
+    if s.suppliers.is_empty() then return
+
+    val used = a.externs_used()
+
+    for i in 0..<used.len()
+        val d = a.tables.externs.get(used.at(i))
+
+        if d.is_none() then continue
+
+        val symbol = extern_symbol(d.unwrap())
+
+        if holds_string(s.elsewhere, symbol) then continue
+
+        for j in 0..<s.suppliers.len()
+            val f = s.suppliers.at(j)
+
+            if f.symbol == symbol && !a.used(f.key) && supplier_runs_here(a, f.module_name)
+                a.uses(f.key)
+end reach_seam_suppliers
+
+// Whether every environment capability a module requires is one this machine has: neither taken
+// away by the manifest nor missing from the target itself.
+private supplier_runs_here(a: &Analysis, module_name: string) -> bool
+    val machine = inherent_capabilities(a.tables.target)
+
+    for i in 0..<a.tables.module_requires.len()
+        val pair = a.tables.module_requires.at(i)
+
+        if pair.0 != module_name || (pair.1 != CapOs && pair.1 != CapPosix) then continue
+        if a.tables.target.lacks_capability(pair.1) || !holds_string(machine, pair.1) then return false
+
+    true
+end supplier_runs_here

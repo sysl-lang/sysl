@@ -520,6 +520,10 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     // `extern` may name something this module already declares for itself**: the library binds
     // `snprintf` under its own name and a body that renders a float asks for the same symbol, which
     // is one function and must be one line.
+    //
+    // **Only an export this module EMITS counts**: a supplier a prebuilt standard module already
+    // compiled is in the program with its thunk in the artifact, so the symbol an `extern` names
+    // still has to be declared here for the linker to resolve it there.
     var seen: Buf[string] = buf()
 
     seen.push(llvm_trap())
@@ -535,9 +539,12 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     if dispatcher_marks(p) then seen.push("write")
 
     for i in 0..<p.funcs.len()
-        p.funcs.at(i).exported match
-            Some(s) -> seen.push(s)
-            None -> ()
+        val f = p.funcs.at(i)
+
+        if !f.ghost && !declared_elsewhere(p, f)
+            f.exported match
+                Some(s) -> seen.push(s)
+                None -> ()
 
     for i in 0..<p.externs.len()
         val x = p.externs.at(i)
