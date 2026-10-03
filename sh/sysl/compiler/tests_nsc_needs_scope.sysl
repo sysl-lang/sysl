@@ -3,7 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
 import sysl.process.{capture, Status}
 import sysl.text.{join, replace_all, split, Search}
 
@@ -50,6 +50,23 @@ private nsc_no_std() -> bool
 
     false
 end nsc_no_std
+
+// Whether the library this run was handed is older than *`sysl.fs` requires `os` and not `posix`*
+// (bootstrap 050a2769, 0.0.157): there `sysl.fs` still imports `sysl.posix.rand`, so everything that
+// reaches it is charged `posix` and the cases built on a fixture reaching `sysl.fs` cannot say what
+// they are about. Against such a library they are skipped, and say so; against 0.0.157's or later
+// they run.
+private nsc_fs_wants_posix() -> bool
+    std_root() match
+        Err(_) -> false
+        Ok(root) -> read_text(s"$root/sysl/fs/publish.sysl") match
+            Err(_) -> false
+            Ok(text) ->
+                if !text.contains("import sysl.posix") then return false
+
+                print("skipped: this library's sysl.fs still imports sysl.posix (it predates bootstrap 050a2769)")
+                true
+end nsc_fs_wants_posix
 
 // Everything the compilation reported, as `file: message`, on this machine less what `lacking` names.
 private nsc_reported(lacking: []const string, lib:[](string, string),
@@ -124,7 +141,7 @@ private val nsc_plain_no_os: string = "@no_os\n\nimport sys.plain\n\nprint(plain
 
 @test("calling the '@needs' declaration from a module that gave os up is refused at the call only")
 nsc_call_refused_at_the_call_only()
-    if nsc_no_std() then return
+    if nsc_no_std() || nsc_fs_wants_posix() then return
 
     val got = nsc_reported([], nsc_nothing,
                            [("sys/a.sysl", nsc_sys), ("main.sysl", "@no_os\n\nimport sys.now\n\nprint(now())\n")])
@@ -138,7 +155,7 @@ end nsc_call_refused_at_the_call_only
 // and calls one that did passes the need on to its callers, at their call.
 @test("an unannotated function calling it passes the need on to its callers, at their call")
 nsc_unannotated_caller_passes_it_on()
-    if nsc_no_std() then return
+    if nsc_no_std() || nsc_fs_wants_posix() then return
 
     val got = nsc_reported([], nsc_nothing,
                            [("sys/a.sysl", nsc_relay), ("main.sysl", "@no_os\n\nimport sys.relay\n\nprint(relay())\n")])
@@ -179,7 +196,7 @@ end nsc_a_body_covers_only_what_it_names
 
 @test("on a machine with no os a program importing the declaration beside a '@needs' one is accepted")
 nsc_target_import_beside_is_accepted()
-    if nsc_no_std() then return
+    if nsc_no_std() || nsc_fs_wants_posix() then return
 
     val got = nsc_reported(nsc_no_os, nsc_nothing,
                            [("sys/a.sysl", nsc_sys), ("main.sysl", "import sys.plain\n\nprint(plain())\n")])
@@ -201,7 +218,7 @@ nsc_target_body_reaching_a_needs_declaration()
 
 @test("and calling it on a machine with no os is refused at the call only, naming the machine")
 nsc_target_call_refused_at_the_call_only()
-    if nsc_no_std() then return
+    if nsc_no_std() || nsc_fs_wants_posix() then return
 
     val got = nsc_reported(nsc_no_os, nsc_nothing,
                            [("sys/a.sysl", nsc_sys), ("main.sysl", "import sys.now\n\nprint(now())\n")])
@@ -304,7 +321,7 @@ end nsc_refused
 
 @test("so a module that gave os up imports the declaration beside a '@needs' one, and it runs")
 nsc_the_report_runs()
-    if !nsc_ready() then return
+    if !nsc_ready() || nsc_fs_wants_posix() then return
 
     assert_eq(nsc_ran([("sys/a.sysl", nsc_sys), ("main.sysl", nsc_plain_no_os)]), "3\n")
 
@@ -321,7 +338,7 @@ end nsc_the_call_is_where_it_is_refused
 
 @test("the module of an unannotated caller is importable for the rest, and the caller runs where os is had")
 nsc_unannotated_caller_runs()
-    if !nsc_ready() then return
+    if !nsc_ready() || nsc_fs_wants_posix() then return
 
     assert_eq(nsc_ran([("sys/a.sysl", nsc_relay), ("main.sysl", nsc_plain_no_os)]), "3\n")
     assert_eq(nsc_ran([("sys/a.sysl", nsc_relay), ("main.sysl", "import sys.relay\n\nprint(relay())\n")]),
@@ -330,7 +347,7 @@ end nsc_unannotated_caller_runs
 
 @test("a closure written inside a '@needs' body is covered with it")
 nsc_a_closure_inside_is_covered()
-    if !nsc_ready() then return
+    if !nsc_ready() || nsc_fs_wants_posix() then return
 
     val sys = "module sys\n\n@needs(os)\nnow() -> bool\n    val ask = (p: string) -> sysl.fs.exists(p)\n" +
               "    ask(\"/\")\n\nplain() -> int = 3\n"
@@ -402,13 +419,13 @@ end nsc_the_library_still_tests
 
 @test("so a program that gave posix up still reads the filesystem")
 nsc_no_posix_reads_the_filesystem()
-    if !nsc_ready() then return
+    if !nsc_ready() || nsc_fs_wants_posix() then return
 
     assert_eq(nsc_ran([("main.sysl", "@no_posix\n\nprint(sysl.fs.exists(\"/\"))\n")]), "true\n")
 
 @test("and publishes through it, which is the part that draws entropy")
 nsc_no_posix_publishes()
-    if !nsc_ready() then return
+    if !nsc_ready() || nsc_fs_wants_posix() then return
 
     val main = "@no_posix\n\nimport sysl.fs.{make_temp_dir, read_text, write_text_atomic}\n" +
                "import sysl.path.join\n\nval at = join(make_temp_dir(\"pub\").unwrap(), \"x\")\n\n" +
@@ -429,7 +446,7 @@ end nsc_no_os_still_refused_for_os
 
 @test("sysl.fs on a machine with an os that is not POSIX is reached, publishing included")
 nsc_not_posix_machine_reaches_sysl_fs()
-    if nsc_no_std() then return
+    if nsc_no_std() || nsc_fs_wants_posix() then return
 
     val got = nsc_reported(["posix"], nsc_nothing,
                            [("main.sysl", "import sysl.fs.write_text_atomic\n\nprint(sysl.fs.exists(\"/\"))\n" +
@@ -452,7 +469,7 @@ private val nsc_not_posix: string = "capabilities { os = true, posix = false }\n
 
 @test("a project whose machine has an os that is not POSIX reaches sysl.fs")
 nsc_not_posix_project_reaches_sysl_fs()
-    if !nsc_ready() then return
+    if !nsc_ready() || nsc_fs_wants_posix() then return
 
     val main = "import sysl.fs.{make_temp_dir, read_text, write_text}\nimport sysl.path.join\n\n" +
                "val at = join(make_temp_dir(\"pub\").unwrap(), \"x\")\n\n" +
@@ -468,7 +485,7 @@ end nsc_not_posix_project_reaches_sysl_fs
 // it was built (`library/sysl/time/clock.sysl`), and links -- the reference's own `sysl run` does too.
 @test("and publishing through it asks the project for a clock")
 nsc_not_posix_project_publishing_asks_for_a_clock()
-    if !nsc_ready() then return
+    if !nsc_ready() || nsc_fs_wants_posix() then return
 
     val root = nsc_tree([("package.hocon", nsc_not_posix),
                          ("main.sysl", "import sysl.fs.write_text_atomic\n\nprint(write_text_atomic(\"/nonexistent/x\", \"\").is_ok())\n")])
@@ -507,19 +524,19 @@ private val nsc_plain_signature: string =
 
 @test("an import used only inside '@needs(os)' bodies leaves the module importable")
 nsc_import_only_in_needs_bodies()
-    if !nsc_ready() then return
+    if !nsc_ready() || nsc_fs_wants_posix() then return
 
     assert_eq(nsc_ran([("sys/a.sysl", nsc_via_import), ("main.sysl", nsc_plain_no_os)]), "3\n")
 
 @test("a gated type named only in a '@needs(os)' signature leaves the module importable")
 nsc_type_only_in_a_needs_signature()
-    if !nsc_ready() then return
+    if !nsc_ready() || nsc_fs_wants_posix() then return
 
     assert_eq(nsc_ran([("sys/a.sysl", nsc_via_signature), ("main.sysl", nsc_plain_no_os)]), "3\n")
 
 @test("and calling either declaration is refused at the call only")
 nsc_calling_either_is_refused_at_the_call()
-    if !nsc_ready() then return
+    if !nsc_ready() || nsc_fs_wants_posix() then return
 
     val cases = [(nsc_via_import, "now(\"/tmp/x\")"), (nsc_via_signature, "now(\"/tmp/x\").is_ok()")]
 
@@ -568,7 +585,7 @@ end nsc_errors_all_say
 
 @test("on a machine with no os the import its body writes through and the types its signature names are the callers' too")
 nsc_target_import_and_signature_are_the_callers()
-    if nsc_no_std() then return
+    if nsc_no_std() || nsc_fs_wants_posix() then return
 
     val cases = [(nsc_via_import, "now(\"/tmp/x\")"), (nsc_via_signature, "now(\"/tmp/x\").is_ok()")]
 
