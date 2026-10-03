@@ -544,15 +544,11 @@ nsc_shared_import_costs_the_module()
     assert(said.contains("<root>/main.sysl:3:1"), said)
 end nsc_shared_import_costs_the_module
 
-@test("a gated type in an unannotated declaration's signature still costs the whole module")
-nsc_plain_signature_costs_the_module()
+@test("a gated type in an unannotated declaration's signature costs the module nothing, naming running no code")
+nsc_plain_signature_costs_nothing()
     if !nsc_ready() then return
 
-    val said = nsc_refused([("sys/a.sysl", nsc_plain_signature), ("main.sysl", nsc_plain_no_os)])
-
-    assert(said.contains("this reaches 'sys', which requires 'os', and this module declared 'no os'"), said)
-    assert(said.contains("<root>/main.sysl:3:1"), said)
-end nsc_plain_signature_costs_the_module
+    assert_eq(nsc_ran([("sys/a.sysl", nsc_plain_signature), ("main.sysl", nsc_plain_no_os)]), "3\n")
 
 // Whether a build's report has an error and every error says `part`.
 private nsc_errors_all_say(said: string, part: string) -> bool
@@ -587,17 +583,18 @@ nsc_target_import_and_signature_are_the_callers()
         assert(nsc_only_at_the_call(got, "sys.now"), nsc_said(got))
 end nsc_target_import_and_signature_are_the_callers
 
-@test("while an import or a signature a shipping declaration uses is still the module's, on a machine with no os")
+@test("while an import a shipping declaration uses is still the module's, and a signature naming a gated type is not, on a machine with no os")
 nsc_target_shared_import_and_plain_signature()
     if nsc_no_std() then return
 
-    val cases = [nsc_shared_import, nsc_plain_signature]
+    val main = ("main.sysl", "import sys.plain\n\nprint(plain())\n")
+    val got = nsc_reported(nsc_no_os, nsc_nothing, [("sys/a.sysl", nsc_shared_import), main])
 
-    for i in 0..<cases.len
-        val got = nsc_reported(nsc_no_os, nsc_nothing,
-                               [("sys/a.sysl", cases[i]), ("main.sysl", "import sys.plain\n\nprint(plain())\n")])
+    assert(nsc_said(got).contains("which requires 'os'"), nsc_said(got))
 
-        assert(nsc_said(got).contains("which requires 'os'"), nsc_said(got))
+    val named = nsc_reported(nsc_no_os, nsc_nothing, [("sys/a.sysl", nsc_plain_signature), main])
+
+    assert(named.is_empty(), nsc_said(named))
 end nsc_target_shared_import_and_plain_signature
 
 @test("on a board, neither the import its body writes through nor a type its signature names costs the module")
@@ -632,3 +629,143 @@ nsc_board_shared_import()
 
     assert(said.contains("which requires 'os'"), said)
 end nsc_board_shared_import
+
+// -- a type costs what it runs ---------------------------------------------------------------------
+
+// Naming a type -- in a field, a variant's payload, a signature, a type argument -- runs none of its
+// code, so it charges the writer nothing. What a type runs is its methods where one is called and its
+// destructor wherever a value of it can die, and those are still charged. The reference's
+// `TypeChargingTests` (`reference/modules.md § A type costs what it runs`), ported; every sentence
+// quoted was read out of the reference.
+
+// The case that asked for the rule: an error enum wraps the gated type, and the one function that
+// can produce it says so.
+private val nsc_wraps_error: string =
+    "module sys\n\nimport sysl.fs.{IoError, write_bytes}\n\nenum E\n    W(e: IoError)\n\n@needs(os)\n" +
+    "save(f: string) -> Result[unit, E] = write_bytes(f, \"x\".bytes).map_err((e) -> W(e))\n\n" +
+    "plain() -> int = 3\n"
+
+// `sys` requires `os` through the destructor alone; `Plain` beside it runs nothing.
+private val nsc_with_drop: string =
+    "module sys\n\nimport sysl.fs.write_bytes\n\nstruct Plain\n    n: int\n\nstruct Handle\n    n: int\n\n" +
+    "impl Drop for Handle\n    drop(self)\n        val _ = write_bytes(\"/tmp/x\", \"x\".bytes)\n"
+
+@test("a variant carrying a gated type leaves the rest of its module importable")
+nsc_tc_variant_carrying_one()
+    if !nsc_ready() then return
+
+    assert_eq(nsc_ran([("sys/a.sysl", nsc_wraps_error), ("main.sysl", nsc_plain_no_os)]), "3\n")
+
+@test("and so does a gated type as a type argument")
+nsc_tc_type_argument()
+    if !nsc_ready() then return
+
+    val sys = "module sys\n\nimport sysl.fs.IoError\n\nstruct Log\n    last: Option[IoError]\n\nplain() -> int = 3\n"
+
+    assert_eq(nsc_ran([("sys/a.sysl", sys), ("main.sysl", nsc_plain_no_os)]), "3\n")
+
+@test("and so does constructing a value of one that has no destructor")
+nsc_tc_constructing_one()
+    if !nsc_ready() then return
+
+    val main = "@no_os\n\nimport sysl.fs.IoError\n\nval e: IoError = IoError.NotFound\n" +
+        "print(e match\n    IoError.NotFound -> 1\n    _ -> 2)\n"
+
+    assert_eq(nsc_ran([("main.sysl", main)]), "1\n")
+
+@test("and so does a qualified path through the type, which names it the same way")
+nsc_tc_qualified_path()
+    if !nsc_ready() then return
+
+    val main = "@no_os\n\nval e = sysl.fs.IoError.NotFound\n" +
+        "print(e match\n    sysl.fs.IoError.NotFound -> 1\n    _ -> 2)\n"
+
+    assert_eq(nsc_ran([("main.sysl", main)]), "1\n")
+
+@test("while calling the function that does run it is refused at the call")
+nsc_tc_calling_the_function()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("sys/a.sysl", nsc_wraps_error),
+                            ("main.sysl", "@no_os\n\nimport sys.save\n\nprint(save(\"/tmp/x\").is_ok())\n")])
+
+    assert(said.contains("this reaches 'sys.save', which needs 'os', and this module declared '@no_os'"), said)
+    assert(said.contains("<root>/main.sysl:5:7"), said)
+    assert(!said.contains("which requires 'os'"), said)
+end nsc_tc_calling_the_function
+
+@test("and calling one of the type's own methods is refused, since that runs its module's code")
+nsc_tc_calling_a_method()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("main.sysl", "@no_os\n\nimport sysl.fs.IoError\n\nval e: IoError = IoError.NotFound\n" +
+                                          "print(e.code())\n")])
+
+    // At the import, as for any module a shipping reference charges: it is what let the call name it.
+    assert(said.contains("this reaches 'sysl.fs', which requires 'os', and this module declared 'no os'"), said)
+    assert(said.contains("<root>/main.sysl:3:1"), said)
+end nsc_tc_calling_a_method
+
+@test("a type with a destructor costs its module where a program holds one")
+nsc_tc_holding_a_destructor()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("sys/a.sysl", nsc_with_drop),
+                            ("main.sysl", "@no_os\n\nimport sys.Handle\n\nval h: &Handle = Handle(1)\nprint(h.n)\n")])
+
+    assert(said.contains("a 'sys.Handle' can die here, and its destructor reaches 'sys', which requires 'os'"),
+           said)
+    assert(said.contains("<root>/main.sysl:5:"), said)
+end nsc_tc_holding_a_destructor
+
+@test("while a type beside it with none is free to hold")
+nsc_tc_holding_one_without()
+    if !nsc_ready() then return
+
+    val main = "@no_os\n\nimport sys.Plain\n\nval p = Plain(4)\nprint(p.n)\n"
+
+    assert_eq(nsc_ran([("sys/a.sysl", nsc_with_drop), ("main.sysl", main)]), "4\n")
+
+// `box` never names `sys` anywhere a value of it could die but the field, and the program never names
+// `sys` at all: what reaches the destructor is the field, through the type that holds it.
+@test("and a type that holds one dies with it, so holding that is refused too")
+nsc_tc_holding_a_holder()
+    if !nsc_ready() then return
+
+    val holder = "module box\n\nimport sys.Handle\n\nstruct Holder\n    h: &Handle\n"
+    val said = nsc_refused([("sys/a.sysl", nsc_with_drop), ("box/a.sysl", holder),
+                            ("main.sysl", "@no_os\n\nimport box.Holder\n\nsize(b: &Holder) -> int = 1\n\nprint(2)\n")])
+
+    assert(said.contains("a 'box.Holder' can die here, and its destructor reaches 'box', which requires 'os'"),
+           said)
+    assert(said.contains("<root>/main.sysl:5:"), said)
+end nsc_tc_holding_a_holder
+
+@test("nor is a variant wrapping a gated type the module's, on a machine with no os")
+nsc_tc_target_variant()
+    if nsc_no_std() then return
+
+    val got = nsc_reported(nsc_no_os, nsc_nothing,
+                           [("sys/a.sysl", nsc_wraps_error), ("main.sysl", "import sys.plain\n\nprint(plain())\n")])
+
+    assert(got.is_empty(), nsc_said(got))
+end nsc_tc_target_variant
+
+// Not in the reference's suite: a value can reach a module that never wrote its constructor, and the
+// method it then calls is the only code of the type that module runs.
+private val nsc_probing: string =
+    "module gate\n\nimport sysl.fs.exists\n\nstruct Probe\n    n: int\n\n" +
+    "    check(self) -> bool = exists(\"/\")\n"
+
+@test("a gated value handed to a module that gave os up is refused at the method it calls, not at the type it names")
+nsc_tc_method_on_a_handed_value()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("gate/a.sysl", nsc_probing),
+                            ("lib/a.sysl", "module lib\n@no_os\n\nuse(p: gate.Probe) -> bool = p.check()\n"),
+                            ("main.sysl", "import lib.use\n\nprint(use(gate.Probe(1)))\n")])
+
+    assert(said.contains("this reaches 'gate', which requires 'os', and 'lib' declared 'no os'"), said)
+    assert(said.contains("<root>/lib/a.sysl:4:32"), said)
+    assert(!said.contains("<root>/lib/a.sysl:4:8"), said)
+end nsc_tc_method_on_a_handed_value
