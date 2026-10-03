@@ -1,0 +1,211 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The whole-program half of the reference's `QuotedIdentTests`: a backtick-quoted identifier as a
+// NAME, reaching what the ordinary grammar cannot (a reserved word, spaces and punctuation), and as
+// a PATTERN, where it is a reference rather than a binding. The token half is `tests_lex.sysl`'s.
+//
+// **Every output and every message here was read out of the reference compiler (0.0.159)** by
+// handing the installed `sysl` the same tree. Only the message is asserted: the reference anchors a
+// module path's refusal inside the path and this compiler at its start (the open span divergence).
+// The harness is `tests_xvr_extern_var.sysl`'s: `xvr_ran` builds and runs a tree, answering with the
+// build's refusal where there is one.
+
+private qix_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+private qix_says(said: string, message: string) = assert(said.contains(s"error: $message\n"), said)
+
+// -- a module path may not be quoted ---------------------------------------------------------------
+
+@test("a module path may not be quoted in the header")
+qix_module_path_in_the_header()
+    if xvr_no_library() then return
+
+    val said = xvr_ran([("m.sysl", "module `my mod`"), ("main.sysl", "print(1)")])
+
+    qix_says(said, "'my mod' is backtick-quoted, and a module path is written with plain names — a " +
+                   "module names a directory, and its parts are what the file system holds")
+end qix_module_path_in_the_header
+
+@test("a module path may not be quoted in an import")
+qix_module_path_in_an_import()
+    if xvr_no_library() then return
+
+    val said = xvr_ran([("m/m.sysl", "module m\nval x: int = 1"), ("main.sysl", "import `m`.x\nprint(1)")])
+
+    qix_says(said, "'m' is backtick-quoted, and a module path is written with plain names — a " +
+                   "module names a directory, and its parts are what the file system holds")
+end qix_module_path_in_an_import
+
+// -- a quoted name is an ordinary name -------------------------------------------------------------
+
+@test("a quoted name is declared, read, and assigned")
+qix_declared_read_and_assigned()
+    if xvr_no_library() then return
+
+    assert_eq(qix_ran("var `item count` = 3\n`item count` += 4\nprint(`item count`)"), "7\n")
+
+@test("a reserved word as a name")
+qix_a_reserved_word_as_a_name()
+    if xvr_no_library() then return
+
+    assert_eq(qix_ran("val `match`: int = 5\nprint(`match`)"), "5\n")
+
+@test("a quoted name as a function and its parameters")
+qix_as_a_function_and_its_parameters()
+    if xvr_no_library() then return
+
+    assert_eq(qix_ran("`add two`(`the value`: int) -> int = `the value` + 2\nprint(`add two`(40))"), "42\n")
+
+// `café` is a name the ordinary grammar produces too; the two spellings are one name.
+@test("a quoted name outside ASCII")
+qix_a_name_outside_ascii()
+    if xvr_no_library() then return
+
+    assert_eq(qix_ran("var `café` = 3\n`café` += 1\nprint(`café`)"), "4\n")
+
+@test("a quoted name as a struct and its fields")
+qix_as_a_struct_and_its_fields()
+    if xvr_no_library() then return
+
+    val src = "struct `Grid Cell`\n    `row index`: int\nend `Grid Cell`\nvar c = `Grid Cell`(9)\n" +
+              "print(c.`row index`)"
+
+    assert_eq(qix_ran(src), "9\n")
+end qix_as_a_struct_and_its_fields
+
+// A method on a type is composed `<type key>.<member>`, so a member holding a space has to be made
+// safe where the symbol becomes IR text, or the define line does not parse.
+@test("a quoted method name, which used to emit IR that would not parse")
+qix_a_quoted_method_name()
+    if xvr_no_library() then return
+
+    val src = "struct Point\n    x: int\n\n    `is ok`(self) -> int = self.x\n\n" +
+              "val p = Point(3)\n\nprint(p.`is ok`())"
+
+    assert_eq(qix_ran(src), "3\n")
+end qix_a_quoted_method_name
+
+@test("a quoted enum variant, which used to crash the compiler")
+qix_a_quoted_enum_variant()
+    if xvr_no_library() then return
+
+    val src = "enum Season\n    `late autumn`\n    Winter\n\nval e = Season.`late autumn`\n\n" +
+              "print(e == `late autumn`, e == Winter)"
+
+    assert_eq(qix_ran(src), "true false\n")
+end qix_a_quoted_enum_variant
+
+// A space is written `$20` where a name becomes IR text, so a name that already holds that text is a
+// different name with a different symbol.
+@test("a name holding a dollar sign is not the name that encodes to it")
+qix_a_dollar_is_not_its_encoding()
+    if xvr_no_library() then return
+
+    assert_eq(qix_ran("var `a b` = 1\nvar `a$20b` = 2\nprint(`a b`, `a$20b`)"), "1 2\n")
+
+// -- as a pattern it references rather than binds --------------------------------------------------
+
+private qix_describe(head: string) -> string
+    head + "describe(n: int) -> string\n    n match\n        `limit` -> \"at the limit\"\n" +
+        "        else \"elsewhere\"\nprint(describe(10), describe(3))"
+
+@test("a quoted pattern naming a val is tested at run time")
+qix_a_val_is_tested()
+    if xvr_no_library() then return
+
+    assert_eq(qix_ran(qix_describe("val limit: int = 10\n")), "at the limit elsewhere\n")
+
+@test("a quoted pattern naming a local is tested, not shadowed")
+qix_a_local_is_tested()
+    if xvr_no_library() then return
+
+    val src = "check(n: int, want: int) -> string\n    n match\n        `want` -> \"same\"\n" +
+              "        else \"different\"\nprint(check(4, 4), check(4, 5))"
+
+    assert_eq(qix_ran(src), "same different\n")
+end qix_a_local_is_tested
+
+@test("a quoted pattern naming a const still folds")
+qix_a_const_still_folds()
+    if xvr_no_library() then return
+
+    assert_eq(qix_ran(qix_describe("const limit: int = 10\n")), "at the limit elsewhere\n")
+
+// A pattern is a place a name is READ, so a body that mentions one nowhere else still captures it.
+@test("a nested function captures a name it mentions only in a pattern")
+qix_a_nested_function_captures_it()
+    if xvr_no_library() then return
+
+    val src = "outer() -> string\n    val limit = 10\n    inner(n: int) -> string\n        n match\n" +
+              "            `limit` -> \"at the limit\"\n            else \"elsewhere\"\n" +
+              "    inner(10) + \" \" + inner(3)\nprint(outer())"
+
+    assert_eq(qix_ran(src), "at the limit elsewhere\n")
+end qix_a_nested_function_captures_it
+
+@test("a closure captures a name it mentions only in a pattern")
+qix_a_closure_captures_it()
+    if xvr_no_library() then return
+
+    val src = "outer() -> string\n    val limit = 10\n    var check = (n: int) ->\n        n match\n" +
+              "            `limit` -> \"at the limit\"\n            else \"elsewhere\"\n" +
+              "    check(10) + \" \" + check(3)\nprint(outer())"
+
+    assert_eq(qix_ran(src), "at the limit elsewhere\n")
+end qix_a_closure_captures_it
+
+@test("the bare name still binds, which is what the quoting distinguishes it from")
+qix_the_bare_name_still_binds()
+    if xvr_no_library() then return
+
+    val src = "const limit: int = 10\ndescribe(n: int) -> string\n    n match\n" +
+              "        other -> \"bound \" + str(other)\nprint(describe(3))"
+
+    assert_eq(qix_ran(src), "bound 3\n")
+end qix_the_bare_name_still_binds
+
+// -- what a quoted pattern refuses -----------------------------------------------------------------
+
+@test("a quoted pattern resolving to nothing is a mistake, not a new local")
+qix_a_name_resolving_to_nothing()
+    if xvr_no_library() then return
+
+    val src = "describe(n: int) -> string\n    n match\n        `nothing here` -> \"yes\"\n" +
+              "        else \"no\"\nprint(describe(1))"
+
+    qix_says(qix_ran(src), "undefined name 'nothing here'")
+end qix_a_name_resolving_to_nothing
+
+@test("a quoted pattern cannot stand at an irrefutable binding")
+qix_not_at_an_irrefutable_binding()
+    if xvr_no_library() then return
+
+    qix_says(qix_ran("val limit: int = 10\nval (`limit`, b) = (3, 4)\nprint(b)"),
+             "a binding cannot test a value — '`limit`' names something already declared, and a " +
+             "binding has no other arm to take when the value turns out to differ; write 'limit' to " +
+             "bind a new name")
+end qix_not_at_an_irrefutable_binding
+
+@test("quoting a name being declared just declares it")
+qix_quoting_a_declared_name()
+    if xvr_no_library() then return
+
+    assert_eq(qix_ran("val `limit`: int = 3\nprint(`limit`)"), "3\n")
+
+// A module-level `val` takes a second file: an entry file's `val` is a local, which a bare name may
+// shadow.
+@test("the diagnostic for a module val in a pattern points at the quoted form")
+qix_a_module_val_in_a_pattern()
+    if xvr_no_library() then return
+
+    val main = "import m.limit\ndescribe(n: int) -> string\n    n match\n        limit -> \"at the limit\"\n" +
+               "        else \"elsewhere\"\nprint(describe(10))"
+
+    qix_says(xvr_ran([("m/m.sysl", "module m\nval limit: int = 10"), ("main.sysl", main)]),
+             "'limit' is a 'val', which is read while the program runs, so a bare name here would " +
+             "bind rather than match — write it as '`limit`' to test the value it holds, or bind a " +
+             "different name")
+end qix_a_module_val_in_a_pattern
