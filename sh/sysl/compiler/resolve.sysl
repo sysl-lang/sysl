@@ -944,6 +944,42 @@ resolved_graph(root: string, m: &Manifest) -> Result[Graph, Refusal]
     Ok(graph)
 end resolved_graph
 
+// The directory of every other tree the build with **every feature on** would take -- the packages
+// that graph reaches and, where `roots`, the `--lib` source roots. Resolved afresh and never written
+// back: it is asked only to tell a library a feature left out from a misspelt one (`link`).
+all_feature_trees(root: string, m: &Manifest, roots: bool) -> Result[Buf[string], Refusal]
+    var out: Buf[string] = buf()
+
+    if wants_graph(m)
+        val cache = cache_root(root) match
+            Err(why) -> return Err(Refusal(why))
+            Ok(dir) -> dir
+
+        val sums = sums_at(root) match
+            Err(why) -> return Err(Refusal(why))
+            Ok(got) -> got
+
+        val graph = resolve_graph(root, m, sums, cache, FeatureRequest(buf(), false, true),
+                                  feature_testing()) match
+            Err(why) -> return Err(Refusal(why))
+            Ok(got) -> got
+
+        for i in 0..<graph.packages.len()
+            val p = graph.packages.at(i)
+
+            if !is_root_package(p) then out.push(p.root)
+    end if
+
+    if roots
+        val libs = lib_roots()
+
+        for i in 0..<libs.len()
+            out.push(libs.at(i))
+    end if
+
+    Ok(out)
+end all_feature_trees
+
 // One tree a compilation was handed beside the project's own: a package its `dependencies` reached,
 // or a source root a `--lib` named.
 struct Handed
