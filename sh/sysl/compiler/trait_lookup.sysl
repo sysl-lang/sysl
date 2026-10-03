@@ -298,8 +298,32 @@ end resolve_bound
 // bound, an `impl`, an object type. The bounds are read in the trait's own scope, since they are
 // the trait's words, and a refusal is reported where the application was written. Asked now where
 // every `impl` is in, and after the hoist where one may still be missing.
+//
+// **Only the arguments that name no type parameter are asked here.** Where a bound or a type is
+// resolved, a parameter standing in for itself may be a scaffolding stand-in that does not yet carry
+// what its declaration asked of it, so it would be refused for a bound it has. Those are asked where
+// the parameters are final: `check_own_trait_args` for a declaration's bounds, and the `impl` block
+// for its own (`check_trait_arg_bounds_all`).
 check_trait_arg_bounds(a: &Analysis, scope: Scope, span: Span, key: string, d: TraitDecl,
                        args: Buf[Type])
+    if d.bounds.is_empty() then return
+
+    var concrete: Buf[Type] = buf()
+    var any = false
+
+    for i in 0..<args.len()
+        if mentions_abstract(args.at(i)) then concrete.push(Unknown)
+        else
+            concrete.push(args.at(i))
+            any = true
+
+    if any then check_trait_arg_bounds_all(a, scope, span, key, d, concrete)
+end check_trait_arg_bounds
+
+// The same, of every argument: the caller vouches that a type parameter among them carries what its
+// declaration asked of it.
+check_trait_arg_bounds_all(a: &Analysis, scope: Scope, span: Span, key: string, d: TraitDecl,
+                           args: Buf[Type])
     if d.bounds.is_empty() || args.len() != d.tparams.len() then return
 
     val home = scope_of_trait(a, key, scope)
