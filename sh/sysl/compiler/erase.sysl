@@ -41,7 +41,14 @@ erase_to(cx: &Analyzer, t: TExpr, want: Type) -> TExpr
         Ptr(_) -> got match
             Ptr(inner) -> erase(cx, t, tr, *inner, want, false)
             inner ->
-                if !conforms(cx.an, trait_bound_of(tr), inner) then return t
+                if !conforms(cx.an, trait_bound_of(tr), inner)
+                    // A type the trait is implemented for at other arguments, or under a condition it
+                    // does not meet, is told so here rather than handed on as a plain mismatch.
+                    if unmet_bound(cx.an, trait_bound_of(tr), inner).is_some() then
+                        return erase(cx, t, tr, inner, want, false)
+
+                    return t
+                end if
 
                 // A concrete value where a *raw* object was expected has no address of its own to
                 // hand over, and taking one silently would be putting a pointer to a temporary in a
@@ -54,7 +61,10 @@ erase_to(cx: &Analyzer, t: TExpr, want: Type) -> TExpr
             // A value where a counted object was expected is boxed first, exactly as a plain `&T`
             // context boxes one -- the allocation is the construction, and the erasure rides on top.
             inner ->
-                if !conforms(cx.an, trait_bound_of(tr), inner) then return t
+                // As above: a type the trait covers some other way goes on to be told what it lacks.
+                val bound = trait_bound_of(tr)
+
+                if !conforms(cx.an, bound, inner) && unmet_bound(cx.an, bound, inner).is_none() then return t
 
                 erase(cx, TExpr(t.span, TBox(t, Ref(inner, sync))), tr, inner, want, true)
         _ -> t

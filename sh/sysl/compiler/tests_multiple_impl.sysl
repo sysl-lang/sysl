@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 @tests
 
+import sysl.text.Search
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
@@ -189,7 +190,36 @@ mix_erasing_to_one_says_nothing_about_the_other()
         print(u.put(true))
         """)
 
-    assert(e.contains("a &Sink[bool] needs a type that implements 'Sink[bool]', and A does not"), e)
+    assert(e.contains("a &Sink[bool] needs a type that implements 'Sink[bool]', and A does not — it implements " +
+                      "'Sink[int]' and 'Sink[real]'"), e)
+
+// The erasure's own refusal reaches a type the trait covers under a condition it misses, behind
+// either sigil -- and a type the trait does not reach at all keeps the plain mismatch.
+@test("an object over a trait whose covering impl's condition is unmet says which condition")
+mix_an_object_over_an_unmet_conditional_impl()
+    if !mix_ready() then return
+
+    val e = mix_err(raw"""
+        trait Show
+            show(self) -> int
+        trait Sink
+            put(self) -> int
+        struct Box[T]
+            v: T
+        impl[T: Show] Sink for Box[T]
+            put(self) -> int = 1
+        struct B
+            v: int
+        var u: &Sink = Box(1)
+        var p: *Sink = Box(1)
+        var w: &Sink = B(1)
+        """)
+
+    assert(e.contains("a &Sink needs a type that implements 'Sink', and Box[int] does not — the 'impl' that " +
+                      "covers it asks 'Show' of int, which does not implement it"), e)
+    assert(e.contains("a *Sink needs a type that implements 'Sink', and Box[int] does not — the 'impl' that " +
+                      "covers it asks 'Show' of int, which does not implement it"), e)
+    assert(e.contains("cannot initialize 'w': declared &Sink but the value is B"), e)
 
 // ---- what a second implementation may not be
 
