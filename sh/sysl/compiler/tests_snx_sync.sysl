@@ -1,0 +1,432 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{split, Search}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `sysl.sync` -- `Atomic[T]` and `SpinLock`, the library half of `library/sync.md`. The forms
+// underneath are `tests_atomic.sysl`'s; what is asserted here is the surface built on them and the
+// two things it adds. The **default**: a raw call states its ordering and a program writes
+// `a.add(1)`, so something in between turns the absence of a name into `SeqCst`. And the
+// **dispatch**: an ordering arrives as a value and leaves as one of five written names, a five-arm
+// match per operation -- five chances to write the wrong one, which still computes the right answer
+// on a strongly ordered machine and so has to be read out of the emitted text. The narrowing on
+// `load` and `store` is the one check that lands at run time: the form refuses a releasing load
+// where the name is written and cannot see one that arrived in a variable.
+//
+// **Every output, exit status, message and instruction here was read out of the reference
+// compiler** (0.0.159) on the same program, whose `SyncTests` these are.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private snx_head() -> string = "import sysl.sync.*\n\n"
+
+private snx_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+private snx_root(main: string) -> string
+    val root = make_temp_dir("sysl-snx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end snx_root
+
+// What the program in `root` does: what it printed and the status it left with, as a shell reports
+// one. A failure to build is its message and `-1`, which no program exits with.
+private snx_outcome_in(root: string) -> (string, int)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end snx_outcome_in
+
+// The program (behind the `import sysl.sync.*` every case here starts with) prints exactly this and
+// exits zero. Returns at once without the library.
+private snx_prints(body: string, want: string)
+    if xvr_no_library() then return
+
+    val out = snx_outcome_in(snx_root(snx_head() + body))
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end snx_prints
+
+// The program builds and stops at a trap -- the status 133 a shell reports for one -- printing
+// nothing.
+private snx_traps(body: string)
+    if xvr_no_library() then return
+
+    val out = snx_outcome_in(snx_root(snx_head() + body))
+
+    assert_eq(out.0, "")
+    assert_eq(out.1, 133)
+end snx_traps
+
+// What the program is told, through the driver, library diagnostics included: an instantiation's
+// refusal is reported at the library line the form sits on.
+private snx_err(body: string) -> string
+    val root = snx_root(snx_head() + body)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end snx_err
+
+// The LLVM text of the program with the library's bodies lowered beside it (nothing precompiled, as
+// `--no-std-lib` does) -- `SpinLock`'s methods are not generic, so with an artifact their bodies
+// would be declarations here and the orderings inside them unreadable.
+private snx_ir(body: string) -> string
+    val t = host_target()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(library) -> units = library
+
+    if units.is_empty() then return "the library could not be read for this machine"
+
+    val parsed = parse(source_of("main.sysl", snx_head() + body), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return said.at(0).render()
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end snx_ir
+
+// Whether some line of `text` holds `before`, then a temporary (`%t<digits>`), then `after` -- the
+// shape `%t\d+` stands for in the reference's patterns, the numbers being the lowering's business.
+private snx_holds(text: string, before: string, after: string) -> bool
+    for line in split(text, "\n")
+        val at = line.index_of(before) match
+            None -> continue
+            Some(i) -> i + before.len
+
+        if !line[at..].starts_with("%t") then continue
+
+        var j = at + 2
+
+        while j < line.len && line[j] >= u8('0') && line[j] <= u8('9')
+            j += 1
+
+        if j > at + 2 && line[j..].starts_with(after) then return true
+    end for
+
+    false
+end snx_holds
+
+// The same with two temporaries: `before %tN middle %tM after`.
+private snx_holds2(text: string, before: string, middle: string, after: string) -> bool
+    for line in split(text, "\n")
+        if !line.contains(before) then continue
+
+        // Re-cut the line at its first temporary after `before`, and ask the one-temporary shape of
+        // what follows it.
+        val at = line.index_of(before).unwrap() + before.len
+
+        if !line[at..].starts_with("%t") then continue
+
+        var j = at + 2
+
+        while j < line.len && line[j] >= u8('0') && line[j] <= u8('9')
+            j += 1
+
+        if j > at + 2 && snx_holds(line[j..], middle, after) then return true
+    end for
+
+    false
+end snx_holds2
+
+// -- what each operation answers -------------------------------------------------------------------
+
+// Every read-modify-write answers the value that was there BEFORE, which is what makes an atomic
+// increment usable as a ticket; a wrapper handing back the new value passes any test that only
+// reads the counter afterwards.
+@test
+snx_a_read_modify_write_hands_back_what_was_there_before_it() =
+    snx_prints("var a = Atomic(0i64)\nprint(a.add(5), a.add(3), a.sub(2), a.load())", "0 5 8 6\n")
+
+@test
+snx_a_swap_answers_the_value_it_displaced() =
+    snx_prints("var a = Atomic(7i64)\nprint(a.swap(100), a.load())", "7 100\n")
+
+// `cas` answers the value it FOUND, so both outcomes are here: one that stored unconditionally
+// would pass a test trying only the match.
+@test
+snx_a_compare_and_swap_answers_what_it_found_and_stores_only_on_a_match() =
+    snx_prints("var a = Atomic(42i64)\nprint(a.cas(42, 7), a.load())\nprint(a.cas(42, 99), a.load())",
+               "42 7\n7 7\n")
+
+@test
+snx_the_retry_loop_a_caller_writes_out_of_that() =
+    snx_prints(raw"""
+        var a = Atomic(3i64)
+
+        double(a: *Atomic[i64]) -> i64
+            var seen = a.load()
+
+            while a.cas(seen, seen * 2) != seen
+                seen = a.load()
+
+            seen
+        print(double(&a), a.load())
+        """, "3 6\n")
+
+@test
+snx_the_bitwise_three_each_answering_the_word_it_changed() =
+    snx_prints("var b = Atomic(0b1010u32)\nprint(b.or(0b0101u32), b.and(0b1100u32), b.xor(0b1111u32), b.load())",
+               "10 15 12 3\n")
+
+@test
+snx_a_store_writes_the_word_the_reads_are_reading() =
+    snx_prints("var a = Atomic(1i64)\na.store(9)\nprint(a.load())", "9\n")
+
+// The discriminating test for the receiver: a `load` taking `self` by value would read a copy, and
+// the field and the load would part company the moment anything wrote through the original.
+@test
+snx_and_reading_the_field_directly_agrees_with_a_load() =
+    snx_prints("var a = Atomic(4i64)\n\nbump(p: *Atomic[i64]) = p.add(6)\nbump(&a)\nprint(a.v, a.load())",
+               "10 10\n")
+
+// -- the ordering the caller wrote is the one that reaches the instruction --------------------------
+
+@test
+snx_an_operation_with_no_ordering_written_is_sequentially_consistent()
+    if xvr_no_library() then return
+
+    val out = snx_ir("var a = Atomic(0i64)\nprint(a.add(1))")
+
+    assert(snx_holds2(out, "atomicrmw add ptr ", ", i64 ", " seq_cst"), out)
+end snx_an_operation_with_no_ordering_written_is_sequentially_consistent
+
+@test
+snx_and_every_arm_of_the_dispatch_reaches_the_ordering_it_names()
+    if xvr_no_library() then return
+
+    val out = snx_ir("var a = Atomic(0i64)\nprint(a.add(1, Relaxed))")
+
+    for keyword in ["monotonic", "acquire", "release", "acq_rel", "seq_cst"]
+        assert(snx_holds2(out, "atomicrmw add ptr ", ", i64 ", s" $keyword"), s"$keyword: $out")
+end snx_and_every_arm_of_the_dispatch_reaches_the_ordering_it_names
+
+@test
+snx_a_load_reaches_the_three_orderings_a_load_has_and_no_others()
+    if xvr_no_library() then return
+
+    val out = snx_ir("var a = Atomic(0i64)\nprint(a.load(Acquire))")
+
+    for keyword in ["monotonic", "acquire", "seq_cst"]
+        assert(snx_holds(out, "load atomic i64, ptr ", s" $keyword"), s"$keyword: $out")
+
+    assert(!snx_holds(out, "load atomic i64, ptr ", " release"), out)
+    assert(!snx_holds(out, "load atomic i64, ptr ", " acq_rel"), out)
+end snx_a_load_reaches_the_three_orderings_a_load_has_and_no_others
+
+@test
+snx_and_a_store_the_three_a_store_has()
+    if xvr_no_library() then return
+
+    val out = snx_ir("var a = Atomic(0i64)\na.store(1, Release)")
+
+    for keyword in ["monotonic", "release", "seq_cst"]
+        assert(snx_holds2(out, "store atomic i64 ", ", ptr ", s" $keyword"), s"$keyword: $out")
+
+    assert(!snx_holds2(out, "store atomic i64 ", ", ptr ", " acquire"), out)
+    assert(!snx_holds2(out, "store atomic i64 ", ", ptr ", " acq_rel"), out)
+end snx_and_a_store_the_three_a_store_has
+
+// The failure ordering is the form's to derive: `AcqRel` fails as an `acquire`.
+@test
+snx_a_compare_and_swap_carries_the_failure_ordering_the_form_derives()
+    if xvr_no_library() then return
+
+    val out = snx_ir("var a = Atomic(0i64)\nprint(a.cas(1, 2, AcqRel))")
+    var found = false
+
+    for line in split(out, "\n")
+        if line.contains(" = cmpxchg ptr %t") && line.ends_with(" acq_rel acquire") then found = true
+
+    assert(found, out)
+end snx_a_compare_and_swap_carries_the_failure_ordering_the_form_derives
+
+// -- which orderings a load and a store have -------------------------------------------------------
+
+@test
+snx_the_load_half_of_the_table() =
+    snx_prints("print(Relaxed.orders_a_load(), Acquire.orders_a_load(), Release.orders_a_load(),\n" +
+               "      AcqRel.orders_a_load(), SeqCst.orders_a_load())",
+               "true true false false true\n")
+
+@test
+snx_the_store_half() =
+    snx_prints("print(Relaxed.orders_a_store(), Acquire.orders_a_store(), Release.orders_a_store(),\n" +
+               "      AcqRel.orders_a_store(), SeqCst.orders_a_store())",
+               "true false true false true\n")
+
+// The contract is what stops the dispatch's catch-all arm from quietly promoting a releasing load to
+// `SeqCst`, which is sound and is not what the author asked for.
+@test
+snx_a_releasing_load_traps_rather_than_being_promoted_to_something_stronger()
+    snx_traps("var a = Atomic(0i64)\nprint(a.load(Release))")
+    snx_traps("var a = Atomic(0i64)\nprint(a.load(AcqRel))")
+
+@test
+snx_an_acquiring_store_likewise()
+    snx_traps("var a = Atomic(0i64)\na.store(1, Acquire)")
+    snx_traps("var a = Atomic(0i64)\na.store(1, AcqRel)")
+
+@test
+snx_while_the_three_each_of_them_has_run() =
+    snx_prints("var a = Atomic(0i64)\na.store(1, Relaxed)\na.store(2, Release)\na.store(3, SeqCst)\n" +
+               "print(a.load(Relaxed), a.load(Acquire), a.load(SeqCst))",
+               "3 3 3\n")
+
+// -- a spinlock -------------------------------------------------------------------------------------
+
+@test
+snx_is_taken_by_the_first_to_ask_and_refused_to_the_next() =
+    snx_prints("var l = SpinLock(0)\nprint(l.try_lock(), l.try_lock())", "true false\n")
+
+@test
+snx_and_is_free_again_once_released() =
+    snx_prints("var l = SpinLock(0)\nprint(l.try_lock(), l.try_lock())\nl.unlock()\nprint(l.try_lock())",
+               "true false\ntrue\n")
+
+// Taking a free lock does not spin -- a swap whose sense was inverted would hang here, not fail.
+@test
+snx_taking_a_free_lock_returns_leaving_it_held() =
+    snx_prints("var l = SpinLock(0)\nl.lock()\nprint(l.held)\nl.unlock()\nprint(l.held)", "1\n0\n")
+
+// Acquire on the way in, release on the way out: a lock's orderings are fixed by what a lock means,
+// which is why it takes no `Ordering` of its own.
+@test
+snx_takes_with_an_acquire_and_releases_with_a_release()
+    if xvr_no_library() then return
+
+    val out = snx_ir("var l = SpinLock(0)\nl.lock()\nl.unlock()")
+
+    assert(snx_holds(out, "atomicrmw xchg ptr ", ", i32 1 acquire"), out)
+    assert(snx_holds(out, "store atomic i32 0, ptr ", " release"), out)
+    assert(snx_holds(out, "load atomic i32, ptr ", " monotonic"), out)
+end snx_takes_with_an_acquire_and_releases_with_a_release
+
+// -- the module a kernel can reach -------------------------------------------------------------------
+
+// `library/sync.md § The module is the gate` puts these in a library available under `no alloc`: a
+// type reaching the allocator, or the operating system through the panic a bounds check wants, would
+// be useless in the place it exists for, and only a module that has given up both would notice.
+@test
+snx_a_module_with_no_allocator_and_no_operating_system_builds_both_types()
+    if xvr_no_library() then return
+
+    val root = snx_root(raw"""
+        import kern.Counter
+        import sysl.sync.*
+
+        var c = Counter(SpinLock(0), Atomic(0u32))
+        print(c.record(3u32), c.record(4u32), c.hits.load())
+        """)
+
+    make_dir_all(root + "/kern").unwrap()
+    write_text(root + "/kern/counter.sysl", raw"""
+        module kern
+        @no_alloc
+        @no_os
+
+        import sysl.sync.*
+
+        struct Counter
+            lock: SpinLock
+            hits: Atomic[u32]
+
+            record(*self, n: u32) -> u32
+                self.lock.lock()
+                defer self.lock.unlock()
+                self.hits.add(n, Relaxed)
+        end Counter
+        """).unwrap()
+
+    val out = snx_outcome_in(root)
+
+    assert_eq(out.0, "0 3 7\n")
+    assert_eq(out.1, 0)
+end snx_a_module_with_no_allocator_and_no_operating_system_builds_both_types
+
+// The contract on `load` traps rather than reporting, which is what lets it exist at all in a module
+// with no operating system to print to.
+@test
+snx_and_the_contract_in_there_is_a_trap_not_a_message()
+    if xvr_no_library() then return
+
+    val out = snx_ir("var a = Atomic(0i64)\nprint(a.load(Acquire))")
+
+    assert(snx_says(out, "call void @llvm.trap()"), out)
+end snx_and_the_contract_in_there_is_a_trap_not_a_message
+
+// -- what is refused ---------------------------------------------------------------------------------
+
+// The refusal comes from the form, at the instantiation, naming the width the caller supplied rather
+// than the `T` the library was written with.
+@test
+snx_a_width_no_machine_has_an_instruction_for()
+    if xvr_no_library() then return
+
+    val out = snx_err("var a = Atomic(0u12)\nprint(a.load())")
+
+    assert(snx_says(out, "error: 'atomic_load' is one machine instruction, and a machine has one for 8, " +
+                         "16, 32 and 64 bits — u12 is 12, so there is nothing to emit"), out)
+end snx_a_width_no_machine_has_an_instruction_for
+
+@test
+snx_an_aggregate_which_is_what_a_lock_is_for()
+    if xvr_no_library() then return
+
+    val out = snx_err("struct Pair\n    a: int\n    b: int\nvar a = Atomic(Pair(1, 2))\nprint(a.load().a)")
+
+    assert(snx_says(out, "error: 'atomic_load' reaches a word the machine can touch indivisibly — an " +
+                         "integer of 8, 16, 32 or 64 bits, or a pointer — and Pair is neither. An " +
+                         "aggregate is what a 'SpinLock' or a '&sync Mutex[T]' is for"), out)
+end snx_an_aggregate_which_is_what_a_lock_is_for
+
+// A pointer is a word the machine can swap and compare-and-swap, and adding to one is a question
+// about pointer arithmetic the raw tier does not answer: the members part company at `Atomic[*T]`.
+@test
+snx_arithmetic_on_an_atomic_of_pointers_while_the_exchanges_on_one_work()
+    snx_prints("var x: i64 = 1\nvar y: i64 = 2\nvar p = Atomic(&x)\nvar was = p.swap(&y)\n" +
+               "print(*was, *p.load(), *p.cas(&y, &x))",
+               "1 2 2\n")
+
+    if xvr_no_library() then return
+
+    val out = snx_err("var x: i64 = 1\nvar p = Atomic(&x)\nprint(p.add(&x) == null)")
+
+    assert(snx_says(out, "error: 'atomic_add' is arithmetic, and what an address plus a number means is " +
+                         "the question the raw tier does not answer — use 'atomic_swap' or 'atomic_cas' " +
+                         "to change a pointer"), out)
+end snx_arithmetic_on_an_atomic_of_pointers_while_the_exchanges_on_one_work
