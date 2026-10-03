@@ -85,12 +85,28 @@ address(e: *Emit, place: TExpr) -> Val = *place.kind match
 
         // A large one is written into the slot rather than produced and then stored into it -- the
         // slot is what it was going to end up in either way.
-        if e.layout.indirect(ty)
+        //
+        // A large result of a call or of a branch is built in the slot and owned there, and given
+        // back at the slot with the statement's temporaries -- `synth(...).unwrap()` hands `unwrap`
+        // the storage `synth` wrote, where producing it as a value first would be a second copy and
+        // its release a third.
+        if e.layout.indirect(ty) && makes_owned(place)
+            gen_into(e, slot, place)
+            own_temp_at(e, slot, ty)
+        else if e.layout.indirect(ty)
             gen_borrowed_into(e, slot, place)
         else
             emit(e, InStore(lty(e, ty), gen_expr(e, place), slot, AccPlain, None))
 
         slot
+
+// Whether a value arrives with a count of its own already taken: a call's result, or what a branch
+// built.
+private makes_owned(x: TExpr) -> bool = *x.kind match
+    TCall(_, _, _, _) -> true
+    TMatch(_, _, _) -> true
+    TIf(_, _, _, _) -> true
+    _ -> false
 
 // Where the `i`th declared field of a receiver lands among the stored ones.
 field_slot_of(recv_ty: Type, index: int) -> usize = underlying(recv_ty) match

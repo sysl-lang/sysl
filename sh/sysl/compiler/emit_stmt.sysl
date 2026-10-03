@@ -20,6 +20,19 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
     TVarDecl(name, ty, init, align) ->
         if zero_sized(ty)
             gen_expr(e, init)
+        else if is_return_slot(e, name)
+            // The local every `return` hands back is built in the caller's result storage
+            // (`return_slot.sysl`). Its counts are the result's from here on, so the slot is not
+            // registered for release: each way out of the function from this point is a `return`
+            // of it, which hands them over.
+            val at = return_slot_address(e, e.return_slot.unwrap().path)
+            val own = declare_local(e, name)
+
+            var idx: Buf[IrArg] = buf()
+
+            idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+            emit(e, InGep(VReg(s"$own.addr"), LInt(8), at, idx))
+            gen_into(e, VReg(s"$own.addr"), init)
         else if is_promoted(e, name) && promoted_elem(ty).is_some()
             gen_promoted_decl(e, name, ty, promoted_elem(ty).unwrap(), init)
         else
@@ -132,6 +145,11 @@ private loop_at(e: *Emit, depth: int) -> GenLoop
     e.loops.at(i)
 end loop_at
 
+// Whether this local is the one the body builds in its caller's result storage.
+private is_return_slot(e: *Emit, name: string) -> bool = e.return_slot match
+    Some(plan) -> plan.name == name
+    None -> false
+
 // Writes `x`'s value into `dest`. A large one is written where it is going rather than produced and
 // then stored, since that is what the callee of `val k = kernel()` needs.
 gen_into(e: *Emit, dest: Val, x: TExpr)
@@ -173,6 +191,18 @@ gen_into(e: *Emit, dest: Val, x: TExpr)
                 // here and a clause mentioning it is left alone; one written about the parameters
                 // alone is repeated exactly as it is on the register path.
                 assume_ensures(e, name, args, None)
+                return
+            end if
+
+        // A branching value is built by whichever branch runs, in place, so the merge slot and the
+        // copy out of it are both gone -- and `Result.unwrap`'s arm hands its payload over without a
+        // binding in between (`payload_move`).
+        TMatch(scrutinee, arms, mty) ->
+            gen_match(e, scrutinee, arms, mty, Some(dest))
+            return
+        TIf(cond, then_block, else_block, ity) ->
+            if else_block.is_some()
+                gen_if(e, cond, then_block, else_block, ity, Some(dest))
                 return
             end if
         _ -> ()

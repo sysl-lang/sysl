@@ -634,6 +634,18 @@ own_temp(e: *Emit, v: Val, ty: Type) -> Val
     v
 end own_temp
 
+// The same, for a large temporary that was written into a slot rather than produced as a value
+// (`address`): it is given back **at its address** with the statement's other temporaries, so the
+// release never loads it whole.
+own_temp_at(e: *Emit, slot: Val, ty: Type)
+    if contains_counted(ty) && !e.temp_marks.is_empty()
+        slot match
+            VReg(n) -> e.temp_slots.add(n)
+            _ -> ()
+
+        e.temps.push((slot, ty))
+end own_temp_at
+
 // Releases the innermost region's temporaries and pops it.
 pop_temps(e: *Emit)
     release_temps(e)
@@ -675,13 +687,18 @@ temps_here(e: *Emit) -> Buf[(Val, Type)]
     out
 end temps_here
 
-// Every value in a list let go of, last taken first.
+// Every value in a list let go of, last taken first -- by value, or at its address where it was
+// registered as a slot (`own_temp_at`).
 release_values(e: *Emit, vs: Buf[(Val, Type)])
     for i in 0..<vs.len()
         val v = vs.at(vs.len() - 1 - i)
 
-        release_value(e, v.1, v.0)
+        if is_temp_slot(e, v.0) then release_at(e, v.1, v.0) else release_value(e, v.1, v.0)
 end release_values
+
+private is_temp_slot(e: *Emit, v: Val) -> bool = v match
+    VReg(n) -> e.temp_slots.has(n)
+    _ -> false
 
 // Opens a lexical scope: the slots it will own, and the statements it will defer.
 push_owned(e: *Emit)

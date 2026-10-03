@@ -1,0 +1,535 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// Which local of a function is built where its result is going, rather than built in a slot of its
+// own and copied there at the `return`.
+//
+// A large result is written into storage the caller supplies (`sret_param`), and a call's result is
+// already built there. What this adds is the **local** that becomes the result:
+//
+//     synth(score: Score, rate: u32) -> Result[Synth, MusicError]
+//         if rate == 0 then return Err(NoSampleRate)
+//         var s = Synth(score, rate, ...)
+//         s.rewind()
+//         Ok(s)
+//
+// Without this `s` has a slot in the frame, and `Ok(s)` copies all of it into the caller's storage
+// -- two copies of a six-kilobyte value alive at once, on a board whose whole stack is four. With it,
+// `s`'s storage *is* the payload of the caller's `Result`, so the `Ok` writes the tag and nothing
+// else.
+//
+// **The rule.** The local `s` of a function with a large result is built in place when all of these
+// hold:
+//
+//   - it is a `var` or `val` declared **at the top level of the body**, with no alignment of its own,
+//     of a large type, and not an array the escape analysis moved to the heap;
+//   - the body's result is `s` itself, or `s` as one argument of a variant or struct being built --
+//     `Ok(s)`, `Some(s)`, `Held(s, n)`, nested to any depth -- where no other argument mentions `s`;
+//   - every `return` after the declaration returns `s` at **the same position**, and no `?` comes
+//     after it. A `return` before it, or inside its initializer, returns anything at all, since `s`
+//     is not yet anything;
+//   - `s`'s address is never taken except as a **direct argument of a call** -- `s.rewind()` on a
+//     `*self` method, `fill(&s)` -- and no `ref` is bound into it and no view is sliced out of it
+//     except as a call's argument;
+//   - where its address *is* handed to a call, nothing runs between a `return` and the end of the
+//     function: no postcondition, and no release that could reach a destructor (`runs_code`);
+//   - the body has no `defer`, no `asm`, no `become`, and no self-call lowered as a jump.
+//
+// **Why those are the conditions.** The local and the result occupy one region, so the program may
+// not be able to tell which one it wrote. Every condition closes a way of telling:
+//
+//   - **A different value returned after `s` exists** would be written over `s`'s bytes while `s`'s
+//     counts are still owed, and its own arguments could read `s` part-way through being overwritten.
+//     A `?` is such a return: its `Err` lands on `s`, whose counts nothing would then give back.
+//   - **Another argument mentioning `s`** could change it between the copy the source promises and
+//     the end of the construction: `Held(s, bump(&s))` returns the `s` from *before* the bump.
+//   - **An address kept anywhere** could be written through after the value was written into the
+//     result, and that write would land in it. So an address may only go to a call, and even then
+//     the callee may have kept it: the only code that runs between the `return` and the function
+//     being left is the releases and the postcondition, so where neither can run any of the
+//     program's code, nothing can write through a kept pointer in that window.
+//   - **A `defer`** runs after the value is written and before the function is left.
+//   - **A jump to the top** re-runs the declaration with the result region already written.
+//
+// Ownership moves with the bytes: the local's counts become the result's, so the slot is never
+// registered for release and the `return` takes no count for it (`gen_around`). Every way out after
+// the declaration is a `return` of `s`, which is what makes leaving it unregistered the same as
+// handing it over.
+//
+// Ported from the reference's `ReturnSlot` (bootstrap 4fc425a1).
+
+// One step from a value's storage into a part of it.
+enum SlotStep
+    FieldStep(decl: &StructType, i: usize)
+    PayloadStep(decl: &EnumType, variant: EnumVariant, i: usize)
+end SlotStep
+
+// The local built in place, and where in the result it sits.
+struct ReturnPlan
+    name: string
+    path: Buf[SlotStep]
+end ReturnPlan
+
+// A count a walk raises through the box it captured.
+struct SlotCount
+    n: usize
+
+    bump(*self)
+        self.n += 1
+end SlotCount
+
+private slot_count() -> &SlotCount = SlotCount(0)
+
+// The local of `f` built in the caller's result storage, where it has one.
+return_plan(e: *Emit, f: TFunc) -> Option[ReturnPlan]
+    if !e.layout.indirect(f.ret_ty) || f.body.result.is_none() then return None
+    if !tail_calls_of(f).is_empty() || forbidden_body(f.body) then return None
+
+    val result = f.body.result.unwrap()
+    val stmts = f.body.stmts
+
+    for i in 0..<stmts.len()
+        stmts.at(i) match
+            TVarDecl(name, ty, _, align) ->
+                if align.is_none() && e.layout.indirect(ty) && !is_promoted(e, name)
+                    path_of(result, name) match
+                        Some(path) ->
+                            if plan_holds(e, f, i, result, name, path) then
+                                return Some(ReturnPlan(name, path))
+                        None -> ()
+            _ -> ()
+
+    None
+end return_plan
+
+// Whether the local declared at `stmts[i]` may live where `path` puts it in the result.
+private plan_holds(e: *Emit, f: TFunc, i: usize, result: TExpr, name: string,
+                   path: Buf[SlotStep]) -> bool
+    var after: Buf[TStmt] = buf()
+
+    for j in i + 1..<f.body.stmts.len()
+        after.push(f.body.stmts.at(j))
+
+    val key = path_key(path)
+    val returned = returns_in(after)
+
+    for j in 0..<returned.len()
+        returned.at(j) match
+            Some(r) ->
+                path_of(r, name) match
+                    Some(p) -> if path_key(p) != key then return false
+                    None -> return false
+            None -> return false
+
+    if tries_after(after, result) then return false
+    if escapes(after, result, name) then return false
+
+    !lent(after, name) || quiet(e, f)
+end plan_holds
+
+// Where `x` puts the local `name`, where `x` is `name` itself or a construction holding it at one
+// argument that no other argument mentions.
+path_of(x: TExpr, name: string) -> Option[Buf[SlotStep]] = *x.kind match
+    TLoad(n, _) -> if n == name then Some(buf()) else None
+
+    TStructNew(decl, args) ->
+        if bitfield_ranges_of(Struct(decl)).is_some() then return None
+
+        within_args(args, name) match
+            Some(found) -> Some(prepend(FieldStep(decl, found.0), found.1))
+            None -> None
+
+    TEnumNew(enum_ty, variant, args) ->
+        enum_decl(enum_ty) match
+            Some(d) ->
+                if d.simple || !variant.carries then return None
+
+                within_args(args, name) match
+                    Some(found) -> Some(prepend(PayloadStep(d, variant, found.0), found.1))
+                    None -> None
+            None -> None
+
+    _ -> None
+
+private prepend(step: SlotStep, rest: Buf[SlotStep]) -> Buf[SlotStep]
+    var out: Buf[SlotStep] = buf()
+
+    out.push(step)
+
+    for i in 0..<rest.len()
+        out.push(rest.at(i))
+
+    out
+end prepend
+
+// The one argument the local sits in, and where inside it -- where no other argument mentions it.
+private within_args(args: Buf[TExpr], name: string) -> Option[(usize, Buf[SlotStep])]
+    var found: Option[(usize, Buf[SlotStep])] = None
+
+    for i in 0..<args.len()
+        path_of(args.at(i), name) match
+            Some(p) ->
+                if found.is_some() then return None
+
+                found = Some((i, p))
+            None -> ()
+
+    found match
+        Some(f) ->
+            for i in 0..<args.len()
+                if i != f.0 && mentions(args.at(i), name) then return None
+
+            found
+        None -> None
+end within_args
+
+// Two paths are the same position when every step agrees; within one function's result type that is
+// the field or the variant and the argument.
+private path_key(path: Buf[SlotStep]) -> string
+    var k = ""
+
+    for i in 0..<path.len()
+        k = k + step_key(path.at(i))
+
+    k
+end path_key
+
+private step_key(step: SlotStep) -> string = step match
+    FieldStep(_, j) -> s"f$j/"
+    PayloadStep(_, v, j) -> s"p${v.tag}.$j/"
+
+// Whether anything in `x` reads or names the local.
+mentions(x: TExpr, name: string) -> bool
+    val c = slot_count()
+
+    walk_texpr(x, expr_walk(true, y -> count_load(c, y, name)))
+    c.n > 0
+end mentions
+
+private mentions_any(xs: Buf[TStmt], name: string) -> bool
+    val c = slot_count()
+
+    walk_stmts(xs, expr_walk(true, y -> count_load(c, y, name)))
+    c.n > 0
+end mentions_any
+
+private count_load(c: &SlotCount, x: TExpr, name: string) = *x.kind match
+    TLoad(n, _) -> if n == name then c.bump()
+    _ -> ()
+
+// The value of every `return` in the statements, at any depth.
+private returns_in(xs: Buf[TStmt]) -> Buf[Option[TExpr]]
+    // Boxed, since a closure captures by value and the walk adds through the box.
+    val out: &ReturnSink = ReturnSink(buf())
+
+    walk_stmts(xs, stmt_walk(false, s -> collect_return(out, s)))
+    out.values
+end returns_in
+
+struct ReturnSink
+    values: Buf[Option[TExpr]]
+
+    add(*self, v: Option[TExpr])
+        self.values.push(v)
+end ReturnSink
+
+private collect_return(out: &ReturnSink, s: TStmt) = s match
+    TReturn(v) -> out.add(v)
+    _ -> ()
+
+// Whether a `?` runs after the declaration: it leaves through the result storage like a `return`,
+// and what it writes there is never the local.
+private tries_after(xs: Buf[TStmt], result: TExpr) -> bool
+    val c = slot_count()
+    val v = expr_walk(false, y -> count_try(c, y))
+
+    walk_stmts(xs, v)
+    walk_texpr(result, v)
+    c.n > 0
+end tries_after
+
+private count_try(c: &SlotCount, x: TExpr) = *x.kind match
+    TTry(_, _, _, _, _, _, _) -> c.bump()
+    _ -> ()
+
+// A body this lowering is not attempted for at all.
+private forbidden_body(b: TBlock) -> bool
+    val c = slot_count()
+
+    walk_block_stmts(b, stmt_walk(true, s -> count_forbidden(c, s)))
+    c.n > 0
+end forbidden_body
+
+private count_forbidden(c: &SlotCount, s: TStmt) = s match
+    TDefer(_) -> c.bump()
+    TAsm(_, _, _) -> c.bump()
+    TBecome(_) -> c.bump()
+    _ -> ()
+
+// Whether the local's storage is reachable by anything but its own name once the statements have
+// run: an address taken anywhere other than as a call's argument, a view sliced out of it on the same
+// terms, or a `ref` bound into it.
+//
+// Every address or view of the local is counted, and so is every one handed straight to a call; the
+// two counts differ exactly where one went somewhere else. An argument that is a borrow contains no
+// other borrow of the local -- its index and its bounds may not mention it -- so no node is counted
+// twice.
+private escapes(xs: Buf[TStmt], result: TExpr, name: string) -> bool
+    val all = slot_count()
+    val passed = slot_count()
+    val refs = slot_count()
+    val v = TWalk(true, y -> count_borrows(all, passed, y, name), w -> (),
+                  s -> count_ref(refs, s, name))
+
+    walk_stmts(xs, v)
+    walk_texpr(result, v)
+    refs.n > 0 || all.n != passed.n
+end escapes
+
+private count_borrows(all: &SlotCount, passed: &SlotCount, x: TExpr, name: string)
+    *x.kind match
+        TAddrOf(place, _) -> if mentions(place, name) then all.bump()
+        TSlice(base, _, _, _, _) -> if mentions(base, name) then all.bump()
+        TCall(_, args, _, _) -> count_passed(passed, args, name)
+        TVCall(_, _, args, _, _) -> count_passed(passed, args, name)
+        TCallPtr(_, args, _, _) -> count_passed(passed, args, name)
+        _ -> ()
+end count_borrows
+
+private count_passed(passed: &SlotCount, args: Buf[TExpr], name: string)
+    for i in 0..<args.len()
+        if borrowed(args.at(i), name) then passed.bump()
+end count_passed
+
+// An argument that is the local's address, or a view of it, and nothing else of it.
+private borrowed(a: TExpr, name: string) -> bool = *a.kind match
+    TAddrOf(place, _) -> mentions(place, name) && rooted(place, name)
+    TSlice(base, lo, hi, _, _) ->
+        mentions(base, name) && rooted(base, name) && !opt_mentions(lo, name) &&
+            !opt_mentions(hi, name)
+    _ -> false
+
+private opt_mentions(x: Option[TExpr], name: string) -> bool =
+    if x.is_some() then mentions(x.unwrap(), name) else false
+
+// The local itself, or a part of it reached by field, index or lane -- which is what makes the address
+// the local's rather than one read out of it.
+private rooted(place: TExpr, name: string) -> bool = *place.kind match
+    TLoad(n, _) -> n == name
+    TField(r, _, _) -> rooted(r, name)
+    TIndex(r, i, _) -> rooted(r, name) && !mentions(i, name)
+    TLane(r, _, _) -> rooted(r, name)
+    _ -> false
+
+private count_ref(c: &SlotCount, s: TStmt, name: string) = s match
+    TRefDecl(_, _, place) -> if mentions(place, name) then c.bump()
+    _ -> ()
+
+// Whether the local's address is handed to any call at all. A callee may keep it, and nothing stops
+// a pointer outliving the call that was given it -- so where one could exist, nothing may run between
+// the `return` writing the result and the function being left (`quiet`).
+private lent(xs: Buf[TStmt], name: string) -> bool
+    val all = slot_count()
+    val passed = slot_count()
+
+    walk_stmts(xs, expr_walk(true, y -> count_borrows(all, passed, y, name)))
+    all.n > 0
+end lent
+
+// Whether nothing of the program's runs between a `return` and the end of `f`: no postcondition, and
+// no value whose release could reach a destructor. What a release can reach is asked of every type
+// the body mentions -- every local, every binding and every temporary it holds, the local in question
+// included -- which is a superset, and cheap, since a program with no destructor answers no for all
+// of them.
+private quiet(e: *Emit, f: TFunc) -> bool
+    if !f.ensures.is_empty() then return false
+    if e.destructors.is_empty() then return true
+
+    for i in 0..<f.params.len()
+        if runs_code(e, f.params.at(i).1) then return false
+
+    val c = slot_count()
+
+    walk_block_stmts(f.body, TWalk(true, y -> count_running(e, c, texpr_type(y)), w -> (),
+                                   s -> count_running_decl(e, c, s)))
+    c.n == 0
+end quiet
+
+private count_running(e: *Emit, c: &SlotCount, t: Type) = if runs_code(e, t) then c.bump()
+
+private count_running_decl(e: *Emit, c: &SlotCount, s: TStmt) = s match
+    TVarDecl(_, ty, _, _) -> count_running(e, c, ty)
+    _ -> ()
+
+// Whether letting go of a value of this type can run a destructor (`reference/memory.md § A
+// destructor`) -- directly, through a box it lets go of, or through what that box's contents let go
+// of. A trait object or a closure answers yes where any type has one, its payload being a type
+// nothing here can see; so does a view whose owner could be a box of a type with a destructor holding
+// an array of its element, since a view keeps its backing alive whatever the backing is.
+runs_code(e: *Emit, t: Type) -> bool
+    if e.destructors.is_empty() then return false
+
+    var seen: Buf[string] = buf()
+
+    reaches_drop(e, t, &seen)
+end runs_code
+
+private reaches_drop(e: *Emit, t: Type, seen: *Buf[string]) -> bool = t match
+    Ref(inner, _) -> underlying(*inner) match
+        Trait(_, _, _) -> true
+        _ -> destructor_of(e, *inner).is_some() || reaches_drop(e, *inner, seen)
+    Weak(_) -> false
+    Slice(elem, _) -> reaches_drop(e, *elem, seen) || dropping_holds(e, *elem)
+    Str -> dropping_holds(e, byte_type())
+    Array(_, elem) -> reaches_drop(e, *elem, seen)
+    Volatile(inner) -> reaches_drop(e, *inner, seen)
+    Constrained(d) -> reaches_drop(e, d.base, seen)
+    Struct(d) -> fields_reach(e, mangle(t), d.fields, seen)
+    Results(d) -> fields_reach(e, mangle(t), d.fields, seen)
+    Enum(d) ->
+        val k = mangle(t)
+
+        if holds_string(*seen, k) then return false
+
+        seen.push(k)
+
+        for i in 0..<d.variants.len()
+            val fs = d.variants.at(i).fields
+
+            for j in 0..<fs.len()
+                if reaches_drop(e, fs.at(j).1, seen) then return true
+
+        false
+    Pack(es) ->
+        for i in 0..<es.len()
+            if reaches_drop(e, es.at(i), seen) then return true
+
+        false
+    Trait(_, _, _) -> true
+    Abstract(_, _) -> true
+    _ -> false
+
+private fields_reach(e: *Emit, k: string, fields: Buf[(string, Type)], seen: *Buf[string]) -> bool
+    if holds_string(*seen, k) then return false
+
+    seen.push(k)
+
+    for i in 0..<fields.len()
+        if reaches_drop(e, fields.at(i).1, seen) then return true
+
+    false
+end fields_reach
+
+// Whether a type with a destructor holds an array of this element, which a view of that element
+// could be keeping alive.
+private dropping_holds(e: *Emit, elem: Type) -> bool
+    for i in 0..<e.dropping.len()
+        var seen: Buf[string] = buf()
+
+        if holds_array_of(e.dropping.at(i), elem, &seen) then return true
+
+    false
+end dropping_holds
+
+private holds_array_of(t: Type, elem: Type, seen: *Buf[string]) -> bool = t match
+    Array(_, x) -> *x == elem || holds_array_of(*x, elem, seen)
+    Struct(d) ->
+        val k = mangle(t)
+
+        if holds_string(*seen, k) then return false
+
+        seen.push(k)
+
+        for i in 0..<d.fields.len()
+            if holds_array_of(d.fields.at(i).1, elem, seen) then return true
+
+        false
+    Enum(d) ->
+        val k = mangle(t)
+
+        if holds_string(*seen, k) then return false
+
+        seen.push(k)
+
+        for i in 0..<d.variants.len()
+            val fs = d.variants.at(i).fields
+
+            for j in 0..<fs.len()
+                if holds_array_of(fs.at(j).1, elem, seen) then return true
+
+        false
+    _ -> false
+
+// The types of the program that have a destructor, which a view's owner could be.
+dropping_types(e: *Emit, p: TProgram) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for i in 0..<p.structs.len()
+        if destructor_of(e, p.structs.at(i)).is_some() then out.push(p.structs.at(i))
+
+    for i in 0..<p.enums.len()
+        if destructor_of(e, p.enums.at(i)).is_some() then out.push(p.enums.at(i))
+
+    out
+end dropping_types
+
+// -- emitting ------------------------------------------------------------------------------------------
+
+// The address one step reaches from `base`.
+private step_addr(e: *Emit, base: Val, step: SlotStep) -> Val = step match
+    FieldStep(decl, i) ->
+        val p = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(decl.slot(i))))))
+        emit(e, InGep(p, struct_lty(decl), base, idx))
+        p
+    PayloadStep(decl, variant, i) ->
+        val payload = payload_ptr(e, decl, base)
+        val p = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(variant.slot(i))))))
+        emit(e, InGep(p, variant_lty(decl, variant), payload, idx))
+        p
+
+// Where the planned local lives: the part of the caller's result storage the `return` will leave it
+// in, reached by the same steps the `return` writes around it.
+return_slot_address(e: *Emit, path: Buf[SlotStep]) -> Val
+    var at = sret_param()
+
+    for i in 0..<path.len()
+        at = step_addr(e, at, path.at(i))
+
+    at
+end return_slot_address
+
+// The result around a local already built inside it: every other part of `x` is written where it
+// goes and owned there, and the local's own bytes are left where they are. Its counts become the
+// result's, which is why its slot was never registered for release.
+gen_around(e: *Emit, dest: Val, x: TExpr, name: string)
+    *x.kind match
+        TStructNew(decl, args) ->
+            for i in 0..<args.len()
+                if !zero_sized(decl.fields.at(i).1)
+                    around_part(e, step_addr(e, dest, FieldStep(decl, i)), args.at(i), name)
+        TEnumNew(enum_ty, variant, args) ->
+            val d = enum_decl(enum_ty).unwrap()
+
+            emit(e, InStore(l_i32(), VInt(from_int(long(variant.tag))), dest, AccPlain, None))
+
+            for i in 0..<args.len()
+                if !zero_sized(variant.fields.at(i).1)
+                    around_part(e, step_addr(e, dest, PayloadStep(d, variant, i)), args.at(i), name)
+        // The local itself: it is already here.
+        _ -> ()
+end gen_around
+
+private around_part(e: *Emit, at: Val, a: TExpr, name: string)
+    if path_of(a, name).is_some() then gen_around(e, at, a, name) else gen_into(e, at, a)
