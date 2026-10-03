@@ -1,0 +1,355 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, from_utf8_unchecked}
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+import sysl.slices.as_ptr
+
+// Conditional compilation against the rest of the compiler: what a whole program built on this
+// machine sees, the standard module read once per target, a gated test, a gated module header, and
+// a package's features as symbols of its own files. `tests_conditional.sysl` holds the gate itself.
+//
+// **Every refusal quoted here was obtained by running the reference compiler on the same source.**
+
+private cdx_macos() -> Target = target_named("aarch64-macos").unwrap()
+private cdx_linux() -> Target = target_named("x86_64-linux").unwrap()
+private cdx_windows() -> Target = target_named("x86_64-windows").unwrap()
+
+// What a program of these files prints, or what the build had to say about it.
+private cdx_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end cdx_out
+
+private cdx_main(text: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", text))
+    cdx_out(fs)
+end cdx_main
+
+// The gated text exactly as it comes out, with the given features enabled.
+private cdx_gated(text: string, features: Buf[string]) -> string
+    gate(source_of("<input>", text), cdx_macos(), features) match
+        Err(d) -> s"!${d.message}"
+        Ok(out) -> from_utf8_unchecked(out.bytes)
+end cdx_gated
+
+// Every name a list of units declares at its top level, an enum's variants included.
+private cdx_names(units: Buf[Program]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for u in 0..<units.len()
+        val body = units.at(u).body
+
+        for i in 0..<body.len()
+            *body.at(i).kind match
+                FuncDecl(d) -> out.push(d.name)
+                ExternDecl(d) -> out.push(d.name)
+                ExternVarDecl(name, _, _, _) -> out.push(name)
+                ConstDecl(name, _, _, _) -> out.push(name)
+                ValDecl(name, _, _, _, _, _) -> out.push(name)
+                StructDecl(d) -> out.push(d.name)
+                TypeDecl(d) -> out.push(d.name)
+                TraitDecl(d) -> out.push(d.name)
+                EnumDecl(d) ->
+                    out.push(d.name)
+
+                    for v in 0..<d.variants.len()
+                        out.push(d.variants.at(v).name)
+                _ -> ()
+
+    out
+end cdx_names
+
+private cdx_sorted(xs: Buf[string]) -> Buf[string]
+    var out = xs
+
+    for i in 1..<out.len()
+        var j = i
+
+        while j > 0 && out.at(j) < out.at(j - 1)
+            val held = out.at(j)
+
+            out.set(j, out.at(j - 1))
+            out.set(j - 1, held)
+            j -= 1
+
+    out
+end cdx_sorted
+
+private cdx_joined(xs: Buf[string]) -> string
+    var acc = ""
+
+    for i in 0..<xs.len()
+        if i > 0 then acc = acc + " "
+
+        acc = acc + xs.at(i)
+
+    acc
+end cdx_joined
+
+// The standard module's trees for one target, rendered one statement to an entry.
+private cdx_trees(root: string, t: Target) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    std_units(root, t) match
+        Err(e) -> out.push(s"!$e")
+        Ok(units) ->
+            for u in 0..<units.len()
+                out.push(units.at(u).src.name)
+
+                for i in 0..<units.at(u).body.len()
+                    out.push(show_stmt(units.at(u).body.at(i)))
+
+    out
+end cdx_trees
+
+private cdx_same(a: Buf[string], b: Buf[string]) -> bool
+    if a.len() != b.len() then return false
+
+    for i in 0..<a.len()
+        if a.at(i) != b.at(i) then return false
+
+    true
+end cdx_same
+
+// -- which lines a target sees -------------------------------------------------------------------
+
+@test("what this machine sees, run rather than read")
+cdx_what_this_machine_sees()
+    // The one place the whole path is exercised end to end -- gate, lex, analyze, lower, link, run.
+    if im_can_run() then return
+
+    assert_eq(cdx_main("#if posix\nprint(\"posix\")\n#else\nprint(\"not posix\")\n#endif\n"), "posix\n")
+
+// -- line numbers survive the gating --------------------------------------------------------------
+
+@test("the quoted line is the one the reader wrote")
+cdx_the_quoted_line_is_the_one_written()
+    if im_can_run() then return
+
+    val out = cdx_main("#if windows\nvar a = 1\n#endif\nvar x: int = \"no\"\n")
+
+    assert(out.contains("cannot initialize 'x': declared int but the value is string"), out)
+    assert(out.contains("4 | var x: int = \"no\""), out)
+
+// -- the carried library is parsed per target ------------------------------------------------------
+
+@test("the same target gets the same trees back")
+cdx_the_same_target_gets_the_same_trees()
+    // The reference keeps one parse per target behind a memo and asserts it hands back the very same
+    // object; this compiler parses the library once per compilation, so what it owes is that two
+    // readings for one machine are the same reading.
+    val root = std_root() match
+        Err(_) -> return
+        Ok(r) -> r
+
+    val first = cdx_trees(root, cdx_macos())
+
+    assert(cdx_same(first, cdx_trees(root, cdx_macos())), "one machine, one reading")
+    assert(first.len() > 0, "the library has trees")
+
+@test("two targets get two")
+cdx_two_targets_get_two()
+    val root = std_root() match
+        Err(_) -> return
+        Ok(r) -> r
+
+    assert(!cdx_same(cdx_trees(root, cdx_macos()), cdx_trees(root, cdx_linux())),
+        "the library carries directives, so two machines read it two ways")
+
+@test("every target in the registry parses at all")
+cdx_every_target_parses()
+    val root = std_root() match
+        Err(_) -> return
+        Ok(r) -> r
+
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        std_units(root, all.at(i)) match
+            Err(e) -> assert(false, s"${all.at(i).name}: $e")
+            Ok(units) -> assert(!units.is_empty(), all.at(i).name)
+
+// -- the names the compiler spells for itself -----------------------------------------------------
+
+@test("a name the compiler spells for itself is declared on every target")
+cdx_a_name_the_compiler_spells_is_declared_everywhere()
+    // This is what lets the library be read for one machine and answer for all of them. A library
+    // that gated `Option` away for Windows would be a library nothing compiles against there.
+    val root = std_root() match
+        Err(_) -> return
+        Ok(r) -> r
+
+    val known = ["Option", "Some", "None", "Result", "Ok", "Err", "FormatSpec", "Display", "Hash",
+        "From", "Drop", "Integer", "Signed", "Bits", "Ordering", "Writer", "putbytes", "printi",
+        "printu", "printr", "printb", "printc", "prints", "Index", "IndexSet", "Iterate", "Range",
+        "args_of", "chars_of", "Add", "Sub", "Mul", "Div", "Rem", "BitAnd", "BitOr", "BitXor", "Shl",
+        "Shr", "Neg", "Not", "Eq", "Ord"]
+    val all = all_targets()
+
+    for t in 0..<all.len()
+        val declared = std_units(root, all.at(t)) match
+            Err(e) ->
+                assert(false, s"${all.at(t).name}: $e")
+                return
+            Ok(units) -> cdx_names(units)
+
+        for k in 0..<known.len
+            assert(has(declared, known[k]), s"${all.at(t).name}: ${known[k]}")
+
+// -- a file with no directives in it ----------------------------------------------------------------
+
+@test("comes back as the very same Source, not a copy")
+cdx_no_directives_comes_back_the_same()
+    // A compilation that gated nothing has to be the compilation it was before any of this existed,
+    // so what comes back is the source's own bytes rather than a copy of them.
+    val src = source_of("<input>", "print(1)\n")
+
+    gate(src, cdx_macos()) match
+        Err(d) -> assert(false, d.message)
+        Ok(out) ->
+            assert(usize(as_ptr(out.bytes)) == usize(as_ptr(src.bytes)), "the same bytes")
+            assert_eq(out.name, src.name)
+
+    gate(src, cdx_linux()) match
+        Err(d) -> assert(false, d.message)
+        Ok(out) -> assert(usize(as_ptr(out.bytes)) == usize(as_ptr(src.bytes)), "the same bytes")
+
+// -- a library gates like anything else ------------------------------------------------------------
+
+// A one-module library whose `flavour` differs between machines, read for a target. A named artifact
+// is retired here (`--lib` takes a source root), so what a target's build of the library carries is
+// what its files declare once gated.
+private cdx_built(t: Target) -> string
+    val text = "module demo\n\n#if macos\nflavour() -> int = 31337\n#elif linux\nflavour() -> int = 42424\n" +
+        "#else\nflavour() -> int = 55555\nextra() -> int = 1\n#endif\n"
+    val parsed = parse(source_of("demo/lib.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+    cdx_joined(cdx_sorted(cdx_names(units)))
+end cdx_built
+
+@test("the artifact carries the declarations its target saw")
+cdx_the_library_carries_what_its_target_saw()
+    assert_eq(cdx_built(cdx_macos()), "flavour")
+    assert_eq(cdx_built(cdx_linux()), "flavour")
+    assert_eq(cdx_built(cdx_windows()), "extra flavour")
+
+@test("and an artifact built for another machine is refused rather than quietly used")
+cdx_an_artifact_for_another_machine_is_refused()
+    // The hazard this feature creates: a tree mismatch decodes perfectly and is simply a different
+    // set of declarations, so the machine an artifact was built for is checked where it is read.
+    val meta = syslib_metadata(cdx_linux(), "0123456789abcdef", buf())
+
+    syslib_read("demo.syslib", meta, cdx_macos()) match
+        Ok(_) -> assert(false, "an artifact built for another machine was accepted")
+        Err(e) ->
+            assert(e.contains("was built for x86_64-linux"), e)
+            assert(e.contains("--target aarch64-macos"), e)
+
+// -- a '@test' is gated like any other declaration -------------------------------------------------
+
+@test("a '@test' is gated like any other declaration")
+cdx_a_test_is_gated_like_any_declaration()
+    // `#` opens both an attribute and a directive, and this is the one place the two meet in earnest:
+    // the test build has to discover the tests the target actually has.
+    if std_root().is_err() then return
+
+    val root = runner_project("main.sysl",
+        "@test\neverywhere()\n    1\n\n#if windows\n@test\nonly_on_windows()\n    1\n#endif\n")
+
+    val build = test_build_of(s"$root/main.sysl", None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    build match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(made) ->
+            assert_eq(made.tests.len(), 1)
+            assert_eq(made.tests.at(0).display, "everywhere")
+
+// -- the shape of the file survives ----------------------------------------------------------------
+
+@test("a file's directory is carried through the gate, so its module still checks out")
+cdx_a_files_directory_survives_the_gate()
+    // `posix` rather than `macos`: this compiles for the host, so a condition true only on the
+    // author's machine takes `two` out of the module everywhere else and the call goes undefined.
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("demo", "a.sysl", "module demo\n\n#if posix\ntwo() -> int = 2\n#endif\n"))
+    fs.push(("", "main.sysl", "print(demo.two())\n"))
+    assert_eq(cdx_out(fs), "2\n")
+
+@test("a gated 'module' header puts the file in the root module, and says so where that is wrong")
+cdx_a_gated_module_header()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("demo", "a.sysl", "#if windows\nmodule demo\n#endif\n\ntwo() -> int = 2\n"))
+    fs.push(("", "main.sysl", "print(1)\n"))
+
+    val out = cdx_out(fs)
+
+    assert(out.contains("declares no module, but it sits in 'demo' — a module is a directory, so the two must agree"),
+        out)
+
+// -- a package's enabled features are symbols of its own files ------------------------------------
+
+@test("each one is the feature's name under a prefix, beside everything the target says")
+cdx_a_feature_is_its_name_under_a_prefix()
+    assert_eq(feature_symbol("server"), "feature_server")
+    assert_eq(feature_symbol("tls"), "feature_tls")
+
+    var on: Buf[string] = buf()
+
+    on.push(feature_symbol("server"))
+    on.push(feature_symbol("tls"))
+    assert_eq(cdx_gated("#if feature_server && feature_tls && macos && aarch64\nprint(1)\n#endif\n", on),
+        "\nprint(1)\n\n")
+
+@test("and a compilation with no features has no symbol of that shape at all")
+cdx_no_features_no_feature_symbols()
+    val all = all_targets()
+
+    for t in 0..<all.len()
+        val on = defined(all.at(t))
+
+        for i in 0..<on.len()
+            assert(!is_feature_symbol(on.at(i)), s"${all.at(t).name}: ${on.at(i)}")
+
+@test("the file carries the set, so the same condition reads differently in two packages")
+cdx_the_same_condition_in_two_packages()
+    val text = "#if feature_server\nprint(1)\n#else\nprint(2)\n#endif\n"
+    var server: Buf[string] = buf()
+
+    server.push(feature_symbol("server"))
+    assert_eq(cdx_gated(text, server), "\nprint(1)\n\n\n\n")
+    assert_eq(cdx_gated(text, buf()), "\n\n\nprint(2)\n\n")
