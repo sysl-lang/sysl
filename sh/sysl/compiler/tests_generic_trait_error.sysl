@@ -200,6 +200,50 @@ gtx_a_trait_object_at_other_arguments_has_no_table()
         """, "a &Sink[real] needs a type that implements 'Sink[real]', and A does not — " +
         "it implements 'Sink[int]'")
 
+@test("a raw object at other arguments is told the same, before anything about an address")
+gtx_a_raw_object_at_other_arguments_is_told_the_same()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Sink[T]
+            put(self, x: T) -> int
+        struct A
+            tag: int
+        impl Sink[int] for A
+            put(self, x: int) -> int = x
+        var u: *Sink[real] = A(0)
+        """, "a *Sink[real] needs a type that implements 'Sink[real]', and A does not — " +
+        "it implements 'Sink[int]'")
+
+@test("an object over a type whose covering 'impl' asks what it lacks says so")
+gtx_an_object_over_a_conditionally_covered_type_says_so()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Show
+            show(self) -> int
+        trait Sink
+            put(self, x: int) -> int
+        struct Box[U]
+            v: U
+        impl[U: Show] Sink for Box[U]
+            put(self, x: int) -> int = x
+        var u: &Sink = Box(1)
+        """, "a &Sink needs a type that implements 'Sink', and Box[int] does not — the 'impl' that " +
+        "covers it asks 'Show' of int, which does not implement it")
+
+@test("an object over a type with no implementation at all is the position's own mismatch")
+gtx_an_object_over_a_type_with_no_implementation()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Sink[T]
+            put(self, x: T) -> int
+        struct A
+            tag: int
+        var u: &Sink[real] = A(0)
+        """, "cannot initialize 'u': declared &Sink[real] but the value is A")
+
 @test("a type with no implementation at all is told so plainly")
 gtx_a_type_with_no_implementation_at_all()
     if !gtx_ready() then return
@@ -381,6 +425,75 @@ gtx_a_bound_whose_argument_does_not_meet_them()
             get(self) -> T
         f[X: Get[int]](x: X) -> int = 1
         """, "'Get' requires its type parameter 'T' to implement 'Show', but int does not")
+
+@test("an object type whose argument does not meet them")
+gtx_an_object_type_whose_argument_does_not_meet_them()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Show
+            show(self) -> int
+        trait Get[T: Show]
+            get(self) -> T
+        f(x: &Get[int]) -> int = 1
+        """, "'Get' requires its type parameter 'T' to implement 'Show', but int does not")
+
+@test("a type parameter as the argument has to carry the bound itself, at a bound")
+gtx_a_type_parameter_argument_carries_the_bound_at_a_bound()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Show
+            show(self) -> int
+        trait Get[T: Show]
+            get(self) -> T
+        f[X: Get[Y], Y](x: X) -> int = 1
+        """, "'Get' requires its type parameter 'T' to implement 'Show', but 'Y' is not bounded by it")
+
+@test("and at an 'impl' block's own parameter")
+gtx_a_type_parameter_argument_carries_the_bound_at_an_impl()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Show
+            show(self) -> int
+        trait Get[T: Show]
+            get(self) -> T
+        struct Box[U]
+            v: U
+        impl[U] Get[U] for Box[U]
+            get(self) -> U = self.v
+        """, "'Get' requires its type parameter 'T' to implement 'Show', but 'U' is not bounded by it")
+
+// The bounds met everywhere at once: inside the trait (its own `T` carries them), at a bound whose
+// parameter is bounded, at a conditional `impl`, and at a concrete argument.
+@test("arguments that meet a trait's own bounds compile and run")
+gtx_arguments_that_meet_a_traits_own_bounds_run()
+    if !gtx_ready() then return
+
+    gtx_prints(raw"""
+        trait Show
+            show(self) -> int
+        trait Get[T: Show]
+            get(self) -> T
+            both(self, o: &Get[T]) -> int = self.get().show() + o.get().show()
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> int = self.v
+        struct Q
+            p: P
+        impl Get[P] for Q
+            get(self) -> P = self.p
+        f[X: Get[Y], Y: Show](x: X, y: Y) -> int = x.get().show() + y.show()
+        struct Box[U]
+            v: U
+        impl[U: Show] Get[U] for Box[U]
+            get(self) -> U = self.v
+        print(f(Q(P(4)), P(1)))
+        print(Q(P(2)).both(Q(P(3))))
+        print(Box(P(6)).get().show())
+        """, "5\n5\n6\n")
 
 // -- a member reached through a generic bound is checked against the trait's signature -------------
 

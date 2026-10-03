@@ -287,8 +287,28 @@ resolve_bound(a: &Analysis, scope: Scope, span: Span, b: BoundRef, subst: Buf[Bi
     val decl = d.unwrap()
 
     check_trait_arity_at(a, scope, span, b.name, decl, written)
-    Bound(key.unwrap(), trait_args_with_defaults(a, scope, span, key.unwrap(), decl, written, subst))
+
+    val args = trait_args_with_defaults(a, scope, span, key.unwrap(), decl, written, subst)
+
+    check_trait_arg_bounds(a, scope, span, key.unwrap(), decl, args)
+    Bound(key.unwrap(), args)
 end resolve_bound
+
+// **A trait's own parameters carry bounds, and everything applying the trait supplies them** -- a
+// bound, an `impl`, an object type. The bounds are read in the trait's own scope, since they are
+// the trait's words, and a refusal is reported where the application was written. Asked now where
+// every `impl` is in, and after the hoist where one may still be missing.
+check_trait_arg_bounds(a: &Analysis, scope: Scope, span: Span, key: string, d: TraitDecl,
+                       args: Buf[Type])
+    if d.bounds.is_empty() || args.len() != d.tparams.len() then return
+
+    val home = scope_of_trait(a, key, scope)
+
+    if a.tables.members.hoisted then
+        check_param_bounds(a, home, span, key, d.tparams, d.bounds, args, buf(), "type parameter", scope)
+    else a.tables.members.deferred.push(DeferredBound(key, d.tparams, d.bounds, args, span, home, scope,
+                                                      "type parameter"))
+end check_trait_arg_bounds
 
 // The key a name spells as a trait, where it spells one.
 lookup_trait_key(a: &Analysis, scope: Scope, written: string) -> Option[string]
