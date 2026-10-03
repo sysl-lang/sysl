@@ -213,15 +213,49 @@ in_package(a: &Analysis, pkg: Packaging, written: string) -> string
 
     val through = mounted(pkg, written)
 
-    if reaches_module(a, written)
+    if reaches_module(a, written) && !projects_only(a, pkg, written)
         val prefix_only = !a.tables.has_module(written)
 
         if prefix_only && through.is_some() && a.tables.has_module(through.unwrap()) then return through.unwrap()
 
         return written
 
-    through.unwrap_or(written)
+    through.unwrap_or(unreached(a, pkg, written))
 end in_package
+
+// Whether a path read as written, in a **dependency's** file, would reach nothing but the project's
+// own modules -- which are that dependency's to reach only through its manifest.
+//
+// Without this a dependency writing `geom` was answered by a `--lib` root's `geom` before its own
+// manifest's `geom` was ever asked: the reading as written goes first, and the project's modules are
+// the only unprefixed ones there besides the library's. The program built and ran the wrong code.
+// The project's own files are untouched, since its modules are its own first level.
+private projects_only(a: &Analysis, pkg: Packaging, written: string) -> bool =
+    pkg.prefix != "" && !reaches_avoiding_project(a, written)
+
+// `reaches_module` over every module but the project's own (`Tables.project_modules`).
+private reaches_avoiding_project(a: &Analysis, path: string) -> bool
+    for i in 0..<a.tables.modules.len()
+        val m = a.tables.modules.at(i)
+
+        if starts_with_module(m, path) && !holds_string(a.tables.project_modules, m) then return true
+
+    val cut = last_dot_in(path)
+
+    if cut.is_none() || cut.unwrap() == 0 then return false
+
+    val parent = path[0..<cut.unwrap()]
+
+    a.tables.has_module(parent) && !holds_string(a.tables.project_modules, parent)
+end reaches_avoiding_project
+
+// A written path nothing answered, handed back for the caller's diagnostic -- and, in a dependency's
+// file where it would otherwise name one of the project's modules, read in that package's own terms
+// instead, where it names nothing, so the caller refuses it rather than reaching the project's module
+// after all.
+private unreached(a: &Analysis, pkg: Packaging, written: string) -> string =
+    if pkg.prefix != "" && reaches_module(a, written) then package_qualify(pkg.prefix, written)
+    else written
 
 // The module a written `head.name` reaches its `name` through, asked of the WHOLE path.
 //

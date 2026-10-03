@@ -2,7 +2,7 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{is_file, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, write_text}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, metadata, read_bytes, read_text, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.{replace_all, Search}
 
@@ -851,10 +851,14 @@ pkb_lib_no_manifest()
     pkb_drop([root, lib])
 end pkb_lib_no_manifest
 
-// `github.com/e/mid` at 1.0.0, offering a module `mid` whose one function answers 7.
+// `github.com/e/other-mid` at 1.0.0, offering a module `mid` whose one function answers 7.
+//
+// The coordinate is `other-mid` rather than `mid` on purpose: a root whose `package.name` is the
+// coordinate's repository name **is** that package and stands in for it, which is the override below
+// rather than a collision.
 private pkb_other_mid(project: string) -> string =
-    pkb_vendored(project, "github.com/e/mid", "1.0.0", pkb_manifest("mid", "1.0.0", ""), "mid",
-                 "stamp() -> int = 7")
+    pkb_vendored(project, "github.com/e/other-mid", "1.0.0", pkb_manifest("other-mid", "1.0.0", ""),
+                 "mid", "stamp() -> int = 7")
 
 // A root's modules are filed under the project's names, so a dependency of that root offering a
 // name the root itself declares is two modules claiming one name -- refused, naming the root as the
@@ -867,12 +871,14 @@ pkb_lib_claiming_the_roots_name()
 
     pkb_other_mid(app)
 
-    val lib = pkb_declaring("m { git = \"github.com/e/mid\", version = \"1.0.0\" }",
+    val lib = pkb_declaring("m { git = \"github.com/e/other-mid\", version = \"1.0.0\" }",
                             "answer() -> int = 42", "mid")
 
     assert_eq(pkb_refused_among(s"$app/main.sysl", [lib]),
               s"package.hocon: 'mid' is both a module of the source root '$lib' and one " +
-              "github.com.e.mid offers — give the dependency a 'mount' to say what it is called here")
+              "github.com.e.other-mid offers — give the dependency a 'mount' to say what it is " +
+              "called here. A source root stands in for a coordinate only when it is that package — " +
+              "when its package.hocon names it 'other-mid'")
     pkb_drop([lib, app])
 end pkb_lib_claiming_the_roots_name
 
@@ -884,7 +890,7 @@ pkb_lib_mount_settles()
 
     pkb_other_mid(app)
 
-    val lib = pkb_declaring("m { git = \"github.com/e/mid\", version = \"1.0.0\", mount = \"theirs\" }",
+    val lib = pkb_declaring("m { git = \"github.com/e/other-mid\", version = \"1.0.0\", mount = \"theirs\" }",
                             "answer() -> int = theirs.mid.stamp() * 6", "mid")
 
     assert_eq(pkb_run_among(s"$app/main.sysl", [lib]), "42\n")
@@ -904,6 +910,306 @@ pkb_lib_name_only_the_root_bound()
     assert_eq(pkb_run_among(s"$app/main.sysl", [lib]), "42\n")
     pkb_drop([geom, lib, app])
 end pkb_lib_name_only_the_root_bound
+
+// -- a --lib root that is a coordinate's package -----------------------------------------------------
+//
+// **A `--lib` root that is a coordinate's package stands in for it** -- Cargo's `[patch]`, Go's
+// `replace`, and the loop for building a project against a working copy of something it depends on
+// (`reference/packages.md § A source root stands in for the package it is`). The coordinate is dropped
+// before selection, wherever in the graph it is named, so nothing is fetched for it. "Is that package"
+// is the root's `package.name` against the coordinate's repository name, the one identity both state
+// without anything being fetched.
+
+// A checkout of `geom` whose `double` answers differently from the published one, so a result says
+// which copy was compiled.
+private pkb_lso_checkout(name: string, deps: string) -> string
+    val root = pkb_temp("sysl-pkb-lso").unwrap()
+
+    pkb_lay(root, "", name, "geom", "double(n: int) -> int = n * 3", deps, pkb_none())
+    root
+end pkb_lso_checkout
+
+// `github.com/e/geom` at 1.0.0 in the project's `vendor/`, whose `double` doubles.
+private pkb_lso_published(project: string) -> string =
+    pkb_vendored(project, "github.com/e/geom", "1.0.0", pkb_manifest("geom", "1.0.0", ""), "geom",
+                 "double(n: int) -> int = n * 2")
+
+@test("stands in for it, and the build compiles the working copy")
+pkb_lso_stands_in()
+    if !pkb_ready() then return
+
+    val app = pkb_app("print(geom.double(7))", "g { git = \"github.com/e/geom\", version = \"1.0.0\" }")
+    val lib = pkb_lso_checkout("geom", "")
+
+    pkb_lso_published(app)
+    assert_eq(pkb_run_among(app, [lib]), "21\n")
+    pkb_drop([app, lib])
+end pkb_lso_stands_in
+
+// The case the override exists for: a coordinate nothing can fetch -- a package not yet published, or
+// no network -- is not reached at all, so it cannot stop the build.
+@test("and fetches nothing, so a coordinate that cannot be fetched does not stop the build")
+pkb_lso_fetches_nothing()
+    if !pkb_ready() then return
+
+    val app = pkb_app("print(geom.double(7))", "g { git = \"nowhere.invalid/e/geom\", version = \"1.0.0\" }")
+    val lib = pkb_lso_checkout("geom", "")
+
+    assert_eq(pkb_run_among(app, [lib]), "21\n")
+    assert(!is_directory(s"$app/vendor/nowhere.invalid"), "the stood-in coordinate was fetched")
+    assert(!is_file(s"$app/sysl.sum"), "a sysl.sum was written for a coordinate nothing fetched")
+    pkb_drop([app, lib])
+end pkb_lso_fetches_nothing
+
+// A major-version suffix is part of the coordinate's identity and not of the repository's name, so a
+// checkout of `json` is a checkout of `json/v2` too.
+@test("matching the repository name with a major-version suffix set aside")
+pkb_lso_major_suffix()
+    if !pkb_ready() then return
+
+    val app = pkb_app("print(geom.double(7))", "g { git = \"nowhere.invalid/e/geom/v2\", version = \"2.0.0\" }")
+    val lib = pkb_lso_checkout("geom", "")
+
+    assert_eq(pkb_run_among(app, [lib]), "21\n")
+    pkb_drop([app, lib])
+end pkb_lso_major_suffix
+
+// The refusal stays where the root is NOT that package: a directory that merely holds a module some
+// coordinate also offers is two claims on one name, and picking the root would be the silent winner
+// `§ 9` refuses. The message now also says what would have made it an override.
+@test("while a root that merely holds the same module is still refused")
+pkb_lso_unrelated_root_refused()
+    if !pkb_ready() then return
+
+    val app = pkb_app("print(geom.double(7))", "g { git = \"github.com/e/geom\", version = \"1.0.0\" }")
+    val lib = pkb_lso_checkout("shapes", "")
+
+    pkb_lso_published(app)
+    assert_eq(pkb_refused_among(app, [lib]),
+              s"package.hocon: 'geom' is both a module of the source root '$lib' and one " +
+              "github.com.e.geom offers — give the dependency a 'mount' to say what it is called " +
+              "here. A source root stands in for a coordinate only when it is that package — when " +
+              "its package.hocon names it 'geom'")
+    pkb_drop([app, lib])
+end pkb_lso_unrelated_root_refused
+
+// **Transitive, and it wins there too.** A dependency that itself depends on the coordinate is built
+// against the root, exactly as the project is -- one copy of the package in the program, the one the
+// reader named. Leaving the dependency on the fetched copy would put two `geom`s in one build, the
+// project's import reading one and the dependency's the other, with nothing said.
+@test("and stands in for it where another dependency names it")
+pkb_lso_transitive()
+    if !pkb_ready() then return
+
+    val app = pkb_app("print(mid.answer())\nprint(geom.double(1))",
+                      "m { git = \"github.com/e/mid\", version = \"1.0.0\" }")
+    val lib = pkb_lso_checkout("geom", "")
+
+    pkb_vendored(app, "github.com/e/mid", "1.0.0",
+                 pkb_manifest("mid", "1.0.0", "g { git = \"nowhere.invalid/e/geom\", version = \"1.0.0\" }"),
+                 "mid", "answer() -> int = geom.double(14)")
+    assert_eq(pkb_run_among(app, [lib]), "42\n3\n")
+    assert(!is_directory(s"$app/vendor/nowhere.invalid"), "the stood-in coordinate was fetched")
+    pkb_drop([app, lib])
+end pkb_lso_transitive
+
+// `github.com/e/mid` at 1.0.0 in `project`'s `vendor/`, depending on `github.com/e/geom`, whose one
+// module `mid` holds `body` -- and the published `geom` beside it.
+private pkb_lso_mid_declaring_geom(project: string, body: string)
+    pkb_lso_published(project)
+    pkb_vendored(project, "github.com/e/mid", "1.0.0",
+                 pkb_manifest("mid", "1.0.0", "g { git = \"github.com/e/geom\", version = \"1.0.0\" }"),
+                 "mid", body)
+end pkb_lso_mid_declaring_geom
+
+private pkb_lso_mid_answer() -> string = "answer() -> int = geom.double(14)"
+
+// Where the root is NOT the package, a dependency's own import of it must still reach the copy that
+// dependency declared: its table binds `geom` to the fetched package, and a name in the project's
+// space is not supposed to answer for it (`§ Imports are transitive` -- the three levels are the
+// *importing package's*, and a root's modules are the project's first level). Before, the root's
+// `geom` answered -- 42 rather than 28 -- with nothing said.
+@test("while a dependency's own import of it is not answered by an unrelated root")
+pkb_lso_unrelated_root_does_not_answer_a_dependency()
+    if !pkb_ready() then return
+
+    val app = pkb_app("print(mid.answer())", "m { git = \"github.com/e/mid\", version = \"1.0.0\" }")
+    val lib = pkb_lso_checkout("shapes", "")
+
+    pkb_lso_mid_declaring_geom(app, pkb_lso_mid_answer())
+    assert_eq(pkb_run_among(app, [lib]), "28\n")
+    pkb_drop([app, lib])
+end pkb_lso_unrelated_root_does_not_answer_a_dependency
+
+// An `import` line in the dependency reads its table the same way a dotted path does.
+@test("nor its import line")
+pkb_lso_nor_its_import_line()
+    if !pkb_ready() then return
+
+    val app = pkb_app("print(mid.answer())", "m { git = \"github.com/e/mid\", version = \"1.0.0\" }")
+    val lib = pkb_lso_checkout("shapes", "")
+
+    pkb_lso_mid_declaring_geom(app, "import geom.double\n\nanswer() -> int = double(14)")
+    assert_eq(pkb_run_among(app, [lib]), "28\n")
+    pkb_drop([app, lib])
+end pkb_lso_nor_its_import_line
+
+// The mirror: the project's own `geom` is still the root's, since the root's modules are its first
+// level and the `geom` that arrived through `mid` is only its third.
+@test("while the project's own import of it still gets the root's")
+pkb_lso_the_projects_own_import_gets_the_roots()
+    if !pkb_ready() then return
+
+    val app = pkb_app("print(mid.answer())\nprint(geom.double(7))",
+                      "m { git = \"github.com/e/mid\", version = \"1.0.0\" }")
+    val lib = pkb_lso_checkout("shapes", "")
+
+    pkb_lso_mid_declaring_geom(app, pkb_lso_mid_answer())
+    assert_eq(pkb_run_among(app, [lib]), "28\n21\n")
+    pkb_drop([app, lib])
+end pkb_lso_the_projects_own_import_gets_the_roots
+
+// No `--lib` is needed for the defect: the project's own `geom/` answered the dependency too.
+@test("and neither is it answered by the project's own module of that name")
+pkb_lso_nor_by_the_projects_own_module()
+    if !pkb_ready() then return
+
+    val app = pkb_app("print(mid.answer())\nprint(geom.double(7))",
+                      "m { git = \"github.com/e/mid\", version = \"1.0.0\" }")
+
+    pkb_lso_mid_declaring_geom(app, pkb_lso_mid_answer())
+    make_dir_all(s"$app/geom").unwrap()
+    write_text(s"$app/geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 3\n").unwrap()
+    assert_eq(pkb_run(app), "28\n21\n")
+    pkb_drop([app])
+end pkb_lso_nor_by_the_projects_own_module
+
+// A dependency that declares nothing called `geom` has no `geom` at all: its table holds its own
+// modules and what its manifest reached, and the project's are neither. So the name is refused there
+// rather than borrowed from whatever project happens to be building it -- a package's source has to
+// mean the same thing whoever depends on it.
+@test("and a dependency that declares nothing by that name is refused it")
+pkb_lso_a_dependency_declaring_nothing_is_refused()
+    if !pkb_ready() then return
+
+    val app = pkb_app("print(mid.answer())", "m { git = \"github.com/e/mid\", version = \"1.0.0\" }")
+    val lib = pkb_lso_checkout("shapes", "")
+
+    pkb_vendored(app, "github.com/e/mid", "1.0.0", pkb_manifest("mid", "1.0.0", ""), "mid",
+                 pkb_lso_mid_answer())
+
+    val said = pkb_refused_among(app, [lib])
+
+    // The reference quotes the bare `'geom'`; this compiler quotes a name qualified, on purpose, and
+    // the qualification is `mid`'s own -- the name read in that package's terms.
+    assert(said.contains("undefined name 'github.com.e.mid.mid.geom'"), said)
+    assert(said.contains("mid/mid.sysl:3:"), said)
+    pkb_drop([app, lib])
+end pkb_lso_a_dependency_declaring_nothing_is_refused
+
+// Whether `bytes` holds `needle` anywhere, which is how an archive's symbol table is read.
+private pkb_lso_holds(bytes: []u8, needle: string) -> bool
+    val n = needle.bytes
+
+    if n.len > bytes.len then return false
+
+    for i in 0..<(bytes.len - n.len + 1)
+        var same = true
+
+        for j in 0..<n.len
+            if bytes[i + j] != n[j]
+                same = false
+                break
+
+        if same then return true
+
+    false
+end pkb_lso_holds
+
+@test("and the same holds for build-c")
+pkb_lso_the_same_holds_for_build_c()
+    if !pkb_ready() then return
+
+    val dir = pkb_temp("sysl-pkb-lso-unrelated-c").unwrap()
+    val lib = pkb_lso_checkout("shapes", "")
+
+    pkb_lso_mid_declaring_geom(dir, pkb_lso_mid_answer())
+    write_text(s"$dir/package.hocon", "package { name = \"clib\", version = \"0.1.0\" }\n" +
+               "dependencies { m { git = \"github.com/e/mid\", version = \"1.0.0\" } }\n").unwrap()
+    write_text(s"$dir/lib.sysl", "@export(\"mid_answer\")\nmid_answer() -> int = mid.answer()\n").unwrap()
+    reset_search_paths()
+    add_lib_root(lib)
+
+    val made = build_c_archive(dir, None, None, DefaultOptimization, Some(s"$dir/out.a"), None, (m) -> ())
+
+    reset_search_paths()
+
+    made match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(_) -> ()
+
+    // The archive's symbol table names which `double` was compiled: the fetched package's carries its
+    // canonical prefix, and the root's would be the bare `geom$double`.
+    val symbols = read_bytes(s"$dir/out.a").unwrap()
+
+    assert(pkb_lso_holds(symbols, "github.com.e.geom.geom$double"), "the fetched geom was not compiled")
+    assert(!pkb_lso_holds(symbols, "_geom$double"), "the root's geom was compiled")
+    pkb_drop([dir, lib])
+end pkb_lso_the_same_holds_for_build_c
+
+// A mount on the stood-in dependency is still the name this manifest gave it.
+@test("and a mount on it still names it")
+pkb_lso_mount()
+    if !pkb_ready() then return
+
+    val app = pkb_app("print(theirs.geom.double(7))",
+                      "g { git = \"nowhere.invalid/e/geom\", version = \"1.0.0\", mount = \"theirs\" }")
+    val lib = pkb_lso_checkout("geom", "")
+
+    assert_eq(pkb_run_among(app, [lib]), "21\n")
+    pkb_drop([app, lib])
+end pkb_lso_mount
+
+// And a dependency the root itself declares still reaches the program through it, as the
+// coordinate's own dependencies would have.
+@test("carrying what the root depends on")
+pkb_lso_carries_the_roots_dependencies()
+    if !pkb_ready() then return
+
+    val shape = pkb_package("shape-lib", "shape", "sides() -> int = 7")
+    val lib = pkb_lso_checkout("geom", s"s { path = \"$shape\" }")
+    val app = pkb_app("print(geom.times_sides(6))", "g { git = \"nowhere.invalid/e/geom\", version = \"1.0.0\" }")
+
+    write_text(s"$lib/geom/more.sysl", "module geom\n\ntimes_sides(n: int) -> int = n * shape.sides()\n").unwrap()
+    assert_eq(pkb_run_among(app, [lib]), "42\n")
+    pkb_drop([app, lib, shape])
+end pkb_lso_carries_the_roots_dependencies
+
+// `build-c` resolves through the same driver path as a build and a test run; this pins that it does.
+@test("for build-c as well")
+pkb_lso_build_c()
+    if !pkb_ready() then return
+
+    val dir = pkb_temp("sysl-pkb-lso-c").unwrap()
+    val lib = pkb_lso_checkout("geom", "")
+
+    write_text(s"$dir/package.hocon", "package { name = \"clib\", version = \"0.1.0\" }\n" +
+               "dependencies { g { git = \"nowhere.invalid/e/geom\", version = \"1.0.0\" } }\n").unwrap()
+    write_text(s"$dir/lib.sysl", "@export(\"twice_geom\")\ntwice_geom(n: int) -> int = geom.double(n)\n").unwrap()
+    reset_search_paths()
+    add_lib_root(lib)
+
+    val made = build_c_archive(dir, None, None, DefaultOptimization, Some(s"$dir/out.a"), None, (m) -> ())
+
+    reset_search_paths()
+
+    made match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(_) -> ()
+
+    assert(is_file(s"$dir/out.a"), "no archive was written")
+    pkb_drop([dir, lib])
+end pkb_lso_build_c
 
 // -- sysl.sum -------------------------------------------------------------------------------------
 
