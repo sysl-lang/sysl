@@ -417,11 +417,17 @@ end export_signature
 // The linker would report this itself, as a duplicate definition, naming a symbol that appears in no
 // sysl file. Saying it here costs one grouping and names both declarations, which is the difference
 // between a diagnostic and an archaeology exercise.
+//
+// **An overload exported under its own name is not a claimant**: it was refused where its `@export`
+// is written (`check_export`, "C has no overloading"), and reporting the same pair again as two
+// definitions of one symbol would be one mistake told twice, the second time at the wrong line.
 private export_duplicates(a: &Analysis, exported: Buf[TFunc])
     var seen: Buf[string] = buf()
 
     for i in 0..<exported.len()
         val symbol = exported.at(i).exported.unwrap()
+
+        if refused_overload_export(a, exported.at(i).name) then continue
 
         if !holds_string(seen, symbol)
             seen.push(symbol)
@@ -430,7 +436,8 @@ private export_duplicates(a: &Analysis, exported: Buf[TFunc])
             var first = exported.at(i)
 
             for j in 0..<exported.len()
-                if exported.at(j).exported.unwrap() == symbol
+                if exported.at(j).exported.unwrap() == symbol &&
+                   !refused_overload_export(a, exported.at(j).name)
                     claimants.push(s"'${qualified_name(exported.at(j).name)}'")
 
             if claimants.len() > 1
@@ -438,6 +445,15 @@ private export_duplicates(a: &Analysis, exported: Buf[TFunc])
                         s"'$symbol' is exported by ${joined_and(sorted_names(claimants))} — one " +
                         "symbol is one definition, and the linker has no way to tell which was meant")
 end export_duplicates
+
+// Whether a function is an overload exported under its own name, which `check_export` refuses.
+private refused_overload_export(a: &Analysis, name: string) -> bool
+    val f = a.tables.funcs.get(name)
+
+    if f.is_none() || f.unwrap().decl.exported.is_none() then return false
+
+    f.unwrap().decl.exported.unwrap().symbol.is_none() && overload_keys(a, overload_plain(name)).len() > 1
+end refused_overload_export
 
 private sorted_names(xs: Buf[string]) -> Buf[string]
     var out: Buf[string] = buf()

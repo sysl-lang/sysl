@@ -1837,6 +1837,7 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
     if keys.len() == 1 then return call_key(cx, span, written, keys.at(0), args, expected, true)
 
     var fitting: Buf[string] = buf()
+    var fitted: Buf[Buf[Type]] = buf()
 
     for i in 0..<keys.len()
         // **A CANDIDATE THAT WAS NOT CHOSEN BUILT NOTHING.** Reading a call against a declaration
@@ -1851,30 +1852,35 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
         val trial = call_key(cx, span, written, keys.at(i), args, expected, false)
         val said = cx.an.complaints() > mark
 
+        // The signature the fit arrived at is read before the instantiation it made is dropped:
+        // the types outlive the trial, and for a generic candidate they are what the call solved.
+        val sig = if said then buf() else fitted_signature(cx, keys.at(i), trial)
+
         cx.an.release(sandbox)
         rewind_instantiations(cx.an, queued, tables)
         cx.an.restore_complaints(mark)
 
-        if !said then fitting.push(keys.at(i))
+        if !said
+            fitting.push(keys.at(i))
+            fitted.push(sig)
 
     // **An argument the position types fits every candidate at that candidate's own type**, so
     // where it is what the candidates differ in, it is no reason to prefer either -- `name(.Ripe)`
     // over a `Colour` and a `Fruit` that both declare `Ripe` is the ambiguity
     // (`reference/declarations.md § Overloading`), not a call meaning whichever was written first.
+    // That step is asked first; only where it leaves nothing tied do the three tie-breaks run.
     val tie = position_tie(cx, fitting, args)
+    val chosen = if tie.is_empty() then narrowed(cx, fitting, fitted, args) else tie
 
-    if tie.len() == 1 then return call_key(cx, span, written, tie.at(0), args, expected, true)
+    if chosen.len() == 1 then return call_key(cx, span, written, chosen.at(0), args, expected, true)
 
-    if tie.len() > 1
+    // **Several fit, and the language does not guess.** A literal is the usual cause: `0` is an
+    // `int` and an `i64`, so a name declared at both is ambiguous at a bare `0` and is not at `0i64`.
+    if chosen.len() > 1
         return cx.err(span, s"'${qualified_callee(keys.at(0), written)}' is ambiguous here — " +
-                      s"${tie.len()} of its declarations take these arguments:\n" +
-                      s"${signature_list(cx, tie)}\nAnnotate an argument, or name the type a " +
+                      s"${chosen.len()} of its declarations take these arguments:\n" +
+                      s"${signature_list(cx, chosen)}\nAnnotate an argument, or name the type a " +
                       "literal is meant at")
-    end if
-
-    val chosen = narrowed(cx, fitting)
-
-    if chosen.is_some() then return call_key(cx, span, written, chosen.unwrap(), args, expected, true)
 
     // **Nothing fits, and where exactly one declaration could have taken this many arguments, its
     // own complaint is the message** -- the reader wrote a call meaning that one and got an argument
@@ -1896,26 +1902,59 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
            s"declarations of that name are:\n${signature_list(cx, keys)}")
 end function_call
 
-// Which of the declarations a call fits is the one meant.
+// Which of the declarations a call fits is the one meant (`reference/declarations.md §
+// Overloading`): the three tie-breaks, in order, stopping as soon as one leaves a single answer.
+// Empty where nothing fits, one key where the call is decided, and several where it is ambiguous.
 //
-// **A declaration written out beats one a type parameter covers**, which is the whole of what a
-// specialization is for: the library declares `copy[T](dst: []T, src: []const T)` and then
-// `copy(dst: []u8, src: []const u8)` beside it, and a call on bytes means the second. Both fit, so
-// order alone would answer with whichever was written first.
-private narrowed(cx: &Analyzer, fitting: Buf[string]) -> Option[string]
-    if fitting.is_empty() then return None
-    if fitting.len() == 1 then return Some(fitting.at(0))
+// 1. **A candidate that needed no default fitted the call as written**, and beats one that did.
+// 2. **A candidate whose parameters are exactly the arguments' own types** beats one reached by a
+//    conversion -- asked of the types the fit SETTLED ON (`fitted`), so `g[T](x: T)` is exact at a
+//    `[]int` and beats `g(s: []const int)`, which takes it only by giving up the ability to write.
+// 3. **A candidate that named its parameters beats one that was solved for them**, where both
+//    fitted at the same types: the library's `copy(dst: []u8, src: []const u8)` beside
+//    `copy[T](dst: []T, src: []const T)` is what a call on bytes means. The pool it asks is the
+//    exact candidates, or -- where none is exact, every argument having been converted -- all of
+//    them provided they fitted at identical types. Candidates fitted at DIFFERENT types stay
+//    ambiguous, since choosing between them would rank one conversion above another.
+private narrowed(cx: &Analyzer, fitting: Buf[string], fitted: Buf[Buf[Type]],
+                 args: Buf[Expr]) -> Buf[string]
+    if fitting.len() <= 1 then return fitting
 
-    var spelled: Buf[string] = buf()
+    var written: Buf[usize] = buf()
 
     for i in 0..<fitting.len()
-        val f = cx.an.tables.funcs.get(fitting.at(i))
+        if cx.an.tables.funcs.get(fitting.at(i)).unwrap().decl.params.len() == args.len()
+            written.push(i)
 
-        if f.is_some() && f.unwrap().decl.tparams.is_empty() then spelled.push(fitting.at(i))
+    var ranked: Buf[usize] = buf()
 
-    if spelled.len() == 1 then return Some(spelled.at(0))
+    for i in 0..<fitting.len()
+        if written.len() != 1 || written.at(0) == i then ranked.push(i)
 
-    Some(fitting.at(0))
+    if ranked.len() == 1 then return keys_at(fitting, ranked)
+
+    val natural = natural_types(cx, args)
+    var exact: Buf[usize] = buf()
+
+    for r in 0..<ranked.len()
+        if fitted_exactly(fitted.at(ranked.at(r)), natural) then exact.push(ranked.at(r))
+
+    if exact.len() == 1 then return keys_at(fitting, exact)
+
+    var pool: Buf[usize] = buf()
+
+    if !exact.is_empty()
+        pool = exact
+    else if all_fitted_alike(fitted, ranked)
+        pool = ranked
+
+    var spelled: Buf[usize] = buf()
+
+    for p in 0..<pool.len()
+        if cx.an.tables.funcs.get(fitting.at(pool.at(p))).unwrap().decl.tparams.is_empty()
+            spelled.push(pool.at(p))
+
+    if spelled.len() == 1 then keys_at(fitting, spelled) else keys_at(fitting, ranked)
 end narrowed
 
 // The written-out candidates a call's position-typed arguments leave tied: empty where no argument
@@ -1974,6 +2013,88 @@ private nth_param_type(cx: &Analyzer, key: string, i: usize) -> Type
 
     param_type(cx, f, f.decl.params.at(i))
 end nth_param_type
+
+// The keys at these indices.
+private keys_at(keys: Buf[string], at: Buf[usize]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<at.len()
+        out.push(keys.at(at.at(i)))
+
+    out
+end keys_at
+
+// The parameter types a candidate took a call at: an instantiation's, for a generic one, which is
+// what the call solved it to, and the declared ones otherwise.
+private fitted_signature(cx: &Analyzer, key: string, trial: TExpr) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    *trial.kind match
+        TCall(name, _, _, _) -> cx.an.tables.members.func_insts.get(name) match
+            Some(sig) ->
+                for i in 0..<sig.params.len()
+                    out.push(sig.params.at(i).1)
+
+                return out
+            None -> ()
+        _ -> ()
+
+    val f = cx.an.tables.funcs.get(key).unwrap()
+
+    for i in 0..<f.decl.params.len()
+        out.push(param_type(cx, f, f.decl.params.at(i)))
+
+    out
+end fitted_signature
+
+// Each argument's own type, read with nothing expected of it -- `None` where that reading was
+// refused, which is no evidence about the type. Every trace of the reading is put back, the
+// instantiations it asked for included.
+private natural_types(cx: &Analyzer, args: Buf[Expr]) -> Buf[Option[Type]]
+    var out: Buf[Option[Type]] = buf()
+
+    for i in 0..<args.len()
+        val sandbox = cx.an.sandboxed()
+        val queued = cx.an.tables.members.pending.len()
+        val tables = cx.an.tables.members.vtables.len()
+        val read = sandboxed_reading(cx, args.at(i))
+
+        cx.an.release(sandbox)
+        rewind_instantiations(cx.an, queued, tables)
+
+        val own = texpr_type(read.0)
+
+        out.push(if read.1 || own == Unknown then None else Some(own))
+
+    out
+end natural_types
+
+// Whether a candidate's fitted parameters are exactly the arguments' own types, one for one.
+private fitted_exactly(params: Buf[Type], natural: Buf[Option[Type]]) -> bool
+    if params.len() != natural.len() then return false
+
+    for i in 0..<params.len()
+        natural.at(i) match
+            Some(t) -> if !type_eq(params.at(i), t) then return false
+            None -> return false
+
+    true
+end fitted_exactly
+
+// Whether every one of these candidates fitted the call at the same parameter types.
+private all_fitted_alike(fitted: Buf[Buf[Type]], at: Buf[usize]) -> bool
+    val first = fitted.at(at.at(0))
+
+    for i in 1..<at.len()
+        val other = fitted.at(at.at(i))
+
+        if other.len() != first.len() then return false
+
+        for j in 0..<first.len()
+            if !type_eq(first.at(j), other.at(j)) then return false
+
+    true
+end all_fitted_alike
 
 // The declarations of one name, as a reader would write them.
 private signature_list(cx: &Analyzer, keys: Buf[string]) -> string
