@@ -152,6 +152,23 @@ struct ModuleEdge
     span: Span
 end ModuleEdge
 
+// One edge of the module graph as the capability check reads it: where it was first written, the
+// capabilities the declaration it was written in needs (implications folded in), and whether it was
+// written in scaffolding -- a `@tests` file or a `@test` function, which every build but a test run
+// drops.
+struct CapabilityRef
+    from: string
+    to: string
+    scope: Scope
+    span: Span
+    needs: Buf[string]
+    scaffolding: bool
+
+    // Whether this is the `import` itself rather than a reference through it. An import says which
+    // names a file may write, not what the module ships, so it is charged by its uses.
+    imported: bool
+end CapabilityRef
+
 // Where an `extern` was written.
 struct ExternHome
     scope: Scope
@@ -403,6 +420,25 @@ struct Tables
     // form has not said.
     reference_at: Span
 
+    // What the declaration whose body is being read asked for in its `@needs(...)`, with the
+    // capabilities each implies, and whether that declaration is a test. **A reference made there is
+    // charged to whoever reaches the declaration, not to its module** -- so an edge it makes says
+    // nothing about what the module needs. Set where a function's body is read and put back after.
+    reaching_needs: Buf[string]
+    reaching_test: bool
+
+    // Every edge of the module graph again, told apart by what the code that made it is: one entry
+    // per edge, per set of capabilities its declaration needs, per whether it was scaffolding. **What
+    // a module requires is read from these rather than from `module_edges`**, which keep only the
+    // first reference to each edge and so cannot say whether every reference to it was made inside a
+    // `@needs` declaration or a test.
+    capability_refs: Buf[CapabilityRef]
+
+    // Every lowered body read inside a declaration that wrote `@needs(...)`, by the name it was
+    // lowered under, with what that declaration needs. The declaration check leaves such a body alone
+    // for those capabilities.
+    body_covers: Buf[(string, Buf[string])]
+
     // Whether a key is one this compilation has a declaration for, whatever kind.
     declares_type(self, key: string) -> bool = self.types.has(key)
 
@@ -430,7 +466,8 @@ tables_for(t: Target) -> &Tables =
            table(),
            table(),
            buf(),
-           span_zero())
+           span_zero(),
+           buf(), false, buf(), buf())
 
 // One trait a registered `impl` block still owes the implementing type, and everything a refusal
 // about it has to name: the type as a reader spelled it, the trait that asked, the trait it asked

@@ -120,7 +120,7 @@ function_address(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf[Exp
         for i in 0..<decl.params.len()
             ptypes.push(param_type(cx, f.unwrap(), decl.params.at(i)))
 
-        ret = declared_result(cx, f.unwrap().scope, decl.ret_type)
+        ret = declared_result(cx, f.unwrap().scope, decl.ret_type, decl.needs)
 
     // The address is of **code**, and the code has to be the code C would call. Where every part of
     // the signature crosses as itself the two conventions agree and the function's own symbol is
@@ -220,11 +220,11 @@ private extern_address(cx: &Analyzer, span: Span, written: string, key: string,
     var ptypes: Buf[Type] = buf()
 
     for i in 0..<d.params.len()
-        ptypes.push(resolve_type(cx.an, scope, d.params.at(i).typ, no_bindings()))
+        ptypes.push(signature_type(cx.an, d.needs, scope, d.params.at(i).typ, no_bindings()))
 
     cx.an.uses_extern(key)
 
-    TExpr(span, TFuncAddr(key, key, CFn(ptypes, declared_result(cx, scope, d.ret_type))))
+    TExpr(span, TFuncAddr(key, key, CFn(ptypes, declared_result(cx, scope, d.ret_type, d.needs))))
 end extern_address
 
 // Which declaration of an overloaded name an address is of.
@@ -270,7 +270,8 @@ private addressed_overload(cx: &Analyzer, span: Span, written: string,
             for j in 0..<f.unwrap().decl.params.len()
                 ps.push(param_type(cx, f.unwrap(), f.unwrap().decl.params.at(j)))
 
-            ret = declared_result(cx, f.unwrap().scope, f.unwrap().decl.ret_type)
+            ret = declared_result(cx, f.unwrap().scope, f.unwrap().decl.ret_type,
+                                  f.unwrap().decl.needs)
         else continue
 
         declared = declared + s"\n    $written: ${type_show(CFn(ps, ret))}"
@@ -305,9 +306,9 @@ private addressed_extern(cx: &Analyzer, span: Span, written: string, base: strin
         var ps: Buf[Type] = buf()
 
         for j in 0..<d.params.len()
-            ps.push(resolve_type(cx.an, scope, d.params.at(j).typ, no_bindings()))
+            ps.push(signature_type(cx.an, d.needs, scope, d.params.at(j).typ, no_bindings()))
 
-        val shape = CFn(ps, declared_result(cx, scope, d.ret_type))
+        val shape = CFn(ps, declared_result(cx, scope, d.ret_type, d.needs))
 
         declared = declared + s"\n    $written: ${type_show(shape)}"
 
@@ -405,11 +406,15 @@ private addressed_instantiation(cx: &Analyzer, span: Span, written: string, f: F
 
     var sub: Buf[Binding] = buf()
 
+    val covered = enter_signature(cx.an, decl.needs)
+
     for i in 0..<decl.params.len()
         unify(cx.an, f.scope, decl.params.at(i).typ, ps.at(i), decl.tparams, &sub)
 
     if decl.ret_type.is_some() then
         unify(cx.an, f.scope, decl.ret_type.unwrap(), want.unwrap().1, decl.tparams, &sub)
+
+    leave_reaching(cx.an, covered)
 
     var targs: Buf[Type] = buf()
     var unsolved: Buf[string] = buf()
