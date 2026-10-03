@@ -1,0 +1,477 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `type Name = Existing` -- a transparent alias, ported from the reference's `TypeAliasTests` case
+// for case. An alias declares no type: it is a second spelling of one that already exists, so a value
+// crosses between the two spellings with nothing emitted. A constrained subtype (`within`) and a
+// derived type (`new`) are the forms that DO declare a type, and the cases at the end pin that they
+// still differ.
+//
+// The base may be anything -- a scalar, a struct, a pointer, a callable signature, an array, a
+// generic instantiation -- and the paths that reach a declared type by its key rather than by
+// resolving a type expression (a cast, an attribute, an associated function, a variant inferred from
+// the expected type) each have to hand the question on to what the alias names.
+//
+// **Every output and diagnostic quoted here was read out of the reference compiler (0.0.159)** on the
+// same program.
+
+private tlx_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end tlx_ready
+
+private tlx_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a project of these `(module directory, file, source)` triples prints, or what its build said.
+private tlx_project(files: Buf[(string, string, string)]) -> string
+    val root = make_temp_dir("sysl-tlx").unwrap()
+
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for i in 0..<files.len()
+        val f = files.at(i)
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tlx_project
+
+// What a one-file program PRINTS.
+private tlx_ran(text: string) -> string
+    val root = make_temp_dir("sysl-tlx-run").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tlx_ran
+
+// Everything a source has to say for itself, taken the whole way through the lowering.
+private tlx_err(text: string) -> string
+    val root = make_temp_dir("sysl-tlx-err").unwrap()
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tlx_err
+
+// -- a scalar base ---------------------------------------------------------------------------------
+
+@test("a scalar alias: a value crosses both ways with no cast")
+tlx_a_value_crosses_both_ways_with_no_cast()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type Count = int
+
+        double(n: Count) -> Count = n * 2
+
+        val c: Count = 21
+
+        print(double(c) + 0)
+        """), "42\n")
+
+@test("a scalar alias and its base are one type at a call")
+tlx_the_alias_and_its_base_are_one_type_at_a_call()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type Count = int
+
+        plain(n: int) -> int = n + 1
+
+        val c: Count = 8
+
+        print(plain(c))
+        """), "9\n")
+
+// An alias to a scalar is not a declared type's key, so an associated function written through it has
+// to be sent to the base explicitly rather than falling to the read form's complaint.
+@test("an associated function of the base is reached through the alias's name")
+tlx_an_associated_function_through_the_alias()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type F = real
+
+        print(F.zero() == 0.0, F.one() == 1.0)
+        """), "true true\n")
+
+@test("an associated function the compiler provides is reached through the alias too")
+tlx_a_compiler_provided_associated_function_through_the_alias()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type Word = u32
+
+        var w: Word = Word.one()
+
+        print(w, Word.zero())
+        """), "1 0\n")
+
+// The delegation is an alias's alone: a constrained subtype is a type of its own, and what it offers
+// under its own name is the `::` surface rather than its base's members.
+@test("a constrained subtype is NOT delegated, and keeps its own complaint")
+tlx_a_constrained_subtype_is_not_delegated()
+    if !tlx_ready() then return
+
+    val said = tlx_err(raw"""
+        type Age = int within 0..150
+
+        print(Age.zero())
+        """)
+
+    assert(tlx_says(said, "error: 'Age' is a type, not a value, and has no member 'zero' — what a constrained type offers under its own name is written with '::': 'Age::First', 'Age::Last', 'Age::Valid(x)', 'Age::Succ(x)', 'Age::Pred(x)'\n"), said)
+
+// -- a struct base ---------------------------------------------------------------------------------
+
+@test("a struct alias is constructed and read through the alias's name")
+tlx_a_struct_alias_is_constructed_and_read()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        end Point
+
+        type P = Point
+
+        val p: P = P(3, 4)
+
+        print(p.x + p.y)
+        """), "7\n")
+
+// The scope question: `type P = Point` names `inner` in the file that wrote the alias, and the file
+// using `P` never imports `inner` and must not have to.
+@test("a struct alias names a type the USING file has not imported")
+tlx_a_struct_alias_names_a_type_the_using_file_has_not_imported()
+    if !tlx_ready() then return
+
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("inner", "inner.sysl", "module inner\n\nstruct Point\n    x: int\n    y: int\nend Point\n"))
+    fs.push(("outer", "outer.sysl", "module outer\n\nimport inner.Point\n\ntype P = Point\n"))
+    fs.push(("", "main.sysl", "import outer.P\n\nval p: P = P(2, 5)\n\nprint(p.x * p.y)\n"))
+
+    assert_eq(tlx_project(fs), "10\n")
+
+// -- the other bases -------------------------------------------------------------------------------
+
+@test("a pointer base, which no constrained subtype may have")
+tlx_a_pointer_base()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type Handle = *u8
+
+        first(h: Handle) -> u8 = h[0]
+
+        var bytes = [7u8, 9u8]
+
+        print(first(&bytes[0]))
+        """), "7\n")
+
+@test("a callable base lets a signature be named once")
+tlx_a_callable_base_names_a_signature_once()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type Comparison = *extern(*u8, *u8) -> i32
+
+        compare(a: *u8, b: *u8) -> i32 = i32(a[0]) - i32(b[0])
+
+        call(f: Comparison, a: *u8, b: *u8) -> i32 = f(a, b)
+
+        var xs = [9u8, 4u8]
+
+        print(str(call(&compare, &xs[0], &xs[1])))
+        """), "5\n")
+
+@test("a chain of aliases resolves to what the last one names")
+tlx_a_chain_of_aliases_resolves()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type A = int
+        type B = A
+        type C = B
+
+        val c: C = 5
+
+        print(c + 1)
+        """), "6\n")
+
+@test("a cycle of aliases is refused rather than followed forever")
+tlx_a_cycle_is_refused()
+    if !tlx_ready() then return
+
+    val said = tlx_err(raw"""
+        type A = B
+        type B = A
+
+        val a: A = 1
+
+        print(1)
+        """)
+
+    assert(tlx_says(said, "error: 'A' is an alias for itself, through a chain of aliases\n"), said)
+    assert(tlx_says(said, "error: 'B' is an alias for itself, through a chain of aliases\n"), said)
+
+// -- what an alias is NOT --------------------------------------------------------------------------
+
+@test("'new' over a struct is still refused")
+tlx_new_over_a_struct_is_still_refused()
+    if !tlx_ready() then return
+
+    val said = tlx_err(raw"""
+        struct Point
+            x: int
+            y: int
+        end Point
+
+        type Bad = new Point
+
+        var b = Bad(Point(1, 2))
+
+        print(b.x)
+        """)
+
+    assert(tlx_says(said, "error: a constrained subtype's base must be an integer, a float, or 'char', not Point\n"), said)
+
+@test("a derived type is still distinct from its base at a call")
+tlx_a_derived_type_is_still_distinct_at_a_call()
+    if !tlx_ready() then return
+
+    val said = tlx_err(raw"""
+        type Meters = new f64
+
+        plain(x: f64) -> f64 = x
+
+        val m: Meters = Meters(3.0)
+
+        print(str(plain(m)))
+        """)
+
+    assert(tlx_says(said, "error: 'x' of 'plain' is real, but Meters was given\n"), said)
+
+@test("a constrained subtype still declares a type, with the bounds that go with one")
+tlx_a_constrained_subtype_still_declares_a_type()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type Age = int within 0..150
+
+        print(str(Age::First), str(Age::Last))
+        """), "0 150\n")
+
+// -- the edges: the paths that reach a declared type by its key -------------------------------------
+
+@test("a cast through the alias is the base's cast")
+tlx_a_cast_through_the_alias()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type Tick = u32
+
+        val n = 300
+
+        print(str(Tick(n)))
+        """), "300\n")
+
+@test("an attribute through the alias is the base's attribute")
+tlx_an_attribute_through_the_alias()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type Tick = u8
+
+        print(str(Tick::Min), str(Tick::Max))
+        """), "0 255\n")
+
+@test("and so is the base's refusal of an attribute it does not have")
+tlx_the_bases_refusal_of_an_attribute()
+    if !tlx_ready() then return
+
+    val said = tlx_err(raw"""
+        type Tick = u8
+
+        print(str(Tick::First))
+        """)
+
+    assert(tlx_says(said, "error: 'Tick' is an integer, not a declared sequence — its extremes are 'Tick::Min' and 'Tick::Max'. 'First' and 'Last' name the ends of an enum's variants or of a 'within' range, which is a different question\n"), said)
+
+@test("an alias over a struct has no attributes, and is told so about the struct")
+tlx_an_alias_over_a_struct_has_no_attributes()
+    if !tlx_ready() then return
+
+    val said = tlx_err(raw"""
+        struct Point
+            x: int
+        end Point
+
+        type P = Point
+
+        print(str(P::Max))
+        """)
+
+    assert(tlx_says(said, "error: 'Point' has no type attributes\n"), said)
+
+@test("an enum's variant is inferred from an alias in the expected position")
+tlx_a_variant_is_inferred_from_an_alias()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        enum Colour
+            Red
+            Green
+            Blue
+        end Colour
+
+        type C = Colour
+
+        val c: C = Green
+
+        print(C::Image(c), str(C::Pos(C::Last)))
+        """), "Green 2\n")
+
+@test("an alias stands as a type argument")
+tlx_an_alias_stands_as_a_type_argument()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type Count = int
+
+        val xs: [3]Count = [1, 2, 3]
+        val o: Option[Count] = Some(4)
+
+        print(xs[2] + o.unwrap())
+        """), "7\n")
+
+@test("an alias names an array type, which no constrained subtype may")
+tlx_an_alias_names_an_array_type()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type Triple = [3]int
+
+        var t: Triple = [1, 2, 3]
+
+        print(t[0] + t[1] + t[2])
+        """), "6\n")
+
+@test("an alias names a generic instantiation")
+tlx_an_alias_names_a_generic_instantiation()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        type MaybeInt = Option[int]
+
+        val m: MaybeInt = Some(9)
+
+        print(m.unwrap())
+        """), "9\n")
+
+@test("a method and a trait implementation are reached through the alias")
+tlx_a_method_and_a_trait_impl_through_the_alias()
+    if !tlx_ready() then return
+
+    assert_eq(tlx_ran(raw"""
+        struct Point
+            x: int
+            y: int
+
+            sum(self) -> int = self.x + self.y
+        end Point
+
+        trait Shown
+            shown(self) -> string
+        end Shown
+
+        impl Shown for Point
+            shown(self) -> string = str(self.x) + "," + str(self.y)
+        end Point
+
+        type P = Point
+
+        val p: P = P(4, 5)
+
+        print(p.sum(), p.shown())
+        """), "9 4,5\n")
+
+// The complaint has to be the base's, not the "add a 'within' range" a constrained subtype's table
+// would produce -- that would tell a reader to repair a declaration that is already correct.
+@test("a member selected from the alias's name complains as the base does")
+tlx_a_member_selected_from_the_alias_complains_as_the_base()
+    if !tlx_ready() then return
+
+    val said = tlx_err(raw"""
+        type Tick = u32
+
+        print(str(Tick.nope))
+        """)
+
+    assert(tlx_says(said, "error: 'Tick' is a type, not a value, and has no associated function 'nope'\n"), said)
+    assert(!tlx_says(said, "has no constraint"), said)
+
+@test("a range is not something an alias over an integer has")
+tlx_a_range_is_not_an_integer_aliases()
+    if !tlx_ready() then return
+
+    val said = tlx_err(raw"""
+        type Tick = u32
+
+        for t in Tick::Range
+            print(str(t))
+        """)
+
+    assert(tlx_says(said, "error: 'Tick' has no attribute 'Range' — an integer type answers 'Tick::Min' and 'Tick::Max'\n"), said)
