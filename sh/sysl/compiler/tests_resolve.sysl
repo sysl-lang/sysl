@@ -1,268 +1,586 @@
 module sh.sysl.compiler
 @tests
 
-import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, Search}
 
-// What a written type resolves to.
+// Version selection, the import tables built over it, and the claims kept beside the answer -- the
+// cases `tests_deps.sysl` does not already answer.
 //
-// **The claim under test is that two trees mean one thing.** `TypeRef` is what the source wrote and
-// `Type` is what it means, and every test here hands the pass a spelling and asks for the value.
+// **Every graph here is built in a cache of its own**, populated by hand as a fetch would have left
+// it, so the answers are about the resolver rather than about what this machine fetched before.
 
-private of(written: string) -> Type = resolve_written("", written).0
+private rvx_cache() -> string = make_temp_dir("sysl-rvx-cache").unwrap()
 
-private of_with(text: string, written: string) -> Type = resolve_written(text, written).0
+private rvx_manifest(name: string, version: string, deps: string) -> string =
+    s"package { name = \"$name\", version = \"$version\" }\n" +
+    (if deps.is_empty() then "" else s"dependencies { $deps }\n")
 
-private said(text: string, written: string) -> string
-    val answered = resolve_written(text, written)
+private rvx_dep(label: string, coordinate: string, version: string) -> string =
+    s"$label { git = \"$coordinate\", version = \"$version\" }"
 
-    if answered.1.is_empty() then return ""
+private rvx_mounted(label: string, coordinate: string, version: string, mount: string) -> string =
+    s"$label { git = \"$coordinate\", version = \"$version\", mount = \"$mount\" }"
 
-    answered.1.at(0)
-end said
+// A package placed in the cache at a coordinate and version, holding only its manifest.
+private rvx_published(cache: string, coordinate: string, version: Release, config: string) -> string
+    val dir = fetch_directory(cache, coordinate, version)
 
-@test("a scalar resolves to the width it names, and the address-width two to the target's")
-a_scalar_resolves_to_its_width()
-    assert(type_eq(of("int"), Integer(32, true, false)))
-    assert(type_eq(of("byte"), Integer(8, false, false)))
-    assert(type_eq(of("bool"), Bool))
-    assert(type_eq(of("string"), Str))
-    assert(type_eq(of("unit"), Unit))
-    // `never` is a result type only (`tests_nev_never.sysl`), so a bare type position refuses it.
-    assert_eq(said("", "never"), "'never' is the type of an expression that does not finish, so it can " +
-                                 "only be a result type")
-    assert(type_eq(of("u12"), Integer(12, false, false)))
-    assert(type_eq(of("i128"), Integer(128, true, false)))
-    assert(type_eq(of("f32"), Floating(32, false)))
-    assert(type_eq(of("usize"), usize_type(int(host_target().pointer_bits()))))
+    make_dir_all(dir).unwrap()
+    write_text(join_path(dir, ManifestName), config).unwrap()
+    dir
+end rvx_published
 
-@test("a qualifier and a pointer are what they are written as")
-a_qualifier_is_what_it_is_written_as()
-    assert(type_eq(of("*int"), Ptr(Integer(32, true, false))))
-    assert(type_eq(of("&int"), Ref(Integer(32, true, false), false)))
-    assert(type_eq(of("&sync int"), Ref(Integer(32, true, false), true)))
-    assert(type_eq(of("weak &int"), Weak(Ref(Integer(32, true, false), false))))
-    assert(type_eq(of("*volatile u32"), Ptr(Volatile(Integer(32, false, false)))))
-    // A bare `volatile` names a value, which the qualifier has nothing to say about.
-    assert_eq(said("", "volatile u32"),
-              "'volatile u32' is the type of *storage*, and this is a value — what a read of a " +
-              "volatile place hands back is an ordinary 'u32'. The qualifier goes where the storage " +
-              "is named: a struct field, an element, or the pointee of a '*T', as '*volatile u32'")
+// One module of source at `module_path` below a directory, which is what makes the path a module.
+private rvx_source(dir: string, module_path: string)
+    make_dir_all(s"$dir/$module_path").unwrap()
+    write_text(s"$dir/$module_path/${rvx_leaf(module_path)}.sysl",
+               s"module ${rvx_dotted(module_path)}\n").unwrap()
 
-@test("a slice takes its element and whether it may be written; an array takes its length too")
-a_slice_and_an_array()
-    assert(type_eq(of("[]byte"), Slice(byte_type(), false)))
-    assert(type_eq(of("[]const byte"), Slice(byte_type(), true)))
-    assert(type_eq(of("[4]int"), Array(4, Integer(32, true, false))))
-    assert(type_eq(of("<4>f32"), Vector(4, Floating(32, false))))
+// A package in the cache holding one module, under a package name that need not be the module's.
+private rvx_module(cache: string, coordinate: string, version: Release, module_path: string,
+                   name: string, deps: string) -> string
+    val dir = rvx_published(cache, coordinate, version,
+                            rvx_manifest(name, release_shown(version), deps))
 
-@test("a tuple is the compiler's own struct, and a result list is that struct wearing a second name")
-a_tuple_and_a_result_list()
-    val pair = of("(int, string)")
+    rvx_source(dir, module_path)
+    dir
+end rvx_module
 
-    assert_eq(type_show(pair), "(int, string)")
+private rvx_leaf(dir: string) -> string
+    var at: usize = 0
 
-    pair match
-        Struct(d) ->
-            assert_eq(d.base, tuple_base(2))
-            assert_eq(d.fields.len(), 2)
-            assert_eq(d.fields.at(0).0, "0")
-            assert(type_eq(d.fields.at(1).1, Str))
-        _ -> assert(false, "a tuple is not a struct")
+    for i in 0..<dir.bytes.len
+        if dir.bytes[i] == u8('/') then at = i + 1
 
-@test("a written callable is the trait of its arity, with its result last")
-a_written_callable()
-    val f = of("&Fn(int, bool) -> string")
+    dir[at..<dir.bytes.len]
+end rvx_leaf
 
-    f match
-        Ref(inner, _) -> *inner match
-            Trait(n, args, _) ->
-                assert_eq(n, fn_base(2))
-                assert_eq(args.len(), 3)
-                assert(type_eq(args.at(2), Str))
-            _ -> assert(false, "a callable is not a trait")
-        _ -> assert(false, "a boxed callable is not a reference")
+private rvx_dotted(dir: string) -> string
+    var out = ""
 
-    assert_eq(type_show(of("&Fn(int) -> int")), "&Fn(int) -> int")
+    for i in 0..<dir.bytes.len
+        out = out + (if dir.bytes[i] == u8('/') then "." else dir[i..<(i + 1)])
 
-// A trait stands where a type does only behind a mode, and a callable is a trait.
-@test("and without a mode it is refused, naming the box it should have been")
-a_written_callable_without_a_mode()
-    assert_eq(said("", "Fn(int) -> int"), "'Fn(int) -> int' is a trait, and a trait is a type " +
-              "only behind a mode — write '&Fn(int) -> int' for the boxed callable a concrete slot " +
-              "takes")
-
-@test("a pointer to a C function keeps the convention it was written under")
-a_c_function_pointer_resolves()
-    assert(type_eq(of("*extern(int) -> unit"), CFn(one_type(Integer(32, true, false)), Unit)))
-
-@test("a declared type resolves to the one record every use of it shares")
-a_declared_type_is_one_record()
-    val text = "struct P\n    x: int\n"
-    val a = of_with(text, "P")
-    val b = of_with(text, "*P")
-
-    assert(type_eq(a, of_with(text, "P")))
-
-    b match
-        Ptr(inner) -> assert(type_eq(*inner, a))
-        _ -> assert(false, "a pointer is not a pointer")
-
-@test("a generic resolves once per set of arguments")
-a_generic_resolves_per_instantiation()
-    val text = "struct Box[T]\n    v: T\n"
-    val of_int = of_with(text, "Box[int]")
-
-    assert_eq(type_show(of_int), "Box[int]")
-
-    of_int match
-        Struct(d) ->
-            assert_eq(d.targs.len(), 1)
-            assert(type_eq(d.fields.at(0).1, Integer(32, true, false)))
-        _ -> assert(false, "a generic is not a struct")
-
-    of_with(text, "Box[string]") match
-        Struct(d) -> assert(type_eq(d.fields.at(0).1, Str))
-        _ -> assert(false, "a generic is not a struct")
-
-@test("a plain alias is another spelling for what it names, and nothing more")
-a_plain_alias_is_a_spelling()
-    assert(type_eq(of_with("type Small = byte\n", "Small"), byte_type()))
-    assert(type_eq(of_with("type A = B\ntype B = []const byte\n", "A"), Slice(byte_type(), true)))
-
-@test("and a derived one is a type of its own, over the base it narrows")
-a_derived_subtype_is_its_own_type()
-    val t = of_with("type Metres = new int\n", "Metres")
-
-    assert(!type_eq(t, Integer(32, true, false)))
-    assert(type_eq(underlying(t), Integer(32, true, false)))
-    assert_eq(type_show(t), "Metres")
-
-@test("a type parameter stands for itself while a signature is read")
-a_type_parameter_stands_for_itself()
-    val a = analysis_for(host_target())
-    val scope = scope_of_unit(a, parse(source_of("test.sysl", "")).program)
-    var subst = stand_ins(a, scope, one_name("T"), buf())
-
-    assert(type_eq(bound_type(subst, "T").unwrap(), Abstract("T", buf())))
-    assert(bound_type(subst, "U").is_none())
-
-@test("and a value parameter stands as a number of its declared type, not as a type")
-vgf_a_value_parameter_stands_as_a_number()
-    val a = analysis_for(host_target())
-    val scope = scope_of_unit(a, parse(source_of("test.sysl", "")).program)
-    var names = one_name("T")
-    var values: Buf[TypeBinding] = buf()
-
-    names.push("N")
-    values.push(TypeBinding("N", parse_type_text("type.sysl", "usize").value))
-
-    val subst = stand_ins(a, scope, names, values)
-
-    assert(type_eq(bound_type(subst, "T").unwrap(), Abstract("T", buf())))
-
-    bound_type(subst, "N").unwrap() match
-        ConstArg(v, ty) ->
-            assert_eq(str(v), "0")
-            assert_eq(type_show(*ty), "usize")
-        _ -> assert(false)
-
-@test("a name nothing declares is refused, and what is refused answers with nothing settled")
-an_unresolvable_name_answers_unknown()
-    val answered = resolve_written("", "Nope")
-
-    assert(type_eq(answered.0, Unknown))
-    assert_eq(answered.1.at(0), "unknown type 'Nope'")
-
-@test("a trait with an associated type takes an argument that binds it")
-a_trait_with_an_associated_type()
-    val text = "trait Yield\n    type Item\n    next(*self) -> Self::Item\n"
-
-    // Behind a mode, which is the one place a trait stands where a type does.
-    assert_eq(said(text, "&Yield[int]"), "")
-
-    val object = of_with(text, "&Yield[int]") match
-        Ref(inner, _) -> *inner
-        other -> other
-
-    object match
-        Trait(_, args, assocs) ->
-            assert(args.is_empty())
-            assert_eq(assocs.len(), 1)
-            assert_eq(assocs.at(0).0, "Item")
-            assert(type_eq(assocs.at(0).1, Integer(32, true, false)))
-        _ -> assert(false, "a trait is not a trait")
-
-@test("and one with no parameters and no associated types is told it takes none")
-a_bare_trait_takes_no_arguments()
-    assert_eq(said("trait Show\n    show(self) -> string\n", "&Show[int]"),
-              "trait 'Show' does not take type arguments")
-
-@test("and a trait written with no mode in front of it is refused as a type, arguments or none")
-a_trait_is_not_a_type()
-    val text = "trait Show\n    show(self) -> string\n"
-    val refusal = "'Show' is a trait, so it describes behaviour rather than a layout — write '*Show' or " +
-                  "'&Show' for a trait object, or bound a type parameter with '[T: Show]'"
-
-    assert_eq(said(text, "Show"), refusal)
-    assert_eq(said(text, "Show[int]"), refusal)
-    assert(type_eq(of_with(text, "Show"), Unknown))
-    assert_eq(said(text, "*Show"), "")
-    assert_eq(said(text, "weak Show"), "")
-end a_trait_is_not_a_type
-
-@test("a module's name may be written in front of a type, and an alias for the module may be too")
-a_qualified_type_name()
-    var units: Buf[Program] = buf()
-
-    units.push(parse(source_of("a.sysl", "module m\n\nstruct P\n    x: int\n")).program)
-    units.push(parse(source_of("b.sysl", "module n\n\nuse(p: m.P) -> int = 1\n")).program)
-
-    assert(analyze_decls(units, host_target()).is_ok())
-
-@test("an 'extern' signature is read in its own file's terms, imports and all")
-an_extern_reads_its_own_imports()
-    var units: Buf[Program] = buf()
-
-    // The ordinary shape of a C binding: the ABI structs one module down, imported by name into the
-    // file of `extern`s that takes them. Nothing else in that file names `P`, so a scope carrying
-    // the module and none of its imports reads it as an unknown type.
-    units.push(parse(source_of("a.sysl", "module m.math\n\nstruct P\n    x: int\n")).program)
-    units.push(parse(source_of("b.sysl",
-        "module m.c\n\nimport m.math.P\n\nextern \"c_take\" take(p: *P) -> int\n")).program)
-
-    val said = analyze_decls(units, host_target())
-
-    assert(said.is_ok(), if said.is_ok() then "" else said.unwrap_err().at(0).diag.message)
-
-private one_type(t: Type) -> Buf[Type]
-    var out: Buf[Type] = buf()
-
-    out.push(t)
     out
-end one_type
+end rvx_dotted
 
-private one_name(n: string) -> Buf[string]
-    var out: Buf[string] = buf()
+// A project on disk with a manifest and, where `own` is not empty, one module of its own there.
+private rvx_project(config: string, own: string) -> string
+    val root = make_temp_dir("sysl-rvx-project").unwrap()
 
-    out.push(n)
-    out
-end one_name
+    if !config.is_empty() then write_text(join_path(root, ManifestName), config).unwrap()
 
-// -- an extent -------------------------------------------------------------------------------------
+    if !own.is_empty() then rvx_source(root, own)
 
-// **A length is any constant expression, not only a literal.** The library writes `[addr_bytes]u8`
-// where `addr_bytes` is a `const`, and an array of zero bytes is what a resolution that read only
-// literals gave it.
+    root
+end rvx_project
 
-@test("an array's length is a literal, or a constant expression that folds to one")
-an_extent_folds()
-    assert(type_eq(of("[4]int"), Array(4, Integer(32, true, false))))
-    assert(type_eq(of_with("const n: usize = 128\n", "[n]byte"),
-                   Array(128, Integer(8, false, false))))
-    assert(type_eq(of_with("const n: usize = 8\n", "[n * 2 + 1]byte"),
-                   Array(17, Integer(8, false, false))))
+// A project with a directory of that name holding no source, which is therefore not a module.
+private rvx_bare(config: string, dir: string) -> string
+    val root = rvx_project(config, "")
 
-@test("and a length written in terms of a type parameter stands at zero until it is instantiated")
-an_unsettled_extent_is_zero()
-    assert(type_eq(of("[sizes]byte"), Array(0, Integer(8, false, false))))
+    make_dir_all(s"$root/$dir").unwrap()
+    root
+end rvx_bare
+
+private rvx_resolved(root: string, cache: string) -> Graph
+    val m = manifest_of_package(root).unwrap()
+
+    resolve_graph(root, m, empty_sums(), cache).unwrap()
+end rvx_resolved
+
+private rvx_refused(root: string, cache: string) -> string
+    val m = manifest_of_package(root).unwrap()
+
+    resolve_graph(root, m, empty_sums(), cache) match
+        Err(why) -> why
+        Ok(_) -> ""
+end rvx_refused
+
+// What selection chose for every fetched package, as sorted `canonical=version` words.
+private rvx_selected(g: &Graph) -> string
+    var rows: Buf[string] = buf()
+
+    for i in 0..<g.packages.len()
+        val p = g.packages.at(i)
+
+        p.version match
+            None -> ()
+            Some(v) -> rows.push(s"${p.canonical}=${release_shown(v)}")
+
+    join(sorted_labels(rows).view(), " ")
+end rvx_selected
+
+private rvx_imports(g: &Graph, canonical: string) -> string
+    for i in 0..<g.packages.len()
+        if g.packages.at(i).canonical != canonical then continue
+
+        var rows: Buf[string] = buf()
+
+        for j in 0..<g.packages.at(i).imports.len()
+            val row = g.packages.at(i).imports.at(j)
+
+            rows.push(s"${row.0}->${row.1}")
+
+        return join(sorted_labels(rows).view(), " ")
+
+    "no such package"
+end rvx_imports
+
+// The claims on one coordinate, in the order they were made, as `asker=version` words.
+private rvx_claimed(g: &Graph, coordinate: string) -> string
+    var rows: Buf[string] = buf()
+
+    for i in 0..<g.claims.len()
+        val c = g.claims.at(i)
+
+        if c.coordinate == coordinate then rows.push(s"${c.asker}=${release_shown(c.version)}")
+
+    join(rows.view(), " ")
+end rvx_claimed
+
+// Every coordinate anything made a claim on, once each, sorted.
+private rvx_claim_keys(g: &Graph) -> string
+    var keys: Buf[string] = buf()
+
+    for i in 0..<g.claims.len()
+        val k = g.claims.at(i).coordinate
+        var seen = false
+
+        for j in 0..<keys.len()
+            if keys.at(j) == k then seen = true
+
+        if !seen then keys.push(k)
+
+    join(sorted_labels(keys).view(), " ")
+end rvx_claim_keys
+
+private rvx_v100() -> Release = Release(1, 0, 0)
+
+private rvx_cleanup(a: string, b: string)
+    remove_dir_all(a).unwrap_or(())
+    remove_dir_all(b).unwrap_or(())
+
+// -- the highest minimum wins, not the newest that exists ------------------------------------------
+
+// 1.10.0 is higher than 1.9.0, which is the case a comparison done on the text gets wrong -- asked of
+// a whole graph rather than of two versions alone.
+@test("versions are compared as numbers")
+rvx_versions_are_compared_as_numbers()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/buf", Release(1, 9, 0), "buf", "buf", "")
+    rvx_module(cache, "github.com/e/buf", Release(1, 10, 0), "buf", "buf", "")
+    rvx_module(cache, "github.com/e/a", rvx_v100(), "a", "a", rvx_dep("buf", "github.com/e/buf", "1.10.0"))
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0",
+                                        rvx_dep("a", "github.com/e/a", "1.0.0") + ", " +
+                                        rvx_dep("buf", "github.com/e/buf", "1.9.0")), "")
+
+    assert_eq(rvx_selected(rvx_resolved(root, cache)), "github.com.e.a=1.0.0 github.com.e.buf=1.10.0")
+    rvx_cleanup(cache, root)
+
+// -- what a name at the head of an import line means -----------------------------------------------
+
+// The package is the unit of distribution and the module the unit of code: sqlite3's package is
+// `sqlite3` and its module is `sqlite`, and a consumer reaching the second need not say the first.
+@test("and not the name the package calls itself")
+rvx_not_the_name_the_package_calls_itself()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/sqlite3", rvx_v100(), "sqlite", "sqlite3", "")
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0",
+                                        rvx_dep("s", "github.com/e/sqlite3", "1.0.0")), "")
+
+    assert_eq(rvx_imports(rvx_resolved(root, cache), ""), "sqlite->github.com.e.sqlite3.sqlite")
+    rvx_cleanup(cache, root)
+
+@test("every module a package has, where there is more than one")
+rvx_every_module_a_package_has()
+    val cache = rvx_cache()
+    val dir = rvx_published(cache, "github.com/e/two", rvx_v100(), rvx_manifest("two", "1.0.0", ""))
+
+    rvx_source(dir, "alpha")
+    rvx_source(dir, "beta")
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0", rvx_dep("t", "github.com/e/two", "1.0.0")), "")
+
+    assert_eq(rvx_imports(rvx_resolved(root, cache), ""),
+              "alpha->github.com.e.two.alpha beta->github.com.e.two.beta")
+    rvx_cleanup(cache, root)
+
+// Per-consumer, which is the whole of the two-layer identity: two projects may write different words
+// and still link one copy of the package.
+@test("is per-package, so a dependency's own table is its own")
+rvx_a_table_is_per_package()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/buf", rvx_v100(), "buf", "buf", "")
+    rvx_module(cache, "github.com/e/a", rvx_v100(), "a", "a", rvx_dep("b", "github.com/e/buf", "1.0.0"))
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0",
+                                        rvx_dep("a", "github.com/e/a", "1.0.0") + ", " +
+                                        rvx_mounted("buf", "github.com/e/buf", "1.0.0", "bytes")), "")
+    val graph = rvx_resolved(root, cache)
+
+    assert_eq(rvx_imports(graph, ""), "a->github.com.e.a.a bytes->github.com.e.buf")
+    assert_eq(rvx_imports(graph, "github.com.e.a"), "buf->github.com.e.buf.buf")
+    rvx_cleanup(cache, root)
+
+// However far down it is: what a program can name is the whole graph, not the first layer of it.
+@test("and one reached through two of them")
+rvx_one_reached_through_two()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/buf", rvx_v100(), "buf", "buf", "")
+    rvx_module(cache, "github.com/e/ui", rvx_v100(), "ui", "ui", rvx_dep("buf", "github.com/e/buf", "1.0.0"))
+    rvx_module(cache, "github.com/e/driver", rvx_v100(), "driver", "driver",
+               rvx_dep("ui", "github.com/e/ui", "1.0.0"))
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0",
+                                        rvx_dep("d", "github.com/e/driver", "1.0.0")), "")
+
+    assert_eq(rvx_imports(rvx_resolved(root, cache), ""),
+              "buf->github.com.e.buf.buf driver->github.com.e.driver.driver ui->github.com.e.ui.ui")
+    rvx_cleanup(cache, root)
+
+// What a manifest declared beats what arrived through something else, which is what makes a mount
+// worth writing: the nearer name is the one in front of the person reading the file.
+@test("a declared name beats an inherited one")
+rvx_a_declared_name_beats_an_inherited_one()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/json", rvx_v100(), "json", "json", "")
+    rvx_module(cache, "github.com/e/driver", rvx_v100(), "driver", "driver",
+               rvx_dep("j", "github.com/e/json", "1.0.0"))
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0",
+                                        rvx_dep("d", "github.com/e/driver", "1.0.0") + ", " +
+                                        rvx_mounted("j", "github.com/e/json", "1.0.0", "ejson")), "")
+
+    assert_eq(rvx_imports(rvx_resolved(root, cache), ""),
+              "driver->github.com.e.driver.driver ejson->github.com.e.json")
+    rvx_cleanup(cache, root)
+
+// -- a collision is an error and never a silent winner ---------------------------------------------
+
+// The same collision one layer further away, refused in the same words, with the fix stated as what
+// a consumer can actually do about it.
+@test("two inherited packages wanting one name")
+rvx_two_inherited_packages_wanting_one_name()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/one", rvx_v100(), "json", "one", "")
+    rvx_module(cache, "github.com/e/two", rvx_v100(), "json", "two", "")
+    rvx_module(cache, "github.com/e/a", rvx_v100(), "a", "a", rvx_dep("j", "github.com/e/one", "1.0.0"))
+    rvx_module(cache, "github.com/e/b", rvx_v100(), "b", "b", rvx_dep("j", "github.com/e/two", "1.0.0"))
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0",
+                                        rvx_dep("a", "github.com/e/a", "1.0.0") + ", " +
+                                        rvx_dep("b", "github.com/e/b", "1.0.0")), "")
+    val said = rvx_refused(root, cache)
+
+    assert(said.index_of("claim the same module").is_some(), said)
+    assert(said.index_of("mount").is_some(), said)
+    rvx_cleanup(cache, root)
+
+// ...and naming one of them is what settles it, because a declared name beats an inherited one.
+@test("which naming one of them settles")
+rvx_naming_one_of_them_settles()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/one", rvx_v100(), "json", "one", "")
+    rvx_module(cache, "github.com/e/two", rvx_v100(), "json", "two", "")
+    rvx_module(cache, "github.com/e/a", rvx_v100(), "a", "a", rvx_dep("j", "github.com/e/one", "1.0.0"))
+    rvx_module(cache, "github.com/e/b", rvx_v100(), "b", "b", rvx_dep("j", "github.com/e/two", "1.0.0"))
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0",
+                                        rvx_dep("a", "github.com/e/a", "1.0.0") + ", " +
+                                        rvx_dep("b", "github.com/e/b", "1.0.0") + ", " +
+                                        rvx_dep("one", "github.com/e/one", "1.0.0")), "")
+
+    assert_eq(rvx_imports(rvx_resolved(root, cache), ""),
+              "a->github.com.e.a.a b->github.com.e.b.b json->github.com.e.one.json")
+    rvx_cleanup(cache, root)
+
+// Two packages that are not one library keep the plainer sentence, because reading them as one would
+// send somebody looking for a version they do not have.
+@test("and two unrelated packages do not")
+rvx_two_unrelated_packages_do_not()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/one", rvx_v100(), "json", "one", "")
+    rvx_module(cache, "github.com/e/two", rvx_v100(), "json", "two", "")
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0",
+                                        rvx_dep("a", "github.com/e/one", "1.0.0") + ", " +
+                                        rvx_dep("b", "github.com/e/two", "1.0.0")), "")
+    val said = rvx_refused(root, cache)
+
+    assert(!said.is_empty(), "the two still collide")
+    assert(said.index_of("major versions").is_none(), said)
+    rvx_cleanup(cache, root)
+
+@test("and a mount settles it")
+rvx_and_a_mount_settles_it()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/one", rvx_v100(), "json", "one", "")
+    rvx_module(cache, "github.com/e/two", rvx_v100(), "json", "two", "")
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0",
+                                        rvx_dep("a", "github.com/e/one", "1.0.0") + ", " +
+                                        rvx_mounted("b", "github.com/e/two", "1.0.0", "json2")), "")
+
+    assert_eq(rvx_imports(rvx_resolved(root, cache), ""),
+              "json->github.com.e.one.json json2->github.com.e.two")
+    rvx_cleanup(cache, root)
+
+@test("and a directory that is not a module does not collide with anything")
+rvx_a_directory_that_is_not_a_module()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/one", rvx_v100(), "json", "one", "")
+
+    val root = rvx_bare(rvx_manifest("app", "0.1.0", rvx_dep("a", "github.com/e/one", "1.0.0")), "json")
+
+    assert_eq(rvx_imports(rvx_resolved(root, cache), ""), "json->github.com.e.one.json")
+    rvx_cleanup(cache, root)
+
+@test("nor does a dot directory, which is never walked at all")
+rvx_nor_does_a_dot_directory()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/one", rvx_v100(), "json", "one", "")
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0", rvx_dep("a", "github.com/e/one", "1.0.0")),
+                           ".git")
+
+    assert_eq(rvx_imports(rvx_resolved(root, cache), ""), "json->github.com.e.one.json")
+    rvx_cleanup(cache, root)
+
+// A project namespacing itself the way packages do is held to the same rule at the same depth: its
+// own `sh/sysl/table` collides, and an unrelated `sh/sysl/other` does not.
+@test("a project's own namespaced module collides only at the path it actually declares")
+rvx_own_namespaced_module_collides_only_at_its_path()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/sysl-lang/table", Release(0, 1, 2), "sh/sysl/table", "table", "")
+
+    val config = rvx_manifest("app", "0.1.0", rvx_dep("table", "github.com/sysl-lang/table", "0.1.2"))
+    val clash = rvx_project(config, "sh/sysl/table")
+    val said = rvx_refused(clash, cache)
+
+    assert(said.index_of("is both a module of this project").is_some(), said)
+
+    val fine = rvx_project(config, "sh/sysl/other")
+
+    assert_eq(rvx_imports(rvx_resolved(fine, cache), ""),
+              "sh.sysl.table->github.com.sysl-lang.table.sh.sysl.table")
+    rvx_cleanup(cache, clash)
+    remove_dir_all(fine).unwrap_or(())
+
+// -- a path dependency ------------------------------------------------------------------------------
+
+// A manifest saying `path = "../helper"` means nothing until it is joined to the directory holding
+// the manifest that wrote it -- never to the process's working directory, which here is elsewhere.
+@test("a relative one is read against the directory of the manifest that wrote it")
+rvx_a_relative_path_is_read_against_its_manifest()
+    val cache = rvx_cache()
+    val parent = make_temp_dir("sysl-rvx-relative").unwrap()
+    val helper = s"$parent/helper"
+
+    make_dir_all(helper).unwrap()
+    write_text(join_path(helper, ManifestName), rvx_manifest("helper", "0.1.0", "")).unwrap()
+    rvx_source(helper, "helper")
+
+    val root = s"$parent/app"
+
+    make_dir_all(root).unwrap()
+    write_text(join_path(root, ManifestName),
+               "package { name = \"app\", version = \"0.1.0\" }\n" +
+               "dependencies { h { path = \"../helper\" } }\n").unwrap()
+
+    val graph = rvx_resolved(root, cache)
+
+    assert_eq(rvx_imports(graph, ""), "helper->h.helper")
+
+    var at = "no such package"
+
+    for i in 0..<graph.packages.len()
+        if graph.packages.at(i).canonical == "h" then at = graph.packages.at(i).root
+
+    assert_eq(at, helper)
+    rvx_cleanup(cache, parent)
+
+// Its git dependencies still take part in selection, so a floor it raises is a floor.
+@test("raises the floors its own manifest asks for")
+rvx_a_path_dependency_raises_floors()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/buf", Release(1, 4, 0), "buf", "buf", "")
+
+    val other = rvx_project(rvx_manifest("helper", "0.1.0", rvx_dep("buf", "github.com/e/buf", "1.4.0")),
+                            "helper")
+    val root = rvx_project("package { name = \"app\", version = \"0.1.0\" }\n" +
+                           s"dependencies { h { path = \"$other\" } }\n", "")
+
+    assert_eq(rvx_selected(rvx_resolved(root, cache)), "github.com.e.buf=1.4.0")
+    rvx_cleanup(cache, root)
+    remove_dir_all(other).unwrap_or(())
+
+// -- every claim is recorded, whether or not it won ------------------------------------------------
+
+@test("the floor that lost is kept, which selection alone cannot say")
+rvx_the_floor_that_lost_is_kept()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/buf", Release(1, 2, 0), "buf", "buf", "")
+    rvx_module(cache, "github.com/e/buf", Release(1, 4, 0), "buf", "buf", "")
+    rvx_module(cache, "github.com/e/a", rvx_v100(), "a", "a", rvx_dep("buf", "github.com/e/buf", "1.2.0"))
+    rvx_module(cache, "github.com/e/b", rvx_v100(), "b", "b", rvx_dep("buf", "github.com/e/buf", "1.4.0"))
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0",
+                                        rvx_dep("a", "github.com/e/a", "1.0.0") + ", " +
+                                        rvx_dep("b", "github.com/e/b", "1.0.0")), "")
+
+    assert_eq(rvx_claimed(rvx_resolved(root, cache), "github.com/e/buf"),
+              "github.com/e/a=1.2.0 github.com/e/b=1.4.0")
+    rvx_cleanup(cache, root)
+
+// The manifest of the version that was passed over is dropped, so nothing in the finished graph could
+// answer this by being scanned -- which is the whole argument for carrying it.
+@test("so a losing claim survives its own manifest leaving the graph")
+rvx_a_losing_claim_survives()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/buf", Release(1, 2, 0), "early", "early", "")
+    rvx_module(cache, "github.com/e/buf", Release(1, 4, 0), "later", "later", "")
+    rvx_module(cache, "github.com/e/a", rvx_v100(), "a", "a", rvx_dep("buf", "github.com/e/buf", "1.2.0"))
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0",
+                                        rvx_dep("a", "github.com/e/a", "1.0.0") + ", " +
+                                        rvx_dep("buf", "github.com/e/buf", "1.4.0")), "")
+    val graph = rvx_resolved(root, cache)
+
+    assert(rvx_selected(graph).index_of("1.2.0").is_none(), rvx_selected(graph))
+    assert(rvx_claimed(graph, "github.com/e/buf").index_of("github.com/e/a=1.2.0").is_some(),
+           rvx_claimed(graph, "github.com/e/buf"))
+    rvx_cleanup(cache, root)
+
+@test("the root asks under the name its manifest gives it")
+rvx_the_root_asks_under_its_name()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/buf", Release(1, 4, 0), "buf", "buf", "")
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0", rvx_dep("buf", "github.com/e/buf", "1.4.0")), "")
+    val graph = rvx_resolved(root, cache)
+
+    assert_eq(rvx_claim_keys(graph), "github.com/e/buf")
+    assert_eq(rvx_claimed(graph, "github.com/e/buf"), "app=1.4.0")
+    rvx_cleanup(cache, root)
+
+// A manifest need not name its package, and a claim attributed to the empty string would read as
+// though nobody had asked for it.
+@test("and under a stand-in where it names none")
+rvx_and_under_a_stand_in()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/buf", Release(1, 4, 0), "buf", "buf", "")
+
+    val root = rvx_project(s"dependencies { ${rvx_dep("buf", "github.com/e/buf", "1.4.0")} }\n", "")
+
+    assert_eq(rvx_claimed(rvx_resolved(root, cache), "github.com/e/buf"), "this project=1.4.0")
+    rvx_cleanup(cache, root)
+
+// A path dependency has no coordinate, so it is attributed by the label its consumer wrote.
+@test("a path dependency's demands are attributed to its label")
+rvx_a_path_dependencys_demands_go_to_its_label()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/buf", Release(1, 4, 0), "buf", "buf", "")
+
+    val other = rvx_project(rvx_manifest("helper", "0.1.0", rvx_dep("buf", "github.com/e/buf", "1.4.0")),
+                            "helper")
+    val root = rvx_project("package { name = \"app\", version = \"0.1.0\" }\n" +
+                           s"dependencies { h { path = \"$other\" } }\n", "")
+    val graph = rvx_resolved(root, cache)
+
+    assert_eq(rvx_claim_keys(graph), "github.com/e/buf")
+    assert_eq(rvx_claimed(graph, "github.com/e/buf"), "h=1.4.0")
+    rvx_cleanup(cache, root)
+    remove_dir_all(other).unwrap_or(())
+
+// Keyed as a manifest writes the coordinate, so no round trip through the dotted form is needed --
+// which would not survive the trip anyway, a coordinate being full of dots.
+@test("and the key is the coordinate as a manifest writes it")
+rvx_the_key_is_the_written_coordinate()
+    val cache = rvx_cache()
+
+    rvx_module(cache, "github.com/e/buf", Release(1, 4, 0), "buf", "buf", "")
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0", rvx_dep("buf", "github.com/e/buf", "1.4.0")), "")
+
+    assert_eq(rvx_claim_keys(rvx_resolved(root, cache)), "github.com/e/buf")
+    rvx_cleanup(cache, root)
+
+@test("a project with no dependencies claims nothing")
+rvx_no_dependencies_claims_nothing()
+    val cache = rvx_cache()
+    val root = rvx_project(rvx_manifest("app", "0.1.0", ""), "")
+
+    assert_eq(rvx_resolved(root, cache).claims.len(), 0)
+    rvx_cleanup(cache, root)
+
+// -- a dependency states the oldest compiler it builds with ----------------------------------------
+
+// Asked against a release-line compiler, since this one makes no claim against its own number
+// (`OnTheReleaseLine`).
+@test("and one too new for the compiler in hand is refused by name")
+rvx_a_dependency_too_new_is_refused_by_name()
+    val cache = rvx_cache()
+    val dir = rvx_published(cache, "github.com/e/future", rvx_v100(),
+                            "package { name = \"future\", version = \"1.0.0\", sysl = \"99.0.0\" }\n")
+
+    rvx_source(dir, "future")
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0", rvx_dep("f", "github.com/e/future", "1.0.0")), "")
+    val graph = rvx_resolved(root, cache)
+
+    assert_eq(dependency_floor_refusal(graph.packages, "0.0.145").unwrap_or("(nothing)"),
+              "package future v1.0.0 cannot be built because it requires sysl 99.0.0 or newer, while " +
+              "the compiler in hand is 0.0.145")
+    rvx_cleanup(cache, root)
+
+@test("and one this compiler satisfies is nothing at all")
+rvx_a_satisfied_dependency_floor_is_nothing()
+    val cache = rvx_cache()
+    val dir = rvx_published(cache, "github.com/e/past", rvx_v100(),
+                            "package { name = \"past\", version = \"1.0.0\", sysl = \"0.0.1\" }\n")
+
+    rvx_source(dir, "past")
+
+    val root = rvx_project(rvx_manifest("app", "0.1.0", rvx_dep("p", "github.com/e/past", "1.0.0")), "")
+    val graph = rvx_resolved(root, cache)
+
+    assert_eq(rvx_selected(graph), "github.com.e.past=1.0.0")
+    assert(dependency_floor_refusal(graph.packages, "0.0.145").is_none(), "0.0.145 is past 0.0.1")
+    rvx_cleanup(cache, root)
+
+// -- a fetch -----------------------------------------------------------------------------------------
+
+// `.invalid` is reserved by RFC 2606 so that it never resolves, which makes this a refusal rather than
+// a network round trip.
+@test("a package the cache has not got, and nothing can fetch")
+rvx_a_package_nothing_can_fetch()
+    val cache = rvx_cache()
+    val root = rvx_project(rvx_manifest("app", "0.1.0",
+                                        rvx_dep("j", "sysl.invalid/e/nothing-here", "1.0.0")), "")
+    val said = rvx_refused(root, cache)
+
+    assert(said.index_of("cannot fetch sysl.invalid/e/nothing-here").is_some(), said)
+    rvx_cleanup(cache, root)
