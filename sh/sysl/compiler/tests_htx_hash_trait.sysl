@@ -1,0 +1,390 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `Hash` -- the catalog trait a keyed container needs (`library/core.md § Hashing`). Its law is
+// `a == b` implies `hash(a) == hash(b)`, and that law is what picks the built-in memberships: `Eq`'s,
+// minus the floats (`NaN != NaN`, and `-0.0 == 0.0` across two bit patterns) and minus the pointer
+// modes, whose `==` is address equality.
+//
+// **Every string quoted here was read out of the reference compiler (0.0.159)**, whose
+// `HashTraitTests` these are.
+
+private var htx_library_cache: Buf[Program] = buf()
+private var htx_library_read: bool = false
+
+private htx_library() -> Buf[Program]
+    if htx_library_read then return htx_library_cache
+
+    htx_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> htx_library_cache = units
+
+    htx_library_cache
+end htx_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private htx_ready() -> bool
+    if htx_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end htx_ready
+
+private htx_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program PRINTS, which is the one claim nothing short of building and running it makes.
+private htx_ran(text: string) -> string
+    val root = make_temp_dir("sysl-hash").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end htx_ran
+
+// Everything a source has to say for itself, and the LLVM text where it had nothing to say.
+private htx_compiled(text: string) -> (string, string)
+    val root = make_temp_dir("sysl-hash").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> (why.message, "")
+        Ok(made) -> if made.report.is_empty() then ("", made.text) else (analysis_report(made.report), "")
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end htx_compiled
+
+private htx_ir(text: string) -> string
+    val made = htx_compiled(text)
+
+    assert(made.0.is_empty(), s"expected the program to compile, got: ${made.0}")
+    made.1
+
+// The source is refused with exactly `message`, at `line:col` of the entry file.
+private htx_refused(text: string, message: string, at: string)
+    val said = htx_compiled(text).0
+
+    assert(htx_says(said, s"error: $message\n --> "), s"expected '$message', got: $said")
+    assert(htx_says(said, s"/main.sysl:$at\n"), s"expected it at $at, got: $said")
+
+private const htx_keyed: string = "keyed[K: Hash](k: K) -> u64 = k.hash()\n"
+
+// ---- a built-in hashes without an impl ----
+
+@test("an integer")
+htx_an_integer()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran("print(str(7.hash() == 7.hash()))\n"), "true\n")
+end htx_an_integer
+
+@test("a string")
+htx_a_string()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran("print(str(\"abc\".hash() == \"abc\".hash()))\n"), "true\n")
+end htx_a_string
+
+@test("a char")
+htx_a_char()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran("print(str('x'.hash() == 'x'.hash()))\n"), "true\n")
+end htx_a_char
+
+@test("a bool")
+htx_a_bool()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran("print(str(true.hash() == true.hash()))\n"), "true\n")
+end htx_a_bool
+
+// The hash has to SEPARATE as well as agree, or a table of it is a linked list.
+@test("and different values hash differently")
+htx_different_values_hash_differently()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran("print(str(7.hash() == 8.hash()))\n"), "false\n")
+    assert_eq(htx_ran("print(str(\"abc\".hash() == \"abd\".hash()))\n"), "false\n")
+    assert_eq(htx_ran("print(str(false.hash() == true.hash()))\n"), "false\n")
+end htx_different_values_hash_differently
+
+// A table indexes by the low bits, so the built-in mixes rather than handing the value back. Zero is
+// the case worth pinning: splitmix64's finalizer alone is a fixed point at 0.
+@test("having actually mixed, rather than handed the value back")
+htx_having_actually_mixed()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran("print(str(5.hash() == 5u64))\n"), "false\n")
+    assert_eq(htx_ran("print(str(0.hash() == 0u64))\n"), "false\n")
+    assert_eq(htx_ran("print(str(0.hash() == 0u64 || 0.hash() % 8u64 == 0u64))\n"), "false\n")
+end htx_having_actually_mixed
+
+@test("and scattering consecutive keys across a table's buckets")
+htx_scattering_consecutive_keys()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran(raw"""
+        var seen: [8]bool
+        var filled = 0
+        for i in 0..<64
+            var b = usize(i.hash()) % 8usize
+            if !seen[b]
+                seen[b] = true
+                filled += 1
+        print(str(filled))
+        """), "8\n")
+end htx_scattering_consecutive_keys
+
+// ---- widths agree, because equality does ----
+
+@test("across integer widths")
+htx_across_integer_widths()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran("print(str(1u8.hash() == 1i64.hash()))\n"), "true\n")
+    assert_eq(htx_ran("print(str(300u16.hash() == 300i32.hash()))\n"), "true\n")
+end htx_across_integer_widths
+
+@test("and across signedness where the value is the same")
+htx_across_signedness()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran("print(str(5u32.hash() == 5i32.hash()))\n"), "true\n")
+end htx_across_signedness
+
+// ---- a user type opts in with an ordinary impl ----
+
+@test("and satisfies the bound with it")
+htx_satisfies_the_bound_with_it()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran(raw"""
+        struct P
+            x: int
+            y: int
+        impl Hash for P
+            hash(self) -> u64 = self.x.hash() ^ self.y.hash() * 31u64
+        keyed[K: Hash](k: K) -> u64 = k.hash()
+        print(str(keyed(P(1, 2)) == keyed(P(1, 2))))
+        print(str(keyed(P(1, 2)) == keyed(P(2, 1))))
+        """), "true\nfalse\n")
+end htx_satisfies_the_bound_with_it
+
+// `reference/generics.md § Bounds`'s definition-time check: the missing bound is reported at the line
+// that writes the call.
+@test("and without the bound the call is refused where it is written")
+htx_without_the_bound_the_call_is_refused()
+    if !htx_ready() then return
+
+    htx_refused("keyed[K](k: K) -> u64 = k.hash()\nprint(1)\n", "'hash' needs 'K: sysl.Hash'", "1:27")
+end htx_without_the_bound_the_call_is_refused
+
+@test("while a type with no impl does not satisfy it")
+htx_a_type_with_no_impl_does_not_satisfy_it()
+    if !htx_ready() then return
+
+    htx_refused("struct P\n    x: int\n" + htx_keyed + "print(str(keyed(P(1))))\n",
+                "'keyed' requires its type parameter 'K' to implement 'sysl.Hash', but P does not", "4:11")
+end htx_a_type_with_no_impl_does_not_satisfy_it
+
+// ---- a built-in satisfies the bound, which is what the membership is for ----
+
+@test("an integer")
+htx_bound_an_integer()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran(htx_keyed + "print(str(keyed(3) == keyed(3)))\n"), "true\n")
+end htx_bound_an_integer
+
+@test("a string, reaching a different lowering through the same bound")
+htx_bound_a_string()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran(htx_keyed + "print(str(keyed(\"a\") == keyed(\"a\")))\n"), "true\n")
+end htx_bound_a_string
+
+@test("and `Hash + Eq` together, which is what a map actually asks for")
+htx_hash_and_eq_together()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran(raw"""
+        same[K: Hash + Eq](a: K, b: K) -> bool = a == b && a.hash() == b.hash()
+        print(str(same(4, 4)))
+        print(str(same("x", "y")))
+        """), "true\nfalse\n")
+end htx_hash_and_eq_together
+
+// ---- a built-in erases to a trait object, its membership being a real function now ----
+
+@test("and a heterogeneous collection of them each hashes through its own impl")
+htx_a_heterogeneous_collection()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran("val xs: [3]&Hash = [7, \"abc\", true]\nfor h in xs do print(str(h.hash() == h.hash()))\n"),
+              "true\ntrue\ntrue\n")
+end htx_a_heterogeneous_collection
+
+@test("while still separating the values it holds")
+htx_still_separating_the_values()
+    if !htx_ready() then return
+
+    assert_eq(htx_ran("val xs: [2]&Hash = [7, 8]\nprint(str(xs[0].hash() == xs[1].hash()))\n"), "false\n")
+end htx_still_separating_the_values
+
+// The refusal `Hash` used to produce, which now belongs to the operator catalog alone.
+@test("the refusal it left behind still fires for the operator catalog")
+htx_the_refusal_it_left_behind()
+    if !htx_ready() then return
+
+    htx_refused("val a: &Add[int, int] = 3\nprint(1)\n",
+                "int is a 'sysl.Add[int, int]' by the compiler's rule rather than through an 'impl', " +
+                "and a &sysl.Add[int, int] holds a table of functions — what the compiler provides " +
+                "for a built-in is an instruction or a rendering, and neither is a function the table " +
+                "could point at", "1:25")
+end htx_the_refusal_it_left_behind
+
+// ---- what is deliberately not a member ----
+
+@test("a float, whose equality a hash over its bits would contradict")
+htx_a_float_is_not_a_member()
+    if !htx_ready() then return
+
+    htx_refused(htx_keyed + "print(str(keyed(1.5)))\n",
+                "'keyed' requires its type parameter 'K' to implement 'sysl.Hash', but real does not", "2:11")
+    htx_refused("print(str(1.5.hash()))\n", "type 'real' has no method 'hash'", "1:15")
+end htx_a_float_is_not_a_member
+
+// Asked through the BOUND, because `p.hash()` written directly is the one-level auto-deref reaching
+// the `u8` behind the pointer -- which is a member, and a different question.
+@test("a pointer or a reference, whose equality is its address")
+htx_a_pointer_or_a_reference_is_not_a_member()
+    if !htx_ready() then return
+
+    htx_refused(htx_keyed + "var p: *u8 = null\nprint(str(keyed(p)))\n",
+                "'keyed' requires its type parameter 'K' to implement 'sysl.Hash', but *byte does not", "3:11")
+    htx_refused("struct P\n    x: int\n" + htx_keyed + "var r: &P = P(1)\nprint(str(keyed(r)))\n",
+                "'keyed' requires its type parameter 'K' to implement 'sysl.Hash', but &P does not", "5:11")
+end htx_a_pointer_or_a_reference_is_not_a_member
+
+// ---- the trait itself is ordinary ----
+
+// Which mixer `k.hash()` lowers to is chosen by the compiler, so every symbol here is one the
+// compiler spells, read off the emitted text with its sigil so a moved declaration cannot pass by
+// substring.
+@test("declared in the library, so a program may name it in a bound")
+htx_declared_in_the_library()
+    if !htx_ready() then return
+
+    val text = htx_ir(htx_keyed + "print(str(keyed(1)))\n")
+
+    assert(htx_says(text, "@sysl$hash_u64"), text)
+end htx_declared_in_the_library
+
+@test("and costs a program that hashes nothing exactly nothing")
+htx_costs_nothing()
+    if !htx_ready() then return
+
+    val text = htx_ir("print(1)\n")
+
+    assert(!htx_says(text, "sysl$hash_u64"), text)
+end htx_costs_nothing
+
+@test("while a bool reaches its own lowering, one bit not being a number here")
+htx_a_bool_reaches_its_own_lowering()
+    if !htx_ready() then return
+
+    val text = htx_ir("print(str(true.hash()))\n")
+
+    assert(htx_says(text, "@sysl$hash_bool"), text)
+end htx_a_bool_reaches_its_own_lowering
+
+@test("and a string reaches the byte-wise one")
+htx_a_string_reaches_the_byte_wise_one()
+    if !htx_ready() then return
+
+    val text = htx_ir("print(str(\"a\".hash()))\n")
+
+    assert(htx_says(text, "@sysl$hash_str"), text)
+end htx_a_string_reaches_the_byte_wise_one
+
+@test("and a wide integer reaches the one that folds it in two")
+htx_a_wide_integer_folds_in_two()
+    if !htx_ready() then return
+
+    val text = htx_ir("print(str(u128(1).hash()))\n")
+
+    assert(htx_says(text, "@sysl$hash_u128"), text)
+end htx_a_wide_integer_folds_in_two
+
+// ---- what it refuses ----
+
+@test("arguments, there being none to take")
+htx_arguments_there_being_none_to_take()
+    if !htx_ready() then return
+
+    htx_refused("print(str(7.hash(1)))\n", "method 'int.hash' takes 0 arguments, but 1 argument was given", "1:13")
+end htx_arguments_there_being_none_to_take
+
+@test("and a second impl for a type that already has one")
+htx_a_second_impl()
+    if !htx_ready() then return
+
+    htx_refused(raw"""
+        struct P
+            x: int
+        impl Hash for P
+            hash(self) -> u64 = 1u64
+        impl Hash for P
+            hash(self) -> u64 = 2u64
+        print(1)
+        """, "'P' already implements 'sysl.Hash'", "5:1")
+end htx_a_second_impl
+
+@test("and an impl whose signature does not match the trait's")
+htx_an_impl_whose_signature_does_not_match()
+    if !htx_ready() then return
+
+    htx_refused(raw"""
+        struct P
+            x: int
+        impl Hash for P
+            hash(self) -> int = 1
+        print(1)
+        """, "method 'hash' returns int, but trait 'sysl.Hash' declares ulong", "3:1")
+end htx_an_impl_whose_signature_does_not_match
