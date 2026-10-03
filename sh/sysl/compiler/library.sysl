@@ -52,13 +52,48 @@ end LibraryBuild
 // **Ownership and linkage are separate facts.** Two units each call their fourth closure by one
 // name, so a closure body -- and every instantiation made at one -- is `internal`: the library's
 // copy and the program's are two symbols, and neither is advertised.
-library_build(units: Buf[Program], own: Buf[string], t: Target) -> LibraryBuild
+library_build(given: Buf[Program], own: Buf[string], t: Target) -> LibraryBuild
+    library_build_of(without_tests(given), own, t)
+
+// The units a library is built from, its tests taken out: every `@tests` file whole, and from every
+// other file the `@test` functions and the hooks around them. Nothing else may be scaffolding -- an
+// `impl` in a `@tests` file is refused -- so no method table has a slot filled by what goes.
+without_tests(units: Buf[Program]) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    for i in 0..<units.len()
+        var u = units.at(i)
+
+        if u.test_only then continue
+
+        var body: Buf[Stmt] = buf()
+
+        for j in 0..<u.body.len()
+            val s = u.body.at(j)
+
+            val scaffolding = *s.kind match
+                FuncDecl(d) -> d.test.is_some() || d.hook.is_some()
+                _ -> false
+
+            if !scaffolding then body.push(s)
+
+        u.body = body
+        out.push(u)
+
+    out
+end without_tests
+
+private library_build_of(units: Buf[Program], own: Buf[string], t: Target) -> LibraryBuild
+    // **A library's tests are parsed and never analyzed** (`reference/attributes.md § @tests — a file
+    // of scaffolding`): analysis is not a passive reading, and a test naming `Buf[int]` makes `Buf` at
+    // `int` -- an instantiation that is an ordinary library function afterwards, with nothing in it
+    // saying a test asked for it. So a `@tests` file and every `@test` function and hook leave before
+    // the analysis, and `sysl test` is where their mistakes are reported.
     val done = analyze_produced(units, t, file_names(units))
     val checked = program_of(done, done.main_module)
     val promotions = post_analysis_checks(done.an, checked, own)
 
-    // **A library's tests are not in the library** -- held to the whole-program checks above like any
-    // other code, then dropped, so the artifact neither defines nor advertises one.
+    // What a test body made would still be dropped here, had anything been left to make it.
     val whole = strip_tests(checked)
     val defers = storage_reaching(whole)
 
@@ -106,7 +141,7 @@ library_build(units: Buf[Program], own: Buf[string], t: Target) -> LibraryBuild
     val library = whole with { funcs = kept, precompiled = within, entry_point = false }
 
     LibraryBuild(library, promotions, sorted_names(determined), errors_of(done.an.diagnostics()))
-end library_build
+end library_build_of
 
 // The files this compilation is producing, which is what makes it a build *of* the library rather
 // than a build against it: every body the library declares is typed, not only the ones its own
