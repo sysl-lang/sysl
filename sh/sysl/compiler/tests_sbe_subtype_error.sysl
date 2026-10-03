@@ -1,0 +1,312 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// Compile-time diagnostics for a malformed `type` declaration: a bound outside the base's range, an
+// inverted range, a non-scalar base, a bound of the wrong kind, a bound that is not a constant, and a
+// conversion of the wrong arity or from the wrong type. Each is caught at the declaration or the use,
+// before anything runs.
+//
+// **Every diagnostic quoted here was read out of the reference compiler**, whose `SubtypeErrorTests`
+// these are.
+
+private var sbe_library_cache: Buf[Program] = buf()
+private var sbe_library_read: bool = false
+
+private sbe_library() -> Buf[Program]
+    if sbe_library_read then return sbe_library_cache
+
+    sbe_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> sbe_library_cache = units
+
+    sbe_library_cache
+end sbe_library
+
+private sbe_ready() -> bool
+    if sbe_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+// What the compiler says about a one-file program, or nothing.
+private sbe_err(text: string) -> string
+    val root = make_temp_dir("sysl-subtype-error").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end sbe_err
+
+// That a program is refused in the words given.
+private sbe_refused(text: string, said: string)
+    val e = sbe_err(text)
+
+    assert(e.contains(said), s"expected '$said', got: $e")
+
+private sbe_meters() -> string = "type Meters = new f64\n"
+private sbe_stamp() -> string = "type Stamp = new i64\ntype Span = new i64\n"
+
+@test("an out-of-range literal bound is rejected")
+sbe_an_out_of_range_literal_bound_is_rejected()
+    if !sbe_ready() then return
+
+    sbe_refused("type T = byte within 0..300\nvar x: T = 1\nprint(int(x))",
+                "the bound 300 does not fit byte")
+
+@test("an inverted range is rejected")
+sbe_an_inverted_range_is_rejected()
+    if !sbe_ready() then return
+
+    sbe_refused("type T = int within 10..5\nvar x: T = 7\nprint(int(x))",
+                "the lower bound of 'T' is above its upper bound")
+
+@test("an empty exclusive range is rejected")
+sbe_an_empty_exclusive_range_is_rejected()
+    if !sbe_ready() then return
+
+    sbe_refused("type T = int within 5..<5\nvar x: T = 1\nprint(int(x))",
+                "the lower bound of 'T' is above its upper bound")
+
+@test("a non-scalar base is rejected")
+sbe_a_non_scalar_base_is_rejected()
+    if !sbe_ready() then return
+
+    sbe_refused("struct P\n    x: int\nend P\ntype T = P within 0..1\nvar t: T = 1\nprint(1)",
+                "a constrained subtype's base must be an integer, a float, or 'char', not P")
+
+// The messages say "integer bounds" rather than "integer-literal bounds", because a bound is a
+// constant expression and need not be a literal at all (`reference/errors.md § Ranges`) -- the kind
+// is what is wrong here, not the spelling.
+@test("character bounds on an integer base are rejected")
+sbe_character_bounds_on_an_integer_base_are_rejected()
+    if !sbe_ready() then return
+
+    sbe_refused("type T = int within 'a'..'z'\nvar x: T = 1\nprint(int(x))",
+                "an integer subtype needs integer bounds, not a character")
+
+@test("integer bounds on a character base are rejected")
+sbe_integer_bounds_on_a_character_base_are_rejected()
+    if !sbe_ready() then return
+
+    sbe_refused("type L = char within 0..25\nvar x: L = 'a'\nprint(x)",
+                "a 'char' subtype needs character bounds, not an integer")
+
+@test("a cast with the wrong number of arguments is rejected")
+sbe_a_cast_with_the_wrong_number_of_arguments_is_rejected()
+    if !sbe_ready() then return
+
+    sbe_refused("type Age = int within 0..150\nprint(int(Age(1, 2)))",
+                "a 'Age' conversion takes exactly one value")
+
+// A bare `type T = Existing` is a transparent alias and declares no subtype at all; what is asserted
+// here is only that it is not an error, since every other case in this file turns on a `type` line
+// being refused.
+@test("a bare transparent alias declares no subtype and is not an error")
+sbe_a_bare_transparent_alias_is_not_an_error()
+    if !sbe_ready() then return
+
+    assert_eq(sbe_err("type T = int\nvar x: T = 1\nprint(int(x))"), "")
+
+@test("a non-bool where predicate is rejected without leaking the synthesised function's name")
+sbe_a_non_bool_where_predicate_is_rejected()
+    if !sbe_ready() then return
+
+    val e = sbe_err("type T = int where value + 1\nvar x: T = 1\nprint(int(x))")
+
+    assert(e.contains("a 'where' predicate must be a 'bool', but this one is int"), e)
+    assert(!e.contains("$pred"), e)
+
+// A transparent subtype's name converts what its base's name converts, and a pair with no meaning
+// is still refused -- naming the type the reader wrote rather than the base they did not.
+@test("a transparent subtype converts only what its base does")
+sbe_a_transparent_subtype_converts_only_what_its_base_does()
+    if !sbe_ready() then return
+
+    sbe_refused("type Age = int within 0..150\nvar s = \"x\"\nprint(Age(s))", "cannot make Age from string")
+
+// -- a derived type is nominally distinct --------------------------------------------------------------
+
+@test("mixing it with its base in arithmetic is rejected")
+sbe_mixing_it_with_its_base_in_arithmetic_is_rejected()
+    if !sbe_ready() then return
+
+    sbe_refused(sbe_meters() + "print(f64(Meters(3.0) + 1.0))",
+                "'+' needs matching types, got Meters and real")
+
+// `new` is what makes the type distinct, so a conversion into one is a WRAP of a value already at the
+// base rather than the scalar conversion a transparent subtype's name performs: `Meters(x)` and
+// `Age(x)` differ only in what was declared.
+@test("a value that is not already at the base is rejected")
+sbe_a_value_not_already_at_the_base_is_rejected()
+    if !sbe_ready() then return
+
+    sbe_refused(sbe_meters() + "var n: int = 3\nprint(f64(Meters(n)))", "cannot make Meters from int")
+    sbe_refused("type Slot = new u8 within 0..<200\nvar k: int = 5\nprint(u8(Slot(k)))",
+                "cannot make Slot from int")
+
+    // A value already at the base wraps, and so does one at a transparent spelling of it.
+    assert_eq(sbe_err(sbe_meters() + "var n: f64 = 3.0\nprint(f64(Meters(n)))"), "")
+    assert_eq(sbe_err("type Age = int within 0..150\ntype M = new int\nvar a: Age = 3\nprint(int(M(a)))"), "")
+
+@test("an implicit conversion from the base is rejected")
+sbe_an_implicit_conversion_from_the_base_is_rejected()
+    if !sbe_ready() then return
+
+    sbe_refused(sbe_meters() + "var m: Meters = 3.0\nprint(f64(m))",
+                "cannot initialize 'm': declared Meters but the value is real")
+
+@test("two derived types over one base do not mix")
+sbe_two_derived_types_over_one_base_do_not_mix()
+    if !sbe_ready() then return
+
+    sbe_refused(sbe_meters() + "type Feet = new f64\nsum(a: Meters, b: Feet) -> f64\n    f64(a + b)\nprint(1)",
+                "'+' needs matching types, got Meters and Feet")
+
+// -- a pointer does not shed the constraint ------------------------------------------------------------
+
+@test("a transparent subtype's address does not coerce to its base's pointer")
+sbe_a_transparent_subtypes_address_does_not_coerce()
+    if !sbe_ready() then return
+
+    sbe_refused("type Age = int within 0..150\nvar x: Age = 50\nvar q: *int = &x\n*q = 999\nprint(x)",
+                "cannot initialize 'q': declared *int but the value is *Age")
+
+@test("nor does a derived subtype's")
+sbe_nor_does_a_derived_subtypes()
+    if !sbe_ready() then return
+
+    sbe_refused("type Slot = new u8 within 0..<200\nvar x = Slot(50)\nvar q: *u8 = &x\n*q = 255\nprint(u8(x))",
+                "cannot initialize 'q': declared *byte but the value is *Slot")
+
+// A constrained cast traps rather than reporting (`reference/errors.md § Where a constraint is
+// checked`), so there is no `T.try(x)` -- though a simple enum has one.
+@test("a subtype has no fallible cast")
+sbe_a_subtype_has_no_fallible_cast()
+    if !sbe_ready() then return
+
+    sbe_refused("type Age = int within 0..150\nprint(Age.try(200).is_some())",
+                "'Age' is a constrained type and has no 'try': a value outside its range is a mistake " +
+                "in the code that produced it rather than a condition to handle, so 'Age(x)' checks it " +
+                "and traps, and 'Age::Valid(x)' asks the question without trapping")
+
+// -- a within bound has to be a constant -----------------------------------------------------------------
+//
+// A name nothing declared, a name that is storage rather than a constant, and a constant of the wrong
+// kind are three different mistakes, so each gets its own message.
+
+@test("a name nothing declared is not one")
+sbe_a_name_nothing_declared_is_not_one()
+    if !sbe_ready() then return
+
+    sbe_refused("type A = new int within 0..<nowhere",
+                "a 'within' bound has to be a constant, and 'nowhere' is not one — a literal, a 'const', " +
+                "or an expression over them")
+
+// A module-level `val` is read-only storage with an address (`reference/modules.md § val — a
+// thing`), which is exactly what a `const` is not.
+@test("a module-level 'val' is storage, not a constant")
+sbe_a_module_level_val_is_storage_not_a_constant()
+    if !sbe_ready() then return
+
+    sbe_refused("val n: int = 4\ntype B = new int within 0..<n",
+                "a 'within' bound has to be a constant, and 'n' is not one")
+
+@test("a constant of the wrong kind is a different complaint")
+sbe_a_constant_of_the_wrong_kind_is_a_different_complaint()
+    if !sbe_ready() then return
+
+    sbe_refused("const label: string = \"hi\"\ntype C = new int within 0..<label",
+                "an integer subtype needs integer bounds, not a string")
+
+@test("a char subtype says so about a numeric bound")
+sbe_a_char_subtype_says_so_about_a_numeric_bound()
+    if !sbe_ready() then return
+
+    sbe_refused("const n: int = 5\ntype D = new char within 'a'..n",
+                "a 'char' subtype needs character bounds, not an integer")
+
+// The ordering check runs on the folded values, so two constants in the wrong order are caught
+// exactly as two literals are.
+@test("and two constants in the wrong order are still refused")
+sbe_two_constants_in_the_wrong_order_are_still_refused()
+    if !sbe_ready() then return
+
+    sbe_refused("const lo: int = 9\nconst hi: int = 2\ntype E = new int within lo..hi",
+                "the lower bound of 'E' is above its upper bound")
+
+// The edges of the same rule, each read out of the reference: a float base takes numeric bounds, a
+// non-constant expression that is not a name is "that", the declaration gets one complaint with the
+// lower end asked first, and a predicate or a bare `new` asks for a scalar base as a range does.
+@test("the bound checks, at their edges")
+sbe_the_bound_checks_at_their_edges()
+    if !sbe_ready() then return
+
+    assert_eq(sbe_err("type F = f64 within 0..1\nvar f: F = 0.5\nprint(f64(f))"), "")
+    sbe_refused("type F = f64 within 'a'..'b'\nprint(1)",
+                "a floating-point subtype needs numeric bounds, not a character")
+    sbe_refused("type T = int within 0.5..3.5\nprint(1)",
+                "an integer subtype needs integer bounds, not a floating-point literal")
+    sbe_refused("f() -> int = 3\ntype T = int within 0..<f()\nprint(1)",
+                "a 'within' bound has to be a constant, and that is not one")
+    sbe_refused("type T = u8 within -1..5\nprint(1)", "the bound -1 does not fit byte")
+    sbe_refused("type T = i8 within -200..5\nprint(1)", "the bound -200 does not fit i8")
+    sbe_refused("type L = char within 'z'..'a'\nprint(1)", "the lower bound of 'L' is above its upper bound")
+    sbe_refused("type T = f64 within 1.0..<1.0\nprint(1)", "the lower bound of 'T' is above its upper bound")
+    sbe_refused("type T = u8 within 0..true\nprint(1)", "an integer subtype needs integer bounds, not a boolean")
+    sbe_refused("struct P\n    x: int\ntype T = new P\nprint(1)",
+                "a constrained subtype's base must be an integer, a float, or 'char', not P")
+    sbe_refused("type T = string where value.len > 0\nprint(1)",
+                "a constrained subtype's base must be an integer, a float, or 'char', not string")
+
+    val e = sbe_err("type T = byte within 300..'a'\nprint(1)")
+
+    assert(e.contains("the bound 300 does not fit byte"), e)
+    assert(!e.contains("character bounds") && !e.contains("integer bounds"), e)
+
+    assert_eq(sbe_err("type T = int within 5..5\nvar x: T = 5\nprint(int(x))"), "")
+    assert_eq(sbe_err("type T = int within 0..1\ntype U = T within 0..5\nprint(1)"), "")
+end sbe_the_bound_checks_at_their_edges
+
+// -- a derived type inherits behaviour it cannot replace -------------------------------------------------
+
+// Replacing it is what is refused, and the block that does so is the one writing no arguments:
+// `impl Add for Stamp` is the `Add[Stamp, Stamp]` the compiler already provides.
+@test("an operator implementation collides with the one the compiler provides")
+sbe_an_operator_implementation_collides()
+    if !sbe_ready() then return
+
+    sbe_refused(sbe_stamp() + "impl Add for Stamp\n    add(self, s: Stamp) -> Stamp = self\nprint(1)",
+                "'Stamp' already implements 'sysl.Add' — the compiler provides it")
+
+@test("and so does any other row of the catalog")
+sbe_and_so_does_any_other_row_of_the_catalog()
+    if !sbe_ready() then return
+
+    sbe_refused(sbe_stamp() + "impl Display for Stamp\n    display(self, out: *Writer, fmt: FormatSpec)\n" +
+                "        display_str(\"x\", out, fmt)\nprint(1)",
+                "'Stamp' already implements 'sysl.Display' — every 'sysl.Integer' does, through one block " +
+                "written over the family, and a subtype has its base's memberships")
+
+@test("even where the base's meaning does not survive the derivation")
+sbe_even_where_the_bases_meaning_does_not_survive()
+    if !sbe_ready() then return
+
+    sbe_refused(sbe_stamp() + "impl Eq for Stamp\n    eq(self, o: Stamp) -> bool = true\nprint(1)",
+                "'Stamp' already implements 'sysl.Eq' — the compiler provides it")
