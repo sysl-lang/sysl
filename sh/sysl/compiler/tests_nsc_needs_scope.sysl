@@ -411,6 +411,127 @@ nsc_the_library_still_tests()
     assert_eq(got.0, Fine, got.1)
 end nsc_the_library_still_tests
 
+// -- a dependency's '@tests' file is not read by its consumer's build ---------------------------------
+
+// Charging was half of it. The other half is that a consumer's build never READS a dependency's test
+// file: it was name-resolved against the consumer's machine and dropped afterwards, and `sysl.fs`
+// declares no `make_temp_dir` on one with no operating system -- so the import itself was refused, in
+// a file no build of the board program keeps.
+private val nsc_scratch_tests: string =
+    "module notes\n@tests\n\nimport sysl.fs.make_temp_dir\n\n@test\n" +
+    "makes_a_scratch_dir() =\n    assert(make_temp_dir(\"t\").is_ok())\n"
+
+private val nsc_broken_tests: string = "module notes\n@tests\n\n@test\nwrong() =\n    assert(\"not a bool\")\n"
+
+private val nsc_boot: string = "import notes.render\n\n@export(\"main\")\nboot() -> int = render()\n"
+
+private nsc_scratch_lib(tests: string) -> string =
+    nsc_tree([("notes/notes.sysl", nsc_notes), ("notes/notes_tests.sysl", tests)])
+
+@test("a library whose '@tests' file imports what the board's machine does not declare is linked through '--lib'")
+nsc_ts_board_links_through_lib()
+    if !nsc_ready() then return
+
+    val lib = nsc_scratch_lib(nsc_scratch_tests)
+    val root = nsc_tree([("package.hocon", nsc_board), ("main.sysl", nsc_boot)])
+    val got = nsc_cli(["sysl", "emit-llvm", root, "--lib", lib])
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+    assert_eq(got.0, Fine, got.1)
+    assert(got.1.contains("define"), got.1)
+end nsc_ts_board_links_through_lib
+
+@test("and archived for the board by 'build-c'")
+nsc_ts_build_c_archives_it()
+    if !nsc_ready() then return
+    if find_backend_clang(target_named("thumbv6m-freestanding").unwrap()).is_err() then return
+
+    val lib = nsc_scratch_lib(nsc_scratch_tests)
+    val root = nsc_tree([("package.hocon", nsc_board), ("main.sysl", nsc_boot)])
+    val got = nsc_cli(["sysl", "build-c", root, "--lib", lib, "-o", s"$root/app.a"])
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+    assert_eq(got.0, Fine, got.1)
+end nsc_ts_build_c_archives_it
+
+// A dependency's tests are its own author's to get right, and nothing of them ships: a mistake in one
+// is reported where that package is tested, never to a program that only links it.
+@test("nor is a type error in that file reported to the consumer, though the library's own suite reports it")
+nsc_ts_type_error_not_reported()
+    if !nsc_ready() then return
+
+    val lib = nsc_scratch_lib(nsc_broken_tests)
+    val root = nsc_tree([("package.hocon", nsc_board), ("main.sysl", nsc_boot)])
+    val got = nsc_cli(["sysl", "emit-llvm", root, "--lib", lib])
+    val own = nsc_cli(["sysl", "test", lib])
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+    assert_eq(got.0, Fine, got.1)
+    assert(got.1.contains("define"), got.1)
+    assert(own.0 != Fine, own.1)
+    assert(own.1.contains("notes_tests.sysl"), own.1)
+end nsc_ts_type_error_not_reported
+
+// The consumer's OWN scaffolding is unchanged: analyzed and then dropped, so its mistakes are still the
+// consumer's to hear about.
+@test("while the consumer's own '@tests' file is still read by its build")
+nsc_ts_consumers_own_tests_read()
+    if !nsc_ready() then return
+
+    val lib = nsc_scratch_lib(nsc_scratch_tests)
+    val root = nsc_tree([("package.hocon", nsc_board), ("main.sysl", nsc_boot),
+                         ("own/own.sysl", "module own\n\nk() -> int = 1\n"),
+                         ("own/own_tests.sysl", "module own\n@tests\n\n@test\nwrong() =\n    assert(\"not a bool\")\n")])
+    val got = nsc_cli(["sysl", "emit-llvm", root, "--lib", lib])
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+    assert(got.0 != Fine, got.1)
+    assert(got.1.contains("own_tests.sysl"), got.1)
+    assert(!got.1.contains("notes_tests.sysl"), got.1)
+end nsc_ts_consumers_own_tests_read
+
+@test("and the library's own 'sysl test' still compiles and runs that file on the host")
+nsc_ts_library_still_runs_it()
+    if !nsc_ready() then return
+
+    val lib = nsc_scratch_lib(nsc_scratch_tests)
+    val got = nsc_cli(["sysl", "test", lib])
+
+    // The runner's report goes to the test binary's own output, so what says the file RAN is the same
+    // library with that test made to fail: its suite has to go red.
+    val failing = nsc_scratch_lib(replace_all(nsc_scratch_tests, ".is_ok()", ".is_err()"))
+    val red = nsc_cli(["sysl", "test", failing])
+
+    remove_dir_all(lib).unwrap_or(())
+    remove_dir_all(failing).unwrap_or(())
+    assert_eq(got.0, Fine, got.1)
+    assert(red.0 != Fine, "the library's own suite ran the file, so a failing test in it fails the suite")
+end nsc_ts_library_still_runs_it
+
+// The same through a fetched coordinate, whose modules are filed under its canonical prefix -- vendored
+// beside the project, so nothing reaches the network.
+@test("a git dependency whose '@tests' file the board's machine could not compile is linked all the same")
+nsc_ts_fetched_dependency()
+    if !nsc_ready() then return
+
+    val here = "vendor/github.com/e/notes/@v0.1.0"
+    val manifest = "package { name = \"app\", version = \"0.1.0\" }\n" +
+        "dependencies { notes { git = \"github.com/e/notes\", version = \"0.1.0\" } }\n" + nsc_board
+    val root = nsc_tree([(s"$here/package.hocon", "package { name = \"notes\", version = \"0.1.0\" }\n"),
+                         (s"$here/notes/notes.sysl", nsc_notes),
+                         (s"$here/notes/notes_tests.sysl", nsc_scratch_tests),
+                         ("package.hocon", manifest), ("main.sysl", nsc_boot)])
+    val got = nsc_cli(["sysl", "emit-llvm", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, Fine, got.1)
+    assert(got.1.contains("define"), got.1)
+end nsc_ts_fetched_dependency
+
 // -- sysl.fs requires 'os' and not 'posix' ---------------------------------------------------------
 
 // `sysl.fs` is an operating system's filesystem, not POSIX's: its `publish` once imported
@@ -786,3 +907,103 @@ nsc_tc_method_on_a_handed_value()
     assert(said.contains("<root>/lib/a.sysl:4:32"), said)
     assert(!said.contains("<root>/lib/a.sysl:4:8"), said)
 end nsc_tc_method_on_a_handed_value
+
+// -- an alias of a type with a destructor dies as that type does ----------------------------------
+
+// An alias is the type it names (`reference/declarations.md § An alias`), so naming one costs what
+// naming the type would: nothing where the type has no destructor, and the destructor's module where
+// it has one -- whichever module wrote the alias, and however many aliases stand between. The
+// reference's `TypeChargingTests` section of that name, ported.
+private val nsc_aliases: string =
+    "module sys\n\nimport sysl.fs.write_bytes\n\nstruct Plain\n    n: int\n\nstruct Handle\n    n: int\n\n" +
+    "impl Drop for Handle\n    drop(self)\n        val _ = write_bytes(\"/tmp/x\", \"x\".bytes)\n\n" +
+    "type H = Handle\n\ntype P = Plain\n\ntype MaybeH = Option[&Handle]\n"
+
+private val nsc_dies: string = "can die here, and its destructor reaches"
+
+@test("so holding one through the alias its own module declares is refused")
+nsc_ta_own_modules_alias()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("sys/a.sysl", nsc_aliases),
+                            ("main.sysl", "@no_os\n\nimport sys.H\n\nsize(h: &H) -> int = 1\n\nprint(2)\n")])
+
+    assert(said.contains(s"a 'sys.H' $nsc_dies 'sys', which requires 'os'"), said)
+    assert(said.contains("<root>/main.sysl:5:"), said)
+end nsc_ta_own_modules_alias
+
+@test("and so is holding one through a qualified path to that alias")
+nsc_ta_qualified_path()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("sys/a.sysl", nsc_aliases),
+                            ("main.sysl", "@no_os\n\nsize(h: &sys.H) -> int = 1\n\nprint(2)\n")])
+
+    assert(said.contains(s"a 'sys.H' $nsc_dies 'sys', which requires 'os'"), said)
+end nsc_ta_qualified_path
+
+@test("and so is one another module re-exports, the program naming only that module")
+nsc_ta_re_exported()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("sys/a.sysl", nsc_aliases),
+                            ("box/a.sysl", "module box\n\nimport sys.Handle\n\ntype H2 = Handle\n"),
+                            ("main.sysl", "@no_os\n\nimport box.H2\n\nsize(h: &H2) -> int = 1\n\nprint(2)\n")])
+
+    assert(said.contains(s"a 'box.H2' $nsc_dies 'box', which requires 'os'"), said)
+    assert(said.contains("<root>/main.sysl:5:"), said)
+end nsc_ta_re_exported
+
+@test("and so is an alias of that alias, through a module that names it qualified")
+nsc_ta_alias_of_an_alias()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("sys/a.sysl", nsc_aliases), ("box/a.sysl", "module box\n\ntype H3 = sys.H\n"),
+                            ("main.sysl", "@no_os\n\nimport box.H3\n\nsize(h: &H3) -> int = 1\n\nprint(2)\n")])
+
+    assert(said.contains(s"a 'box.H3' $nsc_dies 'box', which requires 'os'"), said)
+end nsc_ta_alias_of_an_alias
+
+@test("and so is an alias of a type that holds one, an Option of it")
+nsc_ta_alias_of_an_application()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("sys/a.sysl", nsc_aliases),
+                            ("main.sysl", "@no_os\n\nimport sys.MaybeH\n\nsize(h: MaybeH) -> int = 1\n\nprint(2)\n")])
+
+    assert(said.contains(s"a 'sys.MaybeH' $nsc_dies 'sys', which requires 'os'"), said)
+    assert(said.contains("<root>/main.sysl:5:"), said)
+end nsc_ta_alias_of_an_application
+
+@test("and so is such an alias written in another module")
+nsc_ta_application_in_another_module()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("sys/a.sysl", nsc_aliases),
+                            ("box/a.sysl", "module box\n\nimport sys.Handle\n\ntype MH = Option[&Handle]\n"),
+                            ("main.sysl", "@no_os\n\nimport box.MH\n\nsize(h: MH) -> int = 1\n\nprint(2)\n")])
+
+    assert(said.contains(s"a 'box.MH' $nsc_dies 'box', which requires 'os'"), said)
+end nsc_ta_application_in_another_module
+
+// There is no generic alias to charge: the declaration is refused where its parameters begin. A change
+// that admits one owes this section a case instantiating it over `Handle`.
+@test("and a generic alias, which would need the same answer per instantiation, is not a declaration")
+nsc_ta_generic_alias_is_refused()
+    if !nsc_ready() then return
+
+    val said = nsc_refused([("sys/a.sysl", nsc_aliases), ("box/a.sysl", "module box\n\ntype Box1[T] = Option[T]\n"),
+                            ("main.sysl", "@no_os\n\nimport box.Box1\nimport sys.H\n\nsize(h: Box1[&H]) -> int = 1\n\n" +
+                                          "print(2)\n")])
+
+    assert(said.contains("'=' expected"), said)
+    assert(said.contains("<root>/box/a.sysl:3:10"), said)
+    assert(!said.contains(nsc_dies), said)
+end nsc_ta_generic_alias_is_refused
+
+@test("while an alias of the type beside it with none is free to hold")
+nsc_ta_alias_without_a_destructor()
+    if !nsc_ready() then return
+
+    assert_eq(nsc_ran([("sys/a.sysl", nsc_aliases), ("main.sysl", "@no_os\n\nimport sys.P\n\nval p = P(4)\nprint(p.n)\n")]),
+              "4\n")

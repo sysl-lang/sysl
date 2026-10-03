@@ -936,12 +936,14 @@ end check_gated_modules
 // without anybody calling it. It is asked here rather than where the name was read, because a type's
 // fields are not all laid out until every declaration has been.
 private settle_named_refs(a: &Analysis)
-    val dying = destructor_holders(a)
+    val drops = drops_declared(a)
+    val dying = destructor_holders(a, drops)
 
     for i in 0..<a.tables.capability_refs.len()
         val r = a.tables.capability_refs.at(i)
 
-        if r.named == "" || !holds_string(dying, r.named) then continue
+        if r.named == "" then continue
+        if !holds_string(dying, r.named) && !alias_dies(a, r.named, drops) then continue
 
         a.tables.capability_refs.set(i, CapabilityRef(r.from, r.to, r.scope, r.span, r.needs,
                                                       r.scaffolding, r.imported, r.named, true))
@@ -950,8 +952,7 @@ end settle_named_refs
 // The declarations a value of which runs a destructor when it dies: every type a `Drop` block was
 // written for, and every type that holds one -- in a field, a variant, a box, an array or a view --
 // by the key a written name resolves to.
-private destructor_holders(a: &Analysis) -> Buf[string]
-    val drops = drops_declared(a)
+private destructor_holders(a: &Analysis, drops: Buf[string]) -> Buf[string]
     var out: Buf[string] = buf()
 
     if drops.is_empty() then return out
@@ -976,6 +977,23 @@ private destructor_holders(a: &Analysis) -> Buf[string]
 
     out
 end destructor_holders
+
+// Whether `key` is an alias -- or a constrained subtype -- whose value runs a destructor when it
+// dies. **An alias is the type it names** (`reference/declarations.md § An alias`), so it dies as
+// that type does, whichever module wrote it and however many aliases stand between: `type H =
+// Handle`, `type H3 = sys.H` and `type M = Option[&Handle]` all do. The key a written alias resolves
+// to is the alias's own, which no struct or enum is filed under, so it is answered by what the alias
+// was resolved to stand for -- a type with no key of its own where the alias names an application.
+private alias_dies(a: &Analysis, key: string, drops: Buf[string]) -> bool
+    if drops.is_empty() then return false
+
+    a.tables.constrained_insts.get(key) match
+        None -> false
+        Some(t) ->
+            var seen: Buf[string] = buf()
+
+            holds_destructor(t, drops, &seen)
+end alias_dies
 
 private type_base(t: Type) -> string = t match
     Struct(d) -> d.base

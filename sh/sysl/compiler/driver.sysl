@@ -227,11 +227,14 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     for i in 0..<std.len()
         units.push(std.at(i))
 
-    // Then the packages -- the graph resolved, fetched, and read off disk.
+    // Then the packages -- the graph resolved, fetched, and read off disk. They join the compilation
+    // once the project's own modules are known, below, which is what decides whose tests are read.
     val fetched = package_sources(root, manifest, t)?
 
+    var theirs: Buf[Program] = buf()
+
     for i in 0..<fetched.units.len()
-        units.push(fetched.units.at(i))
+        theirs.push(fetched.units.at(i))
 
     // Then the source roots. **Their modules are not the project's own**: `own` is what decides
     // whose tests a test build keeps, so a root's tests run exactly where the project declares the
@@ -242,7 +245,7 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
         var unit = handed.at(i)
 
         unit.pkg = Packaging("", fetched.root_mounts, true, unit.pkg.manifest, unit.pkg.version)
-        units.push(unit)
+        theirs.push(unit)
 
     // What the project's own files mean by the paths at the head of their import lines. The project
     // itself has no prefix -- its modules keep the names they were written with -- and what it has
@@ -279,14 +282,62 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
         if !strayed.is_empty() then return Err(Reported(joined_reports(strayed)))
 
     for i in 0..<mine_units.len()
+        own.push(module_written(mine_units.at(i)))
+
+    // What the compilation was handed goes in with its scaffolding already out, unless the project
+    // declares the same module (`handed_source`).
+    for i in 0..<theirs.len()
+        val unit = theirs.at(i)
+
+        if holds_string(own, module_written(unit)) then units.push(unit)
+        else handed_source(unit) match
+            Some(kept) -> units.push(kept)
+            None -> ()
+
+    for i in 0..<mine_units.len()
         var unit = mine_units.at(i)
 
         unit.pkg = mine_pkg
         units.push(unit)
-        own.push(module_written(unit))
 
     Ok(Compilation(units, own, t))
 end packaged_compilation_of
+
+// A file a compilation is handed -- a `--lib` root's, a fetched package's -- with that library's
+// **test scaffolding taken out before anything reads it**: a `@tests` file is nothing, and an
+// ordinary file loses every `@test` function and hook written in it.
+//
+// **Those belong to `sysl test` of the library that wrote them, and to no build of a consumer.**
+// Dropping them after analysis is too late: by then a dependency's test file has been name-resolved
+// against the *consumer's* machine, and `sysl.fs` declares no `make_temp_dir` on one with no
+// operating system -- so a library whose tests made a scratch directory could not be linked by a
+// board program at all, refused over a file no build of that program keeps
+// (`reference/modules.md § A @tests file states its own capabilities`). A test file's type errors
+// reached the consumer the same way, and so would an import of the library's own
+// `dev_dependencies`, which a consumer never resolves.
+//
+// It is sound because every reference into the scaffolding has to come from scaffolding, so what
+// is left names nothing that went. **A module the project also declares keeps its tests**: those run
+// with the project's own, where the module is the project's to test.
+private handed_source(unit: Program) -> Option[Program]
+    if unit.test_only then return None
+
+    var kept: Buf[Stmt] = buf()
+
+    for i in 0..<unit.body.len()
+        val s = unit.body.at(i)
+
+        val scaffolding = *s.kind match
+            FuncDecl(f) -> f.test.is_some() || f.hook.is_some()
+            _ -> false
+
+        if !scaffolding then kept.push(s)
+
+    var out = unit
+
+    out.body = kept
+    Some(out)
+end handed_source
 
 // The module a file contributes to: what its header says, or the anonymous root module where it
 // declares none.
