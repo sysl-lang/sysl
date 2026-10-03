@@ -1,0 +1,125 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A bare bound takes the trait's defaulted arguments at the parameter it is written on: `U: Add` is
+// `Add[U, U]`, `Add` declaring `Rhs = Self` and `Out = Self`. That holds inside a trait's default
+// body, where the trait's own `Self` is in scope around the member, and at a generic member's call,
+// where the receiver's `Self` is -- neither of them may answer for the bound's.
+
+private var bbd_library_cache: Buf[Program] = buf()
+private var bbd_library_read: bool = false
+
+private bbd_library() -> Buf[Program]
+    if bbd_library_read then return bbd_library_cache
+
+    bbd_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> bbd_library_cache = units
+
+    bbd_library_cache
+end bbd_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private bbd_ready() -> bool
+    if bbd_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end bbd_ready
+
+// What a one-file program prints, built and run.
+private bbd_ran(text: string) -> string
+    val root = make_temp_dir("sysl-bare-bound").unwrap()
+    val exe = s"$root/built"
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end bbd_ran
+
+// A default body sits inside the trait, whose `Self` is in scope around it -- and `U: Add` still asks
+// `U` for `Add[U, U]`, not for `Add[Self]`. The reference prints 2 and 3.
+@test("a trait default's bare bound is filled at its own parameter")
+bbd_trait_default_bare_bound()
+    if !bbd_ready() then return
+
+    assert_eq(bbd_ran(raw"""
+        trait Twice
+            twice[U: Add](self, u: U) -> U = u + u
+
+        struct P
+            x: int
+
+        impl Twice for P
+
+        print(P(0).twice(1))
+        print(P(0).twice(1.5))
+        """), "2\n3\n")
+
+// Two bare bounds on one parameter of a default, each filled at that parameter. The reference prints 6.
+@test("a trait default's two bare bounds are both filled at their parameter")
+bbd_trait_default_two_bare_bounds()
+    if !bbd_ready() then return
+
+    assert_eq(bbd_ran(raw"""
+        trait Sum
+            sum2[U: Add + Sub](self, a: U, b: U) -> U = a + b - b + a
+
+        struct P
+            x: int
+
+        impl Sum for P
+
+        print(P(0).sum2(3, 4))
+        """), "6\n")
+
+// The same bound on a struct's own method and on a method an `impl` writes for a trait that declares
+// it without a body. The reference prints 2 and 4.
+@test("a struct method's and an impl method's bare bound are filled at their own parameter")
+bbd_struct_and_impl_bare_bound()
+    if !bbd_ready() then return
+
+    assert_eq(bbd_ran(raw"""
+        trait Plain
+            tw[U: Add](self, u: U) -> U
+
+        struct S
+            v: int
+
+            twice_s[U: Add](self, u: U) -> U = u + u
+
+        impl Plain for S
+            tw[U: Add](self, u: U) -> U = u + u
+
+        print(S(0).twice_s(1))
+        print(S(0).tw(2))
+        """), "2\n4\n")
