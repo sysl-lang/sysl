@@ -10,20 +10,23 @@ import sysl.math.bigint.from_int
 // beside the source it came from.
 
 // An `if`, with or without an `else` and with or without a value.
+//
+// `into` is the storage a large value is going to, where it has one: each branch then builds its
+// value there and owns it, and nothing is loaded where they meet.
 gen_if(e: *Emit, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TBlock],
-       ty: Type) -> Val
+       ty: Type, into: Option[Val] = None) -> Val
     val then_l = fresh_label(e, "if.then")
     val else_l = fresh_label(e, "if.else")
     val end_l = fresh_label(e, "if.end")
     val target = if else_block.is_some() then else_l else end_l
-    val slot = result_slot(e, ty)
+    val slot = merge_for(e, ty, into, None)
 
     // The last term's success edge is the branch's entry, so a condition with nothing to bind emits
     // exactly the one test and the one `br` it always did.
     val paths = gen_cond(e, cond, then_l, target)
 
     if no_value(ty) then gen_block_void(e, then_block)
-    else store_block_value(e, then_block, ty, slot)
+    else store_merged(e, then_block, ty, slot)
 
     // The branch's value is computed before the condition's bindings are given back, so a `then`
     // that yields what it destructured has taken its own count by the time this runs.
@@ -35,15 +38,53 @@ gen_if(e: *Emit, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TB
         Some(eb) ->
             emit_label(e, else_l)
 
-            if no_value(ty) then gen_block_void(e, eb) else store_block_value(e, eb, ty, slot)
+            if no_value(ty) then gen_block_void(e, eb) else store_merged(e, eb, ty, slot)
 
             emit_term(e, InBr(end_l))
         None -> ()
 
     emit_label(e, end_l)
     ends_nowhere(e, ty)
-    load_result(e, slot, ty)
+    merged_value(e, slot, ty)
 end gen_if
+
+// Where the branches of an `if` or a `match` leave their value: a slot of the form's own, loaded
+// where they meet, or -- `into` -- the storage a large value is going to, which each branch builds
+// its value in and owns, so nothing is loaded where they meet. `scrutinee` is the address of the
+// local a `match` is over, which is what lets an arm handing a payload back unchanged copy it from
+// there rather than bind it first (`payload_move`).
+struct Merge
+    at: Val
+    into: bool
+    scrutinee: Option[Val]
+end Merge
+
+merge_for(e: *Emit, ty: Type, into: Option[Val], scrutinee: Option[Val]) -> Merge = into match
+    Some(dest) -> Merge(dest, true, scrutinee)
+    None -> Merge(result_slot(e, ty), false, None)
+
+// One branch's value, left where the merge says.
+store_merged(e: *Emit, b: TBlock, ty: Type, m: Merge)
+    if b.ty == Never then gen_block_void(e, b)
+    else if m.into then gen_block_into(e, b, m.at)
+    else emit(e, InStore(lty(e, ty), gen_block_value(e, b), m.at, AccPlain, None))
+end store_merged
+
+// What the form yields where its branches meet: the slot's value, owned by the enclosing statement,
+// or nothing where they built it in place.
+merged_value(e: *Emit, m: Merge, ty: Type) -> Val =
+    if m.into then VNothing else load_result(e, m.at, ty)
+
+// A branch's value built where it is going, and owned there -- `gen_block_value` for a destination.
+// The count is taken before the block's locals are given back, as the register form's is.
+private gen_block_into(e: *Emit, b: TBlock, dest: Val)
+    push_temps(e)
+    push_owned(e)
+    gen_stmts(e, b.stmts)
+    gen_into(e, dest, b.result.unwrap())
+    pop_owned(e)
+    pop_temps(e)
+end gen_block_into
 
 // The slot a form's branches store their value into, or nothing where there is no value.
 private result_slot(e: *Emit, ty: Type) -> Val =

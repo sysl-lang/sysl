@@ -33,6 +33,9 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
     e.caller_exposed = exposed_in(f.body.stmts, f.body.result, none)
 
+    // The local every `return` hands back, where it can be built in the caller's result storage.
+    e.return_slot = return_plan(e, f)
+
     // Which parameters this function keeps a count of its own for, and which it reads through the
     // one its caller is holding for the length of the call (`borrowing.sysl`). The slot is written
     // either way, because the body addresses it like any other local.
@@ -219,7 +222,17 @@ end attribute_of
 // *has* an `ensures`, and only once at each of its returns, which is a price a contract already
 // announces it is willing to pay.
 gen_indirect_return(e: *Emit, r: TExpr)
-    gen_into(e, sret_param(), r)
+    // A local already built inside the result is left where it is, and the rest of the result is
+    // written around it (`return_slot.sysl`).
+    val around = e.return_slot match
+        Some(plan) -> path_of(r, plan.name) match
+            Some(_) -> Some(plan.name)
+            None -> None
+        None -> None
+
+    around match
+        Some(name) -> gen_around(e, sret_param(), r, name)
+        None -> gen_into(e, sret_param(), r)
 
     if !e.ensures.is_empty()
         val v = fresh_reg(e)

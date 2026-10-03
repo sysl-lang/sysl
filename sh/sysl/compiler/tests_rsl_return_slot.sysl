@@ -1,0 +1,543 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, parse_int, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A large result is written into storage its caller supplies, and the value that becomes it is built
+// there rather than built in the frame and copied there (`return_slot.sysl`).
+//
+// Three shapes are tested, each of which used to cost the whole value twice over on the stack:
+//
+//   - **a local returned on every path**, alone or as the payload of `Ok`, `Some` or a struct --
+//     `var s = Big(...); s.touch(); Ok(s)` -- lives in the result storage from its declaration;
+//   - **a `match` or an `if` building a large value** writes each branch's value where it is going,
+//     and `Result.unwrap`'s `Ok(v) -> v` copies the payload straight out of the receiver, with no
+//     binding and no merge slot between (`payload_move`);
+//   - **a large call result read through its address** -- a receiver, `make().unwrap()` -- is written
+//     into the slot the read uses and given back there, not loaded as one value and stored again
+//     (`own_temp_at`).
+//
+// The rule is what keeps it invisible, so each condition that keeps a copy has a program whose output
+// a copy-less lowering would change.
+//
+// Ported from the reference's `ReturnSlotTests` (bootstrap 4fc425a1), whose programs and expected
+// strings these are; the last test is this compiler's own.
+
+private rsl_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end rsl_ready
+
+private rsl_ir(text: string, target: Option[string] = None) -> string
+    val root = make_temp_dir("sysl-return-slot").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rsl_ir
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private rsl_body(out: string, name: string) -> string
+    val lines = lines_of(out)
+    var b = str_builder()
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !inside && line.starts_with("define ") && line.contains("@" + name + "(") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end rsl_body
+
+// How many times `needle` occurs in `hay`.
+private rsl_count(hay: string, needle: string) -> usize
+    var n: usize = 0
+    var rest = hay
+
+    loop
+        rest.index_of(needle) match
+            Some(i) ->
+                n += 1
+                rest = rest[i + needle.len..<rest.len]
+            None -> break
+
+    n
+end rsl_count
+
+// What a program prints, and whether it came back cleanly.
+private rsl_prints(text: string, expected: string)
+    if !rsl_ready() then return
+
+    val root = make_temp_dir("sysl-return-slot").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, expected)
+            assert(out.status.ok(), "the program printed what was expected and did not exit cleanly")
+end rsl_prints
+
+// `Big` is 8 + 2048 bytes on a 64-bit host, which is the copy every one of these used to make.
+private rsl_whole_copy() -> string = "i64 2056"
+
+// No slot of the local's type, and no copy of the whole of it, in the way it is handed back.
+private rsl_no_copy(f: string, ty: string)
+    assert(!f.contains(s"alloca $ty"), f)
+    assert(!f.contains(s"load $ty"), f)
+    assert(rsl_count(f, rsl_whole_copy()) == 0, f)
+end rsl_no_copy
+
+private rsl_big() -> string = raw"""
+    struct Big
+        n: usize
+        table: [512]u32
+
+        @noinline
+        touch(*self)
+            self.table[self.n % 512] = 7
+
+    enum Err
+        Bad
+
+    make(k: usize) -> Big
+        var s = Big(k, [0; 512])
+        s.touch()
+        s
+
+    make_ok(k: usize) -> Result[Big, Err]
+        if k == 0 then return Err(Bad)
+        var s = Big(k, [0; 512])
+        s.touch()
+        Ok(s)
+
+    make_some(k: usize) -> Option[Big]
+        var s = Big(k, [0; 512])
+        s.touch()
+        Some(s)
+
+    boot() -> usize
+        val a = make(3)
+        val b = make_ok(4).unwrap()
+        val c = make_some(5).unwrap()
+        a.n + b.n + c.n + usize(a.table[3] + b.table[4] + c.table[5])
+
+    print(boot())
+    """
+
+@test("a local returned on every path is built in the caller's storage: returned as itself")
+rsl_returned_as_itself()
+    if !rsl_ready() then return
+
+    rsl_no_copy(rsl_body(rsl_ir(rsl_big()), "make"), "%struct.Big")
+end rsl_returned_as_itself
+
+@test("a local returned on every path is built in the caller's storage: returned inside Ok, after a return of Err that comes before it exists")
+rsl_returned_inside_ok()
+    if !rsl_ready() then return
+
+    rsl_no_copy(rsl_body(rsl_ir(rsl_big()), "make_ok"), "%struct.Big")
+end rsl_returned_inside_ok
+
+@test("a local returned on every path is built in the caller's storage: returned inside Some")
+rsl_returned_inside_some()
+    if !rsl_ready() then return
+
+    rsl_no_copy(rsl_body(rsl_ir(rsl_big()), "make_some"), "%struct.Big")
+end rsl_returned_inside_some
+
+@test("a local returned on every path is built in the caller's storage: and the program answers what it did")
+rsl_the_program_answers() = rsl_prints(rsl_big(), "33\n")
+
+@test("unwrap copies its payload once, straight from the receiver to the destination")
+rsl_unwrap_copies_once()
+    if !rsl_ready() then return
+
+    val out = rsl_ir(rsl_big())
+
+    for name in ["sysl$Option.unwrap.Big", "sysl$Result.unwrap.Big.Err"]
+        val f = rsl_body(out, name)
+
+        assert(!f.contains("alloca %struct.Big"), f)
+        assert(!f.contains("alloca %enum"), f)
+        assert(!f.contains("load %struct.Big"), f)
+        assert(rsl_count(f, rsl_whole_copy()) == 1, f)
+end rsl_unwrap_copies_once
+
+// The frame `clang -fstack-usage` reports for one function, out of the `.su` file it writes: one line
+// per function, `p.ll:make<TAB>8<TAB>static`.
+private rsl_frame(su: string, name: string) -> Option[int]
+    val lines = lines_of(su)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+        val key = s":$name\t"
+
+        line.index_of(key) match
+            Some(at) ->
+                val rest = line[at + key.len..<line.len]
+                val bytes = rest.index_of("\t") match
+                    Some(t) -> rest[0..<t]
+                    None -> rest
+
+                return parse_int(bytes).ok()
+            None -> ()
+
+    None
+end rsl_frame
+
+@test("on a board, none of them has a frame the size of what it returns")
+rsl_frames_on_a_board()
+    if !rsl_ready() then return
+
+    val t = target_named("thumb-freestanding-softfp").unwrap()
+    val clang = find_backend_clang(t) match
+        Ok(c) -> c
+        Err(_) ->
+            print("skipped: no clang with an ARM back end")
+            return
+
+    val out = rsl_ir(rsl_big(), Some("thumb-freestanding-softfp"))
+    val head = "target triple = \""
+    var triple = ""
+    val lines = lines_of(out)
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with(head)
+            val rest = lines.at(i)[head.len..<lines.at(i).len]
+
+            triple = rest[0..<rest.len - 1]
+
+    assert(triple != "", out)
+
+    val root = make_temp_dir("sysl-frames").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/p.ll", out).unwrap()
+
+    val said = capture(clang, [s"--target=$triple", "-O1", "-c", "-fstack-usage", "-o", s"$root/p.o",
+                               s"$root/p.ll"], "", [], true)
+
+    val su = read_text(s"$root/p.su").unwrap_or("")
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "clang could not be run")
+        Ok(r) -> assert(r.status.ok(), r.text)
+
+    if su == ""
+        print(s"skipped: $clang wrote no stack-usage file")
+        return
+    end if
+
+    // `Big` is 4 + 2048 bytes here, so a frame holding one is past 2 KB.
+    for name in ["make", "make_ok", "make_some", "sysl$Option.unwrap.Big", "sysl$Result.unwrap.Big.Err"]
+        rsl_frame(su, name) match
+            Some(bytes) -> assert(bytes < 256, s"$name in\n$su")
+            None -> assert(false, s"no frame for $name in\n$su")
+end rsl_frames_on_a_board
+
+private rsl_counted() -> string = raw"""
+    struct Res
+        id: int
+
+    impl Drop for Res
+        drop(self) = print("dropped", self.id)
+
+    struct Big2
+        r: &Res
+        table: [512]u32
+
+    mk(i: int) -> Big2
+        var s = Big2(Res(i), [0; 512])
+        s.table[0] = 1
+        s
+
+    mk_ok(i: int) -> Result[Big2, int]
+        if i == 0 then return Err(0)
+        var s = Big2(Res(i), [0; 512])
+        Ok(s)
+
+    pick(c: bool) -> Big2 = if c then mk(3) else mk(4)
+
+    f()
+        val a = mk(1)
+        val b = mk_ok(2).unwrap()
+        val c = pick(true)
+        print("live", a.r.id, b.r.id, c.r.id)
+
+    f()
+    print("done")
+    """
+
+@test("a counted local handed back is owned once by the caller: with no copy in the function and the receiver given back at its address")
+rsl_counted_no_copy()
+    if !rsl_ready() then return
+
+    val out = rsl_ir(rsl_counted())
+
+    assert(!rsl_body(out, "mk").contains("alloca %struct.Big2"), rsl_body(out, "mk"))
+    assert(!rsl_body(out, "mk_ok").contains("alloca %struct.Big2"), rsl_body(out, "mk_ok"))
+
+    val f = rsl_body(out, "f")
+
+    assert(f.contains("@arc.dispose_at.sysl$Result.Big2.int(ptr"), f)
+    assert(!f.contains("load %enum.sysl$Result.Big2.int"), f)
+end rsl_counted_no_copy
+
+@test("a counted local handed back is owned once by the caller: and each destructor runs exactly once, when the caller lets go")
+rsl_counted_destructors_once() =
+    rsl_prints(rsl_counted(), "live 1 2 3\ndropped 3\ndropped 2\ndropped 1\ndone\n")
+
+private rsl_spoiler() -> string = raw"""
+    struct Big
+        n: usize
+        table: [512]u32
+
+    struct Spoiler
+        p: *Big
+
+    impl Drop for Spoiler
+        drop(self)
+            self.p.n = 99
+    """
+
+@test("a local keeps its copy where the program could tell: its address stored somewhere, written through after the value was returned")
+rsl_an_address_stored() =
+    rsl_prints(rsl_spoiler() + raw"""
+        make() -> Big
+            var s = Big(1, [0; 512])
+            val g: &Spoiler = Spoiler(&s)
+            s
+
+        print(make().n)
+        """, "1\n")
+
+private rsl_kept() -> string = rsl_spoiler() + raw"""
+    spoil(p: *Big) -> &Spoiler = Spoiler(p)
+
+    make() -> Big
+        var s = Big(2, [0; 512])
+        val g = spoil(&s)
+        s
+
+    print(make().n)
+    """
+
+@test("a local keeps its copy where the program could tell: its address handed to a call that keeps it, and a destructor run on the way out")
+rsl_an_address_kept_by_a_callee()
+    if !rsl_ready() then return
+
+    val f = rsl_body(rsl_ir(rsl_kept()), "make")
+
+    assert(f.contains("alloca %struct.Big"), f)
+    rsl_prints(rsl_kept(), "2\n")
+end rsl_an_address_kept_by_a_callee
+
+@test("a local keeps its copy where the program could tell: a different value returned after it exists, built out of its own parts")
+rsl_a_different_value_returned() =
+    rsl_prints(raw"""
+        struct Two
+            a: [256]u32
+            b: [256]u32
+
+        flip(k: u32) -> Option[Two]
+            var s = Two([k; 256], [k + 1; 256])
+            if k == 1 then return Some(Two(s.b, s.a))
+            Some(s)
+
+        val f = flip(1).unwrap()
+        val g = flip(5).unwrap()
+        print(f.a[0], f.b[0], g.a[0], g.b[0])
+        """, "2 1 5 6\n")
+
+@test("a local keeps its copy where the program could tell: another part of the result changing it after it was taken")
+rsl_another_part_changes_it() =
+    rsl_prints(raw"""
+        struct Big
+            n: usize
+            table: [512]u32
+
+        bump(p: *Big) -> usize
+            p.n += 1
+            p.n
+
+        struct Held
+            big: Big
+            m: usize
+
+        pair() -> Held
+            var s = Big(1, [0; 512])
+            Held(s, bump(&s))
+
+        val h = pair()
+        print(h.big.n, h.m)
+        """, "1 2\n")
+
+// A `?` leaves through the result storage like a `return`, and what it writes there is the error --
+// so a local built in that storage would have its bytes written over with its counts still owed, and
+// its destructor would never run.
+private rsl_tried() -> string = raw"""
+    struct Res
+        id: int
+
+    impl Drop for Res
+        drop(self) = print("dropped", self.id)
+
+    struct Big2
+        r: &Res
+        table: [512]u32
+
+    enum Fault
+        Bad
+
+    check(k: int) -> Result[int, Fault] = if k == 0 then Err(Bad) else Ok(k)
+
+    mk(k: int) -> Result[Big2, Fault]
+        var s = Big2(Res(k), [0; 512])
+        val n = check(k - 1)?
+        s.table[0] = u32(n)
+        Ok(s)
+
+    f()
+        mk(1) match
+            Ok(_) -> print("ok")
+            Err(_) -> print("err")
+
+        val b = mk(2).unwrap()
+        print("live", b.r.id)
+
+    f()
+    print("done")
+    """
+
+@test("a local keeps its copy where the program could tell: a try after it, which leaves through the result storage")
+rsl_a_try_after_it()
+    if !rsl_ready() then return
+
+    val f = rsl_body(rsl_ir(rsl_tried()), "mk")
+
+    assert(f.contains("alloca %struct.Big2"), f)
+    rsl_prints(rsl_tried(), "dropped 1\nerr\nlive 2\ndropped 2\ndone\n")
+end rsl_a_try_after_it
+
+// `rsl_tried` with `mk`'s body, and what `f` reads of the result, replaced.
+private rsl_tried_with(decls: string, mk: string, live: string) -> string =
+    rsl_tried_head() + decls + rsl_tried_fault() + mk + rsl_tried_caller() + live + "\nf()\nprint(\"done\")\n"
+
+private rsl_tried_head() -> string = raw"""
+    struct Res
+        id: int
+
+    impl Drop for Res
+        drop(self) = print("dropped", self.id)
+
+    struct Big2
+        r: &Res
+        table: [512]u32
+
+    """
+
+private rsl_tried_fault() -> string = raw"""
+    enum Fault
+        Bad
+
+    check(k: int) -> Result[int, Fault] = if k == 0 then Err(Bad) else Ok(k)
+
+    """
+
+private rsl_tried_caller() -> string = raw"""
+
+    f()
+        mk(1) match
+            Ok(_) -> print("ok")
+            Err(_) -> print("err")
+
+        val b = mk(2).unwrap()
+    """
+
+private rsl_tried_inside() -> string = rsl_tried_with(raw"""
+    struct Held
+        big: Big2
+        n: int
+
+    """, raw"""
+    mk(k: int) -> Result[Held, Fault]
+        var s = Big2(Res(k), [0; 512])
+        Ok(Held(s, check(k - 1)?))
+    """, "    print(\"live\", b.big.r.id, b.n)\n")
+
+@test("a local keeps its copy where the program could tell: a try inside the construction that returns it")
+rsl_a_try_inside_the_construction()
+    if !rsl_ready() then return
+
+    val f = rsl_body(rsl_ir(rsl_tried_inside()), "mk")
+
+    assert(f.contains("alloca %struct.Big2"), f)
+    rsl_prints(rsl_tried_inside(), "dropped 1\nerr\nlive 2 1\ndropped 2\ndone\n")
+end rsl_a_try_inside_the_construction
+
+private rsl_tried_before() -> string = rsl_tried_with("", raw"""
+    mk(k: int) -> Result[Big2, Fault]
+        val n = check(k - 1)?
+        var s = Big2(Res(k), [0; 512])
+        s.table[0] = u32(n)
+        Ok(s)
+    """, "    print(\"live\", b.r.id)\n")
+
+@test("a try that comes before the local exists, or inside its initializer, leaves nothing behind: before it: the local is still built in the caller's storage")
+rsl_a_try_before_it()
+    if !rsl_ready() then return
+
+    val f = rsl_body(rsl_ir(rsl_tried_before()), "mk")
+
+    assert(!f.contains("alloca %struct.Big2"), f)
+    rsl_prints(rsl_tried_before(), "err\nlive 2\ndropped 2\ndone\n")
+end rsl_a_try_before_it
+
+@test("a try that comes before the local exists, or inside its initializer, leaves nothing behind: inside its initializer: what was built of it is let go of once")
+rsl_a_try_inside_the_initializer() =
+    rsl_prints(rsl_tried_with("", raw"""
+        mk(k: int) -> Result[Big2, Fault]
+            var s = Big2(Res(k), [u32(check(k - 1)?); 512])
+            Ok(s)
+        """, "    print(\"live\", b.r.id)\n"), "dropped 1\nerr\nlive 2\ndropped 2\ndone\n")
