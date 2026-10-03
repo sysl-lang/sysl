@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int}
+import sysl.text.Search
 
 // Control flow **as an expression**, and the block that is one too.
 //
@@ -598,7 +599,7 @@ for_expr(cx: &Analyzer, span: Span, label: Option[string], name: string, iter: E
 
     if cursor.is_some() then return cursor.unwrap()
 
-    val elem = walked_element(cx, span, texpr_type(seq), name)
+    val elem = walked_element(cx, span, seq, iter, name)
 
     if elem.is_none() then return bad_expr(span)
 
@@ -633,6 +634,11 @@ private iterated(cx: &Analyzer, span: Span, seq: TExpr, name: string, body: Buf[
     val key = catalog_key(cx.an, "Iterate")
 
     if key.is_none() then return None
+
+    // **The built-in walk of an array or a slice is not something a program competes with**, exactly
+    // as the built-in subscript is not: an `impl Iterate for []T` registers a `next` a program may
+    // call, and the loop still reads the elements the sequence already has.
+    if walked_by_index(cty) then return None
 
     // **A cursor may be a trait object**, and that is what `*Iterate[Item = string]` is for: one loop
     // serving a terminal editor, a file and a string of test input, none of which the loop names. A
@@ -685,8 +691,13 @@ private iterated(cx: &Analyzer, span: Span, seq: TExpr, name: string, body: Buf[
     Some(checked_loop(ctx, span, TExpr(span, TIterate(slot, cty, seq, next, bind, tb, telse, ty))))
 end iterated
 
+private walked_by_index(t: Type) -> bool = t match
+    Array(_, _) -> true
+    Slice(_, _) -> true
+    _ -> false
+
 // Whether a `for` walks its cursor through a table rather than by name: an erased pointer made
-// against `Iterate` itself.
+// against `Iterate` or against a trait requiring it.
 //
 // **A trait object made against some *other* trait is not walkable and falls through**, so the
 // refusal a reader gets names the trait they did not implement rather than this case.
@@ -695,7 +706,16 @@ private walks_through_a_table(cx: &Analyzer, cty: Type, iterate: string) -> bool
 
     if tr.is_none() then return false
 
-    trait_bound_of(tr.unwrap()).name == iterate
+    // **An object over a trait that requires `Iterate` is walked too**: the closure read here is the
+    // list the table is laid out from, so the loop cannot disagree with the table about which member
+    // it is calling.
+    val closure = trait_closure(cx.an, trait_bound_of(tr.unwrap()),
+                                self_binding(Abstract("Self", buf())))
+
+    for i in 0..<closure.len()
+        if closure.at(i).name == iterate then return true
+
+    false
 end walks_through_a_table
 
 // The same walk, over a cursor whose `next` is a slot.
@@ -780,8 +800,8 @@ private option_of(cx: &Analyzer, span: Span, item: Type) -> Option[(Type, EnumVa
 end option_of
 
 // What one turn of a `for` binds, or nothing where the value is not something a loop walks.
-private walked_element(cx: &Analyzer, span: Span, ty: Type, name: string) -> Option[Type]
-    ty match
+private walked_element(cx: &Analyzer, span: Span, seq: TExpr, iter: Expr, name: string) -> Option[Type]
+    texpr_type(seq) match
         Array(_, elem) -> Some(*elem)
         Slice(elem, _) -> Some(*elem)
 
@@ -800,8 +820,76 @@ private walked_element(cx: &Analyzer, span: Span, ty: Type, name: string) -> Opt
             val walks = catalog_key(cx.an, "Iterate").map(k -> module_show(k)).unwrap_or("Iterate")
 
             cx.fault(span, "'for' iterates an integer range, an array, a slice, or a type that " +
-                     s"implements '$walks', and ${type_show(other)} is none of those")
+                     s"implements '$walks', and ${type_show(other)} is none of those" +
+                     road_offered(cx, seq, iter, name))
             None
+end walked_element
+
+// **The road a type that is not a sequence offers to one**, as the tail of the refusal: a container
+// is deliberately not a cursor, so `for x in b` over a `Buf` is refused, and naming only the trait
+// would send a reader looking for a missing implementation when the way was a member of the type in
+// front of them — `view()` on a `Buf`, `walk()` on a `sysl.container` type.
+//
+// The road is the first member, in declaration order, that a call with no arguments reaches and whose
+// result a `for` walks; one wanting an argument is not the loop that was meant. Each is asked in a
+// sandbox, the refusal being the only thing this reading is for. Where the subject is a bare name the
+// loop is written out; anything else has no spelling to hand back, so the member is named alone.
+private road_offered(cx: &Analyzer, seq: TExpr, iter: Expr, name: string) -> string
+    val key = catalog_key(cx.an, "Iterate")
+    val owner = member_owner(receiver_type(texpr_type(seq))).0
+    val prefix = member_key_of(owner, "")
+    val order = cx.an.tables.members.decls.order
+
+    for i in 0..<order.len()
+        val k = order.at(i)
+
+        if !k.starts_with(prefix) then continue
+
+        val d = cx.an.tables.members.decls.get(k)
+
+        if d.is_none() then continue
+
+        val m = d.unwrap()
+
+        if m.receiver.is_none() || m.is_property || m.params.len() > 0 || m.tparams.len() > 0
+            continue
+
+        if !answers_a_walk(cx, seq, m.name, key) then continue
+
+        val loop_line = *iter.kind match
+            Ident(subject) -> s", so 'for $name in $subject.${m.name}()' is the loop"
+            _ -> ""
+
+        return s" — what it does have is '${m.name}()', which answers with something a 'for' " +
+               s"walks$loop_line"
+
+    ""
+end road_offered
+
+// Whether calling `mname` on the sequence with no arguments answers with something a `for` walks:
+// an array, a slice, an erased `Iterate`, or a type implementing it. Nothing the trial wrote is kept.
+private answers_a_walk(cx: &Analyzer, seq: TExpr, mname: string, iterate: Option[string]) -> bool
+    val said = cx.an.complaints()
+    val mark = cx.an.sandboxed()
+    var none_args: Buf[Expr] = buf()
+    val t = texpr_type(call_member(cx, seq.span, seq, mname, none_args, None))
+    val clean = cx.an.complaints() == said
+
+    cx.an.release(mark)
+    cx.an.restore_complaints(said)
+
+    if !clean then return false
+
+    t match
+        Array(_, _) -> true
+        Slice(_, _) -> true
+        Unknown -> false
+        _ ->
+            if iterate.is_none() then return false
+            if walks_through_a_table(cx, t, iterate.unwrap()) then return true
+
+            conforms(cx.an, Bound(iterate.unwrap(), buf()), t)
+end answers_a_walk
 
 // The two ends of a range written as a form, which is what the four positions that read one
 // directly -- a `for` header, a slice index, a pattern and a quantifier -- each match on.
