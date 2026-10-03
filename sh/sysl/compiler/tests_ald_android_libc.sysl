@@ -1,0 +1,145 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, write_text}
+import sysl.text.{join, split, Search}
+
+// `sysl.fs` naming the libc symbols each target actually has -- the reference's
+// `LibraryAndroidLibcCliTests`, driven through the same `run_cli` a shell reaches.
+//
+// Android's Bionic has no `__errno_location` (its accessor is `__errno`) and has `getentropy` only
+// from API 28, where `aarch64-android` is API 24, so an atomic write there reads errno through
+// `__errno` and draws its pending name's token from `arc4random_buf`. Both are a question about which
+// symbol the program declares, so the cases read the LLVM an `emit-llvm` for the target writes: a
+// `build-c` for Android would need an NDK, and what is asserted is this compiler's own output.
+
+private ald_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end ald_ready
+
+// What one command line came to: the status the shell hears, and every line the driver said.
+private ald_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end ald_run
+
+private ald_project(main: string) -> string
+    val root = make_temp_dir("sysl-ald-").unwrap()
+
+    write_text(s"$root/package.hocon", "").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    root
+end ald_project
+
+private ald_publishes() -> string = raw"""
+    import sysl.fs.write_text_atomic
+
+    @export("entry")
+    entry() -> i32
+        write_text_atomic("prefs.txt", "x") match
+            Ok(_) -> 0
+            Err(_) -> 1
+    """
+
+// The LLVM text of `emit-llvm` for one target, the library compiled from source, having succeeded.
+private ald_emitted(target: string) -> string
+    val got = ald_run(["sysl", "emit-llvm", ald_project(ald_publishes()), "--no-std-lib", "--target", target])
+
+    assert_eq(got.0, 0, got.1)
+    got.1
+end ald_emitted
+
+// Every symbol a line starting with `keyword` names, quotes taken off -- the reference's
+// `symbols(ir, "define")` and `symbols(ir, "declare")`.
+private ald_symbols(ir: string, keyword: string) -> Buf[string]
+    var names: Buf[string] = buf()
+    val lines = split(ir, "\n")
+
+    for i in 0..<lines.len
+        val line = lines[i]
+
+        if line.starts_with(s"$keyword ")
+            line.index_of("@") match
+                None -> ()
+                Some(at) ->
+                    var name = line[at + 1..<line.len]
+
+                    name.index_of("(") match
+                        Some(open) -> name = name[0..<open]
+                        None -> ()
+
+                    if name.starts_with("\"") && name.len >= 2 then name = name[1..<name.len - 1]
+
+                    names.push(name)
+    end for
+
+    names
+end ald_symbols
+
+private ald_holds(xs: Buf[string], x: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == x then return true
+
+    false
+end ald_holds
+
+private ald_defines(ir: string, name: string) -> bool = ald_holds(ald_symbols(ir, "define"), name)
+
+private ald_declares(ir: string, name: string) -> bool = ald_holds(ald_symbols(ir, "declare"), name)
+
+@test("an atomic write for aarch64-android reads errno through Bionic's __errno, not glibc's __errno_location")
+ald_android_reads_errno_through_bionic()
+    if !ald_ready() then return
+
+    val ir = ald_emitted("aarch64-android")
+
+    assert(ald_declares(ir, "__errno"), "__errno is declared")
+    assert(!ir.contains("__errno_location"), "and __errno_location is not named")
+end ald_android_reads_errno_through_bionic
+
+@test("an atomic write for aarch64-android draws its pending name's token from arc4random_buf, which Bionic has at API 24")
+ald_android_draws_its_token_from_arc4random_buf()
+    if !ald_ready() then return
+
+    val ir = ald_emitted("aarch64-android")
+
+    assert(ald_declares(ir, "arc4random_buf"), "arc4random_buf is declared")
+    assert(!ir.contains("getentropy"), "and getentropy is not named")
+end ald_android_draws_its_token_from_arc4random_buf
+
+@test("an atomic write for x86_64-linux keeps getentropy and __errno_location")
+ald_linux_keeps_getentropy_and_errno_location()
+    if !ald_ready() then return
+
+    val ir = ald_emitted("x86_64-linux")
+
+    assert(ald_declares(ir, "getentropy"), "getentropy is declared")
+    assert(ald_declares(ir, "__errno_location"), "__errno_location is declared")
+    assert(!ir.contains("arc4random_buf"), "and arc4random_buf is not named")
+end ald_linux_keeps_getentropy_and_errno_location
+
+@test("an atomic write for aarch64-macos keeps getentropy and __error")
+ald_macos_keeps_getentropy_and_error()
+    if !ald_ready() then return
+
+    val ir = ald_emitted("aarch64-macos")
+
+    assert(ald_declares(ir, "getentropy"), "getentropy is declared")
+    assert(ald_declares(ir, "__error"), "__error is declared")
+    assert(!ir.contains("__errno"), "and __errno is not named")
+    assert(!ir.contains("arc4random_buf"), "nor is arc4random_buf")
+end ald_macos_keeps_getentropy_and_error
