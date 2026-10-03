@@ -1,0 +1,252 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// The LLVM type layer (`LType`) and the lowering that produces it (`type_lty`).
+//
+// Two claims are under test and they are different claims. The first is that `l_render` writes
+// LLVM's own spelling, spacing included -- the compiler's tests assert on emitted IR by substring, so
+// `{ ptr, ptr }` is the answer and `{ptr,ptr}` is a different one. The second is that the lowering is
+// the erasure it is meant to be: a constrained subtype, a qualifier and the three reference modes all
+// arrive at the type their base or their address has, because a back end reading these values must
+// not be able to see what the language knew.
+//
+// A lowering is compared through its rendering: `l_render` writes each shape differently, so two
+// types that render alike are the same type to LLVM, which is the claim being made.
+
+private ltx_i32() -> Type = Integer(32, true, false)
+
+private ltx_u8() -> Type = Integer(8, false, false)
+
+// A `usize` for a machine of this many bits: the width is settled when the type is built.
+private ltx_usize(bits: int) -> Type = Integer(bits, false, true)
+
+private ltx_display() -> Type = Trait("Display", buf(), buf())
+
+// The lowering, written down, on a 64-bit machine unless a width is given.
+private ltx_lowered(t: Type) -> Option[string] = type_llvm(t, 64)
+
+private ltx_lowered_at(t: Type, word_bits: int) -> Option[string] = type_llvm(t, word_bits)
+
+private ltx_render(t: LType) -> Option[string] = Some(l_render(t))
+
+// -- render writes LLVM's own spelling -----------------------------------------------------------
+
+@test("an integer is its width, at every width there is")
+ltx_integer_width()
+    assert_eq(l_render(LInt(1)), "i1")
+    assert_eq(l_render(LInt(8)), "i8")
+    assert_eq(l_render(LInt(5)), "i5")
+    assert_eq(l_render(LInt(64)), "i64")
+
+@test("a float is named rather than numbered, which is the one place LLVM is unsystematic")
+ltx_float_named()
+    assert_eq(l_render(LFloat(16, false)), "half")
+    assert_eq(l_render(LFloat(32, false)), "float")
+    assert_eq(l_render(LFloat(64, false)), "double")
+
+@test("an address is opaque and nothing else is spelled like one")
+ltx_address_opaque()
+    assert_eq(l_render(LPtr), "ptr")
+    assert_eq(l_render(LVoid), "void")
+
+@test("an array names its length and its element, and nests")
+ltx_array_nests()
+    assert_eq(l_render(LArr(4, LPtr)), "[4 x ptr]")
+    assert_eq(l_render(LArr(2, LArr(3, LInt(8)))), "[2 x [3 x i8]]")
+
+@test("a vector is angle brackets where an array is square ones")
+ltx_vector_angle()
+    assert_eq(l_render(LVec(4, LFloat(32, false))), "<4 x float>")
+    assert_eq(l_render(LVec(16, LInt(8))), "<16 x i8>")
+    assert_eq(l_render(LVec(4, LInt(1))), "<4 x i1>")
+
+@test("an anonymous aggregate carries the interior spaces the assertions match on")
+ltx_aggregate_spaces()
+    var two: Buf[LType] = buf()
+
+    two.push(LPtr)
+    two.push(LPtr)
+    assert_eq(l_render(LStruct(two)), "{ ptr, ptr }")
+    assert_eq(l_render(LStruct(l_one(LInt(32)))), "{ i32 }")
+
+@test("and one with nothing in it is `{}` rather than a pair of braces with a gap")
+ltx_empty_aggregate()
+    assert_eq(l_render(LStruct(l_none())), "{}")
+
+@test("a named type is its name, sigil and all")
+ltx_named_sigil()
+    assert_eq(l_render(LNamed("%struct.Point")), "%struct.Point")
+
+// -- the two shapes the language names rather than builds ----------------------------------------
+
+@test("a trait object is two words")
+ltx_trait_object_two_words()
+    assert_eq(l_render(l_fat()), "{ ptr, ptr }")
+
+@test("a view is two addresses and a count, and the count is the machine's")
+ltx_view_machine()
+    assert_eq(l_render(l_view(64)), "{ ptr, ptr, i64 }")
+    assert_eq(l_render(l_view(32)), "{ ptr, ptr, i32 }")
+
+// -- the lowering erases what the back end must not see ------------------------------------------
+
+@test("a scalar lowers to itself")
+ltx_scalar_itself()
+    assert_eq(ltx_lowered(ltx_u8()), ltx_render(LInt(8)))
+    assert_eq(ltx_lowered(Bool), ltx_render(LInt(1)))
+    assert_eq(ltx_lowered(Char), ltx_render(LInt(32)))
+    assert_eq(ltx_lowered(Floating(32, false)), ltx_render(LFloat(32, false)))
+
+@test("`unit`, `never` and the type a mistake leaves behind are all no value at all")
+ltx_no_value()
+    assert_eq(ltx_lowered(Unit), ltx_render(LVoid))
+    assert_eq(ltx_lowered(Never), ltx_render(LVoid))
+    assert_eq(ltx_lowered(Unknown), ltx_render(LVoid))
+
+// Where the width is settled is the point: a `usize` built for a 32-bit machine answers `i32`
+// whatever the width in scope when it is asked, because it took the answer when it was made.
+@test("a `usize` is an address wide, and took that answer when it was built")
+ltx_usize_settled()
+    assert_eq(ltx_lowered(ltx_usize(64)), ltx_render(LInt(64)))
+    assert_eq(ltx_lowered_at(ltx_usize(32), 32), ltx_render(LInt(32)))
+    assert_eq(ltx_lowered_at(ltx_usize(32), 64), ltx_render(LInt(32)))
+
+@test("a view is two addresses and a count, and the count is the machine in scope")
+ltx_view_in_scope()
+    var wide: Buf[LType] = buf()
+
+    wide.push(LPtr)
+    wide.push(LPtr)
+    wide.push(LInt(64))
+
+    var narrow: Buf[LType] = buf()
+
+    narrow.push(LPtr)
+    narrow.push(LPtr)
+    narrow.push(LInt(32))
+    assert_eq(ltx_lowered(Slice(ltx_u8(), false)), ltx_render(LStruct(wide)))
+    assert_eq(ltx_lowered_at(Str, 32), ltx_render(LStruct(narrow)))
+
+@test("a qualifier says how storage is reached and nothing about what is in it")
+ltx_qualifier_erased()
+    assert_eq(ltx_lowered(Volatile(ltx_i32())), ltx_render(LInt(32)))
+
+@test("a constrained subtype lowers exactly to its base, derived or not")
+ltx_constrained_base()
+    val plain = constrained("Age", ltx_i32(), false, None, None, false, None)
+    val derived = constrained("Age", ltx_i32(), true, None, None, false, None)
+
+    assert_eq(ltx_lowered(plain), ltx_render(LInt(32)))
+    assert_eq(ltx_lowered(derived), ltx_render(LInt(32)))
+
+@test("every reference mode is an address, and the three of them are indistinguishable here")
+ltx_reference_modes()
+    var params: Buf[Type] = buf()
+
+    params.push(ltx_i32())
+    assert_eq(ltx_lowered(Ptr(ltx_i32())), ltx_render(LPtr))
+    assert_eq(ltx_lowered(Ref(ltx_i32(), false)), ltx_render(LPtr))
+    assert_eq(ltx_lowered(Ref(ltx_i32(), true)), ltx_render(LPtr))
+    assert_eq(ltx_lowered(Weak(ltx_i32())), ltx_render(LPtr))
+    assert_eq(ltx_lowered(CFn(params, Unit)), ltx_render(LPtr))
+
+@test("unless it points at a trait, where the address is fat")
+ltx_trait_pointer_fat()
+    assert_eq(ltx_lowered(Ptr(ltx_display())), ltx_render(l_fat()))
+    assert_eq(ltx_lowered(Ref(ltx_display(), false)), ltx_render(l_fat()))
+    assert_eq(ltx_lowered(Weak(ltx_display())), ltx_render(l_fat()))
+
+@test("an array is its length and its element's lowering, not its element")
+ltx_array_element_lowering()
+    assert_eq(ltx_lowered(Array(3, Volatile(ltx_u8()))), ltx_render(LArr(3, LInt(8))))
+
+@test("a `va_list` is the four pointers' worth every ABI's bookkeeping fits inside")
+ltx_va_list()
+    assert_eq(ltx_lowered(VaList), ltx_render(LArr(4, LPtr)))
+
+@test("a declared struct is a name, because LLVM declares one once and refers to it afterwards")
+ltx_struct_named()
+    var fields: Buf[(string, Type)] = buf()
+
+    fields.push(("x", ltx_i32()))
+    fields.push(("y", ltx_i32()))
+
+    val s = Struct(StructType("Point", buf(), fields, false, None, None, false))
+
+    assert_eq(ltx_lowered(s), ltx_render(LNamed("%struct.Point")))
+
+// -- the four types with no representation say so rather than inventing one ----------------------
+
+@test("a type parameter")
+ltx_no_lowering_type_parameter()
+    assert_eq(ltx_lowered(Abstract("T", buf())), None)
+
+@test("a bare trait")
+ltx_no_lowering_bare_trait()
+    assert_eq(ltx_lowered(ltx_display()), None)
+
+@test("a value argument")
+ltx_no_lowering_value_argument()
+    assert_eq(ltx_lowered(ConstArg(from_int(3), ltx_usize(64))), None)
+
+@test("a type pack")
+ltx_no_lowering_type_pack()
+    var elems: Buf[Type] = buf()
+
+    elems.push(ltx_i32())
+    assert_eq(ltx_lowered(Pack(elems)), None)
+
+// -- one spelling ----------------------------------------------------------------------------------
+
+@test("`llvm` is `lty.render` and has no second opinion")
+ltx_llvm_is_render()
+    var cases: Buf[Type] = buf()
+
+    cases.push(ltx_u8())
+    cases.push(ltx_i32())
+    cases.push(Bool)
+    cases.push(Char)
+    cases.push(Unit)
+    cases.push(ltx_usize(64))
+    cases.push(Floating(64, false))
+    cases.push(VaList)
+    cases.push(Slice(ltx_u8(), false))
+    cases.push(Str)
+    cases.push(Ptr(ltx_i32()))
+    cases.push(Ref(ltx_display(), false))
+    cases.push(Array(2, ltx_u8()))
+    cases.push(Vector(4, Floating(32, false)))
+    cases.push(Volatile(ltx_i32()))
+    cases.push(CFn(buf(), Unit))
+
+    for t in cases
+        val lowered = type_lty(t, 64)
+
+        assert(lowered.is_some())
+        assert_eq(type_llvm(t, 64), Some(l_render(lowered.unwrap())))
+
+// -- the overload suffix is LLVM's intrinsic naming, not its type text ----------------------------
+
+@test("a float is numbered where its type text is named")
+ltx_suffix_float_numbered()
+    assert_eq(l_overload_suffix(LFloat(32, false)), Some("f32"))
+    assert_eq(l_overload_suffix(LFloat(64, false)), Some("f64"))
+    assert_eq(l_render(LFloat(32, false)), "float")
+
+@test("an integer agrees with its type text, and a mask's lane is i1")
+ltx_suffix_integer()
+    assert_eq(l_overload_suffix(LInt(32)), Some("i32"))
+    assert_eq(l_overload_suffix(LInt(1)), Some("i1"))
+
+@test("a vector prefixes its lane count, which is what a reduction is overloaded on")
+ltx_suffix_vector()
+    assert_eq(l_overload_suffix(LVec(4, LFloat(32, false))), Some("v4f32"))
+    assert_eq(l_overload_suffix(LVec(8, LInt(32))), Some("v8i32"))
+    assert_eq(l_overload_suffix(LVec(16, LInt(1))), Some("v16i1"))
+
+@test("an aggregate has none, because no intrinsic the compiler reaches takes one")
+ltx_suffix_aggregate_none()
+    assert_eq(l_overload_suffix(LStruct(l_one(LPtr))), None)
