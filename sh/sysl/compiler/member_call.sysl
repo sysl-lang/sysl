@@ -220,10 +220,9 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
         slots.unwrap().at(i) match
             Some(e) -> ts.push(type_expr(cx, e, Some(want)))
             None ->
-                val inner = analyzer_for(cx.an, member_default_scope(cx, fname))
+                val inner = default_reader(cx, span, member_default_scope(cx, fname), fname,
+                                           decl.bounds)
 
-                inner.reported = Some(span)
-                inner.here_src = caller_source(cx)
                 ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
 
     val refused = refused_argument(cx, span, s"'${qualified_name(found.0)}.$picked'", decl.params,
@@ -818,7 +817,7 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
 
     val own = if !written_args.is_empty() && mine.len() == m.tparams.len() then written_args
     else solve(cx.an, home, cx.scope, span, fd.name, m.tparams, param_refs, prov.tys, fd.ret_type, expected,
-               prov.soft, m.bounds, answered)
+               prov.soft, m.bounds, answered, left_to_default(slots.unwrap()))
 
     // An argument the solve could not read is said out loud rather than instantiated at, as it is
     // for a free function. **Only where saying it said something**: an unknown that no argument
@@ -890,10 +889,8 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
 
                 given.push(t)
             None ->
-                val inner = analyzer_for(cx.an, member_default_scope(cx, name))
+                val inner = default_reader(cx, span, member_default_scope(cx, name), name, m.bounds)
 
-                inner.reported = Some(span)
-                inner.here_src = caller_source(cx)
                 given.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
 
     val refused = refused_argument(cx, span, s"'$name'", m.params, slots.unwrap(), given, wants,
@@ -965,10 +962,8 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
         slots.unwrap().at(i) match
             Some(e) -> given.push(type_expr(cx, e, Some(want)))
             None ->
-                val inner = analyzer_for(cx.an, member_default_scope(cx, fname))
+                val inner = default_reader(cx, span, member_default_scope(cx, fname), fname, m.bounds)
 
-                inner.reported = Some(span)
-                inner.here_src = caller_source(cx)
                 given.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
 
     val refused = refused_argument(cx, span, s"'$fname'", m.params, slots.unwrap(), given, wants,
@@ -1723,7 +1718,7 @@ private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot:
                 val inner = analyzer_for(cx.an, scope)
 
                 inner.reported = Some(span)
-                inner.here_src = caller_source(cx)
+                inner.here = call_site(cx)
                 ts.push(type_expr(inner, m.params.at(i).default.unwrap(), want))
 
     val ret = if m.ret_type.is_some() then

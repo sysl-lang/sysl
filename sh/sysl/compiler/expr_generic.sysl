@@ -106,10 +106,8 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
         slots.at(i) match
             Some(e) -> ts.push(argument_at(cx, decl, i, e, want))
             None ->
-                val inner = analyzer_for(cx.an, f.scope)
+                val inner = default_reader(cx, span, f.scope, name, decl.bounds)
 
-                inner.reported = Some(span)
-                inner.here_src = caller_source(cx)
                 ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
 
     val refused = refused_argument(cx, span, s"'$written'", decl.params, slots, ts, wants, before)
@@ -279,7 +277,7 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
 
     val covered = enter_signature(cx.an, decl.needs)
     val targs = solve(cx.an, f.scope, cx.scope, span, key, decl.tparams, param_refs, prov.tys, decl.ret_type,
-                      expected, prov.soft, decl.bounds, known)
+                      expected, prov.soft, decl.bounds, known, left_to_default(slots))
 
     leave_reaching(cx.an, covered)
 
@@ -347,10 +345,8 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
                     if disagree(texpr_type(kept), want) then ts.push(coerce(cx, kept, want))
                     else ts.push(kept)
                 else
-                    val inner = analyzer_for(cx.an, f.scope)
+                    val inner = default_reader(cx, span, f.scope, name, decl.bounds)
 
-                    inner.reported = Some(span)
-                    inner.here_src = caller_source(cx)
                     ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
 
     val refused = refused_argument(cx, span, s"'$written'", decl.params, slots, ts, wants, before,
@@ -538,6 +534,16 @@ struct Provisional
     kept: Buf[Option[TExpr]]
 end Provisional
 
+// Which positions a call left to a parameter's default -- the literals among them are the last thing
+// `solve` consults, after every literal the call wrote.
+left_to_default(slots: Buf[Option[Expr]]) -> Buf[bool]
+    var out: Buf[bool] = buf()
+
+    for i in 0..<slots.len()
+        out.push(slots.at(i).is_none())
+
+    out
+
 // The reading itself, for a free function and for a member alike. `known` is what the caller
 // already settled -- a member's receiver answers the type's own parameters before an argument is
 // read -- and `expected` is what the call's own position asks for.
@@ -620,9 +626,17 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
     if sub.len() < tparams.len() && result.is_some() && expected.is_some() then
         unify(cx.an, scope, result.unwrap(), expected.unwrap(), tparams, &sub)
 
+    // **A literal the call WROTE outranks one it left to a default**, wherever the two stand: in
+    // `k[T](a: T = 1.5, b: T = 2)` called as `k(b = 3)`, the `3` settles `T = int` and it is the
+    // default that is then refused, never the argument the reader wrote.
     if sub.len() < tparams.len()
         for i in 0..<param_refs.len()
-            if i < tys.len() && soft.at(i) && tys.at(i) != Unknown then
+            if i < tys.len() && soft.at(i) && tys.at(i) != Unknown && slots.at(i).is_some() then
+                unify(cx.an, scope, param_refs.at(i), tys.at(i), tparams, &sub)
+
+    if sub.len() < tparams.len()
+        for i in 0..<param_refs.len()
+            if i < tys.len() && soft.at(i) && tys.at(i) != Unknown && slots.at(i).is_none() then
                 unify(cx.an, scope, param_refs.at(i), tys.at(i), tparams, &sub)
 
     // **By readiness rather than left to right**, so that a callable whose result settles what the
@@ -702,7 +716,7 @@ private arg_reader(cx: &Analyzer, span: Span, scope: Scope, from_default: bool) 
     val inner = analyzer_for(cx.an, scope)
 
     inner.reported = Some(span)
-    inner.here_src = caller_source(cx)
+    inner.here = call_site(cx)
     inner
 end arg_reader
 

@@ -1,0 +1,281 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A default may name its declaration's own type parameters, in type position and in value position:
+// an associated function (`T.zero()`), a conversion (`F(440.0)`), an annotation inside the default.
+// It is read at each call at the type that call solved from the arguments it wrote and the type its
+// position expects -- never the other way round, so a parameter only the default could settle is the
+// ordinary "cannot infer". It is still checked where it is written, against what the bound promises,
+// and it still may not name another parameter.
+
+private var tpd_library_cache: Buf[Program] = buf()
+private var tpd_library_read: bool = false
+
+private tpd_library() -> Buf[Program]
+    if tpd_library_read then return tpd_library_cache
+
+    tpd_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tpd_library_cache = units
+
+    tpd_library_cache
+end tpd_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private tpd_ready() -> bool
+    if tpd_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end tpd_ready
+
+private tpd_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a one-file program prints, built and run.
+private tpd_ran(text: string) -> string
+    val root = make_temp_dir("sysl-tparam-default").unwrap()
+    val exe = s"$root/built"
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tpd_ran
+
+// Everything a one-file program has to say for itself, taken through the lowering.
+private tpd_err(text: string) -> string
+    val root = make_temp_dir("sysl-tparam-default").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tpd_err
+
+// -- read at the type the call solved -------------------------------------------------------------
+
+@test("a default of 'T.zero()' and of 'T(2.0)' is read at real and at int")
+tpd_zero_and_conversion_at_real_and_int()
+    if !tpd_ready() then return
+
+    assert_eq(tpd_ran(raw"""
+        f[T: Zero + Add](x: T, step: T = T.zero()) -> T = x + step
+        g[T](x: T, step: T = T(2.0)) -> T = step
+        print(f(1.5))
+        print(f(3))
+        print(g(1.0))
+        print(g(7))
+        """), "1.5\n3\n2\n2\n")
+
+@test("a default of 'F(440.0)' is read at f32 and at f64")
+tpd_conversion_at_f32_and_f64()
+    if !tpd_ready() then return
+
+    assert_eq(tpd_ran(raw"""
+        import sysl.math.Float
+
+        note_of[F: Float](f: F, a4: F = F(440.0)) -> F = a4 * f
+        val half: f32 = 0.5
+        val narrow: f32 = note_of(half)
+        print(narrow)
+        print(note_of(2.0))
+        """), "220\n880\n")
+
+@test("a default may write 'T' where a type is written inside it")
+tpd_type_position_inside_the_default()
+    if !tpd_ready() then return
+
+    assert_eq(tpd_ran(raw"""
+        width_of[T](x: T, w: usize = sizeof(T)) -> usize = w
+        val b: u8 = 9
+        print(width_of(b))
+        print(width_of(1.5))
+        print(width_of(b, 5))
+        """), "1\n8\n5\n")
+
+@test("a generic struct's method reads 'T.zero()' at the receiver's argument, a generic method at its own")
+tpd_struct_and_generic_method_defaults()
+    if !tpd_ready() then return
+
+    assert_eq(tpd_ran(raw"""
+        struct Acc[T: Zero + Add]
+            v: T
+
+            plus(self, by: T = T.zero()) -> T = self.v + by
+        end Acc
+
+        struct Holder
+            n: int
+
+            pick[T: Zero](self, x: T, d: T = T.zero()) -> T = d
+        end Holder
+
+        val b: u8 = 41
+        print(Acc(b).plus())
+        print(Acc(2.5).plus(1.0))
+        print(Holder(1).pick(7))
+        print(Holder(1).pick(7, 3))
+        """), "41\n3.5\n0\n3\n")
+
+// The reference's `ArgumentTests` "a generic struct's method may name the struct's parameter": a
+// generic method's own `U` and the struct's `T` in one parameter list, each read at its own solution.
+@test("a generic struct's generic method reads its own parameter and the struct's")
+tpd_struct_method_names_both_parameters()
+    if !tpd_ready() then return
+
+    assert_eq(tpd_ran(raw"""
+        struct Acc[T: Zero + Add]
+            v: T
+
+            plus(self, by: T = T.zero()) -> T = self.v + by
+            mix[U: Add](self, u: U, extra: U = U(1.5), base: T = T(2.5)) -> U = u + extra
+        end Acc
+
+        print(Acc(2.5).plus())
+        print(Acc(4).plus())
+        print(Acc(4).plus(5))
+        print(Acc(4).mix(1.0))
+        print(Acc(4).mix(1))
+        """), "2.5\n4\n9\n2.5\n2\n")
+
+@test("an associated function of a generic type reads the type's parameter")
+tpd_generic_type_associated_function()
+    if !tpd_ready() then return
+
+    assert_eq(tpd_ran(raw"""
+        struct Acc[T: Zero]
+            v: T
+
+            start(v: T = T.zero()) -> Acc[T] = Acc(v)
+        end Acc
+
+        val a: Acc[real] = Acc.start()
+        print(a.v)
+        print(Acc.start(3).v)
+        """), "0\n3\n")
+
+// The callee's `T`, never the caller's: `g` is generic over a `T` of its own, a `string` here, and the
+// default it fills for `f` is read at the `int` that `f(5)` settles.
+@test("the parameter is the callee's even inside a caller generic over a 'T' of its own")
+tpd_callee_parameter_inside_a_generic_caller()
+    if !tpd_ready() then return
+
+    assert_eq(tpd_ran(raw"""
+        f[T: Zero + Add](x: T, y: T = T.zero()) -> T = x + y
+        g[T](t: T) -> int = f(5)
+        print(g("s"))
+        """), "5\n")
+
+@test("a default is evaluated only by a call that takes it, once each")
+tpd_evaluated_once_per_call_that_takes_it()
+    if !tpd_ready() then return
+
+    assert_eq(tpd_ran(raw"""
+        loud[T](v: T) -> T
+            print("filled")
+            v
+
+        f[T: Zero](x: T, y: T = loud(T.zero())) -> T = y
+        print(f(1, 2))
+        print(f(3))
+        print(f(4.5))
+        """), "2\nfilled\n0\nfilled\n0\n")
+
+@test("an argument written at the defaulted parameter stands instead of the default")
+tpd_written_argument_overrides()
+    if !tpd_ready() then return
+
+    assert_eq(tpd_ran(raw"""
+        import sysl.math.Float
+
+        f[T: Zero + Add](x: T, step: T = T.zero()) -> T = x + step
+        note_of[F: Float](f: F, a4: F = F(440.0)) -> F = a4 * f
+        print(f(1.5, 2.0))
+        print(f(3, step = 4))
+        print(note_of(2.0, 100.0))
+        """), "3.5\n7\n200\n")
+
+@test("the expected type settles a parameter only the default names")
+tpd_expected_type_settles_it()
+    if !tpd_ready() then return
+
+    assert_eq(tpd_ran(raw"""
+        h[T: Zero](step: T = T.zero()) -> T = step
+        val n: u8 = h()
+        print(n)
+        """), "0\n")
+
+// -- what is still refused -------------------------------------------------------------------------
+
+// The default does not drive the solve: it cannot be read until `T` is known, so a call that says
+// nothing else about `T` is the ordinary refusal, at the call.
+@test("a parameter only the default could settle is refused at the call as one nothing infers")
+tpd_unsolved_parameter_refused()
+    if !tpd_ready() then return
+
+    val said = tpd_err(raw"""
+        h[T: Zero](step: T = T.zero()) -> T = step
+        print(h())
+        """)
+
+    assert(tpd_says(said, "cannot infer the type argument 'T' of 'h' here — annotate the expected " +
+                    "type"), said)
+    assert(tpd_says(said, "2:7"), said)
+
+@test("a default may still not name another parameter, even through a conversion")
+tpd_other_parameter_refused()
+    if !tpd_ready() then return
+
+    val said = tpd_err(raw"""
+        f[T: Zero](x: T, step: T = T(x)) -> T = step
+        print(f(1))
+        """)
+
+    assert(tpd_says(said, "undefined name 'x'"), said)
+
+@test("a default using a member the bound does not promise is refused where it is written")
+tpd_missing_bound_refused()
+    if !tpd_ready() then return
+
+    val said = tpd_err(raw"""
+        k[T](x: T, step: T = T.zero()) -> T = step
+        """)
+
+    assert(tpd_says(said, "'zero' needs 'T: sysl.Zero'"), said)
+    assert(tpd_says(said, "1:24"), said)
+    assert(!tpd_says(said, "undefined name 'T'"), said)

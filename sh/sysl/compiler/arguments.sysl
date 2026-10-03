@@ -313,6 +313,23 @@ fill_default(cx: &Analyzer, span: Span, owner: string, scope: Scope, p: Param, w
 fill_nested_default(cx: &Analyzer, span: Span, owner: string, p: Param, want: Type) -> TExpr =
     fill_default_in(cx, span, owner, cx.scope, p, want, true)
 
+// Who reads a default a call to an INSTANTIATION left out: an analyzer in the declaration's own terms,
+// with the declaration's type parameters standing for what this call fixed them to
+// (`reference/declarations.md § Default parameters and named arguments`). So `step: T = T.zero()` is
+// `int.zero()` at a call that settled `T` to `int`, and `a4: F = F(440.0)` an `f32` at one that
+// settled `F` to `f32`. The bounds go with them, being what says which trait's member a name on a
+// type parameter meant. Nothing local is in scope, the call's or the declaration's.
+default_reader(cx: &Analyzer, span: Span, scope: Scope, inst: string,
+               bounds: Buf[NamedBounds]) -> &Analyzer
+    val inner = analyzer_for(cx.an, scope)
+
+    inner.reported = Some(span)
+    inner.here = call_site(cx)
+    inner.subst = cx.an.tables.members.func_substs.get(inst).unwrap_or(buf())
+    inner.tbounds = bounds
+    inner
+end default_reader
+
 private fill_default_in(cx: &Analyzer, span: Span, owner: string, scope: Scope, p: Param, want: Type,
                         carry: bool) -> TExpr
     if holds_string(cx.an.defaults_filling, owner)
@@ -324,7 +341,7 @@ private fill_default_in(cx: &Analyzer, span: Span, owner: string, scope: Scope, 
     val inner = analyzer_for(cx.an, scope)
 
     inner.reported = Some(span)
-    inner.here_src = caller_source(cx)
+    inner.here = call_site(cx)
 
     if carry then carry_declares(cx, inner)
 

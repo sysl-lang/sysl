@@ -372,7 +372,7 @@ end holds_string
 solve(a: &Analysis, scope: Scope, site: Scope, span: Span, what: string, tparams: Buf[string],
       param_refs: Buf[TypeRef], arg_tys: Buf[Type], result_ref: Option[TypeRef],
       expected: Option[Type], soft: Buf[bool], bounds: Buf[NamedBounds],
-      known: Buf[Binding]) -> Buf[Type]
+      known: Buf[Binding], defaulted: Buf[bool] = buf()) -> Buf[Type]
     var sub: Buf[Binding] = buf()
 
     for i in 0..<known.len()
@@ -385,9 +385,18 @@ solve(a: &Analysis, scope: Scope, site: Scope, span: Span, what: string, tparams
     if sub.len() < tparams.len() && result_ref.is_some() && expected.is_some() then
         unify(a, scope, result_ref.unwrap(), expected.unwrap(), tparams, &sub)
 
+    // `defaulted` marks the positions a call left to a parameter's default, and among the literals
+    // the ones the call WROTE go first: in `k[T](a: T = 1.5, b: T = 2)` called as `k(b = 3)`, the `3`
+    // settles `T = int` and it is the default that is then refused, never the argument the reader
+    // wrote. A default literal settles a parameter only where nothing else said anything.
     if sub.len() < tparams.len()
         for i in 0..<param_refs.len()
-            if i < arg_tys.len() && is_soft(soft, i) then
+            if i < arg_tys.len() && is_soft(soft, i) && !is_soft(defaulted, i) then
+                unify(a, scope, param_refs.at(i), arg_tys.at(i), tparams, &sub)
+
+    if sub.len() < tparams.len()
+        for i in 0..<param_refs.len()
+            if i < arg_tys.len() && is_soft(soft, i) && is_soft(defaulted, i) then
                 unify(a, scope, param_refs.at(i), arg_tys.at(i), tparams, &sub)
 
     // **What a callable argument yields is read back off the closure**, which is the other half of a
@@ -401,7 +410,17 @@ solve(a: &Analysis, scope: Scope, site: Scope, span: Span, what: string, tparams
     if sub.len() < tparams.len() then solve_from_callables(a, scope, tparams, bounds, &sub)
 
     var out: Buf[Type] = buf()
-    val poisoned = mentions_unknown_any(arg_tys) ||
+    // **A default is not one of the things that can poison the solve.** It was checked where it was
+    // written, so a mistake in it has been told there; and one that names the declaration's own type
+    // parameters (`step: T = T.zero()`) cannot be read until they are solved, so its provisional
+    // reading is refused for a reason that is no mistake at all. Counted here it would silence the
+    // one thing wrong with `f()`, which is that nothing says what `T` is.
+    var written_tys: Buf[Type] = buf()
+
+    for i in 0..<arg_tys.len()
+        if !is_soft(defaulted, i) then written_tys.push(arg_tys.at(i))
+
+    val poisoned = mentions_unknown_any(written_tys) ||
                    (expected.is_some() && mentions_unknown(expected.unwrap()))
 
     for i in 0..<tparams.len()
@@ -531,6 +550,7 @@ instantiate_func(a: &Analysis, home: Scope, f: FuncDecl, solved: Buf[Type], cons
 
     leave_reaching(a, covered)
     a.tables.members.func_insts.put(name, FuncSig(params, ret))
+    a.tables.members.func_substs.put(name, subst)
     a.tables.members.pending.push(PendingInst(name, f, subst, home))
     name
 end instantiate_func
