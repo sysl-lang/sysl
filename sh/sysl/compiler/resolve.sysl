@@ -82,7 +82,37 @@ struct ResolveState
     // What this round takes as enabled, which decides which optional dependencies each manifest is
     // read with (`pruned_manifest`). A package no round has reached has nothing turned on.
     enabled: Buf[(string, Buf[string])]
+
+    // Every `--lib` source root that is a directory, with what its manifest says: the candidates to
+    // stand in for a coordinate (`stand_in_for`).
+    roots: Buf[(string, Manifest)]
 end ResolveState
+
+// The `--lib` root that **is** the package `dep` names, where one is -- in which case that coordinate
+// is never selected, fetched or read, anywhere in the graph (`reference/packages.md § A source root
+// stands in for the package it is`). Cargo's `[patch]` and Go's `replace`, as one flag.
+//
+// **A root is that package when its `package.name` is the coordinate's repository name** -- the last
+// segment of the path, a major-version suffix set aside, so `github.com/e/json/v2` is `json`. That is
+// the one identity both sides state without anything being fetched: the coordinate names a
+// repository, and a checkout of it -- a clone, a worktree, a fork -- carries that repository's
+// manifest. Comparing modules instead would need the coordinate's tree, which is the very fetch an
+// override exists to avoid; and the dependency's *label* is a name the consumer chose, which two
+// manifests may spell differently, so the answer would depend on which edge the walk read first.
+//
+// A function of the coordinate alone, so every edge naming it gets the same answer.
+private stand_in_for(state: &ResolveState, dep: &Dependency) -> Option[(string, Manifest)]
+    val coordinate = dependency_coordinate(dep) match
+        None -> return None
+        Some(c) -> c
+
+    val repository = repository_name(coordinate)
+
+    for i in 0..<state.roots.len()
+        if state.roots.at(i).1.name == repository then return Some(state.roots.at(i))
+
+    None
+end stand_in_for
 
 // A manifest that has been read, and where it was read from. The coordinate is the empty string for
 // a package that arrived as a directory, which has none.
@@ -142,7 +172,8 @@ end resolve_graph
 private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string,
                      enabled: Buf[(string, Buf[string])]) -> Result[Graph, string]
     val config = pruned_manifest(written, enabled, "")
-    var state = ResolveState(buf(), buf(), buf(), buf(), sums, false, enabled)
+    val roots = root_packages()?
+    var state = ResolveState(buf(), buf(), buf(), buf(), sums, false, enabled, roots)
 
     read_locals(config.dependencies, &state, cache)?
     demanding(&state, root_asker(config), config.dependencies)
@@ -157,10 +188,8 @@ private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string
     for i in 0..<config.dependencies.len()
         declared.push(config.dependencies.at(i))
 
-    val roots = root_manifests()?
-
     for i in 0..<roots.len()
-        val theirs = roots.at(i).dependencies
+        val theirs = roots.at(i).1.dependencies
 
         read_locals(theirs, &state, cache)?
         demanding(&state, root_asker(config), theirs)
@@ -244,6 +273,9 @@ end check_floors
 // graph can only ever find the one that won, which is the half nobody needed to be told.
 private demanding(state: *ResolveState, asker: string, deps: &Buf[Dependency])
     for i in 0..<deps.len()
+        // A coordinate a source root stands in for takes no part in selection at all.
+        if stand_in_for(*state, deps.at(i)).is_some() then continue
+
         deps.at(i).origin match
             Local(_) -> ()
             Git(coordinate, version) ->
@@ -340,20 +372,20 @@ private already_local(state: &ResolveState, dep: &Dependency) -> bool
     false
 end already_local
 
-// The manifest of every `--lib` source root that is a directory, in the order the roots were given,
+// Every `--lib` source root that is a directory and its manifest, in the order the roots were given,
 // each `path` read against the root's own directory. A root with no manifest answers the empty one,
 // which depends on nothing; an artifact is not a root and is refused where roots are read.
-root_manifests() -> Result[Buf[Manifest], string]
-    var out: Buf[Manifest] = buf()
+root_packages() -> Result[Buf[(string, Manifest)], string]
+    var out: Buf[(string, Manifest)] = buf()
     val libs = lib_roots()
 
     for i in 0..<libs.len()
         if !is_directory(libs.at(i)) then continue
 
-        out.push(manifest_of_package(libs.at(i))?)
+        out.push((libs.at(i), manifest_of_package(libs.at(i))?))
 
     Ok(out)
-end root_manifests
+end root_packages
 
 // Whether a build has a graph to resolve at all: the project's own `dependencies`, or a source
 // root's.
@@ -508,25 +540,59 @@ private table_of(owner: string, owner_root: string, deps: &Buf[Dependency],
 end table_of
 
 // The names a manifest's own `dependencies` block binds, which is what it wrote down.
+//
+// **A coordinate a `--lib` root stands in for binds that root's modules, under the names they
+// already have** -- the root's files are filed under the project's own names, so the module a
+// dependency's source writes as `geom` is the project's `geom` and nothing else. A mount still renames
+// it for the manifest that wrote one. The root is left out of the collision check against itself,
+// since being that package is exactly what it was asked to be; every other root and every other
+// dependency is still checked as before.
 private declared_table(owner: string, owner_root: string, deps: &Buf[Dependency],
                        state: &ResolveState) -> Result[Buf[MountedName], string]
     var table: Buf[MountedName] = buf()
 
     for i in 0..<deps.len()
         val dep = deps.at(i)
-        val dir = their_root(dep, state)?
-        val added = bindings_of(dep, dir) match
-            Err(why) -> return Err(s"$owner: $why")
-            Ok(got) -> got
+        val standing = stand_in_for(state, dep)
+        val standing_dir = if standing.is_some() then standing.unwrap().0 else ""
+
+        val added = if standing.is_some() then stand_in_bindings(dep, standing_dir)
+        else declared_bindings(owner, dep, state)?
 
         for j in 0..<added.len()
-            no_collision(owner, owner_root, table, added.at(j).written, dep)?
+            no_collision(owner, owner_root, table, added.at(j).written, dep, standing_dir)?
 
         for j in 0..<added.len()
             table.push(added.at(j))
 
     Ok(table)
 end declared_table
+
+// What a dependency the build selected or read binds, from the tree it was settled on.
+private declared_bindings(owner: string, dep: &Dependency,
+                          state: &ResolveState) -> Result[Buf[MountedName], string]
+    val dir = their_root(dep, state)?
+
+    bindings_of(dep, dir) match
+        Err(why) -> Err(s"$owner: $why")
+        Ok(got) -> Ok(got)
+end declared_bindings
+
+// What a stood-in coordinate binds: each of the root's modules as itself, or under the mount.
+private stand_in_bindings(dep: &Dependency, dir: string) -> Buf[MountedName]
+    var out: Buf[MountedName] = buf()
+    val owner = dependency_canonical(dep)
+    val modules = package_modules(dir)
+
+    for i in 0..<modules.len()
+        val m = modules.at(i)
+
+        dep.mount match
+            Some(mount) -> out.push(MountedName(package_qualify(mount, m), m, owner))
+            None -> out.push(MountedName(m, m, owner))
+
+    out
+end stand_in_bindings
 
 // Every package reachable through the ones a manifest named, minus those it named itself.
 //
@@ -561,6 +627,20 @@ private inherited(deps: &Buf[Dependency], state: &ResolveState) -> Result[Buf[De
         if already then continue
 
         seen.push(canonical)
+
+        // A coordinate a source root stands in for offers nothing of its own to inherit -- the root's
+        // modules are already the project's -- but what the root depends on is still reached through
+        // it, exactly as the coordinate's own dependencies would have been.
+        val standing = stand_in_for(state, dep)
+
+        if standing.is_some()
+            val root_deps = standing.unwrap().1.dependencies
+
+            for i in 0..<root_deps.len()
+                queue.push(root_deps.at(i))
+
+            continue
+        end if
 
         val theirs = their_manifest(dep, state)?
 
@@ -710,8 +790,15 @@ end bindings_of
 // `sh.sysl` and offer `sh.sysl.sqlite` and `sh.sysl.linenoise` do not collide, because no import
 // line can be read as either. The names they share are `sh` and `sh.sysl`, and neither package
 // declares those -- a directory holding no source is not a module.
+//
+// **A root that IS the coordinate's package never collides with it**: it stands in for the
+// coordinate (`stand_in_for`), which is then neither fetched nor bound, so its modules are the only
+// ones by those names -- `standing` names it, and it is left out here. That is an explicit request,
+// the reader having named the directory, and not the silent winner this refuses. What still arrives
+// is a root that merely *holds* a module some coordinate also offers without being that package, and
+// that is refused exactly as before, with a clause saying what would have made it an override.
 private no_collision(owner: string, owner_root: string, table: &Buf[MountedName], local: string,
-                     dep: &Dependency) -> Result[unit, string]
+                     dep: &Dependency, standing: string) -> Result[unit, string]
     val mine = dependency_canonical(dep)
 
     for i in 0..<table.len()
@@ -735,10 +822,19 @@ private no_collision(owner: string, owner_root: string, table: &Buf[MountedName]
     // And a source root's, which are filed under the project's names rather than under a prefix of
     // their own: a root declaring `geom` beside a dependency offering `geom` is the same collision,
     // named by the root as the command line wrote it.
-    root_claiming(owner, local) match
+    //
+    // A source root colliding with a coordinate is the case an override is for, so the refusal says
+    // what would have made it one: the reader may have meant exactly that.
+    root_claiming(owner, local, standing) match
         Some(given) ->
+            val override_clause = dependency_coordinate(dep) match
+                Some(coordinate) ->
+                    ". A source root stands in for a coordinate only when it is that package — when " +
+                    s"its $ManifestName names it '${repository_name(coordinate)}'"
+                None -> ""
+
             Err(s"$owner: '$local' is both a module of the source root '$given' and one $mine " +
-                "offers — give the dependency a 'mount' to say what it is called here")
+                "offers — give the dependency a 'mount' to say what it is called here" + override_clause)
         None -> Ok(())
 end no_collision
 
@@ -748,12 +844,17 @@ end no_collision
 // **Only the project's table**, because a root's modules sit in the project's name space and in
 // nobody else's: a package's own files read a written path through their own tree and their own
 // manifest first, so what a root declares is no claim against them.
-private root_claiming(owner: string, local: string) -> Option[string]
+//
+// `standing` is a root that stands in for the dependency being bound, which is that package rather
+// than a claim against it, so it is passed over.
+private root_claiming(owner: string, local: string, standing: string = "") -> Option[string]
     if owner != ManifestName then return None
 
     val libs = lib_roots()
 
     for i in 0..<libs.len()
+        if !standing.is_empty() && libs.at(i) == standing then continue
+
         val theirs = package_modules(libs.at(i))
 
         for j in 0..<theirs.len()
