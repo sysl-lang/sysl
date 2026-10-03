@@ -1,0 +1,508 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The run-time behaviour of trait defaults (`reference/traits.md`): a trait method written with a
+// body is a definition every `impl` inherits unless it writes its own, and what the body may assume
+// of its receiver is exactly what the trait declares.
+//
+// The default is materialized per implementing type, so these check what materializing is for: two
+// types inheriting one default each run it against their own methods, and a type that overrides it
+// runs its own body instead.
+//
+// **Every output quoted here was read out of the reference compiler**, whose `TraitDefaultRunTests`
+// these are.
+
+private var tdr_library_cache: Buf[Program] = buf()
+private var tdr_library_read: bool = false
+
+private tdr_library() -> Buf[Program]
+    if tdr_library_read then return tdr_library_cache
+
+    tdr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tdr_library_cache = units
+
+    tdr_library_cache
+end tdr_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private tdr_ready() -> bool
+    if tdr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end tdr_ready
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private tdr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-trait-default").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tdr_ran
+
+// ---------------------------------------------------------------------------------------------
+// A receiverless member carries a default like any other: a constant needs nothing, and one calling
+// `Self.width()` has as much to work on as any method.
+
+@test("a receiverless member may carry a default, which an implementation inherits")
+tdr_a_receiverless_member_may_carry_a_default()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Endian
+            little() -> bool = false
+            width() -> usize
+        struct Big
+        end Big
+        impl Endian for Big
+            width() -> usize = 4
+        show[E: Endian]() = print(E.little(), E.width())
+        show[Big]()
+        """), "false 4\n")
+
+@test("and an implementation that wants its own says 'override'")
+tdr_a_receiverless_override()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Endian
+            little() -> bool = false
+            width() -> usize
+        struct Big
+        end Big
+        struct Small
+        end Small
+        impl Endian for Big
+            width() -> usize = 4
+        impl Endian for Small
+            override little() -> bool = true
+            width() -> usize = 8
+        show[E: Endian]() = print(E.little(), E.width())
+        show[Big]()
+        show[Small]()
+        """), "false 4\ntrue 8\n")
+
+// A receiverless body may name the trait's other members through `Self`, and is materialized per
+// implementing type so each answers its own.
+@test("whose body may reach the trait's other members through 'Self'")
+tdr_a_receiverless_default_reaches_self()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Sized
+            width() -> usize
+            doubled() -> usize = Self.width() * 2
+        struct Word
+        end Word
+        struct Half
+        end Half
+        impl Sized for Word
+            width() -> usize = 4
+        impl Sized for Half
+            width() -> usize = 2
+        show[T: Sized]() = print(T.width(), T.doubled())
+        show[Word]()
+        show[Half]()
+        """), "4 8\n2 4\n")
+
+// A default is reached through the type as an inherent member too, not only through a bound --
+// which is what says it was hoisted onto the type rather than resolved at the bound.
+@test("and the default is the type's own member afterwards")
+tdr_a_receiverless_default_is_the_types_own_member()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Endian
+            little() -> bool = false
+        struct Big
+        end Big
+        impl Endian for Big
+        print(Big.little())
+        """), "false\n")
+
+// ---------------------------------------------------------------------------------------------
+// Inheriting.
+
+@test("an impl may leave out a method the trait supplies a body for")
+tdr_an_impl_may_leave_out_a_defaulted_method()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = "hello, " + self.name()
+        struct Cat
+            n: string
+        impl Greet for Cat
+            name(self) -> string = self.n
+        var c = Cat("mog")
+        print(c.greet())
+        """), "hello, mog\n")
+
+// The default is one body, but it runs against each type's own required method -- so the two
+// results have to differ, which a single shared function could not produce.
+@test("two types inheriting one default each reach their own method")
+tdr_two_types_inheriting_one_default()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = "hello, " + self.name()
+        struct Cat
+            n: string
+        struct Dog
+            n: string
+        impl Greet for Cat
+            name(self) -> string = self.n
+        impl Greet for Dog
+            name(self) -> string = self.n + " the dog"
+        var c = Cat("mog")
+        var d = Dog("rex")
+        print(c.greet())
+        print(d.greet())
+        """), "hello, mog\nhello, rex the dog\n")
+
+@test("an impl that writes the method itself runs its own body")
+tdr_an_impl_that_writes_the_method_runs_its_own()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = "hello, " + self.name()
+        struct Cat
+            n: string
+        struct Dog
+            n: string
+        impl Greet for Cat
+            name(self) -> string = self.n
+        impl Greet for Dog
+            name(self) -> string = self.n
+            override greet(self) -> string = "woof from " + self.n
+        var c = Cat("mog")
+        var d = Dog("rex")
+        print(c.greet())
+        print(d.greet())
+        """), "hello, mog\nwoof from rex\n")
+
+@test("a default takes parameters and returns a value like any other method")
+tdr_a_default_takes_parameters()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Scale
+            unit(self) -> int
+            by(self, k: int, plus: int) -> int = self.unit() * k + plus
+        struct Box
+            n: int
+        impl Scale for Box
+            unit(self) -> int = self.n
+        var b = Box(7)
+        print(b.by(3, 2))
+        """), "23\n")
+
+@test("a default may be an indented block with locals and control flow")
+tdr_a_default_may_be_an_indented_block()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Steps
+            limit(self) -> int
+            total(self) -> int
+                var sum = 0
+                for i in 1..self.limit() do sum += i
+                sum
+        struct N
+            k: int
+        impl Steps for N
+            limit(self) -> int = self.k
+        print(N(4).total(), N(1).total(), N(0).total())
+        """), "10 1 0\n")
+
+// A default calling a default is the case that says the materialized copies are wired to each
+// other and not to the trait's abstract form, which has no body to run.
+@test("a default may call another default")
+tdr_a_default_may_call_another_default()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Chain
+            base(self) -> int
+            twice(self) -> int = self.base() * 2
+            quad(self) -> int = self.twice() * 2
+        struct V
+            n: int
+        impl Chain for V
+            base(self) -> int = self.n
+        print(V(3).quad())
+        """), "12\n")
+
+// A trait every method of which has a default leaves a conforming type nothing to write, so the
+// block is optional -- the `impl` line alone is the opt-in.
+@test("a trait may be all defaults, with nothing left for an impl to supply")
+tdr_a_trait_may_be_all_defaults()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Zero
+            zero(self) -> int = 0
+        struct E
+            n: int
+        impl Zero for E
+        print(E(9).zero())
+        """), "0\n")
+
+@test("an impl with no block still opts in, so a bound accepts the type")
+tdr_an_impl_with_no_block_still_opts_in()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Zero
+            zero(self) -> int = 0
+        struct E
+            n: int
+        impl Zero for E
+        end E
+        nothing[T: Zero](x: T) -> int = x.zero()
+        print(nothing(E(9)))
+        """), "0\n")
+
+// ---------------------------------------------------------------------------------------------
+// Receivers. A default reaches its receiver's *methods* and never its layout, so mutating through
+// `*self` goes through one the trait declares.
+
+@test("a '*self' default mutates through a method the trait declares")
+tdr_a_pointer_self_default_mutates()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Bump
+            step(self) -> int
+            add(*self, k: int)
+            bump(*self) = self.add(self.step())
+        struct C
+            n: int
+        impl Bump for C
+            step(self) -> int = 5
+            add(*self, k: int)
+                self.n += k
+        var c = C(1)
+        c.bump()
+        c.bump()
+        print(c.n)
+        """), "11\n")
+
+@test("a '&self' default reads through the reference")
+tdr_a_ref_self_default_reads_through_the_reference()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Sized
+            width(&self) -> int
+            area(&self) -> int = self.width() * self.width()
+        struct S
+            w: int
+        impl Sized for S
+            width(&self) -> int = self.w
+        var s: &S = S(6)
+        print(s.area())
+        """), "36\n")
+
+// ---------------------------------------------------------------------------------------------
+// Reaching a default. A bound looks the method up in the trait, which is where the default lives.
+
+@test("a bounded generic calls a default on a type that inherited it")
+tdr_a_bounded_generic_calls_an_inherited_default()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = "hi " + self.name()
+        struct Cat
+            n: string
+        struct Dog
+            n: string
+        impl Greet for Cat
+            name(self) -> string = self.n
+        impl Greet for Dog
+            name(self) -> string = self.n
+            override greet(self) -> string = "yo " + self.n
+        announce[T: Greet](x: T) -> string = x.greet()
+        print(announce(Cat("mog")))
+        print(announce(Dog("rex")))
+        """), "hi mog\nyo rex\n")
+
+@test("a raw trait object dispatches to an inherited default")
+tdr_a_raw_trait_object_dispatches_to_a_default()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = "hi " + self.name()
+        struct Cat
+            n: string
+        struct Dog
+            n: string
+        impl Greet for Cat
+            name(self) -> string = self.n
+        impl Greet for Dog
+            name(self) -> string = self.n
+            override greet(self) -> string = "yo " + self.n
+        say(g: *Greet) = print(g.greet())
+        var c = Cat("mog")
+        var d = Dog("rex")
+        say(&c)
+        say(&d)
+        """), "hi mog\nyo rex\n")
+
+@test("a counted trait object dispatches to an inherited default")
+tdr_a_counted_trait_object_dispatches_to_a_default()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = "hi " + self.name()
+        struct Cat
+            n: string
+        impl Greet for Cat
+            name(self) -> string = self.n
+        var g: &Greet = Cat("mog")
+        print(g.greet())
+        """), "hi mog\n")
+
+// A built-in has no module to write an `impl` in, so its memberships are the trait's to license --
+// and a default is materialized for one exactly as it is for a struct.
+@test("a built-in may inherit a default")
+tdr_a_built_in_may_inherit_a_default()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = "hi " + self.name()
+        impl Greet for int
+            name(self) -> string = str(self)
+        print(7.greet())
+        """), "hi 7\n")
+
+@test("a default may return Self")
+tdr_a_default_may_return_self()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Dup
+            scale(self, k: int) -> Self
+            twice(self) -> Self = self.scale(2)
+        struct V
+            n: int
+        impl Dup for V
+            scale(self, k: int) -> Self = V(self.n * k)
+        print(V(5).twice().n)
+        """), "10\n")
+
+// Declarations are hoisted, so the trait a default lives in may be written after the `impl` that
+// inherits it.
+@test("an impl may precede the trait whose default it inherits")
+tdr_an_impl_may_precede_its_trait()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        struct Cat
+            n: string
+        impl Greet for Cat
+            name(self) -> string = self.n
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = "hi " + self.name()
+        print(Cat("mog").greet())
+        """), "hi mog\n")
+
+@test("a default reaches a type's own inherent members, not just the trait's")
+tdr_a_default_reaches_inherent_members()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Total
+            each(self) -> int
+            total(self) -> int = self.each() * 10
+        struct P
+            n: int
+            doubled -> int = self.n * 2
+        impl Total for P
+            each(self) -> int = self.doubled
+        print(P(3).total())
+        """), "60\n")
+
+// ---------------------------------------------------------------------------------------------
+// Ownership. A default that builds a string is a fresh owned value per call, and the materialized
+// copy carries the same counting work a written method does.
+
+@test("a default returning a string neither leaks nor frees twice")
+tdr_a_default_returning_a_string_is_owned_once()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = "hello, " + self.name() + "!"
+        struct Cat
+            n: string
+        impl Greet for Cat
+            name(self) -> string = self.n
+        var c = Cat("mog")
+        var total = 0usize
+        for i in 1..200000
+            var s = c.greet()
+            total += s.len
+        print(total)
+        """), "2200000\n")
+
+@test("a default may render its receiver through Display")
+tdr_a_default_may_render_through_display()
+    if !tdr_ready() then return
+
+    assert_eq(tdr_ran(raw"""
+        trait Label
+            tag(self) -> int
+            label(self) -> string = "#" + str(self.tag())
+        struct T
+            n: int
+        impl Label for T
+            tag(self) -> int = self.n
+        print(T(42).label())
+        """), "#42\n")
