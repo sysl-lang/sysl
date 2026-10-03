@@ -1,0 +1,674 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, str_builder}
+
+// `sysl.posix.threads` -- starting a thread, waiting for one, and the lock that owns what it
+// protects. These are the programs in which a sysl program has two threads in it, so the per-thread
+// reaper worklist, the lock and the atomic reference count stop being claims about emitted text.
+//
+// A concurrency test that passes proves less than an ordinary one: a lock that did nothing would
+// still give the right total on a short enough loop, so the contended counts are long enough that a
+// missing lock loses increments in practice. The orderings cannot be established by running at all,
+// so they are read out of the emitted text.
+//
+// **Every output and diagnostic here was read out of the reference compiler (0.0.159)**, by handing
+// the installed `sysl` the same program; the IR lines are its `emit-llvm`.
+
+private var thx_library_cache: Buf[Program] = buf()
+private var thx_library_read: bool = false
+
+private thx_library() -> Buf[Program]
+    if thx_library_read then return thx_library_cache
+
+    thx_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> thx_library_cache = units
+
+    thx_library_cache
+end thx_library
+
+private thx_no_library() -> bool
+    if thx_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end thx_no_library
+
+private thx_importing() -> string = "import sysl.sync.*\nimport sysl.posix.threads.*\n\n"
+
+// The LLVM text of a one-file program, lowered the way the driver lowers it.
+private thx_ir(text: string) -> string
+    var units: Buf[Program] = buf()
+    val library = thx_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    val parsed = parse(source_of("main.sysl", thx_importing() + text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty()
+        var said = str_builder()
+
+        for i in 0..<done.reported.len()
+            said.push(done.reported.at(i).diag.message)
+            said.push("\n")
+
+        return said.finish()
+    end if
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end thx_ir
+
+// What a program built from these files does: what it printed, and whether it built, ran and exited
+// zero. A refused build answers the driver's whole report.
+private thx_outcome(files: []const (string, string)) -> (string, bool)
+    val root = make_temp_dir("sysl-thx").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end thx_outcome
+
+// What a program prints, where it builds and runs to the end.
+private thx_ran_bare(text: string) -> string
+    val out = thx_outcome([("main.sysl", text)])
+
+    if !out.1 then return s"it did not run to the end: ${out.0}"
+
+    out.0
+end thx_ran_bare
+
+private thx_ran(text: string) -> string = thx_ran_bare(thx_importing() + text)
+
+// What the driver says of a program of several files that it refuses.
+private thx_err_files(files: []const (string, string)) -> string
+    val out = thx_outcome(files)
+
+    if out.1 then return s"it was not refused, and printed: ${out.0}"
+
+    out.0
+end thx_err_files
+
+private thx_err(text: string) -> string = thx_err_files([("main.sysl", thx_importing() + text)])
+
+// Whether one line of `text` holds both `a` and, after it, `b`.
+private thx_line_with(text: string, a: string, b: string) -> bool
+    var rest = text
+
+    loop
+        val line_end = rest.index_of("\n").unwrap_or(rest.bytes.len)
+        val line = rest[0..<line_end]
+
+        line.index_of(a) match
+            Some(at) -> if line[at + a.bytes.len..<line.bytes.len].contains(b) then return true
+            None -> ()
+
+        if line_end >= rest.bytes.len then return false
+
+        rest = rest[line_end + 1..<rest.bytes.len]
+end thx_line_with
+
+// A `&sync` chain to hang the reaper tests off.
+private thx_chain() -> string = raw"""
+    struct Node
+        value: int
+        next: Option[&sync Node]
+
+    build(n: int) -> &sync Node
+        var head: &sync Node = Node(0, None)
+        var i = 1
+
+        while i < n
+            head = Node(i, Some(head))
+            i++
+
+        head
+
+    """
+
+// The same chain counted with a plain reference.
+private thx_plain_chain() -> string = raw"""
+    struct Node
+        value: int
+        next: Option[&Node]
+
+    build(n: int) -> &Node
+        var head: &Node = Node(0, None)
+        var i = 1
+
+        while i < n
+            head = Node(i, Some(head))
+            i++
+
+        head
+
+    """
+
+// -- starting a thread and waiting for one -----------------------------------------------------------
+
+@test("a body runs, and the join is what makes its output land before the line after it")
+thx_a_body_runs_and_the_join_orders_it()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        say(p: *int)
+            print("thread saw", *p)
+
+        var n = 7
+        var t = spawn(&say, &n).unwrap()
+        var waited = t.join()
+
+        print("joined", waited)
+        """), "thread saw 7\njoined true\n")
+
+// The discriminating test for `spawn` actually spawning: a body called directly would print the
+// same as one on a new thread everywhere else, and `pthread_self` differs exactly when there were two.
+@test("the body is on a thread of its own, which is what tells this apart from a call")
+thx_the_body_is_on_a_thread_of_its_own()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        struct Seen
+            caller: usize
+            same: bool
+
+        look(s: *Seen)
+            s.same = current().id == s.caller
+
+        var s = Seen(current().id, true)
+
+        spawn(&look, &s).unwrap().join()
+        print(s.same)
+        """), "false\n")
+
+@test("a body with something of its own is handed its address")
+thx_a_body_is_handed_its_address()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        var ticks = 0
+
+        tick(n: *int)
+            *n = *n + 1
+
+        spawn(&tick, &ticks).unwrap().join()
+        print(ticks)
+        """), "1\n")
+
+// `T` is in both of `spawn`'s parameters, so the body's own type settles what `null` is.
+@test("and one with nothing of its own is passed null, which the body's own type settles")
+thx_one_with_nothing_is_passed_null()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        alone(p: *int)
+            print("nothing passed")
+
+        spawn(&alone, null).unwrap().join()
+        """), "nothing passed\n")
+
+@test("several threads each get their own argument")
+thx_several_threads_each_get_their_own()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        struct Slot
+            n: int
+            doubled: int
+
+        double(s: *Slot)
+            s.doubled = s.n * 2
+
+        var a = Slot(1, 0)
+        var b = Slot(2, 0)
+        var c = Slot(3, 0)
+        var ta = spawn(&double, &a).unwrap()
+        var tb = spawn(&double, &b).unwrap()
+        var tc = spawn(&double, &c).unwrap()
+
+        ta.join()
+        tb.join()
+        tc.join()
+        print(a.doubled, b.doubled, c.doubled)
+        """), "2 4 6\n")
+
+@test("and yielding answers that the system took the hint")
+thx_yielding_answers_true()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran("print(yield_now())"), "true\n")
+
+// `pthread_create` does not care which thread called it, and the reaper's worklist being per thread
+// is what keeps the inner one from finding the outer one's list.
+@test("a thread may start threads of its own")
+thx_a_thread_may_start_threads()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        struct Tree
+            depth: Atomic[int]
+
+        leaf(t: *Tree)
+            t.depth.add(1)
+
+        branch(t: *Tree)
+            var a = spawn(&leaf, t).unwrap()
+            var b = spawn(&leaf, t).unwrap()
+
+            a.join()
+            b.join()
+            t.depth.add(10)
+
+        var t = Tree(Atomic(0))
+
+        spawn(&branch, &t).unwrap().join()
+        print(t.depth.load())
+        """), "12\n")
+
+// -- the lock that owns what it protects -------------------------------------------------------------
+
+@test("hands back the address of what it holds, and the value survives the round trip")
+thx_lock_hands_back_the_address()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        var m = Mutex.new(41)
+        var p = m.lock()
+
+        *p = *p + 1
+        m.unlock()
+        print(*m.lock())
+        """), "42\n")
+
+@test("is taken by the first to ask and refused to the next, and free again once released")
+thx_try_lock_is_taken_then_refused()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        var m = Mutex.new(0)
+
+        print(m.try_lock().is_some(), m.try_lock().is_none())
+        m.unlock()
+        print(m.try_lock().is_some())
+        """), "true true\ntrue\n")
+
+// Twenty thousand increments each and the total is exact -- a read-modify-write split across the
+// lock is what a broken lock loses, and at this length it loses them in practice.
+@test("two threads incrementing through it lose nothing")
+thx_two_threads_lose_nothing()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        struct Job
+            m: Mutex[int]
+            rounds: int
+
+        bump(j: *Job)
+            var i = 0
+
+            while i < j.rounds
+                var p = j.m.lock()
+
+                defer j.m.unlock()
+                *p = *p + 1
+                i = i + 1
+
+        var j = Job(Mutex.new(0), 20000)
+        var a = spawn(&bump, &j).unwrap()
+        var b = spawn(&bump, &j).unwrap()
+
+        a.join()
+        b.join()
+        print(*j.m.lock())
+        """), "40000\n")
+
+@test("and the release a 'defer' writes happens at the end of its block")
+thx_defer_releases_at_the_end_of_its_block()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        var m = Mutex.new(0)
+        var i = 0
+
+        while i < 3
+            var p = m.lock()
+
+            defer m.unlock()
+            *p = *p + 1
+            i = i + 1
+
+        print(*m.lock())
+        """), "3\n")
+
+@test("holds an aggregate, which is what a lock is for and an atomic is not")
+thx_holds_an_aggregate()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        struct Ledger
+            hits: int
+            last: int
+
+        var m = Mutex.new(Ledger(0, 0))
+        var p = m.lock()
+
+        p.hits = p.hits + 1
+        p.last = 9
+        m.unlock()
+
+        var q = m.lock()
+
+        print(q.hits, q.last)
+        """), "1 9\n")
+
+// A `*self` method wants a place, and a counted reference is one.
+@test("and works through the counted reference the chapter reaches it by")
+thx_works_through_a_sync_reference()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        var m: &sync Mutex[int] = Mutex.new(4)
+        var p = m.lock()
+
+        *p = *p * 10
+        m.unlock()
+        print(*m.lock())
+        """), "40\n")
+
+@test("more threads than the machine has processors still finish, since a waiter yields")
+thx_more_threads_than_processors_finish()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        struct Job
+            m: Mutex[int]
+            rounds: int
+
+        bump(j: *Job)
+            var i = 0
+
+            while i < j.rounds
+                var p = j.m.lock()
+
+                defer j.m.unlock()
+                *p = *p + 1
+                i = i + 1
+
+        var j = Job(Mutex.new(0), 5000)
+        var ts = [spawn(&bump, &j).unwrap(), spawn(&bump, &j).unwrap(),
+                  spawn(&bump, &j).unwrap(), spawn(&bump, &j).unwrap(),
+                  spawn(&bump, &j).unwrap(), spawn(&bump, &j).unwrap(),
+                  spawn(&bump, &j).unwrap(), spawn(&bump, &j).unwrap()]
+
+        for t in ts
+            t.join()
+
+        print(*j.m.lock())
+        """), "40000\n")
+
+// An ordering is a keyword in the emitted instruction, and this machine would compute the right
+// total whichever one was written. The reference emits `%t3 = atomicrmw xchg ptr %t2, i32 1 acquire`,
+// `store atomic i32 0, ptr %t2 release, align 4` and `%t7 = load atomic i32, ptr %t6 monotonic`.
+@test("takes with an acquire and releases with a release")
+thx_takes_with_acquire_releases_with_release()
+    if thx_no_library() then return
+
+    val out = thx_ir("var m = Mutex.new(0)\nm.lock()\nm.unlock()")
+
+    assert(thx_line_with(out, "atomicrmw xchg ptr %t", ", i32 1 acquire"), out)
+    assert(thx_line_with(out, "store atomic i32 0, ptr %t", " release"), out)
+    assert(thx_line_with(out, "load atomic i32, ptr %t", " monotonic"), out)
+
+// -- the atomic refcount moves the way the chapter says ----------------------------------------------
+
+@test("a relaxed increment, a releasing decrement, and an acquire fence before the free")
+thx_sync_count_is_relaxed_release_acquire()
+    if thx_no_library() then return
+
+    val out = thx_ir(thx_chain() + "var list: &sync Node = Node(1, None)")
+
+    assert(out.contains("atomicrmw add ptr %p, i64 1 monotonic"), out)
+    assert(out.contains("atomicrmw sub ptr %p, i64 1 release"), out)
+    assert(out.contains("fence acquire"), out)
+
+@test("while a plain reference counts with ordinary loads and stores")
+thx_plain_count_is_not_atomic()
+    if thx_no_library() then return
+
+    val out = thx_ir(thx_plain_chain() + "var list: &Node = Node(1, None)")
+
+    assert(out.contains("define"), out)
+    assert(!out.contains("atomicrmw add ptr %p, i64 1 monotonic"), out)
+    assert(!out.contains("fence acquire"), out)
+
+// -- two threads dropping shared structures at the same moment ---------------------------------------
+
+// The reaper's worklist is `thread_local`, so two threads releasing the last reference to two
+// unrelated chains do not overwrite each other's list; a shared one shows as a double free, a node
+// freed while being walked, or a chain dropped -- so the total is exact.
+@test("each drain finds its own list")
+thx_each_drain_finds_its_own_list()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(thx_chain() + raw"""
+        struct Work
+            rounds: int
+            length: int
+            seen: Atomic[int]
+
+        churn(w: *Work)
+            var i = 0
+
+            while i < w.rounds
+                var list = build(w.length)
+
+                w.seen.add(list.value)
+                i = i + 1
+
+        var w = Work(50, 2000, Atomic(0))
+        var a = spawn(&churn, &w).unwrap()
+        var b = spawn(&churn, &w).unwrap()
+
+        a.join()
+        b.join()
+        print(w.seen.load())
+        """), "199900\n")
+
+// -- the capability that gates it --------------------------------------------------------------------
+
+@test("a module that gave up posix may not reach it")
+thx_no_posix_may_not_reach_threads()
+    if thx_no_library() then return
+
+    val out = thx_err_files([("quiet/work.sysl", raw"""
+                                 module quiet
+                                 @no_posix
+
+                                 import sysl.posix.threads.Mutex
+
+                                 guarded() -> Mutex[int] = Mutex.new(0)
+                                 """),
+                             ("main.sysl", "import quiet.guarded\n\nprint(guarded().try_lock().is_some())\n")])
+
+    assert(out.contains("this reaches 'sysl.posix.threads', which requires 'posix'"), out)
+    assert(out.contains("'quiet' declared 'no posix'"), out)
+
+// Giving up `os` gives up `posix` with it, posix being what needs an operating system.
+@test("and so may a module that gave up its operating system, since pthreads needs one")
+thx_no_os_may_not_reach_threads()
+    if thx_no_library() then return
+
+    val out = thx_err_files([("bare/work.sysl", raw"""
+                                 module bare
+                                 @no_os
+
+                                 import sysl.posix.threads.yield_now
+
+                                 step() -> bool = yield_now()
+                                 """),
+                             ("main.sysl", "import bare.step\n\nprint(step())\n")])
+
+    assert(out.contains("this reaches 'sysl.posix.threads', which requires 'os'"), out)
+    assert(out.contains("'bare' declared 'no os'"), out)
+
+@test("while giving it up on its own is an ordinary clause")
+thx_giving_up_posix_alone_is_ordinary()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran_bare("@no_posix\n\nprint(1 + 1)"), "2\n")
+
+// An unknown capability is refused by name, and that refusal is the only thing telling a reader of
+// the old spelling where their module went.
+@test("and 'threads' is no longer a capability at all")
+thx_threads_is_no_capability()
+    if thx_no_library() then return
+
+    val out = thx_err_files([("main.sysl", "@no_threads\n\nprint(1 + 1)\n")])
+
+    assert(out.contains("no capability is called 'threads'"), out)
+    assert(out.contains("'heap', 'os', 'posix'"), out)
+
+// -- what crossing a domain is checked to be ---------------------------------------------------------
+
+// `spawn` is `@crossing(arg)`, so the pointer it takes is looked through and every count the state
+// reaches has to be atomic.
+@test("a state whose counts are all atomic reaches another thread")
+thx_an_atomic_state_crosses()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        struct Cell
+            v: int
+
+        struct Local
+            r: &sync Cell
+
+        look(p: *Local)
+            print("saw", p.r.v)
+
+        var l = Local(Cell(1))
+
+        spawn(&look, &l).unwrap().join()
+        """), "saw 1\n")
+
+@test("and one holding a plain reference is refused at the call")
+thx_a_plain_reference_is_refused_at_the_call()
+    if thx_no_library() then return
+
+    val out = thx_err(raw"""
+        struct Cell
+            v: int
+
+        struct Local
+            r: &Cell
+
+        look(p: *Local)
+            print("saw", p.r.v)
+
+        var l = Local(Cell(1))
+
+        spawn(&look, &l).unwrap().join()
+        """)
+
+    assert(out.contains("points at reaches another concurrency domain"), out)
+    assert(out.contains("its 'r' reaches a '&Cell'"), out)
+    assert(out.contains("Hold it as a '&sync Cell'"), out)
+
+// -- what is refused ---------------------------------------------------------------------------------
+
+// Both fields are private, so the positional constructor is out of reach -- which is what keeps a
+// lock from being built already held.
+@test("building one by naming its fields, which would let it start held")
+thx_building_one_by_its_fields_is_refused()
+    if thx_no_library() then return
+
+    val out = thx_err("var m = Mutex(1i32, 5)\nprint(m.try_lock().is_some())")
+
+    assert(out.contains("the constructor names every field of 'sysl.posix.threads.Mutex' in order"), out)
+    assert(out.contains("'held' is private"), out)
+    assert(out.contains("associated function"), out)
+
+@test("reading what it protects without taking it")
+thx_reading_the_value_without_the_lock()
+    if thx_no_library() then return
+
+    val out = thx_err("var m = Mutex.new(5)\nprint(m.value)")
+
+    assert(out.contains("field 'value' of 'sysl.posix.threads.Mutex' is private"), out)
+
+// The `&sync` rule reaches through the new type without knowing anything about it: a
+// `Mutex[&Cell]` has a plain counted reference among its fields however deep.
+@test("and sharing one that guards a non-atomically counted reference")
+thx_sharing_a_lock_over_a_plain_reference()
+    if thx_no_library() then return
+
+    val out = thx_err(raw"""
+        struct Cell
+            v: int
+
+        var m: &sync Mutex[&Cell] = Mutex.new(Cell(1))
+
+        print(*m.lock())
+        """)
+
+    assert(out.contains("may be reached from two domains at once"), out)
+    assert(out.contains("its 'value' reaches a '&Cell', whose count is not. Hold it as a '&sync Cell'"), out)
+
+// A thread body is C's shape and a callable is not; the two differ by one character, so the
+// diagnostic names the `&`.
+@test("handing a thread a callable rather than the address of one")
+thx_a_callable_is_not_an_address()
+    if thx_no_library() then return
+
+    val out = thx_err(raw"""
+        work(p: *int)
+            print(*p)
+
+        var n = 1
+
+        spawn(work, &n).unwrap().join()
+        """)
+
+    assert(out.contains("'work' is a function"), out)
+    assert(out.contains("write '&work'"), out)
+    assert(out.contains("no address a C interface could call"), out)
