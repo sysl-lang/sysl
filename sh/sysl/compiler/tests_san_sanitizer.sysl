@@ -1,0 +1,332 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, join, Search}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **The seam that puts a sanitizer under a whole sysl build** -- `SYSL_EXTRA_CFLAGS`, spliced into
+// every clang the build drives, and the IR marking that makes `-fsanitize=` mean something.
+//
+// **The marking is the half that is easy to get silently wrong**: LLVM instruments only functions
+// carrying the sanitizer's attribute, which a frontend adds, so IR handed over as a `.ll` links the
+// sanitizer's runtime, instruments none of the sysl, and reports a clean program. The first eight
+// cases are the reference's `SanitizerHookTests`; the rest build real programs under the flag, and
+// those set the variable through libc and unset it before they return, `sysl.env` setting nothing.
+
+private extern "setenv" san_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" san_c_unsetenv(name: *u8) -> int
+
+private san_flags(value: string)
+    val n = cstring("SYSL_EXTRA_CFLAGS")
+    val v = cstring(value)
+
+    san_c_setenv(n.ptr, v.ptr, 1)
+end san_flags
+
+private san_no_flags()
+    val n = cstring("SYSL_EXTRA_CFLAGS")
+
+    san_c_unsetenv(n.ptr)
+end san_no_flags
+
+private san_list(words: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<words.len
+        out.push(words[i])
+
+    out
+end san_list
+
+private san_ir() -> string =
+    "define private void @arc.retain(ptr %p) {\nentry:\n  ret void\n}\n" +
+    "define i32 @main() {\nentry:\n  ret i32 0\n}\n"
+
+private san_count(text: string, needle: string) -> usize = text.count_of(needle)
+
+// --- reading the flags --------------------------------------------------------------------------
+
+@test("a sanitizer sysl marks for becomes its attribute")
+san_each_sanitizer_has_its_attribute()
+    assert_eq(join(sanitizer_attrs(san_list(["-fsanitize=address"])).view(), " "), "sanitize_address")
+    assert_eq(join(sanitizer_attrs(san_list(["-fsanitize=thread"])).view(), " "), "sanitize_thread")
+    assert_eq(join(sanitizer_attrs(san_list(["-fsanitize=memory"])).view(), " "), "sanitize_memory")
+    assert_eq(join(sanitizer_attrs(san_list(["-fsanitize=hwaddress"])).view(), " "),
+              "sanitize_hwaddress")
+end san_each_sanitizer_has_its_attribute
+
+// The ordinary way to ask for two, and a whole-flag match reads it as neither.
+@test("one flag may name several")
+san_one_flag_names_several()
+    assert_eq(join(sanitizers_asked(san_list(["-fsanitize=address,undefined"])).view(), " "),
+              "address undefined")
+    assert_eq(join(sanitizer_attrs(san_list(["-fsanitize=address,undefined"])).view(), " "),
+              "sanitize_address")
+end san_one_flag_names_several
+
+// UBSan is emitted as checks during codegen rather than switched on by an attribute, so there is
+// nothing to mark and a run over a sysl build covers only the C a package carries.
+@test("undefined asks for nothing, because LLVM has no attribute for it")
+san_undefined_asks_for_nothing()
+    assert(sanitizer_attrs(san_list(["-fsanitize=undefined"])).is_empty(), "undefined has no attribute")
+    assert_eq(sanitized(san_ir(), sanitizer_attrs(san_list(["-fsanitize=undefined"]))), san_ir())
+
+// A substring test reads a suppression as a request, and marks the IR for a sanitizer the build has
+// just turned off.
+@test("a suppression is not a request")
+san_a_suppression_is_not_a_request()
+    assert(sanitizers_asked(san_list(["-fno-sanitize=address"])).is_empty(), "a suppression")
+    assert_eq(join(sanitizer_attrs(san_list(["-fsanitize=address", "-fno-sanitize=thread"])).view(), " "),
+              "sanitize_address")
+
+@test("flags that are not sanitizers say nothing")
+san_other_flags_say_nothing()
+    assert(sanitizer_attrs(san_list(["-g", "-O2", "-Wall"])).is_empty(), "ordinary flags")
+    assert(sanitizer_attrs(buf()).is_empty(), "no flags")
+
+// --- marking the IR -----------------------------------------------------------------------------
+
+@test("with nothing asked for, the IR goes through untouched")
+san_nothing_asked_leaves_the_ir()
+    assert_eq(sanitized(san_ir(), buf()), san_ir())
+
+@test("every function is marked, and the group is declared once")
+san_every_function_is_marked_once()
+    val marked = sanitized(san_ir(), san_list(["sanitize_address"]))
+
+    assert(marked.contains("define private void @arc.retain(ptr %p) #99 {"), marked)
+    assert(marked.contains("define i32 @main() #99 {"), marked)
+    assert_eq(san_count(marked, "attributes #99"), 1)
+    assert(marked.contains("attributes #99 = { sanitize_address }"), marked)
+end san_every_function_is_marked_once
+
+@test("ThreadSanitizer marks the same functions, which is what it was missing")
+san_thread_marks_the_same_functions()
+    val marked = sanitized(san_ir(), san_list(["sanitize_thread"]))
+
+    assert(marked.contains("define private void @arc.retain(ptr %p) #99 {"), marked)
+    assert(marked.contains("define i32 @main() #99 {"), marked)
+    assert(marked.contains("attributes #99 = { sanitize_thread }"), marked)
+end san_thread_marks_the_same_functions
+
+// One group carries them all: LLVM takes a list, and a second numbered group would be a second
+// number for this file to own.
+@test("two sanitizers share the one group")
+san_two_sanitizers_share_the_group()
+    val marked = sanitized(san_ir(), san_list(["sanitize_address", "sanitize_thread"]))
+
+    assert(marked.contains("attributes #99 = { sanitize_address sanitize_thread }"), marked)
+    assert_eq(san_count(marked, "attributes #99"), 1)
+
+// A line that merely opens a block is not a definition, and marking one would not parse -- which is
+// what the two conditions on the line are for, rather than matching `{` alone.
+@test("and nothing that is not a definition is touched")
+san_nothing_else_is_touched()
+    val marked = sanitized(san_ir(), san_list(["sanitize_thread"]))
+
+    assert(marked.contains("entry:"), marked)
+    assert(!marked.contains("entry: #99"), marked)
+    assert(!marked.contains("}#99"), marked)
+
+// --- the flags under a real program -------------------------------------------------------------
+
+// A heap access on the sysl side, through a raw allocation the bounds checks cannot see: the store is
+// one byte past a sixteen-byte block, which only an instrumented function reports.
+private san_program() -> string =
+    "extern \"malloc\" raw_alloc(n: usize) -> *u8\n\n" +
+    "poke_past_end(p: *u8, at: usize)\n" +
+    "    val q: *u8 = ptr_cast(usize(p) + at)\n" +
+    "    *q = 7\n\n" +
+    "val p = raw_alloc(16)\n" +
+    "poke_past_end(p, 16)\n" +
+    "print(\"survived\")\n"
+
+private san_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return false
+        Ok(_) -> ()
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end san_ready
+
+// The program built under `flags` (or none, where empty) into `root`, answered as the executable's
+// path or `unbuilt: <why>`.
+//
+// The level is a parameter because the run-time case wants `-O0`: at the default level the store is
+// inlined into `main`, and the report then names `main` rather than the function that overflowed.
+private san_build(root: string, flags: string, level: string = DefaultOptimization) -> string
+    if flags == "" then san_no_flags() else san_flags(flags)
+
+    val exe = s"$root/built-$level-${flags.len}"
+    val made = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    san_no_flags()
+
+    made match
+        Err(why) -> s"unbuilt: ${failure_text(why)}"
+        Ok(_) -> exe
+end san_build
+
+private san_root() -> string
+    val root = make_temp_dir("sysl-sanitize").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", san_program()).unwrap()
+    root
+end san_root
+
+// The symbols a binary leaves undefined, one per line.
+private san_undefined(exe: string) -> string = capture("nm", ["-u", exe], "", [], true) match
+    Ok(out) -> out.text
+    Err(_) -> ""
+
+// **The measurement that found this**: a self-hosted ASan build left one `__asan_report_*` undefined
+// -- the C the library carries, and nothing of the sysl. The program's only store is the one-byte
+// write through `*q`, so `__asan_report_store1` is the sysl side's and nobody else's.
+@test("an ASan build instruments the sysl side, so its binary calls into the sanitizer")
+san_asan_build_instruments_sysl()
+    if !san_ready() then return
+
+    val root = san_root()
+    val exe = san_build(root, "-fsanitize=address -g")
+
+    assert(!exe.starts_with("unbuilt"), exe)
+
+    val undefined = san_undefined(exe)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(undefined.contains("__asan_report_store1"), undefined)
+end san_asan_build_instruments_sysl
+
+@test("a write one past a raw allocation is caught at run time, naming the sysl function")
+san_asan_catches_a_sysl_overflow()
+    if !san_ready() then return
+
+    val root = san_root()
+    val exe = san_build(root, "-fsanitize=address -g", "0")
+
+    assert(!exe.starts_with("unbuilt"), exe)
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            val said = out.text + out.err.unwrap_or("")
+
+            assert(!said.contains("survived"), said)
+            assert(said.contains("heap-buffer-overflow"), said)
+            assert(said.contains("WRITE of size 1"), said)
+            assert(said.contains("poke_past_end"), said)
+end san_asan_catches_a_sysl_overflow
+
+// What `emit-llvm` prints is what clang is handed, so a build that is marked shows it there.
+@test("emit-llvm under -fsanitize=address marks every define, and without it marks none")
+san_emit_llvm_shows_the_marking()
+    if !san_ready() then return
+
+    val root = san_root()
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    san_flags("-fsanitize=address")
+
+    val marked_code = run_cli(["sysl", "emit-llvm", s"$root/main.sysl"], (line) -> sink.push(line))
+
+    san_no_flags()
+
+    val marked = join(lines.view(), "\n")
+    var plain_lines: Buf[string] = buf()
+    val plain_sink = &plain_lines
+    val plain_code = run_cli(["sysl", "emit-llvm", s"$root/main.sysl"], (line) -> plain_sink.push(line))
+    val plain = join(plain_lines.view(), "\n")
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(marked_code, 0)
+    assert_eq(plain_code, 0)
+    assert(marked.contains(") #99 {"), marked)
+    assert(marked.contains("attributes #99 = { sanitize_address }"), marked)
+    assert(san_count(marked, "\ndefine ") > 0, marked)
+    assert_eq(san_count(marked, "\ndefine "), san_count(marked, " #99 {"))
+    assert(!plain.contains("sanitize_"), plain)
+    assert(!plain.contains("#99"), plain)
+end san_emit_llvm_shows_the_marking
+
+@test("emit-llvm under -fsanitize=thread marks for ThreadSanitizer")
+san_emit_llvm_thread()
+    if !san_ready() then return
+
+    val root = san_root()
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    san_flags("-fsanitize=thread")
+
+    val code = run_cli(["sysl", "emit-llvm", s"$root/main.sysl"], (line) -> sink.push(line))
+
+    san_no_flags()
+    remove_dir_all(root).unwrap_or(())
+
+    val text = join(lines.view(), "\n")
+
+    assert_eq(code, 0)
+    assert(text.contains(") #99 {"), text)
+    assert(text.contains("attributes #99 = { sanitize_thread }"), text)
+    assert(!text.contains("sanitize_address"), text)
+end san_emit_llvm_thread
+
+// **A sanitized build and a plain one may not share anything they compiled.** The standard
+// module's archive is keyed on the flags, the run cache and the codegen units on the environment,
+// and the two programs differ in exactly the way the flag is for.
+@test("a build with the flag and one without share no artifact")
+san_flagged_and_plain_builds_are_separate()
+    san_no_flags()
+
+    val t = host_target()
+    val plain_std = std_artifact_path(t, "0123456789abcdef")
+    val plain_env = build_environment()
+
+    san_flags("-fsanitize=address")
+
+    val flagged_std = std_artifact_path(t, "0123456789abcdef")
+    val flagged_env = build_environment()
+
+    san_flags("  -fsanitize=address ")
+
+    val respaced_std = std_artifact_path(t, "0123456789abcdef")
+
+    san_no_flags()
+
+    assert(plain_std != flagged_std, flagged_std)
+    assert_eq(respaced_std, flagged_std)
+    assert(plain_env != flagged_env, flagged_env)
+    assert(!plain_std.contains("-x"), plain_std)
+
+    if !san_ready() then return
+
+    val root = san_root()
+    val plain_exe = san_build(root, "")
+    val plain_undefined = san_undefined(plain_exe)
+    val flagged_exe = san_build(root, "-fsanitize=address")
+    val flagged_undefined = san_undefined(flagged_exe)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(!plain_exe.starts_with("unbuilt"), plain_exe)
+    assert(!flagged_exe.starts_with("unbuilt"), flagged_exe)
+    assert(!plain_undefined.contains("__asan"), plain_undefined)
+    assert(flagged_undefined.contains("__asan_report_store1"), flagged_undefined)
+end san_flagged_and_plain_builds_are_separate
