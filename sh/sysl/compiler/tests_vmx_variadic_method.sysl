@@ -440,6 +440,59 @@ vmx_an_unimplemented_promise_is_checked()
                     "binding, and a copy of a walk advances nothing 'T.hold''s caller can see, so the walk is " +
                     "handed over by address and the call writes '&ap'"))
 
+// Not a reference case: what the fix above reaches beyond the trait. The reference asks the rule of a
+// type's own member, of an implementation's, and again of an inherited default's copy under the
+// implementing type's name.
+@test("every member is held to the va_list parameter rule, an inherited default's copy included")
+vmx_every_member_is_held_to_the_va_list_rule()
+    if !vmx_ready() then return
+
+    val rule = "a va_list is a parameter as '*va_list', not as 'va_list' — a parameter is a by-value " +
+               "binding, and a copy of a walk advances nothing "
+    val written = vmx_err("trait T\n    hold(self, ap: va_list) -> int\nstruct W\n    v: int\n" +
+                          "impl T for W\n    hold(self, ap: va_list) -> int = 1\nend W\n" +
+                          "struct S\n    v: int\n    take(self, ap: va_list) -> int = 1\nprint(1)\n")
+
+    assert(vmx_says(written, rule + "'T.hold''s caller can see"))
+    assert(vmx_says(written, rule + "'W.hold''s caller can see"))
+    assert(vmx_says(written, rule + "'S.take''s caller can see"))
+
+    val inherited = vmx_err("trait T\n    hold(self, ap: va_list) -> int\n        1\n    end hold\n" +
+                            "struct W\n    v: int\nimpl T for W\nend W\nprint(1)\n")
+
+    assert(vmx_says(inherited, rule + "'T.hold''s caller can see"))
+    assert(vmx_says(inherited, rule + "'W.hold''s caller can see"))
+end vmx_every_member_is_held_to_the_va_list_rule
+
+// A variadic member's tail reaches the callee through every way a member is called.
+@test("a variadic member's tail arrives through an associated, a generic and a dispatched call")
+vmx_the_tail_arrives_through_every_member_call()
+    if !vmx_ready() then return
+
+    val src = vmx_sum() +
+              "struct K\n" +
+              "    v: int\n" +
+              "\n" +
+              "    of(n: int, ...) -> int\n" +
+              vmx_walk("        ") +
+              "        t\n" +
+              "    end of\n" +
+              "\n" +
+              "    on(self, n: int, ...) -> int\n" +
+              vmx_walk("        ") +
+              "        self.v + t\n" +
+              "    end on\n" +
+              "\n" +
+              "    at[T](self, x: T, n: int, ...) -> int\n" +
+              vmx_walk("        ") +
+              "        self.v + t\n" +
+              "    end at\n" +
+              "end K\n" +
+              "print(K.of(n = 0),K.of(2, 40, 2), K(1).on(1, 9), K(1).at(true, 3, 1, 2, 3))\n"
+
+    assert_eq(vmx_ran(src), "0 42 10 7\n")
+end vmx_the_tail_arrives_through_every_member_call
+
 // Two implementations of one trait are told apart by the arguments, and a tail stands at no
 // parameter -- so what tells them apart stops where the declared parameters do.
 @test("two implementations of one variadic member are told apart by the declared arguments")
