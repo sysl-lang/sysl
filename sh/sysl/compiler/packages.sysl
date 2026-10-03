@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
 import sysl.text.{from_utf8_unchecked, Search}
 
 // Which package a file came from, and what the module paths it writes mean.
@@ -70,14 +71,42 @@ struct Packaging
     // root given to the compilation as one -- rather than written by the program's author. Such a
     // file is held to being well formed like any other, and is not held to the target's set.
     supplied: bool
+
+    // The `package.hocon` standing at the root of the tree the file came from, or the empty path
+    // where none does, and the `version` it declares, or the empty one where it declares none. They
+    // are what `__VERSION__` answers with, which is why they are the file's own package's and never
+    // the consumer's: a library's files report the library's version.
+    manifest: string
+    version: string
 end Packaging
 
 // A file of the project being built: no prefix, and nothing mounted.
-no_packaging() -> Packaging = Packaging("", buf(), false)
+no_packaging() -> Packaging = Packaging("", buf(), false, "", "")
 
 // A file a library handed over under the name it was written with, which is what a source root
 // given as a library arrives as.
-supplied_packaging() -> Packaging = Packaging("", buf(), true)
+supplied_packaging() -> Packaging = Packaging("", buf(), true, "", "")
+
+// The manifest the files of the tree rooted at `dir` were read under, as `__VERSION__` needs it:
+// its path where the tree has one, and the version the already-read manifest declares.
+manifest_of_tree(dir: string, version: string) -> (string, string)
+    val file = join_path(dir, ManifestName)
+
+    if !is_file(file) then ("", "") else (absolute_path(file), version)
+
+// What `__VERSION__` is refused with in a file of this packaging, or nothing where it has a version
+// to answer.
+version_refusal(pkg: Packaging) -> Option[string]
+    if pkg.manifest.is_empty()
+        return Some("'__VERSION__' is the 'version' in package.hocon, and this file is not part of " +
+                    "a package — no package.hocon stands at the root of its tree")
+
+    if pkg.version.is_empty()
+        return Some(s"'__VERSION__' is the 'version' in package.hocon, and ${pkg.manifest} " +
+                    "declares none")
+
+    None
+end version_refusal
 
 // What a written module path means where it names a package this one's manifest brought in.
 //
