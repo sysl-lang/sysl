@@ -19,10 +19,15 @@ import sysl.math.bigint.{BigInt, from_int, negate}
 // funnel and finds the flag already spent.
 type_expr(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     val allowed = cx.multi_ok
+    val outer = cx.result_chain
 
     cx.multi_ok = false
+    cx.result_chain = cx.result_next
+    cx.result_next = false
 
     val raw = analyze_expected(cx, e, expected)
+
+    cx.result_chain = outer
     unwrap_results(cx, e, raw, allowed)
 end type_expr
 
@@ -39,6 +44,21 @@ type_expr_multi(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     cx.multi_ok = false
     t
 end type_expr_multi
+
+// A function's own result list read where one may stand: the value of a function that declares one,
+// or what its `return` hands back. **A parenthesized tuple there is refused**, since it would build
+// the carrier a result list says never exists -- the values are written bare. A branch or block the
+// value is made of is the value too, so the expression is read with `result_chain` on.
+type_results(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
+    *e.kind match
+        Tuple(elements) ->
+            return cx.err(e.span, s"this function yields ${quantity(elements.len(), "result")} rather " +
+                          "than a tuple — write the values without the parentheses")
+        _ -> ()
+
+    cx.result_next = true
+    type_expr_multi(cx, e, expected)
+end type_results
 
 // Whether the position being read is the one place a function's own result list may stand: the
 // value of a function that declares one.
@@ -1400,7 +1420,10 @@ end analyze_operands
 private attempt_operand(cx: &Analyzer, e: Expr, expected: Option[Type]) -> Option[TExpr]
     val said = cx.an.complaints()
     val mark = cx.an.sandboxed()
-    val t = analyze_expected(cx, e, expected)
+
+    // An operand is never a place a result list may stand, so one is refused here as `type_expr`
+    // refuses it -- and the refusal sends the operand back to be read for real.
+    val t = unwrap_results(cx, e, analyze_expected(cx, e, expected), false)
 
     if cx.an.complaints() > said
         cx.an.release(mark)
