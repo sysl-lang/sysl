@@ -1,0 +1,460 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.replace_all
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A module-level `val` at **pointer type** — the file-scope register block
+// (`reference/modules.md § val — a thing`).
+//
+// What a `val` promises is that its **own storage** is written once and never again, and holding an
+// address keeps that promise exactly as holding a number does. It is not a promise about what the
+// address reaches, and it could not be: slicing a `val` and writing `&v[0]` already yields a writable
+// `*T` on purpose (`reference/arrays.md § []const T — a view that may not be written`), so refusing one
+// here would decline a route to what another route grants.
+//
+// **Every output, IR line and refusal quoted here was obtained by running the reference compiler
+// (0.0.160) on the same files.**
+
+private vpx_skipped() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end vpx_skipped
+
+// A project with no manifest: each file is its path below the root and its text.
+private vpx_write(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-val-pointer").unwrap()
+
+    make_dir_all(root).unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    root
+end vpx_write
+
+// The program was built, ran to the end, exited zero, and printed exactly this. One that does not
+// build answers what the build said, so a refusal cannot pass for a wrong output.
+private vpx_prints(text: string, printed: string)
+    val root = vpx_write([("main.sysl", text)])
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, s"did not build: ${failure_text(why)}")
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, printed)
+            assert_eq(shell_status(out.status), 0)
+end vpx_prints
+
+// The LLVM text of a project that must compile, for the host or for a named target.
+private vpx_ir_files(files: []const (string, string), target: Option[string] = None) -> string
+    val root = vpx_write(files)
+
+    val out = emit_llvm_text(root, target) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vpx_ir_files
+
+private vpx_ir(text: string) -> string = vpx_ir_files([("main.sysl", text)])
+
+// Everything a program has to say for itself, with the temporary root taken off each path; empty
+// where it compiled.
+private vpx_refused(text: string) -> string
+    val root = vpx_write([("main.sysl", text)])
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, replace_all(root, "//", "/") + "/", "")
+end vpx_refused
+
+// ---- a module-level 'val' holds a raw pointer ----
+
+// The shape this exists for: an address the datasheet gives as a number, named once and reached by
+// every function of a driver rather than re-materialised in each.
+@test("an address the program was told, reached from several functions")
+vpx_an_address_reached_from_several_functions()
+    if vpx_skipped() then return
+
+    vpx_prints(raw"""
+        extern malloc(n: usize) -> *u8
+        struct Uart
+            status: u32
+            data:   u32
+        end Uart
+        static val regs: *Uart = ptr_cast(malloc(16))
+        arm()
+            regs.status = 7u32
+        end arm
+        fire(b: u32)
+            regs.data = b
+        end fire
+        arm()
+        fire(65u32)
+        print(str(regs.status), str(regs.data))
+        """, "7 65\n")
+end vpx_an_address_reached_from_several_functions
+
+@test("and the elements it addresses are read and written through it")
+vpx_the_elements_it_addresses()
+    if vpx_skipped() then return
+
+    vpx_prints(raw"""
+        extern malloc(n: usize) -> *u8
+        static val cells: *int = ptr_cast(malloc(32))
+        put(v: int)
+            cells[0] = v
+        end put
+        put(42)
+        print(str(cells[0]))
+        """, "42\n")
+end vpx_the_elements_it_addresses
+
+@test("an array of them")
+vpx_an_array_of_them()
+    if vpx_skipped() then return
+
+    vpx_prints(raw"""
+        extern malloc(n: usize) -> *u8
+        static val ps: [2]*u8 = [ptr_cast(malloc(8)), ptr_cast(malloc(8))]
+        print(str(usize(ps[0]) != usize(ps[1])))
+        """, "true\n")
+
+@test("a struct with one in it")
+vpx_a_struct_with_one_in_it()
+    if vpx_skipped() then return
+
+    vpx_prints(raw"""
+        extern malloc(n: usize) -> *u8
+        struct Dev
+            base: *u32
+            id:   int
+        end Dev
+        mk() -> Dev = Dev(ptr_cast(malloc(8)), 5)
+        static val d: Dev = mk()
+        print(str(d.id))
+        """, "5\n")
+end vpx_a_struct_with_one_in_it
+
+// The address of a function is the same kind of thing: a machine address that counts nothing.
+@test("the address of a function, and a call through the one it holds")
+vpx_the_address_of_a_function()
+    if vpx_skipped() then return
+
+    vpx_prints(raw"""
+        g(x: int) -> int = x + 1
+        static val f: *extern(int) -> int = &g
+        print(str(f(3)))
+        """, "4\n")
+
+// A pointer is not looked through, so what is at the far end is not this storage's business — which
+// is the whole of why a `*T` is admitted where a `&T` is not.
+@test("one whose pointee is itself counted, since a pointer owns nothing at the far end")
+vpx_one_whose_pointee_is_counted()
+    if vpx_skipped() then return
+
+    val out = vpx_ir(raw"""
+        struct Node
+            v: int
+        end Node
+        extern malloc(n: usize) -> *u8
+        static val p: *&Node = ptr_cast(malloc(8))
+        print("ok")
+        """)
+
+    assert(out.contains("@p = private global ptr zeroinitializer"), out)
+end vpx_one_whose_pointee_is_counted
+
+@test("an enum whose payload is one")
+vpx_an_enum_whose_payload_is_one()
+    if vpx_skipped() then return
+
+    vpx_prints(raw"""
+        extern malloc(n: usize) -> *u8
+        enum Slot
+            Empty
+            At(p: *u8)
+        end Slot
+        mk() -> Slot = At(malloc(8))
+        static val s: Slot = mk()
+        s match
+            At(p) -> print(str(usize(p) != 0))
+            Empty -> print("empty")
+        """, "true\n")
+end vpx_an_enum_whose_payload_is_one
+
+@test("a generic type instantiated at one")
+vpx_a_generic_type_instantiated_at_one()
+    if vpx_skipped() then return
+
+    vpx_prints(raw"""
+        extern malloc(n: usize) -> *u8
+        struct Cell[T]
+            p: *T
+        end Cell
+        mk() -> Cell[int] = Cell(ptr_cast(malloc(8)))
+        static val c: Cell[int] = mk()
+        c.p[0] = 6
+        print(str(c.p[0]))
+        """, "6\n")
+end vpx_a_generic_type_instantiated_at_one
+
+// A tuple is a struct with its fields named for their positions, so whatever a struct field may be, a
+// part may be — a raw pointer, which owns nothing, and a reference, which is a count the storage
+// takes and never gives back.
+@test("a tuple with a pointer in it, and one with a reference")
+vpx_a_tuple_with_a_pointer_and_a_reference()
+    if vpx_skipped() then return
+
+    vpx_prints(raw"""
+        extern malloc(n: usize) -> *u8
+        mk() -> (int, *u8) = (1, malloc(8))
+        static val t: (int, *u8) = mk()
+        print(str(t.0))
+        """, "1\n")
+
+    vpx_prints(raw"""
+        struct Node
+            v: int
+        end Node
+        mk() -> (int, &Node) = (1, Node(2))
+        static val t: (int, &Node) = mk()
+        print(t.0, t.1.v)
+        """, "1 2\n")
+end vpx_a_tuple_with_a_pointer_and_a_reference
+
+@test("and one 'val' is filled from another")
+vpx_one_val_is_filled_from_another()
+    if vpx_skipped() then return
+
+    vpx_prints(raw"""
+        extern malloc(n: usize) -> *u8
+        static val a: *u8 = malloc(8)
+        static val b: *u8 = a
+        print(str(usize(a) == usize(b)))
+        """, "true\n")
+
+// The rule this relaxes is the *module* one — a local `val` was never held to it, since a frame ends
+// and whatever it counted is released there.
+@test("while a local one held a pointer all along, having a frame to end in")
+vpx_a_local_one_held_a_pointer_all_along()
+    if vpx_skipped() then return
+
+    vpx_prints(raw"""
+        extern malloc(n: usize) -> *u8
+        f() -> int
+            val p: *int = ptr_cast(malloc(8))
+            p[0] = 5
+            p[0]
+        end f
+        print(str(f()))
+        """, "5\n")
+end vpx_a_local_one_held_a_pointer_all_along
+
+@test("and another module's is reached by naming it")
+vpx_another_modules_is_reached_by_naming_it()
+    if vpx_skipped() then return
+
+    val out = vpx_ir_files([
+        ("dev/d.sysl", "module dev\nconst UART: usize = 0x1000\nval regs: *u32 = ptr_cast(UART)\n"),
+        ("main.sysl", "print(str(usize(dev.regs)))\n")])
+
+    assert(out.contains("@dev$regs = private constant ptr inttoptr (i64 4096 to ptr)"), out)
+end vpx_another_modules_is_reached_by_naming_it
+
+// ---- a constant address costs no initializer ----
+
+// A constant tree goes in the object file and orders nothing, and an address written as a number is
+// one. A freestanding program reaches its registers before anything has run.
+@test("'ptr_cast' of a constant is laid straight in as an 'inttoptr'")
+vpx_ptr_cast_of_a_constant_is_an_inttoptr()
+    if vpx_skipped() then return
+
+    val out = vpx_ir("const UART: usize = 0x10000000\nstatic val regs: *u32 = ptr_cast(UART)\nprint(\"ok\")\n")
+
+    assert(out.contains("@regs = private constant ptr inttoptr (i64 268435456 to ptr)"), out)
+end vpx_ptr_cast_of_a_constant_is_an_inttoptr
+
+@test("and so is a null one")
+vpx_and_so_is_a_null_one()
+    if vpx_skipped() then return
+
+    val out = vpx_ir("static val p: *u32 = null\nprint(\"ok\")\n")
+
+    assert(out.contains("@p = private constant ptr null"), out)
+
+// A pointer to a trait is two words, so its empty value is not the one-word `null`.
+@test("including a null at a trait pointer, which is two words rather than one")
+vpx_a_null_at_a_trait_pointer()
+    if vpx_skipped() then return
+
+    val out = vpx_ir(raw"""
+        trait Shape
+            area(self) -> int
+        end Shape
+        static val p: *Shape = null
+        print("ok")
+        """)
+
+    assert(out.contains("@p = private constant { ptr, ptr } zeroinitializer"), out)
+end vpx_a_null_at_a_trait_pointer
+
+@test("and an array of them, element by element")
+vpx_an_array_of_them_element_by_element()
+    if vpx_skipped() then return
+
+    val out = vpx_ir("static val ps: [2]*u8 = [null, null]\nprint(\"ok\")\n")
+
+    assert(out.contains("@ps = private constant [2 x ptr] [ptr null, ptr null]"), out)
+
+// A fill says one value and a count, so the global is written out as one word and there is no loop
+// anywhere to run.
+@test("and a repeat of one, written out as a global has no loop to run")
+vpx_a_repeat_has_no_loop_to_run()
+    if vpx_skipped() then return
+
+    val out = vpx_ir("static val ps: [3]*u8 = [null; 3]\nprint(\"ok\")\n")
+
+    assert(out.contains("@ps = private constant [3 x ptr] zeroinitializer"), out)
+    assert(!out.contains("fill.test"), out)
+end vpx_a_repeat_has_no_loop_to_run
+
+// The address of code is the same shape and lands the same way: a reset vector read as something
+// callable.
+@test("and an address read as the address of a function")
+vpx_an_address_read_as_a_function()
+    if vpx_skipped() then return
+
+    val out = vpx_ir(raw"""
+        const RESET: usize = 0x8000
+        static val entry: *extern() -> unit = ptr_cast(RESET)
+        print("ok")
+        """)
+
+    assert(out.contains("@entry = private constant ptr inttoptr (i64 32768 to ptr)"), out)
+end vpx_an_address_read_as_a_function
+
+// The whole point, on the target it is for: no OS, no prologue that has run, and the register block
+// still readable from the first instruction.
+@test("on a freestanding target as much as on this one")
+vpx_on_a_freestanding_target()
+    if vpx_skipped() then return
+
+    val out = vpx_ir_files([("main.sysl", raw"""
+        const UART: usize = 0x10000000
+        static val regs: *u32 = ptr_cast(UART)
+        go() = regs[0] = 1u32
+        go()
+        """)], Some("riscv64-freestanding"))
+
+    assert(out.contains("@regs = private constant ptr inttoptr (i64 268435456 to ptr)"), out)
+end vpx_on_a_freestanding_target
+
+// The other side of the same line: an address a call produces is code, so it is a `global` the
+// prologue writes rather than a `constant` the object file carries.
+@test("while an address a call produces is a computed one, as any other computed value is")
+vpx_an_address_a_call_produces_is_computed()
+    if vpx_skipped() then return
+
+    val out = vpx_ir("extern malloc(n: usize) -> *u8\nstatic val p: *u8 = malloc(8)\nprint(\"ok\")\n")
+
+    assert(out.contains("@p = private global ptr zeroinitializer"), out)
+    assert(!out.contains("@p = private constant"), out)
+end vpx_an_address_a_call_produces_is_computed
+
+// The ordering rule is over the `val`s themselves, so a pointer one joins the graph like any other.
+@test("and a cycle among computed pointer 'val's is still reported")
+vpx_a_cycle_among_pointer_vals()
+    if vpx_skipped() then return
+
+    val said = vpx_refused(raw"""
+        static val a: *u8 = ptr_cast(usize(b))
+        static val b: *u8 = ptr_cast(usize(a))
+        print("ok")
+        """)
+
+    assert(said.contains(
+        "error: 'a' cannot be initialized: its value needs 'b', whose value needs 'a' — computed module " +
+        "storage runs once before anything else does, so what it needs has to be settled first"), said)
+end vpx_a_cycle_among_pointer_vals
+
+// ---- what a pointer 'val' still promises, and what it never did ----
+
+// The promise it keeps: its own storage is written once.
+@test("the name may not be assigned to")
+vpx_the_name_may_not_be_assigned_to()
+    if vpx_skipped() then return
+
+    val said = vpx_refused(raw"""
+        const UART: usize = 0x1000
+        static val regs: *u32 = ptr_cast(UART)
+        regs = ptr_cast(UART)
+        print("ok")
+        """)
+
+    assert(said.contains("error: a 'val' is written once, so assignment has nothing to write through"), said)
+    assert(said.contains(" --> main.sysl:3:1\n"), said)
+end vpx_the_name_may_not_be_assigned_to
+
+// The promise it never made: read-only at every depth is about the storage the declaration lays down,
+// not about what a value inside it addresses.
+@test("while the storage it addresses is writable, which is what the raw tier means")
+vpx_the_storage_it_addresses_is_writable()
+    if vpx_skipped() then return
+
+    val out = vpx_ir(raw"""
+        const UART: usize = 0x1000
+        static val regs: *u32 = ptr_cast(UART)
+        set()
+            regs[0] = 1u32
+        end set
+        print("ok")
+        """)
+
+    assert(out.contains("@regs = private constant ptr inttoptr (i64 4096 to ptr)"), out)
+end vpx_the_storage_it_addresses_is_writable
+
+// ...and the route that was already open: a `val`'s own elements are reachable as a writable `*T`
+// through a view of it, today, on purpose.
+@test("because a writable pointer into a 'val' is already reachable through a view of it")
+vpx_a_writable_pointer_through_a_view()
+    if vpx_skipped() then return
+
+    vpx_prints(raw"""
+        static val k: [4]int = [1, 2, 3, 4]
+        var s = k[1..<3]
+        var p = &s[0]
+        print(str(p[0]))
+        """, "2\n")
+end vpx_a_writable_pointer_through_a_view
