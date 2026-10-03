@@ -312,6 +312,176 @@ arg_default_reaches_a_generic_function()
         print(second("x", "y", true))
         """), "2\nx\n")
 
+// -- a literal default at a type parameter: read at the type the ARGUMENTS settle ------------------
+//
+// A default stands where the argument would have been, but a literal says nothing about its own type,
+// so it must not settle `T` -- and once the arguments have, it is read at that type
+// (`reference/declarations.md § Default parameters and named arguments`: "A default is read at the type
+// its parameter declares"). An integer literal is not a `real` (`reference/traits.md`: "an integer
+// literal is neither"), so at `T = real` the default `1` is refused rather than lowered as an int's
+// bits handed to a float, which is what it was.
+
+@test("an omitted literal default is read at the type a variable argument settles")
+arg_omitted_default_at_a_variable_argument()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        f[T](lo: T, step: T = 1.0) -> real = real(lo) + real(step)
+        val x: real = 0.5
+        print(f(x))
+        """), "1.5\n")
+
+@test("and at the type a written literal settles, which the default does not outvote")
+arg_omitted_default_at_a_written_literal()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        f[T](lo: T, step: T = 1.0) -> real = real(lo) + real(step)
+        print(f(0.5))
+        """), "1.5\n")
+
+@test("and at an integer the call settled, where it stays an integer")
+arg_omitted_default_at_a_settled_integer()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        f[T: Add](lo: T, step: T = 1) -> T = lo + step
+        val n: u8 = 41
+        print(f(n))
+        print(f(10))
+        """), "42\n11\n")
+
+@test("while a written argument at the defaulted parameter still stands")
+arg_written_argument_at_the_defaulted_parameter()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        f[T](lo: T, step: T = 1) -> real = real(lo) + real(step)
+        print(f(0.5, 0.25))
+        print(f(2, step = 3))
+        """), "0.75\n5\n")
+
+// A `u8` binding cannot take an `int`, so this compiling is the proof that the expected type reached
+// `T` ahead of the default's own spelling.
+@test("and it settles the parameter itself only where nothing the call or its context says")
+arg_default_settles_only_where_nothing_else_does()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        g[T](step: T = 1) -> T = step
+        print(g())
+        val b: u8 = g()
+        print(b)
+        """), "1\n1\n")
+
+@test("a generic struct's method reads its default at the receiver's argument")
+arg_struct_method_default_at_the_receiver()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        struct Box[T: Add]
+            v: T
+
+            bumped(self, by: T = 1) -> T = self.v + by
+        end Box
+
+        val b: u8 = 41
+        print(Box(b).bumped())
+        """), "42\n")
+
+// The refusal is about the default, and names the argument the reader wrote nowhere: `lo` is a real
+// literal, so `T` is real -- never "'lo' of 'f' is int, but real was given". It is anchored at the
+// default (line 1, column 23).
+@test("an integer default is refused where the arguments settle 'T' to real")
+arg_integer_default_refused_at_real()
+    if !arg_ready() then return
+
+    val said = arg_err(raw"""
+        f[T](lo: T, step: T = 1) -> real = real(lo) + real(step)
+        print(f(0.5))
+        """)
+
+    assert(arg_says(said, "'step' of 'f' was left to its default, and the default cannot be read at " +
+                    "real, the type the parameter has at this call"), said)
+    assert(!arg_says(said, "'lo' of 'f'"), said)
+    assert(arg_says(said, "1:23"), said)
+
+@test("and so is a float default where they settle it to int")
+arg_float_default_refused_at_int()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f[T](lo: T, step: T = 1.5) -> real = real(lo) + real(step)
+        print(f(2))
+        """, "'step' of 'f' was left to its default, and the default cannot be read at int, the type " +
+        "the parameter has at this call")
+
+// A literal the caller WROTE outranks one it left out, even where the left-out one stands first:
+// `b = 3` settles `T = int`, so it is the `1.5` default that is refused, never the `3`.
+@test("a written literal outranks a default that stands before it")
+arg_written_literal_outranks_an_earlier_default()
+    if !arg_ready() then return
+
+    val said = arg_err(raw"""
+        k[T](a: T = 1.5, b: T = 2) -> T = a
+        print(k(b = 3))
+        """)
+
+    assert(arg_says(said, "'a' of 'k' was left to its default, and the default cannot be read at int"),
+           said)
+    assert(!arg_says(said, "'b' of 'k'"), said)
+
+@test("and a generic struct's method's, at the receiver's argument")
+arg_struct_method_default_refused_at_the_receiver()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        struct Box[T: Add]
+            v: T
+
+            bumped(self, by: T = 1) -> T = self.v + by
+        end Box
+
+        print(Box(0.5).bumped())
+        """, "'by' of 'Box.bumped.real' was left to its default, and the default cannot be read at real")
+
+// Beyond the reference's cases: a variable argument settling `T = real` against an integer default,
+// and a member generic in its own right, whose `U` is settled by `by` and not by the default.
+@test("an integer default is refused where a variable argument settles 'T' to real")
+arg_integer_default_refused_at_a_real_variable()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f[T](lo: T, step: T = 1) -> real = real(lo) + real(step)
+        val x: real = 0.5
+        print(f(x))
+        """, "'step' of 'f' was left to its default, and the default cannot be read at real")
+
+@test("a generic member's own parameter is settled by its argument, not by its default")
+arg_generic_member_default_settled_by_the_argument()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        struct Box[T]
+            v: T
+
+            scaled[U](self, by: U, step: U = 1) -> real = real(by) + real(step)
+        end Box
+
+        print(Box(2).scaled(3))
+        """), "4\n")
+
+    arg_refuses(raw"""
+        struct Box[T]
+            v: T
+
+            scaled[U](self, by: U, step: U = 1) -> real = real(by) + real(step)
+        end Box
+
+        print(Box(2).scaled(0.25))
+        """, "'step' of 'Box.scaled.int.real' was left to its default, and the default cannot be read " +
+        "at real")
+
 // The bare arrow is a bounded type parameter, so what says what `y` is here is the bound.
 @test("a default may be a closure literal at a parameter written with the bare arrow")
 arg_closure_default_at_a_bare_arrow()

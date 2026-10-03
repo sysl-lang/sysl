@@ -372,7 +372,7 @@ end holds_string
 solve(a: &Analysis, scope: Scope, site: Scope, span: Span, what: string, tparams: Buf[string],
       param_refs: Buf[TypeRef], arg_tys: Buf[Type], result_ref: Option[TypeRef],
       expected: Option[Type], soft: Buf[bool], bounds: Buf[NamedBounds],
-      known: Buf[Binding]) -> Buf[Type]
+      known: Buf[Binding], defaulted: Buf[bool] = buf()) -> Buf[Type]
     var sub: Buf[Binding] = buf()
 
     for i in 0..<known.len()
@@ -385,9 +385,18 @@ solve(a: &Analysis, scope: Scope, site: Scope, span: Span, what: string, tparams
     if sub.len() < tparams.len() && result_ref.is_some() && expected.is_some() then
         unify(a, scope, result_ref.unwrap(), expected.unwrap(), tparams, &sub)
 
+    // `defaulted` marks the positions a call left to a parameter's default, and among the literals
+    // the ones the call WROTE go first: in `k[T](a: T = 1.5, b: T = 2)` called as `k(b = 3)`, the `3`
+    // settles `T = int` and it is the default that is then refused, never the argument the reader
+    // wrote. A default literal settles a parameter only where nothing else said anything.
     if sub.len() < tparams.len()
         for i in 0..<param_refs.len()
-            if i < arg_tys.len() && is_soft(soft, i) then
+            if i < arg_tys.len() && is_soft(soft, i) && !is_soft(defaulted, i) then
+                unify(a, scope, param_refs.at(i), arg_tys.at(i), tparams, &sub)
+
+    if sub.len() < tparams.len()
+        for i in 0..<param_refs.len()
+            if i < arg_tys.len() && is_soft(soft, i) && is_soft(defaulted, i) then
                 unify(a, scope, param_refs.at(i), arg_tys.at(i), tparams, &sub)
 
     // **What a callable argument yields is read back off the closure**, which is the other half of a
