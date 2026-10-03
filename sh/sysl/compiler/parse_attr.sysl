@@ -211,7 +211,8 @@ parse_attribute(p: *Parser) -> Option[Attr]
         return None
     end if
 
-    p.fault(at, s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, '@packed' and '@align(n)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
+    // Anchored after the word, as `@ignore`'s is: the reference's point for both.
+    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, '@packed' and '@align(n)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
     skip_line(p)
     None
 end parse_attribute
@@ -537,6 +538,14 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     // of a declaration with no fields -- so it takes `@export` alone and nothing that lays out.
     if p.at_kw("type") && all_are(attrs, "export")
         return exported_type(parse_type_decl(p, at, vis), attrs)
+
+    // At the end of the file there is no declaration below for the annotations to be about, so
+    // nothing an annotation's own sentence says is true of it: the grammar refuses it, at the word
+    // after the `@`, as the reference does.
+    if p.at(Eof)
+        p.fault(Span(start.start + 1, start.start + 1), "an attribute expected")
+        return stmt(start.to(p.just_taken()), Bad)
+    end if
 
     refuse_unless(p, at, attrs, "function")
 
