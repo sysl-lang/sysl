@@ -311,10 +311,13 @@ reads_in_place(e: *Emit, f: TFunc, promoted: Buf[string]) -> Buf[string]
 end reads_in_place
 
 // The local a writable view is taken inside of. A view of a slice or a string reaches storage the
-// local does not hold, so only an array's counts.
+// local does not hold, so only an array's counts; and a `[]const T` writes nothing, so it lets nothing
+// out.
 private viewed_root(out: &NameSink, x: TExpr) = *x.kind match
-    TSlice(base, _, _, _, _) -> repr(texpr_type(base)) match
-        Array(_, _) -> add_root(out, base)
+    TSlice(base, _, _, _, slice_ty) -> repr(slice_ty) match
+        Slice(_, false) -> repr(texpr_type(base)) match
+            Array(_, _) -> add_root(out, base)
+            _ -> ()
         _ -> ()
     _ -> ()
 
@@ -472,6 +475,9 @@ end exposed_in
 
 private exposed_node(out: &NameSink, x: TExpr) = *x.kind match
     TAddrOf(place, _) -> add_root(out, place)
+    // A writable view of an array is the array's address under another spelling: handed to a call,
+    // it lets the callee write the local though no address of it was taken.
+    TSlice(_, _, _, _, _) -> viewed_root(out, x)
     _ -> ()
 
 private exposed_stmt(out: &NameSink, s: TStmt) = s match
