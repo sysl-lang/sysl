@@ -2655,13 +2655,21 @@ variadic_extra(cx: &Analyzer, a: Expr, foreign: bool) -> TExpr
 end variadic_extra
 
 // A named subtype or a qualifier over one of the scalars a tail carries crosses as its base does.
-private tail_scalar(t: Type) -> bool = underlying(t) match
+// A CHECKING subtype -- one with a range or a predicate -- does not: C would read back a bare
+// integer the subtype's check never sees again, so `Small` is refused where `int` is not.
+private tail_scalar(t: Type) -> bool = tail_peeled(t) match
     Integer(_, _, _) -> true
     Floating(_, _) -> true
     Char -> true
     Ptr(_) -> true
     CFn(_, _) -> true
     _ -> false
+
+// The type with every qualifier and every subtype that checks nothing taken off.
+private tail_peeled(t: Type) -> Type = t match
+    Constrained(d) -> if d.lo.is_none() && d.hi.is_none() && d.pred_fn.is_none() then tail_peeled(d.base) else t
+    Volatile(inner) -> tail_peeled(*inner)
+    _ -> t
 
 // Whether a tail argument is an aggregate as the C convention classifies one: `cabi.sysl`'s
 // `c_aggregate` without the layout, which analysis does not have.
