@@ -1,0 +1,496 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **What a target decides about the link, asserted on the command line rather than by linking.**
+//
+// A program that needs `sqrt` links on a Mac whether or not `-lm` is passed, since Darwin keeps the
+// mathematics in `libSystem`; the same program on ELF fails at the link without it. So the machine
+// that would find the mistake is not the machine the compiler is developed on, and the only honest
+// test is one that reads the arguments a cross target would be given. The library named throughout
+// is `m`, the one the standard module itself asks for and the one whose placement differs most.
+
+// The line for a program that asked for the mathematics, with one archive beside its module.
+private lkc_command(t: Target) -> Buf[string]
+    var objects: Buf[string] = buf()
+    var links: Buf[string] = buf()
+
+    objects.push("std.syslib")
+    links.push("m")
+    link_command("clang", "prog.ll", objects, "prog", t, DefaultOptimization, links, no_probe())
+end lkc_command
+
+// The line for a program that named nothing at all.
+private lkc_bare(t: Target) -> Buf[string] =
+    link_command("clang", "prog.ll", buf(), "prog", t, DefaultOptimization, buf(), no_probe())
+
+private lkc_target(name: string) -> Target = target_named(name).unwrap()
+
+private lkc_one(word: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(word)
+    out
+end lkc_one
+
+private lkc_two(a: string, b: string) -> Buf[string]
+    var out = lkc_one(a)
+
+    out.push(b)
+    out
+end lkc_two
+
+private lkc_has(line: Buf[string], word: string) -> bool = lkc_index(line, word) >= 0
+
+// Where a word sits on the line, or -1 where it is not there.
+private lkc_index(line: Buf[string], word: string) -> int
+    for i in 0..<line.len()
+        if line.at(i) == word then return int(i)
+
+    -1
+end lkc_index
+
+private lkc_starting(line: Buf[string], prefix: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<line.len()
+        if line.at(i).starts_with(prefix) then out.push(line.at(i))
+
+    out
+end lkc_starting
+
+// -- the mathematics library ---------------------------------------------------------------------
+
+// ELF has libm as a library of its own, so a program that reaches `sysl.math` has to ask for it.
+@test("is asked for on Linux")
+lkc_libm_asked_for_on_linux()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.os == Linux then assert(lkc_has(lkc_command(t), "-lm"), s"${t.name} was not told -lm")
+end lkc_libm_asked_for_on_linux
+
+// Darwin's is inside `libSystem` and Windows' inside the CRT, both linked without being told; there
+// is no such library to find there, and passing one fails the link.
+@test("is not asked for where the host already carries it")
+lkc_libm_not_asked_for_where_carried()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.os == MacOS || t.os == Windows
+            assert(!lkc_has(lkc_command(t), "-lm"), s"${t.name} was told -lm")
+end lkc_libm_not_asked_for_where_carried
+
+// A bare target has no libc at all, so asking for libm would fail the link of a kernel that never
+// wanted mathematics.
+@test("is not asked for on a freestanding target, which has no libc to hold it")
+lkc_libm_not_asked_for_freestanding()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.os == Freestanding
+            assert(lkc_starting(lkc_command(t), "-l").is_empty(), s"${t.name} was told a library")
+end lkc_libm_not_asked_for_freestanding
+
+// Asking every target in the registry is what makes adding one a decision. Android was measured
+// rather than assumed to be Linux's twin: an NDK link of a program calling `tgamma` fails without it.
+@test("every target in the registry has an answer, and only Linux's and Android's ask for it")
+lkc_only_linux_and_android_ask_for_libm()
+    val all = all_targets()
+    var asking: Buf[string] = buf()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if !library_flags(lkc_one("m"), t).is_empty()
+            val os = os_symbol(t.os)
+
+            if !lkc_has(asking, os) then asking.push(os)
+
+    assert_eq(joined(asking, ","), s"${os_symbol(Linux)},${os_symbol(Android)}")
+    assert_eq(joined(library_flags(lkc_one("m"), lkc_target("aarch64-android")), " "), "-lm")
+end lkc_only_linux_and_android_ask_for_libm
+
+// The directive is what makes it happen: the list is read rather than remembered.
+@test("is not asked for at all when nothing named it")
+lkc_libm_not_asked_for_unnamed()
+    reset_search_paths()
+    assert(!lkc_has(lkc_bare(lkc_target("x86_64-linux")), "-lm"), "a line that named nothing has -lm")
+end lkc_libm_not_asked_for_unnamed
+
+// -- the WebAssembly link ------------------------------------------------------------------------
+
+// Without it the driver opens a wasm link the way it opens a hosted one, with a `crt1.o` and a `-lc`
+// that do not exist for this triple, and the error reads as a broken LLVM installation.
+@test("says -nostdlib, so the driver does not reach for a libc that is not there")
+lkc_wasm_says_nostdlib()
+    reset_search_paths()
+    assert(lkc_has(lkc_command(lkc_target("wasm32-freestanding")), "-nostdlib"), "no -nostdlib")
+end lkc_wasm_says_nostdlib
+
+// `--no-entry` paired with `--gc-sections` leaves nothing reachable, so the linker drops the whole
+// program and reports success. Naming `main` keeps it.
+@test("names main as the entry, because --no-entry would link an empty module green")
+lkc_wasm_names_main_as_entry()
+    reset_search_paths()
+
+    val said = lkc_command(lkc_target("wasm32-freestanding"))
+
+    assert(lkc_has(said, "-Wl,--entry=main"), "no --entry=main")
+    assert(!lkc_has(said, "-Wl,--no-entry"), "told --no-entry")
+end lkc_wasm_names_main_as_entry
+
+// Both are this target's and no other processor's.
+@test("and says neither to any other target")
+lkc_wasm_flags_nowhere_else()
+    reset_search_paths()
+
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.cpu != Wasm32
+            val said = lkc_command(t)
+
+            assert(!lkc_has(said, "-nostdlib"), s"${t.name} was told -nostdlib")
+            assert(lkc_starting(said, "-Wl,--entry").is_empty(), s"${t.name} was told an entry")
+end lkc_wasm_flags_nowhere_else
+
+// -- resolving a library name for a target -------------------------------------------------------
+
+@test("passes an unknown library through on every hosted target, since only its placement is guessable")
+lkc_unknown_library_passes_through()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.os != Freestanding
+            assert_eq(joined(library_flags(lkc_one("z"), t), " "), "-lz")
+end lkc_unknown_library_passes_through
+
+// The C runtime is linked unasked everywhere it exists, so naming it is legal and costs nothing.
+@test("asks for libc nowhere, because every target that has one links it already")
+lkc_libc_asked_for_nowhere()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        assert(library_flags(lkc_one("c"), t).is_empty(), s"${t.name} was told -lc")
+end lkc_libc_asked_for_nowhere
+
+@test("keeps a library a freestanding target might really have")
+lkc_freestanding_keeps_a_board_library()
+    val all = all_targets()
+    var bare: Option[Target] = None
+
+    for i in 0..<all.len()
+        if bare.is_none() && all.at(i).os == Freestanding then bare = Some(all.at(i))
+
+    assert_eq(joined(library_flags(lkc_two("m", "boardsupport"), bare.unwrap()), " "),
+              "-lboardsupport")
+end lkc_freestanding_keeps_a_board_library
+
+// An archive is scanned once, left to right, so a library calling into another has to precede it.
+@test("keeps the order they were written in rather than sorting them")
+lkc_libraries_keep_their_order()
+    val linux = lkc_target("x86_64-linux")
+
+    assert_eq(joined(library_flags(lkc_two("png", "z"), linux), " "), "-lpng -lz")
+    assert_eq(joined(library_flags(lkc_two("z", "png"), linux), " "), "-lz -lpng")
+end lkc_libraries_keep_their_order
+
+// -- the order the linker scans in ---------------------------------------------------------------
+
+// Asserted as positions rather than as a whole list, so an unrelated flag does not fail it.
+@test("puts the module first, then the archives, then the system libraries")
+lkc_module_then_archives_then_libraries()
+    reset_search_paths()
+
+    val cmd = lkc_command(lkc_target("x86_64-linux"))
+    val ll = lkc_index(cmd, "prog.ll")
+    val arch = lkc_index(cmd, "std.syslib")
+    val libm = lkc_index(cmd, "-lm")
+
+    assert(ll > 0, "no module")
+    assert(arch > ll, "the archive is not after the module")
+    assert(libm > arch, "-lm is not after the archive")
+end lkc_module_then_archives_then_libraries
+
+@test("and names the output last, so nothing is scanned after it")
+lkc_output_last()
+    reset_search_paths()
+
+    val cmd = lkc_command(lkc_target("x86_64-linux"))
+
+    assert_eq(cmd.at(cmd.len() - 2), "-o")
+    assert_eq(cmd.at(cmd.len() - 1), "prog")
+end lkc_output_last
+
+@test("carries the dead-strip spelling the object format uses")
+lkc_dead_strip_per_format()
+    reset_search_paths()
+    assert(lkc_has(lkc_command(lkc_target("aarch64-macos")), "-Wl,-dead_strip"), "no -dead_strip")
+    assert(lkc_has(lkc_command(lkc_target("x86_64-linux")), "-Wl,--gc-sections"), "no --gc-sections")
+end lkc_dead_strip_per_format
+
+@test("states the triple, so a cross target fails at the link rather than building for the host")
+lkc_states_the_triple()
+    reset_search_paths()
+
+    val riscv = lkc_target("riscv64-linux")
+
+    assert(lkc_has(lkc_command(riscv), s"--target=${riscv.triple}"), "no --target")
+end lkc_states_the_triple
+
+// -- the optimization level ----------------------------------------------------------------------
+
+// `-O0` is deliberately not the default: the fast instruction selector is a different algorithm from
+// the one everything else ships through, and a miscompile was found living there.
+@test("is asked for, and defaults to something other than none at all")
+lkc_level_defaults_to_something()
+    reset_search_paths()
+    assert(lkc_has(lkc_command(lkc_target("aarch64-macos")), s"-O$DefaultOptimization"), "no level")
+    assert(DefaultOptimization != "0", "the default level is none at all")
+end lkc_level_defaults_to_something
+
+// Whatever was written, spelled after the `-O`; a level clang has no answer for is clang's to say.
+@test("is whatever was named, and only that")
+lkc_level_is_whatever_was_named()
+    reset_search_paths()
+
+    val levels = ["0", "2", "3", "s", "fast"]
+
+    for i in 0..<levels.len
+        val cmd = link_command("clang", "prog.ll", buf(), "prog", lkc_target("aarch64-macos"),
+                               levels[i], buf(), no_probe())
+
+        assert(lkc_has(cmd, s"-O${levels[i]}"), s"no -O${levels[i]}")
+        assert_eq(lkc_starting(cmd, "-O").len(), 1)
+end lkc_level_is_whatever_was_named
+
+// A driver flag goes in front of the inputs rather than after the output.
+@test("is stated before the module it applies to")
+lkc_level_before_the_module()
+    reset_search_paths()
+
+    val cmd = lkc_command(lkc_target("x86_64-linux"))
+
+    assert(lkc_index(cmd, s"-O$DefaultOptimization") < lkc_index(cmd, "prog.ll"),
+           "the level is after the module")
+end lkc_level_before_the_module
+
+// -- a search path given to the driver -----------------------------------------------------------
+
+// The line for a program on x86_64 Linux with `--link-path` naming each of `dirs`.
+private lkc_with_paths(dirs: Buf[string]) -> Buf[string]
+    reset_search_paths()
+
+    for i in 0..<dirs.len()
+        add_link_path(dirs.at(i))
+
+    val cmd = lkc_command(lkc_target("x86_64-linux"))
+
+    reset_search_paths()
+    cmd
+end lkc_with_paths
+
+@test("reaches the command line as clang spells one")
+lkc_search_path_spelled_as_clang()
+    assert(lkc_has(lkc_with_paths(lkc_one("/opt/homebrew/lib")), "-L/opt/homebrew/lib"), "no -L")
+end lkc_search_path_spelled_as_clang
+
+// A search path is where the scan looks rather than an input being scanned.
+@test("comes before everything it could affect")
+lkc_search_path_before_what_it_affects()
+    val cmd = lkc_with_paths(lkc_one("/opt/homebrew/lib"))
+    val at = lkc_index(cmd, "-L/opt/homebrew/lib")
+
+    assert(at >= 0, "no -L")
+    assert(at < lkc_index(cmd, "prog.ll"), "the -L is after the module")
+    assert(at < lkc_index(cmd, "-lm"), "the -L is after -lm")
+end lkc_search_path_before_what_it_affects
+
+@test("keeps the order it was given in, since that is the order searched")
+lkc_search_paths_keep_their_order()
+    assert_eq(joined(lkc_starting(lkc_with_paths(lkc_two("/first", "/second")), "-L"), " "),
+              "-L/first -L/second")
+end lkc_search_paths_keep_their_order
+
+// What a build with no such flag pays: nothing.
+@test("is absent altogether when none was given")
+lkc_no_search_path_when_none_given()
+    reset_search_paths()
+    assert(lkc_starting(lkc_command(lkc_target("x86_64-linux")), "-L").is_empty(), "a -L appeared")
+end lkc_no_search_path_when_none_given
+
+// Guessing `/opt/homebrew/lib` would be wrong for a machine nobody here has.
+@test("is never guessed at for the host")
+lkc_search_path_never_guessed()
+    reset_search_paths()
+
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        assert(lkc_starting(lkc_bare(t), "-L").is_empty(), s"${t.name} was given a -L")
+end lkc_search_path_never_guessed
+
+// -- a run-time search path for what --link-path named -------------------------------------------
+
+// A shared library at an `@rpath` install name needs the program to carry a run-time search path,
+// and `-L` writes none: the link is clean and the run dies with `no LC_RPATH's found`. A directory
+// named to sysl is the only thing anybody gets to say about where the library is, so it is both.
+@test("is emitted beside the -L, so a dylib found at the link is found again at load")
+lkc_rpath_beside_the_search_path()
+    assert(lkc_has(lkc_with_paths(lkc_one("/opt/pfx/lib")), "-Wl,-rpath,/opt/pfx/lib"), "no rpath")
+end lkc_rpath_beside_the_search_path
+
+@test("is one per directory, in the order they were given")
+lkc_rpath_one_per_directory()
+    assert_eq(joined(lkc_starting(lkc_with_paths(lkc_two("/first", "/second")), "-Wl,-rpath"), " "),
+              "-Wl,-rpath,/first -Wl,-rpath,/second")
+end lkc_rpath_one_per_directory
+
+// The loader reads an rpath in whatever directory the program is run from, so a relative one names
+// a place nobody meant.
+@test("is absolute even where a relative directory was named")
+lkc_rpath_is_absolute()
+    val said = lkc_starting(lkc_with_paths(lkc_one("build/lib")), "-Wl,-rpath")
+
+    assert_eq(said.len(), 1)
+    assert(said.at(0).starts_with("-Wl,-rpath,/"), s"not absolute: ${said.at(0)}")
+    assert(said.at(0).ends_with("/build/lib"), s"not the directory named: ${said.at(0)}")
+    assert(!said.at(0).contains("/./"), s"not normalized: ${said.at(0)}")
+end lkc_rpath_is_absolute
+
+// A probe answers with its own rpath where the library's `.pc` file wanted one; a second, guessed
+// one would override a decision the library had already made.
+@test("is not emitted for a directory a pkg-config probe answered with")
+lkc_no_rpath_for_a_probed_directory()
+    reset_search_paths()
+
+    val probed = PkgAnswer(buf(), lkc_two("-L/opt/probed/lib", "-lcairo"))
+    val cmd = link_command("clang", "prog.ll", buf(), "prog", lkc_target("aarch64-linux"),
+                           DefaultOptimization, buf(), probed)
+
+    assert(lkc_has(cmd, "-L/opt/probed/lib"), "the probe's -L is missing")
+    assert(lkc_starting(cmd, "-Wl,-rpath").is_empty(), "an rpath was guessed")
+end lkc_no_rpath_for_a_probed_directory
+
+// There is no loader on a bare machine to read one, so there is nothing to say.
+@test("is not emitted for a freestanding target, which has no loader to read one")
+lkc_no_rpath_freestanding()
+    reset_search_paths()
+    add_link_path("/opt/pfx/lib")
+
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.os == Freestanding
+            assert(lkc_starting(lkc_bare(t), "-Wl,-rpath").is_empty(), s"${t.name} has an rpath")
+
+    reset_search_paths()
+end lkc_no_rpath_freestanding
+
+// Every hosted target has a loader and every one of them gets it.
+@test("is emitted for every target that is not freestanding")
+lkc_rpath_every_hosted_target()
+    reset_search_paths()
+    add_link_path("/opt/pfx/lib")
+
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.os != Freestanding
+            assert(lkc_has(lkc_bare(t), "-Wl,-rpath,/opt/pfx/lib"), s"${t.name} has no rpath")
+
+    reset_search_paths()
+end lkc_rpath_every_hosted_target
+
+@test("is absent altogether when no --link-path was given")
+lkc_no_rpath_when_none_given()
+    reset_search_paths()
+
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        assert(lkc_starting(lkc_bare(t), "-Wl,-rpath").is_empty(), s"${t.name} has an rpath")
+end lkc_no_rpath_when_none_given
+
+// -- a program with no archives ------------------------------------------------------------------
+
+// A directive resolves what the program's own externs name, not only what the standard module's do.
+@test("a link with no archives still asks for the mathematics on Linux")
+lkc_no_archives_still_libm()
+    reset_search_paths()
+
+    val cmd = link_command("clang", "prog.ll", buf(), "prog", lkc_target("aarch64-linux"),
+                           DefaultOptimization, lkc_one("m"), no_probe())
+
+    assert(lkc_has(cmd, "-lm"), "no -lm")
+    assert(lkc_index(cmd, "-lm") > lkc_index(cmd, "prog.ll"), "-lm is before the module")
+end lkc_no_archives_still_libm
+
+// -- what a probe answered -----------------------------------------------------------------------
+
+// **macOS cannot find this**: `ld64` gathers every `-L` before resolving anything, while GNU ld
+// applies a `-L` only to the `-l` options after it.
+private lkc_probed() -> PkgAnswer
+    var flags = lkc_two("-L/opt/pfx/lib", "-Wl,-rpath,/opt/pfx/lib")
+
+    flags.push("-lcairo")
+    PkgAnswer(buf(), flags)
+end lkc_probed
+
+@test("puts its search paths above the objects, where a -l from a directive can still see them")
+lkc_probe_search_paths_above_objects()
+    reset_search_paths()
+
+    val cmd = link_command("clang", "prog.ll", buf(), "prog", lkc_target("aarch64-linux"),
+                           DefaultOptimization, lkc_one("cairo"), lkc_probed())
+
+    assert(lkc_index(cmd, "-L/opt/pfx/lib") >= 0, "no -L")
+    assert(lkc_index(cmd, "-L/opt/pfx/lib") < lkc_index(cmd, "prog.ll"), "the -L is after the module")
+end lkc_probe_search_paths_above_objects
+
+// A `-l` above the objects is dropped by any linker resolving an archive in one pass.
+@test("and puts the library itself, and its rpath, after everything that could refer to it")
+lkc_probe_library_after_objects()
+    reset_search_paths()
+
+    val cmd = link_command("clang", "prog.ll", lkc_one("std.syslib"), "prog",
+                           lkc_target("aarch64-linux"), DefaultOptimization, buf(), lkc_probed())
+
+    assert(lkc_index(cmd, "-lcairo") > lkc_index(cmd, "std.syslib"), "-lcairo is before the archive")
+    assert(lkc_index(cmd, "-Wl,-rpath,/opt/pfx/lib") > lkc_index(cmd, "prog.ll"),
+           "the rpath is before the module")
+end lkc_probe_library_after_objects
+
+@test("and adds nothing at all when nothing was probed")
+lkc_nothing_probed_adds_nothing()
+    reset_search_paths()
+
+    val linux = lkc_target("aarch64-linux")
+
+    assert_eq(joined(lkc_bare(linux), " "),
+              joined(link_command("clang", "prog.ll", buf(), "prog", linux, DefaultOptimization,
+                                  buf(), PkgAnswer(buf(), buf())), " "))
+end lkc_nothing_probed_adds_nothing
