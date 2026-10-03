@@ -1,0 +1,231 @@
+module sh.sysl.compiler
+@tests
+
+// The widened scalar table at run time (`reference/types.md`): integer widths and signedness, the
+// IEEE float widths, `char`, and the explicit conversions between them.
+//
+// **Every output quoted here was read out of the reference compiler**, whose `ScalarRunTests` these
+// are. The programs are built and run through the `enm_` helpers (`tests_enm_enum_run.sysl`).
+
+@test("arithmetic wraps at the declared width")
+scx_arithmetic_wraps_at_the_declared_width()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var b: byte = 200\nvar c: byte = 100\nprint(b + c)\n"), "44\n")
+
+@test("an odd width wraps at its own bit count")
+scx_an_odd_width_wraps_at_its_own_bit_count()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var n: u12 = 4095\nprint(n, n + 1)\n"), "4095 0\n")
+
+@test("a signed minimum is writable as a negated literal")
+scx_a_signed_minimum_is_a_negated_literal()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var s: i8 = -128\nvar w: i32 = -2147483648\nprint(s, w)\n"),
+              "-128 -2147483648\n")
+
+@test("the 64-bit extremes print unmangled")
+scx_the_64_bit_extremes_print_unmangled()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var big: i64 = 9223372036854775807\nvar u: u64 = 18446744073709551615\nprint(big, u)\n"),
+              "9223372036854775807 18446744073709551615\n")
+
+@test("a literal takes the width its context expects")
+scx_a_literal_takes_the_width_its_context_expects()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("f(x: u16) -> u16 = x * 2\nprint(f(300))\n"), "600\n")
+
+@test("a suffix names the width on the spot")
+scx_a_suffix_names_the_width_on_the_spot()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("print(7i8, 250u8, 10usize)\n"), "7 250 10\n")
+
+@test("usize divides and compares unsigned")
+scx_usize_divides_and_compares_unsigned()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var n: usize = 40\nprint(n / 3, n % 3, n > 39usize)\n"), "13 1 true\n")
+
+// Signedness picks the instruction.
+
+@test("division and remainder")
+scx_division_and_remainder()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var s: i32 = -7\nvar u: u32 = 4294967289\nprint(s / 2, u / 2)\n"),
+              "-3 2147483644\n")
+
+@test("the right shift keeps the sign only when the type has one")
+scx_the_right_shift_keeps_the_sign_only_when_signed()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var s: i8 = -8\nvar u: u8 = 200\nprint(s >> 1, u >> 2)\n"), "-4 50\n")
+
+@test("comparison of a large unsigned value is not a negative one")
+scx_a_large_unsigned_value_is_not_negative()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var u: u32 = 4000000000\nprint(u > 1u32)\n"), "true\n")
+
+// The floating-point widths.
+
+@test("f32 computes and prints")
+scx_f32_computes_and_prints()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var f: f32 = 1.5\nprint(f, f * 2.0)\n"), "1.5 3\n")
+
+@test("f16 holds a value it can represent exactly")
+scx_f16_holds_an_exact_value()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var h: f16 = 0.5\nprint(h + 0.25)\n"), "0.75\n")
+
+// A literal crosses the emitter as a binary64 bit pattern narrowed to the width, so a value that is
+// not a `half` is rounded to the nearest one: what prints is the nearest `f16` to a tenth.
+@test("and rounds one it cannot to the nearest it can")
+scx_f16_rounds_to_the_nearest_it_can()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var h: f16 = 0.1\nprint(h)\n"), "0.0999756\n")
+
+// IEEE 754 leaves a NaN unequal to everything including itself and makes `!=` the negation of `==`,
+// so exactly one of the five answers true.
+@test("a NaN is unequal to itself, and unordered against everything")
+scx_a_nan_is_unequal_to_itself()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var nan = 0.0 / 0.0\nprint(nan != nan, nan == nan, nan < 1.0, nan > 1.0, nan <= 1.0, nan >= 1.0)\n"),
+              "true false false false false false\n")
+
+@test("and unequal to an ordinary number, which is the same answer for the same reason")
+scx_a_nan_is_unequal_to_an_ordinary_number()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var nan = 0.0 / 0.0\nprint(nan != 1.0, 1.0 != nan, nan == 1.0)\n"),
+              "true true false\n")
+
+@test("while two ordinary floats still compare the ordinary way")
+scx_two_ordinary_floats_compare_the_ordinary_way()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("print(1.5 != 2.5, 1.5 != 1.5, 1.5 == 1.5)\n"), "true false true\n")
+
+@test("the same holds at a narrower width")
+scx_a_nan_at_a_narrower_width()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var z: f32 = 0.0\nvar nan: f32 = z / z\nprint(nan != nan, nan == nan)\n"),
+              "true false\n")
+
+@test("for loops follow the width of their bounds")
+scx_for_loops_follow_the_width_of_their_bounds()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var count: u16 = 0\nfor i in 0u16..<5u16\n    count += i\nprint(count)\n"), "10\n")
+
+// `char`.
+
+@test("prints as UTF-8 at every encoded length")
+scx_char_prints_as_utf8_at_every_length()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"print('A', 'é', '\u{2603}', '\u{1F600}')" + "\n"), "A é ☃ 😀\n")
+
+@test("orders by scalar value, which chains")
+scx_char_orders_by_scalar_value()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var c = 'q'\nprint('a' <= c <= 'z')\n"), "true\n")
+
+@test("matches literals and ranges")
+scx_char_matches_literals_and_ranges()
+    if !enm_ready() then return
+
+    val text = raw"""
+        kind(c: char) -> string
+            c match
+                'a'..'z' -> "lower"
+                ' ' -> "space"
+                else "other"
+        end kind
+        print(kind('m'), kind(' '), kind('7'))
+        """
+
+    assert_eq(enm_ran(text), "lower space other\n")
+
+// Conversions.
+
+@test("widen, narrow, and change signedness")
+scx_widen_narrow_and_change_signedness()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var s: i8 = -1\nprint(i32(s), byte(s), u16(300u32), byte(300u32))\n"),
+              "-1 255 300 44\n")
+
+@test("cross between integer and floating point")
+scx_cross_between_integer_and_floating_point()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("print(int(3.9), int(-3.9), f32(7) / f32(2), real(3))\n"), "3 -3 3.5 3\n")
+
+@test("carry a char to its codepoint and back")
+scx_carry_a_char_to_its_codepoint_and_back()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("print(u32('A'), char(9731))\n"), "65 ☃\n")
+
+// The fallible way from a codepoint (`reference/types.md § char`): `char(u)` traps and
+// `char_from_u32(u)` answers. A `u32` fails to be a scalar value past `0x10FFFF` and at either end
+// of the surrogate range, whose boundaries are what a `<`/`<=` slip moves.
+
+// Round-trips one `u32` through the fallible constructor, reading a success back as its own
+// codepoint so an unprintable answer is still something a test can compare.
+private scx_ask(u: string) -> string
+    enm_ran(s"import sysl.text.char_from_u32\n\nchar_from_u32(${u}u32) match\n    Some(c) -> print(u32(c))\n    None -> print(\"no\")\n")
+
+@test("a valid scalar value comes back, and is the character it names")
+scx_a_valid_scalar_value_comes_back()
+    if !enm_ready() then return
+
+    assert_eq(scx_ask("9731"), "9731\n")
+    assert_eq(enm_ran("import sysl.text.char_from_u32\n\nchar_from_u32(9731u32) match\n    Some(c) -> print(c)\n    None -> print(\"no\")\n"),
+              "☃\n")
+
+@test("the highest scalar value comes back")
+scx_the_highest_scalar_value_comes_back()
+    if !enm_ready() then return
+
+    assert_eq(scx_ask("1114111"), "1114111\n")
+
+@test("one past the highest does not")
+scx_one_past_the_highest_does_not()
+    if !enm_ready() then return
+
+    assert_eq(scx_ask("1114112"), "no\n")
+
+@test("a surrogate does not, at either end of the range")
+scx_a_surrogate_does_not()
+    if !enm_ready() then return
+
+    assert_eq(scx_ask("55296"), "no\n")
+    assert_eq(scx_ask("57343"), "no\n")
+
+@test("and the values either side of the surrogates do")
+scx_the_values_either_side_of_the_surrogates_do()
+    if !enm_ready() then return
+
+    assert_eq(scx_ask("55295"), "55295\n")
+    assert_eq(scx_ask("57344"), "57344\n")
+
+// The trapping cast is the other spelling, and it has to keep trapping.
+@test("the trapping spelling still traps on what this refuses")
+scx_the_trapping_spelling_still_traps()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits("print(char(1114112u32))\n"), "")
