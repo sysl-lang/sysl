@@ -1,0 +1,98 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A trait's member whose bare-arrow parameter names the trait's own associated type,
+// `over[N](self, f: Self::Item -> N) -> N`. The arrow is rewritten into a type parameter bounded by
+// a callable, so `Self::Item` has to be read where `Self` is bound: on the trait's member, in a
+// default body copied to each implementing type, and on a generic implementing type whose `Self` is
+// itself still being solved.
+//
+// **Every output here was read out of the reference compiler** on the same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private tcl_skip_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end tcl_skip_run
+
+// What the program PRINTS, or what the build had to say about it.
+private tcl_ran(main: string) -> string
+    val root = make_temp_dir("sysl-tcl").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tcl_ran
+
+// The trait every case below implements: `first` answers the associated type, and `over` hands it
+// to a closure whose result type the closure chooses.
+private tcl_mapper() -> string =
+    "trait Mapper\n    type Item\n    first(self) -> Self::Item\n" +
+    "    over[N](self, f: Self::Item -> N) -> N = f(self.first())\n"
+
+private tcl_one() -> string =
+    "struct One\n    v: int\nimpl Mapper for One\n    type Item = int\n    first(self) -> int = self.v\n"
+
+// -- an arrow may name an associated type ---------------------------------------------------------
+
+@test("and 'Self::Item' on a trait's own member")
+tcl_self_item_on_a_traits_own_member()
+    if tcl_skip_run() then return
+
+    assert_eq(tcl_ran(tcl_mapper() + tcl_one() + "print(One(20).over(n -> n + 1))"), "21\n")
+
+@test("with a default body copied to two implementing types")
+tcl_default_copied_to_two_types()
+    if tcl_skip_run() then return
+
+    assert_eq(tcl_ran(tcl_mapper() + tcl_one() +
+                      "struct Word\n    w: string\nimpl Mapper for Word\n    type Item = string\n" +
+                      "    first(self) -> string = self.w\n" +
+                      "print(One(20).over(n -> n + 1))\nprint(Word(\"hello\").over(s -> s.len))"),
+              "21\n5\n")
+
+@test("with a default body on a generic implementing type")
+tcl_default_on_a_generic_implementing_type()
+    if tcl_skip_run() then return
+
+    assert_eq(tcl_ran(tcl_mapper() + "struct Box[T]\n    v: T\nimpl[T] Mapper for Box[T]\n" +
+                      "    type Item = T\n    first(self) -> T = self.v\nprint(Box(20).over(n -> n + 1))"),
+              "21\n")
+
+@test("with the projection on both sides of a default's arrow")
+tcl_projection_on_both_sides()
+    if tcl_skip_run() then return
+
+    assert_eq(tcl_ran("trait Mapper\n    type Item\n    first(self) -> Self::Item\n" +
+                      "    twice(self, f: Self::Item -> Self::Item) -> Self::Item = f(f(self.first()))\n" +
+                      tcl_one() + "print(One(20).twice(n -> n + 1))"),
+              "22\n")

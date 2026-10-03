@@ -31,6 +31,19 @@ self_binding(t: Type) -> Buf[Binding]
     out
 end self_binding
 
+// The terms a bound written on the parameter `tp` is read under: `subst`, with `Self` standing for
+// `self_ty`, the type the bound asks something of. That holds whether `Self` was written in the bound
+// or arrives from one of the trait's defaults, so a bare `U: Add` is `Add[U, U]`. **`Self` goes
+// FIRST**, a substitution answering with the first binding of a name: an enclosing `Self` -- the
+// trait's, around a default body, or the receiver's, at a copied default's call -- would otherwise
+// answer instead and turn the bound into `Add[Self]`.
+//
+// **A bound the bare-arrow sugar added is the exception.** Its arguments were written in a parameter
+// list, where `Self` is the receiver's type, so an enclosing `Self` keeps answering there.
+bound_terms(subst: Buf[Binding], tp: string, self_ty: Type) -> Buf[Binding] =
+    if is_call_bound(tp) then joined_bindings(subst, self_binding(self_ty))
+    else joined_bindings(self_binding(self_ty), subst)
+
 // Two substitutions, the second winning where they name the same thing.
 joined_bindings(outer: Buf[Binding], inner: Buf[Binding]) -> Buf[Binding]
     var out: Buf[Binding] = buf()
@@ -719,8 +732,7 @@ unmet_condition_of(a: &Analysis, ti: TraitImpl, subst: Buf[Binding]) -> Option[(
         if arg.is_some()
             for j in 0..<nb.bounds.len()
                 val b = nb.bounds.at(j)
-                val tr = resolve_bound(a, ti.scope, b.span, b,
-                                       joined_bindings(subst, self_binding(arg.unwrap())))
+                val tr = resolve_bound(a, ti.scope, b.span, b, bound_terms(subst, nb.name, arg.unwrap()))
 
                 if !satisfies(a, tr, arg.unwrap()) then return Some((arg.unwrap(), tr))
 
