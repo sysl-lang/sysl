@@ -238,26 +238,34 @@ private holds_an_address(t: Type) -> bool = repr(t) match
 // out of the array goes through fields and an array's own elements and stops at the first box it
 // meets, which answers only when it is a `&sync` one. A view takes and gives back its share of the
 // box the ordinary way while another domain changes the same count atomically, so such an array may
-// be read by index or walked, never sliced (`reference/arrays.md § What is still refused`).
-sync_box_around(base: TExpr) -> Option[Type]
+// be read by index or walked, never sliced (`reference/arrays.md § What is still refused`). **A
+// `ref` is a second name for the place it stood for**, so the walk goes on through the place it was
+// bound to: `ref q = r.samples` and then `q[..]` is the same view of the same box.
+sync_box_around(cx: &Analyzer, base: TExpr) -> Option[Type]
     if !owns_its_elements(texpr_type(base)) then return None
 
     *base.kind match
-        TField(recv, _, _) -> box_or_further(recv)
-        TIndex(recv, _, _) -> if owns_its_elements(texpr_type(recv)) then box_or_further(recv) else None
+        TField(recv, _, _) -> box_or_further(cx, recv)
+        TIndex(recv, _, _) -> if owns_its_elements(texpr_type(recv)) then box_or_further(cx, recv) else None
         TDeref(operand, _) -> sync_box(texpr_type(operand))
+        TLoad(name, _) -> ref_place(cx, name) match
+            Some(stood) -> sync_box_around(cx, stood)
+            None -> None
         _ -> None
 end sync_box_around
 
-private box_or_further(recv: TExpr) -> Option[Type]
+private box_or_further(cx: &Analyzer, recv: TExpr) -> Option[Type]
     val ty = texpr_type(recv)
 
     if holds_an_address(ty) then return sync_box(ty)
 
     *recv.kind match
-        TField(inner, _, _) -> box_or_further(inner)
-        TIndex(inner, _, _) -> if owns_its_elements(texpr_type(inner)) then box_or_further(inner) else None
+        TField(inner, _, _) -> box_or_further(cx, inner)
+        TIndex(inner, _, _) -> if owns_its_elements(texpr_type(inner)) then box_or_further(cx, inner) else None
         TDeref(operand, _) -> sync_box(texpr_type(operand))
+        TLoad(name, _) -> ref_place(cx, name) match
+            Some(stood) -> box_or_further(cx, stood)
+            None -> None
         _ -> None
 end box_or_further
 
