@@ -1,0 +1,411 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, replace_all, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `val` as a local, what it refuses, and the name it takes (`reference/modules.md § val — a thing`):
+// a `val` inside a body, where the binding is the whole of it; the writes and rebindings refused at
+// every depth; and the collisions with a `const`, a function or a variant of the same name.
+//
+// **Every output, status and refusal quoted here was obtained by running the reference compiler
+// (0.0.158) on the same file.** Where the reference prints a refusal with no position, or runs an
+// assignment's carets under the whole statement where this compiler marks the place, the test asks
+// for the words and the position separately rather than for one rendered text.
+
+private vlx_skipped() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end vlx_skipped
+
+private vlx_write(text: string) -> string
+    val root = make_temp_dir("sysl-val-local").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end vlx_write
+
+// What a program PRINTS and the status it exits with. One that does not build answers what the build
+// said and `-1`, so a refusal cannot pass for a trap.
+private vlx_outcome(text: string) -> (string, int)
+    val root = vlx_write(text)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (s"did not build: ${failure_text(why)}", -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text, shell_status(out.status))
+end vlx_outcome
+
+private vlx_prints(text: string, printed: string)
+    val out = vlx_outcome(text)
+
+    assert_eq(out.0, printed)
+    assert_eq(out.1, 0)
+
+// Everything a program has to say for itself, with the temporary root taken off each path.
+private vlx_err(text: string) -> string
+    val root = vlx_write(text)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, replace_all(root, "//", "/") + "/", "")
+end vlx_err
+
+private vlx_says(said: string, parts: []const string)
+    assert(parts.len > 0, "nothing asked")
+
+    for i in 0..<parts.len
+        assert(said.contains(parts[i]), said)
+
+// What the reference says first about a `static` in a file with no statements to opt out of.
+private vlx_static(at: string, line: string) -> string
+    var carets = str_builder()
+
+    for i in 0..<line.bytes.len do carets.push("^")
+
+    val from = at.index_of(":").unwrap() + 1
+    val row = at[from..<at.last_index_of(":").unwrap()]
+
+    "error: 'static' says a declaration belongs to the module rather than to the body of the file the " +
+    "program starts in — and this file has no such body, so everything it declares is the module's " +
+    s"already\n --> $at\n  |\n$row | $line\n  | ${carets.finish()}"
+end vlx_static
+
+private vlx_written_once(what: string) -> string =
+    s"error: a 'val' is written once, so $what has nothing to write through"
+
+// ---- a local 'val' ----
+
+@test("a local 'val' binds like a 'var'")
+vlx_binds_like_a_var()
+    if vlx_skipped() then return
+
+    vlx_prints("twice() -> int\n    val n = 4\n    n * 2\nend twice\nprint(str(twice()))\n", "8\n")
+
+@test("a local 'val' infers its type from its value")
+vlx_infers_its_type()
+    if vlx_skipped() then return
+
+    vlx_prints("narrow() -> u8\n    val b = 3u8\n    b\nend narrow\nprint(str(narrow()))\n", "3\n")
+
+@test("a local 'val' holds an array, which may then be indexed")
+vlx_holds_an_array()
+    if vlx_skipped() then return
+
+    vlx_prints("f() -> int\n    val xs = [4, 5, 6]\n    xs[0] + xs[2]\nend f\nprint(str(f()))\n", "10\n")
+
+// Inside a block it is a local of that block, so the top-level one it shadows is untouched.
+@test("a local 'val' shadows a module-level one for the rest of its block")
+vlx_shadows_a_module_level_one()
+    if vlx_skipped() then return
+
+    vlx_prints("static val n: int = 1\nf() -> int\n    val n = 50\n    n\nend f\nprint(str(f() + n))\n", "51\n")
+
+// ---- what a counted value in one does, now that it may be held ----
+
+@test("a static 'val' holds a string built while the program runs")
+vlx_a_string_built_at_run_time()
+    if vlx_skipped() then return
+
+    vlx_prints("static val s: string = str(1)\nprint(s)\n", "1\n")
+
+// Two literals joined looks constant and is not, because joining them allocates.
+@test("a static 'val' holds a string joined from two literals")
+vlx_a_string_joined_from_two_literals()
+    if vlx_skipped() then return
+
+    vlx_prints("static val s: string = \"a\" + \"b\"\nprint(s)\n", "ab\n")
+
+@test("a static 'val' holds a reference, which is the count itself")
+vlx_a_reference()
+    if vlx_skipped() then return
+
+    vlx_prints("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nstatic val r: &P = mk()\nprint(r.x)\n", "1\n")
+
+@test("a static 'val' holds a view, whose owner word is a count like any other")
+vlx_a_view()
+    if vlx_skipped() then return
+
+    vlx_prints("static val k: [4]int = [1, 2, 3, 4]\nstatic val s: []const int = k[1..<3]\nprint(s[0], s.len)\n", "2 2\n")
+
+// A struct carrying an `invariant` has to be checked, and a check is code — so this is a computed
+// initializer whatever it looks like.
+@test("a static 'val' of a struct whose invariant has to run, even with a literal in it")
+vlx_a_struct_whose_invariant_has_to_run()
+    if vlx_skipped() then return
+
+    vlx_prints(raw"""
+        struct Tag
+            name: string
+            invariant name.len > 0
+        end Tag
+        static val t: Tag = Tag("uart")
+        print(t.name)
+        """, "uart\n")
+
+// The same declaration with a value that breaks the invariant stops the program before its first
+// statement: a failed constraint is SIGTRAP, which a shell reports as 133.
+@test("and that invariant still runs, before the program's own statements")
+vlx_that_invariant_still_runs()
+    if vlx_skipped() then return
+
+    val out = vlx_outcome(raw"""
+        struct Tag
+            name: string
+            invariant name.len > 0
+        end Tag
+        static val t: Tag = Tag("")
+        print("never")
+        """)
+
+    assert_eq(out.0, "")
+    assert_eq(out.1, 133)
+end vlx_that_invariant_still_runs
+
+// ---- what it refuses ----
+
+@test("assigning to a module-level 'val' is refused")
+vlx_assigning_to_a_module_level_val()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val n: int = 1\nn = 2\n"), [vlx_written_once("assignment"), " --> main.sysl:2:1\n"])
+
+@test("assigning to one of a static 'val''s elements is refused")
+vlx_assigning_to_one_of_its_elements()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val k: [2]int = [1, 2]\nk[0] = 9\n"),
+        [vlx_written_once("assignment"), " --> main.sysl:2:1\n"])
+
+@test("compound assignment to a static 'val''s element is refused, being an assignment")
+vlx_compound_assignment()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val k: [2]int = [1, 2]\nk[1] += 1\n"), [vlx_written_once("'+='"), " --> main.sysl:2:1\n"])
+
+@test("an increment of a static 'val''s element is refused, for the same reason")
+vlx_an_increment()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val k: [2]int = [1, 2]\nk[0]++\n"),
+        [vlx_written_once("'++'"), " --> main.sysl:2:5\n  |\n2 | k[0]++\n  |     ^^"])
+
+// A `*T` is a licence to write, so handing one out would move the mistake one step from where it
+// could still be reported.
+@test("taking the address of a static 'val''s element is refused")
+vlx_taking_its_address()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val k: [2]int = [1, 2]\nvar p = &k[0]\n"),
+        [vlx_written_once("'&'"), " --> main.sysl:2:9\n  |\n2 | var p = &k[0]\n  |         ^^^^^"])
+
+@test("assigning to a local 'val' is refused")
+vlx_assigning_to_a_local_val()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("f() -> int\n    val n = 1\n    n = 2\n    n\nend f\nprint(str(f()))\n"),
+        [vlx_written_once("assignment"), " --> main.sysl:3:5\n"])
+
+@test("assigning through a field of a local 'val' is refused")
+vlx_assigning_through_a_field()
+    if vlx_skipped() then return
+
+    val said = vlx_err(raw"""
+        struct P
+            x: int
+        end P
+        f() -> int
+            val p = P(1)
+            p.x = 2
+            p.x
+        end f
+        print(str(f()))
+        """)
+
+    vlx_says(said, [vlx_written_once("assignment"), " --> main.sysl:6:5\n"])
+end vlx_assigning_through_a_field
+
+// Slicing is no longer refused: a view of a `val` is a `[]const T`, which carries the read-only-ness
+// rather than losing it, so what is refused is the write through the view.
+@test("writing through a view of a static 'val' is where the refusal moved when slicing became legal")
+vlx_writing_through_a_view()
+    if vlx_skipped() then return
+
+    vlx_prints("static val k: [4]int = [1, 2, 3, 4]\nvar s = k[1..<3]\nprint(s[0], s[1])\n", "2 3\n")
+
+    vlx_says(vlx_err("static val k: [4]int = [1, 2, 3, 4]\nvar s = k[1..<3]\ns[0] = 9\n"), [
+        "error: this element belongs to a '[]const int', which views elements it may not write, so there " +
+        "is nothing to assign through. Elements you may write are elements of your own: copy them into a " +
+        "'[]int' first",
+        " --> main.sysl:3:1\n",
+    ])
+end vlx_writing_through_a_view
+
+@test("a module-level 'val' with no type is refused, every module member stating one")
+vlx_a_module_level_val_with_no_type()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val k = [1, 2, 3]\n"), [
+        vlx_static("main.sysl:1:1", "static val k = [1, 2, 3]"),
+        "error: a module-level 'val' states its type, so 'k' needs one — 'val k: T = …'",
+    ])
+
+@test("a static 'val' computed from a variable is refused")
+vlx_a_value_computed_from_a_variable()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("var x = 1\nstatic val n: int = x\n"),
+        ["error: undefined name 'x'\n --> main.sysl:2:21\n  |\n2 | static val n: int = x\n  |                     ^"])
+
+@test("a static 'val' whose initializer does not fit its declared type is refused")
+vlx_an_initializer_that_does_not_fit()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val k: [2]u8 = [1, 300]\n"), [
+        vlx_static("main.sysl:1:1", "static val k: [2]u8 = [1, 300]"),
+        "error: the literal 300 does not fit byte\n --> main.sysl:1:27\n  |\n" +
+        "1 | static val k: [2]u8 = [1, 300]\n  |                           ^^^",
+    ])
+
+@test("a static 'val' whose initializer is of the wrong shape is refused")
+vlx_an_initializer_of_the_wrong_shape()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val k: [3]int = [1, 2]\n"), [
+        vlx_static("main.sysl:1:1", "static val k: [3]int = [1, 2]"),
+        "error: cannot initialize 'k': declared [3]int but the value is [2]int",
+    ])
+
+// Module storage is held to the rule a local binding is: a `static var` as much as a `static val`,
+// and a value of another type altogether as much as an array of another length. (The reference
+// prints these with no position, in the order it reads the storage; here each is anchored at its
+// declaration, so the report's order is the source's.)
+@test("module storage whose initializer is of another type is refused, 'var' and 'val' alike")
+vlx_storage_of_another_type()
+    if vlx_skipped() then return
+
+    val said = vlx_err(
+        "static val k: [3]int = [1, 2]\nstatic var v: [3]int = [1, 2]\nstatic val s: string = 1\nprint(1)\n")
+
+    vlx_says(said, [
+        "error: cannot initialize 'v': declared [3]int but the value is [2]int",
+        "error: cannot initialize 'k': declared [3]int but the value is [2]int",
+        "error: cannot initialize 's': declared string but the value is int",
+    ])
+end vlx_storage_of_another_type
+
+// A step's refusal is anchored where the reference anchors the form: a prefix step at the whole of
+// it, a postfix one at its operator, whatever the operand.
+@test("a refused step is reported at its operator when postfix and at the whole when prefix")
+vlx_a_refused_step_is_anchored()
+    if vlx_skipped() then return
+
+    val said = vlx_err("static val k: [2]int = [1, 2]\nval n = 1\n++k[0]\nn++\n--n\nvar i = 0\nk[i]++\n")
+
+    vlx_says(said, [
+        vlx_written_once("'++'") + "\n --> main.sysl:3:1\n  |\n3 | ++k[0]\n  | ^^^^^^",
+        vlx_written_once("'++'") + "\n --> main.sysl:4:2\n  |\n4 | n++\n  |  ^^",
+        vlx_written_once("'--'") + "\n --> main.sysl:5:1\n  |\n5 | --n\n  | ^^^",
+        vlx_written_once("'++'") + "\n --> main.sysl:7:5\n  |\n7 | k[i]++\n  |     ^^",
+    ])
+end vlx_a_refused_step_is_anchored
+
+// The line between the two declarations, from the other side: a `const` sizes an array because it
+// is a value, and a `val` cannot because it is storage.
+@test("naming a static 'val' as an array's bound is refused")
+vlx_naming_one_as_an_arrays_bound()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val n: usize = 4\nvar bad: [n]int\n"), [
+        "error: an array length must be a constant — a literal, or a 'const' naming one\n" +
+        " --> main.sysl:2:10\n  |\n2 | var bad: [n]int\n  |          ^^^^^^",
+    ])
+
+// A bare name in a pattern binds; a `val` there is refused rather than quietly shadowed, and the
+// refusal names the backticked form.
+@test("matching against a static 'val' with a bare name is refused, since it would bind instead of compare")
+vlx_matching_with_a_bare_name()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val n: int = 1\nvar x = 2\nx match\n    n -> print(1)\n    else print(2)\n"), [
+        "error: 'n' is a 'val', which is read while the program runs, so a bare name here would bind " +
+        "rather than match — write it as '`n`' to test the value it holds, or bind a different name\n" +
+        " --> main.sysl:4:5\n",
+    ])
+end vlx_matching_with_a_bare_name
+
+@test("and the backticked form is what tests a static 'val'")
+vlx_the_backticked_form()
+    if vlx_skipped() then return
+
+    vlx_prints("static val n: int = 1\nvar x = 2\nx match\n    `n` -> print(1)\n    else print(2)\n", "2\n")
+
+// ---- the name it takes ----
+
+@test("a static 'val' clashes with a constant of that name")
+vlx_clashes_with_a_constant()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("const n: int = 1\nstatic val n: int = 2\n"), [
+        vlx_static("main.sysl:2:1", "static val n: int = 2"),
+        "error: 'n' is already used by a constant",
+    ])
+
+@test("a static 'val' clashes with a function of that name")
+vlx_clashes_with_a_function()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val n: int = 1\nn() -> int = 2\n"), [
+        vlx_static("main.sysl:1:1", "static val n: int = 1"),
+        "error: 'n' is already declared as a 'val'\n --> main.sysl:2:1\n  |\n2 | n() -> int = 2\n  | ^^^^^^^^^^^^^^",
+    ])
+
+@test("a static 'val' clashes with an enum variant of that name")
+vlx_clashes_with_an_enum_variant()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("enum Colour\n    Red\nend Colour\nstatic val Red: int = 1\n"), [
+        vlx_static("main.sysl:4:1", "static val Red: int = 1"),
+        "error: 'Red' is already used by enum 'Colour'",
+    ])
+
+@test("a second static 'val' of that name is refused")
+vlx_a_second_val_of_that_name()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val n: int = 1\nstatic val n: int = 2\n"), [
+        vlx_static("main.sysl:1:1", "static val n: int = 1"),
+        vlx_static("main.sysl:2:1", "static val n: int = 2"),
+        "error: 'n' is already declared",
+    ])
+
+@test("while a constant written over a static 'val' is reported the other way round")
+vlx_a_constant_written_over_one()
+    if vlx_skipped() then return
+
+    vlx_says(vlx_err("static val n: int = 1\nconst n: int = 2\n"), [
+        vlx_static("main.sysl:1:1", "static val n: int = 1"),
+        "error: 'n' is already used by a 'val'\n --> main.sysl:2:1\n  |\n2 | const n: int = 2\n  | ^^^^^^^^^^^^^^^^",
+    ])
