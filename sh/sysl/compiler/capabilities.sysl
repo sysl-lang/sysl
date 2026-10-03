@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 
 // What a module says it needs of a machine, and what it gives up in exchange.
 //
@@ -765,7 +766,7 @@ private environment_requirements(a: &Analysis) -> Buf[(string, string)]
         for i in 0..<a.tables.capability_refs.len()
             val r = a.tables.capability_refs.at(i)
 
-            if r.scaffolding then continue
+            if r.scaffolding || !r.charges() then continue
 
             for k in 0..<out.len()
                 val cap = out.at(k).1
@@ -792,11 +793,17 @@ private effective_needs(a: &Analysis, r: CapabilityRef) -> Buf[string]
     if !r.imported then return r.needs
 
     var lifted: Option[Buf[string]] = None
+    var named_only = false
 
     for i in 0..<a.tables.capability_refs.len()
         val u = a.tables.capability_refs.at(i)
 
         if u.from != r.from || u.to != r.to || u.imported || u.scaffolding then continue
+
+        // A use that only names a type runs nothing, so it is a use that covers everything.
+        if !u.charges()
+            named_only = true
+            continue
 
         if lifted.is_none()
             lifted = Some(u.needs)
@@ -808,6 +815,8 @@ private effective_needs(a: &Analysis, r: CapabilityRef) -> Buf[string]
             if holds_string(lifted.unwrap(), u.needs.at(j)) then both.push(u.needs.at(j))
 
         lifted = Some(both)
+
+    if lifted.is_none() && named_only then return capability_core()
 
     var out: Buf[string] = buf()
 
@@ -833,6 +842,8 @@ end effective_needs
 // declaration the reference was written in names in its `@needs` is that declaration's callers'
 // question, not this one's.
 private refused_for(a: &Analysis, e: CapabilityRef, needed: Buf[(string, string)]) -> Option[string]
+    if !e.charges() then return None
+
     val core = capability_core()
     val ours = !from_library(a, e.scope) && !holds_string(a.tables.supplied_modules, e.from)
     val covers = effective_needs(a, e)
@@ -855,7 +866,7 @@ end refused_for
 // reader has to change -- rather than at the clause, which is where it would land if the check were
 // about a module's own text. It runs beside the other whole-program checks, over the settled module
 // graph, because an edge is made by a reference and a reference may be anywhere a body is.
-check_gated_modules(a: &Analysis)
+check_gated_modules(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
     var any = false
 
     for i in 0..<a.tables.module_narrows.len()
@@ -868,15 +879,31 @@ check_gated_modules(a: &Analysis)
     // the walk below reads every edge, and one with no question to ask should pay nothing for it.
     if !any then return
 
+    settle_named_refs(a)
+    note_call_refs(a, funcs, vals, vtables)
+
     val needed = environment_requirements(a)
+    var told: Buf[(string, string)] = buf()
 
     // An edge is refused once, at the first reference to it that is refused -- one written inside a
     // declaration that wrote `@needs` for the capability is charged where that declaration is
-    // reached instead, so the caret lands on a line there is something to change on.
-    for i in 0..<a.tables.module_edges.len()
-        val edge = a.tables.module_edges.at(i)
+    // reached instead, so the caret lands on a line there is something to change on. The edges are
+    // read in the order their references were made, which is the order the module graph made them
+    // in, plus the ones only a call made: a value of a gated type can arrive without its type being
+    // written anywhere, and the call of its method is then the only reference there is.
+    for i in 0..<a.tables.capability_refs.len()
+        val edge = a.tables.capability_refs.at(i)
 
-        for j in 0..<a.tables.capability_refs.len()
+        if holds_pair(told, edge.from, edge.to) then continue
+
+        told.push((edge.from, edge.to))
+
+        // A value that can die is reported ahead of the rest: the destructor is the code it costs,
+        // and the place it is held is the line to change, where an import that let it be named is
+        // only what made that line possible.
+        var first: Option[(CapabilityRef, string)] = None
+
+        for j in i..<a.tables.capability_refs.len()
             val e = a.tables.capability_refs.at(j)
 
             if e.from != edge.from || e.to != edge.to then continue
@@ -885,13 +912,222 @@ check_gated_modules(a: &Analysis)
 
             if cap.is_none() then continue
 
-            val why = if module_narrowed(a, e.from, cap.unwrap()) then gave_it_up(e.from, cap.unwrap())
-            else target_lacks_it(a)
+            if e.dies
+                first = Some((e, cap.unwrap()))
+                break
 
-            a.fault(e.scope, e.span,
-                    s"this reaches '${qualified_name(e.to)}', which requires '${cap.unwrap()}', and $why")
-            break
+            if first.is_none() then first = Some((e, cap.unwrap()))
+
+        if first.is_none() then continue
+
+        val e = first.unwrap().0
+        val cap = first.unwrap().1
+        val why = if module_narrowed(a, e.from, cap) then gave_it_up(e.from, cap) else target_lacks_it(a)
+        val what = if e.dies then s"a '${qualified_name(e.named)}' can die here, and its destructor"
+        else "this"
+
+        a.fault(e.scope, e.span, s"$what reaches '${qualified_name(e.to)}', which requires '$cap', and $why")
 end check_gated_modules
+
+// -- a type is charged for the code it runs -------------------------------------------------------
+
+// Makes a reference that only NAMED a type an ordinary one where a value of the type can die there
+// and the type, or something it holds, has a destructor -- the one piece of the type's code that runs
+// without anybody calling it. It is asked here rather than where the name was read, because a type's
+// fields are not all laid out until every declaration has been.
+private settle_named_refs(a: &Analysis)
+    val dying = destructor_holders(a)
+
+    for i in 0..<a.tables.capability_refs.len()
+        val r = a.tables.capability_refs.at(i)
+
+        if r.named == "" || !holds_string(dying, r.named) then continue
+
+        a.tables.capability_refs.set(i, CapabilityRef(r.from, r.to, r.scope, r.span, r.needs,
+                                                      r.scaffolding, r.imported, r.named, true))
+end settle_named_refs
+
+// The declarations a value of which runs a destructor when it dies: every type a `Drop` block was
+// written for, and every type that holds one -- in a field, a variant, a box, an array or a view --
+// by the key a written name resolves to.
+private destructor_holders(a: &Analysis) -> Buf[string]
+    val drops = drops_declared(a)
+    var out: Buf[string] = buf()
+
+    if drops.is_empty() then return out
+
+    for i in 0..<drops.len()
+        out.push(drops.at(i))
+
+    val tables = [a.tables.struct_insts, a.tables.enum_insts]
+
+    for k in 0..<tables.len
+        val t = tables[k]
+
+        for i in 0..<t.len()
+            val ty = t.at(i)
+            val base = type_base(ty)
+
+            if base == "" || holds_string(out, base) then continue
+
+            var seen: Buf[string] = buf()
+
+            if holds_destructor(ty, drops, &seen) then out.push(base)
+
+    out
+end destructor_holders
+
+private type_base(t: Type) -> string = t match
+    Struct(d) -> d.base
+    Enum(d) -> d.base
+    _ -> ""
+
+// Whether a value of `t` runs a destructor when it dies. A raw pointer and a weak reference own
+// nothing; a box, an array, a view and every field or payload own what they hold.
+private holds_destructor(t: Type, drops: Buf[string], seen: *Buf[string]) -> bool
+    t match
+        Struct(d) ->
+            if holds_string(drops, d.base) then return true
+            if holds_string(*seen, d.name()) then return false
+
+            seen.push(d.name())
+            fields_hold(d.fields, drops, seen)
+        Results(d) -> fields_hold(d.fields, drops, seen)
+        Enum(d) ->
+            if holds_string(drops, d.base) then return true
+            if holds_string(*seen, d.name()) then return false
+
+            seen.push(d.name())
+
+            for i in 0..<d.variants.len()
+                if fields_hold(d.variants.at(i).fields, drops, seen) then return true
+
+            false
+        Ref(inner, _) -> holds_destructor(*inner, drops, seen)
+        Volatile(inner) -> holds_destructor(*inner, drops, seen)
+        Array(_, elem) -> holds_destructor(*elem, drops, seen)
+        Slice(elem, _) -> holds_destructor(*elem, drops, seen)
+        Constrained(d) -> holds_destructor(d.base, drops, seen)
+        Pack(elems) ->
+            for i in 0..<elems.len()
+                if holds_destructor(elems.at(i), drops, seen) then return true
+
+            false
+        _ -> false
+end holds_destructor
+
+private fields_hold(fields: Buf[(string, Type)], drops: Buf[string], seen: *Buf[string]) -> bool
+    for i in 0..<fields.len()
+        if holds_destructor(fields.at(i).1, drops, seen) then return true
+
+    false
+end fields_hold
+
+// Records an edge for every call a shipping body makes into another module -- a method, an
+// operator, a conversion, an invariant's check -- which is the code a type runs where a value of it
+// is used. A value can arrive without its type being written (handed back by a call, read out of a
+// field), and naming the type is no longer what charges for it, so the call has to.
+//
+// **An instantiation is answered for by the body it was written as**, as everywhere in this file:
+// a generic's body calling its argument's method runs in whichever module chose the argument.
+private note_call_refs(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
+    var known: Set[string] = set()
+
+    for i in 0..<a.tables.capability_refs.len()
+        val r = a.tables.capability_refs.at(i)
+
+        if r.charges() && !r.imported then known.add(ref_terms(r.from, r.to, r.needs, r.scaffolding))
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        if a.tables.members.func_origin.has(f.name) then continue
+
+        val scope = func_home(a, f.name)
+        val scaffolding = test_only_file(a, scope.src.name) || holds_string(a.tables.test_only, f.name)
+        var calls: Buf[(string, Span)] = buf()
+        val sink = &calls
+
+        walk_block_stmts(f.body, TWalk(false, e -> note_calls(sink, vtables, e), w -> (), st -> ()))
+        charge_calls(a, &known, home_module(a, f.name), scope, body_needs(a, f.name), scaffolding, calls)
+
+    for i in 0..<vals.len()
+        val v = vals.at(i)
+
+        if v.init.is_none() then continue
+
+        val d = a.tables.vals.get(v.symbol)
+        val scope = if d.is_some() then d.unwrap().scope else empty_scope()
+        var calls: Buf[(string, Span)] = buf()
+        val sink = &calls
+
+        walk_texpr(v.init.unwrap(), TWalk(false, e -> note_calls(sink, vtables, e), w -> (), st -> ()))
+        charge_calls(a, &known, module_of(v.symbol), scope, buf(), holds_string(a.tables.test_only, v.symbol),
+                     calls)
+end note_call_refs
+
+// Records one charging reference per kind of use an edge has not yet seen, at the first call making it.
+private charge_calls(a: &Analysis, known: *Set[string], from: string, scope: Scope, needs: Buf[string],
+                     scaffolding: bool, calls: Buf[(string, Span)])
+    for j in 0..<calls.len()
+        val to = home_module(a, calls.at(j).0)
+
+        if to == from || to == ModuleRoot || !a.tables.has_module(to) then continue
+
+        // An edge already charged on the same terms gains nothing from the call.
+        if !known.add(ref_terms(from, to, needs, scaffolding)) then continue
+
+        a.tables.capability_refs.push(CapabilityRef(from, to, scope, calls.at(j).1, needs, scaffolding,
+                                                    false, "", false))
+end charge_calls
+
+// What one node runs: the functions it calls or takes the address of, and the implementations behind
+// a table it erased a value into.
+private note_calls(sink: *Buf[(string, Span)], vtables: Buf[TVtable], e: TExpr)
+    val refs = own_refs(e)
+
+    for i in 0..<refs.calls.len()
+        sink.push((refs.calls.at(i), e.span))
+
+    for i in 0..<refs.erased.len()
+        for k in 0..<vtables.len()
+            val t = vtables.at(k)
+
+            if t.name != refs.erased.at(i) then continue
+
+            for m in 0..<t.slots.len()
+                sink.push((t.slots.at(m).target, e.span))
+end note_calls
+
+// One key for the terms a charging reference is made on, its covered capabilities sorted by the
+// order the core lists them in so two spellings of one set are one key.
+private ref_terms(from: string, to: string, needs: Buf[string], scaffolding: bool) -> string
+    val core = capability_core()
+    var out = s"$from\t$to\t" + (if scaffolding then "tests" else "ships")
+
+    for i in 0..<core.len()
+        if holds_string(needs, core.at(i)) then out = out + "\t" + core.at(i)
+
+    out
+end ref_terms
+
+// The module a body was written in, which is not always the one its symbol names: a member of an
+// `impl` written for another module's type is lowered under the receiver's.
+private home_module(a: &Analysis, name: string) -> string
+    val home = a.tables.homes.get(name)
+
+    if home.is_some() && home.unwrap().src.name != "" then return home.unwrap().module_name
+
+    module_of(name)
+end home_module
+
+// What the declaration a body was read under covers, which is what reaching it is charged with.
+private body_needs(a: &Analysis, name: string) -> Buf[string]
+    for i in 0..<a.tables.body_covers.len()
+        if a.tables.body_covers.at(i).0 == name then return a.tables.body_covers.at(i).1
+
+    buf()
+end body_needs
 
 // Why an edge is refused where its module gave the capability up.
 private gave_it_up(from: string, cap: string) -> string

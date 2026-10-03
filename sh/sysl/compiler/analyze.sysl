@@ -331,13 +331,20 @@ rewind_registered(into: &Table[Type], mark: usize)
 depends_on(a: &Analysis, scope: Scope, key: string, span: Span) =
     depends_on_module(a, scope, module_of(key), span)
 
+// The same for a type named where no code of it runs -- a signature, a field, a variant, an
+// annotation. The edge is the module graph's as any other is; what differs is the charge, which the
+// capability check settles once it knows whether the type holds a destructor.
+depends_on_named(a: &Analysis, scope: Scope, key: string, span: Span) =
+    depends_on_module(a, scope, module_of(key), span, false, key)
+
 // The same, where the module is already known rather than read off a key.
 //
 // **Where the reference was written is recorded beside the edge**, because a diagnostic about an
 // edge lands at the line that made it rather than anywhere either module states anything. A bare
 // name resolving to another module carries no span of its own, so such a reference records the file
 // and nothing more, and a later reference that does have one fills the position in.
-depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span, imported: bool = false)
+depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span, imported: bool = false,
+                  named: string = "")
     val from = scope.module_name
 
     if to == from || to == ModuleRoot || !a.tables.has_module(to) then return
@@ -346,7 +353,7 @@ depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span, importe
     // may have said where it is (`Tables.reference_at`).
     val span = if written.is_empty() then a.tables.reference_at else written
 
-    note_capability_ref(a, scope, from, to, span, imported)
+    note_capability_ref(a, scope, from, to, span, imported, named)
 
     for i in 0..<a.tables.module_deps.len()
         if a.tables.module_deps.at(i).0 == from
@@ -376,7 +383,7 @@ depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span, importe
 // declaration that wrote `@needs(...)` carries what that declaration needs, since reaching the
 // declaration is what is charged for it.
 private note_capability_ref(a: &Analysis, scope: Scope, from: string, to: string, span: Span,
-                            imported: bool)
+                            imported: bool, named: string)
     val needs = a.tables.reaching_needs
     val scaffolding = a.tables.reaching_test || test_only_file(a, scope.src.name)
 
@@ -384,16 +391,17 @@ private note_capability_ref(a: &Analysis, scope: Scope, from: string, to: string
         val r = a.tables.capability_refs.at(i)
 
         if r.from != from || r.to != to || r.scaffolding != scaffolding then continue
-        if r.imported != imported then continue
+        if r.imported != imported || r.named != named then continue
         if !same_strings(r.needs, needs) then continue
 
         if r.span.is_empty() && !span.is_empty() then
             a.tables.capability_refs.set(i, CapabilityRef(from, to, scope, span, needs, scaffolding,
-                                                          imported))
+                                                          imported, named, false))
 
         return
 
-    a.tables.capability_refs.push(CapabilityRef(from, to, scope, span, needs, scaffolding, imported))
+    a.tables.capability_refs.push(CapabilityRef(from, to, scope, span, needs, scaffolding, imported,
+                                                named, false))
 end note_capability_ref
 
 private same_strings(xs: Buf[string], ys: Buf[string]) -> bool
