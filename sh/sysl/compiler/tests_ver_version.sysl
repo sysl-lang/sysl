@@ -8,7 +8,8 @@ import sysl.text.Search
 
 // `__VERSION__`: the `version` in the `package.hocon` of the package or program whose file writes it.
 // It is per package the way `__FILE__` is per file, so a dependency's files answer with the
-// dependency's own version and never with the consumer's; it folds to a string literal, so a `const`
+// dependency's own version and never with the consumer's -- except in a default argument, which, as
+// `__FILE__` does, answers for the file that wrote the call; it folds to a string literal, so a `const`
 // may hold it; and a file with no manifest above it, or a manifest that declares no version, is
 // refused at the use.
 
@@ -41,6 +42,22 @@ private ver_dependency(version: string, text: string) -> string
     write_text(s"$root/engine/engine.sysl", s"module engine\n\n$text\n").unwrap()
     root
 end ver_dependency
+
+// A manifest's entry for the package at `coordinate`, at `version`.
+private ver_entry(label: string, coordinate: string, version: string) -> string =
+    s"$label { git = \"$coordinate\", version = \"$version\" }"
+
+// A package at `coordinate` in the project's `vendor/` tree, holding one module, as a fetch would
+// have left it.
+private ver_vendor(root: string, coordinate: string, module_name: string, version: string,
+                   deps: string, text: string)
+    val dir = s"$root/vendor/$coordinate/@v$version"
+
+    make_dir_all(s"$dir/$module_name").unwrap()
+    write_text(s"$dir/package.hocon", ver_manifest(module_name, version, deps)).unwrap()
+    write_text(s"$dir/$module_name/$module_name.sysl", s"module $module_name\n\n$text\n").unwrap()
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+end ver_vendor
 
 // What the program a build of `root` makes prints, or what stopped it.
 private ver_run(root: string) -> string
@@ -96,17 +113,48 @@ ver_a_dependency_reports_its_own_version()
     remove_dir_all(root).unwrap_or(())
     remove_dir_all(dep).unwrap_or(())
 
-@test("a default of __VERSION__ is the declaring package's, whoever calls it")
-ver_a_default_is_the_declaring_packages()
+@test("a default of __VERSION__ is the calling package's, as a default of __FILE__ is the calling file")
+ver_a_default_is_the_callers()
     if !ver_ready() then return
 
     val dep = ver_dependency("4.5.6", "stamp(v: string = __VERSION__) -> string = v")
     val root = ver_app(ver_manifest("app", "1.2.3", s"engine { path = \"$dep\" }"),
                        "print(engine.stamp())\n")
 
-    assert_eq(ver_run(root), "4.5.6\n")
+    assert_eq(ver_run(root), "1.2.3\n")
     remove_dir_all(root).unwrap_or(())
     remove_dir_all(dep).unwrap_or(())
+
+@test("a default of __VERSION__ called inside its own package is that package's version")
+ver_a_default_called_at_home_is_its_own()
+    if !ver_ready() then return
+
+    val dep = ver_dependency("4.5.6", "stamp(v: string = __VERSION__) -> string = v\n" +
+                                      "own() -> string = stamp()")
+    val root = ver_app(ver_manifest("app", "1.2.3", s"engine { path = \"$dep\" }"),
+                       "print(engine.own())\nprint(engine.stamp())\n")
+
+    assert_eq(ver_run(root), "4.5.6\n1.2.3\n")
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+
+@test("a default of __VERSION__ called from a second dependency is that dependency's version")
+ver_a_default_called_from_a_second_dependency()
+    if !ver_ready() then return
+
+    // A path dependency may not have one of its own, so both are coordinates the project vendors --
+    // at major 0, a later major riding in the coordinate.
+    val root = ver_app(ver_manifest("app", "1.2.3", ver_entry("relay", "github.com/e/relay", "0.7.8")),
+                       "print(relay.forward())\n")
+
+    ver_vendor(root, "github.com/e/engine", "engine", "0.4.5", "",
+               "stamp(v: string = __VERSION__) -> string = v")
+    ver_vendor(root, "github.com/e/relay", "relay", "0.7.8",
+               ver_entry("engine", "github.com/e/engine", "0.4.5"),
+               "forward() -> string = engine.stamp()")
+
+    assert_eq(ver_run(root), "0.7.8\n")
+    remove_dir_all(root).unwrap_or(())
 
 @test("__VERSION__ folds, so a const and a module val may hold it")
 ver_folds_into_a_const()
