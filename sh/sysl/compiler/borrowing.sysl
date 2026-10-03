@@ -32,8 +32,8 @@ import sysl.container.{Set, set}
 // side discharges a caller's obligation.
 //
 // **And a body that can release nothing at all keeps the borrow in every one of those cases**
-// (`borrows`): with no call that comes back and no write to memory, it cannot reach a release however
-// it was entered. That is also what lets a caller skip its own count on a place argument at a call
+// (`inert_callees`): calling nothing that might and writing only its own locals, it cannot reach a
+// release however it was entered. That is also what lets a caller skip its own count on a place argument at a call
 // to such a function.
 
 // The name that stands for "something was reached that could have written anything", which no local
@@ -58,28 +58,102 @@ struct Verdict
         self.ok = false
 end Verdict
 
-// -- the callee: a body that can release nothing ------------------------------------------------------
+// -- the callee: a body that can release nothing it did not take --------------------------------------
 
-// Whether this function's by-value parameters may be read through the caller's count whatever the
-// caller handed over.
+// The functions whose by-value parameters may be read through the caller's count: every body that
+// can neither write memory it does not own nor call anything that might.
 //
 // **The test is deliberately crude, because what it has to be is obviously right.** A retain is
-// dropped only where the body cannot, by any path that comes back, release anything at all: no call
-// that returns, and no write to memory. A call that cannot return is not an exception but an
-// application of the rule: control never comes back to the release. A contract clause is code too,
-// emitted around the body rather than inside it, so a function carrying one is left alone.
-borrows(f: TFunc) -> bool
-    if !f.requires.is_empty() || !f.ensures.is_empty() || !f.olds.is_empty() then return false
+// dropped only where the body cannot, by any path that comes back, release anything it did not
+// take: no call that returns into something that might, and no write to memory but its own locals'.
+// What that leaves is the reader -- an accessor, a length, a predicate over fields, and whatever
+// calls only those -- which is exactly where the pair costs most. It is also what lets a caller hand
+// such a function a place with no snapshot at all (`indirect_arg`): a body that can write nothing
+// cannot change what it was given. A contract clause is code too, emitted around the body rather
+// than inside it, so a function carrying one is left alone.
+//
+// **A call is allowed where its callee is itself one of these**, so the question is answered over
+// the whole program at once. A function that calls only functions that can release nothing cannot
+// release anything either, and a cycle of them -- recursion -- is no different, since a release
+// needs a finite path to it and none of the members has one. That is the GREATEST set closed under
+// the rule, which is why the computation starts from every candidate and only ever removes one. A
+// comparison or a compound assignment dispatched to a trait method is a call like any other.
+//
+// **A write to the function's own local is allowed too**, for the reason a declaration already is:
+// the count the slot gives back is the one the slot took when it was written. Only a `var` the body
+// itself declared qualifies -- a parameter's slot holds the caller's count under this very borrow,
+// and a `ref` names storage somebody else owns -- and only its own bytes: an element of a SLICE it
+// holds belongs to whoever owns the elements.
+inert_callees(p: TProgram) -> Set[string]
+    var calls: Buf[Buf[string]] = buf()
+    var alive: Buf[bool] = buf()
+    var out: Set[string] = set()
 
-    if f.variant.is_some() then return false
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+        val sink: &CallSink = CallSink(buf())
+        val v: &Verdict = Verdict(f.requires.is_empty() && f.ensures.is_empty() && f.olds.is_empty() &&
+                                  f.variant.is_none())
 
-    // Boxed, because a closure captures by value: a flag lowered in a copy says nothing here.
-    val v: &Verdict = Verdict(true)
+        if v.ok
+            val locals = own_locals(f)
 
-    walk_block_stmts(f.body, TWalk(true, x -> if !inert_node(x) then v.refuse(), w -> v.refuse(),
-                                   s -> if !inert_stmt(s) then v.refuse()))
-    v.ok
-end borrows
+            walk_block_stmts(f.body, TWalk(true, x -> inert_node(v, sink, locals, x), w -> v.refuse(),
+                                           s -> if !inert_stmt(s) then v.refuse()))
+
+        calls.push(sink.names)
+        alive.push(v.ok)
+
+        if v.ok then out.add(f.name)
+
+    var moved = true
+
+    while moved
+        moved = false
+
+        for i in 0..<p.funcs.len()
+            val named = calls.at(i)
+
+            for j in 0..<named.len()
+                if alive.at(i) && !out.has(named.at(j))
+                    alive.set(i, false)
+                    out.remove(p.funcs.at(i).name)
+                    moved = true
+
+    out
+end inert_callees
+
+// The callees a body names, in a box a walk's closures push through.
+private struct CallSink
+    names: Buf[string]
+
+    add(*self, name: string)
+        self.names.push(name)
+end CallSink
+
+// The names whose slots are this body's own: every `var`/`val` it declares, less any spelling a
+// parameter or a `ref` shares, since a name declared twice is one a write cannot be told apart by.
+private own_locals(f: TFunc) -> Set[string]
+    val declared: &CallSink = CallSink(buf())
+    val refs = name_sink()
+
+    walk_block_stmts(f.body, stmt_walk(true, s -> own_decl(declared, refs, s)))
+
+    for i in 0..<f.params.len()
+        refs.add(f.params.at(i).0)
+
+    var out: Set[string] = set()
+
+    for i in 0..<declared.names.len()
+        if !refs.names.has(declared.names.at(i)) then out.add(declared.names.at(i))
+
+    out
+end own_locals
+
+private own_decl(declared: &CallSink, refs: &NameSink, s: TStmt) = s match
+    TVarDecl(name, _, _, _) -> declared.add(name)
+    TRefDecl(name, _, _) -> refs.add(name)
+    _ -> ()
 
 // A statement a body that releases nothing may hold. A local's own storage is the function's, and
 // the count it holds is one the function took, so giving it back at the end of the block gives back
@@ -93,16 +167,42 @@ private inert_stmt(s: TStmt) -> bool = s match
     TContinue(_) -> true
     _ -> false
 
+// One node of a body being asked whether it is inert. A call is noted rather than judged, since
+// whether its callee qualifies is the fixpoint's question.
+private inert_node(v: &Verdict, calls: &CallSink, locals: Set[string], x: TExpr) = *x.kind match
+    // A call that does not come back never reaches the release this is deciding about.
+    TCall(name, _, ty, _) -> if ty != Never then calls.add(name)
+
+    TStore(place, _, _) -> if !own_place(place, locals) then v.refuse()
+    TIncDec(place, _, _, _, _) -> if !own_place(place, locals) then v.refuse()
+    TUpdate(place, _, _, _, dispatch, _) ->
+        if !own_place(place, locals) then v.refuse()
+
+        if dispatch.is_some() then calls.add(dispatch.unwrap().name)
+
+    // A comparison may be a trait method rather than an instruction, and then it is a call.
+    TCompare(_, cmps) ->
+        for i in 0..<cmps.len()
+            if cmps.at(i).dispatch.is_some() then calls.add(cmps.at(i).dispatch.unwrap().name)
+
+    _ -> if !inert_leaf(x) then v.refuse()
+
+// The place a write lands in, where that is one of `locals` reached without a dereference.
+private own_place(place: TExpr, locals: Set[string]) -> bool = *place.kind match
+    TLoad(name, _) -> locals.has(name)
+    TField(r, _, _) -> own_place(r, locals)
+    TIndex(r, _, _) -> repr(texpr_type(r)) match
+        Array(_, _) -> own_place(r, locals)
+        _ -> false
+    _ -> false
+
 // Whether this node, on its own, can neither hand control to code that returns nor write to memory.
 //
 // **The default is `false`, which is the whole reason this is a list of what is allowed.** A node
 // added later is unknown to it, and unknown has to mean "keep the retain" -- the other way round, a
 // new way of reaching arbitrary code would silently start dropping counts that were holding
 // something up.
-private inert_node(x: TExpr) -> bool = *x.kind match
-    // A call that does not come back never reaches the release this is deciding about.
-    TCall(_, _, ty, _) -> ty == Never
-
+private inert_leaf(x: TExpr) -> bool = *x.kind match
     TIntLit(_, _) -> true
     TFloatLit(_, _) -> true
     TStrLit(_) -> true
@@ -125,7 +225,6 @@ private inert_node(x: TExpr) -> bool = *x.kind match
     TUnary(_, _, _) -> true
     TIntOp(_, _, _, _, _) -> true
     TLogical(_, _, _) -> true
-    TCompare(_, _) -> true
     TSeq(_) -> true
 
     TField(_, _, _) -> true
@@ -164,16 +263,60 @@ private inert_node(x: TExpr) -> bool = *x.kind match
 
     _ -> false
 
-// The functions whose bodies can release nothing at all, so a caller handing one of them a place
-// needs no count of its own for the length of the call.
-inert_callees(p: TProgram) -> Set[string]
-    var out: Set[string] = set()
+// -- the callee: which large parameters it reads where the caller put them ---------------------------
 
-    for i in 0..<p.funcs.len()
-        if borrows(p.funcs.at(i)) then out.add(p.funcs.at(i).name)
+// The large by-value parameters of `f` it reads **where its caller put them**, with no copy of its
+// own at entry.
+//
+// A parameter past the indirect boundary arrives as an address, and every sysl caller hands over
+// storage nothing can change for the length of the call (`indirect_arg`): a temporary, a local no
+// callee can name, or a snapshot the caller staged. So a copy at entry would be a second snapshot of
+// a snapshot, and for a multi-kilobyte receiver it is the frame. It is still made wherever something
+// other than reading could tell:
+//
+//   - **the body changes its own copy** -- assigns to it or a part of it, takes its address, binds a
+//     `ref` to it, or calls a `*self` method on it (`rebound`) -- or takes a writable view of an
+//     array inside it, since a write through the view would be a write to the caller's value;
+//   - **the function jumps back to its own entry**, which stores into the slots;
+//   - **something outside the program may call it** -- `@export`, a `@section`, a foreign
+//     convention, an address taken for a `*fn` -- since nothing on that side promises a snapshot;
+//   - **the parameter is promoted**, its storage moving to the heap anyway.
+reads_in_place(e: *Emit, f: TFunc, promoted: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if e.address_taken.has(f.name) || f.exported.is_some() || f.section.is_some() ||
+       f.conv.is_some() || !tail_calls_of(f).is_empty() then
+        return out
+
+    val bound = rebound(f)
+
+    if bound.has(OPAQUE) then return out
+
+    val viewed = name_sink()
+    var moved: Set[string] = set()
+
+    for i in 0..<promoted.len()
+        moved.add(promoted.at(i))
+
+    walk_block_stmts(f.body, expr_walk(true, x -> viewed_root(viewed, x)))
+
+    for i in 0..<f.params.len()
+        val n = f.params.at(i).0
+
+        if e.layout.indirect(f.params.at(i).1) && !bound.has(n) && !viewed.names.has(n) &&
+           !moved.has(n) then
+            out.push(n)
 
     out
-end inert_callees
+end reads_in_place
+
+// The local a writable view is taken inside of. A view of a slice or a string reaches storage the
+// local does not hold, so only an array's counts.
+private viewed_root(out: &NameSink, x: TExpr) = *x.kind match
+    TSlice(base, _, _, _, _) -> repr(texpr_type(base)) match
+        Array(_, _) -> add_root(out, base)
+        _ -> ()
+    _ -> ()
 
 // -- the callee: which parameters it keeps a count of its own for ------------------------------------
 
@@ -182,8 +325,9 @@ end inert_callees
 // A self-jump is checked before anything else, because the count it takes to carry an argument
 // across the release of the whole frame has to be one the slot gives back afterwards -- true even of
 // a body a borrow would otherwise be sound for. A body that can release nothing keeps the borrow
-// whoever entered it, which is what makes it stronger than every condition after it.
-owning(f: TFunc, addressed: bool, jumps: bool) -> Set[string]
+// whoever entered it, which is what makes it stronger than every condition after it. `inert` is
+// whether `f` is one of `inert_callees`', a question about the whole program asked once by the caller.
+owning(f: TFunc, addressed: bool, jumps: bool, inert: bool) -> Set[string]
     var every: Set[string] = set()
 
     for i in 0..<f.params.len()
@@ -191,7 +335,7 @@ owning(f: TFunc, addressed: bool, jumps: bool) -> Set[string]
 
     if jumps then return every
 
-    if borrows(f) then return set()
+    if inert then return set()
 
     if addressed || f.exported.is_some() || f.section.is_some() || f.conv.is_some() then
         return every
