@@ -1268,6 +1268,12 @@ refused_field(cx: &Analyzer, span: Span, shown: string, fields: Buf[(string, Typ
             return Some(cx.err(given.at(i).span, s"'${fields.at(i).0}' of '$shown' is " +
                                s"${type_show(fields.at(i).1)}, but ${type_show(got)} was given"))
 
+        // A field is held to what a parameter is: one inferred from a diverging argument would be
+        // a slot of a type that has no values.
+        if fields.at(i).1 == Never then
+            return Some(cx.err(given.at(i).span, s"cannot pass an expression that never returns as " +
+                               s"'${fields.at(i).0}' of '$shown'"))
+
     None
 end refused_field
 
@@ -2246,6 +2252,17 @@ refused_argument(cx: &Analyzer, span: Span, shown: string, params: Buf[Param],
                 if disagree(got, wants.at(i)) then
                     return Some(cx.err(e.span, s"'${params.at(i).name}' of $shown is " +
                                        s"${type_show(wants.at(i))}, but ${type_show(got)} was given"))
+
+                // **`never` cannot be a parameter, and inference is the one place it could become
+                // one**: a generic parameter takes whatever its argument is, and an expression that
+                // never arrives is the one thing a slot must not be concluded from. A written
+                // parameter is untouched -- the call is dead code, and the slot still has a layout.
+                if wants.at(i) == Never
+                    if !report then return Some(cx.err(e.span, "argument disagrees"))
+
+                    return Some(cx.err(e.span, s"cannot pass an expression that never returns as " +
+                                       s"'${params.at(i).name}' of $shown"))
+                end if
             None -> ()
 
     None
