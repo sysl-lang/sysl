@@ -410,7 +410,17 @@ solve(a: &Analysis, scope: Scope, site: Scope, span: Span, what: string, tparams
     if sub.len() < tparams.len() then solve_from_callables(a, scope, tparams, bounds, &sub)
 
     var out: Buf[Type] = buf()
-    val poisoned = mentions_unknown_any(arg_tys) ||
+    // **A default is not one of the things that can poison the solve.** It was checked where it was
+    // written, so a mistake in it has been told there; and one that names the declaration's own type
+    // parameters (`step: T = T.zero()`) cannot be read until they are solved, so its provisional
+    // reading is refused for a reason that is no mistake at all. Counted here it would silence the
+    // one thing wrong with `f()`, which is that nothing says what `T` is.
+    var written_tys: Buf[Type] = buf()
+
+    for i in 0..<arg_tys.len()
+        if !is_soft(defaulted, i) then written_tys.push(arg_tys.at(i))
+
+    val poisoned = mentions_unknown_any(written_tys) ||
                    (expected.is_some() && mentions_unknown(expected.unwrap()))
 
     for i in 0..<tparams.len()
@@ -538,6 +548,7 @@ instantiate_func(a: &Analysis, home: Scope, f: FuncDecl, solved: Buf[Type], cons
         ret = declared_result_type(Some(resolve_result(a, home, f.ret_type.unwrap(), subst)))
 
     a.tables.members.func_insts.put(name, FuncSig(params, ret))
+    a.tables.members.func_substs.put(name, subst)
     a.tables.members.pending.push(PendingInst(name, f, subst, home))
     name
 end instantiate_func
