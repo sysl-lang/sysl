@@ -1,0 +1,443 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, str_builder}
+
+// Statement position -- a block written for effect has no value (`reference/expressions.md § Statement
+// position discards a block's value`). Assignment yields the value it assigned, so a branch that merely
+// does something would otherwise claim whatever its last expression yields, and two branches each
+// plainly written for effect would be made to agree on a value nobody asked for. Where a block's own
+// value is unused it has none, and that reaches the branches of an `if` and the arms of a `match`; a
+// block that does not *arrive* keeps `never`, that being reachability rather than a value.
+//
+// **Every output, message and location here was read out of the reference compiler (0.0.159)** by
+// handing the installed `sysl` the same program; the IR lines are its `emit-llvm`.
+
+private stp_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private stp_ran(text: string) -> string = xvr_ran(stp_main(text))
+
+private stp_ir(text: string) -> string = xvr_ir(stp_main(text))
+
+private stp_prints(text: string, expected: string)
+    val out = stp_ran(text)
+
+    assert(out == expected, s"expected '$expected', got: $out")
+
+// A refusal carries this message, anchored at this `line:column` of `main.sysl`.
+private stp_refused(text: string, message: string, at: string)
+    val said = stp_ran(text)
+
+    assert(said.contains(s"error: $message\n --> "), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+// The function named, from its `define` line up to the brace that closes it -- the reference's
+// `defineOf`.
+private stp_define(out: string, name: string) -> string
+    val lines = lines_of(out)
+    var said = str_builder()
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !inside && line.starts_with("define") && line.index_of(s"@$name(").is_some()
+            inside = true
+
+        if inside
+            if line == "}" then return said.finish()
+
+            said.push(line)
+            said.push("\n")
+
+    said.finish()
+end stp_define
+
+// How many `br label %if.end` lines directly follow a release of a numbered temporary -- the reference's
+// `call void @arc\.release\(ptr %t\d+\)\n  br label %if\.end`.
+private stp_released_then_joined(out: string) -> usize
+    val lines = lines_of(out)
+    var n: usize = 0
+
+    for i in 1..<lines.len()
+        if lines.at(i).starts_with("  br label %if.end") && lines.at(i - 1).starts_with("  call void @arc.release(ptr %t")
+            n += 1
+
+    n
+end stp_released_then_joined
+
+// -- branches written for effect need not agree ---------------------------------------------------
+
+// The shape the hash map hit: one arm sets a flag, the other counts.
+@test("an 'if' whose branches end in assignments of different types")
+stp_if_branches_assign_different_types()
+    if xvr_no_library() then return
+
+    stp_prints(raw"""
+        var full = false
+        var len = 0usize
+        var c = true
+        if c
+            full = true
+        else
+            len += 1usize
+        print(str(full))
+        print(str(len))
+        """, "true\n0\n")
+end stp_if_branches_assign_different_types
+
+@test("a 'match' whose arms end in assignments of different types")
+stp_match_arms_assign_different_types()
+    if xvr_no_library() then return
+
+    stp_prints(raw"""
+        var full = false
+        var len = 0usize
+        2 match
+            1 -> full = true
+            else len += 3usize
+        print(str(full))
+        print(str(len))
+        """, "false\n3\n")
+end stp_match_arms_assign_different_types
+
+// Not only assignments: any trailing expression is discarded the same way.
+@test("branches ending in calls that return different types")
+stp_branches_end_in_calls_of_different_types()
+    if xvr_no_library() then return
+
+    stp_prints(raw"""
+        n() -> int = 1
+        s() -> string = "x"
+        var c = false
+        if c
+            n()
+        else
+            s()
+        print(2)
+        """, "2\n")
+end stp_branches_end_in_calls_of_different_types
+
+@test("a branch ending in an increment, which yields the old value")
+stp_branch_ends_in_increment()
+    if xvr_no_library() then return
+
+    stp_prints(raw"""
+        var i = 0
+        var b = false
+        if true
+            i++
+        else
+            b = true
+        print(str(i))
+        """, "1\n")
+end stp_branch_ends_in_increment
+
+// -- the position reaches inward ------------------------------------------------------------------
+
+@test("into a 'match' arm's own 'if'")
+stp_into_a_match_arms_if()
+    if xvr_no_library() then return
+
+    stp_prints(raw"""
+        var a = 0
+        var b = false
+        1 match
+            1 ->
+                if a == 0
+                    a = 5
+                else
+                    b = true
+            else b = false
+        print(str(a))
+        """, "5\n")
+end stp_into_a_match_arms_if
+
+// A function owing no value is the outermost statement position, so the `match` that is its whole body
+// is one too.
+@test("into the body of a function that returns nothing")
+stp_into_a_unit_function_body()
+    if xvr_no_library() then return
+
+    stp_prints(raw"""
+        set(v: *int, hit: *bool, k: int)
+            k match
+                0 -> *hit = true
+                else *v += k
+        var n = 0
+        var h = false
+        set(&n, &h, 4)
+        set(&n, &h, 0)
+        print(str(n))
+        print(str(h))
+        """, "4\ntrue\n")
+end stp_into_a_unit_function_body
+
+@test("into a '*self' method that returns nothing")
+stp_into_a_self_method()
+    if xvr_no_library() then return
+
+    stp_prints(raw"""
+        struct C
+            n: int
+            hit: bool
+
+            bump(*self, k: int)
+                k match
+                    0 -> self.hit = true
+                    else self.n += k
+            end bump
+        var c: C
+        c.bump(4)
+        c.bump(0)
+        print(str(c.n))
+        print(str(c.hit))
+        """, "4\ntrue\n")
+end stp_into_a_self_method
+
+// An inner `match` written as a statement is discarded, while the arm it sits in is still asked for the
+// value that follows it.
+@test("without reaching back out of a statement into the arm around it")
+stp_not_back_out_into_the_arm()
+    if xvr_no_library() then return
+
+    stp_prints(raw"""
+        pick(n: int) -> int = n match
+            1 ->
+                var a = 0
+                n match
+                    1 -> a = 5
+                    else a = 6
+                a
+            else 0
+        print(pick(1))
+        """, "5\n")
+end stp_not_back_out_into_the_arm
+
+@test("and through a loop body, whose statements were always discarded")
+stp_through_a_loop_body()
+    if xvr_no_library() then return
+
+    stp_prints(raw"""
+        var t = 0
+        var b = false
+        for i in 0..<3
+            if i == 1
+                b = true
+            else
+                t += i
+        print(str(t))
+        print(str(b))
+        """, "2\ntrue\n")
+end stp_through_a_loop_body
+
+// -- a value position is unchanged ----------------------------------------------------------------
+
+@test("two 'if' branches that disagree about a value are still refused")
+stp_if_value_branches_refused()
+    if xvr_no_library() then return
+
+    stp_refused("var x = if true then 1 else \"no\"\n", "if branches have different types: int and string", "1:9")
+
+@test("two 'match' arms that disagree about a value are still refused")
+stp_match_value_arms_refused()
+    if xvr_no_library() then return
+
+    stp_refused("var x = 3 match\n    1 -> 10\n    else \"big\"\n", "match arms have different types: int and string",
+                "1:9")
+
+// The rule follows what is asking for the value, not the syntax of a trailing `if`.
+@test("and so are the branches ending the body of a function that returns one")
+stp_value_function_body_refused()
+    if xvr_no_library() then return
+
+    stp_refused(raw"""
+        f(c: bool) -> int
+            if c
+                1
+            else
+                "no"
+        print(f(true))
+        """, "if branches have different types: int and string", "2:5")
+end stp_value_function_body_refused
+
+@test("while the same body in a function returning nothing is fine")
+stp_unit_function_body_fine()
+    if xvr_no_library() then return
+
+    stp_prints(raw"""
+        f(c: bool)
+            if c
+                1
+            else
+                "no"
+        f(true)
+        print(9)
+        """, "9\n")
+end stp_unit_function_body_fine
+
+// -- assignment still yields its value wherever one is wanted (`reference/expressions.md § Assignment`)
+
+@test("chained, as the reference writes it")
+stp_chained_assignment()
+    if xvr_no_library() then return
+
+    stp_prints("var a = 0\nvar b = 0\nvar c = 0\na = b = c = 7\nprint(str(a + b + c))\n", "21\n")
+
+@test("captured in a condition")
+stp_assignment_in_a_condition()
+    if xvr_no_library() then return
+
+    stp_prints("var xs = [3, 2, 0, 9]\nvar i = 0\nvar v = 0\nwhile (v = xs[i]) != 0\n    i += 1\nprint(str(i))\n",
+               "2\n")
+
+// An assignment ending the body of a function that owes a value is still that value.
+@test("as the body of a function that returns one")
+stp_assignment_as_a_function_body()
+    if xvr_no_library() then return
+
+    stp_prints("set(p: *int) -> int = *p = 5\nvar n = 0\nprint(str(set(&n) + n))\n", "10\n")
+
+@test("and as a branch's value when the 'if' is bound to something")
+stp_assignment_as_a_bound_branch_value()
+    if xvr_no_library() then return
+
+    stp_prints("var a = 0\nvar b = 0\nvar x = if true then a = 4 else b = 5\nprint(str(x))\n", "4\n")
+
+// -- a loop's 'else' is a block too ---------------------------------------------------------------
+
+// Python's idiom: walk, leave early on a hit, and record in the `else` that nothing hit.
+@test("so the 'for'/'else' search idiom needs nothing written round it")
+stp_for_else_search_idiom()
+    if xvr_no_library() then return
+
+    stp_prints(raw"""
+        var xs = [3, 5, 8, 9]
+        var missing = false
+        for x in xs
+            if x == 100 then break
+        else
+            missing = true
+        print(str(missing))
+        """, "true\n")
+end stp_for_else_search_idiom
+
+@test("the same for a 'while'")
+stp_while_else()
+    if xvr_no_library() then return
+
+    stp_prints("var i = 0\nvar ran_out = false\nwhile i < 3\n    i += 1\nelse\n    ran_out = true\nprint(str(ran_out))\n",
+               "true\n")
+
+// A `break` carrying a value is an explicit request for one, so it is not discarded with the block.
+@test("while a 'break' that carries a value is still held to the 'else'")
+stp_valued_break_held_to_the_else()
+    if xvr_no_library() then return
+
+    stp_refused("var a = 0\nfor i in 0..<3\n    if i == 1 then break 7\nelse\n    a = 1\nprint(str(a))\n",
+                "a loop's break values and its 'else' must have the same type, but got int and unit", "2:1")
+
+@test("and a loop asked for a value is unchanged")
+stp_loop_asked_for_a_value()
+    if xvr_no_library() then return
+
+    stp_prints("var found = for i in 0..<5\n    if i == 3 then break i\nelse -1\nprint(str(found))\n", "3\n")
+
+// -- exhaustiveness follows the same line ---------------------------------------------------------
+
+@test("a scalar 'match' for effect needs no 'else'")
+stp_scalar_match_for_effect_needs_no_else()
+    if xvr_no_library() then return
+
+    stp_prints("var a = 0\n1 match\n    1 -> a = 1\n    2 -> a = 2\nprint(str(a))\n", "1\n")
+
+@test("but one that yields a value still does")
+stp_value_match_must_be_exhaustive()
+    if xvr_no_library() then return
+
+    stp_refused("var x = 1 match\n    1 -> 10\n    2 -> 20\nprint(x)\n",
+                "a 'match' that yields a value must be exhaustive — add an 'else' arm", "1:9")
+
+// An enum's coverage is not about the value at all, so statement position buys nothing there.
+@test("and an enum 'match' must cover its variants even for effect")
+stp_enum_match_for_effect_must_cover()
+    if xvr_no_library() then return
+
+    stp_refused(raw"""
+        enum Colour
+            Red
+            Green
+            Blue
+        var n = 0
+        Colour.Red match
+            Red -> n = 1
+            Green -> n = 2
+        print(str(n))
+        """, "match on 'Colour' is not exhaustive; missing Blue (add an 'else' arm)", "6:8")
+end stp_enum_match_for_effect_must_cover
+
+// -- a block that does not arrive keeps 'never' ---------------------------------------------------
+
+// Collapsing this to `unit` would leave the merge point looking reachable, and the function would end
+// by falling out of it: `f` has no `ret` at all, its last block being the unreachable merge.
+@test("so a discarded 'if' whose branches both diverge still ends nowhere")
+stp_diverging_if_ends_nowhere()
+    if xvr_no_library() then return
+
+    val f = stp_define(stp_ir("f(c: bool)\n    if c\n        exit(1)\n    else\n        exit(2)\nf(true)\n"), "f")
+
+    assert(f.index_of("ret void").is_none(), f)
+    assert(f.trim().ends_with("unreachable"), f)
+
+@test("and an arm that diverges beside arms that do not is still set aside")
+stp_diverging_arm_set_aside()
+    if xvr_no_library() then return
+
+    stp_prints("var a = 0\n2 match\n    1 -> exit(1)\n    else a = 5\nprint(str(a))\n", "5\n")
+
+// -- what the discarded value costs at runtime ----------------------------------------------------
+
+// The rule is about the type, not about whether the code runs: a discarded trailing expression's
+// effects happen exactly once.
+@test("the trailing expression still runs, and once")
+stp_trailing_expression_runs_once()
+    if xvr_no_library() then return
+
+    stp_prints(raw"""
+        bump(n: *int) -> int
+            *n += 1
+            *n
+        var n = 0
+        if true
+            bump(&n)
+        else
+            bump(&n)
+        print(str(n))
+        """, "1\n")
+end stp_trailing_expression_runs_once
+
+// A discarded `&T` is released where it was made rather than carried across the join in a merge slot.
+@test("and an owned value made in a discarded branch is let go where it was made")
+stp_discarded_owned_value_released_in_its_branch()
+    if xvr_no_library() then return
+
+    val src = raw"""
+        struct P
+            x: int
+        var c = true
+        if c
+            var p: &P = P(1)
+            p
+        else
+            var q: &P = P(2)
+            q
+        print(3)
+        """
+
+    stp_prints(src, "3\n")
+
+    val out = stp_define(stp_ir(src), "main")
+
+    assert(stp_released_then_joined(out) == 2, out)
+    assert(out.index_of("load ptr, ptr %t").is_none(), out)
+end stp_discarded_owned_value_released_in_its_branch
