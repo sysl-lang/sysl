@@ -1,0 +1,671 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A trait member with **no receiver**, reached through the type rather than through a value of it
+// (`reference/traits.md § Reaching a trait's members without a value`). A bound can promise something
+// about the *type* -- a width, a zero, a table of constants -- so a generic body need not ask a value it
+// does not read; and an `impl` for a **built-in** may carry such a member, the built-in's name being
+// what a call reaches it through.
+//
+// **Every output, message and location here was read out of the reference compiler** (0.0.157) on the
+// same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private tlv_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end tlv_skip
+
+private tlv_skip_run() -> bool
+    if tlv_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end tlv_skip_run
+
+private tlv_write(main: string) -> string
+    val root = make_temp_dir("sysl-tlv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end tlv_write
+
+// What the program PRINTS, or what the build had to say about it.
+private tlv_ran(main: string) -> string
+    val root = tlv_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tlv_ran
+
+// The LLVM text of the program, or everything the analysis had to say about it.
+private tlv_report(main: string) -> string
+    val root = tlv_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tlv_report
+
+private tlv_prints(main: string, expected: string)
+    if tlv_skip_run() then return
+
+    val out = tlv_ran(main)
+
+    assert(out == expected, s"expected '$expected', got: $out")
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private tlv_refused(main: string, message: string, at: string)
+    tlv_refused_saying(main, message, at)
+
+// The same, answering everything that was said, for a test with more to ask of it.
+private tlv_refused_saying(main: string, message: string, at: string) -> string
+    val out = tlv_report(main)
+    // The first diagnostic alone, which is where the location has to be.
+    val first = out.index_of("\n\n") match
+        Some(n) -> out[0..<n]
+        None -> out
+
+    assert(out.starts_with(s"error: $message\n "), s"expected 'error: $message' first, got: $out")
+    assert(first.index_of(s"/main.sysl:$at\n").is_some(), s"expected it first at main.sysl:$at, got: $out")
+    out
+end tlv_refused_saying
+
+// The body of the function the LLVM text defines as `@name`, or the empty string.
+private tlv_define_of(text: string, name: string) -> string
+    val lines = lines_of(text)
+    var out = ""
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if inside
+            out = out + line + "\n"
+            if line == "}" then return out
+        elif line.starts_with("define") && line.index_of(s" @$name(").is_some()
+            inside = true
+            out = line + "\n"
+
+    out
+end tlv_define_of
+
+private tlv_width() -> string = raw"""
+    trait Width
+        bits() -> usize
+        zero() -> Self
+
+    impl Width for u32
+        bits() -> usize = 32
+        zero() -> u32 = 0
+
+    impl Width for u64
+        bits() -> usize = 64
+        zero() -> u64 = 0
+
+    """
+
+// -- reached through a bound, a built-in, an alias ------------------------------------------------
+
+@test("a bound reaches an associated function through the type parameter")
+tlv_bound_reaches_through_parameter()
+    tlv_prints(tlv_width() + raw"""
+        howWide[T: Width](x: T) -> usize = T.bits()
+
+        main()
+            print(howWide(1u32), howWide(1u64))
+        """, "32 64\n")
+
+@test("the answer follows the instantiation, with no value of the type in the call at all")
+tlv_answer_follows_instantiation()
+    tlv_prints(tlv_width() + raw"""
+        start[T: Width]() -> T = T.zero()
+
+        main()
+            var a: u32 = start()
+            var b: u64 = start()
+            print(a + 7, b + 9)
+        """, "7 9\n")
+
+@test("a built-in's associated function is reached by naming the built-in")
+tlv_builtin_reached_by_name()
+    tlv_prints(tlv_width() + raw"""
+        main()
+            print(u32.bits(), u64.bits(), u32.zero(), u64.zero())
+        """, "32 64 0 0\n")
+
+@test("an alias reaches the one implementation the canonical name filed")
+tlv_alias_reaches_canonical()
+    tlv_prints(raw"""
+        trait Named
+            label() -> string
+
+        impl Named for i32
+            label() -> string = "thirty-two bits"
+
+        main()
+            print(int.label(), i32.label())
+        """, "thirty-two bits thirty-two bits\n")
+
+@test("an associated function takes arguments, and each implementation gets its own table")
+tlv_arguments_and_own_table()
+    tlv_prints(raw"""
+        val small: [4]u32 = [10, 20, 30, 40]
+        val large: [4]u64 = [1000, 2000, 3000, 4000]
+
+        trait Table
+            at(i: usize) -> Self
+
+        impl Table for u32
+            at(i: usize) -> u32 = small[i]
+
+        impl Table for u64
+            at(i: usize) -> u64 = large[i]
+
+        third[T: Table]() -> T = T.at(2)
+
+        main()
+            var a: u32 = third()
+            var b: u64 = third()
+            print(a, b, u32.at(0), u64.at(3))
+        """, "30 3000 10 4000\n")
+
+@test("`Self` names the implementing type inside a member's body")
+tlv_self_names_implementing_type()
+    tlv_prints(tlv_width() + raw"""
+        trait Doubled: Width
+            twice(self) -> usize = 2 * Self.bits()
+
+        impl Doubled for u32
+        impl Doubled for u64
+
+        main()
+            print((1u32).twice(), (1u64).twice())
+        """, "64 128\n")
+
+@test("a default body reaches the associated function the trait declared beside it")
+tlv_default_body_reaches_sibling()
+    tlv_prints(raw"""
+        trait Bounded: Sub
+            top() -> Self
+            headroom(self) -> Self = Self.top() - self
+
+        impl Bounded for u8
+            top() -> u8 = 200
+
+        impl Bounded for u16
+            top() -> u16 = 60000
+
+        main()
+            print((50u8).headroom(), (10000u16).headroom())
+        """, "150 50000\n")
+
+@test("a required trait's associated function is reached through the trait that required it")
+tlv_required_trait_reached()
+    tlv_prints(tlv_width() + raw"""
+        trait Sized: Width
+            bytes() -> usize
+
+        impl Sized for u32
+            bytes() -> usize = 4
+
+        describe[T: Sized](x: T) -> string = str(T.bits()) + " bits in " + str(T.bytes()) + " bytes"
+
+        main()
+            print(describe(1u32))
+        """, "32 bits in 4 bytes\n")
+
+@test("an associated function is emitted once per implementation and called directly")
+tlv_emitted_once_called_directly()
+    if tlv_skip() then return
+
+    // Two instantiations, each holding a direct call to its own implementation. A table would be a load
+    // and an indirect call, and there is no table: object safety refuses a trait declaring one.
+    val out = tlv_report(tlv_width() + raw"""
+        howWide[T: Width](x: T) -> usize = T.bits()
+
+        main()
+            print(howWide(1u32), howWide(1u64))
+        """)
+
+    assert(tlv_define_of(out, "howWide.uint").index_of("call i64 @uint.bits()").is_some(), out)
+    assert(tlv_define_of(out, "howWide.ulong").index_of("call i64 @ulong.bits()").is_some(), out)
+
+// -- what is refused ------------------------------------------------------------------------------
+
+// A trait the file may not **name** is not one the reader can act on, so neither diagnostic below may
+// mention it. `sysl.crypto.Word` is `private[crypto]` and declares `word_rounds` for `u32` and `u64`.
+@test("a private trait is not offered as the bound a type parameter is missing")
+tlv_private_trait_not_offered()
+    if tlv_skip() then return
+
+    val out = tlv_refused_saying(raw"""
+        howMany[T](x: T) -> usize = T.word_rounds()
+
+        main()
+            print(howMany(1u32))
+        """, "'T' is a type parameter, and no trait declares an associated function 'word_rounds' that a bound could promise", "1:31")
+
+    assert(out.index_of("sysl.crypto.Word").is_none(), out)
+
+@test("and a member reached through a private trait says it is private rather than advising an import")
+tlv_private_trait_member_says_private()
+    if tlv_skip() then return
+
+    val out = tlv_refused_saying(raw"""
+        main()
+            print(u32.word_rounds())
+        """, "uint has 'word_rounds', but the trait declaring it is private to the module that wrote it — the member is an implementation detail rather than something to import", "2:15")
+
+    assert(out.index_of("import it to reach the member").is_none(), out)
+
+@test("a bound that does not promise it is named")
+tlv_bound_named()
+    if tlv_skip() then return
+
+    tlv_refused(tlv_width() + "howWide[T](x: T) -> usize = T.bits()\n", "'bits' needs 'T: Width'", "13:31")
+
+@test("a name no trait declares says so rather than blaming the bound")
+tlv_no_trait_declares()
+    if tlv_skip() then return
+
+    tlv_refused(tlv_width() + "howWide[T: Width](x: T) -> usize = T.girth()\n",
+                "'T' is a type parameter, and no trait declares an associated function 'girth' that a bound could promise", "13:38")
+
+@test("a method is not reachable through the type")
+tlv_method_not_through_type()
+    if tlv_skip() then return
+
+    tlv_refused(raw"""
+        trait Show
+            show(self) -> string
+
+        describe[T: Show]() -> string = T.show()
+        """, "'show' is a method of 'Show' — call it on a value of 'T', not on the type itself", "4:35")
+
+@test("a property is not reachable through the type")
+tlv_property_not_through_type()
+    if tlv_skip() then return
+
+    tlv_refused(raw"""
+        trait Wide
+            bits -> usize
+
+        describe[T: Wide]() -> usize = T.bits()
+        """, "'bits' is a property of 'Wide' — read it on a value, as 'value.bits'", "4:34")
+
+@test("the parentheses are what a read is told is missing")
+tlv_read_told_parentheses()
+    if tlv_skip() then return
+
+    tlv_refused(tlv_width() + "howWide[T: Width](x: T) -> usize = T.bits\n",
+                "'bits' is an associated function of 'Width' — call it with 'T.bits()'", "13:38")
+
+@test("the same read on a built-in is told the same thing")
+tlv_builtin_read_told_parentheses()
+    if tlv_skip() then return
+
+    tlv_refused(tlv_width() + "main()\n    print(u32.bits)\n",
+                "'bits' is an associated function of 'uint' — call it with 'u32.bits()'", "14:15")
+
+@test("a built-in with no such member is told it is a type")
+tlv_builtin_told_it_is_a_type()
+    if tlv_skip() then return
+
+    tlv_refused("main()\n    print(u32.girth)\n",
+                "'u32' is a type, not a value, and has no associated function 'girth'", "2:15")
+
+@test("a call for a member the built-in does not have names the type")
+tlv_builtin_call_names_type()
+    if tlv_skip() then return
+
+    tlv_refused("main()\n    print(uint.girth())\n", "uint has no associated function 'girth'", "2:16")
+
+@test("a member reached on a value is not reached on the type")
+tlv_value_member_not_on_type()
+    if tlv_skip() then return
+
+    tlv_refused(raw"""
+        trait Doubler
+            doubled(self) -> Self
+
+        impl Doubler for u32
+            doubled(self) -> u32 = self * 2
+
+        main()
+            print(u32.doubled())
+        """, "'doubled' is an instance method of 'uint' — call it on a value, not the type", "8:15")
+
+@test("a composed type still has no name a call could reach an associated function through")
+tlv_composed_type_has_no_name()
+    if tlv_skip() then return
+
+    tlv_refused(raw"""
+        trait Empty
+            empty() -> int
+
+        impl Empty for []int
+            empty() -> int = 0
+        """, "'empty' has no receiver, and '[]int' is not a name a call could reach it through — give it a 'self' parameter", "5:5")
+
+@test("a trait declaring an associated function has no object, and the diagnostic names the member")
+tlv_no_object_names_member()
+    if tlv_skip() then return
+
+    tlv_refused(tlv_width() + "show(w: *Width) -> usize = 1\n",
+                "'Width' declares the associated function 'bits', which has no receiver to dispatch on — so there is no '*Width' to form", "13:10")
+
+@test("an implementation that leaves an associated function out is held to it")
+tlv_implementation_held_to_it()
+    if tlv_skip() then return
+
+    tlv_refused("trait Width\n    bits() -> usize\n\nimpl Width for u32\n",
+                "'uint' does not implement 'Width': associated function 'bits' is missing", "4:1")
+
+@test("a value of the type does not shadow the type's own name")
+tlv_value_does_not_shadow_type()
+    tlv_prints(tlv_width() + "main()\n    var u32 = 7\n    print(u32)\n", "7\n")
+
+// -- the neighbouring rules, asked rather than assumed --------------------------------------------
+
+// `reference/modules.md § Visibility`: a member is reachable where its **trait** is, and a member with
+// no receiver, reached through the type's name, is no exception.
+@test("a member needs the import too, and it is the trait that is imported")
+tlv_member_needs_trait_import()
+    tlv_prints(raw"""
+        import sysl.math.Float
+
+        main()
+            print(real.epsilon() < 1.0e-15, real.max_value() > 1.0e308)
+        """, "true true\n")
+
+    if tlv_skip() then return
+
+    tlv_refused("main()\n    print(real.epsilon() < 1.0e-15)\n",
+                "real has 'epsilon' from sysl.math.Float, and that trait is not in scope here — import it to reach the member", "2:16")
+
+@test("and a name needs the import in the same way")
+tlv_name_needs_import()
+    if tlv_skip() then return
+
+    tlv_refused("main()\n    print(pi)\n", "undefined name 'pi'", "2:11")
+
+// `reference/declarations.md § Structs`: `copy` is answered ahead of the member table, so a member of
+// that name would be registered and never found -- and having no receiver does not change that.
+@test("a compiler-provided member is still out of reach for an impl")
+tlv_compiler_member_out_of_reach()
+    if tlv_skip() then return
+
+    tlv_refused(raw"""
+        trait Duplicate
+            copy() -> string
+
+        impl Duplicate for string
+            copy() -> string = ""
+        """, "'copy' is a member the compiler provides for string — a member of this name would hide it", "5:5")
+
+// `reference/traits.md § One implementation per argument list`: an associated function has only its
+// arguments to choose by.
+@test("one trait at two argument lists is told apart by the argument, with no receiver to help")
+tlv_two_argument_lists_told_apart()
+    tlv_prints(raw"""
+        trait Of[T]
+            of(x: T) -> Self
+
+        impl Of[int] for u8
+            of(x: int) -> u8 = u8(x) + 1
+
+        impl Of[bool] for u8
+            of(x: bool) -> u8 = if x then 100 else 200
+
+        main()
+            print(u8.of(9), u8.of(true), u8.of(false))
+        """, "10 100 200\n")
+
+@test("a constrained subtype is a name a call reaches through")
+tlv_constrained_subtype_reached()
+    tlv_prints(raw"""
+        type Age = int within 0..150
+
+        trait Oldest
+            oldest() -> Self
+
+        impl Oldest for Age
+            oldest() -> Age = Age(150)
+
+        main()
+            print(int(Age.oldest()))
+        """, "150\n")
+
+@test("a generic type's associated function is reached through a bound at its instantiation")
+tlv_generic_type_reached_through_bound()
+    tlv_prints(raw"""
+        struct Box[T]
+            v: T
+
+        trait Blank
+            blank() -> Self
+
+        impl[T: Blank] Blank for Box[T]
+            blank() -> Box[T] = Box(T.blank())
+
+        impl Blank for int
+            blank() -> int = 0
+
+        empty[U: Blank]() -> U = U.blank()
+
+        main()
+            var b: Box[int] = empty()
+            print(b.v)
+        """, "0\n")
+
+@test("a closure body reaches the enclosing parameter's bound")
+tlv_closure_reaches_bound()
+    tlv_prints(tlv_width() + raw"""
+        twice[T: Width](x: T) -> usize
+            var f = () -> T.bits() * 2
+
+            f()
+
+        main()
+            print(twice(1u32), twice(1u64))
+        """, "64 128\n")
+
+@test("the pointer-width built-ins carry an associated function too")
+tlv_pointer_width_builtins()
+    tlv_prints(raw"""
+        trait Wide
+            wide() -> Self
+
+        impl Wide for usize
+            wide() -> usize = 64
+
+        main()
+            print(usize.wide())
+        """, "64\n")
+
+// `reference/generics.md § Writing the type arguments`: a function whose parameter appears nowhere in
+// its signature is reached by neither direction of inference, so the list written at the call says it.
+@test("a routine entirely about a type is called by writing the type")
+tlv_routine_called_by_writing_type()
+    tlv_prints(tlv_width() + raw"""
+        describe[T: Width]() -> usize = T.bits()
+
+        main()
+            print(describe[u32]())
+        """, "32\n")
+
+// -- a generic type's constructor takes type arguments the way a function does --------------------
+
+@test("a generic type's constructor takes a list of type arguments")
+tlv_constructor_takes_list()
+    tlv_prints(raw"""
+        struct Pair[K, V]
+            key: K
+            value: V
+
+        main()
+            var p = Pair[int, real](1, 2.5)
+            print(p.key, p.value)
+        """, "1 2.5\n")
+
+@test("a generic type's constructor takes one type argument")
+tlv_constructor_takes_one()
+    tlv_prints(raw"""
+        struct Box[T]
+            v: T
+
+        main()
+            var b = Box[int](1)
+            print(b.v)
+        """, "1\n")
+
+// The arguments on the type a variant is selected *from*: a variant is a construction of its type, so
+// they mean here what they mean at a constructor.
+@test("type arguments on the type a variant is selected from")
+tlv_variant_selected_from_applied_type()
+    tlv_prints(raw"""
+        enum Maybe[T]
+            Nothing
+            Just(v: T)
+
+        main()
+            var m = Maybe[int].Just(1)
+            val n: int = m match
+                Just(v) -> v
+                Nothing -> 0
+
+            print(n)
+        """, "1\n")
+
+@test("type arguments on a variant's type where nothing is called")
+tlv_variant_applied_type_nothing_called()
+    tlv_prints(raw"""
+        enum Maybe[T]
+            Nothing
+            Just(v: T)
+
+        main()
+            var m: Maybe[int] = Maybe[int].Nothing
+            val n: int = m match
+                Just(v) -> v
+                Nothing -> 0
+
+            print(n)
+        """, "0\n")
+
+@test("the plain variant name a type argument list points at is what works")
+tlv_plain_variant_name_works()
+    tlv_prints(raw"""
+        enum Maybe[T]
+            Nothing
+            Just(v: T)
+
+        main()
+            var m: Maybe[int] = Just(1)
+            val n: int = m match
+                Just(v) -> v
+                Nothing -> 0
+
+            print(n)
+        """, "1\n")
+
+// A local standing over the type's name is an ordinary subscript, and its author never wrote a type
+// argument to be told about.
+@test("a local named for a generic type keeps its subscript")
+tlv_local_keeps_subscript()
+    if tlv_skip() then return
+
+    val out = tlv_refused_saying(raw"""
+        struct Pair[K, V]
+            key: K
+            value: V
+
+        main()
+            var Pair = [1, 2, 3]
+            print(Pair[0](1))
+        """, "the thing being called must be a name, or something whose type says it is callable", "7:15")
+
+    assert(out.index_of("cannot be given type arguments").is_none(), out)
+
+@test("the annotated form a type-argument message names is the one that works")
+tlv_annotated_form_works()
+    tlv_prints(raw"""
+        struct Pair[K, V]
+            key: K
+            value: V
+
+        main()
+            var p: Pair[int, int] = Pair(1, 2)
+            print(p.key, p.value)
+        """, "1 2\n")
+
+// `reference/arrays.md`: a trait declaring an associated function is a bound that promises a value, so
+// a repeat over a type parameter is ordinary code.
+@test("a generic container can size storage while running, now that a bound can promise a value")
+tlv_container_sizes_storage()
+    tlv_prints(raw"""
+        trait Blank
+            blank() -> Self
+
+        impl Blank for int
+            blank() -> int = -1
+
+        struct Bag[K: Blank]
+            items: []K
+
+            with_room(n: usize) -> Bag[K] = Bag([K.blank(); n])
+
+        main()
+            var b: Bag[int] = Bag.with_room(3)
+
+            b.items[1] = 7
+            print(b.items.len, b.items[0], b.items[1], b.items[2])
+        """, "3 -1 7 -1\n")
+
+// Seven constants at two widths is fourteen functions the library declares; a program asking for one
+// carries none of the other thirteen.
+@test("nothing is emitted for an associated function's implementation nothing calls")
+tlv_nothing_emitted_uncalled()
+    if tlv_skip() then return
+
+    val out = tlv_report(raw"""
+        import sysl.math.Float
+
+        main()
+            print(real.zero())
+        """)
+
+    assert(out.index_of("@real.zero").is_some(), out)
+    assert(out.index_of("@real.nan").is_none(), out)
+    assert(out.index_of("@f32.zero").is_none(), out)

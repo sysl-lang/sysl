@@ -75,7 +75,9 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
         // for `Vector.zeros(n)` and the name is reported undefined. What settles which instantiation
         // is meant is the same thing that settles it for a generic function: what receives the
         // result.
-        None -> generic_subject(cx, span, receiver, name, args, expected)
+        None -> subtype_subject(cx, receiver, name) match
+            Some(found) -> Some(found)
+            None -> generic_subject(cx, span, receiver, name, args, expected)
 
     if subject.is_none() then return generic_enum_stranger(cx, span, receiver, name)
 
@@ -159,8 +161,12 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
                                    s"variant or associated function '$name'"))
             _ -> ()
 
-        return Some(cx.err(span, s"type '${found.0}' has no associated function " +
-                           s"'$name'"))
+        // A declared struct is named as a declaration is, quoted and called a type; a built-in is
+        // named the way a type is shown, `u32` as `uint` -- the reference's two spellings.
+        underlying(ty) match
+            Struct(_) -> return Some(cx.err(span, s"type '${found.0}' has no associated function " +
+                                            s"'$name'"))
+            _ -> return Some(cx.err(span, s"${type_show(ty)} has no associated function '$name'"))
     end if
 
     val decl = m.unwrap()
@@ -260,6 +266,34 @@ private generic_enum_stranger(cx: &Analyzer, span: Span, receiver: Expr,
     Some(cx.err(name_span(span, name), s"enum '${qualified_name(key.unwrap())}' has no variant or " +
                 s"associated function '$name'"))
 end generic_enum_stranger
+
+// `Age.oldest()` -- a constrained subtype is a name a call reaches through, as a struct's is, where an
+// `impl` gave it the member. **Only where it did**: a name the subtype was not given is left to the
+// member read, whose refusal names what a subtype offers under its own name (`Age::First` and the
+// rest), and a subtype is made real here only for a call that is going to use it.
+private subtype_subject(cx: &Analyzer, receiver: Expr, name: string) -> Option[Type]
+    val written = *receiver.kind match
+        Ident(n) -> if cx.lookup(n).is_none() then Some(n) else None
+        _ -> None
+
+    if written.is_none() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+
+    if key.is_none() then return None
+
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        TypeOf(_) -> ()
+        _ -> return None
+
+    if member_at(cx.an, key.unwrap(), name).is_none() then return None
+
+    Some(instantiate(cx.an, cx.scope, receiver.span, written.unwrap(), key.unwrap(), buf()))
+end subtype_subject
 
 // The member's own name at the head of a call through a type -- where the reference anchors a
 // refusal about the member, rather than across the parentheses after it.
