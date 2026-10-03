@@ -175,6 +175,145 @@ inert_callees(p: TProgram) -> Set[string]
     out
 end inert_callees
 
+// -- the callee: a body that writes nothing outside its own frame ---------------------------------
+
+// The functions that, called, change no memory but their own frames' -- and call nothing that does.
+//
+// **This is what makes lending storage invisible.** While such a call runs, every byte outside its
+// frames stays as it was, so storage a caller hands over by address cannot change under the callee
+// whoever else holds a pointer to it, and a count held in that storage stays held. So a caller
+// lends a place to one of these with no snapshot and no count of its own, and a callee among them
+// reads a large `self` where it lies (`lends_self`) -- the copy a `self` receiver is documented as
+// being is then a copy nobody could tell from the original.
+//
+// A body qualifies when every write it makes is rooted at one of its own locals (never through a
+// dereference, a `ref` or a global), every call it makes is to a function of the set or does not
+// come back, and every other node is one that neither calls nor writes (`inert_node`). Calls are
+// the one thing that needs the whole program, so the set is the GREATEST fixpoint: start from every
+// body whose own nodes pass and strike out, until nothing moves, each one calling something struck
+// out. Recursion among bodies that only read is kept, which is right -- none of them writes.
+quiet_callees(p: TProgram) -> Set[string]
+    var calls: Buf[Buf[string]] = buf()
+    var alive: Buf[bool] = buf()
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+        val sink: &CallSink = CallSink(buf())
+        val v: &Verdict = Verdict(own_quiet(f))
+
+        if v.ok
+            walk_block_stmts(f.body, TWalk(true, x -> quiet_node(v, sink, x), w -> quiet_write(v, w),
+                                           s -> if !quiet_stmt(s) then v.refuse()))
+
+        calls.push(sink.names)
+        alive.push(v.ok)
+
+    var out: Set[string] = set()
+
+    for i in 0..<p.funcs.len()
+        if alive.at(i) then out.add(p.funcs.at(i).name)
+
+    var moved = true
+
+    while moved
+        moved = false
+
+        for i in 0..<p.funcs.len()
+            if alive.at(i)
+                val named = calls.at(i)
+
+                for j in 0..<named.len()
+                    if alive.at(i) && !out.has(named.at(j))
+                        alive.set(i, false)
+                        out.remove(p.funcs.at(i).name)
+                        moved = true
+
+    out
+end quiet_callees
+
+// What a function says about itself before its body is read: a clause is code emitted around the
+// body and a measured loop is a frame of a different shape, so either leaves it out.
+private own_quiet(f: TFunc) -> bool =
+    f.requires.is_empty() && f.ensures.is_empty() && f.olds.is_empty() && f.variant.is_none()
+
+private quiet_stmt(s: TStmt) -> bool = s match
+    TVarDecl(_, _, _, _) -> true
+    TExprStmt(_) -> true
+    TWriteStmt(_) -> true
+    TMultiAssign(_) -> true
+    TReturn(_) -> true
+    TBreak(_, _) -> true
+    TContinue(_) -> true
+    _ -> false
+
+// The callees a body names, in a box a walk's closures push through.
+private struct CallSink
+    names: Buf[string]
+
+    add(*self, name: string)
+        self.names.push(name)
+end CallSink
+
+// A call is noted rather than judged, since whether its callee qualifies is the fixpoint's question.
+private quiet_node(v: &Verdict, calls: &CallSink, x: TExpr) = *x.kind match
+    TCall(name, _, ty, _) -> if ty != Never then calls.add(name)
+    TStore(place, _, _) -> if !frame_place(place) then v.refuse()
+    TIncDec(place, _, _, _, check) -> if check.is_some() || !frame_place(place) then v.refuse()
+    TUpdate(place, _, _, _, dispatch, _) ->
+        if dispatch.is_some() || !frame_place(place) then v.refuse()
+    _ -> if !inert_node(x) then v.refuse()
+
+private quiet_write(v: &Verdict, w: TWrite)
+    if w.dispatch.is_some() || !w.check.is_empty() || w.constraint.is_some() || !frame_place(w.place) then
+        v.refuse()
+end quiet_write
+
+// Whether a place is storage of the function's own frame: a local, or a field, array element or lane
+// of one, with no dereference on the way. An element of a SLICE is not -- the elements belong to
+// whoever owns them, however local the view is.
+private frame_place(place: TExpr) -> bool = *place.kind match
+    TLoad(_, _) -> true
+    TField(r, _, _) -> frame_place(r)
+    TIndex(r, _, _) -> repr(texpr_type(r)) match
+        Array(_, _) -> frame_place(r)
+        _ -> false
+    TLane(r, _, _) -> frame_place(r)
+    _ -> false
+
+// Whether a method may read its large `self` where the caller's storage lies rather than copying it
+// in at entry. Three things have to hold beyond the body being quiet: the body never writes `self`,
+// takes its address, or views any of it (a view of the caller's storage would let a write or an
+// escape reach the original); the function is reached only by sysl calls (nothing else lends under
+// this rule); and it makes no self-jump, which reassigns the slot.
+lends_self(f: TFunc, quiet: bool, addressed: bool, jumps: bool) -> bool
+    if !quiet || addressed || jumps then return false
+
+    if f.exported.is_some() || f.section.is_some() || f.conv.is_some() then return false
+
+    val bound = rebound(f)
+
+    if bound.has(OPAQUE) || bound.has("self") then return false
+
+    val v: &Verdict = Verdict(true)
+
+    walk_block_stmts(f.body, expr_walk(true, x -> if views_self(x) then v.refuse()))
+    v.ok
+end lends_self
+
+private views_self(x: TExpr) -> bool = *x.kind match
+    TSlice(base, _, _, _, _) -> rooted_at_self(base)
+    TConstView(arg) -> rooted_at_self(arg)
+    TStrView(arg) -> rooted_at_self(arg)
+    TBytes(r) -> rooted_at_self(r)
+    _ -> false
+
+private rooted_at_self(place: TExpr) -> bool = *place.kind match
+    TLoad(name, _) -> name == "self"
+    TField(r, _, _) -> rooted_at_self(r)
+    TIndex(r, _, _) -> rooted_at_self(r)
+    TLane(r, _, _) -> rooted_at_self(r)
+    _ -> false
+
 // -- the callee: which parameters it keeps a count of its own for ------------------------------------
 
 // The parameters of `f` that it takes a count for at entry and gives back at each return.
@@ -344,6 +483,11 @@ exposed_unknown() -> Set[string]
     out.add(OPAQUE)
     out
 end exposed_unknown
+
+// Whether a call to this function may be handed a place as it lies, with no count taken for it: a
+// body that can release nothing cannot let go of the caller's share, and one that writes nothing
+// outside its frames cannot change the storage the share is held in.
+lends_to(e: *Emit, name: string) -> bool = e.inert.has(name) || e.quiet.has(name)
 
 // Whether the caller already holds a count for this argument that outlives the call.
 //
