@@ -1,0 +1,612 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `.red` -- a member of the type the context EXPECTS, written with that type's own name left off
+// (`reference/expressions.md § A leading dot`). `.name` is `T.name` with the `T` dropped, where `T`
+// is what the context asks for, so what it reaches is exactly what the qualified spelling reaches --
+// a variant, a data-carrying variant, an associated function -- and the two spellings are checked
+// against each other here rather than described.
+//
+// The expectation is not new machinery either: every position that already pushes a type down
+// supplies one, which is why the first group is a list of *positions* rather than of features.
+//
+// **Every output and every message here was read out of the reference compiler** (0.0.156), whose
+// `ImplicitMemberTests` these are, by handing the installed `sysl` the same program.
+
+private var imm_library_cache: Buf[Program] = buf()
+private var imm_library_read: bool = false
+
+private imm_library() -> Buf[Program]
+    if imm_library_read then return imm_library_cache
+
+    imm_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> imm_library_cache = units
+
+    imm_library_cache
+end imm_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private imm_ready() -> bool
+    if imm_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end imm_ready
+
+private imm_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// The files of one program laid out under a fresh directory, each at its path relative to it.
+private imm_tree(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-imm").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    root
+end imm_tree
+
+// **What a program of several files PRINTS.**
+private imm_ran_in(files: []const (string, string)) -> string
+    val root = imm_tree(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end imm_ran_in
+
+private imm_ran(text: string) -> string = imm_ran_in([("main.sysl", text)])
+
+// Everything a program of several files has to say for itself, taken the whole way the reference's
+// own `err` takes it -- through the lowering.
+private imm_err_in(files: []const (string, string)) -> string
+    val root = imm_tree(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end imm_err_in
+
+private imm_err(text: string) -> string = imm_err_in([("main.sysl", text)])
+
+// A refusal, by its whole first line.
+private imm_refused(said: string, message: string)
+    assert(imm_says(said, s"error: $message\n"), said)
+
+private imm_colour() -> string = raw"""
+    enum Colour
+        Red
+        Green
+        Blue
+    code(c: Colour) -> int
+        c match
+            Red -> 1
+            Green -> 2
+            Blue -> 3
+    """
+
+// The same enum in a module of its own, which is what makes a use site's spelling worth measuring:
+// reaching `Green` there otherwise needs the module path, the type, or an import.
+private imm_paint() -> string = raw"""
+    module paint
+    enum Colour
+        Red
+        Green
+    code(c: Colour) -> int
+        c match
+            Red -> 1
+            Green -> 2
+    """
+
+// The refusal a leading dot gets where the position supplies no type to look the name up in.
+private imm_nothing(name: string) -> string =
+    s"'.$name' is a member of whatever type the context expects, and nothing here expects one — " +
+    "write the type's own name in front of the dot. A trait object expects no single type either, " +
+    "since what may be erased into one is whatever implements the trait"
+
+// ---- the expected type supplies the qualifier ----
+
+@test("at an argument")
+imm_at_an_argument()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "print(code(.Green))"), "2\n")
+
+@test("at an annotated binding")
+imm_at_an_annotated_binding()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "val c: Colour = .Blue\nprint(code(c))"), "3\n")
+
+@test("at a mutable one, and at the assignment that follows it")
+imm_at_a_mutable_one()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "var c: Colour = .Red\nc = .Blue\nprint(code(c))"), "3\n")
+
+@test("at a return, and at an expression body")
+imm_at_a_return()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "pick() -> Colour = .Green\nlater() -> Colour\n    return .Blue\n" +
+                      "print(code(pick()), code(later()))"), "2 3\n")
+
+// The branch rather than the whole expression is what a converting context belongs to, so an `if`
+// used as a value hands each side the same expectation it hands a single expression.
+@test("in each branch of an `if` used as a value")
+imm_in_each_branch_of_an_if()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "val c: Colour = if 1 < 2 then .Red else .Blue\nprint(code(c))"),
+              "1\n")
+
+@test("at a struct's field, which the constructor supplies from the declaration")
+imm_at_a_structs_field()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "struct Pen\n    c: Colour\n    width: int\n" +
+                      "val p = Pen(.Green, 3)\nprint(code(p.c), p.width)\n"), "2 3\n")
+
+// A `&T` parameter asks the expression for the `T` it will box, so the payload's type is what
+// arrives -- the boxing is not something the form has to know about.
+@test("at a reference parameter, whose expectation is the payload it boxes")
+imm_at_a_reference_parameter()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "shade(c: &Colour) -> int = code(*c)\nprint(shade(.Blue))"), "3\n")
+
+@test("at a variant that carries data")
+imm_at_a_variant_that_carries_data()
+    if !imm_ready() then return
+
+    val src = raw"""
+        enum Shape
+            Circle(r: int)
+            Square(side: int)
+        area(s: Shape) -> int
+            s match
+                Circle(r) -> r * 3
+                Square(side) -> side * side
+        print(area(.Circle(2)), area(.Square(4)))
+        """
+
+    assert_eq(imm_ran(src), "6 16\n")
+
+@test("and at the library's own enums, which are no different")
+imm_at_the_librarys_own_enums()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran("val o: Option[int] = .None\nval p: Option[int] = .Some(7)\n" +
+                      "print(o.is_some(), p.unwrap())"), "false 7\n")
+
+@test("at an argument written by name rather than by position")
+imm_at_an_argument_written_by_name()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "paint(c: Colour) -> int = code(c)\nprint(paint(c = .Blue))"), "3\n")
+
+// A default is analyzed at the parameter it fills, in the declaration's own scope -- so the
+// expectation reaches it through the wrapper argument binding puts around it.
+@test("at a parameter's default, which is filled at the call that left it out")
+imm_at_a_parameters_default()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "paint(c: Colour = .Green) -> int = code(c)\n" +
+                      "print(paint(), paint(.Blue))"), "2 3\n")
+
+@test("at an element of an array literal, and of a slice")
+imm_at_an_element_of_an_array_literal()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "val xs: [2]Colour = [.Red, .Blue]\n" +
+                      "val ys: []Colour = [.Green, .Red]\nprint(code(xs[1]), code(ys[0]))"), "3 2\n")
+
+@test("at a part of a tuple")
+imm_at_a_part_of_a_tuple()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "val t: (Colour, int) = (.Blue, 2)\nprint(code(t.0), t.1)"), "3 2\n")
+
+// The payload's own type is an expectation like any other, so the form nests: the outer `.Some` is
+// resolved against `Option[Colour]` and hands `Colour` to the inner one.
+@test("and inside another one, at the payload the outer variant declares")
+imm_inside_another_one()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "val o: Option[Colour] = .Some(.Red)\nprint(code(o.unwrap()))"),
+              "1\n")
+
+@test("in the arms of a `match` used as a value")
+imm_in_the_arms_of_a_match()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "val c: Colour = .Red\nval d: Colour = c match\n    Red -> .Blue\n" +
+                      "    Green -> .Green\n    Blue -> .Red\nprint(code(d))\n"), "3\n")
+
+// ---- an operand takes it from the operand beside it ----
+
+@test("on the right of a comparison")
+imm_on_the_right_of_a_comparison()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "val c: Colour = .Green\nprint(c == .Green, c != .Green)"),
+              "true false\n")
+
+@test("and on the left, since neither side is privileged")
+imm_and_on_the_left()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "val c: Colour = .Green\nprint(.Green == c)"), "true\n")
+
+// ---- it reaches what the qualified form reaches ----
+
+@test("an associated function of a struct")
+imm_an_associated_function_of_a_struct()
+    if !imm_ready() then return
+
+    val src = raw"""
+        struct Point
+            x: int
+            y: int
+            origin() -> Point = Point(0, 0)
+        val p: Point = .origin()
+        print(p.x, p.y)
+        """
+
+    assert_eq(imm_ran(src), "0 0\n")
+
+@test("an associated function of an enum")
+imm_an_associated_function_of_an_enum()
+    if !imm_ready() then return
+
+    val src = raw"""
+        enum Signal
+            Stop
+            Go
+            start() -> Signal = Go
+        lit(s: Signal) -> int
+            s match
+                Stop -> 0
+                Go -> 1
+        val s: Signal = .start()
+        print(lit(s))
+        """
+
+    assert_eq(imm_ran(imm_colour() + src), "1\n")
+
+// The parity is the point of the rule, so it is checked where the qualified form FAILS too: an
+// associated function of a generic type has no receiver to read the arguments off, and a result
+// that never mentions `T` gives the expectation nothing to settle it with -- so both spellings say
+// so in the same words.
+@test("and it fails where the qualified form fails, in the same words")
+imm_fails_where_the_qualified_form_fails()
+    if !imm_ready() then return
+
+    val head = "struct Box[T]\n    v: T\n    empty() -> Box[int] = Box(0)\nval b: Box[int] = "
+    val message = "cannot infer the type argument 'T' of 'Box.empty' here — annotate the expected type"
+
+    imm_refused(imm_err(head + ".empty()\nprint(b.v)\n"), message)
+    imm_refused(imm_err(head + "Box.empty()\nprint(b.v)\n"), message)
+
+// And where the result does mention `T`, both spellings read it off the expectation.
+@test("a generic type's associated function whose result names its parameter")
+imm_a_generic_types_associated_function()
+    if !imm_ready() then return
+
+    val src = "struct Box[T]\n    v: T\n    of(x: T) -> Box[T] = Box(x)\nval b: Box[int] = .of(3)\nprint(b.v)"
+
+    assert_eq(imm_ran(src), "3\n")
+
+// `try` is reached because the qualified form reaches it, and it is never useful: what it yields is
+// an `Option` of the enum, so the expectation that would have named the enum is the one thing it
+// cannot satisfy.
+@test("an enum's `try`, which the rule reaches and the types then refuse")
+imm_an_enums_try()
+    if !imm_ready() then return
+
+    imm_refused(imm_err(imm_colour() + "val c: Colour = .try(1)\nprint(code(c))"),
+                "cannot initialize 'c': declared Colour but the value is sysl.Option[Colour]")
+
+// The expectation is read AS WRITTEN rather than through `repr`: a transparent subtype reduces to
+// `int`, and `int` is not where an `Age`'s members are filed.
+@test("an associated function of a constrained subtype, which `repr` would have thrown away")
+imm_an_associated_function_of_a_constrained_subtype()
+    if !imm_ready() then return
+
+    val src = raw"""
+        type Age = int within 0..150
+        trait Fresh
+            fresh() -> Self
+        impl Fresh for Age
+            fresh() -> Age = Age(1)
+        val a: Age = .fresh()
+        print(int(a))
+        """
+
+    assert_eq(imm_ran(src), "1\n")
+
+// ---- the type it resolves against need not be nameable here ----
+
+@test("a variant of another module's enum, with no import and no path")
+imm_a_variant_of_another_modules_enum()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran_in([("paint/paint.sysl", imm_paint()), ("main.sysl", "print(paint.code(.Green))\n")]),
+              "2\n")
+
+// Visibility is still the type's to decide: what the dot leaves off is the spelling, not the check.
+@test("and a private associated function is still refused")
+imm_a_private_associated_function_is_still_refused()
+    if !imm_ready() then return
+
+    val pen = "struct Pen\n    c: Colour\n    private make() -> Pen = Pen(Red)\n"
+    val said = imm_err_in([("paint/paint.sysl", imm_paint() + pen),
+                           ("main.sysl", "val p: paint.Pen = .make()\nprint(1)\n")])
+
+    assert(imm_says(said, "error: associated function 'make' of 'paint.Pen' is private to '"), said)
+    assert(imm_says(said, "paint.sysl', the file that declares it\n"), said)
+
+// ---- overloading decides it the way it decides everything else ----
+
+// A candidate is chosen by TRYING the call against it, and each try analyzes the argument at that
+// candidate's parameter type -- so the one whose enum has no such variant simply does not fit.
+@test("the candidate whose parameter has the variant is the one that fits")
+imm_the_candidate_whose_parameter_has_the_variant()
+    if !imm_ready() then return
+
+    val src = raw"""
+        enum Colour
+            Red
+            Green
+        enum Fruit
+            Apple
+            Pear
+        name(c: Colour) -> int = 1
+        name(f: Fruit) -> int = 2
+        print(name(.Red), name(.Pear))
+        """
+
+    assert_eq(imm_ran(src), "1 2\n")
+
+@test("and a variant both of them declare is the ambiguity the language already reports")
+imm_a_variant_both_declare_is_ambiguous()
+    if !imm_ready() then return
+
+    val src = raw"""
+        enum Colour
+            Red
+            Ripe
+        enum Fruit
+            Apple
+            Ripe
+        name(c: Colour) -> int = 1
+        name(f: Fruit) -> int = 2
+        print(name(.Ripe))
+        """
+
+    imm_refused(imm_err(src), "'name' is ambiguous here — 2 of its declarations take these arguments:\n" +
+                "    name(c: Colour)\n    name(f: Fruit)\nAnnotate an argument, or name the type a " +
+                "literal is meant at")
+
+// The same tie, made by the other two arguments a position types: a bare `None` and `null`. The
+// roster between the two lines is left out: this compiler shows a type by its qualified name
+// (`sysl.Option[int]`, `*byte`) where the reference shows the spelling (`Option[int]`, `*u8`).
+private imm_ambiguous(said: string)
+    assert(imm_says(said, "error: 'f' is ambiguous here — 2 of its declarations take these arguments:\n"),
+           said)
+    assert(imm_says(said, "\nAnnotate an argument, or name the type a literal is meant at\n"), said)
+
+@test("a bare None between two instantiations of Option is the same ambiguity")
+imm_a_bare_none_is_the_same_ambiguity()
+    if !imm_ready() then return
+
+    imm_ambiguous(imm_err("f(x: Option[int]) -> int = 1\nf(x: Option[string]) -> int = 2\nprint(f(None))"))
+
+@test("and so is null between two pointer types")
+imm_null_is_the_same_ambiguity()
+    if !imm_ready() then return
+
+    imm_ambiguous(imm_err("f(x: *int) -> int = 1\nf(x: *u8) -> int = 2\nprint(f(null))"))
+
+// ---- at a generic parameter it is held back, exactly as `null` is ----
+
+@test("so the argument that settles the parameter settles this one too")
+imm_the_argument_that_settles_the_parameter()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran(imm_colour() + "first[T](a: T, b: T) -> T = a\nprint(code(first(Colour.Blue, .Red)))"),
+              "3\n")
+
+@test("and where nothing settles it, the refusal says the context supplied no type")
+imm_where_nothing_settles_it()
+    if !imm_ready() then return
+
+    imm_refused(imm_err(imm_colour() + "only[T](a: T) -> int = 1\nprint(only(.Red))"), imm_nothing("Red"))
+
+// ---- what it refuses ----
+
+@test("a position that expects nothing at all")
+imm_a_position_that_expects_nothing()
+    if !imm_ready() then return
+
+    imm_refused(imm_err(imm_colour() + "print(.Red)"), imm_nothing("Red"))
+
+// A trait object pushes no expectation down at all -- what may be erased into one is whatever
+// implements the trait -- so this arrives as the no-context case, and the message names it.
+@test("a trait object, which expects no single type")
+imm_a_trait_object()
+    if !imm_ready() then return
+
+    val src = raw"""
+        trait Shape
+            area(self) -> int
+        struct Rect
+            w: int
+            h: int
+            unit() -> Rect = Rect(1, 1)
+        impl Shape for Rect
+            area(self) -> int = self.w * self.h
+        report(s: &Shape) -> int = s.area()
+        print(report(.unit()))
+        """
+
+    imm_refused(imm_err(src), imm_nothing("unit"))
+
+// The expectation belongs to the whole expression, and the receiver of a `.x` is not it.
+@test("a receiver, since what the context expects is the whole expression's type")
+imm_a_receiver()
+    if !imm_ready() then return
+
+    val src = raw"""
+        struct Point
+            x: int
+            y: int
+            origin() -> Point = Point(4, 5)
+        print(.origin().x)
+        """
+
+    imm_refused(imm_err(src), imm_nothing("origin"))
+
+// A weak reference expects a value something else keeps alive, so a freshly built one is refused --
+// with the refusal the bare spelling gets.
+@test("a value built at a `weak` reference, which nothing would be holding")
+imm_a_value_built_at_a_weak_reference()
+    if !imm_ready() then return
+
+    imm_refused(imm_err(imm_colour() + "hold(c: weak Colour) -> int = 1\nprint(hold(.Red))"),
+                "a weak reference does not keep Colour alive, and nothing else here holds this one — " +
+                "so it would be gone before it could be read. Hold it in a '&Colour' first, and " +
+                "weaken that")
+
+@test("a name the expected type does not have")
+imm_a_name_the_expected_type_does_not_have()
+    if !imm_ready() then return
+
+    imm_refused(imm_err(imm_colour() + "val c: Colour = .Rd\nprint(code(c))"),
+                "enum 'Colour' has no variant 'Rd'")
+
+@test("a property, which is read on a value")
+imm_a_property()
+    if !imm_ready() then return
+
+    imm_refused(imm_err("enum Colour\n    Red\n    code -> int = 1\nval c: Colour = .code\nprint(1)\n"),
+                "'code' is a property of 'Colour' — read it on a value, as 'value.code'")
+
+@test("a method, which is called on one")
+imm_a_method()
+    if !imm_ready() then return
+
+    imm_refused(imm_err("enum Colour\n    Red\n    tone(self) -> int = 1\nval c: Colour = .tone()\nprint(1)\n"),
+                "'tone' is an instance method of 'Colour' — call it on a value, not the type")
+
+// An associated function written without its parentheses is told the qualified call it meant.
+@test("an associated function written with no parentheses")
+imm_an_associated_function_with_no_parentheses()
+    if !imm_ready() then return
+
+    val src = "struct Point\n    x: int\n    origin() -> Point = Point(4, 5)\nval p: Point = .origin\nprint(p.x)"
+
+    imm_refused(imm_err(src), "'origin' is an associated function of 'Point' — call it with 'Point.origin(…)'")
+
+// The dot is the expression form's, and a pattern is already matched against a type it knows.
+private imm_pattern_message() -> string =
+    "a pattern is matched against a type it already knows, so the variant is written 'Red' with no " +
+    "leading dot — the dot is for an expression, where the type comes from what the context expects"
+
+private imm_dotted_pattern() -> string =
+    imm_colour() + "val c: Colour = .Red\nval n = c match\n    .Red -> 1\n    else -> 2\nprint(n)"
+
+@test("the form written in a pattern, where the type is already known")
+imm_the_form_written_in_a_pattern()
+    if !imm_ready() then return
+
+    imm_refused(imm_err(imm_dotted_pattern()), imm_pattern_message())
+
+// ---- a statement that begins with one ----
+
+// The leading-dot continuation makes the continuation the reading wherever there is a line above.
+@test("is read as a continuation of the line above, where there is one to continue")
+imm_read_as_a_continuation()
+    if !imm_ready() then return
+
+    imm_refused(imm_err(imm_colour() + ".Red\nprint(1)"), "cannot read field 'Red' of int")
+
+// Nothing precedes it, so nothing is joined and the analyzer gets the statement the parser produced.
+@test("and where there is nothing above it, parses and is refused for having no expectation")
+imm_nothing_above_it()
+    if !imm_ready() then return
+
+    imm_refused(imm_err(".Red\n" + imm_colour() + "print(1)"), imm_nothing("Red"))
+
+// ---- the leading-dot continuation does not swallow the first arm of a match ----
+
+// An arm's pattern begins a line, and the lexer declines to join after a reserved word -- nothing
+// can be called on `match` -- which is what leaves the pattern diagnostic reachable at all.
+@test("so the pattern form is still refused in the words written for it")
+imm_the_pattern_form_is_still_refused()
+    if !imm_ready() then return
+
+    val said = imm_err(imm_dotted_pattern())
+
+    imm_refused(said, imm_pattern_message())
+    assert(!imm_says(said, "cannot read field"), said)
+
+// And the ordinary chain, whose line above ends in a name rather than a keyword, is unaffected.
+@test("while a chain after an ordinary line still joins")
+imm_a_chain_still_joins()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran("import sysl.text.Search\n\nval n = \"  hi  \"\n    .trim()\n    .len\nprint(n)"), "2\n")
+
+// ---- the grammar's three neighbours are unchanged ----
+
+@test("a range, whose `..` and `..<` are single tokens")
+imm_a_range()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran("var t = 0\nfor i in 0..<3\n    t += i\nprint(t)"), "3\n")
+
+@test("a tuple index, which is read where there is a value to its left")
+imm_a_tuple_index()
+    if !imm_ready() then return
+
+    assert_eq(imm_ran("val t = (1, 2)\nprint(t.0, t.1)"), "1 2\n")
+
+// A number begins with a digit, so `.5` is two tokens; the dot has an owner to complain about it.
+@test("and a fraction written with no digit before the point, which is refused by name")
+imm_a_fraction_with_no_digit_before_the_point()
+    if !imm_ready() then return
+
+    imm_refused(imm_err("print(.5)"), "a number is written with a digit before the point — '0.5' rather than '.5'")
