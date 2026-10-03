@@ -126,6 +126,13 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
     val m = member_at(cx.an, found.0, picked)
 
     if m.is_none()
+        // **A constrained subtype is a type of its own and is not delegated to its base**: what it
+        // offers under its own name is the `::` surface, so a member it does not declare is told
+        // that rather than reaching the base's `zero` or `width`.
+        val refused = constrained_refusal(cx, span, receiver, name, expected)
+
+        if refused.is_some() then return refused
+
         // A receiverless member the compiler provides is reached through the type, which is exactly
         // the spelling this form is: `uint.zero()` and `u32.width()` are calls with no arguments.
         val provided = builtin_constant_read(cx, span, ty, name)
@@ -541,8 +548,40 @@ subject_named(cx: &Analyzer, receiver: Expr) -> Option[Type]
 
     if key.is_none() then return None
 
-    concrete_instance(cx.an, key.unwrap())
+    val concrete = concrete_instance(cx.an, key.unwrap())
+
+    if concrete.is_some() then return concrete
+
+    // **An alias and a constrained subtype are filed with the constrained instantiations** -- an
+    // alias's entry being what it names -- so `F.zero()` over `type F = real` is `real.zero()`, and
+    // `Age.make()` reaches the `impl` written for `Age`.
+    cx.an.tables.constrained_insts.get(key.unwrap())
 end subject_named
+
+// The refusal a constrained subtype's name gives a member it does not declare, where the name in
+// front of the dot is one; `None` for every other subject, an alias included.
+private constrained_refusal(cx: &Analyzer, span: Span, receiver: Expr, name: string,
+                            expected: Option[Type]) -> Option[TExpr]
+    val written = dotted_name_written(cx, receiver)
+
+    if written.is_none() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+
+    if key.is_none() then return None
+
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        TypeOf(d) ->
+            if is_plain_alias(d) then return None
+
+            Some(constrained_member(cx, span, key.unwrap(), d, receiver, written.unwrap(), name,
+                                    expected))
+        _ -> None
+end constrained_refusal
 
 // `value.member(args)` -- a call, which is what the parentheses said.
 call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr],

@@ -519,9 +519,32 @@ private resolve_named_subtypes(a: &Analysis)
                     a.fault(decl.scope, decl.span,
                             s"'${d.name}' is an alias for itself, through a chain of aliases")
                 else
-                    instantiate_named_subtype(a, decl.scope, decl.span, d.name, key, d, decl.scope,
-                                              buf())
+                    val made = instantiate_named_subtype(a, decl.scope, decl.span, d.name, key, d,
+                                                         decl.scope, buf())
+
+                    subtype_base_refused(a, decl, d, made)
             _ -> ()
+
+// **A type of its own -- `new`, `within` or `where` -- is a number with a narrower meaning**, so its
+// base has to be one: an integer, a float or a `char`. An alias names anything at all, and a struct,
+// a pointer or an array is what it is for; the declarations that make a distinct type are what this
+// refuses over one.
+private subtype_base_refused(a: &Analysis, decl: Decl, d: TypeDecl, made: Type)
+    if !(d.derived || d.range.is_some() || d.pred.is_some()) || d.from_c then return
+
+    val base = made match
+        Constrained(c) -> c.base
+        _ -> made
+
+    underlying(base) match
+        Integer(_, _, _) -> ()
+        Floating(_, _) -> ()
+        Char -> ()
+        Unknown -> ()
+        _ ->
+            a.fault(decl.scope, decl.span, "a constrained subtype's base must be an integer, a " +
+                    s"float, or 'char', not ${type_show(base)}")
+end subtype_base_refused
 
 // Whether following a named subtype's base leads back to the name itself.
 //
