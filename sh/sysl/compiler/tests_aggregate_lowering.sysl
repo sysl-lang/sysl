@@ -239,17 +239,31 @@ end agl_a_small_copy_is_a_load_and_a_store
 
 // -- a large argument crosses the call in memory ---------------------------------------------------
 
-@test("a large argument crosses the call in memory: so the parameter is declared as an address")
+// The callee used to copy every large parameter into a slot of its own at entry. A body that only
+// reads one now reads it where the caller put it (`reads_in_place`), since that storage cannot change
+// for the length of the call; one that writes it still copies. Both halves are asserted, and
+// `tests_slb_self_borrow.sysl` is where the rule and its observable cases live.
+@test("a large argument crosses the call in memory: so the parameter is declared as an address, and a body that only reads it reads it there")
 agl_a_large_parameter_is_an_address()
     if !agl_ready() then return
 
     val out = agl_ir(agl_big() + "tag(b: Big) -> int = b.tag\nprint(tag(Big([0; 64], 6)))")
 
     assert(out.contains("define i32 @tag(ptr %b.param)"), out)
+    assert(!agl_body(out, "tag").contains("llvm.memcpy"), out)
+    assert(!agl_body(out, "tag").contains("alloca %struct.Big"), out)
+end agl_a_large_parameter_is_an_address
+
+@test("a large argument crosses the call in memory: while a body that writes its parameter copies it at entry")
+agl_a_written_parameter_is_copied_at_entry()
+    if !agl_ready() then return
+
+    val out = agl_ir(agl_big() + "tag(b: Big) -> int\n    b.tag += 1\n    b.tag\nprint(tag(Big([0; 64], 6)))")
+
     assert(agl_body(out, "tag").contains(
         "call void @llvm.memcpy.p0.p0.i64(ptr align 8 %b.addr, ptr align 8 %b.param, i64 520, i1 false)"),
         out)
-end agl_a_large_parameter_is_an_address
+end agl_a_written_parameter_is_copied_at_entry
 
 @test("a large argument crosses the call in memory: and the caller hands over storage it already has")
 agl_the_caller_hands_over_storage_it_has()

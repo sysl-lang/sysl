@@ -121,11 +121,12 @@ gen_adapter(e: *Emit, vt: TVtable, slot: TVSlot)
     // The receiver is *borrowed* here, not owned: the implementation retains its parameters on entry
     // and releases them on return, so handing it a value loaded out of the object leaves the object's
     // own count exactly where it was.
+    val staged = adapter_snapshot(e, vt, slot, payload)
+
     val recv = slot.recv match
-        // A large receiver is passed at its address like any other large argument, so the
-        // implementation makes the copy it was always going to make and the adapter makes none.
+        // A large receiver is passed at its address like any other large argument.
         ByValue ->
-            if e.layout.indirect(vt.for_type) then ir_arg(LPtr, payload)
+            if e.layout.indirect(vt.for_type) then ir_arg(LPtr, staged.unwrap_or(payload))
             else
                 val v = fresh_reg(e)
 
@@ -155,6 +156,9 @@ gen_adapter(e: *Emit, vt: TVtable, slot: TVSlot)
 
     if no_value(slot.ret_ty) || e.layout.indirect(slot.ret_ty)
         emit(e, ir_call(None, LVoid, target, call))
+
+        if staged.is_some() then release_at(e, vt.for_type, staged.unwrap())
+
         emit_term(e, InRet(None, None))
         return
     end if
@@ -163,8 +167,29 @@ gen_adapter(e: *Emit, vt: TVtable, slot: TVSlot)
 
     emit(e, InCall(Some(r), lty(e, slot.ret_ty), target, call, c_extension(slot.ret_ty, e.target),
                    None, no_fast_math(), false))
+
+    if staged.is_some() then release_at(e, vt.for_type, staged.unwrap())
+
     emit_term(e, InRet(Some(sysl_result_lty(e, slot.ret_ty)), Some(r)))
 end gen_adapter
+
+// A large receiver the implementation reads in place (`reads_in_place`) is the object itself unless
+// a copy is made here, and the object is storage the call may change -- so the adapter stages the
+// snapshot a caller would have, holding what it refers to for the length of the call.
+private adapter_snapshot(e: *Emit, vt: TVtable, slot: TVSlot, payload: Val) -> Option[Val]
+    val by_value = slot.recv match
+        ByValue -> true
+        _ -> false
+
+    if !by_value || !e.layout.indirect(vt.for_type) || !e.in_place_receivers.has(slot.target) then
+        return None
+
+    val copy = alloca(e, fresh_reg(e), lty(e, vt.for_type))
+
+    emit_memcpy(e, copy, payload, int(e.layout.size(vt.for_type)), int(e.layout.align(vt.for_type)))
+    retain_at(e, vt.for_type, copy)
+    Some(copy)
+end adapter_snapshot
 
 // -- what a body does with a table ------------------------------------------------------------------
 
