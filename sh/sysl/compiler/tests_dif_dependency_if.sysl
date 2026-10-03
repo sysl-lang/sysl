@@ -1,0 +1,208 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **An `#if` gates the lines of the branch not taken, and nothing else** -- wherever the file that
+// writes it reaches the compilation from. A module is one set of declarations however many files it
+// is written across, so a group in one file that this build does not take must leave every other
+// declaration of the module standing: the sibling file's, and the rest of its own file's.
+//
+// Each case lays one module, `sh.x.lib`, across two files -- `a.sysl` declaring `bar`, `b.sysl`
+// carrying the group -- and reaches it four ways: as a path dependency, through `--lib`, and as part
+// of the project being built. `android` is false on this machine and `posix` is true, so a group of
+// each shows the branch not taken disappearing and the branch taken staying.
+
+private dif_ready() -> bool = std_root().is_ok() && clang_available()
+
+private dif_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+// `sh/x/lib/a.sysl` and `sh/x/lib/b.sysl` under `root`.
+private dif_module(root: string, b: string)
+    make_dir_all(s"$root/sh/x/lib").unwrap()
+    write_text(s"$root/sh/x/lib/a.sysl", "module sh.x.lib\n\nbar() -> int = 3\n").unwrap()
+    write_text(s"$root/sh/x/lib/b.sysl", "module sh.x.lib\n\n" + b).unwrap()
+
+// A group at the top level, one branch this build does not take and one it does.
+private dif_top_level() -> string =
+    "#if android\nfoo() -> int = 1\n#else\nfoo() -> int = 4\n#endif\n\n#if posix\nqux() -> int = 5\n#endif\n"
+
+// A group inside a function's body, written at the margin as every directive is.
+private dif_in_body() -> string =
+    "baz() -> int\n#if android\n    return 1\n#endif\n    2\n"
+
+// A package holding the module, with a manifest.
+private dif_package(b: string) -> string
+    val root = dif_temp("sysl-dif-pkg")
+
+    write_text(s"$root/package.hocon", "package { name = \"lib\", version = \"0.1.0\" }\n").unwrap()
+    dif_module(root, b)
+    root
+end dif_package
+
+// A project whose program is `program`, its manifest naming `deps` where there are any.
+private dif_app(program: string, deps: string) -> string
+    val root = dif_temp("sysl-dif-app")
+
+    write_text(s"$root/package.hocon", s"package { name = \"app\", version = \"0.1.0\" }\n" +
+               (if deps.is_empty() then "" else s"dependencies { $deps }\n")).unwrap()
+    write_text(s"$root/main.sysl", program).unwrap()
+    root
+end dif_app
+
+// What the program a build of `root` makes prints, or what stopped it.
+private dif_run(root: string) -> string
+    val out_dir = dif_temp("sysl-dif-exe")
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end dif_run
+
+// The same build with one source root handed over, as `--lib <lib>` hands it.
+private dif_run_beside(root: string, lib: string) -> string
+    reset_search_paths()
+    add_lib_root(lib)
+
+    val said = dif_run(root)
+
+    reset_search_paths()
+    said
+end dif_run_beside
+
+private dif_drop(dirs: []string)
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+// -- a path dependency ------------------------------------------------------------------------------
+
+@test("a top-level '#if' in a dependency's file leaves the rest of its module importable")
+dif_dependency_top_level()
+    if !dif_ready() then return
+
+    val lib = dif_package(dif_top_level())
+    val root = dif_app("import sh.x.lib.bar\n\nprint(bar())", s"lib { path = \"$lib\" }")
+
+    assert_eq(dif_run(root), "3\n")
+    dif_drop([root, lib])
+end dif_dependency_top_level
+
+@test("and the branches it takes are declared, the ones it does not are not")
+dif_dependency_branch_taken()
+    if !dif_ready() then return
+
+    val lib = dif_package(dif_top_level())
+    val root = dif_app("import sh.x.lib.{bar, foo, qux}\n\nprint(bar() + foo() + qux())",
+                       s"lib { path = \"$lib\" }")
+
+    assert_eq(dif_run(root), "12\n")
+    dif_drop([root, lib])
+end dif_dependency_branch_taken
+
+@test("an '#if' inside a dependency's function body leaves the rest of its module importable")
+dif_dependency_in_body()
+    if !dif_ready() then return
+
+    val lib = dif_package(dif_in_body())
+    val root = dif_app("import sh.x.lib.{bar, baz}\n\nprint(bar() * 10 + baz())",
+                       s"lib { path = \"$lib\" }")
+
+    assert_eq(dif_run(root), "32\n")
+    dif_drop([root, lib])
+end dif_dependency_in_body
+
+// The branch not taken is gone: what only it declared is not there to import, and the refusal is
+// about that one name, the rest of the module still standing.
+@test("a dependency's declaration in a branch not taken is refused, and only it")
+dif_dependency_untaken_refused()
+    if !dif_ready() then return
+
+    val lib = dif_package("#if android\nonly_android() -> int = 1\n#endif\n")
+    val root = dif_app("import sh.x.lib.{bar, only_android}\n\nprint(only_android())",
+                       s"lib { path = \"$lib\" }")
+    val said = dif_run(root)
+
+    assert(said.starts_with("refused:"), said)
+    assert(said.contains("only_android"), said)
+    assert(!said.contains("'bar'") && !said.contains("lib.bar"), said)
+    dif_drop([root, lib])
+end dif_dependency_untaken_refused
+
+// A literate file is tangled into a new text before it is read, as a gated one is gated, so a
+// dependency's module written partly in one is the same question asked of the other pass.
+@test("a literate file in a dependency's module leaves the rest of the module importable")
+dif_dependency_literate()
+    if !dif_ready() then return
+
+    val lib = dif_package(dif_top_level())
+
+    write_text(s"$lib/sh/x/lib/c.lsysl",
+               "# More of the module\n\nOne more function, told in prose.\n\n    module sh.x.lib\n\n    lit() -> int = 6\n").unwrap()
+
+    val root = dif_app("import sh.x.lib.{bar, lit}\n\nprint(bar() + lit())", s"lib { path = \"$lib\" }")
+
+    assert_eq(dif_run(root), "9\n")
+    dif_drop([root, lib])
+end dif_dependency_literate
+
+// -- a `--lib` source root --------------------------------------------------------------------------
+
+@test("a top-level '#if' in a '--lib' root's file leaves the rest of its module importable")
+dif_lib_root_top_level()
+    if !dif_ready() then return
+
+    val lib = dif_temp("sysl-dif-lib")
+
+    dif_module(lib, dif_top_level())
+
+    val root = dif_app("import sh.x.lib.{bar, foo}\n\nprint(bar() + foo())", "")
+
+    assert_eq(dif_run_beside(root, lib), "7\n")
+    dif_drop([root, lib])
+end dif_lib_root_top_level
+
+@test("an '#if' inside a '--lib' root's function body leaves the rest of its module importable")
+dif_lib_root_in_body()
+    if !dif_ready() then return
+
+    val lib = dif_temp("sysl-dif-lib")
+
+    dif_module(lib, dif_in_body())
+
+    val root = dif_app("import sh.x.lib.{bar, baz}\n\nprint(bar() * 10 + baz())", "")
+
+    assert_eq(dif_run_beside(root, lib), "32\n")
+    dif_drop([root, lib])
+end dif_lib_root_in_body
+
+// -- the project being built ------------------------------------------------------------------------
+
+@test("a top-level '#if' in the project's own module leaves the rest of it importable")
+dif_root_top_level()
+    if !dif_ready() then return
+
+    val root = dif_app("import sh.x.lib.{bar, foo}\n\nprint(bar() + foo())", "")
+
+    dif_module(root, dif_top_level())
+    assert_eq(dif_run(root), "7\n")
+    dif_drop([root])
+end dif_root_top_level
+
+@test("an '#if' inside a function body of the project's own module leaves the rest of it importable")
+dif_root_in_body()
+    if !dif_ready() then return
+
+    val root = dif_app("import sh.x.lib.{bar, baz}\n\nprint(bar() * 10 + baz())", "")
+
+    dif_module(root, dif_in_body())
+    assert_eq(dif_run(root), "32\n")
+    dif_drop([root])
+end dif_root_in_body
