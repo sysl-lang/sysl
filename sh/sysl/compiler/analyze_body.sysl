@@ -122,6 +122,10 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     // of functions it runs.
     var held: HeldQueue[HeldBody] = held_queue()
 
+    // The library's exports that may answer a seam, and the symbols something else already answers
+    // (`seam_supply.sysl`).
+    var supply = seam_supply()
+
     for i in 0..<units.len()
         val unit = units.at(i)
         val scope = scope_of_unit(a, unit)
@@ -130,6 +134,14 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
 
         for j in 0..<unit.body.len()
             val s = unit.body.at(j)
+
+            *s.kind match
+                FuncDecl(d) ->
+                    if !library && d.tparams.is_empty()
+                        exported_symbol(d) match
+                            Some(sym) -> supply.claim(sym)
+                            None -> ()
+                _ -> ()
 
             // The entry file's own statements are the body the program starts in, and are typed
             // below rather than here -- including the functions of that body, which are nested
@@ -148,6 +160,10 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
                         val key = func_key(a, scope, s.span, d)
 
                         held.hold(key, HeldBody(key, scope, s.span, d, None))
+
+                        exported_symbol(d) match
+                            Some(sym) -> supply.offer(key, sym, scope.module_name)
+                            None -> ()
                     else
                         // **A closure lowered inside a test body goes when the test does.** It has
                         // no declaration of its own to be marked by, so what marks it is the body
@@ -220,6 +236,11 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
         reached = false
 
         val before = a.funcs_used().len()
+
+        // A library export answering an `extern` the program reaches is reached too, though nothing
+        // calls it -- a seam's supplier is named by no line of the program.
+        reach_seam_suppliers(a, supply)
+
         val bodies = held.take_reached(a.funcs_used())
 
         for i in 0..<bodies.len()
@@ -232,6 +253,9 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
             else funcs.push(analyze_body(a, at.scope, at.span, at.decl, at.name))
 
         drain_pending(a, &funcs)
+
+        // And again after the drain, which may have reached an `extern` without reaching a function.
+        reach_seam_suppliers(a, supply)
 
         // **DRAINING THE QUEUE REACHES THINGS TOO**, and a round that analyzed no held body may
         // still have found one to analyze: a vtable built while an instantiation was typed names
