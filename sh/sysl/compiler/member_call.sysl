@@ -714,15 +714,19 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
     for i in 0..<owner_args.len()
         if i < fd.tparams.len() then seed.push(Binding(fd.tparams.at(i), owner_args.at(i)))
 
-    // **And what `Self` is at those arguments.** A default body copied out of a trait keeps the
-    // trait's spelling, so a bare arrow over a projection leaves the bound it became reading
-    // `Fn1[Self::Item, N]` -- which the solve and the bound check resolve, and which names nothing
-    // without `Self` beside the receiver's arguments. A member generic in its own right keeps its
-    // receiver as written until the arguments are known (`self_for` reads it the same way), and they
-    // are known here, being the seed.
+    // **And, for a default body copied out of a trait, what `Self` is at those arguments.** The copy
+    // keeps the trait's spelling, so a bare arrow over a projection leaves the bound it became
+    // reading `Fn1[Self::Item, N]` -- which the solve and the bound check resolve, and which names
+    // nothing without `Self` beside the receiver's arguments. The receiver is kept as written until
+    // the arguments are known (`self_for` reads it the same way), and they are known here.
+    //
+    // **Only for a copy.** A type's own member writes no `Self` in a bound, and binding one there
+    // would change what a bare bound means: `U: Add` fills its defaulted arguments with `Self`, which
+    // has to stay `U` rather than become the receiver.
     val generic_self = cx.an.tables.members.generic_self.get(fd.name)
 
-    if generic_self.is_some() && bound_type(seed, "Self").is_none()
+    if cx.an.tables.members.default_origin.has(fd.name) && generic_self.is_some() &&
+       bound_type(seed, "Self").is_none()
         val at = cx.an.tables.members.generic_scope.get(fd.name).unwrap_or(home)
 
         seed.push(Binding("Self", resolve_type(cx.an, at, generic_self.unwrap(), seed)))
