@@ -2048,7 +2048,22 @@ refused_argument(cx: &Analyzer, span: Span, shown: string, params: Buf[Param],
                 if disagree(got, wants.at(i)) then
                     return Some(cx.err(e.span, s"'${params.at(i).name}' of $shown is " +
                                        s"${type_show(wants.at(i))}, but ${type_show(got)} was given"))
-            None -> ()
+            // **A default is held to its parameter's type at the call too**, because for a generic
+            // declaration that type is only known here: `step: T = 1` cannot be checked where it is
+            // written, `T` standing for itself there, and at `T = real` the literal is an `int`
+            // handed to a `real` -- which lowered as the integer's bits read as a float. It is
+            // refused at the default, in the reference's words.
+            None ->
+                val d = params.at(i).default
+
+                if i < ts.len() && d.is_some() && disagree(texpr_type(ts.at(i)), wants.at(i))
+                    if !report then return Some(cx.err(d.unwrap().span, "argument disagrees"))
+
+                    return Some(cx.err(d.unwrap().span, s"'${params.at(i).name}' of $shown was left " +
+                                       "to its default, and the default cannot be read at " +
+                                       s"${type_show(wants.at(i))}, the type the parameter has at " +
+                                       "this call"))
+                end if
 
     None
 end refused_argument
