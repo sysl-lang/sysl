@@ -197,19 +197,41 @@ end any_refutable
 // turn otherwise.
 //
 // `into` is the storage a large value is going to, where it has one, which each arm builds its value
-// in (`Merge`).
-gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type, into: Option[Val] = None) -> Val
-    val sv = gen_expr(e, scrutinee)
-    val end_l = fresh_label(e, "match.end")
+// in (`Merge`). `held` is the address the scrutinee was already written at and is owned at, by a
+// caller that needed it before the `match` ran (`match_in_place`); `in_place` is that caller's
+// destination being the moved payload inside it.
+gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type, into: Option[Val] = None,
+          held: Option[Val] = None, in_place: bool = false) -> Val
+    // An arm that hands a large payload back unchanged reads it through the scrutinee's address
+    // (`payload_move`), so that address is taken where some arm can use it. A local's is free, and no
+    // arm writes anything before it reads. A large call's or branch's result is written into a slot
+    // and owned there (`address`) -- the one copy of it there has to be -- instead of being produced
+    // as a value, stored again for a payload to be read out of, and bound a third time.
+    val sty = texpr_type(scrutinee)
+    val moving = e.layout.indirect(sty) && any_moves(e, arms, into.is_some())
+    var sv: Val = VNothing
+    var at: Option[Val] = held
 
-    // A local's address is taken only where an arm may read a payload through it, and taking it is
-    // free: no arm writes anything before it reads.
-    val at = if into.is_some() then local_scrutinee(e, scrutinee) else None
-    val slot = merge_for(e, ty, into, at)
+    held match
+        Some(h) -> sv = load_held(e, h, sty, arms, into.is_some())
+        None ->
+            if moving && is_load(scrutinee)
+                sv = gen_expr(e, scrutinee)
+                at = Some(address(e, scrutinee))
+            else if moving && makes_owned(scrutinee)
+                val h = address(e, scrutinee)
+
+                sv = load_held(e, h, sty, arms, into.is_some())
+                at = Some(h)
+            else
+                sv = gen_expr(e, scrutinee)
+
+    val end_l = fresh_label(e, "match.end")
+    val slot = merge_for(e, ty, into, in_place)
 
     tag_switch(arms) match
-        Some(d) -> gen_tag_switch(e, d, sv, ty, slot, end_l)
-        None -> gen_arm_chain(e, arms, sv, ty, slot, end_l)
+        Some(d) -> gen_tag_switch(e, d, sv, at, ty, slot, end_l)
+        None -> gen_arm_chain(e, arms, sv, at, ty, slot, end_l)
 
     emit_label(e, end_l)
     ends_nowhere(e, ty)
@@ -219,10 +241,127 @@ gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type, into: Option[Va
     merged_value(e, slot, ty)
 end gen_match
 
-// The address of a large local a `match` is over, which an arm may copy a payload out of.
-private local_scrutinee(e: *Emit, scrutinee: TExpr) -> Option[Val] = *scrutinee.kind match
-    TLoad(_, sty) -> if e.layout.indirect(sty) then Some(address(e, scrutinee)) else None
-    _ -> None
+private is_load(x: TExpr) -> bool = *x.kind match
+    TLoad(_, _) -> true
+    _ -> false
+
+// Whether an arm writes its payload through the scrutinee's address rather than binding it: one that
+// is boxed always does, and an unboxed one where the `match` has a destination to write it to.
+private moves(e: *Emit, arm: TArm, into: bool) -> bool = moved_payload(e, arm) match
+    Some(m) -> m.boxed_as.is_some() || into
+    None -> false
+
+private any_moves(e: *Emit, arms: Buf[TArm], into: bool) -> bool
+    for i in 0..<arms.len()
+        if moves(e, arms.at(i), into) then return true
+
+    false
+end any_moves
+
+// The scrutinee as the value the pattern tests read, out of the slot that owns it: borrowed, the
+// slot's count being the one released.
+//
+// Where no arm reads anything but the tag -- each one moves its payload through the address, or tests
+// a variant without binding or testing what it carries -- only the tag is loaded, into an otherwise
+// empty value of the enum's type: loading the whole of it would be the second copy of the result this
+// exists to avoid, left to the optimizer to notice it is dead.
+private load_held(e: *Emit, at: Val, ty: Type, arms: Buf[TArm], into: bool) -> Val
+    val r = fresh_reg(e)
+
+    enum_decl(ty) match
+        Some(d) ->
+            if !d.simple && tags_only(e, arms, into)
+                val tag = fresh_reg(e)
+
+                emit(e, InLoad(tag, l_i32(), at, AccPlain, None))
+                emit(e, InInsert(r, enum_lty(d), VUndef, l_i32(), tag, index_list(0)))
+                return r
+            end if
+        None -> ()
+
+    emit(e, InLoad(r, lty(e, ty), at, AccPlain, None))
+    r
+end load_held
+
+private tags_only(e: *Emit, arms: Buf[TArm], into: bool) -> bool
+    for i in 0..<arms.len()
+        val arm = arms.at(i)
+
+        if !moves(e, arm, into)
+            for j in 0..<arm.patterns.len()
+                if !tag_only(arm.patterns.at(j)) then return false
+
+    true
+end tags_only
+
+private tag_only(p: TPattern) -> bool = p match
+    TWildPattern(_) -> true
+    TVariantPattern(_, _, args) -> !any_binds(args) && !any_refutable(args)
+    _ -> false
+
+// What an arm that hands back one large payload unchanged moves: `V(x) -> x`, or `V(x) -> x` boxed
+// into a `&T` by the type the `match` was expected at. Nothing in such an arm runs between the binding
+// and the read, so no binding is visible to miss -- an arm that does anything else with `x` (takes
+// its address, binds a `ref` to it, passes it on) is not this shape and binds it.
+struct Moved
+    d: &EnumType
+    variant: EnumVariant
+    index: usize
+    boxed_as: Option[Type]
+
+moved_payload(e: *Emit, arm: TArm) -> Option[Moved]
+    if arm.guard.is_some() || !arm.body.stmts.is_empty() || arm.patterns.len() != 1 ||
+       arm.body.result.is_none() then
+        return None
+
+    var boxed_as: Option[Type] = None
+
+    val x = *arm.body.result.unwrap().kind match
+        TLoad(n, _) -> n
+        TBox(value, ref_ty) -> *value.kind match
+            TLoad(n, _) ->
+                boxed_as = Some(ref_ty)
+                n
+            _ -> return None
+        _ -> return None
+
+    arm.patterns.at(0) match
+        TVariantPattern(enum_ty, variant, args) ->
+            val d = enum_decl(enum_ty) match
+                Some(found) -> found
+                None -> return None
+
+            if d.simple then return None
+
+            var named: Option[usize] = None
+
+            for i in 0..<args.len()
+                args.at(i) match
+                    TBindPattern(n, _) ->
+                        if n != x || named.is_some() then return None
+
+                        named = Some(i)
+                    TWildPattern(_) -> ()
+                    _ -> return None
+
+            if named.is_none() then return None
+
+            val i = named.unwrap()
+
+            if !e.layout.indirect(variant.fields.at(i).1) then return None
+
+            Some(Moved(d, variant, i, boxed_as))
+        _ -> None
+end moved_payload
+
+// The address of the moved payload inside the scrutinee's storage at `src`, named `p`.
+payload_at(e: *Emit, m: Moved, src: Val, p: Val)
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(m.variant.slot(m.index))))))
+    emit(e, InGep(p, variant_lty(m.d, m.variant), payload_ptr(e, m.d, src), idx))
+end payload_at
 
 // What a `match` is when the scrutinee's discriminant alone decides the arm: the enum it is read
 // off, each arm with the tags that select it, and a trailing catch-all where there is one.
@@ -302,7 +441,8 @@ private switch_variant(p: TPattern) -> Option[(Type, int)] = p match
 // One `switch` on the discriminant, and one block per arm. The default edge carries what the chain's
 // fallthrough carried: the catch-all arm where the match has one, and otherwise the `unreachable` an
 // exhaustive match ends in -- for a statement match too, wherever the table names every variant.
-private gen_tag_switch(e: *Emit, d: TagDispatch, sv: Val, ty: Type, slot: Merge, end_l: string)
+private gen_tag_switch(e: *Emit, d: TagDispatch, sv: Val, at: Option[Val], ty: Type, slot: Merge,
+                       end_l: string)
     val tag_val = tag_of(e, d.en, sv)
 
     var arm_ls: Buf[string] = buf()
@@ -326,12 +466,12 @@ private gen_tag_switch(e: *Emit, d: TagDispatch, sv: Val, ty: Type, slot: Merge,
 
     for i in 0..<d.arms.len()
         emit_label(e, arm_ls.at(i))
-        gen_arm_body(e, d.arms.at(i).0, sv, ty, slot, end_l)
+        gen_arm_body(e, d.arms.at(i).0, sv, at, ty, slot, end_l)
 
     d.catch_all match
         Some(arm) ->
             emit_label(e, none_l)
-            gen_arm_body(e, arm, sv, ty, slot, end_l)
+            gen_arm_body(e, arm, sv, at, ty, slot, end_l)
         None ->
             if none_l != end_l
                 emit_label(e, none_l)
@@ -363,10 +503,11 @@ end every_variant
 
 // An arm's bindings and body, in the block the branch to it has already opened. Only a single
 // pattern may bind, which is what makes one block serve several tags.
-private gen_arm_body(e: *Emit, arm: TArm, sv: Val, ty: Type, slot: Merge, end_l: string)
+private gen_arm_body(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, slot: Merge,
+                     end_l: string)
     push_owned(e)
 
-    if !payload_move(e, arm, slot)
+    if !payload_move(e, arm, slot, at)
         if arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
 
         if no_value(ty) then gen_block_void(e, arm.body)
@@ -379,7 +520,8 @@ end gen_arm_body
 // Every other `match`: each arm tested in turn, falling through to the next one when its pattern or
 // its guard says no. The pattern decides whether the arm is entered, the bindings are made once it
 // is, and a guard runs between the two.
-private gen_arm_chain(e: *Emit, arms: Buf[TArm], sv: Val, ty: Type, slot: Merge, end_l: string)
+private gen_arm_chain(e: *Emit, arms: Buf[TArm], sv: Val, at: Option[Val], ty: Type, slot: Merge,
+                      end_l: string)
     for i in 0..<arms.len()
         val arm = arms.at(i)
         val body_l = fresh_label(e, "match.arm")
@@ -403,7 +545,7 @@ private gen_arm_chain(e: *Emit, arms: Buf[TArm], sv: Val, ty: Type, slot: Merge,
                 emit_label(e, body_l)
                 push_owned(e)
 
-                moved = payload_move(e, arm, slot)
+                moved = payload_move(e, arm, slot, at)
 
                 if !moved && arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
             Some(g) ->
@@ -444,56 +586,62 @@ private gen_arm_chain(e: *Emit, arms: Buf[TArm], sv: Val, ty: Type, slot: Merge,
     if no_value(ty) then emit_term(e, InBr(end_l)) else emit_term(e, InUnreachable)
 end gen_arm_chain
 
-// `V(x) -> x` into a destination, over a local: the payload is copied from where the local holds it
-// straight to where the value is going, and owned there, rather than bound into a slot of its own and
-// copied a second time. Nothing in such an arm runs between the binding and the read, so no binding
-// is visible to miss. `Result.unwrap` and `Option.unwrap` are this arm.
+// An arm that hands back one large payload unchanged (`moved_payload`), written straight from where
+// the scrutinee holds it (`at`) to where the value is going, rather than bound into a slot of its own
+// and copied a second time. `Result.unwrap` and `Option.unwrap` are this arm.
+//
+//   - **Into a destination** -- the payload is copied there and owned there. Where the destination is
+//     the payload itself (`Merge.in_place`), nothing is copied at all.
+//   - **Into a box** -- `V(x) -> x` where the `match` is expected as a `&T`: the box is allocated and
+//     the payload copied straight into it, so no stack slot ever holds it.
+//
+// Either way the destination takes a count of its own of everything the payload holds, and the
+// scrutinee's storage keeps the counts it had -- a local's until its scope ends, a temporary's until
+// the statement does -- so the payload is owned by each exactly once, and released by each once.
 //
 // Answers whether it wrote the arm.
-private payload_move(e: *Emit, arm: TArm, slot: Merge) -> bool
-    if !slot.into || slot.scrutinee.is_none() || arm.guard.is_some() || !arm.body.stmts.is_empty() ||
-       arm.patterns.len() != 1 || arm.body.result.is_none() then
-        return false
+private payload_move(e: *Emit, arm: TArm, slot: Merge, at: Option[Val]) -> bool
+    val m = moved_payload(e, arm) match
+        Some(found) -> found
+        None -> return false
 
-    val x = *arm.body.result.unwrap().kind match
-        TLoad(n, _) -> n
-        _ -> return false
+    val src = at match
+        Some(a) -> a
+        None -> return false
 
-    arm.patterns.at(0) match
-        TVariantPattern(enum_ty, variant, args) ->
-            val d = enum_decl(enum_ty) match
-                Some(found) -> found
-                None -> return false
+    val fty = m.variant.fields.at(m.index).1
 
-            if d.simple then return false
+    m.boxed_as match
+        None ->
+            if !slot.into then return false
 
-            var named: Option[usize] = None
+            if slot.in_place then retain_at(e, fty, slot.at) else move_payload_into(e, m, src, slot.at)
+        Some(ref_ty) ->
+            if slot.into then return false
 
-            for i in 0..<args.len()
-                args.at(i) match
-                    TBindPattern(n, _) ->
-                        if n != x || named.is_some() then return false
+            // The box is handed out with a count of its own, as a branch's value always is
+            // (`gen_block_value`), and the region it was made in lets go of the one it was made with.
+            push_temps(e)
 
-                        named = Some(i)
-                    TWildPattern(_) -> ()
-                    _ -> return false
+            val opened = open_box(e, ref_inner(ref_ty))
 
-            if named.is_none() then return false
+            move_payload_into(e, m, src, opened.1)
 
-            val i = named.unwrap()
-            val fty = variant.fields.at(i).1
+            val b = own_temp(e, opened.0, ref_ty)
 
-            if !e.layout.indirect(fty) then return false
+            retain_value(e, ref_ty, b)
+            pop_temps(e)
+            emit(e, InStore(lty(e, ref_ty), b, slot.at, AccPlain, None))
 
-            val p = fresh_reg(e)
-
-            var idx: Buf[IrArg] = buf()
-
-            idx.push(ir_arg(l_i32(), VInt(from_int(0))))
-            idx.push(ir_arg(l_i32(), VInt(from_int(long(variant.slot(i))))))
-            emit(e, InGep(p, variant_lty(d, variant), payload_ptr(e, d, slot.scrutinee.unwrap()), idx))
-            emit_memcpy(e, slot.at, p, int(e.layout.size(fty)), int(e.layout.align(fty)))
-            retain_at(e, fty, slot.at)
-            true
-        _ -> false
+    true
 end payload_move
+
+// The moved payload copied from the scrutinee at `src` to `dest`, which takes its own counts.
+private move_payload_into(e: *Emit, m: Moved, src: Val, dest: Val)
+    val fty = m.variant.fields.at(m.index).1
+    val p = fresh_reg(e)
+
+    payload_at(e, m, src, p)
+    emit_memcpy(e, dest, p, int(e.layout.size(fty)), int(e.layout.align(fty)))
+    retain_at(e, fty, dest)
+end move_payload_into

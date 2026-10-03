@@ -19,7 +19,7 @@ gen_if(e: *Emit, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TB
     val else_l = fresh_label(e, "if.else")
     val end_l = fresh_label(e, "if.end")
     val target = if else_block.is_some() then else_l else end_l
-    val slot = merge_for(e, ty, into, None)
+    val slot = merge_for(e, ty, into)
 
     // The last term's success edge is the branch's entry, so a condition with nothing to bind emits
     // exactly the one test and the one `br` it always did.
@@ -50,18 +50,17 @@ end gen_if
 
 // Where the branches of an `if` or a `match` leave their value: a slot of the form's own, loaded
 // where they meet, or -- `into` -- the storage a large value is going to, which each branch builds
-// its value in and owns, so nothing is loaded where they meet. `scrutinee` is the address of the
-// local a `match` is over, which is what lets an arm handing a payload back unchanged copy it from
-// there rather than bind it first (`payload_move`).
+// its value in and owns, so nothing is loaded where they meet. `in_place` says the destination
+// already **is** the payload the one arm reaching it hands back, inside the scrutinee's own storage
+// (`match_in_place`), so that arm only takes its counts.
 struct Merge
     at: Val
     into: bool
-    scrutinee: Option[Val]
-end Merge
+    in_place: bool
 
-merge_for(e: *Emit, ty: Type, into: Option[Val], scrutinee: Option[Val]) -> Merge = into match
-    Some(dest) -> Merge(dest, true, scrutinee)
-    None -> Merge(result_slot(e, ty), false, None)
+merge_for(e: *Emit, ty: Type, into: Option[Val], in_place: bool = false) -> Merge = into match
+    Some(dest) -> Merge(dest, true, in_place)
+    None -> Merge(result_slot(e, ty), false, false)
 
 // One branch's value, left where the merge says.
 store_merged(e: *Emit, b: TBlock, ty: Type, m: Merge)
