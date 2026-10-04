@@ -1,0 +1,441 @@
+module sh.sysl.compiler
+@tests
+
+// `sysl.time` — the calendar, the two quantities, and reading either back out of text. The module
+// holds no zones: a wall clock reading becomes a point on the timeline only once somebody says
+// where the wall is, and that needs the IANA database. What is here is the half that is arithmetic,
+// so every expected value is one a reader can check against a calendar — a date whose weekday is
+// known, a leap year that is and one that is not, a round trip that has to be the identity.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `TimeTests` these are.
+// The helpers are `tests_enm_enum_run.sysl`'s.
+
+private tmx_run(src: string) -> string = enm_ran("import sysl.time.*\n" + src)
+
+// ---- the calendar
+
+@test("the epoch is day zero and the day before it is minus one")
+tmx_epoch_is_day_zero()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run("print(date_at(1970, 1, 1).day, date_at(1969, 12, 31).day)\n"), "0 -1\n")
+
+@test("a date renders as ISO 8601, before the epoch as readily as after")
+tmx_date_renders_iso()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run("print(date_text(LocalDate(20520)), date_text(LocalDate(-1)))\n"),
+              "2026-03-08 1969-12-31\n")
+
+// The property the algorithm has rather than a date it produces: over a spread crossing the epoch,
+// two century boundaries and a 400-year one, `civil_from_days` undoes `date_at`.
+@test("civil and day-number conversion round-trips across four centuries")
+tmx_civil_round_trips()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var bad = 0
+
+        for y in 1600..2400
+            for m in 1..12
+                var last = days_in_month(y, m)
+                for d in [1, last / 2, last]
+                    var c = civil_from_days(date_at(y, m, d))
+                    if c.year != y || c.month != m || c.day != d then bad = bad + 1
+
+        print(bad)
+        """), "0\n")
+
+// The two rules that are not "every fourth year", reached through arithmetic on serials.
+@test("which the day numbers agree with")
+tmx_day_numbers_agree()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(date_at(1900, 3, 1).day - date_at(1900, 2, 28).day)
+        print(date_at(2000, 3, 1).day - date_at(2000, 2, 28).day)
+        """), "1\n2\n")
+
+@test("the epoch was a Thursday, and the day before it a Wednesday")
+tmx_epoch_was_thursday()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run("print(weekday_name(weekday(LocalDate(0))), weekday_name(weekday(LocalDate(-1))))\n"),
+              "Thursday Wednesday\n")
+
+// Landing on the day itself, and landing six days later.
+@test("the next given weekday on or after a date")
+tmx_next_weekday()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(date_text(on_or_after(date_at(2026, 3, 3), Tuesday)))
+        print(date_text(on_or_after(date_at(2026, 3, 4), Tuesday)))
+        """), "2026-03-03\n2026-03-10\n")
+
+// ---- adding to a calendar
+
+// The day clamps where the target month is shorter, and reads the month's real length.
+@test("a month added to the 31st lands on the last day of a shorter one")
+tmx_month_clamps()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(date_text(plus_months(date_at(2026, 1, 31), 1)))
+        print(date_text(plus_months(date_at(2024, 1, 31), 1)))
+        """), "2026-02-28\n2024-02-29\n")
+
+// Backwards over a year boundary, where a truncating `%` would put the month in the wrong year.
+@test("months subtract across a year boundary")
+tmx_months_subtract()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(date_text(plus_months(date_at(2026, 2, 15), -3)))
+        print(date_text(plus_months(date_at(2026, 2, 15), -14)))
+        """), "2025-11-15\n2024-12-15\n")
+
+@test("a year added to a leap day clamps, and four years lands back on one")
+tmx_year_from_leap_day()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(date_text(plus_years(date_at(2024, 2, 29), 1)))
+        print(date_text(plus_years(date_at(2024, 2, 29), 4)))
+        """), "2025-02-28\n2028-02-29\n")
+
+// Days added to a wall clock reading are rows of the calendar, not a length of time.
+@test("a week of calendar keeps the clock face")
+tmx_week_keeps_clock_face()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var m = datetime_at(2026, 3, 3, 9, 30, 0)
+        print(datetime_text(plus_days(m, 7)))
+        """), "2026-03-10 09:30\n")
+
+// ---- a time of day
+
+// Seconds appear only where there are any, and the fraction on the same terms.
+@test("renders to the precision it actually has")
+tmx_time_precision()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(time_text(time_at(9, 30, 0)), time_text(time_at(9, 30, 7)))
+        print(time_text(LocalTime(500000i64)), time_text(time_at(0, 0, 0)))
+        """), "09:30 09:30:07\n00:00:00.500000 00:00\n")
+
+@test("the fields come back out")
+tmx_time_fields()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var t = time_at(23, 59, 58)
+        print(hour_of(t), minute_of(t), second_of(t))
+        """), "23 59 58\n")
+
+// Before the epoch is where a truncating division puts the day out by one.
+@test("a wall clock reading round-trips through its count, before the epoch too")
+tmx_wall_round_trips()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(datetime_text(wall_of(wall_us(datetime_at(2026, 3, 8, 2, 30, 0)))))
+        print(datetime_text(wall_of(wall_us(datetime_at(1969, 12, 31, 23, 59, 0)))))
+        """), "2026-03-08 02:30\n1969-12-31 23:59\n")
+
+// ---- instants and durations
+
+@test("an instant moves by a duration and back")
+tmx_instant_moves()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var t = Instant(1000000i64)
+        print((t + hours(2i64)).us, (t + hours(2i64) - hours(2i64)).us)
+        """), "7201000000 1000000\n")
+
+// The difference of two points on a timeline is not a point on it, so it is not `-`.
+@test("the difference of two instants is a duration, by name")
+tmx_difference_by_name()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var t = Instant(1000000i64)
+        print(whole_hours(since(t + hours(3i64), t)))
+        """), "3\n")
+
+@test("a duration is added, negated and scaled")
+tmx_duration_arithmetic()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var d = hours(2i64) + minutes(30i64)
+        print(whole_hours(d), odd_minutes(d))
+        print(whole_minutes(d * 2i64), whole_minutes(-d))
+        """), "2 30\n300 -150\n")
+
+@test("instants and durations compare")
+tmx_compare()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(str(Instant(1i64) < Instant(2i64)), str(hours(1i64) > minutes(59i64)))
+        print(str(Offset(330) == Offset(330)), str(Offset(-300) < Offset(0)))
+        """), "true true\ntrue true\n")
+
+// Minutes rather than hours, because India is +05:30.
+@test("an offset renders with its sign, and zero is Z")
+tmx_offset_renders()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run("print(offset_text(Offset(330)), offset_text(Offset(-300)), offset_text(Offset(0)))\n"),
+              "+05:30 -05:00 Z\n")
+
+// An offset of zero is what the count is measured from, so an instant renders with no zone supplied
+// — through `Display` too, which only the library can implement for a library type.
+@test("an instant renders as its own UTC reading, and through Display")
+tmx_instant_renders()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var t = Instant(1772548200000000i64)
+
+        print(instant_text(t))
+        print(t, Instant(0i64))
+        print(f"$t%25s|")
+        """), "2026-03-03 14:30 Z\n2026-03-03 14:30 Z 1970-01-01 00:00 Z\n       2026-03-03 14:30 Z|\n")
+
+// ---- reading text back
+
+// What the module writes is what it reads, asserted as a round trip so neither direction can drift.
+@test("rendering and parsing are inverse, over a spread of dates")
+tmx_date_parse_inverse()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var bad = 0
+
+        for n in -30000..30000
+            var d = LocalDate(n)
+            parse_date(date_text(d)) match
+                Ok(back) -> if back != d then bad = bad + 1
+                Err(_) -> bad = bad + 1
+
+        print(bad)
+        """), "0\n")
+
+@test("and for a time, at each precision it renders")
+tmx_time_parse_inverse()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var ts = [time_at(0, 0, 0), time_at(9, 30, 0), time_at(23, 59, 58), LocalTime(500000i64),
+                  LocalTime(1i64), LocalTime(86399999999i64)]
+        var bad = 0
+
+        for t in ts
+            parse_time(time_text(t)) match
+                Ok(back) -> if back != t then bad = bad + 1
+                Err(_) -> bad = bad + 1
+
+        print(bad)
+        """), "0\n")
+
+@test("a date-time round-trips through the space its renderer writes")
+tmx_datetime_round_trips()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var x = datetime_at(2026, 3, 8, 2, 30, 0)
+        parse_datetime(datetime_text(x)) match
+            Ok(back) -> print(str(back == x))
+            Err(e) -> print("err", str(e))
+        """), "true\n")
+
+// The ISO spelling with a `T`, which the module does not write and every machine does.
+@test("and through the 'T' it does not write")
+tmx_datetime_with_t()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        parse_datetime("2026-03-08T02:30:07") match
+            Ok(x) -> print(datetime_text(x))
+            Err(e) -> print("err", str(e))
+        """), "2026-03-08 02:30:07\n")
+
+@test("an offset round-trips, including Z")
+tmx_offset_round_trips()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var os = [Offset(0), Offset(330), Offset(-300), Offset(825)]
+        var bad = 0
+
+        for o in os
+            parse_offset(offset_text(o)) match
+                Ok(back) -> if back != o then bad = bad + 1
+                Err(_) -> bad = bad + 1
+
+        print(bad)
+        """), "0\n")
+
+// `.5` is half a second, not five microseconds.
+@test("a short fraction is scaled, not padded")
+tmx_short_fraction_scaled()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(time_text(parse_time("00:00:00.5").unwrap()))
+        print(time_text(parse_time("00:00:00.05").unwrap()))
+        print(time_text(parse_time("00:00:00.000001").unwrap()))
+        """), "00:00:00.500000\n00:00:00.050000\n00:00:00.000001\n")
+
+// ---- what a parse refuses — the format, not the calendar (which the library's own tests hold)
+
+@test("a shape that is not the format")
+tmx_refuses_shape()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(str(parse_date("2026/03/08").unwrap_err()))
+        print(str(parse_date("26-03-08").unwrap_err()))
+        print(str(parse_time("9:30").unwrap_err()))
+        print(str(parse_time("09:30:07.").unwrap_err()))
+        """), "not the expected shape at byte 4\nnot the expected shape at byte 2\n" +
+              "not the expected shape at byte 1\nnot the expected shape at byte 9\n")
+
+// Text left over usually means the caller meant to split something off first.
+@test("text left over after a good one")
+tmx_refuses_left_over()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(str(parse_date("2026-03-08 extra").unwrap_err()))
+        print(str(parse_time("09:30 ").unwrap_err()))
+        """), "unexpected text at byte 10\nunexpected text at byte 5\n")
+
+@test("an empty string, and one that runs out mid-field")
+tmx_refuses_short()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(str(parse_date("").unwrap_err()))
+        print(str(parse_date("2026-03-0").unwrap_err()))
+        """), "not the expected shape at byte 0\nnot the expected shape at byte 8\n")
+
+// The second names byte 3, where the colon is missing, rather than where the offset began.
+@test("an offset that is neither Z nor a signed pair")
+tmx_refuses_offset()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(str(parse_offset("05:30").unwrap_err()))
+        print(str(parse_offset("+0530").unwrap_err()))
+        """), "not the expected shape at byte 0\nnot the expected shape at byte 3\n")
+
+// ---- a fixed offset: both directions total, which a zone's are not
+
+@test("an instant reads against a wall set a fixed distance from UTC")
+tmx_at_offset()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var t = Instant(1772548200000000i64)
+
+        print(at_offset(t, Offset(-300)))
+        print(at_offset(t, Offset(330)))
+        print(at_offset(t, Offset(0)))
+        """), "2026-03-03 09:30\n2026-03-03 20:00\n2026-03-03 14:30\n")
+
+// Inverse at every offset, including the two that cross a day boundary in opposite directions.
+@test("and the two directions are inverse, at every offset a zone uses")
+tmx_offset_inverse()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var t = Instant(1772548200000000i64)
+        var bad = 0
+
+        for m in -720..840
+            var o = Offset(m)
+            if from_offset(at_offset(t, o), o) != t then bad = bad + 1
+
+        print(bad)
+        """), "0\n")
+
+// RFC 3339 rather than for people: the seconds are present at zero and the join is a `T`.
+@test("a timestamp renders in the machine-readable shape, seconds and all")
+tmx_timestamp_renders()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var t = Instant(1772548200000000i64)
+
+        print(timestamp_text(t, Offset(-300)))
+        print(timestamp_text(t, Offset(330)))
+        print(timestamp_text(t, Offset(0)))
+        print(timestamp_text(Instant(1772548200500000i64), Offset(-300)))
+        """), "2026-03-03T09:30:00-05:00\n2026-03-03T20:00:00+05:30\n2026-03-03T14:30:00Z\n" +
+              "2026-03-03T09:30:00.500000-05:00\n")
+
+@test("and what it writes is read back as the same instant")
+tmx_timestamp_round_trips()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var offs = [Offset(0), Offset(-300), Offset(330), Offset(-720), Offset(840)]
+        var bad = 0
+
+        for n in 0..2000
+            var t = Instant(long(n) * 3719000000i64 - 1000000000000i64)
+            for o in offs
+                parse_timestamp(timestamp_text(t, o)) match
+                    Ok(back) -> if back != t then bad = bad + 1
+                    Err(_) -> bad = bad + 1
+
+        print(bad)
+        """), "0\n")
+
+// The parser takes more shapes than the renderer writes; all four name one point on the timeline.
+@test("a parse is liberal in what it accepts, and lands on one instant")
+tmx_timestamp_liberal()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        var t = Instant(1772548200000000i64)
+
+        print(parse_timestamp("2026-03-03T09:30:00-05:00").unwrap_or(Instant(0i64)) == t)
+        print(parse_timestamp("2026-03-03 09:30-05:00").unwrap_or(Instant(0i64)) == t)
+        print(parse_timestamp("2026-03-03T14:30:00Z").unwrap_or(Instant(0i64)) == t)
+        print(parse_timestamp("2026-03-03T20:00:00+05:30").unwrap_or(Instant(0i64)) == t)
+        """), "true\ntrue\ntrue\ntrue\n")
+
+// A timestamp with no offset names no instant; reading one as UTC would invent the fact.
+@test("a timestamp with no offset is refused rather than assumed to be UTC")
+tmx_timestamp_needs_offset()
+    if !enm_ready() then return
+
+    assert_eq(tmx_run(raw"""
+        print(str(parse_timestamp("2026-03-03T09:30:00").unwrap_err()))
+        print(str(parse_timestamp("2026-03-03T09:30:00-25:00").unwrap_err()))
+        print(str(parse_timestamp("2026-03-03T09:30:00Z ").unwrap_err()))
+        """), "not the expected shape at byte 19\noffset hour is out of range\nunexpected text at byte 20\n")
+
+// ---- the module's boundary
+
+// `sysl.time` is a submodule, so a program that does not ask for it does not have it.
+@test("the names are not in scope unasked-for")
+tmx_not_in_scope_unasked()
+    if !enm_ready() then return
+
+    assert(enm_says(enm_err("print(date_at(2026, 1, 1).day)\n"), "undefined function 'date_at'"))
+
+// It renders to `string`, so it is not in the `no alloc` tier.
+@test("it is a module a 'no alloc' program may not render with")
+tmx_not_no_alloc()
+    if !enm_ready() then return
+
+    assert(enm_says(enm_err("@no_alloc\n\nimport sysl.time.*\n\nfn() -> string = date_text(LocalDate(0))\n"),
+                    "this reaches 'sysl.time.date_text', which makes heap storage, and this module declared '@no_alloc'"))
