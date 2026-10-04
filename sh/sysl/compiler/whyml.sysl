@@ -2,7 +2,8 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int, pow, sub, to_string}
-import sysl.text.from_utf8_unchecked
+import sysl.text.{str_builder, StrBuilder}
+import sysl.unicode
 
 // The proof backend: a program's typed tree written out as **WhyML**, the input language of the Why3
 // platform (`reference/verification.md § sysl prove`).
@@ -101,12 +102,12 @@ whyml_module_name(at: string) -> string
 
     if stop == start then return "Program"
 
-    var out: Buf[u8] = buf()
+    var out = str_builder()
 
-    for i in start..<stop
-        if why_word_byte(bytes[i]) then out.push(bytes[i])
+    for c in at[start..<stop].chars
+        if why_word_char(c) then out.push_char(c)
 
-    from_utf8_unchecked(out.view())
+    out.finish()
 end whyml_module_name
 
 // -- the module ------------------------------------------------------------------------------------
@@ -687,38 +688,46 @@ private why_class(name: string) -> string = if name.len > 0 then name[1..<name.l
 
 // A sysl symbol as a WhyML identifier. Module separators and dots become underscores, and a leading
 // capital is lowered, because WhyML reserves an initial capital for types and constructors.
+//
+// **A letter is any Unicode letter, not only an ASCII one** -- a sysl name may be `café`, and Why3
+// reads it as written. What is not a letter, a digit or `_` (a combining mark included) becomes `_`.
 private why_ident(name: string) -> string
-    val bytes = name.bytes
-    var out: Buf[u8] = buf()
+    var out = str_builder()
+    var first = true
 
-    for i in 0..<bytes.len
-        out.push(if why_word_byte(bytes[i]) then bytes[i] else u8('_'))
+    for c in name.chars
+        val kept = if why_word_char(c) then c else '_'
 
-    if out.is_empty() then return "_x"
+        if !first
+            out.push_char(kept)
+        else if unicode.is_upper(kept)
+            out.push_char(unicode.to_lower(kept))
+        else if unicode.is_digit(kept)
+            out.push_char('_')
+            out.push_char(kept)
+        else
+            out.push_char(kept)
 
-    val first = out.at(0)
+        first = false
+    end for
 
-    if first >= u8('A') && first <= u8('Z') then out.set(0, first + 32)
-    else if first >= u8('0') && first <= u8('9') then out.insert(0, u8('_'))
-
-    from_utf8_unchecked(out.view())
+    if first then "_x" else out.finish()
 end why_ident
 
-private why_word_byte(b: u8) -> bool =
-    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) || (b >= u8('0') && b <= u8('9')) ||
-    b == u8('_')
+// Whether a character may stand in a WhyML identifier as it is: a letter, a decimal digit, or `_`.
+private why_word_char(c: char) -> bool = c == '_' || unicode.is_alpha(c) || unicode.is_digit(c)
 
-// The first letter in capitals, which is what a WhyML module's name needs.
+// The first letter in capitals, which is what a WhyML module's name needs -- a lower-case one, that
+// is, in any script; anything else is left as it is.
 private why_capitalized(name: string) -> string
-    val bytes = name.bytes
+    var out = str_builder()
+    var first = true
 
-    if bytes.len == 0 || bytes[0] < u8('a') || bytes[0] > u8('z') then return name
+    for c in name.chars
+        out.push_char(if first && unicode.is_lower(c) then unicode.to_upper(c) else c)
+        first = false
 
-    var out: Buf[u8] = buf()
-
-    out.extend(bytes)
-    out.set(0, bytes[0] - 32)
-    from_utf8_unchecked(out.view())
+    out.finish()
 end why_capitalized
 
 private why_owns(g: *WhyGen, name: string) -> bool

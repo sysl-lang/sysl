@@ -9,8 +9,9 @@ import sysl.text.{join, Search}
 
 // `sysl prove` as far as the WhyML it writes: the translation, `--emit-whyml`, `--overflow`, and the
 // refusals, each worded and ordered as the reference's 0.0.162 words and orders them. Every expected
-// module and message here is the reference's own output for the same source. Discharging the module
-// with Why3 is not here: nothing in this file runs a prover.
+// module and message here is the reference's own output for the same source. The discharge tests at
+// the end run Why3 and assert on its exit status alone, its report carrying a temporary path and
+// timings; on a machine without a Why3 that has a prover each says it was skipped.
 
 private prv_library_here() -> bool = std_root().is_ok()
 
@@ -626,3 +627,249 @@ prv_the_reference_prints_the_same()
         remove_dir_all(dir).unwrap_or(())
     end for
 end prv_the_reference_prints_the_same
+
+// -- names in any script ----------------------------------------------------------------------------
+
+// The reference keeps every Unicode letter and digit of a name, lowering a leading capital in any
+// script, and makes anything else -- a combining mark -- an underscore. `sysl prove --emit-whyml`
+// over this source, as `ñu.sysl`, at 0.0.162:
+//
+//     module Ñu
+//       ...
+//       let  café (x: int) : int
+//       ...
+//       let  état (x: int) : int
+//       ...
+//       = (café x)
+//
+//       let  σ2 (ünï: int) : int
+//         requires { -2147483648 <= ünï <= 2147483647 }
+//         requires { (ünï >= 0) }
+//       ...
+@test("prove keeps a name's letters in any script, and lowers a leading capital in any script")
+prv_a_name_in_any_script()
+    if !prv_library_here()
+        print("skipped: the standard module's source is not on this machine")
+        return
+    end if
+
+    val (dir, file) = prv_file("café(x: int) -> int = x\n\nÉtat(x: int) -> int = café(x)\n\n" +
+                               "σ2(ünï: int) -> int\n    require ünï >= 0\n    ünï\n", "ñu.sysl")
+    val (code, said) = prv_run(["sysl", "prove", "--emit-whyml", file])
+    val range = "    requires { -2147483648 <= x <= 2147483647 }\n" +
+                "    ensures  { -2147483648 <= result <= 2147483647 }\n"
+
+    assert_eq(code, Fine)
+    assert_eq(said, "module Ñu\n" + PrvHead +
+                    "  let  café (x: int) : int\n" + range + "  = x\n\n" +
+                    "  let  état (x: int) : int\n" + range + "  = (café x)\n\n" +
+                    "  let  σ2 (ünï: int) : int\n" +
+                    "    requires { -2147483648 <= ünï <= 2147483647 }\n" +
+                    "    requires { (ünï >= 0) }\n" +
+                    "    ensures  { -2147483648 <= result <= 2147483647 }\n" +
+                    "  = ünï\n" +
+                    "end")
+    remove_dir_all(dir).unwrap_or(())
+end prv_a_name_in_any_script
+
+// The edges of the same rule, each the reference's: a titlecase letter is not a capital (`ǅa`
+// stays), a combining mark is an underscore (`ńe_x`), a Greek capital is lowered (`σx`); in a module
+// name the mark is dropped and a lower-case first letter raised (`e\u{301}z.sysl` is `module Ez`,
+// `ǅé.sysl` is `module ǅé`).
+@test("prove: a titlecase letter is kept, a combining mark is an underscore, a Greek capital is lowered")
+prv_the_edges_of_a_name_in_any_script()
+    assert_eq(whyml_module_name("ñu.sysl"), "ñu")
+    assert_eq(whyml_module_name("e\u{301}z.sysl"), "ez")
+    assert_eq(whyml_module_name("/a/ǅé.sysl"), "ǅé")
+
+    if !prv_library_here()
+        print("skipped: the standard module's source is not on this machine")
+        return
+    end if
+
+    val m = prv_whyml("ǅa(x: int) -> int = x\n\nńe\u{301}x(x: int) -> int = x\n\nΣx(x: int) -> int = x\n")
+
+    assert(prv_has(m, "  let  ǅa (x: int) : int\n"), m)
+    assert(prv_has(m, "  let  ńe_x (x: int) : int\n"), m)
+    assert(prv_has(m, "  let  σx (x: int) : int\n"), m)
+
+    val (dir, file) = prv_file("f(x: int) -> int = x\n", "e\u{301}z.sysl")
+    val (code, said) = prv_run(["sysl", "prove", "--emit-whyml", file])
+
+    assert_eq(code, Fine)
+    assert(said.starts_with("module Ez\n"), said)
+    remove_dir_all(dir).unwrap_or(())
+end prv_the_edges_of_a_name_in_any_script
+
+// -- discharging with Why3 --------------------------------------------------------------------------
+
+// Whether this machine can discharge anything: a Why3, and a prover it knows of. Where it cannot, the
+// test says it was skipped rather than passing over nothing -- a discharge test that returned at once
+// would print `ok` for a claim nobody checked.
+private prv_why3_here() -> bool
+    if !prv_library_here()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !why3_runs("why3") || why3_prover("why3").is_none()
+        print("skipped: there is no why3 with a prover on this machine")
+        return false
+    end if
+
+    true
+end prv_why3_here
+
+// Whether Why3 discharged every goal of what one source translates to. The exit status is the answer
+// -- `why3 prove` reports each goal on its own line and comes back non-zero when one is left.
+private prv_proves(src: string, overflow: bool = true) -> bool
+    why3_prove("why3", prv_whyml(src, overflow)) match
+        Ok((code, _)) -> code == 0
+        Err(why) ->
+            assert(false, why)
+            false
+end prv_proves
+
+// The expected answers are the reference's: `sysl prove <file>` at 0.0.162 over each source exits 0
+// where the case says it proves and 2 where it says it does not (half 0, same 2, gcd 0, count_to 0,
+// count_to without `i <= n` 2, double_it 2, bounded 0, `--overflow ignore` 0, ratio 2, ratio with
+// preconditions 0, divides 0, small 0).
+
+@test("prove discharges a precondition and a postcondition over integers")
+prv_discharges_a_precondition_and_a_postcondition()
+    if !prv_why3_here() then return
+
+    assert(prv_proves("half(x: int) -> int\n    require x >= 0\n    ensure result >= 0\n    x / 2\n"))
+
+@test("prove does not discharge a postcondition that does not hold")
+prv_and_one_that_does_not_hold_is_not()
+    if !prv_why3_here() then return
+
+    assert(!prv_proves("same(x: int) -> int\n    require x >= 0\n    ensure result > x\n    x\n"))
+
+@test("prove discharges a recursion, including that its measure decreases")
+prv_discharges_a_recursion()
+    if !prv_why3_here() then return
+
+    assert(prv_proves("gcd(a: int, b: int) -> int\n    require a >= 0\n    require b >= 0\n" +
+                      "    ensure result >= 0\n    variant b\n    if b == 0 then a\n    else gcd(b, a % b)\n"))
+
+@test("prove discharges a loop, through its invariant and its variant")
+prv_discharges_a_loop()
+    if !prv_why3_here() then return
+
+    assert(prv_proves("count_to(n: int) -> int\n    require n >= 0\n    ensure result == n\n    var i = 0\n\n" +
+                      "    while i < n\n        invariant i >= 0\n        invariant i <= n\n" +
+                      "        variant n - i\n        i += 1\n\n    i\n"))
+
+@test("prove does not discharge the same loop without the invariant that establishes its result")
+prv_and_not_without_the_invariant()
+    if !prv_why3_here() then return
+
+    assert(!prv_proves("count_to(n: int) -> int\n    require n >= 0\n    ensure result == n\n    var i = 0\n\n" +
+                       "    while i < n\n        invariant i >= 0\n        variant n - i\n        i += 1\n\n    i\n"))
+
+@test("prove does not discharge a multiplication that can leave the range")
+prv_a_multiplication_that_can_overflow_is_not_discharged()
+    if !prv_why3_here() then return
+
+    assert(!prv_proves("double_it(n: int) -> int\n    require n >= 0\n    n * 2\n"))
+
+@test("prove discharges the same multiplication once the input is bounded")
+prv_and_is_once_the_input_is_bounded()
+    if !prv_why3_here() then return
+
+    assert(prv_proves("double_it(n: int) -> int\n    require n >= 0\n    require n <= 1000\n    n * 2\n"))
+
+@test("prove --overflow ignore drops the obligation, and the unbounded one then discharges")
+prv_overflow_ignore_drops_the_obligation()
+    if !prv_why3_here() then return
+
+    assert(prv_proves("double_it(n: int) -> int\n    require n >= 0\n    n * 2\n", false))
+
+@test("prove: a division carries the obligation that its divisor is not zero")
+prv_a_division_carries_its_divisor_obligation()
+    if !prv_why3_here() then return
+
+    assert(!prv_proves("ratio(a: int, b: int) -> int = a / b\n"))
+
+@test("prove: a precondition discharges a division's obligations")
+prv_which_a_precondition_discharges()
+    if !prv_why3_here() then return
+
+    assert(prv_proves("ratio(a: int, b: int) -> int\n    require b > 0\n    require a >= 0\n" +
+                      "    require a <= 1000\n    a / b\n"))
+
+@test("prove discharges a contract that reads a ghost predicate")
+prv_a_ghost_predicate_is_discharged()
+    if !prv_why3_here() then return
+
+    assert(prv_proves("@ghost\ndivides(d: int, n: int) -> bool = d != 0 && n % d == 0\n\n" +
+                      "double_it(n: int) -> int\n    require n >= 0\n    require n <= 1000\n" +
+                      "    ensure divides(2, result)\n    n * 2\n"))
+
+@test("prove discharges a ghost predicate that is a quantifier")
+prv_and_a_quantifier_predicate_discharges_too()
+    if !prv_why3_here() then return
+
+    assert(prv_proves("@ghost\nsmall(n: int) -> bool = for all i in 0..<n do i < n\n\n" +
+                      "f(n: int) -> int\n    require small(n)\n    n\n"))
+
+// The command itself, at 0.0.162: `sysl prove half.sysl` prints Why3's report on standard output
+// (`File /…/sysl-479163227292167908.mlw:` / `Goal div_i32'vc.` / `Prover result is: Valid (…).` and
+// the same for `half'vc`), then `every goal was discharged` on standard error, and exits 0;
+// `sysl prove same.sysl` prints `Goal same'vc.` / `Prover result is: Unknown (unknown) (…).` and
+// nothing on standard error, and exits 2 -- Why3's own status, passed through.
+@test("prove runs Why3, says every goal was discharged, and passes Why3's status through")
+prv_the_command_discharges_and_passes_the_status_through()
+    if !prv_why3_here() then return
+
+    val (dir, file) = prv_file("half(x: int) -> int\n    require x >= 0\n    ensure result >= 0\n    x / 2\n")
+    val (code, said) = prv_run(["sysl", "prove", file])
+
+    assert_eq(code, Fine)
+    assert(prv_has(said, "Goal half'vc."), said)
+    assert(said.ends_with("\nevery goal was discharged"), said)
+
+    write_text(file, "same(x: int) -> int\n    require x >= 0\n    ensure result > x\n    x\n").unwrap()
+
+    val (left, report) = prv_run(["sysl", "prove", file])
+
+    assert_eq(left, 2)
+    assert(prv_has(report, "Goal same'vc."), report)
+    assert(!prv_has(report, "every goal was discharged"), report)
+    remove_dir_all(dir).unwrap_or(())
+end prv_the_command_discharges_and_passes_the_status_through
+
+// The reference at 0.0.162 with no why3 on the PATH (`env PATH=/opt/homebrew/bin:/usr/bin:/bin sysl
+// prove half.sysl`), exit 1:
+//
+//     sysl: error: cannot find why3, which proving needs — it installs through opam ('opam install
+//     why3') and has no Homebrew formula, … either of which why3 finds once 'why3 config detect' has run
+@test("prove without a why3 says where one comes from, and fails")
+prv_without_why3_says_where_it_comes_from()
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = prove_discharge("module Test\nend\n", "sysl-prv-no-such-why3", (l) -> sink.push(l),
+                               (l) -> sink.push(l))
+
+    assert_eq(code, Failed)
+    assert_eq(join(lines.view(), "\n"),
+              "error: cannot find why3, which proving needs — it installs through opam ('opam install why3') " +
+              "and has no Homebrew formula, so a shell that has not run 'eval $(opam env)' will not see one " +
+              "that is installed. A prover is wanted too: 'opam install alt-ergo', or Homebrew's z3, either " +
+              "of which why3 finds once 'why3 config detect' has run")
+end prv_without_why3_says_where_it_comes_from
+
+// Which prover is named: the first of Alt-Ergo, Z3, CVC5, CVC4 Why3 lists, as `Name,Version`, never
+// an entry in parentheses. This machine's `why3 config list-provers` answers `Alt-Ergo 2.6.3`,
+// `Alt-Ergo 2.6.3 (BV)`, `Alt-Ergo 2.6.3 (counterexamples)`, `Z3 4.15.4` and two Z3 variants.
+@test("prove names its prover as Why3 lists it, the plain entry, Alt-Ergo first")
+prv_names_the_prover_as_why3_lists_it()
+    if !prv_why3_here() then return
+
+    val p = why3_prover("why3").unwrap()
+
+    assert(p.index_of(",").is_some() && p.index_of("(").is_none() && p.index_of(" ").is_none(), p)
+    assert(why3_prover("sysl-prv-no-such-why3").is_none(), "nothing is named where there is no why3")
+end prv_names_the_prover_as_why3_lists_it

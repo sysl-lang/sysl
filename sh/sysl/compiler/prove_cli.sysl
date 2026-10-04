@@ -1,10 +1,12 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{Search, split}
 
 // `sysl prove [--emit-whyml] [--overflow check|ignore] [--target <name>] <path>` -- the program's own
-// functions as WhyML (`reference/verification.md § sysl prove`).
+// functions as WhyML, and what Why3 made of them (`reference/verification.md § sysl prove`).
 //
 // **A proof stops at the typed tree**, the one `emit-typed` prints: analysis has checked every rule
 // that could fail, and nothing past it -- pruning, lowering, codegen, a link -- has anything to say
@@ -22,7 +24,7 @@ private struct ProveOptions
     overflow: string
 end ProveOptions
 
-prove_command(args: []string, say: string -> unit) -> int
+prove_command(args: []string, say: string -> unit, note: string -> unit) -> int
     val opts = prove_options(args) match
         Some(o) -> o
         None ->
@@ -55,16 +57,125 @@ prove_command(args: []string, say: string -> unit) -> int
             return Failed
         Ok(text) -> text
 
-    if !opts.emit
-        say("error: discharging the module needs Why3, which this compiler does not run yet -- " +
-            "'--emit-whyml' prints what it would be handed")
-        return Failed
-    end if
+    if !opts.emit then return prove_discharge(mlw, "why3", say, note)
 
     // The module ends in a newline of its own, and `say` ends the line it is given.
-    say(if mlw.ends_with("\n") then mlw[0..<mlw.len - 1] else mlw)
+    say(prove_line(mlw))
     Fine
 end prove_command
+
+// The module handed to Why3, and what it made of it: Why3's own report on standard output, the
+// sentence saying every goal was discharged on the `note` channel (standard error, as the reference
+// writes it), and **Why3's exit status as the command's** -- `2` where a goal was left -- so a proof
+// run is usable in a build script that wants to fail on an undischarged goal. `why3` is the program
+// to run, a parameter so a test can name one that is not there.
+prove_discharge(mlw: string, why3: string, say: string -> unit, note: string -> unit) -> int
+    val (code, out) = why3_prove(why3, mlw) match
+        Ok(answer) -> answer
+        Err(why) ->
+            say(s"error: $why")
+            return Failed
+
+    // Why3's report ends in a newline of its own, and `say` ends the line it is given.
+    if out != "" then say(prove_line(out))
+
+    if code == 0 then note("every goal was discharged")
+
+    code
+end prove_discharge
+
+// A text with the one newline it ends in taken off, `say` writing its own.
+private prove_line(text: string) -> string = if text.ends_with("\n") then text[0..<text.len - 1] else text
+
+// -- Why3 ------------------------------------------------------------------------------------------
+
+// Whether a Why3 is there to run, looked for by name only. Why3 installs through opam and has no
+// Homebrew formula, so on a machine that has one it is opam's switch that puts it on the PATH --
+// which is the thing to say when it is missing, rather than a directory to go guessing at.
+why3_runs(why3: string) -> bool = capture(why3, ["--version"], "", [], true) match
+    Ok(o) -> o.status.ok()
+    Err(_) -> false
+
+// The prover to name on the command line, as `Name,Version` -- the spelling Why3 wants when its
+// configuration holds several -- tried in the order Alt-Ergo, Z3, CVC5, CVC4: Alt-Ergo first because
+// it is the one Why3 ships alongside, Z3 next since Homebrew has a formula for it.
+//
+// **A bare name is not enough, and an entry in parentheses is skipped**: with Alt-Ergo's plain,
+// bitvector and counterexample entries configured `-P Alt-Ergo` is refused as ambiguous, and the
+// plain one is what answers an ordinary goal.
+why3_prover(why3: string) -> Option[string]
+    val listed = capture(why3, ["config", "list-provers"], "", [], true) match
+        Ok(o) -> split(o.text, "\n")
+        Err(_) -> return None
+
+    for name in ["Alt-Ergo", "Z3", "CVC5", "CVC4"]
+        for i in 0..<listed.len
+            val line = listed[i].trim()
+
+            if line != "" && line.index_of("(").is_none() && line.starts_with(name + " ")
+                val gap = line.index_of(" ").unwrap()
+
+                return Some(line[0..<gap] + "," + line[gap + 1..<line.len])
+            end if
+        end for
+    end for
+
+    None
+end why3_prover
+
+// Runs Why3 over a WhyML module (`reference/verification.md § sysl prove`), answering its exit status
+// and everything it wrote, standard output then standard error. `prove` is the batch subcommand: it
+// splits each verification condition into goals, runs the prover on them for at most `timeout`
+// seconds each, and reports one line per goal. A machine with Why3 and no prover still runs it, with
+// no prover named, which checks the module and discharges nothing.
+why3_prove(why3: string, mlw: string, timeout: int = 5) -> Result[(int, string), string]
+    if !why3_runs(why3)
+        return Err("cannot find why3, which proving needs — it installs through opam ('opam install why3') " +
+                   "and has no Homebrew formula, so a shell that has not run 'eval $(opam env)' will not see " +
+                   "one that is installed. A prover is wanted too: 'opam install alt-ergo', or Homebrew's z3, " +
+                   "either of which why3 finds once 'why3 config detect' has run")
+    end if
+
+    val dir = make_temp_dir("sysl-") match
+        Ok(d) -> d
+        Err(e) -> return Err(s"cannot make a directory to hand Why3 the module in: $e")
+
+    val file = s"$dir/sysl.mlw"
+    var args: Buf[string] = buf()
+
+    args.push("prove")
+
+    // A prover has to be named for a time limit to mean anything, and naming one is what makes this a
+    // discharge rather than a well-formedness check.
+    why3_prover(why3) match
+        Some(p) ->
+            args.push("--timelimit")
+            args.push(s"$timeout")
+            args.push("-P")
+            args.push(p)
+        None -> ()
+
+    args.push(file)
+
+    val answer = write_text(file, mlw) match
+        Ok(_) -> capture(why3, args.view(), "", [], true)
+        Err(e) ->
+            remove_dir_all(dir).unwrap_or(())
+            return Err(s"cannot write the module for Why3: $e")
+
+    remove_dir_all(dir).unwrap_or(())
+
+    answer match
+        Ok(o) -> Ok((why3_status(o.status), o.text + o.err.unwrap_or("")))
+        Err(e) -> Err(s"cannot run '$why3': $e")
+end why3_prove
+
+// An exit status as a number, a child stopped by a signal answering `128 + n` as a shell reports it.
+// No timeout is asked of the child, Why3 keeping its own per goal, so `TimedOut` is only a failure.
+private why3_status(s: Status) -> int = s match
+    Exited(c) -> c
+    Signalled(n) -> 128 + n
+    TimedOut -> Failed
 
 // The usage line, and under it what the command is for in the reference's own words.
 prove_usage() -> string =
