@@ -167,12 +167,17 @@ private one_write(cx: &Analyzer, op: string, target: Expr, place: TExpr, part: O
     end if
 
     val bin = op[0..<op.bytes.len - 1]
-    val tv = arm_value_at(cx, part, written, update_expected(cx.an, bin, texpr_type(place)))
+    val tv = arm_value_at(cx, part, written, scale_expectation(bin, texpr_type(place), written,
+                                                               update_expected(cx.an, bin, texpr_type(place))))
     val dispatch = update_dispatch(cx, written.span, bin, place, tv)
 
     if dispatch.is_none()
-        if disagree(arith_type(cx, written.span, bin, texpr_type(place), texpr_type(tv),
-                               written.span), texpr_type(place)) then
+        val fixed = fixed_operator_type(cx, written.span, bin, texpr_type(place), texpr_type(tv),
+                                        Some(texpr_type(place)))
+        val got = if fixed.is_some() then fixed.unwrap()
+        else arith_type(cx, written.span, bin, texpr_type(place), texpr_type(tv), written.span)
+
+        if disagree(got, texpr_type(place)) then
             cx.fault(written.span, s"'$op' would change the type of ${describe_target(target)}")
     end if
 

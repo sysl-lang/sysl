@@ -421,3 +421,148 @@ fixed_bits_of(span: Span, value: TExpr, ty: Type) -> TExpr
 
     TExpr(span, TIntOp("fixed_bits", value, None, raw_ty, raw_ty))
 end fixed_bits_of
+
+// -- mixed formats: what `*` and `/` answer ------------------------------------------------------
+
+// Whether a type's fixed-point arithmetic wraps: a `new` type declared `wrapping`, or one derived
+// from such a type. Every other fixed-point type saturates.
+fixed_wraps(t: Type) -> bool = t match
+    Constrained(d) -> d.wrapping || fixed_wraps(d.base)
+    Volatile(inner) -> fixed_wraps(*inner)
+    _ -> false
+
+// The format an operand of `*` or `/` stands for: its width, its fraction and its signedness, an
+// integer being a format with no fraction at all.
+fixed_format(t: Type) -> Option[(int, int, bool)] = underlying(t) match
+    Fixed(b, f, s) -> Some((b, f, s))
+    Integer(b, s, _) -> Some((b, 0, s))
+    _ -> None
+
+// The fixed-point type a position asks a product or a quotient for: a declaration's annotation, an
+// assignment's target, a parameter, a result, a sibling operand. A `new` type over a fixed-point
+// base is one; a transparent subtype asks for its base.
+fixed_context(expected: Option[Type]) -> Option[Type]
+    if expected.is_none() then return None
+
+    val t = repr(expected.unwrap())
+
+    if is_fixed(t) then Some(t) else None
+end fixed_context
+
+// Whether a written operand is an integer literal with nothing to say about its type -- the scale in
+// `x * 3`, which is an integer there and never a fixed-point literal.
+bare_int_literal(e: Expr) -> bool = *e.kind match
+    IntLit(_, _, suffix) -> suffix == ""
+    Unary(op, operand) -> op == "-" && bare_int_literal(operand)
+    _ -> false
+
+// Whether a written operand is a product or a quotient -- the two operators whose result a
+// fixed-point position may give a format.
+rescaled(e: Expr) -> bool = *e.kind match
+    Binary(op, _, _) -> op == "*" || op == "/"
+    _ -> false
+
+// What a compound assignment's value is read at: the place's own type, except that an integer
+// literal multiplying, dividing or shifting a fixed-point place is a scale and is read as the
+// integer it is.
+scale_expectation(bin: string, place_ty: Type, value: Expr, usual: Option[Type]) -> Option[Type] =
+    if scaling_op(bin) && is_fixed(place_ty) && bare_int_literal(value) then None else usual
+
+private scaling_op(op: string) -> bool = op == "*" || op == "/" || op == "<<" || op == ">>"
+
+private plain_integer(t: Type) -> bool = repr(t) match
+    Integer(_, _, _) -> true
+    _ -> false
+
+private derived_type(t: Type) -> bool = repr(t) match
+    Constrained(_) -> true
+    _ -> false
+
+// What `a * b` or `a / b` is where either operand is fixed-point -- or `None` where neither is, or
+// where the ordinary rule for one type on both sides already answers.
+//
+// **A position decides the format of a product, the way it decides a literal's.** `q31 * q31`
+// written where an `i64q62` is wanted IS an `i64q62`: the exact product, nothing rounded and
+// nothing clamped, which is one widening multiply. Where nothing asks, two operands of one format
+// give that format, and two of different formats are refused -- the exact product has a format,
+// and the refusal names it, but it is twice as wide as either operand and nobody should get one
+// without saying so. An integer on either side of `*`, or under `/`, is a scale and keeps the
+// fixed-point operand's format.
+//
+// An operand of a `new` type joins a product only where that is the type asked for: a derived type
+// does not mix with its base, and a position must not be a way around that.
+fixed_operator_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type,
+                    expected: Option[Type]) -> Option[Type]
+    if op != "*" && op != "/" then return None
+    if a == Unknown || b == Unknown then return None
+
+    val fa = is_fixed(a)
+    val fb = is_fixed(b)
+
+    if !fa && !fb then return None
+
+    if fa && !fb
+        if plain_integer(b) then return Some(unary_type(a))
+
+        return None
+    end if
+
+    if !fa
+        if op == "*" && plain_integer(a) then return Some(unary_type(b))
+
+        return None
+    end if
+
+    val want = fixed_context(expected)
+
+    if want.is_some()
+        val t = want.unwrap()
+
+        if (!derived_type(a) || type_eq(repr(a), t)) && (!derived_type(b) || type_eq(repr(b), t)) then
+            return Some(t)
+    end if
+
+    val (wa, qa, sa) = fixed_format(a).unwrap()
+    val (wb, qb, sb) = fixed_format(b).unwrap()
+
+    if wa == wb && qa == qb && sa == sb then return None
+
+    if op == "/"
+        cx.fault(span, s"the quotient of ${type_show(a)} and ${type_show(b)} has no format of its " +
+                 "own; give it a type")
+        return Some(Unknown)
+    end if
+
+    val signed = sa || sb
+    val exact = fixed_show(wa + wb, qa + qb, signed)
+
+    cx.fault(span, s"the product of ${type_show(a)} and ${type_show(b)} has no format of its own — " +
+             s"it is exactly ${if signed then "an" else "a"} $exact; give it a type")
+    Some(Unknown)
+end fixed_operator_type
+
+// A product or a quotient beside a fixed-point operand of another format, read again at that
+// operand's type -- which is what makes `acc + b0 * x` and `b0 * x + acc` the same sum. Only a
+// re-reading that succeeds replaces the first one, so nothing here can turn a sound expression
+// into a refused one.
+fixed_siblings(cx: &Analyzer, operands: Buf[Expr], ts: Buf[TExpr]) -> Buf[TExpr]
+    var anchor: Option[Type] = None
+
+    for i in 0..<ts.len()
+        if anchor.is_none() && !rescaled(operands.at(i)) && is_fixed(texpr_type(ts.at(i))) then
+            anchor = Some(texpr_type(ts.at(i)))
+
+    if anchor.is_none() then return ts
+
+    var out: Buf[TExpr] = buf()
+
+    for i in 0..<ts.len()
+        val t = ts.at(i)
+
+        if rescaled(operands.at(i)) && is_fixed(texpr_type(t)) && disagree(texpr_type(t), anchor.unwrap()) then
+            out.push(reread(cx, t, operands.at(i), anchor.unwrap()))
+        else
+            out.push(t)
+
+    out
+end fixed_siblings

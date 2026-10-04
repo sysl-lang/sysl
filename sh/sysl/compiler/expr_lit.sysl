@@ -250,7 +250,9 @@ arith_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type, rhs: Span) -
     end if
 
     val ra = repr(a)
-    val shift = (op == "<<" || op == ">>") && is_integer(underlying(a))
+    // A fixed-point value shifts too: `x << n` is `x · 2^n` in its own format, saturating, and `x >> n`
+    // the floor of `x / 2^n` -- the one rounding toward minus infinity the operators offer.
+    val shift = (op == "<<" || op == ">>") && (is_integer(underlying(a)) || is_fixed(a))
 
     if !shift && !type_eq(ra, repr(b)) then
         cx.fault(rhs, s"'$op' needs matching types, got ${type_show(a)} and ${type_show(b)}")
@@ -271,7 +273,7 @@ arith_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type, rhs: Span) -
         Floating(_, _) -> if floating_op(op) then result else undefined_for(cx, span, op, a)
         // A fixed-point value has the four a float has -- saturating, and `*` and `/` rescaling and
         // rounding. Its bits are reached through `.bits`, never through `&` or `%`.
-        Fixed(_, _, _) -> if floating_op(op) then result else undefined_for(cx, span, op, a)
+        Fixed(_, _, _) -> if floating_op(op) || shift then result else undefined_for(cx, span, op, a)
         Str -> if op == "+" then result else undefined_for(cx, span, op, a)
         Ptr(_) ->
             if op == "-" then return isize_type(word_bits(cx))

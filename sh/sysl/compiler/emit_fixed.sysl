@@ -1,7 +1,8 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, from_int, pow as big_pow, sub as big_sub, add as big_add, to_string}
+import sysl.math.bigint.{BigInt, from_int, pow as big_pow, sub as big_sub, add as big_add, mul as big_mul,
+                         cmp as big_cmp, to_string}
 
 // Fixed-point arithmetic, lowered.
 //
@@ -87,95 +88,295 @@ private fx_parts(t: Type) -> (int, int, bool) = underlying(t) match
 
 // -- arithmetic ----------------------------------------------------------------------------------
 
-// `a op b` at one fixed-point format.
-fixed_arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val) -> Val
+// `a op b` at one fixed-point format -- what a vector lane's operator is.
+fixed_arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val) -> Val =
+    fixed_binary(e, op, ty, ty, ty, lv, rv)
+
+// `a op b` where either operand is fixed-point: `lt` and `rt` are the operands' types and `ty` the
+// result's, which for a product or a quotient may be a third format the position chose, and for a
+// scale is the fixed-point operand's own.
+//
+// **A `wrapping` type wraps where every other saturates**: its `+` and `-` are the plain integer
+// instructions, and a product or quotient into it is truncated to its width rather than clamped.
+fixed_binary(e: *Emit, op: string, lt: Type, rt: Type, ty: Type, lv: Val, rv: Val) -> Val
+    val wraps = fixed_wraps(ty)
     val (bits, frac, signed) = fx_parts(ty)
+    val result = FixedSide(bits, frac, signed, min_of(bits, signed), max_of(bits, signed))
 
     op match
-        "+" -> fx_sat(e, if signed then "sadd" else "uadd", bits, lv, rv)
-        "-" -> fx_sat(e, if signed then "ssub" else "usub", bits, lv, rv)
-        "*" -> fixed_mul(e, bits, frac, signed, lv, rv)
-        "/" -> fixed_div(e, bits, frac, signed, lv, rv)
+        "+" ->
+            if wraps then return fx_bin(e, OpAdd, bits, lv, rv)
+
+            fx_sat(e, if signed then "sadd" else "uadd", bits, lv, rv)
+        "-" ->
+            if wraps then return fx_bin(e, OpSub, bits, lv, rv)
+
+            fx_sat(e, if signed then "ssub" else "usub", bits, lv, rv)
+        "*" -> fixed_product(e, fx_side(lt, lv), fx_side(rt, rv), result, wraps, lv, rv)
+        "/" -> fixed_quotient(e, fx_side(lt, lv), fx_side(rt, rv), result, wraps, lv, rv)
+        "<<" -> fixed_shift(e, op, lt, rt, wraps, lv, rv)
+        ">>" -> fixed_shift(e, op, lt, rt, wraps, lv, rv)
         _ ->
             gap_here(e, s"fixed-point arith '$op'")
             lv
-end fixed_arith
+end fixed_binary
 
-// The exact product at twice the width, rounded to nearest (ties toward +inf: add half a unit, then
-// shift, which floors) and clamped into the format. Neither step can overflow the double width: a
-// signed product is at most 2^(2W-2) in magnitude and the half unit is below 2^(W-1).
-private fixed_mul(e: *Emit, bits: int, frac: int, signed: bool, lv: Val, rv: Val) -> Val
-    // An unsigned product can reach the top bit of the double width, so it is held one bit wider,
-    // where the signed clamp in `narrowed` reads it correctly.
-    val n = if signed then bits * 2 else bits * 2 + 1
-    val a = fx_resize(e, bits, signed, n, lv)
-    val b = fx_resize(e, bits, signed, n, rv)
-    val p = fx_bin(e, OpMul, n, a, b)
-    val half = fx_bin(e, OpAdd, n, p, fx_int(fx_pow2(frac - 1)))
-    val scaled = fx_bin(e, if signed then OpAShr else OpLShr, n, half, fx_small(long(frac)))
+// One side of a fixed-point product or quotient -- or its result: a format, and the raw values the
+// side can hold, which is the format's whole range, or a single value where the side is a constant.
+// The ranges are what every width below is worked out from, so nothing is ever held wider than the
+// exact arithmetic needs: a Q15 product is a 32-bit multiply, not a 64-bit library call.
+private struct FixedSide
+    bits: int
+    frac: int
+    signed: bool
+    lo: BigInt
+    hi: BigInt
 
-    narrowed(e, n, bits, signed, scaled)
-end fixed_mul
+// An operand of `*` or `/` as a side. A constant -- a literal, a scale written as a number -- is
+// held at the width its value needs, signed.
+private fx_side(t: Type, v: Val) -> FixedSide
+    val (bits, frac, signed) = fixed_format(t).unwrap_or((0, 0, true))
 
-// `scaled`, held at `n` bits, clamped into a `bits`-wide format and truncated to it. An unsigned
-// value at `n` bits has its top bit clear (`n` is at least one wider than anything it holds), so a
-// signed clamp is right for both.
+    v match
+        VInt(n) -> FixedSide(fx_bits_for(n, n), frac, true, n, n)
+        _ -> FixedSide(bits, frac, signed, min_of(bits, signed), max_of(bits, signed))
+end fx_side
+
+// The narrowest signed width holding every value from `lo` to `hi`.
+private fx_bits_for(lo: BigInt, hi: BigInt) -> int
+    var n = 1
+
+    while !fits(lo, n, true) || !fits(hi, n, true)
+        n += 1
+
+    n
+end fx_bits_for
+
+private fx_min(a: BigInt, b: BigInt) -> BigInt = if big_cmp(a, b) <= 0 then a else b
+
+private fx_max(a: BigInt, b: BigInt) -> BigInt = if big_cmp(a, b) >= 0 then a else b
+
+private fx_abs(a: BigInt) -> BigInt = if big_cmp(a, from_int(0)) < 0 then big_sub(from_int(0), a) else a
+
+// A side's value brought to `n` bits. A constant is written at the new width directly, reduced to
+// it the way the width reduces any value.
+private fx_at(e: *Emit, side: FixedSide, n: int, v: Val) -> Val = v match
+    VInt(c) -> VInt(wrap(c, n, true))
+    _ -> fx_resize(e, side.bits, side.signed, n, v)
+
+// `a * b` into the format `t`.
+//
+// **Where `t` holds the exact product, nothing is rounded and nothing is clamped**: both operands
+// are extended to `t`'s width and multiplied there -- `q31 * q31` into an `i64q62`, or `i32q30 *
+// q31` into an `i64q61` accumulator, is `sext`, `sext`, `mul i64`, which a Cortex-M4 selects as one
+// `SMULL` and, added to an accumulator, one `SMLAL`. A `wrapping` result takes the same path whatever
+// the operands' ranges, since a product at `t`'s width IS the true product reduced modulo 2^W.
+//
+// Otherwise the exact product is formed at the narrowest width that holds it and what is done to it,
+// rescaled to `t`'s fraction -- rounding to nearest with ties toward +inf (add half a unit, then an
+// arithmetic shift, which floors) where bits are dropped -- and clamped once into `t`, or truncated
+// into a `wrapping` one.
+private fixed_product(e: *Emit, a: FixedSide, b: FixedSide, t: FixedSide, wraps: bool, lv: Val,
+                      rv: Val) -> Val
+    val shift = t.frac - (a.frac + b.frac)
+    val c1 = big_mul(a.lo, b.lo)
+    val c2 = big_mul(a.lo, b.hi)
+    val c3 = big_mul(a.hi, b.lo)
+    val c4 = big_mul(a.hi, b.hi)
+    val plo = fx_min(fx_min(c1, c2), fx_min(c3, c4))
+    val phi = fx_max(fx_max(c1, c2), fx_max(c3, c4))
+
+    if shift >= 0
+        val scale = fx_pow2(shift)
+        val fits_t = big_cmp(big_mul(plo, scale), t.lo) >= 0 && big_cmp(big_mul(phi, scale), t.hi) <= 0
+
+        if wraps || fits_t
+            val p = fx_bin(e, OpMul, t.bits, fx_at(e, a, t.bits, lv), fx_at(e, b, t.bits, rv))
+
+            if shift == 0 then return p
+
+            return fx_bin(e, OpShl, t.bits, p, fx_small(long(shift)))
+        end if
+    end if
+
+    var lo = fx_min(plo, fx_min(a.lo, b.lo))
+    var hi = fx_max(phi, fx_max(a.hi, b.hi))
+
+    if shift < 0 then hi = fx_max(hi, big_add(phi, fx_pow2(-shift - 1)))
+
+    if shift > 0
+        lo = fx_min(lo, big_mul(plo, fx_pow2(shift)))
+        hi = fx_max(hi, big_mul(phi, fx_pow2(shift)))
+    end if
+
+    val n = fx_width(fx_bits_for(lo, hi), t, wraps)
+    val p = fx_bin(e, OpMul, n, fx_at(e, a, n, lv), fx_at(e, b, n, rv))
+    var scaled = p
+
+    if shift < 0 then scaled = fx_round_off(e, n, p, -shift)
+    if shift > 0 then scaled = fx_bin(e, OpShl, n, p, fx_small(long(shift)))
+
+    fx_settle(e, n, t, wraps, scaled)
+end fixed_product
+
+// The width a result is worked at: the `held` bits its arithmetic needs, and never less than the
+// format it lands in -- one more than that where it is clamped, so the clamp compares values the
+// format cannot hold as well as those it can.
+private fx_width(held: int, t: FixedSide, wraps: bool) -> int
+    val least = if wraps then t.bits else t.bits + 1
+
+    if held > least then held else least
+end fx_width
+
+// `n` as a constant at a width, written the way that width's two's complement reads it.
+private fx_const(n: BigInt, bits: int) -> Val = VInt(wrap(n, bits, true))
+
+// `v`, held at `n` bits, with its low `k` bits rounded off: to nearest, ties toward +inf.
+private fx_round_off(e: *Emit, n: int, v: Val, k: int) -> Val
+    val half = fx_bin(e, OpAdd, n, v, fx_int(fx_pow2(k - 1)))
+
+    fx_bin(e, OpAShr, n, half, fx_small(long(k)))
+end fx_round_off
+
+// A result held at `n` bits brought into its format: clamped, or -- for a `wrapping` type --
+// reduced modulo 2^W.
+private fx_settle(e: *Emit, n: int, t: FixedSide, wraps: bool, v: Val) -> Val
+    if wraps then return fx_resize(e, n, true, t.bits, v)
+
+    narrowed(e, n, t.bits, t.signed, v)
+end fx_settle
+
+// `scaled`, held at `n` bits, clamped into a `bits`-wide format and truncated to it. `n` is wider
+// than anything the format holds, so a signed clamp is right for an unsigned format too.
 private narrowed(e: *Emit, n: int, bits: int, signed: bool, scaled: Val) -> Val
     val clamped = fx_clamp(e, n, scaled, min_of(bits, signed), max_of(bits, signed))
 
     fx_resize(e, n, true, bits, clamped)
 end narrowed
 
-// The exact quotient `(a · 2^F) / b`, rounded to nearest with ties toward +inf and clamped. A zero
-// divisor traps, as integer division's does.
+// `a / b` into the format `t`: the exact quotient `a · 2^(Ft - Fa + Fb) / b`, rounded to nearest with
+// ties toward +inf and clamped (or, into a `wrapping` type, reduced). A zero divisor traps, as
+// integer division's does.
 //
-// The divisor is made positive first (negating both sides), so the remainder of a floor division
-// is in `[0, b)` and "round to nearest, ties up" is one comparison: `2r >= b`. The width is the one
-// that holds `a · 2^F` and its negation, `W + F + 1` bits, and never less than `2W`.
-private fixed_div(e: *Emit, bits: int, frac: int, signed: bool, lv: Val, rv: Val) -> Val
-    val nz = fx_cmp(e, INe, bits, rv, fx_small(0))
+// The scale moves onto whichever side keeps it an integer -- the dividend shifted left where the
+// result wants more fraction than the operands give, the divisor where it wants less. The divisor is
+// then made positive (both sides negated), so the remainder of a floor division is in `[0, b)` and
+// "round to nearest, ties up" is one comparison, `2r >= b`. A constant divisor that is a power of two
+// is a rounding shift instead, with no divide at all.
+private fixed_quotient(e: *Emit, a: FixedSide, b: FixedSide, t: FixedSide, wraps: bool, lv: Val,
+                       rv: Val) -> Val
+    val sh = t.frac - a.frac + b.frac
+    val left = if sh > 0 then sh else 0
+    val right = if sh < 0 then -sh else 0
 
-    trap_unless(e, nz, "div")
+    val constant = rv match
+        VInt(c) -> Some(c)
+        _ -> None
 
-    val n = if !signed then bits * 2 + 1 else if bits + frac + 1 > bits * 2 then bits + frac + 1 else bits * 2
-    val a = fx_bin(e, OpShl, n, fx_resize(e, bits, signed, n, lv), fx_small(long(frac)))
-    val b = fx_resize(e, bits, signed, n, rv)
+    if constant.is_none() || big_cmp(constant.unwrap(), from_int(0)) == 0
+        trap_unless(e, fx_cmp(e, INe, b.bits, fx_at(e, b, b.bits, rv), fx_small(0)), "div")
 
-    if !signed
-        val q = fx_bin(e, OpUDiv, n, a, b)
-        val r = fx_bin(e, OpURem, n, a, b)
-        val twice = fx_bin(e, OpShl, n, r, fx_small(1))
-        val up = fx_cmp(e, IUge, n, twice, b)
-        val q1 = fx_bin(e, OpAdd, n, q, fx_select(e, up, n, fx_small(1), fx_small(0)))
+    val xlo = big_mul(a.lo, fx_pow2(left))
+    val xhi = big_mul(a.hi, fx_pow2(left))
+    val mx = fx_max(fx_abs(xlo), fx_abs(xhi))
+    val my = big_mul(fx_max(fx_abs(b.lo), fx_abs(b.hi)), fx_pow2(right))
+    val k = fx_power_of_two(constant, right)
 
-        return narrowed(e, n, bits, signed, q1)
+    // Every value below fits: the dividend and its negation, a half unit added to it, the divisor
+    // and its negation, twice a remainder, and the quotient one past its floor.
+    val wide = fx_max(big_add(mx, from_int(1)), big_add(big_mul(my, from_int(2)), from_int(1)))
+    val n = fx_width(fx_bits_for(big_sub(from_int(0), wide), wide), t, wraps)
+    val x0 = fx_at(e, a, n, lv)
+    val x = if left > 0 then fx_bin(e, OpShl, n, x0, fx_small(long(left))) else x0
+
+    if k.is_some()
+        val q = if k.unwrap() == 0 then x else fx_round_off(e, n, x, k.unwrap())
+
+        return fx_settle(e, n, t, wraps, q)
     end if
 
-    val bneg = fx_cmp(e, ISlt, n, b, fx_small(0))
-    val a_neg = fx_bin(e, OpSub, n, fx_small(0), a)
-    val b_neg = fx_bin(e, OpSub, n, fx_small(0), b)
-    val a2 = fx_select(e, bneg, n, a_neg, a)
-    val b2 = fx_select(e, bneg, n, b_neg, b)
-    val q = fx_bin(e, OpSDiv, n, a2, b2)
-    val r = fx_bin(e, OpSRem, n, a2, b2)
+    val y0 = fx_at(e, b, n, rv)
+    val y = if right > 0 then fx_bin(e, OpShl, n, y0, fx_small(long(right))) else y0
+    val bneg = fx_cmp(e, ISlt, n, y, fx_small(0))
+    val x_neg = fx_bin(e, OpSub, n, fx_small(0), x)
+    val y_neg = fx_bin(e, OpSub, n, fx_small(0), y)
+    val x2 = fx_select(e, bneg, n, x_neg, x)
+    val y2 = fx_select(e, bneg, n, y_neg, y)
+    val q = fx_bin(e, OpSDiv, n, x2, y2)
+    val r = fx_bin(e, OpSRem, n, x2, y2)
 
     // A truncating division to a floor one: a negative remainder means the quotient was rounded up.
     val rneg = fx_cmp(e, ISlt, n, r, fx_small(0))
     val q_down = fx_bin(e, OpSub, n, q, fx_small(1))
     val q1 = fx_select(e, rneg, n, q_down, q)
-    val r_up = fx_bin(e, OpAdd, n, r, b2)
+    val r_up = fx_bin(e, OpAdd, n, r, y2)
     val r1 = fx_select(e, rneg, n, r_up, r)
     val twice = fx_bin(e, OpShl, n, r1, fx_small(1))
-    val up = fx_cmp(e, ISge, n, twice, b2)
+    val up = fx_cmp(e, ISge, n, twice, y2)
     val q_next = fx_bin(e, OpAdd, n, q1, fx_small(1))
-    val q2 = fx_select(e, up, n, q_next, q1)
 
-    narrowed(e, n, bits, signed, q2)
-end fixed_div
+    fx_settle(e, n, t, wraps, fx_select(e, up, n, q_next, q1))
+end fixed_quotient
 
-// `-x`, saturating: the negation of the most negative value is the largest one.
-fixed_neg(e: *Emit, ty: Type, v: Val) -> Val
+// `k` where a constant divisor, shifted left `right` places, is `2^k`; nothing otherwise.
+private fx_power_of_two(constant: Option[BigInt], right: int) -> Option[int]
+    if constant.is_none() then return None
+
+    val c = constant.unwrap()
+
+    if big_cmp(c, from_int(0)) <= 0 then return None
+
+    var k = 0
+
+    while big_cmp(fx_pow2(k), c) < 0
+        k += 1
+
+    if big_cmp(fx_pow2(k), c) != 0 then return None
+
+    Some(k + right)
+end fx_power_of_two
+
+// `x << n` and `x >> n` in `x`'s own format: a scale by 2^n. The left shift saturates (or, for a
+// `wrapping` type, wraps), the right shift is arithmetic and floors. A count at or past the width is
+// a full shift, as an integer's is, and the count is first held to that.
+private fixed_shift(e: *Emit, op: string, lt: Type, ct: Type, wraps: bool, lv: Val, cv: Val) -> Val
+    val (bits, _, signed) = fx_parts(lt)
+    val (cbits, _, csigned) = fixed_format(ct).unwrap_or((bits, 0, false))
+    val wide = if cbits > bits then cbits else bits
+    val c0 = cv match
+        VInt(c) -> VInt(wrap(c, wide, true))
+        _ -> fx_resize(e, cbits, csigned, wide, cv)
+    val width = fx_const(from_int(long(bits)), wide)
+    val over = fx_cmp(e, IUge, wide, c0, width)
+    val c = fx_resize(e, wide, false, bits, fx_select(e, over, wide, width, c0))
+    val top = fx_const(from_int(long(bits - 1)), bits)
+    val past = fx_cmp(e, IUgt, bits, c, top)
+    val most = fx_select(e, past, bits, top, c)
+    val full = fx_cmp(e, IUge, bits, c, fx_const(from_int(long(bits)), bits))
+
+    if op == ">>"
+        if signed then return fx_bin(e, OpAShr, bits, lv, most)
+
+        return fx_select(e, full, bits, fx_small(0), fx_bin(e, OpLShr, bits, lv, most))
+    end if
+
+    if wraps then return fx_select(e, full, bits, fx_small(0), fx_bin(e, OpShl, bits, lv, most))
+
+    if signed then return fx_sat(e, "sshl", bits, lv, most)
+
+    // An unsigned value shifted by the whole width is past every value but zero.
+    val zero = fx_cmp(e, IEq, bits, lv, fx_small(0))
+    val spilled = fx_select(e, zero, bits, fx_small(0), fx_const(max_of(bits, false), bits))
+
+    fx_select(e, full, bits, spilled, fx_sat(e, "ushl", bits, lv, most))
+end fixed_shift
+
+// `-x`, saturating: the negation of the most negative value is the largest one -- or, for a
+// `wrapping` type, that value itself, as an integer's negation is.
+fixed_neg(e: *Emit, ty: Type, wraps: bool, v: Val) -> Val
     val (bits, _, _) = fx_parts(ty)
+
+    if wraps then return fx_bin(e, OpSub, bits, fx_small(0), v)
 
     fx_sat(e, "ssub", bits, fx_small(0), v)
 end fixed_neg
@@ -190,15 +391,7 @@ fixed_convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
         (Fixed(b1, f1, s1), Fixed(b2, f2, s2)) ->
             if b1 == b2 && f1 == f2 && s1 == s2 then return v
 
-            val d = f2 - f1
-            val n = (if b1 > b2 then b1 else b2) + (if d >= 0 then d else -d) + 2
-            val x = fx_resize(e, b1, s1, n, v)
-
-            if d >= 0 then return narrowed(e, n, b2, s2, fx_bin(e, OpShl, n, x, fx_small(long(d))))
-
-            val half = fx_bin(e, OpAdd, n, x, fx_int(fx_pow2(-d - 1)))
-
-            narrowed(e, n, b2, s2, fx_bin(e, OpAShr, n, half, fx_small(long(-d))))
+            fixed_rescale(e, b1, f1, s1, b2, f2, s2, v)
         (Integer(b1, s1, _), Fixed(b2, f2, s2)) ->
             val n = (if b1 > b2 then b1 else b2) + f2 + 2
             val y = fx_bin(e, OpShl, n, fx_resize(e, b1, s1, n, v), fx_small(long(f2)))
@@ -221,6 +414,46 @@ fixed_convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
         (Fixed(b1, f1, s1), Floating(_, _)) -> fixed_to_float(e, b1, f1, s1, to, v)
         _ -> gap_at(e, s"a conversion from ${type_show(from)} to ${type_show(to)}")
 end fixed_convert
+
+// One fixed-point format brought to another: exact where the fraction grows, rounded to nearest with
+// ties toward +inf where it shrinks, and clamped once.
+//
+// **The width is the narrowest that holds the value and what is done to it**, which is what keeps
+// `q31(acc)` out of an `i64q61` accumulator a 64-bit sequence rather than a 96-bit one. Rounding off
+// `k` bits is `floor((x + 2^(k-1)) / 2^k)`, and where `k` is at least two it is computed as
+// `((x >> (k-1)) + 1) >> 1` -- the same number, since flooring twice floors once -- whose sum
+// cannot overflow the source's own width the way adding the half first would at its largest value.
+private fixed_rescale(e: *Emit, b1: int, f1: int, s1: bool, b2: int, f2: int, s2: bool, v: Val) -> Val
+    val d = f2 - f1
+    val lo = min_of(b1, s1)
+    val hi = max_of(b1, s1)
+
+    if d >= 0
+        val n = fx_wider(fx_bits_for(big_mul(lo, fx_pow2(d)), big_mul(hi, fx_pow2(d))), b2 + 1)
+        val x = fx_resize(e, b1, s1, n, v)
+
+        if d == 0 then return narrowed(e, n, b2, s2, x)
+
+        return narrowed(e, n, b2, s2, fx_bin(e, OpShl, n, x, fx_small(long(d))))
+    end if
+
+    val k = -d
+
+    if k == 1
+        val n = fx_wider(fx_bits_for(lo, big_add(hi, from_int(1))), b2 + 1)
+
+        return narrowed(e, n, b2, s2, fx_round_off(e, n, fx_resize(e, b1, s1, n, v), 1))
+    end if
+
+    val n = fx_wider(fx_bits_for(lo, hi), b2 + 1)
+    val x = fx_resize(e, b1, s1, n, v)
+    val most = fx_bin(e, OpAShr, n, x, fx_small(long(k - 1)))
+    val up = fx_bin(e, OpAdd, n, most, fx_small(1))
+
+    narrowed(e, n, b2, s2, fx_bin(e, OpAShr, n, up, fx_small(1)))
+end fixed_rescale
+
+private fx_wider(a: int, b: int) -> int = if a > b then a else b
 
 // The `double` constant `2^k`, written as its bit pattern.
 private pow2_double(k: int) -> Val = VFloat(long(1023 + k) << 52)

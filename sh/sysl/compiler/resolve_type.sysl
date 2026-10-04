@@ -2045,6 +2045,25 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
         return Unknown
     end if
 
+    // `wrapping` changes what the operators do, so it makes a type of its own -- an alias that
+    // wrapped would be the same values as its base computing differently -- and only a fixed-point
+    // base saturates to begin with.
+    if d.wrapping.is_some()
+        val word = d.wrapping.unwrap()
+
+        if !d.derived
+            a.fault(home, word, "'wrapping' changes what the operators do, so it makes a type of its own " +
+                    s"— write 'type ${d.name} = new ${type_show(base)} wrapping'")
+            return Unknown
+        end if
+
+        if !is_fixed(base)
+            a.fault(home, word, "'wrapping' asks a fixed-point type to wrap rather than saturate, and " +
+                    s"${type_show(base)} is not fixed-point")
+            return Unknown
+        end if
+    end if
+
     var made = base
 
     // **WHAT THE DECLARATION NARROWED IS PART OF THE TYPE.** `type Age = int within 0..150` is not
@@ -2085,7 +2104,8 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
         None -> None
 
     if !is_plain_alias(d) then
-        made = constrained_exported(key, base, d.derived, lo, hi, exclusive, pred, cname)
+        made = constrained_exported(key, base, d.derived, lo, hi, exclusive, pred, cname,
+                                    d.wrapping.is_some())
 
     a.tables.constrained_insts.put(key, made)
     made
@@ -2491,7 +2511,8 @@ end folds_to_nan
 // here would leave nothing there to spell. It is built as a transparent type with no constraint,
 // interchangeable with its base in both directions, as before.
 is_plain_alias(d: TypeDecl) -> bool =
-    !d.derived && d.range.is_none() && d.pred.is_none() && !d.from_c && d.cname.is_none()
+    !d.derived && d.range.is_none() && d.pred.is_none() && !d.from_c && d.cname.is_none() &&
+        d.wrapping.is_none()
 
 // Whether a declaration is an alias a C header is asked to declare as a `typedef`.
 private is_exported_alias(d: TypeDecl) -> bool =

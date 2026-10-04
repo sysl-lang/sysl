@@ -72,13 +72,18 @@ assign_expr(cx: &Analyzer, span: Span, op: string, target: Expr, value: Expr) ->
     if texpr_type(place) == Unknown then return bad_expr(span)
 
     val bin = op[0..<op.bytes.len - 1]
-    val tv = type_expr(cx, value, update_expected(cx.an, bin, texpr_type(place)))
+    val tv = type_expr(cx, value, scale_expectation(bin, texpr_type(place), value,
+                                                    update_expected(cx.an, bin, texpr_type(place))))
     val dispatch = update_dispatch(cx, span, bin, place, tv)
 
     // An operator that reaches an implementation had both its operands checked against the trait's
-    // own signature where it was resolved, and its result checked against the place there too.
+    // own signature where it was resolved, and its result checked against the place there too. A
+    // fixed-point product or quotient is given the place's format, as `x = x * g` would be.
     if dispatch.is_none()
-        val got = arith_type(cx, span, bin, texpr_type(place), texpr_type(tv), value.span)
+        val fixed = fixed_operator_type(cx, span, bin, texpr_type(place), texpr_type(tv),
+                                        Some(texpr_type(place)))
+        val got = if fixed.is_some() then fixed.unwrap()
+        else arith_type(cx, span, bin, texpr_type(place), texpr_type(tv), value.span)
 
         if disagree(got, texpr_type(place)) then
             cx.fault(span, s"'$op' would change the type of ${describe_target(target)}")
