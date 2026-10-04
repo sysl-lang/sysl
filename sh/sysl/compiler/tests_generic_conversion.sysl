@@ -1,0 +1,485 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A conversion written at a TYPE PARAMETER -- `T(x)` where `T` is the parameter a body was
+// instantiated at. `u8(x)` over an `x: T` was always ordinary code; `T(b)` is its mirror, so the two
+// directions are one rule, checked once the instantiation says what `T` is, and saying the same
+// thing when they fail. At a constrained subtype or a simple enum the form is that type's checked
+// cast, trap included; a struct, `bool` and a pointer are refused as they are under their own names.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `GenericConversionTests`
+// these are.
+
+private var gcn_library_cache: Buf[Program] = buf()
+private var gcn_library_read: bool = false
+
+private gcn_library() -> Buf[Program]
+    if gcn_library_read then return gcn_library_cache
+
+    gcn_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> gcn_library_cache = units
+
+    gcn_library_cache
+end gcn_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private gcn_ready() -> bool
+    if gcn_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end gcn_ready
+
+private gcn_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program built from one file does: what it printed, and whether it exited zero. A failure to
+// build is its message and a non-zero exit.
+private gcn_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-generic-conversion").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end gcn_outcome
+
+// **What a program PRINTS**, where it runs to the end.
+private gcn_ran(text: string) -> string
+    val out = gcn_outcome(text)
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+end gcn_ran
+
+// Whether a program that BUILT stopped short of exiting zero -- a check that failed.
+private gcn_exits(text: string) -> bool
+    val out = gcn_outcome(text)
+
+    !out.1 && !out.0.contains("error:")
+end gcn_exits
+
+// Everything a source has to say for itself, taken through the lowering, so a refusal a pass after
+// the analysis makes is one of these too.
+private gcn_err(text: string) -> string
+    val root = make_temp_dir("sysl-generic-conversion").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gcn_err
+
+private gcn_refused(text: string, part: string)
+    val out = gcn_err(text)
+
+    assert(gcn_says(out, part), s"expected '$part' in: $out")
+end gcn_refused
+
+// A trait every fixed-width word the first case shifts through satisfies.
+private gcn_word() -> string = raw"""
+    trait Word: Add + Sub + Shl + Shr + BitOr
+        zero() -> Self
+
+    impl Word for u32
+        zero() -> u32 = 0
+
+    impl Word for u64
+        zero() -> u64 = 0
+
+    """
+
+@test("both directions of one conversion are written generically")
+gcn_both_directions_of_one_conversion()
+    if !gcn_ready() then return
+
+    assert_eq(gcn_ran(gcn_word() + raw"""
+        shift_in[T: Word](x: T, b: u8) -> T = (x << 8) | T(b)
+
+        top_byte[T: Word](x: T, w: T) -> u8 = u8(x >> (w - 8))
+
+        main()
+            var a = shift_in(shift_in(u32.zero(), 0xabu8), 0xcdu8)
+            var b = shift_in(shift_in(u64.zero(), 0xabu8), 0xcdu8)
+            print(a, b, top_byte(a, 16u32), top_byte(b, 16u64))
+        """), "43981 43981 171 171\n")
+
+// A narrowing at `T = u8` truncates and at `T = u32` does not: the conversion is resolved per
+// instantiation rather than once at the definition.
+@test("the conversion is the width's own, not the widest one's")
+gcn_the_conversion_is_the_widths_own()
+    if !gcn_ready() then return
+
+    assert_eq(gcn_ran(raw"""
+        narrow[T](x: int, like: T) -> T = T(x)
+
+        main()
+            print(narrow(300, 0u8), narrow(300, 0u32))
+        """), "44 300\n")
+
+// The reference runs this with `T` unbounded, and `reference/generics.md § Bounds` says an unbounded
+// `T` may do no operator, refused at the definition -- the reference diverges; the spec is followed,
+// and the conversion itself is asserted under the bound the operator needs.
+@test("a float parameter converts as a float does")
+gcn_a_float_parameter_converts_as_a_float_does()
+    if !gcn_ready() then return
+
+    gcn_refused(raw"""
+        half[T](x: int, like: T) -> T = T(x) / T(2)
+
+        main()
+            print(half(7, 0.0), half(7, 0.0f32), half(7, 0))
+        """, "error: '/' needs 'T: sysl.Div'")
+
+    assert_eq(gcn_ran(raw"""
+        half[T: Div](x: int, like: T) -> T = T(x) / T(2)
+
+        main()
+            print(half(7, 0.0), half(7, 0.0f32), half(7, 0))
+        """), "3.5 3.5 3\n")
+
+@test("`Self` is a type parameter too, inside a member's body")
+gcn_self_is_a_type_parameter_too()
+    if !gcn_ready() then return
+
+    assert_eq(gcn_ran(raw"""
+        trait Scaled
+            scaled(self, n: int) -> Self
+
+        impl Scaled for u16
+            scaled(self, n: int) -> u16 = self * Self(n)
+
+        main()
+            print((7u16).scaled(3))
+        """), "21\n")
+
+// The scalar conversion has no meaning for a constrained type and the checked cast does, so the form
+// written at a parameter is the one written under the subtype's name -- trap included.
+@test("an instantiation at a constrained subtype takes that subtype's own cast")
+gcn_a_constrained_subtype_takes_its_own_cast()
+    if !gcn_ready() then return
+
+    assert_eq(gcn_ran(raw"""
+        type Age = int within 0..150
+
+        into[T](x: int, like: T) -> T = T(x)
+
+        main()
+            var a: Age = into(30, Age(0))
+            print(int(a))
+        """), "30\n")
+
+@test("and traps on a value that subtype does not admit")
+gcn_and_traps_on_a_value_that_subtype_does_not_admit()
+    if !gcn_ready() then return
+
+    assert(gcn_exits(raw"""
+        type Age = int within 0..150
+
+        into[T](x: int, like: T) -> T = T(x)
+
+        main()
+            var a: Age = into(200, Age(0))
+            print(int(a))
+        """), "200 is outside 0..150 and the checked cast must stop the program")
+
+@test("a string parameter encodes a char, as the written form does")
+gcn_a_string_parameter_encodes_a_char()
+    if !gcn_ready() then return
+
+    assert_eq(gcn_ran(raw"""
+        text[T](c: char, like: T) -> T = T(c)
+
+        main()
+            print(text('h', ""))
+        """), "h\n")
+
+// -- what is refused, and where ------------------------------------------------------------------
+
+@test("an instantiation with no such conversion names the type it was made at")
+gcn_no_such_conversion_names_the_type()
+    if !gcn_ready() then return
+
+    gcn_refused(raw"""
+        struct P
+            x: int
+
+        make[T](b: u8, like: T) -> T = T(b)
+
+        main()
+            var p = make(1u8, P(0))
+            print(p.x)
+        """, "error: cannot convert byte to P")
+
+@test("the outward direction fails at the same moment and says the same thing")
+gcn_the_outward_direction_fails_the_same_way()
+    if !gcn_ready() then return
+
+    gcn_refused(raw"""
+        struct P
+            x: int
+
+        take[T](v: T) -> u8 = u8(v)
+
+        main()
+            print(take(P(0)))
+        """, "error: cannot convert P to byte")
+
+@test("a conversion still takes exactly one value")
+gcn_a_conversion_still_takes_exactly_one_value()
+    if !gcn_ready() then return
+
+    gcn_refused(raw"""
+        widen[T](a: int, b: int, like: T) -> T = T(a, b)
+
+        main()
+            print(widen(1, 2, 0u8))
+        """, "error: a 'T' conversion takes exactly one value")
+
+@test("a local of the parameter's name is a value and shadows nothing else")
+gcn_a_local_of_the_parameters_name_is_a_value()
+    if !gcn_ready() then return
+
+    assert_eq(gcn_ran(raw"""
+        f(T: int) -> int = T + 1
+
+        main()
+            print(f(41))
+        """), "42\n")
+
+// -- the edges, each a type the form means something different at --------------------------------
+
+@test("an instantiation at a simple enum takes that enum's checked cast")
+gcn_a_simple_enum_takes_its_checked_cast()
+    if !gcn_ready() then return
+
+    assert_eq(gcn_ran(raw"""
+        enum Colour
+            Red
+            Green
+            Blue
+
+        into[T](n: int, like: T) -> T = T(n)
+
+        main()
+            var c: Colour = into(2, Red)
+            print(int(c), Colour::Image(c))
+        """), "2 Blue\n")
+
+@test("and traps on an integer that names no variant")
+gcn_and_traps_on_an_integer_that_names_no_variant()
+    if !gcn_ready() then return
+
+    assert(gcn_exits(raw"""
+        enum Colour
+            Red
+            Green
+            Blue
+
+        into[T](n: int, like: T) -> T = T(n)
+
+        main()
+            var c: Colour = into(7, Red)
+            print(int(c))
+        """), "7 names no variant of Colour and the checked cast must stop the program")
+
+@test("an enum that carries data is told which half of the rule it fails")
+gcn_an_enum_that_carries_data_is_told_why()
+    if !gcn_ready() then return
+
+    gcn_refused(raw"""
+        enum Shape
+            Circle(r: int)
+            Square(s: int)
+
+        into[T](n: int, like: T) -> T = T(n)
+
+        main()
+            var s: Shape = into(0, Circle(1))
+            print(int(s))
+        """, "error: 'T' is Shape here, which carries data — only a simple enum converts to and from an integer")
+
+@test("there is no conversion to bool at a parameter either")
+gcn_there_is_no_conversion_to_bool_at_a_parameter()
+    if !gcn_ready() then return
+
+    gcn_refused(raw"""
+        into[T](n: int, like: T) -> T = T(n)
+
+        main()
+            print(into(1, true))
+        """, "error: cannot convert int to bool")
+
+@test("a pointer target is refused, since making one is not a conversion")
+gcn_a_pointer_target_is_refused()
+    if !gcn_ready() then return
+
+    gcn_refused(raw"""
+        into[T](n: usize, like: T) -> T = T(n)
+
+        main()
+            var x = 1
+            print(usize(into(0usize, &x)))
+        """, "error: cannot convert usize to *int")
+
+@test("an address reads as a number through a parameter")
+gcn_an_address_reads_as_a_number_through_a_parameter()
+    if !gcn_ready() then return
+
+    assert_eq(gcn_ran(raw"""
+        address[T](p: *int, like: T) -> T = T(p)
+
+        main()
+            var x = 7
+            print(address(&x, 0usize) != 0usize)
+        """), "true\n")
+
+// The reference runs this with `T` unbounded; the spec refuses the `+` (see the float case above).
+@test("a member of a generic type converts at its own type's parameter")
+gcn_a_member_of_a_generic_type_converts()
+    if !gcn_ready() then return
+
+    gcn_refused(raw"""
+        struct Packer[T]
+            seed: T
+
+            packed(self, b: u8) -> T = self.seed + T(b)
+
+        main()
+            var p = Packer(100u16)
+            print(p.packed(5u8))
+        """, "error: '+' needs 'T: sysl.Add'")
+
+    assert_eq(gcn_ran(raw"""
+        struct Packer[T: Add]
+            seed: T
+
+            packed(self, b: u8) -> T = self.seed + T(b)
+
+        main()
+            var p = Packer(100u16)
+            var q = Packer(100u64)
+            print(p.packed(5u8), q.packed(5u8))
+        """), "105 105\n")
+
+@test("a closure inside a generic body converts too")
+gcn_a_closure_inside_a_generic_body_converts_too()
+    if !gcn_ready() then return
+
+    assert_eq(gcn_ran(raw"""
+        widen[T](b: u8, like: T) -> T
+            var f = () -> T(b)
+
+            f()
+
+        main()
+            print(widen(9u8, 0u32), widen(9u8, 0.0))
+        """), "9 9\n")
+
+// -- which `T` a name means ----------------------------------------------------------------------
+
+// `var y: T` inside a `[T]` body has always meant the parameter, so `T(x)` meaning a struct of the
+// same name would make one name mean two things one line apart.
+@test("a type parameter wins over a declaration of the same name, as it already does in type position")
+gcn_a_type_parameter_wins_over_a_declaration()
+    if !gcn_ready() then return
+
+    assert_eq(gcn_ran(raw"""
+        struct T
+            v: int
+
+        widen[T](b: u8, like: T) -> T = T(b)
+
+        main()
+            print(widen(9u8, 0u32), T(3).v)
+        """), "9 3\n")
+
+@test("and over a function of the same name")
+gcn_and_over_a_function_of_the_same_name()
+    if !gcn_ready() then return
+
+    assert_eq(gcn_ran(raw"""
+        T(x: int) -> int = x * 2
+
+        widen[T](b: u8, like: T) -> T = T(b)
+
+        main()
+            print(widen(9u8, 0u32), T(3))
+        """), "9 6\n")
+
+// Construction takes a field list rather than a value, and a generic body filling in an unknown
+// struct's fields by position is not something to arrive at by accident.
+@test("a struct instantiation is refused rather than construction being reached for")
+gcn_a_struct_instantiation_is_refused()
+    if !gcn_ready() then return
+
+    gcn_refused(raw"""
+        struct P
+            a: int
+            b: int
+
+        make[T](x: int, like: T) -> T = T(x)
+
+        main()
+            print(make(1, P(0, 0)).a)
+        """, "error: cannot convert int to P")
+
+// The reference runs this with `A` and `B` unbounded; the spec refuses each `+` (see the float case).
+@test("two parameters convert independently in one expression")
+gcn_two_parameters_convert_independently()
+    if !gcn_ready() then return
+
+    val out = gcn_err(raw"""
+        both[A, B](x: A, y: B) -> A = x + A(B(x) + y)
+
+        main()
+            print(both(10u16, 5u8))
+        """)
+
+    assert(gcn_says(out, "error: '+' needs 'A: sysl.Add'"), out)
+    assert(gcn_says(out, "error: '+' needs 'B: sysl.Add'"), out)
+
+    assert_eq(gcn_ran(raw"""
+        both[A: Add, B: Add](x: A, y: B) -> A = x + A(B(x) + y)
+
+        main()
+            print(both(10u16, 5u8), both(10u32, 5u8))
+        """), "25 25\n")
