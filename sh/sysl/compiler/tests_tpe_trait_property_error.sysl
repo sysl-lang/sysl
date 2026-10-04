@@ -1,0 +1,268 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// What the analyzer says about a PROPERTY declared in a trait -- the reference's
+// `TraitPropertyErrorTests`. A property and a method are told apart by shape rather than by a
+// keyword (one has a parameter list and the other has none), so the mistakes worth reporting well are
+// the ones where the two shapes are confused: at the `impl` that supplies the member, and at every
+// site that reads it.
+//
+// **Every message and every `line:col` quoted here was read out of the reference compiler**
+// (0.0.162), on the program the test holds. Each program is a single file with no `module` header,
+// so the names a message quotes are the ones it wrote.
+
+private var tpe_library_cache: Buf[Program] = buf()
+private var tpe_library_read: bool = false
+
+private tpe_library() -> Buf[Program]
+    if tpe_library_read then return tpe_library_cache
+
+    tpe_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tpe_library_cache = units
+
+    tpe_library_cache
+end tpe_library
+
+private tpe_ready() -> bool
+    if tpe_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+end tpe_ready
+
+// What the compiler says about a program, as the command line prints it.
+private tpe_err(text: string) -> string
+    val root = make_temp_dir("sysl-tpe").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tpe_err
+
+// How many complaints a report holds: each names its place once.
+private tpe_complaints(said: string) -> int
+    var rest = said
+    var n = 0
+
+    loop
+        rest.index_of("main.sysl:") match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + 10..<rest.bytes.len]
+
+    n
+end tpe_complaints
+
+// The one complaint a program earns: the whole message, and the `line:col` it is anchored at.
+private tpe_only(said: string, message: string, at: string)
+    val head = s"error: $message\n --> "
+
+    said.index_of(head) match
+        None -> assert(false, said)
+        Some(i) ->
+            val rest = said[i + head.bytes.len..<said.bytes.len]
+            val place = rest.index_of("\n") match
+                Some(n) -> rest[0..<n]
+                None -> rest
+
+            assert(place.ends_with(s"main.sysl:$at"), said)
+
+    assert_eq(tpe_complaints(said), 1, said)
+end tpe_only
+
+// A trait with one property, and a struct to implement it on.
+private tpe_sized() -> string = "trait Sized\n    size -> int\nstruct Box\n    n: int\n"
+
+// The same, implemented.
+private tpe_sized_box() -> string = tpe_sized() + "impl Sized for Box\n    size -> int = self.n\n"
+
+// -- conformance tells the two shapes apart ---------------------------------------------------------
+
+// A property and an associated function both have no receiver to compare, so the kind is what has to
+// be checked -- otherwise `size(self)` would quietly stand in for `size`. The wrong kind is the one
+// complaint: nothing is said about the receiver it has and the trait's member has not.
+@test("a method may not stand in for a property the trait asks for")
+tpe_method_for_property()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err(tpe_sized() + "impl Sized for Box\n    size(self) -> int = self.n\n"),
+             "'size' is a property of trait 'Sized', so an implementation writes it as " +
+             "'size -> …' with no parameter list", "5:1")
+
+@test("a property may not stand in for a method the trait asks for")
+tpe_property_for_method()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err("trait Sized\n    size(self) -> int\nstruct Box\n    n: int\n" +
+                     "impl Sized for Box\n    size -> int = self.n\n"),
+             "'size' is a method of trait 'Sized', so an implementation writes it with a " +
+             "parameter list — a property has none", "5:1")
+
+@test("a property's result is held to the trait's")
+tpe_property_result()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err(tpe_sized() + "impl Sized for Box\n    size -> string = \"big\"\n"),
+             "method 'size' returns string, but trait 'Sized' declares int", "5:1")
+
+// A diagnostic that called this a missing *method* would send the reader off to write a parameter
+// list, which is the one thing that would keep it from conforming.
+@test("a property with no default is still required of an impl, and named as one")
+tpe_property_required()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err(tpe_sized() + "impl Sized for Box\n"),
+             "'Box' does not implement 'Sized': property 'size' is missing", "5:1")
+
+@test("a property no trait declares cannot be defined by an impl")
+tpe_property_undeclared()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err(tpe_sized_box() + "    width -> int = 1\n"),
+             "trait 'Sized' declares no property 'width', so this 'impl' cannot define it", "5:1")
+
+// A property is filed under the type's members like any other, so it collides with a field of the
+// same name exactly as an inherent property would.
+@test("an inherited property may not collide with a field of the same name")
+tpe_property_field_collision()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err("trait Sized\n    size -> int = 0\nstruct Box\n    size: int\nimpl Sized for Box\n"),
+             "type 'Box' has both a field and a member named 'size'", "2:5")
+
+// -- reading one, and not reading one ---------------------------------------------------------------
+
+@test("a property read with parentheses says to drop them")
+tpe_property_with_parens()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err(tpe_sized_box() + "print(Box(1).size())\n"),
+             "'size' is a property of 'Box' — read it as 'value.size', without '()'", "7:14")
+
+@test("a method read without parentheses says to add them")
+tpe_method_without_parens()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err("trait Sized\n    size(self) -> int\nstruct Box\n    n: int\n" +
+                     "impl Sized for Box\n    size(self) -> int = self.n\nprint(Box(1).size)\n"),
+             "'size' is a method of 'Box' — call it with 'size(…)'", "7:14")
+
+@test("a property named on a trait object with parentheses says to drop them")
+tpe_object_property_with_parens()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err(tpe_sized_box() + "show(s: *Sized) = print(s.size())\nvar b = Box(1)\nshow(&b)\n"),
+             "'size' is a property of 'Sized' — read it as 'value.size', without '()'", "7:27")
+
+@test("a name a trait object's trait does not declare is refused")
+tpe_object_undeclared_name()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err(tpe_sized_box() + "show(s: *Sized) = print(s.width)\nvar b = Box(1)\nshow(&b)\n"),
+             "a *Sized has no fields, and trait 'Sized' declares no 'width'", "7:27")
+
+// -- a bound is what licenses the read --------------------------------------------------------------
+
+// The definition-time pass reports this whether or not anything ever instantiates the function, which
+// is what makes the bound worth naming rather than deferring to a call site.
+@test("an unbounded parameter is told which bound would license the property")
+tpe_unbounded_parameter()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err("size[T](x: T) -> int = x.size\n"),
+             "'T' is a type parameter, so it has no fields to read — a field is layout, and no " +
+             "trait declares a property 'size' that a bound could promise instead", "1:26")
+
+@test("a property one trait declares names that trait as the bound to write")
+tpe_one_trait_names_bound()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err("trait Sized\n    size -> int\nwidest[T](x: T) -> int = x.size\n"),
+             "'size' needs 'T: Sized'", "3:28")
+
+@test("a property two traits declare asks for a bound without guessing which")
+tpe_two_traits_no_guess()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err("trait Sized\n    size -> int\ntrait Weighed\n    size -> int\n" +
+                     "widest[T](x: T) -> int = x.size\n"),
+             "'size' needs a bound on 'T' — it is declared by 'Sized', 'Weighed'", "5:28")
+
+// The bound is spent on what the trait declares and no more, so reaching for a method through a
+// property's spelling is a mistake the trait itself settles.
+@test("a bounded parameter reading a method as a property is told to call it")
+tpe_bounded_method_as_property()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err("trait Sized\n    size(self) -> int\nwidest[T: Sized](x: T) -> int = x.size\n"),
+             "'size' is a method of 'Sized' — call it with 'size(…)'", "3:35")
+
+@test("a bound licenses only the property its own trait declares")
+tpe_bound_licenses_own_property()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err("trait Sized\n    size -> int\ntrait Weighed\n    mass -> int\n" +
+                     "widest[T: Sized](x: T) -> int = x.mass\n"),
+             "'mass' needs 'T: Weighed'", "5:35")
+
+// -- a default property is checked at the trait -----------------------------------------------------
+
+// A default property's body is a default like any other, so it is walked once at the trait with its
+// receiver abstract -- which is what catches this with nothing implementing the trait at all.
+@test("a default property reading a field of its receiver is refused with no impl in sight")
+tpe_default_reads_field()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err("trait Sized\n    size -> int = self.n\n"),
+             "'Self' is a type parameter, so it has no fields to read — a field is layout, and no " +
+             "trait declares a property 'n' that a bound could promise instead", "2:24")
+
+@test("a default property may not call a method the trait does not declare")
+tpe_default_calls_undeclared()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err("trait Sized\n    size -> int = self.measure()\n"),
+             "no trait declares a method 'measure', so no bound on 'Self' could license this call",
+             "2:24")
+
+@test("a bad default property is reported once, not once per implementing type")
+tpe_default_reported_once()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err("trait Sized\n    size -> int = self.measure()\nstruct A\n    n: int\n" +
+                     "struct B\n    n: int\nimpl Sized for A\nimpl Sized for B\n"),
+             "no trait declares a method 'measure', so no bound on 'Self' could license this call",
+             "2:24")
+
+// -- object safety is unchanged by a property -------------------------------------------------------
+
+// A property's receiver is by value, so what makes a trait unsafe is still `Self` away from the
+// receiver -- and a property's result is exactly where that shows up.
+@test("a property returning Self has no size for an erased value to hand back")
+tpe_property_returning_self()
+    if !tpe_ready() then return
+
+    tpe_only(tpe_err("trait Cloneable\n    copy -> Self\nstruct Box\n    n: int\n" +
+                     "impl Cloneable for Box\n    copy -> Self = Box(self.n)\n" +
+                     "show(c: *Cloneable) = print(1)\n"),
+             "'copy' of 'Cloneable' mentions 'Self' away from its receiver, and an erased value " +
+             "has forgotten which type that is — so there is no '*Cloneable' to form", "7:10")
