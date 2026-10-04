@@ -73,40 +73,45 @@ struct Packaging
     supplied: bool
 
     // The `package.hocon` standing at the root of the tree the file came from, or the empty path
-    // where none does, and the `version` it declares, or the empty one where it declares none. They
-    // are what `__VERSION__` answers with, which is why they are the file's own package's and never
-    // the consumer's: a library's files report the library's version.
+    // where none does, and the `name` and `version` it declares, each the empty one where it
+    // declares none. They are what `__NAME__` and `__VERSION__` answer with, which is why they are
+    // the file's own package's and never the consumer's: a library's files report the library's.
     manifest: string
+    name: string
     version: string
 end Packaging
 
 // A file of the project being built: no prefix, and nothing mounted.
-no_packaging() -> Packaging = Packaging("", buf(), false, "", "")
+no_packaging() -> Packaging = Packaging("", buf(), false, "", "", "")
 
 // A file a library handed over under the name it was written with, which is what a source root
 // given as a library arrives as.
-supplied_packaging() -> Packaging = Packaging("", buf(), true, "", "")
+supplied_packaging() -> Packaging = Packaging("", buf(), true, "", "", "")
 
-// The manifest the files of the tree rooted at `dir` were read under, as `__VERSION__` needs it:
-// its path where the tree has one, and the version the already-read manifest declares.
-manifest_of_tree(dir: string, version: string) -> (string, string)
+// The manifest the files of the tree rooted at `dir` were read under, as `__NAME__` and
+// `__VERSION__` need it: its path where the tree has one, and the name and version the already-read
+// manifest declares.
+manifest_of_tree(dir: string, name: string, version: string) -> (string, string, string)
     val file = join_path(dir, ManifestName)
 
-    if !is_file(file) then ("", "") else (absolute_path(file), version)
+    if !is_file(file) then ("", "", "") else (absolute_path(file), name, version)
 
-// What `__VERSION__` is refused with in a file of this packaging, or nothing where it has a version
-// to answer.
-version_refusal(pkg: Packaging) -> Option[string]
+// What `__NAME__` or `__VERSION__` stands for in a file of this packaging -- the `name` or the
+// `version` its manifest declares -- or what it is refused with where the file belongs to no
+// package or the manifest leaves the field out.
+manifest_builtin(pkg: Packaging, builtin: string) -> Result[string, string]
+    val key = if builtin == "__NAME__" then "name" else "version"
+    val value = if builtin == "__NAME__" then pkg.name else pkg.version
+
     if pkg.manifest.is_empty()
-        return Some("'__VERSION__' is the 'version' in package.hocon, and this file is not part of " +
-                    "a package — no package.hocon stands at the root of its tree")
+        return Err(s"'$builtin' is the '$key' in package.hocon, and this file is not part of " +
+                   "a package — no package.hocon stands at the root of its tree")
 
-    if pkg.version.is_empty()
-        return Some(s"'__VERSION__' is the 'version' in package.hocon, and ${pkg.manifest} " +
-                    "declares none")
+    if value.is_empty()
+        return Err(s"'$builtin' is the '$key' in package.hocon, and ${pkg.manifest} declares none")
 
-    None
-end version_refusal
+    Ok(value)
+end manifest_builtin
 
 // What a written module path means where it names a package this one's manifest brought in.
 //

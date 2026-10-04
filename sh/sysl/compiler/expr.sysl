@@ -1081,12 +1081,12 @@ end visible_here
 // What a reserved identifier stands for, folded into the use as the literal it names.
 //
 // The file that wrote a call and the package that file belongs to: what a spliced default's
-// `__FILE__`, `__LINE__` and `__VERSION__` answer about.
+// `__FILE__`, `__LINE__`, `__NAME__` and `__VERSION__` answer about.
 struct CallSite
     src: Source
     pkg: Packaging
 
-// Where a spliced default reports its `__FILE__`, `__LINE__` and `__VERSION__` from: the call site,
+// Where a spliced default reports its `__FILE__`, `__LINE__`, `__NAME__` and `__VERSION__` from: the call site,
 // carried down so that a default written in a library names the caller's line and package and not
 // its own. A default inside a default keeps the outermost caller.
 call_site(cx: &Analyzer) -> Option[CallSite] =
@@ -1105,10 +1105,12 @@ private builtin(cx: &Analyzer, span: Span, name: string, expected: Option[Type])
     // **The package of the file that wrote it -- and in a default, of the file that wrote the
     // call**: as `__FILE__` does, a default of `__VERSION__` declared in a library reports the
     // calling package's version, so a library can ask which version of its consumer is running.
-    if name == "__VERSION__"
-        version_refusal(site.pkg) match
-            Some(why) -> return cx.err(span, why)
-            None -> return TExpr(span, TStrLit(site.pkg.version))
+    // `__NAME__` by the same road: a library's `tag: string = __NAME__` default names whichever
+    // package called it, so a logging call made from an application is tagged with it.
+    if name == "__NAME__" || name == "__VERSION__"
+        manifest_builtin(site.pkg, name) match
+            Err(why) -> return cx.err(span, why)
+            Ok(value) -> return TExpr(span, TStrLit(value))
 
     if name == "__LINE__" then
         return int_literal(cx, span, from_int(long(loc.line)), "", expected)
