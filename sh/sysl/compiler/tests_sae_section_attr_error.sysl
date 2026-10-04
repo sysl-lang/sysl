@@ -1,0 +1,138 @@
+module sh.sysl.compiler
+@tests
+
+// What `@section("…")` refuses (`reference/attributes.md § @section`): a declaration that occupies
+// no address, a binding whose storage is the frame, the ways of writing the attribute without
+// naming a section, and the attributes it cannot stand beside.
+//
+// **Every message quoted here was read out of the reference compiler**, whose
+// `SectionAttrErrorTests` these are. Each source is taken the whole way through the lowering by
+// `enm_err`, as the reference's own `err` takes it.
+
+private val sae_unnamed: string = "'@section' names the linker section as a string \u{2014} '@section(\".vectors\")' on the storage or the definition that goes there. The spelling is the target's: '.noinit' and '.ramfunc' are ELF's, '__DATA,__mysection' is Mach-O's"
+
+private val sae_one_object: string = "'@section(\"...\")' places one object in a linker section, so it marks a 'var', a 'val' or a function \u{2014} a 'const' is folded into every use and has no storage to place, and an 'extern' names something this program does not define"
+
+private val sae_local: string = "'n' is a local, so it cannot be placed in section \".noinit\" \u{2014} its storage is the frame of whichever call is running, and a section is a region of the image the linker decides once. Declare it as module storage, outside every function, for a section to be about"
+
+// -- the section has to be named ------------------------------------------------------------------
+
+@test("there is no bare form")
+sae_there_is_no_bare_form()
+    val e = enm_err("@section\nstatic var n: u32 = 0u32\nprint(n)")
+
+    assert(e.contains(sae_unnamed), e)
+
+@test("nor an empty pair of parentheses")
+sae_nor_empty_parentheses()
+    val e = enm_err("@section()\nstatic var n: u32 = 0u32\nprint(n)")
+
+    assert(e.contains(sae_unnamed), e)
+
+@test("the name is a string, as an exported symbol's is")
+sae_the_name_is_a_string()
+    val e = enm_err("@section(vectors)\nstatic var n: u32 = 0u32\nprint(n)")
+
+    assert(e.contains(sae_unnamed), e)
+
+// Every other spelling belongs to some target. `""` belongs to none, and it is the one thing the
+// string form checks -- nothing else about what is in it is sysl's business.
+@test("and \"\" is not the name of one")
+sae_empty_is_not_a_name()
+    val e = enm_err("@section(\"\")\nstatic var n: u32 = 0u32\nprint(n)")
+
+    assert(e.contains("'@section' names a section, and \"\" is not the name of one \u{2014} a section's spelling is the target's, so there is nothing an empty one could resolve to"), e)
+
+// -- it marks something that occupies an address -------------------------------------------------
+
+@test("a 'const' is folded into every use and has none")
+sae_a_const_has_no_address()
+    val e = enm_err("@section(\".rodata\")\nconst N: int = 4\nprint(N)")
+
+    assert(e.contains(sae_one_object), e)
+
+@test("a struct is a type rather than an object")
+sae_a_struct_is_a_type()
+    val e = enm_err("@section(\".data\")\nstruct S\n    a: int\n")
+
+    assert(e.contains(sae_one_object), e)
+
+@test("an 'extern' names storage this program does not lay down")
+sae_an_extern_is_not_laid_down()
+    val e = enm_err("@section(\".data\")\nextern errno: int\nprint(errno)")
+
+    assert(e.contains(sae_one_object), e)
+
+// -- a local's storage is the frame, which no section is about ------------------------------------
+
+// A local and module storage are the same syntax and differ only in where they stand
+// (`reference/modules.md § Where a program starts`), so this is refused by the analyzer rather than
+// by the grammar -- and the message is about the frame, which is the fact that explains it.
+
+@test("a 'var' inside a function")
+sae_a_var_inside_a_function()
+    val e = enm_err("f() -> int\n    @section(\".noinit\")\n    var n: int = 1\n    n\n\nprint(f())")
+
+    assert(e.contains(sae_local), e)
+
+@test("a 'val' inside a function")
+sae_a_val_inside_a_function()
+    val e = enm_err("f() -> int\n    @section(\".noinit\")\n    val n: int = 1\n    n\n\nprint(f())")
+
+    assert(e.contains(sae_local), e)
+
+// The file a program starts in is the case worth pinning: a top-level `var` there is a local of the
+// entry point, which is exactly why the grammar cannot answer this.
+@test("and a top-level 'var' in the file the program starts in, which is one")
+sae_a_top_level_var_of_the_entry_file()
+    val e = enm_err("@section(\".noinit\")\nvar n: int = 1\nprint(n)")
+
+    assert(e.contains(sae_local), e)
+
+// -- it does not stand beside an attribute about something else -----------------------------------
+
+@test("'@packed' lays out a type and this places an object")
+sae_beside_packed()
+    val e = enm_err("@packed\n@section(\".data\")\nstruct S\n    a: int\n")
+
+    assert(e.contains("'@packed' lays out a struct's fields and '@section(\"...\")' places one object, so they cannot stand above one declaration \u{2014} a type occupies no address of its own, and the storage that holds a packed value is what a section would be about"), e)
+
+@test("'@align' beside it is a binding, and only a binding")
+sae_beside_align()
+    val e = enm_err("@align(16)\n@section(\".data\")\nstruct S\n    a: int\n")
+
+    assert(e.contains("'@align(n)' beside '@section(\"...\")' marks one binding's storage \u{2014} the boundary it begins on and the section it sits in are both about one object, and this declares none"), e)
+
+// The pair is about one binding whatever else it stands above: a 'const' and a function are told the
+// same sentence the struct is.
+@test("'@align' beside '@section' above a 'const' or a function is told the same")
+sae_beside_align_const_or_function()
+    val said = "'@align(n)' beside '@section(\"...\")' marks one binding's storage"
+    val c = enm_err("@align(16)\n@section(\".data\")\nconst N: int = 4\nprint(N)\n")
+
+    assert(c.contains(said), c)
+
+    val f = enm_err("@align(16)\n@section(\".data\")\nf() -> int = 1\nprint(f())\n")
+
+    assert(f.contains(said), f)
+end sae_beside_align_const_or_function
+
+// Each attribute says this in its own words, and `@align`'s is left byte-for-byte as it was: it is
+// quoted verbatim in an `error` block on the site, where a page checks a diagnostic by substring and
+// a word inserted into the middle of one breaks it.
+@test("a binding that names several has no one object for either to be about")
+sae_a_binding_naming_several()
+    val s = enm_err("@section(\".data\")\nstatic var a, b = 1, 2\nprint(a)")
+
+    assert(s.contains("'@section(\"...\")' places one object, and a binding that names several has no one object for it to be about \u{2014} declare them on lines of their own"), s)
+
+    val a = enm_err("@align(16)\nstatic var a, b = 1, 2\nprint(a)")
+
+    assert(a.contains("'@align(n)' is the boundary one object's storage begins on, and a binding that names several has no one object for it to be about \u{2014} declare them on lines of their own"), a)
+end sae_a_binding_naming_several
+
+@test("one written twice is refused, as any repeated attribute is")
+sae_written_twice()
+    val e = enm_err("@section(\".a\")\n@section(\".b\")\nstatic var n: u32 = 0u32\nprint(n)")
+
+    assert(e.contains("'@section' is written twice above one declaration, and it says nothing the once does not"), e)
