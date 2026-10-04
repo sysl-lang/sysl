@@ -1,0 +1,371 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.text.split
+
+// What a `string` lowers to across a whole program: the three words it is, the immortal owner a
+// literal carries, and the runtime pieces its content needs -- emitted only where the program
+// reaches them.
+//
+// **Every expected line was read out of the reference compiler (0.0.162)**, by handing the
+// installed `sysl` the same program and quoting `emit-llvm`. The two cases asserting on a LIBRARY
+// body (`putbytes`, the integer renderers) quote the reference's own suite instead: its command
+// line declares the library's functions rather than defining them, where both compilers' whole
+// lowering -- this file's `xvr_ir` -- carries the bodies.
+
+private scg_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+// The function named, from its `define` line to just before its closing brace.
+private scg_define_of(ir: string, name: string) -> string
+    var rest = "\n" + ir
+
+    loop
+        val at = rest.index_of("\ndefine") match
+            None -> return ""
+            Some(i) -> i + 1
+
+        rest = rest[at..<rest.len]
+
+        val eol = rest.index_of("\n") match
+            None -> rest.len
+            Some(e) -> e
+
+        if rest[0..<eol].contains(s"@$name(")
+            val close = rest.index_of("\n}") match
+                None -> rest.len
+                Some(c) -> c
+
+            return rest[0..<close]
+
+        rest = rest[eol..<rest.len]
+end scg_define_of
+
+private scg_main_of(ir: string) -> string = scg_define_of(ir, "main")
+
+private scg_is_digit(b: u8) -> bool = b >= u8('0') && b <= u8('9')
+
+// Whether `s` begins with `pattern`, where each `#` in the pattern stands for one or more digits --
+// the `%t\d+` of the reference's regular expressions.
+private scg_at(s: string, pattern: string) -> bool
+    val hole = pattern.index_of("#") match
+        None -> return s.starts_with(pattern)
+        Some(h) -> h
+
+    if !s.starts_with(pattern[0..<hole]) then return false
+
+    var i = hole
+
+    while i < s.len && scg_is_digit(s.bytes[i])
+        i += 1
+
+    if i == hole then return false
+
+    scg_at(s[i..<s.len], pattern[hole + 1..<pattern.len])
+end scg_at
+
+// Whether `pattern` (with `#` as above) occurs anywhere in `hay`.
+private scg_has(hay: string, pattern: string) -> bool
+    val first = pattern.index_of("#") match
+        None -> return hay.contains(pattern)
+        Some(h) -> pattern[0..<h]
+
+    var from: usize = 0
+
+    loop
+        val at = hay[from..<hay.len].index_of(first) match
+            None -> return false
+            Some(i) -> from + i
+
+        if scg_at(hay[at..<hay.len], pattern) then return true
+
+        from = at + 1
+end scg_has
+
+@test("a string is the same three words a slice is")
+scg_a_string_is_the_same_three_words_a_slice_is()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var s = \"hi\"\nprint(s.len)\n")
+
+    assert(out.contains("%s.addr = alloca { ptr, ptr, i64 }"), out)
+
+@test("a literal is a constant: no owner, the interned bytes, and a length that leaves out the NUL")
+scg_a_literal_is_a_constant()
+    if xvr_no_library() then return
+
+    val out = scg_ir("print(\"hi\")\n")
+
+    assert(out.contains("@.str1 = private constant [3 x i8] c\"hi\\00\""), out)
+    assert(out.contains("{ ptr null, ptr @.str1, i64 2 }"), out)
+
+@test("a length is a word of the value rather than a walk over the bytes")
+scg_a_length_is_a_word_of_the_value()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var s = \"hi\"\nprint(s.len)\n")
+
+    assert(scg_has(out, "extractvalue { ptr, ptr, i64 } %t#, 2"), out)
+
+@test("the bytes of a string are the string, with nothing emitted to convert them")
+scg_the_bytes_of_a_string_are_the_string()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var s = \"hi\"\nvar b = s.bytes\nprint(b.len)\n")
+
+    assert(out.contains("%b.addr = alloca { ptr, ptr, i64 }"), out)
+    assert(!out.contains("bitcast"), out)
+
+@test("a literal's owner is null, so counting it is a run-time no-op")
+scg_a_literals_owner_is_null()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var s = \"hi\"\nprint(s.len)\n")
+
+    assert(out.contains("call void @arc.retain_maybe(ptr %t1)"), out)
+    assert(out.contains("define private void @arc.retain_maybe(ptr %p) {"), out)
+
+// A sysl string may hold an interior NUL, so every shortcut through C -- `puts`, `%s`, even the
+// length-bounded `%.*s` -- would stop early. The sink hands stdio the byte count instead, the whole
+// buffer in one call on a hosted target rather than one `putchar` per byte.
+@test("printing goes by length rather than by terminator")
+scg_printing_goes_by_length()
+    if xvr_no_library() then return
+
+    val out = scg_ir("print(\"hi\")\n")
+    val sink = scg_define_of(out, "sysl$putbytes")
+
+    assert(scg_main_of(out).contains("call void @sysl$prints({ ptr, ptr, i64 } "), out)
+    assert(scg_has(sink, "extractvalue { ptr, ptr, i64 } %t#, 2"), sink)
+    assert(sink.contains("call i64 @sysl_stdout_write(ptr %"), sink)
+    assert(!sink.contains("@putchar"), sink)
+
+    for line in split(out, "\n")
+        if line.starts_with("@.str") then assert(!line.contains("%s"), line)
+end scg_printing_goes_by_length
+
+// Every value is its own call to the renderer its type reaches, with a space between and a newline
+// at the end -- and the separators go out as characters rather than one-character strings, so
+// printing a number never reaches the string runtime at all.
+@test("each argument is rendered by its own call")
+scg_each_argument_is_rendered_by_its_own_call()
+    if xvr_no_library() then return
+
+    val main = scg_main_of(scg_ir("print(1, 2, \"x\", 3, 4)\n"))
+    val renderers = ["printi", "printu", "printr", "printb", "printc", "prints"]
+    var called = ""
+
+    for line in split(main, "\n")
+        val l = line.trim()
+
+        if l.starts_with("call void @sysl$")
+            val rest = l["call void @sysl$".len..<l.len]
+
+            rest.index_of("(") match
+                None -> ()
+                Some(open) ->
+                    for r in renderers
+                        if rest[0..<open] == r then called = called + " " + r
+
+    assert_eq(called, " printi printc printi printc prints printc printi printc printi printc")
+    assert(main.contains("call void @sysl$printc(i32 32)"), main)
+    assert(main.contains("call void @sysl$printc(i32 10)"), main)
+end scg_each_argument_is_rendered_by_its_own_call
+
+@test("comparison is a call, and every operator reads its answer")
+scg_comparison_is_a_call()
+    if xvr_no_library() then return
+
+    val eq = scg_ir("print(\"a\" == \"b\")\n")
+    val lt = scg_ir("print(\"a\" < \"b\")\n")
+
+    assert(scg_has(eq, "call i32 @sysl.str.cmp(ptr %t#, i64 %t#, ptr %t#, i64 %t#)"), eq)
+    assert(scg_has(eq, "icmp eq i32 %t#, 0"), eq)
+    assert(scg_has(lt, "icmp slt i32 %t#, 0"), lt)
+
+@test("a substring is checked for landing between characters, at both ends")
+scg_a_substring_is_checked_at_both_ends()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var s = \"hi\"\nvar t = s[0..<1]\nprint(t.len)\n")
+
+    assert(scg_has(out, "call i1 @sysl.str.boundary(ptr %t#, i64 %t#, i64 0)"), out)
+    assert(scg_has(out, "call i1 @sysl.str.boundary(ptr %t#, i64 %t#, i64 1)"), out)
+    assert(out.contains("%cont = icmp eq i8 %top, -128"), out)
+
+@test("slicing a string yields a string, so it is checked; slicing bytes is not")
+scg_slicing_bytes_is_not_checked()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var s = \"hi\"\nvar b = s.bytes[0..<1]\nprint(b.len)\n")
+
+    assert(!out.contains("@sysl.str.boundary"), out)
+
+@test("concatenation is one call that returns the joined view")
+scg_concatenation_is_one_call()
+    if xvr_no_library() then return
+
+    val out = scg_ir("print(\"a\" + \"b\")\n")
+
+    assert(scg_has(out, "call { ptr, ptr, i64 } @sysl.str.concat(ptr %t#, i64 %t#, ptr %t#, i64 %t#)"), out)
+    assert(out.contains("define private { ptr, ptr, i64 } @sysl.str.concat"), out)
+
+// The buffer a join builds is an ARC box, so it carries a header and a hook like any other -- the
+// hook that frees and does nothing else, raw bytes holding no references.
+@test("a joined string owns a heap buffer, so the module links an allocator and counts references")
+scg_a_joined_string_owns_a_heap_buffer()
+    if xvr_no_library() then return
+
+    val out = scg_ir("print(\"a\" + \"b\")\n")
+
+    assert(out.contains("declare ptr @malloc(i64)"), out)
+    assert(out.contains("store ptr @arc.drop.plain, ptr %hook"), out)
+    assert(out.contains("define private void @arc.drop.plain(ptr %p, i1 %storage) {"), out)
+    assert(out.contains("define private void @arc.release_maybe(ptr %p) {"), out)
+
+@test("a module that never joins strings emits no concatenation helper")
+scg_no_join_no_concatenation_helper()
+    if xvr_no_library() then return
+
+    val out = scg_ir("print(\"hi\")\n")
+
+    assert(!out.contains("@sysl.str.concat"), out)
+
+@test("rendering an integer is one call that allocates a buffer")
+scg_rendering_an_integer_is_one_call()
+    if xvr_no_library() then return
+
+    val out = scg_ir("print(str(42))\n")
+
+    assert(scg_has(out, "call { ptr, ptr, i64 } @sysl.str.int(i64 %t#, i1 1)"), out)
+    assert(out.contains("define private { ptr, ptr, i64 } @sysl.str.from_bytes"), out)
+    assert(out.contains("declare ptr @malloc(i64)"), out)
+
+@test("rendering a string is the identity: no call, no allocation of its own")
+scg_rendering_a_string_is_the_identity()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var s = \"hi\"\nprint(str(s))\n")
+
+    assert(!out.contains("@sysl.str.int"), out)
+    assert(!out.contains("@sysl.str.from_bytes"), out)
+
+@test("rendering a bool selects an immortal word rather than allocating")
+scg_rendering_a_bool_selects_a_word()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var b = true\nprint(str(b))\n")
+
+    assert(scg_has(out, "select i1 %t#, ptr @.true, ptr @.false"), out)
+    assert(scg_has(out, "select i1 %t#, i64 4, i64 5"), out)
+    assert(!out.contains("@sysl.str.from_bytes"), out)
+
+@test("rendering a char goes through the same UTF-8 encoder printing one does")
+scg_rendering_a_char_goes_through_the_encoder()
+    if xvr_no_library() then return
+
+    val out = scg_ir("print(str('A'))\n")
+
+    assert(out.contains("define private { ptr, ptr, i64 } @sysl.str.char"), out)
+    assert(out.contains("call ptr @sysl.utf8(i32 %cp, ptr %buf)"), out)
+    assert(out.contains("define private ptr @sysl.utf8"), out)
+
+@test("rendering a float matches print's %g through snprintf")
+scg_rendering_a_float_goes_through_snprintf()
+    if xvr_no_library() then return
+
+    val out = scg_ir("print(str(1.5))\n")
+
+    assert(out.contains("define private { ptr, ptr, i64 } @sysl.str.float"), out)
+    assert(out.contains("declare i32 @snprintf(ptr, i64, ptr, ...)"), out)
+    assert(out.contains("c\"%g\\00\""), out)
+
+@test("a module that never renders a value emits no str helpers")
+scg_no_rendering_no_str_helpers()
+    if xvr_no_library() then return
+
+    val out = scg_ir("print(\"hi\")\n")
+
+    assert(!out.contains("@sysl.str.int"), out)
+    assert(!out.contains("@sysl.str.char"), out)
+    assert(!out.contains("@sysl.str.float"), out)
+    assert(!out.contains("@sysl.str.from_bytes"), out)
+
+@test("an f-string hole formats through snprintf with the C form of the specifier")
+scg_an_fstring_hole_formats_through_snprintf()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var n = 42\nprint(f\"${n}%04d\")\n")
+
+    assert(out.contains("c\"%04lld\\00\""), out)
+    assert(scg_has(out, "call { ptr, ptr, i64 } @sysl.str.fmt_i(ptr @.str#, i64 %t#)"), out)
+    assert(out.contains("declare i32 @snprintf(ptr, i64, ptr, ...)"), out)
+
+@test("an unsigned integer conversion zero-extends, a signed one sign-extends")
+scg_unsigned_zero_extends_signed_sign_extends()
+    if xvr_no_library() then return
+
+    val hex = scg_ir("var n: i32 = -1\nprint(f\"${n}%x\")\n")
+    val dec = scg_ir("var n: i32 = -1\nprint(f\"${n}%d\")\n")
+
+    assert(hex.contains("c\"%llx\\00\""), hex)
+    assert(scg_has(hex, "zext i32 %t# to i64"), hex)
+    assert(dec.contains("c\"%lld\\00\""), dec)
+    assert(scg_has(dec, "sext i32 %t# to i64"), dec)
+
+@test("a float format passes the double straight through its specifier")
+scg_a_float_format_passes_the_double_through()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var x = 1.5\nprint(f\"${x}%.2f\")\n")
+
+    assert(out.contains("c\"%.2f\\00\""), out)
+    assert(scg_has(out, "call { ptr, ptr, i64 } @sysl.str.fmt_f(ptr @.str#, double %t#)"), out)
+
+@test("a string format copies a NUL-terminated argument for %s")
+scg_a_string_format_copies_a_terminated_argument()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var s = \"hi\"\nprint(f\"${s}%-8s\")\n")
+
+    assert(out.contains("c\"%-8s\\00\""), out)
+    assert(out.contains("define private { ptr, ptr, i64 } @sysl.str.fmt_s"), out)
+    assert(out.contains("call void @free(ptr %cstr)"), out)
+
+@test("snprintf is declared once even when a float str and a format share it")
+scg_snprintf_is_declared_once()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var x = 1.5\nprint(str(x), f\"${x}%.1f\")\n")
+
+    assert_eq(xvr_count(out, "declare i32 @snprintf"), 1)
+
+// The library's 64-bit integer renderers write their own digits (`digits_long`, `digits_ulong`)
+// rather than calling `snprintf`, which parsed a format string on every call. Each body is asserted
+// on its own, and the program as a whole too, since one that renders only integers needs no C
+// formatter at all.
+@test("the library's integer renderers call no snprintf")
+scg_the_librarys_integer_renderers_call_no_snprintf()
+    if xvr_no_library() then return
+
+    val out = scg_ir("import sysl.text.str_builder\n" +
+                     "\n" +
+                     "var b = str_builder()\n" +
+                     "b.push_int(-5)\n" +
+                     "b.push_uint(5)\n" +
+                     "print(b.finish())\n" +
+                     "printi(-3)\n" +
+                     "printu(3)\n" +
+                     "display_int(-7, stdout(), FormatSpec(0, -1, false))\n" +
+                     "display_uint(7, stdout(), FormatSpec(0, -1, false))\n")
+
+    for name in ["sysl.text$StrBuilder.push_int", "sysl.text$StrBuilder.push_uint", "sysl$printi",
+                 "sysl$printu", "sysl$display_int", "sysl$display_uint"]
+        val body = scg_define_of(out, name)
+
+        assert(!body.is_empty(), s"$name: no definition")
+        assert(body.contains("digits_"), s"$name:\n$body")
+        assert(!body.contains("snprintf"), s"$name:\n$body")
+
+    assert(!out.contains("@snprintf"), out)
+end scg_the_librarys_integer_renderers_call_no_snprintf
