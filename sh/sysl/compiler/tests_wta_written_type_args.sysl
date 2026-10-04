@@ -1,0 +1,280 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// Type arguments written at a call head -- `f[T](x)`, `Pair[K, V](…)`, `x.m[T](…)`, `va_arg[int](ap)`
+// (`reference/generics.md § [] means type application in a type, indexing in an expression`).
+//
+// The list and a subscript are one grammar, so `f[T](x)` and `handlers[i](x)` are the same nodes and
+// the parser cannot tell a type argument from an index. Name resolution settles it: a function is
+// not a thing that can be indexed, so where the head resolves to a declaration and nothing nearer,
+// there is no second reading of the brackets to protect. What earned the form is a signature neither
+// direction of inference reaches -- a `[const W: usize]` kernel over slices answering `unit` names its
+// width nowhere a call could read it. Every expected output and message is the reference's own.
+
+private wta_says(text: string, part: string) -> bool = text.contains(part)
+
+// -- a free function -------------------------------------------------------------------------------
+
+@test("takes its type argument written out")
+wta_a_free_function_takes_its_type_argument()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("id[T](x: T) -> T = x\nprint(id[int](3), id[string](\"s\"))\n"), "3 s\n")
+
+// What is written settles the instantiation rather than being checked against what the arguments
+// would have said: a bare `3` lands in whichever copy the brackets named.
+@test("and the written argument is what the copy is chosen by")
+wta_the_written_argument_chooses_the_copy()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("width[T](x: T) -> usize = sizeof(T)\n" +
+                      "print(width[u8](3), width[i64](3), width[real](1.0))\n"), "1 8 8\n")
+
+@test("a value parameter is written the same way")
+wta_a_value_parameter_is_written_the_same_way()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("chunk[const N: usize]() -> usize = N\nprint(chunk[4](), chunk[8]())\n"), "4 8\n")
+
+// The class this was built for: every parameter a slice and the result `unit`, so `W` is in neither
+// direction of inference. Twelve is three runs at four lanes and one at eight, so the tail the wider
+// instantiation leaves says the two bodies are different code rather than one guessed width.
+private wta_kernel() -> string = raw"""
+    add[const W: usize](a: []const f32, b: []const f32, out: []f32)
+        var i: usize = 0
+        while i + W <= a.len
+            val l: <W>f32 = a.load(i)
+            val r: <W>f32 = b.load(i)
+            out.store(i, l + r)
+            i += W
+
+    val xs: [12]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    val ys: [12]f32 = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0]
+    var four: [12]f32
+    var eight: [12]f32
+
+    add[4](xs[..], ys[..], four[..])
+    add[8](xs[..], ys[..], eight[..])
+    print(four[0], four[11], eight[7], eight[11])
+    """
+
+@test("a width-generic kernel with nothing but slices is callable")
+wta_a_width_generic_kernel_is_callable()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(wta_kernel()), "11 132 88 0\n")
+
+// A parameter used only inside the body: well-formed, and uncallable without the brackets.
+private wta_width_trait() -> string = raw"""
+    trait Width
+        bits() -> usize
+
+    impl Width for u32
+        bits() -> usize = 32
+
+    impl Width for u8
+        bits() -> usize = 8
+
+    describe[T: Width]() -> usize = T.bits()
+    print(describe[u32](), describe[u8]())
+    """
+
+@test("so is one whose parameter appears only in its body")
+wta_a_parameter_only_in_the_body()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(wta_width_trait()), "32 8\n")
+
+// Written out is not written out of the bounds: the body was compiled against them.
+@test("a bound is checked on what was written")
+wta_a_bound_is_checked_on_what_was_written()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Plain\n    n: int\n\nshow[T: Display](x: T) -> string = str(x)\n" +
+                       "var p = Plain(1)\nprint(show[Plain](p))\n")
+
+    assert(wta_says(said, "'show' requires its type parameter 'T' to implement 'sysl.Display', " +
+                          "but Plain does not"), said)
+
+@test("the count has to match")
+wta_the_count_has_to_match()
+    if !enm_ready() then return
+
+    val said = enm_err("id[T](x: T) -> T = x\nprint(id[int, string](3))\n")
+
+    assert(wta_says(said, "'id' takes 1 type argument ('T'), and 2 were written"), said)
+
+// A function cannot be indexed, so the sentence is about type arguments rather than callables.
+@test("a function that is not generic says so")
+wta_a_function_that_is_not_generic()
+    if !enm_ready() then return
+
+    val said = enm_err("plain(x: int) -> int = x\nprint(plain[int](3))\n")
+
+    assert(wta_says(said, "'plain' is not generic, so it has no type arguments to write — the call " +
+                          "is 'plain(…)'"), said)
+
+// What is indexed here is the local, and its author never wrote a type argument.
+@test("a local shadowing the name keeps the subscript")
+wta_a_local_shadowing_the_name()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("id[T](x: T) -> T = x\nvar id: []*extern(int) -> int = [&double]\n" +
+                      "double(n: int) -> int = n * 2\nprint(id[0](3))\n"), "6\n")
+
+// The brackets read the expression grammar, so a slice fails in the parser.
+@test("a type the expression grammar cannot spell is refused")
+wta_a_slice_cannot_be_spelled()
+    if !enm_ready() then return
+
+    val said = enm_err("count[T](xs: []T) -> usize = xs.len\nvar ns: [3]int = [1, 2, 3]\n" +
+                       "print(count[[]int](ns[..]))\n")
+
+    assert(wta_says(said, "']' expected"), said)
+
+@test("a vector is one of them, and the annotation still reaches it")
+wta_a_vector_cannot_be_spelled()
+    if !enm_ready() then return
+
+    val said = enm_err("first[T](v: T) -> T = v\nprint(first[<4>f32](1.0))\n")
+
+    assert(wta_says(said, "expression expected"), said)
+
+// -- a special form ----------------------------------------------------------------------------------
+
+private wta_sum() -> string = raw"""
+    sum(n: int, ...) -> int
+        var ap: va_list
+        var total = 0
+        va_start(ap)
+        for i in 0..<n
+            total += va_arg[int](&ap)
+        va_end(ap)
+        total
+    end sum
+    print(sum(3, 10, 20, 30))
+    """
+
+@test("va_arg reads the type written on it")
+wta_va_arg_reads_the_written_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(wta_sum()), "60\n")
+
+@test("and a form that has no type to be told is told that")
+wta_a_form_with_no_type_to_be_told()
+    if !enm_ready() then return
+
+    val said = enm_err("print[int](1)")
+
+    assert(wta_says(said, "'print' takes no type arguments"), said)
+
+// -- a constructor -----------------------------------------------------------------------------------
+
+@test("takes the arguments written on the type's name")
+wta_a_constructor_takes_the_written_arguments()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Pair[K, V]\n    key: K\n    value: V\n\n" +
+                      "var p = Pair[int, real](1, 2.5)\nprint(p.key, p.value)\n"), "1 2.5\n")
+
+// It means what the annotation means: the fields are checked against the written instantiation.
+@test("and the fields are checked against it")
+wta_the_fields_are_checked_against_it()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Box[T]\n    v: T\n\nvar b = Box[real](1)\nprint(b.v)\n")
+
+    assert(wta_says(said, "'v' of 'Box[real]' is real, but int was given"), said)
+
+// A bare enum name is not a constructor, so it is owed the sentence about variants.
+@test("an enum name applied to arguments is not one")
+wta_an_enum_name_is_not_a_constructor()
+    if !enm_ready() then return
+
+    val said = enm_err("enum Maybe[T]\n    Just(v: T)\n    Nothing\n\nvar m = Maybe[int](1)\nprint(1)\n")
+
+    assert(wta_says(said, "'Maybe' is an enum, so it is not built by calling its name — a variant " +
+                          "is what carries a value, as 'Maybe[…].Name(…)'"), said)
+
+// -- a variant selected from the type ----------------------------------------------------------------
+
+@test("carries the instantiation written on the name")
+wta_a_variant_carries_the_instantiation()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("enum Maybe[T]\n    Just(v: T)\n    Nothing\n\nval m = Maybe[int].Just(3)\n" +
+                      "val n = m match\n    Just(v) -> v\n    Nothing -> 0\nprint(n)\n"), "3\n")
+
+@test("including one that carries nothing")
+wta_a_variant_carrying_nothing()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("enum Maybe[T]\n    Just(v: T)\n    Nothing\n\nval m = Maybe[string].Nothing\n" +
+                      "val n = m match\n    Just(v) -> v\n    Nothing -> \"none\"\nprint(n)\n"), "none\n")
+
+// An associated function keeps the refusal: its type's parameters and its own are solved from one
+// list, and honouring the brackets would mean fixing half of it.
+@test("an associated function is still asked for on the binding")
+wta_an_associated_function_is_still_refused()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Box[T]\n    v: T\n    of(x: T) -> Self = Box(x)\n\n" +
+                       "var b = Box[int].of(1)\nprint(b.v)\n")
+
+    assert(wta_says(said, "'Box' cannot be given type arguments where 'of' is selected from it; " +
+                          "write the type on what receives the result — 'var x: Box[…] = …' — and " +
+                          "select 'of' from the plain name"), said)
+
+// -- a method ----------------------------------------------------------------------------------------
+
+@test("takes its own type argument written out")
+wta_a_method_takes_its_own_type_argument()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Counter\n    n: int\n    pick[T](self, x: T) -> T = x\n\n" +
+                      "var c = Counter(1)\nprint(c.pick[int](3), c.pick[string](\"s\"))\n"), "3 s\n")
+
+// The receiver's parameters arrived with the value, so the list is the member's length.
+@test("on a generic receiver, only the member's own are written")
+wta_only_the_members_own_are_written()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Box[T]\n    v: T\n    tag[U](self, u: U) -> usize = sizeof(T) + sizeof(U)\n\n" +
+                      "var b = Box(1u8)\nprint(b.tag[i64](0), b.tag[u8](0))\n"), "9 2\n")
+
+// The one head where the second reading is live: a field may hold a table of callables, and asking
+// the receiver settles it -- an unrelated type's generic member of the same name does not.
+private wta_table() -> string = raw"""
+    struct Table
+        fs: [2]*extern(int) -> int
+
+    double(n: int) -> int = n * 2
+    triple(n: int) -> int = n * 3
+
+    struct Other
+        n: int
+        fs[T](self, x: T) -> T = x
+
+    var t = Table([&double, &triple])
+    print(t.fs[0](5), t.fs[1](5))
+    """
+
+@test("a field holding callables keeps its subscript")
+wta_a_field_holding_callables_keeps_its_subscript()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(wta_table()), "10 15\n")
+
+@test("a method that is not generic says so")
+wta_a_method_that_is_not_generic()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Counter\n    n: int\n    plain(self, x: int) -> int = x\n\n" +
+                       "var c = Counter(1)\nprint(c.plain[int](3))\n")
+
+    assert(wta_says(said, "'plain' is not generic, so it has no type arguments to write — the call " +
+                          "is 'plain(…)'. The arguments of Counter are the receiver's and are already " +
+                          "settled by the value it is read off"), said)
