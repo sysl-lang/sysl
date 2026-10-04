@@ -271,6 +271,12 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     home.from_trait = if call_trait then None else Some(key.unwrap())
     home.overrides = block.overrides
 
+    // **An `override` that overrides nothing is refused**, and the question is held for the reason a
+    // required trait's is: the block being replaced may be written below this one, or in a module
+    // hoisted after it, so the answer never depends on the order the files arrived in.
+    if block.overrides && ty != Unknown
+        a.tables.override_checks.push(OverrideCheck(home.label, bound, ty, span, scope))
+
     // The associated types the block supplies, in its own terms -- the same substitution the subject
     // is built under, so an argument built out of the block's parameter means one thing per
     // instantiation and the subject settles which.
@@ -567,6 +573,38 @@ check_impl_supers(a: &Analysis)
         a.fault(c.scope, c.span, s"'${c.required}' requires '$shown', so '${c.label}' has to " +
                 s"implement that too — $write")
 end check_impl_supers
+
+// Whether each block marked `override` has something to override (`reference/traits.md § override —
+// when the overlap is deliberate`), once every `impl` is registered.
+//
+// The check in the other direction from the one the keyword lifts: a library that drops or narrows
+// the implementation a program was overriding would otherwise leave the override the only one while
+// it still claims to replace something. **The type's own key is deliberately not consulted** — that
+// is where this very block is filed, so asking it would find the override overriding itself. What is
+// asked is the trait AT THESE ARGUMENTS, so a shape implementing another promise of the trait is
+// nothing to override.
+check_impl_overrides(a: &Analysis)
+    val held = a.tables.override_checks
+
+    a.tables.override_checks = buf()
+
+    for i in 0..<held.len()
+        val c = held.at(i)
+
+        if overridden(a, c.bound, c.subject, shape_owners(c.subject)) then continue
+        if overridden(a, c.bound, c.subject, blanket_owners(a, c.subject)) then continue
+
+        a.fault(c.scope, c.span, s"'${c.label}' says 'override', but nothing else implements " +
+                s"'${show_bound(a, c.bound, c.subject)}' for it — an override replaces an " +
+                "implementation that covers the type more generally, and there is none to replace")
+end check_impl_overrides
+
+// Whether one of `owners` implements `bound` for `subject`.
+private overridden(a: &Analysis, bound: Bound, subject: Type, owners: Buf[(string, Buf[Type])]) -> bool
+    for i in 0..<owners.len()
+        if impl_at(a, bound, owners.at(i).0, subject, owners.at(i).1).is_some() then return true
+
+    false
 
 // The suffix an implementation's members carry, empty for the first.
 private suffix_of(nth: usize) -> string = if nth == 1 then "" else s".$nth"
