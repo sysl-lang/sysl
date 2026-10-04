@@ -76,6 +76,35 @@ fsat_a_conversion_over_a_literal_saturates()
     assert_eq(enm_ran("val d = i32(1e30)\nprint(d, i32(1e30), u8(-1.5), u8(300.0), i8(1e10))\n"),
               "2147483647 2147483647 0 255 127\n")
 
+// The constant folder and the running program over the SAME inputs, at every width and both
+// signednesses: each pair of lines must be identical. The reference prints -1294967296 for the
+// folded `i32(3000000000.0)` where the run-time line has 2147483647.
+@test("a folded conversion and the run-time one agree at every width")
+fsat_folded_and_run_time_agree_at_every_width()
+    if !enm_ready() then return
+
+    var src = "same(x: real) -> real = x\n" +
+              "const p: real = 3000000000.0\nconst q: real = -3000000000.0\nconst h: real = 1e300\n" +
+              "const nn: real = 0.0 / 0.0\n"
+    var prints = ""
+
+    for w in ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64"]
+        src = src + s"const ${w}_p: $w = $w(3000000000.0)\nconst ${w}_q: $w = $w(-3000000000.0)\n" +
+              s"const ${w}_h: $w = $w(1e300)\nconst ${w}_n: $w = $w(0.0 / 0.0)\n"
+        prints = prints + s"print(${w}_p, ${w}_q, ${w}_h, ${w}_n)\n" +
+                 s"print($w(same(p)), $w(same(q)), $w(same(h)), $w(same(nn)))\n"
+
+    assert_eq(enm_ran(src + prints),
+              "127 -128 127 0\n127 -128 127 0\n" +
+              "255 0 255 0\n255 0 255 0\n" +
+              "32767 -32768 32767 0\n32767 -32768 32767 0\n" +
+              "65535 0 65535 0\n65535 0 65535 0\n" +
+              "2147483647 -2147483648 2147483647 0\n2147483647 -2147483648 2147483647 0\n" +
+              "3000000000 0 4294967295 0\n3000000000 0 4294967295 0\n" +
+              "3000000000 -3000000000 9223372036854775807 0\n3000000000 -3000000000 9223372036854775807 0\n" +
+              "3000000000 0 18446744073709551615 0\n3000000000 0 18446744073709551615 0\n")
+end fsat_folded_and_run_time_agree_at_every_width
+
 // The reference prints "-1 255 44" for the first line and "0 -1 -9223372036854775808 -2" for the
 // second: its constant fold wraps where the running program saturates. This asserts the run-time
 // rule.
