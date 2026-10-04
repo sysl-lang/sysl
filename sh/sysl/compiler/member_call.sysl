@@ -81,6 +81,15 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
 
     if subject.is_none() then return generic_enum_stranger(cx, span, receiver, name)
 
+    // **A constrained subtype is a type of its own and is not delegated to its base**: what it
+    // offers under its own name is the `::` surface, so a member it does not declare is told that
+    // rather than reaching the base's `zero` or `width`. An alias answers as what it names.
+    if member_at(cx.an, member_key(cx.an, subject.unwrap(), name).0, name).is_none()
+        val refused = constrained_type_call(cx, span, receiver, name, expected)
+
+        if refused.is_some() then return refused
+    end if
+
     // **The traits the WRITTEN name was bounded by.** `T.zero()` still has the `T` in it, so a body
     // whose signature asked `T` for a `Zero` reaches that trait's `zero` even where the file that
     // instantiated it imported another trait declaring one for the very same type.
@@ -133,13 +142,6 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
     val m = member_at(cx.an, found.0, picked)
 
     if m.is_none()
-        // **A constrained subtype is a type of its own and is not delegated to its base**: what it
-        // offers under its own name is the `::` surface, so a member it does not declare is told
-        // that rather than reaching the base's `zero` or `width`.
-        val refused = constrained_refusal(cx, span, receiver, name, expected)
-
-        if refused.is_some() then return refused
-
         // A receiverless member the compiler provides is reached through the type, which is exactly
         // the spelling this form is: `uint.zero()` and `u32.width()` are calls with no arguments.
         val provided = builtin_constant_read(cx, span, ty, name)
@@ -641,31 +643,6 @@ subject_named(cx: &Analyzer, receiver: Expr) -> Option[Type]
     // `Age.make()` reaches the `impl` written for `Age`.
     cx.an.tables.constrained_insts.get(key.unwrap())
 end subject_named
-
-// The refusal a constrained subtype's name gives a member it does not declare, where the name in
-// front of the dot is one; `None` for every other subject, an alias included.
-private constrained_refusal(cx: &Analyzer, span: Span, receiver: Expr, name: string,
-                            expected: Option[Type]) -> Option[TExpr]
-    val written = dotted_name_written(cx, receiver)
-
-    if written.is_none() then return None
-
-    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
-
-    if key.is_none() then return None
-
-    val decl = cx.an.tables.types.get(key.unwrap())
-
-    if decl.is_none() then return None
-
-    decl.unwrap().kind match
-        TypeOf(d) ->
-            if is_plain_alias(d) then return None
-
-            Some(constrained_member(cx, span, key.unwrap(), d, receiver, written.unwrap(), name,
-                                    expected))
-        _ -> None
-end constrained_refusal
 
 // `value.member(args)` -- a call, which is what the parentheses said.
 call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr],
