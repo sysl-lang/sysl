@@ -628,6 +628,10 @@ private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type) -> Val
         return r
 
     if op == "-"
+        // Negating the most negative fixed-point value saturates, as every fixed-point operation
+        // does, rather than wrapping back to itself.
+        if is_fixed(vector_lane_of(ty)) then return fixed_neg(e, vector_lane_of(ty), v)
+
         vector_lane_of(ty) match
             Integer(_, _, _) ->
                 underlying(ty) match
@@ -898,6 +902,28 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                             val op = if d.exclusive_hi then "<" else "<="
 
                             trap_unless(e, compare_value(e, op, wide, x, VFloat(double_bits(str(hi)))),
+                                        "within")
+                        None -> ()
+                // A fixed-point range is compared on the raw value, each end brought to the scale
+                // inward -- the smallest raw value at or above the lower end, the largest at or below
+                // the upper -- so no value outside the written range passes for one inside it.
+                Fixed(_, frac, _) ->
+                    d.lo match
+                        Some(lo) ->
+                            trap_unless(e, compare_value(e, ">=", base, v,
+                                                         VInt(fixed_bound_raw(lo, frac, FixCeil))),
+                                        "within")
+                        None -> ()
+
+                    d.hi match
+                        Some(hi) ->
+                            // `x < hi` on the reals is `raw < hi·2^F`, which over integers is
+                            // `raw < ceil(hi·2^F)`.
+                            val op = if d.exclusive_hi then "<" else "<="
+                            val mode: FixRound = if d.exclusive_hi then FixCeil else FixFloor
+
+                            trap_unless(e, compare_value(e, op, base, v,
+                                                         VInt(fixed_bound_raw(hi, frac, mode))),
                                         "within")
                         None -> ()
                 _ ->
@@ -1290,6 +1316,9 @@ convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
 
     val ut = underlying(to)
 
+    // Every conversion into or out of a fixed-point type rescales, rounds and saturates.
+    if is_fixed(from) || is_fixed(ut) then return fixed_convert(e, underlying(from), ut, v)
+
     (from, ut) match
         (Integer(a_bits, a_signed, _), Integer(b_bits, _, _)) ->
             convert_int(e, a_bits, a_signed, b_bits, v)
@@ -1404,6 +1433,7 @@ zero_of(e: *Emit, ty: Type) -> Val
 
     underlying(ty) match
         Integer(_, _, _) -> VInt(from_int(0))
+        Fixed(_, _, _) -> VInt(from_int(0))
         Floating(_, _) -> v_float(0.0)
         Char -> VInt(from_int(0))
         Bool -> VInt(from_int(0))

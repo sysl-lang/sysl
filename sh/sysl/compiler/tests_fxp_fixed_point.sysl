@@ -1,0 +1,575 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, exists}
+import sysl.process.capture
+
+// Fixed-point numbers, stage 1 of the design the user approved (2026-10-04): the `iWqF`/`uWqF`
+// family and its three aliases, literals converted exactly and range-checked while compiling and
+// laid down as constant data, same-format `+ - * /` saturating and rounding, the conversions, the
+// comparisons, `Min`/`Max`/`Small`/`Bits`, `.bits`, rendering, and `within` on a fixed base.
+//
+// **The reference compiler (0.0.162) has no fixed-point type at all**, so nothing here was read out
+// of it: every expected value is the approved design's, worked out exactly -- a raw value is the
+// exact rational the literal spells times 2^F, rounded once -- and every refusal is this compiler's
+// own wording. That is the expected state for a language feature built in the self-hosted compiler
+// first, not a divergence.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private fxp_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end fxp_ready
+
+// A fresh directory with `main.sysl` in it, named by its normalized path.
+private fxp_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-fxp").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end fxp_root
+
+// What a one-file program prints and the status it exits with -- or why it did not build, with the
+// directory written as `@`, and `-1`.
+private fxp_ran(text: string) -> (string, int)
+    val root = fxp_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return (said, -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> out.status match
+            Exited(code) -> (out.text, code)
+            _ -> (out.text, -2)
+end fxp_ran
+
+private fxp_prints(text: string, expected: string)
+    if !fxp_ready() then return
+
+    val ran = fxp_ran(text)
+
+    assert_eq(ran.0, expected)
+    assert_eq(ran.1, 0)
+end fxp_prints
+
+// A program that built and then stopped: a trap is `128 + n`, so it is neither `0` nor a refusal.
+private fxp_traps(text: string)
+    if !fxp_ready() then return
+
+    val ran = fxp_ran(text)
+
+    assert(ran.1 != -1, ran.0)
+    assert(ran.1 != 0, ran.0)
+end fxp_traps
+
+// Everything a one-file program has to say for itself through the lowering, with the directory
+// written as `@`; the LLVM text where it had nothing to say.
+private fxp_lowered(text: string, target: Option[string]) -> (string, string)
+    val root = fxp_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", target) match
+        Err(why) -> (replace_all(failure_text(why), root, "@"), "")
+        Ok(made) ->
+            if made.report.is_empty() then ("", made.text)
+            else (replace_all(analysis_report(made.report), root, "@"), "")
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fxp_lowered
+
+// A refusal: the whole message, and the place it points at.
+private fxp_refused(text: string, message: string, at: string)
+    if !fxp_ready() then return
+
+    val said = fxp_lowered(text, None).0
+
+    assert(said.contains(s"error: $message\n --> @/main.sysl:$at\n"), said)
+end fxp_refused
+
+private fxp_ir(text: string) -> string
+    val out = fxp_lowered(text, None)
+
+    assert_eq(out.0, "")
+    out.1
+end fxp_ir
+
+// -- the family -----------------------------------------------------------------------------------
+
+@test("the three aliases are the formats they abbreviate")
+fxp_aliases_are_their_formats()
+    fxp_prints(raw"""
+        val a: q31 = 0.5
+        val b: i32q31 = a
+        val c: q15 = 0.5
+        val d: i16q15 = c
+        val e: q7 = 0.5
+        val f: i8q7 = e
+        print(b.bits, d.bits, f.bits)
+        """, "1073741824 16384 64\n")
+
+@test("a width and fraction of any size resolve, unsigned and F = W included")
+fxp_any_width_and_fraction_resolve()
+    fxp_prints(raw"""
+        val a: u32q32 = 0.5
+        val b: i64q62 = 1.5
+        val c: i8q8 = 0.25
+        val d: u8q1 = 100.5
+        val e: i24q23 = -0.5
+        print(a.bits, b.bits, c.bits, d.bits, e.bits)
+        """, "2147483648 6917529027641081856 64 201 -4194304\n")
+
+@test("a fraction of zero is the integer, and says so")
+fxp_fraction_of_zero_is_refused()
+    fxp_refused("var x: i32q0 = 0\n", "'i32q0' has no fractional bits — that is 'i32'", "1:8")
+
+@test("more fraction than storage is refused, naming the finest format of that width")
+fxp_fraction_past_the_width_is_refused()
+    fxp_refused("var x: i16q17 = 0\n",
+                "'i16q17' has more fractional bits than its 16 bits of storage — a fixed-point " +
+                "type's fraction is 1 to its width, so the finest is 'i16q16'", "1:8")
+
+@test("a leading zero says how the type is written plainly")
+fxp_leading_zero_is_refused()
+    fxp_refused("var x: i032q31 = 0\n",
+                "'i032q31' has a leading zero — a fixed-point type is written plainly, as 'i32q31'",
+                "1:8")
+    fxp_refused("var x: i32q015 = 0\n",
+                "'i32q015' has a leading zero — a fixed-point type is written plainly, as 'i32q15'",
+                "1:8")
+
+@test("a width of zero has no bits")
+fxp_zero_width_is_refused()
+    fxp_refused("var x: i0q1 = 0\n", "'i0q1' has no bits — the width families start at 1", "1:8")
+
+@test("a float has no fixed-point family, so the shape is an ordinary unknown name")
+fxp_no_float_family()
+    fxp_refused("var x: f32q8 = 0\n", "unknown type 'f32q8'", "1:8")
+
+// -- literals: exact, range-checked, constant -----------------------------------------------------
+
+@test("a literal is the nearest raw value to the exact decimal")
+fxp_literal_is_nearest()
+    fxp_prints(raw"""
+        val a: q31 = 0.6
+        val b: q15 = 0.6
+        val c: i32q16 = 0.6
+        val d: q31 = -1.0
+        val e: q31 = 5e-1
+        print(a.bits, b.bits, c.bits, d.bits, e.bits)
+        """, "1288490189 19661 39322 -2147483648 1073741824\n")
+
+// `0.1` read through a double is 0.1000000000000000055511151231257827, which at 2^62 is
+// ...816; the decimal itself is ...790.4, so ...790 is the only answer an exact reading gives.
+@test("a literal is read from its text, not through a double, where the format is finer than one")
+fxp_literal_is_not_through_a_double()
+    fxp_prints("val x: i64q62 = 0.1\nprint(x.bits)\n", "461168601842738790\n")
+
+// At `i8q1` the step is a half, so a quarter sits exactly between two raw values.
+@test("a literal exactly between two raw values takes the even one")
+fxp_literal_ties_to_even()
+    fxp_prints(raw"""
+        val a: i8q1 = 0.25
+        val b: i8q1 = 0.75
+        val c: i8q1 = -0.25
+        val d: i8q1 = -0.75
+        print(a.bits, b.bits, c.bits, d.bits)
+        """, "0 2 0 -2\n")
+
+@test("a whole number at a fixed-point type is that value")
+fxp_integer_literal_is_its_value()
+    fxp_prints("val y: i32q16 = 3\nval z: i32q16 = -2\nprint(y.bits, z.bits)\n", "196608 -131072\n")
+
+@test("a suffix names the format")
+fxp_suffixed_literal()
+    fxp_prints("print((0.6i32q31).bits, (1i32q16).bits, (0.25u8q8).bits)\n", "1288490189 65536 64\n")
+
+@test("a literal past the top of the range is refused, naming the range and the largest value")
+fxp_literal_above_the_range()
+    fxp_refused("val x: q31 = 1.0\nprint(x)\n",
+                "the literal 1.0 does not fit q31, whose range is -1 to 0.9999999995; the largest " +
+                "value is 'q31::Max'", "1:14")
+
+@test("one past the bottom is refused, naming the smallest value")
+fxp_literal_below_the_range()
+    fxp_refused("val x: q15 = -1.5\nprint(x)\n",
+                "the literal -1.5 does not fit q15, whose range is -1 to 0.99997; the smallest " +
+                "value is 'q15::Min'", "1:14")
+
+@test("an unsigned format refuses a negative literal")
+fxp_unsigned_refuses_negative()
+    fxp_refused("val x: u8q8 = -0.5\nprint(x)\n",
+                "the literal -0.5 does not fit u8q8, whose range is 0 to 0.996; the smallest value " +
+                "is 'u8q8::Min'", "1:15")
+
+@test("a literal that rounds past the end is refused, though it was written inside it")
+fxp_literal_rounding_past_the_end()
+    fxp_refused("val x: q31 = 0.99999999999\nprint(x)\n",
+                "the literal 0.99999999999 does not fit q31, whose range is -1 to 0.9999999995; the " +
+                "largest value is 'q31::Max'", "1:14")
+
+@test("a whole number past the range is refused the same way")
+fxp_integer_literal_out_of_range()
+    fxp_refused("val x: q31 = 2\nprint(x)\n",
+                "the literal 2 does not fit q31, whose range is -1 to 0.9999999995; the largest " +
+                "value is 'q31::Max'", "1:14")
+
+@test("a suffixed literal is held to its own format's range")
+fxp_suffixed_literal_out_of_range()
+    fxp_refused("print(1.5i32q31)\n",
+                "the literal 1.5 does not fit q31, whose range is -1 to 0.9999999995; the largest " +
+                "value is 'q31::Max'", "1:7")
+
+@test("a fixed-point literal is laid into the object file, with no initializer")
+fxp_literal_is_constant_data()
+    if !fxp_ready() then return
+
+    val out = fxp_ir("static val X: q31 = 0.6\nprint(X)\n")
+
+    assert(out.contains("@X = private constant i32 1288490189"), out)
+    assert(!out.contains("@X = private global"), out)
+
+@test("so is an array of them, the attributes included")
+fxp_array_is_constant_data()
+    if !fxp_ready() then return
+
+    val out = fxp_ir("static val T: [3]q15 = [0.5, -0.25, q15::Max]\nprint(T[1])\n")
+
+    assert(out.contains("@T = private constant [3 x i16] [i16 16384, i16 -8192, i16 32767]"), out)
+
+@test("and a conversion call over a literal, folded with the conversion's own rounding")
+fxp_conversion_call_is_constant_data()
+    if !fxp_ready() then return
+
+    val out = fxp_ir("static val C: q31 = q31(0.6)\nstatic val S: q31 = q31(3)\nprint(C, S)\n")
+
+    assert(out.contains("@C = private constant i32 1288490189"), out)
+    assert(out.contains("@S = private constant i32 2147483647"), out)
+
+@test("and a struct built over fixed-point literals")
+fxp_struct_is_constant_data()
+    if !fxp_ready() then return
+
+    val out = fxp_ir(raw"""
+        struct Segment
+            coeff: q31
+            base: q31
+
+        static val S: Segment = Segment(0.5, 0.25)
+        print(S.coeff)
+        """)
+
+    assert(out.contains("@S = private constant"), out)
+    assert(out.contains("i32 1073741824, i32 536870912"), out)
+    assert(!out.contains("@S = private global"), out)
+
+// -- the operations -------------------------------------------------------------------------------
+
+@test("a value prints as the shortest decimal that reads back as it")
+fxp_prints_shortest_decimal()
+    fxp_prints(raw"""
+        val a: q31 = 0.6
+        val b: i32q16 = 3
+        val c: u32q32 = 0.5
+        val d: q15 = -0.25
+        print(a, q31::Max, q31::Min, q31::Small, b, c, d)
+        print("${a} and ${q15::Max}")
+        """, "0.6 0.9999999995 -1 0.0000000005 3 0.5 -0.25\n0.6 and 0.99997\n")
+
+@test("addition and subtraction saturate at both ends")
+fxp_add_sub_saturate()
+    fxp_prints(raw"""
+        var a: q31 = 0.75
+        var b: q31 = 0.5
+        var c: q31 = -0.75
+        print(a + b, c - b, a - b, (a + b).bits, (c - b).bits)
+        """, "0.9999999995 -1 0.25 2147483647 -2147483648\n")
+
+@test("an unsigned format saturates at zero")
+fxp_unsigned_saturates_at_zero()
+    fxp_prints("var a: u8q8 = 0.25\nvar b: u8q8 = 0.5\nprint((a - b).bits, (b + b + b).bits)\n",
+               "0 255\n")
+
+@test("negation saturates where the minimum has no positive twin")
+fxp_negation_saturates()
+    fxp_prints("var m = q31::Min\nvar h: q31 = 0.5\nprint((-m).bits, -h)\n", "2147483647 -0.5\n")
+
+@test("a product rounds to nearest, a half going up")
+fxp_product_rounds()
+    fxp_prints(raw"""
+        var a = q15::Bits(3)
+        var b = q15::Bits(16384)
+        var c = q15::Bits(-3)
+        var h: q15 = 0.5
+        print((a * b).bits, (c * b).bits, h * h)
+        """, "2 -1 0.25\n")
+
+@test("a product saturates where the true one is out of range")
+fxp_product_saturates()
+    fxp_prints("var m = q31::Min\nprint((m * m).bits)\n", "2147483647\n")
+
+@test("an unsigned product at the top of its width is not read as negative")
+fxp_unsigned_product()
+    fxp_prints("var a = u8q8::Max\nprint((a * a).bits)\n", "254\n")
+
+@test("a quotient rounds to nearest, a half going up, whatever the signs")
+fxp_quotient_rounds()
+    fxp_prints(raw"""
+        var one = q15::Bits(1)
+        var three = q15::Bits(3)
+        var minus = q15::Bits(-1)
+        var p = i8q1::Bits(1)
+        var n = i8q1::Bits(-1)
+        var four = i8q1::Bits(4)
+        var neg_four = i8q1::Bits(-4)
+        print((one / three).bits, (minus / three).bits, (p / four).bits, (n / four).bits,
+              (p / neg_four).bits)
+        """, "10923 -10923 1 0 0\n")
+
+@test("a quotient saturates")
+fxp_quotient_saturates()
+    fxp_prints("var a: q15 = 0.5\nvar b: q15 = 0.25\nvar c: q15 = -0.25\nprint((a / b).bits, (a / c).bits, b / a)\n",
+               "32767 -32768 0.5\n")
+
+@test("an unsigned quotient where the fraction fills the width")
+fxp_unsigned_quotient()
+    fxp_prints("var a: u8q8 = 0.25\nvar b: u8q8 = 0.5\nprint((a / b).bits, (b / a).bits)\n", "128 255\n")
+
+@test("dividing by zero traps, as integer division does")
+fxp_divide_by_zero_traps()
+    fxp_traps("var a: q31 = 0.5\nvar z: q31 = 0.0\nprint(a / z)\n")
+
+@test("a compound assignment saturates too")
+fxp_compound_assignment()
+    fxp_prints("var acc: q31 = 0.5\nacc += 0.75\nacc *= 0.5\nprint(acc.bits)\n", "1073741824\n")
+
+@test("comparisons are on the value")
+fxp_comparisons()
+    fxp_prints(raw"""
+        var a: q31 = -0.5
+        var b: q31 = 0.25
+        var u: u8q8 = 0.75
+        var v: u8q8 = 0.5
+        print(a < b, a == b, b >= a, a != b, u > v, 0.25 == b)
+        """, "true false true true true true\n")
+
+// -- conversions ----------------------------------------------------------------------------------
+
+@test("a float converts to the nearest raw value, a half going up, saturating and NaN to zero")
+fxp_float_to_fixed()
+    fxp_prints(raw"""
+        var f = 0.6
+        var big = 2.0
+        var small = -3.0
+        var nan = 0.0 / 0.0
+        var q = 0.25
+        var mq = -0.25
+        var tq = -0.75
+        print(q31(f).bits, q31(big).bits, q31(small).bits, q31(nan).bits, i8q1(q).bits,
+              i8q1(mq).bits, i8q1(tq).bits)
+        """, "1288490189 2147483647 -2147483648 0 1 0 -1\n")
+
+@test("a fixed-point value converts to a float exactly where the float can hold it")
+fxp_fixed_to_float()
+    fxp_prints(raw"""
+        var m = q31::Min
+        var h: q15 = -0.25
+        var s = q31::Small
+        print(real(m), f32(h), real(s) * 2147483648.0)
+        """, "-1 -0.25 1\n")
+
+@test("one format converts to another, rounding and saturating")
+fxp_fixed_to_fixed()
+    fxp_prints(raw"""
+        var a: q31 = 0.6
+        var b: q15 = 0.6
+        var c: i32q16 = 3.5
+        print(q15(a).bits, q31(b).bits, q15(c).bits, i32q16(a).bits, u8q8(q31::Min).bits)
+        """, "19661 1288503296 32767 39322 0\n")
+
+@test("an integer converts to its value, saturating")
+fxp_integer_to_fixed()
+    fxp_prints("var n = 3\nvar m = -40000\nprint(i32q16(n).bits, q31(n).bits, i32q16(m).bits)\n",
+               "196608 2147483647 -2147483648\n")
+
+@test("a fixed-point value converts to an integer toward zero, saturating")
+fxp_fixed_to_integer()
+    fxp_prints(raw"""
+        var a: i32q16 = -2.75
+        var b: i32q16 = 2.75
+        var c: i32q16 = 300.5
+        print(int(a), int(b), i8(c), u8(a))
+        """, "-2 2 127 0\n")
+
+@test("a fixed-point value and a float do not mix without a conversion")
+fxp_no_implicit_float_mixing()
+    fxp_refused("var a: q31 = 0.5\nvar f = 0.5\nprint(a + f)\n",
+                "'+' needs matching types, got q31 and real", "3:11")
+
+@test("two formats do not mix without a conversion")
+fxp_no_format_mixing()
+    fxp_refused("var a: q31 = 0.5\nvar b: q15 = 0.5\nprint(a + b)\n",
+                "'+' needs matching types, got q31 and q15", "3:11")
+
+// -- attributes and bits --------------------------------------------------------------------------
+
+@test("the attributes are raw values at the type")
+fxp_attributes()
+    fxp_prints(raw"""
+        print(q31::Min.bits, q31::Max.bits, q31::Small.bits, u8q8::Max.bits, u8q8::Min.bits)
+        print(i32q16::Bits(98304), q15::Bits(-16384))
+        """, "-2147483648 2147483647 1 255 0\n1.5 -0.5\n")
+
+@test("'Bits' takes the integer the format is stored as")
+fxp_bits_takes_the_storage()
+    fxp_refused("var n: i64 = 5\nprint(q31::Bits(n))\n",
+                "'q31::Bits' takes the int a q31 is stored as, not long", "2:17")
+
+@test("an attribute a fixed-point type does not have is refused, naming the ones it does")
+fxp_unknown_attribute()
+    fxp_refused("print(q31::First)\n",
+                "'q31' has no attribute 'First' — a fixed-point type answers 'q31::Min', " +
+                "'q31::Max', 'q31::Small' and 'q31::Bits'", "1:7")
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("remainder and the bit operators are not defined; the bits are '.bits'")
+fxp_bit_operators_refused()
+    fxp_refused("var a: q31 = 0.5\nprint(a % a)\n", "operator '%' is not defined for q31", "2:7")
+    fxp_refused("var a: q31 = 0.5\nprint(a & a)\n", "operator '&' is not defined for q31", "2:7")
+
+@test("an unsigned format has no negation")
+fxp_unsigned_negation_refused()
+    fxp_refused("var a: u8q8 = 0.5\nprint(-a)\n", "unary '-' is not defined for the unsigned type u8q8",
+                "2:7")
+
+@test("a constant at a fixed-point type is pointed at 'val'")
+fxp_const_refused()
+    fxp_refused("const X: q31 = 0.5\nprint(X)\n",
+                "a constant is folded as an integer or a real, and q31 is fixed-point — write 'X' as " +
+                "a 'val', which is laid into the object file as constant data", "1:1")
+
+// -- a range on a fixed-point base ----------------------------------------------------------------
+
+@test("'within' on a fixed-point base admits a value inside it")
+fxp_within_admits()
+    fxp_prints("type Gain = i32q27 within 0.0..8.0\nval g: Gain = 4.0\nval h = Gain(0.5)\nprint(g, h)\n",
+               "4 0.5\n")
+
+@test("and traps on one outside it")
+fxp_within_traps()
+    fxp_traps("type Gain = i32q27 within 0.0..8.0\nvar x: i32q27 = 9.0\nval g = Gain(x)\nprint(g)\n")
+
+@test("an exclusive end is exclusive at the raw value")
+fxp_within_exclusive_end()
+    fxp_traps("type Half = q31 within 0.0..<0.5\nvar x: q31 = 0.5\nval u = Half(x)\nprint(u)\n")
+
+@test("a bound outside the format is refused where the range is declared")
+fxp_within_bound_outside()
+    fxp_refused("type Big = q15 within 0.0..2.0\nval b: Big = 0.5\nprint(b)\n",
+                "the bound 2 does not fit q15", "1:1")
+
+// -- a board ----------------------------------------------------------------------------------------
+
+// musicbox's case, as the proposal's §7.6 writes it after the migration: module storage built from
+// fixed-point literals and read by an exported function, archived for a Cortex-M0+ -- which has no
+// loader, so an initializer would be refused rather than run.
+private fxp_box_module() -> string = raw"""
+    module box
+
+    val X: q31 = 0.6
+    val PEAK: q31 = q31::Max
+    val TABLE: [3]q31 = [0.5, -0.25, 0.125]
+
+    struct Segment
+        coeff: q31
+        base: q31
+
+        apply(self, level: q31) -> q31 = level * self.coeff + self.base
+
+    val SEG: Segment = Segment(0.5, 0.25)
+
+    @export("box_level")
+    level(i: i32) -> i32 = (SEG.apply(X) + TABLE[i] - PEAK).bits
+    """
+
+private fxp_box_main() -> string = raw"""
+    import box
+
+    @export("main")
+    boot() -> i32 = box.level(0)
+    """
+
+private fxp_board() -> string =
+    "targets {\n  default = \"thumbv6m-freestanding\"\n" +
+    "  thumbv6m-freestanding { capabilities { os = false, posix = false } }\n}\n"
+
+private fxp_board_root() -> string
+    val root = replace_all(make_temp_dir("sysl-fxp-board").unwrap(), "//", "/")
+
+    make_dir_all(s"$root/box").unwrap()
+    write_text(s"$root/package.hocon", fxp_board()).unwrap()
+    write_text(s"$root/box/box.sysl", fxp_box_module()).unwrap()
+    write_text(s"$root/main.sysl", fxp_box_main()).unwrap()
+    root
+end fxp_board_root
+
+private fxp_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end fxp_cli
+
+@test("musicbox's module storage is constant data for a Cortex-M0+")
+fxp_board_storage_is_constant_data()
+    if !fxp_ready() then return
+
+    val root = fxp_board_root()
+    val got = fxp_cli(["sysl", "emit-llvm", root, "--target", "thumbv6m-freestanding"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, Fine, got.1)
+    assert(got.1.contains("@box$X = private constant i32 1288490189"), got.1)
+    assert(got.1.contains("@box$PEAK = private constant i32 2147483647"), got.1)
+    assert(got.1.contains("@box$TABLE = private constant [3 x i32] [i32 1073741824, i32 -536870912, " +
+                          "i32 268435456]"), got.1)
+    assert(!got.1.contains("@box$X = private global"), got.1)
+
+@test("and 'build-c' archives it for the board")
+fxp_board_build_c()
+    if !fxp_ready() then return
+    if find_backend_clang(target_named("thumbv6m-freestanding").unwrap()).is_err() then return
+
+    val root = fxp_board_root()
+    val got = fxp_cli(["sysl", "build-c", root, "--target", "thumbv6m-freestanding", "-o", s"$root/app.a"])
+    val made = exists(s"$root/app.a")
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, Fine, got.1)
+    assert(made, got.1)

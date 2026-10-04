@@ -64,6 +64,9 @@ arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val) -> Val
         Vector(_, elem) -> underlying(*elem)
         other -> other
 
+    // A fixed-point operation saturates and rescales, which no single instruction does.
+    if is_fixed(lane) then return fixed_arith(e, op, lane, lv, rv)
+
     val ety = lty(e, ty)
 
     val instr = lane match
@@ -261,6 +264,9 @@ int_pred(e: *Emit, op: string, ty: Type) -> ICmp = ty match
     Char -> unsigned_pred(e, op)
     Integer(_, false, _) -> unsigned_pred(e, op)
     Integer(_, true, _) -> signed_pred(e, op)
+    // A fixed-point value compares as the integer it is stored as: one scale on both sides.
+    Fixed(_, _, false) -> unsigned_pred(e, op)
+    Fixed(_, _, true) -> signed_pred(e, op)
     other ->
         gap_here(e, s"compare on ${type_show(other)}")
         IEq
@@ -509,6 +515,11 @@ gen_int_op(e: *Emit, op: string, operand: TExpr, amount: Option[TExpr], width: T
     val ll = lty(e, width)
 
     op match
+        // `x.bits` and `T::Bits(n)`: a fixed-point value and the integer it is stored as are the same
+        // bits at the same width, so the reinterpretation is no instruction at all.
+        "fixed_bits" -> v
+        "fixed_from_bits" -> v
+
         // `x < 0 ? -x : x`, and the negation is the wrapping one the language's own `-` is -- so at
         // the most negative value both answer that value, rather than the member disagreeing with
         // the operator beside it.

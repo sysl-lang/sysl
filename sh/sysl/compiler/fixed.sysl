@@ -1,0 +1,423 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, negate, cmp as big_cmp, add as big_add, sub as big_sub,
+                         mul as big_mul, pow as big_pow, div_rem_floor, to_string, is_odd}
+import sysl.math.decimal.Decimal
+import sysl.text.{str_builder, StrBuilder}
+
+// Fixed-point numbers: `iWqF` and `uWqF`, a `W`-bit integer counting units of 2^-F.
+//
+// **A fixed-point value is held as its raw integer everywhere below the type.** A literal's
+// conversion happens here, exactly, while compiling, and what the typed tree carries is
+// `TIntLit(raw, Fixed(..))` -- so a module `val` initialized by one is constant data laid into the
+// object file with nothing new to emit, and so are arrays and constructors over such literals.
+//
+// **A literal is converted from its text, never through a `double`**: `i64q62` holds more precision
+// than a double has, and `0.1` read through one would already be the wrong number before the
+// rounding below ever saw it. The value is the exact rational the digits spell, rounded once to the
+// nearest representable value, ties to even -- and one outside the type's range is a compile error,
+// as `var x: u8 = 300` is.
+
+// -- the shape of the name -------------------------------------------------------------------------
+
+// Where the `q` of an `iWqF`/`uWqF` spelling is, when the name has that shape: the family letter,
+// digits, one `q`, digits, and nothing else. A float has no fixed-point family, so `f32q8` is not
+// the shape and falls to the ordinary "unknown type".
+fixed_q_at(name: string) -> Option[usize]
+    val b = name.bytes
+
+    if b.len < 4 then return None
+    if b[0] != u8('i') && b[0] != u8('u') then return None
+
+    var q: usize = 0
+
+    for i in 1..<b.len
+        if b[i] == u8('q')
+            if q != 0 then return None
+
+            q = i
+        else if b[i] < u8('0') || b[i] > u8('9') then
+            return None
+
+    if q < 2 || q + 1 >= b.len then return None
+
+    Some(q)
+end fixed_q_at
+
+// Whether a literal suffix names a fixed-point type. The lexer asks this, since a suffixed fixed
+// literal is the one integer-family suffix a fraction may carry.
+fixed_suffix(w: string) -> bool = fixed_q_at(w).is_some()
+
+// The fixed-point type a position asks for, seen through a vector, a qualifier and a transparent
+// subtype exactly as an integer literal's is.
+fixed_wanted(expected: Option[Type]) -> Option[Type]
+    if expected.is_none() then return None
+
+    scalar_wanted(expected.unwrap()) match
+        Fixed(b, f, s) -> Some(Fixed(b, f, s))
+        _ -> None
+end fixed_wanted
+
+// Whether a type computes as a fixed-point number, through any subtype over one.
+is_fixed(t: Type) -> bool = underlying(t) match
+    Fixed(_, _, _) -> true
+    _ -> false
+
+// The integer a fixed-point type is stored as: the same width and signedness.
+fixed_storage(t: Type) -> Type = underlying(t) match
+    Fixed(bits, _, signed) -> Integer(bits, signed, false)
+    other -> other
+
+// The name a type is written with: the three CMSIS aliases where one fits, else `iWqF`.
+fixed_show(bits: int, frac: int, signed: bool) -> string
+    if signed && frac == bits - 1 && (bits == 8 || bits == 16 || bits == 32) then return s"q$frac"
+
+    fixed_canonical(bits, frac, signed)
+end fixed_show
+
+// The spelling with no alias in it, which is what a fixed-point type is mangled under.
+fixed_canonical(bits: int, frac: int, signed: bool) -> string =
+    s"${if signed then "i" else "u"}${bits}q$frac"
+
+// -- the range a format holds ----------------------------------------------------------------------
+
+// The smallest raw value of a format.
+fixed_min_raw(bits: int, signed: bool) -> BigInt = min_of(bits, signed)
+
+// The largest raw value of a format.
+fixed_max_raw(bits: int, signed: bool) -> BigInt = max_of(bits, signed)
+
+// The raw value one unit of 2^-F stands for -- `T::Small`.
+fixed_small_raw() -> BigInt = from_int(1)
+
+// -- exact values ----------------------------------------------------------------------------------
+
+// How a value between two representable ones is settled. A literal rounds to nearest with ties to
+// even, which is what a decimal written in source has always meant; an operation and a conversion
+// at run time round to nearest with ties toward +inf (add half, shift), and a bound rounds inward.
+enum FixRound
+    FixNearestEven
+    FixNearestUp
+    FixFloor
+    FixCeil
+
+// A decimal number as `coef × 10^exp`, read from the canonical text the lexer gives a literal --
+// an optional sign, digits, an optional `.` and digits, an optional `e`, sign and digits. Nothing
+// else is accepted, since nothing else reaches here.
+exact_of_text(text: string) -> Option[(BigInt, int)]
+    val b = text.bytes
+    var i: usize = 0
+    var minus = false
+
+    if i < b.len && (b[i] == u8('-') || b[i] == u8('+'))
+        minus = b[i] == u8('-')
+        i += 1
+
+    var coef = from_int(0)
+    var places = 0
+    var dot = false
+    var seen = false
+
+    while i < b.len && b[i] != u8('e') && b[i] != u8('E')
+        val c = b[i]
+
+        if c == u8('.')
+            if dot then return None
+
+            dot = true
+        else if c >= u8('0') && c <= u8('9')
+            coef = big_add(big_mul(coef, from_int(10)), from_int(long(c - u8('0'))))
+            seen = true
+
+            if dot then places += 1
+        else if c != u8('_') then
+            return None
+
+        i += 1
+
+    if !seen then return None
+
+    var exp = 0
+
+    if i < b.len
+        i += 1
+
+        var eminus = false
+
+        if i < b.len && (b[i] == u8('-') || b[i] == u8('+'))
+            eminus = b[i] == u8('-')
+            i += 1
+
+        var e = 0
+        var edigits = false
+
+        while i < b.len
+            val c = b[i]
+
+            if c < u8('0') || c > u8('9') then return None
+
+            // An exponent past any representable fraction says nothing a smaller one would not;
+            // capping it keeps the arithmetic below finite.
+            if e < 100000 then e = e * 10 + int(c - u8('0'))
+
+            edigits = true
+            i += 1
+
+        if !edigits then return None
+
+        exp = if eminus then -e else e
+    end if
+
+    Some((if minus then negate(coef) else coef, exp - places))
+end exact_of_text
+
+// The exact value of a `within` bound, which the declaration kept as a decimal.
+exact_of_decimal(d: Decimal) -> (BigInt, int) = (d.coefficient(), -d.scale())
+
+// A `within` bound at a fixed-point type's scale, rounded the way the comparison it feeds needs.
+fixed_bound_raw(d: Decimal, frac: int, mode: FixRound) -> BigInt
+    val (coef, exp) = exact_of_decimal(d)
+
+    fixed_raw_of(coef, exp, frac, mode)
+end fixed_bound_raw
+
+// `coef × 10^exp × 2^frac`, rounded to an integer the way `mode` says.
+fixed_raw_of(coef: BigInt, exp: int, frac: int, mode: FixRound) -> BigInt
+    var num = big_mul(coef, big_pow(from_int(2), usize(frac)))
+    var den = from_int(1)
+
+    if exp >= 0 then num = big_mul(num, big_pow(from_int(10), usize(exp)))
+    else den = big_pow(from_int(10), usize(-exp))
+
+    val (q, r) = div_rem_floor(num, den)
+
+    if r.is_zero() then return q
+
+    val up = big_add(q, from_int(1))
+
+    mode match
+        FixFloor -> q
+        FixCeil -> up
+        _ ->
+            val c = big_cmp(big_mul(r, from_int(2)), den)
+
+            if c > 0 then return up
+            if c < 0 then return q
+
+            mode match
+                FixNearestEven -> if is_odd(q) then up else q
+                _ -> up
+end fixed_raw_of
+
+// -- rendering -------------------------------------------------------------------------------------
+
+// A raw value as the **shortest decimal that converts back to it** -- the text `print` writes and a
+// diagnostic quotes. It is never in exponent form: a fixed-point value has a fixed number of places,
+// and `0.0000000005` says which place the one bit is in where `5e-10` makes the reader count.
+//
+// The run-time renderer (`emit_fixed.sysl`'s `str_fixed_text`) finds the same digits by a different
+// route -- one decimal place at a time, holding only the remainder -- and the two have to agree to
+// the byte, so this one is written the plain way: try one place, two, three, and take the first
+// that reads back as the same raw value, the nearer of the two candidates where both do.
+fixed_text(raw: BigInt, frac: int) -> string
+    val neg = raw.sign() < 0
+    val m = if neg then negate(raw) else raw
+    val unit = big_pow(from_int(2), usize(frac))
+    val (ip, f) = div_rem_floor(m, unit)
+    val sign = if neg then "-" else ""
+
+    if f.is_zero() then return s"$sign${to_string(ip)}"
+
+    var k = 1
+    var p = from_int(10)
+
+    loop
+        val scaled = big_mul(f, p)
+        val (low, rem) = div_rem_floor(scaled, unit)
+        val high = big_add(low, from_int(1))
+        val low_ok = reads_back(low, k, f, frac)
+        val high_ok = reads_back(high, k, f, frac)
+
+        if low_ok || high_ok
+            // Both read back where the decimal is closer than half a unit from either side: the
+            // nearer one is the honest rendering, and an exact tie takes the even digit string.
+            var take_low = low_ok
+
+            if low_ok && high_ok
+                val c = big_cmp(rem, big_sub(unit, rem))
+
+                take_low = c < 0 || (c == 0 && !is_odd(low))
+            end if
+
+            val digits = if take_low then low else high
+
+            if big_cmp(digits, p) == 0 then return s"$sign${to_string(big_add(ip, from_int(1)))}"
+
+            return s"$sign${to_string(ip)}.${zero_padded(to_string(digits), k)}"
+        end if
+
+        k += 1
+        p = big_mul(p, from_int(10))
+end fixed_text
+
+// Whether the `k`-place decimal `digits / 10^k` reads back, as a literal would, to the fraction `f`.
+private reads_back(digits: BigInt, k: int, f: BigInt, frac: int) -> bool =
+    big_cmp(fixed_raw_of(digits, -k, frac, FixNearestEven), f) == 0
+
+private zero_padded(s: string, width: int) -> string
+    var b = str_builder()
+
+    for _i in s.bytes.len..<usize(width)
+        b.push_char('0')
+
+    b.push(s)
+    b.finish()
+end zero_padded
+
+// -- literals --------------------------------------------------------------------------------------
+
+// A decimal literal at a fixed-point type: the exact value rounded once, to nearest with ties to
+// even, and refused where it does not fit -- with the range and the attribute naming the end it went
+// past, since the commonest way to write one out of range is to reach for the end itself (`1.0` at
+// `q31`).
+fixed_literal(cx: &Analyzer, span: Span, shown: string, exact: Option[(BigInt, int)], ty: Type) -> TExpr
+    val (bits, frac, signed) = ty match
+        Fixed(b, f, s) -> (b, f, s)
+        _ -> return bad_expr(span)
+
+    if exact.is_none() then return cx.err(span, s"the literal $shown is not a number ${type_show(ty)} can hold")
+
+    val (coef, exp) = exact.unwrap()
+    val raw = fixed_raw_of(coef, exp, frac, FixNearestEven)
+    val lo = fixed_min_raw(bits, signed)
+    val hi = fixed_max_raw(bits, signed)
+    val above = big_cmp(raw, hi) > 0
+
+    if above || big_cmp(raw, lo) < 0
+        val shown_ty = type_show(ty)
+        val end_word = if above then "largest" else "smallest"
+        val attr = if above then "Max" else "Min"
+
+        return cx.err(span, s"the literal $shown does not fit $shown_ty, whose range is " +
+                      s"${fixed_text(lo, frac)} to ${fixed_text(hi, frac)}; the $end_word value is " +
+                      s"'$shown_ty::$attr'")
+    end if
+
+    TExpr(span, TIntLit(raw, ty))
+end fixed_literal
+
+// -- conversions folded while compiling ------------------------------------------------------------
+
+// `q31(0.6)`, `i32q16(3)` -- a conversion call whose argument is a literal is worked out here, with
+// exactly the rounding and saturation the run-time conversion has, so `val X = q31(0.6)` is
+// constant data too. The argument was read at its own type (a `real`, an `int`), as every
+// conversion's is, so the float case converts the double that literal is -- the same value the
+// run-time path would be handed.
+fixed_fold(span: Span, t: TExpr, to: Type) -> Option[TExpr]
+    val (bits, frac, signed) = to match
+        Fixed(b, f, s) -> (b, f, s)
+        _ -> return None
+
+    val raw = *t.kind match
+        TIntLit(v, ty) -> underlying(ty) match
+            Integer(_, _, _) -> fixed_raw_of(v, 0, frac, FixNearestUp)
+            _ -> return None
+        TFloatLit(fbits, _) -> fixed_raw_of_double(fbits, frac) match
+            Some(r) -> r
+            None -> return None
+        _ -> return None
+
+    Some(TExpr(span, TIntLit(clamped(raw, fixed_min_raw(bits, signed), fixed_max_raw(bits, signed)), to)))
+end fixed_fold
+
+// A double times 2^F, rounded to nearest with ties toward +inf -- the conversion call's rounding --
+// and not yet saturated. Nothing for an infinity or a NaN.
+fixed_raw_of_double(fbits: long, frac: int) -> Option[BigInt]
+    val exact = exact_of_double(fbits)
+
+    if exact.is_none() then return None
+
+    val (coef, two_exp) = exact.unwrap()
+    val shift = two_exp + frac
+
+    if shift >= 0 then return Some(big_mul(coef, big_pow(from_int(2), usize(shift))))
+
+    val den = big_pow(from_int(2), usize(-shift))
+    val (q, r) = div_rem_floor(coef, den)
+
+    Some(if big_cmp(big_mul(r, from_int(2)), den) >= 0 then big_add(q, from_int(1)) else q)
+end fixed_raw_of_double
+
+// Whether a raw value is one the format holds.
+fixed_raw_fits(raw: BigInt, bits: int, signed: bool) -> bool =
+    big_cmp(raw, fixed_min_raw(bits, signed)) >= 0 && big_cmp(raw, fixed_max_raw(bits, signed)) <= 0
+
+// A double's bit pattern -- the reinterpretation `v_float` makes too.
+real_bits(x: real) -> long
+    var v = x
+    val p: *i64 = ptr_cast(&v)
+
+    *p
+end real_bits
+
+private clamped(v: BigInt, lo: BigInt, hi: BigInt) -> BigInt =
+    if big_cmp(v, lo) < 0 then lo else if big_cmp(v, hi) > 0 then hi else v
+
+// A finite double's exact value as `coef × 2^exp`; nothing for an infinity or a NaN, which the run
+// time saturates and zeroes and which a fold leaves to it.
+exact_of_double(bits: long) -> Option[(BigInt, int)]
+    val minus = bits < 0
+    val e = int((bits >> 52) & 2047)
+    val m = bits & 4503599627370495
+
+    if e == 2047 then return None
+
+    val (coef, exp) = if e == 0 then (from_int(m), -1074) else (from_int(m + 4503599627370496), e - 1075)
+
+    Some((if minus then negate(coef) else coef, exp))
+end exact_of_double
+
+// -- type attributes -------------------------------------------------------------------------------
+
+// `T::Min`, `T::Max`, `T::Small` and `T::Bits(n)` -- the two ends, one unit, and a value made from
+// its raw bits. Each of the first three is a raw integer at the type, so it is constant data too.
+fixed_attr(cx: &Analyzer, span: Span, written: string, ty: Type, attr: string,
+           args: Buf[Expr]) -> TExpr
+    val (bits, signed) = ty match
+        Fixed(b, _, s) -> (b, s)
+        _ -> (0, true)
+
+    if attr == "Bits"
+        if args.len() != 1 then return cx.err(span, s"'$written::Bits' takes exactly one argument")
+
+        val raw_ty = Integer(bits, signed, false)
+        val x = type_expr(cx, args.at(0), Some(raw_ty))
+        val xt = texpr_type(x)
+
+        if xt == Unknown then return x
+
+        if disagree(xt, raw_ty) then
+            return cx.err(args.at(0).span, s"'$written::Bits' takes the ${type_show(raw_ty)} a " +
+                          s"${type_show(ty)} is stored as, not ${type_show(xt)}")
+
+        return TExpr(span, TIntOp("fixed_from_bits", x, None, raw_ty, ty))
+    end if
+
+    if !args.is_empty() then return cx.err(span, s"'$written::$attr' takes no arguments")
+
+    if attr == "Min" then return TExpr(span, TIntLit(fixed_min_raw(bits, signed), ty))
+    if attr == "Max" then return TExpr(span, TIntLit(fixed_max_raw(bits, signed), ty))
+    if attr == "Small" then return TExpr(span, TIntLit(fixed_small_raw(), ty))
+
+    cx.err(span, s"'$written' has no attribute '$attr' — a fixed-point type answers " +
+           s"'$written::Min', '$written::Max', '$written::Small' and '$written::Bits'")
+end fixed_attr
+
+// `x.bits` -- the raw integer a fixed-point value is stored as, reinterpreted rather than converted.
+fixed_bits_of(span: Span, value: TExpr, ty: Type) -> TExpr
+    val raw_ty = fixed_storage(ty)
+
+    TExpr(span, TIntOp("fixed_bits", value, None, raw_ty, raw_ty))
+end fixed_bits_of
