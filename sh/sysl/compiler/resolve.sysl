@@ -266,17 +266,30 @@ end package_owner
 // The **root** is not checked here -- the driver does it, which is the funnel every command's own
 // manifest comes through, and checking it twice would report it twice.
 private check_floors(packages: &Buf[ResolvedPackage]) -> Result[unit, string]
+    if !OnTheReleaseLine then return Ok(())
+
+    dependency_floor_refusal(packages, Version) match
+        None -> Ok(())
+        Some(why) -> Err(why)
+end check_floors
+
+// The first dependency whose stated floor is newer than `compiler`, worded for the person who has to
+// act on it -- the package by the name it calls itself and the tag that was asked for.
+//
+// The compiler is a parameter rather than read here so that the sentence can be asked for against a
+// release-line version even while this compiler makes no claim against its own (`OnTheReleaseLine`).
+dependency_floor_refusal(packages: &Buf[ResolvedPackage], compiler: string) -> Option[string]
     for i in 0..<packages.len()
         val p = packages.at(i)
 
         if is_root_package(p) then continue
 
-        floor_refusal(package_named(p), p.manifest.floor) match
+        check_floor(package_named(p), p.manifest.floor, compiler) match
             None -> ()
-            Some(why) -> return Err(why)
+            Some(why) -> return Some(why)
 
-    Ok(())
-end check_floors
+    None
+end dependency_floor_refusal
 
 // Every requirement raises a floor and nothing ever lowers one, which is the whole of selection --
 // and every one of them is written down on the way past, whether or not it won.
