@@ -1,0 +1,226 @@
+module sh.sysl.compiler
+@tests
+
+// `sysl.math`'s integer arithmetic — `pow`, `gcd`, `lcm`, `divmod`, and the two questions about
+// powers of two — ported from the reference's `IntegerMathTests.scala` case for case. **Every
+// expected line was read out of the reference compiler** running the same program.
+//
+// These are free generic functions rather than trait members, so one body reaches the signed widths
+// and the unsigned ones; every value test runs at more than one width. The rest are the edges where
+// an integer routine written for one signedness stops working: a negative operand where `%`
+// truncates, a zero operand where the answer would otherwise divide by zero, and an answer too wide
+// for the type it would have to come back in.
+//
+// The runner is `tests_enm_enum_run.sysl`'s; `imx_ran` prepends the wildcard import the way the
+// reference's own `run` override does.
+
+private imx_ran(text: string) -> string = enm_ran("import sysl.math.*\n\n" + text)
+
+// -- pow ------------------------------------------------------------------------------------------
+
+@test("pow raises to a whole power")
+imx_pow_raises_to_a_whole_power()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(pow(2, 10u32), pow(3, 4u32), pow(10, 3u32))\n"), "1024 81 1000\n")
+
+// The two ends of the exponent, which the squaring loop reaches by different paths: a zero exponent
+// never enters the loop, and a one takes the odd branch on its only pass.
+@test("pow: a zero exponent is one, a one is the base")
+imx_pow_zero_and_one_exponents()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(pow(7, 0u32), pow(7, 1u32), pow(0, 0u32), pow(0, 5u32))\n"), "1 7 1 0\n")
+
+@test("pow reaches the unsigned and the wide widths")
+imx_pow_reaches_unsigned_and_wide_widths()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(pow(5u64, 3u32), pow(2u8, 5u32), pow(2i64, 40u32))\n"),
+        "125 32 1099511627776\n")
+
+// A negative base is what tells a squaring loop apart from a repeated multiplication that lost the
+// sign: the parity of the exponent has to survive.
+@test("pow: a negative base keeps the parity of the exponent")
+imx_pow_negative_base_keeps_parity()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(pow(-2, 3u32), pow(-2, 4u32), pow(-1, 63u32))\n"), "-8 16 -1\n")
+
+// Integer arithmetic wraps, and the doc comment promises this answer.
+@test("pow: an overflowing power wraps rather than trapping")
+imx_pow_overflow_wraps()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(pow(2, 32u32), pow(2u8, 8u32))\n"), "0 0\n")
+
+// -- gcd ------------------------------------------------------------------------------------------
+
+@test("gcd: the common divisor, at both signednesses")
+imx_gcd_both_signednesses()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(gcd(48, 18), gcd(48u32, 18u32), gcd(1071u64, 462u64))\n"), "6 6 21\n")
+
+// `%` truncates, so the loop arrives at the right divisor carrying the dividend's sign; the magnitude
+// taken at the end is what makes these positive.
+@test("gcd: a negative operand still answers a positive divisor")
+imx_gcd_negative_operand_positive_divisor()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(gcd(-48, 18), gcd(48, -18), gcd(-48, -18))\n"), "6 6 6\n")
+
+@test("gcd: zero is the identity")
+imx_gcd_zero_is_the_identity()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(gcd(17, 0), gcd(0, 17), gcd(0, 0))\n"), "17 17 0\n")
+
+// Coprime operands are the case a routine passes by accident if it returns the first operand.
+@test("gcd: coprime operands answer one")
+imx_gcd_coprime_answers_one()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(gcd(17, 5), gcd(9, 28), gcd(1u8, 1u8))\n"), "1 1 1\n")
+
+// -- lcm ------------------------------------------------------------------------------------------
+
+@test("lcm: the common multiple, at both signednesses")
+imx_lcm_both_signednesses()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(lcm(4, 6), lcm(21u32, 6u32), lcm(3, 5))\n"), "12 42 15\n")
+
+@test("lcm: a negative operand still answers a positive multiple")
+imx_lcm_negative_operand_positive_multiple()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(lcm(-4, 6), lcm(4, -6), lcm(-4, -6))\n"), "12 12 12\n")
+
+// Without the guard this is `gcd(0, 0)`, which is zero, and then a division by it.
+@test("lcm: a zero operand answers zero rather than dividing by one")
+imx_lcm_zero_operand_answers_zero()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(lcm(0, 5), lcm(5, 0), lcm(0, 0))\n"), "0 0 0\n")
+
+// The product of these two overflows `i64` and their least common multiple does not, so a body
+// written as `a * b / gcd(a, b)` fails here.
+@test("lcm divides before multiplying, so a fitting answer is not lost to the product")
+imx_lcm_divides_before_multiplying()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(lcm(4611686018427387904i64, 2i64))\n"), "4611686018427387904\n")
+
+// -- divmod ---------------------------------------------------------------------------------------
+
+@test("divmod binds the quotient and the remainder from one call")
+imx_divmod_binds_both()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("show() =\n    val q, r = divmod(17, 5)\n    print(q, r)\n\nshow()\n"), "3 2\n")
+
+// Both operators truncate toward zero, so the remainder takes the dividend's sign.
+@test("divmod truncates toward zero, and the remainder follows the dividend")
+imx_divmod_truncates_toward_zero()
+    if !enm_ready() then return
+
+    val text = "show() =\n    val a, b = divmod(-17, 5)\n    val c, d = divmod(17, -5)\n    print(a, b, c, d)\n\nshow()\n"
+
+    assert_eq(imx_ran(text), "-3 -2 -3 2\n")
+
+@test("divmod reaches the unsigned widths")
+imx_divmod_reaches_unsigned_widths()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("show() =\n    val q, r = divmod(200u8, 7u8)\n    print(q, r)\n\nshow()\n"), "28 4\n")
+
+// -- is_power_of_two ------------------------------------------------------------------------------
+
+@test("is_power_of_two: one bit set and above zero")
+imx_is_power_of_two_one_bit_set()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(is_power_of_two(1), is_power_of_two(16), is_power_of_two(1024))\n"),
+        "true true true\n")
+
+@test("is_power_of_two: anything else is not")
+imx_is_power_of_two_anything_else_is_not()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(is_power_of_two(0), is_power_of_two(3), is_power_of_two(17))\n"),
+        "false false false\n")
+
+// At a signed width the most negative value has exactly one bit set, so a body that only counted
+// ones would answer `true` here.
+@test("is_power_of_two: the most negative value is not, though it has one bit set")
+imx_is_power_of_two_most_negative_is_not()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(is_power_of_two(-2147483648), is_power_of_two(-4), is_power_of_two(-1))\n"),
+        "false false false\n")
+
+@test("is_power_of_two reaches the unsigned widths, including their top bit")
+imx_is_power_of_two_unsigned_top_bit()
+    if !enm_ready() then return
+
+    assert_eq(imx_ran("print(is_power_of_two(128u8), is_power_of_two(255u8), is_power_of_two(1u64))\n"),
+        "true false true\n")
+
+// -- next_power_of_two ----------------------------------------------------------------------------
+
+@test("next_power_of_two rounds up to the next power of two")
+imx_next_power_of_two_rounds_up()
+    if !enm_ready() then return
+
+    val text = "print(next_power_of_two(5).unwrap(), next_power_of_two(17).unwrap(), next_power_of_two(1000).unwrap())\n"
+
+    assert_eq(imx_ran(text), "8 32 1024\n")
+
+// The off-by-one a `<` in place of a `<=` would break.
+@test("next_power_of_two: a power of two is already its own answer")
+imx_next_power_of_two_already_a_power()
+    if !enm_ready() then return
+
+    val text = "print(next_power_of_two(16).unwrap(), next_power_of_two(1).unwrap(), next_power_of_two(1024).unwrap())\n"
+
+    assert_eq(imx_ran(text), "16 1 1024\n")
+
+@test("next_power_of_two: zero and the negatives answer one")
+imx_next_power_of_two_zero_and_negatives()
+    if !enm_ready() then return
+
+    val text = "print(next_power_of_two(0).unwrap(), next_power_of_two(-5).unwrap(), next_power_of_two(-2147483648).unwrap())\n"
+
+    assert_eq(imx_ran(text), "1 1 1\n")
+
+// The whole reason the result is an `Option`: at `u8` the answer stops existing above 128.
+@test("next_power_of_two: an answer too wide for an unsigned type is absent")
+imx_next_power_of_two_too_wide_is_absent()
+    if !enm_ready() then return
+
+    val text = "print(next_power_of_two(128u8).unwrap(), next_power_of_two(129u8).is_none(),\n      next_power_of_two(200u8).is_none(), next_power_of_two(255u8).is_none())\n"
+
+    assert_eq(imx_ran(text), "128 true true true\n")
+
+// A signed width loses its top bit to the sign, so it runs out one power before the unsigned width
+// beside it.
+@test("next_power_of_two: a signed type runs out one power before the unsigned width beside it")
+imx_next_power_of_two_signed_runs_out_first()
+    if !enm_ready() then return
+
+    val text = "print(next_power_of_two(1073741824).is_some(), next_power_of_two(1073741825).is_none(),\n      next_power_of_two(2147483648u32).unwrap(),\n      next_power_of_two(2147483649u32).is_none())\n"
+
+    assert_eq(imx_ran(text), "true true 2147483648 true\n")
+
+// -- one body, many types -------------------------------------------------------------------------
+
+// A bound is satisfied by whatever satisfies it, so one source body reaches every width at both
+// signednesses.
+@test("integer math: the widths agree with one another")
+imx_the_widths_agree()
+    if !enm_ready() then return
+
+    val text = "print(gcd(48i8, 18i8), gcd(48u8, 18u8), gcd(48i16, 18i16), gcd(48u16, 18u16),\n      gcd(48i64, 18i64), gcd(48u64, 18u64))\n"
+
+    assert_eq(imx_ran(text), "6 6 6 6 6 6\n")
