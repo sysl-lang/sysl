@@ -1,0 +1,470 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, parse_int, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A `match` arm that hands a large payload back unchanged moves it where the value is going, rather
+// than binding it into a slot of its own and copying it again (`payload_move`).
+//
+// Two destinations are tested, each of which used to cost the payload two or three times over on the
+// stack beside the result the `match` was over:
+//
+//   - **a box** -- `val p: &Big = make() match Ok(s) -> s; Err(_) -> return 1` allocates the box and
+//     copies the payload straight from the call's result into it;
+//   - **a local** -- `var p = make() match ...` with every other arm leaving: the local *is* the
+//     payload, inside the slot the call's result was written to (`match_in_place`), and nothing is
+//     copied.
+//
+// What makes them invisible is that the arm does nothing with the binding but hand it back, and the
+// counts: the destination takes its own share of everything in the payload and the result's slot
+// gives back its own when the statement ends, so every destructor runs exactly once.
+//
+// Ported from the reference's `MatchMoveTests` (bootstrap e4514a42), whose programs and expected
+// strings these are.
+
+private mmv_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end mmv_ready
+
+private mmv_ir(text: string, target: Option[string] = None) -> string
+    val root = make_temp_dir("sysl-match-move").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end mmv_ir
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private mmv_body(out: string, name: string) -> string
+    val lines = lines_of(out)
+    var b = str_builder()
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !inside && line.starts_with("define ") && line.contains("@" + name + "(") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end mmv_body
+
+// How many times `needle` occurs in `hay`.
+private mmv_count(hay: string, needle: string) -> usize
+    var n: usize = 0
+    var rest = hay
+
+    loop
+        rest.index_of(needle) match
+            Some(i) ->
+                n += 1
+                rest = rest[i + needle.len..<rest.len]
+            None -> break
+
+    n
+end mmv_count
+
+// How many lines of `hay` hold `needle`.
+private mmv_lines(hay: string, needle: string) -> usize
+    val lines = lines_of(hay)
+    var n: usize = 0
+
+    for i in 0..<lines.len()
+        if lines.at(i).contains(needle) then n += 1
+
+    n
+end mmv_lines
+
+// What a program prints, and whether it came back cleanly.
+private mmv_prints(text: string, expected: string)
+    if !mmv_ready() then return
+
+    val root = make_temp_dir("sysl-match-move").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, expected)
+            assert(out.status.ok(), "the program printed what was expected and did not exit cleanly")
+end mmv_prints
+
+// `Big` is 8 + 2048 bytes on a 64-bit host.
+private mmv_whole_copy() -> string = "i64 2056"
+
+private mmv_big() -> string = raw"""
+    struct Big
+        n: usize
+        table: [512]u32
+
+        step(*self) -> u32
+            self.n += 1
+            self.table[self.n % 512]
+
+    @noinline
+    make(n: usize) -> Result[Big, int]
+        if n == 0 then return Err(1)
+        var b = Big(n, [0; 512])
+        for i in 0..<b.table.len do b.table[i] = u32(i * n)
+        Ok(b)
+
+    @noinline
+    boxed(k: usize) -> int
+        val p: &Big = make(k) match
+            Ok(s) -> s
+            Err(_) -> return 1
+
+        var t: u32 = 0
+        for _ in 0..<10 do t += p.step()
+        int(t)
+
+    @noinline
+    owned(k: usize) -> int
+        var p = make(k) match
+            Ok(s) -> s
+            Err(_) -> return 1
+
+        var t: u32 = 0
+        for _ in 0..<10 do t += p.step()
+        int(t)
+
+    @noinline
+    unwrapped(k: usize) -> int
+        val r = make(k)
+        if r.is_err() then return 1
+        val p: &Big = r.unwrap()
+
+        var t: u32 = 0
+        for _ in 0..<10 do t += p.step()
+        int(t)
+
+    print(boxed(3), owned(3), unwrapped(3), boxed(0), owned(0))
+    """
+
+@test("a payload moved out of a call's result is never bound: into a box: built straight in the box, with no slot of its own")
+mmv_into_a_box()
+    if !mmv_ready() then return
+
+    val f = mmv_body(mmv_ir(mmv_big()), "boxed")
+
+    assert(!f.contains("alloca %struct.Big"), f)
+    assert(!f.contains("load %enum.sysl$Result.Big.int, ptr"), f)
+    assert(mmv_lines(f, "alloca %enum.sysl$Result.Big.int") == 1, f)
+    assert(mmv_count(f, mmv_whole_copy()) == 1, f)
+end mmv_into_a_box
+
+@test("a payload moved out of a call's result is never bound: into a local: the local is the payload, inside the result's slot")
+mmv_into_a_local()
+    if !mmv_ready() then return
+
+    val f = mmv_body(mmv_ir(mmv_big()), "owned")
+
+    assert(!f.contains("alloca %struct.Big"), f)
+    assert(mmv_lines(f, "alloca %enum.sysl$Result.Big.int") == 1, f)
+    assert(mmv_count(f, mmv_whole_copy()) == 0, f)
+end mmv_into_a_local
+
+@test("a payload moved out of a call's result is never bound: and the program answers what it did")
+mmv_the_program_answers() = mmv_prints(mmv_big(), "255 255 255 1 1\n")
+
+// The frame `clang -fstack-usage` reports for one function, out of the `.su` file it writes: one line
+// per function, `p.ll:boxed<TAB>8<TAB>static`.
+private mmv_frame(su: string, name: string) -> Option[int]
+    val lines = lines_of(su)
+    val key = s":$name\t"
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        line.index_of(key) match
+            Some(at) ->
+                val rest = line[at + key.len..<line.len]
+                val bytes = rest.index_of("\t") match
+                    Some(t) -> rest[0..<t]
+                    None -> rest
+
+                return parse_int(bytes).ok()
+            None -> ()
+
+    None
+end mmv_frame
+
+@test("on a board, neither costs more than unwrapping the result")
+mmv_frames_on_a_board()
+    if !mmv_ready() then return
+
+    val t = target_named("thumb-freestanding-softfp").unwrap()
+    val clang = find_backend_clang(t) match
+        Ok(c) -> c
+        Err(_) ->
+            print("skipped: no clang with an ARM back end")
+            return
+
+    val out = mmv_ir(mmv_big(), Some("thumb-freestanding-softfp"))
+    val head = "target triple = \""
+    var triple = ""
+    val lines = lines_of(out)
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with(head)
+            val rest = lines.at(i)[head.len..<lines.at(i).len]
+
+            triple = rest[0..<rest.len - 1]
+
+    assert(triple != "", out)
+
+    val root = make_temp_dir("sysl-match-move").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/p.ll", out).unwrap()
+
+    val said = capture(clang, [s"--target=$triple", "-O1", "-c", "-fstack-usage", "-o", s"$root/p.o",
+                               s"$root/p.ll"], "", [], true)
+
+    val su = read_text(s"$root/p.su").unwrap_or("")
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "clang could not be run")
+        Ok(r) -> assert(r.status.ok(), r.text)
+
+    if su == ""
+        print(s"skipped: $clang wrote no stack-usage file")
+        return
+    end if
+
+    // `Big` is 4 + 2048 bytes here and its `Result` 2056: one of those is the result itself, which
+    // every form has to hold; a second would be past 4 KB.
+    val unwrapped = mmv_frame(su, "unwrapped") match
+        Some(bytes) -> bytes
+        None ->
+            assert(false, s"no frame for unwrapped in\n$su")
+            return
+
+    assert(unwrapped < 2056 + 256, s"unwrapped in\n$su")
+
+    for name in ["boxed", "owned"]
+        mmv_frame(su, name) match
+            Some(bytes) ->
+                assert(bytes < 2056 + 256, s"$name in\n$su")
+                assert(bytes <= unwrapped, s"$name in\n$su")
+            None -> assert(false, s"no frame for $name in\n$su")
+end mmv_frames_on_a_board
+
+private mmv_counted() -> string = raw"""
+    struct Res
+        id: int
+
+    impl Drop for Res
+        drop(self) = print("dropped", self.id)
+
+    struct Big2
+        r: &Res
+        table: [512]u32
+
+    @noinline
+    mk(i: int) -> Result[Big2, &Res]
+        if i < 0 then return Err(Res(i))
+        Ok(Big2(Res(i), [u32(i); 512]))
+
+    boxed(i: int) -> int
+        val p: &Big2 = mk(i) match
+            Ok(s) -> s
+            Err(e) -> return e.id
+
+        print("boxed", p.r.id, p.table[7])
+        0
+
+    owned(i: int) -> int
+        var p = mk(i) match
+            Ok(s) -> s
+            Err(e) -> return e.id
+
+        p.table[7] = 70
+        print("owned", p.r.id, p.table[7])
+        0
+
+    looped()
+        for i in 5..<7
+            val p = mk(i) match
+                Ok(s) -> s
+                Err(_) -> return
+
+            print("looped", p.r.id)
+
+    from_local()
+        val r = mk(8)
+        val p: &Big2 = r match
+            Ok(s) -> s
+            Err(_) -> return
+
+        print("from local", p.r.id, r.unwrap().r.id)
+
+    print(boxed(1))
+    print(boxed(-2))
+    print(owned(3))
+    print(owned(-4))
+    looped()
+    from_local()
+    print("done")
+    """
+
+@test("every destructor runs exactly once, on the arm that moves and on the arm that leaves: with no copy of the payload in either function")
+mmv_counted_no_copy()
+    if !mmv_ready() then return
+
+    val out = mmv_ir(mmv_counted())
+
+    for name in ["boxed", "owned"]
+        val f = mmv_body(out, name)
+
+        assert(!f.contains("alloca %struct.Big2"), s"$name\n$f")
+end mmv_counted_no_copy
+
+@test("every destructor runs exactly once, on the arm that moves and on the arm that leaves: and each count given back once")
+mmv_counted_once() = mmv_prints(mmv_counted(), raw"""
+    boxed 1 1
+    dropped 1
+    0
+    dropped -2
+    -2
+    owned 3 70
+    dropped 3
+    0
+    dropped -4
+    -4
+    looped 5
+    dropped 5
+    looped 6
+    dropped 6
+    from local 8 8
+    dropped 8
+    done
+    """)
+
+private mmv_shared() -> string = raw"""
+    struct Big
+        n: usize
+        table: [512]u32
+
+    @noinline
+    make(n: usize) -> Result[Big, int]
+        if n == 0 then return Err(1)
+        Ok(Big(n, [u32(n); 512]))
+
+    @noinline
+    peek(b: *Big) -> usize = b.n
+
+    """
+
+@test("a binding the arm does anything else with is still a binding of its own: an arm that takes the binding's address before handing it back")
+mmv_an_arm_that_takes_the_address() = mmv_prints(mmv_shared() + raw"""
+    f() -> usize
+        var p = make(4) match
+            Ok(s) ->
+                var c = s
+                c.n += peek(&c)
+                c
+            Err(_) -> return 0
+
+        p.n
+
+    print(f())
+    """, "8\n")
+
+@test("a binding the arm does anything else with is still a binding of its own: the local's address kept and written through, across passes of a loop")
+mmv_the_address_kept_across_a_loop() = mmv_prints(mmv_shared() + raw"""
+    f() -> usize
+        var total: usize = 0
+        for i in 1..<4
+            var p = make(usize(i)) match
+                Ok(s) -> s
+                Err(_) -> return 0
+
+            val q: *Big = &p
+            q.n += 10
+            q.table[0] = 5
+            total += p.n + usize(p.table[0]) + peek(q)
+        total
+
+    print(f())
+    """, "87\n")
+
+@test("a binding the arm does anything else with is still a binding of its own: a ref into the local writes the local")
+mmv_a_ref_into_the_local() = mmv_prints(mmv_shared() + raw"""
+    f() -> u32
+        var p = make(2) match
+            Ok(s) -> s
+            Err(_) -> return 0
+
+        ref t = p.table
+        t[3] = 30
+        p.table[3] + p.table[4]
+
+    print(f())
+    """, "32\n")
+
+@test("a binding the arm does anything else with is still a binding of its own: a local scrutinee keeps its own payload when the moved one is changed")
+mmv_a_local_scrutinee_keeps_its_own() = mmv_prints(mmv_shared() + raw"""
+    f() -> usize
+        val r = make(6)
+        var p = r match
+            Ok(s) -> s
+            Err(_) -> return 0
+
+        p.n = 100
+        p.n + r.unwrap().n
+
+    print(f())
+    """, "106\n")
+
+@test("a binding the arm does anything else with is still a binding of its own: two arms that arrive build into the local rather than live in the result")
+mmv_two_arms_that_arrive() = mmv_prints(mmv_shared() + raw"""
+    f(k: usize) -> usize
+        var p = make(k) match
+            Ok(s) -> s
+            Err(_) -> Big(7, [0; 512])
+
+        p.n += 1
+        p.n
+
+    print(f(0), f(3))
+    """, "8 4\n")

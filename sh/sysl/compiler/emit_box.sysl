@@ -15,7 +15,6 @@ import sysl.math.bigint.from_int
 // and a copy of the payload -- whose own references the box now holds a share of.
 gen_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
     val inner = ref_inner(ref_ty)
-    val bn = box_lty(e, inner)
 
     // A large payload is written into the box rather than produced and then stored into it, for the
     // reason every other destination has: the value would be a first-class aggregate of kilobytes
@@ -23,6 +22,23 @@ gen_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
     // the one destination that cannot be handed over before the expression runs.
     val large = e.layout.indirect(inner)
     val v = if large then VNothing else gen_expr(e, value)
+    val opened = open_box(e, inner)
+    val slot = opened.1
+
+    if large then gen_into(e, slot, value)
+    else
+        retain_value(e, inner, v)
+        emit(e, InStore(lty(e, inner), v, slot, AccPlain, None))
+
+    own_temp(e, opened.0, ref_ty)
+end gen_box
+
+// A box for `inner` with its header written and its payload not yet: the box, and the address its
+// payload goes at. `gen_box` fills it from an expression; a `match` arm moving a large payload out of
+// its scrutinee fills it straight from that storage (`payload_move`). Whoever fills it owns the box
+// with `own_temp`.
+open_box(e: *Emit, inner: Type) -> (Val, Val)
+    val bn = box_lty(e, inner)
     val p = allocate_box(e, bn)
 
     emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
@@ -39,14 +55,8 @@ gen_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
     idx.push(ir_arg(l_i32(), VInt(from_int(0))))
     idx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields())))))
     emit(e, InGep(slot, bn, p, idx))
-
-    if large then gen_into(e, slot, value)
-    else
-        retain_value(e, inner, v)
-        emit(e, InStore(lty(e, inner), v, slot, AccPlain, None))
-
-    own_temp(e, p, ref_ty)
-end gen_box
+    (p, slot)
+end open_box
 
 // The bytes one box occupies, asked of LLVM rather than computed here: a `getelementptr` one past
 // null, read back as an integer, is the size of what was stepped over.

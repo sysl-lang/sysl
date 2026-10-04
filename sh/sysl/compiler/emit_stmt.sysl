@@ -35,6 +35,12 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
             gen_into(e, VReg(s"$own.addr"), init)
         else if is_promoted(e, name) && promoted_elem(ty).is_some()
             gen_promoted_decl(e, name, ty, promoted_elem(ty).unwrap(), init)
+        else if align.is_none() && match_in_place(e, ty, init).is_some()
+            // `var p = make() match { Ok(s) -> s; Err(_) -> return 1 }`: the payload the one arm
+            // that arrives hands back is already in the storage the call's result was written to,
+            // and that storage is a slot of this frame nothing else will ever name -- so it is `p`'s
+            // storage.
+            gen_in_place_decl(e, name, ty, init, match_in_place(e, ty, init).unwrap())
         else
             // The slot is laid down **before** the initializer runs, because a large one is written
             // into it rather than handed to it.
@@ -144,6 +150,53 @@ private loop_at(e: *Emit, depth: int) -> GenLoop
 
     e.loops.at(i)
 end loop_at
+
+// Whether a large local initialized by a `match` can live inside its scrutinee's storage, and the
+// payload it would be where it can.
+//
+// The scrutinee is a large call's or branch's result, which `address` writes into a slot of the frame
+// that nothing else names, and releases there when the statement ends. Exactly one arm arrives at the
+// end of the `match`, and that arm hands back one payload unchanged (`moved_payload`); every other arm
+// leaves by `return`, `break` or a call that does not come back. So wherever the local exists at all,
+// it is that payload, at that address.
+//
+// Nothing can tell the two apart. The slot is the frame's, as the local's own would be, so an address
+// taken of the local lives exactly as long either way, and a loop rewrites both on each pass. The
+// arrived arm takes the local's counts of everything in the payload, and the statement's release of
+// the result gives back the result's -- the same two shares a copy would have held.
+private match_in_place(e: *Emit, ty: Type, init: TExpr) -> Option[Moved] = *init.kind match
+    TMatch(scrutinee, arms, _) ->
+        if !e.layout.indirect(ty) || !e.layout.indirect(texpr_type(scrutinee)) || !makes_owned(scrutinee)
+            return None
+
+        var arrives: Option[TArm] = None
+
+        for i in 0..<arms.len()
+            if !(arms.at(i).body.ty == Never)
+                if arrives.is_some() then return None
+
+                arrives = Some(arms.at(i))
+
+        arrives match
+            Some(arm) -> moved_payload(e, arm) match
+                Some(m) -> if m.boxed_as.is_none() then Some(m) else None
+                None -> None
+            None -> None
+    _ -> None
+
+// The local `match_in_place` found: its address is the payload's inside the slot the scrutinee is
+// written to, and the arm that arrives only takes its counts.
+private gen_in_place_decl(e: *Emit, name: string, ty: Type, init: TExpr, m: Moved)
+    *init.kind match
+        TMatch(scrutinee, arms, mty) ->
+            val held = address(e, scrutinee)
+            val addr = VReg(s"${declare_local(e, name)}.addr")
+
+            payload_at(e, m, held, addr)
+            gen_match(e, scrutinee, arms, mty, Some(addr), Some(held), true)
+            own_slot(e, name, ty)
+        _ -> ()
+end gen_in_place_decl
 
 // Whether this local is the one the body builds in its caller's result storage.
 private is_return_slot(e: *Emit, name: string) -> bool = e.return_slot match
