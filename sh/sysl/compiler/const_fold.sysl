@@ -570,6 +570,198 @@ private binding_is_abstract(subst: Buf[Binding], name: string) -> bool
     false
 end binding_is_abstract
 
+// -- the typed tree, for module storage --------------------------------------------------------------
+
+// What a TYPED scalar expression comes to while compiling -- the question a module `val`'s
+// initializer asks before it can be laid into the object file rather than computed by a prologue
+// (`laid_down`). It is the arithmetic `const_fold` does over the written tree, done over the tree
+// the analyzer built from it, so a `const` read inside it is already its literal.
+//
+// **It holds itself to one promise `const_fold` does not need**: the answer is the value the
+// expression produces at run time. A `const` that overflows is a mistake to report; an initializer
+// that overflows is code that traps, and the trap belongs to the program. So wherever run time could
+// say something else -- an integer result its type does not hold, a division by zero, a shift by the
+// width or more, a float conversion out of the integer's range, a character outside Unicode -- the
+// answer is `None`, the initializer stays code, and nothing is said. A `f32` is rounded at every step,
+// as the machine rounds it.
+const_fold_typed(t: TExpr) -> Option[Const]
+    val ty = folded_scalar(texpr_type(t))
+
+    if ty.is_none() then return None
+
+    val v = *t.kind match
+        TIntLit(n, _) -> Some(ConstInt(n))
+        TBoolLit(b) -> Some(ConstBool(b))
+        TStrLit(s) -> Some(ConstStr(s))
+        TFloatLit(bits, _) -> Some(ConstFloat(real_of_bits(bits)))
+        TUnary(op, operand, _) -> typed_unary(op, operand, ty.unwrap())
+        TBinary(op, l, r, _) -> typed_binary(op, l, r)
+        TLogical(op, l, r) -> typed_binary(op, l, r)
+        TCompare(operands, cmps) ->
+            if operands.len() == 2 && cmps.len() == 1 && cmps.at(0).dispatch.is_none() then
+                typed_binary(cmps.at(0).op, operands.at(0), operands.at(1))
+            else
+                None
+        TCast(inner, _) -> typed_conversion(inner, ty.unwrap())
+        _ -> None
+
+    if v.is_none() then return None
+
+    held_at(v.unwrap(), ty.unwrap())
+end const_fold_typed
+
+// The scalar a typed node is, where it is one this fold answers for: an integer, a `f32` or `f64`,
+// a `bool`, a `char` or a `string`, or a name for one that checks nothing. A subtype with a range or
+// a predicate runs its check at run time, so it is not one.
+private folded_scalar(t: Type) -> Option[Type] = t match
+    Constrained(d) -> if name_only(d) then folded_scalar(underlying(t)) else None
+    Integer(_, _, _) -> Some(t)
+    Floating(bits, brain) -> if !brain && (bits == 32 || bits == 64) then Some(t) else None
+    Bool -> Some(t)
+    Char -> Some(t)
+    Str -> Some(t)
+    _ -> None
+
+// A settled value as its type holds it, or `None` where the type cannot hold it as it stands.
+private held_at(v: Const, ty: Type) -> Option[Const] = v match
+    ConstInt(n) -> ty match
+        Integer(bits, signed, _) -> if fits(n, bits, signed) then Some(v) else None
+        Char -> if scalar_value(n) then Some(v) else None
+        _ -> None
+    // A NaN's bits are the machine's choice -- x86 and Arm make different ones -- so one is not
+    // written down for it.
+    ConstFloat(f) -> ty match
+        Floating(bits, _) -> if f != f then None else Some(ConstFloat(if bits == 32 then real(f32(f)) else f))
+        _ -> None
+    ConstBool(_) -> if ty == Bool then Some(v) else None
+    ConstStr(_) -> if ty == Str then Some(v) else None
+    ConstChar(_) -> None
+
+// Whether a number is a Unicode scalar value -- what `char(u)` checks at run time.
+private scalar_value(n: BigInt) -> bool =
+    cmp(n, from_int(0)) >= 0 && cmp(n, from_int(0x10FFFF)) <= 0 &&
+    !(cmp(n, from_int(0xD800)) >= 0 && cmp(n, from_int(0xDFFF)) <= 0)
+
+private typed_unary(op: string, operand: TExpr, ty: Type) -> Option[Const]
+    val v = const_fold_typed(operand)
+
+    if v.is_none() then return None
+
+    v.unwrap() match
+        ConstInt(n) -> ty match
+            Integer(bits, signed, _) ->
+                if op == "-" then Some(ConstInt(negate(n)))
+                // `~` is the complement within the width, which is the only reading a width has.
+                else if op == "~" then Some(ConstInt(wrap(big_not(n), bits, signed)))
+                else None
+            _ -> None
+        // `0.0 - f` is the fold's negation, and it is not the machine's at zero, whose sign it flips.
+        ConstFloat(f) -> if op == "-" && f != 0.0 then Some(ConstFloat(0.0 - f)) else None
+        ConstBool(b) -> if op == "!" then Some(ConstBool(!b)) else None
+        _ -> None
+end typed_unary
+
+private typed_binary(op: string, l: TExpr, r: TExpr) -> Option[Const]
+    val a = const_fold_typed(l)
+    val b = const_fold_typed(r)
+
+    if a.is_none() || b.is_none() then return None
+
+    a.unwrap() match
+        ConstInt(x) -> b.unwrap() match
+            ConstInt(y) -> typed_int_binary(op, x, y, folded_scalar(texpr_type(l)).unwrap())
+            _ -> None
+        // A NaN compares unequal to everything, itself included, which `float_binary`'s sign of the
+        // difference cannot say.
+        ConstFloat(x) -> b.unwrap() match
+            ConstFloat(y) -> if x != x || y != y then None else float_binary(op, x, y)
+            _ -> None
+        ConstBool(x) -> b.unwrap() match
+            ConstBool(y) -> bool_binary(op, x, y)
+            _ -> None
+        ConstStr(x) -> b.unwrap() match
+            ConstStr(y) -> str_binary(op, x, y)
+            _ -> None
+        ConstChar(_) -> None
+end typed_binary
+
+// The integer operators, answered only where run time answers the same: never a division by zero,
+// never `%` by `-1` (whose quotient is the one a signed width cannot hold), never a shift by a
+// negative count or by the operand's whole width.
+private typed_int_binary(op: string, x: BigInt, y: BigInt, lt: Type) -> Option[Const]
+    if op == "/" || op == "%"
+        if cmp(y, from_int(0)) == 0 || (op == "%" && cmp(y, from_int(-1)) == 0) then return None
+
+        val q = div_rem(x, y)
+
+        return Some(ConstInt(if op == "/" then q.0 else q.1))
+    end if
+
+    if op == "<<" || op == ">>"
+        val bits = lt match
+            Integer(w, _, _) -> w
+            _ -> 0
+
+        if cmp(y, from_int(0)) < 0 || cmp(y, from_int(long(bits))) >= 0 then return None
+
+        val scale = pow(from_int(2), usize(y.to_long().unwrap_or(0)))
+
+        if op == "<<" then return Some(ConstInt(mul(x, scale)))
+
+        val q = div_rem(x, scale)
+
+        if cmp(x, from_int(0)) < 0 && cmp(q.1, from_int(0)) != 0 then
+            return Some(ConstInt(sub(q.0, from_int(1))))
+
+        return Some(ConstInt(q.0))
+    end if
+
+    if op == "+" then return Some(ConstInt(add(x, y)))
+    if op == "-" then return Some(ConstInt(sub(x, y)))
+    if op == "*" then return Some(ConstInt(mul(x, y)))
+    if op == "&" then return Some(ConstInt(big_and(x, y)))
+    if op == "|" then return Some(ConstInt(big_or(x, y)))
+    if op == "^" then return Some(ConstInt(big_xor(x, y)))
+
+    compared(op, cmp(x, y))
+end typed_int_binary
+
+// A written conversion between scalars, where run time converts to the same value. An integer
+// narrowed wraps, as `converted` says; a float becomes an integer only where the integer holds it,
+// so the answer never depends on what an out-of-range conversion does.
+private typed_conversion(inner: TExpr, to: Type) -> Option[Const]
+    val from = folded_scalar(texpr_type(inner))
+    val v = const_fold_typed(inner)
+
+    if from.is_none() || v.is_none() then return None
+
+    v.unwrap() match
+        ConstInt(n) -> to match
+            Integer(bits, signed, _) -> from.unwrap() match
+                Integer(_, _, _) -> Some(ConstInt(wrap(n, bits, signed)))
+                // A `char` read as an integer is its code point, and only where the width holds it.
+                Char -> if fits(n, bits, signed) then Some(ConstInt(n)) else None
+                _ -> None
+            Char -> if scalar_value(n) then Some(ConstInt(n)) else None
+            // Past 2^53 the integer is rounded on its way to a `real`, and rounding it again to a
+            // `f32` is two roundings where the machine does one.
+            Floating(bits, _) ->
+                if bits == 32 && cmp(big_abs(n), pow(from_int(2), 53)) > 0 then None
+                else Some(ConstFloat(big_to_real(n)))
+            _ -> None
+        ConstFloat(f) -> to match
+            Integer(bits, signed, _) -> big_of_real(f) match
+                Some(n) -> if fits(n, bits, signed) then Some(ConstInt(n)) else None
+                None -> None
+            Floating(_, _) -> Some(ConstFloat(f))
+            _ -> None
+        ConstBool(b) -> if to == Bool then Some(ConstBool(b)) else None
+        ConstStr(s) -> if to == Str then Some(ConstStr(s)) else None
+        ConstChar(_) -> None
+end typed_conversion
+
+private big_abs(n: BigInt) -> BigInt = if cmp(n, from_int(0)) < 0 then negate(n) else n
+
 // Which type parameters the body was compiled against, where it was compiled against any.
 //
 // The mistake is at the call that asked while the sentence explaining why is at the declaration, so
