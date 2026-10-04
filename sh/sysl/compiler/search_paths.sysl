@@ -57,7 +57,51 @@ reset_search_paths()
     sp_verbose = false
     sp_explain = false
     sp_say = None
+    sp_link_mode = None
+    forget_link_notes()
 end reset_search_paths
+
+// What `--link` typed, where it was given: which of the build's `pkg_config` libraries come from
+// their archives. It beats the root manifest's `link` key (`chosen_link`).
+private var sp_link_mode: Option[LinkMode] = None
+
+link_flag() -> Option[LinkMode] = sp_link_mode
+
+// The refusal for a `--link` whose operand names an empty library, said before any command reads its
+// own flags -- every command takes the flag, so every command refuses it the same way. Arguments
+// after a `--` are the program's and are not looked at.
+link_flag_refusal(args: []string) -> Option[string]
+    for i in 0..<args.len
+        if args[i] == "--" then return None
+
+        if args[i] == "--link" && i + 1 < args.len
+            parse_link_mode(args[i + 1]) match
+                Err(why) -> return Some(why)
+                Ok(_) -> ()
+        end if
+
+    None
+end link_flag_refusal
+
+// The names a `--include-path <name>=<dir>` answered.
+supplied_names() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<sp_named.len()
+        out.push(sp_named.at(i).0)
+
+    out
+end supplied_names
+
+// Every `--link-path` directory, in the order written.
+link_paths() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<sp_link.len()
+        out.push(sp_link.at(i))
+
+    out
+end link_paths
 
 // Whether `--explain-escapes` was given: the build says, one line per array, which local arrays it
 // moved to the heap and the view that forced it -- or that there were none.
@@ -217,6 +261,18 @@ took_search_flag(args: []string, i: usize) -> int
     if arg == "--no-std-lib"
         sp_std_from_source = true
         return 1
+    end if
+
+    // Which libraries come from their archives. A malformed operand was refused before the command
+    // ran (`link_flag_refusal`), so one reaching here is the command line's usage error.
+    if arg == "--link"
+        if i + 1 >= args.len then return 0
+
+        parse_link_mode(args[i + 1]) match
+            Ok(mode) -> sp_link_mode = Some(mode)
+            Err(_) -> return 0
+
+        return 2
     end if
 
     if arg == "--verbose" || arg == "-v"

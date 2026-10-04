@@ -1,0 +1,333 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, split, Search}
+
+// Linking a `pkg_config` library from its static archive (`reference/packages.md § Linking a library
+// statically`): the root manifest's `link` key, the `--link` flag that beats it, and the rule saying
+// which `-l` of a library's answer becomes which archive's path.
+//
+// **The rule is a set of pure functions over a `pkg-config` answer and a test for whether a file
+// exists**, so every case of it -- an archive found, a named one missing, a private one missing, a
+// system library -- is answerable on any machine. The driver hands them the real answer and `is_file`.
+
+// Which of the libraries a build found through `pkg_config` come from their archives.
+enum LinkMode
+    // None of them -- what saying nothing, `"dynamic"` and an empty list all mean.
+    LinkDynamic
+
+    // Every one that has an archive; one that has none is linked dynamically and traced.
+    LinkStatic
+
+    // These, by the name the manifests write under `pkg_config`, each of which must have one.
+    LinkOnly(modules: Buf[string])
+end LinkMode
+
+// Whether a library of this `pkg_config` name is to come from its archive.
+link_marks(mode: LinkMode, pc: string) -> bool = mode match
+    LinkDynamic -> false
+    LinkStatic -> true
+    LinkOnly(modules) -> contains_name(modules, pc)
+
+// How the mode is spelt on a command line, which is also what the run cache keys it under.
+link_spelling(mode: LinkMode) -> string = mode match
+    LinkDynamic -> "dynamic"
+    LinkStatic -> "static"
+    LinkOnly(modules) -> join(modules.view(), ",")
+
+// The operand of `--link`: one of the two modes, or the comma-separated names. **An empty name is
+// refused where it was typed** -- `libuv,` is a slip, and read as the one name it would link a
+// library the reader thinks is named twice.
+parse_link_mode(text: string) -> Result[LinkMode, string]
+    if text == "static" then return Ok(LinkStatic)
+
+    if text == "dynamic" then return Ok(LinkDynamic)
+
+    var names: Buf[string] = buf()
+
+    for part in split(text, ",")
+        val name = part.trim()
+
+        if name.is_empty()
+            return Err(s"'--link $text' names an empty library — it is 'static', 'dynamic', or the " +
+                "pkg_config names of the libraries to link statically, separated by commas")
+
+        if !contains_name(names, name) then names.push(name.copy())
+
+    Ok(LinkOnly(names))
+end parse_link_mode
+
+// The mode a build links with: what the command line typed, then the root manifest's key, then
+// dynamic. **The flag typed for one invocation beats the key written for all**, as `-O` beats
+// `optimization`.
+chosen_link(given: Option[LinkMode], key: Option[LinkMode]) -> LinkMode = given match
+    Some(mode) -> mode
+    None -> key.unwrap_or(LinkDynamic)
+
+// What `pkg-config` says about one library that is to come from its archive: its ordinary `--libs`,
+// its `--static --libs`, which adds what it links privately, and its `libdir`.
+struct StaticAnswer
+    direct: Buf[string]
+    whole: Buf[string]
+    libdir: Option[string]
+end StaticAnswer
+
+// The platform's own libraries, which are never taken from an archive whatever the key says:
+// linking one statically is not a faster program but a different one.
+val SystemLibraries: []const string =
+    ["System", "c", "m", "pthread", "dl", "rt", "util", "resolv", "c++", "c++abi", "stdc++", "gcc",
+     "gcc_s", "objc"]
+
+private is_system_library(name: string) -> bool
+    for i in 0..<SystemLibraries.len
+        if SystemLibraries[i] == name then return true
+
+    false
+end is_system_library
+
+private contains_name(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end contains_name
+
+// The `-l` names of a flag list, the platform's own left out.
+private static_libs(flags: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<flags.len()
+        val f = flags.at(i)
+
+        if f.starts_with("-l") && f.len > 2
+            val name = f[2..<f.len]
+
+            if !is_system_library(name) then out.push(name)
+
+    out
+end static_libs
+
+// The library names an archive was found for, in the order found.
+archive_names(found: Buf[(string, string)]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<found.len()
+        out.push(found.at(i).0)
+
+    out
+end archive_names
+
+// The archive found for a library name, where one was.
+private archive_of(found: Buf[(string, string)], lib: string) -> Option[string]
+    for i in 0..<found.len()
+        if found.at(i).0 == lib then return Some(found.at(i).1)
+
+    None
+end archive_of
+
+// Where an archive is looked for: the `-L` directories of the `--static` answer, then the `libdir`
+// -- since `pkg-config` prints no `-L` for a directory the linker searches anyway, and that is exactly
+// where the archive then is -- then every `--link-path`, each once.
+static_searched(answer: StaticAnswer, link_paths: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<answer.whole.len()
+        val f = answer.whole.at(i)
+
+        if f.starts_with("-L") && f.len > 2 && !contains_name(out, f[2..<f.len]) then out.push(f[2..<f.len])
+
+    answer.libdir match
+        Some(dir) -> if !contains_name(out, dir) then out.push(dir)
+        None -> ()
+
+    for i in 0..<link_paths.len()
+        if !contains_name(out, link_paths.at(i)) then out.push(link_paths.at(i))
+
+    out
+end static_searched
+
+// Which `-l` of one library's `--static` answer becomes which archive, as `(name, path)` pairs.
+//
+// A library the program links **directly** with no archive is refused where `required` (a list
+// named it) and left dynamic otherwise; one only `--static` added stays an `-l` where it has none,
+// since nobody named it. **And where no direct library has an archive, none of the private ones is
+// taken either**: a private archive alone would link the library's shared object beside a copy of
+// what it links.
+static_archives(pc: string, answer: StaticAnswer, link_paths: Buf[string], exists: string -> bool,
+                required: bool = true) -> Result[Buf[(string, string)], string]
+    val dirs = static_searched(answer, link_paths)
+    val direct = static_libs(answer.direct)
+    val all = static_libs(answer.whole)
+    var found: Buf[(string, string)] = buf()
+
+    for i in 0..<all.len()
+        val lib = all.at(i)
+
+        if archive_of(found, lib).is_some() then continue
+
+        var archive: Option[string] = None
+
+        for j in 0..<dirs.len()
+            val candidate = s"${dirs.at(j)}/lib$lib.a"
+
+            if archive.is_none() && exists(candidate) then archive = Some(candidate)
+
+        archive match
+            Some(path) -> found.push((lib, path))
+            None -> if required && contains_name(direct, lib) then return Err(static_missing(pc, lib, dirs))
+
+    if direct.is_empty() then return Ok(found)
+
+    for i in 0..<direct.len()
+        if archive_of(found, direct.at(i)).is_some() then return Ok(found)
+
+    Ok(buf())
+end static_archives
+
+// The direct libraries no archive was found for, which stay an `-l`.
+static_kept(answer: StaticAnswer, found: Buf[(string, string)]) -> Buf[string]
+    val direct = static_libs(answer.direct)
+    var out: Buf[string] = buf()
+
+    for i in 0..<direct.len()
+        if archive_of(found, direct.at(i)).is_none() && !contains_name(out, direct.at(i))
+            out.push(direct.at(i))
+
+    out
+end static_kept
+
+// The refusal for a library a list named that has no archive anywhere it was looked for.
+static_missing(pc: string, lib: string, dirs: Buf[string]) -> string =
+    s"'$pc' is to be linked statically, and there is no 'lib$lib.a' to link it from — " +
+    s"${static_where(dirs)}. Install its static archive there, or leave '$pc' out of 'link' to " +
+    "link it dynamically"
+
+// The trace for a library `"static"` could not take from an archive.
+static_kept_note(pc: string, lib: string, dirs: Buf[string]) -> string =
+    s"static: '$pc' has no 'lib$lib.a', so -l$lib is linked dynamically — ${static_where(dirs)}"
+
+private static_where(dirs: Buf[string]) -> string =
+    if dirs.is_empty() then "pkg-config named no directory to look in"
+    else s"looked in ${join(dirs.view(), ", ")}"
+
+// The names a list writes that no requirement of this build declares.
+static_unmatched(mode: LinkMode, declared: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    mode match
+        LinkOnly(names) ->
+            for i in 0..<names.len()
+                if !contains_name(declared, names.at(i)) then out.push(names.at(i))
+        _ -> ()
+
+    out
+end static_unmatched
+
+// The unmatched names that the build with every feature on does declare -- left out with a trace
+// rather than refused, since a feature this build leaves off is what requires them.
+static_gated(mode: LinkMode, declared: Buf[string], could: Buf[string]) -> Buf[string]
+    val stray = static_unmatched(mode, declared)
+    var out: Buf[string] = buf()
+
+    for i in 0..<stray.len()
+        if contains_name(could, stray.at(i)) then out.push(stray.at(i))
+
+    out
+end static_gated
+
+// The refusal for a list naming a library this build cannot take from an archive: a name no
+// requirement declares, even with every feature on (`could`), or one `--include-path` answered, so
+// `pkg-config` was never asked where its archive is. **A misspelling is refused rather than
+// ignored**, since it would otherwise link dynamically and say nothing.
+static_unknown(mode: LinkMode, declared: Buf[string], supplied: Buf[string],
+               could: Buf[string] = buf()) -> Option[string]
+    val names = mode match
+        LinkOnly(listed) -> listed
+        _ -> return None
+
+    var known: Buf[string] = buf()
+
+    for i in 0..<declared.len()
+        if !contains_name(known, declared.at(i)) then known.push(declared.at(i))
+
+    for i in 0..<could.len()
+        if !contains_name(known, could.at(i)) then known.push(could.at(i))
+
+    for i in 0..<names.len()
+        if !contains_name(known, names.at(i))
+            val which = if known.is_empty() then ""
+            else s", which here are ${join(sort_names(known).view(), ", ")}"
+
+            return Some(s"'link' names '${names.at(i)}', and no pkg_config requirement in this build " +
+                "is called that — the names are the ones the manifests write under " +
+                s"'requires.pkg_config'$which")
+        end if
+
+    for i in 0..<names.len()
+        if contains_name(supplied, names.at(i))
+            val name = names.at(i)
+
+            return Some(s"'link' names '$name', which '--include-path $name=<dir>' answered, so " +
+                "pkg-config was not asked which archive it is — link it statically by naming the " +
+                "archive's path to the linker yourself, or leave it out of 'link'")
+        end if
+
+    None
+end static_unknown
+
+// The tail of a link line with each `-l` an archive was found for replaced by **the archive's
+// path** -- `-l` cannot be made to mean the archive on macOS, whose `ld` takes a `.dylib` over a `.a`
+// in the same directory. **An archive named twice is kept at its last place only**: `@link("uv")` and
+// `pkg-config`'s `-luv` name one library, and the later place is after everything that needs it.
+static_rewrite(flags: Buf[string], archives: Buf[(string, string)]) -> Buf[string]
+    if archives.is_empty() then return flags
+
+    var replaced: Buf[string] = buf()
+
+    for i in 0..<flags.len()
+        val f = flags.at(i)
+        val swapped = if f.starts_with("-l") then archive_of(archives, f[2..<f.len]) else None
+
+        replaced.push(swapped.unwrap_or(f))
+
+    var out: Buf[string] = buf()
+
+    for i in 0..<replaced.len()
+        val f = replaced.at(i)
+        var later = false
+
+        if is_archive_path(archives, f)
+            for j in (i + 1)..<replaced.len()
+                if replaced.at(j) == f then later = true
+
+        if !later then out.push(f)
+
+    out
+end static_rewrite
+
+private is_archive_path(archives: Buf[(string, string)], f: string) -> bool
+    for i in 0..<archives.len()
+        if archives.at(i).1 == f then return true
+
+    false
+end is_archive_path
+
+// -- the trace ------------------------------------------------------------------------------------
+
+// What the static link decided, line by line: which `-l` became which archive, which stayed dynamic,
+// and which named library a feature left out. **Kept as well as said**, so a test can read what
+// `--verbose` would have printed; said only under `--verbose`.
+private var sl_notes: Buf[string] = buf()
+
+// One line of that trace.
+link_note(line: string)
+    sl_notes.push(line)
+
+    if verbose() then eprints(s"sysl: $line\n")
+end link_note
+
+// Every line the last command traced.
+link_notes() -> string = join(sl_notes.view(), "\n")
+
+// Called with the search paths, before each command's flags are read.
+forget_link_notes() = sl_notes = buf()
