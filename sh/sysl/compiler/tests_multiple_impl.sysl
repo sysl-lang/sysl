@@ -1,0 +1,545 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A type implementing one trait at more than one argument list (`reference/traits.md § One
+// implementation per argument list`). A parameterized trait is a family of promises, and the argument
+// list every use already carries -- an operator's pair of operands, a bound's arguments, a call's
+// values -- selects among them. The selection is determined rather than preferred: nothing ranks two
+// candidates, and a call that determines neither is reported.
+//
+// **Every string quoted here was read out of the reference compiler**, whose
+// `MultipleImplementationTests` these are.
+
+private mix_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end mix_ready
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private mix_ran(text: string) -> string
+    val root = make_temp_dir("sysl-multi-impl").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end mix_ran
+
+// Everything a source has to say for itself, taken through the lowering.
+private mix_err(text: string) -> string
+    val root = make_temp_dir("sysl-multi-impl").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end mix_err
+
+// A trait taking one argument, and a struct that implements it twice.
+private mix_sink() -> string = raw"""
+    trait Sink[T]
+        put(self, x: T) -> int
+    struct A
+        tag: int
+    impl Sink[int] for A
+        put(self, x: int) -> int = self.tag + x
+    impl Sink[real] for A
+        put(self, x: f64) -> int = self.tag - int(x)
+    """
+
+// `C` implementing `Mul` at itself and at `int`.
+private mix_two() -> string = raw"""
+    struct C
+        v: int
+    impl Mul for C
+        mul(self, o: C) -> C = C(self.v * o.v)
+    impl Mul[int] for C
+        mul(self, k: int) -> C = C(self.v + k)
+    """
+
+private mix_timeline() -> string = raw"""
+    struct Instant
+        us: long
+    struct Duration
+        us: long
+    """
+
+// ---- what the documents claim
+
+@test("both implementations' members are reachable by the name the trait wrote")
+mix_both_members_are_reachable_by_the_trait_name()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(mix_sink() + raw"""
+        print(A(10).put(1))
+        print(A(10).put(1.0))
+        """), "11\n9\n")
+
+@test("an operator dispatches on the pair, at three argument lists")
+mix_an_operator_dispatches_on_the_pair_at_three_lists()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(mix_two() + raw"""
+        impl Mul[bool] for C
+            mul(self, b: bool) -> C = C(if b then self.v else 0)
+        print((C(3) * C(4)).v)
+        print((C(3) * 4).v)
+        print((C(3) * false).v)
+        """), "12\n7\n0\n")
+
+@test("a bound names one of them, and a bare bound still names the homogeneous one")
+mix_a_bound_names_one_and_a_bare_bound_the_homogeneous()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(mix_two() + raw"""
+        sq[T: Mul](x: T) -> T = x * x
+        bump[T: Mul[int]](x: T) -> T = x * 5
+        print(sq(C(3)).v)
+        print(bump(C(3)).v)
+        """), "9\n8\n")
+
+@test("and one parameter may be held to both at once")
+mix_one_parameter_may_be_held_to_both()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(mix_two() + raw"""
+        both[T: Mul + Mul[int]](x: T) -> T = x * x * 1
+        print(both(C(3)).v)
+        """), "10\n")
+
+@test("a property has no argument to select with, and is told so")
+mix_a_property_has_no_argument_to_select_with()
+    if !mix_ready() then return
+
+    val e = mix_err(raw"""
+        trait Named[T]
+            tag(self) -> int
+        struct A
+            v: int
+        impl Named[int] for A
+            tag(self) -> int = 1
+        impl Named[real] for A
+            tag(self) -> int = 2
+        print(A(0).tag)
+        """)
+
+    assert(e.contains("'tag' comes from 2 implementations of one trait on A, and the arguments do not say " +
+                      "which was meant"), e)
+
+@test("a bound that names neither is told what the type does implement")
+mix_a_bound_that_names_neither_is_told_what_is_implemented()
+    if !mix_ready() then return
+
+    val e = mix_err(mix_sink() + raw"""
+        f[X: Sink[bool]](x: X) -> int = 1
+        print(f(A(0)))
+        """)
+
+    assert(e.contains("it implements 'Sink[int]' and 'Sink[real]'"), e)
+
+// ---- what a trait object does with two of them
+
+@test("each object's table points at its own implementation")
+mix_each_objects_table_points_at_its_own_implementation()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(mix_sink() + raw"""
+        var u: &Sink[int] = A(10)
+        var v: &Sink[real] = A(10)
+        print(u.put(1))
+        print(v.put(1.0))
+        """), "11\n9\n")
+
+@test("and erasing to one says nothing about the other")
+mix_erasing_to_one_says_nothing_about_the_other()
+    if !mix_ready() then return
+
+    val e = mix_err(mix_sink() + raw"""
+        var u: &Sink[bool] = A(10)
+        print(u.put(true))
+        """)
+
+    assert(e.contains("a &Sink[bool] needs a type that implements 'Sink[bool]', and A does not — it implements " +
+                      "'Sink[int]' and 'Sink[real]'"), e)
+
+// The erasure's own refusal reaches a type the trait covers under a condition it misses, behind
+// either sigil -- and a type the trait does not reach at all keeps the plain mismatch.
+@test("an object over a trait whose covering impl's condition is unmet says which condition")
+mix_an_object_over_an_unmet_conditional_impl()
+    if !mix_ready() then return
+
+    val e = mix_err(raw"""
+        trait Show
+            show(self) -> int
+        trait Sink
+            put(self) -> int
+        struct Box[T]
+            v: T
+        impl[T: Show] Sink for Box[T]
+            put(self) -> int = 1
+        struct B
+            v: int
+        var u: &Sink = Box(1)
+        var p: *Sink = Box(1)
+        var w: &Sink = B(1)
+        """)
+
+    assert(e.contains("a &Sink needs a type that implements 'Sink', and Box[int] does not — the 'impl' that " +
+                      "covers it asks 'Show' of int, which does not implement it"), e)
+    assert(e.contains("a *Sink needs a type that implements 'Sink', and Box[int] does not — the 'impl' that " +
+                      "covers it asks 'Show' of int, which does not implement it"), e)
+    assert(e.contains("cannot initialize 'w': declared &Sink but the value is B"), e)
+
+// ---- what a second implementation may not be
+
+@test("the same argument list twice")
+mix_the_same_argument_list_twice()
+    if !mix_ready() then return
+
+    val e = mix_err(mix_sink() + raw"""
+        impl Sink[int] for A
+            put(self, x: int) -> int = 0
+        """)
+
+    assert(e.contains("'A' already implements 'Sink[int]'"), e)
+
+@test("on a generic type, an argument built out of the type itself")
+mix_on_a_generic_type_an_argument_built_out_of_itself()
+    if !mix_ready() then return
+
+    val e = mix_err(raw"""
+        struct Box[T]
+            v: T
+        impl[T] Mul[Box[int]] for Box[T]
+            mul(self, o: Box[int]) -> Box[T] = self
+        """)
+
+    assert(e.contains("'Box[int]' is a Box, and a 'sysl.Mul' whose arguments default names the type it is " +
+                      "written for — so at one Box this block and a defaulted one would promise the same thing"), e)
+
+@test("though an argument built out of anything else is fine")
+mix_an_argument_built_out_of_anything_else_is_fine()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(raw"""
+        struct Box[T]
+            v: T
+        impl[T] Mul for Box[T]
+            mul(self, o: Box[T]) -> Box[T] = o
+        impl[T] Mul[int] for Box[T]
+            mul(self, k: int) -> Box[T] = self
+        print((Box(7) * Box(9)).v)
+        print((Box(7) * 2).v)
+        """), "9\n7\n")
+
+// ---- the boundary with a shape: a shape's members and a written-out type's are filed under two owner
+// keys, so a second implementation would be one no call could name, whatever its arguments
+
+@test("different written argument lists do not coexist either")
+mix_different_written_lists_do_not_coexist_on_a_shape()
+    if !mix_ready() then return
+
+    val e = mix_err(raw"""
+        trait Sink[T]
+            put(self, x: T) -> int
+        impl[E] Sink[int] for [3]E
+            put(self, x: int) -> int = x + 1
+        impl Sink[real] for [3]int
+            put(self, x: f64) -> int = int(x) + 2
+        """)
+
+    assert(e.contains("every array of 3 already implements 'Sink', so '[3]int' has an implementation and " +
+                      "cannot be given a second one"), e)
+
+@test("and the same written list is the collision it always was")
+mix_the_same_written_list_is_the_collision_it_was()
+    if !mix_ready() then return
+
+    val e = mix_err(raw"""
+        trait Sink[T]
+            put(self, x: T) -> int
+        impl[E] Sink[int] for [3]E
+            put(self, x: int) -> int = x
+        impl Sink[int] for [3]int
+            put(self, x: int) -> int = x
+        """)
+
+    assert(e.contains("every array of 3 already implements 'Sink', so '[3]int' has an implementation and " +
+                      "cannot be given a second one"), e)
+
+@test("and a block that leaves the arguments out is no different")
+mix_a_block_leaving_the_arguments_out_is_no_different()
+    if !mix_ready() then return
+
+    val e = mix_err(raw"""
+        trait Sink[T = Self]
+            put(self, x: T) -> int
+        impl[E] Sink for [3]E
+            put(self, x: [3]E) -> int = 1
+        impl Sink[real] for [3]int
+            put(self, x: f64) -> int = 2
+        """)
+
+    assert(e.contains("every array of 3 already implements 'Sink', so '[3]int' has an implementation and " +
+                      "cannot be given a second one"), e)
+
+// ---- what a call that determines nothing gets
+
+@test("an argument matching neither implementation")
+mix_an_argument_matching_neither_implementation()
+    if !mix_ready() then return
+
+    val e = mix_err(mix_sink() + "print(A(0).put(true))\n")
+
+    assert(e.contains("'put' comes from 2 implementations of one trait on A, and none of them takes (bool) — " +
+                      "write the argument at the type of the implementation that was meant"), e)
+
+// A literal has no type of its own to be matched by, and picking the "nearest" candidate would be a
+// preference rule -- which is the thing this resolution deliberately is not.
+@test("a literal whose default type matches neither")
+mix_a_literal_whose_default_type_matches_neither()
+    if !mix_ready() then return
+
+    val e = mix_err(raw"""
+        trait Sink[T]
+            put(self, x: T) -> int
+        struct A
+            tag: int
+        impl Sink[i64] for A
+            put(self, x: i64) -> int = 1
+        impl Sink[real] for A
+            put(self, x: f64) -> int = 2
+        print(A(0).put(3))
+        """)
+
+    assert(e.contains("'put' comes from 2 implementations of one trait on A, and none of them takes (int) — " +
+                      "write the argument at the type of the implementation that was meant"), e)
+
+@test("and the wrong number of arguments to any of them")
+mix_the_wrong_number_of_arguments_to_any_of_them()
+    if !mix_ready() then return
+
+    val e = mix_err(mix_sink() + "print(A(0).put(1, 2))\n")
+
+    assert(e.contains("'put' comes from 2 implementations of one trait on A, and none of them takes " +
+                      "(int, int) — write the argument at the type of the implementation that was meant"), e)
+
+// ---- what the order of the blocks does not change: the two programs differ only in that order
+
+@test("the homogeneous block first")
+mix_the_homogeneous_block_first()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(mix_two() + raw"""
+        print((C(3) * C(4)).v)
+        print((C(3) * 4).v)
+        """), "12\n7\n")
+
+@test("and the same two the other way round")
+mix_and_the_same_two_the_other_way_round()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(raw"""
+        struct C
+            v: int
+        impl Mul[int] for C
+            mul(self, k: int) -> C = C(self.v + k)
+        impl Mul for C
+            mul(self, o: C) -> C = C(self.v * o.v)
+        print((C(3) * C(4)).v)
+        print((C(3) * 4).v)
+        """), "12\n7\n")
+
+// ---- what else still holds
+
+@test("a compound assignment picks by the value's type")
+mix_a_compound_assignment_picks_by_the_values_type()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(mix_two() + raw"""
+        var a = C(3)
+        a *= C(4)
+        print(a.v)
+        a *= 5
+        print(a.v)
+        """), "12\n17\n")
+
+// A conditional block's condition is asked of the implementation the arguments selected, not of
+// whichever one happens to be filed first.
+@test("a conditional block's own bound is still the one reported")
+mix_a_conditional_blocks_own_bound_is_reported()
+    if !mix_ready() then return
+
+    val e = mix_err(raw"""
+        trait Show
+            show(self) -> int
+        struct Box[U]
+            v: U
+        impl[U] Mul[int] for Box[U]
+            mul(self, k: int) -> Box[U] = self
+        impl[U: Show] Mul for Box[U]
+            mul(self, o: Box[U]) -> Box[U] = o
+        sq[T: Mul](x: T) -> T = x * x
+        print(1)
+        var q = sq(Box(1))
+        """)
+
+    assert(e.contains("the 'impl' that covers it asks 'Show' of int, which does not implement it"), e)
+
+@test("a trait's default body is copied once per implementation")
+mix_a_default_body_is_copied_once_per_implementation()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(raw"""
+        trait Sink[T]
+            put(self, x: T) -> int
+            twice(self, x: T) -> int = self.put(x) + self.put(x)
+        struct A
+            tag: int
+        impl Sink[int] for A
+            put(self, x: int) -> int = x
+        impl Sink[real] for A
+            put(self, x: f64) -> int = int(x) + 100
+        print(A(0).twice(1))
+        print(A(0).twice(1.0))
+        """), "2\n202\n")
+
+@test("a built-in still cannot be given an operator implementation")
+mix_a_builtin_still_cannot_be_given_an_operator()
+    if !mix_ready() then return
+
+    val e = mix_err(raw"""
+        impl Mul for int
+            mul(self, k: int) -> int = self
+        """)
+
+    assert(e.contains("'int' already implements 'sysl.Mul' — the compiler provides it"), e)
+
+// Coherence counts the trait's arguments, so this is the block a scalar on the left of an operator
+// needs.
+@test("and a second argument list is how a scalar gets on the left")
+mix_a_second_argument_list_puts_a_scalar_on_the_left()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(raw"""
+        struct C
+            v: int
+        impl Mul[C, C] for int
+            mul(self, c: C) -> C = C(self * c.v)
+        print((3 * C(5)).v)
+        """), "15\n")
+
+@test("and the built-in keeps its own pair, by the operator and by name")
+mix_the_builtin_keeps_its_own_pair()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(raw"""
+        struct C
+            v: int
+        impl Mul[C, C] for int
+            mul(self, c: C) -> C = C(self * c.v)
+        print(3 * 5)
+        print(5.mul(2))
+        print(4.mul(C(6)).v)
+        """), "15\n10\n24\n")
+
+@test("but a block that names nothing of its own still has no home")
+mix_a_block_naming_nothing_of_its_own_has_no_home()
+    if !mix_ready() then return
+
+    val e = mix_err(raw"""
+        impl Mul[real, real] for real
+            mul(self, k: real) -> real = self
+        """)
+
+    assert(e.contains("and 'sysl.Mul' is the library's while nothing this block names is declared outside " +
+                      "the library — so this one has no home"), e)
+
+// ---- what an argument list does not reach: it selects which implementation runs, never the result
+
+@test("a moment plus a length is a moment")
+mix_a_moment_plus_a_length_is_a_moment()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(mix_timeline() + raw"""
+        impl Add[Duration] for Instant
+            add(self, d: Duration) -> Instant = Instant(self.us + d.us)
+        print((Instant(100i64) + Duration(5i64)).us)
+        """), "105\n")
+
+@test("a moment minus a length is a moment")
+mix_a_moment_minus_a_length_is_a_moment()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(mix_timeline() + raw"""
+        impl Sub[Duration] for Instant
+            sub(self, d: Duration) -> Instant = Instant(self.us - d.us)
+        print((Instant(100i64) - Duration(5i64)).us)
+        """), "95\n")
+
+@test("and two lengths add to a length")
+mix_two_lengths_add_to_a_length()
+    if !mix_ready() then return
+
+    assert_eq(mix_ran(mix_timeline() + raw"""
+        impl Add for Duration
+            add(self, d: Duration) -> Duration = Duration(self.us + d.us)
+        print((Duration(100i64) + Duration(5i64)).us)
+        """), "105\n")
+
+@test("but two moments cannot subtract to a length")
+mix_two_moments_cannot_subtract_to_a_length()
+    if !mix_ready() then return
+
+    val e = mix_err(mix_timeline() + raw"""
+        impl Sub[Instant] for Instant
+            sub(self, o: Instant) -> Duration = Duration(self.us - o.us)
+        print(1)
+        """)
+
+    assert(e.contains("method 'sub' returns Duration, but trait 'sysl.Sub' declares Instant"), e)
+
+@test("and giving the subject both argument lists does not help")
+mix_giving_the_subject_both_lists_does_not_help()
+    if !mix_ready() then return
+
+    val e = mix_err(mix_timeline() + raw"""
+        impl Sub[Duration] for Instant
+            sub(self, d: Duration) -> Instant = Instant(self.us - d.us)
+        impl Sub[Instant] for Instant
+            sub(self, o: Instant) -> Duration = Duration(self.us - o.us)
+        print(1)
+        """)
+
+    assert(e.contains("method 'sub' returns Duration, but trait 'sysl.Sub' declares Instant"), e)
