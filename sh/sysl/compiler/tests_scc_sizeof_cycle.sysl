@@ -1,0 +1,89 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.replace_all
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// A measurement of a type inside that type's own declaration -- `bytes: [sizeof(Loop)]u8` in `Loop` --
+// is one mistake, and the program is told it once: the type contains itself, so it has no size. The
+// array's length has no value BECAUSE of that, so it is not also "not a constant".
+//
+// **Every expected diagnostic here was obtained by running the reference compiler (0.0.162) on the
+// same file**, and each test asserts the whole report: exactly one error, its words, its position and
+// its carets.
+
+private scc_skipped() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end scc_skipped
+
+// What the analysis reports about a one-file program, with the temporary directory taken out.
+private scc_err(text: string) -> string
+    val root = make_temp_dir("sysl-sizeof-cycle").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, replace_all(root, "//", "/") + "/", "")
+end scc_err
+
+private scc_count(text: string, part: string) -> int
+    var rest = text
+    var n = 0
+
+    loop
+        rest.index_of(part) match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + part.bytes.len..<rest.bytes.len]
+
+    n
+end scc_count
+
+// The report holds exactly this one diagnostic and nothing else.
+private scc_only(said: string, diagnostic: string)
+    assert_eq(scc_count(said, "error: "), 1, said)
+    assert(said.contains(diagnostic), said)
+end scc_only
+
+@test("a struct measuring itself in an array length is told it contains itself, and only that")
+scc_a_struct_measuring_itself()
+    if scc_skipped() then return
+
+    scc_only(scc_err("struct Loop\n    bytes: [sizeof(Loop)]u8\n\nprint(0)\n"),
+             "error: type 'Loop' contains itself, so it has no finite size\n" +
+             " --> main.sysl:2:20\n  |\n2 |     bytes: [sizeof(Loop)]u8\n  |                    ^^^^")
+
+@test("the same through a nested struct: the outer type is the one that contains itself")
+scc_through_a_nested_struct()
+    if scc_skipped() then return
+
+    scc_only(scc_err("struct Outer\n    inner: Inner\n\nstruct Inner\n    bytes: [sizeof(Outer)]u8\n\nprint(0)\n"),
+             "error: type 'Outer' contains itself, so it has no finite size\n" +
+             " --> main.sysl:5:20\n  |\n5 |     bytes: [sizeof(Outer)]u8\n  |                    ^^^^^")
+
+@test("a measured type nothing declares is told once, as unknown, and the length is not blamed")
+scc_an_unknown_measured_type()
+    if scc_skipped() then return
+
+    scc_only(scc_err("struct Box\n    bytes: [sizeof(Nope)]u8\n\nprint(0)\n"),
+             "error: unknown type 'Nope'\n" +
+             " --> main.sysl:2:20\n  |\n2 |     bytes: [sizeof(Nope)]u8\n  |                    ^^^^")
+
+// The other side of the line: a length that genuinely does not fold is still that mistake.
+@test("a length that is genuinely not a constant is still refused as one")
+scc_a_length_that_is_not_a_constant()
+    if scc_skipped() then return
+
+    scc_only(scc_err("n() -> usize = 4\n\nstruct Box\n    bytes: [n()]u8\n\nprint(0)\n"),
+             "error: an array length must be a constant — a literal, or a 'const' naming one\n" +
+             " --> main.sysl:4:12\n  |\n4 |     bytes: [n()]u8\n  |            ^^^^^^^")

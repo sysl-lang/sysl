@@ -89,8 +89,8 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
 
     // `sizeof(T)` and `alignof(T)` are compile-time constants, so they fold exactly as a literal
     // does -- which is what makes them usable in an array bound and in a `const`.
-    LayoutOf(what, t) -> layout_bytes(cx, what, resolve_type(cx.an, cx.scope, t, cx.subst))
-    OffsetOf(t, field) -> offset_bytes(cx, e.span, resolve_type(cx.an, cx.scope, t, cx.subst), field)
+    LayoutOf(what, t) -> layout_bytes(cx, what, measured(cx, t))
+    OffsetOf(t, field) -> offset_bytes(cx, e.span, measured(cx, t), field)
 
     // `T::Min` and `T::Max` on a built-in integer are constants for the reason `sizeof` is: the
     // answer is a property of the type and is known once the type is.
@@ -302,6 +302,19 @@ private bool_binary(op: string, x: bool, y: bool) -> Option[Const]
 
     None
 end bool_binary
+
+// The type a `sizeof`, `alignof` or `offsetof` measures. One that resolves to `Unknown` was told
+// where it is written -- a name nothing declares, or a type that contains itself, so has no size --
+// and the measurement has no value because of that mistake rather than because it is not a constant.
+// So it counts as a refused fold: a reader asking "did this fold refuse?" stays silent, where it would
+// otherwise add "an array length must be a constant" to a `[sizeof(Loop)]u8` inside `Loop` itself.
+private measured(cx: &Analyzer, t: TypeRef) -> Type
+    val out = resolve_type(cx.an, cx.scope, t, cx.subst)
+
+    if out == Unknown then cx.an.const_refusals += 1
+
+    out
+end measured
 
 // How many bytes `sizeof` or `alignof` answers with, where the type is one this compilation has a
 // layout for. A type parameter is not measured: its width is fixed at each instantiation.
