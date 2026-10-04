@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.env.get as env_var
 import sysl.fs.{read_text, read_bytes}
-import sysl.text.{chars_of, from_utf8_unchecked, str_builder, Search}
+import sysl.text.{chars_of, from_utf8_unchecked, join, str_builder, Search}
 
 // A library as one **file**: the half that could be compiled ahead of time as an object file, and
 // the metadata a consuming compilation reads back out of it.
@@ -191,13 +191,32 @@ end cache_directory
 // the default argument, so a caller naming none and a build that resolved the default agree on one
 // archive rather than building two.
 //
+// **And `SYSL_EXTRA_CFLAGS`, where it says anything**, because those flags reach the clang that
+// compiles the archive and decide what its objects are: `-fsanitize=address` both marks every
+// function for instrumentation and runs the pass. Keyed without them, a sanitized build links
+// whichever archive the first build left -- an ASan run over an uninstrumented library, which reports
+// nothing because it looked at nothing. An unset variable adds nothing, so an ordinary build's path
+// is unchanged.
+//
 // Nothing here is ever evicted. Every distinct library leaves an artifact behind, which is what a
 // cache directory is for -- everything under it is derived, so removing the lot costs a rebuild.
 std_artifact_path(t: Target, fingerprint: string,
                   level: string = DefaultOptimization) -> string = cache_directory() match
     Some(dir) -> s"$dir/sysl/${compiler_identity()}-$fingerprint-${t.name}-${malloc_symbol()}-${free_symbol()}" +
-        s"-O$level/std$SyslibExtension"
+        s"-O$level${extra_flags_key()}/std$SyslibExtension"
     None -> std_artifact_local()
+
+// What `SYSL_EXTRA_CFLAGS` adds to an artifact's key: nothing where it names no flag, and a digest of
+// the flags as clang is handed them otherwise, so spacing alone does not make a second archive.
+extra_flags_key() -> string
+    val flags = extra_cflags()
+
+    if flags.is_empty() then return ""
+
+    val joined = join(flags.view(), " ")
+
+    s"-x${bytes_fingerprint(joined.bytes)}"
+end extra_flags_key
 
 // The project-local artifact path, which is where a machine with no cache directory keeps one. It is
 // **not** keyed by target, because it is one file in one project rather than a cache with room for

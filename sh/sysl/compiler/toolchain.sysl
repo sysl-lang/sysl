@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.process.{capture, run, Output, Status}
 import sysl.fs.{IoError, remove_file, write_text, is_file, is_dir, entries}
-import sysl.text.{join, split, repeat, Search}
+import sysl.text.{join, split, repeat, str_builder, Search}
 import sysl.env.{get as env_var}
 
 // **The C toolchain a build drives**: which clang, what it is handed, and what comes back.
@@ -362,6 +362,90 @@ extra_cflags() -> Buf[string]
     out
 end extra_cflags
 
+// The LLVM function attribute a `-fsanitize=` name needs on the IR sysl generates, or nothing where
+// the sanitizer has none.
+//
+// **This table is the whole of what sysl reads out of the extra flags** -- everything else is passed
+// to clang, which answers for it. A sanitizer is in here when it works by instrumenting functions
+// that carry an attribute, and a frontend is what normally adds one.
+//
+// **UndefinedBehaviorSanitizer is deliberately absent.** UBSan has no such attribute: clang emits
+// its checks into the IR as it generates it, so there is nothing to switch on afterwards, and
+// `-fsanitize=undefined` over a sysl build covers the C a package carries and none of the sysl.
+private sanitizer_attribute(name: string) -> Option[string] = name match
+    "address" -> Some("sanitize_address")
+    "hwaddress" -> Some("sanitize_hwaddress")
+    "memory" -> Some("sanitize_memory")
+    "thread" -> Some("sanitize_thread")
+    _ -> None
+
+// The sanitizers `flags` asked for, by their `-fsanitize=` name, each once.
+//
+// One flag may name several -- `-fsanitize=address,undefined` is the ordinary way to ask for two --
+// so the list is split rather than matched whole. **`-fno-sanitize=` is not an ask**, which is why
+// the prefix is anchored: a substring test would read a suppression as a request.
+sanitizers_asked(flags: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<flags.len()
+        val flag = flags.at(i)
+
+        if flag.starts_with("-fsanitize=")
+            val names = split(flag[11..<flag.bytes.len], ",")
+
+            for j in 0..<names.len
+                if names[j] != "" && !holds_string(out, names[j]) then out.push(names[j])
+
+    out
+end sanitizers_asked
+
+// The attributes every generated function needs for what `flags` asked, in the table's order rather
+// than the flags', so that the text a build writes is the same however the flags were spelled. The
+// flags are a parameter so that a test can ask about a build it is not running in.
+sanitizer_attrs(flags: Buf[string]) -> Buf[string]
+    val asked = sanitizers_asked(flags)
+    val known: []const string = ["address", "hwaddress", "memory", "thread"]
+    var out: Buf[string] = buf()
+
+    for i in 0..<known.len
+        if holds_string(asked, known[i]) then out.push(sanitizer_attribute(known[i]).unwrap())
+
+    out
+end sanitizer_attrs
+
+// The IR with every function marked for the sanitizers `SYSL_EXTRA_CFLAGS` asked for.
+//
+// **LLVM instruments only functions carrying the right attribute, and it is a *frontend* that adds
+// one** -- so IR handed to clang as a `.ll` links against the sanitizer's runtime and is instrumented
+// nowhere. That reads as a clean run and is a sanitizer that never looked; marking every `define`
+// here is what makes the answer mean something. It is applied wherever the text is written for
+// clang, and to what `emit-llvm` prints, which is that same text.
+//
+// The group is numbered because LLVM's syntax takes nothing else, and the number is one nothing else
+// emits -- sysl's IR carries no attribute groups of its own.
+sanitized(ir: string, attrs: Buf[string] = sanitizer_attrs(extra_cflags())) -> string
+    if attrs.is_empty() then return ir
+
+    var b = str_builder()
+    var start: usize = 0
+
+    for i in 0..<ir.bytes.len
+        if ir.bytes[i] == u8('\n')
+            b.push(marked_line(ir[start..<i]))
+            b.push_char('\n')
+            start = i + 1
+
+    if start < ir.bytes.len then b.push(marked_line(ir[start..<ir.bytes.len]))
+
+    b.push(s"\nattributes #99 = { ${join(attrs.view(), " ")} }\n")
+    b.finish()
+end sanitized
+
+// One line of a module, with a definition's opening brace preceded by the sanitizer group.
+private marked_line(line: string) -> string =
+    if line.starts_with("define ") && line.ends_with(" {") then line[0..<(line.bytes.len - 1)] + "#99 {"
+    else line
+
 private split_on_space(text: string) -> Buf[string]
     var out: Buf[string] = buf()
     var start: usize = 0
@@ -582,7 +666,7 @@ compile_object(cc: string, ir: string, obj: string, target: Target,
                level: string, lto: Option[string] = None) -> Result[unit, string]
     val ll = s"$obj.ll"
 
-    write_text(ll, ir) match
+    write_text(ll, sanitized(ir)) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 
@@ -599,6 +683,14 @@ compile_object(cc: string, ir: string, obj: string, target: Target,
 
     // Bitcode rather than an object, for a link that optimizes across every member.
     if lto.is_some() then args.push(s"-flto=${lto.unwrap()}")
+
+    // **The extra flags reach this clang too**, or a library artifact or a `build-c` archive is
+    // marked for a sanitizer whose pass never runs: the attribute says which functions to
+    // instrument, and only `-fsanitize=` puts the pass in the pipeline.
+    val extra = extra_cflags()
+
+    for i in 0..<extra.len()
+        args.push(extra.at(i))
 
     val machine = machine_flags(target)
 
@@ -721,7 +813,7 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
 
     val ll = s"$exe.ll"
 
-    write_text(ll, ir) match
+    write_text(ll, sanitized(ir)) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 
