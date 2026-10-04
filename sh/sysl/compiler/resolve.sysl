@@ -583,7 +583,7 @@ private declared_table(owner: string, owner_root: string, deps: &Buf[Dependency]
         val standing = stand_in_for(state, dep)
         val standing_dir = if standing.is_some() then standing.unwrap().0 else ""
 
-        val added = if standing.is_some() then stand_in_bindings(dep, standing_dir)
+        val added = if standing.is_some() then stand_in_bindings(dep, standing_dir)?
         else declared_bindings(owner, dep, state)?
 
         for j in 0..<added.len()
@@ -605,11 +605,15 @@ private declared_bindings(owner: string, dep: &Dependency,
         Ok(got) -> Ok(got)
 end declared_bindings
 
-// What a stood-in coordinate binds: each of the root's modules as itself, or under the mount.
-private stand_in_bindings(dep: &Dependency, dir: string) -> Buf[MountedName]
+// What a stood-in coordinate binds: each of the root's modules as itself, or under the mount. A root
+// whose tree holds a malformed per-OS selector is refused as any package's is.
+private stand_in_bindings(dep: &Dependency, dir: string) -> Result[Buf[MountedName], string]
     var out: Buf[MountedName] = buf()
     val owner = dependency_canonical(dep)
-    val modules = package_modules(dir)
+
+    val modules = package_modules(dir) match
+        Err(e) -> return Err(e.message)
+        Ok(m) -> m
 
     for i in 0..<modules.len()
         val m = modules.at(i)
@@ -618,7 +622,7 @@ private stand_in_bindings(dep: &Dependency, dir: string) -> Buf[MountedName]
             Some(mount) -> out.push(MountedName(package_qualify(mount, m), m, owner))
             None -> out.push(MountedName(m, m, owner))
 
-    out
+    Ok(out)
 end stand_in_bindings
 
 // Every package reachable through the ones a manifest named, minus those it named itself.
