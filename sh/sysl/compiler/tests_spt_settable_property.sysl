@@ -1,0 +1,278 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Status, capture}
+
+// A property that can be written as well as read (`reference/declarations.md § A property may be
+// settable`). `p.count = v` is a **call** rather than a store, which is what every case here is really
+// about: the value reaches the setter's body, the compound forms read and write through one address,
+// and the forms that cannot be a call are refused by name rather than by the absence of an address.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.162)**, whose
+// `SettablePropertyTests` these are, by handing the installed `sysl` the same program.
+
+private var spt_library_cache: Buf[Program] = buf()
+private var spt_library_read: bool = false
+
+private spt_library() -> Buf[Program]
+    if spt_library_read then return spt_library_cache
+
+    spt_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> spt_library_cache = units
+
+    spt_library_cache
+end spt_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private spt_ready() -> bool
+    if spt_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end spt_ready
+
+// **What a program printed, where it exited 0**; a program that stopped answers with how it ended in
+// front, and one the build refused answers with the refusal.
+private spt_ran(text: string) -> string
+    val root = make_temp_dir("sysl-spt").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(o) -> o.status match
+            Status.Exited(code) -> if code == 0 then o.text else s"exited $code: ${o.text}"
+            Status.Signalled(sig) -> s"signalled $sig: ${o.text}"
+            _ -> s"timed out: ${o.text}"
+end spt_ran
+
+// What the build said is a refusal carrying this message, anchored at this `line:column` of the program.
+private spt_check(said: string, message: string, at: string)
+    assert(said.contains(s"error: $message\n --> "), said)
+    assert(said.contains(s"main.sysl:$at\n"), said)
+
+private spt_refused(text: string, message: string, at: string) = spt_check(spt_ran(text), message, at)
+
+// The cell most cases write through: a getter over one field and a setter storing what it is given.
+private spt_cell() -> string = "struct Cell\n    v: int\n\n    count -> int = self.v\n\n    set count(x)\n        self.v = x\n"
+
+// -- a write is a call -----------------------------------------------------------------------------
+
+@test("a write reaches the setter's body")
+spt_write_reaches_the_setter()
+    if !spt_ready() then return
+
+    assert_eq(spt_ran("struct Cell\n    v: int\n\n    count -> int = self.v\n\n    set count(x)\n" +
+                      "        self.v = x * 10\nvar c = Cell(0)\nc.count = 4\nprint(c.count)\n"), "40\n")
+
+@test("the setter sees the value and the getter is unaffected")
+spt_setter_sees_the_value()
+    if !spt_ready() then return
+
+    assert_eq(spt_ran("struct Temp\n    c: int\n\n    f -> int = self.c * 9 / 5 + 32\n\n    set f(v)\n" +
+                      "        self.c = (v - 32) * 5 / 9\nvar t = Temp(0)\nt.f = 212\nprint(t.c, t.f)\n"),
+              "100 212\n")
+
+@test("a setter runs code the write could not have done itself")
+spt_setter_runs_code()
+    if !spt_ready() then return
+
+    assert_eq(spt_ran("struct Counted\n    v: int\n    writes: int\n\n    value -> int = self.v\n\n" +
+                      "    set value(x)\n        self.v = x\n        self.writes += 1\nvar c = Counted(0, 0)\n" +
+                      "c.value = 1\nc.value = 2\nc.value = 3\nprint(c.value, c.writes)\n"), "3 3\n")
+
+// -- the compound forms ----------------------------------------------------------------------------
+
+@test("the compound forms read through the setter and write back")
+spt_compound_forms()
+    if !spt_ready() then return
+
+    assert_eq(spt_ran(spt_cell() + "var c = Cell(1)\nc.count += 1\nc.count *= 5\nc.count -= 2\nprint(c.count)\n"),
+              "8\n")
+
+@test("a compound form calls the setter once, not the getter twice over")
+spt_compound_calls_the_setter_once()
+    if !spt_ready() then return
+
+    assert_eq(spt_ran("struct Counted\n    v: int\n    reads: int\n    writes: int\n\n    value -> int = self.v\n\n" +
+                      "    set value(x)\n        self.v = x\n        self.writes += 1\nvar c = Counted(5, 0, 0)\n" +
+                      "c.value += 1\nprint(c.value, c.writes)\n"), "6 1\n")
+
+@test("the receiver of a compound form is evaluated once")
+spt_compound_receiver_once()
+    if !spt_ready() then return
+
+    assert_eq(spt_ran(spt_cell() + "var calls = 0\nwhich(n: int) -> int\n    calls += 1\n    n\n" +
+                      "var cells = [Cell(1), Cell(2)]\ncells[which(0)].count += 10\nprint(cells[0].count, calls)\n"),
+              "11 1\n")
+
+// -- receivers -------------------------------------------------------------------------------------
+
+private spt_plus_one() -> string = "struct Cell\n    v: int\n\n    count -> int = self.v\n\n    set count(x)\n        self.v = x + 1\n"
+
+@test("a setter is reached through a pointer receiver")
+spt_pointer_receiver()
+    if !spt_ready() then return
+
+    assert_eq(spt_ran(spt_plus_one() + "var c = Cell(0)\nval p = &c\np.count = 5\nprint(c.count)\n"), "6\n")
+
+@test("a setter is reached through a reference receiver")
+spt_reference_receiver()
+    if !spt_ready() then return
+
+    assert_eq(spt_ran(spt_plus_one() + "var c: &Cell = Cell(0)\nc.count = 5\nprint(c.count)\n"), "6\n")
+
+@test("a setter on a generic type is instantiated per receiver")
+spt_generic_receiver()
+    if !spt_ready() then return
+
+    assert_eq(spt_ran("struct Box[T]\n    v: T\n\n    value -> T = self.v\n\n    set value(x)\n        self.v = x\n" +
+                      "var a = Box(1)\nvar b = Box(\"hi\")\na.value = 7\nb.value = \"there\"\nprint(a.value, b.value)\n"),
+              "7 there\n")
+
+@test("a setter may be written on an enum")
+spt_enum_receiver()
+    if !spt_ready() then return
+
+    assert_eq(spt_ran("enum Dial\n    Low\n    High\n\n    level -> int = self match\n        Low -> 1\n" +
+                      "        High -> 2\n\n    set level(n)\n        *self = if n > 1 then Dial.High else Dial.Low\n" +
+                      "var d = Dial.Low\nd.level = 5\nprint(d.level)\n"), "2\n")
+
+@test("a private setter leaves the property readable")
+spt_private_setter()
+    if !spt_ready() then return
+
+    assert_eq(spt_ran("struct Cell\n    v: int\n\n    count -> int = self.v\n\n    private set count(x)\n" +
+                      "        self.v = x\n\n    bump(*self)\n        self.count = self.count + 1\n" +
+                      "var c = Cell(1)\nc.bump()\nprint(c.count)\n"), "2\n")
+
+// -- refusals --------------------------------------------------------------------------------------
+
+@test("a setter with no property of that name is refused")
+spt_setter_with_no_property()
+    if !spt_ready() then return
+
+    spt_refused("struct Cell\n    v: int\n\n    set count(x)\n        self.v = x\nprint(1)\n",
+                "'set count' writes a property called 'count', and 'Cell' declares none — a property is read " +
+                "as well as written, and its result is where the value's type comes from",
+                "4:5")
+
+@test("a read-only property says what to write")
+spt_read_only_says_what_to_write()
+    if !spt_ready() then return
+
+    spt_refused("struct Cell\n    v: int\n    count -> int = self.v\nvar c = Cell(1)\nc.count = 2\n",
+                "'count' is a property of 'Cell', which computes rather than naming storage, so there is " +
+                "nothing to assign through — write 'set count(…)' on 'Cell' to give it a setter",
+                "5:1")
+
+@test("a compound form on a read-only property is refused too")
+spt_compound_on_read_only()
+    if !spt_ready() then return
+
+    spt_refused("struct Cell\n    v: int\n    count -> int = self.v\nvar c = Cell(1)\nc.count += 2\n",
+                "'count' is a property of 'Cell', which computes rather than naming storage, so '+=' has " +
+                "nothing to write back — write 'set count(…)' on 'Cell' to give it a setter",
+                "5:1")
+
+@test("a setter refuses a value of the wrong type")
+spt_wrong_type()
+    if !spt_ready() then return
+
+    spt_refused(spt_cell() + "var c = Cell(1)\nc.count = \"two\"\n", "'x' of 'set' is int, but string was given",
+                "9:11")
+
+@test("a second setter for one property is refused, and named as one")
+spt_second_setter()
+    if !spt_ready() then return
+
+    val said = spt_ran(spt_cell() + "\n    set count(y)\n        self.v = y\nprint(1)\n")
+
+    spt_check(said, "type 'Cell' already has a setter for 'count'", "9:5")
+    assert(!said.contains("$"), said)
+
+@test("a setter refuses a 'val' receiver, naming the binding")
+spt_val_receiver()
+    if !spt_ready() then return
+
+    spt_refused(spt_cell() + "val c = Cell(1)\nc.count = 2\n",
+                "'set' takes '*self', so it writes through what it is called on, and a 'val' is written " +
+                "once — write 'var c' if it is meant to change",
+                "9:1")
+
+@test("a property cannot be one place of a multiple assignment")
+spt_not_a_multiple_assignment_place()
+    if !spt_ready() then return
+
+    val said = spt_ran(spt_cell() + "var c = Cell(1)\nvar n = 0\nc.count, n = 1, 2\n")
+
+    assert(said.contains("error: 'count' is set by a call rather than by a store, so it cannot be one place of " +
+                         "a multiple assignment — write that one on its own\n  --> "), said)
+    assert(said.contains("main.sysl:10:3\n"), said)
+
+@test("the address of a property is refused")
+spt_address_of_a_property()
+    if !spt_ready() then return
+
+    spt_refused(spt_cell() + "var c = Cell(1)\nval p = &c.count\n",
+                "'&' needs a variable, a field, an element, or a dereference — something with an address",
+                "9:9")
+
+// The name a setter is filed under holds a `$`, which no source text can spell, so the reach is
+// refused by the lexer and never comes near a member lookup that could answer "already".
+@test("a setter is not reachable under the name it is filed under")
+spt_filed_name_unreachable()
+    if !spt_ready() then return
+
+    val said = spt_ran(spt_cell() + "var c = Cell(1)\nprint(c.count$set)\n")
+
+    spt_check(said, "illegal character", "9:14")
+    assert(!said.contains("already"), said)
+
+@test("a getter that reads its own property is refused")
+spt_getter_reads_itself()
+    if !spt_ready() then return
+
+    spt_refused("struct Cell\n    v: int\n    count -> int = self.count\nvar c = Cell(1)\nprint(c.count)\n",
+                "'count' reads the property it is defining, so it calls itself — the value a property computes " +
+                "is not the property. What a body like this means to read is the field it is in front of",
+                "3:25")
+
+@test("a setter that writes its own property is refused")
+spt_setter_writes_itself()
+    if !spt_ready() then return
+
+    spt_refused("struct Cell\n    v: int\n\n    count -> int = self.v\n\n    set count(x)\n        self.count = x\n" +
+                "var c = Cell(1)\nc.count = 2\n",
+                "'count' writes the property it is defining, so it calls itself — a setter is what writing the " +
+                "property means, and there is nothing further in for it to reach. What a body like this means " +
+                "to write is the field it is in front of",
+                "7:9")
