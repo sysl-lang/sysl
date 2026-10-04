@@ -1,0 +1,534 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `@test` as the grammar and the analyzer see it (`reference/attributes.md § @test`), and the four
+// hooks a module writes around its tests. Half of what is pinned here is about the attribute as a
+// mechanism -- that `@` opens one, that the word after it is checked rather than swallowed, that the
+// attribute and its declaration are one statement -- and the other half is what a `@test` function
+// may be: everything the runner needs to call it with nothing and read the answer off whether it
+// returned.
+//
+// **Every string quoted here was read off the reference compiler (0.0.158)** on the same source; none
+// of it is composed.
+
+// -- the machinery ----------------------------------------------------------------------------------
+
+private tax_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end tax_ready
+
+// Everything one source has to say for itself, taken the whole way an ordinary build takes it.
+private tax_err(text: string) -> string
+    val root = make_temp_dir("sysl-test-attr").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tax_err
+
+// The LLVM text of a program that must compile.
+private tax_ir(text: string) -> string
+    val root = make_temp_dir("sysl-test-attr").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tax_ir
+
+// What a one-file program prints.
+private tax_ran(text: string) -> string
+    val root = make_temp_dir("sysl-test-attr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tax_ran
+
+// A tree of files, each `(directory, file, text)` with the directory relative to the root and empty
+// for the root itself.
+private tax_file(files: *Buf[(string, string, string)], dir: string, name: string, text: string)
+    files.push((dir, name, text))
+
+// What a test build of a tree lists -- its tests, each carrying its hooks -- or the refusal it was
+// met with, rendered.
+private tax_build(files: *Buf[(string, string, string)]) -> Result[Buf[TTest], string]
+    val root = make_temp_dir("sysl-test-attr").unwrap()
+
+    make_dir_all(root).unwrap()
+
+    for i in 0..<files.len()
+        val (dir, name, text) = files.at(i)
+        val home = if dir == "" then root else s"$root/$dir"
+
+        make_dir_all(home).unwrap()
+        write_text(s"$home/$name", text).unwrap()
+
+    val out: Result[Buf[TTest], string] = test_build_of(root, None) match
+        Err(refusal) -> Err(refusal.message)
+        Ok(made) ->
+            if made.emitted.report.is_empty() then Ok(made.tests)
+            else Err(analysis_report(made.emitted.report))
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tax_build
+
+// The display names a one-file tree's test build lists, in order.
+private tax_discovered(text: string) -> string
+    var files: Buf[(string, string, string)] = buf()
+
+    tax_file(&files, "", "m.sysl", text)
+
+    tax_build(&files) match
+        Err(why) -> s"refused: $why"
+        Ok(tests) ->
+            var out = ""
+
+            for i in 0..<tests.len()
+                out = out + (if i == 0 then "" else ",") + tests.at(i).display
+
+            out
+end tax_discovered
+
+private tax_hook_func(h: Option[THook]) -> string = h match
+    Some(one) -> one.func
+    None -> "none"
+
+// -- the attribute parses in each form it offers ----------------------------------------------------
+
+@test("a bare '@test' says only that the function is one")
+tax_a_bare_test()
+    assert_eq(pf("@test\nt() = 0\n"), "(fn @test t () 0)")
+
+@test("a string is the name a report shows")
+tax_a_string_is_the_name()
+    assert_eq(pf("@test(\"a sentence about what holds\")\nt() = 0\n"),
+              "(fn @test(\"a sentence about what holds\") t () 0)")
+
+@test("'should_trap' inverts the verdict")
+tax_should_trap_inverts()
+    assert_eq(pf("@test(should_trap)\nt() = 0\n"), "(fn @test@should_trap t () 0)")
+
+@test("'should_trap' may name what the run must have printed")
+tax_should_trap_names_the_text()
+    assert_eq(pf("@test(should_trap: \"past the end\")\nt() = 0\n"),
+              "(fn @test@should_trap(\"past the end\") t () 0)")
+
+// The two are independent -- a test may want a sentence for its name *and* be about a check that
+// fires -- so they compose rather than being alternatives.
+@test("a name and an expectation may be written together")
+tax_a_name_and_an_expectation()
+    assert_eq(pf("@test(\"an index past the end is refused\", should_trap: \"past the end\")\nt() = 0\n"),
+              "(fn @test(\"an index past the end is refused\")@should_trap(\"past the end\") t () 0)")
+
+// -- an attribute the language does not have is refused by name -------------------------------------
+
+// Every member of the closed set is named, so a reader who wrote the wrong word is shown the right one.
+@test("an unknown word after '@' says what the annotations are")
+tax_an_unknown_word()
+    assert_eq(pf_err("@serializable\nt() = 0\n"),
+        "'serializable' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, '@packed' and '@align(n)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
+    assert_eq(pf_at("@serializable\nt() = 0\n"), "1:14")
+
+// `#if` never reaches the grammar at all, so nothing about the annotation sigil can be about one.
+@test("while a directive at the margin is read as a directive")
+tax_a_directive_at_the_margin()
+    if !tax_ready() || !clang_available() then return
+
+    assert_eq(tax_ran("#if posix\nt() -> int = 1\n#else\nt() -> int = 2\n#endif\nprint(t())\n"), "1\n")
+
+@test("an extern has no body to run")
+tax_an_extern_has_no_body()
+    assert_eq(pf_err("@test\nextern side_effect()\n"),
+        "an annotation marks a function, and only a function — neither what 'sysl test' calls nor what recurses is anything a declaration of another kind supplies. '@packed', '@align(n)' and '@export(\"...\")' are the three that mark a struct instead")
+    assert_eq(pf_at("@test\nextern side_effect()\n"), "2:1")
+
+// -- what a '@test' function may be is what the runner can call -------------------------------------
+
+@test("a parameter has nowhere to come from")
+tax_a_parameter_has_nowhere_to_come_from()
+    if !tax_ready() then return
+
+    val said = tax_err("@test\nt(n: int) =\n    print(n)\n")
+
+    assert(said.contains("a '@test' function takes no parameters, and 't' takes one — 'sysl test' calls it with nothing, so there is nowhere for an argument to come from"), said)
+    assert(said.contains("main.sysl:1:1"), said)
+
+// A variadic needs a named parameter in front of its tail, so it is refused by the rule above.
+@test("a variadic tail is refused for the parameter it has to have")
+tax_a_variadic_tail()
+    if !tax_ready() then return
+
+    val said = tax_err("@test\nt(n: int, ...) =\n    print(n)\n")
+
+    assert(said.contains("a '@test' function takes no parameters, and 't' takes one — 'sysl test' calls it with nothing, so there is nowhere for an argument to come from"), said)
+
+@test("a tail with nothing in front of it is refused where any other signature would be")
+tax_a_tail_with_nothing_in_front()
+    if !tax_ready() then return
+
+    val said = tax_err("@test\nt(...) = 0\n")
+
+    assert(said.contains("'t' needs at least one named parameter before '...'"), said)
+
+@test("a generic has no compiled form until a caller fixes its arguments")
+tax_a_generic_test()
+    if !tax_ready() then return
+
+    val said = tax_err("@test\nt[T]() = 0\n")
+
+    assert(said.contains("a '@test' function has no type parameters, and 't' declares 'T' — a generic is compiled for the arguments a caller fixes, and the runner supplies none"), said)
+    assert(said.contains("main.sysl:1:1"), said)
+
+@test("a result is a value nothing is going to read")
+tax_a_result_nothing_reads()
+    if !tax_ready() then return
+
+    val said = tax_err("@test\nt() -> int = 3\n")
+
+    assert(said.contains("a '@test' function returns nothing, and 't' returns 'int' — a test's result is whether it came back, so there is nothing to read a value with"), said)
+    assert(said.contains("main.sysl:1:1"), said)
+
+// `-> unit` and no result at all are one signature written two ways, so a rule checking the syntax
+// rather than the resolved type would have refused this one.
+@test("an explicit '-> unit' is the same as writing none")
+tax_an_explicit_unit()
+    if !tax_ready() then return
+
+    assert_eq(tax_discovered("@test\nt() -> unit = 0\n"), "t")
+
+// -- a test is reported under the name it was given -------------------------------------------------
+
+@test("with no string, that is the function's own bare name")
+tax_the_bare_name()
+    if !tax_ready() then return
+
+    assert_eq(tax_discovered("@test\nadds_two() = 0\n"), "adds_two")
+
+@test("a module does not decorate it — the report groups by file already")
+tax_a_module_does_not_decorate()
+    if !tax_ready() then return
+
+    var files: Buf[(string, string, string)] = buf()
+
+    tax_file(&files, "m", "m.sysl", "module m\n\n@test\nadds_two() = 0\n")
+
+    val tests = tax_build(&files).unwrap()
+
+    assert_eq(tests.len(), 1)
+    assert_eq(tests.at(0).display, "adds_two")
+    assert_eq(tests.at(0).func, module_qualify("m", "adds_two"))
+
+@test("the position a report points at is the attribute's, not the function's")
+tax_the_position_is_the_attributes()
+    if !tax_ready() then return
+
+    var files: Buf[(string, string, string)] = buf()
+
+    tax_file(&files, "", "m.sysl", "double(n: int) -> int = n * 2\n\n@test\nt() = 0\n")
+
+    val tests = tax_build(&files).unwrap()
+
+    assert_eq(tests.len(), 1)
+    assert(tests.at(0).file.ends_with("m.sysl"), tests.at(0).file)
+    assert_eq(tests.at(0).line, 3)
+
+@test("tests are listed in the order the source declared them")
+tax_listed_in_declaration_order()
+    if !tax_ready() then return
+
+    assert_eq(tax_discovered("@test\nthird() = 0\n\n@test\nfirst() = 0\n\n@test\nsecond() = 0\n"),
+              "third,first,second")
+
+// -- the shapes the grammar has to say no to --------------------------------------------------------
+
+// A member parses under the rule every member does, so the refusal is that rule's.
+@test("a method cannot be a test")
+tax_a_method_cannot_be_a_test()
+    assert_eq(pf_err("struct Point\n    x: int\n\n    @test\n    t(self) = 0\n"),
+        "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@reads' and '@writes' — and the three about the function it lowers to, '@noinline', '@inline' and '@cold'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')")
+    assert_eq(pf_at("struct Point\n    x: int\n\n    @test\n    t(self) = 0\n"), "4:5")
+
+@test("an attribute with empty parentheses says nothing, and is not a form")
+tax_empty_parentheses()
+    assert_eq(pf_err("@test()\nt() = 0\n"),
+        "'@test' takes a description or nothing at all, and '()' is neither — drop the parentheses, and the function's own name becomes its description")
+    assert_eq(pf_at("@test()\nt() = 0\n"), "1:6")
+
+private tax_left_open() -> string =
+    "'@test' closes what it opened — the description, 'should_trap' and 'ignore' go between parentheses, in that order, and there is no ')' here to end them"
+
+@test("an argument list left open is answered by the annotation rather than by the line below it")
+tax_an_argument_list_left_open()
+    assert_eq(pf_err("@test(\"what holds\"\nt() = 0\n"), tax_left_open())
+    assert_eq(pf_at("@test(\"what holds\"\nt() = 0\n"), "2:1")
+
+@test("'should_trap' left open is the same case")
+tax_should_trap_left_open()
+    assert_eq(pf_err("@test(should_trap\nt() = 0\n"), tax_left_open())
+    assert_eq(pf_at("@test(should_trap\nt() = 0\n"), "2:1")
+
+@test("one attribute to a declaration")
+tax_one_attribute_to_a_declaration()
+    assert_eq(pf_err("@test\n@test\nt() = 0\n"),
+        "'@test' is written twice above one declaration, and it says nothing the once does not")
+    assert_eq(pf_at("@test\n@test\nt() = 0\n"), "3:1")
+
+// Refused by the grammar rather than by the attribute rule: at the end of a file there is no token
+// after the newline for the attribute's own sentence to be reported against.
+@test("an attribute at the end of a file has nothing to attach to")
+tax_an_attribute_at_the_end_of_a_file()
+    assert_eq(pf_err("@test\n"), "an attribute expected")
+    assert_eq(pf_at("@test\n"), "1:2")
+
+// -- the hooks a module writes around its tests -----------------------------------------------------
+
+@test("each of the four is its own moment")
+tax_each_hook_is_its_own_moment()
+    assert_eq(pf("@setup\ns() = 0\n"), "(fn @setup s () 0)")
+    assert_eq(pf("@teardown\nd() = 0\n"), "(fn @teardown d () 0)")
+    assert_eq(pf("@setup_all\ns() = 0\n"), "(fn @setup_all s () 0)")
+    assert_eq(pf("@teardown_all\nd() = 0\n"), "(fn @teardown_all d () 0)")
+
+// `setup_all` is one identifier, so nothing has to order the alternatives to keep it from being read
+// as `setup` with a stray word after it.
+@test("'setup_all' is not 'setup' with something after it")
+tax_setup_all_is_not_setup()
+    assert(pf("@setup_all\ns() = 0\n") != pf("@setup\ns() = 0\n"), "two kinds")
+
+@test("a hook takes no arguments")
+tax_a_hook_takes_no_arguments()
+    assert_eq(pf_err("@setup(\"once\")\ns() = 0\n"),
+        "a hook takes no arguments — when it runs is what the word says, and what it does is its body. There is nothing left for a parenthesis to carry")
+    assert_eq(pf_at("@setup(\"once\")\ns() = 0\n"), "1:7")
+
+@test("the position a report points at is the attribute's")
+tax_a_hooks_position()
+    if !tax_ready() then return
+
+    var files: Buf[(string, string, string)] = buf()
+
+    tax_file(&files, "", "m.sysl", "double(n: int) -> int = n * 2\n\n@setup\ns() = 0\n\n@test\nt() = 0\n")
+
+    val tests = tax_build(&files).unwrap()
+    val setup = tests.at(0).hooks.setup.unwrap()
+
+    assert_eq(setup.func, "s")
+    assert(setup.file.ends_with("m.sysl"), setup.file)
+    assert_eq(setup.line, 3)
+
+@test("a module's tests all carry that module's hooks")
+tax_a_modules_tests_carry_its_hooks()
+    if !tax_ready() then return
+
+    var files: Buf[(string, string, string)] = buf()
+
+    tax_file(&files, "m", "m.sysl", "module m\n\n@setup\ns() = 0\n\n@test\none() = 0\n\n@test\ntwo() = 0\n")
+
+    val tests = tax_build(&files).unwrap()
+
+    assert_eq(tests.len(), 2)
+    assert_eq(tax_hook_func(tests.at(0).hooks.setup), module_qualify("m", "s"))
+    assert_eq(tax_hook_func(tests.at(1).hooks.setup), module_qualify("m", "s"))
+
+// The scope is the module and nothing smaller, so two modules keep their own -- which is what makes
+// the refusal below a rule about a module rather than about a file.
+@test("a hook reaches only the module that declared it")
+tax_a_hook_reaches_only_its_module()
+    if !tax_ready() then return
+
+    var files: Buf[(string, string, string)] = buf()
+
+    tax_file(&files, "a", "a.sysl", "module a\n\n@setup\ns() = 0\n\n@test\nmine() = 0\n")
+    tax_file(&files, "b", "b.sysl", "module b\n\n@test\ntheirs() = 0\n")
+
+    val tests = tax_build(&files).unwrap()
+
+    assert_eq(tests.len(), 2)
+
+    for i in 0..<tests.len()
+        val t = tests.at(i)
+
+        val want = if t.display == "mine" then module_qualify("a", "s") else "none"
+
+        assert_eq(tax_hook_func(t.hooks.setup), want)
+
+@test("a second hook of one kind in one module is refused, and the message names both")
+tax_a_second_hook_of_one_kind()
+    if !tax_ready() then return
+
+    var files: Buf[(string, string, string)] = buf()
+
+    tax_file(&files, "a", "a.sysl",
+             "module a\n\n@setup\nfirst() = 0\n\n@setup\nsecond() = 0\n\n@test\nt() = 0\n")
+
+    val said = tax_build(&files) match
+        Err(why) -> why
+        Ok(_) -> "accepted"
+
+    assert(said.contains("a module writes at most one '@setup', and 'a' already has one — 'first' at "), said)
+    assert(said.contains("a/a.sysl:3, and now 'second'. Both would run at the same moment, and nothing says in which order; write one hook and have it call what it needs"), said)
+    assert(said.contains("a/a.sysl:6:1"), said)
+
+@test("the same kind in two modules is two hooks and no complaint")
+tax_the_same_kind_in_two_modules()
+    if !tax_ready() then return
+
+    var files: Buf[(string, string, string)] = buf()
+
+    tax_file(&files, "a", "a.sysl", "module a\n\n@setup\ns() = 0\n\n@test\nmine() = 0\n")
+    tax_file(&files, "b", "b.sysl", "module b\n\n@setup\ns() = 0\n\n@test\ntheirs() = 0\n")
+
+    val tests = tax_build(&files).unwrap()
+    var seen = ""
+
+    for i in 0..<tests.len()
+        seen = seen + tests.at(i).display + "=" + tax_hook_func(tests.at(i).hooks.setup) + ";"
+
+    assert_eq(tests.len(), 2)
+    assert(seen.contains(s"mine=${module_qualify("a", "s")};"), seen)
+    assert(seen.contains(s"theirs=${module_qualify("b", "s")};"), seen)
+
+@test("the four kinds are four scopes, so all four may stand in one module")
+tax_the_four_kinds_in_one_module()
+    if !tax_ready() then return
+
+    var files: Buf[(string, string, string)] = buf()
+
+    tax_file(&files, "m", "m.sysl", "module m\n\n@setup\nup() = 0\n\n@teardown\ndown() = 0\n\n" +
+                                    "@setup_all\nboot() = 0\n\n@teardown_all\nhalt() = 0\n\n@test\nt() = 0\n")
+
+    val hooks = tax_build(&files).unwrap().at(0).hooks
+
+    assert_eq(tax_hook_func(hooks.setup), module_qualify("m", "up"))
+    assert_eq(tax_hook_func(hooks.teardown), module_qualify("m", "down"))
+    assert_eq(tax_hook_func(hooks.setup_all), module_qualify("m", "boot"))
+    assert_eq(tax_hook_func(hooks.teardown_all), module_qualify("m", "halt"))
+
+@test("two hooks above one declaration name two moments")
+tax_two_hooks_above_one_declaration()
+    assert_eq(pf_err("@setup\n@teardown\ns() = 0\n"),
+        "'@setup' and '@teardown' each say when 'sysl test' calls this function, and they name different moments — a function is a test or one of the hooks around one, and it is called once")
+    assert_eq(pf_at("@setup\n@teardown\ns() = 0\n"), "3:1")
+
+@test("one hook written twice above one declaration is the ordinary repeat")
+tax_one_hook_written_twice()
+    assert_eq(pf_err("@setup\n@setup\ns() = 0\n"),
+        "'@setup' is written twice above one declaration, and it says nothing the once does not")
+    assert_eq(pf_at("@setup\n@setup\ns() = 0\n"), "3:1")
+
+// -- what a hook function may be is what the runner can call ----------------------------------------
+
+@test("a parameter has nowhere to come from, and the message names the hook")
+tax_a_hooks_parameter()
+    if !tax_ready() then return
+
+    val said = tax_err("@setup\ns(n: int) =\n    print(n)\n")
+
+    assert(said.contains("a '@setup' function takes no parameters, and 's' takes one — 'sysl test' calls it with nothing, so there is nowhere for an argument to come from"), said)
+
+@test("a generic hook has no compiled form until a caller fixes its arguments")
+tax_a_generic_hook()
+    if !tax_ready() then return
+
+    val said = tax_err("@teardown_all\nd[T]() = 0\n")
+
+    assert(said.contains("a '@teardown_all' function has no type parameters, and 'd' declares 'T' — a generic is compiled for the arguments a caller fixes, and the runner supplies none"), said)
+
+@test("a hook's result is a value nothing is going to read")
+tax_a_hooks_result()
+    if !tax_ready() then return
+
+    val said = tax_err("@setup_all\ns() -> int = 3\n")
+
+    assert(said.contains("a '@setup_all' function returns nothing, and 's' returns 'int' — a hook is called for what it does rather than for what it answers, so there is nothing to read a value with"), said)
+    assert(said.contains("main.sysl:1:1"), said)
+
+// -- a hook is scaffolding, and a build that runs nothing drops it ----------------------------------
+
+// Analyzed in every build, emitted in one: a hook that stopped being checked outside `sysl test`
+// would rot exactly as an unchecked test would.
+@test("a broken hook is an error in an ordinary build")
+tax_a_broken_hook()
+    if !tax_ready() then return
+
+    val said = tax_err("@setup\ns() =\n    print(undefined_name)\n")
+
+    assert(said.contains("undefined name 'undefined_name'"), said)
+    assert(said.contains("main.sysl:3:11"), said)
+
+@test("an ordinary build emits neither the hook nor what only it calls")
+tax_an_ordinary_build_drops_the_hook()
+    if !tax_ready() then return
+
+    val out = tax_ir("only_the_hook_calls_me() = print(\"scaffolding\")\n\n@setup\ns() =\n" +
+                     "    only_the_hook_calls_me()\n\nprint(\"program\")\n")
+
+    assert(!out.starts_with("did not compile"), out)
+    assert(!out.contains("only_the_hook_calls_me"), "the hook's callee is dropped with it")
+    assert(out.contains("program"), "the program itself is emitted")
+
+// -- a test is analyzed whether or not the build would run it ---------------------------------------
+
+@test("a broken test is an error in an ordinary build")
+tax_a_broken_test_in_an_ordinary_build()
+    if !tax_ready() then return
+
+    val said = tax_err("@test\nt() =\n    print(undefined_name)\n")
+
+    assert(said.contains("undefined name 'undefined_name'"), said)
+    assert(said.contains("main.sysl:3:11"), said)
+
+@test("a broken test is an error in a test build too")
+tax_a_broken_test_in_a_test_build()
+    if !tax_ready() then return
+
+    var files: Buf[(string, string, string)] = buf()
+
+    tax_file(&files, "", "m.sysl", "@test\nt() =\n    print(undefined_name)\n")
+
+    tax_build(&files) match
+        Err(why) -> assert(why.contains("undefined name 'undefined_name'"), why)
+        Ok(_) -> assert(false, "expected the broken test to be reported")
