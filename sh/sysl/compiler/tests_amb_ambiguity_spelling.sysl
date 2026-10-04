@@ -1,0 +1,80 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// **The roster a refused call carries quotes each parameter's type the way its declaration WROTE
+// it** (`reference/declarations.md § Overloading`): the reader's question at that point is which
+// declarations exist, and the answer is the text they can find in their file -- `Option[int]`
+// rather than the resolved `sysl.Option[int]`, `u8` and `byte` each as written rather than one
+// canonical name, an alias by its own name.
+//
+// Every message here was read out of the reference compiler (0.0.162) on the same program.
+
+private amb_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end amb_ready
+
+// Everything a one-file program has to say for itself, taken through the lowering.
+private amb_err(text: string) -> string
+    val root = make_temp_dir("sysl-amb").unwrap()
+    val at = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(at, text).unwrap()
+
+    val out = emit_llvm_text(at, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end amb_err
+
+private amb_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+@test("an ambiguous call's roster keeps a width's written name")
+amb_a_written_width_name_is_kept()
+    if !amb_ready() then return
+
+    amb_refused(amb_err("f(x: byte) -> int = 1\nf(x: i64) -> int = 2\nprint(f(1))\n"),
+                "'f' is ambiguous here — 2 of its declarations take these arguments:\n" +
+                "    f(x: byte)\n    f(x: i64)\n" +
+                "Annotate an argument, or name the type a literal is meant at", "3:7")
+
+@test("a roster with nothing fitting spells a slice and an Option as written")
+amb_nothing_fits_spells_slice_and_option()
+    if !amb_ready() then return
+
+    amb_refused(amb_err("f(x: u8, y: []u8) -> int = 1\nf(x: u8, y: Option[u8]) -> int = 2\n" +
+                        "f(x: int, y: string) -> int = 3\nprint(f(1, 2, 3))\n"),
+                "no 'f' takes these arguments — the declarations of that name are:\n" +
+                "    f(x: u8, y: []u8)\n    f(x: u8, y: Option[u8])\n    f(x: int, y: string)", "4:7")
+
+@test("and an alias by its own name, a tuple and a weak reference as written")
+amb_alias_tuple_and_weak_as_written()
+    if !amb_ready() then return
+
+    amb_refused(amb_err("type Id = u8\nf(x: Id, y: (int, u8)) -> int = 1\n" +
+                        "f(x: string, y: weak string) -> int = 2\nprint(f())\n"),
+                "no 'f' takes these arguments — the declarations of that name are:\n" +
+                "    f(x: Id, y: (int, u8))\n    f(x: string, y: weak string)", "4:7")
+
+@test("and a callable reference and an array as written")
+amb_callable_and_array_as_written()
+    if !amb_ready() then return
+
+    amb_refused(amb_err("f(g: &Fn(int) -> int, n: [3]u8) -> int = 1\nf(x: *u8) -> int = 2\nprint(f())\n"),
+                "no 'f' takes these arguments — the declarations of that name are:\n" +
+                "    f(g: &Fn(int) -> int, n: [3]u8)\n    f(x: *u8)", "3:7")
