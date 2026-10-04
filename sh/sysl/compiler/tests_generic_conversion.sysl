@@ -155,12 +155,22 @@ gcn_the_conversion_is_the_widths_own()
             print(narrow(300, 0u8), narrow(300, 0u32))
         """), "44 300\n")
 
+// The reference runs this with `T` unbounded, and `reference/generics.md § Bounds` says an unbounded
+// `T` may do no operator, refused at the definition -- the reference diverges; the spec is followed,
+// and the conversion itself is asserted under the bound the operator needs.
 @test("a float parameter converts as a float does")
 gcn_a_float_parameter_converts_as_a_float_does()
     if !gcn_ready() then return
 
-    assert_eq(gcn_ran(raw"""
+    gcn_refused(raw"""
         half[T](x: int, like: T) -> T = T(x) / T(2)
+
+        main()
+            print(half(7, 0.0), half(7, 0.0f32), half(7, 0))
+        """, "error: '/' needs 'T: sysl.Div'")
+
+    assert_eq(gcn_ran(raw"""
+        half[T: Div](x: int, like: T) -> T = T(x) / T(2)
 
         main()
             print(half(7, 0.0), half(7, 0.0f32), half(7, 0))
@@ -362,12 +372,24 @@ gcn_an_address_reads_as_a_number_through_a_parameter()
             print(address(&x, 0usize) != 0usize)
         """), "true\n")
 
+// The reference runs this with `T` unbounded; the spec refuses the `+` (see the float case above).
 @test("a member of a generic type converts at its own type's parameter")
 gcn_a_member_of_a_generic_type_converts()
     if !gcn_ready() then return
 
-    assert_eq(gcn_ran(raw"""
+    gcn_refused(raw"""
         struct Packer[T]
+            seed: T
+
+            packed(self, b: u8) -> T = self.seed + T(b)
+
+        main()
+            var p = Packer(100u16)
+            print(p.packed(5u8))
+        """, "error: '+' needs 'T: sysl.Add'")
+
+    assert_eq(gcn_ran(raw"""
+        struct Packer[T: Add]
             seed: T
 
             packed(self, b: u8) -> T = self.seed + T(b)
@@ -440,12 +462,23 @@ gcn_a_struct_instantiation_is_refused()
             print(make(1, P(0, 0)).a)
         """, "error: cannot convert int to P")
 
+// The reference runs this with `A` and `B` unbounded; the spec refuses each `+` (see the float case).
 @test("two parameters convert independently in one expression")
 gcn_two_parameters_convert_independently()
     if !gcn_ready() then return
 
-    assert_eq(gcn_ran(raw"""
+    val out = gcn_err(raw"""
         both[A, B](x: A, y: B) -> A = x + A(B(x) + y)
+
+        main()
+            print(both(10u16, 5u8))
+        """)
+
+    assert(gcn_says(out, "error: '+' needs 'A: sysl.Add'"), out)
+    assert(gcn_says(out, "error: '+' needs 'B: sysl.Add'"), out)
+
+    assert_eq(gcn_ran(raw"""
+        both[A: Add, B: Add](x: A, y: B) -> A = x + A(B(x) + y)
 
         main()
             print(both(10u16, 5u8), both(10u32, 5u8))
