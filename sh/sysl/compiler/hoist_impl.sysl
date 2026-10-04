@@ -61,10 +61,11 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     val asked = a.complaints()
     val target = impl_target(a, scope, span, block)
 
-    // A subject that is not the generic type applied to the block's parameters leaves nothing to
-    // file the block under, and it ends here, told once: read on, every name the subject left out
-    // would be reported as unknown wherever a member wrote it.
-    if covers_whole && a.complaints() > asked then return im
+    // A subject the block cannot be filed under -- not the generic type applied to the block's
+    // parameters, a shape that fixed its element, a memory mode, a bare parameter -- ends the block
+    // here, told once: read on, every name the subject left out would be reported as unknown
+    // wherever a member or the subject itself wrote it.
+    if a.complaints() > asked then return im
 
     // A block for `never` has been told it implements nothing, and it ends there: read on, each
     // member's receiver would be a parameter of a type no parameter may have, told again per member.
@@ -878,6 +879,9 @@ private structural_target(a: &Analysis, scope: Scope, span: Span, block: ImplDec
     // spellings of one type are one implementation. **A bare `never` is read as the type it names**
     // rather than refused as a place no value can stand: `impl_target` has already said why a block
     // for it is wrong, and that is the one complaint.
+    // What the line has already been refused for, so that a subject refused for what it is gets
+    // that one complaint rather than a second about its parameters.
+    val before = a.complaints()
     val ty = resolve_result(a, scope, subject, abstracts)
 
     refuse_unimplementable(a, scope, span, ty)
@@ -911,6 +915,14 @@ private structural_target(a: &Analysis, scope: Scope, span: Span, block: ImplDec
         // should change if the trait moves between the library's files, and nothing a program
         // declares should be able to land on it.
         symbol = s"bound.${blanket.unwrap()}"
+    else if a.complaints() != before
+        // The subject was already refused for what it is -- a memory mode, an object, a bare
+        // parameter with no closed bound -- and that is the one complaint the line earns: a second
+        // about its parameters would send the reader to the part written correctly.
+        symbol = shape_symbol(ty, shape)
+    else if head.is_none()
+        not_generic(a, scope, span, subject)
+        symbol = shape_symbol(ty, shape)
     else
         order = shape_args(a, scope, span, block, ty, shape)
         symbol = shape_symbol(ty, shape)
@@ -1157,14 +1169,37 @@ private shape_args(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, ty: 
             for i in 0..<matched.len()
                 matched.at(i) match
                     Abstract(n, _) ->
-                        if holds_string(block.tparams, n) then names.push(n)
-                        else element_fixed(a, scope, span, matched.at(i), shape)
+                        if !holds_string(block.tparams, n)
+                            element_fixed(a, scope, span, matched.at(i), shape)
+                            return names
+                        end if
+
+                        names.push(n)
                     ConstArg(_, _) -> ()
-                    other -> element_fixed(a, scope, span, other, shape)
+                    other ->
+                        // One complaint per line: the parameter the fixed type displaced would
+                        // otherwise be reported again as appearing nowhere.
+                        element_fixed(a, scope, span, other, shape)
+                        return names
 
     check_argument_names(a, scope, span, block, names, type_text(block.for_type))
     names
 end shape_args
+
+// Why a block declaring type parameters has nothing to apply them to: the subject takes no arguments
+// and has no shape either. A composed type does have a shape, and `shape_args` checks the match
+// instead; what is left here is a name that resolved, so the complaint is about the name rather than
+// about the parameters, which are the one part of the line written correctly.
+private not_generic(a: &Analysis, scope: Scope, span: Span, subject: TypeRef)
+    *subject.kind match
+        NamedType(n, _) ->
+            a.fault(scope, span, s"'$n' takes no type arguments, so an 'impl' for it has nothing " +
+                    "to be generic over")
+        _ ->
+            a.fault(scope, span, s"'${type_text(subject)}' has no shape for an 'impl' to match — a " +
+                    "slice and an array do, and a generic struct or enum has a name of its own to " +
+                    "be generic over")
+end not_generic
 
 private element_fixed(a: &Analysis, scope: Scope, span: Span, t: Type, shape: string)
     a.fault(scope, span, s"'${type_show(t)}' fixes the element type, and an 'impl' with type " +
