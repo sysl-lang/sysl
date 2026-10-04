@@ -1,0 +1,541 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A trait implemented for every type of a **shape** (`reference/traits.md`): `impl[T] Total for []T`
+// is the block a generic type gets, written for a type that has no name to be generic over. The
+// members are monomorphized from each receiver's element type, and a bound on a parameter makes the
+// whole thing conditional -- a slice implements the trait exactly when its element does.
+//
+// **Every output quoted here was read out of the reference compiler** (0.0.159), whose
+// `ImplShapeRunTests` these are.
+
+private var isr_library_cache: Buf[Program] = buf()
+private var isr_library_read: bool = false
+
+private isr_library() -> Buf[Program]
+    if isr_library_read then return isr_library_cache
+
+    isr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> isr_library_cache = units
+
+    isr_library_cache
+end isr_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private isr_ready() -> bool
+    if isr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end isr_ready
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private isr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-impl-shape-run").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end isr_ran
+
+// The trait most of these implement.
+private isr_total() -> string = "trait Total\n    total(self) -> usize\n"
+
+// ---- a slice of any element ----
+
+@test("a slice of any element carries a method, monomorphized from the receiver's element type")
+isr_slice_carries_a_method()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(isr_total() + raw"""
+        impl[T] Total for []T
+            total(self) -> usize = self.len
+        var a = [1, 2, 3, 4]
+        var b = ["x", "y"]
+        print(a[0..].total())
+        print(b[0..].total())
+        """), "4\n2\n")
+
+@test("a slice of any element carries a property, read with no parentheses")
+isr_slice_carries_a_property()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Sized
+            empty -> bool
+        impl[T] Sized for []T
+            empty -> bool = self.len == 0
+        var a = [1, 2]
+        var b: [0]bool = []
+        print(a[0..].empty)
+        print(b[0..].empty)
+        """), "false\ntrue\n")
+
+// Iterating yields the element type, which under a bound is the parameter standing in for itself --
+// so what the loop body may do with it is what the bound licenses, checked once.
+@test("a slice of any element iterates its elements under whatever the bound licenses")
+isr_slice_iterates_under_the_bound()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Show
+            show(self) -> string
+        impl[T: Display] Show for []T
+            show(self) -> string
+                var s = ""
+                for x in self do s = s + str(x)
+                s
+        var a = [1, 2, 3]
+        var b = ["x", "y"]
+        print(a[0..].show())
+        print(b[0..].show())
+        """), "123\nxy\n")
+
+@test("a slice of any element reaches its element's implementation through the block's bound")
+isr_slice_reaches_the_elements_implementation()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Show
+            show(self) -> string
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> string = f"P${self.v}"
+        impl[T: Show] Show for []T
+            show(self) -> string
+                var s = ""
+                for i in 0..<self.len do s = s + self[i].show()
+                s
+        var a = [P(1), P(2)]
+        print(a[0..].show())
+        """), "P1P2\n")
+
+// `Self` is the subject applied to whatever fixed the parameters, so it means `[]int` inside the
+// instantiation a `[]int` receiver asked for.
+@test("a slice of any element writes 'Self' for the type it was instantiated at")
+isr_slice_writes_self()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Dup
+            dup(self) -> Self
+        impl[T] Dup for []T
+            dup(self) -> Self = self
+        var a = [1, 2, 3]
+        print(a[0..].dup().len)
+        """), "3\n")
+
+@test("a slice of any element inherits a trait default like any other implementing type")
+isr_slice_inherits_a_default()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Named
+            name(self) -> string
+            greet(self) -> string = f"hi ${self.name()}"
+        impl[T] Named for []T
+            name(self) -> string = "slice"
+        var a = [1, 2]
+        print(a[0..].greet())
+        """), "hi slice\n")
+
+@test("a slice of any element satisfies a bound, so a generic takes one by value")
+isr_slice_satisfies_a_bound()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(isr_total() + raw"""
+        impl[T] Total for []T
+            total(self) -> usize = self.len
+        twice[S: Total](x: S) -> usize = x.total() * 2
+        var a = [5, 6, 7]
+        print(twice(a[0..]))
+        """), "6\n")
+
+// The object outlives the frame, so the elements the slice views have to as well -- escape
+// analysis's ordinary rule about a slice, met here by putting the array on the heap.
+@test("a slice of any element erases to a counted trait object, one table per element type")
+isr_slice_erases_to_a_trait_object()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(isr_total() + raw"""
+        impl[T] Total for []T
+            total(self) -> usize = self.len
+        sum_of(t: &Total) -> usize = t.total()
+        var a: &[2]int = [10, 20]
+        var b: &[3]bool = [true, false, true]
+        print(sum_of(a[0..]))
+        print(sum_of(b[0..]))
+        """), "2\n3\n")
+
+// The trait is the program's own: `Display` is the library's and so is every slice, so a shape
+// block for it has no home and only the library may write one. What the shape still buys a program
+// is one block covering every slice whose element conforms.
+@test("a slice of any element: a conditional shape's member reaches its element through the bound")
+isr_slice_conditional_member_reaches_the_element()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Render
+            render(self) -> string
+        impl[T: Display] Render for []T
+            render(self) -> string
+                var out = "["
+                for i in 0..<self.len do
+                    if i > 0 then out = out + ", "
+                    out = out + str(self[i])
+                out + "]"
+        var a = [3, 1, 4]
+        var b = ["x", "y"]
+        print(a[0..].render())
+        print(b[0..].render())
+        """), "[3, 1, 4]\n[x, y]\n")
+
+// An operator is one of the library's catalog traits, so what a program may write is the composed
+// type spelled out, which its own element type gives a home to. The `override` is what the library
+// supplying `Eq for []T` costs a program that wants its own.
+@test("a slice of any element: a composed type carries an operator, dispatched to the instantiated member")
+isr_slice_composed_type_carries_an_operator()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        struct N
+            v: int
+        override impl Eq for []N
+            eq(self, rhs: Self) -> bool = self.len == rhs.len
+        var a = [N(1), N(2)]
+        var b = [N(3), N(4)]
+        var c = [N(5)]
+        print(a[0..] == b[0..])
+        print(a[0..] == c[0..])
+        """), "true\nfalse\n")
+
+@test("a slice of any element reaches another member of the same shape from inside one")
+isr_slice_reaches_another_member()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Two
+            one(self) -> int
+            other(self) -> int
+        impl[T] Two for []T
+            one(self) -> int = 1
+            other(self) -> int = self.one() + 1
+        var v = ["x"]
+        print(v[0..].other())
+        """), "2\n")
+
+// A slice's elements belong to whoever made them, so a member taking one by value borrows it -- the
+// same contract every other function taking a `[]T` parameter has.
+@test("a slice of any element taken by value in a loop neither leaks nor frees twice")
+isr_slice_taken_by_value_in_a_loop()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(isr_total() + raw"""
+        impl[T] Total for []T
+            total(self) -> usize = self.len
+        var a = ["x", "y", "z"]
+        var acc: usize = 0
+        for i in 0..<1000 do acc += a[0..].total()
+        print(acc)
+        """), "3000\n")
+
+// ---- an array of any element ----
+
+// A length written out is a shape of its own: `[2]T` and `[3]T` are two, each covering every element
+// type at its own length.
+@test("an array of any element is a shape per length")
+isr_array_is_a_shape_per_length()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[T] Tag for [2]T
+            tag(self) -> string = "pair"
+        impl[T] Tag for [3]T
+            tag(self) -> string = "triple"
+        var a: [2]int = [1, 2]
+        var b: [3]string = ["x", "y", "z"]
+        print(a.tag())
+        print(b.tag())
+        """), "pair\ntriple\n")
+
+@test("an array of any element, including the empty one, whose length is a shape like any other")
+isr_array_including_the_empty_one()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[T] Tag for [0]T
+            tag(self) -> string = "empty"
+        var a: [0]int = []
+        print(a.tag())
+        """), "empty\n")
+
+// A `self` receiver copies, which for an array copies every element -- so writing through the copy
+// is invisible to the caller, exactly as it is for a struct.
+@test("an array of any element takes its receiver by value, so a member sees a copy")
+isr_array_takes_its_receiver_by_value()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Bump
+            bumped(self) -> int
+        impl[T] Bump for [2]T
+            bumped(self) -> int
+                self[0] = self[1]
+                self[0]
+        var a: [2]int = [1, 2]
+        print(a.bumped())
+        print(a[0])
+        """), "2\n1\n")
+
+// ---- a block written for '[]T' and a receiver that may not be written ----
+
+// Both views of a slice share the one shape key, so a block written for `[]T` covers a `[]const T`,
+// made real at that view with a `self` the body may not write through.
+@test("a block for '[]T' reaches a read-only receiver, since the body only reads")
+isr_const_reaches_the_block()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(isr_total() + raw"""
+        impl[T] Total for []T
+            total(self) -> usize = self.len
+        var a = [1, 2, 3]
+        val c: []const int = a[..]
+        print(a[..].total())
+        print(c.total())
+        """), "3\n3\n")
+
+// `s.bytes` is a `[]const u8` nobody wrote a `const` for, which is how a caller meets this without
+// ever having named the read-only view.
+@test("a block for '[]T' reaches a read-only receiver, including the read-only view a string hands over")
+isr_const_including_a_strings_bytes()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(isr_total() + raw"""
+        impl[T] Total for []T
+            total(self) -> usize = self.len
+        var s = "hello"
+        print(s.bytes.total())
+        """), "5\n")
+
+// A member with type parameters of its own is named by the call rather than by the receiver, so it
+// takes the other road through the analyzer.
+@test("a block for '[]T' reaches a read-only receiver, and a member generic in its own right")
+isr_const_and_a_generic_member()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Pick
+            pick[U: Display](self, u: U)
+        impl[T: Display] Pick for []T
+            pick[U: Display](self, u: U)
+                print(self.len)
+                print(u)
+        var a = [1, 2, 3]
+        val c: []const int = a[..]
+        c.pick("hi")
+        """), "3\nhi\n")
+
+// The library's own two blocks: `assert_eq` renders both sequences.
+@test("a block for '[]T' reaches a read-only receiver, so the library's own 'Eq' and 'Display' cover it")
+isr_const_the_librarys_eq_and_display()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        val a: []const u8 = "ab".bytes
+        val b: []const u8 = "ab".bytes
+        print(a == b)
+        print(a)
+        assert_eq(a, b)
+        print("through")
+        """), "true\n[97, 98]\nthrough\n")
+
+// A pair of operands meets at the read-only view where one of them is read-only, so `==` dispatches
+// at the read-only instance whichever side the const view was written on.
+@test("a block for '[]T' reaches a read-only receiver, and an operator, in either order")
+isr_const_an_operator_in_either_order()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        var a = [1, 2, 3]
+        var b = [1, 2, 3]
+        val c: []const int = b[..]
+        print(c == a[..], a[..] == c)
+        """), "true true\n")
+
+@test("a block for '[]T' reaches a read-only receiver, for an element type of the program's own")
+isr_const_for_an_element_of_the_programs_own()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        struct P
+            x: int
+        impl Display for P
+            display(self, out: *Writer, fmt: FormatSpec) = self.x.display(out, fmt)
+        impl Eq for P
+            eq(self, rhs: P) -> bool = self.x == rhs.x
+        var a = [P(1), P(2)]
+        val c: []const P = a[..]
+        val d: []const P = a[..]
+        print(c)
+        print(c == d)
+        """), "[1, 2]\ntrue\n")
+
+// ---- a shape and the types it covers ----
+
+// `string` is a view of bytes that are valid UTF-8, and that invariant is the whole difference
+// between it and a `[]u8` -- so a block written for every slice has said nothing about it.
+@test("a shape leaves 'string' alone, since a string is not a slice")
+isr_shape_leaves_string_alone()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(isr_total() + raw"""
+        impl[T] Total for []const T
+            total(self) -> usize = self.len
+        impl Total for string
+            total(self) -> usize = 0
+        var s = "hello"
+        print(s.total())
+        print(s.bytes.total())
+        """), "0\n5\n")
+
+@test("a block for '[]const T' covers a writable view and a read-only one alike")
+isr_shape_const_block_covers_both_views()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(isr_total() + raw"""
+        impl[T] Total for []const T
+            total(self) -> usize = self.len
+        val k: [4]int = [1, 2, 3, 4]
+        var a = [1, 2, 3]
+        print(k[0..].total(), a[0..].total())
+        """), "4 3\n")
+
+// A slice and an array of two are two shapes, so one trait may be implemented for both.
+@test("shapes are one key each, so two shapes may implement one trait")
+isr_shape_one_key_each()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[T] Tag for []T
+            tag(self) -> string = "slice"
+        impl[T] Tag for [2]T
+            tag(self) -> string = "pair"
+        var a: [2]int = [1, 2]
+        print(a.tag())
+        print(a[0..].tag())
+        """), "pair\nslice\n")
+
+// A type's members are one namespace whatever brought them, and the shape's are in it -- but two
+// traits implemented for one type were always allowed, and still are.
+@test("a shape's members share a namespace across traits, which distinct names do not disturb")
+isr_shape_shares_a_namespace()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(isr_total() + raw"""
+        trait Tag
+            tag(self) -> string
+        impl[T] Total for []T
+            total(self) -> usize = self.len
+        impl Tag for []int
+            tag(self) -> string = "ints"
+        var a = [1, 2]
+        print(a[0..].total())
+        print(a[0..].tag())
+        """), "2\nints\n")
+
+@test("a shape coexists with a written implementation for another length")
+isr_shape_coexists_with_another_length()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[T] Tag for [2]T
+            tag(self) -> string = "any pair"
+        impl Tag for [3]int
+            tag(self) -> string = "three ints"
+        var a: [2]string = ["x", "y"]
+        var b: [3]int = [1, 2, 3]
+        print(a.tag())
+        print(b.tag())
+        """), "any pair\nthree ints\n")
+
+// The control for the refusals: an element that meets the condition passes at every place the
+// condition is asked -- a bound, an erasure, a rendering.
+@test("a shape conforms at each place the condition is asked, when the element meets it")
+isr_shape_conforms_at_each_place()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Show
+            show(self) -> string
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> string = str(self.v)
+        impl[T: Show] Show for []T
+            show(self) -> string = self[0].show()
+        tell[S: Show](x: S) -> string = x.show()
+        var a: &[1]P = [P(7)]
+        var o: &Show = a[0..]
+        print(tell(a[0..]))
+        print(o.show())
+        """), "7\n7\n")
+
+// Conditional conformance composes: a slice of slices conforms when the inner slice does.
+@test("conditional shapes compose, so a slice of slices conforms when the inner one does")
+isr_shape_conformance_composes()
+    if !isr_ready() then return
+
+    assert_eq(isr_ran(raw"""
+        trait Show
+            show(self) -> string
+        impl[T: Show] Show for []T
+            show(self) -> string
+                var s = "("
+                for i in 0..<self.len do s = s + self[i].show()
+                s + ")"
+        impl Show for int
+            show(self) -> string = str(self)
+        var inner: &[2]int = [1, 2]
+        var outer = [inner[0..], inner[1..]]
+        print(outer[0..].show())
+        """), "((12)(2))\n")
