@@ -1,0 +1,213 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// `@packed` and `@align(n)` — the two layout attributes a struct takes (`reference/types.md §
+// Structs`), and `@align(n)` above a binding — ported from the reference's `LayoutAttrRunTests`
+// case for case.
+//
+// They are separate axes and compose: `@packed` removes the padding *between* fields, `@align`
+// raises where the aggregate must *begin*. `sizeof` and `alignof` are how a program observes both,
+// and they are the same numbers the back end lays the aggregate out with, so a test that reads them
+// is testing the emitted layout and not a second opinion about it.
+//
+// **Every output and every line of IR quoted here was read out of the reference compiler** (0.0.162),
+// `sysl run` / `sysl emit-llvm` on the same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private lyr_plain() -> string = "struct Head\n    tag: u8\n    len: u32\n"
+
+private lyr_packed() -> string = "@packed\nstruct Head\n    tag: u8\n    len: u32\n"
+
+// The text of `main` alone, out of the LLVM a program lowers to — the reference's `irMain`.
+private lyr_main_ir(text: string) -> string
+    val all = enm_ir(text)
+    val head = all.index_of("define i32 @main(")
+
+    if head.is_none() then return all
+
+    val rest = all[head.unwrap()..<all.len]
+    val tail = rest.index_of("\n}\n")
+
+    if tail.is_none() then return rest
+
+    rest[0..<tail.unwrap() + 3]
+end lyr_main_ir
+
+// The LLVM text for a project of several files, each at its path below the root.
+private lyr_ir_of(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-lyr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end lyr_ir_of
+
+// -- a struct pads by default ---------------------------------------------------------------------
+
+@test("the gap in front of the wider field is real")
+lyr_the_gap_in_front_of_the_wider_field_is_real()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(lyr_plain() + "print(sizeof(Head), alignof(Head))\n"), "8 4\n")
+
+// -- @packed removes the interior padding ---------------------------------------------------------
+
+@test("the fields are laid end to end")
+lyr_the_fields_are_laid_end_to_end()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(lyr_packed() + "print(sizeof(Head))\n"), "5\n")
+
+@test("and the aggregate needs no alignment of its own")
+lyr_the_aggregate_needs_no_alignment_of_its_own()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(lyr_packed() + "print(alignof(Head))\n"), "1\n")
+
+@test("an array of them has no gap between elements either")
+lyr_an_array_of_them_has_no_gap_between_elements()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(lyr_packed() + "print(sizeof([4]Head))\n"), "20\n")
+
+@test("the fields still read and write their own values")
+lyr_the_fields_still_read_and_write_their_own_values()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(lyr_packed() + "var h = Head(7u8, 1000u32)\nh.len += 1u32\nprint(h.tag, h.len)\n"),
+              "7 1001\n")
+
+// -- @align raises where the aggregate begins -----------------------------------------------------
+
+@test("alignof reports the boundary asked for")
+lyr_alignof_reports_the_boundary_asked_for()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@align(64)\n" + lyr_plain() + "print(alignof(Head))\n"), "64\n")
+
+@test("and the size rounds up so an array keeps every element on it")
+lyr_the_size_rounds_up_to_the_boundary()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@align(64)\n" + lyr_plain() + "print(sizeof(Head))\n"), "64\n")
+
+@test("asking for less than the fields need changes nothing")
+lyr_asking_for_less_than_the_fields_need_changes_nothing()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@align(2)\n" + lyr_plain() + "print(sizeof(Head), alignof(Head))\n"), "8 4\n")
+
+@test("the bound may be a constant rather than a literal")
+lyr_the_bound_may_be_a_constant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("const CACHE_LINE: int = 64\n@align(CACHE_LINE)\n" + lyr_plain() +
+                      "print(alignof(Head))\n"),
+              "64\n")
+
+@test("and arithmetic over one")
+lyr_the_bound_may_be_arithmetic_over_a_constant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("const WORDS: int = 8\n@align(WORDS * 2)\n" + lyr_plain() + "print(alignof(Head))\n"),
+              "16\n")
+
+// -- the two compose, because they are different axes ---------------------------------------------
+
+// A wire header that has to live in a DMA-capable buffer is exactly this shape: no interior gaps,
+// and the whole thing beginning on a boundary the device requires.
+@test("no interior padding, and still aligned")
+lyr_no_interior_padding_and_still_aligned()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@packed\n@align(16)\n" + lyr_plain() + "print(sizeof(Head), alignof(Head))\n"),
+              "16 16\n")
+
+@test("the order they are written in does not matter")
+lyr_the_order_they_are_written_in_does_not_matter()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@align(16)\n@packed\n" + lyr_plain() + "print(sizeof(Head), alignof(Head))\n"),
+              "16 16\n")
+
+// -- @align(n) marks one binding's storage --------------------------------------------------------
+
+// C's `alignas` rather than Rust's `#[repr(align)]`. The boundary is asserted from the **IR**,
+// because there is nothing at run time to ask: `alignof` is a question about a type and this is a
+// fact about one object, so what the back end was told is the whole of the claim.
+
+@test("a local's slot begins on the boundary it asked for")
+lyr_a_locals_slot_begins_on_its_boundary()
+    if !enm_ready() then return
+
+    assert(lyr_main_ir("@align(64)\nvar buf: [8]u8\nprint(buf[0])\n")
+               .contains("alloca [8 x i8], align 64"))
+
+@test("a val's does too, the boundary being about storage rather than about writing")
+lyr_a_vals_slot_begins_on_its_boundary()
+    if !enm_ready() then return
+
+    assert(lyr_main_ir("@align(32)\nval n: int = 7\nprint(n)\n").contains("alloca i32, align 32"))
+
+@test("one that asks for nothing is left to the back end")
+lyr_one_that_asks_for_nothing_is_left_to_the_back_end()
+    if !enm_ready() then return
+
+    assert(lyr_main_ir("var n: int = 7\nprint(n)\n").contains("alloca i32\n"))
+
+@test("module storage carries it to the global it lays down")
+lyr_module_storage_carries_the_boundary()
+    if !enm_ready() then return
+
+    assert(lyr_ir_of([("m/m.sysl", "module m\n\n@align(4096)\nvar table: [4]u64\n"),
+                      ("main.sysl", "print(m.table[0])\n")])
+               .contains("align 4096"))
+
+@test("and so does the 'static' spelling of the same declaration")
+lyr_a_static_carries_the_boundary()
+    if !enm_ready() then return
+
+    assert(enm_ir("@align(128)\nstatic var ticks: u64 = 0u64\nprint(ticks)\n").contains("align 128"))
+
+@test("the bound may be a constant, exactly as a struct's may")
+lyr_a_bindings_bound_may_be_a_constant()
+    if !enm_ready() then return
+
+    assert(lyr_main_ir("const LINE: int = 64\n@align(LINE)\nvar buf: [8]u8\nprint(buf[0])\n")
+               .contains("alloca [8 x i8], align 64"))
+
+// -- a packed struct still works as a value -------------------------------------------------------
+
+@test("it passes to a function and comes back")
+lyr_a_packed_struct_passes_and_comes_back()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(lyr_packed() + "bump(h: Head) -> Head = Head(h.tag, h.len + 1u32)\n" +
+                      "print(bump(Head(1u8, 2u32)).len)\n"),
+              "3\n")
+
+// Only the *field's* address is refused. The struct's own is an ordinary pointer to an ordinary
+// aggregate, and reading a field through it goes via the offset the back end knows.
+@test("and the struct's own address is still an address")
+lyr_a_packed_structs_own_address_is_an_address()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(lyr_packed() + "var h = Head(7u8, 2u32)\nval p = &h\nprint((*p).tag)\n"), "7\n")
