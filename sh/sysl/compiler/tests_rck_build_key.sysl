@@ -223,3 +223,44 @@ rck_not_handed_another_builds_test_binary()
     assert(replayed.0 != 0, s"the seeded entry is what that build's key finds:\n${replayed.1}")
     assert_eq(mine.0, 0, mine.1)
 end rck_not_handed_another_builds_test_binary
+
+// -- the manifest a file belongs to ----------------------------------------------------------------
+
+// `__NAME__` and `__VERSION__` fold the manifest into the program, and the manifest is not a source
+// file -- so a key over the sources alone replays the old binary after either is changed. The program
+// says which pair it was built with in its status, so a replay is visible and cannot be mistaken for
+// the build.
+private val rck_stating_program: string =
+    "said(s: string) -> int\n" +
+    "    if s == \"app 1.0.0\" then return 10\n" +
+    "    if s == \"app 1.0.1\" then return 11\n" +
+    "    if s == \"tool 1.0.1\" then return 12\n" +
+    "    99\n\n" +
+    "exit(said(__NAME__ + \" \" + __VERSION__))\n"
+
+private rck_stating(root: string, name: string, version: string) -> int
+    write_text(s"$root/package.hocon", s"package { name = \"$name\", version = \"$version\" }\n").unwrap()
+    rck_ran(root)
+
+@test("a manifest whose version or name changed is a different program, though no source file moved")
+rck_a_changed_manifest_is_another_program()
+    if !rck_ready() then return
+
+    val cache = rck_cache()
+    val root = runner_project("main.sysl", rck_stating_program)
+
+    val first = rck_stating(root, "app", "1.0.0")
+    val bumped = rck_stating(root, "app", "1.0.1")
+    val renamed = rck_stating(root, "tool", "1.0.1")
+    val three = rck_slots(cache).len()
+    val again = rck_stating(root, "app", "1.0.0")
+    val still = rck_slots(cache).len()
+
+    rck_restore([cache, root])
+    assert_eq(first, 10)
+    assert_eq(bumped, 11, "a bumped version is a different program")
+    assert_eq(renamed, 12, "a renamed package is a different program")
+    assert_eq(three, 3)
+    assert_eq(again, 10, "and the first manifest finds the first entry")
+    assert_eq(still, 3)
+end rck_a_changed_manifest_is_another_program

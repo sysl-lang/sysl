@@ -1,0 +1,219 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `__NAME__`: the `name` in the `package.hocon` of the package or program whose file writes it --
+// `__VERSION__`'s twin, by the same machinery. A dependency's files and a `--lib` root's answer with
+// their own manifest's name; a default argument answers for the package that wrote the call, so a
+// logging library's `tag: string = __NAME__` tags with the application that called it; it folds to a
+// string literal, so a `const` or a module `val` may hold it; and a file with no manifest above it, or
+// a manifest that states no name, is refused at the use.
+
+private nam_ready() -> bool = std_root().is_ok() && clang_available()
+
+private nam_temp() -> string = absolute_path(make_temp_dir("sysl-nam").unwrap())
+
+private nam_manifest(name: string, version: string, deps: string) -> string
+    s"package { name = \"$name\", version = \"$version\" }\n" +
+    (if deps.is_empty() then "" else s"dependencies { $deps }\n")
+
+// A project with the given manifest (none where it is empty) and one program file at its root.
+private nam_app(config: string, program: string) -> string
+    val root = nam_temp()
+
+    if !config.is_empty() then write_text(s"$root/package.hocon", config).unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+    root
+end nam_app
+
+// A package called `name` at 1.0.0, declaring one module, `module_name`, holding `text`.
+private nam_library(name: string, module_name: string, text: string) -> string
+    val root = nam_temp()
+
+    make_dir_all(s"$root/$module_name").unwrap()
+    write_text(s"$root/package.hocon", nam_manifest(name, "1.0.0", "")).unwrap()
+    write_text(s"$root/$module_name/$module_name.sysl", s"module $module_name\n\n$text\n").unwrap()
+    root
+end nam_library
+
+// What the program a build of `root` with these source roots makes prints, or what stopped it.
+private nam_run(root: string, libs: []string) -> string
+    reset_feature_request()
+    reset_search_paths()
+
+    for l in libs
+        add_lib_root(l)
+
+    val out_dir = nam_temp()
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    reset_search_paths()
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end nam_run
+
+// The first diagnostic `sysl build <root>` renders.
+private nam_build_says(root: string) -> string
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    run_cli(["sysl", "build", root], (line) -> sink.push(line))
+
+    if lines.is_empty() then "" else lines.at(0)
+
+// `root` refused with `message` at `main.sysl:line:col`.
+private nam_refused(root: string, message: string, line: int, col: int)
+    val said = nam_build_says(root)
+    val head = s"error: $message\n --> $root/main.sysl:$line:$col\n"
+
+    assert(said.starts_with(head), s"expected\n$head\ngot\n$said")
+
+private nam_drop(dirs: []string)
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+@test("__NAME__ is the name the program's own package.hocon states")
+nam_the_programs_own_name()
+    if !nam_ready() then return
+
+    val root = nam_app(nam_manifest("logger-app", "1.2.3", ""), "print(__NAME__)\n")
+
+    assert_eq(nam_run(root, []), "logger-app\n")
+    nam_drop([root])
+
+@test("a dependency's __NAME__ is its own name, not its consumer's")
+nam_a_dependency_reports_its_own_name()
+    if !nam_ready() then return
+
+    val lib = nam_library("name-lib", "namelib", "own() -> string = __NAME__")
+    val root = nam_app(nam_manifest("app", "0.1.0", s"n { path = \"$lib\" }"),
+                       "print(namelib.own())\nprint(__NAME__)\n")
+
+    assert_eq(nam_run(root, []), "name-lib\napp\n")
+    nam_drop([root, lib])
+
+// The logcat case: a library's default of `__NAME__` tags the message with the caller's package, as
+// `__FILE__` in the same default names the caller's file.
+@test("a library's default of __NAME__ is the caller's name, as __FILE__ there is the caller's file")
+nam_a_default_is_the_callers()
+    if !nam_ready() then return
+
+    val lib = nam_library("name-lib", "namelib",
+                          "tag(t: string = __NAME__, f: string = __FILE__) -> string = t + \" \" + f")
+    val root = nam_app(nam_manifest("app", "0.1.0", s"n { path = \"$lib\" }"),
+                       "print(namelib.tag())\n")
+
+    val printed = nam_run(root, [])
+
+    nam_drop([root, lib])
+    assert(printed.starts_with("app "), printed)
+    assert(printed.index_of("main.sysl").is_some(), printed)
+
+@test("a default called from inside its own package answers that package's name")
+nam_a_default_called_at_home_is_its_own()
+    if !nam_ready() then return
+
+    val lib = nam_library("name-lib", "namelib",
+                          "tag(t: string = __NAME__) -> string = t\n\nown() -> string = tag()")
+    val root = nam_app(nam_manifest("app", "0.1.0", s"n { path = \"$lib\" }"),
+                       "print(namelib.own())\nprint(namelib.tag())\n")
+
+    assert_eq(nam_run(root, []), "name-lib\napp\n")
+    nam_drop([root, lib])
+
+@test("a default filled at a call in a second dependency answers the second dependency's name")
+nam_a_default_called_from_a_second_dependency()
+    if !nam_ready() then return
+
+    val lib = nam_library("name-lib", "namelib", "tag(t: string = __NAME__) -> string = t")
+    val mid = nam_library("name-mid", "midlib", "mid() -> string = namelib.tag()")
+    val root = nam_app(nam_manifest("app", "0.1.0", ""), "print(midlib.mid())\n")
+
+    assert_eq(nam_run(root, [lib, mid]), "name-mid\n")
+    nam_drop([root, lib, mid])
+
+@test("a --lib source root with a manifest answers with that manifest's name")
+nam_a_lib_root_answers_with_its_own_name()
+    if !nam_ready() then return
+
+    val lib = nam_library("name-lib", "namelib", "own() -> string = __NAME__")
+    val root = nam_app(nam_manifest("app", "0.1.0", ""), "print(namelib.own())\n")
+
+    assert_eq(nam_run(root, [lib]), "name-lib\n")
+    nam_drop([root, lib])
+
+@test("it folds to a constant, so a module's 'const' and 'val' may be initialized with it")
+nam_folds_into_a_const()
+    if !nam_ready() then return
+
+    val lib = nam_library("name-lib", "namelib",
+                          "const NAME: string = __NAME__\nval ALSO: string = __NAME__")
+    val root = nam_app(nam_manifest("app", "0.1.0", s"n { path = \"$lib\" }"),
+                       "print(namelib.NAME)\nprint(namelib.ALSO)\n")
+
+    assert_eq(nam_run(root, []), "name-lib\nname-lib\n")
+    nam_drop([root, lib])
+
+@test("a file that is not part of any package is refused at the use")
+nam_refused_outside_a_package()
+    if !nam_ready() then return
+
+    val root = nam_app("", "print(__NAME__)\n")
+
+    nam_refused(root, "'__NAME__' is the 'name' in package.hocon, and this file is not part of a " +
+                      "package — no package.hocon stands at the root of its tree", 1, 7)
+    nam_drop([root])
+
+@test("and a 'const' of it in such a file is refused the same way, not as a non-constant")
+nam_a_const_is_refused_in_the_same_words()
+    if !nam_ready() then return
+
+    val root = nam_app("", "const N: string = __NAME__\nprint(N)\n")
+
+    nam_refused(root, "'__NAME__' is the 'name' in package.hocon, and this file is not part of a " +
+                      "package — no package.hocon stands at the root of its tree", 1, 19)
+    nam_drop([root])
+
+@test("a manifest that states no name is refused, naming the manifest")
+nam_refused_without_a_name()
+    if !nam_ready() then return
+
+    val root = nam_app("package { version = \"1.0.0\" }\n", "print(__NAME__)\n")
+
+    nam_refused(root, s"'__NAME__' is the 'name' in package.hocon, and $root/package.hocon declares " +
+                      "none", 1, 7)
+    nam_drop([root])
+
+// The two read different fields and neither depends on the other being there.
+@test("a manifest with a name and no version answers __NAME__ and still refuses __VERSION__")
+nam_a_name_without_a_version()
+    if !nam_ready() then return
+
+    val named = nam_app("package { name = \"app\" }\n", "print(__NAME__)\n")
+    val both = nam_app("package { name = \"app\" }\n", "print(__NAME__)\nprint(__VERSION__)\n")
+
+    assert_eq(nam_run(named, []), "app\n")
+    nam_refused(both, s"'__VERSION__' is the 'version' in package.hocon, and $both/package.hocon " +
+                      "declares none", 2, 7)
+    nam_drop([named, both])
+
+@test("a declaration may not take the name, since it is a built-in of the reserved shape")
+nam_a_declaration_may_not_take_it()
+    if !nam_ready() then return
+
+    val root = nam_app(nam_manifest("app", "0.1.0", ""), "val __NAME__ = 1\nprint(__NAME__)\n")
+    val said = nam_build_says(root)
+
+    nam_drop([root])
+    assert(said.index_of("'__NAME__' begins and ends with '__'").is_some(), said)
