@@ -60,7 +60,14 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
 
         if bound.is_some() then return bound
 
-        const_of_name(cx, name)
+        val named = const_of_name(cx, name)
+
+        // `infinity` and `nan` written bare are the built-in constants wherever nothing nearer
+        // has the name -- which is the same question `name_expr` answers, asked of the same tables.
+        if named.is_none() && builtin_float_reached(cx, name) then
+            return Some(ConstFloat(builtin_float(name).unwrap()))
+
+        named
 
     // `A.len` -- how many types a **pack** stands for, which is a compile-time integer and folds as
     // one. It is here as well as in the analyzer because the range of a `for const` is read *before*
@@ -74,7 +81,17 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
 
         if packed.is_some() then return packed
 
-        dotted_name(receiver, name).and_then(n -> const_of_name(cx, n))
+        val dotted = dotted_name(receiver, name).and_then(n -> const_of_name(cx, n))
+
+        if dotted.is_some() then return dotted
+
+        // `real.infinity`, `f32.nan` -- read off the float type they are of, exactly as the
+        // analyzer reads them (`bare_type_member`).
+        if builtin_float(name).is_none() then return None
+
+        subject_named(cx, receiver) match
+            Some(Floating(_, _)) -> Some(ConstFloat(builtin_float(name).unwrap()))
+            _ -> None
 
     Unary(op, operand) -> const_unary(cx, op, operand)
     Binary(op, l, r) -> const_binary(cx, e.span, op, l, r)
@@ -543,7 +560,37 @@ private const_text(v: Const) -> string = v match
     ConstBool(b) -> if b then "true" else "false"
     ConstChar(c) -> s"'$c'"
     ConstStr(s) -> s"\"$s\""
-    ConstFloat(f) -> str(f)
+    ConstFloat(f) -> real_text(f)
+
+// A float as a sentence spells it -- the non-finite ones by the names a program writes for them,
+// rather than as the `inf` and `nan` the C formatting underneath would print.
+real_text(f: real) -> string
+    if f != f then return "nan"
+    if f > MaxReal then return "infinity"
+    if f < -MaxReal then return "-infinity"
+
+    str(f)
+end real_text
+
+// -- the two float values no literal spells ---------------------------------------------------------
+
+// `infinity` and `nan`: read without parentheses off a float type (`real.infinity`, `f32.nan`), and
+// written bare for the `real` ones wherever nothing the program declared or imported has the name.
+// They are constants -- a `within` bound, a `const` initializer -- where the library's
+// `real.infinity()` is an associated function, which is why that spelling stays the library's.
+builtin_float(name: string) -> Option[real] =
+    if name == "infinity" then Some(1.0 / 0.0) else if name == "nan" then Some(0.0 / 0.0) else None
+
+// The literal one of those reads as, at the float type it was read off. The bit patterns are written
+// down rather than computed, so the emitted text is the same whatever host compiled it: a NaN has
+// many, and this is the quiet one every arithmetic unit here produces.
+builtin_float_lit(span: Span, name: string, ty: Type) -> TExpr =
+    TExpr(span, TFloatLit(if name == "infinity" then InfinityBits else NanBits, ty))
+
+const InfinityBits: long = 0x7FF0000000000000
+const NegInfinityBits: long = -0x0010000000000000
+private const NanBits: long = 0x7FF8000000000000
+private const MaxReal: real = 1.7976931348623157e308
 
 // What a value that is not a condition is, said the way the refusal names it.
 const_kind(v: Const) -> string = v match

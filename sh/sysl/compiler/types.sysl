@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int}
-import sysl.math.decimal.Decimal
+import sysl.math.decimal.{Decimal, zero as decimal_zero}
 
 // What a written type resolves to: the representation the analyzer settles every name against, and
 // the one every later pass reads.
@@ -137,12 +137,40 @@ struct ConstrainedType
     name: string
     base: Type
     derived: bool
-    lo: Option[Decimal]
-    hi: Option[Decimal]
+    lo: Option[RangeEnd]
+    hi: Option[RangeEnd]
     exclusive_hi: bool
     pred_fn: Option[string]
     cname: Option[string]
 end ConstrainedType
+
+// One end of a `within` range: a number, or -- over a float base only -- one of the two infinities,
+// which no decimal is. `real within 0.0..infinity` is bounded below and open above, and the end that
+// says so still refuses a NaN, every comparison with one being false.
+enum RangeEnd
+    EndAt(value: Decimal)
+    EndInfinite(negative: bool)
+
+// The number an end stands for. **An integer or `char` range's ends are always finite** -- a bound
+// that folds to a float is refused for either -- so the paths that read one never meet an infinity;
+// the zero is what one would read if a float end ever reached them, and none does.
+finite_end(e: RangeEnd) -> Decimal = e match
+    EndAt(d) -> d
+    EndInfinite(_) -> decimal_zero()
+
+// The end as a sentence spells it: the number, or `infinity` with its sign.
+end_text(e: RangeEnd) -> string = e match
+    EndAt(d) -> s"$d"
+    EndInfinite(negative) -> if negative then "-infinity" else "infinity"
+
+// `-1`, `0` or `1` as the first end is below, at or above the second.
+end_cmp(a: RangeEnd, b: RangeEnd) -> int = a match
+    EndInfinite(an) -> b match
+        EndInfinite(bn) -> if an == bn then 0 else if an then -1 else 1
+        EndAt(_) -> if an then -1 else 1
+    EndAt(x) -> b match
+        EndInfinite(bn) -> if bn then 1 else -1
+        EndAt(y) -> if x < y then -1 else if x > y then 1 else 0
 
 // A type.
 enum Type
@@ -394,17 +422,23 @@ type_eq(a: Type, b: Type) -> bool = a match
 // Two named subtypes, field for field, as the case class this mirrors compares.
 private constrained_eq(a: &ConstrainedType, b: &ConstrainedType) -> bool =
     a.name == b.name && a.derived == b.derived && a.exclusive_hi == b.exclusive_hi &&
-        a.pred_fn == b.pred_fn && decimal_opt_eq(a.lo, b.lo) && decimal_opt_eq(a.hi, b.hi) &&
+        a.pred_fn == b.pred_fn && end_opt_eq(a.lo, b.lo) && end_opt_eq(a.hi, b.hi) &&
         a.cname == b.cname && type_eq(a.base, b.base)
 
 // A named subtype, built the way the reference compiler's case class is.
 constrained(name: string, base: Type, derived: bool, lo: Option[Decimal], hi: Option[Decimal],
             exclusive_hi: bool, pred_fn: Option[string]) -> Type =
-    Constrained(ConstrainedType(name, base, derived, lo, hi, exclusive_hi, pred_fn, None))
+    Constrained(ConstrainedType(name, base, derived, finite_at(lo), finite_at(hi), exclusive_hi,
+                                pred_fn, None))
+
+// A written end that is a number, as the end it is.
+private finite_at(d: Option[Decimal]) -> Option[RangeEnd] = d match
+    Some(x) -> Some(EndAt(x))
+    None -> None
 
 // The same, carrying the name a C header gives it.
-constrained_exported(name: string, base: Type, derived: bool, lo: Option[Decimal],
-                     hi: Option[Decimal], exclusive_hi: bool, pred_fn: Option[string],
+constrained_exported(name: string, base: Type, derived: bool, lo: Option[RangeEnd],
+                     hi: Option[RangeEnd], exclusive_hi: bool, pred_fn: Option[string],
                      cname: Option[string]) -> Type =
     Constrained(ConstrainedType(name, base, derived, lo, hi, exclusive_hi, pred_fn, cname))
 
@@ -428,9 +462,9 @@ private assocs_eq(xs: Buf[(string, Type)], ys: Buf[(string, Type)]) -> bool
     true
 end assocs_eq
 
-private decimal_opt_eq(a: Option[Decimal], b: Option[Decimal]) -> bool = a match
+private end_opt_eq(a: Option[RangeEnd], b: Option[RangeEnd]) -> bool = a match
     Some(x) -> b match
-        Some(y) -> x == y
+        Some(y) -> end_cmp(x, y) == 0
         None -> false
     None -> b.is_none()
 
