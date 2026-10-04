@@ -1,0 +1,344 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{split, Search}
+
+// The half of the reference's `CAbiTests` that is not a declaration table (that half is
+// `tests_cabi.sysl`): an aggregate past a variadic callee's declared parameters, a counted field
+// crossing to C, the widening a narrow scalar is owed and by whom, and the calls that are run so the
+// bytes are seen to arrive.
+//
+// **Every expected line and output here was read out of the reference compiler (0.0.159)** --
+// `sysl emit-llvm --no-std-lib --target <name>` for an IR line, `sysl run` for a printed one -- and
+// agrees with what the reference's own suite asserts.
+
+// The LLVM text of one program lowered for a named target, against that target's own library.
+private cab_ir_for(name: string, text: string) -> string
+    val t = target_named(name).unwrap()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("main.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    if !errors_of(done.an.diagnostics()).is_empty()
+        return analysis_report(errors_of(done.an.diagnostics()))
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end cab_ir_for
+
+private cab_arm(text: string) -> string = cab_ir_for("aarch64-macos", text)
+
+private cab_name_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) ||
+    (c >= u8('0') && c <= u8('9')) || c == u8('_') || c == u8('.')
+
+// A line with every value name written `%_`, so a call is compared by its shape and not by how the
+// temporaries were numbered. A named type (`%struct.S24`) keeps its name, being part of the shape.
+private cab_shape(line: string) -> string
+    val b = line.bytes
+    var out = ""
+    var from: usize = 0
+    var i: usize = 0
+
+    while i < b.len
+        if b[i] == u8('%') && !line[i + 1..<b.len].starts_with("struct.")
+            out = out + line[from..<i] + "%_"
+            i += 1
+
+            while i < b.len && cab_name_byte(b[i])
+                i += 1
+
+            from = i
+        else
+            i += 1
+
+    out + line[from..<b.len]
+end cab_shape
+
+// Whether some line of `ir` holds `want`, value names aside.
+private cab_has(ir: string, want: string) -> bool
+    val shaped = cab_shape(want)
+
+    for line in split(ir, "\n")
+        if cab_shape(line).contains(shaped) then return true
+
+    false
+end cab_has
+
+// The whole `define` of `symbol`, to its closing brace.
+private cab_define(ir: string, symbol: string) -> string
+    val fs = func_texts(ir)
+
+    for i in 0..<fs.len()
+        if fs.at(i).0 == symbol then return fs.at(i).1
+
+    s"nothing defines '$symbol'"
+end cab_define
+
+private cab_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+// -- the variadic tail ------------------------------------------------------------------------------
+
+// An argument past a variadic callee's declared parameters gets the same classification a declared
+// parameter of that type would, which is what C does with one too -- so the tail needs no rule of
+// its own.
+@test("an argument past the declared parameters is classified the same way")
+cab_a_tail_argument_is_classified()
+    if xvr_no_library() then return
+
+    val src = "struct P\n    a: i32\n    b: i32\nextern report(fmt: *u8, ...) -> i32\n" +
+              "var f: u8 = 0\nprint(report(&f, P(1, 2)))\n"
+    val x = cab_ir_for("x86_64-linux", src)
+    val a = cab_arm(src)
+
+    assert(cab_has(x, "call i32 (ptr, ...) @report(ptr %f.addr, i64 %t5)"), x)
+    assert(cab_has(a, "call i32 (ptr, ...) @report(ptr %f.addr, i64 %t5)"), a)
+
+@test("including one that goes in floating registers, or by address")
+cab_a_tail_argument_in_floating_registers_or_memory()
+    if xvr_no_library() then return
+
+    val hfa = "struct D2\n    a: f64\n    b: f64\nextern report(fmt: *u8, ...) -> i32\n" +
+              "var f: u8 = 0\nprint(report(&f, D2(1.0, 2.0)))\n"
+
+    val a = cab_arm(hfa)
+    val l = cab_ir_for("aarch64-linux", hfa)
+    val x = cab_ir_for("x86_64-linux", hfa)
+
+    assert(cab_has(a, "@report(ptr %f.addr, [2 x double] %t5)"), a)
+    assert(cab_has(l, "@report(ptr %f.addr, [2 x double] alignstack(8) %t5)"), l)
+    assert(cab_has(x, "@report(ptr %f.addr, double %t6, double %t8)"), x)
+
+    val big = "struct S24\n    a: i64\n    b: i64\n    c: i64\nextern report(fmt: *u8, ...) -> i32\n" +
+              "var f: u8 = 0\nprint(report(&f, S24(1i64, 2i64, 3i64)))\n"
+
+    val ab = cab_arm(big)
+    val xb = cab_ir_for("x86_64-linux", big)
+
+    assert(cab_has(ab, "@report(ptr %f.addr, ptr align 8 %t4)"), ab)
+    assert(cab_has(xb, "@report(ptr %f.addr, ptr byval(%struct.S24) align 8 %t4)"), xb)
+end cab_a_tail_argument_in_floating_registers_or_memory
+
+// What is still refused there is what has no layout to hand over at all.
+@test("while something with no layout is refused")
+cab_a_unit_tail_argument_is_refused()
+    if xvr_no_library() then return
+
+    val out = cab_arm("extern report(fmt: *u8, ...) -> i32\nvar f: u8 = 0\nprint(report(&f, ()))\n")
+
+    assert(out.contains("a unit cannot be passed to '...' — a variadic argument must be an " +
+                        "integer, a float, a char, a raw pointer, or the address of a function"), out)
+
+// And a *sysl* variadic callee still refuses one, because it is the callee's own walk that would
+// have to read it back and the walk reads one register at a time.
+@test("and a sysl function's own tail still refuses an aggregate, for a reason of its own")
+cab_a_sysl_tail_refuses_an_aggregate()
+    if xvr_no_library() then return
+
+    val out = cab_arm("total(first: int, ...) -> int\n    var ap: va_list\n    va_start(ap)\n" +
+                      "    va_end(ap)\n    return first\nstruct P\n    a: i32\n    b: i32\n" +
+                      "print(total(1, P(2, 3)))\n")
+
+    assert(out.contains("a P cannot be passed to a sysl function's '...' — a walk over the tail " +
+                        "reads back one register at a time and an aggregate is not one, where a " +
+                        "foreign callee takes it because C says which registers it arrives in"), out)
+
+@test("a declared parameter in front of the ellipsis is coerced like any other")
+cab_a_declared_parameter_before_the_ellipsis()
+    if xvr_no_library() then return
+
+    val out = cab_ir_for("x86_64-linux", "struct P\n    a: i32\n    b: i32\n" +
+                         "extern report(p: P, ...) -> i32\nprint(report(P(1, 2)))\n")
+
+    assert(out.contains("declare i32 @report(i64, ...)"), out)
+    assert(cab_has(out, "call i32 (i64, ...) @report(i64 %t5)"), out)
+
+// -- and the bytes arrive where the callee looks for them --------------------------------------------
+
+// The coincidence, run rather than read: sixteen bytes of integers always worked, and it has to go on
+// working.
+@test("and so does one of two words, which is where the naive answer was already right")
+cab_two_words_come_back()
+    if xvr_no_library() then return
+
+    assert_eq(cab_ran("struct ldiv_t\n    quot: i64\n    rem: i64\n" +
+                      "extern ldiv(a: i64, b: i64) -> ldiv_t\nvar d = ldiv(-7i64, 2i64)\n" +
+                      "print(d.quot, d.rem)\n"), "-3 -1\n")
+
+// C's `double complex` is a struct of two doubles, which is the one by-value aggregate parameter a
+// standard library offers -- so it is the only place the *argument* direction can be run at all.
+@test("a floating aggregate is passed by value and read on the other side")
+cab_a_floating_aggregate_goes_out()
+    if xvr_no_library() then return
+
+    assert_eq(cab_ran("struct cplx\n    re: f64\n    im: f64\nextern cabs(z: cplx) -> f64\n" +
+                      "print(cabs(cplx(3.0, 4.0)))\n"), "5\n")
+
+@test("and one of two floats, which travels in narrower registers")
+cab_two_floats_go_out()
+    if xvr_no_library() then return
+
+    assert_eq(cab_ran("struct cplxf\n    re: f32\n    im: f32\nextern cabsf(z: cplxf) -> f32\n" +
+                      "print(cabsf(cplxf(3.0f32, 4.0f32)))\n"), "5\n")
+
+@test("a floating aggregate comes back by value too")
+cab_a_floating_aggregate_comes_back()
+    if xvr_no_library() then return
+
+    assert_eq(cab_ran("struct cplx\n    re: f64\n    im: f64\nextern csqrt(z: cplx) -> cplx\n" +
+                      "var r = csqrt(cplx(-4.0, 0.0))\nprint(r.re, r.im)\n"), "0 2\n")
+
+@test("and two of them go out while a third comes back")
+cab_two_go_out_and_one_comes_back()
+    if xvr_no_library() then return
+
+    assert_eq(cab_ran("struct cplx\n    re: f64\n    im: f64\n" +
+                      "extern cpow(z: cplx, w: cplx) -> cplx\n" +
+                      "var r = cpow(cplx(2.0, 0.0), cplx(3.0, 0.0))\nprint(r.re, r.im)\n"), "8 0\n")
+
+// Two conversions in one expression, and a result nothing reads: each call gets its own storage, so
+// neither can overwrite the other's bytes before they are handed over.
+@test("two calls in one expression do not share the storage the conversion needs")
+cab_two_calls_in_one_expression()
+    if xvr_no_library() then return
+
+    assert_eq(cab_ran("struct div_t\n    quot: i32\n    rem: i32\n" +
+                      "extern div(a: i32, b: i32) -> div_t\n" +
+                      "print(div(7, 2).quot, div(9, 2).rem)\ndiv(1, 1)\n"), "3 1\n")
+
+// A zero-sized parameter is dropped from the signature (`reference/types.md § unit and never`),
+// which has to happen *before* the rest are classified or every argument after it lands one register
+// early.
+@test("a parameter that occupies nothing is dropped from in front of a coerced one")
+cab_a_unit_parameter_is_dropped()
+    if xvr_no_library() then return
+
+    assert_eq(cab_ran("struct div_t\n    quot: i32\n    rem: i32\n" +
+                      "extern \"div\" divide(nothing: unit, a: i32, b: i32) -> div_t\n" +
+                      "var d = divide((), 7, 2)\nprint(d.quot, d.rem)\n"), "3 1\n")
+
+@test("and a call in a loop keeps its storage in the frame rather than growing it")
+cab_a_call_in_a_loop_keeps_its_storage_in_the_frame()
+    if xvr_no_library() then return
+
+    val src = "struct div_t\n    quot: i32\n    rem: i32\nextern div(a: i32, b: i32) -> div_t\n" +
+              "var total = 0\nfor i in 1..5\n    total = total + div(i * 10, 3).quot\n"
+
+    assert_eq(cab_ran(src + "print(total)\n"), "48\n")
+
+    // The slots the conversion needs are hoisted, so the loop body allocates nothing.
+    val body = cab_define(cab_arm(src), "main")
+    var all: usize = 0
+    var before: usize = 0
+    var looping = false
+
+    for line in split(body, "\n")
+        if line.contains("br label") then looping = true
+
+        if line.contains("= alloca")
+            all += 1
+            if !looping then before += 1
+
+    assert(all > 0, body)
+    assert_eq(all, before)
+end cab_a_call_in_a_loop_keeps_its_storage_in_the_frame
+
+// -- a counted field changes the ownership not at all ----------------------------------------------
+
+// Both conventions pass this aggregate in memory but spell it differently, so the declaration names
+// AAPCS64's. The ownership half is the convention's business not at all: the callee borrows, so the
+// conversion is a copy of the bytes and nothing is retained for it.
+@test("a struct holding a string is passed by address and released once, at its own scope")
+cab_a_counted_field_is_released_once()
+    if xvr_no_library() then return
+
+    val out = cab_arm("struct Named\n    tag: i32\n    name: string\nextern take(v: Named)\n" +
+                      "use()\n    var n = Named(7, \"hi\")\n    take(n)\nend use\nuse()\n")
+
+    assert(out.contains("declare void @take(ptr align 8)"), out)
+
+    val body = cab_define(out, "use")
+
+    assert_eq(xvr_count(body, "@arc.copy.Named("), 1)
+    assert_eq(xvr_count(body, "@arc.dispose.Named("), 1)
+end cab_a_counted_field_is_released_once
+
+// -- a narrow scalar is widened by whoever owes it --------------------------------------------------
+
+// The callee's half: widening a result is the callee's obligation, and `@export` and `&f` hand this
+// very definition to C, so every definition states it. A register-width result has nothing owed.
+@test("a sysl definition states its own result's extension")
+cab_a_definition_states_its_results_extension()
+    if xvr_no_library() then return
+
+    val out = cab_arm("yes() -> bool = true\nsmall() -> u8 = 7\nwide() -> i64 = 7\n" +
+                      "print(if yes() then int(small()) else int(wide()))\n")
+
+    assert(cab_define(out, "yes").contains("define zeroext i1 @yes()"), out)
+    assert(cab_define(out, "small").contains("define zeroext i8 @small()"), out)
+    assert(cab_define(out, "wide").contains("define i64 @wide()"), out)
+
+// The caller's half: the extension is at the **call** as well as on the declaration, since it is the
+// call that makes the back end widen the value.
+@test("a foreign call states its arguments'")
+cab_a_foreign_call_states_its_arguments()
+    if xvr_no_library() then return
+
+    val out = cab_arm("extern take(v: u8)\ntake(7)\n")
+
+    assert(out.contains("declare void @take(i8 zeroext)"), out)
+    assert(out.contains("call void @take(i8 zeroext 7)"), out)
+
+// A simple enum is its discriminant, so a narrow one is widened by its own annotation's width and
+// signedness rather than as the `int` an enum is assumed to be.
+@test("a narrow simple enum by the width its annotation chose")
+cab_a_narrow_enum_by_its_width()
+    if xvr_no_library() then return
+
+    val out = cab_arm("enum Code : u8\n    Ok\n    Bad\nextern take(c: Code)\ntake(Code.Ok)\n")
+
+    assert(out.contains("declare void @take(i8 zeroext)"), out)
+
+// C's default argument promotion has already made a narrow tail argument an `int`, so there is
+// nothing narrow left to widen -- except on RISC-V 64, whose rule reaches 32 bits, where the promoted
+// `int` is still widened, and so is the variadic declaration's result.
+@test("a promoted variadic argument takes the width it was promoted to")
+cab_a_promoted_tail_argument()
+    if xvr_no_library() then return
+
+    val src = "extern vf(f: *u8, ...) -> int\nval b: u8 = 7\nprint(vf(null, b))\n"
+    val a = cab_arm(src)
+
+    assert(a.contains("call i32 (ptr, ...) @vf(ptr null, i32"), a)
+
+    val r = cab_ir_for("riscv64-linux", src)
+
+    assert(r.contains("declare signext i32 @vf(ptr, ...)"), r)
+    assert(r.contains("i32 signext"), r)
+
+// AArch64 away from Darwin is the same convention as the host's and answers the opposite way:
+// AAPCS64 leaves the top bits unspecified and makes the callee narrow what it reads.
+@test("and nowhere at all on AArch64 away from Darwin, which widens nothing")
+cab_nothing_widened_on_aarch64_linux()
+    if xvr_no_library() then return
+
+    val out = cab_ir_for("aarch64-linux", "extern take(v: u8)\nyes() -> bool = true\ntake(7)\n" +
+                         "print(yes())\n")
+
+    assert(out.contains("declare void @take(i8)"), out)
+    assert(cab_define(out, "yes").contains("define i1 @yes()"), out)
