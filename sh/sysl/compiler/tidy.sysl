@@ -1,0 +1,148 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, read_text, remove_file, write_text}
+import sysl.text.Search
+
+// `sysl tidy [<path>] [--check]` -- `sysl.sum` cut down to what this project resolves to now.
+//
+// A build only ever adds a line, so moving a dependency from 0.1.0 to 0.3.0 leaves 0.1.0's line in
+// the file for good. **Pruning belongs here rather than in a build** because a build resolves only
+// the part of the graph its features turn on: a build that pruned would drop the lines of every
+// feature it was not asked for, and the next build with that feature on would write them back.
+//
+// So the graph resolved here is the whole of it -- every feature the root declares, its
+// `dev_dependencies` as well as its `dependencies`, and every `--lib` root's own dependencies. A line
+// stays when resolving that graph reads its package at its version (`Graph.read`), and every other
+// line goes. Nothing is fetched that a build of the same graph would not fetch; a package with no
+// line yet is fetched and recorded exactly as a build would record it.
+//
+// `--check` asks the same question and writes nothing, failing where the answer would change the
+// file -- the form a CI job wants. A project depending on nothing is tidy with **no** `sysl.sum` at
+// all, since that is what a build leaves for one.
+//
+// It stops above the target, as `deps` does: which lines the file owes is a property of the
+// manifests, so a project that cannot be built on this machine can still be tidied.
+tidy_command(args: []string, say: string -> unit) -> int =
+    tidy_arguments(args) match
+        None ->
+            say(tidy_usage())
+            Misused
+        Some(read) -> tidy_project(read.0, read.1, say)
+
+// What a `sysl tidy` command line asks for: the project, which is the working directory where no path
+// is given, and whether it is `--check`. A `--lib` and the other search flags are taken on the way.
+tidy_arguments(args: []string) -> Option[(string, bool)]
+    var path = "."
+    var given = false
+    var check = false
+    var i: usize = 2
+
+    while i < args.len
+        val took = took_search_flag(args, i)
+
+        if took == 0 then return None
+
+        if took > 0
+            i += usize(took)
+            continue
+
+        if args[i] == "--check"
+            check = true
+        else if !given && !args[i].starts_with("-")
+            path = args[i]
+            given = true
+        else
+            return None
+
+        i += 1
+
+    Some((path, check))
+end tidy_arguments
+
+private tidy_usage() -> string = "usage: sysl tidy [--check] [<path>]"
+
+// The project a path names: the directory itself, or the one holding the file it names.
+private tidy_root(path: string) -> string
+    if is_directory(path) then return absolute_path(path)
+
+    absolute_path(parent_of(path).unwrap_or("."))
+end tidy_root
+
+// The whole command once the command line has been read.
+tidy_project(path: string, check: bool, say: string -> unit) -> int
+    val root = tidy_root(path)
+    val file = join_path(root, SumsName)
+
+    if !is_file(join_path(root, ManifestName))
+        say(s"error: '$root' has no $ManifestName — 'sysl tidy' tidies a project's $SumsName, and " +
+            "only a project with a manifest resolves anything to record")
+        return Failed
+
+    var text = ""
+
+    if is_file(file)
+        text = read_text(file) match
+            Err(_) ->
+                say(s"error: cannot read $file")
+                return Failed
+            Ok(got) -> got
+    end if
+
+    val answered = tidy_answer(root, text) match
+        Err(why) ->
+            say(s"error: $why")
+            return Failed
+        Ok(got) -> got
+
+    val present = is_file(file)
+    val tidy = if answered.text.is_empty() then !present else present && answered.text == text
+
+    if tidy then return Fine
+
+    if check
+        tidy_say(say, "would remove", answered.removed)
+        tidy_say(say, "would add", answered.added)
+        say(s"error: $SumsName is not tidy — 'sysl tidy' rewrites it to what this project resolves to")
+        return Failed
+
+    val wrote = if answered.text.is_empty() then remove_file(file) else write_text(file, answered.text)
+
+    if wrote.is_err()
+        say(s"error: cannot write $file")
+        return Failed
+
+    tidy_say(say, "removed", answered.removed)
+    tidy_say(say, "added", answered.added)
+    Fine
+end tidy_project
+
+private tidy_say(say: string -> unit, verb: string, keys: &Buf[(string, Release)])
+    for i in 0..<keys.len()
+        say(s"$verb ${keys.at(i).0} ${release_tag(keys.at(i).1)}")
+
+// What the file would be after tidying, resolved over the whole graph.
+private tidy_answer(root: string, text: string) -> Result[Tidied, string]
+    val before = sums_read(text)?
+    val m = manifest_of_package(root)?
+    var declared: Buf[Dependency] = buf()
+
+    for i in 0..<m.dependencies.len()
+        declared.push(m.dependencies.at(i))
+
+    for i in 0..<m.dev_dependencies.len()
+        declared.push(m.dev_dependencies.at(i))
+
+    var whole = m
+
+    whole.dependencies = declared
+
+    var none: Buf[(string, Release)] = buf()
+
+    if !wants_graph(whole) then return Ok(sums_tidied(text, before, none))
+
+    val cache = cache_root(root)?
+    val graph = resolve_graph(root, whole, before, cache, FeatureRequest(buf(), false, true), true)?
+
+    Ok(sums_tidied(text, graph.sums, graph.read))
+end tidy_answer
