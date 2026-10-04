@@ -306,7 +306,18 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // A bare-arrow parameter is sugar for a bounded type parameter, and the rewrite happens
         // at the declaration so that everything after it is the generic machinery that exists.
         FuncDecl(d) -> hoist_func(a, scope, s.span, with_call_bounds(d))
-        ImplDecl(d) -> a.tables.impls.push(Impl(with_impl_call_bounds(d), s.span, scope))
+        // **A `@tests` file may not hold an `impl`**: a test build keeps the file and every other
+        // build drops it, so the trait would answer differently in the tests than in the program
+        // that ships. Refused rather than registered, so nothing is analyzed against an answer that
+        // will not be there.
+        ImplDecl(d) ->
+            if test_only_file(a, scope.src.name)
+                a.fault(scope, s.span, "an 'impl' block may not sit in a file that said '@tests' — a " +
+                        "test build would keep it and every other build would drop it, so a trait " +
+                        "would answer one way while the tests ran and another way in the program " +
+                        "that ships. It belongs beside the type")
+            else
+                a.tables.impls.push(Impl(with_impl_call_bounds(d), s.span, scope))
         // **`static` says outright what a header would have said**, so what is under one is
         // registered exactly as another file's declaration of it would be -- which is the whole of
         // what the modifier does, in the one file where an ordinary `var` is a local instead.
