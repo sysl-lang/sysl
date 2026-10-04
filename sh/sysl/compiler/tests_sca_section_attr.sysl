@@ -1,0 +1,257 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The reference's `SectionAttrTests`: `@section("...")`, where the linker puts one object or one
+// definition (`reference/attributes.md § @section("...")`).
+//
+// It is asserted from the IR, because there is nothing at run time to ask: a program cannot read
+// back which section its own storage landed in, and the name is a string the back end passes through
+// to the object file. The programs that do run name their section the way Mach-O spells one, that
+// being the machine the suite runs on.
+//
+// **Every IR line and every output here was read out of the reference compiler (0.0.162)** by handing
+// the installed `sysl` the same tree; the IR is its `emit-llvm`. The harness is the one
+// `tests_xvr_extern_var.sysl` builds.
+
+private sca_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+private sca_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+// The `define` lines of some IR that are placed in `section`.
+private sca_placed_defines(out: string, section: string) -> usize
+    val lines = lines_of(out)
+    var n: usize = 0
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with("define") && lines.at(i).contains(s"section \"$section\"") then n += 1
+
+    n
+end sca_placed_defines
+
+// The assembly clang makes of a module at the level a program is built at. It is read rather than an
+// object file because a section directive is text in every format. `None` where there is no clang.
+private sca_assembly(llvm: string) -> Option[string]
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no assembler to ask")
+        return None
+    end if
+
+    val dir = make_temp_dir("sysl-section").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, llvm).unwrap()
+
+    val got = capture("clang", ["-O1", "-S", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end sca_assembly
+
+// -- @section places module storage ----------------------------------------------------------------
+
+@test("a 'var' carries the section to the global it lays down")
+sca_var_carries_the_section()
+    if xvr_no_library() then return
+
+    val out = xvr_ir([("m/m.sysl", "module m\n\n@section(\".vectors\")\nvar table: [4]u64\n"),
+                      ("main.sysl", "print(m.table[0])\n")])
+
+    assert(out.contains("@m$table = private global [4 x i64] zeroinitializer, section \".vectors\""), out)
+end sca_var_carries_the_section
+
+@test("a 'val' does too, a section being about storage rather than about writing")
+sca_val_does_too()
+    if xvr_no_library() then return
+
+    val out = xvr_ir([("m/m.sysl", "module m\n\n@section(\".rodata.boot\")\nval magic: u32 = 0xdeadbeefu32\n"),
+                      ("main.sysl", "print(m.magic)\n")])
+
+    assert(out.contains("@m$magic = private constant i32 3735928559, section \".rodata.boot\""), out)
+end sca_val_does_too
+
+@test("and so does the 'static' spelling of the same declaration")
+sca_static_spelling()
+    if xvr_no_library() then return
+
+    val out = sca_ir("@section(\".noinit\")\nstatic var reason: u32 = 0u32\nprint(reason)")
+
+    assert(out.contains("@reason = private global i32 0, section \".noinit\""), out)
+
+@test("one that asks for nothing carries none")
+sca_one_that_asks_for_nothing()
+    if xvr_no_library() then return
+
+    val out = sca_ir("static var n: u32 = 0u32\nprint(n)")
+
+    assert(!out.contains("section \""), out)
+
+// -- @section composes with @align on a binding ----------------------------------------------------
+
+@test("both reach the global, the section first as LLVM writes it")
+sca_with_align_section_first()
+    if xvr_no_library() then return
+
+    val out = sca_ir("@align(4096)\n@section(\".noinit\")\nstatic var page: [8]u8\nprint(page[0])")
+
+    assert(out.contains("@page = private global [8 x i8] zeroinitializer, section \".noinit\", align 4096"), out)
+
+@test("the order they are written in does not matter")
+sca_with_align_either_order()
+    if xvr_no_library() then return
+
+    val out = sca_ir("@section(\".noinit\")\n@align(4096)\nstatic var page: [8]u8\nprint(page[0])")
+
+    assert(out.contains("@page = private global [8 x i8] zeroinitializer, section \".noinit\", align 4096"), out)
+
+// -- @section places a definition ------------------------------------------------------------------
+
+@test("the 'define' line carries it")
+sca_define_line_carries_it()
+    if xvr_no_library() then return
+
+    val out = sca_ir("@section(\".ramfunc\")\nerase() -> int = 7\nprint(erase())")
+
+    assert(out.contains("define i32 @erase() section \".ramfunc\" {"), out)
+
+@test("a placed function nothing calls is still emitted")
+sca_placed_uncalled_is_emitted()
+    if xvr_no_library() then return
+
+    val out = sca_ir("@section(\".ramfunc\")\nerase() -> int = 7\nprint(1)")
+
+    assert(out.contains("define i32 @erase() section \".ramfunc\" {"), out)
+    assert(out.contains("@llvm.used = appending global [1 x ptr] [ptr @erase], section \"llvm.metadata\""), out)
+end sca_placed_uncalled_is_emitted
+
+@test("one nothing calls and nothing places is dropped, which is what makes that a claim")
+sca_unplaced_uncalled_is_dropped()
+    if xvr_no_library() then return
+
+    val out = sca_ir("erase() -> int = 7\nprint(1)")
+
+    assert(!out.contains("@erase"), out)
+
+// The two say different things about one definition -- one names the symbol a C caller resolves, the
+// other says where that definition lands -- and a boot entry a linker script places is routinely both.
+@test("it stands beside '@export', which is about the symbol rather than the address")
+sca_beside_export()
+    if xvr_no_library() then return
+
+    val out = sca_ir("@export(\"boot_entry\")\n@section(\".text.boot\")\nstart() -> int = 0\nprint(1)")
+
+    assert(out.contains("define i32 @boot_entry() {"), out)
+    assert(out.contains("define i32 @start() section \".text.boot\" {"), out)
+end sca_beside_export
+
+// A function declared inside another is hoisted to a definition of its own, so the placement has to
+// travel with it.
+@test("a nested function carries it too")
+sca_nested_function()
+    if xvr_no_library() then return
+
+    assert_eq(sca_ran("outer() -> int\n    @section(\"__TEXT,__mine\")\n    inner() -> int = 7\n    inner()\n\n" +
+                      "print(outer())"), "7\n")
+end sca_nested_function
+
+// A generic is one declaration and many definitions, so the section is a property each carries.
+@test("an instantiation of a generic carries it")
+sca_generic_instantiations()
+    if xvr_no_library() then return
+
+    val out = sca_ir("@section(\".ramfunc\")\nid[T](v: T) -> T = v\nprint(id(1), id(2u8))")
+
+    assert_eq(sca_placed_defines(out, ".ramfunc"), 2)
+    assert(out.contains("define i32 @id.int(i32 %v.param) section \".ramfunc\" {"), out)
+    assert(out.contains("define zeroext i8 @id.byte(i8 %v.param) section \".ramfunc\" {"), out)
+end sca_generic_instantiations
+
+// -- a placed symbol is written into llvm.used ----------------------------------------------------
+
+@test("storage is named there")
+sca_used_names_storage()
+    if xvr_no_library() then return
+
+    val out = sca_ir("@section(\".noinit\")\nstatic var reason: u32 = 0u32\nprint(reason)")
+
+    assert(out.contains("@llvm.used = appending global [1 x ptr] [ptr @reason], section \"llvm.metadata\""), out)
+
+@test("and so is a definition")
+sca_used_names_a_definition()
+    if xvr_no_library() then return
+
+    val out = sca_ir("@section(\".ramfunc\")\nerase() -> int = 7\nprint(erase())")
+
+    assert(out.contains("@llvm.used = appending global [1 x ptr] [ptr @erase], section \"llvm.metadata\""), out)
+
+@test("two placed things share one list")
+sca_used_one_list()
+    if xvr_no_library() then return
+
+    val out = sca_ir("@section(\".ramfunc\")\nerase() -> int = 7\n@section(\".noinit\")\nstatic var n: u32 = 0u32\n" +
+                     "print(erase(), n)")
+
+    assert(out.contains("@llvm.used = appending global [2 x ptr] [ptr @n, ptr @erase], section \"llvm.metadata\""), out)
+    assert_eq(xvr_count(out, "@llvm.used"), 1)
+end sca_used_one_list
+
+@test("a program that places nothing carries no list at all")
+sca_no_list_without_placement()
+    if xvr_no_library() then return
+
+    val out = sca_ir("print(1)")
+
+    assert(!out.contains("@llvm.used"), out)
+
+// -- a placed object goes through the real toolchain -----------------------------------------------
+
+@test("the program still runs, and reads what it put there")
+sca_placed_object_runs()
+    if xvr_no_library() then return
+
+    assert_eq(sca_ran("@section(\"__DATA,__mine\")\nstatic var ticks: u32 = 7u32\nticks += 1u32\nprint(ticks)"), "8\n")
+
+@test("a placed function is called like any other")
+sca_placed_function_runs()
+    if xvr_no_library() then return
+
+    assert_eq(sca_ran("@section(\"__TEXT,__mine\")\ndouble(n: int) -> int = n * 2\nprint(double(21))"), "42\n")
+
+// -- a placed object nothing reads survives the optimizer ------------------------------------------
+//
+// A table gathered by a linker script has no reader inside the program, the globals are `private`,
+// and a program builds at -O1 -- so the pass that deletes an unreferenced private global stands
+// between the attribute and the object file. `llvm.used` is what stops it, and the control is the
+// same IR with that one line removed, which loses the section entirely.
+
+private val sca_unread_table: string = "@section(\"__DATA,__mine\")\nstatic var table: [4]u64\nprint(1)"
+
+@test("the section reaches the assembler")
+sca_section_reaches_the_assembler()
+    if xvr_no_library() then return
+
+    sca_assembly(sca_ir(sca_unread_table)) match
+        None -> ()
+        Some(asm) -> assert(asm.contains("__mine"), asm)
+end sca_section_reaches_the_assembler
+
+@test("and without the 'used' list it would not, which is what that line buys")
+sca_without_used_the_section_is_lost()
+    if xvr_no_library() then return
+
+    val lines = lines_of(sca_ir(sca_unread_table))
+    var stripped = ""
+
+    for i in 0..<lines.len()
+        if !lines.at(i).starts_with("@llvm.used") then stripped = stripped + lines.at(i) + "\n"
+
+    assert(stripped.contains("__mine"), stripped)
+
+    sca_assembly(stripped) match
+        None -> ()
+        Some(asm) -> assert(!asm.contains("__mine"), asm)
+end sca_without_used_the_section_is_lost
