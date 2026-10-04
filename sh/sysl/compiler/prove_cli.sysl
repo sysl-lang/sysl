@@ -1,0 +1,109 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// `sysl prove [--emit-whyml] [--overflow check|ignore] [--target <name>] <path>` -- the program's own
+// functions as WhyML (`reference/verification.md § sysl prove`).
+//
+// **A proof stops at the typed tree**, the one `emit-typed` prints: analysis has checked every rule
+// that could fail, and nothing past it -- pruning, lowering, codegen, a link -- has anything to say
+// about what a function promises. Analysis still runs the C compiler over a `c const` block's
+// headers, so the search flags every compiling command takes are taken here too.
+//
+// **`--overflow` is read after the program has compiled**, as the reference reads it: a program that
+// does not compile is told so first, whatever else the command line got wrong.
+
+// What the command was asked for.
+private struct ProveOptions
+    file: string
+    named: Option[string]
+    emit: bool
+    overflow: string
+end ProveOptions
+
+prove_command(args: []string, say: string -> unit) -> int
+    val opts = prove_options(args) match
+        Some(o) -> o
+        None ->
+            say(prove_usage())
+            return Misused
+
+    val c = typed_compilation(opts.file, opts.named) match
+        Err(why) ->
+            prove_say_failure(why, say)
+            return Failed
+        Ok(found) -> found
+
+    val (program, report) = typed_program(c)
+
+    // An analysis error is reported exactly as any other compiling command reports one, with
+    // nothing on standard output.
+    if !report.is_empty()
+        say(analysis_report(report))
+        return Failed
+    end if
+
+    if opts.overflow != "check" && opts.overflow != "ignore"
+        say(s"error: --overflow is 'check' or 'ignore', and '${opts.overflow}' is neither")
+        return Failed
+    end if
+
+    val mlw = whyml_module(program, c.own, whyml_module_name(opts.file), opts.overflow == "check") match
+        Err(why) ->
+            say(s"error: $why")
+            return Failed
+        Ok(text) -> text
+
+    if !opts.emit
+        say("error: discharging the module needs Why3, which this compiler does not run yet -- " +
+            "'--emit-whyml' prints what it would be handed")
+        return Failed
+    end if
+
+    // The module ends in a newline of its own, and `say` ends the line it is given.
+    say(if mlw.ends_with("\n") then mlw[0..<mlw.len - 1] else mlw)
+    Fine
+end prove_command
+
+// The usage line, and under it what the command is for in the reference's own words.
+prove_usage() -> string =
+    "usage: sysl prove [--emit-whyml] [--overflow check|ignore] [--target <name>] " + where_flags() +
+    " <path>\ntranslate a module to WhyML and discharge its proof obligations with Why3 (17)"
+
+// The command line after `prove`, or nothing where it is not one this command can read.
+private prove_options(args: []string) -> Option[ProveOptions]
+    var opts = ProveOptions("", None, false, "check")
+    var i: usize = 2
+
+    while i < args.len
+        val took = took_search_flag(args, i)
+
+        if took == 0 then return None
+
+        if took > 0
+            if took == 2 then i += 1
+        else if args[i] == "--emit-whyml"
+            opts.emit = true
+        else if args[i] == "--overflow" || args[i] == "--target"
+            if i + 1 >= args.len then return None
+
+            if args[i] == "--overflow" then opts.overflow = args[i + 1] else opts.named = Some(args[i + 1])
+
+            i += 1
+        else if args[i].starts_with("--overflow=")
+            opts.overflow = args[i][11..<args[i].len]
+        else
+            opts.file = args[i]
+
+        i += 1
+    end while
+
+    if opts.file == "" then None else Some(opts)
+end prove_options
+
+// A failure on its way out: a refusal about the project takes its `error: ` here, where an analysis
+// report already carries its own.
+private prove_say_failure(why: Failure, say: string -> unit) = why match
+    Said(refusal) -> say(s"error: ${refusal.message}")
+    Reported(report) -> say(report)

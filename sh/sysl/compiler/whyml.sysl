@@ -1,0 +1,745 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, pow, sub, to_string}
+import sysl.text.from_utf8_unchecked
+
+// The proof backend: a program's typed tree written out as **WhyML**, the input language of the Why3
+// platform (`reference/verification.md § sysl prove`).
+//
+// **It reads the typed tree, not the parse tree.** A `TFunc` keeps its `requires`, `ensures` and
+// `variant` beside the body, so the clauses arrive as clauses and every name is already resolved.
+//
+// **Two worlds, and the mark decides which one a function lands in.** WhyML separates *terms*, which
+// are mathematics and may appear in a `requires`, from *programs*, which have state and may not. A
+// `@ghost` function is a term -- a `predicate` where it answers `bool`, a `let function` otherwise --
+// and every other function is a program, a plain `let`, which a contract may not call.
+//
+// **Integer overflow is a proof obligation in code and not in specifications.** sysl's integers have
+// widths and WhyML's `int` is the mathematical integers, so translating `a + b` to `a + b` would
+// prove theorems about a language sysl is not. In a *program* body every arithmetic operation goes
+// through a checked helper whose precondition is that the true result is representable; a *term*
+// keeps plain arithmetic, the specification being the mathematics the code is measured against.
+//
+// **What it has no answer for is refused by name**, as `the proof backend does not translate …`, so
+// a gap in the translator reads as a gap in the translator rather than as a program the prover
+// disliked. A refusal is the first thing the walk could not translate, the walk going function by
+// function in declaration order and, inside one, signature, clauses, then body.
+
+// What the translation is doing, held across one module.
+private struct WhyGen
+    // The functions this module is about: the ones the program's own modules declare. A library
+    // function is not translated and not called -- a call to one is refused by name.
+    own: Buf[TFunc]
+
+    // The `@ghost` ones among them, which are the only functions a contract may call.
+    ghosts: Buf[string]
+
+    check_overflow: bool
+
+    // The checked-arithmetic helpers the module turned out to need, in the order they were first
+    // asked for so the output is stable: their names, and the text of each.
+    helper_names: Buf[string]
+    helper_texts: Buf[string]
+
+    // The locals that are `ref`s, which is every one a body declares; a block gives back the ones it
+    // declared by cutting the list to where it stood. A parameter is never one: WhyML's parameters
+    // are immutable, and a body that assigns to one is refused by name.
+    refs: Buf[string]
+
+    // The `old(e)` expressions of the function being written, which `TOld` indexes into.
+    olds: Buf[TExpr]
+end WhyGen
+
+// The program's own functions as a WhyML module named `name`, or the sentence saying what in it the
+// translation has no answer for.
+//
+// `own` is the modules the program declares; none at all means the module its statements were
+// written in. `check_overflow` off drops the range obligations -- the helpers' and the parameters'
+// and the result's together, since keeping one without the others would leave a function promising
+// a result nothing makes it stay inside.
+whyml_module(p: TProgram, own: Buf[string], name: string, check_overflow: bool) -> Result[string, string]
+    var mine: Buf[string] = buf()
+
+    if own.is_empty() then mine.push(p.main_module) else mine = own
+
+    var funcs: Buf[TFunc] = buf()
+    var ghosts: Buf[string] = buf()
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if why_has(mine, module_of(f.name))
+            funcs.push(f)
+
+            if f.ghost then ghosts.push(f.name)
+    end for
+
+    var g = WhyGen(funcs, ghosts, check_overflow, buf(), buf(), buf(), buf())
+
+    why_module(&g, name).map_err((what) -> s"the proof backend does not translate $what")
+end whyml_module
+
+// A WhyML module's name, taken from the path the program was given: the last part of it up to its
+// first dot, kept to what an identifier may hold, `Program` where nothing is left of it.
+whyml_module_name(at: string) -> string
+    val bytes = at.bytes
+    var end_at = bytes.len
+
+    while end_at > 0 && bytes[end_at - 1] == u8('/')
+        end_at -= 1
+
+    var start = end_at
+
+    while start > 0 && bytes[start - 1] != u8('/')
+        start -= 1
+
+    var stop = start
+
+    while stop < end_at && bytes[stop] != u8('.')
+        stop += 1
+
+    if stop == start then return "Program"
+
+    var out: Buf[u8] = buf()
+
+    for i in start..<stop
+        if why_word_byte(bytes[i]) then out.push(bytes[i])
+
+    from_utf8_unchecked(out.view())
+end whyml_module_name
+
+// -- the module ------------------------------------------------------------------------------------
+
+private why_module(g: *WhyGen, name: string) -> Result[string, string]
+    // The helpers are collected while the bodies are written, so they can only be laid down once
+    // the bodies are finished -- which is why this is assembled rather than streamed.
+    var bodies: Buf[string] = buf()
+
+    for i in 0..<g.own.len()
+        bodies.push(why_function(g, g.own.at(i))?)
+
+    var out = s"module ${why_capitalized(name)}\n  use int.Int\n  use int.ComputerDivision\n  use ref.Ref\n\n"
+
+    for i in 0..<g.helper_texts.len()
+        out = out + g.helper_texts.at(i) + "\n"
+
+    Ok(out + why_joined(bodies, "\n") + "end\n")
+end why_module
+
+// -- functions -------------------------------------------------------------------------------------
+
+private why_function(g: *WhyGen, f: TFunc) -> Result[string, string]
+    g.refs.clear()
+    g.olds = f.olds
+
+    var params = "(_: unit)"
+
+    if !f.params.is_empty()
+        var parts: Buf[string] = buf()
+
+        for i in 0..<f.params.len()
+            val (n, t) = f.params.at(i)
+            val shown = why_type(t)?
+
+            parts.push(s"(${why_ident(n)}: $shown)")
+
+        params = why_joined(parts, " ")
+    end if
+
+    // A `@ghost` declaration is a specification, so it is a term whatever it costs to say; one that
+    // answers `bool` is a `predicate`, `forall` being a formula with no type of its own.
+    val is_term = f.ghost
+    val again = if why_recursive(f) then "rec " else ""
+    val predicate = is_term && why_is_bool(f.ret_ty)
+    var kind = s"let $again"
+
+    if predicate then kind = s"${again}predicate" else if is_term then kind = s"let ${again}function"
+
+    var head = s"  $kind ${why_ident(f.name)} $params\n"
+
+    if !predicate
+        val answer = why_type(f.ret_ty)?
+
+        head = s"  $kind ${why_ident(f.name)} $params : $answer\n"
+    end if
+
+    // What the parameter's type already says: WhyML's `int` is unbounded and a sysl `int` is not.
+    // A `@ghost` function gets none of it, its parameters being mathematics.
+    if !is_term && g.check_overflow
+        for i in 0..<f.params.len()
+            val (n, t) = f.params.at(i)
+
+            underlying(t) match
+                Integer(bits, signed, _) ->
+                    head = head + s"    requires { ${why_lo(bits, signed)} <= ${why_ident(n)} <= ${why_hi(bits, signed)} }\n"
+                _ -> ()
+    end if
+
+    for i in 0..<f.requires.len()
+        val c = why_term(g, f.requires.at(i).cond)?
+
+        head = head + s"    requires { $c }\n"
+
+    // And what the result's type says, which a caller reading a call needs as much as this body
+    // needed the parameters'.
+    if !is_term && g.check_overflow
+        underlying(f.ret_ty) match
+            Integer(bits, signed, _) ->
+                head = head + s"    ensures  { ${why_lo(bits, signed)} <= result <= ${why_hi(bits, signed)} }\n"
+            _ -> ()
+    end if
+
+    for i in 0..<f.ensures.len()
+        val c = why_term(g, f.ensures.at(i).cond)?
+
+        head = head + s"    ensures  { $c }\n"
+
+    if f.variant.is_some()
+        val v = why_term(g, f.variant.unwrap())?
+
+        head = head + s"    variant  { $v }\n"
+    end if
+
+    val body = if is_term then why_term_body(g, f)? else why_block(g, f.body)?
+
+    Ok(s"$head  = $body\n")
+end why_function
+
+// Whether a body calls the function it belongs to, contracts left out as the reference leaves them.
+private why_recursive(f: TFunc) -> bool
+    var found = false
+    val at = &found
+    val name = f.name
+
+    walk_stmts(f.body.stmts, expr_walk(true, (e) -> why_note_call(e, name, at)))
+
+    if f.body.result.is_some() then
+        walk_texpr(f.body.result.unwrap(), expr_walk(true, (e) -> why_note_call(e, name, at)))
+
+    found
+end why_recursive
+
+private why_note_call(e: TExpr, name: string, at: *bool)
+    *e.kind match
+        TCall(callee, _, _, _) -> if callee == name then *at = true
+        _ -> ()
+
+// A body that is one expression, which is what a `@ghost` function's has to be.
+private why_term_body(g: *WhyGen, f: TFunc) -> Result[string, string]
+    g.refs.clear()
+
+    if f.body.stmts.is_empty() && f.body.result.is_some() then return why_term(g, f.body.result.unwrap())
+
+    Err(s"'${module_show(f.name)}', a '@ghost' function whose body declares or does something rather " +
+        "than being one expression — a specification is mathematics, so it may not declare a variable " +
+        "or run a loop")
+end why_term_body
+
+// -- types -----------------------------------------------------------------------------------------
+
+private why_type(t: Type) -> Result[string, string]
+    val u = underlying(t)
+
+    u match
+        Integer(_, _, _) -> Ok("int")
+        Bool -> Ok("bool")
+        Unit -> Ok("unit")
+        _ -> Err(s"the type ${type_show(u)}")
+end why_type
+
+private why_is_bool(t: Type) -> bool = underlying(t) match
+    Bool -> true
+    _ -> false
+
+// The bounds of a width, and the name its helpers are generated under.
+private why_lo(bits: int, signed: bool) -> string =
+    if signed then to_string(sub(from_int(0), pow(from_int(2), usize(bits - 1)))) else "0"
+
+private why_hi(bits: int, signed: bool) -> string =
+    if signed then to_string(sub(pow(from_int(2), usize(bits - 1)), from_int(1)))
+    else to_string(sub(pow(from_int(2), usize(bits)), from_int(1)))
+
+private why_width(bits: int, signed: bool) -> string = (if signed then "i" else "u") + s"$bits"
+
+// -- terms and programs ----------------------------------------------------------------------------
+
+// An expression as a WhyML **term**: mathematics, with no state and no obligations.
+private why_term(g: *WhyGen, e: TExpr) -> Result[string, string] = why_expr(g, e, true)
+
+// The same expression as a WhyML **program**, where arithmetic carries its range obligation.
+private why_code(g: *WhyGen, e: TExpr) -> Result[string, string] = why_expr(g, e, false)
+
+private why_expr(g: *WhyGen, e: TExpr, in_term: bool) -> Result[string, string]
+    *e.kind match
+        TIntLit(v, _) -> Ok(if v.sign() < 0 then s"(${to_string(v)})" else to_string(v))
+        TBoolLit(b) -> Ok(if b then "true" else "false")
+        TUnitLit -> Ok("()")
+        TLoad(n, _) -> Ok(if why_has(g.refs, n) then s"!${why_ident(n)}" else why_ident(n))
+        TResult(_) -> Ok("result")
+        TOld(i, _) ->
+            if i < 0 || usize(i) >= g.olds.len() then return Err("an 'old' the translator lost track of")
+
+            val was = why_expr(g, g.olds.at(usize(i)), in_term)?
+
+            Ok(s"(old $was)")
+        TBinary(op, l, r, ty) -> why_binary(g, op, l, r, ty, in_term)
+        TUnary(op, o, ty) -> why_unary(g, e, op, o, ty, in_term)
+
+        // A term is always a formula position here -- a clause, a loop's invariant, a `predicate`
+        // body -- so the connectives are the logical ones; a program keeps WhyML's lazy operators.
+        TLogical(op, l, r) ->
+            var o = if in_term then "\\/" else "||"
+
+            if op == "&&" then o = if in_term then "/\\" else "&&"
+
+            val a = why_expr(g, l, in_term)?
+            val b = why_expr(g, r, in_term)?
+
+            Ok(s"($a $o $b)")
+
+        // A chain shares its middle operands, and every operand in this fragment is pure, so
+        // writing each one twice means what the chain means.
+        TCompare(operands, cmps) ->
+            var parts: Buf[string] = buf()
+
+            for i in 0..<cmps.len()
+                if i + 1 >= operands.len() then break
+
+                val cmp = cmps.at(i)
+
+                if cmp.dispatch.is_some() then return Err("a comparison that dispatches to a trait method")
+
+                val a = why_expr(g, operands.at(i), in_term)?
+                val b = why_expr(g, operands.at(i + 1), in_term)?
+
+                parts.push(s"$a ${why_compare_op(cmp.op)} $b")
+
+            Ok("(" + why_joined(parts, if in_term then " /\\ " else " && ") + ")")
+        TIf(cond, then_block, else_block, _) ->
+            val c = why_single_test(cond)
+
+            if c.is_none() || else_block.is_none() then
+                return Err("an 'if' with a binding condition or with no 'else'")
+
+            val test = why_expr(g, c.unwrap(), in_term)?
+            val yes = why_block_as(g, then_block, in_term)?
+            val no = why_block_as(g, else_block.unwrap(), in_term)?
+
+            Ok(s"(if $test then $yes else $no)")
+        TQuantifier(universal, n, _, lo, hi, inclusive, pred) ->
+            if !in_term then
+                return Err("a quantifier outside a contract — it is a statement about every value in a " +
+                           "range, which a prover reads and a program would have to run")
+
+            val v = why_ident(n)
+            val upper = if inclusive then "<=" else "<"
+            val low = why_term(g, lo)?
+            val high = why_term(g, hi)?
+            val range = s"$low <= $v $upper $high"
+            val holds = why_term(g, pred)?
+
+            Ok(if universal then s"(forall $v: int. $range -> $holds)" else s"(exists $v: int. $range /\\ $holds)")
+
+        // `print(x)` lowers to a sequence, which is descended into rather than refused as a shape,
+        // so what the reader is told about is the call they wrote.
+        TSeq(es) ->
+            if in_term then return Err("a sequence of expressions in a contract")
+
+            var parts: Buf[string] = buf()
+
+            for i in 0..<es.len()
+                parts.push(why_expr(g, es.at(i), in_term)?)
+
+            Ok("(" + why_joined(parts, "; ") + ")")
+        TBlockExpr(_) -> Err("a 'for const' in a contract")
+        TCall(name, args, _, _) ->
+            if !why_owns(g, name) then
+                return Err(s"a call to '${module_show(name)}', which this module does not declare")
+
+            if in_term && !why_has(g.ghosts, name) then
+                return Err(s"a call to '${module_show(name)}' from a contract — it is a program rather " +
+                           "than mathematics, so it has no meaning as a term. Mark it '@ghost', which " +
+                           "is what says a declaration exists for the specification")
+
+            var parts: Buf[string] = buf()
+
+            for i in 0..<args.len()
+                parts.push(why_expr(g, args.at(i), in_term)?)
+
+            Ok(s"(${why_ident(name)} " + (if parts.is_empty() then "()" else why_joined(parts, " ")) + ")")
+        _ -> Err(why_shape_expr(e))
+end why_expr
+
+private why_unary(g: *WhyGen, e: TExpr, op: string, o: TExpr, ty: Type, in_term: bool) -> Result[string, string]
+    if op == "!"
+        val inner = why_expr(g, o, in_term)?
+
+        return Ok(s"(not $inner)")
+    end if
+
+    if op != "-" then return Err(why_shape_expr(e))
+
+    underlying(ty) match
+        Integer(bits, signed, _) ->
+            if !in_term && g.check_overflow
+                // The helper is asked for before the operand is written, as the reference does, which
+                // is what decides where it stands among the others.
+                val h = why_helper(g, "neg", bits, signed)
+                val checked = why_expr(g, o, in_term)?
+
+                return Ok(s"($h $checked)")
+            end if
+
+            val plain = why_expr(g, o, in_term)?
+
+            Ok(s"(- $plain)")
+        other -> Err(s"unary '-' on ${type_show(other)}")
+end why_unary
+
+private why_compare_op(op: string) -> string =
+    if op == "==" then "=" else if op == "!=" then "<>" else op
+
+private why_binary(g: *WhyGen, op: string, l: TExpr, r: TExpr, ty: Type, in_term: bool) -> Result[string, string]
+    val a = why_expr(g, l, in_term)?
+    val b = why_expr(g, r, in_term)?
+
+    why_binary_text(g, op, a, b, ty, in_term)
+end why_binary
+
+// The arithmetic over two operands already written. Division is `int.ComputerDivision`'s, C's
+// truncating one, and goes through a helper in code whatever the overflow setting, dividing by zero
+// being an obligation the arithmetic setting has nothing to do with.
+private why_binary_text(g: *WhyGen, op: string, a: string, b: string, ty: Type,
+                        in_term: bool) -> Result[string, string]
+    underlying(ty) match
+        Integer(bits, signed, _) ->
+            if op == "+" || op == "-" || op == "*"
+                if !in_term && g.check_overflow then
+                    return Ok(s"(${why_helper(g, why_word(op), bits, signed)} $a $b)")
+
+                return Ok(s"($a $op $b)")
+            end if
+
+            if op == "/" then
+                return Ok(if in_term then s"(div $a $b)" else s"(${why_helper(g, "div", bits, signed)} $a $b)")
+
+            if op == "%" then
+                return Ok(if in_term then s"(mod $a $b)" else s"(${why_helper(g, "rem", bits, signed)} $a $b)")
+
+            Err(s"the operator '$op' on an integer")
+        other -> Err(s"the operator '$op' on ${type_show(other)}")
+end why_binary_text
+
+private why_word(op: string) -> string = if op == "+" then "add" else if op == "-" then "sub" else "mul"
+
+// A checked arithmetic helper for one width, generated the first time it is asked for. Its
+// precondition is the whole point: the obligation that the operation does not leave the range the
+// type can hold.
+private why_helper(g: *WhyGen, op: string, bits: int, signed: bool) -> string
+    val name = s"${op}_${why_width(bits, signed)}"
+
+    if why_has(g.helper_names, name) then return name
+
+    val lo = why_lo(bits, signed)
+    val hi = why_hi(bits, signed)
+    var sym = "mod"
+
+    if op == "add" then sym = "+"
+    else if op == "sub" || op == "neg" then sym = "-"
+    else if op == "mul" then sym = "*"
+    else if op == "div" then sym = "div"
+
+    var text = s"  let $name (a b: int) : int\n    requires { $lo <= a $sym b <= $hi }\n" +
+               s"    ensures  { result = a $sym b }\n  = a $sym b\n"
+
+    if op == "neg"
+        text = s"  let $name (a: int) : int\n    requires { $lo <= - a <= $hi }\n" +
+               s"    ensures  { result = - a }\n  = - a\n"
+    else if op == "div" || op == "rem"
+        text = s"  let $name (a b: int) : int\n    requires { b <> 0 }\n    requires { $lo <= $sym a b <= $hi }\n" +
+               s"    ensures  { result = $sym a b }\n  = $sym a b\n"
+    end if
+
+    g.helper_names.push(name)
+    g.helper_texts.push(text)
+    name
+end why_helper
+
+// -- programs --------------------------------------------------------------------------------------
+
+private why_block_as(g: *WhyGen, b: TBlock, in_term: bool) -> Result[string, string]
+    if !in_term then return why_block(g, b)
+
+    if b.stmts.is_empty() && b.result.is_some() then return why_term(g, b.result.unwrap())
+
+    Err("a block with statements inside a term")
+end why_block_as
+
+// A block as a WhyML program. Every declaration opens a `let … in`, so what follows a binding is
+// nested inside it, which is how WhyML scopes one.
+private why_block(g: *WhyGen, b: TBlock) -> Result[string, string]
+    val saved = g.refs.len()
+    val out = why_stmts(g, b.stmts, 0, b.result)?
+
+    g.refs.truncate(saved)
+    Ok(out)
+end why_block
+
+// The statements from `from` on, and then the block's trailing expression. **The trailing expression
+// is written after the statements are walked**, not before: it reads the locals the block declared,
+// and `refs` only knows about one once its declaration has been walked.
+private why_stmts(g: *WhyGen, list: Buf[TStmt], from: usize, tail: Option[TExpr]) -> Result[string, string]
+    if from >= list.len() then return why_tail(g, tail)
+
+    list.at(from) match
+        TVarDecl(n, _, init, _) ->
+            val i = why_code(g, init)?
+
+            g.refs.push(n)
+
+            val rest = why_stmts(g, list, from + 1, tail)?
+
+            Ok(s"let ${why_ident(n)} = ref $i in\n    $rest")
+        TExprStmt(e) ->
+            val head = why_statement(g, e)?
+
+            if from + 1 >= list.len()
+                val t = why_tail(g, tail)?
+
+                return Ok(if t == "()" then head else s"$head;\n    $t")
+            end if
+
+            val rest = why_stmts(g, list, from + 1, tail)?
+
+            Ok(s"$head;\n    $rest")
+        TInvariant(_, _) -> Err("an 'invariant' outside a loop the translator recognized")
+        TVariantCheck(_, _, _) -> Err("a 'variant' outside a loop the translator recognized")
+        other -> Err(why_shape_stmt(other))
+end why_stmts
+
+private why_tail(g: *WhyGen, tail: Option[TExpr]) -> Result[string, string] = tail match
+    Some(e) -> why_code(g, e)
+    None -> Ok("()")
+
+// An expression written for its effect.
+private why_statement(g: *WhyGen, e: TExpr) -> Result[string, string]
+    *e.kind match
+        TStore(place, v, _) ->
+            val n = why_loaded(place)
+
+            if n.is_none() then return Err("an assignment to something other than a local")
+
+            if !why_has(g.refs, n.unwrap()) then
+                return Err(s"an assignment to '${why_ident(n.unwrap())}', which is a parameter — WhyML's " +
+                           "are immutable, so give the value a local of its own")
+
+            val value = why_code(g, v)?
+
+            Ok(s"${why_ident(n.unwrap())} := $value")
+
+        // `a += e` carries its operator with the `=` still on, and means the arithmetic without one --
+        // the range obligation included, a compound assignment overflowing exactly as the long form
+        // does.
+        TUpdate(place, op, v, ty, _, _) ->
+            val n = why_loaded(place)
+
+            if n.is_none() || !why_has(g.refs, n.unwrap()) then return why_code(g, e)
+
+            val b = why_code(g, v)?
+            val math = why_binary_text(g, op[0..<op.len - 1], s"!${why_ident(n.unwrap())}", b, ty, false)?
+
+            Ok(s"${why_ident(n.unwrap())} := $math")
+        TIncDec(place, op, _, ty, _) ->
+            val n = why_loaded(place)
+
+            if n.is_none() || !why_has(g.refs, n.unwrap()) then return why_code(g, e)
+
+            val math = why_binary_text(g, if op == "++" then "+" else "-", s"!${why_ident(n.unwrap())}",
+                                       "1", ty, false)?
+
+            Ok(s"${why_ident(n.unwrap())} := $math")
+        TWhile(cond, body, else_block, _) -> why_while(g, cond, body, else_block)
+        TCheckedLoop(_, _, inner) -> why_statement(g, inner)
+        TIf(cond, then_block, else_block, _) ->
+            val c = why_single_test(cond)
+
+            if c.is_none() then return why_code(g, e)
+
+            // The `else` is written first, as the reference writes it, which decides which refusal a
+            // program with two wins and where a helper first asked for stands.
+            var els = ""
+
+            if else_block.is_some()
+                val no = why_block(g, else_block.unwrap())?
+
+                els = s" else $no"
+            end if
+
+            val test = why_code(g, c.unwrap())?
+            val yes = why_block(g, then_block)?
+
+            Ok(s"(if $test then $yes$els)")
+        _ -> why_code(g, e)
+end why_statement
+
+// `while` with its clauses, which are the leading statements of its body and become WhyML's own
+// `invariant` and `variant`.
+private why_while(g: *WhyGen, cond: Buf[TCondTerm], body: Buf[TStmt],
+                  else_block: Option[TBlock]) -> Result[string, string]
+    if else_block.is_some() then return Err("a loop with an 'else'")
+
+    val c = why_single_test(cond)
+
+    if c.is_none() then return Err("a loop whose condition binds a pattern")
+
+    val test = why_code(g, c.unwrap())?
+    var lines: Buf[string] = buf()
+    var rest: Buf[TStmt] = buf()
+    var leading = true
+
+    for i in 0..<body.len()
+        val s = body.at(i)
+        val clause = if leading then why_loop_clause(s) else None
+
+        if clause.is_some()
+            val (word, c) = clause.unwrap()
+            val shown = why_term(g, c)?
+
+            lines.push(s"      $word { $shown }")
+        else
+            leading = false
+            rest.push(s)
+        end if
+    end for
+
+    val inside = why_stmts(g, rest, 0, None)?
+
+    Ok(s"while $test do\n${why_joined(lines, "\n")}\n      $inside\n    done")
+end why_while
+
+// A loop's leading clause, as the word WhyML writes it under (padded to line the braces up) and the
+// condition or measure it carries.
+private why_loop_clause(s: TStmt) -> Option[(string, TExpr)] = s match
+    TInvariant(c, _) -> Some(("invariant", c))
+    TVariantCheck(_, _, measure) -> Some(("variant  ", measure))
+    _ -> None
+
+// The one plain test a condition is, where it is one.
+private why_single_test(cond: Buf[TCondTerm]) -> Option[TExpr]
+    if cond.len() != 1 then return None
+
+    cond.at(0) match
+        TCondTest(c) -> Some(c)
+        _ -> None
+end why_single_test
+
+// The local a place names, where it is a bare one.
+private why_loaded(place: TExpr) -> Option[string] = *place.kind match
+    TLoad(n, _) -> Some(n)
+    _ -> None
+
+// -- what a refusal calls a node -------------------------------------------------------------------
+
+// What to call an expression a reader would recognize.
+private why_shape_expr(e: TExpr) -> string = *e.kind match
+    TMatch(_, _, _) -> "a 'match'"
+    TFor(_, _, _, _, _, _, _, _) -> "a 'for' loop"
+    TCFor(_, _, _, _, _, _) -> "a 'for' loop"
+    TForEach(_, _, _, _, _, _) -> "a 'for' loop"
+    TIterate(_, _, _, _, _, _, _, _) -> "a 'for' loop"
+    TDoWhile(_, _, _, _) -> "a 'do while' loop"
+    TLoop(_, _) -> "a 'loop'"
+    TStrLit(_) -> "a string"
+    TStr(_) -> "a string"
+    TArrayLit(_, _) -> "an array or a slice"
+    TArrayFill(_, _) -> "an array or a slice"
+    TBufLit(_, _) -> "an array or a slice"
+    TBufFill(_, _, _) -> "an array or a slice"
+    TIndex(_, _, _) -> "an array or a slice"
+    TSlice(_, _, _, _, _) -> "an array or a slice"
+    TStructNew(_, _) -> "a struct"
+    TField(_, _, _) -> "a struct"
+    TEnumNew(_, _, _) -> "an enum"
+    TCast(_, _) -> "a conversion between types"
+    TDeref(_, _) -> "a pointer"
+    TAddrOf(_, _) -> "a pointer"
+    TTempAddr(_, _) -> "a pointer"
+    TNullLit(_) -> "a pointer"
+    TVCall(_, _, _, _, _) -> "a call through a value"
+    TCallPtr(_, _, _, _) -> "a call through a value"
+    TFloatLit(_, _) -> "a floating-point value"
+    _ -> s"the expression '${why_class(texpr_node_name(e))}'"
+
+// The same for a statement.
+private why_shape_stmt(s: TStmt) -> string = s match
+    TReturn(_) -> "an early 'return' — WhyML has no way to leave a body part-way through"
+    TBreak(_, _) -> "a 'break'"
+    TContinue(_) -> "a 'continue'"
+    TAsm(_, _, _, _) -> "an 'asm' block"
+    TDefer(_) -> "a 'defer'"
+    _ -> s"the statement '${why_class(tstmt_node_name(s))}'"
+
+// A node's class name as the reference's refusal quotes it, the `T` taken off.
+private why_class(name: string) -> string = if name.len > 0 then name[1..<name.len] else name
+
+// -- names -----------------------------------------------------------------------------------------
+
+// A sysl symbol as a WhyML identifier. Module separators and dots become underscores, and a leading
+// capital is lowered, because WhyML reserves an initial capital for types and constructors.
+private why_ident(name: string) -> string
+    val bytes = name.bytes
+    var out: Buf[u8] = buf()
+
+    for i in 0..<bytes.len
+        out.push(if why_word_byte(bytes[i]) then bytes[i] else u8('_'))
+
+    if out.is_empty() then return "_x"
+
+    val first = out.at(0)
+
+    if first >= u8('A') && first <= u8('Z') then out.set(0, first + 32)
+    else if first >= u8('0') && first <= u8('9') then out.insert(0, u8('_'))
+
+    from_utf8_unchecked(out.view())
+end why_ident
+
+private why_word_byte(b: u8) -> bool =
+    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) || (b >= u8('0') && b <= u8('9')) ||
+    b == u8('_')
+
+// The first letter in capitals, which is what a WhyML module's name needs.
+private why_capitalized(name: string) -> string
+    val bytes = name.bytes
+
+    if bytes.len == 0 || bytes[0] < u8('a') || bytes[0] > u8('z') then return name
+
+    var out: Buf[u8] = buf()
+
+    out.extend(bytes)
+    out.set(0, bytes[0] - 32)
+    from_utf8_unchecked(out.view())
+end why_capitalized
+
+private why_owns(g: *WhyGen, name: string) -> bool
+    for i in 0..<g.own.len()
+        if g.own.at(i).name == name then return true
+
+    false
+end why_owns
+
+private why_has(xs: Buf[string], x: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == x then return true
+
+    false
+end why_has
+
+private why_joined(parts: Buf[string], sep: string) -> string
+    var out = ""
+
+    for i in 0..<parts.len()
+        out = if i == 0 then parts.at(i) else out + sep + parts.at(i)
+
+    out
+end why_joined

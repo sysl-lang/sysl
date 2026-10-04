@@ -1,0 +1,628 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// `sysl prove` as far as the WhyML it writes: the translation, `--emit-whyml`, `--overflow`, and the
+// refusals, each worded and ordered as the reference's 0.0.162 words and orders them. Every expected
+// module and message here is the reference's own output for the same source. Discharging the module
+// with Why3 is not here: nothing in this file runs a prover.
+
+private prv_library_here() -> bool = std_root().is_ok()
+
+// One source compiled alone, as `test.sysl` in a directory of its own: the directory, and the file.
+private prv_file(src: string, name: string = "test.sysl") -> (string, string)
+    val dir = make_temp_dir("sysl-prove").unwrap()
+
+    write_text(s"$dir/$name", src).unwrap()
+    (dir, s"$dir/$name")
+end prv_file
+
+// The module one source translates to, or the sentence refusing it -- named `Test`, as the
+// reference's own suite names it.
+private prv_translated(src: string, overflow: bool) -> Result[string, string]
+    val (dir, file) = prv_file(src)
+    val c = typed_compilation(file, None).unwrap()
+    val (p, report) = typed_program(c)
+
+    assert(report.is_empty(), "the program compiles")
+
+    val out = whyml_module(p, c.own, "Test", overflow)
+
+    remove_dir_all(dir).unwrap_or(())
+    out
+end prv_translated
+
+private prv_whyml(src: string, overflow: bool = true) -> string
+    val out = prv_translated(src, overflow)
+
+    assert(out.is_ok(), "expected a module, got a refusal")
+    out.unwrap_or("")
+end prv_whyml
+
+private prv_refusal(src: string) -> string
+    prv_translated(src, true) match
+        Ok(text) ->
+            assert(false, s"expected a refusal, got:\n$text")
+            ""
+        Err(why) -> why
+end prv_refusal
+
+// A command line, and everything it said as one text.
+private prv_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end prv_run
+
+private prv_has(said: string, part: string) -> bool = said.index_of(part).is_some()
+
+private prv_count(text: string, part: string) -> usize
+    var n: usize = 0
+    var at: usize = 0
+
+    loop
+        val rest = text[at..<text.len]
+        val found = rest.index_of(part)
+
+        if found.is_none() then break
+
+        n += 1
+        at += found.unwrap() + part.len
+
+    n
+end prv_count
+
+private const PrvHead: string = "  use int.Int\n  use int.ComputerDivision\n  use ref.Ref\n\n"
+
+// -- a ghost declaration is what a specification is written in -----------------------------------
+
+@test("prove: a ghost predicate may be a quantifier")
+prv_a_ghost_predicate_may_be_a_quantifier()
+    if !prv_library_here() then return
+
+    val m = prv_whyml("@ghost\nsmall(n: int) -> bool = for all i in 0..<n do i < n\n\n" +
+                      "f(n: int) -> int\n    require small(n)\n    n\n")
+
+    assert(prv_has(m, "predicate small"), "a bool-valued ghost function is a predicate")
+    assert_eq(m, "module Test\n" + PrvHead +
+                 "  predicate small (n: int)\n" +
+                 "  = (forall i: int. 0 <= i < n -> (i < n))\n" +
+                 "\n" +
+                 "  let  f (n: int) : int\n" +
+                 "    requires { -2147483648 <= n <= 2147483647 }\n" +
+                 "    requires { (small n) }\n" +
+                 "    ensures  { -2147483648 <= result <= 2147483647 }\n" +
+                 "  = n\n" +
+                 "end\n")
+
+@test("prove: an ordinary function called from a contract is refused, and told to mark it")
+prv_an_ordinary_function_called_from_a_contract_is_refused()
+    if !prv_library_here() then return
+
+    val why = prv_refusal("ok(n: int) -> bool = n > 0\n\nf(n: int) -> int\n    require ok(n)\n    n\n")
+
+    assert(prv_has(why, "'@ghost'"), "it says what to mark")
+    assert_eq(why, "the proof backend does not translate a call to 'ok' from a contract — it is a " +
+                   "program rather than mathematics, so it has no meaning as a term. Mark it '@ghost', " +
+                   "which is what says a declaration exists for the specification")
+
+@test("prove: a ghost function whose body is not one expression is refused")
+prv_a_ghost_function_whose_body_is_not_one_expression_is_refused()
+    if !prv_library_here() then return
+
+    val why = prv_refusal("@ghost\nok(n: int) -> bool\n    var k = n\n    k > 0\n\n" +
+                          "f(n: int) -> int\n    require ok(n)\n    n\n")
+
+    assert_eq(why, "the proof backend does not translate 'ok', a '@ghost' function whose body declares " +
+                   "or does something rather than being one expression — a specification is " +
+                   "mathematics, so it may not declare a variable or run a loop")
+
+// -- what the translation refuses, by name ----------------------------------------------------------
+
+@test("prove refuses a string, at the signature")
+prv_a_string()
+    if !prv_library_here() then return
+
+    assert_eq(prv_refusal("f(s: string) -> string = s\n"),
+              "the proof backend does not translate the type string")
+
+@test("prove refuses an array, at the signature")
+prv_an_array()
+    if !prv_library_here() then return
+
+    assert_eq(prv_refusal("f(a: [4]int) -> int = a[0]\n"),
+              "the proof backend does not translate the type [4]int")
+
+@test("prove refuses a struct, at the signature")
+prv_a_struct()
+    if !prv_library_here() then return
+
+    assert_eq(prv_refusal("struct P\n    x: int\n\nf(p: P) -> int = p.x\n"),
+              "the proof backend does not translate the type P")
+
+@test("prove refuses a 'match'")
+prv_a_match()
+    if !prv_library_here() then return
+
+    assert_eq(prv_refusal("f(n: int) -> int\n    n match\n        0 -> 1\n        _ -> 2\n"),
+              "the proof backend does not translate a 'match'")
+
+@test("prove refuses an early return, and says why WhyML has no answer for one")
+prv_an_early_return()
+    if !prv_library_here() then return
+
+    assert_eq(prv_refusal("f(n: int) -> int\n    if n > 0 then return 1\n    0\n"),
+              "the proof backend does not translate an early 'return' — WhyML has no way to leave a " +
+              "body part-way through")
+
+@test("prove refuses a 'for' loop")
+prv_a_for_loop()
+    if !prv_library_here() then return
+
+    assert_eq(prv_refusal("f(n: int) -> int\n    var s = 0\n\n    for i in 0..<n\n        s += i\n\n    s\n"),
+              "the proof backend does not translate a 'for' loop")
+
+@test("prove refuses a call into the library, which this module does not declare")
+prv_a_call_into_the_library()
+    if !prv_library_here() then return
+
+    assert_eq(prv_refusal("f(n: int) -> int\n    print(n)\n    n\n"),
+              "the proof backend does not translate a call to 'sysl.printi', which this module does " +
+              "not declare")
+
+@test("prove refuses a quantifier in code rather than in a contract")
+prv_a_quantifier_in_code()
+    if !prv_library_here() then return
+
+    assert_eq(prv_refusal("f(n: int) -> bool = for all i in 0..<n do i < n\n"),
+              "the proof backend does not translate a quantifier outside a contract — it is a " +
+              "statement about every value in a range, which a prover reads and a program would " +
+              "have to run")
+
+@test("prove: every refusal says it is the translator's gap")
+prv_every_refusal_says_it_is_the_translators_gap()
+    if !prv_library_here() then return
+
+    assert(prv_refusal("f(s: string) -> string = s\n").starts_with("the proof backend does not translate"),
+           "the refusal opens with the translator's own words")
+
+// A program with two things the translator has no answer for is refused for the one the walk reaches
+// first: the first function before the second, a parameter's type before anything else in it.
+@test("prove refuses the first thing it reaches, in declaration order")
+prv_the_first_refusal_wins()
+    if !prv_library_here() then return
+
+    assert_eq(prv_refusal("f(n: int) -> int\n    n match\n        _ -> 1\n\ng(s: string) -> int = 0\n"),
+              "the proof backend does not translate a 'match'")
+    assert_eq(prv_refusal("f(s: string, a: [2]int) -> int = 0\n"),
+              "the proof backend does not translate the type string")
+    assert_eq(prv_refusal("ok(n: int) -> bool = n > 0\n\nf(n: int) -> int\n    require ok(n)\n" +
+                          "    n match\n        _ -> 1\n"),
+              "the proof backend does not translate a call to 'ok' from a contract — it is a " +
+              "program rather than mathematics, so it has no meaning as a term. Mark it '@ghost', " +
+              "which is what says a declaration exists for the specification")
+
+@test("prove refuses an assignment to a parameter, a loop with an 'else', a 'break' and a 'defer'")
+prv_the_statements_it_refuses()
+    if !prv_library_here() then return
+
+    assert_eq(prv_refusal("f(n: int) -> int\n    n = 3\n    n\n"),
+              "the proof backend does not translate an assignment to 'n', which is a parameter — " +
+              "WhyML's are immutable, so give the value a local of its own")
+    assert_eq(prv_refusal("f(n: int) -> int\n    var i = 0\n    while i < n\n        i += 1\n    else\n" +
+                          "        i = 0\n    i\n"),
+              "the proof backend does not translate a loop with an 'else'")
+    assert_eq(prv_refusal("f(n: int) -> int\n    var i = 0\n    while i < n\n        if i > 3 then break\n" +
+                          "        i += 1\n    i\n"),
+              "the proof backend does not translate a 'break'")
+    assert_eq(prv_refusal("f(n: int) -> int\n    var k = n\n    defer k = 0\n    k\n"),
+              "the proof backend does not translate a 'defer'")
+    assert_eq(prv_refusal("f(a: int) -> int = ~a\n"),
+              "the proof backend does not translate the expression 'Unary'")
+    assert_eq(prv_refusal("f(n: int)\n    var k = n\n    k += 1\n"),
+              "the proof backend does not translate the expression 'Update'")
+    assert_eq(prv_refusal("f(a: int, b: int) -> int = a & b\n"),
+              "the proof backend does not translate the operator '&' on an integer")
+
+// -- the emitted module -----------------------------------------------------------------------------
+
+@test("prove declares the checked helper for each width it used, once")
+prv_declares_the_checked_helper_once()
+    if !prv_library_here() then return
+
+    val m = prv_whyml("f(a: int, b: int) -> int\n    require a >= 0\n    require b >= 0\n" +
+                      "    require a <= 100\n    require b <= 100\n    a + b + a + b\n")
+
+    assert_eq(prv_count(m, "let add_i32"), 1)
+    assert_eq(m, "module Test\n" + PrvHead +
+                 "  let add_i32 (a b: int) : int\n" +
+                 "    requires { -2147483648 <= a + b <= 2147483647 }\n" +
+                 "    ensures  { result = a + b }\n" +
+                 "  = a + b\n" +
+                 "\n" +
+                 "  let  f (a: int) (b: int) : int\n" +
+                 "    requires { -2147483648 <= a <= 2147483647 }\n" +
+                 "    requires { -2147483648 <= b <= 2147483647 }\n" +
+                 "    requires { (a >= 0) }\n" +
+                 "    requires { (b >= 0) }\n" +
+                 "    requires { (a <= 100) }\n" +
+                 "    requires { (b <= 100) }\n" +
+                 "    ensures  { -2147483648 <= result <= 2147483647 }\n" +
+                 "  = (add_i32 (add_i32 (add_i32 a b) a) b)\n" +
+                 "end\n")
+
+@test("prove carries each parameter's own range, which its type already said")
+prv_carries_each_parameters_own_range()
+    if !prv_library_here() then return
+
+    val m = prv_whyml("f(x: int) -> int = x\n")
+
+    assert(prv_has(m, "<= x <= "), "the parameter's range is a precondition")
+    assert_eq(m, "module Test\n" + PrvHead +
+                 "  let  f (x: int) : int\n" +
+                 "    requires { -2147483648 <= x <= 2147483647 }\n" +
+                 "    ensures  { -2147483648 <= result <= 2147483647 }\n" +
+                 "  = x\n" +
+                 "end\n")
+
+@test("prove drops the ranges when the obligations are dropped")
+prv_drops_them_when_the_obligations_are_dropped()
+    if !prv_library_here() then return
+
+    val m = prv_whyml("f(x: int) -> int = x\n", false)
+
+    assert(!prv_has(m, "<= x <= "), "no range without the obligations")
+    assert_eq(m, "module Test\n" + PrvHead + "  let  f (x: int) : int\n  = x\nend\n")
+
+// Every width is bounded by its own range and gets helpers of its own, a pointer-wide one included.
+@test("prove bounds every width by its own range, in the order its helpers were asked for")
+prv_every_width_has_its_own_helpers()
+    if !prv_library_here() then return
+
+    val m = prv_whyml("g(a: u8, b: i64, c: usize, d: i16) -> u32\n    val x = a + a\n    val y = b - b\n" +
+                      "    val z = c * c\n    val w = -d\n    val q = b % b\n    0\n")
+
+    assert_eq(m, "module Test\n" + PrvHead +
+                 "  let add_u8 (a b: int) : int\n    requires { 0 <= a + b <= 255 }\n" +
+                 "    ensures  { result = a + b }\n  = a + b\n\n" +
+                 "  let sub_i64 (a b: int) : int\n" +
+                 "    requires { -9223372036854775808 <= a - b <= 9223372036854775807 }\n" +
+                 "    ensures  { result = a - b }\n  = a - b\n\n" +
+                 "  let mul_u64 (a b: int) : int\n    requires { 0 <= a * b <= 18446744073709551615 }\n" +
+                 "    ensures  { result = a * b }\n  = a * b\n\n" +
+                 "  let neg_i16 (a: int) : int\n    requires { -32768 <= - a <= 32767 }\n" +
+                 "    ensures  { result = - a }\n  = - a\n\n" +
+                 "  let rem_i64 (a b: int) : int\n    requires { b <> 0 }\n" +
+                 "    requires { -9223372036854775808 <= mod a b <= 9223372036854775807 }\n" +
+                 "    ensures  { result = mod a b }\n  = mod a b\n\n" +
+                 "  let  g (a: int) (b: int) (c: int) (d: int) : int\n" +
+                 "    requires { 0 <= a <= 255 }\n" +
+                 "    requires { -9223372036854775808 <= b <= 9223372036854775807 }\n" +
+                 "    requires { 0 <= c <= 18446744073709551615 }\n" +
+                 "    requires { -32768 <= d <= 32767 }\n" +
+                 "    ensures  { 0 <= result <= 4294967295 }\n" +
+                 "  = let x = ref (add_u8 a a) in\n" +
+                 "    let y = ref (sub_i64 b b) in\n" +
+                 "    let z = ref (mul_u64 c c) in\n" +
+                 "    let w = ref (neg_i16 d) in\n" +
+                 "    let q = ref (rem_i64 b b) in\n" +
+                 "    0\n" +
+                 "end\n")
+
+// A loop's clauses become WhyML's own, a local is a `ref` read with `!`, and the block's trailing
+// expression is written inside the bindings it reads.
+@test("prove writes a loop with its invariant and variant, and the locals as refs")
+prv_a_loop_with_its_clauses()
+    if !prv_library_here() then return
+
+    val m = prv_whyml("sum_to(n: int) -> int\n    require n >= 0 && n <= 1000\n    ensure result >= 0\n" +
+                      "    var i = 0\n    var s = 0\n\n    while i < n\n" +
+                      "        invariant i >= 0 && i <= n && s >= 0 && s <= i * 1000\n" +
+                      "        variant n - i\n        s += i\n        i += 1\n\n    s\n")
+
+    assert_eq(m, "module Test\n" + PrvHead +
+                 "  let add_i32 (a b: int) : int\n" +
+                 "    requires { -2147483648 <= a + b <= 2147483647 }\n" +
+                 "    ensures  { result = a + b }\n" +
+                 "  = a + b\n\n" +
+                 "  let  sum_to (n: int) : int\n" +
+                 "    requires { -2147483648 <= n <= 2147483647 }\n" +
+                 "    requires { ((n >= 0) /\\ (n <= 1000)) }\n" +
+                 "    ensures  { -2147483648 <= result <= 2147483647 }\n" +
+                 "    ensures  { (result >= 0) }\n" +
+                 "  = let i = ref 0 in\n" +
+                 "    let s = ref 0 in\n" +
+                 "    while (!i < n) do\n" +
+                 "      invariant { ((((!i >= 0) /\\ (!i <= n)) /\\ (!s >= 0)) /\\ (!s <= (!i * 1000))) }\n" +
+                 "      variant   { (n - !i) }\n" +
+                 "      s := (add_i32 !s !i);\n" +
+                 "    i := (add_i32 !i 1)\n" +
+                 "    done;\n" +
+                 "    !s\n" +
+                 "end\n")
+
+@test("prove writes a ghost function as a term, and 'old' as WhyML's own")
+prv_a_ghost_function_and_old()
+    if !prv_library_here() then return
+
+    val m = prv_whyml("@ghost\ntwice(n: int) -> int = n * 2\n\nf(n: int) -> int\n" +
+                      "    require n >= 0 && n <= 10\n    ensure result == twice(old(n))\n" +
+                      "    var k = n\n    k = k * 2\n    k\n")
+
+    assert_eq(m, "module Test\n" + PrvHead +
+                 "  let mul_i32 (a b: int) : int\n" +
+                 "    requires { -2147483648 <= a * b <= 2147483647 }\n" +
+                 "    ensures  { result = a * b }\n" +
+                 "  = a * b\n\n" +
+                 "  let function twice (n: int) : int\n" +
+                 "  = (n * 2)\n\n" +
+                 "  let  f (n: int) : int\n" +
+                 "    requires { -2147483648 <= n <= 2147483647 }\n" +
+                 "    requires { ((n >= 0) /\\ (n <= 10)) }\n" +
+                 "    ensures  { -2147483648 <= result <= 2147483647 }\n" +
+                 "    ensures  { (result = (twice (old n))) }\n" +
+                 "  = let k = ref n in\n" +
+                 "    k := (mul_i32 !k 2);\n" +
+                 "    !k\n" +
+                 "end\n")
+
+// The project's own modules are what is translated, so a module-qualified symbol is renamed into an
+// identifier WhyML takes.
+@test("prove renames a module-qualified symbol to something WhyML will take")
+prv_renames_a_module_qualified_symbol()
+    if !prv_library_here() then return
+
+    val root = make_temp_dir("sysl-prove-demo").unwrap()
+
+    make_dir_all(s"$root/demo").unwrap()
+    write_text(s"$root/package.hocon", "package { name = \"app\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/demo/demo.sysl", "module demo\n\nf(x: int) -> int = x\n").unwrap()
+
+    val (code, said) = prv_run(["sysl", "prove", "--emit-whyml", root])
+
+    assert_eq(code, Fine)
+    assert(prv_has(said, "demo_f"), "the module's separator became an underscore")
+    assert(said.ends_with(PrvHead + "  let  demo_f (x: int) : int\n" +
+                          "    requires { -2147483648 <= x <= 2147483647 }\n" +
+                          "    ensures  { -2147483648 <= result <= 2147483647 }\n" +
+                          "  = x\nend"), said)
+    remove_dir_all(root).unwrap_or(())
+
+// -- the command line -------------------------------------------------------------------------------
+
+// `reference/verification.md § variant on a function`, verbatim, with the statement that runs it:
+// the entry body is not among the functions a proof is about.
+@test("prove --emit-whyml prints the module, named for the file")
+prv_emit_whyml_prints_the_module()
+    if !prv_library_here() then return
+
+    val (dir, file) = prv_file("gcd(a: int, b: int) -> int\n    require b >= 0\n    variant b\n" +
+                               "    if b == 0 then a else gcd(b, a % b)\n\nprint(gcd(48, 18))\n", "gcd.sysl")
+    val (code, said) = prv_run(["sysl", "prove", "--emit-whyml", file])
+
+    assert_eq(code, Fine)
+    assert_eq(said, "module Gcd\n" + PrvHead +
+                    "  let rem_i32 (a b: int) : int\n" +
+                    "    requires { b <> 0 }\n" +
+                    "    requires { -2147483648 <= mod a b <= 2147483647 }\n" +
+                    "    ensures  { result = mod a b }\n" +
+                    "  = mod a b\n\n" +
+                    "  let rec  gcd (a: int) (b: int) : int\n" +
+                    "    requires { -2147483648 <= a <= 2147483647 }\n" +
+                    "    requires { -2147483648 <= b <= 2147483647 }\n" +
+                    "    requires { (b >= 0) }\n" +
+                    "    ensures  { -2147483648 <= result <= 2147483647 }\n" +
+                    "    variant  { b }\n" +
+                    "  = (if (b = 0) then a else (gcd b (rem_i32 a b)))\n" +
+                    "end")
+    remove_dir_all(dir).unwrap_or(())
+
+@test("prove --overflow is 'check' or 'ignore', in either spelling")
+prv_overflow_is_check_or_ignore()
+    if !prv_library_here() then return
+
+    val (dir, file) = prv_file("f(x: int) -> int = x\n")
+    val (bad, refused) = prv_run(["sysl", "prove", "--emit-whyml", "--overflow", "bogus", file])
+
+    assert_eq(bad, Failed)
+    assert_eq(refused, "error: --overflow is 'check' or 'ignore', and 'bogus' is neither")
+
+    val (fine, said) = prv_run(["sysl", "prove", "--emit-whyml", "--overflow=ignore", file])
+
+    assert_eq(fine, Fine)
+    assert_eq(said, "module Test\n" + PrvHead + "  let  f (x: int) : int\n  = x\nend")
+
+    val (apart, spelled) = prv_run(["sysl", "prove", "--overflow", "ignore", "--emit-whyml", file])
+
+    assert_eq(apart, Fine)
+    assert_eq(spelled, said)
+    remove_dir_all(dir).unwrap_or(())
+
+@test("prove reports a refusal as an error and fails")
+prv_a_refusal_fails()
+    if !prv_library_here() then return
+
+    val (dir, file) = prv_file("f(a: []int) -> int = 0\n")
+    val (code, said) = prv_run(["sysl", "prove", "--emit-whyml", file])
+
+    assert_eq(code, Failed)
+    assert_eq(said, "error: the proof backend does not translate the type []int")
+    remove_dir_all(dir).unwrap_or(())
+
+@test("prove with no path prints its usage")
+prv_no_path_is_usage()
+    val (code, said) = prv_run(["sysl", "prove", "--emit-whyml"])
+
+    assert_eq(code, Misused)
+    assert(said.starts_with("usage: sysl prove [--emit-whyml] [--overflow check|ignore] "), said)
+    assert(prv_has(said, "translate a module to WhyML and discharge its proof obligations with Why3 (17)"),
+           said)
+    assert(prv_has(usage(), " | prove [--emit-whyml] [--overflow check|ignore] "), "the command list names it")
+
+@test("prove names the WhyML module for the path it was given")
+prv_the_module_name()
+    assert_eq(whyml_module_name("gcd.sysl"), "gcd")
+    assert_eq(whyml_module_name("/a/b/sum_to.test.sysl"), "sum_to")
+    assert_eq(whyml_module_name("/a/b/proj/"), "proj")
+    assert_eq(whyml_module_name("x-y.sysl"), "xy")
+    assert_eq(whyml_module_name("."), "Program")
+    assert_eq(whyml_module_name(""), "Program")
+    assert_eq(whyml_module_name("-.sysl"), "")
+
+// -- a command that never links still reads the headers ---------------------------------------------
+
+// A project whose only need of a header is a `c const` block, and the directory holding that header.
+private prv_measuring() -> (string, string)
+    val root = make_temp_dir("sysl-prove-noreach").unwrap()
+
+    make_dir_all(s"$root/include").unwrap()
+    make_dir_all(s"$root/proj/m").unwrap()
+    write_text(s"$root/include/probe.h", "#define PROBE_WIDTH 41\nint probe_answer(void);\n").unwrap()
+    write_text(s"$root/proj/main.sysl", "print(m.width())\n").unwrap()
+    write_text(s"$root/proj/m/m.sysl", "module m\n@include(\"probe.h\")\n\nc const\n" +
+                                       "    WIDTH: int = \"PROBE_WIDTH\"\n\nwidth() -> int = WIDTH\n").unwrap()
+    (root, s"$root/include")
+end prv_measuring
+
+@test("prove cannot find the header unaided either")
+prv_prove_cannot_find_it_either()
+    if !prv_library_here() then return
+
+    val (root, _) = prv_measuring()
+    val (code, said) = prv_run(["sysl", "prove", s"$root/proj"])
+
+    assert(code != Fine, "the probe fails")
+    assert(prv_has(said, "probe.h"), said)
+    remove_dir_all(root).unwrap_or(())
+
+// Whatever the command then does, the header is no longer what stopped it -- and the module it
+// translates carries the header's own number.
+@test("prove gets past the header once it is given one")
+prv_and_gets_past_the_header_once_given_one()
+    if !prv_library_here() then return
+
+    val (root, include) = prv_measuring()
+    val (_, said) = prv_run(["sysl", "prove", "--include-path", include, s"$root/proj"])
+
+    assert(!prv_has(said, "probe.h"), said)
+
+    val (code, mlw) = prv_run(["sysl", "prove", "--emit-whyml", "--include-path", include, s"$root/proj"])
+
+    assert_eq(code, Fine)
+    assert(mlw.ends_with(PrvHead + "  let  m_width (_: unit) : int\n" +
+                         "    ensures  { -2147483648 <= result <= 2147483647 }\n  = 41\nend"), mlw)
+    remove_dir_all(root).unwrap_or(())
+
+// -- prove over a project with a dependency ---------------------------------------------------------
+
+// The program's OWN modules are what is translated: a dependency counted as one of them had its
+// bodies translated as though the consumer had written them.
+@test("prove over a project with a dependency does not translate the package as the program's own")
+prv_does_not_translate_the_packages_scaffolding()
+    if !prv_library_here() then return
+
+    val root = make_temp_dir("sysl-prove-app").unwrap()
+    val here = s"$root/vendor/github.com/e/geom/@v1.0.0"
+
+    make_dir_all(s"$here/geom").unwrap()
+    write_text(s"$here/package.hocon", "package { name = \"geom\", version = \"1.0.0\" }\n").unwrap()
+    write_text(s"$here/geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 2\n").unwrap()
+    write_text(s"$here/geom/tests.sysl",
+               "module geom\n@tests\n\n@test(\"doubling\")\ngeom_scaffolding_doubles()\n" +
+               "    assert_eq(double(21), 42)\n").unwrap()
+    write_text(s"$root/package.hocon",
+               "package { name = \"app\", version = \"0.1.0\" }\n" +
+               "dependencies { g { git = \"github.com/e/geom\", version = \"1.0.0\" } }\n").unwrap()
+    write_text(s"$root/main.sysl", "import geom.double\n\nprint(double(21))\n").unwrap()
+
+    val (code, mlw) = prv_run(["sysl", "prove", "--emit-whyml", root])
+
+    assert_eq(code, Fine)
+    assert(!prv_has(mlw, "geom_scaffolding_doubles"), mlw)
+    assert(!prv_has(mlw, "double"), mlw)
+    assert(mlw.ends_with(PrvHead + "end"), mlw)
+    remove_dir_all(root).unwrap_or(())
+
+// -- the reference, on the same sources -------------------------------------------------------------
+
+// What the translator is compared against the reference on: every construct it writes, every
+// refusal it makes, and programs carrying two things it refuses so the order is part of the claim.
+private prv_corpus() -> Buf[string]
+    var xs: Buf[string] = buf()
+
+    xs.push("half(x: int) -> int\n    require x >= 0\n    ensure result >= 0\n    x / 2\n")
+    xs.push("gcd(a: int, b: int) -> int\n    require a >= 0\n    require b >= 0\n    ensure result >= 0\n" +
+            "    variant b\n    if b == 0 then a\n    else gcd(b, a % b)\n")
+    xs.push("count_to(n: int) -> int\n    require n >= 0\n    ensure result == n\n    var i = 0\n\n" +
+            "    while i < n\n        invariant i >= 0\n        invariant i <= n\n        variant n - i\n" +
+            "        i += 1\n\n    i\n")
+    xs.push("double_it(n: int) -> int\n    require n >= 0\n    n * 2\n")
+    xs.push("ratio(a: int, b: int) -> int = a / b\n")
+    xs.push("@ghost\ndivides(d: int, n: int) -> bool = d != 0 && n % d == 0\n\ndouble_it(n: int) -> int\n" +
+            "    require n >= 0\n    require n <= 1000\n    ensure divides(2, result)\n    n * 2\n")
+    xs.push("f(a: int, b: int) -> int = -(a + b)\n")
+    xs.push("f(a: int, b: int, c: int) -> bool\n    ensure result == (a < b)\n    a < b <= c\n")
+    xs.push("f(a: bool, b: bool) -> bool\n    require a || b\n    ensure result == (a && b)\n    a && !b || b\n")
+    xs.push("@ghost\nsome_below(n: int) -> bool = for some i in 0..<n do i * i == n\n\n" +
+            "inc(n: int) -> int\n    require n >= 0 && n < 100 && some_below(n + 1)\n" +
+            "    ensure result == old(n) + 1\n    n + 1\n")
+    xs.push("f(n: int) -> int\n    var k = n\n    if k > 5\n        k = 5\n    k\n")
+    xs.push("f(n: int) -> int\n    var k = n\n    if k < 0 then k = 0 else k += 1\n    k\n")
+    xs.push("seven() -> int = 7\n\nf() -> int = seven() + 1\n")
+    xs.push("@ghost\neven(n: int) -> bool = if n == 0 then true else if n == 1 then false else even(n - 2)\n\n" +
+            "f(n: int) -> int\n    require n >= 0 && even(n)\n    n\n")
+    xs.push("f(n: int) -> int\n    val k = if n > 0 then 1 else 2\n    k\n")
+    xs.push("f() -> int = -5\n")
+    xs.push("f(n: int) -> int\n    var i = n\n    i--\n    i++\n    i\n")
+    xs.push("f(n: int) -> int\n    var i = 0\n    while i < n\n        i++\n    i\n")
+    xs.push("f(n: int) -> int\n    var a = 1\n    if n > 0\n        var b = 2\n        a = b\n    a\n")
+    xs.push("even(n: int) -> bool\n    require n >= 0\n    if n == 0 then true else odd(n - 1)\n\n" +
+            "odd(n: int) -> bool\n    require n >= 0\n    if n == 0 then false else even(n - 1)\n")
+    xs.push("@ghost\nzero() -> int = 0\n\nf(n: int) -> int\n    ensure result >= zero()\n    0\n")
+    xs.push("Foo(n: int) -> int = n\n")
+    xs.push("f(x: real) -> int = 0\n")
+    xs.push("f(n: int) -> long = long(n)\n")
+    xs.push("f(n: int) -> int\n    var i = 0\n    loop\n        i += 1\n        if i > n then break\n    i\n")
+    xs.push("f(n: int) -> int\n    var i = 0\n    do\n        i += 1\n    while i < n\n    i\n")
+    xs.push("f(n: int) -> int\n    print(\"x\")\n    n\n")
+    xs.push("f(a: string, b: string) -> bool = a == b\n")
+    xs.push("f(n: int) -> int\n    n match\n        _ -> 1\n\ng(s: string) -> int = 0\n")
+    xs.push("f(x: int) -> int = x + 1\n\nprint(f(2))\n")
+    xs
+end prv_corpus
+
+@test("prove --emit-whyml prints what the reference prints, refusals included")
+prv_the_reference_prints_the_same()
+    val oracle = env_var("SYSL_ORACLE")
+
+    if oracle.is_none() || !prv_library_here() then return
+
+    val corpus = prv_corpus()
+
+    for i in 0..<corpus.len()
+        val (dir, file) = prv_file(corpus.at(i))
+
+        for overflow in ["check", "ignore"]
+            val theirs = capture(oracle.unwrap(), ["prove", "--emit-whyml", "--overflow", overflow, file],
+                                 "", [], true).unwrap()
+            val (code, said) = prv_run(["sysl", "prove", "--emit-whyml", "--overflow", overflow, file])
+
+            if theirs.status.ok()
+                assert_eq(code, Fine)
+                assert_eq(said + "\n", theirs.text)
+            else
+                assert_eq(code, Failed)
+                assert_eq("sysl: " + said + "\n", theirs.err.unwrap_or(""))
+            end if
+        end for
+
+        remove_dir_all(dir).unwrap_or(())
+    end for
+end prv_the_reference_prints_the_same
