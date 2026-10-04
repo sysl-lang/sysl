@@ -774,8 +774,50 @@ private check_signature_rules(a: &Analysis, scope: Scope, span: Span, name: stri
     if variadic && params.is_empty() then
         a.fault(scope, span, s"'$name' needs at least one named parameter before '...'")
 
+    rest_position_fault(name, params, variadic, foreign) match
+        Some((at, msg)) -> a.fault(scope, at, msg)
+        None -> ()
+
     check_va_list_positions(a, scope, name, params, ret, foreign)
 end check_signature_rules
+
+// Where a `...T` parameter may stand, which is last and only last
+// (`reference/declarations.md § A parameter may collect the rest of the call`).
+//
+// **It collects everything the call has left**, so a parameter after it could never be given
+// anything: the arguments that would have been its are already inside the slice. **It may not stand
+// beside the C ellipsis**, a different feature wearing the same three characters, since a call has
+// one tail. **And an `extern` may not carry one**: the packing hands over a sysl slice, three words
+// with an owner in them, which is not something a C function was compiled to read. Answered as the
+// span and the sentence, so a nested function's reader, which faults through its own context, says
+// the same thing.
+rest_position_fault(name: string, params: Buf[Param], variadic: bool,
+                    foreign: bool) -> Option[(Span, string)]
+    for i in 0..<params.len()
+        val p = params.at(i)
+
+        if p.rest
+            if foreign
+                return Some((p.span, s"'$name' is an 'extern', and '${p.name}: ...T' hands over a " +
+                             "sysl slice — which is three words with an owner in them, and not " +
+                             "what a C function was compiled to read. C's own tail is the bare " +
+                             "'...' with no name and no type"))
+
+            if variadic
+                return Some((p.span, s"'$name' has two tails: '${p.name}: ...T' collects the " +
+                             "rest of the call into a slice, and '...' is C's ellipsis, walked " +
+                             "with 'va_arg'. A call has one tail, so a declaration may write one " +
+                             "of them"))
+
+            if i + 1 < params.len()
+                return Some((p.span, s"'${p.name}' collects the rest of the call, so nothing can " +
+                             s"follow it — the arguments that would be " +
+                             s"'${params.at(params.len() - 1).name}' are already inside it"))
+
+            return None
+
+    None
+end rest_position_fault
 
 // **A member is held to the same rules, its receiver counting as the named parameter a `...` anchors
 // on** -- so `only(self, ...)` is complete and a receiverless `make(...)` is not. `name` is the
@@ -784,6 +826,10 @@ end check_signature_rules
 check_member_signature(a: &Analysis, scope: Scope, span: Span, name: string, m: MethodDecl)
     if m.variadic && m.params.is_empty() && m.recv_mode().is_none() then
         a.fault(scope, span, s"'$name' needs at least one named parameter before '...'")
+
+    rest_position_fault(name, m.params, m.variadic, false) match
+        Some((at, msg)) -> a.fault(scope, at, msg)
+        None -> ()
 
     check_va_list_positions(a, scope, name, m.params, m.ret_type, false)
 end check_member_signature

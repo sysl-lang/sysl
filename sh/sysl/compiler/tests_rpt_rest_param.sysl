@@ -1,0 +1,310 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `xs: ...T` -- the parameter that collects a call's trailing arguments into a `[]const T`
+// (`reference/declarations.md § A parameter may collect the rest of the call`). It is the CHECKED
+// variadic, beside the C-faithful one: what a `...` tail holds is known only to whatever reads it
+// with `va_arg`, and what a `...T` tail holds is in the signature. The heterogeneous form is the same
+// parameter at `T = &Display`.
+//
+// The packing is a rewrite of the argument list and nothing else, and the array it makes is the
+// caller's frame -- which is what the `@no_alloc` cases pin.
+//
+// **Every string quoted here was read out of the reference compiler (0.0.162)**, whose
+// `RestParamTests` these are.
+
+private var rpt_library_cache: Buf[Program] = buf()
+private var rpt_library_read: bool = false
+
+private rpt_library() -> Buf[Program]
+    if rpt_library_read then return rpt_library_cache
+
+    rpt_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> rpt_library_cache = units
+
+    rpt_library_cache
+end rpt_library
+
+private rpt_ready() -> bool
+    if rpt_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end rpt_ready
+
+private rpt_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program prints.
+private rpt_ran(text: string) -> string
+    val root = make_temp_dir("sysl-rpt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end rpt_ran
+
+// Everything a source has to say for itself, taken through the lowering.
+private rpt_err(text: string) -> string
+    val root = make_temp_dir("sysl-rpt").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rpt_err
+
+private rpt_total() -> string = "total(xs: ...int) -> int\n" +
+                                "    var s = 0\n" +
+                                "\n" +
+                                "    for x in xs\n" +
+                                "        s += x\n" +
+                                "\n" +
+                                "    s\n" +
+                                "\n"
+
+// --- the trailing arguments are collected ---------------------------------------------------------
+
+@test("rest param: the trailing arguments are collected into a slice the body walks")
+rpt_into_a_slice_the_body_walks()
+    if !rpt_ready() then return
+
+    assert_eq(rpt_ran(rpt_total() + "print(total(1, 2, 3))\n"), "6\n")
+
+// The empty call is the case the packing has to answer differently and not the case it may refuse:
+// "the rest" with nothing left is the empty slice.
+@test("rest param: a call with none gets the empty slice")
+rpt_a_call_with_none_gets_the_empty_slice()
+    if !rpt_ready() then return
+
+    assert_eq(rpt_ran(rpt_total() + "print(total(), total(1))\n"), "0 1\n")
+
+@test("rest param: the parameters in front of it are ordinary, and may be named")
+rpt_the_parameters_in_front_are_ordinary()
+    if !rpt_ready() then return
+
+    assert_eq(rpt_ran("label(tag: string, xs: ...int) -> string\n" +
+                      "    var out = tag\n" +
+                      "\n" +
+                      "    for x in xs\n" +
+                      "        out = out + \" \" + str(x)\n" +
+                      "\n" +
+                      "    out\n" +
+                      "\n" +
+                      "print(label(\"sum\", 1, 2))\n" +
+                      "print(label(tag = \"none\"))\n"),
+              "sum 1 2\nnone\n")
+
+@test("rest param: a method takes one, with the receiver in front")
+rpt_a_method_takes_one()
+    if !rpt_ready() then return
+
+    assert_eq(rpt_ran("struct Adder\n" +
+                      "    base: int\n" +
+                      "\n" +
+                      "    total(self, xs: ...int) -> int\n" +
+                      "        var s = self.base\n" +
+                      "\n" +
+                      "        for x in xs\n" +
+                      "            s += x\n" +
+                      "\n" +
+                      "        s\n" +
+                      "\n" +
+                      "var a = Adder(10)\n" +
+                      "print(a.total(1, 2, 3), a.total())\n"),
+              "16 10\n")
+
+// A checked `print`-alike takes `...&Display`, and each argument is erased where it stands.
+@test("rest param: the heterogeneous form is the same parameter at a trait object")
+rpt_the_heterogeneous_form()
+    if !rpt_ready() then return
+
+    assert_eq(rpt_ran("show(xs: ...&Display) -> unit\n" +
+                      "    for x in xs\n" +
+                      "        print(x)\n" +
+                      "\n" +
+                      "show(1, \"hi\", true)\n"),
+              "1\nhi\ntrue\n")
+
+// --- `xs...` hands an existing slice through ------------------------------------------------------
+
+// Without it a function forwarding its own tail could not be written at all -- it has a slice and not
+// a list of values, and packing that would make a slice of one slice.
+@test("rest param: a spread lets a function forward its own tail")
+rpt_a_function_forwards_its_own_tail()
+    if !rpt_ready() then return
+
+    assert_eq(rpt_ran(rpt_total() + "forward(xs: ...int) -> int = total(xs...)\n\n" +
+                      "print(forward(4, 5, 6))\n"),
+              "15\n")
+
+@test("rest param: a spread hands over an ordinary slice from anywhere else")
+rpt_a_spread_of_an_ordinary_slice()
+    if !rpt_ready() then return
+
+    assert_eq(rpt_ran(rpt_total() + "var xs = [7, 8]\n\nprint(total(xs[..]...))\n"), "15\n")
+
+// --- the packed array is the caller's frame, not the heap -----------------------------------------
+
+@test("rest param: an allocator-free module may call one")
+rpt_an_allocator_free_module_may_call_one()
+    if !rpt_ready() then return
+
+    assert_eq(rpt_ran("@no_alloc\n\n" + rpt_total() + "print(total(1, 2, 3), total())\n"), "6 0\n")
+
+@test("rest param: the empty slice literal it rests on needs no allocator either")
+rpt_the_empty_slice_literal_needs_no_allocator()
+    if !rpt_ready() then return
+
+    assert_eq(rpt_ran("@no_alloc\n\nval e: []const int = []\nvar w: []int = []\n" +
+                      "print(e.len, w.len)\n"),
+              "0 0\n")
+
+// An array literal is the one receiver with no type of its own, so a view of one is the one place
+// the view's own expectation has to reach through to the elements.
+@test("rest param: a sliced array literal takes its element type from the view asked for")
+rpt_a_sliced_array_literal_takes_the_views_element()
+    if !rpt_ready() then return
+
+    assert_eq(rpt_ran("show(xs: []const &Display) -> unit\n" +
+                      "    for x in xs\n" +
+                      "        print(x)\n" +
+                      "\n" +
+                      "show([1, \"hi\", true][..])\n"),
+              "1\nhi\ntrue\n")
+
+// --- where it may stand ---------------------------------------------------------------------------
+
+@test("rest param: nothing may follow it")
+rpt_nothing_may_follow_it()
+    if !rpt_ready() then return
+
+    assert(rpt_says(rpt_err("f(xs: ...int, last: int) -> int = last\n\nprint(f(1))\n"),
+                    "'xs' collects the rest of the call, so nothing can follow it — the " +
+                        "arguments that would be 'last' are already inside it"),
+           "a parameter after a rest parameter is refused")
+
+// The same rule holds wherever a signature is written: a member and a nested function both.
+@test("rest param: nothing may follow it in a member or a nested function either")
+rpt_nothing_may_follow_it_in_a_member_or_nested()
+    if !rpt_ready() then return
+
+    val said = "'xs' collects the rest of the call, so nothing can follow it — the arguments " +
+               "that would be 'last' are already inside it"
+
+    assert(rpt_says(rpt_err("struct S\n    v: int\n\n" +
+                            "    f(self, xs: ...int, last: int) -> int = last\n\nprint(1)\n"),
+                    said),
+           "a member is held to the rule")
+    assert(rpt_says(rpt_err("outer() -> int\n" +
+                            "    g(xs: ...int, last: int) -> int = last\n\n" +
+                            "    g(1)\n\nprint(outer())\n"),
+                    said),
+           "a nested function is held to the rule")
+
+@test("rest param: it may not stand beside C's ellipsis")
+rpt_not_beside_cs_ellipsis()
+    if !rpt_ready() then return
+
+    assert(rpt_says(rpt_err("f(xs: ...int, ...) -> int = 1\n\nprint(f(1))\n"),
+                    "'f' has two tails: 'xs: ...T' collects the rest of the call into a slice, " +
+                        "and '...' is C's ellipsis, walked with 'va_arg'. A call has one tail, so " +
+                        "a declaration may write one of them"),
+           "a rest parameter beside '...' is refused")
+
+@test("rest param: an extern may not carry one")
+rpt_an_extern_may_not_carry_one()
+    if !rpt_ready() then return
+
+    assert(rpt_says(rpt_err("extern f(xs: ...int) -> int\n\nprint(f(1))\n"),
+                    "'f' is an 'extern', and 'xs: ...T' hands over a sysl slice — which is three " +
+                        "words with an owner in them, and not what a C function was compiled to " +
+                        "read. C's own tail is the bare '...' with no name and no type"),
+           "an extern's rest parameter is refused")
+
+@test("rest param: it declares no default")
+rpt_it_declares_no_default()
+    if !rpt_ready() then return
+
+    assert(rpt_says(rpt_err("f(xs: ...int = [1][..]) -> int = 1\n\nprint(f())\n"),
+                    "a parameter that collects the rest of the call declares no default — a call " +
+                        "that leaves it out gets the empty slice, which is what 'the rest' means " +
+                        "when there is none, and a default beside that is a second answer to a " +
+                        "settled question"),
+           "a rest parameter's default is refused")
+
+// --- what a call may write ------------------------------------------------------------------------
+
+@test("rest param: its arguments are positional")
+rpt_its_arguments_are_positional()
+    if !rpt_ready() then return
+
+    assert(rpt_says(rpt_err(rpt_total() + "print(total(xs = 1))\n"),
+                    "'xs' collects the rest of the call, so its arguments are positional — a " +
+                        "name picks out one parameter and this one takes as many as are left"),
+           "a named argument for a rest parameter is refused")
+
+@test("rest param: a spread is the whole of the tail or none of it")
+rpt_a_spread_is_the_whole_tail()
+    if !rpt_ready() then return
+
+    assert(rpt_says(rpt_err(rpt_total() + "var xs = [1, 2]\n\nprint(total(1, xs[..]...))\n"),
+                    "'...' hands the whole of 'xs' over, so it is the only argument there — a " +
+                        "slice and a value cannot both be part of one tail"),
+           "a value beside a spread is refused")
+
+@test("rest param: a spread at a call that collects nothing is refused, naming the callee")
+rpt_a_spread_where_nothing_collects()
+    if !rpt_ready() then return
+
+    assert(rpt_says(rpt_err("f(a: int) -> int = a\n\nvar xs = [1]\n\nprint(f(xs[..]...))\n"),
+                    "'...' says this argument is already the slice a '...T' parameter collects, " +
+                        "and function 'f' has no such parameter"),
+           "a spread with no rest parameter is refused")
+
+// `...` is read where `name =` is read and nowhere else, so outside an argument list this is a
+// parse error rather than one of the sentences above.
+@test("rest param: outside an argument list the grammar does not read a spread")
+rpt_outside_an_argument_list()
+    if !rpt_ready() then return
+
+    assert(rpt_says(rpt_err("var xs = [1]\nval y = xs[..]...\nprint(1)\n"), "newline expected"),
+           "a spread outside an argument list is a parse error")
