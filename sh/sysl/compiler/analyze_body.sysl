@@ -1113,12 +1113,18 @@ end statements_from
 // The leading `require`/`ensure`/`variant` clauses. Both conditions must be `bool`; `result` and
 // `old(e)` are only in scope inside an `ensure` -- `result` also only where the function returns a
 // value -- and the `old` expressions are collected so that the emitter can snapshot them at entry.
-analyze_contract(cx: &Analyzer, at: Span, body: Buf[Stmt], upto: usize,
-                 ret: Type) -> (Buf[TClause], Buf[TClause], Buf[TExpr], Option[TExpr])
+//
+// **A `variant` is a top-level function's** (`measured`): its measure is checked where a call to the
+// same body is written, which a closure, reached through `Fn`, and a nested function, whose calls
+// carry an environment, never are. There each clause is refused where it stands and read no further,
+// every such clause being told before the body after them is given up.
+analyze_contract(cx: &Analyzer, at: Span, body: Buf[Stmt], upto: usize, ret: Type,
+                 measured: bool = true) -> (Buf[TClause], Buf[TClause], Buf[TExpr], Option[TExpr])
     var requires: Buf[TClause] = buf()
     var ensures: Buf[TClause] = buf()
     var olds: Buf[TExpr] = buf()
     var measure: Option[TExpr] = None
+    var misplaced = false
 
     for i in 0..<upto
         val c = body.at(i)
@@ -1140,12 +1146,24 @@ analyze_contract(cx: &Analyzer, at: Span, body: Buf[Stmt], upto: usize,
             // The measure reads the parameters and nothing else, and **scoping is what enforces
             // it** rather than a rule of this pass: the clause is read before the body, in a scope
             // holding the parameters alone, so a name from the body is undefined here.
-            Variant(e) -> measure = function_measure(cx, c.span, e, measure)
+            Variant(e) ->
+                if measured then measure = function_measure(cx, c.span, e, measure)
+                else
+                    cx.an.fault_in_place(cx.scope, c.span, unmeasured_variant())
+                    misplaced = true
 
             _ -> ()
 
+    // Every misplaced clause has been told, and the body after them is not read for more.
+    if misplaced then cx.an.poison_quietly()
+
     (requires, ensures, olds, measure)
 end analyze_contract
+
+private unmeasured_variant() -> string =
+    "a 'variant' is a top-level function's — the measure is checked where a call to the same body " +
+    "is written, and neither a closure, which is reached through 'Fn', nor a function nested in " +
+    "another, whose calls carry a captured environment, is reached that way"
 
 private function_measure(cx: &Analyzer, span: Span, e: Expr,
                          already: Option[TExpr]) -> Option[TExpr]
