@@ -269,10 +269,10 @@ private resolve_vector(a: &Analysis, scope: Scope, span: Span, lanes: Expr, elem
 
     val n = const_extent(a, scope, span, lanes, subst)
 
-    // A count naming a value parameter folds to zero on the generic body's own walk, the parameter
-    // standing in as a zero there, and is not that mistake. That stand-in cannot be told from an
-    // instantiation made at zero, so such a count is not asked at all.
-    if n == 0 && !names_value_param(lanes, subst)
+    // A count naming a value parameter folds to zero while the generic declaration is read in its
+    // own terms, the parameter standing in as a zero there, and is not that mistake. An
+    // instantiation made at zero is, and is told so here, at the spelling in the declaration.
+    if n == 0 && !names_stand_in(lanes, subst)
         a.fault(scope, span, "a vector of no lanes holds nothing and computes nothing — an array may " +
                 "be empty because it is storage, and a register cannot be")
         return Unknown
@@ -290,13 +290,14 @@ private resolve_vector(a: &Analysis, scope: Scope, span: Span, lanes: Expr, elem
     Vector(int(n), lane)
 end resolve_vector
 
-// Whether a written count reads a name bound to a value parameter's argument.
-private names_value_param(e: Expr, subst: Buf[Binding]) -> bool = *e.kind match
+// Whether a written count or value argument reads a value parameter that is only standing in --
+// the generic declaration being read in its own terms rather than instantiated.
+private names_stand_in(e: Expr, subst: Buf[Binding]) -> bool = *e.kind match
     Ident(n) -> bound_type(subst, n) match
-        Some(ConstArg(_, _)) -> true
+        Some(ConstArg(_, _, stood)) -> stood
         _ -> false
-    Unary(_, operand) -> names_value_param(operand, subst)
-    Binary(_, l, r) -> names_value_param(l, subst) || names_value_param(r, subst)
+    Unary(_, operand) -> names_stand_in(operand, subst)
+    Binary(_, l, r) -> names_stand_in(l, subst) || names_stand_in(r, subst)
     _ -> false
 
 // Whether a written lane type may be one: `can_be_lane`, or a type not settled yet. A qualifier is
@@ -426,7 +427,7 @@ private const_arg_names(subst: Buf[Binding]) -> Buf[string]
 
     for i in 0..<subst.len()
         subst.at(i).ty match
-            ConstArg(_, _) -> out.push(subst.at(i).name)
+            ConstArg(_, _, _) -> out.push(subst.at(i).name)
             _ -> ()
 
     out
@@ -815,11 +816,15 @@ private const_argument(a: &Analysis, scope: Scope, span: Span, e: Expr,
 
     a.restore_complaints(mark)
 
+    // An argument written over a parameter that is only standing in is a stand-in too, so a generic
+    // declaration naming `Lanes[W]` is not read as one that asked for `Lanes[0]`.
+    val stood = names_stand_in(e, subst)
+
     folded match
-        Some(ConstBool(b)) -> ConstArg(from_int(if b then 1 else 0), Bool)
-        Some(ConstChar(c)) -> ConstArg(from_int(long(int(u32(c)))), Char)
-        Some(ConstInt(v)) -> ConstArg(v, int_type())
-        _ -> ConstArg(from_int(long(const_extent(a, scope, span, e, subst))), int_type())
+        Some(ConstBool(b)) -> ConstArg(from_int(if b then 1 else 0), Bool, stood)
+        Some(ConstChar(c)) -> ConstArg(from_int(long(int(u32(c)))), Char, stood)
+        Some(ConstInt(v)) -> ConstArg(v, int_type(), stood)
+        _ -> ConstArg(from_int(long(const_extent(a, scope, span, e, subst))), int_type(), stood)
 end const_argument
 
 private digits_value(digits: string, base: int) -> usize
@@ -987,9 +992,10 @@ private at_declared_widths(a: &Analysis, key: string, targs: Buf[Type]) -> Buf[T
         val written = if i < pair.0.len() then binding_named(pair.1, pair.0.at(i)) else None
 
         targs.at(i) match
-            ConstArg(v, ty) ->
-                if written.is_none() then out.push(ConstArg(v, *ty))
-                else out.push(ConstArg(v, resolve_type(a, home, written.unwrap(), no_bindings())))
+            ConstArg(v, ty, stood) ->
+                if written.is_none() then out.push(ConstArg(v, *ty, stood))
+                else out.push(ConstArg(v, resolve_type(a, home, written.unwrap(), no_bindings()),
+                                       stood))
             other -> out.push(other)
 
     out
@@ -1060,7 +1066,7 @@ trait_args_read(a: &Analysis, scope: Scope, span: Span, key: string, args: Buf[T
 
         if declared.is_none() then out.push(Unknown)
         else out.push(ConstArg(from_int(0), resolve_type(a, a.tables.types.get(key).unwrap().scope,
-                                                         declared.unwrap(), no_bindings())))
+                                                         declared.unwrap(), no_bindings()), true))
 
     out
 end trait_args_read
@@ -1140,14 +1146,14 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
                 end if
             _ -> ()
 
-        return Some(ConstArg(folded.unwrap(), ty))
+        return Some(ConstArg(folded.unwrap(), ty, names_stand_in(e, subst)))
     end if
 
     val tag = variant_tag(e, ty)
 
-    if tag.is_some() then return Some(ConstArg(from_int(long(tag.unwrap())), ty))
+    if tag.is_some() then return Some(ConstArg(from_int(long(tag.unwrap())), ty, false))
 
-    if awaits_instantiation(a, scope, e, subst) then return Some(ConstArg(from_int(0), ty))
+    if awaits_instantiation(a, scope, e, subst) then return Some(ConstArg(from_int(0), ty, true))
 
     // A name that turns out to be a TYPE is the likely mistake in this position, and gets its own
     // sentence: `Buf[int]` reads as a list of types until the declaration says otherwise.
