@@ -135,3 +135,219 @@ otb_a_bounded_parameter_is_accepted()
         """)
 
     assert(said == "", said)
+
+// -- a member's own parameters, a generic `impl`'s members, a trait's members, and bodies ----------
+
+// How many diagnostics a report holds.
+private otb_count(said: string) -> usize = said.split("error:").len() - 1
+
+// The refusals a program earns, each said once, and nothing else.
+private otb_refused_at(text: string, refusals: Buf[(string, string)])
+    val said = otb_err(otb_traits() + text)
+
+    for i in 0..<refusals.len()
+        val (name, at) = refusals.at(i)
+
+        assert(said.contains(s"error: 'Get' requires its type parameter 'T' to implement 'Show', but " +
+                             s"'$name' is not bounded by it\n"), said)
+        assert(said.contains(s"/main.sysl:$at\n"), said)
+
+    assert(otb_count(said) == refusals.len(), said)
+
+private otb_one(name: string, at: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push((name, at))
+    out
+
+private otb_two(n1: string, at1: string, n2: string, at2: string) -> Buf[(string, string)]
+    var out = otb_one(n1, at1)
+
+    out.push((n2, at2))
+    out
+
+@test("a member's own unbounded parameter is refused in its signature")
+otb_a_member_own_parameter_unbounded()
+    if !otb_ready() then return
+
+    otb_refused_at(raw"""
+        struct S
+            v: int
+
+            m[Y](self, x: &Get[Y]) -> unit = ()
+
+        print("hi")
+        """, otb_one("Y", "10:20"))
+
+@test("so is one of a generic type's member, and the type's own parameter there")
+otb_a_generic_type_member_parameters_unbounded()
+    if !otb_ready() then return
+
+    otb_refused_at(raw"""
+        struct Box[Y]
+            v: int
+
+            m[W](self, x: &Get[W]) -> unit = ()
+
+        print("hi")
+        """, otb_one("W", "10:20"))
+
+    otb_refused_at(raw"""
+        struct Box[Y]
+            v: int
+
+            m(self, x: &Get[Y]) -> unit = ()
+
+        print("hi")
+        """, otb_one("Y", "10:17"))
+
+@test("a trait member's own unbounded parameter is refused, though it has no body")
+otb_a_trait_member_own_parameter_unbounded()
+    if !otb_ready() then return
+
+    otb_refused_at(raw"""
+        trait Foo
+            foo[Y](self, x: &Get[Y]) -> unit
+
+        print("hi")
+        """, otb_one("Y", "8:22"))
+
+    otb_refused_at(raw"""
+        trait Foo[Y]
+            foo(self, x: &Get[Y]) -> unit
+
+        print("hi")
+        """, otb_one("Y", "8:19"))
+
+@test("a generic impl's member over the block's unbounded parameter is refused, beside its header")
+otb_a_generic_impl_member_over_an_unbounded_parameter()
+    if !otb_ready() then return
+
+    otb_refused_at(raw"""
+        struct Box[Y]
+            v: int
+
+        trait Foo[Z]
+            foo(self, x: Z) -> unit
+
+        impl[Y] Foo[&Get[Y]] for Box[Y]
+            foo(self, x: &Get[Y]) -> unit = ()
+
+        print("hi")
+        """, otb_two("Y", "13:14", "Y", "14:19"))
+
+    otb_refused_at(raw"""
+        struct Box[Y]
+            v: int
+
+        trait Foo[Z]
+            foo(self, x: Option[Z]) -> unit
+
+        impl[Y] Foo[&Get[Y]] for Box[Y]
+            foo(self, x: Option[&Get[Y]]) -> unit = ()
+
+        print("hi")
+        """, otb_two("Y", "13:14", "Y", "14:26"))
+
+// The reference says one more thing here: a third refusal, naming the trait's 'W' at the block's
+// member (14:22) -- the trait's signature read again under the block's spelling. The member is told
+// once about its own 'V', which is the parameter it wrote.
+@test("an impl member's own parameter is held to its own bounds, not the trait's")
+otb_an_impl_member_parameter_is_held_to_its_own_bounds()
+    if !otb_ready() then return
+
+    otb_refused_at(raw"""
+        struct Box[Y]
+            v: int
+
+        trait Foo
+            foo[W: Show](self, x: &Get[W]) -> unit
+
+        impl[Y] Foo for Box[Y]
+            foo[V](self, x: &Get[V]) -> unit = ()
+
+        print("hi")
+        """, otb_one("V", "14:22"))
+
+    otb_refused_at(raw"""
+        struct Box[Y]
+            v: int
+
+        trait Foo
+            foo[W](self, x: &Get[W]) -> unit
+
+        impl[Y] Foo for Box[Y]
+            foo[V](self, x: &Get[V]) -> unit = ()
+
+        print("hi")
+        """, otb_two("W", "11:22", "V", "14:22"))
+
+@test("a type a generic body writes is held to the trait's bounds too")
+otb_a_type_written_in_a_generic_body()
+    if !otb_ready() then return
+
+    otb_refused_at(raw"""
+        f[Y](x: int) -> unit
+            val g: Option[&Get[Y]] = None
+
+        print("hi")
+        """, otb_one("Y", "8:20"))
+
+    otb_refused_at(raw"""
+        struct S
+            v: int
+
+            m[Y](self) -> unit
+                val g: Option[&Get[Y]] = None
+
+        print("hi")
+        """, otb_one("Y", "11:24"))
+
+    otb_refused_at(raw"""
+        struct Box[Y]
+            v: int
+
+        trait Foo
+            foo[W](self, x: W) -> unit
+
+        impl[Y] Foo for Box[Y]
+            foo[W](self, x: W) -> unit
+                val g: Option[&Get[Y]] = None
+
+        print("hi")
+        """, otb_one("Y", "15:24"))
+
+@test("members, impl blocks and bodies whose parameters carry the bound are accepted")
+otb_bounded_members_and_bodies_are_accepted()
+    if !otb_ready() then return
+
+    val said = otb_err(otb_traits() + raw"""
+        struct S
+            v: int
+
+            m[Y: Show](self, x: &Get[Y]) -> unit
+                val g: Option[&Get[Y]] = None
+
+        f[Y: Show](x: int) -> unit
+            val g: Option[&Get[Y]] = None
+
+        struct Box[Y]
+            v: int
+
+        trait Foo
+            foo[W: Show](self, x: &Get[W]) -> unit
+
+        impl[Y: Show] Foo for Box[Y]
+            foo[V: Show](self, x: &Get[V]) -> unit
+                val g: Option[&Get[Y]] = None
+
+        trait Bar[Z]
+            bar(self, x: Z) -> unit
+
+        impl[Y: Show] Bar[&Get[Y]] for Box[Y]
+            bar(self, x: &Get[Y]) -> unit = ()
+
+        print("hi")
+        """)
+
+    assert(said == "", said)
