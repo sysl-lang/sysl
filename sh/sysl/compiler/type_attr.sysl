@@ -74,6 +74,12 @@ type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: B
                                    usize_type(word_bits(cx))))
     end if
 
+    // **A type parameter answers the same two attributes in every reading of the body**, the one
+    // where it stands for itself and each instantiation alike -- so what it was bound to decides
+    // the value and never which attributes may be asked.
+    if written != "Self" && bound_type(cx.subst, written).is_some() then
+        return bound_parameter_attr(cx, span, written, attr, args, ty)
+
     ty match
         // A parameter standing in for itself, in the one walk that has no argument for it: there is
         // no width to answer with and none is wanted, since every instantiation supplies one.
@@ -128,6 +134,25 @@ private attr_subject(cx: &Analyzer, span: Span, written: string) -> Option[Type]
 
     scalar_type_named(cx, span, written)
 end attr_subject
+
+// `T::Attr` where `T` is a type parameter of the body being read, whatever this reading bound it to.
+// No bound is required of `T`, following `sizeof(T)`, so an argument with no extremes is refused at
+// the instantiation that supplied it, naming both the parameter and what it was given.
+private bound_parameter_attr(cx: &Analyzer, span: Span, written: string, attr: string,
+                             args: Buf[Expr], stood: Type) -> TExpr
+    if attr != "Min" && attr != "Max" then return parameter_attr(cx, span, written, attr, args, stood)
+
+    stood match
+        Abstract(_, _) -> parameter_attr(cx, span, written, attr, args, stood)
+        Integer(bits, signed, pw) -> integer_attr(cx, span, written, bits, signed, pw, attr, args)
+        Constrained(d) -> constrained_attr(cx, span, d, stood, attr, args)
+        _ ->
+            val extreme = if attr == "Min" then "minimum" else "maximum"
+
+            cx.err(span, s"'$written::$attr' needs an integer type, and '$written' is " +
+                   s"${type_show(stood)} here — a $extreme is a property of a range of numbers, so " +
+                   "a type argument without one has none to answer with")
+end bound_parameter_attr
 
 // What a **type parameter** answers, which is the two extremes and nothing else: every other
 // attribute is asked on a written type name, where the type it belongs to is known while the body is
