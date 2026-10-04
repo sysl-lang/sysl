@@ -398,6 +398,91 @@ cfn_refuses_a_vector()
                           "print(f())\n"),
                 cfn_f("it uses a vector — vectors are not evaluated while compiling yet"), "2:21")
 
+@test("nor perform an atomic operation")
+cfn_refuses_an_atomic()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("import sysl.sync.*\n\nconst f(p: *i64) -> i64 = atomic_load(p, SeqCst)\n\n" +
+                          "var n: i64 = 1\nprint(f(&n))\n"),
+                cfn_f("it performs an atomic operation — atomics are not evaluated while compiling yet"),
+                "3:27")
+
+@test("nor order memory with a fence")
+cfn_refuses_a_fence()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("import sysl.sync.*\n\nconst f() -> int\n    atomic_fence(SeqCst)\n    1\n\n" +
+                          "print(f())\n"),
+                cfn_f("it orders memory with a fence — fences are not evaluated while compiling yet"),
+                "4:5")
+
+// A variadic signature is refused at the declaration, and walking the arguments in the body at the
+// form that walks them.
+@test("nor take C variadic arguments, nor walk them")
+cfn_refuses_varargs()
+    if !enm_ready() then return
+
+    val said = cfn_built("const f(first: int, ...) -> int\n    var ap: va_list\n    va_start(ap)\n" +
+                         "    va_end(ap)\n    first\n\nprint(f(1, 2))\n")
+
+    cfn_refused(said, cfn_f("it takes C variadic arguments — C variadic arguments are not evaluated " +
+                            "while compiling yet"), "1:1")
+    cfn_refused(said, cfn_f("it walks C variadic arguments — C variadic arguments are not evaluated " +
+                            "while compiling yet"), "3:5")
+end cfn_refuses_varargs
+
+@test("nor take a function's address")
+cfn_refuses_a_function_address()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("inc(x: int) -> int = x + 1\n\nconst f(x: int) -> int\n    val g = &inc\n" +
+                          "    g(x)\n\nprint(f(1))\n"),
+                cfn_f("it takes a function's address — which function a call through it reaches is " +
+                      "decided when the program runs"), "4:13")
+
+@test("nor call through a function pointer")
+cfn_refuses_a_call_through_a_pointer()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("inc(x: int) -> int = x + 1\n\nconst f(x: int) -> int\n    val g = &inc\n" +
+                          "    g(x)\n\nprint(f(1))\n"),
+                cfn_f("it calls through a value — which function that is is decided when the " +
+                      "program runs"), "5:5")
+
+// `?` widening the error calls the `From` conversion, which is a call like any other.
+@test("nor use '?' where it converts through a 'From' that is not 'const'")
+cfn_refuses_a_try_through_from()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("struct Small\n    code: int\n\nstruct Big\n    code: int\n\n" +
+                          "impl From[Small] for Big\n    from(s: Small) -> Big = Big(s.code)\n\n" +
+                          "const lift(r: Result[int, Small]) -> Result[int, Big]\n    val v = r?\n" +
+                          "    Ok(v + 1)\n\nprint(lift(Ok(1)).is_ok())\n"),
+                "'lift' is 'const', so it runs while compiling, and it calls 'Big.from', which is " +
+                "not — mark 'Big.from' 'const' too, or compute this at run time", "11:13")
+
+// An operator a type supplied is a call to its implementation.
+@test("nor compare through an implementation that is not 'const'")
+cfn_refuses_a_dispatched_comparison()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("struct P\n    x: int\n\n" +
+                          "impl Eq for P\n    eq(self, rhs: P) -> bool = self.x == rhs.x\n\n" +
+                          "const f(a: P, b: P) -> bool = a == b\n\nprint(f(P(1), P(1)))\n"),
+                cfn_f("it calls 'P.eq', which is not — mark 'P.eq' 'const' too, or compute this at " +
+                      "run time"), "7:31")
+
+@test("nor assign through an operator whose implementation is not 'const'")
+cfn_refuses_a_dispatched_compound_assignment()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("struct V\n    x: int\n\n" +
+                          "impl Add for V\n    add(self, rhs: V) -> V = V(self.x + rhs.x)\n\n" +
+                          "const f(a: V, b: V) -> int\n    var c = a\n    c += b\n    c.x\n\n" +
+                          "print(f(V(1), V(2)))\n"),
+                cfn_f("it calls 'V.add', which is not — mark 'V.add' 'const' too, or compute this at " +
+                      "run time"), "9:5")
+
 @test("a generic one is refused at its definition for what does not go through a type parameter")
 cfn_refuses_at_a_generic_definition()
     if !enm_ready() then return
