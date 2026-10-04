@@ -1972,6 +1972,17 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
 
     if type_eq(base, Unknown) then return Unknown
 
+    // A range, a predicate or a `new` makes a type that is checked or told apart by value, and only a
+    // scalar has a value of that kind. A measured `c type` is a typedef whose width C chose, not a
+    // narrowing, so it is not asked.
+    val at = declared_at(a, key, span)
+
+    if (d.derived || d.range.is_some() || d.pred.is_some()) && !d.from_c && !scalar_base(base)
+        a.fault(home, at, "a constrained subtype's base must be an integer, a float, or 'char', not " +
+                type_show(base))
+        return Unknown
+    end if
+
     var made = base
 
     // **WHAT THE DECLARATION NARROWED IS PART OF THE TYPE.** `type Age = int within 0..150` is not
@@ -1985,9 +1996,11 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
     if d.range.is_some()
         val r = d.range.unwrap()
 
-        lo = range_end(a, home, r.lo)
-        hi = range_end(a, home, r.hi)
-        exclusive = r.exclusive_hi
+        if bounds_hold(a, home, at, d.name, base, r)
+            lo = range_end(a, home, r.lo)
+            hi = range_end(a, home, r.hi)
+            exclusive = r.exclusive_hi
+        end if
     end if
 
     // A `where` predicate narrows the type without saying where to, which is why the ends are not
@@ -2039,6 +2052,100 @@ private range_end(a: &Analysis, scope: Scope, e: Expr) -> Option[Decimal]
         Some(ConstChar(c)) -> Some(decimal_of(from_int(long(u32(c))), 0))
         _ -> None
 end range_end
+
+// Where a declared type was written, the whole declaration being what a refusal of it points at.
+private declared_at(a: &Analysis, key: string, fallback: Span) -> Span = a.tables.types.get(key) match
+    Some(decl) -> decl.span
+    None -> fallback
+
+// The bases a subtype may narrow or derive from.
+private scalar_base(t: Type) -> bool = underlying(t) match
+    Integer(_, _, _) -> true
+    Floating(_, _) -> true
+    Char -> true
+    _ -> false
+
+// **A `within` is checked where it is declared, one complaint to a declaration**: each end is a
+// constant, of the kind the base counts in, and inside the base's range, the lower end first; then
+// the two are in order. A bound is a constant expression rather than a literal
+// (`reference/errors.md § Ranges`), so what is refused is a bound that does not fold -- and a name
+// that does not is named, being the commonest way to write one.
+private bounds_hold(a: &Analysis, scope: Scope, at: Span, name: string, base: Type,
+                    r: RangeBound) -> bool
+    if !bound_holds(a, scope, at, base, r.lo) then return false
+    if !bound_holds(a, scope, at, base, r.hi) then return false
+
+    val lo = range_end(a, scope, r.lo)
+    val hi = range_end(a, scope, r.hi)
+
+    if lo.is_none() || hi.is_none() then return true
+
+    val l = lo.unwrap()
+    val h = hi.unwrap()
+
+    if l > h || (r.exclusive_hi && l >= h)
+        a.fault(scope, at, s"the lower bound of '$name' is above its upper bound")
+        return false
+    end if
+
+    true
+end bounds_hold
+
+private bound_holds(a: &Analysis, scope: Scope, at: Span, base: Type, e: Expr) -> bool
+    val cx = analyzer_for(a, scope)
+    val mark = a.complaints()
+    val folded = const_fold(cx, e)
+
+    a.restore_complaints(mark)
+
+    if folded.is_none()
+        val what = *e.kind match
+            Ident(n) -> s"'$n'"
+            _ -> "that"
+
+        a.fault(scope, at, s"a 'within' bound has to be a constant, and $what is not one — a " +
+                "literal, a 'const', or an expression over them")
+        return false
+    end if
+
+    val value = folded.unwrap()
+    val b = underlying(base)
+
+    // A float is "a floating-point literal" here whether or not it was written as one, since the
+    // kind is what is wrong rather than the spelling.
+    val kind = value match
+        ConstFloat(_) -> "a floating-point literal"
+        _ -> const_kind(value)
+
+    val wanted = b match
+        Integer(_, _, _) -> value match
+            ConstInt(_) -> None
+            _ -> Some("an integer subtype needs integer bounds")
+        Floating(_, _) -> value match
+            ConstInt(_) -> None
+            ConstFloat(_) -> None
+            _ -> Some("a floating-point subtype needs numeric bounds")
+        _ -> value match
+            ConstChar(_) -> None
+            _ -> Some("a 'char' subtype needs character bounds")
+
+    if wanted.is_some()
+        a.fault(scope, at, s"${wanted.unwrap()}, not $kind")
+        return false
+    end if
+
+    value match
+        ConstInt(n) -> b match
+            Integer(bits, signed, _) ->
+                if !fits(n, bits, signed)
+                    a.fault(scope, at, s"the bound ${to_string(n)} does not fit ${type_show(b)}")
+                    return false
+                end if
+            _ -> ()
+        _ -> ()
+
+    true
+end bound_holds
 
 // **Every constant declared at a constrained type holds a value its range admits**, settled while
 // compiling -- a constant has no run time to be checked at. It is what makes a range on a constant

@@ -192,6 +192,12 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
             if on_type.is_some() then return on_type.unwrap()
 
+            // `Age.try(x)` -- a constrained type's name offers nothing through '.', called or not, so
+            // the call is refused in the words the read is rather than reported as an undefined name.
+            val on_subtype = constrained_type_call(cx, span, receiver, member, expected)
+
+            if on_subtype.is_some() then return on_subtype.unwrap()
+
             // `Status.Exited(0)` -- a variant named through its own enum, which is how one that
             // carries something is written where the bare name would be ambiguous.
             // `E[int].A(x)` -- the same through a generic enum at the arguments the reader wrote,
@@ -1210,6 +1216,11 @@ private into_subtype(cx: &Analyzer, span: Span, target: Type, written: string,
     target match
         Constrained(d) ->
             val t = type_expr(cx, args.at(0), Some(d.base))
+
+            // A derived type's name WRAPS a value already at its base; only a transparent subtype's
+            // name converts, being its base's name with a check after it.
+            if disagree(texpr_type(t), d.base) && d.derived then
+                return cx.err(span, refusal(Some(written), texpr_type(t), target))
 
             if disagree(texpr_type(t), d.base) then
                 val converted = convert_to(cx, span, t, d.base, Some(written))

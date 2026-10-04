@@ -347,6 +347,30 @@ private trait_type_member(cx: &Analyzer, span: Span, key: string, d: TraitDecl,
            s"a type that implements '${qualified_name(key)}', or on a '&${module_show(key)}'")
 end trait_type_member
 
+// A member CALLED off a constrained type's name, which is refused exactly as the same member read is.
+// An alias is left alone, being whatever its base is.
+constrained_type_call(cx: &Analyzer, span: Span, receiver: Expr, name: string,
+                      expected: Option[Type]) -> Option[TExpr]
+    val written = dotted_name_written(cx, receiver)
+
+    if written.is_none() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+
+    if key.is_none() then return None
+
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        TypeOf(d) ->
+            if is_plain_alias(d) then return None
+
+            Some(constrained_member(cx, span, key.unwrap(), d, receiver, written.unwrap(), name, expected))
+        _ -> None
+end constrained_type_call
+
 // A constrained subtype's name with a member selected from it. What one offers under its own name is
 // spelled with `::`, so a range that has one is told about the attributes rather than only that the
 // member is missing.
@@ -370,8 +394,11 @@ constrained_member(cx: &Analyzer, span: Span, key: string, d: TypeDecl, receiver
 
     var ranged = false
 
-    if stood.is_some()
-        stood.unwrap() match
+    // What the declaration made is filed with the subtypes rather than with the structs and enums.
+    val made = cx.an.tables.constrained_insts.get(instance_key(key, buf()))
+
+    if made.is_some()
+        made.unwrap() match
             Constrained(c) ->
                 underlying(c.base) match
                     Integer(_, _, _) -> ranged = c.lo.is_some()
