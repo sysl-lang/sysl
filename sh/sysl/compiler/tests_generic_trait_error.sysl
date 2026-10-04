@@ -1,0 +1,608 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What a generic trait refuses, and why. Three groups of rule: the arguments must be there and be
+// right wherever the trait is named; the promise an implementation makes is the one a bound has to
+// ask for; and a trait is implemented once per **argument list**, so what tells two implementations
+// apart is the thing that distinguishes them and nothing else does.
+//
+// **Every message and every output quoted here was read out of the reference compiler** (0.0.159)
+// on the same program, whose `GenericTraitErrorTests` these are. Each is a whole program compiled
+// against the standard module, so every test here wants `SYSL_LIB`.
+
+private gtx_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end gtx_ready
+
+private gtx_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program that must be refused is told, every diagnostic in one report.
+private gtx_err(text: string) -> string
+    val root = make_temp_dir("sysl-generic-trait-error").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gtx_err
+
+// The LLVM text of a program that must compile.
+private gtx_ir(text: string) -> string
+    val root = make_temp_dir("sysl-generic-trait-error").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gtx_ir
+
+// **What a program PRINTS**, which only building and running it says.
+private gtx_ran(text: string) -> string
+    if !clang_available() then return "skipped: there is no clang on this machine"
+
+    val root = make_temp_dir("sysl-generic-trait-error").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end gtx_ran
+
+private gtx_refused(text: string, part: string)
+    val said = gtx_err(text)
+
+    assert(gtx_says(said, part), said)
+
+private gtx_prints(text: string, want: string)
+    val out = gtx_ran(text)
+
+    if out.starts_with("skipped:") then return
+
+    assert(out == want, out)
+
+// -- a trait applied to the wrong arguments is refused where it is written ------------------------
+
+@test("an 'impl' that leaves them out")
+gtx_an_impl_that_leaves_them_out()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Into[T]
+            into(self) -> T
+        struct P
+            v: int
+        impl Into for P
+            into(self) -> int = self.v
+        """, "trait 'Into' takes 1 type argument, but 0 type arguments were given")
+
+@test("an 'impl' that supplies too many")
+gtx_an_impl_that_supplies_too_many()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Get[T]
+            get(self) -> T
+        struct P
+            v: int
+        impl Get[int, real] for P
+            get(self) -> int = 1
+        """, "trait 'Get' takes 1 type argument, but 2 type arguments were given")
+
+@test("a bound that leaves them out")
+gtx_a_bound_that_leaves_them_out()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Get[T]
+            get(self) -> T
+        f[X: Get](x: X) -> int = 1
+        """, "trait 'Get' takes 1 type argument, but 0 type arguments were given")
+
+@test("arguments on a trait that declares none")
+gtx_arguments_on_a_trait_that_declares_none()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Show
+            show(self) -> int
+        f[X: Show[int]](x: X) -> int = 1
+        """, "trait 'Show' does not take type arguments")
+
+@test("an argument that names no type")
+gtx_an_argument_that_names_no_type()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Get[T]
+            get(self) -> T
+        f[X: Get[Nope]](x: X) -> int = 1
+        """, "unknown type 'Nope'")
+
+@test("the trait itself, standing where a type was asked for")
+gtx_the_trait_itself_standing_where_a_type_was_asked_for()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Get[T]
+            get(self) -> T
+        f(x: Get[int]) -> int = 1
+        """, "'Get' is a trait, so it describes behaviour rather than a layout — write '*Get' or " +
+        "'&Get' for a trait object, or bound a type parameter with '[T: Get]'")
+
+// -- the promise an implementation makes is the one a bound must ask for --------------------------
+
+@test("a bound at other arguments is not met")
+gtx_a_bound_at_other_arguments_is_not_met()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Get[T]
+            get(self) -> T
+        struct P
+            v: int
+        impl Get[int] for P
+            get(self) -> int = self.v
+        f[X: Get[real]](x: X) -> int = 1
+        print(f(P(1)))
+        """, "'f' requires its type parameter 'X' to implement 'Get[real]', but P does not — " +
+        "it implements 'Get[int]'")
+
+@test("a trait object at other arguments has no table to point at")
+gtx_a_trait_object_at_other_arguments_has_no_table()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Sink[T]
+            put(self, x: T) -> int
+        struct A
+            tag: int
+        impl Sink[int] for A
+            put(self, x: int) -> int = x
+        var u: &Sink[real] = A(0)
+        """, "a &Sink[real] needs a type that implements 'Sink[real]', and A does not — " +
+        "it implements 'Sink[int]'")
+
+@test("a raw object at other arguments is told the same, before anything about an address")
+gtx_a_raw_object_at_other_arguments_is_told_the_same()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Sink[T]
+            put(self, x: T) -> int
+        struct A
+            tag: int
+        impl Sink[int] for A
+            put(self, x: int) -> int = x
+        var u: *Sink[real] = A(0)
+        """, "a *Sink[real] needs a type that implements 'Sink[real]', and A does not — " +
+        "it implements 'Sink[int]'")
+
+@test("an object over a type whose covering 'impl' asks what it lacks says so")
+gtx_an_object_over_a_conditionally_covered_type_says_so()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Show
+            show(self) -> int
+        trait Sink
+            put(self, x: int) -> int
+        struct Box[U]
+            v: U
+        impl[U: Show] Sink for Box[U]
+            put(self, x: int) -> int = x
+        var u: &Sink = Box(1)
+        """, "a &Sink needs a type that implements 'Sink', and Box[int] does not — the 'impl' that " +
+        "covers it asks 'Show' of int, which does not implement it")
+
+@test("an object over a type with no implementation at all is the position's own mismatch")
+gtx_an_object_over_a_type_with_no_implementation()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Sink[T]
+            put(self, x: T) -> int
+        struct A
+            tag: int
+        var u: &Sink[real] = A(0)
+        """, "cannot initialize 'u': declared &Sink[real] but the value is A")
+
+@test("a type with no implementation at all is told so plainly")
+gtx_a_type_with_no_implementation_at_all()
+    if !gtx_ready() then return
+
+    val said = gtx_err(raw"""
+        trait Get[T]
+            get(self) -> T
+        struct P
+            v: int
+        f[X: Get[int]](x: X) -> int = 1
+        print(f(P(1)))
+        """)
+
+    assert(gtx_says(said, "'f' requires its type parameter 'X' to implement 'Get[int]', but P does not"),
+           said)
+    assert(!gtx_says(said, "it implements"), said)
+
+@test("a conditional implementation's own bound still reports")
+gtx_a_conditional_implementations_own_bound_still_reports()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Show
+            show(self) -> int
+        trait Get[T]
+            get(self) -> T
+        struct Box[U]
+            v: U
+        impl[U: Show] Get[int] for Box[U]
+            get(self) -> int = self.v.show()
+        f[X: Get[int]](x: X) -> int = 1
+        print(f(Box(1)))
+        """, "'f' requires its type parameter 'X' to implement 'Get[int]', but Box[int] does not — " +
+        "the 'impl' that covers it asks 'Show' of int, which does not implement it")
+
+// -- one trait is implemented once per argument list -----------------------------------------------
+
+@test("a second implementation at other arguments is what the arguments are for")
+gtx_a_second_implementation_at_other_arguments()
+    if !gtx_ready() then return
+
+    gtx_prints(raw"""
+        trait From[T]
+            from(x: T) -> Self
+        struct C
+            v: int
+        impl From[int] for C
+            from(x: int) -> Self = C(x)
+        impl From[real] for C
+            from(x: real) -> Self = C(int(x) * 10)
+        print(C.from(3).v)
+        print(C.from(2.5).v)
+        """, "3\n20\n")
+
+@test("a second implementation at the same arguments is the duplicate it always was")
+gtx_a_second_implementation_at_the_same_arguments()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Get[T]
+            get(self) -> T
+        struct C
+            v: int
+        impl Get[int] for C
+            get(self) -> int = 1
+        impl Get[int] for C
+            get(self) -> int = 2
+        """, "'C' already implements 'Get[int]' — a trait's members become the type's, so a second " +
+        "'get' at these arguments would have a call no way to say which was meant")
+
+@test("and one that let the arguments default is the same duplicate said differently")
+gtx_one_that_let_the_arguments_default_is_the_same_duplicate()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Get[T = Self]
+            get(self) -> T
+        struct C
+            v: int
+        impl Get for C
+            get(self) -> C = self
+        impl Get[C] for C
+            get(self) -> C = self
+        """, "'C' already implements 'Get' — arguments left out are the ones 'Get' declares them to " +
+        "default to, so the two blocks implement the same trait at the same arguments")
+
+// -- an 'impl' fixes the trait's arguments and its own parameters separately -----------------------
+
+// A block's parameter is an argument the *subject* settles, so the promise is one per instantiation
+// exactly as a defaulted list on a generic subject is (`reference/traits.md § One implementation per
+// argument list`). This is what carries the element type of a container.
+@test("the trait's argument may be one of the block's own parameters")
+gtx_the_traits_argument_may_be_one_of_the_blocks_own_parameters()
+    if !gtx_ready() then return
+
+    gtx_prints(raw"""
+        trait Get[T]
+            get(self) -> T
+        struct Box[U]
+            v: U
+        impl[U] Get[U] for Box[U]
+            get(self) -> U = self.v
+        print(Box(3).get())
+        print(Box("hi").get())
+        """, "3\nhi\n")
+
+@test("and may be built out of one")
+gtx_and_may_be_built_out_of_one()
+    if !gtx_ready() then return
+
+    gtx_prints(raw"""
+        trait Get[T]
+            get(self) -> T
+        struct Box[U]
+            v: U
+        impl[U] Get[Box[U]] for Box[U]
+            get(self) -> Box[U] = self
+        print(Box(3).get().v)
+        """, "3\n")
+
+// Resolving that argument instantiates `Box[U]`, and a `U` is not something a layout can be emitted
+// for. The instantiation names the family the block covers, so it is dropped before codegen rather
+// than reaching a backend that would have to invent a representation for a type parameter.
+@test("and the instantiation it names is not emitted, even where nothing uses the block")
+gtx_the_instantiation_it_names_is_not_emitted()
+    if !gtx_ready() then return
+
+    val out = gtx_ir(raw"""
+        trait Get[T]
+            get(self) -> T
+        struct Box[U]
+            v: U
+        impl[U] Get[Box[U]] for Box[U]
+            get(self) -> Box[U] = self
+        """)
+
+    assert(!gtx_says(out, "did not compile"), out)
+    assert(!gtx_says(out, "%struct.Box"), out)
+
+@test("the block may not spell one of its own the way the trait spells one of its")
+gtx_the_block_may_not_spell_one_of_its_own_the_way_the_trait_does()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Get[T]
+            get(self) -> T
+        struct Box[T]
+            v: T
+        impl[T] Get[int] for Box[T]
+            get(self) -> int = 1
+        """, "trait 'Get' already declares a type parameter 'T', so this 'impl' cannot declare one of " +
+        "that name")
+
+// -- a trait's own parameters carry bounds, and everything applying it supplies them ---------------
+
+@test("an 'impl' whose argument does not meet them")
+gtx_an_impl_whose_argument_does_not_meet_them()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Show
+            show(self) -> int
+        trait Get[T: Show]
+            get(self) -> T
+        struct P
+            v: int
+        impl Get[int] for P
+            get(self) -> int = self.v
+        """, "'Get' requires its type parameter 'T' to implement 'Show', but int does not")
+
+@test("a bound whose argument does not meet them")
+gtx_a_bound_whose_argument_does_not_meet_them()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Show
+            show(self) -> int
+        trait Get[T: Show]
+            get(self) -> T
+        f[X: Get[int]](x: X) -> int = 1
+        """, "'Get' requires its type parameter 'T' to implement 'Show', but int does not")
+
+@test("an object type whose argument does not meet them")
+gtx_an_object_type_whose_argument_does_not_meet_them()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Show
+            show(self) -> int
+        trait Get[T: Show]
+            get(self) -> T
+        f(x: &Get[int]) -> int = 1
+        """, "'Get' requires its type parameter 'T' to implement 'Show', but int does not")
+
+@test("a type parameter as the argument has to carry the bound itself, at a bound")
+gtx_a_type_parameter_argument_carries_the_bound_at_a_bound()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Show
+            show(self) -> int
+        trait Get[T: Show]
+            get(self) -> T
+        f[X: Get[Y], Y](x: X) -> int = 1
+        """, "'Get' requires its type parameter 'T' to implement 'Show', but 'Y' is not bounded by it")
+
+@test("and at an 'impl' block's own parameter")
+gtx_a_type_parameter_argument_carries_the_bound_at_an_impl()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Show
+            show(self) -> int
+        trait Get[T: Show]
+            get(self) -> T
+        struct Box[U]
+            v: U
+        impl[U] Get[U] for Box[U]
+            get(self) -> U = self.v
+        """, "'Get' requires its type parameter 'T' to implement 'Show', but 'U' is not bounded by it")
+
+// The bounds met everywhere at once: inside the trait (its own `T` carries them), at a bound whose
+// parameter is bounded, at a conditional `impl`, and at a concrete argument.
+@test("arguments that meet a trait's own bounds compile and run")
+gtx_arguments_that_meet_a_traits_own_bounds_run()
+    if !gtx_ready() then return
+
+    gtx_prints(raw"""
+        trait Show
+            show(self) -> int
+        trait Get[T: Show]
+            get(self) -> T
+            both(self, o: &Get[T]) -> int = self.get().show() + o.get().show()
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> int = self.v
+        struct Q
+            p: P
+        impl Get[P] for Q
+            get(self) -> P = self.p
+        f[X: Get[Y], Y: Show](x: X, y: Y) -> int = x.get().show() + y.show()
+        struct Box[U]
+            v: U
+        impl[U: Show] Get[U] for Box[U]
+            get(self) -> U = self.v
+        print(f(Q(P(4)), P(1)))
+        print(Q(P(2)).both(Q(P(3))))
+        print(Box(P(6)).get().show())
+        """, "5\n5\n6\n")
+
+// -- a member reached through a generic bound is checked against the trait's signature -------------
+
+@test("at the arguments the bound supplied")
+gtx_at_the_arguments_the_bound_supplied()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Sink[T]
+            put(self, x: T) -> int
+        f[X: Sink[int]](x: X) -> int = x.put("no")
+        """, "'x' of 'Sink.put' is int, but string was given")
+
+@test("the result is the trait's argument, not whatever the body wants")
+gtx_the_result_is_the_traits_argument()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Get[T]
+            get(self) -> T
+        struct P
+            v: int
+        impl Get[string] for P
+            get(self) -> string = "s"
+        f[X: Get[string]](x: X) -> int = x.get()
+        print(f(P(1)))
+        """, "function 'f' should return int, but its body yields string")
+
+@test("a parameter the bound leaves abstract needs its own bound to be rendered")
+gtx_a_parameter_the_bound_leaves_abstract_needs_its_own_bound()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Into[T]
+            into(self) -> T
+        show[X: Into[Y], Y](x: X)
+            print(x.into())
+        """, "'print' needs 'Y: sysl.Display'")
+
+// -- the rules a trait already had are unchanged by its taking parameters --------------------------
+
+@test("a default body may assume only what the trait promises")
+gtx_a_default_body_may_assume_only_what_the_trait_promises()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Tag[T]
+            tag(self) -> T
+            bad(self) -> T = self.nope()
+        """, "no trait declares a method 'nope', so no bound on 'Self' could license this call")
+
+@test("'Self' away from the receiver still refuses an object")
+gtx_self_away_from_the_receiver_still_refuses_an_object()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Swap[T]
+            swap(self, other: Self) -> T
+        struct A
+            tag: int
+        impl Swap[int] for A
+            swap(self, other: A) -> int = 1
+        var u: &Swap[int] = A(0)
+        """, "'swap' of 'Swap' mentions 'Self' away from its receiver, and an erased value has " +
+        "forgotten which type that is — so there is no '&Swap[int]' to form")
+
+// A generic member is the one unslottable shape that does **not** cost the trait its object: it is
+// left out of the table and the object still forms. It sits beside the `Self` case above because the
+// two are the same question answered two different ways.
+@test("a generic method does not cost the trait its object — it costs itself a slot")
+gtx_a_generic_method_does_not_cost_the_trait_its_object()
+    if !gtx_ready() then return
+
+    gtx_prints(raw"""
+        trait Get[T]
+            tag(self) -> T
+            pick[U](self, u: U) -> T
+        struct A
+            n: int
+        impl Get[int] for A
+            tag(self) -> int = self.n
+            pick[U](self, u: U) -> int = self.n
+        val u: &Get[int] = A(7)
+        print(u.tag())
+        """, "7\n")
+
+@test("an implementation still supplies every member the trait declares")
+gtx_an_implementation_still_supplies_every_member()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Pairing[A, B]
+            left(self) -> A
+            right(self) -> B
+        struct P
+            n: int
+        impl Pairing[int, string] for P
+            left(self) -> int = self.n
+        """, "'P' does not implement 'Pairing': method 'right' is missing")
+
+@test("a member written at the wrong type is compared against the arguments the block fixed")
+gtx_a_member_written_at_the_wrong_type()
+    if !gtx_ready() then return
+
+    gtx_refused(raw"""
+        trait Sink[T]
+            put(self, x: T) -> int
+        struct A
+            tag: int
+        impl Sink[int] for A
+            put(self, x: string) -> int = 1
+        """, "parameter 'x' of method 'put' is string, but trait 'Sink' declares int")

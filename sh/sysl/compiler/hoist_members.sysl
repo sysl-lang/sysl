@@ -849,8 +849,47 @@ abstract_subst(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: Buf[Nam
 
     // A second pass, so that a bound naming a sibling reads that sibling with its own bounds on. The
     // parameter's own stay off inside its own bound, which is what breaks the walk back around.
-    bounded_pass(a, scope, tparams, bounds, tvalues, tpacks, outer, once)
+    val settled = bounded_pass(a, scope, tparams, bounds, tvalues, tpacks, outer, once)
+
+    check_own_trait_args(a, scope, tparams, bounds, settled)
+    settled
 end abstract_subst
+
+// What a declaration's bounds hand a trait's own bounded parameters, where what they hand is one of
+// the declaration's own parameters: `[X: Get[Y], Y]` over `trait Get[T: Show]` asks `Show` of `Y`,
+// which only `Y`'s own bounds can answer. Asked here, once every parameter carries its bounds --
+// `resolve_bound` asks only of the arguments that name no parameter, its stand-ins being scaffolding.
+private check_own_trait_args(a: &Analysis, scope: Scope, tparams: Buf[string],
+                             bounds: Buf[NamedBounds], settled: Buf[Binding])
+    for i in 0..<bounds.len()
+        val refs = bounds.at(i).bounds
+
+        for j in 0..<refs.len()
+            val r = refs.at(j)
+            val key = lookup_trait_key(a, scope, r.name)
+            val d = if key.is_some() then trait_decl_at(a, key.unwrap()) else None
+
+            if d.is_some() && !d.unwrap().bounds.is_empty() && r.args.len() == d.unwrap().tparams.len()
+                var args: Buf[Type] = buf()
+                var any = false
+
+                for k in 0..<r.args.len()
+                    val own = own_param_named(r.args.at(k), tparams)
+
+                    if own.is_some() && bound_type(settled, own.unwrap()).is_some()
+                        args.push(bound_type(settled, own.unwrap()).unwrap())
+                        any = true
+                    else args.push(Unknown)
+
+                if any then check_trait_arg_bounds_all(a, scope, r.span, key.unwrap(), d.unwrap(), args)
+            end if
+end check_own_trait_args
+
+// The declaration's own parameter a written argument names bare, where it names one.
+private own_param_named(t: TypeRef, tparams: Buf[string]) -> Option[string] = *t.kind match
+    NamedType(written, targs) ->
+        if targs.is_empty() && holds_string(tparams, written) then Some(written) else None
+    _ -> None
 
 private bounded_pass(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: Buf[NamedBounds],
                      tvalues: Buf[TypeBinding], tpacks: Buf[string], outer: Buf[Binding],
