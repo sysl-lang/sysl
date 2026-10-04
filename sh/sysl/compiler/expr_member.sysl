@@ -376,6 +376,32 @@ constrained_type_call(cx: &Analyzer, span: Span, receiver: Expr, name: string,
         _ -> None
 end constrained_type_call
 
+// A member CALLED off a trait's name -- `T.f(x)`, `geom.T.f(x)` -- which is refused exactly as the
+// same member read is: a trait is not a value, so what is wrong is the member, and the complaint says
+// where it is reached from. A name a type parameter or `Self` stands for is the parameter, not the
+// trait, and is left to the associated call.
+trait_name_call(cx: &Analyzer, span: Span, receiver: Expr, name: string) -> Option[TExpr]
+    val written = dotted_name_written(cx, receiver)
+
+    if written.is_none() then return None
+
+    val w = written.unwrap()
+
+    if w == "Self" || bound_type(cx.subst, w).is_some() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, w)
+
+    if key.is_none() then return None
+
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        TraitOf(d) -> Some(trait_type_member(cx, span, key.unwrap(), d, name))
+        _ -> None
+end trait_name_call
+
 // A constrained subtype's name with a member selected from it. What one offers under its own name is
 // spelled with `::`, so a range that has one is told about the attributes rather than only that the
 // member is missing.
