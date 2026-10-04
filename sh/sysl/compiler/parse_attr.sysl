@@ -682,7 +682,24 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     // so the two cannot be about the same declaration whichever kind it turns out to be.
     if packed && section
         p.fault(p.here(), "'@packed' lays out a struct's fields and '@section(\"...\")' places one object, so they cannot stand above one declaration — a type occupies no address of its own, and the storage that holds a packed value is what a section would be about")
+        return
+    end if
+
+    // A layout annotation and a function annotation describe different kinds of thing, so one
+    // declaration cannot carry both -- and saying which pair collided is more use than the refusal
+    // whichever kind the declaration turns out to be would give. `@section` is in neither camp, and
+    // a set of nothing but layout and `@export("...")` is a struct's C name beside its layout.
+    if has_layout(attrs) && !all_layout_or_export(attrs) && marks_a_function(attrs)
+        p.fault(p.here(), "'@packed' and '@align' describe a layout and the rest mark a function, so they cannot stand above one declaration — a struct has no body to be tail-recursive or pure in, and a function has no fields to lay out")
 end refuse_impossible_pairs
+
+// Whether any annotation in the set is neither about a layout nor `@section`'s placing of an object.
+private marks_a_function(attrs: Buf[Attr]) -> bool
+    for i in 0..<attrs.len()
+        if !is_layout(attrs.at(i)) && attr_word(attrs.at(i)) != "section" then return true
+
+    false
+end marks_a_function
 
 private joined(so_far: string, word: string) -> string
     if so_far == "" then return s"'@${word}'"
