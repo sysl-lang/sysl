@@ -742,6 +742,17 @@ private const_value_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
     // `(1 << 23) - 1` is a way of saying 8388607 that a reader can check, and every use of the name
     // is the number. Where the initializer is something no fold answers -- a struct, an array, a
     // call -- the expression itself is what a use gets, exactly as it was.
+    //
+    // A float constant whose value calls a `const` function is run over the tree typed at the
+    // constant's own width, so a `f32` is rounded at every step as it would be at run time.
+    underlying(ty) match
+        Floating(_, _) ->
+            val ran = const_float_value(inner, d.init.unwrap(), ty)
+
+            if ran.is_some() then
+                return TExpr(span, TFloatLit(float_pattern(ran.unwrap()), underlying(ty)))
+        _ -> ()
+
     val settled = const_fold(inner, d.init.unwrap())
 
     if settled.is_some()
@@ -760,6 +771,7 @@ private const_literal(span: Span, v: Const, ty: Type) -> Option[TExpr] = v match
     ConstInt(n) -> Some(TExpr(span, TIntLit(n, ty)))
     ConstBool(b) -> Some(TExpr(span, TBoolLit(b)))
     ConstStr(s) -> Some(TExpr(span, TStrLit(s)))
+    ConstChar(c) -> Some(TExpr(span, TIntLit(from_int(long(u32(c))), ty)))
     _ -> None
 
 // Whether a name that stands for module storage is one a program may write to.

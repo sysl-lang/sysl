@@ -77,6 +77,9 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
 
     val units = read_decls(a, written, has_entry_point)
 
+    // Every declaration is read, so a body can be typed: a `const` call may run from here on.
+    a.evaluation.ready = true
+
     var funcs: Buf[TFunc] = buf()
     var generic: usize = 0
     var defaults: usize = 0
@@ -1603,8 +1606,12 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
                 // An initializer that is constant data but not yet written as literals is written as
                 // them, so the object file carries it and nothing runs to fill it in.
+                //
+                // **A call to a `const` function is run here**, and its value laid down on every
+                // target: what would have trapped at startup is refused now (`const_eval.sysl`).
                 if init.is_some() && !laid_down(init.unwrap())
-                    val image = static_image(init.unwrap())
+                    val run = const_val_image(cx, d.name, init.unwrap())
+                    val image = if run.is_some() then run else static_image(init.unwrap())
 
                     if image.is_some() then init = image
 
