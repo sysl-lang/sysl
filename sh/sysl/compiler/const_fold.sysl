@@ -433,13 +433,28 @@ private converted(cx: &Analyzer, span: Span, v: Const, target: Type) -> Option[C
             Some(ConstChar(char(u32(n.to_long().unwrap_or(0)))))
         _ -> None
     ConstFloat(f) -> target match
-        Integer(bits, signed, _) -> Some(ConstInt(wrap(big_of_real(f).unwrap_or(big_zero()), bits, signed)))
+        Integer(bits, signed, _) -> Some(ConstInt(saturated(f, bits, signed)))
         Floating(_, _) -> Some(ConstFloat(f))
         _ -> None
     ConstChar(c) -> target match
         Integer(bits, signed, _) -> Some(ConstInt(wrap(from_int(long(u32(c))), bits, signed)))
         _ -> None
     _ -> None
+
+// A float read as an integer while compiling, by the rule the running program follows: truncated
+// toward zero, clamped to the ends of the width, and zero for a NaN. A constant is the same
+// expression evaluated earlier, so it may not come to a different number than the conversion would
+// at run time.
+private saturated(f: real, bits: int, signed: bool) -> BigInt
+    if f.is_nan() then return big_zero()
+
+    big_of_real(f) match
+        Some(n) ->
+            if cmp(n, min_of(bits, signed)) < 0 then min_of(bits, signed)
+            else if cmp(n, max_of(bits, signed)) > 0 then max_of(bits, signed)
+            else n
+        None -> if f > 0.0 then max_of(bits, signed) else min_of(bits, signed)
+end saturated
 
 // -- `@assert` -----------------------------------------------------------------------------------
 
