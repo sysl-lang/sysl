@@ -1,0 +1,184 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.repeat
+
+// The reference's `FormatSpecRunTests`: what a `FormatSpec` does once it reaches a renderer
+// (`library/core.md § A specifier is the whole value's field`). An `f"…"` hole hands its width,
+// precision and justification to the `Display` it calls, and the library's own renderers act on
+// them, so a width means the same thing whether the value is an integer the compiler renders or a
+// struct that renders itself.
+//
+// Every case drives the specifier through a wrapper that forwards it, because that is the only way
+// one reaches a built-in's renderer: `%s` on a bare integer is still a mistake, and a hole whose
+// value renders itself is the path a specifier travels.
+//
+// **Every output here was read out of the reference compiler (0.0.162)** by handing the installed
+// `sysl` the same program. The harness is `tests_xvr_extern_var.sysl`'s `xvr_ran`, which builds,
+// links and runs a program and answers with what it printed.
+
+// A wrapper whose whole rendering is one field's, so forwarding the specifier down is correct rather
+// than merely convenient — the field's text *is* the value's text.
+private fsx_wrap(ty: string, value: string) -> string =
+    "struct W\n    n: " + ty + "\nimpl Display for W\n" +
+    "    display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)\n" +
+    "var w = W(" + value + ")\n"
+
+// What `body`, after a wrapper of `ty` around `value`, prints.
+private fsx_prints(ty: string, value: string, body: string, expected: string)
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("main.sysl", fsx_wrap(ty, value) + body)]), expected)
+
+// What a whole program prints.
+private fsx_program(text: string, expected: string)
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("main.sysl", text)]), expected)
+
+// -- a width ---------------------------------------------------------------------------------------
+
+@test("right-justifies by default")
+fsx_width_right_justifies_by_default()
+    fsx_prints("int", "7", "print(f\"[${w}%6s]\")\n", "[     7]\n")
+
+@test("left-justifies when the specifier says so")
+fsx_width_left_justifies_when_asked()
+    fsx_prints("int", "7", "print(f\"[${w}%-6s]\")\n", "[7     ]\n")
+
+// A width is a *minimum*: printf never truncates to it, and neither does this.
+@test("narrower than the text changes nothing")
+fsx_width_narrower_than_the_text_changes_nothing()
+    fsx_prints("int", "1234567", "print(f\"[${w}%3s]\")\n", "[1234567]\n")
+
+@test("equal to the text pads by nothing")
+fsx_width_equal_to_the_text_pads_by_nothing()
+    fsx_prints("int", "123", "print(f\"[${w}%3s]\")\n", "[123]\n")
+
+// Wider than the fill buffer, so the padding loop has run several times and the last chunk is a
+// partial one — 40 spaces is two full passes and a remainder.
+@test("far wider than the buffer the padding is written from")
+fsx_width_far_wider_than_the_fill_buffer()
+    fsx_prints("int", "7", "print(f\"[${w}%41s]\")\n", "[" + repeat(" ", 40) + "7]\n")
+
+// The sign belongs to the number, so it is inside the field rather than beside it.
+@test("counts a negative number's sign")
+fsx_width_counts_a_negative_numbers_sign()
+    fsx_prints("int", "-42", "print(f\"[${w}%6s]\")\n", "[   -42]\n")
+
+@test("counts bytes, not characters")
+fsx_width_counts_bytes_not_characters()
+    fsx_prints("string", "\"é\"", "print(f\"[${w}%4s]\")\n", "[  é]\n")
+
+// -- a precision -----------------------------------------------------------------------------------
+
+// On a number it is a minimum digit count, as printf's is: the zeros go after the sign, and the width
+// is then measured over the whole thing.
+@test("fills a number out to a minimum digit count")
+fsx_precision_fills_a_number_out()
+    fsx_prints("int", "42", "print(f\"[${w}%.5s]\")\n", "[00042]\n")
+
+@test("puts its zeros after a minus sign, inside the field")
+fsx_precision_puts_its_zeros_after_a_minus_sign()
+    fsx_prints("int", "-42", "print(f\"[${w}%8.5s]\")\n", "[  -00042]\n")
+
+@test("shorter than the number changes nothing")
+fsx_precision_shorter_than_the_number_changes_nothing()
+    fsx_prints("int", "12345", "print(f\"[${w}%.2s]\")\n", "[12345]\n")
+
+@test("truncates text")
+fsx_precision_truncates_text()
+    fsx_prints("string", "\"hello\"", "print(f\"[${w}%.3s]\")\n", "[hel]\n")
+
+@test("longer than the text leaves it whole")
+fsx_precision_longer_than_the_text_leaves_it_whole()
+    fsx_prints("string", "\"hi\"", "print(f\"[${w}%.9s]\")\n", "[hi]\n")
+
+// Truncation counts bytes, as C's does — but it backs off to a character boundary rather than
+// writing half of one, since a sink that is handed invalid UTF-8 has no way to recover.
+@test("never splits a character")
+fsx_precision_never_splits_a_character()
+    fsx_prints("string", "\"héllo\"", "print(f\"[${w}%.3s]\")\nprint(f\"[${w}%.2s]\")\n", "[hé]\n[h]\n")
+
+@test("combines with a width, which measures the truncated text")
+fsx_precision_combines_with_a_width()
+    fsx_prints("string", "\"hello\"", "print(f\"[${w}%6.3s]\")\n", "[   hel]\n")
+
+// -- a real ----------------------------------------------------------------------------------------
+
+@test("renders as it always did when no precision is written")
+fsx_real_renders_as_it_always_did()
+    fsx_prints("real", "2.5", "print(f\"[${w}%8s]\")\n", "[     2.5]\n")
+
+@test("reads a precision as significant digits, the conversion it renders through")
+fsx_real_reads_a_precision_as_significant_digits()
+    fsx_prints("real", "1.0 / 3.0", "print(f\"[${w}%.3s]\")\n", "[0.333]\n")
+
+// A precision is written by the programmer and the scratch buffer is fixed, so an absurd one is
+// clamped rather than allowed to overrun it. Forty significant digits is well past the seventeen a
+// double carries: the tail is the binary value's own decimal expansion, which is why clamping there
+// loses nothing a program could have meant.
+@test("clamps a precision no double carries information at")
+fsx_real_clamps_an_absurd_precision()
+    fsx_prints("real", "1.0 / 3.0", "print(f\"[${w}%.200s]\")\n",
+               "[0.3333333333333333148296162562473909929395]\n")
+
+// -- other renderings ------------------------------------------------------------------------------
+
+@test("an unsigned number pads like a signed one")
+fsx_an_unsigned_number_pads_like_a_signed_one()
+    fsx_prints("u32", "7u32", "print(f\"[${w}%.3s]\")\n", "[007]\n")
+
+@test("a bool pads and truncates as the text it is")
+fsx_a_bool_pads_and_truncates_as_text()
+    fsx_prints("bool", "true", "print(f\"[${w}%6s]\")\nprint(f\"[${w}%.2s]\")\n", "[  true]\n[tr]\n")
+
+@test("a char pads")
+fsx_a_char_pads()
+    fsx_prints("char", "'x'", "print(f\"[${w}%3s]\")\n", "[  x]\n")
+
+// -- the padding is written, not conjured ----------------------------------------------------------
+
+// The spaces go out through the sink like every other byte, so a writer of the program's own sees
+// them. If padding were applied around the call instead, this counter would read 1.
+@test("reaches a writer the program wrote itself")
+fsx_padding_reaches_a_writer_the_program_wrote()
+    fsx_program(raw"""
+        struct Counter
+            n: usize
+        impl Fallible for Counter
+
+        impl Writer for Counter
+            write(*self, bytes: []const u8)
+                self.n += bytes.len
+        var c: Counter
+        var w: *Writer = &c
+        display_int(7, w, FormatSpec(5, -1, false))
+        print(c.n)
+        """, "5\n")
+
+// What a composite implementation reaches for: render the parts into a string, then let one call put
+// that text in the field the specifier asked for.
+@test("is available to an implementation with text of its own")
+fsx_padding_is_available_to_an_implementation()
+    fsx_program(raw"""
+        struct Point
+            x: int
+            y: int
+        impl Display for Point
+            display(self, out: *Writer, fmt: FormatSpec)
+                display_pad((str(self.x) + "," + str(self.y)).bytes, out, fmt)
+        print(f"[${Point(1, 2)}%7s]")
+        print(f"[${Point(1, 2)}%-7s]")
+        """, "[    1,2]\n[1,2    ]\n")
+
+// -- the neutral specifier changes nothing ---------------------------------------------------------
+
+// `print` and `str` write no specifier, so the neutral one has to leave every renderer doing exactly
+// what it did before the padding existed.
+@test("no width and no precision render each built-in plainly")
+fsx_neutral_specifier_renders_plainly()
+    fsx_program(raw"""
+        print(-2147483648, 0, 7u8, 2.5, true, 'é', "s")
+        print(str(-42) + "|" + str(2.5) + "|" + str(false))
+        """, "-2147483648 0 7 2.5 true é s\n-42|2.5|false\n")
