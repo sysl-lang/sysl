@@ -1,0 +1,507 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Storage sized while running (`reference/arrays.md § Storage sized while running`), ported from the
+// reference's `HeapBufferTests` case for case. An array form written where a `[]T` is expected makes
+// storage of its own and yields a view of all of it, so a count may be computed while running there,
+// and everything about indexing, slicing, `.len` and release is what a slice already did.
+//
+// **Every output, every refusal and every line of LLVM quoted here was read out of the reference
+// compiler (0.0.157)** by handing the installed `sysl` the same program.
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private hbx_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return false
+        Ok(_) -> ()
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end hbx_ready
+
+// **What a program PRINTS and what it EXITS with**, from a fresh build. A program that did not build
+// answers `-1` and the refusal; one stopped by a signal answers `-2`.
+private hbx_ran(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-heap-buffer").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> out.status match
+            Exited(code) -> (out.text, code)
+            _ -> (out.text, -2)
+end hbx_ran
+
+private hbx_prints(text: string, expected: string)
+    if !hbx_ready() then return
+
+    val ran = hbx_ran(text)
+
+    assert_eq(ran.0, expected)
+    assert_eq(ran.1, 0)
+
+// The reference's program stops on a trap (exit 133, SIGTRAP) before printing anything. What is
+// asserted is that it built, that it did not finish normally, and that it printed nothing.
+private hbx_traps(text: string)
+    if !hbx_ready() then return
+
+    val ran = hbx_ran(text)
+
+    assert(ran.1 != -1, ran.0)
+    assert(ran.1 != 0, ran.0)
+    assert_eq(ran.0, "")
+
+// Everything a source has to say for itself, taken the whole way through the lowering; the LLVM text
+// where it had nothing to say.
+private hbx_lowered(text: string) -> (string, string)
+    val root = make_temp_dir("sysl-heap-buffer").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> (failure_text(why), "")
+        Ok(made) -> if made.report.is_empty() then ("", made.text) else (analysis_report(made.report), "")
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end hbx_lowered
+
+// A refusal is its message and its position; the `-->` line carries the temporary directory, so the
+// position is read from the end of it. The caret's WIDTH is not asserted: this compiler underlines a
+// node's extent where the reference underlines its anchor.
+private hbx_refused(text: string, message: string, at: string)
+    if !hbx_ready() then return
+
+    val said = hbx_lowered(text).0
+
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"main.sysl:$at\n"), said)
+
+private hbx_llvm(text: string) -> string
+    val out = hbx_lowered(text)
+
+    assert_eq(out.0, "")
+    out.1
+
+private hbx_func(llvm: string, symbol: string) -> string
+    val texts = func_texts(llvm)
+
+    for i in 0..<texts.len()
+        if texts.at(i).0 == symbol then return texts.at(i).1
+
+    s"no definition of '$symbol'"
+end hbx_func
+
+// -- what is expected decides which thing an array form is -----------------------------------------
+
+@test("a repeat under a '[]T' takes a count computed while running")
+hbx_repeat_takes_a_computed_count()
+    hbx_prints("f(n: usize) -> []int = [7; n]\n" +
+               "var xs = f(3usize)\n" +
+               "print(xs.len, xs[0], xs[2])\n",
+               "3 7 7\n")
+
+@test("and under a '[N]T' the count is still part of the type")
+hbx_under_an_array_the_count_is_the_type()
+    hbx_prints("var a: [3]int = [7; 3]\n" +
+               "print(a.len, a[2])\n",
+               "3 7\n")
+
+@test("a constant count under a '[]T' allocates all the same")
+hbx_constant_count_allocates()
+    hbx_prints("var xs: []int = [7; 3]\n" +
+               "print(xs.len, xs[1])\n",
+               "3 7\n")
+
+@test("an element list under a '[]T' does too")
+hbx_element_list_allocates()
+    hbx_prints("var xs: []int = [1, 2, 3]\n" +
+               "print(xs.len, xs[0], xs[2])\n",
+               "3 1 3\n")
+
+@test("and an empty one, whose element type its context still fixes")
+hbx_empty_list_takes_its_context()
+    hbx_prints("var xs: []int = []\n" +
+               "print(xs.len)\n",
+               "0\n")
+
+@test("a buffer is an ordinary '[]T' everywhere afterwards")
+hbx_a_buffer_is_an_ordinary_slice()
+    hbx_prints("total(xs: []int) -> int\n" +
+               "    var s = 0\n" +
+               "    for x in xs do s += x\n" +
+               "    s\n" +
+               "var xs: []int = [1, 2, 3, 4]\n" +
+               "var half = xs[1..<3]\n" +
+               "print(total(xs), total(half), half.len)\n",
+               "10 5 2\n")
+
+// -- the storage leaves the frame, which is what it is for -----------------------------------------
+
+@test("a function sizes a buffer from something it read and returns it")
+hbx_sized_from_what_it_read()
+    hbx_prints("decode(src: []u8) -> []int\n" +
+               "    var n = usize(src[0])\n" +
+               "    var out: []int = [0; n]\n" +
+               "    for i in 0..<n do out[i] = int(src[i + 1usize]) * 2\n" +
+               "    out\n" +
+               "end decode\n" +
+               "var src: []u8 = [3, 10, 20, 30]\n" +
+               "var got = decode(src)\n" +
+               "print(got.len, got[0], got[2])\n",
+               "3 20 60\n")
+
+@test("and a buffer of buffers, each sized while running")
+hbx_a_buffer_of_buffers()
+    hbx_prints("grid(w: usize, h: usize) -> [][]int\n" +
+               "    var g: [][]int = [[0; w]; h]\n" +
+               "    for y in 0..<h\n" +
+               "        for x in 0..<w do g[y][x] = int(y) * 10 + int(x)\n" +
+               "    g\n" +
+               "end grid\n" +
+               "var g = grid(3usize, 2usize)\n" +
+               "print(g.len, g[0].len, g[1][2])\n",
+               "2 3 12\n")
+
+@test("a struct may hold one, so the sizing crosses a field too")
+hbx_a_struct_holds_one()
+    hbx_prints("struct Frame\n" +
+               "    rows: []int\n" +
+               "    tag: string\n" +
+               "make(n: usize) -> Frame = Frame([5; n], \"hi\")\n" +
+               "var f = make(4usize)\n" +
+               "print(f.rows.len, f.rows[3], f.tag)\n",
+               "4 5 hi\n")
+
+// -- what the documents claim about a slice is true of a buffer -------------------------------------
+
+@test("the loop evaluates its sequence once, so a buffer nothing holds lives for the whole loop")
+hbx_the_loop_holds_its_sequence()
+    hbx_prints("make(n: usize) -> []int\n" +
+               "    var xs: []int = [0; n]\n" +
+               "    for i in 0..<n do xs[i] = int(i) + 1\n" +
+               "    xs\n" +
+               "end make\n" +
+               "var s = 0\n" +
+               "for x in make(6usize) do s += x\n" +
+               "print(s)\n",
+               "21\n")
+
+@test("a sub-slice outlives the view its storage came from")
+hbx_a_sub_slice_outlives_its_view()
+    hbx_prints("make(n: usize) -> []int\n" +
+               "    var xs: []int = [0; n]\n" +
+               "    for i in 0..<n do xs[i] = int(i) + 1\n" +
+               "    xs\n" +
+               "end make\n" +
+               "tail(n: usize) -> []int = make(n)[2..<5]\n" +
+               "var t = tail(8usize)\n" +
+               "print(t.len, t[0], t[2])\n",
+               "3 3 5\n")
+
+@test("a branch each yields a buffer, since the expectation reaches into them")
+hbx_each_branch_yields_a_buffer()
+    hbx_prints("pick(c: bool, n: usize) -> []int = if c then [1; n] else [2; n]\n" +
+               "print(pick(true, 2usize)[0], pick(false, 2usize)[1])\n",
+               "1 2\n")
+
+@test("a variant's payload fixes the type as a declaration does")
+hbx_a_payload_fixes_the_type()
+    hbx_prints("maybe(n: usize) -> Option[[]int] = Some([3; n])\n" +
+               "print(maybe(2usize).unwrap()[1])\n",
+               "3\n")
+
+@test("and a buffer boxes into a '&[]T' like any other value")
+hbx_a_buffer_boxes()
+    hbx_prints("var boxed: &[]int = [4; 3usize]\n" +
+               "print((*boxed).len, (*boxed)[0])\n",
+               "3 4\n")
+
+// -- the elements belong to the buffer -------------------------------------------------------------
+
+@test("a buffer of references keeps them alive and lets them go")
+hbx_a_buffer_of_references()
+    hbx_prints("struct Node\n" +
+               "    value: int\n" +
+               "refs(n: usize) -> []&Node\n" +
+               "    var xs: []&Node = [Node(0); n]\n" +
+               "    for i in 0..<n do xs[i] = Node(int(i) * 3)\n" +
+               "    xs\n" +
+               "end refs\n" +
+               "var r = refs(4usize)\n" +
+               "print(r.len, r[0].value, r[3].value)\n",
+               "4 0 9\n")
+
+@test("a buffer of strings likewise")
+hbx_a_buffer_of_strings()
+    hbx_prints("f(n: usize) -> []string = [str(n) + \"!\"; n]\n" +
+               "var s = f(3usize)\n" +
+               "print(s.len, s[0], s[2])\n",
+               "3 3! 3!\n")
+
+// The elements are reachable only from the hook that destroys them, which is why the count is in the
+// box: a slice's owner arrives with no static type to consult.
+@test("so the deallocation hook walks them")
+hbx_the_hook_walks_them()
+    if !hbx_ready() then return
+
+    val llvm = hbx_llvm("struct Node\n" +
+                        "    value: int\n" +
+                        "f(n: usize) -> []&Node = [Node(0); n]\n" +
+                        "print(f(2usize).len)\n")
+
+    assert_eq(hbx_func(llvm, "arc.dropbuf.ref.Node"),
+              "define private void @arc.dropbuf.ref.Node(ptr %p, i1 %storage) {\n" +
+              "entry:\n" +
+              "  %t4 = alloca i64\n" +
+              "  br i1 %storage, label %arc.give1, label %arc.over2\n" +
+              "arc.over2:\n" +
+              "  %t1 = getelementptr %arc.buf.ref.Node, ptr %p, i32 0, i32 3\n" +
+              "  %t2 = load i64, ptr %t1\n" +
+              "  %t3 = getelementptr %arc.buf.ref.Node, ptr %p, i32 0, i32 4\n" +
+              "  store i64 0, ptr %t4\n" +
+              "  br label %buf.test3\n" +
+              "buf.test3:\n" +
+              "  %t5 = load i64, ptr %t4\n" +
+              "  %t6 = icmp ult i64 %t5, %t2\n" +
+              "  br i1 %t6, label %buf.elem4, label %buf.done5\n" +
+              "buf.elem4:\n" +
+              "  %t7 = getelementptr ptr, ptr %t3, i64 %t5\n" +
+              "  %t8 = load ptr, ptr %t7\n" +
+              "  call void @arc.release(ptr %t8)\n" +
+              "  %t9 = add i64 %t5, 1\n" +
+              "  store i64 %t9, ptr %t4\n" +
+              "  br label %buf.test3\n" +
+              "buf.done5:\n" +
+              "  ret void\n" +
+              "arc.give1:\n" +
+              "  call void @free(ptr %p)\n" +
+              "  ret void\n" +
+              "}\n")
+    assert(llvm.contains("store ptr @arc.dropbuf.ref.Node, ptr"), llvm)
+end hbx_the_hook_walks_them
+
+// Elements that hold nothing need no walk, so the buffer gets the plain hook: it gives the storage
+// back and does nothing else.
+@test("and elements that hold nothing get the hook that only frees")
+hbx_plain_elements_get_the_plain_hook()
+    if !hbx_ready() then return
+
+    val llvm = hbx_llvm("f(n: usize) -> []u8 = [0; n]\n" +
+                        "print(f(2usize).len)\n")
+
+    assert(llvm.contains("store ptr @arc.drop.plain, ptr"), llvm)
+    assert(!llvm.contains("arc.dropbuf"), llvm)
+
+@test("many buffers of references come apart rather than accumulating")
+hbx_many_buffers_come_apart()
+    hbx_prints("struct Node\n" +
+               "    value: int\n" +
+               "refs(n: usize) -> []&Node = [Node(1); n]\n" +
+               "var i = 0\n" +
+               "while i < 100000\n" +
+               "    var t = refs(8usize)\n" +
+               "    i++\n" +
+               "print(\"done\")\n",
+               "done\n")
+
+// -- a repeat still evaluates its value exactly once ------------------------------------------------
+
+@test("however many elements it fills")
+hbx_the_value_once_however_many()
+    hbx_prints("var calls = 0\n" +
+               "tick(c: *int) -> int\n" +
+               "    *c += 1\n" +
+               "    7\n" +
+               "f(c: *int, n: usize) -> []int = [tick(c); n]\n" +
+               "var xs = f(&calls, 5usize)\n" +
+               "print(xs.len, xs[4], calls)\n",
+               "5 7 1\n")
+
+@test("including none at all, since the value is generated above the loop")
+hbx_the_value_once_for_none()
+    hbx_prints("var calls = 0\n" +
+               "tick(c: *int) -> int\n" +
+               "    *c += 1\n" +
+               "    7\n" +
+               "f(c: *int, n: usize) -> []int = [tick(c); n]\n" +
+               "var xs = f(&calls, 0usize)\n" +
+               "print(xs.len, calls)\n",
+               "0 1\n")
+
+// -- a computed length is checked, since that is where arithmetic goes wrong ------------------------
+
+@test("zero elements is an ordinary buffer, not a special case")
+hbx_zero_elements()
+    hbx_prints("f(n: usize) -> []int = [0; n]\n" +
+               "var xs = f(0usize)\n" +
+               "print(xs.len)\n",
+               "0\n")
+
+@test("a negative count arrives as a very large one and traps")
+hbx_a_negative_count_traps()
+    hbx_traps("f(n: int) -> []int = [0; n]\n" +
+              "var xs = f(-1)\n" +
+              "print(xs.len)\n")
+
+// 2^62 elements of 8 bytes is 2^65: the byte count wraps, and without the checked multiply it would
+// wrap to something small -- a buffer far shorter than the length its view reports.
+@test("a count whose byte size wraps traps rather than allocating a shorter buffer")
+hbx_a_wrapping_size_traps()
+    hbx_traps("f(n: usize) -> []i64 = [0; n]\n" +
+              "var xs = f(4611686018427387904usize)\n" +
+              "print(xs.len)\n")
+
+@test("an allocation that fails traps rather than yielding a null to store through")
+hbx_a_failed_allocation_traps()
+    hbx_traps("f(n: usize) -> []i64 = [0; n]\n" +
+              "var xs = f(1152921504606846976usize)\n" +
+              "print(xs.len)\n")
+
+@test("both checks are emitted, so neither magnitude relies on the other's")
+hbx_both_checks_are_emitted()
+    if !hbx_ready() then return
+
+    val llvm = hbx_llvm("f(n: usize) -> []i64 = [0; n]\n" +
+                        "print(f(2usize).len)\n")
+
+    assert(llvm.contains("@llvm.umul.with.overflow.i64"), llvm)
+    assert(llvm.contains("@llvm.uadd.with.overflow.i64"), llvm)
+    assert(llvm.contains("icmp ne ptr"), llvm)
+    assert(llvm.contains("declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)"), llvm)
+
+@test("and an index into a buffer is checked like every other")
+hbx_an_index_is_checked()
+    hbx_traps("f(n: usize) -> []int = [0; n]\n" +
+              "var xs = f(3usize)\n" +
+              "print(xs[3])\n")
+
+// -- a count takes the types an index takes --------------------------------------------------------
+
+@test("a transparent 'within' subtype counts, and indexes, with no cast")
+hbx_a_within_subtype_counts()
+    hbx_prints("type Small = usize within 0..100\n" +
+               "f(n: Small) -> []int = [7; n]\n" +
+               "var xs = f(Small(4usize))\n" +
+               "var i: Small = Small(1usize)\n" +
+               "print(xs.len, xs[i])\n",
+               "4 7\n")
+
+@test("a derived one does neither, since 'new' is nominal")
+hbx_a_derived_type_does_not_count()
+    hbx_refused("type Count = new usize\n" +
+                "f(n: Count) -> []int = [7; n]\n",
+                "a repeat count is a number of elements, and Count is not an integer", "2:24")
+
+@test("and the index refuses it in the same words")
+hbx_a_derived_type_does_not_index()
+    hbx_refused("type Ix = new usize\n" +
+                "var a = [1, 2, 3]\n" +
+                "var i: Ix = Ix(1usize)\n" +
+                "print(a[i])\n",
+                "an index must be an integer, not Ix", "4:9")
+
+// -- what is refused -------------------------------------------------------------------------------
+
+@test("a count that is not a number of elements")
+hbx_a_string_count()
+    hbx_refused("f(s: string) -> []int = [0; s]\n",
+                "a repeat count is a number of elements, and string is not an integer", "1:25")
+
+private hbx_must_be_constant() -> string =
+    "an array's repeat count must be a constant, since it is the array's bound — a literal, or a " +
+    "'const' naming one. A count computed while running makes storage instead, which is written " +
+    "where a '[]T' is expected"
+
+@test("a computed count where an array was expected, naming the form that takes one")
+hbx_a_computed_count_for_an_array()
+    hbx_refused("var n = 4\n" +
+                "var xs = [0; n]\n",
+                hbx_must_be_constant(), "2:10")
+
+// The reference reports the slice type of unit first and the element refusal second; both are quoted.
+@test("elements of a type that has no values")
+hbx_elements_of_unit()
+    if !hbx_ready() then return
+
+    val said = hbx_lowered("f(n: usize) -> []unit = [(); n]\n").0
+
+    assert(said.contains("error: an array cannot hold unit values\n"), said)
+    assert(said.contains("main.sysl:1:25\n"), said)
+    assert(said.contains("error: unit occupies no storage, so there is nothing for a slice to point at\n"), said)
+    assert(said.contains("main.sysl:1:16\n"), said)
+end hbx_elements_of_unit
+
+// The refusal of a view of `unit` belongs to the TYPE, wherever it is written: a parameter, and a
+// field reached through a substitution (the reference's own words and anchors, 0.0.157).
+@test("a view of unit is refused where the type is written, a substitution included")
+hbx_a_view_of_unit_is_refused_as_a_type()
+    hbx_refused("f(xs: []unit) = ()\nprint(1)\n",
+                "unit occupies no storage, so there is nothing for a slice to point at", "1:7")
+    hbx_refused("struct W[T]\n    xs: []T\nvar w: W[unit] = W([])\nprint(1)\n",
+                "unit occupies no storage, so there is nothing for a slice to point at", "2:9")
+
+@test("a computed count with no context to make it storage")
+hbx_a_computed_count_with_no_context()
+    hbx_refused("f(n: usize) = [0; n]\n", hbx_must_be_constant(), "1:15")
+
+// What used to escape was the *array* the views in the buffer pointed at. That array is a plain
+// local, so it moves to the heap with them and the whole thing outlives the frame together.
+@test("a buffer filled with views of this frame takes the array with it")
+hbx_views_of_this_frame_take_the_array()
+    val src = "leak() -> [][]u8\n" +
+              "    var local: [4]u8\n" +
+              "    local[0usize] = 68u8\n" +
+              "    var xs: [][]u8 = [local[..]; 2]\n" +
+              "    xs\n" +
+              "end leak\n" +
+              "var xs = leak()\n" +
+              "print(xs.len, str(char(xs[0usize][0usize])), str(char(xs[1usize][0usize])))\n"
+
+    hbx_prints(src, "2 D D\n")
+
+    if !hbx_ready() then return
+
+    val llvm = hbx_llvm(src)
+
+    assert(llvm.contains("call ptr @malloc"), llvm)
+end hbx_views_of_this_frame_take_the_array
+
+@test("while the same function keeps its own storage and returns it")
+hbx_its_own_storage_returned()
+    hbx_prints("keep() -> [][]u8\n" +
+               "    var local: []u8 = [0; 4usize]\n" +
+               "    local[1] = 9\n" +
+               "    var xs: [][]u8 = [local[..]; 2]\n" +
+               "    xs\n" +
+               "end keep\n" +
+               "var g = keep()\n" +
+               "print(g.len, g[1][1])\n",
+               "2 9\n")
