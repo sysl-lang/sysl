@@ -1,0 +1,200 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The reference's `GhostTests`: `@ghost`, a declaration that exists for the specification and is
+// erased before codegen (`reference/verification.md § @ghost — what costs nothing to say`).
+//
+// Two halves, neither implying the other: the program still RUNS, and the ghost is really GONE. A
+// ghost predicate quietly emitted and called would give the same answers and the same output, so
+// the erasure is asserted against the emitted IR.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.162)** by
+// handing the installed `sysl` the same program. The harness is `tests_enm_enum_run.sysl`'s.
+
+// An insertion sort with a ghost `is_sorted` in its postcondition and its outer invariant -- where
+// checking the clause would turn O(n^2) into O(n^3).
+private ghx_sort() -> string = raw"""
+    @ghost
+    is_sorted(a: []int, n: int) -> bool = for all i in 0..<n - 1 do a[i] <= a[i + 1]
+
+    insertion(a: []int, n: int) -> int
+        ensure is_sorted(a, n)
+        var i = 1
+
+        while i < n
+            invariant is_sorted(a, i)
+            variant n - i
+            var j = i
+
+            while j > 0 && a[j - 1] > a[j]
+                variant j
+                var t = a[j - 1]
+
+                a[j - 1] = a[j]
+                a[j] = t
+                j -= 1
+
+            i += 1
+
+        n
+
+    var xs = [5, 2, 9, 1, 7]
+    print(insertion(xs[..], 5))
+    print(xs[0], xs[1], xs[2], xs[3], xs[4])
+    """
+
+private ghx_big(arg: string) -> string =
+    "@ghost\nbig(n: int) -> bool = n > 0\n\nf(n: int) -> int\n    require n >= 0\n" +
+    s"    require big(n)\n    n\n\nprint(f($arg))\n"
+
+private ghx_refusal() -> string =
+    "error: 'ok' is '@ghost', so it exists for the specification and is not there when the program " +
+    "runs — it may be called from a 'require', an 'ensure', a loop's 'invariant' or 'variant', or " +
+    "from another '@ghost' function, and from nowhere else"
+
+private ghx_called_at_top() -> string = "@ghost\nok(n: int) -> bool = n > 0\n\nprint(ok(1))\n"
+
+// -- a ghost predicate in a contract ---------------------------------------------------------------
+
+@test("a ghost predicate in a contract leaves the program running")
+ghx_leaves_the_program_running()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ghx_sort()), "5\n1 2 5 7 9\n")
+
+// The half a run test cannot see.
+@test("and the function is not in the emitted module at all")
+ghx_not_in_the_emitted_module()
+    if !enm_ready() then return
+
+    val out = enm_ir(ghx_sort())
+
+    assert(out.contains("define"), out)
+    assert(!out.contains("is_sorted"), out)
+
+// Its body is a quantifier, which lowers to a counted loop: had the clauses been laid down, that loop
+// would be in the module, so this is the sharper of the two.
+@test("nor is the loop its body would have lowered to")
+ghx_nor_the_loop_its_body_lowers_to()
+    if !enm_ready() then return
+
+    val out = enm_ir(ghx_sort())
+
+    assert(out.contains("define"), out)
+    assert(!out.contains("quant"), out)
+
+// The ordinary clause beside it is untouched, so the erasure is about the ghost name rather than
+// about clauses in general. `@big(` rather than `big`: the module carries the library's type table,
+// and a function appears as `define … @big(` and is reached as `call … @big(`.
+@test("while an ordinary clause in the same function is still emitted")
+ghx_an_ordinary_clause_is_still_emitted()
+    if !enm_ready() then return
+
+    val out = enm_ir(ghx_big("1"))
+
+    assert(out.contains("define"), out)
+    assert(!out.contains("@big("), out)
+    assert_eq(enm_ran(ghx_big("1")), "1\n")
+    // The ordinary `require` still traps, so the neighbouring value is refused.
+    assert_eq(enm_exits(ghx_big("0 - 1")), "")
+
+// -- where a ghost function may be called ----------------------------------------------------------
+
+@test("a ghost function may be called from a require")
+ghx_from_a_require()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@ghost\nok(n: int) -> bool = n > 0\n\nf(n: int) -> int\n    require ok(n)\n" +
+                      "    n\n\nprint(f(1))\n"), "1\n")
+
+@test("a ghost function may be called from an ensure")
+ghx_from_an_ensure()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@ghost\nok(n: int) -> bool = n > 0\n\nf(n: int) -> int\n" +
+                      "    ensure ok(result)\n    n\n\nprint(f(1))\n"), "1\n")
+
+@test("a ghost function may be called from a loop invariant")
+ghx_from_a_loop_invariant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@ghost\nok(n: int) -> bool = n >= 0\n\nf() -> int\n    var i = 0\n\n" +
+                      "    while i < 3\n        invariant ok(i)\n        i += 1\n\n    i\n\n" +
+                      "print(f())\n"), "3\n")
+
+// A ghost function's body reads real state freely -- that is the whole point of an `is_sorted` -- so
+// what it calls is not restricted at all.
+@test("a ghost function may be called from another ghost function, and may call a real one")
+ghx_from_another_ghost_and_a_real_one()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("plain(n: int) -> bool = n > 0\n\n@ghost\ninner(n: int) -> bool = plain(n)\n\n" +
+                      "@ghost\nouter(n: int) -> bool = inner(n)\n\nf(n: int) -> int\n" +
+                      "    require outer(n)\n    n\n\nprint(f(1))\n"), "1\n")
+
+// -- where it may not ------------------------------------------------------------------------------
+
+@test("a ghost function may not be called from the body of an ordinary function")
+ghx_not_from_an_ordinary_body()
+    if !enm_ready() then return
+
+    val out = enm_err("@ghost\nok(n: int) -> bool = n > 0\n\nf(n: int) -> int\n    if ok(n) then n\n" +
+                      "    else 0\n\nprint(f(1))\n")
+
+    assert(out.contains(ghx_refusal()), out)
+
+@test("a ghost function may not be called from a top-level statement")
+ghx_not_from_a_top_level_statement()
+    if !enm_ready() then return
+
+    val out = enm_err(ghx_called_at_top())
+
+    assert(out.contains("is '@ghost'"), out)
+
+@test("and the message says where a ghost function may be called from")
+ghx_the_message_says_where()
+    if !enm_ready() then return
+
+    val out = enm_err(ghx_called_at_top())
+
+    assert(out.contains(ghx_refusal()), out)
+    assert(out.contains("'require'"), out)
+
+// -- the annotation itself -------------------------------------------------------------------------
+
+@test("@ghost composes with @pure")
+ghx_composes_with_pure()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@ghost\n@pure\nok(n: int) -> bool = n > 0\n\nf(n: int) -> int\n" +
+                      "    require ok(n)\n    n\n\nprint(f(1))\n"), "1\n")
+
+@test("@ghost is refused on anything but a function")
+ghx_refused_on_anything_but_a_function()
+    if !enm_ready() then return
+
+    val out = enm_err("@ghost\nstruct Point\n    x: int\n")
+
+    assert(out.contains("error: an annotation marks a function, and only a function — neither what " +
+                        "'sysl test' calls nor what recurses is anything a declaration of another " +
+                        "kind supplies. '@packed', '@align(n)' and '@export(\"...\")' are the three " +
+                        "that mark a struct instead"), out)
+
+@test("and the unknown-annotation message names @ghost")
+ghx_unknown_annotation_names_ghost()
+    if !enm_ready() then return
+
+    val out = enm_err("@sideways\nf(x: int) -> int = x\n")
+
+    assert(out.contains("'sideways' is not an annotation a declaration takes — '@test', '@setup', " +
+                        "'@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', " +
+                        "'@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)' " +
+                        "and '@crossing(...)' mark a function"), out)
+
+@test("a value may still be called 'ghost'")
+ghx_a_value_may_be_called_ghost()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("f() -> int\n    var ghost = 41\n    ghost + 1\n\nprint(f())\n"), "42\n")
