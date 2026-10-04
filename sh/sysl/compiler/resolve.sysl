@@ -67,6 +67,12 @@ struct Graph
     // The features each package has enabled, keyed as `ResolvedPackage.canonical` is -- the root's
     // under the empty name. A package missing from it has enabled nothing (`enabled_of`).
     features: Buf[(string, Buf[string])]
+
+    // Every coordinate and version whose manifest this resolution read, which is wider than what
+    // `packages` holds: a floor that rose after its lower version was read leaves that version read
+    // and unselected, and every resolution of the same manifests reads it again. So it is the set a
+    // `sysl.sum` has to cover for a build to add nothing to it, which is what `sysl tidy` keeps.
+    read: Buf[(string, Release)]
 end Graph
 
 // What the selecting pass carries: the version floors, who asked for them, the manifests read so
@@ -212,7 +218,15 @@ private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string
         packages.push(p)
 
     check_floors(packages)?
-    Ok(Graph(packages, state.claims, state.sums, state.changed, enabled))
+
+    var read: Buf[(string, Release)] = buf()
+
+    for i in 0..<state.manifests.len()
+        val had = state.manifests.at(i)
+
+        read.push((had.coordinate, had.version.unwrap()))
+
+    Ok(Graph(packages, state.claims, state.sums, state.changed, enabled, read))
 end resolve_once
 
 // What the root calls itself when it is the one asking, since it has no coordinate to be named by.

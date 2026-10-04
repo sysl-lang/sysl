@@ -153,6 +153,140 @@ sums_read(text: string) -> Result[Sums, string]
     Ok(Sums(out))
 end sums_read
 
+// What `sysl tidy` leaves of a file: the new text, what was dropped and what was added, the last two
+// sorted the way the file is.
+struct Tidied
+    text: string
+    removed: Buf[(string, Release)]
+    added: Buf[(string, Release)]
+end Tidied
+
+// `text` as it stands, cut down to the packages in `needed`.
+//
+// `current` is the sums after resolving, so it holds every line `text` held plus one for anything
+// resolving had to fetch that no line covered.
+//
+// **A line that stays is the line that was there, byte for byte and in its place**, so a file nothing
+// was added to is the old one with lines taken out -- a diff of it shows removals and nothing else.
+// Where a line has to be added, the file is rendered whole instead, which is exactly the file a build
+// would have written on adding it; a build always writes the rendered form, so for any file a build
+// wrote the two agree on every line that stays.
+//
+// A file with nothing left in it is the empty string, and the caller deletes it rather than writing
+// it: a build that resolves no package never writes one, so no file at all is what a project
+// depending on nothing looks like.
+sums_tidied(text: string, current: &Sums, needed: &Buf[(string, Release)]) -> Tidied
+    val split_lines = split(text, "\n")
+    var lines: Buf[string] = buf()
+
+    for i in 0..<split_lines.len
+        if !split_lines[i].trim().is_empty() then lines.push(split_lines[i])
+
+    var had: Buf[(string, Release)] = buf()
+
+    for i in 0..<lines.len()
+        line_key(lines.at(i)) match
+            Some(key) -> if !holds_key(had, key) then had.push(key)
+            None -> ()
+
+    var removed: Buf[(string, Release)] = buf()
+
+    for i in 0..<had.len()
+        if !holds_key(needed, had.at(i)) then removed.push(had.at(i))
+
+    var added: Buf[(string, Release)] = buf()
+
+    for i in 0..<needed.len()
+        val key = needed.at(i)
+
+        if !holds_key(had, key) && sum_of(current, key.0, key.1).is_some() then added.push(key)
+
+    var out = str_builder()
+
+    if added.is_empty()
+        var seen: Buf[string] = buf()
+
+        for i in 0..<lines.len()
+            val line = lines.at(i)
+            var wanted = false
+
+            line_key(line) match
+                Some(key) -> wanted = holds_key(needed, key)
+                None -> ()
+
+            var repeated = false
+
+            for j in 0..<seen.len()
+                if seen.at(j) == line then repeated = true
+
+            if wanted && !repeated
+                seen.push(line)
+                out.push(s"$line\n")
+    else
+        var kept: Buf[SumEntry] = buf()
+
+        for i in 0..<current.entries.len()
+            val entry = current.entries.at(i)
+
+            if holds_key(needed, (entry.coordinate, entry.version)) then kept.push(entry)
+
+        out.push(sums_render(Sums(kept)))
+    end if
+
+    Tidied(out.finish(), sorted_keys(removed), sorted_keys(added))
+end sums_tidied
+
+// A line's package and version, where it names them.
+private line_key(line: string) -> Option[(string, Release)]
+    val parts = fields(line)
+
+    if parts.len() != 3 || !parts.at(1).starts_with("v") then return None
+
+    val tag = parts.at(1)
+
+    release_of(tag[1..<tag.bytes.len]) match
+        Ok(v) -> Some((parts.at(0), v))
+        Err(_) -> None
+end line_key
+
+private holds_key(keys: &Buf[(string, Release)], key: (string, Release)) -> bool
+    for i in 0..<keys.len()
+        if keys.at(i).0 == key.0 && keys.at(i).1 == key.1 then return true
+
+    false
+end holds_key
+
+// The keys in the order the file is written in: by coordinate, then by version.
+private sorted_keys(keys: Buf[(string, Release)]) -> Buf[(string, Release)]
+    var out: Buf[(string, Release)] = buf()
+
+    for i in 0..<keys.len()
+        val key = keys.at(i)
+        var at = out.len()
+
+        for j in 0..<out.len()
+            if at == out.len() && key_before(key, out.at(j)) then at = j
+
+        var next: Buf[(string, Release)] = buf()
+
+        for j in 0..<out.len()
+            if j == at then next.push(key)
+
+            next.push(out.at(j))
+
+        if at == out.len() then next.push(key)
+
+        out = next
+
+    out
+end sorted_keys
+
+private key_before(a: (string, Release), b: (string, Release)) -> bool
+    if a.0 != b.0 then return a.0 < b.0
+
+    release_before(a.1, b.1)
+end key_before
+
 // A line's words, with the runs of blanks between them dropped.
 private fields(line: string) -> Buf[string]
     var out: Buf[string] = buf()

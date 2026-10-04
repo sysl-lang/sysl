@@ -1,0 +1,345 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, write_text}
+import sysl.text.Search
+
+// `sysl tidy` -- `sysl.sum` cut down to what the project resolves to now.
+//
+// A build only ever adds a line, so a version the project has moved off stays recorded until this
+// runs. The claims pinned here are the ones that make it safe to run in CI: a line that stays is the
+// line that was there, byte for byte; a line a feature or a `dev_dependencies` entry needs is not
+// mistaken for a stale one; running it twice is running it once; and `--check` writes nothing.
+//
+// Every `git` dependency is laid out in the project's `vendor/` tree with its tree hash recorded beside
+// it, as a fetch would have left it, so every case drives the whole command with no network.
+
+// A temporary directory as the compiler names it, so a refusal quoting the project quotes this.
+private tdy_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+private tdy_manifest(name: string, version: string, deps: string) -> string =
+    s"package { name = \"$name\", version = \"$version\" }\n" +
+    (if deps.is_empty() then "" else s"dependencies { $deps }\n")
+
+private tdy_dep(label: string, coordinate: string, version: string) -> string =
+    s"$label { git = \"$coordinate\", version = \"$version\" }"
+
+// A project on disk holding a manifest and one module of its own, `name`.
+private tdy_project(config: string, name: string) -> string
+    val root = tdy_temp("sysl-tdy-project")
+
+    write_text(s"$root/package.hocon", config).unwrap()
+    make_dir_all(s"$root/$name").unwrap()
+    write_text(s"$root/$name/$name.sysl", s"module $name\n").unwrap()
+    root
+end tdy_project
+
+private tdy_app(deps: string) -> string = tdy_project(tdy_manifest("app", "0.1.0", deps), "app")
+
+// A package in the project's `vendor/` tree with one module and its hash recorded beside it, as a
+// fetch leaves it. Answers the hash, which is what its `sysl.sum` line carries.
+private tdy_put(root: string, coordinate: string, version: string, deps: string) -> string
+    val leaf = basename(coordinate)
+    val dir = s"$root/vendor/$coordinate/@v$version"
+
+    make_dir_all(s"$dir/$leaf").unwrap()
+    write_text(s"$dir/package.hocon", tdy_manifest(leaf, version, deps)).unwrap()
+    write_text(s"$dir/$leaf/$leaf.sysl", s"module $leaf\n").unwrap()
+
+    val hash = tree_hash(dir).unwrap()
+
+    write_text(s"$dir.hash", s"$hash\n").unwrap()
+    hash
+end tdy_put
+
+// A stand-in digest for a line whose package is never read, which nothing ever checks. `c` has to be
+// a hex digit, or the file is refused as unreadable before anything is tidied.
+private tdy_stale(c: string) -> string
+    var out = DigestPrefix
+
+    while out.bytes.len < DigestPrefix.bytes.len + 64
+        out = out + c
+
+    out
+end tdy_stale
+
+private tdy_sums(root: string) -> string = read_text(s"$root/sysl.sum").unwrap_or("<none>")
+
+private tdy_has_sums(root: string) -> bool = is_file(s"$root/sysl.sum")
+
+private tdy_write_sums(root: string, text: string) = write_text(s"$root/sysl.sum", text).unwrap()
+
+// The command, as `sysl tidy [--check] <root>` reaches it: the status, and every line it said.
+private tdy_run(root: string, check: bool) -> (int, string)
+    var args: Buf[string] = buf()
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    args.push("sysl")
+    args.push("tidy")
+
+    if check then args.push("--check")
+
+    args.push(root)
+
+    val code = run_cli(args.view(), (line) -> sink.push(line))
+    var said = ""
+
+    for i in 0..<lines.len()
+        said = said + lines.at(i) + "\n"
+
+    (code, said)
+end tdy_run
+
+// The command's status and what it said, each against what it should have been.
+private tdy_expect(root: string, check: bool, code: int, said: string)
+    val got = tdy_run(root, check)
+
+    assert_eq(got.1, said)
+    assert_eq(got.0, code)
+
+private tdy_drop(root: string) = remove_dir_all(root).unwrap_or(())
+
+// -- what an argument list says ---------------------------------------------------------------------
+
+@test("tidy takes the working directory where no path is given")
+tdy_takes_the_working_directory()
+    val read = tidy_arguments(["sysl", "tidy"]).unwrap()
+
+    assert_eq(read.0, ".")
+    assert(!read.1)
+
+@test("and a path and --check where they are")
+tdy_takes_a_path_and_check()
+    val read = tidy_arguments(["sysl", "tidy", "--check", "/somewhere"]).unwrap()
+
+    assert_eq(read.0, "/somewhere")
+    assert(read.1)
+
+// -- what it removes and what it keeps ---------------------------------------------------------------
+
+// The case the command exists for: a project that moved from 0.9.0 to 1.0.0, and a package it stopped
+// depending on at all, both still recorded. The live lines are deliberately out of the order a build
+// would write them in, so that keeping them "byte for byte" is a claim that could fail.
+@test("a version nothing selects goes, and the lines that stay are the lines that were there")
+tdy_a_version_nothing_selects_goes()
+    val root = tdy_app(tdy_dep("geom", "github.com/e/geom", "1.0.0") + "\n" +
+                       tdy_dep("buf", "github.com/e/buf", "1.2.0"))
+    val geom = tdy_put(root, "github.com/e/geom", "1.0.0", "")
+    val bf = tdy_put(root, "github.com/e/buf", "1.2.0", "")
+
+    tdy_write_sums(root,
+        s"github.com/e/geom v1.0.0 $geom\n" +
+        s"github.com/e/geom v0.9.0 ${tdy_stale("a")}\n" +
+        s"github.com/e/buf v1.2.0 $bf\n" +
+        s"github.com/e/gone v3.1.0 ${tdy_stale("b")}\n")
+
+    tdy_expect(root, false, 0, "removed github.com/e/geom v0.9.0\nremoved github.com/e/gone v3.1.0\n")
+    assert_eq(tdy_sums(root), s"github.com/e/geom v1.0.0 $geom\ngithub.com/e/buf v1.2.0 $bf\n")
+    tdy_drop(root)
+end tdy_a_version_nothing_selects_goes
+
+// A build of the default features would not reach `tiny`, which is exactly why a build cannot be the
+// thing that prunes: the line has to survive a tidy run with no feature named.
+@test("a dependency only a feature turns on keeps its line")
+tdy_a_feature_dependency_keeps_its_line()
+    val root = tdy_project(
+        "package { name = \"app\", version = \"0.1.0\" }\n" +
+        "dependencies { tiny { git = \"github.com/e/tiny\", version = \"1.0.0\", optional = true } }\n" +
+        "features { small = [tiny] }\n", "app")
+    val tiny = tdy_put(root, "github.com/e/tiny", "1.0.0", "")
+
+    tdy_write_sums(root, s"github.com/e/tiny v1.0.0 $tiny\n")
+
+    tdy_expect(root, false, 0, "")
+    assert_eq(tdy_sums(root), s"github.com/e/tiny v1.0.0 $tiny\n")
+    tdy_drop(root)
+end tdy_a_feature_dependency_keeps_its_line
+
+@test("and so does one only the project's own tests use")
+tdy_a_dev_dependency_keeps_its_line()
+    val root = tdy_project(
+        "package { name = \"app\", version = \"0.1.0\" }\n" +
+        s"dev_dependencies { ${tdy_dep("check", "github.com/e/check", "1.0.0")} }\n", "app")
+    val check = tdy_put(root, "github.com/e/check", "1.0.0", "")
+
+    tdy_write_sums(root, s"github.com/e/check v1.0.0 $check\n")
+
+    tdy_expect(root, false, 0, "")
+    assert_eq(tdy_sums(root), s"github.com/e/check v1.0.0 $check\n")
+    tdy_drop(root)
+end tdy_a_dev_dependency_keeps_its_line
+
+// `b` 1.0.0 is read before `z` raises it to 1.1.0, so every resolution of these manifests reads it --
+// a build after a tidy that dropped it would put it straight back.
+@test("a version read on the way to a higher one keeps its line, since every build reads it again")
+tdy_a_version_read_on_the_way_keeps_its_line()
+    val root = tdy_app(tdy_dep("b", "github.com/e/b", "1.0.0") + "\n" +
+                       tdy_dep("z", "github.com/e/z", "1.0.0"))
+    val b10 = tdy_put(root, "github.com/e/b", "1.0.0", "")
+    val b11 = tdy_put(root, "github.com/e/b", "1.1.0", "")
+    val z = tdy_put(root, "github.com/e/z", "1.0.0", tdy_dep("b", "github.com/e/b", "1.1.0"))
+    val file = s"github.com/e/b v1.0.0 $b10\ngithub.com/e/b v1.1.0 $b11\ngithub.com/e/z v1.0.0 $z\n"
+
+    tdy_write_sums(root, file)
+
+    tdy_expect(root, false, 0, "")
+    assert_eq(tdy_sums(root), file)
+    tdy_drop(root)
+end tdy_a_version_read_on_the_way_keeps_its_line
+
+@test("a package with no line yet is recorded as a build would record it")
+tdy_a_package_with_no_line_is_recorded()
+    val root = tdy_app(tdy_dep("geom", "github.com/e/geom", "1.0.0"))
+    val geom = tdy_put(root, "github.com/e/geom", "1.0.0", "")
+
+    tdy_write_sums(root, s"github.com/e/old v1.0.0 ${tdy_stale("c")}\n")
+
+    tdy_expect(root, false, 0, "removed github.com/e/old v1.0.0\nadded github.com/e/geom v1.0.0\n")
+    assert_eq(tdy_sums(root), s"github.com/e/geom v1.0.0 $geom\n")
+    tdy_drop(root)
+end tdy_a_package_with_no_line_is_recorded
+
+// -- a path dependency ------------------------------------------------------------------------------
+
+// A directory beside the project is expected to change, so it never has a line -- and a project whose
+// only dependencies are paths ends with no file, which is what a build leaves for one.
+@test("gets no line, and a file left holding nothing is removed")
+tdy_a_path_dependency_gets_no_line()
+    val lib = tdy_project(tdy_manifest("geom", "0.1.0", ""), "geom")
+    val root = tdy_app(s"g { path = \"$lib\" }")
+
+    tdy_write_sums(root, s"github.com/e/geom v1.0.0 ${tdy_stale("d")}\n")
+
+    tdy_expect(root, false, 0, "removed github.com/e/geom v1.0.0\n")
+    assert(!tdy_has_sums(root))
+    tdy_drop(root)
+    tdy_drop(lib)
+end tdy_a_path_dependency_gets_no_line
+
+@test("and beside a git dependency only the git one is recorded")
+tdy_beside_a_git_dependency_only_it_is_recorded()
+    val lib = tdy_project(tdy_manifest("geom", "0.1.0", ""), "geom")
+    val root = tdy_app(s"g { path = \"$lib\" }\n" + tdy_dep("buf", "github.com/e/buf", "1.0.0"))
+    val bf = tdy_put(root, "github.com/e/buf", "1.0.0", "")
+
+    tdy_expect(root, false, 0, "added github.com/e/buf v1.0.0\n")
+    assert_eq(tdy_sums(root), s"github.com/e/buf v1.0.0 $bf\n")
+    tdy_drop(root)
+    tdy_drop(lib)
+end tdy_beside_a_git_dependency_only_it_is_recorded
+
+// -- a project depending on nothing ------------------------------------------------------------------
+
+@test("is tidy with no file, and says nothing")
+tdy_nothing_depended_on_is_tidy_with_no_file()
+    val root = tdy_app("")
+
+    tdy_expect(root, false, 0, "")
+    assert(!tdy_has_sums(root))
+    tdy_drop(root)
+
+@test("and a file it still carries is removed")
+tdy_nothing_depended_on_removes_the_file()
+    val root = tdy_app("")
+
+    tdy_write_sums(root, s"github.com/e/geom v1.0.0 ${tdy_stale("e")}\n")
+
+    tdy_expect(root, false, 0, "removed github.com/e/geom v1.0.0\n")
+    assert(!tdy_has_sums(root))
+    tdy_drop(root)
+end tdy_nothing_depended_on_removes_the_file
+
+// -- a tidy file -------------------------------------------------------------------------------------
+
+@test("is left alone, and nothing is printed")
+tdy_a_tidy_file_is_left_alone()
+    val root = tdy_app(tdy_dep("geom", "github.com/e/geom", "1.0.0"))
+    val geom = tdy_put(root, "github.com/e/geom", "1.0.0", "")
+
+    tdy_write_sums(root, s"github.com/e/geom v1.0.0 $geom\n")
+
+    val before = metadata(s"$root/sysl.sum").unwrap().modified.us
+
+    tdy_expect(root, false, 0, "")
+    assert_eq(metadata(s"$root/sysl.sum").unwrap().modified.us, before)
+    tdy_drop(root)
+end tdy_a_tidy_file_is_left_alone
+
+@test("and a second run after a first does nothing at all")
+tdy_a_second_run_does_nothing()
+    val root = tdy_app(tdy_dep("geom", "github.com/e/geom", "1.0.0"))
+    val geom = tdy_put(root, "github.com/e/geom", "1.0.0", "")
+
+    tdy_write_sums(root, s"github.com/e/geom v0.1.0 ${tdy_stale("f")}\ngithub.com/e/geom v1.0.0 $geom\n")
+
+    assert_eq(tdy_run(root, false).1, "removed github.com/e/geom v0.1.0\n")
+
+    val once = tdy_sums(root)
+
+    tdy_expect(root, false, 0, "")
+    assert_eq(tdy_sums(root), once)
+    tdy_drop(root)
+end tdy_a_second_run_does_nothing
+
+// -- --check -----------------------------------------------------------------------------------------
+
+@test("passes a tidy file, quietly")
+tdy_check_passes_a_tidy_file()
+    val root = tdy_app(tdy_dep("geom", "github.com/e/geom", "1.0.0"))
+    val geom = tdy_put(root, "github.com/e/geom", "1.0.0", "")
+
+    tdy_write_sums(root, s"github.com/e/geom v1.0.0 $geom\n")
+
+    tdy_expect(root, true, 0, "")
+    tdy_drop(root)
+end tdy_check_passes_a_tidy_file
+
+@test("fails an untidy one, says what would go, and writes nothing")
+tdy_check_fails_an_untidy_file()
+    val root = tdy_app(tdy_dep("geom", "github.com/e/geom", "1.0.0"))
+    val geom = tdy_put(root, "github.com/e/geom", "1.0.0", "")
+    val file = s"github.com/e/geom v0.1.0 ${tdy_stale("0")}\ngithub.com/e/geom v1.0.0 $geom\n"
+
+    tdy_write_sums(root, file)
+
+    val (code, said) = tdy_run(root, true)
+
+    assert(code != 0)
+    assert_eq(said, "would remove github.com/e/geom v0.1.0\nerror: sysl.sum is not tidy — " +
+              "'sysl tidy' rewrites it to what this project resolves to\n")
+    assert_eq(tdy_sums(root), file)
+    tdy_drop(root)
+end tdy_check_fails_an_untidy_file
+
+@test("and fails a file missing a line the project needs")
+tdy_check_fails_a_missing_line()
+    val root = tdy_app(tdy_dep("geom", "github.com/e/geom", "1.0.0"))
+
+    tdy_put(root, "github.com/e/geom", "1.0.0", "")
+
+    val (code, said) = tdy_run(root, true)
+
+    assert(code != 0)
+    assert(said.starts_with("would add github.com/e/geom v1.0.0\nerror: "))
+    assert(!tdy_has_sums(root))
+    tdy_drop(root)
+end tdy_check_fails_a_missing_line
+
+// -- outside a project -------------------------------------------------------------------------------
+
+@test("is refused, and names the manifest it looked for")
+tdy_outside_a_project_is_refused()
+    val dir = tdy_temp("sysl-tdy-no-project")
+
+    write_text(s"$dir/main.sysl", "print(1)\n").unwrap()
+
+    val (code, said) = tdy_run(dir, false)
+
+    assert(code != 0)
+    assert_eq(said, s"error: '$dir' has no package.hocon — 'sysl tidy' tidies a project's sysl.sum, " +
+              "and only a project with a manifest resolves anything to record\n")
+    assert(!tdy_has_sums(dir))
+    tdy_drop(dir)
+end tdy_outside_a_project_is_refused
