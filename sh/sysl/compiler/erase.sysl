@@ -42,7 +42,7 @@ erase_to(cx: &Analyzer, t: TExpr, want: Type) -> TExpr
             Ptr(inner) -> erase(cx, t, tr, *inner, want, false)
             inner ->
                 if !conforms(cx.an, trait_bound_of(tr), inner)
-                    return if near_miss(cx, tr, inner) then erase(cx, t, tr, inner, want, false) else t
+                    return if near_miss(cx, tr, inner) then erase(cx, t, tr, inner, want, false) else by_rule(cx, t, tr, inner, want)
 
                 // A concrete value where a *raw* object was expected has no address of its own to
                 // hand over, and taking one silently would be putting a pointer to a temporary in a
@@ -56,7 +56,7 @@ erase_to(cx: &Analyzer, t: TExpr, want: Type) -> TExpr
             // context boxes one -- the allocation is the construction, and the erasure rides on top.
             inner ->
                 if !conforms(cx.an, trait_bound_of(tr), inner)
-                    return if near_miss(cx, tr, inner) then erase(cx, t, tr, inner, want, true) else t
+                    return if near_miss(cx, tr, inner) then erase(cx, t, tr, inner, want, true) else by_rule(cx, t, tr, inner, want)
 
                 erase(cx, TExpr(t.span, TBox(t, Ref(inner, sync))), tr, inner, want, true)
         _ -> t
@@ -68,6 +68,24 @@ end erase_to
 // at all is left to the position's own mismatch, which names the parameter or the variable.
 private near_miss(cx: &Analyzer, tr: Type, inner: Type) -> bool
     unmet_bound(cx.an, trait_bound_of(tr), inner).is_some()
+
+// A built-in that belongs to the trait by the compiler's rule rather than through an `impl`. The
+// membership is real -- a bound over the trait is met -- so the caller's plain mismatch would deny
+// the one thing about this value that is true. What a built-in cannot do is fill a table slot, since
+// what the compiler provides is an instruction or a rendering rather than a function. `Display` and
+// `Hash` are written `impl`s now, so what still arrives here is the operator catalog at written
+// arguments: `3` as a `&Add[int, int]`. Anything else is left for the caller's own diagnostic.
+private by_rule(cx: &Analyzer, t: TExpr, tr: Type, inner: Type, want: Type) -> TExpr
+    val bound = trait_bound_of(tr)
+    val spelling = library_spelling(bound.name)
+
+    if spelling.is_none() || !core_builtin(spelling.unwrap(), inner) then return t
+
+    cx.err(t.span, s"${type_show(inner)} is a '${bound.show()}' by the compiler's rule rather than " +
+           s"through an 'impl', and a ${type_show(want)} holds a table of functions — what the " +
+           "compiler provides for a built-in is an instruction or a rendering, and neither is a " +
+           "function the table could point at")
+end by_rule
 
 // The erasure itself, once the type going in is known.
 private erase(cx: &Analyzer, t: TExpr, tr: Type, inner: Type, want: Type, boxed: bool) -> TExpr
