@@ -223,13 +223,6 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                 VsSaid -> return bad_expr(span)
                 VsNone -> ()
 
-            // `m.Hit(5)` -- a variant named through the MODULE that declares it, which says which
-            // enum is meant as plainly as naming the enum would.
-            module_variant_solved(cx, span, named_at, receiver, member, args, expected) match
-                VsFound(en, v) -> return variant_call(cx, span, en, v, args)
-                VsSaid -> return bad_expr(span)
-                VsNone -> ()
-
             // **A TYPE reached through the module it belongs to**, which is the other half of the
             // function case above: `c.InBuffer(p, n, 0)` is the struct's constructor, `c.Mode(n)` an
             // enum's checked cast and `c.Tick(n)` a constrained type's, each exactly what the
@@ -242,6 +235,15 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             val a_type = dotted.is_some() && lookup_type_key(cx.an, cx.scope, dotted.unwrap()).is_some()
 
             cx.an.tables.reference_at = span_zero()
+
+            // `m.Hit(5)` -- a variant named through the MODULE that declares it, which says which
+            // enum is meant as plainly as naming the enum would. Where the module also declares a
+            // TYPE of that name, the choice is the one the bare name makes in the module's own file:
+            // the variant where the expected type names its enum, the type everywhere else.
+            module_variant_solved(cx, span, named_at, receiver, member, args, expected, a_type) match
+                VsFound(en, v) -> return variant_call(cx, span, en, v, args)
+                VsSaid -> return bad_expr(span)
+                VsNone -> ()
 
             if a_type then return named_call(cx, span, callee, dotted.unwrap(), args, expected)
 
@@ -1445,13 +1447,26 @@ end qualified_variant_solved
 
 // The same where the name in front of the dot is the MODULE: the enum is the one the module declares
 // the variant in, and a generic one is settled the way it would be through its own name -- the
-// position first, then the values.
+// position first, then the values. `type_too` says the module also declares a type of the name, which
+// then answers wherever the expected type does not name the variant's enum.
 private module_variant_solved(cx: &Analyzer, span: Span, named_at: Span, receiver: Expr,
                               member: string, args: Buf[Expr],
-                              expected: Option[Type]) -> VariantSolve
+                              expected: Option[Type], type_too: bool) -> VariantSolve
     val homes = module_variant_homes(cx, receiver, member)
 
     if homes.is_empty() then return VsNone
+
+    if type_too
+        val named = expected_variant(member, expected)
+
+        if named.is_none() then return VsNone
+
+        for i in 0..<homes.len()
+            if instantiation_of_key(named.unwrap().0, homes.at(i)) then
+                return VsFound(named.unwrap().0, named.unwrap().1)
+
+        return VsNone
+    end if
 
     if homes.len() > 1
         module_variant_ambiguous(cx, named_at, homes, member)
