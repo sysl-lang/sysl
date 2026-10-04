@@ -1,0 +1,289 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// Diagnostics for trait objects -- the reference's `TraitObjectErrorTests`: what a trait has to look
+// like before an object can be formed at all, what a value has to be before it can be erased into
+// one, and what an object still offers once it has been.
+//
+// **Every refusal here was read out of the reference compiler's own `emit-llvm`** on the same
+// program: its whole first line and the `line:column` it anchors at.
+
+// Everything a source has to say for itself, taken the whole way through the lowering; empty when
+// it lowers cleanly.
+private toe_said(text: string) -> string
+    val root = make_temp_dir("sysl-toe").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end toe_said
+
+// Refused with this first line, anchored at this `line:column` of `main.sysl`.
+private toe_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val said = toe_said(text)
+
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"main.sysl:$at\n"), said)
+end toe_refused
+
+// The whole lowered text of a one-file program, or nothing without the library. A program that
+// does not lower cleanly fails the test here, naming what it said.
+private toe_ir(text: string) -> Option[string]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-toe").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val made = emit_llvm_text(root, None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    made match
+        Err(why) ->
+            assert(false, failure_text(why))
+            None
+        Ok(emitted) ->
+            assert(emitted.report.is_empty(), analysis_report(emitted.report))
+            Some(emitted.text)
+end toe_ir
+
+// The reference suite's `shape`: one trait, one type implementing it, and one that does not. Nine
+// lines, so a statement after it is on line 10.
+private toe_shape() -> string = raw"""
+    trait Shape
+        area(self) -> int
+    struct Rect
+        w: int
+        h: int
+    impl Shape for Rect
+        area(self) -> int = self.w * self.h
+    struct Plain
+        n: int
+    """
+
+// ---- object safety ----
+
+// A bare `*Add` is `*Add[Self, Self]`, and both arguments would have to be the type the object
+// forgot -- so the advice is a spelling rather than "this trait cannot be erased".
+@test("an operator trait is refused bare, because its arguments default to 'Self'")
+toe_an_operator_trait_is_refused_bare()
+    toe_refused("var s: *Add = 1",
+                "'Rhs' defaults to 'Self', which names the type implementing 'sysl.Add', and an object " +
+                "has forgotten which type it holds — write the argument", "1:9")
+
+// The arguments being written leave the signature with no `Self` in it, so object safety is no
+// longer what stops this: a built-in's membership is the compiler's rule, with nothing to point at.
+@test("an operator trait at written arguments is not what object safety refuses")
+toe_an_operator_trait_at_written_arguments()
+    if xvr_no_library() then return
+
+    val said = toe_said("var s: *Add[int, int] = 1")
+
+    assert(!said.contains("mentions 'Self' away from its receiver"), said)
+    toe_refused("var s: *Add[int, int] = 1",
+                "int is a 'sysl.Add[int, int]' by the compiler's rule rather than through an 'impl', " +
+                "and a *sysl.Add[int, int] holds a table of functions — what the compiler provides " +
+                "for a built-in is an instruction or a rendering, and neither is a function the table " +
+                "could point at", "1:25")
+end toe_an_operator_trait_at_written_arguments
+
+@test("so is a 'Self' result")
+toe_so_is_a_self_result()
+    toe_refused("trait Copy\n    copy(self) -> Self\nvar c: *Copy = 1",
+                "'copy' of 'Copy' mentions 'Self' away from its receiver, and an erased value has " +
+                "forgotten which type that is — so there is no '*Copy' to form", "3:9")
+
+@test("a 'Self' buried inside another type is found too")
+toe_a_self_buried_inside_another_type()
+    toe_refused("trait Pair\n    pair(self, other: *Self) -> int\nvar p: *Pair = 1",
+                "'pair' of 'Pair' mentions 'Self' away from its receiver, and an erased value has " +
+                "forgotten which type that is — so there is no '*Pair' to form", "3:9")
+
+// Object safety is all-or-nothing: `Make` declares a dispatchable `use` beside the associated
+// function, and the answer is that there is no `*Make`, rather than a `*Make` without `build`.
+@test("an associated function has no receiver to dispatch on, and takes the whole trait with it")
+toe_an_associated_function_takes_the_whole_trait()
+    toe_refused("trait Make\n    build() -> int\n    use(self) -> int\nvar m: *Make = 1",
+                "'Make' declares the associated function 'build', which has no receiver to dispatch " +
+                "on — so there is no '*Make' to form", "4:9")
+
+// A `&self` method wants its receiver inside a box, which only the counted object carries -- the
+// one rule that depends on which sigil was written.
+private toe_counted_self() -> string = raw"""
+    trait T
+        go(&self)
+        v(self) -> int
+    struct S
+        n: int
+    impl T for S
+        go(&self)
+            self.n += 1
+        v(self) -> int = self.n
+    """
+
+@test("a '&self' method is refused by a raw object and accepted by a counted one")
+toe_a_ref_self_method_needs_a_counted_object()
+    toe_refused(toe_counted_self() + "var m: *T = 1",
+                "'go' of 'T' takes '&self', so it needs its receiver inside a reference-counted box " +
+                "— '*T' points straight at a value, so write '&T' instead", "10:9")
+
+    val ir = toe_ir(toe_counted_self() + "var m: &T = S(1)\nm.go()\nprint(m.v())")
+
+    if ir.is_some() then assert(ir.unwrap().contains("@vt.ref.T.S"), ir.unwrap())
+end toe_a_ref_self_method_needs_a_counted_object
+
+// ---- forming one ----
+
+@test("a bare trait name is not a type")
+toe_a_bare_trait_name_is_not_a_type()
+    toe_refused(toe_shape() + "var s: Shape = Rect(1, 2)",
+                "'Shape' is a trait, so it describes behaviour rather than a layout — write '*Shape' or " +
+                "'&Shape' for a trait object, or bound a type parameter with '[T: Shape]'", "10:8")
+
+@test("a type with no 'impl' cannot be erased")
+toe_a_type_with_no_impl_cannot_be_erased()
+    toe_refused(toe_shape() + "var p = Plain(1)\nvar s: *Shape = &p",
+                "a *Shape needs a type that implements 'Shape', and Plain does not", "11:17")
+
+// A raw object points at a value that has to be somewhere; taking the address of a temporary
+// silently would put a dangling pointer in the program.
+@test("a raw object needs an address, not a value")
+toe_a_raw_object_needs_an_address()
+    toe_refused(toe_shape() + "var s: *Shape = Rect(1, 2)",
+                "a *Shape points at a value, so it needs an address — write '&' in front of the Rect to " +
+                "take one", "10:17")
+
+// A closure has no name, so it is described as "a closure", and that description's article is the
+// one the sentence already supplies.
+@test("and the advice reads correctly for a closure, which is described rather than named")
+toe_the_advice_reads_correctly_for_a_closure()
+    val text = "take(f: *Fn(int) -> unit) = f(1)\n\ntake((n) -> print(n))\n"
+
+    toe_refused(text, "a *Fn(int) -> unit points at a value, so it needs an address — write '&' in " +
+                "front of the closure to take one", "3:6")
+
+    if xvr_no_library() then return
+
+    val said = toe_said(text)
+
+    assert(!said.contains("the a closure"), said)
+end toe_the_advice_reads_correctly_for_a_closure
+
+// An object satisfies a bound on the trait it dispatches through and on nothing else -- the table
+// it carries is what answers the bound.
+@test("a bound on some other trait is still not satisfied by an object")
+toe_a_bound_on_some_other_trait()
+    val text = toe_shape() + "trait Other\n    other(self) -> int\nf[T: Other](x: T) -> int = x.other()\n" +
+               "var r = Rect(1,2)\nvar s: *Shape = &r\nprint(f(s))"
+
+    toe_refused(text, "'f' requires its type parameter 'T' to implement 'Other', but *Shape does not",
+                "15:7")
+end toe_a_bound_on_some_other_trait
+
+// Erasing again is a different question from satisfying a bound, and only the second of them the
+// table can answer.
+@test("and an object may not be erased into the object of another trait")
+toe_an_object_may_not_be_erased_again()
+    val text = toe_shape() + "trait Other\n    other(self) -> int\nvar r = Rect(1,2)\n" +
+               "var s: *Shape = &r\nvar t: *Other = s"
+
+    toe_refused(text, "a *Shape has forgotten which type it holds, so there is nothing for a *Other to " +
+                "be built from — 'Other' is reachable *through* the value, and a bound on it is " +
+                "satisfied by one, but its slots are not a table of their own", "14:17")
+end toe_an_object_may_not_be_erased_again
+
+// ---- using one ----
+
+@test("it cannot be dereferenced")
+toe_it_cannot_be_dereferenced()
+    toe_refused(toe_shape() + "var r = Rect(1,2)\nvar s: *Shape = &r\nprint((*s).w)",
+                "a *Shape has forgotten what it points at, so there is no value to read through it — " +
+                "call one of the trait's methods instead", "12:8")
+
+@test("it has no fields")
+toe_it_has_no_fields()
+    toe_refused(toe_shape() + "var r = Rect(1,2)\nvar s: *Shape = &r\nprint(s.w)",
+                "a *Shape has no fields, and trait 'Shape' declares no 'w'", "12:9")
+
+@test("a method the trait does not declare is refused, and the ones it does are named")
+toe_a_method_the_trait_does_not_declare()
+    toe_refused(toe_shape() + "var r = Rect(1,2)\nvar s: *Shape = &r\nprint(s.nope())",
+                "trait 'Shape' declares no method 'nope' — it has 'area'", "12:9")
+
+@test("a call is checked against the trait's own signature")
+toe_a_call_is_checked_against_the_trait()
+    toe_refused(toe_shape() + "var r = Rect(1,2)\nvar s: *Shape = &r\nprint(s.area(1))",
+                "method 'Shape.area' takes 0 arguments, but 1 argument was given", "12:9")
+
+// Two objects over one value through different traits are the same value and different tables, so
+// what equality would mean is the trait's question rather than the machine's.
+@test("two objects do not compare")
+toe_two_objects_do_not_compare()
+    toe_refused(toe_shape() + "var r = Rect(1,2)\nvar a: *Shape = &r\nprint(a == a)",
+                "'==' is not defined for *Shape", "12:7")
+
+@test("a counted object is never absent")
+toe_a_counted_object_is_never_absent()
+    toe_refused(toe_shape() + "var s: &Shape = null",
+                "'null' is a raw pointer, and &Shape was expected here", "10:17")
+
+// ---- the two sigils do not convert ----
+
+@test("a counted object is not accepted where a raw one is wanted")
+toe_a_counted_object_where_a_raw_one_is_wanted()
+    toe_refused(toe_shape() + "f(s: *Shape) -> int = s.area()\nvar o: &Shape = Rect(3, 4)\nprint(f(o))",
+                "'s' of 'f' is *Shape, but &Shape was given", "12:9")
+
+// A raw object points at a value with no count to take a share of, so accepting one would be
+// inventing ownership.
+@test("a raw object is not accepted where a counted one is wanted")
+toe_a_raw_object_where_a_counted_one_is_wanted()
+    toe_refused(toe_shape() + "f(s: &Shape) -> int = s.area()\nvar r = Rect(3, 4)\nvar o: *Shape = &r\n" +
+                "print(f(o))", "'s' of 'f' is &Shape, but *Shape was given", "13:9")
+
+// `&*r` lends a plain reference to a `*T` parameter; an object has no dereference, so the same
+// spelling has nothing to say.
+@test("and the lend that works for a plain reference has nothing to say about an object")
+toe_the_lend_has_nothing_to_say_about_an_object()
+    toe_refused(toe_shape() + "f(s: *Shape) -> int = s.area()\nvar o: &Shape = Rect(3, 4)\nprint(f(&*o))",
+                "a &Shape has forgotten what it points at, so there is no value to read through it — " +
+                "call one of the trait's methods instead", "12:10")
+
+// ---- erasure keeps one trait ----
+
+// An object offers the trait's members and nothing else, and what lifts that is the trait
+// requiring `Display` -- a word on the declaration, not a cast at the use.
+@test("erasing drops the other traits the type implements")
+toe_erasing_drops_the_other_traits()
+    val text = raw"""
+        trait Shape
+            area(self) -> int
+        struct Rect
+            w: int
+            h: int
+        impl Shape for Rect
+            area(self) -> int = self.w * self.h
+        impl Display for Rect
+            display(self, out: *Writer, fmt: FormatSpec) = display_str("a rect", out, fmt)
+        var r = Rect(3, 4)
+        print(f"${r}")
+        var o: &Shape = Rect(3, 4)
+        print(f"${o}")
+        """
+
+    toe_refused(text, "cannot make a string of a &Shape value — an object offers what its trait " +
+                "declares and what that trait requires, so write 'trait Shape: sysl.Display' to keep " +
+                "the rendering the value had before it was erased", "13:7")
+end toe_erasing_drops_the_other_traits
