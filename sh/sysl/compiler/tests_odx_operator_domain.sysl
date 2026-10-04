@@ -1,0 +1,289 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// Which operands an operator accepts, and which conversions exist -- `01`'s two tables read as
+// claims rather than as prose, ported from the reference's `OperatorDomainTests` case for case. Each
+// says something is defined or is refused, and a claim of the second kind is the one worth pinning: a
+// refusal that quietly stops being one is invisible, because every program already written keeps
+// compiling.
+//
+// **Every string quoted here was read out of the reference compiler** (0.0.159). The helpers are
+// `tests_enm_enum_run.sysl`'s.
+
+// The entry point's lowered text alone, so a shift the library lowers somewhere cannot answer for one
+// the program wrote.
+private odx_main_of(ir: string) -> string
+    val at = ir.index_of("define i32 @main(").unwrap_or(0)
+    val rest = ir[at..<ir.len]
+    val close = rest.index_of("\n}").unwrap_or(rest.len)
+
+    rest[0..<close]
+end odx_main_of
+
+// The two views of one slice, a writable one and a read-only one over equal contents.
+private odx_views() -> string = raw"""
+    var a = [1, 2, 3]
+    var b = [1, 2, 3]
+    val c: []const int = b[..]
+    val w: []int = a[..]
+    """
+
+// -- equality reaches further than ordering
+
+@test("a bool compares equal and unequal")
+odx_a_bool_compares_equal_and_unequal()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("print(true == true, true != false)\n"), "true true\n")
+
+@test("and has no ordering, which is the half of `01`'s sentence that is a refusal")
+odx_a_bool_has_no_ordering()
+    if !enm_ready() then return
+
+    val out = enm_err("print(true < false)\n")
+
+    assert(enm_says(out, "'<' is not defined for bool"), out)
+
+// -- unary operators take the types that have the operation
+
+@test("complement is defined on every integer type, signed or not")
+odx_complement_is_defined_on_every_integer_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var a: u8 = 1
+        var b: i16 = 1
+        var c: u128 = 0
+        print(~a, ~b)
+        print(~c)
+        """), "254 -2\n340282366920938463463374607431768211455\n")
+
+@test("and negation needs a type with a sign")
+odx_negation_needs_a_type_with_a_sign()
+    if !enm_ready() then return
+
+    val out = enm_err("var a: u8 = 1\nprint(-a)\n")
+
+    assert(enm_says(out, "unary '-' is not defined for the unsigned type byte"), out)
+
+// -- remainder is integer-only, at the operator and at the bound
+//
+// `reference/expressions.md § Operator dispatch` gives `Rem`'s membership to the integers rather than
+// to the numeric types, since a wider membership would promise a bounded generic an operation that
+// fails at the instantiation the bound was meant to have proven. So there are two refusals, one at
+// the operator and one at the bound.
+
+@test("a float has no remainder to lower")
+odx_a_float_has_no_remainder_to_lower()
+    if !enm_ready() then return
+
+    val out = enm_err("print(5.0 % 2.0)\n")
+
+    assert(enm_says(out, "operator '%' is not defined for real"), out)
+
+@test("and does not satisfy a 'Rem' bound either")
+odx_a_float_does_not_satisfy_a_rem_bound()
+    if !enm_ready() then return
+
+    val out = enm_err("m[T: Rem](a: T, b: T) -> T = a % b\nprint(m(5.0, 2.0))\n")
+
+    assert(enm_says(out, "requires its type parameter 'T' to implement 'sysl.Rem', but real does not"), out)
+
+@test("while an integer does both")
+odx_an_integer_does_both()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("m[T: Rem](a: T, b: T) -> T = a % b\nprint(m(20, 7), 20 % 7)\n"), "6 6\n")
+
+// -- both operands of a binary operator have the same type
+
+// Both widths are named, and by their alias: a width with a friendly name is shown by it whichever
+// spelling the program used, so `u8` is reported as `byte`.
+@test("two widths do not mix, and the message names both")
+odx_two_widths_do_not_mix()
+    if !enm_ready() then return
+
+    val out = enm_err(raw"""
+        var a: u8 = 1
+        var b: u16 = 2
+        print(a + b)
+        """)
+
+    assert(enm_says(out, "'+' needs matching types, got byte and ushort"), out)
+
+@test("a width with no alias is shown by its systematic name")
+odx_a_width_with_no_alias_is_shown_by_its_systematic_name()
+    if !enm_ready() then return
+
+    val out = enm_err(raw"""
+        var a: u12 = 1
+        var b: u20 = 2
+        print(a + b)
+        """)
+
+    assert(enm_says(out, "'+' needs matching types, got u12 and u20"), out)
+
+// A shift is the exception: `x << n` asks for `x` shifted `n` places, so `n`'s width has nothing to
+// do with `x`'s -- as C, Rust, Java, Go and Scala all read it.
+@test("except a shift, whose right operand is a count and may be any integer width")
+odx_a_shift_count_may_be_any_integer_width()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var x: u8 = 1
+        var k: u16 = 2
+        print(x << k)
+        """), "4\n")
+
+@test("and the conversion still compiles, meaning the same thing")
+odx_the_shift_conversion_still_compiles()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var x: u8 = 1
+        var k: u16 = 2
+        print(x << u8(k))
+        """), "4\n")
+
+@test("but the count must still be an integer, and the message names it as a count")
+odx_the_shift_count_must_be_an_integer()
+    if !enm_ready() then return
+
+    val out = enm_err("var x: u8 = 1\nprint(x << 1.5)\n")
+
+    assert(enm_says(out, "'<<' shifts by a count, and real is not an integer"), out)
+
+// The one pair with a meeting point: a `[]T` and a `[]const T` are one type with a bit, and the
+// writable one is accepted wherever the read-only one is wanted -- in either order.
+
+@test("with the read-only view on the left")
+odx_the_read_only_view_on_the_left()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(odx_views() + "print(c == w)\n"), "true\n")
+
+@test("and on the right, which is the half that was refused")
+odx_the_read_only_view_on_the_right()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(odx_views() + "print(w == c)\n"), "true\n")
+
+// A slicing expression rather than a name, since an expression can be re-read at a type it was not
+// first given and a name cannot -- so the pair has to be settled rather than one side adapted.
+@test("however the writable side is spelled")
+odx_however_the_writable_side_is_spelled()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(odx_views() + "print(a[..] == c, c == a[..])\n"), "true true\n")
+
+@test("while two writable views settle on the writable type as before")
+odx_two_writable_views_settle_as_before()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(odx_views() + "print(a[..] == b[..])\n"), "true\n")
+
+// -- a literal takes its type from its position, and a suffixed one never adapts
+
+@test("the other operand of a binary operator is one of those positions")
+odx_the_other_operand_is_a_position()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var n: u8 = 250\nprint(n + 5)\n"), "255\n")
+
+@test("two literals with nothing to go on both take the default, so `1 << 2` is an int")
+odx_two_literals_take_the_default()
+    if !enm_ready() then return
+
+    val ir = enm_ir("print(1 << 2)\n")
+
+    assert(odx_main_of(ir).contains("shl i32"), ir)
+
+@test("a suffix fixes the type on the spot, and the other operand must already match it")
+odx_a_suffix_fixes_the_type_on_the_spot()
+    if !enm_ready() then return
+
+    val out = enm_err("var n: u16 = 1\nprint(n + 5u8)\n")
+
+    assert(enm_says(out, "'+' needs matching types, got ushort and byte"), out)
+
+@test("a suffixed literal in a position expecting another width is refused rather than adapted")
+odx_a_suffixed_literal_is_refused_rather_than_adapted()
+    if !enm_ready() then return
+
+    val out = enm_err("var x: u8 = 42i32\n")
+
+    assert(enm_says(out, "cannot initialize 'x': declared byte but the value is int"), out)
+
+// -- `usize` and `isize` are distinct types, not aliases
+
+@test("so a fixed-width value of the same size still needs the cast written")
+odx_a_fixed_width_value_still_needs_the_cast()
+    if !enm_ready() then return
+
+    val out = enm_err("var n: u64 = 7\nvar k: usize = n\n")
+
+    assert(enm_says(out, "cannot initialize 'k': declared usize but the value is ulong"), out)
+
+@test("and the cast is ordinary in both directions")
+odx_the_cast_is_ordinary_in_both_directions()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var n: u64 = 7
+        var k: usize = usize(n)
+        var back: u64 = u64(k)
+        print(k, back)
+        """), "7 7\n")
+
+@test("the two of them do not mix with each other either")
+odx_usize_and_isize_do_not_mix()
+    if !enm_ready() then return
+
+    val out = enm_err("var k: usize = 1\nvar j: isize = 1\nprint(k + j)\n")
+
+    assert(enm_says(out, "'+' needs matching types, got usize and isize"), out)
+
+// -- the conversions that do not exist
+
+@test("nothing converts to or from bool")
+odx_nothing_converts_to_or_from_bool()
+    if !enm_ready() then return
+
+    val to = enm_err("print(int(true))\n")
+    val from = enm_err("print(bool(0))\n")
+
+    assert(enm_says(to, "cannot convert bool to int"), to)
+    assert(enm_says(from, "cannot convert int to bool"), from)
+
+@test("a number is not a string, in either direction")
+odx_a_number_is_not_a_string()
+    if !enm_ready() then return
+
+    val to = enm_err("print(int(\"5\"))\n")
+    val from = enm_err("print(string(5))\n")
+
+    assert(enm_says(to, "cannot convert string to int"), to)
+    assert(enm_says(from, "a 'string' conversion encodes a char, and int is not one — 'str(x)' renders a value as text"), from)
+
+@test("and a char is the one primitive a `string` conversion does take")
+odx_a_char_is_the_one_primitive_a_string_conversion_takes()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("print(string('q'))\n"), "q\n")
+
+// -- the two conversions `01` calls out as partial or total
+
+@test("every char is an integer")
+odx_every_char_is_an_integer()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("print(u32('A'), u32('\\u{10FFFF}'))\n"), "65 1114111\n")
+
+@test("and an integer is a char only when it names one")
+odx_an_integer_is_a_char_only_when_it_names_one()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("print(char(65u32))\n"), "A\n")
+    assert_eq(enm_exits("print(char(1114112u32))\n"), "")
