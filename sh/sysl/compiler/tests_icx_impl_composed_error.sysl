@@ -1,0 +1,326 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// What an `impl` may and may not be *for*, now that the type it names is a full type reference
+// rather than a name. A slice and an array are types, so they carry an `impl`; the refusals are each
+// about a shape an implementation could not be about -- a memory mode, which is a way of holding a
+// type; a trait object, which has forgotten which type it holds; and one instantiation of a generic
+// type, whose block covers every instantiation at once. Ported from the reference's
+// `ImplComposedErrorTests.scala` case for case.
+//
+// **Every message and output here was read out of the reference compiler (0.0.162)** by handing the
+// installed `sysl` the same program. The harness is `tests_xvr_extern_var.sysl`'s: `xvr_ir` lowers a
+// program or answers its report, `xvr_ran` builds, links and runs it.
+
+private icx_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+private icx_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+// That a program is refused in the words given.
+private icx_refused(text: string, said: string)
+    val e = icx_ir(text)
+
+    assert(e.contains(said), s"expected '$said', got: $e")
+
+private icx_show() -> string = "trait Show\n    show(self) -> string\n"
+
+private icx_two_traits() -> string = raw"""
+    trait A
+        go(self) -> int
+    trait B
+        go(self) -> int
+    impl A for []int
+        go(self) -> int = 1
+    impl B for []int
+        go(self) -> int = 2
+    """
+
+// -- a shape an impl cannot be about --------------------------------------------------------------
+
+@test("a raw pointer is a way of holding a type, not one of its own")
+icx_a_raw_pointer_is_a_way_of_holding()
+    if xvr_no_library() then return
+
+    val e = icx_ir(icx_show() + "struct P\n    v: int\nimpl Show for *P\n    show(self) -> string = \"p\"")
+
+    assert(e.contains("'*P' is a way of holding a P rather than a type of its own — write the 'impl' for P, which a member call reaches through one '*' to find"), e)
+
+@test("a counted reference is refused the same way")
+icx_a_counted_reference_is_refused_the_same_way()
+    if xvr_no_library() then return
+
+    icx_refused(icx_show() + "struct P\n    v: int\nimpl Show for &P\n    show(self) -> string = \"p\"",
+                "'&P' is a way of holding a P rather than a type of its own — write the 'impl' for P, which a member call reaches through one '&' to find")
+
+@test("a sync reference names its own spelling in the complaint")
+icx_a_sync_reference_names_its_own_spelling()
+    if xvr_no_library() then return
+
+    icx_refused(icx_show() + "struct P\n    v: int\nimpl Show for &sync P\n    show(self) -> string = \"p\"",
+                "'&sync P' is a way of holding a P rather than a type of its own — write the 'impl' for P, which a member call reaches through one '&sync' to find")
+
+// The one thing an `impl` says is how *one particular* type behaves, which is exactly the fact an
+// erased value no longer carries.
+@test("a trait object has already forgotten which type it holds")
+icx_a_trait_object_has_forgotten_its_type()
+    if xvr_no_library() then return
+
+    icx_refused(icx_show() + "impl Show for *Show\n    show(self) -> string = \"s\"",
+                "'*Show' has forgotten which type it holds, and an 'impl' says how one particular type behaves — so it is written for that type, not for an object over it")
+
+// An implementation for one instantiation is a second implementation for a key that holds one,
+// which is why the fix is the block that covers the type as a whole.
+@test("an applied generic type is refused, naming the block to write instead")
+icx_an_applied_generic_type_is_refused()
+    if xvr_no_library() then return
+
+    icx_refused(icx_show() + "struct Box[T]\n    v: T\nimpl Show for Box[int]\n    show(self) -> string = \"b\"",
+                "'Box' is generic, so an 'impl' for it covers every instantiation at once — write 'impl[T] Show for Box[T]'")
+
+@test("an element type that does not exist is an unknown type, not a bad impl")
+icx_an_unknown_element_type()
+    if xvr_no_library() then return
+
+    icx_refused(icx_show() + "impl Show for []Ghost\n    show(self) -> string = \"g\"", "unknown type 'Ghost'")
+
+// -- the type is the key, not the spelling --------------------------------------------------------
+
+@test("two spellings of one slice are one implementation")
+icx_two_spellings_of_one_slice()
+    if xvr_no_library() then return
+
+    icx_refused(icx_show() + raw"""
+        impl Show for []int
+            show(self) -> string = "a"
+        impl Show for []i32
+            show(self) -> string = "b"
+        """, "'[]int' already implements 'Show'")
+
+// The length is part of an array's type, so the first two are two types and the second is no
+// duplicate -- what makes this a rejection is the *third* block, which repeats one of them.
+@test("two arrays of one length and element type are one implementation")
+icx_two_arrays_of_one_length()
+    if xvr_no_library() then return
+
+    icx_refused(icx_show() + raw"""
+        impl Show for [2]int
+            show(self) -> string = "a"
+        impl Show for [3]int
+            show(self) -> string = "b"
+        impl Show for [2]int
+            show(self) -> string = "c"
+        """, "'[2]int' already implements 'Show'")
+
+// -- conformance names the type as a diagnostic writes it -----------------------------------------
+
+@test("a missing member is reported against the slice")
+icx_a_missing_member_against_the_slice()
+    if xvr_no_library() then return
+
+    icx_refused(icx_show() + "impl Show for []int", "'[]int' does not implement 'Show': method 'show' is missing")
+
+@test("a mismatched result names the trait's")
+icx_a_mismatched_result_names_the_traits()
+    if xvr_no_library() then return
+
+    icx_refused(icx_show() + "impl Show for []int\n    show(self) -> int = 1",
+                "method 'show' returns int, but trait 'Show' declares string")
+
+// -- a compiler-provided member may not be hidden -------------------------------------------------
+
+// `len` is reached ahead of the member table, so a member of that name would be registered and
+// never found. It is the built-in analogue of an `impl` method colliding with a field.
+@test("a slice's len is out of reach for an impl")
+icx_a_slices_len_is_out_of_reach()
+    if xvr_no_library() then return
+
+    icx_refused(raw"""
+        trait Size
+            len -> usize
+        impl Size for []int
+            len -> usize = 0usize
+        """, "'len' is a member the compiler provides for []int — a member of this name would hide it")
+
+@test("a string's bytes are too")
+icx_a_strings_bytes_are_too()
+    if xvr_no_library() then return
+
+    icx_refused(raw"""
+        trait Raw
+            bytes -> []u8
+        impl Raw for string
+            bytes -> []u8 = self.bytes
+        """, "'bytes' is a member the compiler provides for string — a member of this name would hide it")
+
+@test("an array's len is too")
+icx_an_arrays_len_is_too()
+    if xvr_no_library() then return
+
+    icx_refused(raw"""
+        trait Size
+            len -> usize
+        impl Size for [3]int
+            len -> usize = 0usize
+        """, "'len' is a member the compiler provides for [3]int — a member of this name would hide it")
+
+// -- the end marker closes the type it opened -----------------------------------------------------
+
+@test("a matching one is accepted")
+icx_a_matching_end_marker_is_accepted()
+    if xvr_no_library() then return
+
+    val ir = icx_ir(icx_show() + raw"""
+        impl Show for []int
+            show(self) -> string = "s"
+        end []int
+        var a = [1]
+        print(a[0..].show())
+        """)
+
+    assert(ir.contains("define { ptr, ptr, i64 } @slice.int.show({ ptr, ptr, i64 } %self.param) {"), ir)
+    assert(ir.contains("@slice.int.show("), ir)
+
+@test("a different one is a parse error naming both")
+icx_a_different_end_marker_names_both()
+    if xvr_no_library() then return
+
+    icx_refused(icx_show() + "impl Show for []int\n    show(self) -> string = \"s\"\nend []bool",
+                "'end []bool' does not match '[]int'")
+
+// The marker matches the *spelling*, exactly as `end Point` does -- nothing has resolved either
+// reference when the parser compares them, so an alias of the same type is a different marker.
+@test("another spelling of the same type does not match it")
+icx_another_spelling_does_not_match()
+    if xvr_no_library() then return
+
+    icx_refused(icx_show() + "impl Show for []int\n    show(self) -> string = \"s\"\nend []i32",
+                "'end []i32' does not match '[]int'")
+
+// -- two impls for one composed type share its member table ---------------------------------------
+
+// A composed type's members are one namespace like any other type's, and like any other type's that
+// namespace is per trait (`reference/modules.md § Visibility`): both blocks are accepted, because
+// which `go` a use means is a question about what the file can name rather than about the slice.
+@test("so both are filed, and the declarations stand")
+icx_both_are_filed()
+    if xvr_no_library() then return
+
+    assert_eq(icx_ran(icx_two_traits() + "main()\n    print(\"ok\")"), "ok\n")
+
+// What used to be reported at the second `impl` is reported at the use that reaches both -- the
+// later point, and the only one that knows a program actually wrote something ambiguous.
+@test("and a call reaching both is what is refused")
+icx_a_call_reaching_both_is_refused()
+    if xvr_no_library() then return
+
+    icx_refused(icx_two_traits() + "main()\n    var a = [1, 2]\n    print(a[0..].go())",
+                "'go' on []int comes from A and B, and each is in scope here — nothing in the call says which was meant")
+
+// -- reaching a member that is not there ----------------------------------------------------------
+
+@test("a slice with no impl has no method of that name")
+icx_a_slice_with_no_impl_has_no_method()
+    if xvr_no_library() then return
+
+    icx_refused("var a = [1, 2]\nprint(a[0..].show())", "type '[]int' has no method 'show'")
+
+// Neither a slice nor an array reaches the "write an impl" advice any more, and for one reason: the
+// library covers both. What a `[]P` or a `[2]P` fails is that block's condition, so the diagnostic
+// names the element that does not render rather than telling the reader to write a block.
+@test("printing a composed type names the element its covering block asks about")
+icx_printing_a_composed_type_names_the_element()
+    if xvr_no_library() then return
+
+    icx_refused("struct P\n    v: int\nvar a = [P(1), P(2)]\nprint(a)",
+                "cannot print a [2]P value — the 'impl' that covers it asks 'sysl.Display' of P, which does not implement it")
+
+@test("and the slice of them says the same thing")
+icx_the_slice_of_them_says_the_same()
+    if xvr_no_library() then return
+
+    icx_refused("struct P\n    v: int\nvar a = [P(1), P(2)]\nprint(a[0..])",
+                "cannot print a []P value — the 'impl' that covers it asks 'sysl.Display' of P, which does not implement it")
+
+// One level at a time, through however many shapes it takes: the block covering `[2][1]P` asks
+// about `[1]P`, and the block covering that one is what asks about `P`.
+@test("and an array of them names the array, not the bottom of it")
+icx_an_array_of_them_names_the_array()
+    if xvr_no_library() then return
+
+    icx_refused("struct P\n    v: int\nvar a = [[P(1)], [P(2)]]\nprint(a)",
+                "cannot print a [2][1]P value — the 'impl' that covers it asks 'sysl.Display' of [1]P, which does not implement it")
+
+// A `[2]int`, where nothing in the subject is the program's, so any block named as advice would be
+// one coherence refuses. It prints, which is the strongest form of not naming an impossible block.
+@test("while an array of a built-in simply prints")
+icx_an_array_of_a_builtin_prints()
+    if xvr_no_library() then return
+
+    assert_eq(icx_ran("var a = [1, 2]\nprint(a)"), "[1, 2]\n")
+
+// Advice naming something the compiler refuses is worse than none: the coherence rule refuses the
+// block as having no home, and nothing tells the reader to write that very block.
+@test("so a program that tries the advice is not told to try it again")
+icx_the_advice_is_not_repeated()
+    if xvr_no_library() then return
+
+    val e = icx_ir(raw"""
+        impl Display for [2]int
+            display(self, out: *Writer, fmt: FormatSpec)
+                display_str("ints", out, fmt)
+
+        var a = [1, 2]
+        print(a)
+        """)
+
+    assert(e.contains("and 'sysl.Display' is the library's while nothing in '[2]int' is declared outside the library — so this one has no home"), e)
+    assert(!e.contains("write an 'impl sysl.Display for"), e)
+
+// Both renderers ask one function, so an interpolation gets whatever print gets.
+@test("and an interpolation renders an array as print does")
+icx_an_interpolation_renders_an_array()
+    if xvr_no_library() then return
+
+    assert_eq(icx_ran(raw"""
+        var a = [1, 2]
+        print(f"${a}")
+        """), "[1, 2]\n")
+
+// The unprintable element reaches the interpolation the same way, and says the same thing.
+@test("while an unprintable element reaches it as the same condition")
+icx_an_unprintable_element_in_an_interpolation()
+    if xvr_no_library() then return
+
+    icx_refused(raw"""
+        struct P
+            v: int
+        var a = [P(1), P(2)]
+        print(f"${a}")
+        """, "cannot make a string of a [2]P value — the 'impl' that covers it asks 'sysl.Display' of P, which does not implement it")
+
+// A memory mode is one of the shapes an `impl` may not be for, so there is nothing to suggest.
+@test("printing a pointer says only that it does not render")
+icx_printing_a_pointer()
+    if xvr_no_library() then return
+
+    icx_refused("struct P\n    v: int\nvar p = P(1)\nprint(&p)", "cannot print a *P value — it does not implement 'sysl.Display'")
+
+// -- erasing a frame-owned slice ------------------------------------------------------------------
+
+// Erasing a view into a trait object is an escape, answered by moving the array to the heap rather
+// than by refusing, so what this checks is that the erasure still happens and still dispatches.
+@test("erasing a frame-owned slice moves the array to the heap")
+icx_erasing_a_frame_owned_slice()
+    if xvr_no_library() then return
+
+    assert_eq(icx_ran(raw"""
+        trait Show
+            show(self) -> string
+        impl Show for []int
+            show(self) -> string = "s"
+        name(t: &Show) -> string = t.show()
+        var a = [1, 2]
+        print(name(a[0..]))
+        """), "s\n")
