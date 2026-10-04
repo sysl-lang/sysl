@@ -1,0 +1,465 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **Indexing a type the compiler has no elements for — `b[i]` through the library's `Index`.** The
+// element type is an ordinary trait argument the subject binds: `impl[T] Index[usize, T] for Buf[T]`
+// says a `Buf` of anything is indexed by a `usize` and gives back whatever it holds. The open case,
+// `impl[T] From[T] for Wrapper`, settles nothing and stays refused.
+//
+// Every program is an entry file that imports `sysl.buf.*`, and **every output and refusal quoted
+// here was obtained by running the reference compiler on the same source.**
+
+// What a program said, and whether it exited zero — a refusal is the build's failure text.
+private idt_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-index-trait").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", "import sysl.buf.*\n\n" + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture("/bin/sh", ["-c", s"'$exe' < /dev/null"], "", [], true, 60000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end idt_outcome
+
+private idt_can_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end idt_can_run
+
+private idt_ran(text: string) -> string
+    val out = idt_outcome(text)
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+
+// The refusal a program earns; a program that built and ran is reported as such.
+private idt_err(text: string) -> string
+    val out = idt_outcome(text)
+
+    if out.1 then return s"it built and ran: ${out.0}"
+
+    out.0
+
+private idt_refused(text: string, part: string)
+    val said = idt_err(text)
+
+    assert(said.contains(part), said)
+
+// A trait with an index type and an element type, and a struct that keeps two of it.
+private idt_get() -> string = raw"""
+    trait Get[I, E]
+        get(self, i: I) -> E
+    struct Row
+        a: int
+    impl Get[usize, int] for Row
+        get(self, i: usize) -> int = self.a + int(i)
+    impl Get[bool, string] for Row
+        get(self, f: bool) -> string = if f then "yes" else "no"
+    """
+
+// The same trait, implemented once for every `Buf` at the element type the `Buf` holds.
+private idt_buf_get() -> string = raw"""
+    trait Get[I, E]
+        get(self, i: I) -> E
+    impl[T] Get[usize, T] for Buf[T]
+        get(self, i: usize) -> T = self.at(i)
+    """
+
+private idt_env() -> string = raw"""
+    struct Env
+        fallback: int
+    impl Index[string, int] for Env
+        index(self, k: string) -> int = if k == "answer" then 42 else self.fallback
+    """
+
+// -- what the documents claim ---------------------------------------------------------------------
+
+@test("a trait taking two arguments is implemented at two argument lists")
+idt_two_argument_lists()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(idt_get() + "print(Row(3).get(1usize))\nprint(Row(3).get(true))\n"), "4\nyes\n")
+
+// Nothing at the call site wrote the element type; the index selected the implementation.
+@test("the element type comes from the implementation the index selected")
+idt_element_type_from_the_index()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(idt_get() + raw"""
+        var s: string = Row(3).get(false)
+        var n: int = Row(3).get(0usize)
+        print(s, n)
+        """), "no 3\n")
+
+@test("a generic subject may write a trait argument its own type settles")
+idt_generic_subject_settles_the_argument()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(idt_buf_get() + raw"""
+        var b: Buf[string] = buf()
+        b.push("hi")
+        print(b.get(0usize))
+        """), "hi\n")
+
+// The diagnostic names `Get[usize, string]` for a `Buf[string]`, not the `T` the block wrote.
+@test("a bound is met by what the subject makes the argument, and reported that way when it is not")
+idt_bound_reported_at_the_subject_argument()
+    if !idt_can_run() then return
+
+    idt_refused(idt_buf_get() + raw"""
+        firstOf[C: Get[usize, int]](c: C) -> int = c.get(0usize)
+        var s: Buf[string] = buf()
+        s.push("x")
+        print(firstOf(s))
+        """, "requires its type parameter 'C' to implement 'Get[usize, int]', but " +
+        "sysl.buf.Buf[string] does not — it implements 'Get[usize, string]'")
+
+@test("and the same bound is met by the instantiation that does supply it")
+idt_bound_met_by_the_instantiation()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(idt_buf_get() + raw"""
+        firstOf[C: Get[usize, int]](c: C) -> int = c.get(0usize)
+        var a: Buf[int] = buf()
+        a.push(5)
+        print(firstOf(a))
+        """), "5\n")
+
+@test("a Buf is read with a subscript")
+idt_buf_read_with_a_subscript()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(raw"""
+        var b: Buf[int] = buf()
+        b.push(7)
+        b.push(8)
+        print(b[0usize], b[1usize])
+        """), "7 8\n")
+
+@test("and written with one")
+idt_buf_written_with_a_subscript()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(raw"""
+        var b: Buf[int] = buf()
+        b.push(7)
+        b.push(8)
+        b[1usize] = 42
+        print(b[0usize], b[1usize])
+        """), "7 42\n")
+
+// The block's parameters are matched to the subject's positions, not to the order it declared them.
+@test("a conditional block's bound follows the subject's positions, not the order the block wrote")
+idt_conditional_bound_follows_positions()
+    if !idt_can_run() then return
+
+    val src = raw"""
+        trait Show2
+            show2(self) -> string
+        struct Pair[X, Y]
+            a: X
+            b: Y
+        impl Show2 for int
+            show2(self) -> string = "int"
+        impl[A, B: Show2] Show2 for Pair[B, A]
+            show2(self) -> string = "pair"
+        tell[T: Show2](x: T) -> string = x.show2()
+        """
+
+    assert_eq(idt_ran(src + "print(tell(Pair(1, true)))\n"), "pair\n")
+    idt_refused(src + "print(tell(Pair(true, 1)))\n",
+        "the 'impl' that covers it asks 'Show2' of bool, which does not implement it")
+
+// -- what a subscript may index by ----------------------------------------------------------------
+
+@test("a type may be indexed by something that is not an integer")
+idt_indexed_by_a_string()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(idt_env() + "var e = Env(0)\nprint(e[\"answer\"], e[\"other\"])\n"), "42 0\n")
+
+@test("and by two things at once, the written index saying which")
+idt_indexed_by_two_things()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(idt_env() + raw"""
+        impl Index[bool, int] for Env
+            index(self, f: bool) -> int = if f then 1 else 0
+        var e = Env(7)
+        print(e["answer"], e["nope"], e[true])
+        """), "42 7 1\n")
+
+@test("a built-in's subscript is still the compiler's")
+idt_builtin_subscript_is_the_compilers()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(raw"""
+        var a: [3]int = [4, 5, 6]
+        var s = a[1..<3]
+        print(a[1], s[1], "abc"[2])
+        """), "5 6 99\n")
+
+@test("a type with no Index still cannot be indexed")
+idt_no_index_cannot_be_indexed()
+    if !idt_can_run() then return
+
+    idt_refused("struct Box\n    v: int\nprint(Box(1)[0usize])\n", "cannot index Box")
+
+// -- what a second implementation may not be ------------------------------------------------------
+
+@test("a block whose subject takes no arguments has no parameter to write into one")
+idt_subject_without_arguments()
+    if !idt_can_run() then return
+
+    idt_refused(raw"""
+        trait From[T]
+            of(x: T) -> Self
+        struct Wrapper
+            v: int
+        impl[T] From[T] for Wrapper
+            of(x: T) -> Wrapper = Wrapper(0)
+        """, "'Wrapper' takes no type arguments, so an 'impl' for it has nothing to be generic over")
+
+@test("a parameter the subject does not name is refused, which is what settles every argument")
+idt_parameter_the_subject_does_not_name()
+    if !idt_can_run() then return
+
+    idt_refused(raw"""
+        trait Get[I, E]
+            get(self, i: I) -> E
+        impl[T, U] Get[U, T] for Buf[T]
+            get(self, i: U) -> T = self.at(0usize)
+        """, "'U' is declared by this 'impl' but does not appear in 'Buf[T]', so nothing would ever fix it")
+
+@test("two blocks that differ only in the letter of the parameter are one implementation twice")
+idt_same_block_another_letter()
+    if !idt_can_run() then return
+
+    idt_refused(idt_buf_get() + raw"""
+        impl[U] Get[usize, U] for Buf[U]
+            get(self, i: usize) -> U = self.at(i)
+        """, "already implements 'Get[usize, U]'")
+
+@test("two that differ in the argument are two implementations")
+idt_two_arguments_two_implementations()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(idt_buf_get() + raw"""
+        impl[T] Get[bool, usize] for Buf[T]
+            get(self, f: bool) -> usize = if f then self.len() else 0usize
+        var b: Buf[int] = buf()
+        b.push(3)
+        b.push(4)
+        print(b.get(1usize), b.get(true))
+        """), "4 2\n")
+
+// -- what the edge cases do -----------------------------------------------------------------------
+
+// `[]T` at a `Buf[int]` is `[]int`: the substitution reaches inside an argument.
+@test("a parameter reached through a composed argument is substituted too")
+idt_composed_argument_substituted()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(raw"""
+        trait Get[I, E]
+            get(self, i: I) -> E
+        impl[T] Get[bool, []T] for Buf[T]
+            get(self, f: bool) -> []T = if f then self.view() else self.view()[0..<0usize]
+        var b: Buf[int] = buf()
+        b.push(3)
+        b.push(4)
+        var all: []int = b.get(true)
+        print(all.len, b.get(false).len)
+        """), "2 0\n")
+
+@test("the element type is not inferred from a bound, and the annotation supplies it")
+idt_element_type_not_inferred_from_a_bound()
+    if !idt_can_run() then return
+
+    val decls = raw"""
+        trait Get[I, E]
+            get(self, i: I) -> E
+        struct Row
+            a: int
+        impl Get[usize, int] for Row
+            get(self, i: usize) -> int = self.a
+        first[E, C: Get[usize, E]](c: C) -> E = c.get(0usize)
+        """
+
+    idt_refused(decls + "print(first(Row(3)))\n", "cannot infer the type argument 'E' of 'first'")
+    assert_eq(idt_ran(decls + "var x: int = first(Row(3))\nprint(x)\n"), "3\n")
+
+// A subscript is a call, so a read-modify-write would evaluate the receiver and the index twice.
+@test("a compound assignment through Index is refused rather than evaluated twice")
+idt_compound_assignment_refused()
+    if !idt_can_run() then return
+
+    idt_refused("var b: Buf[int] = buf()\nb.push(1)\nb[0usize] += 2\n",
+        "'+=' on an element read through 'sysl.Index' would evaluate the receiver and the index twice")
+
+@test("and the form it points at works")
+idt_written_out_form_works()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(raw"""
+        var b: Buf[int] = buf()
+        b.push(1)
+        b[0usize] = b[0usize] + 2
+        print(b[0usize])
+        """), "3\n")
+
+@test("slicing through Index is not built, and says so rather than that the type is the wrong shape")
+idt_slicing_through_index_not_built()
+    if !idt_can_run() then return
+
+    val said = idt_err(raw"""
+        struct Row
+            a: int
+            b: int
+
+        impl Index[usize, int] for Row
+            index(self, i: usize) -> int = if i == 0usize then self.a else self.b
+
+        var r = Row(1, 2)
+        print(r[0usize..<2usize])
+        """)
+
+    assert(said.contains("slicing through the trait is not built"), said)
+    assert(said.contains("a range is not yet a type a program can name"), said)
+    assert(!said.contains("cannot slice Row"), said)
+
+@test("while a type that indexes no way at all keeps the plain one")
+idt_no_indexing_keeps_plain_refusal()
+    if !idt_can_run() then return
+
+    idt_refused("struct P\n    v: int\nvar p = P(1)\nprint(p[0usize..<1usize])\n", "cannot slice P")
+
+// Reading takes `self` and writing takes `*self`, so both reach through a pointer and a counted box.
+@test("a container is indexed through a pointer and through a counted reference")
+idt_indexed_through_pointer_and_reference()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(raw"""
+        fill(b: *Buf[int])
+            b.push(1)
+            b[0usize] = 5
+        var b: Buf[int] = buf()
+        fill(&b)
+        var r: &Buf[int] = buf()
+        r.push(2)
+        r[0usize] = 9
+        print(b[0usize], r[0usize])
+        """), "5 9\n")
+
+// The bounds check is the container's, and it is still there under the subscript.
+@test("a subscript past the end stops the program the way the method did")
+idt_subscript_past_the_end_stops()
+    if !idt_can_run() then return
+
+    val out = idt_outcome("var b: Buf[int] = buf()\nb.push(1)\nprint(b[4usize])\n")
+
+    assert(!out.1, s"expected the program to stop, but it exited cleanly: ${out.0}")
+    assert(out.0.contains("panic: index 4 past the 1 elements of a Buf"), out.0)
+
+// A freshly built container is not a place, so a store into it is refused. The reference's refusal
+// is the uninferable `buf()` itself, which comes first.
+@test("writing into a container that is not a place is refused")
+idt_store_into_a_non_place_refused()
+    if !idt_can_run() then return
+
+    idt_refused(raw"""
+        trait Get[I, E]
+            get(self, i: I) -> E
+        var b: Buf[int] = buf()
+        b.push(1)
+        buf()[0usize] = 5
+        """, "cannot infer the type argument 'T' of 'sysl.buf.buf' here")
+
+@test("the element type travels with the implementation, so two containers of one trait keep theirs")
+idt_element_type_travels_with_the_implementation()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(raw"""
+        var a: Buf[int] = buf()
+        var s: Buf[string] = buf()
+        a.push(1)
+        s.push("x")
+        var n: int = a[0usize]
+        var t: string = s[0usize]
+        print(n, t)
+        """), "1 x\n")
+
+// `Index` written second is filed under a suffix, and the subscript still reaches it.
+@test("a subscript reaches an Index that was written after another implementation of it")
+idt_subscript_reaches_the_second_index()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(raw"""
+        struct Env
+            fallback: int
+        impl Index[bool, int] for Env
+            index(self, f: bool) -> int = if f then 1 else 0
+        impl Index[string, int] for Env
+            index(self, k: string) -> int = if k == "answer" then 42 else self.fallback
+        var e = Env(7)
+        print(e["answer"], e[false])
+        """), "42 0\n")
+
+@test("a container read by two indices is read by a tuple")
+idt_two_indices_read_by_a_tuple()
+    if !idt_can_run() then return
+
+    assert_eq(idt_ran(raw"""
+        struct Img
+            w: int
+            cells: [6]int
+        impl Index[(int, int), int] for Img
+            index(self, at: (int, int)) -> int = self.cells[at.1 * self.w + at.0]
+        impl IndexSet[(int, int), int] for Img
+            index_set(*self, at: (int, int), v: int)
+                self.cells[at.1 * self.w + at.0] = v
+        var i = Img(3, [1, 2, 3, 4, 5, 6])
+        print(i[(2, 1)])
+        i[(0, 0)] = 60
+        print(i[(0, 0)], i[(1, 0)])
+        """), "6\n60 2\n")
+
+// Reported rather than resolved by a preference rule, as a call with the same ambiguity is.
+@test("an index that names no implementation is reported")
+idt_index_naming_no_implementation()
+    if !idt_can_run() then return
+
+    idt_refused(raw"""
+        struct Env
+            fallback: int
+        impl Index[string, int] for Env
+            index(self, k: string) -> int = self.fallback
+        impl Index[bool, int] for Env
+            index(self, f: bool) -> int = if f then 1 else 0
+        var e = Env(7)
+        print(e[0usize])
+        """, "'index' comes from 2 implementations of one trait on Env, and none of them takes (usize)")
