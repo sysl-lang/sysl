@@ -19,11 +19,11 @@ import sysl.buf.{Buf, buf}
 blank_func(name: string) -> FuncDecl =
     FuncDecl(name, buf(), buf(), None, buf(), buf(), false, Public, buf(), buf(), buf(),
         None, None, None, false, false, false, None, None, None, None, buf(), buf(), no_marks(),
-        span_zero())
+        span_zero(), false)
 
 blank_method(at: Span, name: string) -> MethodDecl =
     MethodDecl(at, name, None, false, buf(), buf(), None, buf(), buf(), buf(), Public, false, false,
-        buf(), buf(), buf(), None, None, buf(), false, no_marks(), at)
+        buf(), buf(), buf(), None, None, buf(), false, no_marks(), at, false)
 
 blank_struct(name: string) -> StructDecl =
     StructDecl(name, buf(), buf(), buf(), buf(), buf(), Public, buf(), false, buf(), false, None,
@@ -183,6 +183,21 @@ end parse_param_list
 // parenthesised list and the body after it. Nothing is reported by a probe that fails -- the report
 // is wound back with the cursor, since a reading nobody chose said nothing about the file.
 try_func_decl(p: *Parser, start: Span, vis: Visibility, attrs: Buf[Attr]) -> Option[Stmt]
+    // `const` in front marks a function the compiler may run. The word has been seen with a name and
+    // a bracket after it, so the line is a function or nothing: a probe failing past it is told so,
+    // since the word cannot be put back for a constant to read.
+    val marked_const = at_const_func(p)
+
+    if marked_const
+        p.bump()
+
+        if !looks_like_func_decl(p)
+            p.fault(start, "'const' in front of a name and its parameter list marks a function the compiler may run, and this has no body — write '= value' or an indented block after the signature")
+            skip_line(p)
+            return Some(stmt(start.to(p.just_taken()), Bad))
+        end if
+    end if
+
     val reserved = at_reserved_func_head(p)
 
     if !reserved && !looks_like_func_decl(p) then return None
@@ -224,6 +239,7 @@ try_func_decl(p: *Parser, start: Span, vis: Visibility, attrs: Buf[Attr]) -> Opt
     decl.tvalues = tp.values
     decl.tpacks = tp.packs
     decl.conv = conv
+    decl.const_fn = marked_const
 
     accept_end_name(p, name)
     apply_func_attrs(&decl, attrs)
@@ -231,6 +247,20 @@ try_func_decl(p: *Parser, start: Span, vis: Visibility, attrs: Buf[Attr]) -> Opt
     decl.at = start.to(p.just_taken())
     Some(stmt(decl.at, FuncDecl(decl)))
 end try_func_decl
+
+// Whether `const` here marks a function rather than opening a constant: the word, a name, and then
+// the bracket a parameter list or a type-parameter list opens with. A constant has a `:` where the
+// bracket would be, so one token past the name settles it.
+at_const_func(p: *Parser) -> bool
+    if !p.at_kw("const") then return false
+
+    val named = p.peek_at(1) match
+        Ident(_) -> true
+        QuotedIdent(_) -> true
+        _ -> false
+
+    named && (p.kw_at(2, "(") || p.kw_at(2, "["))
+end at_const_func
 
 // Whether a function declaration begins here.
 //

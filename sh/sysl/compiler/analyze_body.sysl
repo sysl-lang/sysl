@@ -319,7 +319,7 @@ private with_entry_body(funcs: Buf[TFunc], started: (Buf[TStmt], string)) -> Buf
 
     out.push(TFunc(span_zero(), entry_check_name(started.1), buf(), Unit,
                    TBlock(started.0, None, Unit), false, buf(), buf(), buf(), false, None, false,
-                   None, false, false, None, None, None, None, no_marks(), started.1))
+                   None, false, false, None, None, None, None, no_marks(), started.1, false))
 
     out
 end with_entry_body
@@ -542,6 +542,8 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
 
     a.tables.homes.put(name, scope)
 
+    if d.const_fn then check_const_signature(a, scope, name, d, params, ret)
+
     // **A file-private declaration's symbol is internal**, since nothing outside the file it was
     // written in can name it -- which is what keeps two files' `private pick` from being one symbol
     // at the link.
@@ -549,7 +551,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
           contract.2, file_local(d.vis), d.conv, d.tailrec, contract.3, d.pure, d.ghost,
           frame_symbols(cx, span, name, d.reads, "reads"),
           frame_symbols(cx, span, name, d.writes, "writes"),
-          exported_symbol(d), d.section, d.marks, cx.owner)
+          exported_symbol(d), d.section, d.marks, cx.owner, d.const_fn)
 end analyze_body
 
 // Whether the declaration wrote the parameter `name` by name (`x: -> T`).
@@ -695,7 +697,7 @@ private trait_default_decl(td: TraitDecl, m: MethodDecl) -> FuncDecl
     FuncDecl(s"${td.name}.${m.name}", tparams, params, m.ret_type, m.body, bounds, m.variadic, File,
              buf(), joined_values(td.tvalues, m.tvalues), m.tpacks, None, None, None, false, false,
              false, m.reads, m.writes,
-             None, None, m.crossing, buf(), m.marks, m.named_at)
+             None, None, m.crossing, buf(), m.marks, m.named_at, false)
 end trait_default_decl
 
 // One such body, in a region everything but a kept complaint is rewound out of.
@@ -774,10 +776,14 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     // Recorded after the rewind so that neither the entry nor the file it names can be taken back.
     if !keep then return
 
+    // A generic `const` function's signature is answered for once, here, as its body is: a type
+    // parameter stands for whatever an instantiation picks, and what it is made of is checked there.
+    if d.const_fn then check_const_signature(a, scope, d.name, d, params, ret)
+
     a.tables.homes.put(d.name, scope)
     a.tables.abstracts.push(TFunc(span_zero(), d.name, params, ret, body, d.variadic, buf(), buf(),
                                   buf(), true, d.conv, false, None, d.pure, d.ghost, None, None,
-                                  None, None, no_marks(), cx.owner))
+                                  None, None, no_marks(), cx.owner, d.const_fn))
 end check_abstract_body
 
 // What a `some` member's body produces, read speculatively and taken back: the one reading that
@@ -945,7 +951,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
 
     if sig.is_none() then return TFunc(span_zero(), name, buf(), Unit, empty_block(), false, buf(),
                                        buf(), buf(), false, None, false, None, false, false, None,
-                                       None, None, None, no_marks(), cx.owner)
+                                       None, None, None, no_marks(), cx.owner, false)
 
     remember_bounds(cx, d)
 
@@ -993,7 +999,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
           d.conv, d.tailrec, contract.3, d.pure, d.ghost,
           frame_symbols(cx, span, name, d.reads, "reads"),
           frame_symbols(cx, span, name, d.writes, "writes"),
-          exported_symbol(d), d.section, d.marks, cx.owner)
+          exported_symbol(d), d.section, d.marks, cx.owner, d.const_fn)
 end analyze_instance_in
 
 // The key a declaration was filed under, for a diagnostic naming the declaration an instantiation
