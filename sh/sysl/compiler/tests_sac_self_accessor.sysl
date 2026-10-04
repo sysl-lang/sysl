@@ -1,0 +1,157 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// An accessor that reaches the member it is defining calls itself. There is no reading under which
+// either half is what the author meant — the value a property computes is not the property, and
+// there is no `super` to reach past it — so the shape is refused rather than left to run out of
+// stack. What these are really about is the line between that and every neighbouring shape that
+// terminates and has to keep working: the setter reading its own getter, a member reading a
+// *different* property, and a method reading either.
+//
+// **Every string quoted here was read out of the reference compiler (0.0.162)**, whose
+// `SelfAccessorTests` these are. The whole-program helpers are the `enm_` files'.
+
+private sac_reads() -> string = "reads the property it is defining"
+private sac_writes() -> string = "writes the property it is defining"
+
+// A setter whose body writes its own property, shared by two of the refusals.
+private sac_setter_writes_itself() -> string =
+    "struct Cell\n    v: int\n\n    count -> int = self.v\n\n    set count(x)\n        self.count = x\n" +
+        "var c = Cell(1)\nc.count = 2\n"
+
+@test
+sac_a_getter_that_reads_itself()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Cell\n    v: int\n    count -> int = self.count\nvar c = Cell(1)\n" +
+                       "print(c.count)\n")
+
+    assert(enm_says(said, sac_reads()), said)
+end sac_a_getter_that_reads_itself
+
+@test
+sac_a_getter_that_reads_itself_from_inside_a_block_body()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Cell\n    v: int\n    count -> int\n        val n = self.count\n" +
+                       "        n + 1\nvar c = Cell(1)\nprint(c.count)\n")
+
+    assert(enm_says(said, sac_reads()), said)
+end sac_a_getter_that_reads_itself_from_inside_a_block_body
+
+@test
+sac_a_setter_that_writes_itself()
+    if !enm_ready() then return
+
+    val said = enm_err(sac_setter_writes_itself())
+
+    assert(enm_says(said, sac_writes()), said)
+
+@test
+sac_a_setter_that_writes_itself_through_star_self()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Cell\n    v: int\n\n    count -> int = self.v\n\n    set count(x)\n" +
+                       "        (*self).count = x\nvar c = Cell(1)\nc.count = 2\n")
+
+    assert(enm_says(said, sac_writes()), said)
+end sac_a_setter_that_writes_itself_through_star_self
+
+@test
+sac_a_setter_that_writes_itself_with_a_compound_form()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Cell\n    v: int\n\n    count -> int = self.v\n\n    set count(x)\n" +
+                       "        self.count += x\nvar c = Cell(1)\nc.count = 2\n")
+
+    assert(enm_says(said, sac_writes()), said)
+end sac_a_setter_that_writes_itself_with_a_compound_form
+
+@test
+sac_a_getter_on_a_generic_type_that_reads_itself()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Box[T]\n    v: T\n    value -> T = self.value\nvar b = Box(1)\n" +
+                       "print(b.value)\n")
+
+    assert(enm_says(said, sac_reads()), said)
+end sac_a_getter_on_a_generic_type_that_reads_itself
+
+@test
+sac_a_trait_default_that_reads_itself()
+    if !enm_ready() then return
+
+    val said = enm_err("trait Counter\n    count -> int = self.count\n\nstruct Cell\n    v: int\n\n" +
+                       "impl Counter for Cell\n\nvar c = Cell(1)\nprint(c.count)\n")
+
+    assert(enm_says(said, sac_reads()), said)
+end sac_a_trait_default_that_reads_itself
+
+@test
+sac_neither_message_names_the_setter_by_the_name_it_is_filed_under()
+    if !enm_ready() then return
+
+    val said = enm_err(sac_setter_writes_itself())
+
+    assert(said != "", "the setter writing itself was accepted")
+    assert(!enm_says(said, "$"), said)
+end sac_neither_message_names_the_setter_by_the_name_it_is_filed_under
+
+@test
+sac_a_setter_reads_its_own_getter_which_is_a_different_member()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Cell\n    v: int\n\n    count -> int = self.v\n\n    set count(x)\n" +
+                      "        self.v = x + self.count\nvar c = Cell(10)\nc.count = 1\n" +
+                      "print(c.count)\n"), "11\n")
+end sac_a_setter_reads_its_own_getter_which_is_a_different_member
+
+@test
+sac_a_property_reads_a_different_property()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Cell\n    v: int\n    twice -> int = self.v * 2\n" +
+                      "    quad -> int = self.twice * 2\nvar c = Cell(3)\nprint(c.quad)\n"), "12\n")
+
+@test
+sac_a_method_reads_the_property_beside_it()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Cell\n    v: int\n    count -> int = self.v\n" +
+                      "    describe(self) -> int = self.count + 1\nvar c = Cell(3)\n" +
+                      "print(c.describe())\n"), "4\n")
+end sac_a_method_reads_the_property_beside_it
+
+@test
+sac_a_method_writes_the_property_beside_it()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Cell\n    v: int\n\n    count -> int = self.v\n\n    set count(x)\n" +
+                      "        self.v = x\n\n    bump(*self)\n        self.count += 1\nvar c = Cell(3)\n" +
+                      "c.bump()\nprint(c.count)\n"), "4\n")
+end sac_a_method_writes_the_property_beside_it
+
+// The check is about the member, not about the name: `Outer.count` reading `Inner.count` is two
+// members that happen to share a spelling, and it terminates.
+@test
+sac_a_property_reads_a_property_of_the_same_name_on_another_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Inner\n    v: int\n    count -> int = self.v * 2\n\nstruct Outer\n" +
+                      "    i: Inner\n    count -> int = self.i.count + 1\nvar o = Outer(Inner(3))\n" +
+                      "print(o.count)\n"), "7\n")
+end sac_a_property_reads_a_property_of_the_same_name_on_another_type
+
+// Beside the suite: a METHOD named for the member it reads is told it is a method, as it was before
+// the getter's refusal — the refusal is for a property only.
+@test
+sac_a_method_reading_itself_unparenthesized_is_told_it_is_a_method()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Cell\n    v: int\n    count(self) -> int = self.count\nvar c = Cell(1)\n" +
+                       "print(c.count())\n")
+
+    assert(enm_says(said, "'count' is a method of 'Cell' — call it with 'count(…)'"), said)
+end sac_a_method_reading_itself_unparenthesized_is_told_it_is_a_method

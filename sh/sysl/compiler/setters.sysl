@@ -126,6 +126,30 @@ private check_not_own_setter(cx: &Analyzer, span: Span, receiver: Expr, name: st
              "What a body like this means to write is the field it is in front of")
 end check_not_own_setter
 
+// **A property that reads itself calls itself**, the getter's half of the same refusal: the value a
+// property computes is not the property, so `self.count` inside `count` can only recurse. It is
+// asked of the member the name resolves to, so a field, a method and a property of another type
+// that shares the spelling all read as they always did. The answer is whether it was refused.
+refused_own_getter(cx: &Analyzer, span: Span, receiver: Expr, rt: Type, name: string) -> bool
+    if !names_self(receiver) then return false
+    if enclosing_member(cx) != name then return false
+    if !is_property_of(cx.an, receiver_type(rt), name) then return false
+
+    cx.fault(Span(span.end - name.bytes.len, span.end),
+             s"'$name' reads the property it is defining, so it calls itself — the value a property " +
+             "computes is not the property. What a body like this means to read is the field it is " +
+             "in front of")
+    true
+end refused_own_getter
+
+private is_property_of(a: &Analysis, ty: Type, name: string) -> bool = ty match
+    Abstract(_, bounds) -> bound_member(a, ty, bounds, name) match
+        Some(m) -> m.2.is_property
+        None -> false
+    _ -> member_at(a, member_key(a, ty, name).0, name) match
+        Some(d) -> d.is_property
+        None -> false
+
 private names_self(receiver: Expr) -> bool = *receiver.kind match
     Ident(n) -> n == "self"
     Unary(op, inner) -> op == "*" && names_self(inner)
