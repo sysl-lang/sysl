@@ -792,6 +792,9 @@ private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string],
     // is what lets a signature name a projection off one: `S::Token` is answerable exactly where `S`
     // is bounded by a trait declaring a `Token`.
     val subst = abstract_subst(a, scope, tparams, bounds, tvalues, tpacks, buf())
+    val before = a.settled
+
+    a.settled = subst
 
     for i in 0..<params.len()
         resolve_type(a, scope, params.at(i).typ, subst)
@@ -823,6 +826,8 @@ private runner_result(a: &Analysis, f: Func, result: Option[Type])
                 "there is nothing to read a value with")
 end runner_result
 
+    a.settled = before
+
 // **Only a concrete member of a concrete type keeps what its signature makes real**, the rule the
 // free functions above follow and for the same reason: a member of a trait, a member of a generic
 // type and a member generic in its own right -- a bare-arrow parameter makes it one -- are shapes,
@@ -836,7 +841,11 @@ private resolve_members(a: &Analysis, scope: Scope, owner: string, tparams: Buf[
     val shape = is_trait || !tparams.is_empty()
     val whole = if shape then Some(registration_mark(a)) else None
     var subst = abstract_subst(a, scope, tparams, bounds, tvalues, buf(), buf())
+    val before = a.settled
 
+    // The type's own parameters are final here, for its fields (read where `Self` is made) and its
+    // members' signatures alike; `Self` is not among them.
+    a.settled = joined_bindings(subst, buf())
     subst.push(Binding("Self", self_type(a, scope, owner, tparams, bounds)))
 
     for i in 0..<members.len()
@@ -855,6 +864,8 @@ private resolve_members(a: &Analysis, scope: Scope, owner: string, tparams: Buf[
         resolve_method(a, scope, m, subst)
 
         if own.is_some() then rewind_to(a, own.unwrap())
+
+    a.settled = before
 
     if whole.is_some() then rewind_to(a, whole.unwrap())
 end resolve_members

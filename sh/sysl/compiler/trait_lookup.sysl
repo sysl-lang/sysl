@@ -316,7 +316,9 @@ end resolve_bound
 // resolved, a parameter standing in for itself may be a scaffolding stand-in that does not yet carry
 // what its declaration asked of it, so it would be refused for a bound it has. Those are asked where
 // the parameters are final: `check_own_trait_args` for a declaration's bounds, and the `impl` block
-// for its own (`check_trait_arg_bounds_all`).
+// for its own (`check_trait_arg_bounds_all`) -- and here too, where every parameter an argument names
+// is the very stand-in `Analysis.settled` holds: a declaration's signature, members or fields read at
+// its final parameters, so `f[Y](x: &Get[Y])` is held to `Get`'s bounds as written.
 check_trait_arg_bounds(a: &Analysis, scope: Scope, span: Span, key: string, d: TraitDecl,
                        args: Buf[Type])
     if d.bounds.is_empty() then return
@@ -325,13 +327,42 @@ check_trait_arg_bounds(a: &Analysis, scope: Scope, span: Span, key: string, d: T
     var any = false
 
     for i in 0..<args.len()
-        if mentions_abstract(args.at(i)) then concrete.push(Unknown)
+        if mentions_abstract(args.at(i)) && !stands_settled(args.at(i), a.settled) then
+            concrete.push(Unknown)
         else
             concrete.push(args.at(i))
             any = true
 
     if any then check_trait_arg_bounds_all(a, scope, span, key, d, concrete)
 end check_trait_arg_bounds
+
+// Whether every parameter a type mentions is the stand-in a settled reading binds it to, bounds and
+// all. One that is not -- a scaffolding pass's bound-free stand-in, a member's own parameter, a pack
+// -- says nothing, and the check is left to where the parameters are final.
+private stands_settled(t: Type, settled: Buf[Binding]) -> bool = t match
+    Abstract(n, _) -> bound_type(settled, n) match
+        Some(Abstract(m, bs)) -> stand_in_tag(Abstract(m, bs)) == stand_in_tag(t)
+        _ -> false
+    Struct(d) -> all_settled(d.targs, settled)
+    Enum(d) -> all_settled(d.targs, settled)
+    Results(parts) -> all_settled(parts.targs, settled)
+    Ptr(inner) -> stands_settled(*inner, settled)
+    Ref(inner, _) -> stands_settled(*inner, settled)
+    Weak(inner) -> stands_settled(*inner, settled)
+    Array(_, elem) -> stands_settled(*elem, settled)
+    Vector(_, elem) -> stands_settled(*elem, settled)
+    Slice(elem, _) -> stands_settled(*elem, settled)
+    Volatile(inner) -> stands_settled(*inner, settled)
+    CFn(ps, r) -> all_settled(ps, settled) && stands_settled(*r, settled)
+    Pack(_) -> false
+    _ -> true
+
+private all_settled(ts: Buf[Type], settled: Buf[Binding]) -> bool
+    for i in 0..<ts.len()
+        if !stands_settled(ts.at(i), settled) then return false
+
+    true
+end all_settled
 
 // The same, of every argument: the caller vouches that a type parameter among them carries what its
 // declaration asked of it.
