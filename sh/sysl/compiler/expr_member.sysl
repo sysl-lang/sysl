@@ -350,15 +350,23 @@ end trait_type_member
 // A constrained subtype's name with a member selected from it. What one offers under its own name is
 // spelled with `::`, so a range that has one is told about the attributes rather than only that the
 // member is missing.
-private constrained_member(cx: &Analyzer, span: Span, key: string, d: TypeDecl, receiver: Expr,
-                           written: string, name: string, expected: Option[Type]) -> TExpr
-    val stood = concrete_instance(cx.an, key)
+constrained_member(cx: &Analyzer, span: Span, key: string, d: TypeDecl, receiver: Expr,
+                   written: string, name: string, expected: Option[Type]) -> TExpr
+    // A constrained subtype is filed with the constrained instantiations, which is what says whether
+    // it has a range to offer.
+    val stood = cx.an.tables.constrained_insts.get(key)
 
     // An alias reaches this case because it is declared in the same table, and none of what follows
     // is about it: it has no range to be asked about and no cast to be told to use. What it has is
     // whatever the base has, so the complaint is the base's, said about the name that was written.
-    if is_plain_alias(d) && stood.is_some() then
-        return bare_type_member(cx, span, receiver, stood.unwrap(), written, name, expected)
+    // An alias's entry in that table is what it names.
+    if is_plain_alias(d) && stood.is_some()
+        stood.unwrap() match
+            // A declared type answers under its own key, exactly as its own name would.
+            Struct(sd) -> return struct_type_member(cx, span, sd.base, written, name)
+            Enum(ed) -> return enum_member(cx, span, ed.base, written, name, expected)
+            other -> return bare_type_member(cx, span, receiver, other, written, name, expected)
+    end if
 
     var ranged = false
 
