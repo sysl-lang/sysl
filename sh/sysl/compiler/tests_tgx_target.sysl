@@ -1,0 +1,777 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, split, str_builder}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.slices.sort_by
+
+// The machine a program is compiled **for** (`getting-started/cli.md § targets`), past what
+// `tests_target.sysl` asks of the registry's names: what each row records about its floating-point
+// unit, its `va_list` and its thread storage, what is said to clang beyond the triple, what naming a
+// target changes about the module that comes out -- and what it does not, which is any part of a
+// layout but the width of a word.
+
+// The names of the targets a registry query answered, one to a line, in registry order.
+private tgx_names(ts: Buf[Target]) -> string
+    var out = str_builder()
+
+    for i in 0..<ts.len()
+        out.push(ts.at(i).name)
+        out.push("\n")
+
+    out.finish()
+end tgx_names
+
+private tgx_lines(names: []const string) -> string
+    var out = str_builder()
+
+    for i in 0..<names.len
+        out.push(names[i])
+        out.push("\n")
+
+    out.finish()
+end tgx_lines
+
+private tgx_where(keep: Target -> bool) -> Buf[Target]
+    val all = all_targets()
+    var out: Buf[Target] = buf()
+
+    for i in 0..<all.len()
+        if keep(all.at(i)) then out.push(all.at(i))
+
+    out
+end tgx_where
+
+private tgx_supported() -> Buf[Target] = tgx_where((t) -> t.supported())
+
+private tgx_row(name: string) -> Target = target_named(name).unwrap()
+
+private tgx_flags(t: Target) -> string = tgx_lines(machine_flags(t).view())
+
+private tgx_has[T: Eq](xs: Buf[T], x: T) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == x then return true
+
+    false
+end tgx_has
+
+private tgx_va(a: VaListAbi) -> string = a match
+    VaAddress -> "address"
+    VaLoaded -> "loaded"
+    VaCopied -> "copied"
+
+// -- the registry -------------------------------------------------------------------------------------
+
+@test("and one distinct thing to say to clang, which the triple alone no longer is")
+tgx_one_distinct_thing_to_say_to_clang()
+    val all = all_targets()
+    var shared_triples = 0
+
+    for i in 0..<all.len()
+        for j in 0..<all.len()
+            if i < j
+                val a = all.at(i)
+                val b = all.at(j)
+
+                if a.triple == b.triple
+                    shared_triples += 1
+                    assert(tgx_flags(a) != tgx_flags(b), s"${a.name} and ${b.name} say one thing")
+                end if
+
+    assert(shared_triples > 0, "the triple alone is unique, so nothing here was asked")
+end tgx_one_distinct_thing_to_say_to_clang
+
+@test("wants position-independent carried C exactly where a program is loaded as a shared object")
+tgx_position_independent_only_for_a_shared_object()
+    assert_eq(tgx_names(tgx_where((t) -> t.position_independent())), "aarch64-android\n")
+
+    val bare = tgx_where((t) -> t.os == Freestanding)
+
+    for i in 0..<bare.len()
+        assert(!bare.at(i).position_independent(), bare.at(i).name)
+
+    // And the answer reaches the line a package's C is compiled with, on the one row and no other.
+    assert(tgx_has(c_target_flags(tgx_row("aarch64-android")), "-fPIC"), "android")
+    assert(!tgx_has(c_target_flags(tgx_row("aarch64-linux")), "-fPIC"), "linux")
+    assert(!tgx_has(c_target_flags(tgx_row("thumb-freestanding")), "-fPIC"), "thumb")
+end tgx_position_independent_only_for_a_shared_object
+
+@test("names no target it cannot answer the ABI questions for")
+tgx_every_row_answers_the_abi_questions()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        assert(all.at(i).triple != "", all.at(i).name)
+        assert(all.at(i).va_list_bytes > 0, all.at(i).name)
+
+@test("records the va_list ABI each triple was measured to have")
+tgx_the_va_list_abi_each_triple_has()
+    assert_eq(tgx_va(tgx_row("aarch64-macos").va_list), "loaded")
+    assert_eq(tgx_va(tgx_row("x86_64-windows").va_list), "loaded")
+    assert_eq(tgx_va(tgx_row("riscv64-linux").va_list), "loaded")
+
+    assert_eq(tgx_va(tgx_row("x86_64-linux").va_list), "address")
+    assert_eq(tgx_va(tgx_row("x86_64-macos").va_list), "address")
+    assert_eq(tgx_va(tgx_row("x86_64-freestanding").va_list), "address")
+
+    assert_eq(tgx_va(tgx_row("aarch64-linux").va_list), "copied")
+    assert_eq(tgx_va(tgx_row("aarch64-freestanding").va_list), "copied")
+end tgx_the_va_list_abi_each_triple_has
+
+@test("reserves storage wide enough for every target's own va_list")
+tgx_va_list_storage_is_wide_enough()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        assert(layout_for(t).size(VaList) >= usize(t.va_list_bytes), t.name)
+
+@test("records which targets have floating registers to pass arguments in")
+tgx_which_targets_pass_floats_in_registers()
+    assert_eq(tgx_names(tgx_where((t) -> !t.hard_float())),
+        tgx_lines(["riscv64-freestanding", "thumb-freestanding-softfp", "thumb-freestanding-soft",
+                   "thumbv6m-freestanding", "thumbv7m-freestanding", "thumbv7em-freestanding-soft",
+                   "riscv32-freestanding", "craft-freestanding"]))
+
+@test("records which targets have no floating-point unit at all, which is not the same question")
+tgx_which_targets_have_no_unit()
+    assert_eq(tgx_names(tgx_where((t) -> t.no_fpu)),
+        tgx_lines(["riscv64-freestanding", "thumb-freestanding-soft", "thumbv6m-freestanding",
+                   "thumbv7m-freestanding", "thumbv7em-freestanding-soft", "riscv32-freestanding",
+                   "craft-freestanding"]))
+
+    assert(tgx_row("thumb-freestanding-softfp").soft_float, "softfp is the soft convention")
+    assert(!tgx_row("thumb-freestanding-softfp").no_fpu, "over a unit that is there")
+end tgx_which_targets_have_no_unit
+
+@test("says the convention and the unit to clang for a Thumb machine, and nothing for anything else")
+tgx_the_convention_and_the_unit_for_thumb()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+        var want: Buf[string] = buf()
+
+        if t.cpu == Thumb
+            if t.no_fpu
+                want.push("-mfloat-abi=soft")
+                want.push("-mfpu=none")
+            elif t.fpu != ""
+                want.push(if t.soft_float then "-mfloat-abi=softfp" else "-mfloat-abi=hard")
+                want.push(s"-mfpu=${t.fpu}")
+        end if
+
+        assert_eq(tgx_flags(t), tgx_lines(want.view()))
+    end for
+
+    assert_eq(tgx_flags(tgx_row("riscv32-freestanding")), "")
+
+    // The row the pair exists for, spelled out: `soft` would override the `-mfpu` beside it.
+    assert_eq(tgx_flags(tgx_row("thumb-freestanding-softfp")),
+        tgx_lines(["-mfloat-abi=softfp", "-mfpu=fpv5-sp-d16"]))
+    assert_eq(tgx_flags(tgx_row("thumb-freestanding")),
+        tgx_lines(["-mfloat-abi=hard", "-mfpu=fpv5-sp-d16"]))
+    assert_eq(tgx_flags(tgx_row("thumb-freestanding-soft")),
+        tgx_lines(["-mfloat-abi=soft", "-mfpu=none"]))
+end tgx_the_convention_and_the_unit_for_thumb
+
+@test("never lets a row claim a unit and no unit at once")
+tgx_never_a_unit_and_no_unit()
+    assert_eq(tgx_names(tgx_where((t) -> t.no_fpu && t.fpu != "")), "")
+
+@test("names the unit on every Thumb row that has one, since the default is the toolchain's")
+tgx_every_thumb_unit_is_named()
+    val rows = tgx_where((t) -> t.cpu == Thumb && !t.no_fpu)
+    var said = str_builder()
+
+    for i in 0..<rows.len()
+        said.push(s"${rows.at(i).name} ${rows.at(i).fpu}\n")
+
+    assert_eq(said.finish(),
+        tgx_lines(["thumb-freestanding fpv5-sp-d16", "thumb-freestanding-softfp fpv5-sp-d16",
+                   "thumbv7em-freestanding fpv4-sp-d16"]))
+end tgx_every_thumb_unit_is_named
+
+// Everything a row records beyond its name, its triple and its unit, as one line to compare.
+private tgx_rest(t: Target) -> string =
+    s"${cpu_symbol(t.cpu)} ${os_symbol(t.os)} ${tgx_va(t.va_list)} ${t.va_list_bytes} ${t.soft_float} " +
+    s"${t.short_enums}"
+
+@test("keeps the softfp row and the soft row apart on the unit, sharing everything else")
+tgx_softfp_and_soft_differ_on_the_unit()
+    val softfp = tgx_row("thumb-freestanding-softfp")
+    val soft = tgx_row("thumb-freestanding-soft")
+
+    assert_eq(soft.triple, softfp.triple)
+
+    assert(!softfp.no_fpu, "softfp has a unit")
+    assert(soft.no_fpu, "soft has none")
+
+    assert(tgx_has(machine_flags(soft), "-mfpu=none"), tgx_flags(soft))
+    assert(tgx_has(machine_flags(softfp), "-mfpu=fpv5-sp-d16"), tgx_flags(softfp))
+
+    assert_eq(tgx_rest(soft), tgx_rest(softfp))
+end tgx_softfp_and_soft_differ_on_the_unit
+
+@test("gives Armv7-M a row of its own rather than aiming Armv6-M at a Cortex-M3")
+tgx_armv7m_has_a_row_of_its_own()
+    val m3 = tgx_row("thumbv7m-freestanding")
+    val m0 = tgx_row("thumbv6m-freestanding")
+
+    assert_eq(m3.triple, "thumbv7m-none-eabi")
+    assert_eq(m0.triple, "thumbv6m-none-eabi")
+
+    assert(m3.no_fpu, "Armv7-M has no unit")
+    assert(m0.no_fpu, "nor has Armv6-M")
+
+    assert_eq(tgx_rest(m3), tgx_rest(m0))
+end tgx_armv7m_has_a_row_of_its_own
+
+@test("keeps the two Thumb targets apart on the float ABI, and on nothing else")
+tgx_the_two_thumb_targets_differ_on_the_float_abi()
+    val hard = tgx_row("thumb-freestanding")
+    val soft = tgx_row("thumb-freestanding-softfp")
+
+    assert(hard.hard_float(), "hard")
+    assert(!soft.hard_float(), "softfp")
+    assert(hard.triple.ends_with("-eabihf"), hard.triple)
+    assert(soft.triple.ends_with("-eabi"), soft.triple)
+
+    assert_eq(s"${cpu_symbol(hard.cpu)} ${os_symbol(hard.os)} ${tgx_va(hard.va_list)} ${hard.va_list_bytes}",
+        s"${cpu_symbol(soft.cpu)} ${os_symbol(soft.os)} ${tgx_va(soft.va_list)} ${soft.va_list_bytes}")
+end tgx_the_two_thumb_targets_differ_on_the_float_abi
+
+@test("keeps the Armv6-M target apart from the Armv8-M pair on the architecture")
+tgx_armv6m_differs_on_the_architecture()
+    val m0 = tgx_row("thumbv6m-freestanding")
+    val m33 = tgx_row("thumb-freestanding-softfp")
+
+    assert(m0.triple.starts_with("thumbv6m"), m0.triple)
+    assert(m33.triple.starts_with("thumbv8m"), m33.triple)
+
+    // Both soft, and neither says why.
+    assert(!m0.hard_float(), "v6-M")
+    assert(!m33.hard_float(), "v8-M softfp")
+
+    assert_eq(s"${cpu_symbol(m0.cpu)} ${os_symbol(m0.os)} ${tgx_va(m0.va_list)} ${m0.va_list_bytes} " +
+              s"${m0.short_enums}",
+        s"${cpu_symbol(m33.cpu)} ${os_symbol(m33.os)} ${tgx_va(m33.va_list)} ${m33.va_list_bytes} " +
+        s"${m33.short_enums}")
+end tgx_armv6m_differs_on_the_architecture
+
+@test("records which targets have thread-local storage set up before main")
+tgx_which_targets_have_thread_storage()
+    assert_eq(tgx_names(tgx_where((t) -> !t.thread_local_storage())),
+        tgx_lines(["aarch64-freestanding", "x86_64-freestanding", "riscv64-freestanding",
+                   "thumb-freestanding", "thumb-freestanding-softfp", "thumb-freestanding-soft",
+                   "thumbv6m-freestanding", "thumbv7m-freestanding", "thumbv7em-freestanding",
+                   "thumbv7em-freestanding-soft", "riscv32-freestanding",
+                   // LLVM compiles a wasm `thread_local` to an ordinary data symbol unless the
+                   // module is built for threads, which this one is not.
+                   "wasm32-freestanding", "craft-freestanding"]))
+
+@test("tells one processor's systems apart")
+tgx_one_processors_systems_differ()
+    val aarch64 = tgx_where((t) -> t.cpu == Aarch64)
+    var systems = ""
+    var abis: Buf[VaListAbi] = buf()
+
+    for i in 0..<aarch64.len()
+        systems = systems + os_symbol(aarch64.at(i).os) + " "
+
+        if !tgx_has(abis, aarch64.at(i).va_list) then abis.push(aarch64.at(i).va_list)
+
+    assert(systems.contains("macos "), systems)
+    assert(systems.contains("linux "), systems)
+    assert(systems.contains("freestanding "), systems)
+    assert_eq(abis.len(), 2)
+end tgx_one_processors_systems_differ
+
+@test("records Android's ABI as aarch64-linux's, and its system as its own")
+tgx_android_has_linuxs_abi_and_its_own_system()
+    val gnu = tgx_row("aarch64-linux")
+    val android = tgx_row("aarch64-android")
+
+    assert_eq(s"${cpu_symbol(android.cpu)} ${tgx_va(android.va_list)} ${android.va_list_bytes} " +
+              s"${android.soft_float}",
+        s"${cpu_symbol(gnu.cpu)} ${tgx_va(gnu.va_list)} ${gnu.va_list_bytes} ${gnu.soft_float}")
+
+    assert_eq(os_symbol(android.os), "android")
+    assert(android.os != gnu.os, "android is a system of its own")
+end tgx_android_has_linuxs_abi_and_its_own_system
+
+@test("keeps the API level in Android's triple, which a bare android triple does not supply")
+tgx_android_triple_keeps_the_api_level()
+    val triple = tgx_row("aarch64-android").triple
+    val at = triple.last_index_of("-android").unwrap()
+    val level = triple[at + 8..<triple.len]
+
+    assert(triple.ends_with("android24"), triple)
+    assert(!level.is_empty(), triple)
+
+    for i in 0..<level.len
+        assert(level.bytes[i] >= u8('0') && level.bytes[i] <= u8('9'), triple)
+end tgx_android_triple_keeps_the_api_level
+
+@test("answers hosted and posix for Android, which is what makes it the third POSIX system")
+tgx_android_is_hosted_and_posix()
+    val android = tgx_row("aarch64-android")
+
+    assert_eq(tgx_lines(inherent_capabilities(android).view()), tgx_lines([CapOs, CapPosix]))
+    assert_eq(tgx_lines(inherent_capabilities(android).view()),
+        tgx_lines(inherent_capabilities(tgx_row("aarch64-linux")).view()))
+    assert(android.thread_local_storage(), "android")
+end tgx_android_is_hosted_and_posix
+
+// -- what a target changes, and what it does not ------------------------------------------------------
+
+private tgx_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+end tgx_ready
+
+// The whole module these files lower to for `t`, the library's bodies included as `emit-llvm
+// --no-std-lib` lowers them -- or, where anything was said about them, every message.
+private tgx_ir_for(t: Target, text: string) -> string
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(why) -> return why
+        Ok(root) -> std_units(root, t) match
+            Err(why) -> return why
+            Ok(library) -> units = library
+
+    val parsed = parse(source_of("main.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    if !done.reported.is_empty()
+        var said = str_builder()
+
+        for i in 0..<done.reported.len()
+            said.push(done.reported.at(i).diag.message)
+            said.push("\n")
+
+        return said.finish()
+    end if
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, t, promotions).0)
+end tgx_ir_for
+
+// Everything whose width the emitted text states rather than leaving to LLVM: a padded aggregate, a
+// nested one, an array, a data enum's union region -- and a `va_list`.
+private tgx_shapes_text() -> string = raw"""
+    struct Padded
+        a: u8
+        big: i64
+        b: u16
+
+    struct Nested
+        p: Padded
+        q: [3]u16
+
+    enum Payload
+        Small(c: u8)
+        Large(x: i64, y: i64)
+        Middling(f: f32)
+
+    extern vprintf(fmt: *u8, ap: va_list) -> i32
+
+    log(fmt: *u8, ...) -> i32
+        var ap: va_list
+        va_start(ap)
+        var k = vprintf(fmt, &ap)
+        va_end(ap)
+        k
+    end log
+
+    what(p: Payload) -> int
+        p match
+            Small(c) -> int(c)
+            Large(x, y) -> int(x + y)
+            Middling(f) -> 0
+    end what
+
+    var n = Nested(Padded(1u8, 2i64, 3u16), [4u16; 3])
+    var s: *u8 = null
+    print(n.p.a, what(Small(1u8)), log(s, 1))
+    """
+
+// The shapes' module for every supported target, lowered once for the whole file: each is the
+// library and the program analyzed and lowered afresh, and seven tests ask about the same ones.
+private var tgx_shape_names: Buf[string] = buf()
+private var tgx_shape_texts: Buf[string] = buf()
+
+private tgx_shapes(t: Target) -> string
+    for i in 0..<tgx_shape_names.len()
+        if tgx_shape_names.at(i) == t.name then return tgx_shape_texts.at(i)
+
+    val text = tgx_ir_for(t, tgx_shapes_text())
+
+    tgx_shape_names.push(t.name)
+    tgx_shape_texts.push(text)
+    text
+end tgx_shapes
+
+private tgx_type_name(line: string) -> string = line[0..<line.index_of("=").unwrap()].trim()
+
+// Every `= type` line a target's module declares, in the order it declared them.
+private tgx_all_type_lines(t: Target) -> Buf[string]
+    var out: Buf[string] = buf()
+    val lines = split(tgx_shapes(t), "\n")
+
+    for i in 0..<lines.len
+        if lines[i].contains("= type") then out.push(lines[i])
+
+    out
+end tgx_all_type_lines
+
+// The type names **every** supported target declares. An OS-conditional declaration decides which
+// instantiations the library asks for, which is reachability; every claim below is about layout,
+// and a type only some targets declare has nothing to be laid out differently from.
+private tgx_shared_names() -> Buf[string]
+    val ts = tgx_supported()
+    var shared: Buf[string] = buf()
+    val first = tgx_all_type_lines(ts.at(0))
+
+    for i in 0..<first.len()
+        shared.push(tgx_type_name(first.at(i)))
+
+    for k in 1..<ts.len()
+        val lines = tgx_all_type_lines(ts.at(k))
+        var names: Buf[string] = buf()
+
+        for i in 0..<lines.len()
+            names.push(tgx_type_name(lines.at(i)))
+
+        var kept: Buf[string] = buf()
+
+        for i in 0..<shared.len()
+            if tgx_has(names, shared.at(i)) then kept.push(shared.at(i))
+
+        shared = kept
+    end for
+
+    shared
+end tgx_shared_names
+
+// The comparable type lines of a target, **sorted by name**: order is not a layout property, and
+// comparing by position would assert that it was.
+private tgx_type_lines(t: Target, shared: Buf[string]) -> Buf[string]
+    val all = tgx_all_type_lines(t)
+    var out: Buf[string] = buf()
+
+    for i in 0..<all.len()
+        if tgx_has(shared, tgx_type_name(all.at(i))) then out.push(all.at(i))
+
+    sort_by(out.view(), (a, b) -> tgx_type_name(a) < tgx_type_name(b))
+    out
+end tgx_type_lines
+
+// The supported targets of one address width.
+private tgx_of_width(bits: usize) -> Buf[Target] =
+    tgx_where((t) -> t.supported() && t.pointer_bits() == bits)
+
+@test("the module says which machine it is for")
+tgx_the_module_names_its_machine()
+    if !tgx_ready() then return
+
+    val ts = tgx_supported()
+
+    for i in 0..<ts.len()
+        val t = ts.at(i)
+
+        assert(tgx_shapes(t).contains(s"target triple = \"${t.triple}\""), t.name)
+end tgx_the_module_names_its_machine
+
+// The LLVM text `emit-llvm` prints for a program that names no target, or what it said instead.
+private tgx_unnamed_ir(text: string) -> string
+    val root = make_temp_dir("sysl-target").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tgx_unnamed_ir
+
+@test("a compilation that names none is for the default")
+tgx_naming_none_is_the_default()
+    if !tgx_ready() then return
+
+    val out = tgx_unnamed_ir("print(1)\n")
+
+    assert(out.contains(s"target triple = \"${host_target().triple}\""), out)
+
+@test("and the triple is the first thing in the module")
+tgx_the_triple_comes_first()
+    if !tgx_ready() then return
+
+    val out = tgx_unnamed_ir("print(1)\n")
+
+    assert(out.starts_with("target triple ="), out)
+
+@test("a cross build is refused by the toolchain rather than quietly made for this machine")
+tgx_a_cross_build_is_refused()
+    if !tgx_ready() then return
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return
+    end if
+
+    // **A different OS, not merely a different target**: one clang builds `x86_64-macos` on an
+    // Apple Silicon machine quite happily. What makes a link fail is the platform.
+    val host = host_target()
+    var foreign: Option[Target] = None
+
+    for name in ["aarch64-macos", "x86_64-macos", "aarch64-linux", "x86_64-linux"]
+        val c = tgx_row(name)
+
+        if foreign.is_none() && c.os != host.os then foreign = Some(c)
+
+    val t = foreign.unwrap()
+    val root = make_temp_dir("sysl-cross-target").unwrap()
+    val exe = s"$root/cross"
+
+    make_dir_all(root).unwrap()
+
+    val built = find_clang(t, None) match
+        Err(why) -> Err(why)
+        Ok(cc) -> build_native(cc, tgx_ir_for(t, "print(1)\n"), buf(), exe, t, DefaultOptimization,
+                               buf(), no_probe())
+
+    val made = exists(exe)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(built.is_err(), s"a build for ${t.name} succeeded on this machine")
+    assert(!made, "and left an executable behind")
+end tgx_a_cross_build_is_refused
+
+@test("and the build for this machine is not disturbed by stating it")
+tgx_stating_the_host_builds()
+    if !tgx_ready() then return
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return
+    end if
+
+    val root = make_temp_dir("sysl-host-target").unwrap()
+    val exe = s"$root/host"
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", "print(1)\n").unwrap()
+
+    val said = build_native_program(s"$root/main.sysl", Some(host_target().name), None,
+                                    DefaultOptimization, Some(exe)) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "built"
+
+    val made = exists(exe)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(said, "built")
+    assert(made, "the executable is there")
+end tgx_stating_the_host_builds
+
+@test("and the types every target has in common are nearly all of them")
+tgx_the_shared_types_are_nearly_all()
+    if !tgx_ready() then return
+
+    val ts = tgx_supported()
+    var most: usize = 0
+
+    for i in 0..<ts.len()
+        val n = tgx_all_type_lines(ts.at(i)).len()
+
+        if n > most then most = n
+
+    val shared = tgx_shared_names().len()
+
+    assert(shared > most * 9 / 10, s"$shared shared of $most")
+    assert(shared > 250, s"$shared shared")
+end tgx_the_shared_types_are_nearly_all
+
+@test("targets of one width lay an aggregate out the same way, which is why Layout takes a Word")
+tgx_one_width_one_layout()
+    if !tgx_ready() then return
+
+    val shared = tgx_shared_names()
+
+    for bits in [16usize, 32, 64]
+        val group = tgx_of_width(bits)
+        val first = tgx_type_lines(group.at(0), shared)
+
+        assert(!first.is_empty(), s"$bits-bit")
+
+        for i in 1..<group.len()
+            assert(tgx_type_lines(group.at(i), shared) == first,
+                s"${group.at(i).name} against ${group.at(0).name} at $bits-bit")
+    end for
+end tgx_one_width_one_layout
+
+@test("and an operating system decides no part of a layout")
+tgx_an_os_decides_no_layout()
+    if !tgx_ready() then return
+
+    val shared = tgx_shared_names()
+    val aarch64 = tgx_where((t) -> t.cpu == Aarch64 && t.supported())
+    var systems: Buf[Os] = buf()
+
+    for i in 0..<aarch64.len()
+        if !tgx_has(systems, aarch64.at(i).os) then systems.push(aarch64.at(i).os)
+
+    assert(systems.len() > 1, "one system")
+
+    val first = tgx_type_lines(aarch64.at(0), shared)
+
+    for i in 1..<aarch64.len()
+        assert(tgx_type_lines(aarch64.at(i), shared) == first, aarch64.at(i).name)
+end tgx_an_os_decides_no_layout
+
+@test("and a width reaches only what actually holds a pointer or a usize")
+tgx_a_width_reaches_only_a_word()
+    if !tgx_ready() then return
+
+    val shared = tgx_shared_names()
+    var heads: Buf[string] = buf()
+
+    for bits in [16usize, 32, 64]
+        val lines = tgx_type_lines(tgx_of_width(bits).at(0), shared)
+        var mine = str_builder()
+
+        for i in 0..<lines.len()
+            val l = lines.at(i)
+
+            if l.contains("Padded") || l.contains("Nested") || l.contains("Payload") ||
+               l.contains("va_list")
+                mine.push(l)
+                mine.push("\n")
+            end if
+
+        heads.push(mine.finish())
+    end for
+
+    assert(!heads.at(0).is_empty(), "the shapes are among the types")
+    assert_eq(heads.at(1), heads.at(0))
+    assert_eq(heads.at(2), heads.at(0))
+end tgx_a_width_reaches_only_a_word
+
+@test("and a width decides how wide a word is, and nothing else about a type")
+tgx_a_width_decides_only_the_word()
+    if !tgx_ready() then return
+
+    val shared = tgx_shared_names()
+    var lines: Buf[Buf[string]] = buf()
+
+    for bits in [16usize, 32, 64]
+        lines.push(tgx_type_lines(tgx_of_width(bits).at(0), shared))
+
+    // Every width declares the same types under the same names.
+    for w in 1..<lines.len()
+        assert_eq(lines.at(w).len(), lines.at(0).len())
+
+        for i in 0..<lines.at(0).len()
+            assert_eq(tgx_type_name(lines.at(w).at(i)), tgx_type_name(lines.at(0).at(i)))
+    end for
+
+    // Something moved between each adjacent pair, so no comparison is vacuous.
+    for w in 1..<lines.len()
+        var moved = 0
+
+        for i in 0..<lines.at(w).len()
+            if lines.at(w).at(i) != lines.at(w - 1).at(i) then moved += 1
+
+        assert(moved > 0, s"no type moved between widths $w and ${w - 1}, so this proved nothing")
+    end for
+
+    // What each moved line is, asked of 32 against 64: an i32 against an i64.
+    val thirty_two = lines.at(1)
+    val sixty_four = lines.at(2)
+
+    for i in 0..<thirty_two.len()
+        val a = thirty_two.at(i)
+        val b = sixty_four.at(i)
+
+        if a != b
+            assert(a.contains("i32"), s"\n$a\n$b")
+            assert(b.contains("i64"), s"\n$a\n$b")
+        end if
+    end for
+end tgx_a_width_decides_only_the_word
+
+@test("while a view's length is the width, which is the one type that is")
+tgx_a_views_length_is_the_width()
+    if !tgx_ready() then return
+
+    val slice = "count(xs: []const int) -> usize\n    xs.len\nvar n = count([1, 2, 3])\n"
+    val ts = tgx_supported()
+
+    for i in 0..<ts.len()
+        val t = ts.at(i)
+        val want = s"{ ptr, ptr, i${t.pointer_bits()} }"
+
+        assert_eq(l_render(type_lty(Slice(Integer(64, true, false), true), int(t.pointer_bits())).unwrap()),
+            want)
+        assert(tgx_ir_for(t, slice).contains(want), t.name)
+end tgx_a_views_length_is_the_width
+
+@test("while the code around those types is not the same for all of them")
+tgx_the_code_is_not_the_same()
+    if !tgx_ready() then return
+
+    val ts = tgx_supported()
+    var distinct: Buf[string] = buf()
+
+    for i in 0..<ts.len()
+        val text = tgx_shapes(ts.at(i))
+
+        if !tgx_has(distinct, text) then distinct.push(text)
+
+    assert(distinct.len() > 1, "every target lowered the shapes identically")
+end tgx_the_code_is_not_the_same
+
+@test("and a va_list is spelled one way in every module, four words wide")
+tgx_a_va_list_is_four_words()
+    if !tgx_ready() then return
+
+    val ts = tgx_supported()
+    var widths: Buf[int] = buf()
+
+    for i in 0..<ts.len()
+        if !tgx_has(widths, ts.at(i).va_list_bytes) then widths.push(ts.at(i).va_list_bytes)
+
+    assert(widths.len() > 1, "one va_list width")
+
+    val spelled = l_render(type_lty(VaList, 64).unwrap())
+
+    assert_eq(spelled, "[4 x ptr]")
+
+    for i in 0..<ts.len()
+        val t = ts.at(i)
+
+        assert_eq(layout_for(t).size(VaList), t.pointer_bytes() * 4)
+        assert(tgx_shapes(t).contains(s"alloca $spelled"), t.name)
+end tgx_a_va_list_is_four_words
