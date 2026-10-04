@@ -11,7 +11,7 @@ import sysl.text.{join, Search}
 // refusals, each worded and ordered as the reference's 0.0.162 words and orders them. Every expected
 // module and message here is the reference's own output for the same source. The discharge tests at
 // the end run Why3 and assert on its exit status alone, its report carrying a temporary path and
-// timings; on a machine without a Why3 that has a prover each says it was skipped.
+// timings; on a machine without a Why3 that has a prover each is reported as `skip`.
 
 private prv_library_here() -> bool = std_root().is_ok()
 
@@ -703,22 +703,14 @@ end prv_the_edges_of_a_name_in_any_script
 
 // -- discharging with Why3 --------------------------------------------------------------------------
 
-// Whether this machine can discharge anything: a Why3, and a prover it knows of. Where it cannot, the
-// test says it was skipped rather than passing over nothing -- a discharge test that returned at once
-// would print `ok` for a claim nobody checked.
-private prv_why3_here() -> bool
-    if !prv_library_here()
-        print("skipped: the standard module's source is not on this machine")
-        return false
-    end if
+// Skips the calling test where this machine cannot discharge anything: a Why3, and a prover it knows
+// of, are what it needs. A discharge test that returned at once would print `ok` for a claim nobody
+// checked, so it is reported as `skip` with the reason instead.
+private prv_needs_why3()
+    if !prv_library_here() then skip("the standard module's source is not on this machine")
 
     if !why3_runs("why3") || why3_prover("why3").is_none()
-        print("skipped: there is no why3 with a prover on this machine")
-        return false
-    end if
-
-    true
-end prv_why3_here
+        skip("there is no why3 with a prover on this machine")
 
 // Whether Why3 discharged every goal of what one source translates to. The exit status is the answer
 // -- `why3 prove` reports each goal on its own line and comes back non-zero when one is left.
@@ -737,26 +729,26 @@ end prv_proves
 
 @test("prove discharges a precondition and a postcondition over integers")
 prv_discharges_a_precondition_and_a_postcondition()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     assert(prv_proves("half(x: int) -> int\n    require x >= 0\n    ensure result >= 0\n    x / 2\n"))
 
 @test("prove does not discharge a postcondition that does not hold")
 prv_and_one_that_does_not_hold_is_not()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     assert(!prv_proves("same(x: int) -> int\n    require x >= 0\n    ensure result > x\n    x\n"))
 
 @test("prove discharges a recursion, including that its measure decreases")
 prv_discharges_a_recursion()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     assert(prv_proves("gcd(a: int, b: int) -> int\n    require a >= 0\n    require b >= 0\n" +
                       "    ensure result >= 0\n    variant b\n    if b == 0 then a\n    else gcd(b, a % b)\n"))
 
 @test("prove discharges a loop, through its invariant and its variant")
 prv_discharges_a_loop()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     assert(prv_proves("count_to(n: int) -> int\n    require n >= 0\n    ensure result == n\n    var i = 0\n\n" +
                       "    while i < n\n        invariant i >= 0\n        invariant i <= n\n" +
@@ -764,45 +756,45 @@ prv_discharges_a_loop()
 
 @test("prove does not discharge the same loop without the invariant that establishes its result")
 prv_and_not_without_the_invariant()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     assert(!prv_proves("count_to(n: int) -> int\n    require n >= 0\n    ensure result == n\n    var i = 0\n\n" +
                        "    while i < n\n        invariant i >= 0\n        variant n - i\n        i += 1\n\n    i\n"))
 
 @test("prove does not discharge a multiplication that can leave the range")
 prv_a_multiplication_that_can_overflow_is_not_discharged()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     assert(!prv_proves("double_it(n: int) -> int\n    require n >= 0\n    n * 2\n"))
 
 @test("prove discharges the same multiplication once the input is bounded")
 prv_and_is_once_the_input_is_bounded()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     assert(prv_proves("double_it(n: int) -> int\n    require n >= 0\n    require n <= 1000\n    n * 2\n"))
 
 @test("prove --overflow ignore drops the obligation, and the unbounded one then discharges")
 prv_overflow_ignore_drops_the_obligation()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     assert(prv_proves("double_it(n: int) -> int\n    require n >= 0\n    n * 2\n", false))
 
 @test("prove: a division carries the obligation that its divisor is not zero")
 prv_a_division_carries_its_divisor_obligation()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     assert(!prv_proves("ratio(a: int, b: int) -> int = a / b\n"))
 
 @test("prove: a precondition discharges a division's obligations")
 prv_which_a_precondition_discharges()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     assert(prv_proves("ratio(a: int, b: int) -> int\n    require b > 0\n    require a >= 0\n" +
                       "    require a <= 1000\n    a / b\n"))
 
 @test("prove discharges a contract that reads a ghost predicate")
 prv_a_ghost_predicate_is_discharged()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     assert(prv_proves("@ghost\ndivides(d: int, n: int) -> bool = d != 0 && n % d == 0\n\n" +
                       "double_it(n: int) -> int\n    require n >= 0\n    require n <= 1000\n" +
@@ -810,7 +802,7 @@ prv_a_ghost_predicate_is_discharged()
 
 @test("prove discharges a ghost predicate that is a quantifier")
 prv_and_a_quantifier_predicate_discharges_too()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     assert(prv_proves("@ghost\nsmall(n: int) -> bool = for all i in 0..<n do i < n\n\n" +
                       "f(n: int) -> int\n    require small(n)\n    n\n"))
@@ -822,7 +814,7 @@ prv_and_a_quantifier_predicate_discharges_too()
 // nothing on standard error, and exits 2 -- Why3's own status, passed through.
 @test("prove runs Why3, says every goal was discharged, and passes Why3's status through")
 prv_the_command_discharges_and_passes_the_status_through()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     val (dir, file) = prv_file("half(x: int) -> int\n    require x >= 0\n    ensure result >= 0\n    x / 2\n")
     val (code, said) = prv_run(["sysl", "prove", file])
@@ -866,7 +858,7 @@ end prv_without_why3_says_where_it_comes_from
 // `Alt-Ergo 2.6.3 (BV)`, `Alt-Ergo 2.6.3 (counterexamples)`, `Z3 4.15.4` and two Z3 variants.
 @test("prove names its prover as Why3 lists it, the plain entry, Alt-Ergo first")
 prv_names_the_prover_as_why3_lists_it()
-    if !prv_why3_here() then return
+    prv_needs_why3()
 
     val p = why3_prover("why3").unwrap()
 
