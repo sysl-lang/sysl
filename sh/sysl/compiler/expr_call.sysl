@@ -66,8 +66,35 @@ private pending_named(cx: &Analyzer, name: string) -> bool
     false
 end pending_named
 
+// A call, with every complaint written at the whole call shown at its callee's name for as long as
+// it is being read -- and the call around it given its anchor back afterwards, an argument being a
+// call of its own.
 call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
           expected: Option[Type]) -> TExpr
+    val outer = cx.call_anchor
+    val named = callee_anchor(callee)
+
+    if named.is_some() then cx.call_anchor = Some((span, named.unwrap()))
+
+    val out = call_read(cx, span, callee, args, expected)
+
+    cx.call_anchor = outer
+    out
+end call_expr
+
+// Where a complaint about a call to this callee points: a name at itself, a member at its name (a
+// `Field`'s span is already that), a written instantiation at its `[`, and a call of a call where
+// the inner one does. Any other callee keeps the whole call.
+private callee_anchor(callee: Expr) -> Option[Span] = *callee.kind match
+    Ident(_) -> Some(callee.span)
+    Field(_, _) -> Some(callee.span)
+    Index(_, _) -> Some(Span(callee.span.start, callee.span.start + 1))
+    TypeArgs(_, _) -> Some(Span(callee.span.start, callee.span.start + 1))
+    Call(inner, _) -> callee_anchor(inner)
+    _ -> None
+
+private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
+                  expected: Option[Type]) -> TExpr
     *callee.kind match
         Ident(name) ->
             // A nested function is called on the receiver the body already has, and the name is the
@@ -280,7 +307,7 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             // type the reader never wrote -- so the lookup sees the mode and the message can name it.
             call_member(cx, span, tr, member, args, expected, receiver_bound(cx, receiver))
         _ -> call_value(cx, span, callee, args, expected)
-end call_expr
+end call_read
 
 // **The head of a call may be any expression whose type says it is callable** — the result of
 // another call, an element of an array of them, an item read out of a container. `reference/types.md
