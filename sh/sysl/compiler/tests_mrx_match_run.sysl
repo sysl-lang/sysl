@@ -1,0 +1,543 @@
+module sh.sysl.compiler
+@tests
+
+// What a `match` *does* at run time (`reference/patterns.md`): literal, alternative, range and
+// wildcard arms, struct and variant destructuring, guards, a match as a value and as a statement,
+// the counts of what an arm binds, and a simple enum narrower than `i32`.
+//
+// **Every output quoted here was read out of the reference compiler**, whose `MatchRunTests` these
+// are. The programs are built and run through `tests_enm_enum_run.sysl`'s helpers.
+
+@test("literal, alternative, range, and else arms")
+mrx_literal_alternative_range_and_else_arms()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        classify(n: int) -> string
+            n match
+                0 -> "zero"
+                1 | 2 | 3 -> "small"
+                4..10 -> "medium"
+                else "large"
+        print(classify(0), classify(2), classify(7), classify(99))
+        """), "zero small medium large\n")
+
+@test("a bool matches its two literal values without an else")
+mrx_a_bool_matches_both_values_without_an_else()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        word(b: bool) -> string
+            b match
+                true -> "yes"
+                false -> "no"
+        print(word(true), word(false))
+        """), "yes no\n")
+
+@test("a bool match reads a computed condition")
+mrx_a_bool_match_reads_a_computed_condition()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        parity(n: int) -> string
+            n % 2 == 0 match
+                true -> "even"
+                false -> "odd"
+        print(parity(4), parity(7))
+        """), "even odd\n")
+
+@test("a bool match may cover one value and fall through to else")
+mrx_a_bool_match_may_cover_one_value()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        flag(b: bool) -> int
+            b match
+                true -> 1
+                else 0
+        print(flag(true), flag(false))
+        """), "1 0\n")
+
+@test("a positional struct pattern destructures every field in order")
+mrx_a_positional_struct_pattern_destructures_in_order()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        end Point
+        classify(p: Point) -> string
+            p match
+                Point(0, 0) -> "origin"
+                Point(x, 0) -> "x-axis"
+                Point(0, y) -> "y-axis"
+                else "elsewhere"
+        print(classify(Point(0, 0)), classify(Point(5, 0)), classify(Point(0, 3)), classify(Point(1, 2)))
+        """), "origin x-axis y-axis elsewhere\n")
+
+@test("an irrefutable struct pattern is exhaustive without an else")
+mrx_an_irrefutable_struct_pattern_is_exhaustive()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        end Point
+        sum(p: Point) -> int
+            p match
+                Point(x, y) -> x + y
+        print(sum(Point(3, 4)))
+        """), "7\n")
+
+@test("a named struct pattern matches fields by name and may omit them")
+mrx_a_named_struct_pattern_matches_by_name()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        end Point
+        where(p: Point) -> string
+            p match
+                Point{x: 0} -> "y-axis"
+                Point{y: 0} -> "x-axis"
+                Point{x, y} -> "elsewhere"
+        print(where(Point(0, 9)), where(Point(9, 0)), where(Point(3, 4)))
+        """), "y-axis x-axis elsewhere\n")
+
+@test("a named-field shorthand binds each field to its own name")
+mrx_a_named_field_shorthand_binds_each_field()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        end Point
+        swapSum(p: Point) -> int
+            p match
+                Point{y, x} -> x * 10 + y
+        print(swapSum(Point(3, 4)))
+        """), "34\n")
+
+@test("a struct pattern nests inside another struct pattern")
+mrx_a_struct_pattern_nests_inside_another()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        end Point
+        struct Line
+            a: Point
+            b: Point
+        end Line
+        describe(l: Line) -> string
+            l match
+                Line(Point(0, 0), b) -> "from origin"
+                else "other"
+        print(describe(Line(Point(0, 0), Point(3, 4))), describe(Line(Point(1, 1), Point(2, 2))))
+        """), "from origin other\n")
+
+// A bound refcounted field is retained on bind and released once, and the struct scrutinee is torn
+// down each iteration — a leak or a double free would drift or crash over the loop.
+@test("binding a refcounted struct field neither leaks nor frees twice")
+mrx_binding_a_refcounted_struct_field()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Named
+            tag: string
+            n: int
+        end Named
+        var total = 0
+        for i in 1..5000
+            var nm = Named("ab" + "cd", i)
+            var got = nm match
+                Named{tag: t, n} -> int(t[0]) + n
+            total += got
+        print(total)
+        """), "12987500\n")
+
+@test("an exclusive range pattern excludes its upper bound")
+mrx_an_exclusive_range_excludes_its_upper_bound()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        band(n: int) -> string
+            n match
+                0..<10 -> "low"
+                else "high"
+        print(band(9), band(10))
+        """), "low high\n")
+
+@test("guards select among wildcard arms")
+mrx_guards_select_among_wildcard_arms()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        sign(x: int) -> int
+            x match
+                _ if x > 0 -> 1
+                _ if x < 0 -> -1
+                else 0
+        print(sign(5), sign(-3), sign(0))
+        """), "1 -1 0\n")
+
+@test("match runs as a statement for its effect")
+mrx_match_runs_as_a_statement()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var n = 2
+        n match
+            1 -> print("one")
+            2 -> print("two")
+            else print("many")
+        """), "two\n")
+
+// The first arm wins when its guard holds, and a failed guard falls through to a later arm whose
+// pattern overlaps it.
+@test("a failed guard falls through to a later overlapping arm")
+mrx_a_failed_guard_falls_through_to_an_overlapping_arm()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        classify(n: int) -> string
+            n match
+                1..10 if n > 5 -> "high"
+                1..10 -> "low"
+                else "other"
+        print(classify(3), classify(7), classify(50))
+        """), "low high other\n")
+
+@test("an inclusive range pattern includes both bounds")
+mrx_an_inclusive_range_includes_both_bounds()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        band(n: int) -> string
+            n match
+                3..7 -> "in"
+                else "out"
+        print(band(2), band(3), band(7), band(8))
+        """), "out in in out\n")
+
+@test("a guarded arm on a data variant falls through while keeping the binding")
+mrx_a_guarded_variant_arm_falls_through()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Tree
+            Leaf(v: int)
+            Node(l: int, r: int)
+        sum(t: Tree) -> int
+            t match
+                Leaf(v) if v < 0 -> 0
+                Leaf(v) -> v
+                Node(a, b) -> a + b
+        print(sum(Leaf(5)), sum(Leaf(-3)), sum(Node(10, 20)))
+        """), "5 0 30\n")
+
+@test("a nested variant pattern destructures through a layer")
+mrx_a_nested_variant_pattern_destructures_a_layer()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Inner
+            Val(n: int)
+            Nought
+        enum Outer
+            Wrap(i: Inner)
+            Bare
+        peek(o: Outer) -> int
+            o match
+                Wrap(Val(n)) -> n
+                Wrap(Nought) -> -1
+                else -2
+        print(peek(Wrap(Val(42))), peek(Wrap(Nought)), peek(Bare))
+        """), "42 -1 -2\n")
+
+// A variant's payload is tested only once its tag says the payload is that variant's: the
+// alternatives here reach a `char` payload and a `string` one, so reading the wrong one cannot pass
+// by coincidence.
+@test("across an alternation whose variants carry different types")
+mrx_payload_tested_across_an_alternation()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Arg
+            Short(name: char)
+            Long(name: string)
+            Positional(value: string)
+        one(a: Arg) -> string
+            a match
+                Short('o') | Long("output") -> "matched"
+                Short(_) -> "other short"
+                Long(_) -> "other long"
+                Positional(_) -> "pos"
+        print(one(Short('o')), one(Long("output")), one(Short('v')), one(Long("x")))
+        """), "matched matched other short other long\n")
+
+@test("in a plain arm whose literal is a string")
+mrx_payload_tested_in_a_plain_string_arm()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Arg
+            Short(name: char)
+            Long(name: string)
+        pick(a: Arg) -> string
+            a match
+                Long("output") -> "the output option"
+                Short(_) -> "short"
+                Long(_) -> "other long"
+        print(pick(Long("output")), pick(Short('o')), pick(Long("x")))
+        """), "the output option short other long\n")
+
+@test("through a nested variant, where the outer tag rules the inner payload out")
+mrx_payload_tested_through_a_nested_variant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Inner
+            Val(s: string)
+        enum Outer
+            Wrap(i: Inner)
+            Bare(s: string)
+        peek(o: Outer) -> string
+            o match
+                Wrap(Val("hit")) -> "wrapped hit"
+                Wrap(_) -> "wrapped"
+                Bare(_) -> "bare"
+        print(peek(Wrap(Val("hit"))), peek(Wrap(Val("no"))), peek(Bare("hit")))
+        """), "wrapped hit wrapped bare\n")
+
+@test("a nullary variant pattern takes a qualifier as a data one does")
+mrx_a_nullary_variant_pattern_takes_a_qualifier()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Outer
+            Wrap(n: int)
+            Bare
+        peek(o: Outer) -> int
+            o match
+                Outer.Wrap(n) -> n
+                Outer.Bare -> -1
+        print(peek(Wrap(7)), peek(Bare))
+        """), "7 -1\n")
+
+@test("a guard is evaluated only when its arm's pattern matches")
+mrx_a_guard_runs_only_when_its_pattern_matches()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        noisy() -> bool
+            print("guard")
+            true
+        end noisy
+        check(n: int) -> int
+            n match
+                5 if noisy() -> 1
+                else 0
+        print(check(3))
+        print(check(5))
+        """), "0\nguard\n1\n")
+
+@test("the scrutinee is evaluated exactly once")
+mrx_the_scrutinee_is_evaluated_once()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        src() -> int
+            print("eval")
+            2
+        end src
+        src() match
+            1 -> print("one")
+            2 -> print("two")
+            else print("other")
+        """), "eval\ntwo\n")
+
+// The arms meet at `&Point`: the bound payload is already one and the value arm is boxed. The
+// extracted payload outlives the enum it was bound from.
+@test("a match in a &T context extracts a reference payload alongside a value arm")
+mrx_a_ref_context_match_extracts_a_payload()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        enum Box
+            Full(p: &Point)
+            Empty
+        extract(b: Box) -> &Point
+            b match
+                Full(p) -> p
+                Empty -> Point(0, 0)
+        var got = extract(Full(Point(11, 22)))
+        var zero = extract(Empty)
+        print(got.x, got.y, zero.x)
+        """), "11 22 0\n")
+
+// A long loop catches a double free (a crash) or a wrong count (a wrong total).
+@test("an extracted reference payload is retained on bind and freed exactly once")
+mrx_an_extracted_payload_is_freed_once()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        enum Box
+            Full(p: &Point)
+            Empty
+        extract(b: Box) -> &Point
+            b match
+                Full(p) -> p
+                Empty -> Point(0, 0)
+        var i = 0
+        var total = 0
+        while i < 20000
+            var got = extract(Full(Point(3, 0)))
+            total += got.x
+            i++
+        print(total)
+        """), "60000\n")
+
+// The guard-fallthrough path binds a counted payload and releases it exactly once when the guard
+// fails.
+@test("a refcounted binding under a failed guard is released exactly once")
+mrx_a_binding_under_a_failed_guard_is_released_once()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        enum Cell
+            Full(p: &Point)
+            Empty
+        score(c: Cell) -> int
+            c match
+                Full(p) if p.x > 100 -> 1
+                Full(p) -> p.x
+                Empty -> 0
+        var total = 0
+        var i = 0
+        while i < 20000
+            total += score(Full(Point(i % 200, 0)))
+            i++
+        print(total)
+        """), "514900\n")
+
+// A simple enum is its discriminant, so a `: iN` annotation is its storage and a variant test
+// compares at that width rather than at `i32`.
+@test("matches its variants at its own width")
+mrx_a_narrow_enum_matches_at_its_own_width()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Op: u8
+            Halt
+            Push
+            Jump
+        name(o: Op) -> string
+            o match
+                Halt -> "halt"
+                Push -> "push"
+                Jump -> "jump"
+        print(name(Halt), name(Push), name(Jump))
+        """), "halt push jump\n")
+
+@test("compares a discriminant that fills the high half of a byte")
+mrx_a_narrow_enum_compares_a_high_byte()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Code: u8
+            Fine = 3
+            Gone = 200
+            Late = 255
+        word(c: Code) -> string
+            c match
+                Fine -> "fine"
+                Gone -> "gone"
+                Late -> "late"
+        print(word(Fine), word(Gone), word(Late))
+        """), "fine gone late\n")
+
+@test("matches a negative discriminant of a signed underlying type")
+mrx_a_narrow_enum_matches_a_negative_discriminant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Trend: i8
+            Down = -1
+            Flat = 0
+            Up = 1
+        step(t: Trend) -> int
+            t match
+                Down -> -10
+                Flat -> 0
+                Up -> 10
+        print(step(Down), step(Flat), step(Up))
+        """), "-10 0 10\n")
+
+@test("matches at a width between the byte and the word")
+mrx_a_narrow_enum_matches_at_sixteen_bits()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Port: u16
+            Shut = 0
+            Http = 80
+            High = 40000
+        busy(p: Port) -> bool
+            p match
+                Shut -> false
+                Http -> true
+                High -> true
+        print(busy(Shut), busy(Http), busy(High))
+        """), "false true true\n")
+
+// Inside a data enum's payload the value arrives from an `extractvalue` rather than off a local.
+@test("matches inside another enum's payload")
+mrx_a_narrow_enum_matches_inside_a_payload()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Op: u8
+            Halt
+            Push
+        read(o: Option[Op]) -> int
+            o match
+                Some(Halt) -> 0
+                Some(Push) -> 1
+                else -1
+        var some: Option[Op] = Some(Push)
+        var gone: Option[Op] = None
+        print(read(some), read(gone))
+        """), "1 -1\n")
+
+@test("discriminates a value the fallible constructor handed back")
+mrx_a_narrow_enum_discriminates_what_try_returned()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Op: u8
+            Halt
+            Push = 9
+        decode(b: u8) -> string
+            Op.try(b) match
+                Some(Halt) -> "halt"
+                Some(Push) -> "push"
+                else "?"
+        print(decode(0u8), decode(9u8), decode(4u8))
+        """), "halt push ?\n")
