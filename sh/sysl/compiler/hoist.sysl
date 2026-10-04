@@ -300,8 +300,17 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // never reach this walk.
         VarDecl(name, typ, init, vis, align, section, thread_local) ->
             hoist_storage(a, scope, s.span, name, typ, vis, init, align, section, thread_local)
+        // **The back end's namespace holds code, never storage**: left alone this emits
+        // `@llvm.x = external global`, which the verifier refuses for a reason nobody would trace
+        // back to the line that caused it.
         ExternVarDecl(name, typ, link, vis) ->
-            check_foreign_symbol(a, scope, s.span, link.unwrap_or(name), link.is_some())
+            if is_intrinsic_name(link.unwrap_or(name))
+                a.fault(scope, s.span, s"'${link.unwrap_or(name)}' is in the namespace the back end's " +
+                        "own operations live in, and those are code rather than storage — an " +
+                        "'extern' variable names a symbol the linker resolves")
+            else
+                check_foreign_symbol(a, scope, s.span, link.unwrap_or(name), link.is_some())
+
             hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.extern_vars,
                         "'extern' variable", None, None, None, false, link)
         ExternDecl(d) -> hoist_extern(a, scope, s.span, d)
