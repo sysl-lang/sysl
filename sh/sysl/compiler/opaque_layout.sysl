@@ -1,0 +1,47 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+
+// **An `opaque struct` withholds its layout from every module but the one declaring it**
+// (`reference/ffi.md § opaque`). Outside, the type is incomplete exactly as C's `struct foo;` is, and
+// the one thing that may be said about it is `*Name`.
+//
+// The reach is the declaring module **exactly**, not a subtree the way `private[M]` widens: what the
+// modifier buys is that a field may move with nothing downstream recompiled, and the unit that
+// recompiles together is the module. A submodule is a different scope however its name reads.
+//
+// Every refusal is one message because it is one fact, and a reader who hits any of them needs the
+// same next step -- reach the value through that module's own functions. The positions are the ones
+// that need a size or an offset: a type written anywhere but behind a `*` (`resolve_named`), a
+// construction, a field selection, a dereference, a by-value receiver, and a temporary's address.
+
+// Whether the layout of the struct at `key` is hidden from code written in `scope`.
+layout_hidden(a: &Analysis, scope: Scope, key: string) -> bool
+    val d = a.tables.types.get(key)
+
+    if d.is_none() then return false
+
+    d.unwrap().kind match
+        StructOf(s) -> s.opaque && d.unwrap().scope.module_name != scope.module_name
+        _ -> false
+end layout_hidden
+
+// Refuses a use of the struct at `key` that would need its layout, answering whether it was allowed.
+// `written` is how the diagnostic names the type: what the source wrote where it wrote a type, the
+// qualified name where it reached the type through a value.
+layout_known(a: &Analysis, scope: Scope, span: Span, key: string, written: string) -> bool
+    if !layout_hidden(a, scope, key) then return true
+
+    val home = a.tables.types.get(key).unwrap().scope.module_name
+
+    a.fault(scope, span, s"'$written' is opaque outside '$home', so its layout is not known here — " +
+            s"it may be named as '*$written' and passed to that module's own functions, but not " +
+            "built, held by value, laid out inside another type, taken apart, or measured")
+    false
+end layout_known
+
+// The same asked of a value's type, where the type is a struct: a dereference produces the value, a
+// by-value receiver is a copy of it, and a temporary's address lays one down.
+value_layout_known(cx: &Analyzer, span: Span, ty: Type) -> bool = underlying(ty) match
+    Struct(d) -> layout_known(cx.an, cx.scope, span, d.base, qualified_name(d.base))
+    _ -> true

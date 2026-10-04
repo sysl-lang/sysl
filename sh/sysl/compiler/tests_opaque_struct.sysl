@@ -1,0 +1,401 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+import sysl.text.Search
+
+// **`opaque struct` withholds a type's layout from every module but the one declaring it**
+// (`reference/ffi.md § opaque`). Two things want it and they meet in the middle: a sysl library that
+// wants to add and reorder fields with nothing downstream noticing, and a binding to a C library that
+// wants `*sqlite3` to be a type a `*u8` cannot be mistaken for. Outside the declaring module the type
+// is incomplete exactly as C's `struct foo;` is, and the only thing that may be said about it is
+// `*Name`.
+//
+// The claims are about programs of several modules, so each case is a tree built and run.
+//
+// **Every refusal quoted here was obtained by running the reference compiler (0.0.157) on the same
+// source.** Where it reached the type through a value -- a dereference, a by-value receiver -- the
+// reference names the type by its internal key (`'Conn'`, `'*net$Conn'`); this compiler names it as a
+// reader writes it, so those cases quote the sentence and the qualified name.
+
+// A module declaring an opaque type with a real layout, plus the functions that are the only way to
+// do anything with one. What leaves it is a `*Conn`, which is the whole downstream interface.
+private osx_conn() -> string =
+    "module net\n\nopaque struct Conn\n    fd: int\n    live: bool\nend Conn\n\n" +
+    "fd_of(c: *Conn) -> int = c.fd\n\nsum(a: *Conn, b: *Conn) -> int = a.fd + b.fd\n\n" +
+    "here() -> int\n    var c = Conn(7, true)\n\n    fd_of(&c)\nend here\n"
+
+// The same kind of type carrying both receiver forms, since which of them survives the boundary is
+// the question a caller of an opaque type actually has.
+private osx_with_methods() -> string =
+    "module net\n\nopaque struct Handle\n    fd: int\n\n    through(*self) -> int = self.fd\n\n" +
+    "    copied(self) -> int = self.fd\nend Handle\n\n" +
+    "make() -> int\n    var h = Handle(9)\n\n    h.through()\nend make\n"
+
+// The refusal every position that needs `net.Conn`'s layout earns.
+private osx_refusal() -> string =
+    "'net.Conn' is opaque outside 'net', so its layout is not known here — it may be named as " +
+    "'*net.Conn' and passed to that module's own functions, but not built, held by value, laid out " +
+    "inside another type, taken apart, or measured"
+
+// The part of it that does not depend on how the type is named.
+private osx_said() -> string = "is opaque outside 'net', so its layout is not known here"
+
+// What a program of these files prints, or what the build had to say about it.
+private osx_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end osx_out
+
+// A program of one module beside its entry file.
+private osx_two(dir: string, file: string, text: string, main: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    fs.push((dir, file, text))
+    osx_out(fs)
+end osx_two
+
+private osx_with_conn(main: string) -> string = osx_two("net", "conn.sysl", osx_conn(), main)
+
+// -- inside the module that declares it, nothing changes -------------------------------------------
+
+@test("it is built, held by value, and its fields are read")
+osx_built_held_and_read_inside()
+    if im_can_run() then return
+
+    assert_eq(osx_with_conn("print(net.here())"), "7\n")
+
+@test("a member may take it by value, which only this module could have written")
+osx_member_takes_it_by_value()
+    if im_can_run() then return
+
+    val net = "module net\n\nopaque struct Conn\n    fd: int\nend Conn\n\n" +
+              "doubled(c: Conn) -> int = c.fd * 2\n\nhere() -> int = doubled(Conn(21))\n"
+
+    assert_eq(osx_two("net", "conn.sysl", net, "print(net.here())"), "42\n")
+
+// -- outside, only a pointer to it may be named -----------------------------------------------------
+
+@test("a pointer may be held, passed back in, and compared")
+osx_pointer_held_and_compared()
+    if im_can_run() then return
+
+    assert_eq(osx_with_conn("var c: *net.Conn = null\nprint(c == null)\n"), "true\n")
+
+@test("a binding of it by value is refused")
+osx_binding_by_value_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("var c: net.Conn\nprint(1)\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_binding_by_value_refused
+
+@test("a by-value parameter is refused")
+osx_by_value_parameter_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("take(c: net.Conn) -> int = 1\nprint(1)\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_by_value_parameter_refused
+
+@test("a by-value result is refused")
+osx_by_value_result_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("give(c: *net.Conn) -> net.Conn = *c\nprint(1)\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_by_value_result_refused
+
+@test("embedding it in another type is refused, since that type would have to lay it out")
+osx_embedding_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("struct Holder\n    c: net.Conn\nend Holder\n\nprint(1)\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_embedding_refused
+
+@test("an array of them is refused, since a row of them needs a stride")
+osx_array_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("var cs: [4]net.Conn\nprint(1)\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_array_refused
+
+@test("constructing one is refused — the module's own function is the way to get one")
+osx_construction_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("var c = net.Conn(1, true)\nprint(1)\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_construction_refused
+
+@test("'sizeof' is refused, which is the question asked outright")
+osx_sizeof_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("print(sizeof(net.Conn))\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_sizeof_refused
+
+@test("and so is 'alignof'")
+osx_alignof_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("print(alignof(net.Conn))\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_alignof_refused
+
+// An offset is the one fact the modifier exists to withhold, so this is the question asked most
+// directly of all -- refused by resolving the written type, as the other two are.
+@test("and 'offsetof', which asks for the withheld fact by name")
+osx_offsetof_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("print(offsetof(net.Conn, fd))\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_offsetof_refused
+
+@test("reading a field through the pointer is refused, since that needs an offset")
+osx_field_read_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("f(c: *net.Conn) -> int = c.fd\nprint(1)\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_field_read_refused
+
+// Dereferencing produces the value, which is the thing there is no layout for.
+@test("dereferencing one is refused")
+osx_dereference_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("f(c: *net.Conn) -> int\n    var here = *c\n    1\nend f\n\nprint(1)\n")
+
+    assert(said.contains(osx_said()), said)
+    assert(said.contains("'*net.Conn'"), said)
+end osx_dereference_refused
+
+// A pointer to a pointer is still only ever a pointer, so the layout is never wanted.
+@test("a pointer to a pointer to one is fine")
+osx_pointer_to_pointer_fine()
+    if im_can_run() then return
+
+    assert_eq(osx_with_conn("var c: *net.Conn = null\nvar p = &c\nprint(*p == null)\n"), "true\n")
+
+// The nesting case: a pointer excuses its own pointee and nothing deeper. `*Holder` is legal, and
+// `Holder`'s by-value field is not made legal by it.
+@test("a pointer excuses one level and not the subtree")
+osx_pointer_excuses_one_level()
+    if im_can_run() then return
+
+    val said = osx_with_conn("struct Holder\n    c: net.Conn\nend Holder\n\n" +
+                             "f(h: *Holder) -> int = 1\n\nprint(1)\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_pointer_excuses_one_level
+
+// -- a struct with no body at all is C's incomplete type --------------------------------------------
+
+@test("an opaque one may have none, which is what a C handle is")
+osx_c_handle_has_no_body()
+    if im_can_run() then return
+
+    val sq = "module sq\n\nopaque struct Session\n\nextern \"strlen\" length(s: *u8) -> usize\n"
+
+    assert_eq(osx_two("sq", "lib.sysl", sq, "var s: *sq.Session = null\nprint(s == null)\n"), "true\n")
+
+@test("an ordinary one may not, and is told what to write instead")
+osx_ordinary_empty_refused()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "struct Empty\n\nprint(1)\n"))
+
+    val said = osx_out(fs)
+
+    assert(said.contains("'struct Empty' declares no fields — a struct's body is indented under it, " +
+                         "a type with no fields at all is written 'struct Empty' closed by 'end " +
+                         "Empty', and one with no layout of its own is written 'opaque struct Empty'"),
+           said)
+end osx_ordinary_empty_refused
+
+// The point of declaring it at all: `*Session` and `*u8` are different types, where a binding that
+// used `*u8` for the handle had nothing to stop the two being swapped.
+@test("and its pointer is a type of its own, not interchangeable with '*u8'")
+osx_pointer_not_a_byte_pointer()
+    if im_can_run() then return
+
+    val said = osx_two("sq", "lib.sysl", "module sq\n\nopaque struct Session\n",
+                       "f(p: *u8) -> int = 1\nvar s: *sq.Session = null\nprint(f(s))\n")
+
+    assert(said.contains("is *byte, but *sq.Session was given"), said)
+end osx_pointer_not_a_byte_pointer
+
+// -- 'opaque' is still an ordinary name -------------------------------------------------------------
+
+// A soft keyword, for the reason `link` is: the fully opaque end of an alpha channel is exactly the
+// field somebody wants to call it.
+@test("a field may be called it")
+osx_a_field_named_opaque()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "struct Colour\n    opaque: bool\nend Colour\n\nprint(Colour(true).opaque)\n"))
+    assert_eq(osx_out(fs), "true\n")
+end osx_a_field_named_opaque
+
+@test("and a variable may be")
+osx_a_variable_named_opaque()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "var opaque = 5\nprint(opaque + 1)\n"))
+    assert_eq(osx_out(fs), "6\n")
+end osx_a_variable_named_opaque
+
+// -- the reach is the declaring module, no more and no less -----------------------------------------
+
+@test("another file of the same module sees the layout")
+osx_another_file_of_the_module_sees_it()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "print(net.doubled())"))
+    fs.push(("net", "conn.sysl", osx_conn()))
+    fs.push(("net", "more.sysl", "module net\n\ndoubled() -> int\n    var c = Conn(21, true)\n" +
+                                 "    c.fd * 2\nend doubled\n"))
+    assert_eq(osx_out(fs), "42\n")
+end osx_another_file_of_the_module_sees_it
+
+@test("a submodule does not, though its name sits underneath")
+osx_a_submodule_does_not()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "print(1)"))
+    fs.push(("net", "conn.sysl", osx_conn()))
+    fs.push(("net.deep", "inner.sysl", "module net.deep\n\nf() -> usize = sizeof(net.Conn)\n"))
+
+    val said = osx_out(fs)
+
+    assert(said.contains(osx_refusal()), said)
+end osx_a_submodule_does_not
+
+// -- the counted and viewing forms are refused too, since only a raw pointer says nothing about shape
+
+// A counted reference's release has to know what the object holds, which is the layout.
+@test("a '&' to one is refused")
+osx_counted_reference_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("f(c: &net.Conn) -> int = 1\nprint(1)\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_counted_reference_refused
+
+@test("a slice of them is refused, a slice being a row with a stride")
+osx_slice_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("f(cs: []net.Conn) -> int = 1\nprint(1)\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_slice_refused
+
+@test("and a type argument is refused, since the instantiation would hold one")
+osx_type_argument_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("f(o: sysl.Option[net.Conn]) -> int = 1\nprint(1)\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_type_argument_refused
+
+// -- taking one apart is refused wherever the shape would be needed ---------------------------------
+
+// The value the pattern would take apart is the dereference, which is refused first.
+@test("a pattern naming its fields")
+osx_pattern_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("f(c: *net.Conn) -> int\n    *c match\n        net.Conn(a, b) -> a\nprint(1)\n")
+
+    assert(said.contains(osx_said()), said)
+end osx_pattern_refused
+
+@test("and writing a field through the pointer, which is the same offset read backwards")
+osx_field_write_refused()
+    if im_can_run() then return
+
+    val said = osx_with_conn("f(c: *net.Conn) -> unit\n    c.fd = 3\nend f\n\nprint(1)\n")
+
+    assert(said.contains(osx_refusal()), said)
+end osx_field_write_refused
+
+// -- methods on an opaque type ----------------------------------------------------------------------
+
+// A `*self` method is a call through a pointer and needs no shape, while a by-value `self` is handed
+// a copy and needs the whole of it.
+@test("a '*self' method may be called through the pointer")
+osx_pointer_self_method_called()
+    if im_can_run() then return
+
+    assert_eq(osx_two("net", "h.sysl", osx_with_methods(), "print(net.make())"), "9\n")
+
+@test("a by-value 'self' method is refused, since the call would copy the whole of it")
+osx_value_self_method_refused()
+    if im_can_run() then return
+
+    val said = osx_two("net", "h.sysl", osx_with_methods(),
+                       "f(h: *net.Handle) -> int = h.copied()\nprint(1)\n")
+
+    assert(said.contains(osx_said()), said)
+    assert(said.contains("'*net.Handle'"), said)
+end osx_value_self_method_refused
+
+@test("a generic struct may be opaque, and its instantiations are too")
+osx_generic_instantiations_opaque()
+    if im_can_run() then return
+
+    val bx = "module box\n\nopaque struct Box[T]\n    item: T\nend Box\n\npeek(b: *Box[int]) -> int = b.item\n"
+    val said = osx_two("box", "b.sysl", bx, "var b: box.Box[int]\nprint(1)\n")
+
+    assert(said.contains("'box.Box' is opaque outside 'box', so its layout is not known here — it may " +
+                         "be named as '*box.Box' and passed to that module's own functions, but not " +
+                         "built, held by value, laid out inside another type, taken apart, or measured"),
+           said)
+end osx_generic_instantiations_opaque
