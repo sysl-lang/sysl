@@ -1,0 +1,530 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// Linking a `pkg_config` library from its static archive -- the root manifest's `link` key and
+// `--link` (`reference/packages.md § Linking a library statically`).
+//
+// Ported from the reference's `StaticLinkTests`. The rule itself is asserted as pure functions over a
+// made-up `pkg-config` answer and a made-up filesystem, so every case runs on any machine; the
+// end-to-end cases need libuv installed **with** its archive, which Homebrew's is, and return at once
+// where it is not. Every sentence quoted was read off the reference (0.0.159) on the same input.
+
+// -- the 'link' key -------------------------------------------------------------------------------
+
+private slk_manifest(says: string) -> string =
+    s"package { name = \"thing\", version = \"0.1.0\" }\n$says\n"
+
+private slk_read(says: string) -> Manifest = read_manifest(slk_manifest(says)) match
+    Ok(m) -> m
+    Err(why) ->
+        assert(false, s"'$says' was refused: $why")
+        empty_manifest()
+
+private slk_refused(says: string) -> string = read_manifest(slk_manifest(says)) match
+    Ok(_) -> s"'$says' was accepted"
+    Err(why) -> why
+
+// A mode as one comparable string.
+private slk_shown(mode: Option[LinkMode]) -> string = mode match
+    None -> "none"
+    Some(m) -> m match
+        LinkStatic -> "static"
+        LinkDynamic -> "dynamic"
+        LinkOnly(names) -> s"only:${join(names.view(), ",")}"
+
+@test("the 'link' key is absent unless written")
+slk_absent_unless_written()
+    assert_eq(slk_shown(slk_read("").link), "none")
+
+@test("the 'link' key takes 'static', 'dynamic' and a list of pkg_config names")
+slk_three_forms()
+    assert_eq(slk_shown(slk_read("link = \"static\"").link), "static")
+    assert_eq(slk_shown(slk_read("link = \"dynamic\"").link), "dynamic")
+    assert_eq(slk_shown(slk_read("link = [\"openssl\", \"libuv\"]").link), "only:openssl,libuv")
+
+@test("the 'link' key reads an empty list as dynamic, since it names nothing to link statically")
+slk_empty_list_is_dynamic()
+    assert_eq(slk_shown(slk_read("link = []").link), "dynamic")
+
+@test("the 'link' key is a key this compiler knows, so it draws no unknown-key warning")
+slk_no_unknown_key_warning()
+    assert(slk_read("link = \"static\"").warnings.is_empty(), "a warning was drawn")
+
+// One library written as a bare string is the likeliest mistake, so the refusal writes the list.
+@test("the 'link' key refuses a string that is neither mode, and says how to name one library")
+slk_refuses_a_bare_name()
+    val e = slk_refused("link = \"libuv\"")
+
+    assert(e.contains("'link = \"libuv\"' is neither \"static\" nor \"dynamic\""), e)
+    assert(e.contains("'link = [\"libuv\"]'"), e)
+
+@test("the 'link' key refuses a list holding something other than names, and a block")
+slk_refuses_a_list_of_numbers_and_a_block()
+    val numbers = slk_refused("link = [1, 2]")
+    val block = slk_refused("link { libuv = true }")
+
+    assert(numbers.contains("each one a name"), numbers)
+    assert(block.contains("a list of the pkg_config names"), block)
+
+// -- the '--link' flag ----------------------------------------------------------------------------
+
+// What one command line came to. The flag it parsed is left in place for the case to read.
+private slk_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end slk_cli
+
+private slk_flag_after(args: []string) -> string
+    slk_cli(args)
+
+    val got = slk_shown(link_flag())
+
+    reset_search_paths()
+    got
+end slk_flag_after
+
+@test("the '--link' flag takes the same three forms, the list comma-separated")
+slk_flag_three_forms()
+    val p = "/does/not/exist/p.sysl"
+
+    assert_eq(slk_flag_after(["sysl", "build", p]), "none")
+    assert_eq(slk_flag_after(["sysl", "build", p, "--link", "static"]), "static")
+    assert_eq(slk_flag_after(["sysl", "build", p, "--link", "dynamic"]), "dynamic")
+    assert_eq(slk_flag_after(["sysl", "build", p, "--link", "libuv,openssl"]), "only:libuv,openssl")
+
+@test("the '--link' flag belongs to every command that links")
+slk_flag_every_command()
+    val commands = ["build", "run", "test"]
+
+    for i in 0..<commands.len
+        slk_cli(["sysl", commands[i], "/does/not/exist/p.sysl", "--link", "static"])
+
+        assert_eq(link_spelling(chosen_link(link_flag(), None)), "static", commands[i])
+        reset_search_paths()
+
+@test("the '--link' flag refuses an empty name where it was typed")
+slk_flag_refuses_an_empty_name()
+    val got = slk_cli(["sysl", "build", "/does/not/exist/p.sysl", "--link", "libuv,"])
+
+    assert_eq(got.0, Misused)
+    assert(got.1.contains("'--link libuv,' names an empty library — it is 'static', 'dynamic', or " +
+        "the pkg_config names of the libraries to link statically, separated by commas"), got.1)
+
+    val parsed = parse_link_mode("libuv,") match
+        Ok(_) -> "accepted"
+        Err(why) -> why
+
+    assert(parsed.contains("names an empty library"), parsed)
+    reset_search_paths()
+
+// The flag typed for one invocation beats the key written for all, as `-O` beats `optimization`.
+@test("the '--link' flag beats the root manifest's key, and the key beats the default")
+slk_flag_beats_key()
+    assert_eq(link_spelling(chosen_link(Some(LinkDynamic), Some(LinkStatic))), "dynamic")
+    assert_eq(link_spelling(chosen_link(None, Some(LinkStatic))), "static")
+    assert_eq(link_spelling(chosen_link(None, None)), "dynamic")
+
+// -- which -l becomes which archive ---------------------------------------------------------------
+
+private slk_list(items: []string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<items.len
+        out.push(items[i])
+
+    out
+end slk_list
+
+private slk_answer() -> StaticAnswer =
+    StaticAnswer(slk_list(["-L/p/lib", "-luv", "-lpthread", "-lm"]),
+                 slk_list(["-L/p/lib", "-luv", "-lpthread", "-lm", "-lz", "-lextra"]), Some("/p/lib"))
+
+// The archives found, sorted by library name, as `name=path` joined; or the refusal.
+private slk_map(got: Result[Buf[(string, string)], string]) -> string = got match
+    Err(why) -> s"refused: $why"
+    Ok(found) -> slk_pairs(found)
+
+private slk_pairs(found: Buf[(string, string)]) -> string
+    val names = sort_names(archive_names(found))
+    var out: Buf[string] = buf()
+
+    for i in 0..<names.len()
+        for j in 0..<found.len()
+            if found.at(j).0 == names.at(i) then out.push(s"${names.at(i)}=${found.at(j).1}")
+
+    join(out.view(), ",")
+end slk_pairs
+
+private slk_archives(pc: string, answer: StaticAnswer, dirs: []string, files: []string,
+                     required: bool = true) -> Result[Buf[(string, string)], string]
+    val present = slk_list(files)
+
+    static_archives(pc, answer, slk_list(dirs), (f) -> slk_has(present, f), required)
+end slk_archives
+
+private slk_has(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end slk_has
+
+@test("a library with an archive in a directory pkg-config named becomes that archive's path")
+slk_archive_in_a_named_directory()
+    assert_eq(slk_map(slk_archives("libuv", slk_answer(), [], ["/p/lib/libuv.a"])), "uv=/p/lib/libuv.a")
+
+@test("and a --link-path directory is searched after pkg-config's")
+slk_link_path_searched_after()
+    assert_eq(slk_map(slk_archives("libuv", slk_answer(), ["/mine"], ["/mine/libuv.a", "/mine/libz.a"])),
+              "uv=/mine/libuv.a,z=/mine/libz.a")
+
+@test("the libdir is searched where pkg-config printed no -L")
+slk_libdir_searched()
+    val bare = StaticAnswer(slk_list(["-luv"]), slk_list(["-luv"]), Some("/usr/lib/x"))
+
+    assert_eq(slk_map(slk_archives("libuv", bare, [], ["/usr/lib/x/libuv.a"])), "uv=/usr/lib/x/libuv.a")
+
+// Only `--static` named these, so the reader did not: they stay an `-l`.
+@test("a private library with no archive is left an -l")
+slk_private_without_archive_stays()
+    val found = slk_archives("libuv", slk_answer(), [], ["/p/lib/libuv.a"]).unwrap()
+
+    assert(archive_of_name(found, "z").is_none(), "z was taken from an archive")
+    assert_eq(join(static_rewrite(slk_list(["-luv", "-lz"]), found).view(), " "), "/p/lib/libuv.a -lz")
+
+private archive_of_name(found: Buf[(string, string)], name: string) -> Option[string]
+    for i in 0..<found.len()
+        if found.at(i).0 == name then return Some(found.at(i).1)
+
+    None
+end archive_of_name
+
+@test("the platform's own libraries are never replaced, even where an archive of one exists")
+slk_system_libraries_stay()
+    val found = slk_archives("libuv", slk_answer(), [],
+                             ["/p/lib/libuv.a", "/p/lib/libm.a", "/p/lib/libpthread.a"])
+
+    assert_eq(slk_map(found), "uv=/p/lib/libuv.a")
+
+@test("a library the program links directly with no archive is refused, naming the file and the directories")
+slk_direct_without_archive_refused()
+    assert_eq(slk_map(slk_archives("libuv", slk_answer(), ["/mine"], [])),
+              "refused: 'libuv' is to be linked statically, and there is no 'libuv.a' to link it " +
+              "from — looked in /p/lib, /mine. Install its static archive there, or leave 'libuv' " +
+              "out of 'link' to link it dynamically")
+
+// `link = "static"`: nobody named this library, so it is linked dynamically and traced.
+@test("under 'static', a library with no archive is linked dynamically rather than refused")
+slk_static_keeps_dynamic()
+    val found = slk_archives("sqlite3", slk_answer(), ["/mine"], [], false)
+
+    assert_eq(slk_map(found), "")
+    assert_eq(join(static_kept(slk_answer(), found.unwrap()).view(), ","), "uv")
+    assert_eq(static_kept_note("sqlite3", "uv", slk_list(["/p/lib", "/mine"])),
+              "static: 'sqlite3' has no 'libuv.a', so -luv is linked dynamically — looked in /p/lib, /mine")
+
+// A private archive alone would link the library's shared object beside a copy of what it links.
+@test("and one with no archive for any direct library takes none of its private ones either")
+slk_no_direct_archive_takes_no_private()
+    assert_eq(slk_map(slk_archives("libuv", slk_answer(), [], ["/p/lib/libz.a"], false)), "")
+
+@test("while the direct libraries that do have one are still taken from it")
+slk_direct_ones_with_archives_taken()
+    val two = StaticAnswer(slk_list(["-L/p", "-lssl", "-lcrypto"]), slk_list(["-L/p", "-lssl", "-lcrypto"]),
+                           None)
+    val found = slk_archives("libssl", two, [], ["/p/libcrypto.a"], false).unwrap()
+
+    assert_eq(slk_pairs(found), "crypto=/p/libcrypto.a")
+    assert_eq(join(static_kept(two, found).view(), ","), "ssl")
+
+@test("but a library the list NAMES with no archive is refused exactly as before")
+slk_named_without_archive_refused()
+    val got = slk_map(slk_archives("sqlite3", slk_answer(), [], [], true))
+
+    assert(got.starts_with("refused: 'sqlite3' is to be linked statically, and there is no 'libuv.a' " +
+        "to link it from"), got)
+
+private slk_one(name: string, path: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push((name, path))
+    out
+end slk_one
+
+@test("the rewrite touches only the -l names it has an archive for")
+slk_rewrite_only_named()
+    val got = static_rewrite(slk_list(["-L/p", "-luv", "-framework", "Cocoa", "-lSystem"]),
+                             slk_one("uv", "/p/libuv.a"))
+
+    assert_eq(join(got.view(), " "), "-L/p /p/libuv.a -framework Cocoa -lSystem")
+
+// `@link("uv")` and pkg-config's `-luv` name one library; the later place is after everything.
+@test("and an archive named twice is kept at its last place only")
+slk_rewrite_keeps_last_place()
+    val got = static_rewrite(slk_list(["-luv", "-lm", "-L/p", "-luv", "-lpthread"]), slk_one("uv", "/p/libuv.a"))
+
+    assert_eq(join(got.view(), " "), "-lm -L/p /p/libuv.a -lpthread")
+
+@test("and the link line carries the archive where the -l was")
+slk_link_line_carries_the_archive()
+    reset_search_paths()
+
+    val line = link_command("clang", "p.ll", buf(), "out", host_target(), "1", slk_list(["uv"]),
+                            PkgAnswer(buf(), slk_list(["-L/p", "-luv"]), slk_one("uv", "/p/libuv.a")))
+
+    assert(slk_has(line, "/p/libuv.a"), join(line.view(), " "))
+    assert(!slk_has(line, "-luv"), join(line.view(), " "))
+
+// -- a name the build does not declare ------------------------------------------------------------
+
+private slk_unknown(mode: LinkMode, declared: []string, supplied: []string,
+                    could: []string = []) -> string =
+    static_unknown(mode, slk_list(declared), slk_list(supplied), slk_list(could)).unwrap_or("none")
+
+@test("a name the build does not declare is refused, naming the ones it does")
+slk_unknown_name_refused()
+    assert_eq(slk_unknown(LinkOnly(slk_list(["libvu"])), ["libuv", "openssl"], []),
+              "'link' names 'libvu', and no pkg_config requirement in this build is called that — the " +
+              "names are the ones the manifests write under 'requires.pkg_config', which here are " +
+              "libuv, openssl")
+
+@test("and one answered by --include-path is refused, since pkg-config was never asked")
+slk_supplied_name_refused()
+    val got = slk_unknown(LinkOnly(slk_list(["libuv"])), ["libuv"], ["libuv"])
+
+    assert(got.contains("'--include-path libuv=<dir>' answered"), got)
+
+@test("while 'static' and a declared name are not")
+slk_static_and_declared_pass()
+    assert_eq(slk_unknown(LinkStatic, [], []), "none")
+    assert_eq(slk_unknown(LinkOnly(slk_list(["libuv"])), ["libuv"], []), "none")
+
+// `could` is what the build with every feature on requires.
+@test("a name only a feature this build leaves off requires is left out, not refused")
+slk_gated_name_left_out()
+    val mode = LinkOnly(slk_list(["libuv", "lmdb"]))
+
+    assert_eq(join(static_unmatched(mode, slk_list(["libuv"])).view(), ","), "lmdb")
+    assert_eq(slk_unknown(mode, ["libuv"], [], ["libuv", "lmdb"]), "none")
+    assert_eq(join(static_gated(mode, slk_list(["libuv"]), slk_list(["libuv", "lmdb"])).view(), ","), "lmdb")
+
+@test("and a misspelt one is still refused, naming the gated ones among the rest")
+slk_misspelt_refused_with_gated()
+    assert_eq(slk_unknown(LinkOnly(slk_list(["lmbd"])), ["libuv", "sqlite3"], [], ["libuv", "lmdb", "sqlite3"]),
+              "'link' names 'lmbd', and no pkg_config requirement in this build is called that — the " +
+              "names are the ones the manifests write under 'requires.pkg_config', which here are " +
+              "libuv, lmdb, sqlite3")
+
+// -- a real build against libuv -------------------------------------------------------------------
+
+// libuv's archive, where this machine has libuv and an archive beside it -- and the library a whole
+// program needs.
+private slk_archive() -> Option[string]
+    if !std_root().is_ok() then return None
+
+    val answer = pkg_config_query_static("libuv") match
+        Ok(a) -> a
+        Err(_) -> return None
+
+    val dirs = static_searched(answer, buf())
+
+    for i in 0..<dirs.len()
+        if is_file(s"${dirs.at(i)}/libuv.a") then return Some(s"${dirs.at(i)}/libuv.a")
+
+    None
+end slk_archive
+
+// What the binary loads at run time, as the platform's own tool says.
+private slk_loads(exe: string) -> string
+    capture("otool", ["-L", exe], "", [], true) match
+        Ok(out) -> if out.status.ok() then return out.text
+        Err(_) -> ()
+
+    capture("ldd", [exe], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> ""
+end slk_loads
+
+private slk_project(link: string) -> string
+    val root = make_temp_dir("sysl-static-link-").unwrap()
+
+    write_text(s"$root/package.hocon",
+        "package { name = \"app\", version = \"0.1.0\" }\n" +
+        "requires { os = true, heap = true, pkg_config { libuv = \"libuv — brew install libuv\" } }\n" +
+        s"$link\n").unwrap()
+    write_text(s"$root/main.sysl",
+        "@link(\"uv\")\n\nextern uv_version() -> u32\n\nprint(uv_version() > 0)\n").unwrap()
+    root
+end slk_project
+
+// A build of the project: the status, every line the driver said, and the trace the static link
+// kept -- which is what `--verbose` prints.
+private slk_build(root: string, extra: []string = []) -> (int, string, string)
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("build")
+    args.push(root)
+    args.push("-o")
+    args.push(s"$root/out")
+
+    for i in 0..<extra.len
+        args.push(extra[i])
+
+    val got = slk_cli(args.view())
+    val notes = link_notes()
+
+    reset_search_paths()
+    (got.0, got.1, notes)
+end slk_build
+
+// The dynamic build is here so that the static one's assertion is one that could have failed.
+@test("links libuv's dylib when nothing asks otherwise")
+slk_dynamic_by_default()
+    if slk_archive().is_none() then return
+
+    val root = slk_project("")
+    val built = slk_build(root)
+
+    assert_eq(built.0, 0, built.1)
+    assert(slk_loads(s"$root/out").contains("libuv"), slk_loads(s"$root/out"))
+    remove_dir_all(root).unwrap_or(())
+
+@test("and its archive when 'link' names it, so the binary no longer loads libuv")
+slk_static_when_named()
+    val archive = slk_archive() match
+        None -> return
+        Some(a) -> a
+
+    val root = slk_project("link = [\"libuv\"]")
+    val built = slk_build(root)
+
+    assert_eq(built.0, 0, built.1)
+    assert(!slk_loads(s"$root/out").contains("libuv"), slk_loads(s"$root/out"))
+    assert(built.2.contains(s"static: -luv is $archive"), built.2)
+    assert_eq(capture(s"$root/out", [], "", [], true).unwrap().text, "true\n")
+    remove_dir_all(root).unwrap_or(())
+
+@test("and when 'link' says static")
+slk_static_when_static()
+    if slk_archive().is_none() then return
+
+    val root = slk_project("link = \"static\"")
+    val built = slk_build(root)
+
+    assert_eq(built.0, 0, built.1)
+    assert(!slk_loads(s"$root/out").contains("libuv"), slk_loads(s"$root/out"))
+    remove_dir_all(root).unwrap_or(())
+
+@test("and '--link dynamic' overrules the key")
+slk_flag_overrules_key()
+    if slk_archive().is_none() then return
+
+    val root = slk_project("link = \"static\"")
+    val built = slk_build(root, ["--link", "dynamic"])
+
+    assert_eq(built.0, 0, built.1)
+    assert(slk_loads(s"$root/out").contains("libuv"), slk_loads(s"$root/out"))
+    remove_dir_all(root).unwrap_or(())
+
+// A package cannot decide how the application links, for `optimization`'s reason.
+@test("a dependency's own 'link' key is not consulted")
+slk_dependency_key_ignored()
+    if slk_archive().is_none() then return
+
+    val dep = make_temp_dir("sysl-static-link-dep-").unwrap()
+
+    write_text(s"$dep/package.hocon",
+        "package { name = \"dep\", version = \"1.0.0\" }\n" +
+        "requires { os = true, pkg_config { libuv = \"libuv — brew install libuv\" } }\n" +
+        "link = \"static\"\n").unwrap()
+    make_dir_all(s"$dep/dep").unwrap()
+    write_text(s"$dep/dep/dep.sysl", "module dep\n@link(\"uv\")\n\nextern \"uv_version\" version() -> u32\n")
+        .unwrap()
+
+    val root = make_temp_dir("sysl-static-link-app-").unwrap()
+
+    write_text(s"$root/package.hocon",
+        "package { name = \"app\", version = \"0.1.0\" }\n" +
+        "requires { os = true, heap = true }\n" +
+        s"dependencies { d { path = \"$dep\" } }\n").unwrap()
+    write_text(s"$root/main.sysl", "print(dep.version() > 0)\n").unwrap()
+
+    val built = slk_build(root)
+
+    assert_eq(built.0, 0, built.1)
+    assert(slk_loads(s"$root/out").contains("libuv"), slk_loads(s"$root/out"))
+    assert(!built.2.contains("static: "), built.2)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+
+@test("a name the build does not declare stops it")
+slk_undeclared_name_stops_the_build()
+    if slk_archive().is_none() then return
+
+    val root = slk_project("link = [\"libvu\"]")
+    val built = slk_build(root)
+
+    assert(built.0 != 0, "the build went ahead")
+    assert(built.1.contains("'link' names 'libvu'"), built.1)
+    remove_dir_all(root).unwrap_or(())
+
+// -- a name behind a feature this build leaves off -------------------------------------------------
+
+// slate's shape: the library is a dependency's, and the dependency is behind a feature.
+private slk_gated(link: string) -> (string, string)
+    val dep = make_temp_dir("sysl-static-link-gated-dep-").unwrap()
+
+    write_text(s"$dep/package.hocon",
+        "package { name = \"dep\", version = \"1.0.0\" }\n" +
+        "requires { os = true, pkg_config { libuv = \"libuv — brew install libuv\" } }\n").unwrap()
+    make_dir_all(s"$dep/dep").unwrap()
+    write_text(s"$dep/dep/dep.sysl", "module dep\n@link(\"uv\")\n\nextern \"uv_version\" version() -> u32\n")
+        .unwrap()
+
+    val root = make_temp_dir("sysl-static-link-gated-").unwrap()
+
+    write_text(s"$root/package.hocon",
+        "package { name = \"app\", version = \"0.1.0\" }\n" +
+        "requires { os = true, heap = true }\n" +
+        s"dependencies { d { path = \"$dep\", optional = true } }\n" +
+        "features { default = [uv], uv = [d] }\n" +
+        s"$link\n").unwrap()
+    write_text(s"$root/main.sysl", "print(true)\n").unwrap()
+    (root, dep)
+end slk_gated
+
+@test("is left out with a trace, and the build links")
+slk_gated_left_out_and_linked()
+    if !std_root().is_ok() then return
+
+    val dirs = slk_gated("link = [\"libuv\"]")
+    val built = slk_build(dirs.0, ["--no-default-features"])
+
+    assert_eq(built.0, 0, built.1)
+    assert(built.2.contains("link: 'libuv' is required only under a feature this build leaves off"),
+           built.2)
+    remove_dir_all(dirs.0).unwrap_or(())
+    remove_dir_all(dirs.1).unwrap_or(())
+
+@test("while a misspelt one is still refused, naming the gated name among the rest")
+slk_gated_misspelt_refused()
+    if !std_root().is_ok() then return
+
+    val dirs = slk_gated("link = [\"libvu\"]")
+    val built = slk_build(dirs.0, ["--no-default-features"])
+
+    assert(built.0 != 0, "the build went ahead")
+    assert(built.1.contains("'link' names 'libvu', and no pkg_config requirement in this build is " +
+        "called that — the names are the ones the manifests write under 'requires.pkg_config', " +
+        "which here are libuv"), built.1)
+    remove_dir_all(dirs.0).unwrap_or(())
+    remove_dir_all(dirs.1).unwrap_or(())

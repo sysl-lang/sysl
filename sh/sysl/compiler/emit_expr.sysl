@@ -887,9 +887,11 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                     val wide = real_type()
                     val x = if bits == 64 then v else cast_to(e, CastFPExt, base, wide, v)
 
+                    // An infinite end is still compared: `x >= -infinity` is false for a NaN alone,
+                    // which is the whole of what `-infinity..infinity` refuses.
                     d.lo match
                         Some(lo) ->
-                            trap_unless(e, compare_value(e, ">=", wide, x, VFloat(double_bits(str(lo)))),
+                            trap_unless(e, compare_value(e, ">=", wide, x, VFloat(end_bits(lo))),
                                         "within")
                         None -> ()
 
@@ -897,13 +899,14 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                         Some(hi) ->
                             val op = if d.exclusive_hi then "<" else "<="
 
-                            trap_unless(e, compare_value(e, op, wide, x, VFloat(double_bits(str(hi)))),
+                            trap_unless(e, compare_value(e, op, wide, x, VFloat(end_bits(hi))),
                                         "within")
                         None -> ()
                 _ ->
                     d.lo match
                         Some(lo) ->
-                            trap_unless(e, compare_value(e, ">=", base, v, VInt(decimal_int(lo))),
+                            trap_unless(e, compare_value(e, ">=", base, v,
+                                                         VInt(decimal_int(finite_end(lo)))),
                                         "within")
                         None -> ()
 
@@ -911,7 +914,8 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                         Some(hi) ->
                             val op = if d.exclusive_hi then "<" else "<="
 
-                            trap_unless(e, compare_value(e, op, base, v, VInt(decimal_int(hi))),
+                            trap_unless(e, compare_value(e, op, base, v,
+                                                         VInt(decimal_int(finite_end(hi)))),
                                         "within")
                         None -> ()
 
@@ -935,10 +939,10 @@ private gen_constrained_valid(e: *Emit, value: TExpr, c: Type) -> Val
         Constrained(d) ->
             val base = underlying(d.base)
             val lo = d.lo match
-                Some(x) -> decimal_int(x)
+                Some(x) -> decimal_int(finite_end(x))
                 None -> from_int(0)
             val hi = d.hi match
-                Some(x) -> decimal_int(x)
+                Some(x) -> decimal_int(finite_end(x))
                 None -> from_int(0)
 
             val ge_lo = compare_value(e, ">=", base, v, VInt(lo))
@@ -959,14 +963,14 @@ private gen_constrained_step(e: *Emit, value: TExpr, c: Type, up: bool) -> Val
 
             if up
                 val h = d.hi match
-                    Some(x) -> decimal_int(x)
+                    Some(x) -> decimal_int(finite_end(x))
                     None -> from_int(0)
                 val last = if d.exclusive_hi then big_sub(h, from_int(1)) else h
 
                 trap_unless(e, compare_value(e, "<", base, v, VInt(last)), "succ")
             else
                 val first = d.lo match
-                    Some(x) -> decimal_int(x)
+                    Some(x) -> decimal_int(finite_end(x))
                     None -> from_int(0)
 
                 trap_unless(e, compare_value(e, ">", base, v, VInt(first)), "pred")
@@ -1424,6 +1428,12 @@ end zero_of
 // A range bound as a whole number. Every bound an integer type carries is one; a float base's
 // bounds are read by `emit_constraint_checks`' float arm instead, in double precision.
 decimal_int(d: Decimal) -> BigInt = rescale(d, 0, Rounding.Down).coefficient()
+
+// A float base's range end as the `double` it is compared at -- an infinity included, which is the
+// one end no decimal spells.
+private end_bits(r: RangeEnd) -> long = r match
+    EndAt(d) -> double_bits(str(d))
+    EndInfinite(negative) -> if negative then NegInfinityBits else InfinityBits
 
 // -- `?` --------------------------------------------------------------------------------------------
 

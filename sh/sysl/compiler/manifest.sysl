@@ -85,6 +85,10 @@ struct Manifest
     // The level this project's builds hand clang, as clang spells it after the `-O`.
     optimization: Option[string]
 
+    // Which `pkg_config` libraries this project's builds take from their static archives. Only the
+    // root project's applies, as only its `optimization` does.
+    link: Option[LinkMode]
+
     // A key this compiler does not understand is said out loud and then ignored, once per key.
     warnings: Buf[string]
 end Manifest
@@ -92,7 +96,7 @@ end Manifest
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
-             buf(), None, buf())
+             buf(), None, None, buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -231,13 +235,6 @@ end check_floor
 // accident of spelling. It flips with this one line the day this compiler ships under a number of
 // its own.
 const OnTheReleaseLine: bool = false
-
-// The refusal a floor makes, or nothing where this compiler is in no position to make one.
-floor_refusal(who: string, floor: string) -> Option[string]
-    if !OnTheReleaseLine then return None
-
-    check_floor(who, floor, Version)
-end floor_refusal
 
 // The refusal the project being built earns, against a compiler of the given version.
 //
@@ -378,6 +375,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     val allocator = read_allocator(root)?
     val features = read_features(root, dependencies)?
     val optimization = read_optimization(root)?
+    val link = read_link(root)?
 
     val keys = conf_keys(root)
 
@@ -386,7 +384,7 @@ read_manifest(text: string) -> Result[Manifest, string]
 
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
                 target_capabilities, pkg_config, headers, defines, targets, allocator, features,
-                optimization, warnings))
+                optimization, link, warnings))
 end read_manifest
 
 // The warning a key this compiler does not know draws. **Said and then ignored, not refused**: a
@@ -625,6 +623,56 @@ private read_optimization(root: &Conf) -> Result[Option[string], string]
 
     Err(s"'optimization = \"$level\"' names no level clang has — it is one of 0, 1, 2, 3, s, z")
 end read_optimization
+
+// The `link` key: `"static"`, `"dynamic"`, or a list of the `pkg_config` names to link statically.
+// **An empty list is dynamic**, naming nothing to link statically. A single name written as a string
+// is the likeliest slip, so its refusal writes the list it meant.
+private read_link(root: &Conf) -> Result[Option[LinkMode], string]
+    val value = conf_at(root, "link") match
+        None -> return Ok(None)
+        Some(v) -> v
+
+    val what = "'link' says which libraries are linked from their static archives, so it is " +
+        "\"static\", \"dynamic\", or a list of the pkg_config names to link statically"
+
+    *value match
+        Text(s) -> return link_word(s)
+        Word(s) -> if conf_is_prose(value) then return link_word(s)
+        Items(values) ->
+            var names: Buf[string] = buf()
+
+            for i in 0..<values.len()
+                val item = values.at(i)
+
+                val name = *item match
+                    Text(s) -> s
+                    Word(s) -> s
+                    _ -> ""
+
+                if name.is_empty() || !conf_is_prose(item)
+                    return Err(s"$what — each one a name, written as a string")
+
+                var seen = false
+
+                for j in 0..<names.len()
+                    if names.at(j) == name then seen = true
+
+                if !seen then names.push(name)
+
+            return Ok(Some(if names.is_empty() then LinkDynamic else LinkOnly(names)))
+        _ -> ()
+
+    Err(what)
+end read_link
+
+private link_word(s: string) -> Result[Option[LinkMode], string]
+    if s == "static" then return Ok(Some(LinkStatic))
+
+    if s == "dynamic" then return Ok(Some(LinkDynamic))
+
+    Err(s"'link = \"$s\"' is neither \"static\" nor \"dynamic\" — to link one library statically, " +
+        s"name it in a list: 'link = [\"$s\"]'")
+end link_word
 
 // The `features` block, checked against the dependencies it turns on.
 //
@@ -1225,4 +1273,4 @@ private known_package_key(key: string) -> bool =
 private known_top_key(key: string) -> bool =
     key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
     key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
-    key == "links" || key == "features" || key == "optimization"
+    key == "links" || key == "features" || key == "optimization" || key == "link"

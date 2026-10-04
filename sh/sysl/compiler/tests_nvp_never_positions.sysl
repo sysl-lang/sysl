@@ -1,0 +1,133 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// `never` is legal only as a result type (`reference/types.md § unit and never`), and two positions
+// reach a type by roads of their own: an alias's base, and a trait member's parameter -- in the trait
+// and in an `impl` of it. Each is refused with the one message a function's parameter gets, and a
+// member that *returns* `never` stays legal.
+//
+// **Every diagnostic and every `line:col` here was read out of the reference compiler (0.0.162)** by
+// handing the installed `sysl` the same program, except where a test says the reference diverges.
+
+// What the compiler says about a program, and whether it lowered.
+private nvp_emit(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-nvp").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> (why.message, false)
+        Ok(made) ->
+            if !made.report.is_empty() then (analysis_report(made.report), false)
+            else (made.text, true)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end nvp_emit
+
+// How many times a piece of text occurs.
+private nvp_count(said: string, part: string) -> int
+    var rest = said
+    var n = 0
+
+    loop
+        rest.index_of(part) match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + part.bytes.len..<rest.bytes.len]
+
+    n
+end nvp_count
+
+private nvp_never() -> string =
+    "error: 'never' is the type of an expression that does not finish, so it can only be a result type\n"
+
+// The program is refused with the `never` complaint at each of these places and nothing else.
+private nvp_refused(text: string, places: []string)
+    if xvr_no_library() then return
+
+    val out = nvp_emit(text)
+
+    assert(!out.1, s"it compiled: ${out.0}")
+
+    for at in places
+        assert(out.0.contains(s"main.sysl:$at\n"), out.0)
+
+    assert_eq(nvp_count(out.0, nvp_never()), int(places.len), out.0)
+    assert_eq(nvp_count(out.0, "error: "), int(places.len), out.0)
+end nvp_refused
+
+@test("an alias of never is refused at its base")
+nvp_alias_of_never() = nvp_refused("type N = never\nprint(1)", ["1:10"])
+
+@test("an alias of never used as a parameter is refused once, at the alias")
+nvp_alias_as_a_parameter() = nvp_refused("type N = never\nf(x: N) -> int = 1\nprint(1)", ["1:10"])
+
+// The alias is a second spelling of a type, and `never` has no type to be a spelling of anywhere but
+// a result -- so it is refused even where it is only ever used as one.
+@test("an alias of never used only as a result is still refused at the alias")
+nvp_alias_as_a_result() = nvp_refused("type N = never\nstop() -> N = exit(1)\nprint(1)", ["1:10"])
+
+@test("an alias of never as a trait member's parameter is refused at the alias")
+nvp_alias_in_a_trait() = nvp_refused("type N = never\ntrait T\n    m(self, x: N) -> int\nprint(1)", ["1:10"])
+
+@test("a trait member's parameter of never is refused")
+nvp_trait_member_parameter() = nvp_refused("trait T\n    m(self, x: never) -> int\nprint(1)", ["2:16"])
+
+@test("a trait member's parameter of never is refused where the member has a default body")
+nvp_trait_default_parameter() = nvp_refused("trait T\n    m(self, x: never) -> int = 1\nprint(1)", ["2:16"])
+
+// The impl's parameter has been refused where it was written, so the conformance check has nothing
+// to compare it with -- a `?` against the trait's `int` would be a second complaint about the first.
+@test("an impl member's parameter of never is refused, and not again as a signature mismatch")
+nvp_impl_member_parameter() =
+    nvp_refused("trait T\n    m(self, x: int) -> int\n\nimpl T for int\n    m(self, x: never) -> int = 1\nprint(1)",
+                ["5:16"])
+
+// **The reference diverges**: it reports only 2:16, because its conformance check throws at the
+// trait's parameter and takes the impl's member with it. The impl's parameter is a mistake of its
+// own, written in its own place, so both are told -- as two functions with a `never` parameter each
+// are told by the reference itself.
+@test("a never parameter in both the trait and the impl is refused at each")
+nvp_trait_and_impl_parameter() =
+    nvp_refused("trait T\n    m(self, x: never) -> int\n\nimpl T for int\n    m(self, x: never) -> int = 1\nprint(1)",
+                ["2:16", "5:16"])
+
+@test("an unknown type in an impl member's parameter is told once, not again as a mismatch")
+nvp_unknown_impl_parameter()
+    if xvr_no_library() then return
+
+    val out = nvp_emit("trait T\n    m(self, x: int) -> int\n\nimpl T for int\n    m(self, x: Bogus) -> int = 1\nprint(1)")
+
+    assert(!out.1, s"it compiled: ${out.0}")
+    assert(out.0.contains("error: unknown type 'Bogus'\n"), out.0)
+    assert(out.0.contains("main.sysl:5:16\n"), out.0)
+    assert_eq(nvp_count(out.0, "error: "), 1, out.0)
+end nvp_unknown_impl_parameter
+
+@test("an unknown type in an impl member's result is told once, not again as a mismatch")
+nvp_unknown_impl_result()
+    if xvr_no_library() then return
+
+    val out = nvp_emit("trait T\n    m(self) -> int\n\nimpl T for int\n    m(self) -> Bogus = 1\nprint(1)")
+
+    assert(!out.1, s"it compiled: ${out.0}")
+    assert(out.0.contains("error: unknown type 'Bogus'\n"), out.0)
+    assert(out.0.contains("main.sysl:5:16\n"), out.0)
+    assert_eq(nvp_count(out.0, "error: "), 1, out.0)
+end nvp_unknown_impl_result
+
+@test("a trait member returning never, and its impl, stay legal")
+nvp_member_returning_never()
+    if xvr_no_library() then return
+
+    val out = nvp_emit("trait T\n    m(self) -> never\n\nimpl T for int\n    m(self) -> never = exit(1)\nprint(1)")
+
+    assert(out.1, out.0)
+end nvp_member_returning_never

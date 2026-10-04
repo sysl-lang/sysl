@@ -1,0 +1,316 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+import sysl.text.Search
+
+// The reference's `UnicodeIdentTests`: **a name begins with `_` or anything Unicode calls a letter, and
+// continues with that, a digit or a combining mark** (`reference/lexical.md § Identifiers`).
+//
+// Three halves. The token: what the lexer makes of a name written in another script. The ordinary
+// name: a program declaring, reading and calling such names prints what an ASCII one would. And the
+// symbol: every place a symbol is composed from a user's name -- a generic's instantiation, a vtable
+// slot, a variant's payload type, a closure's environment, a destructor's hook, an ownership box, a
+// `declare` across an artifact -- carries the name through the encoding rather than writing it raw.
+//
+// **Every expected output was obtained by running the reference compiler (0.0.162) on the same
+// source.**
+
+// -- the token ------------------------------------------------------------------------------------
+
+@test("a Latin letter with an accent on it")
+uix_a_latin_letter_with_an_accent()
+    assert_eq(bare("café"), of([Ident("café")]))
+    assert_eq(bare("año"), of([Ident("año")]))
+    assert_eq(bare("größe"), of([Ident("größe")]))
+    assert_eq(bare("ação"), of([Ident("ação")]))
+
+// The rule is Unicode's own answer rather than a Latin-1 carve-out, so a script that has nothing to
+// do with the request that prompted it is pinned too.
+@test("and any other script's letters, on the same rule")
+uix_any_other_scripts_letters()
+    assert_eq(bare("μ"), of([Ident("μ")]))
+    assert_eq(bare("Ελλάδα"), of([Ident("Ελλάδα")]))
+    assert_eq(bare("Москва"), of([Ident("Москва")]))
+    assert_eq(bare("名前"), of([Ident("名前")]))
+
+@test("an accented letter may begin a name, since it is a letter")
+uix_an_accented_letter_may_begin_a_name()
+    assert_eq(bare("área"), of([Ident("área")]))
+    assert_eq(bare("Ómnibus"), of([Ident("Ómnibus")]))
+
+@test("a digit still may not begin one")
+uix_a_digit_still_may_not_begin_one()
+    assert_eq(bad("3café"), "invalid literal suffix 'café'")
+
+// A name written in a script with its own digits may use them; the *literal* grammar is unmoved,
+// since a literal is a value the arithmetic has to read.
+@test("a non-ASCII digit may continue a name and may not begin one")
+uix_a_non_ascii_digit_continues_a_name()
+    assert_eq(bare("caf٣"), of([Ident("caf٣")]))
+    assert_eq(bad("٣"), "illegal character")
+
+// Every living script's letters are inside the Basic Multilingual Plane; what is outside is the
+// historic scripts and the CJK extension planes. The diagnostic gives no hint that the plane is what
+// decided it, which is why the edge is asserted rather than left to be discovered.
+@test("a letter above the BMP is refused, and that edge is real")
+uix_a_letter_above_the_bmp_is_refused()
+    assert_eq(bad("𠮷"), "illegal character")
+
+@test("an operator is still not a letter")
+uix_an_operator_is_still_not_a_letter()
+    assert_eq(bad("×"), "illegal character")
+    assert_eq(bad("÷"), "illegal character")
+
+// -- the compiler's own name tests ----------------------------------------------------------------
+
+// A string's subscript is boundary-checked, so every question the compiler asks of a name by its
+// prefix compares bytes: cut at another string's length, `geometría` and `Cuentaañ` end inside a
+// character and the compiler itself traps.
+@test("a name's prefix is asked of its bytes, never by cutting it inside a character")
+uix_a_prefix_is_asked_of_the_bytes()
+    assert(!starts_with_module("geometría", "geometr"))
+    assert(starts_with_module("geometría.básica", "geometría"))
+    assert(!mentions_closure("Cuentaañ.drop"))
+    assert(mentions_closure("Cuentaañ.$closure4"))
+    assert(!is_call_bound("ñandú"))
+    assert(bytes_at("año ñandú", 5, "ñandú"))
+    assert(!bytes_at("año", 1, "ñandú"))
+
+// -- whole programs -------------------------------------------------------------------------------
+
+// What a tree of files PRINTS, or what the build had to say about it.
+private uix_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end uix_out
+
+// What a one-file program prints.
+private uix_ran(main: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    uix_out(fs)
+
+// What a program of an entry file and one module prints.
+private uix_ran_with(main: string, dir: string, file: string, text: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    fs.push((dir, file, text))
+    uix_out(fs)
+
+@test("declared, read and assigned")
+uix_declared_read_and_assigned()
+    if im_can_run() then return
+
+    assert_eq(uix_ran("var año = 3\naño += 4\nprint(año)\n"), "7\n")
+
+@test("as a function and its parameters")
+uix_as_a_function_and_its_parameters()
+    if im_can_run() then return
+
+    assert_eq(uix_ran("área(ancho: real, altura: real) -> real = ancho * altura\nprint(área(3.0, 4.0))\n"),
+              "12\n")
+
+@test("as a struct, its fields and its methods")
+uix_as_a_struct_its_fields_and_methods()
+    if im_can_run() then return
+
+    val src = "struct Círculo\n    radio: real\n\n    área(self) -> real = 3.0 * self.radio * self.radio\n\n" +
+        "val c = Círculo(2.0)\n\nprint(c.radio, c.área())\n"
+
+    assert_eq(uix_ran(src), "2 12\n")
+
+@test("as an enum and its variants")
+uix_as_an_enum_and_its_variants()
+    if im_can_run() then return
+
+    val src = "enum Estación\n    Otoño\n    Invierno\n\nval e = Estación.Otoño\n\n" +
+        "print(e == Otoño, e == Invierno)\n"
+
+    assert_eq(uix_ran(src), "true false\n")
+
+private uix_storage() -> string =
+    "module contabilidad\n\nvar contador: int = 0\n\nincrementar(cuánto: int) -> int\n" +
+    "    contador += cuánto\n    contador\n"
+
+// Module storage is laid into the object file under a mangled name, so this is what says the
+// encoding carries a bare identifier as well as it carried a quoted one.
+@test("as module storage, which is what reaches the emitted symbol")
+uix_as_module_storage()
+    if im_can_run() then return
+
+    assert_eq(uix_ran_with("import contabilidad.incrementar\n\nprint(incrementar(5), incrementar(37))\n",
+                           "contabilidad", "c.sysl", uix_storage()), "5 42\n")
+
+// A bare name and the quoted form of it are one name written two ways.
+@test("and the quoted form of the same name is the same name")
+uix_the_quoted_form_is_the_same_name()
+    if im_can_run() then return
+
+    assert_eq(uix_ran("var café = 3\n`café` += 1\nprint(café)\n"), "4\n")
+
+@test("across a module boundary, imported by name")
+uix_across_a_module_boundary()
+    if im_can_run() then return
+
+    assert_eq(uix_ran_with("import geometría.área\n\nprint(área(41))\n", "geometría", "a.sysl",
+                           "module geometría\n\nárea(x: int) -> int = x + 1\n"), "42\n")
+
+@test("through a nested module path, every segment of which is accented")
+uix_through_a_nested_accented_module_path()
+    if im_can_run() then return
+
+    assert_eq(uix_ran_with("import geometría.básica.área\n\nprint(área(21))\n", "geometría.básica", "a.sysl",
+                           "module geometría.básica\n\nárea(x: int) -> int = x * 2\n"), "42\n")
+
+// -- every place a symbol is composed -------------------------------------------------------------
+
+// The mangled name of an instantiation carries the type argument.
+@test("a generic instantiated at a type whose name is not ASCII")
+uix_a_generic_at_a_non_ascii_type()
+    if im_can_run() then return
+
+    val src = "struct Estación\n    día: int\n\nprimero[T](xs: []const T) -> T = xs[0]\n\n" +
+        "val es = [Estación(4), Estación(9)]\n\nprint(primero(es).día)\n"
+
+    assert_eq(uix_ran(src), "4\n")
+
+// A vtable slot is a global whose initializer names each function, so the name travels as a value
+// naming a global rather than as a `define`.
+@test("a trait, its impl and a dynamic call through the slot")
+uix_a_trait_and_a_dynamic_call()
+    if im_can_run() then return
+
+    val src = "trait Área\n    área(self) -> int\n\nstruct Círculo\n    radio: int\n\n" +
+        "impl Área for Círculo\n    área(self) -> int = 3 * self.radio * self.radio\n\n" +
+        "describir(f: &Área) -> int = f.área()\n\nprint(describir(Círculo(2)))\n"
+
+    assert_eq(uix_ran(src), "12\n")
+
+// The payload type of a variant is a declared type named for the enum and the variant, which a
+// nullary variant never reaches.
+@test("an enum variant that carries a payload, which names a type of its own")
+uix_a_variant_carrying_a_payload()
+    if im_can_run() then return
+
+    val src = "enum Medida\n    Ancho(valor: int)\n    Altura(valor: int)\n\nval m = Ancho(7)\n\n" +
+        "print(m match\n    Ancho(n) -> n\n    Altura(n) -> n * 100)\n"
+
+    assert_eq(uix_ran(src), "7\n")
+
+// A closure's environment is a struct the compiler names, and a captured local is a field of it.
+@test("a closure capturing a local whose name is not ASCII")
+uix_a_closure_capturing_a_non_ascii_local()
+    if im_can_run() then return
+
+    val src = "aplicar(f: () -> int) -> int = f()\n\nval año = 40\n\nprint(aplicar(() -> año + 2))\n"
+
+    assert_eq(uix_ran(src), "42\n")
+
+// A destructor is reached by a hook the emitter names for the type. The receiver is a `&T` because a
+// plain value's scope end runs nothing.
+@test("a destructor, whose hook the emitter names for the type")
+uix_a_destructor_hook()
+    if im_can_run() then return
+
+    val src = "struct Cuentaañ\n    valor: int\n\nimpl Drop for Cuentaañ\n" +
+        "    drop(self) = print(\"suelto\", self.valor)\n\nhacer()\n" +
+        "    val c: &Cuentaañ = Cuentaañ(5)\n    print(\"hecho\", c.valor)\n\nhacer()\nprint(\"fin\")\n"
+
+    assert_eq(uix_ran(src), "hecho 5\nsuelto 5\nfin\n")
+
+// `Display` is the rendering path, and an associated function the receiverless half of member
+// lowering.
+@test("an impl of Display, and an associated function beside it")
+uix_an_impl_of_display_and_an_associated_function()
+    if im_can_run() then return
+
+    val src = "struct Número\n    valor: int\n\n    cero() -> Número = Número(0)\n\n" +
+        "impl Display for Número\n    display(self, out: *Writer, fmt: FormatSpec)\n" +
+        "        \"№\".display(out, fmt)\n        self.valor.display(out, fmt)\n\n" +
+        "print(Número(8), Número.cero())\n"
+
+    assert_eq(uix_ran(src), "№8 №0\n")
+
+// A `&T` is a counted box, and its retain and release are named for the type.
+@test("a boxed value of a type whose name is not ASCII")
+uix_a_boxed_value_of_a_non_ascii_type()
+    if im_can_run() then return
+
+    val src = "struct Árbol\n    peso: int\n\nval a: &Árbol = Árbol(11)\nval b = a\n\nprint(a.peso + b.peso)\n"
+
+    assert_eq(uix_ran(src), "22\n")
+
+// **A `declare` line is the one rendering a whole-program compile never reaches**: a library built
+// against another states the dependency's half rather than emitting a second copy, and that statement
+// carries a name somebody else wrote. Both halves of the module key need the encoding --
+// `geometr$eda$$e1rea` -- which is the shape a single-module program never produces.
+@test("a dependency's compiled half, declared rather than defined, across an artifact")
+uix_a_dependency_declared_across_an_artifact()
+    val base = parse(source_of("geometría/lib.sysl", "module geometría\n\nárea(x: int) -> int = x + 1\n"))
+    val piel = parse(source_of("piel/lib.sysl",
+                               "module piel\n\nimport geometría.área\n\ndoble(x: int) -> int = área(área(x))\n"))
+
+    assert(base.ok(), "the dependency parses")
+    assert(piel.ok(), "the dependent parses")
+
+    var units: Buf[Program] = buf()
+
+    units.push(base.program)
+    units.push(piel.program)
+
+    var own: Buf[string] = buf()
+
+    own.push("piel")
+
+    val built = library_build(units, own, host_target())
+
+    assert(built.report.is_empty(), "the dependent builds")
+
+    val ir = ir_print_module(codegen_with_gaps(built.program, host_target(), built.promotions).0)
+    val lines = lines_of(ir)
+
+    var declared = false
+    var defined = false
+    var doble = false
+
+    for i in 0..<lines.len()
+        val l = lines.at(i)
+
+        if l.starts_with("declare ") && l.contains("@geometr$eda$$e1rea(") then declared = true
+        if l.starts_with("define ") && l.contains("@geometr$eda$$e1rea(") then defined = true
+        if l.starts_with("define ") && l.contains("@piel$doble(") then doble = true
+
+    assert(declared, ir)
+    assert(!defined, "the dependency is stated and not copied")
+    assert(doble, ir)
+end uix_a_dependency_declared_across_an_artifact
+
+// Module storage in an accented module needs the encoding in both halves of `<module>$<name>`.
+@test("module storage in an accented module, read from another module")
+uix_module_storage_read_from_another_module()
+    if im_can_run() then return
+
+    assert_eq(uix_ran_with("import contabilidad.incrementar\n\nprint(incrementar(5), incrementar(37))\n",
+                           "contabilidad", "c.sysl", uix_storage()), "5 42\n")

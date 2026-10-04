@@ -751,6 +751,8 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
     // describe the last step rather than the first.
     if !t.builds_with_clang() then return Err(Said(Refusal(t.no_toolchain())))
 
+    headers_refused(path).map_err(said)?
+
     val emitted = emit_llvm_text(path, named_target, level, also_auto_imported)?
 
     if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
@@ -812,6 +814,8 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
     val archiver = find_ar(None) match
         Err(why) -> return Err(Said(Refusal(why)))
         Ok(found) -> found
+
+    headers_refused(path).map_err(said)?
 
     val lowered = lower_for_c(path, t)?
 
@@ -1086,7 +1090,7 @@ private link_lowered_text(path: string, text: string, t: Target, cc: Option[stri
     // **What this machine says about the libraries the packages named**, asked once for the whole
     // build. It answers both halves of one fact: the `--cflags` a binding's own C is compiled with,
     // and the `-L`, `-l` and `-Wl,-rpath` its archive is linked with.
-    val probed = supplied_or_refused(path, t)?
+    val probed = supplied_or_refused(path, t, true, true)?
 
     val objects = native_objects(clang, path, exe, t, level, probed)?
 
@@ -1136,6 +1140,7 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
 
     heap_refusal(path, t).map_err(said)?
     not_this_machine(t, "run").map_err(said)?
+    headers_refused(path).map_err(said)?
 
     val key = run_cache_key_for("run", path, named_target, level, cc)
 
@@ -1353,6 +1358,8 @@ end TestBuild
 test_build_of(path: string, named_target: Option[string],
               level: string = DefaultOptimization) -> Result[TestBuild, Failure]
     val t = test_target_of(path, named_target)?
+
+    headers_refused(path)?
 
     Ok(test_build_from(packaged_compilation_of(path, t)?, false, level)?)
 end test_build_of
@@ -1701,23 +1708,108 @@ unmet_headers(needs: Buf[HeaderNeed]) -> Option[string]
     None
 end unmet_headers
 
-// The two requirements a command line answers, checked together and in the order a reader can act
-// on: the headers a package's C includes, then the installed libraries it links. `roots` says whether
-// the `--lib` source roots' own requirements are this command's to answer, which they are wherever
-// their C is compiled -- everywhere but `build-lib`.
-private supplied_or_refused(path: string, t: Target, roots: bool = true) -> Result[PkgAnswer, Refusal]
+// The header requirements a command line answers, asked by every command that compiles C **before
+// the analysis**: a `c const` block is measured against those headers, so a tree asked afterwards
+// stops inside the C compiler with `'probe.h' file not found` -- a message naming neither the
+// package that wanted the header nor the flag that supplies it. Asking twice is harmless, a
+// requirement answered from the environment being answered once.
+headers_refused(path: string, roots: bool = true) -> Result[unit, Refusal]
     val headers = header_needs(path, roots)?
 
     answer_headers_from_env(headers)
 
     unmet_headers(headers) match
+        Some(why) -> Err(Refusal(why))
+        None -> Ok(())
+end headers_refused
+
+// The two requirements a command line answers, checked together and in the order a reader can act
+// on: the headers a package's C includes, then the installed libraries it links. `roots` says whether
+// the `--lib` source roots' own requirements are this command's to answer, which they are wherever
+// their C is compiled -- everywhere but `build-lib`.
+//
+// **Which of the libraries come from their archives is asked only by a command that links**
+// (`linking`), since a missing archive is a reason not to link and says nothing to anything else.
+private supplied_or_refused(path: string, t: Target, roots: bool = true,
+                            linking: bool = false) -> Result[PkgAnswer, Refusal]
+    headers_refused(path, roots)?
+
+    val needs = pkg_config_needs(path, roots)?
+    val mode = if linking then link_mode_for(path) else LinkDynamic
+
+    var declared: Buf[string] = buf()
+
+    for i in 0..<needs.len()
+        declared.push(needs.at(i).pc)
+
+    // **A name that matches nothing here may be gated off rather than misspelt**, and only the build
+    // with every feature on can tell the two apart -- so that build is resolved for a stray name and
+    // not otherwise.
+    val stray = static_unmatched(mode, declared)
+
+    var could: Buf[string] = buf()
+
+    if !stray.is_empty()
+        linkable_names(path, roots) match
+            Ok(names) -> could = names
+            Err(why) ->
+                return Err(Refusal(s"'link' names '${stray.at(0)}', and no pkg_config requirement " +
+                    "in this build is called that — whether a package behind a feature this build " +
+                    s"leaves off requires it could not be read: ${why.message}"))
+    end if
+
+    static_unknown(mode, declared, supplied_names(), could) match
         Some(why) -> return Err(Refusal(why))
         None -> ()
 
-    probe_libs(pkg_config_needs(path, roots)?, t) match
+    val gated = static_gated(mode, declared, could)
+
+    for i in 0..<gated.len()
+        link_note(s"link: '${gated.at(i)}' is required only under a feature this build leaves off, " +
+            "so there is nothing of it to link")
+
+    probe_libs(needs, t, mode) match
         Err(why) -> Err(Refusal(why))
         Ok(found) -> Ok(found)
 end supplied_or_refused
+
+// The mode a build of this project links with: `--link`, then the ROOT manifest's `link`, then
+// dynamic. **A dependency's key is never consulted** -- how a program is linked is decided once for
+// the whole of it, and a package that could decide it would be deciding for code it never sees. A
+// manifest that will not read answers dynamic here, the build refusing it in its own words.
+link_mode_for(path: string) -> LinkMode
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+
+    val key = manifest_at(root) match
+        Ok(m) -> m.link
+        Err(_) -> None
+
+    chosen_link(link_flag(), key)
+end link_mode_for
+
+// Every `pkg_config` name the build with **every feature on** requires -- the project's own, each
+// package's that graph reaches, and each `--lib` root's -- which is what tells a name a feature left
+// out from a misspelt one.
+private linkable_names(path: string, roots: bool) -> Result[Buf[string], Refusal]
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+    val mine = manifest_at(root)?
+
+    var out: Buf[string] = buf()
+
+    for i in 0..<mine.pkg_config.len()
+        out.push(mine.pkg_config.at(i).0)
+
+    val dirs = all_feature_trees(root, mine, roots)?
+
+    for i in 0..<dirs.len()
+        manifest_at(dirs.at(i)) match
+            Err(_) -> ()
+            Ok(m) ->
+                for j in 0..<m.pkg_config.len()
+                    out.push(m.pkg_config.at(j).0)
+
+    Ok(out)
+end linkable_names
 
 private discard_objects(objects: Buf[string])
     for i in 0..<objects.len()

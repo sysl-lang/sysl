@@ -1,0 +1,335 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// What an `impl` with type parameters of its own may and may not say. A generic type has one key for
+// all of its instantiations, which is what makes an implementation cover the type as a whole — and
+// what makes an implementation for some of its instantiations a second one for a key that already
+// holds one. A block that states what it assumes of its parameters has its members checked at their
+// definition, once, rather than at whichever instantiation first supplies a type without the method.
+//
+// **Every message quoted here was read out of the reference compiler** (0.0.162) on the same
+// program, whose `ImplGenericErrorTests` these are. Each is a whole program compiled against the
+// standard module, so every test here wants `SYSL_LIB`.
+
+private igx_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end igx_ready
+
+private igx_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program that must be refused is told, every diagnostic in one report.
+private igx_err(text: string) -> string
+    val root = make_temp_dir("sysl-igx").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end igx_err
+
+// The LLVM text of a program that must compile.
+private igx_ir(text: string) -> string
+    val root = make_temp_dir("sysl-igx").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end igx_ir
+
+private igx_refused(text: string, part: string)
+    val said = igx_err(text)
+
+    assert(igx_says(said, part), said)
+
+private igx_lowers(text: string, part: string)
+    val out = igx_ir(text)
+
+    assert(igx_says(out, part), out)
+
+private igx_show() -> string = "trait Show\n    show(self) -> string\n"
+private igx_box() -> string = "struct Box[T]\n    v: T\n"
+private igx_pair() -> string = "struct Pair[A, B]\n    a: A\n    b: B\n"
+
+// -- the subject is the type as a whole ------------------------------------------------------------
+
+@test("so a bare generic name says how to write the block")
+igx_bare_generic_name_says_how_to_write_the_block()
+    if !igx_ready() then return
+
+    val said = igx_err(igx_show() + igx_box() + "impl Show for Box\n    show(self) -> string = \"b\"")
+
+    assert(igx_says(said, "'Box' is generic, so an 'impl' for it covers every instantiation at once"), said)
+    assert(igx_says(said, "write 'impl[T] Show for Box[T]'"), said)
+
+// The advice is meant to be typed, so a library trait is named the way a program spells it.
+@test("and the trait it tells you to write is spelled the way a program spells it")
+igx_advised_trait_is_spelled_as_a_program_spells_it()
+    if !igx_ready() then return
+
+    val said = igx_err(igx_box() + "impl Mul for Box\n    mul(self, rhs: Box[int]) -> Box[int] = self")
+
+    assert(igx_says(said, "write 'impl[T] sysl.Mul for Box[T]'"), said)
+    assert(!igx_says(said, "sysl$Mul"), said)
+
+@test("and an instantiation fixed to one type is refused the same way")
+igx_instantiation_fixed_to_one_type_is_refused_the_same_way()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_box() + "impl Show for Box[int]\n    show(self) -> string = \"b\"",
+        "covers every instantiation at once")
+
+@test("and one argument fixed among several is too")
+igx_one_argument_fixed_among_several_is_too()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_pair() + "impl[T] Show for Pair[T, int]\n    show(self) -> string = \"b\"",
+        "'int' fixes an argument of 'Pair' to one type")
+
+@test("so two blocks for one generic type collide")
+igx_two_blocks_for_one_generic_type_collide()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_box() + raw"""
+        impl[T] Show for Box[T]
+            show(self) -> string = "b"
+        impl[U] Show for Box[U]
+            show(self) -> string = "c"
+        """, "'Box' already implements 'Show'")
+
+// -- the block's parameters and the subject's arguments line up ------------------------------------
+
+@test("each argument taking a parameter of its own")
+igx_each_argument_taking_a_parameter_of_its_own()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_pair() + "impl[T] Show for Pair[T, T]\n    show(self) -> string = \"b\"",
+        "this 'impl' names 'T' twice")
+
+@test("every declared parameter appearing in the subject")
+igx_every_declared_parameter_appearing_in_the_subject()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_box() + "impl[T, U] Show for Box[T]\n    show(self) -> string = \"b\"",
+        "'U' is declared by this 'impl' but does not appear in 'Box[T]'")
+
+@test("and the count matching the type's own")
+igx_the_count_matching_the_types_own()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_box() + "impl[T] Show for Box\n    show(self) -> string = \"b\"",
+        "'Box' takes 1 type argument, but 0 type arguments were given")
+
+@test("a type that takes no arguments has nothing to be generic over")
+igx_a_type_taking_no_arguments_has_nothing_to_be_generic_over()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + "struct P\n    v: int\nimpl[T] Show for P\n    show(self) -> string = \"b\"",
+        "'P' takes no type arguments, so an 'impl' for it has nothing to be generic over")
+
+@test("a built-in takes no arguments either")
+igx_a_builtin_takes_no_arguments_either()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + "impl[T] Show for int\n    show(self) -> string = \"b\"", "'int' takes no type arguments")
+
+// What is wrong with the line is the name, so the name is what the diagnostic is about.
+@test("and a name that declares no type is reported as itself")
+igx_a_name_that_declares_no_type_is_reported_as_itself()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + "impl[T] Show for Ghost[T]\n    show(self) -> string = \"b\"", "unknown type 'Ghost'")
+
+// -- conformance is checked with the parameters standing in for themselves -------------------------
+
+@test("so a missing member is reported against the generic type")
+igx_a_missing_member_is_reported_against_the_generic_type()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_box() + "impl[T] Show for Box[T]",
+        "'Box' does not implement 'Show': method 'show' is missing")
+
+@test("and a result written through the parameter must be the one the trait declares")
+igx_a_result_through_the_parameter_must_be_the_declared_one()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_box() + "impl[T] Show for Box[T]\n    show(self) -> T = self.v",
+        "method 'show' returns T, but trait 'Show' declares string")
+
+// `Self` on the trait's side is the subject applied to the block's parameters.
+@test("and 'Self' matches the subject written out")
+igx_self_matches_the_subject_written_out()
+    if !igx_ready() then return
+
+    igx_refused("trait Dup\n    dup(self) -> Self\n" + igx_box() + "impl[T] Dup for Box[T]\n    dup(self) -> Box[int] = Box(1)",
+        "returns Box[int], but trait 'Dup' declares Box[T]")
+
+// -- the block's bounds decide which instantiations conform ----------------------------------------
+
+@test("so a bound is refused where the argument does not carry it")
+igx_a_bound_is_refused_where_the_argument_does_not_carry_it()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_box() + raw"""
+        struct P
+            v: int
+        impl[T: Show] Show for Box[T]
+            show(self) -> string = self.v.show()
+        name[U: Show](x: U) -> string = x.show()
+        print(name(Box(P(1))))
+        """, "requires its type parameter 'U' to implement 'Show', but Box[P] does not")
+
+@test("while the instantiation that carries it is accepted")
+igx_the_instantiation_that_carries_it_is_accepted()
+    if !igx_ready() then return
+
+    igx_lowers(igx_show() + igx_box() + raw"""
+        impl Show for int
+            show(self) -> string = str(self)
+        impl[T: Show] Show for Box[T]
+            show(self) -> string = self.v.show()
+        name[U: Show](x: U) -> string = x.show()
+        print(name(Box(1)))
+        """, "@Box.show.int(")
+
+// The erasure asks the same question a bound does.
+@test("and erasing an instantiation that fails the condition is refused")
+igx_erasing_an_instantiation_failing_the_condition_is_refused()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_box() + raw"""
+        struct P
+            v: int
+        impl[T: Show] Show for Box[T]
+            show(self) -> string = self.v.show()
+        var b: &Box[P] = Box(P(1))
+        var o: &Show = b
+        """, "a &Show needs a type that implements 'Show', and Box[P] does not")
+
+@test("and a type with no rendering names the block to write")
+igx_a_type_with_no_rendering_names_the_block_to_write()
+    if !igx_ready() then return
+
+    igx_refused(igx_box() + "print(Box(1))", "write an 'impl[T] sysl.Display for Box[T]' to say how it renders")
+
+// -- a member is checked at its definition, against the block's bounds ------------------------------
+
+// Nothing instantiates the block, and the mistake is reported anyway, on the line that made it.
+@test("a method no bound licenses is reported with nothing instantiated")
+igx_a_method_no_bound_licenses_is_reported_uninstantiated()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_box() + "impl[T] Show for Box[T]\n    show(self) -> string = self.v.show()",
+        "'show' needs 'T: Show'")
+
+@test("rendering a parameter needs 'Display', and says so")
+igx_rendering_a_parameter_needs_display()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_box() + "impl[T] Show for Box[T]\n    show(self) -> string = str(self.v)",
+        "'str' needs 'T: sysl.Display'")
+
+@test("an operator needs its own bound")
+igx_an_operator_needs_its_own_bound()
+    if !igx_ready() then return
+
+    igx_refused("trait Twice\n    twice(self) -> string\n" + igx_box() + raw"""
+        impl[T] Twice for Box[T]
+            twice(self) -> string
+                var doubled = self.v + self.v
+                "done"
+        """, "'+' needs 'T: sysl.Add'")
+
+// One mistake, one diagnostic: the instantiations that would each complain about a consequence are
+// dropped.
+@test("and an instantiation of a member already reported adds nothing")
+igx_an_instantiation_of_a_reported_member_adds_nothing()
+    if !igx_ready() then return
+
+    val said = igx_err(igx_show() + igx_box() + raw"""
+        impl[T] Show for Box[T]
+            show(self) -> string = self.v.show()
+        print(Box(1).show())
+        """)
+
+    assert(igx_says(said, "'show' needs 'T: Show'"), said)
+    assert(!igx_says(said, "type 'int' has no method 'show'"), said)
+
+// -- the rest of the member surface -----------------------------------------------------------------
+
+// An associated function has no receiver, so a parameter its signature never mentions has nothing
+// at the call to fix it.
+@test("an associated function whose signature never mentions the parameter cannot be called")
+igx_an_associated_function_never_mentioning_the_parameter()
+    if !igx_ready() then return
+
+    igx_refused("trait Make\n    make() -> int\n" + igx_box() + raw"""
+        impl[T] Make for Box[T]
+            make() -> int = 1
+        print(Box.make())
+        """, "cannot infer the type argument 'T' of 'Box.make'")
+
+@test("a member colliding with the type's field is refused")
+igx_a_member_colliding_with_the_types_field_is_refused()
+    if !igx_ready() then return
+
+    igx_refused("trait Named\n    v(self) -> string\n" + igx_box() + "impl[T] Named for Box[T]\n    v(self) -> string = \"b\"",
+        "type 'Box' has both a field and a member named 'v'")
+
+@test("a member colliding with the type's own is refused")
+igx_a_member_colliding_with_the_types_own_is_refused()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + raw"""
+        struct Box[T]
+            v: T
+            show(self) -> string = "own"
+        impl[T] Show for Box[T]
+            show(self) -> string = "impl"
+        """, "type 'Box' already has a member named 'show'")
+
+// -- the end marker closes the subject it opened ----------------------------------------------------
+
+@test("a matching one is accepted")
+igx_a_matching_end_marker_is_accepted()
+    if !igx_ready() then return
+
+    igx_lowers(igx_show() + igx_box() + raw"""
+        impl[T] Show for Box[T]
+            show(self) -> string = "b"
+        end Box[T]
+        print(Box(1).show())
+        """, "@Box.show.int(")
+
+@test("a differently spelled parameter does not match it")
+igx_a_differently_spelled_parameter_does_not_match()
+    if !igx_ready() then return
+
+    igx_refused(igx_show() + igx_box() + raw"""
+        impl[T] Show for Box[T]
+            show(self) -> string = "b"
+        end Box[U]
+        """, "'end Box[U]' does not match 'Box[T]'")

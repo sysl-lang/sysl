@@ -1,0 +1,137 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// A trait's own parameter bounds are held wherever the trait is applied -- and an object type over a
+// declaration's own type parameter is an application like any other: `f[Y](x: &Get[Y])` over
+// `trait Get[T: Show]` asks `Show` of `Y`, which only `Y`'s own bounds can answer.
+//
+// **Every message and position quoted here was read out of the reference compiler** (0.0.162) on the
+// same program. Each is a whole program compiled against the standard module, so every test here
+// wants `SYSL_LIB`.
+
+private otb_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end otb_ready
+
+// What a program is told, every diagnostic in one report; empty where it compiled.
+private otb_err(text: string) -> string
+    val root = make_temp_dir("sysl-object-trait-bound").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end otb_err
+
+// Whether a report holds exactly one diagnostic.
+private otb_once(said: string) -> bool
+    val first = said.index_of("error:")
+
+    first.is_some() && first == said.last_index_of("error:")
+
+private otb_traits() -> string = raw"""
+    trait Show
+        show(self) -> string
+
+    trait Get[T: Show]
+        get(self) -> T
+
+    """
+
+// The one refusal, said once, at the place the reference puts it.
+private otb_refused_once(text: string, at: string)
+    val said = otb_err(otb_traits() + text)
+
+    assert(said.contains("error: 'Get' requires its type parameter 'T' to implement 'Show', but 'Y' is " +
+                         "not bounded by it\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+    assert(otb_once(said), said)
+
+@test("a counted object type over an unbounded parameter is refused")
+otb_a_counted_object_over_an_unbounded_parameter()
+    if !otb_ready() then return
+
+    otb_refused_once(raw"""
+        f[Y](x: &Get[Y]) -> unit = ()
+
+        print("hi")
+        """, "7:10")
+
+@test("so is a raw object type")
+otb_a_raw_object_over_an_unbounded_parameter()
+    if !otb_ready() then return
+
+    otb_refused_once(raw"""
+        f[Y](x: *Get[Y]) -> unit = ()
+
+        print("hi")
+        """, "7:10")
+
+@test("and one written as a generic struct's field")
+otb_an_object_field_over_an_unbounded_parameter()
+    if !otb_ready() then return
+
+    otb_refused_once(raw"""
+        struct Holder[Y]
+            g: &Get[Y]
+
+        print("hi")
+        """, "8:9")
+
+@test("and one inside another type's arguments")
+otb_an_object_nested_in_a_type_argument()
+    if !otb_ready() then return
+
+    otb_refused_once(raw"""
+        f[Y](x: Option[&Get[Y]]) -> unit = ()
+
+        print("hi")
+        """, "7:17")
+
+@test("a concrete argument that does not meet the bound is refused there too")
+otb_a_concrete_argument_that_does_not_meet_it()
+    if !otb_ready() then return
+
+    val said = otb_err(otb_traits() + raw"""
+        f(x: &Get[int]) -> unit = ()
+
+        print("hi")
+        """)
+
+    assert(said.contains("error: 'Get' requires its type parameter 'T' to implement 'Show', but int does " +
+                         "not\n"), said)
+    assert(said.contains("/main.sysl:7:7\n"), said)
+    assert(otb_once(said), said)
+
+@test("a parameter that carries the bound is accepted in every one of those places")
+otb_a_bounded_parameter_is_accepted()
+    if !otb_ready() then return
+
+    val said = otb_err(otb_traits() + raw"""
+        f[Y: Show](x: &Get[Y]) -> unit = ()
+
+        struct Holder[Y: Show]
+            g: &Get[Y]
+
+        g[Y: Show](x: *Get[Y]) -> unit = ()
+
+        h[Y: Show](x: Option[&Get[Y]]) -> unit = ()
+
+        print("hi")
+        """)
+
+    assert(said == "", said)
