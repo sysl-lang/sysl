@@ -751,6 +751,8 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
     // describe the last step rather than the first.
     if !t.builds_with_clang() then return Err(Said(Refusal(t.no_toolchain())))
 
+    headers_refused(path).map_err(said)?
+
     val emitted = emit_llvm_text(path, named_target, level, also_auto_imported)?
 
     if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
@@ -812,6 +814,8 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
     val archiver = find_ar(None) match
         Err(why) -> return Err(Said(Refusal(why)))
         Ok(found) -> found
+
+    headers_refused(path).map_err(said)?
 
     val lowered = lower_for_c(path, t)?
 
@@ -1136,6 +1140,7 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
 
     heap_refusal(path, t).map_err(said)?
     not_this_machine(t, "run").map_err(said)?
+    headers_refused(path).map_err(said)?
 
     val key = run_cache_key_for("run", path, named_target, level, cc)
 
@@ -1353,6 +1358,8 @@ end TestBuild
 test_build_of(path: string, named_target: Option[string],
               level: string = DefaultOptimization) -> Result[TestBuild, Failure]
     val t = test_target_of(path, named_target)?
+
+    headers_refused(path)?
 
     Ok(test_build_from(packaged_compilation_of(path, t)?, false, level)?)
 end test_build_of
@@ -1701,18 +1708,27 @@ unmet_headers(needs: Buf[HeaderNeed]) -> Option[string]
     None
 end unmet_headers
 
-// The two requirements a command line answers, checked together and in the order a reader can act
-// on: the headers a package's C includes, then the installed libraries it links. `roots` says whether
-// the `--lib` source roots' own requirements are this command's to answer, which they are wherever
-// their C is compiled -- everywhere but `build-lib`.
-private supplied_or_refused(path: string, t: Target, roots: bool = true) -> Result[PkgAnswer, Refusal]
+// The header requirements a command line answers, asked by every command that compiles C **before
+// the analysis**: a `c const` block is measured against those headers, so a tree asked afterwards
+// stops inside the C compiler with `'probe.h' file not found` -- a message naming neither the
+// package that wanted the header nor the flag that supplies it. Asking twice is harmless, a
+// requirement answered from the environment being answered once.
+headers_refused(path: string, roots: bool = true) -> Result[unit, Refusal]
     val headers = header_needs(path, roots)?
 
     answer_headers_from_env(headers)
 
     unmet_headers(headers) match
-        Some(why) -> return Err(Refusal(why))
-        None -> ()
+        Some(why) -> Err(Refusal(why))
+        None -> Ok(())
+end headers_refused
+
+// The two requirements a command line answers, checked together and in the order a reader can act
+// on: the headers a package's C includes, then the installed libraries it links. `roots` says whether
+// the `--lib` source roots' own requirements are this command's to answer, which they are wherever
+// their C is compiled -- everywhere but `build-lib`.
+private supplied_or_refused(path: string, t: Target, roots: bool = true) -> Result[PkgAnswer, Refusal]
+    headers_refused(path, roots)?
 
     probe_libs(pkg_config_needs(path, roots)?, t) match
         Err(why) -> Err(Refusal(why))
