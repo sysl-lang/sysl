@@ -780,8 +780,12 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
                             base: string, m: MethodDecl, fd: FuncDecl, owner_args: Buf[Type],
                             args: Buf[Expr], expected: Option[Type], written: string,
                             targs: Buf[Expr]) -> TExpr
-    val shown = if receiver.is_some() then member_subject(cx, rty, source_member_name(m.name))
-    else s"associated function '${qualified_name(base)}.${source_member_name(m.name)}'"
+    // **The member is named by its TYPE, not by the instantiation the receiver is**: its own
+    // parameters are not settled yet, and the type's arguments are not what a reader wrote at the
+    // member, so a refusal reads `'Box.one'` where a member with none of its own reads the receiver.
+    val subject = s"'${qualified_name(base)}.${source_member_name(m.name)}'"
+    val shown = generic_member_subject(cx, rty, receiver.is_some(), source_member_name(m.name),
+                                       subject)
     val off: usize = if receiver.is_some() then 1 else 0
 
     // **Only the member's own parameters are written**, and a bare arrow among them is the sugar's
@@ -930,8 +934,7 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
 
                 given.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
 
-    val refused = refused_argument(cx, span, s"'$name'", m.params, slots.unwrap(), given, wants,
-                                   before)
+    val refused = refused_argument(cx, span, subject, m.params, slots.unwrap(), given, wants, before)
 
     if refused.is_some() then return refused.unwrap()
 
@@ -952,6 +955,14 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
 
     recheck_after(cx, span, ts.at(0), call)
 end call_generic_member
+
+// What a message about a generic member's arguments calls it: `subject` is the member quoted under
+// its type's name, with no arguments on either.
+private generic_member_subject(cx: &Analyzer, rty: Type, has_receiver: bool, name: string,
+                               subject: string) -> string =
+    if !has_receiver then s"associated function $subject"
+    else if name == "call" && callable_of(cx.an, rty).is_some() then "this callable"
+    else s"method $subject"
 
 // What a message about a member's arguments calls it. **A call through the call trait is written as
 // a call and reads as one**, so it is `this callable` rather than a member no program wrote, on a
