@@ -529,10 +529,15 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
                                 "closure, which has no address a C interface could call")
         end if
 
+        // A declared `infinity` or `nan` hides the built-in constant of the name, and the reader
+        // who meant the constant is told the spelling no declaration can hide.
+        val hides = s". The built-in constant this declaration hides is spelled 'real.$name'"
+        val hidden = if builtin_float(name).is_some() then hides else ""
+
         return cx.err(span, s"'$name' is a function, and a function becomes a value only where a " +
                             "callable is wanted — a bare-arrow parameter, or a '&Fn' where a " +
                             "concrete type is required. Nothing here asks for one; where the " +
-                            s"address of code is what is wanted, that is written '&$name'")
+                            s"address of code is what is wanted, that is written '&$name'$hidden")
     end if
 
     variant_expr(cx, span, name, expected)
@@ -795,6 +800,10 @@ variant_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) ->
 
         if early.is_some() then return cx.err_whatever_the_types(span, early.unwrap())
 
+        // `infinity` and `nan` are the outermost names there are, at `real`: everything the program
+        // declared or imported of the spelling was asked above and would have answered first.
+        if builtin_float(name).is_some() then return builtin_float_lit(span, name, real_type())
+
         return cx.err_whatever_the_types(span, s"undefined name '${qualified_name(module_qualify(cx.scope.module_name, name))}'")
 
     val clash = ambiguous_variant(cx, span, name, expected)
@@ -921,6 +930,20 @@ variant_of(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[(Type,
 
     None
 end variant_of
+
+// Whether `infinity` or `nan` written bare reaches the built-in constant: nothing nearer has the
+// name -- a local, a value parameter, a `const`, a `val`, an `extern` variable, a function or a
+// variant -- which are the tables `name_expr` asks before it falls through to the built-in.
+builtin_float_reached(cx: &Analyzer, name: string) -> bool
+    if builtin_float(name).is_none() then return false
+    if cx.lookup(name).is_some() || bound_type(cx.subst, name).is_some() then return false
+    if value_key_of(cx, a_consts(cx), name).is_some() then return false
+    if value_key_of(cx, a_vals(cx), name).is_some() then return false
+    if value_key_of(cx, a_extern_vars(cx), name).is_some() then return false
+    if names_a_function(cx, name) || cx.nested_of(name).is_some() then return false
+
+    variant_of(cx, name, None).is_none() && !generic_variant_in_reach(cx, name, true)
+end builtin_float_reached
 
 // The enum whose variant this name was imported as, by name rather than through a wildcard, at the
 // innermost level of imports that answers for it.

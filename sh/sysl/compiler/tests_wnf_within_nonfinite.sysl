@@ -1,0 +1,282 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The two float values no literal spells, as constants, and the `within` ranges that end at one.
+//
+// - **`real.infinity` and `real.nan` are read without parentheses**, on every float width, and are
+//   constants: a `const` initializer and a `within` bound take them. `infinity` and `nan` written bare
+//   are the `real` ones, and the outermost names there are -- anything the program declares or imports
+//   of the spelling answers first. `real.infinity()` stays the library's associated function.
+// - **A range may end at an infinity and may not end at a NaN.** `0.0..infinity` is open above and
+//   still refuses a NaN at a produce site, every comparison with one being false; a NaN bound would
+//   admit no value at all and is refused at the declaration.
+//
+// **This is the user's design (2026-10-04) and the reference compiler (0.0.162) does not have it**:
+// it calls `real.infinity` an associated function missing its `()`, `infinity` an undefined name, and
+// crashes on a non-finite float bound. The two refusals it does share are quoted from it: `1/0` in a
+// bound is "a constant divided by zero" at the division (`main.sysl:1:26` over `real`, `1:25` over
+// `int`), and `f64 within 2.0..(0.5*2.0)` is "the lower bound of 'T' is above its upper bound" at 1:1.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private wnf_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end wnf_ready
+
+// **What a one-file program PRINTS**, what the build said about it instead with the project root
+// written as `@`, or `trapped` where it built and stopped short of exiting zero.
+private wnf_out(text: string) -> string
+    // `$TMPDIR` ends in a slash, and a diagnostic names the file by its normalized path.
+    val root = replace_all(make_temp_dir("sysl-wnf").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", text).unwrap()
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else "trapped"
+end wnf_out
+
+private wnf_says(text: string, part: string)
+    val said = wnf_out(text)
+
+    assert(said.index_of(part).is_some(), s"expected '$part', got: $said")
+
+// -- the constants --------------------------------------------------------------------------------
+
+@test("real.infinity and real.nan are read without parentheses")
+wnf_read_without_parentheses()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("print(real.infinity > 1.0e308, f64.infinity == real.infinity, " +
+                      "real.nan != real.nan, -real.infinity < -1.0e308)\n"),
+              "true true true true\n")
+
+@test("and on the narrower widths, at those widths")
+wnf_narrower_widths()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("val f: f32 = f32.infinity\nval g: f32 = f32.nan\n" +
+                      "print(f > f32(3.0e38), g != g, f64(f16.infinity) > 1.0e300, " +
+                      "f64(bf16.infinity) > 1.0e300)\n"),
+              "true true true true\n")
+
+@test("infinity and nan written bare are the real ones")
+wnf_bare_names_are_real()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("val x: real = infinity\nprint(x == real.infinity, nan != nan, " +
+                      "-infinity < -1.0e308)\n"),
+              "true true true\n")
+
+@test("each is a constant, so a const takes one")
+wnf_a_const_takes_one()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("const top: real = infinity\nconst low: f32 = -f32.infinity\n" +
+                      "const odd: real = real.nan\nprint(top > 1.0e308, low < f32(-3.0e38), odd != odd)\n"),
+              "true true true\n")
+
+@test("the library's real.infinity() and sysl.math's infinity() are unchanged")
+wnf_the_functions_are_unchanged()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("import sysl.math.*\n\nprint(infinity() == real.infinity(), " +
+                      "real.infinity() == real.infinity, nan().is_nan(), real.nan().is_nan())\n"),
+              "true true true true\n")
+
+// -- what the program declares answers first ------------------------------------------------------
+
+@test("a local named infinity shadows the built-in")
+wnf_a_local_shadows_infinity()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("val infinity = 5.0\nprint(infinity == 5.0)\n"), "true\n")
+
+@test("and so does a parameter named nan")
+wnf_a_parameter_shadows_nan()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("f(nan: int) -> int = nan + 1\n\nprint(f(2))\n"), "3\n")
+
+@test("and a module constant named nan, in a bound as well")
+wnf_a_constant_shadows_nan()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("const nan: int = 7\ntype T = int within 0..nan\nvar t: T = 7\nprint(nan + 1, int(t))\n"),
+              "8 7\n")
+
+@test("a function named infinity is called, and read bare is told the spelling it hides")
+wnf_a_function_hides_infinity()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("infinity() -> real = 2.0\n\nprint(infinity())\n"), "2\n")
+
+    wnf_says("infinity() -> real = 2.0\n\nval x: real = infinity\nprint(x)\n",
+             "error: 'infinity' is a function, and a function becomes a value only where a callable " +
+             "is wanted — a bare-arrow parameter, or a '&Fn' where a concrete type is required. " +
+             "Nothing here asks for one; where the address of code is what is wanted, that is " +
+             "written '&infinity'. The built-in constant this declaration hides is spelled " +
+             "'real.infinity'\n --> @/main.sysl:3:15")
+
+@test("and a local named nan inside a body")
+wnf_a_local_shadows_nan()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("f() -> int\n    val nan = 3\n    nan + 1\n\nprint(f())\n"), "4\n")
+
+// -- ranges ending at an infinity -----------------------------------------------------------------
+
+@test("0.0..infinity admits every non-negative value and an infinity")
+wnf_open_above_admits()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("type Pos = real within 0.0..infinity\nvar a: Pos = 1.0e300\n" +
+                      "var b: Pos = infinity\nprint(f64(a) > 1.0, f64(b) == infinity)\n"),
+              "true true\n")
+
+@test("and refuses a NaN at a produce site")
+wnf_open_above_refuses_nan()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("type Pos = real within 0.0..infinity\nval z = nan\nvar x: Pos = z\nprint(1)\n"),
+              "trapped")
+
+@test("and a negative value")
+wnf_open_above_refuses_negative()
+    if !wnf_ready() then return
+
+    assert_eq(wnf_out("type Pos = real within 0.0..infinity\nval z = -1.0\nvar x: Pos = z\nprint(1)\n"),
+              "trapped")
+
+@test("0.0..<infinity admits a finite value and refuses the infinity it stops under")
+wnf_exclusive_infinity()
+    if !wnf_ready() then return
+
+    val t = "type Fin = real within 0.0..<infinity\n"
+
+    assert_eq(wnf_out(t + "var a: Fin = 1.0e300\nprint(f64(a) > 1.0)\n"), "true\n")
+    assert_eq(wnf_out(t + "val z = infinity\nvar x: Fin = z\nprint(1)\n"), "trapped")
+    assert_eq(wnf_out(t + "val z = nan\nvar x: Fin = z\nprint(1)\n"), "trapped")
+
+@test("-infinity..infinity admits both infinities and refuses only a NaN")
+wnf_whole_line_refuses_only_nan()
+    if !wnf_ready() then return
+
+    val t = "type Num = real within -infinity..infinity\n"
+
+    assert_eq(wnf_out(t + "var a: Num = -infinity\nvar b: Num = infinity\nvar c: Num = 0.0\n" +
+                      "print(f64(a) < 0.0, f64(b) > 0.0, f64(c) == 0.0)\n"),
+              "true true true\n")
+    assert_eq(wnf_out(t + "val z = nan\nvar x: Num = z\nprint(1)\n"), "trapped")
+
+@test("the qualified spellings bound a range on a narrower width")
+wnf_qualified_bounds()
+    if !wnf_ready() then return
+
+    val t = "type Wide = f32 within -f32.infinity..real.infinity\n"
+
+    assert_eq(wnf_out(t + "var a: Wide = f32.infinity\nprint(f64(a) > 1.0e300)\n"), "true\n")
+    assert_eq(wnf_out(t + "val z = f32.nan\nvar x: Wide = z\nprint(1)\n"), "trapped")
+
+@test("a range ending at an infinity is still ordered")
+wnf_infinite_ends_are_ordered()
+    if !wnf_ready() then return
+
+    wnf_says("type T = real within infinity..0.0\nprint(1)\n",
+             "error: the lower bound of 'T' is above its upper bound\n --> @/main.sysl:1:1")
+    wnf_says("type T = real within infinity..<infinity\nprint(1)\n",
+             "error: the lower bound of 'T' is above its upper bound\n --> @/main.sysl:1:1")
+    assert_eq(wnf_out("type T = real within infinity..infinity\nvar t: T = infinity\nprint(1)\n"),
+              "1\n")
+
+@test("a constant at a range ending at an infinity is held to it, and the end is spelled infinity")
+wnf_a_constant_is_held_to_an_infinite_range()
+    if !wnf_ready() then return
+
+    wnf_says("type Pos = real within 0.0..infinity\nconst c: Pos = -1.0\nprint(1)\n",
+             "error: 'c' is -1.0, which Pos does not admit — it holds 0.0 to infinity\n" +
+             " --> @/main.sysl:2:16")
+
+@test("a NaN constant is admitted by no range")
+wnf_a_nan_constant_is_refused()
+    if !wnf_ready() then return
+
+    wnf_says("type Unit = real within 0.0..1.0\nconst c: Unit = nan\nprint(1)\n",
+             "error: 'c' is nan, which Unit does not admit — it holds 0.0 to 1.0\n" +
+             " --> @/main.sysl:2:17")
+
+@test("an integer range may not end at an infinity")
+wnf_an_integer_range_has_no_infinity()
+    if !wnf_ready() then return
+
+    wnf_says("type T = int within 0..infinity\nprint(1)\n",
+             "error: an integer subtype needs integer bounds, not a floating-point literal")
+
+// -- a NaN bound ----------------------------------------------------------------------------------
+
+@test("a NaN bound is refused, however it is spelled")
+wnf_a_nan_bound_is_refused()
+    if !wnf_ready() then return
+
+    val said = "error: a 'within' bound may not be NaN — every comparison with one is false, so a " +
+               "range ending at a NaN admits no value\n --> @/main.sysl:1:1"
+
+    wnf_says("type T = real within 0.0..nan\nprint(1)\n", said)
+    wnf_says("type T = real within real.nan..1.0\nprint(1)\n", said)
+    wnf_says("type T = f32 within 0.0..(0.0/0.0)\nprint(1)\n", said)
+
+// -- the two refusals the reference shares --------------------------------------------------------
+
+@test("a bound dividing by zero is the fold's own complaint, at the division")
+wnf_a_bound_dividing_by_zero()
+    if !wnf_ready() then return
+
+    wnf_says("type R = real within 0..(1/0)\nprint(1)\n",
+             "error: a constant divided by zero\n --> @/main.sysl:1:26")
+    wnf_says("type R = int within 0..(1/0)\nprint(1)\n",
+             "error: a constant divided by zero\n --> @/main.sysl:1:25")
+
+    val said = wnf_out("type R = int within 0..(1/0)\nprint(1)\n")
+
+    assert(said.index_of("has to be a constant").is_none(), said)
+
+@test("a folded float bound is ordered")
+wnf_a_folded_float_bound_is_ordered()
+    if !wnf_ready() then return
+
+    wnf_says("type T = f64 within 2.0..(0.5*2.0)\nprint(1)\n",
+             "error: the lower bound of 'T' is above its upper bound\n --> @/main.sysl:1:1")
+    wnf_says("type T = f64 within 1.0e10..2.0\nprint(1)\n",
+             "error: the lower bound of 'T' is above its upper bound\n --> @/main.sysl:1:1")
+    assert_eq(wnf_out("type T = f64 within 0.5..(0.5*3.0)\nvar t: T = 1.5\nprint(f64(t) == 1.5)\n"),
+              "true\n")
