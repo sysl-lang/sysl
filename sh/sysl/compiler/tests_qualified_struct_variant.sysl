@@ -1,0 +1,184 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A module declaring both a struct and an enum variant of one name, called through the module's own
+// name from another file: `m.Shape(1, 2, 3)`. The qualified call makes the choice the bare name makes
+// in the module's own file (`reference/modules.md § Visibility`: "at each use the expected type decides
+// which answers") -- the variant where the expected type names its enum, the struct everywhere else.
+// The qualified call used to take the variant whatever was expected, and refused the struct's three
+// values as too many for the variant's one.
+//
+// **Every output here was read out of the reference compiler (0.0.162)** by building the same tree.
+
+private var qsv_library_cache: Buf[Program] = buf()
+private var qsv_library_read: bool = false
+
+private qsv_library() -> Buf[Program]
+    if qsv_library_read then return qsv_library_cache
+
+    qsv_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> qsv_library_cache = units
+
+    qsv_library_cache
+end qsv_library
+
+private qsv_ready() -> bool
+    if qsv_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end qsv_ready
+
+// What a program of two files prints: the module `m` and an entry file importing it.
+private qsv_ran(module_text: string, main_text: string) -> string
+    val root = make_temp_dir("sysl-qsv").unwrap()
+
+    make_dir_all(s"$root/m").unwrap()
+    write_text(s"$root/m/m.sysl", module_text).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end qsv_ran
+
+private qsv_enum() -> string = raw"""
+    enum Error
+        Refused(why: string)
+        Shape(needed: usize)
+    """
+
+private qsv_struct() -> string = raw"""
+    struct Shape
+        width: int
+        height: int
+        channels: int
+    """
+
+// The enum declared first, then the struct -- and the other way about.
+private qsv_enum_first() -> string = "module m\n" + qsv_enum() + qsv_struct()
+private qsv_struct_first() -> string = "module m\n" + qsv_struct() + qsv_enum()
+
+private qsv_describe() -> string = raw"""
+    import m
+    describe(e: m.Error) -> string = e match
+        m.Error.Refused(w) -> w
+        m.Error.Shape(n) -> s"needs $n"
+    """
+
+// -- through the module, nothing expected: the struct ----------------------------------------------
+
+@test("a qualified call with nothing expected builds the struct, the enum declared first")
+qsv_qualified_struct_enum_first()
+    if !qsv_ready() then return
+
+    assert_eq(qsv_ran(qsv_enum_first(), "import m\nval s = m.Shape(1, 2, 3)\nprint(s.channels)\n"), "3\n")
+
+@test("and the struct declared first")
+qsv_qualified_struct_struct_first()
+    if !qsv_ready() then return
+
+    assert_eq(qsv_ran(qsv_struct_first(), "import m\nval s = m.Shape(1, 2, 3)\nprint(s.channels)\n"), "3\n")
+
+@test("and where the expected type is the struct, inside an Option")
+qsv_qualified_struct_expected()
+    if !qsv_ready() then return
+
+    assert_eq(qsv_ran(qsv_enum_first(), raw"""
+        import m
+        probe() -> Option[m.Shape] = Some(m.Shape(1, 2, 3))
+        print(probe().unwrap().channels)
+        """), "3\n")
+
+// -- through the module, the enum expected: the variant ----------------------------------------------
+
+@test("a qualified call where the expected type is the enum builds the variant, the enum declared first")
+qsv_qualified_variant_enum_first()
+    if !qsv_ready() then return
+
+    assert_eq(qsv_ran(qsv_enum_first(), qsv_describe() + "val e: m.Error = m.Shape(5)\nprint(describe(e))\n"),
+              "needs 5\n")
+
+@test("and the struct declared first")
+qsv_qualified_variant_struct_first()
+    if !qsv_ready() then return
+
+    assert_eq(qsv_ran(qsv_struct_first(), qsv_describe() + "val e: m.Error = m.Shape(5)\nprint(describe(e))\n"),
+              "needs 5\n")
+
+@test("and at an argument, which supplies the enum without an annotation")
+qsv_qualified_variant_argument()
+    if !qsv_ready() then return
+
+    assert_eq(qsv_ran(qsv_enum_first(), qsv_describe() + "print(describe(m.Shape(7)))\n"), "needs 7\n")
+
+@test("and inside an Err whose Result names the enum")
+qsv_qualified_variant_in_err()
+    if !qsv_ready() then return
+
+    assert_eq(qsv_ran(qsv_enum_first(), qsv_describe() + raw"""
+        fail() -> Result[int, m.Error] = Err(m.Shape(9))
+        fail() match
+            Err(e) -> print(describe(e))
+            Ok(_) -> print("ok")
+        """), "needs 9\n")
+
+@test("a variant with no type of its name is still reached through the module")
+qsv_qualified_variant_alone()
+    if !qsv_ready() then return
+
+    assert_eq(qsv_ran(qsv_enum_first(), qsv_describe() + "val e = m.Refused(\"no\")\nprint(describe(e))\n"),
+              "no\n")
+
+// -- the bare name in the module's own file, which the qualified call now agrees with ---------------
+
+private qsv_local(decls: string, body: string) -> string = qsv_ran("module m\nval unused: int = 0\n", decls + body)
+
+private qsv_local_describe() -> string = raw"""
+    describe(e: Error) -> string = e match
+        Refused(w) -> w
+        Shape(n) -> s"needs $n"
+    """
+
+@test("the bare name with nothing expected builds the struct, in either order")
+qsv_bare_struct()
+    if !qsv_ready() then return
+
+    assert_eq(qsv_local(qsv_enum() + qsv_struct(), "val s = Shape(1, 2, 3)\nprint(s.channels)\n"), "3\n")
+    assert_eq(qsv_local(qsv_struct() + qsv_enum(), "val s = Shape(1, 2, 3)\nprint(s.channels)\n"), "3\n")
+
+@test("and the variant where the expected type is the enum, in either order")
+qsv_bare_variant()
+    if !qsv_ready() then return
+
+    val body = qsv_local_describe() + "val e: Error = Shape(4)\nprint(describe(e))\n"
+
+    assert_eq(qsv_local(qsv_enum() + qsv_struct(), body), "needs 4\n")
+    assert_eq(qsv_local(qsv_struct() + qsv_enum(), body), "needs 4\n")

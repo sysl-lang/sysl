@@ -120,68 +120,80 @@ end written_generic_call
 
 // One type argument as a **call** writes it, which is an expression: brackets in an expression are
 // indexing, so what a reader writes between them here is read back as the type it names.
-written_type_arg(cx: &Analyzer, e: Expr) -> Type = *e.kind match
+written_type_arg(cx: &Analyzer, e: Expr) -> Type = type_arg_read(cx, e, false)
+
+// The same at an address, `&f[T]`, whose refusal advises writing the type on the binding instead,
+// there being no call to infer anything from.
+address_type_arg(cx: &Analyzer, e: Expr) -> Type = type_arg_read(cx, e, true)
+
+private type_arg_read(cx: &Analyzer, e: Expr, at_address: bool) -> Type = *e.kind match
     Ident(n) -> resolve_type(cx.an, cx.scope, named_type(e.span, n), cx.subst)
     // A **value** argument is written as the number it is, which is the one place the two grammars
     // agree without a conversion. It travels at the width a length does, so a copy the reader named
     // and one a call read off an argument are the same instantiation and not two.
     IntLit(_, _, _) -> const_arg_at(cx, e)
-    Index(head, one) -> applied_type_arg(cx, e.span, head, one_arg(one))
-    TypeArgs(head, inner) -> applied_type_arg(cx, e.span, head, inner)
+    Index(head, one) -> applied_type_arg(cx, e.span, head, one_arg(one), at_address)
+    TypeArgs(head, inner) -> applied_type_arg(cx, e.span, head, inner, at_address)
     // The three the two grammars share a spelling for. `*T` and `&T` are a unary operator in an
     // expression and a qualifier in a type; a tuple is parentheses either way. Everything else has
     // no spelling here at all, which the refusal below is what says.
     Unary(op, inner) ->
         if op == "*" then resolve_type(cx.an, cx.scope, type_ref(e.span,
-            PtrType(written_type_ref(cx, inner))), cx.subst)
+            PtrType(written_type_ref(cx, inner, at_address))), cx.subst)
         else if op == "&" then resolve_type(cx.an, cx.scope, type_ref(e.span,
-            RefType(written_type_ref(cx, inner), false)), cx.subst)
-        else not_a_type_arg(cx, e)
+            RefType(written_type_ref(cx, inner, at_address), false)), cx.subst)
+        else not_a_type_arg(cx, e, at_address)
     Tuple(parts) ->
         var written: Buf[TypeRef] = buf()
 
         for i in 0..<parts.len()
-            written.push(written_type_ref(cx, parts.at(i)))
+            written.push(written_type_ref(cx, parts.at(i), at_address))
 
         resolve_type(cx.an, cx.scope, type_ref(e.span, TupleType(written, false)), cx.subst)
     // A dotted path is one name to the type grammar, so `mod.Box` is read as the word it is.
-    Field(_, _) -> dotted_type_arg(cx, e)
-    _ -> not_a_type_arg(cx, e)
+    Field(_, _) -> dotted_type_arg(cx, e, at_address)
+    _ -> not_a_type_arg(cx, e, at_address)
 
-private not_a_type_arg(cx: &Analyzer, e: Expr) -> Type
+private not_a_type_arg(cx: &Analyzer, e: Expr, at_address: bool) -> Type
+    var advice = "Annotate what receives the result and let the call infer it instead"
+
+    if at_address then advice = "Write the type on the binding instead: 'var f: *extern(…) -> … = &…'"
+
     cx.fault(e.span, "this is not a type — what is written in the brackets is a type argument, " +
              "and they read it out of the expression grammar, so a slice, a 'weak', a 'volatile', " +
-             "a vector and a callable have no spelling here. Annotate what receives the result and " +
-             "let the call infer it instead")
+             s"a vector and a callable have no spelling here. $advice")
 
     Unknown
 end not_a_type_arg
 
 // The same, stopped one step earlier: a written type rather than a resolved one, so that a pointer
 // to a pointer nests without each level being resolved on its own.
-private written_type_ref(cx: &Analyzer, e: Expr) -> TypeRef = *e.kind match
+private written_type_ref(cx: &Analyzer, e: Expr, at_address: bool) -> TypeRef = *e.kind match
     Ident(n) -> named_type(e.span, n)
     Unary(op, inner) ->
-        if op == "*" then type_ref(e.span, PtrType(written_type_ref(cx, inner)))
-        else if op == "&" then type_ref(e.span, RefType(written_type_ref(cx, inner), false))
+        if op == "*" then type_ref(e.span, PtrType(written_type_ref(cx, inner, at_address)))
+        else if op == "&" then type_ref(e.span, RefType(written_type_ref(cx, inner, at_address), false))
         else
-            not_a_type_arg(cx, e)
+            not_a_type_arg(cx, e, at_address)
             named_type(e.span, "")
     Field(_, _) ->
         val path = dotted_path_of(e)
 
         if path.is_none()
-            not_a_type_arg(cx, e)
+            not_a_type_arg(cx, e, at_address)
             named_type(e.span, "")
         else named_type(e.span, path.unwrap())
+    // An applied generic behind a pointer or a reference -- `&Box[i32]` -- nests the same way.
+    Index(head, one) -> applied_type_ref(cx, e.span, head, one_arg(one), at_address)
+    TypeArgs(head, inner) -> applied_type_ref(cx, e.span, head, inner, at_address)
     _ ->
-        not_a_type_arg(cx, e)
+        not_a_type_arg(cx, e, at_address)
         named_type(e.span, "")
 
-private dotted_type_arg(cx: &Analyzer, e: Expr) -> Type
+private dotted_type_arg(cx: &Analyzer, e: Expr, at_address: bool) -> Type
     val path = dotted_path_of(e)
 
-    if path.is_none() then return not_a_type_arg(cx, e)
+    if path.is_none() then return not_a_type_arg(cx, e, at_address)
 
     resolve_type(cx.an, cx.scope, named_type(e.span, path.unwrap()), cx.subst)
 end dotted_type_arg
@@ -210,7 +222,8 @@ private one_arg(e: Expr) -> Buf[Expr]
 end one_arg
 
 // A generic type applied to arguments, written the way an expression spells it.
-private applied_type_arg(cx: &Analyzer, span: Span, head: Expr, inner: Buf[Expr]) -> Type
+private applied_type_arg(cx: &Analyzer, span: Span, head: Expr, inner: Buf[Expr],
+                         at_address: bool) -> Type
     val name = *head.kind match
         Ident(n) -> Some(n)
         _ -> None
@@ -220,16 +233,32 @@ private applied_type_arg(cx: &Analyzer, span: Span, head: Expr, inner: Buf[Expr]
         return Unknown
     end if
 
+    resolve_type(cx.an, cx.scope, applied_type_ref(cx, span, head, inner, at_address), cx.subst)
+end applied_type_arg
+
+// The written form of an applied generic: each argument a type where it is spelled as one -- a
+// name, a pointer, a reference, another application -- and a value argument otherwise.
+private applied_type_ref(cx: &Analyzer, span: Span, head: Expr, inner: Buf[Expr],
+                         at_address: bool) -> TypeRef
+    val name = *head.kind match
+        Ident(n) -> n
+        _ -> ""
+
     var refs: Buf[TypeRef] = buf()
 
     for i in 0..<inner.len()
-        *inner.at(i).kind match
-            Ident(n) -> refs.push(named_type(inner.at(i).span, n))
-            _ -> refs.push(type_ref(inner.at(i).span, ValueArgType(inner.at(i))))
+        val arg = inner.at(i)
+
+        *arg.kind match
+            Ident(n) -> refs.push(named_type(arg.span, n))
+            Unary(op, _) if op == "*" || op == "&" -> refs.push(written_type_ref(cx, arg, at_address))
+            Index(_, _) -> refs.push(written_type_ref(cx, arg, at_address))
+            TypeArgs(_, _) -> refs.push(written_type_ref(cx, arg, at_address))
+            _ -> refs.push(type_ref(arg.span, ValueArgType(arg)))
 
 
-    resolve_type(cx.an, cx.scope, type_ref(span, NamedType(name.unwrap(), refs)), cx.subst)
-end applied_type_arg
+    type_ref(span, NamedType(name, refs))
+end applied_type_ref
 
 // One call to a generic function.
 generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, args: Buf[Expr],

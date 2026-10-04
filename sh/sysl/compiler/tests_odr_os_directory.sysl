@@ -1,0 +1,471 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+import sysl.text.Search
+
+// **A directory named `__<os>__` selects source for an operating system and names nothing**
+// (`reference/modules.md § Platform selection`).
+//
+// Every case is written against the machine it runs on: the folder this machine selects holds what
+// must be compiled, and the folder for another operating system holds something a build could not
+// survive reading -- a second definition, a `#error`, source that does not parse -- so a green run
+// says the file was not read and cannot say it by accident. **Each expected output and each refusal
+// was obtained by running the reference compiler on the same tree.**
+
+// The per-OS directory this machine selects, and one it never will.
+private odr_here() -> string = s"__${odr_here_sym()}__"
+
+private odr_other() -> string = s"__${odr_other_sym()}__"
+
+private odr_here_sym() -> string = os_symbol(host_os())
+
+private odr_other_sym() -> string = if host_os() == MacOS then "linux" else "macos"
+
+// Seven is a number only the C knows and the multiplication is only the sysl's, so neither half
+// can be dropped without the answer changing.
+private odr_shim() -> string = "int demo_seven(void) { return 7; }\n"
+
+// C that cannot compile, for the folder this machine must never look inside.
+private odr_refuses() -> string = "#error this file is for another operating system\n"
+
+private odr_demo() -> string =
+    "module demo\n\nextern \"demo_seven\" c_seven() -> int\n\nseven_times(n: int) -> int = c_seven() * n\n"
+
+private odr_common() -> string = "module demo\n\nloud(s: string) -> string = s + \"!\"\n"
+
+private odr_tree(entries: []const (string, string, string)) -> Buf[(string, string, string)]
+    var fs = im_files()
+
+    for i in 0..<entries.len
+        fs.push(entries[i])
+
+    fs
+end odr_tree
+
+// What the program prints, or what the build said instead.
+private odr_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true, 20000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end odr_out
+
+// The names of the C files a tree carries for one machine, sorted, or the refusal.
+private odr_c(files: Buf[(string, string, string)], os: Os) -> string
+    val root = im_write(files)
+
+    val said = c_sources(root, Some(os)) match
+        Err(e) -> e.message
+        Ok(found) -> odr_names(found)
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end odr_c
+
+private odr_names(found: Buf[string]) -> string
+    var names: Buf[string] = buf()
+
+    for i in 0..<found.len()
+        names.push(basename(found.at(i)))
+
+    val sorted = sort_names(names)
+    var out = ""
+
+    for i in 0..<sorted.len()
+        if i > 0 then out = out + " "
+
+        out = out + sorted.at(i)
+
+    out
+end odr_names
+
+private odr_vocabulary() -> string =
+    "names no machine this compiler selects source for. A selector names operating systems and the " +
+    "two facts that hold without naming one, separated by commas: android, bsd, freestanding, " +
+    "hosted, linux, macos, posix, wasi, windows. A processor is not among them — that is what " +
+    "'#if' is for"
+
+private odr_nested() -> string =
+    s"'${odr_other()}' sits inside '${odr_here()}', and both select source for a machine — an " +
+    "unselected directory is never read, so nothing inside one could ever be taken. Write them " +
+    "beside each other, or use '#if' inside a sysl file or the C preprocessor inside a '.c'"
+
+// ---- a per-OS directory ----
+
+@test("a per-OS directory selects the implementation for this machine and contributes no name")
+odr_selects_and_names_nothing()
+    if im_can_run() then return
+
+    // The module is `demo` and not `demo.__macos__`, or the call would not resolve; and the other
+    // folder's file is not compiled, or the two `tag`s would collide.
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.tag())\n"),
+                                ("demo", "common.sysl", odr_common()),
+                                (s"demo/${odr_here()}", "impl.sysl",
+                                 "module demo\n\ntag() -> string = loud(\"selected\")\n"),
+                                (s"demo/${odr_other()}", "impl.sysl",
+                                 "module demo\n\ntag() -> string = loud(\"other\")\n")])),
+              "selected!\n")
+
+@test("a per-OS directory leaves the files beside it compiled for every machine")
+odr_leaves_the_files_beside_it()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.tag())\n"),
+                                ("demo", "common.sysl", odr_common()),
+                                (s"demo/${odr_here()}", "impl.sysl",
+                                 "module demo\n\ntag() -> string = loud(\"selected\")\n")])),
+              "selected!\n")
+
+@test("a per-OS directory may hold a directory, which is a module of the one holding the folder")
+odr_may_hold_a_directory()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.sub.answer())\n"),
+                                ("demo", "common.sysl", odr_common()),
+                                (s"demo/${odr_here()}/sub", "deep.sysl",
+                                 "module demo.sub\n\nanswer() -> string = \"nested\"\n"),
+                                (s"demo/${odr_other()}/sub", "deep.sysl",
+                                 "module demo.sub\n\nanswer() -> string = \"wrong\"\n")])),
+              "nested\n")
+
+@test("a per-OS directory works at the project root, where the folder is above every module")
+odr_works_at_the_root()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(util.name())\n"),
+                                (s"${odr_here()}/util", "util.sysl",
+                                 "module util\n\nname() -> string = \"selected\"\n"),
+                                (s"${odr_other()}/util", "util.sysl",
+                                 "module util\n\nname() -> string = \"wrong\"\n")])),
+              "selected\n")
+
+// An unselected tree is not compiled, not analyzed and not *parsed*; source that could never lex
+// proves the last of those, which nothing about a duplicate definition can.
+@test("a per-OS directory is not parsed at all when it is not the one selected")
+odr_unselected_is_not_parsed()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.tag())\n"),
+                                (s"demo/${odr_here()}", "impl.sysl",
+                                 "module demo\n\ntag() -> string = \"selected\"\n"),
+                                (s"demo/${odr_other()}", "broken.sysl",
+                                 "module demo\n\n((( this is not sysl at all\n")])),
+              "selected\n")
+
+// ---- the C under a per-OS directory ----
+
+// A build that offered the other folder's file to clang stops on its `#error`, so 42 is the whole
+// assertion: the shim linked, and the one beside it did not.
+@test("the C under a per-OS directory is compiled for this machine, and the other's is never offered to clang")
+odr_c_for_this_machine_only()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.seven_times(6))\n"),
+                                ("demo", "demo.sysl", odr_demo()),
+                                (s"demo/${odr_here()}", "shim.c", odr_shim()),
+                                (s"demo/${odr_other()}", "shim.c", odr_refuses())])),
+              "42\n")
+
+// `demo/` holds no sysl of its own -- all of it is inside the folder -- so the flattening is what
+// makes `demo` a module at all, and the C walk takes its C only because of that.
+@test("the C under a per-OS directory belongs to the module holding the folder, not to the folder")
+odr_c_belongs_to_the_module_above()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.seven_times(6))\n"),
+                                (s"demo/${odr_here()}", "demo.sysl", odr_demo()),
+                                (s"demo/${odr_here()}", "shim.c", odr_shim())])),
+              "42\n")
+
+// The root is the tree rather than a directory in it, so its C is taken whether or not it holds
+// sysl -- and a folder at the root inherits that.
+@test("the C under a per-OS directory is taken at the tree's own root, where no module is declared")
+odr_c_at_the_root()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.seven_times(6))\n"),
+                                ("demo", "demo.sysl", odr_demo()),
+                                (odr_here(), "shim.c", odr_shim()),
+                                (odr_other(), "shim.c", odr_refuses())])),
+              "42\n")
+
+// ---- a capability clause ----
+
+// A file inside a folder is a file of the module holding the folder, so the clause reaches in there.
+@test("a capability clause must appear on a file inside a per-OS directory, like every other file of the module")
+odr_capability_reaches_the_folder()
+    if im_can_run() then return
+
+    val said = odr_out(odr_tree([("", "main.sysl", "print(1)\n"),
+                                 ("demo", "common.sysl",
+                                  "module demo\n@requires(os)\n\nloud(s: string) -> string = s\n"),
+                                 (s"demo/${odr_here()}", "impl.sysl",
+                                  "module demo\n\ntag() -> string = loud(\"x\")\n")]))
+
+    assert(said.contains(s"/demo/${odr_here()}/impl.sysl and "), said)
+    assert(said.contains("/demo/common.sysl are both files of 'demo', and they declare different " +
+                         "capabilities — a capability is a property of the module, so every one of " +
+                         "its files states it: none against '@requires(os)'\n --> "), said)
+    assert(said.contains(s"/demo/${odr_here()}/impl.sysl:1:1\n"), said)
+
+// The discriminating half: without it the refusal above could be about the folder rather than the
+// clause, and would look exactly as green.
+@test("a capability clause and the two agreeing is what a module with a per-OS half looks like")
+odr_capability_agreeing()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.tag())\n"),
+                                ("demo", "common.sysl",
+                                 "module demo\n@requires(os)\n\nloud(s: string) -> string = s + \"!\"\n"),
+                                (s"demo/${odr_here()}", "impl.sysl",
+                                 "module demo\n@requires(os)\n\ntag() -> string = loud(\"selected\")\n")])),
+              "selected!\n")
+
+// ---- a directory that looks like one and is not ----
+
+// The vocabulary is listed as bare symbols, a selector being a list of them.
+@test("a directory that looks like one and is not is refused, and the message says which machines there are")
+odr_misspelled_is_refused()
+    if im_can_run() then return
+
+    val said = odr_out(odr_tree([("", "main.sysl", "print(demo.tag())\n"),
+                                 ("demo/__linx__", "x.sysl",
+                                  "module demo\n\ntag() -> string = \"typo\"\n")]))
+
+    assert(said.contains("'linx', in the directory '__linx__', " + odr_vocabulary()), said)
+
+// `__nosuchos__` is not the selected folder on any target, and is still refused: validation is over
+// every folder a walk meets, not only the one it takes.
+@test("a directory that looks like one and is not is refused whichever machine is asking")
+odr_refused_whichever_machine()
+    if im_can_run() then return
+
+    val said = odr_out(odr_tree([("", "main.sysl", "print(1)\n"),
+                                 ("demo/__nosuchos__", "x.sysl", "module demo\n")]))
+
+    assert(said.contains("'nosuchos', in the directory '__nosuchos__', " + odr_vocabulary()), said)
+
+    for os in [MacOS, Linux, Windows, Freestanding, Android, Wasi]
+        val walked = odr_c(odr_tree([("demo/__nosuchos__", "x.sysl", "module demo\n")]), os)
+
+        assert(walked.contains("'nosuchos', in the directory '__nosuchos__', "), walked)
+
+@test("a directory that looks like one and is not is an ordinary directory when it does not have the shape")
+odr_plain_name_is_a_module()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.linux.tag())\n"),
+                                ("demo/linux", "x.sysl",
+                                 "module demo.linux\n\ntag() -> string = \"a module called linux\"\n")])),
+              "a module called linux\n")
+
+// ---- nesting one inside another ----
+
+@test("nesting one per-OS directory inside another is refused directly")
+odr_nesting_refused_directly()
+    if im_can_run() then return
+
+    val said = odr_out(odr_tree([("", "main.sysl", "print(1)\n"),
+                                 (s"demo/${odr_here()}/${odr_other()}", "x.sysl", "module demo\n")]))
+
+    assert(said.contains(odr_nested()), said)
+
+// The refusal follows the folder down rather than stopping at its own listing.
+@test("nesting one per-OS directory inside another is refused through a module in between")
+odr_nesting_refused_through_a_module()
+    if im_can_run() then return
+
+    val said = odr_out(odr_tree([("", "main.sysl", "print(1)\n"),
+                                 (s"demo/${odr_here()}/sub/${odr_other()}", "x.sysl",
+                                  "module demo.sub\n")]))
+
+    assert(said.contains(odr_nested()), said)
+
+// ---- a selector naming more than one machine ----
+
+@test("a selector naming more than one machine selects for a family, which is what a POSIX shim actually means")
+odr_posix_family()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.seven_times(6))\n"),
+                                ("demo", "demo.sysl", odr_demo()),
+                                ("demo/__posix__", "shim.c", odr_shim())])),
+              "42\n")
+
+@test("a selector names 'hosted', which is the same claim one step weaker")
+odr_hosted()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.tag())\n"),
+                                ("demo/__hosted__", "impl.sysl",
+                                 "module demo\n\ntag() -> string = \"hosted\"\n")])),
+              "hosted\n")
+
+@test("a selector may be a comma-separated list, taken when one of its names is this machine")
+odr_list_naming_this_machine()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.tag())\n"),
+                                (s"demo/__${odr_here_sym()},${odr_other_sym()}__", "impl.sysl",
+                                 "module demo\n\ntag() -> string = \"listed\"\n")])),
+              "listed\n")
+
+// A list is *any*, so a list naming neither must be as unread as a single name that does not match.
+@test("a comma-separated list is not read at all when none of its names is this machine")
+odr_list_naming_neither()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.tag())\n"),
+                                ("demo", "impl.sysl", "module demo\n\ntag() -> string = \"outside\"\n"),
+                                ("demo/__windows,freestanding__", "no.sysl",
+                                 "module demo\n\n((( this is not sysl at all\n")])),
+              "outside\n")
+
+// A freestanding machine has neither capability, so neither folder is taken. Asked of the walk rather
+// than of a build, there being no freestanding clang here to run one against.
+@test("so a freestanding machine takes neither __posix__ nor __hosted__, while the folder naming it is taken")
+odr_freestanding_takes_neither()
+    val tree = odr_tree([("demo", "demo.sysl", "module demo\n"),
+                         ("demo/__posix__", "posix.c", odr_shim()),
+                         ("demo/__hosted__", "hosted.c", odr_shim()),
+                         ("demo/__freestanding__", "bare.c", odr_shim())])
+
+    assert_eq(odr_c(tree, Freestanding), "bare.c")
+    assert_eq(odr_c(tree, Linux), "hosted.c posix.c")
+
+// A `__posix__` folder covers a new POSIX machine untouched while a `__macos,linux__` folder silently
+// does not -- the chapter's advice to prefer the name that says why over the list that says which.
+@test("so Android takes every __posix__ folder, and a spelled list of the other two silently misses it")
+odr_android_takes_posix()
+    val tree = odr_tree([("demo", "demo.sysl", "module demo\n"),
+                         ("demo/__posix__", "why.c", odr_shim()),
+                         ("demo/__macos,linux__", "which.c", odr_shim())])
+
+    assert_eq(odr_c(tree, Android), "why.c")
+    assert_eq(odr_c(tree, Linux), "which.c why.c")
+
+@test("and Android's own __android__ folder besides, which no other machine reads")
+odr_android_own_folder()
+    val tree = odr_tree([("demo", "demo.sysl", "module demo\n"),
+                         ("demo/__android__", "log.c", odr_shim()),
+                         ("demo/__posix__", "shared.c", odr_shim())])
+
+    assert_eq(odr_c(tree, Android), "log.c shared.c")
+    assert_eq(odr_c(tree, Linux), "shared.c")
+    assert_eq(odr_c(tree, MacOS), "shared.c")
+
+// The library's POSIX shims reach a hosted build and no other; what does reach a bare machine is
+// named, which `empty` could not say and which fails if selection breaks towards taking nothing.
+@test("which is what keeps the library's own shims off a bare machine")
+odr_library_shims_stay_off_a_bare_machine()
+    val library = std_root() match
+        Ok(r) -> r
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return
+
+    val bare = c_sources(library, Some(Freestanding)).unwrap()
+    val hosted = c_sources(library, Some(Linux)).unwrap()
+
+    assert_eq(odr_names(bare), "utf8proc.c")
+    // `stdout.c` sits under `__hosted__` rather than `__posix__` -- it needs a C library's stdio, not
+    // POSIX -- and a bare machine takes it no more than it takes the shims.
+    assert_eq(odr_names(hosted), "clock.c cpus.c dirent.c dirs.c meta.c net.c sleep.c spawn.c " +
+                                 "stackguard.c stat.c stdout.c termios.c utf8proc.c zone.c")
+    assert_eq(odr_names(c_sources(library, Some(MacOS)).unwrap()), odr_names(hosted))
+
+@test("a selector's refusal names the element that is wrong, not the whole directory")
+odr_names_the_wrong_element()
+    if im_can_run() then return
+
+    val dir = s"__${odr_here_sym()},linxu__"
+    val said = odr_out(odr_tree([("", "main.sysl", "print(1)\n"),
+                                 (s"demo/$dir", "x.sysl", "module demo\n")]))
+
+    assert(said.contains(s"'linxu', in the directory '$dir', " + odr_vocabulary()), said)
+
+// The deliberate hole, pinned so that widening it is a decision rather than a drift.
+@test("a selector refuses a processor, which is what '#if' is for")
+odr_refuses_a_processor()
+    if im_can_run() then return
+
+    val said = odr_out(odr_tree([("", "main.sysl", "print(1)\n"),
+                                 ("demo/__aarch64__", "x.sysl", "module demo\n")]))
+
+    assert(said.contains("'aarch64', in the directory '__aarch64__', " + odr_vocabulary()), said)
+
+// Every POSIX machine is hosted, so these two are true together always.
+@test("so two selectors that both answer are taken together, when what they hold differs")
+odr_two_answering_taken_together()
+    assert_eq(odr_c(odr_tree([("demo", "demo.sysl", "module demo\n"),
+                              ("demo/__hosted__", "any.c", odr_shim()),
+                              ("demo/__posix__", "posix.c", odr_shim())]), Linux),
+              "any.c posix.c")
+
+@test("and refuses two selectors that both answer and hold one name between them")
+odr_two_answering_one_name_refused()
+    val said = odr_c(odr_tree([("", "main.sysl", "print(1)\n"),
+                               ("demo", "demo.sysl", "module demo\n"),
+                               ("demo/__posix__", "shim.c", odr_shim()),
+                               (s"demo/${odr_here()}", "shim.c", odr_shim())]), host_os())
+    val here = odr_here()
+    val both = if here < "__posix__" then s"'$here' and '__posix__'" else s"'__posix__' and '$here'"
+
+    assert_eq(said, s"'shim.c' is in more than one directory that selects source for this machine — " +
+                    s"$both. A selector may name a family, so two of them can answer at once and both " +
+                    "files would be taken. Give them different names, or name the machines so that at " +
+                    "most one matches")
+
+// The pair a module actually wants is one no machine takes together.
+@test("while a family and a machine outside it live together")
+odr_family_and_outsider()
+    if im_can_run() then return
+
+    assert_eq(odr_out(odr_tree([("", "main.sysl", "print(demo.tag())\n"),
+                                ("demo/__posix__", "impl.sysl",
+                                 "module demo\n\ntag() -> string = \"posix\"\n"),
+                                ("demo/__windows__", "impl.sysl",
+                                 "module demo\n\ntag() -> string = \"windows\"\n")])),
+              "posix\n")
+
+// ---- the modules a tree offers ----
+
+// What a tree offers is a property of the tree rather than of the machine consuming it, so a module
+// whose source is only in the folder this machine does not select is still offered.
+@test("the modules a tree offers include one whose source is only under a per-OS directory")
+odr_offers_a_folder_only_module()
+    val root = im_write(odr_tree([(s"pkg/${odr_other()}", "only.sysl", "module pkg\n"),
+                                  ("plain", "plain.sysl", "module plain\n")]))
+    val offered = package_modules(root).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(odr_names(offered), "pkg plain")
+
+// The walk tolerates a root it cannot read, a dependency's root being anything on disk; a mistake in
+// the tree must not be swallowed by that tolerance.
+@test("and a malformed one is still refused rather than silently offering nothing")
+odr_malformed_offer_is_refused()
+    val root = im_write(odr_tree([("pkg/__linx__", "only.sysl", "module pkg\n")]))
+    val said = package_modules(root) match
+        Err(e) -> e.message
+        Ok(_) -> "offered without a word"
+
+    remove_dir_all(root).unwrap_or(())
+    assert(said.contains("'linx', in the directory '__linx__', " + odr_vocabulary()), said)

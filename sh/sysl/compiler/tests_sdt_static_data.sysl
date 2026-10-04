@@ -1,0 +1,239 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **Constant data**: a module `val` whose initializer is a constant expression -- arithmetic,
+// conversions and `const`s over literals, at any depth inside the arrays and structs built from
+// them -- is laid into the object file, so it needs nothing to run before the program's own
+// statements, and a freestanding archive may read it. A call is not constant data whatever its
+// arguments are.
+//
+// **The reference (0.0.162) refuses every one of these shapes on a freestanding target**, its
+// classifier admitting literal leaves only, while its own advice for an aggregate `const` reads
+// "write it as a 'val', which is laid into the object file as constant data". This compiler follows
+// the advice; the reference diverging is a bootstrap defect, noted and not fixed. Every expected
+// global below is the text the reference emits for the same program with the folded literal written
+// out by hand, and every printed line is what the reference prints running the same program.
+
+private sdt_no_library(t: Target) -> bool
+    if sdt_library_for(t).is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end sdt_no_library
+
+private sdt_library_for(t: Target) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end sdt_library_for
+
+// The library's own complaints are not what a question about a program is asking.
+private sdt_first_of(said: Buf[Placed]) -> string
+    for i in 0..<said.len()
+        if !said.at(i).src.name.starts_with("library/") then return said.at(i).diag.message
+
+    ""
+end sdt_first_of
+
+// An archive for a machine, as `build-c` makes one: the first thing the compilation had to say, or
+// the LLVM text it lowered to.
+private sdt_archive(text: string, target: string) -> string
+    val t = target_named(target)
+
+    if t.is_none() then return s"there is no target '$target'"
+
+    var units = sdt_library_for(t.unwrap())
+    val parsed = parse(source_of("main.sysl", text), t.unwrap())
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t.unwrap(), buf(), false)
+    val early = sdt_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = sdt_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t.unwrap(), pr).0)
+end sdt_archive
+
+private sdt_freestanding(text: string) -> string = sdt_archive(text, "thumbv6m-freestanding")
+
+// The archive was built, the storage is the constant the object file carries, and nothing was
+// written to run before `main` to fill it.
+private sdt_laid_down(out: string, global: string)
+    assert(out.contains(global), out)
+    assert(!out.contains("module_init"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+end sdt_laid_down
+
+@test("a conversion over float arithmetic is constant data, laid down for a freestanding archive")
+sdt_a_conversion_over_float_arithmetic_is_laid_down()
+    if sdt_no_library(target_named("thumbv6m-freestanding").unwrap()) then return
+
+    sdt_laid_down(sdt_freestanding("val R: i32 = i32(0.6 * 2147483648.0)\n\n" +
+                                   "@export(\"main\")\nmain_entry() -> int = R\n"),
+                  "@R = private constant i32 1288490188\n")
+end sdt_a_conversion_over_float_arithmetic_is_laid_down
+
+@test("float arithmetic alone is constant data")
+sdt_float_arithmetic_is_laid_down()
+    if sdt_no_library(target_named("thumbv6m-freestanding").unwrap()) then return
+
+    sdt_laid_down(sdt_freestanding("val F: f64 = 0.6 * 2147483648.0\n\n" +
+                                   "@export(\"main\")\nmain_entry() -> int = int(F)\n"),
+                  "@F = private constant double 0x41D3333333333333\n")
+end sdt_float_arithmetic_is_laid_down
+
+// `16777216 + 1` is a tie a `f32` rounds back down to `16777216`, twice; done in `f64` and rounded
+// once at the end it would be `16777218`. The machine rounds at every step, so the fold does.
+@test("an 'f32' is rounded at every step, as the machine rounds it")
+sdt_an_f32_is_rounded_at_every_step()
+    if sdt_no_library(target_named("thumbv6m-freestanding").unwrap()) then return
+
+    sdt_laid_down(sdt_freestanding("val G: f32 = 16777216.0 + 1.0 + 1.0\n\n" +
+                                   "@export(\"main\")\nmain_entry() -> int = int(G)\n"),
+                  "@G = private constant float 0x4170000000000000\n")
+end sdt_an_f32_is_rounded_at_every_step
+
+@test("a struct built over arithmetic on a 'const' is constant data")
+sdt_a_struct_over_a_const_is_laid_down()
+    if sdt_no_library(target_named("thumbv6m-freestanding").unwrap()) then return
+
+    sdt_laid_down(sdt_freestanding("const R: i32 = 3 * 7 + 1\n\nstruct Q31\n    raw: i32\n\n" +
+                                   "val X: Q31 = Q31(R * 2)\n\n" +
+                                   "@export(\"main\")\nmain_entry() -> int = X.raw\n"),
+                  "@X = private constant %struct.Q31 { i32 44 }\n")
+end sdt_a_struct_over_a_const_is_laid_down
+
+// What the reference's advice for an aggregate `const` asks for, followed.
+@test("a struct over a conversion, and an array of folded elements, are constant data")
+sdt_a_struct_and_an_array_over_folds_are_laid_down()
+    if sdt_no_library(target_named("thumbv6m-freestanding").unwrap()) then return
+
+    val out = sdt_freestanding("struct Q31\n    raw: i32\n\n" +
+                               "val X: Q31 = Q31(i32(0.6 * 2147483648.0))\n" +
+                               "val T: [3]i32 = [1 << 4, -(2 + 3), ~0]\n" +
+                               "val B: bool = 3 < 4 && !false\n\n" +
+                               "@export(\"main\")\nmain_entry() -> int = X.raw + T[0] + (if B then 1 else 0)\n")
+
+    sdt_laid_down(out, "@X = private constant %struct.Q31 { i32 1288490188 }\n")
+    assert(out.contains("@T = private constant [3 x i32] [i32 16, i32 -5, i32 -1]\n"), out)
+    assert(out.contains("@B = private constant i1 1\n"), out)
+end sdt_a_struct_and_an_array_over_folds_are_laid_down
+
+// The reference's refusal, word for word -- and still this compiler's for a call, which is not
+// constant data whatever it is called with.
+private sdt_refusal(name: string) -> string =
+    s"'main_entry' is exported and reaches '$name', which is module storage an initializer fills " +
+    "before the program's own statements run. This artifact has no entry point to fill it in, and " +
+    "'thumbv6m-freestanding' is freestanding — there is no loader to run a constructor either, so " +
+    "the function would read whatever the image left. Build for a hosted target, where the storage " +
+    "is filled before any export can run, or make the initializer constant data, which is laid " +
+    "straight into the object file"
+
+@test("a call over literals is still module storage, and a freestanding archive refuses it")
+sdt_a_call_is_not_constant_data()
+    if sdt_no_library(target_named("thumbv6m-freestanding").unwrap()) then return
+
+    assert_eq(sdt_freestanding("double(x: int) -> int = x * 2\n\nval N: int = double(3)\n\n" +
+                               "@export(\"main\")\nmain_entry() -> int = N\n"),
+              sdt_refusal("N"))
+end sdt_a_call_is_not_constant_data
+
+// An overflow is the program's trap to take at run time, not a value to write down -- so the
+// initializer stays code, and on a freestanding target that is the storage refusal, as before.
+@test("an initializer that would overflow at run time is not folded")
+sdt_an_overflow_is_not_folded()
+    if sdt_no_library(target_named("thumbv6m-freestanding").unwrap()) then return
+
+    assert_eq(sdt_freestanding("val O: i8 = i8(100) + i8(100)\n\n" +
+                               "@export(\"main\")\nmain_entry() -> int = int(O)\n"),
+              sdt_refusal("O"))
+end sdt_an_overflow_is_not_folded
+
+// -- what the program reads -------------------------------------------------------------------------
+
+private sdt_skipped() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end sdt_skipped
+
+// What a project of these files prints when it is built and run on this machine.
+private sdt_prints(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-static-data").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end sdt_prints
+
+@test("constant data holds the value the same initializer computes at run time")
+sdt_the_values_are_the_run_time_values()
+    if sdt_skipped() then return
+
+    val defs = "module m\n\nconst K: i32 = 3 * 7 + 1\n\nstruct Q31\n    raw: i32\n\n" +
+               "val R: i32 = i32(0.6 * 2147483648.0)\n" +
+               "val F: f64 = 0.6 * 2147483648.0\n" +
+               "val G: f32 = 16777216.0 + 1.0 + 1.0\n" +
+               "val X: Q31 = Q31(K * 2)\n" +
+               "val T: [3]i32 = [1 << 4, -(2 + 3), ~0]\n" +
+               "val B: bool = 3 < 4 && !false\n" +
+               "val P: Q31 = Q31(i32(-0.6 * 2147483648.0))\n"
+
+    val main = "import m\n\nprint(m.R)\nprint(long(m.F * 10.0))\nprint(int(m.G))\nprint(m.X.raw)\n" +
+               "print(m.T[0], m.T[1], m.T[2])\nprint(m.B)\nprint(m.P.raw)\n"
+
+    assert_eq(sdt_prints([("m/defs.sysl", defs), ("main.sysl", main)]),
+              "1288490188\n12884901888\n16777216\n44\n16 -5 -1\ntrue\n-1288490188\n")
+end sdt_the_values_are_the_run_time_values

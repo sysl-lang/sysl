@@ -2,7 +2,8 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.process.capture
-import sysl.text.Search
+import sysl.fs.is_file
+import sysl.text.{join, Search}
 
 // The one machine-side question a package is allowed to ask: **where does this library live here?**
 //
@@ -26,11 +27,15 @@ import sysl.text.Search
 struct PkgAnswer
     cflags: Buf[string]
     ldflags: Buf[string]
+
+    // Each `-l` name the link takes from its static archive, paired with the archive's path
+    // (`static_link.sysl`). Empty for a dynamic build.
+    archives: Buf[(string, string)]
 end PkgAnswer
 
 // What a compilation that asked nothing was told, which is what a build with no `pkg_config` block
 // anywhere hands the toolchain.
-no_probe() -> PkgAnswer = PkgAnswer(buf(), buf())
+no_probe() -> PkgAnswer = PkgAnswer(buf(), buf(), buf())
 
 // The tool, by name only. `pkg-config` on this machine is commonly `pkgconf` wearing the traditional
 // name, and the two are compatible in the two queries asked here -- so looking for a second spelling
@@ -64,8 +69,20 @@ pkg_config_query(pc: string) -> Result[PkgAnswer, string]
     val c = flags_of(pc, "--cflags")?
     val l = flags_of(pc, "--libs")?
 
-    Ok(PkgAnswer(c, l))
+    Ok(PkgAnswer(c, l, buf()))
 end pkg_config_query
+
+// What a library that is to come from its archive needs besides `pkg_config_query`'s answer:
+// `--static --libs`, which adds the libraries it links **privately** -- a shared library carries
+// those inside itself and an archive does not -- and `libdir`, since `pkg-config` prints no `-L` for a
+// directory the linker searches anyway, and that is exactly where the archive then is.
+pkg_config_query_static(pc: string) -> Result[StaticAnswer, string]
+    val plain = pkg_config_query(pc)?
+    val whole = flags_of_all(pc, ["--static", "--libs"])?
+    val dir = flags_of_all(pc, ["--variable=libdir"])?
+
+    Ok(StaticAnswer(plain.ldflags, whole, if dir.is_empty() then None else Some(dir.at(0))))
+end pkg_config_query_static
 
 // One query's output, split the way a shell would split it.
 //
@@ -73,11 +90,17 @@ end pkg_config_query
 // such a path in its output, and a splitter that ignored the quoting would hand clang two arguments
 // that are each half a directory -- which fails as a missing header, naming neither the space nor
 // this line. The reader is told to say the path themselves, which is a flag that takes it whole.
-private flags_of(pc: string, what: string) -> Result[Buf[string], string]
+private flags_of(pc: string, what: string) -> Result[Buf[string], string] = flags_of_all(pc, [what])
+
+private flags_of_all(pc: string, whats: []string) -> Result[Buf[string], string]
     var args: Buf[string] = buf()
 
-    args.push(what)
+    for i in 0..<whats.len
+        args.push(whats[i])
+
     args.push(pc)
+
+    val what = join(whats, " ")
 
     val said = ran(args) match
         None -> return Err(s"'$PkgTool $what $pc' failed")
@@ -88,7 +111,7 @@ private flags_of(pc: string, what: string) -> Result[Buf[string], string]
             "space — say where it is on the command line instead, which takes a path whole")
 
     Ok(words_of(said))
-end flags_of
+end flags_of_all
 
 // What the tool printed, where it succeeded.
 private ran(args: Buf[string]) -> Option[string]
@@ -143,8 +166,13 @@ end LibNeed
 // this exactly as it satisfies a header requirement and takes precedence over anything a probe would
 // have found, which is what keeps a hermetic build, a hand-built prefix and a machine with a broken
 // `.pc` from being hostage to whatever happens to be installed.
-probe_libs(needs: Buf[LibNeed], t: Target) -> Result[PkgAnswer, string]
-    var out = PkgAnswer(buf(), buf())
+//
+// **A library `mode` marks is linked from its archive with everything `--static` names**, since an
+// archive carries none of the libraries it links privately. Only a library a list NAMED must have
+// one; `"static"` over the whole build takes one where there is one, and where no library the program
+// links directly has one the link is the dynamic one, `--libs` and all.
+probe_libs(needs: Buf[LibNeed], t: Target, mode: LinkMode = LinkDynamic) -> Result[PkgAnswer, string]
+    var out = PkgAnswer(buf(), buf(), buf())
     var wanted: Buf[LibNeed] = buf()
 
     for i in 0..<needs.len()
@@ -177,8 +205,37 @@ probe_libs(needs: Buf[LibNeed], t: Target) -> Result[PkgAnswer, string]
         for j in 0..<answer.cflags.len()
             out.cflags.push(answer.cflags.at(j))
 
-        for j in 0..<answer.ldflags.len()
-            out.ldflags.push(answer.ldflags.at(j))
+        var ldflags = answer.ldflags
+
+        if link_marks(mode, need.pc)
+            val required = mode match
+                LinkOnly(_) -> true
+                _ -> false
+
+            val whole = pkg_config_query_static(need.pc)?
+            val found = static_archives(need.pc, whole, link_paths(), (f) -> is_file(f), required)?
+
+            if !found.is_empty()
+                ldflags = whole.whole
+
+                val names = sort_names(archive_names(found))
+
+                for j in 0..<names.len()
+                    for k in 0..<found.len()
+                        if found.at(k).0 == names.at(j)
+                            link_note(s"static: -l${names.at(j)} is ${found.at(k).1}")
+                            out.archives.push(found.at(k))
+                        end if
+            end if
+
+            val kept = static_kept(whole, found)
+
+            for j in 0..<kept.len()
+                link_note(static_kept_note(need.pc, kept.at(j), static_searched(whole, link_paths())))
+        end if
+
+        for j in 0..<ldflags.len()
+            out.ldflags.push(ldflags.at(j))
 
     Ok(out)
 end probe_libs

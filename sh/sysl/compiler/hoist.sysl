@@ -125,12 +125,25 @@ last_dot_in(name: string) -> Option[usize]
     found
 end last_dot_in
 
-// Whether one module name is the other or is below it.
+// Whether one module name is the other or is below it. Compared as bytes: a string's subscript is
+// boundary-checked, so cutting `geometría` at the length of a shorter module's prefix traps.
 starts_with_module(name: string, outer: string) -> bool
     val prefix = s"$outer."
 
-    name == outer || (name.bytes.len > prefix.bytes.len && name[0..<prefix.bytes.len] == prefix)
+    name == outer || (name.bytes.len > prefix.bytes.len && name.starts_with(prefix))
 end starts_with_module
+
+// Whether `part`'s bytes stand in `text` at byte `at`. Compared byte by byte rather than by cutting
+// the string, for the same reason: a segment that is not ASCII (`Cuentaañ`) cut at another string's
+// length can end inside a character, and the subscript traps there.
+bytes_at(text: string, at: usize, part: string) -> bool
+    if at + part.bytes.len > text.bytes.len then return false
+
+    for i in 0..<part.bytes.len
+        if text.bytes[at + i] != part.bytes[i] then return false
+
+    true
+end bytes_at
 
 // The parts of a path joined by a separator.
 joined(parts: Buf[string], sep: string) -> string
@@ -253,6 +266,8 @@ private check_trait_defaults(a: &Analysis, scope: Scope, d: TraitDecl)
                     s"'${d.name}.${m.name}' is a property of the type, so a default body would " +
                     "give every implementation the same value — drop the body and let each one " +
                     "supply it")
+
+        check_member_signature(a, scope, m.span, s"${d.name}.${m.name}", m)
 end check_trait_defaults
 
 // Registers one top-level declaration.
@@ -306,7 +321,18 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // A bare-arrow parameter is sugar for a bounded type parameter, and the rewrite happens
         // at the declaration so that everything after it is the generic machinery that exists.
         FuncDecl(d) -> hoist_func(a, scope, s.span, with_call_bounds(d))
-        ImplDecl(d) -> a.tables.impls.push(Impl(with_impl_call_bounds(d), s.span, scope))
+        // **A `@tests` file may not hold an `impl`**: a test build keeps the file and every other
+        // build drops it, so the trait would answer differently in the tests than in the program
+        // that ships. Refused rather than registered, so nothing is analyzed against an answer that
+        // will not be there.
+        ImplDecl(d) ->
+            if test_only_file(a, scope.src.name)
+                a.fault(scope, s.span, "an 'impl' block may not sit in a file that said '@tests' — a " +
+                        "test build would keep it and every other build would drop it, so a trait " +
+                        "would answer one way while the tests ran and another way in the program " +
+                        "that ships. It belongs beside the type")
+            else
+                a.tables.impls.push(Impl(with_impl_call_bounds(d), s.span, scope))
         // **`static` says outright what a header would have said**, so what is under one is
         // registered exactly as another file's declaration of it would be -- which is the whole of
         // what the modifier does, in the one file where an ordinary `var` is a local instead.
@@ -764,6 +790,17 @@ private check_signature_rules(a: &Analysis, scope: Scope, span: Span, name: stri
     check_va_list_positions(a, scope, name, params, ret, foreign)
 end check_signature_rules
 
+// **A member is held to the same rules, its receiver counting as the named parameter a `...` anchors
+// on** -- so `only(self, ...)` is complete and a receiverless `make(...)` is not. `name` is the
+// member as the lowered function is called (`S.make`). A trait's members lower to nothing, so a
+// promise nothing implements is asked here, at its declaration, or nowhere.
+check_member_signature(a: &Analysis, scope: Scope, span: Span, name: string, m: MethodDecl)
+    if m.variadic && m.params.is_empty() && m.recv_mode().is_none() then
+        a.fault(scope, span, s"'$name' needs at least one named parameter before '...'")
+
+    check_va_list_positions(a, scope, name, m.params, m.ret_type, false)
+end check_member_signature
+
 // A name spread as a pack has to have been DECLARED as one, and a pack may only be written as the
 // whole of a tuple (`reference/generics.md § A parameter may stand for a list of types`) -- asked
 // of the signature as written, with no substitution. Left to resolution it is never said at all:
@@ -1054,7 +1091,35 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
         val h = d.hook.unwrap()
 
         runner_signature(a, scope, h.span, d, hook_word(h.kind))
+        second_hook(a, scope, h, key)
 end hoist_func
+
+// **A module writes at most one hook of each kind**: two would both have to run at the same moment,
+// and nothing decides in which order -- not a detail a program could work around, since what a setup
+// leaves behind is what the test finds. The second is refused, and the message names the first,
+// because "where is the other one" is the reader's question. A question about the MODULE rather than
+// the declaration, so it is asked of every function already hoisted, which is declaration order.
+private second_hook(a: &Analysis, scope: Scope, h: HookAttr, key: string)
+    for i in 0..<a.tables.funcs.len()
+        val other_key = a.tables.funcs.key_at(i)
+        val other = a.tables.funcs.at(i)
+
+        if other_key != key && module_of(other_key) == scope.module_name && other.decl.hook.is_some()
+            val first = other.decl.hook.unwrap()
+
+            if first.kind == h.kind
+                val line = other.scope.src.locate(first.span.start).line
+                val named = s"'${module_show(scope.module_name)}'"
+                val owner = if scope.module_name == ModuleRoot then "this one" else named
+
+                a.fault(scope, h.span, s"a module writes at most one '@${hook_word(h.kind)}', and " +
+                        s"$owner already has one — '${module_bare(other_key)}' at " +
+                        s"${other.scope.src.name}:$line, and now '${module_bare(key)}'. Both would " +
+                        "run at the same moment, and nothing says in which order; write one hook " +
+                        "and have it call what it needs")
+                return
+            end if
+end second_hook
 
 // What a `@test` -- and each of the four hooks, held to the same rules for the same reason -- has to
 // look like, checked at the declaration.

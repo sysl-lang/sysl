@@ -1,0 +1,327 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Status, capture}
+
+// `base with { bg = ACCENT }` -- the value `base` again, with the fields named here changed
+// (`reference/expressions.md § with`). The form is the two statements a reader writes today -- a
+// copy bound to a name, an assignment per field, the copy -- written as one expression. So the cases
+// come in groups: what the form buys (it composes, layers and chains), that every rule it obeys is an
+// assignment's, the refusals the desugaring could not have supplied, and where it sits in the grammar.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.159)**, whose
+// `WithExprTests` these are, by handing the installed `sysl` the same tree.
+
+private var wex_library_cache: Buf[Program] = buf()
+private var wex_library_read: bool = false
+
+private wex_library() -> Buf[Program]
+    if wex_library_read then return wex_library_cache
+
+    wex_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> wex_library_cache = units
+
+    wex_library_cache
+end wex_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private wex_ready() -> bool
+    if wex_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end wex_ready
+
+// **What a program of several files printed, where it exited 0**; a program that stopped answers with
+// how it ended in front, and one the build refused answers with the refusal.
+private wex_run(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-wex").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(o) -> o.status match
+            Status.Exited(code) -> if code == 0 then o.text else s"exited $code: ${o.text}"
+            Status.Signalled(sig) -> s"signalled $sig: ${o.text}"
+            _ -> s"timed out: ${o.text}"
+end wex_run
+
+private wex_ran(text: string) -> string = wex_run([("main.sysl", text)])
+
+// A refusal carries this message, anchored at this `file:line:column`.
+private wex_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> "), said)
+    assert(said.contains(s"/$at\n"), said)
+
+private wex_style() -> string = "struct Style\n    fg: int\n    bg: int\n    pad: int\n"
+
+// -- what the form buys ----------------------------------------------------------------------------
+
+@test("one field changed, and the base is untouched")
+wex_one_field_changed()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran(wex_style() + "val base = Style(1, 2, 3)\nval hot = base with { bg = 9 }\n" +
+                      "print(base.fg, base.bg, base.pad)\nprint(hot.fg, hot.bg, hot.pad)\n"), "1 2 3\n1 9 3\n")
+
+@test("several fields at once, written one per line")
+wex_several_fields()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran(wex_style() + "val base = Style(1, 2, 3)\nval hot = base with {\n    bg = 9,\n" +
+                      "    pad = 8,\n}\nprint(hot.fg, hot.bg, hot.pad)\n"), "1 9 8\n")
+
+@test("it layers, which is the case a style has and the two-line form cannot reach")
+wex_it_layers()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran(wex_style() + "val theme = Style(1, 2, 3)\nval pressed = theme with { bg = 9 }\n" +
+                      "val disabled = pressed with { fg = 7 }\nprint(theme.fg, theme.bg)\n" +
+                      "print(pressed.fg, pressed.bg)\nprint(disabled.fg, disabled.bg)\n"),
+              "1 2\n1 9\n7 9\n")
+
+@test("and it chains in one expression")
+wex_it_chains()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran(wex_style() + "val base = Style(1, 2, 3)\nval hot = base with { bg = 9 } with { pad = 8 }\n" +
+                      "print(hot.fg, hot.bg, hot.pad)\n"), "1 9 8\n")
+
+// A style layered at the point it is used, which is what a `var` and two statements cannot be.
+@test("it sits inside a larger expression")
+wex_inside_a_larger_expression()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran(wex_style() + "sum(s: Style) -> int = s.fg + s.bg + s.pad\nval base = Style(1, 2, 3)\n" +
+                      "print(sum(base with { bg = 9 }))\n"), "13\n")
+
+// The base is bound before anything is written, so a base that is a call is called once.
+@test("the base is evaluated once, however many fields change")
+wex_base_evaluated_once()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran(wex_style() + "var calls = 0\ntheme() -> Style\n    calls += 1\n    return Style(1, 2, 3)\n" +
+                      "val hot = theme() with { bg = 9, pad = 8, fg = 7 }\nprint(hot.fg, hot.bg, hot.pad, calls)\n"),
+              "7 9 8 1\n")
+
+@test("a counted field is carried into the copy and outlives the base's scope")
+wex_counted_field_carried()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran("struct Label\n    text: string\nstruct Card\n    n: int\n    tag: &Label\n" +
+                      "val base = Card(1, Label(\"hi\"))\nval other = base with { n = 2 }\n" +
+                      "print(base.n, base.tag.text)\nprint(other.n, other.tag.text)\n"), "1 hi\n2 hi\n")
+
+@test("a generic struct, at each instantiation")
+wex_generic_struct()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran("struct Box[T]\n    v: T\n    n: int\nval bi = Box(1, 0) with { n = 5 }\n" +
+                      "val bs = Box(\"a\", 0) with { v = \"b\" }\nprint(bi.v, bi.n)\nprint(bs.v, bs.n)\n"),
+              "1 5\nb 0\n")
+
+// The value is analyzed against the field's type -- the rule a named argument at a construction follows.
+@test("the field's type is what the value is read against, so a literal needs no suffix")
+wex_literal_needs_no_suffix()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran("struct Style\n    bg: u32\n    pad: usize\nval base = Style(0, 0)\n" +
+                      "val hot = base with { bg = 0x3A6EA5, pad = 4 }\nprint(hot.bg, hot.pad)\n"),
+              "3829413 4\n")
+
+// -- every rule it obeys is the assignment's -------------------------------------------------------
+
+@test("a struct's invariant is rechecked, and a change that breaks it traps")
+wex_invariant_rechecked()
+    if !wex_ready() then return
+
+    val account = "struct Account\n    balance: int\n    invariant balance >= 0\n"
+
+    assert_eq(wex_ran(account + "val a = Account(5)\nprint((a with { balance = 8 }).balance)\n"), "8\n")
+
+    // The reference's program ends on SIGTRAP (exit 133) and prints nothing.
+    assert_eq(wex_ran(account + "val a = Account(5)\nval bad = a with { balance = -1 }\nprint(bad.balance)\n"),
+              "signalled 5: ")
+end wex_invariant_rechecked
+
+@test("a settable property runs its setter")
+wex_setter_runs()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran("struct Cell\n    v: int\n\n    count -> int = self.v\n\n    set count(x)\n" +
+                      "        self.v = x * 10\nval c = Cell(0)\nprint((c with { count = 4 }).v)\n"), "40\n")
+
+@test("the fields are changed in the order written")
+wex_order_written()
+    if !wex_ready() then return
+
+    val log = "struct Log\n    seen: int\n\n    a -> int = 0\n\n    set a(x)\n" +
+              "        self.seen = self.seen * 10 + 1\n\n    b -> int = 0\n\n    set b(x)\n" +
+              "        self.seen = self.seen * 10 + 2\nval l = Log(0)\n"
+
+    assert_eq(wex_ran(log + "print((l with { a = 0, b = 0 }).seen)\n"), "12\n")
+    assert_eq(wex_ran(log + "print((l with { b = 0, a = 0 }).seen)\n"), "21\n")
+
+@test("a field another module keeps private is refused here as it is at an assignment")
+wex_private_field_refused()
+    if !wex_ready() then return
+
+    val lib = "module shape\nstruct Box\n    private n: int\n    w: int\n    make() -> Box = Box(1, 2)\n"
+    val said = wex_run([("shape/shape.sysl", lib),
+                        ("main.sysl", "import shape.*\nval b = Box.make()\nval c = b with { n = 9 }\nprint(c.w)\n")])
+
+    assert(said.contains("error: field 'n' of 'shape.Box' is private to '"), said)
+    assert(said.contains("/shape/shape.sysl', the file that declares it\n --> "), said)
+    assert(said.contains("/main.sysl:3:18\n"), said)
+end wex_private_field_refused
+
+// The sentence, not the caret: the two spellings put the value in different columns.
+@test("a value the field's type does not take is refused in the assignment's words")
+wex_value_refused_as_assignment()
+    if !wex_ready() then return
+
+    val with_form = wex_ran(wex_style() + "val base = Style(1, 2, 3)\nval hot = base with { bg = \"nine\" }\n" +
+                            "print(hot.bg)\n")
+    val assigned = wex_ran(wex_style() + "var base = Style(1, 2, 3)\nbase.bg = \"nine\"\nprint(base.bg)\n")
+
+    wex_refused(with_form, "cannot assign string to field 'bg' of type int", "main.sysl:6:23")
+    wex_refused(assigned, "cannot assign string to field 'bg' of type int", "main.sysl:6:1")
+end wex_value_refused_as_assignment
+
+@test("a field the struct does not have is refused in the assignment's words, at the name")
+wex_missing_field_refused()
+    if !wex_ready() then return
+
+    wex_refused(wex_ran(wex_style() + "val base = Style(1, 2, 3)\nval hot = base with { bgg = 9 }\nprint(hot.bg)\n"),
+                "'Style' has no field or property 'bgg'", "main.sysl:6:23")
+
+// -- what the desugaring could not have said itself ------------------------------------------------
+
+// `var tmp = p` where `p` is a `&Style` binds a second reference, so the writes would land on the
+// object every other holder sees -- the form would have compiled and meant the opposite of a copy.
+@test("a counted reference is refused, with the spelling that copies")
+wex_counted_reference_refused()
+    if !wex_ready() then return
+
+    wex_refused(wex_ran("struct Style\n    bg: int\nval base: &Style = Style(2)\nval hot = base with { bg = 9 }\n" +
+                        "print(hot.bg)\n"),
+                "'with' copies a struct, and this is a counted reference to one \u{2014} writing through it would " +
+                "change the 'Style' every other holder can see. Copy what it points at first, as " +
+                "'(*base) with { \u{2026} }'", "main.sysl:4:16")
+
+@test("a pointer is refused for the same reason")
+wex_pointer_refused()
+    if !wex_ready() then return
+
+    wex_refused(wex_ran("struct Style\n    bg: int\nvar base = Style(2)\nval p = &base\nval hot = p with { bg = 9 }\n" +
+                        "print(hot.bg)\n"),
+                "'with' copies a struct, and this is a pointer to one \u{2014} writing through it would " +
+                "change the 'Style' every other holder can see. Copy what it points at first, as " +
+                "'(*base) with { \u{2026} }'", "main.sysl:5:13")
+
+// The spelling the refusal advises is the one that works.
+@test("and dereferencing first is what the refusal advised")
+wex_dereference_first()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran("struct Style\n    bg: int\n    pad: int\nvar base = Style(2, 3)\nval p = &base\n" +
+                      "val hot = (*p) with { bg = 9 }\nprint(base.bg, hot.bg, hot.pad)\n"), "2 9 3\n")
+
+@test("a scalar is refused by naming what it is")
+wex_scalar_refused()
+    if !wex_ready() then return
+
+    wex_refused(wex_ran("val n = 3\nval m = n with { bg = 9 }\nprint(m)\n"),
+                "'with' copies a struct and changes some of its fields, and 'int' is not a struct", "main.sysl:2:11")
+
+@test("a tuple is refused by naming why it has nothing to write")
+wex_tuple_refused()
+    if !wex_ready() then return
+
+    wex_refused(wex_ran("val t = (1, 2)\nval u = t with { n = 9 }\nprint(u.0)\n"),
+                "a tuple's parts are named for their positions rather than by a name 'with' could write, so a " +
+                "changed one is spelled by rebuilding it \u{2014} '(t.0, 9)'", "main.sysl:2:11")
+
+@test("the same field twice is refused, because the first change would be thrown away")
+wex_same_field_twice()
+    if !wex_ready() then return
+
+    wex_refused(wex_ran(wex_style() + "val base = Style(1, 2, 3)\nval hot = base with { bg = 9, bg = 8 }\nprint(hot.bg)\n"),
+                "'bg' is changed twice in one 'with', so the first change is thrown away \u{2014} write the value it " +
+                "should end with, once", "main.sysl:6:31")
+
+@test("no fields at all is refused by name")
+wex_no_fields()
+    if !wex_ready() then return
+
+    wex_refused(wex_ran(wex_style() + "val base = Style(1, 2, 3)\nval hot = base with { }\nprint(hot.bg)\n"),
+                "'with' changes at least one field \u{2014} with none, 'base with { }' is the value 'base' already is",
+                "main.sysl:6:23")
+
+@test("and a clause with no braces says what the form takes")
+wex_no_braces()
+    if !wex_ready() then return
+
+    wex_refused(wex_ran(wex_style() + "val base = Style(1, 2, 3)\nval hot = base with bg = 9\nprint(hot.bg)\n"),
+                "'with' takes the fields to change in braces, as 'base with { bg = ACCENT }'", "main.sysl:6:21")
+
+// -- where it sits in the grammar ------------------------------------------------------------------
+
+// A tail rather than a binary operator, so it binds as tightly as a field selection.
+@test("it binds tighter than arithmetic, so it changes the operand it follows")
+wex_binds_tighter_than_arithmetic()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran("struct N\n    v: int\nval a = N(1)\nval b = N(2)\nprint(a.v + (b with { v = 9 }).v)\n"), "10\n")
+
+@test("a selection after the clause reads the changed value")
+wex_selection_after_clause()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran(wex_style() + "val base = Style(1, 2, 3)\nprint(base with { bg = 9 }.bg)\n"), "9\n")
+
+// `with` is a soft word, so it is still a name everywhere else.
+@test("'with' is not reserved, so it stays a legal name")
+wex_with_stays_a_name()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran("val with = 3\nprint(with)\n"), "3\n")
+
+@test("including as a field's own name, on both sides of the clause")
+wex_with_as_a_field_name()
+    if !wex_ready() then return
+
+    assert_eq(wex_ran("struct Flags\n    with: int\nval f = Flags(1)\nprint((f with { with = 9 }).with)\n"), "9\n")

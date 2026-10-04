@@ -239,6 +239,11 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
 
     if refused.is_some() then return refused
 
+    val tail = member_tail(cx, decl, args)
+
+    for i in 0..<tail.len()
+        ts.push(tail.at(i))
+
     check_crossings(cx, decl.crossing, shown, sig.unwrap().params, ts)
     cx.an.uses(fname)
     Some(TExpr(span, TCall(fname, ts, sig.unwrap().ret, false)))
@@ -933,6 +938,11 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
     for i in 0..<given.len()
         ts.push(given.at(i))
 
+    val tail = member_tail(cx, m, args)
+
+    for i in 0..<tail.len()
+        ts.push(tail.at(i))
+
     check_crossings(cx, m.crossing, shown, params, ts)
     cx.an.uses(name)
 
@@ -1006,6 +1016,11 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
     for i in 0..<given.len()
         ts.push(given.at(i))
 
+    val tail = member_tail(cx, m, args)
+
+    for i in 0..<tail.len()
+        ts.push(tail.at(i))
+
     check_crossings(cx, m.crossing, shown, params, ts)
     cx.an.uses(fname)
     recheck_after(cx, span, ts.at(0), TExpr(span, TCall(fname, ts, sig.unwrap().ret, false)))
@@ -1077,6 +1092,30 @@ bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
 
     Some(slots)
 end bind_member_args
+
+// **The tail of a variadic member**: every positional argument past the ones its parameters took,
+// each read at whatever type it has and passed as C's promotions leave it -- the free function's
+// rule (`expr_call.sysl`), read one slot in. The slots `bind_member_args` hands back name only the
+// declared parameters, so a caller that lowers the slots alone passes the callee no tail at all.
+private member_tail(cx: &Analyzer, m: MethodDecl, args: Buf[Expr]) -> Buf[TExpr]
+    var out: Buf[TExpr] = buf()
+
+    if !m.variadic then return out
+
+    var positional: usize = 0
+
+    for i in 0..<args.len()
+        val a = args.at(i)
+
+        *a.kind match
+            NamedArg(_, _) -> ()
+            _ ->
+                if positional >= m.params.len() then out.push(variadic_extra(cx, a, false))
+
+                positional += 1
+
+    out
+end member_tail
 
 // The receiver as the member's `self` asked for it: a copy, an address, or a counted reference.
 // The receiver **in the type the member's `self` was declared at**, which for a slice is the one

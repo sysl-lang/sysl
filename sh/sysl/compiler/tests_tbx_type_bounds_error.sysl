@@ -1,0 +1,305 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// What a bound on a TYPE's own parameters refuses (`reference/generics.md § Bounds`). Everything
+// applying the type must supply what it asks, checked at the application wherever one is written;
+// and its members may assume no more than it asks, checked once, at the definition.
+//
+// **Every message quoted here was read out of the reference compiler** (0.0.162) on the same
+// program, whose `TypeBoundsErrorTests` these are. Each is a whole program compiled against the
+// standard module, so every test here wants `SYSL_LIB`.
+
+private tbx_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end tbx_ready
+
+// What a program that must be refused is told, every diagnostic in one report.
+private tbx_err(text: string) -> string
+    val root = make_temp_dir("sysl-type-bounds-error").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tbx_err
+
+private tbx_refused(text: string, part: string)
+    val said = tbx_err(text)
+
+    assert(said.index_of(part).is_some(), s"expected «$part» in:\n$said")
+
+private tbx_show() -> string = "trait Show\n    show(self) -> string\n"
+
+// A bounded wrapper and a struct that does not implement the bound.
+private tbx_wrap() -> string = s"${tbx_show()}struct Wrap[T: Show]\n    inner: T\nstruct P\n    v: int\n"
+
+@test("an argument must implement what the type asks: so a struct without the implementation is refused")
+tbx_a_struct_without_the_implementation()
+    if !tbx_ready() then return
+
+    tbx_refused(s"${tbx_wrap()}var w = Wrap(P(1))",
+                "'Wrap' requires its type parameter 'T' to implement 'Show', but P does not")
+
+@test("an argument must implement what the type asks: and so is a built-in that is outside the trait")
+tbx_a_builtin_outside_the_trait()
+    if !tbx_ready() then return
+
+    tbx_refused(s"${tbx_wrap()}var w = Wrap(5)",
+                "'Wrap' requires its type parameter 'T' to implement 'Show', but int does not")
+
+@test("wherever the type is written — a declared parameter")
+tbx_a_declared_parameter()
+    if !tbx_ready() then return
+
+    tbx_refused(s"${tbx_wrap()}label(w: Wrap[P]) -> int = 1",
+                "'Wrap' requires its type parameter 'T' to implement 'Show', but P does not")
+
+@test("wherever the type is written — a declared result")
+tbx_a_declared_result()
+    if !tbx_ready() then return
+
+    tbx_refused(s"${tbx_wrap()}make(p: P) -> Wrap[P] = Wrap(p)",
+                "'Wrap' requires its type parameter 'T' to implement 'Show', but P does not")
+
+@test("wherever the type is written — a field of another type")
+tbx_a_field_of_another_type()
+    if !tbx_ready() then return
+
+    tbx_refused(s"${tbx_wrap()}struct Holder\n    held: Wrap[P]",
+                "'Wrap' requires its type parameter 'T' to implement 'Show', but P does not")
+
+@test("wherever the type is written — a variant's payload")
+tbx_a_variant_payload()
+    if !tbx_ready() then return
+
+    tbx_refused(s"${tbx_wrap()}enum Held\n    One(w: Wrap[P])",
+                "'Wrap' requires its type parameter 'T' to implement 'Show', but P does not")
+
+@test("wherever the type is written — an argument of a further application")
+tbx_an_argument_of_a_further_application()
+    if !tbx_ready() then return
+
+    tbx_refused(s"${tbx_wrap()}var w: Wrap[Wrap[P]] = Wrap(Wrap(P(1)))",
+                "'Wrap' requires its type parameter 'T' to implement 'Show', but P does not")
+
+// An enum asks for what it asks in the same place and is held to it the same way.
+@test("an enum's parameter asking the same question")
+tbx_an_enum_parameter()
+    if !tbx_ready() then return
+
+    tbx_refused(raw"""
+        trait Show
+            show(self) -> string
+        enum Maybe[T: Show]
+            Just(value: T)
+            Nothing
+        struct P
+            v: int
+        var m = Just(P(1))
+        """, "'Maybe' requires its type parameter 'T' to implement 'Show', but P does not")
+
+// A trait object still fails a bound on a trait it does not dispatch through.
+@test("and a trait object still fails a bound on some other trait")
+tbx_a_trait_object_and_some_other_trait()
+    if !tbx_ready() then return
+
+    tbx_refused(raw"""
+        trait Show
+            show(self) -> string
+        trait Other
+            other(self) -> int
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> string = "p"
+        struct Wrap[T: Other]
+            inner: T
+        var w: Wrap[&Show] = Wrap(P(1))
+        """, "'Wrap' requires its type parameter 'T' to implement 'Other', but &Show does not")
+
+// A type an implementation covers is told what that implementation asked of it.
+@test("and a covered type is told which of its own arguments fails")
+tbx_a_covered_type()
+    if !tbx_ready() then return
+
+    tbx_refused(raw"""
+        trait Show
+            show(self) -> string
+        struct Box[T]
+            v: T
+        impl[T: Show] Show for Box[T]
+            show(self) -> string = self.v.show()
+        struct Wrap[T: Show]
+            inner: T
+        struct P
+            v: int
+        var w = Wrap(Box(P(1)))
+        """,
+                "'Wrap' requires its type parameter 'T' to implement 'Show', but Box[P] does not — " +
+                "the 'impl' that covers it asks 'Show' of P, which does not implement it")
+
+// The body is wrong on its own line, whether or not anything instantiates it.
+@test("so a method calling what no bound licenses is reported at the definition")
+tbx_a_method_calling_what_no_bound_licenses()
+    if !tbx_ready() then return
+
+    tbx_refused(s"${tbx_show()}struct Box[T]\n    value: T\n    label(self) -> string = self.value.show()",
+                "'show' needs 'T: Show'")
+
+@test("and an operator the parameter does not promise names the bound to add")
+tbx_an_operator_names_the_bound()
+    if !tbx_ready() then return
+
+    tbx_refused(raw"""
+        struct Box[T]
+            value: T
+            twice(self) -> T = self.value + self.value
+        """, "'+' needs 'T: sysl.Add'")
+
+@test("a bound licenses only its own trait's members")
+tbx_a_bound_licenses_only_its_own_members()
+    if !tbx_ready() then return
+
+    tbx_refused(raw"""
+        trait Show
+            show(self) -> string
+        trait Size
+            size(self) -> int
+        struct Wrap[T: Show]
+            inner: T
+            n(self) -> int = self.inner.size()
+        """, "'size' needs 'T: Size'")
+
+@test("and rendering the element asks for 'Display'")
+tbx_rendering_asks_for_display()
+    if !tbx_ready() then return
+
+    tbx_refused(raw"""
+        struct Wrap[T]
+            inner: T
+            line(self) -> string = str(self.inner)
+        """, "'str' needs 'T: sysl.Display'")
+
+// A field is layout rather than behaviour, so no bound could ever license one.
+@test("while a field read off the parameter is refused with no bound to suggest")
+tbx_a_field_read_off_the_parameter()
+    if !tbx_ready() then return
+
+    tbx_refused(raw"""
+        struct Wrap[T]
+            inner: T
+            peek(self) -> int = self.inner.v
+        """, "'T' is a type parameter, so it has no fields to read — a field is layout, and no trait " +
+             "declares a property 'v' that a bound could promise instead")
+
+// One mistake stays one diagnostic: the instantiations are dropped in favour of the definition's.
+@test("and the definition's diagnostic is the only one, however many instantiations there are")
+tbx_one_diagnostic_however_many_instantiations()
+    if !tbx_ready() then return
+
+    val said = tbx_err(raw"""
+        struct Box[T]
+            value: T
+            twice(self) -> T = self.value + self.value
+        var a = Box(1)
+        var b = Box(2.5)
+        print(a.twice(), b.twice())
+        """)
+
+    assert_eq(said.count_of("needs 'T: sysl.Add'"), 1)
+
+// The declaration is wrong on its own line, and the fix is on that line too.
+@test("so a function applying a bounded type to its own parameter must bound it")
+tbx_a_function_applying_a_bounded_type()
+    if !tbx_ready() then return
+
+    tbx_refused(s"${tbx_wrap()}label[U](w: Wrap[U]) -> int = 1",
+                "'Wrap' requires its type parameter 'T' to implement 'Show', but 'U' is not bounded by it")
+
+// A generic type's fields are laid out once against its own bounds.
+@test("and so must a field of one generic type applying another")
+tbx_a_field_of_one_generic_type_applying_another()
+    if !tbx_ready() then return
+
+    tbx_refused(raw"""
+        trait Show
+            show(self) -> string
+        trait Rank
+            rank(self) -> int
+        struct Inner[U: Rank]
+            u: U
+        struct Wrap[T: Show]
+            held: Inner[T]
+        """, "'Inner' requires its type parameter 'U' to implement 'Rank', but 'T' is not bounded by it")
+
+@test("a variant's payload the same way")
+tbx_a_variant_payload_the_same_way()
+    if !tbx_ready() then return
+
+    tbx_refused(raw"""
+        trait Show
+            show(self) -> string
+        trait Rank
+            rank(self) -> int
+        struct Inner[U: Rank]
+            u: U
+        enum Held[T: Show]
+            One(held: Inner[T])
+            None2
+        """, "'Inner' requires its type parameter 'U' to implement 'Rank', but 'T' is not bounded by it")
+
+// Its subject is an application of that type like any other, so it must ask at least as much.
+@test("must ask at least what the type asks of its own parameter")
+tbx_a_generic_impl_must_ask_as_much()
+    if !tbx_ready() then return
+
+    tbx_refused(raw"""
+        trait Show
+            show(self) -> string
+        trait Loud
+            loud(self) -> string
+        struct Wrap[T: Show]
+            inner: T
+        impl[T] Loud for Wrap[T]
+            loud(self) -> string = "!"
+        """, "'Wrap' requires its type parameter 'T' to implement 'Show', but 'T' is not bounded by it")
+
+@test("so a struct name in bound position is refused")
+tbx_a_struct_name_in_bound_position()
+    if !tbx_ready() then return
+
+    tbx_refused(raw"""
+        struct P
+            v: int
+        struct Wrap[T: P]
+            inner: T
+        """, "the bound on 'T' in 'Wrap' names 'P', which is not a trait")
+
+@test("and so is a name that declares nothing at all")
+tbx_a_name_that_declares_nothing()
+    if !tbx_ready() then return
+
+    tbx_refused("struct Wrap[T: Nothing]\n    inner: T",
+                "the bound on 'T' in 'Wrap' names 'Nothing', which is not a trait")
+
+@test("on an enum as readily as on a struct")
+tbx_on_an_enum_as_readily()
+    if !tbx_ready() then return
+
+    tbx_refused("enum Maybe[T: Nothing]\n    Just(value: T)\n    Nothing",
+                "the bound on 'T' in 'Maybe' names 'Nothing', which is not a trait")

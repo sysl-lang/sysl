@@ -1,0 +1,138 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A file-private generic is instantiated under its own key, slot and all.** The spelling is shared
+// by every file of the module that declares one, so an instantiation named off the spelling is one
+// name for two functions: two files' `private twice[T]` made real at `int` were one body, and a
+// private generic beside a `@tests` file's declaration of the spelling was filed as that file's
+// scaffolding and stripped from every build but `sysl test` -- a call left to a function no longer
+// there, which clang refused. A bare-arrow parameter makes a function generic, which is how a
+// closure argument reached it.
+//
+// Every output here is the reference's (0.0.162) for the same tree: `sysl run` printing it, `sysl
+// test` passing, and `emit-llvm` naming the instantiation `app$verdict.private1.$closure8`.
+
+private ttc_ready() -> bool = std_root().is_ok()
+
+// A program whose `main.sysl` imports module `app`, made of the given files under `app/`, written to
+// a fresh directory.
+private ttc_tree(main: string, files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-ttc").unwrap()
+
+    make_dir_all(s"$root/app").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+
+    for i in 0..<files.len
+        write_text(s"$root/app/${files[i].0}", files[i].1).unwrap()
+
+    root
+end ttc_tree
+
+// What the program prints when it is built the way `sysl build` builds it, which strips the tests.
+private ttc_ran(main: string, files: []const (string, string)) -> string
+    val root = ttc_tree(main, files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ttc_ran
+
+// `sysl <command>` over the tree: what it said and the exit status. A test build's report goes to
+// the process's own output, so the status is what says the tests built and passed.
+private ttc_cli(command: string, main: string, files: []const (string, string)) -> (string, int)
+    val root = ttc_tree(main, files)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", command, root], (line) -> sink.push(line))
+    var out = ""
+
+    for i in 0..<lines.len()
+        out = out + lines.at(i)
+
+    remove_dir_all(root).unwrap_or(())
+    (out, code)
+end ttc_cli
+
+private ttc_closure_main() -> string = "import app\n\napp.run(1, (s) -> print(s))\n"
+
+private ttc_closure_private() -> string =
+    "module app\n\nprivate verdict(n: int, say: string -> unit)\n    say(s\"n=$n\")\n\n" +
+    "run(n: int, say: string -> unit) = verdict(n, (s) -> say(s + \"?\"))\n"
+
+private ttc_twin(body: string) -> string =
+    "module app\n@tests\n\nverdict(s: string) -> string = s + \"!\"\n\n@test\nboth_answer()\n" +
+    "    assert(verdict(\"x\") == \"x!\")\n" + body
+
+private ttc_closure_files() -> [2](string, string) =
+    [("a.sysl", ttc_closure_private()),
+     ("b.sysl", ttc_twin("    run(2, (s) -> assert(s == \"n=2?\"))\n"))]
+
+@test("a private generic beside a @tests twin of its spelling survives the build that strips tests")
+ttc_closure_twin_builds_and_runs()
+    if !ttc_ready() then return
+
+    assert_eq(ttc_ran(ttc_closure_main(), ttc_closure_files()), "n=1?\n")
+
+@test("and under sysl test, where the twin is live, both answer")
+ttc_closure_twin_under_test()
+    if !ttc_ready() then return
+
+    val (out, code) = ttc_cli("test", ttc_closure_main(), ttc_closure_files())
+
+    assert_eq(code, 0, out)
+
+@test("the private generic's instantiation is filed under its own slot")
+ttc_instantiation_takes_the_slot()
+    if !ttc_ready() then return
+
+    val (out, code) = ttc_cli("emit-llvm", ttc_closure_main(), ttc_closure_files())
+
+    assert_eq(code, 0, out)
+    assert(out.contains("define internal void @app$verdict.private1.$closure"), out)
+    assert(!out.contains("@app$verdict.$closure"), out)
+
+private ttc_plain_files() -> [2](string, string) =
+    [("a.sysl", "module app\n\nprivate verdict(n: int) -> int = n + 1\n\nrun(n: int) -> int = verdict(n)\n"),
+     ("b.sysl", ttc_twin("    assert(run(2) == 3)\n"))]
+
+@test("a private function that is not generic beside the same twin builds and runs")
+ttc_plain_twin_builds_and_runs()
+    if !ttc_ready() then return
+
+    assert_eq(ttc_ran("import app\n\nprint(app.run(1))\n", ttc_plain_files()), "2\n")
+
+@test("and passes under sysl test")
+ttc_plain_twin_under_test()
+    if !ttc_ready() then return
+
+    val (out, code) = ttc_cli("test", "import app\n\nprint(app.run(1))\n", ttc_plain_files())
+
+    assert_eq(code, 0, out)
+
+@test("two files' private generics of one spelling at one type are two functions")
+ttc_two_private_generics_are_two_bodies()
+    if !ttc_ready() then return
+
+    val files: [2](string, string) =
+        [("a.sysl", "module app\n\nprivate twice[T: Add[T]](x: T) -> T = x + x\n\n" +
+                    "one(n: int) -> int = twice(n)\n"),
+         ("b.sysl", "module app\n\nprivate twice[T: Mul[T]](x: T) -> T = x * x * x\n\n" +
+                    "two(n: int) -> int = twice(n + 1)\n")]
+
+    assert_eq(ttc_ran("import app\n\nprint(app.one(1))\nprint(app.two(1))\n", files), "2\n8\n")

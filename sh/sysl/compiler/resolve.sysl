@@ -255,7 +255,7 @@ private package_owner(p: &ResolvedPackage) -> string
 end package_owner
 
 // Every dependency's stated floor against the compiler in hand, where this compiler is in a
-// position to make a claim about one at all (`floor_refusal`).
+// position to make a claim about one at all (`OnTheReleaseLine`).
 //
 // **This is the whole point of the field**, and it is why the check is here rather than left to
 // whatever fails later: a package using something the language grew fails somewhere *inside* itself,
@@ -266,17 +266,30 @@ end package_owner
 // The **root** is not checked here -- the driver does it, which is the funnel every command's own
 // manifest comes through, and checking it twice would report it twice.
 private check_floors(packages: &Buf[ResolvedPackage]) -> Result[unit, string]
+    if !OnTheReleaseLine then return Ok(())
+
+    dependency_floor_refusal(packages, Version) match
+        None -> Ok(())
+        Some(why) -> Err(why)
+end check_floors
+
+// The first dependency whose stated floor is newer than `compiler`, worded for the person who has to
+// act on it -- the package by the name it calls itself and the tag that was asked for.
+//
+// The compiler is a parameter rather than read here so that the sentence can be asked for against a
+// release-line version even while this compiler makes no claim against its own (`OnTheReleaseLine`).
+dependency_floor_refusal(packages: &Buf[ResolvedPackage], compiler: string) -> Option[string]
     for i in 0..<packages.len()
         val p = packages.at(i)
 
         if is_root_package(p) then continue
 
-        floor_refusal(package_named(p), p.manifest.floor) match
+        check_floor(package_named(p), p.manifest.floor, compiler) match
             None -> ()
-            Some(why) -> return Err(why)
+            Some(why) -> return Some(why)
 
-    Ok(())
-end check_floors
+    None
+end dependency_floor_refusal
 
 // Every requirement raises a floor and nothing ever lowers one, which is the whole of selection --
 // and every one of them is written down on the way past, whether or not it won.
@@ -570,7 +583,7 @@ private declared_table(owner: string, owner_root: string, deps: &Buf[Dependency]
         val standing = stand_in_for(state, dep)
         val standing_dir = if standing.is_some() then standing.unwrap().0 else ""
 
-        val added = if standing.is_some() then stand_in_bindings(dep, standing_dir)
+        val added = if standing.is_some() then stand_in_bindings(dep, standing_dir)?
         else declared_bindings(owner, dep, state)?
 
         for j in 0..<added.len()
@@ -592,11 +605,15 @@ private declared_bindings(owner: string, dep: &Dependency,
         Ok(got) -> Ok(got)
 end declared_bindings
 
-// What a stood-in coordinate binds: each of the root's modules as itself, or under the mount.
-private stand_in_bindings(dep: &Dependency, dir: string) -> Buf[MountedName]
+// What a stood-in coordinate binds: each of the root's modules as itself, or under the mount. A root
+// whose tree holds a malformed per-OS selector is refused as any package's is.
+private stand_in_bindings(dep: &Dependency, dir: string) -> Result[Buf[MountedName], string]
     var out: Buf[MountedName] = buf()
     val owner = dependency_canonical(dep)
-    val modules = package_modules(dir)
+
+    val modules = package_modules(dir) match
+        Err(e) -> return Err(e.message)
+        Ok(m) -> m
 
     for i in 0..<modules.len()
         val m = modules.at(i)
@@ -605,7 +622,7 @@ private stand_in_bindings(dep: &Dependency, dir: string) -> Buf[MountedName]
             Some(mount) -> out.push(MountedName(package_qualify(mount, m), m, owner))
             None -> out.push(MountedName(m, m, owner))
 
-    out
+    Ok(out)
 end stand_in_bindings
 
 // Every package reachable through the ones a manifest named, minus those it named itself.
@@ -702,7 +719,9 @@ private inherit(owner: string, owner_root: string, table: Buf[MountedName], bind
             s"project depends on. Name one of them in $ManifestName with a 'mount' to say which " +
             "name it takes here")
 
-    val ours = package_modules(owner_root)
+    val ours = package_modules(owner_root) match
+        Err(e) -> return Err(e.message)
+        Ok(m) -> m
 
     for i in 0..<ours.len()
         if module_overlap(ours.at(i), local) then return Ok(table)
@@ -782,7 +801,9 @@ bindings_of(dep: &Dependency, dir: string) -> Result[Buf[MountedName], string]
             return Ok(out)
         None -> ()
 
-    val modules = package_modules(dir)
+    val modules = package_modules(dir) match
+        Err(e) -> return Err(e.message)
+        Ok(m) -> m
 
     if modules.is_empty()
         return Err(s"'${dep.label}' has no modules — a package is a tree of directories holding " +
@@ -826,7 +847,9 @@ private no_collision(owner: string, owner_root: string, table: &Buf[MountedName]
     // The consumer's own modules are in the same name space, and a project with a `json` directory
     // at its root taking a dependency that offers `json` is the common case rather than an exotic
     // one. Refused in the same words, because it is the same collision.
-    val ours = package_modules(owner_root)
+    val ours = package_modules(owner_root) match
+        Err(e) -> return Err(e.message)
+        Ok(m) -> m
 
     for i in 0..<ours.len()
         if module_overlap(ours.at(i), local)
@@ -869,7 +892,7 @@ private root_claiming(owner: string, local: string, standing: string = "") -> Op
     for i in 0..<libs.len()
         if !standing.is_empty() && libs.at(i) == standing then continue
 
-        val theirs = package_modules(libs.at(i))
+        val theirs = package_modules(libs.at(i)).unwrap_or(buf())
 
         for j in 0..<theirs.len()
             if module_overlap(theirs.at(j), local) then return Some(libs.at(i))
@@ -1058,6 +1081,42 @@ resolved_graph(root: string, m: &Manifest) -> Result[Graph, Refusal]
 
     Ok(graph)
 end resolved_graph
+
+// The directory of every other tree the build with **every feature on** would take -- the packages
+// that graph reaches and, where `roots`, the `--lib` source roots. Resolved afresh and never written
+// back: it is asked only to tell a library a feature left out from a misspelt one (`link`).
+all_feature_trees(root: string, m: &Manifest, roots: bool) -> Result[Buf[string], Refusal]
+    var out: Buf[string] = buf()
+
+    if wants_graph(m)
+        val cache = cache_root(root) match
+            Err(why) -> return Err(Refusal(why))
+            Ok(dir) -> dir
+
+        val sums = sums_at(root) match
+            Err(why) -> return Err(Refusal(why))
+            Ok(got) -> got
+
+        val graph = resolve_graph(root, m, sums, cache, FeatureRequest(buf(), false, true),
+                                  feature_testing()) match
+            Err(why) -> return Err(Refusal(why))
+            Ok(got) -> got
+
+        for i in 0..<graph.packages.len()
+            val p = graph.packages.at(i)
+
+            if !is_root_package(p) then out.push(p.root)
+    end if
+
+    if roots
+        val libs = lib_roots()
+
+        for i in 0..<libs.len()
+            out.push(libs.at(i))
+    end if
+
+    Ok(out)
+end all_feature_trees
 
 // One tree a compilation was handed beside the project's own: a package its `dependencies` reached,
 // or a source root a `--lib` named.

@@ -1,0 +1,119 @@
+module sh.sysl.compiler
+@tests
+
+// A float read as an integer SATURATES (`reference/expressions.md § Conversions are calls`): truncated
+// toward zero, a value past either end of the width comes to that end, and a NaN comes to zero.
+// Programs lean on it -- a q31 sample clamps through `i32(x * 2147483648.0)` and nothing else.
+//
+// The run-time outputs were read out of the reference compiler (0.0.162), which emits the `.sat`
+// intrinsics. The constants are where the reference diverges: its fold wraps the truncated value
+// into the width (`i32(1e30)` folds to -1, `u8(300.0)` to 44, `i32(1.0 / 0.0)` to -1) while the
+// same conversion at run time saturates. A constant is the same expression evaluated earlier, so it
+// may not come to a different number; the constants here assert the run-time answer.
+
+@test("a real past either end of the width comes to that end, and a NaN to zero")
+fsat_a_real_saturates_at_run_time()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var big = 1e30\nvar nbig = -1e30\nvar z = 0.0\nvar nan = z / z\nvar neg = -1.5\n" +
+                      "print(i32(big), i32(nbig), i32(nan))\n" +
+                      "print(u8(big), u8(nbig), u8(nan), u8(neg))\n" +
+                      "print(int(big), int(nbig), int(nan))\n" +
+                      "print(u64(big), i64(nbig), u64(neg), i8(neg))\n"),
+              "2147483647 -2147483648 0\n255 0 0 0\n2147483647 -2147483648 0\n" +
+              "18446744073709551615 -9223372036854775808 0 -1\n")
+
+@test("an f32 saturates the same way")
+fsat_an_f32_saturates_at_run_time()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var fb: f32 = 1e30\nvar fn: f32 = -1e30\nvar fz: f32 = 0.0\nvar fnan: f32 = fz / fz\n" +
+                      "print(i32(fb), i32(fn), i32(fnan))\n" +
+                      "print(u8(fb), u8(fn), u8(fnan), u32(fn))\n"),
+              "2147483647 -2147483648 0\n255 0 0 0\n")
+
+@test("a float past an integer's range saturates to its maximum or minimum")
+fsat_past_the_range_saturates_to_max_or_min()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var hi = 1.0e30\nvar lo = -1.0e30\nvar edge = 2147483648.0\nprint(int(hi), int(lo), int(edge))\n"),
+              "2147483647 -2147483648 2147483647\n")
+
+@test("a negative float saturates to zero when the target is unsigned")
+fsat_a_negative_float_saturates_to_zero_unsigned()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("var neg = -5.0\nprint(u8(neg), u16(neg), u32(neg))\n"), "0 0 0\n")
+
+@test("float to integer uses the saturating intrinsic, not a bare cast")
+fsat_float_to_integer_uses_the_saturating_intrinsic()
+    if !enm_ready() then return
+
+    val signed = enm_ir("print(int(1.5))\n")
+
+    assert(enm_says(signed, "declare i32 @llvm.fptosi.sat.i32.f64(double)"), signed)
+    assert(enm_says(signed, "call i32 @llvm.fptosi.sat.i32.f64(double"), signed)
+    assert(!enm_says(signed, "fptosi double"), signed)
+
+    val unsigned = enm_ir("print(u8(1.5))\n")
+
+    assert(enm_says(unsigned, "declare i8 @llvm.fptoui.sat.i8.f64(double)"), unsigned)
+    assert(enm_says(unsigned, "call i8 @llvm.fptoui.sat.i8.f64(double"), unsigned)
+    assert(!enm_says(unsigned, "fptoui double"), unsigned)
+end fsat_float_to_integer_uses_the_saturating_intrinsic
+
+@test("a value inside the width truncates toward zero")
+fsat_inside_the_width_truncates_toward_zero()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("print(i32(2.9), i32(-2.9), u8(255.9), i16(-32768.5))\n"),
+              "2 -2 255 -32768\n")
+
+@test("a written conversion over a literal saturates too")
+fsat_a_conversion_over_a_literal_saturates()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("val d = i32(1e30)\nprint(d, i32(1e30), u8(-1.5), u8(300.0), i8(1e10))\n"),
+              "2147483647 2147483647 0 255 127\n")
+
+// The constant folder and the running program over the SAME inputs, at every width and both
+// signednesses: each pair of lines must be identical. The reference prints -1294967296 for the
+// folded `i32(3000000000.0)` where the run-time line has 2147483647.
+@test("a folded conversion and the run-time one agree at every width")
+fsat_folded_and_run_time_agree_at_every_width()
+    if !enm_ready() then return
+
+    var src = "same(x: real) -> real = x\n" +
+              "const p: real = 3000000000.0\nconst q: real = -3000000000.0\nconst h: real = 1e300\n" +
+              "const nn: real = 0.0 / 0.0\n"
+    var prints = ""
+
+    for w in ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64"]
+        src = src + s"const ${w}_p: $w = $w(3000000000.0)\nconst ${w}_q: $w = $w(-3000000000.0)\n" +
+              s"const ${w}_h: $w = $w(1e300)\nconst ${w}_n: $w = $w(0.0 / 0.0)\n"
+        prints = prints + s"print(${w}_p, ${w}_q, ${w}_h, ${w}_n)\n" +
+                 s"print($w(same(p)), $w(same(q)), $w(same(h)), $w(same(nn)))\n"
+
+    assert_eq(enm_ran(src + prints),
+              "127 -128 127 0\n127 -128 127 0\n" +
+              "255 0 255 0\n255 0 255 0\n" +
+              "32767 -32768 32767 0\n32767 -32768 32767 0\n" +
+              "65535 0 65535 0\n65535 0 65535 0\n" +
+              "2147483647 -2147483648 2147483647 0\n2147483647 -2147483648 2147483647 0\n" +
+              "3000000000 0 4294967295 0\n3000000000 0 4294967295 0\n" +
+              "3000000000 -3000000000 9223372036854775807 0\n3000000000 -3000000000 9223372036854775807 0\n" +
+              "3000000000 0 18446744073709551615 0\n3000000000 0 18446744073709551615 0\n")
+end fsat_folded_and_run_time_agree_at_every_width
+
+// The reference prints "-1 255 44" for the first line and "0 -1 -9223372036854775808 -2" for the
+// second: its constant fold wraps where the running program saturates. This asserts the run-time
+// rule.
+@test("a constant folds to the number the conversion comes to at run time")
+fsat_a_constant_folds_to_the_saturated_value()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("const a: i32 = i32(1e30)\nconst b: u8 = u8(-1.5)\nconst c: u8 = u8(300.0)\n" +
+                      "const n: i32 = i32(0.0 / 0.0)\nconst inf: i32 = i32(1.0 / 0.0)\n" +
+                      "const lo: i64 = i64(-1e300)\nconst t: i8 = i8(-2.9)\n" +
+                      "print(a, b, c)\nprint(n, inf, lo, t)\n"),
+              "2147483647 0 255\n0 2147483647 -9223372036854775808 -2\n")

@@ -1,0 +1,88 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A file-private enum's variants carry the enum's own visibility (`reference/modules.md §
+// Visibility`), and a name a file may not reach is not a candidate for it. So a private enum's
+// variant `Voice` in one file and a private `struct Voice` in another file of the same module never
+// contend: each file sees only its own, and `Voice(1)` in the struct's file builds the struct.
+//
+// **The reference diverges here.** 0.0.162 refuses the struct's own use in all three programs below
+// with "error: 'demo.Voice' is private to '<dir>/demo/b.sysl', the file that declares it". When the
+// files are swapped it names the struct's OWN file as the declaring one. This compiler follows the
+// specification, and a public enum's variant beside a private struct (which the reference builds) is
+// covered by `tests_rlb_file_private.sysl`.
+
+private pvs_no_library() -> bool
+    std_root() match
+        Ok(_) -> false
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            true
+
+// What a program of several files prints. The tree goes on disk, since a module is a directory and a
+// build reads one.
+private pvs_ran(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-pvs").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end pvs_ran
+
+private pvs_main() -> string = "import demo\n\nprint(demo.mk())\nprint(demo.stop_code())\n"
+
+private pvs_struct(vis: string) -> string = s"module demo\n\n${vis}struct Voice\n    x: int\n\nmk() -> int = Voice(1).x\n"
+
+private pvs_enum() -> string
+    val head = "module demo\n\nprivate enum Stop\n    Voice(n: int)\n    Top\n\n"
+    val pick = "private pick(s: Stop) -> int = s match\n    Voice(n) -> n\n    Top -> 0\n\n"
+
+    head + pick + "stop_code() -> int = pick(Voice(3))\n"
+
+@test("a private struct and another file's private variant of its name never contend")
+pvs_a_private_variant_does_not_shadow_a_private_struct()
+    if pvs_no_library() then return
+
+    assert_eq(pvs_ran([("main.sysl", pvs_main()),
+                       ("demo/a.sysl", pvs_struct("private ")),
+                       ("demo/b.sysl", pvs_enum())]),
+              "1\n3\n")
+
+@test("and the same with the two files the other way round")
+pvs_the_same_with_the_files_swapped()
+    if pvs_no_library() then return
+
+    assert_eq(pvs_ran([("main.sysl", pvs_main()),
+                       ("demo/a.sysl", pvs_enum()),
+                       ("demo/b.sysl", pvs_struct("private "))]),
+              "1\n3\n")
+
+@test("and a public struct is not shadowed by a variant its file cannot reach")
+pvs_a_public_struct_beside_a_private_variant()
+    if pvs_no_library() then return
+
+    assert_eq(pvs_ran([("main.sysl", pvs_main()),
+                       ("demo/a.sysl", pvs_struct("")),
+                       ("demo/b.sysl", pvs_enum())]),
+              "1\n3\n")

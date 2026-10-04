@@ -2,8 +2,10 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, from_int, to_string}
+import sysl.math.bigint.{BigInt, from_int, to_string, mul as big_mul, pow as big_pow,
+                         negate as big_negate}
 import sysl.math.decimal.{Decimal, of as decimal_of, parse as decimal_parse}
+import sysl.text.parse_real
 import sysl.text.Search
 
 // A written type, resolved to the type it means.
@@ -2049,8 +2051,8 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
     // an `int` wearing a name: its ends are what `Age::Min` and `Age::Max` answer, what `Age::Valid`
     // asks about, and what a literal standing at it is held to. Left off, every one of those reads
     // the base's range and says nothing about the type the reader declared.
-    var lo: Option[Decimal] = None
-    var hi: Option[Decimal] = None
+    var lo: Option[RangeEnd] = None
+    var hi: Option[RangeEnd] = None
     var exclusive = false
 
     if d.range.is_some()
@@ -2090,15 +2092,12 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
 end instantiate_named_subtype
 
 // The number a written range end stands for, where it settles at all. A `within` may be written over
-// floats as well as integers, so a literal is read as text and everything else is folded.
-private range_end(a: &Analysis, scope: Scope, e: Expr) -> Option[Decimal]
-    *e.kind match
-        FloatLit(text, _) -> return decimal_parse(text)
-        // `-0.5` is a negation of a float literal rather than a literal, and folding knows no floats.
-        Unary(op, operand) -> *operand.kind match
-            FloatLit(text, _) -> if op == "-" then return decimal_parse(text).map((d) -> -d)
-            _ -> ()
-        _ -> ()
+// floats as well as integers, so a decimal literal is read as the text it is -- `0.1` the decimal
+// written rather than the double nearest it -- and everything else is folded.
+private range_end(a: &Analysis, scope: Scope, e: Expr) -> Option[RangeEnd]
+    val written = literal_end(e)
+
+    if written.is_some() then return written
 
     val cx = analyzer_for(a, scope)
     val mark = a.complaints()
@@ -2108,10 +2107,63 @@ private range_end(a: &Analysis, scope: Scope, e: Expr) -> Option[Decimal]
 
     // A `char` range is a range over code points, so its ends are the numbers the characters are.
     folded match
-        Some(ConstInt(n)) -> Some(decimal_of(n, 0))
-        Some(ConstChar(c)) -> Some(decimal_of(from_int(long(u32(c))), 0))
+        Some(ConstInt(n)) -> Some(EndAt(decimal_of(n, 0)))
+        Some(ConstChar(c)) -> Some(EndAt(decimal_of(from_int(long(u32(c))), 0)))
+        Some(ConstFloat(f)) -> float_end(f)
         _ -> None
 end range_end
+
+// A float literal's text, or the negation of one (`-0.5` is not a literal), where the text is a plain
+// decimal; one with an exponent is left to the fold.
+private literal_end(e: Expr) -> Option[RangeEnd]
+    val parsed = *e.kind match
+        FloatLit(text, _) -> decimal_parse(text)
+        Unary(op, operand) -> *operand.kind match
+            FloatLit(text, _) -> if op == "-" then decimal_parse(text).map((d) -> -d) else None
+            _ -> None
+        _ -> None
+
+    parsed match
+        Some(d) -> Some(EndAt(d))
+        None -> None
+end literal_end
+
+// A folded float as a range end. An infinity is one of the two infinite ends; a finite value is the
+// decimal it is -- its short spelling where that reads back as the same double, and otherwise its
+// exact binary expansion, since every double is a finite decimal. A NaN is no end at all, and
+// `bound_holds` has refused one before this is asked.
+private float_end(f: real) -> Option[RangeEnd]
+    if f != f then return None
+    // `f - f` is a NaN exactly where `f` is infinite.
+    if f - f != f - f then return Some(EndInfinite(f < 0.0))
+
+    val text = str(f)
+    val short = decimal_parse(text)
+    val back = parse_real(text)
+
+    if short.is_some() && back.is_ok() && back.unwrap() == f then return Some(EndAt(short.unwrap()))
+
+    Some(EndAt(exact_decimal(f)))
+end float_end
+
+// The decimal a finite double is exactly: its significand times a power of two, and `2^-k` is
+// `5^k / 10^k`, so a power of ten always reaches it.
+private exact_decimal(f: real) -> Decimal
+    var held = f
+    val p: *long = ptr_cast(&held)
+    val bits = *p
+    val biased = (bits >> 52) & 0x7FF
+    val fraction = bits & 0xFFFFFFFFFFFFF
+    val significand = if biased == 0 then fraction else fraction | (long(1) << 52)
+    // A subnormal's exponent is the smallest normal one's; only the implicit leading bit differs.
+    val power = if biased == 0 then long(1) else biased
+    val e = power - 1075
+    val signed = if bits < 0 then big_negate(from_int(significand)) else from_int(significand)
+
+    if e >= 0 then return decimal_of(big_mul(signed, big_pow(from_int(2), usize(e))), 0)
+
+    decimal_of(big_mul(signed, big_pow(from_int(5), usize(-e))), int(-e))
+end exact_decimal
 
 // Where a declared type was written, the whole declaration being what a refusal of it points at.
 private declared_at(a: &Analysis, key: string, fallback: Span) -> Span = a.tables.types.get(key) match
@@ -2141,10 +2193,9 @@ private bounds_hold(a: &Analysis, scope: Scope, at: Span, name: string, base: Ty
 
     if lo.is_none() || hi.is_none() then return true
 
-    val l = lo.unwrap()
-    val h = hi.unwrap()
+    val order = end_cmp(lo.unwrap(), hi.unwrap())
 
-    if l > h || (r.exclusive_hi && l >= h)
+    if order > 0 || (r.exclusive_hi && order >= 0)
         a.fault(scope, at, s"the lower bound of '$name' is above its upper bound")
         return false
     end if
@@ -2155,7 +2206,12 @@ end bounds_hold
 private bound_holds(a: &Analysis, scope: Scope, at: Span, base: Type, e: Expr) -> bool
     val cx = analyzer_for(a, scope)
     val mark = a.complaints()
+    val refusals = a.const_refusals
     val folded = const_fold(cx, e)
+
+    // A fold that refused -- `1/0` -- said so at the sub-expression that stopped it, which is the
+    // mistake; that it is then not a constant is no second one.
+    if folded.is_none() && const_refused_since(a, refusals) then return false
 
     a.restore_complaints(mark)
 
@@ -2198,6 +2254,15 @@ private bound_holds(a: &Analysis, scope: Scope, at: Span, base: Type, e: Expr) -
         a.fault(scope, at, s"${wanted.unwrap()}, not $kind")
         return false
     end if
+
+    // **An infinity is an end and a NaN is not**: `0.0..infinity` is open above and still refuses a
+    // NaN, but every comparison with a NaN is false, so a range ending at one would admit nothing.
+    value match
+        ConstFloat(f) if f != f ->
+            a.fault(scope, at, "a 'within' bound may not be NaN — every comparison with one is " +
+                    "false, so a range ending at a NaN admits no value")
+            return false
+        _ -> ()
 
     value match
         ConstInt(n) -> b match
@@ -2378,19 +2443,41 @@ private const_admitted(a: &Analysis, v: ValueDecl, t: Type, cd: &ConstrainedType
     if cd.derived || cd.pred_fn.is_some() || cd.lo.is_none() || cd.hi.is_none() then return
 
     val value = range_end(a, v.scope, v.init.unwrap())
-
-    if value.is_none() then return
-
-    val n = value.unwrap()
     val lo = cd.lo.unwrap()
     val hi = cd.hi.unwrap()
-    val under = if cd.exclusive_hi then n < hi else n <= hi
-    val top = if cd.exclusive_hi then s"under $hi" else s"$hi"
+    val top = if cd.exclusive_hi then s"under ${end_text(hi)}" else end_text(hi)
+    val holds = s"it holds ${end_text(lo)} to $top"
 
-    if n < lo || !under then
+    // A NaN is the one float no range admits, every comparison with it being false -- and the one
+    // folded value that is no end of a range, so it is asked after on its own.
+    if value.is_none()
+        if folds_to_nan(a, v.scope, v.init.unwrap()) then
+            a.fault(v.scope, v.init.unwrap().span,
+                    s"'${v.name}' is nan, which ${type_show(t)} does not admit — $holds")
+        return
+    end if
+
+    val n = value.unwrap()
+    val above = end_cmp(n, lo) >= 0
+    val under = if cd.exclusive_hi then end_cmp(n, hi) < 0 else end_cmp(n, hi) <= 0
+
+    if !above || !under then
         a.fault(v.scope, v.init.unwrap().span,
-                s"'${v.name}' is $n, which ${type_show(t)} does not admit — it holds $lo to $top")
+                s"'${v.name}' is ${end_text(n)}, which ${type_show(t)} does not admit — $holds")
 end const_admitted
+
+// Whether a constant's initializer folds to a NaN.
+private folds_to_nan(a: &Analysis, scope: Scope, e: Expr) -> bool
+    val cx = analyzer_for(a, scope)
+    val mark = a.complaints()
+    val folded = const_fold(cx, e)
+
+    a.restore_complaints(mark)
+
+    folded match
+        Some(ConstFloat(f)) -> f != f
+        _ -> false
+end folds_to_nan
 
 // Whether a declaration is another spelling of its base rather than a type of its own.
 //

@@ -385,19 +385,25 @@ idt_subscript_past_the_end_stops()
     assert(!out.1, s"expected the program to stop, but it exited cleanly: ${out.0}")
     assert(out.0.contains("panic: index 4 past the 1 elements of a Buf"), out.0)
 
-// A freshly built container is not a place, so a store into it is refused. The reference's refusal
-// is the uninferable `buf()` itself, which comes first.
+// A call's result is not a place, so a store into it is refused: the store goes through `IndexMut`'s
+// `*self`, which needs an address the call has not got. The container is typed (`mk() -> Buf[int]`)
+// so that the refusal is about the place and not about an element type nobody gave.
 @test("writing into a container that is not a place is refused")
 idt_store_into_a_non_place_refused()
     if !idt_can_run() then return
 
-    idt_refused(raw"""
-        trait Get[I, E]
-            get(self, i: I) -> E
-        var b: Buf[int] = buf()
-        b.push(1)
-        buf()[0usize] = 5
-        """, "cannot infer the type argument 'T' of 'sysl.buf.buf' here")
+    val said = idt_err(raw"""
+        mk() -> Buf[int]
+            var b: Buf[int] = buf()
+            b.push(1)
+            b
+
+        mk()[0usize] = 5
+        """)
+
+    assert(said.contains("'*self' needs a variable, field, or dereference to point at — this " +
+                         "receiver has no address"), said)
+    assert(said.contains("main.sysl:8:1"), said)
 
 @test("the element type travels with the implementation, so two containers of one trait keep theirs")
 idt_element_type_travels_with_the_implementation()

@@ -74,7 +74,7 @@ function_address(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf[Exp
 
     if decl.tparams.is_empty() && !targ_exprs.is_empty() then
         return cx.err(span, s"'$written' is not generic, so it has no type arguments to write — " +
-                      s"the address is '&$written'")
+                      s"its address is '&$written'")
 
     if !decl.tparams.is_empty()
         // **Written arguments say which copy outright**, which is what the refusal below asks for
@@ -204,7 +204,7 @@ private extern_address(cx: &Analyzer, span: Span, written: string, key: string,
 
     if !targ_exprs.is_empty() then
         return cx.err(span, s"'$written' is not generic, so it has no type arguments to write — " +
-                      s"the address is '&$written'")
+                      s"its address is '&$written'")
 
     // An intrinsic names an instruction the back end lays down in place, not a symbol anything links.
     if is_intrinsic_name(extern_symbol(d)) then
@@ -362,15 +362,30 @@ private written_instantiation(cx: &Analyzer, span: Span, written: string, key: s
     end if
 
     if decl.tparams.len() != targ_exprs.len()
-        cx.fault(span, s"'$written' takes ${quantity(decl.tparams.len(), "type argument")}, " +
-                 s"but ${supplied_phrase(targ_exprs.len(), "type argument")}")
+        var names = ""
+
+        for i in 0..<decl.tparams.len()
+            names = names + (if i == 0 then "" else ", ") + s"'${decl.tparams.at(i)}'"
+
+        val were = if targ_exprs.len() == 1 then "was" else "were"
+
+        cx.fault(span, s"'$written' takes ${quantity(decl.tparams.len(), "type argument")} " +
+                 s"($names), and ${targ_exprs.len()} $were written")
+        return ""
+    end if
+
+    // A pack stands for a list of types rather than one, so no written argument stands against it.
+    if !decl.tpacks.is_empty()
+        cx.fault(span, s"'${decl.tpacks.at(0)}' is a type pack, which stands for a list of types " +
+                 "rather than one, so it has no written form here — a declaration taking one has " +
+                 "its instantiation read off the type its address is wanted at")
         return ""
     end if
 
     var targs: Buf[Type] = buf()
 
     for i in 0..<targ_exprs.len()
-        targs.push(written_type_arg(cx, targ_exprs.at(i)))
+        targs.push(address_type_arg(cx, targ_exprs.at(i)))
 
     if !check_param_bounds(cx.an, f.scope, span, key, decl.tparams, decl.bounds, targs, buf(),
                            "type parameter", cx.scope) then return ""
