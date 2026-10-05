@@ -477,3 +477,105 @@ buffer_renders()
     assert_eq(str(a), "[1, 2, 3]")
     assert_eq(str(b), "[]")
 end buffer_renders
+
+// -- the spare capacity holds nothing ---------------------------------------------------------------
+//
+// Each case watches an element through a `weak` reference: the buffer's own count is the only strong
+// one left, so the moment the buffer gives the element up the weak reference reads `None`. Before
+// the storage was made with `slot_storage`, every spare slot held a count of whatever was pushed
+// first, and none of these went to `None` until the whole buffer did.
+
+struct Probe
+    n: int
+
+// One probe pushed, and a weak reference to it handed back -- so nothing but the buffer holds it.
+private push_probe(b: *Buf[&Probe], n: int) -> weak Probe
+    val p: &Probe = Probe(n)
+
+    b.push(p)
+    p
+end push_probe
+
+@test("a value set out of the only slot holding it is let go of at once")
+set_lets_go_at_once()
+    var b: Buf[Option[&Probe]] = buf()
+    var p: &Probe = Probe(1)
+    val w: weak Probe = p
+
+    b.push(Some(p))
+    p = Probe(2)
+    b.set(0, None)
+
+    assert(w.get().is_none())
+end set_lets_go_at_once
+
+@test("pop lets go of the element it takes out once the caller does")
+pop_lets_go()
+    var b: Buf[&Probe] = buf()
+    val w = push_probe(&b, 1)
+
+    b.pop()
+
+    assert(w.get().is_none())
+    assert_eq(b.len(), 0)
+end pop_lets_go
+
+@test("truncate and clear let go of the tail there and then, and keep the storage")
+truncate_and_clear_let_go()
+    var b: Buf[&Probe] = buf()
+    val w1 = push_probe(&b, 1)
+    val w2 = push_probe(&b, 2)
+    val w3 = push_probe(&b, 3)
+
+    b.truncate(1)
+
+    assert(w1.get().is_some())
+    assert(w2.get().is_none())
+    assert(w3.get().is_none())
+
+    b.clear()
+
+    assert(w1.get().is_none())
+    assert_eq(b.cap(), 8)
+end truncate_and_clear_let_go
+
+@test("remove hands the element back and keeps no second count of the last one")
+remove_lets_go()
+    var b: Buf[&Probe] = buf()
+    val w1 = push_probe(&b, 1)
+    val w2 = push_probe(&b, 2)
+
+    b.remove(0)
+
+    assert(w1.get().is_none())
+    assert_eq(b.at(0).n, 2)
+
+    b.remove(0)
+
+    assert(w2.get().is_none())
+end remove_lets_go
+
+@test("growing the storage keeps every element and adds no count to any")
+growth_adds_no_count()
+    var b: Buf[&Probe] = buf()
+    val w = push_probe(&b, 1)
+
+    for i in 2..20
+        push_probe(&b, i)
+
+    b.truncate(0)
+
+    assert(w.get().is_none())
+end growth_adds_no_count
+
+@test("buf_with_capacity keeps nothing of its fill")
+with_capacity_keeps_no_fill()
+    var p: &Probe = Probe(1)
+    val w: weak Probe = p
+    var b = buf_with_capacity(4, p)
+
+    p = Probe(2)
+
+    assert(w.get().is_none())
+    assert_eq(b.cap(), 4)
+end with_capacity_keeps_no_fill
