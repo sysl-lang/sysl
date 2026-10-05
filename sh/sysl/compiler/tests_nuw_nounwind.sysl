@@ -1,0 +1,292 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, Search}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **Every function sysl defines is `nounwind`, and carries `uwtable` exactly where clang's own C
+// would** (`toolchain.sysl`'s `function_attributes`, applied by `for_clang`).
+//
+// sysl has no exceptions, so nothing ever unwinds through one of its frames. Without the attribute a
+// bare-metal Arm build gives every function an EHABI table entry naming `__aeabi_unwind_cpp_pr0`,
+// and that one reference drags libgcc's C++ unwinder, `abort`, `signal` and newlib's stdio into the
+// firmware: measured on an STM32H7 image, sysl's own code was 0.8 KB of 10.6. The `uwtable` half is
+// read off clang rather than reasoned about, so the oracle test asks clang about every row.
+
+private nuw_list(words: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<words.len
+        out.push(words[i])
+
+    out
+end nuw_list
+
+private nuw_attrs(name: string) -> string =
+    join(function_attributes(target_named(name).unwrap(), buf()).view(), " ")
+
+private nuw_ir() -> string =
+    "define private void @arc.retain(ptr %p) {\nentry:\n  ret void\n}\n" +
+    "define void @handler() \"interrupt\"=\"machine\" section \".isr\" {\nentry:\n  ret void\n}\n" +
+    "define i32 @main() {\nentry:\n  ret i32 0\n}\n"
+
+// --- the table ----------------------------------------------------------------------------------
+
+@test("a freestanding definition is nounwind and has no unwind table")
+nuw_freestanding_is_nounwind_alone()
+    assert_eq(nuw_attrs("thumbv7em-freestanding"), "nounwind")
+    assert_eq(nuw_attrs("thumbv6m-freestanding"), "nounwind")
+    assert_eq(nuw_attrs("thumb-freestanding-softfp"), "nounwind")
+    assert_eq(nuw_attrs("riscv32-freestanding"), "nounwind")
+    assert_eq(nuw_attrs("aarch64-freestanding"), "nounwind")
+    assert_eq(nuw_attrs("wasm32-freestanding"), "nounwind")
+    assert_eq(nuw_attrs("craft-freestanding"), "nounwind")
+end nuw_freestanding_is_nounwind_alone
+
+@test("a hosted definition is nounwind and keeps clang's unwind table")
+nuw_hosted_keeps_the_table()
+    assert_eq(nuw_attrs("aarch64-macos"), "nounwind uwtable(sync)")
+    assert_eq(nuw_attrs("x86_64-macos"), "nounwind uwtable")
+    assert_eq(nuw_attrs("x86_64-linux"), "nounwind uwtable")
+    assert_eq(nuw_attrs("aarch64-linux"), "nounwind uwtable")
+    assert_eq(nuw_attrs("x86_64-windows"), "nounwind uwtable")
+    assert_eq(nuw_attrs("aarch64-android"), "nounwind uwtable")
+    assert_eq(nuw_attrs("wasm32-wasi"), "nounwind")
+end nuw_hosted_keeps_the_table
+
+@test("a sanitizer's attribute goes after the unwinding ones, in the one group")
+nuw_sanitizer_joins_the_group()
+    val t = target_named("x86_64-linux").unwrap()
+    val got = function_attributes(t, nuw_list(["-fsanitize=address"]))
+
+    assert_eq(join(got.view(), " "), "nounwind uwtable sanitize_address")
+
+// **The oracle**: each row's answer against what clang gives a trivial C function for the same
+// triple at `-O2`. CRAFT has no clang back end, so it is the one row not asked.
+@test("every row's unwind table is the one clang gives C on that triple")
+nuw_every_row_matches_clang()
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return
+    end if
+
+    val dir = make_temp_dir("sysl-nuw-clang-").unwrap()
+    val src = s"$dir/x.c"
+
+    write_text(src, "int f(int x) { return x + 1; }\n").unwrap()
+
+    val all = all_targets()
+    var asked: usize = 0
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.triple == "craft" then continue
+
+        val got = capture("clang", [s"--target=${t.triple}", "-O2", "-S", "-emit-llvm", "-o", "-", src],
+                          "", [], true).unwrap()
+
+        assert(got.status.ok(), s"clang refused ${t.triple}")
+
+        val group = nuw_group_zero(got.text)
+
+        assert(group.contains(" nounwind "), s"${t.triple}: $group")
+
+        val theirs = nuw_uwtable_in(group)
+        val ours = unwind_table(t).unwrap_or("")
+
+        assert_eq(s"${t.name}: $ours", s"${t.name}: $theirs")
+        asked += 1
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(asked > 20, s"asked $asked rows")
+end nuw_every_row_matches_clang
+
+// The text of `attributes #0 = { ... }`, padded with a space each side so a word test needs no
+// boundary handling.
+private nuw_group_zero(ir: string) -> string
+    val lines = lines_of(ir)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.starts_with("attributes #0 = { ")
+            return " " + line[18..<line.bytes.len - 1]
+        end if
+
+    ""
+end nuw_group_zero
+
+// `uwtable` or `uwtable(sync)` as the group spells it, or empty.
+private nuw_uwtable_in(group: string) -> string
+    val words = nuw_words(group)
+
+    for i in 0..<words.len()
+        if words.at(i).starts_with("uwtable") then return words.at(i)
+
+    ""
+end nuw_uwtable_in
+
+private nuw_words(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var start: usize = 0
+
+    for i in 0..<text.bytes.len
+        if text.bytes[i] == u8(' ')
+            if i > start then out.push(text[start..<i])
+
+            start = i + 1
+        end if
+
+    if start < text.bytes.len then out.push(text[start..<text.bytes.len])
+
+    out
+end nuw_words
+
+// --- the marking --------------------------------------------------------------------------------
+
+@test("for_clang marks every definition, and declares the group once")
+nuw_every_definition_is_marked()
+    val marked = for_clang(nuw_ir(), target_named("thumbv7em-freestanding").unwrap())
+
+    assert(marked.contains("define private void @arc.retain(ptr %p) #99 {"), marked)
+    assert(marked.contains("define i32 @main() #99 {"), marked)
+    assert_eq(marked.count_of("attributes #99"), 1)
+    assert(marked.contains("attributes #99 = { nounwind }"), marked)
+end nuw_every_definition_is_marked
+
+// LLVM takes a function's attribute group before its `section` and refuses it after ("expected '{'
+// in function body"), and an interrupt handler is exactly the definition that carries both.
+@test("the group goes before a section, after every attribute already on the line")
+nuw_group_precedes_a_section()
+    val marked = for_clang(nuw_ir(), target_named("x86_64-linux").unwrap())
+
+    assert(marked.contains("define void @handler() \"interrupt\"=\"machine\" #99 section \".isr\" {"),
+           marked)
+    assert(marked.contains("attributes #99 = { nounwind uwtable }"), marked)
+end nuw_group_precedes_a_section
+
+@test("and clang accepts what for_clang wrote")
+nuw_clang_accepts_the_marked_text()
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return
+    end if
+
+    val t = target_named("thumbv7em-freestanding").unwrap()
+    val dir = make_temp_dir("sysl-nuw-ll-").unwrap()
+    val ll = s"$dir/m.ll"
+
+    write_text(ll, s"target triple = \"${t.triple}\"\n\n" + for_clang(nuw_ir(), t)).unwrap()
+
+    val got = capture("clang", [s"--target=${t.triple}", "-c", "-x", "ir", ll, "-o", s"$dir/m.o"],
+                      "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), got.err.unwrap_or(""))
+end nuw_clang_accepts_the_marked_text
+
+// --- the seam -----------------------------------------------------------------------------------
+
+private nuw_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end nuw_cli
+
+private nuw_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end nuw_ready
+
+// A program directory as `build-c` takes one: a manifest, and a `main.sysl` beside it declaring no
+// module, whose `@export("main")` is what an image's start-up code calls.
+private nuw_program() -> string
+    val root = make_temp_dir("sysl-nuw-").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/package.hocon", "package {\n  name    = \"nuw\"\n  version = \"0.0.1\"\n}\n")
+        .unwrap()
+    write_text(s"$root/main.sysl",
+               "step(n: u32) -> u32 = n * 3 + 1\n\n" +
+               "@export(\"main\")\n" +
+               "boot() -> int\n" +
+               "    var n: u32 = 7\n" +
+               "    loop\n" +
+               "        n = step(n)\n" +
+               "        if n == 0 then return 1\n").unwrap()
+    root
+end nuw_program
+
+@test("emit-llvm shows every definition marked nounwind, with the host's unwind table")
+nuw_emit_llvm_shows_the_attributes()
+    if !nuw_ready() then return
+
+    val root = nuw_program()
+    val got = nuw_cli(["sysl", "emit-llvm", s"$root/main.sysl"])
+    val want = join(function_attributes(host_target(), buf()).view(), " ")
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(got.0, 0)
+    assert(got.1.contains(s"attributes #99 = { $want }"), got.1)
+    assert(got.1.contains("nounwind"), got.1)
+    assert(got.1.count_of("\ndefine ") > 0, got.1)
+    assert_eq(got.1.count_of("\ndefine "), got.1.count_of(" #99 {") + got.1.count_of(" #99 section "))
+end nuw_emit_llvm_shows_the_attributes
+
+// **The measurement this exists for**: a Cortex-M7 archive of a sysl program names no Arm unwind
+// personality, so nothing pulls libgcc's unwinder into the image. Read with the LLVM `nm` beside the
+// archiver, since the host's cannot read an Arm object and a tool that fails reads like one that
+// found nothing.
+@test("a thumbv7em archive references no __aeabi_unwind_cpp_pr0")
+nuw_thumb_archive_names_no_personality()
+    if !nuw_ready() then return
+
+    val archiver = find_ar(None) match
+        Err(why) ->
+            print(s"skipped: $why")
+            return
+        Ok(a) -> a
+
+    var nm = "llvm-nm"
+
+    if archiver.ends_with("llvm-ar") then nm = archiver[0..<(archiver.bytes.len - 2)] + "nm"
+
+    val root = nuw_program()
+    val lib = s"$root/libnuw.a"
+    val built = nuw_cli(["sysl", "build-c", root, "--target", "thumbv7em-freestanding", "-o", lib])
+
+    if built.0 != 0
+        remove_dir_all(root).unwrap_or(())
+        assert(false, built.1)
+        return
+    end if
+
+    val listed = capture(nm, [lib], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val out = listed match
+        Err(_) ->
+            print("skipped: llvm-nm is not available")
+            return
+        Ok(o) -> o
+
+    assert(out.status.ok(), s"$nm failed: ${out.err.unwrap_or("")}")
+    assert(out.text.contains(" T main"), out.text)
+    assert(!out.text.contains("__aeabi_unwind_cpp_pr"), out.text)
+end nuw_thumb_archive_names_no_personality
