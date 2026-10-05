@@ -1,0 +1,151 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The reference's `StaticPropertyTests`: `static freezing -> int`, a property of the TYPE rather
+// than of a value of it, read as `Temp.freezing` (`reference/declarations.md § A static property`).
+// The claim is that a static property is an associated function a reader writes no parentheses
+// after — so the cases check both directions (the type reaches it, a value does not), not only that
+// a program using it prints the right number.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.162)** by
+// running the installed `sysl` on the same program. Each program is built and run for real through
+// `tests_xvr_extern_var.sysl`'s `xvr_ran`, which answers with the build's refusal where there is one.
+
+private spr_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+// A refusal carries this message as an error of its own.
+private spr_refused(said: string, message: string) = assert(said.contains(s"error: $message"), said)
+
+// -- a type reaches its own ------------------------------------------------------------------------
+
+@test("a static property on a struct is read through the type")
+spr_on_a_struct()
+    if xvr_no_library() then return
+
+    assert_eq(spr_ran("struct Temp\n    n: int\n    static freezing -> int = 32\nprint(Temp.freezing)\n"),
+              "32\n")
+
+@test("a static property on an enum is read through the type")
+spr_on_an_enum()
+    if xvr_no_library() then return
+
+    assert_eq(spr_ran("enum Colour\n    Red\n    Green\n    static count -> int = 2\nprint(Colour.count)\n"),
+              "2\n")
+
+@test("a static property supplied in an impl block is read through the type")
+spr_in_an_impl_block()
+    if xvr_no_library() then return
+
+    assert_eq(spr_ran("trait Bounded\n    static lowest -> int\nstruct Age\n    n: int\n" +
+                      "impl Bounded for Age\n    static lowest -> int = 0\nprint(Age.lowest)\n"),
+              "0\n")
+
+@test("a static property's body may be a block, reading another static property")
+spr_with_a_block_body()
+    if xvr_no_library() then return
+
+    assert_eq(spr_ran("struct Temp\n    n: int\n    static freezing -> int = 32\n" +
+                      "    static boiling -> int\n        Temp.freezing + 180\nprint(Temp.boiling)\n"),
+              "212\n")
+
+@test("a static property may return a value of the type it belongs to")
+spr_returning_its_own_type()
+    if xvr_no_library() then return
+
+    assert_eq(spr_ran("struct P\n    x: int\n    static origin -> P = P(0)\nprint(P.origin.x)\n"), "0\n")
+
+// -- a bound reaches one ---------------------------------------------------------------------------
+
+@test("a generic body reads a static property off its own type parameter")
+spr_read_off_a_type_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(spr_ran("trait Bounded\n    static lowest -> int\nstruct Age\n    n: int\n" +
+                      "impl Bounded for Age\n    static lowest -> int = 7\n" +
+                      "lowest_of[T: Bounded]() -> int = T.lowest\nprint(lowest_of[Age]())\n"),
+              "7\n")
+
+@test("an implementation that does not supply a static property is refused at the block")
+spr_missing_from_the_impl()
+    if xvr_no_library() then return
+
+    spr_refused(spr_ran("trait Bounded\n    static lowest -> int\nstruct Age\n    n: int\n" +
+                        "impl Bounded for Age\nprint(Age.lowest)\n"),
+                "'Age' does not implement 'Bounded': property 'lowest' is missing")
+
+// -- it is read on the type and not on a value -----------------------------------------------------
+
+@test("a static property read off a value is refused, and told which side of the dot to change")
+spr_read_off_a_value()
+    if xvr_no_library() then return
+
+    spr_refused(spr_ran("struct Temp\n    n: int\n    static freezing -> int = 32\nprint(Temp(1).freezing)\n"),
+                "'freezing' is a property of the type 'Temp' rather than of a value of it — " +
+                "read it as 'Temp.freezing'")
+
+@test("so is a static property read off 'self' inside an instance method of the same type")
+spr_read_off_self()
+    if xvr_no_library() then return
+
+    spr_refused(spr_ran("struct Temp\n    n: int\n    static freezing -> int = 32\n" +
+                        "    above(self) -> int = self.freezing\nprint(Temp(50).above())\n"),
+                "'freezing' is a property of the type 'Temp' rather than of a value of it — " +
+                "read it as 'Temp.freezing'")
+
+@test("a static property's body cannot name 'self'")
+spr_body_cannot_name_self()
+    if xvr_no_library() then return
+
+    spr_refused(spr_ran("struct Temp\n    n: int\n    static freezing -> int = self.n\nprint(Temp.freezing)\n"),
+                "undefined name 'self'")
+
+// -- the form is bounded where a read would have nothing to solve from ------------------------------
+
+@test("a static property with a parameter list is told it is an associated function already")
+spr_with_a_parameter_list()
+    if xvr_no_library() then return
+
+    spr_refused(spr_ran("struct Temp\n    n: int\n    static freezing(k: int) -> int = k\n" +
+                        "print(Temp.freezing(1))\n"),
+                "'static freezing' declares a property of the type, which has a result and no " +
+                "parameter list — 'static freezing -> T'. A member with a parameter list is an " +
+                "associated function already, reached the same way and called with '()'")
+
+@test("a static property with type parameters is refused, a read having nothing to fix them from")
+spr_with_type_parameters()
+    if xvr_no_library() then return
+
+    spr_refused(spr_ran("struct Temp\n    n: int\n    static freezing[T] -> int = 1\nprint(Temp.freezing)\n"),
+                "a property takes no type parameters")
+
+@test("a trait's static property with a default body is refused, and not told to add a 'self'")
+spr_default_body_in_a_trait()
+    if xvr_no_library() then return
+
+    val said = spr_ran("trait Bounded\n    static lowest -> int = 0\nstruct Age\n    n: int\n" +
+                       "impl Bounded for Age\nprint(Age.lowest)\n")
+
+    spr_refused(said, "'Bounded.lowest' is a property of the type, so a default body would give " +
+                      "every implementation the same value — drop the body and let each one supply it")
+    assert(!said.contains("'self' parameter"), said)
+end spr_default_body_in_a_trait
+
+@test("a static property named as another member of the type collides, as any member's name does")
+spr_collides_with_a_member()
+    if xvr_no_library() then return
+
+    spr_refused(spr_ran("struct Temp\n    n: int\n    freezing -> int = 1\n    static freezing -> int = 32\n" +
+                        "print(Temp.freezing)\n"),
+                "type 'Temp' already has a member named 'freezing'")
+
+// -- the word's other job is untouched -------------------------------------------------------------
+
+@test("'static' on an entry file's binding still makes it the module's")
+spr_static_binding_untouched()
+    if xvr_no_library() then return
+
+    assert_eq(spr_ran("static var seen: int = 0\n\nbump() -> int\n    seen += 1\n    seen\n\n" +
+                      "print(bump())\nprint(bump())\n"),
+              "1\n2\n")
