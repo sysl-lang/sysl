@@ -1,0 +1,245 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The reference's `IntrinsicTests`: the back end's own operations, reached from sysl as `extern`s.
+// The library can name one, the width in the emitted name is derived from the signature rather than
+// written, and a declaration LLVM would refuse is refused earlier, at the line that wrote it.
+//
+// **Every diagnostic, output and IR line here was read out of the reference compiler (0.0.162)** by
+// handing the installed `sysl` the same program. The harness is `tests_xvr_extern_var.sysl`'s:
+// `xvr_ir` for the text (or the analysis's report where there is one), `xvr_ran` for a program
+// linked and run.
+
+private itr_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private itr_ir(text: string) -> string = xvr_ir(itr_main(text))
+
+private itr_ran(text: string) -> string = xvr_ran(itr_main(text))
+
+// A refusal carries this message, anchored at the declaration on the first line.
+private itr_refused(said: string, message: string) =
+    assert(said.contains(s"error: $message\n --> main.sysl:1:1\n"), said)
+
+// The LLVM text of one file lowered for a machine, or the first thing the program itself was told.
+private itr_for(t: Target, text: string) -> string
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(library) -> units = library
+
+    if units.is_empty() then return "the library could not be read for this machine"
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    for i in 0..<said.len()
+        if !said.at(i).src.name.starts_with("library/") then return said.at(i).render()
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end itr_for
+
+// -- the declaration --------------------------------------------------------------------------------
+
+// One base name, two widths, and the suffix comes from the signature: writing the whole name would
+// state the width twice and let the two disagree.
+@test("derives the width suffix from the types it was declared at")
+itr_derives_the_width_suffix()
+    if xvr_no_library() then return
+
+    val out = itr_ir(raw"""
+        private extern "llvm.sqrt" root(x: f64) -> f64
+        private extern "llvm.sqrt" rootf(x: f32) -> f32
+
+        print(root(144.0), rootf(16.0f32))
+        """)
+
+    assert(out.contains("declare double @llvm.sqrt.f64(double)"), out)
+    assert(out.contains("declare float @llvm.sqrt.f32(float)"), out)
+    assert(out.contains("call double @llvm.sqrt.f64("), out)
+    assert(out.contains("call float @llvm.sqrt.f32("), out)
+end itr_derives_the_width_suffix
+
+@test("reaches the right values at both widths")
+itr_reaches_the_right_values()
+    if xvr_no_library() then return
+
+    assert_eq(itr_ran(raw"""
+        private extern "llvm.sqrt" root(x: f64) -> f64
+        private extern "llvm.sqrt" rootf(x: f32) -> f32
+        private extern "llvm.fabs" mag(x: f64) -> f64
+        private extern "llvm.copysign" signed(x: f64, y: f64) -> f64
+        private extern "llvm.floor" down(x: f64) -> f64
+        private extern "llvm.ceil" up(x: f64) -> f64
+        private extern "llvm.trunc" cut(x: f64) -> f64
+        private extern "llvm.round" near(x: f64) -> f64
+
+        print(root(144.0), rootf(16.0f32), mag(-2.5), signed(1.0, -0.0))
+        print(down(-2.5), up(-2.5), cut(-2.5), near(-2.5), near(2.5))
+        """), "12 4 2.5 -1\n-3 -2 -2 -3 3\n")
+end itr_reaches_the_right_values
+
+// The magnitude comes from the sign bit, so it is right for the operand a comparison cannot see.
+@test("an intrinsic magnitude is right at a negative zero")
+itr_magnitude_at_negative_zero()
+    if xvr_no_library() then return
+
+    assert_eq(itr_ran("private extern \"llvm.fabs\" mag(x: f64) -> f64\n\n" +
+                      "print(mag(-0.0), mag(0.0), mag(-2.5))\n"), "0 0 2.5\n")
+
+@test("the supported names are all in the namespace that makes them recognisable")
+itr_supported_names_are_in_the_namespace()
+    val names = supported_intrinsics()
+
+    assert(names.len > 0)
+
+    for i in 0..<names.len
+        assert(is_intrinsic_name(names[i]), names[i])
+end itr_supported_names_are_in_the_namespace
+
+// Two declarations may share one symbol under different sysl names, and the derived suffix does not
+// change it: a module declares each symbol once however many names reach it.
+@test("two names for one intrinsic declare it once")
+itr_two_names_declare_it_once()
+    if xvr_no_library() then return
+
+    val out = itr_ir(raw"""
+        private extern "llvm.sqrt" root(x: f64) -> f64
+        private extern "llvm.sqrt" also(x: f64) -> f64
+
+        print(root(4.0), also(9.0))
+        """)
+
+    assert_eq(xvr_count(out, "declare double @llvm.sqrt.f64"), 1)
+end itr_two_names_declare_it_once
+
+// The third lowered width, which nothing in the library reaches: the suffix is read off the
+// signature rather than off a list of the widths `sysl.math` happens to use.
+@test("a width the library does not itself use")
+itr_a_width_the_library_does_not_use()
+    if xvr_no_library() then return
+
+    val out = itr_ir("private extern \"llvm.fabs\" mag(x: f16) -> f16\n\nprint(mag(-1.5f16))\n")
+
+    assert(out.contains("declare half @llvm.fabs.f16(half)"), out)
+
+// -- the library takes the instruction rather than the call -----------------------------------------
+
+// A program that takes a square root declares the intrinsic and not libm's `sqrt`, so there is no
+// symbol left for a linker to resolve and a machine with no libc can run it.
+@test("a program that roots a number names no libm symbol for it")
+itr_a_root_names_no_libm_symbol()
+    if xvr_no_library() then return
+
+    val out = itr_ir("import sysl.math.*\n\nprint((144.0).sqrt())\n")
+
+    assert(out.contains("@llvm.sqrt.f64"), out)
+    assert(!out.contains("declare double @sqrt(double)"), out)
+end itr_a_root_names_no_libm_symbol
+
+// The complement: no machine sysl targets has a sine instruction, so it stays libm's.
+@test("a program that takes a sine still names libm's")
+itr_a_sine_still_names_libm()
+    if xvr_no_library() then return
+
+    val out = itr_ir("import sysl.math.*\n\nprint((0.5).sin())\n")
+
+    assert(out.contains("declare double @sin(double)"), out)
+    assert(!out.contains("@llvm.sin"), out)
+end itr_a_sine_still_names_libm
+
+// A bare machine has no libm to link against, so the operations that became instructions are the
+// ones that reach a freestanding target -- a claim about the IR, there being no kernel to link here.
+@test("the instructions reach a target that has no library to ask")
+itr_the_instructions_reach_a_bare_target()
+    if xvr_no_library() then return
+
+    val t = target_named("aarch64-freestanding").unwrap()
+    val out = itr_for(t, "import sysl.math.*\n\nprint((144.0).sqrt())\n")
+
+    assert(out.contains("@llvm.sqrt.f64"), out)
+    assert(!out.contains("declare double @sqrt(double)"), out)
+end itr_the_instructions_reach_a_bare_target
+
+// -- the error path ---------------------------------------------------------------------------------
+
+// The list is closed on purpose: an intrinsic's signature is LLVM's to change, and a declaration
+// that disagrees is a verifier failure or a miscompile rather than a link error.
+@test("an intrinsic sysl does not support is refused by name")
+itr_an_unsupported_intrinsic_is_refused_by_name()
+    if xvr_no_library() then return
+
+    itr_refused(itr_ir("private extern \"llvm.frobnicate\" f(x: f64) -> f64\n\nprint(f(1.0))\n"),
+                "'llvm.frobnicate' is not an intrinsic sysl supports — it has llvm.ceil, " +
+                "llvm.copysign, llvm.fabs, llvm.floor, llvm.round, llvm.sqrt, llvm.trunc")
+
+@test("the wrong number of arguments")
+itr_the_wrong_number_of_arguments()
+    if xvr_no_library() then return
+
+    itr_refused(itr_ir("private extern \"llvm.sqrt\" f(x: f64, y: f64) -> f64\n\nprint(f(1.0, 2.0))\n"),
+                "'llvm.sqrt' takes 1 argument, but 2 were declared")
+    itr_refused(itr_ir("private extern \"llvm.copysign\" f(x: f64) -> f64\n\nprint(f(1.0))\n"),
+                "'llvm.copysign' takes 2 arguments, but 1 were declared")
+end itr_the_wrong_number_of_arguments
+
+@test("a type the intrinsic is not overloaded on")
+itr_a_type_it_is_not_overloaded_on()
+    if xvr_no_library() then return
+
+    itr_refused(itr_ir("private extern \"llvm.sqrt\" f(x: int) -> int\n\nprint(f(1))\n"),
+                "'llvm.sqrt' takes and returns one floating-point type, and this declaration " +
+                "states int")
+
+// Every operand and the result share one width: this is the declaration that would emit a `.f64`
+// intrinsic called with a `float`, which the verifier catches and no one reads.
+@test("widths that disagree with each other")
+itr_widths_that_disagree()
+    if xvr_no_library() then return
+
+    itr_refused(itr_ir("private extern \"llvm.copysign\" f(x: f64, y: f32) -> f64\n\n" +
+                       "print(f(1.0, 2.0f32))\n"),
+                "'llvm.copysign' takes and returns one floating-point type, and this declaration " +
+                "states real and f32")
+
+@test("a tail an intrinsic has nowhere to put")
+itr_a_tail_it_has_nowhere_to_put()
+    if xvr_no_library() then return
+
+    itr_refused(itr_ir("private extern \"llvm.sqrt\" f(x: f64, ...) -> f64\n\nprint(f(1.0))\n"),
+                "an intrinsic takes a fixed argument list, so it may not be declared with '...'")
+
+// The namespace holds code. Left alone this emits `@llvm.x = external global`, which the verifier
+// rejects for a reason nobody would connect back to the line that caused it.
+@test("an intrinsic name may not be storage")
+itr_an_intrinsic_name_may_not_be_storage()
+    if xvr_no_library() then return
+
+    itr_refused(itr_ir("private extern \"llvm.sqrt\" x: f64\n\nprint(x)\n"),
+                "'llvm.sqrt' is in the namespace the back end's own operations live in, and those " +
+                "are code rather than storage — an 'extern' variable names a symbol the linker " +
+                "resolves")
+
+// And it is refused where it is written, whether or not anything reads it.
+@test("an intrinsic name may not be storage, read or not")
+itr_storage_refused_unread()
+    if xvr_no_library() then return
+
+    itr_refused(itr_ir("private extern \"llvm.sqrt\" x: f64\n\nprint(1)\n"),
+                "'llvm.sqrt' is in the namespace the back end's own operations live in, and those " +
+                "are code rather than storage — an 'extern' variable names a symbol the linker " +
+                "resolves")
