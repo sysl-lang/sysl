@@ -91,12 +91,25 @@ struct Manifest
 
     // A key this compiler does not understand is said out loud and then ignored, once per key.
     warnings: Buf[string]
+
+    // Whether the file has a `package` block at all. A workspace root without one is no project of
+    // its own (`workspace.sysl`).
+    has_package: bool
+
+    // `package.repository`: the coordinate this package is published at, or `""`. It is what a
+    // workspace member is named by when another member depends on it, so that its modules carry the
+    // prefix a fetch by that coordinate would give them.
+    repository: string
+
+    // The `workspace` list, as written: each member's directory relative to this file, `*` standing
+    // for one directory level. `None` where the file declares no workspace.
+    workspace: Option[Buf[string]]
 end Manifest
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
-             buf(), None, None, buf())
+             buf(), None, None, buf(), false, "", None)
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -303,6 +316,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     var name = ""
     var version = ""
     var floor = ""
+    var repository = ""
     var warnings: Buf[string] = buf()
 
     conf_at(root, "package") match
@@ -311,6 +325,7 @@ read_manifest(text: string) -> Result[Manifest, string]
             name = conf_text(pkg, "name")
             version = conf_text(pkg, "version")
             floor = conf_text(pkg, "sysl")
+            repository = conf_text(pkg, "repository")
 
             val keys = conf_keys(pkg)
 
@@ -376,6 +391,14 @@ read_manifest(text: string) -> Result[Manifest, string]
     val features = read_features(root, dependencies)?
     val optimization = read_optimization(root)?
     val link = read_link(root)?
+    val has_package = conf_at(root, "package").is_some()
+    val workspace = read_workspace(root)?
+
+    // **A workspace root with no `package` block compiles nothing of its own**, so a dependency
+    // named there would reach no code -- and a reader would believe every member had it.
+    if workspace.is_some() && !has_package && (!dependencies.is_empty() || !dev.is_empty())
+        return Err("'dependencies' in a workspace with no 'package' block reaches nothing — the " +
+            "root compiles nothing of its own, so name each dependency in the member that imports it")
 
     val keys = conf_keys(root)
 
@@ -384,8 +407,34 @@ read_manifest(text: string) -> Result[Manifest, string]
 
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
                 target_capabilities, pkg_config, headers, defines, targets, allocator, features,
-                optimization, link, warnings))
+                optimization, link, warnings, has_package, repository, workspace))
 end read_manifest
+
+// The `workspace` list: the members' directories, relative to the file. **A list and nothing else**
+// -- the members are the whole of what a workspace says, and a value of any other shape was written
+// by somebody who believes they declared members the reader cannot see.
+private read_workspace(root: &Conf) -> Result[Option[Buf[string]], string]
+    val written = conf_at(root, "workspace") match
+        None -> return Ok(None)
+        Some(v) -> v
+
+    val bad = "'workspace' is not a list of directories — a workspace is written " +
+        "'workspace = [\"compiler\", \"tools/*\"]', each entry a member's directory relative to " +
+        "this file"
+
+    *written match
+        Items(values) ->
+            var out: Buf[string] = buf()
+
+            for i in 0..<values.len()
+                *values.at(i) match
+                    Text(s) -> out.push(s)
+                    Word(s) -> out.push(s)
+                    _ -> return Err(bad)
+
+            Ok(Some(out))
+        _ -> Err(bad)
+end read_workspace
 
 // The warning a key this compiler does not know draws. **Said and then ignored, not refused**: a
 // manifest written for a newer compiler must still build with this one wherever the parts it uses
@@ -1273,4 +1322,5 @@ private known_package_key(key: string) -> bool =
 private known_top_key(key: string) -> bool =
     key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
     key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
-    key == "links" || key == "features" || key == "optimization" || key == "link"
+    key == "links" || key == "features" || key == "optimization" || key == "link" ||
+    key == "workspace"

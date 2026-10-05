@@ -17,6 +17,12 @@ enum Origin
 
     // A directory beside the consumer, for a package being developed alongside what uses it.
     Local(dir: string)
+
+    // A member of the workspace the consumer belongs to, written `{ workspace = true }` under the
+    // member's `package.name`. The manifest reader leaves both fields empty; `bind_members`
+    // (`workspace.sysl`) fills in the member's directory and the prefix its modules carry, which only
+    // a reader that knows where the manifest sits can do.
+    Member(dir: string, canonical: string)
 end Origin
 
 // One entry of the `dependencies` block.
@@ -57,28 +63,37 @@ dependency_canonical(dep: &Dependency) -> string
     dep.origin match
         Git(coordinate, _) -> canonical_prefix(coordinate)
         Local(_) -> dep.label
+        Member(_, canonical) -> if canonical.is_empty() then dep.label else canonical
 end dependency_canonical
 
 // The coordinate a dependency names, where it names one.
 dependency_coordinate(dep: &Dependency) -> Option[string]
     dep.origin match
         Git(coordinate, _) -> Some(coordinate)
-        Local(_) -> None
+        _ -> None
 end dependency_coordinate
 
 // The version a dependency asks for, where it asks for one.
 dependency_version(dep: &Dependency) -> Option[Release]
     dep.origin match
         Git(_, version) -> Some(version)
-        Local(_) -> None
+        _ -> None
 end dependency_version
 
-// The directory a path dependency names, where it names one.
+// The directory a path dependency or a workspace member names, where it names one.
 dependency_dir(dep: &Dependency) -> Option[string]
     dep.origin match
         Git(_, _) -> None
         Local(dir) -> Some(dir)
+        Member(dir, _) -> Some(dir)
 end dependency_dir
+
+// Whether a dependency is a member of the consumer's workspace.
+is_member_dependency(dep: &Dependency) -> bool
+    dep.origin match
+        Member(_, _) -> true
+        _ -> false
+end is_member_dependency
 
 // A `path` origin read against the directory of the manifest that declared it, rather than against
 // whatever directory the build happened to be started from.
@@ -90,6 +105,7 @@ end dependency_dir
 resolved_against(dep: &Dependency, declaring_dir: string) -> Dependency
     dep.origin match
         Git(_, _) -> *dep
+        Member(_, _) -> *dep
         Local(dir) ->
             val joined = if dir.starts_with("/") then dir else join_path(declaring_dir, dir)
 
@@ -224,7 +240,8 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
     for i in 0..<keys.len()
         if !known_dependency_key(keys.at(i))
             return Err(s"'$where.${keys.at(i)}' is not something a dependency says — the keys are " +
-                "'default_features', 'features', 'git', 'mount', 'optional', 'path', 'version'")
+                "'default_features', 'features', 'git', 'mount', 'optional', 'path', 'version', " +
+                "'workspace'")
 
     val mount = read_mount(sub, where)?
     val origin = read_origin(sub, where)?
@@ -242,7 +259,7 @@ end read_dependency
 
 private known_dependency_key(key: string) -> bool =
     key == "git" || key == "version" || key == "path" || key == "mount" || key == "optional" ||
-    key == "features" || key == "default_features"
+    key == "features" || key == "default_features" || key == "workspace"
 
 // A yes-or-no field of an entry, which is a flag and nothing else: `"yes"` is a string, and a
 // string here was written by somebody who believes they said something the reader cannot see.
@@ -295,6 +312,22 @@ private letter_byte(c: u8) -> bool =
 private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
     val has_git = conf_at(sub, "git").is_some()
     val has_path = conf_at(sub, "path").is_some()
+
+    // **A workspace member is named by the workspace, and by nothing else**: it is the directory the
+    // root's list names, at whatever is on disk, so a coordinate, a path or a version beside it is a
+    // second answer to a question the workspace already settled.
+    if conf_at(sub, "workspace").is_some()
+        if !read_yes_no(sub, where, "workspace", false)?
+            return Err(s"'$where.workspace' is only ever 'true' — leave it out and name a 'git' " +
+                "coordinate or a 'path' instead")
+
+        if has_git || has_path || conf_at(sub, "version").is_some()
+            return Err(s"'$where' names 'workspace = true' and a 'git', 'path' or 'version' as well " +
+                "— a workspace member is the directory the workspace lists, at no version, so it " +
+                "is named by the workspace alone")
+
+        return Ok(Member("", ""))
+    end if
 
     if has_git && has_path
         return Err(s"'$where' names both a 'git' coordinate and a 'path' — a dependency is fetched " +
