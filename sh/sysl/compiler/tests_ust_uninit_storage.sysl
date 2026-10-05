@@ -1,0 +1,796 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The slot forms (`slots.sysl`): `slot_storage`, `slot_place` and `slot_vacate`, which let a
+// growable container keep its spare capacity holding NOTHING. A buffer box releases only its live
+// prefix, so a slot past it is never let go of -- which is the whole difference from storage made by
+// repeating a fill value, where every spare slot held a count of the fill.
+//
+// Every claim is about WHEN a destructor runs, so each program prints a line from a `Drop` and a line
+// of its own, and the order of the two is the assertion. Each runs at `-O0` and at the default level:
+// the release a form owes is emitted code, and an optimizer that moved or merged it would change
+// the order.
+//
+// The second half is a stand-in `Buf` and `Deque` written inside the program with the forms -- the
+// code the library patch carries, as far as one file holds it -- run over every case the finder's
+// reductions found (spare slots keeping a removed value alive until the buffer went).
+
+// What a program of several files prints, built at `level` and run.
+private ust_ran_at(files: []const (string, string), level: string) -> string
+    val root = make_temp_dir("sysl-ust").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    // A trap ends the program with its output still in the buffer, so what says it trapped is the
+    // signal, written after whatever did come out.
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Signalled(n) -> s"${out.text}signal $n\n"
+            _ -> out.text
+end ust_ran_at
+
+// The program traps before printing `never`, at both levels.
+private ust_traps(text: string, never: string)
+    for level in [ "0", DefaultOptimization ]
+        val said = ust_ran_at(ust_main(text), level)
+
+        assert(said.ends_with("signal 5\n") && !said.contains(never), said)
+end ust_traps
+
+private ust_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+// The program prints `want` unoptimized and optimized alike.
+private ust_both(text: string, want: string)
+    assert_eq(ust_ran_at(ust_main(text), "0"), want)
+    assert_eq(ust_ran_at(ust_main(text), DefaultOptimization), want)
+end ust_both
+
+// The program is refused, saying `message`.
+private ust_refused(files: []const (string, string), message: string)
+    val said = ust_ran_at(files, DefaultOptimization)
+
+    assert(said.contains(message), said)
+end ust_refused
+
+// A value whose destructor says when it ran.
+private ust_noisy() -> string = raw"""
+    struct N
+        v: int
+
+    impl Drop for N
+        drop(self) = print(f"dropped ${self.v}")
+
+    """
+
+// -- the forms themselves ----------------------------------------------------------------------------
+
+@test("storage made by slot_storage has its length and holds nothing")
+ust_storage_holds_nothing()
+    if xvr_no_library() then return
+
+    ust_both(ust_noisy() + raw"""
+        hold()
+            var s: []&N = slot_storage(4)
+
+            print(s.len)
+
+        hold()
+        print("gone")
+        """, "4\ngone\n")
+end ust_storage_holds_nothing
+
+@test("the element type may be written in brackets")
+ust_storage_in_brackets()
+    if xvr_no_library() then return
+
+    ust_both(raw"""
+        val s = slot_storage[int](3)
+
+        slot_place(s, 0, 7)
+        print(s.len, s[0])
+        """, "3 7\n")
+end ust_storage_in_brackets
+
+@test("a placed value is released exactly once, when the storage goes")
+ust_place_releases_with_the_storage()
+    if xvr_no_library() then return
+
+    ust_both(ust_noisy() + raw"""
+        hold()
+            var s: []&N = slot_storage(4)
+
+            slot_place(s, 0, N(1))
+            slot_place(s, 1, N(2))
+            print("placed")
+
+        hold()
+        print("gone")
+        """, "placed\ndropped 2\ndropped 1\ngone\n")
+end ust_place_releases_with_the_storage
+
+@test("placing into a live slot lets go of what was there")
+ust_place_into_a_live_slot_assigns()
+    if xvr_no_library() then return
+
+    ust_both(ust_noisy() + raw"""
+        hold()
+            var s: []&N = slot_storage(2)
+
+            slot_place(s, 0, N(1))
+            slot_place(s, 0, N(2))
+            print("replaced")
+
+        hold()
+        print("gone")
+        """, "dropped 1\nreplaced\ndropped 2\ngone\n")
+end ust_place_into_a_live_slot_assigns
+
+@test("placing past the first free slot traps, since the release would never reach it")
+ust_place_past_the_prefix_traps()
+    if xvr_no_library() then return
+
+    ust_traps(ust_noisy() + raw"""
+        var s: []&N = slot_storage(4)
+
+        slot_place(s, 2, N(1))
+        print("after")
+        """, "after")
+end ust_place_past_the_prefix_traps
+
+@test("placing past the storage's length is a bounds trap")
+ust_place_past_the_end_traps()
+    if xvr_no_library() then return
+
+    ust_traps(raw"""
+        var s: []int = slot_storage(2)
+
+        slot_place(s, 2, 1)
+        print("after")
+        """, "after")
+end ust_place_past_the_end_traps
+
+@test("vacating from past the storage's length is a bounds trap")
+ust_vacate_past_the_end_traps()
+    if xvr_no_library() then return
+
+    ust_traps(ust_noisy() + raw"""
+        var s: []&N = slot_storage(2)
+
+        slot_vacate(s, 3)
+        print("after")
+        """, "after")
+end ust_vacate_past_the_end_traps
+
+@test("vacating lets go of every live slot from the index on, there and then")
+ust_vacate_releases_now()
+    if xvr_no_library() then return
+
+    ust_both(ust_noisy() + raw"""
+        hold()
+            var s: []&N = slot_storage(4)
+
+            slot_place(s, 0, N(1))
+            slot_place(s, 1, N(2))
+            slot_place(s, 2, N(3))
+            slot_vacate(s, 1)
+            print("vacated")
+            slot_place(s, 1, N(4))
+            print("refilled")
+
+        hold()
+        print("gone")
+        """, "dropped 2\ndropped 3\nvacated\nrefilled\ndropped 4\ndropped 1\ngone\n")
+end ust_vacate_releases_now
+
+// **A parameter is a borrow and takes no count**, so the holder here is the `val` the callee binds:
+// the storage then has two counts, and the vacate leaves the slot to the second.
+@test("vacating storage somebody else still holds lets go of nothing, and a later vacate catches up")
+ust_vacate_leaves_shared_storage_alone()
+    if xvr_no_library() then return
+
+    ust_both(ust_noisy() + raw"""
+        peek(xs: []&N)
+            val keep = xs
+
+            slot_vacate(xs, 0)
+            print("inside", keep[0].v)
+
+        hold()
+            var s: []&N = slot_storage(2)
+
+            slot_place(s, 0, N(1))
+            peek(s)
+            print("back")
+            slot_vacate(s, 0)
+            print("vacated")
+
+        hold()
+        """, "inside 1\nback\ndropped 1\nvacated\n")
+end ust_vacate_leaves_shared_storage_alone
+
+@test("a view whose owner is a struct's box is not a buffer, so vacating it is nothing")
+ust_vacate_of_a_struct_field_view()
+    if xvr_no_library() then return
+
+    ust_both(ust_noisy() + raw"""
+        struct Holder
+            a: [2]&N
+
+        hold()
+            val r: &Holder = Holder([N(1), N(2)])
+
+            slot_vacate(r.a[..], 0)
+            print("vacated", r.a[1].v)
+            slot_place(r.a[..], 1, N(3))
+            print("placed")
+
+        hold()
+        print("gone")
+        """, "vacated 2\ndropped 2\nplaced\ndropped 3\ndropped 1\ngone\n")
+end ust_vacate_of_a_struct_field_view
+
+@test("a slot form yields to a function of its name")
+ust_a_declaration_takes_the_name()
+    if xvr_no_library() then return
+
+    ust_both(raw"""
+        slot_vacate(x: int) -> int = x + 1
+
+        print(slot_vacate(2))
+        """, "3\n")
+end ust_a_declaration_takes_the_name
+
+// -- refusals ----------------------------------------------------------------------------------------
+
+@test("slot_storage with nothing to say its element type is refused")
+ust_storage_needs_a_type()
+    if xvr_no_library() then return
+
+    ust_refused(ust_main("val s = slot_storage(4)\nprint(s.len)\n"),
+                "'slot_storage' makes storage for elements of some type, and nothing here says which")
+end ust_storage_needs_a_type
+
+@test("slot_storage into a read-only view is refused")
+ust_storage_read_only_is_refused()
+    if xvr_no_library() then return
+
+    ust_refused(ust_main("val s: []const int = slot_storage(4)\nprint(s.len)\n"),
+                "'slot_storage' makes slots that are placed into, and []const int is a read-only view")
+end ust_storage_read_only_is_refused
+
+@test("slot_place into a read-only view is refused")
+ust_place_read_only_is_refused()
+    if xvr_no_library() then return
+
+    ust_refused(ust_main("f(xs: []const int) = slot_place(xs, 0, 1)\nf([1])\n"),
+                "'slot_place' writes into the slots of a buffer, and []const int is a read-only view of one")
+end ust_place_read_only_is_refused
+
+@test("slot_vacate of something that is not a slice is refused")
+ust_vacate_needs_a_slice()
+    if xvr_no_library() then return
+
+    ust_refused(ust_main("val n = 3\nslot_vacate(n, 0)\n"),
+                "'slot_vacate' works on the slots of a buffer, which is a '[]T' — this is int")
+end ust_vacate_needs_a_slice
+
+@test("slot_place of a value of another type is refused")
+ust_place_wrong_type_is_refused()
+    if xvr_no_library() then return
+
+    ust_refused(ust_main("val s: []int = slot_storage(2)\nslot_place(s, 0, \"x\")\n"),
+                "'slot_place' puts a int into a slot of []int, and this is a string")
+end ust_place_wrong_type_is_refused
+
+@test("a slot form given the wrong number of arguments is refused")
+ust_wrong_arity_is_refused()
+    if xvr_no_library() then return
+
+    ust_refused(ust_main("val s: []int = slot_storage(2)\nslot_place(s, 0)\n"),
+                "'slot_place' takes 3 arguments — a buffer, a slot and a value — but 2 arguments were given")
+end ust_wrong_arity_is_refused
+
+@test("slot_storage in a module that declared '@no_alloc' is refused")
+ust_storage_under_no_alloc_is_refused()
+    if xvr_no_library() then return
+
+    ust_refused([("main.sysl", "print(thing.f()[0])\n"),
+                 ("thing/a.sysl", "module thing\n@no_alloc\n\nf() -> []int = slot_storage(4)\n")],
+                "a slice with storage of its own needs an allocator, and this module declared '@no_alloc'")
+end ust_storage_under_no_alloc_is_refused
+
+@test("slot_place and slot_vacate in a '@pure' function are refused")
+ust_writes_in_a_pure_function_are_refused()
+    if xvr_no_library() then return
+
+    ust_refused(ust_main("@pure\nf(xs: []int) -> int\n    slot_place(xs, 0, 1)\n    0\n\nprint(f([2]))\n"),
+                "writes a buffer's slots with 'slot_place'")
+    ust_refused(ust_main("@pure\nf(xs: []int) -> int\n    slot_vacate(xs, 0)\n    0\n\nprint(f([2]))\n"),
+                "writes a buffer's slots with 'slot_vacate'")
+end ust_writes_in_a_pure_function_are_refused
+
+// -- a stand-in Buf and Deque, written with the forms ------------------------------------------------
+
+// The library patch's `Buf` and `Deque`, as far as one program holds them: the members whose bodies
+// changed, word for word, and none of the performance notes.
+private ust_containers() -> string = raw"""
+    struct Buf[T]
+        elems: []T
+        count: usize
+        invariant count <= elems.len
+
+        len(self) -> usize = self.count
+
+        cap(self) -> usize = self.elems.len
+
+        at(self, i: usize) -> T
+            if i >= self.count then past_end(i, self.count)
+
+            self.elems[i]
+
+        set(*self, i: usize, v: T)
+            if i >= self.count then past_end(i, self.count)
+
+            self.elems[i] = v
+
+        push(*self, v: T)
+            if self.count >= self.elems.len
+                self.grow_store(v)
+                self.count += 1
+            else
+                val n = self.count
+
+                slot_place(self.elems, n, v)
+                self.count = n + 1
+
+        private grow_store(*self, v: T)
+            ensure self.count < self.elems.len
+
+            self.grow(self.count + 1)
+
+            slot_place(self.elems, self.count, v)
+        end grow_store
+
+        private grow(*self, need: usize)
+            require need > self.count
+            ensure self.count < self.elems.len
+            ensure need <= self.elems.len
+
+            var bigger_len = if self.elems.len == 0 then 8usize else self.elems.len
+
+            while bigger_len < need
+                bigger_len *= 2
+
+            var bigger: []T = slot_storage(bigger_len)
+
+            for i in 0..<self.count
+                slot_place(bigger, i, self.elems[i])
+
+            self.elems = bigger
+        end grow
+
+        extend(*self, xs: []const T)
+            if xs.len == 0 then return
+
+            var need = self.count + xs.len
+
+            if need > self.elems.len then self.grow(need)
+
+            for i in 0..<xs.len
+                slot_place(self.elems, self.count + i, xs[i])
+
+            self.count = need
+        end extend
+
+        pop(*self) -> Option[T]
+            if self.count == 0 then return None
+
+            val n = self.count - 1
+            val v = self.elems[n]
+
+            self.count = n
+            slot_vacate(self.elems, n)
+            Some(v)
+        end pop
+
+        truncate(*self, n: usize)
+            if n < self.count
+                self.count = n
+                slot_vacate(self.elems, n)
+
+        clear(*self)
+            self.truncate(0)
+
+        remove(*self, i: usize) -> T
+            if i >= self.count then past_end(i, self.count)
+
+            var gone = self.elems[i]
+
+            for j in i..<self.count - 1
+                self.elems[j] = self.elems[j + 1]
+
+            self.truncate(self.count - 1)
+            gone
+        end remove
+
+        view(self) -> []T = self.elems[..<self.count]
+    end Buf
+
+    past_end(i: usize, n: usize) -> never
+        print("panic: index", i, "past the", n, "elements of a Buf")
+        exit(1)
+
+    buf[T]() -> Buf[T]
+        var b: Buf[T] = Buf([], 0)
+
+        b
+
+    buf_with_capacity[T](n: usize, fill: T) -> Buf[T]
+        var b: Buf[T] = Buf(slot_storage(n), 0)
+
+        b
+
+    struct Deque[T]
+        elems: []Option[T]
+        head: usize
+        count: usize
+
+        private seat(self, i: usize) -> usize = (self.head + i) & (self.elems.len - 1)
+
+        private grow(*self)
+            val bigger_len = if self.elems.len == 0 then 8usize else self.elems.len * 2
+            var bigger: []Option[T] = [None; bigger_len]
+
+            for i in 0..<self.count
+                bigger[i] = self.elems[self.seat(i)]
+
+            self.elems = bigger
+            self.head = 0
+        end grow
+
+        push_back(*self, v: T)
+            if self.count == self.elems.len then self.grow()
+
+            val s = self.seat(self.count)
+
+            self.elems[s] = Some(v)
+            self.count += 1
+        end push_back
+
+        push_front(*self, v: T)
+            if self.count == self.elems.len then self.grow()
+
+            self.head = (self.head + self.elems.len - 1) & (self.elems.len - 1)
+            self.elems[self.head] = Some(v)
+            self.count += 1
+        end push_front
+
+        pop_front(*self) -> Option[T]
+            if self.count == 0 then return None
+
+            val v = self.elems[self.head]
+
+            self.elems[self.head] = None
+            self.head = (self.head + 1) & (self.elems.len - 1)
+            self.count -= 1
+            v
+        end pop_front
+
+        pop_back(*self) -> Option[T]
+            if self.count == 0 then return None
+
+            self.count -= 1
+
+            val s = self.seat(self.count)
+            val v = self.elems[s]
+
+            self.elems[s] = None
+            v
+        end pop_back
+    end Deque
+
+    deque[T]() -> Deque[T]
+        var d: Deque[T] = Deque([], 0, 0)
+
+        d
+
+    """
+
+private ust_with_containers(text: string) -> string = ust_noisy() + ust_containers() + text
+
+// The finder's first reduction, unchanged: the drop has to come BEFORE the line after the `set`.
+@test("a value set out of the only slot holding it is dropped at once")
+ust_buf_set_drops_at_once()
+    if xvr_no_library() then return
+
+    ust_both(ust_with_containers(raw"""
+        var b: Buf[Option[&N]] = buf()
+        b.push(Some(N(1)))
+        b.set(0, None)
+        print("set")
+        """), "dropped 1\nset\n")
+end ust_buf_set_drops_at_once
+
+@test("the second reduction's four cases each drop at the set")
+ust_buf_second_reduction()
+    if xvr_no_library() then return
+
+    ust_both(ust_with_containers(raw"""
+        a()
+            var b: Buf[Option[&N]] = buf()
+            val x: Option[&N] = Some(N(1))
+            b.push(x)
+            print("pushed")
+            b.set(0, None)
+            print("set a")
+
+        c()
+            var b: Buf[Option[&N]] = buf()
+            b.push(Some(N(2)))
+            print("pushed")
+            b.set(0, None)
+            print("set c")
+
+        d()
+            var b: Buf[&N] = buf()
+            b.push(N(3))
+            b.set(0, N(4))
+            print("set d")
+
+        e()
+            var b: Buf[Option[&N]] = buf()
+            b.push(None)
+            b.set(0, Some(N(5)))
+            print("set e1")
+            b.set(0, None)
+            print("set e2")
+
+        a()
+        print("--")
+        c()
+        print("--")
+        d()
+        print("--")
+        e()
+        print("end")
+        """), "pushed\nset a\ndropped 1\n--\npushed\ndropped 2\nset c\n--\ndropped 3\nset d\n" +
+              "dropped 4\n--\nset e1\ndropped 5\nset e2\nend\n")
+end ust_buf_second_reduction
+
+@test("the third reduction's cases: a grown buffer, a reserved one, a Result, and the capacity")
+ust_buf_third_reduction()
+    if xvr_no_library() then return
+
+    ust_both(ust_with_containers(raw"""
+        enum E
+            Bad
+
+        filled()
+            var b: Buf[Option[&N]] = buf()
+            b.push(Some(N(1)))
+            for i in 0..<7
+                b.push(None)
+            b.set(0, None)
+            print("set filled")
+
+        reserved()
+            var b: Buf[Option[&N]] = buf()
+            b.push(None)
+            b.set(0, Some(N(2)))
+            b.set(0, Some(N(3)))
+            print("set reserved")
+            b.set(0, None)
+            print("cleared reserved")
+
+        result()
+            var b: Buf[Result[&N, E]] = buf()
+            b.push(Ok(N(4)))
+            b.set(0, Err(Bad))
+            print("set result")
+
+        capacity()
+            var b: Buf[&N] = buf()
+            b.push(N(6))
+            print(b.cap())
+
+        filled()
+        print("--")
+        reserved()
+        print("--")
+        result()
+        print("--")
+        capacity()
+        print("end")
+        """), "dropped 1\nset filled\n--\ndropped 2\nset reserved\ndropped 3\ncleared reserved\n--\n" +
+              "dropped 4\nset result\n--\n8\ndropped 6\nend\n")
+end ust_buf_third_reduction
+
+@test("pop, truncate, clear and remove each let go of what they took out, there and then")
+ust_buf_shortening_drops_at_once()
+    if xvr_no_library() then return
+
+    ust_both(ust_with_containers(raw"""
+        fill() -> Buf[&N]
+            var b: Buf[&N] = buf()
+
+            for i in 1..4
+                b.push(N(i))
+
+            b
+
+        popping()
+            var b = fill()
+            b.pop()
+            print("popped", b.len())
+
+        truncating()
+            var b = fill()
+            b.truncate(2)
+            print("truncated", b.len())
+
+        clearing()
+            var b = fill()
+            b.clear()
+            print("cleared", b.len())
+
+        removing()
+            var b = fill()
+            b.remove(1)
+            print("removed", b.len(), b.at(1).v)
+
+        popping()
+        print("--")
+        truncating()
+        print("--")
+        clearing()
+        print("--")
+        removing()
+        """), "dropped 4\npopped 3\ndropped 3\ndropped 2\ndropped 1\n--\n" +
+              "dropped 3\ndropped 4\ntruncated 2\ndropped 2\ndropped 1\n--\n" +
+              "dropped 1\ndropped 2\ndropped 3\ndropped 4\ncleared 0\n--\n" +
+              "dropped 2\nremoved 3 3\ndropped 4\ndropped 3\ndropped 1\n")
+end ust_buf_shortening_drops_at_once
+
+@test("a popped value lives as long as the caller holds it")
+ust_buf_popped_value_is_the_callers()
+    if xvr_no_library() then return
+
+    ust_both(ust_with_containers(raw"""
+        var b: Buf[&N] = buf()
+        b.push(N(1))
+        val got = b.pop()
+        print("held", got.unwrap().v)
+        """), "held 1\ndropped 1\n")
+end ust_buf_popped_value_is_the_callers
+
+@test("a view still held keeps a popped slot alive, and the next shortening releases it")
+ust_buf_view_keeps_slots()
+    if xvr_no_library() then return
+
+    ust_both(ust_with_containers(raw"""
+        peek(v: []&N) = print("view", v.len, v[1].v)
+
+        hold()
+            var b: Buf[&N] = buf()
+            b.push(N(1))
+            b.push(N(2))
+
+            val v = b.view()
+
+            b.pop()
+            peek(v)
+
+        hold()
+        print("gone")
+        """), "view 2 2\ndropped 2\ndropped 1\ngone\n")
+end ust_buf_view_keeps_slots
+
+@test("the Deque stand-in lets go of an element at pop_back and pop_front")
+ust_deque_pops_drop_at_once()
+    if xvr_no_library() then return
+
+    ust_both(ust_with_containers(raw"""
+        var d: Deque[&N] = deque()
+        d.push_back(N(1))
+        d.push_back(N(2))
+        d.push_front(N(0))
+        d.pop_back()
+        print("popped back")
+        d.pop_front()
+        print("popped front")
+        """), "dropped 2\npopped back\ndropped 0\npopped front\ndropped 1\n")
+end ust_deque_pops_drop_at_once
+
+// The case the director warned about: a type whose destructor closes something. Spare capacity is
+// never dropped, so a buffer of four holds four destructor runs and no more -- the eight slots of
+// storage under it are never mistaken for values.
+@test("a destructor runs once per element pushed, never for spare capacity")
+ust_buf_spare_capacity_is_never_dropped()
+    if xvr_no_library() then return
+
+    ust_both(ust_with_containers(raw"""
+        struct File
+            fd: int
+
+        impl Drop for File
+            drop(self) = print(f"closing ${self.fd}")
+
+        hold()
+            var b: Buf[&File] = buf_with_capacity(8, File(99))
+            b.push(File(3))
+            b.push(File(4))
+            print("cap", b.cap())
+
+        hold()
+        print("end")
+        """), "closing 99\ncap 8\nclosing 4\nclosing 3\nend\n")
+end ust_buf_spare_capacity_is_never_dropped
+
+// Balance: every value made is dropped exactly once over a run that grows through three doublings,
+// shortens every way there is, and is given up at the end.
+@test("every value made is dropped exactly once")
+ust_buf_balance()
+    if xvr_no_library() then return
+
+    ust_both(raw"""
+        static var made: int = 0
+        static var dropped: int = 0
+
+        struct C
+            v: int
+
+        impl Drop for C
+            drop(self) = dropped += 1
+
+        make(v: int) -> &C
+            made += 1
+            C(v)
+
+        """ + ust_containers() + raw"""
+        run()
+            var b: Buf[&C] = buf()
+
+            for i in 0..<50
+                b.push(make(i))
+
+            for i in 0..<10
+                b.pop()
+
+            b.remove(3)
+            b.truncate(20)
+            b.set(0, make(100))
+
+            var more: Buf[&C] = buf()
+
+            more.push(make(200))
+            b.extend(more.view())
+            print("live", made - dropped)
+            b.clear()
+            print("after clear", made - dropped)
+
+        run()
+        print("made", made, "dropped", dropped)
+        """, "live 21\nafter clear 1\nmade 52 dropped 52\n")
+end ust_buf_balance

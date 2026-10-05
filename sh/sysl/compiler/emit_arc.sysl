@@ -376,6 +376,13 @@ drop_buf_fn(e: *Emit, elem: Type) -> Val
     VGlobal(request_helper(e, s"arc.dropbuf.${mangle(elem)}", HrDropBuf(elem)))
 end drop_buf_fn
 
+// The hook of storage `slot_storage` made, for an element that holds a count. It walks the buffer
+// exactly as `drop_buf_fn`'s does; what differs is the symbol, which is `weak_odr` rather than
+// private, so every codegen unit and the standard module's artifact agree on its address -- the
+// slot forms tell such storage from any other box by comparing a box's hook against it.
+slot_buf_fn(e: *Emit, elem: Type) -> Val =
+    VGlobal(request_helper(e, s"arc.slotbuf.${mangle(elem)}", HrSlotBuf(elem)))
+
 // The hook for a box whose payload holds nothing: there is no walk to make, so the only phase that
 // does anything is the one that gives the storage back.
 //
@@ -409,6 +416,7 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrDrop(_) -> helper_sig(name, hook_params())
         HrDropBuf(_) -> helper_sig(name, hook_params())
         HrPlainDrop -> helper_sig(name, hook_params())
+        HrSlotBuf(_) -> helper_sig(name, hook_params()) with { linkage = LinkWeakOdr }
 
         // A hand-written block is text rather than a function: the drain writes it down as it
         // stands, so nothing brings one here.
@@ -426,6 +434,7 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrDrop(payload) -> gen_drop_hook(e, payload)
         HrDropBuf(elem) -> gen_drop_buf_hook(e, elem)
         HrPlainDrop -> gen_plain_hook(e)
+        HrSlotBuf(elem) -> gen_drop_buf_hook(e, elem)
         HrText(_) -> gap_here(e, "a hand-written runtime block asked of the generator")
         HrAdapter(table, slot) -> gen_adapter(e, table, slot)
 
@@ -536,7 +545,7 @@ end emit_free
 
 // Walks `n` elements starting at `data`, letting go of each. A loop rather than a straight line for
 // the reason the ARC walk over an array gives: the count is exactly the thing that may be large.
-private each_element_release(e: *Emit, elem: Type, data: Val, n: Val)
+each_element_release(e: *Emit, elem: Type, data: Val, n: Val)
     val ep = each_element_begin(e, elem, data, n)
     val ev = fresh_reg(e)
 
