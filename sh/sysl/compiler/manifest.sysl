@@ -221,20 +221,31 @@ check_floor(who: string, floor: string, compiler: string) -> Option[string]
         s"hand is $compiler")
 end check_floor
 
-// **Whether this compiler's own version is a release of the line package floors are written
-// against.** It is not, and saying so is what keeps a floor from turning away every package there
-// is.
+// The number a development build of this compiler carries. No release is ever numbered this low.
+const DevVersion: string = "0.0.1"
+
+// **Whether a compiler of this version is a release of the line package floors are written
+// against** -- which every release is, and a development build is not.
 //
 // A floor states the oldest *released* compiler a package builds with, and every floor in the
-// ecosystem is a point on the reference compiler's line. `Version` here is `0.0.1`: this compiler
-// is numbered from its own beginning and has never been released under that line at all, so
-// comparing the two reads a number as saying something it is not saying -- and the answer it
-// reaches, that a package needing 0.0.76 cannot be built by 0.0.1, is wrong about every package in
-// the org. The reference makes no claim at all about a version it cannot read as a release, for
-// exactly this reason; this is the same answer with the reason spelled out rather than left to an
-// accident of spelling. It flips with this one line the day this compiler ships under a number of
-// its own.
-const OnTheReleaseLine: bool = false
+// ecosystem is a point on that line. A development build holds `Version` at `0.0.1` while the
+// compiler under it changes, so comparing the two reads a number as saying something it is not
+// saying -- and the answer it reaches, that a package needing 0.0.76 cannot be built by 0.0.1, is
+// wrong about every package in the org. So a development build makes no claim, which is the
+// reference's own answer for a version it cannot read as a release. A release (`0.1.0-alpha.1` and
+// on) is stamped into `Version` and is held to every floor.
+on_the_release_line(version: string) -> bool = version != DevVersion
+
+// A version a test stands in for, in place of `Version`. Empty is none.
+private var version_pinned: string = ""
+
+// The version this compiler answers a floor with: `Version`, or the one a test has pinned.
+compiler_version() -> string = if version_pinned != "" then version_pinned else Version
+
+// Run as though this compiler were numbered `v` -- which is how a test asks what a release would
+// say about a floor without a release being built. `None` puts the real version back.
+pin_compiler_version(v: Option[string])
+    version_pinned = v.unwrap_or("")
 
 // The refusal the project being built earns, against a compiler of the given version.
 //
@@ -246,11 +257,16 @@ project_floor_refusal(floor: string, compiler: string) -> Option[string] =
 
 // The refusal the project being built earns against this compiler, or nothing where it is in no
 // position to make one.
-root_floor_refusal(floor: string) -> Option[string] =
-    if OnTheReleaseLine then project_floor_refusal(floor, Version) else None
+root_floor_refusal(floor: string) -> Option[string]
+    val v = compiler_version()
 
-// Whether one release came before another, compared a number at a time. A pre-release suffix is cut
-// away first: `0.0.66-fcf4e33a` is dev heading for 0.0.66 and has everything 0.0.65 shipped.
+    if on_the_release_line(v) then project_floor_refusal(floor, v) else None
+
+// Whether one version came before another, in semver's order: the three numbers first, compared a
+// number at a time, and where they are equal **a pre-release comes before the release it leads to**
+// -- `0.1.0-alpha.1` is above every `0.0.x` and below `0.1.0`, so a floor of `0.1.0` refuses the
+// alpha. `0.0.66-fcf4e33a` is above 0.0.65 for the same reason it is below 0.0.66. A `+build` suffix
+// takes no part, as semver says.
 older(a: string, b: string) -> bool
     val left = numbers_of(a)
     val right = numbers_of(b)
@@ -264,8 +280,61 @@ older(a: string, b: string) -> bool
 
         i += 1
 
-    false
+    pre_release_older(pre_release_of(a), pre_release_of(b))
 end older
+
+// What follows a version's first `-`, up to any `+`, or nothing for a release.
+private pre_release_of(text: string) -> string
+    val plain = text.index_of("+") match
+        Some(at) -> text[0..<at]
+        None -> text
+
+    plain.index_of("-") match
+        Some(at) -> plain[(at + 1)..<plain.bytes.len]
+        None -> ""
+
+// Semver's order over two pre-release parts of one version: none at all is the release, above every
+// pre-release; otherwise field by field, a number below a word, numbers by value, words byte by byte,
+// and where one runs out first it is the lower.
+private pre_release_older(a: string, b: string) -> bool
+    if a == "" then return false
+
+    if b == "" then return true
+
+    val left = split(a, ".")
+    val right = split(b, ".")
+
+    for i in 0..<left.len
+        if i >= right.len then return false
+
+        if left[i] != right[i] then return field_older(left[i], right[i])
+
+    left.len < right.len
+end pre_release_older
+
+private field_older(a: string, b: string) -> bool
+    val x = all_digits(a)
+    val y = all_digits(b)
+
+    if x && y then return numbers_of(a).at(0) < numbers_of(b).at(0)
+
+    if x != y then return x
+
+    for i in 0..<a.bytes.len
+        if i >= b.bytes.len then return false
+
+        if a.bytes[i] != b.bytes[i] then return a.bytes[i] < b.bytes[i]
+
+    a.bytes.len < b.bytes.len
+end field_older
+
+private all_digits(text: string) -> bool
+    if text.bytes.len == 0 then return false
+
+    for i in 0..<text.bytes.len
+        if text.bytes[i] < u8('0') || text.bytes[i] > u8('9') then return false
+
+    true
 
 private numbers_of(text: string) -> Buf[usize]
     var out: Buf[usize] = buf()
@@ -275,7 +344,7 @@ private numbers_of(text: string) -> Buf[usize]
     for i in 0..<text.bytes.len
         val c = text.bytes[i]
 
-        if c == u8('-') then break
+        if c == u8('-') || c == u8('+') then break
 
         if c >= u8('0') && c <= u8('9')
             held = held * 10 + usize(c - u8('0'))
