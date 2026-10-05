@@ -16,9 +16,11 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     push_temps(e)
     push_owned(e)
 
-    // An async function's caller receives a task, and the state machine a task runs is not built
-    // yet, so its body is left out whether or not it awaits anything.
-    if f.marks.is_async() then gap_here(e, "async")
+    // An async function is a coroutine: its caller receives a task, and the body runs when the task
+    // is driven (`emit_async.sysl`). The frame is made before the parameters are copied into it.
+    val is_async = f.marks.is_async()
+
+    if is_async then begin_coroutine(e, f)
 
     // A clause naming a `@ghost` function is a proof obligation and not something to lay down: the
     // callee will not be there.
@@ -43,8 +45,12 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     // Which parameters this function keeps a count of its own for, and which it reads through the
     // one its caller is holding for the length of the call (`borrowing.sysl`). The slot is written
     // either way, because the body addresses it like any other local.
+    //
+    // **A task keeps every parameter**: its body runs after the call has returned, so nothing its
+    // caller holds for the length of the call is held for long enough.
     val found = tail_calls_of(f)
-    val owns = owning(f, e.address_taken.has(f.name), !found.is_empty(), e.inert.has(f.name))
+    val owns = owning(f, e.address_taken.has(f.name), is_async || !found.is_empty(),
+                      e.inert.has(f.name))
 
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep, so
     // it takes no slot and the emitted signature does not mention it.
@@ -56,8 +62,9 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
             val owned = owns.has(p.0)
 
             // A large one nothing but reading reaches is read where it arrived (`reads_in_place`):
-            // the slot *is* the caller's storage, and only a name for it is made here.
-            if e.in_place.has(f.name + "\n" + p.0)
+            // the slot *is* the caller's storage, and only a name for it is made here. A task's
+            // never is, the caller's storage being gone by the time the body reads it.
+            if !is_async && e.in_place.has(f.name + "\n" + p.0)
                 var idx: Buf[IrArg] = buf()
 
                 idx.push(ir_arg(l_i32(), VInt(from_int(0))))
@@ -132,37 +139,44 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
         own_slot(e, s"old.$i", oty)
         pop_temps(e)
 
+    // A task is made suspended: everything above ran at the call, and the body runs when the task is
+    // first resumed.
+    if is_async then initial_suspend(e)
+
     gen_stmts(e, f.body.stmts)
 
     // A `never` result is `void` like `unit`: the body's trailing expression diverges, so it has
     // already terminated the block and the `ret` emitted here is dropped.
-    f.body.result match
-        Some(r) ->
-            if e.layout.indirect(f.ret_ty) then gen_indirect_return(e, r)
-            else if !no_value(f.ret_ty)
-                val v = gen_expr(e, r)
+    if is_async
+        coro_result(e, f)
+    else
+        f.body.result match
+            Some(r) ->
+                if e.layout.indirect(f.ret_ty) then gen_indirect_return(e, r)
+                else if !no_value(f.ret_ty)
+                    val v = gen_expr(e, r)
 
-                retain_value(e, f.ret_ty, v)
-                emit_ensures(e, Some(v))
-                release_all(e)
-                emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(v)))
-            else
-                gen_expr(e, r)
-                emit_ensures(e, None)
-                release_all(e)
-                emit_term(e, InRet(None, None))
-        None ->
-            if no_value(f.ret_ty)
-                emit_ensures(e, None)
-                release_all(e)
-                emit_term(e, InRet(None, None))
-            else if e.layout.indirect(f.ret_ty)
-                emit(e, InStore(lty(e, f.ret_ty), VZero, sret_param(), AccPlain, None))
-                release_all(e)
-                emit_term(e, InRet(None, None))
-            else
-                release_all(e)
-                emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(zero_of(e, f.ret_ty))))
+                    retain_value(e, f.ret_ty, v)
+                    emit_ensures(e, Some(v))
+                    release_all(e)
+                    emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(v)))
+                else
+                    gen_expr(e, r)
+                    emit_ensures(e, None)
+                    release_all(e)
+                    emit_term(e, InRet(None, None))
+            None ->
+                if no_value(f.ret_ty)
+                    emit_ensures(e, None)
+                    release_all(e)
+                    emit_term(e, InRet(None, None))
+                else if e.layout.indirect(f.ret_ty)
+                    emit(e, InStore(lty(e, f.ret_ty), VZero, sret_param(), AccPlain, None))
+                    release_all(e)
+                    emit_term(e, InRet(None, None))
+                else
+                    release_all(e)
+                    emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(zero_of(e, f.ret_ty))))
 
     if has_gap(e) then return None
 
@@ -171,11 +185,43 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     // inside calls it either.
     val linkage = if f.internal then LinkInternal else LinkDefault
 
+    // LLVM's coroutine passes split a function only where it says it is one.
+    var bare = bare_attributes(f.marks)
+
+    if is_async then bare.push("presplitcoroutine")
+
+    // What a call of one hands back is its task.
+    val sig_result = defined_result(f)
+
     Some(finish_func(e, IrFuncSig(symbol_of(e, f.name),
-                                  sysl_fn_type(e, f.ret_ty, f.params, f.variadic, Some(f)),
+                                  sysl_fn_type(e, sig_result, f.params, f.variadic, Some(f)),
                                   linkage, convention_of(e, f), attribute_of(e, f), f.section,
-                                  bare_attributes(f.marks))))
+                                  bare)))
 end gen_function
+
+// An async body's last expression, put in its task, and the blocks every coroutine ends with.
+private coro_result(e: *Emit, f: TFunc)
+    val result = e.coro.unwrap().result
+
+    f.body.result match
+        Some(r) ->
+            if e.layout.indirect(result) then gen_indirect_return(e, r)
+            else if !no_value(result)
+                val v = gen_expr(e, r)
+
+                retain_value(e, result, v)
+                emit_ensures(e, Some(v))
+                coro_deliver(e, v)
+            else
+                gen_expr(e, r)
+                emit_ensures(e, None)
+                coro_deliver(e, VNothing)
+        None ->
+            emit_ensures(e, None)
+            coro_deliver(e, VNothing)
+
+    finish_coroutine(e)
+end coro_result
 
 // The **enum** function attributes a definition carries, which LLVM writes as bare keywords
 // (`reference/attributes.md § @noinline, @inline and @cold`). One fixed order -- the inlining mark,
@@ -234,16 +280,24 @@ gen_indirect_return(e: *Emit, r: TExpr)
             None -> None
         None -> None
 
+    // An async body builds it in its task's promise instead.
+    val dest = if e.coro.is_some() then coro_result_dest(e) else sret_param()
+
     around match
-        Some(name) -> gen_around(e, sret_param(), r, name)
-        None -> gen_into(e, sret_param(), r)
+        Some(name) -> gen_around(e, dest, r, name)
+        None -> gen_into(e, dest, r)
 
     if !e.ensures.is_empty()
         val v = fresh_reg(e)
 
-        emit(e, InLoad(v, lty_of(e, r), sret_param(), AccPlain, None))
+        emit(e, InLoad(v, lty_of(e, r), dest, AccPlain, None))
         emit_ensures(e, Some(v))
     else emit_ensures(e, None)
+
+    if e.coro.is_some()
+        coro_deliver(e, VNothing)
+        return
+    end if
 
     release_all(e)
     emit_term(e, InRet(None, None))

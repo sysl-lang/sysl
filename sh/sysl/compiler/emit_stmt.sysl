@@ -537,10 +537,23 @@ private gen_return(e: *Emit, opt: Option[TExpr])
 
             retain_value(e, ty, v)
             emit_ensures(e, Some(v))
+
+            // An async body's result goes into its task rather than back to a caller.
+            if e.coro.is_some()
+                coro_deliver(e, v)
+                return
+            end if
+
             release_all(e)
             emit_term(e, InRet(Some(lty(e, ty)), Some(v)))
         None ->
             emit_ensures(e, None)
+
+            if e.coro.is_some()
+                coro_deliver(e, VNothing)
+                return
+            end if
+
             release_all(e)
             emit_term(e, InRet(None, None))
 end gen_return
@@ -593,6 +606,12 @@ private gen_become(e: *Emit, call: TExpr)
 
     if !found
         gap_here(e, "a 'become' of something that is not a call")
+        return
+    end if
+
+    // A coroutine's frame outlives every call it makes, so it has no frame for a tail call to replace.
+    if e.coro.is_some()
+        gap_here(e, "a 'become' in an async function")
         return
     end if
 

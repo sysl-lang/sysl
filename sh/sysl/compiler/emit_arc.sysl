@@ -48,14 +48,26 @@ private arc_value(e: *Emit, ty: Type, v: Val, retain: bool) = ty match
         arc_call(e, s"arc.${if retain then "retain" else "release"}_maybe", view_owner(e, ty, v))
     Str ->
         arc_call(e, s"arc.${if retain then "retain" else "release"}_maybe", view_owner(e, ty, v))
-    _ ->
-        if contains_counted(ty)
-            val name = value_helper(e, ty, retain)
 
-            var args: Buf[IrArg] = buf()
+    // A task is counted as a `&T` is: its value is the address of a box header, the one at the head
+    // of its coroutine's promise, and the hook installed there is what destroys the frame.
+    Struct(d) ->
+        if d.base == TaskBase
+            e.heap = true
+            arc_call(e, s"arc.${if retain then "retain" else "release"}", v)
+        else aggregate_arc(e, ty, v, retain)
+    _ -> aggregate_arc(e, ty, v, retain)
 
-            args.push(ir_arg(lty(e, ty), v))
-            emit(e, ir_call(None, LVoid, VGlobal(name), args))
+// The per-type helper an aggregate's walk is, called on the value.
+private aggregate_arc(e: *Emit, ty: Type, v: Val, retain: bool)
+    if contains_counted(ty)
+        val name = value_helper(e, ty, retain)
+
+        var args: Buf[IrArg] = buf()
+
+        args.push(ir_arg(lty(e, ty), v))
+        emit(e, ir_call(None, LVoid, VGlobal(name), args))
+end aggregate_arc
 
 private arc_call(e: *Emit, name: string, p: Val)
     var args: Buf[IrArg] = buf()
@@ -163,7 +175,7 @@ private one_param(name: string, ty: LType) -> Buf[(string, LType)]
     out
 end one_param
 
-private hook_params() -> Buf[(string, LType)]
+hook_params() -> Buf[(string, LType)]
     var out: Buf[(string, LType)] = buf()
 
     out.push(("p", LPtr))
@@ -409,6 +421,7 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrDrop(_) -> helper_sig(name, hook_params())
         HrDropBuf(_) -> helper_sig(name, hook_params())
         HrPlainDrop -> helper_sig(name, hook_params())
+        HrTaskDrop(_) -> helper_sig(name, hook_params())
 
         // A hand-written block is text rather than a function: the drain writes it down as it
         // stands, so nothing brings one here.
@@ -426,6 +439,7 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrDrop(payload) -> gen_drop_hook(e, payload)
         HrDropBuf(elem) -> gen_drop_buf_hook(e, elem)
         HrPlainDrop -> gen_plain_hook(e)
+        HrTaskDrop(result) -> gen_task_hook(e, result)
         HrText(_) -> gap_here(e, "a hand-written runtime block asked of the generator")
         HrAdapter(table, slot) -> gen_adapter(e, table, slot)
 

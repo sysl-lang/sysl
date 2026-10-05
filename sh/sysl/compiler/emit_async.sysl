@@ -1,0 +1,572 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int}
+
+// **An `async` function is an LLVM coroutine**, of the switched-resume kind: its frame is on the heap,
+// LLVM's coroutine passes split the body at each suspension, and a task is resumed and destroyed
+// through the frame's handle.
+//
+// **A task is lazy.** Calling an async function allocates the frame, copies the arguments into it
+// (taking a count of every one), and suspends before the first statement of the body. What the call
+// hands back is the address of the coroutine's PROMISE -- the one region of the frame this compiler
+// lays out -- and the promise begins with an ordinary box header:
+//
+//     { count, hook, weak count, handle, result }
+//
+// so a `Task[T]` is counted exactly as a `&T` is, through `arc.retain`/`arc.release`, and the last
+// share going runs the hook. The hook lets go of the result a finished task still holds and then
+// destroys the frame, which runs whatever the frame still owes from the suspension it was left at --
+// the parameters of a task that never started, nothing for one that finished -- and gives the
+// storage back. The handle sits in the promise because the promise is what a task value points at,
+// and reading the handle back out of it needs no alignment the hook would have to be told.
+//
+// **The storage comes from one pair of hooks**, `sysl_task_alloc(size)` and `sysl_task_free(p)`,
+// defined here `weak` over the program's allocator, so a firmware image can serve frames from a
+// static pool by defining the two symbols itself. A program that `@export`s either one gets no
+// default for it, and its own is the one every frame comes from.
+//
+// **`await t` drives `t` from inside the awaiting task**: it resumes `t` until `t` is done, and each
+// time `t` suspends without finishing, the awaiting task suspends too -- so a suspension travels out
+// to whoever is driving the outermost task, and `block_on` is the one driver there is. The result is
+// copied out of the awaited promise with a count of its own; the frame goes when its last share does.
+//
+// **A task dropped while suspended in the middle of its body** destroys its frame from that
+// suspension, and the edge it takes gives back everything the body owns at that point, exactly as a
+// `return` written there would -- the locals, the temporaries of the statement it was suspended in,
+// the parameters, and the deferred statements.
+
+// The coroutine the body being emitted is: its promise, the type the promise holds, the intrinsics'
+// two handles, and the three blocks every suspension leads to.
+struct CoroCtx
+    promise: Val
+    result: Type
+    id: Val
+    hdl: Val
+
+    // Where a returning body goes to suspend for the last time, where a destroyed frame is given
+    // back, and the ramp's way out, which hands the caller the task.
+    final_label: string
+    free_label: string
+    out_label: string
+end CoroCtx
+
+// The two symbols a frame's storage comes from and goes back to.
+task_alloc_symbol() -> string = "sysl_task_alloc"
+task_free_symbol() -> string = "sysl_task_free"
+
+// The promise's fields, by position: the box header's three, the coroutine's handle, the result.
+private task_handle_field() -> int = 3
+private task_result_field() -> int = 4
+
+private token_lty() -> LType = LNamed("token")
+
+// The size intrinsic is named for the width it answers in, which is the machine's word.
+private coro_size_name(e: *Emit) -> string = s"llvm.coro.size.i${e.word_bits}"
+
+// The promise of a task ending with `result`.
+promise_shape(e: *Emit, result: Type) -> LType
+    var fields: Buf[LType] = buf()
+
+    fields.push(word_lty(e))
+    fields.push(LPtr)
+    fields.push(word_lty(e))
+    fields.push(LPtr)
+
+    if !no_value(result) then fields.push(lty(e, result))
+
+    LStruct(fields)
+end promise_shape
+
+private promise_align(e: *Emit, result: Type) -> int
+    val word = e.layout.pointer_bytes()
+    val wanted = e.layout.align(result)
+
+    int(if wanted > word then wanted else word)
+end promise_align
+
+private field_addr(e: *Emit, shape: LType, base: Val, field: int) -> Val
+    val r = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(field)))))
+    emit(e, InGep(r, shape, base, idx))
+    r
+end field_addr
+
+// The handle of the coroutine behind a task value.
+private task_handle(e: *Emit, task: Val) -> Val
+    val h = fresh_reg(e)
+
+    emit(e, InLoad(h, LPtr, field_addr(e, promise_shape(e, Unit), task, task_handle_field()), AccPlain,
+                   None))
+    h
+end task_handle
+
+private coro_call(e: *Emit, dest: Option[Val], ret: LType, name: string, args: Buf[IrArg])
+    emit(e, ir_call(dest, ret, VGlobal(name), args))
+
+private one_ptr(v: Val) -> Buf[IrArg]
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, v))
+    args
+end one_ptr
+
+private coro_done(e: *Emit, h: Val) -> Val
+    val d = fresh_reg(e)
+
+    coro_call(e, Some(d), l_i1(), "llvm.coro.done", one_ptr(h))
+    d
+end coro_done
+
+// A suspension: `0` is a resumption, `1` the frame being destroyed, anything else the ramp's or the
+// resumer's way out.
+private coro_suspend(e: *Emit, last: bool) -> Val
+    val s = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(token_lty(), VTokenNone))
+    args.push(ir_arg(l_i1(), VBool(last)))
+    coro_call(e, Some(s), LInt(8), "llvm.coro.suspend", args)
+    s
+end coro_suspend
+
+private suspend_switch(e: *Emit, s: Val, out: string, resumed: string, destroyed: string)
+    var cases: Buf[(BigInt, string)] = buf()
+
+    cases.push((from_int(0), resumed))
+    cases.push((from_int(1), destroyed))
+    emit_term(e, InSwitch(LInt(8), s, out, cases))
+end suspend_switch
+
+// The hook a task's promise carries: the shared one where the result holds no count, one of the
+// result's own where it does.
+private task_hook(e: *Emit, result: Type) -> Val
+    if !contains_counted(result) then
+        return VGlobal(request_helper(e, "sysl.task.hook", HrText(task_hook_text(e))))
+
+    VGlobal(request_helper(e, s"sysl.task.drop.${mangle(result)}", HrTaskDrop(result)))
+end task_hook
+
+// Everything a module holding a coroutine needs said about it.
+private using_coroutines(e: *Emit)
+    e.uses_coro = true
+    e.heap = true
+    e.traps = true
+end using_coroutines
+
+// -- the ramp: what calling an async function does --------------------------------------------------
+
+// The frame, its promise's header, and the task's handle, written before the parameters are copied
+// in. The frame comes from `sysl_task_alloc` unless LLVM has proved it may live in the caller's own
+// frame instead, which is what `llvm.coro.alloc` answers.
+begin_coroutine(e: *Emit, f: TFunc)
+    using_coroutines(e)
+
+    val result = coro_body_result(f)
+    val shape = promise_shape(e, result)
+    val promise = emit_alloca(e, VReg("task.promise"), shape, Some(promise_align(e, result)))
+    val mem_slot = emit_alloca(e, VReg("task.mem"), LPtr, None)
+    val id = VReg("task.id")
+    val hdl = VReg("task.hdl")
+
+    var id_args: Buf[IrArg] = buf()
+
+    id_args.push(ir_arg(l_i32(), VInt(from_int(long(promise_align(e, result))))))
+    id_args.push(ir_arg(LPtr, promise))
+    id_args.push(ir_arg(LPtr, VNull))
+    id_args.push(ir_arg(LPtr, VNull))
+    coro_call(e, Some(id), token_lty(), "llvm.coro.id", id_args)
+    emit(e, InStore(LPtr, VNull, mem_slot, AccPlain, None))
+
+    var token_arg: Buf[IrArg] = buf()
+
+    token_arg.push(ir_arg(token_lty(), id))
+
+    val need = fresh_reg(e)
+
+    coro_call(e, Some(need), l_i1(), "llvm.coro.alloc", token_arg)
+    emit_term(e, InCondBr(need, "task.alloc", "task.begin"))
+    emit_label(e, "task.alloc")
+
+    val size = fresh_reg(e)
+
+    coro_call(e, Some(size), word_lty(e), coro_size_name(e), buf())
+
+    var size_arg: Buf[IrArg] = buf()
+
+    size_arg.push(ir_arg(word_lty(e), size))
+
+    val mem = fresh_reg(e)
+
+    coro_call(e, Some(mem), LPtr, task_alloc_symbol(), size_arg)
+    emit(e, InStore(LPtr, mem, mem_slot, AccPlain, None))
+    emit_term(e, InBr("task.begin"))
+    emit_label(e, "task.begin")
+
+    val frame = fresh_reg(e)
+
+    emit(e, InLoad(frame, LPtr, mem_slot, AccPlain, None))
+
+    var begin_args: Buf[IrArg] = buf()
+
+    begin_args.push(ir_arg(token_lty(), id))
+    begin_args.push(ir_arg(LPtr, frame))
+    coro_call(e, Some(hdl), LPtr, "llvm.coro.begin", begin_args)
+
+    // The header a box is born with: one share, the caller's; the hook; and the weak count every box
+    // starts at.
+    emit(e, InStore(word_lty(e), VInt(from_int(1)), field_addr(e, shape, promise, 0), AccPlain, None))
+    emit(e, InStore(LPtr, task_hook(e, result), field_addr(e, shape, promise, 1), AccPlain, None))
+    emit(e, InStore(word_lty(e), VInt(from_int(1)), field_addr(e, shape, promise, 2), AccPlain, None))
+    emit(e, InStore(LPtr, hdl, field_addr(e, shape, promise, task_handle_field()), AccPlain, None))
+
+    e.coro = Some(CoroCtx(promise, result, id, hdl, "task.final", "task.free", "task.out"))
+end begin_coroutine
+
+// What an async function's body ends with. The typed function carries the type its body was read
+// against, which is the `T` of the `Task[T]` its callers receive.
+coro_body_result(f: TFunc) -> Type = task_result(f.ret_ty).unwrap_or(f.ret_ty)
+
+// What a definition answers its callers with: an async function's task, anything else's result.
+defined_result(f: TFunc) -> Type =
+    if f.marks.is_async() then task_type(coro_body_result(f)) else f.ret_ty
+
+// The suspension a call makes before running any of the body. A task destroyed here never started:
+// what it owns is its parameters, given back on the way to freeing the frame.
+initial_suspend(e: *Emit)
+    val c = e.coro.unwrap()
+    val s = coro_suspend(e, false)
+    val start = fresh_label(e, "task.start")
+    val unstarted = fresh_label(e, "task.unstarted")
+
+    suspend_switch(e, s, c.out_label, start, unstarted)
+    emit_label(e, unstarted)
+    release_all(e)
+    emit_term(e, InBr(c.free_label))
+    emit_label(e, start)
+end initial_suspend
+
+// -- the body's way out ----------------------------------------------------------------------------
+
+// Where a result the body is about to hand back is built in place: the promise's result field.
+coro_result_dest(e: *Emit) -> Val
+    val c = e.coro.unwrap()
+
+    field_addr(e, promise_shape(e, c.result), c.promise, task_result_field())
+end coro_result_dest
+
+// A `return`, a `?` that fails, or the body's last expression: the value (already holding the count
+// it leaves with) is put in the promise, the frame gives back what it owns, and the task suspends for
+// the last time. `VNothing` is a value written in place already, or none at all.
+coro_deliver(e: *Emit, v: Val)
+    val c = e.coro.unwrap()
+
+    val written = v match
+        VNothing -> true
+        _ -> no_value(c.result)
+
+    if !written then emit(e, InStore(lty(e, c.result), v, coro_result_dest(e), AccPlain, None))
+
+    release_all(e)
+    emit_term(e, InBr(c.final_label))
+end coro_deliver
+
+// The final suspension, the frame's release, and the ramp's return, after every block of the body.
+finish_coroutine(e: *Emit)
+    val c = e.coro.unwrap()
+
+    emit_label(e, c.final_label)
+
+    val s = coro_suspend(e, true)
+    val resumed = fresh_label(e, "task.resumed")
+
+    suspend_switch(e, s, c.out_label, resumed, c.free_label)
+
+    // Resuming a finished task is what `await` and `block_on` never do, since both ask first.
+    emit_label(e, resumed)
+    emit(e, ir_call(None, LVoid, VGlobal(llvm_trap()), no_ir_args()))
+    emit_term(e, InUnreachable)
+
+    emit_label(e, c.free_label)
+
+    val m = fresh_reg(e)
+
+    var free_args: Buf[IrArg] = buf()
+
+    free_args.push(ir_arg(token_lty(), c.id))
+    free_args.push(ir_arg(LPtr, c.hdl))
+    coro_call(e, Some(m), LPtr, "llvm.coro.free", free_args)
+
+    // Null where the frame was placed in the caller's own frame rather than allocated.
+    val none = fresh_reg(e)
+    val give = fresh_label(e, "task.give")
+
+    emit(e, InIntCmp(none, IEq, LPtr, m, VNull))
+    emit_term(e, InCondBr(none, c.out_label, give))
+    emit_label(e, give)
+    coro_call(e, None, LVoid, task_free_symbol(), one_ptr(m))
+    emit_term(e, InBr(c.out_label))
+
+    emit_label(e, c.out_label)
+
+    var end_args: Buf[IrArg] = buf()
+
+    end_args.push(ir_arg(LPtr, c.hdl))
+    end_args.push(ir_arg(l_i1(), VBool(false)))
+    end_args.push(ir_arg(token_lty(), VTokenNone))
+    coro_call(e, None, LVoid, "llvm.coro.end", end_args)
+    emit_term(e, InRet(Some(LPtr), Some(c.promise)))
+end finish_coroutine
+
+// -- await, block_on, yield_now --------------------------------------------------------------------
+
+// `await t`: `t` resumed until it is done, the awaiting task suspending each time `t` suspends without
+// finishing, then the result read out of `t`'s promise.
+gen_await(e: *Emit, operand: TExpr, ty: Type) -> Val
+    if e.coro.is_none() then return gap_at(e, "an 'await' outside an async function's body")
+
+    val c = e.coro.unwrap()
+    val task = gen_expr(e, operand)
+    val h = task_handle(e, task)
+    val test = fresh_label(e, "await.test")
+    val step = fresh_label(e, "await.step")
+    val wait = fresh_label(e, "await.wait")
+    val dropped = fresh_label(e, "await.dropped")
+    val ready = fresh_label(e, "await.ready")
+
+    emit_term(e, InBr(test))
+    emit_label(e, test)
+    emit_term(e, InCondBr(coro_done(e, h), ready, step))
+    emit_label(e, step)
+    coro_call(e, None, LVoid, "llvm.coro.resume", one_ptr(h))
+    emit_term(e, InCondBr(coro_done(e, h), ready, wait))
+    emit_label(e, wait)
+    suspend_switch(e, coro_suspend(e, false), c.out_label, test, dropped)
+
+    // This task destroyed while it waits: what it owns here is given back as a `return` from this
+    // point would, the awaited task among it where nothing else holds that one.
+    emit_label(e, dropped)
+    release_all(e)
+    emit_term(e, InBr(c.free_label))
+
+    emit_label(e, ready)
+    task_value(e, task, ty)
+end gen_await
+
+// `block_on(t)`: `t` resumed on this thread until it is done, and its result.
+gen_block_on(e: *Emit, operand: TExpr, ty: Type) -> Val
+    using_coroutines(e)
+
+    val task = gen_expr(e, operand)
+    val drive = request_helper(e, "sysl.task.drive", HrText(task_drive_text(e)))
+
+    coro_call(e, None, LVoid, drive, one_ptr(task))
+    task_value(e, task, ty)
+end gen_block_on
+
+// `yield_now()`: a task of the runtime's that suspends once.
+gen_yield_now(e: *Emit) -> Val
+    using_coroutines(e)
+    task_hook(e, Unit)
+
+    val name = request_helper(e, "sysl.task.yield", HrText(task_yield_text(e)))
+    val r = fresh_reg(e)
+
+    coro_call(e, Some(r), LPtr, name, buf())
+    own_temp(e, r, task_type(Unit))
+end gen_yield_now
+
+// The result of a finished task: a copy, with a count of its own, which the statement's temporaries
+// give back. The promise keeps its own until the frame goes.
+private task_value(e: *Emit, task: Val, ty: Type) -> Val
+    if no_value(ty)
+        if ty == Never then emit_term(e, InUnreachable)
+
+        return VNothing
+    end if
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, ty), field_addr(e, promise_shape(e, ty), task, task_result_field()),
+                   AccPlain, None))
+    retain_value(e, ty, r)
+    own_temp(e, r, ty)
+end task_value
+
+// -- the runtime -------------------------------------------------------------------------------------
+
+// The hook of a task whose result holds a count: a finished task's result is let go of when the last
+// share goes, and the frame is destroyed when the storage is.
+gen_task_hook(e: *Emit, result: Type)
+    val give = fresh_label(e, "task.give")
+    val over = fresh_label(e, "task.over")
+
+    emit_term(e, InCondBr(VReg("storage"), give, over))
+    emit_label(e, over)
+
+    val held = fresh_label(e, "task.held")
+    val kept = fresh_label(e, "task.kept")
+
+    emit_term(e, InCondBr(coro_done(e, task_handle(e, VReg("p"))), held, kept))
+    emit_label(e, held)
+    release_at(e, result, field_addr(e, promise_shape(e, result), VReg("p"), task_result_field()))
+    emit_term(e, InRet(None, None))
+    emit_label(e, kept)
+    emit_term(e, InRet(None, None))
+    emit_label(e, give)
+    coro_call(e, None, LVoid, "llvm.coro.destroy", one_ptr(task_handle(e, VReg("p"))))
+    emit_term(e, InRet(None, None))
+end gen_task_hook
+
+private header_text(e: *Emit) -> string = s"{ i${e.word_bits}, ptr, i${e.word_bits}, ptr }"
+
+// The hook every task whose result holds nothing shares: destroying the frame is all there is to do.
+private task_hook_text(e: *Emit) -> string =
+    "define private void @sysl.task.hook(ptr %p, i1 %storage) {\n" +
+    "entry:\n" +
+    "  br i1 %storage, label %give, label %over\n" +
+    "over:\n" +
+    "  ret void\n" +
+    "give:\n" +
+    s"  %hp = getelementptr ${header_text(e)}, ptr %p, i32 0, i32 ${task_handle_field()}\n" +
+    "  %h = load ptr, ptr %hp\n" +
+    "  call void @llvm.coro.destroy(ptr %h)\n" +
+    "  ret void\n" +
+    "}\n"
+
+// The one driver: resumes a task on the calling thread until it is done. Kept out of line, so the
+// task it drives has its frame on the heap like any other.
+private task_drive_text(e: *Emit) -> string =
+    "define private void @sysl.task.drive(ptr %p) noinline {\n" +
+    "entry:\n" +
+    s"  %hp = getelementptr ${header_text(e)}, ptr %p, i32 0, i32 ${task_handle_field()}\n" +
+    "  %h = load ptr, ptr %hp\n" +
+    "  br label %test\n" +
+    "test:\n" +
+    "  %d = call i1 @llvm.coro.done(ptr %h)\n" +
+    "  br i1 %d, label %out, label %go\n" +
+    "go:\n" +
+    "  call void @llvm.coro.resume(ptr %h)\n" +
+    "  br label %test\n" +
+    "out:\n" +
+    "  ret void\n" +
+    "}\n"
+
+// `yield_now()`'s task: started, it suspends once, and resumed it is done.
+private task_yield_text(e: *Emit) -> string
+    val w = s"i${e.word_bits}"
+    val a = e.layout.pointer_bytes()
+
+    "define private ptr @sysl.task.yield() presplitcoroutine {\n" +
+    "entry:\n" +
+    s"  %pr = alloca ${header_text(e)}, align $a\n" +
+    s"  %id = call token @llvm.coro.id(i32 $a, ptr %pr, ptr null, ptr null)\n" +
+    "  %need = call i1 @llvm.coro.alloc(token %id)\n" +
+    "  br i1 %need, label %alloc, label %begin\n" +
+    "alloc:\n" +
+    s"  %size = call $w @${coro_size_name(e)}()\n" +
+    s"  %mem = call ptr @${task_alloc_symbol()}($w %size)\n" +
+    "  br label %begin\n" +
+    "begin:\n" +
+    "  %frame = phi ptr [ null, %entry ], [ %mem, %alloc ]\n" +
+    "  %hdl = call ptr @llvm.coro.begin(token %id, ptr %frame)\n" +
+    s"  store $w 1, ptr %pr\n" +
+    s"  %hook = getelementptr ${header_text(e)}, ptr %pr, i32 0, i32 1\n" +
+    "  store ptr @sysl.task.hook, ptr %hook\n" +
+    s"  %weak = getelementptr ${header_text(e)}, ptr %pr, i32 0, i32 2\n" +
+    s"  store $w 1, ptr %weak\n" +
+    s"  %hp = getelementptr ${header_text(e)}, ptr %pr, i32 0, i32 ${task_handle_field()}\n" +
+    "  store ptr %hdl, ptr %hp\n" +
+    "  %s0 = call i8 @llvm.coro.suspend(token none, i1 false)\n" +
+    "  switch i8 %s0, label %out [ i8 0, label %run\n" +
+    "                              i8 1, label %free ]\n" +
+    "run:\n" +
+    "  %s1 = call i8 @llvm.coro.suspend(token none, i1 false)\n" +
+    "  switch i8 %s1, label %out [ i8 0, label %fin\n" +
+    "                              i8 1, label %free ]\n" +
+    "fin:\n" +
+    "  %s2 = call i8 @llvm.coro.suspend(token none, i1 true)\n" +
+    "  switch i8 %s2, label %out [ i8 0, label %resumed\n" +
+    "                              i8 1, label %free ]\n" +
+    "resumed:\n" +
+    "  call void @llvm.trap()\n" +
+    "  unreachable\n" +
+    "free:\n" +
+    "  %m = call ptr @llvm.coro.free(token %id, ptr %hdl)\n" +
+    "  %none = icmp eq ptr %m, null\n" +
+    "  br i1 %none, label %out, label %give\n" +
+    "give:\n" +
+    s"  call void @${task_free_symbol()}(ptr %m)\n" +
+    "  br label %out\n" +
+    "out:\n" +
+    "  call void @llvm.coro.end(ptr %hdl, i1 false, token none)\n" +
+    "  ret ptr %pr\n" +
+    "}\n"
+end task_yield_text
+
+// The two hooks' defaults, over the program's own allocator, and `weak` so that a definition linked
+// in from anywhere else wins. One the program defines itself is left out, since a module may not
+// define a symbol twice.
+request_task_storage(e: *Emit, p: TProgram)
+    if !e.uses_coro then return
+
+    val w = s"i${e.word_bits}"
+
+    if !claimed_symbol(e, p, task_alloc_symbol())
+        request_helper(e, task_alloc_symbol(), HrText(
+            s"define weak ptr @${task_alloc_symbol()}($w %size) {\n" +
+            "entry:\n" +
+            s"  %p = call ptr @${malloc_symbol()}($w %size)\n" +
+            "  ret ptr %p\n" +
+            "}\n"))
+
+    if !claimed_symbol(e, p, task_free_symbol())
+        request_helper(e, task_free_symbol(), HrText(
+            s"define weak void @${task_free_symbol()}(ptr %p) {\n" +
+            "entry:\n" +
+            s"  call void @${free_symbol()}(ptr %p)\n" +
+            "  ret void\n" +
+            "}\n"))
+end request_task_storage
+
+// Whether the program already says what this symbol is, by exporting a function under it or by
+// declaring it `extern`.
+private claimed_symbol(e: *Emit, p: TProgram, sym: string) -> bool
+    for i in 0..<e.export_symbols.len()
+        if e.export_symbols.at(i).1 == sym then return true
+
+    for i in 0..<p.externs.len()
+        if p.externs.at(i).symbol == sym then return true
+
+    false
+end claimed_symbol
+
+// The coroutine intrinsics, declared where any body or helper uses one.
+coro_declares(e: *Emit, out: *Buf[IrFuncSig])
+    if !e.uses_coro then return
+
+    out.push(ir_sig("llvm.coro.id", ir_fn_type(token_lty(), coro_params([l_i32(), LPtr, LPtr, LPtr]))))
+    out.push(ir_sig("llvm.coro.alloc", ir_fn_type(l_i1(), coro_params([token_lty()]))))
+    out.push(ir_sig(coro_size_name(e), ir_fn_type(word_lty(e), coro_params([]))))
+    out.push(ir_sig("llvm.coro.begin", ir_fn_type(LPtr, coro_params([token_lty(), LPtr]))))
+    out.push(ir_sig("llvm.coro.suspend", ir_fn_type(LInt(8), coro_params([token_lty(), l_i1()]))))
+    out.push(ir_sig("llvm.coro.free", ir_fn_type(LPtr, coro_params([token_lty(), LPtr]))))
+    out.push(ir_sig("llvm.coro.end", ir_fn_type(LVoid, coro_params([LPtr, l_i1(), token_lty()]))))
+    out.push(ir_sig("llvm.coro.done", ir_fn_type(l_i1(), coro_params([LPtr]))))
+    out.push(ir_sig("llvm.coro.resume", ir_fn_type(LVoid, coro_params([LPtr]))))
+    out.push(ir_sig("llvm.coro.destroy", ir_fn_type(LVoid, coro_params([LPtr]))))
+end coro_declares
+
+private coro_params(tys: []const LType) -> Buf[IrParam]
+    var out: Buf[IrParam] = buf()
+
+    for i in 0..<tys.len
+        out.push(ir_param(tys[i]))
+
+    out
+end coro_params

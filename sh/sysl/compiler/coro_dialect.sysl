@@ -1,0 +1,59 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.process.capture
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{replace_all, Search}
+
+// **`llvm.coro.end` answers `i1` before LLVM 22 and nothing from it**, and neither spelling is
+// accepted by the other: an older clang says "Intrinsic has incorrect return type", a newer one
+// "intrinsic return type expected void, but got i1". Apple's clang and Homebrew's are a version
+// apart on one machine, so the text is emitted in the newer spelling (`emit_async.sysl`) and turned
+// into the older one on its way into a clang that wants it -- which is asked of the clang itself,
+// once per path, by handing it the newer spelling.
+
+private var coro_end_answers: Buf[(string, bool)] = buf()
+
+// The text a clang is handed, in the coroutine dialect that clang reads.
+for_clang(cc: string, ir: string) -> string
+    if !ir.contains("@llvm.coro.end(") || coro_end_is_void(cc) then return ir
+
+    replace_all(replace_all(ir, "call void @llvm.coro.end(", "call i1 @llvm.coro.end("),
+                "declare void @llvm.coro.end(", "declare i1 @llvm.coro.end(")
+end for_clang
+
+// Whether this clang reads `llvm.coro.end` as answering nothing.
+coro_end_is_void(cc: string) -> bool
+    for i in 0..<coro_end_answers.len()
+        if coro_end_answers.at(i).0 == cc then return coro_end_answers.at(i).1
+
+    val answer = probe_coro_end(cc)
+
+    coro_end_answers.push((cc, answer))
+    answer
+end coro_end_is_void
+
+private probe_coro_end(cc: string) -> bool
+    val dir = make_temp_dir("sysl-coro") match
+        Ok(d) -> d
+        Err(_) -> return true
+
+    val ll = s"$dir/probe.ll"
+    val probe = "define void @probe(ptr %h) {\n" +
+                "entry:\n" +
+                "  call void @llvm.coro.end(ptr %h, i1 false, token none)\n" +
+                "  ret void\n" +
+                "}\n" +
+                "\n" +
+                "declare void @llvm.coro.end(ptr, i1, token)\n"
+
+    var answer = true
+
+    if write_text(ll, probe).is_ok()
+        answer = capture(cc, ["-c", "-x", "ir", ll, "-o", s"$dir/probe.o"], "", [], true) match
+            Ok(out) -> out.status.ok()
+            Err(_) -> true
+
+    remove_dir_all(dir).unwrap_or(())
+    answer
+end probe_coro_end

@@ -79,7 +79,7 @@ closure_await_site(outer: AwaitSite) -> AwaitSite =
 // The operand is read first and whatever is wrong inside it is told; then where the `await` stands,
 // at the word; then what it was handed, at the operand.
 await_expr(cx: &Analyzer, span: Span, inner: Expr) -> TExpr
-    val t = type_expr_bare(cx, inner)
+    val t = if awaits_yield(cx, inner) then yield_now_task(cx, inner) else type_expr_bare(cx, inner)
     val word = Span(span.start, span.start + 5)
 
     if cx.await_site == AwaitInClosure then
@@ -108,6 +108,52 @@ await_expr(cx: &Analyzer, span: Span, inner: Expr) -> TExpr
         None -> cx.err(inner.span, s"'await' needs a Task, which is what calling an 'async' " +
                        s"function hands back, but this value is ${type_show(ty)}")
 end await_expr
+
+// -- the two forms the compiler supplies -----------------------------------------------------------
+
+// Whether a name in call position is `block_on` or `yield_now` and nothing the program can see claims
+// it -- the library's `sysl.posix.threads.yield_now`, imported, is the nearer name. They are the
+// compiler's because the standard module is also compiled by a compiler that has no tasks.
+task_form(cx: &Analyzer, name: string) -> bool =
+    (name == "block_on" || name == "yield_now") && cx.lookup(name).is_none() &&
+        function_keys(cx, name).is_empty()
+
+// `block_on(t)`, or `yield_now()` written somewhere it is not awaited.
+task_form_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
+    if name == "yield_now" then
+        return cx.err(span, "'yield_now()' is a task that suspends once, and it can only be " +
+                      "awaited — write 'await yield_now()' in the body of an 'async' function")
+
+    if args.len() != 1 then
+        return cx.err(span, s"'block_on' takes one task — the one it runs to its end — but " +
+                      supplied(args.len(), "argument"))
+
+    val t = type_expr_bare(cx, args.at(0))
+    val ty = texpr_type(t)
+
+    if ty == Unknown then return t
+
+    task_result(ty) match
+        Some(r) -> TExpr(span, TBlockOn(t, r))
+        None -> cx.err(args.at(0).span, s"'block_on' needs a Task, which is what calling an " +
+                       s"'async' function hands back, but this value is ${type_show(ty)}")
+end task_form_call
+
+// Whether an awaited operand is the compiler's `yield_now()`.
+private awaits_yield(cx: &Analyzer, inner: Expr) -> bool = *inner.kind match
+    Call(callee, _) -> *callee.kind match
+        Ident(name) -> name == "yield_now" && task_form(cx, name)
+        _ -> false
+    _ -> false
+
+private yield_now_task(cx: &Analyzer, inner: Expr) -> TExpr = *inner.kind match
+    Call(_, args) ->
+        if !args.is_empty() then
+            return cx.err(inner.span, s"'yield_now' takes no arguments, but " +
+                          supplied(args.len(), "argument"))
+
+        TExpr(inner.span, TYieldNow)
+    _ -> bad_expr(inner.span)
 
 // What a mismatch adds where a `Task[T]` stands where its `T` was wanted: the `await` left out. Each
 // position keeps its own sentence -- it names the parameter, the binding, the result -- and this is

@@ -1,0 +1,433 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `async` and `await`, lowered: programs that build, run and print. Each one is built at `-O0` and at
+// the default level, and both have to print the same thing -- LLVM's coroutine passes run at both,
+// and the default level is where a frame may be moved into its caller's.
+//
+// **The reference compiler has neither word**, so the expected outputs are worked out from the
+// programs, as the stage-1 front-end tests' are.
+
+// The programs' shared module: the two allocation hooks, counting, over C's allocator.
+private tsk_pool() -> string = raw"""
+    module pool
+
+    extern "malloc" c_malloc(n: usize) -> *u8
+    extern "free" c_free(p: *u8)
+
+    var allocs: int = 0
+    var frees: int = 0
+
+    @export("sysl_task_alloc")
+    task_alloc(size: usize) -> *u8
+        allocs += 1
+        c_malloc(size)
+
+    @export("sysl_task_free")
+    task_free(p: *u8)
+        frees += 1
+        c_free(p)
+
+    balance() -> string = if allocs > 0 && allocs == frees then "balanced" else s"$allocs/$frees"
+    """
+
+// What a program built from these files prints at one optimization level, or why it did not run.
+private tsk_outcome(files: []const (string, string), level: string) -> string
+    val root = make_temp_dir("sysl-tsk").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else
+            s"it did not run to the end: ${out.text}${out.err.unwrap_or("")}"
+end tsk_outcome
+
+// What it prints at both levels, where the two agree.
+private tsk_ran(files: []const (string, string)) -> string
+    val low = tsk_outcome(files, "0")
+    val high = tsk_outcome(files, DefaultOptimization)
+
+    if low != high then return s"-O0 printed:\n$low\nthe default level printed:\n$high"
+
+    low
+end tsk_ran
+
+private tsk_no_library() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+    end if
+
+    false
+end tsk_no_library
+
+@test("an async function's result comes back through block_on, with arithmetic across awaits")
+tsk_block_on_and_arithmetic()
+    if tsk_no_library() then return
+
+    assert_eq(tsk_ran([("work/work.sysl", raw"""
+        module work
+
+        async double(n: int) -> int = n * 2
+
+        async sum3(a: int, b: int, c: int) -> int
+            val x = await double(a)
+            val y = await double(b)
+            val z = await double(c)
+            x + y + z + 1
+        """), ("main.sysl", "import work.*\n\nprint(block_on(sum3(1, 2, 3)))\n")]), "13\n")
+
+@test("async calls async calls async, four deep, and a counted result travels back up")
+tsk_chain_four_deep()
+    if tsk_no_library() then return
+
+    assert_eq(tsk_ran([("work/work.sysl", raw"""
+        module work
+
+        async leaf(n: int) -> int = n + 1
+
+        async mid(n: int) -> int = await leaf(n) * 10
+
+        async top(n: int) -> int = await mid(n) + await mid(n + 1)
+
+        async root() -> string
+            val v = await top(1)
+            s"root saw $v"
+        """), ("main.sysl", "import work.*\n\nprint(block_on(root()))\n")]), "root saw 50\n")
+
+@test("an async function written in the entry file is a task like any other")
+tsk_async_in_the_entry_file()
+    if tsk_no_library() then return
+
+    assert_eq(tsk_ran([("main.sysl", raw"""
+        async inc(n: int) -> int = n + 1
+
+        async twice(n: int) -> int = await inc(await inc(n))
+
+        print(block_on(twice(40)))
+        """)]), "42\n")
+
+@test("await yield_now() in a loop suspends once per round, and block_on drives every round")
+tsk_yield_in_a_loop()
+    if tsk_no_library() then return
+
+    // Every round prints before it suspends and counts after it is resumed, so the count says how
+    // many times the task came back from a suspension.
+    assert_eq(tsk_ran([("work/work.sysl", raw"""
+        module work
+
+        async ticks(n: int) -> int
+            var resumed = 0
+
+            for i in 0..<n
+                print(s"round $i")
+                await yield_now()
+                resumed += 1
+
+            resumed
+
+        async outer() -> int
+            val a = await ticks(3)
+            val b = await ticks(2)
+            a * 10 + b
+        """), ("main.sysl", "import work.*\n\nprint(block_on(outer()))\n")]),
+        "round 0\nround 1\nround 2\nround 0\nround 1\n32\n")
+
+@test("yield_now's task suspends exactly once between its start and its end")
+tsk_yield_now_suspends_once()
+    if tsk_no_library() then return
+
+    val ir = tsk_ir([("main.sysl", raw"""
+        async pause() -> int
+            await yield_now()
+            7
+
+        print(block_on(pause()))
+        """)])
+
+    val start = ir.index_of("define private ptr @sysl.task.yield()")
+
+    assert(start.is_some(), "the runtime's yield task is in the module")
+
+    val body = ir[start.unwrap()..<ir.bytes.len]
+    val body_end = body.index_of("\n}\n").unwrap_or(body.bytes.len)
+    val text = body[0..<body_end]
+
+    // The suspension a call makes, the one it yields at, and the final one.
+    assert_eq(count_of(text, "@llvm.coro.suspend(token none, i1 false)"), 2)
+    assert_eq(count_of(text, "@llvm.coro.suspend(token none, i1 true)"), 1)
+
+    // And block_on's driver resumes until the task says it is done.
+    assert(ir.contains("define private void @sysl.task.drive(ptr %p) noinline"), "the driver is in")
+    assert(ir.contains("call void @llvm.coro.resume(ptr %h)"), "the driver resumes")
+
+@test("await …? propagates an Err out of an async function, and an Ok through it")
+tsk_await_then_try()
+    if tsk_no_library() then return
+
+    assert_eq(tsk_ran([("work/work.sysl", raw"""
+        module work
+
+        async check(n: int) -> Result[int, string] =
+            if n < 0 then Err(s"negative $n") else Ok(n)
+
+        async total(a: int, b: int) -> Result[int, string]
+            val x = await check(a)?
+            val y = await check(b)?
+            Ok(x + y)
+
+        show(r: Result[int, string]) -> string = r match
+            Ok(v) -> s"ok $v"
+            Err(m) -> s"err $m"
+        """), ("main.sysl", raw"""
+        import work.*
+
+        print(show(block_on(total(1, 2))))
+        print(show(block_on(total(1, -5))))
+        print(show(block_on(total(-2, 9))))
+        """)]), "ok 3\nerr negative -5\nerr negative -2\n")
+
+@test("a generic async function runs at each type its calls solved")
+tsk_generic_async()
+    if tsk_no_library() then return
+
+    assert_eq(tsk_ran([("work/work.sysl", raw"""
+        module work
+
+        async same[T](x: T) -> T = x
+
+        async run() -> string
+            val s: string = await same("hi")
+            val n = await same(5)
+            s"$s $n"
+        """), ("main.sysl", "import work.*\n\nprint(block_on(run()))\n")]), "hi 5\n")
+
+@test("an async method runs with its receiver held by the task")
+tsk_async_method()
+    if tsk_no_library() then return
+
+    assert_eq(tsk_ran([("work/work.sysl", raw"""
+        module work
+
+        struct Dev
+            base: int
+            name: string
+
+            async read(self, n: int) -> int = self.base + n
+            async label(self) -> string = s"${self.name}:${await self.read(1)}"
+
+        async use_dev(d: Dev) -> string
+            val a = await d.read(3)
+            s"${await d.label()} $a"
+        """), ("main.sysl", "import work.*\n\nprint(block_on(use_dev(Dev(10, \"dev\"))))\n")]),
+        "dev:11 13\n")
+
+@test("the program's own allocation hooks are the ones every frame comes from, and they balance")
+tsk_hooks_overridden()
+    if tsk_no_library() then return
+
+    assert_eq(tsk_ran([("pool/pool.sysl", tsk_pool()), ("work/work.sysl", raw"""
+        module work
+
+        async leaf(n: int) -> int = n + 1
+
+        async top() -> int
+            await yield_now()
+            await leaf(1) + await leaf(2)
+        """), ("main.sysl", raw"""
+        import pool.*
+        import work.*
+
+        print(block_on(top()))
+        print(balance())
+        """)]), "5\nbalanced\n")
+
+@test("a task dropped before it started frees its frame once and lets go of its parameters")
+tsk_unstarted_task_dropped()
+    if tsk_no_library() then return
+
+    assert_eq(tsk_ran([("pool/pool.sysl", tsk_pool()), ("work/work.sysl", raw"""
+        module work
+
+        struct Noisy
+            id: int
+
+        impl Drop for Noisy
+            drop(self)
+                print(s"dropped ${self.id}")
+
+        async hold(n: &Noisy, label: string) -> string = s"$label ${n.id}"
+
+        make_and_drop()
+            val t = hold(Noisy(7), "never")
+            print("made")
+        """), ("main.sysl", raw"""
+        import pool.*
+        import work.*
+
+        make_and_drop()
+        print("after")
+        print(balance())
+        print(allocs)
+        """)]), "made\ndropped 7\nafter\nbalanced\n1\n")
+
+@test("a task that ran is freed once too, and its parameter outlives it only by the caller's share")
+tsk_finished_task_dropped()
+    if tsk_no_library() then return
+
+    assert_eq(tsk_ran([("pool/pool.sysl", tsk_pool()), ("work/work.sysl", raw"""
+        module work
+
+        struct Noisy
+            id: int
+
+        impl Drop for Noisy
+            drop(self)
+                print(s"dropped ${self.id}")
+
+        async hold(n: &Noisy) -> int
+            await yield_now()
+            print(s"body ${n.id}")
+            n.id * 2
+        """), ("main.sysl", raw"""
+        import pool.*
+        import work.*
+
+        print(block_on(hold(Noisy(4))))
+        print(balance())
+        """)]), "body 4\n8\ndropped 4\nbalanced\n")
+
+@test("an async object for a board holds no coroutine intrinsic and reaches only the two hooks")
+tsk_board_object()
+    if tsk_no_library() then return
+
+    val program = [("work/work.sysl", raw"""
+        module work
+
+        extern "board_alloc" board_alloc(n: usize) -> *u8
+        extern "board_free" board_free(p: *u8)
+
+        @export("sysl_task_alloc")
+        task_alloc(size: usize) -> *u8 = board_alloc(size)
+
+        @export("sysl_task_free")
+        task_free(p: *u8) = board_free(p)
+
+        async leaf(n: int) -> int
+            await yield_now()
+            n + 1
+
+        async top(n: int) -> int = await leaf(n) + await leaf(n + 1)
+
+        @export("run")
+        run(n: int) -> int = block_on(top(n))
+        """), ("package.hocon", "package { name = \"board\" }\n")]
+
+    for level in ["0", DefaultOptimization]
+        val undefined = tsk_board_undefined(program, level)
+
+        assert(!undefined.contains("llvm.coro"), s"-O$level: $undefined")
+        assert(!undefined.contains("malloc"), s"-O$level: $undefined")
+        assert(undefined.contains("board_alloc"), s"-O$level: $undefined")
+        assert(undefined.contains("board_free"), s"-O$level: $undefined")
+
+        val defined = tsk_board_defined(program, level)
+
+        assert(defined.contains("sysl_task_alloc"), s"-O$level: $defined")
+        assert(defined.contains("sysl_task_free"), s"-O$level: $defined")
+        assert(!defined.contains("llvm.coro"), s"-O$level: $defined")
+
+// The LLVM text of a program, lowered the way the driver lowers it for the host.
+private tsk_ir(files: []const (string, string)) -> string
+    val root = tsk_tree(files)
+    val text = emit_llvm_text(root, None, DefaultOptimization) match
+        Ok(emitted) -> emitted.text
+        Err(why) -> s"it did not lower: ${failure_text(why)}"
+
+    remove_dir_all(root).unwrap_or(())
+    text
+end tsk_ir
+
+private tsk_tree(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-tsk").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    root
+end tsk_tree
+
+// `nm`'s list of a board object's undefined symbols, and of its defined ones.
+private tsk_board_undefined(files: []const (string, string), level: string) -> string =
+    tsk_board_symbols(files, level, "-u")
+
+private tsk_board_defined(files: []const (string, string), level: string) -> string =
+    tsk_board_symbols(files, level, "-U")
+
+private tsk_board_symbols(files: []const (string, string), level: string, which: string) -> string
+    val root = tsk_tree(files)
+    val t = target_named("thumbv7em-freestanding").unwrap()
+
+    val text = emit_llvm_text(root, Some("thumbv7em-freestanding"), level) match
+        Ok(emitted) -> emitted.text
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not lower: ${failure_text(why)}"
+
+    val cc = find_clang(t, None).unwrap()
+    val obj = s"$root/board.o"
+
+    compile_object(cc, text, obj, t, level) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not compile: $why"
+        Ok(_) -> ()
+
+    val listed = capture("nm", [which, obj], "", [], true).unwrap().text
+
+    remove_dir_all(root).unwrap_or(())
+    listed
+end tsk_board_symbols
+
+// How many times `part` occurs in `text`.
+private count_of(text: string, part: string) -> int
+    var n = 0
+    var rest = text
+
+    loop
+        rest.index_of(part) match
+            Some(at) ->
+                n += 1
+                rest = rest[at + part.bytes.len..<rest.bytes.len]
+            None -> return n
+end count_of

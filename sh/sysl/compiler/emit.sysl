@@ -223,6 +223,11 @@ struct Emit
 
     // The first form this body reached that nothing here lowers. A body that has one is not emitted.
     gap: Option[string]
+
+    // The coroutine the body being emitted is, where it is an `async` function's; and whether any
+    // body is one, which is what the coroutine intrinsics are declared for (`emit_async.sysl`).
+    coro: Option[CoroCtx]
+    uses_coro: bool
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -238,6 +243,10 @@ enum HelperReq
     HrDrop(payload: Type)
     HrDropBuf(elem: Type)
     HrPlainDrop
+
+    // The hook installed in a task's promise whose result holds a count (`emit_async.sysl`): it lets
+    // go of the result a finished task still holds, and destroys the frame.
+    HrTaskDrop(result: Type)
 
     // A block written out by hand as LLVM, which is text and can only be **named** by anything that
     // is not LLVM. It shares the queue with the generated ones so that a module writes its helpers
@@ -365,7 +374,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          "", self_params, None, ghost_funcs, destructors, false, false, false,
          false, boxes, bufs, requested, requested_set, queue, temps, temp_marks, owned_slots, owned_marks, defers,
          defer_marks, set(), relaid, promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
-         set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None)
+         set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None, None, false)
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -423,6 +432,7 @@ start_function(e: *Emit)
     e.return_slot = None
     e.temp_slots = set()
     e.gap = None
+    e.coro = None
 end start_function
 
 // A register nothing else in this function uses.
