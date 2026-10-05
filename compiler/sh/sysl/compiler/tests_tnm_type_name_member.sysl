@@ -1,0 +1,295 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A type's own name with a member selected from it** — `Age.try(200)`, `Show.show()`,
+// `Point.origin`. None of these is a value, so the one answer that is certainly false is that the
+// name is undefined. Each kind of name answers for itself — a struct, an enum, a constrained subtype
+// and a trait — and the three things that could have been meant are the same in every case: a
+// method or a property, reached on a value; an associated function, reached exactly this way; and a
+// member the type does not have.
+//
+// **Every output and refusal quoted here was obtained by running the reference compiler on the same
+// source.**
+
+// What a build of `entry` under `root` said, and whether the program it made exited zero — a
+// refusal is the build's failure text.
+private tnm_outcome(root: string, entry: string) -> (string, bool)
+    val exe = s"$root/built"
+
+    build_native_program(entry, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture("/bin/sh", ["-c", s"'$exe' < /dev/null"], "", [], true, 60000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end tnm_outcome
+
+// A program of one file.
+private tnm_single(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-type-name-member").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    tnm_outcome(root, s"$root/main.sysl")
+
+// A program of two files: the module `geom` beside the entry file.
+private tnm_with_geom(module_text: string, main_text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-type-name-member").unwrap()
+
+    make_dir_all(s"$root/geom").unwrap()
+    write_text(s"$root/geom/g.sysl", module_text).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+    tnm_outcome(root, root)
+
+private tnm_can_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end tnm_can_run
+
+private tnm_ran(text: string) -> string
+    val out = tnm_single(text)
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+
+// The refusal a program earns; a program that built and ran is reported as such.
+private tnm_failed(out: (string, bool)) -> string = if out.1 then s"it built and ran: ${out.0}" else out.0
+
+private tnm_err(text: string) -> string = tnm_failed(tnm_single(text))
+
+private tnm_age() -> string = "type Age = int within 0..150\n"
+
+private tnm_meters() -> string = "type Meters = new f64\n"
+
+private tnm_show() -> string = "trait Show\n    show(self) -> string\n"
+
+// -- a constrained subtype ------------------------------------------------------------------------
+
+@test("`try` is answered by the ruling that there is no `try`")
+tnm_try_is_ruled_out()
+    if !tnm_can_run() then return
+
+    val said = tnm_err(tnm_age() + "var a = Age.try(200)\nprint(int(a))")
+
+    assert(said.contains("error: 'Age' is a constrained type and has no 'try': a value outside its " +
+                         "range is a mistake in the code that produced it rather than a condition to " +
+                         "handle, so 'Age(x)' checks it and traps, and 'Age::Valid(x)' asks the " +
+                         "question without trapping"), said)
+    assert(!said.contains("undefined name"), said)
+
+// The bare form is the same mistake with the parentheses left off, so it gets the same answer rather
+// than falling through to a field read of a name that stands for nothing.
+@test("`try` read without parentheses says the same thing")
+tnm_bare_try()
+    if !tnm_can_run() then return
+
+    val said = tnm_err(tnm_age() + "var a = Age.try\nprint(1)")
+
+    assert(said.contains("error: 'Age' is a constrained type and has no 'try'"), said)
+
+// `Valid`/`Succ`/`Pred` are integer-range attributes, so a derived float is not told to reach for
+// them: the advice would be refused by the very next message.
+@test("a derived type with no range is not offered the range attributes")
+tnm_derived_try()
+    if !tnm_can_run() then return
+
+    val said = tnm_err(tnm_meters() + "var m = Meters.try(1.0)\nprint(1)")
+
+    assert(said.contains("error: 'Meters' is a constrained type and has no 'try': a value outside its " +
+                         "range is a mistake in the code that produced it rather than a condition to " +
+                         "handle, so 'Meters(x)' checks it and traps\n"), said)
+    assert(!said.contains("Valid"), said)
+
+@test("a member the type does not have names the attributes instead")
+tnm_absent_member_of_a_range()
+    if !tnm_can_run() then return
+
+    val said = tnm_err(tnm_age() + "var a = Age.limit\nprint(1)")
+
+    assert(said.contains("error: 'Age' is a type, not a value, and has no member 'limit' — what a " +
+                         "constrained type offers under its own name is written with '::': " +
+                         "'Age::First', 'Age::Last', 'Age::Valid(x)', 'Age::Succ(x)', 'Age::Pred(x)'"),
+           said)
+
+@test("a derived type with no range says only that the member is absent")
+tnm_absent_member_of_a_derived()
+    if !tnm_can_run() then return
+
+    val said = tnm_err(tnm_meters() + "var m = Meters.scale\nprint(1)")
+
+    assert(said.contains("error: 'Meters' is a type, not a value, and has no member 'scale'\n"), said)
+    assert(!said.contains("::"), said)
+
+@test("a method of the subtype is reported as one to call on a value")
+tnm_subtype_method()
+    if !tnm_can_run() then return
+
+    val said = tnm_err(tnm_meters() + "trait Show\n    show(self) -> string\nimpl Show for Meters\n" +
+                       "    show(self) -> string = \"m\"\nprint(Meters.show())")
+
+    assert(said.contains("error: 'show' is a method of 'Meters' — call it on a value, as " +
+                         "'value.show(…)'"), said)
+    assert(!said.contains("undefined name"), said)
+
+@test("a property of the subtype is reported as one to read on a value")
+tnm_subtype_property()
+    if !tnm_can_run() then return
+
+    val said = tnm_err(tnm_meters() + "trait Size\n    size -> int\nimpl Size for Meters\n" +
+                       "    size -> int = 1\nprint(Meters.size)")
+
+    assert(said.contains("error: 'size' is a property of 'Meters' — read it on a value, as " +
+                         "'value.size'"), said)
+
+// What the diagnostic tells the reader to write has to work, or it is a second wrong answer.
+@test("the two forms the message names both compile and run")
+tnm_named_forms_run()
+    if !tnm_can_run() then return
+
+    assert_eq(tnm_ran(tnm_age() + "print(Age::Valid(200), int(Age(40)))"), "false 40\n")
+
+// -- a trait --------------------------------------------------------------------------------------
+
+@test("a member of the trait is reported as one to call on a value")
+tnm_trait_member()
+    if !tnm_can_run() then return
+
+    val said = tnm_err(tnm_show() + "print(Show.show())")
+
+    assert(said.contains("error: 'show' is a member of the trait 'Show' — call it on a value of a " +
+                         "type that implements 'Show', or on a '&Show'"), said)
+    assert(!said.contains("undefined name"), said)
+
+@test("a property of the trait is reported as one to read on a value")
+tnm_trait_property()
+    if !tnm_can_run() then return
+
+    val said = tnm_err("trait Size\n    size -> int\nprint(Size.size)")
+
+    assert(said.contains("error: 'size' is a property of the trait 'Size' — read it on a value of a " +
+                         "type that implements 'Size', or on a '&Size'"), said)
+
+@test("a member the trait does not declare says the trait is not a value")
+tnm_trait_absent_member()
+    if !tnm_can_run() then return
+
+    val said = tnm_err(tnm_show() + "print(Show.render())")
+
+    assert(said.contains("error: 'Show' is a trait, not a value, and declares no member 'render'"), said)
+
+// A trait object is the value the message names, so it has to be the thing that works.
+@test("the form the message names compiles and runs")
+tnm_trait_object_runs()
+    if !tnm_can_run() then return
+
+    assert_eq(tnm_ran(tnm_show() + "struct P\n    v: int\nimpl Show for P\n" +
+                      "    show(self) -> string = \"p\"\nf(s: &Show) -> string = s.show()\n" +
+                      "print(f(P(1)))"), "p\n")
+
+// -- the edges of `the name is a type` ------------------------------------------------------------
+
+// A local of the same name is nearer, so it is what the selection reaches — otherwise a program
+// could not name a variable after a type it uses.
+@test("a local shadowing the type name is an ordinary field read, not a type")
+tnm_local_shadows_a_subtype()
+    if !tnm_can_run() then return
+
+    val said = tnm_err(tnm_age() + "var Age = 1\nprint(Age.try)")
+
+    assert(said.contains("error: cannot read field 'try' of int"), said)
+    assert(!said.contains("is a constrained type"), said)
+
+@test("and a local shadowing a trait name is too")
+tnm_local_shadows_a_trait()
+    if !tnm_can_run() then return
+
+    val said = tnm_err(tnm_show() + "var Show = 1\nprint(Show.show())")
+
+    assert(said.contains("error: type 'int' has no method 'show'"), said)
+    assert(!said.contains("is a member of the trait"), said)
+
+// The module-qualified form folds the module into the name it qualifies before anything else looks
+// at it (`reference/modules.md § Imports`), so the answer is the same one, naming the type by its
+// qualified name.
+@test("a subtype reached through its module gets the same answer")
+tnm_subtype_through_its_module()
+    if !tnm_can_run() then return
+
+    val said = tnm_failed(tnm_with_geom("module geom\ntype Age = int within 0..150\n",
+                                        "print(int(geom.Age.try(200)))"))
+
+    assert(said.contains("error: 'geom.Age' is a constrained type and has no 'try'"), said)
+    assert(!said.contains("undefined name"), said)
+
+@test("a trait reached through its module gets the same answer")
+tnm_trait_through_its_module()
+    if !tnm_can_run() then return
+
+    val said = tnm_failed(tnm_with_geom("module geom\ntrait Show\n    show(self) -> string\n",
+                                        "print(geom.Show.show())"))
+
+    assert(said.contains("error: 'show' is a member of the trait 'geom.Show' — call it on a value of " +
+                         "a type that implements 'geom.Show', or on a '&geom.Show'"), said)
+
+// A call trait is an ordinary trait of the library's, and here the reader is the one who wrote it,
+// so this is the one position where the arity-carrying name is printed.
+@test("a call trait is answered as the ordinary trait it is")
+tnm_call_trait()
+    if !tnm_can_run() then return
+
+    val said = tnm_err("print(Fn1.call())")
+
+    assert(said.contains("error: 'call' is a member of the trait 'sysl.Fn1' — call it on a value of a " +
+                         "type that implements 'sysl.Fn1', or on a '&sysl.Fn1'"), said)
+
+@test("and its member is reached on a value, which is what applying one does")
+tnm_call_member_on_a_value()
+    if !tnm_can_run() then return
+
+    assert_eq(tnm_ran("var f = (x: int) -> x + 1\nprint(f(1), f.call(2))"), "2 3\n")
+
+// -- a struct and an enum keep answering by name --------------------------------------------------
+
+@test("a struct's absent member")
+tnm_struct_absent_member()
+    if !tnm_can_run() then return
+
+    val said = tnm_err("struct P\n    v: int\nprint(P.origin)")
+
+    assert(said.contains("error: type 'P' has no member 'origin' — and 'P' is a type, not a value"),
+           said)
+
+@test("an enum's absent variant")
+tnm_enum_absent_variant()
+    if !tnm_can_run() then return
+
+    val said = tnm_err("enum Color\n    Red\nprint(Color.Purple)")
+
+    assert(said.contains("error: enum 'Color' has no variant 'Purple'"), said)
+
+// An enum does have `try`, and it is why a reader writes `Age.try` in the first place.
+@test("an enum's `try` is a fallible constructor, which is what makes the subtype's absence surprising")
+tnm_enum_try()
+    if !tnm_can_run() then return
+
+    assert_eq(tnm_ran("enum Color\n    Red\n    Green\nColor.try(1) match\n" +
+                      "    Some(c) -> print(Color::Image(c))\n    None -> print(\"none\")"), "Green\n")

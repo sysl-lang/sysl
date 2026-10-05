@@ -285,7 +285,8 @@ end import_name
 
 // A name the compiler answers itself, which no module declares however the import spells its home.
 private imports_a_form(name: string) -> bool =
-    special_form_word(name) || atomic_operands(name).is_some() || name == "atomic_fence"
+    special_form_word(name) || atomic_operands(name).is_some() || name == "atomic_fence" ||
+    slot_form_word(name)
 
 // What an import may not be called here, and whether it may be called this.
 //
@@ -781,7 +782,7 @@ private stand_in(a: &Analysis, scope: Scope, tp: string, tvalues: Buf[TypeBindin
 
     if written.is_none() then return Abstract(tp, buf())
 
-    ConstArg(from_int(0), resolve_type(a, scope, written.unwrap(), no_bindings()))
+    ConstArg(from_int(0), resolve_type(a, scope, written.unwrap(), no_bindings()), true)
 end stand_in
 
 private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string],
@@ -915,19 +916,43 @@ private rewind_to(a: &Analysis, m: RegistrationMark)
     rewind_registered(a.tables.enum_insts, m.enums)
     rewind_registered(a.tables.constrained_insts, m.constrained)
 
+// A member's own type parameters stand in for themselves **carrying what the member asked of them**,
+// as the type's do, so `m[Y](self, x: &Get[Y])` over `trait Get[T: Show]` is held to `Get`'s bounds
+// here -- a trait's member has no body for the generic walk to read it at. The bounds are read
+// quietly: whatever is wrong with them is told where the member is hoisted. A value parameter and a
+// pack keep their plain stand-ins.
 private resolve_method(a: &Analysis, scope: Scope, m: MethodDecl, outer: Buf[Binding])
     var subst: Buf[Binding] = buf()
+    var own: Buf[Binding] = buf()
+    val mark = a.complaints()
+    val bounded = abstract_subst(a, scope, m.tparams, m.bounds, m.tvalues, buf(), outer)
+
+    a.restore_complaints(mark)
 
     for i in 0..<outer.len()
         subst.push(outer.at(i))
 
     for i in 0..<m.tparams.len()
-        subst.push(Binding(m.tparams.at(i), stand_in(a, scope, m.tparams.at(i), m.tvalues)))
+        val tp = m.tparams.at(i)
+
+        if binding_named(m.tvalues, tp).is_some() || holds_string(m.tpacks, tp) then
+            subst.push(Binding(tp, stand_in(a, scope, tp, m.tvalues)))
+        else
+            val stood = Binding(tp, bounded.at(outer.len() + i).ty)
+
+            subst.push(stood)
+            own.push(stood)
+
+    val before = a.settled
+
+    a.settled = joined_bindings(before, own)
 
     for i in 0..<m.params.len()
         resolve_type(a, scope, m.params.at(i).typ, subst)
 
     if m.ret_type.is_some() then resolve_result(a, scope, m.ret_type.unwrap(), subst)
+
+    a.settled = before
 
 // What `Self` stands for inside a type's own members: the type at its own parameters.
 private self_type(a: &Analysis, scope: Scope, owner: string, tparams: Buf[string],

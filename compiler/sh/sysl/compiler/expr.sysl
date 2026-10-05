@@ -557,7 +557,7 @@ end name_expr
 private const_parameter(cx: &Analyzer, span: Span, name: string,
                         expected: Option[Type]) -> Option[TExpr]
     bound_type(cx.subst, name) match
-        Some(ConstArg(v, ty)) -> underlying(*ty) match
+        Some(ConstArg(v, ty, _)) -> underlying(*ty) match
             Enum(d) ->
                 val n = v.to_long().unwrap_or(-1)
 
@@ -1109,23 +1109,26 @@ end visible_here
 
 // What a reserved identifier stands for, folded into the use as the literal it names.
 //
-// The file that wrote a call and the package that file belongs to: what a spliced default's
-// `__FILE__`, `__LINE__`, `__NAME__` and `__VERSION__` answer about.
+// A call, as a spliced default's built-ins answer about it: the file that wrote it and the package
+// that file belongs to, where in that file it stands, and the function it is written in.
 struct CallSite
     src: Source
     pkg: Packaging
+    at: Span
+    func: string
 
-// Where a spliced default reports its `__FILE__`, `__LINE__`, `__NAME__` and `__VERSION__` from: the call site,
-// carried down so that a default written in a library names the caller's line and package and not
-// its own. A default inside a default keeps the outermost caller.
-call_site(cx: &Analyzer) -> Option[CallSite] =
-    if cx.here.is_none() then Some(CallSite(cx.scope.src, cx.scope.pkg)) else cx.here
+// Where a spliced default reports its `__FILE__`, `__LINE__`, `__COLUMN__`, `__FUNCTION__`,
+// `__NAME__` and `__VERSION__` from: the call at `span`, carried down so that a default written in a
+// library names the caller's line, function and package and not its own. **A default inside a
+// default keeps the outermost call** -- its line and its function as well as its file.
+call_site(cx: &Analyzer, span: Span) -> CallSite =
+    cx.here.unwrap_or(CallSite(cx.scope.src, cx.scope.pkg, span, cx.func_name))
 
 // `__LINE__` and `__COLUMN__` go through `int_literal`, so each takes the integer type its context
 // asks for and is range-checked like any other literal.
 private builtin(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TExpr
-    val at = cx.reported.unwrap_or(span)
-    val site = cx.here.unwrap_or(CallSite(cx.scope.src, cx.scope.pkg))
+    val site = call_site(cx, span)
+    val at = site.at
     val src = site.src
     val loc = src.locate(at.start)
 
@@ -1147,8 +1150,9 @@ private builtin(cx: &Analyzer, span: Span, name: string, expected: Option[Type])
         return int_literal(cx, span, from_int(long(loc.col)), "", expected)
 
     // **Empty outside any body, rather than an error.** A module's storage is filled before any
-    // function runs, so there is genuinely no function to name there.
-    if name == "__FUNCTION__" then return TExpr(span, TStrLit(cx.func_name))
+    // function runs, so there is genuinely no function to name there. In a default it is the
+    // calling function, as `__FILE__` there is the calling file.
+    if name == "__FUNCTION__" then return TExpr(span, TStrLit(site.func))
 
     // A name of the shape that a binding took anyway was refused where it was bound, and a use of it
     // is that one mistake's consequence rather than a second one.
