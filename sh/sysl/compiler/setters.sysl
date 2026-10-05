@@ -128,20 +128,26 @@ end check_not_own_setter
 
 // **A property that reads itself calls itself** — `count -> int = self.count` is a body that never
 // returns, and what it means to read is the field the property stands in front of. Nothing where the
-// read is not `self.<the property being defined>`, which leaves every other read to answer.
+// read is not `self.<the property being defined>`, which leaves every other read to answer. It is
+// asked of the member the name resolves to, so a field, a method and a property of another type
+// that shares the spelling all read as they always did.
 own_property_read(cx: &Analyzer, at: Span, receiver: Expr, rt: Type, name: string) -> Option[TExpr]
     if !names_self(receiver) then return None
     if enclosing_member(cx) != name then return None
-
-    val found = member_key(cx.an, rt, name)
-    val m = member_at(cx.an, found.0, name)
-
-    if m.is_none() || !m.unwrap().is_property then return None
+    if !is_property_of(cx.an, receiver_type(rt), name) then return None
 
     Some(cx.err(at, s"'$name' reads the property it is defining, so it calls itself — the value a " +
                 "property computes is not the property. What a body like this means to read is the " +
                 "field it is in front of"))
 end own_property_read
+
+private is_property_of(a: &Analysis, ty: Type, name: string) -> bool = ty match
+    Abstract(_, bounds) -> bound_member(a, ty, bounds, name) match
+        Some(m) -> m.2.is_property
+        None -> false
+    _ -> member_at(a, member_key(a, ty, name).0, name) match
+        Some(d) -> d.is_property
+        None -> false
 
 private names_self(receiver: Expr) -> bool = *receiver.kind match
     Ident(n) -> n == "self"
@@ -151,7 +157,7 @@ private names_self(receiver: Expr) -> bool = *receiver.kind match
 // The member the body being analyzed *is*, as it was filed — `count` in `Cell.count`, and
 // `count$set` in `Cell.count$set`.
 private enclosing_member(cx: &Analyzer) -> string
-    val name = cx.func_name
+    val name = cx.decl_name
     val b = name.bytes
 
     var cut: usize = 0
