@@ -171,7 +171,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
     // The hand-written blocks go in front of the generated ones, and which of them the module needs
     // is settled only once every helper has been written -- a helper is as much a reason to hold the
     // runtime as a body is.
-    var helpers = runtime_bundles(e, t)
+    var helpers = runtime_bundles(e, t, emits_export(p, bounds_fail_symbol()))
 
     for i in 0..<built_helpers.len()
         helpers.push(built_helpers.at(i))
@@ -202,6 +202,13 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
     // read **after** the drain.
     for i in 0..<e.globals.len()
         globals.push(e.globals.at(i))
+
+    // The `file:line:column` each failed bounds check names, numbered apart from the interned
+    // strings so that a check's location never moves another string's number.
+    val locs = bounds_location_globals(e)
+
+    for i in 0..<locs.len()
+        globals.push(locs.at(i))
 
     for i in 0..<vtables.len()
         globals.push(vtables.at(i))
@@ -256,7 +263,7 @@ end box_defs
 
 // The parts of the runtime the module turned out to need, each a hand-written template and so
 // reachable to anything that is not LLVM only by name.
-private runtime_bundles(e: *Emit, t: Target) -> Buf[IrRuntime]
+private runtime_bundles(e: *Emit, t: Target, bounds_overridden: bool) -> Buf[IrRuntime]
     var out: Buf[IrRuntime] = buf()
 
     if e.char_buf then out.push(RtTemplate("sysl.utf8", utf8_encoder()))
@@ -265,8 +272,25 @@ private runtime_bundles(e: *Emit, t: Target) -> Buf[IrRuntime]
     if e.maybe_heap then out.push(RtTemplate("arc.maybe", arc_maybe()))
     if e.weak_heap then out.push(RtTemplate("arc.weak", arc_weak(t)))
 
+    // The weak default a failed bounds check reports through -- unless this module's own `@export`
+    // is the override, which would make the default a second definition of the one symbol.
+    if e.bounds_fails && !bounds_overridden
+        out.push(RtTemplate("sysl.bounds", bounds_runtime(t)))
+
     out
 end runtime_bundles
+
+// Whether a function this module defines publishes itself under `symbol`.
+private emits_export(p: TProgram, symbol: string) -> bool
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if !f.ghost && !declared_elsewhere(p, f) && f.exported.is_some() &&
+                f.exported.unwrap() == symbol
+            return true
+
+    false
+end emits_export
 
 // One of the two words a `bool` renders as, as the constant a module lays down.
 private bool_constant(word: string) -> IrGlobal
@@ -423,6 +447,10 @@ end is_displaced
 private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     var out: Buf[IrFuncSig] = buf()
 
+    // The bounds default renders its own digits and writes with `write`, where it prints at all.
+    val bounds_prints = e.bounds_fails && bounds_default_prints(e.target) &&
+        !emits_export(p, bounds_fail_symbol())
+
     if e.traps then out.push(ir_sig(llvm_trap(), ir_fn_type(LVoid, no_params())))
 
     if e.heap
@@ -481,7 +509,7 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     // What the dispatcher tells the runner with, and only where there is a hook for it to say
     // anything about. It is the same primitive the library prints with, at the signature the
     // standard module already binds it at.
-    if dispatcher_marks(p)
+    if dispatcher_marks(p) || bounds_prints
         var write_params: Buf[IrParam] = buf()
 
         write_params.push(ir_param(l_i32()))
@@ -547,7 +575,7 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
     if p.entry_point && !p.tests.is_empty() then seen.push("strcmp")
 
-    if dispatcher_marks(p) then seen.push("write")
+    if dispatcher_marks(p) || bounds_prints then seen.push("write")
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
