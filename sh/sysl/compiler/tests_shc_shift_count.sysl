@@ -1,0 +1,199 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// A shift's right operand is a COUNT, not a value combined with the left, so it may be any integer
+// type and the result is the shifted value's own (`reference/expressions.md § A shift takes a count`).
+// Ported from the reference's `ShiftCountTests` case for case. The conversion underneath is
+// `emit_scalar.sysl`'s `shift_amount`, and its order is load bearing: a count wider than the value is
+// clamped at the value's width BEFORE it is truncated, since truncating first would turn 256 into 0
+// and answer `x` where every other over-shift answers zero.
+//
+// **Every string quoted here was read out of the reference compiler** (0.0.162). The helpers are
+// `tests_enm_enum_run.sysl`'s.
+
+// The entry point's lowered text alone, so a shift the library lowers cannot answer for the program's.
+private shc_main_of(ir: string) -> string
+    val at = ir.index_of("define i32 @main(").unwrap_or(0)
+    val rest = ir[at..<ir.len]
+    val close = rest.index_of("\n}").unwrap_or(rest.len)
+
+    rest[0..<close]
+
+// -- a count narrower than the value is extended
+
+@test("an unsigned one, which is the shape a length arrives in")
+shc_an_unsigned_narrower_count_is_extended()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var x: u32 = 1
+        var n: u8 = 5
+        print(x << n, (x << n) >> n)
+        """), "32 1\n")
+
+@test("a signed one")
+shc_a_signed_narrower_count_is_extended()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var x: long = 1
+        var n: i16 = 40
+        print(x << n)
+        """), "1099511627776\n")
+
+// -- a count wider than the value is clamped before it is truncated
+
+// 256 truncated to a `u8` is 0, so a conversion done in the wrong order would print `1`.
+@test("so 256 places on a byte is a full shift and not a shift by nothing")
+shc_256_places_on_a_byte_is_a_full_shift()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var x: u8 = 1
+        var n: u32 = 256
+        print(x << n)
+        """), "0\n")
+
+@test("and the same holds of the right shift")
+shc_the_same_holds_of_the_right_shift()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var x: u8 = 0xFF
+        var n: u32 = 256
+        print(x >> n)
+        """), "0\n")
+
+// The clamp is an unsigned comparison, so a negative count reads as an enormous one and shifts all
+// the way -- the answer `bounded_shift` gives a negative count of the value's own width.
+@test("a negative count shifts all the way, exactly as one of the value's own width does")
+shc_a_negative_count_shifts_all_the_way()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var x: u8 = 0xFF
+        var wide: i32 = -1
+        var same: i8 = -1
+        print(x << wide, x << same)
+        """), "0 0\n")
+
+@test("a signed value shifted right past its width is its sign")
+shc_a_signed_value_shifted_right_past_its_width_is_its_sign()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var x: i8 = -1
+        var n: u64 = 1000
+        print(x >> n)
+        """), "-1\n")
+
+// -- the result is the shifted value's type, never the count's
+
+@test("so a byte shifted by a 64-bit count is still a byte, and wraps as one")
+shc_a_byte_shifted_by_a_64_bit_count_is_still_a_byte()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var x: u8 = 0x81
+        var n: u64 = 1
+        print(x << n)
+        """), "2\n")
+
+@test("which the emitted instruction says outright")
+shc_the_emitted_instruction_says_so()
+    if !enm_ready() then return
+
+    val ir = enm_ir("var x: u8 = 1\nvar n: u64 = 3\nprint(x << n)\n")
+
+    assert(shc_main_of(ir).contains("shl i8"), ir)
+
+// -- a compound shift computes what the long form computes
+
+@test("with a wider count")
+shc_a_compound_shift_with_a_wider_count()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var x: u8 = 1
+        var n: u32 = 256
+        x <<= n
+        print(x)
+        """), "0\n")
+
+@test("and with a narrower one")
+shc_a_compound_shift_with_a_narrower_count()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var x: u32 = 1
+        var n: u8 = 5
+        x <<= n
+        x >>= n
+        print(x)
+        """), "1\n")
+
+// -- the count must still be an integer (the float case is `odx_the_shift_count_must_be_an_integer`)
+
+@test("so is a bool")
+shc_a_bool_count_is_refused()
+    if !enm_ready() then return
+
+    val out = enm_err("var x: u8 = 1\nprint(x >> true)\n")
+
+    assert(enm_says(out, "'>>' shifts by a count, and bool is not an integer"), out)
+
+@test("and the ordinary same-type rule is untouched for everything else")
+shc_the_same_type_rule_is_untouched_for_everything_else()
+    if !enm_ready() then return
+
+    val out = enm_err("var a: u8 = 1\nvar b: u16 = 2\nprint(a | b)\n")
+
+    assert(enm_says(out, "'|' needs matching types, got byte and ushort"), out)
+
+// -- a ranged receiver takes a foreign count on the same terms: a `within` type's left shift is the
+// checked one, and the count is brought to width before that check rather than after
+
+@test("and the checked shift computes what the plain one computes")
+shc_the_checked_shift_computes_what_the_plain_one_computes()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        type Slot = new u8 within 0..<200
+
+        var s: Slot = Slot(3)
+        var narrow: u8 = 4
+        var wide: u32 = 4
+
+        print(int(s << narrow), int(s << wide))
+        """), "48 48\n")
+
+// The clamp happens before `checked_shl`'s own comparison, so a wide count whose result leaves the
+// range still trips the range check.
+@test("while a shift that leaves the range still traps")
+shc_a_shift_that_leaves_the_range_still_traps()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits(raw"""
+        type Slot = new u8 within 0..<200
+
+        var s: Slot = Slot(3)
+        var wide: u32 = 7
+
+        print(int(s << wide))
+        """), "")
+
+// A vector's count is lane-wise and already the same register type, so nothing is relaxed there.
+@test("a vector shift is untouched: its lanes must still agree")
+shc_a_vector_shift_is_untouched()
+    if !enm_ready() then return
+
+    val out = enm_err(raw"""
+        val a: <4>u32 = [1, 2, 3, 4]
+        val b: <4>u8 = [1, 2, 3, 4]
+        f() -> unit
+            val c = a << b
+        """)
+
+    assert(enm_says(out, "'<<' needs matching types, got <4>uint and <4>byte"), out)
