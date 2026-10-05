@@ -10,9 +10,9 @@ import sysl.text.Search
 //
 // **The reference compiler has neither word**, so nothing here is read out of it: these assert the
 // approved design (stackless async written on the function, a compiler-known `Task[T]`, prefix
-// `await` binding tighter than `?`), the precedent being the self-hosted-only features before it.
-// Nothing is lowered yet -- an async body is left out of emission -- so every claim is about the
-// tree or the analysis.
+// `await` binding tighter than `?`).
+// Every claim here is about the tree or the analysis; what a task does when it runs is asserted
+// beside the lowering, in `tests_tsk_task_run.sysl` and `tests_xqt_executor.sysl`.
 
 private var asy_library_cache: Buf[Program] = buf()
 private var asy_library_read: bool = false
@@ -334,6 +334,45 @@ asy_await_on_a_non_task()
             1
         """), "'await' needs a Task, which is what calling an 'async' function hands back, but " +
         "this value is string", "2:11")
+
+@test("a glob import of the thread module takes 'yield_now', and the refusal says whose it became")
+asy_thread_yield_now_shadows_the_task_form()
+    if asy_no_library() then return
+
+    asy_says(asy_refused(raw"""
+        import sysl.posix.threads.*
+
+        async h() -> int
+            await yield_now()
+            1
+        """), "'await' needs a Task, which is what calling an 'async' function hands back, but " +
+        "this value is bool — the 'yield_now' called here resolved to " +
+        "'sysl.posix.threads.yield_now', declared in 'sysl.posix.threads', and a declaration of that " +
+        "name stands in front of the task form 'yield_now(…)', so the task form is shadowed", "4:11")
+
+@test("a local named 'park' that is not a task says it shadowed the task form")
+asy_local_park_shadows_the_task_form()
+    if asy_no_library() then return
+
+    asy_says(asy_refused(raw"""
+        async h(park: &Fn(int) -> int) -> int
+            await park(1)
+        """), "'await' needs a Task, which is what calling an 'async' function hands back, but " +
+        "this value is int — the 'park' called here resolved to a local binding, and a binding of " +
+        "that name stands in front of the task form 'park(…)', so the task form is shadowed",
+        "2:11")
+
+@test("a program's own 'yield_now' handing back a task is awaited as any task is")
+asy_own_yield_now_is_a_task()
+    if asy_no_library() then return
+
+    assert_eq(asy_refused(raw"""
+        async tick(n: int) -> int = n + 1
+
+        yield_now() -> Task[int] = tick(41)
+
+        async h() -> int = await yield_now()
+        """), "")
 
 @test("a task where its value was wanted suggests await: a binding's declared type")
 asy_unawaited_task_at_a_binding()

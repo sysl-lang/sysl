@@ -12,7 +12,7 @@ import sysl.text.Search
 // and the default level is where a frame may be moved into its caller's.
 //
 // **The reference compiler has neither word**, so the expected outputs are worked out from the
-// programs, as the stage-1 front-end tests' are.
+// programs, as the front end's in `tests_asy_async.sysl` are.
 
 // The programs' shared module: the two allocation hooks, counting, over C's allocator.
 private tsk_pool() -> string = raw"""
@@ -361,6 +361,92 @@ tsk_board_object()
         assert(defined.contains("sysl_task_alloc"), s"-O$level: $defined")
         assert(defined.contains("sysl_task_free"), s"-O$level: $defined")
         assert(!defined.contains("llvm.coro"), s"-O$level: $defined")
+
+// A pool that supplies the allocation hook and leaves the freeing one to the default.
+private tsk_alloc_only() -> string = raw"""
+    module pool
+
+    extern "malloc" c_malloc(n: usize) -> *u8
+
+    var allocs: int = 0
+
+    @export("sysl_task_alloc")
+    task_alloc(size: usize) -> *u8
+        allocs += 1
+        c_malloc(size)
+    """
+
+private tsk_alloc_only_work() -> string = raw"""
+    module work
+
+    async leaf(n: int) -> int
+        await yield_now()
+        n + 1
+
+    async top() -> int = await leaf(1) + await leaf(2)
+    """
+
+@test("the default hooks are weak: a program defining only the allocation hook keeps the default free")
+tsk_hooks_half_overridden()
+    if tsk_no_library() then return
+
+    val program = [("pool/pool.sysl", tsk_alloc_only()), ("work/work.sysl", tsk_alloc_only_work()),
+                   ("main.sysl", "import pool.*\nimport work.*\n\nprint(block_on(top()))\n" +
+                                 "print(allocs > 0)\n")]
+
+    assert_eq(tsk_ran(program), "5\ntrue\n")
+
+    val ir = tsk_ir(program)
+
+    assert(ir.contains("define weak void @sysl_task_free(ptr %p)"), ir)
+    assert(!ir.contains("define weak ptr @sysl_task_alloc"), ir)
+
+@test("a park's waker comes from the frames' hooks too, and every one of them is given back")
+tsk_park_waker_through_the_hooks()
+    if tsk_no_library() then return
+
+    val program = [("pool/pool.sysl", tsk_pool()), ("work/work.sysl", raw"""
+        module work
+
+        async waits(n: int) -> int
+            var total = 0
+
+            for i in 0..<n
+                await park(w -> w())
+                total += 1
+
+            total
+        """), ("main.sysl", raw"""
+        import pool.*
+        import work.*
+
+        print(block_on(waits(3)))
+        print(balance())
+        print(allocs >= 3)
+        print(allocs)
+        """)]
+
+    // Unoptimized, nothing is elided: the task's frame, then a frame and a waker for each park.
+    assert_eq(tsk_outcome(program, "0"), "3\nbalanced\ntrue\n7\n")
+
+    // Optimized, a park's frame may live in its caller's; its waker is still the hooks' every time.
+    val high = tsk_outcome(program, DefaultOptimization)
+
+    assert(high.starts_with("3\nbalanced\ntrue\n"), high)
+
+@test("a program's own 'yield_now' handing back a task runs as the task it hands back")
+tsk_own_yield_now_runs()
+    if tsk_no_library() then return
+
+    assert_eq(tsk_ran([("main.sysl", raw"""
+        async tick(n: int) -> int = n + 1
+
+        yield_now() -> Task[int] = tick(41)
+
+        async h() -> int = await yield_now()
+
+        print(block_on(h()))
+        """)]), "42\n")
 
 // The LLVM text of a program, lowered the way the driver lowers it for the host.
 private tsk_ir(files: []const (string, string)) -> string

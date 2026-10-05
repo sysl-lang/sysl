@@ -607,8 +607,49 @@ tdx_registrar_keeps_the_waker_local()
             1
 
         print(block_on(waits()))
+        """), tdx_waker_refusal("w"), "5:27")
+
+// What a closure sharing a park's waker is told: not to hold it as a '&sync Fn', which neither
+// 'park' nor 'step' would take, but where the waker belongs.
+private tdx_waker_refusal(name: string) -> string =
+    "a closure shared between two domains may be called from either, so every count it captures has " +
+    s"to be atomic — but the '$name' it captures is the waker 'park' handed its registrar, a " +
+    "'&Fn() -> unit' belonging to the domain whose executor steps the task, and no spelling makes it " +
+    "atomic. Keep the waker in that domain: let the other domain — an interrupt, another thread — " +
+    "signal the executor, and have the executor call the waker"
+
+@test("a waker captured again inside the registrar is still the executor's")
+tdx_registrar_waker_captured_twice()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(raw"""
+        @crossing(f)
+        later(f: &sync Fn() -> unit) = ()
+
+        async waits() -> int
+            await park(w ->
+                val again = () -> later(() -> w())
+                again())
+            1
+
+        print(block_on(waits()))
+        """), tdx_waker_refusal("w"), "6:33")
+
+@test("an ordinary '&Fn' captured beside a registrar keeps the '&sync' advice")
+tdx_registrar_other_capture_keeps_the_advice()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(raw"""
+        @crossing(f)
+        later(f: &sync Fn() -> unit) = ()
+
+        async waits(g: &Fn() -> unit) -> int
+            await park(w -> later(() -> g()))
+            1
+
+        print(block_on(waits(() -> ())))
         """), "a closure shared between two domains may be called from either, so every count it " +
-        "captures has to be atomic — but the 'w' it captures reaches a '&Fn() -> unit', whose count is " +
+        "captures has to be atomic — but the 'g' it captures reaches a '&Fn() -> unit', whose count is " +
         "not. Hold it as a '&sync Fn() -> unit' ('06')", "5:27")
 
 // -- a task that really crosses ------------------------------------------------------------------------

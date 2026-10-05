@@ -308,7 +308,13 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     params.push((inner.bind("self", self_ty), self_ty))
 
     for i in 0..<names.len()
-        params.push((inner.bind(names.at(i), ptypes.at(i)), ptypes.at(i)))
+        val unique = inner.bind(names.at(i), ptypes.at(i))
+
+        params.push((unique, ptypes.at(i)))
+
+        // The registrar a `park` was handed takes the task's waker as its one parameter.
+        if cx.reading_registrar && names.len() == 1 && type_eq(ptypes.at(i), waker_type(cx))
+            inner.wakers.push(unique)
 
     for i in 0..<captured.len()
         val stored = st.fields.at(i).1
@@ -320,6 +326,9 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
         // A by-name parameter captured is still one: the field holds the callable, and a read of
         // the name calls it.
         if reads_by_name(cx, captured.at(i)) then inner.by_name.push(unique)
+
+        // So is a waker: captured, it is still the executor's.
+        if holds_waker(cx, captured.at(i)) then inner.wakers.push(unique)
 
         inner.captured.push((unique, read))
 

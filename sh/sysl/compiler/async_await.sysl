@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.text.Search
 
 // `async` and `await`, as far as the front end goes: what an async function's call hands back,
 // where an `await` may stand, and what it may wait for.
@@ -106,8 +107,43 @@ await_expr(cx: &Analyzer, span: Span, inner: Expr) -> TExpr
     task_result(ty) match
         Some(r) -> TExpr(span, TAwait(t, r))
         None -> cx.err(inner.span, s"'await' needs a Task, which is what calling an 'async' " +
-                       s"function hands back, but this value is ${type_show(ty)}")
+                       s"function hands back, but this value is ${type_show(ty)}" +
+                       shadowed_form(cx, inner))
 end await_expr
+
+// Where an awaited call names a task form a declaration has taken the name of, what the call
+// reached instead -- or nothing. **A declaration the program can see is the nearer name**, which is
+// the rule, so `import sysl.posix.threads.*` makes `yield_now()` the thread's: the refusal that
+// follows is about a `bool`, and without this it never says where the `bool` came from.
+private shadowed_form(cx: &Analyzer, inner: Expr) -> string
+    val name = *inner.kind match
+        Call(callee, _) -> *callee.kind match
+            Ident(n) -> n
+            _ -> ""
+        _ -> ""
+
+    if name != "yield_now" && name != "park" then return ""
+
+    var from = "a local binding"
+    var kind = "binding"
+
+    if cx.lookup(name).is_none()
+        kind = "declaration"
+
+        val keys = function_keys(cx, name)
+
+        if keys.is_empty() then return ""
+
+        val decl = qualified_name(keys.at(0))
+        val cut = decl.bytes.len - name.bytes.len
+
+        from = if cut > 1 && decl.ends_with(s".$name") then s"'$decl', declared in '${decl[0..<cut - 1]}'"
+        else "the program's own declaration"
+    end if
+
+    s" — the '$name' called here resolved to $from, and a $kind of that name stands in front of the " +
+    s"task form '$name(…)', so the task form is shadowed"
+end shadowed_form
 
 // -- the forms the compiler supplies ---------------------------------------------------------------
 //
@@ -245,7 +281,13 @@ private park_task(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
                       supplied(args.len(), "argument"))
 
     val want = registrar_type(cx)
+    val before = cx.reading_registrar
+
+    cx.reading_registrar = true
+
     val r = read_callable(cx, args.at(0), want)
+
+    cx.reading_registrar = before
 
     if texpr_type(r) == Unknown then return bad_expr(span)
 
@@ -256,6 +298,46 @@ private park_task(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
 
     TExpr(span, TPark(r))
 end park_task
+
+// Whether `name`, read here, holds the waker a `park` handed its registrar.
+holds_waker(cx: &Analyzer, name: string) -> bool
+    val l = cx.lookup(name)
+
+    if l.is_none() then return false
+
+    val unique = l.unwrap().unique
+
+    for i in 0..<cx.wakers.len()
+        if cx.wakers.at(i) == unique then return true
+
+    false
+end holds_waker
+
+// Why a closure erased into a `&sync Fn` may not capture what it captured, where what is in the way
+// is a waker -- or nothing, leaving the ordinary refusal.
+//
+// **The ordinary refusal's advice cannot be taken here.** It says to hold the capture as a `&sync`
+// reference, but `park` hands its registrar a `&Fn() -> unit` and `step` refuses a `&sync` waker,
+// so nothing the program writes makes this one atomic. What is true instead is where the waker
+// belongs: to the executor stepping the task, which is the one to call it.
+waker_capture_complaint(cx: &Analyzer, inner: Type) -> Option[string]
+    if !is_closure_literal(inner) then return None
+
+    val part = unshareable(inner)
+
+    if part.is_none() then return None
+
+    val p = part.unwrap()
+
+    if p.path.len() != 1 || !holds_waker(cx, p.path.at(0)) then return None
+
+    Some("a closure shared between two domains may be called from either, so every count it " +
+         s"captures has to be atomic — but the '${p.path.at(0)}' it captures is the waker 'park' " +
+         s"handed its registrar, a '${type_show(p.ty)}' belonging to the domain whose executor " +
+         "steps the task, and no spelling makes it atomic. Keep the waker in that domain: let the " +
+         "other domain — an interrupt, another thread — signal the executor, and have the executor " +
+         "call the waker")
+end waker_capture_complaint
 
 // What a mismatch adds where a `Task[T]` stands where its `T` was wanted: the `await` left out. Each
 // position keeps its own sentence -- it names the parameter, the binding, the result -- and this is
