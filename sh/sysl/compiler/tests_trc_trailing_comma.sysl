@@ -1,0 +1,197 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+
+// **A comma-separated list may end in a comma.** Every such list in sysl is bracketed, and a bracket
+// suspends the off-side rule (`reference/lexical.md § Brackets suspend the rule`), so a list has
+// always been free to span lines; the trailing comma is what makes one element to a line worth
+// writing, the last line no longer being special.
+//
+// The rule is that the comma is optional AFTER an element and never stands instead of one, so the
+// refusals at the end are as much the claim as the programs that run. **Every output and every
+// refusal here was obtained by running the reference compiler (0.0.162) on the same source.**
+
+private trc_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end trc_ready
+
+// What a tree of files PRINTS, or what the build had to say about it. The project ROOT is what is
+// built, so an import names a module the tree declares.
+private trc_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end trc_out
+
+private trc_ran(text: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", text))
+    trc_out(fs)
+
+// ---- a list may end in a comma ----
+
+@test("an array literal takes a trailing comma")
+trc_an_array_literal()
+    if !trc_ready() then return
+
+    assert_eq(trc_ran("var a = [1, 2, 3,]\nprint(a[0], a[2])\n"), "1 3\n")
+
+@test("an array literal written one element to a line")
+trc_an_array_literal_one_element_to_a_line()
+    if !trc_ready() then return
+
+    assert_eq(trc_ran(raw"""
+        var a = [
+            10,
+            20,
+            30,
+        ]
+        print(a[0] + a[1] + a[2])
+        """), "60\n")
+
+@test("a call's arguments take a trailing comma")
+trc_a_calls_arguments()
+    if !trc_ready() then return
+
+    assert_eq(trc_ran("print(1, 2,)\n"), "1 2\n")
+
+@test("a parameter list takes a trailing comma")
+trc_a_parameter_list()
+    if !trc_ready() then return
+
+    assert_eq(trc_ran("f(a: int, b: int,) -> int = a + b\nprint(f(20, 22,))\n"), "42\n")
+
+@test("a method's parameters take one, with and without a receiver")
+trc_a_methods_parameters()
+    if !trc_ready() then return
+
+    assert_eq(trc_ran(raw"""
+        struct P
+            x: int
+            y: int
+            sum(self, k: int,) -> int = self.x + self.y + k
+            of(a: int, b: int,) -> P = P(a, b)
+        var p = P.of(1, 2,)
+        print(p.sum(39,))
+        """), "42\n")
+
+@test("a type-argument list takes a trailing comma")
+trc_a_type_argument_list()
+    if !trc_ready() then return
+
+    assert_eq(trc_ran("import sysl.buf.*\n\nvar b: &Buf[int,] = buf()\nb.push(7)\nprint(b.at(0))\n"), "7\n")
+
+@test("a type-parameter list takes a trailing comma")
+trc_a_type_parameter_list()
+    if !trc_ready() then return
+
+    assert_eq(trc_ran("first[T, U,](a: T, b: U) -> T = a\nprint(first(1, \"x\"))\n"), "1\n")
+
+@test("an enum variant's payload takes one, and so does a pattern that takes it apart")
+trc_an_enum_variants_payload_and_its_pattern()
+    if !trc_ready() then return
+
+    assert_eq(trc_ran(raw"""
+        enum Shape
+            Rect(w: int, h: int,)
+            Dot
+        var s = Rect(6, 7,)
+        var a = s match
+            Rect(w, h,) -> w * h
+            Dot -> 0
+        print(a)
+        """), "42\n")
+
+@test("an import selector list takes a trailing comma")
+trc_an_import_selector_list()
+    if !trc_ready() then return
+
+    var fs = im_files()
+
+    fs.push(("isa", "isa.sysl", "module isa\n\nwidth() -> int = 6\nheight() -> int = 7\n"))
+    fs.push(("", "main.sysl", "import isa.{width, height,}\n\nprint(width() * height())"))
+    assert_eq(trc_out(fs), "42\n")
+
+// The variadic marker still reads the comma before it as the separator it is, so the two features
+// do not collide.
+@test("a variadic parameter list is unaffected by the trailing comma")
+trc_a_variadic_parameter_list()
+    if !trc_ready() then return
+
+    assert_eq(trc_ran("f(n: int, ...) -> int = n\nprint(f(42, 1, 2))\n"), "42\n")
+
+// ---- the comma follows an element, it does not replace one ----
+
+@test("an empty array literal with a comma in it is refused")
+trc_an_empty_list_with_a_comma()
+    assert_eq(pf_err("var a = [,]\n"), "']' expected")
+    assert_eq(pf_at("var a = [,]\n"), "1:10")
+
+// The reference answers `'=' expected` at 2:1 here: it reads `print(,)` as a function declaration,
+// accepting `(,)` as a parameter list (`f(,) -> int = 1` compiles there), and complains only that no
+// body follows. The comma stands instead of a parameter, so this compiler refuses the call where the
+// comma is, in the words the reference uses for `g(,)` on an assignment's right.
+@test("an empty argument list with a comma in it is refused")
+trc_an_empty_argument_list_with_a_comma()
+    assert_eq(pf_err("print(,)\n"), "')' expected")
+    assert_eq(pf_at("print(,)\n"), "1:7")
+    assert_eq(pf_err("val x = g(,)\n"), "')' expected")
+    assert_eq(pf_at("val x = g(,)\n"), "1:11")
+    assert_eq(pf_err("print(1,,)\n"), "')' expected")
+    assert_eq(pf_at("print(1,,)\n"), "1:9")
+
+// The parameter-list half of the case above: a comma where the first parameter should be. The
+// reference diverges -- it compiles this and prints 1 -- against its own suite's rule that the
+// comma is optional after an element and never instead of one.
+@test("a parameter list made of a comma is refused")
+trc_a_parameter_list_made_of_a_comma()
+    assert_eq(pf_err("f(,) -> int = 1\nprint(f())\n"), "')' expected")
+    assert_eq(pf_at("f(,) -> int = 1\nprint(f())\n"), "1:3")
+
+@test("two commas in a row are refused")
+trc_two_commas_in_a_row()
+    assert_eq(pf_err("var a = [1,, 2]\n"), "']' expected")
+    assert_eq(pf_at("var a = [1,, 2]\n"), "1:12")
+    assert_eq(pf_err("var a = [1, 2,,]\n"), "']' expected")
+    assert_eq(pf_at("var a = [1, 2,,]\n"), "1:15")
+
+@test("a leading comma is refused")
+trc_a_leading_comma()
+    assert_eq(pf_err("var a = [, 1]\n"), "']' expected")
+    assert_eq(pf_at("var a = [, 1]\n"), "1:10")
+
+// An empty list is still an empty list -- the trailing comma adds nothing there.
+@test("an empty list is unchanged by the trailing comma")
+trc_an_empty_list_is_unchanged()
+    if !trc_ready() then return
+
+    assert_eq(trc_ran("var a: [0]int = []\nprint(a.len)\n"), "0\n")

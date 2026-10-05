@@ -413,7 +413,9 @@ sanitizer_attrs(flags: Buf[string]) -> Buf[string]
     out
 end sanitizer_attrs
 
-// The IR with every function marked for the sanitizers `SYSL_EXTRA_CFLAGS` asked for.
+// The IR with every definition marked with `attrs` as one attribute group -- by default the sanitizers
+// `SYSL_EXTRA_CFLAGS` asked for; `for_clang` hands it `function_attributes`, which puts `nounwind`
+// and the target's unwind table in front of them.
 //
 // **LLVM instruments only functions carrying the right attribute, and it is a *frontend* that adds
 // one** -- so IR handed to clang as a `.ll` links against the sanitizer's runtime and is instrumented
@@ -441,10 +443,83 @@ sanitized(ir: string, attrs: Buf[string] = sanitizer_attrs(extra_cflags())) -> s
     b.finish()
 end sanitized
 
-// One line of a module, with a definition's opening brace preceded by the sanitizer group.
-private marked_line(line: string) -> string =
-    if line.starts_with("define ") && line.ends_with(" {") then line[0..<(line.bytes.len - 1)] + "#99 {"
-    else line
+// One line of a module, with a definition's attributes followed by the group.
+//
+// **The group is a function attribute, so it goes where the attributes end, and that is before a
+// `section`** -- LLVM refuses `section "x" #99 {` with "expected '{' in function body". A definition
+// with no section takes it in front of its opening brace.
+private marked_line(line: string) -> string
+    if !line.starts_with("define ") || !line.ends_with(" {") then return line
+
+    val at = last_section(line) match
+        Some(i) -> i
+        None -> line.bytes.len - 1
+
+    line[0..<at] + "#99 " + line[at..<line.bytes.len]
+end marked_line
+
+// Where the ` section "` of a definition line begins, past its leading space, or nothing. The last
+// one is taken, since a section is the final thing before the brace and a parameter's type cannot
+// spell one.
+private last_section(line: string) -> Option[usize]
+    val word = " section \""
+    var found: Option[usize] = None
+
+    for i in 0..<line.bytes.len
+        if bytes_at(line, i, word) then found = Some(i + 1)
+
+    found
+end last_section
+
+// The LLVM function attributes every function sysl DEFINES carries on `t`, before any sanitizer's.
+//
+// **`nounwind` everywhere, because sysl has no exceptions**: nothing unwinds through a sysl frame --
+// a failed check and `panic` end the process, and the test runner reads a child's exit status. Left
+// off, a bare-metal Arm build gives every function an EHABI entry naming `__aeabi_unwind_cpp_pr0`,
+// and that one reference links libgcc's C++ unwinder, `abort`, `signal` and newlib's stdio into a
+// firmware image none of it can ever run in.
+//
+// **`uwtable` is clang's per-triple choice, read off `clang -O2 -S -emit-llvm` for each row** -- a
+// table is still wanted where a debugger, a profiler or a crash reporter walks the stack, which is
+// every hosted system and, as clang has it, `x86_64-unknown-none-elf`. Its absence on the other
+// freestanding rows is what lets Arm mark a function `.cantunwind`. `tests_nuw_nounwind.sysl` holds
+// the table against clang's answers.
+function_attributes(t: Target, flags: Buf[string] = extra_cflags()) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("nounwind")
+
+    unwind_table(t) match
+        Some(u) -> out.push(u)
+        None -> ()
+
+    val sanitizers = sanitizer_attrs(flags)
+
+    for i in 0..<sanitizers.len()
+        out.push(sanitizers.at(i))
+
+    out
+end function_attributes
+
+// The `uwtable` attribute clang gives a function on `t`, or nothing where it gives none. `sync` on
+// Apple's arm64, whose compact unwind needs only call-site accuracy; the plain (asynchronous) form
+// elsewhere.
+unwind_table(t: Target) -> Option[string] = t.triple match
+    "arm64-apple-macosx" -> Some("uwtable(sync)")
+    "x86_64-apple-macosx" -> Some("uwtable")
+    "aarch64-unknown-linux-gnu" -> Some("uwtable")
+    "x86_64-unknown-linux-gnu" -> Some("uwtable")
+    "riscv64-unknown-linux-gnu" -> Some("uwtable")
+    "x86_64-pc-windows-msvc" -> Some("uwtable")
+    "aarch64-linux-android24" -> Some("uwtable")
+    "x86_64-unknown-none-elf" -> Some("uwtable")
+    "i386-unknown-linux-gnu" -> Some("uwtable")
+    _ -> None
+
+// The text clang is handed for a module built for `t`: every definition marked with the function
+// attributes. Wherever IR is written for clang it goes through here, and `emit-llvm` prints it, so a
+// reader sees exactly what was compiled.
+for_clang(ir: string, t: Target) -> string = sanitized(ir, function_attributes(t))
 
 private split_on_space(text: string) -> Buf[string]
     var out: Buf[string] = buf()
@@ -680,7 +755,7 @@ compile_object(cc: string, ir: string, obj: string, target: Target,
                level: string, lto: Option[string] = None) -> Result[unit, string]
     val ll = s"$obj.ll"
 
-    write_text(ll, sanitized(for_clang(cc, ir))) match
+    write_text(ll, in_coro_dialect(cc, for_clang(ir, target))) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 
@@ -827,7 +902,7 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
 
     val ll = s"$exe.ll"
 
-    write_text(ll, sanitized(for_clang(cc, ir))) match
+    write_text(ll, in_coro_dialect(cc, for_clang(ir, target))) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 

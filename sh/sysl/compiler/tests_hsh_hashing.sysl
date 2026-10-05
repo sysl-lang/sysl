@@ -1,0 +1,210 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, write_text}
+import sysl.text.Search
+
+// The content hash `sysl.sum` is written in (`reference/packages.md § sysl.sum`).
+//
+// Two things are pinned here and they are pinned separately, because they fail separately. The
+// **wiring** -- that what comes back really is SHA-256 -- is held to the published vectors, so a
+// platform whose utility printed something else, or printed it in another column, is caught by a
+// number nobody here chose. The **definition** -- what a tree hashes to -- is held to a constant
+// computed by hand from the two commands the listing describes, so that a `sysl.sum` written today
+// still verifies whatever computes the digest later.
+
+private val hsh_empty: string = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+private val hsh_abc: string = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+// Computed by hand, and reproducible by hand:
+//
+//     shasum -a 256 a.sysl sub/b.sysl | shasum -a 256
+//
+// with `a.sysl` holding "one\n" and `sub/b.sysl` holding "two\n". If this constant ever has to
+// change, something about the *definition* changed, and every `sysl.sum` in existence stopped
+// verifying. That is what it is here to make loud.
+private val hsh_known: string = "sha256:318922b4f287252c897a51afc023ee780d60abf62d60977e4cac7b060b5eea70"
+
+private hsh_file_of(text: string) -> string
+    val dir = make_temp_dir("sysl-hash-").unwrap()
+    val file = s"$dir/f"
+
+    write_text(file, text).unwrap()
+    file
+end hsh_file_of
+
+private hsh_digest(text: string) -> string
+    var paths: Buf[string] = buf()
+
+    paths.push(hsh_file_of(text))
+
+    val got = digests_of(paths).unwrap()
+
+    assert_eq(got.len(), 1)
+    got.at(0)
+end hsh_digest
+
+// A file written under `root` at a relative path, its directories made first -- which is what a
+// fetched package is.
+private hsh_put(root: string, rel: string, text: string)
+    rel.last_index_of("/") match
+        Some(i) -> make_dir_all(s"$root/${rel[0..<i]}").unwrap()
+        None -> ()
+
+    write_text(s"$root/$rel", text).unwrap()
+
+private hsh_tree() -> string = make_temp_dir("sysl-hash-tree-").unwrap()
+
+// The tree of the known constant, its files written in the order given.
+private hsh_known_tree(b_first: bool) -> string
+    val root = hsh_tree()
+
+    if b_first then hsh_put(root, "sub/b.sysl", "two\n")
+
+    hsh_put(root, "a.sysl", "one\n")
+
+    if !b_first then hsh_put(root, "sub/b.sysl", "two\n")
+
+    root
+end hsh_known_tree
+
+private hsh_one_file(rel: string, text: string) -> string
+    val root = hsh_tree()
+
+    hsh_put(root, rel, text)
+    root
+
+private hsh_of(root: string) -> string = tree_hash(root).unwrap()
+
+// -- the digest really is SHA-256 -------------------------------------------------------------------
+
+// FIPS 180-4's own two, which is the point: neither number was chosen here, so a utility that
+// answered with anything else -- a different algorithm, a different column of its output -- cannot
+// agree with them by accident.
+@test("the empty input")
+hsh_the_empty_input()
+    assert_eq(hsh_digest(""), hsh_empty)
+
+@test("'abc'")
+hsh_abc_vector()
+    assert_eq(hsh_digest("abc"), hsh_abc)
+
+// -- many files at once -----------------------------------------------------------------------------
+
+// Whether a batch boundary can disturb the answer: the digests come back by position, so a call that
+// lost or reordered a line would pair every digest after it with the wrong file. Alternating two
+// known contents across the boundary makes that visible -- a slip of one turns every later pair over.
+@test("are answered in the order they were asked, across the batch boundary")
+hsh_in_order_across_the_batch_boundary()
+    var paths: Buf[string] = buf()
+
+    for i in 0..<600
+        paths.push(hsh_file_of(if i % 2 == 0 then "abc" else ""))
+
+    val digests = digests_of(paths).unwrap()
+
+    assert_eq(digests.len(), 600)
+
+    for i in 0..<digests.len()
+        assert_eq(digests.at(i), if i % 2 == 0 then hsh_abc else hsh_empty)
+end hsh_in_order_across_the_batch_boundary
+
+@test("no files at all is no digests, and no process")
+hsh_no_files_no_digests()
+    var none: Buf[string] = buf()
+
+    assert(digests_of(none).unwrap().is_empty(), "no digests")
+
+// -- the tree hash is the definition, not whatever the utility printed ------------------------------
+
+@test("a known tree hashes to a known number")
+hsh_a_known_tree()
+    assert_eq(hsh_of(hsh_known_tree(false)), hsh_known)
+
+@test("the same content unpacked somewhere else hashes the same")
+hsh_unpacked_elsewhere()
+    val here = hsh_known_tree(false)
+    val there = hsh_known_tree(false)
+
+    assert_eq(hsh_of(here), hsh_of(there))
+    assert(here != there, "two roots")
+
+// The listing is sorted by relative path rather than by the order a directory happened to be read
+// in, so the walk's own order cannot reach the answer.
+@test("the order the files were written in does not reach it")
+hsh_write_order()
+    assert_eq(hsh_of(hsh_known_tree(true)), hsh_known)
+
+// -- what changes the hash, and what does not -------------------------------------------------------
+
+@test("a changed byte")
+hsh_a_changed_byte()
+    assert(hsh_of(hsh_one_file("a.sysl", "one\n")) != hsh_of(hsh_one_file("a.sysl", "one")), "moved")
+
+// The path is in the listing beside the digest, so a file moved is a different tree even though every
+// byte of content is the same.
+@test("a file moved to another path, with its content untouched")
+hsh_a_file_moved()
+    assert(hsh_of(hsh_one_file("a.sysl", "one\n")) != hsh_of(hsh_one_file("sub/a.sysl", "one\n")),
+           "moved")
+
+// Two clones of one commit differ here -- packing, timestamps, remote names -- so a hash that included
+// it would depend on how the package was fetched rather than on what was fetched.
+@test("the repository's own bookkeeping")
+hsh_the_repositorys_bookkeeping()
+    val bare = hsh_one_file("a.sysl", "one\n")
+    val cloned = hsh_one_file("a.sysl", "one\n")
+
+    hsh_put(cloned, ".git/HEAD", "ref: refs/heads/main\n")
+    hsh_put(cloned, ".git/objects/ab/cdef", "whatever")
+    assert_eq(hsh_of(cloned), hsh_of(bare))
+end hsh_the_repositorys_bookkeeping
+
+// The hash covers what the package *is*, not the part of it a compiler happens to parse: a package's
+// C is compiled and linked into whoever depends on it, so a listing that took only `.sysl` would let
+// a shim be swapped under a `sysl.sum` that still verified.
+@test("a C file beside the sysl, which is as much of the package as the sysl is")
+hsh_a_c_file_counts()
+    val one = hsh_one_file("a.sysl", "one\n")
+    val two = hsh_one_file("a.sysl", "one\n")
+
+    hsh_put(one, "shim.c", "int f(void) { return 1; }\n")
+    hsh_put(two, "shim.c", "int f(void) { return 2; }\n")
+    assert(hsh_of(one) != hsh_of(two), "the C is in the hash")
+
+// Nor is it a list of extensions that C was added to: anything under the root is in.
+@test("and a file of no kind the compiler knows at all")
+hsh_any_file_counts()
+    val bare = hsh_one_file("a.sysl", "one\n")
+    val noticed = hsh_one_file("a.sysl", "one\n")
+
+    hsh_put(noticed, "NOTICE", "x\n")
+    assert(hsh_of(noticed) != hsh_of(bare), "NOTICE is in the hash")
+
+@test("a `.git` further down, which is a submodule's and is not this package's either")
+hsh_a_nested_git()
+    val bare = hsh_known_tree(false)
+    val nested = hsh_known_tree(false)
+
+    hsh_put(nested, "sub/.git/HEAD", "x\n")
+    assert_eq(hsh_of(nested), hsh_of(bare))
+
+// -- the edges ---------------------------------------------------------------------------------------
+
+@test("a name that would break the listing is refused rather than escaped")
+hsh_a_newline_in_a_name()
+    val root = hsh_one_file("a.sysl", "one\n")
+
+    write_text(s"$root/two\nlines.sysl", "x").unwrap()
+
+    tree_hash(root) match
+        Err(e) -> assert(e.contains("may not hold a newline"), e)
+        Ok(h) -> assert(false, s"expected a refusal, got $h")
+end hsh_a_newline_in_a_name
+
+@test("a path is spelled relative to the package root")
+hsh_relative_to_the_root()
+    assert_eq(relative_to("/tmp/pkg", "/tmp/pkg/a.sysl"), "a.sysl")
+    assert_eq(relative_to("/tmp/pkg/", "/tmp/pkg/sub/b.sysl"), "sub/b.sysl")
+    assert_eq(relative_to("/tmp/pkg", "/tmp/pkg"), "/tmp/pkg")

@@ -417,8 +417,17 @@ private parse_paren_tail(p: *Parser, at: Span) -> Expr
 end parse_paren_tail
 
 // `[a, b]`, `[v; n]` and the empty literal, whose element type comes from the context.
+//
+// **A comma follows an element and never stands in for one**, so a comma where an element should
+// be -- `[,]`, `[, 1]`, `[1,, 2]` -- is the list having ended without its `]`, which is the
+// reference's reading and its words.
 private parse_array_literal(p: *Parser, at: Span) -> Expr
     if p.accept_kw("]") then return expr(at.to(p.just_taken()), ArrayLit(buf()))
+
+    if p.at_kw(",")
+        p.expect_kw("]")
+        return expr(at.to(p.just_taken()), Bad)
+    end if
 
     val first = parse_expr(p)
 
@@ -435,7 +444,7 @@ private parse_array_literal(p: *Parser, at: Span) -> Expr
 
     loop
         if !p.accept_kw(",") then break
-        if p.at_kw("]") then break
+        if p.at_kw("]") || p.at_kw(",") then break
 
         items.push(parse_expr(p))
 
@@ -646,16 +655,17 @@ private refuse_inclusive_eq(p: *Parser, at: Span)
     p.fault(at, "'..=' is not a range \u{2014} inclusive is 'a..b' and exclusive is 'a..<b'")
     p.bump()
 
-// `f(a, b)`, with the trailing block a call may write after it.
+// `f(a, b)`, with the trailing block a call may write after it. A comma where an argument should be
+// ends the list, so `f(,)` and `f(1,, 2)` are told the `)` is missing, as the reference tells them.
 private led_call(lhs: Expr, p: *Parser) -> Expr
     var args: Buf[Expr] = buf()
 
-    if !p.at_kw(")")
+    if !p.at_kw(")") && !p.at_kw(",")
         loop
             args.push(parse_argument(p))
 
             if !p.accept_kw(",") then break
-            if p.at_kw(")") then break
+            if p.at_kw(")") || p.at_kw(",") then break
 
     p.expect_kw(")")
 

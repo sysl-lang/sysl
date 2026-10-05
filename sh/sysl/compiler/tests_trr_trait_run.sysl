@@ -1,0 +1,475 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The run-time behaviour of traits (`reference/traits.md`). An `impl` method lowers to the same
+// member function a method written in the type's body would, so a trait call runs like any other
+// member call: these confirm each receiver mode, several traits and types together, bounded generics
+// dispatching statically, an `impl` for a built-in type, and that declaration order does not matter.
+//
+// **Every output quoted here was read out of the reference compiler** (0.0.162), whose
+// `TraitRunTests` these are.
+
+private var trr_library_cache: Buf[Program] = buf()
+private var trr_library_read: bool = false
+
+private trr_library() -> Buf[Program]
+    if trr_library_read then return trr_library_cache
+
+    trr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> trr_library_cache = units
+
+    trr_library_cache
+end trr_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private trr_ready() -> bool
+    if trr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end trr_ready
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private trr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-trait-run").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end trr_ran
+
+// -- the receiver modes -------------------------------------------------------------------------
+
+@test("a value-receiver trait method runs on the implementing type")
+trr_a_value_receiver_method_runs()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Area
+            area(self) -> int
+        struct Rect
+            w: int
+            h: int
+        impl Area for Rect
+            area(self) -> int = self.w * self.h
+        var r = Rect(3, 4)
+        print(r.area())
+        """), "12\n")
+
+@test("a pointer-receiver trait method mutates the instance in place")
+trr_a_pointer_receiver_method_mutates_in_place()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Bumpable
+            bump(*self, by: int)
+        struct Counter
+            n: int
+        impl Bumpable for Counter
+            bump(*self, by: int)
+                self.n += by
+        var c = Counter(10)
+        c.bump(5)
+        c.bump(7)
+        print(c.n)
+        """), "22\n")
+
+@test("a reference-receiver trait method mutates the shared heap object")
+trr_a_reference_receiver_method_mutates_the_heap_object()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Ticker
+            tick(&self)
+            value(self) -> int
+        struct Clock
+            t: int
+        impl Ticker for Clock
+            tick(&self)
+                self.t += 1
+            value(self) -> int = self.t
+        var c: &Clock = Clock(0)
+        c.tick()
+        c.tick()
+        c.tick()
+        print(c.value())
+        """), "3\n")
+
+// -- several traits, several types ---------------------------------------------------------------
+
+// Two types implement one trait; the method called on each is that type's own impl, so the two
+// results must differ — a coincidence of names could not produce 12 and 22.
+@test("two types implementing one trait each dispatch to their own impl")
+trr_two_types_each_dispatch_to_their_own_impl()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Area
+            area(self) -> int
+        struct Rect
+            w: int
+            h: int
+        struct Box
+            w: int
+            h: int
+            d: int
+        impl Area for Rect
+            area(self) -> int = self.w * self.h
+        impl Area for Box
+            area(self) -> int = 2 * (self.w * self.h + self.w * self.d + self.h * self.d)
+        var r = Rect(3, 4)
+        var b = Box(1, 2, 3)
+        print(r.area(), b.area())
+        """), "12 22\n")
+
+// One type implements two different traits; both methods are reachable on the same value and read
+// different fields, so neither can be standing in for the other.
+@test("one type implementing two traits exposes both methods")
+trr_one_type_two_traits_exposes_both()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Named
+            name(self) -> string
+        trait Aged
+            age(self) -> int
+        struct Person
+            who: string
+            years: int
+        impl Named for Person
+            name(self) -> string = self.who
+        impl Aged for Person
+            age(self) -> int = self.years
+        var p = Person("Ada", 36)
+        print(p.name())
+        print(p.age())
+        """), "Ada\n36\n")
+
+// A trait method takes an ordinary parameter alongside self, and its body calls another impl method
+// on self — so the lowered function resolves a further member call, not just field reads.
+@test("a trait method takes parameters and calls another method on self")
+trr_a_method_takes_parameters_and_calls_another()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Scale
+            unit(self) -> int
+            scaled(self, factor: int) -> int
+        struct Ruler
+            base: int
+        impl Scale for Ruler
+            unit(self) -> int = self.base
+            scaled(self, factor: int) -> int = self.unit() * factor
+        var r = Ruler(7)
+        print(r.scaled(6))
+        """), "42\n")
+
+// Declarations are hoisted, so an impl written before either the trait or the struct it names still
+// resolves. The value it computes proves the impl was wired up, not merely parsed.
+@test("an impl may appear before the trait and struct it names")
+trr_an_impl_may_precede_its_trait_and_struct()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        impl Doubler for Cell
+            double(self) -> int = self.v * 2
+        trait Doubler
+            double(self) -> int
+        struct Cell
+            v: int
+        var c = Cell(21)
+        print(c.double())
+        """), "42\n")
+
+// An impl method lowers to the same function a hand-written member does, so its counting must match:
+// a `&self` trait method returning a `&T` field hands out the reference the receiver holds, retained
+// so it outlives the receiver dropped when `extract` returns. Over a long loop each `Inner` is freed
+// exactly once — a leak grows the resident set, a double free crashes. The total is the sum of
+// `i % 4`, 750000.
+@test("a &self trait method returning a &T field neither leaks nor frees twice")
+trr_a_ref_self_method_returning_a_ref_field_counts_correctly()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Peek
+            peek(&self) -> &Inner
+        struct Inner
+            v: int
+        struct Outer
+            inner: &Inner
+        impl Peek for Outer
+            peek(&self) -> &Inner = self.inner
+        extract(seed: int) -> &Inner
+            var o: &Outer = Outer(Inner(seed))
+            o.peek()
+        var i = 0
+        var total = 0
+        while i < 500000
+            var got = extract(i % 4)
+            total += got.v
+            i++
+        print(total)
+        """), "750000\n")
+
+// A free function taking a concrete type still calls a trait method on it — the method is an
+// ordinary member, so it works in any context a hand-written method would.
+@test("a trait method is callable from an ordinary function")
+trr_a_trait_method_is_callable_from_an_ordinary_function()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Length
+            length(self) -> int
+        struct Word
+            n: int
+        impl Length for Word
+            length(self) -> int = self.n
+        total(a: Word, b: Word) -> int = a.length() + b.length()
+        print(total(Word(3), Word(4)))
+        """), "7\n")
+
+// -- bounded generics ----------------------------------------------------------------------------
+
+// A generic bounded by a trait dispatches statically: it is monomorphized once per concrete type, and
+// each copy calls that type's own impl. Two types compute different values through the same bound,
+// so the copies are genuinely distinct.
+@test("a trait-bounded generic dispatches to each concrete type's impl")
+trr_a_bounded_generic_dispatches_per_type()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Doubler
+            double(self) -> int
+        struct Cell
+            v: int
+        struct Twin
+            a: int
+            b: int
+        impl Doubler for Cell
+            double(self) -> int = self.v * 2
+        impl Doubler for Twin
+            double(self) -> int = self.a + self.b
+        apply[T: Doubler](x: T) -> int = x.double()
+        print(apply(Cell(21)))
+        print(apply(Twin(10, 15)))
+        """), "42\n25\n")
+
+// A multi-bound parameter may use a method from either trait it names; the two results read different
+// fields, so neither stands in for the other.
+@test("a multi-bound generic may call methods from every trait in the bound")
+trr_a_multi_bound_generic_calls_every_trait()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Named
+            name(self) -> string
+        trait Aged
+            age(self) -> int
+        struct Person
+            who: string
+            years: int
+        impl Named for Person
+            name(self) -> string = self.who
+        impl Aged for Person
+            age(self) -> int = self.years
+        label[T: Named + Aged](x: T) -> string = x.name()
+        tally[T: Named + Aged](x: T) -> int = x.age()
+        var p = Person("Ada", 36)
+        print(label(p))
+        print(tally(p))
+        """), "Ada\n36\n")
+
+// A bounded generic may forward its own type parameter to another bounded generic: when the outer is
+// monomorphized at a concrete type the inner call is checked against that same type, so the bounds
+// compose and the innermost impl is what finally runs.
+@test("a bounded generic forwards its type parameter into another bounded generic")
+trr_a_bounded_generic_forwards_its_parameter()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Show
+            show(self) -> string
+        struct Tag
+            label: string
+        impl Show for Tag
+            show(self) -> string = self.label
+        inner[U: Show](y: U) -> string = y.show()
+        outer[T: Show](x: T) -> string = inner(x)
+        print(outer(Tag("hi")))
+        """), "hi\n")
+
+// A bound threads through a reference receiver: the parameter is `&T`, `T` is inferred from the
+// argument's `&Clock`, and the bound's mutating `&self` method drives the shared heap object.
+@test("a trait-bounded generic works over a reference receiver")
+trr_a_bounded_generic_over_a_reference_receiver()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Ticker
+            tick(&self)
+            value(self) -> int
+        struct Clock
+            t: int
+        impl Ticker for Clock
+            tick(&self)
+                self.t += 1
+            value(self) -> int = self.t
+        run3[T: Ticker](c: &T) -> int
+            c.tick()
+            c.tick()
+            c.tick()
+            c.value()
+        var c: &Clock = Clock(0)
+        print(run3(c))
+        """), "3\n")
+
+// -- traits over the built-in types --------------------------------------------------------------
+
+// A trait may be implemented for a built-in type, not only a struct or an enum: every type has an
+// owner key its members are filed under, so `5.show()` takes the same path `p.show()` does. This is
+// a `Show` implemented for each built-in, as a preamble the tests below build on.
+private trr_show_builtins() -> string = raw"""
+    trait Show
+        show(self) -> string
+    impl Show for int
+        show(self) -> string = if self == 0 then "zero" else "an int"
+    impl Show for bool
+        show(self) -> string = if self then "yes" else "no"
+    impl Show for char
+        show(self) -> string = "a char"
+    impl Show for string
+        show(self) -> string = self
+    impl Show for real
+        show(self) -> string = "a real"
+    """
+
+@test("a method call resolves on a value of a built-in type")
+trr_a_method_call_resolves_on_a_built_in()
+    if !trr_ready() then return
+
+    val src = trr_show_builtins() + "print(5.show(), 0.show(), true.show(), 'x'.show(), \"me\".show(), 2.5.show())\n"
+
+    assert_eq(trr_ran(src), "an int zero yes a char me a real\n")
+
+@test("it resolves on a variable, an expression, and a literal alike")
+trr_it_resolves_on_a_variable_an_expression_and_a_literal()
+    if !trr_ready() then return
+
+    val src = trr_show_builtins() + "var n = 3\nprint(n.show(), (n - 3).show(), 7.show())\n"
+
+    assert_eq(trr_ran(src), "an int zero an int\n")
+
+@test("a trait bound accepts a built-in type")
+trr_a_trait_bound_accepts_a_built_in()
+    if !trr_ready() then return
+
+    val src = trr_show_builtins() + raw"""
+        render[T: Show](x: T) -> string = x.show()
+        print(render(1), render(true), render("s"))
+        """
+
+    assert_eq(trr_ran(src), "an int yes s\n")
+
+@test("a built-in and a struct satisfy one bound together")
+trr_a_built_in_and_a_struct_share_a_bound()
+    if !trr_ready() then return
+
+    val src = trr_show_builtins() + raw"""
+        struct Point
+            x: int
+        impl Show for Point
+            show(self) -> string = "a point"
+        render[T: Show](x: T) -> string = x.show()
+        print(render(1), render(Point(2)))
+        """
+
+    assert_eq(trr_ran(src), "an int a point\n")
+
+// Distinct widths are distinct types, so each carries its own implementation and a call picks the one
+// for the receiver's actual type rather than the nearest.
+@test("each width is its own type with its own impl")
+trr_each_width_is_its_own_type()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Show
+            show(self) -> string
+        impl Show for int
+            show(self) -> string = "32"
+        impl Show for long
+            show(self) -> string = "64"
+        impl Show for byte
+            show(self) -> string = "8"
+        var a: long = 1i64
+        var b: byte = 2u8
+        print(1.show(), a.show(), b.show())
+        """), "32 64 8\n")
+
+@test("a built-in's impl method may take parameters and return anything")
+trr_a_built_in_impl_method_takes_parameters()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        trait Repeat
+            times(self, n: int) -> int
+        impl Repeat for int
+            times(self, n: int) -> int = self * n
+        print(6.times(7))
+        """), "42\n")
+
+// Reached through a reference and through a pointer, which is the receiver-seeing-through rule
+// applying to a built-in exactly as it does to a struct.
+@test("it is reached through a reference and a pointer too")
+trr_a_built_in_is_reached_through_a_reference_and_a_pointer()
+    if !trr_ready() then return
+
+    val src = trr_show_builtins() + raw"""
+        var r: &int = 5
+        var v = 6
+        var p = &v
+        print(r.show(), p.show())
+        """
+
+    assert_eq(trr_ran(src), "an int an int\n")
+
+@test("an impl for a built-in may appear before the trait")
+trr_an_impl_for_a_built_in_may_precede_the_trait()
+    if !trr_ready() then return
+
+    assert_eq(trr_ran(raw"""
+        impl Show for int
+            show(self) -> string = "late"
+        trait Show
+            show(self) -> string
+        print(1.show())
+        """), "late\n")

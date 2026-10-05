@@ -1,0 +1,541 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, from_utf8_unchecked}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// `const f(...)`: a function the compiler may run while it compiles, and the checker holding its body
+// to what exists at that moment (`const_check.sysl`). This is the marker and the checker only --
+// nothing is evaluated yet, so every program here calls its `const` functions at run time, where they
+// are ordinary calls.
+//
+// **The reference (0.0.162) has no such marker**: it reads `const sq(` as a constant missing its
+// `:` (`error: ':' expected`, at the bracket). Every expectation here is the approved design's, not
+// the reference's. The harness is `tests_enm_enum_run.sysl`'s: a program built and run for real,
+// answering with the build's refusal where there is one.
+
+// A refusal carries this message, anchored at this `file:line:column`.
+private cfn_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+private cfn_built(text: string) -> string = enm_outcome(text).0
+
+// The opening every refusal of `f` shares.
+private cfn_f(rest: string) -> string = s"'f' is 'const', so it runs while compiling, and $rest"
+
+private cfn_outside() -> string = "nothing outside the program exists while compiling"
+private cfn_heap() -> string =
+    "a heap made while compiling has nowhere to go: the object file holds values, not a heap"
+private cfn_address() -> string = "an address exists only when the program runs"
+
+// -- the marker ------------------------------------------------------------------------------------
+
+@test("'const' in front of a function's name marks it, and the tree says so")
+cfn_the_marker_is_read()
+    assert_eq(pf("const f() = 1\n"), "(fn const f () 1)")
+    assert_eq(pf("private const f() = 1\n"), "(fn private const f () 1)")
+
+@test("and it composes with the annotations above it, '@pure' included")
+cfn_the_marker_composes_with_annotations()
+    assert_eq(pf("@pure\nconst f() = 1\n"), "(fn @pure const f () 1)")
+    assert_eq(pf("@inline\nprivate const f() = 1\n"), "(fn private @inline const f () 1)")
+
+@test("a generic function may be marked")
+cfn_a_generic_function_may_be_marked()
+    val said = pf("const id[T](x: T) -> T = x\n")
+
+    assert(said.starts_with("(fn const id"), said)
+
+@test("a constant is still a constant: 'const' then a name and a ':'")
+cfn_a_constant_is_still_a_constant()
+    val said = pf("const N: int = 4\n")
+
+    assert(!said.starts_with("(fn"), said)
+    assert(!said.starts_with("!"), said)
+
+@test("a member of a type, of an 'impl' and of an enum may be marked, an associated one too")
+cfn_members_may_be_marked()
+    assert(pf("struct P\n    x: int\n\n    const twice(self) -> int = self.x * 2\n")
+               .contains("(method const "), "a struct's method")
+    assert(pf("struct P\n    x: int\n\n    const origin() -> P = P(0)\n")
+               .contains("(method const "), "an associated function")
+    assert(pf("struct P\n    x: int\n\n    const static unit -> int = 1\n")
+               .contains("const static "), "a static property")
+    assert(pf("impl Weigh for P\n    const weight(self) -> int = 1\n").contains("(method const "),
+           "an implementation's member")
+
+    val en = pf("enum E\n    A\n    B\n\n    const code(self) -> int = 1\n")
+
+    assert(en.contains("(method const "), en)
+end cfn_members_may_be_marked
+
+@test("a trait's member is not marked: the implementation that supplies the body is")
+cfn_a_trait_member_is_not_marked()
+    val src = "trait T\n    const f(self) -> int\n"
+
+    assert_eq(pf_err(src), "a trait's member is not marked 'const' — whether a call can run while " +
+                           "compiling is a fact about the body that answers it, so each 'impl' " +
+                           "marks the member it supplies")
+    assert_eq(pf_at(src), "2:5")
+
+@test("a marked signature with no body is told what an unmarked one is")
+cfn_a_marked_signature_owes_a_body()
+    assert_eq(pf_err("const f(x: int)\n"), pf_err("f(x: int)\n"))
+
+// `const`, a name and a bracket commit the line to a function, so a line that then reads as no
+// function at all is told so rather than read as a constant missing its `:`.
+@test("'const', a name and a bracket that go on as no function are refused as one owed a body")
+cfn_a_marked_function_needs_a_body()
+    val src = "const f(1)\n"
+
+    assert_eq(pf_err(src), "'const' in front of a name and its parameter list marks a function the " +
+                           "compiler may run, and this has no body — write '= value' or an " +
+                           "indented block after the signature")
+    assert_eq(pf_at(src), "1:1")
+
+@test("'sysl doc' writes the word in a function's and a member's signature")
+cfn_doc_writes_the_word()
+    val r = parse(source_of("t.sysl", "module m\n\nconst sq(x: int) -> int = x * x\n\n" +
+                                       "struct P\n    x: int\n\n    const twice(self) -> int = self.x\n"))
+
+    assert(r.ok(), "it parses")
+
+    var sigs: Buf[string] = buf()
+
+    for i in 0..<r.program.body.len()
+        doc_signature(r.program.body.at(i)) match
+            Some(t) -> sigs.push(t)
+            None -> ()
+
+        *r.program.body.at(i).kind match
+            StructDecl(d) -> sigs.push(doc_method(d.members.at(0)))
+            _ -> ()
+
+    assert(holds_string(sigs, "const sq(x: int) -> int"), str(sigs.len()))
+    assert(holds_string(sigs, "const twice(self) -> int"), str(sigs.len()))
+end cfn_doc_writes_the_word
+
+@test("the typed tree marks a 'const' function, and only a 'const' one")
+cfn_the_typed_tree_marks_it()
+    if !enm_ready() then return
+
+    val root = make_temp_dir("sysl-cfn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", "const sq(x: int) -> int = x * x\n\nplain(x: int) -> int = x\n\n" +
+                                   "print(sq(3), plain(1))\n").unwrap()
+
+    val out = emit_typed_text(root, None, false)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.is_ok(), "the program compiles")
+
+    val text = out.unwrap().text
+    val marked = cfn_block(text, "sq")
+    val plain = cfn_block(text, "plain")
+
+    assert(marked != "" && plain != "", text)
+    assert(marked.contains("        const: true\n"), marked)
+    assert(!plain.contains("const:"), plain)
+end cfn_the_typed_tree_marks_it
+
+// -- what a const function may do, run at run time ---------------------------------------------------
+
+@test("a 'const' function called at run time is an ordinary call")
+cfn_called_at_run_time()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("const sq(x: int) -> int = x * x\n\nprint(sq(7))\n"), "49\n")
+
+@test("and it takes a value only the run has, as any function does")
+cfn_takes_a_run_time_value()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("const sq(x: int) -> int = x * x\n\nvar n = 6\nn += 1\nprint(sq(n))\n"),
+              "49\n")
+
+@test("its body may hold locals, branches, matches, every loop, early returns, recursion and a contract")
+cfn_admitted_control_flow()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("enum Shape\n    Dot\n    Square(side: int)\n\n" +
+                      "const area(s: Shape) -> int = s match\n    Dot -> 0\n    Square(n) -> n * n\n\n" +
+                      "const fact(n: int) -> int\n    require n >= 0\n    if n <= 1 then return 1\n" +
+                      "    n * fact(n - 1)\n\n" +
+                      "const total(xs: [4]int) -> int\n    var t = 0\n\n    for x in xs\n        t += x\n\n" +
+                      "    t\n\n" +
+                      "const count(n: int) -> int\n    var i = 0\n    var steps = 0\n\n" +
+                      "    while i < n\n        i += 1\n        steps += 2\n\n" +
+                      "    loop\n        if steps > 100 then break\n        steps += 50\n\n    steps\n\n" +
+                      "const ranged(n: int) -> int\n    var t = 0\n\n    for i in 0..<n\n        t += i\n\n" +
+                      "    t\n\n" +
+                      "print(area(Square(3)), fact(5), total([1, 2, 3, 4]), count(3), ranged(5))\n"),
+              "9 120 10 106 10\n")
+
+@test("it may build and take apart structs, tuples and enums carrying a payload, and use '?'")
+cfn_admitted_values()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct P\n    x: int\n    y: int\n\n" +
+                      "const flip(p: P) -> P = P(p.y, p.x)\n\n" +
+                      "const swap(a: int, b: int) -> (int, int) = (b, a)\n\n" +
+                      "const pick(o: Option[int]) -> Option[int]\n    val v = o?\n    Some(v + 1)\n\n" +
+                      "val (s, t) = swap(1, 2)\n" +
+                      "print(flip(P(1, 2)).x, s, t, pick(Some(1)).unwrap(), pick(None).is_none())\n"),
+              "2 2 1 2 true\n")
+
+// A pointer into the evaluation's own locals is admitted: sysl mutates through `*self` everywhere.
+@test("a '*self' method may change a local of the 'const' function that called it")
+cfn_a_star_self_method_on_a_local()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Counter\n    n: int\n\n    const bump(*self)\n        self.n += 1\n\n" +
+                      "const counted(k: int) -> int\n    var c = Counter(0)\n\n" +
+                      "    while c.n < k\n        c.bump()\n\n    c.n\n\n" +
+                      "print(counted(4))\n"),
+              "4\n")
+
+@test("it may call another, read a laid-down 'val', and reach an exactly specified LLVM operation")
+cfn_admitted_calls()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("extern \"llvm.sqrt\" root(x: f64) -> f64\n\nstatic val base: int = 3\n\n" +
+                      "private const tri(n: int) -> int = n * (n + 1) / 2\n\n" +
+                      "const plus(n: int) -> int = tri(n) + base\n\n" +
+                      "const hyp(a: f64, b: f64) -> f64 = root(a * a + b * b)\n\n" +
+                      "print(tri(4), plus(2), int(hyp(3.0, 4.0)))\n"),
+              "10 6 5\n")
+
+@test("a generic one is checked at its definition, and a call through its bound waits for the type")
+cfn_a_generic_one_runs()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("const twice[T: Add](x: T) -> T = x + x\n\nprint(twice(21), twice(u8(2)))\n"),
+              "42 4\n")
+
+@test("a member of a type, of an 'impl' and of an enum may be 'const' and is called as any member")
+cfn_members_run()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Money\n    cents: int\n\n    const zero() -> Money = Money(0)\n" +
+                      "    const doubled(self) -> int = self.cents * 2\n\n" +
+                      "trait Weigh\n    weight(self) -> int\n\n" +
+                      "impl Weigh for Money\n    const weight(self) -> int = self.cents\n\n" +
+                      "enum Level\n    Low\n    High\n\n" +
+                      "    const rank(self) -> int = self match\n        Low -> 1\n        High -> 10\n\n" +
+                      "const heavy(m: Money) -> int = m.weight() + m.doubled()\n\n" +
+                      "val lv: Level = High\n" +
+                      "print(Money.zero().cents, heavy(Money(5)), lv.rank())\n"),
+              "0 15 10\n")
+
+// `const` implies pure, so the two together say one thing twice, which is accepted; and a pure
+// function may call a `const` one.
+@test("'@pure' on a 'const' function is accepted, and a pure function may call a 'const' one")
+cfn_const_is_pure()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@pure\nconst tri(n: int) -> int = n * (n + 1) / 2\n\n" +
+                      "const sq(n: int) -> int = n * n\n\n" +
+                      "@pure\nboth(n: int) -> int = tri(n) + sq(n)\n\nprint(both(3))\n"),
+              "15\n")
+
+// -- what it may not do ----------------------------------------------------------------------------
+
+@test("a 'const' function may not call one that is not")
+cfn_refuses_a_call_to_an_unmarked_function()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("noisy(x: int) -> int = x + 1\n\nconst f(x: int) -> int = noisy(x)\n\n" +
+                          "print(f(1))\n"),
+                cfn_f("it calls 'noisy', which is not — mark 'noisy' 'const' too, or compute this " +
+                      "at run time"), "3:26")
+
+// The standard library is unmarked until the self-hosted compiler compiles it, so the advice cannot
+// be to mark the callee.
+@test("nor one of the standard library's, which marks nothing yet")
+cfn_refuses_a_library_call()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("import sysl.math.max\n\nconst f(a: int, b: int) -> int = max(a, b)\n\n" +
+                          "print(f(1, 2))\n"),
+                cfn_f("it calls 'sysl.math.max', which is not — the standard library marks nothing " +
+                      "'const' yet, so compute this at run time"), "3:34")
+
+@test("it may not print")
+cfn_refuses_printing()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("const f(x: int) -> int\n    print(x)\n    x\n\nprint(f(1))\n"),
+                cfn_f(s"it prints, which is outside the program — ${cfn_outside()}"), "2:5")
+
+@test("it may not call the C library's mathematics, whose last bit is the library's own")
+cfn_refuses_libm()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("extern \"sin\" c_sin(x: f64) -> f64\n\nconst f(x: f64) -> f64 = c_sin(x)\n\n" +
+                          "print(f(1.0))\n"),
+                cfn_f("it calls 'c_sin', which is the C library's 'sin' — its last bit differs " +
+                      "between C libraries, and the board's would not agree with this compiler's"),
+                "3:26")
+
+@test("nor any other 'extern'")
+cfn_refuses_an_extern()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("extern abs(x: i32) -> i32\n\nconst f(x: i32) -> i32 = abs(x)\n\n" +
+                          "print(f(1))\n"),
+                cfn_f(s"it calls 'abs', which is outside the program — ${cfn_outside()}"), "3:26")
+
+@test("nor hold an 'asm' block")
+cfn_refuses_asm()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("const f() -> int\n    asm\n" +
+                          "        [aarch64, x86_64, riscv64, riscv32, thumb, wasm32, craft] \"nop\"\n\n" +
+                          "    1\n\nprint(f())\n"),
+                cfn_f(s"it holds an 'asm' block, which is outside the program — ${cfn_outside()}"),
+                "2:5")
+
+@test("it may not box a value")
+cfn_refuses_a_box()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("struct Cell\n    v: int\n\nconst f() -> int\n    val b: &Cell = Cell(1)\n" +
+                          "    b.v\n\nprint(f())\n"),
+                cfn_f(s"it boxes a value, which allocates — ${cfn_heap()}"), "5:20")
+
+@test("nor build a string")
+cfn_refuses_a_string_built()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("const f(n: int) -> int\n    val s = str(n)\n    1\n\nprint(f(1))\n"),
+                cfn_f(s"it builds a string, which allocates — ${cfn_heap()}"), "2:13")
+
+@test("it may not turn a pointer into a number")
+cfn_refuses_a_pointer_conversion()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("const f(p: *int) -> usize = usize(p)\n\nvar x = 1\nprint(f(&x) > 0)\n"),
+                cfn_f(s"it converts a pointer — ${cfn_address()}"), "1:29")
+
+@test("nor name 'null'")
+cfn_refuses_null()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("const f() -> bool\n    val p: *int = null\n    true\n\nprint(f())\n"),
+                cfn_f(s"it names 'null' — ${cfn_address()}"), "2:19")
+
+@test("a pointer may come in, but may not be what it answers")
+cfn_refuses_a_pointer_result()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("const f(p: *int) -> *int = p\n\nvar x = 1\nval q = f(&x)\nprint(q == &x)\n"),
+                cfn_f(s"its result is a '*int' — ${cfn_address()}, and a pointer answered would " +
+                      "outlive every local it could point at"), "1:21")
+
+@test("it may not call through a closure")
+cfn_refuses_a_closure_call()
+    if !enm_ready() then return
+
+    val said = cfn_built("const f(x: int) -> int\n    val g = (y: int) -> y + 1\n    g(x)\n\nprint(f(1))\n")
+
+    assert(said.contains("error: " + cfn_f("it calls through a closure — which function that is is " +
+                                            "decided when the program runs") + "\n"), said)
+    assert(said.contains("/main.sysl:3:5\n"), said)
+end cfn_refuses_a_closure_call
+
+@test("nor take a trait object")
+cfn_refuses_a_trait_object()
+    if !enm_ready() then return
+
+    val said = cfn_built("const f(d: &Display) -> int = 1\n\nprint(f(5))\n")
+
+    assert(said.contains("its parameter 'd' is a '&"), said)
+    assert(said.contains("' — which function a call through a trait object reaches is decided when " +
+                         "the program runs\n"), said)
+    assert(said.contains("/main.sysl:1:12\n"), said)
+end cfn_refuses_a_trait_object
+
+@test("it may not reach a module 'var', which is filled when the program runs")
+cfn_refuses_a_module_var()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("static var counter: int = 0\n\nconst f() -> int = counter\n\nprint(f())\n"),
+                cfn_f("it reaches 'counter' — 'counter' is filled when the program runs"), "3:20")
+
+@test("nor a 'val' computed while the program starts")
+cfn_refuses_a_computed_val()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("noisy() -> int = 3\n\nstatic val t: int = noisy()\n\nconst f() -> int = t\n\n" +
+                          "print(f())\n"),
+                cfn_f("it reaches 't' — 't' is filled when the program runs"), "5:20")
+
+@test("strings and slices are not evaluated yet, so a parameter of one is refused at its type")
+cfn_refuses_a_string_parameter()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("const f(s: string) -> int = 1\n\nprint(f(\"a\"))\n"),
+                cfn_f("its parameter 's' is a 'string' — strings and slices are not evaluated while " +
+                      "compiling yet"), "1:12")
+
+@test("nor the two sixteen-bit floats")
+cfn_refuses_f16()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("const f(x: f16) -> int = 1\n\nprint(f(1.0))\n"),
+                cfn_f("its parameter 'x' is a 'f16' — 'f16' and 'bf16' are not evaluated while " +
+                      "compiling yet"), "1:12")
+
+@test("nor a vector")
+cfn_refuses_a_vector()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("const f() -> f32\n    val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\n    v[0]\n\n" +
+                          "print(f())\n"),
+                cfn_f("it uses a vector — vectors are not evaluated while compiling yet"), "2:21")
+
+@test("nor perform an atomic operation")
+cfn_refuses_an_atomic()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("import sysl.sync.*\n\nconst f(p: *i64) -> i64 = atomic_load(p, SeqCst)\n\n" +
+                          "var n: i64 = 1\nprint(f(&n))\n"),
+                cfn_f("it performs an atomic operation — atomics are not evaluated while compiling yet"),
+                "3:27")
+
+@test("nor order memory with a fence")
+cfn_refuses_a_fence()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("import sysl.sync.*\n\nconst f() -> int\n    atomic_fence(SeqCst)\n    1\n\n" +
+                          "print(f())\n"),
+                cfn_f("it orders memory with a fence — fences are not evaluated while compiling yet"),
+                "4:5")
+
+// A variadic signature is refused at the declaration, and walking the arguments in the body at the
+// form that walks them.
+@test("nor take C variadic arguments, nor walk them")
+cfn_refuses_varargs()
+    if !enm_ready() then return
+
+    val said = cfn_built("const f(first: int, ...) -> int\n    var ap: va_list\n    va_start(ap)\n" +
+                         "    va_end(ap)\n    first\n\nprint(f(1, 2))\n")
+
+    cfn_refused(said, cfn_f("it takes C variadic arguments — C variadic arguments are not evaluated " +
+                            "while compiling yet"), "1:1")
+    cfn_refused(said, cfn_f("it walks C variadic arguments — C variadic arguments are not evaluated " +
+                            "while compiling yet"), "3:5")
+end cfn_refuses_varargs
+
+@test("nor take a function's address")
+cfn_refuses_a_function_address()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("inc(x: int) -> int = x + 1\n\nconst f(x: int) -> int\n    val g = &inc\n" +
+                          "    g(x)\n\nprint(f(1))\n"),
+                cfn_f("it takes a function's address — which function a call through it reaches is " +
+                      "decided when the program runs"), "4:13")
+
+@test("nor call through a function pointer")
+cfn_refuses_a_call_through_a_pointer()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("inc(x: int) -> int = x + 1\n\nconst f(x: int) -> int\n    val g = &inc\n" +
+                          "    g(x)\n\nprint(f(1))\n"),
+                cfn_f("it calls through a value — which function that is is decided when the " +
+                      "program runs"), "5:5")
+
+// `?` widening the error calls the `From` conversion, which is a call like any other.
+@test("nor use '?' where it converts through a 'From' that is not 'const'")
+cfn_refuses_a_try_through_from()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("struct Small\n    code: int\n\nstruct Big\n    code: int\n\n" +
+                          "impl From[Small] for Big\n    from(s: Small) -> Big = Big(s.code)\n\n" +
+                          "const lift(r: Result[int, Small]) -> Result[int, Big]\n    val v = r?\n" +
+                          "    Ok(v + 1)\n\nprint(lift(Ok(1)).is_ok())\n"),
+                "'lift' is 'const', so it runs while compiling, and it calls 'Big.from', which is " +
+                "not — mark 'Big.from' 'const' too, or compute this at run time", "11:13")
+
+// An operator a type supplied is a call to its implementation.
+@test("nor compare through an implementation that is not 'const'")
+cfn_refuses_a_dispatched_comparison()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("struct P\n    x: int\n\n" +
+                          "impl Eq for P\n    eq(self, rhs: P) -> bool = self.x == rhs.x\n\n" +
+                          "const f(a: P, b: P) -> bool = a == b\n\nprint(f(P(1), P(1)))\n"),
+                cfn_f("it calls 'P.eq', which is not — mark 'P.eq' 'const' too, or compute this at " +
+                      "run time"), "7:31")
+
+@test("nor assign through an operator whose implementation is not 'const'")
+cfn_refuses_a_dispatched_compound_assignment()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("struct V\n    x: int\n\n" +
+                          "impl Add for V\n    add(self, rhs: V) -> V = V(self.x + rhs.x)\n\n" +
+                          "const f(a: V, b: V) -> int\n    var c = a\n    c += b\n    c.x\n\n" +
+                          "print(f(V(1), V(2)))\n"),
+                cfn_f("it calls 'V.add', which is not — mark 'V.add' 'const' too, or compute this at " +
+                      "run time"), "9:5")
+
+@test("a generic one is refused at its definition for what does not go through a type parameter")
+cfn_refuses_at_a_generic_definition()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("noisy() -> int = 1\n\nconst g[T](x: T) -> int = noisy()\n\nprint(g(5))\n"),
+                "'g' is 'const', so it runs while compiling, and it calls 'noisy', which is not — " +
+                "mark 'noisy' 'const' too, or compute this at run time", "3:27")
+
+@test("and its signature is held to the same values, a slice of its parameter included")
+cfn_refuses_a_generic_slice_parameter()
+    if !enm_ready() then return
+
+    cfn_refused(cfn_built("const total[T](xs: []T) -> int = 0\n\nprint(total([1, 2]))\n"),
+                "'total' is 'const', so it runs while compiling, and its parameter 'xs' is a '[]T' — " +
+                "strings and slices are not evaluated while compiling yet", "1:20")
+
+// The refusal is one caret per stretch of source: the call that prints is the mistake, and the
+// newline the same `print` lowers to a second call for is not a second one.
+@test("one message per mistake, not one per lowered node")
+cfn_one_message_per_mistake()
+    if !enm_ready() then return
+
+    val said = cfn_built("const f(x: int) -> int\n    print(x)\n    x\n\nprint(f(1))\n")
+
+    assert_eq(cfn_count(said, "error:"), 1)
+end cfn_one_message_per_mistake
+
+// How many times `part` occurs in `text`.
+private cfn_count(text: string, part: string) -> int
+    var n = 0
+    var rest = text
+
+    loop
+        val at = rest.index_of(part)
+
+        if at.is_none() then break
+
+        n += 1
+        rest = from_utf8_unchecked(rest.bytes[at.unwrap() + part.bytes.len..<rest.bytes.len])
+
+    n
+end cfn_count
+
+// One function's block of the typed rendering: from its name to the next function's.
+private cfn_block(text: string, name: string) -> string
+    val at = text.index_of(s"name: \"$name\"")
+
+    if at.is_none() then return ""
+
+    val rest = from_utf8_unchecked(text.bytes[at.unwrap()..<text.bytes.len])
+    val next = rest.index_of("- TFunc")
+
+    if next.is_none() then return rest
+
+    from_utf8_unchecked(rest.bytes[0..<next.unwrap()])
+end cfn_block

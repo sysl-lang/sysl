@@ -560,6 +560,12 @@ end c_for_type
 for_expr(cx: &Analyzer, span: Span, label: Option[string], name: string, iter: Expr,
          body: Buf[Stmt], else_body: Option[Buf[Stmt]], expected: Option[Type],
          discarded: bool) -> TExpr
+    val ranged = range_subject(cx, span, iter)
+
+    if ranged.is_some() then
+        return subtype_range_for(cx, span, label, name, ranged.unwrap(), body, else_body,
+                                 expected, discarded)
+
     val bounds = range_bounds(iter)
 
     if bounds.is_some()
@@ -896,6 +902,35 @@ end answers_a_walk
 
 // The two ends of a range written as a form, which is what the four positions that read one
 // directly -- a `for` header, a slice index, a pattern and a quantifier -- each match on.
+// `for x in T::Range`. The loop variable is a `T`, since what the range walks are the values of the
+// subtype -- while the bounds and the comparison stay at the base, which is what `T` is laid out as.
+private subtype_range_for(cx: &Analyzer, span: Span, label: Option[string], name: string,
+                          ranged: Result[(Type, BigInt, BigInt), TExpr], body: Buf[Stmt],
+                          else_body: Option[Buf[Stmt]], expected: Option[Type],
+                          discarded: bool) -> TExpr
+    val ends = ranged match
+        Ok(e) -> e
+        Err(refused) -> return refused
+
+    val base = underlying(ends.0)
+    val tlo = TExpr(span, TIntLit(ends.1, base))
+    val thi = TExpr(span, TIntLit(ends.2, base))
+
+    cx.enter()
+
+    val u = cx.bind(name, ends.0)
+    val ctx = open_loop(cx, span, expected, label)
+    val tb = loop_stmts(cx, body)
+
+    close_loop(cx, ctx)
+    cx.leave()
+
+    val telse = else_body.map(b -> type_value_block(cx, b, expected, discarded))
+    val ty = loop_result_type(cx, span, ctx, telse)
+
+    checked_loop(ctx, span, TExpr(span, TFor(u, base, tlo, thi, true, tb, telse, ty)))
+end subtype_range_for
+
 private range_bounds(e: Expr) -> Option[(Expr, Expr, bool)] = *e.kind match
     RangeExpr(lo, hi, inclusive) ->
         if lo.is_none() || hi.is_none() then None
@@ -1000,7 +1035,7 @@ const_for_expr(cx: &Analyzer, span: Span, name: string, iter: Expr, body: Buf[St
         for i in 0..<saved_subst.len()
             if saved_subst.at(i).name != name then subst.push(saved_subst.at(i))
 
-        subst.push(Binding(name, ConstArg(from_int(v), usize_type(word_bits(cx)))))
+        subst.push(Binding(name, ConstArg(from_int(v), usize_type(word_bits(cx)), false)))
         cx.subst = subst
         copies.push(TExpr(span, TBlockExpr(type_value_block(cx, body, None, true))))
         v = v + 1

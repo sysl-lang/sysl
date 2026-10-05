@@ -77,6 +77,9 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
 
     val units = read_decls(a, written, has_entry_point)
 
+    // Every declaration is read, so a body can be typed: a `const` call may run from here on.
+    a.evaluation.ready = true
+
     var funcs: Buf[TFunc] = buf()
     var generic: usize = 0
     var defaults: usize = 0
@@ -319,7 +322,7 @@ private with_entry_body(funcs: Buf[TFunc], started: (Buf[TStmt], string)) -> Buf
 
     out.push(TFunc(span_zero(), entry_check_name(started.1), buf(), Unit,
                    TBlock(started.0, None, Unit), false, buf(), buf(), buf(), false, None, false,
-                   None, false, false, None, None, None, None, no_marks(), started.1))
+                   None, false, false, None, None, None, None, no_marks(), started.1, false))
 
     out
 end with_entry_body
@@ -531,6 +534,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     val ret = body_result(d, declared_result_type(written))
 
     cx.func_name = d.name
+    cx.decl_name = d.name
     cx.ret_ty = Some(ret)
     cx.await_site = await_site_of(d)
     cx.ret_is_list = written.is_some() && is_result_list(written.unwrap())
@@ -552,6 +556,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     a.tables.homes.put(name, scope)
 
     if !d.crossing.is_empty() then a.crossing_params.put(name, d.crossing)
+    if d.const_fn then check_const_signature(a, scope, name, d, params, ret)
 
     // **A file-private declaration's symbol is internal**, since nothing outside the file it was
     // written in can name it -- which is what keeps two files' `private pick` from being one symbol
@@ -560,7 +565,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
           contract.2, file_local(d.vis), d.conv, d.tailrec, contract.3, d.pure, d.ghost,
           frame_symbols(cx, span, name, d.reads, "reads"),
           frame_symbols(cx, span, name, d.writes, "writes"),
-          exported_symbol(d), d.section, d.marks, cx.owner)
+          exported_symbol(d), d.section, d.marks, cx.owner, d.const_fn)
 end analyze_body
 
 // Whether the declaration wrote the parameter `name` by name (`x: -> T`).
@@ -709,7 +714,7 @@ private trait_default_decl(td: TraitDecl, m: MethodDecl) -> FuncDecl
     FuncDecl(s"${td.name}.${m.name}", tparams, params, m.ret_type, m.body, bounds, m.variadic, File,
              buf(), joined_values(td.tvalues, m.tvalues), m.tpacks, None, None, None, false, false,
              false, m.reads, m.writes,
-             None, None, m.crossing, buf(), m.marks, m.named_at)
+             None, None, m.crossing, buf(), m.marks, m.named_at, false)
 end trait_default_decl
 
 // One such body, in a region everything but a kept complaint is rewound out of.
@@ -734,6 +739,13 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     val outer = a.tables.members.selves.get(d.name).unwrap_or(buf())
     var subst = joined_bindings(outer, abstract_subst(a, scope, d.tparams, d.bounds, d.tvalues,
                                                       d.tpacks, outer))
+    val settled_before = a.settled
+
+    // The parameters are final here, so a trait applied to one of them -- in the signature or in a
+    // type the body writes, `val g: Option[&Get[Y]]` -- is held to the trait's own bounds at once.
+    // The complaint is a kept one, outliving the rewind below. `Self` is not among them.
+    a.settled = joined_bindings(subst, buf())
+
     // On a generic type `Self` is the type applied to its own parameters, which is what the members
     // of one are read under.
     val written = a.tables.members.generic_self.get(d.name)
@@ -762,6 +774,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
                                                                       subst))))
 
     cx.func_name = d.name
+    cx.decl_name = d.name
     cx.ret_ty = Some(ret)
     cx.await_site = await_site_of(d)
     cx.ret_is_list = written_result_list(d.ret_type)
@@ -777,6 +790,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     for i in 0..<d.params.len()
         params.push((d.params.at(i).name, resolve_type(a, scope, d.params.at(i).typ, subst)))
 
+    a.settled = settled_before
     a.release(trial)
     a.restore_complaints(mark)
     rewind_instantiations(a, queued, tables, structs, enums, constrained)
@@ -790,10 +804,14 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     // Recorded after the rewind so that neither the entry nor the file it names can be taken back.
     if !keep then return
 
+    // A generic `const` function's signature is answered for once, here, as its body is: a type
+    // parameter stands for whatever an instantiation picks, and what it is made of is checked there.
+    if d.const_fn then check_const_signature(a, scope, d.name, d, params, ret)
+
     a.tables.homes.put(d.name, scope)
     a.tables.abstracts.push(TFunc(span_zero(), d.name, params, ret, body, d.variadic, buf(), buf(),
                                   buf(), true, d.conv, false, None, d.pure, d.ghost, None, None,
-                                  None, None, no_marks(), cx.owner))
+                                  None, None, no_marks(), cx.owner, d.const_fn))
 end check_abstract_body
 
 // What a `some` member's body produces, read speculatively and taken back: the one reading that
@@ -844,6 +862,7 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
         if p.by_name then cx.by_name.push(unique)
 
     cx.func_name = d.name
+    cx.decl_name = d.name
     cx.ret_ty = Some(Unknown)
     cx.await_site = await_site_of(d)
     cx.ret_is_list = false
@@ -962,7 +981,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
 
     if sig.is_none() then return TFunc(span_zero(), name, buf(), Unit, empty_block(), false, buf(),
                                        buf(), buf(), false, None, false, None, false, false, None,
-                                       None, None, None, no_marks(), cx.owner)
+                                       None, None, None, no_marks(), cx.owner, false)
 
     remember_bounds(cx, d)
 
@@ -981,6 +1000,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     val ret = body_result(d, sig.unwrap().ret)
 
     cx.func_name = name
+    cx.decl_name = d.name
     note_body_covers(a, name)
     cx.ret_ty = Some(ret)
     cx.await_site = await_site_of(d)
@@ -1013,7 +1033,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
           d.conv, d.tailrec, contract.3, d.pure, d.ghost,
           frame_symbols(cx, span, name, d.reads, "reads"),
           frame_symbols(cx, span, name, d.writes, "writes"),
-          exported_symbol(d), d.section, d.marks, cx.owner)
+          exported_symbol(d), d.section, d.marks, cx.owner, d.const_fn)
 end analyze_instance_in
 
 // The key a declaration was filed under, for a diagnostic naming the declaration an instantiation
@@ -1608,8 +1628,12 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
                 // An initializer that is constant data but not yet written as literals is written as
                 // them, so the object file carries it and nothing runs to fill it in.
+                //
+                // **A call to a `const` function is run here**, and its value laid down on every
+                // target: what would have trapped at startup is refused now (`const_eval.sysl`).
                 if init.is_some() && !laid_down(init.unwrap())
-                    val image = static_image(init.unwrap())
+                    val run = const_val_image(cx, d.name, init.unwrap())
+                    val image = if run.is_some() then run else static_image(init.unwrap())
 
                     if image.is_some() then init = image
 

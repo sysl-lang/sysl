@@ -1,0 +1,175 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+
+// **A closure reads names where it was WRITTEN, not where it is called.** A block's imports are asked
+// before the file's, and a closure written inside that block -- stored, passed, returned, or called
+// after the block has closed -- keeps reading them. And where two wildcards both offer a variant, the
+// type a use is expected to have settles which enum it is, which is the second half of this file.
+//
+// **Every output and refusal quoted here was obtained by running the reference compiler (0.0.162) on
+// the same tree.**
+
+// What a project of these `(module directory, file, source)` triples prints, or what its build said.
+private imt_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end imt_out
+
+// Two modules declaring one spelling to different effect, so what a program prints says which one a
+// name inside a closure reached. The file imports `a`'s; every block below imports `b`'s.
+private imt_rivals(main: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    fs.push(("a", "a.sysl", "module a\nf() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\nf() -> int = 2"))
+    imt_out(fs)
+end imt_rivals
+
+// -- a closure written inside a block reads names as that block does -----------------------------------
+
+@test("its named import")
+imt_a_closure_reads_its_blocks_named_import()
+    if im_can_run() then return
+
+    assert_eq(imt_rivals("import a.f\nuse() -> int =\n    import b.f\n    val g = () -> f()\n    g()\n" +
+                         "print(use())"), "2\n")
+
+@test("its wildcard")
+imt_a_closure_reads_its_blocks_wildcard()
+    if im_can_run() then return
+
+    assert_eq(imt_rivals("import a.f\nuse() -> int =\n    import b.*\n    val g = () -> f()\n    g()\n" +
+                         "print(use())"), "2\n")
+
+@test("an enclosing block's import, from a nested block")
+imt_a_closure_reads_an_enclosing_blocks_import()
+    if im_can_run() then return
+
+    assert_eq(imt_rivals("import a.f\nuse() -> int =\n    import b.f\n    if true\n        val g = () -> f()\n" +
+                         "        return g()\n    0\nprint(use())"), "2\n")
+
+@test("and the inner block's before the outer one's")
+imt_a_closure_reads_the_inner_blocks_import_first()
+    if im_can_run() then return
+
+    assert_eq(imt_rivals("use() -> int =\n    import b.*\n    if true\n        import a.*\n" +
+                         "        val g = () -> f()\n        return g()\n    0\nprint(use())"), "1\n")
+
+@test("a closure written as an argument")
+imt_a_closure_argument_reads_its_blocks_import()
+    if im_can_run() then return
+
+    assert_eq(imt_rivals("import a.f\napply(h: &Fn() -> int) -> int = h()\nuse() -> int =\n    import b.f\n" +
+                         "    apply(() -> f())\nprint(use())"), "2\n")
+
+@test("a closure stored, and called after the block that imported has closed")
+imt_a_stored_closure_keeps_its_blocks_import()
+    if im_can_run() then return
+
+    assert_eq(imt_rivals("import a.f\nuse() -> int =\n    var g: &Fn() -> int = () -> 0\n    if true\n" +
+                         "        import b.f\n        g = () -> f()\n    g()\nprint(use())"), "2\n")
+
+@test("a closure returned out of the function whose block imported")
+imt_a_returned_closure_keeps_its_blocks_import()
+    if im_can_run() then return
+
+    assert_eq(imt_rivals("import a.f\nmake() -> &Fn() -> int =\n    import b.f\n    () -> f()\n" +
+                         "print(make()())"), "2\n")
+
+@test("a nested function written below the import")
+imt_a_nested_function_reads_its_blocks_import()
+    if im_can_run() then return
+
+    assert_eq(imt_rivals("import a.f\nuse() -> int =\n    import b.f\n    h() -> int = f()\n    h()\n" +
+                         "print(use())"), "2\n")
+
+@test("while a closure outside any importing block still reads the file's")
+imt_a_closure_outside_any_block_reads_the_files()
+    if im_can_run() then return
+
+    assert_eq(imt_rivals("import a.f\nuse() -> int =\n    val g = () -> f()\n    g()\nprint(use())"), "1\n")
+
+@test("including one written after the importing block has closed")
+imt_a_closure_after_the_block_reads_the_files()
+    if im_can_run() then return
+
+    assert_eq(imt_rivals("import a.f\nuse() -> int =\n    if true\n        import b.f\n" +
+                         "        val k = () -> f()\n        print(k())\n    val g = () -> f()\n    g()\n" +
+                         "print(use())"), "2\n1\n")
+
+// -- two wildcards offering one variant ----------------------------------------------------------------
+
+// `m` and `m2` each declare an enum with a `Hit`; `m` also has a function taking its own enum, so a
+// parameter can be the expected type.
+private imt_variants(body: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import m.*\nimport m2.*\n" + body))
+    fs.push(("m", "m.sysl", "module m\nenum M\n    Hit(n: int)\n    Miss\nshow(v: M) -> int = v match\n" +
+                            "    Hit(n) -> n\n    Miss -> 0"))
+    fs.push(("m2", "m2.sysl", "module m2\nenum N\n    Hit(n: int)\n    Gone"))
+    imt_out(fs)
+end imt_variants
+
+private imt_hit_offered() -> string =
+    "'Hit' is offered by 'm.*' and 'm2.*' — import it selectively, or write the module it comes from"
+
+@test("are settled by an annotated binding's type")
+imt_two_wildcards_variant_settled_by_an_annotation()
+    if im_can_run() then return
+
+    assert_eq(imt_variants("val x: m.M = Hit(1)\nprint(show(x))"), "1\n")
+
+@test("by a parameter's type")
+imt_two_wildcards_variant_settled_by_a_parameter()
+    if im_can_run() then return
+
+    assert_eq(imt_variants("print(show(Hit(2)))"), "2\n")
+
+@test("and by a function's declared return type")
+imt_two_wildcards_variant_settled_by_a_return_type()
+    if im_can_run() then return
+
+    assert_eq(imt_variants("make() -> m.M = Hit(3)\nprint(show(make()))"), "3\n")
+
+@test("but with nothing expected the use is still ambiguous")
+imt_two_wildcards_variant_with_nothing_expected()
+    if im_can_run() then return
+
+    val said = imt_variants("val x = Hit(1)\nprint(1)")
+
+    assert(said.contains(imt_hit_offered()), said)
+    assert(said.contains("/main.sysl:3:9\n  |\n3 | val x = Hit(1)\n  |         ^^^"), said)
+end imt_two_wildcards_variant_with_nothing_expected
+
+@test("and so it is where the expected type is neither enum")
+imt_two_wildcards_variant_expected_neither_enum()
+    if im_can_run() then return
+
+    val said = imt_variants("val x: int = Hit(1)\nprint(x)")
+
+    assert(said.contains(imt_hit_offered()), said)
+    assert(said.contains("/main.sysl:3:14\n  |\n3 | val x: int = Hit(1)\n  |              ^^^"), said)
+end imt_two_wildcards_variant_expected_neither_enum

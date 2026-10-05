@@ -42,6 +42,11 @@ private print_one(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
 
     if ty == Unknown then return t
 
+    // **A fixed-point value renders itself**, as the shortest decimal that reads back as the same
+    // value -- C has no conversion for one -- and goes out as the string that came back. A subtype
+    // over one renders as its base.
+    if is_fixed(ty) then return library_call(cx, span, "prints", TExpr(span, TStr(t)))
+
     ty match
         // A width past 64 bits has no printf conversion to be widened to, so it renders itself
         // first and goes out as the string that came back. That is the one scalar whose printing
@@ -107,6 +112,10 @@ end stdout_call
 scalar_render(t: Type) -> bool = t match
     Integer(_, _, _) -> true
     Floating(_, _) -> true
+    // A fixed-point value, and a subtype over one, renders through the compiler's own renderer --
+    // there is no `Display` for one to reach.
+    Fixed(_, _, _) -> true
+    Constrained(_) -> is_fixed(t)
     Bool -> true
     Char -> true
     Str -> true
@@ -191,7 +200,7 @@ private renderer(cx: &Analyzer, span: Span, t: TExpr, asked: string,
             val form = if asked == "print" then "print" else "str"
 
             if !satisfies(cx.an, tr, here) then
-                cx.an.bound_fault(cx.scope, span, s"'$form' needs '${type_show(here)}: ${tr.show()}'")
+                cx.an.bound_fault(cx.scope, cx.said_at(span), s"'$form' needs '${type_show(here)}: ${tr.show()}'")
 
             return (s"${tr.name}.display", None)
         _ -> ()

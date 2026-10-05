@@ -1,0 +1,175 @@
+module sh.sysl.compiler
+@tests
+
+// The attributes a constrained integer subtype exposes (`reference/errors.md § What the type's own
+// name offers: :: attributes`): its bounds (`First`/`Last`, honouring an exclusive upper), the total
+// membership test (`Valid`, which never traps), the trapping steps (`Succ`/`Pred`), and `Range` as a
+// `for` loop's iterable.
+//
+// **Every output here was read out of the reference compiler**, whose `TypeAttrRunTests` these are.
+// The helpers are `tests_enm_enum_run.sysl`'s.
+
+private tar2_age() -> string = "type Age = int within 0..150\n"
+private tar2_prob() -> string = "type Prob = int within 0..<10\n"
+
+// A **derived** subtype, the only place it is observable what the attributes are typed *as*: every
+// one of them but `Valid` speaks the subtype, and `only` takes nothing else.
+private tar2_slot() -> string = "type Slot = new u8 within 0..<8\nonly(s: Slot) -> int = int(s)\n"
+
+@test("First and Last: an inclusive range reports both endpoints")
+tar2_an_inclusive_range_reports_both_endpoints()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tar2_age() + "print(Age::First, Age::Last)\n"), "0 150\n")
+
+@test("First and Last: an exclusive upper bound reports one below it")
+tar2_an_exclusive_upper_bound_reports_one_below_it()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tar2_prob() + "print(Prob::First, Prob::Last)\n"), "0 9\n")
+
+@test("Valid: an in-range value is valid")
+tar2_an_in_range_value_is_valid()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tar2_age() + "print(Age::Valid(40))\n"), "true\n")
+
+@test("Valid: an out-of-range value is not, and does not trap")
+tar2_an_out_of_range_value_is_not_and_does_not_trap()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tar2_age() + "print(Age::Valid(200))\n"), "false\n")
+
+@test("Valid: the excluded upper endpoint is not valid")
+tar2_the_excluded_upper_endpoint_is_not_valid()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tar2_prob() + "print(Prob::Valid(10))\n"), "false\n")
+
+@test("Succ and Pred move one along")
+tar2_succ_and_pred_move_one_along()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tar2_age() + "print(Age::Succ(40), Age::Pred(40))\n"), "41 39\n")
+
+@test("Succ traps at Last")
+tar2_succ_traps_at_last()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits(tar2_age() + "print(Age::Succ(150))\n"), "")
+
+@test("Pred traps at First")
+tar2_pred_traps_at_first()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits(tar2_age() + "print(Age::Pred(0))\n"), "")
+
+@test("Succ at the value below Last is fine")
+tar2_succ_below_last_is_fine()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tar2_age() + "print(Age::Succ(149))\n"), "150\n")
+
+@test("Range drives a for loop over First..Last inclusive")
+tar2_range_drives_a_for_loop()
+    if !enm_ready() then return
+
+    val out = enm_ran(tar2_prob() + "var sum = 0\nfor i in Prob::Range do\n    sum = sum + i\nprint(sum)\n")
+
+    assert_eq(out, "45\n")
+
+@test("on a derived subtype a bound is a value of the type it bounds")
+tar2_a_bound_is_a_value_of_the_type_it_bounds()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tar2_slot() + "print(only(Slot::First), only(Slot::Last))\n"), "0 7\n")
+
+@test("on a derived subtype a step takes one and gives another")
+tar2_a_step_takes_one_and_gives_another()
+    if !enm_ready() then return
+
+    val out = enm_ran(tar2_slot() + "print(only(Slot::Succ(Slot(3u8))), only(Slot::Pred(Slot(3u8))))\n")
+
+    assert_eq(out, "4 2\n")
+
+@test("on a derived subtype the loop variable of Range is one too")
+tar2_the_loop_variable_of_range_is_one_too()
+    if !enm_ready() then return
+
+    val out = enm_ran(tar2_slot() + "var n = 0\nfor s in Slot::Range do n += only(s)\nprint(n)\n")
+
+    assert_eq(out, "28\n")
+
+// The point of all three: a `new` subtype exists to be nominally distinct from its base, and an
+// attribute surface that handed back the base would make its own type the one thing you had to cast
+// away to use it.
+@test("so stepping round a ring needs no cast through the base")
+tar2_stepping_round_a_ring_needs_no_cast()
+    if !enm_ready() then return
+
+    val out = enm_ran(tar2_slot() + "wrap(s: Slot) -> Slot = Slot(u8((usize(s) + 1) % 8))\n" +
+                      "print(only(wrap(Slot::Last)), only(wrap(Slot::First)))\n")
+
+    assert_eq(out, "0 1\n")
+
+// `Valid` is the exception, and the asymmetry is the whole of its job.
+@test("while Valid asks about the base, since its answer may be no")
+tar2_valid_asks_about_the_base()
+    if !enm_ready() then return
+
+    val out = enm_ran(tar2_slot() + "print(Slot::Valid(7u8), Slot::Valid(8u8), Slot::Valid(255u8))\n")
+
+    assert_eq(out, "true false false\n")
+
+// `::` is what keeps these out of the member namespace, so a member of the same name is the
+// discriminating case: sharing one namespace, one of the two would have to win.
+@test("an attribute is not a member, so a member of the same name does not shadow it")
+tar2_an_attribute_is_not_a_member()
+    if !enm_ready() then return
+
+    val out = enm_ran(tar2_age() + "trait Marked\n    First -> int\nimpl Marked for Age\n" +
+                      "    First -> int = 99\nvar a = Age(7)\nprint(Age::First, a.First)\n")
+
+    assert_eq(out, "0 99\n")
+
+// -- the edges of `for x in T::Range`, each quoted from the reference ------------------------------
+
+@test("Range through an alias of a constrained subtype walks that subtype's range")
+tar2_range_through_an_alias_walks_the_subtype()
+    if !enm_ready() then return
+
+    val out = enm_ran(tar2_prob() + "type P2 = Prob\nvar sum = 0\nfor i in P2::Range do sum += i\nprint(sum)\n")
+
+    assert_eq(out, "45\n")
+
+@test("a for over Range runs its else once the range is walked")
+tar2_a_range_loop_runs_its_else()
+    if !enm_ready() then return
+
+    val out = enm_ran("type W = int within 0..9\nfor x in W::Range do\n    print(x)\nelse\n    print(99)\n")
+
+    assert_eq(out, "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n99\n")
+
+@test("Range of a subtype with no within range is refused")
+tar2_range_needs_a_within_range()
+    if !enm_ready() then return
+
+    val out = enm_err("type W = int where value > 0\nfor x in W::Range do print(x)\n")
+
+    assert(enm_says(out, "error: 'W::Range' needs a 'within' range"), out)
+
+@test("Range of a subtype over a float is refused")
+tar2_range_needs_an_integer_subtype()
+    if !enm_ready() then return
+
+    val out = enm_err("type R = real within 0.0..1.0\nfor x in R::Range do print(x)\n")
+
+    assert(enm_says(out, "error: 'R::Range' iterates an integer subtype, not real"), out)
+
+@test("Range outside a for is still refused")
+tar2_range_outside_a_for_is_refused()
+    if !enm_ready() then return
+
+    val out = enm_err(tar2_prob() + "print(Prob::Range)\n")
+
+    assert(enm_says(out, "error: 'Prob::Range' is only meaningful as the iterable of a 'for' loop"), out)

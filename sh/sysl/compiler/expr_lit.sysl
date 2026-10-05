@@ -34,6 +34,13 @@ literal_value(digits: string, base: int) -> BigInt = parse_radix(digits, base).u
 // is not `volatile` even where the field it is about to fill is.
 int_literal(cx: &Analyzer, span: Span, value: BigInt, suffix: string,
             expected: Option[Type]) -> TExpr
+    // A whole number written where a fixed-point value is wanted is that value, `1` at `i32q16`
+    // being one -- converted exactly and held to the format's range as a decimal literal is.
+    val fixed = if suffix != "" then fixed_suffixed(cx, span, suffix) else fixed_wanted(expected)
+
+    if fixed.is_some() then
+        return fixed_literal(cx, span, to_string(value), Some((value, 0)), fixed.unwrap())
+
     val ty = if suffix != "" then suffixed_int(cx, span, suffix) else expected_int(cx, expected)
 
     ty match
@@ -78,10 +85,25 @@ end expected_int
 // `real` is wanted is a type error, not a silent conversion.
 float_literal(cx: &Analyzer, span: Span, text: string, suffix: string,
               expected: Option[Type]) -> TExpr
+    // At a fixed-point type the literal is read from its TEXT, exactly, and never through a double.
+    val fixed = if suffix != "" then fixed_suffixed(cx, span, suffix) else fixed_wanted(expected)
+
+    if fixed.is_some() then return fixed_literal(cx, span, text, exact_of_text(text), fixed.unwrap())
+
     val ty = if suffix != "" then suffixed_float(cx, span, suffix) else expected_float(cx, expected)
 
     TExpr(span, TFloatLit(double_bits(text), ty))
 end float_literal
+
+// The fixed-point type a literal's suffix names, where it names one -- `0.6i32q31`.
+private fixed_suffixed(cx: &Analyzer, span: Span, suffix: string) -> Option[Type]
+    if !fixed_suffix(suffix) then return None
+
+    scalar_type_named(cx, span, suffix) match
+        Some(Fixed(b, f, s)) -> Some(Fixed(b, f, s))
+        // A malformed fraction was told by the name's own reading; the literal has no type left.
+        _ -> Some(Unknown)
+end fixed_suffixed
 
 private suffixed_float(cx: &Analyzer, span: Span, suffix: string) -> Type
     val named = scalar_type_named(cx, span, suffix)
@@ -228,7 +250,9 @@ arith_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type, rhs: Span) -
     end if
 
     val ra = repr(a)
-    val shift = (op == "<<" || op == ">>") && is_integer(underlying(a))
+    // A fixed-point value shifts too: `x << n` is `x · 2^n` in its own format, saturating, and `x >> n`
+    // the floor of `x / 2^n` -- the one rounding toward minus infinity the operators offer.
+    val shift = (op == "<<" || op == ">>") && (is_integer(underlying(a)) || is_fixed(a))
 
     if !shift && !type_eq(ra, repr(b)) then
         cx.fault(rhs, s"'$op' needs matching types, got ${type_show(a)} and ${type_show(b)}")
@@ -247,6 +271,9 @@ arith_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type, rhs: Span) -
     underlying(a) match
         Integer(_, _, _) -> if integer_op(op) then result else undefined_for(cx, span, op, a)
         Floating(_, _) -> if floating_op(op) then result else undefined_for(cx, span, op, a)
+        // A fixed-point value has the four a float has -- saturating, and `*` and `/` rescaling and
+        // rounding. Its bits are reached through `.bits`, never through `&` or `%`.
+        Fixed(_, _, _) -> if floating_op(op) || shift then result else undefined_for(cx, span, op, a)
         Str -> if op == "+" then result else undefined_for(cx, span, op, a)
         Ptr(_) ->
             if op == "-" then return isize_type(word_bits(cx))

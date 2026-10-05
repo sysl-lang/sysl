@@ -1,0 +1,260 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// Compile-time diagnostics for a misused `invariant`: a clause that is not a `bool`, one that names
+// something not in scope, and the aliases a clause forbids -- the larger half, because a clause is
+// checked at the write by walking the *place*, and every refusal here is a way of reaching the
+// storage with no place that names the struct.
+//
+// **Every diagnostic quoted here was read out of the reference compiler**, whose
+// `StructInvariantErrorTests` these are.
+
+private var sie_library_cache: Buf[Program] = buf()
+private var sie_library_read: bool = false
+
+private sie_library() -> Buf[Program]
+    if sie_library_read then return sie_library_cache
+
+    sie_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> sie_library_cache = units
+
+    sie_library_cache
+end sie_library
+
+private sie_ready() -> bool
+    if sie_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+// The IR of a one-file program, or what the compiler says about it.
+private sie_out(text: string) -> string
+    val root = make_temp_dir("sysl-struct-invariant-error").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end sie_out
+
+// That a program is refused in the words given.
+private sie_refused(text: string, said: string)
+    val e = sie_out(text)
+
+    assert(e.contains(said), s"expected '$said', got: $e")
+
+// A clause that reads THROUGH a field, which is what makes `o.a.n` a write only `Outer` knows is
+// checked. `c` is read by nothing, so a refusal below is about the clause rather than the struct.
+private sie_outer() -> string =
+    "struct Inner\n    n: int\nstruct Outer\n    a: Inner\n    b: int\n    c: int\n    invariant a.n <= b\n"
+
+private sie_severed(pointer: string, reads: string) -> string =
+    s"'&' here makes a '$pointer' pointing inside Outer, whose invariant reads '$reads' — and a " +
+    s"'$pointer' names no Outer, so a write through it would break the clause with nothing left to " +
+    "re-check it against. Take the address of the Outer itself, which keeps the invariant in its " +
+    "type, or make the change through a method"
+
+private sie_got_out(how: string) -> string =
+    s"a '*self' method may not let a pointer into the receiver's own storage outlive the call, and " +
+    s"this one $how — the receiver may be a field of a struct whose invariant reads it, and a " +
+    "pointer that gets out is somewhere to write that names no such struct. Hand back a copy of the " +
+    "value, or an index into it, and let the caller reach the storage through the receiver it " +
+    "already has"
+
+private sie_not_owned(what: string) -> string =
+    s"an invariant may only read storage the struct owns, and $what — what is on the far side has " +
+    "an identity of its own, so another alias of it could break the clause with nothing left to " +
+    "re-check it against. Hold the value in a field of the struct, and state the invariant over that"
+
+// -- a non-bool clause, without leaking the synthesised function's name ---------------------------
+
+@test("a bare integer field is not a condition")
+sie_a_bare_integer_field()
+    if !sie_ready() then return
+
+    val e = sie_out("struct Account\n    balance: int\n    invariant balance\nvar a = Account(1)")
+
+    assert(e.contains("an 'invariant' must be a 'bool', but this one is int"), e)
+    assert(!e.contains("$inv"), e)
+
+@test("an arithmetic expression is not a condition")
+sie_an_arithmetic_expression()
+    if !sie_ready() then return
+
+    sie_refused("struct Account\n    balance: int\n    invariant balance + 1\nvar a = Account(1)",
+                "an 'invariant' must be a 'bool', but this one is int")
+
+@test("an invariant that names an unknown field is rejected")
+sie_an_unknown_field()
+    if !sie_ready() then return
+
+    sie_refused("struct Account\n    balance: int\n    invariant blance >= 0\nvar a = Account(1)",
+                "undefined name 'blance'")
+
+// -- an alias typed below an invariant is refused where it is made ---------------------------------
+
+@test("a pointer to a field the clause reads through")
+sie_a_pointer_read_through()
+    if !sie_ready() then return
+
+    sie_refused(sie_outer() + "wreck(p: *Inner)\n    p.n = 9\nvar o = Outer(Inner(1), 5, 0)\nwreck(&o.a)",
+                sie_severed("*Inner", "a.n"))
+
+@test("a pointer to a field the clause reads directly")
+sie_a_pointer_read_directly()
+    if !sie_ready() then return
+
+    sie_refused(sie_outer() + "var o = Outer(Inner(1), 5, 0)\nvar p = &o.b", sie_severed("*int", "b"))
+
+@test("a pointer to storage below what the clause reads")
+sie_a_pointer_below_the_read()
+    if !sie_ready() then return
+
+    sie_refused(sie_outer() + "var o = Outer(Inner(1), 5, 0)\nvar p = &o.a.n", sie_severed("*int", "a.n"))
+
+// Inside the struct's own method the receiver is a `*Outer`, so the place is `(*self).a`: a clause
+// is not a rule about who may break it.
+@test("and a method of the struct itself is not exempt")
+sie_a_method_is_not_exempt()
+    if !sie_ready() then return
+
+    val handing = "struct Inner\n    n: int\nstruct Outer\n    a: Inner\n    b: int\n    invariant a.n <= b\n\n" +
+                  "    hand(*self) -> *Inner\n        &self.a\n"
+
+    sie_refused(handing + "var o = Outer(Inner(1), 5)\nprint(o.b)", sie_severed("*Inner", "a.n"))
+
+@test("a pointer taken through a pointer to the enclosing struct")
+sie_through_a_pointer_to_the_struct()
+    if !sie_ready() then return
+
+    sie_refused(sie_outer() + "var o = Outer(Inner(1), 5, 0)\nvar p = &o\nvar q = &(*p).a",
+                sie_severed("*Inner", "a.n"))
+
+private sie_wrapping(clause: string) -> string =
+    s"struct Outer\n    b: int\n    c: int\n    invariant $clause\n"
+
+// A unary inside a binary, and a chained comparison's list of operands: a walk that stopped at
+// either would drop `b` from what the clause reads, and the `&` would be allowed.
+@test("a field the clause reaches only through nested forms is still read")
+sie_nested_forms_are_still_read()
+    if !sie_ready() then return
+
+    sie_refused(sie_wrapping("-b < 0") + "var o = Outer(5, 0)\nvar p = &o.b", sie_severed("*int", "b"))
+    sie_refused(sie_wrapping("0 < b < 100") + "var o = Outer(5, 0)\nvar p = &o.b", sie_severed("*int", "b"))
+
+    // The control: a field no clause reaches is still ordinary.
+    val ir = sie_out(sie_wrapping("0 < b < 100") + "var o = Outer(5, 0)\nvar p = &o.c\nprint(*p)")
+
+    assert(ir.contains("define"), ir)
+
+// A path hidden inside a statement -- an `if` used as a value has statement bodies -- is one the
+// reading cannot see, so such a clause is taken to read every field.
+@test("every field of a struct whose clause hides its reads inside a branch")
+sie_a_branch_reads_every_field()
+    if !sie_ready() then return
+
+    val branching = "struct Inner\n    n: int\nstruct Outer\n    a: Inner\n    b: int\n    c: int\n" +
+                    "    invariant if b > 0 then a.n <= b else true\n"
+
+    sie_refused(branching + "var o = Outer(Inner(1), 5, 0)\nvar p = &o.c", sie_severed("*int", "c"))
+
+@test("a writable view of an array the clause reads")
+sie_a_writable_view()
+    if !sie_ready() then return
+
+    val grid = "struct Grid\n    items: [2]int\n    cap: int\n    invariant items[0] <= cap\n"
+
+    sie_refused(grid + "var g = Grid([0, 0], 5)\nvar v = g.items[0..<2]",
+                "this view may be written, and it views storage inside Grid, whose invariant reads " +
+                "'items' — a '[]int' names no Grid, so a write through it would break the clause with " +
+                "nothing left to re-check it against. Take it as a '[]const int', which may not write, " +
+                "or make the change through a method")
+
+// -- a '*self' method may not let a pointer into its receiver outlive the call ---------------------
+
+private sie_with_outer(inner_methods: string) -> string =
+    "struct Inner\n    n: int\n\n" + inner_methods + "struct Outer\n    a: Inner\n    b: int\n    invariant a.n <= b\n"
+
+@test("by returning it")
+sie_by_returning_it()
+    if !sie_ready() then return
+
+    sie_refused(sie_with_outer("    leak(*self) -> *int\n        &self.n\n") +
+                "var o = Outer(Inner(1), 5)\nvar p = o.a.leak()",
+                sie_got_out("is returned"))
+
+@test("by storing it where the caller can still reach it")
+sie_by_storing_it()
+    if !sie_ready() then return
+
+    sie_refused("struct Slot\n    p: *int\n" + sie_with_outer("    hide(*self, s: *Slot)\n        s.p = &self.n\n") +
+                "var s = Slot(null)\nvar o = Outer(Inner(1), 5)\no.a.hide(&s)",
+                sie_got_out("is stored somewhere the call does not own"))
+
+// Through a local first, which is why the locals holding one are worked out to a fixpoint.
+@test("by passing it through a local on the way out")
+sie_through_a_local()
+    if !sie_ready() then return
+
+    sie_refused(sie_with_outer("    leak(*self) -> *int\n        var q = &self.n\n        var r = q\n        r\n") +
+                "var o = Outer(Inner(1), 5)\nvar p = o.a.leak()",
+                sie_got_out("is returned"))
+
+@test("by wrapping it in a struct on the way out")
+sie_wrapped_in_a_struct()
+    if !sie_ready() then return
+
+    sie_refused("struct Wrap\n    p: *int\n" + sie_with_outer("    held(*self) -> Wrap\n        Wrap(&self.n)\n") +
+                "var o = Outer(Inner(1), 5)\nvar w = o.a.held()",
+                sie_got_out("is returned"))
+
+// An array between the two is still one object.
+@test("and a struct reached through an array field is covered too")
+sie_through_an_array_field()
+    if !sie_ready() then return
+
+    val celled = "struct Cell\n    n: int\n\n    at(*self) -> *int\n        &self.n\n" +
+                 "struct Grid\n    items: [2]Cell\n    cap: int\n    invariant items[0].n <= cap\n"
+
+    sie_refused(celled + "var g = Grid([Cell(0), Cell(0)], 5)\nvar p = g.items[1].at()",
+                sie_got_out("is returned"))
+
+// -- an invariant may only read storage the struct owns --------------------------------------------
+
+@test("not through a raw pointer")
+sie_not_through_a_raw_pointer()
+    if !sie_ready() then return
+
+    sie_refused("struct Inner\n    n: int\nstruct Outer\n    a: *Inner\n    b: int\n    invariant a.n <= b\nprint(1)",
+                sie_not_owned("'n' is read through *Inner"))
+
+@test("not through a reference")
+sie_not_through_a_reference()
+    if !sie_ready() then return
+
+    sie_refused("struct Inner\n    n: int\nstruct Outer\n    a: &Inner\n    b: int\n    invariant a.n <= b\nprint(1)",
+                sie_not_owned("'n' is read through &Inner"))
+
+@test("not the elements of a view")
+sie_not_the_elements_of_a_view()
+    if !sie_ready() then return
+
+    sie_refused("struct Buf\n    xs: []int\n    cap: int\n    invariant xs[0] <= cap\nprint(1)",
+                sie_not_owned("an element is read through []int"))

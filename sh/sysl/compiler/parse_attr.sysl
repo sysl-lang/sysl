@@ -106,8 +106,11 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
         val at = p.here()
         val word = attr_name(p)
 
+        // An indented '#' never reaches the directive pass, so whatever word follows it, the member
+        // rule answers -- and names the sigil, since '@' is what the reader writes in any case.
         if p.at_kw("#")
-            refuse_hash_attr(p, at)
+            p.fault(at, member_attr_refusal() + ". An annotation is written '@' in any case — '#' opens a directive, which gates lines before the lexer sees them and sits at the margin")
+            skip_line(p)
             break
         end if
 
@@ -115,7 +118,7 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
             if word == "assert"
                 p.fault(at, "'@assert' stands where a declaration stands, and a type's body holds its members — write it beside the type rather than inside it, where 'sizeof' and 'offsetof' still name what it is about")
             else
-                p.fault(at, "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@reads' and '@writes' — and the three about the function it lowers to, '@noinline', '@inline' and '@cold'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')")
+                p.fault(at, member_attr_refusal())
 
             skip_line(p)
             break
@@ -130,6 +133,9 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
     refuse_duplicates(p, out, "member")
     out
 end parse_member_attrs
+
+private member_attr_refusal() -> string =
+    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@reads' and '@writes' — and the three about the function it lowers to, '@noinline', '@inline' and '@cold'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
 
 private member_attr_word(w: string) -> bool
     for word in ["crossing", "borrows", "reads", "writes", "noinline", "inline", "cold"]
@@ -590,6 +596,12 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
     if all_are(attrs, "needs")
         return "'@needs(...)' names what reaching a declaration requires, so it marks a function or an 'extern' — and this declares neither"
 
+    // `@align` beside `@section` is a binding and only a binding: a struct takes the first and not
+    // the second, and a function the second and not the first. It is the pair a statically placed
+    // stack is written with, so it is the case rather than a corner.
+    if has_layout(attrs) && has_section(attrs) && all_layout_or_storage(attrs)
+        return "'@align(n)' beside '@section(\"...\")' marks one binding's storage — the boundary it begins on and the section it sits in are both about one object, and this declares none"
+
     if all_layout(attrs)
         return "'@packed' describes how a struct's fields are laid out, so it can only mark a struct — a 'var' or a 'val' has no fields to pack, and '@align(n)' is the one of the two that may stand above one"
 
@@ -684,7 +696,25 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     // so the two cannot be about the same declaration whichever kind it turns out to be.
     if packed && section
         p.fault(p.here(), "'@packed' lays out a struct's fields and '@section(\"...\")' places one object, so they cannot stand above one declaration — a type occupies no address of its own, and the storage that holds a packed value is what a section would be about")
+        return
+    end if
+
+    // A layout annotation and a function annotation describe different kinds of thing, so one
+    // declaration cannot carry both -- and saying which pair collided is more use than the refusal
+    // whichever kind the declaration turns out to be would give. `@section` is in neither camp, and
+    // a set of nothing but layout and `@export("...")` is a struct's C name beside its layout. A set
+    // holding `@thread_local` is a binding's, settled by the rule above.
+    if has_layout(attrs) && !per_thread(attrs) && !all_layout_or_export(attrs) && marks_a_function(attrs)
+        p.fault(p.here(), "'@packed' and '@align' describe a layout and the rest mark a function, so they cannot stand above one declaration — a struct has no body to be tail-recursive or pure in, and a function has no fields to lay out")
 end refuse_impossible_pairs
+
+// Whether any annotation in the set is neither about a layout nor `@section`'s placing of an object.
+private marks_a_function(attrs: Buf[Attr]) -> bool
+    for i in 0..<attrs.len()
+        if !is_layout(attrs.at(i)) && attr_word(attrs.at(i)) != "section" then return true
+
+    false
+end marks_a_function
 
 private joined(so_far: string, word: string) -> string
     if so_far == "" then return s"'@${word}'"
@@ -723,6 +753,20 @@ private has_layout(attrs: Buf[Attr]) -> bool
 
     false
 end has_layout
+
+private has_section(attrs: Buf[Attr]) -> bool
+    for i in 0..<attrs.len()
+        if attr_word(attrs.at(i)) == "section" then return true
+
+    false
+end has_section
+
+private all_layout_or_storage(attrs: Buf[Attr]) -> bool
+    for i in 0..<attrs.len()
+        if !is_layout(attrs.at(i)) && !is_storage(attrs.at(i)) then return false
+
+    true
+end all_layout_or_storage
 
 private all_layout_or_export(attrs: Buf[Attr]) -> bool
     for i in 0..<attrs.len()

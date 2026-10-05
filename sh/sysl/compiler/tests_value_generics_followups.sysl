@@ -315,3 +315,28 @@ vgf_a_type_argument_as_a_fields_length()
                               "naming one"), 1, said)
     assert_eq(vgf_count(said, "main.sysl:"), 1, said)
     assert(said.index_of("main.sysl:2:11").is_some(), said)
+
+// A signature is read against stand-ins before anything instantiates it: a type parameter stands as
+// itself, and a value parameter as a zero of the type it was declared at -- a number, so `[N]T`
+// reads as an array -- marked as a stand-in rather than an argument anybody gave.
+@test("and a value parameter stands as a number of its declared type, not as a type")
+vgf_a_value_parameter_stands_as_a_number()
+    val a = analysis_for(host_target())
+    val scope = scope_of_unit(a, parse(source_of("test.sysl", "")).program)
+    var names: Buf[string] = buf()
+    var values: Buf[TypeBinding] = buf()
+
+    names.push("T")
+    names.push("N")
+    values.push(TypeBinding("N", parse_type_text("type.sysl", "usize").value))
+
+    val subst = stand_ins(a, scope, names, values)
+
+    assert(type_eq(bound_type(subst, "T").unwrap(), Abstract("T", buf())))
+
+    bound_type(subst, "N").unwrap() match
+        ConstArg(v, ty, stand_in) ->
+            assert_eq(str(v), "0")
+            assert_eq(type_show(*ty), "usize")
+            assert(stand_in)
+        _ -> assert(false)

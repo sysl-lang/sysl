@@ -458,6 +458,22 @@ struct Tables
     // coordinate reaches the packages that named it (`packages.sysl`'s `in_package`).
     project_modules: Buf[string]
 
+    // Every block marked `override`, held until every `impl` is registered: the block it replaces may
+    // be written below it or in a module hoisted after it, so whether there is one is asked once the
+    // table is whole (`hoist_impl.sysl`'s `check_impl_overrides`).
+    override_checks: Buf[OverrideCheck]
+
+    // Every lowered body read inside a `@test` or hook declaration, by the name it was lowered under:
+    // a test written beside what it tests is scaffolding, and answers to the tests' clause as a
+    // `@tests` file's body does.
+    test_bodies: Buf[string]
+
+    // Every function written `const`, by the name its body is typed under: a declaration's key, a
+    // member's lowered name, a nested function's, and each instantiation of a generic one. **Filed
+    // where the name is made and never taken back** -- a rewound reading of a generic body still
+    // names instantiations, and whether one of them is `const` is a fact about its declaration.
+    const_fns: &Table[bool]
+
     // Whether a key is one this compilation has a declaration for, whatever kind.
     declares_type(self, key: string) -> bool = self.types.has(key)
 
@@ -487,7 +503,19 @@ tables_for(t: Target) -> &Tables =
            buf(),
            span_zero(),
            buf(), false, buf(), buf(),
-           buf())
+           buf(),
+           buf(),
+           buf(),
+           table())
+
+// One `override impl` still to be held to there being something for it to override: the type as a
+// reader spelled it, the promise the block makes, the type it covers, and where to point.
+struct OverrideCheck
+    label: string
+    bound: Bound
+    subject: Type
+    span: Span
+    scope: Scope
 
 // One trait a registered `impl` block still owes the implementing type, and everything a refusal
 // about it has to name: the type as a reader spelled it, the trait that asked, the trait it asked
@@ -700,6 +728,10 @@ struct Analysis
     // read from one has been held to the rule by every caller.
     crossing_params: &Table[Buf[string]]
 
+    // What running `const` functions while compiling keeps: the bodies typed for it and what each
+    // call came to (`const_eval.sysl`).
+    evaluation: &ConstEvaluation
+
     // Records a name as produced. The set is what matters and not the order, but the order is what
     // a walk over it reads, so a name is kept once.
     uses(*self, name: string) = note_reached(self.reached, self.journal, name)
@@ -891,7 +923,7 @@ analysis_for(t: Target) -> &Analysis = analysis_producing(t, buf())
 analysis_producing(t: Target, producing: Buf[string]) -> &Analysis =
     Analysis(tables_for(t), buf(), buf(), journal(), buf(), 0, 0, 0, 0, buf(), buf(), buf(), buf(),
              set(), reached_none(), producing, reached_none(), reached_none(), 0, buf(), 0, None,
-             false, buf(), false, None, buf(), buf(), buf(), table())
+             false, buf(), false, None, buf(), buf(), buf(), table(), const_evaluation())
 
 // -- how far a declaration reaches ---------------------------------------------------------------
 

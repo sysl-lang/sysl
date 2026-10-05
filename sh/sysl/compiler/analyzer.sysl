@@ -96,10 +96,6 @@ struct Analyzer
     func_name: string
     ret_ty: Option[Type]
 
-    // Where a built-in that reports its own place says it stands. It is the node's own span
-    // everywhere except while a parameter's default is filled in, where it is the call's.
-    reported: Option[Span]
-
     // Every unique name this **function** has handed out, whichever scope it was in.
     //
     // **It is per-function rather than per-scope, which is what the typed tree records.** Two
@@ -155,7 +151,8 @@ struct Analyzer
     // place.** That is the whole point of `assert(c, msg, file = __FILE__, line = __LINE__)`: what
     // it names is the line that wrote the call, not one in `library/sysl/check.sysl`. It is the
     // whole `Source` and not its name, because a line is an offset looked up in the text -- and the
-    // caller's packaging beside it, so a default of `__VERSION__` names the calling package.
+    // caller's packaging beside it, so a default of `__VERSION__` names the calling package, and
+    // the call's span and function, so `__LINE__`, `__COLUMN__` and `__FUNCTION__` name the call.
     here: Option[CallSite]
 
     // The nested functions of the block being read, and of every block around it inside this same
@@ -301,6 +298,23 @@ struct Analyzer
     // parameter, and the capture of it in any closure written inside. A waker is the executor's, so
     // a refusal about one sharing it says so rather than offering a '&sync' spelling it cannot take.
     wakers: Buf[string]
+
+    // The call being read, as the span its node covers and the span a complaint about it is
+    // anchored at. **A complaint about a call is about its callee** -- the name that does not exist,
+    // or does not take these arguments -- so where it would underline the whole call it underlines
+    // the name written in front of the parentheses instead, as the reference does.
+    call_anchor: Option[(Span, Span)]
+
+    // The declaration the body being read was written as -- `Box.value` where `func_name` is the
+    // instantiation `Box.value.int`. It is what asks "is this the member it names?", which an
+    // instantiation's own name, carrying its type arguments, cannot answer.
+    decl_name: string
+
+    // Where a complaint written at this span is shown: the callee's name where the span is the
+    // whole of the call being read, and the span itself everywhere else.
+    said_at(self, span: Span) -> Span = self.call_anchor match
+        Some((whole, named)) -> if whole == span then named else span
+        None -> span
 
     // What a name bound as a capture reads, or nothing where the name is an ordinary local.
     capture_read(self, unique: string) -> Option[TExpr]
@@ -469,7 +483,7 @@ struct Analyzer
 
     // Records a mistake about a place.
     fault(*self, span: Span, message: string)
-        self.an.fault(self.scope, span, message)
+        self.an.fault(self.scope, self.said_at(span), message)
 
     // Records a mistake and answers with the node every rule downstream agrees with.
     err(*self, span: Span, message: string) -> TExpr
@@ -479,7 +493,7 @@ struct Analyzer
     // The same, for a mistake no type argument could repair: read at a generic's definition, it is
     // kept rather than left for an instantiation to raise again, since nothing may instantiate it.
     err_whatever_the_types(*self, span: Span, message: string) -> TExpr
-        if self.at_definition then self.an.bound_fault(self.scope, span, message)
+        if self.at_definition then self.an.bound_fault(self.scope, self.said_at(span), message)
 
         self.err(span, message)
 
@@ -501,10 +515,10 @@ bad_expr(span: Span) -> TExpr = TExpr(span, TZero(Unknown))
 
 // An analyzer over a compilation's tables, reading a file in its own terms.
 analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
-    Analyzer(an, scope, buf(), buf(), buf(), buf(), "", None, None, buf(), buf(), false, false,
+    Analyzer(an, scope, buf(), buf(), buf(), buf(), "", None, buf(), buf(), false, false,
              None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
              empty_names(), false, buf(), buf(), buf(), "", buf(), None, None, None, buf(), 0, buf(),
-             false, false, false, AwaitOutside, false, buf())
+             false, false, false, AwaitOutside, false, buf(), None, "")
 
 // A run of names with nothing in it, named so that a constructor can say which kind it means.
 private empty_names() -> Buf[string] = buf()

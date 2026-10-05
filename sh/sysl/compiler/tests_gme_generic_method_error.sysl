@@ -1,0 +1,200 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.str_builder
+
+// What a member with type parameters of its own may and may not say (`reference/generics.md §
+// Members and associated functions`). What the CALL has to settle is the member's own parameters, so
+// one nothing at the call mentions is refused there; what the DECLARATION has to settle is which name
+// belongs to which list, and what a body may assume of either. A trait's generic member is left out
+// of an object's table, and an `impl` supplies exactly the parameters the trait's member declares.
+//
+// **Every expected list is the reference's complete output for that program (0.0.162)**, every
+// diagnostic of it, in source order; these are its `GenericMethodErrorTests`.
+
+private gme_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+// Every diagnostic a one-file program earns, one message to a line in source order.
+private gme_diags(text: string) -> string
+    val root = make_temp_dir("sysl-gme").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    var b = str_builder()
+
+    emit_llvm_text(src, None) match
+        Err(why) -> b.push(s"refused: ${why.message}")
+        Ok(made) ->
+            val ordered = in_source_order(made.report)
+
+            for i in 0..<ordered.len()
+                if i > 0 then b.push("\n")
+
+                b.push(if ordered.at(i).is_error() then "error: " else "warning: ")
+                b.push(ordered.at(i).diag.message)
+
+    remove_dir_all(root).unwrap_or(())
+    b.finish()
+end gme_diags
+
+private gme_refused(text: string, expected: string)
+    if !gme_ready() then return
+
+    assert_eq(gme_diags(text), s"error: $expected")
+
+private gme_rank() -> string = "trait Rank\n    rank(self) -> int\n"
+
+private gme_show() -> string = "trait Show\n    show(self) -> int\n"
+
+// -- the member's own parameters have to be inferable at the call --------------------------------
+
+@test("a parameter the signature never mentions cannot be inferred")
+gme_a_parameter_the_signature_never_mentions()
+    gme_refused("struct Box[T]\n    v: T\n    count[U](self) -> int = 0\nvar b = Box(1)\n" +
+                "print(b.count())\n",
+                "cannot infer the type argument 'U' of 'Box.count' here — annotate the expected type")
+
+@test("one of several left unsettled is named on its own")
+gme_one_of_several_left_unsettled()
+    gme_refused("struct Box[T]\n    v: T\n    two[U, V](self, x: U) -> int = 0\nvar b = Box(1)\n" +
+                "print(b.two(3))\n",
+                "cannot infer the type argument 'V' of 'Box.two' here — annotate the expected type")
+
+@test("a type with no parameters of its own is no different")
+gme_a_type_with_no_parameters_is_no_different()
+    gme_refused("struct Counter\n    n: int\n    count[U](self) -> int = 0\nvar c = Counter(1)\n" +
+                "print(c.count())\n",
+                "cannot infer the type argument 'U' of 'Counter.count' here — annotate the expected type")
+
+// -- the instantiation the call resolves to is checked -------------------------------------------
+
+@test("a bound the member wrote is reported in the member's name")
+gme_a_bound_the_member_wrote()
+    gme_refused(gme_rank() + "struct Box[T]\n    v: T\n    scored[U: Rank](self, x: U) -> int = " +
+                "x.rank()\nvar b = Box(1)\nprint(b.scored(2))\n",
+                "'Box.scored' requires its type parameter 'U' to implement 'Rank', but int does not")
+
+@test("and so is one on an associated function of a type with no parameters")
+gme_and_so_is_one_on_an_associated_function()
+    gme_refused(gme_rank() + "struct C\n    n: int\n    of[U: Rank](x: U) -> int = x.rank()\n" +
+                "print(C.of(1))\n",
+                "'C.of' requires its type parameter 'U' to implement 'Rank', but int does not")
+
+@test("the type's own bound is still reported in the type's name")
+gme_the_types_own_bound_is_still_reported()
+    gme_refused(gme_rank() + "struct Scored[T: Rank]\n    n: int\n    of[U](x: T, y: U) -> U = y\n" +
+                "print(Scored.of(3, true))\n",
+                "'Scored' requires its type parameter 'T' to implement 'Rank', but int does not")
+
+@test("the arity is checked before anything is inferred from the arguments")
+gme_the_arity_is_checked_first()
+    gme_refused("struct Box[T]\n    v: T\n    one[U](self, x: U) -> U = x\nvar b = Box(1)\n" +
+                "print(b.one(1, 2))\n",
+                "method 'Box.one' takes 1 argument, but 2 arguments were given")
+
+@test("an argument disagreeing with the parameter the other one fixed is reported")
+gme_an_argument_disagreeing()
+    gme_refused("struct Box[T]\n    v: T\n    two[U](self, x: U, y: U) -> U = x\nvar b = Box(1)\n" +
+                "print(b.two(1, \"s\"))\n",
+                "'x' of 'Box.two' is string, but int was given")
+
+@test("a result the arguments already fixed is not bent to the annotation")
+gme_a_result_is_not_bent_to_the_annotation()
+    gme_refused("struct Box[T]\n    v: T\n    one[U](self, x: U) -> U = x\nvar b = Box(1)\n" +
+                "var s: string = b.one(2)\n",
+                "'x' of 'Box.one' is string, but int was given")
+
+// -- the body is checked at the definition, against the member's own bounds ----------------------
+
+@test("rendering an unbounded parameter names the bound that would license it")
+gme_rendering_an_unbounded_parameter()
+    gme_refused("struct Box[T]\n    v: T\n    describe[U](self, x: U) -> string = str(x)\n",
+                "'str' needs 'U: sysl.Display'")
+
+@test("an operator on one does too")
+gme_an_operator_on_one_does_too()
+    gme_refused("struct Box[T]\n    v: T\n    twice[U](self, x: U) -> U = x + x\n",
+                "'+' needs 'U: sysl.Add'")
+
+@test("a type with no parameters of its own has its member checked all the same")
+gme_a_type_with_no_parameters_is_checked()
+    gme_refused("struct Counter\n    n: int\n    describe[U](self, x: U) -> string = str(x)\n",
+                "'str' needs 'U: sysl.Display'")
+
+@test("what the type asks of its own parameter says nothing about the member's")
+gme_the_types_bound_says_nothing_of_the_members()
+    gme_refused("struct Box[T: Display]\n    v: T\n    describe[U](self, x: U) -> string = str(x)\n",
+                "'str' needs 'U: sysl.Display'")
+
+@test("an unbounded parameter handed to a bounded type is refused at the definition")
+gme_an_unbounded_parameter_handed_to_a_bounded_type()
+    gme_refused(gme_rank() + "struct Scored[T: Rank]\n    n: int\nstruct Box[T]\n    v: T\n" +
+                "    keep[U](self, x: U) -> Scored[U] = Scored(0)\n",
+                "'Scored' requires its type parameter 'T' to implement 'Rank', but 'U' is not " +
+                "bounded by it")
+
+// -- the two lists of parameters stay apart ------------------------------------------------------
+
+@test("a member may not spell one of its own the way the type spells one of its")
+gme_a_member_may_not_reuse_the_types_name()
+    gme_refused("struct Box[T]\n    v: T\n    cast[T](self, x: T) -> T = x\n",
+                "'Box' already declares a type parameter 'T', so member 'cast' cannot declare one " +
+                "of that name")
+
+@test("a bound on the member's own parameter still has to name a trait")
+gme_a_bound_still_has_to_name_a_trait()
+    gme_refused("struct Box[T]\n    v: T\n    keep[U: Loud](self, x: U) -> U = x\n",
+                "the bound on 'U' in 'Box.keep' names 'Loud', which is not a trait")
+
+// -- an 'impl' supplies exactly the type parameters the trait's member declares ------------------
+
+@test("the trait may declare one, and the object is what cannot reach it")
+gme_the_object_cannot_reach_it()
+    gme_refused("trait Mapper\n    tag(self) -> int\n    map[U](self, x: U) -> U\nstruct P\n    n: int\n" +
+                "impl Mapper for P\n    tag(self) -> int = self.n\n    map[U](self, x: U) -> U = x\n" +
+                "val o: &Mapper = P(1)\nprint(o.map(2))\n",
+                "'map' of 'Mapper' declares type parameters of its own, so it is not a function " +
+                "until a call names them and no slot of a &Mapper's table can point at it — reach " +
+                "it through a bound, where the type is known")
+
+@test("an 'impl' may not add parameters the trait did not declare")
+gme_an_impl_may_not_add_parameters()
+    gme_refused(gme_show() + "struct P\n    n: int\nimpl Show for P\n    show[U](self) -> int = 1\n",
+                "method 'show' of 'impl Show for P' declares 1 type parameter, but trait 'Show' " +
+                "declares 0")
+
+@test("nor may a generic 'impl'")
+gme_nor_may_a_generic_impl()
+    gme_refused(gme_show() + "struct Box[T]\n    v: T\nimpl[T] Show for Box[T]\n" +
+                "    show[U](self) -> int = 1\n",
+                "method 'show' of 'impl Show for Box' declares 1 type parameter, but trait 'Show' " +
+                "declares 0")
+
+@test("nor may one matching a shape")
+gme_nor_may_one_matching_a_shape()
+    gme_refused(gme_show() + "impl[T] Show for []T\n    show[U](self) -> int = 1\n",
+                "method 'show' of 'impl Show for []T' declares 1 type parameter, but trait 'Show' " +
+                "declares 0")
+
+// A member a generic type gives a type parameter of its own names the TYPE in an argument's refusal,
+// and an associated function does the same: neither the receiver's arguments nor the member's own
+// solved ones are something a reader wrote at the member.
+@test("generic method error: a refused argument of an associated function names the type")
+gme_associated_argument_names_the_type()
+    gme_refused("struct C\n    n: int\n    of[U](x: U, y: U) -> U = x\nprint(C.of(1, \"s\"))\n",
+                "'x' of 'C.of' is string, but int was given")
+
+@test("generic method error: a parameter the solve did not touch is named the same way")
+gme_a_written_parameter_names_the_type()
+    gme_refused("struct Box[T]\n    v: T\n    two[U](self, x: U, y: int) -> U = x\nvar b = Box(1)\n" +
+                "print(b.two(1, \"s\"))\n",
+                "'y' of 'Box.two' is int, but string was given")

@@ -145,6 +145,38 @@ asy_interrupt_cannot_be_async()
               "drive")
     assert_eq(pf_at(text), "1:1")
 
+// -- `async` beside `const`: a function run while compiling answers no task ------------------------
+
+private asy_async_const_refusal() -> string = "'async' and 'const' do not combine: a 'const' " +
+    "function is run while compiling and answers its value there, and an 'async' function answers " +
+    "a task that only a running program can step — mark it one or the other"
+
+// That a file is refused once, at `at`, for the pair, and reads on as a `const` function with no task.
+private asy_one_async_const(text: string, at: string)
+    assert_eq(pf_err(text), asy_async_const_refusal())
+    assert_eq(pf_at(text), at)
+    assert_eq(pf_lines(text).len(), 1)
+
+    val tree = pf_tree(text)
+
+    assert(!tree.contains("$task"), tree)
+end asy_one_async_const
+
+@test("a function cannot be both const and async, in either order")
+asy_function_cannot_be_const_and_async()
+    asy_one_async_const("const async f(n: int) -> int = n + 1\n", "1:7")
+    asy_one_async_const("async const f(n: int) -> int = n + 1\n", "1:1")
+    asy_one_async_const("const async same[T](x: T) -> T = x\n", "1:7")
+
+@test("a method cannot be both const and async, in either order")
+asy_method_cannot_be_const_and_async()
+    asy_one_async_const("struct S\n    x: int\n\n    const async twice(self) -> int = self.x * 2\n", "4:11")
+    asy_one_async_const("struct S\n    x: int\n\n    async const twice(self) -> int = self.x * 2\n", "4:5")
+
+@test("const and async each still mark a function alone")
+asy_const_and_async_apart()
+    assert_eq(pf_err("const f(n: int) -> int = n + 1\nasync g(n: int) -> int = n\n"), "")
+
 @test("the entry body's statements cannot be async")
 asy_entry_statement_cannot_be_async()
     val text = "print(1)\nasync print(\"hi\")\n"

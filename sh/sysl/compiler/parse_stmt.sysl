@@ -100,12 +100,16 @@ end ForHeader
 
 // Which one, decided by looking down the header for the token that settles it.
 //
-// **A `;` at bracket depth zero is the three-clause loop and a `,` there is the comma spelling**,
-// and whichever comes first before the `in` decides. The scan cannot run off the line: a newline
-// inside brackets is not a token, so the first `Newline` is the end of the header.
+// **A `;` at bracket depth zero is the three-clause loop, wherever it falls before the `in`**, and a
+// `,` there with no `;` after it is the comma spelling. The `;` has to win over an earlier comma
+// because a three-clause init may itself be a list -- `for var i, j = 0, 6; …` and
+// `for a, b = 0, 6; …` open with the same tokens as the spelling being refused. The scan cannot run
+// off the line: a newline inside brackets is not a token, so the first `Newline` is the end of the
+// header.
 private for_header(p: *Parser) -> ForHeader
     var i: usize = 0
     var depth: usize = 0
+    var comma = false
 
     loop
         p.peek_at(i) match
@@ -122,14 +126,14 @@ private for_header(p: *Parser) -> ForHeader
                     depth -= 1
                 elif depth == 0
                     if w == ";" then return CStyle
-                    if w == "," then return CommaNames
+                    if w == "," then comma = true
                     if w == "in" then break
                     if w == "do" then break
             _ -> ()
 
         i += 1
 
-    Plain
+    if comma then CommaNames else Plain
 end for_header
 
 private parse_for_expr(p: *Parser, at: Span, label: Option[string]) -> Expr
@@ -288,7 +292,8 @@ private refuse_comma_names(p: *Parser, at: Span) -> Expr
 
         written = written + names.at(i)
 
-    p.fault(at, s"a 'for' names one thing, and a pattern is what takes it apart — write 'for (${written}) in …'")
+    // Anchored at the word after the names -- the `in` -- which is where the reference points.
+    p.fault(p.here(), s"a 'for' names one thing, and a pattern is what takes it apart — write 'for (${written}) in …'")
     expr(at.to(p.just_taken()), Bad)
 end refuse_comma_names
 
@@ -373,6 +378,7 @@ private parse_decl_or_stmt(p: *Parser, start: Span, vis: Visibility, marked: boo
     if p.at_kw("static") then return parse_static_decl(p, start, vis)
     if p.at_kw("val") then return parse_val_decl(p, start, vis)
     if p.at_kw("var") then return parse_var_decl(p, start, vis)
+    if at_const_func(p) then return try_func_decl(p, start, vis, no_attrs()).unwrap()
     if p.at_kw("const") then return parse_const_decl(p, start, vis)
     if p.at_kw("ref") then return parse_ref_decl(p, start)
     if p.at_kw("struct") then return parse_struct_decl(p, start, vis, false)
@@ -440,8 +446,9 @@ private parse_override_stmt(p: *Parser, start: Span) -> Stmt
         return parse_impl_decl(p, start, true)
     end if
 
+    // Pointed at the declaration the word stands in front of, as the reference points.
     p.bump()
-    p.fault(start, "'override' marks something that replaces an implementation already covering the same type, so it goes in front of an 'impl' block or of a member inside one — a declaration of its own replaces nothing")
+    p.fault(p.here(), "'override' marks something that replaces an implementation already covering the same type, so it goes in front of an 'impl' block or of a member inside one — a declaration of its own replaces nothing")
     skip_line(p)
     stmt(start.to(p.just_taken()), Bad)
 end parse_override_stmt

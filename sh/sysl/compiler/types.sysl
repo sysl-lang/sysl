@@ -142,6 +142,9 @@ struct ConstrainedType
     exclusive_hi: bool
     pred_fn: Option[string]
     cname: Option[string]
+    // `type Acc = new i64q61 wrapping`: the fixed-point arithmetic of this type wraps, as an
+    // integer's does, where every other fixed-point type saturates.
+    wrapping: bool
 end ConstrainedType
 
 // One end of a `within` range: a number, or -- over a float base only -- one of the two infinities,
@@ -190,6 +193,13 @@ enum Type
     // conversion between the two sixteen-bit formats, which goes through `f32`. `brain` is set only
     // at sixteen bits.
     Floating(bits: int, brain: bool)
+
+    // `i32q31`, `q15`, `u32q16` -- a `bits`-wide two's-complement (or unsigned) integer counting
+    // units of 2^-`frac`: an `i32` read in 2^-31ths. It is a variant of its own rather than a flag on
+    // `Integer` because its arithmetic is not an integer's -- `+` saturates and `*` rescales and
+    // rounds -- so every place that asks "is this an integer?" would otherwise answer it wrongly. It
+    // is laid out, passed and stored exactly as the `iN`/`uN` of its width.
+    Fixed(bits: int, frac: int, signed: bool)
 
     // `char` -- one Unicode scalar value.
     Char
@@ -242,7 +252,13 @@ enum Type
 
     // A value written where a type argument was expected -- `[4]` in `Buf[int, 4]`. It is a type so
     // that one substitution machinery carries both kinds of argument.
-    ConstArg(value: BigInt, ty: &Type)
+    //
+    // `stand_in` marks the zero a value parameter stands at while a generic declaration is read in
+    // its own terms. It folds like any other zero, so `[N]T` still reads as an array there, but it is
+    // no argument anybody gave: a check that a real zero fails -- a vector of no lanes -- is not
+    // asked of it, and every instantiation, which binds what the program wrote, is asked instead.
+    // It takes no part in equality or in a name.
+    ConstArg(value: BigInt, ty: &Type, stand_in: bool)
 
     // A run of types standing where one was written, which is what a variadic type parameter binds
     // to.
@@ -307,6 +323,11 @@ scalar_named(name: string, word_bits: int) -> Option[Type] = name match
     // apart from `f16` -- so it is a name here rather than a shape the width families recognise,
     // and a type annotation, a cast and a literal suffix all find it the same way.
     "bf16" -> Some(Floating(16, true))
+    // The three fixed-point formats CMSIS names, and no others: every other format is spelled out
+    // as its width and its fraction.
+    "q7" -> Some(Fixed(8, 7, true))
+    "q15" -> Some(Fixed(16, 15, true))
+    "q31" -> Some(Fixed(32, 31, true))
     "va_list" -> Some(VaList)
     "usize" -> Some(usize_type(word_bits))
     "isize" -> Some(isize_type(word_bits))
@@ -348,6 +369,9 @@ type_eq(a: Type, b: Type) -> bool = a match
         _ -> false
     Floating(ab, abr) -> b match
         Floating(bb, bbr) -> ab == bb && abr == bbr
+        _ -> false
+    Fixed(ab, af, asg) -> b match
+        Fixed(bb, bf, bsg) -> ab == bb && af == bf && asg == bsg
         _ -> false
     Char -> b match
         Char -> true
@@ -397,8 +421,8 @@ type_eq(a: Type, b: Type) -> bool = a match
     Vector(an, ae) -> b match
         Vector(bn, be) -> an == bn && type_eq(*ae, *be)
         _ -> false
-    ConstArg(av, at) -> b match
-        ConstArg(bv, bt) -> av == bv && type_eq(*at, *bt)
+    ConstArg(av, at, _) -> b match
+        ConstArg(bv, bt, _) -> av == bv && type_eq(*at, *bt)
         _ -> false
     Pack(aes) -> b match
         Pack(bes) -> types_eq(aes, bes)
@@ -423,13 +447,13 @@ type_eq(a: Type, b: Type) -> bool = a match
 private constrained_eq(a: &ConstrainedType, b: &ConstrainedType) -> bool =
     a.name == b.name && a.derived == b.derived && a.exclusive_hi == b.exclusive_hi &&
         a.pred_fn == b.pred_fn && end_opt_eq(a.lo, b.lo) && end_opt_eq(a.hi, b.hi) &&
-        a.cname == b.cname && type_eq(a.base, b.base)
+        a.cname == b.cname && a.wrapping == b.wrapping && type_eq(a.base, b.base)
 
 // A named subtype, built the way the reference compiler's case class is.
 constrained(name: string, base: Type, derived: bool, lo: Option[Decimal], hi: Option[Decimal],
             exclusive_hi: bool, pred_fn: Option[string]) -> Type =
     Constrained(ConstrainedType(name, base, derived, finite_at(lo), finite_at(hi), exclusive_hi,
-                                pred_fn, None))
+                                pred_fn, None, false))
 
 // A written end that is a number, as the end it is.
 private finite_at(d: Option[Decimal]) -> Option[RangeEnd] = d match
@@ -439,8 +463,8 @@ private finite_at(d: Option[Decimal]) -> Option[RangeEnd] = d match
 // The same, carrying the name a C header gives it.
 constrained_exported(name: string, base: Type, derived: bool, lo: Option[RangeEnd],
                      hi: Option[RangeEnd], exclusive_hi: bool, pred_fn: Option[string],
-                     cname: Option[string]) -> Type =
-    Constrained(ConstrainedType(name, base, derived, lo, hi, exclusive_hi, pred_fn, cname))
+                     cname: Option[string], wrapping: bool) -> Type =
+    Constrained(ConstrainedType(name, base, derived, lo, hi, exclusive_hi, pred_fn, cname, wrapping))
 
 // Two lists of types, element for element.
 types_eq(xs: Buf[Type], ys: Buf[Type]) -> bool

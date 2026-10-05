@@ -1,0 +1,738 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, replace_all, split}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, exists}
+import sysl.process.capture
+
+// Fixed-point numbers, stage 2 of the design the user approved (2026-10-04): mixed formats, whose
+// product and quotient take their format from the position they are written in; an integer as a
+// scale on either side of `*` and under `/`; the shifts as scales by a power of two; the `wrapping`
+// clause for an accumulator; and conversions between formats rounding to nearest, ties toward +inf.
+//
+// **The reference compiler (0.0.162) has no fixed-point type**, so nothing here was read out of it:
+// every expected raw value is the approved design's, worked out exactly by hand, and every refusal
+// is this compiler's own wording. The emitted code is checked on the two boards the proposal names:
+// a Cortex-M0+, where a Q15 product must not become a 64-bit library call, and a Cortex-M4, where an
+// exact product added into a 64-bit accumulator must be one `SMLAL`.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private fx2_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end fx2_ready
+
+private fx2_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-fx2").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end fx2_root
+
+// What a one-file program prints and the status it exits with -- or why it did not build, with the
+// directory written as `@`, and `-1`.
+private fx2_ran(text: string) -> (string, int)
+    val root = fx2_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return (said, -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> out.status match
+            Exited(code) -> (out.text, code)
+            _ -> (out.text, -2)
+end fx2_ran
+
+private fx2_prints(text: string, expected: string)
+    if !fx2_ready() then return
+
+    val ran = fx2_ran(text)
+
+    assert_eq(ran.0, expected)
+    assert_eq(ran.1, 0)
+end fx2_prints
+
+private fx2_traps(text: string)
+    if !fx2_ready() then return
+
+    val ran = fx2_ran(text)
+
+    assert(ran.1 != -1, ran.0)
+    assert(ran.1 != 0, ran.0)
+end fx2_traps
+
+// What a one-file program has to say for itself through the lowering, with the directory written as
+// `@`; the LLVM text where it had nothing to say.
+private fx2_lowered(text: string) -> (string, string)
+    val root = fx2_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> (replace_all(failure_text(why), root, "@"), "")
+        Ok(made) ->
+            if made.report.is_empty() then ("", made.text)
+            else (replace_all(analysis_report(made.report), root, "@"), "")
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fx2_lowered
+
+private fx2_refused(text: string, message: string, at: string)
+    if !fx2_ready() then return
+
+    val said = fx2_lowered(text).0
+
+    assert(said.contains(s"error: $message\n --> @/main.sysl:$at\n"), said)
+end fx2_refused
+
+// The LLVM text of the function `name` -- the definition an exported thunk calls.
+private fx2_function(text: string, name: string) -> string
+    val out = fx2_lowered(text)
+
+    assert_eq(out.0, "")
+
+    val parts = split(out.1, "\n}\n")
+
+    for i in 0..<parts.len
+        val lines = split(parts[i], "\n")
+
+        for j in 0..<lines.len
+            if lines[j].starts_with("define") && lines[j].contains("@" + name + "(") then return parts[i]
+
+    assert(false, out.1)
+    ""
+end fx2_function
+
+private fx2_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end fx2_cli
+
+private fx2_objdump() -> Option[string]
+    val candidates = ["/opt/homebrew/bin/arm-none-eabi-objdump", "/usr/local/bin/arm-none-eabi-objdump",
+                      "/usr/bin/arm-none-eabi-objdump"]
+
+    for i in 0..<candidates.len
+        if exists(candidates[i]) then return Some(candidates[i])
+
+    None
+end fx2_objdump
+
+// The disassembly of one exported function, as `sysl build-c` archives it for a board -- the whole
+// pipeline, optimization included, read back by the board's own disassembler. Nothing only where the
+// standard module's source is absent, as for every whole-program test here. **A missing tool is a
+// failure, not a skip**: the runner shows nobody what a passing test printed, so a skip would read
+// as a board checked when nothing was.
+private fx2_board_code(program: string, target: string, symbol: string) -> Option[string]
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+    end if
+
+    assert(clang_available(), "this test reads a board's code and there is no clang on this machine")
+
+    val tool = fx2_objdump()
+
+    assert(tool.is_some(), "this test reads a board's code and there is no arm-none-eabi-objdump " +
+           "on this machine (Homebrew's arm-none-eabi-binutils has one)")
+    assert(find_backend_clang(target_named(target).unwrap()).is_ok(),
+           s"this test reads a board's code and no clang here has the back end '$target' needs")
+
+    val root = fx2_root(program)
+
+    write_text(s"$root/package.hocon", s"targets {\n  default = \"$target\"\n" +
+               s"  $target { capabilities { os = false, posix = false } }\n}\n").unwrap()
+
+    val got = fx2_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"])
+
+    assert_eq(got.0, Fine, got.1)
+
+    val dis = capture(tool.unwrap(), ["-d", s"$root/app.a"], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val text = dis match
+        Ok(out) -> out.text
+        Err(_) -> ""
+
+    // The exported thunk and the definition it calls, whichever of them the optimizer kept.
+    val blocks = split(text, "\n\n")
+    var found = ""
+
+    for i in 0..<blocks.len
+        if blocks[i].contains(s"<$symbol>:") || blocks[i].contains(s"<$symbol" + "$") then
+            found = found + blocks[i] + "\n"
+
+    assert(found != "", text)
+    Some(found)
+end fx2_board_code
+
+// The calls a disassembly makes to anything but the function's own definition.
+private fx2_foreign_calls(code: string, symbol: string) -> usize
+    val lines = split(code, "\n")
+    var n: usize = 0
+
+    for i in 0..<lines.len
+        if lines[i].contains("\tbl\t") && !lines[i].contains(s"<$symbol") then n += 1
+
+    n
+end fx2_foreign_calls
+
+private fx2_count(text: string, word: string) -> usize = split(text, word).len - 1
+
+// -- what a product is ---------------------------------------------------------------------------
+
+@test("two formats with no position to name a third are refused, naming the exact product")
+fx2_mixed_product_needs_a_type()
+    fx2_refused("val a: i32q30 = 0.5\nval x: q31 = 0.25\nval y = a * x\n",
+                "the product of i32q30 and q31 has no format of its own — it is exactly an i64q61; " +
+                "give it a type", "3:9")
+
+@test("an unsigned product's exact format is unsigned")
+fx2_unsigned_mixed_product_needs_a_type()
+    fx2_refused("val a: u16q16 = 0.5\nval x: u8q8 = 0.25\nval y = a * x\n",
+                "the product of u16q16 and u8q8 has no format of its own — it is exactly a u24q24; " +
+                "give it a type", "3:9")
+
+@test("a quotient of two formats with no position to name a third is refused")
+fx2_mixed_quotient_needs_a_type()
+    fx2_refused("val a: i32q30 = 0.5\nval x: q31 = 0.25\nval y = a / x\n",
+                "the quotient of i32q30 and q31 has no format of its own; give it a type", "3:9")
+
+@test("q31 times q31 at an i64q62 is the exact product: nothing rounded")
+fx2_exact_product_into_a_wider_format()
+    fx2_prints(raw"""
+        val x: q31 = 0.75
+        val p: i64q62 = x * x
+        print(p.bits)
+        """, "2594073385365405696\n")
+
+// (-1) · (-1) is 1, which q31 cannot hold and i64q62 can: the same product saturates in one
+// position and is exact in the other.
+@test("the one product q31 cannot hold is exact at i64q62 and saturates at q31")
+fx2_minus_one_squared()
+    fx2_prints(raw"""
+        val p: i64q62 = q31::Min * q31::Min
+        val s: q31 = q31::Min * q31::Min
+        print(p.bits, s.bits)
+        """, "4611686018427387904 2147483647\n")
+
+@test("a Q2.30 coefficient times a Q31 sample at i64q61 is exact")
+fx2_coefficient_times_sample()
+    fx2_prints(raw"""
+        val b: i32q30 = 1.5
+        val x: q31 = -0.5
+        val acc: i64q61 = b * x
+        print(acc.bits)
+        """, "-1729382256910270464\n")
+
+// 2^-31 · 0.5 is exactly half a q31 unit: ties go toward +inf, so up to 1 above zero and up to 0
+// below it.
+@test("a mixed product into a narrower format rounds to nearest, ties toward +inf")
+fx2_mixed_product_rounds()
+    fx2_prints(raw"""
+        val half: i32q30 = 0.5
+        val one_and_half: i32q30 = 1.5
+        val x: q31 = 0.5
+        val p: q31 = x * one_and_half
+        val up: q31 = q31::Small * half
+        val down: q31 = -q31::Small * half
+        print(p.bits, up.bits, down.bits)
+        """, "1610612736 1 0\n")
+
+@test("a mixed product into a narrower format saturates at both ends")
+fx2_mixed_product_saturates()
+    fx2_prints(raw"""
+        val x: q31 = 0.9
+        val hi: q31 = i32q30::Max * x
+        val lo: q31 = i32q30::Min * x
+        print(hi.bits, lo.bits)
+        """, "2147483647 -2147483648\n")
+
+@test("an unsigned and a signed format multiply into a signed one")
+fx2_unsigned_times_signed()
+    fx2_prints(raw"""
+        val a: u8q8 = 0.75
+        val b: q7 = -0.5
+        val p: i16q15 = a * b
+        print(p.bits)
+        """, "-12288\n")
+
+@test("a parameter and a returned value are positions that name a format")
+fx2_parameter_and_result_name_the_format()
+    fx2_prints(raw"""
+        wide(p: i64q62) -> i64 = p.bits
+
+        square(x: q31) -> i64q62 = x * x
+
+        val x: q31 = 0.5
+        print(wide(x * x), square(x).bits)
+        """, "1152921504606846976 1152921504606846976\n")
+
+// The sibling of `+` and of a comparison is a position too, on either side.
+@test("a product beside an operand of a wider format takes that format, on either side")
+fx2_sibling_names_the_format()
+    fx2_prints(raw"""
+        val acc: i64q62 = 0.0
+        val x: q31 = 0.5
+        val lim: i64q62 = 0.3
+        val s1 = acc + x * x
+        val s2 = x * x + acc
+        print(s1.bits, s2.bits, x * x < lim, lim < x * x)
+        """, "1152921504606846976 1152921504606846976 true false\n")
+
+@test("a compound assignment gives the product the place's format")
+fx2_compound_assignment()
+    fx2_prints(raw"""
+        var y: q31 = 0.5
+        val g: i32q27 = 1.5
+        y *= g
+        val a = y.bits
+        y *= 2
+        val b = y.bits
+        y /= 4
+        val c = y.bits
+        y >>= 1
+        print(a, b, c, y.bits)
+        """, "1610612736 2147483647 536870912 268435456\n")
+
+// A derived type does not mix with its base, and a position must not be a way around that.
+@test("an operand of a 'new' type joins a product only at that same type")
+fx2_derived_operand_does_not_mix()
+    fx2_refused("type M = new q31\nval m: M = M(0.5)\nval y: i64q62 = m * m\n",
+                "cannot initialize 'y': declared i64q62 but the value is M", "3:1")
+
+// -- integer scales ------------------------------------------------------------------------------
+
+@test("an integer on either side of '*' scales and saturates, a literal there being an integer")
+fx2_integer_scale()
+    fx2_prints(raw"""
+        val x: q15 = 0.25
+        val n: int = -4
+        val a: q15 = x * 3
+        val b: q15 = x * 5
+        val c: q15 = 3 * x
+        val d: q15 = x * n
+        print(a.bits, b.bits, c.bits, d.bits)
+        """, "24576 32767 24576 -32768\n")
+
+@test("an integer under '/' divides, rounding to nearest with ties toward +inf")
+fx2_integer_divisor()
+    fx2_prints(raw"""
+        val x: q15 = 0.25
+        val three: int = 3
+        val a: q15 = x / 3
+        val b: q15 = x / three
+        val c: q15 = x / -2
+        val d: q15 = x / 2
+        val up: q15 = q15::Small / 2
+        val down: q15 = -q15::Small / 2
+        print(a.bits, b.bits, c.bits, d.bits, up.bits, down.bits)
+        """, "2731 2731 -4096 4096 1 0\n")
+
+@test("an integer divided by a fixed-point value is refused as two types")
+fx2_integer_over_fixed_is_refused()
+    fx2_refused("val x: q15 = 0.5\nval n: int = 2\nval y = n / x\n",
+                "'/' needs matching types, got int and q15", "3:13")
+
+@test("an integer divisor of zero traps")
+fx2_integer_divisor_of_zero_traps()
+    fx2_traps("val x: q15 = 0.5\nvar n: int = 0\nval y: q15 = x / n\nprint(y.bits)\n")
+
+// -- quotients -----------------------------------------------------------------------------------
+
+@test("a mixed quotient takes the format its position names, rounding to nearest")
+fx2_mixed_quotient()
+    fx2_prints(raw"""
+        val a: i32q16 = 3.0
+        val b: i16q8 = 0.5
+        val q: i32q16 = a / b
+        val s: q15 = 0.25
+        val t: q15 = 0.5
+        val r: q31 = s / t
+        val one: i16q8 = 1.0
+        val three: i16q8 = 3.0
+        val third: q15 = one / three
+        val minus: q15 = -one / three
+        print(q.bits, r.bits, third.bits, minus.bits)
+        """, "393216 1073741824 10923 -10923\n")
+
+@test("a mixed quotient saturates")
+fx2_mixed_quotient_saturates()
+    fx2_prints(raw"""
+        val one: i16q8 = 1.0
+        var small: i16q8 = i16q8::Small
+        val q: q15 = one / small
+        val r: q15 = -one / small
+        print(q.bits, r.bits)
+        """, "32767 -32768\n")
+
+@test("a mixed quotient by zero traps")
+fx2_mixed_quotient_by_zero_traps()
+    fx2_traps("val a: i32q16 = 1.0\nvar b: i16q8 = 0.0\nval q: i32q16 = a / b\nprint(q.bits)\n")
+
+// -- shifts --------------------------------------------------------------------------------------
+
+@test("a left shift scales by a power of two and saturates; a right shift floors")
+fx2_shifts()
+    fx2_prints(raw"""
+        val x: q15 = 0.25
+        val z: q15 = 0.0
+        val a = x << 1
+        val b = x << 3
+        val c = x >> 1
+        val d = -q15::Small >> 1
+        val e = x << 40
+        val f = -x << 40
+        val g = z << 40
+        print(a.bits, b.bits, c.bits, d.bits, e.bits, f.bits, g.bits)
+        """, "16384 32767 4096 -1 32767 -32768 0\n")
+
+@test("an unsigned format shifted past its width saturates or empties")
+fx2_unsigned_shifts()
+    fx2_prints(raw"""
+        val u: u8q8 = 0.5
+        val n: u8 = 9
+        print((u << 1).bits, (u << n).bits, (u >> n).bits)
+        """, "255 255 0\n")
+
+// -- the wrapping clause -------------------------------------------------------------------------
+
+@test("'wrapping' makes a type of its own, so it needs 'new'")
+fx2_wrapping_needs_new()
+    fx2_refused("type Acc = i64q61 wrapping\nval z: Acc = 0.0\n",
+                "'wrapping' changes what the operators do, so it makes a type of its own — write " +
+                "'type Acc = new i64q61 wrapping'", "1:19")
+
+@test("'wrapping' is for a fixed-point base")
+fx2_wrapping_needs_a_fixed_base()
+    fx2_refused("type W = new i32 wrapping\nval z: W = W(0)\n",
+                "'wrapping' asks a fixed-point type to wrap rather than saturate, and int is not " +
+                "fixed-point", "1:18")
+
+// At `i8q4` the range is [-8, 8): 7 + 2 wraps to -7, and taking 3 away again lands on 6 -- the
+// intermediate overflow cancels, which is the whole reason an accumulator wraps. The saturating
+// type clips at the first step and never recovers.
+@test("a 'wrapping' type's sum wraps, and an intermediate overflow cancels")
+fx2_wrapping_sum_cancels()
+    fx2_prints(raw"""
+        type Acc = new i8q4 wrapping
+
+        var w: Acc = Acc(7.0)
+        w += Acc(2.0)
+        val once = w.bits
+        w -= Acc(3.0)
+        var s: i8q4 = 7.0
+        s += 2.0
+        s -= 3.0
+        print(once, w.bits, s.bits)
+        """, "-112 96 79\n")
+
+@test("a product into a 'wrapping' type rounds, then wraps")
+fx2_wrapping_product()
+    fx2_prints(raw"""
+        type Acc = new i8q4 wrapping
+
+        val x: i8q4 = 3.0
+        val p: Acc = x * x
+        val q: i8q4 = x * x
+        print(p.bits, q.bits)
+        """, "-112 127\n")
+
+@test("negating a 'wrapping' type's most negative value wraps to itself")
+fx2_wrapping_negation()
+    fx2_prints(raw"""
+        type Acc = new i8q4 wrapping
+
+        val a: Acc = Acc(-8.0)
+        val x: i8q4 = -8.0
+        print((-a).bits, (-x).bits)
+        """, "-128 127\n")
+
+@test("a left shift of a 'wrapping' type wraps")
+fx2_wrapping_shift()
+    fx2_prints(raw"""
+        type Acc = new i8q4 wrapping
+
+        val a: Acc = Acc(1.0)
+        print((a << 3).bits, (a << 9).bits)
+        """, "-128 0\n")
+
+@test("converting out of a 'wrapping' type still rounds and saturates")
+fx2_wrapping_converts_saturating()
+    fx2_prints(raw"""
+        type Acc = new i64q61 wrapping
+
+        val big: Acc = Acc(3.5)
+        val small: Acc = Acc(-3.5)
+        val quarter: Acc = Acc(0.25)
+        print(q31(big).bits, q31(small).bits, q31(quarter).bits)
+        """, "2147483647 -2147483648 536870912\n")
+
+// -- conversions between formats -----------------------------------------------------------------
+
+// i32q16 to i16q8 drops eight bits: 0x0180 is 1.5 units of 2^-8, 0x0080 exactly half a unit.
+@test("a conversion to a coarser format rounds to nearest, ties toward +inf, and saturates")
+fx2_rescale_rounds()
+    fx2_prints(raw"""
+        val a = i32q16::Bits(384)
+        val b = i32q16::Bits(128)
+        val c = i32q16::Bits(-128)
+        val d = i32q16::Bits(-129)
+        val e: i32q16 = 200.0
+        print(i16q8(a).bits, i16q8(b).bits, i16q8(c).bits, i16q8(d).bits, i16q8(e).bits)
+        """, "2 1 0 -1 32767\n")
+
+@test("a conversion to a finer format is exact, and saturates where the range is narrower")
+fx2_rescale_widens()
+    fx2_prints(raw"""
+        val a: i16q8 = -1.5
+        val b: i16q8 = 2.0
+        print(i32q16(a).bits, q15(a).bits, q15(b).bits, u8q8(a).bits)
+        """, "-98304 -32768 32767 0\n")
+
+@test("rounding a q31 out of an i64q61 accumulator is exact at its largest value")
+fx2_rescale_at_the_top()
+    fx2_prints(raw"""
+        val top = i64q61::Max
+        val bottom = i64q61::Min
+        val half = i64q61::Bits(536870912)
+        val below = i64q61::Bits(536870911)
+        print(q31(top).bits, q31(bottom).bits, q31(half).bits, q31(below).bits)
+        """, "2147483647 -2147483648 1 0\n")
+
+// -- what is emitted -----------------------------------------------------------------------------
+
+@test("a product its position holds exactly is one widening multiply: no rounding, no clamp")
+fx2_exact_product_is_one_multiply()
+    if !fx2_ready() then return
+
+    val f = fx2_function(raw"""
+        @export("fx2_mac")
+        mac(b: i32q30, x: q31) -> i64q61 = b * x
+        """, "mac")
+
+    assert_eq(fx2_count(f, "sext i32"), 2, f)
+    assert_eq(fx2_count(f, "mul i64"), 1, f)
+    assert(!f.contains("icmp"), f)
+    assert(!f.contains("select"), f)
+    assert(!f.contains("ashr"), f)
+
+@test("a 'wrapping' sum is the plain add; a saturating one is the intrinsic")
+fx2_wrapping_sum_is_a_plain_add()
+    if !fx2_ready() then return
+
+    val w = fx2_function(raw"""
+        type Acc = new i64q61 wrapping
+
+        @export("fx2_add")
+        add(a: Acc, b: Acc) -> Acc = a + b
+        """, "add")
+
+    assert(w.contains("add i64"), w)
+    assert(!w.contains("sadd.sat"), w)
+
+    val s = fx2_function(raw"""
+        @export("fx2_add")
+        add(a: i64q61, b: i64q61) -> i64q61 = a + b
+        """, "add")
+
+    assert(s.contains("@llvm.sadd.sat.i64"), s)
+
+@test("no fixed-point operation is lowered through LLVM's fixed-point intrinsics")
+fx2_no_fix_intrinsics()
+    if !fx2_ready() then return
+
+    val out = fx2_lowered(raw"""
+        @export("fx2_ops")
+        ops(a: q15, b: q15, c: i32q30, x: q31, n: int) -> q31
+            val p: q15 = a * b
+            val q: q15 = a / b
+            val r: q31 = c * x
+            val s: q31 = c / x
+            val t: q15 = p * n + q / n
+            r + s + q31(t)
+        """)
+
+    assert_eq(out.0, "")
+    assert(!out.1.contains("mul.fix"), out.1)
+    assert(!out.1.contains("div.fix"), out.1)
+
+@test("a Q15 product on a Cortex-M0+ is a 32-bit multiply, never a 64-bit library call")
+fx2_q15_product_on_m0()
+    val code = fx2_board_code(raw"""
+        @export("fx2_mul15")
+        mul15(a: q15, b: q15) -> q15 = a * b
+
+        @export("fx2_wide15")
+        wide15(a: q15, b: q15) -> i32q30 = a * b
+
+        @export("main")
+        boot() -> i32 = 0
+        """, "thumbv6m-freestanding", "fx2_mul15")
+
+    if code.is_none() then return
+
+    val f = code.unwrap()
+
+    assert(f.contains("muls"), f)
+    assert(!f.contains("__aeabi_lmul"), f)
+    assert_eq(fx2_foreign_calls(f, "fx2_mul15"), 0, f)
+
+@test("an exact product added to a 64-bit accumulator on a Cortex-M4 is one SMLAL")
+fx2_accumulate_on_m4()
+    val code = fx2_board_code(raw"""
+        type Acc = new i64q61 wrapping
+
+        @export("fx2_mac2")
+        mac2(b0: i32q30, x0: q31, b1: i32q30, x1: q31) -> q31
+            var acc: Acc = b0 * x0
+            acc += b1 * x1
+            q31(acc)
+
+        @export("main")
+        boot() -> i32 = 0
+        """, "thumbv7em-freestanding", "fx2_mac2")
+
+    if code.is_none() then return
+
+    val f = code.unwrap()
+
+    assert_eq(fx2_count(f, "smull"), 1, f)
+    assert_eq(fx2_count(f, "smlal"), 1, f)
+    assert_eq(fx2_foreign_calls(f, "fx2_mac2"), 0, f)
+
+// -- the worked example --------------------------------------------------------------------------
+
+// The proposal's §7.1: a direct-form-I biquad with Q31 samples, Q2.30 coefficients and a wrapping
+// i64q61 accumulator, run beside a `real` copy of itself carrying the SAME coefficients (each read
+// back out of its Q2.30), so the only difference between the two is the fixed-point arithmetic.
+//
+// **The tolerance is 1e-7, and it is stated rather than tuned**: every product is exact in the
+// accumulator, so the one error per sample is the rounding to q31 at the end -- half of 2^-31, about
+// 2.3e-10 -- recirculated through the poles (radius 0.91), which amplifies it by a few tens at most;
+// an exact model of the arithmetic puts the worst case over this signal at 4.2e-9. The filter's own
+// output reaches 0.82 against an input of 0.75 (the overshoot), so a filter that did nothing would
+// be off by most of that.
+private fx2_biquad_decls() -> string = raw"""
+    type Acc = new i64q61 wrapping
+
+    struct Biquad
+        b0: i32q30
+        b1: i32q30
+        b2: i32q30
+        a1: i32q30
+        a2: i32q30
+        x1: q31
+        x2: q31
+        y1: q31
+        y2: q31
+
+        process(*self, x: q31) -> q31
+            var acc: Acc = self.b0 * x
+            acc += self.b1 * self.x1
+            acc += self.b2 * self.x2
+            acc -= self.a1 * self.y1
+            acc -= self.a2 * self.y2
+
+            val y = q31(acc)
+
+            self.x2 = self.x1
+            self.x1 = x
+            self.y2 = self.y1
+            self.y1 = y
+            y
+        end process
+    end Biquad
+
+    struct Reference
+        b0: real
+        b1: real
+        b2: real
+        a1: real
+        a2: real
+        x1: real
+        x2: real
+        y1: real
+        y2: real
+
+        process(*self, x: real) -> real
+            val y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2 - self.a1 * self.y1 -
+                self.a2 * self.y2
+
+            self.x2 = self.x1
+            self.x1 = x
+            self.y2 = self.y1
+            self.y1 = y
+            y
+        end process
+    end Reference
+
+    @export("fx2_step")
+    step(f: *Biquad, x: q31) -> q31 = f.process(x)
+    """
+
+private fx2_biquad_program() -> string = fx2_biquad_decls() + raw"""
+    // A 1 kHz low-pass at 48 kHz.
+    var f = Biquad(0.0039160, 0.0078320, 0.0039160, -1.8153396, 0.8310036, 0.0, 0.0, 0.0, 0.0)
+    var r = Reference(real(f.b0), real(f.b1), real(f.b2), real(f.a1), real(f.a2), 0.0, 0.0, 0.0, 0.0)
+    var worst = 0.0
+    var peak = 0.0
+
+    // A 500 Hz square wave at three quarters of full scale, which the filter rounds off with a
+    // little overshoot.
+    for i in 0..<4800
+        val x: q31 = if (i / 48) % 2 == 0 then 0.75 else -0.75
+        val y = f.process(x)
+        val want = r.process(real(x))
+        val d = real(y) - want
+        val err = if d < 0.0 then -d else d
+
+        if err > worst then worst = err
+        if want > peak then peak = want
+
+    print(if worst < 1.0e-7 then "within 1e-7" else s"off by $worst")
+    print(if peak > 0.75 then "it overshoots the square wave" else s"peak $peak")
+    """
+
+@test("the worked biquad, in q31 with a wrapping i64q61 accumulator, matches its float copy")
+fx2_biquad_matches_float()
+    fx2_prints(fx2_biquad_program(), "within 1e-7\nit overshoots the square wave\n")
+
+@test("and on a Cortex-M4 its five products are five 32x32-to-64 multiplies and no call")
+fx2_biquad_on_m4()
+    val code = fx2_board_code(fx2_biquad_decls() + "\n@export(\"main\")\nboot() -> i32 = 0\n",
+                              "thumbv7em-freestanding", "fx2_step")
+
+    if code.is_none() then return
+
+    val f = code.unwrap()
+
+    assert_eq(fx2_count(f, "smull") + fx2_count(f, "smlal"), 5, f)
+    assert_eq(fx2_foreign_calls(f, "fx2_step"), 0, f)

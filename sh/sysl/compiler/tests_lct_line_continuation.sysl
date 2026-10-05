@@ -1,0 +1,183 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.Buf
+import sysl.text.Search
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+
+// **An operator at the end of a line carries the expression onto the next one, and a line beginning
+// with a dot continues the one above it** (`reference/lexical.md § An unbracketed line continues
+// after an operator`). `tests_lex_layout.sysl` proves the token streams; what is here is the other
+// half of the reference's `LineContinuationTests` -- that the programs those streams make RUN, with
+// the precedence, the block extents and the bracket rule all left where they were.
+//
+// **Every output and refusal quoted here was obtained by running the reference compiler (0.0.162)
+// on the same source.**
+
+// What a program PRINTS, or what the build had to say about it.
+private lct_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end lct_out
+
+private lct_run(main: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    lct_out(fs)
+
+// -- an operator at the end of a line --------------------------------------------------------------
+
+@test("an arithmetic expression split over three lines")
+lct_an_arithmetic_expression_over_three_lines()
+    if im_can_run() then return
+
+    assert_eq(lct_run("var a = 1 +\n    2 +\n    3\nprint(a)"), "6\n")
+
+@test("a conjunction split at '&&'")
+lct_a_conjunction_split_at_and()
+    if im_can_run() then return
+
+    assert_eq(lct_run("var w = 10\nvar x = 20\nvar y = 30\nvar big = w > 5 &&\n          x > 5 &&\n" +
+                      "          y > 5\nprint(big)"),
+              "true\n")
+
+@test("a comparison split at the operator")
+lct_a_comparison_split_at_the_operator()
+    if im_can_run() then return
+
+    assert_eq(lct_run("var a = 3\nvar b = 4\nprint(a <\n      b)"), "true\n")
+
+@test("precedence is unchanged by where the line broke")
+lct_precedence_is_unchanged()
+    if im_can_run() then return
+
+    assert_eq(lct_run("var a = 2 +\n3 *\n4\nprint(a)"), "14\n")
+    assert_eq(lct_run("var a = 2 * 3 +\n4 * 5\nprint(a)"), "26\n")
+
+@test("multiplication carries a line")
+lct_multiplication_carries_a_line()
+    if im_can_run() then return
+
+    assert_eq(lct_run("var a = 6 *\n7\nprint(a)"), "42\n")
+
+@test("and a wildcard import beside it is unaffected")
+lct_a_wildcard_import_beside_it()
+    // A wildcard's `.*` is one token, so the import line still ends where it looks like it does
+    // while a `*` at the end of the line after it carries that line on.
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("isa", "isa.sysl", "module isa\n\nsix() -> int = 6\n"))
+    fs.push(("", "main.sysl", "import isa.*\n\nvar a = six() *\n    7\nprint(a)"))
+    assert_eq(lct_out(fs), "42\n")
+
+@test("a continuation inside an indented block leaves the block intact")
+lct_a_continuation_inside_a_block()
+    if im_can_run() then return
+
+    assert_eq(lct_run("var t = 0\nvar i = 0\nwhile i < 3\n    t = t +\n        i * 10\n    i++\nprint(t)"),
+              "30\n")
+
+@test("a continuation inside a function body")
+lct_a_continuation_inside_a_function_body()
+    if im_can_run() then return
+
+    assert_eq(lct_run("total(a: int, b: int, c: int) -> int\n    a +\n    b +\n    c\n" +
+                      "print(total(1, 2, 3))"),
+              "6\n")
+
+@test("an operator continuation inside a bracketed one")
+lct_an_operator_continuation_inside_brackets()
+    if im_can_run() then return
+
+    assert_eq(lct_run("print(1 +\n      2, 3 +\n      4)"), "3 7\n")
+
+@test("a signature is not affected — a parameter list already continued")
+lct_a_signature_is_not_affected()
+    if im_can_run() then return
+
+    assert_eq(lct_run("total(a: int,\n      b: int) -> int = a + b\nprint(total(20, 22))"), "42\n")
+
+// -- the error path --------------------------------------------------------------------------------
+
+@test("an operator at the end of the file has no right-hand side")
+lct_an_operator_at_the_end_of_the_file()
+    // The complaint is about the missing operand rather than the newline: the line ended, the
+    // expression did not.
+    if im_can_run() then return
+
+    val said = lct_run("var a = 1 +")
+
+    assert(said.contains("expression expected"), said)
+
+@test("a dedented continuation line does not close the block it looks like it left")
+lct_a_dedented_continuation_line()
+    // The hazard the rule accepts: the dedent is swallowed with the newline, so `1` is the
+    // assignment's right operand and the `if` closes a line later than it looks like it does.
+    if im_can_run() then return
+
+    assert_eq(lct_run("var t = 0\nif true then\n    t = 1 +\n1\nprint(t)"), "2\n")
+
+@test("a trailing dot is still an error")
+lct_a_trailing_dot_is_still_an_error()
+    // Two ways to write one chain would be a style argument in every file that has one, so only the
+    // leading dot continues.
+    if im_can_run() then return
+
+    val said = lct_run("var a = \"hi\".\n    len")
+
+    assert(said.contains("tuple index expected"), said)
+
+// -- a chain broken before the dot -----------------------------------------------------------------
+
+@test("at the top level")
+lct_a_chain_at_the_top_level()
+    if im_can_run() then return
+
+    assert_eq(lct_run("var a = \"hello\"\n    .len\nprint(a)"), "5\n")
+
+@test("with several links")
+lct_a_chain_with_several_links()
+    if im_can_run() then return
+
+    assert_eq(lct_run("import sysl.text.Search\n\nvar a = \"  padded  \"\n    .trim()\n    .len\nprint(a)"),
+              "6\n")
+
+@test("inside an indented block, which still ends where it looks like it does")
+lct_a_chain_inside_a_block()
+    if im_can_run() then return
+
+    assert_eq(lct_run("var t = 0\nvar i = 0\nwhile i < 3\n    t = t + int(s\"${i}\"\n        .len)\n" +
+                      "    i++\nprint(t)"),
+              "3\n")
+
+@test("inside a function body")
+lct_a_chain_inside_a_function_body()
+    if im_can_run() then return
+
+    assert_eq(lct_run("digits(n: int) -> usize\n    s\"${n}\"\n        .len\nprint(digits(12345))"), "5\n")
+
+@test("inside a bracketed expression")
+lct_a_chain_inside_brackets()
+    if im_can_run() then return
+
+    assert_eq(lct_run("print(\"hi\"\n    .len, \"abc\"\n    .len)"), "2 3\n")

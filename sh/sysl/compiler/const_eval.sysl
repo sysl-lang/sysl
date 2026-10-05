@@ -1,0 +1,1949 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.math.bigint.{BigInt, add, cmp, from_int, negate, sub, to_string,
+                         not as big_not}
+import sysl.text.Search
+
+// The evaluator: a `const` function run while compiling.
+//
+// **A call to a `const` function, standing where a constant is wanted, is answered by running the
+// function's body here** -- a tree-walking interpreter over the TYPED tree, the same tree the
+// lowering reads, so what a body means is settled once, by the analyzer, for both. What each
+// operation does is not defined here either: `const_fold.sysl`'s run-time arithmetic is the one
+// definition (`run_int_binary`, `run_float_binary`, `run_convert`), read by the typed fold too.
+//
+// **What it holds is scalars**: every integer width, `f32` and `f64`, `bool`, `char` and `unit`,
+// constrained subtypes of them with their checks run. Locals, assignment, every loop, `break`,
+// `continue`, an early `return`, recursion and the contract clauses are evaluated. A form outside
+// that -- a struct, an array, a string, a call to a function that is not `const` -- stops the run
+// and says so; it never falls back to a guess.
+//
+// **A trap is a compile error.** Whatever would stop the program at run time -- a division by zero,
+// a quotient a width cannot hold, a value a `within` type does not admit, a failed `require` -- stops
+// the evaluation, and the constant is refused with what stopped it and the calls it was inside.
+//
+// **Every run is bounded**: 16,000,000 steps, one per expression and statement visited, and calls
+// 512 deep. Running out of either is an error naming the constant, not a warning.
+//
+// **A callee's body is typed for the evaluation in a trial that is taken back** -- the reading
+// `opaque_body_type` makes of a `some` member's body -- so the main pass types it as it always would,
+// once, and nothing the trial registered survives into the program. The typed tree is kept here for
+// the rest of the compilation, since a body reads the same way every time it is asked.
+
+private const EvStepLimit: long = 16000000
+
+private const EvDepthLimit: usize = 512
+
+// What the evaluator keeps for the whole compilation.
+struct ConstEvaluation
+    // Whether every declaration has been read, which is when a body can be typed at all. A constant
+    // folded before then -- one a type is read in terms of -- cannot run a call.
+    ready: bool
+
+    // The bodies typed for evaluation, by the key a call names.
+    bodies: Map[string, &TFunc]
+
+    // What a call standing in a constant came to, by where it was written: the value, or the refusal
+    // it earned. A constant is folded at every use, and running it again would say nothing new.
+    done: Map[string, Option[Const]]
+    failed: Map[string, string]
+
+    // The successful runs of each callee, by the call and its arguments.
+    memo: Map[string, Option[Const]]
+
+    // Module storage being read, so a value read in terms of itself stops rather than recursing.
+    vals_reading: Buf[string]
+
+    // The bodies being typed for an evaluation: one whose typing needs a value that runs it again
+    // is a loop, told rather than followed.
+    typing: Buf[string]
+end ConstEvaluation
+
+// An evaluator that has evaluated nothing.
+const_evaluation() -> &ConstEvaluation =
+    ConstEvaluation(false, map(), map(), map(), map(), buf(), buf())
+
+// -- the seams ---------------------------------------------------------------------------------------
+
+// A call in a constant expression, answered by running it where it names a `const` function: what
+// `const_fold` asks of a `Call` that is not a conversion. `None` where the call is not one this
+// answers for, or where it stopped -- having said why, and counted the refusal, where it was a
+// mistake.
+const_call(cx: &Analyzer, e: Expr) -> Option[Const]
+    val callee = *e.kind match
+        Call(c, _) -> c
+        _ -> return None
+
+    val written = callee_word(callee)
+
+    if written.is_none() || !names_const_fn(cx.an, written.unwrap()) then return None
+
+    val ev = cx.an.evaluation
+
+    if !ev.ready
+        cx.fault(e.span, s"'${written.unwrap()}' is a 'const' function, but this value is read while " +
+                 "declarations are, before any body can be run — a 'const' call is evaluated where a " +
+                 "value is wanted, and not yet where a type is read")
+        cx.an.const_refusals += 1
+        return None
+    end if
+
+    val key = call_site_key(cx, e.span)
+    val known = ev.done.get(key)
+
+    if known.is_some() then return known.unwrap()
+
+    val refused = ev.failed.get(key)
+
+    if refused.is_some()
+        cx.fault(e.span, refused.unwrap())
+        cx.an.const_refusals += 1
+        return None
+    end if
+
+    val typed = typed_call(cx, e, None)
+
+    if typed.is_none() then return None
+
+    *typed.unwrap().kind match
+        TCall(name, _, _, _) -> if !cx.an.tables.const_fns.has(name) then return None
+        _ -> return None
+
+    evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap()) match
+        EvValue(v) ->
+            val out = v.map(c -> folded_form(c, texpr_type(typed.unwrap())))
+
+            ev.done.put(key, out)
+            out
+        EvFail(message, _) ->
+            ev.failed.put(key, message)
+            cx.fault(e.span, message)
+            cx.an.const_refusals += 1
+            None
+        EvBroken ->
+            cx.an.const_refusals += 1
+            None
+        EvQuiet -> None
+end const_call
+
+// A float constant whose initializer calls a `const` function, evaluated over the tree typed at the
+// constant's own type -- so a `f32` is rounded at every operation, as it would be at run time, rather
+// than worked out in `f64` the way the untyped fold works. Says nothing where it stops: the untyped
+// fold that `check_const_admits` runs over the same initializer is what reports.
+const_float_value(cx: &Analyzer, e: Expr, ty: Type) -> Option[real]
+    if !cx.an.evaluation.ready || !mentions_const_call(cx.an, e) then return None
+
+    val typed = typed_call(cx, e, Some(ty))
+
+    if typed.is_none() then return None
+
+    evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap()) match
+        EvValue(Some(ConstFloat(f))) -> Some(f)
+        _ -> None
+end const_float_value
+
+// A module `val`'s initializer as the literal it comes to, where it calls a `const` function: such a
+// value is laid down on every target, the compiler having run the call. A trap is refused at the
+// initializer. Where the evaluation meets something it does not hold, the initializer stays code,
+// computed before the program's statements, as it always was.
+const_val_image(cx: &Analyzer, name: string, init: TExpr) -> Option[TExpr]
+    if !calls_const_fn(cx.an, init) then return None
+
+    evaluate(cx.an, cx.scope, s"'$name'", init) match
+        EvValue(Some(v)) -> value_literal(init.span, v, texpr_type(init))
+        EvFail(message, trapped) ->
+            if trapped then cx.fault(init.span, message)
+
+            None
+        _ -> None
+end const_val_image
+
+// What a `const` initializer that calls a function owes its reader, where the function is not
+// `const`: the advice to mark it. Empty where the initializer is anything else.
+const_call_advice(cx: &Analyzer, e: Expr) -> string
+    val callee = *e.kind match
+        Call(c, _) -> c
+        _ -> return ""
+
+    val written = callee_word(callee)
+
+    if written.is_none() then return ""
+
+    val typed = typed_call(cx, e, None)
+
+    if typed.is_none() then return ""
+
+    *typed.unwrap().kind match
+        TCall(name, _, _, _) ->
+            if cx.an.tables.funcs.has(name) && !cx.an.tables.const_fns.has(name) then
+                s" — '${written.unwrap()}' is not 'const', so it runs only when the program does; " +
+                "mark it 'const' to call it here"
+            else ""
+        _ -> ""
+end const_call_advice
+
+// -- reading the call --------------------------------------------------------------------------------
+
+// The word a call's callee was written as: `f` or the `f` of `m.f`.
+private callee_word(callee: Expr) -> Option[string] = *callee.kind match
+    Ident(n) -> Some(n)
+    Field(_, n) -> Some(n)
+    _ -> None
+
+// Whether some `const` function is spelled `word` -- the cheap question asked before anything is
+// typed, so a constant that calls nothing marked pays nothing.
+private names_const_fn(a: &Analysis, word: string) -> bool
+    for i in 0..<a.tables.const_fns.len()
+        if spelled_word(a.tables.const_fns.key_at(i)) == word then return true
+
+    false
+end names_const_fn
+
+// The name a key was written as: the module and any owning type in front of it dropped, and an
+// overload's number after it.
+private spelled_word(key: string) -> string
+    var end_at = key.bytes.len
+    var start: usize = 0
+
+    // An overload's slot is a dot and digits on the end.
+    var i = key.bytes.len
+
+    while i > 0 && key.bytes[i - 1] >= u8('0') && key.bytes[i - 1] <= u8('9')
+        i -= 1
+
+    if i > 0 && i < key.bytes.len && key.bytes[i - 1] == u8('.') then end_at = i - 1
+
+    for j in 0..<end_at
+        val b = key.bytes[j]
+
+        if b == u8('$') || b == u8('.') then start = j + 1
+
+    key[start..<end_at]
+end spelled_word
+
+// Whether a written expression calls something spelled as a `const` function anywhere in it.
+private mentions_const_call(a: &Analysis, e: Expr) -> bool = *e.kind match
+    Call(c, args) ->
+        val w = callee_word(c)
+
+        if w.is_some() && names_const_fn(a, w.unwrap()) then return true
+
+        for i in 0..<args.len()
+            if mentions_const_call(a, args.at(i)) then return true
+
+        false
+    Unary(_, operand) -> mentions_const_call(a, operand)
+    Binary(_, l, r) -> mentions_const_call(a, l) || mentions_const_call(a, r)
+    Compare(operands, _) ->
+        for i in 0..<operands.len()
+            if mentions_const_call(a, operands.at(i)) then return true
+
+        false
+    _ -> false
+
+// Whether a typed tree calls a `const` function anywhere in it.
+private calls_const_fn(a: &Analysis, t: TExpr) -> bool
+    var found: Buf[bool] = buf()
+    val sink = &found
+
+    walk_texpr(t, expr_walk(true, x -> *x.kind match
+        TCall(name, _, _, _) -> if a.tables.const_fns.has(name) then sink.push(true)
+        _ -> ()))
+
+    !found.is_empty()
+end calls_const_fn
+
+// Where a call in a constant was written, with the type arguments it was read under -- the key its
+// answer is kept by.
+private call_site_key(cx: &Analyzer, at: Span) -> string
+    var out = s"${cx.scope.src.name}:${at.start}"
+
+    for i in 0..<cx.subst.len()
+        out = out + s";${cx.subst.at(i).name}=${type_show(cx.subst.at(i).ty)}"
+
+    out
+end call_site_key
+
+// What a message names the evaluation after: the constant being folded, where one is.
+private subject_of(a: &Analysis) -> string =
+    if a.consts_in_progress.is_empty() then "this value"
+    else s"'${qualified_name(a.consts_in_progress.at(a.consts_in_progress.len() - 1))}'"
+
+// A written call typed in the constant's own terms, in a trial taken back: the call is not one the
+// program makes, so nothing it reaches is reached. `None` where the reading complained.
+private typed_call(cx: &Analyzer, e: Expr, expected: Option[Type]) -> Option[TExpr]
+    val a = cx.an
+    val inner = analyzer_for(a, cx.scope)
+
+    inner.subst = cx.subst
+
+    val mark = a.complaints()
+    val trial = a.sandboxed()
+    val queued = a.tables.members.pending.len()
+    val tables = a.tables.members.vtables.len()
+    val structs = a.tables.struct_insts.len()
+    val enums = a.tables.enum_insts.len()
+    val constrained = a.tables.constrained_insts.len()
+    val closures = a.closure_funcs.len()
+
+    val t = type_expr(inner, e, expected)
+    val clean = a.complaints() == mark
+
+    a.release(trial)
+    a.restore_complaints(mark)
+    rewind_instantiations(a, queued, tables, structs, enums, constrained)
+    a.closure_funcs.truncate(closures)
+
+    if clean then Some(t) else None
+end typed_call
+
+// A callee's body, typed in a trial that is taken back (see the file's header). `None` where it has
+// no body here or the reading complained -- the main pass reads it again and says so there.
+private trial_body(a: &Analysis, name: string) -> Option[TFunc]
+    val mark = a.complaints()
+    val trial = a.sandboxed()
+    val queued = a.tables.members.pending.len()
+    val tables = a.tables.members.vtables.len()
+    val structs = a.tables.struct_insts.len()
+    val enums = a.tables.enum_insts.len()
+    val constrained = a.tables.constrained_insts.len()
+    val closures = a.closure_funcs.len()
+    val covers = a.tables.body_covers.len()
+    var typed: Option[TFunc] = None
+    val f = a.tables.funcs.get(name)
+
+    if f.is_some()
+        val d = f.unwrap()
+
+        typed = Some(analyze_body(a, d.scope, d.span, with_call_bounds(d.decl), name))
+    else
+        val lowered = a.tables.members.lowered
+
+        for i in 0..<lowered.len()
+            if typed.is_none() && lowered.at(i).name == name then
+                typed = Some(analyze_instance(a, name, lowered.at(i)))
+    end if
+
+    val clean = a.complaints() == mark
+
+    a.release(trial)
+    a.restore_complaints(mark)
+    rewind_instantiations(a, queued, tables, structs, enums, constrained)
+    a.closure_funcs.truncate(closures)
+    a.tables.body_covers.truncate(covers)
+
+    if clean then typed else None
+end trial_body
+
+// -- the run -----------------------------------------------------------------------------------------
+
+// How an evaluation ended.
+enum EvOutcome
+    // It came to a value, or to nothing for a `unit`.
+    EvValue(value: Option[Const])
+
+    // It stopped, and this is the whole of what to say: a trap where `trapped` is set, and otherwise
+    // a form the evaluator does not hold.
+    EvFail(message: string, trapped: bool)
+
+    // A body it needed did not read cleanly, which the reading of that body reports.
+    EvBroken
+
+    // It met a value that is not constant -- module storage filled at run time, an argument read
+    // out of a variable -- which is the reader's to report in its own words.
+    EvQuiet
+end EvOutcome
+
+// What one step of the walk comes to: a value, nothing, or control leaving the step.
+private enum Flow
+    EvGave(value: Const)
+    EvNone
+    EvBreak(depth: int, value: Option[Const])
+    EvContinue(depth: int)
+    EvReturn(value: Option[Const])
+    EvStop
+end Flow
+
+// How a run stopped.
+private enum EvStopKind
+    EvRunning
+    EvTrap
+    EvForm
+    EvLimit
+    EvBodyBroken
+    EvNotConstant
+end EvStopKind
+
+// One call being run.
+private struct EvFrame
+    func: string
+    shown: string
+    call: Span
+    caller: Scope
+    home: Scope
+    locals: Map[string, Const]
+    olds: Buf[Const]
+    result: Option[Const]
+    slots: Map[string, Const]
+end EvFrame
+
+// One evaluation.
+private struct EvRun
+    a: &Analysis
+    subject: string
+    base: Scope
+    steps: long
+    frames: Buf[&EvFrame]
+    loops: Buf[(Scope, Span)]
+    kind: EvStopKind
+    message: string
+end EvRun
+
+// Runs one typed expression standing in a constant: `subject` is what a refusal names, `base` the
+// file it was written in.
+private evaluate(a: &Analysis, base: Scope, subject: string, t: TExpr) -> EvOutcome
+    val r: &EvRun = EvRun(a, subject, base, 0, buf(), buf(), EvRunning, "")
+
+    // The expression itself is read in a frame of its own, which names no call: what it binds -- a
+    // pattern in a `match` -- lands there.
+    r.frames.push(EvFrame("", "", t.span, base, base, map(), buf(), None, map()))
+
+    val f = eval(r, t)
+
+    f match
+        EvGave(v) -> return EvValue(Some(v))
+        EvNone -> return EvValue(None)
+        _ -> ()
+
+    r.kind match
+        EvTrap -> EvFail(s"$subject traps while it is being compiled: ${r.message}", true)
+        EvForm -> EvFail(s"$subject cannot be computed while compiling: ${r.message}", false)
+        EvLimit -> EvFail(r.message, false)
+        EvBodyBroken -> EvBroken
+        _ -> EvQuiet
+end evaluate
+
+// The file a node of the current body was written in.
+private here(r: &EvRun) -> Scope = r.frames.at(r.frames.len() - 1).home
+
+// The call being run, where one is: the outermost frame is the expression's own.
+private running(r: &EvRun) -> &EvFrame = r.frames.at(r.frames.len() - 1)
+
+// A place in a file, as a reader finds it: the file's own name, the line and the column.
+@noinline
+private place_text(s: Scope, at: Span) -> string
+    val name = s.src.name
+    var start: usize = 0
+
+    for i in 0..<name.bytes.len
+        if name.bytes[i] == u8('/') then start = i + 1
+
+    s"${name[start..<name.bytes.len]}:${s.src.locate(at.start)}"
+end place_text
+
+// The calls the run was inside, innermost first. A deep stack is told by its three innermost calls
+// and its outermost one, with how many were left out between.
+@noinline
+private stack_text(r: &EvRun) -> string
+    var out = ""
+    val calls = r.frames.len() - 1
+    var i = r.frames.len()
+
+    while i > 1
+        i -= 1
+
+        val depth = r.frames.len() - 1 - i
+
+        if calls > 5 && depth == 3 then out = out + s"; … ${calls - 4} more calls"
+
+        if calls <= 5 || depth < 3 || i == 1
+            val f = r.frames.at(i)
+
+            out = out + (if out == "" then " — inside" else "; inside") +
+                  s" '${f.shown}', called at ${place_text(f.caller, f.call)}"
+        end if
+
+    out
+end stack_text
+
+// Stops the run at a trap: what stopped it and where, then the calls it was inside.
+@noinline
+private trap(r: &EvRun, at: Span, why: string) -> Flow
+    if r.kind == EvRunning
+        r.kind = EvTrap
+        r.message = s"$why (${place_text(here(r), at)})${stack_text(r)}"
+    end if
+
+    EvStop
+end trap
+
+// Stops the run at something it does not hold.
+@noinline
+private refuse_form(r: &EvRun, at: Span, why: string) -> Flow
+    if r.kind == EvRunning
+        r.kind = EvForm
+        r.message = s"$why (${place_text(here(r), at)})${stack_text(r)}"
+    end if
+
+    EvStop
+end refuse_form
+
+// Stops the run at a value that is not constant.
+private not_constant(r: &EvRun) -> Flow
+    if r.kind == EvRunning then r.kind = EvNotConstant
+
+    EvStop
+end not_constant
+
+// Counts one step, and stops the run where it has used them all.
+private tick(r: &EvRun) -> bool
+    r.steps += 1
+
+    if r.steps <= EvStepLimit then return true
+
+    out_of_steps(r)
+
+    false
+end tick
+
+// Stops the run that has used every step, naming what was still running.
+@noinline
+private out_of_steps(r: &EvRun)
+    if r.kind == EvRunning
+        r.kind = EvLimit
+
+        var still = "it was still running"
+
+        if r.frames.len() > 1 then still = s"'${running(r).shown}' was still running"
+
+        if !r.loops.is_empty()
+            val l = r.loops.at(r.loops.len() - 1)
+
+            still = s"the loop at ${place_text(l.0, l.1)} was still running"
+
+        r.message = s"${r.subject} did not finish within 16,000,000 steps while compiling — $still"
+    end if
+end out_of_steps
+
+// -- values -----------------------------------------------------------------------------------------
+
+// Why a value of this type is not one the evaluator holds, or nothing where it is.
+private unheld(t: Type) -> Option[string] = t match
+    Constrained(d) -> unheld(d.base)
+    Integer(_, _, _) -> None
+    Floating(bits, brain) ->
+        if !brain && (bits == 32 || bits == 64) then None
+        else Some("'f16' and 'bf16' are not evaluated while compiling yet")
+    Bool -> None
+    Char -> None
+    Unit -> None
+    Never -> None
+    Unknown -> None
+    Str -> Some("a 'string' is not evaluated while compiling yet")
+    _ -> Some(s"a '${type_show(t)}' is not evaluated while compiling yet — integers, floats, 'bool' " +
+              "and 'char' are")
+
+// A value as a reader writes it, in a call shown in a message.
+private value_text(v: Const, t: Type) -> string = v match
+    ConstInt(n) -> if underlying(t) == Char then s"'${char(u32(n.to_long().unwrap_or(0)))}'" else to_string(n)
+    ConstFloat(f) -> real_text(f)
+    ConstBool(b) -> if b then "true" else "false"
+    ConstChar(c) -> s"'$c'"
+    ConstStr(s) -> s
+
+// A settled value as `const_fold`'s callers read one: a `char` is a character there.
+private folded_form(v: Const, t: Type) -> Const = v match
+    ConstInt(n) -> if underlying(t) == Char then ConstChar(char(u32(n.to_long().unwrap_or(0)))) else v
+    _ -> v
+
+// A value as the literal it is laid down as.
+private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
+    ConstInt(n) -> Some(TExpr(span, TIntLit(n, t)))
+    ConstBool(b) -> Some(TExpr(span, TBoolLit(b)))
+    ConstFloat(f) -> Some(TExpr(span, TFloatLit(float_pattern(f), underlying(t))))
+    _ -> None
+
+// The `double` pattern a float literal carries. A NaN is the canonical quiet one: which NaN a
+// computation produces is the machine's choice, and the language promises only that it is a NaN.
+float_pattern(f: real) -> long
+    if f != f then return 0x7FF8000000000000
+
+    v_float(f) match
+        VFloat(bits) -> bits
+        _ -> 0
+end float_pattern
+
+// The value a float literal of a width stands for.
+private float_at(f: real, t: Type) -> real = underlying(t) match
+    Floating(32, _) -> real(f32(f))
+    _ -> f
+
+// What a step that has to produce a value produced, or the control it handed back.
+private ev_value_of(f: Flow) -> Option[Const] = f match
+    EvGave(v) -> Some(v)
+    _ -> None
+
+// The flow a step that wanted a value passes on, where it did not get one.
+private passed(r: &EvRun, at: Span, f: Flow) -> Flow = f match
+    EvNone -> refuse_form(r, at, "a value was wanted and nothing was produced")
+    _ -> f
+
+// -- expressions -------------------------------------------------------------------------------------
+
+// **The walk is a recursion as deep as the calls it runs, so what sits on the machine's stack for
+// each level is kept small.** A form is told apart here by its tag alone, binding nothing, and handed
+// to a function of its own (`<form>_node`) that reads the node's parts and is never folded back in --
+// so the stack holds one form's parts at each step rather than every form's. One frame holding the
+// bindings of every form, with the helpers inlined into it, came to about 32 KB a call level, and the
+// 512 levels the design promises did not fit the 8 MB a process's main thread is given.
+private eval(r: &EvRun, e: TExpr) -> Flow
+    if !tick(r) then return EvStop
+
+    *e.kind match
+        TIntLit(_, _) -> int_node(e)
+        TBoolLit(_) -> bool_node(e)
+        TLoad(_, _) -> load_node(r, e)
+        TUnary(_, _, _) -> unary_node(r, e)
+        TBinary(_, _, _, _) -> binary_node(r, e)
+        TLogical(_, _, _) -> logical_node(r, e)
+        TCompare(_, _) -> compare_node(r, e)
+        TCall(_, _, _, _) -> call_node(r, e)
+        TBlockExpr(_) -> block_node(r, e)
+        TIf(_, _, _, _) -> if_node(r, e)
+        TMatch(_, _, _) -> match_node(r, e)
+        TLoop(_, _) -> loop_node(r, e)
+        TWhile(_, _, _, _) -> while_node(r, e)
+        TDoWhile(_, _, _, _) -> do_while_node(r, e)
+        TFor(_, _, _, _, _, _, _, _) -> for_node(r, e)
+        TCFor(_, _, _, _, _, _) -> c_for_node(r, e)
+        TStore(_, _, _) -> store_node(r, e)
+        TUpdate(_, _, _, _, _, _) -> update_node(r, e)
+        TIncDec(_, _, _, _, _) -> inc_dec_node(r, e)
+        _ -> eval_rest(r, e)
+end eval
+
+@noinline
+private int_node(e: TExpr) -> Flow = *e.kind match
+    TIntLit(n, _) -> EvGave(ConstInt(n))
+    _ -> EvStop
+
+@noinline
+private bool_node(e: TExpr) -> Flow = *e.kind match
+    TBoolLit(b) -> EvGave(ConstBool(b))
+    _ -> EvStop
+
+@noinline
+private load_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TLoad(name, ty) -> load(r, e.span, name, ty)
+    _ -> EvStop
+
+@noinline
+private unary_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TUnary(op, operand, ty) -> unary(r, e.span, op, operand, ty)
+    _ -> EvStop
+
+@noinline
+private binary_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TBinary(op, l, r2, ty) -> binary(r, e.span, op, l, r2, ty)
+    _ -> EvStop
+
+@noinline
+private logical_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TLogical(op, l, r2) -> logical(r, e.span, op, l, r2)
+    _ -> EvStop
+
+@noinline
+private compare_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TCompare(operands, cmps) -> compare_chain(r, e.span, operands, cmps)
+    _ -> EvStop
+
+@noinline
+private call_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TCall(name, args, _, results) -> call(r, e.span, name, args, results)
+    _ -> EvStop
+
+@noinline
+private block_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TBlockExpr(b) -> block(r, b)
+    _ -> EvStop
+
+@noinline
+private if_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TIf(cond, then_block, else_block, _) -> ev_if(r, e.span, cond, then_block, else_block)
+    _ -> EvStop
+
+@noinline
+private match_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TMatch(scrutinee, arms, _) -> ev_match(r, e.span, scrutinee, arms)
+    _ -> EvStop
+
+@noinline
+private loop_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TLoop(body, _) -> ev_loop(r, e.span, body)
+    _ -> EvStop
+
+@noinline
+private while_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TWhile(cond, body, else_block, _) -> ev_while(r, e.span, cond, body, else_block)
+    _ -> EvStop
+
+@noinline
+private do_while_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TDoWhile(body, cond, else_block, _) -> ev_do_while(r, e.span, body, cond, else_block)
+    _ -> EvStop
+
+@noinline
+private for_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TFor(name, var_ty, lo, hi, inclusive, body, else_block, _) ->
+        ev_for(r, e.span, name, var_ty, lo, hi, inclusive, body, else_block)
+    _ -> EvStop
+
+@noinline
+private c_for_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TCFor(init, cond, step, body, else_block, _) -> ev_c_for(r, e.span, init, cond, step, body, else_block)
+    _ -> EvStop
+
+@noinline
+private store_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TStore(place, value, _) -> store(r, e.span, place, value)
+    _ -> EvStop
+
+@noinline
+private update_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TUpdate(place, op, value, ty, dispatch, check) -> update(r, e.span, place, op, value, ty, dispatch, check)
+    _ -> EvStop
+
+@noinline
+private inc_dec_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TIncDec(place, op, pre, ty, check) -> ev_inc_dec(r, e.span, place, op, pre, ty, check)
+    _ -> EvStop
+
+// Every form `eval` does not dispatch itself: the rarer ones, and those it refuses.
+@noinline
+private eval_rest(r: &EvRun, e: TExpr) -> Flow
+    *e.kind match
+        TFloatLit(bits, ty) -> EvGave(ConstFloat(float_at(real_of_bits(bits), ty)))
+        TZero(ty) -> zero_value(r, e.span, ty)
+        TGlobal(symbol, ty, writable) -> global_value(r, e.span, symbol, ty, writable)
+        TResult(_) ->
+            val res = running(r).result
+
+            if res.is_some() then EvGave(res.unwrap()) else EvNone
+        TOld(index, _) -> EvGave(running(r).olds.at(usize(index)))
+        TCast(operand, ty) -> cast(r, e.span, operand, ty)
+        TConstrainedCheck(value, target) -> constrained_check(r, e.span, value, target)
+        TConstrainedValid(value, c) -> constrained_valid(r, e.span, value, c)
+        TConstrainedStep(value, c, up, _) -> constrained_step(r, e.span, value, c, up)
+        TCheckedLoop(slot, _, inner) ->
+            running(r).slots.remove(slot)
+            eval(r, inner)
+        TQuantifier(universal, name, _, lo, hi, inclusive, pred) ->
+            quantifier(r, e.span, universal, name, lo, hi, inclusive, pred)
+        TSeq(exprs) -> seq(r, exprs)
+        TStrLit(_) -> refuse_form(r, e.span, "a 'string' is not evaluated while compiling yet")
+        TStructNew(_, _) -> refuse_form(r, e.span, "a struct is not evaluated while compiling yet")
+        TEnumNew(_, _, _) -> refuse_form(r, e.span, "an enum value is not evaluated while compiling yet")
+        TArrayLit(_, _) -> refuse_form(r, e.span, "an array is not evaluated while compiling yet")
+        TArrayFill(_, _) -> refuse_form(r, e.span, "an array is not evaluated while compiling yet")
+        TField(_, _, _) -> refuse_form(r, e.span, "a field is not evaluated while compiling yet")
+        TIndex(_, _, _) -> refuse_form(r, e.span, "an element is not evaluated while compiling yet")
+        TIntOp(op, _, _, _, _) ->
+            refuse_form(r, e.span, s"'$op' is not evaluated while compiling yet")
+        _ -> refuse_form(r, e.span, s"'${texpr_kind_name(e)}' is not evaluated while compiling yet")
+end eval_rest
+
+// Expressions run in turn for their effects.
+@noinline
+private seq(r: &EvRun, exprs: Buf[TExpr]) -> Flow
+    for i in 0..<exprs.len()
+        val f = eval(r, exprs.at(i))
+
+        f match
+            EvGave(_) -> ()
+            EvNone -> ()
+            _ -> return f
+
+    EvNone
+end seq
+
+// A step that has to come to a value.
+private eval_value(r: &EvRun, e: TExpr) -> Result[Const, Flow]
+    val f = eval(r, e)
+
+    f match
+        EvGave(v) -> Ok(v)
+        _ -> Err(passed(r, e.span, f))
+end eval_value
+
+// A step that has to come to a `bool`.
+private eval_bool(r: &EvRun, e: TExpr) -> Result[bool, Flow]
+    eval_value(r, e) match
+        Ok(ConstBool(b)) -> Ok(b)
+        Ok(_) -> Err(refuse_form(r, e.span, "a condition that is not a 'bool'"))
+        Err(f) -> Err(f)
+end eval_bool
+
+@noinline
+private zero_value(r: &EvRun, at: Span, ty: Type) -> Flow = underlying(ty) match
+    Integer(_, _, _) -> EvGave(ConstInt(from_int(0)))
+    Char -> EvGave(ConstInt(from_int(0)))
+    Floating(_, _) -> EvGave(ConstFloat(0.0))
+    Bool -> EvGave(ConstBool(false))
+    Unit -> EvNone
+    _ -> refuse_form(r, at, unheld(ty).unwrap_or(s"the zero of '${type_show(ty)}' is not evaluated while compiling yet"))
+
+@noinline
+private load(r: &EvRun, at: Span, name: string, ty: Type) -> Flow
+    val v = running(r).locals.get(name)
+
+    if v.is_some() then return EvGave(v.unwrap())
+
+    if underlying(ty) == Unit then return EvNone
+
+    refuse_form(r, at, s"'$name' is read before anything was written to it")
+end load
+
+// Module storage read by a body: a `val` whose value is constant data is that value; storage filled
+// while the program runs is not there yet.
+@noinline
+private global_value(r: &EvRun, at: Span, symbol: string, ty: Type, writable: bool) -> Flow
+    val shown = qualified_name(symbol)
+
+    if writable then return refuse_form(r, at, s"'$shown' is filled when the program runs")
+
+    val d = r.a.tables.vals.get(symbol)
+
+    if d.is_none() || d.unwrap().init.is_none() then
+        return refuse_form(r, at, s"'$shown' is filled when the program runs")
+
+    val ev = r.a.evaluation
+
+    for i in 0..<ev.vals_reading.len()
+        if ev.vals_reading.at(i) == symbol then
+            return refuse_form(r, at, s"'$shown' is read while its own value is being worked out")
+
+    ev.vals_reading.push(symbol)
+
+    val folded = const_fold(analyzer_for(r.a, d.unwrap().scope), d.unwrap().init.unwrap())
+
+    ev.vals_reading.truncate(ev.vals_reading.len() - 1)
+
+    val base = underlying(ty)
+
+    folded match
+        Some(ConstInt(n)) -> base match
+            Integer(bits, signed, _) ->
+                if fits(n, bits, signed) then EvGave(ConstInt(n))
+                else refuse_form(r, at, s"'$shown' is filled when the program runs")
+            Floating(_, _) -> EvGave(ConstFloat(float_at(int_to_float(n, 64), ty)))
+            _ -> refuse_form(r, at, s"'$shown' is filled when the program runs")
+        Some(ConstFloat(f)) -> EvGave(ConstFloat(float_at(f, ty)))
+        Some(ConstBool(b)) -> EvGave(ConstBool(b))
+        Some(ConstChar(c)) -> EvGave(ConstInt(from_int(long(u32(c)))))
+        _ -> refuse_form(r, at, s"'$shown' is filled when the program runs")
+end global_value
+
+@noinline
+private unary(r: &EvRun, at: Span, op: string, operand: TExpr, ty: Type) -> Flow
+    val v = eval_value(r, operand) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    v match
+        ConstInt(n) -> underlying(ty) match
+            Integer(bits, signed, _) ->
+                if op == "-" then EvGave(ConstInt(wrap(negate(n), bits, signed)))
+                else if op == "~" then EvGave(ConstInt(wrap(big_not(n), bits, signed)))
+                else refuse_form(r, at, s"'$op' on ${type_show(ty)}")
+            _ -> refuse_form(r, at, s"'$op' on ${type_show(ty)}")
+        ConstFloat(f) ->
+            if op == "-" then EvGave(ConstFloat(run_float_negate(f)))
+            else refuse_form(r, at, s"'$op' on ${type_show(ty)}")
+        ConstBool(b) -> if op == "!" then EvGave(ConstBool(!b)) else refuse_form(r, at, s"'$op' on bool")
+        _ -> refuse_form(r, at, s"'$op' on ${type_show(ty)}")
+end unary
+
+@noinline
+private binary(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -> Flow
+    val x = eval_value(r, l) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    val y = eval_value(r, rt) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    operate(r, at, op, texpr_type(l), x, y, checked_op(op, l, rt))
+end binary
+
+// Whether an operator is the overflow-checking form: a `within` operand makes it one.
+@noinline
+private checked_op(op: string, l: TExpr, rt: TExpr) -> bool =
+    if op == "<<" then is_ranged(texpr_type(l))
+    else (op == "+" || op == "-" || op == "*") && (is_ranged(texpr_type(l)) || is_ranged(texpr_type(rt)))
+
+// One binary operator over two values, the left operand being of type `lt`.
+@noinline
+private operate(r: &EvRun, at: Span, op: string, lt: Type, x: Const, y: Const,
+                checked: bool) -> Flow
+    val out = (x, y) match
+        (ConstInt(a), ConstInt(b)) -> underlying(lt) match
+            Integer(bits, signed, _) -> run_int_binary(op, a, b, bits, signed, checked)
+            Char -> run_int_binary(op, a, b, 32, false, false)
+            _ -> Err(s"'$op' on ${type_show(lt)}")
+        (ConstFloat(a), ConstFloat(b)) -> underlying(lt) match
+            Floating(bits, _) -> run_float_binary(op, a, b, bits)
+            _ -> Err(s"'$op' on ${type_show(lt)}")
+        (ConstBool(a), ConstBool(b)) ->
+            if op == "&" || op == "&&" then Ok(ConstBool(a && b))
+            else if op == "|" || op == "||" then Ok(ConstBool(a || b))
+            else if op == "^" || op == "!=" then Ok(ConstBool(a != b))
+            else if op == "==" then Ok(ConstBool(a == b))
+            else Err(s"'$op' on bool")
+        _ -> Err(s"'$op' on ${type_show(lt)}")
+
+    out match
+        Ok(v) -> EvGave(v)
+        Err(why) ->
+            // Two kinds of `Err` come back: a trap, and an operator that is not one of these types'.
+            // Only the run-time arithmetic traps, and every trap it answers names the operation.
+            if is_trap_text(why) then trap(r, at, why)
+            else refuse_form(r, at, s"$why is not evaluated while compiling yet")
+end operate
+
+// Whether what the arithmetic answered is a trap rather than an operator it does not have.
+private is_trap_text(why: string) -> bool =
+    why.contains("overflows") || why.contains("by zero") || why.contains("Unicode")
+
+@noinline
+private logical(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr) -> Flow
+    val a = eval_bool(r, l) match
+        Ok(b) -> b
+        Err(f) -> return f
+
+    if op == "&&" && !a then return EvGave(ConstBool(false))
+    if op == "||" && a then return EvGave(ConstBool(true))
+
+    eval_bool(r, rt) match
+        Ok(b) -> EvGave(ConstBool(b))
+        Err(f) -> f
+end logical
+
+// `a < b <= c`: each link compared in turn, and the chain false at the first link that is.
+@noinline
+private compare_chain(r: &EvRun, at: Span, operands: Buf[TExpr], cmps: Buf[TCmp]) -> Flow
+    var left = eval_value(r, operands.at(0)) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    for i in 0..<cmps.len()
+        if cmps.at(i).dispatch.is_some() then
+            return refuse_form(r, at, s"'${cmps.at(i).op}' through an implementation is not evaluated " +
+                               "while compiling yet")
+
+        val right = eval_value(r, operands.at(i + 1)) match
+            Ok(v) -> v
+            Err(f) -> return f
+
+        val verdict = operate(r, at, cmps.at(i).op, texpr_type(operands.at(i)), left, right, false)
+
+        verdict match
+            EvGave(ConstBool(false)) -> return verdict
+            EvGave(ConstBool(true)) -> ()
+            _ -> return verdict
+
+        left = right
+
+    EvGave(ConstBool(true))
+end compare_chain
+
+@noinline
+private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
+    val v = eval_value(r, operand) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    val why = unheld(ty)
+
+    if why.is_some() then return refuse_form(r, at, why.unwrap())
+
+    run_convert(v, underlying(texpr_type(operand)), underlying(ty)) match
+        Ok(out) -> EvGave(out)
+        Err(message) ->
+            if is_trap_text(message) then trap(r, at, message)
+            else refuse_form(r, at, s"$message is not evaluated while compiling yet")
+end cast
+
+// The ends of a `within` range, as the numbers the checks compare against.
+private int_end(e: RangeEnd) -> BigInt = decimal_int(finite_end(e))
+
+private ev_float_end(e: RangeEnd) -> real = e match
+    EndAt(d) -> real_of_bits(double_bits(s"$d"))
+    EndInfinite(negative) ->
+        val inf = builtin_float("infinity").unwrap()
+
+        if negative then -inf else inf
+
+// Whether a value is one a constrained type's range admits -- the checks a produce site runs.
+private admitted(d: &ConstrainedType, v: Const) -> bool = v match
+    ConstInt(n) ->
+        val lo_ok = d.lo match
+            Some(lo) -> cmp(n, int_end(lo)) >= 0
+            None -> true
+        val hi_ok = d.hi match
+            Some(hi) -> if d.exclusive_hi then cmp(n, int_end(hi)) < 0 else cmp(n, int_end(hi)) <= 0
+            None -> true
+
+        lo_ok && hi_ok
+    ConstFloat(f) ->
+        val lo_ok = d.lo match
+            Some(lo) -> f >= ev_float_end(lo)
+            None -> true
+        val hi_ok = d.hi match
+            Some(hi) -> if d.exclusive_hi then f < ev_float_end(hi) else f <= ev_float_end(hi)
+            None -> true
+
+        lo_ok && hi_ok
+    _ -> true
+
+@noinline
+private constrained_check(r: &EvRun, at: Span, value: TExpr, target: Type) -> Flow
+    val v = eval_value(r, value) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    target match
+        Constrained(d) ->
+            if d.pred_fn.is_some() then
+                return refuse_form(r, at, s"the 'where' predicate of '${type_show(target)}' is not " +
+                                   "evaluated while compiling yet")
+
+            if !admitted(d, v) then
+                return trap(r, at, s"${value_text(v, target)} is not a value '${type_show(target)}' admits")
+
+            EvGave(v)
+        _ -> EvGave(v)
+end constrained_check
+
+@noinline
+private constrained_valid(r: &EvRun, at: Span, value: TExpr, c: Type) -> Flow
+    val v = eval_value(r, value) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    c match
+        Constrained(d) -> EvGave(ConstBool(admitted(d, v)))
+        _ -> EvGave(ConstBool(true))
+end constrained_valid
+
+// `Succ` and `Pred`: one step along a range, which traps at its end.
+@noinline
+private constrained_step(r: &EvRun, at: Span, value: TExpr, c: Type, up: bool) -> Flow
+    val v = eval_value(r, value) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    val n = v match
+        ConstInt(x) -> x
+        _ -> return refuse_form(r, at, "a step along a range that is not of integers")
+
+    c match
+        Constrained(d) ->
+            if up
+                val last = d.hi match
+                    Some(h) -> if d.exclusive_hi then sub(int_end(h), from_int(1)) else int_end(h)
+                    None -> from_int(0)
+
+                if cmp(n, last) >= 0 then
+                    return trap(r, at, s"there is no value after ${to_string(n)} in '${type_show(c)}'")
+
+                EvGave(ConstInt(add(n, from_int(1))))
+            else
+                val first = d.lo match
+                    Some(l) -> int_end(l)
+                    None -> from_int(0)
+
+                if cmp(n, first) <= 0 then
+                    return trap(r, at, s"there is no value before ${to_string(n)} in '${type_show(c)}'")
+
+                EvGave(ConstInt(sub(n, from_int(1))))
+        _ -> EvGave(v)
+end constrained_step
+
+// -- calls ------------------------------------------------------------------------------------------
+
+@noinline
+private call(r: &EvRun, at: Span, name: string, args: Buf[TExpr], results: bool) -> Flow
+    if results then return refuse_form(r, at, "a call answering a list of results is not evaluated " +
+                                       "while compiling yet")
+
+    var vals: Buf[Const] = buf()
+
+    for i in 0..<args.len()
+        eval_value(r, args.at(i)) match
+            Ok(v) -> vals.push(v)
+            Err(f) -> return f
+
+    run_call(r, at, name, vals)
+end call
+
+// The body a call names, typed for the evaluation once and kept.
+@noinline
+private callee(r: &EvRun, at: Span, name: string) -> Option[&TFunc]
+    val ev = r.a.evaluation
+    val kept = ev.bodies.get(name)
+
+    if kept.is_some() then return kept
+
+    val caller = if r.frames.len() > 1 then s"'${qualified_name(running(r).func)}'" else "it"
+
+    if !r.a.tables.const_fns.has(name)
+        refuse_form(r, at, s"$caller calls '${qualified_name(name)}', which is not 'const'")
+        return None
+    end if
+
+    if r.a.tables.members.func_origin.has(name)
+        refuse_form(r, at, s"'${qualified_name(name)}' is an instance of a generic 'const' function, and " +
+                    "those are not evaluated while compiling yet")
+        return None
+    end if
+
+    // The loop is found inside the reading of the body, which is a trial whose complaints are taken
+    // back -- so it is told as one a thrown-away trial keeps.
+    for i in 0..<ev.typing.len()
+        if ev.typing.at(i) == name
+            r.a.bound_fault(here(r), at, s"${r.subject} cannot be computed while compiling: the body of " +
+                            s"'${qualified_name(name)}' is being read, and reading it needs ${r.subject}, " +
+                            "which is worked out by running that body")
+
+            if r.kind == EvRunning then r.kind = EvBodyBroken
+
+            return None
+
+    ev.typing.push(name)
+
+    val typed = trial_body(r.a, name)
+
+    ev.typing.truncate(ev.typing.len() - 1)
+
+    if typed.is_none()
+        if r.kind == EvRunning then r.kind = EvBodyBroken
+
+        return None
+    end if
+
+    val kept_now: &TFunc = typed.unwrap()
+
+    ev.bodies.put(name, kept_now)
+    Some(kept_now)
+end callee
+
+@noinline
+private run_call(r: &EvRun, at: Span, name: string, vals: Buf[Const]) -> Flow
+    val found = callee(r, at, name)
+
+    if found.is_none() then return EvStop
+
+    val f = found.unwrap()
+    val key = memo_key(name, vals)
+
+    val frame = entered(r, at, name, vals, f, key) match
+        Ok(fr) -> fr
+        Err(fl) -> return fl
+
+    // A direct self-call is where a function's `variant` is checked: the measure over the arguments
+    // about to be passed has to be below the measure over the parameters as they stand.
+    val measured = f.variant.is_some() && running(r).func == name
+
+    var before: Option[Const] = None
+
+    if measured
+        eval_value(r, f.variant.unwrap()) match
+            Ok(v) -> before = Some(v)
+            Err(fl) -> return fl
+    end if
+
+    r.frames.push(frame)
+
+    val out = run_frame(r, at, f, measured, before)
+
+    r.frames.truncate(r.frames.len() - 1)
+
+    out match
+        EvGave(v) -> r.a.evaluation.memo.put(key, Some(v))
+        EvNone -> r.a.evaluation.memo.put(key, None)
+        _ -> ()
+
+    out
+end run_call
+
+// The frame a call runs in, with its arguments bound -- or, where the call need not or may not run,
+// what it comes to instead: the value an earlier run with the same arguments gave, or the refusal of
+// a parameter or result the evaluator does not hold, or of a call nested too deep. Kept out of
+// `run_call`, which sits on the stack once per call level, so its strings do not.
+@noinline
+private entered(r: &EvRun, at: Span, name: string, vals: Buf[Const], f: &TFunc,
+                key: string) -> Result[&EvFrame, Flow]
+    for i in 0..<f.params.len()
+        val why = unheld(f.params.at(i).1)
+
+        if why.is_some() then return Err(refuse_form(r, at, why.unwrap()))
+
+    val result_why = unheld(f.ret_ty)
+
+    if result_why.is_some() then return Err(refuse_form(r, at, result_why.unwrap()))
+
+    val known = r.a.evaluation.memo.get(key)
+
+    if known.is_some() then return Err(gave(known.unwrap()))
+
+    var shown = s"${qualified_name(name)}("
+
+    for i in 0..<vals.len()
+        shown = shown + (if i > 0 then ", " else "") + value_text(vals.at(i), f.params.at(i).1)
+
+    shown = shown + ")"
+
+    if r.frames.len() > EvDepthLimit then
+        return Err(refuse_form(r, at, s"the calls nest more than 512 deep, at '$shown'"))
+
+    val frame: &EvFrame = EvFrame(name, shown, at, here(r), func_home(r.a, name), map(), buf(), None, map())
+
+    for i in 0..<f.params.len()
+        frame.locals.put(f.params.at(i).0, vals.at(i))
+
+    Ok(frame)
+end entered
+
+// The body of a call whose frame is on top: the measure, the preconditions, the snapshots `old`
+// reads, the body, and the postconditions.
+@noinline
+private run_frame(r: &EvRun, at: Span, f: &TFunc, measured: bool, before: Option[Const]) -> Flow
+    val entry = preconditions(r, at, f, measured, before)
+
+    if entry.is_some() then return entry.unwrap()
+
+    val ran = block(r, f.body)
+
+    val result = ran match
+        EvGave(v) -> Some(v)
+        EvNone -> None
+        EvReturn(v) -> v
+        _ -> return ran
+
+    val exit = postconditions(r, f, result)
+
+    if exit.is_some() then return exit.unwrap()
+
+    gave(result)
+end run_frame
+
+// What a call checks before its body runs -- the measure, the preconditions -- and the snapshots
+// `old` reads. Nothing where the body may run, and otherwise what stopped it.
+@noinline
+private preconditions(r: &EvRun, at: Span, f: &TFunc, measured: bool, before: Option[Const]) -> Option[Flow]
+    val frame = r.frames.at(r.frames.len() - 1)
+
+    if measured
+        val after = eval_value(r, f.variant.unwrap()) match
+            Ok(v) -> v
+            Err(fl) -> return Some(fl)
+
+        if !below(after, before.unwrap()) then
+            return Some(trap(r, at, s"the 'variant' of '${qualified_name(f.name)}' did not decrease: " +
+                             s"${value_text(after, texpr_type(f.variant.unwrap()))} is not below " +
+                             s"${value_text(before.unwrap(), texpr_type(f.variant.unwrap()))}"))
+    end if
+
+    for i in 0..<f.requires.len()
+        val clause = f.requires.at(i).cond
+
+        if !names_ghost(r.a, clause)
+            eval_bool(r, clause) match
+                Ok(true) -> ()
+                Ok(false) ->
+                    return Some(trap(r, clause.span, s"a 'require' of '${qualified_name(f.name)}' failed"))
+                Err(fl) -> return Some(fl)
+
+    for i in 0..<f.olds.len()
+        eval_value(r, f.olds.at(i)) match
+            Ok(v) -> frame.olds.push(v)
+            Err(fl) -> return Some(fl)
+
+    None
+end preconditions
+
+// What a call checks once its body has come to `result`: the postconditions, which read it.
+@noinline
+private postconditions(r: &EvRun, f: &TFunc, result: Option[Const]) -> Option[Flow]
+    r.frames.at(r.frames.len() - 1).result = result
+
+    for i in 0..<f.ensures.len()
+        val clause = f.ensures.at(i).cond
+
+        if !names_ghost(r.a, clause)
+            eval_bool(r, clause) match
+                Ok(true) -> ()
+                Ok(false) ->
+                    return Some(trap(r, clause.span, s"an 'ensure' of '${qualified_name(f.name)}' failed"))
+                Err(fl) -> return Some(fl)
+
+    None
+end postconditions
+
+// Whether one measure is below another.
+private below(a: Const, b: Const) -> bool = (a, b) match
+    (ConstInt(x), ConstInt(y)) -> cmp(x, y) < 0
+    (ConstFloat(x), ConstFloat(y)) -> x < y
+    _ -> false
+
+// The key a run of a callee is kept by: the callee, and each argument's exact value.
+@noinline
+private memo_key(name: string, vals: Buf[Const]) -> string
+    var out = name
+
+    for i in 0..<vals.len()
+        out = out + "|" + (vals.at(i) match
+            ConstInt(n) -> to_string(n)
+            ConstFloat(f) -> s"f${float_pattern_exact(f)}"
+            ConstBool(b) -> if b then "t" else "f"
+            ConstChar(c) -> s"c${u32(c)}"
+            ConstStr(s) -> s)
+
+    out
+end memo_key
+
+// A float's own pattern, a NaN's included, so that two arguments differing in a bit are two runs.
+private float_pattern_exact(f: real) -> long
+    var v = f
+    val p: *long = ptr_cast(&v)
+
+    *p
+end float_pattern_exact
+
+// Whether a clause names a `@ghost` function, which makes it specification rather than code.
+@noinline
+private names_ghost(a: &Analysis, e: TExpr) -> bool
+    var found: Buf[bool] = buf()
+    val sink = &found
+
+    walk_texpr(e, expr_walk(true, x -> *x.kind match
+        TCall(name, _, _, _) ->
+            val f = a.tables.funcs.get(name)
+
+            if f.is_some() && f.unwrap().decl.ghost then sink.push(true)
+        _ -> ()))
+
+    !found.is_empty()
+end names_ghost
+
+// -- statements and blocks ---------------------------------------------------------------------------
+
+private block(r: &EvRun, b: TBlock) -> Flow
+    val f = stmts(r, b.stmts)
+
+    f match
+        EvNone -> ()
+        _ -> return f
+
+    if b.result.is_some() then eval(r, b.result.unwrap()) else EvNone
+end block
+
+private stmts(r: &EvRun, list: Buf[TStmt]) -> Flow
+    for i in 0..<list.len()
+        val f = ev_stmt(r, list.at(i))
+
+        f match
+            EvNone -> ()
+            _ -> return f
+
+    EvNone
+end stmts
+
+@noinline
+private ev_stmt(r: &EvRun, s: TStmt) -> Flow
+    if !tick(r) then return EvStop
+
+    // Told apart by the tag alone, as `eval` tells expressions apart, for the same reason.
+    s match
+        TVarDecl(_, _, _, _) -> var_decl_stmt(r, s)
+        TExprStmt(_) -> expr_stmt(r, s)
+        TReturn(_) -> return_stmt(r, s)
+        TBreak(_, _) -> break_stmt(r, s)
+        TContinue(depth) -> EvContinue(depth)
+        _ -> stmt_rest(r, s)
+end ev_stmt
+
+@noinline
+private var_decl_stmt(r: &EvRun, s: TStmt) -> Flow
+    s match
+        TVarDecl(name, ty, init, _) ->
+            val why = unheld(ty)
+
+            if why.is_some() then return refuse_form(r, init.span, why.unwrap())
+
+            val f = eval(r, init)
+
+            f match
+                EvGave(v) ->
+                    r.frames.at(r.frames.len() - 1).locals.put(name, v)
+                    EvNone
+                EvNone -> EvNone
+                _ -> f
+        _ -> EvStop
+end var_decl_stmt
+
+@noinline
+private expr_stmt(r: &EvRun, s: TStmt) -> Flow
+    s match
+        TExprStmt(e) ->
+            val f = eval(r, e)
+
+            f match
+                EvGave(_) -> EvNone
+                _ -> f
+        _ -> EvStop
+end expr_stmt
+
+@noinline
+private return_stmt(r: &EvRun, s: TStmt) -> Flow
+    s match
+        TReturn(value) ->
+            if value.is_none() then return EvReturn(None)
+
+            val f = eval(r, value.unwrap())
+
+            f match
+                EvGave(v) -> EvReturn(Some(v))
+                EvNone -> EvReturn(None)
+                _ -> f
+        _ -> EvStop
+end return_stmt
+
+@noinline
+private break_stmt(r: &EvRun, s: TStmt) -> Flow
+    s match
+        TBreak(value, depth) ->
+            if value.is_none() then return EvBreak(depth, None)
+
+            val f = eval(r, value.unwrap())
+
+            f match
+                EvGave(v) -> EvBreak(depth, Some(v))
+                EvNone -> EvBreak(depth, None)
+                _ -> f
+        _ -> EvStop
+end break_stmt
+
+// Every statement `ev_stmt` does not dispatch itself.
+@noinline
+private stmt_rest(r: &EvRun, s: TStmt) -> Flow
+    s match
+        TInvariant(cond, _) ->
+            if names_ghost(r.a, cond) then return EvNone
+
+            eval_bool(r, cond) match
+                Ok(true) -> EvNone
+                Ok(false) -> trap(r, cond.span, "a loop 'invariant' failed")
+                Err(f) -> f
+        TVariantCheck(slot, _, e) ->
+            if names_ghost(r.a, e) then return EvNone
+
+            variant_check(r, slot, e)
+        TWriteStmt(w) -> write(r, w)
+        TMultiAssign(writes) -> ev_multi_assign(r, writes)
+        TBecome(c) ->
+            val f = eval(r, c)
+
+            f match
+                EvGave(v) -> EvReturn(Some(v))
+                EvNone -> EvReturn(None)
+                _ -> f
+        TRefDecl(name, _, place) ->
+            refuse_form(r, place.span, s"'ref $name' is not evaluated while compiling yet")
+        TDefer(_) -> refuse_form(r, span_zero(), "a 'defer' is not evaluated while compiling yet")
+        TAsm(_, _, _, span) -> refuse_form(r, span, "an 'asm' block is outside the program")
+        _ -> EvStop
+end stmt_rest
+
+// A loop's measure, compared against the one the turn before took.
+@noinline
+private variant_check(r: &EvRun, slot: string, e: TExpr) -> Flow
+    val cur = eval_value(r, e) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    val frame = r.frames.at(r.frames.len() - 1)
+    val prev = frame.slots.get(slot)
+
+    if prev.is_some() && !below(cur, prev.unwrap()) then
+        return trap(r, e.span, s"the loop's 'variant' did not decrease: ${value_text(cur, texpr_type(e))} " +
+                    s"is not below ${value_text(prev.unwrap(), texpr_type(e))}")
+
+    frame.slots.put(slot, cur)
+    EvNone
+end variant_check
+
+// The local a write lands in, where the place is one.
+private local_place(place: TExpr) -> Option[string] = *place.kind match
+    TLoad(name, _) -> Some(name)
+    _ -> None
+
+private assign(r: &EvRun, name: string, v: Const) =
+    r.frames.at(r.frames.len() - 1).locals.put(name, v)
+
+private no_place(r: &EvRun, place: TExpr) -> Flow =
+    refuse_form(r, place.span, "a write into a field or an element is not evaluated while compiling yet")
+
+@noinline
+private store(r: &EvRun, at: Span, place: TExpr, value: TExpr) -> Flow
+    val name = local_place(place)
+
+    if name.is_none() || r.frames.is_empty() then return no_place(r, place)
+
+    val v = eval_value(r, value) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    assign(r, name.unwrap(), v)
+    EvGave(v)
+end store
+
+// What a compound assignment's operator makes of the place's value and the value on the right, and
+// the check a constrained place owes the result.
+@noinline
+private combined(r: &EvRun, at: Span, op: string, place_ty: Type, cur: Const, v: Const,
+                 check: Option[Type]) -> Flow
+    val bin = op[0..<(op.bytes.len - 1)]
+    val checked = is_ranged(place_ty) && (bin == "+" || bin == "-" || bin == "*" || bin == "<<")
+    val out = operate(r, at, bin, place_ty, cur, v, checked)
+
+    if check.is_none() then return out
+
+    val nv = ev_value_of(out)
+
+    if nv.is_none() then return out
+
+    check.unwrap() match
+        Constrained(d) ->
+            if d.pred_fn.is_some() then
+                return refuse_form(r, at, s"the 'where' predicate of '${type_show(check.unwrap())}' is " +
+                                   "not evaluated while compiling yet")
+
+            if !admitted(d, nv.unwrap()) then
+                return trap(r, at, s"${value_text(nv.unwrap(), check.unwrap())} is not a value " +
+                            s"'${type_show(check.unwrap())}' admits")
+
+            out
+        _ -> out
+end combined
+
+@noinline
+private update(r: &EvRun, at: Span, place: TExpr, op: string, value: TExpr, ty: Type,
+               dispatch: Option[TDispatch], check: Option[Type]) -> Flow
+    if dispatch.is_some() then
+        return refuse_form(r, at, s"'$op' through an implementation is not evaluated while compiling yet")
+
+    val name = local_place(place)
+
+    if name.is_none() || r.frames.is_empty() then return no_place(r, place)
+
+    val cur = eval_value(r, place) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    val v = eval_value(r, value) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    val out = combined(r, at, op, ty, cur, v, check)
+
+    ev_value_of(out) match
+        Some(nv) -> assign(r, name.unwrap(), nv)
+        None -> ()
+
+    out
+end update
+
+@noinline
+private ev_inc_dec(r: &EvRun, at: Span, place: TExpr, op: string, pre: bool, ty: Type,
+                check: Option[Type]) -> Flow
+    val name = local_place(place)
+
+    if name.is_none() || r.frames.is_empty() then return no_place(r, place)
+
+    val cur = eval_value(r, place) match
+        Ok(ConstInt(n)) -> n
+        Ok(_) -> return refuse_form(r, at, s"'$op' on ${type_show(ty)} is not evaluated while compiling yet")
+        Err(f) -> return f
+
+    val stepped = if op == "++" then add(cur, from_int(1)) else sub(cur, from_int(1))
+    val nv = underlying(ty) match
+        Integer(bits, signed, _) -> wrap(stepped, bits, signed)
+        _ -> stepped
+
+    check match
+        Some(Constrained(d)) ->
+            if d.pred_fn.is_some() then
+                return refuse_form(r, at, s"the 'where' predicate of '${type_show(check.unwrap())}' is " +
+                                   "not evaluated while compiling yet")
+
+            if !admitted(d, ConstInt(nv)) then
+                return trap(r, at, s"${to_string(nv)} is not a value '${type_show(check.unwrap())}' admits")
+        _ -> ()
+
+    assign(r, name.unwrap(), ConstInt(nv))
+    EvGave(ConstInt(if pre then nv else cur))
+end ev_inc_dec
+
+@noinline
+private write(r: &EvRun, w: TWrite) -> Flow
+    if !w.check.is_empty() then return no_place(r, w.place)
+
+    if w.op == "=" then
+        return store(r, w.value.span, w.place, w.value) match
+            EvGave(_) -> EvNone
+            other -> other
+
+    update(r, w.value.span, w.place, w.op, w.value, texpr_type(w.place), w.dispatch, w.constraint) match
+        EvGave(_) -> EvNone
+        other -> other
+end write
+
+// `a, b = b, a`: every value worked out before anything lands.
+@noinline
+private ev_multi_assign(r: &EvRun, writes: Buf[TWrite]) -> Flow
+    var landing: Buf[(string, Const)] = buf()
+
+    for i in 0..<writes.len()
+        val w = writes.at(i)
+        val name = local_place(w.place)
+
+        if name.is_none() || !w.check.is_empty() || r.frames.is_empty() then return no_place(r, w.place)
+
+        val v = eval_value(r, w.value) match
+            Ok(x) -> x
+            Err(f) -> return f
+
+        if w.op == "="
+            landing.push((name.unwrap(), v))
+        else
+            if w.dispatch.is_some() then
+                return refuse_form(r, w.value.span, s"'${w.op}' through an implementation is not " +
+                                   "evaluated while compiling yet")
+
+            val cur = eval_value(r, w.place) match
+                Ok(x) -> x
+                Err(f) -> return f
+
+            val out = combined(r, w.value.span, w.op, texpr_type(w.place), cur, v, w.constraint)
+
+            ev_value_of(out) match
+                Some(nv) -> landing.push((name.unwrap(), nv))
+                None -> return out
+        end if
+
+    for i in 0..<landing.len()
+        assign(r, landing.at(i).0, landing.at(i).1)
+
+    EvNone
+end ev_multi_assign
+
+// -- branching ---------------------------------------------------------------------------------------
+
+// Whether every term of a condition holds, binding what its patterns bind.
+@noinline
+private ev_holds(r: &EvRun, terms: Buf[TCondTerm]) -> Result[bool, Flow]
+    for i in 0..<terms.len()
+        terms.at(i) match
+            TCondTest(c) ->
+                eval_bool(r, c) match
+                    Ok(true) -> ()
+                    Ok(false) -> return Ok(false)
+                    Err(f) -> return Err(f)
+            TCondIs(subject, patterns, negated) ->
+                val v = eval_value(r, subject) match
+                    Ok(x) -> x
+                    Err(f) -> return Err(f)
+
+                var any = false
+
+                for j in 0..<patterns.len()
+                    if !any
+                        matches(r, patterns.at(j), v) match
+                            Ok(m) -> any = m
+                            Err(f) -> return Err(f)
+
+                if any == negated then return Ok(false)
+
+    Ok(true)
+end ev_holds
+
+// Whether a scalar matches a pattern, binding the names it binds.
+@noinline
+private matches(r: &EvRun, p: TPattern, v: Const) -> Result[bool, Flow] = p match
+    TWildPattern(_) -> Ok(true)
+    TBindPattern(name, _) ->
+        assign(r, name, v)
+        Ok(true)
+    TAtPattern(name, inner) ->
+        val m = matches(r, *inner, v)
+
+        m match
+            Ok(true) -> assign(r, name, v)
+            _ -> ()
+
+        m
+    TLitPattern(value) ->
+        eval_value(r, value) match
+            Ok(lit) -> ev_value_of(operate(r, value.span, "==", texpr_type(value), v, lit, false)) match
+                Some(ConstBool(b)) -> Ok(b)
+                _ -> Err(EvStop)
+            Err(f) -> Err(f)
+    TRangePattern(lo, hi, inclusive) ->
+        val l = eval_value(r, lo) match
+            Ok(x) -> x
+            Err(f) -> return Err(f)
+
+        val h = eval_value(r, hi) match
+            Ok(x) -> x
+            Err(f) -> return Err(f)
+
+        val ty = texpr_type(lo)
+        val above = ev_value_of(operate(r, lo.span, ">=", ty, v, l, false))
+        val under = ev_value_of(operate(r, hi.span, if inclusive then "<=" else "<", ty, v, h, false))
+
+        (above, under) match
+            (Some(ConstBool(a)), Some(ConstBool(b))) -> Ok(a && b)
+            _ -> Err(EvStop)
+    TVariantPattern(_, _, _) ->
+        Err(refuse_form(r, span_zero(), "a variant pattern is not evaluated while compiling yet"))
+    TStructPattern(_, _) ->
+        Err(refuse_form(r, span_zero(), "a struct pattern is not evaluated while compiling yet"))
+
+@noinline
+private ev_if(r: &EvRun, at: Span, cond: Buf[TCondTerm], then_block: TBlock,
+                else_block: Option[TBlock]) -> Flow
+    ev_holds(r, cond) match
+        Ok(true) -> block(r, then_block)
+        Ok(false) -> if else_block.is_some() then block(r, else_block.unwrap()) else EvNone
+        Err(f) -> f
+end ev_if
+
+@noinline
+private ev_match(r: &EvRun, at: Span, scrutinee: TExpr, arms: Buf[TArm]) -> Flow
+    val v = eval_value(r, scrutinee) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    chosen_arm(r, arms, v) match
+        Ok(Some(body)) -> block(r, body)
+        Ok(None) -> trap(r, at, "no arm of the 'match' took the value")
+        Err(f) -> f
+end ev_match
+
+// The body of the first arm whose pattern takes the value and whose guard holds, its bindings made.
+@noinline
+private chosen_arm(r: &EvRun, arms: Buf[TArm], v: Const) -> Result[Option[TBlock], Flow]
+    for i in 0..<arms.len()
+        val arm = arms.at(i)
+        var hit = false
+
+        for j in 0..<arm.patterns.len()
+            if !hit
+                matches(r, arm.patterns.at(j), v) match
+                    Ok(m) -> hit = m
+                    Err(f) -> return Err(f)
+
+        if hit && arm.guard.is_some()
+            eval_bool(r, arm.guard.unwrap()) match
+                Ok(g) -> hit = g
+                Err(f) -> return Err(f)
+
+        if hit then return Ok(Some(arm.body))
+
+    Ok(None)
+end chosen_arm
+
+// -- loops -------------------------------------------------------------------------------------------
+
+// What one pass through a loop's body comes to for the loop.
+private enum Turn
+    TurnOn
+    TurnDone(value: Option[Const])
+    TurnOut(flow: Flow)
+end Turn
+
+private turn(f: Flow) -> Turn = f match
+    EvNone -> TurnOn
+    EvGave(_) -> TurnOn
+    EvContinue(d) -> if d == 0 then TurnOn else TurnOut(EvContinue(d - 1))
+    EvBreak(d, v) -> if d == 0 then TurnDone(v) else TurnOut(EvBreak(d - 1, v))
+    _ -> TurnOut(f)
+
+private enter_loop(r: &EvRun, at: Span) = r.loops.push((here(r), at))
+
+// Leaves a loop with what it came to.
+private left(r: &EvRun, f: Flow) -> Flow
+    r.loops.truncate(r.loops.len() - 1)
+    f
+end left
+
+private gave(v: Option[Const]) -> Flow = if v.is_some() then EvGave(v.unwrap()) else EvNone
+
+// What a loop that ran out comes to: its `else`, or nothing.
+private ran_out(r: &EvRun, else_block: Option[TBlock]) -> Flow =
+    left(r, if else_block.is_some() then block(r, else_block.unwrap()) else EvNone)
+
+@noinline
+private ev_loop(r: &EvRun, at: Span, body: Buf[TStmt]) -> Flow
+    enter_loop(r, at)
+
+    loop
+        if !tick(r) then return left(r, EvStop)
+
+        turn(stmts(r, body)) match
+            TurnOn -> ()
+            TurnDone(v) -> return left(r, gave(v))
+            TurnOut(f) -> return left(r, f)
+end ev_loop
+
+@noinline
+private ev_while(r: &EvRun, at: Span, cond: Buf[TCondTerm], body: Buf[TStmt],
+                   else_block: Option[TBlock]) -> Flow
+    enter_loop(r, at)
+
+    loop
+        if !tick(r) then return left(r, EvStop)
+
+        ev_holds(r, cond) match
+            Ok(true) -> ()
+            Ok(false) -> return ran_out(r, else_block)
+            Err(f) -> return left(r, f)
+
+        turn(stmts(r, body)) match
+            TurnOn -> ()
+            TurnDone(v) -> return left(r, gave(v))
+            TurnOut(f) -> return left(r, f)
+end ev_while
+
+@noinline
+private ev_do_while(r: &EvRun, at: Span, body: Buf[TStmt], cond: TExpr,
+                      else_block: Option[TBlock]) -> Flow
+    enter_loop(r, at)
+
+    loop
+        if !tick(r) then return left(r, EvStop)
+
+        turn(stmts(r, body)) match
+            TurnOn -> ()
+            TurnDone(v) -> return left(r, gave(v))
+            TurnOut(f) -> return left(r, f)
+
+        eval_bool(r, cond) match
+            Ok(true) -> ()
+            Ok(false) -> return ran_out(r, else_block)
+            Err(f) -> return left(r, f)
+end ev_do_while
+
+@noinline
+private ev_for(r: &EvRun, at: Span, name: string, var_ty: Type, lo: TExpr, hi: TExpr,
+                 inclusive: bool, body: Buf[TStmt], else_block: Option[TBlock]) -> Flow
+    val first = eval_value(r, lo) match
+        Ok(ConstInt(n)) -> n
+        Ok(_) -> return refuse_form(r, at, "a range that is not of integers is not evaluated while compiling yet")
+        Err(f) -> return f
+
+    val last = eval_value(r, hi) match
+        Ok(ConstInt(n)) -> n
+        Ok(_) -> return refuse_form(r, at, "a range that is not of integers is not evaluated while compiling yet")
+        Err(f) -> return f
+
+    enter_loop(r, at)
+
+    var i = first
+
+    loop
+        if !tick(r) then return left(r, EvStop)
+
+        val more = if inclusive then cmp(i, last) <= 0 else cmp(i, last) < 0
+
+        if !more then return ran_out(r, else_block)
+
+        assign(r, name, ConstInt(i))
+
+        turn(stmts(r, body)) match
+            TurnOn -> ()
+            TurnDone(v) -> return left(r, gave(v))
+            TurnOut(f) -> return left(r, f)
+
+        i = add(i, from_int(1))
+end ev_for
+
+@noinline
+private ev_c_for(r: &EvRun, at: Span, init: Buf[TStmt], cond: Option[TExpr], step: Buf[TStmt],
+                   body: Buf[TStmt], else_block: Option[TBlock]) -> Flow
+    val started = stmts(r, init)
+
+    started match
+        EvNone -> ()
+        _ -> return started
+
+    enter_loop(r, at)
+
+    loop
+        if !tick(r) then return left(r, EvStop)
+
+        if cond.is_some()
+            eval_bool(r, cond.unwrap()) match
+                Ok(true) -> ()
+                Ok(false) -> return ran_out(r, else_block)
+                Err(f) -> return left(r, f)
+        end if
+
+        turn(stmts(r, body)) match
+            TurnOn -> ()
+            TurnDone(v) -> return left(r, gave(v))
+            TurnOut(f) -> return left(r, f)
+
+        val stepped = stmts(r, step)
+
+        stepped match
+            EvNone -> ()
+            _ -> return left(r, stepped)
+end ev_c_for
+
+// `forall`/`exists` over a range, answered by trying every value in it.
+@noinline
+private quantifier(r: &EvRun, at: Span, universal: bool, name: string, lo: TExpr, hi: TExpr,
+                   inclusive: bool, pred: TExpr) -> Flow
+    val first = eval_value(r, lo) match
+        Ok(ConstInt(n)) -> n
+        Ok(_) -> return refuse_form(r, at, "a quantifier over a range that is not of integers")
+        Err(f) -> return f
+
+    val last = eval_value(r, hi) match
+        Ok(ConstInt(n)) -> n
+        Ok(_) -> return refuse_form(r, at, "a quantifier over a range that is not of integers")
+        Err(f) -> return f
+
+    var i = first
+
+    loop
+        if !tick(r) then return EvStop
+
+        val more = if inclusive then cmp(i, last) <= 0 else cmp(i, last) < 0
+
+        if !more then return EvGave(ConstBool(universal))
+
+        assign(r, name, ConstInt(i))
+
+        eval_bool(r, pred) match
+            Ok(b) -> if b != universal then return EvGave(ConstBool(b))
+            Err(f) -> return f
+
+        i = add(i, from_int(1))
+end quantifier

@@ -1,0 +1,219 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture}
+import sysl.text.{repeat, Search}
+
+// **A member called off a trait's name is refused at the member**, in the words the same member read
+// is: a trait is no value and no type of its own, so `T.f(1)` is told that `f` is reached through a
+// value of an implementing type, and `T.nope(1)` that the trait declares no `nope` -- never that `T`
+// is an undefined name. Every message, location and caret here is the reference's own output (sysl
+// 0.0.162) for the same project, with the scratch directory put back in for its path.
+
+private tcl_ready() -> bool = std_root().is_ok()
+
+// What `sysl build <dir>` says about a project holding `main.sysl` and, where `geom` is not empty, a
+// module `geom` beside it.
+private tcl_run(text: string, geom: string = "") -> (string, string, int)
+    val root = make_temp_dir("sysl-tcl").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    if geom != ""
+        make_dir_all(s"$root/geom").unwrap()
+        write_text(s"$root/geom/geom.sysl", geom).unwrap()
+    end if
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build", root], (line) -> sink.push(line))
+    val out = if lines.is_empty() then "" else lines.at(0)
+
+    remove_dir_all(root).unwrap_or(())
+    (out, absolute_path(root), code)
+
+// The whole rendered diagnostic: `quoted` is the line it quotes, and the caret stands under column
+// `col`, `width` wide.
+private tcl_expect(text: string, message: string, line: int, col: int, quoted: string, width: int,
+                   geom: string = "")
+    val (out, root, code) = tcl_run(text, geom)
+    val pad = repeat(" ", usize(col - 1))
+    val carets = repeat("^", usize(width))
+
+    assert_eq(code, 1)
+    assert_eq(out, s"error: $message\n --> $root/main.sysl:$line:$col\n  |\n" +
+                   s"$line | $quoted\n  | $pad$carets")
+
+private tcl_geom() -> string = "module geom\n\ntrait T\n    f(self) -> int\n"
+
+@test("a member a trait does not declare, called off its name in the same module")
+tcl_missing_member_same_module()
+    if !tcl_ready() then return
+
+    tcl_expect("trait T\n    f(self) -> int\n\nval n = T.nope(1)\nprint(n)\n",
+               "'T' is a trait, not a value, and declares no member 'nope'",
+               4, 11, "val n = T.nope(1)", 4)
+
+@test("a member a trait declares, called off its name in the same module")
+tcl_present_member_same_module()
+    if !tcl_ready() then return
+
+    tcl_expect("trait T\n    f(self) -> int\n\nval n = T.f(1)\nprint(n)\n",
+               "'f' is a member of the trait 'T' — call it on a value of a type that implements " +
+               "'T', or on a '&T'",
+               4, 11, "val n = T.f(1)", 1)
+
+@test("an associated member of a trait, called off its name, is the same refusal")
+tcl_associated_member_same_module()
+    if !tcl_ready() then return
+
+    tcl_expect("trait Z\n    zero() -> Self\n\nval n = Z.zero()\nprint(n)\n",
+               "'zero' is a member of the trait 'Z' — call it on a value of a type that implements " +
+               "'Z', or on a '&Z'",
+               4, 11, "val n = Z.zero()", 4)
+
+@test("a property of a trait, called off its name, is told to be read on a value")
+tcl_property_same_module()
+    if !tcl_ready() then return
+
+    tcl_expect("trait T\n    size -> int\n\nval n = T.size(1)\nprint(n)\n",
+               "'size' is a property of the trait 'T' — read it on a value of a type that " +
+               "implements 'T', or on a '&T'",
+               4, 11, "val n = T.size(1)", 4)
+
+@test("a member a trait declares, called through the module that declares the trait")
+tcl_present_member_through_module()
+    if !tcl_ready() then return
+
+    tcl_expect("import geom\n\nval n = geom.T.f(1)\nprint(n)\n",
+               "'f' is a member of the trait 'geom.T' — call it on a value of a type that " +
+               "implements 'geom.T', or on a '&geom.T'",
+               3, 16, "val n = geom.T.f(1)", 1, tcl_geom())
+
+@test("a member a trait does not declare, called through the module that declares the trait")
+tcl_missing_member_through_module()
+    if !tcl_ready() then return
+
+    tcl_expect("import geom\n\nval n = geom.T.nope(1)\nprint(n)\n",
+               "'geom.T' is a trait, not a value, and declares no member 'nope'",
+               3, 16, "val n = geom.T.nope(1)", 4, tcl_geom())
+
+@test("a trait imported by name, with a member it does not declare called off it")
+tcl_missing_member_imported_by_name()
+    if !tcl_ready() then return
+
+    tcl_expect("import geom.T\n\nval n = T.nope(1)\nprint(n)\n",
+               "'geom.T' is a trait, not a value, and declares no member 'nope'",
+               3, 11, "val n = T.nope(1)", 4, tcl_geom())
+
+@test("a trait imported by name, with a member it declares called off it")
+tcl_present_member_imported_by_name()
+    if !tcl_ready() then return
+
+    tcl_expect("import geom.T\n\nval n = T.f(1)\nprint(n)\n",
+               "'f' is a member of the trait 'geom.T' — call it on a value of a type that " +
+               "implements 'geom.T', or on a '&geom.T'",
+               3, 11, "val n = T.f(1)", 1, tcl_geom())
+
+// `import geom` binds the module's name and none of the names in it, so a bare `T` is no trait here.
+@test("a trait's bare name after importing only its module is an undefined name")
+tcl_bare_name_after_module_import()
+    if !tcl_ready() then return
+
+    tcl_expect("import geom\n\nval n = T.nope(1)\nprint(n)\n", "undefined name 'T'",
+               3, 9, "val n = T.nope(1)", 1, tcl_geom())
+
+// A value of the trait's name is the receiver, and the call is an ordinary method call on it. The
+// reference shows it at 6:7, the member's name; where a method call's complaint is anchored is the
+// call-span rule's business rather than this one's, so only the message and the line are asserted.
+@test("a local value named like the trait is the receiver, not the trait")
+tcl_local_value_shadows_the_trait()
+    if !tcl_ready() then return
+
+    val (out, root, code) = tcl_run("trait T\n    f(self) -> int\n\nf(x: int) -> int\n" +
+                                    "    val T = 3\n    T.f(x)\n\nprint(f(1))\n")
+
+    assert_eq(code, 1)
+    assert(out.starts_with(s"error: type 'int' has no method 'f'\n --> $root/main.sysl:6:"), out)
+
+// -- the reference's own cases (TypeNameMemberTests.scala, "a trait" and its edges) -----------------
+
+private tcl_show() -> string = "trait Show\n    show(self) -> string\n"
+
+@test("a member of the trait is reported as one to call on a value")
+tcl_ref_member_of_the_trait()
+    if !tcl_ready() then return
+
+    tcl_expect(tcl_show() + "print(Show.show())\n",
+               "'show' is a member of the trait 'Show' — call it on a value of a type that " +
+               "implements 'Show', or on a '&Show'",
+               3, 12, "print(Show.show())", 4)
+
+@test("a member the trait does not declare says the trait is not a value")
+tcl_ref_member_the_trait_does_not_declare()
+    if !tcl_ready() then return
+
+    tcl_expect(tcl_show() + "print(Show.render())\n",
+               "'Show' is a trait, not a value, and declares no member 'render'",
+               3, 12, "print(Show.render())", 6)
+
+@test("a property of the trait is reported as one to read on a value")
+tcl_ref_property_of_the_trait()
+    if !tcl_ready() then return
+
+    tcl_expect("trait Size\n    size -> int\nprint(Size.size)\n",
+               "'size' is a property of the trait 'Size' — read it on a value of a type that " +
+               "implements 'Size', or on a '&Size'",
+               3, 12, "print(Size.size)", 4)
+
+@test("a trait reached through its module gets the same answer")
+tcl_ref_trait_through_its_module()
+    if !tcl_ready() then return
+
+    tcl_expect("import geom\nprint(geom.Show.show())\n",
+               "'show' is a member of the trait 'geom.Show' — call it on a value of a type that " +
+               "implements 'geom.Show', or on a '&geom.Show'",
+               2, 17, "print(geom.Show.show())", 4, "module geom\n" + tcl_show())
+
+// The reference shows it at the member's name, 4:12; as above, only the message and the line.
+@test("and a local shadowing a trait name is too")
+tcl_ref_local_shadowing_a_trait_name()
+    if !tcl_ready() then return
+
+    val (out, root, code) = tcl_run(tcl_show() + "var Show = 1\nprint(Show.show())\n")
+
+    assert_eq(code, 1)
+    assert(out.starts_with(s"error: type 'int' has no method 'show'\n --> $root/main.sysl:4:"), out)
+    assert(!out.contains("is a member of the trait"), out)
+
+@test("a call trait is answered as the ordinary trait it is")
+tcl_ref_a_call_trait()
+    if !tcl_ready() then return
+
+    tcl_expect("print(Fn1.call())\n",
+               "'call' is a member of the trait 'sysl.Fn1' — call it on a value of a type that " +
+               "implements 'sysl.Fn1', or on a '&sysl.Fn1'",
+               1, 11, "print(Fn1.call())", 4)
+
+// A trait object is the value the message names, so it has to be the thing that works.
+@test("the form the message names compiles and runs")
+tcl_ref_the_named_form_runs()
+    if !tcl_ready() || !clang_available() then return
+
+    val root = make_temp_dir("sysl-tcl").unwrap()
+    val exe = s"$root/built"
+
+    write_text(s"$root/main.sysl", tcl_show() + "struct P\n    v: int\nimpl Show for P\n" +
+               "    show(self) -> string = \"p\"\nf(s: &Show) -> string = s.show()\n" +
+               "print(f(P(1)))\n").unwrap()
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    assert(built.is_ok(), "the program did not build")
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said.unwrap().text, "p\n")

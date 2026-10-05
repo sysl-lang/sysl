@@ -559,7 +559,7 @@ end name_expr
 private const_parameter(cx: &Analyzer, span: Span, name: string,
                         expected: Option[Type]) -> Option[TExpr]
     bound_type(cx.subst, name) match
-        Some(ConstArg(v, ty)) -> underlying(*ty) match
+        Some(ConstArg(v, ty, _)) -> underlying(*ty) match
             Enum(d) ->
                 val n = v.to_long().unwrap_or(-1)
 
@@ -744,6 +744,17 @@ private const_value_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
     // `(1 << 23) - 1` is a way of saying 8388607 that a reader can check, and every use of the name
     // is the number. Where the initializer is something no fold answers -- a struct, an array, a
     // call -- the expression itself is what a use gets, exactly as it was.
+    //
+    // A float constant whose value calls a `const` function is run over the tree typed at the
+    // constant's own width, so a `f32` is rounded at every step as it would be at run time.
+    underlying(ty) match
+        Floating(_, _) ->
+            val ran = const_float_value(inner, d.init.unwrap(), ty)
+
+            if ran.is_some() then
+                return TExpr(span, TFloatLit(float_pattern(ran.unwrap()), underlying(ty)))
+        _ -> ()
+
     val settled = const_fold(inner, d.init.unwrap())
 
     if settled.is_some()
@@ -762,6 +773,7 @@ private const_literal(span: Span, v: Const, ty: Type) -> Option[TExpr] = v match
     ConstInt(n) -> Some(TExpr(span, TIntLit(n, ty)))
     ConstBool(b) -> Some(TExpr(span, TBoolLit(b)))
     ConstStr(s) -> Some(TExpr(span, TStrLit(s)))
+    ConstChar(c) -> Some(TExpr(span, TIntLit(from_int(long(u32(c))), ty)))
     _ -> None
 
 // Whether a name that stands for module storage is one a program may write to.
@@ -1111,23 +1123,26 @@ end visible_here
 
 // What a reserved identifier stands for, folded into the use as the literal it names.
 //
-// The file that wrote a call and the package that file belongs to: what a spliced default's
-// `__FILE__`, `__LINE__`, `__NAME__` and `__VERSION__` answer about.
+// A call, as a spliced default's built-ins answer about it: the file that wrote it and the package
+// that file belongs to, where in that file it stands, and the function it is written in.
 struct CallSite
     src: Source
     pkg: Packaging
+    at: Span
+    func: string
 
-// Where a spliced default reports its `__FILE__`, `__LINE__`, `__NAME__` and `__VERSION__` from: the call site,
-// carried down so that a default written in a library names the caller's line and package and not
-// its own. A default inside a default keeps the outermost caller.
-call_site(cx: &Analyzer) -> Option[CallSite] =
-    if cx.here.is_none() then Some(CallSite(cx.scope.src, cx.scope.pkg)) else cx.here
+// Where a spliced default reports its `__FILE__`, `__LINE__`, `__COLUMN__`, `__FUNCTION__`,
+// `__NAME__` and `__VERSION__` from: the call at `span`, carried down so that a default written in a
+// library names the caller's line, function and package and not its own. **A default inside a
+// default keeps the outermost call** -- its line and its function as well as its file.
+call_site(cx: &Analyzer, span: Span) -> CallSite =
+    cx.here.unwrap_or(CallSite(cx.scope.src, cx.scope.pkg, span, cx.func_name))
 
 // `__LINE__` and `__COLUMN__` go through `int_literal`, so each takes the integer type its context
 // asks for and is range-checked like any other literal.
 private builtin(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TExpr
-    val at = cx.reported.unwrap_or(span)
-    val site = cx.here.unwrap_or(CallSite(cx.scope.src, cx.scope.pkg))
+    val site = call_site(cx, span)
+    val at = site.at
     val src = site.src
     val loc = src.locate(at.start)
 
@@ -1149,8 +1164,9 @@ private builtin(cx: &Analyzer, span: Span, name: string, expected: Option[Type])
         return int_literal(cx, span, from_int(long(loc.col)), "", expected)
 
     // **Empty outside any body, rather than an error.** A module's storage is filled before any
-    // function runs, so there is genuinely no function to name there.
-    if name == "__FUNCTION__" then return TExpr(span, TStrLit(cx.func_name))
+    // function runs, so there is genuinely no function to name there. In a default it is the
+    // calling function, as `__FILE__` there is the calling file.
+    if name == "__FUNCTION__" then return TExpr(span, TStrLit(site.func))
 
     // A name of the shape that a binding took anyway was refused where it was bound, and a use of it
     // is that one mistake's consequence rather than a second one.
@@ -1228,6 +1244,12 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
     if op == "-" then
         op_subject(ty) match
             Integer(_, signed, _) ->
+                if !signed then
+                    return cx.err(e.span, s"unary '-' is not defined for the unsigned type " +
+                                  s"${type_show(ty)}")
+
+                return produced(TExpr(e.span, TUnary("-", t, unary_type(ty))))
+            Fixed(_, _, signed) ->
                 if !signed then
                     return cx.err(e.span, s"unary '-' is not defined for the unsigned type " +
                                   s"${type_show(ty)}")
@@ -1356,15 +1378,9 @@ private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
     if op == "&&" || op == "||" then
         return TExpr(span, TLogical(op, analyze_bool(cx, l, span), analyze_bool(cx, r, span)))
 
-    var operands: Buf[Expr] = buf()
-
-    operands.push(l)
-    operands.push(r)
-
     val numeric = numeric_expectation(expected)
-    val ts = analyze_operands(cx, operands, numeric)
-    val tl = ts.at(0)
-    val tr = operand_rhs(cx, op, tl, r, ts.at(1))
+    val scaled = scale_operands(cx, op, l, r, numeric)
+    val (tl, tr) = if scaled.is_some() then scaled.unwrap() else paired_operands(cx, op, l, r, numeric)
 
     if texpr_type(tl) == Unknown || texpr_type(tr) == Unknown then return bad_expr(span)
 
@@ -1372,17 +1388,75 @@ private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
 
     if dispatched.is_some() then return dispatched.unwrap()
 
-    val ty = arith_type(cx, span, op, texpr_type(tl), texpr_type(tr), r.span)
+    // A fixed-point product or quotient takes its format from the position it is written in.
+    val fixed = fixed_operator_type(cx, span, op, texpr_type(tl), texpr_type(tr), expected)
+    val ty = if fixed.is_some() then fixed.unwrap()
+    else arith_type(cx, span, op, texpr_type(tl), texpr_type(tr), r.span)
 
     if ty == Unknown then return bad_expr(span)
 
     produced(TExpr(span, TBinary(op, tl, tr, ty)))
 end binary_expr
 
+// The two operands of a binary operator, read as a pair that shares one type.
+private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
+                        numeric: Option[Type]) -> (TExpr, TExpr)
+    var operands: Buf[Expr] = buf()
+
+    operands.push(l)
+    operands.push(r)
+
+    val read = analyze_operands(cx, operands, numeric)
+    val ts = if op == "+" || op == "-" then fixed_siblings(cx, operands, read) else read
+    val tl = ts.at(0)
+
+    (tl, operand_rhs(cx, op, tl, r, ts.at(1)))
+end paired_operands
+
+// `x * 3`, `3 * x`, `x / 2`, `x >> 1`: an integer literal beside a fixed-point operand of `*`, `/`
+// or a shift is a SCALE, read as the integer it is rather than as a fixed-point literal of the other
+// side's format -- so `x * 3` works where `3` is not a `q31`. Answers nothing where the pair is not
+// that shape.
+//
+// The other operand is read first and alone, exactly as the pair would read it, since a literal
+// contributes nothing to what its neighbour is read at; only where that neighbour turns out not to
+// be fixed-point does the literal take its type, as it always has.
+private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
+                       numeric: Option[Type]) -> Option[(TExpr, TExpr)]
+    if op != "*" && op != "/" && op != "<<" && op != ">>" then return None
+
+    if bare_int_literal(r) && !is_literal(l)
+        var one: Buf[Expr] = buf()
+
+        one.push(l)
+
+        val tl = analyze_operands(cx, one, numeric).at(0)
+
+        if is_fixed(texpr_type(tl)) then return Some((tl, type_expr(cx, r, None)))
+
+        return Some((tl, operand_rhs(cx, op, tl, r, type_expr(cx, r, Some(repr(texpr_type(tl)))))))
+    end if
+
+    if op == "*" && bare_int_literal(l) && !is_literal(r)
+        var one: Buf[Expr] = buf()
+
+        one.push(r)
+
+        val tr = analyze_operands(cx, one, numeric).at(0)
+
+        if is_fixed(texpr_type(tr)) then return Some((type_expr(cx, l, None), tr))
+
+        return Some((type_expr(cx, l, Some(repr(texpr_type(tr)))), tr))
+    end if
+
+    None
+end scale_operands
+
 // Each link of the chain is resolved on its own, so a chain reads and behaves exactly as a chain of
 // scalars does, sharing each middle operand between the two comparisons that use it.
 private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[string]) -> TExpr
-    val ts = analyze_operands(cx, operands, None)
+    // A fixed-point product compared with a value of another format is read at that format.
+    val ts = fixed_siblings(cx, operands, analyze_operands(cx, operands, None))
 
     // A comparison either side of which is a vector is one link and a mask rather than a `bool`, so
     // it is a different node and a different set of rules.

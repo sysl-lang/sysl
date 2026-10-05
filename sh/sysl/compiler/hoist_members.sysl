@@ -157,6 +157,10 @@ hoist_all_members(a: &Analysis, units: Buf[Program])
     // And whether each `impl` of a trait that requires others supplies those too, which is the same
     // question about the same table and so waits for the same moment.
     check_impl_supers(a)
+
+    // And whether each block marked `override` has something to override, which waits for the same
+    // moment and for the same reason: the block being replaced may be hoisted after it.
+    check_impl_overrides(a)
 end hoist_all_members
 
 // The type applications whose bounds could not be answered where they were written, asked now.
@@ -347,9 +351,12 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl]) -> B
         val written = source_member_name(m.name)
 
         if has_member_at(a, home.key, filed)
-            if is_setter_name(m.name) then
+            if is_setter_name(m.name)
                 a.fault(home.scope, m.span, s"type '${home.label}' already has a setter for " +
                         s"'$written'")
+                // Left out, not filed over the first: both lower to one function, so the second's
+                // parameters would be what the first body is read against.
+                continue
             else
                 a.fault(home.scope, m.span, s"type '${home.label}' already has a member named " +
                         s"'$written'")
@@ -375,6 +382,8 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl]) -> B
         if filed != m.name then record_alt(a, home.key, m.name, filed)
 
         val fd = synthesize(a, home, m)
+
+        if fd.const_fn then a.tables.const_fns.put(fd.name, true)
 
         // An inherited default is asked again under the implementing type's name, as the reference
         // asks it: the copy is a function of that type's, whose callers the message is about.
@@ -770,7 +779,7 @@ synthesize(a: &Analysis, home: MemberHome, m: MethodDecl) -> FuncDecl
     FuncDecl(name, tparams, params, m.ret_type, m.body, bounds, m.variadic,
              member_visibility(a, home, m), buf(), tvalues,
              tpacks, None, None, None, false, false, false, m.reads, m.writes, None, None,
-             m.crossing, buf(), m.marks, m.named_at)
+             m.crossing, buf(), m.marks, m.named_at, m.const_fn)
 end synthesize
 
 // **A member is no more visible than the type it belongs to.** Nothing outside the file that
@@ -913,7 +922,7 @@ private bounded_pass(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: B
         // that checks a generic body read `[N]T` as an array and `N` as a `usize`.
         if written.is_some()
             out.push(Binding(tp, ConstArg(from_int(0), resolve_type(a, scope, written.unwrap(),
-                                                                    others))))
+                                                                    others), true)))
         else if holds_string(tpacks, tp)
             // A **pack** stands at **two** types, each carrying the pack's own bounds, because an
             // unrolled loop has no fixed length for this walk to run at. Two rather than one is what

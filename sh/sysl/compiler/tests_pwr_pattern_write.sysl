@@ -1,0 +1,231 @@
+module sh.sysl.compiler
+@tests
+
+// A name bound by a pattern is written once — in a `match` arm, in an `is`, and under `@`. A pattern
+// hands the arm the part it matched rather than a way back into the value it came out of, so a write
+// to the name would reach the arm's copy and nothing a later line can observe. One rule reaches four
+// surfaces (assignment, a compound assignment, `&`, a `*self` method) through every spelling that
+// binds, and the diagnostic names the pattern rather than a `val` the reader did not write.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `PatternWriteTests`
+// these are. The helpers are `tests_enm_enum_run.sysl`'s.
+
+private const pwr_cell: string = "enum Cell\n    Empty\n    Full(v: int)\n\n"
+
+// A struct behind a variant, so a write can be aimed at a field of what the pattern bound.
+private const pwr_shape: string = "struct P\n    x: int\n    y: int\n\nenum Shape\n    Nothing\n    At(p: P)\n\n"
+
+private const pwr_slot: string = "struct Entry\n    value: int\n\nenum Slot\n    Empty\n    Filled(e: &Entry)\n\n"
+
+private pwr_counter() -> string = "struct Counter\n    n: int\n\n    bump(*self) = self.n += 1\n\n" +
+                                    "    read(self) -> int = self.n\nend Counter\n\nenum Box\n" +
+                                    "    Nothing\n    Has(c: Counter)\n\nvar b: Box = Has(Counter(0))\n\n" +
+                                    "b match\n    Has(c) -> c.bump()\n    Nothing -> print(\"nothing\")\n"
+
+// The reference's sentence for a write `form` aimed at a pattern binding.
+private pwr_written_once(form: string) -> string =
+    s"a pattern binding is written once, because it holds a copy of what it matched — so $form " +
+    "would reach that copy rather than the value it came from. Where you mean to change something, " +
+    "take a 'var' from the binding first"
+
+private pwr_assigned() -> string = pwr_written_once("assignment")
+
+private pwr_full_n_99() -> string = pwr_cell + "var d: Cell = Full(1)\n\nd match\n    Full(n) -> n = 99\n" +
+                                    "    Empty -> print(\"empty\")\n"
+
+// ---- the write is refused, whichever spelling bound the name
+
+@test("a match arm's capture")
+pwr_a_match_arms_capture()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_full_n_99())
+
+    assert(enm_says(said, pwr_assigned()), said)
+
+@test("an 'is' binding, which is the one-arm match written without the arm")
+pwr_an_is_binding()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_cell + "var d: Cell = Full(1)\n\nif d is Full(m)\n    m = 77\n    print(m)\n")
+
+    assert(enm_says(said, pwr_assigned()), said)
+
+@test("the name an '@' puts in front of a pattern")
+pwr_the_name_an_at_binds()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_cell + "var d: Cell = Full(1)\n\nd match\n    w @ Full(n) -> w = Empty\n" +
+                       "    Empty -> print(\"empty\")\n")
+
+    assert(enm_says(said, pwr_assigned()), said)
+
+// A bare name in an arm is a binding when nothing answers to it, and it holds the whole value rather
+// than a part — the copy is the same copy, and so is the rule.
+@test("a bare name, which binds the whole value rather than a part")
+pwr_a_bare_name()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_cell + "var d: Cell = Full(1)\n\nd match\n    Full(n) -> print(n)\n" +
+                       "    other -> other = Full(2)\n")
+
+    assert(enm_says(said, pwr_assigned()), said)
+
+@test("a compound assignment, which is a write with a read in front of it")
+pwr_a_compound_assignment()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_cell + "var d: Cell = Full(1)\n\nd match\n    Full(n) -> n += 1\n" +
+                       "    Empty -> print(\"empty\")\n")
+
+    assert(enm_says(said, pwr_written_once("'+='")), said)
+
+// Reaching into the binding keeps the property, exactly as reaching into a `val` does: the field is a
+// field of the arm's copy, so a store to it is discarded with the copy.
+@test("a field of what the pattern bound")
+pwr_a_field_of_what_was_bound()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_shape + "var s: Shape = At(P(1, 2))\n\ns match\n    At(p) -> p.x = 9\n" +
+                       "    Nothing -> print(\"nothing\")\n")
+
+    assert(enm_says(said, pwr_assigned()), said)
+
+@test("a field the pattern itself named, which is the same name one level down")
+pwr_a_field_the_pattern_named()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_shape + "var s: Shape = At(P(1, 2))\n\ns match\n    At(P{x, y}) -> x = 9\n" +
+                       "    Nothing -> print(\"nothing\")\n")
+
+    assert(enm_says(said, pwr_assigned()), said)
+
+// ---- the two writes that are not assignments
+
+// `&` is refused for the reason a `val`'s is: a `*T` is a licence to write.
+@test("'&' on a bound name")
+pwr_address_of_a_bound_name()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_cell + "take(q: *int) = print(*q)\n\nvar d: Cell = Full(1)\n\nd match\n" +
+                       "    Full(n) -> take(&n)\n    Empty -> print(\"empty\")\n")
+
+    assert(enm_says(said, pwr_written_once("'&'")), said)
+
+// A `*self` receiver is an `&` the caller did not write, and it is asked the same question.
+@test("a method that takes '*self'")
+pwr_a_star_self_method()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_counter())
+
+    assert(enm_says(said, "'bump' takes '*self', so it writes through what it is called on — and a " +
+                          "pattern binding holds a copy of what it matched, so the write would reach " +
+                          "that copy rather than the value it came from. Copy it into a 'var' and call " +
+                          "this on that"), said)
+
+// The advice a `val` receiver gets is "write 'var c'", and there is no keyword on an arm's capture to
+// rewrite — so the two messages differ in the fix as well as the reason.
+@test("and its advice is a copy rather than a keyword, because there is no keyword to change")
+pwr_its_advice_is_a_copy()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_counter())
+
+    assert(enm_says(said, "Copy it into a 'var' and call this on that"), said)
+    assert(!enm_says(said, "write 'var"), said)
+
+// ---- the diagnostic is the pattern's own
+
+@test("it says what a pattern binding holds, and does not name a 'val' the program never wrote")
+pwr_it_says_what_a_binding_holds()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_full_n_99())
+
+    assert(enm_says(said, pwr_assigned()), said)
+    assert(!enm_says(said, "a 'val' is written once"), said)
+
+@test("and it names the fix")
+pwr_and_it_names_the_fix()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_full_n_99())
+
+    assert(enm_says(said, "Where you mean to change something, take a 'var' from the binding first"),
+           said)
+
+// The `val` message is untouched where a `val` is what was written.
+@test("while a real 'val' still gets the sentence about a 'val'")
+pwr_a_real_val_gets_the_val_sentence()
+    if !enm_ready() then return
+
+    val said = enm_err("show() =\n    val n = 5\n    n = 6\n\nshow()\n")
+
+    assert(enm_says(said, "a 'val' is written once, so assignment has nothing to write through"), said)
+    assert(!enm_says(said, "pattern binding"), said)
+
+// ---- the copy is what the rule is about, and a 'var' taken from it is the way to change one
+
+@test("the copy may be changed under its own name, and the matched value does not move")
+pwr_the_copy_may_be_changed()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(pwr_cell + "var d: Cell = Full(1)\n\nd match\n    Full(n) ->\n        var m = n\n" +
+                      "        m = 99\n        print(m)\n    Empty -> print(\"empty\")\n\nd match\n" +
+                      "    Full(n) -> print(n)\n    Empty -> print(\"empty\")\n"), "99\n1\n")
+
+@test("a struct payload copied out, changed, and the original still holding its own value")
+pwr_a_struct_payload_copied_out()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(pwr_shape + "var s: Shape = At(P(1, 2))\n\ns match\n    At(p) ->\n" +
+                      "        var q = p\n        q.x = 9\n        print(q.x, q.y)\n" +
+                      "    Nothing -> print(\"nothing\")\n\ns match\n    At(p) -> print(p.x, p.y)\n" +
+                      "    Nothing -> print(\"nothing\")\n"), "9 2\n1 2\n")
+
+// ---- a '&T' payload still writes through, because the copy is the reference
+
+// Selection dereferences, so `e.value = 99` is a store through the reference and not a store into
+// the binding — while the name itself is still written once.
+@test("the write reaches the object the enum is holding")
+pwr_the_write_reaches_the_object()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(pwr_slot + "var s: Slot = Filled(Entry(1))\n\ns match\n" +
+                      "    Filled(e) -> e.value = 99\n    Empty -> print(\"empty\")\n\ns match\n" +
+                      "    Filled(e) -> print(e.value)\n    Empty -> print(\"empty\")\n"), "99\n")
+
+@test("and the name is written once all the same, so it may not be aimed somewhere else")
+pwr_the_name_is_written_once()
+    if !enm_ready() then return
+
+    val said = enm_err(pwr_slot + "var s: Slot = Filled(Entry(1))\nvar other: &Entry = Entry(5)\n\n" +
+                       "s match\n    Filled(e) -> e = other\n    Empty -> print(\"empty\")\n")
+
+    assert(enm_says(said, pwr_assigned()), said)
+
+// ---- what the rule does not reach
+
+@test("reading the binding, which is everything an arm usually does with one")
+pwr_reading_the_binding()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(pwr_cell + "add(a: int, b: int) -> int = a + b\n\nvar d: Cell = Full(20)\n\n" +
+                      "d match\n    Full(n) -> print(add(n, n) + 2)\n    Empty -> print(\"empty\")\n"),
+              "42\n")
+
+@test("the variable that was matched, which is a 'var' and stays one")
+pwr_the_matched_variable_stays_a_var()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(pwr_cell + "var d: Cell = Full(1)\n\nd match\n    Full(n) -> print(n)\n" +
+                      "    Empty -> print(\"empty\")\n\nd = Empty\n\nd match\n    Full(n) -> print(n)\n" +
+                      "    Empty -> print(\"empty\")\n"), "1\nempty\n")
+
+// A `for` element is not a pattern binding, and the rule is not widened to it.
+@test("a 'for' element, which is bound by a header rather than by a pattern")
+pwr_a_for_element()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("for i in 0..<3\n    var j = i\n    j += 10\n    print(j)\n"), "10\n11\n12\n")

@@ -1,0 +1,292 @@
+module sh.sysl.compiler
+@tests
+
+// A trait may ask for a property -- a member with no parameter list and an implicit receiver, read
+// as `value.name` with no parentheses -- and asking is the only thing that needed adding: the read
+// reaches an implementation through a bound and through a trait object's table, and a trait may
+// supply a default one. These run programs through each road. Ported from the reference's
+// `TraitPropertyRunTests.scala` case for case.
+//
+// **Every output here was read out of the reference compiler (0.0.162)** by handing the installed
+// `sysl` the same program (`sysl run`). The harness is `tests_xvr_extern_var.sysl`'s: `xvr_ran`
+// builds, links and runs a tree.
+
+private tpr_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+// -- an impl supplies one -------------------------------------------------------------------------
+
+@test("a property a trait asks for is read on a value")
+tpr_read_on_a_value()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Sized
+            size -> int
+        struct Box
+            n: int
+        impl Sized for Box
+            size -> int = self.n * 2
+        print(Box(4).size)
+        """), "8\n")
+
+@test("two types implementing one property each read their own")
+tpr_two_types_each_read_their_own()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Named
+            label -> string
+        struct Cat
+            n: string
+        struct Dog
+            n: string
+        impl Named for Cat
+            label -> string = "cat " + self.n
+        impl Named for Dog
+            label -> string = "dog " + self.n
+        print(Cat("mog").label)
+        print(Dog("rex").label)
+        """), "cat mog\ndog rex\n")
+
+@test("a property may sit alongside the methods a trait declares")
+tpr_alongside_methods()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Shape
+            area -> int
+            scaled(self, k: int) -> int = self.area * k
+        struct Sq
+            w: int
+        impl Shape for Sq
+            area -> int = self.w * self.w
+        var s = Sq(3)
+        print(s.area, s.scaled(2))
+        """), "9 18\n")
+
+// A built-in has no module to write an `impl` in, so its memberships are the trait's to license --
+// and a property is filed under its owner key exactly as a method is.
+@test("a built-in may implement a property")
+tpr_builtin_implements()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Doubled
+            twice -> int
+        impl Doubled for int
+            twice -> int = self * 2
+        print(21.twice)
+        """), "42\n")
+
+// An enum's members are filed under its own name exactly as a struct's are, and the property's
+// receiver is the value -- which the inherent method it calls is there to show.
+@test("an enum may implement a property")
+tpr_enum_implements()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Sized
+            size -> int
+        enum Shape
+            Dot
+            Line
+            tick(self) -> int = 3
+        impl Sized for Shape
+            size -> int = self.tick() * 2
+        print(Dot.size, Line.size)
+        """), "6 6\n")
+
+// -- a bound reads one ----------------------------------------------------------------------------
+
+// A generic body may read a property, checked once at the definition against the trait rather than
+// at each type that turns up.
+@test("a bounded generic reads a property off its parameter")
+tpr_bounded_reads_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Sized
+            size -> int
+        struct Box
+            n: int
+        struct Bag
+            k: int
+        impl Sized for Box
+            size -> int = self.n
+        impl Sized for Bag
+            size -> int = self.k * 10
+        total[T: Sized](a: T, b: T) -> int = a.size + b.size
+        print(total(Box(3), Box(4)))
+        print(total(Bag(3), Bag(4)))
+        """), "7\n70\n")
+
+@test("a property read mixes with a method call in one bounded body")
+tpr_mixes_with_method_call()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Sized
+            size -> int
+            grow(self, k: int) -> int
+        struct Box
+            n: int
+        impl Sized for Box
+            size -> int = self.n
+            grow(self, k: int) -> int = self.n + k
+        both[T: Sized](x: T) -> int = x.grow(x.size)
+        print(both(Box(6)))
+        """), "12\n")
+
+@test("a trait default may read a property the same trait declares")
+tpr_default_reads_property()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Sized
+            size -> int
+            doubled -> int = self.size * 2
+        struct Box
+            n: int
+        impl Sized for Box
+            size -> int = self.n
+        print(Box(5).doubled)
+        """), "10\n")
+
+// The bound looks the property up in the trait, which is where a default lives -- so a generic body
+// reads one whether or not the type it is instantiated at wrote its own.
+@test("a bounded generic reads a default property off a type that inherited it")
+tpr_bounded_reads_inherited_default()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Tagged
+            tag -> string = "none"
+        struct A
+            n: int
+        struct B
+            n: int
+        impl Tagged for A
+        impl Tagged for B
+            override tag -> string = "bee"
+        name[T: Tagged](x: T) -> string = x.tag
+        print(name(A(1)))
+        print(name(B(1)))
+        """), "none\nbee\n")
+
+@test("a trait may supply a default property outright, leaving an impl nothing to write")
+tpr_default_outright()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Tagged
+            tag -> string = "none"
+        struct A
+            n: int
+        struct B
+            n: int
+        impl Tagged for A
+        impl Tagged for B
+            override tag -> string = "bee"
+        print(A(1).tag)
+        print(B(1).tag)
+        """), "none\nbee\n")
+
+// -- an object dispatches one ---------------------------------------------------------------------
+
+@test("a raw trait object reads a property through its table")
+tpr_raw_object_reads()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Sized
+            size -> int
+        struct Box
+            n: int
+        struct Bag
+            k: int
+        impl Sized for Box
+            size -> int = self.n
+        impl Sized for Bag
+            size -> int = self.k * 10
+        show(s: *Sized) = print(s.size)
+        var b = Box(3)
+        var g = Bag(3)
+        show(&b)
+        show(&g)
+        """), "3\n30\n")
+
+@test("a counted trait object reads a property through its table")
+tpr_counted_object_reads()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Sized
+            size -> int
+        struct Box
+            n: int
+        impl Sized for Box
+            size -> int = self.n + 1
+        var s: &Sized = Box(9)
+        print(s.size)
+        """), "10\n")
+
+// The slot a property occupies is one of the trait's own, in declaration order -- so a method either
+// side of it has to keep dispatching correctly, which a mis-indexed table would break.
+@test("a property between two methods keeps every slot straight")
+tpr_slots_straight()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Full
+            first(self) -> int
+            middle -> int
+            last(self) -> int
+        struct V
+            n: int
+        impl Full for V
+            first(self) -> int = self.n
+            middle -> int = self.n * 2
+            last(self) -> int = self.n * 3
+        show(f: *Full) = print(f.first(), f.middle, f.last())
+        var v = V(5)
+        show(&v)
+        """), "5 10 15\n")
+
+@test("an object dispatches to an inherited default property")
+tpr_object_inherited_default()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Tagged
+            tag -> string = "none"
+        struct A
+            n: int
+        impl Tagged for A
+        var t: &Tagged = A(1)
+        print(t.tag)
+        """), "none\n")
+
+// -- ownership ------------------------------------------------------------------------------------
+
+// A property returning a string is a fresh owned value per read, and the read through a table goes
+// through an adapter that borrows its receiver -- so a loop of them must neither leak the result
+// nor release the object it was read from.
+@test("a property returning a string neither leaks nor frees twice")
+tpr_string_neither_leaks_nor_frees_twice()
+    if xvr_no_library() then return
+
+    assert_eq(tpr_ran(raw"""
+        trait Named
+            label -> string
+        struct Cat
+            n: string
+        impl Named for Cat
+            label -> string = "the " + self.n + "!"
+        var c = Cat("mog")
+        var o: *Named = &c
+        var total: usize = 0
+        for i in 1..200000
+            var s = o.label
+            total += s.len
+        print(total, c.n.len)
+        """), "1600000 3\n")
