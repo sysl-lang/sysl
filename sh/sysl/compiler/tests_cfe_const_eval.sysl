@@ -238,6 +238,21 @@ cfe_wrap_and_trap_rules()
     cfe_agree(decls, cases)
 end cfe_wrap_and_trap_rules
 
+// `200 + 100` wraps to 44, which has its top bit clear, so a sum that loses its eighth bit reads the
+// same as the right one there. These two land with the top bit set.
+@test("an 8-bit sum whose top bit is set is the same while compiling as at run time")
+cfe_eight_bit_top_bit()
+    val decls =
+        "const add8(a: u8, b: u8) -> u8 = a + b\n\n" +
+        "const addi8(a: i8, b: i8) -> i8 = a + b\n"
+
+    var cases: Buf[(string, string, string)] = buf()
+
+    cases.push(cfe_case("u8", "add8(100, 50)", "add8(h_u8(100), h_u8(50))"))
+    cases.push(cfe_case("i8", "addi8(-100, 20)", "addi8(h_i8(-100), h_i8(20))"))
+    cfe_agree(decls, cases)
+end cfe_eight_bit_top_bit
+
 // -- floats -----------------------------------------------------------------------------------------
 
 @test("a 'f32' rounded at every operation, a negative zero, NaN, infinities, and no fused multiply-add")
@@ -274,6 +289,25 @@ cfe_floats()
     cases.push(cfe_case("real", "widen(0.1)", "widen(h_f32(0.1))"))
     cfe_agree(decls, cases)
 end cfe_floats
+
+// One `f32` operation worked in `f64` and rounded once at the end gives the right answer -- the
+// product, difference or quotient of two `f32`s is near enough in `f64` -- so a single operation
+// cannot show whether a step was rounded. A second one can: each of these three comes to a different
+// `f32` when the first result is carried to the second unrounded.
+@test("a 'f32' chain of '*', '-' or '/' is rounded between its two operations")
+cfe_f32_chains()
+    val decls =
+        "const mul3(a: f32, b: f32, c: f32) -> f32 = a * b * c\n\n" +
+        "const sub3(a: f32, b: f32, c: f32) -> f32 = a - b - c\n\n" +
+        "const div3(a: f32, b: f32, c: f32) -> f32 = a / b / c\n"
+
+    var cases: Buf[(string, string, string)] = buf()
+
+    cases.push(cfe_case("f32", "mul3(0.1, 0.1, 10.0)", "mul3(h_f32(0.1), h_f32(0.1), h_f32(10.0))"))
+    cases.push(cfe_case("f32", "sub3(0.1, 0.3, 0.2)", "sub3(h_f32(0.1), h_f32(0.3), h_f32(0.2))"))
+    cases.push(cfe_case("f32", "div3(0.1, 0.3, 0.1)", "div3(h_f32(0.1), h_f32(0.3), h_f32(0.1))"))
+    cfe_agree(decls, cases)
+end cfe_f32_chains
 
 @test("conversions: a float saturates into an integer, an integer rounds once into a 'f32'")
 cfe_conversions()
@@ -657,6 +691,24 @@ cfe_the_step_limit()
               "5:16 'k' did not finish within 16,000,000 steps while compiling — the loop at " +
               "main.sysl:2:5 was still running\n")
 end cfe_the_step_limit
+
+// A loop that never ends is stopped at any limit, and the message names the number whatever the limit
+// was, so the test above cannot tell a limit of 8 or 32 million from the 16 the design states. Each
+// round of this loop is six to nine steps -- the round, the condition's three nodes, the statement
+// and what it reads -- so 1,500,000 rounds is 9 to 13.5 million steps and finishes, and 3,000,000 is
+// 18 to 27 million and does not: a limit half or twice the stated one turns one of the two around.
+@test("the step limit is 16,000,000 and not half or twice it: one run below it finishes, one above stops")
+cfe_the_step_limit_is_its_number()
+    if !cfe_ready() then return
+
+    val decls = "const count(n: int) -> int\n    var i = 0\n\n    while i < n\n        i += 1\n\n    i\n\n"
+
+    assert_eq(enm_ran(decls + "const k: int = count(1500000)\n\nprint(k)\n"), "1500000\n")
+
+    val said = cfe_said(decls + "const k: int = count(3000000)\n\nprint(k)\n")
+
+    assert(said.starts_with("9:16 'k' did not finish within 16,000,000 steps while compiling"), said)
+end cfe_the_step_limit_is_its_number
 
 @test("calls nested past 512 deep stop the run, where the same recursion 500 deep does not")
 cfe_the_depth_limit()
