@@ -1,0 +1,721 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, pow as big_pow, sub as big_sub, add as big_add, mul as big_mul,
+                         cmp as big_cmp, to_string}
+
+// Fixed-point arithmetic, lowered.
+//
+// **Every operation answers the representable value nearest the true result**: `+` and `-` saturate,
+// `*` and `/` compute the exact result at twice the width, round it to nearest with ties toward
+// +inf (add half, then an arithmetic shift, which floors), and clamp it once into the format.
+//
+// **LLVM's `smul.fix`/`sdiv.fix` family is never emitted**, and that is measured rather than
+// preferred: LangRef leaves `mul.fix`'s rounding unspecified, a Q15 product through it is a 64-bit
+// libcall on a Cortex-M0+ where the open-coded form is four instructions, and `sdiv.fix.sat` at 32
+// bits is two 128-bit libcalls where the open-coded form is one 64-bit divide. The saturating add and
+// subtract ARE the right thing to emit -- `llvm.sadd.sat` is one `QADD` on a core with the DSP
+// extension.
+
+// -- small pieces --------------------------------------------------------------------------------
+
+private fx_bin(e: *Emit, op: BinOp, bits: int, a: Val, b: Val) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, op, LInt(bits), a, b))
+    r
+end fx_bin
+
+private fx_cmp(e: *Emit, p: ICmp, bits: int, a: Val, b: Val) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InIntCmp(r, p, LInt(bits), a, b))
+    r
+end fx_cmp
+
+private fx_select(e: *Emit, c: Val, bits: int, a: Val, b: Val) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InSelect(r, c, LInt(bits), a, b, l_i1()))
+    r
+end fx_select
+
+private fx_int(n: BigInt) -> Val = VInt(n)
+
+private fx_small(n: long) -> Val = VInt(from_int(n))
+
+// `2^k` as a constant.
+private fx_pow2(k: int) -> BigInt = big_pow(from_int(2), usize(k))
+
+// A value of `from` bits brought to `to` bits, extended by the source's signedness.
+private fx_resize(e: *Emit, from: int, signed: bool, to: int, v: Val) -> Val = convert_int(e, from, signed, to, v)
+
+// `v` held at `bits` (a width with room to spare, so a signed comparison is always meaningful)
+// clamped into `[lo, hi]`.
+private fx_clamp(e: *Emit, bits: int, v: Val, lo: BigInt, hi: BigInt) -> Val
+    val below = fx_cmp(e, ISlt, bits, v, fx_int(lo))
+    val raised = fx_select(e, below, bits, fx_int(lo), v)
+    val above = fx_cmp(e, ISgt, bits, raised, fx_int(hi))
+
+    fx_select(e, above, bits, fx_int(hi), raised)
+end fx_clamp
+
+// A two-operand saturating intrinsic -- `llvm.sadd.sat.i32` and its three siblings.
+private fx_sat(e: *Emit, name: string, bits: int, a: Val, b: Val) -> Val
+    val it = LInt(bits)
+    val fn = s"llvm.$name.sat.i$bits"
+
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(it))
+    params.push(ir_param(it))
+    request_intrinsic(e, ir_sig(fn, ir_fn_type(it, params)))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(it, a))
+    args.push(ir_arg(it, b))
+
+    val r = fresh_reg(e)
+
+    emit(e, ir_call(Some(r), it, VGlobal(fn), args))
+    r
+end fx_sat
+
+private fx_parts(t: Type) -> (int, int, bool) = underlying(t) match
+    Fixed(b, f, s) -> (b, f, s)
+    _ -> (0, 0, true)
+
+// -- arithmetic ----------------------------------------------------------------------------------
+
+// `a op b` at one fixed-point format -- what a vector lane's operator is.
+fixed_arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val) -> Val =
+    fixed_binary(e, op, ty, ty, ty, lv, rv)
+
+// `a op b` where either operand is fixed-point: `lt` and `rt` are the operands' types and `ty` the
+// result's, which for a product or a quotient may be a third format the position chose, and for a
+// scale is the fixed-point operand's own.
+//
+// **A `wrapping` type wraps where every other saturates**: its `+` and `-` are the plain integer
+// instructions, and a product or quotient into it is truncated to its width rather than clamped.
+fixed_binary(e: *Emit, op: string, lt: Type, rt: Type, ty: Type, lv: Val, rv: Val) -> Val
+    val wraps = fixed_wraps(ty)
+    val (bits, frac, signed) = fx_parts(ty)
+    val result = FixedSide(bits, frac, signed, min_of(bits, signed), max_of(bits, signed))
+
+    op match
+        "+" ->
+            if wraps then return fx_bin(e, OpAdd, bits, lv, rv)
+
+            fx_sat(e, if signed then "sadd" else "uadd", bits, lv, rv)
+        "-" ->
+            if wraps then return fx_bin(e, OpSub, bits, lv, rv)
+
+            fx_sat(e, if signed then "ssub" else "usub", bits, lv, rv)
+        "*" -> fixed_product(e, fx_side(lt, lv), fx_side(rt, rv), result, wraps, lv, rv)
+        "/" -> fixed_quotient(e, fx_side(lt, lv), fx_side(rt, rv), result, wraps, lv, rv)
+        "<<" -> fixed_shift(e, op, lt, rt, wraps, lv, rv)
+        ">>" -> fixed_shift(e, op, lt, rt, wraps, lv, rv)
+        _ ->
+            gap_here(e, s"fixed-point arith '$op'")
+            lv
+end fixed_binary
+
+// One side of a fixed-point product or quotient -- or its result: a format, and the raw values the
+// side can hold, which is the format's whole range, or a single value where the side is a constant.
+// The ranges are what every width below is worked out from, so nothing is ever held wider than the
+// exact arithmetic needs: a Q15 product is a 32-bit multiply, not a 64-bit library call.
+private struct FixedSide
+    bits: int
+    frac: int
+    signed: bool
+    lo: BigInt
+    hi: BigInt
+
+// An operand of `*` or `/` as a side. A constant -- a literal, a scale written as a number -- is
+// held at the width its value needs, signed.
+private fx_side(t: Type, v: Val) -> FixedSide
+    val (bits, frac, signed) = fixed_format(t).unwrap_or((0, 0, true))
+
+    v match
+        VInt(n) -> FixedSide(fx_bits_for(n, n), frac, true, n, n)
+        _ -> FixedSide(bits, frac, signed, min_of(bits, signed), max_of(bits, signed))
+end fx_side
+
+// The narrowest signed width holding every value from `lo` to `hi`.
+private fx_bits_for(lo: BigInt, hi: BigInt) -> int
+    var n = 1
+
+    while !fits(lo, n, true) || !fits(hi, n, true)
+        n += 1
+
+    n
+end fx_bits_for
+
+private fx_min(a: BigInt, b: BigInt) -> BigInt = if big_cmp(a, b) <= 0 then a else b
+
+private fx_max(a: BigInt, b: BigInt) -> BigInt = if big_cmp(a, b) >= 0 then a else b
+
+private fx_abs(a: BigInt) -> BigInt = if big_cmp(a, from_int(0)) < 0 then big_sub(from_int(0), a) else a
+
+// A side's value brought to `n` bits. A constant is written at the new width directly, reduced to
+// it the way the width reduces any value.
+private fx_at(e: *Emit, side: FixedSide, n: int, v: Val) -> Val = v match
+    VInt(c) -> VInt(wrap(c, n, true))
+    _ -> fx_resize(e, side.bits, side.signed, n, v)
+
+// `a * b` into the format `t`.
+//
+// **Where `t` holds the exact product, nothing is rounded and nothing is clamped**: both operands
+// are extended to `t`'s width and multiplied there -- `q31 * q31` into an `i64q62`, or `i32q30 *
+// q31` into an `i64q61` accumulator, is `sext`, `sext`, `mul i64`, which a Cortex-M4 selects as one
+// `SMULL` and, added to an accumulator, one `SMLAL`. A `wrapping` result takes the same path whatever
+// the operands' ranges, since a product at `t`'s width IS the true product reduced modulo 2^W.
+//
+// Otherwise the exact product is formed at the narrowest width that holds it and what is done to it,
+// rescaled to `t`'s fraction -- rounding to nearest with ties toward +inf (add half a unit, then an
+// arithmetic shift, which floors) where bits are dropped -- and clamped once into `t`, or truncated
+// into a `wrapping` one.
+private fixed_product(e: *Emit, a: FixedSide, b: FixedSide, t: FixedSide, wraps: bool, lv: Val,
+                      rv: Val) -> Val
+    val shift = t.frac - (a.frac + b.frac)
+    val c1 = big_mul(a.lo, b.lo)
+    val c2 = big_mul(a.lo, b.hi)
+    val c3 = big_mul(a.hi, b.lo)
+    val c4 = big_mul(a.hi, b.hi)
+    val plo = fx_min(fx_min(c1, c2), fx_min(c3, c4))
+    val phi = fx_max(fx_max(c1, c2), fx_max(c3, c4))
+
+    if shift >= 0
+        val scale = fx_pow2(shift)
+        val fits_t = big_cmp(big_mul(plo, scale), t.lo) >= 0 && big_cmp(big_mul(phi, scale), t.hi) <= 0
+
+        if wraps || fits_t
+            val p = fx_bin(e, OpMul, t.bits, fx_at(e, a, t.bits, lv), fx_at(e, b, t.bits, rv))
+
+            if shift == 0 then return p
+
+            return fx_bin(e, OpShl, t.bits, p, fx_small(long(shift)))
+        end if
+    end if
+
+    var lo = fx_min(plo, fx_min(a.lo, b.lo))
+    var hi = fx_max(phi, fx_max(a.hi, b.hi))
+
+    if shift < 0 then hi = fx_max(hi, big_add(phi, fx_pow2(-shift - 1)))
+
+    if shift > 0
+        lo = fx_min(lo, big_mul(plo, fx_pow2(shift)))
+        hi = fx_max(hi, big_mul(phi, fx_pow2(shift)))
+    end if
+
+    val n = fx_width(fx_bits_for(lo, hi), t, wraps)
+    val p = fx_bin(e, OpMul, n, fx_at(e, a, n, lv), fx_at(e, b, n, rv))
+    var scaled = p
+
+    if shift < 0 then scaled = fx_round_off(e, n, p, -shift)
+    if shift > 0 then scaled = fx_bin(e, OpShl, n, p, fx_small(long(shift)))
+
+    fx_settle(e, n, t, wraps, scaled)
+end fixed_product
+
+// The width a result is worked at: the `held` bits its arithmetic needs, and never less than the
+// format it lands in -- one more than that where it is clamped, so the clamp compares values the
+// format cannot hold as well as those it can.
+private fx_width(held: int, t: FixedSide, wraps: bool) -> int
+    val least = if wraps then t.bits else t.bits + 1
+
+    if held > least then held else least
+end fx_width
+
+// `n` as a constant at a width, written the way that width's two's complement reads it.
+private fx_const(n: BigInt, bits: int) -> Val = VInt(wrap(n, bits, true))
+
+// `v`, held at `n` bits, with its low `k` bits rounded off: to nearest, ties toward +inf.
+private fx_round_off(e: *Emit, n: int, v: Val, k: int) -> Val
+    val half = fx_bin(e, OpAdd, n, v, fx_int(fx_pow2(k - 1)))
+
+    fx_bin(e, OpAShr, n, half, fx_small(long(k)))
+end fx_round_off
+
+// A result held at `n` bits brought into its format: clamped, or -- for a `wrapping` type --
+// reduced modulo 2^W.
+private fx_settle(e: *Emit, n: int, t: FixedSide, wraps: bool, v: Val) -> Val
+    if wraps then return fx_resize(e, n, true, t.bits, v)
+
+    narrowed(e, n, t.bits, t.signed, v)
+end fx_settle
+
+// `scaled`, held at `n` bits, clamped into a `bits`-wide format and truncated to it. `n` is wider
+// than anything the format holds, so a signed clamp is right for an unsigned format too.
+private narrowed(e: *Emit, n: int, bits: int, signed: bool, scaled: Val) -> Val
+    val clamped = fx_clamp(e, n, scaled, min_of(bits, signed), max_of(bits, signed))
+
+    fx_resize(e, n, true, bits, clamped)
+end narrowed
+
+// `a / b` into the format `t`: the exact quotient `a · 2^(Ft - Fa + Fb) / b`, rounded to nearest with
+// ties toward +inf and clamped (or, into a `wrapping` type, reduced). A zero divisor traps, as
+// integer division's does.
+//
+// The scale moves onto whichever side keeps it an integer -- the dividend shifted left where the
+// result wants more fraction than the operands give, the divisor where it wants less. The divisor is
+// then made positive (both sides negated), so the remainder of a floor division is in `[0, b)` and
+// "round to nearest, ties up" is one comparison, `2r >= b`. A constant divisor that is a power of two
+// is a rounding shift instead, with no divide at all.
+private fixed_quotient(e: *Emit, a: FixedSide, b: FixedSide, t: FixedSide, wraps: bool, lv: Val,
+                       rv: Val) -> Val
+    val sh = t.frac - a.frac + b.frac
+    val left = if sh > 0 then sh else 0
+    val right = if sh < 0 then -sh else 0
+
+    val constant = rv match
+        VInt(c) -> Some(c)
+        _ -> None
+
+    if constant.is_none() || big_cmp(constant.unwrap(), from_int(0)) == 0
+        trap_unless(e, fx_cmp(e, INe, b.bits, fx_at(e, b, b.bits, rv), fx_small(0)), "div")
+
+    val xlo = big_mul(a.lo, fx_pow2(left))
+    val xhi = big_mul(a.hi, fx_pow2(left))
+    val mx = fx_max(fx_abs(xlo), fx_abs(xhi))
+    val my = big_mul(fx_max(fx_abs(b.lo), fx_abs(b.hi)), fx_pow2(right))
+    val k = fx_power_of_two(constant, right)
+
+    // Every value below fits: the dividend and its negation, a half unit added to it, the divisor
+    // and its negation, twice a remainder, and the quotient one past its floor.
+    val wide = fx_max(big_add(big_add(mx, my), from_int(1)), big_add(big_mul(my, from_int(2)), from_int(1)))
+    val n = fx_width(fx_bits_for(big_sub(from_int(0), wide), wide), t, wraps)
+    val x0 = fx_at(e, a, n, lv)
+    val x = if left > 0 then fx_bin(e, OpShl, n, x0, fx_small(long(left))) else x0
+
+    if k.is_some()
+        val q = if k.unwrap() == 0 then x else fx_round_off(e, n, x, k.unwrap())
+
+        return fx_settle(e, n, t, wraps, q)
+    end if
+
+    val y0 = fx_at(e, b, n, rv)
+    val y = if right > 0 then fx_bin(e, OpShl, n, y0, fx_small(long(right))) else y0
+    val bneg = fx_cmp(e, ISlt, n, y, fx_small(0))
+    val x_neg = fx_bin(e, OpSub, n, fx_small(0), x)
+    val y_neg = fx_bin(e, OpSub, n, fx_small(0), y)
+    val x2 = fx_select(e, bneg, n, x_neg, x)
+    val y2 = fx_select(e, bneg, n, y_neg, y)
+    val q = fx_bin(e, OpSDiv, n, x2, y2)
+    val r = fx_bin(e, OpSRem, n, x2, y2)
+
+    // A truncating division to a floor one: a negative remainder means the quotient was rounded up.
+    val rneg = fx_cmp(e, ISlt, n, r, fx_small(0))
+    val q_down = fx_bin(e, OpSub, n, q, fx_small(1))
+    val q1 = fx_select(e, rneg, n, q_down, q)
+    val r_up = fx_bin(e, OpAdd, n, r, y2)
+    val r1 = fx_select(e, rneg, n, r_up, r)
+    val twice = fx_bin(e, OpShl, n, r1, fx_small(1))
+    val up = fx_cmp(e, ISge, n, twice, y2)
+    val q_next = fx_bin(e, OpAdd, n, q1, fx_small(1))
+
+    fx_settle(e, n, t, wraps, fx_select(e, up, n, q_next, q1))
+end fixed_quotient
+
+// `k` where a constant divisor, shifted left `right` places, is `2^k`; nothing otherwise.
+private fx_power_of_two(constant: Option[BigInt], right: int) -> Option[int]
+    if constant.is_none() then return None
+
+    val c = constant.unwrap()
+
+    if big_cmp(c, from_int(0)) <= 0 then return None
+
+    var k = 0
+
+    while big_cmp(fx_pow2(k), c) < 0
+        k += 1
+
+    if big_cmp(fx_pow2(k), c) != 0 then return None
+
+    Some(k + right)
+end fx_power_of_two
+
+// `x << n` and `x >> n` in `x`'s own format: a scale by 2^n. The left shift saturates (or, for a
+// `wrapping` type, wraps), the right shift is arithmetic and floors. A count at or past the width is
+// a full shift, as an integer's is, and the count is first held to that.
+private fixed_shift(e: *Emit, op: string, lt: Type, ct: Type, wraps: bool, lv: Val, cv: Val) -> Val
+    val (bits, _, signed) = fx_parts(lt)
+    val (cbits, _, csigned) = fixed_format(ct).unwrap_or((bits, 0, false))
+    val wide = if cbits > bits then cbits else bits
+    val c0 = cv match
+        VInt(c) -> VInt(wrap(c, wide, true))
+        _ -> fx_resize(e, cbits, csigned, wide, cv)
+    val width = fx_const(from_int(long(bits)), wide)
+    val over = fx_cmp(e, IUge, wide, c0, width)
+    val c = fx_resize(e, wide, false, bits, fx_select(e, over, wide, width, c0))
+    val top = fx_const(from_int(long(bits - 1)), bits)
+    val past = fx_cmp(e, IUgt, bits, c, top)
+    val most = fx_select(e, past, bits, top, c)
+    val full = fx_cmp(e, IUge, bits, c, fx_const(from_int(long(bits)), bits))
+
+    if op == ">>"
+        if signed then return fx_bin(e, OpAShr, bits, lv, most)
+
+        return fx_select(e, full, bits, fx_small(0), fx_bin(e, OpLShr, bits, lv, most))
+    end if
+
+    if wraps then return fx_select(e, full, bits, fx_small(0), fx_bin(e, OpShl, bits, lv, most))
+
+    if signed then return fx_sat(e, "sshl", bits, lv, most)
+
+    // An unsigned value shifted by the whole width is past every value but zero.
+    val zero = fx_cmp(e, IEq, bits, lv, fx_small(0))
+    val spilled = fx_select(e, zero, bits, fx_small(0), fx_const(max_of(bits, false), bits))
+
+    fx_select(e, full, bits, spilled, fx_sat(e, "ushl", bits, lv, most))
+end fixed_shift
+
+// `-x`, saturating: the negation of the most negative value is the largest one -- or, for a
+// `wrapping` type, that value itself, as an integer's negation is.
+fixed_neg(e: *Emit, ty: Type, wraps: bool, v: Val) -> Val
+    val (bits, _, _) = fx_parts(ty)
+
+    if wraps then return fx_bin(e, OpSub, bits, fx_small(0), v)
+
+    fx_sat(e, "ssub", bits, fx_small(0), v)
+end fixed_neg
+
+// -- conversions ---------------------------------------------------------------------------------
+
+// One scalar read as another where either side is fixed-point. Every row rounds to nearest (ties
+// toward +inf) and saturates, except into an integer, which truncates toward zero and saturates as a
+// float does.
+fixed_convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
+    (from, to) match
+        (Fixed(b1, f1, s1), Fixed(b2, f2, s2)) ->
+            if b1 == b2 && f1 == f2 && s1 == s2 then return v
+
+            fixed_rescale(e, b1, f1, s1, b2, f2, s2, v)
+        (Integer(b1, s1, _), Fixed(b2, f2, s2)) ->
+            val n = (if b1 > b2 then b1 else b2) + f2 + 2
+            val y = fx_bin(e, OpShl, n, fx_resize(e, b1, s1, n, v), fx_small(long(f2)))
+
+            narrowed(e, n, b2, s2, y)
+        (Fixed(b1, f1, s1), Integer(b2, s2, _)) ->
+            val n = (if b1 > b2 then b1 else b2) + 2
+            val x = fx_resize(e, b1, s1, n, v)
+
+            // Toward zero: a negative value is biased up by one unit less than a whole before the
+            // floor the shift performs.
+            val neg = fx_cmp(e, ISlt, n, x, fx_small(0))
+            val biased = fx_bin(e, OpAdd, n, x, fx_int(big_sub(fx_pow2(f1), from_int(1))))
+            val toward = fx_select(e, neg, n, biased, x)
+            val y = fx_bin(e, OpAShr, n, toward, fx_small(long(f1)))
+            val clamped = fx_clamp(e, n, y, min_of(b2, s2), max_of(b2, s2))
+
+            fx_resize(e, n, true, b2, clamped)
+        (Floating(_, _), Fixed(b2, f2, s2)) -> float_to_fixed(e, from, b2, f2, s2, v)
+        (Fixed(b1, f1, s1), Floating(_, _)) -> fixed_to_float(e, b1, f1, s1, to, v)
+        _ -> gap_at(e, s"a conversion from ${type_show(from)} to ${type_show(to)}")
+end fixed_convert
+
+// One fixed-point format brought to another: exact where the fraction grows, rounded to nearest with
+// ties toward +inf where it shrinks, and clamped once.
+//
+// **The width is the narrowest that holds the value and what is done to it**, which is what keeps
+// `q31(acc)` out of an `i64q61` accumulator a 64-bit sequence rather than a 96-bit one. Rounding off
+// `k` bits is `floor((x + 2^(k-1)) / 2^k)`, and where `k` is at least two it is computed as
+// `((x >> (k-1)) + 1) >> 1` -- the same number, since flooring twice floors once -- whose sum
+// cannot overflow the source's own width the way adding the half first would at its largest value.
+private fixed_rescale(e: *Emit, b1: int, f1: int, s1: bool, b2: int, f2: int, s2: bool, v: Val) -> Val
+    val d = f2 - f1
+    val lo = min_of(b1, s1)
+    val hi = max_of(b1, s1)
+
+    if d >= 0
+        val n = fx_wider(fx_bits_for(big_mul(lo, fx_pow2(d)), big_mul(hi, fx_pow2(d))), b2 + 1)
+        val x = fx_resize(e, b1, s1, n, v)
+
+        if d == 0 then return narrowed(e, n, b2, s2, x)
+
+        return narrowed(e, n, b2, s2, fx_bin(e, OpShl, n, x, fx_small(long(d))))
+    end if
+
+    val k = -d
+
+    if k == 1
+        val n = fx_wider(fx_bits_for(lo, big_add(hi, from_int(1))), b2 + 1)
+
+        return narrowed(e, n, b2, s2, fx_round_off(e, n, fx_resize(e, b1, s1, n, v), 1))
+    end if
+
+    val n = fx_wider(fx_bits_for(lo, hi), b2 + 1)
+    val x = fx_resize(e, b1, s1, n, v)
+    val most = fx_bin(e, OpAShr, n, x, fx_small(long(k - 1)))
+    val up = fx_bin(e, OpAdd, n, most, fx_small(1))
+
+    narrowed(e, n, b2, s2, fx_bin(e, OpAShr, n, up, fx_small(1)))
+end fixed_rescale
+
+private fx_wider(a: int, b: int) -> int = if a > b then a else b
+
+// The `double` constant `2^k`, written as its bit pattern.
+private pow2_double(k: int) -> Val = VFloat(long(1023 + k) << 52)
+
+// `x · 2^F`, rounded to nearest with ties toward +inf, saturated, NaN to zero. Everything happens in
+// `double`: a narrower float widens exactly, and multiplying by a power of two is exact.
+//
+// The rounding is `floor(y + 1/2)` without adding the half in floating point -- which would round a
+// value past 2^52 a second time. Instead `t = trunc(y)` (saturating, so a NaN is zero and an
+// infinity an end), `fr = y - t` exactly, a floor correction where `fr < 0`, and a step up where what
+// is left is at least a half. `t` is first held to one past either end of the format, so the steps
+// that follow cannot wrap it.
+private float_to_fixed(e: *Emit, from: Type, bits: int, frac: int, signed: bool, v: Val) -> Val
+    val dbl = LFloat(64, false)
+    val wide = convert(e, from, real_type(), v)
+    val y = fresh_reg(e)
+
+    emit(e, InBin(y, OpFMul, dbl, wide, pow2_double(frac)))
+
+    val k = bits + 2
+    val kt = LInt(k)
+    val sat = s"llvm.fptosi.sat.i$k.f64"
+
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(dbl))
+    request_intrinsic(e, ir_sig(sat, ir_fn_type(kt, params)))
+
+    var ops: Buf[IrArg] = buf()
+
+    ops.push(ir_arg(dbl, y))
+
+    val t = fresh_reg(e)
+
+    emit(e, ir_call(Some(t), kt, VGlobal(sat), ops))
+
+    val lo = big_sub(min_of(bits, signed), from_int(1))
+    val hi = big_add(max_of(bits, signed), from_int(1))
+    val tc = fx_clamp(e, k, t, lo, hi)
+    val back = fresh_reg(e)
+
+    emit(e, InCast(back, CastSIToFP, kt, tc, dbl))
+
+    val fr = fresh_reg(e)
+
+    emit(e, InBin(fr, OpFSub, dbl, y, back))
+
+    val isneg = fresh_reg(e)
+
+    emit(e, InFloatCmp(isneg, FOlt, dbl, fr, VFloat(0)))
+
+    val t_down = fx_bin(e, OpSub, k, tc, fx_small(1))
+    val t1 = fx_select(e, isneg, k, t_down, tc)
+    val fr_up = fresh_reg(e)
+
+    emit(e, InBin(fr_up, OpFAdd, dbl, fr, pow2_double(0)))
+
+    val fr1 = fresh_reg(e)
+
+    emit(e, InSelect(fr1, isneg, dbl, fr_up, fr, l_i1()))
+
+    val up = fresh_reg(e)
+
+    emit(e, InFloatCmp(up, FOge, dbl, fr1, pow2_double(-1)))
+
+    val t_next = fx_bin(e, OpAdd, k, t1, fx_small(1))
+    val t2 = fx_select(e, up, k, t_next, t1)
+
+    narrowed(e, k, bits, signed, t2)
+end float_to_fixed
+
+// `raw · 2^-F` at a float type. At 32 bits and up the raw integer converts straight into the
+// destination, which rounds once, and the scale is an exact multiplication by a power of two; the
+// two sixteen-bit formats cannot hold a 32-bit raw value at all, so they go through `double` and
+// round once more on the way down.
+private fixed_to_float(e: *Emit, bits: int, frac: int, signed: bool, to: Type, v: Val) -> Val
+    val fbits = to match
+        Floating(b, _) -> b
+        _ -> 64
+
+    val target = if fbits >= 32 then to else real_type()
+    val ft = lty(e, target)
+    val f = fresh_reg(e)
+
+    emit(e, InCast(f, if signed then CastSIToFP else CastUIToFP, LInt(bits), v, ft))
+
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, OpFMul, ft, f, pow2_double(-frac)))
+
+    if fbits >= 32 then return r
+
+    convert(e, real_type(), to, r)
+end fixed_to_float
+
+// -- rendering -----------------------------------------------------------------------------------
+
+// `str(x)` of a fixed-point value: the shortest decimal that reads back as the same value, through a
+// renderer generated once per format.
+gen_fixed_str(e: *Emit, arg: TExpr, bits: int, frac: int, signed: bool) -> Val
+    e.heap = true
+
+    request_from_bytes(e)
+
+    val name = s"sysl.str.fixed.${fixed_canonical(bits, frac, signed)}"
+    val fn = request_text(e, name, str_fixed_text(name, bits, frac, signed, s"i${e.word_bits}",
+                                                  l_render(lty(e, Str))))
+    val v = gen_expr(e, arg)
+    val r = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LInt(bits), v))
+    emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
+    r
+end gen_fixed_str
+
+// The width the renderer works at: room for the magnitude and a carry into it (`W + 1`), and for the
+// fraction scaled by ten (`F + 1` bits times ten, plus the power of ten that bounds it) -- rounded up
+// to a whole number of 64-bit words, which is what a divide by ten is cheapest at.
+private render_width(bits: int, frac: int) -> int
+    val need = if bits + 1 > frac + 8 then bits + 1 else frac + 8
+
+    ((need + 63) / 64) * 64
+end render_width
+
+// A fixed-point value as its shortest round-tripping decimal, without libc.
+//
+// **The fraction's digits are found one place at a time, holding only a remainder.** In units of
+// 2^-(F+1) the fraction `f` is `M = 2f`, and a decimal reads back as `f` exactly when it lies within
+// one unit of `M` (or exactly one unit away where `f` is even, the literal's ties going to even).
+// After `k` places the truncated decimal `T` is off by `rem / 10^k` units and the one above it by
+// `(2^(F+1) - rem) / 10^k`, so each step asks two comparisons against `10^k`; the first `k` where
+// either holds is the shortest, the nearer one is taken (the even one on an exact tie), and a step
+// up that carries out of every place adds one to the whole part instead. By the place where `10^k`
+// passes `2^(F+1)` the truncated decimal always qualifies, so the loop ends.
+//
+// `fixed.sysl`'s `fixed_text` answers the same question the plain way, and the two must agree to the
+// byte: the diagnostics quote one and `print` writes the other.
+//
+// Then the digits are written backwards into a stack buffer -- the fraction's `k` places, the dot,
+// the whole part, the sign -- and copied out into a string, as the integer renderer does.
+str_fixed_text(name: string, bits: int, frac: int, signed: bool, word: string, text_ty: string) -> string
+    val n = render_width(bits, frac)
+    val it = s"i$n"
+    val wt = s"i$bits"
+    val ext = if signed then "sext" else "zext"
+    val mask = to_string(big_sub(fx_pow2(frac), from_int(1)))
+    val two_f1 = to_string(fx_pow2(frac + 1))
+    val mask2 = to_string(big_sub(fx_pow2(frac + 1), from_int(1)))
+    val cap = bits * 3 / 10 + frac * 3 / 10 + 12
+
+    s"""
+    define private $text_ty @$name($wt %v) {
+    entry:
+      %buf = alloca [$cap x i8]
+      %end = getelementptr i8, ptr %buf, $word $cap
+      %wide = $ext $wt %v to $it
+      %isneg = icmp slt $it %wide, 0
+      %negv = sub $it 0, %wide
+      %mag = select i1 %isneg, $it %negv, $it %wide
+      %ip0 = lshr $it %mag, $frac
+      %f = and $it %mag, $mask
+      %m = shl $it %f, 1
+      %fodd = and $it %f, 1
+      %feven = icmp eq $it %fodd, 0
+      %fz = icmp eq $it %f, 0
+      br i1 %fz, label %render, label %loop
+    loop:
+      %k = phi $it [ 0, %entry ], [ %k1, %next ]
+      %rem = phi $it [ %m, %entry ], [ %rem1, %next ]
+      %tt = phi $it [ 0, %entry ], [ %tt1, %next ]
+      %p = phi $it [ 1, %entry ], [ %p1, %next ]
+      %k1 = add $it %k, 1
+      %t = mul $it %rem, 10
+      %d = lshr $it %t, ${frac + 1}
+      %rem1 = and $it %t, $mask2
+      %tt10 = mul $it %tt, 10
+      %tt1 = add $it %tt10, %d
+      %p1 = mul $it %p, 10
+      %gap = sub $it $two_f1, %rem1
+      %lowlt = icmp ult $it %rem1, %p1
+      %loweq = icmp eq $it %rem1, %p1
+      %lowtie = and i1 %loweq, %feven
+      %lowok = or i1 %lowlt, %lowtie
+      %hilt = icmp ult $it %gap, %p1
+      %hieq = icmp eq $it %gap, %p1
+      %hitie = and i1 %hieq, %feven
+      %hiok = or i1 %hilt, %hitie
+      %any = or i1 %lowok, %hiok
+      br i1 %any, label %pick, label %next
+    next:
+      br label %loop
+    pick:
+      %closer = icmp ult $it %rem1, %gap
+      %same = icmp eq $it %rem1, %gap
+      %ttodd = and $it %tt1, 1
+      %tteven = icmp eq $it %ttodd, 0
+      %tiepick = and i1 %same, %tteven
+      %prefer = or i1 %closer, %tiepick
+      %bothok = and i1 %lowok, %hiok
+      %lowbest = and i1 %bothok, %prefer
+      %nohi = xor i1 %hiok, true
+      %onlylow = and i1 %lowok, %nohi
+      %takelow = or i1 %lowbest, %onlylow
+      %ttup = add $it %tt1, 1
+      %tc = select i1 %takelow, $it %tt1, $it %ttup
+      %carry = icmp eq $it %tc, %p1
+      %ipc = zext i1 %carry to $it
+      %ip1 = add $it %ip0, %ipc
+      %kk = select i1 %carry, $it 0, $it %k1
+      br label %render
+    render:
+      %ipr = phi $it [ %ip0, %entry ], [ %ip1, %pick ]
+      %ttr = phi $it [ 0, %entry ], [ %tc, %pick ]
+      %kr = phi $it [ 0, %entry ], [ %kk, %pick ]
+      %hasfrac = icmp ne $it %kr, 0
+      br i1 %hasfrac, label %floop, label %iloop0
+    floop:
+      %fi = phi $it [ 0, %render ], [ %fi1, %floop ]
+      %fv = phi $it [ %ttr, %render ], [ %fq, %floop ]
+      %fpos = phi ptr [ %end, %render ], [ %fpp, %floop ]
+      %fpp = getelementptr i8, ptr %fpos, $word -1
+      %fq = udiv $it %fv, 10
+      %fr = urem $it %fv, 10
+      %frb = trunc $it %fr to i8
+      %fdig = add i8 %frb, 48
+      store i8 %fdig, ptr %fpp
+      %fi1 = add $it %fi, 1
+      %fmore = icmp ult $it %fi1, %kr
+      br i1 %fmore, label %floop, label %dot
+    dot:
+      %dp = getelementptr i8, ptr %fpp, $word -1
+      store i8 46, ptr %dp
+      br label %iloop0
+    iloop0:
+      %istart = phi ptr [ %end, %render ], [ %dp, %dot ]
+      br label %iloop
+    iloop:
+      %iv = phi $it [ %ipr, %iloop0 ], [ %iq, %iloop ]
+      %ipos = phi ptr [ %istart, %iloop0 ], [ %ipp, %iloop ]
+      %ipp = getelementptr i8, ptr %ipos, $word -1
+      %iq = udiv $it %iv, 10
+      %ir = urem $it %iv, 10
+      %irb = trunc $it %ir to i8
+      %idig = add i8 %irb, 48
+      store i8 %idig, ptr %ipp
+      %imore = icmp ne $it %iq, 0
+      br i1 %imore, label %iloop, label %sign
+    sign:
+      br i1 %isneg, label %addsign, label %finish
+    addsign:
+      %sp = getelementptr i8, ptr %ipp, $word -1
+      store i8 45, ptr %sp
+      br label %finish
+    finish:
+      %start = phi ptr [ %ipp, %sign ], [ %sp, %addsign ]
+      %si = ptrtoint ptr %start to $word
+      %ei = ptrtoint ptr %end to $word
+      %len = sub $word %ei, %si
+      %res = call $text_ty @sysl.str.from_bytes(ptr %start, $word %len)
+      ret $text_ty %res
+    }
+    """
+end str_fixed_text

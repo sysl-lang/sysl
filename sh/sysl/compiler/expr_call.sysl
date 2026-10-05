@@ -830,6 +830,12 @@ convert_to(cx: &Analyzer, span: Span, t: TExpr, to: Type, asked: Option[string])
     if !converts(cx, span, from, to) then
         return cx.err(span, refusal(asked, texpr_type(t), to))
 
+    // `q31(0.6)` over a literal is worked out now, with the run-time conversion's own rounding and
+    // saturation, so it is constant data like the literal `0.6` at `q31` is.
+    val folded = fixed_fold(span, t, to)
+
+    if folded.is_some() then return folded.unwrap()
+
     TExpr(span, TCast(t, to))
 end convert_to
 
@@ -852,11 +858,20 @@ private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
         Integer(_, _, _) -> to match
             Integer(_, _, _) -> return true
             Floating(_, _) -> return true
+            Fixed(_, _, _) -> return true
             Char -> return true
             _ -> return false
         Floating(_, _) -> to match
             Integer(_, _, _) -> return true
             Floating(_, _) -> return true
+            Fixed(_, _, _) -> return true
+            _ -> return false
+        // A fixed-point value converts to and from every number, each crossing rounding to nearest
+        // and saturating -- into an integer it truncates toward zero, as a float does.
+        Fixed(_, _, _) -> to match
+            Integer(_, _, _) -> return true
+            Floating(_, _) -> return true
+            Fixed(_, _, _) -> return true
             _ -> return false
         Char -> to match
             Integer(_, _, _) -> return true

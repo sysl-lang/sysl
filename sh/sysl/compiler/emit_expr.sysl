@@ -567,6 +567,11 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type) -> Val
     val lv = gen_expr(e, l)
     val rv0 = gen_expr(e, r)
 
+    // A fixed-point operation reads both operands' formats and the result's: a product or a quotient
+    // may mix formats and be given a third, and a `wrapping` type's arithmetic wraps.
+    if is_fixed(texpr_type(l)) || is_fixed(texpr_type(r)) then
+        return fixed_binary(e, op, texpr_type(l), texpr_type(r), ty, lv, rv0)
+
     // A shift's count may be any integer width, so it is brought to the shifted value's own here:
     // every instruction below takes two operands of one type.
     val rv = if op == "<<" || op == ">>" then shift_amount(e, bt, texpr_type(r), rv0) else rv0
@@ -628,6 +633,10 @@ private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type) -> Val
         return r
 
     if op == "-"
+        // Negating the most negative fixed-point value saturates, as every fixed-point operation
+        // does, rather than wrapping back to itself -- except in a `wrapping` type, which wraps.
+        if is_fixed(vector_lane_of(ty)) then return fixed_neg(e, vector_lane_of(ty), fixed_wraps(ty), v)
+
         vector_lane_of(ty) match
             Integer(_, _, _) ->
                 underlying(ty) match
@@ -856,6 +865,9 @@ combine(e: *Emit, op: string, ty: Type, value_ty: Type, dispatch: Option[TDispat
     if underlying(ty) == Str then return own_temp(e, str_concat(e, cur, v), Str)
 
     val bin = op[0..<(op.bytes.len - 1)]
+
+    if is_fixed(ty) then return fixed_binary(e, bin, ty, value_ty, ty, cur, v)
+
     val bt = underlying(ty)
     val rv = if bin == "<<" || bin == ">>" then shift_amount(e, bt, value_ty, v) else v
 
@@ -900,6 +912,28 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                             val op = if d.exclusive_hi then "<" else "<="
 
                             trap_unless(e, compare_value(e, op, wide, x, VFloat(end_bits(hi))),
+                                        "within")
+                        None -> ()
+                // A fixed-point range is compared on the raw value, each end brought to the scale
+                // inward -- the smallest raw value at or above the lower end, the largest at or below
+                // the upper -- so no value outside the written range passes for one inside it.
+                Fixed(_, frac, _) ->
+                    d.lo match
+                        Some(lo) ->
+                            trap_unless(e, compare_value(e, ">=", base, v,
+                                                         VInt(fixed_bound_raw(finite_end(lo), frac, FixCeil))),
+                                        "within")
+                        None -> ()
+
+                    d.hi match
+                        Some(hi) ->
+                            // `x < hi` on the reals is `raw < hi·2^F`, which over integers is
+                            // `raw < ceil(hi·2^F)`.
+                            val op = if d.exclusive_hi then "<" else "<="
+                            val mode: FixRound = if d.exclusive_hi then FixCeil else FixFloor
+
+                            trap_unless(e, compare_value(e, op, base, v,
+                                                         VInt(fixed_bound_raw(finite_end(hi), frac, mode))),
                                         "within")
                         None -> ()
                 _ ->
@@ -1294,6 +1328,9 @@ convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
 
     val ut = underlying(to)
 
+    // Every conversion into or out of a fixed-point type rescales, rounds and saturates.
+    if is_fixed(from) || is_fixed(ut) then return fixed_convert(e, underlying(from), ut, v)
+
     (from, ut) match
         (Integer(a_bits, a_signed, _), Integer(b_bits, _, _)) ->
             convert_int(e, a_bits, a_signed, b_bits, v)
@@ -1408,6 +1445,7 @@ zero_of(e: *Emit, ty: Type) -> Val
 
     underlying(ty) match
         Integer(_, _, _) -> VInt(from_int(0))
+        Fixed(_, _, _) -> VInt(from_int(0))
         Floating(_, _) -> v_float(0.0)
         Char -> VInt(from_int(0))
         Bool -> VInt(from_int(0))

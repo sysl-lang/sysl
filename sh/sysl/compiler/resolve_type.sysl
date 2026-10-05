@@ -150,6 +150,7 @@ private volatile_admits(a: &Analysis, scope: Scope, span: Span, t: Type) -> bool
     val why = underlying(t) match
         Unknown -> return false
         Integer(_, _, _) -> return true
+        Fixed(_, _, _) -> return true
         Floating(_, _) -> return true
         Char -> return true
         Bool -> return true
@@ -1242,6 +1243,12 @@ width_type(a: &Analysis, scope: Scope, span: Span, name: string) -> Option[Type]
     if b.len < 2 then return None
     if b[0] != u8('i') && b[0] != u8('u') && b[0] != u8('f') then return None
 
+    // `i32q31` is the width family with a fraction written after it, so it is the same shape read
+    // one letter further -- and a bad fraction is told in the same terms a bad width is.
+    val q = fixed_q_at(name)
+
+    if q.is_some() then return fixed_width_type(a, scope, span, name, q.unwrap())
+
     for i in 1..<b.len
         if b[i] < u8('0') || b[i] > u8('9') then return None
 
@@ -1281,6 +1288,53 @@ width_type(a: &Analysis, scope: Scope, span: Span, name: string) -> Option[Type]
     a.fault(scope, span, s"'$name' is wider than the $MaxIntegerBits bits the back end lowers")
     Some(Unknown)
 end width_type
+
+// `iWqF` and `uWqF`: a `W`-bit integer counting units of 2^-F. The shape is already known to match
+// (`fixed_q_at`), so everything wrong from here is the number that was written: a width or a
+// fraction with a leading zero, no fraction at all (which is the integer `iW`), or more fraction than
+// the storage has bits.
+private fixed_width_type(a: &Analysis, scope: Scope, span: Span, name: string, q: usize) -> Option[Type]
+    val b = name.bytes
+    val head = name[0..<1]
+    val width_digits = name[1..<q]
+    val frac_digits = name[(q + 1)..<b.len]
+    val plain = s"$head${without_leading_zeros(width_digits)}q${without_leading_zeros(frac_digits)}"
+
+    if (width_digits.bytes.len > 1 && b[1] == u8('0')) ||
+       (frac_digits.bytes.len > 1 && b[q + 1] == u8('0')) then
+        a.fault(scope, span, s"'$name' has a leading zero — a fixed-point type is written plainly, " +
+                s"as '$plain'")
+        return Some(Unknown)
+
+    if !fits_i32(width_digits) || !fits_i32(frac_digits) then
+        a.fault(scope, span, s"'$name' is far wider than anything can hold")
+        return Some(Unknown)
+
+    val bits = int(digits_value(width_digits, 10))
+    val frac = int(digits_value(frac_digits, 10))
+
+    if bits == 0 then
+        a.fault(scope, span, s"'$name' has no bits — the width families start at 1")
+        return Some(Unknown)
+
+    if frac == 0 then
+        a.fault(scope, span, s"'$name' has no fractional bits — that is '$head$bits'")
+        return Some(Unknown)
+
+    if frac > bits then
+        a.fault(scope, span, s"'$name' has more fractional bits than its $bits bits of storage — a " +
+                s"fixed-point type's fraction is 1 to its width, so the finest is '${head}${bits}q$bits'")
+        return Some(Unknown)
+
+    // A product is computed exactly at twice the width before it is rounded back, so the widest
+    // fixed-point type is half the widest integer.
+    if bits > MaxIntegerBits / 2 then
+        a.fault(scope, span, s"'$name' is wider than the ${MaxIntegerBits / 2} bits a fixed-point " +
+                "type may be — its products are computed exactly at twice its width")
+        return Some(Unknown)
+
+    Some(Fixed(bits, frac, b[0] == u8('i')))
+end fixed_width_type
 
 private all_zero(digits: string) -> bool
     val b = digits.bytes
@@ -2004,6 +2058,25 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
         return Unknown
     end if
 
+    // `wrapping` changes what the operators do, so it makes a type of its own -- an alias that
+    // wrapped would be the same values as its base computing differently -- and only a fixed-point
+    // base saturates to begin with.
+    if d.wrapping.is_some()
+        val word = d.wrapping.unwrap()
+
+        if !d.derived
+            a.fault(home, word, "'wrapping' changes what the operators do, so it makes a type of its own " +
+                    s"— write 'type ${d.name} = new ${type_show(base)} wrapping'")
+            return Unknown
+        end if
+
+        if !is_fixed(base)
+            a.fault(home, word, "'wrapping' asks a fixed-point type to wrap rather than saturate, and " +
+                    s"${type_show(base)} is not fixed-point")
+            return Unknown
+        end if
+    end if
+
     var made = base
 
     // **WHAT THE DECLARATION NARROWED IS PART OF THE TYPE.** `type Age = int within 0..150` is not
@@ -2044,7 +2117,8 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
         None -> None
 
     if !is_plain_alias(d) then
-        made = constrained_exported(key, base, d.derived, lo, hi, exclusive, pred, cname)
+        made = constrained_exported(key, base, d.derived, lo, hi, exclusive, pred, cname,
+                                    d.wrapping.is_some())
 
     a.tables.constrained_insts.put(key, made)
 
@@ -2137,6 +2211,7 @@ private declared_at(a: &Analysis, key: string, fallback: Span) -> Span = a.table
 private scalar_base(t: Type) -> bool = underlying(t) match
     Integer(_, _, _) -> true
     Floating(_, _) -> true
+    Fixed(_, _, _) -> true
     Char -> true
     _ -> false
 
@@ -2204,6 +2279,10 @@ private bound_holds(a: &Analysis, scope: Scope, at: Span, base: Type, e: Expr) -
             ConstInt(_) -> None
             ConstFloat(_) -> None
             _ -> Some("a floating-point subtype needs numeric bounds")
+        Fixed(_, _, _) -> value match
+            ConstInt(_) -> None
+            ConstFloat(_) -> None
+            _ -> Some("a fixed-point subtype needs numeric bounds")
         _ -> value match
             ConstChar(_) -> None
             _ -> Some("a 'char' subtype needs character bounds")
@@ -2227,6 +2306,20 @@ private bound_holds(a: &Analysis, scope: Scope, at: Span, base: Type, e: Expr) -
             Integer(bits, signed, _) ->
                 if !fits(n, bits, signed)
                     a.fault(scope, at, s"the bound ${to_string(n)} does not fit ${type_show(b)}")
+                    return false
+                end if
+            Fixed(bits, frac, signed) ->
+                if !fixed_raw_fits(fixed_raw_of(n, 0, frac, FixNearestEven), bits, signed)
+                    a.fault(scope, at, s"the bound ${to_string(n)} does not fit ${type_show(b)}")
+                    return false
+                end if
+            _ -> ()
+        ConstFloat(f) -> b match
+            Fixed(bits, frac, signed) ->
+                val raw = fixed_raw_of_double(real_bits(f), frac)
+
+                if raw.is_none() || !fixed_raw_fits(raw.unwrap(), bits, signed)
+                    a.fault(scope, at, s"the bound ${str(f)} does not fit ${type_show(b)}")
                     return false
                 end if
             _ -> ()
@@ -2311,6 +2404,16 @@ private const_type_refused(a: &Analysis, v: ValueDecl, t: Type) -> bool
         _ -> false
 
     if scalar then return false
+
+    // A fixed-point constant would be folded through every arithmetic the fold knows, and that
+    // arithmetic is the integers' and the reals' -- neither of which a fixed-point value has. The
+    // `val` it is written as instead is constant data all the same.
+    if is_fixed(t)
+        a.fault(v.scope, v.span, s"a constant is folded as an integer or a real, and ${type_show(t)} " +
+                s"is fixed-point — write '${v.name}' as a 'val', which is laid into the object file " +
+                "as constant data")
+        return true
+    end if
 
     t match
         Constrained(cd) -> return cd.derived || cd.pred_fn.is_some()
@@ -2427,7 +2530,8 @@ end folds_to_nan
 // here would leave nothing there to spell. It is built as a transparent type with no constraint,
 // interchangeable with its base in both directions, as before.
 is_plain_alias(d: TypeDecl) -> bool =
-    !d.derived && d.range.is_none() && d.pred.is_none() && !d.from_c && d.cname.is_none()
+    !d.derived && d.range.is_none() && d.pred.is_none() && !d.from_c && d.cname.is_none() &&
+        d.wrapping.is_none()
 
 // Whether a declaration is an alias a C header is asked to declare as a `typedef`.
 private is_exported_alias(d: TypeDecl) -> bool =

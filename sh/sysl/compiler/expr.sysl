@@ -1247,6 +1247,12 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
                                   s"${type_show(ty)}")
 
                 return produced(TExpr(e.span, TUnary("-", t, unary_type(ty))))
+            Fixed(_, _, signed) ->
+                if !signed then
+                    return cx.err(e.span, s"unary '-' is not defined for the unsigned type " +
+                                  s"${type_show(ty)}")
+
+                return produced(TExpr(e.span, TUnary("-", t, unary_type(ty))))
             Floating(_, _) -> return produced(TExpr(e.span, TUnary("-", t, unary_type(ty))))
             _ -> return cx.err(e.span, s"unary '-' is not defined for ${type_show(ty)}")
 
@@ -1370,15 +1376,9 @@ private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
     if op == "&&" || op == "||" then
         return TExpr(span, TLogical(op, analyze_bool(cx, l, span), analyze_bool(cx, r, span)))
 
-    var operands: Buf[Expr] = buf()
-
-    operands.push(l)
-    operands.push(r)
-
     val numeric = numeric_expectation(expected)
-    val ts = analyze_operands(cx, operands, numeric)
-    val tl = ts.at(0)
-    val tr = operand_rhs(cx, op, tl, r, ts.at(1))
+    val scaled = scale_operands(cx, op, l, r, numeric)
+    val (tl, tr) = if scaled.is_some() then scaled.unwrap() else paired_operands(cx, op, l, r, numeric)
 
     if texpr_type(tl) == Unknown || texpr_type(tr) == Unknown then return bad_expr(span)
 
@@ -1386,17 +1386,75 @@ private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
 
     if dispatched.is_some() then return dispatched.unwrap()
 
-    val ty = arith_type(cx, span, op, texpr_type(tl), texpr_type(tr), r.span)
+    // A fixed-point product or quotient takes its format from the position it is written in.
+    val fixed = fixed_operator_type(cx, span, op, texpr_type(tl), texpr_type(tr), expected)
+    val ty = if fixed.is_some() then fixed.unwrap()
+    else arith_type(cx, span, op, texpr_type(tl), texpr_type(tr), r.span)
 
     if ty == Unknown then return bad_expr(span)
 
     produced(TExpr(span, TBinary(op, tl, tr, ty)))
 end binary_expr
 
+// The two operands of a binary operator, read as a pair that shares one type.
+private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
+                        numeric: Option[Type]) -> (TExpr, TExpr)
+    var operands: Buf[Expr] = buf()
+
+    operands.push(l)
+    operands.push(r)
+
+    val read = analyze_operands(cx, operands, numeric)
+    val ts = if op == "+" || op == "-" then fixed_siblings(cx, operands, read) else read
+    val tl = ts.at(0)
+
+    (tl, operand_rhs(cx, op, tl, r, ts.at(1)))
+end paired_operands
+
+// `x * 3`, `3 * x`, `x / 2`, `x >> 1`: an integer literal beside a fixed-point operand of `*`, `/`
+// or a shift is a SCALE, read as the integer it is rather than as a fixed-point literal of the other
+// side's format -- so `x * 3` works where `3` is not a `q31`. Answers nothing where the pair is not
+// that shape.
+//
+// The other operand is read first and alone, exactly as the pair would read it, since a literal
+// contributes nothing to what its neighbour is read at; only where that neighbour turns out not to
+// be fixed-point does the literal take its type, as it always has.
+private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
+                       numeric: Option[Type]) -> Option[(TExpr, TExpr)]
+    if op != "*" && op != "/" && op != "<<" && op != ">>" then return None
+
+    if bare_int_literal(r) && !is_literal(l)
+        var one: Buf[Expr] = buf()
+
+        one.push(l)
+
+        val tl = analyze_operands(cx, one, numeric).at(0)
+
+        if is_fixed(texpr_type(tl)) then return Some((tl, type_expr(cx, r, None)))
+
+        return Some((tl, operand_rhs(cx, op, tl, r, type_expr(cx, r, Some(repr(texpr_type(tl)))))))
+    end if
+
+    if op == "*" && bare_int_literal(l) && !is_literal(r)
+        var one: Buf[Expr] = buf()
+
+        one.push(r)
+
+        val tr = analyze_operands(cx, one, numeric).at(0)
+
+        if is_fixed(texpr_type(tr)) then return Some((type_expr(cx, l, None), tr))
+
+        return Some((type_expr(cx, l, Some(repr(texpr_type(tr)))), tr))
+    end if
+
+    None
+end scale_operands
+
 // Each link of the chain is resolved on its own, so a chain reads and behaves exactly as a chain of
 // scalars does, sharing each middle operand between the two comparisons that use it.
 private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[string]) -> TExpr
-    val ts = analyze_operands(cx, operands, None)
+    // A fixed-point product compared with a value of another format is read at that format.
+    val ts = fixed_siblings(cx, operands, analyze_operands(cx, operands, None))
 
     // A comparison either side of which is a vector is one link and a mask rather than a `bool`, so
     // it is a different node and a different set of rules.
