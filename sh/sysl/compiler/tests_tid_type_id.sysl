@@ -1,0 +1,194 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// `T::Id` and `o::Id` — a type's compile-time identity. One number with one promise: **equal ids
+// mean the same type, and nothing else.** So these are organized around what that promise has to
+// survive — the same type reached two ways, two types that must not collide, an erased value (the
+// case the form exists for) — and the two refusals that keep it from being read as more than it is.
+//
+// **Every output and diagnostic here was read out of the reference compiler (0.0.162)**, whose
+// `TypeIdTests` these are, by handing the installed `sysl` the same program. The harness is
+// `tests_enm_enum_run.sysl`'s: `enm_ran` for what a program prints, `enm_err` for its refusal.
+
+private tid_shapes() -> string =
+    "trait Shape\n" +
+    "    area(self) -> int\n" +
+    "end Shape\n" +
+    "\n" +
+    "struct Rect\n" +
+    "    w: int\n" +
+    "end Rect\n" +
+    "\n" +
+    "struct Sq\n" +
+    "    s: int\n" +
+    "end Sq\n" +
+    "\n" +
+    "impl Shape for Rect\n" +
+    "    area(self) -> int = self.w\n" +
+    "\n" +
+    "impl Shape for Sq\n" +
+    "    area(self) -> int = self.s\n" +
+    "\n"
+
+// -- a type answers the same number every time, and no two types answer alike ----------------------
+
+@test("the same type twice")
+tid_the_same_type_twice()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tid_shapes() + "print(Rect::Id == Rect::Id)\n"), "true\n")
+
+@test("two structs")
+tid_two_structs()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tid_shapes() + "print(Rect::Id == Sq::Id)\n"), "false\n")
+
+@test("two built-in scalars, which are types like any other here")
+tid_two_builtin_scalars()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("print(int::Id == usize::Id, int::Id == int::Id)\n"), "false true\n")
+
+// A transparent subtype shares its base's representation and mangles as the base, so an id keyed on
+// the mangling would merge the two — and silently merge a cache keyed on it.
+@test("a constrained subtype is not its base")
+tid_a_constrained_subtype_is_not_its_base()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("type Age = int within 0..150\n\nprint(Age::Id == int::Id)\n"), "false\n")
+
+// -- an erased value carries it, which is the case the form exists for -----------------------------
+
+@test("the id of what is inside it, not of the trait")
+tid_the_id_of_what_is_inside()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tid_shapes() +
+                      "var a: *Shape = &Rect(2)\n" +
+                      "\n" +
+                      "print(a::Id == Rect::Id, a::Id == Sq::Id)\n"),
+              "true false\n")
+
+@test("two objects holding different types disagree")
+tid_two_objects_disagree()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tid_shapes() +
+                      "var a: *Shape = &Rect(2)\n" +
+                      "var b: *Shape = &Sq(3)\n" +
+                      "\n" +
+                      "print(a::Id == b::Id)\n"),
+              "false\n")
+
+// There is a table per memory mode, so a counted object and a raw one over one type are two tables —
+// and both carry the same number, because the number is a property of the type.
+@test("a counted object and a raw one over the same type agree")
+tid_counted_and_raw_agree()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tid_shapes() +
+                      "var r: &Shape = Rect(4)\n" +
+                      "var p: *Shape = &Rect(5)\n" +
+                      "\n" +
+                      "print(r::Id == p::Id, r::Id == Rect::Id)\n"),
+              "true true\n")
+
+// The id sits in front of the slots, so every dispatch through a table is one slot further in than
+// it would otherwise be; wrong arithmetic would call the wrong function rather than crash.
+@test("and dispatch through the table still reaches the right method")
+tid_dispatch_reaches_the_right_method()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tid_shapes() +
+                      "var a: *Shape = &Rect(2)\n" +
+                      "var b: *Shape = &Sq(3)\n" +
+                      "\n" +
+                      "print(a.area(), b.area())\n"),
+              "2 3\n")
+
+@test("a trait with several methods, so the shift is exercised past the first slot")
+tid_several_methods()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("trait Named\n" +
+                      "    first(self) -> int\n" +
+                      "    second(self) -> int\n" +
+                      "    third(self) -> int\n" +
+                      "end Named\n" +
+                      "\n" +
+                      "struct P\n" +
+                      "    n: int\n" +
+                      "end P\n" +
+                      "\n" +
+                      "impl Named for P\n" +
+                      "    first(self) -> int = self.n\n" +
+                      "    second(self) -> int = self.n * 2\n" +
+                      "    third(self) -> int = self.n * 3\n" +
+                      "\n" +
+                      "var o: *Named = &P(5)\n" +
+                      "\n" +
+                      "print(o.first(), o.second(), o.third())\n"),
+              "5 10 15\n")
+end tid_several_methods
+
+// -- a type parameter answers what the instantiation bound it to -----------------------------------
+
+@test("one instantiation is itself, and agrees with the type written out")
+tid_one_instantiation_is_itself()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("kind[T](x: T) -> usize = T::Id\n" +
+                      "\n" +
+                      "print(kind(1) == int::Id, kind(1) == kind(2))\n"),
+              "true true\n")
+
+@test("and two instantiations are two answers")
+tid_two_instantiations()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("kind[T](x: T) -> usize = T::Id\n\nprint(kind(1u8) == kind(1))\n"), "false\n")
+
+// `Id` needs no bound, because every type has one — so a parameter can be asked for it without
+// narrowing what the parameter may be.
+@test("a parameter carrying a struct, which has no bounds to answer with")
+tid_a_parameter_carrying_a_struct()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tid_shapes() +
+                      "kind[T](x: T) -> usize = T::Id\n" +
+                      "\n" +
+                      "print(kind(Rect(1)) == Rect::Id)\n"),
+              "true\n")
+
+// -- what it does not offer ------------------------------------------------------------------------
+
+// A value whose type is known asks for it by name, so `::Id` on a value never reads as "the runtime
+// type of anything" (`reference/traits.md § There is no way back to the type`).
+@test("a value whose type is known here is told to ask for it by name")
+tid_a_known_value_asks_by_name()
+    if !enm_ready() then return
+
+    val said = enm_err(tid_shapes() + "var r = Rect(2)\n\nprint(r::Id)\n")
+
+    assert(said.contains("'::Id' on a value reads the identity an erased value carries, and this one " +
+                         "is a Rect, whose type is known right here — write 'Rect::Id'"), said)
+end tid_a_known_value_asks_by_name
+
+@test("and the spelling it names is the one that works")
+tid_the_named_spelling_works()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tid_shapes() + "var r = Rect(2)\n\nprint(Rect::Id == Rect::Id)\n"), "true\n")
+
+// A generic name has no single type to be the identity of — the answer `X::Max` gives on a generic
+// enum. A type parameter is how a generic body asks.
+@test("a generic type name has no single type to answer for")
+tid_a_generic_type_name()
+    if !enm_ready() then return
+
+    val said = enm_err("import sysl.buf.Buf\n\nprint(Buf::Id)\n")
+
+    assert(said.contains("type 'sysl.buf.Buf' takes 1 type argument, but 0 type arguments were given"), said)
