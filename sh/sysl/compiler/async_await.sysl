@@ -109,20 +109,42 @@ await_expr(cx: &Analyzer, span: Span, inner: Expr) -> TExpr
                        s"function hands back, but this value is ${type_show(ty)}")
 end await_expr
 
-// -- the two forms the compiler supplies -----------------------------------------------------------
+// -- the forms the compiler supplies ---------------------------------------------------------------
+//
+// **The executor contract is two forms and a closure type, and nothing else.** An executor is
+// ordinary code holding tasks; what it needs from the compiler is a way to run a task as far as its
+// next suspension, and a way for a task to wait on something outside it and say when to run again:
+//
+//     step(t: Task[T], wake: &Fn() -> unit) -> bool      // resume once; true where `t` is finished
+//     await park(register: &Fn(&Fn() -> unit) -> unit)   // hand `register` a waker, then wait on it
+//
+// A WAKER IS A `&Fn() -> unit`, so there is no type to learn: an executor hands `step` a closure that
+// queues the task it is stepping, and a library leaf hands `park` a closure that keeps the waker it
+// is given wherever the event it waits for will find it. Calling the waker calls the executor's
+// closure -- the first time; every later call, and every call once the `park` has returned or its
+// task has been dropped, does nothing. `yield_now()` is `park` with a registrar that wakes at once.
+// `block_on(t)` is `step` in a loop, refusing (with a trap) a task that suspended unwoken, which
+// nothing could ever run again.
 
-// Whether a name in call position is `block_on` or `yield_now` and nothing the program can see claims
-// it -- the library's `sysl.posix.threads.yield_now`, imported, is the nearer name. They are the
+// Whether a name in call position is one of the four forms and nothing the program can see claims it
+// -- the library's `sysl.posix.threads.yield_now`, imported, is the nearer name. They are the
 // compiler's because the standard module is also compiled by a compiler that has no tasks.
 task_form(cx: &Analyzer, name: string) -> bool =
-    (name == "block_on" || name == "yield_now") && cx.lookup(name).is_none() &&
-        function_keys(cx, name).is_empty()
+    (name == "block_on" || name == "yield_now" || name == "step" || name == "park") &&
+        cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
 
-// `block_on(t)`, or `yield_now()` written somewhere it is not awaited.
+// `block_on(t)` or `step(t, wake)`, or `yield_now()`/`park(…)` written somewhere it is not awaited.
 task_form_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
     if name == "yield_now" then
         return cx.err(span, "'yield_now()' is a task that suspends once, and it can only be " +
                       "awaited — write 'await yield_now()' in the body of an 'async' function")
+
+    if name == "park" then
+        return cx.err(span, "'park(…)' is a task that waits on the waker it hands its registrar, " +
+                      "and it can only be awaited — write 'await park(…)' in the body of an " +
+                      "'async' function")
+
+    if name == "step" then return step_call(cx, span, args)
 
     if args.len() != 1 then
         return cx.err(span, s"'block_on' takes one task — the one it runs to its end — but " +
@@ -139,21 +161,101 @@ task_form_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExp
                        s"'async' function hands back, but this value is ${type_show(ty)}")
 end task_form_call
 
-// Whether an awaited operand is the compiler's `yield_now()`.
+// `step(t, wake)`: any task, and the executor's closure for the parks it reaches.
+private step_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 2 then
+        return cx.err(span, s"'step' takes the task it resumes and the waker its parks are to call, " +
+                      s"but ${supplied(args.len(), "argument")}")
+
+    val t = type_expr_bare(cx, args.at(0))
+    val ty = texpr_type(t)
+    val wake_ty = waker_type(cx)
+    val w = read_callable(cx, args.at(1), wake_ty)
+
+    if ty == Unknown || texpr_type(w) == Unknown then return bad_expr(span)
+
+    if task_result(ty).is_none() then
+        return cx.err(args.at(0).span, s"'step' needs a Task, which is what calling an 'async' " +
+                      s"function hands back, but this value is ${type_show(ty)}")
+
+    if !type_eq(texpr_type(w), wake_ty) then
+        return cx.err(args.at(1).span, s"'step' needs the waker as a '&Fn() -> unit', the closure " +
+                      s"a park in the task calls to say the task can run again, but this value is " +
+                      type_show(texpr_type(w)))
+
+    TExpr(span, TStep(t, w))
+end step_call
+
+// `&Fn() -> unit`: what a waker is.
+waker_type(cx: &Analyzer) -> Type = callable_type(cx, "Fn0", buf())
+
+// `&Fn(&Fn() -> unit) -> unit`: what `park` hands its waker to.
+private registrar_type(cx: &Analyzer) -> Type
+    var takes: Buf[Type] = buf()
+
+    takes.push(waker_type(cx))
+    callable_type(cx, "Fn1", takes)
+end registrar_type
+
+private callable_type(cx: &Analyzer, spelling: string, takes: Buf[Type]) -> Type
+    var args: Buf[Type] = buf()
+
+    for i in 0..<takes.len()
+        args.push(takes.at(i))
+
+    args.push(Unit)
+    Ref(Trait(catalog_key(cx.an, spelling).unwrap_or(spelling), args, buf()), false)
+end callable_type
+
+// An argument read at a callable type, a closure written there boxed and erased into it.
+private read_callable(cx: &Analyzer, e: Expr, want: Type) -> TExpr
+    val t = type_expr(cx, e, Some(want))
+
+    if texpr_type(t) == Unknown then return t
+
+    coerce(cx, t, want)
+end read_callable
+
+// Whether an awaited operand is the compiler's `yield_now()` or `park(…)`.
 private awaits_yield(cx: &Analyzer, inner: Expr) -> bool = *inner.kind match
     Call(callee, _) -> *callee.kind match
-        Ident(name) -> name == "yield_now" && task_form(cx, name)
+        Ident(name) -> (name == "yield_now" || name == "park") && task_form(cx, name)
         _ -> false
     _ -> false
 
 private yield_now_task(cx: &Analyzer, inner: Expr) -> TExpr = *inner.kind match
-    Call(_, args) ->
+    Call(callee, args) ->
+        val parks = *callee.kind match
+            Ident(name) -> name == "park"
+            _ -> false
+
+        if parks then return park_task(cx, inner.span, args)
+
         if !args.is_empty() then
             return cx.err(inner.span, s"'yield_now' takes no arguments, but " +
                           supplied(args.len(), "argument"))
 
         TExpr(inner.span, TYieldNow)
     _ -> bad_expr(inner.span)
+
+// `park(register)`, awaited.
+private park_task(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 1 then
+        return cx.err(span, s"'park' takes one registrar — the closure handed the waker — but " +
+                      supplied(args.len(), "argument"))
+
+    val want = registrar_type(cx)
+    val r = read_callable(cx, args.at(0), want)
+
+    if texpr_type(r) == Unknown then return bad_expr(span)
+
+    if !type_eq(texpr_type(r), want) then
+        return cx.err(args.at(0).span, s"'park' needs its registrar as a " +
+                      s"'${type_show(want)}', which is handed the waker of the task being stepped, " +
+                      s"but this value is ${type_show(texpr_type(r))}")
+
+    TExpr(span, TPark(r))
+end park_task
 
 // What a mismatch adds where a `Task[T]` stands where its `T` was wanted: the `await` left out. Each
 // position keeps its own sentence -- it names the parameter, the binding, the result -- and this is

@@ -1,0 +1,728 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The executor contract: `step(t, wake)` resumes a task once and says whether it finished, and
+// `await park(register)` hands `register` a waker -- a `&Fn() -> unit` -- and waits until it is
+// called. Every program here carries an executor written in plain sysl (`xqt_exec`), counts every
+// frame and waker through the two allocation hooks (`xqt_pool`), and is built and run at `-O0` and
+// at the default level, both of which have to print the same thing.
+//
+// **The reference compiler has none of this**, so the expected outputs are worked out from the
+// programs, as `tests_tsk_task_run.sysl`'s are.
+
+// The two allocation hooks, counting, over C's allocator. A waker's box comes from them too.
+private xqt_pool() -> string = raw"""
+    module pool
+
+    extern "malloc" c_malloc(n: usize) -> *u8
+    extern "free" c_free(p: *u8)
+
+    var allocs: int = 0
+    var frees: int = 0
+
+    @export("sysl_task_alloc")
+    task_alloc(size: usize) -> *u8
+        allocs += 1
+        c_malloc(size)
+
+    @export("sysl_task_free")
+    task_free(p: *u8)
+        frees += 1
+        c_free(p)
+
+    balance() -> string = if allocs > 0 && allocs == frees then "balanced" else s"$allocs/$frees"
+    """
+
+// A run queue of task numbers, and a loop that steps whatever is on it, in order, until it is empty.
+// A task's waker puts its number back on the queue; a finished task is let go of.
+private xqt_exec() -> string = raw"""
+    module exec
+
+    import sysl.buf.{Buf, buf}
+
+    var tasks: [4]Option[Task[unit]] = [None, None, None, None]
+    var steps: [4]int = [0, 0, 0, 0]
+    var spawned: usize = 0
+    var ready: Buf[usize] = buf()
+
+    spawn(t: Task[unit]) -> usize
+        val id = spawned
+
+        tasks[id] = Some(t)
+        spawned += 1
+        ready.push(id)
+        id
+
+    waker_for(id: usize) -> &Fn() -> unit
+        () -> ready.push(id)
+
+    run()
+        var i: usize = 0
+
+        while i < ready.len()
+            val id = ready[i]
+
+            i += 1
+
+            tasks[id] match
+                Some(t) ->
+                    steps[id] += 1
+
+                    if step(t, waker_for(id))
+                        tasks[id] = None
+                None -> ()
+
+        ready.clear()
+
+    steps_of(id: usize) -> int = steps[id]
+
+    queued() -> usize = ready.len()
+
+    poke(id: usize)
+        ready.push(id)
+
+    kill(id: usize)
+        tasks[id] = None
+    """
+
+// A library leaf's registrar: the waker kept where a later event would find it, the one before it
+// kept too, so a test can call a waker whose park is over.
+private xqt_wakers() -> string = raw"""
+    module wakers
+
+    var held: Option[&Fn() -> unit] = None
+    var old: Option[&Fn() -> unit] = None
+
+    stash(w: &Fn() -> unit)
+        old = held
+        held = Some(w)
+
+    private wake(which: Option[&Fn() -> unit])
+        which match
+            Some(w) -> w()
+            None -> print("nothing held")
+
+    wake_held() = wake(held)
+
+    wake_old() = wake(old)
+
+    forget()
+        held = None
+        old = None
+    """
+
+// What a program built from these files prints at one optimization level, or why it did not run.
+private xqt_outcome(files: []const (string, string), level: string) -> string
+    val root = make_temp_dir("sysl-xqt").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else
+            s"it did not run to the end: ${out.text}${out.err.unwrap_or("")}"
+end xqt_outcome
+
+// What a program of `work` and `main` prints at both levels, where the two agree, with the pool,
+// the executor and the registrar beside it.
+private xqt_ran(work: string, main: string) -> string
+    val files = [("pool/pool.sysl", xqt_pool()), ("exec/exec.sysl", xqt_exec()),
+                 ("wakers/wakers.sysl", xqt_wakers()), ("work/work.sysl", work),
+                 ("main.sysl", main)]
+
+    val low = xqt_outcome(files, "0")
+    val high = xqt_outcome(files, DefaultOptimization)
+
+    if low != high then return s"-O0 printed:\n$low\nthe default level printed:\n$high"
+
+    low
+end xqt_ran
+
+private xqt_no_library() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+    end if
+
+    false
+end xqt_no_library
+
+// -- stepping --------------------------------------------------------------------------------------
+
+@test("an executor in plain sysl interleaves two tasks through yield_now, one step per suspension")
+xqt_two_tasks_interleave()
+    if xqt_no_library() then return
+
+    // `yield_now` wakes the task being stepped before it suspends, so each round puts the task back
+    // on the queue behind the other: n yields are n + 1 steps, the last one finishing it.
+    assert_eq(xqt_ran(raw"""
+        module work
+
+        async ticker(name: string, n: int)
+            for i in 0..<n
+                print(s"$name $i")
+                await yield_now()
+
+            print(s"$name done")
+        """, raw"""
+        import pool.*
+        import exec.*
+        import work.*
+
+        val a = spawn(ticker("a", 3))
+        val b = spawn(ticker("b", 2))
+
+        run()
+        print(s"steps ${steps_of(a)} ${steps_of(b)}")
+        print(balance())
+        """), "a 0\nb 0\na 1\nb 1\na 2\nb done\na done\nsteps 4 3\nbalanced\n")
+
+@test("stepping a finished task resumes nothing and answers true")
+xqt_step_after_the_end()
+    if xqt_no_library() then return
+
+    assert_eq(xqt_ran(raw"""
+        module work
+
+        async once()
+            print("ran")
+        """, raw"""
+        import pool.*
+        import work.*
+
+        val t = once()
+        val w: &Fn() -> unit = () -> print("woken")
+
+        print(step(t, w))
+        print(step(t, w))
+        print(step(t, w))
+        """), "ran\ntrue\ntrue\ntrue\n")
+
+// -- park and wake ---------------------------------------------------------------------------------
+
+@test("a parked task waits for its waker; a second wake, and a wake after the end, do nothing")
+xqt_park_waits_for_its_waker()
+    if xqt_no_library() then return
+
+    assert_eq(xqt_ran(raw"""
+        module work
+
+        import wakers.*
+
+        async waiter()
+            print("parking")
+            await park((w) -> stash(w))
+            print("woken")
+        """, raw"""
+        import pool.*
+        import exec.*
+        import wakers.*
+        import work.*
+
+        val t = spawn(waiter())
+
+        run()
+        print(s"parked after ${steps_of(t)}")
+        run()
+        print(s"nothing ran: ${steps_of(t)}")
+        wake_held()
+        wake_held()
+        print(s"queued ${queued()}")
+        run()
+        print(s"finished after ${steps_of(t)}")
+        wake_held()
+        print(s"queued ${queued()}")
+        forget()
+        print(balance())
+        """), "parking\nparked after 1\nnothing ran: 1\nqueued 1\nwoken\nfinished after 2\n" +
+              "queued 0\nbalanced\n")
+
+@test("a waker called during its own registration still costs one suspension, and is heard once")
+xqt_wake_before_the_park_suspends()
+    if xqt_no_library() then return
+
+    assert_eq(xqt_ran(raw"""
+        module work
+
+        async eager()
+            await park((w) -> w())
+            print("eager went on")
+        """, raw"""
+        import pool.*
+        import exec.*
+        import work.*
+
+        val e = spawn(eager())
+
+        run()
+        print(s"eager took ${steps_of(e)}")
+        print(balance())
+        """), "eager went on\neager took 2\nbalanced\n")
+
+@test("a waker whose park is over does nothing to the task's next park")
+xqt_a_stale_waker_is_a_no_op()
+    if xqt_no_library() then return
+
+    assert_eq(xqt_ran(raw"""
+        module work
+
+        import wakers.*
+
+        async twice()
+            await park((w) -> stash(w))
+            print("first park over")
+            await park((w) -> stash(w))
+            print("second park over")
+        """, raw"""
+        import pool.*
+        import exec.*
+        import wakers.*
+        import work.*
+
+        val t = spawn(twice())
+
+        run()
+        wake_held()
+        run()
+        wake_old()
+        print(s"stale wake queued ${queued()}")
+        wake_held()
+        run()
+        print(s"twice took ${steps_of(t)}")
+        forget()
+        print(balance())
+        """), "first park over\nstale wake queued 0\nsecond park over\ntwice took 3\nbalanced\n")
+
+@test("waking a dropped task is safe: its park disarmed the waker on the way out")
+xqt_waking_a_dropped_task()
+    if xqt_no_library() then return
+
+    assert_eq(xqt_ran(raw"""
+        module work
+
+        import wakers.*
+
+        async waiter()
+            print("parking")
+            await park((w) -> stash(w))
+            print("never")
+        """, raw"""
+        import pool.*
+        import exec.*
+        import wakers.*
+        import work.*
+
+        val t = spawn(waiter())
+
+        run()
+        kill(t)
+        wake_held()
+        wake_held()
+        print(s"queued ${queued()}")
+        forget()
+        print(balance())
+        """), "parking\nqueued 0\nbalanced\n")
+
+@test("a park three awaits down wakes the outermost task, and a step nobody asked for is absorbed")
+xqt_nested_park_wakes_the_outermost()
+    if xqt_no_library() then return
+
+    assert_eq(xqt_ran(raw"""
+        module work
+
+        import wakers.*
+
+        async leaf() -> int
+            print("leaf parks")
+            await park((w) -> stash(w))
+            print("leaf woken")
+            7
+
+        async mid() -> int = await leaf() + 1
+
+        async top()
+            val v = await mid()
+            print(s"top got $v")
+        """, raw"""
+        import pool.*
+        import exec.*
+        import wakers.*
+        import work.*
+
+        val other = spawn(top())
+        val t = spawn(top())
+
+        kill(other)
+        run()
+        print(s"parked after ${steps_of(t)}")
+        poke(t)
+        run()
+        print(s"after a step nobody asked for: ${steps_of(t)}")
+        wake_held()
+        print(s"queued ${queued()}, the outermost: ${queued() == 1}")
+        run()
+        print(s"finished after ${steps_of(t)}")
+        forget()
+        print(balance())
+        """), "leaf parks\nparked after 1\nafter a step nobody asked for: 2\n" +
+              "queued 1, the outermost: true\nleaf woken\ntop got 8\nfinished after 3\nbalanced\n")
+
+@test("block_on runs a task whose park is woken at once")
+xqt_block_on_over_a_park()
+    if xqt_no_library() then return
+
+    assert_eq(xqt_ran(raw"""
+        module work
+
+        async quick() -> int
+            await park((w) -> w())
+            await yield_now()
+            5
+        """, raw"""
+        import pool.*
+        import work.*
+
+        print(block_on(quick()))
+        print(balance())
+        """), "5\nbalanced\n")
+
+@test("block_on traps on a task that parked with nothing to wake it, rather than spinning")
+xqt_block_on_a_task_nothing_wakes()
+    if xqt_no_library() then return
+
+    val said = xqt_ran(raw"""
+        module work
+
+        async stuck()
+            await park((w) -> ())
+        """, raw"""
+        import work.*
+
+        block_on(stuck())
+        """)
+
+    assert(said.starts_with("it did not run to the end"), said)
+
+// -- the destroy edges: a task dropped where it is suspended ---------------------------------------
+
+private xqt_noisy() -> string = raw"""
+    module noisy
+
+    struct Noisy
+        id: int
+
+    impl Drop for Noisy
+        drop(self)
+            print(s"dropped ${self.id}")
+
+    var wakes: int = 0
+
+    quiet() -> &Fn() -> unit
+        () -> wakes += 1
+
+    // `t` stepped `n` times; the caller's temporary is its last share, let go of after this returns.
+    steps_then_drop(t: Task[unit], n: int)
+        for i in 0..<n
+            step(t, quiet())
+    """
+
+private xqt_dropped(work: string, main: string) -> string
+    val files = [("pool/pool.sysl", xqt_pool()), ("noisy/noisy.sysl", xqt_noisy()),
+                 ("work/work.sysl", work), ("main.sysl", main)]
+
+    val low = xqt_outcome(files, "0")
+    val high = xqt_outcome(files, DefaultOptimization)
+
+    if low != high then return s"-O0 printed:\n$low\nthe default level printed:\n$high"
+
+    low
+end xqt_dropped
+
+@test("a task dropped at a suspension lets go of a local holding a destructor, once")
+xqt_drop_releases_a_local()
+    if xqt_no_library() then return
+
+    assert_eq(xqt_dropped(raw"""
+        module work
+
+        import noisy.*
+
+        async local_held()
+            val n: &Noisy = Noisy(1)
+            await yield_now()
+            print(s"unreachable ${n.id}")
+        """, raw"""
+        import pool.*
+        import noisy.*
+        import work.*
+
+        steps_then_drop(local_held(), 1)
+        print("after")
+        print(balance())
+        """), "dropped 1\nafter\nbalanced\n")
+
+@test("a task dropped at a suspension lets go of a parameter holding a destructor, once")
+xqt_drop_releases_a_parameter()
+    if xqt_no_library() then return
+
+    assert_eq(xqt_dropped(raw"""
+        module work
+
+        import noisy.*
+
+        async param_held(n: &Noisy)
+            await yield_now()
+            print(s"unreachable ${n.id}")
+        """, raw"""
+        import pool.*
+        import noisy.*
+        import work.*
+
+        steps_then_drop(param_held(Noisy(2)), 1)
+        print("after")
+        print(balance())
+        """), "dropped 2\nafter\nbalanced\n")
+
+@test("a task dropped while it awaits gives back the awaited task and its own local, as a return would")
+xqt_drop_releases_an_awaited_task()
+    if xqt_no_library() then return
+
+    // `plain` is the same frame left by a `return`: the order the dropped task's two droppables go
+    // in has to be this one.
+    assert_eq(xqt_dropped(raw"""
+        module work
+
+        import noisy.*
+
+        async inner_holds()
+            val n: &Noisy = Noisy(3)
+            await yield_now()
+            print("inner unreachable")
+
+        async outer_awaits()
+            val m: &Noisy = Noisy(4)
+            await inner_holds()
+            print("outer unreachable")
+
+        plain()
+            val m: &Noisy = Noisy(4)
+            val n: &Noisy = Noisy(3)
+            return
+        """, raw"""
+        import pool.*
+        import noisy.*
+        import work.*
+
+        plain()
+        print("--")
+        steps_then_drop(outer_awaits(), 1)
+        print("after")
+        print(balance())
+        """), "dropped 3\ndropped 4\n--\ndropped 3\ndropped 4\nafter\nbalanced\n")
+
+@test("a task dropped at a suspension runs its pending defer, then lets go, as a return would")
+xqt_drop_runs_a_defer()
+    if xqt_no_library() then return
+
+    assert_eq(xqt_dropped(raw"""
+        module work
+
+        import noisy.*
+
+        async deferred()
+            val n: &Noisy = Noisy(5)
+            defer print("deferred ran")
+            await yield_now()
+            print("unreachable")
+
+        plain()
+            val n: &Noisy = Noisy(5)
+            defer print("deferred ran")
+            return
+        """, raw"""
+        import pool.*
+        import noisy.*
+        import work.*
+
+        plain()
+        print("--")
+        steps_then_drop(deferred(), 1)
+        print("after")
+        print(balance())
+        """), "deferred ran\ndropped 5\n--\ndeferred ran\ndropped 5\nafter\nbalanced\n")
+
+@test("a task dropped between two awaits, the first finished, lets go of what each half bound")
+xqt_drop_between_two_awaits()
+    if xqt_no_library() then return
+
+    assert_eq(xqt_dropped(raw"""
+        module work
+
+        import noisy.*
+
+        async between()
+            val a: &Noisy = Noisy(6)
+            await yield_now()
+            print("past the first")
+            val b: &Noisy = Noisy(7)
+            await yield_now()
+            print("unreachable")
+
+        plain()
+            val a: &Noisy = Noisy(6)
+            val b: &Noisy = Noisy(7)
+            return
+        """, raw"""
+        import pool.*
+        import noisy.*
+        import work.*
+
+        plain()
+        print("--")
+        steps_then_drop(between(), 2)
+        print("after")
+        print(balance())
+        """), "dropped 7\ndropped 6\n--\npast the first\ndropped 7\ndropped 6\nafter\nbalanced\n")
+
+@test("a task dropped while parked frees its frame, its park's frame and the waker nobody kept")
+xqt_drop_while_parked()
+    if xqt_no_library() then return
+
+    assert_eq(xqt_dropped(raw"""
+        module work
+
+        import noisy.*
+
+        async parked()
+            val n: &Noisy = Noisy(8)
+            await park((w) -> ())
+            print("unreachable")
+        """, raw"""
+        import pool.*
+        import noisy.*
+        import work.*
+
+        steps_then_drop(parked(), 3)
+        print("after")
+        print(balance())
+        """), "dropped 8\nafter\nbalanced\n")
+
+// -- what the front end refuses --------------------------------------------------------------------
+
+private var xqt_library_cache: Buf[Program] = buf()
+private var xqt_library_read: bool = false
+
+private xqt_library() -> Buf[Program]
+    if xqt_library_read then return xqt_library_cache
+
+    xqt_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> xqt_library_cache = units
+
+    xqt_library_cache
+end xqt_library
+
+// The whole report a one-file program is refused with, or `""` where it analyzes clean.
+private xqt_refused(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.report.render(parsed.src)
+
+    var units: Buf[Program] = buf()
+    val library = xqt_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end xqt_refused
+
+private xqt_says(report: string, message: string, at: string)
+    assert(report.contains(s"error: $message\n --> t.sysl:$at"), report)
+
+@test("step and park read clean where they are written as the contract says")
+xqt_the_contract_reads_clean()
+    if xqt_library().is_empty() then return
+
+    assert_eq(xqt_refused(raw"""
+        async waits()
+            await park((w) -> w())
+
+        tick(t: Task[unit]) -> bool = step(t, () -> ())
+        """), "")
+
+@test("step is refused without its waker, over a value that is not a task, and with a waker of another type")
+xqt_step_refusals()
+    if xqt_library().is_empty() then return
+
+    xqt_says(xqt_refused("h(t: Task[unit]) -> bool = step(t)\n"),
+             "'step' takes the task it resumes and the waker its parks are to call, but 1 argument " +
+             "was given", "1:28")
+    xqt_says(xqt_refused("k(n: int) -> bool = step(n, () -> ())\n"),
+             "'step' needs a Task, which is what calling an 'async' function hands back, but this " +
+             "value is int", "1:26")
+    xqt_says(xqt_refused("m(t: Task[unit]) -> bool = step(t, 5)\n"),
+             "'step' needs the waker as a '&Fn() -> unit', the closure a park in the task calls to " +
+             "say the task can run again, but this value is int", "1:36")
+
+@test("park is refused where it is not awaited, without a registrar, and with one taking no waker")
+xqt_park_refusals()
+    if xqt_library().is_empty() then return
+
+    xqt_says(xqt_refused("q()\n    val p = park((w) -> w())\n"),
+             "'park(…)' is a task that waits on the waker it hands its registrar, and it can only " +
+             "be awaited — write 'await park(…)' in the body of an 'async' function", "2:13")
+    xqt_says(xqt_refused("async g()\n    await park()\n"),
+             "'park' takes one registrar — the closure handed the waker — but 0 arguments were " +
+             "given", "2:11")
+
+    val wrong = xqt_refused("async f()\n    await park((n: int) -> print(n))\n")
+
+    assert(wrong.contains("t.sysl:2:16"), wrong)
+    assert(wrong.contains("'sysl.Fn1[&Fn() -> unit, unit]'"), wrong)
+
+@test("a program's own step or park is the nearer name and is called as written")
+xqt_own_names_stand_in_front()
+    if xqt_library().is_empty() then return
+
+    assert_eq(xqt_refused(raw"""
+        step(n: int) -> int = n + 1
+        park() -> int = 2
+
+        both() -> int = step(1) + park()
+        """), "")
