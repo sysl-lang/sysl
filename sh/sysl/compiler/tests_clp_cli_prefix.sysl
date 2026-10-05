@@ -1,0 +1,59 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// A refusal about the command is introduced by the binary's own name, `sysl: error: `, as the
+// reference introduces one, and a source diagnostic anchored at a file is not. `main` sends a line
+// beginning with that lead to standard error, so the lead is also what decides the stream.
+
+private clp_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end clp_run
+
+@test("a path that is not there is refused under the command's name, in the reference's words")
+clp_a_missing_path_is_refused_with_the_lead()
+    val dir = make_temp_dir("sysl-clp-").unwrap()
+    val gone = s"$dir/nowhere"
+    val got = clp_run(["sysl", "build", gone])
+
+    assert_eq(got.0, Failed, got.1)
+    assert_eq(got.1, s"sysl: error: cannot read $gone: '$gone' does not exist")
+    remove_dir_all(dir).unwrap_or(())
+
+@test("build-lib -o is refused under the command's name")
+clp_an_output_for_build_lib_is_refused_with_the_lead()
+    val got = clp_run(["sysl", "build-lib", "/does/not/matter", "-o", "x.syslib"])
+
+    assert_eq(got.0, Misused, got.1)
+    assert_eq(got.1, "sysl: error: build-lib writes nothing anybody names — it checks a library, and " +
+                     "what it compiles is this compiler's cache, found by the compiler alone — so it " +
+                     "takes no -o")
+
+@test("--all-features beside --no-default-features is refused under the command's name")
+clp_a_feature_conflict_is_refused_with_the_lead()
+    val got = clp_run(["sysl", "build", "/does/not/matter", "--all-features", "--no-default-features"])
+
+    assert_eq(got.1, "sysl: error: --all-features says every feature the manifest declares is wanted, " +
+                     "and --features/--no-default-features each say something narrower about the same " +
+                     "set — a compilation cannot ask for both")
+
+@test("a source diagnostic is anchored at its file and carries no lead, so it is not a refusal")
+clp_a_source_diagnostic_carries_no_lead()
+    val dir = make_temp_dir("sysl-clp-").unwrap()
+    val file = s"$dir/bad.sysl"
+
+    write_text(file, "f() -> int = (1 +\n").unwrap()
+
+    val got = clp_run(["sysl", "emit-ast", file])
+
+    assert_eq(got.0, Failed, got.1)
+    assert_eq(got.1, s"error: expression expected\n --> $file:2:1\n  |\n2 | \n  | ^")
+    assert(!got.1.starts_with(RefusalLead), got.1)
+    remove_dir_all(dir).unwrap_or(())

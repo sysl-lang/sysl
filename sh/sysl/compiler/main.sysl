@@ -43,14 +43,14 @@ run_cli_noted(args: []string, say: string -> unit, note: string -> unit) -> int
     // A flag that named a `.syslib` is refused by every command in one sentence, before any of them
     // reads its own flags -- none of them takes it, whatever it was handed.
     if names_std_lib(args[1..<args.len])
-        say(s"error: ${std_lib_refusal()}")
+        say(refused(std_lib_refusal()))
         return Misused
     end if
 
     // A `--link` naming an empty library is refused where it was typed, by every command alike.
     link_flag_refusal(args[1..<args.len]) match
         Some(why) ->
-            say(s"error: $why")
+            say(refused(why))
             return Misused
         None -> ()
 
@@ -368,13 +368,22 @@ private build_command(args: []string, say: string -> unit) -> int
             Fine
 end build_command
 
+// How a refusal about the COMMAND begins -- a flag, a path, a manifest, a library the compilation was
+// pointed at. The reference introduces one with its own name, as a Unix tool does; a source
+// diagnostic is anchored at a file and line instead and carries no name in front. `main` sends a
+// line that begins this way to standard error, which is where the reference writes it.
+const RefusalLead: string = "sysl: error: "
+
+// A refusal about the command, introduced as the reference introduces one.
+refused(why: string) -> string = RefusalLead + why
+
 // The one place a command's failure becomes output, and the two kinds are printed differently
 // **because only one of them is a sentence**: a refusal about the project has no `error: ` on it and
-// takes one here, where an analysis report is already rendered and every diagnostic in it carries
-// its own. Prefixing both is what printed `error: error:`.
+// takes the command's lead here, where an analysis report is already rendered and every diagnostic
+// in it carries its own. Prefixing both is what printed `error: error:`.
 private say_failure(why: Failure, say: string -> unit)
     why match
-        Said(refusal) -> say(s"error: ${refusal.message}")
+        Said(refusal) -> say(refused(refusal.message))
         Reported(report) -> say(report)
 
 // An optimization level at `args[i]`, spelled the way clang spells it -- `-O2` joined, `-O 2` apart
@@ -399,7 +408,7 @@ private build_usage() -> string =
 // either of the flags that say something narrower. Whether it fired.
 private refused_features(say: string -> unit) -> bool = feature_conflict() match
     Some(why) ->
-        say(s"error: $why")
+        say(refused(why))
         true
     None -> false
 
@@ -450,8 +459,8 @@ private build_c_command(args: []string, say: string -> unit) -> int
                 // A mode clang does not have is the command line's mistake, told before anything is
                 // read, as the reference's parser tells it.
                 if args[i] != "thin" && args[i] != "full"
-                    say(s"sysl: error: '--lto ${args[i]}' names no kind of link-time optimization " +
-                        "clang has — it is thin or full")
+                    say(refused(s"'--lto ${args[i]}' names no kind of link-time optimization " +
+                        "clang has — it is thin or full"))
                     say(build_c_usage())
                     return Misused
                 end if
@@ -762,7 +771,7 @@ private test_command(args: []string, say: string -> unit) -> int
 
     val made = build_test_binary_cached(file, build, cc, level, key) match
         Err(refusal) ->
-            say(s"error: ${refusal.message}")
+            say(refused(refusal.message))
             return Failed
         Ok(built) -> built
 
@@ -845,7 +854,7 @@ private build_lib_command(args: []string, say: string -> unit) -> int
         if took > 0
             if took == 2 then i += 1
         else if args[i] == "-o" || args[i] == "--output"
-            say(s"error: ${build_lib_output_refusal()}")
+            say(refused(build_lib_output_refusal()))
             return Misused
         else if args[i] == "--target"
             if i + 1 >= args.len
@@ -902,7 +911,7 @@ private build_lib_command(args: []string, say: string -> unit) -> int
 
     build_std_artifact_of(file, named, None, at) match
         Err(refusal) ->
-            say(s"error: ${refusal.message}")
+            say(refused(refusal.message))
             Failed
         Ok(where) ->
             say(s"wrote $where")
@@ -961,7 +970,7 @@ private add_command(args: []string, say: string -> unit) -> int
 
     add_to_project(root, spec) match
         Err(why) ->
-            say(s"error: $why")
+            say(refused(why))
             Failed
         Ok(said) ->
             say(said)
@@ -984,13 +993,13 @@ private deps_command(args: []string, say: string -> unit) -> int
 
     val m = manifest_of_package(root) match
         Err(why) ->
-            say(s"error: $why")
+            say(refused(why))
             return Failed
         Ok(got) -> got
 
     resolved_graph(root, m) match
         Err(refusal) ->
-            say(s"error: ${refusal.message}")
+            say(refused(refusal.message))
             Failed
         Ok(g) ->
             val text = deps_listing(m, g)
@@ -1015,7 +1024,12 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     ": a feature of the root project to turn on beside 'default', comma-separated and repeatable; " +
     "leave the root's 'default' feature off; turn on every feature the root's manifest declares"
 
+// Where `main` writes one line: a refusal about the command goes to standard error, as the
+// reference writes it, and everything else to standard output.
+private said_to_terminal(line: string)
+    if line.starts_with(RefusalLead) then eprints(line + "\n") else print(line)
+
 main(args: []string)
-    val code = run_cli_noted(args, line -> print(line), line -> eprints(line + "\n"))
+    val code = run_cli_noted(args, said_to_terminal, line -> eprints(line + "\n"))
 
     if code != Fine then exit(code)
