@@ -1,0 +1,277 @@
+module sysl.fs
+@requires(os)
+
+import sysl.env.get
+import sysl.path.{join, parent, relative_to}
+import sysl.slices.{as_mut_ptr, as_ptr}
+import sysl.text.{cstring, from_cstring}
+
+// Where the program is, where it can put something nobody else will take, and the two directory
+// operations that are loops rather than calls.
+//
+// **`make_dir_all` and `remove_dir_all` are not syscalls and belong here anyway.** Neither is one
+// right answer per operating system -- they are loops over calls that already exist -- so they earn
+// their place on the other test `library/_index.md` sets: hand-writing a post-order delete walk is a
+// tax every test suite with a scratch directory was paying, not a domain anybody chose to take on.
+//
+// They are also where this module and `sysl.path` meet, and the split is visible in one line:
+// `make_dir_all` asks `sysl.path.parent` where to climb to, and asks the filesystem whether it is
+// there. The first question needs no operating system and the second is nothing else.
+
+private[sysl] extern "getcwd" c_getcwd(into: *u8, room: usize) -> *u8
+private[sysl] extern "chdir" c_chdir(path: *u8) -> int
+private[sysl] extern "sysl_fs_temp_dir" c_temp_dir(prefix: *u8, into: *u8, room: usize) -> int
+
+/** How much storage a path answer is given, which `links.sysl` explains at length. */
+private const path_bytes: usize = 4096
+
+/** Where the program is, which nothing in the library could ask before.
+ *
+ * `sysl.process` takes a `dir` for a child to start in, so a program could say where somebody *else*
+ * should be and not where it was itself. This is the other half.
+ *
+ * **It is a global the whole process shares**, so a threaded program that reads this while another
+ * thread is calling `set_current_dir` gets one of the two answers and no promise about which.
+ * Building an absolute path once at start-up is the shape that avoids the question.
+ */
+current_dir() -> Result[string, IoError]
+    var into: []u8 = [0; path_bytes]
+
+    if c_getcwd(as_mut_ptr(into), into.len) == null then return Err(why())
+
+    from_cstring(as_ptr(into)) match
+        Ok(s) -> Ok(s)
+        Err(_) -> Err(Other(84))
+end current_dir
+
+/** Moves the program. **It is process-wide**, which is the thing to know before reaching for it: a
+ * library that changes the working directory changes it for every thread and for every other library
+ * in the program, and puts it back only if it remembers to.
+ *
+ * Prefer building an absolute path. This exists because a program that drives a build, or that is
+ * the shell-like thing at the top, genuinely needs it.
+ */
+set_current_dir(path: string) -> Result[unit, IoError] = told(c_chdir(cstring(path).ptr))
+
+// ## Where a directory BELONGS, as against where one IS
+//
+// The four below answer a different question from `current_dir`: not where the program happens to
+// be, but where the machine's own conventions say a file of a given kind goes. A program that wants
+// to cache a download, remember a setting or keep a database has to put it somewhere, and before
+// these the only way to decide was to read `HOME` and invent a rule -- which is how every program
+// ends up with a rule of its own and the conventions stop being conventions.
+//
+// **They are `Option` because a machine may genuinely not say.** An environment with no `HOME` set
+// is not a failure to report an errno about; it is a machine that has not told the program where its
+// user lives. A caller that gets `None` falls back to something of its own knowingly, which is the
+// whole difference between this and reading the variable itself.
+//
+// **They name a directory and do not make one.** Nothing here touches the filesystem at all -- the
+// answer is a path, and whether it exists is `exists` and whether it should is `make_dir_all`. That
+// is deliberate: a program asking where its configuration belongs is often about to *read*, and a
+// question that created a directory as a side effect could not be asked.
+
+/** Where the user's home directory is, or `None` where the environment does not say.
+ *
+ * `HOME` everywhere but Windows, which spells it `USERPROFILE`. **A variable set to nothing counts
+ * as unset here**, which is where this differs from `sysl.env.get`: an empty string is a truthful
+ * reading of an environment and is not a place, and every specification that mentions the case says
+ * to treat it as absent.
+ */
+home_dir() -> Option[string] =
+    os() match
+        Windows -> named("USERPROFILE")
+        _ -> named("HOME")
+
+/** Where a program's own cache belongs -- the things it can regenerate and would rather not.
+ *
+ * `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows, and `$XDG_CACHE_HOME` or `~/.cache`
+ * elsewhere, which is the freedesktop rule.
+ *
+ * **A program appends its own name and nothing here does it for you**: this answers where the
+ * machine keeps caches, not where yours goes, so the call is
+ * `cache_dir().map((d) -> join(d, "myprogram"))`. A library that guessed the leaf would be guessing
+ * the program's identity.
+ */
+cache_dir() -> Option[string] =
+    os() match
+        MacOS -> under_home("Library/Caches")
+        Windows -> named("LOCALAPPDATA")
+        _ -> named("XDG_CACHE_HOME").or_else(() -> under_home(".cache"))
+
+/** Where a program's configuration belongs -- what a person edits, and what survives a reinstall.
+ *
+ * `~/Library/Application Support` on macOS, `%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or
+ * `~/.config` elsewhere.
+ *
+ * **macOS answers the same directory for this and for `data_dir`, and that is Apple's convention
+ * rather than an omission here.** The platform draws the line between *cache* and *everything else*
+ * and does not draw one between configuration and data; a library that invented a `~/Library/Config`
+ * to make the four look symmetrical would be putting files where nothing else on the machine looks.
+ */
+config_dir() -> Option[string] =
+    os() match
+        MacOS -> under_home("Library/Application Support")
+        Windows -> named("APPDATA")
+        _ -> named("XDG_CONFIG_HOME").or_else(() -> under_home(".config"))
+
+/** Where a program's own data belongs -- what it wrote and cannot regenerate.
+ *
+ * `~/Library/Application Support` on macOS, `%APPDATA%` on Windows, `$XDG_DATA_HOME` or
+ * `~/.local/share` elsewhere. See `config_dir` for why two of those three are the same answer.
+ */
+data_dir() -> Option[string] =
+    os() match
+        MacOS -> under_home("Library/Application Support")
+        Windows -> named("APPDATA")
+        _ -> named("XDG_DATA_HOME").or_else(() -> under_home(".local/share"))
+
+/** An environment variable read as a directory, where set-to-empty is the same answer as unset. */
+private named(name: string) -> Option[string] = get(name).filter((s) -> s.len > 0)
+
+/** A leaf under the home directory, or `None` where there is no home to put it under. */
+private under_home(leaf: string) -> Option[string] = home_dir().map((h) -> join(h, leaf))
+
+/** A directory that did not exist a moment ago and that nobody else can take, made inside whatever
+ * `TMPDIR` names -- or `/tmp` where it names nothing.
+ *
+ * **It is created, not merely named**, which is the whole point: inventing a path and then making it
+ * leaves a gap between the two in which somebody else on a shared `/tmp` can take the name, and that
+ * somebody is not necessarily friendly. The prefix is for a human reading a directory listing and is
+ * not what makes the name unique.
+ *
+ * **Removing it is the caller's**, and `remove_dir_all` is the call: nothing here runs at the end of
+ * a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
+ */
+#if posix
+make_temp_dir(prefix: string) -> Result[string, IoError]
+    var into: []u8 = [0; path_bytes]
+    val code = c_temp_dir(cstring(prefix).ptr, as_mut_ptr(into), into.len)
+
+    if code != 0 then return Err(from_errno(code))
+
+    from_cstring(as_ptr(into)) match
+        Ok(s) -> Ok(s)
+        Err(_) -> Err(Other(84))
+end make_temp_dir
+#endif
+
+/** Every directory on the path made, from the topmost one that is missing down.
+ *
+ * **A path that is already a directory is success, not `AlreadyExists`**, which is the difference
+ * between this and a loop over `make_dir` and is what every caller of it wanted: the question being
+ * asked is "make sure this is there", and a program that has to distinguish "I made it" from "it was
+ * there" is asking a question this cannot answer honestly anyway, since somebody else may have made
+ * it in between.
+ *
+ * It climbs with `sysl.path.parent` and recurses, so the work is done from the top down and each
+ * level is attempted exactly once. A component that exists and is **not** a directory reports
+ * `NotADirectory` from the `make_dir` beneath it rather than being silently accepted.
+ */
+make_dir_all(path: string) -> Result[unit, IoError]
+    if path.len == 0 || is_dir(path) then return Ok(())
+
+    parent(path) match
+        Some(up) -> make_dir_all(up)?
+        None -> ()
+
+    make_dir(path) match
+        Ok(_) -> Ok(())
+        // Somebody else may have made it between the `is_dir` above and this call, and a program
+        // that asked for the directory to exist got what it asked for. Anything else it was is a
+        // real failure and is reported.
+        Err(AlreadyExists) -> if is_dir(path) then Ok(()) else Err(AlreadyExists)
+        Err(e) -> Err(e)
+end make_dir_all
+
+// **`remove_dir_all` is posix-only and `make_dir_all` above it is not**, which looks arbitrary and
+// is the one call each needs that the other does not. `make_dir_all` climbs with `sysl.path.parent`
+// and asks `exists` and `make_dir`, all of which every target has. `remove_dir_all` has to know
+// whether an entry is a symbolic link *without following it*, and the only reading in the library
+// that answers that is `link_metadata` -- which `meta.sysl` gates on `posix`, because a Windows
+// reading of a filesystem entry is a different struct rather than the same one with fields missing.
+//
+// Following the link instead is not an option worth taking to keep the function portable: the whole
+// point of the test is that a link pointing out of the tree is unlinked rather than walked into, so
+// a version without it deletes things nobody asked it to.
+#if posix
+
+/** A directory and everything under it removed.
+ *
+ * **The walk is post-order** -- a directory is emptied before it is taken -- because `rmdir` refuses
+ * one that is not empty, which is the rule `remove_dir` states and this exists to work within rather
+ * than around.
+ *
+ * **A symbolic link is unlinked, not followed**, which is the property that keeps this from deleting
+ * something outside the tree it was pointed at. `entries` says what is in a directory and `is_dir`
+ * follows links, so the test here is `link_metadata` -- the one reading in the module that describes
+ * the path itself.
+ *
+ * A path that is not there at all is success. A caller tearing down after a failure should not have
+ * to know how far the failure got.
+ */
+remove_dir_all(path: string) -> Result[unit, IoError]
+    if !exists(path) && !is_link(path) then return Ok(())
+
+    for item in walk(path).bottom_up()
+        val e = item?
+
+        if e.is_dir() then remove_dir(e.path)? else remove_file(e.path)?
+
+    Ok(())
+end remove_dir_all
+
+/** A directory and everything under it copied, making the destination and everything under it.
+ *
+ * **A directory is merged into and a file is never overwritten.** Those are the safe half of each
+ * question: a destination that already holds a subtree gains what this brings, and a destination
+ * that already holds a *file* of a name being copied reports `AlreadyExists` rather than quietly
+ * replacing something. `make_dir_all` is idempotent, so the merge half is simply what happens.
+ *
+ * **Permissions are carried**, which is where this differs from `copy_file` -- an executable copied
+ * with that one stops being executable, and this org copies build inputs. A symbolic link is copied
+ * *as a link*, pointing wherever it pointed, which may be nothing and may be outside the tree.
+ *
+ * **A failure part way through leaves what it has already written.** Nothing here removes a tree on
+ * the way out, because it cannot know whether the destination existed before it started, and
+ * deleting one the caller owned would be far worse than the failure being reported. A caller that
+ * needs the destination to appear whole or not at all copies to `pending_name(to)` and hands that to
+ * `publish_dir` -- a copy built beside its destination rather than in `make_temp_dir`, since a rename
+ * only moves a directory within one filesystem, and that rename is the only atomicity a filesystem has.
+ *
+ * The source may be a plain file, in which case this is `copy_file` with the mode carried.
+ */
+copy_dir_all(from: string, to: string) -> Result[unit, IoError]
+    for item in walk(from)
+        val e = item?
+
+        // `e.path` is the root or was built from it by `join`, so the two always agree about
+        // starting at the root and `relative_to` always answers. It is checked rather than assumed
+        // because a walk that ever reported something else should say so rather than go on.
+        val rel = relative_to(e.path, from)
+
+        if rel.is_none() then return Err(Other(22))
+
+        val dst = if e.depth == 0 then to else join(to, rel.unwrap())
+
+        if e.is_link()
+            symlink(read_link(e.path)?, dst)?
+            continue
+        end if
+
+        if e.is_dir()
+            make_dir_all(dst)?
+        else
+            if exists(dst) || is_link(dst) then return Err(AlreadyExists)
+
+            copy_file(e.path, dst)?
+
+        set_permissions(dst, e.meta.permissions())?
+
+    Ok(())
+end copy_dir_all
+
+#endif
+
+/** A C call that reports success as zero. */
+private told(rc: int) -> Result[unit, IoError] = if rc != 0 then Err(why()) else Ok(())

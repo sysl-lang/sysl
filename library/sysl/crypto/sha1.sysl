@@ -1,0 +1,123 @@
+module sysl.crypto
+@no_alloc
+
+import sysl.math.Bits
+
+// SHA-1 — here for one wire protocol, and not for anything a new program is choosing.
+//
+// **It is broken, and has been publicly broken since 2017**: `SHAttered` exhibited two PDFs with one
+// digest, and `SHA-1 is a Shambles` made that a *chosen-prefix* collision in 2019 for about $45,000
+// of rented compute. A SHA-1 digest therefore says nothing about a document nobody could have
+// substituted, so it must not carry a signature, a certificate, a content address, or a
+// deduplication key. **`sha256` is what all of those want** and it is in this same module.
+//
+// What it is here for is **RFC 6455's opening handshake**, where the server answers
+// `base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))` and every browser checks the answer.
+// There is no substitute: the constant and the algorithm are both written into the standard. That
+// use makes no security claim at all — the handshake shows that the far end read the request and
+// understood the protocol, not that anybody is who they say — which is why an algorithm this broken
+// is still adequate for it, and why nothing else here should follow it.
+//
+// **Everything but the compression below is shared with SHA-2**, in `hasher.sysl`: SHA-1's block and
+// length conventions are SHA-256's exactly, which is a fact about the standards rather than a
+// coincidence — SHA-1 is what SHA-2's 32-bit half was designed from.
+
+// The four constants, one per twenty rounds. They are the first thirty-two bits of the fractional
+// parts of the square roots of 2, 3, 5 and 10 — the same kind of derivation SHA-2's tables have, and
+// the reason a table of four is a table rather than four numbers in the round.
+private val k1: [4]u32 = [0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6]
+
+// The published initial values, in the first five words of the eight `Sha` carries. The other three
+// are zero and are never read: `finish` publishes twenty bytes, which is exactly these five.
+private val iv1: [8]u32 = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0, 0, 0, 0]
+
+// SHA-1's compression, and the empty struct that carries it.
+private[crypto] struct Sha1C
+end Sha1C
+
+impl Compression for Sha1C
+    type W = u32
+
+    block_bytes() -> usize = 64
+    word_bytes() -> usize = 4
+
+    // **The schedule is where SHA-1 was broken.** SHA-2 mixes each new word through two rotate-heavy
+    // functions; SHA-1 rotates a four-way XOR by one, and that single bit of rotation is what leaves
+    // enough linear structure for the published attacks.
+    compress(h: *[8]u32, block: []const u8)
+        var w = [0u32; 80]
+
+        for i in 0..<16usize
+            var v = 0u32
+
+            for j in 0..<4usize do v = shift_in(v, block[i * 4 + j])
+
+            w[i] = v
+
+        for i in 16..<80usize
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1)
+
+        var a = h[0]
+        var b = h[1]
+        var c = h[2]
+        var d = h[3]
+        var e = h[4]
+
+        for i in 0..<80usize
+            // `ch` and `maj` are the module's own, and they are the right functions rather than
+            // close ones — `hasher.sysl` says why the published `|` form and their `^` agree.
+            var f = if i < 20 then ch(b, c, d) else if i < 40 || i >= 60 then b ^ c ^ d else maj(b, c, d)
+            var t = a.rotate_left(5) + f + e + k1[i / 20] + w[i]
+
+            e = d
+            d = c
+            c = b.rotate_left(30)
+            b = a
+            a = t
+
+        h[0] += a
+        h[1] += b
+        h[2] += c
+        h[3] += d
+        h[4] += e
+    end compress
+
+/** A SHA-1 hash in progress. **SHA-1 is broken** -- see `sha1` for what that does and does not
+ * rule out.
+ */
+// It is an ordinary struct like the four SHA-2 hashers beside it, so **copying one is starting
+// another from the same point**, which is what `hmac` is written in terms of. `update` may be called
+// as often as you like and `finish` writes into storage the caller owns.
+struct Sha1
+    private[crypto] inner: Sha[Sha1C]
+
+    update(*self, data: []const u8) = self.inner.update(data)
+    finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
+
+/** A hasher ready for its first `update`.
+ *
+ * **SHA-1 is broken.** Reach for `new_sha256` unless a wire protocol names this one; see `sha1`.
+ */
+new_sha1() -> Sha1 = Sha1(started(iv1, 20))
+
+/** The digest of one slice of bytes, which is the whole of what most callers want.
+ *
+ * **SHA-1 is broken, and has been publicly broken since 2017.** A collision is buildable, and since
+ * 2019 a chosen-prefix collision is, so this digest says nothing about a document nobody could have
+ * substituted: it must not carry a signature, a certificate, a content address or a deduplication
+ * key. **`sha256` is what all of those want.**
+ *
+ * It is in this module for **RFC 6455's opening handshake**, which answers a client's key with
+ * `base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))` and names both the algorithm and the
+ * constant in the standard, so there is no substitute. That use makes no security claim at all --
+ * the handshake shows the far end read the request and authenticates nobody -- which is why an
+ * algorithm this broken still serves it. Where a second preimage would buy an attacker nothing,
+ * SHA-1 is adequate; everywhere else it is not, and there is no third case.
+ */
+sha1(data: []const u8) -> [20]u8
+    var s = new_sha1()
+    var out: [20]u8
+
+    s.update(data)
+    s.finish(out[0..<20]).expect("a digest buffer sized from the hasher itself")
+    out

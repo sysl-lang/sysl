@@ -1,0 +1,441 @@
+module sysl.process
+@requires(posix)
+@tests
+
+import sysl.fs.IoError
+import sysl.posix.time.{monotonic, sleep}
+import sysl.time.{millis, whole_millis}
+
+// What the tests below ask the kernel directly, rather than the module: whether a pid still names a
+// process at all. A signal of zero is delivered to nothing and checks only that the target exists --
+// and a zombie exists, which is exactly what makes this the question for whether one was left.
+private extern "kill" c_kill(pid: i32, sig: int) -> int
+
+// What starting another program promises, asserted in sysl rather than beside it in Scala.
+//
+// **These start real programs**, which is the only honest way to test this module: what it does is
+// fork and exec, and a test that mocked either would be asserting the mock. The programs chosen are
+// ones every hosted system has and whose behaviour is specified rather than conventional --
+// `true`, `false`, `echo`, `printenv`, `pwd`.
+//
+// **They are named without a path wherever the point is not the path**, so that the `PATH` search
+// `execvp` does is itself under test. A tool shelling out to `git` or `adb` depends on that search,
+// and a module that only ever worked with absolute paths would pass every test here and be useless.
+//
+// Like `sysl.fs`'s, these depend on the library's own C: the shim under `__posix__` is what decodes
+// how a child ended, so a build that did not compile or did not link it fails here rather than in
+// whatever program first called it.
+
+// ## Starting one, and how it ended
+
+@test("a program that succeeds exits zero")
+succeeds_exits_zero()
+    assert_eq(run("true").unwrap(), Status.Exited(0))
+
+// **`Ok` carrying a non-zero status, not `Err`.** The distinction is the module's central claim:
+// `Err` is for a child that could not be *started*, and a program that ran and chose to fail has
+// answered the question it was asked.
+@test("a program that fails is still Ok, carrying its status")
+fails_is_still_ok()
+    val r = run("false")
+
+    assert(r.is_ok(), "a program that exits non-zero still started")
+    assert_eq(r.unwrap(), Status.Exited(1))
+
+// **The case the report pipe exists for.** Without it a missing program is indistinguishable from
+// one that ran and exited 127, because that is the status the child would have used to say so.
+@test("a program that is not there is an error rather than a status")
+missing_is_an_error()
+    val r = run("sysl-no-such-program-anywhere-on-this-machine")
+
+    assert(r.is_err(), "a program that cannot be started is an error")
+    assert_eq(r.unwrap_err(), IoError.NotFound)
+
+// A directory is not an executable, and the platform says so with a different number -- which is
+// the evidence that the errno really travels back through the pipe rather than being invented here.
+@test("a path that cannot be executed says why")
+not_executable_says_why()
+    val r = run("/")
+
+    assert(r.is_err(), "a directory is not a program")
+    assert(r.unwrap_err() != IoError.NotFound, "and the reason is not that it is missing")
+
+// **A child that is killed rather than exiting**, which is the other half of `Status` and the only
+// way to reach it: a signal has to come from somewhere, and a shell asked to kill itself is the
+// shortest arrangement that always produces one. The one test here that uses a shell, and it uses
+// it as a way to get a signal rather than as a way to run a command.
+@test("a child that is killed reports the signal")
+killed_reports_the_signal()
+    assert_eq(run("sh", ["-c", "kill -9 $$"]).unwrap(), Status.Signalled(9))
+
+// ## What it wrote
+
+@test("what a program prints comes back")
+prints_come_back()
+    val out = capture("echo", ["hello"]).unwrap()
+
+    assert_eq(out.text, "hello\n")
+    assert(out.status.ok(), "and it exited cleanly")
+
+// **Nothing goes through a shell, and this is what says so.** Under `/bin/sh` this argument would
+// be three words and a second command; `execvp` hands it over exactly as written, so it comes back
+// as one line of text.
+@test("an argument is never read by a shell")
+no_shell_reads_an_argument()
+    val out = capture("echo", ["a b; rm -rf /; $HOME *"]).unwrap()
+
+    assert_eq(out.text, "a b; rm -rf /; $HOME *\n")
+
+@test("a program that prints nothing captures nothing")
+silence_captures_nothing()
+    val out = capture("true").unwrap()
+
+    assert_eq(out.text, "")
+    assert(out.status.ok())
+
+// The temporary file a capture goes through is the module's own business and must not be left
+// behind or reused while it is still held. Two in a row is the cheapest thing that would notice.
+@test("two captures in a row do not collide")
+captures_do_not_collide()
+    assert_eq(capture("echo", ["one"]).unwrap().text, "one\n")
+    assert_eq(capture("echo", ["two"]).unwrap().text, "two\n")
+
+// ## Where it starts
+
+@test("a child starts where it is told")
+starts_where_told()
+    assert_eq(capture("pwd", [], "/").unwrap().text, "/\n")
+
+@test("an empty directory means wherever this program is")
+empty_dir_means_here()
+    val here = capture("pwd").unwrap().text
+
+    assert(here.len > 1, "a path, rather than nothing")
+    assert(here != "/\n", "and not the root, which is what the test above asked for")
+
+// ## The environment
+
+@test("a variable reaches the child")
+a_variable_reaches_the_child()
+    val out = capture("printenv", ["SYSL_PROCESS_TEST"], "",
+                      [Var("SYSL_PROCESS_TEST", "present")]).unwrap()
+
+    assert_eq(out.text, "present\n")
+
+// **Added to the environment rather than replacing it**, which is why these are set in the child
+// instead of being handed to `execve` as a whole `envp`. A child that had lost `PATH` because its
+// parent set one variable could not find the next program it wanted.
+@test("the rest of the environment survives")
+rest_of_environment_survives()
+    val out = capture("printenv", ["PATH"], "", [Var("SYSL_PROCESS_TEST", "present")]).unwrap()
+
+    assert(out.text.len > 1, "PATH is still there alongside what was added")
+
+// Named by an absolute path here, for the reason the next test exists.
+@test("a variable the parent has is overridden for the child")
+a_variable_is_overridden()
+    val out = capture("/usr/bin/printenv", ["PATH"], "", [Var("PATH", "/nowhere")]).unwrap()
+
+    assert_eq(out.text, "/nowhere\n")
+
+// **Setting `PATH` changes where the program itself is looked for**, which is the one variable
+// whose effect starts before the child does. The variables are set between the fork and the exec,
+// so `execvp` searches the child's `PATH` rather than this program's -- consistent, and surprising
+// the first time.
+@test("setting PATH decides where the program is looked for")
+path_decides_the_lookup()
+    val r = capture("printenv", ["PATH"], "", [Var("PATH", "/nowhere")])
+
+    assert(r.is_err(), "there is no printenv under /nowhere")
+    assert_eq(r.unwrap_err(), IoError.NotFound)
+
+// ## Status itself
+
+@test("ok is exited zero and nothing else")
+ok_is_exited_zero()
+    assert(Status.Exited(0).ok())
+    assert(!Status.Exited(1).ok())
+    assert(!Status.Signalled(9).ok(), "a signal is never a success, whatever its number")
+    assert(!Status.TimedOut.ok(), "and a child that was stopped never finished")
+
+// **An exit status and a signal are different answers.** A shell folds them together as `128 + n`,
+// which makes a program killed by `SIGKILL` indistinguishable from one that chose to exit 137.
+@test("a signal is not an exit status")
+signal_is_not_a_status()
+    assert(Status.Exited(9) != Status.Signalled(9))
+    assert(Status.Exited(137) != Status.Signalled(9))
+
+// **A child that ran out of time was killed by a signal, and saying so would lose the one thing
+// the caller knows**: which of the two it is deciding between is whether to report a crash or to
+// wait longer next time.
+@test("running out of time is not the same answer as being killed")
+timed_out_is_not_a_signal()
+    assert(Status.TimedOut != Status.Signalled(9))
+    assert(Status.TimedOut != Status.Signalled(15))
+    assert(Status.TimedOut != Status.Exited(0))
+    assert(Status.TimedOut == Status.TimedOut)
+
+@test("a status says which it is")
+a_status_says_which()
+    assert_eq(s"${Status.Exited(0)}", "exited")
+    assert_eq(s"${Status.Exited(2)}", "exited 2")
+    assert_eq(s"${Status.Signalled(9)}", "killed by signal 9")
+    assert_eq(s"${Status.TimedOut}", "timed out")
+
+// ## What it wrote to the OTHER stream
+//
+// **The claim these are about is that the two streams are separate**, so every one of them asserts
+// something about `text` as well: a capture that quietly merged them would satisfy any test that
+// only ever looked at `err`.
+
+@test("standard error is left alone unless it is asked for")
+stderr_is_not_collected_by_default()
+    val out = capture("sh", ["-c", "echo out; echo boom >&2"]).unwrap()
+
+    assert_eq(out.text, "out\n")
+    assert(out.err.is_none(), "a call that did not ask for standard error says so with 'None'")
+
+@test("standard error comes back when it is asked for, and the two streams stay apart")
+stderr_comes_back_when_asked()
+    val out = capture("sh", ["-c", "echo out; echo boom >&2"], "", [], true).unwrap()
+
+    assert_eq(out.text, "out\n")
+    assert_eq(out.err.unwrap(), "boom\n")
+
+// **`None` and `Some("")` are the two answers a bare string could not tell apart**, which is the
+// whole reason the field is an `Option`: a tool reporting why a child failed has to know whether it
+// is looking at silence or at a stream nobody collected.
+@test("a child that says nothing on standard error is not the same as not asking")
+stderr_empty_is_not_absent()
+    val asked = capture("true", [], "", [], true).unwrap()
+
+    assert(asked.err.is_some(), "it was collected")
+    assert_eq(asked.err.unwrap(), "")
+    assert(capture("true").unwrap().err.is_none(), "and this one was not")
+end stderr_empty_is_not_absent
+
+// The reason the card exists: a failed child's diagnosis is on the stream a plain capture lets
+// through to the terminal, where a tool cannot read it.
+@test("a failed child's reason is readable rather than only its status")
+stderr_carries_the_reason()
+    val out = capture("sh", ["-c", "echo why >&2; exit 3"], "", [], true).unwrap()
+
+    assert_eq(out.status, Status.Exited(3))
+    assert_eq(out.err.unwrap(), "why\n")
+    assert_eq(out.text, "")
+
+// Two files rather than one, so the same collision the pair of captures above looks for is worth
+// looking for across the streams of a single call.
+@test("the two streams do not share a file")
+stderr_does_not_collide_with_stdout()
+    val out = capture("sh", ["-c", "echo aaa; echo bbb >&2"], "", [], true).unwrap()
+
+    assert_eq(out.text, "aaa\n")
+    assert_eq(out.err.unwrap(), "bbb\n")
+
+// ## Running out of time
+//
+// **The claim is that a call which waits can be told to stop waiting**, and nothing else in this
+// file asserts it: every other child here ends on its own. The ones below are asked to take far
+// longer than the bound they are given, so each of these tests is a measurement -- how long the
+// call took against how long the child wanted -- rather than an assertion that it came back at all.
+
+@test("a child that outstays its timeout is stopped and says so")
+outstaying_the_timeout_is_reported()
+    val t0 = monotonic()
+    val s = run("sleep", ["5"], "", [], 200).unwrap()
+    val took = whole_millis(monotonic() - t0)
+
+    assert_eq(s, Status.TimedOut)
+    assert(!s.ok(), "a child that was stopped never finished, so it is not a success")
+    assert(took < 3000, s"waited ${took}ms, which is the child's five seconds rather than the bound")
+end outstaying_the_timeout_is_reported
+
+// **Asked first and made second**, which is the whole of why there are two signals: a child that
+// stops on `SIGTERM` gets to tidy up, and one that ignores it is still gone when the call returns.
+// This one ignores it -- a disposition of "ignore" survives an `exec`, which is what lets the child
+// be a single process rather than a shell holding one -- so the only way the call can come back
+// before the child's own three seconds is the `SIGKILL` behind the grace.
+@test("a child that ignores being asked to stop is made to")
+ignoring_the_ask_is_still_stopped()
+    val t0 = monotonic()
+    val s = run("sh", ["-c", "trap '' TERM; exec sleep 3"], "", [], 200).unwrap()
+    val took = whole_millis(monotonic() - t0)
+
+    assert_eq(s, Status.TimedOut)
+    assert(took < 2000, s"waited ${took}ms, so the child was never made to stop")
+end ignoring_the_ask_is_still_stopped
+
+// A bound is a bound rather than a deadline for the call: a child that finishes inside it is
+// reported exactly as it would have been without one, failure included.
+@test("a child that finishes inside its timeout is unaffected")
+finishing_in_time_is_unaffected()
+    assert_eq(run("true", [], "", [], 5000).unwrap(), Status.Exited(0))
+    assert_eq(run("false", [], "", [], 5000).unwrap(), Status.Exited(1))
+
+// Zero is the default, so this is what every other test in this file is relying on: a child that
+// takes a whole second is waited for, and a bound of any size would have cut it short.
+@test("a timeout of zero is no bound at all")
+zero_is_no_bound()
+    val t0 = monotonic()
+    val s = run("sleep", ["1"], "", [], 0).unwrap()
+    val took = whole_millis(monotonic() - t0)
+
+    assert_eq(s, Status.Exited(0))
+    assert(took >= 900, s"came back after ${took}ms, so something bounded a call that asked for none")
+end zero_is_no_bound
+
+// **What a child wrote before it ran out of time is usually what says where it stopped**, so the
+// files are read whatever the status is rather than only when the child succeeded.
+//
+// The shell `exec`s what it waits on, here and above, so that the child is one process and not two.
+// A shell that stayed would leave its own child behind holding the streams this test collects, and
+// the timeout has no claim on a grandchild: the signals go to what was started, which is the same
+// restraint that keeps this module out of process groups.
+@test("what a child wrote before it ran out of time still comes back")
+capture_keeps_what_was_written()
+    val out = capture("sh", ["-c", "echo half; exec sleep 5"], "", [], false, 300).unwrap()
+
+    assert_eq(out.status, Status.TimedOut)
+    assert_eq(out.text, "half\n")
+
+// The error half is about starting a child, and a bound on one that never started is not an answer
+// to anything -- so a timeout must not turn a missing program into a status.
+@test("a timeout does not change what a program that cannot start reports")
+timeout_does_not_disturb_a_start_failure()
+    val r = run("sysl-no-such-program-anywhere-on-this-machine", [], "", [], 1000)
+
+    assert(r.is_err(), "a program that is not there cannot run out of time")
+    assert_eq(r.unwrap_err(), IoError.NotFound)
+end timeout_does_not_disturb_a_start_failure
+
+// ## Starting one now and waiting for it later
+
+// **The claim `start` is built on**: `capture` with room in the middle, so turning one into the other
+// changes when the answer arrives and nothing about what it is. Every field is compared, on a child
+// that writes to both streams and fails, which is the case with the most to get wrong.
+@test("start then wait answers what capture answers")
+start_then_wait_is_capture()
+    val script = "echo out; echo err >&2; exit 3"
+    val want = capture("sh", ["-c", script], stderr = true).unwrap()
+    val got = start("sh", ["-c", script], stderr = true).unwrap().wait().unwrap()
+
+    assert_eq(got.status, want.status)
+    assert_eq(got.text, want.text)
+    assert_eq(got.err, want.err)
+    assert_eq(got.status, Status.Exited(3))
+    assert_eq(got.err, Some("err\n"))
+
+// A child is waited for in whatever order suits the caller, and its answer is its own whichever was
+// collected first. **And they run at the same time**, which is the point of having them: three
+// children sleeping a second each, waited for in reverse, come back in well under the three seconds
+// one after another would take.
+@test("three children started then waited in reverse order")
+three_children_reverse_order()
+    val t0 = monotonic()
+    val a = start("sh", ["-c", "sleep 1; echo a"]).unwrap()
+    val b = start("sh", ["-c", "sleep 1; echo b"]).unwrap()
+    val c = start("sh", ["-c", "sleep 1; echo c"]).unwrap()
+
+    assert_eq(c.wait().unwrap().text, "c\n")
+    assert_eq(b.wait().unwrap().text, "b\n")
+    assert_eq(a.wait().unwrap().text, "a\n")
+
+    val took = whole_millis(monotonic() - t0)
+
+    assert(took < 2500, s"took ${took}ms, which is the three run one after another")
+end three_children_reverse_order
+
+// **The deadlock this module was built to be unable to reach.** A child writing a megabyte to a pipe
+// blocks once the pipe's buffer is full until somebody reads, and a parent waiting on a *different*
+// child first never does. Through files nothing fills: the big child runs to its end on its own while
+// the parent waits for the other two, and both of its streams come back whole.
+@test("a megabyte on each stream is captured while two other children run")
+large_output_does_not_deadlock()
+    val n: usize = 1100000
+    val big = start("sh", ["-c", f"yes o | head -c $n%d; yes e | head -c $n%d >&2"],
+                    stderr = true, timeout = 30000).unwrap()
+    val one = start("sleep", ["0.2"]).unwrap()
+    val two = start("sleep", ["0.2"]).unwrap()
+
+    assert_eq(two.wait().unwrap().status, Status.Exited(0))
+    assert_eq(one.wait().unwrap().status, Status.Exited(0))
+
+    val out = big.wait().unwrap()
+
+    assert_eq(out.status, Status.Exited(0))
+    assert_eq(out.text.len, n)
+    assert_eq(out.err.unwrap().len, n)
+end large_output_does_not_deadlock
+
+// A child waited for twice has nothing left to ask by the second time, so the second answer is the
+// first one kept rather than an error about a pid the kernel has already forgotten.
+@test("waiting twice answers the same thing twice")
+waiting_twice()
+    val c = start("sh", ["-c", "echo once; exit 4"]).unwrap()
+    val first = c.wait().unwrap()
+    val second = c.wait().unwrap()
+
+    assert_eq(first.status, Status.Exited(4))
+    assert_eq(second.status, first.status)
+    assert_eq(second.text, "once\n")
+
+// A program that is not there is reported where it fails -- at the start, with no child to hand back.
+@test("a program that is not there fails to start rather than failing to finish")
+start_of_a_missing_program()
+    val r = start("sysl-no-such-program-anywhere-on-this-machine")
+
+    assert(r.is_err(), "there is no child to answer")
+    assert_eq(r.unwrap_err(), IoError.NotFound)
+
+// The bound is the child's life measured from `start`, and `wait` is what keeps it.
+@test("a started child that outstays its timeout is stopped at the wait")
+started_child_times_out()
+    val t0 = monotonic()
+    val out = start("sleep", ["5"], timeout = 200).unwrap().wait().unwrap()
+    val took = whole_millis(monotonic() - t0)
+
+    assert_eq(out.status, Status.TimedOut)
+    assert(took < 3000, s"waited ${took}ms, which is the child's five seconds rather than the bound")
+
+// The pid of a child that was started, still running, when its handle went.
+private abandoned_while_running() -> i32
+    val c = start("sleep", ["30"]).unwrap()
+
+    c.pid
+
+// The pid of a child that had finished, unreaped, when its handle went -- after first checking that
+// it really was a zombie by then, which is what makes the test below able to fail: a check that the
+// pid is gone is worth nothing unless the same check could see it there.
+private abandoned_after_finishing() -> i32
+    val c = start("true").unwrap()
+
+    sleep(millis(300))
+    assert(c_kill(c.pid, 0) == 0, "a finished child nobody has waited for is still a zombie")
+
+    c.pid
+
+// **Dropping a child is how a program says it is not going to wait**, and the module answers by
+// ending it and reaping it, so nothing is left in the process table either way. A pid that still
+// answers `kill(pid, 0)` is a zombie or a running child, and both are what this rules out.
+@test("a child dropped without being waited for leaves no zombie")
+dropped_child_is_reaped()
+    val t0 = monotonic()
+    val running = abandoned_while_running()
+    val took = whole_millis(monotonic() - t0)
+
+    assert(c_kill(running, 0) != 0, s"pid ${running} survived its handle")
+    assert(took < 3000, s"dropping took ${took}ms, which is waiting the child out rather than ending it")
+
+    val finished = abandoned_after_finishing()
+
+    assert(c_kill(finished, 0) != 0, s"pid ${finished} was left a zombie")
+end dropped_child_is_reaped
+
+// The number is the machine's own rather than merely positive: `getconf` is POSIX's own way of asking
+// the same question from outside, so the two have to agree.
+@test("cpu_count agrees with getconf")
+cpu_count_agrees_with_getconf()
+    val out = capture("getconf", ["_NPROCESSORS_ONLN"]).unwrap()
+
+    assert_eq(out.text, f"${cpu_count()}\n")

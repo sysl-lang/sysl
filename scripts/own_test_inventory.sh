@@ -12,7 +12,7 @@ set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(dirname "$here")
 
-for f in "$root"/sh/sysl/compiler/tests_*.sysl; do
+for f in "$root"/compiler/sh/sysl/compiler/tests_*.sysl; do
     [ -r "$f" ] || continue
     awk -v file="${f##*/}" '
         /^@test([(]|[ \t]*$)/ {

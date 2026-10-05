@@ -1,0 +1,334 @@
+module sysl.io
+
+import sysl.buf.{Buf, buf}
+import sysl.sys.{sysl_memchr, sysl_read}
+import sysl.text.{from_utf8, Utf8Error}
+
+/** The input half of the byte surface, and the line cursor over it.
+ *
+ * A module of its own rather than part of `sysl`, because nothing the language desugars onto reads:
+ * a program that never takes input never needs one of these names, and one that does says so with an
+ * `import`. The output half stays where it is for the opposite reason -- `print` is a keyword, and
+ * what it desugars onto cannot be behind an import a program has not written.
+ *
+ * `Reader` is here for the same reason `Writer` is: a program that reads has to name what it reads
+ * from, and naming it once is what keeps two mechanisms -- and so two buffers, and bytes arriving in
+ * the wrong order -- from growing. It is `Writer` turned around, down to the `Fallible` latch both
+ * require, so a source that cannot fail says nothing about failing.
+ *
+ * **The latch is required rather than declared**, and that is what lets one type be a reader and a
+ * writer at once: a trait's members become the implementing type's, so two traits each declaring a
+ * `failed` could not both be implemented for one file. Sharing `Fallible` is what makes an open
+ * file writable at all (`sysl.fs`).
+ *
+ * `read` hands back **the prefix of `into` that was filled** rather than a count, because a slice
+ * already *is* a count and a pointer: the length is `got.len` and there is no way to be handed one
+ * and forget to apply it to the other. Returning empty says end of input and nothing more -- whether
+ * input *ended badly* is what `failed` is for, and the two questions are separate because a caller
+ * that does not care should not have to ask.
+ *
+ * **A TERMINAL DOES NOT END A LINE THE WAY A FILE DOES, and the failure used to be silent.** A
+ * terminal sends a bare `\r` when Enter is pressed, so a cursor splitting on `\n` never sees a line
+ * at all: it waits forever, prints nothing, and looks hung, with no diagnostic to grep for, because
+ * nothing has gone wrong -- the line has not ended.
+ *
+ * **`console_lines` is the answer, and `lines` is unchanged.** The policy is the caller's because
+ * the right one is a property of where the bytes came from, which the library cannot know: a pipe
+ * carrying `\r` in the middle of a line means a `\r`, and a console pressing Enter means a line. So
+ * a file or a pipe keeps LF, and a console asks for CR, LF and CRLF alike.
+ *
+ * **Echo and editing are not covered here, and they are the rest of what a console needs.** A
+ * terminal in raw mode shows nothing as it is typed, and with no echo a mistake cannot be corrected.
+ * Neither is a line cursor's business -- one is about the *terminal* and the other about the *line*
+ * -- and both still have to come from somewhere. That somewhere is `sysl.term.edit`, which is this
+ * trait's other consumer: it edits where nothing else will, and answers whole lines the same way a
+ * `Lines` does -- an `Iterate` whose `Item` is `string` -- so the two are interchangeable at a call
+ * site, as a `*Iterate[string]`. Which of them a
+ * program wants is decided by `sysl.posix.tty.raw` on a host, and by there being no line discipline
+ * at all on a board.
+ */
+trait Reader: Fallible
+    read(*self, into: []u8) -> []const u8
+
+/** What ends a line for a given cursor.
+ *
+ * Two policies rather than three: there is no CRLF-only setting, because a reader strict about
+ * which of the two a sender used has a protocol rather than a line, and would want the bytes.
+ */
+enum LineEnding
+    // `\n` alone, with a trailing `\r` trimmed off the line -- a file or a pipe, and what
+    // `bufio.Scanner` does. The trim is what makes input written on one system read the same on the
+    // other.
+    Lf
+    // `\r`, `\n` or `\r\n`, each ending one line -- a terminal.
+    //
+    // **A bare `\r` ends the line immediately rather than waiting to see whether an `\n` follows**,
+    // because on a bare-CR terminal it never does, and waiting inside the read would hang until the
+    // next keystroke. What that costs is that the `\n` of a `\r\n` may arrive in a later read than
+    // its `\r`, so the cursor remembers it is owed one.
+    CrOrLf
+end LineEnding
+
+/** A line is found with `memchr` rather than a byte loop because libc's reads a word at a time and
+ * sysl's could not. This is the whole of what pointer difference is for: `memchr` answers *where*
+ * with an address, and an index is that address minus the first.
+ */
+find_byte(b: []const u8, c: u8) -> Option[usize]
+    if b.len == 0 then return None
+
+    var hit = sysl_memchr(&b[0], int(c), b.len)
+
+    if hit == null then None else Some(usize(hit - &b[0]))
+
+/** A reader over a file descriptor -- one of the two places a freestanding target has to substitute
+ * its own body, the other being `putbytes`. Swap this for a `read` syscall and the whole surface
+ * above it is unchanged.
+ */
+struct FdReader
+    fd: int
+    bad: bool
+
+fd_reader(fd: int) -> FdReader = FdReader(fd, false)
+
+stdin() -> FdReader = fd_reader(0)
+
+impl Reader for FdReader
+    read(*self, into: []u8) -> []const u8
+        if into.len == 0 then return into
+
+        var k = sysl_read(self.fd, &into[0], into.len)
+
+        if k < 0 then self.bad = true
+        if k <= 0 then return into[0..<0]
+
+        into[0..<usize(k)]
+    end read
+end FdReader
+
+impl Fallible for FdReader
+    override failed(*self) -> bool = self.bad
+
+/** Bytes to text at the boundary they arrive at, which is where `04` puts the check. A trailing `\r`
+ * goes with the `\n`, so input written on one system reads the same on the other --
+ * `bufio.Scanner`'s choice rather than C `getline`'s.
+ *
+ * Ill-formed input stops the program the way an ill-formed argument does, and that is the right
+ * severity for a program reading a file it expects to be text: there is nothing sensible for it to
+ * do with the rest, and carrying on would put the mistake a long way from its cause.
+ *
+ * **Where that is the wrong severity, `try_line_text` is the same conversion without it.** Input off
+ * a wire, out of a serial port, or from a file somebody else wrote carries whatever was sent, and a
+ * program reading that wants to be told rather than stopped -- as does anything running where there
+ * is nowhere to exit *to*, since a freestanding `exit` is a halt with no supervisor to notice it.
+ */
+line_text(b: []const u8) -> string
+    try_line_text(b) match
+        Ok(s) -> s
+        Err(e) ->
+            print("panic: a line read from input is not UTF-8 at byte", e.offset, "of the line")
+            exit(1)
+
+/** The same conversion, reporting rather than stopping.
+ *
+ * It exists so that the choice is the caller's without their having to drop to `Reader` and
+ * re-implement line splitting to get it. Which of the two is right is a property of where the bytes
+ * came from, and the library cannot know that -- so both are here and the caller says which.
+ */
+try_line_text(b: []const u8) -> Result[string, Utf8Error]
+    var n = if b.len > 0 && b[b.len - 1] == 13 then b.len - 1 else b.len
+
+    from_utf8(b[0..<n])
+
+/** A cursor that yields one line at a time.
+ *
+ * **It borrows its reader rather than owning it**, which is not a preference: a `for` loop iterates
+ * a *copy* of the iterator, so a `Lines` holding an `FdReader` by value would latch its failure on a
+ * copy the caller cannot reach, and `failed` would be decorative. Holding a `*Reader` leaves the
+ * reader in the caller's hands, which is exactly what makes `r.failed()` answerable after the loop
+ * has ended. It costs a line at the call site -- the reader has to be named -- and buys the only
+ * question worth asking once reading has stopped.
+ *
+ * It scans **the buffer in place** and copies nothing for a line that fits in one read; only a line
+ * that spans two reads is gathered, into a `Buf[u8]` that is then reused, so the cost is
+ * proportional to the input rather than to the input times the number of refills.
+ *
+ * What it scans is **the slice `read` handed back**, not the one it offered. Those are the same
+ * memory for a reader that fills what it was given, and the distinction costs nothing -- but it is
+ * what lets a reader hand back a view of a buffer of *its own*, never touching the offered one, and
+ * still be read correctly. Taking a *length* from the answer and the *bytes* from the offer is how
+ * the two could have disagreed, and there is now nowhere for them to.
+ *
+ * An empty read ends the cursor for good. That is right for the sources `read(2)` serves, where zero
+ * means end of file and a failure arrives as `-1` instead -- so nothing is being conflated, and a
+ * caller wanting to read again past the end gets `None` every time rather than a second chance.
+ */
+struct Lines
+    src: *Reader
+    chunk: []u8
+    have: []const u8
+    at: usize
+    held: &Buf[u8]
+    done: bool
+    ending: LineEnding
+    // Whether a `\n` arriving next belongs to the `\r` that already ended the previous line. It is a
+    // field rather than a local because the two bytes of a `\r\n` can arrive in different reads, and
+    // that is the case a hand-rolled console reader gets wrong.
+    owed_lf: bool
+
+    /** Where the next line ends in `b`, which is the whole of what the policy decides.
+     *
+     * Under `CrOrLf` the CR is searched for only as far as the LF, so the second pass is never longer
+     * than the first and the answer is the earlier of the two either way.
+     */
+    line_end(self, b: []const u8) -> Option[usize]
+        self.ending match
+            Lf -> find_byte(b, 10)
+            CrOrLf ->
+                find_byte(b, 10) match
+                    Some(n) ->
+                        find_byte(b[0..<n], 13) match
+                            Some(c) -> Some(c)
+                            None -> Some(n)
+                    None -> find_byte(b, 13)
+    end line_end
+
+    /** The next line, or nothing once the input has ended. Ill-formed bytes stop the program, which
+     * is `line_text`'s severity and its reasoning -- `try_getline` below is the same walk without it.
+     */
+    getline(*self) -> Option[string]
+        self.try_getline() match
+            None -> None
+            Some(line) ->
+                line match
+                    Ok(s) -> Some(s)
+                    Err(e) ->
+                        print("panic: a line read from input is not UTF-8 at byte", e.offset,
+                          "of the line")
+                        exit(1)
+    end getline
+
+    /** The whole of the line-finding, so that the two forms cannot come to disagree about where a
+     * line ends. There are two answers to distinguish and they nest: the outer `Option` says whether
+     * there was a line at all, and the inner `Result` says whether it was text.
+     */
+    try_getline(*self) -> Option[Result[string, Utf8Error]]
+        loop
+            var rest = self.have[self.at..]
+
+            // The second half of a `\r\n`, which may be the first byte of a read made after the line
+            // its `\r` ended was already handed back. Nothing is consumed while there are no bytes
+            // to look at, so the debt survives the refill below rather than being written off by it.
+            if self.owed_lf && rest.len > 0
+                self.owed_lf = false
+
+                if rest[0] == 10
+                    self.at += 1
+                    rest = self.have[self.at..]
+
+            self.line_end(rest) match
+                Some(i) ->
+                    self.owed_lf = rest[i] == 13
+                    self.at += i + 1
+
+                    if self.held.is_empty() then return Some(try_line_text(rest[0..<i]))
+
+                    for b in rest[0..<i] do self.held.push(b)
+                    return Some(self.held_line())
+                None -> ()
+
+            for b in rest do self.held.push(b)
+            self.at = self.have.len
+
+            if self.done
+                if self.held.is_empty() then return None
+
+                return Some(self.held_line())
+
+            self.refill()
+    end try_getline
+
+    held_line(*self) -> Result[string, Utf8Error]
+        var s = try_line_text(self.held.view())
+
+        self.held.clear()
+        s
+
+    refill(*self)
+        self.have = self.src.read(self.chunk)
+        self.at = 0
+
+        if self.have.len == 0 then self.done = true
+end Lines
+
+impl Iterate for Lines
+    type Item = string
+    next(*self) -> Option[string] = self.getline()
+
+/** Every byte the reader has left, gathered into one buffer.
+ *
+ * **The whole-stream read the surface was missing.** A `Reader` answers whatever one call could
+ * fill, so a program that wants the lot has to loop -- and hand-rolling that loop is where the two
+ * mistakes live: stopping at the first short read, which is not the end of anything, and taking the
+ * length from the slice you offered rather than from the one you were handed.
+ *
+ * It ends at the first empty read, which is what end of input means here, and says nothing about
+ * whether input ended badly -- `failed` is still the question for that, asked once afterwards.
+ *
+ * The chunk is the same 4096 a `Lines` uses. It is a buffer size rather than a limit: a stream
+ * larger than it is read in as many passes as it takes.
+ */
+read_all(r: *Reader) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    var chunk: [4096]u8 = [0; 4096]
+
+    loop
+        val got = r.read(chunk)
+
+        if got.len == 0 then break
+
+        for b in got do out.push(b)
+
+    out
+
+/** The same, as text.
+ *
+ * **There is no panicking twin, and that is deliberate** -- `line_text` has one because a program
+ * reading a file it expects to be text has nothing sensible to do with a bad line, while a whole
+ * stream is exactly what arrives off a wire, out of a serial port, or from a file somebody else
+ * wrote. A caller who wants the other severity has `line_text`'s shape to copy in one line.
+ */
+read_all_text(r: *Reader) -> Result[string, Utf8Error] = from_utf8(read_all(r).view())
+
+/** Reads until `into` is full or the input ends, and hands back the prefix that was filled.
+ *
+ * `read` may answer short for reasons that have nothing to do with the end of input -- a pipe with
+ * one write in it so far, a socket, a terminal -- so *"fill this"* and *"read once"* are different
+ * requests, and only the second one was expressible. What comes back is a prefix of `into` exactly
+ * as `read`'s is, so a caller checks `got.len` against what it asked for rather than being handed a
+ * count it might forget to apply.
+ */
+read_exact(r: *Reader, into: []u8) -> []const u8
+    var at: usize = 0
+
+    while at < into.len
+        val got = r.read(into[at..])
+
+        if got.len == 0 then break
+
+        at += got.len
+
+    into[0..<at]
+
+/** A cursor over a file or a pipe: `\n` ends a line, and a trailing `\r` is trimmed. */
+lines(r: *Reader) -> Lines = lines_ending(r, Lf)
+
+/** A cursor over a terminal: `\r`, `\n` and `\r\n` each end a line.
+ *
+ * It is a name of its own rather than a flag on `lines` because the reason to reach for it is *where
+ * the bytes come from* rather than a setting to be looked up, and "I am reading from a console" is
+ * the thing a caller actually knows.
+ */
+console_lines(r: *Reader) -> Lines = lines_ending(r, CrOrLf)
+
+lines_ending(r: *Reader, ending: LineEnding) -> Lines =
+    Lines(r, [0; 4096], [], 0, buf(), false, ending, false)

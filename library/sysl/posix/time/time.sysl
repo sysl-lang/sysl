@@ -1,0 +1,185 @@
+module sysl.posix.time
+@requires(posix)
+
+import sysl.time.{Instant, Duration, micros, whole_micros}
+
+/** Reading the two clocks the host keeps, which is the one thing `sysl.time` deliberately cannot do.
+ *
+ * **This is a module of its own so that `sysl.time` is not.** The calendar and the arithmetic ask for
+ * no capability and run on a bare machine; `clock_gettime(2)` is asking an operating system for
+ * something, and a capability requirement is module-wide -- so a `now()` written next to `Instant`
+ * would cost the whole of the date-time library its freestanding reach for one function. `sysl.rand`
+ * and `sysl.posix.rand` are split for exactly this reason, and that file's header makes the argument
+ * at length.
+ *
+ * ## The two clocks are different clocks, and the return types say so
+ *
+ * `now` answers an `Instant`: a point on the timeline, counted from 1970, comparable with one taken
+ * on another machine. It is the clock somebody can *set*, so it can move backwards, and subtracting
+ * two readings of it to time something is a measurement that a passing `ntpd` can make negative.
+ *
+ * `monotonic` answers a `Duration`, not an `Instant`, and that is the whole of the distinction: it is
+ * counted from an origin nobody specifies -- boot, usually -- so a single reading means nothing and
+ * only the difference of two does. It cannot be set and cannot go backwards, which is what makes it
+ * the one to measure with. Giving it a type that no calendar function accepts is what stops it being
+ * mistaken for a timestamp.
+ *
+ * ## What a freestanding target does instead
+ *
+ * **Nothing here, and deliberately nothing shared with it.** A board's clock is a board's decision:
+ * two boards carrying the same chip -- so the same *target* -- can count time from a different RTC,
+ * which is precisely the case a `#if` on the target cannot express. So an embedded environment
+ * supplies a module of its own with these two function names, in its own package, and a program picks
+ * its clock by which one it imports.
+ *
+ * **That used to give up a program compiling unchanged against both, and it no longer does.** The
+ * shape this paragraph described as unbuilt -- a symbol declared in capability-free `sysl.time` that
+ * host and board alike link an implementation of -- is built: `sysl.time.now` and
+ * `sysl.time.monotonic` are it, `library/sysl/time/clock.sysl` carries the argument, and the two
+ * `@export`s at the foot of this file are what answer it on a host. The names above are unchanged, as
+ * that paragraph promised, so nothing that imported this module has moved.
+ *
+ * **Both spellings are right and neither is deprecated.** A program that is only ever going to run on
+ * a host imports this module and calls `now` directly, which needs no seam and no linker cooperation.
+ * A program that wants to move imports `sysl.time` instead and lets whatever it is linked against
+ * decide.
+ */
+
+// **Nothing here transcribes a C structure, and nothing here names a clock by number.** Both of
+// those were done in sysl until the library could carry C, and both were the same mistake in
+// different clothes: `struct timespec` is caller-allocated, and `CLOCK_MONOTONIC` is a `#define`
+// whose value is 1 on Linux, 6 on macOS and 4 on the BSDs. `reference/ffi.md § A library may carry
+// C` names a layout and a macro as the two things only C can reach, and this file needed both.
+//
+// The shim beside this one answers with the finished number, so neither crosses. What that retires:
+//
+//   - **the mirror.** `[2]long` was `struct timespec` on every target that could reach this module,
+//     which was true and unverifiable -- nothing in a program could check it, and `sizeof` would have
+//     reported what sysl laid out rather than what C did. It was also the one place in `library/sysl`
+//     that transcribed a structure at all, which `sysl.posix.tty` used to cite as the exception to
+//     its own rule. There is now no exception.
+//   - **the id table**, and with it the `#else` that declared a symbol nobody defines. That existed
+//     because the library is compiled whole for every target, so a branch declaring nothing would
+//     have failed in the compiler on all of them rather than at the link on the one that mattered.
+//     A per-OS directory says the same thing without the trick: an operating system with no folder
+//     here has no shim, and a program that asks the time fails at the link naming the symbol it could
+//     not find. Same behaviour, and now it is the general mechanism rather than a hand-written one.
+//   - **the 32-bit worry.** `x86-linux` was the target to watch, because a 32-bit glibc `time_t` is
+//     not a `long` unless `_TIME_BITS=64` says so, and two `long`s is then not that structure. The
+//     shim reads the header, so whoever measures i386's calling convention inherits nothing here.
+private[sysl] extern "sysl_posix_time_nanosleep" c_nanosleep(nanos: long) -> long
+private[sysl] extern "sysl_posix_time_realtime_us" c_realtime_us() -> long
+private[sysl] extern "sysl_posix_time_monotonic_us" c_monotonic_us() -> long
+
+/** The wall clock: where the host thinks it is on the timeline.
+ *
+ * **Two readings of this may differ by anything at all**, including a negative amount, because it is
+ * the clock a person and an `ntpd` are both allowed to set. Use it to stamp something, and use
+ * `monotonic` to measure something.
+ */
+now() -> Instant = Instant(c_realtime_us())
+
+/** A monotonic counter, as a length of time from an origin this deliberately does not name.
+ *
+ * One reading answers nothing. **Two readings subtracted answer how long something took**, and that
+ * is the only question it can be asked:
+ *
+ * val t0 = monotonic()
+ * work()
+ * print(s"took ${(monotonic() - t0).us}us")
+ *
+ * It never goes backwards and nothing can set it, which is the difference from `now` and the reason
+ * a measurement wants this one.
+ */
+monotonic() -> Duration = micros(c_monotonic_us())
+
+// ## Waiting
+//
+// **`sysl.time` cannot carry these for the reason the header of this file gives about `now`**:
+// `nanosleep(2)` is asking an operating system for something, and a capability requirement is
+// module-wide. `sysl-lang/pico2` has a `sleep` of its own over the SDK's `sleep_us`, with this
+// signature, so the same line reads the same on a board and on a host — which is the point of the
+// `Duration` rather than a count in a unit the caller has to remember.
+
+/** Wait for `d`, however many attempts that takes.
+ *
+ * **A signal cuts a wait short, and this one carries on.** `nanosleep(2)` returns early with `EINTR`
+ * and the time still owed, so a wait written as one call is a wait that is quietly shorter than it
+ * asked for whenever anything arrives -- which is exactly when a test that depends on it starts
+ * looking flaky. This retries with the remainder until nothing is left.
+ *
+ * **It answers nothing, because there is nothing left to say**: it returns when the time has passed.
+ * A caller that wants to *know* it was interrupted wants `nanosleep` below.
+ *
+ *     sleep(50.ms)
+ *
+ * A duration of zero or less returns at once rather than yielding, which is not the same thing --
+ * `sleep(0.s)` is not a way to offer the processor to something else.
+ */
+sleep(d: Duration)
+    var left = whole_micros(d) * 1000
+
+    while left > 0
+        left = c_nanosleep(left)
+
+/** Wait for `nanos` nanoseconds, and answer how many were still owed when it stopped.
+ *
+ * **Zero means the whole time passed.** Anything else is what a signal interrupted, and handing it
+ * back rather than swallowing it is the difference from `sleep`: a program with a handler installed
+ * can tell "the wait finished" from "something happened", which one call to `sleep` cannot.
+ *
+ *     var left = nanosleep(2_000_000)
+ *
+ *     while left > 0 && !cancelled()
+ *         left = nanosleep(left)
+ *
+ * **Nanoseconds, where `sleep` takes a `Duration`, and that is what this is for.** A `Duration`
+ * counts microseconds, so it cannot name a wait shorter than one -- and `nanosleep(2)` can. Reach
+ * for `sleep` unless you need the resolution or the remainder.
+ */
+nanosleep(nanos: long) -> long = c_nanosleep(nanos)
+
+// ## Answering `sysl.time`'s seam
+//
+// `sysl.time` declares `sysl_wall_us` and `sysl_monotonic_us` and defines neither, so a program that
+// writes the portable `sysl.time.now()` needs somebody to. On a host that is this module, and these
+// two lines are the whole of it (`library/sysl/time/clock.sysl` carries the argument).
+//
+// **Nothing here changes for a caller.** `now` and `monotonic` above are the same functions they
+// were, imported and called the same way, and a host program that names this module directly needs
+// none of this. What the seam adds is the *other* spelling, for a program that wants to move.
+//
+// **There is no `#if posix` around these and none is needed, which is worth stating because the
+// instinct to add one is right about the danger and wrong about who already handles it.** The danger
+// is real: a `define` costs what a `declare` does not, so an unconditional body calling
+// `clock_gettime` reaching a freestanding link would fail naming a symbol that target has never had.
+//
+// What answers it is this file's own header. `@requires(posix)` is a property of the whole module, and
+// a supplier is taken only from a module whose clause the target satisfies -- so on a machine without
+// `posix` these two are never reached, and a `#if` would be a second statement of a claim the header
+// already makes. (An earlier version of this paragraph offered a byte-identical freestanding archive
+// as the proof. That archive was missing the supplier on *every* target, POSIX ones included,
+// because nothing put a library supplier in the program at all; `LibrarySupplierCliTests` now holds
+// both halves -- defined on a POSIX target, left declared on a freestanding one.)
+//
+// So a freestanding program that asks the time and links no supplier fails at the link naming
+// `sysl_wall_us`, which is the diagnostic it should get: the board is what has a clock to offer, and
+// this module is not on that board.
+
+/** Answers `sysl.time`'s wall-clock seam. **Call `now` instead** -- this exists to be linked, not to
+ * be called, and it is public only because an `@export` may not be `private`: a private declaration
+ * promises every caller is inside its module and an export promises the opposite, so the compiler
+ * refuses a definition making both claims.
+ *
+ * The name says what it is for rather than what it reads, so that it does not compete with anything
+ * a program would reach for -- and a package answering the same seam on a board writes the same two
+ * lines with its own chip behind them.
+ */
+@export("sysl_wall_us")
+supply_wall_us() -> long = c_realtime_us()
+
+/** Answers `sysl.time`'s monotonic seam. **Call `monotonic` instead** -- this exists to be linked
+ * rather than called, and `supply_wall_us` beside it says why it is public.
+ */
+@export("sysl_monotonic_us")
+supply_monotonic_us() -> long = c_monotonic_us()

@@ -1,0 +1,200 @@
+module sysl
+
+import sysl.sys.{sysl_fflush, sysl_putchar, sysl_snprintf, sysl_stdout_write, sysl_write}
+
+/** The printing surface, which lives in the library rather than in the compiler. `print(a, b, c)` is
+ * a desugaring onto these one-value functions, chosen by each argument's static type, so the
+ * compiler knows a handful of *names* and implements no printing of its own.
+ *
+ * Everything goes out through the single sink `putbytes`, and that is not incidental: two mechanisms
+ * means two buffers, and output emerging in the wrong order. Where there is a C library it hands the
+ * whole buffer to stdio's `fwrite` in one call -- counted rather than terminated, so an interior NUL
+ * goes out like any other byte, which `puts`, `%s` and even `%.*s` would all stop at. It stays on
+ * stdio rather than a raw `write(1, ...)` because C in the same program writing through `printf`
+ * shares that buffer, and one queue is what keeps the two in order.
+ *
+ * A freestanding target has no stdio, so there it writes a byte at a time through the `putchar` the
+ * board supplies. That is also one of the two functions such a target has to replace: swap its body
+ * for a `write` syscall, and `FdReader.read`'s for a `read` one, and the whole surface above both is
+ * unchanged.
+ *
+ * A short `fwrite` is looped over, and one that wrote nothing ends the loop -- the stream has failed,
+ * and there is nowhere left to report that to.
+ */
+putbytes(b: []const u8)
+#if hosted
+    var at: usize = 0
+
+    while at < b.len
+        val k = sysl_stdout_write(&b[at], b.len - at)
+
+        if k == 0 then return
+
+        at += k
+#else
+    for i in 0..<b.len
+        sysl_putchar(int(b[i]))
+#endif
+
+/** Standard output as a `Writer`, which is what a value writes itself into when it renders through
+ * its own `Display` rather than through one of the `print*` functions above.
+ *
+ * It is an ordinary sink written in ordinary sysl, and it is worth saying why that is possible at
+ * all: a destination fixed at compile time keeps no state, so the type has no fields -- and a struct
+ * may have none. Everything the compiler used to supply here by hand is now three declarations a
+ * reader can check, and the sink they end in is still `putbytes`, so a freestanding target replaces
+ * the same one function it always did.
+ */
+struct Stdout
+end Stdout
+
+impl Fallible for Stdout
+
+impl Writer for Stdout
+    write(*self, bytes: []const u8) = putbytes(bytes)
+
+// A writer with no state has nothing for its data word to point at, so the pointer the sink is built
+// on addresses nothing -- and nothing ever reads through it, because `write` above never looks at
+// `self`. The type carries the whole of what this sink is.
+val sink: *Stdout = ptr_cast(0usize)
+
+stdout() -> *Writer = sink
+
+prints(s: string) = putbytes(s.bytes)
+
+/** Push everything `putbytes` has been holding out to wherever standard output is going, right now
+ * rather than waiting for the buffer to fill or the process to exit.
+ *
+ * **C fully buffers a stream that is not a terminal.** A live report -- rows streamed to a log as
+ * they complete, output piped into another program, a test runner reading a child's output while it
+ * still runs -- can otherwise sit on everything already printed until the process ends, because
+ * `putbytes` writes through C's buffered `stdout`. This is the call that pushes it out early.
+ *
+ * `fflush(NULL)` runs underneath, which flushes every open output stream rather than naming one --
+ * `stdout` is a `#define` on Darwin (`reference/ffi.md § An extern also declares a variable`), so an
+ * `extern` naming it by pointer would not link there, and flushing everything costs nothing a program
+ * would notice, since there is normally only the one stream open to flush.
+ *
+ * `eprints` needs no matching call: `eputbytes` writes with a raw `write(2)`, which keeps no buffer
+ * of its own to hold anything back.
+ */
+flush() = sysl_fflush(null)
+
+/** The other stream, which is where a program's diagnostics belong.
+ *
+ * **The distinction is not decoration.** A program whose output is being read by another program --
+ * piped, redirected, captured in a variable -- writes its answer to one stream and its complaints to
+ * the other, so that a complaint never lands in the middle of the answer and a redirect that keeps
+ * the answer still lets a person see what went wrong. `sysl.args` puts a usage error here and its
+ * `--help` text on standard output for exactly that reason: the help *was* what was asked for.
+ *
+ * It goes through `write` rather than through `putchar`'s neighbour `fputc`, and directly rather
+ * than a byte at a time, because there is no buffer between this and the descriptor: a diagnostic
+ * written just before the program stops has to have left, and C's standard error is unbuffered for
+ * the same reason. That also makes it the one printing path whose output cannot be lost to a trap,
+ * which is worth knowing when a program is being debugged.
+ *
+ * A short write is looped over rather than ignored, since a signal may cut one anywhere; a write
+ * that reports failure ends the loop, because there is nowhere left to report *that* to.
+ */
+eputbytes(b: []const u8)
+    var at: usize = 0
+
+    while at < b.len
+        var k = sysl_write(2, &b[at], b.len - at)
+
+        if k <= 0 then return
+
+        at += usize(k)
+end eputbytes
+
+eprints(s: string) = eputbytes(s.bytes)
+
+/** Standard error as a `Writer`, so a value renders itself onto the diagnostic stream through the
+ * same `Display` it uses for standard output. It carries no state for the reason `Stdout` does not.
+ */
+struct Stderr
+end Stderr
+
+impl Fallible for Stderr
+
+impl Writer for Stderr
+    write(*self, bytes: []const u8) = eputbytes(bytes)
+
+val esink: *Stderr = ptr_cast(0usize)
+
+stderr() -> *Writer = esink
+
+/** The integers render in sysl, through `digits_long` and `digits_ulong` beside `display_int`. The
+ * float still leans on `snprintf`, which is formatting rather than I/O. What it prints is `%g`'s six
+ * significant digits, correctly rounded, and rounding to a precision the caller chose needs exact
+ * arithmetic over the whole value -- a different job from `shortest_real`'s, which finds the fewest
+ * digits and never rounds to a count it was given -- so it waits until there is a reason, such as a
+ * target without a C library.
+ */
+printi(n: long)
+    var buf: [24]u8
+    val at = digits_long(n, buf[0..<24])
+    putbytes(buf[at..<24])
+
+printu(n: ulong)
+    var buf: [24]u8
+    val at = digits_ulong(n, buf[0..<24])
+    putbytes(buf[at..<24])
+
+printr(x: real)
+    var buf: [32]u8
+    var k = sysl_snprintf(&buf[0], 32, c"%g", x)
+    putbytes(buf[0..<usize(k)])
+
+printb(b: bool) = prints(if b then "true" else "false")
+
+/** A character's UTF-8 bytes, written into storage the caller owns, answering how many were written.
+ * No character needs more than four, so `var b: [4]u8` is always enough and always on the stack --
+ * which is what keeps this usable where there is no allocator.
+ *
+ * The caller supplying the buffer is what makes that true, and it is the same shape every other
+ * place in the library takes when a result has a known bound. A slice with fewer than the four bytes
+ * is a mistake in the program rather than a truncation, and the bounds check says so: how many bytes
+ * are needed is not known until the character has been looked at, so there is no honest way to
+ * answer "it did not fit" that is cheaper than having room.
+ *
+ * **It lives in `sysl` rather than beside `from_utf8` in `sysl.text`, and that is forced.** A
+ * submodule may name the standard module freely and `sysl` may not name back (`reference/modules.md
+ * § The module graph is acyclic`), so an encoder over in `sysl.text` would be one `printc` below
+ * could not call -- and the second encoder that would then have to be written for it is exactly the
+ * hand-rolled copy this function exists to prevent. One encoder in an odd place beats two in tidy
+ * ones.
+ */
+encode_utf8(ch: char, into: []u8) -> usize
+    var cp = uint(ch)
+
+    if cp < 128 then
+        into[0] = u8(cp)
+        return 1
+
+    if cp < 2048 then
+        into[0] = u8(192 | (cp >> 6))
+        into[1] = u8(128 | (cp & 63))
+        return 2
+
+    if cp < 65536 then
+        into[0] = u8(224 | (cp >> 12))
+        into[1] = u8(128 | ((cp >> 6) & 63))
+        into[2] = u8(128 | (cp & 63))
+        return 3
+
+    into[0] = u8(240 | (cp >> 18))
+    into[1] = u8(128 | ((cp >> 12) & 63))
+    into[2] = u8(128 | ((cp >> 6) & 63))
+    into[3] = u8(128 | (cp & 63))
+    4
+end encode_utf8
+
+/** A `char` is encoded rather than handed to `snprintf`, which has no conversion that takes a code
+ * point.
+ */
+printc(ch: char)
+    var buf: [4]u8
+
+    putbytes(buf[0..<encode_utf8(ch, buf[0..<4])])

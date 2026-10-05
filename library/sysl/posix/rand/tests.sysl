@@ -1,0 +1,81 @@
+module sysl.posix.rand
+@requires(posix)
+@tests
+
+// What `sysl.posix.rand` claims, asserted in sysl.
+//
+// **Randomness is the awkward thing to test**, and what is honestly assertable is narrower than it
+// looks: that the call succeeded, that it wrote where it was told and nowhere else, and that two
+// draws differ. Nothing here asserts a distribution -- a test that did would be a test of the
+// kernel's pool, which is not this package's to make claims about.
+// -- seed_from_os ----------------------------------------------------------------------------------
+
+// This module had no test file at all until `entropy_from_os` needed one, so `seed_from_os` was
+// covered by nothing. It is one line to say what it promises.
+@test("a seed is answered, and two of them differ")
+seed_is_answered()
+    val a = seed_from_os()
+    val b = seed_from_os()
+
+    assert(a.is_some(), "the host supplies a seed")
+    assert(b.is_some())
+    assert(a.unwrap() != b.unwrap(), "two 64-bit seeds collide with probability 2^-64")
+end seed_is_answered
+
+// -- entropy_from_os -------------------------------------------------------------------------------
+
+// What can honestly be asserted about randomness is that the call succeeded, that it wrote where it
+// was told and nowhere else, and that two draws differ. The last is probabilistic and the odds are
+// what make it worth having: two independent 32-byte draws colliding is 2^-256, so a failure is a
+// generator that is not one rather than bad luck.
+@test("entropy fills the slice it was given and nothing around it")
+entropy_fills_exactly()
+    var buf: [40]u8 = [0; 40]
+
+    assert(entropy_from_os(buf[4..<36]), "the host supplies entropy")
+
+    for i in 0..<4
+        assert_eq(buf[i], 0, "nothing before the slice was written")
+
+    for i in 36..<40
+        assert_eq(buf[i], 0, "nothing after the slice was written")
+end entropy_fills_exactly
+
+@test("two draws differ, which is the whole claim")
+entropy_differs()
+    var a: [32]u8 = [0; 32]
+    var b: [32]u8 = [0; 32]
+
+    assert(entropy_from_os(a))
+    assert(entropy_from_os(b))
+    assert(a != b, "two 32-byte draws collide with probability 2^-256")
+end entropy_differs
+
+// The loop is what this is for: 256 is `getentropy`'s per-call limit, so a longer slice takes
+// several calls and the seam between them is where a hand-rolled version goes wrong.
+@test("a slice past getentropy's 256-byte limit is filled by looping")
+entropy_loops_past_the_limit()
+    var big: [700]u8 = [0; 700]
+
+    assert(entropy_from_os(big[..]))
+
+    // **The TAIL is what says the loop ran more than once**, and a window across the first seam is
+    // not: a version that fills only the first 256 bytes leaves the six bytes after the boundary
+    // zero and the six before it random, which any threshold loose enough to allow real randomness
+    // also allows. Checked by breaking the loop on purpose — the seam version stayed green.
+    //
+    // The last 64 bytes are past two seams. Filled, about a quarter of one byte in them is zero;
+    // unfilled, all 64 are, so 32 is a threshold nothing but a broken loop reaches.
+    var zeros: usize = 0
+
+    for i in 636..<700
+        if big[i] == 0 then zeros += 1
+
+    assert(zeros < 32, "the last 64 bytes are past two seams and were written")
+end entropy_loops_past_the_limit
+
+@test("an empty slice is filled successfully, which is what no bytes means")
+entropy_of_nothing()
+    var none: [0]u8 = []
+
+    assert(entropy_from_os(none[..]))

@@ -8,15 +8,29 @@ remains the reference: the two are checked against the same programs, and where 
 bootstrap decides until this one has earned the last word. The language is specified at
 [sysl.sh](https://sysl.sh), and nothing here changes it.
 
+## The layout
+
+| directory | what it holds |
+|---|---|
+| `compiler/` | the compiler: its `package.hocon`, `sysl.sum` and the module `sh.sysl.compiler` |
+| `library/` | the standard library, the tree whose root module is `sysl` |
+| `scripts/` | the censuses that compare this compiler with the reference |
+
+The compiler is a project of its own in `compiler/` because a compiler reads every `.sysl` file
+under a project's root as part of that project, and the library's modules are not the compiler's.
+
 ## Building
 
 ```
-sysl build .
-sysl test .
+cd compiler
+SYSL_LIB=../library sysl build .
+SYSL_LIB=../library sysl test .
 ```
 
 Both commands are the bootstrap compiler's, installed with `brew install sysl-lang/tap/sysl`. The
-first produces `./sysl`; the second runs every `@test` in the tree.
+first produces `compiler/sysl`; the second runs every `@test` in the tree. `SYSL_LIB` names the
+library the compiler under test compiles programs against; the standard library's own suite is
+`SYSL_LIB=../library ./sysl test ../library --std`.
 
 ## The road to self-hosting
 
@@ -27,7 +41,7 @@ first produces `./sysl`; the second runs every `@test` in the tree.
    `Newline`, `Indent` and `Dedent`, so that nothing above it ever looks at a column; `parse.sysl`
    and the files beside it read a whole file — every expression, type and pattern, every statement,
    every declaration, the header, the annotations, and a literate `.lsysl` document. It is checked
-   against every file of this compiler's own source, of the bootstrap's library, and of the parsing
+   against every file of this compiler's own source, of the standard library, and of the parsing
    package it is built on.
 3. Analysis, then LLVM emission, phase by phase against the suite.
 4. This compiler builds itself, and the compiler it builds builds the same thing again.

@@ -1,0 +1,397 @@
+module sysl
+
+/** The core trait catalog (`library/core.md § What is in it`).
+ *
+ * These are ordinary trait declarations. A program can read them, and can call their methods by
+ * name -- `5.add(3)` is exactly `5 + 3` -- because what makes them an *operator* catalog is not
+ * anything written here. The compiler adds the identity: which operator token means which trait,
+ * and which built-in types are members. That part cannot be written in sysl at all, because the
+ * open `iN` / `uN` families have no finite list of scalars an `impl` could be written for.
+ *
+ * **Each trait requires exactly one method**, and that is the point. Implementing a comparison
+ * means writing `lt` and nothing else, so there is no way for four functions to disagree with each
+ * other: `a > b` is `lt(b, a)`, `a <= b` is `!lt(b, a)`, and the compiler derives the rest.
+ *
+ * The ten binary traits take `[Rhs = Self, Out = Self]` so that an implementation may accept an
+ * operand of another type and yield a third, while the overwhelmingly common case -- a type closed
+ * under its own operator -- writes neither argument. A use writes neither either: `a * b` fixes the
+ * operands and asks to be told the result, so the operands select the implementation and the result
+ * is whatever that one supplies.
+ */
+
+trait Add[Rhs = Self, Out = Self]
+    add(self, rhs: Rhs) -> Out
+
+trait Sub[Rhs = Self, Out = Self]
+    sub(self, rhs: Rhs) -> Out
+
+trait Mul[Rhs = Self, Out = Self]
+    mul(self, rhs: Rhs) -> Out
+
+trait Div[Rhs = Self, Out = Self]
+    div(self, rhs: Rhs) -> Out
+
+trait Rem[Rhs = Self, Out = Self]
+    rem(self, rhs: Rhs) -> Out
+
+trait BitAnd[Rhs = Self, Out = Self]
+    bitand(self, rhs: Rhs) -> Out
+
+trait BitOr[Rhs = Self, Out = Self]
+    bitor(self, rhs: Rhs) -> Out
+
+trait BitXor[Rhs = Self, Out = Self]
+    bitxor(self, rhs: Rhs) -> Out
+
+trait Shl[Rhs = Self, Out = Self]
+    shl(self, rhs: Rhs) -> Out
+
+trait Shr[Rhs = Self, Out = Self]
+    shr(self, rhs: Rhs) -> Out
+
+trait Neg
+    neg(self) -> Self
+
+trait Not
+    not(self) -> Self
+
+trait Eq
+    eq(self, rhs: Self) -> bool
+
+trait Ord
+    lt(self, rhs: Self) -> bool
+
+// A tuple is comparable, hashable and printable exactly when its parts are, which is what these
+// rows say: the membership is *structural*, so nothing has to be written per tuple type.
+//
+// One block each, at every arity, because a tuple's parts are a **type pack**
+// (`reference/generics.md § A parameter may stand for a list of types`) and the loop that walks
+// them is unrolled -- so `self.i` is an ordinary part selection at whatever type that part has, and
+// one written line covers all of them. These were eight blocks over `(A, B)` and `(A, B, C)` before
+// the pack existed, and a tuple of four parts implemented none of them.
+
+impl[..A: Eq] Eq for (..A)
+    eq(self, rhs: Self) -> bool
+        for const i in 0..<A.len
+            if self.i != rhs.i then return false
+
+        true
+
+/** Lexicographic, and written as a ladder rather than as `<` on each part in turn because deciding a
+ * position takes *two* comparisons: this one is less, or it is greater, or the two agree and the
+ * next position decides. Every position runs the same ladder and all-tied ends `false` -- a tuple is
+ * not less than one it agrees with everywhere. Written per arity this needed a last position that
+ * ended with a bare `<`, having no next position to fall through to; the loop has no such case.
+ */
+impl[..A: Ord] Ord for (..A)
+    lt(self, rhs: Self) -> bool
+        for const i in 0..<A.len
+            if self.i < rhs.i then return true
+            if rhs.i < self.i then return false
+
+        false
+    end lt
+
+/** Mixed with the same FNV prime the string hash uses, so that the parts' order matters -- `(1, 2)`
+ * and `(2, 1)` are different keys, and a plain XOR would make them the same one. The fold starts at
+ * the FNV offset basis rather than at the first part's hash, which is what lets one loop cover every
+ * arity rather than treating the first position as the seed.
+ */
+impl[..A: Hash] Hash for (..A)
+    hash(self) -> u64
+        var h = 0xcbf29ce484222325u64
+
+        for const i in 0..<A.len
+            h = h * 0x100000001b3u64 ^ self.i.hash()
+
+        hash_u64(h)
+    end hash
+
+/** The elements between brackets, written straight through to wherever they are going. Each element
+ * gets a plain specifier, because the field a specifier describes is the whole tuple and not its
+ * parts (`library/core.md § A specifier is the whole value's field`).
+ */
+private render_tuple[..A: Display](t: (..A), out: *Writer, parts: FormatSpec)
+    out.write("(".bytes)
+
+    for const i in 0..<A.len
+        if i > 0 then out.write(", ".bytes)
+
+        t.i.display(out, parts)
+
+    out.write(")".bytes)
+end render_tuple
+
+/** Rendered as one field: a specifier describes the field the *whole* value occupies
+ * (`library/core.md § A specifier is the whole value's field`), so `%8s` on a pair pads the pair and
+ * not its first element.
+ *
+ * **It is measured rather than gathered**, which is what a compound rendering costs when it is done
+ * the obvious way: building the text first meant one string per element plus one per separator, all
+ * of them thrown away as soon as they were written. Running the same writes into a `Counting` sink
+ * answers the same question and stores nothing, and the sink is built only where a width was asked
+ * for -- so an ordinary print of a tuple costs one pass and allocates nothing at all.
+ */
+impl[..A: Display] Display for (..A)
+    display(self, out: *Writer, fmt: FormatSpec)
+        val parts = FormatSpec(0, -1, false)
+        var pad = 0
+
+        if fmt.width > 0
+            var count = Counting(0)
+            var sink: *Writer = &count
+
+            render_tuple(self, sink, parts)
+            pad = fmt.width - int(count.n)
+
+            if pad < 0 then pad = 0
+
+        if !fmt.left then display_fill(out, 32, pad)
+
+        render_tuple(self, out, parts)
+
+        if fmt.left then display_fill(out, 32, pad)
+    end display
+
+/** A sink that keeps the length of what it was given and drops the bytes, which is how a value made
+ * of parts honours a width without gathering: the parts are rendered twice and stored nowhere,
+ * rather than once into a buffer that has to be allocated. `sysl` cannot reach `sysl.buf` -- that
+ * module is built on this one -- so a growable buffer is not available here even if one were wanted.
+ *
+ * **Public, because the problem it answers is not the library's.** A specifier describes the field
+ * the *whole* value occupies (`library/core.md § A specifier is the whole value's field`), so any
+ * `Display` rendering more than one part has to know how wide the whole came out before it can pad
+ * once -- and an implementation written outside `sysl` had nowhere to measure into but a buffer.
+ * `[]T`, `Option`, `Result`, `Complex[F]` and the tuple above all honour a width this way, from five
+ * separate files -- and so does **every derived `Display`**, which the compiler writes in this shape
+ * (`reference/traits.md § The compiler writes four of them`).
+ */
+struct Counting
+    n: usize
+
+impl Fallible for Counting
+
+impl Writer for Counting
+    write(*self, bytes: []const u8)
+        self.n = self.n + bytes.len
+
+/** Same length, same elements, same order -- which is the equality a sequence has when its elements
+ * have one, and the reason it is written here rather than left to each caller.
+ *
+ * `sysl.slices.equal` answers the same question and stays: it is a free function over `[]const T`
+ * for a caller that has one, and the module it lives in is `@no_alloc` and reachable from a
+ * freestanding target. What the block adds is `==` itself, and with it every generic bounded by
+ * `Eq` -- `assert_eq` above all, which is where the absence was found, since a bare `bool` says a
+ * comparison failed and neither of the two sequences that disagreed.
+ *
+ * The length test comes first, so the common refusal costs nothing.
+ */
+impl[T: Eq] Eq for []T
+    eq(self, rhs: Self) -> bool
+        if self.len != rhs.len then return false
+
+        for i in 0..<self.len
+            if self[i] != rhs[i] then return false
+
+        true
+    end eq
+
+/** Every array of an equatable element, at every length -- the whole-array view is the elements a
+ * slice would have walked, so this is a delegation rather than a second copy of the loop, exactly as
+ * `Display for [N]T` delegates to `Display for []T`.
+ */
+impl[const N: usize, T: Eq] Eq for [N]T
+    eq(self, rhs: Self) -> bool = self[..] == rhs[..]
+
+/** Lexicographic, first element first, and a shorter sequence ordering before a longer one it is a
+ * prefix of -- which is the rule a string already follows and the one a tuple's `Ord` follows over
+ * its parts.
+ *
+ * The ladder is the tuple's and is written for the same reason: deciding a position takes **two**
+ * comparisons, since this one is less, or it is greater, or the two agree and the next position
+ * decides. All-tied then falls through to the lengths, so `[1, 2]` is less than `[1, 2, 3]` and two
+ * equal sequences are not less than each other.
+ */
+impl[T: Ord] Ord for []T
+    lt(self, rhs: Self) -> bool
+        val n = if self.len < rhs.len then self.len else rhs.len
+
+        for i in 0..<n
+            if self[i] < rhs[i] then return true
+            if rhs[i] < self[i] then return false
+
+        self.len < rhs.len
+    end lt
+
+/** Every array of an orderable element, delegating to the slice exactly as `Eq` does. Two arrays of
+ * one type have one length, so the length test the slice ends on can never decide here.
+ */
+impl[const N: usize, T: Ord] Ord for [N]T
+    lt(self, rhs: Self) -> bool = self[..] < rhs[..]
+
+/** Mixed with the same FNV prime the tuple's hash uses, so that position matters: `[1, 2]` and
+ * `[2, 1]` are different keys, where a plain XOR would make them one.
+ *
+ * **An array is hashable and a SLICE IS NOT, which is a decision rather than an omission.** A hash
+ * is a promise about a key, and a slice is a view: putting one in a table leaves the storage behind
+ * it reachable and writable by whoever owns it, so the key can change under the table and the entry
+ * is then unfindable. An array is a value and copies, so it has no such owner to be surprised by.
+ * A caller holding a slice it means as a key hashes something it owns -- a `string`, or an array
+ * built from the elements.
+ */
+impl[const N: usize, T: Hash] Hash for [N]T
+    hash(self) -> u64
+        val xs = self[..]
+
+        var h = 0xcbf29ce484222325u64
+
+        for i in 0..<xs.len
+            h = h * 0x100000001b3u64 ^ xs[i].hash()
+
+        hash_u64(h)
+    end hash
+
+/** The elements between brackets, written straight through to wherever they are going. Each element
+ * gets a plain specifier, because the field a specifier describes is the whole slice and not its
+ * parts (`library/core.md § A specifier is the whole value's field`).
+ */
+private render_slice[T: Display](xs: []const T, out: *Writer)
+    out.write("[".bytes)
+
+    for i in 0..<xs.len
+        if i > 0 then out.write(", ".bytes)
+
+        xs[i].display(out, FormatSpec(0, -1, false))
+
+    out.write("]".bytes)
+end render_slice
+
+impl[T: Display] Display for []T
+    display(self, out: *Writer, fmt: FormatSpec)
+        var pad = 0
+
+        // Measured only when a width was asked for, so the ordinary print costs one pass.
+        if fmt.width > 0
+            var count = Counting(0)
+            var sink: *Writer = &count
+
+            render_slice(self, sink)
+            pad = fmt.width - int(count.n)
+
+            if pad < 0 then pad = 0
+
+        if !fmt.left then display_fill(out, 32, pad)
+
+        render_slice(self, out)
+
+        if fmt.left then display_fill(out, 32, pad)
+    end display
+end []T
+
+/** Every array of a printable element, at every length -- one block, because a length is a value
+ * parameter (`reference/generics.md § A parameter may stand for a value`) and so an argument to the
+ * shape rather than part of it. Before that, one `impl` per length was the only way to write this
+ * and no library could write them all.
+ *
+ * The whole-array view is the elements a slice would have walked, so `Display for []T` renders it
+ * and this one is a delegation rather than a second copy of the padding.
+ */
+impl[const N: usize, T: Display] Display for [N]T
+    display(self, out: *Writer, fmt: FormatSpec) = self[..].display(out, fmt)
+
+// -- The identities of the two operators above -------------------------------------------------------
+//
+// **A generic body cannot spell a zero.** `0` and `0.0` are literals of particular types, so a
+// routine bounded by `[T: Add]` has an addition and nothing to start an accumulator at, and one
+// bounded by `[T: Mul]` has a multiplication and nothing to start a product at. That is the whole of
+// what these two say, and `sysl.math.Float` had been making the argument for them since it was
+// written: *"a signum needs a one to answer with and a reciprocal needs a one to divide, and neither
+// can be written in a body shared by two widths unless there is a way to ask a type for its own
+// one."* The reasoning never stopped at floats, so the two members left `Float` and became the
+// traits they always were.
+//
+// **They are here, in the standard module, and that is not a filing decision.** A trait outside it
+// is reachable only where a file has named it (`reference/traits.md § Reaching a member through its
+// trait`), so declaring these in `sysl.math` would mean every caller of `real.zero()` gaining an
+// import — including ones that never mention the trait, because a member moved out of a type and
+// into a trait is reached through that trait. Beside the operators whose identities they are, they
+// cost a reader nothing and a program no import.
+//
+// **Two traits rather than one**, because a sum wants `Add + Zero` and a product wants `Mul + One`:
+// splitting them is what lets a bound ask for exactly what its body uses, where a `Ring` naming both
+// would make every accumulator claim a multiplication it never performs.
+//
+// **Both members have no receiver**: there is no value of `T` to hand a `zero()` before the
+// accumulator exists, which is the entire situation. So they are reached through the type —
+// `T.zero()` in a generic body, `real.zero()` at a concrete one.
+//
+// **The integers are compiler-provided, and there is no block below for them.** An `impl` can only
+// name types that exist and the `iN`/`uN` families are **open** — a program may write `u256` and get
+// an integer no library file listed — so integer membership is not something a block can supply
+// however long the list is. It is the argument `Signed` and `Bits` are compiler-provided for, and it
+// is the same answer: every integer type is a member of both, and `T.zero()` at one lowers to the
+// literal rather than to a call. So `[T: Add + Zero]` takes an `int` and a `u256` beside the `real`,
+// the `f32` and the `Complex` the blocks below cover.
+//
+// **A constrained subtype is deliberately not a member**, which is the one place this parts company
+// with `Signed` and `Bits`. Those promise an operation, and `reference/errors.md § A derivation
+// inherits its base's behaviour` gives a subtype its base's operations; these promise a **value**,
+// and a range written to exclude zero does not have one.
+//
+// **What it cost to get, since the next member of this shape will want to know**: a provided
+// membership used to have to be a method with a **receiver**, lowered from the value it was called
+// on, and a `zero()` has no value to lower from. A receiverless one is reached through the type
+// instead, and what it lowers to is stated in the compiler rather than read off anything.
+
+/** The value `x + zero() == x` holds for. */
+trait Zero
+    zero() -> Self
+
+/** A value of one type built from a value of another, without either type being changed to know
+  * about the other (`reference/errors.md § A ? converts through From`).
+  *
+  * **It is what `?` converts through.** A function returning `Result[T, Fault]` may write `?` on a
+  * call returning `Result[U, Io]` exactly when `Fault` implements `From[Io]`, so the two layers of
+  * error type are joined once, in the block that says how, rather than at every call that crosses
+  * between them. Nothing else in the language reads it; a program may implement and call it for its
+  * own conversions like any other trait.
+  *
+  * **The parameter is the SOURCE and `Self` is the destination**, which is the direction that lets a
+  * type accept conversions from types it does not own: `impl From[Io] for Fault` is written where
+  * `Fault` is, and `Io` need never have heard of it. Written the other way round the block would
+  * have to live with the source, and the orphan rule would put every conversion in whichever module
+  * lost the argument.
+  *
+  * A type may implement it several times over — `From[int]` and `From[real]` for one type are two
+  * blocks — and a call says which it means by the argument it wrote.
+  */
+trait From[T]
+    from(value: T) -> Self
+
+/** The value `x * one() == x` holds for. */
+trait One
+    one() -> Self
+
+impl Zero for real
+    zero() -> real = 0.0
+
+impl One for real
+    one() -> real = 1.0
+
+impl Zero for f32
+    zero() -> f32 = 0.0f32
+
+impl One for f32
+    one() -> f32 = 1.0f32
+
+impl Zero for f16
+    zero() -> f16 = 0.0f16
+
+impl One for f16
+    one() -> f16 = 1.0f16
+
+impl Zero for bf16
+    zero() -> bf16 = 0.0bf16
+
+impl One for bf16
+    one() -> bf16 = 1.0bf16

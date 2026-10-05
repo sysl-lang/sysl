@@ -1,0 +1,262 @@
+module sysl.posix.time
+@requires(posix)
+@tests
+
+import sysl.time.{Resolution, parse_timestamp, since, whole_micros, whole_millis, millis, micros}
+import sysl.time.tzif.{parse, offset_at, is_dst_at}
+
+// What `sysl.posix.time` claims, asserted in sysl.
+//
+// **These were the only check on the two clock ids and on the `struct timespec` mirror, and there is
+// now neither.** Both moved into a shim beside the module, where the header answers for them, so
+// what these assert is no longer a transcription somebody typed but a shim that has to compile,
+// link, and mean what it says. That is a weaker thing to get wrong and a stronger thing to test:
+// there is no longer any way for the *numbers* to be wrong on a platform nobody ran on.
+//
+// They stay in sysl rather than moving to Scala, and the reason is unchanged: `StdSelfTests` compiles
+// this tree on the development machine and again on CI's Linux runner, where `CLOCK_MONOTONIC` is a
+// different number and where this machine cannot read a header. A shim is compiled per target too,
+// so the thing being checked still differs between the two runs.
+//
+// Every assertion below is written to survive a slow machine and a loaded one. Nothing here asserts
+// an upper bound on how long anything took.
+
+const us_per_second: long = 1000000
+
+// 2020-01-01T00:00:00Z and 2100-01-01T00:00:00Z, in microseconds from 1970. Wide enough that no
+// clock a person would tolerate falls outside, and narrow enough that a reading which is not a wall
+// clock at all cannot land inside by accident.
+const after_2020: long = 1577836800 * us_per_second
+const before_2100: long = 4102444800 * us_per_second
+
+// Something the optimizer cannot fold to a closed form, so that measurable time actually passes. A
+// running sum is not enough: `n += i` over a range is Gauss's formula and LLVM knows it, which cost
+// a confusing `elapsed 0us` while this module was being written.
+private churn(rounds: int) -> long
+    var n: long = 1
+
+    for i in 0..<rounds
+        n = n * 31 + long(i)
+
+    n
+end churn
+
+@test("the wall clock reads a plausible date, which is what says the shim reads the right clock")
+wall_clock_is_a_date()
+    val us = now().us
+
+    // A shim reading the wrong clock lands here: `CLOCK_MONOTONIC` counts from boot, so it is a few
+    // days rather than fifty-odd years and falls below the lower bound. So does one that scales
+    // wrongly on the way out -- nanoseconds handed back as microseconds are a thousand times too
+    // large, and seconds alone a million times too small.
+    assert(us > after_2020, "the wall clock reads before 2020")
+    assert(us < before_2100, "the wall clock reads after 2100")
+end wall_clock_is_a_date
+
+@test("the monotonic clock is not the wall clock, which is the other half of the same mistake")
+monotonic_is_not_the_wall_clock()
+    // Uptime, not a date. This fails if the shim's two clocks are swapped and the test above somehow
+    // did not,
+    // and it is the assertion that would still be here if `now` were ever removed.
+    assert(monotonic().us < after_2020, "the monotonic clock reads like a date, not an uptime")
+
+@test("the monotonic clock advances over work, and never backwards over any of it")
+monotonic_advances()
+    val a = monotonic()
+
+    val work = churn(2000000)
+
+    val b = monotonic()
+
+    // The whole point of the type: `b - a` is a `Duration` and the compiler would refuse it as an
+    // `Instant`, which is what stops a measurement being mistaken for a timestamp.
+    val elapsed = b - a
+
+    assert(elapsed.us >= 0, "the monotonic clock went backwards")
+    assert(elapsed.us > 0, "two million rounds took under a microsecond")
+
+    // So the loop cannot be discarded as dead, which would take the measurement with it.
+    assert(work != 0)
+end monotonic_advances
+
+@test("reading it twice in a row never goes backwards, however close together the two are")
+monotonic_never_retreats()
+    var last = monotonic()
+
+    for i in 0..<1000
+        val next = monotonic()
+
+        assert((next - last).us >= 0, "the monotonic clock went backwards between two reads")
+
+        last = next
+end monotonic_never_retreats
+
+@test("the wall clock advances, which says it is being read rather than remembered")
+wall_clock_advances()
+    val a = now()
+
+    val work = churn(2000000)
+
+    // `since` rather than `-` for the same reason it exists: it says which end is which.
+    val elapsed = since(now(), a)
+
+    assert(elapsed.us > 0, "the wall clock did not move over two million rounds")
+    assert(work != 0)
+end wall_clock_advances
+
+// -- the host's zone --------------------------------------------------------------------------------
+//
+// **Nothing here may assume which zone the machine is set to**, since this tree is compiled and run
+// on the development machine and again on CI's Linux runner, and `TZ` may be anything or unset. So
+// every assertion below is an invariant that holds in every zone -- which is the stronger kind
+// anyway: a test asserting `-05:00` would pass in one place and fail in the next without either
+// being wrong.
+
+@test("the host's offset from UTC is one a zone could actually have")
+local_offset_is_plausible()
+    val m = local_offset(now()).minutes
+
+    // -12:00 to +14:00 is the whole range the database uses. A shim answering seconds rather than
+    // minutes lands far outside it, and so does one reading an uninitialized `struct tm`.
+    assert(m >= -720, "the host is set more than twelve hours behind UTC")
+    assert(m <= 840, "the host is set more than fourteen hours ahead of UTC")
+end local_offset_is_plausible
+
+@test("the host's own wall clock reading resolves back to the instant it came from")
+local_round_trips()
+    val t = now()
+
+    // A reading taken *from* an instant is one the clocks did show, so a gap is unreachable here and
+    // asserting so is what would catch a `resolve` that had the two candidates backwards.
+    from_local(local(t)) match
+        Unique(at) -> assert(at == t, "the host's reading resolved to a different instant")
+        Ambiguous(earlier, later) ->
+            assert(earlier == t || later == t, "neither instant of the repeated hour was the original")
+        Gap(before, after) -> assert(false, "an instant produced a reading no clock ever showed")
+end local_round_trips
+
+@test("a local timestamp is read back as the instant it was written from")
+local_text_round_trips()
+    val t = now()
+
+    // Through the renderer and the parser, which is the pair a program actually uses -- and the one
+    // place the offset this module computes has to agree with the offset `timestamp_text` writes.
+    parse_timestamp(local_text(t)) match
+        Ok(back) -> assert(back == t, "a local timestamp did not read back as itself")
+        Err(e) -> assert(false, f"a local timestamp would not parse: $e%s")
+end local_text_round_trips
+
+@test("the offset is a property of the instant, not of when it was asked")
+local_offset_is_stable()
+    val t = now()
+
+    val a = local_offset(t)
+    val work = churn(100000)
+    val b = local_offset(t)
+
+    assert(a == b, "the same instant gave two different offsets")
+    assert(work != 0)
+end local_offset_is_stable
+
+// -- the zone database ------------------------------------------------------------------------------
+//
+// **A machine may not have one, and that is not a failure of this module.** The database is a
+// package rather than part of the operating system, so a minimal container has none — and the
+// decoder's own tests carry their zone as bytes precisely so they never depend on it. What these add
+// is the half those cannot reach: that the path is built correctly and that a real file, written by
+// somebody else and changing several times a year, decodes.
+
+@test("a zone read off the host decodes, where the host has a database at all")
+zone_database_decodes()
+    // `UTC` is the one name every distribution of the database carries.
+    zone_data("UTC") match
+        Ok(d) ->
+            val z = parse(d[..]).unwrap()
+
+            // Whatever else UTC has done, it has never been set away from zero.
+            assert_eq(offset_at(z, now()).unwrap().minutes, 0)
+            assert(!is_dst_at(z, now()).unwrap(), "UTC reported daylight saving")
+        Err(e) -> ()
+end zone_database_decodes
+
+@test("the host's own zone file decodes, and agrees with the offset libc reports")
+local_zone_agrees_with_libc()
+    // The strongest assertion available here, and the only one that checks the two halves of this
+    // module against each other: `local_offset` asks the C library and `local_zone_data` reads the
+    // file it is reading, so a decoder that mis-parsed the table would disagree with `localtime_r`
+    // about the very same instant.
+    local_zone_data() match
+        Ok(d) ->
+            val z = parse(d[..]).unwrap()
+            val t = now()
+
+            assert_eq(offset_at(z, t).unwrap().minutes, local_offset(t).minutes)
+        Err(e) -> ()
+end local_zone_agrees_with_libc
+
+// ## Waiting
+//
+// **The clock is the oracle, because a wait can only be checked against one.** Every assertion here
+// is a lower bound plus a generous upper one: a machine under load may sleep far longer than it was
+// asked, and a test that pinned an upper bound tightly would be a test that reddens when something
+// else is busy rather than when this is wrong.
+
+@test("a sleep takes at least as long as it was asked for")
+sleep_waits()
+    val t0 = monotonic()
+
+    sleep(millis(50))
+
+    val took = monotonic() - t0
+
+    // **The lower bound is the whole claim.** A `nanosleep` whose remainder was dropped returns
+    // early, and this is what notices -- the wait still *happens*, so nothing else would.
+    assert(whole_millis(took) >= 50, s"slept ${whole_millis(took)}ms, wanted at least 50")
+
+    // Loose, and deliberately: it is here to catch a unit error of a thousand, not to police the
+    // scheduler. A microseconds-for-nanoseconds slip would land at 50 microseconds or at 50 seconds.
+    assert(whole_millis(took) < 5000, s"slept ${whole_millis(took)}ms, which is not 50ms late")
+
+@test("a sleep of zero or of a negative duration returns at once")
+sleep_zero()
+    val t0 = monotonic()
+
+    sleep(millis(0))
+    sleep(micros(-1000))
+
+    assert(whole_millis(monotonic() - t0) < 1000)
+
+@test("nanosleep answers zero when nothing interrupted it")
+nanosleep_completes()
+    // **Zero is the whole point of the return value**: it is what a caller's retry loop tests, so a
+    // shim that answered the elapsed time instead would loop forever and this is what says so.
+    assert_eq(nanosleep(2000000), 0)
+
+@test("nanosleep waits, and it waits in NANOseconds")
+nanosleep_unit()
+    val t0 = monotonic()
+
+    nanosleep(30000000)
+
+    val took = whole_millis(monotonic() - t0)
+
+    // 30,000,000ns is 30ms. Read as microseconds it would be 30 seconds, and as milliseconds it
+    // would be eight hours -- so the upper bound is what pins the unit, and it is the only place
+    // in this file where an upper bound is doing real work.
+    assert(took >= 30, s"waited ${took}ms, wanted at least 30")
+    assert(took < 3000, s"waited ${took}ms — that is not nanoseconds")
+
+@test("nanosleep of zero or less returns at once and answers zero")
+nanosleep_zero()
+    assert_eq(nanosleep(0), 0)
+    assert_eq(nanosleep(-5), 0)
+
+@test("sleep reaches a resolution finer than a millisecond")
+sleep_sub_milli()
+    val t0 = monotonic()
+
+    sleep(micros(1500))
+
+    // The claim is that the argument is not being rounded to whole milliseconds on the way down --
+    // which a shim taking `usleep` or a millisecond count would do, and which no test above sees.
+    assert(whole_micros(monotonic() - t0) >= 1500)

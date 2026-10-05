@@ -11,7 +11,10 @@
 #
 #   scripts/own_tree_census.sh <this compiler's binary> [<reference binary>]
 #
-# `SYSL_LIB` must name the standard module's source, as it must for every whole-program sweep.
+# **Each compiler is run against its OWN library.** This compiler takes `SYSL_LIB`, defaulting to this
+# repository's `library/`; the reference takes `SYSL_ORACLE_LIB` where it is set and otherwise runs
+# with `SYSL_LIB` removed from its environment, so it finds the library installed beside it. The tree
+# lowered is `compiler/`, the compiler's own project.
 
 set -e
 
@@ -23,16 +26,25 @@ if [ -z "$ours_bin" ]; then
     exit 2
 fi
 
-if [ -z "$SYSL_LIB" ]; then
-    echo "SYSL_LIB must name the standard module's source" >&2
-    exit 2
-fi
-
 root=$(cd "$(dirname "$0")/.." && pwd)
+project=$root/compiler
 work=$(mktemp -d "${TMPDIR:-/tmp}/sysl-census.XXXXXX")
 
-( cd "$root" && "$theirs_bin" emit-llvm . ) > "$work/theirs.ll"
-( cd "$root" && "$ours_bin"   emit-llvm . ) > "$work/ours.ll"
+SYSL_LIB=$(cd "${SYSL_LIB:-$root/library}" && pwd)
+export SYSL_LIB
+
+case $ours_bin in
+    /*) ;;
+    *) ours_bin=$(cd "$(dirname "$ours_bin")" && pwd)/$(basename "$ours_bin") ;;
+esac
+
+if [ -n "$SYSL_ORACLE_LIB" ]; then
+    ( cd "$project" && SYSL_LIB=$SYSL_ORACLE_LIB "$theirs_bin" emit-llvm . ) > "$work/theirs.ll"
+else
+    ( cd "$project" && env -u SYSL_LIB "$theirs_bin" emit-llvm . ) > "$work/theirs.ll"
+fi
+
+( cd "$project" && "$ours_bin" emit-llvm . ) > "$work/ours.ll"
 
 echo "the reference: $work/theirs.ll"
 echo "this compiler: $work/ours.ll"

@@ -1,0 +1,177 @@
+module sysl.crypto
+@no_alloc
+
+import sysl.math.Bits
+
+// SHA-2: four digests, two compressions, one implementation.
+//
+// SHA-224 and SHA-256 are the same 32-bit compression started from different initial values and
+// truncated differently; SHA-384 and SHA-512 are the same 64-bit one. So the width is what a type
+// parameter carries, and the compression below is written once over the `Word` bound in
+// `words.sysl` — which is where everything that depends on how wide a word is lives: the round
+// count, the constant table and the four mixing functions.
+//
+// The buffering, the padding and the publication are not here at all: they are `Sha[C]` in
+// `hasher.sysl`, which SHA-1 shares.
+
+// One block into an eight-word state, for either width.
+//
+// The schedule is sized for the longer of the two round counts and only the first `rounds` entries
+// are ever read.
+private sha2_compress[T: Word](h: *[8]T, block: []const u8)
+    var wl = usize(T.width()) / 8
+    var n = T.word_rounds()
+    var w = [T.zero(); 80]
+
+    for i in 0..<16usize
+        var v = T.zero()
+
+        for j in 0..<wl do v = shift_in(v, block[i * wl + j])
+
+        w[i] = v
+
+    for i in 16..<n
+        w[i] = w[i - 16] + w[i - 15].ssig0() + w[i - 7] + w[i - 2].ssig1()
+
+    var a = h[0]
+    var b = h[1]
+    var c = h[2]
+    var d = h[3]
+    var e = h[4]
+    var f = h[5]
+    var g = h[6]
+    var t = h[7]
+
+    for i in 0..<n
+        var t1 = t + e.bsig1() + ch(e, f, g) + T.round_key(i) + w[i]
+        var t2 = a.bsig0() + maj(a, b, c)
+
+        t = g
+        g = f
+        f = e
+        e = d + t1
+        d = c
+        c = b
+        b = a
+        a = t1 + t2
+
+    h[0] += a
+    h[1] += b
+    h[2] += c
+    h[3] += d
+    h[4] += e
+    h[5] += f
+    h[6] += g
+    h[7] += t
+end sha2_compress
+
+// The two compressions, which are the one above at two widths.
+//
+// They carry no data, so they are empty structs closed by an `end` marker — which is what
+// distinguishes a deliberately empty body from one whose author forgot to indent it.
+private[crypto] struct Sha2Narrow
+end Sha2Narrow
+
+private[crypto] struct Sha2Wide
+end Sha2Wide
+
+impl Compression for Sha2Narrow
+    type W = u32
+
+    block_bytes() -> usize = 64
+    word_bytes() -> usize = 4
+
+    compress(h: *[8]u32, block: []const u8) = sha2_compress(h, block)
+
+impl Compression for Sha2Wide
+    type W = u64
+
+    block_bytes() -> usize = 128
+    word_bytes() -> usize = 8
+
+    compress(h: *[8]u64, block: []const u8) = sha2_compress(h, block)
+
+// A hasher for one of the four digests.
+//
+// **The genericity stops here, deliberately.** `Sha[C]` is one implementation serving every hash in
+// this module, and that is worth having — but it is a fact about how they are *written*, not
+// something a caller should have to know. A public generic would drag its bound into the public
+// surface with it, and `Compression` and `Word` declare names general enough that the standard
+// library claiming them would collide with the next program that wanted one. So the four widths are
+// four ordinary types, and the traits behind them are the module's own business.
+//
+// Each is `update` as often as you like, then `finish` into storage the caller owns. Copying a
+// hasher copies the hash in progress, so a common prefix can be hashed once and finished several
+// ways.
+struct Sha224
+    private[crypto] inner: Sha[Sha2Narrow]
+
+    update(*self, data: []const u8) = self.inner.update(data)
+    finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
+
+struct Sha256
+    private[crypto] inner: Sha[Sha2Narrow]
+
+    update(*self, data: []const u8) = self.inner.update(data)
+    finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
+
+struct Sha384
+    private[crypto] inner: Sha[Sha2Wide]
+
+    update(*self, data: []const u8) = self.inner.update(data)
+    finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
+
+struct Sha512
+    private[crypto] inner: Sha[Sha2Wide]
+
+    update(*self, data: []const u8) = self.inner.update(data)
+    finish(*self, digest: []u8) -> Result[unit, Fault] = self.inner.finish(digest)
+
+new_sha224() -> Sha224 = Sha224(started(iv224, 28))
+new_sha256() -> Sha256 = Sha256(started(iv256, 32))
+new_sha384() -> Sha384 = Sha384(started(iv384, 48))
+new_sha512() -> Sha512 = Sha512(started(iv512, 64))
+
+// The four digests, each answering the bytes it is defined to produce.
+//
+// **A digest is bytes, not text.** The guide program this came from ended every one of these in
+// `hex_string(…)`, which is right for something whose job is to print test vectors and wrong for a
+// library twice over: it builds a string, so it allocates and the module could not be used where
+// there is no allocator — which the `@no_alloc` in this file's header is now the compiler holding
+// it to; and a caller who wants the digest *as a digest* — to compare it, to sign
+// it, to key an HMAC with it — would have to parse the text back. Rendering is one call away and
+// composes, `hex_string(sha256(data))`, which is why this module imports nothing to do it.
+//
+// The length is in the type rather than in a field, so the array a caller receives is exactly the
+// digest and there is no partially-filled buffer to carry a length beside.
+sha224(data: []const u8) -> [28]u8
+    var s = new_sha224()
+    var out: [28]u8
+
+    s.update(data)
+    s.finish(out[0..<28]).expect("a digest buffer sized from the hasher itself")
+    out
+
+sha256(data: []const u8) -> [32]u8
+    var s = new_sha256()
+    var out: [32]u8
+
+    s.update(data)
+    s.finish(out[0..<32]).expect("a digest buffer sized from the hasher itself")
+    out
+
+sha384(data: []const u8) -> [48]u8
+    var s = new_sha384()
+    var out: [48]u8
+
+    s.update(data)
+    s.finish(out[0..<48]).expect("a digest buffer sized from the hasher itself")
+    out
+
+sha512(data: []const u8) -> [64]u8
+    var s = new_sha512()
+    var out: [64]u8
+
+    s.update(data)
+    s.finish(out[0..<64]).expect("a digest buffer sized from the hasher itself")
+    out

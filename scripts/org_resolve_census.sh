@@ -15,7 +15,9 @@
 #
 #   scripts/org_resolve_census.sh <this compiler's binary> [<reference binary>]
 #
-# `SYSL_LIB` must name the standard module's source, as it must for every whole-program sweep. The
+# **Each compiler is run against its OWN library.** This compiler takes `SYSL_LIB`, defaulting to this
+# repository's `library/`; the reference takes `SYSL_ORACLE_LIB` where it is set and otherwise runs
+# with `SYSL_LIB` removed from its environment, so it finds the library installed beside it. The
 # rows are printed as they are decided and the counts come last:
 #
 #   matched            both compilers answered, and the two texts are identical
@@ -33,9 +35,17 @@ if [ -z "$ours_bin" ]; then
     exit 2
 fi
 
-if [ -z "$SYSL_LIB" ]; then
-    echo "SYSL_LIB must name the standard module's source" >&2
-    exit 2
+root=$(cd "$(dirname "$0")/.." && pwd)
+
+# Made absolute, since every repository is read from a copy somewhere else.
+SYSL_LIB=$(cd "${SYSL_LIB:-$root/library}" && pwd)
+export SYSL_LIB
+
+# What `env` is handed in front of the reference: its own library named, or ours taken away.
+if [ -n "$SYSL_ORACLE_LIB" ]; then
+    theirs_env="SYSL_LIB=$SYSL_ORACLE_LIB"
+else
+    theirs_env="-u SYSL_LIB"
 fi
 
 case $ours_bin in
@@ -43,7 +53,6 @@ case $ours_bin in
     *) ours_bin=$(cd "$(dirname "$ours_bin")" && pwd)/$(basename "$ours_bin") ;;
 esac
 
-root=$(cd "$(dirname "$0")/.." && pwd)
 org=$(dirname "$root")
 work=$(mktemp -d "${TMPDIR:-/tmp}/sysl-org-census.XXXXXX")
 
@@ -80,7 +89,7 @@ for repo in "$org"/*/; do
         theirs_ok=0
         ours_ok=0
 
-        ( cd "$repo" && "$theirs_bin" $command . ) > "$theirs" 2> "$theirs.err" || theirs_ok=1
+        ( cd "$repo" && env $theirs_env "$theirs_bin" $command . ) > "$theirs" 2> "$theirs.err" || theirs_ok=1
         ( cd "$repo" && "$ours_bin" $command . ) > "$ours" 2> "$ours.err" || ours_ok=1
 
 

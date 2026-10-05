@@ -1,0 +1,499 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.path.{is_absolute, join}
+
+// The tree operations, the working directory, and the two whole-file calls that were missing.
+
+private ignore(r: Result[unit, IoError]) = ()
+
+private scratch(name: string) -> string
+    val dir = "/tmp/sysl-fs-dirs-" + name
+
+    ignore(remove_dir_all(dir))
+    make_dir(dir).unwrap()
+    dir
+end scratch
+
+// -- make_dir_all ---------------------------------------------------------------------------------
+
+@test("a chain of directories is made from the topmost missing one down")
+make_dir_all_builds_a_chain()
+    val dir = scratch("chain")
+    val deep = join(dir, "a/b/c")
+
+    make_dir_all(deep).unwrap()
+
+    assert(is_dir(join(dir, "a")))
+    assert(is_dir(join(dir, "a/b")))
+    assert(is_dir(deep))
+
+    ignore(remove_dir_all(dir))
+end make_dir_all_builds_a_chain
+
+/** **The difference between this and a loop over `make_dir`**, and what every caller of it wanted:
+ * the question is "make sure this is there", so a directory that is already there is success rather
+ * than `AlreadyExists`.
+ */
+@test("a directory that is already there is success rather than an error")
+make_dir_all_is_idempotent()
+    val dir = scratch("again")
+
+    make_dir_all(join(dir, "x/y")).unwrap()
+    make_dir_all(join(dir, "x/y")).unwrap()
+    make_dir_all(dir).unwrap()
+
+    assert(is_dir(join(dir, "x/y")))
+
+    ignore(remove_dir_all(dir))
+end make_dir_all_is_idempotent
+
+@test("a component that exists and is not a directory is reported rather than accepted")
+make_dir_all_over_a_file()
+    val dir = scratch("overfile")
+
+    write_text(join(dir, "f"), "x").unwrap()
+
+    make_dir_all(join(dir, "f/below")) match
+        Ok(_) -> assert(false, "making a directory under a file answered")
+        Err(_) -> ()
+
+    ignore(remove_dir_all(dir))
+end make_dir_all_over_a_file
+
+// -- remove_dir_all -------------------------------------------------------------------------------
+
+@test("a tree is removed with everything under it")
+remove_dir_all_empties_a_tree()
+    val dir = scratch("tree")
+
+    make_dir_all(join(dir, "a/b")).unwrap()
+    write_text(join(dir, "a/one"), "1").unwrap()
+    write_text(join(dir, "a/b/two"), "2").unwrap()
+    write_text(join(dir, "top"), "3").unwrap()
+
+    remove_dir_all(dir).unwrap()
+
+    assert(!exists(dir))
+end remove_dir_all_empties_a_tree
+
+@test("a path that is not there is success, so a teardown after a failure need not know how far it got")
+remove_dir_all_of_nothing()
+    remove_dir_all("/tmp/sysl-fs-dirs-never-existed").unwrap()
+
+@test("a plain file is removed, so the call does not have to be told which it is")
+remove_dir_all_of_a_file()
+    val dir = scratch("justafile")
+    val path = join(dir, "f")
+
+    write_text(path, "x").unwrap()
+    remove_dir_all(path).unwrap()
+
+    assert(!exists(path))
+    assert(is_dir(dir))
+
+    ignore(remove_dir_all(dir))
+end remove_dir_all_of_a_file
+
+/** **The property that keeps this from deleting something it was never pointed at.** A link into a
+ * tree outside is unlinked rather than walked, so the tree at the other end survives -- which is why
+ * the walk tests `link_metadata` rather than `is_dir`, since `is_dir` follows.
+ */
+@test("a symbolic link is unlinked rather than followed")
+remove_dir_all_does_not_follow_a_link()
+    val keep = scratch("keep")
+    val dir = scratch("walk")
+
+    write_text(join(keep, "precious"), "still here").unwrap()
+    symlink(keep, join(dir, "elsewhere")).unwrap()
+
+    remove_dir_all(dir).unwrap()
+
+    assert(!exists(dir))
+    assert(is_dir(keep))
+    assert_eq(read_text(join(keep, "precious")).unwrap(), "still here")
+
+    ignore(remove_dir_all(keep))
+end remove_dir_all_does_not_follow_a_link
+
+// -- copy_file ------------------------------------------------------------------------------------
+
+// -- copy_dir_all ---------------------------------------------------------------------------------
+
+@test("a tree is copied with its structure and its bytes")
+copy_dir_all_copies_a_tree()
+    val dir = scratch("copytree")
+    val from = join(dir, "src")
+    val to = join(dir, "dst")
+
+    make_dir_all(join(from, "a/b")).unwrap()
+    write_text(join(from, "top"), "1").unwrap()
+    write_text(join(from, "a/mid"), "2").unwrap()
+    write_text(join(from, "a/b/deep"), "3").unwrap()
+
+    copy_dir_all(from, to).unwrap()
+
+    assert(is_dir(join(to, "a/b")))
+    assert_eq(read_text(join(to, "top")).unwrap(), "1")
+    assert_eq(read_text(join(to, "a/mid")).unwrap(), "2")
+    assert_eq(read_text(join(to, "a/b/deep")).unwrap(), "3")
+
+    ignore(remove_dir_all(dir))
+end copy_dir_all_copies_a_tree
+
+/** Where this differs from `copy_file`, which does not carry the mode: an executable copied with
+ * that one stops being executable, and a tree copy is how build inputs move.
+ */
+@test("permissions are carried, so an executable copies as an executable")
+copy_dir_all_carries_permissions()
+    val dir = scratch("copymode")
+    val from = join(dir, "src")
+    val to = join(dir, "dst")
+
+    make_dir_all(from).unwrap()
+    write_text(join(from, "run"), "#!/bin/sh\n").unwrap()
+    set_permissions(join(from, "run"), 0o755).unwrap()
+
+    copy_dir_all(from, to).unwrap()
+
+    assert_eq(metadata(join(to, "run")).unwrap().permissions(), 0o755)
+
+    ignore(remove_dir_all(dir))
+end copy_dir_all_carries_permissions
+
+/** The safe half of each question: a directory that is already there is merged into, and a file that
+ * is already there is reported rather than quietly replaced.
+ */
+@test("a directory is merged into and an existing file is refused")
+copy_dir_all_merges_and_refuses()
+    val dir = scratch("copymerge")
+    val from = join(dir, "src")
+    val to = join(dir, "dst")
+
+    make_dir_all(join(from, "shared")).unwrap()
+    write_text(join(from, "shared/new"), "n").unwrap()
+
+    make_dir_all(join(to, "shared")).unwrap()
+    write_text(join(to, "shared/old"), "o").unwrap()
+
+    copy_dir_all(from, to).unwrap()
+
+    assert_eq(read_text(join(to, "shared/new")).unwrap(), "n")
+    assert_eq(read_text(join(to, "shared/old")).unwrap(), "o")
+
+    copy_dir_all(from, to) match
+        Ok(_) -> assert(false, "copying over an existing file answered")
+        Err(e) -> assert_eq(e, AlreadyExists)
+
+    // The refusal changed nothing about what was already there.
+    assert_eq(read_text(join(to, "shared/new")).unwrap(), "n")
+
+    ignore(remove_dir_all(dir))
+end copy_dir_all_merges_and_refuses
+
+/** Copied *as a link*, pointing wherever it pointed -- which may be outside the tree and may be
+ * nothing at all. Following it instead would duplicate whatever it names and, for a link to an
+ * ancestor, would not terminate.
+ */
+@test("a symbolic link is copied as a link rather than as what it points at")
+copy_dir_all_copies_a_link()
+    val dir = scratch("copylink")
+    val from = join(dir, "src")
+    val to = join(dir, "dst")
+
+    make_dir_all(join(from, "real")).unwrap()
+    write_text(join(from, "real/f"), "x").unwrap()
+    symlink(join(from, "real"), join(from, "to_real")).unwrap()
+
+    copy_dir_all(from, to).unwrap()
+
+    assert(is_link(join(to, "to_real")), "the link was copied as something other than a link")
+    assert_eq(read_link(join(to, "to_real")).unwrap(), join(from, "real"))
+
+    ignore(remove_dir_all(dir))
+end copy_dir_all_copies_a_link
+
+@test("a source that is a plain file copies as one, mode and all")
+copy_dir_all_of_a_file()
+    val dir = scratch("copyone")
+    val from = join(dir, "only")
+    val to = join(dir, "copy")
+
+    write_text(from, "x").unwrap()
+    set_permissions(from, 0o600).unwrap()
+
+    copy_dir_all(from, to).unwrap()
+
+    assert_eq(read_text(to).unwrap(), "x")
+    assert_eq(metadata(to).unwrap().permissions(), 0o600)
+
+    ignore(remove_dir_all(dir))
+end copy_dir_all_of_a_file
+
+@test("copying a source that is not there reports it")
+copy_dir_all_of_nothing()
+    val dir = scratch("copymissing")
+
+    copy_dir_all(join(dir, "gone"), join(dir, "dst")) match
+        Ok(_) -> assert(false, "copying a tree that is not there answered")
+        Err(e) -> assert_eq(e, NotFound)
+
+    assert(!exists(join(dir, "dst")))
+
+    ignore(remove_dir_all(dir))
+end copy_dir_all_of_nothing
+
+@test("a copy has the same bytes and is a different file")
+copy_file_copies()
+    val dir = scratch("copy")
+
+    write_bytes(join(dir, "src"), [0u8, 1, 2, 255, 10]).unwrap()
+    copy_file(join(dir, "src"), join(dir, "dst")).unwrap()
+
+    assert_eq(read_bytes(join(dir, "dst")).unwrap(), read_bytes(join(dir, "src")).unwrap())
+
+    // A copy is not a link: the two have different inodes, and changing one does not change the
+    // other. That is what a hard link would have got wrong while passing the assertion above.
+    assert(!metadata(join(dir, "src")).unwrap().same_file(metadata(join(dir, "dst")).unwrap()))
+
+    write_text(join(dir, "src"), "changed").unwrap()
+
+    assert_eq(read_bytes(join(dir, "dst")).unwrap().len, 5)
+
+    ignore(remove_dir_all(dir))
+end copy_file_copies
+
+@test("a copy replaces whatever was at the destination rather than appending to it")
+copy_file_replaces()
+    val dir = scratch("replace")
+
+    write_text(join(dir, "src"), "short").unwrap()
+    write_text(join(dir, "dst"), "a much longer thing that was already there").unwrap()
+
+    copy_file(join(dir, "src"), join(dir, "dst")).unwrap()
+
+    assert_eq(read_text(join(dir, "dst")).unwrap(), "short")
+
+    ignore(remove_dir_all(dir))
+end copy_file_replaces
+
+@test("an empty file copies to an empty file rather than failing on the first read")
+copy_file_of_an_empty_file()
+    val dir = scratch("empty")
+
+    write_text(join(dir, "src"), "").unwrap()
+    copy_file(join(dir, "src"), join(dir, "dst")).unwrap()
+
+    assert_eq(size_of(join(dir, "dst")).unwrap(), 0)
+
+    ignore(remove_dir_all(dir))
+end copy_file_of_an_empty_file
+
+@test("copying a source that is not there reports it and makes no destination")
+copy_file_of_nothing()
+    val dir = scratch("nosrc")
+
+    copy_file(join(dir, "missing"), join(dir, "dst")) match
+        Ok(_) -> assert(false, "copying a file that does not exist answered")
+        Err(e) -> assert_eq(e, IoError.NotFound)
+
+    assert(!exists(join(dir, "dst")))
+
+    ignore(remove_dir_all(dir))
+end copy_file_of_nothing
+
+// -- truncate -------------------------------------------------------------------------------------
+
+@test("a file is cut to a length, and extended to one with zeroes")
+truncate_cuts_and_extends()
+    val dir = scratch("cut")
+    val path = join(dir, "f")
+
+    write_text(path, "0123456789").unwrap()
+
+    truncate(path, 4).unwrap()
+
+    assert_eq(read_text(path).unwrap(), "0123")
+
+    truncate(path, 6).unwrap()
+
+    assert_eq(size_of(path).unwrap(), 6)
+    assert_eq(read_bytes(path).unwrap(), [u8('0'), u8('1'), u8('2'), u8('3'), 0, 0])
+
+    ignore(remove_dir_all(dir))
+end truncate_cuts_and_extends
+
+@test("truncate makes nothing: a path that is not there is reported")
+truncate_of_nothing()
+    truncate("/tmp/sysl-fs-dirs-no-such-file", 0) match
+        Ok(_) -> assert(false, "cutting a file that does not exist answered")
+        Err(e) -> assert_eq(e, IoError.NotFound)
+
+/** **What makes the buffered handle worth a shim**: bytes still in the buffer would be written back
+ * past the cut if nothing flushed first, so this asserts the length *after* a write that has not
+ * been flushed by anything else.
+ */
+@test("cutting an open file flushes first and leaves the position where it was")
+file_truncate_flushes()
+    val dir = scratch("open")
+    val path = join(dir, "f")
+
+    var f = create(path).unwrap()
+
+    f.write("0123456789".bytes)
+    f.truncate(4).unwrap()
+
+    assert_eq(f.tell().unwrap(), 10)
+
+    f.close().unwrap()
+
+    assert_eq(read_text(path).unwrap(), "0123")
+
+    ignore(remove_dir_all(dir))
+end file_truncate_flushes
+
+@test("cutting a closed file reports rather than reaching a handle C has freed")
+file_truncate_when_closed()
+    val dir = scratch("closed")
+    val path = join(dir, "f")
+
+    var f = create(path).unwrap()
+
+    f.close().unwrap()
+
+    f.truncate(0) match
+        Ok(_) -> assert(false, "cutting a closed file answered")
+        Err(e) -> assert_eq(e, IoError.NotOpen)
+
+    ignore(remove_dir_all(dir))
+end file_truncate_when_closed
+
+// -- where the program is -------------------------------------------------------------------------
+
+/** Nothing here may assert a particular directory, since the suite runs from wherever it is run
+ * from. What it can assert is the shape of the answer and that the two calls agree.
+ */
+@test("the working directory is absolute, exists, and is what set_current_dir just set")
+current_dir_reads_and_moves()
+    val dir = scratch("cwd")
+    val was = current_dir().unwrap()
+
+    assert(is_absolute(was))
+    assert(is_dir(was))
+
+    set_current_dir(dir).unwrap()
+
+    // Through `canonicalize` on both sides, because `/tmp` is itself a link on macOS and the kernel
+    // answers the resolved path -- comparing the string as written would fail there and pass on
+    // Linux, which is a test that reports the platform rather than the behaviour.
+    assert_eq(canonicalize(current_dir().unwrap()).unwrap(), canonicalize(dir).unwrap())
+
+    set_current_dir(was).unwrap()
+
+    assert_eq(current_dir().unwrap(), was)
+
+    ignore(remove_dir_all(dir))
+end current_dir_reads_and_moves
+
+@test("moving to a directory that is not there is reported and moves nothing")
+set_current_dir_of_nothing()
+    val was = current_dir().unwrap()
+
+    set_current_dir("/tmp/sysl-fs-dirs-no-such-directory") match
+        Ok(_) -> assert(false, "moving to a directory that does not exist answered")
+        Err(e) -> assert_eq(e, IoError.NotFound)
+
+    assert_eq(current_dir().unwrap(), was)
+end set_current_dir_of_nothing
+
+// -- a directory nobody else can take -------------------------------------------------------------
+
+/** **It is created, not merely named**, which is the whole point of the call: the directory is there
+ * when it answers, so there is no gap in which somebody else takes the name.
+ */
+@test("a temporary directory exists when it is answered, and is empty")
+temp_dir_is_made()
+    val d = make_temp_dir("sysl-fs-test-").unwrap()
+
+    assert(is_dir(d))
+    assert(is_absolute(d))
+    assert_eq(entries(d).unwrap().len(), 0)
+
+    remove_dir_all(d).unwrap()
+
+    assert(!exists(d))
+end temp_dir_is_made
+
+@test("two temporary directories are two directories")
+temp_dirs_are_distinct()
+    val a = make_temp_dir("sysl-fs-test-").unwrap()
+    val b = make_temp_dir("sysl-fs-test-").unwrap()
+
+    assert(a != b)
+    assert(is_dir(a))
+    assert(is_dir(b))
+
+    ignore(remove_dir_all(a))
+    ignore(remove_dir_all(b))
+end temp_dirs_are_distinct
+
+// -- where a directory belongs --------------------------------------------------------------------
+//
+// **These read the environment the suite is running in, so what can be asserted is a RELATION rather
+// than a path.** The machine's home is not this file's to know; that the four answers are absolute,
+// that the cache is not the home itself, and that macOS gives one directory for configuration and
+// data are claims that hold on any machine the suite runs on and would each break under a plausible
+// mistake.
+
+@test("the four directories are absolute paths, or nothing at all")
+belongs_answers_absolute_paths()
+    for d in [home_dir(), cache_dir(), config_dir(), data_dir()]
+        d match
+            Some(p) -> assert(is_absolute(p), "a platform directory is not an absolute path")
+            None -> ()
+
+@test("a machine that names a home names the other three under it")
+belongs_follows_the_home()
+    if home_dir().is_none() then return
+
+    val home = home_dir().unwrap()
+
+    assert(cache_dir().is_some(), "there is a home and no cache directory")
+    assert(config_dir().is_some(), "there is a home and no configuration directory")
+    assert(data_dir().is_some(), "there is a home and no data directory")
+
+    // Not the home itself: a `join` that dropped its leaf would answer the home four times over, and
+    // every other assertion here would still pass.
+    assert(cache_dir().unwrap() != home, "the cache directory is the home directory")
+end belongs_follows_the_home
+
+// macOS keeps configuration and data in one place and separates only the cache, which is Apple's
+// convention rather than a gap here -- `config_dir` says so at length. Asserted so that a later
+// tidy-up that makes the four look symmetrical fails instead of moving people's files.
+@test("macOS answers one directory for configuration and for data, and a different one for cache")
+belongs_follows_the_platform()
+    if os() != MacOS then return
+
+    assert_eq(config_dir().unwrap(), data_dir().unwrap())
+    assert(cache_dir().unwrap() != config_dir().unwrap(), "the cache and the configuration are one place")
+end belongs_follows_the_platform
+
+// -- what the OS gates decide, asserted through the surface rather than through their numbers -------
+//
+// `ENOTEMPTY` and `ENAMETOOLONG` are two of the handful of error numbers a BSD libc and glibc
+// disagree about, so each is behind a `#if bsd` in `error.sysl` and `links.sysl`. **Both would fail
+// silently if a gate picked the wrong branch**: the recognition simply stops matching and the error
+// arrives as `Other(66)` or `Other(63)` -- a plausible-looking value that no test asserting merely
+// "this failed" would notice. These two assert the *name*, which is the only thing that moves.
+
+@test("removing a directory that still has something in it is recognised rather than reported as a number")
+remove_dir_on_a_full_one_is_named()
+    val dir = scratch("full")
+
+    write_text(join(dir, "kept"), "x").unwrap()
+
+    assert_eq(remove_dir(dir).unwrap_err(), DirectoryNotEmpty, "ENOTEMPTY was not recognised")
+
+    ignore(remove_dir_all(dir))
+end remove_dir_on_a_full_one_is_named

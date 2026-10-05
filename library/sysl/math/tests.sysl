@@ -1,0 +1,480 @@
+module sysl.math
+@tests
+@requires(heap)
+
+// The module ships allocating nowhere and says so. Testing it does not: `assert_eq` renders
+// both sides into the message it would print on a failure, and rendering builds a string. That
+// is the harness's business rather than this module's, and none of it ships.
+
+// What `sysl.math` computes, asserted in sysl.
+//
+// The arithmetic identities are what belongs here: that `gcd` is symmetric, that `pow` at zero is
+// one, that a float rounds half away from zero. What is deliberately **not** here is the claim these
+// tests would be least able to make -- that one spelling reaches both widths, and that an `f32` is
+// really computing at `f32`'s width. Those are claims about generic dispatch and about codegen, and
+// `MathTests` keeps them because its expectation is written in another language: a compiler that had
+// quietly widened everything to binary64 would compile the `f32` assertions here into binary64 ones
+// and pass them.
+
+// -- comparison ------------------------------------------------------------------------------------
+
+@test("min and max pick the right end")
+min_max_pick()
+    assert_eq(min(3, 7), 3)
+    assert_eq(max(3, 7), 7)
+    assert_eq(min(-3, -7), -7)
+
+// The equal case is the one where an implementation can differ from itself: `if b < a` and
+// `if b <= a` give the same answer for distinct arguments and disagree about which of two equal ones
+// comes back. It matters for a non-`int` `T` whose values can be equal without being identical.
+@test("min and max of equal arguments answer with that value")
+min_max_equal()
+    assert_eq(min(4, 4), 4)
+    assert_eq(max(4, 4), 4)
+
+@test("clamp holds a value inside the range")
+clamp_holds()
+    assert_eq(clamp(5, 1, 10), 5)
+    assert_eq(clamp(0, 1, 10), 1)
+    assert_eq(clamp(99, 1, 10), 10)
+
+@test("and a value already at a bound stays there")
+clamp_at_bounds()
+    assert_eq(clamp(1, 1, 10), 1)
+    assert_eq(clamp(10, 1, 10), 10)
+
+// -- integer arithmetic -------------------------------------------------------------------------------
+
+@test("pow raises to the exponent")
+pow_raises()
+    assert_eq(pow(2, 10), 1024)
+    assert_eq(pow(3, 3), 27)
+
+// Anything to the zero is one, including zero -- the convention, and the case a loop written as
+// "multiply n times starting from the base" gets wrong.
+@test("anything to the zero is one")
+pow_zero()
+    assert_eq(pow(2, 0), 1)
+    assert_eq(pow(0, 0), 1)
+
+@test("gcd is the greatest common divisor")
+gcd_value()
+    assert_eq(gcd(12, 18), 6)
+    assert_eq(gcd(17, 5), 1)
+
+// Zero is the identity, which falls out of the Euclidean algorithm rather than being written into
+// it -- and is the case that loops forever if the recursion is the wrong way round.
+@test("gcd with zero is the other argument")
+gcd_zero()
+    assert_eq(gcd(0, 5), 5)
+    assert_eq(gcd(5, 0), 5)
+
+@test("gcd does not care which way round its arguments are")
+gcd_symmetric()
+    assert_eq(gcd(12, 18), gcd(18, 12))
+
+@test("lcm is the least common multiple")
+lcm_value()
+    assert_eq(lcm(4, 6), 12)
+    assert_eq(lcm(7, 3), 21)
+
+@test("divmod answers with both halves of a division")
+divmod_both()
+    var q, r = divmod(17, 5)
+
+    assert_eq(q, 3)
+    assert_eq(r, 2)
+
+// -- powers of two ---------------------------------------------------------------------------------
+//
+// One is a power of two and zero is not, and the usual one-line test -- `x & (x - 1) == 0` -- says
+// the opposite about zero. That is the whole reason this is a library function rather than something
+// each caller writes.
+
+@test("a power of two is recognised")
+power_of_two_yes()
+    assert(is_power_of_two(1))
+    assert(is_power_of_two(2))
+    assert(is_power_of_two(1024))
+
+@test("and zero and a non-power are not")
+power_of_two_no()
+    assert(!is_power_of_two(0))
+    assert(!is_power_of_two(3))
+    assert(!is_power_of_two(-4))
+
+@test("the next power of two is the one at or above")
+next_power_at_or_above()
+    assert_eq(next_power_of_two(5).unwrap(), 8)
+    assert_eq(next_power_of_two(1).unwrap(), 1)
+    assert_eq(next_power_of_two(8).unwrap(), 8)
+
+// -- bit counting ------------------------------------------------------------------------------------
+
+@test("the ones and the zeros account for the whole width")
+bits_account_for_the_width()
+    var x = 5
+
+    assert_eq(x.count_ones(), 2)
+    assert_eq(x.count_ones() + x.count_zeros(), 32)
+
+@test("the leading and trailing runs are counted from the ends they name")
+bit_runs()
+    assert_eq(4.trailing_zeros(), 2)
+    assert_eq(1.leading_zeros(), 31)
+
+@test("a type answers its own width, and the answer is the type's rather than the value's")
+width_is_a_fact_about_the_type()
+    assert_eq(u8.width(), 8)
+    assert_eq(u32.width(), 32)
+    assert_eq(i64.width(), 64)
+
+    // Signedness does not change how many bits there are, which is the whole of why `width` is on
+    // `Bits` and not on `Signed`.
+    assert_eq(i8.width(), u8.width())
+
+// The width is what makes a bit expression writable in a body that does not know its own width, and
+// these are the two that a program would otherwise write as a loop or as a literal that is wrong at
+// the next instantiation.
+private reversed_low[T: Bits + Shr](v: T, n: u32) -> T =
+    v.reverse_bits() >> T(T.width() - n)
+
+private width_of[T: Bits]() -> u32 = T.width()
+
+@test("a bound reaches the width, so one body serves every integer width")
+width_through_a_bound()
+    assert_eq(width_of[u8](), 8)
+    assert_eq(width_of[u64](), 64)
+
+    // The low three bits of 0b101 reversed are 0b101; the low three of 0b001 are 0b100. Written
+    // against the receiver's own width, which the body does not know and does not need to.
+    assert_eq(reversed_low(u8(0b101), 3), u8(0b101))
+    assert_eq(reversed_low(u8(0b001), 3), u8(0b100))
+    assert_eq(reversed_low(u32(0b001), 3), u32(0b100))
+
+// -- floating point ------------------------------------------------------------------------------------
+
+@test("the roots are the roots")
+roots()
+    assert_approx_eq(9.0.sqrt(), 3.0, 1.0e-12)
+    assert_approx_eq(27.0.cbrt(), 3.0, 1.0e-12)
+
+// The exponent and the logarithm undo each other, which is worth asserting as a pair: either one
+// alone could be scaled by a constant and still look plausible.
+@test("the exponential and the logarithm undo each other")
+exp_ln_inverse()
+    assert_approx_eq(e.ln(), 1.0, 1.0e-12)
+    assert_approx_eq(1.0.exp(), e, 1.0e-12)
+    assert_approx_eq(5.0.ln().exp(), 5.0, 1.0e-12)
+
+@test("the circle constants agree with the trigonometry")
+trig_at_the_constants()
+    assert_approx_eq(pi.sin(), 0.0, 1.0e-12)
+    assert_approx_eq(pi.cos(), -1.0, 1.0e-12)
+    assert_approx_eq((pi / 2.0).sin(), 1.0, 1.0e-12)
+
+// The four roundings differ only on a negative fraction and on a tie, so that is where they are
+// asserted -- on 2.5 and -2.5 they give four different answers.
+@test("the four roundings differ where they are supposed to")
+roundings_differ()
+    assert_eq((-2.5).floor(), -3.0)
+    assert_eq((-2.5).ceil(), -2.0)
+    assert_eq((-2.5).trunc(), -2.0)
+    assert_eq((-2.5).round(), -3.0)
+
+@test("round goes half away from zero")
+round_half_away()
+    assert_eq(2.5.round(), 3.0)
+    assert_eq(3.5.round(), 4.0)
+
+// -- the two sixteen-bit widths --------------------------------------------------------------------
+
+// `Float` reaches every width the back end lowers, and the two narrow ones get there by widening to
+// `f32`, computing, and narrowing back -- libm has no entry point at sixteen bits to bind. So these
+// assert what that route is supposed to preserve: a root and a floor whose answers the width holds
+// exactly come back exact, rather than a fraction off from having gone the long way round.
+@test("the trait reaches both sixteen-bit widths")
+half_width_mathematics()
+    assert_eq(9.0f16.sqrt(), 3.0f16)
+    assert_eq(9.0bf16.sqrt(), 3.0bf16)
+    assert_eq((-2.5f16).floor(), -3.0f16)
+    assert_eq((-2.5bf16).floor(), -3.0bf16)
+
+// Each width's own constants, asserted where they are a property rather than where they are a
+// number. `epsilon` is the smallest step above one, which is a claim two comparisons make: adding it
+// moves off one, and adding half of it rounds back to one.
+@test("each sixteen-bit width's constants are its own")
+half_width_constants()
+    assert_eq(f16.max_value(), 65504.0f16)
+
+    assert(f16.one() + f16.epsilon() != f16.one())
+    assert(f16.one() + f16.epsilon() / 2.0f16 == f16.one())
+    assert(bf16.one() + bf16.epsilon() != bf16.one())
+    assert(bf16.one() + bf16.epsilon() / 2.0bf16 == bf16.one())
+end half_width_constants
+
+// The two formats are the same width and divide it differently -- ten bits of significand against
+// seven -- so the nearest each holds to a tenth is a different number. Compared as `f32`, which
+// holds both exactly, so what is asserted is the two values and not a third rounding.
+@test("the two sixteen-bit formats round a tenth differently")
+half_widths_round_differently()
+    var h: f16 = 0.1
+    var b: bf16 = 0.1
+
+    assert_eq(f32(h), 0.0999755859375f32)
+    assert_eq(f32(b), 0.10009765625f32)
+
+// And the precision `bf16` gives up buys range: its exponent is `f32`'s, so the largest finite `f16`
+// doubles to an ordinary number where at `f16` it is already past the end of the format.
+@test("bf16 keeps f32's range where f16 runs out")
+bf16_reaches_further()
+    assert(!(65504.0f16 * 2.0f16).is_finite())
+    assert((65504.0bf16 * 2.0bf16).is_finite())
+    assert_eq(f32(65504.0bf16 * 2.0bf16), 131072.0f32)
+
+// The two values no literal spells, and the reason `is_nan` exists at all: NaN is the one value not
+// equal to itself, so `x == x` is the test and `x == nan()` is never true.
+@test("NaN is not equal to itself")
+nan_is_not_itself()
+    var x = nan()
+
+    assert(x.is_nan())
+    assert(!(x == x))
+
+@test("infinity is beyond every finite value")
+infinity_is_beyond()
+    assert(infinity().is_infinite())
+    assert(infinity() > real.max_value())
+    assert(!1.0.is_infinite())
+
+// `approx_eq` takes an absolute tolerance and `approx_eq_rel` a relative one, and the pair only
+// earns its keep where the two disagree -- at a large magnitude, where a fixed tolerance is far too
+// tight and a proportional one is right.
+@test("an absolute tolerance and a relative one are different questions")
+absolute_and_relative()
+    assert(approx_eq(1.0, 1.0 + 1.0e-15, 1.0e-12))
+    assert(!approx_eq(1.0e9, 1.0e9 + 1.0, 1.0e-12))
+    assert(approx_eq_rel(1.0e9, 1.0e9 + 1.0, 1.0e-6))
+
+// -- The identities, asked of a type rather than written as a literal ---------------------------------
+//
+// The point of `Zero` and `One` is the **generic** body, so that is what these assert through: a sum
+// and a product written once, with nothing in either that names a width or a literal. Asserting
+// `real.zero() == 0.0` alone would pass against a pair of traits nothing could actually use.
+
+private sum[T: Add + Zero](xs: []const T) -> T
+    var total = T.zero()
+
+    for x in xs do total = total + x
+
+    total
+end sum
+
+private product[T: Mul + One](xs: []const T) -> T
+    var acc = T.one()
+
+    for x in xs do acc = acc * x
+
+    acc
+end product
+
+@test("a sum starts at the additive identity, whatever the element type")
+sum_over_widths()
+    var rs: []real = [1.5, 2.5, 3.0]
+    var fs: []f32 = [1.5f32, 2.5f32]
+    var none: []real = []
+
+    assert_eq(sum(rs), 7.0)
+    assert_eq(sum(fs), 4.0f32)
+
+    // The empty case is the one the identity exists for: with no element to start from there is
+    // nothing but `T.zero()` to answer with.
+    assert_eq(sum(none), 0.0)
+end sum_over_widths
+
+@test("and a product starts at the multiplicative one")
+product_over_widths()
+    var rs: []real = [2.0, 3.0, 4.0]
+    var none: []real = []
+
+    assert_eq(product(rs), 24.0)
+    assert_eq(product(none), 1.0)
+end product_over_widths
+
+@test("the identities are what their names promise")
+identities_are_identities()
+    assert_eq(3.5 + real.zero(), 3.5)
+    assert_eq(3.5 * real.one(), 3.5)
+    assert_eq(f32.zero(), 0.0f32)
+    assert_eq(f32.one(), 1.0f32)
+
+// -- magnitude -------------------------------------------------------------------------------------
+
+// A pivot rule reduced to what it needs: the largest of a slice by size, answering in whatever terms
+// the element type measures. It names `T::Size` nowhere but the result, which is the point of the
+// associated type — the body compares sizes without knowing what one is.
+private largest[T: Magnitude](xs: []const T) -> T::Size
+    var best = xs[0].magnitude()
+
+    for x in xs do if best < x.magnitude() then best = x.magnitude()
+
+    best
+end largest
+
+@test("a float's size is its own width, not the wider one")
+magnitude_of_a_float()
+    assert_eq((-7.5).magnitude(), 7.5)
+    assert_eq((-7.5f32).magnitude(), 7.5f32)
+    assert_eq(0.0.magnitude(), 0.0)
+
+@test("an integer's size is an integer, at every width and either signedness")
+magnitude_of_an_integer()
+    assert_eq((-9).magnitude(), 9)
+    assert_eq(9.magnitude(), 9)
+
+    // Unsigned, where the negation the signed branch would take does not exist: every value is its
+    // own size and the branch is never entered.
+    assert_eq(200u8.magnitude(), 200u8)
+
+    var narrow: i16 = -300
+
+    assert_eq(narrow.magnitude(), 300)
+end magnitude_of_an_integer
+
+@test("and the most negative value answers itself, as its abs does")
+magnitude_wraps_at_the_edge()
+    var edge: i8 = -128
+
+    assert_eq(edge.magnitude(), edge)
+    assert_eq(edge.magnitude(), edge.abs())
+
+@test("a body bounded by the trait compares sizes it cannot name")
+magnitude_orders_by_size()
+    var xs: []real = [3.0, -40.0, 7.0]
+    var ns: []int = [3, -40, 7]
+
+    assert_eq(largest(xs), 40.0)
+    assert_eq(largest(ns), 40)
+end magnitude_orders_by_size
+
+// -- arithmetic that reports its own overflow --------------------------------------------------------
+
+@test("the checked operators answer with the value wherever it fits")
+checked_ordinary_values()
+    assert_eq(checked_add(2, 3).unwrap(), 5)
+    assert_eq(checked_sub(2, 3).unwrap(), -1)
+    assert_eq(checked_mul(6, 7).unwrap(), 42)
+    assert_eq(checked_mul(-6, 7).unwrap(), -42)
+    assert_eq(checked_mul(-6, -7).unwrap(), 42)
+    assert_eq(checked_mul(0, 0).unwrap(), 0)
+    assert_eq(checked_mul(-1, 5).unwrap(), -5)
+    assert_eq(checked_mul(5, -1).unwrap(), -5)
+end checked_ordinary_values
+
+@test("the checked operators refuse at the ends of the width they are used at")
+checked_refuses_at_the_edges()
+    val imax: int = 2147483647
+    val imin: int = -2147483648
+
+    assert(checked_add(imax, 1).is_none())
+    assert(checked_sub(imin, 1).is_none())
+    assert(checked_mul(imin, -1).is_none())
+    assert(checked_mul(-1, imin).is_none())
+    assert_eq(checked_add(imax, -1).unwrap(), 2147483646)
+    assert_eq(checked_mul(imin, 1).unwrap(), imin)
+
+    val lmax: long = 9223372036854775807
+    val lmin: long = -9223372036854775807 - 1
+
+    assert(checked_add(lmax, 1).is_none())
+    assert(checked_add(lmin, -1).is_none())
+    assert(checked_sub(lmin, 1).is_none())
+    assert(checked_sub(lmax, -1).is_none())
+    assert_eq(checked_sub(lmax, 1).unwrap(), 9223372036854775806)
+
+    // The pair a machine divide cannot take, which is why `-1` is answered before anything divides.
+    assert(checked_mul(lmin, -1).is_none())
+    assert(checked_mul(-1, lmin).is_none())
+    assert_eq(checked_mul(lmin, 1).unwrap(), lmin)
+    assert_eq(checked_mul(1, lmin).unwrap(), lmin)
+    assert_eq(checked_mul(lmax, -1).unwrap(), -9223372036854775807)
+end checked_refuses_at_the_edges
+
+@test("the multiplication is right on either side of the bar that picks its route")
+checked_mul_takes_both_routes()
+    // Well under the bar, where the leading-zero counts settle it without dividing.
+    val small: long = 1000
+
+    assert_eq(checked_mul(small, small).unwrap(), 1000000)
+
+    // Either side of the largest product that fits, where only the division answers.
+    val under: long = 3037000499
+    val over: long = 3037000500
+
+    assert_eq(checked_mul(under, under).unwrap(), 9223372030926249001)
+    assert(checked_mul(over, over).is_none())
+
+    // And a product that needs the full width and fits exactly.
+    val half: long = 4294967296
+
+    assert(checked_mul(half, half).is_none())
+    assert_eq(checked_mul(half, 2147483647).unwrap(), 9223372032559808512)
+end checked_mul_takes_both_routes
+
+@test("the overflowing operators hand back the wrapped value beside the flag")
+overflowing_carries_the_value()
+    val lmax: long = 9223372036854775807
+    val lmin: long = -9223372036854775807 - 1
+
+    val (sum, sum_over) = overflowing_add(lmax, 1)
+
+    assert_eq(sum, lmin)
+    assert(sum_over)
+
+    val (difference, difference_over) = overflowing_sub(lmin, 1)
+
+    assert_eq(difference, lmax)
+    assert(difference_over)
+
+    val (product, product_over) = overflowing_mul(lmin, -1)
+
+    assert_eq(product, lmin)
+    assert(product_over)
+
+    val (fine, fine_over) = overflowing_add(2, 3)
+
+    assert_eq(fine, 5)
+    assert(!fine_over)
+end overflowing_carries_the_value
+
+@test("the checked operators agree with a wider computation over every pair of i8")
+checked_against_a_wider_width()
+    // Every operand a byte can hold against every other, with the answer computed at a width where
+    // it cannot overflow -- which is the only oracle that owes nothing to the code under test.
+    for a in -128..<128
+        for b in -128..<128
+            val x = i8(a)
+            val y = i8(b)
+            val sum: long = long(a) + long(b)
+            val difference: long = long(a) - long(b)
+            val product: long = long(a) * long(b)
+
+            check_one(x, y, sum, checked_add(x, y), overflowing_add(x, y))
+            check_one(x, y, difference, checked_sub(x, y), overflowing_sub(x, y))
+            check_one(x, y, product, checked_mul(x, y), overflowing_mul(x, y))
+end checked_against_a_wider_width
+
+/** One operation's two answers against the width-independent truth: the checked form carries the
+ * value exactly when it fits, and the overflowing form carries the wrapped value always and the
+ * flag that says which happened.
+ */
+private check_one(a: i8, b: i8, wide: long, checked: Option[i8], overflowing: (i8, bool))
+    val fits = wide >= -128 && wide <= 127
+    val (wrapped, flag) = overflowing
+
+    assert_eq(checked.is_some(), fits)
+    assert_eq(flag, !fits)
+    assert_eq(wrapped, i8(wide))
+
+    if fits then assert_eq(checked.unwrap(), i8(wide))
+end check_one

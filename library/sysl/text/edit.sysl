@@ -1,0 +1,242 @@
+module sysl.text
+
+import sysl.buf.{Buf, buf}
+import sysl.unicode.{to_upper as unicode_upper, to_lower as unicode_lower, fold}
+
+// The operations that make new text -- the half `find.sysl` does not hold.
+//
+// **The file boundary is the allocator.** Everything in `find.sysl` answers with an offset, a
+// `bool`, or a view of what it was given, so all of it is reachable under `no alloc`. Everything
+// here builds bytes that were not there before and needs one. Keeping the two apart means a program
+// that only searches never links an allocator on account of a `join` it does not call.
+//
+// **These take a `string` rather than being members of `Search`.** A default cannot write them: it
+// would have to build a `Self` out of new bytes, and there is no way for a trait to say how -- a
+// `[]const u8` has no constructor a default could reach. That is the honest boundary of the
+// write-it-once trick, and it falls exactly where the allocator does.
+//
+// **What splitting hands back are views.** A piece of a split shares the bytes of the string it
+// came from and costs a retain, so `split` allocates the *vector* and not the text. The older sysl
+// copied every piece, because it had no O(1) substring to hand out -- this is the single place
+// where the representation `04` chose pays off most visibly.
+
+/** The pieces between each occurrence of a separator.
+ *
+ * Adjacent separators yield an empty piece between them, and a separator at either end yields an
+ * empty piece outside it, so the count is always one more than the number of separators found and
+ * nothing about the input is silently dropped. A caller wanting the other behaviour wants `fields`.
+ *
+ * **An empty separator yields the whole string as one piece.** Splitting on nothing has no
+ * meaningful answer here: the byte-level reading would cut multi-byte characters in half and hand
+ * back pieces that are not text, and the character-level reading is what `s.chars` already is.
+ */
+split(s: string, sep: string) -> []string
+    var out: Buf[string] = buf()
+
+    if sep.len == 0
+        out.push(s)
+        return out.view()
+
+    var start: usize = 0
+
+    loop
+        s.index_of_from(sep, start) match
+            Some(at) ->
+                out.push(s[start..<at])
+                start = at + sep.len
+            None ->
+                out.push(s[start..])
+                break
+
+    out.view()
+end split
+
+/** The runs of non-whitespace, with the whitespace between them discarded.
+ *
+ * This is not `split` on a space: a run of several spaces separates two fields rather than
+ * producing empty ones between them, and leading or trailing whitespace produces nothing at all.
+ * It is what reading a line of columns wants, and writing it as a `split` and a filter would be
+ * slower and no clearer.
+ */
+fields(s: string) -> []string
+    var out: Buf[string] = buf()
+    var b = s.bytes
+    var i: usize = 0
+
+    while i < b.len
+        while i < b.len && b[i].is_space()
+            i += 1
+
+        if i >= b.len then break
+
+        var start = i
+
+        while i < b.len && !b[i].is_space()
+            i += 1
+
+        out.push(s[start..<i])
+
+    out.view()
+end fields
+
+/** Every piece laid end to end with a separator between, which is `split`'s inverse whenever the
+ * separator is one `split` would have found.
+ *
+ * It sizes the buffer before it starts, since it can: the answer's length is the sum of the pieces
+ * plus the separators, and knowing it turns a series of doublings into one allocation.
+ */
+join(parts: []const string, sep: string) -> string
+    if parts.len == 0 then return ""
+
+    var total = sep.len * (parts.len - 1)
+
+    for p in parts
+        total += p.len
+
+    var b = str_builder_with_capacity(total)
+    var first = true
+
+    for p in parts
+        if !first then b.push(sep)
+        b.push(p)
+        first = false
+
+    b.finish()
+end join
+
+/** The text repeated `n` times, and nothing when `n` is zero. */
+repeat(s: string, n: usize) -> string
+    if n == 0 || s.len == 0 then return ""
+
+    var b = str_builder_with_capacity(s.len * n)
+    var k: usize = 0
+
+    while k < n
+        b.push(s)
+        k += 1
+
+    b.finish()
+end repeat
+
+/** Every non-overlapping occurrence of `old` replaced by `new`, left to right.
+ *
+ * Non-overlapping and left-to-right is the same rule `count_of` counts by, so the number of
+ * replacements made is exactly the number it reports -- and the scan continues *after* what was
+ * substituted, so a replacement containing the pattern does not feed on itself.
+ *
+ * An empty `old` matches nowhere rather than everywhere: the alternative inserts a copy of `new`
+ * between every pair of bytes, which for a `string` would cut multi-byte characters apart.
+ */
+replace_all(s: string, old: string, new: string) -> string
+    if old.len == 0 || old.len > s.len then return s
+
+    var b = str_builder_with_capacity(s.len)
+    var start: usize = 0
+
+    loop
+        s.index_of_from(old, start) match
+            Some(at) ->
+                b.push(s[start..<at])
+                b.push(new)
+                start = at + old.len
+            None ->
+                b.push(s[start..])
+                break
+
+    b.finish()
+end replace_all
+
+/** Unicode case conversion.
+ *
+ * **It walks characters rather than bytes, and that is what keeps it safe.** A byte map would be
+ * the faster loop and would need a way to put a raw byte into a builder -- which is the one thing
+ * the builder deliberately does not offer, since a public `write` taking bytes is
+ * `from_utf8_unchecked` with a longer name (`reference/strings.md § Making new bytes`). Going
+ * through `push_char` instead means every way in still carries the UTF-8 guarantee and no unchecked
+ * primitive is named here at all. The decode and re-encode that costs is the right price for that.
+ *
+ * It works because `sysl.unicode.to_upper` is **total**: a character the database gives no mapping
+ * for comes back as itself, so text that has no case is re-encoded to exactly the bytes it arrived
+ * as. `to_upper("héllo")` is `HÉLLO`.
+ *
+ * **The mapping is the *simple* one, character for character**, which is what a walk over a
+ * `char -> char` function can promise. *Special* casing, where a character uppercases to more than
+ * one and the result is longer than its input, is `sysl.unicode.fold`'s -- and folding is the
+ * operation a caller comparing two strings wanted anyway. *Locale-sensitive* casing needs a notion
+ * of locale this library does not have.
+ *
+ * **`ß` is the one worth knowing before calling this.** Most languages uppercase it to `SS`, which
+ * is full casing and two characters; the simple mapping has one to give and gives `ẞ`, the capital
+ * sharp s, which lowercases back. `sysl.unicode.to_upper` carries the detail.
+ *
+ * **A program that never calls this links no table.** The database is 330 KB and `sysl.text` is not
+ * optional -- it is what places a diagnostic's caret -- so the two facts have to be stated together
+ * or the first reads as a cost every program pays. It is not: the library is one archive with an
+ * object per C file, a member is pulled in only to resolve a symbol something already referenced,
+ * and the link runs `-dead_strip` over `-ffunction-sections`. What a program links is decided by
+ * the functions it calls rather than by the modules it names, and `StdArtifactTests` pins both
+ * directions of that.
+ */
+to_upper(s: string) -> string
+    // A hint rather than a bound: a simple mapping may change a character's width in either
+    // direction -- `ſ` uppercases to the one-byte `S` and `ɐ` to the three-byte `Ɐ` -- so the
+    // builder grows if it has to, exactly as it would from any other guess.
+    var b = str_builder_with_capacity(s.len)
+
+    for c in s.chars do b.push_char(unicode_upper(c))
+
+    b.finish()
+end to_upper
+
+/** The other direction, and everything `to_upper` says applies to it unchanged: `to_lower("HÉLLO")`
+ * is `héllo`, and `to_lower('ẞ')` is `ß`.
+ */
+to_lower(s: string) -> string
+    var b = str_builder_with_capacity(s.len)
+
+    for c in s.chars do b.push_char(unicode_lower(c))
+
+    b.finish()
+end to_lower
+
+/** Whether two strings are the same text ignoring case, which is what a caller comparing a header
+ * name, a filename, a scheme or a keyword actually wants.
+ *
+ * **`to_lower(a) == to_lower(b)` is the obvious spelling and it is wrong**, because simple case
+ * mapping is one character in and one out and case *folding* is not. `"STRASSE"` and `"straße"` are
+ * the same word and lowercase to `"strasse"` and `"straße"`, which differ; folded, both are
+ * `"strasse"`. The ligature `"ﬁ"` and the letters `"fi"` go the same way. Folding is the operation
+ * Unicode defines for exactly this question and nothing else answers it.
+ *
+ * **It allocates two strings, and a caller in a loop should not use it.** Each call folds both
+ * sides; a caller comparing one needle against many haystacks folds the needle once with
+ * `sysl.unicode.fold` and compares against `fold(h)` itself. That is the same advice `to_upper`
+ * gives about building a string per call, and it is why this is a free function rather than an
+ * operator: `==` on two strings is a byte comparison and stays one.
+ *
+ * **The folded form is composed**, so two strings that fold alike compare alike with no separate
+ * normalization pass -- `sysl.unicode.fold` says why.
+ *
+ * **There is no locale in it.** The one common casualty is Turkish, where a dotless `ı` and an `i`
+ * are different letters and this reports them as the same; a program that has to make that
+ * distinction has a notion of locale that this library does not.
+ */
+eq_fold(a: string, b: string) -> bool = fold(a) == fold(b)
+
+/** Whether `s` starts with `prefix`, ignoring case, and everything `eq_fold` says applies.
+ *
+ * **Both sides are folded before the comparison rather than either being folded alone**, which is
+ * what makes it right at the boundary: folding can change a string's length, so a prefix folded
+ * against an unfolded haystack would be looking for bytes that are not there.
+ */
+starts_with_fold(s: string, prefix: string) -> bool = fold(s).starts_with(fold(prefix))
+
+/** The other end, and it is `starts_with_fold`'s claim read backwards. */
+ends_with_fold(s: string, suffix: string) -> bool = fold(s).ends_with(fold(suffix))
+
+/** Whether `needle` occurs anywhere in `s`, ignoring case.
+ *
+ * This is the one a search box wants, and it is the one where folding rather than lowercasing shows
+ * up most often in practice: a user typing `strasse` expects to find `Straße`.
+ */
+contains_fold(s: string, needle: string) -> bool = fold(s).contains(fold(needle))
