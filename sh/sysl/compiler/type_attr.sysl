@@ -136,6 +136,48 @@ private attr_subject(cx: &Analyzer, span: Span, written: string) -> Option[Type]
     scalar_type_named(cx, span, written)
 end attr_subject
 
+// `for x in T::Range` -- the one place `::Range` is meaningful -- read as the subtype it walks and
+// the two ends, `First` through `Last` inclusive. `None` where the iterable is anything else: a
+// local of the name, a type parameter, and an alias of a plain integer, which declares no range and
+// is left to the ordinary attribute path to be refused there in the base's own words. An alias of a
+// constrained subtype walks that subtype's range. An `Err` is the refusal.
+range_subject(cx: &Analyzer, span: Span, iter: Expr) -> Option[Result[(Type, BigInt, BigInt), TExpr]]
+    val written = *iter.kind match
+        TypeAttr(receiver, attr) -> if attr == "Range" then attr_type_name(receiver) else None
+        _ -> None
+
+    if written.is_none() || cx.lookup(written.unwrap()).is_some() then return None
+    if bound_type(cx.subst, written.unwrap()).is_some() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+
+    if key.is_none() then return None
+
+    val ty = resolve_type(cx.an, cx.scope, named_type(iter.span, written.unwrap()), cx.subst)
+
+    val d = ty match
+        Constrained(c) -> c
+        _ -> return None
+
+    val shown = module_show(d.name)
+    val is_integer = underlying(ty) match
+        Integer(_, _, _) -> true
+        _ -> false
+
+    if !is_integer then
+        return Some(Err(cx.err(span, s"'$shown::Range' iterates an integer subtype, not " +
+                                          s"${type_show(d.base)}")))
+
+    if d.lo.is_none() || d.hi.is_none() then
+        return Some(Err(cx.err(span, s"'$shown::Range' needs a 'within' range")))
+
+    var last = decimal_to_int(d.hi.unwrap())
+
+    if d.exclusive_hi then last = sub(last, from_int(1))
+
+    Some(Ok((ty, decimal_to_int(d.lo.unwrap()), last)))
+end range_subject
+
 // `T::Attr` where `T` is a type parameter of the body being read, whatever this reading bound it to.
 // No bound is required of `T`, following `sizeof(T)`, so an argument with no extremes is refused at
 // the instantiation that supplied it, naming both the parameter and what it was given.
