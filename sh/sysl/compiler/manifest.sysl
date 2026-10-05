@@ -89,6 +89,10 @@ struct Manifest
     // root project's applies, as only its `optimization` does.
     link: Option[LinkMode]
 
+    // Whether this project's builds are linked with link-time optimization, and in which mode -- `thin`
+    // or `full` (`pipeline.sysl`). Only the root project's applies, as only its `optimization` does.
+    lto: Option[string]
+
     // A key this compiler does not understand is said out loud and then ignored, once per key.
     warnings: Buf[string]
 end Manifest
@@ -96,7 +100,7 @@ end Manifest
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
-             buf(), None, None, buf())
+             buf(), None, None, None, buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -376,6 +380,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     val features = read_features(root, dependencies)?
     val optimization = read_optimization(root)?
     val link = read_link(root)?
+    val lto = read_lto(root)?
 
     val keys = conf_keys(root)
 
@@ -384,7 +389,7 @@ read_manifest(text: string) -> Result[Manifest, string]
 
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
                 target_capabilities, pkg_config, headers, defines, targets, allocator, features,
-                optimization, link, warnings))
+                optimization, link, lto, warnings))
 end read_manifest
 
 // The warning a key this compiler does not know draws. **Said and then ignored, not refused**: a
@@ -623,6 +628,32 @@ private read_optimization(root: &Conf) -> Result[Option[string], string]
 
     Err(s"'optimization = \"$level\"' names no level clang has — it is one of 0, 1, 2, 3, s, z")
 end read_optimization
+
+// The `lto` key: `"thin"` or `"full"`. **A boolean is taken as well as a mode**, and only because
+// `lto = true` is what somebody writes who has not read which modes there are: it means `thin`, near an
+// ordinary link's cost for most of the benefit. `lto = false` means the same as saying nothing, so a
+// fork of a manifest can turn it off without deleting the line. Anything else is refused here rather
+// than left to arrive from inside clang with nothing naming the manifest.
+private read_lto(root: &Conf) -> Result[Option[string], string]
+    val value = conf_at(root, "lto") match
+        None -> return Ok(None)
+        Some(v) -> v
+
+    val mode = *value match
+        Flag(on) -> return Ok(if on then Some("thin") else None)
+        Text(s) -> s
+        Word(s) -> if conf_is_prose(value) then s else ""
+        _ -> ""
+
+    if mode == ""
+        return Err("'lto' says whether this project is linked with link-time optimization, so it " +
+                   "is thin or full — written as a string, or 'true' for thin, and not a block or a list")
+
+    if is_lto_mode(mode) then return Ok(Some(mode))
+
+    Err(s"'lto = \"$mode\"' names no kind of link-time optimization clang has — it is thin or full, " +
+        "or 'true' for thin")
+end read_lto
 
 // The `link` key: `"static"`, `"dynamic"`, or a list of the `pkg_config` names to link statically.
 // **An empty list is dynamic**, naming nothing to link statically. A single name written as a string
@@ -1273,4 +1304,4 @@ private known_package_key(key: string) -> bool =
 private known_top_key(key: string) -> bool =
     key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
     key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
-    key == "links" || key == "features" || key == "optimization" || key == "link"
+    key == "links" || key == "features" || key == "optimization" || key == "link" || key == "lto"

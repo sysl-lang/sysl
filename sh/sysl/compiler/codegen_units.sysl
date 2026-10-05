@@ -81,6 +81,14 @@ codegen_units(size: usize, t: Target) -> int
 
         if n >= 1 then return if n > MaxUnits then MaxUnits else n
 
+    // **Under link-time optimization the text is one unit**, as the reference's always is. Split, the
+    // units are bitcode the link optimizes across, but ThinLTO imports only what its thresholds
+    // admit, so the inlining one module had inside itself is lost at every cut: measured on slate's
+    // interpreter (`bench/`, six programs, median of five interleaved runs), eight units under
+    // `-flto=thin` ran 1.20x the bootstrap's time on the geometric mean, one unit 1.01x. The
+    // parallel compile it gives up is the cheaper half -- 75 s against 93 s for the whole build.
+    if settled_lto().is_some() then return 1
+
     if size < MinSplitBytes then return 1
 
     val cpus = int(cpu_count())
@@ -726,7 +734,10 @@ end compile_units
 // Mach-O an archive is compiled as one unit, as it always was.
 compile_object_in_units(cc: string, ir: string, obj: string, target: Target,
                         level: string) -> Result[unit, string]
-    val units = if merge_localizes_hidden(target) then codegen_units(ir.len, target) else 1
+    // A relocatable link reads objects and not the bitcode `-flto` writes, so under it the text is
+    // one unit, as a `build-c --lto` archive's always is.
+    val splits = merge_localizes_hidden(target) && settled_lto().is_none()
+    val units = if splits then codegen_units(ir.len, target) else 1
 
     if units < 2 then return compile_object(cc, ir, obj, target, level)
 
