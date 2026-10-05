@@ -1,0 +1,339 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{split, Search}
+
+// The reference's `TraitCallableTests`: a trait's member may take a BARE-ARROW callable,
+// `f: T -> U`, which is sugar for a bounded type parameter exactly as it is on a type's own member
+// (`reference/types.md § Function types`). What it buys is that nothing is boxed -- the closure is
+// a type argument and the call monomorphizes -- and what it costs is the member's table slot, a
+// member with type parameters of its own being no function until a call names them. An arrow's
+// parameter and result may name an associated-type projection, off a bounded parameter, on a
+// trait's member and on an implementation's.
+//
+// The four cases about a trait's DEFAULT body over `Self::Item` live in
+// `tests_tcl_trait_callable.sysl`.
+//
+// **Every output and diagnostic here was read out of the reference compiler (0.0.162)** by handing
+// the installed `sysl` the same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// What a program printed, or what the build had to say about it.
+private tcb_ran(text: string) -> string
+    val root = make_temp_dir("sysl-tcb").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tcb_ran
+
+// The program builds, runs and prints exactly this.
+private tcb_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    assert_eq(tcb_ran(text), want)
+
+// The build is refused, and what it said. Empty without the library.
+private tcb_refused(text: string) -> string
+    if xvr_no_library() then return ""
+
+    val root = make_temp_dir("sysl-tcb").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val made = build_native_program(root, None, None, DefaultOptimization, Some(s"$root/built"))
+
+    remove_dir_all(root).unwrap_or(())
+
+    made match
+        Err(why) -> failure_text(why)
+        Ok(_) ->
+            assert(false, "the program was accepted")
+            ""
+end tcb_refused
+
+// The whole lowered program, which has to have been accepted. Empty without the library.
+private tcb_ir(text: string) -> string
+    if xvr_no_library() then return ""
+
+    val root = make_temp_dir("sysl-tcb").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val made = emit_llvm_text(root, None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    made match
+        Err(why) ->
+            assert(false, failure_text(why))
+            ""
+        Ok(emitted) ->
+            assert(emitted.report.is_empty(), analysis_report(emitted.report))
+            emitted.text
+end tcb_ir
+
+// How many lines of the text call the allocator, as the reference's test counts them.
+private tcb_mallocs(ir: string) -> usize
+    var n: usize = 0
+
+    for line in split(ir, "\n")
+        if line.contains("call") && line.contains("@malloc") then n += 1
+
+    n
+
+// The trait every case of the first group implements, and the one type implementing it.
+private tcb_applies() -> string = raw"""
+    trait Applies
+        apply(self, f: int -> int) -> int
+    struct N
+        v: int
+    impl Applies for N
+        apply(self, f: int -> int) -> int = f(self.v)
+    """
+
+// The same pair written with the boxed spelling.
+private tcb_boxed() -> string = raw"""
+    trait Applies
+        apply(self, f: &Fn(int) -> int) -> int
+    struct N
+        v: int
+    impl Applies for N
+        apply(self, f: &Fn(int) -> int) -> int = f(self.v)
+    """
+
+// A trait with a member that has a slot and one that has none.
+private tcb_two_members() -> string = raw"""
+    trait Applies
+        tag(self) -> int
+        apply(self, f: int -> int) -> int
+    struct N
+        v: int
+    impl Applies for N
+        tag(self) -> int = self.v
+        apply(self, f: int -> int) -> int = f(self.v)
+    val o: &Applies = N(7)
+    """
+
+// A walk that counts down, answering its associated type.
+private tcb_walk() -> string = raw"""
+    trait Walk
+        type Item
+        step(*self) -> Option[Self::Item]
+    struct Down
+        n: int
+    impl Walk for Down
+        type Item = int
+        step(*self) -> Option[int]
+            if self.n <= 0 then return None
+            self.n -= 1
+            Some(self.n)
+    """
+
+// -- a trait's member takes a bare-arrow callable -------------------------------------------------
+
+@test("and the value it is called on runs it")
+tcb_the_value_it_is_called_on_runs_it() =
+    tcb_prints(tcb_applies() + "print(N(20).apply(n -> n + 1))", "21\n")
+
+// The `impl` writes the arrow again rather than the synthesized parameter; both sides are
+// rewritten the same way and line up by position.
+@test("through a bound, which is where a library would reach it")
+tcb_through_a_bound() =
+    tcb_prints(tcb_applies() + "twice[A: Applies](a: A) -> int = a.apply(n -> n * 2)\nprint(twice(N(21)))",
+               "42\n")
+
+// The result type may be the member's own parameter, which is `map`'s shape.
+@test("and the result type may be chosen by the closure")
+tcb_the_result_type_chosen_by_the_closure() =
+    tcb_prints(raw"""
+        trait Mapping[T]
+            mapped[U](self, f: T -> U) -> U
+        struct One[E]
+            v: E
+        impl[E] Mapping[E] for One[E]
+            mapped[U](self, f: E -> U) -> U = f(self.v)
+        print(One(3).mapped(n -> s"<${n}>"))
+        """, "<3>\n")
+
+// A closure handed to a bare arrow is a type argument, so the emitted program never reaches the
+// allocator.
+@test("and the closure is not boxed, which is the whole point")
+tcb_the_closure_is_not_boxed()
+    if xvr_no_library() then return
+
+    assert_eq(tcb_mallocs(tcb_ir(tcb_applies() + "print(N(20).apply(n -> n + 1))")), 0)
+
+// The comparison that says it is the SPELLING and not the trait: the boxed form allocates.
+@test("where the boxed spelling beside it does")
+tcb_where_the_boxed_spelling_does()
+    if xvr_no_library() then return
+
+    val ir = tcb_ir(tcb_boxed() + "print(N(20).apply(n -> n + 1))")
+
+    assert(tcb_mallocs(ir) > 0, ir)
+
+// -- what it costs is the table slot --------------------------------------------------------------
+
+@test("the object forms and dispatches everything else")
+tcb_the_object_dispatches_everything_else() =
+    tcb_prints(tcb_two_members() + "print(o.tag())", "7\n")
+
+@test("and refuses the one that has none")
+tcb_and_refuses_the_one_that_has_none()
+    if xvr_no_library() then return
+
+    val said = tcb_refused(tcb_two_members() + "print(o.apply(n -> n + 1))")
+
+    assert(said.contains("'apply' of 'Applies' declares type parameters of its own, so it is not a " +
+                         "function until a call names them and no slot of a &Applies's table can " +
+                         "point at it — reach it through a bound, where the type is known"), said)
+
+// So a trait meant to be erased writes the boxed form deliberately.
+@test("while the boxed spelling keeps its slot and dispatches")
+tcb_the_boxed_spelling_keeps_its_slot() =
+    tcb_prints(tcb_boxed() + "val o: &Applies = N(20)\nprint(o.apply(n -> n + 1))", "21\n")
+
+// -- one implementation answering by handing its callable to another ------------------------------
+
+// The parameter's type is by then the BOUND type parameter rather than a callable type, so passing
+// it on asks whether a value known only by its bound satisfies the same bound at the next call.
+@test("one implementation may hand its callable to another")
+tcb_one_implementation_hands_its_callable_on() =
+    tcb_prints(raw"""
+        trait Applies
+            apply(self, f: int -> int) -> int
+        struct N
+            v: int
+        struct M
+            inner: N
+        impl Applies for N
+            apply(self, f: int -> int) -> int = f(self.v)
+        impl Applies for M
+            apply(self, f: int -> int) -> int = self.inner.apply(f)
+        print(M(N(20)).apply(n -> n + 1))
+        """, "21\n")
+
+// A default body may take one too; the lowered function carries the trait's parameters and the
+// member's own together.
+@test("a default body takes one as well")
+tcb_a_default_body_takes_one() =
+    tcb_prints(raw"""
+        trait Applies
+            value(self) -> int
+            apply(self, f: int -> int) -> int = f(self.value())
+        struct N
+            v: int
+        impl Applies for N
+            value(self) -> int = self.v
+        print(N(20).apply(n -> n + 1))
+        """, "21\n")
+
+// -- an arrow may name an associated type ---------------------------------------------------------
+
+@test("off a bounded parameter")
+tcb_off_a_bounded_parameter() =
+    tcb_prints(tcb_walk() + raw"""
+        first_of[S: Walk, N](s: *S, f: S::Item -> N) -> Option[N] =
+            s.step() match
+                Some(t) -> Some(f(t))
+                None -> None
+        var d = Down(3)
+        print(first_of(&d, n -> n * 10).expect("a step"))
+        """, "20\n")
+
+// The result side of the arrow resolves through the same walk.
+@test("in the arrow's result as well as its parameter")
+tcb_in_the_arrows_result_as_well() =
+    tcb_prints(tcb_walk() + raw"""
+        made[S: Walk, N](s: *S, x: N, f: N -> S::Item) -> S::Item = f(x)
+        var d = Down(1)
+        print(made(&d, 4, n -> n + 38))
+        """, "42\n")
+
+// The same on an `impl` block's member rather than a trait's default.
+@test("and on an implementation's member")
+tcb_and_on_an_implementations_member() =
+    tcb_prints(raw"""
+        trait Mapper
+            type Item
+            over[N](self, f: Self::Item -> N) -> N
+        struct One
+            v: int
+        impl Mapper for One
+            type Item = int
+            over[N](self, f: int -> N) -> N = f(self.v)
+        print(One(20).over(n -> n + 1))
+        """, "21\n")
+
+// The boxed spelling always accepted a projection.
+@test("which the boxed spelling could already do")
+tcb_which_the_boxed_spelling_could_do() =
+    tcb_prints(tcb_walk() + raw"""
+        boxed_first[S: Walk](s: *S, f: &Fn(S::Item) -> int) -> int =
+            s.step() match
+                Some(t) -> f(t)
+                None -> 0
+        var d = Down(3)
+        print(boxed_first(&d, n -> n * 10))
+        """, "20\n")
+
+// A projection naming something the bound's trait does not declare is still refused, about the
+// parameter the reader wrote rather than the synthesized one.
+@test("while a projection the bound cannot supply is still refused")
+tcb_a_projection_the_bound_cannot_supply()
+    if xvr_no_library() then return
+
+    val said = tcb_refused(raw"""
+        trait Walk
+            type Item
+            step(*self) -> Option[Self::Item]
+        first_of[S: Walk, N](s: *S, f: S::Missing -> N) -> int = 0
+        print(1)
+        """)
+
+    assert(said.contains("'S' is not bounded by a trait declaring an associated type 'Missing', so " +
+                         "there is nothing here to say what 'S::Missing' is"), said)
+    assert(!said.contains("$F"), said)
+
+// The same on a trait's default body: the refusal survives the rewrite and names what was written.
+@test("while a default's projection the trait cannot supply is still refused")
+tcb_a_defaults_projection_the_trait_cannot_supply()
+    if xvr_no_library() then return
+
+    val said = tcb_refused(raw"""
+        trait Mapper
+            type Item
+            first(self) -> Self::Item
+            over[N](self, f: Self::Missing -> N) -> N = f(self.first())
+        struct One
+            v: int
+        impl Mapper for One
+            type Item = int
+            first(self) -> int = self.v
+        print(One(20).over(n -> n + 1))
+        """)
+
+    assert(said.contains("'Self' is not bounded by a trait declaring an associated type 'Missing', " +
+                         "so there is nothing here to say what 'Self::Missing' is"), said)
+    assert(!said.contains("$F"), said)
