@@ -1,0 +1,241 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.str_builder
+
+// What the raw tier refuses (`reference/memory.md § Reinterpreting storage`). Reading an address
+// *out of* a pointer is an ordinary conversion and reading one *into* a pointer is not, so the
+// refusals cluster on the second direction -- what `ptr_cast` may produce, and what it may be given.
+// Then the operands `sizeof` has no width to give, which must be refused before anything measures
+// them.
+//
+// **Every expected list is the reference's complete output for that program (0.0.162)**, every
+// diagnostic of it, in source order; these are its `RawStorageErrorTests`.
+
+private rsr_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+// Every diagnostic a one-file program earns, one message to a line in source order.
+private rsr_diags(text: string) -> string
+    val root = make_temp_dir("sysl-rsr").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    var b = str_builder()
+
+    emit_llvm_text(src, None) match
+        Err(why) -> b.push(s"refused: ${why.message}")
+        Ok(made) ->
+            val ordered = in_source_order(made.report)
+
+            for i in 0..<ordered.len()
+                if i > 0 then b.push("\n")
+
+                b.push(if ordered.at(i).is_error() then "error: " else "warning: ")
+                b.push(ordered.at(i).diag.message)
+
+    remove_dir_all(root).unwrap_or(())
+    b.finish()
+end rsr_diags
+
+private val rsr_arena: string ="var arena: [64]u8 = [0u8; 64]\nvar p: *u8 = &arena[0]\n"
+
+private val rsr_square: string = "trait Shape\n    area(self) -> int\nstruct Sq\n    s: int\nimpl Shape for Sq\n    area(self) -> int\n        self.s * self.s\nvar sq = Sq(2)\nvar o: *Shape = &sq\n"
+
+// ---- the target comes from the context, so a context that says nothing is refused ---------------
+
+@test("a binding with no annotation")
+rsr_a_binding_with_no_annotation()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_arena + "var q = ptr_cast(p)\n"),
+        "error: 'ptr_cast' reads an address as a pointer to some type, and nothing here says which — " +
+        "annotate the variable, field, or result it is read into")
+
+@test("a discarded expression")
+rsr_a_discarded_expression()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_arena + "ptr_cast(p)\n"),
+        "error: 'ptr_cast' reads an address as a pointer to some type, and nothing here says which — " +
+        "annotate the variable, field, or result it is read into")
+
+// ---- it never produces a reference ------------------------------------------------------------
+//
+// The one refusal about the safe subset rather than about shapes: a `&T` is counted and non-null,
+// and an address invented from bytes says neither.
+
+@test("a '&T' binding")
+rsr_a_ref_binding()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_arena + "var r: &int = ptr_cast(p)\n"),
+        "error: 'ptr_cast' never produces a reference: a '&T' is counted and non-null, and an address " +
+        "read out of bytes carries no count for anything to own — read it as a '*T'")
+
+@test("a 'weak T' binding")
+rsr_a_weak_binding()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags("struct Node\n    v: int\n" + rsr_arena + "var w: weak Node = ptr_cast(p)\n"),
+        "error: 'ptr_cast' never produces a weak reference, which is a counted reference that does not " +
+        "keep its referent alive — read the address as a '*T'")
+
+// ---- it produces a pointer, so a target that is not one is refused with what it is -----------
+
+@test("a plain scalar")
+rsr_a_plain_scalar()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_arena + "var n: int = ptr_cast(p)\n"),
+        "error: 'ptr_cast' produces a pointer, and int is not one")
+
+@test("a slice, which is a pointer and a length together")
+rsr_a_slice_is_a_pointer_and_a_length()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_arena + "var s: []u8 = ptr_cast(p)\n"),
+        "error: 'ptr_cast' produces a pointer, and a []byte is a pointer and a length together — read " +
+        "the address as a pointer and take the view from it, as 'p[0..<n]'")
+
+@test("a string, for the same reason")
+rsr_a_string_for_the_same_reason()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_arena + "var s: string = ptr_cast(p)\n"),
+        "error: 'ptr_cast' produces a pointer, and a string is a pointer and a length together — read " +
+        "the address as a pointer and take the view from it, as 'p[0..<n]'")
+
+@test("a pointer to a trait, which is two words rather than an address")
+rsr_a_trait_pointer_target()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags("trait Shape\n    area(self) -> int\n" + rsr_arena + "var o: *Shape = ptr_cast(p)\n"),
+        "error: 'ptr_cast' produces a plain pointer, and a pointer to a trait is two words — the address " +
+        "and the table of the type it was erased from, which an address alone does not say")
+
+// ---- the value it is given must be an address -------------------------------------------------
+
+@test("a fixed-width integer is not one on every target")
+rsr_a_fixed_width_integer_is_not_an_address()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_arena + "var n = 4u32\nvar q: *u8 = ptr_cast(n)\n"),
+        "error: 'ptr_cast' reads an address, and uint is not address-width — convert it first, as " +
+        "'ptr_cast(usize(n))'")
+
+@test("a value that is not a number at all")
+rsr_a_value_that_is_not_a_number()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_arena + "var q: *u8 = ptr_cast(true)\n"),
+        "error: 'ptr_cast' takes a pointer or an address-width integer, and the value has type bool")
+
+@test("a trait object, whose address half is reached by reading through it")
+rsr_a_trait_object_operand()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_square + "var q: *u8 = ptr_cast(o)\n"),
+        "error: 'ptr_cast' takes a plain pointer, and a pointer to a trait is two words — select the " +
+        "address half by reading through it, rather than reinterpreting the pair")
+
+@test("it takes exactly one value")
+rsr_it_takes_exactly_one_value()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_arena + "var q: *u8 = ptr_cast(p, p)\n"),
+        "error: 'ptr_cast' takes exactly one value, the address to read as a pointer")
+
+// ---- an address is read as 'usize' or 'isize' and not as a fixed width ------------------------
+//
+// The inverse direction is an ordinary conversion, so its refusals are the conversion table's: only
+// the two address-width targets, and nothing at all for a fat pointer.
+
+@test("a 32-bit target")
+rsr_a_32_bit_target()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_arena + "var n = u32(p)\n"),
+        "error: an address is read as 'usize' or 'isize' rather than as uint — a fixed width is not an " +
+        "address's width on every target")
+
+@test("'int', which is a fixed width like any other")
+rsr_int_is_a_fixed_width()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_arena + "var n = int(p)\n"),
+        "error: an address is read as 'usize' or 'isize' rather than as int — a fixed width is not an " +
+        "address's width on every target")
+
+@test("a pointer to a trait is not a number")
+rsr_a_trait_pointer_is_not_a_number()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags(rsr_square + "var n = usize(o)\n"),
+        "error: a pointer to a trait is two words — the address and the table of the type it was erased " +
+        "from — so it is not a number")
+
+@test("and there is no conversion the other way")
+rsr_no_conversion_the_other_way()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags("var n = 4096usize\nvar p: *u8 = n\n"),
+        "error: cannot initialize 'p': declared *byte but the value is usize")
+
+// ---- an operand that has no storage is refused before it is measured --------------------------
+//
+// The layout model has no answer for any of these, so what is pinned is that the DIAGNOSTIC arrives
+// first, keeping a reader's typo from ending in a crash.
+
+@test("a bare trait name, which is only ever the pointee of a pointer")
+rsr_a_bare_trait_name()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags("trait Shape\n    area(self) -> int\nprint(sizeof(Shape))\n"),
+        "error: 'Shape' is a trait, so it describes behaviour rather than a layout — write " +
+        "'*Shape' or '&Shape' for a trait object, or bound a type parameter with '[T: Shape]'")
+
+@test("a name that is not a type at all")
+rsr_a_name_that_is_not_a_type()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags("print(sizeof(Nope))\n"), "error: unknown type 'Nope'")
+
+@test("a name that is a value rather than a type")
+rsr_a_name_that_is_a_value()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags("var n = 3\nprint(sizeof(n))\n"), "error: unknown type 'n'")
+
+@test("a generic given the wrong number of arguments")
+rsr_a_generic_given_the_wrong_arity()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags("print(sizeof(Option[int, int]))\n"),
+        "error: type 'sysl.Option' takes 1 type argument, but 2 type arguments were given")
+
+// `unit` has a width, and an array of it is refused anyway: the array rule is about there being no
+// element to address, not about the width being zero.
+@test("a zero-sized type has a width, and an array of one is still refused")
+rsr_an_array_of_a_zero_sized_type()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags("print(sizeof([8]unit))\n"),
+        "error: unit occupies no storage, so there is nothing for an array to point at")
+
+// A type's own size cannot be part of its own layout -- C's "incomplete type", reached through the
+// array bound that asks. The diagnostic owed is the cycle, at the `sizeof` that closed it.
+@test("a type may not be laid out in terms of its own size")
+rsr_a_type_laid_out_in_terms_of_its_own_size()
+    if !rsr_ready() then return
+
+    assert_eq(rsr_diags("struct Loop\n    bytes: [sizeof(Loop)]u8\nprint(sizeof(Loop))\n"),
+        "error: type 'Loop' contains itself, so it has no finite size")

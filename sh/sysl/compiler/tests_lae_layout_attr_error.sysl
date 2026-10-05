@@ -1,0 +1,179 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// What the layout annotations refuse (`reference/attributes.md § @packed`, `§ @align`): a boundary
+// that is not one, a bound that is not constant, a layout annotation above a declaration that has no
+// layout, and the pointer a packed field cannot give. The reference's `LayoutAttrErrorTests`, case for
+// case.
+//
+// **Every expected string here was read out of the reference compiler (0.0.162)** on the same
+// program, whole -- each source is taken the whole way the reference's `err` takes it.
+
+private lae_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+        Ok(_) -> true
+
+// Everything a source has to say for itself, from the parse to the end of the analysis.
+private lae_err(text: string) -> string
+    val root = make_temp_dir("sysl-layout-attr").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end lae_err
+
+private lae_says(said: string, part: string) -> bool = said.index_of(part).is_some()
+
+private lae_packed() -> string = "@packed\nstruct Head\n    tag: u8\n    len: u32\n"
+
+@test("lae: an alignment must be a power of two")
+lae_an_alignment_must_be_a_power_of_two()
+    if !lae_ready() then return
+
+    val said = lae_err("@align(6)\nstruct S\n    a: int\n")
+
+    assert(lae_says(said, "'@align(6)' on 'S' is not an alignment — a boundary is a power of two, " +
+                    "since an address is aligned by having low bits clear"), said)
+
+@test("lae: and must be constant")
+lae_and_must_be_constant()
+    if !lae_ready() then return
+
+    val said = lae_err("var n: int = 8\n@align(n)\nstruct S\n    a: int\n")
+
+    assert(lae_says(said, "'@align' on 'S' needs a constant — a literal, a 'const', or the " +
+                    "arithmetic over them. A layout is fixed while compiling and is part of what " +
+                    "this module publishes, so it cannot wait on a value"), said)
+
+@test("lae: @align needs its parentheses")
+lae_align_needs_its_parentheses()
+    if !lae_ready() then return
+
+    val said = lae_err("@align\nstruct S\n    a: int\n")
+
+    assert(lae_says(said, "'@align' names the boundary in parentheses — '@align(64)', or " +
+                    "'@align(CACHE_LINE)' for a constant that says what the number is for. There " +
+                    "is no bare form: an alignment with no number is not a weaker claim, it is no " +
+                    "claim"), said)
+
+@test("lae: the layout attributes mark a struct, not a function")
+lae_the_layout_attributes_mark_a_struct_not_a_function()
+    if !lae_ready() then return
+
+    val said = lae_err("@packed\nf() -> int = 1\n")
+
+    assert(lae_says(said, "'@packed' describes how a struct's fields are laid out, so it can only " +
+                    "mark a struct — a 'var' or a 'val' has no fields to pack, and '@align(n)' is " +
+                    "the one of the two that may stand above one"), said)
+
+@test("lae: and a function's attributes do not mark a struct")
+lae_a_functions_attributes_do_not_mark_a_struct()
+    if !lae_ready() then return
+
+    val said = lae_err("@tailrec\nstruct S\n    a: int\n")
+
+    assert(lae_says(said, "an annotation marks a function, and only a function — neither what " +
+                    "'sysl test' calls nor what recurses is anything a declaration of another kind " +
+                    "supplies. '@packed', '@align(n)' and '@export(\"...\")' are the three that mark " +
+                    "a struct instead"), said)
+
+@test("lae: the two kinds cannot stand above one declaration")
+lae_the_two_kinds_cannot_stand_above_one_declaration()
+    if !lae_ready() then return
+
+    val said = lae_err("@packed\n@pure\nf() -> int = 1\n")
+
+    assert(lae_says(said, "'@packed' and '@align' describe a layout and the rest mark a function, " +
+                    "so they cannot stand above one declaration — a struct has no body to be " +
+                    "tail-recursive or pure in, and a function has no fields to lay out"), said)
+
+@test("lae: one written twice is refused, as any repeated attribute is")
+lae_one_written_twice_is_refused()
+    if !lae_ready() then return
+
+    val packed = lae_err("@packed\n@packed\nstruct S\n    a: int\n")
+
+    assert(lae_says(packed, "'@packed' is written twice above one declaration, and it says " +
+                    "nothing the once does not"), packed)
+
+    val aligned = lae_err("@align(4)\n@align(8)\nstruct S\n    a: int\n")
+
+    assert(lae_says(aligned, "'@align' is written twice above one declaration, and it says " +
+                    "nothing the once does not"), aligned)
+
+@test("lae: '@packed' is not the one of the pair a binding takes")
+lae_packed_is_not_the_one_a_binding_takes()
+    if !lae_ready() then return
+
+    val said = lae_err("@packed\nvar n: int = 1\nprint(n)")
+
+    assert(lae_says(said, "'@packed' describes how a struct's fields are laid out, so it can only " +
+                    "mark a struct — a 'var' or a 'val' has no fields to pack, and '@align(n)' is " +
+                    "the one of the two that may stand above one"), said)
+
+@test("lae: a binding that names several has no one object for a boundary to be about")
+lae_a_binding_of_several_has_no_one_object()
+    if !lae_ready() then return
+
+    val expected = "'@align(n)' is the boundary one object's storage begins on, and a binding " +
+        "that names several has no one object for it to be about — declare them on lines of their own"
+    val names = lae_err("@align(16)\nvar a, b = 1, 2\nprint(a)")
+
+    assert(lae_says(names, expected), names)
+
+    val pattern = lae_err("@align(16)\nval (a, b) = (1, 2)\nprint(a)")
+
+    assert(lae_says(pattern, expected), pattern)
+
+@test("lae: an aligned array whose view outlives the frame is refused rather than quietly moved")
+lae_an_aligned_array_whose_view_escapes_is_refused()
+    if !lae_ready() then return
+
+    val said = lae_err("escaping() -> []u8\n    @align(4096)\n    var page: [8]u8\n    page[0..<8]\n\n" +
+                       "print(escaping().len)\n")
+
+    assert(lae_says(said, "this view of 'page' is returned, so the array would move to the heap " +
+                    "to outlive the frame — and 'page' asked to begin on a 4096-byte boundary, " +
+                    "which is the allocator's to answer there rather than this declaration's. Keep " +
+                    "the view inside the frame, or put the boundary on a struct with '@align', " +
+                    "which every value of that type carries wherever its storage is"), said)
+
+@test("lae: the bound on a binding is held to the same rule a struct's is")
+lae_the_bound_on_a_binding_is_held_to_the_same_rule()
+    if !lae_ready() then return
+
+    val two = lae_err("@align(6)\nvar n: int = 1\nprint(n)")
+
+    assert(lae_says(two, "'@align(6)' on 'n' is not an alignment — a boundary is a power of two, " +
+                    "since an address is aligned by having low bits clear"), two)
+
+    val constant = lae_err("var k: int = 8\n@align(k)\nvar n: int = 1\nprint(n)")
+
+    assert(lae_says(constant, "'@align' on 'n' needs a constant — a literal, a 'const', or the " +
+                    "arithmetic over them. A layout is fixed while compiling and is part of what " +
+                    "this module publishes, so it cannot wait on a value"), constant)
+
+@test("lae: taking a packed field's address is refused, and says why")
+lae_taking_a_packed_fields_address_is_refused()
+    if !lae_ready() then return
+
+    val said = lae_err(lae_packed() + "var h = Head(1u8, 2u32)\nval p = &h.len\nprint(1)")
+
+    assert(lae_says(said, "'&' here makes a '*uint' into Head, which is '@packed' — its fields sit " +
+                    "at their declared offsets, so this one need not be on a 'uint' boundary, and " +
+                    "every use of a '*uint' is entitled to assume that it is. Read or write the " +
+                    "field through the struct, which is where the offset is known, or take the " +
+                    "address of the Head itself"), said)

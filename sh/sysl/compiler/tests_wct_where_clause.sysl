@@ -1,0 +1,168 @@
+module sh.sysl.compiler
+@tests
+
+// `where T: Display` — a declaration's bounds written after its signature rather than inside its
+// `[…]` list (`reference/generics.md § A bound may be written out of line`).
+//
+// **The claim is an equivalence, deliberately stronger than "the clause works".** A clause is folded
+// into the same bound map the bracket list fills, so each program below is run twice, once written
+// each way, and the two answers must equal each other as well as the expected text. A test asserting
+// only that the `where` form prints `42` would pass on an implementation that dropped the bounds,
+// since an unbounded parameter compiles until something needs the bound.
+//
+// The refusals are the other half: a clause naming something the declaration cannot bound says so at
+// the clause. Every string quoted here was read out of the reference compiler, whose
+// `WhereClauseTests` these are.
+
+// The same program in both spellings: both print `want`, and print the same thing.
+private wct_both_ways(inline: string, clause: string, want: string)
+    val a = enm_ran(inline)
+    val b = enm_ran(clause)
+
+    assert_eq(a, want)
+    assert_eq(b, want)
+    assert_eq(b, a)
+
+@test("one parameter, one bound")
+wct_one_parameter_one_bound()
+    if !enm_ready() then return
+
+    wct_both_ways("show[T: Display](x: T) -> string = str(x)\nprint(show(42))\n",
+                  "show[T](x: T) -> string where T: Display = str(x)\nprint(show(42))\n",
+                  "42\n")
+
+@test("two parameters, separated by a comma")
+wct_two_parameters()
+    if !enm_ready() then return
+
+    wct_both_ways(raw"""
+        pair[A: Display, B: Display](a: A, b: B) -> string = s"${str(a)}/${str(b)}"
+        print(pair(1, "two"))
+        """,
+                  raw"""
+        pair[A, B](a: A, b: B) -> string where A: Display, B: Display = s"${str(a)}/${str(b)}"
+        print(pair(1, "two"))
+        """,
+                  "1/two\n")
+
+@test("two bounds on one parameter, joined by '+'")
+wct_two_bounds_joined()
+    if !enm_ready() then return
+
+    wct_both_ways("same[T: Display + Eq](a: T, b: T) -> string =\n" +
+                  "    if a == b then str(a) else \"no\"\nprint(same(3, 3))\nprint(same(3, 4))\n",
+                  "same[T](a: T, b: T) -> string where T: Display + Eq =\n" +
+                  "    if a == b then str(a) else \"no\"\nprint(same(3, 3))\nprint(same(3, 4))\n",
+                  "3\nno\n")
+
+@test("a member's own parameters take one")
+wct_member_parameters()
+    if !enm_ready() then return
+
+    wct_both_ways(raw"""
+        struct Box[T: Display]
+            v: T
+            tag[U: Display](self, u: U) -> string = s"${str(self.v)}:${str(u)}"
+        print(Box(7).tag("x"))
+        """,
+                  raw"""
+        struct Box[T] where T: Display
+            v: T
+            tag[U](self, u: U) -> string where U: Display = s"${str(self.v)}:${str(u)}"
+        print(Box(7).tag("x"))
+        """,
+                  "7:x\n")
+
+// The two spellings are one bound map, so a declaration may use both: the choice is per bound rather
+// than per declaration.
+@test("the bracket list and a clause may bound the SAME parameter between them")
+wct_bracket_and_clause_together()
+    if !enm_ready() then return
+
+    wct_both_ways("same[T: Eq + Display](a: T, b: T) -> string =\n" +
+                  "    if a == b then str(a) else \"different\"\nprint(same(3, 3))\nprint(same(3, 4))\n",
+                  "same[T: Eq](a: T, b: T) -> string where T: Display =\n" +
+                  "    if a == b then str(a) else \"different\"\nprint(same(3, 3))\nprint(same(3, 4))\n",
+                  "3\ndifferent\n")
+
+@test("an enum takes one")
+wct_enum_takes_one()
+    if !enm_ready() then return
+
+    val rest = "    Empty\n    Full(x: T)\nval s: Slot[int] = Slot.Full(4)\n" +
+               "print(s match\n    Slot.Full(n) -> str(n)\n    Slot.Empty -> \"none\")\n"
+
+    wct_both_ways("enum Slot[T: Display]\n" + rest, "enum Slot[T] where T: Display\n" + rest, "4\n")
+
+// An unbounded `T` compiles right up until the body needs the bound, so a program that USES it is the
+// only thing that can tell whether the clause was read.
+@test("a body may use what the clause promised")
+wct_body_uses_the_bound()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("describe[T](x: T) -> string where T: Display = s\"<${str(x)}>\"\nprint(describe(5))\n"),
+              "<5>\n")
+
+@test("a call that does not satisfy it is refused, exactly as the bracket form is")
+wct_unsatisfied_call_refused()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Bare\n    n: int\nshow[T](x: T) -> string where T: Display = str(x)\n" +
+                       "print(show(Bare(1)))\n")
+
+    assert(enm_says(said, "requires its type parameter 'T' to implement 'sysl.Display', but Bare does not"),
+           said)
+
+@test("a name the declaration does not have")
+wct_unknown_name()
+    if !enm_ready() then return
+
+    val said = enm_err("show[T](x: T) -> string where U: Display = str(x)\nprint(show(1))\n")
+
+    assert(enm_says(said, "this declaration has no type parameter 'U', so a 'where' clause has nothing to bound — it takes 'T'"),
+           said)
+
+@test("a declaration with no parameters at all")
+wct_no_parameters()
+    if !enm_ready() then return
+
+    val said = enm_err("plain(x: int) -> int where T: Display = x\nprint(plain(1))\n")
+
+    assert(enm_says(said, "this declaration has no type parameter 'T', so a 'where' clause has nothing to bound — it takes none"),
+           said)
+
+// A value parameter's `: usize` is the type its argument must have rather than a bound, and a value
+// implements no trait, so there is nothing for a clause to add to one.
+@test("a value parameter, which has a type rather than a bound")
+wct_value_parameter()
+    if !enm_ready() then return
+
+    val said = enm_err("sum[const N: usize](xs: [N]int) -> int where N: Display = 0\nprint(sum([1, 2]))\n")
+
+    assert(enm_says(said, "'N' stands for a value rather than a type, and a value implements no trait — " +
+                          "its 'const' declaration is where the type its argument must have is written"),
+           said)
+
+@test("a clause with no ':' says which half is missing")
+wct_missing_colon()
+    if !enm_ready() then return
+
+    val said = enm_err("show[T](x: T) -> string where T = str(x)\nprint(show(1))\n")
+
+    assert(enm_says(said, "a 'where' clause names a type parameter and what it must implement, as " +
+                          "'where T: Display' — the ':' is what separates the two"),
+           said)
+
+// `where` also introduces a constrained subtype's predicate in a `type` declaration; the two are told
+// apart by position, so the word stays an ordinary identifier everywhere else.
+@test("a constrained subtype still takes its predicate")
+wct_constrained_subtype()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("type Even = new int where value % 2 == 0\nvar e = Even(4)\nprint(int(e))\n"), "4\n")
+
+@test("a program may still name a function 'where'")
+wct_function_named_where()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("where(n: int) -> int = n + 1\nprint(where(1))\n"), "2\n")

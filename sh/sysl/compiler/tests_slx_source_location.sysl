@@ -1,0 +1,244 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// What the built-ins that report a place evaluate to (`reference/lexical.md § Reserved
+// identifiers`): `__LINE__`, `__FILE__`, `__COLUMN__`, `__FUNCTION__` and the build stamp.
+//
+// The load-bearing group is *the caller's location*, at the bottom. Everything above it is a
+// constant folded into its use; the thing worth pinning is that a built-in written in a **default
+// argument** reports the call rather than the declaration -- its line, its file and its function,
+// and the OUTERMOST call's where one default fills another -- which falls out of
+// `reference/declarations.md § Default parameters and named arguments` rather than being written
+// anywhere in this feature.
+//
+// **Every string quoted here was read out of the reference compiler** (0.0.162), whose
+// `SourceLocationTests` these are. Its harness names the program `<input>`; this one writes it to
+// `main.sysl` in a directory of its own, and the reference run on that same path answers the path,
+// so that is what the file-naming claims assert.
+
+private var slx_library_cache: Buf[Program] = buf()
+private var slx_library_read: bool = false
+
+private slx_library() -> Buf[Program]
+    if slx_library_read then return slx_library_cache
+
+    slx_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> slx_library_cache = units
+
+    slx_library_cache
+end slx_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private slx_ready() -> bool
+    if slx_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end slx_ready
+
+private slx_root() -> string
+    val root = make_temp_dir("sysl-source-location").unwrap()
+
+    make_dir_all(root).unwrap()
+    root
+
+// What the program `text`, written to `<root>/main.sysl`, does, as `<exit status>: <everything it
+// printed>`. A program that could not be built answers `unbuilt: <why>`, and one a signal stopped
+// answers `signalled: …`, so neither can be mistaken for a status the program chose.
+private slx_does_at(root: string, text: string) -> string
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"unbuilt: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "unbuilt: the program that was built could not be run"
+        Ok(out) ->
+            val all = out.text + out.err.unwrap_or("")
+
+            out.status match
+                Status.Exited(code) -> s"$code: $all"
+                _ -> s"signalled: $all"
+end slx_does_at
+
+private slx_does(text: string) -> string = slx_does_at(slx_root(), text)
+
+// ---- each built-in, where it is written ----
+
+@test("__LINE__ is the line it is written on")
+slx_line_is_the_line_it_is_written_on()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("print(__LINE__)\nprint(__LINE__)\n"), "0: 1\n2\n")
+
+@test("__FILE__ is the name of the file it is written in")
+slx_file_is_the_file_it_is_written_in()
+    if !slx_ready() then return
+
+    val root = slx_root()
+
+    assert_eq(slx_does_at(root, "print(__FILE__)\n"), s"0: $root/main.sysl\n")
+
+@test("__COLUMN__ is the column it starts at")
+slx_column_is_the_column_it_starts_at()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("print(__COLUMN__)\n"), "0: 7\n")
+
+@test("__FUNCTION__ is the enclosing function, as it was written")
+slx_function_is_the_enclosing_function()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("adds_two() -> string = __FUNCTION__\nprint(adds_two())\n"), "0: adds_two\n")
+
+// A module's storage is filled before any function runs, so there is genuinely no function to name.
+@test("__FUNCTION__ is empty outside any body")
+slx_function_is_empty_outside_any_body()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("val here: string = __FUNCTION__\nprint(here.len)\n"), "0: 0\n")
+
+// A closure has no name a reader wrote, so it reports the function it is written in.
+@test("__FUNCTION__ in a closure names the function the closure is written in")
+slx_function_in_a_closure()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("apply(f: () -> string) -> string = f()\n" +
+                       "outer() -> string = apply(() -> __FUNCTION__)\nprint(outer())\n"), "0: outer\n")
+
+@test("a built-in in an ordinary body reports its own line, not its caller's")
+slx_an_ordinary_body_reports_its_own_line()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("f() -> int = __LINE__\nprint(f())\nprint(f())\n"), "0: 1\n1\n")
+
+@test("__LINE__ takes the integer type its context asks for")
+slx_line_takes_the_type_its_context_asks_for()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("var small: u16 = __LINE__\nnarrow(n: i32) -> i32 = n\n" +
+                       "print(small, narrow(__LINE__))\n"), "0: 1 3\n")
+
+// ---- the build stamp ----
+
+@test("__DATE__ is C's eleven-character date")
+slx_date_is_eleven_characters()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("print(__DATE__.len)\n"), "0: 11\n")
+
+// Indexing a string yields the byte, so the separators are the code point 58 rather than ':'.
+@test("__TIME__ is C's eight-character clock, colons and all")
+slx_time_is_eight_characters()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("print(__TIME__.len)\nprint(__TIME__[2], __TIME__[5])\n"), "0: 8\n58 58\n")
+
+// ---- a default reports the CALLER, which is the whole point of the feature ----
+
+@test("a default reports the caller: one call site")
+slx_default_one_call_site()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("where(line: int = __LINE__) -> int = line\nprint(where())\n"), "0: 2\n")
+
+@test("two call sites report their own lines from one declaration")
+slx_default_two_call_sites()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("where(line: int = __LINE__) -> int = line\nprint(where())\nprint(where())\n" +
+                       "print(where(0))\n"), "0: 2\n3\n0\n")
+
+@test("an argument written out wins, as any argument does")
+slx_default_an_argument_written_out_wins()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("where(line: int = __LINE__) -> int = line\nprint(where(99))\n"), "0: 99\n")
+
+@test("__FILE__ in a default names the file the call is in")
+slx_default_file_names_the_calls_file()
+    if !slx_ready() then return
+
+    val root = slx_root()
+
+    assert_eq(slx_does_at(root, "whence(file: string = __FILE__) -> string = file\nprint(whence())\n"),
+              s"0: $root/main.sysl\n")
+
+@test("__FUNCTION__ in a default names the calling function")
+slx_default_function_names_the_caller()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("who(name: string = __FUNCTION__) -> string = name\n" +
+                       "caller() -> string = who()\nprint(caller())\n"), "0: caller\n")
+
+// `inner()` is written on line 2, inside `outer`'s default; the call that filled that default is on
+// line 3, and it is the one reported.
+@test("the OUTERMOST call wins where a default fills another default")
+slx_default_the_outermost_call_wins()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("inner(line: int = __LINE__) -> int = line\n" +
+                       "outer(n: int = inner()) -> int = n\nprint(outer())\n"), "0: 3\n")
+
+// The standard module's `assert` is the first customer: it no longer needs a message, because the
+// place it failed is printed.
+@test("the standard module's 'assert' names where it failed")
+slx_assert_names_where_it_failed()
+    if !slx_ready() then return
+
+    val root = slx_root()
+
+    assert_eq(slx_does_at(root, "var x = 1\nassert(x == 2)\n"),
+              s"1: panic: assertion failed ($root/main.sysl:2)\n")
+
+@test("and still carries a message where one is given")
+slx_assert_still_carries_a_message()
+    if !slx_ready() then return
+
+    val root = slx_root()
+
+    assert_eq(slx_does_at(root, "assert(1 == 2, \"one is not two\")\n"),
+              s"1: panic: one is not two ($root/main.sysl:1)\n")
+
+// `assert` forwards its own file and line to `panic` rather than letting `panic` fill them, so the
+// location is the reader's call and not the line inside the library that calls `panic`.
+@test("a location forwarded through a helper stays the caller's")
+slx_a_forwarded_location_stays_the_callers()
+    if !slx_ready() then return
+
+    val root = slx_root()
+
+    assert_eq(slx_does_at(root, "panic(\"direct\")\n"), s"1: panic: direct ($root/main.sysl:1)\n")
+
+@test("a method's default reports its call site too")
+slx_a_methods_default_reports_its_call_site()
+    if !slx_ready() then return
+
+    assert_eq(slx_does("struct P\n    x: int\n    at(self, line: int = __LINE__) -> int = line\n" +
+                       "var p = P(1)\nprint(p.at())\n"), "0: 5\n")

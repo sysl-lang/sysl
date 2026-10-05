@@ -730,6 +730,13 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     val outer = a.tables.members.selves.get(d.name).unwrap_or(buf())
     var subst = joined_bindings(outer, abstract_subst(a, scope, d.tparams, d.bounds, d.tvalues,
                                                       d.tpacks, outer))
+    val settled_before = a.settled
+
+    // The parameters are final here, so a trait applied to one of them -- in the signature or in a
+    // type the body writes, `val g: Option[&Get[Y]]` -- is held to the trait's own bounds at once.
+    // The complaint is a kept one, outliving the rewind below. `Self` is not among them.
+    a.settled = joined_bindings(subst, buf())
+
     // On a generic type `Self` is the type applied to its own parameters, which is what the members
     // of one are read under.
     val written = a.tables.members.generic_self.get(d.name)
@@ -771,6 +778,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     for i in 0..<d.params.len()
         params.push((d.params.at(i).name, resolve_type(a, scope, d.params.at(i).typ, subst)))
 
+    a.settled = settled_before
     a.release(trial)
     a.restore_complaints(mark)
     rewind_instantiations(a, queued, tables, structs, enums, constrained)
