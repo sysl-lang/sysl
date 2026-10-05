@@ -1976,11 +1976,18 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
 
     if already.is_some() then return already.unwrap()
 
-    if a.tables.broken.has(key) then return Unknown
-
     // Entered before the base is resolved, so a chain that leads back here finds the mark rather
-    // than the answer.
-    a.tables.broken.put(key, true)
+    // than the answer. **The mark lets ONE reading back in**: an alias of a pointer to a struct
+    // (`type Callback = &Fn(*Loop) -> unit`) makes the struct real while its base is followed, and
+    // that struct's own fields may name the alias again (`idles: Slots[Callback]`) -- refused there,
+    // the field would keep `Unknown` for good. The second reading finds the struct already in
+    // progress and finishes; only a chain that comes round a third time is one that would not end.
+    a.tables.broken.get(key) match
+        Some(first) ->
+            if !first then return Unknown
+
+            a.tables.broken.put(key, false)
+        None -> a.tables.broken.put(key, true)
 
     val base = resolve_type(a, home, d.base, no_bindings())
 
@@ -2041,10 +2048,8 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
 
     a.tables.constrained_insts.put(key, made)
 
-    // **The mark comes off with the answer in place.** A trial reading rewinds `constrained_insts`
-    // and not `broken`, so a mark left behind would make the next reading of the name -- `idles:
-    // Slots[Callback]` after `TimerState.cb: Callback` was read inside a rewound trial -- find no
-    // answer and the mark, and come back `Unknown`.
+    // **The mark comes off with the answer in place**, so a reading after a trial that rewound
+    // `constrained_insts` (and not `broken`) starts afresh rather than finding a stale mark.
     a.tables.broken.remove(key)
     made
 end instantiate_named_subtype
