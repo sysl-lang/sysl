@@ -1,0 +1,383 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// The slot forms: what a growable container needs so that its spare capacity holds NOTHING.
+//
+// **A buffer box already says how many of its elements are real.** Its fourth header word is the
+// count the destruction hook walks, and every buffer the language makes today sets it to the whole
+// length, which is why a container written over `[fill; n]` holds a count of `fill` in every spare
+// slot. These three forms let the raw tier move that word, which turns it into the buffer's *live
+// prefix*: the slots `[0, live)` hold values and the hook releases exactly those, while the slots
+// past it hold bytes nothing reads and nothing releases.
+//
+// - `slot_storage(n) -> []T` (or `slot_storage[T](n)`) is a buffer of `n` slots with **none** live.
+// - `slot_place(xs, i, v)` puts `v` in slot `i`. The first slot past the live prefix is filled
+//   without letting go of anything, and the prefix grows by one; a live slot is an ordinary
+//   assignment; a slot further on would leave a gap the hook cannot see past, so it traps.
+// - `slot_vacate(xs, n)` lets go of every live slot from `n` on and shortens the prefix to `n` --
+//   **but only where the storage has no other holder**. A view handed out earlier, or a second copy
+//   of the container, still reads those slots, and releasing them under it would be a read of freed
+//   storage; where the strong count is above one the form does nothing, and the next vacate made
+//   once the sharing is over catches up, the prefix still covering what was left.
+//
+// **The storage is recognised by its hook, not trusted to be one.** A view's owner may be a struct
+// box (a view of an array field), a buffer some other form made, or nothing at all (static, a
+// frame, a `*T`). So `slot_storage` installs a hook of its own, `arc.slotbuf.<T>` -- the buffer walk
+// under a `weak_odr` symbol, one address in every codegen unit and in the standard module's
+// artifact, where a private helper is copied into each -- and both writing forms ask whether the
+// owner's hook is that one. Where it is not, they are an ordinary assignment and a no-op.
+//
+// **A parameter is a borrow and holds no count**, so "no other holder" means no other *counted*
+// one: a view handed down to a callee that then vacates the caller's storage through another path is
+// the one sharing the strong count cannot see.
+// An element that holds no count needs none of it: its hook walks nothing, so a place is a store and
+// a vacate is nothing.
+//
+// They are the raw tier's bargain, like `ptr_cast` and the atomics: greppable, and the caller owes
+// the one thing the compiler cannot check -- that nothing reads a slot of `[]T` past the live prefix.
+// `sysl.buf.Buf` is what writes them, so that no program has to.
+
+// The three names, whatever claims them.
+slot_form_word(name: string) -> bool =
+    name == "slot_storage" || name == "slot_place" || name == "slot_vacate"
+
+// Whether a name in call position is one of these forms. Like the atomics, a function or a local of
+// the name is what a call reaches, and the form applies only where nothing else claims it.
+slot_form(cx: &Analyzer, name: string) -> bool =
+    slot_form_word(name) && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
+
+// One of the forms, analyzed.
+slot_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr], expected: Option[Type]) -> TExpr
+    if name == "slot_storage" then return slot_storage_call(cx, span, args, expected)
+
+    slot_write_call(cx, span, name, args)
+end slot_call
+
+// `slot_storage(n)` -- the element type comes from the position, the way `ptr_cast`'s does.
+private slot_storage_call(cx: &Analyzer, span: Span, args: Buf[Expr],
+                          expected: Option[Type]) -> TExpr
+    if args.len() != 1 then
+        return cx.err(span, "'slot_storage' takes 1 argument — how many slots — but " +
+                      supplied(args.len(), "argument"))
+
+    if expected.is_none() then
+        return cx.err(span, "'slot_storage' makes storage for elements of some type, and nothing " +
+                      "here says which — write 'slot_storage[T](n)', or put it where a '[]T' is " +
+                      "expected")
+
+    val want = expected.unwrap()
+
+    val elem = underlying(want) match
+        Slice(el, read_only) ->
+            if read_only then
+                return cx.err(span, "'slot_storage' makes slots that are placed into, and " +
+                              s"${type_show(want)} is a read-only view — ask for a " +
+                              s"'[]${type_show(*el)}'")
+
+            *el
+        _ ->
+            return cx.err(span, "'slot_storage' makes a buffer, which is a '[]T', and the " +
+                          s"position here wants ${type_show(want)}")
+
+    val n = slot_count(cx, args.at(0))
+
+    TExpr(span, TSlots("slot_storage", one_texpr(n), elem, Slice(elem, false)))
+end slot_storage_call
+
+// `slot_place(xs, i, v)` and `slot_vacate(xs, n)`.
+private slot_write_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
+    val place = name == "slot_place"
+    val want: usize = if place then 3 else 2
+
+    if args.len() != want then
+        return cx.err(span, s"'$name' takes ${quantity(want, "argument")} — " +
+                      s"${if place then "a buffer, a slot and a value" else "a buffer and a slot"}" +
+                      s" — but ${supplied(args.len(), "argument")}")
+
+    val xs = type_expr_bare(cx, args.at(0))
+    val xt = texpr_type(xs)
+
+    if xt == Unknown then return bad_expr(span)
+
+    val elem = underlying(xt) match
+        Slice(el, read_only) ->
+            if read_only then
+                return cx.err(args.at(0).span, s"'$name' writes into the slots of a buffer, and " +
+                              s"${type_show(xt)} is a read-only view of one")
+
+            *el
+        _ ->
+            return cx.err(args.at(0).span, s"'$name' works on the slots of a buffer, which is a " +
+                          s"'[]T' — this is ${type_show(xt)}")
+
+    var all: Buf[TExpr] = buf()
+
+    all.push(xs)
+    all.push(slot_count(cx, args.at(1)))
+
+    if place then
+        val v = coerce(cx, type_expr(cx, args.at(2), Some(elem)), elem)
+        val vt = texpr_type(v)
+
+        if vt != Unknown && !type_eq(vt, elem) && !type_eq(underlying(vt), underlying(elem)) then
+            cx.fault(args.at(2).span, s"'slot_place' puts a ${type_show(elem)} into a slot of " +
+                     s"${type_show(xt)}, and this is a ${type_show(vt)}")
+
+        all.push(v)
+    end if
+
+    TExpr(span, TSlots(name, all, elem, Unit))
+end slot_write_call
+
+// A slot index or a count, read as an index is.
+private slot_count(cx: &Analyzer, e: Expr) -> TExpr
+    val t = type_expr(cx, e, Some(usize_type(word_bits(cx))))
+
+    repr(texpr_type(t)) match
+        Integer(_, _, _) -> ()
+        other -> if other != Unknown then
+                     cx.fault(e.span, s"a slot is counted by an integer, not ${type_show(other)}")
+
+    t
+end slot_count
+
+private one_texpr(t: TExpr) -> Buf[TExpr]
+    var out: Buf[TExpr] = buf()
+
+    out.push(t)
+    out
+end one_texpr
+
+// -- lowering --------------------------------------------------------------------------------------
+
+// One of the forms, lowered.
+gen_slots(e: *Emit, op: string, args: Buf[TExpr], elem: Type, ty: Type) -> Val
+    if op == "slot_storage" then return gen_slot_storage(e, args.at(0), elem, ty)
+
+    if op == "slot_place" then gen_slot_place(e, args.at(0), args.at(1), args.at(2), elem)
+    else gen_slot_vacate(e, args.at(0), args.at(1), elem)
+
+    VNothing
+end gen_slots
+
+// A buffer like `[v; n]`'s, with the live count stored as zero and no element written.
+private gen_slot_storage(e: *Emit, count: TExpr, elem: Type, slice_ty: Type) -> Val
+    val n = widen_index(e, count)
+    val made = gen_buffer(e, elem, n)
+
+    emit(e, InStore(word_lty(e), VInt(from_int(0)), slot_header(e, elem, made.0, header_fields()),
+                    AccPlain, None))
+
+    if contains_counted(elem) then
+        emit(e, InStore(LPtr, slot_buf_fn(e, elem), slot_header(e, elem, made.0, 1), AccPlain, None))
+
+    buffer_view(e, slice_ty, made.0, made.1, n)
+end gen_slot_storage
+
+private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Type)
+    val view = slot_view(e, xs)
+    val i = widen_index(e, index)
+
+    bounds_check(e, i, view.2)
+
+    val p = slot_at(e, elem, view.1, i)
+    val v = gen_expr(e, value)
+
+    if !contains_counted(elem)
+        emit(e, InStore(lty(e, elem), v, p, AccPlain, None))
+        return
+
+    val buffer_l = fresh_label(e, "slot.buffer")
+    val past_l = fresh_label(e, "slot.past")
+    val fresh_l = fresh_label(e, "slot.fresh")
+    val held_l = fresh_label(e, "slot.held")
+    val done_l = fresh_label(e, "slot.done")
+
+    buffer_test(e, elem, view.0, buffer_l, held_l)
+    emit_label(e, buffer_l)
+
+    val lp = slot_header(e, elem, view.0, header_fields())
+    val live = fresh_reg(e)
+
+    emit(e, InLoad(live, word_lty(e), lp, AccPlain, None))
+
+    val edge = slot_at(e, elem, slot_header(e, elem, view.0, header_fields() + 1), live)
+    val at_edge = fresh_reg(e)
+
+    emit(e, InIntCmp(at_edge, IEq, LPtr, p, edge))
+    emit_term(e, InCondBr(at_edge, fresh_l, past_l))
+
+    // A slot beyond the first free one: the hook walks a prefix, so a value there would never be let
+    // go of and the slots between would be walked as though they held something.
+    emit_label(e, past_l)
+
+    val inside = fresh_reg(e)
+
+    emit(e, InIntCmp(inside, IUlt, LPtr, p, edge))
+    trap_unless(e, inside, "slot")
+    emit_term(e, InBr(held_l))
+
+    // The first free slot: nothing is there to give back, and the prefix now covers it.
+    emit_label(e, fresh_l)
+    retain_value(e, elem, v)
+    emit(e, InStore(lty(e, elem), v, p, AccPlain, None))
+
+    val grown = fresh_reg(e)
+
+    emit(e, InBin(grown, OpAdd, word_lty(e), live, VInt(from_int(1))))
+    emit(e, InStore(word_lty(e), grown, lp, AccPlain, None))
+    emit_term(e, InBr(done_l))
+
+    emit_label(e, held_l)
+    store_into(e, elem, p, v, AccPlain)
+    emit_term(e, InBr(done_l))
+    emit_label(e, done_l)
+end gen_slot_place
+
+private gen_slot_vacate(e: *Emit, xs: TExpr, from: TExpr, elem: Type)
+    val view = slot_view(e, xs)
+    val n = widen_index(e, from)
+    val within = fresh_reg(e)
+
+    emit(e, InIntCmp(within, IUle, word_lty(e), n, view.2))
+    trap_unless(e, within, "bounds")
+
+    if !contains_counted(elem) then return
+
+    val buffer_l = fresh_label(e, "slot.buffer")
+    val sole_l = fresh_label(e, "slot.sole")
+    val drop_l = fresh_label(e, "slot.drop")
+    val kept_l = fresh_label(e, "slot.kept")
+
+    buffer_test(e, elem, view.0, buffer_l, kept_l)
+    emit_label(e, buffer_l)
+
+    // The strong count is the box's first word. Anything above one is a view or a second container
+    // still reading these slots.
+    val strong = fresh_reg(e)
+
+    emit(e, InLoad(strong, word_lty(e), view.0, AccPlain, None))
+
+    val sole = fresh_reg(e)
+
+    emit(e, InIntCmp(sole, IEq, word_lty(e), strong, VInt(from_int(1))))
+    emit_term(e, InCondBr(sole, sole_l, kept_l))
+    emit_label(e, sole_l)
+
+    val lp = slot_header(e, elem, view.0, header_fields())
+    val live = fresh_reg(e)
+
+    emit(e, InLoad(live, word_lty(e), lp, AccPlain, None))
+
+    val data = slot_header(e, elem, view.0, header_fields() + 1)
+    val cut = slot_at(e, elem, view.1, n)
+    val edge = slot_at(e, elem, data, live)
+    val more = fresh_reg(e)
+
+    emit(e, InIntCmp(more, IUlt, LPtr, cut, edge))
+    emit_term(e, InCondBr(more, drop_l, kept_l))
+    emit_label(e, drop_l)
+
+    val size = element_size(e, elem)
+    val gone = slot_distance(e, cut, edge, size)
+    val kept = slot_distance(e, data, cut, size)
+
+    // **The prefix is shortened BEFORE anything is let go of**, so a destructor that reaches this
+    // storage again finds the slots it is being run for already outside it.
+    emit(e, InStore(word_lty(e), kept, lp, AccPlain, None))
+    each_element_release(e, elem, cut, gone)
+    emit_term(e, InBr(kept_l))
+    emit_label(e, kept_l)
+end gen_slot_vacate
+
+// The owner, the first element and the length of a view.
+private slot_view(e: *Emit, xs: TExpr) -> (Val, Val, Val)
+    val lt = lty(e, texpr_type(xs))
+    val v = gen_expr(e, xs)
+    val owner = fresh_reg(e)
+
+    emit(e, InExtract(owner, lt, v, index_list(0)))
+
+    val data = fresh_reg(e)
+
+    emit(e, InExtract(data, lt, v, index_list(1)))
+
+    val len = fresh_reg(e)
+
+    emit(e, InExtract(len, lt, v, index_list(2)))
+    (owner, data, len)
+end slot_view
+
+// Branches to `yes` where `owner` is a buffer of `elem` -- non-null, and released through this element
+// type's buffer hook -- and to `no` otherwise.
+private buffer_test(e: *Emit, elem: Type, owner: Val, yes: string, no: string)
+    val owned_l = fresh_label(e, "slot.owned")
+    val present = fresh_reg(e)
+
+    emit(e, InIntCmp(present, INe, LPtr, owner, VNull))
+    emit_term(e, InCondBr(present, owned_l, no))
+    emit_label(e, owned_l)
+
+    val hook = fresh_reg(e)
+
+    emit(e, InLoad(hook, LPtr, slot_header(e, elem, owner, 1), AccPlain, None))
+
+    val mine = fresh_reg(e)
+
+    emit(e, InIntCmp(mine, IEq, LPtr, hook, slot_buf_fn(e, elem)))
+    emit_term(e, InCondBr(mine, yes, no))
+end buffer_test
+
+// The address of one word of a buffer box's header, or of its elements at `header_fields() + 1`.
+private slot_header(e: *Emit, elem: Type, owner: Val, field: int) -> Val
+    val r = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(field)))))
+    emit(e, InGep(r, buf_lty(e, elem), owner, idx))
+    r
+end slot_header
+
+private slot_at(e: *Emit, elem: Type, base: Val, i: Val) -> Val
+    val r = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(word_lty(e), i))
+    emit(e, InGep(r, lty(e, elem), base, idx))
+    r
+end slot_at
+
+// How many bytes one element takes, as the address of element one past a null base.
+private element_size(e: *Emit, elem: Type) -> Val
+    val one = slot_at(e, elem, VNull, VInt(from_int(1)))
+    val r = fresh_reg(e)
+
+    emit(e, InCast(r, CastPtrToInt, LPtr, one, word_lty(e)))
+    r
+end element_size
+
+// How many elements lie between two addresses into one buffer, `lo` first.
+private slot_distance(e: *Emit, lo: Val, hi: Val, size: Val) -> Val
+    val a = fresh_reg(e)
+
+    emit(e, InCast(a, CastPtrToInt, LPtr, lo, word_lty(e)))
+
+    val b = fresh_reg(e)
+
+    emit(e, InCast(b, CastPtrToInt, LPtr, hi, word_lty(e)))
+
+    val bytes = fresh_reg(e)
+
+    emit(e, InBin(bytes, OpSub, word_lty(e), b, a))
+
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, OpUDiv, word_lty(e), bytes, size))
+    r
+end slot_distance

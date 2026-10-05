@@ -156,6 +156,10 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
                 if written == "ptr_cast" then return ptr_cast_call(cx, span, args, targ)
 
+                // `slot_storage[T](n)` names the ELEMENT; the position the form fills is a view.
+                if written == "slot_storage" then
+                    return slot_call(cx, span, written, args, targ.map(t -> Slice(t, false)))
+
                 return cx.err(span, s"'$written' takes no type arguments")
             end if
 
@@ -695,6 +699,9 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
     // The two task forms yield to a declaration of the name for the same reason.
     if task_form(cx, name) then return Some(task_form_call(cx, span, name, args))
 
+    // The slot forms yield to a declaration of the name in the same way.
+    if slot_form(cx, name) then return Some(slot_call(cx, span, name, args, expected))
+
     if name == "str_cast" then return Some(str_cast_call(cx, span, args))
     if name == "str_alias" then return Some(str_alias_call(cx, span, args))
 
@@ -797,7 +804,7 @@ private is_trait_type(t: Type) -> bool = t match
 // decide what a **type argument** written after one means, so the atomics are in it too: they take
 // none either, and saying so is better than reporting the name as uncallable.
 private special_form_name(cx: &Analyzer, name: string) -> bool =
-    special_form_word(name) || atomic_form(cx, name) || task_form(cx, name)
+    special_form_word(name) || atomic_form(cx, name) || task_form(cx, name) || slot_form(cx, name)
 
 // The words the compiler answers itself, the atomics aside: a form belongs to no module, so an import
 // naming one is told so rather than that the module lacks it.
