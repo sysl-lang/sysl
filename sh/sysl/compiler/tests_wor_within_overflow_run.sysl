@@ -1,0 +1,183 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Arithmetic on a ranged (`within`) integer type is overflow-detecting when the operands' declared
+// ranges allow a result the base width cannot hold -- a plain instruction would wrap before the
+// produce-site range check could examine it. A range narrow enough that its results always fit the
+// width stays on the plain path, and raw integers wrap as always.
+//
+// **Every output quoted here was read out of the reference compiler**, whose `WithinOverflowRunTests`
+// these are.
+
+private var wor_library_cache: Buf[Program] = buf()
+private var wor_library_read: bool = false
+
+private wor_library() -> Buf[Program]
+    if wor_library_read then return wor_library_cache
+
+    wor_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> wor_library_cache = units
+
+    wor_library_cache
+end wor_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private wor_ready() -> bool
+    if wor_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end wor_ready
+
+// i32 holds +-2_147_483_647; the range stops well inside it so two near-maximal values sum past it.
+private wor_big() -> string = "type Big = i32 within -2000000000..2000000000\n"
+
+// u32 holds 0..4_294_967_295; again the range leaves headroom the sum of two operands can cross.
+private wor_ubig() -> string = "type UBig = u32 within 0..4000000000\n"
+
+private wor_age() -> string = "type Age = int within 0..150\n"
+
+// Builds a program and runs it: what it printed and whether it exited cleanly.
+private wor_build_and_run(text: string) -> Result[(string, bool), string]
+    val root = make_temp_dir("sysl-within-overflow").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return Err(failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> Err("the program that was built could not be run")
+        Ok(out) -> Ok((out.text, out.status.ok()))
+end wor_build_and_run
+
+// **What a program PRINTS**, which only building and running it can say.
+private wor_ran(text: string) -> string = wor_build_and_run(text) match
+    Err(why) -> why
+    Ok(got) -> got.0
+
+// **That a program STOPS ITSELF**: the status is not zero. Answers what is wrong, or the empty string.
+private wor_exits(text: string) -> string = wor_build_and_run(text) match
+    Err(why) -> why
+    Ok(got) -> if got.1 then s"it exited cleanly: ${got.0}" else ""
+
+// ---- a wide signed range detects overflow the base width cannot hold
+
+@test("addition that overflows traps")
+wor_addition_that_overflows_traps()
+    if !wor_ready() then return
+
+    assert_eq(wor_exits(wor_big() + "print(Big(2000000000) + Big(2000000000))"), "")
+
+@test("addition that fits computes normally")
+wor_addition_that_fits_computes_normally()
+    if !wor_ready() then return
+
+    assert_eq(wor_ran(wor_big() + "print(Big(1000000000) + Big(1000000000))"), "2000000000\n")
+
+@test("subtraction that underflows traps")
+wor_subtraction_that_underflows_traps()
+    if !wor_ready() then return
+
+    assert_eq(wor_exits(wor_big() + "print(Big(-2000000000) - Big(2000000000))"), "")
+
+@test("multiplication that overflows traps")
+wor_multiplication_that_overflows_traps()
+    if !wor_ready() then return
+
+    assert_eq(wor_exits(wor_big() + "print(Big(100000) * Big(100000))"), "")
+
+@test("multiplication that fits computes normally")
+wor_multiplication_that_fits_computes_normally()
+    if !wor_ready() then return
+
+    assert_eq(wor_ran(wor_big() + "print(Big(40000) * Big(40000))"), "1600000000\n")
+
+// ---- a wide unsigned range detects overflow too
+
+@test("unsigned addition past the top traps")
+wor_unsigned_addition_past_the_top_traps()
+    if !wor_ready() then return
+
+    assert_eq(wor_exits(wor_ubig() + "print(UBig(3000000000) + UBig(3000000000))"), "")
+
+@test("unsigned addition that fits computes normally")
+wor_unsigned_addition_that_fits_computes_normally()
+    if !wor_ready() then return
+
+    assert_eq(wor_ran(wor_ubig() + "print(UBig(2000000000) + UBig(2000000000))"), "4000000000\n")
+
+// ---- a wide range shifted left detects lost bits
+//
+// A left shift has no overflow intrinsic, so it is checked by shifting back: a bit pushed out of the
+// top does not return, and a shift amount at or past the width is undefined and traps.
+
+@test("a shift that pushes bits out traps")
+wor_a_shift_that_pushes_bits_out_traps()
+    if !wor_ready() then return
+
+    assert_eq(wor_exits(wor_ubig() + "print(UBig(2000000000) << 2u32)"), "")
+
+@test("a shift that fits computes normally")
+wor_a_shift_that_fits_computes_normally()
+    if !wor_ready() then return
+
+    assert_eq(wor_ran(wor_ubig() + "print(UBig(1) << 3u32)"), "8\n")
+
+@test("a shift amount at the width traps")
+wor_a_shift_amount_at_the_width_traps()
+    if !wor_ready() then return
+
+    assert_eq(wor_exits(wor_ubig() + "print(UBig(1) << 32u32)"), "")
+
+// ---- a narrow range stays on the plain path
+//
+// A narrow range can never overflow the representation on the way to the produce-site check, so the
+// range check alone catches an out-of-range value.
+
+@test("in-range arithmetic computes without an overflow check")
+wor_in_range_arithmetic_computes_without_an_overflow_check()
+    if !wor_ready() then return
+
+    assert_eq(wor_ran(wor_age() + "print(int(Age(100) + Age(40)))"), "140\n")
+
+@test("an out-of-range result is caught by the produce-site range check, not overflow")
+wor_an_out_of_range_result_is_caught_by_the_range_check()
+    if !wor_ready() then return
+
+    assert_eq(wor_exits(wor_age() + "var a: Age = Age(100) + Age(60)\nprint(int(a))"), "")
+
+// ---- the systems substrate is unchanged: raw integer arithmetic wraps at the width, never checked
+
+@test("raw integer arithmetic still wraps")
+wor_raw_integer_arithmetic_still_wraps()
+    if !wor_ready() then return
+
+    assert_eq(wor_ran("var x: i32 = 2000000000\nvar y: i32 = 2000000000\nprint(x + y)"), "-294967296\n")
