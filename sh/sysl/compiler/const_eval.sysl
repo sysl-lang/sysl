@@ -44,7 +44,7 @@ struct ConstEvaluation
     ready: bool
 
     // The bodies typed for evaluation, by the key a call names.
-    bodies: Map[string, TFunc]
+    bodies: Map[string, &TFunc]
 
     // What a call standing in a constant came to, by where it was written: the value, or the refusal
     // it earned. A constant is folded at every use, and running it again would say nothing new.
@@ -594,30 +594,134 @@ private passed(r: &EvRun, at: Span, f: Flow) -> Flow = f match
 // -- expressions -------------------------------------------------------------------------------------
 
 // **The walk is a recursion as deep as the calls it runs, so what sits on the machine's stack for
-// each level is kept small**: the forms a recursion passes through are told apart here, each handed
-// to a function of its own that is never folded back in, and every other form goes to `eval_rest`.
-// One frame holding the bindings of every form, with the helpers inlined into it, came to about
-// 32 KB a call level, and the 512 levels the design promises did not fit the 8 MB a process's
-// main thread is given.
+// each level is kept small.** A form is told apart here by its tag alone, binding nothing, and handed
+// to a function of its own (`<form>_node`) that reads the node's parts and is never folded back in --
+// so the stack holds one form's parts at each step rather than every form's. One frame holding the
+// bindings of every form, with the helpers inlined into it, came to about 32 KB a call level, and the
+// 512 levels the design promises did not fit the 8 MB a process's main thread is given.
 private eval(r: &EvRun, e: TExpr) -> Flow
     if !tick(r) then return EvStop
 
     *e.kind match
-        TIntLit(n, _) -> EvGave(ConstInt(n))
-        TBoolLit(b) -> EvGave(ConstBool(b))
-        TLoad(name, ty) -> load(r, e.span, name, ty)
-        TUnary(op, operand, ty) -> unary(r, e.span, op, operand, ty)
-        TBinary(op, l, r2, ty) -> binary(r, e.span, op, l, r2, ty)
-        TLogical(op, l, r2) -> logical(r, e.span, op, l, r2)
-        TCompare(operands, cmps) -> compare_chain(r, e.span, operands, cmps)
-        TCall(name, args, _, results) -> call(r, e.span, name, args, results)
-        TBlockExpr(b) -> block(r, b)
-        TIf(cond, then_block, else_block, _) -> ev_if(r, e.span, cond, then_block, else_block)
-        TMatch(scrutinee, arms, _) -> ev_match(r, e.span, scrutinee, arms)
+        TIntLit(_, _) -> int_node(e)
+        TBoolLit(_) -> bool_node(e)
+        TLoad(_, _) -> load_node(r, e)
+        TUnary(_, _, _) -> unary_node(r, e)
+        TBinary(_, _, _, _) -> binary_node(r, e)
+        TLogical(_, _, _) -> logical_node(r, e)
+        TCompare(_, _) -> compare_node(r, e)
+        TCall(_, _, _, _) -> call_node(r, e)
+        TBlockExpr(_) -> block_node(r, e)
+        TIf(_, _, _, _) -> if_node(r, e)
+        TMatch(_, _, _) -> match_node(r, e)
+        TLoop(_, _) -> loop_node(r, e)
+        TWhile(_, _, _, _) -> while_node(r, e)
+        TDoWhile(_, _, _, _) -> do_while_node(r, e)
+        TFor(_, _, _, _, _, _, _, _) -> for_node(r, e)
+        TCFor(_, _, _, _, _, _) -> c_for_node(r, e)
+        TStore(_, _, _) -> store_node(r, e)
+        TUpdate(_, _, _, _, _, _) -> update_node(r, e)
+        TIncDec(_, _, _, _, _) -> inc_dec_node(r, e)
         _ -> eval_rest(r, e)
 end eval
 
-// Every form `eval` does not dispatch itself.
+@noinline
+private int_node(e: TExpr) -> Flow = *e.kind match
+    TIntLit(n, _) -> EvGave(ConstInt(n))
+    _ -> EvStop
+
+@noinline
+private bool_node(e: TExpr) -> Flow = *e.kind match
+    TBoolLit(b) -> EvGave(ConstBool(b))
+    _ -> EvStop
+
+@noinline
+private load_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TLoad(name, ty) -> load(r, e.span, name, ty)
+    _ -> EvStop
+
+@noinline
+private unary_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TUnary(op, operand, ty) -> unary(r, e.span, op, operand, ty)
+    _ -> EvStop
+
+@noinline
+private binary_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TBinary(op, l, r2, ty) -> binary(r, e.span, op, l, r2, ty)
+    _ -> EvStop
+
+@noinline
+private logical_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TLogical(op, l, r2) -> logical(r, e.span, op, l, r2)
+    _ -> EvStop
+
+@noinline
+private compare_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TCompare(operands, cmps) -> compare_chain(r, e.span, operands, cmps)
+    _ -> EvStop
+
+@noinline
+private call_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TCall(name, args, _, results) -> call(r, e.span, name, args, results)
+    _ -> EvStop
+
+@noinline
+private block_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TBlockExpr(b) -> block(r, b)
+    _ -> EvStop
+
+@noinline
+private if_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TIf(cond, then_block, else_block, _) -> ev_if(r, e.span, cond, then_block, else_block)
+    _ -> EvStop
+
+@noinline
+private match_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TMatch(scrutinee, arms, _) -> ev_match(r, e.span, scrutinee, arms)
+    _ -> EvStop
+
+@noinline
+private loop_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TLoop(body, _) -> ev_loop(r, e.span, body)
+    _ -> EvStop
+
+@noinline
+private while_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TWhile(cond, body, else_block, _) -> ev_while(r, e.span, cond, body, else_block)
+    _ -> EvStop
+
+@noinline
+private do_while_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TDoWhile(body, cond, else_block, _) -> ev_do_while(r, e.span, body, cond, else_block)
+    _ -> EvStop
+
+@noinline
+private for_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TFor(name, var_ty, lo, hi, inclusive, body, else_block, _) ->
+        ev_for(r, e.span, name, var_ty, lo, hi, inclusive, body, else_block)
+    _ -> EvStop
+
+@noinline
+private c_for_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TCFor(init, cond, step, body, else_block, _) -> ev_c_for(r, e.span, init, cond, step, body, else_block)
+    _ -> EvStop
+
+@noinline
+private store_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TStore(place, value, _) -> store(r, e.span, place, value)
+    _ -> EvStop
+
+@noinline
+private update_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TUpdate(place, op, value, ty, dispatch, check) -> update(r, e.span, place, op, value, ty, dispatch, check)
+    _ -> EvStop
+
+@noinline
+private inc_dec_node(r: &EvRun, e: TExpr) -> Flow = *e.kind match
+    TIncDec(place, op, pre, ty, check) -> ev_inc_dec(r, e.span, place, op, pre, ty, check)
+    _ -> EvStop
+
+// Every form `eval` does not dispatch itself: the rarer ones, and those it refuses.
 @noinline
 private eval_rest(r: &EvRun, e: TExpr) -> Flow
     *e.kind match
@@ -633,32 +737,12 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TConstrainedCheck(value, target) -> constrained_check(r, e.span, value, target)
         TConstrainedValid(value, c) -> constrained_valid(r, e.span, value, c)
         TConstrainedStep(value, c, up, _) -> constrained_step(r, e.span, value, c, up)
-        TLoop(body, _) -> ev_loop(r, e.span, body)
-        TWhile(cond, body, else_block, _) -> ev_while(r, e.span, cond, body, else_block)
-        TDoWhile(body, cond, else_block, _) -> ev_do_while(r, e.span, body, cond, else_block)
-        TFor(name, var_ty, lo, hi, inclusive, body, else_block, _) ->
-            ev_for(r, e.span, name, var_ty, lo, hi, inclusive, body, else_block)
-        TCFor(init, cond, step, body, else_block, _) ->
-            ev_c_for(r, e.span, init, cond, step, body, else_block)
         TCheckedLoop(slot, _, inner) ->
             running(r).slots.remove(slot)
             eval(r, inner)
         TQuantifier(universal, name, _, lo, hi, inclusive, pred) ->
             quantifier(r, e.span, universal, name, lo, hi, inclusive, pred)
-        TStore(place, value, _) -> store(r, e.span, place, value)
-        TUpdate(place, op, value, ty, dispatch, check) ->
-            update(r, e.span, place, op, value, ty, dispatch, check)
-        TIncDec(place, op, pre, ty, check) -> ev_inc_dec(r, e.span, place, op, pre, ty, check)
-        TSeq(exprs) ->
-            for i in 0..<exprs.len()
-                val f = eval(r, exprs.at(i))
-
-                f match
-                    EvGave(_) -> ()
-                    EvNone -> ()
-                    _ -> return f
-
-            EvNone
+        TSeq(exprs) -> seq(r, exprs)
         TStrLit(_) -> refuse_form(r, e.span, "a 'string' is not evaluated while compiling yet")
         TStructNew(_, _) -> refuse_form(r, e.span, "a struct is not evaluated while compiling yet")
         TEnumNew(_, _, _) -> refuse_form(r, e.span, "an enum value is not evaluated while compiling yet")
@@ -670,6 +754,20 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
             refuse_form(r, e.span, s"'$op' is not evaluated while compiling yet")
         _ -> refuse_form(r, e.span, s"'${texpr_kind_name(e)}' is not evaluated while compiling yet")
 end eval_rest
+
+// Expressions run in turn for their effects.
+@noinline
+private seq(r: &EvRun, exprs: Buf[TExpr]) -> Flow
+    for i in 0..<exprs.len()
+        val f = eval(r, exprs.at(i))
+
+        f match
+            EvGave(_) -> ()
+            EvNone -> ()
+            _ -> return f
+
+    EvNone
+end seq
 
 // A step that has to come to a value.
 private eval_value(r: &EvRun, e: TExpr) -> Result[Const, Flow]
@@ -778,12 +876,14 @@ private binary(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -
         Ok(v) -> v
         Err(f) -> return f
 
-    val lt = texpr_type(l)
-    val checked = if op == "<<" then is_ranged(lt)
-    else (op == "+" || op == "-" || op == "*") && (is_ranged(lt) || is_ranged(texpr_type(rt)))
-
-    operate(r, at, op, lt, x, y, checked)
+    operate(r, at, op, texpr_type(l), x, y, checked_op(op, l, rt))
 end binary
+
+// Whether an operator is the overflow-checking form: a `within` operand makes it one.
+@noinline
+private checked_op(op: string, l: TExpr, rt: TExpr) -> bool =
+    if op == "<<" then is_ranged(texpr_type(l))
+    else (op == "+" || op == "-" || op == "*") && (is_ranged(texpr_type(l)) || is_ranged(texpr_type(rt)))
 
 // One binary operator over two values, the left operand being of type `lt`.
 @noinline
@@ -992,7 +1092,7 @@ end call
 
 // The body a call names, typed for the evaluation once and kept.
 @noinline
-private callee(r: &EvRun, at: Span, name: string) -> Option[TFunc]
+private callee(r: &EvRun, at: Span, name: string) -> Option[&TFunc]
     val ev = r.a.evaluation
     val kept = ev.bodies.get(name)
 
@@ -1035,8 +1135,10 @@ private callee(r: &EvRun, at: Span, name: string) -> Option[TFunc]
         return None
     end if
 
-    ev.bodies.put(name, typed.unwrap())
-    typed
+    val kept_now: &TFunc = typed.unwrap()
+
+    ev.bodies.put(name, kept_now)
+    Some(kept_now)
 end callee
 
 @noinline
@@ -1046,37 +1148,11 @@ private run_call(r: &EvRun, at: Span, name: string, vals: Buf[Const]) -> Flow
     if found.is_none() then return EvStop
 
     val f = found.unwrap()
-
-    for i in 0..<f.params.len()
-        val why = unheld(f.params.at(i).1)
-
-        if why.is_some() then return refuse_form(r, at, why.unwrap())
-
-    val result_why = unheld(f.ret_ty)
-
-    if result_why.is_some() then return refuse_form(r, at, result_why.unwrap())
-
-    var shown = s"${qualified_name(name)}("
-
-    for i in 0..<vals.len()
-        shown = shown + (if i > 0 then ", " else "") + value_text(vals.at(i), f.params.at(i).1)
-
-    shown = shown + ")"
-
-    val ev = r.a.evaluation
     val key = memo_key(name, vals)
-    val known = ev.memo.get(key)
 
-    if known.is_some() then return if known.unwrap().is_some() then EvGave(known.unwrap().unwrap()) else EvNone
-
-    if r.frames.len() > EvDepthLimit then
-        return refuse_form(r, at, s"the calls nest more than 512 deep, at '$shown'")
-
-    val home = func_home(r.a, name)
-    val frame: &EvFrame = EvFrame(name, shown, at, here(r), home, map(), buf(), None, map())
-
-    for i in 0..<f.params.len()
-        frame.locals.put(f.params.at(i).0, vals.at(i))
+    val frame = entered(r, at, name, vals, f, key) match
+        Ok(fr) -> fr
+        Err(fl) -> return fl
 
     // A direct self-call is where a function's `variant` is checked: the measure over the arguments
     // about to be passed has to be below the measure over the parameters as they stand.
@@ -1097,44 +1173,58 @@ private run_call(r: &EvRun, at: Span, name: string, vals: Buf[Const]) -> Flow
     r.frames.truncate(r.frames.len() - 1)
 
     out match
-        EvGave(v) -> ev.memo.put(key, Some(v))
-        EvNone -> ev.memo.put(key, None)
+        EvGave(v) -> r.a.evaluation.memo.put(key, Some(v))
+        EvNone -> r.a.evaluation.memo.put(key, None)
         _ -> ()
 
     out
 end run_call
 
+// The frame a call runs in, with its arguments bound -- or, where the call need not or may not run,
+// what it comes to instead: the value an earlier run with the same arguments gave, or the refusal of
+// a parameter or result the evaluator does not hold, or of a call nested too deep. Kept out of
+// `run_call`, which sits on the stack once per call level, so its strings do not.
+@noinline
+private entered(r: &EvRun, at: Span, name: string, vals: Buf[Const], f: &TFunc,
+                key: string) -> Result[&EvFrame, Flow]
+    for i in 0..<f.params.len()
+        val why = unheld(f.params.at(i).1)
+
+        if why.is_some() then return Err(refuse_form(r, at, why.unwrap()))
+
+    val result_why = unheld(f.ret_ty)
+
+    if result_why.is_some() then return Err(refuse_form(r, at, result_why.unwrap()))
+
+    val known = r.a.evaluation.memo.get(key)
+
+    if known.is_some() then return Err(gave(known.unwrap()))
+
+    var shown = s"${qualified_name(name)}("
+
+    for i in 0..<vals.len()
+        shown = shown + (if i > 0 then ", " else "") + value_text(vals.at(i), f.params.at(i).1)
+
+    shown = shown + ")"
+
+    if r.frames.len() > EvDepthLimit then
+        return Err(refuse_form(r, at, s"the calls nest more than 512 deep, at '$shown'"))
+
+    val frame: &EvFrame = EvFrame(name, shown, at, here(r), func_home(r.a, name), map(), buf(), None, map())
+
+    for i in 0..<f.params.len()
+        frame.locals.put(f.params.at(i).0, vals.at(i))
+
+    Ok(frame)
+end entered
+
 // The body of a call whose frame is on top: the measure, the preconditions, the snapshots `old`
 // reads, the body, and the postconditions.
 @noinline
-private run_frame(r: &EvRun, at: Span, f: TFunc, measured: bool, before: Option[Const]) -> Flow
-    val frame = r.frames.at(r.frames.len() - 1)
+private run_frame(r: &EvRun, at: Span, f: &TFunc, measured: bool, before: Option[Const]) -> Flow
+    val entry = preconditions(r, at, f, measured, before)
 
-    if measured
-        val after = eval_value(r, f.variant.unwrap()) match
-            Ok(v) -> v
-            Err(fl) -> return fl
-
-        if !below(after, before.unwrap()) then
-            return trap(r, at, s"the 'variant' of '${qualified_name(f.name)}' did not decrease: " +
-                        s"${value_text(after, texpr_type(f.variant.unwrap()))} is not below " +
-                        s"${value_text(before.unwrap(), texpr_type(f.variant.unwrap()))}")
-    end if
-
-    for i in 0..<f.requires.len()
-        val clause = f.requires.at(i).cond
-
-        if !names_ghost(r.a, clause)
-            eval_bool(r, clause) match
-                Ok(true) -> ()
-                Ok(false) ->
-                    return trap(r, clause.span, s"a 'require' of '${qualified_name(f.name)}' failed")
-                Err(fl) -> return fl
-
-    for i in 0..<f.olds.len()
-        eval_value(r, f.olds.at(i)) match
-            Ok(v) -> frame.olds.push(v)
-            Err(fl) -> return fl
+    if entry.is_some() then return entry.unwrap()
 
     val ran = block(r, f.body)
 
@@ -1144,7 +1234,52 @@ private run_frame(r: &EvRun, at: Span, f: TFunc, measured: bool, before: Option[
         EvReturn(v) -> v
         _ -> return ran
 
-    frame.result = result
+    val exit = postconditions(r, f, result)
+
+    if exit.is_some() then return exit.unwrap()
+
+    gave(result)
+end run_frame
+
+// What a call checks before its body runs -- the measure, the preconditions -- and the snapshots
+// `old` reads. Nothing where the body may run, and otherwise what stopped it.
+@noinline
+private preconditions(r: &EvRun, at: Span, f: &TFunc, measured: bool, before: Option[Const]) -> Option[Flow]
+    val frame = r.frames.at(r.frames.len() - 1)
+
+    if measured
+        val after = eval_value(r, f.variant.unwrap()) match
+            Ok(v) -> v
+            Err(fl) -> return Some(fl)
+
+        if !below(after, before.unwrap()) then
+            return Some(trap(r, at, s"the 'variant' of '${qualified_name(f.name)}' did not decrease: " +
+                             s"${value_text(after, texpr_type(f.variant.unwrap()))} is not below " +
+                             s"${value_text(before.unwrap(), texpr_type(f.variant.unwrap()))}"))
+    end if
+
+    for i in 0..<f.requires.len()
+        val clause = f.requires.at(i).cond
+
+        if !names_ghost(r.a, clause)
+            eval_bool(r, clause) match
+                Ok(true) -> ()
+                Ok(false) ->
+                    return Some(trap(r, clause.span, s"a 'require' of '${qualified_name(f.name)}' failed"))
+                Err(fl) -> return Some(fl)
+
+    for i in 0..<f.olds.len()
+        eval_value(r, f.olds.at(i)) match
+            Ok(v) -> frame.olds.push(v)
+            Err(fl) -> return Some(fl)
+
+    None
+end preconditions
+
+// What a call checks once its body has come to `result`: the postconditions, which read it.
+@noinline
+private postconditions(r: &EvRun, f: &TFunc, result: Option[Const]) -> Option[Flow]
+    r.frames.at(r.frames.len() - 1).result = result
 
     for i in 0..<f.ensures.len()
         val clause = f.ensures.at(i).cond
@@ -1153,11 +1288,11 @@ private run_frame(r: &EvRun, at: Span, f: TFunc, measured: bool, before: Option[
             eval_bool(r, clause) match
                 Ok(true) -> ()
                 Ok(false) ->
-                    return trap(r, clause.span, s"an 'ensure' of '${qualified_name(f.name)}' failed")
-                Err(fl) -> return fl
+                    return Some(trap(r, clause.span, s"an 'ensure' of '${qualified_name(f.name)}' failed"))
+                Err(fl) -> return Some(fl)
 
-    if result.is_some() then EvGave(result.unwrap()) else EvNone
-end run_frame
+    None
+end postconditions
 
 // Whether one measure is below another.
 private below(a: Const, b: Const) -> bool = (a, b) match
@@ -1166,6 +1301,7 @@ private below(a: Const, b: Const) -> bool = (a, b) match
     _ -> false
 
 // The key a run of a callee is kept by: the callee, and each argument's exact value.
+@noinline
 private memo_key(name: string, vals: Buf[Const]) -> string
     var out = name
 
@@ -1231,6 +1367,18 @@ end stmts
 private ev_stmt(r: &EvRun, s: TStmt) -> Flow
     if !tick(r) then return EvStop
 
+    // Told apart by the tag alone, as `eval` tells expressions apart, for the same reason.
+    s match
+        TVarDecl(_, _, _, _) -> var_decl_stmt(r, s)
+        TExprStmt(_) -> expr_stmt(r, s)
+        TReturn(_) -> return_stmt(r, s)
+        TBreak(_, _) -> break_stmt(r, s)
+        TContinue(depth) -> EvContinue(depth)
+        _ -> stmt_rest(r, s)
+end ev_stmt
+
+@noinline
+private var_decl_stmt(r: &EvRun, s: TStmt) -> Flow
     s match
         TVarDecl(name, ty, init, _) ->
             val why = unheld(ty)
@@ -1245,12 +1393,55 @@ private ev_stmt(r: &EvRun, s: TStmt) -> Flow
                     EvNone
                 EvNone -> EvNone
                 _ -> f
+        _ -> EvStop
+end var_decl_stmt
+
+@noinline
+private expr_stmt(r: &EvRun, s: TStmt) -> Flow
+    s match
         TExprStmt(e) ->
             val f = eval(r, e)
 
             f match
                 EvGave(_) -> EvNone
                 _ -> f
+        _ -> EvStop
+end expr_stmt
+
+@noinline
+private return_stmt(r: &EvRun, s: TStmt) -> Flow
+    s match
+        TReturn(value) ->
+            if value.is_none() then return EvReturn(None)
+
+            val f = eval(r, value.unwrap())
+
+            f match
+                EvGave(v) -> EvReturn(Some(v))
+                EvNone -> EvReturn(None)
+                _ -> f
+        _ -> EvStop
+end return_stmt
+
+@noinline
+private break_stmt(r: &EvRun, s: TStmt) -> Flow
+    s match
+        TBreak(value, depth) ->
+            if value.is_none() then return EvBreak(depth, None)
+
+            val f = eval(r, value.unwrap())
+
+            f match
+                EvGave(v) -> EvBreak(depth, Some(v))
+                EvNone -> EvBreak(depth, None)
+                _ -> f
+        _ -> EvStop
+end break_stmt
+
+// Every statement `ev_stmt` does not dispatch itself.
+@noinline
+private stmt_rest(r: &EvRun, s: TStmt) -> Flow
+    s match
         TInvariant(cond, _) ->
             if names_ghost(r.a, cond) then return EvNone
 
@@ -1264,15 +1455,6 @@ private ev_stmt(r: &EvRun, s: TStmt) -> Flow
             variant_check(r, slot, e)
         TWriteStmt(w) -> write(r, w)
         TMultiAssign(writes) -> ev_multi_assign(r, writes)
-        TReturn(value) ->
-            if value.is_none() then return EvReturn(None)
-
-            val f = eval(r, value.unwrap())
-
-            f match
-                EvGave(v) -> EvReturn(Some(v))
-                EvNone -> EvReturn(None)
-                _ -> f
         TBecome(c) ->
             val f = eval(r, c)
 
@@ -1280,21 +1462,12 @@ private ev_stmt(r: &EvRun, s: TStmt) -> Flow
                 EvGave(v) -> EvReturn(Some(v))
                 EvNone -> EvReturn(None)
                 _ -> f
-        TBreak(value, depth) ->
-            if value.is_none() then return EvBreak(depth, None)
-
-            val f = eval(r, value.unwrap())
-
-            f match
-                EvGave(v) -> EvBreak(depth, Some(v))
-                EvNone -> EvBreak(depth, None)
-                _ -> f
-        TContinue(depth) -> EvContinue(depth)
         TRefDecl(name, _, place) ->
             refuse_form(r, place.span, s"'ref $name' is not evaluated while compiling yet")
         TDefer(_) -> refuse_form(r, span_zero(), "a 'defer' is not evaluated while compiling yet")
         TAsm(_, _, _, span) -> refuse_form(r, span, "an 'asm' block is outside the program")
-end ev_stmt
+        _ -> EvStop
+end stmt_rest
 
 // A loop's measure, compared against the one the turn before took.
 @noinline
@@ -1341,6 +1514,7 @@ end store
 
 // What a compound assignment's operator makes of the place's value and the value on the right, and
 // the check a constrained place owes the result.
+@noinline
 private combined(r: &EvRun, at: Span, op: string, place_ty: Type, cur: Const, v: Const,
                  check: Option[Type]) -> Flow
     val bin = op[0..<(op.bytes.len - 1)]
@@ -1565,6 +1739,15 @@ private ev_match(r: &EvRun, at: Span, scrutinee: TExpr, arms: Buf[TArm]) -> Flow
         Ok(x) -> x
         Err(f) -> return f
 
+    chosen_arm(r, arms, v) match
+        Ok(Some(body)) -> block(r, body)
+        Ok(None) -> trap(r, at, "no arm of the 'match' took the value")
+        Err(f) -> f
+end ev_match
+
+// The body of the first arm whose pattern takes the value and whose guard holds, its bindings made.
+@noinline
+private chosen_arm(r: &EvRun, arms: Buf[TArm], v: Const) -> Result[Option[TBlock], Flow]
     for i in 0..<arms.len()
         val arm = arms.at(i)
         var hit = false
@@ -1573,17 +1756,17 @@ private ev_match(r: &EvRun, at: Span, scrutinee: TExpr, arms: Buf[TArm]) -> Flow
             if !hit
                 matches(r, arm.patterns.at(j), v) match
                     Ok(m) -> hit = m
-                    Err(f) -> return f
+                    Err(f) -> return Err(f)
 
         if hit && arm.guard.is_some()
             eval_bool(r, arm.guard.unwrap()) match
                 Ok(g) -> hit = g
-                Err(f) -> return f
+                Err(f) -> return Err(f)
 
-        if hit then return block(r, arm.body)
+        if hit then return Ok(Some(arm.body))
 
-    trap(r, at, "no arm of the 'match' took the value")
-end ev_match
+    Ok(None)
+end chosen_arm
 
 // -- loops -------------------------------------------------------------------------------------------
 
