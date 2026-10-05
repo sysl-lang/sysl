@@ -489,6 +489,14 @@ link_command(cc: string, ll: string, objects: Buf[string], exe: string, target: 
     out.push("-Wno-override-module")
     out.push(level_flag(level))
 
+    // **What the build asks of LLVM beyond the level reaches the link as it reaches every compile**
+    // (`pipeline.sysl`): `-flto` is what has the linker optimize across the bitcode the compiles
+    // wrote, and `-fprofile-generate` what links the profile runtime the instrumented code calls.
+    val piped = pipeline_flags()
+
+    for i in 0..<piped.len()
+        out.push(piped.at(i))
+
     val extra = extra_cflags()
 
     for i in 0..<extra.len()
@@ -622,8 +630,7 @@ end linker_flags
 // decision, and every one worth setting either deletes a symbol or changes the size of a state the
 // package exports as a constant.
 compile_c(cc: string, src: string, obj: string, target: Target,
-          level: string, probed: PkgAnswer, macros: Buf[string] = buf(),
-          lto: Option[string] = None) -> Result[unit, string]
+          level: string, probed: PkgAnswer, macros: Buf[string] = buf()) -> Result[unit, string]
     var args: Buf[string] = buf()
 
     args.push(s"--target=${target.triple}")
@@ -632,7 +639,11 @@ compile_c(cc: string, src: string, obj: string, target: Target,
     args.push("-ffunction-sections")
     args.push("-fdata-sections")
 
-    if lto.is_some() then args.push(s"-flto=${lto.unwrap()}")
+    // Bitcode under `-flto`, which is what lets a call from sysl into this C be inlined at the link.
+    val piped = pipeline_flags()
+
+    for i in 0..<piped.len()
+        args.push(piped.at(i))
 
     val machine = c_target_flags(target)
 
@@ -676,8 +687,13 @@ end compile_c
 // `-x ir` is what makes clang read the text as LLVM rather than guess from an extension, so the
 // caller may name the temporary whatever suits it. The sectioning flags are `compile_c`'s and are
 // here for the same reason: a library is linked by programs that reach a fraction of it.
+//
+// `piped` says whether the build's pipeline reaches this object (`pipeline.sysl`), which it does for
+// everything but an artifact's metadata: that is read back by finding its marker in the member's
+// bytes, and the bitcode `-flto` writes does not keep a string constant's bytes together. It is
+// data, so nothing is lost.
 compile_object(cc: string, ir: string, obj: string, target: Target,
-               level: string, lto: Option[string] = None) -> Result[unit, string]
+               level: string, piped: bool = true) -> Result[unit, string]
     val ll = s"$obj.ll"
 
     write_text(ll, sanitized(ir)) match
@@ -696,7 +712,11 @@ compile_object(cc: string, ir: string, obj: string, target: Target,
     args.push("-fdata-sections")
 
     // Bitcode rather than an object, for a link that optimizes across every member.
-    if lto.is_some() then args.push(s"-flto=${lto.unwrap()}")
+    if piped
+        val flags = pipeline_flags()
+
+        for i in 0..<flags.len()
+            args.push(flags.at(i))
 
     // **The extra flags reach this clang too**, or a library artifact or a `build-c` archive is
     // marked for a sanitizer whose pass never runs: the attribute says which functions to
@@ -879,6 +899,13 @@ ir_object_args(target: Target, level: string, sections: bool) -> Buf[string]
     if sections
         args.push("-ffunction-sections")
         args.push("-fdata-sections")
+
+    // **A unit is compiled under the pipeline as the whole text is**: under `-flto` each unit is
+    // bitcode, and the link optimizes across all of them and the C beside them.
+    val piped = pipeline_flags()
+
+    for i in 0..<piped.len()
+        args.push(piped.at(i))
 
     val extra = extra_cflags()
 

@@ -589,21 +589,39 @@ end target_for
 // module's artifact -- and the level names that artifact's directory. Left to clang, `-O7` and `-O-1`
 // were not refused at all: clang warns that it is using `-O3` instead, nobody is shown the warning,
 // and a whole standard module was built and kept under a key that says something else.
-build_level(path: string, given: Option[string]) -> Result[string, Failure]
+//
+// **It is the one funnel every building command comes through, so it is where the root manifest's
+// other build settings are folded in too**, as the reference folds them beside the level: its `lto`
+// (`settle_lto`) -- except for `build-c`, which says `manifest_lto = false`, its archive being for a
+// link the key was not written for -- and the keys this compiler does not understand, each said once
+// on the note channel. **Said, not swallowed**: a manifest asking for something this compiler ignores
+// silently looks configured and is not, which is how a build went unnoticed without the link-time
+// optimization its manifest asked for.
+build_level(path: string, given: Option[string], manifest_lto: bool = true) -> Result[string, Failure]
     given match
         Some(level) ->
-            for i in 0..<CommandLineLevels.len
-                if CommandLineLevels[i] == level then return Ok(level)
+            var known = false
 
-            return Err(Said(Refusal(s"'-O$level' names no level clang has — it is one of " +
-                                    join(CommandLineLevels, ", "))))
+            for i in 0..<CommandLineLevels.len
+                if CommandLineLevels[i] == level then known = true
+
+            if !known
+                return Err(Said(Refusal(s"'-O$level' names no level clang has — it is one of " +
+                                        join(CommandLineLevels, ", "))))
         None -> ()
 
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
 
     manifest_at(root) match
-        Ok(m) -> Ok(m.optimization.unwrap_or(DefaultOptimization))
-        Err(_) -> Ok(DefaultOptimization)
+        Ok(m) ->
+            for i in 0..<m.warnings.len()
+                say_note(m.warnings.at(i))
+
+            settle_lto(if manifest_lto then m.lto else None)
+            Ok(given.unwrap_or(m.optimization.unwrap_or(DefaultOptimization)))
+        Err(_) ->
+            settle_lto(None)
+            Ok(given.unwrap_or(DefaultOptimization))
 end build_level
 
 // The levels a command line may name: the manifest's six, and the two more clang has that a person
@@ -940,7 +958,7 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
 
     // A bitcode archive is one module: its units would be merged by a relocatable link, which reads
     // objects and not bitcode, and the link that reads it splits the work again anyway.
-    val compiled = if lto.is_some() then compile_object(clang, ir, code, t, level, lto)
+    val compiled = if lto.is_some() then compile_object(clang, ir, code, t, level)
     else compile_object_in_units(clang, ir, code, t, level)
 
     compiled match
@@ -978,7 +996,7 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
             make_dir_all(parent_of(obj).unwrap_or("."))
 
             compile_c(clang, found.at(j), obj, t, level, probed,
-                      defines_for(declared, found.at(j)), lto) match
+                      defines_for(declared, found.at(j))) match
                 Err(why) -> return Err(Refusal(why))
                 Ok(_) -> ()
 

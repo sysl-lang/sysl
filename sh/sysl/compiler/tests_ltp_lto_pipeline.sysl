@@ -1,0 +1,457 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_get
+import sysl.fs.{make_temp_dir, read_bytes, remove_dir_all, write_text}
+import sysl.text.Search
+
+// **What a build asks of LLVM beyond the level** (`pipeline.sysl`): the manifest's `lto`, `--lto`
+// over it, and the two ends of a profile-guided build. Each lever is asserted where it has to arrive
+// -- the link line, a codegen unit's compile, a C file's object -- and in every key a build is looked
+// up by, since a lever that reaches the bytes and not the key is a cache handing back the other build.
+//
+// Found from slate: its manifest says `lto = "thin"`, this compiler did not know the key, said nothing
+// about it, and linked a 43% slower interpreter.
+
+// A project holding `manifest` beside a one-line program.
+private ltp_project(manifest: string) -> string
+    val root = make_temp_dir("sysl-ltp").unwrap()
+
+    write_text(s"$root/package.hocon", s"package { name = \"ltp\", version = \"0.1.0\" }\n$manifest")
+        .unwrap()
+    write_text(s"$root/main.sysl", "print(1)\n").unwrap()
+    root
+end ltp_project
+
+// The command line `args` read the way a command reads it, then the root manifest folded in.
+private ltp_settled(args: []string, root: string, manifest_lto: bool = true) -> Option[string]
+    reset_search_paths()
+
+    var i: usize = 0
+
+    while i < args.len
+        if took_search_flag(args, i) == 2 then i += 1
+
+        i += 1
+
+    build_level(root, None, manifest_lto).unwrap()
+    settled_lto()
+end ltp_settled
+
+// The link line a build of `root` settled on would run.
+private ltp_link() -> Buf[string] =
+    link_command("clang", "prog.ll", buf(), "prog", host_target(), "2", buf(), no_probe())
+
+private ltp_index(line: Buf[string], word: string) -> int
+    for i in 0..<line.len()
+        if line.at(i) == word then return int(i)
+
+    -1
+
+private ltp_starting(line: Buf[string], prefix: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<line.len()
+        if line.at(i).starts_with(prefix) then out.push(line.at(i))
+
+    out
+end ltp_starting
+
+// `sysl <args>` as the command line answers it: the status, and everything it said.
+private ltp_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for i in 0..<said.len()
+        text = text + said.at(i) + "\n"
+
+    (code, text)
+end ltp_cli
+
+// -- the manifest's key, at the link -------------------------------------------------------------
+
+@test("the manifest's 'lto' reaches the link line, beside the level")
+ltp_manifest_lto_reaches_the_link()
+    val root = ltp_project("lto = \"thin\"\n")
+
+    assert_eq(ltp_settled([], root), Some("thin"))
+
+    val line = ltp_link()
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(ltp_index(line, "-flto=thin"), ltp_index(line, "-O2") + 1, joined(line, " "))
+end ltp_manifest_lto_reaches_the_link
+
+@test("and nothing is asked of LLVM where the manifest says nothing")
+ltp_no_key_no_flag()
+    val root = ltp_project("")
+
+    assert_eq(ltp_settled([], root), None)
+    assert(ltp_starting(ltp_link(), "-flto").is_empty(), joined(ltp_link(), " "))
+    assert(ltp_starting(ltp_link(), "-fprofile").is_empty(), joined(ltp_link(), " "))
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+end ltp_no_key_no_flag
+
+@test("'lto = true' is thin, and 'lto = false' is the same as saying nothing")
+ltp_a_boolean_is_taken()
+    assert_eq(read_manifest("lto = true\n").unwrap().lto, Some("thin"))
+    assert_eq(read_manifest("lto = false\n").unwrap().lto, None)
+    assert_eq(read_manifest("lto = full\n").unwrap().lto, Some("full"))
+    assert_eq(read_manifest("lto = \"thin\"\n").unwrap().lto, Some("thin"))
+
+@test("'lto' is a key this compiler knows, so it draws no warning")
+ltp_lto_is_known()
+    assert(read_manifest("lto = \"thin\"\n").unwrap().warnings.is_empty(), "lto was warned about")
+
+// -- the command line over the key --------------------------------------------------------------
+
+@test("'--lto' beats the manifest's key, as '-O' beats 'optimization'")
+ltp_flag_beats_the_manifest()
+    val root = ltp_project("lto = \"thin\"\n")
+
+    assert_eq(ltp_settled(["--lto", "full"], root), Some("full"))
+
+    val line = ltp_link()
+
+    assert_eq(ltp_settled(["--lto=full"], root), Some("full"))
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+    assert(ltp_index(line, "-flto=full") >= 0, joined(line, " "))
+    assert(ltp_index(line, "-flto=thin") < 0, joined(line, " "))
+end ltp_flag_beats_the_manifest
+
+@test("and is taken where the manifest says nothing")
+ltp_flag_alone()
+    val root = ltp_project("")
+
+    assert_eq(ltp_settled(["--lto", "thin"], root), Some("thin"))
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+// The key is how this project's own link is done, and `build-c` does no link.
+@test("build-c takes '--lto' and not the manifest's key")
+ltp_build_c_takes_the_flag_alone()
+    val root = ltp_project("lto = \"thin\"\n")
+
+    assert_eq(ltp_settled([], root, false), None)
+    assert_eq(ltp_settled(["--lto", "full"], root, false), Some("full"))
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+// -- what is refused, in the reference's words ---------------------------------------------------
+
+@test("a manifest 'lto' clang has no mode for is refused, naming the file")
+ltp_bad_key_refused()
+    val root = ltp_project("lto = \"medium\"\n")
+    val said = manifest_at(root)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Ok(_) -> panic("'lto = \"medium\"' was accepted")
+        Err(why) -> assert_eq(why.message, "package.hocon: 'lto = \"medium\"' names no kind of " +
+            "link-time optimization clang has — it is thin or full, or 'true' for thin")
+end ltp_bad_key_refused
+
+@test("and so is one that is not a mode at all")
+ltp_block_key_refused()
+    read_manifest("lto { a = 1 }\n") match
+        Ok(_) -> panic("a block was accepted as 'lto'")
+        Err(why) -> assert_eq(why, "'lto' says whether this project is linked with link-time " +
+            "optimization, so it is thin or full — written as a string, or 'true' for thin, and not " +
+            "a block or a list")
+
+@test("'--lto' naming a mode clang does not have is the command line's mistake, in either spelling")
+ltp_bad_flag_refused()
+    val apart = ltp_cli(["sysl", "build", "/somewhere", "--lto", "medium"])
+    val joined_form = ltp_cli(["sysl", "run", "/somewhere", "--lto=medium"])
+    val want = s"error: ${lto_mode_refusal("medium")}"
+
+    assert_eq(want, "error: '--lto medium' names no kind of link-time optimization clang has — it " +
+        "is thin or full")
+
+    assert_eq(apart.0, Misused)
+    assert(apart.1.starts_with(want), apart.1)
+    assert_eq(joined_form.0, Misused)
+    assert(joined_form.1.starts_with(want), joined_form.1)
+end ltp_bad_flag_refused
+
+@test("both ends of the profile workflow at once are refused")
+ltp_both_profiles_refused()
+    val got = ltp_cli(["sysl", "test", "/somewhere", "--profile-generate", "/tmp/raw", "--profile-use",
+                       "/tmp/x.profdata"])
+
+    assert_eq(got.0, Misused)
+    assert(got.1.starts_with(s"error: $ProfileBothRefusal"), got.1)
+
+@test("a profile flag with nothing after it is a misuse, answered with how the command is written")
+ltp_profile_flag_needs_a_value()
+    val got = ltp_cli(["sysl", "build", "/somewhere", "--profile-generate"])
+
+    assert_eq(got.0, Misused)
+    assert(got.1.starts_with("usage: sysl build"), got.1)
+
+// Arguments after `--` are the program's.
+@test("what follows '--' is the program's and is not read")
+ltp_program_arguments_are_not_read()
+    assert(pipeline_flag_refusal(["run", "x", "--", "--lto", "medium"]).is_none(), "the program's was read")
+
+// -- a key this compiler does not understand ------------------------------------------------------
+
+@test("a manifest key this compiler does not understand is said, once, and the build goes on")
+ltp_unknown_key_is_said()
+    val root = ltp_project("lto = \"thin\"\nfrobnicate = 1\n")
+    var said: Buf[string] = buf()
+    val sink = &said
+
+    reset_search_paths()
+    set_explain_sink((line) -> sink.push(line))
+
+    val level = build_level(root, None)
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+    assert(level.is_ok(), "the build stopped")
+    assert_eq(said.len(), 1)
+    assert_eq(said.at(0), "package.hocon: 'frobnicate' is not something this sysl understands, and " +
+        "is ignored — either it is a misspelling, or it was added by a newer compiler")
+end ltp_unknown_key_is_said
+
+// -- the profile flags, at the compile and at the link -------------------------------------------
+
+@test("'--profile-generate' reaches the link and a codegen unit's compile, its directory absolute")
+ltp_generate_reaches_compile_and_link()
+    reset_search_paths()
+    took_search_flag(["--profile-generate", "raw"], 0)
+
+    val want = s"-fprofile-generate=${absolute_path("raw")}"
+    val link = ltp_link()
+    val unit = ir_object_args(host_target(), "2", false)
+
+    reset_search_paths()
+    assert(ltp_index(link, want) >= 0, joined(link, " "))
+    assert(ltp_index(unit, want) >= 0, joined(unit, " "))
+end ltp_generate_reaches_compile_and_link
+
+@test("'--profile-use' reaches them too, and so does the manifest's 'lto'")
+ltp_use_reaches_compile_and_link()
+    val root = ltp_project("lto = \"thin\"\n")
+
+    ltp_settled(["--profile-use=/tmp/slate.profdata"], root)
+
+    val link = ltp_link()
+    val unit = ir_object_args(host_target(), "2", true)
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+    assert(ltp_index(link, "-fprofile-use=/tmp/slate.profdata") >= 0, joined(link, " "))
+    assert(ltp_index(link, "-flto=thin") >= 0, joined(link, " "))
+    assert(ltp_index(unit, "-fprofile-use=/tmp/slate.profdata") >= 0, joined(unit, " "))
+    assert(ltp_index(unit, "-flto=thin") >= 0, joined(unit, " "))
+end ltp_use_reaches_compile_and_link
+
+private ltp_clang() -> Option[string] = find_clang(host_target(), None) match
+    Ok(c) -> Some(c)
+    Err(_) -> None
+
+private ltp_head(file: string) -> Buf[u8]
+    var head: Buf[u8] = buf()
+    val bytes = read_bytes(file).unwrap()
+
+    for i in 0..<4
+        head.push(bytes[i])
+
+    head
+end ltp_head
+
+// The raw bitstream's `BC 0xC0DE`, or Apple's wrapper's `0x0B17C0DE` little-endian.
+private ltp_bitcode(h: Buf[u8]) -> bool =
+    (h.at(0) == 0x42 && h.at(1) == 0x43 && h.at(2) == 0xc0 && h.at(3) == 0xde) ||
+    (h.at(0) == 0xde && h.at(1) == 0xc0 && h.at(2) == 0x17 && h.at(3) == 0x0b)
+
+// What clang wrote is what decides it: a C file's object, the module's, and the metadata the reader
+// finds by its marker -- which stays native, the bitcode `-flto` writes not keeping its bytes together.
+@test("under '--lto' a C file and the module's text compile to bitcode, and an artifact's metadata does not")
+ltp_lto_reaches_every_compile()
+    val clang = ltp_clang() match
+        None -> return
+        Some(c) -> c
+
+    val dir = make_temp_dir("sysl-ltp-obj").unwrap()
+
+    use_c_object_cache_dir(Some(dir))
+    reset_search_paths()
+    took_search_flag(["--lto", "thin"], 0)
+    write_text(s"$dir/one.c", "int one(void) { return 1; }\n").unwrap()
+    compile_c(clang, s"$dir/one.c", s"$dir/one.o", host_target(), "1", no_probe()).unwrap()
+    compile_object(clang, "define i32 @two() {\n  ret i32 2\n}\n", s"$dir/two.o", host_target(), "1")
+        .unwrap()
+    compile_object(clang, "@meta = constant [4 x i8] c\"halt\"\n", s"$dir/meta.o", host_target(), "1",
+                   false).unwrap()
+
+    val c = ltp_head(s"$dir/one.o")
+    val text = ltp_head(s"$dir/two.o")
+    val meta = ltp_head(s"$dir/meta.o")
+
+    reset_search_paths()
+    use_c_object_cache_dir(None)
+    remove_dir_all(dir).unwrap_or(())
+    assert(ltp_bitcode(c), "the C file's object is not bitcode")
+    assert(ltp_bitcode(text),"the module's object is not bitcode")
+    assert(!ltp_bitcode(meta), "the metadata is bitcode")
+end ltp_lto_reaches_every_compile
+
+// -- codegen units under link-time optimization ---------------------------------------------------
+
+// Split under ThinLTO, slate's interpreter ran 1.20x the bootstrap's time; as one module, 1.01x.
+@test("under link-time optimization the text is compiled as one unit, however large it is")
+ltp_lto_is_one_unit()
+    if env_get("SYSL_CODEGEN_UNITS").is_some() then return
+
+    reset_search_paths()
+
+    val big: usize = 67108864
+    val plain = codegen_units(big, host_target())
+
+    took_search_flag(["--lto", "thin"], 0)
+
+    val thin = codegen_units(big, host_target())
+
+    reset_search_paths()
+    assert_eq(thin, 1)
+    assert(plain > 1 || cpu_count() < 2, s"$plain units without link-time optimization")
+end ltp_lto_is_one_unit
+
+// -- every key a build is looked up by ------------------------------------------------------------
+
+private ltp_key(root: string, args: []string) -> Option[string]
+    ltp_settled(args, root)
+
+    val key = run_cache_key_of("run", root, host_target(), "1", None)
+
+    reset_search_paths()
+    key
+end ltp_key
+
+@test("two runs differing only in what they ask of LLVM are two run-cache entries")
+ltp_the_run_key_carries_the_pipeline()
+    if std_root().is_err() then return
+
+    val root = ltp_project("")
+    val plain = ltp_key(root, [])
+    val thin = ltp_key(root, ["--lto", "thin"])
+    val full = ltp_key(root, ["--lto", "full"])
+    val generating = ltp_key(root, ["--profile-generate", "/tmp/ltp-raw"])
+    val again = ltp_key(root, ["--lto", "thin"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(plain.is_some(), "no key at all")
+    assert(plain != thin, "--lto thin replays the plain build")
+    assert(thin != full, "--lto full replays the thin one")
+    assert(plain != generating, "--profile-generate replays the plain build")
+    assert_eq(thin, again)
+end ltp_the_run_key_carries_the_pipeline
+
+@test("and the manifest's key is in it as the flag is, being the same build")
+ltp_the_run_key_reads_the_manifest()
+    if std_root().is_err() then return
+
+    val bare = ltp_project("")
+    val keyed = ltp_project("lto = \"thin\"\n")
+    val flagged = ltp_key(bare, ["--lto", "thin"])
+    val unflagged = ltp_key(bare, [])
+    val from_key = ltp_key(keyed, [])
+
+    remove_dir_all(bare).unwrap_or(())
+    remove_dir_all(keyed).unwrap_or(())
+    assert(from_key.is_some() && unflagged.is_some(), "no key")
+    assert(flagged != unflagged, "--lto is not in the key")
+    assert(pipeline_key() == "", "a reset left a lever pulled")
+end ltp_the_run_key_reads_the_manifest
+
+// A profile merged again over the same path is what the ordinary workflow does, so the path is not
+// enough: keyed on it, the second build would be handed the binary the first profile laid out.
+@test("a profile is keyed by what it says, so one merged again at the same path is another build")
+ltp_a_profile_is_keyed_by_its_bytes()
+    if std_root().is_err() then return
+
+    val root = ltp_project("")
+    val profile = s"$root/slate.profdata"
+
+    write_text(profile, "first").unwrap()
+
+    val first = ltp_key(root, ["--profile-use", profile])
+    val unit_first = ltp_unit_key(profile, root)
+    val unit_same = ltp_unit_key(profile, root)
+
+    write_text(profile, "second").unwrap()
+
+    val second = ltp_key(root, ["--profile-use", profile])
+    val unit_second = ltp_unit_key(profile, root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(first != second, "a re-merged profile replays the old build")
+    assert_eq(unit_first, unit_same)
+    assert(unit_first != unit_second, "a re-merged profile reuses a codegen unit's old object")
+end ltp_a_profile_is_keyed_by_its_bytes
+
+// A codegen unit's cache key under `--profile-use <profile>`, over a fixed text, kept under `dir`.
+private ltp_unit_key(profile: string, dir: string) -> string
+    use_c_object_cache_dir(Some(dir))
+    reset_search_paths()
+    took_search_flag(["--profile-use", profile], 0)
+
+    val key = unit_object_key("clang", "define void @f() {\n  ret void\n}\n",
+                              ir_object_args(host_target(), "1", false))
+
+    reset_search_paths()
+    use_c_object_cache_dir(None)
+    key
+end ltp_unit_key
+
+@test("the standard module's artifact is keyed by the levers, as the reference names it")
+ltp_the_std_path_carries_the_pipeline()
+    if cache_directory().is_none() then return
+
+    reset_search_paths()
+
+    val plain = std_artifact_path(host_target(), "0123456789abcdef", "2")
+
+    took_search_flag(["--lto", "thin"], 0)
+
+    val thin = std_artifact_path(host_target(), "0123456789abcdef", "2")
+
+    reset_search_paths()
+    assert(plain.index_of("-O2/").is_some(), plain)
+    assert(thin.index_of("-O2-lto-thin/").is_some(), thin)
+end ltp_the_std_path_carries_the_pipeline
+
+// -- the whole build -----------------------------------------------------------------------------
+
+// A program built under the manifest's key links -- the standard module's artifact rebuilt as bitcode
+// under a key of its own -- and the link that ran is the one asked for.
+@test("a project whose manifest says 'lto = \"thin\"' builds and runs, linked with -flto=thin")
+ltp_a_thin_build_runs()
+    if std_root().is_err() || !clang_available() then return
+
+    val root = ltp_project("lto = \"thin\"\n")
+    val cache = make_temp_dir("sysl-ltp-run").unwrap()
+
+    use_run_cache_dir(Some(cache))
+    forget_last_link()
+
+    val got = ltp_cli(["sysl", "run", root])
+    val link = last_link_command()
+
+    use_run_cache_dir(None)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    assert(link.index_of(" -flto=thin ").is_some(), link)
+end ltp_a_thin_build_runs
