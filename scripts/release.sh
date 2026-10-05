@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Cut a release of this compiler: stamp the version, build it twice, prove the two builds agree,
+# Cut a release of this compiler: stamp the version, build it three times, prove the last two agree,
 # package the second, and prove the package works from where it was unpacked.
 #
 #   scripts/release.sh <version> [--library <dir>] [--out <dir>] [--expect <sha>] [--repo <dir>] [-O<level>]
@@ -22,10 +22,14 @@
 #   2. stamp `<version>` into `const Version` (`sh/sysl/compiler/main.sysl`) and `package.version`
 #      (`package.hocon`), both under the compiler project -- the test beside `main.sysl` holds the
 #      two in step -- and commit it
-#   3. stage 1: the `sysl` on PATH (or `SYSL_RELEASE_SEED`) builds this tree
-#   4. stage 2: stage 1 builds this tree; **stage 2 is the binary that ships**
-#   5. stage 1 and stage 2 each `emit-llvm .` over this tree, and the two texts must be identical --
-#      they are one source, so a difference is stage 1 having miscompiled itself
+#   3. stage 1: the `sysl` on PATH (or `SYSL_RELEASE_SEED`) builds this tree against the SEED'S OWN
+#      library -- `SYSL_RELEASE_SEED_LIB`, else `<seed prefix>/share/sysl/library` -- since the
+#      release library may use forms the seed's library has not got and the seed cannot compile
+#   4. stage 2: stage 1 builds this tree against the RELEASE library; **stage 2 is what ships**
+#   5. stage 3: stage 2 builds this tree against the release library; stage 2 and stage 3 each
+#      `emit-llvm .` and the two texts must be identical -- one source, one library, so a difference
+#      is stage 2 having miscompiled itself. Stage 1 against stage 2 is logged and does not decide:
+#      built over two libraries, the two may differ honestly
 #   6. package `sysl-<version>-darwin-arm64.tar.gz`: `bin/sysl` and `share/sysl/library`, which is a
 #      prefix (the binary finds its library beside itself), and its sha256
 #   7. unpack it to a scratch prefix and, with that prefix's binary and no `SYSL_LIB`: `--version`;
@@ -39,7 +43,9 @@
 # wrapper every build and test step is run through, as `zsh <script> <dir> <command...>` -- the
 # census's slot script is one -- so a release waits its turn rather than racing a gate.
 #
-# `-O<level>` is handed to both stage builds; without it they take the compiler's own default.
+# `-O<level>` is handed to every stage build; without it they take the compiler's own default.
+# `--reuse-stage1` keeps a `<out>/stage1` an earlier run left rather than building it again -- the
+# seed's build is the slow one -- and says so in the log and the notes.
 # `SYSL_RELEASE_PACKAGE` names the package step 7 tests (a git URL or path; `json` by default).
 
 set -u
@@ -51,6 +57,7 @@ die() { print -u2 -r -- "release: $*"; exit 1 }
 
 version=""
 repo=""
+reuse_stage1=0
 library="${SYSL_RELEASE_LIBRARY:-}"
 out=""
 expect=""
@@ -62,6 +69,7 @@ while (( $# > 0 )); do
         --out) (( $# > 1 )) || die "--out needs a directory"; out=$2; shift 2 ;;
         --expect) (( $# > 1 )) || die "--expect needs a commit"; expect=$2; shift 2 ;;
         --repo) (( $# > 1 )) || die "--repo needs a checkout"; repo=$2; shift 2 ;;
+        --reuse-stage1) reuse_stage1=1; shift ;;
         -O?*) opt=($1); shift ;;
         -*) die "unknown flag '$1'" ;;
         *) [[ -z $version ]] || die "one version, please -- '$version' and '$1'"; version=$1; shift ;;
@@ -90,6 +98,13 @@ log=$out/release.log
 
 seed=${SYSL_RELEASE_SEED:-$(command -v sysl)}
 [[ -x $seed ]] || die "no seed compiler: put a 'sysl' on PATH or set SYSL_RELEASE_SEED"
+
+# The library the seed was released with, which is the only one it is known to compile against.
+# `:A` follows a brew symlink into the keg, where `share/sysl/library` sits beside `bin/sysl`.
+seed_lib=${SYSL_RELEASE_SEED_LIB:-${seed:A:h:h}/share/sysl/library}
+[[ -d $seed_lib/sysl ]] ||
+    die "no library for the seed $seed: '$seed_lib' is not one -- set SYSL_RELEASE_SEED_LIB to the library that seed was released with"
+seed_lib=${seed_lib:A}
 
 slot=${SYSL_RELEASE_SLOT:-}
 [[ -z $slot || -f $slot ]] || die "SYSL_RELEASE_SLOT names '$slot', which is not a file"
@@ -227,32 +242,52 @@ say "release commit: $release_commit"
 
 seed_version=$($seed --version 2>&1 | head -1)
 say "seed: $seed ($seed_version)"
-
+say "seed library: $seed_lib"
 say "compiler project: $proj"
 
-step 03-stage1 heavy $proj env SYSL_LIB=$library $seed build . $opt -o $out/stage1
+if (( reuse_stage1 )); then
+    [[ -x $out/stage1 ]] || die "--reuse-stage1, but there is no $out/stage1"
+    say "== 03-stage1 reused: $out/stage1 ($(stat -f %Sm $out/stage1))"
+    took+=("03-stage1 reused")
+else
+    step 03-stage1 heavy $proj env SYSL_LIB=$seed_lib $seed build . $opt -o $out/stage1
+fi
 step 04-stage2 heavy $proj env SYSL_LIB=$library $out/stage1 build . $opt -o $out/stage2
+step 05a-stage3 heavy $proj env SYSL_LIB=$library $out/stage2 build . $opt -o $out/stage3
 
-agree() {
-    heavy $proj env SYSL_LIB=$library $out/stage1 emit-llvm . > $out/stage1.ll || { print "stage 1 emit-llvm failed"; return 1 }
-    heavy $proj env SYSL_LIB=$library $out/stage2 emit-llvm . > $out/stage2.ll || { print "stage 2 emit-llvm failed"; return 1 }
-
-    # A slot wrapper prints one line of its own first; drop it so the texts are the compilers'.
-    local f
-    for f in $out/stage1.ll $out/stage2.ll; do
-        grep -v '^slot .* taken ' $f > $f.tmp && mv $f.tmp $f
-    done
-
-    [[ -s $out/stage1.ll ]] || { print "stage 1 emitted nothing"; return 1 }
-    if ! cmp -s $out/stage1.ll $out/stage2.ll; then
-        print "stage 1 and stage 2 emit different text for this tree:"
-        diff $out/stage1.ll $out/stage2.ll | head -40
-        return 1
-    fi
-    print -r -- "identical: $(wc -l < $out/stage1.ll | tr -d ' ') lines, $(wc -c < $out/stage1.ll | tr -d ' ') bytes"
+# `emit-llvm .` from one stage against the release library, into `<out>/<stage>.ll`, the slot
+# wrapper's own line dropped so the text is the compiler's.
+emitted() {
+    heavy $proj env SYSL_LIB=$library $out/$1 emit-llvm . > $out/$1.ll || return 1
+    grep -v '^slot .* taken ' $out/$1.ll > $out/$1.ll.tmp && mv $out/$1.ll.tmp $out/$1.ll
+    [[ -s $out/$1.ll ]]
 }
 
-step 05-stages-agree agree
+agree() {
+    emitted stage2 || { print "stage 2 emit-llvm failed"; return 1 }
+    emitted stage3 || { print "stage 3 emit-llvm failed"; return 1 }
+
+    if ! cmp -s $out/stage2.ll $out/stage3.ll; then
+        print "stage 2 and stage 3 emit different text for this tree:"
+        diff $out/stage2.ll $out/stage3.ll | head -40
+        return 1
+    fi
+    print -r -- "identical: $(wc -l < $out/stage2.ll | tr -d ' ') lines, $(wc -c < $out/stage2.ll | tr -d ' ') bytes"
+}
+
+step 05b-stages-agree agree
+
+# Stage 1 against stage 2, for the record only: built over two libraries they may differ honestly.
+if emitted stage1 > /dev/null 2>&1; then
+    if cmp -s $out/stage1.ll $out/stage2.ll; then
+        stage12="identical"
+    else
+        stage12="different ($(diff $out/stage1.ll $out/stage2.ll | grep -c '^[<>]') changed lines)"
+    fi
+else
+    stage12="stage 1 could not emit against the release library"
+fi
+say "report only -- stage 1 vs stage 2 emit-llvm: $stage12"
 
 [[ $($out/stage2 --version) == "sysl $version" ]] || die "stage 2 answers '$($out/stage2 --version)', not 'sysl $version'"
 
@@ -379,8 +414,9 @@ or download \`$asset\` below and put its \`bin/\` on your PATH; the compiler fin
 
 ## What changed versus bootstrap 0.0.162
 
-- **The compiler is written in sysl**, built by itself: stage 1 (built by $seed_version) built
-  stage 2, the binary in this tarball, and the two emit identical LLVM text for the compiler's own tree.
+- **The compiler is written in sysl**, built by itself: stage 1 (built by $seed_version against
+  its own library) built stage 2, the binary in this tarball, against the release library; stage 2
+  rebuilt itself as stage 3, and stage 2 and stage 3 emit identical LLVM text for the compiler's own tree.
 - **\`sysl doc\` is built in** and renders Markdown; there is no separate \`sysl-doc\` binary.
 - <features>
 
@@ -406,12 +442,13 @@ or download \`$asset\` below and put its \`bin/\` on your PATH; the compiler fin
 | hello, built and run | \`Hello, sysl!\` / \`42\` |
 | \`sysl test\` on $package_src | $package_summary |
 | \`sysl test share/sysl/library --std\` | $std_summary |
-| stage 1 = stage 2 (\`emit-llvm .\`) | identical |
+| stage 2 = stage 3 (\`emit-llvm .\`) | identical |
+| stage 1 vs stage 2 (report only) | $stage12 |
 
 ## Provenance
 
 - commit: \`$release_commit\` (stamp over \`$base_commit\`)
-- seed compiler: \`$seed\` — $seed_version
+- seed compiler: \`$seed\` — $seed_version, against its library \`$seed_lib\`$( (( reuse_stage1 )) && print -n ' (stage 1 reused from an earlier run)')
 - library: $library_from
 - \`$asset\`: $size bytes, sha256 \`$sha\`
 NOTES
