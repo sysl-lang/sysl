@@ -1,0 +1,408 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// `async` and `await`, the front end: the words, where `await` binds, what an async function's call
+// hands back, and every place either is refused.
+//
+// **The reference compiler has neither word**, so nothing here is read out of it: these assert the
+// approved design (stackless async written on the function, a compiler-known `Task[T]`, prefix
+// `await` binding tighter than `?`), the precedent being the self-hosted-only features before it.
+// Nothing is lowered yet -- an async body is left out of emission -- so every claim is about the
+// tree or the analysis.
+
+private var asy_library_cache: Buf[Program] = buf()
+private var asy_library_read: bool = false
+
+private asy_library() -> Buf[Program]
+    if asy_library_read then return asy_library_cache
+
+    asy_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> asy_library_cache = units
+
+    asy_library_cache
+end asy_library
+
+private asy_no_library() -> bool
+    if asy_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+    end if
+
+    false
+end asy_no_library
+
+// The whole report a one-file program is refused with, or `""` where it analyzes clean.
+private asy_refused(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.report.render(parsed.src)
+
+    var units: Buf[Program] = buf()
+    val library = asy_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end asy_refused
+
+// What a mismatch between a `Task[int]` and the `int` it ends with adds to the position's sentence.
+private asy_hint() -> string = " — calling an 'async' function hands back its task rather than " +
+    "running it, so write 'await' in front to run it and take the int it ends with"
+
+// That a report holds one complaint, worded exactly so and anchored at `line:column`.
+private asy_says(report: string, message: string, at: string)
+    assert(report.contains(s"error: $message\n --> t.sysl:$at"), report)
+
+// -- the parse: `await`'s place between the postfix forms and `?` ----------------------------------
+
+@test("await takes a call, and a call through a member")
+asy_await_takes_a_call()
+    assert_eq(pe("await f()"), "(await (call f))")
+    assert_eq(pe("await a.b(c)"), "(await (call (field a b) c))")
+    assert_eq(pe("await xs[0]"), "(await (index xs 0))")
+
+@test("await binds tighter than ?, so the ? applies to what was awaited")
+asy_await_binds_tighter_than_try()
+    assert_eq(pe("await dev.dma_read(512)?"), "(try (await (call (field dev dma_read) 512)))")
+    assert_eq(pe("await f()?.x"), "(field (try (await (call f))) x)")
+
+@test("await binds tighter than arithmetic and looser than a prefix minus's operand")
+asy_await_against_the_operators()
+    assert_eq(pe("await f() + 1"), "(+ (await (call f)) 1)")
+    assert_eq(pe("1 + await f()"), "(+ 1 (await (call f)))")
+    assert_eq(pe("-await f()"), "(- (await (call f)))")
+
+@test("moving ? below the other postfix forms changes nothing written without await")
+asy_try_reads_as_before()
+    assert_eq(pe("-a?"), "(- (try a))")
+    assert_eq(pe("a.b?.c"), "(field (try (field a b)) c)")
+    assert_eq(pe("xs[0]?"), "(try (index xs 0))")
+
+@test("await is a name wherever no operand follows it")
+asy_await_is_contextual()
+    assert_eq(pe("await(x)"), "(call await x)")
+    assert_eq(pe("await + 1"), "(+ await 1)")
+    assert_eq(pe("await.x"), "(field await x)")
+
+@test("async marks a function, a generic function and a method")
+asy_async_marks_declarations()
+    val f = pf("async load(n: int) -> int = n\n")
+    val g = pf("async same[T](x: T) -> T = x\n")
+    val m = pf("struct Dev\n    base: int\n\n    async read(self, n: int) -> int = self.base + n\n")
+
+    assert(f.contains("async ") && f.contains("$task"), f)
+    assert(g.contains("async ") && g.contains("$task"), g)
+    assert(m.contains("async ") && m.contains("$task"), m)
+
+@test("async is a name wherever no declaration follows it")
+asy_async_is_contextual()
+    assert_eq(pf_err("var async = 1\nprint(async + 1)\nasync = 2\n"), "")
+    assert_eq(pf_err("async(n: int) -> int = n\nprint(async(3))\n"), "")
+
+// -- the parse's refusals: what C calls directly cannot be async -----------------------------------
+
+@test("an @export function cannot be async")
+asy_export_cannot_be_async()
+    val text = "@export async tick() -> int = 1\n"
+
+    assert_eq(pf_err(text), "an '@export'ed function cannot be 'async': C calls it directly, and " +
+              "calling an async function only makes its task, which C has no way to drive. Export " +
+              "a plain function and keep the 'async' one behind it")
+    assert_eq(pf_at(text), "1:9")
+
+@test("an extern cannot be async")
+asy_extern_cannot_be_async()
+    val text = "async extern \"getpid\" c_pid() -> int\n"
+
+    assert_eq(pf_err(text), "an 'extern' cannot be 'async': it names a C function, called " +
+              "directly, and calling an async function only makes its task, which C has no way to " +
+              "drive")
+    assert_eq(pf_at(text), "1:1")
+
+@test("an interrupt handler cannot be async")
+asy_interrupt_cannot_be_async()
+    val text = "async interrupt timer()\n    print(1)\n"
+
+    assert_eq(pf_err(text), "an interrupt handler cannot be 'async': the hardware calls it " +
+              "directly, and calling an async function only makes its task, which nothing there can " +
+              "drive")
+    assert_eq(pf_at(text), "1:1")
+
+@test("the entry body's statements cannot be async")
+asy_entry_statement_cannot_be_async()
+    val text = "print(1)\nasync print(\"hi\")\n"
+
+    assert_eq(pf_err(text), "'async' marks a function declaration, and what follows it here is a " +
+              "statement. The statements of a body run where they stand — the entry file's are the " +
+              "program's 'main', which C calls directly and cannot drive a task through — so put " +
+              "the work in an 'async' function instead")
+    assert_eq(pf_at(text), "2:1")
+
+@test("a property cannot be async")
+asy_property_cannot_be_async()
+    val text = "struct S\n    x: int\n\n    async doubled -> int = self.x * 2\n"
+
+    assert_eq(pf_err(text), "a property cannot be 'async': it is read like a field, with no call " +
+              "to hand a task back from — make it a method, written with '()'")
+    assert_eq(pf_at(text), "4:5")
+
+// -- typing: the happy paths -----------------------------------------------------------------------
+
+@test("an async function's call is awaited to its declared result")
+asy_await_types_as_the_result()
+    if asy_no_library() then return
+
+    assert_eq(asy_refused(raw"""
+        async twice(n: int) -> int = n * 2
+
+        async run() -> int
+            val a: int = await twice(3)
+            a + await twice(4)
+        """), "")
+
+@test("await and ? together: the ? propagates out of the awaited Result")
+asy_await_then_try()
+    if asy_no_library() then return
+
+    assert_eq(asy_refused(raw"""
+        async load(n: int) -> Result[int, string]
+            if n < 0 then return Err("negative")
+            Ok(n * 2)
+
+        async total() -> Result[int, string]
+            val a = await load(1)?
+            val b: int = await load(2)?
+            Ok(a + b)
+        """), "")
+
+@test("an async method is awaited through the member, with and without ?")
+asy_async_method()
+    if asy_no_library() then return
+
+    assert_eq(asy_refused(raw"""
+        struct Dev
+            base: int
+
+            async read(self, n: int) -> int = self.base + n
+            async fetch(self, n: int) -> Result[int, string] = Ok(self.base + n)
+
+        async use_dev(d: Dev) -> Result[int, string]
+            val a = await d.read(3) + 1
+            val b = await d.fetch(a)?
+            Ok(b)
+        """), "")
+
+@test("a generic async function is awaited at the type its call solved")
+asy_generic_async()
+    if asy_no_library() then return
+
+    assert_eq(asy_refused(raw"""
+        async same[T](x: T) -> T = x
+
+        async run() -> int
+            val s: string = await same("hi")
+            await same(5) + int(s.bytes.len)
+        """), "")
+
+@test("await stands in an if's branch and in a match's arm")
+asy_await_in_branches()
+    if asy_no_library() then return
+
+    assert_eq(asy_refused(raw"""
+        async pick(n: int) -> int = n
+
+        async choose(c: bool, o: Option[int]) -> int
+            val x = if c then await pick(1) else 0
+            val y = o match
+                Some(v) -> await pick(v)
+                None -> 0
+            x + y
+        """), "")
+
+@test("Task[T] may be written, and a task held in a binding is awaited later")
+asy_task_written_and_held()
+    if asy_no_library() then return
+
+    assert_eq(asy_refused(raw"""
+        async seven() -> int = 7
+
+        async run() -> int
+            val t: Task[int] = seven()
+            await t
+        """), "")
+
+@test("an async function with no result is a Task[unit], awaited as a statement")
+asy_unit_task()
+    if asy_no_library() then return
+
+    assert_eq(asy_refused(raw"""
+        async tick()
+            print("tick")
+
+        async run()
+            await tick()
+            val t: Task[unit] = tick()
+            await t
+        """), "")
+
+@test("a program's own Task is the nearer name and captures no async function's result")
+asy_own_task_type()
+    if asy_no_library() then return
+
+    assert_eq(asy_refused(raw"""
+        struct Task
+            id: int
+
+        async seven() -> int = 7
+
+        async run() -> int
+            val mine = Task(3)
+            await seven() + mine.id
+        """), "")
+
+@test("async and await stay ordinary names in a program that uses them so")
+asy_words_as_names()
+    if asy_no_library() then return
+
+    assert_eq(asy_refused("var async = 1\nvar await = 2\nprint(async + await)\n"), "")
+    assert_eq(asy_refused("await(n: int) -> int = n\nprint(await(3))\n"), "")
+
+// -- typing: the refusals --------------------------------------------------------------------------
+
+@test("await outside an async function says to make the function async")
+asy_await_outside_async()
+    if asy_no_library() then return
+
+    asy_says(asy_refused(raw"""
+        async g() -> int = 1
+
+        f() -> int
+            await g()
+        """), "'await' may only be written in the body of an 'async' function, and the function " +
+        "it stands in is not one — write 'async' in front of its name to make it one", "4:5")
+
+@test("await in the entry file's body is refused")
+asy_await_in_entry_body()
+    if asy_no_library() then return
+
+    asy_says(asy_refused(raw"""
+        async g() -> int = 1
+
+        print(await g())
+        """), "'await' may only be written in the body of an 'async' function, and this is the " +
+        "entry file's body — the program's 'main', which C calls directly and cannot drive a task " +
+        "through. Move the work into an 'async' function", "3:7")
+
+@test("await in a closure inside an async function is refused: a closure is not async")
+asy_await_in_closure()
+    if asy_no_library() then return
+
+    asy_says(asy_refused(raw"""
+        async g() -> int = 1
+
+        async h() -> int
+            val f = () -> await g()
+            f()
+        """), "'await' cannot be written in a closure: a closure is not itself async, even inside " +
+        "an 'async' function, so there is no task of its own for it to wait in. Await in the " +
+        "enclosing function's body and hand the closure the value", "4:19")
+
+@test("await on a value that is not a task names the type it got")
+asy_await_on_a_non_task()
+    if asy_no_library() then return
+
+    asy_says(asy_refused(raw"""
+        async h(s: string) -> int
+            await s
+            1
+        """), "'await' needs a Task, which is what calling an 'async' function hands back, but " +
+        "this value is string", "2:11")
+
+@test("a task where its value was wanted suggests await: a binding's declared type")
+asy_unawaited_task_at_a_binding()
+    if asy_no_library() then return
+
+    asy_says(asy_refused(raw"""
+        async seven() -> int = 7
+
+        async run() -> int
+            val n: int = seven()
+            n
+        """), "cannot initialize 'n': declared int but the value is Task[int]" + asy_hint(), "4:5")
+
+@test("a task where its value was wanted suggests await: an argument")
+asy_unawaited_task_at_an_argument()
+    if asy_no_library() then return
+
+    asy_says(asy_refused(raw"""
+        async seven() -> int = 7
+
+        double(n: int) -> int = n * 2
+
+        async run() -> int
+            double(seven())
+        """), "'n' of 'double' is int, but Task[int] was given" + asy_hint(), "6:12")
+
+@test("a task where its value was wanted suggests await: a function's result")
+asy_unawaited_task_at_a_result()
+    if asy_no_library() then return
+
+    asy_says(asy_refused(raw"""
+        async seven() -> int = 7
+
+        async run() -> int
+            return seven()
+        """), "return type mismatch: expected int, got Task[int]" + asy_hint(), "4:5")
+
+@test("a task where its value was wanted suggests await: a body's last expression")
+asy_unawaited_task_as_a_body_value()
+    if asy_no_library() then return
+
+    val said = asy_refused(raw"""
+        async seven() -> int = 7
+
+        async run() -> int
+            seven()
+        """)
+
+    assert(said.contains("should return int, but its body yields Task[int]" + asy_hint()), said)
+
+@test("a mismatch between a task and anything but its value says nothing of await")
+asy_no_hint_for_other_mismatches()
+    if asy_no_library() then return
+
+    val said = asy_refused(raw"""
+        async seven() -> int = 7
+
+        async run() -> int
+            val s: string = seven()
+            1
+        """)
+
+    asy_says(said, "cannot initialize 's': declared string but the value is Task[int]", "4:5")
+    assert(!said.contains("write 'await'"), said)
+
+@test("Task takes one type argument")
+asy_task_arity()
+    if asy_no_library() then return
+
+    asy_says(asy_refused("f(t: Task[int, int]) -> int = 1\n"),
+             "'Task' takes one type argument — the type the task ends with — and 2 were written",
+             "1:6")

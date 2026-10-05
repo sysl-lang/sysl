@@ -341,6 +341,7 @@ private entry_body(a: &Analysis, units: Buf[Program]) -> (Buf[TStmt], string)
         // and anything else is a mismatch against `int` -- the reference's reading, since it lowers
         // the body into the `i32 @main` it emits and types the statements there.
         cx.ret_ty = Some(int_type())
+        cx.await_site = AwaitInEntry
 
         // The file the whole-program checks blame a statement of this body on. The body is not a
         // declaration, so it has no key of its own to be filed under, and one is made here rather
@@ -527,10 +528,11 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     // expected and the value it comes to is discarded -- which is why `probe() = 42` is a `unit`
     // function rather than an `int` one.
     val written = d.ret_type.map(w -> resolve_result(a, scope, w, no_bindings()))
-    val ret = declared_result_type(written)
+    val ret = body_result(d, declared_result_type(written))
 
     cx.func_name = d.name
     cx.ret_ty = Some(ret)
+    cx.await_site = await_site_of(d)
     cx.ret_is_list = written.is_some() && is_result_list(written.unwrap())
     cx.result_chain = cx.ret_is_list
 
@@ -754,10 +756,12 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     var ret = Unit
 
     if d.ret_type.is_some() then
-        ret = declared_result_type(Some(resolve_result(a, scope, d.ret_type.unwrap(), subst)))
+        ret = body_result(d, declared_result_type(Some(resolve_result(a, scope, d.ret_type.unwrap(),
+                                                                      subst))))
 
     cx.func_name = d.name
     cx.ret_ty = Some(ret)
+    cx.await_site = await_site_of(d)
     cx.ret_is_list = written_result_list(d.ret_type)
     cx.result_chain = cx.ret_is_list
 
@@ -839,6 +843,7 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
 
     cx.func_name = d.name
     cx.ret_ty = Some(Unknown)
+    cx.await_site = await_site_of(d)
     cx.ret_is_list = false
 
     val split = contract_length(d.body)
@@ -971,11 +976,12 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
 
         params.push((unique, p.1))
 
-    val ret = sig.unwrap().ret
+    val ret = body_result(d, sig.unwrap().ret)
 
     cx.func_name = name
     note_body_covers(a, name)
     cx.ret_ty = Some(ret)
+    cx.await_site = await_site_of(d)
     cx.ret_is_list = written_result_list(d.ret_type)
     cx.result_chain = cx.ret_is_list
     // An instantiation of a variadic generic is as variadic as the declaration, so its body may
@@ -1034,7 +1040,8 @@ body_disagreement(name: string, ret: Type, got: Type, listed: bool) -> string
 
     val declared = if listed then as_written_results(ret) else ret
 
-    s"function '$name' should return ${type_show(declared)}, but its body yields ${type_show(got)}"
+    s"function '$name' should return ${type_show(declared)}, but its body yields " +
+        s"${type_show(got)}${await_hint(got, ret)}"
 end body_disagreement
 
 // The tuple a result list lays out as, given back its written shape for a diagnostic.
@@ -1563,7 +1570,7 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
                     if disagree(got, ty) then
                         cx.fault(d.span, s"cannot initialize '${d.name}': declared ${type_show(ty)} but " +
-                                 s"the value is ${type_show(got)}")
+                                 s"the value is ${type_show(got)}${await_hint(got, ty)}")
 
                     refuse_storage_slots(cx, init.unwrap())
                 else if !mentions_unknown(ty) && !has_zero(ty)

@@ -909,6 +909,10 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
         return Unknown
     end if
 
+    // An async function's result, as the parser rewrote it: the name holds a `$`, so nothing a
+    // program declares can stand in front of it.
+    if name == TaskBase && targs.len() == 1 then return task_type(targs.at(0))
+
     val scalar = scalar_named(name, int(a.tables.target.pointer_bits()))
 
     if scalar.is_some() then return plain_type(a, scope, span, name, targs, scalar.unwrap())
@@ -926,6 +930,10 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
 
     if key.is_none() then
         val rivals = offered_by(a, scope, name, k -> a.tables.types.has(k))
+
+        // `Task[T]` is the compiler's, and only where nothing the program can see is called `Task`
+        // -- a declaration of that name is the nearer binding, as it is for any other type.
+        if name == "Task" && rivals.is_empty() then return written_task(a, scope, span, targs)
 
         if rivals.len() > 1 then a.fault(scope, span, ambiguous_offer(name, rivals))
         else a.fault(scope, span, s"unknown type '$name'")

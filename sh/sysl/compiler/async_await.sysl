@@ -1,0 +1,123 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `async` and `await`, as far as the front end goes: what an async function's call hands back,
+// where an `await` may stand, and what it may wait for.
+//
+// **Stackless async, written on the function.** `async load(dev: &Codec) -> Result[Frame, Error]`
+// declares a function whose CALL does not run it: the call makes a task, of the compiler's own type
+// `Task[T]`, and the body runs only when the task is awaited or handed to something that drives it.
+// So the parser rewrites the written result to `Task[T]` (`async_result`) and every caller, through
+// every path a call is typed by, reads the task; the body alone is read against `T`
+// (`body_result`), which is what its `return`s and its `?`s answer.
+//
+// **`await e` needs `e : Task[T]` and is `T`.** It binds looser than a call and tighter than `?`,
+// so `await dev.read(512)?` propagates out of the awaited `Result`. It may stand only in an async
+// function's own body: a closure is not itself async, even one written inside an async function,
+// and the entry file's body is the program's `main`, which C calls directly.
+//
+// The reference compiler has neither word, so nothing here is checked against it; the design is the
+// user's, and `tests_asy_async.sysl` asserts it.
+
+// The base a task's type is filed under, and the name the parser writes for one. It holds a `$`,
+// which no identifier may, so a program's own `Task` is never this one.
+const TaskBase: string = "$task"
+
+// `Task[T]`. A struct the compiler supplies: opaque, with no fields a program can read, and equal to
+// another task exactly where the two `T`s are equal.
+task_type(result: Type) -> Type
+    var args: Buf[Type] = buf()
+
+    args.push(result)
+    Struct(StructType(TaskBase, args, buf(), false, None, None, true))
+end task_type
+
+// The `T` of a `Task[T]`, or nothing where the type is not a task.
+task_result(t: Type) -> Option[Type] = t match
+    Struct(d) -> if d.base == TaskBase && d.targs.len() == 1 then Some(d.targs.at(0)) else None
+    _ -> None
+
+// `Task[T]` written by a program, where nothing it can see declares a `Task` of its own.
+written_task(a: &Analysis, scope: Scope, span: Span, targs: Buf[Type]) -> Type
+    if targs.len() != 1
+        a.fault(scope, span, s"'Task' takes one type argument — the type the task ends with — and " +
+                s"${targs.len()} were written")
+        return Unknown
+    end if
+
+    task_type(targs.at(0))
+end written_task
+
+// What a body is read against: the declared result, or for an async function the `T` of the
+// `Task[T]` the parser made its declared result into.
+body_result(d: FuncDecl, declared: Type) -> Type
+    if !d.marks.is_async() then return declared
+
+    task_result(declared).unwrap_or(declared)
+end body_result
+
+// -- where an `await` stands ----------------------------------------------------------------------
+
+enum AwaitSite
+    AwaitOutside
+    AwaitInAsync
+    AwaitInClosure
+    AwaitInEntry
+
+// The site a function's own body is, by whether the function is async.
+await_site_of(d: FuncDecl) -> AwaitSite = if d.marks.is_async() then AwaitInAsync else AwaitOutside
+
+// The site a closure's body is, written where `outer` is. **A closure is not itself async**, so
+// inside an async function it is a site of its own, refused in words that say so.
+closure_await_site(outer: AwaitSite) -> AwaitSite =
+    if outer == AwaitInAsync || outer == AwaitInClosure then AwaitInClosure else AwaitOutside
+
+// `await e`.
+//
+// The operand is read first and whatever is wrong inside it is told; then where the `await` stands,
+// at the word; then what it was handed, at the operand.
+await_expr(cx: &Analyzer, span: Span, inner: Expr) -> TExpr
+    val t = type_expr_bare(cx, inner)
+    val word = Span(span.start, span.start + 5)
+
+    if cx.await_site == AwaitInClosure then
+        return cx.err(word, "'await' cannot be written in a closure: a closure is not itself " +
+                      "async, even inside an 'async' function, so there is no task of its own for " +
+                      "it to wait in. Await in the enclosing function's body and hand the closure " +
+                      "the value")
+
+    if cx.await_site == AwaitInEntry then
+        return cx.err(word, "'await' may only be written in the body of an 'async' function, and " +
+                      "this is the entry file's body — the program's 'main', which C calls " +
+                      "directly and cannot drive a task through. Move the work into an 'async' " +
+                      "function")
+
+    if cx.await_site == AwaitOutside then
+        return cx.err(word, "'await' may only be written in the body of an 'async' function, and " +
+                      "the function it stands in is not one — write 'async' in front of its name " +
+                      "to make it one")
+
+    val ty = texpr_type(t)
+
+    if ty == Unknown then return t
+
+    task_result(ty) match
+        Some(r) -> TExpr(span, TAwait(t, r))
+        None -> cx.err(inner.span, s"'await' needs a Task, which is what calling an 'async' " +
+                       s"function hands back, but this value is ${type_show(ty)}")
+end await_expr
+
+// What a mismatch adds where a `Task[T]` stands where its `T` was wanted: the `await` left out. Each
+// position keeps its own sentence -- it names the parameter, the binding, the result -- and this is
+// appended to it, or nothing is where the two types are not a task and its value.
+await_hint(got: Type, wanted: Type) -> string
+    val awaited = task_result(got)
+
+    if awaited.is_none() || task_result(wanted).is_some() then return ""
+    if !type_eq(awaited.unwrap(), wanted) then return ""
+
+    " — calling an 'async' function hands back its task rather than running it, so write 'await' " +
+        s"in front to run it and take the ${type_show(wanted)} it ends with"
+end await_hint

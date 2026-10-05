@@ -51,6 +51,11 @@ const PrefixPower: u8 = 70
 // Calls, indexing, member access and `with` are postfix, so they bind tighter than any arithmetic.
 const PostfixPower: u8 = 80
 
+// `?` is postfix too, one step below the rest: nothing but `await` is read at the level between
+// them, so `await f()?` gives the call to `await` and the `?` to what it awaited, while `-a?`,
+// `a.b?.c` and `xs[0]?` read exactly as they did when `?` stood with the others.
+private const TryPower: u8 = 79
+
 private power_of(t: Tok) -> Power = t match
     Keyword(w) -> power_of_word(w)
 
@@ -77,7 +82,9 @@ private power_of_word(w: string) -> Power
     for m in ["*", "/", "%", "<<", ">>"]
         if m == w then return left_assoc(MulPower)
 
-    for t in ["(", "[", ".", "::", "?", "++", "--"]
+    if w == "?" then return left_assoc(TryPower)
+
+    for t in ["(", "[", ".", "::", "++", "--"]
         if t == w then return left_assoc(PostfixPower)
 
     left_assoc(0)
@@ -289,7 +296,10 @@ private nud(t: Spanned[Tok], p: *Parser) -> Expr
         StrLit(v) -> expr(at, StrLit(v))
         CStrLit(v) -> expr(at, CStrLit(v))
         StrInterp(parts, exprs, specs, starts) -> desugar_interp(p, at, parts, exprs, specs, starts)
-        Ident(n) -> if n == "_" then expr(at, Ident(fresh_placeholder(p))) else expr(at, Ident(n))
+        Ident(n) ->
+            if n == "_" then expr(at, Ident(fresh_placeholder(p)))
+            else if n == "await" && awaits_here(p) then parse_await(p, at)
+            else expr(at, Ident(n))
         QuotedIdent(n) -> expr(at, Ident(n))
         Label(n) ->
             if opens_an_expression(p) then parse_labelled_loop(p, at, n)
@@ -299,6 +309,30 @@ private nud(t: Spanned[Tok], p: *Parser) -> Expr
             p.fault(at, "expression expected")
             expr(at, Bad)
 end nud
+
+// Whether the `await` just taken is the prefix rather than a name. **The word is contextual**, so a
+// program may still call a variable `await`: it is the prefix only where an operand follows on the
+// same line, starting with something no name is ever followed by -- another name, `self`, or a
+// literal. `await(x)`, `await + 1`, `await.f`, `await is T` and `await with { … }` stay a name.
+private awaits_here(p: *Parser) -> bool = p.peek() match
+    Ident(n) -> n != "is" && n != "with"
+    QuotedIdent(_) -> true
+    Keyword(w) -> w == "self"
+    IntLit(_, _, _) -> true
+    FloatLit(_, _) -> true
+    StrLit(_) -> true
+    CStrLit(_) -> true
+    CharLit(_) -> true
+    StrInterp(_, _, _, _) -> true
+    _ -> false
+
+// `await e`. The operand is read at `TryPower`, which takes every call, index and member access and
+// stops at `?` -- so `await dev.read(512)?` awaits the call and propagates out of what it gave.
+private parse_await(p: *Parser, at: Span) -> Expr
+    val operand = parse_expr_bp(p, TryPower)
+
+    expr(at.to(p.just_taken()), AwaitExpr(operand))
+end parse_await
 
 private nud_word(p: *Parser, at: Span, w: string) -> Expr
     if w == "true" then return expr(at, BoolLit(true))

@@ -744,6 +744,7 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
     end if
 
     val head = p.here()
+    val async_at = take_async_word(p)
 
     parse_member(p, start, site) match
         Some(read) ->
@@ -753,9 +754,26 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
             member.vis = vis
             member.overrides = overrides
             apply_member_attrs(&member, attrs)
+
+            // **A property is read, not called**, so there is no call for a task to come out of.
+            if async_at.is_some() then mark_async_member(p, &member, async_at.unwrap())
+
             out.push(member)
         None -> ()
 end parse_member_line
+
+// An `async` member: a method's result becomes the task its call hands back. **A property is read,
+// not called**, so there is no call for a task to come out of, and it is refused at the word.
+private mark_async_member(p: *Parser, m: *MethodDecl, at: Span)
+    if m.is_property
+        p.fault(at, "a property cannot be 'async': it is read like a field, with no call to hand a " +
+                "task back from — make it a method, written with '()'")
+        return
+    end if
+
+    m.marks.async_at = Some(at)
+    m.ret_type = async_result(m.ret_type, at)
+end mark_async_member
 
 // The name a setter is filed under, and the placeholder its parameter carries until the property it
 // pairs with supplies the type.
