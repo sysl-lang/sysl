@@ -1,0 +1,332 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The reference's `PromotedTemporaryTests`: a slice of a TEMPORARY array -- an array literal, a repeat
+// form, a call answering `[N]T`, a field of a temporary struct -- that escapes its frame. There is no
+// declaration to move, so `reference/memory.md § What happens when a slice escapes` gives the
+// temporary storage of its own; a `...T` pack is exactly `[a, b, c][..]`, which is why a variadic
+// member through a trait object meets it. A module that gave the allocator up is refused at the view
+// that leaves the frame, naming the temporary; a partial slice of a literal is not promoted at all.
+//
+// Every output and diagnostic here was read out of the reference compiler (0.0.162) by handing the
+// installed `sysl` the same program.
+
+// What a program does: what it printed and the status it exited with. A failure to build is its
+// message and `-1`, which no program exits with.
+private ptp_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-ptp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end ptp_outcome
+
+// The program runs to the end and prints exactly this.
+private ptp_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = ptp_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end ptp_prints
+
+// The build is refused, and the refusal says `part`.
+private ptp_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = ptp_outcome(text)
+
+    assert_eq(out.1, -1)
+    assert(out.0.contains(part), out.0)
+end ptp_refused
+
+private ptp_sink() -> string = raw"""
+    trait Sink
+        take(self, xs: []const int) -> int
+
+    struct Adder
+        base: int
+
+    impl Sink for Adder
+        take(self, xs: []const int) -> int = self.base + int(xs.len)
+
+    """
+
+private ptp_triple() -> string = "triple(n: int) -> [3]int = [n, n + 1, n + 2]\n\n"
+
+// The reference's tail, said of a view that has nowhere to go in an allocator-free module.
+private ptp_no_alloc_tail() -> string =
+    "so the array would move to the heap to outlive the frame — and this module declared " +
+    "'@no_alloc', so there is nothing to move it into. Keep the view inside the frame, or take the " +
+    "storage from a caller as a '[]T' parameter, which is already wherever its owner put it"
+
+// -- a view of an array literal that escapes is given storage of its own -----------------------------
+
+@test("through a trait object, which is the reduction the card was written from")
+ptp_literal_through_a_trait_object() =
+    ptp_prints(ptp_sink() + raw"""
+        var a = Adder(10)
+        val d: &Sink = a
+        var arr = [1, 2, 3]
+
+        print(d.take(arr[..]))
+        print(d.take([4, 5, 6][..]))
+        """, "13\n13\n")
+
+@test("and the elements are the ones written, rather than whatever the frame left")
+ptp_the_elements_are_the_ones_written() =
+    ptp_prints(raw"""
+        trait Sink
+            total(self, xs: []const int) -> int
+
+        struct Sum
+            base: int
+
+        impl Sink for Sum
+            total(self, xs: []const int) -> int
+                var n = self.base
+
+                for x in xs
+                    n += x
+
+                n
+
+        var s = Sum(100)
+        val d: &Sink = s
+
+        print(d.total([4, 5, 6][..]))
+        """, "115\n")
+
+@test("a repeat form is the same case, since it is the other array literal")
+ptp_a_repeat_form_is_the_same_case() =
+    ptp_prints(ptp_sink() + raw"""
+        var a = Adder(10)
+        val d: &Sink = a
+
+        print(d.take([7; 4][..]))
+        """, "14\n")
+
+// -- the shape that met it: a `...T` pack is a literal ----------------------------------------------
+
+@test("a variadic trait member works through a trait object")
+ptp_a_variadic_trait_member_through_an_object() =
+    ptp_prints(raw"""
+        trait Sink
+            take(self, xs: ...int) -> int
+
+        struct Adder
+            base: int
+
+        impl Sink for Adder
+            take(self, xs: ...int) -> int
+                var n = self.base
+
+                for x in xs
+                    n += x
+
+                n
+
+        var a = Adder(10)
+        val d: &Sink = a
+
+        print(d.take(1, 2, 3))
+        print(d.take())
+        """, "16\n10\n")
+
+// A store into module storage is the other way out of a frame, and the one an allocator-free module
+// can actually reach.
+@test("a literal stored into module storage outlives the frame, and is given storage")
+ptp_a_literal_stored_into_module_storage() =
+    ptp_prints(raw"""
+        static var kept: []const int = []
+
+        fill()
+            kept = [4, 5, 6][..]
+
+        fill()
+        print(kept.len, kept[0], kept[2])
+        """, "3 4 6\n")
+
+// The storage is the allocator's, so a module that gave it up is refused at the view that leaves the
+// frame. The entry file declares no module, and its `@no_alloc` binds it all the same.
+@test("a module that gave the allocator up is refused, and told what it costs")
+ptp_no_alloc_refuses_a_promoted_literal() =
+    ptp_refused(raw"""
+        @no_alloc
+
+        static var kept: []const int = []
+
+        fill()
+            kept = [4, 5, 6][..]
+
+        fill()
+        print(kept.len)
+        """, s"this view of an array literal is returned, ${ptp_no_alloc_tail()}")
+
+// A variadic call that does not escape is still frame-only: `@no_alloc` refuses exactly where the
+// allocator is reached, so a green build is the evidence.
+@test("a variadic call that does not escape still needs no allocator")
+ptp_a_variadic_call_needs_no_allocator() =
+    ptp_prints(raw"""
+        @no_alloc
+
+        total(xs: ...int) -> int
+            var n = 0
+
+            for x in xs
+                n += x
+
+            n
+
+        print(total(1, 2, 3))
+        """, "6\n")
+
+// -- a view of any other temporary array that escapes is given storage of its own -------------------
+
+@test("stored into module storage, and read after the frame that made it is gone")
+ptp_a_call_result_stored_into_module_storage() =
+    ptp_prints(ptp_triple() + raw"""
+        static var kept: []const int = []
+
+        fill()
+            kept = triple(7)[..]
+
+        fill()
+        print(kept.len, kept[0], kept[2])
+        """, "3 7 9\n")
+
+// Nothing of the slice is really returned, since the callee copies -- but a call's result is taken to
+// view every argument, so this is an escape and the temporary is what has to move.
+@test("handed to a callee whose result is returned, which is the reduction the card was written from")
+ptp_a_call_result_handed_to_a_returning_callee() =
+    ptp_prints(ptp_triple() + raw"""
+        keep(xs: []const int) -> []const int = xs
+
+        copied() -> []const int = keep(triple(7)[..])
+
+        var s = copied()
+        print(s.len, s[0], s[2])
+        """, "3 7 9\n")
+
+@test("through a trait object, which is where the literal form was found")
+ptp_a_call_result_through_a_trait_object() =
+    ptp_prints(ptp_sink() + ptp_triple() + raw"""
+        var a = Adder(10)
+        val d: &Sink = a
+
+        print(d.take(triple(7)[..]))
+        """, "13\n")
+
+// A field of a temporary is a temporary: there is no declaration under it either. A field of a NAMED
+// value is still refused, in `tests_esc_escape.sysl`.
+@test("a field of a temporary struct is the same case")
+ptp_a_field_of_a_temporary_struct() =
+    ptp_prints(raw"""
+        struct Frame
+            cells: [3]int
+
+        framed(n: int) -> Frame = Frame([n, n + 1, n + 2])
+
+        static var kept: []const int = []
+
+        fill()
+            kept = framed(4).cells[..]
+
+        fill()
+        print(kept.len, kept[0], kept[2])
+        """, "3 4 6\n")
+
+// The buffer is a second holder of whatever the temporary counted, so it takes a count. The strings
+// read back correctly either way until something else has reused the storage, which is what the
+// churn is for.
+@test("and elements that carry counts are still theirs after the frame and the heap have moved on")
+ptp_counted_elements_survive_the_churn() =
+    ptp_prints(raw"""
+        pair(n: int) -> [2]string
+            var a = s"alpha${n}"
+            var b = s"beta${n}"
+
+            [a, b]
+
+        static var kept: []const string = []
+
+        fill()
+            kept = pair(1)[..]
+
+        fill()
+
+        var i = 0
+
+        while i < 100000
+            var junk = str(i)
+
+            if junk.len == 0 then exit(1)
+
+            i += 1
+
+        print(kept[0], kept[1])
+        """, "alpha1 beta1\n")
+
+// The message names the call, since that is what the reader has on the line.
+@test("a module that gave the allocator up is refused, and told which temporary it was")
+ptp_no_alloc_refuses_a_promoted_call_result() =
+    ptp_refused(raw"""
+        @no_alloc
+
+        triple(n: int) -> [3]int = [n, n + 1, n + 2]
+
+        static var kept: []const int = []
+
+        fill()
+            kept = triple(7)[..]
+
+        fill()
+        print(kept.len)
+        """, s"this view of the array 'triple' answered with is returned, ${ptp_no_alloc_tail()}")
+
+@test("a temporary whose view does not escape still needs no allocator")
+ptp_a_temporary_that_stays_needs_no_allocator() =
+    ptp_prints(raw"""
+        @no_alloc
+
+        triple(n: int) -> [3]int = [n, n + 1, n + 2]
+
+        count(xs: []const int) -> usize = xs.len
+
+        print(count(triple(7)[..]))
+        """, "3\n")
+
+// -- a partial slice of a literal is not promoted ----------------------------------------------------
+
+@test("a partial slice of a literal is still refused, and says so")
+ptp_a_partial_slice_of_a_literal_is_refused() =
+    ptp_refused(ptp_sink() + raw"""
+        var a = Adder(10)
+        val d: &Sink = a
+
+        print(d.take([4, 5, 6][1..]))
+        """, "a slice of an array this frame owns is passed through a trait object, which may hold " +
+        "on to it, so it would outlive the array, and the storage is not this body's to move — it is " +
+        "a field of a value, an array a caller passed by value, or part of an array literal, which " +
+        "has no declaration to move. Declare it as a '[]T', which makes a buffer of its own and owns " +
+        "it, or as a '&[N]T' where the length is fixed")
