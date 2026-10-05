@@ -3,7 +3,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.env.{get as env_var}
-import sysl.fs.{make_temp_dir, metadata, read_text, remove_dir_all, walk, write_text}
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, walk, write_text}
 import sysl.process.capture
 import sysl.text.{split, str_builder, Search}
 
@@ -306,6 +306,33 @@ private docs_check(src: string, exe: string, archive_at: string, b: DocsBlock) -
     docs_refuses(src, archive_at, b, where)
 end docs_check
 
+// A block that opens with a `module` header, written where its header says it sits: the reference
+// compiles a block as a source with no place at all, and a file named on its own here sits at the
+// project root, where a header is refused. So such a block becomes a tree, `<dir>/tree/<m/n>/main.sysl`,
+// and the tree is what is compiled. Nothing where the block declares no module.
+private docs_placed(dir: string, source: string) -> Option[string]
+    val lines = split(source, "\n")
+
+    for i in 0..<lines.len
+        val line = lines[i].trim()
+
+        if line == "" || line.starts_with("//") then continue
+
+        if !line.starts_with("module ") then return None
+
+        val parts = split(line["module ".bytes.len..<line.bytes.len].trim(), ".")
+        var at = s"$dir/tree"
+
+        for k in 0..<parts.len
+            at = s"$at/${parts[k]}"
+
+        make_dir_all(at).unwrap()
+        write_text(s"$at/main.sysl", source).unwrap()
+        return Some(s"$dir/tree")
+
+    None
+end docs_placed
+
 // -- the sweep -------------------------------------------------------------------------------------
 
 // Where the site is: what `SYSL_SITE` names, or the sibling checkout, and nothing where neither is
@@ -449,9 +476,15 @@ the_sites_pages_run_here()
         for i in 0..<blocks.len()
             val b = blocks.at(i)
 
-            write_text(src, b.source).unwrap()
+            val placed = docs_placed(dir, b.source)
+            var path = src
 
-            val said = docs_check(src, exe, archive_at, b)
+            if placed.is_some() then path = placed.unwrap()
+            else write_text(src, b.source).unwrap()
+
+            val said = docs_check(path, exe, archive_at, b)
+
+            if placed.is_some() then remove_dir_all(s"$dir/tree").unwrap_or(())
 
             row = docs_counted(row, b, said.is_none())
 

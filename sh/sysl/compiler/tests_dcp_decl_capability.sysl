@@ -1,0 +1,339 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+import sysl.text.Search
+
+// `@needs(...)` -- a DECLARATION naming what reaching it requires (`reference/modules.md § A
+// declaration may name what reaching it needs`). A file header's `@requires(...)` is about the
+// module and is checked once against the target; this is about one declaration and is checked at the
+// call, in the caller's module. The declaration it exists for is `extern`, the one route by which a
+// module that had given up an environment capability could reach `open()` without a body the
+// compiler reads.
+//
+// The reference's `DeclCapabilityTests`, ported. Its body-charging, signature and `sysl.fs` cases are
+// `tests_nsc_needs_scope.sysl`'s. Every expected text is the reference's (0.0.162) on the same tree,
+// quoted whole: the message, the place the caret points and the line it quotes.
+
+private dcp_ready() -> bool = std_root().is_ok() && clang_available()
+
+private dcp_tree(files: [](string, string)) -> string
+    var b: Buf[(string, string)] = buf()
+
+    for i in 0..<files.len
+        b.push(files[i])
+
+    lbr_tree(b)
+end dcp_tree
+
+// What `sysl build` says about a tree, and its status.
+private dcp_built(root: string) -> (int, string)
+    val got = lbr_cli(["sysl", "build", root])
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end dcp_built
+
+// What the program of a tree prints, or what stopped it.
+private dcp_ran(root: string) -> string
+    val out_dir = lbr_temp("sysl-dcp-exe")
+
+    reset_search_paths()
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+    said
+end dcp_ran
+
+// Whether a report holds a diagnostic: its message, where it points, and the line it quotes.
+private dcp_says(out: string, message: string, at: string, line: string) -> bool =
+    out.contains(s"error: $message") && out.contains(s" --> $at") && out.contains(line)
+
+private dcp_sys() -> string = "module sys\n\n@needs(os)\nextern \"getpid\" pid() -> int\n"
+
+private dcp_no_os(who: string) -> string =
+    s"this reaches '$who', which needs 'os', and this module declared '@no_os'"
+
+// -- an extern may name the capability calling it needs ---------------------------------------------
+
+@test("and a module that gave that capability up may not reach it")
+dcp_a_module_that_gave_it_up()
+    if !dcp_ready() then return
+
+    val root = dcp_tree([("sys/a.sysl", dcp_sys()), ("main.sysl", "@no_os\n\nprint(sys.pid())\n")])
+    val (code, out) = dcp_built(root)
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, dcp_no_os("sys.pid"), s"$root/main.sysl:3:11", "3 | print(sys.pid())"), out)
+end dcp_a_module_that_gave_it_up
+
+@test("while a module that said nothing reaches it exactly as before")
+dcp_a_module_that_said_nothing()
+    if !dcp_ready() then return
+
+    val root = dcp_tree([("sys/a.sysl", dcp_sys()), ("main.sysl", "print(sys.pid())\n")])
+
+    reset_search_paths()
+
+    val text = emit_llvm_text(root, None) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    remove_dir_all(root).unwrap_or(())
+    assert(text.contains("declare i32 @getpid()"), text)
+end dcp_a_module_that_said_nothing
+
+// `no alloc` is checked at every construction that makes heap storage, and an `extern` that
+// allocates walks straight past that.
+@test("the heap is the same rule, and it is the case a module clause could not see")
+dcp_the_heap_is_the_same_rule()
+    if !dcp_ready() then return
+
+    val root = dcp_tree([("sys/a.sysl", "module sys\n\n@needs(heap)\nextern \"malloc\" grab(n: usize) -> *u8\n"),
+                         ("main.sysl", "@no_alloc\n\nval p = sys.grab(8)\nprint(p == null)\n")])
+    val (code, out) = dcp_built(root)
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, "this reaches 'sys.grab', which needs 'heap', and this module declared '@no_alloc'",
+                    s"$root/main.sysl:3:13", "3 | val p = sys.grab(8)"), out)
+end dcp_the_heap_is_the_same_rule
+
+@test("and a `private` extern is reached through the wrapper that exports it, which is where the caret goes")
+dcp_a_private_extern_through_its_wrapper()
+    if !dcp_ready() then return
+
+    val root = dcp_tree([("sys/a.sysl", "module sys\n\n@needs(os)\nprivate extern \"getpid\" c_pid() -> int\n\n" +
+                                        "pid() -> int = c_pid()\n"),
+                         ("main.sysl", "@no_os\n\nprint(sys.pid())\n")])
+    val (code, out) = dcp_built(root)
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, dcp_no_os("sys.c_pid"), s"$root/main.sysl:3:11", "3 | print(sys.pid())"), out)
+end dcp_a_private_extern_through_its_wrapper
+
+// -- the requirement is transitive, because reaching is ----------------------------------------------
+
+@test("through a function of the caller's own")
+dcp_through_a_function_of_the_callers_own()
+    if !dcp_ready() then return
+
+    val root = dcp_tree([("sys/a.sysl", dcp_sys()),
+                         ("main.sysl", "@no_os\n\nask() -> int = sys.pid()\n\nprint(ask())\n")])
+    val (code, out) = dcp_built(root)
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, dcp_no_os("sys.pid"), s"$root/main.sysl:3:20", "3 | ask() -> int = sys.pid()"), out)
+    assert(dcp_says(out, dcp_no_os("sys.pid"), s"$root/main.sysl:5:7", "5 | print(ask())"), out)
+end dcp_through_a_function_of_the_callers_own
+
+@test("and through a third module that has the capability itself")
+dcp_through_a_third_module()
+    if !dcp_ready() then return
+
+    val root = dcp_tree([("sys/a.sysl", dcp_sys()),
+                         ("mid/a.sysl", "module mid\n\nask() -> int = sys.pid()\n"),
+                         ("main.sysl", "@no_os\n\nprint(mid.ask())\n")])
+    val (code, out) = dcp_built(root)
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, dcp_no_os("sys.pid"), s"$root/main.sysl:3:11", "3 | print(mid.ask())"), out)
+end dcp_through_a_third_module
+
+// -- a capability implies what it rests on -----------------------------------------------------------
+
+// POSIX needs an operating system under it, so a declaration needing `posix` needs `os` -- and a
+// module that gave up only `os` is refused, naming the capability it actually lacks. The declaration
+// check walks once per capability, so the reference refuses it once for each.
+@test("so `@needs(posix)` is out of reach of a module that gave up `os` alone")
+dcp_needs_posix_without_os()
+    if !dcp_ready() then return
+
+    val root = dcp_tree([("sys/a.sysl", "module sys\n\n@needs(posix)\nextern \"getpid\" pid() -> int\n"),
+                         ("main.sysl", "@no_os\n\nprint(sys.pid())\n")])
+    val (code, out) = dcp_built(root)
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, dcp_no_os("sys.pid"), s"$root/main.sysl:3:11", "3 | print(sys.pid())"), out)
+    assert(dcp_says(out, "this reaches 'sys.pid', which needs 'posix', and this module declared '@no_posix'",
+                    s"$root/main.sysl:3:11", "3 | print(sys.pid())"), out)
+end dcp_needs_posix_without_os
+
+// -- an ordinary function may carry it too -----------------------------------------------------------
+
+private dcp_now_and_plain() -> string = "module sys\n\n@needs(os)\nnow() -> int = 7\n\nplain() -> int = 3\n"
+
+@test("which is the granularity a module clause could not give a library")
+dcp_an_ordinary_function()
+    if !dcp_ready() then return
+
+    val root = dcp_tree([("sys/a.sysl", dcp_now_and_plain()), ("main.sysl", "@no_os\n\nprint(sys.now())\n")])
+    val (code, out) = dcp_built(root)
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, dcp_no_os("sys.now"), s"$root/main.sysl:3:11", "3 | print(sys.now())"), out)
+end dcp_an_ordinary_function
+
+@test("and the declaration beside it, which said nothing, is reached freely")
+dcp_the_declaration_beside_it()
+    if !dcp_ready() then return
+
+    assert_eq(dcp_ran(dcp_tree([("sys/a.sysl", dcp_now_and_plain()),
+                                ("main.sysl", "@no_os\n\nprint(sys.plain())\n")])), "3\n")
+end dcp_the_declaration_beside_it
+
+// -- a '@tests' file's clause is what its tests are held to ------------------------------------------
+
+// The clause a module writes is a promise about what SHIPS, and scaffolding does not ship -- so a
+// `@tests` file may take back what the module gave up (`reference/modules.md § A @tests file states
+// its own capabilities`). Only the module's half moves; the target's does not.
+
+private dcp_gave_up_os() -> string = "module sys\n@no_os\n\n@needs(os)\nextern \"getpid\" pid() -> int\n"
+
+private dcp_lifting_helper() -> string = "module sys\n@tests\n@requires(os)\n\nhelper() -> int = 2\n"
+
+@test("so a test may reach what the module gave up, since what it declares does not ship")
+dcp_a_test_may_reach_what_the_module_gave_up()
+    if !dcp_ready() then return
+
+    assert_eq(dcp_ran(dcp_tree([("sys/a.sysl", dcp_gave_up_os()),
+                                ("sys/tests.sysl", "module sys\n@tests\n@requires(os)\n\n@test\n" +
+                                                   "reaches_the_machine() =\n    assert(pid() > 0)\n"),
+                                ("main.sysl", "print(1)\n")])), "1\n")
+end dcp_a_test_may_reach_what_the_module_gave_up
+
+// The half that must not move with it: a shipping file of the same module is refused exactly as it
+// was, so what the `@tests` file lifted is lifted for scaffolding and for nothing else.
+@test("while a shipping declaration of that module is refused as it always was")
+dcp_a_shipping_declaration_is_still_refused()
+    if !dcp_ready() then return
+
+    val root = dcp_tree([("sys/a.sysl", dcp_gave_up_os() + "\nships() -> int = pid()\n"),
+                         ("sys/tests.sysl", dcp_lifting_helper()),
+                         ("main.sysl", "print(1)\n")])
+    val (code, out) = dcp_built(root)
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, "this reaches 'sys.pid', which needs 'os', and 'sys' declared '@no_os'",
+                    s"$root/sys/a.sysl:7:18", "7 | ships() -> int = pid()"), out)
+end dcp_a_shipping_declaration_is_still_refused
+
+@test("and a test file that says nothing is held to its module's clause")
+dcp_a_silent_test_file_is_held_to_the_module()
+    if !dcp_ready() then return
+
+    val root = dcp_tree([("sys/a.sysl", dcp_gave_up_os()),
+                         ("sys/tests.sysl", "module sys\n@tests\n\n@test\n" +
+                                            "reaches_the_machine() =\n    assert(pid() > 0)\n"),
+                         ("main.sysl", "print(1)\n")])
+    val (code, out) = dcp_built(root)
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, "this reaches 'sys.pid', which needs 'os', and 'sys' declared '@no_os'",
+                    s"$root/sys/tests.sysl:6:12", "6 |     assert(pid() > 0)"), out)
+end dcp_a_silent_test_file_is_held_to_the_module
+
+// `why` moves with `lacks`, or the diagnostic sends a reader to delete a line that is not there.
+@test("a test refused under its OWN narrowing is told which file declared it")
+dcp_a_test_refused_under_its_own_narrowing()
+    if !dcp_ready() then return
+
+    val root = dcp_tree([("sys/a.sysl", dcp_sys()),
+                         ("sys/tests.sysl", "module sys\n@tests\n@no_os\n\n@test\n" +
+                                            "reaches_the_machine() =\n    assert(pid() > 0)\n"),
+                         ("main.sysl", "print(1)\n")])
+    val (code, out) = dcp_built(root)
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, "this reaches 'sys.pid', which needs 'os', and the '@tests' file of 'sys' declared " +
+                         "'@no_os'", s"$root/sys/tests.sysl:7:12", "7 |     assert(pid() > 0)"), out)
+end dcp_a_test_refused_under_its_own_narrowing
+
+// A test is scaffolding wherever it is written, so a `@test` beside what it tests answers to the
+// tests' clause.
+@test("a '@test' in an ordinary file answers to the tests' clause too")
+dcp_a_test_in_an_ordinary_file()
+    if !dcp_ready() then return
+
+    assert_eq(dcp_ran(dcp_tree([("sys/a.sysl", dcp_gave_up_os() + "\n@test\nbeside_what_it_tests() =\n" +
+                                               "    assert(pid() > 0)\n"),
+                                ("sys/tests.sysl", dcp_lifting_helper()),
+                                ("main.sysl", "print(1)\n")])), "1\n")
+end dcp_a_test_in_an_ordinary_file
+
+// -- what the annotation may say ---------------------------------------------------------------------
+
+private dcp_one_file(text: string) -> (int, string, string)
+    val root = dcp_tree([("main.sysl", text)])
+    val (code, out) = dcp_built(root)
+
+    (code, out, root)
+end dcp_one_file
+
+private dcp_no_empty_form() -> string =
+    "'@needs' names the capabilities reaching this declaration requires, in parentheses — " +
+    "'@needs(heap)', '@needs(os, posix)'. There is no empty form: a declaration that needs nothing " +
+    "beyond what its module has says so by not writing the annotation"
+
+@test("a capability nothing has heard of is refused, in the words a file header's is")
+dcp_an_unknown_capability()
+    if !dcp_ready() then return
+
+    val (code, out, root) = dcp_one_file("@needs(sockets)\nf() -> int = 1\n\nprint(f())\n")
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, "no capability is called 'sockets' — the set is 'heap', 'os', 'posix'",
+                    s"$root/main.sysl:1:1", "1 | @needs(sockets)"), out)
+end dcp_an_unknown_capability
+
+// The mistake somebody makes having just read `@no_alloc` beside it: `alloc` is what a module does,
+// and a requirement names the facility.
+@test("and the narrowing's own word is answered by naming the facility")
+dcp_the_narrowings_own_word()
+    if !dcp_ready() then return
+
+    val (code, out, root) = dcp_one_file("@needs(alloc)\nf() -> int = 1\n\nprint(f())\n")
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, "'alloc' is what a module does, not something a machine has — a '@needs' names the " +
+                         "facility, so this is '@needs(heap)'", s"$root/main.sysl:1:1", "1 | @needs(alloc)"), out)
+end dcp_the_narrowings_own_word
+
+@test("the parentheses are mandatory and may not be empty")
+dcp_the_parentheses_are_mandatory()
+    if !dcp_ready() then return
+
+    val (code, out, root) = dcp_one_file("@needs\nf() -> int = 1\n\nprint(f())\n")
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, dcp_no_empty_form(), s"$root/main.sysl:1:7", "1 | @needs"), out)
+end dcp_the_parentheses_are_mandatory
+
+@test("so is the list inside them")
+dcp_so_is_the_list_inside_them()
+    if !dcp_ready() then return
+
+    val (code, out, root) = dcp_one_file("@needs()\nf() -> int = 1\n\nprint(f())\n")
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, dcp_no_empty_form(), s"$root/main.sysl:1:8", "1 | @needs()"), out)
+end dcp_so_is_the_list_inside_them
+
+@test("and it marks a function or an 'extern', not a struct")
+dcp_it_marks_a_function_or_an_extern()
+    if !dcp_ready() then return
+
+    val (code, out, root) = dcp_one_file("@needs(os)\nstruct P\n    x: int\n\nprint(1)\n")
+
+    assert_eq(code, 1, out)
+    assert(dcp_says(out, "'@needs(...)' names what reaching a declaration requires, so it marks a function " +
+                         "or an 'extern' — and this declares neither", s"$root/main.sysl:2:1", "2 | struct P"), out)
+end dcp_it_marks_a_function_or_an_extern

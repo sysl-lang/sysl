@@ -1,0 +1,422 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The run-time behaviour of an `impl` written for a GENERIC type (`reference/traits.md`): a block
+// with type parameters of its own implements the trait for every instantiation at once, and its
+// members are monomorphized per receiver exactly as a generic type's own members are.
+//
+// Two halves are worth separating: that the MEMBERS work -- a call, a property, `Self`, a default, a
+// vtable slot -- and that the CONFORMANCE is conditional: `impl[T: Show] Show for Box[T]` makes a
+// `Box[int]` implement `Show` precisely when `int` does, a question asked one step in.
+//
+// **Every output quoted here was read out of the reference compiler** (0.0.162), whose
+// `ImplGenericRunTests` these are, case for case.
+
+private var igr_library_cache: Buf[Program] = buf()
+private var igr_library_read: bool = false
+
+private igr_library() -> Buf[Program]
+    if igr_library_read then return igr_library_cache
+
+    igr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> igr_library_cache = units
+
+    igr_library_cache
+end igr_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private igr_ready() -> bool
+    if igr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end igr_ready
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private igr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-igr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end igr_ran
+
+// -- a member of a generic impl -------------------------------------------------------------------
+
+@test("a member of a generic impl resolves on a value, once per element type")
+igr_resolves_once_per_element_type()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Show
+            show(self) -> string
+        struct Box[T]
+            v: T
+        impl[T: Display] Show for Box[T]
+            show(self) -> string = "box(" + str(self.v) + ")"
+        var a = Box(5)
+        var b = Box("hi")
+        print(a.show(), b.show())
+        """), "box(5) box(hi)\n")
+
+@test("a member of a generic impl takes a parameter of the block's own type parameter")
+igr_takes_a_parameter()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Plus
+            plus(self, other: int) -> int
+        struct Box[T]
+            v: T
+        impl[T] Plus for Box[T]
+            plus(self, other: int) -> int = other + 1
+        print(Box("ignored").plus(41))
+        """), "42\n")
+
+// The receiver modes are the ones every member has, and a generic block changes none of them: what
+// the mode governs is how the instance is passed, which is settled before `T` is.
+@test("a member of a generic impl mutates through a pointer receiver")
+igr_mutates_through_a_pointer_receiver()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Bump
+            bump(*self)
+        struct Box[T]
+            v: T
+            n: int
+        impl[T] Bump for Box[T]
+            bump(*self)
+                self.n += 1
+        var a = Box("x", 0)
+        a.bump()
+        a.bump()
+        print(a.n)
+        """), "2\n")
+
+@test("a member of a generic impl reads a property with no parentheses")
+igr_reads_a_property()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Sized
+            size -> int
+        struct Pair[A, B]
+            a: A
+            b: B
+        impl[X, Y] Sized for Pair[X, Y]
+            size -> int = 2
+        print(Pair(1, "z").size)
+        """), "2\n")
+
+// `Self` inside a generic block is the type applied to the block's parameters, and it is not a type
+// until an instantiation says what they are -- so it is resolved with them rather than ahead of them.
+@test("a member of a generic impl writes 'Self' for the type it is being implemented for")
+igr_writes_self()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Dup
+            dup(self) -> Self
+        struct Box[T]
+            v: T
+        impl[T] Dup for Box[T]
+            dup(self) -> Self = Box(self.v)
+        var a = Box(5)
+        print(a.dup().v)
+        """), "5\n")
+
+@test("a member of a generic impl inherits a default the block did not write")
+igr_inherits_a_default()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = "hi " + self.name()
+        struct Box[T]
+            v: T
+        impl[T: Display] Greet for Box[T]
+            name(self) -> string = str(self.v)
+        print(Box(9).greet())
+        """), "hi 9\n")
+
+@test("a member of a generic impl belongs to a generic enum the same way")
+igr_belongs_to_a_generic_enum()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Show
+            show(self) -> string
+        enum Maybe[T]
+            Just(v: T)
+            Nothing
+        impl[T: Display] Show for Maybe[T]
+            show(self) -> string
+                self match
+                    Just(x) -> str(x)
+                    Nothing -> "-"
+        var a: Maybe[int] = Just(4)
+        var b: Maybe[int] = Nothing
+        print(a.show(), b.show())
+        """), "4 -\n")
+
+// The parameters are matched to the type's arguments by POSITION IN THE SUBJECT, not by the order
+// they were declared in, so a block may name them however it reads best.
+@test("a member of a generic impl binds its parameters in the order the subject applies them")
+igr_binds_in_subject_order()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Show
+            show(self) -> string
+        struct Pair[A, B]
+            a: A
+            b: B
+        impl[X: Display, Y: Display] Show for Pair[Y, X]
+            show(self) -> string = str(self.a) + "/" + str(self.b)
+        print(Pair(1, "z").show())
+        """), "1/z\n")
+
+@test("a member of a generic impl sits beside the type's own members without colliding")
+igr_sits_beside_own_members()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Show
+            show(self) -> string
+        struct Box[T]
+            v: T
+            twice(self) -> int = self.n * 2
+            n: int
+        impl[T] Show for Box[T]
+            show(self) -> string = "b"
+        var a = Box("x", 21)
+        print(a.show(), a.twice())
+        """), "b 42\n")
+
+// -- an operator implemented for a generic type ---------------------------------------------------
+//
+// An operator resolves to the one method its trait requires (`reference/expressions.md § Operator
+// dispatch`), and on a generic type that method is an instantiation -- so the operator has to name
+// it the way a call does rather than by appending the method to the type.
+
+@test("an operator implemented for a generic type dispatches to the instantiation the operands are")
+igr_operator_dispatches()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        struct Box[T]
+            v: T
+            n: int
+        impl[T] Add for Box[T]
+            add(self, rhs: Box[T]) -> Box[T] = Box(self.v, self.n + rhs.n)
+        var a = Box("x", 1)
+        var b = Box("y", 2)
+        print((a + b).n)
+        """), "3\n")
+
+@test("an operator implemented for a generic type updates a place through the same method")
+igr_operator_updates_a_place()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        struct Box[T]
+            v: T
+            n: int
+        impl[T] Add for Box[T]
+            add(self, rhs: Box[T]) -> Box[T] = Box(self.v, self.n + rhs.n)
+        var a = Box("x", 1)
+        a += Box("y", 40)
+        print(a.n)
+        """), "41\n")
+
+// A comparison chain shares each middle operand between two links, and a dispatched link reads the
+// value codegen already holds -- so the generic instantiation has to reach it the same way.
+@test("an operator implemented for a generic type compares, and chains, through its own instantiation")
+igr_operator_compares_and_chains()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        struct Box[T]
+            v: T
+            n: int
+        impl[T] Eq for Box[T]
+            eq(self, rhs: Box[T]) -> bool = self.n == rhs.n
+        var a = Box("x", 1)
+        var b = Box("y", 1)
+        var c = Box("z", 1)
+        print(a == b, a == b == c)
+        """), "true true\n")
+
+// -- a bound is satisfied by a generic impl -------------------------------------------------------
+
+@test("a bound satisfied by a generic impl lets a generic function accept every instantiation")
+igr_bound_accepts_every_instantiation()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Show
+            show(self) -> string
+        struct Box[T]
+            v: T
+        impl[T: Display] Show for Box[T]
+            show(self) -> string = str(self.v)
+        name[U: Show](x: U) -> string = x.show()
+        print(name(Box(7)), name(Box(true)))
+        """), "7 true\n")
+
+// The condition is asked one step in, so a `Box` of a `Box` conforms exactly when the inner one does
+// -- which is the whole of what makes conditional conformance compose.
+@test("a nested instantiation conforms through the same condition")
+igr_nested_instantiation_conforms()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Show
+            show(self) -> string
+        struct Box[T]
+            v: T
+        impl Show for int
+            show(self) -> string = str(self)
+        impl[T: Show] Show for Box[T]
+            show(self) -> string = "(" + self.v.show() + ")"
+        name[U: Show](x: U) -> string = x.show()
+        print(name(Box(Box(3))))
+        """), "((3))\n")
+
+@test("a bounded body may read a property through a generic impl")
+igr_bounded_body_reads_a_property()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Sized
+            size -> int
+        struct Box[T]
+            v: T
+        impl[T] Sized for Box[T]
+            size -> int = 1
+        total[U: Sized](x: U, y: U) -> int = x.size + y.size
+        print(total(Box("a"), Box("b")))
+        """), "2\n")
+
+// -- a generic Display implementation renders -----------------------------------------------------
+//
+// `Display` is the one trait the compiler itself reaches for, so a generic implementation of it has
+// to satisfy `print`, `str` and an `f"..."` hole alike -- each of which asks the conformance question
+// and then names the member that answers it.
+
+@test("a generic Display implementation renders through print, once per instantiation")
+igr_display_through_print()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        struct Box[T]
+            v: T
+        impl[T: Display] Display for Box[T]
+            display(self, out: *Writer, fmt: FormatSpec)
+                display_str("<", out, FormatSpec(0, -1, false))
+                self.v.display(out, FormatSpec(0, -1, false))
+                display_str(">", out, fmt)
+        print(Box(5), Box("hi"))
+        """), "<5> <hi>\n")
+
+@test("a generic Display implementation renders through str and an f-string hole, which hands the specifier on")
+igr_display_through_str_and_fstring()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        struct Box[T]
+            v: T
+        impl[T: Display] Display for Box[T]
+            display(self, out: *Writer, fmt: FormatSpec)
+                self.v.display(out, fmt)
+        var b = Box(7)
+        print(str(b), f"[${b}%4s]")
+        """), "7 [   7]\n")
+
+// -- erasing an instantiation ---------------------------------------------------------------------
+
+@test("an erased instantiation dispatches through the table its own instantiation filled")
+igr_erased_dispatches_through_its_table()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Show
+            show(self) -> string
+        struct Box[T]
+            v: T
+        impl[T: Display] Show for Box[T]
+            show(self) -> string = str(self.v)
+        name(s: &Show) -> string = s.show()
+        var a: &Show = Box(7)
+        var b: &Show = Box("hi")
+        print(name(a), name(b))
+        """), "7 hi\n")
+
+// Two instantiations of one generic type are two types, so they get two tables -- which is what lets
+// them sit in the one array and still render as themselves.
+@test("erasing puts two instantiations behind one trait object type")
+igr_two_instantiations_one_object_type()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Show
+            show(self) -> string
+        struct Box[T]
+            v: T
+        impl[T: Display] Show for Box[T]
+            show(self) -> string = str(self.v)
+        var xs: [2]&Show = [Box(1), Box(false)]
+        print(xs[0].show(), xs[1].show())
+        """), "1 false\n")
+
+// A member of a generic `impl` is an ordinary function once instantiated, so what it does with a
+// reference-counted payload is the ordinary counting path -- worth running in a loop, where a leak or
+// a double free is what a wrong count would show up as.
+@test("an instantiation over a counted payload neither leaks nor frees twice")
+igr_counted_payload_in_a_loop()
+    if !igr_ready() then return
+
+    assert_eq(igr_ran(raw"""
+        trait Show
+            show(self) -> string
+        struct Box[T]
+            v: T
+        impl[T: Display] Show for Box[T]
+            show(self) -> string = str(self.v) + "!"
+        var n = 0usize
+        for i in 0..<1000
+            var b = Box("x")
+            n += b.show().len
+        print(n)
+        """), "2000\n")

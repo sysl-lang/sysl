@@ -1,0 +1,155 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, repeat, Search}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// A module is a directory, so a file's header is held to where the file sits -- and **a file named on
+// its own sits at the project root**, the directory it is in being the root. So a lone `main.sysl`
+// declaring `module thing` is refused under every command, `build-c` included (the org's rule that a
+// `build-c` probe program declares no module rests on it), exactly as the root file of a tree is.
+//
+// **Every message and position here was read out of the reference** (`sysl` 0.0.162) on the same
+// files: `<file> declares 'thing', but it sits at the project root — a module is a directory, so the
+// two must agree`, anchored at the header, `1:1`, with the header underlined. Before this, a file named
+// on its own was exempt and its header was taken at its word.
+
+private rml_ready() -> bool = std_root().is_ok()
+
+// A directory holding these files, each written at its path below it. Named by its absolute path,
+// textual and with no doubled separator (`TMPDIR` ends in one), since that is how a tree's walk names
+// its files in a diagnostic.
+private rml_tree(files: []const (string, string)) -> string
+    val root = absolute_path(make_temp_dir("sysl-rml").unwrap())
+
+    for (at, text) in files
+        val file = s"$root/$at"
+
+        make_dir_all(parent_of(file).unwrap()).unwrap()
+        write_text(file, text).unwrap()
+
+    root
+end rml_tree
+
+// What one command line came to: the status, and every line it said joined.
+private rml_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    reset_search_paths()
+    (code, join(lines.view(), "\n"))
+end rml_cli
+
+// The reference's refusal of a header that disagrees with where its file sits, rendered whole: the
+// message, the anchor at the header, and the header underlined.
+private rml_refusal(file: string, header: string, theirs: string, here: string) -> string =
+    s"error: $file $theirs, but it $here — a module is a directory, so the two must agree\n" +
+    s" --> $file:1:1\n" +
+    "  |\n" +
+    s"1 | $header\n" +
+    s"  | ${repeat("^", header.bytes.len)}"
+
+@test("a lone file declaring a module is refused by build: it sits at the project root")
+rml_a_lone_file_with_a_header_is_refused_by_build()
+    if !rml_ready() then return
+
+    val root = rml_tree([("main.sysl", "module thing\n\nprint(\"hi\")\n")])
+    val (code, said) = rml_cli(["sysl", "build", s"$root/main.sysl", "-o", s"$root/out"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Failed)
+    assert(said.starts_with(rml_refusal(s"$root/main.sysl", "module thing", "declares 'thing'",
+                                        "sits at the project root")), said)
+end rml_a_lone_file_with_a_header_is_refused_by_build
+
+@test("and by build-c, whose probe programs declare no module for exactly this reason")
+rml_a_lone_file_with_a_header_is_refused_by_build_c()
+    if !rml_ready() then return
+
+    val root = rml_tree([("main.sysl", "module thing\n\n@export(\"probe\")\nprobe() -> int = 0\n")])
+    val (code, said) = rml_cli(["sysl", "build-c", s"$root/main.sysl", "-o", s"$root/lib.a"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Failed)
+    assert(said.starts_with(rml_refusal(s"$root/main.sysl", "module thing", "declares 'thing'",
+                                        "sits at the project root")), said)
+end rml_a_lone_file_with_a_header_is_refused_by_build_c
+
+@test("a lone file is at the root wherever it sits, so a header naming its own directory is refused")
+rml_a_lone_file_in_a_directory_is_still_at_the_root()
+    if !rml_ready() then return
+
+    val root = rml_tree([("sub/a.sysl", "module sub\n\nf() -> int = 1\n")])
+    val (code, said) = rml_cli(["sysl", "emit-llvm", s"$root/sub/a.sysl"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Failed)
+    assert(said.starts_with(rml_refusal(s"$root/sub/a.sysl", "module sub", "declares 'sub'",
+                                        "sits at the project root")), said)
+end rml_a_lone_file_in_a_directory_is_still_at_the_root
+
+@test("a lone file with no header is the root module, and builds")
+rml_a_lone_file_without_a_header_builds()
+    if !rml_ready() then return
+
+    val root = rml_tree([("main.sysl", "print(\"hi\")\n")])
+    val (code, said) = rml_cli(["sysl", "build", s"$root/main.sysl", "-o", s"$root/out"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine)
+    assert_eq(said, s"wrote $root/out")
+end rml_a_lone_file_without_a_header_builds
+
+@test("a tree's root file declaring a module is refused by build-c too")
+rml_a_root_file_with_a_header_is_refused_by_build_c()
+    if !rml_ready() then return
+
+    val root = rml_tree([("main.sysl", "module thing\n\n@export(\"probe\")\nprobe() -> int = 0\n")])
+    val (code, said) = rml_cli(["sysl", "build-c", root, "-o", s"$root/lib.a"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Failed)
+    assert(said.starts_with(rml_refusal(s"$root/main.sysl", "module thing", "declares 'thing'",
+                                        "sits at the project root")), said)
+end rml_a_root_file_with_a_header_is_refused_by_build_c
+
+@test("a nested file whose header names its directory builds beside a root file with none")
+rml_a_nested_file_naming_its_directory_builds()
+    if !rml_ready() then return
+
+    val root = rml_tree([("main.sysl", "print(\"hi\")\n"), ("sub/a.sysl", "module sub\n\nf() -> int = 1\n")])
+    val (code, said) = rml_cli(["sysl", "build", root, "-o", s"$root/out"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine)
+    assert_eq(said, s"wrote $root/out")
+end rml_a_nested_file_naming_its_directory_builds
+
+@test("a nested file whose header names another module is refused, naming the directory it sits in")
+rml_a_nested_file_naming_another_module_is_refused()
+    if !rml_ready() then return
+
+    val root = rml_tree([("main.sysl", "print(\"hi\")\n"), ("sub/a.sysl", "module other\n\nf() -> int = 1\n")])
+    val (code, said) = rml_cli(["sysl", "build", root, "-o", s"$root/out"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Failed)
+    assert(said.starts_with(rml_refusal(s"$root/sub/a.sysl", "module other", "declares 'other'",
+                                        "sits in 'sub'")), said)
+end rml_a_nested_file_naming_another_module_is_refused
+
+@test("a source root named as one file is at the root too, so its header is refused")
+rml_a_lone_file_lib_root_with_a_header_is_refused()
+    if !rml_ready() then return
+
+    val root = rml_tree([("main.sysl", "print(1)\n"), ("lib/geom.sysl", "module geom\n\none() -> int = 1\n")])
+    val (code, said) = rml_cli(["sysl", "build", s"$root/main.sysl", "--lib", s"$root/lib/geom.sysl",
+                                "-o", s"$root/out"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Failed)
+    assert(said.starts_with(rml_refusal(s"$root/lib/geom.sysl", "module geom", "declares 'geom'",
+                                        "sits at the project root")), said)
+end rml_a_lone_file_lib_root_with_a_header_is_refused

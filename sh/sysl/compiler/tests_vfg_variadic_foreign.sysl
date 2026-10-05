@@ -1,0 +1,512 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A walk over a variadic tail handed to a **C** function -- `vprintf` and its family
+// (`reference/ffi.md § Variadic functions`). C's `va_list` is a different type on every target and
+// is passed three different ways, so the address of a walk -- the only thing sysl has -- reaches a
+// foreign callee as that address, as the value stored at it, or as the address of a copy of it. All
+// three pass one `ptr`, which is why the difference has to be tested per target, and why the run
+// tests carry the feature: emitted text cannot tell a walk handed over correctly from one handed
+// over plausibly.
+//
+// **Every expected line, message and output here was read out of the reference compiler (0.0.162)**
+// -- `sysl emit-llvm --no-std-lib --target <name>` for IR, `sysl run` for a printed line -- whose
+// `VariadicForeignTests` these are.
+
+// The LLVM text of one program lowered for a named target, against that target's own library.
+private vfg_ir_for(name: string, text: string) -> string
+    val t = target_named(name).unwrap()
+
+    vfg_ir_on(t, text)
+end vfg_ir_for
+
+private vfg_ir_on(t: Target, text: string) -> string
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("main.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    if !errors_of(done.an.diagnostics()).is_empty()
+        return analysis_report(errors_of(done.an.diagnostics()))
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end vfg_ir_on
+
+// The whole `define` of `symbol`, to its closing brace.
+private vfg_define(ir: string, symbol: string) -> string
+    val fs = func_texts(ir)
+
+    for i in 0..<fs.len()
+        if fs.at(i).0 == symbol then return fs.at(i).1
+
+    s"nothing defines '$symbol'"
+end vfg_define
+
+// The first diagnostic a program earns, or nothing.
+private vfg_said(text: string) -> string
+    val ds = stmt_diagnostics(text)
+
+    if ds.is_empty() then "" else ds.at(0)
+end vfg_said
+
+// The C shape this whole suite exists for: a sysl variadic that renders its own tail through
+// `vprintf`, with the extern written the way the C header is.
+private vfg_logger() -> string =
+    "import sysl.text.cstring\n" +
+    "\n" +
+    "extern vprintf(fmt: *u8, ap: va_list) -> i32\n" +
+    "\n" +
+    "log(fmt: *u8, ...) -> i32\n" +
+    "    var ap: va_list\n" +
+    "    va_start(ap)\n" +
+    "    var n = vprintf(fmt, &ap)\n" +
+    "    va_end(ap)\n" +
+    "    n\n" +
+    "end log\n"
+
+// The same program with a call in it, for the tests that read the emitted text.
+private vfg_call() -> string = vfg_logger() + "var p: *u8 = null\nprint(log(p, 1))\n"
+
+// The other of C's two spellings -- `va_list *`, which a callee advances on its caller's behalf.
+private vfg_by_pointer() -> string =
+    "extern advance(ap: *va_list) -> i32\n" +
+    "\n" +
+    "f(n: int, ...) -> i32\n" +
+    "    var ap: va_list\n" +
+    "    va_start(ap)\n" +
+    "    var r = advance(&ap)\n" +
+    "    va_end(ap)\n" +
+    "    r\n" +
+    "end f\n" +
+    "print(f(0))\n"
+
+private vfg_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+end vfg_ready
+
+// -- handing a walk to C ----------------------------------------------------------------------------
+
+@test("a variadic renders its own tail through vprintf")
+vfg_a_variadic_renders_its_own_tail_through_vprintf()
+    if !vfg_ready() then return
+
+    assert_eq(xvr_ran([("main.sysl", vfg_logger() +
+                        "var f = cstring(\"%lld and %lld\\n\")\n" +
+                        "print(log(f.ptr, 3, 4))\n")]),
+              "3 and 4\n8\n")
+
+// Every argument of the tail has to arrive, not just the first -- a walk handed over at the wrong ABI
+// can still get one right by accident.
+@test("every argument of the tail arrives")
+vfg_every_argument_of_the_tail_arrives()
+    if !vfg_ready() then return
+
+    assert_eq(xvr_ran([("main.sysl", vfg_logger() +
+                        "var f = cstring(\"%lld %lld %lld %lld %lld\\n\")\n" +
+                        "var n = log(f.ptr, 1, 2, 3, 4, 5)\n" +
+                        "print(n > 0)\n")]),
+              "1 2 3 4 5\ntrue\n")
+
+// The caller's walk is at some position when it is lent, and C reads on from there.
+@test("C reads on from wherever the walk had reached")
+vfg_c_reads_on_from_wherever_the_walk_had_reached()
+    if !vfg_ready() then return
+
+    assert_eq(xvr_ran([("main.sysl", vfg_logger() +
+                        "\n" +
+                        "skip_one(fmt: *u8, ...) -> i32\n" +
+                        "    var ap: va_list\n" +
+                        "    va_start(ap)\n" +
+                        "    var first: int = va_arg(ap)\n" +
+                        "    var n = vprintf(fmt, &ap)\n" +
+                        "    va_end(ap)\n" +
+                        "    first + n\n" +
+                        "end skip_one\n" +
+                        "\n" +
+                        "var f = cstring(\"%lld\\n\")\n" +
+                        "print(skip_one(f.ptr, 100, 7))\n")]),
+              "7\n102\n")
+
+// A walk this function was lent is already an address, so lending it on to C asks nothing new.
+@test("a walk lent by a sysl caller can be handed straight on to C")
+vfg_a_walk_lent_by_a_sysl_caller_can_be_handed_straight_on_to_c()
+    if !vfg_ready() then return
+
+    assert_eq(xvr_ran([("main.sysl",
+                        "import sysl.text.cstring\n" +
+                        "\n" +
+                        "extern vprintf(fmt: *u8, ap: va_list) -> i32\n" +
+                        "\n" +
+                        "render(fmt: *u8, ap: *va_list) -> i32 = vprintf(fmt, ap)\n" +
+                        "\n" +
+                        "log(fmt: *u8, ...) -> i32\n" +
+                        "    var ap: va_list\n" +
+                        "    va_start(ap)\n" +
+                        "    var n = render(fmt, &ap)\n" +
+                        "    va_end(ap)\n" +
+                        "    n\n" +
+                        "end log\n" +
+                        "\n" +
+                        "var f = cstring(\"%lld!\\n\")\n" +
+                        "print(log(f.ptr, 9))\n")]),
+              "9!\n3\n")
+
+// -- the three ABIs: one program, three machines, three lowerings ----------------------------------
+
+// Darwin arm64's `va_list` *is* a `char *`, so what a call passes is the value in the storage.
+@test("a target that passes the value loads it out of the storage")
+vfg_a_target_that_passes_the_value_loads_it_out_of_the_storage()
+    if !vfg_ready() then return
+
+    assert_eq(vfg_define(vfg_ir_for("aarch64-macos", vfg_call()), "log"),
+              "define i32 @log(ptr %fmt.param, ...) {\n" +
+              "entry:\n" +
+              "  %fmt.addr = alloca ptr\n" +
+              "  %ap.addr = alloca [4 x ptr]\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store ptr %fmt.param, ptr %fmt.addr\n" +
+              "  store [4 x ptr] zeroinitializer, ptr %ap.addr\n" +
+              "  call void @llvm.va_start.p0(ptr %ap.addr)\n" +
+              "  %t1 = load ptr, ptr %fmt.addr\n" +
+              "  %t2 = load ptr, ptr %ap.addr\n" +
+              "  %t3 = call i32 @vprintf(ptr %t1, ptr %t2)\n" +
+              "  store i32 %t3, ptr %n.addr\n" +
+              "  call void @llvm.va_end.p0(ptr %ap.addr)\n" +
+              "  %t4 = load i32, ptr %n.addr\n" +
+              "  ret i32 %t4\n" +
+              "}\n")
+
+// x86-64 System V's is an array of one struct, which decays -- so the storage's own address goes.
+@test("a target that passes the storage passes its address unchanged")
+vfg_a_target_that_passes_the_storage_passes_its_address_unchanged()
+    if !vfg_ready() then return
+
+    assert_eq(vfg_define(vfg_ir_for("x86_64-linux", vfg_call()), "log"),
+              "define i32 @log(ptr %fmt.param, ...) {\n" +
+              "entry:\n" +
+              "  %fmt.addr = alloca ptr\n" +
+              "  %ap.addr = alloca [4 x ptr]\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store ptr %fmt.param, ptr %fmt.addr\n" +
+              "  store [4 x ptr] zeroinitializer, ptr %ap.addr\n" +
+              "  call void @llvm.va_start.p0(ptr %ap.addr)\n" +
+              "  %t1 = load ptr, ptr %fmt.addr\n" +
+              "  %t2 = call i32 @vprintf(ptr %t1, ptr %ap.addr)\n" +
+              "  store i32 %t2, ptr %n.addr\n" +
+              "  call void @llvm.va_end.p0(ptr %ap.addr)\n" +
+              "  %t3 = load i32, ptr %n.addr\n" +
+              "  ret i32 %t3\n" +
+              "}\n")
+
+// AAPCS64's is a struct passed indirectly, so the callee gets a copy it may advance freely.
+@test("a target that passes it indirectly copies it first")
+vfg_a_target_that_passes_it_indirectly_copies_it_first()
+    if !vfg_ready() then return
+
+    assert_eq(vfg_define(vfg_ir_for("aarch64-linux", vfg_call()), "log"),
+              "define i32 @log(ptr %fmt.param, ...) {\n" +
+              "entry:\n" +
+              "  %fmt.addr = alloca ptr\n" +
+              "  %ap.addr = alloca [4 x ptr]\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %t2 = alloca [4 x ptr]\n" +
+              "  store ptr %fmt.param, ptr %fmt.addr\n" +
+              "  store [4 x ptr] zeroinitializer, ptr %ap.addr\n" +
+              "  call void @llvm.va_start.p0(ptr %ap.addr)\n" +
+              "  %t1 = load ptr, ptr %fmt.addr\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %t2, ptr align 8 %ap.addr, i64 32, i1 false)\n" +
+              "  %t3 = call i32 @vprintf(ptr %t1, ptr %t2)\n" +
+              "  store i32 %t3, ptr %n.addr\n" +
+              "  call void @llvm.va_end.p0(ptr %ap.addr)\n" +
+              "  %t4 = load i32, ptr %n.addr\n" +
+              "  ret i32 %t4\n" +
+              "}\n")
+
+// The number copied is the target's own `va_list`, not sysl's storage for one -- the storage is the
+// widest any target needs, and copying all of it would read past what `va_start` wrote.
+@test("the copy is the size of that target's va_list")
+vfg_the_copy_is_the_size_of_that_targets_va_list()
+    if !vfg_ready() then return
+
+    assert(vfg_ir_for("aarch64-linux", vfg_call()).contains("i64 32, i1 false"))
+    assert_eq(target_named("aarch64-linux").unwrap().va_list_bytes, 32)
+
+// A module carries the declaration for what it does, so which intrinsics it declares is itself a
+// fact about the target it was built for.
+@test("only the target that copies declares the copy")
+vfg_only_the_target_that_copies_declares_the_copy()
+    if !vfg_ready() then return
+
+    assert(vfg_ir_for("aarch64-linux", vfg_call()).contains("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)"))
+    assert(!vfg_ir_for("aarch64-macos", vfg_call()).contains("llvm.memcpy"))
+    assert(!vfg_ir_for("x86_64-linux", vfg_call()).contains("llvm.memcpy"))
+
+// The parameter list is what is the same everywhere: a `va_list` reaches C as one pointer whatever
+// the target does with the storage behind it. The result is not asserted -- RISC-V 64 widens a
+// 32-bit one (`signext i32`), which is that convention's business.
+@test("and every target declares the callee the same way, taking one pointer")
+vfg_every_target_declares_the_callee_taking_one_pointer()
+    if !vfg_ready() then return
+
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        if all.at(i).supported()
+            assert(vfg_ir_on(all.at(i), vfg_call()).contains("@vprintf(ptr, ptr)"), all.at(i).name)
+end vfg_every_target_declares_the_callee_taking_one_pointer
+
+// -- C's two spellings: `va_list` is the by-value parameter `vprintf` takes, `*va_list` is
+// `va_list *`. The call writes `&ap` for either.
+
+// `va_list *` is an ordinary pointer on every machine, so nothing is converted for it.
+@test("a va_list* parameter takes the address itself, on every target")
+vfg_a_va_list_pointer_parameter_takes_the_address_itself()
+    if !vfg_ready() then return
+
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        if all.at(i).supported()
+            val out = vfg_define(vfg_ir_on(all.at(i), vfg_by_pointer()), "f")
+
+            assert(out.contains("@advance(ptr %ap.addr)"), all.at(i).name)
+            assert(!out.contains("memcpy"), all.at(i).name)
+end vfg_a_va_list_pointer_parameter_takes_the_address_itself
+
+// Same source, one word different in the declaration, and a different thing crosses over.
+@test("the same call converts or does not, according to which was declared")
+vfg_the_same_call_converts_or_does_not()
+    if !vfg_ready() then return
+
+    assert(vfg_define(vfg_ir_for("aarch64-macos", vfg_call()), "log").contains("load ptr, ptr %ap.addr"))
+    assert_eq(vfg_define(vfg_ir_for("aarch64-macos", vfg_by_pointer()), "f"),
+              "define i32 @f(i32 %n.param, ...) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %ap.addr = alloca [4 x ptr]\n" +
+              "  %r.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  store [4 x ptr] zeroinitializer, ptr %ap.addr\n" +
+              "  call void @llvm.va_start.p0(ptr %ap.addr)\n" +
+              "  %t1 = call i32 @advance(ptr %ap.addr)\n" +
+              "  store i32 %t1, ptr %r.addr\n" +
+              "  call void @llvm.va_end.p0(ptr %ap.addr)\n" +
+              "  %t2 = load i32, ptr %r.addr\n" +
+              "  ret i32 %t2\n" +
+              "}\n")
+end vfg_the_same_call_converts_or_does_not
+
+// -- the corners: shapes that would have shipped green under a lowering that handled only one case
+
+private vfg_two_walks() -> string =
+    "extern both(a: va_list, b: va_list) -> i32\n" +
+    "\n" +
+    "f(n: int, ...) -> i32\n" +
+    "    var x: va_list\n" +
+    "    var y: va_list\n" +
+    "    va_start(x)\n" +
+    "    va_copy(y, x)\n" +
+    "    var r = both(&x, &y)\n" +
+    "    va_end(x)\n" +
+    "    va_end(y)\n" +
+    "    r\n" +
+    "end f\n" +
+    "print(f(0))\n"
+
+// Two walks in one call: the positions are converted independently, and a lowering that took "the
+// va_list argument" would convert one of them.
+@test("an extern taking two walks converts both")
+vfg_an_extern_taking_two_walks_converts_both()
+    if !vfg_ready() then return
+
+    val head = "define i32 @f(i32 %n.param, ...) {\n" +
+               "entry:\n" +
+               "  %n.addr = alloca i32\n" +
+               "  %x.addr = alloca [4 x ptr]\n" +
+               "  %y.addr = alloca [4 x ptr]\n" +
+               "  %r.addr = alloca i32\n"
+    val start = "  store i32 %n.param, ptr %n.addr\n" +
+                "  store [4 x ptr] zeroinitializer, ptr %x.addr\n" +
+                "  store [4 x ptr] zeroinitializer, ptr %y.addr\n" +
+                "  call void @llvm.va_start.p0(ptr %x.addr)\n" +
+                "  call void @llvm.va_copy.p0(ptr %y.addr, ptr %x.addr)\n"
+    val tail = "  %t3 = call i32 @both(ptr %t1, ptr %t2)\n" +
+               "  store i32 %t3, ptr %r.addr\n" +
+               "  call void @llvm.va_end.p0(ptr %x.addr)\n" +
+               "  call void @llvm.va_end.p0(ptr %y.addr)\n" +
+               "  %t4 = load i32, ptr %r.addr\n" +
+               "  ret i32 %t4\n" +
+               "}\n"
+
+    assert_eq(vfg_define(vfg_ir_for("aarch64-macos", vfg_two_walks()), "f"),
+              head + start +
+              "  %t1 = load ptr, ptr %x.addr\n" +
+              "  %t2 = load ptr, ptr %y.addr\n" + tail)
+    assert_eq(vfg_define(vfg_ir_for("aarch64-linux", vfg_two_walks()), "f"),
+              head +
+              "  %t1 = alloca [4 x ptr]\n" +
+              "  %t2 = alloca [4 x ptr]\n" + start +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %t1, ptr align 8 %x.addr, i64 32, i1 false)\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %t2, ptr align 8 %y.addr, i64 32, i1 false)\n" +
+              tail)
+end vfg_an_extern_taking_two_walks_converts_both
+
+// A `va_list` before the tail of a *variadic* extern: the conversion is by position, and the tail's
+// arguments are not parameters, so the two must not be counted together.
+@test("a walk in front of a foreign tail is found by position")
+vfg_a_walk_in_front_of_a_foreign_tail_is_found_by_position()
+    if !vfg_ready() then return
+
+    val src = "extern odd(ap: va_list, ...) -> i32\n" +
+              "\n" +
+              "f(n: int, ...) -> i32\n" +
+              "    var ap: va_list\n" +
+              "    va_start(ap)\n" +
+              "    var r = odd(&ap, 1, 2)\n" +
+              "    va_end(ap)\n" +
+              "    r\n" +
+              "end f\n" +
+              "print(f(0))\n"
+
+    assert_eq(vfg_define(vfg_ir_for("aarch64-macos", src), "f"),
+              "define i32 @f(i32 %n.param, ...) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %ap.addr = alloca [4 x ptr]\n" +
+              "  %r.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  store [4 x ptr] zeroinitializer, ptr %ap.addr\n" +
+              "  call void @llvm.va_start.p0(ptr %ap.addr)\n" +
+              "  %t1 = load ptr, ptr %ap.addr\n" +
+              "  %t2 = call i32 (ptr, ...) @odd(ptr %t1, i32 1, i32 2)\n" +
+              "  store i32 %t2, ptr %r.addr\n" +
+              "  call void @llvm.va_end.p0(ptr %ap.addr)\n" +
+              "  %t3 = load i32, ptr %r.addr\n" +
+              "  ret i32 %t3\n" +
+              "}\n")
+end vfg_a_walk_in_front_of_a_foreign_tail_is_found_by_position
+
+// The storage a copy goes into is an entry-block slot, so a call in a loop reuses one rather than
+// growing the frame per iteration.
+@test("a call in a loop copies into one slot, not one per iteration")
+vfg_a_call_in_a_loop_copies_into_one_slot()
+    if !vfg_ready() then return
+
+    val src = vfg_logger() +
+              "var p: *u8 = null\n" +
+              "\n" +
+              "go(n: int, ...) -> int\n" +
+              "    for i in 0..<n\n" +
+              "        var ap: va_list\n" +
+              "        va_start(ap)\n" +
+              "        var q: *u8 = null\n" +
+              "        var unused = vprintf(q, &ap)\n" +
+              "        va_end(ap)\n" +
+              "    0\n" +
+              "end go\n" +
+              "print(go(0))\n"
+    val out = vfg_define(vfg_ir_for("aarch64-linux", src), "go")
+
+    assert_eq(xvr_count(out, "alloca [4 x ptr]"), 2)
+    assert(out.contains("entry:\n" +
+                        "  %n.addr = alloca i32\n" +
+                        "  %i.addr = alloca i32\n" +
+                        "  %ap.addr = alloca [4 x ptr]\n" +
+                        "  %q.addr = alloca ptr\n" +
+                        "  %unused.addr = alloca i32\n" +
+                        "  %t5 = alloca [4 x ptr]\n"), out)
+    assert(out.contains("  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %t5, ptr align 8 %ap.addr, i64 32, i1 false)\n" +
+                        "  %t6 = call i32 @vprintf(ptr %t4, ptr %t5)\n"), out)
+end vfg_a_call_in_a_loop_copies_into_one_slot
+
+// The four forms and the crossing are the same address, so a body may do both to one walk.
+@test("a walk may be read, lent to C, and read again")
+vfg_a_walk_may_be_read_lent_to_c_and_read_again()
+    if !vfg_ready() then return
+
+    assert_eq(xvr_ran([("main.sysl", vfg_logger() +
+                        "\n" +
+                        "mixed(fmt: *u8, ...) -> int\n" +
+                        "    var ap: va_list\n" +
+                        "    va_start(ap)\n" +
+                        "    var first: int = va_arg(ap)\n" +
+                        "    var copy: va_list\n" +
+                        "    va_copy(copy, ap)\n" +
+                        "    var wrote = vprintf(fmt, &copy)\n" +
+                        "    va_end(copy)\n" +
+                        "    var second: int = va_arg(ap)\n" +
+                        "    va_end(ap)\n" +
+                        "    first + second + wrote\n" +
+                        "end mixed\n" +
+                        "\n" +
+                        "var f = cstring(\"%lld\\n\")\n" +
+                        "print(mixed(f.ptr, 10, 20))\n")]),
+              "20\n33\n")
+
+// The extern is reached only through the converted argument, so nothing else keeps it alive.
+@test("the callee is still declared when the walk is the only reason to reach it")
+vfg_the_callee_is_still_declared()
+    if !vfg_ready() then return
+
+    assert(vfg_ir_for("aarch64-macos", vfg_call()).contains("declare i32 @vprintf(ptr, ptr)"))
+
+// -- what is still refused --------------------------------------------------------------------------
+
+// The rule is about a *sysl* body, which could do nothing with a copy of a walk. A foreign body is
+// C's, and C's `vprintf` is exactly a body that reads one.
+@test("a bare va_list parameter on a sysl function, and only there")
+vfg_a_bare_va_list_parameter_on_a_sysl_function_only()
+    if !vfg_ready() then return
+
+    assert_eq(vfg_said("f(ap: va_list) -> int = 1\nprint(1)\n"),
+              "a va_list is a parameter as '*va_list', not as 'va_list' — a parameter is a by-value " +
+              "binding, and a copy of a walk advances nothing 'f''s caller can see, so the walk is " +
+              "handed over by address and the call writes '&ap'")
+    assert(vfg_ir_for("aarch64-macos", "extern g(ap: va_list) -> i32\nprint(g(null))\n")
+               .contains("declare i32 @g(ptr)"))
+end vfg_a_bare_va_list_parameter_on_a_sysl_function_only
+
+// There is no by-value `va_list` in sysl at all, foreign or not, so there is nowhere to put one that
+// came back.
+@test("handing one back, whoever the callee is")
+vfg_handing_one_back_whoever_the_callee_is()
+    assert_eq(vfg_said("extern current() -> va_list\nprint(1)\n"),
+              "a va_list cannot be returned from 'current' — the type names the storage a walk lives " +
+              "in, and there is no value of it to hand back")
+    assert_eq(vfg_said("f(n: int, ...) -> va_list\n    var ap: va_list\n    ap\nend f\nprint(1)\n"),
+              "a va_list cannot be returned from 'f' — the type names the storage a walk lives in, and " +
+              "there is no value of it to hand back")
+end vfg_handing_one_back_whoever_the_callee_is
+
+// The parameter is checked as the address it is, so the complaint names `*va_list` -- the thing the
+// caller has to produce -- rather than C's spelling, which the caller never writes.
+@test("something that is not a walk at all, where one is wanted")
+vfg_something_that_is_not_a_walk_at_all()
+    assert_eq(vfg_said("extern vprintf(fmt: *u8, ap: va_list) -> i32\nvar p: *u8 = null\nprint(vprintf(p, p))\n"),
+              "'ap' of 'vprintf' is *va_list, but *byte was given")
+
+@test("too few arguments, which the foreign declaration counts like any other")
+vfg_too_few_arguments_counted_like_any_other()
+    assert_eq(vfg_said("extern vprintf(fmt: *u8, ap: va_list) -> i32\nvar p: *u8 = null\nprint(vprintf(p))\n"),
+              "function 'vprintf' takes 2 arguments, but 1 argument was given")

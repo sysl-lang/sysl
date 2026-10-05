@@ -1,0 +1,107 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// A vector's lane count reached through a value parameter, and instantiated at zero
+// (`reference/vectors.md § Lanes`, `§ One kernel, every width`). The generic declaration is read in
+// its own terms with the parameter standing in as a zero, which is no mistake; an instantiation the
+// program made at zero is, and is refused at the `<W>f32` the declaration wrote -- as the reference
+// does. **Every message and position here was read out of the reference compiler (0.0.162).**
+
+private zln_no_lanes() -> string =
+    "a vector of no lanes holds nothing and computes nothing — an array may be empty because it " +
+        "is storage, and a register cannot be"
+
+private zln_refused(text: string, at: string)
+    val said = zln_text(text)
+
+    assert(said.contains(zln_no_lanes()), s"expected the zero-lane refusal\nit said: $said")
+    assert(said.contains(at), s"expected it at $at\nit said: $said")
+    assert(zln_times(said, zln_no_lanes()) == 1, s"expected one refusal\nit said: $said")
+    assert(!said.contains("has lanes 0 to"), s"the index is not the mistake\nit said: $said")
+
+private zln_text(text: string) -> string = enm_err(text)
+
+// How many times `part` occurs in `text`, none overlapping.
+private zln_times(text: string, part: string) -> int
+    var rest = text
+    var n = 0
+
+    loop
+        rest.index_of(part) match
+            Some(i) ->
+                n += 1
+                rest = rest[i + part.len..]
+            None -> break
+
+    n
+
+@test("a lane count instantiated at zero through a written argument is refused at the spelling")
+zln_written_zero_is_refused()
+    if !enm_ready() then return
+
+    zln_refused("make[const W: usize]() -> f32\n    val v: <W>f32 = 1.0\n    v[0]\n\n" +
+                    "print(make[4]())\nprint(make[0]())\n",
+                "main.sysl:2:12")
+
+@test("the length of a vector instantiated at zero is refused rather than handed to the back end")
+zln_zero_never_reaches_lowering()
+    if !enm_ready() then return
+
+    zln_refused("make[const W: usize]() -> usize\n    val v: <W>f32 = 1.0\n    v.len\n\n" +
+                    "print(make[0]())\n",
+                "main.sysl:2:12")
+
+@test("a zero bound through an empty array argument is refused the same way")
+zln_zero_bound_from_an_argument()
+    if !enm_ready() then return
+
+    zln_refused("first[const W: usize](v: [W]f32) -> f32\n    val x: <W>f32 = 1.0\n    x[0]\n\n" +
+                    "val e: [0]f32 = []\nprint(first(e))\n",
+                "main.sysl:2:12")
+
+@test("a generic struct's vector field instantiated at zero is refused at the field")
+zln_struct_field_at_zero()
+    if !enm_ready() then return
+
+    zln_refused("struct Lanes[const W: usize]\n    v: <W>f32\n\nval s: Lanes[0] = Lanes(1.0)\n" +
+                    "print(1)\n",
+                "main.sysl:2:8")
+
+// `low`'s signature names `Lanes[W]` with `W` standing in at zero, which is the same name a real
+// `Lanes[0]` has -- read first, it must not leave the real one looking already settled.
+@test("a generic signature naming the struct at its stand-in does not excuse a real zero")
+zln_stand_in_does_not_excuse_a_real_zero()
+    if !enm_ready() then return
+
+    zln_refused("struct Lanes[const W: usize]\n    v: <W>f32\n\n" +
+                    "low[const W: usize](l: Lanes[W]) -> f32 = l.v[0]\n\n" +
+                    "val s: Lanes[0] = Lanes(1.0)\nprint(low(s))\n",
+                "main.sysl:2:8")
+
+@test("a zero passed on from one generic to another is refused once, where it was first spelled")
+zln_zero_passed_on()
+    if !enm_ready() then return
+
+    zln_refused("width[const W: usize](v: <W>f32) -> usize = v.len\n\n" +
+                    "outer[const W: usize]() -> usize\n    val v: <W>f32 = 2.0\n    width(v)\n\n" +
+                    "print(outer[4]())\nprint(outer[0]())\n",
+                "main.sysl:4:12")
+
+// The other side: the declaration read in its own terms says nothing, whether or not anything
+// instantiates it, and an instantiation at a real width runs.
+@test("a generic vector kernel nothing instantiates at zero is not refused")
+zln_stand_in_is_not_refused()
+    if !enm_ready() then return
+
+    val out = enm_outcome("first[const W: usize](v: <W>f32) -> f32 = v[0]\n\n" +
+                          "struct Lanes[const W: usize]\n    v: <W>f32\n\n" +
+                          "low[const W: usize](l: Lanes[W]) -> f32 = l.v[0]\n\n" +
+                          "make[const W: usize]() -> f32\n    val v: <W>f32 = 1.0\n    v[0]\n\n" +
+                          "val four: <4>f32 = [1.0, 2.0, 3.0, 4.0]\n" +
+                          "val l: Lanes[2] = Lanes(3.0)\n" +
+                          "print(first(four), low(l), make[8]())\n")
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "1 3 1\n")

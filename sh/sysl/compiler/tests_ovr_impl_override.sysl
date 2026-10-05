@@ -1,0 +1,333 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.str_builder
+
+// `override` — the one relaxation of "one implementation per type" (`reference/traits.md § override —
+// when the overlap is deliberate`), and the marking it requires of a member that replaces a trait's
+// default body.
+//
+// The keyword goes on the OVERRIDING side: a library author cannot know which of their
+// implementations somebody will need to replace, so nothing is granted in advance. An unmarked second
+// implementation is still refused exactly as it was, so the accidental duplicate is still caught; and
+// in the other direction an `override` with nothing to override is refused, and so is one written on
+// the general kind, which has nothing below it.
+//
+// **Every expected list is the reference's complete output for that program (0.0.162)**, every
+// diagnostic of it in source order; these are its `ImplOverrideTests`.
+
+private ovr_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+// Every diagnostic a one-file program earns, one message to a line in source order.
+private ovr_diags(text: string) -> string
+    val root = make_temp_dir("sysl-ovr").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    var b = str_builder()
+
+    emit_llvm_text(src, None) match
+        Err(why) -> b.push(s"refused: ${why.message}")
+        Ok(made) ->
+            val ordered = in_source_order(made.report)
+
+            for i in 0..<ordered.len()
+                if i > 0 then b.push("\n")
+
+                b.push(if ordered.at(i).is_error() then "error: " else "warning: ")
+                b.push(ordered.at(i).diag.message)
+
+    remove_dir_all(root).unwrap_or(())
+    b.finish()
+end ovr_diags
+
+// What a program prints, or why it did not build or run.
+private ovr_run(text: string) -> string
+    if !clang_available() then return "skipped"
+
+    val root = make_temp_dir("sysl-ovr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end ovr_run
+
+private ovr_ran(text: string, expected: string)
+    val got = ovr_run(text)
+
+    if got != "skipped" then assert_eq(got, expected)
+
+private ovr_show() -> string = "trait Show\n    show(self) -> string\n"
+
+private ovr_fallible() -> string = "trait Fallible2\n    failed(self) -> bool = false\n"
+
+private ovr_p() -> string = "struct P\n    v: int\n"
+
+// A parse refusal and where it points, as `<message> @ <line>:<column>`.
+private ovr_refused(text: string) -> string = s"${pf_err(text)} @ ${pf_at(text)}"
+
+// The refusal of an `override` written on a member outside an `impl` block.
+private ovr_misplaced_member() -> string =
+    "'override' says a member replaces a body its trait supplied, and it is written on that member " +
+    "inside the 'impl' block — a trait's own member is where a default is written rather than " +
+    "replaced, and a member of a type's body implements no trait"
+
+// -- a written-out type overriding a shape -------------------------------------------------------------
+
+@test("impl override: the override answers for the type it names")
+ovr_the_override_answers_for_the_type_it_names()
+    if !ovr_ready() then return
+
+    ovr_ran(ovr_show() + "impl[T] Show for []T\n    show(self) -> string = \"any\"\n" + ovr_p() +
+            "override impl Show for []P\n    show(self) -> string = \"points\"\n" +
+            "var a = [P(1)]\nvar b = [1, 2]\nprint(a[0..].show())\nprint(b[0..].show())\n",
+            "points\nany\n")
+
+// The flag travels with the written-out type rather than with whichever block is hoisted last.
+@test("impl override: in whichever order the file writes the two")
+ovr_in_whichever_order_the_file_writes_the_two()
+    if !ovr_ready() then return
+
+    ovr_ran(ovr_show() + ovr_p() + "override impl Show for []P\n    show(self) -> string = \"points\"\n" +
+            "impl[T] Show for []T\n    show(self) -> string = \"any\"\n" +
+            "var a = [P(1)]\nvar b = [1, 2]\nprint(a[0..].show())\nprint(b[0..].show())\n",
+            "points\nany\n")
+
+@test("impl override: and an array of the block's length is the same case")
+ovr_an_array_of_the_blocks_length_is_the_same_case()
+    if !ovr_ready() then return
+
+    ovr_ran(ovr_show() + "impl[T] Show for [2]T\n    show(self) -> string = \"any\"\n" + ovr_p() +
+            "override impl Show for [2]P\n    show(self) -> string = \"points\"\n" +
+            "var a = [P(1), P(2)]\nprint(a.show())\n",
+            "points\n")
+
+// Without the keyword the pair is refused exactly as before, so an accidental duplicate still lands
+// on the diagnostic that finds it.
+@test("impl override: while the unmarked pair is refused as it always was")
+ovr_while_the_unmarked_pair_is_refused_as_it_always_was()
+    if !ovr_ready() then return
+
+    assert_eq(ovr_diags(ovr_show() + "impl[T] Show for []T\n    show(self) -> string = \"any\"\n" + ovr_p() +
+                        "impl Show for []P\n    show(self) -> string = \"points\"\n"),
+              "error: every slice already implements 'Show', so '[]P' has an implementation and " +
+              "cannot be given a second one — write 'override impl' to say that replacing it for " +
+              "this one type is what was meant")
+
+@test("impl override: and so is the pair with the shape written second")
+ovr_and_so_is_the_pair_with_the_shape_written_second()
+    if !ovr_ready() then return
+
+    assert_eq(ovr_diags(ovr_show() + ovr_p() + "impl Show for []P\n    show(self) -> string = \"points\"\n" +
+                        "impl[T] Show for []T\n    show(self) -> string = \"any\"\n"),
+              "error: '[]P' already implements 'Show', and this 'impl' would implement it for every " +
+              "slice — including that one")
+
+// -- an erasure sees the override, because one type still has one table --------------------------------
+
+@test("impl override: so a trait object over the overridden type dispatches to the override")
+ovr_a_trait_object_dispatches_to_the_override()
+    if !ovr_ready() then return
+
+    ovr_ran(ovr_show() + "impl[T] Show for [1]T\n    show(self) -> string = \"any\"\n" + ovr_p() +
+            "override impl Show for [1]P\n    show(self) -> string = \"points\"\n" +
+            "var a: &[1]P = [P(1)]\nvar o: &Show = a\nprint(o.show())\n",
+            "points\n")
+
+// -- an 'override' with nothing to override -------------------------------------------------------------
+
+@test("impl override: is refused when no block covers the type more generally")
+ovr_is_refused_when_no_block_covers_the_type_more_generally()
+    if !ovr_ready() then return
+
+    assert_eq(ovr_diags(ovr_show() + ovr_p() + "override impl Show for []P\n    show(self) -> string = \"points\"\n"),
+              "error: '[]P' says 'override', but nothing else implements 'Show' for it — an override " +
+              "replaces an implementation that covers the type more generally, and there is none to replace")
+
+// What is asked is the trait AT THESE ARGUMENTS: a shape may implement one promise of a generic trait
+// and the override name another, and then there is nothing under it.
+@test("impl override: and it is asked of the promise the block makes, not of the trait")
+ovr_it_is_asked_of_the_promise_the_block_makes()
+    if !ovr_ready() then return
+
+    assert_eq(ovr_diags("trait Take[T]\n    take(self, x: T) -> int\n" +
+                        "impl[U] Take[int] for []U\n    take(self, x: int) -> int = x\n" + ovr_p() +
+                        "override impl Take[string] for []P\n    take(self, x: string) -> int = 0\n"),
+              "error: '[]P' says 'override', but nothing else implements 'Take[string]' for it — an " +
+              "override replaces an implementation that covers the type more generally, and there is " +
+              "none to replace")
+
+// The condition decides which slices conform, not whether the block covers the shape.
+@test("impl override: while a conditional block is something to override")
+ovr_while_a_conditional_block_is_something_to_override()
+    if !ovr_ready() then return
+
+    ovr_ran(ovr_show() + "impl[T: Show] Show for []T\n    show(self) -> string = self[0].show()\n" + ovr_p() +
+            "override impl Show for []P\n    show(self) -> string = \"points\"\n" +
+            "var a = [P(1)]\nprint(a[0..].show())\n",
+            "points\n")
+
+// -- 'override' on the general kind is refused, since nothing is below it -------------------------------
+
+@test("impl override: a shape covers every type it matches at once")
+ovr_a_shape_covers_every_type_it_matches_at_once()
+    if !ovr_ready() then return
+
+    assert_eq(ovr_diags(ovr_show() + "override impl[T] Show for []T\n    show(self) -> string = \"any\"\n"),
+              "error: 'override' says this block replaces a more general one, and '[]T' is the general " +
+              "kind — an implementation for a shape or for a generic type covers every type it matches " +
+              "at once, so there is nothing below it. The override is written on the block for one type " +
+              "spelled out in full")
+
+@test("impl override: and a generic type has one key for all of its instantiations")
+ovr_a_generic_type_has_one_key_for_all_of_its_instantiations()
+    if !ovr_ready() then return
+
+    assert_eq(ovr_diags(ovr_show() + "struct Box[T]\n    v: T\n" +
+                        "override impl[T] Show for Box[T]\n    show(self) -> string = \"box\"\n"),
+              "error: 'override' says this block replaces a more general one, and 'Box' is the general " +
+              "kind — an implementation for a shape or for a generic type covers every type it matches " +
+              "at once, so there is nothing below it. The override is written on the block for one type " +
+              "spelled out in full")
+
+// -- coherence is untouched, which is what keeps one type to one table ----------------------------------
+
+// `[]int` names nothing outside the library, so a program cannot override the library's block for it
+// however the block is marked — the refusal is coherence's, arriving after `override` lifted the overlap.
+@test("impl override: so a program cannot override the library's block for a slice of a built-in")
+ovr_a_program_cannot_override_the_librarys_block_for_a_builtin_slice()
+    if !ovr_ready() then return
+
+    assert_eq(ovr_diags("override impl Display for []int\n" +
+                        "    display(self, out: *Writer, fmt: FormatSpec) = display_str(\"ints\", out, fmt)\n" +
+                        "print(1)\n"),
+              "error: an 'impl' may be written only in the module that declares the trait or in one that " +
+              "declares a type the block names, and 'sysl.Display' is the library's while nothing in " +
+              "'[]int' is declared outside the library — so this one has no home. A trait of your own, or " +
+              "a type of your own in what it is written for or in the trait's arguments, gives it one")
+
+// Two blocks for one key are two blocks for one key whatever they say.
+@test("impl override: and one type takes one override, not a stack of them")
+ovr_one_type_takes_one_override_not_a_stack()
+    if !ovr_ready() then return
+
+    assert_eq(ovr_diags(ovr_show() + "impl[T] Show for []T\n    show(self) -> string = \"any\"\n" + ovr_p() +
+                        "override impl Show for []P\n    show(self) -> string = \"points\"\n" +
+                        "override impl Show for []P\n    show(self) -> string = \"again\"\n"),
+              "error: '[]P' already implements 'Show'")
+
+// -- the blankets a derived subtype and a tuple meet -----------------------------------------------------
+
+// `reference/errors.md § A derivation inherits its base's behaviour and may replace none of it` gives
+// a derived subtype its base's memberships, so the library's integer `Display` covers it; `override`
+// is how it prints its own way.
+@test("impl override: a derived subtype overrides the blanket its base is covered by")
+ovr_a_derived_subtype_overrides_the_blanket_its_base_is_covered_by()
+    if !ovr_ready() then return
+
+    ovr_ran("type Stamp = new int\noverride impl Display for Stamp\n" +
+            "    display(self, out: *Writer, fmt: FormatSpec) = display_str(\"#\" + str(int(self)), out, fmt)\n" +
+            "var s: Stamp = Stamp(7)\nprint(s)\nprint(7)\n",
+            "#7\n7\n")
+
+// A tuple is a shape like a slice, its arity the key.
+@test("impl override: a tuple of the program's own types overrides the library's block for its arity")
+ovr_a_tuple_of_the_programs_own_types_overrides_the_librarys_block()
+    if !ovr_ready() then return
+
+    ovr_ran(ovr_p() + "impl Display for P\n" +
+            "    display(self, out: *Writer, fmt: FormatSpec) = display_int(i64(self.v), out, fmt)\n" +
+            "override impl Display for (P, int)\n" +
+            "    display(self, out: *Writer, fmt: FormatSpec) = display_str(\"a pair\", out, fmt)\n" +
+            "var t = (P(1), 2)\nvar u = (1, 2)\nprint(t)\nprint(u)\n",
+            "a pair\n(1, 2)\n")
+
+// -- a member that replaces a trait's default body says so -----------------------------------------------
+
+@test("impl override: the keyword is required where a body is replaced")
+ovr_the_keyword_is_required_where_a_body_is_replaced()
+    if !ovr_ready() then return
+
+    assert_eq(ovr_diags(ovr_fallible() + "struct File\n    e: int\n" +
+                        "impl Fallible2 for File\n    failed(self) -> bool = self.e != 0\n"),
+              "error: trait 'Fallible2' supplies a body for method 'failed', so writing one here " +
+              "replaces it — say 'override failed', or leave the member out to keep the trait's")
+
+@test("impl override: and with it the member replaces the default")
+ovr_and_with_it_the_member_replaces_the_default()
+    if !ovr_ready() then return
+
+    ovr_ran(ovr_fallible() + "struct File\n    e: int\n" +
+            "impl Fallible2 for File\n    override failed(self) -> bool = self.e != 0\n" +
+            "print(File(1).failed())\nprint(File(0).failed())\n",
+            "true\nfalse\n")
+
+// An implementation content with the default writes no member at all.
+@test("impl override: while leaving the member out keeps the trait's body and needs no keyword")
+ovr_leaving_the_member_out_keeps_the_traits_body()
+    if !ovr_ready() then return
+
+    ovr_ran(ovr_fallible() + "struct File\n    e: int\nimpl Fallible2 for File\nprint(File(1).failed())\n",
+            "false\n")
+
+@test("impl override: and the keyword is refused where the trait declared no body")
+ovr_the_keyword_is_refused_where_the_trait_declared_no_body()
+    if !ovr_ready() then return
+
+    assert_eq(ovr_diags(ovr_show() + ovr_p() + "impl Show for P\n    override show(self) -> string = \"p\"\n"),
+              "error: trait 'Show' declares method 'show' without a body, so this member supplies what " +
+              "the trait asked for rather than replacing anything — 'override' says a body was replaced")
+
+// A property carries a body in its declaration form, so the same question is asked of it.
+@test("impl override: a property's default is replaced the same way")
+ovr_a_propertys_default_is_replaced_the_same_way()
+    if !ovr_ready() then return
+
+    assert_eq(ovr_diags("trait Named\n    label -> string = \"?\"\n" + ovr_p() +
+                        "impl Named for P\n    label -> string = \"p\"\n"),
+              "error: trait 'Named' supplies a body for property 'label', so writing one here replaces " +
+              "it — say 'override label', or leave the member out to keep the trait's")
+
+// -- where the word may not be written at all ------------------------------------------------------------
+
+@test("impl override: a trait's own member is where a default is written rather than replaced")
+ovr_a_traits_own_member_is_where_a_default_is_written()
+    assert_eq(ovr_refused("trait Named\n    override label -> string = \"?\"\nprint(1)\n"),
+              ovr_misplaced_member() + " @ 2:14")
+
+// An inherent member implements no trait, so there is nothing for the keyword to mark.
+@test("impl override: and a member of a type's own body implements no trait")
+ovr_a_member_of_a_types_own_body_implements_no_trait()
+    assert_eq(ovr_refused(ovr_p() + "    override show(self) -> string = \"p\"\nprint(1)\n"),
+              ovr_misplaced_member() + " @ 3:14")
+
+@test("impl override: nor does a declaration of its own replace anything")
+ovr_nor_does_a_declaration_of_its_own_replace_anything()
+    assert_eq(ovr_refused("override struct P\n    v: int\nprint(1)\n"),
+              "'override' marks something that replaces an implementation already covering the same " +
+              "type, so it goes in front of an 'impl' block or of a member inside one — a declaration " +
+              "of its own replaces nothing @ 1:10")

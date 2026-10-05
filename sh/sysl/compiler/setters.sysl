@@ -126,6 +126,23 @@ private check_not_own_setter(cx: &Analyzer, span: Span, receiver: Expr, name: st
              "What a body like this means to write is the field it is in front of")
 end check_not_own_setter
 
+// **A property that reads itself calls itself** — `count -> int = self.count` is a body that never
+// returns, and what it means to read is the field the property stands in front of. Nothing where the
+// read is not `self.<the property being defined>`, which leaves every other read to answer.
+own_property_read(cx: &Analyzer, at: Span, receiver: Expr, rt: Type, name: string) -> Option[TExpr]
+    if !names_self(receiver) then return None
+    if enclosing_member(cx) != name then return None
+
+    val found = member_key(cx.an, rt, name)
+    val m = member_at(cx.an, found.0, name)
+
+    if m.is_none() || !m.unwrap().is_property then return None
+
+    Some(cx.err(at, s"'$name' reads the property it is defining, so it calls itself — the value a " +
+                "property computes is not the property. What a body like this means to read is the " +
+                "field it is in front of"))
+end own_property_read
+
 private names_self(receiver: Expr) -> bool = *receiver.kind match
     Ident(n) -> n == "self"
     Unary(op, inner) -> op == "*" && names_self(inner)

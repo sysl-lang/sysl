@@ -1,0 +1,390 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A bound on a **type's own** type parameters (`reference/generics.md § Bounds`): `struct
+// SortedList[T: Ord]` is the same list a generic function writes, in the same place, meaning the same
+// thing. The members may assume it, so they are checked once at their definition rather than once
+// per instantiation, and the bound travels into whatever the type hands its parameter to.
+//
+// **Every output quoted here was read out of the reference compiler** (0.0.162), whose
+// `TypeBoundsRunTests` these are.
+
+private var tbr_library_cache: Buf[Program] = buf()
+private var tbr_library_read: bool = false
+
+private tbr_library() -> Buf[Program]
+    if tbr_library_read then return tbr_library_cache
+
+    tbr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tbr_library_cache = units
+
+    tbr_library_cache
+end tbr_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private tbr_ready() -> bool
+    if tbr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end tbr_ready
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private tbr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-type-bounds-run").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tbr_ran
+
+// The emitted LLVM text, or whatever the compiler had to say instead.
+private tbr_ir(text: string) -> string
+    val root = make_temp_dir("sysl-type-bounds-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tbr_ir
+
+// The trait and the one type implementing it that most of these bound their parameter by.
+private tbr_show() -> string = raw"""
+    trait Show
+        show(self) -> string
+    struct P
+        v: int
+    impl Show for P
+        show(self) -> string = "p" + str(self.v)
+    """
+
+// ---- a struct's parameter ----
+
+@test("a struct's parameter may carry a bound, and its members may assume it")
+tbr_struct_bound_members_assume_it()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(tbr_show() + raw"""
+        struct Wrap[T: Show]
+            inner: T
+            label(self) -> string = self.inner.show()
+        var w = Wrap(P(7))
+        print(w.label())
+        """), "p7\n")
+
+// The member is checked against the bound alone, so nothing about it waits for an instantiation.
+@test("a struct's bound licenses a member of a type nothing ever constructs")
+tbr_struct_bound_unconstructed_type()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(tbr_show() + raw"""
+        struct Wrap[T: Show]
+            inner: T
+            label(self) -> string = self.inner.show()
+        print("ok")
+        """), "ok\n")
+
+@test("a struct's parameter may carry several bounds, all of them available")
+tbr_struct_several_bounds()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(raw"""
+        trait Show
+            show(self) -> string
+        trait Size
+            size(self) -> int
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> string = "p"
+        impl Size for P
+            size(self) -> int = 3
+        struct Wrap[T: Show + Size]
+            inner: T
+            both(self) -> string = self.inner.show() + str(self.inner.size())
+        print(Wrap(P(1)).both())
+        """), "p3\n")
+
+// A trait's operators come with it -- `+` on the element is `Add`, as inside a bounded function.
+@test("a struct's bound licenses an operator through the trait that supplies it")
+tbr_struct_bound_operator()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(raw"""
+        struct Sum[T: Add]
+            a: T
+            b: T
+            total(self) -> T = self.a + self.b
+        print(Sum(3, 4).total())
+        print(Sum(1.5, 2.25).total())
+        """), "7\n3.75\n")
+
+@test("a struct's bound licenses a property as readily as a method")
+tbr_struct_bound_property()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(tbr_show() + raw"""
+        struct Wrap[T: Show]
+            inner: T
+            label -> string = self.inner.show()
+        print(Wrap(P(2)).label)
+        """), "p2\n")
+
+// `Display` is the bound the rendering surface asks for, so a type whose element it bounds may print
+// one.
+@test("a struct's Display bound licenses rendering the element")
+tbr_struct_bound_rendering()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(raw"""
+        struct Wrap[T: Display]
+            inner: T
+            line(self) -> string = f"[${self.inner}]"
+        print(Wrap(41).line())
+        print(Wrap("x").line())
+        """), "[41]\n[x]\n")
+
+// ---- an enum's parameter ----
+
+@test("an enum's parameter carries a bound the same way a struct's does")
+tbr_enum_bound()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(tbr_show() + raw"""
+        enum Maybe[T: Show]
+            Just(value: T)
+            Nothing
+
+            render(self) -> string = self match
+                Just(v) -> v.show()
+                Nothing -> "-"
+        var a = Just(P(4))
+        var b: Maybe[P] = Nothing
+        print(a.render(), b.render())
+        """), "p4 -\n")
+
+// ---- the bound travels ----
+
+// The same "a bound is satisfied by a bound" rule a generic function's body follows.
+@test("the bound travels from the type's parameter into a bounded function it calls")
+tbr_travels_into_bounded_function()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(tbr_show() + raw"""
+        render[U: Show](x: U) -> string = x.show()
+        struct Wrap[T: Show]
+            inner: T
+            label(self) -> string = render(self.inner)
+        print(Wrap(P(9)).label())
+        """), "p9\n")
+
+@test("the bound travels from the type's parameter into another bounded type it holds")
+tbr_travels_into_held_bounded_type()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(tbr_show() + raw"""
+        struct Inner[T: Show]
+            v: T
+            label(self) -> string = self.v.show()
+        struct Outer[T: Show]
+            held: Inner[T]
+            label(self) -> string = self.held.label()
+        print(Outer(Inner(P(5))).label())
+        """), "p5\n")
+
+// Whether an argument meets a bound is answerable only once every `impl` is registered; here the
+// implementation that makes it true is written below the signature that needs it.
+@test("the bound is met even where the impl that satisfies it comes later in the file")
+tbr_travels_impl_later_in_file()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(raw"""
+        trait Show
+            show(self) -> string
+        struct Wrap[T: Show]
+            inner: T
+        label(w: Wrap[P]) -> string = w.inner.show()
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> string = "p" + str(self.v)
+        print(label(Wrap(P(8))))
+        """), "p8\n")
+
+// A generic `impl` for a bounded type asks at least what the type asks.
+@test("the bound travels into a generic impl written for the bounded type")
+tbr_travels_into_generic_impl()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(tbr_show() + raw"""
+        trait Loud
+            loud(self) -> string
+        struct Wrap[T: Show]
+            inner: T
+        impl[T: Show] Loud for Wrap[T]
+            loud(self) -> string = self.inner.show() + "!"
+        print(Wrap(P(3)).loud())
+        """), "p3!\n")
+
+// ---- an unbounded parameter is unchanged ----
+
+@test("an unbounded container that only moves values around needs no bound")
+tbr_unbounded_moves_values()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(raw"""
+        struct Box[T]
+            value: T
+            get(self) -> T = self.value
+        var a = Box(41)
+        var b = Box("boxed")
+        print(a.get(), b.get())
+        """), "41 boxed\n")
+
+@test("an unbounded parameter takes any type at all as its argument")
+tbr_unbounded_any_argument()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(tbr_show() + raw"""
+        struct Box[T]
+            value: T
+            get(self) -> T = self.value
+        print(Box(P(6)).get().show())
+        """), "p6\n")
+
+// ---- a bound reaches through the shapes a type is built from ----
+
+// A recursive type is laid out with its own parameter standing in for itself, so the bound has to
+// survive reaching the type again through the pointer that breaks the cycle.
+@test("a bound reaches a type that holds a pointer to itself")
+tbr_reaches_self_pointer()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(tbr_show() + raw"""
+        struct Node[T: Show]
+            value: T
+            next: *Node[T]
+            head(self) -> string = self.value.show()
+        var tail: Node[P] = Node(P(2), null)
+        var list = Node(P(1), &tail)
+        print(list.head(), tail.head())
+        """), "p1 p2\n")
+
+@test("a bound reaches a function that bounds its own parameter to match")
+tbr_reaches_matching_function()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(tbr_show() + raw"""
+        struct Wrap[T: Show]
+            inner: T
+        label[U: Show](w: Wrap[U]) -> string = w.inner.show()
+        print(label(Wrap(P(1))))
+        """), "p1\n")
+
+// Erasure asks whether the type implements the trait, which for a conditional implementation is a
+// question about the argument -- and the bound is what makes the answer available.
+@test("a bound reaches erasing a bounded type into a trait object")
+tbr_reaches_trait_object()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(tbr_show() + raw"""
+        trait Loud
+            loud(self) -> string
+        struct Wrap[T: Show]
+            inner: T
+        impl[T: Show] Loud for Wrap[T]
+            loud(self) -> string = self.inner.show() + "!"
+        var o: &Loud = Wrap(P(1))
+        print(o.loud())
+        """), "p1!\n")
+
+// ---- each definition is checked against its own bounds ----
+
+// Every declaration here spells its parameter `T` while bounding it differently; a walk that kept
+// what an earlier one worked out would answer the next one's question with the wrong bounds.
+@test("each definition is checked against its own bounds, however many spell their parameter alike")
+tbr_own_bounds_same_spelling()
+    if !tbr_ready() then return
+
+    assert_eq(tbr_ran(raw"""
+        trait Show
+            show(self) -> string
+        trait Rank
+            rank(self) -> int
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> string = "p"
+        impl Rank for P
+            rank(self) -> int = 7
+        struct Box[T: Show]
+            v: T
+            named(self) -> string = self.v.show()
+        trait Loud
+            loud(self) -> string
+        impl[T: Show + Rank] Loud for Box[T]
+            loud(self) -> string = str(self.v.rank())
+        rendered[T: Display](x: T) -> string = str(x)
+        var b = Box(P(1))
+        print(b.named(), b.loud(), rendered(3))
+        """), "p 7 3\n")
+
+// ---- a bounded type is emitted per instantiation ----
+
+@test("a bounded type is emitted with one copy of the member for each element type")
+tbr_emitted_per_instantiation()
+    if !tbr_ready() then return
+
+    val out = tbr_ir(raw"""
+        struct Sum[T: Add]
+            a: T
+            b: T
+            total(self) -> T = self.a + self.b
+        print(Sum(1, 2).total())
+        print(Sum(1.5, 2.5).total())
+        """)
+
+    var n = 0
+
+    for line in lines_of(out).view()
+        if line.starts_with("define") && line.contains("@Sum.total.") then n += 1
+
+    assert_eq(n, 2)

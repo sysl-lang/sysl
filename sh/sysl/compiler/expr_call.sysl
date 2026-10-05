@@ -66,8 +66,35 @@ private pending_named(cx: &Analyzer, name: string) -> bool
     false
 end pending_named
 
+// A call, with every complaint written at the whole call shown at its callee's name for as long as
+// it is being read -- and the call around it given its anchor back afterwards, an argument being a
+// call of its own.
 call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
           expected: Option[Type]) -> TExpr
+    val outer = cx.call_anchor
+    val named = callee_anchor(callee)
+
+    if named.is_some() then cx.call_anchor = Some((span, named.unwrap()))
+
+    val out = call_read(cx, span, callee, args, expected)
+
+    cx.call_anchor = outer
+    out
+end call_expr
+
+// Where a complaint about a call to this callee points: a name at itself, a member at its name (a
+// `Field`'s span is already that), a written instantiation at its `[`, and a call of a call where
+// the inner one does. Any other callee keeps the whole call.
+private callee_anchor(callee: Expr) -> Option[Span] = *callee.kind match
+    Ident(_) -> Some(callee.span)
+    Field(_, _) -> Some(callee.span)
+    Index(_, _) -> Some(Span(callee.span.start, callee.span.start + 1))
+    TypeArgs(_, _) -> Some(Span(callee.span.start, callee.span.start + 1))
+    Call(inner, _) -> callee_anchor(inner)
+    _ -> None
+
+private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
+                  expected: Option[Type]) -> TExpr
     *callee.kind match
         Ident(name) ->
             // A nested function is called on the receiver the body already has, and the name is the
@@ -127,8 +154,7 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                     if va.is_some() then return va.unwrap()
                 end if
 
-                if written == "ptr_cast" && args.len() == 1 then
-                    return ptr_cast_call(cx, span, args, targ)
+                if written == "ptr_cast" then return ptr_cast_call(cx, span, args, targ)
 
                 // `slot_storage[T](n)` names the ELEMENT; the position the form fills is a view.
                 if written == "slot_storage" then
@@ -189,6 +215,13 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
             if dotted.is_some() && names_a_function(cx, dotted.unwrap()) then
                 return named_call(cx, span, callee, dotted.unwrap(), args, expected)
+
+            // `T.f(x)` -- a member called off a TRAIT's name, which is no value and no type of its
+            // own, so it is refused at the member's name in the words the same read is.
+            val on_trait = trait_name_call(cx, Span(callee.span.end - member.bytes.len,
+                                                    callee.span.end), receiver, member)
+
+            if on_trait.is_some() then return on_trait.unwrap()
 
             // An **associated function**, reached through the type rather than through a value: a
             // name in front of the dot that stands for a type is not something to read a value off.
@@ -284,7 +317,7 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             // type the reader never wrote -- so the lookup sees the mode and the message can name it.
             call_member(cx, span, tr, member, args, expected, receiver_bound(cx, receiver))
         _ -> call_value(cx, span, callee, args, expected)
-end call_expr
+end call_read
 
 // **The head of a call may be any expression whose type says it is callable** — the result of
 // another call, an element of an array of them, an item read out of a container. `reference/types.md
@@ -691,23 +724,78 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
             StrLit(spec) -> return Some(format_call(cx, span, args.at(0), spec))
             _ -> ()
 
-    if name == "ptr_cast" && args.len() == 1 then
-        return Some(ptr_cast_call(cx, span, args, expected))
+    if name == "ptr_cast" then return Some(ptr_cast_call(cx, span, args, expected))
 
     None
 end special_form
 
 // `ptr_cast(p)` and `ptr_cast[T](p)` -- an address read as a pointer to some type, which is either
 // the type the position gives it or the one written in the brackets.
+//
+// **What comes out is always a `*T` and never a `&T`**: a reference is counted and non-null, and an
+// address invented from bytes is neither. The first complaint is the only one, as the reference's.
 private ptr_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Option[Type]) -> TExpr
-    if expected.is_none() then
-        return cx.err(span, "'ptr_cast' reads an address as a pointer to some type, and nothing " +
-                      "here says which")
+    if args.len() != 1 then
+        return cx.err(span, "'ptr_cast' takes exactly one value, the address to read as a pointer")
 
     val t = type_expr_bare(cx, args.at(0))
 
-    TExpr(span, TCast(t, expected.unwrap()))
+    if expected.is_none() then
+        return cx.err(span, "'ptr_cast' reads an address as a pointer to some type, and nothing " +
+                      "here says which — annotate the variable, field, or result it is read into")
+
+    val to = expected.unwrap()
+    val wrong = ptr_cast_target_fault(to).or_else(() -> ptr_cast_source_fault(texpr_type(t)))
+
+    if wrong.is_some() then return cx.err(span, wrong.unwrap())
+
+    TExpr(span, TCast(t, to))
 end ptr_cast_call
+
+// What a reinterpreted address may NOT be read as, named by what the type promises that an address
+// cannot supply. A function pointer is an address like any other.
+private ptr_cast_target_fault(to: Type) -> Option[string] = underlying(to) match
+    Ptr(inner) ->
+        if !is_trait_type(*inner) then return None
+
+        Some("'ptr_cast' produces a plain pointer, and a pointer to a trait is two words — the " +
+             "address and the table of the type it was erased from, which an address alone does " +
+             "not say")
+    CFn(_, _) -> None
+    Unknown -> None
+    Ref(_, _) -> Some("'ptr_cast' never produces a reference: a '&T' is counted and non-null, and an " +
+                      "address read out of bytes carries no count for anything to own — read it as a '*T'")
+    Weak(_) -> Some("'ptr_cast' never produces a weak reference, which is a counted reference that " +
+                    "does not keep its referent alive — read the address as a '*T'")
+    Slice(_, _) -> Some(ptr_cast_view_fault(to))
+    Str -> Some(ptr_cast_view_fault(to))
+    other -> Some(s"'ptr_cast' produces a pointer, and ${type_show(other)} is not one")
+
+private ptr_cast_view_fault(v: Type) -> string =
+    s"'ptr_cast' produces a pointer, and a ${type_show(underlying(v))} is a pointer and a length " +
+    "together — read the address as a pointer and take the view from it, as 'p[0..<n]'"
+
+// What an address may NOT be read out of. An integer narrower than an address would be read with its
+// top bits invented -- the one mistake here that makes a wild pointer silently.
+private ptr_cast_source_fault(from: Type) -> Option[string] = underlying(from) match
+    Ptr(inner) ->
+        if !is_trait_type(*inner) then return None
+
+        Some("'ptr_cast' takes a plain pointer, and a pointer to a trait is two words — select " +
+             "the address half by reading through it, rather than reinterpreting the pair")
+    CFn(_, _) -> None
+    Unknown -> None
+    Integer(_, _, wide) ->
+        if wide then return None
+
+        Some(s"'ptr_cast' reads an address, and ${type_show(underlying(from))} is not " +
+             "address-width — convert it first, as 'ptr_cast(usize(n))'")
+    other -> Some(s"'ptr_cast' takes a pointer or an address-width integer, and the value has type " +
+                  type_show(other))
+
+private is_trait_type(t: Type) -> bool = t match
+    Trait(_, _, _) -> true
+    _ -> false
 
 // Whether a name is one the compiler answers itself rather than looking up. It is asked only to
 // decide what a **type argument** written after one means, so the atomics are in it too: they take

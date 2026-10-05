@@ -1,0 +1,481 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Status, capture}
+
+// `@reads` and `@writes` -- which module storage a function may touch (`reference/verification.md §
+// @reads and @writes — what a call may touch`), whole programs end to end: the reference's
+// `FrameTests`. `tests_checks.sysl` holds the analysis-level cases over a module of its own.
+//
+// **The feature is three rules, so the cases are the three plus the neighbour of each**: what each
+// refuses, and the thing one step away that it must not. `@writes(v)` alone permits reading `v`;
+// writing any part of a global is writing the global; and a function that never said anything is
+// held to nothing, which is what lets adoption run from the leaves up.
+//
+// **Every refusal quoted here was read out of the reference compiler** (0.0.162), by handing the
+// installed `sysl` the same source.
+
+// What a program of these files prints where it exited 0, or how it ended otherwise, or what the
+// build had to say about it.
+private fra_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(o) -> o.status match
+            Status.Exited(code) -> if code == 0 then o.text else s"exited $code: ${o.text}"
+            Status.Signalled(sig) -> s"signalled $sig: ${o.text}"
+            _ -> s"timed out: ${o.text}"
+end fra_out
+
+private fra_ran(text: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", text))
+    fra_out(fs)
+
+// Everything a source has to say for itself, taken through the lowering as the reference's `err` is.
+private fra_err(text: string) -> string
+    val root = make_temp_dir("sysl-frame").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fra_err
+
+private fra_refused(text: string, message: string)
+    val said = fra_err(text)
+
+    assert(said.contains(message), said)
+
+// -- what a frame permits ------------------------------------------------------------------------
+
+@test("a frame permits reading a variable it names")
+fra_reading_a_variable_it_names()
+    if im_can_run() then return
+
+    assert_eq(fra_ran(raw"""
+        static var limit: int = 7
+
+        @reads(limit)
+        ceiling() -> int = limit
+
+        print(ceiling())
+        """), "7\n")
+end fra_reading_a_variable_it_names
+
+@test("a frame permits writing a variable its '@writes' names")
+fra_writing_a_variable_its_writes_names()
+    if im_can_run() then return
+
+    assert_eq(fra_ran(raw"""
+        static var count: int = 0
+
+        @writes(count)
+        bump()
+            count = count + 1
+
+        bump()
+        bump()
+        print(count)
+        """), "2\n")
+end fra_writing_a_variable_its_writes_names
+
+// `W` is inside the readable set on purpose, which is what makes `count += 1` one annotation rather
+// than two saying the same thing.
+@test("a frame permits reading a variable that only its '@writes' names")
+fra_reading_a_variable_only_its_writes_names()
+    if im_can_run() then return
+
+    assert_eq(fra_ran(raw"""
+        static var count: int = 0
+
+        @writes(count)
+        bump()
+            count += 1
+
+        bump()
+        bump()
+        bump()
+        print(count)
+        """), "3\n")
+end fra_reading_a_variable_only_its_writes_names
+
+@test("an empty frame on a function that touches no module storage")
+fra_an_empty_frame()
+    if im_can_run() then return
+
+    assert_eq(fra_ran(raw"""
+        @reads()
+        @writes()
+        double(x: int) -> int = x * 2
+
+        print(double(21))
+        """), "42\n")
+end fra_an_empty_frame
+
+@test("calling a '@pure' function, which is inside every frame there is")
+fra_calling_a_pure_function()
+    if im_can_run() then return
+
+    assert_eq(fra_ran(raw"""
+        static var count: int = 0
+
+        @pure
+        twice(x: int) -> int = x * 2
+
+        @writes(count)
+        bump()
+            count = twice(count) + 1
+
+        bump()
+        bump()
+        print(count)
+        """), "3\n")
+end fra_calling_a_pure_function
+
+@test("calling a framed function whose frame fits inside this one")
+fra_calling_a_frame_that_fits()
+    if im_can_run() then return
+
+    assert_eq(fra_ran(raw"""
+        static var count: int = 0
+        static var limit: int = 10
+
+        @writes(count)
+        bump()
+            count += 1
+
+        @reads(limit)
+        @writes(count)
+        bump_if_room()
+            if count < limit then bump()
+
+        bump_if_room()
+        bump_if_room()
+        print(count)
+        """), "2\n")
+end fra_calling_a_frame_that_fits
+
+// A function that never said anything is held to nothing, and may still call and be called by
+// anything.
+@test("an unannotated function doing whatever it likes")
+fra_an_unannotated_function()
+    if im_can_run() then return
+
+    assert_eq(fra_ran(raw"""
+        static var count: int = 0
+
+        noisy()
+            count += 1
+            print(count)
+
+        noisy()
+        noisy()
+        """), "1\n2\n")
+end fra_an_unannotated_function
+
+@test("an unannotated function calling a framed one")
+fra_an_unannotated_function_calling_a_framed_one()
+    if im_can_run() then return
+
+    assert_eq(fra_ran(raw"""
+        static var count: int = 0
+
+        @writes(count)
+        bump()
+            count += 1
+
+        anything()
+            bump()
+            print(count)
+
+        anything()
+        """), "1\n")
+end fra_an_unannotated_function_calling_a_framed_one
+
+// A frame is resolved through the same lookup a body's own reference is, so it reaches a module's
+// `var` as well as the entry file's `static var`.
+@test("a frame reaches a variable declared with 'var' in a module of its own")
+fra_a_var_in_a_module_of_its_own()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", raw"""
+        import counter
+
+        counter.bump()
+        counter.bump()
+        print(counter.value())
+        """))
+    fs.push(("counter", "counter.sysl", raw"""
+        module counter
+
+        var count: int = 0
+
+        @writes(count)
+        bump()
+            count += 1
+
+        @reads(count)
+        value() -> int = count
+        """))
+    assert_eq(fra_out(fs), "2\n")
+end fra_a_var_in_a_module_of_its_own
+
+@test("a local of the same name as a variable the frame does not have")
+fra_a_local_the_frame_does_not_have()
+    if im_can_run() then return
+
+    assert_eq(fra_ran(raw"""
+        static var count: int = 0
+
+        @reads(count)
+        peek() -> int
+            var scratch = count
+            scratch += 1
+            scratch
+
+        print(peek())
+        """), "1\n")
+end fra_a_local_the_frame_does_not_have
+
+// -- what a frame refuses ------------------------------------------------------------------------
+
+@test("a frame refuses reading a variable neither half names")
+fra_reading_a_variable_neither_half_names()
+    if im_can_run() then return
+
+    fra_refused(raw"""
+        static var count: int = 0
+        static var limit: int = 10
+
+        @reads(count)
+        f() -> int = limit
+
+        print(f())
+        """, "a function with a frame reads 'limit', which neither its '@reads' nor its '@writes' names")
+end fra_reading_a_variable_neither_half_names
+
+@test("a frame refuses writing a variable its '@reads' names but its '@writes' does not")
+fra_writing_a_variable_only_its_reads_names()
+    if im_can_run() then return
+
+    fra_refused(raw"""
+        static var count: int = 0
+
+        @reads(count)
+        f()
+            count = 1
+
+        f()
+        """, "a function with a frame writes 'count', which its '@writes' does not name")
+end fra_writing_a_variable_only_its_reads_names
+
+// The rule is about the storage, not about the name being mentioned: after this the variable holds
+// something different, which is the only thing a prover is asking.
+@test("a frame refuses writing an element of an array its '@writes' does not name")
+fra_writing_an_element_of_an_array()
+    if im_can_run() then return
+
+    fra_refused(raw"""
+        static var buf: [4]u8
+        static var pos: usize = 0
+
+        @reads(buf)
+        @writes(pos)
+        put(b: u8)
+            buf[pos] = b
+            pos += 1
+
+        put(65u8)
+        """, "a function with a frame writes 'buf', which its '@writes' does not name")
+end fra_writing_an_element_of_an_array
+
+@test("a frame refuses calling a function that has no frame at all")
+fra_calling_a_function_with_no_frame()
+    if im_can_run() then return
+
+    fra_refused(raw"""
+        static var count: int = 0
+
+        noisy()
+            count += 1
+
+        @writes(count)
+        f()
+            noisy()
+
+        f()
+        """, "a function with a frame calls 'noisy', which has no '@reads' or '@writes' — an " +
+             "annotated function may call only annotated or '@pure' ones, since a frame cannot " +
+             "cover what a callee never said")
+end fra_calling_a_function_with_no_frame
+
+@test("a frame refuses calling a framed function that writes something this one does not")
+fra_calling_a_function_that_writes_more()
+    if im_can_run() then return
+
+    fra_refused(raw"""
+        static var a: int = 0
+        static var b: int = 0
+
+        @writes(b)
+        touch_b()
+            b += 1
+
+        @writes(a)
+        f()
+            touch_b()
+
+        f()
+        """, "a function with a frame calls 'touch_b', which writes 'b' — a name this function's " +
+             "'@writes' does not have")
+end fra_calling_a_function_that_writes_more
+
+@test("a frame refuses calling a framed function that reads something this one does not")
+fra_calling_a_function_that_reads_more()
+    if im_can_run() then return
+
+    fra_refused(raw"""
+        static var a: int = 0
+        static var b: int = 0
+
+        @reads(b)
+        peek_b() -> int = b
+
+        @writes(a)
+        f()
+            a = peek_b()
+
+        f()
+        """, "a function with a frame calls 'peek_b', which reads 'b' — a name neither this " +
+             "function's '@reads' nor its '@writes' has")
+end fra_calling_a_function_that_reads_more
+
+@test("a frame refuses calling an extern, which says nothing about what it touches")
+fra_calling_an_extern()
+    if im_can_run() then return
+
+    fra_refused(raw"""
+        extern abs(x: int) -> int
+
+        static var count: int = 0
+
+        @writes(count)
+        f()
+            count = abs(count)
+
+        f()
+        """, "a function with a frame calls 'abs', which is an 'extern' and says nothing about " +
+             "what it touches")
+end fra_calling_an_extern
+
+@test("a frame refuses reading a variable from inside its own contract")
+fra_reading_from_inside_a_contract()
+    if im_can_run() then return
+
+    fra_refused(raw"""
+        static var count: int = 0
+        static var limit: int = 10
+
+        @writes(count)
+        bump()
+            require count < limit
+            count += 1
+
+        bump()
+        """, "a function with a frame reads 'limit', which neither its '@reads' nor its '@writes' names")
+end fra_reading_from_inside_a_contract
+
+// -- what the annotation itself refuses ----------------------------------------------------------
+
+@test("'@pure' beside a frame, which says one thing twice")
+fra_pure_beside_a_frame()
+    if im_can_run() then return
+
+    fra_refused(raw"""
+        static var count: int = 0
+
+        @pure
+        @writes(count)
+        f()
+            count += 1
+
+        f()
+        """, "'@pure' already says '@reads()' and '@writes()', so a frame beside it says one thing " +
+             "twice — write the frame alone if the function touches module storage, and '@pure' " +
+             "alone if it touches none")
+end fra_pure_beside_a_frame
+
+@test("a frame naming something that is not module storage")
+fra_a_name_that_is_not_module_storage()
+    if im_can_run() then return
+
+    fra_refused(raw"""
+        @reads(nothing)
+        f() -> int = 1
+
+        print(f())
+        """, "'@reads' names 'nothing', which is not module-level storage — a frame covers a " +
+             "module's own 'val' and 'var' declarations, and a local or a parameter is not " +
+             "something a caller could observe across the call")
+end fra_a_name_that_is_not_module_storage
+
+// The message is raised inside the parentheses rather than after them, so that it beats the "not an
+// annotation" alternative on position rather than losing to it.
+@test("a frame written without its parentheses")
+fra_a_frame_without_parentheses()
+    if im_can_run() then return
+
+    fra_refused(raw"""
+        static var count: int = 0
+
+        @writes
+        f()
+            count += 1
+
+        f()
+        """, "'@writes' names the module variables it covers, in parentheses — '@writes(count)', " +
+             "or '@writes()' for none. The parentheses are what tell a frame that covers nothing " +
+             "from a function that never said")
+end fra_a_frame_without_parentheses
+
+@test("the same half of a frame written twice")
+fra_the_same_half_written_twice()
+    if im_can_run() then return
+
+    fra_refused(raw"""
+        static var a: int = 0
+        static var b: int = 0
+
+        @writes(a)
+        @writes(b)
+        f()
+            a += 1
+
+        f()
+        """, "'@writes' is written twice above one declaration, and it says nothing the once does not")
+end fra_the_same_half_written_twice
