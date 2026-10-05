@@ -4,7 +4,9 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, add, cmp, div_rem, from_int, mul, negate, pow, sub, to_string,
                          and as big_and, or as big_or, xor as big_xor, not as big_not,
-                         from_real as big_of_real, to_real as big_to_real, zero as big_zero}
+                         from_real as big_of_real, to_real as big_to_real, zero as big_zero,
+                         bit_length as big_bits, shl as big_shl, shr as big_shr,
+                         is_odd as big_odd}
 import sysl.math.Float
 import sysl.text.parse_real
 
@@ -103,7 +105,12 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
 
     // A conversion is written, so what it does while compiling is what it does while running: a
     // narrowing wraps and a float-to-integer truncates toward zero.
-    Call(callee, args) -> const_conversion(cx, e.span, callee, args)
+    //
+    // A call to a `const` function is run, which is what such a function is for (`const_eval.sysl`).
+    Call(callee, args) ->
+        val converted = const_conversion(cx, e.span, callee, args)
+
+        if converted.is_some() then converted else const_call(cx, e)
 
     // `sizeof(T)` and `alignof(T)` are compile-time constants, so they fold exactly as a literal
     // does -- which is what makes them usable in an array bound and in a `const`.
@@ -476,7 +483,7 @@ private converted(cx: &Analyzer, span: Span, v: Const, target: Type) -> Option[C
 // toward zero, clamped to the ends of the width, and zero for a NaN. A constant is the same
 // expression evaluated earlier, so it may not come to a different number than the conversion would
 // at run time.
-private saturated(f: real, bits: int, signed: bool) -> BigInt
+saturated(f: real, bits: int, signed: bool) -> BigInt
     if f.is_nan() then return big_zero()
 
     big_of_real(f) match
@@ -819,11 +826,8 @@ private typed_conversion(inner: TExpr, to: Type) -> Option[Const]
                 Char -> if fits(n, bits, signed) then Some(ConstInt(n)) else None
                 _ -> None
             Char -> if scalar_value(n) then Some(ConstInt(n)) else None
-            // Past 2^53 the integer is rounded on its way to a `real`, and rounding it again to a
-            // `f32` is two roundings where the machine does one.
-            Floating(bits, _) ->
-                if bits == 32 && cmp(big_abs(n), pow(from_int(2), 53)) > 0 then None
-                else Some(ConstFloat(big_to_real(n)))
+            // Rounded once, straight to the width, as the machine's conversion rounds it.
+            Floating(bits, _) -> Some(ConstFloat(int_to_float(n, bits)))
             _ -> None
         ConstFloat(f) -> to match
             Integer(bits, signed, _) -> big_of_real(f) match
@@ -837,6 +841,173 @@ private typed_conversion(inner: TExpr, to: Type) -> Option[Const]
 end typed_conversion
 
 private big_abs(n: BigInt) -> BigInt = if cmp(n, from_int(0)) < 0 then negate(n) else n
+
+// -- what an operation does when the program runs it ----------------------------------------------
+
+// **One definition of each scalar operation, read by everything that computes one while compiling**:
+// the typed fold above and the evaluator a `const` function runs on (`const_eval.sysl`). Each says
+// what the machine does -- the width it wraps at, where it traps, how it rounds -- because a value
+// worked out here stands in for the one the program would have computed, bit for bit. A trap is
+// answered as `Err` with what stopped it, in the words a reader of the program would use.
+//
+// Every change to what an operator lowers to in `emit_scalar.sysl` or `emit_expr.sysl` owes the same
+// change here.
+
+// An integer operator at the left operand's width. `checked` is what a `within` operand makes of
+// `+`, `-`, `*` and `<<`: the overflow-detecting form, which traps where the plain one wraps
+// (`emit_scalar.sysl`'s `checked_arith`, `checked_shl`). A comparison answers a `bool`.
+run_int_binary(op: string, x: BigInt, y: BigInt, bits: int, signed: bool,
+               checked: bool) -> Result[Const, string]
+    val ty = type_show(Integer(bits, signed, false))
+
+    // A zero divisor traps, and so does the one quotient a signed width cannot hold; the remainder
+    // of that same division is the zero it would have been, which is what the lowering divides by
+    // one to get.
+    if op == "/" || op == "%"
+        if cmp(y, from_int(0)) == 0 then return Err("integer division by zero")
+
+        if signed && cmp(y, from_int(-1)) == 0
+            if op == "%" then return Ok(ConstInt(from_int(0)))
+
+            if cmp(x, min_of(bits, signed)) == 0 then
+                return Err(s"${to_string(x)} / -1 overflows $ty")
+        end if
+
+        val q = div_rem(x, y)
+
+        return Ok(ConstInt(wrap(if op == "/" then q.0 else q.1, bits, signed)))
+    end if
+
+    if op == "<<" || op == ">>"
+        if checked && op == "<<"
+            if cmp(y, from_int(0)) < 0 || cmp(y, from_int(long(bits))) >= 0 then
+                return Err(s"${to_string(x)} << ${to_string(y)} overflows $ty")
+
+            val exact = mul(x, pow(from_int(2), usize(y.to_long().unwrap_or(0))))
+
+            if !fits(exact, bits, signed) then return Err(s"${to_string(x)} << ${to_string(y)} overflows $ty")
+
+            return Ok(ConstInt(exact))
+        end if
+
+        return Ok(ConstInt(shift_at_width(op, x, y, bits, signed)))
+    end if
+
+    if op == "+" || op == "-" || op == "*"
+        val exact = if op == "+" then add(x, y) else if op == "-" then sub(x, y) else mul(x, y)
+
+        if checked && !fits(exact, bits, signed) then
+            return Err(s"${to_string(x)} $op ${to_string(y)} overflows $ty")
+
+        return Ok(ConstInt(wrap(exact, bits, signed)))
+    end if
+
+    if op == "&" then return Ok(ConstInt(wrap(big_and(x, y), bits, signed)))
+    if op == "|" then return Ok(ConstInt(wrap(big_or(x, y), bits, signed)))
+    if op == "^" then return Ok(ConstInt(wrap(big_xor(x, y), bits, signed)))
+
+    compared(op, cmp(x, y)) match
+        Some(v) -> Ok(v)
+        None -> Err(s"'$op' on $ty")
+end run_int_binary
+
+// A shift by any count, as `expressions.md § Shifting by the width or more` defines it: a count at or
+// past the width -- or below zero, which the lowering reads as a count past it -- shifts all the way,
+// giving zero, or the sign for a signed `>>`. Below the width it is the instruction.
+shift_at_width(op: string, x: BigInt, count: BigInt, bits: int, signed: bool) -> BigInt
+    if cmp(count, from_int(0)) < 0 || cmp(count, from_int(long(bits))) >= 0
+        if op == ">>" && signed && cmp(x, from_int(0)) < 0 then return from_int(-1)
+
+        return from_int(0)
+    end if
+
+    val n = usize(count.to_long().unwrap_or(0))
+
+    if op == "<<" then wrap(big_shl(x, n), bits, signed) else big_shr(x, n)
+end shift_at_width
+
+// A float operator at a width. A `f32` is computed as a `f32`, rounded at every operation as the
+// machine rounds it -- never in `f64` and rounded once at the end, which gives another answer on a
+// tie. A comparison with a NaN is false, except `!=`, which is true.
+run_float_binary(op: string, x: real, y: real, bits: int) -> Result[Const, string]
+    if op == "+" || op == "-" || op == "*" || op == "/"
+        if bits == 32
+            val a = f32(x)
+            val b = f32(y)
+            val r = if op == "+" then a + b else if op == "-" then a - b
+            else if op == "*" then a * b else a / b
+
+            return Ok(ConstFloat(real(r)))
+        end if
+
+        val r = if op == "+" then x + y else if op == "-" then x - y
+        else if op == "*" then x * y else x / y
+
+        return Ok(ConstFloat(r))
+    end if
+
+    if x != x || y != y
+        if op == "!=" then return Ok(ConstBool(true))
+
+        return if compared(op, 0).is_some() then Ok(ConstBool(false)) else Err(s"'$op' on a float")
+    end if
+
+    compared(op, if x < y then -1 else if x > y then 1 else 0) match
+        Some(v) -> Ok(v)
+        None -> Err(s"'$op' on a float")
+end run_float_binary
+
+// A float negated, which flips the sign of a zero as the machine's `fneg` does.
+run_float_negate(x: real) -> real = -x
+
+// A written conversion between scalars, as the lowering converts (`emit_expr.sysl`'s `convert`): an
+// integer narrowed wraps, an integer becomes a float rounded once to the width, a float becomes an
+// integer saturating at the width's ends with a NaN as zero, and an integer becomes a `char` only
+// where it is a Unicode scalar value -- read at 64 bits, as the check reads it -- and traps otherwise.
+// `from` and `to` are the types the two are laid out as.
+run_convert(v: Const, from: Type, to: Type) -> Result[Const, string] = v match
+    ConstInt(n) -> (from, to) match
+        (_, Integer(bits, signed, _)) -> Ok(ConstInt(wrap(n, bits, signed)))
+        (_, Floating(bits, _)) -> Ok(ConstFloat(int_to_float(n, bits)))
+        (Char, Char) -> Ok(v)
+        (_, Char) ->
+            val u = wrap(n, 64, false)
+
+            if scalar_value(u) then Ok(ConstInt(u))
+            else Err(s"${to_string(n)} is not a Unicode scalar value")
+        _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
+    ConstFloat(f) -> to match
+        Integer(bits, signed, _) -> Ok(ConstInt(saturated(f, bits, signed)))
+        Floating(bits, _) -> Ok(ConstFloat(if bits == 32 then real(f32(f)) else f))
+        _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
+    ConstBool(_) -> if to == Bool then Ok(v) else Err(s"a conversion from bool to ${type_show(to)}")
+    _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
+
+// An integer as the nearest float of a width, ties to even, rounded ONCE: a `f32` straight from the
+// integer, since going through a `f64` rounds twice above 2^53 and lands on the other neighbour at a
+// tie. A value past the width's largest finite one is an infinity.
+int_to_float(n: BigInt, bits: int) -> real
+    if bits != 32 then return big_to_real(n)
+
+    val negative = cmp(n, from_int(0)) < 0
+    val m = big_abs(n)
+    val length = big_bits(m)
+
+    if length <= 24 then return big_to_real(n)
+
+    val drop = length - 24
+    var q = big_shr(m, drop)
+    val lost = sub(m, big_shl(q, drop))
+    val c = cmp(lost, big_shl(from_int(1), drop - 1))
+
+    if c > 0 || (c == 0 && big_odd(q)) then q = add(q, from_int(1))
+
+    // `q` holds at most 25 bits, so the `real` below is exact, and narrowing it rounds nothing --
+    // unless it is past the `f32` range, where it becomes the infinity it should.
+    val v = real(f32(big_to_real(big_shl(q, drop))))
+
+    if negative then -v else v
+end int_to_float
 
 // Which type parameters the body was compiled against, where it was compiled against any.
 //

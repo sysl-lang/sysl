@@ -1,0 +1,791 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, add, from_int, sub, to_string}
+import sysl.text.{Search, split}
+
+// The evaluator (`const_eval.sysl`): a `const` function called where a constant is wanted is run
+// while compiling, over scalars -- locals, every loop, recursion, early `return`, the contract
+// clauses -- and a trap during the run is a compile error naming what stopped it and the calls it was
+// inside.
+//
+// **Every positive case is differential**: the same call is worked out twice, once by the compiler
+// (a `const` initialized from it) and once by the program (the call made at run time, its arguments
+// read through a `volatile` field behind a `@noinline` function so the optimizer cannot fold them),
+// and the two are printed side by side -- floats as their bits -- and required to agree. A NaN is
+// compared as a NaN, the language promising nothing about which one a computation makes. Beside the
+// run, a typed reading of the same constants says each use is a LITERAL and not a call, so the
+// compile-time side cannot be the run-time call wearing a constant's name.
+//
+// **The reference (0.0.162) has no `const` functions** -- it reads `const f(` as a constant missing its
+// `:`. Every expectation here is the approved design's; every refusal's wording is this compiler's.
+
+private cfe_ready() -> bool = enm_ready()
+
+// What the build of a program said, or what it printed.
+private cfe_built(text: string) -> string = enm_outcome(text).0
+
+// -- the differential harness -----------------------------------------------------------------------
+
+// The scalar types a case may be of, each written as the program spells it.
+private cfe_scalars() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for t in ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "i5", "u12",
+              "int", "usize", "f32", "real", "bool", "char"]
+        out.push(t)
+
+    out
+end cfe_scalars
+
+// What every differential program carries: a hiding function per type -- a `volatile` read behind a
+// call the optimizer may not look into -- and the renderers that print a float's bits.
+private cfe_support() -> string
+    var out = ""
+    val types = cfe_scalars()
+
+    for i in 0..<types.len()
+        val t = types.at(i)
+
+        out = out + s"struct Hv_$t\n    v: volatile $t\n\n@noinline\nh_$t(x: $t) -> $t\n" +
+              s"    var c = Hv_$t(x)\n\n    c.v\n\n"
+
+    out + "b64(x: real) -> string\n    if x != x then return \"nan\"\n\n    var v = x\n" +
+          "    val p: *u64 = ptr_cast(&v)\n\n    str(*p)\n\n" +
+          "b32(x: f32) -> string\n    if x != x then return \"nan\"\n\n    var v = x\n" +
+          "    val p: *u32 = ptr_cast(&v)\n\n    str(*p)\n\n" +
+          "w128(x: i128) -> string = s\"${i64(x >> 64)}:${u64(x)}\"\n\n" +
+          "wu128(x: u128) -> string = s\"${u64(x >> 64)}:${u64(x)}\"\n\n"
+end cfe_support
+
+// A value of a type, as the program prints it.
+private cfe_show(t: string, e: string) -> string
+    if t == "f32" then return s"b32($e)"
+    if t == "real" then return s"b64($e)"
+    if t == "i128" then return s"w128($e)"
+    if t == "u128" then return s"wu128($e)"
+    if t == "i5" || t == "u12" then return s"int($e)"
+
+    e
+end cfe_show
+
+// One case: the type the call answers, the call as the compiler runs it, and the call as the program
+// makes it.
+private cfe_case(t: string, ct: string, rt: string) -> (string, string, string) = (t, ct, rt)
+
+// Every case's two sides agree, and the compile-time side was a literal by the time a body read it.
+private cfe_agree(decls: string, cases: Buf[(string, string, string)])
+    if !cfe_ready() then return
+
+    var fold = decls + "\n"
+
+    for i in 0..<cases.len()
+        fold = fold + s"const K$i: ${cases.at(i).0} = ${cases.at(i).1}\n"
+
+    for i in 0..<cases.len()
+        fold = fold + s"\nct$i() -> ${cases.at(i).0} = K$i\n"
+
+    val done = typed_of(fold)
+
+    assert(done.reported.is_empty(), if done.reported.is_empty() then "" else done.reported.at(0).diag.message)
+
+    var seen = 0
+
+    for i in 0..<done.funcs.len()
+        val f = done.funcs.at(i)
+
+        if f.name.starts_with("ct")
+            seen += 1
+
+            val shown = show_typed_func(f)
+
+            assert(!shown.contains("TCall"), s"${f.name} still calls something: $shown")
+    end for
+
+    assert_eq(seen, int(cases.len()))
+
+    var program = decls + "\n" + cfe_support()
+
+    for i in 0..<cases.len()
+        program = program + s"const K$i: ${cases.at(i).0} = ${cases.at(i).1}\n"
+
+    for i in 0..<cases.len()
+        val c = cases.at(i)
+
+        program = program + s"print(${cfe_show(c.0, s"K$i")}, ${cfe_show(c.0, c.2)})\n"
+
+    val out = enm_ran(program)
+    val lines = split(out, "\n")
+
+    assert(lines.len >= cases.len(), out)
+
+    for i in 0..<cases.len()
+        val parts = split(lines[i], " ")
+
+        assert(parts.len == 2, s"case $i (${cases.at(i).1}): '${lines[i]}'")
+        assert(parts[0] == parts[1], s"case $i: ${cases.at(i).1} is ${parts[0]} while compiling and " +
+               s"${parts[1]} at run time")
+end cfe_agree
+
+// The full list of what the build said, one `line:column message` per line.
+private cfe_said(text: string) -> string = isc_diags(text)
+
+// -- integers, control flow, recursion --------------------------------------------------------------
+
+@test("recursion, a loop over a local, an early return: each the same while compiling as at run time")
+cfe_recursion_and_loops()
+    val decls =
+        "const fact(n: u64) -> u64 = if n <= 1 then 1 else n * fact(n - 1)\n\n" +
+        "const gcd(a: int, b: int) -> int\n    var x = a\n    var y = b\n\n" +
+        "    while y != 0\n        val t = x % y\n\n        x = y\n        y = t\n\n    x\n\n" +
+        "const first_square_over(n: int) -> int\n    var i = 0\n\n    loop\n" +
+        "        if i * i > n then return i\n\n        i += 1\n\n" +
+        "const fib(n: int) -> int\n    var a = 0\n    var b = 1\n\n    for i in 0..<n\n" +
+        "        a, b = b, a + b\n\n    a\n\n" +
+        "const evens(n: int) -> int\n    var count = 0\n\n    for i in 0..n\n" +
+        "        if i % 2 == 1 then continue\n\n        count += 1\n\n    count\n\n" +
+        "const found(n: int) -> int\n    loop\n        break n * 3\n\n" +
+        "const c_style(n: int) -> int\n    var s = 0\n\n    for var i = 0; i < n; i += 1\n" +
+        "        s += i\n\n    s\n\n" +
+        "const once(n: int) -> int\n    var k = n\n\n    do\n        k -= 1\n    while k > 100\n\n    k\n"
+
+    var cases: Buf[(string, string, string)] = buf()
+
+    cases.push(cfe_case("u64", "fact(20)", "fact(h_u64(20))"))
+    cases.push(cfe_case("u64", "fact(25)", "fact(h_u64(25))"))
+    cases.push(cfe_case("int", "gcd(1071, 462)", "gcd(h_int(1071), h_int(462))"))
+    cases.push(cfe_case("int", "gcd(-48, 18)", "gcd(h_int(-48), h_int(18))"))
+    cases.push(cfe_case("int", "first_square_over(1000)", "first_square_over(h_int(1000))"))
+    cases.push(cfe_case("int", "fib(90)", "fib(h_int(90))"))
+    cases.push(cfe_case("int", "fib(100)", "fib(h_int(100))"))
+    cases.push(cfe_case("int", "evens(10)", "evens(h_int(10))"))
+    cases.push(cfe_case("int", "found(14)", "found(h_int(14))"))
+    cases.push(cfe_case("int", "c_style(100)", "c_style(h_int(100))"))
+    cases.push(cfe_case("int", "once(7)", "once(h_int(7))"))
+    cases.push(cfe_case("int", "once(500)", "once(h_int(500))"))
+    cfe_agree(decls, cases)
+end cfe_recursion_and_loops
+
+@test("a 'match' over integers and characters, with guards and bindings, and a 'bool' function")
+cfe_match_and_bool()
+    val decls =
+        "const kind(n: int) -> int = n match\n    0 -> 100\n    1 | 2 -> 200\n" +
+        "    m if m < 0 -> -m\n    m -> m * 10\n\n" +
+        "const vowel(c: char) -> bool = c match\n    'a' | 'e' | 'i' | 'o' | 'u' -> true\n" +
+        "    _ -> false\n\n" +
+        "const both(a: bool, b: bool) -> bool = (a && !b) || (b && !a)\n\n" +
+        "const next_letter(c: char) -> char = char(u32(c) + 1)\n\n" +
+        "const code(c: char) -> u32 = u32(c)\n"
+
+    var cases: Buf[(string, string, string)] = buf()
+
+    cases.push(cfe_case("int", "kind(0)", "kind(h_int(0))"))
+    cases.push(cfe_case("int", "kind(2)", "kind(h_int(2))"))
+    cases.push(cfe_case("int", "kind(-7)", "kind(h_int(-7))"))
+    cases.push(cfe_case("int", "kind(9)", "kind(h_int(9))"))
+    cases.push(cfe_case("bool", "vowel('e')", "vowel(h_char('e'))"))
+    cases.push(cfe_case("bool", "vowel('z')", "vowel(h_char('z'))"))
+    cases.push(cfe_case("bool", "both(true, false)", "both(h_bool(true), h_bool(false))"))
+    cases.push(cfe_case("bool", "both(true, true)", "both(h_bool(true), h_bool(true))"))
+    cases.push(cfe_case("char", "next_letter('q')", "next_letter(h_char('q'))"))
+    cases.push(cfe_case("u32", "code('\u{e9}')", "code(h_char('\u{e9}'))"))
+    cfe_agree(decls, cases)
+end cfe_match_and_bool
+
+@test("wrapping at the declared width, the division edges and the shifts past the width")
+cfe_wrap_and_trap_rules()
+    val decls =
+        "const add8(a: u8, b: u8) -> u8 = a + b\n\n" +
+        "const neg8(a: i8) -> i8 = -a\n\n" +
+        "const mul16(a: i16, b: i16) -> i16 = a * b\n\n" +
+        "const add5(a: i5, b: i5) -> i5 = a + b\n\n" +
+        "const sub12(a: u12, b: u12) -> u12 = a - b\n\n" +
+        "const div32(a: i32, b: i32) -> i32 = a / b\n\n" +
+        "const rem32(a: i32, b: i32) -> i32 = a % b\n\n" +
+        "const shl8(a: u8, n: u8) -> u8 = a << n\n\n" +
+        "const shr32(a: i32, n: i32) -> i32 = a >> n\n\n" +
+        "const shru32(a: u32, n: u32) -> u32 = a >> n\n\n" +
+        "const shl64(a: i64, n: u8) -> i64 = a << n\n\n" +
+        "const not16(a: u16) -> u16 = ~a\n\n" +
+        "const mix128(a: i128, b: i128) -> i128 = a * b + (a ^ b)\n"
+
+    var cases: Buf[(string, string, string)] = buf()
+
+    cases.push(cfe_case("u8", "add8(200, 100)", "add8(h_u8(200), h_u8(100))"))
+    cases.push(cfe_case("i8", "neg8(-128)", "neg8(h_i8(-128))"))
+    cases.push(cfe_case("i16", "mul16(300, 300)", "mul16(h_i16(300), h_i16(300))"))
+    cases.push(cfe_case("i5", "add5(15, 1)", "add5(h_i5(15), h_i5(1))"))
+    cases.push(cfe_case("u12", "sub12(0, 1)", "sub12(h_u12(0), h_u12(1))"))
+    cases.push(cfe_case("i32", "div32(-7, 2)", "div32(h_i32(-7), h_i32(2))"))
+    cases.push(cfe_case("i32", "rem32(-7, 2)", "rem32(h_i32(-7), h_i32(2))"))
+    cases.push(cfe_case("i32", "rem32(-2147483648, -1)", "rem32(h_i32(-2147483648), h_i32(-1))"))
+    cases.push(cfe_case("u8", "shl8(1, 7)", "shl8(h_u8(1), h_u8(7))"))
+    cases.push(cfe_case("u8", "shl8(1, 8)", "shl8(h_u8(1), h_u8(8))"))
+    cases.push(cfe_case("u8", "shl8(255, 200)", "shl8(h_u8(255), h_u8(200))"))
+    cases.push(cfe_case("i32", "shr32(-8, 1)", "shr32(h_i32(-8), h_i32(1))"))
+    cases.push(cfe_case("i32", "shr32(-8, 40)", "shr32(h_i32(-8), h_i32(40))"))
+    cases.push(cfe_case("i32", "shr32(8, 32)", "shr32(h_i32(8), h_i32(32))"))
+    cases.push(cfe_case("i32", "shr32(-8, -1)", "shr32(h_i32(-8), h_i32(-1))"))
+    cases.push(cfe_case("u32", "shru32(4294967295, 31)", "shru32(h_u32(4294967295), h_u32(31))"))
+    cases.push(cfe_case("u32", "shru32(4294967295, 32)", "shru32(h_u32(4294967295), h_u32(32))"))
+    cases.push(cfe_case("i64", "shl64(1, 63)", "shl64(h_i64(1), h_u8(63))"))
+    cases.push(cfe_case("i64", "shl64(3, 64)", "shl64(h_i64(3), h_u8(64))"))
+    cases.push(cfe_case("u16", "not16(5)", "not16(h_u16(5))"))
+    cases.push(cfe_case("i128", "mix128(170141183460469231731687303715884105727, 3)",
+                        "mix128(h_i128(170141183460469231731687303715884105727), h_i128(3))"))
+    cfe_agree(decls, cases)
+end cfe_wrap_and_trap_rules
+
+// -- floats -----------------------------------------------------------------------------------------
+
+@test("a 'f32' rounded at every operation, a negative zero, NaN, infinities, and no fused multiply-add")
+cfe_floats()
+    val decls =
+        "const tenth_sum(n: int) -> f32\n    var s: f32 = 0.0\n\n    for i in 0..<n\n" +
+        "        s = s + 0.1\n\n    s\n\n" +
+        "const tie(x: f32) -> f32 = x + 1.0 + 1.0\n\n" +
+        "const flip(x: real) -> real = -x\n\n" +
+        "const scaled(x: real) -> real = x * -1.0\n\n" +
+        "const quotient(a: real, b: real) -> real = a / b\n\n" +
+        "const fused(a: real, b: real, c: real) -> real = a * b + c\n\n" +
+        "const unequal(a: real, b: real) -> bool = a != b\n\n" +
+        "const less(a: real, b: real) -> bool = a < b\n\n" +
+        "const narrow(x: real) -> f32 = f32(x)\n\n" +
+        "const widen(x: f32) -> real = real(x)\n"
+
+    var cases: Buf[(string, string, string)] = buf()
+
+    cases.push(cfe_case("f32", "tenth_sum(10)", "tenth_sum(h_int(10))"))
+    cases.push(cfe_case("f32", "tenth_sum(1000)", "tenth_sum(h_int(1000))"))
+    cases.push(cfe_case("f32", "tie(16777216.0)", "tie(h_f32(16777216.0))"))
+    cases.push(cfe_case("real", "flip(0.0)", "flip(h_real(0.0))"))
+    cases.push(cfe_case("real", "scaled(0.0)", "scaled(h_real(0.0))"))
+    cases.push(cfe_case("real", "quotient(0.0, 0.0)", "quotient(h_real(0.0), h_real(0.0))"))
+    cases.push(cfe_case("real", "quotient(1.0, 0.0)", "quotient(h_real(1.0), h_real(0.0))"))
+    cases.push(cfe_case("real", "quotient(-1.0, 0.0)", "quotient(h_real(-1.0), h_real(0.0))"))
+    cases.push(cfe_case("real", "fused(0.1, 10.0, -1.0)", "fused(h_real(0.1), h_real(10.0), h_real(-1.0))"))
+    cases.push(cfe_case("bool", "unequal(nan, nan)", "unequal(h_real(nan), h_real(nan))"))
+    cases.push(cfe_case("bool", "less(nan, 1.0)", "less(h_real(nan), h_real(1.0))"))
+    cases.push(cfe_case("bool", "less(-0.0, 0.0)", "less(h_real(-0.0), h_real(0.0))"))
+    cases.push(cfe_case("f32", "narrow(0.1)", "narrow(h_real(0.1))"))
+    cases.push(cfe_case("f32", "narrow(1e300)", "narrow(h_real(1e300))"))
+    cases.push(cfe_case("real", "widen(0.1)", "widen(h_f32(0.1))"))
+    cfe_agree(decls, cases)
+end cfe_floats
+
+// One `f32` operation worked in `f64` and rounded once at the end gives the right answer -- the
+// product, difference or quotient of two `f32`s is near enough in `f64` -- so a single operation
+// cannot show whether a step was rounded. A second one can: each of these three comes to a different
+// `f32` when the first result is carried to the second unrounded.
+@test("a 'f32' chain of '*', '-' or '/' is rounded between its two operations")
+cfe_f32_chains()
+    val decls =
+        "const mul3(a: f32, b: f32, c: f32) -> f32 = a * b * c\n\n" +
+        "const sub3(a: f32, b: f32, c: f32) -> f32 = a - b - c\n\n" +
+        "const div3(a: f32, b: f32, c: f32) -> f32 = a / b / c\n"
+
+    var cases: Buf[(string, string, string)] = buf()
+
+    cases.push(cfe_case("f32", "mul3(0.1, 0.1, 10.0)", "mul3(h_f32(0.1), h_f32(0.1), h_f32(10.0))"))
+    cases.push(cfe_case("f32", "sub3(0.1, 0.3, 0.2)", "sub3(h_f32(0.1), h_f32(0.3), h_f32(0.2))"))
+    cases.push(cfe_case("f32", "div3(0.1, 0.3, 0.1)", "div3(h_f32(0.1), h_f32(0.3), h_f32(0.1))"))
+    cfe_agree(decls, cases)
+end cfe_f32_chains
+
+@test("conversions: a float saturates into an integer, an integer rounds once into a 'f32'")
+cfe_conversions()
+    val decls =
+        "const to_i32(x: real) -> i32 = i32(x)\n\n" +
+        "const to_u8(x: real) -> u8 = u8(x)\n\n" +
+        "const f_to_i64(x: f32) -> i64 = i64(x)\n\n" +
+        "const nan_to_int(x: real) -> int = int(x / x)\n\n" +
+        "const i64_to_f32(n: i64) -> f32 = f32(n)\n\n" +
+        "const u64_to_real(n: u64) -> real = real(n)\n\n" +
+        "const narrow8(n: int) -> i8 = i8(n)\n\n" +
+        "const to_char(n: u32) -> char = char(n)\n"
+
+    var cases: Buf[(string, string, string)] = buf()
+
+    cases.push(cfe_case("i32", "to_i32(3e9)", "to_i32(h_real(3e9))"))
+    cases.push(cfe_case("i32", "to_i32(-3e9)", "to_i32(h_real(-3e9))"))
+    cases.push(cfe_case("i32", "to_i32(-2.9)", "to_i32(h_real(-2.9))"))
+    cases.push(cfe_case("i32", "to_i32(infinity)", "to_i32(h_real(infinity))"))
+    cases.push(cfe_case("u8", "to_u8(-1.5)", "to_u8(h_real(-1.5))"))
+    cases.push(cfe_case("u8", "to_u8(300.7)", "to_u8(h_real(300.7))"))
+    cases.push(cfe_case("i64", "f_to_i64(1e30)", "f_to_i64(h_f32(1e30))"))
+    cases.push(cfe_case("int", "nan_to_int(0.0)", "nan_to_int(h_real(0.0))"))
+    cases.push(cfe_case("f32", "i64_to_f32(16777217)", "i64_to_f32(h_i64(16777217))"))
+    cases.push(cfe_case("f32", "i64_to_f32(16777219)", "i64_to_f32(h_i64(16777219))"))
+    cases.push(cfe_case("f32", "i64_to_f32(18014399583223809)", "i64_to_f32(h_i64(18014399583223809))"))
+    cases.push(cfe_case("f32", "i64_to_f32(-9223372036854775808)",
+                        "i64_to_f32(h_i64(-9223372036854775808))"))
+    cases.push(cfe_case("real", "u64_to_real(18446744073709551615)",
+                        "u64_to_real(h_u64(18446744073709551615))"))
+    cases.push(cfe_case("real", "u64_to_real(9007199254740993)", "u64_to_real(h_u64(9007199254740993))"))
+    cases.push(cfe_case("i8", "narrow8(300)", "narrow8(h_int(300))"))
+    cases.push(cfe_case("char", "to_char(65)", "to_char(h_u32(65))"))
+    cfe_agree(decls, cases)
+end cfe_conversions
+
+// -- a generated corpus -----------------------------------------------------------------------------
+
+// The integer types the corpus covers, with their widths and signedness.
+private cfe_int_types() -> Buf[(string, int, bool)]
+    var out: Buf[(string, int, bool)] = buf()
+
+    out.push(("i8", 8, true))
+    out.push(("u8", 8, false))
+    out.push(("i16", 16, true))
+    out.push(("u16", 16, false))
+    out.push(("i32", 32, true))
+    out.push(("u32", 32, false))
+    out.push(("i64", 64, true))
+    out.push(("u64", 64, false))
+    out.push(("i128", 128, true))
+    out.push(("u128", 128, false))
+    out.push(("i5", 5, true))
+    out.push(("u12", 12, false))
+    out
+end cfe_int_types
+
+// The operators the corpus covers, each with the name of the function written for it.
+private cfe_int_ops() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push(("+", "add"))
+    out.push(("-", "sub"))
+    out.push(("*", "mul"))
+    out.push(("/", "div"))
+    out.push(("%", "rem"))
+    out.push(("&", "and"))
+    out.push(("|", "or"))
+    out.push(("^", "xor"))
+    out.push(("<<", "shl"))
+    out.push((">>", "shr"))
+    out
+end cfe_int_ops
+
+// A deterministic stream of numbers, so the corpus is the same on every run.
+private struct CfeStream
+    state: u64
+
+    next(*self) -> u64
+        self.state = self.state * 6364136223846793005 + 1442695040888963407
+
+        self.state >> 11
+end CfeStream
+
+// The values a corpus draws a type's operands from: its edges, and a few from the stream.
+private cfe_values(bits: int, signed: bool, s: *CfeStream) -> Buf[BigInt]
+    var out: Buf[BigInt] = buf()
+    val lo = min_of(bits, signed)
+    val hi = max_of(bits, signed)
+
+    out.push(from_int(0))
+    out.push(from_int(1))
+    out.push(wrap(from_int(2), bits, signed))
+    out.push(lo)
+    out.push(hi)
+    out.push(add(lo, from_int(1)))
+    out.push(sub(hi, from_int(1)))
+
+    if signed then out.push(from_int(-1))
+
+    for i in 0..<4
+        out.push(wrap(from_int(long(s.next())), bits, signed))
+
+    out
+end cfe_values
+
+// The cases for one width: every operator over pairs drawn from its values, leaving out the two that
+// trap (a zero divisor, and the signed minimum divided by -1), which the refusal tests cover.
+private cfe_int_corpus(t: (string, int, bool), s: *CfeStream) -> (string, Buf[(string, string, string)])
+    var decls = ""
+    var cases: Buf[(string, string, string)] = buf()
+    val ops = cfe_int_ops()
+    val vals = cfe_values(t.1, t.2, s)
+    val counts = cfe_values(t.1, t.2, s)
+
+    for i in 0..<ops.len()
+        val op = ops.at(i)
+        val fname = s"${op.1}_${t.0}"
+
+        decls = decls + s"const $fname(a: ${t.0}, b: ${t.0}) -> ${t.0} = a ${op.0} b\n\n"
+
+        for k in 0..<6
+            val a = vals.at(usize(s.next() % u64(vals.len())))
+            val shift = op.0 == "<<" || op.0 == ">>"
+
+            // A shift's count is drawn from the counts that straddle the width.
+            var b = if shift then wrap(from_int(long(k * t.1 / 2)), t.1, t.2)
+            else vals.at(usize(s.next() % u64(vals.len())))
+
+            if shift && k == 5 then b = counts.at(usize(s.next() % u64(counts.len())))
+
+            val zero = to_string(b) == "0"
+            val overflowing = t.2 && to_string(a) == to_string(min_of(t.1, true)) && to_string(b) == "-1"
+
+            if (op.0 == "/" || op.0 == "%") && zero then continue
+            if op.0 == "/" && overflowing then continue
+
+            val at = to_string(a)
+            val bt = to_string(b)
+
+            cases.push(cfe_case(t.0, s"$fname($at, $bt)", s"$fname(h_${t.0}($at), h_${t.0}($bt))"))
+    end for
+
+    (decls, cases)
+end cfe_int_corpus
+
+@test("a generated corpus: every integer operator at twelve widths, the same both ways")
+cfe_integer_corpus()
+    var s = CfeStream(20261004)
+    val types = cfe_int_types()
+
+    for i in 0..<types.len()
+        val made = cfe_int_corpus(types.at(i), &s)
+
+        cfe_agree(made.0, made.1)
+end cfe_integer_corpus
+
+@test("a generated corpus: float arithmetic and comparison at both widths, the same both ways")
+cfe_float_corpus()
+    var s = CfeStream(77)
+
+    for w in 0..<2
+        val t = if w == 0 then "f32" else "real"
+        val vals = if w == 0 then ["0.0", "-0.0", "1.0", "-1.0", "0.1", "3.0", "1e30", "-2.5e-30",
+                                   "16777216.0", "16777217.0", "3.4028235e38", "1.0e-45",
+                                   "f32.infinity", "-f32.infinity", "f32.nan"]
+        else ["0.0", "-0.0", "1.0", "-1.0", "0.1", "3.0", "1e300", "-2.5e-300", "9007199254740992.0",
+              "1.7976931348623157e308", "5e-324", "infinity", "-infinity", "nan", "0.3"]
+
+        var decls = ""
+        var cases: Buf[(string, string, string)] = buf()
+
+        for op in [("+", "add", t), ("-", "sub", t), ("*", "mul", t), ("/", "div", t), ("<", "lt", "bool"),
+                   ("==", "eq", "bool"), ("!=", "ne", "bool")]
+            val fname = s"f${op.1}_$t"
+
+            decls = decls + s"const $fname(a: $t, b: $t) -> ${op.2} = a ${op.0} b\n\n"
+
+            for k in 0..<10
+                val a = vals[usize(s.next() % u64(vals.len))]
+                val b = vals[usize(s.next() % u64(vals.len))]
+
+                cases.push(cfe_case(op.2, s"$fname($a, $b)", s"$fname(h_$t($a), h_$t($b))"))
+        end for
+
+        cfe_agree(decls, cases)
+    end for
+end cfe_float_corpus
+
+@test("a generated corpus: conversions between every integer width and both float widths")
+cfe_conversion_corpus()
+    val types = cfe_int_types()
+    var s = CfeStream(4242)
+    val floats = ["0.0", "-0.0", "0.5", "-0.5", "1.5", "-1.5", "2147483647.5", "-2147483648.9", "3e9",
+                  "-3e9", "1e30", "-1e30", "255.9", "-1.0", "65535.5", "1e19", "-9.3e18", "nan",
+                  "infinity", "-infinity"]
+
+    var decls = ""
+    var cases: Buf[(string, string, string)] = buf()
+
+    for i in 0..<types.len()
+        val t = types.at(i).0
+
+        decls = decls + s"const from_real_$t(x: real) -> $t = $t(x)\n\n" +
+                s"const from_f32_$t(x: f32) -> $t = $t(x)\n\n" +
+                s"const to_real_$t(n: $t) -> real = real(n)\n\n" +
+                s"const to_f32_$t(n: $t) -> f32 = f32(n)\n\n"
+
+        for k in 0..<floats.len
+            val f = floats[k]
+            val f32v = if f == "nan" then "f32.nan" else if f == "infinity" then "f32.infinity"
+            else if f == "-infinity" then "-f32.infinity" else f
+
+            cases.push(cfe_case(t, s"from_real_$t($f)", s"from_real_$t(h_real($f))"))
+
+            if k % 2 == 0 then
+                cases.push(cfe_case(t, s"from_f32_$t($f32v)", s"from_f32_$t(h_f32($f32v))"))
+
+        val vals = cfe_values(types.at(i).1, types.at(i).2, &s)
+
+        for k in 0..<vals.len()
+            val n = to_string(vals.at(k))
+
+            cases.push(cfe_case("real", s"to_real_$t($n)", s"to_real_$t(h_$t($n))"))
+            cases.push(cfe_case("f32", s"to_f32_$t($n)", s"to_f32_$t(h_$t($n))"))
+    end for
+
+    // The ties a `f32` rounds once and a `f64` on the way would round twice.
+    for n in ["16777217", "16777219", "33554435", "18014399583223809", "-18014399583223809",
+              "9007199254740993", "36028797018963971"]
+        cases.push(cfe_case("f32", s"to_f32_i64($n)", s"to_f32_i64(h_i64($n))"))
+
+    cfe_agree(decls, cases)
+end cfe_conversion_corpus
+
+// -- the contract and the constrained types ----------------------------------------------------------
+
+@test("a 'require', an 'ensure', a loop 'invariant' and a 'within' type, each evaluated where it holds")
+cfe_contract_and_ranges()
+    val decls =
+        "type Pct = int within 0..100\n\n" +
+        "const half(n: int) -> int\n    require n % 2 == 0\n    ensure result * 2 == n\n\n    n / 2\n\n" +
+        "const pct(n: int) -> Pct = Pct(n)\n\n" +
+        "const summed(n: int) -> int\n    var s = 0\n    var i = 0\n\n    while i < n\n" +
+        "        invariant s >= 0\n\n        s += i\n        i += 1\n\n    s\n"
+
+    var cases: Buf[(string, string, string)] = buf()
+
+    cases.push(cfe_case("int", "half(10)", "half(h_int(10))"))
+    cases.push(cfe_case("int", "int(pct(42))", "int(pct(h_int(42)))"))
+    cases.push(cfe_case("int", "summed(10)", "summed(h_int(10))"))
+    cfe_agree(decls, cases)
+end cfe_contract_and_ranges
+
+// -- module storage ---------------------------------------------------------------------------------
+
+// An archive for a machine, as `build-c` makes one: the first thing the compilation had to say, or
+// the LLVM text it lowered to (`tests_sdt_static_data.sysl`'s harness).
+private cfe_archive(text: string, target: string) -> string
+    val t = target_named(target)
+
+    if t.is_none() then return s"there is no target '$target'"
+
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> return "skipped"
+        Ok(root) -> std_units(root, t.unwrap()) match
+            Err(_) -> return "skipped"
+            Ok(read) -> units = read
+
+    val parsed = parse(source_of("main.sysl", text), t.unwrap())
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t.unwrap(), buf(), false)
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/") then return done.reported.at(i).diag.message
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = done.an.diagnostics()
+
+    for i in 0..<late.len()
+        if !late.at(i).src.name.starts_with("library/") then return late.at(i).diag.message
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t.unwrap(), pr).0)
+end cfe_archive
+
+@test("a module 'val' calling a 'const' function is laid down for a freestanding archive")
+cfe_a_val_is_laid_down()
+    if !cfe_ready() then return
+
+    val out = cfe_archive("const q31(x: real) -> i32 = i32(x * 2147483648.0)\n\n" +
+                          "val R: i32 = q31(0.6)\n\n" +
+                          "@export(\"main\")\nmain_entry() -> int = R\n", "thumbv6m-freestanding")
+
+    if out == "skipped" then return
+
+    assert(out.contains("@R = private constant i32 1288490188\n"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+end cfe_a_val_is_laid_down
+
+@test("and the evaluation is at the target's width: a 'usize' wraps at 32 bits on a thumb")
+cfe_the_target_width()
+    if !cfe_ready() then return
+
+    val out = cfe_archive("const next(x: usize) -> usize = x + 1\n\n" +
+                          "val U: usize = next(4294967295)\n\n" +
+                          "@export(\"main\")\nmain_entry() -> int = int(U)\n", "thumbv6m-freestanding")
+
+    if out == "skipped" then return
+
+    assert(out.contains("@U = private constant i32 0\n"), out)
+end cfe_the_target_width
+
+@test("a module 'val' a program reads is the value the call comes to, printed")
+cfe_a_val_reads_its_value()
+    if !cfe_ready() then return
+
+    assert_eq(enm_ran("const fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)\n\n" +
+                      "static val V: int = fact(10)\n\nprint(V)\n"), "3628800\n")
+end cfe_a_val_reads_its_value
+
+// -- traps, limits and refusals ---------------------------------------------------------------------
+
+@test("a division by zero during the run is a compile error naming every call it was inside")
+cfe_a_trap_names_the_stack()
+    if !cfe_ready() then return
+
+    assert_eq(cfe_said("const per(n: int, k: int) -> int = n / k\n\n" +
+                       "const buckets(n: int, k: int) -> int = per(n, k) + 1\n\n" +
+                       "const steps: int = buckets(1024, 0)\n\nprint(steps)\n"),
+              "5:20 'steps' traps while it is being compiled: integer division by zero (main.sysl:1:36)" +
+              " — inside 'per(1024, 0)', called at main.sysl:3:40; inside 'buckets(1024, 0)', called " +
+              "at main.sysl:5:20\n")
+end cfe_a_trap_names_the_stack
+
+@test("the signed minimum divided by -1 traps while compiling as it does at run time")
+cfe_the_minimum_over_minus_one()
+    if !cfe_ready() then return
+
+    // `i32` and `int` are one type, which every diagnostic calls `int`.
+    assert_eq(cfe_said("const quot(a: i32, b: i32) -> i32 = a / b\n\n" +
+                       "const q: i32 = quot(-2147483648, -1)\n\nprint(q)\n"),
+              "3:16 'q' traps while it is being compiled: -2147483648 / -1 overflows int (main.sysl:1:37)" +
+              " — inside 'quot(-2147483648, -1)', called at main.sysl:3:16\n")
+end cfe_the_minimum_over_minus_one
+
+@test("a 'char' made of a surrogate traps, a failed 'require' traps, a value outside a 'within' traps")
+cfe_the_checked_traps()
+    if !cfe_ready() then return
+
+    assert_eq(cfe_said("const ch(n: u32) -> char = char(n)\n\nconst c: char = ch(55296)\n\nprint(c)\n"),
+              "3:17 'c' traps while it is being compiled: 55296 is not a Unicode scalar value " +
+              "(main.sysl:1:28) — inside 'ch(55296)', called at main.sysl:3:17\n")
+
+    assert_eq(cfe_said("const half(n: int) -> int\n    require n % 2 == 0\n\n    n / 2\n\n" +
+                       "const h: int = half(7)\n\nprint(h)\n"),
+              "6:16 'h' traps while it is being compiled: a 'require' of 'half' failed " +
+              "(main.sysl:2:13) — inside 'half(7)', called at main.sysl:6:16\n")
+
+    assert_eq(cfe_said("type Pct = int within 0..100\n\nconst pct(n: int) -> Pct = Pct(n)\n\n" +
+                       "const p: Pct = pct(150)\n\nprint(p)\n"),
+              "5:16 'p' traps while it is being compiled: 150 is not a value 'Pct' admits " +
+              "(main.sysl:3:28) — inside 'pct(150)', called at main.sysl:5:16\n")
+end cfe_the_checked_traps
+
+@test("a run that does not finish is stopped at 16,000,000 steps, naming the loop still running")
+cfe_the_step_limit()
+    if !cfe_ready() then return
+
+    assert_eq(cfe_said("const spin() -> int\n    loop\n        continue\n\nconst k: int = spin()\n\nprint(k)\n"),
+              "5:16 'k' did not finish within 16,000,000 steps while compiling — the loop at " +
+              "main.sysl:2:5 was still running\n")
+end cfe_the_step_limit
+
+// A loop that never ends is stopped at any limit, and the message names the number whatever the limit
+// was, so the test above cannot tell a limit of 8 or 32 million from the 16 the design states. Each
+// round of this loop is six to nine steps -- the round, the condition's three nodes, the statement
+// and what it reads -- so 1,500,000 rounds is 9 to 13.5 million steps and finishes, and 3,000,000 is
+// 18 to 27 million and does not: a limit half or twice the stated one turns one of the two around.
+@test("the step limit is 16,000,000 and not half or twice it: one run below it finishes, one above stops")
+cfe_the_step_limit_is_its_number()
+    if !cfe_ready() then return
+
+    val decls = "const count(n: int) -> int\n    var i = 0\n\n    while i < n\n        i += 1\n\n    i\n\n"
+
+    assert_eq(enm_ran(decls + "const k: int = count(1500000)\n\nprint(k)\n"), "1500000\n")
+
+    val said = cfe_said(decls + "const k: int = count(3000000)\n\nprint(k)\n")
+
+    assert(said.starts_with("9:16 'k' did not finish within 16,000,000 steps while compiling"), said)
+end cfe_the_step_limit_is_its_number
+
+@test("calls nested past 512 deep stop the run, where the same recursion 500 deep does not")
+cfe_the_depth_limit()
+    if !cfe_ready() then return
+
+    val decls = "const deep(n: int) -> int = if n == 0 then 0 else deep(n - 1) + 1\n\n"
+
+    assert_eq(enm_ran(decls + "const k: int = deep(500)\n\nprint(k)\n"), "500\n")
+
+    // The heavier shape: each level passes through a `match`, a `for` and a local before it calls the
+    // next, so a frame the walk keeps for any of them is paid 500 times over.
+    assert_eq(enm_ran("const down(n: int) -> int = n match\n    0 -> 0\n    m ->\n        var s = 0\n\n" +
+                      "        for i in 0..<1\n            s += down(m - 1) + 1\n\n        s\n\n" +
+                      "const k: int = down(500)\n\nprint(k)\n"), "500\n")
+
+    val said = cfe_said(decls + "const k: int = deep(1000)\n\nprint(k)\n")
+
+    assert(said.starts_with("3:16 'k' cannot be computed while compiling: the calls nest more than 512 " +
+                            "deep, at 'deep(488)' (main.sysl:1:51)"), said)
+end cfe_the_depth_limit
+
+@test("a struct inside the body is refused clearly: aggregates are not evaluated yet")
+cfe_an_aggregate_is_refused()
+    if !cfe_ready() then return
+
+    assert_eq(cfe_said("struct P\n    x: int\n\nconst f(n: int) -> int\n    val p = P(n)\n\n    p.x\n\n" +
+                       "const k: int = f(3)\n\nprint(k)\n"),
+              "9:16 'k' cannot be computed while compiling: a 'P' is not evaluated while compiling " +
+              "yet — integers, floats, 'bool' and 'char' are (main.sysl:5:13) — inside 'f(3)', called " +
+              "at main.sysl:9:16\n")
+end cfe_an_aggregate_is_refused
+
+@test("a call to a function that is not 'const' inside the body stops the run, beside the checker's word")
+cfe_a_call_that_is_not_const()
+    if !cfe_ready() then return
+
+    val said = cfe_said("noisy(x: int) -> int = x + 1\n\nconst f(x: int) -> int = noisy(x)\n\n" +
+                        "const k: int = f(1)\n\nprint(k)\n")
+
+    assert(said.contains("3:26 'f' is 'const', so it runs while compiling, and it calls 'noisy', which " +
+                         "is not — mark 'noisy' 'const' too, or compute this at run time\n"), said)
+    assert(said.contains("5:16 'k' cannot be computed while compiling: 'f' calls 'noisy', which is not " +
+                         "'const' (main.sysl:3:26) — inside 'f(1)', called at main.sysl:5:16\n"), said)
+end cfe_a_call_that_is_not_const
+
+@test("a constant that calls a function that is not 'const' is told to mark it")
+cfe_the_advice_to_mark()
+    if !cfe_ready() then return
+
+    assert_eq(cfe_said("size() -> int = 4\n\nconst called: int = size()\n\nprint(called)\n"),
+              "3:21 the value of 'called' is not a constant expression — 'size' is not 'const', so it " +
+              "runs only when the program does; mark it 'const' to call it here\n")
+    assert_eq(enm_ran("const size() -> int = 4\n\nconst called: int = size()\n\nprint(called)\n"), "4\n")
+end cfe_the_advice_to_mark
+
+@test("a module 'val' whose call traps is refused at its initializer")
+cfe_a_val_that_traps()
+    if !cfe_ready() then return
+
+    assert_eq(cfe_said("const per(n: int, k: int) -> int = n / k\n\nstatic val Z: int = per(1, 0)\n\n" +
+                       "print(Z)\n"),
+              "3:21 'Z' traps while it is being compiled: integer division by zero (main.sysl:1:36) — " +
+              "inside 'per(1, 0)', called at main.sysl:3:21\n")
+end cfe_a_val_that_traps
+
+@test("a 'const' call where a type is read is refused until types can be read that way")
+cfe_not_where_a_type_is_read()
+    if !cfe_ready() then return
+
+    val said = cfe_said("const four() -> int = 4\n\nconst N: int = four()\n\nstruct S\n    a: [N]u8\n\n" +
+                        "print(sizeof(S))\n")
+
+    assert(said.contains("3:16 'four' is a 'const' function, but this value is read while declarations " +
+                         "are, before any body can be run — a 'const' call is evaluated where a value is " +
+                         "wanted, and not yet where a type is read\n"), said)
+end cfe_not_where_a_type_is_read
+
+@test("a constant whose function reads the constant back is a loop, told once")
+cfe_a_loop_through_a_body()
+    if !cfe_ready() then return
+
+    val said = cfe_said("const f() -> int = N + 1\n\nconst N: int = f()\n\nprint(N)\n")
+
+    assert(said.contains("defined in terms of itself") || said.contains("needs 'N'"), said)
+end cfe_a_loop_through_a_body
+
+@test("the same constant read twice runs once and says one thing")
+cfe_said_once()
+    if !cfe_ready() then return
+
+    assert_eq(cfe_said("const per(n: int, k: int) -> int = n / k\n\nconst z: int = per(1, 0)\n\n" +
+                       "print(z)\nprint(z + 1)\n"),
+              "3:16 'z' traps while it is being compiled: integer division by zero (main.sysl:1:36) — " +
+              "inside 'per(1, 0)', called at main.sysl:3:16\n")
+end cfe_said_once

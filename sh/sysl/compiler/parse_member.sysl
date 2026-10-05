@@ -148,7 +148,7 @@ private can_begin_member(p: *Parser, site: MemberSite) -> bool = p.peek() match
     QuotedIdent(_) -> true
     Keyword(w) -> w == "@" || w == "#" || w == "private" || w == "static" || w == "override" ||
         (w == "type" && site != InType) || (is_reserved(w) && p.kw_at(1, ":")) ||
-        at_reserved_member_head(p)
+        at_reserved_member_head(p) || at_const_member(p)
     _ -> false
 
 // Refuse a line that cannot begin a member, in the body's own terms; `true` where it was refused.
@@ -338,7 +338,7 @@ private positional_payload_refusal(typ: TypeRef) -> string =
 // member's parameter list opens with a receiver or is a signature. A bare name, and a name with a
 // value pinned to it, are variants and nothing else.
 private at_enum_variant(p: *Parser) -> bool
-    if p.at_kw("@") || p.at_kw("private") || p.at_kw("static") then return false
+    if p.at_kw("@") || p.at_kw("private") || p.at_kw("static") || at_const_member(p) then return false
     // `override` opens a member's line as a visibility does, and is refused there in words of its own.
     if p.at_kw("override") && !at_reserved_member_head(p) then return false
     // `set` is a name like any other, so `set`, `set = 3` and `set(x: int)` are variants; only a
@@ -745,6 +745,22 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
         overrides = true
     end if
 
+    var marked_const = false
+
+    if at_const_member(p)
+        // **Whether a call can run while compiling is a fact about one body**, and a trait's member
+        // is a signature every implementing type answers with a body of its own.
+        if site == InTrait
+            p.fault(p.here(), "a trait's member is not marked 'const' — whether a call can run while compiling is a fact about the body that answers it, so each 'impl' marks the member it supplies")
+            skip_line(p)
+            return
+        end if
+
+        p.bump()
+
+        marked_const = true
+    end if
+
     val head = p.here()
 
     parse_member(p, start, site) match
@@ -754,6 +770,7 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
             member.named_at = Span(head.start, read.span.end)
             member.vis = vis
             member.overrides = overrides
+            member.const_fn = marked_const
             apply_member_attrs(&member, attrs)
             out.push(member)
         None -> ()
@@ -818,6 +835,18 @@ private at_reserved_member_head(p: *Parser) -> bool
 
     i != 0 && (p.kw_at(i, "(") || p.kw_at(i, "->"))
 end at_reserved_member_head
+
+// Whether `const` here marks the member after it: the word, then the member's name or the `static`
+// an associated function opens with. A field named with the word has its `:` there instead.
+private at_const_member(p: *Parser) -> bool
+    if !p.at_kw("const") then return false
+
+    p.peek_at(1) match
+        Ident(_) -> true
+        QuotedIdent(_) -> true
+        Keyword(w) -> w == "static"
+        _ -> false
+end at_const_member
 
 // `set width(w)` -- the member a write to a property reaches.
 //
