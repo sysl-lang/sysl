@@ -182,7 +182,7 @@ end share_where
 
 // What to do about the part in the way: a plain reference has an atomic spelling to reach for, a
 // weak one has none yet, and a view has a distinction the language cannot draw.
-private share_remedy(head: string, ty: Type) -> string = ty match
+share_remedy(head: string, ty: Type) -> string = ty match
     Ref(inner, _) -> head + s"whose count is not. Hold it as a '&sync ${type_show(*inner)}' ('06')"
     Weak(_) -> head + "and a weak count has no atomic form yet"
     _ -> head + share_view_remedy(if ty == Str then "bytes" else "elements")
@@ -214,13 +214,22 @@ check_crossings(cx: &Analyzer, crossing: Buf[string], shown: string, params: Buf
         if i >= args.len() then break
         if !holds_string(crossing, params.at(i).0) then continue
 
-        check_crossing(cx, args.at(i).span, params.at(i).0, shown, params.at(i).1)
+        check_crossing(cx, args.at(i), params.at(i).0, shown, params.at(i).1)
 end check_crossings
 
-private check_crossing(cx: &Analyzer, span: Span, pname: string, shown: string, pty: Type)
-    val why = pty match
-        Ptr(inner) -> crossing_complaint(s"what '$pname' of '$shown' points at", *inner)
-        _ -> crossing_complaint(s"'$pname' of '$shown'", pty)
+// **A task in what crosses is noted rather than answered**: what its frame holds is read off the
+// body of the async function that made it, which need not be typed yet (`task_domains.sysl`). The
+// argument's own type is what is asked about there, since a parameter written `Task[T]` says nothing
+// about which function made the one it is handed.
+private check_crossing(cx: &Analyzer, arg: TExpr, pname: string, shown: string, pty: Type)
+    val subject = pty match
+        Ptr(_) -> s"what '$pname' of '$shown' points at"
+        _ -> s"'$pname' of '$shown'"
 
-    if why.is_some() then cx.fault(span, why.unwrap())
+    val why = pty match
+        Ptr(inner) -> crossing_complaint(subject, *inner)
+        _ -> crossing_complaint(subject, pty)
+
+    if why.is_some() then cx.fault(arg.span, why.unwrap())
+    else note_task_crossing(cx, arg.span, CrossArg(subject), arg)
 end check_crossing

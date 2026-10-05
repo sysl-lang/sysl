@@ -49,12 +49,16 @@ private arc_value(e: *Emit, ty: Type, v: Val, retain: bool) = ty match
     Str ->
         arc_call(e, s"arc.${if retain then "retain" else "release"}_maybe", view_owner(e, ty, v))
 
-    // A task is counted as a `&T` is: its value is the address of a box header, the one at the head
-    // of its coroutine's promise, and the hook installed there is what destroys the frame.
+    // A task is counted as a `&sync T` is: its value is the address of a box header, the one at the
+    // head of its coroutine's promise, and the hook installed there is what destroys the frame.
+    // **The count is atomic for every task**, since a task whose frame may cross is handed to another
+    // domain with a share still held in this one, and `Task[T]` cannot say which tasks those are: a
+    // count is atomic or it is not from the moment the box is made (`task_domains.sysl`).
     Struct(d) ->
         if d.base == TaskBase
             e.heap = true
-            arc_call(e, s"arc.${if retain then "retain" else "release"}", v)
+            e.sync_heap = true
+            arc_call(e, s"arc.${if retain then "retain" else "release"}_sync", v)
         else aggregate_arc(e, ty, v, retain)
     _ -> aggregate_arc(e, ty, v, retain)
 

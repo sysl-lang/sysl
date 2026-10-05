@@ -1,0 +1,507 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// Whether a task may reach another concurrency domain (`task_domains.sysl`): a task's frame holds
+// its parameters, its result and the locals alive across an `await`, and crossing it is asked the
+// question a closure crossing into a `&sync Fn` is asked, of each of them.
+//
+// **The reference compiler has no tasks**, so the messages are the design's own, worded as the
+// existing refusals at the same three places are.
+
+private var tdx_library_cache: Buf[Program] = buf()
+private var tdx_library_read: bool = false
+
+private tdx_library() -> Buf[Program]
+    if tdx_library_read then return tdx_library_cache
+
+    tdx_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tdx_library_cache = units
+
+    tdx_library_cache
+end tdx_library
+
+private tdx_no_library() -> bool
+    if tdx_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+    end if
+
+    false
+end tdx_no_library
+
+// The whole report a one-file program is refused with, or `""` where it analyzes clean.
+private tdx_refused(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.report.render(parsed.src)
+
+    var units: Buf[Program] = buf()
+    val library = tdx_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end tdx_refused
+
+// That a report holds the complaint, worded so and anchored at `line:column` -- the arrow is
+// indented to the width of the line numbers in the gutter, so it is matched without its margin.
+private tdx_says(report: string, message: string, at: string)
+    assert(report.contains(s"error: $message\n"), report)
+    assert(report.contains(s"--> t.sysl:$at\n"), report)
+end tdx_says
+
+// A facility that hands a task to another domain, and a cell to count through.
+private tdx_prelude() -> string = raw"""
+    struct Cell
+        n: int
+
+    @crossing(t)
+    hand(t: Task[int]) = ()
+
+    """
+
+private tdx_arg() -> string =
+    "'t' of 'hand' reaches another concurrency domain, so every count inside it has to be atomic — "
+
+private tdx_view() -> string =
+    "which owns its bytes through a count that is not atomic. A literal's bytes are immortal and " +
+    "would be safe to share, but nothing in the type says whether these are, so a shared object holds " +
+    "no view at all ('06')"
+
+private tdx_unmade() -> string =
+    " — what a task's frame holds is known only where the call that makes it can be seen, so a task " +
+    "crosses there, or through a parameter its function names in '@crossing'"
+
+// -- what a frame holds ---------------------------------------------------------------------------------
+
+@test("a task of plain scalars crosses")
+tdx_scalars_cross()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_refused(tdx_prelude() + raw"""
+        async work(a: int, b: real) -> int
+            val k = a * 2
+            await yield_now()
+            k + int(b)
+
+        hand(work(1, 2.0))
+        """), "")
+
+@test("a task holding a '&sync T' parameter crosses")
+tdx_sync_parameter_crosses()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_refused(tdx_prelude() + raw"""
+        async work(c: &sync Cell) -> int
+            await yield_now()
+            c.n
+
+        val c: &sync Cell = Cell(1)
+
+        hand(work(c))
+        """), "")
+
+@test("a task holding a 'string' parameter is refused at the argument, naming the function and the parameter")
+tdx_string_parameter_refused()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(tdx_prelude() + raw"""
+        async work(s: string) -> int
+            await yield_now()
+            1
+
+        hand(work("hi"))
+        """), tdx_arg() + "but it is a task of 'work', whose frame holds its parameter 's', a " +
+        "'string', " + tdx_view(), "11:6")
+
+@test("a task holding an ordinary '&T' local across an 'await' is refused, naming the local")
+tdx_local_across_await_refused()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(tdx_prelude() + raw"""
+        async work(n: int) -> int
+            val r: &Cell = Cell(n)
+            await yield_now()
+            r.n
+
+        hand(work(1))
+        """), tdx_arg() + "but it is a task of 'work', whose frame holds its local 'r', a '&Cell', " +
+        "whose count is not. Hold it as a '&sync Cell' ('06')", "12:6")
+
+@test("the same local let go of before the first 'await' is not in the frame, so the task crosses")
+tdx_local_dropped_before_await_crosses()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_refused(tdx_prelude() + raw"""
+        async work(n: int) -> int
+            var k = 0
+
+            if n > 0
+                val r: &Cell = Cell(n)
+                k = r.n
+
+            await yield_now()
+            k
+
+        hand(work(1))
+        """), "")
+
+@test("a counted local is held to the end of its block, so one read only before the 'await' still is")
+tdx_local_held_to_its_block_end()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(tdx_prelude() + raw"""
+        async work(n: int) -> int
+            val r: &Cell = Cell(n)
+            val k = r.n
+            await yield_now()
+            k
+
+        hand(work(1))
+        """), tdx_arg() + "but it is a task of 'work', whose frame holds its local 'r', a '&Cell', " +
+        "whose count is not. Hold it as a '&sync Cell' ('06')", "13:6")
+
+@test("a task ending with a 'string' is refused: its result is written in one domain and read in another")
+tdx_string_result_refused()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(raw"""
+        @crossing(t)
+        hand_text(t: Task[string]) = ()
+
+        async work(n: int) -> string
+            await yield_now()
+            "done"
+
+        hand_text(work(1))
+        """), "'t' of 'hand_text' reaches another concurrency domain, so every count inside it has to " +
+        "be atomic — but it is a task of 'work', whose frame holds its result, a 'string', " +
+        tdx_view(), "8:11")
+
+@test("a task it awaits is in its frame, and the refusal follows the chain")
+tdx_awaited_task_followed()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(tdx_prelude() + raw"""
+        async inner(s: string) -> int
+            await yield_now()
+            1
+
+        async outer(n: int) -> int
+            val v = await inner("x")
+            v + n
+
+        hand(outer(1))
+        """), tdx_arg() + "but it is a task of 'outer', whose frame holds the task it awaits, a task " +
+        "of 'inner', whose frame holds its parameter 's', a 'string', " + tdx_view(), "15:6")
+
+@test("a task parameter of an async function is answered by the argument its call was handed")
+tdx_task_parameter_follows_the_argument()
+    if tdx_no_library() then return
+
+    val program = tdx_prelude() + raw"""
+        async plain(n: int) -> int
+            await yield_now()
+            n
+
+        async text(s: string) -> int
+            await yield_now()
+            1
+
+        async twice(t: Task[int]) -> int = await t * 2
+
+        hand(twice(plain(1)))
+        hand(twice(text("x")))
+        """
+
+    tdx_says(tdx_refused(program), tdx_arg() + "but it is a task of 'twice', whose frame holds its " +
+             "parameter 't', a task of 'text', whose frame holds its parameter 's', a 'string', " +
+             tdx_view(), "18:6")
+
+@test("a task that parks stays in its domain, the waker it is handed being domain-local")
+tdx_parking_task_refused()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(tdx_prelude() + raw"""
+        async waits() -> int
+            await park(w -> w())
+            1
+
+        hand(waits())
+        """), tdx_arg() + "but it is a task of 'waits', whose frame holds the 'park' it awaits — a " +
+        "task that parks is handed a waker, and a waker is a '&Fn() -> unit' belonging to the domain " +
+        "whose executor steps the task, so a task that parks stays in that domain", "11:6")
+
+// -- where it is asked ----------------------------------------------------------------------------------
+
+@test("a task captured by a closure shared into a '&sync Fn' is refused at the closure")
+tdx_captured_task_refused()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(raw"""
+        @crossing(f)
+        later(f: &sync Fn() -> unit) = ()
+
+        async work(s: string) -> int
+            await yield_now()
+            1
+
+        val t = work("hi")
+
+        later(() -> print(block_on(t)))
+        """), "a closure shared between two domains may be called from either, so every count it " +
+        "captures has to be atomic — but the 't' it captures is a task of 'work', whose frame holds " +
+        "its parameter 's', a 'string', " + tdx_view(), "10:7")
+
+@test("and one of plain scalars captured that way is not")
+tdx_captured_scalar_task_crosses()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_refused(raw"""
+        @crossing(f)
+        later(f: &sync Fn() -> unit) = ()
+
+        async work(n: int) -> int
+            await yield_now()
+            n
+
+        val t = work(1)
+
+        later(() -> print(block_on(t)))
+        """), "")
+
+@test("a task held by a '&sync' structure is refused where the structure is boxed")
+tdx_shared_structure_refused()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(raw"""
+        struct Holder
+            t: Task[int]
+
+        async work(s: string) -> int
+            await yield_now()
+            1
+
+        val h: &sync Holder = Holder(work("x"))
+        """), "'&sync Holder' may be reached from two domains at once, so every count inside it has to " +
+        "be atomic — but its 't' is a task of 'work', whose frame holds its parameter 's', a 'string', " +
+        tdx_view(), "8:23")
+
+@test("a task whose making cannot be seen from where it crosses is refused")
+tdx_unseen_task_refused()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(tdx_prelude() + raw"""
+        relay(t: Task[int]) = hand(t)
+        """), tdx_arg() + "but it is a task, and nothing here says which async function made it" +
+        tdx_unmade(), "7:28")
+
+@test("a parameter its function names in '@crossing' crosses on, and its callers are held to the rule")
+tdx_vouched_parameter_crosses_on()
+    if tdx_no_library() then return
+
+    val program = tdx_prelude() + raw"""
+        @crossing(t)
+        relay(t: Task[int]) = hand(t)
+
+        async plain(n: int) -> int
+            await yield_now()
+            n
+
+        async text(s: string) -> int
+            await yield_now()
+            1
+
+        relay(plain(1))
+        relay(text("x"))
+        """
+
+    tdx_says(tdx_refused(program), "'t' of 'relay' reaches another concurrency domain, so every count " +
+             "inside it has to be atomic — but it is a task of 'text', whose frame holds its " +
+             "parameter 's', a 'string', " + tdx_view(), "19:7")
+
+@test("a local written again after it was made is not followed back to its first value")
+tdx_rewritten_local_is_unseen()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(tdx_prelude() + raw"""
+        async work(n: int) -> int
+            await yield_now()
+            n
+
+        var t = work(1)
+
+        t = work(2)
+        hand(t)
+        """), tdx_arg() + "but it is a task, and nothing here says which async function made it" +
+        tdx_unmade(), "14:6")
+
+@test("everything refused above is accepted where it stays in its own domain")
+tdx_domain_local_use_unchanged()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_refused(raw"""
+        struct Cell
+            n: int
+
+        struct Holder
+            t: Task[int]
+
+        async work(s: string) -> int
+            val r: &Cell = Cell(1)
+            await yield_now()
+            r.n + int(s.bytes.len)
+
+        async text(n: int) -> string
+            await yield_now()
+            "done"
+
+        async waits() -> int
+            await park(w -> w())
+            1
+
+        async outer(n: int) -> int = await work("x") + n
+
+        relay(t: Task[int]) -> int = block_on(t)
+
+        val t = work("hi")
+        val f: &Fn() -> unit = () -> print(block_on(t))
+        val h: &Holder = Holder(work("y"))
+
+        f()
+        print(relay(outer(1)), block_on(text(1)), block_on(waits()), block_on(h.t))
+        """), "")
+
+// -- the waker ------------------------------------------------------------------------------------------
+
+// **A waker is a `&Fn() -> unit`, and neither form takes a `&sync Fn`**: `&T` and `&sync T` are
+// distinct types with no conversion between them, so accepting one would be a new form. The waker
+// `park` makes counts and arms itself with plain stores, so it is domain-local by construction, and
+// the existing capture rule is what keeps a registrar from sending it anywhere.
+
+@test("step takes a '&Fn() -> unit' waker, and a '&sync Fn() -> unit' one is refused")
+tdx_step_refuses_a_sync_waker()
+    if tdx_no_library() then return
+
+    val out = tdx_refused(raw"""
+        async work(n: int) -> int
+            await yield_now()
+            n
+
+        val w: &sync Fn() -> unit = () -> ()
+
+        print(step(work(1), w))
+        """)
+
+    assert(out.contains("error: "), out)
+    assert(out.contains("&sync Fn() -> unit"), out)
+
+@test("a registrar may not send the waker park hands it into a '&sync Fn'")
+tdx_registrar_keeps_the_waker_local()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(raw"""
+        @crossing(f)
+        later(f: &sync Fn() -> unit) = ()
+
+        async waits() -> int
+            await park(w -> later(() -> w()))
+            1
+
+        print(block_on(waits()))
+        """), "a closure shared between two domains may be called from either, so every count it " +
+        "captures has to be atomic — but the 'w' it captures reaches a '&Fn() -> unit', whose count is " +
+        "not. Hold it as a '&sync Fn() -> unit' ('06')", "5:27")
+
+// -- a task that really crosses ------------------------------------------------------------------------
+
+// What a program prints at the default level, or why it did not build or run to the end.
+private tdx_ran(text: string) -> string
+    val root = make_temp_dir("sysl-tdx").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else
+            s"it did not run to the end: ${out.text}${out.err.unwrap_or("")}"
+end tdx_ran
+
+// `spawn` alone is imported: the library's own `yield_now` is the nearer name where the module is
+// imported whole, and it is a thread's, not a task's.
+private tdx_threaded(params: string) -> string = raw"""
+    import sysl.posix.threads.spawn
+
+    struct Job
+        t: Task[int]
+        out: int
+
+    run(j: *Job)
+        j.out = block_on(j.t)
+
+    """ + s"async sum_to($params) -> int\n" + raw"""
+        var total = 0
+
+        for i in 0..<n
+            await yield_now()
+            total += i
+
+        total
+
+    """
+
+@test("a task of scalars is handed to another thread and run there while this one runs its own")
+tdx_a_task_runs_on_another_thread()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_ran(tdx_threaded("n: int") + raw"""
+        var job = Job(sum_to(1000), 0)
+        val th = spawn(&run, &job).unwrap()
+        val mine = block_on(sum_to(2000))
+
+        th.join()
+        print(job.out, mine)
+        """), "499500 1999000\n")
+
+@test("and the same hand-over is refused where the task's frame holds a 'string'")
+tdx_a_threaded_task_holding_a_string_is_refused()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(tdx_threaded("n: int, label: string") + raw"""
+        var job = Job(sum_to(10, "ten"), 0)
+
+        spawn(&run, &job).unwrap().join()
+        """), "what 'arg' of 'sysl.posix.threads.spawn' points at reaches another concurrency domain, " +
+        "so every count inside it has to be atomic — but its 't' is a task of 'sum_to', whose frame " +
+        "holds its parameter 'label', a 'string', " + tdx_view(), "21:13")

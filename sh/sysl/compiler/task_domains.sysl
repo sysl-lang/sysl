@@ -1,0 +1,622 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// Whether a task may reach another concurrency domain.
+//
+// **A task is a closure environment by another name**: its frame holds its parameters, its result,
+// and every local alive across an `await` -- so the question a closure crossing into a `&sync Fn` is
+// asked is the question a task crossing is asked, and the answer comes from the same predicate,
+// `unshareable` in `sharing.sysl`. Nothing here decides what a count may be; it decides only what a
+// task's frame can hold.
+//
+// **What a frame holds is a fact about the async function that made the task, and a `Task[T]` does
+// not say which one did.** Two tasks of one `T` are one type wherever they come from, so the type
+// cannot carry the frame. So the three places a value crosses today -- a `@crossing` argument, a
+// closure erased into a `&sync Fn`, a value boxed into a `&sync T` -- note the value as it crosses,
+// and once every body is typed the value is followed back to the call that made each task in it:
+// through a `val` to its initializer, through a struct literal to its fields, through a parameter of
+// the task being judged to the argument its call was handed. **A task whose making cannot be seen
+// from where it crosses is refused**, there being no frame to ask about; a parameter its own
+// function names in `@crossing` is the one exception, its callers having been held to the rule.
+//
+// **A local is in the frame where an `await` follows its binding inside the block that binds it**:
+// a value that holds a count is let go of at the end of its block, so from its binding to there it
+// is held, and an `await` in that stretch is a suspension it is held across. A local whose block
+// ends before the first `await` is not in the frame at all.
+
+// Where a value crossed, in the words the existing refusals use for the place.
+enum CrossKind
+    // A `@crossing` argument; `subject` is what `check_crossing` calls it.
+    CrossArg(subject: string)
+
+    // A closure erased into a `&sync Fn`.
+    CrossClosure
+
+    // A value boxed into a `&sync T`; `shown` is the `T`.
+    CrossShared(shown: string)
+end CrossKind
+
+// One value that crossed while holding a task, kept until every body is typed.
+struct TaskCross
+    scope: Scope
+    span: Span
+    kind: CrossKind
+    value: TExpr
+end TaskCross
+
+// Whether a type holds a task by value -- the frame being what is reached through it. A reference
+// is a leaf, as it is for `unshareable`: a `&sync` was asked about where it was formed.
+holds_task(t: Type) -> bool = t match
+    Struct(d) -> if d.base == TaskBase then true else fields_hold_task(d.fields)
+    Enum(d) -> variants_hold_task(d.variants)
+    Array(_, elem) -> holds_task(*elem)
+    Constrained(d) -> holds_task(d.base)
+    _ -> false
+
+private fields_hold_task(fields: Buf[(string, Type)]) -> bool
+    for i in 0..<fields.len()
+        if holds_task(fields.at(i).1) then return true
+
+    false
+end fields_hold_task
+
+private variants_hold_task(variants: Buf[EnumVariant]) -> bool
+    for i in 0..<variants.len()
+        if fields_hold_task(variants.at(i).fields) then return true
+
+    false
+end variants_hold_task
+
+// Notes a value crossing at `span` where it holds a task, for `check_task_crossings` to answer.
+note_task_crossing(cx: &Analyzer, span: Span, kind: CrossKind, value: TExpr)
+    if holds_task(texpr_type(unboxed(value)))
+        cx.an.task_crossings.push(TaskCross(cx.scope, span, kind, value))
+end note_task_crossing
+
+// The value itself, under the box or the address it is handed over in.
+private unboxed(e: TExpr) -> TExpr = *e.kind match
+    TBox(inner, _) -> unboxed(inner)
+    TAddrOf(place, _) -> unboxed(place)
+    _ -> e
+
+// -- what a body binds ------------------------------------------------------------------------------
+
+// What one typed body says about its own names: its parameters, the value each local starts at, the
+// locals written again after that, and the parameters it names in `@crossing`.
+struct BodyValues
+    params: Buf[string]
+    inits: &Table[TExpr]
+    rewritten: Buf[string]
+    crossing: Buf[string]
+
+    note_write(*self, place: TExpr)
+        *place.kind match
+            TLoad(name, _) -> if !holds_string(self.rewritten, name) then self.rewritten.push(name)
+            _ -> ()
+end BodyValues
+
+private body_values(a: &Analysis, f: TFunc) -> &BodyValues
+    var params: Buf[string] = buf()
+
+    for i in 0..<f.params.len()
+        params.push(f.params.at(i).0)
+
+    val out: &BodyValues = BodyValues(params, table(), buf(), a.crossing_params.get(f.name).unwrap_or(buf()))
+
+    walk_block_stmts(f.body, TWalk(false, e -> note_update(out, e), w -> out.note_write(w.place),
+                                   s -> note_binding(out, s)))
+    out
+end body_values
+
+// A write written as an expression is a write all the same.
+private note_update(out: &BodyValues, e: TExpr)
+    *e.kind match
+        TStore(place, _, _) -> out.note_write(place)
+        TUpdate(place, _, _, _, _, _) -> out.note_write(place)
+        _ -> ()
+end note_update
+
+private no_values() -> &BodyValues = BodyValues(buf(), table(), buf(), buf())
+
+private note_binding(out: &BodyValues, s: TStmt)
+    s match
+        TVarDecl(name, _, init, _) -> out.inits.put(name, init)
+        TRefDecl(name, _, place) -> out.inits.put(name, place)
+        _ -> ()
+end note_binding
+
+// -- following a value back to the calls that made its tasks -----------------------------------------
+
+// Where a value is read: the body, and -- inside a task being judged -- the arguments its call was
+// handed and where that call was written.
+struct Ctx
+    values: &BodyValues
+    args: Buf[TExpr]
+    has_args: bool
+    caller: Option[&Ctx]
+end Ctx
+
+// What made one task.
+enum Maker
+    MadeBy(key: string, args: Buf[TExpr], caller: &Ctx)
+    Vouched
+    Unseen
+end Maker
+
+// The tasks a value holds, each with the path that reaches it and what made it.
+struct Crossed
+    found: Buf[(Buf[string], Maker)]
+
+    add(*self, path: Buf[string], m: Maker) = self.found.push((path, m))
+end Crossed
+
+private crossed(e: TExpr, ctx: &Ctx, path: Buf[string], out: &Crossed)
+    val through = *e.kind match
+        TBox(inner, _) -> Some(inner)
+        TAddrOf(place, _) -> Some(place)
+        _ -> None
+
+    if through.is_some()
+        crossed(through.unwrap(), ctx, path, out)
+        return
+    end if
+
+    val ty = texpr_type(e)
+
+    if !holds_task(ty) then return
+
+    *e.kind match
+        TCall(name, args, _, _) ->
+            if task_result(ty).is_some() then out.add(path, MadeBy(name, args, ctx)) else out.add(path, Unseen)
+        TLoad(name, _) -> crossed_load(name, ctx, path, out)
+        TStructNew(decl, args) ->
+            for i in 0..<args.len()
+                if i >= decl.fields.len() then break
+
+                crossed(args.at(i), ctx, extended(path, decl.fields.at(i).0), out)
+        _ -> out.add(path, Unseen)
+end crossed
+
+private crossed_load(name: string, ctx: &Ctx, path: Buf[string], out: &Crossed)
+    val v = ctx.values
+
+    for i in 0..<v.params.len()
+        if v.params.at(i) != name then continue
+
+        if ctx.has_args && i < ctx.args.len() && ctx.caller.is_some()
+            crossed(ctx.args.at(i), ctx.caller.unwrap(), path, out)
+        else
+            out.add(path, if holds_string(v.crossing, name) then Vouched else Unseen)
+
+        return
+    end for
+
+    val init = v.inits.get(name)
+
+    if init.is_none() || holds_string(v.rewritten, name)
+        out.add(path, Unseen)
+    else
+        crossed(init.unwrap(), ctx, path, out)
+end crossed_load
+
+private extended(path: Buf[string], name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<path.len()
+        out.push(path.at(i))
+
+    out.push(name)
+    out
+end extended
+
+// -- what a frame holds -------------------------------------------------------------------------------
+
+// One thing a task's frame holds: how a message names it, its type, and the value it is read from
+// where that can be followed.
+struct FrameMember
+    desc: string
+    ty: Type
+    value: Option[TExpr]
+end FrameMember
+
+struct TaskFrame
+    members: Buf[FrameMember]
+    parks: bool
+
+    hold(*self, desc: string, ty: Type, value: Option[TExpr]) = self.members.push(FrameMember(desc, ty, value))
+end TaskFrame
+
+// Everything a task of `f` can hold at a suspension, in the order a message would name it:
+// parameters, the result, the locals alive across an `await`, and the tasks it awaits.
+private frame_of(f: TFunc) -> &TaskFrame
+    val out: &TaskFrame = TaskFrame(buf(), false)
+
+    for i in 0..<f.params.len()
+        val p = f.params.at(i)
+        val desc = if p.0 == "self" then "its receiver" else s"its parameter '${p.0}'"
+
+        out.hold(desc, p.1, Some(TExpr(span_zero(), TLoad(p.0, p.1))))
+    end for
+
+    out.hold("its result", task_result(f.ret_ty).unwrap_or(f.ret_ty), None)
+
+    scan_list(out, f.body.stmts, f.body.result)
+    walk_block_stmts(f.body, TWalk(false, e -> scan_node(out, e), w -> (), s -> scan_stmt(out, s)))
+    out
+end frame_of
+
+private hold_local(out: &TaskFrame, name: string, ty: Type) =
+    out.hold(s"its local '$name'", ty, Some(TExpr(span_zero(), TLoad(name, ty))))
+
+// A binding of `stmts` is held where an `await` follows it in the same list or in what the list
+// yields.
+private scan_list(out: &TaskFrame, stmts: Buf[TStmt], result: Option[TExpr])
+    for i in 0..<stmts.len()
+        stmts.at(i) match
+            TVarDecl(name, ty, _, _) -> if awaits_after(stmts, i + 1, result) then hold_local(out, name, ty)
+            TRefDecl(name, ty, _) -> if awaits_after(stmts, i + 1, result) then hold_local(out, name, ty)
+            _ -> ()
+end scan_list
+
+private scan_block(out: &TaskFrame, b: TBlock) = scan_list(out, b.stmts, b.result)
+
+private scan_opt(out: &TaskFrame, b: Option[TBlock]) = if b.is_some() then scan_block(out, b.unwrap())
+
+private scan_stmt(out: &TaskFrame, s: TStmt)
+    s match
+        TDefer(stmts) -> scan_list(out, stmts, None)
+        _ -> ()
+end scan_stmt
+
+// Every node owning a list of statements has that list scanned, and what a pattern or a loop holds
+// for the length of a body is held where that body awaits. The walk reaches every node, so a list
+// nested at any depth is scanned when its owner is.
+private scan_node(out: &TaskFrame, e: TExpr)
+    *e.kind match
+        TAwait(op, _) -> awaited(out, op)
+        TIf(cond, then_block, else_block, _) ->
+            scan_block(out, then_block)
+            scan_opt(out, else_block)
+
+            if block_awaits(then_block) then hold_subjects(out, cond)
+        TMatch(scrutinee, arms, _) ->
+            var held = false
+
+            for i in 0..<arms.len()
+                scan_block(out, arms.at(i).body)
+
+                if block_awaits(arms.at(i).body) then held = true
+
+            if held then hold_value(out, "the value it matches", scrutinee)
+        TBlockExpr(block) -> scan_block(out, block)
+        TWhile(cond, body, else_block, _) ->
+            scan_list(out, body, None)
+            scan_opt(out, else_block)
+
+            if awaits_after(body, 0, None) then hold_subjects(out, cond)
+        TDoWhile(body, _, else_block, _) ->
+            scan_list(out, body, None)
+            scan_opt(out, else_block)
+        TLoop(body, _) -> scan_list(out, body, None)
+        TFor(_, _, _, _, _, body, else_block, _) ->
+            scan_list(out, body, None)
+            scan_opt(out, else_block)
+        TCFor(init, cond, step, body, else_block, _) ->
+            val later = awaits_after(step, 0, cond) || awaits_after(body, 0, None)
+
+            if later then hold_all(out, init) else scan_list(out, init, None)
+
+            scan_list(out, step, None)
+            scan_list(out, body, None)
+            scan_opt(out, else_block)
+        TForEach(name, elem_ty, seq, body, else_block, _) ->
+            scan_list(out, body, None)
+            scan_opt(out, else_block)
+
+            if awaits_after(body, 0, None)
+                hold_local(out, name, elem_ty)
+                hold_value(out, "the sequence it walks", seq)
+            end if
+        TIterate(cursor, cursor_ty, _, next, _, body, else_block, _) ->
+            scan_list(out, body, None)
+            scan_opt(out, else_block)
+
+            if awaits_after(body, 0, None)
+                out.hold("the iterator it walks", cursor_ty, None)
+                out.hold("what the iterator handed it", texpr_type(next), None)
+            end if
+        _ -> ()
+end scan_node
+
+// What an `await` holds while it waits: the task awaited, unless that is a name the frame already
+// holds; `yield_now()` holds nothing, and `park(...)` holds the waker it will be handed.
+private awaited(out: &TaskFrame, op: TExpr)
+    *op.kind match
+        TYieldNow -> ()
+        TPark(_) -> out.parks = true
+        TLoad(_, _) -> ()
+        _ -> out.hold("the task it awaits", texpr_type(op), Some(op))
+end awaited
+
+// A value held for a stretch: a name is already one of the frame's, so only a computed value is.
+private hold_value(out: &TaskFrame, desc: string, e: TExpr)
+    *e.kind match
+        TLoad(_, _) -> ()
+        _ -> out.hold(desc, texpr_type(e), Some(e))
+end hold_value
+
+private hold_subjects(out: &TaskFrame, terms: Buf[TCondTerm])
+    for i in 0..<terms.len()
+        terms.at(i) match
+            TCondIs(subject, _, _) -> hold_value(out, "the value it matches", subject)
+            _ -> ()
+end hold_subjects
+
+private hold_all(out: &TaskFrame, stmts: Buf[TStmt])
+    for i in 0..<stmts.len()
+        stmts.at(i) match
+            TVarDecl(name, ty, _, _) -> hold_local(out, name, ty)
+            _ -> ()
+end hold_all
+
+private block_awaits(b: TBlock) -> bool = awaits_after(b.stmts, 0, b.result)
+
+// Whether an `await` is written in `stmts` from `from` on, or in `result`.
+private awaits_after(stmts: Buf[TStmt], from: usize, result: Option[TExpr]) -> bool
+    val seen: &Seen = Seen(false)
+    val v = expr_walk(false, e -> note_await(seen, e))
+
+    for i in from..<stmts.len()
+        walk_stmt(stmts.at(i), v)
+
+    if result.is_some() then walk_texpr(result.unwrap(), v)
+
+    seen.yes
+end awaits_after
+
+private struct Seen
+    yes: bool
+
+private note_await(seen: &Seen, e: TExpr)
+    *e.kind match
+        TAwait(_, _) -> seen.yes = true
+        _ -> ()
+end note_await
+
+// -- the verdict ------------------------------------------------------------------------------------
+
+// Why a task's frame may not cross: the member in the way, and what about it.
+enum Holding
+    HeldPart(member: string, part: Unshareable, member_ty: Type)
+    HeldTask(member: string, path: Buf[string], maker: string, inner: &Holding)
+    HeldUnmade(member: string, path: Buf[string])
+    HeldParks
+end Holding
+
+// What a made task comes to: nothing in the way, a making nothing can see, or the member that is.
+enum TaskAnswer
+    Clear
+    Unmade
+    Holds(maker: string, why: &Holding)
+end TaskAnswer
+
+// The bodies a verdict reads, each body's names read once.
+struct World
+    a: &Analysis
+    tasks: &Table[TFunc]
+    values: &Table[&BodyValues]
+
+    values_of(*self, f: TFunc) -> &BodyValues
+        val known = self.values.get(f.name)
+
+        if known.is_some() then return known.unwrap()
+
+        val made = body_values(self.a, f)
+
+        self.values.put(f.name, made)
+        made
+    end values_of
+end World
+
+private task_answer(w: &World, m: Maker, visiting: Buf[string]) -> TaskAnswer
+    val made = m match
+        Vouched -> return Clear
+        Unseen -> return Unmade
+        MadeBy(key, args, caller) -> (key, args, caller)
+
+    val f = w.tasks.get(made.0)
+
+    if f.is_none() then return Unmade
+    if holds_string(visiting, made.0) then return Clear
+
+    val ctx: &Ctx = Ctx(w.values_of(f.unwrap()), made.1, true, Some(made.2))
+    val why = frame_holding(w, f.unwrap(), ctx, extended(visiting, made.0))
+
+    if why.is_some() then Holds(made.0, why.unwrap()) else Clear
+end task_answer
+
+private frame_holding(w: &World, f: TFunc, ctx: &Ctx, visiting: Buf[string]) -> Option[&Holding]
+    val frame = frame_of(f)
+
+    for i in 0..<frame.members.len()
+        val m = frame.members.at(i)
+        val part = unshareable(m.ty)
+
+        if part.is_some() then return Some(HeldPart(m.desc, part.unwrap(), m.ty))
+        if !holds_task(m.ty) then continue
+
+        val found: &Crossed = Crossed(buf())
+
+        if m.value.is_some() then crossed(m.value.unwrap(), ctx, buf(), found) else found.add(buf(), Unseen)
+
+        for j in 0..<found.found.len()
+            val hit = found.found.at(j)
+
+            task_answer(w, hit.1, visiting) match
+                Clear -> ()
+                Unmade -> return Some(HeldUnmade(m.desc, hit.0))
+                Holds(g, why) -> return Some(HeldTask(m.desc, hit.0, g, why))
+    end for
+
+    if frame.parks then Some(HeldParks) else None
+end frame_holding
+
+// -- the message ------------------------------------------------------------------------------------
+
+private enum Tail
+    TailType(ty: Type)
+    TailUnmade
+    TailParks
+
+private task_shown(key: string) -> string = s"a task of '${qualified_name(key)}'"
+
+private member_at(member: string, path: Buf[string]) -> string =
+    if path.is_empty() then s"$member, " else s"$member, whose '${joined(path, ".")}' is "
+
+// What one frame holds, as the end of a sentence, and what the sentence ends on.
+private holding_text(h: Holding) -> (string, Tail) = h match
+    HeldPart(member, p, mty) ->
+        val what = if p.path.is_empty() && p.ty == mty then s"$member, a '${type_show(p.ty)}'"
+        else if p.path.is_empty() then s"$member, which holds a '${type_show(p.ty)}'"
+        else s"$member, whose '${joined(p.path, ".")}' reaches a '${type_show(p.ty)}'"
+
+        (what, TailType(p.ty))
+    HeldTask(member, path, g, inner) ->
+        val rest = holding_text(*inner)
+
+        (member_at(member, path) + s"${task_shown(g)}, whose frame holds ${rest.0}", rest.1)
+    HeldUnmade(member, path) ->
+        (member_at(member, path) + "a task nothing here says the making of", TailUnmade)
+    HeldParks -> ("the 'park' it awaits", TailParks)
+
+private finished(text: string, tail: Tail) -> string = tail match
+    TailType(ty) -> share_remedy(text + ", ", ty)
+    TailUnmade -> text + unmade_remedy()
+    TailParks ->
+        text + " — a task that parks is handed a waker, and a waker is a '&Fn() -> unit' belonging to " +
+        "the domain whose executor steps the task, so a task that parks stays in that domain"
+
+private unmade_remedy() -> string =
+    " — what a task's frame holds is known only where the call that makes it can be seen, so a task " +
+    "crosses there, or through a parameter its function names in '@crossing'"
+
+// The opening of the sentence: what crossed, as the existing refusal for that place says it.
+private cross_head(kind: CrossKind) -> string = kind match
+    CrossArg(subject) ->
+        s"$subject reaches another concurrency domain, so every count inside it has to be atomic — "
+    CrossClosure ->
+        "a closure shared between two domains may be called from either, so every count it captures " +
+        "has to be atomic — "
+    CrossShared(shown) ->
+        s"'&sync $shown' may be reached from two domains at once, so every count inside it has to be " +
+        "atomic — "
+
+private cross_subject(kind: CrossKind, path: Buf[string]) -> string = kind match
+    CrossClosure -> s"the '${joined(path, ".")}' it captures"
+    _ -> if path.is_empty() then "it" else s"its '${joined(path, ".")}'"
+
+private cross_message(kind: CrossKind, path: Buf[string], key: string, why: Holding) -> string
+    val said = holding_text(why)
+    val head = cross_head(kind) + s"but ${cross_subject(kind, path)} is ${task_shown(key)}, " +
+               s"whose frame holds ${said.0}"
+
+    finished(head, said.1)
+end cross_message
+
+private unmade_message(kind: CrossKind, path: Buf[string]) -> string =
+    cross_head(kind) + s"but ${cross_subject(kind, path)} is a task, and nothing here says which " +
+    "async function made it" + unmade_remedy()
+
+// -- settling -----------------------------------------------------------------------------------------
+
+// Answers every crossing noted while the bodies were typed, now that every body is.
+check_task_crossings(a: &Analysis, funcs: Buf[TFunc])
+    if a.task_crossings.is_empty() then return
+
+    val w: &World = World(a, table(), table())
+
+    for i in 0..<funcs.len()
+        if funcs.at(i).marks.is_async() then w.tasks.put(funcs.at(i).name, funcs.at(i))
+
+    var said: Buf[(string, usize, usize)] = buf()
+
+    for i in 0..<a.task_crossings.len()
+        val c = a.task_crossings.at(i)
+        val at = (c.scope.src.name, c.span.start, c.span.end)
+
+        if said_at(said, at) then continue
+
+        said.push(at)
+
+        // A value no body is found to hold is still followed as far as it goes without one, a name
+        // it reads then being something nothing here says the making of.
+        val home = body_holding(a, funcs, c)
+        val values = if home.is_some() then w.values_of(home.unwrap()) else no_values()
+        val ctx: &Ctx = Ctx(values, buf(), false, None)
+        val found: &Crossed = Crossed(buf())
+
+        crossed(c.value, ctx, buf(), found)
+
+        for j in 0..<found.found.len()
+            val hit = found.found.at(j)
+            val why = task_answer(w, hit.1, buf()) match
+                Clear -> None
+                Unmade -> Some(unmade_message(c.kind, hit.0))
+                Holds(g, h) -> Some(cross_message(c.kind, hit.0, g, *h))
+
+            if why.is_some()
+                a.fault(c.scope, c.span, why.unwrap())
+                break
+            end if
+        end for
+    end for
+
+    a.task_crossings = buf()
+end check_task_crossings
+
+private said_at(said: Buf[(string, usize, usize)], at: (string, usize, usize)) -> bool
+    for i in 0..<said.len()
+        val s = said.at(i)
+
+        if s.0 == at.0 && s.1 == at.1 && s.2 == at.2 then return true
+
+    false
+end said_at
+
+// The typed body a crossing was written in: one holding an expression of the value's type at the
+// value's span. A body that says which file it is from is asked first, where it is the crossing's
+// file; then the bodies that say nothing, from the last -- the entry file's statements are the last
+// body there is, and a closure's body never holds the expression that formed it.
+private body_holding(a: &Analysis, funcs: Buf[TFunc], c: TaskCross) -> Option[TFunc]
+    for i in 0..<funcs.len()
+        val home = a.tables.homes.get(funcs.at(i).name)
+
+        val same_file = home.is_some() && home.unwrap().src.name == c.scope.src.name
+
+        if same_file && holds_value(funcs.at(i), c.value) then return Some(funcs.at(i))
+    end for
+
+    var i = funcs.len()
+
+    while i > 0
+        i -= 1
+
+        if a.tables.homes.get(funcs.at(i).name).is_none() && holds_value(funcs.at(i), c.value) then
+            return Some(funcs.at(i))
+    end while
+
+    None
+end body_holding
+
+private holds_value(f: TFunc, value: TExpr) -> bool
+    val seen: &Seen = Seen(false)
+    val shown = type_show(texpr_type(value))
+
+    walk_block_stmts(f.body, expr_walk(false, e -> note_span(seen, e, value.span, shown)))
+    seen.yes
+end holds_value
+
+private note_span(seen: &Seen, e: TExpr, span: Span, shown: string)
+    if e.span == span && type_show(texpr_type(e)) == shown then seen.yes = true

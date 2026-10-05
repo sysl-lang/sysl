@@ -515,12 +515,17 @@ private task_hook_text(e: *Emit) -> string =
 // tells the executor about the task it holds. The slot is saved and put back around a step, so a step
 // inside a task being stepped is its own.
 //
-// It is one word pair rather than a thread's: waking happens in the executor's own context.
+// **It is a thread's own where the target has thread-local storage**, as `block_on`'s note is: a task
+// handed to another thread is stepped there by an executor of its own, and two threads stepping at
+// once would otherwise each read the other's waker. A target with none has one slot.
+
+// `thread_local ` where the target keeps storage per thread, and nothing where it does not.
+private task_tls(e: *Emit) -> string = if e.target.thread_local_storage() then "thread_local " else ""
 
 // The waker of the step in progress, `{ table, box }` as any `&Fn() -> unit` is; null outside one.
 private request_current(e: *Emit)
     request_helper(e, "sysl.task.current", HrText(
-        "@sysl.task.current = internal global { ptr, ptr } zeroinitializer\n"))
+        s"@sysl.task.current = internal ${task_tls(e)}global { ptr, ptr } zeroinitializer\n"))
 
 // `step`'s runtime, with the slot it sets; answers its name.
 private request_stepping(e: *Emit) -> string
@@ -563,8 +568,8 @@ private task_step_text(e: *Emit) -> string =
 private task_drive_text(e: *Emit) -> string
     val w = s"i${e.word_bits}"
 
-    s"@sysl.task.woken = internal global i1 false\n" +
-    s"@sysl.task.noted = internal global { $w, ptr, $w } { $w 1, ptr null, $w 1 }\n" +
+    s"@sysl.task.woken = internal ${task_tls(e)}global i1 false\n" +
+    s"@sysl.task.noted = internal ${task_tls(e)}global { $w, ptr, $w } { $w 1, ptr null, $w 1 }\n" +
     s"@sysl.task.noter = private constant { $w, [1 x ptr] } { $w 0, [1 x ptr] [ptr @sysl.task.note] }\n" +
     "\n" +
     "define private void @sysl.task.note(ptr %d) {\n" +
