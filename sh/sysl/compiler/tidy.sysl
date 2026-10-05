@@ -25,39 +25,41 @@ import sysl.text.Search
 // manifests, so a project that cannot be built on this machine can still be tidied.
 tidy_command(args: []string, say: string -> unit) -> int =
     tidy_arguments(args) match
-        None ->
-            say(tidy_usage())
+        Err(mistakes) ->
+            say(if mistakes.len() > 0 then misused(mistakes, tidy_usage()) else tidy_usage())
             Misused
-        Some(read) -> tidy_project(read.0, read.1, say)
+        Ok(read) -> tidy_project(read.0, read.1, say)
 
 // What a `sysl tidy` command line asks for: the project, which is the working directory where no path
-// is given, and whether it is `--check`. A `--lib` and the other search flags are taken on the way.
-tidy_arguments(args: []string) -> Option[(string, bool)]
+// is given, and whether it is `--check`. A `--lib` and the flags every command takes are taken on the
+// way. `Err` carries the mistakes in the command line, and is empty where the mistake is a second
+// path.
+tidy_arguments(args: []string) -> Result[(string, bool), Buf[string]]
     var path = "."
     var given = false
     var check = false
+    var mistakes: Buf[string] = buf()
     var i: usize = 2
 
     while i < args.len
-        val took = took_search_flag(args, i)
-
-        if took == 0 then return None
-
-        if took > 0
-            i += usize(took)
-            continue
-
         if args[i] == "--check"
             check = true
-        else if !given && !args[i].starts_with("-")
-            path = args[i]
-            given = true
         else
-            return None
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken > 0
+                i += taken - 1
+            else if given
+                return Err(mistakes)
+            else
+                path = args[i]
+                given = true
 
         i += 1
 
-    Some((path, check))
+    if mistakes.len() > 0 then return Err(mistakes)
+
+    Ok((path, check))
 end tidy_arguments
 
 private tidy_usage() -> string = "usage: sysl tidy [--check] [<path>]"

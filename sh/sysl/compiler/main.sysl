@@ -54,13 +54,22 @@ run_cli_noted(args: []string, say: string -> unit, note: string -> unit) -> int
             return Misused
         None -> ()
 
+    // `--help` and `--version` are options of every command, as the reference's parser has them,
+    // answered wherever they are written up to a `--`, past which a program's own arguments start.
+    // `doc` keeps its own `--help`, which prints its own usage.
+    val outright = if args[1] == "doc" then args[1] else asked_outright(args)
+
+    if outright == "--version"
+        say(s"sysl ${Version}")
+        return Fine
+    end if
+
+    if outright == "--help"
+        say(usage())
+        return Fine
+    end if
+
     args[1] match
-        "--version" ->
-            say(s"sysl ${Version}")
-            Fine
-        "--help" ->
-            say(usage())
-            Fine
         "emit-ast" -> emit_ast_command(args, say)
         "emit-typed" -> emit_typed_command(args, say)
         "emit-llvm" -> emit_llvm_command(args, say)
@@ -89,15 +98,26 @@ run_cli_noted(args: []string, say: string -> unit, note: string -> unit) -> int
 private emit_ast_command(args: []string, say: string -> unit) -> int
     var spans = true
     var file = ""
+    var mistakes: Buf[string] = buf()
+    var i: usize = 2
 
-    for i in 2..<args.len
+    while i < args.len
         if args[i] == "--no-spans"
             spans = false
         else
-            file = args[i]
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken == 0 then file = args[i] else i += taken - 1
+
+        i += 1
+
+    if mistakes.len() > 0
+        say(misused(mistakes, emit_ast_usage()))
+        return Misused
+    end if
 
     if file == ""
-        say("usage: sysl emit-ast [--no-spans] <file>")
+        say(emit_ast_usage())
         return Misused
 
     read_text(file) match
@@ -119,6 +139,8 @@ private emit_ast_command(args: []string, say: string -> unit) -> int
             Fine
 end emit_ast_command
 
+private emit_ast_usage() -> string = "usage: sysl emit-ast [--no-spans] <file>"
+
 // `sysl emit-typed [--no-spans] [--tables] [--target <name>] [--lib <dir>] <path>` -- one whole program's typed
 // tree, or its declaration tables.
 //
@@ -130,6 +152,7 @@ private emit_typed_command(args: []string, say: string -> unit) -> int
     var tables = false
     var named: Option[string] = None
     var file = ""
+    var mistakes: Buf[string] = buf()
     var i: usize = 2
 
     while i < args.len
@@ -139,8 +162,8 @@ private emit_typed_command(args: []string, say: string -> unit) -> int
         val took = took_search_flag(args, i)
 
         if took == 0
-            say(emit_typed_usage())
-            return Misused
+            mistakes.push(missing_value(args[i]))
+            break
         end if
 
         if took > 0
@@ -154,16 +177,23 @@ private emit_typed_command(args: []string, say: string -> unit) -> int
             tables = tables
         else if args[i] == "--target"
             if i + 1 >= args.len
-                say(emit_typed_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             i += 1
             named = Some(args[i])
         else
-            file = args[i]
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken == 0 then file = args[i] else i += taken - 1
 
         i += 1
+
+    if mistakes.len() > 0
+        say(misused(mistakes, emit_typed_usage()))
+        return Misused
+    end if
 
     if file == ""
         say(emit_typed_usage())
@@ -206,22 +236,23 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
     var level: Option[string] = None
     var gaps = false
     var file = ""
+    var mistakes: Buf[string] = buf()
     var i: usize = 2
 
     while i < args.len
         val took = took_search_flag(args, i)
 
         if took == 0
-            say(emit_llvm_usage())
-            return Misused
+            mistakes.push(missing_value(args[i]))
+            break
         end if
 
         if took > 0
             if took == 2 then i += 1
         else if args[i] == "--target"
             if i + 1 >= args.len
-                say(emit_llvm_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             i += 1
@@ -232,17 +263,24 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
             val given = took_level(args, i)
 
             if given.0 < 0
-                say(emit_llvm_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             level = Some(given.1)
 
             if given.0 == 2 then i += 1
         else
-            file = args[i]
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken == 0 then file = args[i] else i += taken - 1
 
         i += 1
+
+    if mistakes.len() > 0
+        say(misused(mistakes, emit_llvm_usage()))
+        return Misused
+    end if
 
     if file == ""
         say(emit_llvm_usage())
@@ -296,21 +334,22 @@ private build_command(args: []string, say: string -> unit) -> int
     var out: Option[string] = None
     var level: Option[string] = None
     var file = ""
+    var mistakes: Buf[string] = buf()
     var i: usize = 2
 
     while i < args.len
         val took = took_search_flag(args, i)
 
         if took == 0
-            say(build_usage())
-            return Misused
+            mistakes.push(missing_value(args[i]))
+            break
         end if
 
         val featured = took_feature_flag(args, i)
 
         if featured == 0
-            say(build_usage())
-            return Misused
+            mistakes.push(missing_value(args[i]))
+            break
         end if
 
         if took > 0
@@ -319,8 +358,8 @@ private build_command(args: []string, say: string -> unit) -> int
             if featured == 2 then i += 1
         else if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o"
             if i + 1 >= args.len
-                say(build_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             val flag = args[i]
@@ -334,17 +373,24 @@ private build_command(args: []string, say: string -> unit) -> int
             val given = took_level(args, i)
 
             if given.0 < 0
-                say(build_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             level = Some(given.1)
 
             if given.0 == 2 then i += 1
         else
-            file = args[i]
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken == 0 then file = args[i] else i += taken - 1
 
         i += 1
+
+    if mistakes.len() > 0
+        say(misused(mistakes, build_usage()))
+        return Misused
+    end if
 
     if file == ""
         say(build_usage())
@@ -376,6 +422,76 @@ const RefusalLead: string = "sysl: error: "
 
 // A refusal about the command, introduced as the reference introduces one.
 refused(why: string) -> string = RefusalLead + why
+
+// How a mistake in the command line ITSELF is introduced -- an option no command takes, a flag with
+// nothing after it -- in the reference's option parser's words, which are not a Unix tool's: one
+// line per mistake, then how the command is written, and the status `Misused`. `main` sends the
+// whole of it to standard error, as the reference does.
+const OptionLead: string = "Error: "
+
+unknown_option(arg: string) -> string = OptionLead + s"Unknown option $arg"
+
+missing_value(flag: string) -> string = OptionLead + s"Missing value after $flag"
+
+// The mistakes a command line held, one to a line, with the usage under them -- said as one piece,
+// so that all of it goes to the stream its first line chooses.
+misused(mistakes: Buf[string], usage: string) -> string
+    var text = ""
+
+    for i in 0..<mistakes.len()
+        text = text + mistakes.at(i) + "\n"
+
+    text + usage
+end misused
+
+// An argument none of a command's own flags took, read as the reference's parser reads it: how many
+// arguments it took, with `0` for a positional one, which is the caller's to keep.
+//
+// **A flag the reference takes on EVERY command is taken here whether or not the command does
+// anything with it** -- the search flags, `--target`, `--cc` and a level, which the reference
+// accepts after `emit-ast` as readily as after `build`. Anything else spelled as an option is a
+// mistake, pushed onto `mistakes`, and so is one of those flags with nothing after it. A lone `-`
+// is not an option: it is a path.
+//
+// It is asked only AFTER a command's own readers have passed an argument by, so a flag a command
+// learns to read is read by that command and never arrives here.
+took_any_command_flag(args: []string, i: usize, mistakes: *Buf[string]) -> usize
+    val arg = args[i]
+    val searched = took_search_flag(args, i)
+
+    if searched > 0 then return usize(searched)
+
+    val level = took_level(args, i)
+
+    if level.0 > 0 then return usize(level.0)
+
+    val valued = arg == "--target" || arg == "--cc"
+
+    if valued && i + 1 < args.len then return 2
+
+    if searched == 0 || level.0 < 0 || valued
+        mistakes.push(missing_value(arg))
+        return 1
+    end if
+
+    if arg.len > 1 && arg.starts_with("-")
+        mistakes.push(unknown_option(arg))
+        return 1
+    end if
+
+    0
+end took_any_command_flag
+
+// Which of `--help` and `--version` a command line asks for outright, wherever it is written up to a
+// `--`, and the empty string where it asks for neither.
+private asked_outright(args: []string) -> string
+    for i in 1..<args.len
+        if args[i] == "--" then return ""
+
+        if args[i] == "--help" || args[i] == "--version" then return args[i]
+
+    ""
+end asked_outright
 
 // The one place a command's failure becomes output, and the two kinds are printed differently
 // **because only one of them is a sentence**: a refusal about the project has no `error: ` on it and
@@ -425,6 +541,7 @@ private build_c_command(args: []string, say: string -> unit) -> int
     var level: Option[string] = None
     var lto: Option[string] = None
     var file = ""
+    var mistakes: Buf[string] = buf()
     var i: usize = 2
 
     while i < args.len
@@ -433,8 +550,8 @@ private build_c_command(args: []string, say: string -> unit) -> int
         val featured = took_feature_flag(args, i)
 
         if took == 0 || featured == 0
-            say(build_c_usage())
-            return Misused
+            mistakes.push(missing_value(args[i]))
+            break
         end if
 
         if took > 0
@@ -444,8 +561,8 @@ private build_c_command(args: []string, say: string -> unit) -> int
         else if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o" || args[i] == "--header" ||
                 args[i] == "--lto"
             if i + 1 >= args.len
-                say(build_c_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             val flag = args[i]
@@ -471,17 +588,24 @@ private build_c_command(args: []string, say: string -> unit) -> int
             val given = took_level(args, i)
 
             if given.0 < 0
-                say(build_c_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             level = Some(given.1)
 
             if given.0 == 2 then i += 1
         else
-            file = args[i]
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken == 0 then file = args[i] else i += taken - 1
 
         i += 1
+
+    if mistakes.len() > 0
+        say(misused(mistakes, build_c_usage()))
+        return Misused
+    end if
 
     if file == ""
         say(build_c_usage())
@@ -516,36 +640,40 @@ private build_c_usage() -> string =
 private emit_header_command(args: []string, say: string -> unit) -> int
     var named: Option[string] = None
     var file = ""
+    var mistakes: Buf[string] = buf()
     var i: usize = 2
 
     while i < args.len
         val took = took_search_flag(args, i)
 
         if took == 0
-            say(emit_header_usage())
-            return Misused
+            mistakes.push(missing_value(args[i]))
+            break
         end if
 
         if took > 0
             if took == 2 then i += 1
         else if args[i] == "--target"
             if i + 1 >= args.len
-                say(emit_header_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             i += 1
             named = Some(args[i])
-        else if args[i].starts_with("--")
-            // An option this command does not take, the feature flags among them: it prints a
-            // header and resolves no request.
-            say(s"Error: Unknown option ${args[i]}")
-            say(emit_header_usage())
-            return Misused
         else
-            file = args[i]
+            // An option this command does not take -- the feature flags among them, since it prints
+            // a header and resolves no request -- is a mistake told there.
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken == 0 then file = args[i] else i += taken - 1
 
         i += 1
+
+    if mistakes.len() > 0
+        say(misused(mistakes, emit_header_usage()))
+        return Misused
+    end if
 
     if file == ""
         say(emit_header_usage())
@@ -577,6 +705,7 @@ private run_command(args: []string, say: string -> unit) -> int
     var file = ""
     var forwarding = false
     var program_args: Buf[string] = buf()
+    var mistakes: Buf[string] = buf()
     var i: usize = 2
 
     while i < args.len
@@ -590,8 +719,8 @@ private run_command(args: []string, say: string -> unit) -> int
             val featured = took_feature_flag(args, i)
 
             if took == 0 || featured == 0
-                say(run_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             if took > 0
@@ -600,8 +729,8 @@ private run_command(args: []string, say: string -> unit) -> int
                 if featured == 2 then i += 1
             else if args[i] == "--target" || args[i] == "--cc"
                 if i + 1 >= args.len
-                    say(run_usage())
-                    return Misused
+                    mistakes.push(missing_value(args[i]))
+                    break
                 end if
 
                 val flag = args[i]
@@ -613,17 +742,25 @@ private run_command(args: []string, say: string -> unit) -> int
                 val given = took_level(args, i)
 
                 if given.0 < 0
-                    say(run_usage())
-                    return Misused
+                    mistakes.push(missing_value(args[i]))
+                    break
                 end if
 
                 level = Some(given.1)
 
                 if given.0 == 2 then i += 1
             else
-                file = args[i]
+                // Only ahead of the `--`: what comes after it is the program's, options and all.
+                val taken = took_any_command_flag(args, i, &mistakes)
+
+                if taken == 0 then file = args[i] else i += taken - 1
 
         i += 1
+
+    if mistakes.len() > 0
+        say(misused(mistakes, run_usage()))
+        return Misused
+    end if
 
     if file == ""
         say(run_usage())
@@ -674,6 +811,7 @@ private test_command(args: []string, say: string -> unit) -> int
     var std = false
     var named_level: Option[string] = None
     var file = ""
+    var mistakes: Buf[string] = buf()
     var i: usize = 2
 
     while i < args.len
@@ -681,8 +819,8 @@ private test_command(args: []string, say: string -> unit) -> int
         val featured = took_feature_flag(args, i)
 
         if took == 0 || featured == 0
-            say(test_usage())
-            return Misused
+            mistakes.push(missing_value(args[i]))
+            break
         end if
 
         if took > 0
@@ -691,8 +829,8 @@ private test_command(args: []string, say: string -> unit) -> int
             if featured == 2 then i += 1
         else if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter"
             if i + 1 >= args.len
-                say(test_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             val flag = args[i]
@@ -710,17 +848,24 @@ private test_command(args: []string, say: string -> unit) -> int
             val given = took_level(args, i)
 
             if given.0 < 0
-                say(test_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             named_level = Some(given.1)
 
             if given.0 == 2 then i += 1
         else
-            file = args[i]
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken == 0 then file = args[i] else i += taken - 1
 
         i += 1
+
+    if mistakes.len() > 0
+        say(misused(mistakes, test_usage()))
+        return Misused
+    end if
 
     if file == ""
         say(test_usage())
@@ -841,14 +986,15 @@ private build_lib_command(args: []string, say: string -> unit) -> int
     var level: Option[string] = None
     var std = false
     var file = ""
+    var mistakes: Buf[string] = buf()
     var i: usize = 2
 
     while i < args.len
         val took = took_search_flag(args, i)
 
         if took == 0
-            say(build_lib_usage())
-            return Misused
+            mistakes.push(missing_value(args[i]))
+            break
         end if
 
         if took > 0
@@ -858,8 +1004,8 @@ private build_lib_command(args: []string, say: string -> unit) -> int
             return Misused
         else if args[i] == "--target"
             if i + 1 >= args.len
-                say(build_lib_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             i += 1
@@ -870,23 +1016,26 @@ private build_lib_command(args: []string, say: string -> unit) -> int
             val given = took_level(args, i)
 
             if given.0 < 0
-                say(build_lib_usage())
-                return Misused
+                mistakes.push(missing_value(args[i]))
+                break
             end if
 
             level = Some(given.1)
 
             if given.0 == 2 then i += 1
-        else if args[i].starts_with("--")
+        else
             // An option this command does not take -- the feature flags among them, `build-lib`
             // resolving no graph -- is the command line's mistake, as the reference's parser says.
-            say(s"Error: Unknown option ${args[i]}")
-            say(build_lib_usage())
-            return Misused
-        else
-            file = args[i]
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken == 0 then file = args[i] else i += taken - 1
 
         i += 1
+
+    if mistakes.len() > 0
+        say(misused(mistakes, build_lib_usage()))
+        return Misused
+    end if
 
     if file == ""
         say(build_lib_usage())
@@ -951,10 +1100,14 @@ private add_command(args: []string, say: string -> unit) -> int
     var spec = ""
     var root = "."
     var extra: usize = 0
+    var mistakes: Buf[string] = buf()
     var i: usize = 2
 
     while i < args.len
-        if spec.is_empty() then spec = args[i]
+        val taken = took_any_command_flag(args, i, &mistakes)
+
+        if taken > 0 then i += taken - 1
+        else if spec.is_empty() then spec = args[i]
         else if extra == 0
             root = args[i]
             extra += 1
@@ -963,6 +1116,11 @@ private add_command(args: []string, say: string -> unit) -> int
             return Misused
 
         i += 1
+
+    if mistakes.len() > 0
+        say(misused(mistakes, add_usage()))
+        return Misused
+    end if
 
     if spec.is_empty()
         say(add_usage())
@@ -985,11 +1143,44 @@ private add_usage() -> string = "usage: sysl add <coordinate>[@<version>] [<path
 // target: nothing in it asks anything of a machine, so a project pinned to one this machine cannot
 // build for is still inspectable.
 private deps_command(args: []string, say: string -> unit) -> int
-    if args.len != 3
+    var root = ""
+    var paths: usize = 0
+    var mistakes: Buf[string] = buf()
+    var i: usize = 2
+
+    // The graph listed is the one a build resolves, so the feature flags choose it here as there.
+    while i < args.len
+        val featured = took_feature_flag(args, i)
+
+        if featured == 0
+            mistakes.push(missing_value(args[i]))
+            break
+        end if
+
+        if featured > 0
+            if featured == 2 then i += 1
+        else
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken > 0
+                i += taken - 1
+            else
+                root = args[i]
+                paths += 1
+
+        i += 1
+
+    if mistakes.len() > 0
+        say(misused(mistakes, deps_usage()))
+        return Misused
+    end if
+
+    if paths != 1
         say(deps_usage())
         return Misused
+    end if
 
-    val root = args[2]
+    if refused_features(say) then return Failed
 
     val m = manifest_of_package(root) match
         Err(why) ->
@@ -1008,7 +1199,7 @@ private deps_command(args: []string, say: string -> unit) -> int
             Fine
 end deps_command
 
-private deps_usage() -> string = "usage: sysl deps <path>"
+private deps_usage() -> string = "usage: sysl deps " + feature_flags() + " <path>"
 
 usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <file> | " +
     "emit-typed [--no-spans] [--tables] [--target <name>] <path> | " +
@@ -1024,10 +1215,12 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     ": a feature of the root project to turn on beside 'default', comma-separated and repeatable; " +
     "leave the root's 'default' feature off; turn on every feature the root's manifest declares"
 
-// Where `main` writes one line: a refusal about the command goes to standard error, as the
-// reference writes it, and everything else to standard output.
+// Where `main` writes one line: a refusal about the command, and a mistake in the command line with
+// the usage under it, go to standard error, as the reference writes them, and everything else to
+// standard output.
 private said_to_terminal(line: string)
-    if line.starts_with(RefusalLead) then eprints(line + "\n") else print(line)
+    if line.starts_with(RefusalLead) || line.starts_with(OptionLead) then eprints(line + "\n")
+    else print(line)
 
 main(args: []string)
     val code = run_cli_noted(args, said_to_terminal, line -> eprints(line + "\n"))

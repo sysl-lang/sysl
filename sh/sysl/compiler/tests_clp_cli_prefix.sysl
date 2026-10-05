@@ -2,8 +2,10 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
-import sysl.text.{join, Search}
+import sysl.process.capture
+import sysl.text.{join, split, Search}
 
 // A refusal about the command is introduced by the binary's own name, `sysl: error: `, as the
 // reference introduces one, and a source diagnostic anchored at a file is not. `main` sends a line
@@ -57,3 +59,242 @@ clp_a_source_diagnostic_carries_no_lead()
     assert_eq(got.1, s"error: expression expected\n --> $file:2:1\n  |\n2 | \n  | ^")
     assert(!got.1.starts_with(RefusalLead), got.1)
     remove_dir_all(dir).unwrap_or(())
+
+// -- options no command takes ----------------------------------------------------------------------
+//
+// A command line the option reader cannot make sense of is told in the reference's own words --
+// `Error: Unknown option <flag>` or `Error: Missing value after <flag>`, one line per mistake -- with
+// the command's usage under them, and exits 2. Before, an unknown flag was taken for the path and a
+// typo such as `--relase` did nothing and said nothing.
+
+private val clp_commands: [3]string = ["build", "test", "run"]
+
+@test("an unknown long option is refused by build, test and run, in the reference's words")
+clp_an_unknown_long_option_is_refused()
+    for command in clp_commands
+        val got = clp_run(["sysl", command, "/does/not/matter", "--frobnicate"])
+
+        assert_eq(got.0, Misused, got.1)
+        assert(got.1.starts_with(s"Error: Unknown option --frobnicate\nusage: sysl $command "), got.1)
+
+@test("an unknown short option is refused by build, test and run")
+clp_an_unknown_short_option_is_refused()
+    for command in clp_commands
+        val got = clp_run(["sysl", command, "/does/not/matter", "-x"])
+
+        assert_eq(got.0, Misused, got.1)
+        assert(got.1.starts_with(s"Error: Unknown option -x\nusage: sysl $command "), got.1)
+
+@test("an unknown option ahead of the path is not taken for the path")
+clp_an_unknown_option_ahead_of_the_path()
+    val got = clp_run(["sysl", "build", "--relase", "/does/not/matter"])
+
+    assert_eq(got.0, Misused, got.1)
+    assert(got.1.starts_with("Error: Unknown option --relase\nusage: sysl build "), got.1)
+
+@test("every unknown option is named, one to a line, with the usage once under them")
+clp_every_unknown_option_is_named()
+    val got = clp_run(["sysl", "test", "/does/not/matter", "--frob", "-x"])
+
+    assert_eq(got.0, Misused, got.1)
+    assert(got.1.starts_with("Error: Unknown option --frob\nError: Unknown option -x\nusage: sysl test "),
+           got.1)
+    assert_eq(split(got.1, "usage:").len, 2)
+
+@test("an option another command takes is unknown to one that does not: -o on test")
+clp_another_commands_option_is_unknown()
+    val got = clp_run(["sysl", "test", "/does/not/matter", "-o", "foo"])
+
+    assert_eq(got.0, Misused, got.1)
+    assert(got.1.starts_with("Error: Unknown option -o\nusage: sysl test "), got.1)
+
+@test("an option with nothing after it is a missing value, in the reference's words")
+clp_a_missing_value_is_named()
+    for command in clp_commands
+        val got = clp_run(["sysl", command, "/does/not/matter", "--target"])
+
+        assert_eq(got.0, Misused, got.1)
+        assert(got.1.starts_with(s"Error: Missing value after --target\nusage: sysl $command "), got.1)
+
+    val filter = clp_run(["sysl", "test", "/does/not/matter", "--filter"])
+
+    assert(filter.1.starts_with("Error: Missing value after --filter\n"), filter.1)
+
+    val features = clp_run(["sysl", "build", "/does/not/matter", "--features"])
+
+    assert(features.1.starts_with("Error: Missing value after --features\n"), features.1)
+
+@test("a valid option is still taken, and the command goes on to the path")
+clp_a_valid_option_is_still_taken()
+    for command in clp_commands
+        val got = clp_run(["sysl", command, "/does/not/exist/clp", "-O2", "--target", "aarch64-macos"])
+
+        assert_eq(got.0, Failed, got.1)
+        assert(got.1.starts_with(RefusalLead), got.1)
+
+@test("a lone '-' is a path, not an option")
+clp_a_lone_dash_is_a_path()
+    val got = clp_run(["sysl", "build", "-"])
+
+    assert_eq(got.0, Failed, got.1)
+    assert(got.1.index_of("Unknown option").is_none(), got.1)
+
+@test("an option every command takes is taken by one that does nothing with it, as the reference's is")
+clp_an_any_command_option_is_taken_everywhere()
+    val got = clp_run(["sysl", "tidy", "/does/not/exist/clp", "--cc", "/x", "-O2", "--target", "wasm32"])
+
+    assert_eq(got.0, Failed, got.1)
+    assert(got.1.index_of("Unknown option").is_none(), got.1)
+
+@test("--help after a command answers with the usage, and --version with the version")
+clp_help_after_a_command()
+    val help = clp_run(["sysl", "build", "/does/not/matter", "--help"])
+    val version = clp_run(["sysl", "test", "--version"])
+
+    assert_eq(help.0, Fine, help.1)
+    assert(help.1.starts_with("usage: sysl --version | --help"), help.1)
+    assert_eq(version.0, Fine, version.1)
+    assert_eq(version.1, s"sysl ${Version}")
+
+@test("emit-header and build-lib name an unknown option in the same words")
+clp_emit_header_and_build_lib_agree()
+    for command in ["emit-header", "build-lib", "emit-ast", "emit-typed", "emit-llvm", "build-c", "deps",
+                    "tidy"]
+        val got = clp_run(["sysl", command, "/does/not/matter", "--frob"])
+
+        assert_eq(got.0, Misused, s"$command: ${got.1}")
+        assert(got.1.starts_with(s"Error: Unknown option --frob\nusage: sysl $command"), got.1)
+
+    val added = clp_run(["sysl", "add", "github.com/sysl-lang/clp", "--frob"])
+
+    assert_eq(added.0, Misused, added.1)
+    assert(added.1.starts_with("Error: Unknown option --frob\nusage: sysl add "), added.1)
+
+// What comes after `--` is the program's, options and `--help` among them, and reaches it untouched.
+// The program exits 0 only where it was handed exactly those four.
+@test("a run's arguments after '--' reach the program, those spelled as options included")
+clp_program_arguments_after_the_separator()
+    if !(std_root().is_ok() && clang_available()) then return
+
+    val dir = make_temp_dir("sysl-clp-run-").unwrap()
+    val file = s"$dir/main.sysl"
+
+    write_text(file, "main(args: []string)\n" +
+        "    val want = [\"--frob\", \"-x\", \"-\", \"--help\"]\n" +
+        "    if args.len != 5 then exit(3)\n" +
+        "    for i in 0..<4\n" +
+        "        if args[i + 1] != want[i] then exit(4)\n").unwrap()
+
+    val got = clp_run(["sysl", "run", file, "--", "--frob", "-x", "-", "--help"])
+
+    assert_eq(got.0, 0, got.1)
+
+    val ahead = clp_run(["sysl", "run", file, "--frob", "--", "-x"])
+
+    assert_eq(ahead.0, Misused, ahead.1)
+    assert(ahead.1.starts_with("Error: Unknown option --frob\nusage: sysl run "), ahead.1)
+    remove_dir_all(dir).unwrap_or(())
+
+// -- every option the reference documents is still taken -------------------------------------------
+//
+// The reference's own `--help` is read, section by section, and every option it lists for a command
+// this compiler carries -- the command's own and those "which any command takes" -- is handed to that
+// command. None may be answered with `Unknown option` or `Missing value`, so an option this change
+// wrongly refused shows up by name.
+
+// The commands of the reference this compiler carries.
+private val clp_carried: [12]string = ["run", "build", "build-lib", "build-c", "emit-header", "test",
+                                       "emit-llvm", "emit-ast", "emit-typed", "deps", "add", "tidy"]
+
+// Options the reference documents that are not on this compiler yet: `--ar` names an archive, the
+// retired shape, and the link-time and profile-guided flags (`--lto` beyond build-c's,
+// `--profile-generate`, `--profile-use`, and `--output` on build and build-c) arrive with the work
+// that builds them.
+private clp_not_here(command: string, flag: string) -> bool =
+    flag == "--ar" || flag == "--profile-generate" || flag == "--profile-use" ||
+    (flag == "--lto" && command != "build-c") || (flag == "--output" && command != "build-lib")
+
+// A value the flag takes, of the kind it takes.
+private clp_value_for(flag: string) -> string
+    if flag == "--target" then return "aarch64-macos"
+    if flag == "-O" || flag == "--optimize" then return "1"
+    if flag == "--link" then return "dynamic"
+    if flag == "--lto" then return "thin"
+
+    "x"
+end clp_value_for
+
+// One option line of the reference's usage -- `-o, --output <value>   …` -- as its spellings and
+// whether it takes a value.
+private clp_option_line(line: string) -> (Buf[string], bool)
+    var flags: Buf[string] = buf()
+    var valued = false
+
+    for word in split(line.trim(), " ")
+        if word.starts_with("-")
+            flags.push(if word.ends_with(",") then word[0..<(word.len - 1)] else word)
+        else if word == "<value>" && flags.len() > 0
+            valued = true
+            break
+        else if !word.is_empty()
+            break
+
+    (flags, valued)
+end clp_option_line
+
+@test("every option the reference documents for a command this compiler carries is still taken")
+clp_every_documented_option_is_taken()
+    val oracle = env_var("SYSL_ORACLE") match
+        None ->
+            print("skipped: SYSL_ORACLE names no reference compiler")
+            return
+        Some(binary) -> binary
+
+    val text = capture(oracle, ["--help"]) match
+        Err(_) -> ""
+        Ok(answer) -> answer.text
+
+    // (command, flag, takes a value), with "" for an option every command takes.
+    var options: Buf[(string, string, bool)] = buf()
+    var section = ""
+
+    for line in split(text, "\n")
+        if line.starts_with("Command: ")
+            section = split(line, " ")[1]
+        else if line.starts_with("Options, which any command takes")
+            section = ""
+        else if line.trim().starts_with("-")
+            val read = clp_option_line(line)
+
+            for k in 0..<read.0.len()
+                options.push((section, read.0.at(k), read.1))
+
+    var asked: usize = 0
+
+    for command in clp_carried
+        for k in 0..<options.len()
+            val (owner, flag, valued) = options.at(k)
+
+            if (owner == "" || owner == command) && !clp_not_here(command, flag)
+                var line: Buf[string] = buf()
+
+                line.push("sysl")
+                line.push(command)
+
+                if command == "add" then line.push("github.com/sysl-lang/clp")
+
+                line.push("/does/not/exist/clp")
+                line.push(flag)
+
+                if valued then line.push(clp_value_for(flag))
+
+                val got = clp_run(line.view())
+
+                assert(got.1.index_of("Unknown option").is_none() && got.1.index_of("Missing value").is_none(),
+                       s"$command $flag: ${got.1}")
+                asked += 1
+
+    // The reference lists twenty-odd options for every command; a reading that found a handful has
+    // misread the text rather than proved anything.
+    assert(asked > 200, s"only $asked options were asked")
+end clp_every_documented_option_is_taken
