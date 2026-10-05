@@ -25,6 +25,16 @@ import sysl.buf.{Buf, buf}
 // a value that holds a count is let go of at the end of its block, so from its binding to there it
 // is held, and an `await` in that stretch is a suspension it is held across. A local whose block
 // ends before the first `await` is not in the frame at all.
+//
+// **So is a value computed before an `await` in the same statement**: an earlier argument, the left
+// operand, a receiver, an earlier element, the text an interpolation has built so far. The emitter
+// keeps every temporary a statement makes until the statement ends (`emit_arc.sysl`'s temp regions),
+// and an `await`'s destroy edge gives them back with the rest of the frame (`emit_async.sysl`'s
+// `gen_await`, through `release_all`), so each of them is in the frame at that suspension. Those
+// regions are emission state, which analysis cannot read, so the rule is mirrored here from where
+// the emitter opens and closes a region: a statement, a block, a condition term, the right side of
+// `&&` and `||` -- which close before what follows them -- and a link of a comparison chain, which
+// stays open to the chain's end.
 
 // Where a value crossed, in the words the existing refusals use for the place.
 enum CrossKind
@@ -258,6 +268,8 @@ private scan_list(out: &TaskFrame, stmts: Buf[TStmt], result: Option[TExpr])
             TVarDecl(name, ty, _, _) -> if awaits_after(stmts, i + 1, result) then hold_local(out, name, ty)
             TRefDecl(name, ty, _) -> if awaits_after(stmts, i + 1, result) then hold_local(out, name, ty)
             _ -> ()
+
+    list_temps(out, stmts, result)
 end scan_list
 
 private scan_block(out: &TaskFrame, b: TBlock) = scan_list(out, b.stmts, b.result)
@@ -289,7 +301,10 @@ private scan_node(out: &TaskFrame, e: TExpr)
 
                 if block_awaits(arms.at(i).body) then held = true
 
-            if held then hold_value(out, "the value it matches", scrutinee)
+            if held
+                hold_value(out, "the value it matches", scrutinee)
+                hold_inner(out, scrutinee)
+            end if
         TBlockExpr(block) -> scan_block(out, block)
         TWhile(cond, body, else_block, _) ->
             scan_list(out, body, None)
@@ -306,7 +321,12 @@ private scan_node(out: &TaskFrame, e: TExpr)
         TCFor(init, cond, step, body, else_block, _) ->
             val later = awaits_after(step, 0, cond) || awaits_after(body, 0, None)
 
-            if later then hold_all(out, init) else scan_list(out, init, None)
+            if later
+                hold_all(out, init)
+                list_temps(out, init, None)
+            else
+                scan_list(out, init, None)
+            end if
 
             scan_list(out, step, None)
             scan_list(out, body, None)
@@ -318,6 +338,7 @@ private scan_node(out: &TaskFrame, e: TExpr)
             if awaits_after(body, 0, None)
                 hold_local(out, name, elem_ty)
                 hold_value(out, "the sequence it walks", seq)
+                hold_inner(out, seq)
             end if
         TIterate(cursor, cursor_ty, _, next, _, body, else_block, _) ->
             scan_list(out, body, None)
@@ -350,7 +371,9 @@ end hold_value
 private hold_subjects(out: &TaskFrame, terms: Buf[TCondTerm])
     for i in 0..<terms.len()
         terms.at(i) match
-            TCondIs(subject, _, _) -> hold_value(out, "the value it matches", subject)
+            TCondIs(subject, _, _) ->
+                hold_value(out, "the value it matches", subject)
+                hold_inner(out, subject)
             _ -> ()
 end hold_subjects
 
@@ -360,6 +383,160 @@ private hold_all(out: &TaskFrame, stmts: Buf[TStmt])
             TVarDecl(name, ty, _, _) -> hold_local(out, name, ty)
             _ -> ()
 end hold_all
+
+// -- the statement's temporaries -----------------------------------------------------------------------
+
+private temp_desc() -> string = "a value computed before an 'await' in the same statement"
+
+// The temporaries each statement of `stmts`, and what the list yields, holds across an `await`.
+private list_temps(out: &TaskFrame, stmts: Buf[TStmt], result: Option[TExpr])
+    for i in 0..<stmts.len()
+        stmts.at(i) match
+            TVarDecl(_, _, init, _) -> order_temps(out, init)
+            TExprStmt(e) -> order_temps(out, e)
+            TRefDecl(_, _, place) -> order_temps(out, place)
+            TWriteStmt(w) -> write_temps(out, w)
+            TMultiAssign(writes) ->
+                for j in 0..<writes.len()
+                    write_temps(out, writes.at(j))
+            TReturn(value) -> if value.is_some() then order_temps(out, value.unwrap())
+            TBecome(call) -> order_temps(out, call)
+            TBreak(value, _) -> if value.is_some() then order_temps(out, value.unwrap())
+            _ -> ()
+    end for
+
+    if result.is_some() then order_temps(out, result.unwrap())
+end list_temps
+
+private write_temps(out: &TaskFrame, w: TWrite)
+    order_temps(out, w.place)
+    order_temps(out, w.value)
+end write_temps
+
+// What `e` holds across an `await` inside it: each operand computed before a later one that awaits,
+// in the order the emitter computes them. A block, a loop body and a condition term are regions of
+// their own, their statements' temporaries gone before what follows, so only what such a form
+// computes in the enclosing region -- a scrutinee, a sequence -- is looked into here; the lists
+// inside are `list_temps`' when `scan_node` reaches them.
+private order_temps(out: &TaskFrame, e: TExpr)
+    *e.kind match
+        TIf(cond, _, _, _) -> term_temps(out, cond)
+        TWhile(cond, _, _, _) -> term_temps(out, cond)
+        TDoWhile(_, cond, _, _) -> order_temps(out, cond)
+        TCFor(_, cond, _, _, _, _) -> if cond.is_some() then order_temps(out, cond.unwrap())
+        TFor(_, _, lo, hi, _, _, _, _) ->
+            order_temps(out, lo)
+            order_temps(out, hi)
+        TMatch(scrutinee, _, _) -> order_temps(out, scrutinee)
+        TForEach(_, _, seq, _, _, _) -> order_temps(out, seq)
+        TIterate(_, _, init, next, _, _, _, _) ->
+            order_temps(out, init)
+            order_temps(out, next)
+        TBlockExpr(_) -> ()
+        TLoop(_, _) -> ()
+        TQuantifier(_, _, _, _, _, _, _) -> ()
+        TCheckedLoop(_, _, loop_expr) -> order_temps(out, loop_expr)
+        TAwait(op, _) ->
+            order_temps(out, op)
+
+            // What the awaited task was made from is the statement's until it ends, so it waits
+            // too; the task itself is `awaited`'s.
+            *op.kind match
+                TYieldNow -> ()
+                TPark(_) -> ()
+                _ -> hold_inner(out, op)
+        _ ->
+            val kids = children(e)
+
+            for i in 0..<kids.len()
+                order_temps(out, kids.at(i))
+
+            var later = false
+
+            for j in 0..<kids.len()
+                val k = kids.at(kids.len() - 1 - j)
+
+                if later then hold_temps(out, k)
+                if has_await(k) then later = true
+            end for
+end order_temps
+
+private term_temps(out: &TaskFrame, terms: Buf[TCondTerm])
+    for i in 0..<terms.len()
+        terms.at(i) match
+            TCondTest(c) -> order_temps(out, c)
+            TCondIs(subject, _, _) -> order_temps(out, subject)
+end term_temps
+
+// `e`'s own value, where it is one computed rather than named, and every temporary it made.
+private hold_temps(out: &TaskFrame, e: TExpr)
+    *e.kind match
+        TStrLit(_) -> ()
+        TGlobal(_, _, _) -> ()
+        _ -> hold_value(out, temp_desc(), e)
+
+    hold_inner(out, e)
+end hold_temps
+
+// The temporaries computing `e` made that are still the statement's once it has its value: a form
+// with regions of its own leaves only what it computed before entering them.
+private hold_inner(out: &TaskFrame, e: TExpr)
+    *e.kind match
+        TIf(_, _, _, _) -> ()
+        TWhile(_, _, _, _) -> ()
+        TDoWhile(_, _, _, _) -> ()
+        TCFor(_, _, _, _, _, _) -> ()
+        TFor(_, _, _, _, _, _, _, _) -> ()
+        TBlockExpr(_) -> ()
+        TLoop(_, _) -> ()
+        TQuantifier(_, _, _, _, _, _, _) -> ()
+        TCheckedLoop(_, _, _) -> ()
+        TMatch(scrutinee, _, _) -> hold_temps(out, scrutinee)
+        TForEach(_, _, seq, _, _, _) -> hold_temps(out, seq)
+        TIterate(_, _, init, _, _, _, _, _) -> hold_temps(out, init)
+        _ ->
+            val kids = children(e)
+
+            for i in 0..<kids.len()
+                hold_temps(out, kids.at(i))
+end hold_inner
+
+// The operands of `e`, in the order the walk visits them. The walk is outermost first, so the first
+// operand follows `e` itself and each later one follows the whole of the one before it.
+private children(e: TExpr) -> Buf[TExpr]
+    val all = preorder(e)
+
+    var kids: Buf[TExpr] = buf()
+    var i: usize = 1
+
+    while i < all.len()
+        val k = all.at(i)
+
+        kids.push(k)
+        i += preorder(k).len()
+    end while
+
+    kids
+end children
+
+private struct Visited
+    list: Buf[TExpr]
+
+private preorder(e: TExpr) -> Buf[TExpr]
+    val seen: &Visited = Visited(buf())
+
+    walk_texpr(e, expr_walk(false, x -> visit(seen, x)))
+    seen.list
+end preorder
+
+private visit(seen: &Visited, e: TExpr) = seen.list.push(e)
+
+private has_await(e: TExpr) -> bool
+    val seen: &Seen = Seen(false)
+
+    walk_texpr(e, expr_walk(false, x -> note_await(seen, x)))
+    seen.yes
+end has_await
 
 private block_awaits(b: TBlock) -> bool = awaits_after(b.stmts, 0, b.result)
 

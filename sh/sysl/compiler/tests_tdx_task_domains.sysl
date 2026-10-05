@@ -214,6 +214,185 @@ tdx_awaited_task_followed()
         """), tdx_arg() + "but it is a task of 'outer', whose frame holds the task it awaits, a task " +
         "of 'inner', whose frame holds its parameter 's', a 'string', " + tdx_view(), "15:6")
 
+// -- a statement's temporaries ------------------------------------------------------------------------
+
+// A value computed before an `await` in the same statement is the statement's until it ends, so it
+// is in the frame at that suspension: the five shapes, each refused where the value holds a count
+// that is not atomic and accepted where it is a scalar.
+private tdx_temps(body: string) -> string = tdx_prelude() + raw"""
+    struct Meter
+        n: int
+
+        plus(self, k: int) -> int = self.n + k
+
+    async other() -> int
+        await yield_now()
+        1
+
+    make_string() -> string = "made"
+    make_cell(n: int) -> &Cell = Cell(n)
+    make_meter(n: int) -> &Meter = Meter(n)
+    take(s: string, n: int) -> int = n
+    sum(a: int, b: int) -> int = a + b
+
+    """ + body
+
+private tdx_temp_held(report: string, shown: string) =
+    assert(report.contains(tdx_arg() + "but it is a task of 'work', whose frame holds a value computed " +
+                           s"before an 'await' in the same statement, a '$shown', "), report)
+
+@test("an argument computed before an awaited one is in the frame")
+tdx_temp_earlier_argument_refused()
+    if tdx_no_library() then return
+
+    tdx_says(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            take(make_string(), await other())
+
+        hand(work(1))
+        """)), tdx_arg() + "but it is a task of 'work', whose frame holds a value computed before an " +
+        "'await' in the same statement, a 'string', " + tdx_view(), "25:6")
+
+@test("and a scalar argument computed before an awaited one crosses")
+tdx_temp_earlier_argument_scalar_crosses()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            sum(n * 2, await other())
+
+        hand(work(1))
+        """)), "")
+
+@test("the left operand of an operator whose right one awaits is in the frame")
+tdx_temp_left_operand_refused()
+    if tdx_no_library() then return
+
+    tdx_temp_held(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            print(make_string() + str(await other()))
+            n
+
+        hand(work(1))
+        """)), "string")
+
+@test("and a scalar left operand crosses")
+tdx_temp_left_operand_scalar_crosses()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            n * 3 + await other()
+
+        hand(work(1))
+        """)), "")
+
+@test("a receiver whose method call awaits in an argument is in the frame")
+tdx_temp_receiver_refused()
+    if tdx_no_library() then return
+
+    tdx_temp_held(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            make_meter(n).plus(await other())
+
+        hand(work(1))
+        """)), "&Meter")
+
+@test("and a receiver of plain scalars crosses")
+tdx_temp_receiver_scalar_crosses()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            Meter(n).plus(await other())
+
+        hand(work(1))
+        """)), "")
+
+@test("an array element built before an awaited one is in the frame")
+tdx_temp_array_element_refused()
+    if tdx_no_library() then return
+
+    tdx_temp_held(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            val xs = [make_cell(n), make_cell(await other())]
+            xs[1].n
+
+        hand(work(1))
+        """)), "&Cell")
+
+@test("and a scalar array element crosses")
+tdx_temp_array_element_scalar_crosses()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            val xs = [n + 1, await other()]
+            xs[0] + xs[1]
+
+        hand(work(1))
+        """)), "")
+
+@test("a tuple element built before an awaited one is in the frame")
+tdx_temp_tuple_element_refused()
+    if tdx_no_library() then return
+
+    tdx_temp_held(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            val p = (make_cell(n), await other())
+            p.1
+
+        hand(work(1))
+        """)), "&Cell")
+
+@test("and a scalar tuple element crosses")
+tdx_temp_tuple_element_scalar_crosses()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            val p = (n + 1, await other())
+            p.0 + p.1
+
+        hand(work(1))
+        """)), "")
+
+@test("the text an interpolation has built before an awaited hole is in the frame")
+tdx_temp_interpolation_refused()
+    if tdx_no_library() then return
+
+    tdx_temp_held(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            print(s"n is ${n}, then ${await other()}")
+            n
+
+        hand(work(1))
+        """)), "string")
+
+@test("and an interpolation with only literal text before its awaited hole crosses")
+tdx_temp_interpolation_literal_crosses()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            print(s"then ${await other()}")
+            n
+
+        hand(work(1))
+        """)), "")
+
+@test("a temporary used up in an earlier statement is gone before the 'await', so the task crosses")
+tdx_temp_consumed_earlier_crosses()
+    if tdx_no_library() then return
+
+    assert_eq(tdx_refused(tdx_temps(raw"""
+        async work(n: int) -> int
+            val k = make_cell(n).n + int(make_string().bytes.len)
+            sum(k, await other())
+
+        hand(work(1))
+        """)), "")
+
 @test("a task parameter of an async function is answered by the argument its call was handed")
 tdx_task_parameter_follows_the_argument()
     if tdx_no_library() then return
