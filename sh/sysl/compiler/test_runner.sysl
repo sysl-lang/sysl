@@ -49,16 +49,25 @@ end TestOptions
 // **An ignored test is one of these too, and it never ran**: its test carries the reason, `detail`
 // is absent and `millis` is zero. It fails nothing — `passed` reads true, which an ignored test does
 // not spoil — and it is counted apart in the summary.
+//
+// **A test that skipped itself is one of these as well, and it DID run**: `skipped` carries the reason
+// it gave `skip` (`skip_reason`), `millis` is how long it took to find out, and it is counted with the
+// ignored ones — a run that could not test something says so rather than calling it a pass.
 struct Outcome
     test: TTest
     detail: Option[string]
     output: string
     millis: long
+    skipped: Option[string]
 
     passed(self) -> bool = self.detail.is_none()
 
     // Why the test was not run, where it was ignored.
     ignored(self) -> Option[string] = self.test.ignored
+
+    // Whether the row is a `skip` rather than a verdict: ignored by its annotation, or skipped by the
+    // test itself and nothing after that failed.
+    not_run(self) -> bool = self.passed() && (self.ignored().is_some() || self.skipped.is_some())
 end Outcome
 
 // Every selected test, run in the order it was written -- which is the order it is reported in, so
@@ -125,7 +134,8 @@ run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
                 // An ignored test starts no process — not the test's, and not its `@setup` or
                 // `@teardown` either, since those bracket a run and there is none.
                 val t = group.at(i)
-                val outcome = if t.ignored.is_some() then Outcome(t, None, "", 0) else run_one_test(exe, t)
+                val outcome = if t.ignored.is_some() then Outcome(t, None, "", 0, None)
+                else run_one_test(exe, t)
 
                 done.push(outcome)
                 show_outcome(outcome, width, &shown, &any_shown, emit)
@@ -257,9 +267,16 @@ private run_one_test(exe: string, t: TTest) -> Outcome
     val setup_ran = t.hooks.setup.is_none() || raw.has_byte(setup_byte())
     val entered_down = t.hooks.teardown.is_some() && raw.has_byte(test_byte())
 
+    // A skip is the mark AND a clean exit: a test that failed before it called `skip` never wrote the
+    // mark, and one that wrote it and then died did not skip. Asked first, since a `@setup` that
+    // skips leaves no setup mark behind it and is the module saying none of its tests can run here.
+    val skipped = if state == 0 then skip_reason(raw) else None
+
     var detail: Option[string] = None
 
-    if !setup_ran
+    if skipped.is_some()
+        ()
+    else if !setup_ran
         detail = Some(guarded_by_setup(t.hooks.setup.unwrap(), state))
     else if entered_down && state != 0
         detail = Some(hook_did_not_return(t.hooks.teardown.unwrap(), state) +
@@ -279,7 +296,7 @@ private run_one_test(exe: string, t: TTest) -> Outcome
 
         if r.status != 0 && detail.is_none() then detail = Some(hook_did_not_return(h, r.status))
 
-    Outcome(t, detail, output + trailing, took)
+    Outcome(t, detail, output + trailing, took, skipped)
 end run_one_test
 
 // What one hook's own process did.
@@ -315,7 +332,7 @@ const NotStarted: int = 127
 // is what a reader greps for.
 private hook_outcome(h: THook, r: HookRun) -> Outcome =
     Outcome(TTest(h.func, module_bare(h.func), false, None, h.file, h.line, no_hooks(), None),
-            Some(hook_did_not_return(h, r.status)), r.output, r.millis)
+            Some(hook_did_not_return(h, r.status)), r.output, r.millis, None)
 
 private hook_did_not_return(h: THook, state: int) -> string =
     s"the module's '@${hook_word(h.kind)}', '${qualified_name(h.func)}', did not return — " +
@@ -386,14 +403,17 @@ test_file_header(file: string) -> string = s"\n$file\n"
 // was doing, not something anyone asked to read.
 //
 // An ignored test's row carries its reason where the time would be: it has no run to time, and the
-// reason is the one thing its reader is owed.
+// reason is the one thing its reader is owed. A test that skipped itself gets the same row with the
+// word that says which of the two it was: `ignored` is the annotation's, `skipped` the run's own.
 test_row(o: Outcome, width: usize) -> string
     val mark = if o.passed() then "ok  " else "FAIL"
     val pad = if o.test.display.len < width then repeat(" ", width - o.test.display.len) else ""
 
     var out = o.ignored() match
         Some(why) -> s"  skip  ${o.test.display}$pad  ignored: $why\n"
-        None -> s"  $mark  ${o.test.display}$pad  ${o.millis}ms\n"
+        None -> o.skipped match
+            Some(why) if o.passed() -> s"  skip  ${o.test.display}$pad  skipped: $why\n"
+            _ -> s"  $mark  ${o.test.display}$pad  ${o.millis}ms\n"
 
     o.detail match
         None -> ()
@@ -411,7 +431,8 @@ end test_row
 
 // The closing line: how many of the rows passed, against how long the whole run took — and how many
 // were ignored, where any were. **The ignored count appears only when it is not zero**, so a run that
-// ignored nothing prints the line it always has and whatever reads that line keeps reading it.
+// ignored nothing prints the line it always has and whatever reads that line keeps reading it. A test
+// that skipped itself is counted there too: neither kind is a pass, and neither is a failure.
 tests_summary(outcomes: Buf[Outcome]) -> string
     var failed: usize = 0
     var ignored: usize = 0
@@ -419,7 +440,7 @@ tests_summary(outcomes: Buf[Outcome]) -> string
 
     for i in 0..<outcomes.len()
         if !outcomes.at(i).passed() then failed += 1
-        if outcomes.at(i).ignored().is_some() then ignored += 1
+        if outcomes.at(i).not_run() then ignored += 1
 
         total += outcomes.at(i).millis
 
@@ -530,19 +551,52 @@ private setup_byte() -> u8 = setup_mark().bytes[0]
 
 private test_byte() -> u8 = test_mark().bytes[0]
 
+// The byte a test writes when it gives up: `skip(why)` prints it, then the reason and a newline, then
+// ends the process with status 0. **It is the TEST's mark rather than the dispatcher's**, written by
+// the library function every test calls rather than by the emitted entry point, so this is the one
+// place in the compiler that states it and `sysl/check.sysl`'s `skip` is the other.
+//
+// Why a mark and a clean exit rather than an exit status of its own: the mark rides the channel this
+// runner already reads, and the clean exit is what makes `skip` safe under a runner that predates it —
+// there the test reads as one that returned, which is exactly what a test that printed a note and
+// returned used to be. A reserved status would have turned every such run red instead.
+skip_mark() -> string = "\u{3}"
+
+private skip_byte() -> u8 = skip_mark().bytes[0]
+
+// The reason a run gave `skip`, where it gave one: what follows the mark, up to the end of its line.
+skip_reason(output: string) -> Option[string]
+    val mark = skip_byte()
+
+    for i in 0..<output.bytes.len
+        if output.bytes[i] == mark
+            var why: Buf[u8] = buf()
+
+            for j in i + 1..<output.bytes.len
+                if output.bytes[j] == u8('\n') then break
+
+                why.push(output.bytes[j])
+
+            return Some(from_utf8_unchecked(why.view()))
+        end if
+
+    None
+end skip_reason
+
 // A run's output as a reader should see it: the marks above taken out.
 unmarked_output(output: string) -> string
     val setup = setup_byte()
     val test = test_byte()
+    val skip = skip_byte()
 
-    if !output.has_byte(setup) && !output.has_byte(test) then return output
+    if !output.has_byte(setup) && !output.has_byte(test) && !output.has_byte(skip) then return output
 
     var out: Buf[u8] = buf()
 
     for i in 0..<output.bytes.len
         val b = output.bytes[i]
 
-        if b != setup && b != test then out.push(b)
+        if b != setup && b != test && b != skip then out.push(b)
 
     from_utf8_unchecked(out.view())
 end unmarked_output

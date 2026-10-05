@@ -434,7 +434,12 @@ end dotted
 // module is read from source and analyzed with it, so the library's declarations are in scope
 // exactly as they are for a build.
 emit_typed_text(path: string, named_target: Option[string],
-                tables: bool) -> Result[Emitted, Failure]
+                tables: bool) -> Result[Emitted, Failure] =
+    Ok(typed_text(typed_compilation(path, named_target)?, tables))
+
+// The compilation `emit-typed` and `prove` read: the program at `path`, with its packages, for the
+// target it names or its manifest's default.
+typed_compilation(path: string, named_target: Option[string]) -> Result[Compilation, Failure]
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
     val manifest = manifest_at(root)?
 
@@ -453,10 +458,8 @@ emit_typed_text(path: string, named_target: Option[string],
         None -> ()
         Some(why) -> return Err(said(Refusal(why)))
 
-    val program = packaged_compilation_of(path, t)?
-
-    Ok(typed_text(program, tables))
-end emit_typed_text
+    packaged_compilation_of(path, t)
+end typed_compilation
 
 // `sysl emit-llvm [--target <name>] [-O<level>] <path>` -- one program's LLVM text.
 //
@@ -707,12 +710,19 @@ end Emitted
 // **`--tables` is the same program read by its tables** (`show_tables`), so the two views of one
 // compilation cannot disagree about what it reached.
 private typed_text(c: Compilation, tables: bool) -> Emitted
-    val done = analyze_bodies(c.units, c.target)
-    val shown = strip_handed(program_of(done, done.main_module), c.own)
+    val (shown, report) = typed_program(c)
     val text = if tables then show_tables(shown) else show_typed_program(shown)
 
-    Emitted(text, errors_of(done.reported), buf(), buf())
+    Emitted(text, report, buf(), buf())
 end typed_text
+
+// The typed tree a compilation answers with, and what its analysis reported -- the tree `emit-typed`
+// prints and `prove` translates.
+typed_program(c: Compilation) -> (TProgram, Buf[Placed])
+    val done = analyze_bodies(c.units, c.target)
+
+    (strip_handed(program_of(done, done.main_module), c.own), errors_of(done.reported))
+end typed_program
 
 // Whether a body is one a program **emits**, which is the question a printed tree answers.
 //
