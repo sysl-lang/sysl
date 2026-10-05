@@ -92,6 +92,38 @@ end use_bounds_locations
 // unchanged.
 bounds_locations_key() -> string = if locations_on then "" else "-nl"
 
+// -- how a location names its file -----------------------------------------------------------------
+
+// **A location names a file by where it sits in what was built, never by where that was on the
+// building machine**, so no home directory or build path is laid into an image. A file's name is
+// the absolute path the tree was walked from (which is what `__FILE__` and a diagnostic quote, and
+// they keep it); a location strips the longest of these roots off the front and puts what each is
+// paired with in its place. A library file is already named by its place (`library/sysl/…`) and
+// matches none of them.
+private var location_roots: Buf[(string, string)] = buf()
+
+// The roots one compilation's files are named under, set by the driver as the compilation is
+// gathered: the project's own directory (shown as nothing, so `src/main.sysl`), the directory
+// fetched packages live under (so `github.com/o/p/@v1.2.0/…`), and each other root it read.
+use_location_roots(roots: Buf[(string, string)])
+    location_roots = roots
+end use_location_roots
+
+// A file's name as a location shows it.
+location_file(name: string) -> string
+    var best: usize = 0
+    var shown = name
+
+    for i in 0..<location_roots.len()
+        val (dir, instead) = location_roots.at(i)
+
+        if dir.bytes.len > best && name.bytes.len > dir.bytes.len && bytes_at(name, 0, dir)
+            best = dir.bytes.len
+            shown = instead + name[dir.bytes.len..<name.bytes.len]
+
+    shown
+end location_file
+
 // -- the check -------------------------------------------------------------------------------------
 
 // Traps unless `ok` holds, having first reported the failure through `sysl_bounds_fail`. The labels
@@ -145,7 +177,7 @@ private location_of(e: *Emit, site: Span) -> Val
         None -> return VNull
 
     val loc = src.locate(site.start)
-    val text = s"${src.name}:${loc.line}:${loc.col}"
+    val text = s"${location_file(src.name)}:${loc.line}:${loc.col}"
 
     for i in 0..<e.locs.len()
         if e.locs.at(i) == text then return VGlobal(bounds_location_name(i))

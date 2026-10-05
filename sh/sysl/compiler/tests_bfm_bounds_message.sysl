@@ -4,7 +4,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{capture, Status}
-import sysl.text.{replace_all, split, Search}
+import sysl.text.{split, Search}
 
 // A failed bounds check says what failed and where (`bounds_fail.sysl`): an index, every way a range
 // can be wrong, a string cut inside a character -- each on standard error, followed by the same trap
@@ -18,8 +18,8 @@ import sysl.text.{replace_all, split, Search}
 private bfm_ready() -> bool = std_root().is_ok() && clang_available()
 
 // The tree built at `level` and run: its status, what it printed, and what it wrote to standard
-// error with the tree's own directory taken out of every location, so a location reads as the path
-// inside the project.
+// error -- taken as it came, since a location names a file by its path inside the project and the
+// temporary directory the tree was built in must appear nowhere.
 private bfm_run(files: []const (string, string), level: string) -> (Status, string, string)
     val root = make_temp_dir("sysl-bfm").unwrap()
 
@@ -43,9 +43,7 @@ private bfm_run(files: []const (string, string), level: string) -> (Status, stri
 
     said match
         Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
-        Ok(out) -> (out.status, out.text,
-                    replace_all(replace_all(out.err.unwrap_or(""), s"$root/", ""),
-                                absolute_path(root) + "/", ""))
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
 end bfm_run
 
 // At both levels, the program stops on SIGTRAP having written exactly `said` to standard error.
@@ -121,6 +119,44 @@ bfm_a_range_in_another_file()
         ("util/util.sysl", "module util\n\n// The first n.\nhead(xs: []const int, n: int) -> []const int = xs[0..<n]\n")]
 
     bfm_traps_saying(files[..], "range 0..<7 out of bounds for length 3 (util/util.sysl:4:50)\n")
+
+@test("a location names its file inside what was built, and __FILE__ still names the path it was read from")
+bfm_a_location_names_no_build_directory()
+    if !bfm_ready() then return
+
+    val ran = bfm_run(bfm_main("print(__FILE__)\nval xs = [1, 2, 3]\nval i: usize = 5\nprint(xs[i])\n"), "0")
+
+    assert_eq(ran.2, "index 5 out of bounds for length 3 (main.sysl:4:9)\n")
+
+    // `__FILE__` is the absolute path, as before; the trap loses the buffered line, so ask again.
+    val said = bfm_run(bfm_main("print(__FILE__)\n"), "0")
+
+    assert(said.1.starts_with("/"), said.1)
+    assert(said.1.ends_with("/main.sysl\n"), said.1)
+end bfm_a_location_names_no_build_directory
+
+@test("a fetched package's file is named from its coordinate, a library file by its place")
+bfm_a_package_file_is_named_from_its_coordinate()
+    var roots: Buf[(string, string)] = buf()
+
+    roots.push(("/home/u/proj/", ""))
+    roots.push(("/home/u/.cache/sysl/pkg/", ""))
+    roots.push(("/home/u/side/", "side/"))
+    use_location_roots(roots)
+
+    val package = location_file("/home/u/.cache/sysl/pkg/github.com/o/p/@v1.2.0/sh/o/p/a.sysl")
+    val own = location_file("/home/u/proj/src/main.sysl")
+    val side = location_file("/home/u/side/b.sysl")
+    val library = location_file("library/sysl/print.sysl")
+    val elsewhere = location_file("/home/u/projector/c.sysl")
+
+    use_location_roots(buf())
+    assert_eq(package, "github.com/o/p/@v1.2.0/sh/o/p/a.sysl")
+    assert_eq(own, "src/main.sysl")
+    assert_eq(side, "side/b.sysl")
+    assert_eq(library, "library/sysl/print.sysl")
+    assert_eq(elsewhere, "/home/u/projector/c.sysl")
+end bfm_a_package_file_is_named_from_its_coordinate
 
 // -- the one function the failures go through ----------------------------------------------------------
 
