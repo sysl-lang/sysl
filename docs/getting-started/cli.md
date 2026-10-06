@@ -16,7 +16,7 @@ the path is standing on.
 |---|---|
 | `sysl run <path>` | compile and execute |
 | `sysl build <path> -o <exe>` | compile to a native executable |
-| `sysl build-lib <path> -o <artifact>` | compile a library to a linkable artifact |
+| `sysl build-lib <path>` | check a library for one machine, writing nothing |
 | `sysl build-c <path> -o <archive>` | compile to a static archive and a C header, for a C project |
 | `sysl test <path>` | run the `@test` functions |
 | `sysl emit-llvm <path>` | print the generated LLVM IR |
@@ -31,9 +31,7 @@ the path is standing on.
 | `sysl tidy [<path>]` | drop the `sysl.sum` lines for versions the project no longer resolves |
 | `sysl doc <path>` | generate an API reference from declarations and their doc comments |
 | `sysl targets` | list the machines sysl can build for |
-
-`sysl prove` is a seventeenth, and it has a page of its own — see
-[verification](/reference/verification/#sysl-prove).
+| `sysl prove <path>` | discharge the contracts with Why3 — see [verification](/reference/verification/#sysl-prove) |
 
 A subcommand is required; sysl with none exits 2 and prints its usage.
 
@@ -115,8 +113,7 @@ that file's, with its extension dropped, in the current directory: `src/tools/fm
 
 Given a **directory**, the executable goes *inside* it, named after it. `sysl build .`,
 `sysl build fmt` and `sysl build ../fmt` are three ways of naming one project, and all three write
-`fmt/fmt` — so the answer does not depend on where you were standing when you asked. `build-lib`
-follows the same rule, writing `fmt/fmt.syslib` into the root it was built from.
+`fmt/fmt` — so the answer does not depend on where you were standing when you asked.
 
 **A project whose `package.hocon` names dependencies gets them fetched here**, if this machine has
 not got them already — see [packages](/reference/packages/). `run` and `test` do the same; there is
@@ -125,32 +122,28 @@ no separate step to remember, and a project with no dependencies does none of it
 ### `build-lib`
 
 ```bash
-sysl build-lib mylib -o mylib.syslib
-sysl run prog.sysl --lib mylib.syslib
+sysl build-lib mylib --target thumbv7em-freestanding
+checked mylib
 ```
 
-A library compiled once into the two halves a program links against. See
-[modules](/reference/modules/) for what an artifact holds and why the generic half of it travels as
-trees rather than as object code.
+A library run through the whole analysis, against the standard module, for one machine — and nothing
+written. It is the only check a board package gets on a host, which is what it is for. A library is
+handed to a program as the directory it is written in, never as an artifact somebody names
+([modules](/reference/modules/#separate-compilation) has why), so `build-lib` takes no `-o`:
 
-**A library may itself be built on another one**, and `--lib` is what says so — it takes an artifact
-or a source root here exactly as it does for a compilation:
-
-```bash
-sysl build-lib sdl3 -o sdl3.syslib
-sysl build-lib sdl3-ttf --lib sdl3.syslib -o sdl3-ttf.syslib
+```text
+sysl: error: build-lib writes nothing anybody names — it checks a library, and what it compiles is this compiler's cache, found by the compiler alone — so it takes no -o
 ```
+
+**A library may itself be built on another one**, and `--lib` naming the other's directory is what
+says so, exactly as it does for a compilation.
 
 **Unlike `build`, `run` and `test`, this does not fetch.** A package with a `dependencies` block is
 refused rather than resolved over the network, and the message names the dependency and points at
-`--lib`. A command whose whole job is to compile one tree into an artifact for one machine should not
-be the thing that goes looking; the cost is that such a package writes its dependency down twice.
+`--lib`. A command whose whole job is to check one tree for one machine should not be the thing that
+goes looking; the cost is that such a package writes its dependency down twice.
 
-Building one needs an `llvm-ar` as well as a `clang`, because a `.syslib` **is** an `ar` archive —
-[installation](/getting-started/installation/) has the note about which `ar` and why the platform
-one will not do.
-
-**`--cc` and `--ar` name them, where a search would not find the right ones.**
+**`--cc` names the clang, where a search would not find the right one.**
 
 ```
 sysl build hello.sysl --cc /opt/homebrew/opt/llvm/bin/clang
@@ -824,10 +817,8 @@ __aeabi_ldivmod` at the link, which is the one place anybody will come looking f
 | | |
 |---|---|
 | `--target <name>` | the machine to build for; defaults to this one |
-| `--lib <path>` | a library to compile against; may be given more than once |
-| `--std-lib <path>` | a prebuilt standard module |
-| `--no-std-lib` | compile the standard module from source rather than linking a prebuilt one |
-| `--ar <path>` | the `llvm-ar` to build a library with |
+| `--lib <dir>` | a library's source directory to compile against; may be given more than once |
+| `--no-std-lib` | compile the standard module from source rather than linking the cached one |
 | `--link-path <dir>` | where to look for a library a `link` directive named; may be given more than once |
 | `--include-path <dir>` | where to look for a header the C beside a module includes; may be given more than once |
 | `--include-path <name>=<dir>` | the same, and it answers the header requirement a package declared under that name |
@@ -837,8 +828,23 @@ __aeabi_ldivmod` at the link, which is the one place anybody will come looking f
 | `--link <how>` | link `pkg_config` libraries from their static archives: `static`, `dynamic`, or a comma-separated list of their names |
 | `--profile-generate <dir>` | build an instrumented program that writes its counters into this directory |
 | `--profile-use <file>` | build against a merged profile |
-| `-v`, `--verbose` | report what the build decided — the standard module, the files read, the command lines, and where `build-lib` staged |
+| `--no-bounds-locations` | leave the `file:line:column` out of a failed bounds check's report — the [`bounds_locations` key](/reference/packages/#leaving-the-bounds-locations-out) for one build |
+| `-p <member>`, `--package <member>` | in a [workspace](/reference/packages/#workspaces), the member to build, test or run |
+| `-v`, `--verbose` | report what the build decided — the standard module, the files read, the command lines |
 | `--explain-escapes` | report every local array promoted to the heap |
+
+**An option no command takes is refused, never passed over.** Each mistake is named on a line of its
+own, the command's usage under them, on standard error, and the exit status is 2 — so a misspelt
+`--relase` is never quietly built as a debug binary, and one taken for the path is never compiled:
+
+```text
+Error: Unknown option --relase
+usage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] …
+```
+
+An option that wants a value and was given none says `Error: Missing value after --target` the same
+way. An option one command takes and another does not — `-o` on `test` — is unknown to the second.
+A lone `-` is a path, and what follows `--` in `run` is the program's, options included.
 
 The standard-module flags and `-O` are covered in
 [installation](/getting-started/installation/), including why the default is `-O1` and not off.
@@ -965,13 +971,15 @@ stops being a surprise: written `--include-path <name>=<dir>`, the flag answers 
 package declared, and a build that is missing one is refused by name before clang runs. See
 [packages](/reference/packages/#headers-a-package-needs-and-does-not-carry).
 
-### `--lib` takes either a source tree or an artifact
+### `--lib` takes a source tree
 
-Which one a path names is read off the name: a `.syslib` is decoded, anything else is walked as
-source. That is deliberate — how a library was shipped is the shipper's business, and a program
-depending on one should not have to write down which it got. `build-lib` is what turns the first
-into the second, and the only difference downstream is what the compilation *cost*: an artifact is a
-linear decode where source is a parse.
+A library is handed over as the directory it is written in — a
+[source root](/reference/modules/#source-roots) — and what the compiler makes from it is its own
+cache, which nobody names. A path to a `.syslib` is refused:
+
+```text
+sysl: error: --lib takes the directory a library's source is in, and 'mylib.syslib' is a '.syslib' — a library is handed over as the tree it is written in, and the compiler keeps its own cache of what it compiled from one, which nobody names
+```
 
 **A source tree that is a dependency's package overrides that dependency.** Building against a
 working copy of something the manifest names is one flag, with the manifest left alone:
@@ -1015,7 +1023,7 @@ build was for:
 ```
 sysl: 1 source file(s) under hello
 sysl:   read hello/hello.sysl
-sysl: standard module linked from ~/Library/Caches/sysl/<version>+<build>-…/std.syslib
+sysl: standard module linked from ~/Library/Caches/sysl/<version>-…/std.syslib
 sysl: link: clang --target=arm64-apple-macosx -Wno-override-module -O1 …
 ```
 
@@ -1024,18 +1032,6 @@ standard module** the compilation got and whether it was linked or compiled from
 it read**, and the **command lines** handed to clang together with the `--lib`, `--link-path` and
 `--include-path` searches behind them. There are no phase timings: a build that is slow is diagnosed
 by asking what it *did*.
-
-`build-lib` adds a fourth, because it is the one command that writes anywhere but the artifact it
-was asked for:
-
-```
-sysl: members staged in /var/folders/…/sysl-lib-1729384756
-```
-
-The members are archived under names of their own rather than under whatever a temporary file was
-called, which is what the directory is for, and it is removed whether the build succeeded or gave up
-partway. The line is there for the run that is interrupted in between: what is left behind is a
-directory nothing else would have named.
 
 ### `--explain-escapes`
 
@@ -1060,19 +1056,14 @@ letter, and only where something follows it, so a bare `-O` still takes the next
 `--optimize` is untouched. Nothing in that rewrite can reach the program's own arguments, which were
 already split off at the `--`.
 
-## Two combinations that are refused
+## The standard module is never named
 
-Neither is resolved by precedence, because whichever precedence were chosen would silently discard
-half of what was asked for:
+The compiled standard module is the compiler's cache, so no flag points a build at one. `--std-lib`
+is refused by every command in the same words, before any of them reads its own options:
 
 ```
-sysl: error: --core-lib compiles against the standard module, and 'build-lib --core' is what builds it
-sysl: error: --no-core-lib and --core-lib ask for different standard modules
+sysl: error: --std-lib names a '.syslib', and a '.syslib' is this compiler's cache, which nobody names — to compile against another standard module, set SYSL_LIB to the root its source is in
 ```
-
-The first is `build-lib --core --core-lib x`, which cannot mean anything: the declarations being
-compiled are the ones the artifact holds. The second is the pair of near-identical spellings that a
-typo produces.
 
 ## Exit statuses
 
@@ -1080,7 +1071,7 @@ typo produces.
 |---|---|
 | **0** | it worked — and for `test`, every test that ran passed |
 | **1** | a compiler diagnostic, a driver error, or a failing test |
-| **2** | the command line did not parse |
+| **2** | the command line did not parse — an unknown option, a missing value, no subcommand |
 | *the program's* | `run` only, once the program has started |
 
 A compiler diagnostic is printed exactly as the compiler wrote it: the message, the location, the
@@ -1097,8 +1088,9 @@ error: 'b' of 'add' is int, but string was given
 ```
 
 A driver error — something that went wrong *around* the compilation rather than inside it — is
-prefixed `sysl: error:`, which is why every message quoted on this page carries it and none of the
-ones on the language pages do.
+prefixed `sysl: error:` and written to standard error, which is why every message quoted on this
+page carries it and none of the ones on the language pages do. A command line that did not parse is
+the one exception: it is answered `Error: …` with the command's usage under it, as above.
 
 ---
 
