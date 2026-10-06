@@ -1,0 +1,86 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// A package's `sysl = "x.y.z"` floor against a released compiler, which is held to it, and against a
+// development build, which makes no claim. A release is numbered `0.1.0-alpha.N` and the floors in
+// the org are all `0.0.x`, so the order between the two is semver's: a pre-release sits above every
+// earlier release and below the release it leads to. The version is pinned rather than read, so
+// these say the same thing in a development tree and in the release that stamps `Version`.
+
+private vfl_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end vfl_run
+
+@test("an alpha of 0.1.0 is newer than every 0.0.x and older than 0.1.0 itself")
+vfl_an_alpha_sits_between_the_lines()
+    assert(older("0.0.162", "0.1.0-alpha.1"), "0.0.162 before the alpha")
+    assert(!older("0.1.0-alpha.1", "0.0.162"), "the alpha not before 0.0.162")
+    assert(older("0.1.0-alpha.1", "0.1.0"), "the alpha before 0.1.0")
+    assert(!older("0.1.0", "0.1.0-alpha.1"), "0.1.0 not before the alpha")
+    assert(!older("0.1.0-alpha.1", "0.1.0-alpha.1"), "an alpha not before itself")
+
+@test("alphas order by their number, and a number by its value rather than its spelling")
+vfl_alphas_order_by_number()
+    assert(older("0.1.0-alpha.1", "0.1.0-alpha.2"), "alpha.1 before alpha.2")
+    assert(!older("0.1.0-alpha.2", "0.1.0-alpha.1"), "alpha.2 not before alpha.1")
+    assert(older("0.1.0-alpha.2", "0.1.0-alpha.10"), "alpha.2 before alpha.10")
+
+@test("the rest of semver's pre-release order: fewer fields first, a number before a word")
+vfl_semver_pre_release_rules()
+    assert(older("0.1.0-alpha", "0.1.0-alpha.1"), "a prefix before what extends it")
+    assert(older("0.1.0-alpha.1", "0.1.0-beta"), "words byte by byte")
+    assert(older("0.1.0-1", "0.1.0-alpha"), "a number before a word")
+    assert(!older("0.1.0+abc", "0.1.0"), "build metadata takes no part")
+    assert(!older("0.1.0", "0.1.0+abc"), "either way round")
+
+@test("every 0.0.x floor is met by the alpha")
+vfl_the_org_floors_are_met()
+    assert(check_floor("this project", "0.0.62", "0.1.0-alpha.1").is_none(), "0.0.62")
+    assert(check_floor("this project", "0.0.162", "0.1.0-alpha.1").is_none(), "0.0.162")
+    assert(check_floor("this project", "0.0.999", "0.1.0-alpha.1").is_none(), "0.0.999")
+
+// The reference's sentence, read out of 0.0.162 on a project stating `sysl = "0.1.0"`, with the
+// alpha's number where the reference names its own.
+@test("a floor of 0.1.0 refuses the alpha, in the reference's words")
+vfl_a_floor_above_the_alpha_is_refused()
+    pin_compiler_version(Some("0.1.0-alpha.1"))
+    defer pin_compiler_version(None)
+
+    assert_eq(root_floor_refusal("0.1.0").unwrap_or("(nothing)"),
+              "this project cannot be built because it requires sysl 0.1.0 or newer, while the compiler " +
+              "in hand is 0.1.0-alpha.1")
+    assert(root_floor_refusal("0.0.162").is_none(), "a 0.0.x floor is met")
+
+@test("and at the command line it is a refusal about the command")
+vfl_the_refusal_reaches_the_command_line()
+    pin_compiler_version(Some("0.1.0-alpha.1"))
+    defer pin_compiler_version(None)
+
+    val root = make_temp_dir("sysl-vfl-").unwrap()
+
+    write_text(s"$root/package.hocon", "package { name = \"app\", sysl = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/main.sysl", "print(\"hi\")\n").unwrap()
+
+    val got = vfl_run(["sysl", "build", root, "-o", s"$root/out"])
+
+    assert_eq(got.0, Failed, got.1)
+    assert_eq(got.1, "sysl: error: this project cannot be built because it requires sysl 0.1.0 or " +
+                     "newer, while the compiler in hand is 0.1.0-alpha.1")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a development build checks no floor at all")
+vfl_a_development_build_checks_nothing()
+    pin_compiler_version(Some(DevVersion))
+    defer pin_compiler_version(None)
+
+    assert(!on_the_release_line(DevVersion), "0.0.1 is not a release")
+    assert(on_the_release_line("0.1.0-alpha.1"), "an alpha is")
+    assert(root_floor_refusal("99.0.0").is_none(), "no floor is too high for it")
