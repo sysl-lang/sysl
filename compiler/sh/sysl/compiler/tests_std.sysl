@@ -4,7 +4,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
 import sysl.text.Search
-import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.fs.{current_dir, make_dir_all, make_temp_dir, metadata, remove_dir_all, set_current_dir, write_text}
 
 // Where the standard module's source is, and what a compilation gets from it.
 
@@ -54,7 +54,20 @@ the_old_spelling_is_still_searched()
 
 @test("a compiler that cannot find its library lists every path it tried, and the two ways out")
 a_missing_library_lists_what_was_tried()
-    val said = std_root_of(None, Some("/nowhere/bin/sysl")).unwrap_err()
+    // The working-directory candidates are relative, and this suite runs from `compiler/`, whose
+    // `../library` is the repository's own -- so the question is asked from a scratch directory with
+    // no library anywhere above it, and the working directory is put back before anything can fail.
+    val here = current_dir().unwrap()
+    val scratch = make_temp_dir("sysl-nolib").unwrap()
+
+    set_current_dir(scratch).unwrap()
+
+    val answer = std_root_of(None, Some("/nowhere/bin/sysl"))
+
+    set_current_dir(here).unwrap()
+    remove_dir_all(scratch).unwrap_or(())
+
+    val said = answer.unwrap_err()
 
     assert(said.index_of("cannot find the standard module's source").is_some(), said)
     assert(said.index_of("/nowhere/share/sysl/library (beside this compiler)").is_some(), said)
