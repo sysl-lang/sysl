@@ -33,9 +33,15 @@ operator symbols, and no facility to add one.
 | 11 | `*` `/` `%` `<<` `>>` | multiply, divide, remainder, shift | left |
 | 12 | `-` `!` `~` `*` `&` `++` `--` | prefix unary | right |
 | 13 | `[]` `.` `()` `::` `with` `?` `++` `--` | postfix | left |
+| — | `await` | run a task: prefix, taking the postfix chain up to its first `?` | right |
 
 `*` and `&` appear at two levels each — prefix at 12 (dereference, address-of) and binary at 11 and 9
 (multiply, bitwise and). Position tells them apart, and nothing else has to.
+
+**`await` sits between the two postfix kinds** rather than on a level of its own: it takes the calls,
+member selections and indexes after it, so `await d.read(n)` awaits the call, and stops at the first
+`?`, which then applies to the awaited value — `await f()?` is `(await f())?`, and `await f() + 1` is
+`(await f()) + 1`. [Where `await` binds](/reference/async/#where-await-binds) has the whole table.
 
 ### Two deliberate corrections to C
 
@@ -542,6 +548,9 @@ arguments, index expressions. With an order defined, the expression above has on
 merely hard to read, which makes it a lint candidate and not a footgun.
 
 Postfix binds tighter than prefix, so `*p++` is `*(p++)` and `-a.b` is `-(a.b)`, exactly as in C.
+The one prefix that reaches past a postfix is [`await`](/reference/async/#where-await-binds), which
+takes its operand's calls, member selections and indexes but stops at the first `?` — `await f()?`
+is `(await f())?` — while `-a?` stays `-(a?)`.
 
 ## The postfix tail
 

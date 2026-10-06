@@ -54,7 +54,7 @@ sizeof static struct then trait true type val var weak while`.
 
 **Contextual** — keywords only where the grammar expects one, ordinary names everywhere else: `is`,
 `not`, `end`, `become`, `opaque`, `derives`, `invariant`, `new`, `set`, `some`, `with`, `within`,
-`where`, and the `c` of a `c const` / `c type` block. Type names (`int`, `usize`, `f32`, `string`, …)
+`where`, `async`, `await`, and the `c` of a `c const` / `c type` block. Type names (`int`, `usize`, `f32`, `string`, …)
 are predeclared identifiers, not reserved.
 
 **`__…__`** — leading and trailing `__` with capitals between — is reserved to the language;
@@ -239,9 +239,10 @@ enclosing module and everything under it. The bracket takes a **simple name, not
 - **`x is Pat`** and `x is not Pat` test against the full pattern grammar, alternatives included, and
   stand **in the condition of an `if` or a `while` and nowhere else** — chain them with `&&`, or use a
   `match`.
-- **`?`** is postfix and tightest: on `Ok(v)`/`Some(v)` it is `v`, otherwise it returns the failure
-  from the enclosing function — which must return the same channel. It converts the error through
-  `From`.
+- **`?`** is postfix and tightest — except that **`await`** takes the postfix chain up to the first
+  `?`, so `await f()?` is `(await f())?`: on `Ok(v)`/`Some(v)` it is `v`, otherwise it returns the
+  failure from the enclosing function — which must return the same channel. It converts the error
+  through `From`.
 - **`base with { bg = 9 }`** is `base` again with those fields changed; the left side is untouched.
 - **`.Green`** is the variant with the qualifier the context already supplies left off.
 - **A call's last argument may be an indented block** after a `:`; what the block becomes is decided
@@ -426,6 +427,37 @@ default; a `requires` block names what the consumer must supply a path or a `.pc
 `sysl run · build · build-lib · build-c · test · add · deps · vendor · emit-llvm · emit-ast ·
 emit-typed · emit-header · weave · tangle · targets · prove`, and an unknown word runs `sysl-<word>`
 off the `PATH`.
+
+## Async and tasks
+
+[Full page](/reference/async/).
+
+```sysl
+async double(n: int) -> int
+    await yield_now()
+    n * 2
+
+async total() -> int = await double(3) + await double(4)
+
+print(block_on(total()))
+```
+
+```output
+14
+```
+
+- **Calling an `async` function runs nothing** — it hands back a `Task[T]`. **`await t`** runs the
+  task to its `T`, and is written only in an `async` function's body: not in a closure, not in the
+  entry file's statements. A task where its value was wanted is refused with a hint to `await` it.
+- **`block_on(t)`** drives a task to its end from ordinary code; an executor is written against
+  **`step(t, waker)`**, **`await park(registrar)`** and **`await yield_now()`**, and lives in a
+  package, never in the standard library.
+- **A task's frame is on the heap**, through a pair of overridable hooks; **dropping a task cancels
+  it**, running its `defer`s and releasing its locals.
+- **A task crosses a concurrency domain** only when everything its frame holds — parameters, result,
+  bindings alive across an `await`, values a statement computed before its `await`, the tasks it
+  awaits — is safe to share. A task that awaits `park` never crosses.
+- `@export`, `extern`, `interrupt`, a property and an entry statement cannot be `async`.
 
 ## C interop
 

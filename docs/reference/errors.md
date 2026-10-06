@@ -1672,4 +1672,4 @@ is one nobody could reason about. That is why the row above says *instead of*: t
 
 ---
 
-Next: [the foreign interface](/reference/ffi/).
+Next: [async and tasks](/reference/async/).

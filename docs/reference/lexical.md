@@ -499,14 +499,16 @@ lexer having heard of them, and no list of widths has to be maintained anywhere.
 
 A few words are **contextual** — special only where the grammar expects one, and ordinary identifiers
 everywhere else: `is`, `not`, `end`, `become`, `opaque`, `derives`, `invariant`, `new`, `set`, `some`,
-`with`, `within`, `where`, and the `c` of a [`c const` or `c type`](/reference/ffi/) block. You may name a
-variable `where`; you may not name one `while`.
+`with`, `within`, `where`, [`async` and `await`](/reference/async/#async-and-await-are-contextual),
+and the `c` of a [`c const` or `c type`](/reference/ffi/) block. You may name a variable `where`; you
+may not name one `while`.
 
 **A word is contextual rather than reserved when it can be**, and the trade is the same every time: a
 reserved word is spent out of every program's namespace for the sake of one line apiece.
-[`become`](/reference/declarations/) is the newest of them and needs no reservation at all, because
-two identifiers in a row are not otherwise a statement — so a `become` of a function called `become`
-reads as exactly what it is.
+[`become`](/reference/declarations/) needs no reservation at all, because two identifiers in a row
+are not otherwise a statement — so a `become` of a function called `become` reads as exactly what it
+is. `async` is the same case, being a keyword only where a declaration follows it, and `await` only
+where an operand does.
 
 `set` is read only where a member declaration begins, which is what keeps the word available for
 everything else it is wanted for — a container, a local, a method:
