@@ -25,7 +25,8 @@
 #   3. stage 1: the `sysl` on PATH (or `SYSL_RELEASE_SEED`) builds this tree against the SEED'S OWN
 #      library -- `SYSL_RELEASE_SEED_LIB`, else `<seed prefix>/share/sysl/library` -- since the
 #      release library may use forms the seed's library has not got and the seed cannot compile --
-#      plus a `--lib` overlay of the modules the release library ADDS (`reference_overlay.sh`)
+#      plus a `--lib` overlay of the modules the release library ADDS (`reference_overlay.sh`), with
+#      `SYSL_LIB` unset as the gate runs it
 #   4. stage 2: stage 1 builds this tree against the RELEASE library; **stage 2 is what ships**
 #   5. stage 3: stage 2 builds this tree against the release library; stage 2 and stage 3 each
 #      `emit-llvm .` and the two texts must be identical -- one source, one library, so a difference
@@ -262,7 +263,11 @@ build_stage1() {
     else
         print -r -- "seed overlay: none (the seed's library has every module the tree adds)"
     fi
-    heavy $proj env SYSL_LIB=$seed_lib $seed build . $lib_args $opt -o $out/stage1
+    # The gate's form: `SYSL_LIB` unset, so the seed finds the library beside itself. Only a library
+    # named outright (`SYSL_RELEASE_SEED_LIB`, a seed with none beside it) is handed over.
+    local lib_env=(-u SYSL_LIB)
+    [[ -n $SYSL_RELEASE_SEED_LIB ]] && lib_env=(SYSL_LIB=$seed_lib)
+    heavy $proj env $lib_env $seed build . $lib_args $opt -o $out/stage1
 }
 
 if (( reuse_stage1 )); then
