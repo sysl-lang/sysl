@@ -190,13 +190,19 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
         emit(e, InStore(lty(e, elem), v, p, AccPlain, None))
         return
 
+    // **Only the first free slot is placed in line.** It is the case a container appending to its own
+    // storage reaches every time, and it gives nothing back. A live slot (an ordinary assignment,
+    // letting go of what was there), a slot past the first free one (a trap) and storage that is not
+    // a buffer of these slots are all one out-of-line call, `arc.slotplace.<T>`, kept so by `noinline`
+    // and `cold`: written here they made every append carry a trap the optimizer cannot settle -- it
+    // cannot see that a container's count never passes the live prefix -- and a body too large for
+    // `@inline` to bring into its caller.
     val buffer_l = fresh_label(e, "slot.buffer")
-    val past_l = fresh_label(e, "slot.past")
     val fresh_l = fresh_label(e, "slot.fresh")
-    val held_l = fresh_label(e, "slot.held")
+    val rest_l = fresh_label(e, "slot.rest")
     val done_l = fresh_label(e, "slot.done")
 
-    buffer_test(e, elem, view.0, buffer_l, held_l)
+    buffer_test(e, elem, view.0, buffer_l, rest_l)
     emit_label(e, buffer_l)
 
     val lp = slot_header(e, elem, view.0, header_fields())
@@ -208,17 +214,7 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
     val at_edge = fresh_reg(e)
 
     emit(e, InIntCmp(at_edge, IEq, LPtr, p, edge))
-    emit_term(e, InCondBr(at_edge, fresh_l, past_l))
-
-    // A slot beyond the first free one: the hook walks a prefix, so a value there would never be let
-    // go of and the slots between would be walked as though they held something.
-    emit_label(e, past_l)
-
-    val inside = fresh_reg(e)
-
-    emit(e, InIntCmp(inside, IUlt, LPtr, p, edge))
-    trap_unless(e, inside, "slot")
-    emit_term(e, InBr(held_l))
+    emit_term(e, InCondBr(at_edge, fresh_l, rest_l))
 
     // The first free slot: nothing is there to give back, and the prefix now covers it.
     emit_label(e, fresh_l)
@@ -231,11 +227,51 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
     emit(e, InStore(word_lty(e), grown, lp, AccPlain, None))
     emit_term(e, InBr(done_l))
 
-    emit_label(e, held_l)
-    store_into(e, elem, p, v, AccPlain)
+    emit_label(e, rest_l)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, view.0))
+    args.push(ir_arg(LPtr, p))
+    args.push(ir_arg(lty(e, elem), v))
+    emit(e, ir_call(None, LVoid, slot_place_fn(e, elem), args))
     emit_term(e, InBr(done_l))
     emit_label(e, done_l)
 end gen_slot_place
+
+// The out-of-line rest of a `slot_place` of an element that holds a count.
+private slot_place_fn(e: *Emit, elem: Type) -> Val =
+    VGlobal(request_helper(e, s"arc.slotplace.${mangle(elem)}", HrSlotPlace(elem)))
+
+/** The body of `arc.slotplace.<T>(o, p, v)`: `v` put at `p`, a slot of storage owned by `o`, where
+ * the caller has already found `p` is not the first free slot of a buffer of these slots. In such a
+ * buffer a slot before the edge is live and is an ordinary assignment, and one past it would leave a
+ * gap the hook cannot see past, so it traps; storage of any other kind is an ordinary assignment.
+ */
+gen_slot_place_rest(e: *Emit, elem: Type)
+    val owner = VReg("o")
+    val p = VReg("p")
+    val buffer_l = fresh_label(e, "slot.buffer")
+    val held_l = fresh_label(e, "slot.held")
+
+    buffer_test(e, elem, owner, buffer_l, held_l)
+    emit_label(e, buffer_l)
+
+    val live = fresh_reg(e)
+
+    emit(e, InLoad(live, word_lty(e), slot_header(e, elem, owner, header_fields()), AccPlain, None))
+
+    val edge = slot_at(e, elem, slot_header(e, elem, owner, header_fields() + 1), live)
+    val inside = fresh_reg(e)
+
+    emit(e, InIntCmp(inside, IUlt, LPtr, p, edge))
+    trap_unless(e, inside, "slot")
+    emit_term(e, InBr(held_l))
+
+    emit_label(e, held_l)
+    store_into(e, elem, p, VReg("v"), AccPlain)
+    emit_term(e, InRet(None, None))
+end gen_slot_place_rest
 
 private gen_slot_vacate(e: *Emit, xs: TExpr, from: TExpr, elem: Type)
     val view = slot_view(e, xs)
