@@ -44,14 +44,9 @@ sysl --version
 sysl --help
 ```
 
-**macOS on Apple silicon, and Linux on x86_64 and arm64.** The tap picks the right one for the
-machine it is run on. Anything else builds from source, below.
-
-The Linux binaries need **glibc 2.34 or newer** — Ubuntu 22.04, Debian 12, RHEL 9, and anything
-later. That is a property of the machine they were built on rather than of sysl, and it is the one
-way an install can fail that the formula cannot check for you: `version GLIBC_2.34 not found` from
-the dynamic loader is this, and not a corrupted download. On an older distribution, build from
-source.
+**The alpha formula is macOS on Apple silicon only.** The `0.1.0` alphas are cut by the compiler
+itself on a Mac and ship one binary, `darwin-arm64`; Linux binaries return when a Linux build is part
+of the release. Anything else builds from source, below.
 
 ## Your first compile
 
@@ -150,7 +145,7 @@ wherever `XDG_CACHE_HOME` points — under a fingerprint of the library it was b
 built once per machine rather than once per project, nothing is written into your source tree, and
 installing a compiler with a different library gets its own entry instead of a stale hit.
 
-**The entry also names the compiler that built it — its version and a digest of its own sources — so
+**The entry also names the compiler that built it — its version and a digest of its own executable — so
 a different build of the same version never reads back another build's archive.** The same key
 names the binaries `sysl run` and `sysl test` keep, so neither replays what an earlier compiler made
 for an unchanged program. A compiler before 0.0.151 keyed both on the version alone.
@@ -172,11 +167,9 @@ path, since the ordinary way of training is to merge a new profile over the old 
 Nothing there is ever evicted, and everything in it is derived: deleting the directory costs one
 rebuild.
 
-Two flags matter when you want something other than that. `--std-lib <path>` names an artifact
-explicitly, and an artifact you named is never rebuilt behind your back — if it will not read, the
-compilation stops and says so. `--no-std-lib` compiles the standard module from its source instead
-of linking a prebuilt one, with no toolchain involved at all, which is the path the compiler's own
-test suite takes.
+**Nothing names the cached artifact.** To compile against another standard module, set `SYSL_LIB`
+to the root its source is in; `--std-lib` is refused, saying exactly that. `--no-std-lib` compiles
+the standard module from its source together with the program instead of linking the cached one.
 
 ## Optimization
 
@@ -199,14 +192,12 @@ still wins where it is given, so a project built at `2` is profiled at `0` by ty
 Install clang and try again. Installing from the tap brings LLVM with it, so this is a
 built-from-source problem.
 
-**`llvm-ar` complaints when building a library** — you have the platform archiver, not LLVM's.
-Point at LLVM's with `--ar /path/to/llvm-ar`.
+**`cannot find llvm-ar`** — the platform's own `ar` is not a substitute, so sysl looks for LLVM's:
+`llvm-ar` on the `PATH`, then `/opt/homebrew/opt/llvm/bin` and `/usr/local/opt/llvm/bin`. Install
+LLVM, or put its `bin` on the `PATH`.
 
 **`cannot find the standard module's source`** — the compiler could not find the library it ships
 with, and the message lists every path it tried. From a package install that means the install is
 incomplete: reinstall it. From a checkout it usually means the working directory is not in the tree.
 Either way `SYSL_LIB=/path/to/library` names the library root outright, where the root is the
 directory holding `sysl` — that is, the `library` above `library/sysl`, not `library/sysl` itself.
-
-**sbt is slow on the first run** — it is downloading Scala and the dependency tree. This happens
-once.

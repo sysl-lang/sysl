@@ -425,7 +425,9 @@ with; a `capabilities` block says what the machine **cannot** do, since everythi
 default; a `requires` block names what the consumer must supply a path or a `.pc` file for.
 
 `sysl run · build · build-lib · build-c · test · add · deps · tidy · vendor · doc · emit-llvm ·
-emit-ast · emit-typed · emit-header · weave · tangle · targets · prove`. An option no command takes
+emit-ast · emit-typed · emit-header · weave · tangle · targets · prove` — `weave`, `tangle`, `vendor`
+and `targets` not yet in this compiler, which answers each with "not a command this compiler can carry
+out yet". An option no command takes
 is refused, never passed over. A `workspace = [...]` list in a root manifest makes several projects
 one [workspace](/reference/packages/#workspaces): one version selection, one `sysl.sum`, members
 depending on each other with `{ workspace = true }`, and `-p <member>` to pick one.

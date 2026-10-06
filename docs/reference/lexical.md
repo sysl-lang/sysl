@@ -136,6 +136,9 @@ ask for each half by name:
   so nothing can colour it and nothing scanning for the code can find it. `weave` tells the renderer
   that an indented block is sysl and passes the source through verbatim.
 
+*Neither command is in this compiler yet — each answers "is not a command this compiler can carry
+out yet". A build still tangles a `.lsysl` file, which is how one compiles.*
+
 Both are covered under the [CLI](/getting-started/cli/). Weaving asks for no target, no standard
 module and no library, which is what makes a package's prose worth reading on a machine that could
 not build it.

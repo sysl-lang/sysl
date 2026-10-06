@@ -96,6 +96,9 @@ Releases carry three binaries:
 | `linux-arm64` | |
 | `linux-x86_64` | |
 
+**The `0.1.0` alphas carry only the first**, `darwin-arm64`: they are cut by the self-hosted compiler
+on a Mac, and the two Linux binaries return when a Linux build of it is part of the release.
+
 There is **no darwin-x86_64 build and no Windows build**, and neither is an oversight. Building from
 source reaches more than this list does; what the table describes is what is downloadable, not what
 the compiler supports.

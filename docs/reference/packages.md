@@ -1182,8 +1182,9 @@ graph that somehow did not settle is refused rather than built against whichever
 
 ### Choosing them on the command line
 
-Three flags, and [`run`, `build`, `build-c`, `test`, `deps` and
-`vendor`](/getting-started/cli/#the-feature-flags) take them:
+Three flags, and [`run`, `build`, `build-c`, `test` and
+`deps`](/getting-started/cli/#the-feature-flags) take them — `vendor` too, once it is in this
+compiler:
 
 | | |
 |---|---|
@@ -1527,6 +1528,10 @@ The version comes from `git ls-remote --tags`, so it works for any host a build 
 manifest is rewritten one run of bytes at a time, which is why your comments and layout survive it,
 and the result is read back before it is written — a rewrite that produced something unreadable
 leaves the file exactly as it was. Nothing is fetched; the next build does that.
+
+*`sysl vendor` is not yet in this compiler — it answers "`vendor` is not a command this compiler can
+carry out yet". A `vendor/` directory already there is read as described below; what follows is the
+command that will write one.*
 
 `sysl vendor` puts everything the project resolves to into a `vendor/` directory beside the manifest:
 

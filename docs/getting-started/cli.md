@@ -23,19 +23,27 @@ the path is standing on.
 | `sysl emit-ast <path>` | print one file's untyped parse tree, as deterministic text |
 | `sysl emit-typed <path>` | print one module's typed tree, as deterministic text |
 | `sysl emit-header <path>` | print the C header for what a module exports |
-| `sysl weave <path>` | render a literate source as an HTML document |
-| `sysl tangle <path>` | print the program a literate source holds |
+| `sysl weave <path>` | render a literate source as an HTML document — *not yet in this compiler* |
+| `sysl tangle <path>` | print the program a literate source holds — *not yet in this compiler* |
 | `sysl deps <path>` | print the dependency graph the project resolves to |
 | `sysl add <coordinate>` | add a dependency to the project's manifest |
-| `sysl vendor <path>` | put what the project depends on into `vendor/` |
+| `sysl vendor <path>` | put what the project depends on into `vendor/` — *not yet in this compiler* |
 | `sysl tidy [<path>]` | drop the `sysl.sum` lines for versions the project no longer resolves |
 | `sysl doc <path>` | generate an API reference from declarations and their doc comments |
-| `sysl targets` | list the machines sysl can build for |
+| `sysl targets` | list the machines sysl can build for — *not yet in this compiler* |
 | `sysl prove <path>` | discharge the contracts with Why3 — see [verification](/reference/verification/#sysl-prove) |
 
 A subcommand is required; sysl with none exits 2 and prints its usage.
 
 A word that is not one of these is refused with the usage, and exits 2.
+
+**Four of these are not in this compiler yet**: `weave`, `tangle`, `vendor` and `targets`. Each is
+described below as it will work, and until it is added each is refused in the same words, with the
+usage under them and exit status 2:
+
+```text
+sysl: `weave` is not a command this compiler can carry out yet
+```
 
 ### `run`
 
@@ -330,6 +338,9 @@ error, exits non-zero and prints the ordinary diagnostic instead, with nothing o
 
 ### `weave`
 
+*Not yet in this compiler — it answers "`weave` is not a command this compiler can carry out yet".
+What follows is the command as it will be.*
+
 ```bash
 sysl weave guide/slab/slab.lsysl -o slab.html
 sysl weave library/sysl/regex -o documents/
@@ -365,6 +376,9 @@ The two answer different questions — `weave` renders a document somebody *wrot
 the declarations *say* — so a tree usually wants both, and neither is a substitute for the other.
 
 ### `tangle`
+
+*Not yet in this compiler — it answers "`tangle` is not a command this compiler can carry out yet".
+What follows is the command as it will be.*
 
 ```bash
 sysl tangle guide/slab/slab.lsysl
@@ -476,6 +490,9 @@ result is read back through the manifest reader before it is written, so a rewri
 something unreadable leaves the file exactly as it was.
 
 ### `vendor`
+
+*Not yet in this compiler — it answers "`vendor` is not a command this compiler can carry out yet".
+What follows is the command as it will be.*
 
 Every package the project depends on, put in a `vendor/` directory beside the manifest.
 
@@ -593,6 +610,10 @@ site means a templating engine, an asset pipeline and a web server, and a system
 business carrying any of that. Without a `juicer` it says so and where one comes from.
 
 ### `targets`
+
+*Not yet in this compiler — it answers "`targets` is not a command this compiler can carry out yet".
+What follows is the command as it will be; meanwhile the names a `--target` takes are listed by the
+refusal of one it does not know, quoted under `--target` below.*
 
 The registry, one line per machine — the name to write after `--target`, the LLVM triple it stands
 for, and, for a target sysl knows and cannot build for, why not:
@@ -822,7 +843,7 @@ __aeabi_ldivmod` at the link, which is the one place anybody will come looking f
 | `--profile-use <file>` | build against a merged profile |
 | `--no-bounds-locations` | leave the `file:line:column` out of a failed bounds check's report — the [`bounds_locations` key](/reference/packages/#leaving-the-bounds-locations-out) for one build |
 | `-p <member>`, `--package <member>` | in a [workspace](/reference/packages/#workspaces), the member to build, test or run |
-| `-v`, `--verbose` | report what the build decided — the standard module, the files read, the command lines |
+| `-v`, `--verbose` | report the link line handed to clang |
 | `--explain-escapes` | report every local array promoted to the heap |
 
 **An option no command takes is refused, never passed over.** Each mistake is named on a line of its
@@ -914,7 +935,8 @@ training looked like, expect less.
 
 ### The feature flags
 
-`run`, `build`, `build-c`, `test`, `deps` and `vendor` take three more, which choose the root
+`run`, `build`, `build-c`, `test` and `deps` take three more (and `vendor` will, once it is in this
+compiler), which choose the root
 project's [features](/reference/packages/#features) — and so which optional dependencies are fetched
 at all:
 
@@ -1009,21 +1031,17 @@ sysl: error: unknown target 'arm-linux' — sysl knows aarch64-macos, x86_64-mac
 
 ### `-v`, `--verbose`
 
-What the build decided, on stderr — which is where `wrote <exe>` goes, so stdout stays whatever the
-build was for:
+The link line the build handed to clang, on stderr — `wrote <exe>` stays on stdout, so the two can
+be read apart:
 
 ```
-sysl: 1 source file(s) under hello
-sysl:   read hello/hello.sysl
-sysl: standard module linked from ~/Library/Caches/sysl/<version>-…/std.syslib
-sysl: link: clang --target=arm64-apple-macosx -Wno-override-module -O1 …
+sysl: link: clang --target=arm64-apple-macosx -Wno-override-module -O1 -Wl,-dead_strip hello.ll ~/Library/Caches/sysl/<version>+…/std.syslib -o hello
 ```
 
-Three things, and they are the three that have actually been the answer to a question: **which
-standard module** the compilation got and whether it was linked or compiled from source, the **files
-it read**, and the **command lines** handed to clang together with the `--lib`, `--link-path` and
-`--include-path` searches behind them. There are no phase timings: a build that is slow is diagnosed
-by asking what it *did*.
+That one line answers the question that has most often been asked of a build: **which standard
+module** it got — a cached `std.syslib` on the line, or, under `--no-std-lib`, the objects compiled
+from its source in its place — and with which flags, search paths and libraries it was linked. There
+are no phase timings: a build that is slow is diagnosed by asking what it *did*.
 
 ### `--explain-escapes`
 

@@ -501,9 +501,9 @@ failing line will appear to have printed **none** of them if a check is what sto
 survives the trap:
 
 ```text
-index 5 out of bounds for length 3 (main.sysl:2:9)
-range 2..<9 out of bounds for length 3 (main.sysl:2:9)
-range start 3 is past its end 2 (main.sysl:2:9)
+index 5 out of bounds for length 3 (main.sysl:2:8)
+range 2..<9 out of bounds for length 3 (main.sysl:2:8)
+range start 3 is past its end 2 (main.sysl:2:8)
 range end 2 is not on a character boundary (main.sysl:2:8)
 ```
 
