@@ -73,7 +73,14 @@ end tidy_root
 
 // The whole command once the command line has been read.
 tidy_project(path: string, check: bool, say: string -> unit) -> int
-    val root = tidy_root(path)
+    // **Inside a workspace there is one `sysl.sum`, at its root**, and tidying it from any member
+    // tidies it for all of them.
+    val root = resolution_root(tidy_root(path)) match
+        Err(why) ->
+            say(refused(why))
+            return Failed
+        Ok(dir) -> dir
+
     val file = join_path(root, SumsName)
 
     if !is_file(join_path(root, ManifestName))
@@ -126,6 +133,17 @@ private tidy_say(say: string -> unit, verb: string, keys: &Buf[(string, Release)
 // What the file would be after tidying, resolved over the whole graph.
 private tidy_answer(root: string, text: string) -> Result[Tidied, string]
     val before = sums_read(text)?
+
+    // A workspace's lines are what its one selection reads, which is every member's whole graph.
+    val around = workspace_around(root)?
+
+    around match
+        Some(ws) ->
+            val s = workspace_selection(ws, before, cache_root(ws.root)?)?
+
+            return Ok(sums_tidied(text, s.sums, s.read))
+        None -> ()
+
     val m = manifest_of_package(root)?
     var declared: Buf[Dependency] = buf()
 

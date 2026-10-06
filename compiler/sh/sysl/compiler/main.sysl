@@ -4,7 +4,7 @@ import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
 import sysl.fs.read_text
 import sysl.prints
-import sysl.text.Search
+import sysl.text.{join, Search}
 
 // The driver: what the shell asked for, and what it hears back.
 //
@@ -349,6 +349,7 @@ private build_command(args: []string, say: string -> unit) -> int
     var cc: Option[string] = None
     var out: Option[string] = None
     var level: Option[string] = None
+    var picked: Option[string] = None
     var file = ""
     var mistakes: Buf[string] = buf()
     var i: usize = 2
@@ -396,6 +397,16 @@ private build_command(args: []string, say: string -> unit) -> int
             level = Some(given.1)
 
             if given.0 == 2 then i += 1
+        else if took_package_flag(args, i).0 != 0
+            val given = took_package_flag(args, i)
+
+            if given.0 < 0
+                mistakes.push(missing_value(args[i]))
+                break
+            end if
+
+            picked = Some(given.1)
+            i += 1
         else
             val taken = took_any_command_flag(args, i, &mistakes)
 
@@ -408,6 +419,9 @@ private build_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
+    // `-p` alone builds that member of the workspace the working directory is in.
+    if file == "" && picked.is_some() then file = "."
+
     if file == ""
         say(build_usage())
         return Misused
@@ -415,6 +429,35 @@ private build_command(args: []string, say: string -> unit) -> int
 
     if refused_features(say) then return Failed
 
+    // **At a workspace root, every member is built**, the root first where it is a package; `-p`
+    // narrows that to one. Each is an ordinary build of its own directory, the first refusal ending
+    // the run as a build's refusal always does.
+    val projects = workspace_projects(file, picked) match
+        Err(why) ->
+            say(refused(why))
+            return Failed
+        Ok(found) -> found
+
+    projects match
+        None -> build_project(file, named, cc, level, out, say)
+        Some(members) ->
+            if out.is_some() && members.len() > 1
+                say(refused(s"'-o' names one file, and this workspace builds ${members.len()} " +
+                    "members — pick one with '-p <member>'"))
+                return Failed
+            end if
+
+            for k in 0..<members.len()
+                val code = build_project(members.at(k).dir, named, cc, level, out, say)
+
+                if code != Fine then return code
+
+            Fine
+end build_command
+
+// One project's build, once the command line has been read.
+private build_project(file: string, named: Option[string], cc: Option[string], level: Option[string],
+                      out: Option[string], say: string -> unit) -> int
     val at = build_level(file, level) match
         Err(why) ->
             say_failure(why, say)
@@ -428,7 +471,7 @@ private build_command(args: []string, say: string -> unit) -> int
         Ok(exe) ->
             say(s"wrote $exe")
             Fine
-end build_command
+end build_project
 
 // How a refusal about the COMMAND begins -- a flag, a path, a manifest, a library the compilation was
 // pointed at. The reference introduces one with its own name, as a Unix tool does; a source
@@ -533,8 +576,8 @@ took_level(args: []string, i: usize) -> (int, string)
 end took_level
 
 private build_usage() -> string =
-    "usage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] " + where_flags() +
-    " " + feature_flags() + " " + pipeline_usage() + " <path>"
+    "usage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] [-p <member>] " +
+    where_flags() + " " + feature_flags() + " " + pipeline_usage() + " <path>"
 
 // What a build may ask of LLVM beyond the level (`pipeline.sysl`), which `build`, `run` and `test` say.
 private pipeline_usage() -> string =
@@ -714,6 +757,7 @@ private run_command(args: []string, say: string -> unit) -> int
     var named: Option[string] = None
     var cc: Option[string] = None
     var level: Option[string] = None
+    var picked: Option[string] = None
     var file = ""
     var forwarding = false
     var program_args: Buf[string] = buf()
@@ -761,6 +805,16 @@ private run_command(args: []string, say: string -> unit) -> int
                 level = Some(given.1)
 
                 if given.0 == 2 then i += 1
+            else if took_package_flag(args, i).0 != 0
+                val given = took_package_flag(args, i)
+
+                if given.0 < 0
+                    mistakes.push(missing_value(args[i]))
+                    break
+                end if
+
+                picked = Some(given.1)
+                i += 1
             else
                 // Only ahead of the `--`: what comes after it is the program's, options and all.
                 val taken = took_any_command_flag(args, i, &mistakes)
@@ -774,10 +828,22 @@ private run_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
+    // `-p` alone runs that member of the workspace the working directory is in.
+    if file == "" && picked.is_some() then file = "."
+
     if file == ""
         say(run_usage())
         return Misused
     end if
+
+    // **One program runs**, so a workspace narrows to the member `-p` picked; without one, the path
+    // is the project, the root package where the root is one.
+    if picked.is_some()
+        file = workspace_projects(file, picked) match
+            Err(why) ->
+                say(refused(why))
+                return Failed
+            Ok(found) -> found.unwrap().at(0).dir
 
     if refused_features(say) then return Failed
 
@@ -795,8 +861,8 @@ private run_command(args: []string, say: string -> unit) -> int
 end run_command
 
 private run_usage() -> string =
-    "usage: sysl run [--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " " +
-    feature_flags() + " " + pipeline_usage() + " <path> [-- <args>]"
+    "usage: sysl run [--target <name>] [--cc <path>] [-O<level>] [-p <member>] " + where_flags() +
+    " " + feature_flags() + " " + pipeline_usage() + " <path> [-- <args>]"
 
 // The flags every command that compiles a program takes, written once so that seven usage lines
 // cannot come to disagree about them. `--lib` names a source **directory** and may be given more
@@ -822,6 +888,7 @@ private test_command(args: []string, say: string -> unit) -> int
     var fail_fast = false
     var std = false
     var named_level: Option[string] = None
+    var picked: Option[string] = None
     var file = ""
     var mistakes: Buf[string] = buf()
     var i: usize = 2
@@ -867,6 +934,16 @@ private test_command(args: []string, say: string -> unit) -> int
             named_level = Some(given.1)
 
             if given.0 == 2 then i += 1
+        else if took_package_flag(args, i).0 != 0
+            val given = took_package_flag(args, i)
+
+            if given.0 < 0
+                mistakes.push(missing_value(args[i]))
+                break
+            end if
+
+            picked = Some(given.1)
+            i += 1
         else
             val taken = took_any_command_flag(args, i, &mistakes)
 
@@ -879,6 +956,9 @@ private test_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
+    // `-p` alone tests that member of the workspace the working directory is in.
+    if file == "" && picked.is_some() then file = "."
+
     if file == ""
         say(test_usage())
         return Misused
@@ -890,6 +970,50 @@ private test_command(args: []string, say: string -> unit) -> int
     // build never compiles is code the suite would otherwise never see.
     set_feature_testing()
 
+    val projects = workspace_projects(file, picked) match
+        Err(why) ->
+            say(refused(why))
+            return Failed
+        Ok(found) -> found
+
+    projects match
+        None -> test_project(file, named, cc, filter, fail_fast, std, named_level, say)
+        Some(members) -> test_members(members, named, cc, filter, fail_fast, std, named_level, say)
+end test_command
+
+// **Every member's suite, each reported under its own name**, and a line at the end saying how the
+// workspace came out. A failing member does not stop the others unless `--fail-fast` asked for that:
+// the point of testing a workspace at once is to hear about all of it.
+private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: Option[string],
+                     filter: Option[string], fail_fast: bool, std: bool, named_level: Option[string],
+                     say: string -> unit) -> int
+    var failed: Buf[string] = buf()
+    var tested: usize = 0
+
+    for k in 0..<members.len()
+        val mb = members.at(k)
+
+        say(s"testing ${mb.name} (${mb.dir})")
+        tested += 1
+
+        if test_project(mb.dir, named, cc, filter, fail_fast, std, named_level, say) != Fine
+            failed.push(mb.name)
+
+            if fail_fast then break
+        end if
+
+    if members.len() > 1
+        if failed.is_empty() then say(s"workspace: $tested members tested, every one passed")
+        else say(s"workspace: $tested members tested, ${failed.len()} failed: " +
+                 join(failed.view(), ", "))
+    end if
+
+    if failed.is_empty() then Fine else Failed
+end test_members
+
+// One project's suite, once the command line has been read.
+private test_project(file: string, named: Option[string], cc: Option[string], filter: Option[string],
+                     fail_fast: bool, std: bool, named_level: Option[string], say: string -> unit) -> int
     val level = build_level(file, named_level) match
         Err(why) ->
             say_failure(why, say)
@@ -937,7 +1061,7 @@ private test_command(args: []string, say: string -> unit) -> int
     if made.1 then write_test_list(key.unwrap(), build.tests)
 
     tests_run(file, made.0, build.tests, filter, fail_fast, !made.1, say)
-end test_command
+end test_project
 
 // Nothing to run is not nothing to say. A tree with no tests at all and a filter that matched none of
 // the tests there are lead to the same empty report and are different mistakes, so each is named.
@@ -980,7 +1104,7 @@ private tests_run(file: string, exe: string, all: Buf[TTest], filter: Option[str
 end tests_run
 
 private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fast] [--std] " +
-    "[--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " " + feature_flags() + " " +
+    "[-p <member>] [--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " " + feature_flags() + " " +
     pipeline_usage() + " <path>"
 
 // `sysl build-lib [--std] [--target <name>] <path>` -- a library held to being a library for one
@@ -1139,6 +1263,17 @@ private add_command(args: []string, say: string -> unit) -> int
         say(add_usage())
         return Misused
 
+    // A workspace root with no `package` block refuses a `dependencies` block, so writing one there
+    // would leave a manifest the next build refuses.
+    manifest_at(root) match
+        Ok(m) ->
+            if m.workspace.is_some() && !m.has_package
+                say(refused(s"'${absolute_path(root)}' is a workspace with no 'package' block, so " +
+                    "it takes no dependencies — add it to the member that imports it, " +
+                    "'sysl add <coordinate> <member directory>'"))
+                return Failed
+        Err(_) -> ()
+
     add_to_project(root, spec) match
         Err(why) ->
             say(refused(why))
@@ -1195,6 +1330,26 @@ private deps_command(args: []string, say: string -> unit) -> int
 
     if refused_features(say) then return Failed
 
+    // **At a workspace root, every member's graph in turn**, each resolved as its build would be --
+    // with the workspace's versions -- and separated by a blank line.
+    workspace_projects(root, None) match
+        Err(why) ->
+            say(refused(why))
+            return Failed
+        Ok(None) -> deps_of(root, say)
+        Ok(Some(members)) ->
+            for k in 0..<members.len()
+                if k > 0 then say("")
+
+                val code = deps_of(members.at(k).dir, say)
+
+                if code != Fine then return code
+
+            Fine
+end deps_command
+
+// One project's listing.
+private deps_of(root: string, say: string -> unit) -> int
     val m = manifest_of_package(root) match
         Err(why) ->
             say(refused(why))
@@ -1210,7 +1365,7 @@ private deps_command(args: []string, say: string -> unit) -> int
 
             say(text[0..<text.len - 1])
             Fine
-end deps_command
+end deps_of
 
 private deps_usage() -> string = "usage: sysl deps " + feature_flags() + " <path>"
 

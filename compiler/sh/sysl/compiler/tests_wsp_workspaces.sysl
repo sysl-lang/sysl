@@ -1,0 +1,812 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, is_file, make_dir_all, make_temp_dir, read_text, remove_dir_all, remove_file, write_text}
+import sysl.process.capture
+import sysl.text.{join, split, Search}
+
+// **Workspaces**: several projects in one repository, resolved as one (`workspace.sysl`). Every tree
+// here is built on disk in a temporary directory -- a root manifest listing members, each member a
+// project of its own -- and every `git` dependency is laid out in the workspace's `vendor/`, sealed
+// with its tree hash as a fetch leaves it, so nothing reaches the network.
+
+// -- trees on disk --------------------------------------------------------------------------------
+
+private wsp_ready() -> bool = std_root().is_ok() && clang_available()
+
+private wsp_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+// A file at `rel` below `root`, its directories made.
+private wsp_write(root: string, rel: string, text: string)
+    val at = s"$root/$rel"
+
+    make_dir_all(parent_of(at).unwrap_or(root)).unwrap()
+    write_text(at, text).unwrap()
+end wsp_write
+
+private wsp_package(name: string, rest: string) -> string =
+    s"package { name = \"$name\", version = \"0.1.0\" }\n$rest"
+
+private wsp_deps(entries: string) -> string = s"dependencies { $entries }\n"
+
+private wsp_git(label: string, coordinate: string, version: string) -> string =
+    s"$label { git = \"$coordinate\", version = \"$version\" }"
+
+// A package in the workspace's `vendor/` at a coordinate and version, holding one module whose text
+// is `text`, sealed as a fetch would have left it.
+private wsp_vendored(ws: string, coordinate: string, version: string, module_name: string,
+                     text: string)
+    val dir = s"$ws/vendor/$coordinate/@v$version"
+
+    wsp_write(dir, "package.hocon", s"package { name = \"$module_name\", version = \"$version\" }\n")
+    wsp_write(dir, s"$module_name/$module_name.sysl", s"module $module_name\n\n$text\n")
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+end wsp_vendored
+
+// The refusal finding the workspace a directory belongs to answers with, or `""` where it found one.
+private wsp_refused(dir: string) -> string
+    workspace_around(dir) match
+        Err(why) -> why
+        Ok(_) -> ""
+end wsp_refused
+
+private wsp_members(dir: string) -> string
+    workspace_around(dir) match
+        Err(why) -> s"refused: $why"
+        Ok(None) -> "no workspace"
+        Ok(Some(ws)) ->
+            var rows: Buf[string] = buf()
+
+            for i in 0..<ws.members.len()
+                rows.push(s"${ws.members.at(i).path}=${ws.members.at(i).name}")
+
+            join(rows.view(), " ")
+end wsp_members
+
+// The whole driver: the status and every line said.
+private wsp_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end wsp_cli
+
+// What the program a build of `root` makes prints, or what stopped it.
+private wsp_run(root: string) -> string
+    val out_dir = wsp_temp("sysl-wsp-exe")
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end wsp_run
+
+// What selection chose for every fetched package of a graph, as sorted `canonical=version` words.
+private wsp_selected(g: &Graph) -> string
+    var rows: Buf[string] = buf()
+
+    for i in 0..<g.packages.len()
+        val p = g.packages.at(i)
+
+        p.version match
+            None -> ()
+            Some(v) -> rows.push(s"${p.canonical}=${release_shown(v)}")
+
+    join(sorted_labels(rows).view(), " ")
+end wsp_selected
+
+// Every package of a graph that is not the root, by canonical prefix.
+private wsp_canonicals(g: &Graph) -> string
+    var rows: Buf[string] = buf()
+
+    for i in 0..<g.packages.len()
+        if !is_root_package(g.packages.at(i)) then rows.push(g.packages.at(i).canonical)
+
+    join(sorted_labels(rows).view(), " ")
+end wsp_canonicals
+
+private wsp_graph(dir: string) -> Graph
+    val m = manifest_of_package(dir).unwrap()
+
+    resolved_graph(dir, m).unwrap()
+end wsp_graph
+
+private wsp_drop(dirs: []string)
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+// The base names of the files a walk of `root` collects, sorted.
+private wsp_collected(root: string) -> string
+    var names: Buf[string] = buf()
+    val found = collect(root, None).unwrap()
+
+    for i in 0..<found.len()
+        names.push(basename(found.at(i).src.name))
+
+    join(sorted_labels(names).view(), " ")
+end wsp_collected
+
+// -- the manifest ---------------------------------------------------------------------------------
+
+@test("wsp: the workspace is a list of member directories")
+wsp_the_list_is_read()
+    val m = read_manifest("workspace = [\"compiler\", \"tools/*\", \"examples/board-probe\"]\n").unwrap()
+
+    assert_eq(join(m.workspace.unwrap().view(), " "), "compiler tools/* examples/board-probe")
+    assert(!m.has_package)
+    assert(m.warnings.is_empty())
+end wsp_the_list_is_read
+
+@test("wsp: and a manifest without one declares no workspace")
+wsp_no_list_no_workspace()
+    assert(read_manifest(wsp_package("app", "")).unwrap().workspace.is_none())
+
+@test("wsp: a workspace that is not a list of strings is refused")
+wsp_not_a_list()
+    val why = "'workspace' is not a list of directories — a workspace is written " +
+        "'workspace = [\"compiler\", \"tools/*\"]', each entry a member's directory relative to " +
+        "this file"
+
+    assert_eq(read_manifest("workspace = \"compiler\"\n").err().unwrap(), why)
+    assert_eq(read_manifest("workspace { members = [\"compiler\"] }\n").err().unwrap(), why)
+    assert_eq(read_manifest("workspace = [true]\n").err().unwrap(), why)
+end wsp_not_a_list
+
+@test("wsp: a workspace root with no package block takes no dependencies")
+wsp_virtual_root_takes_no_dependencies()
+    val got = read_manifest("workspace = [\"a\"]\n" + wsp_deps(wsp_git("buf", "github.com/e/buf", "1.0.0")))
+
+    assert_eq(got.err().unwrap(), "'dependencies' in a workspace with no 'package' block reaches " +
+        "nothing — the root compiles nothing of its own, so name each dependency in the member that " +
+        "imports it")
+end wsp_virtual_root_takes_no_dependencies
+
+@test("wsp: a member is depended on by name, with workspace = true")
+wsp_member_dependency_is_read()
+    val m = read_manifest(wsp_package("app", wsp_deps("geom { workspace = true }"))).unwrap()
+
+    assert_eq(m.dependencies.len(), 1)
+    assert_eq(m.dependencies.at(0).label, "geom")
+    assert(is_member_dependency(m.dependencies.at(0)))
+    assert(!is_git_dependency(m.dependencies.at(0)))
+end wsp_member_dependency_is_read
+
+@test("wsp: workspace = false is refused, since it is only ever true")
+wsp_workspace_false()
+    val got = read_manifest(wsp_package("app", wsp_deps("geom { workspace = false }")))
+
+    assert_eq(got.err().unwrap(), "'dependencies.geom.workspace' is only ever 'true' — leave it out " +
+        "and name a 'git' coordinate or a 'path' instead")
+end wsp_workspace_false
+
+@test("wsp: and a member named with a coordinate or a path as well is refused")
+wsp_workspace_and_git()
+    val why = "'dependencies.geom' names 'workspace = true' and a 'git', 'path' or 'version' as " +
+        "well — a workspace member is the directory the workspace lists, at no version, so it is " +
+        "named by the workspace alone"
+
+    assert_eq(read_manifest(wsp_package("app", wsp_deps("geom { workspace = true, git = " +
+        "\"github.com/e/geom\", version = \"1.0.0\" }"))).err().unwrap(), why)
+    assert_eq(read_manifest(wsp_package("app", wsp_deps("geom { workspace = true, path = " +
+        "\"../geom\" }"))).err().unwrap(), why)
+end wsp_workspace_and_git
+
+// -- the walk -------------------------------------------------------------------------------------
+
+// **A directory holding its own manifest is another project**, so the root's walk takes neither a
+// member nor a project nobody listed, and a member's walk still leaves its own `examples/` out.
+@test("wsp: a member's files are not the root's, and neither is any nested project")
+wsp_walk_stops_at_a_manifest()
+    val ws = wsp_temp("sysl-wsp-walk")
+
+    wsp_write(ws, "package.hocon", wsp_package("root", "workspace = [\"tools/probe\"]\n"))
+    wsp_write(ws, "lib/lib.sysl", "module lib\n")
+    wsp_write(ws, "examples/demo.sysl", "print(1)\n")
+    wsp_write(ws, "tools/probe/package.hocon", wsp_package("probe", ""))
+    wsp_write(ws, "tools/probe/main.sysl", "print(2)\n")
+    wsp_write(ws, "tools/probe/examples/try.sysl", "print(3)\n")
+    wsp_write(ws, "tools/probe/helper/helper.sysl", "module helper\n")
+    wsp_write(ws, "stray/package.hocon", wsp_package("stray", ""))
+    wsp_write(ws, "stray/stray.sysl", "print(4)\n")
+
+    assert_eq(wsp_collected(ws), "lib.sysl")
+    assert_eq(wsp_collected(s"$ws/tools/probe"), "helper.sysl main.sysl")
+    wsp_drop([ws])
+end wsp_walk_stops_at_a_manifest
+
+@test("wsp: and the C walk stops at the same place")
+wsp_c_walk_stops_too()
+    val ws = wsp_temp("sysl-wsp-cwalk")
+
+    wsp_write(ws, "package.hocon", wsp_package("root", "workspace = [\"m\"]\n"))
+    wsp_write(ws, "glue/glue.sysl", "module glue\n")
+    wsp_write(ws, "glue/glue.c", "int glue(void) { return 1; }\n")
+    wsp_write(ws, "m/package.hocon", wsp_package("m", ""))
+    wsp_write(ws, "m/inner/inner.sysl", "module inner\n")
+    wsp_write(ws, "m/inner/inner.c", "int inner(void) { return 2; }\n")
+
+    val cs = c_sources(ws, None).unwrap()
+
+    assert_eq(cs.len(), 1)
+    assert(cs.at(0).ends_with("/glue/glue.c"), cs.at(0))
+    wsp_drop([ws])
+end wsp_c_walk_stops_too
+
+// -- finding the workspace ------------------------------------------------------------------------
+
+@test("wsp: a member finds the workspace above it, and so does the root")
+wsp_found_from_member_and_root()
+    val ws = wsp_temp("sysl-wsp-find")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"a\", \"tools/*\"]\n")
+    wsp_write(ws, "a/package.hocon", wsp_package("a", ""))
+    wsp_write(ws, "tools/x/package.hocon", wsp_package("x", ""))
+    wsp_write(ws, "tools/y/package.hocon", wsp_package("y", ""))
+    make_dir_all(s"$ws/tools/images").unwrap()
+
+    assert_eq(wsp_members(ws), "a=a tools/x=x tools/y=y")
+    assert_eq(wsp_members(s"$ws/a"), "a=a tools/x=x tools/y=y")
+    assert_eq(wsp_members(s"$ws/tools/y"), "a=a tools/x=x tools/y=y")
+    wsp_drop([ws])
+end wsp_found_from_member_and_root
+
+@test("wsp: a root with a package block is a member itself, listed first")
+wsp_root_package_is_a_member()
+    val ws = wsp_temp("sysl-wsp-rootpkg")
+
+    wsp_write(ws, "package.hocon", wsp_package("kairos", "workspace = [\"examples/board-probe\"]\n"))
+    wsp_write(ws, "examples/board-probe/package.hocon", wsp_package("board-probe", ""))
+
+    assert_eq(wsp_members(ws), ".=kairos examples/board-probe=board-probe")
+    wsp_drop([ws])
+end wsp_root_package_is_a_member
+
+@test("wsp: a project below a workspace root that the list does not name belongs to none")
+wsp_unlisted_project_is_alone()
+    val ws = wsp_temp("sysl-wsp-alone")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"a\"]\n")
+    wsp_write(ws, "a/package.hocon", wsp_package("a", ""))
+    wsp_write(ws, "scratch/package.hocon", wsp_package("scratch", ""))
+
+    assert_eq(wsp_members(s"$ws/scratch"), "no workspace")
+    assert_eq(resolution_root(s"$ws/scratch").unwrap(), s"$ws/scratch")
+    assert_eq(resolution_root(s"$ws/a").unwrap(), ws)
+    wsp_drop([ws])
+end wsp_unlisted_project_is_alone
+
+// -- the refusals ---------------------------------------------------------------------------------
+
+@test("wsp: a member that does not exist is refused")
+wsp_missing_member()
+    val ws = wsp_temp("sysl-wsp-missing")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"nope\"]\n")
+
+    assert_eq(wsp_refused(ws), s"workspace member 'nope' does not exist — '$ws/nope' is not a directory")
+    wsp_drop([ws])
+end wsp_missing_member
+
+@test("wsp: a member with no manifest is refused")
+wsp_member_without_manifest()
+    val ws = wsp_temp("sysl-wsp-bare")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"bare\"]\n")
+    wsp_write(ws, "bare/bare.sysl", "print(1)\n")
+
+    assert_eq(wsp_refused(ws), "workspace member 'bare' has no package.hocon — a member is a project, " +
+        "and a project is a directory holding one")
+    wsp_drop([ws])
+end wsp_member_without_manifest
+
+@test("wsp: a member written outside the workspace is refused")
+wsp_member_outside()
+    val ws = wsp_temp("sysl-wsp-outside")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"../x\"]\n")
+
+    assert_eq(wsp_refused(ws), "'workspace' names '../x', which is not a directory below the " +
+        "workspace — a member is written relative to the file declaring the workspace, inside it, " +
+        "with '*' standing for one directory level")
+    wsp_drop([ws])
+end wsp_member_outside
+
+@test("wsp: a member nested inside another member is refused")
+wsp_nested_member()
+    val ws = wsp_temp("sysl-wsp-nested")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"a\", \"a/inner\"]\n")
+    wsp_write(ws, "a/package.hocon", wsp_package("a", ""))
+    wsp_write(ws, "a/inner/package.hocon", wsp_package("inner", ""))
+
+    assert_eq(wsp_refused(ws), "workspace member 'a/inner' is inside member 'a' — each member's tree " +
+        "is its own, so one member cannot hold another")
+    wsp_drop([ws])
+end wsp_nested_member
+
+@test("wsp: two members with one name are refused")
+wsp_two_members_one_name()
+    val ws = wsp_temp("sysl-wsp-twins")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"a\", \"b\"]\n")
+    wsp_write(ws, "a/package.hocon", wsp_package("twin", ""))
+    wsp_write(ws, "b/package.hocon", wsp_package("twin", ""))
+
+    assert_eq(wsp_refused(ws), "workspace members 'a' and 'b' are both named 'twin' — a member is " +
+        "picked and depended on by its 'package.name', so each needs its own")
+    wsp_drop([ws])
+end wsp_two_members_one_name
+
+@test("wsp: a member with no name is refused")
+wsp_member_without_name()
+    val ws = wsp_temp("sysl-wsp-anon")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"anon\"]\n")
+    wsp_write(ws, "anon/package.hocon", "requires { heap = true }\n")
+
+    assert_eq(wsp_refused(ws), "workspace member 'anon' has no 'package.name' — a member is picked " +
+        "with '-p' and depended on by that name")
+    wsp_drop([ws])
+end wsp_member_without_name
+
+@test("wsp: a member declaring a workspace of its own is refused")
+wsp_nested_workspace()
+    val ws = wsp_temp("sysl-wsp-nest")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"a\"]\n")
+    wsp_write(ws, "a/package.hocon", wsp_package("a", "workspace = []\n"))
+
+    assert_eq(wsp_refused(ws), "workspace member 'a' declares a workspace of its own — workspaces do " +
+        "not nest, so its members belong in the root's list")
+    wsp_drop([ws])
+end wsp_nested_workspace
+
+@test("wsp: a workspace dependency naming no member is refused")
+wsp_dependency_on_a_non_member()
+    val ws = wsp_temp("sysl-wsp-ghost")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"app\", \"geom\"]\n")
+    wsp_write(ws, "app/package.hocon", wsp_package("app", wsp_deps("ghost { workspace = true }")))
+    wsp_write(ws, "geom/package.hocon", wsp_package("geom", ""))
+
+    assert_eq(wsp_refused(s"$ws/app"), "'app' names 'ghost' as a workspace dependency, and no member " +
+        "of the workspace is called 'ghost' — the members are 'app', 'geom'")
+    wsp_drop([ws])
+end wsp_dependency_on_a_non_member
+
+@test("wsp: members depending on each other in a cycle are refused")
+wsp_member_cycle()
+    val ws = wsp_temp("sysl-wsp-cycle")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"a\", \"b\"]\n")
+    wsp_write(ws, "a/package.hocon", wsp_package("a", wsp_deps("b { workspace = true }")))
+    wsp_write(ws, "b/package.hocon", wsp_package("b", "dev_dependencies { a { workspace = true } }\n"))
+
+    assert_eq(wsp_refused(ws), "workspace members depend on each other in a cycle: a -> b -> a — a " +
+        "member is compiled into the one that depends on it, so one of these edges has to go")
+    wsp_drop([ws])
+end wsp_member_cycle
+
+@test("wsp: a workspace dependency outside any workspace is refused")
+wsp_member_dependency_without_workspace()
+    val dir = wsp_temp("sysl-wsp-lone")
+
+    wsp_write(dir, "package.hocon", wsp_package("app", wsp_deps("geom { workspace = true }")))
+
+    assert_eq(manifest_of_package(dir).err().unwrap(), s"'geom' is a workspace dependency, and " +
+        s"'$dir' is in no workspace — 'workspace = true' names a member of the workspace this " +
+        "project is listed in")
+    wsp_drop([dir])
+end wsp_member_dependency_without_workspace
+
+@test("wsp: a member's repository that is not a coordinate is refused")
+wsp_repository_not_a_coordinate()
+    val ws = wsp_temp("sysl-wsp-url")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"geom\"]\n")
+    wsp_write(ws, "geom/package.hocon",
+              "package { name = \"geom\", version = \"0.1.0\", repository = \"https://github.com/e/geom\" }\n")
+
+    assert_eq(wsp_refused(ws), "workspace member 'geom' gives 'package.repository' as " +
+        "'https://github.com/e/geom', which is not a coordinate — it is written as a consumer writes " +
+        "'git', 'github.com/you/thing', since it is what the member's modules are named by")
+    wsp_drop([ws])
+end wsp_repository_not_a_coordinate
+
+// -- one resolution -------------------------------------------------------------------------------
+
+// `a` asks for buf 1.2.0 and `b` for 1.4.0, and `b` alone for `extra`: the shape where a member's own
+// manifest does not say what its build uses.
+private wsp_two_floors() -> string
+    val ws = wsp_temp("sysl-wsp-mvs")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"a\", \"b\"]\n")
+    wsp_write(ws, "a/package.hocon", wsp_package("a", wsp_deps(wsp_git("buf", "github.com/e/buf", "1.2.0"))))
+    wsp_write(ws, "b/package.hocon", wsp_package("b", wsp_deps(
+        s"${wsp_git("buf", "github.com/e/buf", "1.4.0")}, ${wsp_git("extra", "github.com/e/extra", "1.0.0")}")))
+    wsp_vendored(ws, "github.com/e/buf", "1.2.0", "buf", "version() -> int = 12")
+    wsp_vendored(ws, "github.com/e/buf", "1.4.0", "buf", "version() -> int = 14")
+    wsp_vendored(ws, "github.com/e/extra", "1.0.0", "extra", "")
+    ws
+end wsp_two_floors
+
+@test("wsp: members asking different floors share the highest")
+wsp_shared_selection()
+    val ws = wsp_two_floors()
+
+    assert_eq(wsp_selected(wsp_graph(s"$ws/a")), "github.com.e.buf=1.4.0")
+    assert_eq(wsp_selected(wsp_graph(s"$ws/b")), "github.com.e.buf=1.4.0 github.com.e.extra=1.0.0")
+    wsp_drop([ws])
+end wsp_shared_selection
+
+@test("wsp: and the claim that raised it is listed beside the member's own")
+wsp_shared_claims()
+    val ws = wsp_two_floors()
+    val g = wsp_graph(s"$ws/a")
+    var rows: Buf[string] = buf()
+
+    for i in 0..<g.claims.len()
+        if g.claims.at(i).coordinate == "github.com/e/buf"
+            rows.push(s"${g.claims.at(i).asker}=${release_shown(g.claims.at(i).version)}")
+
+    assert_eq(join(sorted_labels(rows).view(), " "), "a=1.2.0 b=1.4.0")
+    wsp_drop([ws])
+end wsp_shared_claims
+
+@test("wsp: one sysl.sum, at the workspace root, covering every member")
+wsp_one_sum_at_the_root()
+    val ws = wsp_two_floors()
+
+    wsp_graph(s"$ws/a")
+
+    assert(!is_file(s"$ws/a/$SumsName"))
+
+    val sums = read_text(s"$ws/$SumsName").unwrap()
+
+    assert(sums.index_of("github.com/e/buf v1.4.0 ").is_some(), sums)
+    assert(sums.index_of("github.com/e/extra v1.0.0 ").is_some(), sums)
+    assert(sums.index_of("v1.2.0").is_none(), sums)
+    wsp_drop([ws])
+end wsp_one_sum_at_the_root
+
+@test("wsp: and tidy from a member tidies it for all of them")
+wsp_tidy_from_a_member()
+    val ws = wsp_two_floors()
+
+    wsp_write(ws, SumsName, s"github.com/e/gone v1.0.0 ${DigestPrefix}" +
+        "0000000000000000000000000000000000000000000000000000000000000000\n")
+
+    val got = wsp_cli(["sysl", "tidy", s"$ws/a"])
+
+    assert_eq(got.0, Fine, got.1)
+    assert(got.1.index_of("removed github.com/e/gone v1.0.0").is_some(), got.1)
+
+    val sums = read_text(s"$ws/$SumsName").unwrap()
+
+    assert(sums.index_of("github.com/e/extra v1.0.0 ").is_some(), sums)
+    assert(sums.index_of("gone").is_none(), sums)
+    wsp_drop([ws])
+end wsp_tidy_from_a_member
+
+// The run cache keys a member's build over the trees it is handed, so another member raising a floor
+// is a different binary.
+@test("wsp: another member raising a floor changes a member's run-cache key")
+wsp_run_cache_follows_the_workspace()
+    if !wsp_ready() then return
+
+    val ws = wsp_two_floors()
+
+    wsp_write(ws, "a/main.sysl", "print(buf.version())\n")
+
+    val before = run_cache_key_of("run", s"$ws/a", host_target(), DefaultOptimization, None)
+
+    wsp_write(ws, "b/package.hocon", wsp_package("b", wsp_deps(
+        s"${wsp_git("buf", "github.com/e/buf", "1.2.0")}, ${wsp_git("extra", "github.com/e/extra", "1.0.0")}")))
+
+    val after = run_cache_key_of("run", s"$ws/a", host_target(), DefaultOptimization, None)
+
+    assert(before.is_some() && after.is_some())
+    assert(before.unwrap() != after.unwrap())
+    assert_eq(wsp_run(s"$ws/a"), "12\n")
+    wsp_drop([ws])
+end wsp_run_cache_follows_the_workspace
+
+// -- a member depending on a member ---------------------------------------------------------------
+
+private wsp_geom_and_app(repository: string) -> string
+    val ws = wsp_temp("sysl-wsp-dep")
+    val repo = if repository.is_empty() then "" else s", repository = \"$repository\""
+
+    wsp_write(ws, "package.hocon", "workspace = [\"app\", \"geom\"]\n")
+    wsp_write(ws, "geom/package.hocon", s"package { name = \"geom\", version = \"0.1.0\"$repo }\n")
+    wsp_write(ws, "geom/geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 2\n")
+    wsp_write(ws, "app/package.hocon", wsp_package("app", wsp_deps("geom { workspace = true }")))
+    wsp_write(ws, "app/main.sysl", "print(geom.double(21))\n")
+    ws
+end wsp_geom_and_app
+
+@test("wsp: a member depends on another by name, with no fetch and no sum line")
+wsp_member_on_member()
+    if !wsp_ready() then return
+
+    val ws = wsp_geom_and_app("")
+
+    assert_eq(wsp_run(s"$ws/app"), "42\n")
+    assert(!is_file(s"$ws/$SumsName"))
+    assert(!is_file(s"$ws/app/$SumsName"))
+    wsp_drop([ws])
+end wsp_member_on_member
+
+// **A member is named by the coordinate it says it is published at**, so moving a package into a
+// workspace or out of one renames none of its symbols; one stating no coordinate is named by its
+// `package.name`.
+@test("wsp: a member's modules carry its repository's prefix, or its name where it states none")
+wsp_member_prefix()
+    val named = wsp_geom_and_app("")
+    val published = wsp_geom_and_app("github.com/e/geom")
+
+    assert_eq(wsp_canonicals(wsp_graph(s"$named/app")), "geom")
+    assert_eq(wsp_canonicals(wsp_graph(s"$published/app")), canonical_prefix("github.com/e/geom"))
+    wsp_drop([named, published])
+end wsp_member_prefix
+
+// The define line of `double`, which carries the mangled name.
+private wsp_double_symbol(llvm: string) -> string
+    val lines = split(llvm, "\n")
+
+    for i in 0..<lines.len
+        if lines[i].starts_with("define") && lines[i].index_of("double").is_some() then return lines[i]
+
+    "no define of double"
+end wsp_double_symbol
+
+@test("wsp: and the same symbol whether the package is a member or fetched by that coordinate")
+wsp_same_symbol_member_or_fetched()
+    if !wsp_ready() then return
+
+    val ws = wsp_geom_and_app("github.com/e/geom")
+    val alone = wsp_temp("sysl-wsp-fetched")
+
+    wsp_write(alone, "package.hocon", wsp_package("app", wsp_deps(wsp_git("geom", "github.com/e/geom", "0.1.0"))))
+    wsp_write(alone, "main.sysl", "print(geom.double(21))\n")
+    wsp_vendored(alone, "github.com/e/geom", "0.1.0", "geom", "double(n: int) -> int = n * 2")
+
+    val as_member = wsp_cli(["sysl", "emit-llvm", s"$ws/app"])
+    val as_fetched = wsp_cli(["sysl", "emit-llvm", alone])
+
+    assert_eq(as_member.0, Fine, as_member.1)
+    assert_eq(as_fetched.0, Fine, as_fetched.1)
+
+    val symbol = wsp_double_symbol(as_member.1)
+
+    assert(symbol.index_of("github.com.e.geom").is_some(), symbol)
+    assert_eq(symbol, wsp_double_symbol(as_fetched.1))
+    wsp_drop([ws, alone])
+end wsp_same_symbol_member_or_fetched
+
+// -- the commands ---------------------------------------------------------------------------------
+
+// Two members, each with one test that leaves a file named for the member in `marks`; `b`'s test
+// fails where `b_fails`.
+private wsp_tested(marks: string, b_fails: bool) -> string
+    val ws = wsp_temp("sysl-wsp-test")
+    val b_body = if b_fails then "    assert(false)\n" else ""
+
+    wsp_write(ws, "package.hocon", "workspace = [\"a\", \"b\"]\n")
+
+    wsp_write(ws, "a/package.hocon", wsp_package("a", ""))
+    wsp_write(ws, "a/ta/ta.sysl", "module ta\n\nimport sysl.fs.write_text\n\n@test(\"a marks\")\n" +
+        s"marks()\n    write_text(\"$marks/a\", \"ran\").unwrap()\n")
+
+    wsp_write(ws, "b/package.hocon", wsp_package("b", ""))
+    wsp_write(ws, "b/tb/tb.sysl", "module tb\n\nimport sysl.fs.write_text\n\n@test(\"b marks\")\n" +
+        s"marks()\n    write_text(\"$marks/b\", \"ran\").unwrap()\n$b_body")
+    ws
+end wsp_tested
+
+private wsp_marked(marks: string) -> string
+    var out: Buf[string] = buf()
+
+    if exists(s"$marks/a") then out.push("a")
+    if exists(s"$marks/b") then out.push("b")
+
+    remove_file(s"$marks/a").unwrap_or(())
+    remove_file(s"$marks/b").unwrap_or(())
+    join(out.view(), " ")
+end wsp_marked
+
+@test("wsp: test at the root tests every member, each reported under its name")
+wsp_test_at_the_root()
+    if !wsp_ready() then return
+
+    val marks = wsp_temp("sysl-wsp-marks")
+    val ws = wsp_tested(marks, false)
+    val got = wsp_cli(["sysl", "test", ws])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(wsp_marked(marks), "a b")
+    assert(got.1.index_of(s"testing a ($ws/a)").is_some(), got.1)
+    assert(got.1.index_of(s"testing b ($ws/b)").is_some(), got.1)
+    assert(got.1.index_of("workspace: 2 members tested, every one passed").is_some(), got.1)
+    wsp_drop([ws, marks])
+end wsp_test_at_the_root
+
+@test("wsp: -p picks one member")
+wsp_test_picks_one()
+    if !wsp_ready() then return
+
+    val marks = wsp_temp("sysl-wsp-marks")
+    val ws = wsp_tested(marks, false)
+    val got = wsp_cli(["sysl", "test", ws, "-p", "b"])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(wsp_marked(marks), "b")
+
+    val long = wsp_cli(["sysl", "test", "--package", "a", s"$ws/b"])
+
+    assert_eq(long.0, Fine, long.1)
+    assert_eq(wsp_marked(marks), "a")
+    wsp_drop([ws, marks])
+end wsp_test_picks_one
+
+@test("wsp: run inside a member, test acts on that member alone")
+wsp_test_inside_a_member()
+    if !wsp_ready() then return
+
+    val marks = wsp_temp("sysl-wsp-marks")
+    val ws = wsp_tested(marks, false)
+    val got = wsp_cli(["sysl", "test", s"$ws/a"])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(wsp_marked(marks), "a")
+    assert(got.1.index_of("testing").is_none(), got.1)
+    wsp_drop([ws, marks])
+end wsp_test_inside_a_member
+
+@test("wsp: a failing member fails the run and the others still run")
+wsp_test_a_failing_member()
+    if !wsp_ready() then return
+
+    val marks = wsp_temp("sysl-wsp-marks")
+    val ws = wsp_tested(marks, true)
+    val got = wsp_cli(["sysl", "test", ws])
+
+    assert_eq(got.0, Failed, got.1)
+    assert_eq(wsp_marked(marks), "a b")
+    assert(got.1.index_of("workspace: 2 members tested, 1 failed: b").is_some(), got.1)
+    wsp_drop([ws, marks])
+end wsp_test_a_failing_member
+
+@test("wsp: -p naming no member is refused, with the members listed")
+wsp_pick_unknown()
+    val marks = wsp_temp("sysl-wsp-marks")
+    val ws = wsp_tested(marks, false)
+    val got = wsp_cli(["sysl", "test", ws, "-p", "nope"])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, s"sysl: error: the workspace at '$ws' has no member called 'nope' — its members are " +
+        "'a', 'b'")
+    wsp_drop([ws, marks])
+end wsp_pick_unknown
+
+@test("wsp: -p outside any workspace is refused")
+wsp_pick_outside()
+    val dir = wsp_temp("sysl-wsp-nows")
+
+    wsp_write(dir, "package.hocon", wsp_package("app", ""))
+
+    val got = wsp_cli(["sysl", "build", dir, "-p", "a"])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, s"sysl: error: '-p a' picks a member of a workspace, and '$dir' is in none")
+    wsp_drop([dir])
+end wsp_pick_outside
+
+@test("wsp: -o beside a workspace of several members is refused")
+wsp_one_output_many_members()
+    val marks = wsp_temp("sysl-wsp-marks")
+    val ws = wsp_tested(marks, false)
+    val got = wsp_cli(["sysl", "build", ws, "-o", s"$marks/out"])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, "sysl: error: '-o' names one file, and this workspace builds 2 members — pick one " +
+        "with '-p <member>'")
+    wsp_drop([ws, marks])
+end wsp_one_output_many_members
+
+@test("wsp: a command compiling one project refuses a root with no package block")
+wsp_virtual_root_is_no_project()
+    val marks = wsp_temp("sysl-wsp-marks")
+    val ws = wsp_tested(marks, false)
+    val got = wsp_cli(["sysl", "emit-llvm", ws])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, s"sysl: error: '$ws' is a workspace with no 'package' block, so it is no project of" +
+        "its own — point at a member's directory, or pick one with '-p <member>'")
+    wsp_drop([ws, marks])
+end wsp_virtual_root_is_no_project
+
+@test("wsp: add refuses a root with no package block")
+wsp_add_to_virtual_root()
+    val marks = wsp_temp("sysl-wsp-marks")
+    val ws = wsp_tested(marks, false)
+    val got = wsp_cli(["sysl", "add", "github.com/e/buf@1.0.0", ws])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, s"sysl: error: '$ws' is a workspace with no 'package' block, so it takes no" +
+        "dependencies — add it to the member that imports it, 'sysl add <coordinate> <member " +
+        "directory>'")
+    wsp_drop([ws, marks])
+end wsp_add_to_virtual_root
+
+@test("wsp: a broken workspace is refused by a member's build too")
+wsp_broken_workspace_refused_from_member()
+    val ws = wsp_temp("sysl-wsp-broken")
+
+    wsp_write(ws, "package.hocon", "workspace = [\"a\", \"nope\"]\n")
+    wsp_write(ws, "a/package.hocon", wsp_package("a", ""))
+    wsp_write(ws, "a/main.sysl", "print(1)\n")
+
+    val got = wsp_cli(["sysl", "emit-llvm", s"$ws/a"])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, s"sysl: error: workspace member 'nope' does not exist — '$ws/nope' is not a directory")
+    wsp_drop([ws])
+end wsp_broken_workspace_refused_from_member
+
+@test("wsp: deps at the root lists every member's graph")
+wsp_deps_at_the_root()
+    val ws = wsp_two_floors()
+    val got = wsp_cli(["sysl", "deps", ws])
+
+    assert_eq(got.0, Fine, got.1)
+    assert(got.1.starts_with("a 0.1.0\n"), got.1)
+    assert(got.1.index_of("\n\nb 0.1.0\n").is_some(), got.1)
+    assert(got.1.index_of("b asks for 1.4.0").is_some(), got.1)
+    wsp_drop([ws])
+end wsp_deps_at_the_root
+
+// -- the kairos case: a package and its board probe in one repository ------------------------------
+
+private wsp_kairos() -> string
+    val ws = wsp_temp("sysl-wsp-kairos")
+
+    wsp_write(ws, "package.hocon", "package { name = \"kairos\", version = \"0.1.0\", repository = " +
+        "\"github.com/sysl-lang/kairos\" }\nworkspace = [\"examples/board-probe\", \"probe\"]\n")
+    wsp_write(ws, "sh/sysl/kairos/kairos.sysl", "module sh.sysl.kairos\n\ntwice(n: int) -> int = n * 2\n\n" +
+        "@test(\"twice\")\ntwice_doubles()\n    assert_eq(twice(2), 4)\n")
+    wsp_write(ws, "examples/board-probe/package.hocon",
+              wsp_package("board-probe", wsp_deps("kairos { workspace = true }")))
+    wsp_write(ws, "examples/board-probe/main.sysl", "import sh.sysl.kairos\n\nprint(kairos.twice(21))\n")
+
+    // A program member outside `examples/`, which only the walk's stop keeps out of the package: its
+    // entry file declares no module, which the package's walk would refuse.
+    wsp_write(ws, "probe/package.hocon", wsp_package("probe", wsp_deps("kairos { workspace = true }")))
+    wsp_write(ws, "probe/main.sysl", "print(sh.sysl.kairos.twice(5))\n")
+    ws
+end wsp_kairos
+
+@test("wsp: a package and its probe programs, one repository")
+wsp_kairos_case()
+    if !wsp_ready() then return
+
+    val ws = wsp_kairos()
+    val own = wsp_cli(["sysl", "test", ws, "-p", "kairos"])
+
+    assert_eq(own.0, Fine, own.1)
+    assert_eq(wsp_run(s"$ws/examples/board-probe"), "42\n")
+    assert_eq(wsp_run(s"$ws/probe"), "10\n")
+
+    val all = wsp_cli(["sysl", "test", ws])
+
+    assert_eq(all.0, Fine, all.1)
+    assert(all.1.index_of("workspace: 3 members tested, every one passed").is_some(), all.1)
+    wsp_drop([ws])
+end wsp_kairos_case
