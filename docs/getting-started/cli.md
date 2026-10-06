@@ -35,10 +35,7 @@ the path is standing on.
 
 A subcommand is required; sysl with none exits 2 and prints its usage.
 
-**`doc` is not built into the compiler**, and neither is anything else you care to add. A word sysl
-does not recognise is looked for on your `PATH` as `sysl-<word>`, the way `git foo` runs `git-foo`,
-so `sysl doc` runs `sysl-doc` — which the release ships beside the compiler. See
-[It is a separate binary](#it-is-a-separate-binary).
+A word that is not one of these is refused with the usage, and exits 2.
 
 ### `run`
 
@@ -540,7 +537,7 @@ sysl doc library --out docs/api
 ```
 
 ```
-sysl-doc: 27 modules -> docs/api
+sysl doc: 27 modules -> docs/api
 ```
 
 **It writes Markdown rather than a website**, against what scaladoc, javadoc and rustdoc all do, and
@@ -555,6 +552,7 @@ be reviewed in a commit.
 |---|---|
 | `-o`, `--out <dir>` | where the Markdown goes (default `docs/api`) |
 | `-t`, `--title <text>` | the index page's title |
+| `-n`, `--note <text>` | a note under the index page's title |
 | `-V`, `--docversion <v>` | the version being documented, shown on the pages |
 | `--private` | include file- and module-private declarations |
 | `--site <dir>` | after writing, build the juicer site rooted at `<dir>` |
@@ -568,7 +566,7 @@ sysl doc library --out docs/api --check
 ```
 
 ```
-sysl-doc: docs/api is stale — 2 file(s) differ:
+sysl doc: docs/api is stale — 2 file(s) differ:
   sysl-text.md
   sysl-slices.md
 
@@ -587,18 +585,12 @@ prose is an essay about the program and belongs to [`weave`](#weave). A doc comm
 its code blocks is read like any other. A literate module whose author explained everything in the
 narrative therefore produces bare signatures here, and that is the honest answer rather than a defect.
 
-#### It is a separate binary
+#### The site is somebody else's
 
-`sysl doc` is not built into the compiler. It runs **`sysl-doc`**, found on your `PATH`, exactly as
-`git foo` runs `git-foo` — and the release tarball ships both, so it works as soon as sysl is
-installed.
-
-The reason is the dependency profile: generating a site means a templating engine, an asset pipeline
-and a web server, and a systems compiler has no business carrying any of that. scaladoc sits beside
-scalac and rustdoc beside rustc for the same reason.
-
-**The general benefit outlives this one command.** Any binary named `sysl-<name>` on your `PATH` is a
-subcommand — no compiler change, no release, no permission.
+`sysl doc` is built into the compiler, and what it writes is Markdown and nothing else. `--site`
+hands the pages to the **`juicer`** command, found on your `PATH`, to build the HTML: generating a
+site means a templating engine, an asset pipeline and a web server, and a systems compiler has no
+business carrying any of that. Without a `juicer` it says so and where one comes from.
 
 ### `targets`
 

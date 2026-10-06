@@ -424,9 +424,11 @@ only what the project's own files import. `package.sysl` is the oldest compiler 
 with; a `capabilities` block says what the machine **cannot** do, since everything is provided by
 default; a `requires` block names what the consumer must supply a path or a `.pc` file for.
 
-`sysl run · build · build-lib · build-c · test · add · deps · vendor · emit-llvm · emit-ast ·
-emit-typed · emit-header · weave · tangle · targets · prove`, and an unknown word runs `sysl-<word>`
-off the `PATH`.
+`sysl run · build · build-lib · build-c · test · add · deps · tidy · vendor · doc · emit-llvm ·
+emit-ast · emit-typed · emit-header · weave · tangle · targets · prove`. An option no command takes
+is refused, never passed over. A `workspace = [...]` list in a root manifest makes several projects
+one [workspace](/reference/packages/#workspaces): one version selection, one `sysl.sum`, members
+depending on each other with `{ workspace = true }`, and `-p <member>` to pick one.
 
 ## Async and tasks
 
