@@ -1643,7 +1643,7 @@ a fetched package of its name, whose modules carry the coordinate instead.
 
 A member that is also published may say where, with `package.repository`, and is then named exactly
 as a consumer fetching it names it ([what a dependency's modules are
-called](#what-a-dependencys-modules-are-called)): with `repository = "github.com/sysl-lang/kairos"`
+called](#what-a-dependency-s-modules-are-called)): with `repository = "github.com/sysl-lang/kairos"`
 its module is `github.com.sysl-lang.kairos.sh.sysl.kairos`, so moving it into or out of the workspace
 renames none of its symbols. Nothing requires it; a workspace builds the same either way.
 

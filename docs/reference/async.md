@@ -27,7 +27,7 @@ print(block_on(average(1, 3)))
 **The language supplies the words and the contract, and nothing that schedules.** `block_on` above
 runs one task to its end on the calling thread; anything that interleaves tasks — an event loop, a
 run queue, a timer wheel — is an ordinary program written against four builtins
-([the executor contract](#the-executor-contract-step-park-and-yield_now)). No executor lives in the
+([the executor contract](#the-executor-contract-step-park-and-yield-now)). No executor lives in the
 language or the standard library ([where the executors live](#where-the-executors-live)).
 
 ## Calling an async function makes a task, and runs nothing
