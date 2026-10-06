@@ -178,6 +178,36 @@ private modules_written(units: Buf[Program]) -> Buf[string]
     out
 end modules_written
 
+// The roots a failed bounds check's location strips off a file's name (`bounds_fail.sysl`'s
+// `location_file`): the project's own directory, shown as nothing; the directory fetched packages live
+// under, shown as nothing too, which leaves a package's file as `<coordinate>/@v<version>/<place>`;
+// each `--lib` root, shown as its own files; and any other package root -- a path dependency --
+// shown under its directory's name.
+private location_roots_of(root: string, packages: Buf[string]) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push((absolute_path(root) + "/", ""))
+
+    val fetched_under = cache_root(root) match
+        Ok(dir) -> absolute_path(dir) + "/"
+        Err(_) -> ""
+
+    if fetched_under != "" then out.push((fetched_under, ""))
+
+    val handed = lib_roots()
+
+    for i in 0..<handed.len()
+        out.push((absolute_path(handed.at(i)) + "/", ""))
+
+    for i in 0..<packages.len()
+        val dir = absolute_path(packages.at(i)) + "/"
+
+        if fetched_under == "" || !bytes_at(dir, 0, fetched_under)
+            out.push((dir, basename(packages.at(i)) + "/"))
+
+    out
+end location_roots_of
+
 // Everything one invocation reads, given the path the command line named and the machine it is for,
 // with each fetched package's modules under the canonical prefix its coordinate gives them -- which
 // is what makes two consumers naming one package differently link one copy of it.
@@ -231,6 +261,8 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     // Then the packages -- the graph resolved, fetched, and read off disk. They join the compilation
     // once the project's own modules are known, below, which is what decides whose tests are read.
     val fetched = package_sources(root, manifest, t)?
+
+    use_location_roots(location_roots_of(root, fetched.roots))
 
     var theirs: Buf[Program] = buf()
 
@@ -572,6 +604,10 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
     choose_allocator(allocator_claims(root, manifest)) match
         Err(why) -> return Err(Refusal(why))
         Ok(pair) -> use_allocator(pair)
+
+    // **And whether a failed bounds check names where it was written**, settled here for the same
+    // reason: the standard module's artifact is built the same way as the program, and keyed by it.
+    use_bounds_locations(!no_bounds_locations_flag() && manifest.bounds_locations.unwrap_or(true))
 
     // The machine as the project describes it, which is what the analysis holds a module to.
     Ok(as_declared(manifest, t))

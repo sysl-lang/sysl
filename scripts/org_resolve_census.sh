@@ -56,6 +56,61 @@ esac
 org=$(dirname "$root")
 work=$(mktemp -d "${TMPDIR:-/tmp}/sysl-org-census.XXXXXX")
 
+# **This compiler reports a failed bounds check before trapping and the reference traps silently**, so
+# every `emit-llvm` text holding a check differs by exactly what `bounds_fail.sysl` adds. That is taken
+# out of OUR text, and only that -- the four rules of `tests_oracle.sysl`'s
+# `ours_without_the_bounds_report`, each removing one construct matched by a prefix only it writes:
+# (1) the `call void @sysl_bounds_fail(` a failure block gains, (2) the `@.loc<n>` location
+# constants, (3) the weak default's `@sysl.bounds.` constants and its three `define`s through their
+# closing brace, (4) the `write` declaration where the reference declares none -- plus the blank line
+# a removed run leaves doubled. The `declare` lines are then compared as a set, the `write`
+# declaration landing where the bounds default asked for it (`same_text_but_declare_order`).
+without_bounds_report() {
+    theirs_writes=0
+    grep -q '^declare .* @write(i32, ptr, ' "$2" && theirs_writes=1
+    awk -v tw=$theirs_writes '
+        {
+            line = $0
+            drop = 0
+            if (inside) {
+                drop = 1
+                if (line == "}") inside = 0
+            } else if (index(line, "  call void @sysl_bounds_fail(") == 1) {
+                drop = 1
+            } else if (line ~ /^@\.loc[0-9]+ = private constant \[/) {
+                drop = 1
+            } else if (index(line, "@sysl.bounds.") == 1) {
+                drop = 1
+            } else if (index(line, "define weak void @sysl_bounds_fail(") == 1 ||
+                       index(line, "define private ptr @sysl.bounds.put(") == 1 ||
+                       index(line, "define private ptr @sysl.bounds.num(") == 1) {
+                drop = 1
+                inside = 1
+            } else if (!tw && line ~ /^declare / && index(line, " @write(i32, ptr, ") > 0) {
+                drop = 1
+            } else if (line == "" && dropped && kept > 0 && last == "") {
+                drop = 1
+            }
+            if (!drop) {
+                print line
+                last = line
+                kept++
+            }
+            dropped = drop && line != ""
+        }' "$1"
+}
+
+# Two `emit-llvm` texts that are one text but for what the bounds report adds and the order of their
+# `declare` lines.
+same_llvm_text() {
+    without_bounds_report "$2" "$1" > "$2.normal"
+    grep -v '^declare ' "$1" > "$1.body" || true
+    grep -v '^declare ' "$2.normal" > "$2.body" || true
+    grep '^declare ' "$1" | sort > "$1.declares" || true
+    grep '^declare ' "$2.normal" | sort > "$2.declares" || true
+    cmp -s "$1.body" "$2.body" && cmp -s "$1.declares" "$2.declares"
+}
+
 matched=0
 mismatched=0
 both_refused=0
@@ -99,15 +154,17 @@ for repo in "$org"/*/; do
         elif [ $theirs_ok -ne 0 ] || [ $ours_ok -ne 0 ]; then
             one_refused=$((one_refused + 1))
 
-            # **A refusal is written to standard output, not to standard error**, so that is where
-            # the sentence is read from -- both compilers print `error: …` on the stream the text
-            # would have gone to and exit non-zero.
+            # A source diagnostic is written to standard output and a refusal about the command line or
+            # the project (`sysl: error: …`) to standard error, so the sentence is read from both.
             if [ $ours_ok -ne 0 ]; then
-                echo "REFUSED BY US    $label -- $(head -1 "$ours")"
+                echo "REFUSED BY US    $label -- $(cat "$ours" "$ours.err" | head -1)"
             else
-                echo "REFUSED BY THEM  $label -- $(head -1 "$theirs")"
+                echo "REFUSED BY THEM  $label -- $(cat "$theirs" "$theirs.err" | head -1)"
             fi
         elif cmp -s "$theirs" "$ours"; then
+            matched=$((matched + 1))
+            echo "matched          $label"
+        elif [ "$command" = "emit-llvm" ] && same_llvm_text "$theirs" "$ours"; then
             matched=$((matched + 1))
             echo "matched          $label"
         else

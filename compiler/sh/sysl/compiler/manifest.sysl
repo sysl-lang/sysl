@@ -95,12 +95,16 @@ struct Manifest
 
     // A key this compiler does not understand is said out loud and then ignored, once per key.
     warnings: Buf[string]
+
+    // Whether a failed bounds check names its `file:line:column` (`bounds_fail.sysl`). Only the root
+    // project's applies, as only its `optimization` does.
+    bounds_locations: Option[bool]
 end Manifest
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
-             buf(), None, None, None, buf())
+             buf(), None, None, None, buf(), None)
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -450,6 +454,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     val optimization = read_optimization(root)?
     val link = read_link(root)?
     val lto = read_lto(root)?
+    val bounds_locations = read_bounds_locations(root)?
 
     val keys = conf_keys(root)
 
@@ -458,8 +463,23 @@ read_manifest(text: string) -> Result[Manifest, string]
 
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
                 target_capabilities, pkg_config, headers, defines, targets, allocator, features,
-                optimization, link, lto, warnings))
+                optimization, link, lto, warnings, bounds_locations))
 end read_manifest
+
+// The `bounds_locations` key: `true`, the default, or `false` to leave every failed bounds check's
+// `file:line:column` out of the image.
+private read_bounds_locations(root: &Conf) -> Result[Option[bool], string]
+    val value = conf_at(root, "bounds_locations") match
+        None -> return Ok(None)
+        Some(v) -> v
+
+    *value match
+        Flag(on) -> return Ok(Some(on))
+        _ -> ()
+
+    Err("'bounds_locations' says whether a failed bounds check names the file, line and column it " +
+        "was written at, so it is true or false")
+end read_bounds_locations
 
 // The warning a key this compiler does not know draws. **Said and then ignored, not refused**: a
 // manifest written for a newer compiler must still build with this one wherever the parts it uses
@@ -1373,4 +1393,5 @@ private known_package_key(key: string) -> bool =
 private known_top_key(key: string) -> bool =
     key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
     key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
-    key == "links" || key == "features" || key == "optimization" || key == "link" || key == "lto"
+    key == "links" || key == "features" || key == "optimization" || key == "link" || key == "lto" ||
+    key == "bounds_locations"

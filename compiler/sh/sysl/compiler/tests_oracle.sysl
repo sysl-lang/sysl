@@ -6,7 +6,7 @@ import sysl.buf.{Buf, buf}
 import sysl.env.{get as env_var}
 import sysl.fs.{IoError, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, walk, write_text}
 import sysl.process.{capture, Output, Var}
-import sysl.text.{split, str_builder, Search}
+import sysl.text.{replace_all, split, str_builder, Search}
 
 // The differential proof: this parser's tree against the reference compiler's, on the same input.
 //
@@ -88,6 +88,137 @@ private without_trailing_newlines(text: string) -> string
 
     text[0..<end]
 end without_trailing_newlines
+
+// -- what the bounds report adds, taken out of OUR text before it meets the reference's --------------
+
+// **This compiler reports a failed bounds check before trapping and the pinned reference (0.0.162)
+// traps silently**, so every body holding a check differs by exactly what `bounds_fail.sysl` adds.
+// That is taken out of OUR text, and only that: each rule below names the one construct it removes,
+// matched by a prefix only that construct writes, so it cannot swallow anything the reference also
+// emits. Everything else -- the check, its branch, its labels, every register -- is still compared.
+// `tests_bfm_bounds_message.sysl`'s `bfm_the_normalisation_can_still_fail` holds it to that.
+//
+// The fourth difference is ordering, not content -- the `write` declaration lands where the bounds
+// default asked for it -- so the whole-file comparison reads `declare` lines as a set
+// (`same_text_but_declare_order`) rather than this rewriting them.
+ours_without_the_bounds_report(ours: string, theirs: string) -> string
+    val lines = lines_of(ours)
+    val theirs_writes = declares_write(theirs)
+
+    var out = str_builder()
+    var kept: Buf[string] = buf()
+    var inside = false
+    var dropped = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+        var drop = false
+
+        if inside
+            // RULE 3b, continued: the rest of a bounds function's body, through its closing brace.
+            drop = true
+            if line == "}" then inside = false
+        // RULE 1: the report a failed check makes before its trap -- the one line the failure block
+        // gains. The `llvm.trap` and `unreachable` after it stay and are compared.
+        else if line.starts_with("  call void @sysl_bounds_fail(")
+            drop = true
+        // RULE 2: the `file:line:column` constant each report names (`.loc<n>`, numbered apart from
+        // the interned strings so no other constant moves).
+        else if is_location_constant(line)
+            drop = true
+        // RULE 3a: the default's own constants, every one under the `sysl.bounds.` prefix.
+        else if line.starts_with("@sysl.bounds.")
+            drop = true
+        // RULE 3b: the weak default and its two private helpers, from the `define` line on.
+        else if line.starts_with("define weak void @sysl_bounds_fail(") ||
+                line.starts_with("define private ptr @sysl.bounds.put(") ||
+                line.starts_with("define private ptr @sysl.bounds.num(")
+            drop = true
+            inside = true
+        // RULE 4: the `write` the default writes through, where the reference declares none -- the
+        // default is then its only user.
+        else if !theirs_writes && is_write_declaration(line)
+            drop = true
+        // The blank line the removed run leaves doubled: each runtime block ends in one, and a
+        // section made of nothing but location constants has its own.
+        else if line == "" && dropped && !kept.is_empty() && kept.at(kept.len() - 1) == ""
+            drop = true
+
+        if !drop
+            kept.push(line)
+            out.push(line)
+            out.push_char('\n')
+
+        // Only a removed CONSTRUCT owns the blank after it; a blank this rule took is not one, or the
+        // printer's own separator after the last runtime block would go with it.
+        dropped = drop && line != ""
+
+    out.finish()
+end ours_without_the_bounds_report
+
+// `@.loc<digits> = private constant …`, the shape `bounds_location_globals` writes and nothing else.
+private is_location_constant(line: string) -> bool
+    if !line.starts_with("@.loc") then return false
+
+    var i: usize = 5
+
+    if i >= line.bytes.len || line.bytes[i] < u8('0') || line.bytes[i] > u8('9') then return false
+
+    while i < line.bytes.len && line.bytes[i] >= u8('0') && line.bytes[i] <= u8('9')
+        i += 1
+
+    bytes_at(line, i, " = private constant [")
+end is_location_constant
+
+private is_write_declaration(line: string) -> bool =
+    line.starts_with("declare ") && line.index_of(" @write(i32, ptr, ").is_some()
+
+private declares_write(text: string) -> bool
+    val lines = lines_of(text)
+
+    for i in 0..<lines.len()
+        if is_write_declaration(lines.at(i)) then return true
+
+    false
+end declares_write
+
+// Two texts that are one text but for the order of their `declare` lines, which are compared as a
+// set: every other line in place, and the same declarations, each as often.
+same_text_but_declare_order(theirs: string, ours: string) -> bool
+    val a = lines_of(theirs)
+    val b = lines_of(ours)
+
+    if a.len() != b.len() then return false
+
+    var a_declares: Buf[string] = buf()
+    var b_declares: Buf[string] = buf()
+
+    for i in 0..<a.len()
+        val x = a.at(i)
+        val y = b.at(i)
+
+        if x.starts_with("declare ") || y.starts_with("declare ")
+            if !(x.starts_with("declare ") && y.starts_with("declare ")) then return false
+
+            a_declares.push(x)
+            b_declares.push(y)
+        else if x != y then return false
+
+    for i in 0..<a_declares.len()
+        if count_of(a_declares, a_declares.at(i)) != count_of(b_declares, a_declares.at(i))
+            return false
+
+    true
+end same_text_but_declare_order
+
+private count_of(items: Buf[string], item: string) -> usize
+    var n: usize = 0
+
+    for i in 0..<items.len()
+        if items.at(i) == item then n += 1
+
+    n
+end count_of
 
 // What the reference compiler printed for one file, and whether it was willing to parse it at all.
 struct Answer
@@ -1028,8 +1159,9 @@ private compare_types(binary: string, path: string, label: string, found: *TypeA
                 return
             end if
 
+            val ours = ours_without_the_bounds_report(mine.text, theirs.text)
             val want = declared_type_lines(theirs.text)
-            val got = declared_type_lines(mine.text)
+            val got = declared_type_lines(ours)
 
             found.compared += 1
             found.definitions += want.len()
@@ -1042,9 +1174,9 @@ private compare_types(binary: string, path: string, label: string, found: *TypeA
                 if found.mismatched <= 4
                     found.first_bad = s"${found.first_bad}\n$label: ${where.unwrap()}"
 
-            compare_boxes(theirs.text, mine.text, label, found)
-            compare_funcs(theirs.text, mine.text, mine.gaps, label, found)
-            compare_whole_text(theirs.text, mine.text, label, found)
+            compare_boxes(theirs.text, ours, label, found)
+            compare_funcs(theirs.text, ours, mine.gaps, label, found)
+            compare_whole_text(theirs.text, ours, label, found)
 end compare_types
 
 // The ownership runtime's own type definitions, matched by name -- and **every** name the reference
@@ -1135,7 +1267,7 @@ private compare_whole_text(theirs: string, raw: string, label: string, found: *T
     // a string, so what a shell would have shown as the last line differs in whether it is there.
     val ours = without_trailing_newlines(raw)
 
-    if theirs == ours
+    if same_text_but_declare_order(theirs, ours)
         found.whole_matched += 1
         return
     end if
@@ -1456,7 +1588,9 @@ the_two_agree_on_this_compilers_own_tree()
             var reasons: Buf[(string, usize)] = buf()
             var found = OwnTree(0, 0, 0, 0, 0, 0, "", reasons)
 
-            census_over(theirs.text, without_trailing_newlines(mine.text), mine.gaps, &found)
+            val ours = ours_without_the_bounds_report(mine.text, theirs.text)
+
+            census_over(theirs.text, without_trailing_newlines(ours), mine.gaps, &found)
 
             val summary = s"own tree: ${found.theirs} definitions theirs, ${found.ours} ours, " +
                 s"${found.shared} shared of which ${found.differing} differ, " +
@@ -1509,3 +1643,112 @@ private census_over(theirs: string, ours: string, gaps: Buf[(string, string)], f
     for i in 0..<mine.len()
         if !holds_name(theirs_names, mine.at(i).0) then found.only_ours += 1
 end census_over
+
+// -- the bounds normalisation, held to taking out only what the report adds ---------------------------
+
+// A function 0.0.162 writes for `ix(xs: [3]int, i: usize) -> int = xs[i]`, in a module with one
+// interned string -- the shape the reference lays down around a bounds check.
+private bfm_reference_module() -> string = raw"""
+    target triple = "arm64-apple-macosx"
+
+    declare void @llvm.trap()
+
+    @.str1 = private constant [3 x i8] c"hi\00"
+
+    define i32 @ix([3 x i32] %xs.param, i64 %i.param) {
+    entry:
+      %xs.addr = alloca [3 x i32]
+      %i.addr = alloca i64
+      store [3 x i32] %xs.param, ptr %xs.addr
+      store i64 %i.param, ptr %i.addr
+      %t1 = load i64, ptr %i.addr
+      %t2 = icmp ult i64 %t1, 3
+      br i1 %t2, label %bounds.ok1, label %bounds.bad2
+    bounds.bad2:
+      call void @llvm.trap()
+      unreachable
+    bounds.ok1:
+      %t3 = getelementptr i32, ptr %xs.addr, i64 %t1
+      %t4 = load i32, ptr %t3
+      ret i32 %t4
+    }
+    """
+
+// The same module as this compiler writes it: the report's call in the failure block, its location
+// constant, the `write` the default needs, and the default itself -- the real runtime text.
+private bfm_our_module(theirs: string) -> string =
+    replace_all(replace_all(replace_all(theirs,
+        "declare void @llvm.trap()\n",
+        "declare i64 @write(i32, ptr, i64)\ndeclare void @llvm.trap()\n"),
+        "c\"hi\\00\"\n\n",
+        "c\"hi\\00\"\n@.loc0 = private constant [15 x i8] c\"main.sysl:1:38\\00\"\n\n" +
+            bounds_runtime(host_target())),
+        "bounds.bad2:\n",
+        "bounds.bad2:\n  call void @sysl_bounds_fail(i32 0, i64 %t1, i64 0, i64 3, ptr @.loc0)\n")
+
+// How many bodies two texts disagree on, by the own-tree census's own reading.
+private bfm_differing(theirs: string, ours: string) -> usize
+    var found = OwnTree(0, 0, 0, 0, 0, 0, "", buf())
+
+    census_over(theirs, without_trailing_newlines(ours_without_the_bounds_report(ours, theirs)),
+                buf(), &found)
+    found.differing
+end bfm_differing
+
+@test("the bounds normalisation takes out exactly what the report adds, and a changed instruction still differs")
+bfm_the_normalisation_can_still_fail()
+    val theirs = bfm_reference_module()
+    val ours = bfm_our_module(theirs)
+
+    // The fixture is what it claims: every construct the report adds is in it.
+    assert(ours.contains("call void @sysl_bounds_fail("), ours)
+    assert(ours.contains("define weak void @sysl_bounds_fail("), ours)
+    assert(ours.contains("@.loc0 = "), ours)
+
+    // Taken out, the two are one text, whole and body by body.
+    val normal = without_trailing_newlines(ours_without_the_bounds_report(ours, theirs))
+
+    assert(same_text_but_declare_order(without_trailing_newlines(theirs), normal), normal)
+    assert_eq(bfm_differing(theirs, ours), 0)
+
+    // The default laid down after another runtime block, the printer's own blank after the last of
+    // them: that blank is the reference's too and stays.
+    val arc = "define private void @arc.x() {\nentry:\n  ret void\n}\n\n"
+    val theirs_after = replace_all(theirs, "define i32 @ix", arc + "\ndefine i32 @ix")
+    val ours_after = replace_all(theirs_after, arc, arc + bounds_runtime(host_target()))
+
+    assert(same_text_but_declare_order(without_trailing_newlines(theirs_after),
+           without_trailing_newlines(ours_without_the_bounds_report(ours_after, theirs_after))))
+
+    // One unrelated instruction changed in OUR text -- the check's own comparison -- and the census
+    // goes red, as does the whole-file reading.
+    val mutated = replace_all(ours, "icmp ult i64 %t1, 3", "icmp ule i64 %t1, 3")
+
+    assert_eq(bfm_differing(theirs, mutated), 1)
+    assert(!same_text_but_declare_order(without_trailing_newlines(theirs),
+           without_trailing_newlines(ours_without_the_bounds_report(mutated, theirs))))
+
+    // The trap after the report is compared too: dropping it is a difference, not a normalisation.
+    val untrapped = replace_all(ours, "  call void @llvm.trap()\n  unreachable\nbounds.ok1:",
+                                "  unreachable\nbounds.ok1:")
+
+    assert_eq(bfm_differing(theirs, untrapped), 1)
+
+    // A call that only looks like the report's -- another symbol -- is not taken out.
+    val lookalike = replace_all(ours, "call void @sysl_bounds_fail(", "call void @sysl_bounds_failed(")
+
+    assert_eq(bfm_differing(theirs, lookalike), 1)
+
+    // Nor is a constant that only begins like a location.
+    val constant = replace_all(theirs, "@.str1 = ", "@.locale = ")
+
+    assert(!same_text_but_declare_order(without_trailing_newlines(theirs),
+           without_trailing_newlines(ours_without_the_bounds_report(constant, theirs))))
+
+    // And the declarations are a set, not a free pass: one the reference has not got still differs.
+    val extra = replace_all(ours, "declare void @llvm.trap()\n",
+                            "declare void @llvm.trap()\ndeclare void @abort()\n")
+
+    assert(!same_text_but_declare_order(without_trailing_newlines(theirs),
+           without_trailing_newlines(ours_without_the_bounds_report(extra, theirs))))
+end bfm_the_normalisation_can_still_fail

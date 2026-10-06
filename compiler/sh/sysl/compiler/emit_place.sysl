@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int, mul, pow, sub}
 
@@ -76,7 +77,7 @@ address(e: *Emit, place: TExpr) -> Val = *place.kind match
         emit(e, InGep(r, lty(e, rty), base, idx))
         r
 
-    TIndex(receiver, index, _) -> element_addr(e, receiver, index)
+    TIndex(receiver, index, _) -> element_addr(e, receiver, index, place.span)
 
     // A computed value has no address of its own, so reaching into one means giving it a slot first.
     _ ->
@@ -127,8 +128,9 @@ payload_addr(e: *Emit, operand: TExpr) -> Val
 end payload_addr
 
 // The address of one element, after checking that it exists. An array is indexed from its own
-// storage; a view is indexed from the pointer it carries; a `*T` has no length, so no check.
-element_addr(e: *Emit, receiver: TExpr, index: TExpr) -> Val
+// storage; a view is indexed from the pointer it carries; a `*T` has no length, so no check. `site`
+// is the subscript's span, which a failed check names.
+element_addr(e: *Emit, receiver: TExpr, index: TExpr, site: Span) -> Val
     val rty = texpr_type(receiver)
 
     val parts = rty match
@@ -140,10 +142,10 @@ element_addr(e: *Emit, receiver: TExpr, index: TExpr) -> Val
             gap_here(e, s"index into ${type_show(other)}")
             (VUndef, None, int_type())
 
-    val i = widen_index(e, index)
+    val i = widen_index(e, index, site)
 
     parts.1 match
-        Some(l) -> bounds_check(e, i, l)
+        Some(l) -> bounds_check(e, i, l, signed_index(index), site)
         None -> ()
 
     val r = fresh_reg(e)
@@ -161,7 +163,7 @@ end element_addr
 // array traps even though element 3 is there, because elements 3 through 6 are not -- so the test is
 // that there is room for a run at all and that this one starts early enough to fit. The subtraction
 // is safe under the first half: a length shorter than the width has already failed.
-run_addr(e: *Emit, receiver: TExpr, index: TExpr, lanes: int) -> Val
+run_addr(e: *Emit, receiver: TExpr, index: TExpr, lanes: int, site: Span) -> Val
     val rty = texpr_type(receiver)
 
     val parts = rty match
@@ -174,7 +176,7 @@ run_addr(e: *Emit, receiver: TExpr, index: TExpr, lanes: int) -> Val
             gap_here(e, s"a run of ${type_show(other)}")
             (VUndef, VZero, int_type())
 
-    val i = widen_index(e, index)
+    val i = widen_index(e, index, site)
     val wty = word_lty(e)
     val width = VInt(from_int(long(lanes)))
     val room = fresh_reg(e)
@@ -192,7 +194,8 @@ run_addr(e: *Emit, receiver: TExpr, index: TExpr, lanes: int) -> Val
     val ok = fresh_reg(e)
 
     emit(e, InBin(ok, OpAnd, l_i1(), room, here))
-    trap_unless(e, ok, "bounds")
+    bounds_unless(e, ok, "bounds", bounds_kind(BoundsRun, signed_index(index), false), i, width,
+                  parts.1, site)
 
     val r = fresh_reg(e)
 
@@ -225,28 +228,33 @@ index_list(n: int) -> Buf[int]
 end index_list
 
 // An index brought to the address width. A wider one is checked to fit first, since truncating it
-// would turn an index past the end into one inside.
-widen_index(e: *Emit, index: TExpr) -> Val = underlying(texpr_type(index)) match
-    Integer(bits, signed, _) ->
-        if bits <= e.word_bits then convert_int(e, bits, signed, e.word_bits, gen_expr(e, index))
-        else
-            val v = gen_expr(e, index)
-            val wide = LInt(bits)
-            val limit = sub(pow(from_int(2), usize(e.word_bits)), from_int(1))
-            val fits = fresh_reg(e)
+// would turn an index past the end into one inside. `site` is what a failure names, and `kind` says
+// whether the value is an index or a count.
+widen_index(e: *Emit, index: TExpr, site: Span, kind: int = BoundsTooWide) -> Val =
+    underlying(texpr_type(index)) match
+        Integer(bits, signed, _) ->
+            if bits <= e.word_bits then convert_int(e, bits, signed, e.word_bits, gen_expr(e, index))
+            else
+                val v = gen_expr(e, index)
+                val wide = LInt(bits)
+                val limit = sub(pow(from_int(2), usize(e.word_bits)), from_int(1))
+                val fits = fresh_reg(e)
 
-            emit(e, InIntCmp(fits, IUle, wide, v, VInt(limit)))
-            trap_unless(e, fits, "bounds")
-            convert_int(e, bits, signed, e.word_bits, v)
-    other -> gap_at(e, s"index of type ${type_show(other)}")
+                emit(e, InIntCmp(fits, IUle, wide, v, VInt(limit)))
+                bounds_unless(e, fits, "bounds", kind, bounds_none(), bounds_none(), bounds_none(),
+                              site)
+                convert_int(e, bits, signed, e.word_bits, v)
+        other -> gap_at(e, s"index of type ${type_show(other)}")
 
 // Traps unless `i` names an element that exists. The comparison is unsigned at the address width, so
-// a negative index arrives as a very large one and fails the same test.
-bounds_check(e: *Emit, i: Val, len: Val)
+// a negative index arrives as a very large one and fails the same test -- and is reported with its
+// sign where it came from a signed integer.
+bounds_check(e: *Emit, i: Val, len: Val, signed: bool, site: Span)
     val ok = fresh_reg(e)
 
     emit(e, InIntCmp(ok, IUlt, word_lty(e), i, len))
-    trap_unless(e, ok, "bounds")
+    bounds_unless(e, ok, "bounds", bounds_kind(BoundsIndex, signed, false), i, bounds_none(), len,
+                  site)
 end bounds_check
 
 // -- reading and writing through a place -------------------------------------------------------------
@@ -550,9 +558,9 @@ private address_under(e: *Emit, place: TExpr, root: TExpr, at: Val) -> Val
                 Array(n, elem) -> (long(n), *elem)
                 _ -> (long(0), int_type())
             val base = address_under(e, r, root, at)
-            val i = widen_index(e, index)
+            val i = widen_index(e, index, place.span)
 
-            bounds_check(e, i, VInt(from_int(parts.0)))
+            bounds_check(e, i, VInt(from_int(parts.0)), signed_index(index), place.span)
 
             val x = fresh_reg(e)
 
@@ -580,16 +588,24 @@ private same_node(a: TExpr, b: TExpr) -> bool = a.span == b.span && texpr_kind_n
 // how many there are -- and the view is built by narrowing the last two and taking a share of the
 // first.
 gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
-          slice_ty: Type) -> Val
+          slice_ty: Type, site: Span) -> Val
     val elem = element(slice_ty).unwrap_or(byte_type())
     val parts = slice_base(e, base)
     val owner = parts.0
     val first = parts.1
     val len = parts.2
+    val zero = bounds_none()
 
     val start = lo match
-        Some(l) -> widen_index(e, l)
+        Some(l) -> widen_index(e, l, site)
         None -> VInt(from_int(0))
+
+    // How a failure prints the two ends: each with its sign where it came from a signed integer.
+    val lo_signed = lo.is_some() && signed_index(lo.unwrap())
+    val hi_signed = hi.is_some() && signed_index(hi.unwrap())
+
+    // The high end as written, which is what a failure about an inclusive range names.
+    var written: Val = zero
 
     // The check is on the half-open interval the view ends up naming. An inclusive high end
     // additionally has to name an element that exists, which is also what stops `hi + 1` from
@@ -597,7 +613,9 @@ gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive
     val end = hi match
         None -> len.unwrap_or(VUndef)
         Some(h) ->
-            val v = widen_index(e, h)
+            val v = widen_index(e, h, site)
+
+            written = v
 
             if !inclusive then v
             else
@@ -606,7 +624,9 @@ gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive
                         val within = fresh_reg(e)
 
                         emit(e, InIntCmp(within, IUlt, word_lty(e), v, l))
-                        trap_unless(e, within, "bounds")
+                        bounds_unless(e, within, "bounds",
+                                      bounds_kind(BoundsRangeInclusive, lo_signed, hi_signed), start, v,
+                                      l, site)
                     None -> ()
 
                 val one = fresh_reg(e)
@@ -620,21 +640,37 @@ gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive
                 val fits = fresh_reg(e)
 
                 emit(e, InIntCmp(fits, IUle, word_lty(e), end, l))
-                trap_unless(e, fits, "bounds")
+                bounds_unless(e, fits, "bounds", bounds_kind(BoundsRange, lo_signed, hi_signed), start,
+                              end, l, site)
             None -> ()
 
     val ordered = fresh_reg(e)
 
     emit(e, InIntCmp(ordered, IUle, word_lty(e), start, end))
-    trap_unless(e, ordered, "bounds")
+
+    // Which way round the ends failed to be depends on what the reader wrote for the high one: an
+    // exclusive end, an inclusive one (which may sit one below the start and still name nothing), or
+    // none, where the end is the length.
+    if hi.is_none()
+        bounds_unless(e, ordered, "bounds", bounds_kind(BoundsStartPastLength, lo_signed, false), start,
+                      zero, end, site)
+    else if inclusive
+        bounds_unless(e, ordered, "bounds",
+                      bounds_kind(BoundsStartPastInclusiveEnd, lo_signed, hi_signed), start, written, zero,
+                      site)
+    else
+        bounds_unless(e, ordered, "bounds", bounds_kind(BoundsStartPastEnd, lo_signed, hi_signed),
+                      start, end, zero, site)
 
     // A substring has to be a string, so both ends must fall between characters. This runs after the
     // bounds checks, which is what makes reading the byte at either end safe.
     if slice_ty == Str
         len match
             Some(l) ->
-                trap_unless(e, str_boundary(e, first, l, start), "boundary")
-                trap_unless(e, str_boundary(e, first, l, end), "boundary")
+                bounds_unless(e, str_boundary(e, first, l, start), "boundary",
+                              bounds_kind(BoundsStartSplitsChar, lo_signed, false), start, zero, l, site)
+                bounds_unless(e, str_boundary(e, first, l, end), "boundary",
+                              bounds_kind(BoundsEndSplitsChar, false, false), zero, end, l, site)
             None -> ()
 
     val p = fresh_reg(e)

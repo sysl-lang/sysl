@@ -1,0 +1,412 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{split, Search}
+
+// A failed bounds check says what failed and where (`bounds_fail.sysl`): an index, every way a range
+// can be wrong, a string cut inside a character -- each on standard error, followed by the same trap
+// as before, so the status is still SIGTRAP's (133 under a shell) and `@test(should_trap)` reads it as
+// it always did. The report goes through one weak function a program may override with `@export`, and
+// the locations can be left out of the image.
+//
+// Every program is built at `-O0` and at the default level: the failure path is a call followed by a
+// trap, and an optimizer that folded the check to its outcome must still make the call.
+
+private bfm_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The tree built at `level` and run: its status, what it printed, and what it wrote to standard
+// error -- taken as it came, since a location names a file by its path inside the project and the
+// temporary directory the tree was built in must appear nowhere.
+private bfm_run(files: []const (string, string), level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-bfm").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end bfm_run
+
+// At both levels, the program stops on SIGTRAP having written exactly `said` to standard error.
+private bfm_traps_saying(files: []const (string, string), said: string)
+    if !bfm_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, printed, err) = bfm_run(files, level)
+
+        assert_eq(err, said)
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state, having printed '$printed'")
+end bfm_traps_saying
+
+private bfm_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+// -- what each failure says ----------------------------------------------------------------------------
+
+@test("an index past the end names the index, the length and the bracket's line and column")
+bfm_an_index_past_the_end()
+    bfm_traps_saying(bfm_main("val xs = [1, 2, 3]\nprint(xs[5])\n"),
+                     "index 5 out of bounds for length 3 (main.sysl:2:9)\n")
+
+@test("a negative index is printed with its sign")
+bfm_a_negative_index()
+    bfm_traps_saying(bfm_main("at(xs: []const int, i: int) -> int = xs[i]\n\nval xs = [1, 2, 3]\n" +
+                              "print(at(xs[..], 0 - 1))\n"),
+                     "index -1 out of bounds for length 3 (main.sysl:1:40)\n")
+
+@test("an exclusive range ending past the length names both ends and the length")
+bfm_an_exclusive_range_past_the_end()
+    bfm_traps_saying(bfm_main("val xs = [1, 2, 3]\nprint(xs[2..<9].len)\n"),
+                     "range 2..<9 out of bounds for length 3 (main.sysl:2:9)\n")
+
+@test("an inclusive range ending at the length is out of bounds, in its own spelling")
+bfm_an_inclusive_range_past_the_end()
+    bfm_traps_saying(bfm_main("val xs = [1, 2, 3]\nprint(xs[1..3].len)\n"),
+                     "range 1..3 out of bounds for length 3 (main.sysl:2:9)\n")
+
+@test("a range starting past its exclusive end says so")
+bfm_a_start_past_its_end()
+    bfm_traps_saying(bfm_main("val xs = [1, 2, 3]\nprint(xs[3..<2].len)\n"),
+                     "range start 3 is past its end 2 (main.sysl:2:9)\n")
+
+@test("a range starting more than one past its inclusive end says so, and one past is empty")
+bfm_a_start_past_its_inclusive_end()
+    bfm_traps_saying(bfm_main("val xs = [1, 2, 3]\nprint(xs[2..1].len)\nprint(xs[3..1].len)\n"),
+                     "range start 3 is more than one past its end 1 (main.sysl:3:9)\n")
+
+@test("a range with no end starting past the length names the length")
+bfm_an_open_range_past_the_length()
+    bfm_traps_saying(bfm_main("val xs = [1, 2, 3]\nprint(xs[4..].len)\n"),
+                     "range start 4 is past length 3 (main.sysl:2:9)\n")
+
+@test("a string's index is a byte index, and its length is in bytes")
+bfm_a_string_index()
+    bfm_traps_saying(bfm_main("val s = \"héllo\"\nprint(s[6])\n"),
+                     "index 6 out of bounds for length 6 (main.sysl:2:8)\n")
+
+@test("a substring ending inside a character names the end")
+bfm_a_substring_ending_inside_a_character()
+    bfm_traps_saying(bfm_main("val s = \"héllo\"\nprint(s[0..<2])\n"),
+                     "range end 2 is not on a character boundary (main.sysl:2:8)\n")
+
+@test("a substring starting inside a character names the start")
+bfm_a_substring_starting_inside_a_character()
+    bfm_traps_saying(bfm_main("val s = \"héllo\"\nprint(s[2..<4])\n"),
+                     "range start 2 is not on a character boundary (main.sysl:2:8)\n")
+
+@test("a range inside a function in another file names that file, line and column")
+bfm_a_range_in_another_file()
+    var files: [2](string, string) = [
+        ("main.sysl", "import util\n\nval xs = [1, 2, 3]\nprint(util.head(xs[..], 7).len)\n"),
+        ("util/util.sysl", "module util\n\n// The first n.\nhead(xs: []const int, n: int) -> []const int = xs[0..<n]\n")]
+
+    bfm_traps_saying(files[..], "range 0..<7 out of bounds for length 3 (util/util.sysl:4:50)\n")
+
+@test("a location names its file inside what was built, and __FILE__ still names the path it was read from")
+bfm_a_location_names_no_build_directory()
+    if !bfm_ready() then return
+
+    val ran = bfm_run(bfm_main("print(__FILE__)\nval xs = [1, 2, 3]\nval i: usize = 5\nprint(xs[i])\n"), "0")
+
+    assert_eq(ran.2, "index 5 out of bounds for length 3 (main.sysl:4:9)\n")
+
+    // `__FILE__` is the absolute path, as before; the trap loses the buffered line, so ask again.
+    val said = bfm_run(bfm_main("print(__FILE__)\n"), "0")
+
+    assert(said.1.starts_with("/"), said.1)
+    assert(said.1.ends_with("/main.sysl\n"), said.1)
+end bfm_a_location_names_no_build_directory
+
+@test("a fetched package's file is named from its coordinate, a library file by its place")
+bfm_a_package_file_is_named_from_its_coordinate()
+    var roots: Buf[(string, string)] = buf()
+
+    roots.push(("/home/u/proj/", ""))
+    roots.push(("/home/u/.cache/sysl/pkg/", ""))
+    roots.push(("/home/u/side/", "side/"))
+    use_location_roots(roots)
+
+    val package = location_file("/home/u/.cache/sysl/pkg/github.com/o/p/@v1.2.0/sh/o/p/a.sysl")
+    val own = location_file("/home/u/proj/src/main.sysl")
+    val side = location_file("/home/u/side/b.sysl")
+    val library = location_file("library/sysl/print.sysl")
+    val elsewhere = location_file("/home/u/projector/c.sysl")
+
+    use_location_roots(buf())
+    assert_eq(package, "github.com/o/p/@v1.2.0/sh/o/p/a.sysl")
+    assert_eq(own, "src/main.sysl")
+    assert_eq(side, "side/b.sysl")
+    assert_eq(library, "library/sysl/print.sysl")
+    assert_eq(elsewhere, "/home/u/projector/c.sysl")
+end bfm_a_package_file_is_named_from_its_coordinate
+
+// -- the one function the failures go through ----------------------------------------------------------
+
+@test("an exported sysl_bounds_fail replaces the default, is handed what failed, and the trap still follows")
+bfm_an_override_replaces_the_default()
+    var files: [2](string, string) = [
+        ("main.sysl", "import report\n\nval xs = [1, 2, 3]\nval i: usize = 5\nprint(xs[i])\n"),
+        ("report/report.sysl",
+         "module report\n\nimport sysl.text.from_cstring\n\nprivate var calls: int = 0\n\n" +
+         "@export(\"sysl_bounds_fail\")\n" +
+         "on_bounds(kind: u32, a: usize, b: usize, n: usize, at: *u8)\n" +
+         "    calls += 1\n\n" +
+         "    val place = if usize(at) == 0 then \"-\" else from_cstring(at).unwrap_or(\"?\")\n\n" +
+         "    eprints(s\"override $kind $a $b $n $place calls=$calls\\n\")\n")]
+
+    bfm_traps_saying(files[..], "override 0 5 0 3 main.sysl:5:9 calls=1\n")
+
+@test("the override is handed the form, with the sign of a signed index marked")
+bfm_an_override_is_handed_the_form()
+    var files: [2](string, string) = [
+        ("main.sysl", "import report\n\ncut(xs: []const int, lo: int, hi: usize) -> []const int = xs[lo..<hi]\n\n" +
+                      "val xs = [1, 2, 3]\nprint(cut(xs[..], 1, 4).len)\n"),
+        ("report/report.sysl",
+         "module report\n\n@export(\"sysl_bounds_fail\")\n" +
+         "on_bounds(kind: u32, a: usize, b: usize, n: usize, at: *u8)\n" +
+         "    eprints(s\"form $kind: $a $b $n\\n\")\n")]
+
+    bfm_traps_saying(files[..], "form 257: 1 4 3\n")
+
+// -- leaving the locations out ---------------------------------------------------------------------------
+
+@test("bounds_locations = false keeps the values and leaves out the location")
+bfm_the_manifest_drops_the_location()
+    var files: [2](string, string) = [
+        ("package.hocon", "package {\n  name = \"probe\"\n}\n\nbounds_locations = false\n"),
+        ("main.sysl", "val xs = [1, 2, 3]\nprint(xs[5])\n")]
+
+    bfm_traps_saying(files[..], "index 5 out of bounds for length 3\n")
+
+@test("--no-bounds-locations does what the key does")
+bfm_the_flag_drops_the_location()
+    var flags: [1]string = ["--no-bounds-locations"]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+    bfm_traps_saying(bfm_main("val xs = [1, 2, 3]\nprint(xs[5])\n"),
+                     "index 5 out of bounds for length 3\n")
+    reset_search_paths()
+end bfm_the_flag_drops_the_location
+
+@test("with the locations dropped, no file:line:column reaches the module at all")
+bfm_no_location_constant_without_locations()
+    use_bounds_locations(false)
+
+    val ir = xvr_ir(bfm_main("val xs = [1, 2, 3]\nprint(xs[5])\n"))
+
+    use_bounds_locations(true)
+    assert(ir.contains("@sysl_bounds_fail(i32 0, i64 5, i64 0, i64 3, ptr null)"), ir)
+    assert(!ir.contains("main.sysl:"), ir)
+end bfm_no_location_constant_without_locations
+
+@test("bounds_locations must be true or false")
+bfm_the_key_is_a_boolean()
+    val root = make_temp_dir("sysl-bfm").unwrap()
+
+    val manifest = "package {\n  name = \"probe\"\n}\n\nbounds_locations = \"no\"\n"
+
+    write_text(s"$root/package.hocon", manifest).unwrap()
+
+    val read = manifest_at(root)
+
+    remove_dir_all(root).unwrap_or(())
+
+    read match
+        Ok(_) -> assert(false, "a string was taken as a boolean")
+        Err(why) -> assert(why.message.contains("'bounds_locations' says whether"), why.message)
+end bfm_the_key_is_a_boolean
+
+// -- the check itself is what it was ------------------------------------------------------------------
+
+// `sum`'s body as 0.0.162 emits it (`sysl emit-llvm` over this program), before the failure path
+// reported anything: the check, the branch and the element's address are the same instructions under
+// the same numbers, and the failure block gains exactly one line.
+private bfm_sum() -> string = raw"""
+    define i32 @sum({ ptr, ptr, i64 } %xs.param) {
+    entry:
+      %xs.addr = alloca { ptr, ptr, i64 }
+      %total.addr = alloca i32
+      %i.addr = alloca i64
+      store { ptr, ptr, i64 } %xs.param, ptr %xs.addr
+      store i32 0, ptr %total.addr
+      %t1 = load { ptr, ptr, i64 }, ptr %xs.addr
+      %t2 = extractvalue { ptr, ptr, i64 } %t1, 2
+      store i64 0, ptr %i.addr
+      br label %for.cond1
+    for.cond1:
+      %t3 = load i64, ptr %i.addr
+      %t4 = icmp ult i64 %t3, %t2
+      br i1 %t4, label %for.body2, label %for.end4
+    for.body2:
+      %t5 = load i32, ptr %total.addr
+      %t6 = load { ptr, ptr, i64 }, ptr %xs.addr
+      %t7 = extractvalue { ptr, ptr, i64 } %t6, 1
+      %t8 = extractvalue { ptr, ptr, i64 } %t6, 2
+      %t9 = load i64, ptr %i.addr
+      %t10 = icmp ult i64 %t9, %t8
+      br i1 %t10, label %bounds.ok5, label %bounds.bad6
+    bounds.bad6:
+      call void @llvm.trap()
+      unreachable
+    bounds.ok5:
+      %t11 = getelementptr i32, ptr %t7, i64 %t9
+      %t12 = load i32, ptr %t11
+      %t13 = add i32 %t5, %t12
+      store i32 %t13, ptr %total.addr
+      br label %for.step3
+    for.step3:
+      %t14 = load i64, ptr %i.addr
+      %t15 = add i64 %t14, 1
+      store i64 %t15, ptr %i.addr
+      br label %for.cond1
+    for.end4:
+      %t16 = load i32, ptr %total.addr
+      ret i32 %t16
+    }
+    """
+
+// The lines of the function `head` opens, through its closing brace.
+private bfm_function(ir: string, head: string) -> string
+    val lines = split(ir, "\n")
+    var out = ""
+    var inside = false
+
+    for i in 0..<lines.len
+        if lines[i].starts_with(head) then inside = true
+
+        if inside
+            out = out + lines[i] + "\n"
+
+            if lines[i] == "}" then return out
+
+    out
+end bfm_function
+
+@test("an in-bounds loop's check is the instructions 0.0.162 emits, and only the failure block grows")
+bfm_the_fast_path_is_unchanged()
+    val ir = xvr_ir(bfm_main("sum(xs: []int) -> int\n    var total = 0\n\n    for i in 0..<xs.len\n" +
+                             "        total += xs[i]\n\n    total\nend sum\n\nprint(sum([1, 2, 3]))\n"))
+    val body = bfm_function(ir, "define i32 @sum(")
+    val lines = split(body, "\n")
+    val head = "  call void @sysl_bounds_fail(i32 0, i64 %t9, i64 0, i64 %t8, ptr @"
+    var call = ""
+    var rest = ""
+
+    for i in 0..<lines.len
+        if lines[i].starts_with(head) then call = lines[i]
+        else if i + 1 < lines.len then rest = rest + lines[i] + "\n"
+
+    assert(call != "", body)
+    assert(body.contains("bounds.bad6:\n" + call + "\n  call void @llvm.trap()\n"), body)
+    assert_eq(rest, bfm_sum())
+
+    // The constant the call names is where the subscript was written: the `[` of `xs[i]`.
+    val named = call[head.bytes.len..<call.bytes.len - 1]
+
+    assert(ir.contains(s"@$named = private constant [15 x i8] c\"main.sysl:5:20\\00\""), ir)
+end bfm_the_fast_path_is_unchanged
+
+// -- where the default prints and where it does not ------------------------------------------------
+
+@test("the hosted default renders its own digits, writes once to standard error, and is weak")
+bfm_the_hosted_default()
+    val text = bounds_runtime(host_target())
+
+    assert(text.contains("define weak void @sysl_bounds_fail(i32 %kind, i64 %a, i64 %b, i64 %n, ptr %at)"),
+           text)
+    assert(text.contains("@write(i32 2, ptr %msg"), text)
+    assert(text.contains("call void @llvm.trap()"), text)
+    assert(!text.contains("snprintf"), text)
+
+    // A program that indexes and formats nothing links no C formatter for the report's sake.
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(bfm_main("val xs = [1, 2, 3]\nval i: usize = 5\nprint(xs[i])\n"))
+
+    assert(ir.contains("define weak void @sysl_bounds_fail"), ir)
+    assert(!ir.contains("@snprintf"), ir)
+end bfm_the_hosted_default
+
+@test("the freestanding default returns, writing nothing, so the call site's trap is what stops it")
+bfm_the_freestanding_default()
+    val t = target_resolved("thumbv7em-freestanding").unwrap()
+
+    assert_eq(bounds_runtime(t),
+              "define weak void @sysl_bounds_fail(i32 %kind, i32 %a, i32 %b, i32 %n, ptr %at) {\n" +
+              "entry:\n  ret void\n}\n\n")
+end bfm_the_freestanding_default
+
+@test("a module exporting sysl_bounds_fail carries no default beside it")
+bfm_an_override_carries_no_default()
+    val ir = xvr_ir(bfm_main("@export(\"sysl_bounds_fail\")\n" +
+                             "on_bounds(kind: u32, a: usize, b: usize, n: usize, at: *u8) = ()\n\n" +
+                             "val xs = [1, 2, 3]\nprint(xs[5])\n"))
+
+    assert(!ir.contains("define weak void @sysl_bounds_fail"), ir)
+    assert(ir.contains("call void @sysl_bounds_fail(i32 0"), ir)
+end bfm_an_override_carries_no_default
+
+// -- under the test runner ------------------------------------------------------------------------------
+
+// The tests of a one-file project, built and run as `sysl test` runs them.
+private bfm_outcomes(text: string) -> Option[Buf[Outcome]]
+    if !bfm_ready() then return None
+
+    val root = make_temp_dir("sysl-bfm").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val build = test_build_of(root, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(refusal))
+            return None
+        Ok(made) -> made
+
+    val exe = build_test_binary(root, build, None, DefaultOptimization) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return None
+        Ok(built) -> built
+
+    val ran = run_selected(exe, build.tests, TestOptions(None, false), 0, piece -> ())
+
+    discard_test_binary(exe)
+    remove_dir_all(root).unwrap_or(())
+    Some(ran)
+end bfm_outcomes
+
+@test("should_trap still passes on an index past the end, and the message can now be asked for")
+bfm_should_trap_still_passes()
+    val ran = bfm_outcomes("@test(should_trap)\nplain()\n    val xs = [1, 2, 3]\n\n    print(xs[5])\n\n" +
+                           "@test(should_trap: \"out of bounds for length 3\")\nsaying()\n" +
+                           "    val xs = [1, 2, 3]\n\n    print(xs[5])\n")
+
+    if ran.is_none() then return
+
+    val outcomes = ran.unwrap()
+
+    assert_eq(outcomes.len(), 2)
+
+    for i in 0..<outcomes.len()
+        assert(outcomes.at(i).passed(), outcomes.at(i).detail.unwrap_or(""))
+end bfm_should_trap_still_passes
