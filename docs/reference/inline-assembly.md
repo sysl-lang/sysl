@@ -1,0 +1,437 @@
+---
+title: Inline assembly
+summary: Machine instructions, in an arm per architecture — where operands are values and the compiler owns the constraint string, the escaping, and the labels.
+weight: 125
+---
+
+**Inline assembly is EXPERIMENTAL, and outside the [0.1.0 promise](/getting-started/stability/).**
+Everything below is shipped, documented and checked against the compiler like every other page here.
+What it does not have is a settled surface: a read-modify-write operand, a floating register class,
+and the two spellings that hand memory and the flags back are all unbuilt, and each would add to the
+notation rather than only to what it can reach. Build on it where it earns its place — but do not
+expect it to hold unchanged across releases, and prefer a construct from the promised part of the
+language where one will do.
+
+`asm` reaches the instructions no library can wrap: the privileged ones, the ones that talk to a bus
+rather than to memory, and the handful that change the machine the library is running on. It is the
+one construct that steps outside the language, and it is shaped so that stepping outside costs as
+little as possible — you supply instructions, and nothing else.
+
+**What you do not supply is the interesting part.** Which register an operand lands in, how the
+value gets there, what the block destroys, how a label avoids colliding with its own second
+expansion, how an operand is spelled in the emitted template: each is something the compiler knows,
+and each is something that, written by hand, is a comment nothing checks.
+
+sysl does **not** ship named functions for "disable interrupts" or "flush the TLB" that expand to
+each machine's instruction. Assembly is the primitive; the architecture layer above it is ordinary
+sysl that you write. What the language contributes is that the layer can be *checked*.
+
+## One arm per architecture
+
+An `asm` statement is a head with architecture arms indented under it. Exactly one is selected — the
+one naming the processor being compiled for — and the others contribute nothing:
+
+```sysl
+arch_cli()
+    asm
+        [x86_64]           "cli"
+        [aarch64]          "msr daifset, #2"
+        [riscv64, riscv32] "csrci mstatus, 8"
+        [thumb]            "cpsid i"
+        [craft]
+            "csrr t0, status"
+            "li t1, -3"
+            "and t0, t0, t1"
+            "csrw status, t0"
+            clobbers "t0", "t1"
+        [wasm32]           unavailable "a wasm module has no interrupts to disable"
+```
+
+An arm names one processor or several, spelled as [`#if`](/reference/attributes/) spells them:
+`aarch64`, `x86_64`, `riscv64`, `riscv32`, `thumb`, `x86`, `wasm32`, `craft`. A name outside that
+set is an error rather than a machine nobody has heard of.
+
+**`wasm32` is the one that is not a processor**, and it will not carry instructions at all: a wasm
+module has no registers to name and no assembler behind it. Its arm is therefore always empty or
+`unavailable` — both forms are below — which makes it the standing reminder that these arms are
+about *targets* rather than about chips.
+
+**`craft` is 16-bit, and its arms are the ones worth reading twice.** It has three-operand
+arithmetic and eight registers, so `mv` and `add` are spelled as RISC-V spells them — but it has no
+logical immediate and no bit-clear on a control register, so clearing one bit of `status` is a
+read-modify-write through two scratch registers rather than the one instruction every other machine
+here writes. That is what a deliberately small instruction set costs, stated where somebody can see
+it.
+
+**`riscv32` and `thumb` are one board's two halves**, which is why they are usually written together
+in what follows. The RP2350 boots either a pair of Cortex-M33s or a pair of RV32IMAC cores, and a
+microcontroller is what inline assembly is mostly for. `thumb` rather than `arm` names the Arm one
+because a Cortex-M executes Thumb only — an arm written for A32 would assemble for a machine that
+cannot run it, and the name is what says so.
+
+Here is a whole program. `yield`, `pause` and `nop` are each their machine's hint that a spin loop is
+spinning, which is about as small as a real use of this construct gets:
+
+```sysl
+spin_hint()
+    asm
+        [x86_64]           "pause"
+        [aarch64, thumb]   "yield"
+        [riscv64, riscv32] "nop"
+        [craft]            "nop"
+        [wasm32]
+
+spin_hint()
+print("hinted")
+```
+
+```output
+hinted
+```
+
+**Square brackets rather than a `match` arm's `->`.** Brackets are already what sysl writes around
+things resolved at compile time — a type parameter list, `Option[T]` — and the arrow is what it
+writes between a runtime pattern and its body. An architecture is not a value being tested: the arms
+not chosen do not exist in the output at all.
+
+## Every architecture needs an answer
+
+The arms must cover every processor a target can be built for, not merely the one you are building
+for now. A missing arm is an error on **every** build:
+
+```sysl
+halt()
+    asm
+        [x86_64] "hlt"
+
+halt()
+```
+
+```error
+this assembly has no arm for 'aarch64', 'riscv64', 'riscv32', 'thumb', 'wasm32' or 'craft'
+```
+
+This is the rule `#if` follows one level up, where every condition is checked in the branches being
+skipped as well as the one being taken. Here it reaches past whether a branch *parses* to whether one
+*exists* — so a forgotten processor is found by whoever forgot it, rather than by whoever first
+builds for the machine that was left out.
+
+### When there is genuinely no answer
+
+Some assembly is unportable in principle rather than by omission. `outb` and `inb` are x86's; every
+other processor here reaches devices through memory and has no equivalent at all. Such an
+architecture says so, and says why:
+
+```sysl
+port_out(port: u16, value: u8)
+    asm
+        [x86_64]
+            "outb {value}, {port}"
+            in port : "dx"
+            in value : "al"
+        [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "port I/O is x86-only; devices are reached through memory"
+```
+
+The x86-64 build compiles that. A build for a processor the arm covers is refused, and the reason
+travels into the diagnostic — which is the whole of what this form buys over leaving the arm out,
+since leaving it out fails *every* build instead:
+
+```sysl target=aarch64-macos
+port_out()
+    asm
+        [x86_64] "outb %al, %dx"
+        [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "port I/O is x86-only; devices are reached through memory"
+
+port_out()
+```
+
+```error
+port I/O is x86-only; devices are reached through memory
+```
+
+### When the answer is no instruction
+
+An arm written with nothing under it is an answer too: this processor needs no instruction. A memory
+barrier is free on a machine that never reordered the accesses in question, and `unavailable` would
+be false there — the operation is available, it simply costs nothing.
+
+```sysl
+barrier()
+    asm
+        [x86_64]
+        [aarch64]          "dmb ish"
+        [thumb]            "dmb sy"
+        [riscv64, riscv32] "fence rw, rw"
+        [craft]
+        [wasm32]
+```
+
+An empty arm cannot be confused with a forgotten one, because a forgotten arm is not empty — it is
+absent, and absent is the error above.
+
+## Operands are values, not registers
+
+An operand names a variable already in scope, gives its direction, and gives the register class or
+the machine register it must occupy. The template refers to it by that same name in braces:
+
+```sysl
+copy(n: int) -> int
+    var v: int = 0
+    asm
+        [x86_64]
+            "movl {n}, {v}"
+            in n : reg
+            out v : reg
+        [aarch64, thumb]
+            "mov {v}, {n}"
+            in n : reg
+            out v : reg
+        [riscv64, riscv32, craft]
+            "mv {v}, {n}"
+            in n : reg
+            out v : reg
+        [wasm32] unavailable "there are no registers for an operand to land in"
+    v
+
+print(copy(7))
+```
+
+```output
+7
+```
+
+`reg` means *any general-purpose register the allocator likes*, and it is the only class there is.
+Where an instruction demands a particular register, name it — quoted, because it is the assembler's
+name and not sysl's:
+
+```sysl
+out_byte(port: u16, value: u8)
+    asm
+        [x86_64]
+            "outb {value}, {port}"
+            in port : "dx"
+            in value : "al"
+        [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "port I/O is x86-only"
+```
+
+**A bare word is sysl's and a quoted word is the assembler's.** That rule decides every case in the
+construct: `reg` is a class this language names, `"dx"` is a register only the assembler knows, and
+instruction text is quoted because sysl does not read it.
+
+The class slot is required even though `reg` is currently the only class. Writing it keeps every
+operand line one shape, so a second class arrives as a peer rather than as the exception to an
+invisible default.
+
+**The `:` here is not a type annotation.** An operand names a variable that already has a type, so
+there is nothing left to declare — the slot holds a class or a register.
+
+### What an operand may be
+
+An operand must be a plain variable, and its type must fit a general-purpose register: the integers,
+the pointers, `bool`. A float needs a floating class, which does not exist yet.
+
+**A name bound by `ref` is not an operand.** It names a place somewhere else rather than a variable
+of its own, so there is no slot for the register to be loaded from or stored back to:
+
+```sysl
+f()
+    var xs: [3]int = [1, 2, 3]
+    ref r = xs[1]
+    var v: int = 0
+    asm
+        [x86_64]
+            "movl {r}, {v}"
+            in r : reg
+            out v : reg
+        [aarch64, thumb]
+            "mov {v}, {r}"
+            in r : reg
+            out v : reg
+        [riscv64, riscv32, craft]
+            "mv {v}, {r}"
+            in r : reg
+            out v : reg
+        [wasm32] unavailable "there are no registers for an operand to land in"
+
+f()
+```
+
+```error
+'r' is bound by 'ref', so it names storage somewhere else rather than a variable of its own, and there is nothing here for an operand to be. Copy it into a 'var' first, and write that back afterwards if the instructions set it
+```
+
+Copy it into a `var` and hand the instructions that, writing the result back through the `ref` if
+they set it:
+
+```sysl
+f()
+    var xs: [3]int = [1, 2, 3]
+    ref r = xs[1]
+    var n: int = r
+    var v: int = 0
+    asm
+        [x86_64]
+            "movl {n}, {v}"
+            in n : reg
+            out v : reg
+        [aarch64, thumb]
+            "mov {v}, {n}"
+            in n : reg
+            out v : reg
+        [riscv64, riscv32, craft]
+            "mv {v}, {n}"
+            in n : reg
+            out v : reg
+        [wasm32] unavailable "there are no registers for an operand to land in"
+    r = v + 40
+    print(xs[0], xs[1], xs[2])
+
+f()
+```
+
+```output
+1 42 3
+```
+
+Reading and writing the same variable is refused, because it is two operands and so possibly two
+registers — the instructions would read one and write another:
+
+```sysl
+f()
+    var n: int = 1
+    asm
+        [x86_64]
+            "addl {n}, {n}"
+            in n : reg
+            out n : reg
+        [aarch64, thumb, riscv64, riscv32, craft]
+            "add {n}, {n}, {n}"
+            in n : reg
+            out n : reg
+        [wasm32] unavailable "there are no registers for an operand to land in"
+
+f()
+```
+
+```error
+both read and written here
+```
+
+Only the **selected** arm's operands are checked, since the others describe machines this build is
+not for. So a mistake in an arm is reported by a build for that arm's processor — which is the same
+bargain exhaustiveness makes, one level down.
+
+## What the block destroys
+
+An arm may name registers it destroys beyond its operands:
+
+```sysl
+f()
+    asm
+        [x86_64]
+            "nop"
+            clobbers "rax", "rdx"
+        [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "x86 only here"
+```
+
+**Memory and the condition flags are assumed clobbered, always**, and cannot currently be given
+back. That is the conservative direction on purpose: assuming them costs optimization quality across
+a handful of instructions, and not assuming them costs a value kept in a register the block
+overwrote — a wrong answer with nothing to point at.
+
+Registers cannot be treated the same way. "Everything is clobbered" is a legal assumption and a
+useless one, so the registers an arm destroys are the one part of its effect you have to state.
+
+## What the compiler owns
+
+**Operand substitution and its escaping.** `$` is LLVM's own operand marker, so a `$` you write — an
+x86 immediate, `movq $1, %rsi` — is doubled by the compiler rather than by you. A doubled brace is a
+literal one, which is not a nicety: ARM writes register lists as `{r0-r3}`, so `push {{lr}}` is how
+you spell `push {lr}`.
+
+**Label uniqueness.** A label in an arm is local to that arm's expansion, and a block emitted twice
+gets two distinct labels. A label in inline assembly is otherwise a global symbol, and the second
+definition is a duplicate the assembler rejects for reasons you cannot do anything about from where
+you are standing.
+
+**Line joining.** Instructions are separate strings on separate lines, each able to carry a comment.
+This is the difference between an assembly routine that can be read and a six-instruction spinlock
+written on one line with `\n` between the instructions.
+
+**The constraint string**, which you never write, because a constraint that disagrees with the
+instruction text is not detectable by reading either one.
+
+## The words this construct spends
+
+None of them is reserved. `asm`, `unavailable`, `out`, `reg` and `clobbers` are contextual: each is
+recognized in exactly one position and is an ordinary identifier everywhere else — including inside
+an assembly block, in any other position.
+
+```sysl
+f() -> int
+    var out = 1
+    var reg = 2
+    var clobbers = 3
+    var asm = 4
+    out + reg + clobbers + asm
+
+print(f())
+```
+
+```output
+10
+```
+
+`in` is a reserved word already, for `for x in xs`, and is reused here rather than added to.
+
+## Where assembly may not go
+
+**Not in a `require` or `ensure` condition** — and there is no check that says so, because there is
+no way to write it: a contract's condition is an expression and assembly is a statement. A contract
+is a claim the compiler reasons about and an assembly block is precisely what it cannot reason
+about, so the two never meeting is a property to rely on.
+
+**Nothing about a block's contents is understood, including whether control comes back.** The
+compiler does not read the instructions, so it cannot know that a jump to a reset vector never
+returns — and it does not try. A function declared `-> never` with an assembly body is taken at its
+word, exactly as anything else declared not to return is:
+
+```sysl
+arch_reset() -> never
+    asm
+        [x86_64]
+            "cli"
+            "1: hlt"
+            "jmp 1b"
+        [aarch64]
+            "msr daifset, #2"
+            "1: wfi"
+            "b 1b"
+        [thumb]
+            "cpsid i"
+            "1: wfi"
+            "b 1b"
+        [riscv64, riscv32]
+            "csrci mstatus, 8"
+            "1: wfi"
+            "j 1b"
+        [craft]
+            "csrr t0, status"
+            "li t1, -3"
+            "and t0, t0, t1"
+            "csrw status, t0"
+            "wfi"
+            clobbers "t0", "t1"
+        [wasm32] unavailable "a wasm module cannot halt its host"
+```
+
+The promise is yours to keep here, which is true of the instructions themselves anyway.
+
+## What is not here yet
+
+- **`inout`** — a read-modify-write operand. The instructions wanting one are the exchange and
+  compare-exchange family, which [`sysl.sync`](/library/) already covers.
+- **Giving memory and the flags back**, which is an optimization over an answer that is currently
+  always correct.
+- **A floating register class.** It cannot be a single one: bare-metal RISC-V has no floating
+  registers to name.

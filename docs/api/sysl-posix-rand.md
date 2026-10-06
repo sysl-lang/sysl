@@ -1,0 +1,73 @@
+---
+title: sysl.posix.rand
+layout: api-module
+headingShift: 0
+slugStyle: github
+module: sysl.posix.rand
+summary: "A seed taken from the host, for a program that wants a different sequence on every run."
+requires: "no alloc, requires { posix }"
+---
+
+**This is a module of its own so that `sysl.rand` is not.** A directory is a module, so a second
+file under `rand/` would *be* `sysl.rand` and importing the generator would drag an operating
+system in behind it -- and the generator is deliberately usable on a target that has none. A
+freestanding program imports `sysl.rand` and never names this.
+
+**It lives under `sysl.posix` rather than under `sysl.rand` because `getentropy(2)` is what it
+is**, and that is the rule the whole namespace follows: a module there is one a freestanding
+target does not get. `sysl.posix.tty` sits beside `sysl.term` for the same reason.
+
+**`seed_from_os` is entropy for SEEDING, and it is not a cryptographic generator.** What it feeds
+is PCG32, whose whole output is computable by anyone who sees a few of its values. Seeding a
+predictable generator unpredictably does not make it unpredictable, and `sysl.rand` should not be
+mistaken for a source of key material.
+
+**`entropy_from_os` IS that source, and the distinction is the point of having both.** The kernel's
+pool is exactly what a salt, a nonce, an IV, a session id or a token wants; what must not be
+mistaken for one is the generator the seed is fed to. Everything `sysl.crypto` and every binding
+over monocypher or openssl says about randomness is *"the caller brings it"*, and before this
+there was nothing in sysl for the caller to bring it from -- so a program wanting sixteen fresh
+bytes opened `/dev/urandom` by hand, which works, and is a descriptor, an open, a read and a close
+for something the kernel answers in one call.
+
+## Index
+
+[`entropy_from_os`](#entropy_from_os) [`seed_from_os`](#seed_from_os)
+
+## Functions
+
+### `entropy_from_os`
+
+```sysl
+entropy_from_os(into: []u8) -> bool
+```
+
+`into` filled from the kernel's entropy pool, or `false` where the host would not supply it.
+
+**This is the source key material comes from**, unlike `seed_from_os` above it, which feeds a
+generator that is not one. A salt, a nonce, an IV, a session id and a token all want these bytes
+and want nothing computed from them.
+
+**A slice longer than 256 bytes is filled by looping**, because that is `getentropy(2)`'s limit
+per call and not a limit on what a caller may ask for. Refusing a longer slice was the other road
+and is worse: every real caller wants 16 or 32, so the cap would be a rule nobody meets and
+everybody has to read about, and the loop is three lines.
+
+**An empty slice is filled successfully**, which is what a loop over no bytes means. It is worth
+saying because the alternative -- asking the kernel for zero bytes -- is a call some libcs refuse.
+
+Answers a `bool` rather than trapping, for `seed_from_os`'s reason turned the other way round: a
+caller who cannot get entropy has no reasonable fallback for key material and must **stop**, and a
+value it has to look at is what makes that a decision rather than an omission.
+
+### `seed_from_os`
+
+```sysl
+seed_from_os() -> Option[u64]
+```
+
+Eight bytes of host entropy as a seed, or `None` where the host would not supply them.
+
+**Answers an `Option` rather than trapping.** A program that cannot get entropy usually has a
+reasonable fallback -- a fixed seed, and a line in its log saying so -- and a library that aborted
+would take that choice away.

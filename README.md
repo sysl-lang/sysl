@@ -5,8 +5,8 @@ The sysl compiler, written in sysl.
 **This is the compiler that will ship as `sysl`.** Until it can build itself it is built by the
 [bootstrap compiler](https://github.com/sysl-lang/sysl-bootstrap), which is written in Scala and
 remains the reference: the two are checked against the same programs, and where they disagree the
-bootstrap decides until this one has earned the last word. The language is specified at
-[sysl.sh](https://sysl.sh), and nothing here changes it.
+bootstrap decides until this one has earned the last word. The language is specified by the pages
+in `docs/`, which [sysl.sh](https://sysl.sh) publishes from a release tag.
 
 ## The layout
 
@@ -14,6 +14,7 @@ bootstrap decides until this one has earned the last word. The language is speci
 |---|---|
 | `compiler/` | the compiler: its `package.hocon`, `sysl.sum` and the module `sh.sysl.compiler` |
 | `library/` | the standard library, the tree whose root module is `sysl` |
+| `docs/` | the documentation's pages — the reference, the library, the tour — every `sysl` block of which the compiler's suite builds and runs (`tests_docs.sysl`, with `SYSL_DOCS=1`) |
 | `scripts/` | the censuses that compare this compiler with the reference |
 
 The compiler is a project of its own in `compiler/` because a compiler reads every `.sysl` file
