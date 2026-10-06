@@ -1,0 +1,130 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.Search
+
+// The coroutine dialect a clang reads, and the one thing the rewrite into it may never touch: a
+// string constant. A literal's value is its bytes, so a program printing the text of an instruction
+// prints that text whichever clang compiled it.
+
+// A module holding the text of the instruction four ways as data, and the instruction and its
+// declaration once each as code.
+private cde_module() -> string = raw"""
+    @.a = private constant [26 x i8] c"call void @llvm.coro.end(\00"
+    @.b = private constant [32 x i8] c"x\0A  call void @llvm.coro.end(\00"
+    @.c = private constant [29 x i8] c"declare void @llvm.coro.end(\00"
+    @.d = private constant [31 x i8] c"\22call void @llvm.coro.end(\22\00"
+
+    define void @f(ptr %h) {
+    entry:
+      call void @llvm.coro.end(ptr %h, i1 false, token none)
+      ret void
+    }
+
+    declare void @llvm.coro.end(ptr, i1, token)
+    """
+
+@test("the i1 dialect changes the instruction and its declaration and leaves every constant alone")
+cde_constants_keep_their_bytes()
+    val out = coro_end_as_i1(cde_module())
+
+    assert(out.contains("  call i1 @llvm.coro.end(ptr %h, i1 false, token none)\n"), out)
+    assert(out.contains("\ndeclare i1 @llvm.coro.end(ptr, i1, token)\n"), out)
+    assert(!out.contains("  call void @llvm.coro.end(ptr %h"), out)
+    assert(out.contains("c\"call void @llvm.coro.end(\\00\""), out)
+    assert(out.contains("c\"x\\0A  call void @llvm.coro.end(\\00\""), out)
+    assert(out.contains("c\"declare void @llvm.coro.end(\\00\""), out)
+    assert(out.contains("c\"\\22call void @llvm.coro.end(\\22\\00\""), out)
+    assert_eq(out.count_of("call i1 @llvm.coro.end("), 1)
+    assert_eq(out.count_of("declare i1 @llvm.coro.end("), 1)
+end cde_constants_keep_their_bytes
+
+// A codegen unit is a cut of the module, so its text may begin with the declaration.
+@test("a declaration on the text's first line is in the i1 dialect too")
+cde_declaration_at_the_start()
+    assert_eq(coro_end_as_i1("declare void @llvm.coro.end(ptr, i1, token)\n"),
+              "declare i1 @llvm.coro.end(ptr, i1, token)\n")
+
+@test("a text with no instruction in it is handed back unchanged")
+cde_nothing_to_change()
+    val text = "@.a = private constant [26 x i8] c\"call void @llvm.coro.end(\\00\"\n"
+
+    assert_eq(coro_end_as_i1(text), text)
+
+@test("for_clang marks a definition and never a constant spelling one")
+cde_for_clang_leaves_constants()
+    val ir = "@.s = private constant [20 x i8] c\"define void @g() {\\00\"\n\n" +
+             "define void @g() {\nentry:\n  ret void\n}\n"
+    val marked = for_clang(ir, target_named("x86_64-linux").unwrap())
+
+    assert(marked.contains("c\"define void @g() {\\00\""), marked)
+    assert(marked.contains("define void @g() #99 {"), marked)
+end cde_for_clang_leaves_constants
+
+// --- the whole program, through each clang this machine has -------------------------------------
+
+private cde_program() -> string = raw"""
+    async twice(n: int) -> int = n * 2
+
+    print("call void @llvm.coro.end(")
+    print("declare void @llvm.coro.end(ptr, i1, token)")
+    print("x\n  call void @llvm.coro.end(ptr %h, i1 false, token none)\ndeclare void @llvm.coro.end(ptr)")
+    print("call i1 @llvm.coro.end(")
+    print("\"call void @llvm.coro.end(\" and \\declare void @llvm.coro.end(")
+    print(block_on(twice(21)))
+    """
+
+private cde_expected() -> string =
+    "call void @llvm.coro.end(\n" +
+    "declare void @llvm.coro.end(ptr, i1, token)\n" +
+    "x\n  call void @llvm.coro.end(ptr %h, i1 false, token none)\ndeclare void @llvm.coro.end(ptr)\n" +
+    "call i1 @llvm.coro.end(\n" +
+    "\"call void @llvm.coro.end(\" and \\declare void @llvm.coro.end(\n" +
+    "42\n"
+
+// What the program prints when `cc` compiles it, or why it did not run.
+private cde_outcome(cc: string) -> string
+    val root = make_temp_dir("sysl-cde").unwrap()
+
+    write_text(s"$root/main.sysl", cde_program()).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, Some(cc), DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else
+            s"it did not run to the end: ${out.text}${out.err.unwrap_or("")}"
+end cde_outcome
+
+// Runs the program through `cc`, which has to read `llvm.coro.end` in the dialect `void_end` says.
+private cde_through(cc: string, void_end: bool)
+    if std_root().is_err() then skip("the standard module's source is not on this machine")
+    if !exists(cc) then skip(s"there is no $cc on this machine")
+    if coro_end_is_void(cc) != void_end then skip(s"$cc does not read the dialect this test is about")
+
+    assert_eq(cde_outcome(cc), cde_expected())
+end cde_through
+
+// Apple's clang 21 reads `llvm.coro.end` as answering `i1`.
+@test("a program printing the instruction's text prints it exactly through a clang of the i1 dialect")
+cde_literals_survive_the_i1_dialect()
+    cde_through("/usr/bin/clang", false)
+
+// Homebrew's LLVM (22 and later) reads it as answering nothing.
+@test("a program printing the instruction's text prints it exactly through a clang of the void dialect")
+cde_literals_survive_the_void_dialect()
+    cde_through("/opt/homebrew/opt/llvm/bin/clang", true)

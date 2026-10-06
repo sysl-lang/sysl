@@ -19,9 +19,27 @@ private var coro_end_answers: Buf[(string, bool)] = buf()
 in_coro_dialect(cc: string, ir: string) -> string
     if !ir.contains("@llvm.coro.end(") || coro_end_is_void(cc) then return ir
 
-    replace_all(replace_all(ir, "call void @llvm.coro.end(", "call i1 @llvm.coro.end("),
-                "declare void @llvm.coro.end(", "declare i1 @llvm.coro.end(")
+    coro_end_as_i1(ir)
 end in_coro_dialect
+
+// The text with `llvm.coro.end`'s calls and declaration answering `i1`, and every other byte as it was.
+//
+// **Only a line BEGINNING with the instruction or the declaration changes**, and that is what keeps a
+// string constant out of reach: a constant is a `c"..."` on a global's line, which begins with `@`,
+// and no quoted string in the module holds a raw newline -- a constant writes one as `\0A`, as an
+// `asm` template does between its lines -- so the text of an instruction inside a literal is never at
+// the start of a line, however the literal spells it. A literal's value is its bytes, and a program
+// printing `"call void @llvm.coro.end("` prints exactly that through either dialect.
+coro_end_as_i1(ir: string) -> string
+    val call = "  call void @llvm.coro.end("
+    val decl = "declare void @llvm.coro.end("
+    val body = replace_all(replace_all(ir, "\n" + call, "\n  call i1 @llvm.coro.end("),
+                           "\n" + decl, "\ndeclare i1 @llvm.coro.end(")
+
+    // A codegen unit is a cut of the module, so its first line may be the declaration.
+    if body.starts_with(decl) then "declare i1 @llvm.coro.end(" + body[decl.bytes.len..<body.bytes.len]
+    else body
+end coro_end_as_i1
 
 // Whether this clang reads `llvm.coro.end` as answering nothing.
 coro_end_is_void(cc: string) -> bool
