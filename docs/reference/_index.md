@@ -28,7 +28,7 @@ connections are written down where they matter. Thorough is the point; brevity i
 
 The order runs from the smallest units upward: what the compiler reads, then what a type is, then
 what an expression is, then the declarations that bind them, then the systems built on top —
-memory, traits, generics, modules, errors, the foreign interface, and the forms that reach into the
+memory, traits, generics, modules, errors, async and tasks, the foreign interface, and the forms that reach into the
 compilation itself.
 
 **One page is the opposite of thorough, on purpose.** [Compact reference](/reference/compact/) is the

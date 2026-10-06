@@ -33,9 +33,15 @@ operator symbols, and no facility to add one.
 | 11 | `*` `/` `%` `<<` `>>` | multiply, divide, remainder, shift | left |
 | 12 | `-` `!` `~` `*` `&` `++` `--` | prefix unary | right |
 | 13 | `[]` `.` `()` `::` `with` `?` `++` `--` | postfix | left |
+| — | `await` | run a task: prefix, taking the postfix chain up to its first `?` | right |
 
 `*` and `&` appear at two levels each — prefix at 12 (dereference, address-of) and binary at 11 and 9
 (multiply, bitwise and). Position tells them apart, and nothing else has to.
+
+**`await` sits between the two postfix kinds** rather than on a level of its own: it takes the calls,
+member selections and indexes after it, so `await d.read(n)` awaits the call, and stops at the first
+`?`, which then applies to the awaited value — `await f()?` is `(await f())?`, and `await f() + 1` is
+`(await f()) + 1`. [Where `await` binds](/reference/async/#where-await-binds) has the whole table.
 
 ### Two deliberate corrections to C
 
@@ -542,6 +548,9 @@ arguments, index expressions. With an order defined, the expression above has on
 merely hard to read, which makes it a lint candidate and not a footgun.
 
 Postfix binds tighter than prefix, so `*p++` is `*(p++)` and `-a.b` is `-(a.b)`, exactly as in C.
+The one prefix that reaches past a postfix is [`await`](/reference/async/#where-await-binds), which
+takes its operand's calls, member selections and indexes but stops at the first `?` — `await f()?`
+is `(await f())?` — while `-a?` stays `-(a?)`.
 
 ## The postfix tail
 
@@ -916,8 +925,9 @@ memory model rests on applies to representation changes too.
 |---|---|---|
 | integer → integer | `u16(n)`, `byte(n)` | truncates or extends; sign-extends only when the *source* is signed |
 | integer → float | `real(n)`, `f32(n)` | rounds to nearest; signed and unsigned sources differ |
-| float → integer | `int(x)` | truncates toward zero |
+| float → integer | `int(x)`, `u8(x)` | truncates toward zero, **saturating** — past either end it is that end; a NaN is `0` |
 | float → float | `f32(x)`, `real(x)` | rounds to nearest |
+| fixed-point → fixed-point, float or integer, and back | `q31(x)`, `real(q)`, `int(q)` | rounds to nearest and saturates — see [fixed-point numbers](/reference/fixed-point/#conversions) |
 | `char` → integer | `u32(c)` | total — every `char` is an integer |
 | integer → `char` | `char(u)` | **partial** — traps on a value that is not a Unicode scalar value |
 | `char` → `string` | `string(c)` | total — the one character, UTF-8 encoded into a fresh string |
@@ -932,6 +942,31 @@ print(byte(n), real(n), u32(c), int(3.9))
 
 ```output
 44 300 65 3
+```
+
+**A float read as an integer saturates.** The value is truncated toward zero, and where that does not
+fit the width it comes to the width's nearest end: anything above `i32::Max` is `i32::Max`, anything
+below `i32::Min` is `i32::Min`, and a negative value read as an unsigned type is `0`. **A NaN, which
+has no integer value at all, comes to `0`** — for a signed and an unsigned target alike. An infinity
+is past either end, so it is that end. The rule is the same at both float widths, for every integer
+width and signedness, and for a constant as for a value computed at run time. Nothing traps and
+nothing wraps, which is what makes `i32(x * 2147483648.0)` a correct clamp of a sample in
+`-1.0 ..= 1.0` into q31.
+
+```sysl
+var big = 1.0e30
+var z = 0.0
+var nan = z / z
+
+print(i32(big), i32(-big), i32(nan))
+print(u8(300.0), u8(-1.5), u8(nan), u8(255.9))
+print(int(2.9), int(-2.9))
+```
+
+```output
+2147483647 -2147483648 0
+255 0 0 255
+2 -2
 ```
 
 Everything else is rejected. There is **no conversion to or from `bool`** — `int(true)` is an error

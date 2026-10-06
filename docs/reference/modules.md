@@ -1473,7 +1473,9 @@ print(nil.raw.len)
 ```
 
 That is `sysl.encoding.nil` exactly: the nil UUID is a module-level `val` for this reason and no
-other. A `const` whose *type* is a scalar and whose *value* is genuinely not constant still gets the
+other. [What constant data is](/reference/ffi/#what-constant-data-is) says which initializers are
+laid down that way — arrays, structs and variants over constant expressions, at any depth. A `const`
+whose *type* is a scalar and whose *value* is genuinely not constant still gets the
 older wording, which is the case it was written for and is the `size()` example below.
 
 ```sysl
@@ -1496,13 +1498,14 @@ is refused too, because a predicate is checked where a value is *made* and a con
 its uses rather than made anywhere — admitting one would be a check the declaration claims and the
 program never gets.
 
-**A constant expression** is a literal; a `const`; a conversion; a unary `-`, `!` or `~`; or a binary
-arithmetic, bitwise, shift, or comparison operator applied to constant expressions. Integers, floats,
-`bool` and `char` fold.
+**A constant expression** is a literal; a `const`; a conversion; a unary `-`, `!` or `~`; a binary
+arithmetic, bitwise, shift, or comparison operator applied to constant expressions; or **a call to
+a [`const` function](/reference/declarations/#a-const-function-runs-while-compiling)** whose
+arguments are constant expressions. Integers, floats, `bool` and `char` fold.
 
-**There are no calls**, and a `string` constant's initializer must be a **literal** — since `+` on
-strings allocates, and a compile-time concatenation would be a different operation wearing the same
-spelling:
+**A call to any other function is refused**, and a `string` constant's initializer must be a
+**literal** — since `+` on strings allocates, and a compile-time concatenation would be a different
+operation wearing the same spelling:
 
 ```sysl
 size() -> int = 4
@@ -1513,11 +1516,68 @@ print(called)
 ```
 
 ```error
-the value of 'called' is not a constant expression
+the value of 'called' is not a constant expression — 'size' is not 'const', so it runs only when the program does; mark it 'const' to call it here
 ```
 
-A function call in a constant expression is a request for compile-time evaluation of arbitrary code,
-which is a language of its own.
+A `const` function is the one kind of code the compiler runs while it compiles, so marking it is
+all the call needs:
+
+```sysl
+const size() -> int = 4
+
+const called: int = size()
+
+print(called)
+```
+
+```output
+4
+```
+
+**The call is run, not guessed at.** The compiler runs the function's body over the arguments, at
+the target's widths — a `usize` wraps at 32 bits when the target's `usize` is 32 bits — with every
+integer operation wrapping as it does at run time and every `f32` operation rounded as it is at run
+time, so the constant is the bits the same call makes when the program runs. A module `val`
+initialized by such a call is laid into the object file as data on every target, a freestanding
+one included, rather than computed before the program's statements:
+
+```sysl
+const fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)
+
+static val V: int = fact(10)
+
+print(V)
+```
+
+```output
+3628800
+```
+
+**Every run is bounded**: 16,000,000 steps — one per expression and statement the run visits — and
+calls 512 deep. Running out of either is an error naming the constant, not a warning, and there is
+no setting that raises them:
+
+```sysl
+const spin() -> int
+    loop
+        continue
+
+const k: int = spin()
+
+print(k)
+```
+
+```error
+'k' did not finish within 16,000,000 steps while compiling — the loop at
+```
+
+**What a body may hold while it runs is narrower than what it may hold**: integers of every width,
+`f32` and `real`, `bool`, `char` and `unit`, and constrained types of them, with their checks run.
+A struct, an array, an enum value, a field or an element stops the run with *"a 'P' is not
+evaluated while compiling yet — integers, floats, 'bool' and 'char' are"*; the program's own
+run-time call is unaffected. A `const` call where a **type** is read — an array bound, a `within` —
+is not evaluated yet either, and is refused with *"'four' is a 'const' function, but this value is
+read while declarations are, before any body can be run"*.
 
 **"A `const`" above means the declaration, not a spelling of it.** A constant reached by its full path
 is the same constant as one reached by an import, and the two fold alike in every position below —
@@ -1681,80 +1741,43 @@ slice of one yields — is on [declarations](/reference/declarations/#a-module-m
 
 ## Separate compilation
 
-A library is built into one file and linked against, rather than recompiled by everything that uses
-it:
+**A library is handed to a compilation as the directory its source is written in** — a
+[source root](#source-roots) given to `--lib`, or a coordinate in a manifest's
+[`dependencies`](/reference/packages/). There is no library artifact anybody names. What the compiler
+makes from a tree it can make again, so it keeps that in its own cache and finds it there by itself;
+a `--lib` naming a `.syslib` is refused, with the reason:
 
+```text
+$ sysl build main.sysl --lib mylib.syslib
+sysl: error: --lib takes the directory a library's source is in, and 'mylib.syslib' is a '.syslib' — a library is handed over as the tree it is written in, and the compiler keeps its own cache of what it compiled from one, which nobody names
 ```
-sysl build-lib mylib -o mylib.syslib     # compile the library once
-sysl run prog.sysl --lib mylib.syslib    # link a program against it
-```
 
-**`--lib` takes either an artifact or a source tree**, and which one is read off the name. How a
-library shipped is the shipper's business; a program that depends on one should not have to write down
-which form it got. Given a source tree the library is simply *more modules*, and the rules at the top
-of this page do the rest.
+How a library shipped is therefore never the consumer's business: a program depending on one names a
+directory or a coordinate and nothing else, and the rules at the top of this page do the rest — a
+library is simply *more modules*.
 
-**An artifact has two halves, and the split is the whole design.** A declaration with **no type
-parameters** is compiled ahead of time into object code by whoever built the library, and a program
-that calls it declares the symbol and links the body. A **generic** has nothing to compile until a
-caller fixes its type arguments, so it crosses as the tree it was parsed into and is monomorphized in
-the consuming program. Rust's `.rlib` makes the same split for the same reason.
+**`sysl build-lib <dir>` checks a library for one machine** — the whole analysis, against the
+standard module, for the `--target` named — and writes nothing; `checked <dir>` is its whole answer.
+That is the only check a board package gets on a host, which is what the command is for. It takes no
+`-o`, and says why: *"build-lib writes nothing anybody names — it checks a library, and what it
+compiles is this compiler's cache, found by the compiler alone — so it takes no -o"*.
 
-The metadata carries **every** declaration, not only the generic ones: a call into the precompiled
-half still has to be type-checked, and the tree is where the signature is. What the symbol list adds
-is which of those the consumer must declare rather than emit a second time.
+Two rules about a library hold whichever way it reaches a build:
 
-Five consequences, each a thing a reader would otherwise have to discover:
-
-- **An artifact is for one machine**, and *both* halves pin it. The object half obviously does; the
-  tree half does because a library may gate on the machine it is built for, which makes two artifacts
-  built from one source two different sets of declarations. So an artifact records its target and is
-  refused by a build for another — refused rather than left to the linker, which would eventually
-  complain about object formats in a message saying nothing about which library or why.
 - **A library carries no entry point.** A `main` of its own would collide with the one belonging to
   whatever links it.
-- **Nothing is pruned when a library is built.** A program is lowered from `main` outwards because
-  what it cannot reach is dead; a library has no `main` and every public declaration is a potential
-  entry, so all of them are emitted and the *linker* discards what a given program never calls.
-- **A library defines its own declarations and nobody else's.** A library that prints reaches the
-  library's own printing surface exactly as a program does — but emitting *those* would put a copy in
-  every artifact, so two libraries that both printed could not be linked into one program. They are
-  declared in the artifact and defined in the consuming program.
 - **A library may not sit in the anonymous root module.** A library is reached by naming its module,
   and the root module has no name, so nothing depending on it could write a path to what it declares.
 
-**A library may be built on another library**, and `--lib` is how one gets there:
+**The standard module is the one compiled library, and it is linked by default.** It is compiled
+once per machine, optimization level and allocator into an archive in the compiler's cache: a
+declaration with **no type parameters** is compiled ahead of time into object code, and a program that
+calls it declares the symbol and links the body, while a **generic** has nothing to compile until a
+caller fixes its type arguments and is monomorphized in the consuming program. Rust's `.rlib` makes
+the same split for the same reason.
 
-```bash
-sysl build-lib sdl3 -o sdl3.syslib
-sysl build-lib sdl3-ttf --lib sdl3.syslib -o sdl3-ttf.syslib
-```
-
-`build-lib` takes `--lib` exactly as a compilation does, and for the same reason: a library whose
-declarations are written in another library's types does not compile without them. `sdl3-ttf`'s
-`Font` renders to an `sdl3` `Surface`, so a package that could not say so would have to be a module
-inside its dependency rather than a package of its own. Nothing about the artifact changes, because
-the fourth bullet above already governs it — the dependency's compiled half is declared here and
-defined by whatever program links both.
-
-**What `build-lib` does not do is fetch.** A `dependencies` block is a coordinate to resolve over the
-network, and a command whose whole job is to compile one tree into an artifact for one machine does
-not go looking — so a package that declares dependencies and is handed no library is refused, naming
-the dependency and the flag that answers it. Such a package writes its dependency down twice, once in
-`package.hocon` and once on the command line, and that is the price of a compile step that is offline
-by construction.
-
-**The container is an `ar` archive**, which is what an `.rlib` is and for the same reason: the linker
-already reads one, so the compiled half needs no unwrapping and a member is pulled in only to resolve
-something a program actually left undefined. The metadata rides inside it wrapped in a real object
-file, as one `private` constant in a section of its own, so nothing ever gives the linker a reason to
-pull it in and it costs the linked program nothing.
-
-**The standard module is built the same way, and linked by default.** Which library a compilation is
-compiled against is a *parameter* of it rather than an ambient fact — which is what lets two cores be
-handed to two compilations and compared — but the parameter has a default, and the default is found
-rather than named. **A compilation that finds no standard module at the default path builds one**, in
-well under a second, announcing it on stderr. That is not the silent substitution a compiler must
+Which library a compilation is compiled against is found rather than named. **A compilation that
+finds no standard module at the default path builds one**, announcing it on stderr. That is not the silent substitution a compiler must
 never make: a rebuild compiles against *this* library, from its own source, held to the same
 fingerprint on the way back in. Nothing is substituted, so there is nothing to be misled about.
 
@@ -1769,11 +1792,9 @@ The default path is keyed by a fingerprint of the library, so every compilation 
 on the machine finds the same artifact — and a rebuild therefore **publishes by rename**: it is
 assembled beside its destination and moved onto it. Two builds may run at once; a reader gets the
 whole of one artifact or the whole of the other, and a rebuild that fails leaves the one that was
-already there.
-
-An artifact **named** on the command line is never rebuilt, and one that cannot be read stops the
-compilation — corrupt, truncated, built by another sysl, or built from other sources. Someone who
-wrote down which standard module to compile against is owed the truth about that one.
+already there. One that cannot be read — corrupt, truncated, built by another sysl, or built from
+other sources — is not trusted: the fingerprint it carries is checked against the library's own, and
+an archive that does not match is built again rather than linked.
 
 ## Source roots
 

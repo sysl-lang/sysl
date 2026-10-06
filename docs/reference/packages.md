@@ -90,6 +90,11 @@ the package offers, and out of the walk `sysl test .` makes — that walk takes 
 root and refuses one that declares no module, so the exclusion has to reach it too or the feature
 does not work.
 
+**A directory holding a `package.hocon` of its own is left out the same way, wherever it sits** — it
+is another project ([workspaces](#a-directory-holding-its-own-manifest-is-another-project)). A demo
+that wants dependencies of its own, or is more than a few files, is better as a project in
+`examples/<name>/` with its own manifest and the package as a workspace member it depends on.
+
 **A program in it compiles against the package with nothing on the command line.** `sysl run
 mypkg/examples/demo.sysl` and `sysl run mypkg/examples/bigger` both find the package they sit under
 and use it as a library, exactly as a `--lib` naming it would — so the manifest's own dependencies,
@@ -166,10 +171,17 @@ can make that claim.
 **Both kinds of manifest are held to it**: the project being built, and every package it depends on.
 Saying nothing is the ordinary case and is never an error.
 
-**An interim compiler satisfies the floor its numbers reach.** One is stamped `0.0.66-fcf4e33a` — the
-next patch, plus the commit it was built from — and it has everything the release before it shipped,
-so it is read as `0.0.66`. Cargo makes the same ruling for a nightly toolchain against
-`rust-version`.
+**A compiler's own version is ordered as semver orders it**, pre-release included. A release
+numbered `0.1.0-alpha.1` sits above every `0.0.x` and below `0.1.0` itself, and alphas order by
+their number — `alpha.2` before `alpha.10` — so every `0.0.x` floor in the org is met by the alpha,
+and a floor of `0.1.0` is not:
+
+```
+this project cannot be built because it requires sysl 0.1.0 or newer, while the compiler in hand is 0.1.0-alpha.1
+```
+
+**A development build checks no floor at all.** A compiler built from a checkout rather than cut as
+a release says `0.0.1`, which makes no claim about what it has, so no floor is too high for it.
 
 **An older compiler cannot report this**, and nothing can change that: it does not know the key, so
 it reads the manifest, ignores the field, and fails wherever it was going to fail. The field starts
@@ -459,6 +471,21 @@ name it in a list: 'link = ["libuv"]'
 `sysl run`'s cache carries the choice, so changing `link` over a tree that did not otherwise move
 relinks rather than replaying the other kind of binary.
 
+## Leaving the bounds locations out
+
+A failed bounds check [says what failed and where](/reference/errors/#what-stopping-looks-like),
+and the *where* is a `file:line:column` string per check carried in the image. A board short of
+flash can drop them:
+
+```hocon
+bounds_locations = false
+```
+
+The report keeps its values — `index 5 out of bounds for length 3` — and loses only the location;
+no location string reaches the module at all. `--no-bounds-locations` on the command line does the
+same for one build. The key is `true` or `false` and nothing else, and anything else is refused when
+the file is read.
+
 ## Capabilities
 
 **Whether the machine has a heap, an operating system or POSIX is a project engineering
@@ -568,21 +595,14 @@ declare a pair too, which covers an application with its own arena and no depend
 handed over as a `--lib` source root declare the same thing and settle the same question — this is a
 property of the package, not of the flag that reached it.
 
-### A library artifact is built for one allocator
+### The compiled standard module is built for one allocator
 
-A `.syslib`'s object half is compiled code, and it calls the pair by name. So an artifact is built for
-one allocator exactly as it is built for one machine, and a program that allocates another way refuses
-it:
-
-```
-geom.syslib allocates through malloc / free and this program allocates through
-pvPortMalloc / vPortFree — a program has one heap, so a library compiled against
-another cannot be linked into it. Rebuild the library against this one
-```
-
-That refusal is sharper than the one for a mismatched target, and deliberately so: an artifact for the
-wrong machine is eventually refused by a linker that cannot read the object at all, while an artifact
-for the wrong allocator is refused by nothing. Recording the name is the only place it can be caught.
+The [standard module's compiled half](/reference/modules/#separate-compilation) is object code, and
+it calls the pair by name. So the compiler's cache keeps one for each pair exactly as it keeps one for
+each machine — the allocator's two symbols are in the cache key beside the target and the
+optimization level — and a program that allocates another way is linked against a standard module
+compiled for its own heap rather than handed one that frees into somebody else's. A library reaches a
+build as source, so it is compiled against the program's pair along with everything else.
 
 The standard module is under the same rule and needs nothing done about it — its cache is keyed by the
 pair among the other things it is keyed by, so a program that names an allocator gets a standard
@@ -733,20 +753,15 @@ exactly what the paragraph above exists to prevent.
 
 ### It is asked whichever way the package arrived
 
-A package reaches a build by three roads, and the declaration is worth the same on each — though they
-do not all need the same thing from it.
+A package reaches a build by two roads, and the declaration is worth the same on each:
 
 | how the package arrived | what happens |
 |---|---|
 | named in `dependencies` | its manifest comes with the graph, and the requirement is asked |
-| handed over as a `.syslib` | nothing is asked, because nothing is needed |
 | given as a `--lib` source root | its manifest is read for this, and the requirement is asked |
 
-**The artifact needs no header at all**, which is worth knowing before going to look for a flag to
-pass. `build-lib` measures a `c const` and a `c type` while it builds and stores the **answer** —
-the value, and the integer a typedef turned out to be — rather than the C that produced it, so a
-consumer of a `.syslib` needs neither a clang nor the library's headers. There is nothing left to
-require.
+A library is always handed over as source, so there is no third road on which its C would arrive
+already compiled and its headers could be skipped.
 
 **The header requirements, the allocator and the `dependencies` are read from a `--lib` root.** That
 flag names a *source root*, which need not be a package at all, and one that is not has nothing to
@@ -895,6 +910,15 @@ a directory instead, for a package being developed alongside its consumer:
 ```hocon
 dependencies {
   helper { path = "../helper" }
+}
+```
+
+A third kind names **a member of the workspace the project is in**, by its `package.name`, and is
+resolved to that member's directory ([workspaces](#workspaces)):
+
+```hocon
+dependencies {
+  kairos { workspace = true }
 }
 ```
 
@@ -1158,8 +1182,9 @@ graph that somehow did not settle is refused rather than built against whichever
 
 ### Choosing them on the command line
 
-Three flags, and [`run`, `build`, `build-c`, `test`, `deps` and
-`vendor`](/getting-started/cli/#the-feature-flags) take them:
+Three flags, and [`run`, `build`, `build-c`, `test` and
+`deps`](/getting-started/cli/#the-feature-flags) take them — `vendor` too, once it is in this
+compiler:
 
 | | |
 |---|---|
@@ -1450,6 +1475,10 @@ nothing to record about which versions were chosen. The first time a package is 
 and recorded; reviewing the line that appears is the part a person does. A `path` dependency gets no
 entry, because a directory beside you is expected to change.
 
+**A workspace has one `sysl.sum`, at its root**, covering every member: a member's build reads and
+writes that file, and a [workspace member](#workspaces) depended on by name gets no line, being a
+directory of the same checkout.
+
 **A build only ever adds a line.** Move a dependency from 0.1.0 to 0.3.0 and the 0.1.0 line stays,
 alongside every version any earlier build resolved. A build does not prune, because it resolves only
 the part of the graph its `--features` turn on: it would drop the lines of every feature it was not
@@ -1500,6 +1529,10 @@ manifest is rewritten one run of bytes at a time, which is why your comments and
 and the result is read back before it is written — a rewrite that produced something unreadable
 leaves the file exactly as it was. Nothing is fetched; the next build does that.
 
+*`sysl vendor` is not yet in this compiler — it answers "`vendor` is not a command this compiler can
+carry out yet". A `vendor/` directory already there is read as described below; what follows is the
+command that will write one.*
+
 `sysl vendor` puts everything the project resolves to into a `vendor/` directory beside the manifest:
 
 ```text
@@ -1515,6 +1548,194 @@ is not, so nothing in it is compiled as one of your modules.
 Commit it where you want a build that an upstream disappearing cannot break; leave it out where you
 would rather fetch. A `path` dependency is not vendored and cannot be — it is a directory you are
 editing beside this one, which is why nothing keeps a sum for it either.
+
+## Workspaces
+
+**A workspace is several projects in one repository, resolved as one.** The root manifest lists
+the members, and the list is the whole declaration:
+
+```hocon
+workspace = ["compiler", "tools/*", "examples/board-probe"]
+```
+
+Each entry is a directory relative to the file, and **each member is an ordinary project** with a
+`package.hocon` of its own — built, tested and depended on exactly as it would be on its own. `*`
+stands for one directory level and matches inside a name (`tools/*`, `tools/sysl-*`); a glob takes
+the directories it reaches that hold a manifest and passes over the rest, so `tools/*` beside a
+directory of images is the ordinary case. Nothing fancier is read: no `**`, no `..`, no absolute
+path.
+
+What the workspace adds is three things, and nothing else:
+
+- **one version selection over every member's dependencies**, so no two members can be built against
+  two versions of one package;
+- **one `sysl.sum` and one `vendor/`, at the workspace root**;
+- **members depending on each other by name**, with no fetch, no version and no `sysl.sum` line.
+
+### The root may be a package too
+
+A root manifest with a `package` block is a member itself — the first one — which is the shape of a
+package that keeps a probe program or a starter beside it:
+
+```hocon
+package {
+  name    = "kairos"
+  version = "0.1.0"
+}
+
+workspace = ["examples/board-probe"]
+```
+
+A root with **no** `package` block compiles nothing of its own: it is a list and the files beside
+it. It therefore takes no dependencies, since a dependency there would reach no code while a reader
+believed every member had it:
+
+```text
+package.hocon: 'dependencies' in a workspace with no 'package' block reaches nothing — the root compiles nothing of its own, so name each dependency in the member that imports it
+```
+
+The list is a list and nothing else. A string, a block or a list of anything but directory names is
+refused:
+
+```text
+package.hocon: 'workspace' is not a list of directories — a workspace is written 'workspace = ["compiler", "tools/*"]', each entry a member's directory relative to this file
+```
+
+### A directory holding its own manifest is another project
+
+**A tree stops at any directory below its root that holds a `package.hocon`** — the rule Cargo keeps
+for a nested `Cargo.toml`. It holds whether or not anything declares a workspace, because a nested
+project is a different program either way:
+
+```
+kairos/package.hocon
+kairos/sh/sysl/kairos/kairos.sysl            the package
+kairos/probe/package.hocon                   another project: not part of the package's tree
+kairos/probe/main.sysl
+```
+
+That one rule is what lets a repository hold more than one project, and it is also why a workspace
+needs no second rule for its members: every member has a manifest, so the root's walk never swallows
+one. The C walk stops at the same place. A member's own `examples/` and `vendor/` are left out of
+its tree exactly as a root's are.
+
+A project below a workspace root that the list does **not** name belongs to no workspace and builds
+as it would anywhere else.
+
+### Depending on another member
+
+A member names another by its `package.name`, with `workspace = true`:
+
+```hocon
+dependencies {
+  kairos { workspace = true }
+}
+```
+
+That is resolved to the member's directory — nothing fetched, no version, no `sysl.sum` line — and
+the member's own dependencies join the graph as a fetched package's would. `mount`, `optional` and
+`features` mean what they mean on any other entry. A coordinate, a path or a version beside
+`workspace = true` is refused, the workspace having already said where the member is:
+
+```text
+'dependencies.kairos' names 'workspace = true' and a 'git', 'path' or 'version' as well — a workspace member is the directory the workspace lists, at no version, so it is named by the workspace alone
+```
+
+**A member's modules are named by its `package.name`**, as a path dependency's are named by its
+label: `kairos`'s `sh.sysl.kairos` is `kairos.sh.sysl.kairos` in every member that depends on it.
+Two members may not share a name, so two members' modules never collide, and a member never meets
+a fetched package of its name, whose modules carry the coordinate instead.
+
+A member that is also published may say where, with `package.repository`, and is then named exactly
+as a consumer fetching it names it ([what a dependency's modules are
+called](#what-a-dependency-s-modules-are-called)): with `repository = "github.com/sysl-lang/kairos"`
+its module is `github.com.sysl-lang.kairos.sh.sysl.kairos`, so moving it into or out of the workspace
+renames none of its symbols. Nothing requires it; a workspace builds the same either way.
+
+`package.repository` is written as a consumer writes `git`; a URL there is refused:
+
+```text
+workspace member 'geom' gives 'package.repository' as 'https://github.com/e/geom', which is not a coordinate — it is written as a consumer writes 'git', 'github.com/you/thing', since it is what the member's modules are named by
+```
+
+### One resolution
+
+**Minimal Version Selection runs once, over every member's `dependencies` and `dev_dependencies`
+together**, with every optional dependency read — the answer has to hold for any build of any member
+with any features. Each member's own build then takes the versions the workspace settled on, so a
+member asking for `buf` 1.2.0 beside one asking for 1.4.0 is built against 1.4.0 — and `sysl deps`
+of the first lists the second member's claim beside its own, since that is the line explaining a
+version it never asked for.
+
+A member's build still compiles **only what it reaches**: the workspace's selection sets floors, it
+does not hand a member another member's packages, so a library one member links is never on
+another's link line.
+
+**`sysl.sum` and `vendor/` live at the workspace root**, read and written from whichever member is
+being built. `sysl tidy`, run anywhere in the workspace, rewrites that one file to what the whole
+workspace resolves to.
+
+### Commands
+
+| command | at the workspace root | inside a member | `-p <member>` |
+|---|---|---|---|
+| `sysl build` | every member, root package first; `-o` refused beside more than one | that member | that member |
+| `sysl test` | every member, each suite under `testing <name> (<dir>)`, then one `workspace:` line | that member | that member |
+| `sysl run` | the root package; refused for a root with no `package` | that member | that member |
+| `sysl deps` | every member's graph, one after another | that member | — |
+| `sysl tidy` | the workspace's `sysl.sum` | the workspace's `sysl.sum` | — |
+| `sysl add` | the root package; refused for a root with no `package` | that member's manifest | — |
+| `emit-llvm`, `emit-typed`, `build-c`, `build-lib`, `emit-header` | the root package; refused for a root with no `package` | that member | — |
+
+`-p` is also spelled `--package`, and without a path it means the workspace the working directory is
+in. A member's build always resolves with the workspace — its versions, its `sysl.sum` — whichever
+way it was reached.
+
+```text
+sysl test .
+sysl test . -p kairos
+sysl build -p board-probe
+```
+
+A failing member's suite fails the run and the others still run, unless `--fail-fast` was given:
+
+```text
+workspace: 3 members tested, 1 failed: probe
+```
+
+### What is refused
+
+Every one of these is refused by any command that builds any part of the workspace, a member's
+included — a list naming a directory that is not there is wrong whichever member is being built.
+
+```text
+workspace member 'nope' does not exist — '/…/repo/nope' is not a directory
+workspace member 'bare' has no package.hocon — a member is a project, and a project is a directory holding one
+'workspace' names '../x', which is not a directory below the workspace — a member is written relative to the file declaring the workspace, inside it, with '*' standing for one directory level
+workspace member 'a/inner' is inside member 'a' — each member's tree is its own, so one member cannot hold another
+workspace members 'a' and 'b' are both named 'twin' — a member is picked and depended on by its 'package.name', so each needs its own
+workspace member 'anon' has no 'package.name' — a member is picked with '-p' and depended on by that name
+workspace member 'a' declares a workspace of its own — workspaces do not nest, so its members belong in the root's list
+'app' names 'ghost' as a workspace dependency, and no member of the workspace is called 'ghost' — the members are 'app', 'geom'
+'geom' is a workspace dependency, and '/…/app' is in no workspace — 'workspace = true' names a member of the workspace this project is listed in
+```
+
+**Members depending on each other in a cycle** are refused, `dev_dependencies` counting, since a test
+build compiles them in exactly as it does `dependencies`:
+
+```text
+workspace members depend on each other in a cycle: a -> b -> a — a member is compiled into the one that depends on it, so one of these edges has to go
+```
+
+From the command line:
+
+```text
+sysl: error: the workspace at '/…/repo' has no member called 'nope' — its members are 'a', 'b'
+sysl: error: '-p a' picks a member of a workspace, and '/…/app' is in none
+sysl: error: '-o' names one file, and this workspace builds 2 members — pick one with '-p <member>'
+sysl: error: '/…/repo' is a workspace with no 'package' block, so it is no project of its own — point at a member's directory, or pick one with '-p <member>'
+sysl: error: '/…/repo' is a workspace with no 'package' block, so it takes no dependencies — add it to the member that imports it, 'sysl add <coordinate> <member directory>'
+```
 
 ## No build scripts, ever
 

@@ -144,7 +144,7 @@ A type's name is a type and not a value, so nothing is *read* from it. What it a
 `Color::First` cannot be confused with a variant, an associated function, or a member an `impl`
 added, and no `impl` can shadow one by declaring a member of that name.
 
-Three kinds of type answer them, and each set is **fixed and closed**.
+Four kinds of type answer them, and each set is **fixed and closed**.
 
 ### A simple enum
 
@@ -378,6 +378,20 @@ print(1)
 That is the same deferral `sizeof(T)` takes, and it is what keeps a bound from being something a
 generic has to declare in order to measure.
 
+### A fixed-point type
+
+A [fixed-point type](/reference/fixed-point/#attributes-and-the-bits) answers `Min`, `Max`, `Small`
+— one unit, 2^-F — and `Bits(n)`, which makes a value from the integer it is stored as, and nothing
+else:
+
+```sysl
+print(q31::Min, q31::Max, q15::Bits(16384))
+```
+
+```output
+-1 0.9999999995 0.5
+```
+
 ### What has no attributes
 
 **A data enum**, because its value is a variant plus a payload, so a position, a name and a
@@ -528,8 +542,10 @@ ends the process, and none of them had to know it was running under a test.
 
 `should_trap` inverts the reading, for a test whose subject *is* the check. With a string it
 additionally requires that the run printed it, which is what tells a trap from the **right** trap. A
-silent trap satisfies `should_trap` and can satisfy no string, because a compiler-inserted check
-raises a signal and says nothing — see [what stopping looks like](/reference/errors/).
+bounds check says what failed before it traps — `@test(should_trap: "out of bounds for length 3")`
+asks for exactly that — while every other compiler-inserted check raises a signal and says nothing,
+so it satisfies `should_trap` and can satisfy no string — see
+[what stopping looks like](/reference/errors/#what-stopping-looks-like).
 
 ### A test may be written and not run
 
@@ -572,6 +588,59 @@ keeps_both_arms()
 
 Ignoring is something a *test* is, so there is no `@ignore` of its own; written above a function it
 is answered with the spelling above.
+
+### A test may find out that it cannot run
+
+`ignore` is decided before the test starts. Some tests can only find out once they are running: a
+test that drives a tool which is not installed, or talks to a device that is not plugged in. Such a
+test calls **`skip`**, from `sysl.testing`, and the runner reports it as `skip` with the reason it
+gave:
+
+```sysl
+import sysl.env.get
+import sysl.testing.skip
+
+needs_tool(name: string)
+    if get(name).is_none() then skip(s"${name} is not set, so there is nothing to talk to")
+
+@test
+talks_to_the_board()
+    needs_tool("BOARD_PORT")
+    assert(false, "not reached on a machine without a board")
+```
+
+```
+running 1 test
+
+board.sysl
+  skip  talks_to_the_board  skipped: BOARD_PORT is not set, so there is nothing to talk to
+
+0 passed, 0 failed, 1 ignored — 2ms
+```
+
+**A test that printed a note and returned would have been reported `ok`**: a pass that checked
+nothing. `skip` makes the run say so on the line a reader looks at last.
+
+- **`skip` is imported, not ambient.** It lives in `sysl.testing` rather than the root module, so a
+  test file that also imports `sysl.harness.*` — which has a `skip` of its own, for the on-target
+  runner — is not told the two collide.
+- **`skip` ends the test at once.** It returns `never`, so nothing after it runs, and a helper the
+  test calls may make the call on the test's behalf, as `needs_tool` does above.
+- **It is not a pass and not a failure.** The summary counts it with the ignored tests, it does not
+  change the exit status, and `--fail-fast` does not stop at it. The row's word says which kind it
+  was: `ignored` is the annotation's, `skipped` is the test's own.
+- **A failure before it is still a failure.** An `assert` that failed earlier ended the process
+  before `skip` was reached, so the run is reported as that failure.
+- **The test's `@teardown` still runs**, in a process of its own, as it does after a test that
+  trapped. A teardown that fails turns the row into that failure. A `@setup` that calls `skip` skips
+  the test it was setting up.
+- A `should_trap` test that skips is reported as skipped, since it never reached the thing it was
+  meant to trap on.
+
+**How it works**: `skip` prints one control byte, the reason up to the end of its line, and then
+ends the process with status 0. The runner looks for that byte in what the run printed. Because the
+exit is clean, a `sysl test` older than `skip` reads the test as one that returned and reports `ok`,
+which is what such a test was before `skip` existed, rather than reporting a failure.
 
 ### A test has one caller, and the program is not it
 
@@ -759,6 +828,10 @@ parser.sysl
 
 1 passed, 0 failed, 1 ignored — 1ms
 ```
+
+A test that [skipped itself](#a-test-may-find-out-that-it-cannot-run) gets the same `skip` row,
+reading `skipped:` where an ignored test's reads `ignored:`, and the summary counts it in the same
+figure.
 
 Where nothing was ignored the summary is `N passed, M failed` exactly as it always was. A filter
 selects an ignored test like any other and reports it as ignored, and an ignored test fails nothing:

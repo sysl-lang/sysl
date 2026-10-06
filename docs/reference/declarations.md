@@ -1059,6 +1059,264 @@ what tells overloads of an `extern` apart is the symbol, and a sysl function dec
 A bracketed list directly after the name declares type parameters, with optional bounds. See
 [generics and traits](/reference/generics/).
 
+### A `const` function runs while compiling
+
+`const` in front of a function's name marks one the compiler may run while it compiles, so that a
+call to it can stand where a [constant](/reference/modules/) is required. Called anywhere else it is
+an ordinary function, and an ordinary call:
+
+```sysl
+const sq(x: int) -> int = x * x
+
+var n = 6
+n += 1
+print(sq(n))
+```
+
+```output
+49
+```
+
+The word is the one sysl already uses for "settled while compiling" — a `const` declaration,
+`for const`, a `[const N: usize]` parameter — and a `const` function is a constant with parameters.
+`const`, then a name, then `(` or `[` is a function; `const`, a name and `:` is a constant. It sits
+after a visibility and after the annotations, and it marks a member of a type, of an enum and of an
+`impl` block the same way, an associated function included:
+
+```sysl
+struct Money
+    cents: int
+
+    const zero() -> Money = Money(0)
+    const doubled(self) -> int = self.cents * 2
+
+trait Weigh
+    weight(self) -> int
+
+impl Weigh for Money
+    const weight(self) -> int = self.cents
+
+private const heavy(m: Money) -> int = m.weight() + m.doubled()
+
+print(Money.zero().cents, heavy(Money(5)))
+```
+
+```output
+0 15
+```
+
+**A trait's member is not marked.** Whether a call can run while compiling is a fact about the body
+that answers it, and a trait's member is a signature every implementing type answers with a body of
+its own:
+
+```sysl
+trait Shape
+    const area(self) -> int
+```
+
+```error
+a trait's member is not marked 'const' — whether a call can run while compiling is a fact about the body that answers it, so each 'impl' marks the member it supplies
+```
+
+**What its body may hold.** Every integer width, `f32` and `real`, `bool`, `char` and `unit`, and
+structs, tuples, fixed arrays and enums made of them — payload-carrying ones included — all by value;
+constrained and `new` types; locals, assignment into a local's fields and elements; `if`, `match`,
+`loop`, `while`, `do … while`, the C `for`, `for i in a..<b` and `for x in` a fixed array; `break`,
+`continue`, an early `return`, recursion; `?`; `require`, `ensure`, a struct's `invariant` and a loop's
+`invariant` and `variant`. It may call another `const` function, read a `const` and a `val` laid into
+the object file, and reach the LLVM operations whose result is exactly specified (`llvm.sqrt`,
+`floor`, `ceil`, `trunc`, `round`, `roundeven`, `fabs`, `copysign`, `fma`, `ctpop`, `ctlz`, `cttz`,
+`bswap`, `bitreverse`, `fshl`, `fshr`, and the `.sat` integer operations):
+
+```sysl
+extern "llvm.sqrt" root(x: f64) -> f64
+
+static val base: int = 3
+
+enum Shape
+    Dot
+    Square(side: int)
+
+const area(s: Shape) -> int = s match
+    Dot -> 0
+    Square(n) -> n * n
+
+const fact(n: int) -> int
+    require n >= 0
+    if n <= 1 then return 1
+    n * fact(n - 1)
+
+const plus(n: int) -> int = fact(n) + base
+
+const hyp(a: f64, b: f64) -> f64 = root(a * a + b * b)
+
+print(area(Square(3)), plus(3), int(hyp(3.0, 4.0)))
+```
+
+```output
+9 9 5
+```
+
+What the compiler *evaluates* while compiling is narrower today than what a body may hold — scalars,
+not yet aggregates; [modules § const](/reference/modules/) says where the line is.
+
+**A `*self` method, and a `*T` parameter, are admitted** — sysl mutates through `*self` everywhere,
+and such a pointer can only point at a local of the evaluation that made the call:
+
+```sysl
+struct Counter
+    n: int
+
+    const bump(*self)
+        self.n += 1
+
+const counted(k: int) -> int
+    var c = Counter(0)
+
+    while c.n < k
+        c.bump()
+
+    c.n
+
+print(counted(4))
+```
+
+```output
+4
+```
+
+**What it may not hold** is everything that exists only once the program runs, and the few kinds of
+value the compiler does not evaluate yet. Each is refused where it was written:
+
+| construct | refusal |
+|---|---|
+| a call to a function that is not `const` | `'f' is 'const', so it runs while compiling, and it calls 'noisy', which is not — mark 'noisy' 'const' too, or compute this at run time` |
+| a call into the standard library | `… it calls 'sysl.math.max', which is not — the standard library marks nothing 'const' yet, so compute this at run time` |
+| `print` | `… it prints, which is outside the program — nothing outside the program exists while compiling` |
+| the C library's mathematics (`sin`, `exp`, `pow`, `cbrt`…) | `… it calls 'c_sin', which is the C library's 'sin' — its last bit differs between C libraries, and the board's would not agree with this compiler's` |
+| any other `extern` | `… it calls 'abs', which is outside the program — nothing outside the program exists while compiling` |
+| an `asm` block | `… it holds an 'asm' block, which is outside the program — nothing outside the program exists while compiling` |
+| a box, a buffer, a string built | `… it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap` (and `builds a buffer`, `builds a string`) |
+| a pointer converted, `null`, a C string | `… it converts a pointer — an address exists only when the program runs` (and `names 'null'`, `takes the address of a C string`) |
+| a pointer answered | `… its result is a '*int' — an address exists only when the program runs, and a pointer answered would outlive every local it could point at` |
+| a closure called, a function pointer, a trait object | `… it calls through a closure — which function that is is decided when the program runs` |
+| module storage filled at run time — a `var`, a `val` computed at startup | `… it reaches 'counter' — 'counter' is filled when the program runs` |
+| atomics, fences, C variadic arguments, vectors | `… it uses a vector — vectors are not evaluated while compiling yet` |
+| `string` and `[]T` | `… its parameter 's' is a 'string' — strings and slices are not evaluated while compiling yet` |
+| `f16`, `bf16` | `… its parameter 'x' is a 'f16' — 'f16' and 'bf16' are not evaluated while compiling yet` |
+
+One worked refusal for each of the commonest:
+
+```sysl
+noisy(x: int) -> int = x + 1
+
+const f(x: int) -> int = noisy(x)
+
+print(f(1))
+```
+
+```error
+'f' is 'const', so it runs while compiling, and it calls 'noisy', which is not — mark 'noisy' 'const' too, or compute this at run time
+```
+
+```sysl
+const f(x: int) -> int
+    print(x)
+    x
+
+print(f(1))
+```
+
+```error
+'f' is 'const', so it runs while compiling, and it prints, which is outside the program — nothing outside the program exists while compiling
+```
+
+```sysl
+extern "sin" c_sin(x: f64) -> f64
+
+const f(x: f64) -> f64 = c_sin(x)
+
+print(f(1.0))
+```
+
+```error
+'f' is 'const', so it runs while compiling, and it calls 'c_sin', which is the C library's 'sin' — its last bit differs between C libraries, and the board's would not agree with this compiler's
+```
+
+```sysl
+struct Cell
+    v: int
+
+const f() -> int
+    val b: &Cell = Cell(1)
+    b.v
+
+print(f())
+```
+
+```error
+'f' is 'const', so it runs while compiling, and it boxes a value, which allocates — a heap made while compiling has nowhere to go: the object file holds values, not a heap
+```
+
+```sysl
+const f(p: *int) -> *int = p
+
+var x = 1
+val q = f(&x)
+print(q == &x)
+```
+
+```error
+'f' is 'const', so it runs while compiling, and its result is a '*int' — an address exists only when the program runs, and a pointer answered would outlive every local it could point at
+```
+
+```sysl
+static var counter: int = 0
+
+const f() -> int = counter
+
+print(f())
+```
+
+```error
+'f' is 'const', so it runs while compiling, and it reaches 'counter' — 'counter' is filled when the program runs
+```
+
+```sysl
+const f(s: string) -> int = 1
+
+print(f("a"))
+```
+
+```error
+'f' is 'const', so it runs while compiling, and its parameter 's' is a 'string' — strings and slices are not evaluated while compiling yet
+```
+
+**A generic `const` function is checked at its definition** for everything that does not go through a
+type parameter; a call through a bound is answered by whichever type fills the parameter:
+
+```sysl
+const twice[T: Add](x: T) -> T = x + x
+
+print(twice(21), twice(u8(2)))
+```
+
+```output
+42 4
+```
+
+```sysl
+noisy() -> int = 1
+
+const g[T](x: T) -> int = noisy()
+
+print(g(5))
+```
+
+```error
+'g' is 'const', so it runs while compiling, and it calls 'noisy', which is not — mark 'noisy' 'const' too, or compute this at run time
+```
+
 ## Structs
 
 A named product type. Fields are declared one per line; methods, properties and an `invariant` may

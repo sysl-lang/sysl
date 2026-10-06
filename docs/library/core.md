@@ -32,7 +32,7 @@ print(maybe.unwrap_or(0), "— and not one import above this line")
 | area | names | where it is written up |
 |---|---|---|
 | absence and failure | `Option`, `Result`, `Fallible` | [errors and contracts](/reference/errors/) |
-| stopping | `panic`, `assert`, `exit` | below, and [attributes](/reference/attributes/) for `@test` |
+| stopping | `panic`, `assert`, `exit` | below, and [attributes](/reference/attributes/) for `@test` — whose `skip(why)` is imported from `sysl.testing` |
 | rendering to standard output | `print`-family: `prints`, `printi`, `printu`, `printr`, `printb`, `printc`, `putbytes`, `encode_utf8`; the sink itself, `Stdout` and `stdout` | below |
 | rendering to standard error | `eprints`, `eputbytes`; the sink itself, `Stderr` and `stderr` | below |
 | rendering to a sink | `Display`, `FormatSpec`, `Writer`, `Counting`, the `display_*` family | below |

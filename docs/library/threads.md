@@ -594,22 +594,72 @@ system took the offer.
 
 `current()` is what a body compares against to learn that it is not the thread that spawned it.
 
-## There is no `async`
+## Threads and tasks
 
-No `async`, no `await`, and no task runtime — in the language or in this module. Threads are what
-sysl offers for doing two things at once, and this page is all of it.
+Threads are one of two ways sysl does two things at once. The other is the
+[task](/reference/async/): an `async` function's call hands back a `Task[T]` without running it,
+`await` runs one to its result inside another, and something outside the tasks — `block_on`, or an
+executor written against `step` and `park` — decides which one runs next. Nothing on this page
+changes because tasks exist: a thread is still a thread, and every rule above still holds.
 
-**It is deferred rather than refused**, and the difference is worth knowing if you are deciding
-whether to build on threads something you would rather have written as tasks. The shape it would take
-here is settled: futures compiled to state machines, sized at compile time, with no allocation
-inherent in a future and the executor an ordinary library. What stands between that and being built
-is a schedule. Nothing on this page changes when it arrives — a thread will still be a thread.
+**The two compose rather than compete.** A task is a value, so it can be handed to a thread like any
+other — `spawn`'s `@crossing(arg)` asks of the task's frame what it asks of everything else at that
+address, and the thread runs it with an executor of its own:
 
-What you get in the meantime is worth having, and both halves of it are things an `await` costs a
-language that has one. sysl has no **actor reentrancy** hazard — the trap where an actor's state
-changes across an `await` — because there is no await-based interleaving. And blocking is honest: a
-thread that waits is a thread that waits, with no cooperative-scheduling model to reason about on top
-of it, and no way for one stalled task to stall nine others you never looked at.
+```sysl
+import sysl.posix.threads.spawn
+
+struct Job
+    t: Task[int]
+    out: int
+
+run(j: *Job)
+    j.out = block_on(j.t)
+
+async checksum(n: int) -> int
+    var total = 0
+
+    for i in 0..<n
+        await yield_now()
+        total += i
+
+    total
+end checksum
+
+var job = Job(checksum(1000), 0)
+val worker = spawn(&run, &job).unwrap()
+val mine = block_on(checksum(2000))
+
+worker.join()
+print(job.out, mine)
+```
+
+```output
+499500 1999000
+```
+
+A task whose frame holds a `string`, an ordinary `&T` across an `await`, a value a statement computed
+before its `await`, or a `park` is refused at that `spawn`, exactly where the same things would be
+refused inside a plain struct — the rule is
+[on the reference page](/reference/async/#a-task-crossing-a-concurrency-domain).
+
+**Note the import.** This module's `yield_now` is the *thread's* — a hint to the system that answers
+a `bool` — and the task's `yield_now` is a form the compiler supplies, so the module's declaration is
+the nearer name wherever the module is imported whole; awaiting it is refused, the refusal naming
+`sysl.posix.threads.yield_now` as what shadowed the task form. A file that runs tasks imports what it
+uses from here by name, as the program above imports `spawn`.
+
+**What a task changes is where interleaving can happen.** Two tasks driven by one executor run on one
+thread and never at the same instant, so they cannot race on a plain `var` — but each `await` is a
+point where the task stops and others run, so state read before an `await` may have changed after
+it. A thread has the opposite pair of properties: no stopping point is written down, and anything it
+shares is shared at every instruction. Blocking stays honest on both sides — a thread that waits is a
+thread that waits, and a task that waits says so with `await` at the place it does.
+
+**There is no task runtime in this module or anywhere in the standard library.** The compiler
+supplies `block_on` and the executor contract; an event loop that drives many tasks is a package —
+[`kairos`](https://github.com/sysl-lang/kairos) for a microcontroller, with its async face planned,
+and one over [`libuv`](https://github.com/sysl-lang/libuv) planned for a host.
 
 ## How strong this is
 

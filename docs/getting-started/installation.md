@@ -29,7 +29,8 @@ tap once covers both, and covers every upgrade after it.
 
 That is a native binary — there is no JVM under it and nothing to start up. It brings **LLVM** with
 it, which sysl needs at runtime: the compiler emits textual LLVM IR and hands it to `clang` to
-assemble and link, and `llvm-ar` is what builds a library into a `.syslib`.
+assemble and link, and `llvm-ar` is what archives the standard module's compiled half into the
+compiler's cache.
 
 It also brings **pkgconf**. A package that binds an installed C library can name it — `requires {
 pkg_config { sdl3 = "…" } }` — and sysl asks `pkg-config` where that library's headers and link line
@@ -43,14 +44,9 @@ sysl --version
 sysl --help
 ```
 
-**macOS on Apple silicon, and Linux on x86_64 and arm64.** The tap picks the right one for the
-machine it is run on. Anything else builds from source, below.
-
-The Linux binaries need **glibc 2.34 or newer** — Ubuntu 22.04, Debian 12, RHEL 9, and anything
-later. That is a property of the machine they were built on rather than of sysl, and it is the one
-way an install can fail that the formula cannot check for you: `version GLIBC_2.34 not found` from
-the dynamic loader is this, and not a corrupted download. On an older distribution, build from
-source.
+**The alpha formula is macOS on Apple silicon only.** The `0.1.0` alphas are cut by the compiler
+itself on a Mac and ship one binary, `darwin-arm64`; Linux binaries return when a Linux build is part
+of the release. Anything else builds from source, below.
 
 ## Your first compile
 
@@ -72,58 +68,57 @@ sysl build hello.sysl -o hello
 
 ## Build from source
 
-The compiler is a Scala 3 cross-project, so the path in is a clone and an sbt build. You want this if
-you are working *on* sysl, or if you are on a platform the tap has no binary for.
+**The compiler is written in sysl and builds itself**, so the path in is a clone and a `sysl build`
+by a compiler you already have. You want this if you are working *on* sysl, or if you are on a
+platform the tap has no binary for.
 
 | | why |
 |---|---|
-| **JDK 17+** | the compiler is written in Scala and runs on the JVM |
-| **sbt 1.12+** | builds it |
+| **an installed `sysl`** | the compiler is a sysl program, so building it takes a sysl — the seed |
 | **clang** | sysl emits textual LLVM IR; clang assembles and links it |
-| **llvm-ar** | only for building a library — a `.syslib` is an `ar` archive of objects |
+| **llvm-ar** | the standard module's compiled half is an `ar` archive of objects |
 | **pkg-config** | only for a package that names an installed C library; without it, say where the library is with `--include-path` and `--link-path` |
 
 `clang` is the only one most systems already have — `pkg-config` is common on Linux and absent from a
 stock macOS. On macOS the Xcode command-line tools supply
 one; on Debian and Ubuntu it is the `clang` package.
 
-`llvm-ar` matters only when you build a library of your own, and it has to be the LLVM one: a
-`.syslib` holds objects for the machine it was built *for*, and a platform archiver indexes only
-its own format and silently drops the rest. On a Mac, Homebrew keeps its LLVM deliberately off the
-`PATH`, so sysl looks in `/opt/homebrew/opt/llvm/bin` as well. `--ar` names one anywhere else.
+`llvm-ar` has to be the LLVM one: the standard module's archive holds objects for the machine it was
+built *for*, and a platform archiver indexes only its own format and silently drops the rest. On a Mac, Homebrew keeps its LLVM deliberately off the
+`PATH`, so sysl looks in `/opt/homebrew/opt/llvm/bin` as well.
+
+The repository holds two things side by side: **`compiler/`**, the compiler's own project, and
+**`library/`**, the standard library it ships. Every build of the compiler runs from `compiler/` —
+the repository root is not a project, and a build there reads the library's files as though they were
+the program's.
+
+The build is the one a release makes, in two stages. The seed builds the tree against **its own**
+library, since `library/` may use forms the seed's library has not got; what that produces then
+builds the tree again against `library/`, and **the second is the compiler**:
 
 ```bash
-git clone https://github.com/sysl-lang/sysl-bootstrap.git
-cd sysl-bootstrap
-sbt syslJVM/compile
+git clone https://github.com/sysl-lang/sysl.git
+cd sysl/compiler
+sysl build . -o stage1
+SYSL_LIB=$(cd ../library; pwd) ./stage1 build . -o sysl
 ```
 
-The JVM target is the one to develop against. JS and Native cross-targets exist in the build, and the
-Native one is what the released binary is built from:
-
-```bash
-SYSL_RELEASE=1 sbt syslNative/nativeLink
-```
-
-Without `SYSL_RELEASE` that links in debug mode, which is much faster and is what you want while
-working on the compiler.
+Each stage takes several minutes. Debug or release is
+the optimization level and nothing else: the compiler's default is `-O1`, and a release passes the
+same `-O` to both stages.
 
 ### Check it
 
 ```bash
-sbt "syslJVM/run run guide/ring"
+./sysl --version
+./sysl run hello.sysl
 ```
 
-That compiles one of the guide programs all the way to a native binary and runs it. Each guide
-program checks itself, so what you should see is a run of `-- section` headers and `ok` lines and
-nothing saying `FAIL` — at which point everything is in place.
-
-Any of the directories in `guide/` works the same way. Where a program declares
-`main(args: []string)`, anything after a `--` goes to it rather than to sysl:
-
-```bash
-sbt "syslJVM/run run <program> -- one two"
-```
+A compiler built from a checkout answers `sysl 0.0.1` — it is a development build, not a release, and
+it [checks no version floor](/reference/packages/#the-oldest-compiler-a-package-builds-with). Run from
+`compiler/` it finds the standard library as `../library` with nothing set; anywhere else, set
+`SYSL_LIB` to the checkout's `library/`. An install is the same two things laid out as a prefix —
+`bin/sysl` and `share/sysl/library` beside it — which is where the compiler looks first.
 
 ## The standard library
 
@@ -150,7 +145,7 @@ wherever `XDG_CACHE_HOME` points — under a fingerprint of the library it was b
 built once per machine rather than once per project, nothing is written into your source tree, and
 installing a compiler with a different library gets its own entry instead of a stale hit.
 
-**The entry also names the compiler that built it — its version and a digest of its own sources — so
+**The entry also names the compiler that built it — its version and a digest of its own executable — so
 a different build of the same version never reads back another build's archive.** The same key
 names the binaries `sysl run` and `sysl test` keep, so neither replays what an earlier compiler made
 for an unchanged program. A compiler before 0.0.151 keyed both on the version alone.
@@ -172,11 +167,9 @@ path, since the ordinary way of training is to merge a new profile over the old 
 Nothing there is ever evicted, and everything in it is derived: deleting the directory costs one
 rebuild.
 
-Two flags matter when you want something other than that. `--std-lib <path>` names an artifact
-explicitly, and an artifact you named is never rebuilt behind your back — if it will not read, the
-compilation stops and says so. `--no-std-lib` compiles the standard module from its source instead
-of linking a prebuilt one, with no toolchain involved at all, which is the path the compiler's own
-test suite takes.
+**Nothing names the cached artifact.** To compile against another standard module, set `SYSL_LIB`
+to the root its source is in; `--std-lib` is refused, saying exactly that. `--no-std-lib` compiles
+the standard module from its source together with the program instead of linking the cached one.
 
 ## Optimization
 
@@ -199,14 +192,12 @@ still wins where it is given, so a project built at `2` is profiled at `0` by ty
 Install clang and try again. Installing from the tap brings LLVM with it, so this is a
 built-from-source problem.
 
-**`llvm-ar` complaints when building a library** — you have the platform archiver, not LLVM's.
-Point at LLVM's with `--ar /path/to/llvm-ar`.
+**`cannot find llvm-ar`** — the platform's own `ar` is not a substitute, so sysl looks for LLVM's:
+`llvm-ar` on the `PATH`, then `/opt/homebrew/opt/llvm/bin` and `/usr/local/opt/llvm/bin`. Install
+LLVM, or put its `bin` on the `PATH`.
 
 **`cannot find the standard module's source`** — the compiler could not find the library it ships
 with, and the message lists every path it tried. From a package install that means the install is
 incomplete: reinstall it. From a checkout it usually means the working directory is not in the tree.
 Either way `SYSL_LIB=/path/to/library` names the library root outright, where the root is the
 directory holding `sysl` — that is, the `library` above `library/sysl`, not `library/sysl` itself.
-
-**sbt is slow on the first run** — it is downloading Scala and the dependency tree. This happens
-once.

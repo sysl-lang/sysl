@@ -255,6 +255,11 @@ call other pure functions; recurse; use every control-flow form; **allocate**; a
 `*T`, into a `&T`'s field, or into any storage it did not create; perform I/O; contain an `asm` block;
 call through a closure, or dispatch through a trait object.
 
+**A [`const` function](/reference/declarations/#a-const-function-runs-while-compiling) is pure as
+well**, being held to more than this — it may not allocate either, nor read storage filled while the
+program runs — so a pure function may call one, and `@pure` written on a `const` function says one
+thing twice and is accepted as such.
+
 A write is examined through its *path*, not its root — so storage the call made is the call's,
 however deep the indexing goes:
 
@@ -578,14 +583,44 @@ a miscompile rather than a missing check.
 
 `sysl prove <file>` translates a module to [WhyML](https://www.why3.org/), the input language of the
 Why3 platform, and discharges the resulting goals with whichever provers Why3 is configured with.
+Euclid's algorithm, with what it needs said about its arguments:
+
+```sysl
+gcd(a: int, b: int) -> int
+    require a >= 0
+    require b >= 0
+    ensure result >= 0
+    variant b
+    if b == 0 then a
+    else gcd(b, a % b)
+
+print(gcd(48, 18))
+```
+
+```output
+6
+```
 
 ```bash
 $ sysl prove gcd.sysl
+File /tmp/sysl-3Sktnh/sysl.mlw:
+Goal rem_i32'vc.
+Prover result is: Valid (0.01s, 0 steps).
+
+File /tmp/sysl-3Sktnh/sysl.mlw:
 Goal gcd'vc.
 Prover result is: Valid (0.01s, 165 steps).
 
 every goal was discharged
 ```
+
+Why3's report is on standard output, one goal per checked operation the translation used and one
+per function; the last line is sysl's, on standard error, and the exit status is Why3's own.
+
+**Every `require` there is load-bearing.** Without `require a >= 0` the postcondition does not
+follow — `gcd(-4, 0)` is `-4` — and the prover is left searching for a proof of something false
+until it gives up: `Goal gcd'vc.` reads `Prover result is: Timeout (5.00s, …)` and the command exits
+2, which says the goal was not discharged rather than that it is false.
 
 `--emit-whyml` prints the translation instead of proving it, which is what to reach for when a goal
 will not go through.

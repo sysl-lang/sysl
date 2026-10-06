@@ -58,6 +58,7 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 | [`sysl.posix.rand`](/library/rand/#taking-a-seed-from-the-host-sysl-posix-rand) | `seed_from_os` and `entropy_from_os`, kept apart so the generator stays freestanding | `posix` |
 | [`sysl.args`](/library/args/) | command-line options — `Scan`, `Cli`, and `args_of` for a raw `argv` | — |
 | [`sysl.log`](/library/log/) | structured logging — a `Record`, a `Sink` of one method, `text` and `json` renderings, and a threshold that [costs a relaxed load](/library/log/#the-threshold-is-an-atomic-and-the-sink-is-under-a-lock) on a filtered call | — |
+| [`sysl.testing`](/reference/attributes/#a-test-may-find-out-that-it-cannot-run) | `skip(why)` — a `@test` that finds out it cannot run ends without a verdict, reported as skipped | — |
 | [`sysl.harness`](/library/harness/) | a test framework that runs **on the target** — `run`, `check`, `check_eq`, `check_slice_eq`, `skip`, and a tally | — |
 | [`sysl.sys`](/library/sys/) | the platform seam — what a freestanding target replaces | — |
 

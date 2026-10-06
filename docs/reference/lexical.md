@@ -136,6 +136,9 @@ ask for each half by name:
   so nothing can colour it and nothing scanning for the code can find it. `weave` tells the renderer
   that an indented block is sysl and passes the source through verbatim.
 
+*Neither command is in this compiler yet — each answers "is not a command this compiler can carry
+out yet". A build still tangles a `.lsysl` file, which is how one compiles.*
+
 Both are covered under the [CLI](/getting-started/cli/). Weaving asks for no target, no standard
 module and no library, which is what makes a package's prose worth reading on a machine that could
 not build it.
@@ -499,14 +502,16 @@ lexer having heard of them, and no list of widths has to be maintained anywhere.
 
 A few words are **contextual** — special only where the grammar expects one, and ordinary identifiers
 everywhere else: `is`, `not`, `end`, `become`, `opaque`, `derives`, `invariant`, `new`, `set`, `some`,
-`with`, `within`, `where`, and the `c` of a [`c const` or `c type`](/reference/ffi/) block. You may name a
-variable `where`; you may not name one `while`.
+`with`, `within`, `where`, [`async` and `await`](/reference/async/#async-and-await-are-contextual),
+and the `c` of a [`c const` or `c type`](/reference/ffi/) block. You may name a variable `where`; you
+may not name one `while`.
 
 **A word is contextual rather than reserved when it can be**, and the trade is the same every time: a
 reserved word is spent out of every program's namespace for the sake of one line apiece.
-[`become`](/reference/declarations/) is the newest of them and needs no reservation at all, because
-two identifiers in a row are not otherwise a statement — so a `become` of a function called `become`
-reads as exactly what it is.
+[`become`](/reference/declarations/) needs no reservation at all, because two identifiers in a row
+are not otherwise a statement — so a `become` of a function called `become` reads as exactly what it
+is. `async` is the same case, being a keyword only where a declaration follows it, and `await` only
+where an operand does.
 
 `set` is read only where a member declaration begins, which is what keeps the word available for
 everything else it is wanted for — a container, a local, a method:
@@ -730,6 +735,10 @@ print(f1, f2, f3)
 
 Note the rendering: a float prints in the shortest form that round-trips, so `2.5e3` shows as `2500`
 and carries no `.0`. Hexadecimal, binary and octal have no floating-point form.
+
+A [fixed-point](/reference/fixed-point/) suffix (`0.6i32q31`, `1i32q16`) is the one integer-family
+suffix a fraction may carry. An unsuffixed decimal literal written where a fixed-point type is
+expected adopts it, converted exactly from its digits; outside the range it is a compile error.
 
 ### Characters
 

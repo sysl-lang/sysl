@@ -461,12 +461,11 @@ happens, and nothing needs to — the constructor is `@llvm.global_ctors`, which
 on ELF, `__mod_init_func` on Mach-O and `.CRT$XCU` on COFF. A `.so` loaded with `dlopen` runs it at
 load, which is what makes this work on Android.
 
-**Which build fills it is the whole rule, and there are three of them:**
+**Which build fills it is the whole rule, and there are two of them:**
 
 | build | who fills the module storage |
 |---|---|
-| `sysl build`, `sysl test` | its own entry point, before the first statement |
-| `sysl build-lib` | the **program** that links the artifact, which has an entry point |
+| `sysl build`, `sysl test` | its own entry point, before the first statement — a library's storage included, since a library joins the program as source |
 | `sysl build-c` | a constructor the platform runs before the C project's `main` |
 
 **A `val` whose initializer is constant data is not in the question at all**, because nothing runs to
@@ -483,6 +482,44 @@ begin() -> i32 = start
 ```
 
 A `const` has no storage at all and never arises.
+
+#### What constant data is
+
+**An initializer is constant data when every scalar in it is a constant expression** — the same
+expressions a `const` may be written as ([modules § const](/reference/modules/)): a literal, a
+`const`, a conversion, a unary `-`, `!` or `~`, or an arithmetic, bitwise, shift, comparison or
+logical operator over those — **and the arrays, structs and variants carrying nothing that are built
+from them, at any depth.** A pointer written as `ptr_cast` of such an integer is one too. The compiler
+works the value out and the object file carries it, so nothing runs to fill the storage:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+const SCALE: i32 = 1 << 4
+
+struct Q31
+    raw: i32
+
+val gain: Q31 = Q31(i32(0.6 * 2147483648.0))
+val taps: [3]i32 = [SCALE, -(SCALE / 2), ~0]
+val rate: f64 = 48000.0 / 3.0
+
+@export
+begin() -> i32 = gain.raw + taps[0] + i32(rate)
+```
+
+**A call is constant data only when it calls a
+[`const` function](/reference/declarations/#a-const-function-runs-while-compiling)** over constant
+arguments, which the compiler runs while compiling. Any other call is module storage whatever it is
+called with — `val start: i32 = counter()` below is storage even where `counter` is `= 7`, because
+nothing marked it as code the compiler may run.
+
+**The value laid down is the value the same initializer computes at run time, and where the two
+could differ it is not laid down.** An integer operation whose result its type does not hold, a
+division by zero, a shift by the operand's width or more: each of these leaves the initializer as code, run before the program's
+statements like any other computed one — so on a freestanding archive it is refused below rather
+than given a value the program would never have computed. A `f32` is rounded after every operation,
+as the machine rounds it, so `val g: f32 = 16777216.0 + 1.0 + 1.0` holds `16777216`.
 
 #### The one case with nowhere to fill
 
@@ -734,8 +771,9 @@ $ clang main.c libmylib.a -o app
 ```
 
 **The archive is self-contained.** Whatever of the standard library the module reaches is compiled
-into it, because a `.syslib` is not something a C link line can be handed — an archive referring to
-one would fail at that link naming a `sysl$` symbol its author has no way to place. So `--std-lib` is
+into it, because the compiler's cached standard module is not something a C link line can be handed
+— an archive referring to it would fail at that link naming a `sysl$` symbol its author has no way to
+place. So `--std-lib` is
 refused here and `--no-std-lib` asks for what already happens. The cost, which is accepted: two
 `build-c` archives linked into one program each carry the part of the library they reach. Its members
 are native objects whatever the manifest's `lto` key says — bitcode would link only under
@@ -925,10 +963,11 @@ in the other produces one naming a *function*, on a platform the author does not
 
 Four more rules:
 
-- **The requirement travels in the artifact.** The clauses are part of the tree a `.syslib` carries,
-  so a program depending on a prebuilt library learns to pass `-lz` without reading that library's
-  source. Leaving them out would mean a binding that works from source and stops working the moment
-  it ships — the worst available shape, since the build that breaks is one its author never ran.
+- **The requirement travels with the library.** The clauses are part of its source, so a program
+  depending on a library learns to pass `-lz` without its author writing that down anywhere else.
+  Leaving them out would mean a binding that works in its own repository and stops working the
+  moment it ships — the worst available shape, since the build that breaks is one its author never
+  ran.
 - **A module's requirement is the union of its files', and its files are not held to agreeing.**
   This is where the directive differs from a [capability clause](/reference/modules/), which it is
   otherwise shaped like: a capability describes what the whole module may do, so files that
@@ -1786,8 +1825,8 @@ for, and that building it for another fails loudly.
 
 **A `.c` file dropped in any module of a library's tree is compiled with it and archived beside it.**
 Nothing declares it and nothing lists it: the build already walks every directory, and a C file found
-in one that holds source is compiled for the same target and becomes one more member of the
-`.syslib`. The sysl side reaches it through the `extern` that was already the way to name a symbol
+in one that holds source is compiled for the same target and linked with the program that uses the
+library. The sysl side reaches it through the `extern` that was already the way to name a symbol
 the linker has — so the *language* gains nothing, and the whole of the feature is in the build.
 
 **A module, and not merely a directory.** A project is not the only thing that writes into its own
