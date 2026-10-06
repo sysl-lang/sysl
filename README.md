@@ -6,7 +6,7 @@ The sysl compiler, written in sysl.
 [bootstrap compiler](https://github.com/sysl-lang/sysl-bootstrap), which is written in Scala and
 remains the reference: the two are checked against the same programs, and where they disagree the
 bootstrap decides until this one has earned the last word. The language is specified by the pages
-in `docs/`, which [sysl.sh](https://sysl.sh) publishes from a release tag.
+in `docs/content/`, which [sysl.sh](https://sysl.sh) publishes from a release tag.
 
 ## The layout
 
@@ -14,19 +14,17 @@ in `docs/`, which [sysl.sh](https://sysl.sh) publishes from a release tag.
 |---|---|
 | `compiler/` | the compiler: its `package.hocon`, `sysl.sum` and the module `sh.sysl.compiler` |
 | `library/` | the standard library, the tree whose root module is `sysl` |
-| `docs/` | the documentation's pages — the reference, the library, the tour — every `sysl` block of which the compiler's suite builds and runs (`tests_docs.sysl`, with `SYSL_DOCS=1`) |
-| `site/` | the documentation site: juicer's `site.toml`, the themes, the static files and the grammar |
+| `docs/` | the documentation site: juicer's `site.toml`, the themes, the static files, the grammar, and under `docs/content/` the pages — the reference, the library, the tour — every `sysl` block of which the compiler's suite builds and runs (`tests_docs.sysl`, with `SYSL_DOCS=1`) |
 | `scripts/` | the censuses that compare this compiler with the reference |
 
 The compiler is a project of its own in `compiler/` because a compiler reads every `.sysl` file
 under a project's root as part of that project, and the library's modules are not the compiler's.
 
 The site at [sysl.sh](https://sysl.sh) is built by [juicer](https://github.com/edadma/juicer) from
-`site/` and the pages in `docs/` (`site/content` is a symlink to `../docs`, juicer reading only
-content inside its source directory). `.github/workflows/docs.yml` builds it on every push to `dev`
+`docs/`. `.github/workflows/docs.yml` builds it on every push to `dev`
 and deploys it to GitHub Pages only from a release tag, so the published site documents a release.
 Building it needs juicer and nothing else — no sysl compiler or library. A local preview is
-`sbt 'juicerJVM/run serve -s <this repository>/site -L'`, run from a juicer checkout.
+`sbt 'juicerJVM/run serve -s <this repository>/docs -L'`, run from a juicer checkout.
 
 ## Building
 
