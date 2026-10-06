@@ -1,0 +1,320 @@
+module sysl.buf
+
+import sysl.slices.copy
+
+/** The growable sequence and the sink built on it.
+ *
+ * A module of its own because nothing in the language reaches either: an array literal makes a `[]T`
+ * and a `for` walks whatever implements `Iterate`, so a program that wants a sequence that grows is
+ * asking for one, and asks with an `import`. What renders into a buffer without a program naming a
+ * sink is `str(x)`, and that goes through storage the compiler lays out rather than through
+ * `ByteSink` -- which is why the sink can sit here beside the buffer it wraps.
+ */
+
+/** A sequence that grows, over a `[]T` it replaces when it runs out.
+ *
+ * It is ordinary sysl rather than a built-in because a `[]T` that can be sized while running is all
+ * it needs: `push` allocates a slice twice the size and copies, so the amortized cost is the one a
+ * growable sequence has anywhere, and none of it is underneath the language.
+ *
+ * The bounds-checked members panic rather than returning an `Option`, which is the same bargain
+ * `unwrap` makes -- an index past the end is a mistake in the program, not a value it meant to
+ * handle -- while `pop` returns one, because taking from an empty sequence is a question a caller
+ * asks on purpose.
+ *
+ * **The count never passes the storage, and the type says so.** The clause is checked wherever
+ * either field is written, which in this module is at a handful of places the storage has just made
+ * room at -- and in return every member is told it on entry. That is what makes `at` one compare:
+ * the index is tested against `count` for the panic, and the slice's own test against `elems.len`
+ * is then implied by it and folds.
+ */
+struct Buf[T]
+    elems: []T
+    count: usize
+    invariant count <= elems.len
+
+    len(self) -> usize = self.count
+
+    cap(self) -> usize = self.elems.len
+
+    is_empty(self) -> bool = self.count == 0
+
+    at(self, i: usize) -> T
+        if i >= self.count then past_end(i, self.count)
+
+        self.elems[i]
+
+    set(*self, i: usize, v: T)
+        if i >= self.count then past_end(i, self.count)
+
+        self.elems[i] = v
+
+    /** One element appended, after growing the storage where there is no room left for it.
+     *
+     * **The three parts of the shape below are what let a caller absorb the whole member**, which is
+     * the difference between an append that is a store and an append that is a call and a frame:
+     *
+     *  - the room is asked for with `>=` rather than `==`, so the arm that does not grow is reached
+     *    knowing `count < elems.len` and its store needs no bounds check of its own;
+     *  - the growth *and the store that follows it* sit behind one out-of-line name, so nothing the
+     *    store needs has to survive a call and no callee-saved register is spilled to hold it;
+     *  - the count is raised here rather than inside the growth, so a caller appending in a loop keeps
+     *    it in a register instead of reading it back out of the buffer on every turn -- and it is
+     *    raised in **each arm**, beside the fact that makes the raise legal: the clause
+     *    `count <= elems.len` is re-checked at the write, and on the growing arm `grow_store`'s
+     *    `ensure` settles that check where it stands.
+     *
+     * **The arm that does not grow raises the count from the value it compared, and writes it after
+     * the element.** The element store goes through the storage pointer, which the optimizer cannot
+     * tell apart from the buffer's own fields, so a `self.count` read after it is a load -- and that
+     * load lands on the count the previous append has only just stored, read as a pair with
+     * `elems.len` beside it. A load that needs one store's bytes and memory's for the rest waits for
+     * the store to retire rather than taking the value from it, and a run of appends, an interpreter's
+     * operand stack above all, then carries that wait on every one. Held in `n`, the count is never
+     * read back: the store of `n + 1` is the last thing the append does, the next append starts from
+     * it in a register, and what the clause's re-check reads fresh is `elems.len` alone, which nothing
+     * has written. That re-check is left as one compare, which costs a great deal less than the wait.
+     *
+     * **`@inline` raises the element type at which an append stops being a store.** Shaped as above
+     * the member still costs a little more for every word of the element and a good deal more for
+     * every counted field it carries, so a small element leaves it just inside the budget a caller
+     * may spend and a larger one just outside -- and the same `push`, at the same call site, becomes
+     * a call and a frame because a struct grew a field. The mark raises what the inliner will spend
+     * here, which moves that boundary out rather than away: an element of nine words carrying one
+     * reference is a store with the mark and a call without it.
+     */
+    @inline
+    push(*self, v: T)
+        if self.count >= self.elems.len
+            self.grow_store(v)
+            self.count += 1
+        else
+            val n = self.count
+
+            self.elems[n] = v
+            self.count = n + 1
+
+    /** Storage grown by one element's worth, with that element written into the slot the count
+     * names -- the rare half of `push`, behind a name of its own.
+     *
+     * **The store is repeated here rather than left to `push` because an element that has to survive
+     * the growth call is an element the caller has to spill.** Written as the shared tail of both
+     * arms, it costs every append a frame big enough to hold the value across a call that is almost
+     * never made. What deliberately does *not* move here is the count: `push` raises it for both
+     * arms, and a count raised in here would be a count its caller had to read back.
+     *
+     * **The `ensure` is what keeps that raise free.** Raising the count re-checks the clause, and on
+     * this arm the promise is the only thing that can say there is room, repeated at the call as a
+     * fact.
+     */
+    @noinline
+    @cold
+    private grow_store(*self, v: T)
+        ensure self.count < self.elems.len
+
+        self.grow(self.count + 1, v)
+
+        self.elems[self.count] = v
+    end grow_store
+
+    /** Storage replaced by storage that holds at least `need` elements, with everything already
+     * there copied across. The growth is geometric -- the capacity doubles until it fits, rather
+     * than sizing exactly to what was asked for -- so a caller adding elements one at a time still
+     * pays amortized constant time per element. Sizing to fit would make a loop of `extend` calls
+     * quadratic in the same way `+=` on a string is.
+     *
+     * **It is out of line, and marked so, because that is what lets `push` disappear into its
+     * caller.** An allocation and a copy written inside `push` make the whole member too large for
+     * a caller to absorb, so every push is a call and a frame; behind a name that is kept out of
+     * line and declared rare, what is left where the growth was is a compare and a branch that is
+     * almost never taken. The marks are on the declaration, so every element type a program asks
+     * for carries them.
+     *
+     * **The fill is a parameter because a generic `T` has no zero**: an array is made by repeating
+     * a value, and nothing about `T` says what an unused slot should hold. None of those slots is
+     * read -- `count` is what says which elements are real.
+     *
+     * **The contract is what carries the growth back out to the caller.** A postcondition is
+     * repeated at every call site as a fact the optimizer may use, so the store `grow_store` makes
+     * on the line after the call needs no bounds test of its own -- without it LLVM sees a call to
+     * something it was told not to inline, then a subscript, and has nothing joining the two. What
+     * is promised is the smallest thing that does the job: the count is a valid index once the
+     * storage has been replaced. The precondition beside it is what makes that true rather than
+     * hopeful, and both callers satisfy it -- `grow_store` asks for one more than the count, and
+     * `extend` for the count plus a run it has already found to be non-empty.
+     */
+    @noinline
+    @cold
+    private grow(*self, need: usize, fill: T)
+        require need > self.count
+        ensure self.count < self.elems.len
+        ensure need <= self.elems.len
+
+        var bigger_len = if self.elems.len == 0 then 8usize else self.elems.len
+
+        while bigger_len < need
+            bigger_len *= 2
+
+        var bigger: []T = [fill; bigger_len]
+
+        copy(bigger, self.elems[0..<self.count])
+
+        self.elems = bigger
+    end grow
+
+    /** Every element of a slice appended at once, which is what `push` in a loop was costing more
+     * than it looked like. A run of n elements pushed one at a time asks the capacity question n
+     * times and may reallocate several times along the way; this asks once, grows once to a size
+     * that fits the whole run, and copies.
+     *
+     * The empty case leaves early because the fill `grow` repeats is `xs[0]`, and a run of no
+     * elements has none to offer -- which costs nothing, since a run of no elements has nothing to
+     * append either.
+     */
+    extend(*self, xs: []const T)
+        if xs.len == 0 then return
+
+        var need = self.count + xs.len
+
+        if need > self.elems.len then self.grow(need, xs[0])
+
+        copy(self.elems[self.count..], xs)
+
+        self.count = need
+    end extend
+
+    pop(*self) -> Option[T]
+        if self.count == 0 then return None
+
+        self.count -= 1
+        Some(self.elems[self.count])
+
+    truncate(*self, n: usize)
+        if n < self.count then self.count = n
+
+    clear(*self)
+        self.truncate(0)
+
+    /** An element put at `i`, with everything from there on moved up one. `remove`'s other half, and
+     * the reason it is worth having is that hand-rolling it is a shift written backwards -- a loop
+     * walking up overwrites the element it is about to read, so the copy has to start at the end and
+     * that is where the off-by-one lives.
+     *
+     * Inserting at `len` is a `push`, and is allowed for that reason: a loop inserting at a cursor
+     * reaches the end of the sequence on its last step, and refusing there would make the caller
+     * write the case that this one already handles. Anything past `len` is a gap, which a sequence
+     * has no way to represent, and panics the way every other index past the end does.
+     */
+    insert(*self, i: usize, v: T)
+        if i > self.count then past_end(i, self.count)
+
+        self.push(v)
+
+        var j = self.count - 1
+
+        while j > i
+            self.elems[j] = self.elems[j - 1]
+            j -= 1
+
+        self.elems[i] = v
+    end insert
+
+    remove(*self, i: usize) -> T
+        if i >= self.count then past_end(i, self.count)
+
+        var gone = self.elems[i]
+
+        for j in i..<self.count - 1
+            self.elems[j] = self.elems[j + 1]
+
+        self.truncate(self.count - 1)
+        gone
+    end remove
+
+    /** The elements as a slice, which is what everything reading a `Buf` in bulk goes through. It is
+     * a view of the storage rather than a copy, so it is only valid while nothing pushes.
+     */
+    view(self) -> []T = self.elems[..<self.count]
+end Buf
+
+// The report an index past the end makes, out of line because of what a bounds-checked member costs
+// when it is not. Written inline, the report is a dozen calls in the middle of a two-instruction
+// accessor: the whole member is then too big for a caller to absorb, so every read is a call and a
+// frame. Behind a name that does not return, what is left where the check was is a compare and a
+// branch, and the accessor is small enough to disappear into its caller.
+private past_end(i: usize, n: usize) -> never
+    print("panic: index", i, "past the", n, "elements of a Buf")
+    exit(1)
+end past_end
+
+/** A buffer compares as the sequence it holds, which is `view()` -- the elements it actually has,
+ * rather than the backing slice, whose slots past `count` were never written.
+ *
+ * **The delegation is on purpose.** A `Buf[T]` is the growable form of a `[]T` and the two would be
+ * hard to explain if either answered differently, so the loop is written once, over the slice, and
+ * this is the growable sequence saying it is the same sequence.
+ */
+impl[T: Eq] Eq for Buf[T]
+    eq(self, rhs: Self) -> bool = self.view() == rhs.view()
+
+/** A buffer renders as the sequence it holds, which is `view()` -- the same delegation its equality
+ * goes through, and for the same reason.
+ *
+ * What the delegation buys here beyond agreement is the padding: a specifier describes the field the
+ * whole value occupies, and `[]T`'s own block already measures a rendering before it pads one, so a
+ * width on a `Buf` pads the whole sequence rather than being worked out a second time.
+ */
+impl[T: Display] Display for Buf[T]
+    display(self, out: *Writer, fmt: FormatSpec) = self.view().display(out, fmt)
+
+/** Subscripting reaches the bounds-checked members rather than the storage, so `b[i]` on a `Buf`
+ * means what `b.at(i)` means and cannot read a slot past the count that the backing slice still has.
+ */
+impl[T] Index[usize, T] for Buf[T]
+    index(self, i: usize) -> T = self.at(i)
+
+impl[T] IndexSet[usize, T] for Buf[T]
+    index_set(*self, i: usize, v: T) = self.set(i, v)
+
+buf[T]() -> Buf[T]
+    var b: Buf[T] = Buf([], 0)
+
+    b
+
+/** A buffer that has already been given room for `n` elements, for a caller that knows roughly how
+ * many are coming. What it saves is the reallocation-and-copy at each doubling on the way up, which
+ * is the one cost a growable sequence has that an exactly-sized array does not.
+ *
+ * **The fill is a parameter because a generic `T` has no zero**, and an array is made by repeating a
+ * value. It is written rather than inferred for the same reason the language asks for it anywhere
+ * else: nothing about `T` says what an unused slot should hold, and none of these slots is read --
+ * `count` starts at zero, so every one of them is written before anything can see it.
+ */
+buf_with_capacity[T](n: usize, fill: T) -> Buf[T]
+    var b: Buf[T] = Buf([fill; n], 0)
+
+    b
+
+/** A writer that gathers, and the reason it is supplied rather than left to each program is the rule
+ * that a specifier describes the field the *whole* value occupies (`library/core.md § A specifier
+ * is the whole value's field`): an implementation rendering more than one part has to gather them
+ * before it can pad what they came to, and gathering needs somewhere to put them.
+ *
+ * It is one of the library's two writers; the other is `Stdout`, in the standard module, which
+ * stands for standard output and holds no state at all.
+ */
+struct ByteSink
+    bytes: &Buf[u8]
+
+    text(self) -> []u8 = self.bytes.view()
+
+byte_sink() -> ByteSink = ByteSink(buf())
+
+/** A buffer that grows has nothing to fail at, so the whole of implementing the latch is opting into
+ * it: every member of `Fallible` has a default, and a trait like that needs no block
+ * (`reference/traits.md § Conformance is explicit, always`).
+ */
+impl Fallible for ByteSink
+
+impl Writer for ByteSink
+    write(*self, bytes: []const u8) = self.bytes.extend(bytes)

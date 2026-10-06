@@ -1,0 +1,184 @@
+module sysl
+
+import sysl.sys.sysl_snprintf
+
+// What the built-in types render as -- the sink counterpart of the `print*` family.
+//
+// These are the same renderings written into a `*Writer` instead of into standard output, and in
+// the argument order `Display` declares. They are the built-ins' `display`: what `x.display(out,
+// fmt)` lowers to when `x` is a scalar (`reference/expressions.md § Operator dispatch`), so a
+// `Display` written for a struct can render the struct's own fields without leaving the
+// allocation-free path.
+//
+// The two families are separate because a scalar renders the same either way and the `print*` path
+// builds no sink to do it, which is the cheaper of two identical answers. That is the whole of the
+// reason now: the writer standing for standard output *can* be written here, and is -- `Stdout` in
+// the file beside this one -- so what used to be an impossibility is a choice about which path a
+// built-in takes.
+//
+// **Each of them honours its `FormatSpec`**, and `display_pad` is where they all end up: it puts a
+// finished run of bytes in the field the specifier asked for, padding with spaces on whichever side
+// justification says. Doing it once is the point -- six renderers each growing their own padding is
+// six chances for `%8s` to mean something slightly different.
+//
+// A specifier describes **the field the whole value occupies**, so an implementation rendering
+// *parts* hands each part the neutral specifier and applies `fmt` to the whole -- which
+// `display_pad` is public for. Forwarding `fmt` straight down is right only when the part being
+// rendered *is* the whole rendering, as it is for a wrapper around one field.
+//
+// What a precision means is left to each renderer, because the conversion letter does not cross the
+// boundary -- only a width, a precision, and a justification do. Text truncates to it, a number
+// fills out to it in digits, and a real reads it as significant digits, which is printf's meaning
+// under each of `%s`, `%d`, and `%g` respectively. Width and precision count **bytes**, as C's do,
+// so a `string` renders the same width whether it went through `snprintf` or through here -- with
+// the one refinement that truncation backs off to a character boundary rather than handing a sink
+// half of a codepoint.
+
+display_fill(out: *Writer, b: u8, n: int)
+    var buf: [16]u8
+    for i in 0..<16 do buf[i] = b
+    var left = n
+    while left > 0
+        var k = if left < 16 then left else 16
+        out.write(buf[0..<usize(k)])
+        left -= k
+end display_fill
+
+display_pad(text: []const u8, out: *Writer, fmt: FormatSpec)
+    var pad = fmt.width - int(text.len)
+    if pad < 0 then pad = 0
+    if !fmt.left then display_fill(out, 32, pad)
+    out.write(text)
+    if fmt.left then display_fill(out, 32, pad)
+end display_pad
+
+display_digits(text: []const u8, out: *Writer, fmt: FormatSpec)
+    var sign: usize = if text.len > 0 && text[0] == 45 then 1 else 0
+    var zeros = 0
+    if fmt.prec > int(text.len - sign) then zeros = fmt.prec - int(text.len - sign)
+    var pad = fmt.width - int(text.len) - zeros
+    if pad < 0 then pad = 0
+    if !fmt.left then display_fill(out, 32, pad)
+    if sign > 0 then out.write(text[0..<1])
+    display_fill(out, 48, zeros)
+    out.write(text[sign..<text.len])
+    if fmt.left then display_fill(out, 32, pad)
+end display_digits
+
+display_str(s: string, out: *Writer, fmt: FormatSpec)
+    var b = s.bytes
+    var n = b.len
+    if fmt.prec >= 0 && usize(fmt.prec) < n then
+        n = usize(fmt.prec)
+        while n > 0 && (b[n] & 192) == 128
+            n -= 1
+    display_pad(b[0..<n], out, fmt)
+end display_str
+
+/** The two below render a number a program already holds at 64 bits, and they are what a caller
+ * with a `long` in hand reaches directly.
+ *
+ * **Nothing in the library routes through them any longer.** Every integer, at every width, renders
+ * from the one blanket `impl Display` in `display.sysl`, whose buffer is measured from the type it
+ * was instantiated at. What that replaced was three ranges of special case: these two below 64
+ * bits, a hand-rolled pair between 64 and 128 where C has no conversion wide enough, and above that
+ * a fall back through `str` that allocated -- so the widest values were the ones a `no alloc`
+ * module could not print, which is exactly backwards. The three wide renderers are gone with the
+ * routing that chose them; these two stay because a `long` is a thing programs have.
+ *
+ * `display_digits` above is where all of them ended, and it is where the blanket ends still.
+ */
+display_int(n: long, out: *Writer, fmt: FormatSpec)
+    var buf: [24]u8
+    val at = digits_long(n, buf[0..<24])
+    display_digits(buf[at..<24], out, fmt)
+
+display_uint(n: ulong, out: *Writer, fmt: FormatSpec)
+    var buf: [24]u8
+    val at = digits_ulong(n, buf[0..<24])
+    display_digits(buf[at..<24], out, fmt)
+
+/** A `ulong`'s decimal digits, written backward so that they end where `into` ends, answering the
+ * index they start at. Twenty bytes always suffice, and twenty-one with the sign `digits_long` adds.
+ *
+ * **Every 64-bit integer the library renders ends here** -- `printi`, `display_int` and a builder's
+ * `push_int`, with their unsigned twins. They went through `snprintf` until it was measured: a
+ * format string parsed on every call and a varargs frame built, for a job that is a loop of
+ * divisions by a constant. That was a third of a string-building benchmark whose only formatting
+ * was integers. The rendering is `%lld`'s and `%llu`'s exactly -- no padding, a `-` and nothing else
+ * for a sign -- so no output changed, and the library's integers need no C library.
+ *
+ * **Two digits come off per division.** A division by a constant is a multiply and a shift, and
+ * what bounds the loop is that each one waits on the last; taking a pair and splitting it with
+ * arithmetic that does not feed the next step halves the length of that chain.
+ */
+private[sysl] digits_ulong(n: ulong, into: []u8) -> usize
+    var i = into.len
+    var v = n
+
+    while v >= 100
+        val pair = v % 100
+        v /= 100
+        i -= 2
+        into[i] = u8('0') + u8(pair / 10)
+        into[i + 1] = u8('0') + u8(pair % 10)
+
+    if v >= 10
+        i -= 2
+        into[i] = u8('0') + u8(v / 10)
+        into[i + 1] = u8('0') + u8(v % 10)
+    else
+        i -= 1
+        into[i] = u8('0') + u8(v)
+
+    i
+end digits_ulong
+
+/** A `long`'s decimal digits, the way `digits_ulong` writes them, with a `-` before a negative one.
+ *
+ * **The magnitude is taken one short and made up as a `ulong`**, because the most negative `long`
+ * has a magnitude one larger than a `long` holds: `-(n + 1)` fits for every negative `n`, and adding
+ * the one back happens at a width where it cannot overflow.
+ */
+private[sysl] digits_long(n: long, into: []u8) -> usize
+    if n >= 0 then return digits_ulong(ulong(n), into)
+
+    val at = digits_ulong(ulong(-(n + 1)) + 1, into) - 1
+    into[at] = u8('-')
+    at
+
+display_real(x: real, out: *Writer, fmt: FormatSpec)
+    var buf: [64]u8
+    var p = fmt.prec
+    if p < 0 then p = 6
+    if p > 40 then p = 40
+    var k = sysl_snprintf(&buf[0], 64, c"%.*g", p, x)
+    display_pad(buf[0..<usize(k)], out, fmt)
+end display_real
+
+/** A `real` written in the fewest digits that read back as the same number, which is what a
+ * serializer needs and what `display_real` cannot give it.
+ *
+ * A precision is a count of significant digits, so any fixed one is a choice between losing the
+ * value and printing digits nobody asked for: six -- the default, and the one `str` shows a person
+ * -- turns 3.141592653589793 into 3.14159, and seventeen turns 0.1 into 0.10000000000000001. What a
+ * document wants is neither, and the answer has been the same since Steele and White: **the
+ * shortest text that parses back to the value you started with**.
+ *
+ * The digits are JavaScript's and Python's: the fewest that read back; among those, the closest to
+ * the value; and a tie to the even digit. `shortest_real` finds them exactly, with no round trip
+ * through a reader, and `shortest.sysl` says how. The spelling around them is `%g`'s, so `1e+23`,
+ * `0.5`, `-0`, `inf` and `nan` read as they always have. A caller that needs `null` or `Infinity`
+ * written for a non-finite value is writing a format's syntax and owns that decision.
+ */
+display_real_shortest(x: real, out: *Writer, fmt: FormatSpec)
+    var buf: [32]u8
+
+    display_pad(buf[0..<shortest_real(x, buf[..])], out, fmt)
+
+display_bool(b: bool, out: *Writer, fmt: FormatSpec) = display_str(if b then "true" else "false", out, fmt)
+
+display_char(ch: char, out: *Writer, fmt: FormatSpec)
+    var buf: [4]u8
+
+    display_pad(buf[0..<encode_utf8(ch, buf[0..<4])], out, fmt)

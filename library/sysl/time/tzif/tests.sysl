@@ -1,0 +1,142 @@
+module sysl.time.tzif
+@tests
+
+import sysl.time.{Instant, Offset, datetime_at, resolve, Resolution}
+
+// What the TZif decoder claims, asserted against a zone written out as bytes.
+//
+// **These need no filesystem and no host zone, which is the whole reason the decoder is a module of
+// its own.** The zone below is 188 bytes of real TZif -- a well-formed version 2 file carrying US
+// Eastern's two 2023 transitions -- so what is exercised is the format rather than a mock of it.
+//
+// **The bytes were generated from RFC 8536 and then read back by a parser nobody here wrote**:
+// Python's `zoneinfo`, which agreed on every expected value below. That matters more than it sounds,
+// because a table asserted against the decoder that produced it asserts nothing at all. The same six
+// instants were also checked against the host's own `localtime_r` through the real
+// `America/Toronto`, which is a third implementation and the one a user's clock actually agrees with.
+
+// US Eastern in 2023: EST at -05:00, EDT at -04:00, with the two transitions the year had. The
+// footer carries the POSIX rule string a real file ends with, so the length arithmetic has to step
+// over it correctly rather than run to the end of the buffer.
+// **The bytes are module storage**, which is what lets `eastern` below hand a `Zone` back out of a
+// frame: a `Zone` is a view into them, so a blob that lived in a local could not leave the function
+// that made it. A `@tests` file has no body, so a declaration here is the module's already and needs
+// no `static` to say so.
+val eastern_tzif: [188]u8 = [
+    84, 90, 105, 102, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0,
+    0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 8, 100, 13, 120, 112,
+    101, 71, 47, 96, 1, 0, 255, 255, 185, 176, 0, 0, 255, 255, 199, 192,
+    1, 4, 69, 83, 84, 0, 69, 68, 84, 0, 0, 0, 0, 0, 84, 90,
+    105, 102, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0,
+    0, 2, 0, 0, 0, 2, 0, 0, 0, 8, 0, 0, 0, 0, 100, 13,
+    120, 112, 0, 0, 0, 0, 101, 71, 47, 96, 1, 0, 255, 255, 185, 176,
+    0, 0, 255, 255, 199, 192, 1, 4, 69, 83, 84, 0, 69, 68, 84, 0,
+    0, 0, 0, 0, 10, 69, 83, 84, 53, 69, 68, 84, 44, 77, 51, 46,
+    50, 46, 48, 44, 77, 49, 49, 46, 49, 46, 48, 10
+]
+
+private at_second(secs: long) -> Instant = Instant(secs * 1000000)
+
+private eastern() -> Zone = parse(eastern_tzif[..]).unwrap()
+
+@test("a version 2 file decodes, and it is the wide block that was taken")
+tzif_parses()
+    val z = eastern()
+
+    assert_eq(z.timecnt, 2)
+    assert_eq(z.typecnt, 2)
+
+    // The narrow block is stepped over rather than read, so a decoder that stopped at the first
+    // header would have `wide` false here and would then read the 4-byte times as 8-byte ones.
+    assert(z.wide, "the version 2 block was not the one taken")
+end tzif_parses
+
+@test("an offset is read at each side of both transitions")
+tzif_offsets()
+    val z = eastern()
+
+    // Every number here was produced by Python's `zoneinfo` from these same bytes.
+    assert_eq(offset_at(z, at_second(1686844800)).unwrap().minutes, -240)
+    assert_eq(offset_at(z, at_second(1673798400)).unwrap().minutes, -300)
+
+    // One minute either side of the November transition, which is the boundary a binary search gets
+    // wrong by one in whichever direction it is written carelessly.
+    assert_eq(offset_at(z, at_second(1699163940)).unwrap().minutes, -240)
+    assert_eq(offset_at(z, at_second(1699164000)).unwrap().minutes, -300)
+
+    // And of the March one.
+    assert_eq(offset_at(z, at_second(1678604340)).unwrap().minutes, -300)
+    assert_eq(offset_at(z, at_second(1678604400)).unwrap().minutes, -240)
+end tzif_offsets
+
+@test("a time before the first transition takes the first type that is not daylight saving")
+tzif_before_the_table()
+    val z = eastern()
+
+    // RFC 8536's rule, and not the same as "the first type": a file whose type 0 is the daylight one
+    // would answer an hour out for every date before its table begins. Both of these are before the
+    // first transition this file records.
+    assert_eq(offset_at(z, at_second(0)).unwrap().minutes, -300)
+    assert_eq(offset_at(z, at_second(-631152000)).unwrap().minutes, -300)
+end tzif_before_the_table
+
+@test("the abbreviation and the daylight flag come out of the same type")
+tzif_names()
+    val z = eastern()
+
+    assert_eq(abbrev_at(z, at_second(1686844800)).unwrap(), "EDT")
+    assert_eq(abbrev_at(z, at_second(1673798400)).unwrap(), "EST")
+
+    assert(is_dst_at(z, at_second(1686844800)).unwrap(), "June is not daylight saving")
+    assert(!is_dst_at(z, at_second(1673798400)).unwrap(), "January is daylight saving")
+
+    // The designations are one NUL-separated run, so a reader that took a fixed width, or forgot the
+    // index, would answer 'EST\0EDT' or 'DT' here rather than either name.
+    assert_eq(abbrev_at(z, at_second(0)).unwrap(), "EST")
+end tzif_names
+
+@test("a decoded zone is what resolve takes, which is the point of the shape")
+tzif_resolves()
+    val z = eastern()
+
+    // The repeated hour, answered from the file rather than from a table written by hand -- and this
+    // is the assertion that says the two modules compose, which neither of them can say alone.
+    resolve(datetime_at(2023, 11, 5, 1, 30, 0), t -> offset_at(z, t).unwrap()) match
+        Ambiguous(earlier, later) ->
+            assert_eq(earlier.us, 1699162200 * 1000000)
+            assert_eq(later.us, 1699165800 * 1000000)
+        _ -> assert(false, "the repeated hour did not resolve to two instants")
+
+    resolve(datetime_at(2023, 3, 12, 2, 30, 0), t -> offset_at(z, t).unwrap()) match
+        Gap(before, after) ->
+            assert_eq(before.minutes, -300)
+            assert_eq(after.minutes, -240)
+        _ -> assert(false, "the skipped hour resolved to an instant")
+end tzif_resolves
+
+@test("bytes that are not a TZif file are refused rather than read")
+tzif_refuses_rubbish()
+    var not_tzif: [8]u8 = [1, 2, 3, 4, 5, 6, 7, 8]
+
+    parse(not_tzif[..]) match
+        Err(BadMagic) -> ()
+        _ -> assert(false, "eight arbitrary bytes were accepted as a zone")
+
+    // Short of even the header, which is the other way a caller's buffer is wrong: it is the failure
+    // of a read that stopped early rather than of a file that is something else.
+    parse(eastern_tzif[0..<10]) match
+        Err(Truncated(needed)) -> assert_eq(needed, 44)
+        _ -> assert(false, "ten bytes were accepted as a zone")
+end tzif_refuses_rubbish
+
+@test("a header promising more than the buffer holds is refused")
+tzif_refuses_truncation()
+    // Enough for both headers to be read and for the arithmetic to work out where the data ends --
+    // which is past the end of what is here. A decoder that trusted the counts would index off the
+    // end of the slice instead of saying so.
+    parse(eastern_tzif[0..<120]) match
+        Err(Truncated(_)) -> ()
+        _ -> assert(false, "a file cut short of its own data block was accepted")
+end tzif_refuses_truncation

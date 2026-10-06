@@ -1,0 +1,133 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.buf.Buf
+import sysl.io.Reader
+
+// What listing a directory promises, asserted in sysl rather than beside it in Scala.
+//
+// **These are the first tests in the library that depend on the library's own C**, which is the
+// thing worth knowing about this file: `entries` is answered by a shim under a per-OS directory
+// (`reference/modules.md § Platform selection`), so a build that did not compile or did not link
+// that shim fails here rather than in whatever program first called it. The compiler's own
+// `OsDirectoryTests` proves the mechanism on a temporary tree; this proves it on the tree that
+// ships.
+//
+// The directories are made rather than found. A test that listed something already on the machine
+// would be asserting what the machine happens to hold, which is a different test every time it runs
+// and no test at all on a fresh checkout.
+
+// `/tmp` outright rather than through `TMPDIR`. These tests run only where the shim was compiled --
+// macOS and Linux, which are the per-OS directories the module has -- and POSIX fixes this path on
+// both. There is no environment access in the library to read the variable with anyway.
+private scratch(name: string) -> string
+    val dir = "/tmp/sysl-fs-entries-" + name
+
+    clean(dir)
+    make_dir(dir).unwrap()
+    dir
+end scratch
+
+// A scratch directory removed with whatever is in it, which is what makes a test rerunnable after
+// one of them failed halfway.
+//
+// **This used to be a hand-written walk, and its comment said a library function that removes a tree
+// is a thing to design rather than a thing to need for a test.** It was designed -- it has to answer
+// for symlinks, which it unlinks rather than follows, and for how far it goes, which is the whole
+// tree -- so this is now the one line it should always have been. The tax that comment described is
+// exactly what card 0315 named: every test suite that makes a scratch directory was writing this.
+private clean(dir: string) = ignore(remove_dir_all(dir))
+
+private ignore(r: Result[unit, IoError]) = ()
+
+private touch(path: string) = write_text(path, "").unwrap()
+
+private has(names: Buf[string], want: string) -> bool
+    for name in names.view()
+        if name == want then return true
+
+    false
+
+@test("an empty directory lists nothing")
+empty_lists_nothing()
+    val dir = scratch("empty")
+
+    assert_eq(entries(dir).unwrap().len(), 0)
+    clean(dir)
+
+@test("every name in the directory comes back, and '.' and '..' do not")
+names_come_back()
+    val dir = scratch("names")
+
+    touch(dir + "/alpha")
+    touch(dir + "/beta")
+
+    val names = entries(dir).unwrap()
+
+    // The order is the filesystem's, so the assertion is over membership rather than over position.
+    assert_eq(names.len(), 2)
+    assert(has(names, "alpha"))
+    assert(has(names, "beta"))
+    assert(!has(names, "."))
+    assert(!has(names, ".."))
+
+    clean(dir)
+end names_come_back
+
+@test("a directory that is not there reports why rather than answering empty")
+missing_is_an_error()
+    entries("/tmp/sysl-fs-entries-nothing-is-here") match
+        Ok(_)  -> assert(false, "listing a directory that does not exist answered")
+        Err(e) -> assert_eq(e, IoError.NotFound)
+
+@test("a directory inside one is listed by name, like anything else in it")
+a_directory_is_a_name()
+    val dir = scratch("nested")
+
+    make_dir(dir + "/inner").unwrap()
+
+    val names = entries(dir).unwrap()
+
+    assert_eq(names.len(), 1)
+    assert(has(names, "inner"))
+
+    clean(dir)
+end a_directory_is_a_name
+
+@test("size answers the file's length, and leaves the position where the caller put it")
+size_does_not_move_the_position()
+    val path = "/tmp/sysl-fs-size-test"
+
+    write_text(path, "0123456789").unwrap()
+
+    var f = open(path).unwrap()
+
+    defer f.close()
+
+    // Put the position somewhere deliberate, ask, and check nothing moved. This held before `size`
+    // was a `fstat` too -- the old shape seeked to the end and back -- but it held by *restoring*
+    // rather than by never moving, so a failure between the two left the position at the end. It is
+    // pinned here because it is the property a later change is most likely to take away.
+    f.seek(4).unwrap()
+
+    assert_eq(f.size().unwrap(), 10)
+    assert_eq(f.tell().unwrap(), 4)
+
+    ignore(remove_file(path))
+end size_does_not_move_the_position
+
+@test("size answers zero for an empty file rather than failing")
+size_of_an_empty_file()
+    val path = "/tmp/sysl-fs-size-empty"
+
+    write_text(path, "").unwrap()
+
+    var f = open(path).unwrap()
+
+    defer f.close()
+
+    assert_eq(f.size().unwrap(), 0)
+
+    ignore(remove_file(path))
+end size_of_an_empty_file

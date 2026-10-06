@@ -1,0 +1,479 @@
+module sysl.buf
+@tests
+
+// What a `Buf` promises, asserted in sysl rather than beside it in Scala.
+//
+// The header says the file is scaffolding: every build but `sysl test` drops all of it, and nothing
+// outside a test may name any of it. These run under `sysl test library --std`, where the tree in front
+// of the compiler is the standard module itself rather than a program compiled against one.
+//
+// **What belongs here is what is true of the buffer**, not what is true of the compiler. That a
+// generic method dispatches, that a `*self` receiver may be written, that an `Option` returned by
+// value round-trips -- those are language claims, and they are asserted in Scala against an
+// independent oracle. Asserting them here would ask the compiler under test whether it had compiled
+// itself correctly.
+
+// -- growth ---------------------------------------------------------------------------------------
+
+@test("a fresh buffer is empty and holds nothing")
+fresh_is_empty()
+    var b: Buf[int] = buf()
+
+    assert_eq(b.len(), 0)
+    assert(b.is_empty())
+
+@test("pushing raises the length and the element comes back")
+push_then_read()
+    var b: Buf[int] = buf()
+
+    b.push(7)
+    b.push(9)
+
+    assert_eq(b.len(), 2)
+    assert_eq(b[0], 7)
+    assert_eq(b[1], 9)
+end push_then_read
+
+// The doubling is the whole reason `push` is amortized constant, and the empty buffer is the case
+// with no length to double -- it starts at eight rather than at twice nothing.
+@test("capacity grows geometrically from a first push")
+capacity_doubles()
+    var b: Buf[int] = buf()
+
+    assert_eq(b.cap(), 0)
+
+    b.push(1)
+    assert_eq(b.cap(), 8)
+
+    for i in 0..<8 do b.push(i)
+
+    assert_eq(b.len(), 9)
+    assert_eq(b.cap(), 16)
+end capacity_doubles
+
+// `extend` sizes once for the whole run rather than asking the capacity question per element, and
+// the growth stays geometric -- sizing exactly to fit would make a loop of `extend` calls quadratic.
+@test("extend appends a whole slice and grows once")
+extend_appends()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3])
+    b.extend([4, 5])
+
+    assert_eq(b.len(), 5)
+    assert_slice_eq(b.view(), [1, 2, 3, 4, 5])
+end extend_appends
+
+// The early return in `extend` is not a shortcut: an array is made by repeating a value and a
+// generic `T` has no zero, so the empty run is the one case with no element in hand to repeat.
+@test("extending by nothing leaves the buffer alone")
+extend_by_empty()
+    var b: Buf[int] = buf()
+    var none: []int = []
+
+    b.push(1)
+    b.extend(none)
+
+    assert_eq(b.len(), 1)
+end extend_by_empty
+
+// `push` and `extend` reach the same storage through the same rule: capacity starts at eight and
+// doubles until it holds what was asked for. So a push at capacity doubles, and a run that
+// overshoots a doubling lands on the next power of two that fits rather than on an exact size --
+// the two are written once, and a buffer filled either way has the same room afterwards.
+@test("a push at capacity and a run that overshoots it grow by one rule")
+growth_is_one_rule()
+    var pushed: Buf[int] = buf()
+    var extended: Buf[int] = buf()
+
+    for i in 0..<8 do pushed.push(i)
+
+    extended.extend([0, 1, 2, 3, 4, 5, 6, 7])
+
+    assert_eq(pushed.cap(), 8)
+    assert_eq(extended.cap(), 8)
+
+    pushed.push(8)
+    extended.extend([8])
+
+    assert_eq(pushed.cap(), 16)
+    assert_eq(extended.cap(), 16)
+
+    var far: Buf[int] = buf()
+
+    far.extend([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+    assert_eq(far.cap(), 16)
+    assert_slice_eq(far.view(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+end growth_is_one_rule
+
+// `push` has two arms, and they write the element through different code: the one that finds no room
+// grows and stores out of line, the one that finds room stores where it stands. A run long enough to
+// double twice goes through the first three times and through the second everywhere else, so the
+// order it all comes back in is what says each arm wrote the element it was handed into the slot the
+// count named -- and that the count was raised once either way.
+@test("a run of pushes across two doublings keeps every element and its order")
+push_across_doublings()
+    var b: Buf[usize] = buf()
+    var i = 0usize
+
+    while i < 20
+        b.push(i * 3)
+        i += 1
+
+    assert_eq(b.len(), 20)
+    assert_eq(b.cap(), 32)
+
+    i = 0
+
+    while i < 20
+        assert_eq(b[i], i * 3)
+        i += 1
+end push_across_doublings
+
+// The same crossing with an element that owns storage, which is where the shares are easy to get
+// wrong: growing repeats the new element into every slot it makes, copies the live prefix over the
+// low ones, and then writes that element again over the slot the count names. A share too few there
+// frees a string under the buffer and a share too many leaks one, so everything is read back after
+// the growth rather than only counted.
+@test("a counted element pushed at capacity survives the growth that made room for it")
+pushing_counted_at_capacity()
+    var b: Buf[string] = buf()
+    var i = 0usize
+
+    while i < 8
+        b.push("alpha")
+        i += 1
+
+    assert_eq(b.cap(), 8)
+
+    b.push("beta")
+
+    assert_eq(b.len(), 9)
+    assert_eq(b.cap(), 16)
+    assert_eq(b[8], "beta")
+
+    i = 0
+
+    while i < 8
+        assert_eq(b[i], "alpha")
+        i += 1
+end pushing_counted_at_capacity
+
+// The other arm on its own: a buffer given room up front takes its first elements without growing at
+// all, so the capacity it was asked for is still the capacity afterwards.
+@test("a push into room that is already there leaves the capacity alone")
+push_into_spare_capacity()
+    var b: Buf[int] = buf_with_capacity(4, 0)
+
+    assert_eq(b.len(), 0)
+    assert_eq(b.cap(), 4)
+
+    b.push(7)
+    b.push(9)
+
+    assert_eq(b.len(), 2)
+    assert_eq(b.cap(), 4)
+    assert_eq(b[0], 7)
+    assert_eq(b[1], 9)
+end push_into_spare_capacity
+
+// -- shrinking ------------------------------------------------------------------------------------
+
+@test("pop answers with the last element and shortens")
+pop_returns_last()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.push(2)
+
+    assert_eq(b.pop().unwrap(), 2)
+    assert_eq(b.len(), 1)
+end pop_returns_last
+
+// The empty case answers rather than trapping, which is what makes `pop` the one shrinking operation
+// a caller may reach for without checking first.
+@test("popping an empty buffer answers None")
+pop_empty_is_none()
+    var b: Buf[int] = buf()
+
+    assert(b.pop().is_none())
+
+// Truncation moves the count and leaves the storage, so what it costs is nothing and what it frees
+// is nothing either. The capacity staying put is the observable half of that.
+@test("truncate drops the tail and keeps the storage")
+truncate_keeps_capacity()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3, 4])
+
+    var before = b.cap()
+
+    b.truncate(2)
+
+    assert_eq(b.len(), 2)
+    assert_eq(b.cap(), before)
+    assert_slice_eq(b.view(), [1, 2])
+end truncate_keeps_capacity
+
+// Asking for more than there is is not an error -- `truncate` says "no longer than", and a buffer
+// already shorter than the bound is already that.
+@test("truncating past the end changes nothing")
+truncate_past_end()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2])
+    b.truncate(9)
+
+    assert_eq(b.len(), 2)
+end truncate_past_end
+
+@test("clear empties the buffer")
+clear_empties()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3])
+    b.clear()
+
+    assert(b.is_empty())
+    assert_eq(b.len(), 0)
+end clear_empties
+
+@test("remove takes the element out and closes the gap")
+remove_closes_gap()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3, 4])
+
+    assert_eq(b.remove(1), 2)
+    assert_slice_eq(b.view(), [1, 3, 4])
+end remove_closes_gap
+
+@test("insert puts the element at the index and moves the rest up")
+insert_shifts_up()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 3, 4])
+    b.insert(1, 2)
+
+    assert_slice_eq(b.view(), [1, 2, 3, 4])
+    assert_eq(b.len(), 4)
+end insert_shifts_up
+
+// The two ends, which are where a hand-rolled shift goes wrong: at zero it moves everything, and at
+// `len` it moves nothing and is a `push`.
+@test("insert at either end is the end it names")
+insert_at_the_ends()
+    var b: Buf[int] = buf()
+
+    b.extend([2, 3])
+    b.insert(0, 1)
+    b.insert(3, 4)
+
+    assert_slice_eq(b.view(), [1, 2, 3, 4])
+end insert_at_the_ends
+
+@test("insert into an empty buffer is the whole of it")
+insert_into_empty()
+    var b: Buf[int] = buf()
+
+    b.insert(0, 7)
+
+    assert_slice_eq(b.view(), [7])
+end insert_into_empty
+
+// -- what the bounds refuse -----------------------------------------------------------------------
+//
+// Each refusal is written beside the call that is *not* refused, because a `should_trap` test passes
+// for any failure at all -- including one in its own setup. The pair is what makes it a measurement:
+// one call over the line, one call up to it, and the difference between them is the check.
+
+@test(should_trap)
+reading_past_the_count_traps()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3])
+    b.truncate(1)
+
+    // The slot is still allocated -- `truncate` moved the count and left the storage -- so this
+    // reads a live element of the backing slice and must still be refused.
+    b.at(1)
+end reading_past_the_count_traps
+
+@test("but reading up to the count is not refused")
+reading_within_the_count_is_fine()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3])
+    b.truncate(1)
+
+    assert_eq(b.at(0), 1)
+end reading_within_the_count_is_fine
+
+// An element that owns storage is the case the int tests above cannot reach: reading one hands the
+// caller a share of the same bytes, and the buffer keeps its own. A read that took one share too few
+// would free the string under the buffer, and one that took one too many would leak it -- so the
+// same element is read repeatedly, and then read again after everything else has let go.
+@test("reading an element that owns storage leaves the buffer holding it")
+reading_a_counted_element_keeps_it()
+    var b: Buf[string] = buf()
+
+    b.extend(["alpha", "beta"])
+
+    var seen = ""
+    var i = 0usize
+
+    while i < 8
+        seen = b.at(0)
+        i += 1
+
+    assert_eq(seen, "alpha")
+    assert_eq(b.at(0), "alpha")
+    assert_eq(b.at(1), "beta")
+end reading_a_counted_element_keeps_it
+
+@test(should_trap)
+writing_past_the_count_traps()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.set(1, 5)
+
+@test("but writing up to the count is not refused")
+writing_within_the_count_is_fine()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.set(0, 5)
+
+    assert_eq(b[0], 5)
+end writing_within_the_count_is_fine
+
+@test(should_trap)
+removing_past_the_count_traps()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.remove(1)
+
+// -- the count never passes the storage -----------------------------------------------------------
+//
+// The clause every member is told on entry, and so the one every write has to keep. The fields are
+// public, so the writes that could break it are a caller's as much as the module's -- and each is
+// refused where it is made rather than left for the next read to find.
+
+@test("a buffer with no initializer is the empty one, and grows")
+a_zero_buffer_is_empty()
+    var b: Buf[int]
+
+    assert_eq(b.len(), 0)
+    b.push(7)
+    assert_eq(b.at(0), 7)
+end a_zero_buffer_is_empty
+
+@test(should_trap)
+moving_the_count_past_the_storage_traps()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.count = b.elems.len + 1
+
+@test("but moving it within the storage is not refused")
+moving_the_count_within_the_storage_is_fine()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3])
+    b.truncate(1)
+    b.count = 3
+
+    assert_eq(b.at(2), 3)
+end moving_the_count_within_the_storage_is_fine
+
+@test(should_trap)
+taking_the_storage_from_under_the_count_traps()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.elems = []
+
+// -- a buffer is the sequence it holds ------------------------------------------------------------
+//
+// Both `Eq` and `Display` delegate to `view()`, so what is asserted here is that the storage past
+// the count is not part of the value. The Scala side carries the rendering itself, where the
+// expected text is written in another language.
+
+@test("two buffers holding the same elements are equal")
+equal_buffers()
+    var a: Buf[int] = buf()
+    var b: Buf[int] = buf()
+
+    for i in 1..3
+        a.push(i)
+        b.push(i)
+
+    assert(a == b)
+    assert_eq(a, b)
+end equal_buffers
+
+@test("a differing element or a differing length makes them unequal")
+unequal_buffers()
+    var a: Buf[int] = buf()
+    var b: Buf[int] = buf()
+    var c: Buf[int] = buf()
+
+    for i in 1..3
+        a.push(i)
+
+    b.push(1)
+    b.push(9)
+    b.push(3)
+
+    c.push(1)
+    c.push(2)
+
+    assert(a != b)
+    assert(a != c)
+end unequal_buffers
+
+// A buffer grown to eight and shortened to two has six slots holding values nobody asked about, so
+// a comparison reading `elems` rather than `view()` would be comparing them.
+@test("the spare capacity is not part of the value")
+capacity_is_not_compared()
+    var a: Buf[int] = buf()
+    var b: Buf[int] = buf()
+
+    a.push(1)
+    a.push(2)
+
+    for i in 0..<9 do b.push(i)
+
+    b.truncate(2)
+    b.set(0, 1)
+    b.set(1, 2)
+
+    assert(a.cap() != b.cap())
+    assert_eq(a, b)
+end capacity_is_not_compared
+
+@test("two empty buffers are equal, and an empty one differs from a filled one")
+empty_buffers_compare()
+    var a: Buf[int] = buf()
+    var b: Buf[int] = buf()
+    var c: Buf[int] = buf()
+
+    c.push(1)
+
+    assert(a == b)
+    assert(a != c)
+end empty_buffers_compare
+
+@test("it renders as the sequence it holds")
+buffer_renders()
+    var a: Buf[int] = buf()
+    var b: Buf[int] = buf()
+
+    for i in 1..3 do a.push(i)
+
+    assert_eq(str(a), "[1, 2, 3]")
+    assert_eq(str(b), "[]")
+end buffer_renders

@@ -1,0 +1,410 @@
+module sysl.text
+
+/** What a program says when it means text as bytes: the validator, the two conversions either side of
+ * C, the character cursor, and the builder in the file beside this one.
+ *
+ * A module of its own for the reason a submodule exists at all. None of this is what the language
+ * desugars onto -- a `string` literal, `+`, and an interpolation are all the compiler's own doing and
+ * reach none of these names -- so a program that converts says so with an `import`, and one that
+ * never leaves `string` never sees them. The one exception is reached without being named: `s.chars`
+ * is a member the compiler provides, and it calls `chars_of` by key rather than by resolving the
+ * word, so the cursor moving costs a `for` over characters nothing at all.
+ *
+ * Everything here reaches the standard module's names freely -- `Option`, `Result`, `Iterate` --
+ * which `reference/modules.md § The module graph is acyclic` allows so long as `sysl` does not name
+ * back. It could not have moved while the reading surface was still in `sysl`, since `line_text`
+ * validates.
+ */
+
+/** The fallible half of `u32` -> `char` (`reference/types.md § char`). It is a free function because
+ * a scalar has no member namespace to hang a `char.try` on, and it needs no unchecked primitive
+ * underneath it: the guard it writes and the check `char(u)` already makes are the same two
+ * comparisons on the same value, so the cast on the far side of the guard can never trip and the
+ * optimizer folds it. Trading a primitive for a redundant compare in a cold branch is the better
+ * side of that bargain.
+ */
+char_from_u32(u: u32) -> Option[char]
+    if u > 0x10FFFFu32 || (u >= 0xD800 && u <= 0xDFFFu32) then
+        None
+    else
+        Some(char(u))
+
+/** What a refused decode reports: the offset `04` asks for, plus the one distinction a caller can
+ * act on -- whether the input merely *ended* in the middle of a sequence, which more bytes would
+ * fix, or holds one that no continuation could rescue.
+ */
+struct Utf8Error
+    offset: usize
+    truncated: bool
+
+/** The one direction a `string` could not otherwise be reached from, and it is written here rather
+ * than in the compiler because only its last line needs to be: validation is ordinary sysl over a
+ * `[]u8`, and the compiler supplies just `str_cast`, the raw-tier primitive that says "these bytes
+ * are a string now".
+ *
+ * The validation is `scan_at` below, which is also what the lossy form walks -- one table, so that
+ * the two can never come to disagree about which bytes are text.
+ */
+from_utf8(b: []const u8) -> Result[string, Utf8Error]
+    var i: usize = 0
+
+    while i < b.len
+        scan_at(b, i) match
+            Valid(n) -> i += n
+            Truncated(_) -> return Err(Utf8Error(i, true))
+            Invalid(_) -> return Err(Utf8Error(i, false))
+
+    Ok(str_cast(b))
+end from_utf8
+
+/** The same conversion with the validation left out -- the bytes become a `string` and nothing looks
+ * at them.
+ *
+ * **It is here so that a reader meets it beside `from_utf8`**, which is the whole of what one has to
+ * choose between. It was a compiler form until 0.0.82 and so belonged to no module: in scope
+ * everywhere, importable from nowhere, and absent from the page where somebody comparing the two
+ * would look. What could not move is the *operation* -- every safe route to a `string` carries the
+ * UTF-8 guarantee, so setting it aside comes from underneath the language -- and that is `str_cast`,
+ * in the raw tier beside `ptr_cast`, which this is one line over.
+ *
+ * **The caller owes the guarantee the compiler would otherwise have.** A `string` holding bytes that
+ * are not UTF-8 breaks `char` downstream of it, which is why the name is long and greppable and why
+ * `from_utf8` is the one to reach for on anything that came from outside the program.
+ */
+from_utf8_unchecked(b: []const u8) -> string = str_cast(b)
+
+/** The bytes of a writable slice as a `string` **without copying them**: the string is a view that
+ * shares the slice's storage, exactly as `s[a..b]` shares a string's, so a later write through the
+ * slice is seen by the string.
+ *
+ * **It is here for a buffer that grows in place and is read as text at every step** -- an
+ * appending builder whose contents are handed out as a `string` each time, where
+ * `from_utf8_unchecked` would copy the whole of the text on every call. Go's `unsafe.String` is the
+ * same operation.
+ *
+ * **The caller owes two guarantees, not one.** The bytes are valid UTF-8, as for
+ * `from_utf8_unchecked`; and **nothing writes the bytes the string covers while the string is
+ * alive**, since a `string` is taken everywhere to be immutable and a change underneath one breaks
+ * whatever compared, hashed or measured it. Writing *past* the end of the view is fine: the string's
+ * length is the slice's, fixed where it is made. What the compiler still guarantees is the storage.
+ * The string holds a share of the slice's owner, so the bytes live as long as the string does, and a
+ * view of an array the frame owns moves that array to the heap.
+ */
+str_view(b: []u8) -> string = str_alias(b)
+
+/** What one step of the walk found, and how far it reaches.
+ *
+ * The two failures are separated for the reason `Utf8Error` separates them -- input that merely
+ * *ended* mid-sequence is fixed by more bytes and input that cannot be rescued is not -- and both
+ * carry a length, which is what a caller substituting rather than refusing needs. That length is
+ * the **maximal ill-formed subsequence**: the bytes that were consistent with a longer sequence
+ * before the one that was not. Unicode asks for one replacement character per such run rather than
+ * one per byte, and getting that right is the whole reason a length is reported at all.
+ */
+private enum Scan
+    Valid(len: usize)
+    Invalid(len: usize)
+    Truncated(len: usize)
+
+    /** How far this step reaches, whichever of the three it was -- which is what a walk that only
+     * needs to find the next character asks, and it is never zero, so a loop over it terminates.
+     */
+    width(self) -> usize = self match
+        Valid(n) -> n
+        Invalid(n) -> n
+        Truncated(n) -> n
+
+/** The well-formedness table, walked one character at a time.
+ *
+ * It is Unicode's own table rather than a decode-and-range-check, which is what makes the four ways
+ * of being ill-formed -- overlong, a surrogate, a value past `10FFFF`, and a byte that can never
+ * appear -- fall out of the lead byte's row instead of each needing a test of its own.
+ */
+private scan_at(b: []const u8, i: usize) -> Scan
+    var c = b[i]
+    var need: usize = 0
+    var lo: u8 = 128
+    var hi: u8 = 191
+
+    if c < 128 then
+        return Valid(1)
+    elif c < 194 then
+        return Invalid(1)
+    elif c < 224 then
+        need = 2
+    elif c < 240 then
+        need = 3
+        if c == 224 then lo = 160
+        if c == 237 then hi = 159
+    elif c < 245 then
+        need = 4
+        if c == 240 then lo = 144
+        if c == 244 then hi = 143
+    else
+        return Invalid(1)
+
+    var have = b.len - i
+    var k: usize = 1
+
+    while k < need
+        if k >= have then return Truncated(k)
+
+        var t = b[i + k]
+        var min = if k == 1 then lo else 128
+        var max = if k == 1 then hi else 191
+
+        if t < min || t > max then return Invalid(k)
+
+        k += 1
+
+    Valid(need)
+end scan_at
+
+/** What a decoder is expected to do with bytes that are not text: keep what is well-formed and put
+ * U+FFFD where the rest was, rather than refusing the whole input.
+ *
+ * **It is the right answer for untrusted bytes and the wrong one for bytes that ought to be valid**,
+ * which is why it sits beside `from_utf8` rather than replacing it. Text coming off a wire, out of a
+ * file somebody else wrote, or from a serial port carries whatever was sent; a caller reading that
+ * wants a string it can show a person, and a `Result` there only moves the substitution one line up.
+ * A caller decoding its own output wants to be told, and `from_utf8` tells it.
+ *
+ * One replacement character per **maximal ill-formed subsequence**, which is what Unicode recommends
+ * and what `scan_at` reports: a truncated three-byte sequence at the end of the input is one U+FFFD
+ * and not two.
+ *
+ * Valid input costs one walk and no allocation at all -- the bytes are handed over as they are, which
+ * is the case a caller who cannot know has most of the time.
+ */
+from_utf8_lossy(b: []const u8) -> string
+    var i: usize = 0
+
+    while i < b.len
+        scan_at(b, i) match
+            Valid(n) -> i += n
+            _ -> return lossy_from(b, i)
+
+    from_utf8_unchecked(b)
+end from_utf8_lossy
+
+/** The rebuilding half, entered at the first fault so that the valid prefix is copied once rather
+ * than walked twice.
+ */
+private lossy_from(b: []const u8, from: usize) -> string
+    var out = str_builder()
+
+    out.bytes.extend(b[0..<from])
+
+    var i = from
+
+    while i < b.len
+        scan_at(b, i) match
+            Valid(n) ->
+                out.bytes.extend(b[i..<i + n])
+                i += n
+            Invalid(n) ->
+                out.push_char(replacement)
+                i += n
+            Truncated(n) ->
+                out.push_char(replacement)
+                i += n
+
+    out.finish()
+end lossy_from
+
+private const replacement: char = '\u{FFFD}'
+
+/** A `string` copied out of the NUL-terminated bytes a C function handed back -- the other direction
+ * of `cstring`, and the one every binding needs the moment a C library reports anything in words.
+ *
+ * **The copy is not optional.** The bytes belong to C: a static buffer it reuses on the next call,
+ * or storage the caller is about to free. A `string` outlives the call that produced it, so it
+ * cannot be a view onto either.
+ *
+ * **But it is one copy, and it is `from_utf8`'s.** Slicing a `*u8` names the bytes where C left them
+ * without taking any hold on them -- a `*T` promises nothing about how long they stay -- and
+ * validation is what turns that borrowed run into a `string` owning its own. Gathering them into a
+ * `[]u8` first, as this once did, is a second buffer for the same bytes that is freed on the next
+ * line.
+ *
+ * Fallible for the same reason `from_utf8` is, and it goes through it rather than around it: nothing
+ * about a `char *` promises well-formed UTF-8, and a C library reporting in a non-UTF-8 locale is
+ * the ordinary case rather than a corrupt one.
+ */
+from_cstring(p: *u8) -> Result[string, Utf8Error]
+    var n: usize = 0
+
+    while p[n] != 0
+        n += 1
+
+    from_utf8(p[0..<n])
+end from_cstring
+
+/** Whether a byte begins a character rather than continuing one. A continuation byte is the only one
+ * matching `10xxxxxx`, so this is one mask and one comparison -- and it is what a program walking
+ * backwards through text, or snapping an arbitrary offset onto a boundary, needs and would
+ * otherwise write inline. `reference/strings.md § Granularity` calls the same property
+ * "boundary-checked" where the compiler enforces it on `s[a..b]`; this is how a program asks the
+ * question for itself.
+ */
+is_char_boundary(b: u8) -> bool = (b & 192) != 128
+
+/** How many bytes the character starting with this lead byte occupies. The width is written into the
+ * lead byte, which is the property that makes UTF-8 walkable forwards without decoding anything.
+ *
+ * **It answers for a lead byte that begins a character, and says nothing about one that cannot** --
+ * `0xFF` reads as 4 because that is the row it falls in, and there is no character there at all. So
+ * it is a decoder's helper and never a walk's: what a walk asks is `scan_at`, which distinguishes
+ * the two.
+ */
+private char_width(lead: u8) -> usize
+    if lead >= 240 then
+        4
+    elif lead >= 224 then
+        3
+    elif lead >= 192 then
+        2
+    else
+        1
+end char_width
+
+/** One character read out of a run of bytes.
+ *
+ * It is a function rather than a body inside `step_at` because it is the half that is only about the
+ * bits: `step_at` decides *whether* there is a character here and how far it reaches, and this says
+ * what it is. Counting needs only the first half, which is why the width is not returned alongside.
+ *
+ * The decode is a plain shift-and-accumulate with no validation, and what makes that sound is the
+ * caller: it is `private`, and the only thing that reaches it is `step_at`, which decodes exactly
+ * where `scan_at` answered `Valid`. So the lead byte's width is the width that is there.
+ *
+ * **It used to say the guarantee came from `string` being UTF-8 by construction, and that was a
+ * whole byte-slice wide of the truth**: `chars_of` is public and takes any `[]const u8`, so
+ * `char_width(0xFF)` answering 4 over a two-byte run read past the end of it and the program
+ * trapped. The precondition is now checked rather than assumed, which is the only version of it a
+ * caller cannot get wrong.
+ */
+private decode_at(b: []const u8, i: usize) -> char
+    var lead = b[i]
+    var need = char_width(lead)
+    var v = u32(lead)
+
+    if need == 4 then
+        v = u32(lead & 7)
+    elif need == 3 then
+        v = u32(lead & 15)
+    elif need == 2 then
+        v = u32(lead & 31)
+
+    for k in 1..<need
+        v = (v << 6) | u32(b[i + k] & 63)
+
+    char(v)
+end decode_at
+
+/** One step of a walk over bytes that may not be text: the character there, and how many bytes it
+ * took.
+ *
+ * **This is the one place the two halves of this file meet**, and it is why the walk is safe.
+ * `scan_at` is Unicode's own well-formedness table and already reports the **maximal ill-formed
+ * subsequence**, so a step over bytes that are not text yields one U+FFFD and advances past exactly
+ * the run that was wrong -- which is what `from_utf8_lossy` does with the same table, and the two
+ * therefore cannot come to disagree about what a run of bad bytes contains.
+ *
+ * The width is never zero, so a loop driven by this one terminates on any input at all.
+ */
+private step_at(b: []const u8, i: usize) -> (char, usize)
+    val found = scan_at(b, i)
+
+    found match
+        Valid(n) -> (decode_at(b, i), n)
+        _ -> (replacement, found.width())
+
+/** A cursor over the characters of a run of bytes, which is what `s.chars` reaches -- the compiler
+ * names `chars_of` for itself, so this is a declaration the language depends on by name rather than
+ * one a program has to find.
+ */
+struct Chars
+    rest: []const u8
+    at: usize
+
+    /** Where the cursor is, in bytes from the start of the run it was made over.
+     *
+     * **It is here because a `for` walks a copy** (`sysl.iter`), so a loop over `s.chars` cannot
+     * ask the cursor anything afterwards -- and a program that needs to know where it is drives the
+     * cursor by hand with `next` instead. That is the shape a lexer wants, and without an offset it
+     * has to index bytes itself and decode a second time.
+     */
+    offset -> usize = self.at
+
+    /** The next character without moving to it. The receiver is taken by value, so what is peeked at
+     * is a copy's business and the cursor is left where it was.
+     */
+    peek(self) -> Option[char]
+        if self.at >= self.rest.len then return None
+
+        Some(step_at(self.rest, self.at).0)
+
+    /** How many characters are left, which costs a walk of the remaining bytes -- there is nothing
+     * in the representation that knows it, since the whole point of UTF-8 is that the count and the
+     * byte length are different numbers. By value again, so counting does not consume.
+     *
+     * It reads how far each step reaches and skips, decoding nothing: what a count needs to know is
+     * where the characters start, not what they are. Bytes that are not text count as the one
+     * replacement character the walk would hand back for them, so this agrees with `next` rather
+     * than with the byte length.
+     */
+    count(self) -> usize
+        var n: usize = 0
+        var i = self.at
+
+        while i < self.rest.len
+            i += scan_at(self.rest, i).width()
+            n += 1
+
+        n
+    end count
+end Chars
+
+chars_of(b: []const u8) -> Chars = Chars(b, 0)
+
+impl Iterate for Chars
+    type Item = char
+    next(*self) -> Option[char]
+        if self.at >= self.rest.len then return None
+
+        val (c, width) = step_at(self.rest, self.at)
+
+        self.at += width
+        Some(c)
+    end next
+
+/** The same walk, reporting where each character started as well as what it was.
+ *
+ * This is the cursor a lexer actually wants, and its absence is why the JSON reader that used to sit
+ * in `guide/` and the bytecode lexer beside it both index bytes by hand: a `for` walks a *copy* of a
+ * cursor, so `for c in s.chars`
+ * cannot be asked afterwards where it got to, and a program needing both the character and its
+ * offset had no form that gave it both. Rust calls this `char_indices` and it is here for the same
+ * reason.
+ *
+ * The offset is the character's **first** byte, so it is directly what `s[a..b]` takes -- a slice
+ * from a reported offset lands on a boundary by construction.
+ *
+ * It wraps a `Chars` rather than decoding for itself, so there is one decoder and the two cursors
+ * cannot come to disagree about a width.
+ */
+struct CharIndices
+    inner: Chars
+
+char_indices(b: []const u8) -> CharIndices = CharIndices(chars_of(b))
+
+impl Iterate for CharIndices
+    type Item = (usize, char)
+    next(*self) -> Option[(usize, char)]
+        var start = self.inner.at
+
+        self.inner.next() match
+            Some(c) -> Some((start, c))
+            None -> None
+    end next

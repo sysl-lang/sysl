@@ -1,0 +1,439 @@
+module sysl.math
+@no_alloc
+
+import sysl.sys.*
+
+/** Mathematics on the floating-point types, offered as a trait rather than as two sets of functions.
+ *
+ * The shape was forced by a language decision that has since been reversed, and is kept because it
+ * is the better one anyway. sysl had no overloading when this was written, so a module of free
+ * functions could not call the square root of a `real` and the square root of an `f32` by one name
+ * -- it would have needed `sqrt` and `sqrtf` the way C does, and every caller would have had to
+ * keep track of which width it was holding. `reference/declarations.md § Overloading` now admits
+ * two declarations of one name, so that argument no longer decides anything.
+ *
+ * What the trait still buys is the half overloading does not. A method whose result is *arithmetic
+ * over the others* -- the logarithm in an arbitrary base, the hypotenuse -- is written once as a
+ * default and inherited by both widths, where two free functions would need it twice and could
+ * disagree. Dispatch on the receiver is worth having for its own sake too: `x.sqrt()` is the same
+ * three words whichever width `x` is, and changing a declaration from `f32` to `real` sends nobody
+ * editing call sites. `02` allows an `impl` for a built-in precisely so a library can do this.
+ *
+ * **What the trait requires and what it answers are two different lists, and the split is where the
+ * mathematics is.** A method whose result C computes -- a range-reduced sine, a correctly rounded
+ * root -- is required, and each width binds it to its own libm entry point. A method that is
+ * arithmetic over the others is a default, written once and inherited by both. So `log` in an
+ * arbitrary base exists in exactly one place, and adding a third floating-point width would be 38
+ * bindings and no new mathematics.
+ *
+ * **The constants are members too, and they are how the defaults get to be defaults.** A signum
+ * needs a one to answer with and a reciprocal needs a one to divide, and neither can be written in a
+ * body shared by two widths unless there is a way to ask a type for its own one. `Self.one()` is
+ * that way: a member with no receiver, reached through the type rather than through a value of it
+ * (`02`), so a generic routine bounded by `Float` can build a value of a width it has never met.
+ * What stays per width is what needs a literal that is neither zero nor one -- the two angle
+ * conversions, whose factor is pi over 180.
+ */
+trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div
+
+    // --- The type's own values, which no receiver is needed to ask for. ---
+    //
+    // The two identities are **required rather than declared**: `Zero` and `One` are core traits of
+    // their own, because the argument above for asking a type for its own one is not an argument
+    // about floats. `F.zero()` and `F.one()` still read the same from a body bounded by `Float`,
+    // since a required trait's members are reachable through the bound that requires it.
+
+    /** The largest finite value, and the smallest step above one. `epsilon` is what a convergence
+     * test is written against -- a loop that stops when two iterations agree to within a few
+     * epsilons stops at the right point at both widths, and a literal tolerance does not.
+     */
+    max_value() -> Self
+    epsilon() -> Self
+
+    /** The two values no literal spells. `infinity` is what a running minimum starts at, so that the
+     * first value compared always replaces it; `nan` is the answer to a question that has none.
+     */
+    infinity() -> Self
+    nan() -> Self
+
+    /** The ratio of a circle's circumference to its diameter, at this width. `sysl.math.pi` is the
+     * same number as a `real`; this is what a routine generic over the width asks for instead.
+     */
+    pi() -> Self
+
+    /** Roots. `sqrt` is the one every float program reaches for and the one hardware has an
+     * instruction for; `cbrt` is here because the alternative a program would otherwise write --
+     * raising to one third -- is wrong for negative operands.
+     */
+    sqrt(self) -> Self
+    cbrt(self) -> Self
+
+    /** Exponentials and their inverses. `ln` is the natural logarithm and is spelled for what it is
+     * rather than as C's bare `log`, which reads as though it were the general one and is the single
+     * most common way to get a base wrong.
+     */
+    exp(self) -> Self
+    exp2(self) -> Self
+    ln(self) -> Self
+    log2(self) -> Self
+    log10(self) -> Self
+
+    /** Raising to an arbitrary power, and the length of a two-dimensional vector. `hypot` is not
+     * `(x*x + y*y).sqrt()`: the squares of operands near the top of the range overflow to infinity
+     * when the answer itself is perfectly representable, and libm's does the scaling that avoids it.
+     */
+    pow(self, exponent: Self) -> Self
+    hypot(self, other: Self) -> Self
+
+    /** Circular trigonometry, in radians. `atan2` takes the two coordinates rather than their ratio,
+     * which is what lets it tell the four quadrants apart -- and the receiver is the *vertical*
+     * coordinate, matching the argument order the name has had since Fortran.
+     */
+    sin(self) -> Self
+    cos(self) -> Self
+    tan(self) -> Self
+    asin(self) -> Self
+    acos(self) -> Self
+    atan(self) -> Self
+    atan2(self, x: Self) -> Self
+
+    /** Hyperbolic trigonometry, and its inverses. The three inverses are the ones with domains:
+     * `acosh` wants an argument of at least one and `atanh` one strictly between minus one and one,
+     * while `asinh` is defined everywhere. Outside a domain the answer is a NaN rather than a trap,
+     * which is what `asin` and `acos` do outside theirs -- a float has a value for "no answer" and
+     * the library uses it rather than stopping the program.
+     */
+    sinh(self) -> Self
+    cosh(self) -> Self
+    tanh(self) -> Self
+    asinh(self) -> Self
+    acosh(self) -> Self
+    atanh(self) -> Self
+
+    /** Rounding to an integral value. All four answer in the float's own type, because a `floor` that
+     * returned an integer would have no answer for the operands that do not fit one -- the caller who
+     * wants an integer is the caller who knows the range, and casts.
+     *
+     * `round` goes away from zero at a half, which is C's rule and not the banker's rounding a
+     * printed value gets; `trunc` goes towards zero, which is what a cast already does.
+     */
+    floor(self) -> Self
+    ceil(self) -> Self
+    round(self) -> Self
+    trunc(self) -> Self
+
+    /** The remainder of a division that truncates, keeping the sign of the receiver. This is `%` on
+     * the integers and is *not* `%` here: `01` leaves `Rem` to the integer types, since a float
+     * remainder is a library operation rather than an instruction.
+     */
+    fmod(self, divisor: Self) -> Self
+
+    /** Sign, taken two ways because the two answer differently at the edges. `abs` clears the sign
+     * bit and `copysign` copies one across, so both see a negative zero.
+     */
+    abs(self) -> Self
+    copysign(self, sign: Self) -> Self
+
+    /** Degrees are what a person writes down and radians are what the functions above take, so the
+     * conversion belongs beside them rather than in each program that reads an angle from a file.
+     * These two are the whole of what stays per width: the factor is pi over 180, and 180 is not
+     * something a zero and a one can be built up into.
+     */
+    to_radians(self) -> Self
+    to_degrees(self) -> Self
+
+    // --- What the trait answers for itself. ---
+
+    /** The third reading of a sign, and the one that is arithmetic rather than a bit. It is a pair of
+     * comparisons and so does not see a negative zero, which is why it answers a zero with that zero
+     * rather than with a one it cannot justify -- and a NaN satisfies neither comparison and leaves
+     * by the same arm holding itself.
+     */
+    signum(self) -> Self =
+        if self > Self.zero() then Self.one() else if self < Self.zero() then -Self.one() else self
+
+    /** One over the receiver, which is worth a name because a loop that divides by the same value
+     * repeatedly should multiply by this instead.
+     */
+    recip(self) -> Self = Self.one() / self
+
+    /** Whether the receiver is one of the two infinities. Larger in magnitude than the largest finite
+     * value is a condition only they meet, and a NaN fails it the way it fails every comparison.
+     */
+    is_infinite(self) -> bool = self.abs() > Self.max_value()
+
+    /** The only value that is not equal to itself, which is both the definition and the test. */
+    is_nan(self) -> bool = self != self
+
+    /** Neither infinite nor NaN, and so a value the arithmetic below will keep meaning something for. */
+    is_finite(self) -> bool = !self.is_nan() && !self.is_infinite()
+
+    /** The receiver multiplied by itself, which is worth a name for the same reason `hypot` is: it
+     * says what was meant, and it evaluates the operand once where `x * x` written over a call
+     * evaluates it twice.
+     */
+    square(self) -> Self = self * self
+
+    /** The logarithm in an arbitrary base. One place, one identity, and the two logarithms it is
+     * built from are the accurate ones -- which is why `log2` and `log10` are required separately
+     * rather than left to this: reading them back through a ratio loses digits that libm keeps.
+     */
+    log(self, base: Self) -> Self = self.ln() / base.ln()
+
+    /** The point a fraction of the way from the receiver to another, which is the interpolation every
+     * program that animates or resamples writes for itself. Written as `a + (b - a) * t` rather than
+     * `a * (1 - t) + b * t`: the second form is the exact one at `t = 1` and this one is the exact
+     * one at `t = 0`, and starting where you said you would start is what a caller notices.
+     */
+    lerp(self, to: Self, t: Self) -> Self = self + (to - self) * t
+
+end Float
+
+/** Binary64, which is what `real` names and what a float literal is unless it says otherwise. */
+impl Float for real
+    max_value() -> real = 1.7976931348623157e308
+    epsilon() -> real = 2.220446049250313e-16
+
+    /** Neither has a decimal expansion to write down, and these quotients are the definitions IEEE
+     * 754 gives them. Dividing a float by zero is not the error dividing an integer by zero is --
+     * the standard says what the answer is, and this is where the library says it too.
+     */
+    infinity() -> real = 1.0 / 0.0
+    nan() -> real = 0.0 / 0.0
+
+    pi() -> real = 3.141592653589793
+
+    sqrt(self) -> real = sysl_sqrt(self)
+    cbrt(self) -> real = sysl_cbrt(self)
+
+    exp(self) -> real = sysl_exp(self)
+    exp2(self) -> real = sysl_exp2(self)
+    ln(self) -> real = sysl_log(self)
+    log2(self) -> real = sysl_log2(self)
+    log10(self) -> real = sysl_log10(self)
+
+    pow(self, exponent: real) -> real = sysl_pow(self, exponent)
+    hypot(self, other: real) -> real = sysl_hypot(self, other)
+
+    sin(self) -> real = sysl_sin(self)
+    cos(self) -> real = sysl_cos(self)
+    tan(self) -> real = sysl_tan(self)
+    asin(self) -> real = sysl_asin(self)
+    acos(self) -> real = sysl_acos(self)
+    atan(self) -> real = sysl_atan(self)
+    atan2(self, x: real) -> real = sysl_atan2(self, x)
+
+    sinh(self) -> real = sysl_sinh(self)
+    cosh(self) -> real = sysl_cosh(self)
+    tanh(self) -> real = sysl_tanh(self)
+    asinh(self) -> real = sysl_asinh(self)
+    acosh(self) -> real = sysl_acosh(self)
+    atanh(self) -> real = sysl_atanh(self)
+
+    floor(self) -> real = sysl_floor(self)
+    ceil(self) -> real = sysl_ceil(self)
+    round(self) -> real = sysl_round(self)
+    trunc(self) -> real = sysl_trunc(self)
+    fmod(self, divisor: real) -> real = sysl_fmod(self, divisor)
+
+    abs(self) -> real = sysl_fabs(self)
+    copysign(self, sign: real) -> real = sysl_copysign(self, sign)
+
+    to_radians(self) -> real = self * 0.017453292519943295
+    to_degrees(self) -> real = self * 57.29577951308232
+end real
+
+/** Binary32. Every body here is its binary64 counterpart with libm's `f`-suffixed entry point and a
+ * literal of this width, which is the duplication the trait exists to keep out of programs.
+ */
+impl Float for f32
+    max_value() -> f32 = 3.4028235e38f32
+    epsilon() -> f32 = 1.1920929e-7f32
+
+    infinity() -> f32 = 1.0f32 / 0.0f32
+    nan() -> f32 = 0.0f32 / 0.0f32
+
+    pi() -> f32 = 3.1415927f32
+
+    sqrt(self) -> f32 = sysl_sqrtf(self)
+    cbrt(self) -> f32 = sysl_cbrtf(self)
+
+    exp(self) -> f32 = sysl_expf(self)
+    exp2(self) -> f32 = sysl_exp2f(self)
+    ln(self) -> f32 = sysl_logf(self)
+    log2(self) -> f32 = sysl_log2f(self)
+    log10(self) -> f32 = sysl_log10f(self)
+
+    pow(self, exponent: f32) -> f32 = sysl_powf(self, exponent)
+    hypot(self, other: f32) -> f32 = sysl_hypotf(self, other)
+
+    sin(self) -> f32 = sysl_sinf(self)
+    cos(self) -> f32 = sysl_cosf(self)
+    tan(self) -> f32 = sysl_tanf(self)
+    asin(self) -> f32 = sysl_asinf(self)
+    acos(self) -> f32 = sysl_acosf(self)
+    atan(self) -> f32 = sysl_atanf(self)
+    atan2(self, x: f32) -> f32 = sysl_atan2f(self, x)
+
+    sinh(self) -> f32 = sysl_sinhf(self)
+    cosh(self) -> f32 = sysl_coshf(self)
+    tanh(self) -> f32 = sysl_tanhf(self)
+    asinh(self) -> f32 = sysl_asinhf(self)
+    acosh(self) -> f32 = sysl_acoshf(self)
+    atanh(self) -> f32 = sysl_atanhf(self)
+
+    floor(self) -> f32 = sysl_floorf(self)
+    ceil(self) -> f32 = sysl_ceilf(self)
+    round(self) -> f32 = sysl_roundf(self)
+    trunc(self) -> f32 = sysl_truncf(self)
+    fmod(self, divisor: f32) -> f32 = sysl_fmodf(self, divisor)
+
+    abs(self) -> f32 = sysl_fabsf(self)
+    copysign(self, sign: f32) -> f32 = sysl_copysignf(self, sign)
+
+    to_radians(self) -> f32 = self * 0.017453292f32
+    to_degrees(self) -> f32 = self * 57.295776f32
+end f32
+
+/** Binary16, and the first width whose mathematics is not its own.
+ *
+ * **libm stops at `float`.** There is no half-width entry point to bind -- no `sqrth`, no `sinh` that
+ * means the square root of a half -- because no C library offers one, and nothing about the width
+ * suggests one is coming: sixteen bits of significand is a storage format, and the machines that
+ * compute in it compute a lane at a time rather than a value at a time. So every body below widens to
+ * `f32`, calls the `f`-suffixed entry point the width above already binds, and narrows the answer.
+ *
+ * **That is not a compromise, it is the correct answer, and the reason is worth stating once here
+ * rather than doubted at each of the thirty-odd methods that use it.** `f32` holds every `f16`
+ * exactly -- more exponent range and more than twice the significand -- so widening loses nothing.
+ * The `f32` result is then within half an `f32` ulp of the true answer, and narrowing rounds it to
+ * the nearest `f16`. Two roundings rather than one, and the first is so much finer than the second
+ * that it changes the result only for an answer sitting within an `f32` ulp of the midpoint between
+ * two `f16` values -- which is the accuracy libm itself promises, not a loss this widening
+ * introduced.
+ *
+ * **The constants are written as the mathematics rather than as this width's nearest value.** A
+ * literal is narrowed to the type it is written at, so `3.141592653589793f16` *is* the nearest `f16`
+ * to pi and says which number was meant, where the eight digits that spelling rounds to would only
+ * say what came out. The two that have to be exact are exact anyway: the largest finite `f16` is
+ * 65504, and its epsilon is two to the minus tenth.
+ */
+impl Float for f16
+    max_value() -> f16 = 65504.0f16
+    epsilon() -> f16 = 0.0009765625f16
+
+    infinity() -> f16 = 1.0f16 / 0.0f16
+    nan() -> f16 = 0.0f16 / 0.0f16
+
+    pi() -> f16 = 3.141592653589793f16
+
+    sqrt(self) -> f16 = f16(sysl_sqrtf(f32(self)))
+    cbrt(self) -> f16 = f16(sysl_cbrtf(f32(self)))
+
+    exp(self) -> f16 = f16(sysl_expf(f32(self)))
+    exp2(self) -> f16 = f16(sysl_exp2f(f32(self)))
+    ln(self) -> f16 = f16(sysl_logf(f32(self)))
+    log2(self) -> f16 = f16(sysl_log2f(f32(self)))
+    log10(self) -> f16 = f16(sysl_log10f(f32(self)))
+
+    pow(self, exponent: f16) -> f16 = f16(sysl_powf(f32(self), f32(exponent)))
+    hypot(self, other: f16) -> f16 = f16(sysl_hypotf(f32(self), f32(other)))
+
+    sin(self) -> f16 = f16(sysl_sinf(f32(self)))
+    cos(self) -> f16 = f16(sysl_cosf(f32(self)))
+    tan(self) -> f16 = f16(sysl_tanf(f32(self)))
+    asin(self) -> f16 = f16(sysl_asinf(f32(self)))
+    acos(self) -> f16 = f16(sysl_acosf(f32(self)))
+    atan(self) -> f16 = f16(sysl_atanf(f32(self)))
+    atan2(self, x: f16) -> f16 = f16(sysl_atan2f(f32(self), f32(x)))
+
+    sinh(self) -> f16 = f16(sysl_sinhf(f32(self)))
+    cosh(self) -> f16 = f16(sysl_coshf(f32(self)))
+    tanh(self) -> f16 = f16(sysl_tanhf(f32(self)))
+    asinh(self) -> f16 = f16(sysl_asinhf(f32(self)))
+    acosh(self) -> f16 = f16(sysl_acoshf(f32(self)))
+    atanh(self) -> f16 = f16(sysl_atanhf(f32(self)))
+
+    /** The four roundings are the exception the paragraph above has to admit: their answer is an
+     * integral value, and every integral value an `f16` can hold is one an `f32` holds exactly. So
+     * these are the bodies where the widening provably changes nothing at all, rather than changing
+     * something too small to reach the result.
+     */
+    floor(self) -> f16 = f16(sysl_floorf(f32(self)))
+    ceil(self) -> f16 = f16(sysl_ceilf(f32(self)))
+    round(self) -> f16 = f16(sysl_roundf(f32(self)))
+    trunc(self) -> f16 = f16(sysl_truncf(f32(self)))
+    fmod(self, divisor: f16) -> f16 = f16(sysl_fmodf(f32(self), f32(divisor)))
+
+    abs(self) -> f16 = f16(sysl_fabsf(f32(self)))
+    copysign(self, sign: f16) -> f16 = f16(sysl_copysignf(f32(self), f32(sign)))
+
+    /** The two angle conversions multiply at `f32` rather than at this width, for the reason the
+     * calls above widen: the factor is not an `f16` and forcing it to be one would round it before
+     * the multiplication instead of rounding the product after, which is a worse answer for no gain.
+     */
+    to_radians(self) -> f16 = f16(f32(self) * 0.017453292f32)
+    to_degrees(self) -> f16 = f16(f32(self) * 57.295776f32)
+end f16
+
+/** Bfloat16 -- binary32's range at a quarter of its precision, and the other way sixteen bits can be
+ * divided up.
+ *
+ * **It is not a smaller `f16`, it is a shorter `f32`**, and the difference is the whole reason both
+ * exist. `f16` spends five bits on the exponent and ten on the significand, so it is precise to
+ * about three decimal digits and runs out of range above 65504. `bf16` spends eight and seven: it is
+ * precise to about two digits and reaches 3.4e38, exactly as far as an `f32`, because its bits *are*
+ * an `f32`'s top sixteen. So a value that overflows an `f16` is ordinary here, and a value the two
+ * both hold is held more accurately there.
+ *
+ * Everything the width above says about widening applies unchanged and for the same reason: `f32`
+ * holds every `bf16` exactly, and libm has no entry point at this width either.
+ */
+impl Float for bf16
+    max_value() -> bf16 = 3.3895313892515355e38bf16
+    epsilon() -> bf16 = 0.0078125bf16
+
+    infinity() -> bf16 = 1.0bf16 / 0.0bf16
+    nan() -> bf16 = 0.0bf16 / 0.0bf16
+
+    pi() -> bf16 = 3.141592653589793bf16
+
+    sqrt(self) -> bf16 = bf16(sysl_sqrtf(f32(self)))
+    cbrt(self) -> bf16 = bf16(sysl_cbrtf(f32(self)))
+
+    exp(self) -> bf16 = bf16(sysl_expf(f32(self)))
+    exp2(self) -> bf16 = bf16(sysl_exp2f(f32(self)))
+    ln(self) -> bf16 = bf16(sysl_logf(f32(self)))
+    log2(self) -> bf16 = bf16(sysl_log2f(f32(self)))
+    log10(self) -> bf16 = bf16(sysl_log10f(f32(self)))
+
+    pow(self, exponent: bf16) -> bf16 = bf16(sysl_powf(f32(self), f32(exponent)))
+    hypot(self, other: bf16) -> bf16 = bf16(sysl_hypotf(f32(self), f32(other)))
+
+    sin(self) -> bf16 = bf16(sysl_sinf(f32(self)))
+    cos(self) -> bf16 = bf16(sysl_cosf(f32(self)))
+    tan(self) -> bf16 = bf16(sysl_tanf(f32(self)))
+    asin(self) -> bf16 = bf16(sysl_asinf(f32(self)))
+    acos(self) -> bf16 = bf16(sysl_acosf(f32(self)))
+    atan(self) -> bf16 = bf16(sysl_atanf(f32(self)))
+    atan2(self, x: bf16) -> bf16 = bf16(sysl_atan2f(f32(self), f32(x)))
+
+    sinh(self) -> bf16 = bf16(sysl_sinhf(f32(self)))
+    cosh(self) -> bf16 = bf16(sysl_coshf(f32(self)))
+    tanh(self) -> bf16 = bf16(sysl_tanhf(f32(self)))
+    asinh(self) -> bf16 = bf16(sysl_asinhf(f32(self)))
+    acosh(self) -> bf16 = bf16(sysl_acoshf(f32(self)))
+    atanh(self) -> bf16 = bf16(sysl_atanhf(f32(self)))
+
+    floor(self) -> bf16 = bf16(sysl_floorf(f32(self)))
+    ceil(self) -> bf16 = bf16(sysl_ceilf(f32(self)))
+    round(self) -> bf16 = bf16(sysl_roundf(f32(self)))
+    trunc(self) -> bf16 = bf16(sysl_truncf(f32(self)))
+    fmod(self, divisor: bf16) -> bf16 = bf16(sysl_fmodf(f32(self), f32(divisor)))
+
+    abs(self) -> bf16 = bf16(sysl_fabsf(f32(self)))
+    copysign(self, sign: bf16) -> bf16 = bf16(sysl_copysignf(f32(self), f32(sign)))
+
+    to_radians(self) -> bf16 = bf16(f32(self) * 0.017453292f32)
+    to_degrees(self) -> bf16 = bf16(f32(self) * 57.295776f32)
+end bf16

@@ -1,0 +1,1131 @@
+module sysl.text
+@tests
+
+import sysl.buf.byte_sink
+import sysl.math.Float
+import sysl.rand.rng
+import sysl.unicode.fold
+
+// What `sysl.text` promises, asserted in sysl.
+//
+// These are the clearest case for a library test rather than a Scala one: every claim below is about
+// a string operation and none is about the compiler. `split` on an empty separator, `fields` over
+// runs of blanks, a parse that overflows -- a reader wanting to know what the function does can read
+// the answer here, in the module, rather than in a suite written in another language.
+
+// -- splitting and joining ------------------------------------------------------------------------
+
+@test("split cuts at every separator")
+split_cuts()
+    assert_slice_eq(split("a,b,c", ","), ["a", "b", "c"])
+
+// The empty pieces are the point: `split` reports the gaps it found rather than tidying them away,
+// which is what makes it invertible with `join`.
+@test("split keeps the empty pieces at both ends")
+split_keeps_empties()
+    assert_slice_eq(split(",a,", ","), ["", "a", ""])
+
+@test("a separator that does not occur yields the whole string")
+split_without_separator()
+    assert_slice_eq(split("abc", ","), ["abc"])
+
+@test("a multi-byte separator is matched whole")
+split_multibyte_separator()
+    assert_slice_eq(split("a::b", "::"), ["a", "b"])
+
+// `fields` is the other splitter and is deliberately not `split` on a space: it treats a *run* of
+// blanks as one, and ignores those at the ends, which is what makes it right for a line of input and
+// wrong for a record.
+@test("fields treats a run of blanks as one separator")
+fields_collapses_runs()
+    assert_slice_eq(fields("  a   b  "), ["a", "b"])
+
+@test("fields of nothing but blanks is empty")
+fields_of_blanks()
+    var got = fields("   ")
+
+    assert_eq(got.len, 0)
+
+@test("join puts the separator between and not around")
+join_between()
+    assert_eq(join(["a", "b", "c"], ", "), "a, b, c")
+
+@test("joining one piece is that piece")
+join_single()
+    assert_eq(join(["a"], ", "), "a")
+
+@test("joining nothing is nothing")
+join_empty()
+    var none: []string = []
+
+    assert_eq(join(none, ", "), "")
+
+// The pair that says the two are inverses, which is the property a reader actually relies on.
+@test("split and join undo each other")
+split_join_round_trip()
+    assert_eq(join(split("a,b,,c", ","), ","), "a,b,,c")
+
+// -- rewriting ------------------------------------------------------------------------------------
+
+@test("repeat concatenates n copies")
+repeat_copies()
+    assert_eq(repeat("ab", 3), "ababab")
+
+@test("repeating nothing times is the empty string")
+repeat_zero()
+    assert_eq(repeat("ab", 0), "")
+
+@test("replace_all rewrites every occurrence")
+replace_every()
+    assert_eq(replace_all("a.b.c", ".", "-"), "a-b-c")
+
+// The overlapping case: replacing "aa" in "aaa" finds one match and leaves the odd one, rather than
+// rescanning what it just wrote.
+@test("replace_all does not rescan what it wrote")
+replace_no_rescan()
+    assert_eq(replace_all("aaa", "aa", "b"), "ba")
+
+@test("replacing something absent leaves the string alone")
+replace_absent()
+    assert_eq(replace_all("abc", "z", "y"), "abc")
+
+// Case mapping is Unicode, through `sysl.unicode`.
+//
+// **The mixed string is the case a caller actually meets**, and it is the one worth pinning: a
+// fully general name over a per-character call has to answer for every character, not for the
+// ASCII half of one.
+//
+// What is pinned beyond the accents is that the mapping is the *simple* one, character for
+// character. `ß` uppercases to `ẞ`, the capital sharp s, rather than to the `SS` full casing would
+// give -- a caller who wanted `SS` is comparing two strings, which is `sysl.unicode.fold` and is
+// asserted where it lives.
+@test("case mapping is Unicode, not ASCII")
+case_is_unicode()
+    assert_eq(to_upper("abc"), "ABC")
+    assert_eq(to_lower("ABC"), "abc")
+    assert_eq(to_upper("é"), "É")
+    assert_eq(to_upper("héllo"), "HÉLLO")
+    assert_eq(to_lower("HÉLLO"), "héllo")
+    // The simple uppercase of `ß` is `ẞ` rather than the `SS` full casing would give; `sysl.unicode`
+    // says why, and the case beside this one is the pair that pins it.
+    assert_eq(to_upper("straße"), "STRAẞE")
+    assert_eq(to_upper("ЖУРНАЛ"), "ЖУРНАЛ")
+    assert_eq(to_lower("ЖУРНАЛ"), "журнал")
+
+// A character with no case at all is left alone, which is what makes the walk total: a name, a
+// number and a piece of punctuation all come back as the bytes they arrived as.
+@test("case mapping leaves caseless text alone")
+case_leaves_caseless_text()
+    assert_eq(to_upper("日本語 123!"), "日本語 123!")
+    assert_eq(to_lower("日本語 123!"), "日本語 123!")
+
+// **Lowercasing is not folding**, and this is the pair that says so: `sysl.text`'s case mapping is
+// character for character, so `straße` and `STRASSE` stay different text through it, and
+// `sysl.unicode.fold` is the operation that answers the question a caller comparing them meant.
+// It is asserted here because this is the file that can name both -- `sysl.unicode`'s own tests
+// cannot import `sysl.text` back.
+@test("case mapping is not the comparison key; folding is")
+case_is_not_folding()
+    assert(to_lower("STRASSE") != to_lower("straße"))
+    assert(fold("STRASSE") == fold("straße"))
+
+// -- parsing --------------------------------------------------------------------------------------
+
+@test("an integer parses to its value")
+parse_int_value()
+    assert_eq(parse_int("42").unwrap(), 42)
+    assert_eq(parse_int("-7").unwrap(), -7)
+
+@test("a base is honoured")
+parse_int_base_honoured()
+    assert_eq(parse_int_base("ff", 16).unwrap(), 255)
+    assert_eq(parse_int_base("101", 2).unwrap(), 5)
+
+// Each of these is a *different* way to not be a number, and a parser that answered `0` for any of
+// them would be the classic silent-wrong-answer. The `Result` is what makes each sayable.
+@test("what is not a number is refused rather than guessed at")
+parse_int_refuses()
+    assert(parse_int("").is_err())
+    assert(parse_int("abc").is_err())
+    assert(parse_int("12x").is_err())
+    assert(parse_int(" 12").is_err())
+
+@test("a bool parses from its two spellings and nothing else")
+parse_bool_values()
+    assert(parse_bool("true").unwrap())
+    assert(!parse_bool("false").unwrap())
+    assert(parse_bool("True").is_err())
+    assert(parse_bool("1").is_err())
+
+// Exact rather than approximate, and deliberately so: 1.5 is a dyadic rational and binary64 holds
+// it exactly, so a tolerance here would be hiding a defect rather than allowing for one. It is also
+// why this test does not reach for `assert_approx_eq` -- that lives in `sysl.math`, and a `sysl.text`
+// test has no business pulling a second module in to compare a number that is exact.
+@test("a real parses to its value")
+parse_real_value()
+    assert_eq(parse_real("1.5").unwrap(), 1.5)
+    assert(parse_real("x").is_err())
+
+// -- parsing off a byte slice ---------------------------------------------------------------------
+//
+// The forms a parser actually reaches for, since what one holds is bytes and a span rather than a
+// string. Each of these would have cost a `string` built from the slice to ask through the `string`
+// forms, and the float one a `cstring` copy on top of that.
+
+@test("an integer parses out of the bytes it is already in")
+parse_int_slice()
+    var text = "  42, -7  ".bytes
+
+    assert_eq(parse_int(text[2..<4]).unwrap(), 42)
+    assert_eq(parse_int(text[6..<8]).unwrap(), -7)
+
+@test("a base is honoured on a slice too")
+parse_int_base_slice()
+    var text = "0xff".bytes
+
+    assert_eq(parse_int_base(text[2..<4], 16).unwrap(), 255)
+
+// The slice forms are where the checking happens and the `string` forms are one line over them, so
+// a refusal has to arrive by the same road rather than only from the wrapper.
+@test("a slice that is not a number is refused the same way")
+parse_slice_refuses()
+    var text = "12x".bytes
+
+    assert(parse_int(text[0..<3]).is_err())
+    assert(parse_int(text[0..<0]).is_err())
+    assert(parse_ulong("-1".bytes).is_err())
+
+@test("the unsigned range reads back off a slice")
+parse_ulong_slice()
+    assert_eq(parse_ulong("18446744073709551615".bytes).unwrap(), 18446744073709551615)
+    assert(parse_ulong("18446744073709551616".bytes).is_err())
+
+@test("a bool parses off a slice from its two spellings")
+parse_bool_slice()
+    var text = "true false".bytes
+
+    assert(parse_bool(text[0..<4]).unwrap())
+    assert(!parse_bool(text[5..<10]).unwrap())
+    assert(parse_bool(text[0..<3]).is_err())
+
+// The stack buffer is what the short case uses and the heap what a long one falls back to, so both
+// roads are walked here: the second literal is longer than the buffer and reads to the same value,
+// which is the point -- the fallback must not be a different parse.
+@test("a real parses off a slice, on both sides of the buffer")
+parse_real_slice()
+    var text = "x1.5y".bytes
+    var long_form = "1.500000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "00000000000000000000000000000000000000000000000000000000"
+
+    assert_eq(parse_real(text[1..<4]).unwrap(), 1.5)
+    assert(long_form.len > 128)
+    assert_eq(parse_real(long_form.bytes).unwrap(), 1.5)
+    assert(parse_real(text[0..<5]).is_err())
+
+// -- display width --------------------------------------------------------------------------------
+//
+// The whole reason `columns` exists: a byte count, a character count and a column count are three
+// different numbers, and only the third lays out a table. Each case below is one where two of the
+// three disagree.
+
+@test("ASCII is one column per byte")
+columns_ascii()
+    assert_eq(columns("abc".bytes), 3)
+
+@test("a wide character takes two columns and more than one byte")
+columns_wide()
+    // Three bytes, one character, two columns -- all three numbers different at once.
+    assert_eq(columns("世".bytes), 2)
+
+@test("an accented letter is two bytes and one column")
+columns_accented()
+    // U+00E9 precomposed: one character, two bytes, one column. The narrow case where a byte count
+    // overstates the width, which is the mistake `columns` was written to stop a table making.
+    assert_eq(columns("é".bytes), 1)
+
+// -- UTF-8, both directions -------------------------------------------------------------------------
+//
+// The encoder is `sysl.encode_utf8` rather than one of this module's, and it is asserted here because
+// this is where the decoder it has to agree with lives: a round trip is the only test that catches
+// the two drifting apart.
+
+@test("a character encodes to the bytes its length says")
+encode_widths()
+    var b: [4]u8
+
+    assert_eq(encode_utf8('A', b[0..<4]), 1)
+    assert_eq(b[0], 65)
+
+    assert_eq(encode_utf8('é', b[0..<4]), 2)
+    assert_eq(b[0], 195)
+    assert_eq(b[1], 169)
+
+    assert_eq(encode_utf8('世', b[0..<4]), 3)
+    assert_eq(encode_utf8('\u{1F600}', b[0..<4]), 4)
+end encode_widths
+
+@test("every character round-trips through the encoder and the decoder")
+encode_round_trip()
+    var b: [4]u8
+    var out = str_builder()
+
+    for c in "aé世\u{1F600}".chars
+        var n = encode_utf8(c, b[0..<4])
+
+        // Through the *strict* decoder, so the bytes have to be well-formed and not merely the right
+        // count -- an encoder that dropped a continuation byte would still agree with itself.
+        out.push(from_utf8(b[0..<n]).unwrap())
+
+    assert_eq(out.finish(), "aé世\u{1F600}")
+end encode_round_trip
+
+@test("valid bytes decode lossily to themselves")
+lossy_keeps_valid()
+    assert_eq(from_utf8_lossy("héllo ☃".bytes), "héllo ☃")
+
+// One replacement per ill-formed run, not one per byte: `E2 82` is a euro sign missing its last
+// byte, which Unicode asks be reported as a single U+FFFD.
+@test("a truncated sequence becomes one replacement character")
+lossy_truncated_is_one()
+    var bad: [3]u8 = [97, 226, 130]
+
+    assert_eq(from_utf8_lossy(bad[0..<3]), "a\u{FFFD}")
+
+@test("a byte that can never begin a character is replaced on its own")
+lossy_stray_byte()
+    var bad: [3]u8 = [97, 255, 98]
+
+    assert_eq(from_utf8_lossy(bad[0..<3]), "a\u{FFFD}b")
+
+// The same bytes the strict form refuses, which is the pair that says the two agree about what is
+// text and differ only in what they do about it.
+@test("the strict form refuses what the lossy form repairs")
+lossy_and_strict_agree()
+    var bad: [2]u8 = [97, 255]
+
+    assert(from_utf8(bad[0..<2]).is_err())
+    assert_eq(from_utf8_lossy(bad[0..<2]), "a\u{FFFD}")
+
+// -- a string made in place over bytes ------------------------------------------------------------
+
+// `str_view` is the one conversion that does not copy, so a write through the slice after it is seen
+// by the string -- which is the whole of what it is for, and what `from_utf8_unchecked` beside it
+// does not do.
+@test("str_view sees a write made through the slice after it")
+str_view_sees_writes()
+    var store: []u8 = [0; 8]
+    store[0] = 104
+    store[1] = 105
+
+    val viewed = str_view(store[0..<2])
+    val copied = from_utf8_unchecked(store[0..<2])
+
+    store[1] = 97
+    assert_eq(viewed, "ha")
+    assert_eq(copied, "hi")
+
+// The string's length is the slice's, fixed where it is made, so writing past the end of the view --
+// which is how a buffer grows in place -- leaves the string as it was.
+@test("str_view is as long as the slice it was made from")
+str_view_length_is_fixed()
+    var store: []u8 = [0; 8]
+    store[0] = 111
+    store[1] = 107
+
+    val s = str_view(store[0..<2])
+
+    store[2] = 33
+    assert_eq(s.len, 2)
+    assert_eq(s, "ok")
+    assert_eq(str_view(store[0..<3]), "ok!")
+
+private str_view_of_a_buffer() -> string
+    var store: []u8 = [0; 4]
+    store[0] = 111
+    store[1] = 107
+    str_view(store[0..<2])
+
+private str_view_of_a_frame_array() -> string
+    var a: [2]u8 = [111, 107]
+    str_view(a[0..<2])
+
+// The string holds a share of the slice's owner, so the buffer outlives the function that made it
+// and every other holder. Allocating the same size again afterwards is what would land on its bytes
+// had the share not been taken.
+@test("a str_view keeps its bytes alive after the slice is gone")
+str_view_keeps_the_owner()
+    val s = str_view_of_a_buffer()
+    val t = str_view_of_a_frame_array()
+
+    for i in 0..<1000
+        var churn: []u8 = [120; 4]
+        churn[0] = u8(i % 100)
+
+    assert_eq(s, "ok")
+    assert_eq(t, "ok")
+
+// Every route through a view shares the one owner: a substring of the string, and a string made from
+// a slice of a slice, see the same bytes the first view does.
+@test("a view of a slice of a view sees the same bytes")
+str_view_of_views()
+    var store: []u8 = [0; 6]
+    for i in 0..<6
+        store[i] = u8(97 + i)
+
+    val whole = str_view(store[0..<6])
+    val inner = whole[1..<4]
+    var narrow = store[2..<6]
+    val deep = str_view(narrow[1..<3])
+
+    assert_eq(inner, "bcd")
+    assert_eq(deep, "de")
+
+    store[3] = 90
+    assert_eq(whole, "abcZef")
+    assert_eq(inner, "bcZ")
+    assert_eq(deep, "Ze")
+
+@test("making and dropping views in a loop neither leaks nor frees twice")
+str_view_in_a_loop()
+    var total: usize = 0
+
+    for i in 0..<20000
+        var store: []u8 = [0; 4]
+        store[0] = 97
+        val s = str_view(store[0..<1])
+        total += s.len
+
+    assert_eq(total, 20000)
+
+// -- walking bytes that may not be text -----------------------------------------------------------
+
+// `chars_of` is public and takes any run of bytes, so the walk cannot assume what `from_utf8` would
+// have proved. It used to: `char_width` answers 4 for `0xFF` because that is the row the byte falls
+// in, and decoding four bytes out of a two-byte run read past the end of it and trapped. These are
+// the same ill-formed runs the lossy tests above use, walked one character at a time.
+
+@test("a lead byte promising more than is there ends the walk instead of running off it")
+chars_stop_at_the_end_of_the_bytes()
+    var bad: [2]u8 = [97, 255]
+    var cs = chars_of(bad[0..<2])
+
+    assert_eq(cs.next(), Some('a'))
+    assert_eq(cs.next(), Some('\u{FFFD}'))
+    assert_eq(cs.next(), None)
+end chars_stop_at_the_end_of_the_bytes
+
+@test("a byte that can never begin a character is one replacement, and the walk goes on")
+chars_replace_a_stray_byte()
+    var bad: [3]u8 = [97, 255, 98]
+    var cs = chars_of(bad[0..<3])
+
+    assert_eq(cs.next(), Some('a'))
+    assert_eq(cs.next(), Some('\u{FFFD}'))
+    assert_eq(cs.next(), Some('b'))
+    assert_eq(cs.next(), None)
+end chars_replace_a_stray_byte
+
+// One replacement per maximal ill-formed subsequence, which is the rule `scan_at` reports and the
+// lossy rebuild already follows -- so a euro sign missing its last byte is one character here too.
+@test("a truncated sequence is one character to the walk as well")
+chars_truncated_is_one()
+    var bad: [3]u8 = [97, 226, 130]
+    var cs = chars_of(bad[0..<3])
+
+    assert_eq(cs.next(), Some('a'))
+    assert_eq(cs.next(), Some('\u{FFFD}'))
+    assert_eq(cs.next(), None)
+end chars_truncated_is_one
+
+// The walk and the count read the same table, so they cannot come to disagree about how many
+// characters a run of bad bytes holds -- and neither can the lossy rebuild, which is the third
+// reader of it.
+@test("the count agrees with the walk and with the lossy rebuild")
+chars_count_agrees_with_what_it_yields()
+    var bad: [4]u8 = [97, 255, 226, 130]
+    var cs = chars_of(bad[0..<4])
+    var walked: usize = 0
+
+    loop
+        cs.next() match
+            Some(_) -> walked += 1
+            None -> break
+
+    assert_eq(chars_of(bad[0..<4]).count(), walked)
+    assert_eq(walked, 3)
+    assert_eq(from_utf8_lossy(bad[0..<4]), "a\u{FFFD}\u{FFFD}")
+end chars_count_agrees_with_what_it_yields
+
+@test("peeking at bytes that are not text moves nothing and answers what the walk would")
+chars_peek_over_bad_bytes()
+    var bad: [2]u8 = [255, 98]
+    var cs = chars_of(bad[0..<2])
+
+    assert_eq(cs.peek(), Some('\u{FFFD}'))
+    assert_eq(cs.peek(), Some('\u{FFFD}'))
+    assert_eq(cs.next(), Some('\u{FFFD}'))
+    assert_eq(cs.next(), Some('b'))
+end chars_peek_over_bad_bytes
+
+// The offsets are what say how far a replacement reached: the `E2 82` pair is one character, so the
+// byte after it is at 3 and not at 2.
+@test("char_indices reports where an ill-formed run started and how far it went")
+char_indices_over_bad_bytes()
+    var bad: [4]u8 = [97, 226, 130, 98]
+    var seen = str_builder()
+
+    for (at, c) in char_indices(bad[0..<4])
+        seen.push_int(long(at))
+        seen.push_char(c)
+
+    assert_eq(seen.finish(), "0a1\u{FFFD}3b")
+end char_indices_over_bad_bytes
+
+// The case that is the whole point of the walk being fast: text that is text walks exactly as it
+// did, one character per character, at every width.
+@test("well-formed text is unaffected, at every width")
+chars_over_valid_text()
+    var cs = chars_of("aé世\u{1F600}".bytes)
+
+    assert_eq(cs.next(), Some('a'))
+    assert_eq(cs.next(), Some('é'))
+    assert_eq(cs.next(), Some('世'))
+    assert_eq(cs.next(), Some('\u{1F600}'))
+    assert_eq(cs.next(), None)
+    assert_eq(chars_of("aé世\u{1F600}".bytes).count(), 4)
+end chars_over_valid_text
+
+// -- the shortest rendering of a real ----------------------------------------------------------------
+
+// `display_real_shortest` is the root module's, and its cases are here because what it promises is a
+// **round trip** -- and the other half of that trip is `parse_real`, three hundred lines up this
+// module. A rendering asserted against a literal string says only that this library agrees with
+// itself; asserted against the reader a consumer will use, it says the value survives.
+
+private shortest(x: real) -> string
+    var sink = byte_sink()
+
+    display_real_shortest(x, &sink, FormatSpec(0, -1, false))
+    from_utf8(sink.text()).unwrap()
+
+// The values that matter are the ones a fixed precision breaks in each direction: six digits -- the
+// default, and what `str` shows a person -- loses 3.141592653589793, and seventeen would spell 0.1
+// with noise on the end.
+@test("a real renders at the shortest precision that reads back equal")
+real_renders_shortest()
+    assert_eq(shortest(3.141592653589793), "3.141592653589793")
+    assert_eq(shortest(0.1), "0.1")
+    assert_eq(shortest(0.5), "0.5")
+    assert_eq(shortest(1.0 / 3.0), "0.3333333333333333")
+    assert_eq(shortest(1e23), "1e+23")
+    assert_eq(shortest(0.1 + 0.2), "0.30000000000000004")
+
+// A subnormal's neighbours are far apart, so many short decimals read back as one -- `5e-324`
+// rounded to fifteen digits is `4.94065645841247e-324`, which reads back correctly and is fourteen
+// characters longer than it needs to be. These three each have a true shortest reading well under
+// fifteen digits.
+@test("a subnormal renders at its true shortest, not just what fifteen digits round-trips")
+real_renders_shortest_subnormal()
+    assert_eq(shortest(5e-324), "5e-324")
+    assert_eq(shortest(-5e-324), "-5e-324")
+    assert_eq(shortest(1e-310), "1e-310")
+
+// Near the top of the subnormal range the spacing is as fine as the normal range's, and the two
+// sides of the boundary each need all the digits they have.
+@test("the subnormal-normal boundary needs no shorter reading than fifteen digits already finds")
+real_renders_shortest_at_the_boundary()
+    assert_eq(shortest(2.225073858507201e-308), "2.225073858507201e-308")
+    assert_eq(shortest(2.2250738585072014e-308), "2.2250738585072014e-308")
+
+// The value `str` shows a person, beside the one a document has to carry. They are different
+// renderings of one number on purpose -- six significant digits is a reasonable thing to print and a
+// broken thing to serialize -- and this is the case that says the default did not move.
+@test("and str still renders the six digits a person reads")
+str_is_unchanged()
+    assert_eq(str(3.141592653589793), "3.14159")
+
+// A reading is only as good as the reader that takes it back, so the assertion here is the property
+// itself: 0.1 needs one digit, 1/3 sixteen, and the extremes of the range seventeen.
+private assert_round_trip(x: real)
+    val same = parse_real(shortest(x)) match
+        Ok(back) -> back == x
+        Err(_) -> false
+
+    assert(same, "a real did not survive its own shortest rendering")
+
+@test("every rendering parses back to the value it came from")
+real_round_trips()
+    assert_round_trip(0.1)
+    assert_round_trip(1.0 / 3.0)
+    assert_round_trip(2.0 / 3.0)
+    assert_round_trip(1.7976931348623157e308)
+    assert_round_trip(5e-324)
+    assert_round_trip(-5e-324)
+    assert_round_trip(1e-310)
+    assert_round_trip(2.225073858507201e-308)
+    assert_round_trip(2.2250738585072014e-308)
+    assert_round_trip(3.141592653589793)
+    assert_round_trip(1e23)
+    assert_round_trip(0.1 + 0.2)
+    assert_round_trip(-1234.56789012345)
+    assert_round_trip(0.0)
+    assert_round_trip(-0.0)
+
+// `%g` chooses the exponent form for a value whose plain decimal would be long, and this function
+// makes that choice where `%g` makes it: it decides the digits and nothing else. A `1` with no point
+// in it is the same fact one step smaller -- writing a number a format's reader will take as an
+// integer is that format's problem, not the number's.
+@test("the exponent form and a whole number are left as %g spells them")
+real_keeps_its_form()
+    assert_eq(shortest(1e300), "1e+300")
+    assert_eq(shortest(1.0), "1")
+
+// A value with no decimal reading is spelled the way `%g` spells it rather than with a name this
+// library chose, and that is deliberate: a format that wants `null` here is writing its own syntax.
+@test("an infinity and a NaN are spelled as %g spells them")
+real_non_finite()
+    assert_eq(shortest(real.infinity()), "inf")
+    assert_eq(shortest(-real.infinity()), "-inf")
+    assert_eq(shortest(real.nan()), "nan")
+
+// The digits are the ones JavaScript and Python print -- the fewest that read back, the closest of
+// those, a tie to the even digit -- in `%g`'s spelling around them. Each value below is one a search
+// over `printf` precisions gets wrong or one that sits on an edge of the spelling.
+@test("the digits are the ones JavaScript prints")
+real_digits_are_javascripts()
+    // Below a power of two the neighbour is half as far away, so the sixteen-digit rounding
+    // `...062` does not read back while `...063`, one digit shorter than the exact value, does.
+    assert_eq(shortest(5.9604644775390625e-8), "5.960464477539063e-08")
+    assert_eq(shortest(7.120236347223045e-307), "7.120236347223045e-307")
+    assert_eq(shortest(5.684341886080802e-14), "5.684341886080802e-14")
+    assert_eq(shortest(9.5367431640625e-7), "9.5367431640625e-07")
+
+    assert_eq(shortest(5e-324), "5e-324")
+    assert_eq(shortest(1.5e-323), "1.5e-323")
+    assert_eq(shortest(1.7976931348623157e308), "1.7976931348623157e+308")
+    assert_eq(shortest(0.3), "0.3")
+    assert_eq(shortest(2.0 / 3.0), "0.6666666666666666")
+    assert_eq(shortest(4.35), "4.35")
+    assert_eq(shortest(-2.5e-10), "-2.5e-10")
+    assert_eq(shortest(123456789012345680000.0), "1.2345678901234568e+20")
+    assert_eq(shortest(9007199254740993.0), "9007199254740992")
+    assert_eq(shortest(9223372036854775808.0), "9.223372036854776e+18")
+    assert_eq(shortest(123456789012345.6), "123456789012345.6")
+    assert_eq(shortest(-0.0), "-0")
+    assert_eq(shortest(0.0), "0")
+
+// Where the plain decimal gives way to the exponent: below 1e-4, and at fifteen digits before the
+// point -- or at the digit count, where a reading needs sixteen or seventeen.
+@test("the exponent form starts where %g starts it")
+real_exponent_boundaries()
+    assert_eq(shortest(1e-4), "0.0001")
+    assert_eq(shortest(1e-5), "1e-05")
+    assert_eq(shortest(1e-6), "1e-06")
+    assert_eq(shortest(1e-7), "1e-07")
+    assert_eq(shortest(1e14), "100000000000000")
+    assert_eq(shortest(1e15), "1e+15")
+    assert_eq(shortest(100.0), "100")
+    assert_eq(shortest(1.5), "1.5")
+    assert_eq(shortest(1e21), "1e+21")
+    assert_eq(shortest(1e22), "1e+22")
+
+private real_of_bits(b: u64) -> real
+    var held = b
+    val p: *real = ptr_cast(&held)
+    *p
+
+// Each binade has its own spacing and the one power of two at its foot is where the spacing
+// changes, which is the case a reading most often gets wrong -- so every one of them, subnormal to
+// the largest, both signs.
+@test("every power of two reads back as itself")
+real_powers_of_two_round_trip()
+    var x = 5e-324
+
+    for _ in 0..<2098
+        assert_round_trip(x)
+        assert_round_trip(-x)
+        x *= 2.0
+
+    assert_eq(x, real.infinity())
+
+// The digits in front of the exponent, less leading and trailing zeros.
+private significant_digits(text: string) -> int
+    var first = -1
+    var last = -1
+    var at = 0
+
+    for b in text.bytes
+        if b == u8('e') then break
+        if b >= u8('0') && b <= u8('9')
+            if b != u8('0')
+                if first < 0 then first = at
+                last = at
+            at += 1
+
+    if first < 0 then 0 else last - first + 1
+
+private at_precision(x: real, digits: int) -> string
+    var sink = byte_sink()
+
+    display_real(x, &sink, FormatSpec(0, digits, false))
+    from_utf8(sink.text()).unwrap()
+
+// Ten thousand bit patterns from a fixed-seed generator, every one finite: each rendering reads back
+// as the value, and one digit fewer does not -- the nearest decimal a digit shorter is the only one
+// that could have, so its failing to read back is what says no shorter reading exists.
+@test("random reals read back, and a digit fewer does not")
+real_random_bits_are_shortest()
+    var state: u64 = 20260924
+
+    for _ in 0..<10000
+        state = state * 6364136223846793005 + 1442695040888963407
+        val x = real_of_bits(state)
+
+        if x != x || x == real.infinity() || x == -real.infinity() then continue
+
+        val text = shortest(x)
+        val back = parse_real(text) match
+            Ok(v) -> v == x
+            Err(_) -> false
+
+        assert(back, "a random real did not survive its own shortest rendering")
+        assert(!text.contains("0e"), "a rendering kept a trailing zero")
+
+        val n = significant_digits(text)
+
+        if n > 1
+            val shorter = parse_real(at_precision(x, n - 1)) match
+                Ok(v) -> v == x
+                Err(_) -> false
+
+            assert(!shorter, "a reading one digit shorter also reads back")
+
+// -- trimming a string, which is Unicode, against trimming bytes, which is not ---------------------
+//
+// The two receivers deliberately answer differently and the pair of cases below is the whole of the
+// claim: a `string` is text and a `[]const u8` is not, so the same operation asks a character
+// question of the first and a byte question of the second.
+
+@test("a string trims Unicode whitespace")
+trim_unicode()
+    // A no-break space, an ideographic space and the next-line control: none of them ASCII, all of
+    // them carrying the database's `White_Space` property, which is the set a `string` asks about.
+    assert_eq("\u{a0}\u{3000}hi\u{85}\u{a0}".trim(), "hi")
+
+@test("a string trims the ASCII whitespace too")
+trim_ascii_through_string()
+    // ASCII whitespace is a subset of the Unicode set, so every ASCII input answers here exactly as
+    // it does on the byte receiver -- which is what makes the two receivers a refinement rather than
+    // a disagreement.
+    assert_eq("  hi\t\n".trim(), "hi")
+    assert_eq("  hi  ".trim_start(), "hi  ")
+    assert_eq("  hi  ".trim_end(), "  hi")
+
+@test("a string with nothing to trim is returned whole")
+trim_nothing()
+    assert_eq("hi".trim(), "hi")
+    assert_eq("".trim(), "")
+
+@test("a string of nothing but whitespace trims to nothing")
+trim_everything()
+    assert_eq("\u{a0} \u{3000}".trim(), "")
+
+@test("bytes trim ASCII whitespace and leave the rest")
+trim_bytes_stay_ascii()
+    // The two bytes of a no-break space are 0xc2 0xa0, and neither is a space on its own -- so the
+    // byte receiver takes the trailing ASCII space and leaves the pair, ending at four bytes where
+    // the same text as a `string` trims to two.
+    val s = "\u{a0}hi "
+    var b = s.bytes
+
+    assert_eq(b.trim().len, 4)
+    assert_eq(s.trim().len, 2)
+
+// -- comparing text without regard to case --------------------------------------------------------
+//
+// Every case here is one where folding and lowercasing disagree, which is the whole reason these
+// exist: `to_lower(a) == to_lower(b)` is the spelling everybody reaches for first and it is wrong.
+
+@test("folding compares text lowercasing cannot")
+eq_fold_sharp_s()
+    assert(eq_fold("STRASSE", "straße"))
+    assert(!(to_lower("STRASSE") == to_lower("straße")))
+
+@test("folding decomposes a ligature")
+eq_fold_ligature()
+    assert(eq_fold("ﬁle", "file"))
+
+@test("folding is ordinary case-insensitivity as well")
+eq_fold_ascii()
+    assert(eq_fold("HÉLLO", "héllo"))
+    assert(!eq_fold("hello", "hallo"))
+
+@test("a fold comparison at either end and in the middle")
+fold_prefixes()
+    assert(starts_with_fold("STRASSENBAHN", "straße"))
+    assert(ends_with_fold("die STRASSE", "straße"))
+    assert(contains_fold("eine STRASSE hier", "straße"))
+    assert(!contains_fold("eine STRASSE hier", "gasse"))
+
+// -- columns, counted a cluster at a time ---------------------------------------------------------
+//
+// `columns` and `grapheme_columns` agree about text and disagree about emoji, and each case below
+// names which of the two is right for its input.
+
+@test("a combining mark joins the letter before it")
+cluster_combining()
+    // Both answers are 1: the mark is zero-width per code point as well as being part of the
+    // cluster, so this is the case where the cheap walk is already right.
+    assert_eq(grapheme_columns("e\u{301}".bytes), 1)
+    assert_eq(columns("e\u{301}".bytes), 1)
+
+@test("a flag is two columns")
+cluster_flag()
+    // Two regional indicators, drawn as one flag. The per-code-point sum lands on 2 as well, and by
+    // a different route -- the database rates a lone indicator narrow -- so the cluster rule has to
+    // put it back, or this would answer 1.
+    assert_eq(grapheme_columns("\u{1f1e8}\u{1f1e6}".bytes), 2)
+
+@test("a joined emoji sequence is one glyph, not four")
+cluster_zwj()
+    // Four emoji at two columns each and three joiners at nothing: the per-code-point sum is 8 and
+    // a terminal draws two. This is the case the cluster walk exists for.
+    val family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}"
+
+    assert_eq(grapheme_columns(family.bytes), 2)
+    assert_eq(columns(family.bytes), 8)
+
+@test("a skin tone modifies rather than adding")
+cluster_skin_tone()
+    assert_eq(grapheme_columns("\u{1f44d}\u{1f3fd}".bytes), 2)
+
+@test("a variation selector widens a text-presentation character")
+cluster_presentation()
+    // U+2764 is one column on its own and two when asked to be drawn as an emoji, and what asks is
+    // a code point that measures zero -- so no sum over code points can reach the second answer.
+    assert_eq(columns("\u{2764}".bytes), 1)
+    assert_eq(grapheme_columns("\u{2764}\u{fe0f}".bytes), 2)
+
+@test("cluster columns over ordinary text is the ordinary answer")
+cluster_plain()
+    assert_eq(grapheme_columns("abc".bytes), 3)
+    assert_eq(grapheme_columns("世界".bytes), 4)
+    assert_eq(grapheme_columns("".bytes), 0)
+
+// -- searching, and searching from an offset -------------------------------------------------------
+
+// `_from` is one rule across the whole family and the tests are written to say so: it names a place
+// to START, so the search is over `self[from..]` and the answer is an offset in the whole receiver.
+// A backward `_from` therefore looks at the same suffix as a forward one and differs only in which
+// end it answers from -- which is the half a reader is most likely to guess the other way round.
+
+@test("a search from an offset walks the occurrences without cutting the haystack up")
+searching_from_an_offset()
+    val s = "abcabcabc"
+
+    assert_eq(s.index_of_from("abc", 0).unwrap(), 0)
+    assert_eq(s.index_of_from("abc", 1).unwrap(), 3)
+    assert_eq(s.index_of_from("abc", 4).unwrap(), 6)
+    assert(s.index_of_from("abc", 7).is_none(), "there is no fourth occurrence")
+
+@test("the offsets at the edges answer rather than trapping")
+searching_from_the_edges()
+    val s = "abcabc"
+
+    assert(s.index_of_from("abc", s.len).is_none(), "nothing but the empty needle is at the end")
+    assert(s.index_of_from("abc", s.len + 1).is_none(), "a from past the end is not a position")
+    assert(s.index_of_from("abc", 9999).is_none(), "and neither is one far past it")
+    assert(s.last_index_of_from("abc", 9999).is_none(), "backwards from past the end is the same")
+    assert(s.index_of_byte_from(u8('a'), 9999).is_none(), "and so is the byte search")
+    assert(s.last_index_of_byte_from(u8('a'), 9999).is_none(), "at both ends")
+
+@test("the empty needle is found at from, and at the end going backwards")
+searching_for_nothing()
+    val s = "abcdef"
+
+    assert_eq(s.index_of_from("", 0).unwrap(), 0)
+    assert_eq(s.index_of_from("", 4).unwrap(), 4)
+    assert_eq(s.index_of_from("", s.len).unwrap(), 6)
+    assert(s.index_of_from("", s.len + 1).is_none(), "past the end there is not even nothing")
+    assert_eq(s.last_index_of_from("", 4).unwrap(), 6)
+
+@test("a needle longer than what is left is not there")
+searching_for_too_much()
+    val s = "abcdef"
+
+    assert(s.index_of("abcdefg").is_none(), "longer than the haystack")
+    assert(s.index_of_from("def", 4).is_none(), "longer than what from leaves")
+    assert(s.last_index_of_from("def", 4).is_none(), "and the same backwards")
+
+@test("a needle at the very end is found from either direction")
+searching_at_the_end()
+    val s = "xxxxxxyz"
+
+    assert_eq(s.index_of("yz").unwrap(), 6)
+    assert_eq(s.last_index_of("yz").unwrap(), 6)
+    assert_eq(s.index_of_from("yz", 6).unwrap(), 6)
+    assert_eq(s.last_index_of_from("yz", 6).unwrap(), 6)
+
+@test("the backward search from an offset answers the LAST occurrence in that suffix")
+searching_backwards_from_an_offset()
+    val s = "abcabcabc"
+
+    assert_eq(s.last_index_of_from("abc", 0).unwrap(), 6)
+    assert_eq(s.last_index_of_from("abc", 4).unwrap(), 6)
+    assert(s.last_index_of_from("abc", 7).is_none(), "the suffix from 7 is too short to hold it")
+    assert_eq(s.index_of_byte_from(u8('c'), 3).unwrap(), 5)
+    assert_eq(s.last_index_of_byte_from(u8('c'), 3).unwrap(), 8)
+
+@test("overlapping occurrences are counted the way replace_all finds them")
+counting_overlaps()
+    assert_eq("aaa".count_of("aa"), 1)
+    assert_eq("aaaa".count_of("aa"), 2)
+    assert_eq("aaaaa".count_of("aa"), 2)
+    assert_eq("abababa".count_of("aba"), 2)
+
+// Long enough to be over `sublinear_floor`, which is the whole point: the same four claims asserted
+// on the other side of the threshold, where a different function answers them.
+@test("and the same counts hold over a haystack long enough to shift through")
+counting_overlaps_at_length()
+    var hay: [900]u8
+
+    for i in 0..<hay.len
+        hay[i] = u8('a')
+
+    assert_eq(hay[..].count_of("aa".bytes), 450)
+    assert_eq(hay[..].count_of("aaa".bytes), 300)
+    assert_eq(hay[..].index_of("aaa".bytes).unwrap(), 0)
+    assert_eq(hay[..].last_index_of("aaa".bytes).unwrap(), 897)
+
+// The three references below are written out longhand on purpose. A differential test whose two
+// sides share a helper is a test that cannot fail for the interesting reason, so these share
+// nothing with `find.sysl` -- no `matches_at`, no early break in the inner loop, and the backward
+// one walks FORWARDS keeping the last hit, which is the opposite of what it is checking.
+
+private ref_find(h: []const u8, n: []const u8, from: usize) -> Option[usize]
+    if from > h.len then return None
+    if n.len == 0 then return Some(from)
+
+    var i = from
+
+    while i + n.len <= h.len
+        var ok = true
+        var j: usize = 0
+
+        while j < n.len
+            if h[i + j] != n[j] then ok = false
+
+            j += 1
+
+        if ok then return Some(i)
+
+        i += 1
+
+    None
+end ref_find
+
+private ref_rfind(h: []const u8, n: []const u8, from: usize) -> Option[usize]
+    if from > h.len then return None
+    if n.len == 0 then return Some(h.len)
+
+    var best: Option[usize] = None
+    var i = from
+
+    while i + n.len <= h.len
+        var ok = true
+        var j: usize = 0
+
+        while j < n.len
+            if h[i + j] != n[j] then ok = false
+
+            j += 1
+
+        if ok then best = Some(i)
+
+        i += 1
+
+    best
+end ref_rfind
+
+private ref_count(h: []const u8, n: []const u8) -> usize
+    if n.len == 0 then return 0
+
+    var found: usize = 0
+    var i: usize = 0
+
+    while i + n.len <= h.len
+        var ok = true
+        var j: usize = 0
+
+        while j < n.len
+            if h[i + j] != n[j] then ok = false
+
+            j += 1
+
+        if ok
+            found += 1
+            i += n.len
+        else
+            i += 1
+
+    found
+end ref_count
+
+// The corroboration that could actually fail: two thousand random haystacks over a three-letter
+// alphabet, so that a needle of two to five letters really does occur, at lengths that fall on both
+// sides of `sublinear_floor` -- and a counter asserting the fast path was reached at all, because a
+// differential test that only ever ran the naive scan would agree with itself.
+@test("the sub-linear search answers exactly what a naive scan does, over random inputs")
+horspool_agrees_with_a_naive_scan()
+    var g = rng(20260905, 1)
+    var hay: [640]u8
+    var ned: [8]u8
+    var fast_cases: usize = 0
+    var slow_cases: usize = 0
+    var hits: usize = 0
+
+    for _ in 0..<2000
+        val hlen = usize(g.below(u64(hay.len))) + 1
+        val nlen = usize(g.below(5)) + 1
+
+        for i in 0..<hlen
+            hay[i] = u8(97 + g.below(3))
+
+        for i in 0..<nlen
+            ned[i] = u8(97 + g.below(3))
+
+        val h = hay[0..<hlen]
+        val n = ned[0..<nlen]
+        val from = usize(g.below(u64(hlen) + 2))
+
+        // `from` runs one past the length on purpose, so the subtraction is guarded rather than
+        // assumed -- on a `usize` it would wrap rather than go negative.
+        if nlen >= 2 && from <= hlen && hlen - from >= sublinear_floor
+            fast_cases += 1
+        else
+            slow_cases += 1
+
+        assert_eq(h.index_of_from(n, from), ref_find(h, n, from), "index_of_from")
+        assert_eq(h.last_index_of_from(n, from), ref_rfind(h, n, from), "last_index_of_from")
+        assert_eq(h.count_of(n), ref_count(h, n), "count_of")
+
+        if h.index_of(n).is_some() then hits += 1
+
+    assert(fast_cases > 100, "the sub-linear path was never reached, so nothing was compared")
+    assert(slow_cases > 100, "and the scan below the threshold was never reached either")
+    assert(hits > 100, "the needle was never found, so only the absent case was compared")
+end horspool_agrees_with_a_naive_scan
+
+// -- the 64-bit integer renderings ----------------------------------------------------------------
+//
+// `push_int`, `push_uint`, `display_int` and `display_uint` render with a digit loop of their own
+// (`digits_long`, `digits_ulong`) rather than through `snprintf`, and they promise exactly what
+// `%lld` and `%llu` printed: no padding, and a `-` and nothing else for a sign. The cases are the
+// boundaries a digit loop gets wrong -- zero, each change in digit count, the pair loop's odd tail,
+// and the most negative value, whose magnitude a `long` does not hold.
+
+private pushed(n: long) -> string
+    var b = str_builder()
+    b.push_int(n)
+    b.finish()
+
+private pushed_u(n: ulong) -> string
+    var b = str_builder()
+    b.push_uint(n)
+    b.finish()
+
+private displayed(n: long, fmt: FormatSpec) -> string
+    var sink = byte_sink()
+    display_int(n, &sink, fmt)
+    from_utf8(sink.text()).unwrap()
+
+private displayed_u(n: ulong) -> string
+    var sink = byte_sink()
+    display_uint(n, &sink, FormatSpec(0, -1, false))
+    from_utf8(sink.text()).unwrap()
+
+// Both paths, and the blanket `Display` beside them, which is a separate digit loop and so a check
+// that could disagree.
+private renders_as(n: long, want: string)
+    assert_eq(pushed(n), want)
+    assert_eq(displayed(n, FormatSpec(0, -1, false)), want)
+    assert_eq(s"${n}", want)
+
+@test("a long renders at the small boundaries, in both signs")
+long_renders_small()
+    renders_as(0, "0")
+    renders_as(1, "1")
+    renders_as(-1, "-1")
+    renders_as(9, "9")
+    renders_as(-9, "-9")
+    renders_as(10, "10")
+    renders_as(-10, "-10")
+    renders_as(99, "99")
+    renders_as(-99, "-99")
+    renders_as(100, "100")
+    renders_as(-100, "-100")
+    renders_as(101, "101")
+    renders_as(1005, "1005")
+    renders_as(-10203, "-10203")
+end long_renders_small
+
+// Every digit count from one to nineteen, on each side of each boundary: `10^k - 1` is all nines
+// and `10^k` is a one and zeros, so a loop that drops or doubles a digit at a length shows here.
+@test("a long renders on both sides of every power of ten")
+long_renders_every_digit_count()
+    var p: long = 1
+    var nines = ""
+    var ones = "1"
+
+    for _ in 0..<18
+        val below = p * 10 - 1
+        nines = nines + "9"
+        ones = ones + "0"
+        renders_as(below, nines)
+        renders_as(-below, "-" + nines)
+        renders_as(below + 1, ones)
+        renders_as(-(below + 1), "-" + ones)
+        p *= 10
+
+    renders_as(9223372036854775807, "9223372036854775807")
+    renders_as(-9223372036854775807 - 1, "-9223372036854775808")
+    renders_as(-9223372036854775807, "-9223372036854775807")
+end long_renders_every_digit_count
+
+@test("a ulong renders across its whole range, past where a long stops")
+ulong_renders()
+    assert_eq(pushed_u(0), "0")
+    assert_eq(pushed_u(7), "7")
+    assert_eq(pushed_u(10), "10")
+    assert_eq(pushed_u(9223372036854775808u64), "9223372036854775808")
+    assert_eq(pushed_u(9999999999999999999u64), "9999999999999999999")
+    assert_eq(pushed_u(10000000000000000000u64), "10000000000000000000")
+    assert_eq(pushed_u(18446744073709551615u64), "18446744073709551615")
+    assert_eq(displayed_u(18446744073709551615u64), "18446744073709551615")
+    assert_eq(displayed_u(0), "0")
+
+// The specifier is `display_digits`'s job and untouched by the digit loop; asserted so that the
+// sign the loop now writes is still the one `display_digits` finds and keeps ahead of the zeros.
+@test("a formatted long still pads and zero-fills around its sign")
+long_display_honours_the_spec()
+    assert_eq(displayed(-42, FormatSpec(6, -1, false)), "   -42")
+    assert_eq(displayed(-42, FormatSpec(0, 5, false)), "-00042")
+    assert_eq(displayed(42, FormatSpec(5, -1, true)), "42   ")
+
+// Ten thousand values of every magnitude, each rendered and read back: what comes out must parse to
+// what went in, and must agree byte for byte with the blanket `Display`'s independent loop.
+@test("random longs and ulongs render and read back to themselves")
+integers_round_trip()
+    var g = rng(20260923, 7)
+
+    for i in 0..<10000
+        val bits = g.next_u64() >> usize(g.below(64))
+        val u = ulong(bits)
+        val n = if g.boolean() then long(bits >> 1) else -long(bits >> 1) - long(i & 1)
+        val text = pushed(n)
+
+        assert_eq(parse_long(text).unwrap(), n)
+        assert_eq(text, s"${n}")
+        assert_eq(parse_ulong(pushed_u(u)).unwrap(), u)
+        assert_eq(pushed_u(u), s"${u}")
+end integers_round_trip

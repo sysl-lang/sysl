@@ -10,7 +10,9 @@
 #
 #   scripts/org_build_census.sh <this compiler's binary> [<reference binary>]
 #
-# `SYSL_LIB` must name the standard module's source, as it must for every whole-program sweep.
+# **Each compiler is run against its OWN library.** This compiler takes `SYSL_LIB`, defaulting to this
+# repository's `library/`; the reference takes `SYSL_ORACLE_LIB` where it is set and otherwise runs
+# with `SYSL_LIB` removed from its environment, so it finds the library installed beside it.
 #
 # **The command that answered is printed beside every row**, and that is not decoration: a script
 # that tried `test` and fell back to `build` would print a bare `ok` for a repository whose *suite*
@@ -56,9 +58,17 @@ if [ -z "$ours_bin" ]; then
     exit 2
 fi
 
-if [ -z "$SYSL_LIB" ]; then
-    echo "SYSL_LIB must name the standard module's source" >&2
-    exit 2
+root=$(cd "$(dirname "$0")/.." && pwd)
+
+# Made absolute, since every repository is built from a copy somewhere else.
+SYSL_LIB=$(cd "${SYSL_LIB:-$root/library}" && pwd)
+export SYSL_LIB
+
+# What `env` is handed in front of the reference: its own library named, or ours taken away.
+if [ -n "$SYSL_ORACLE_LIB" ]; then
+    theirs_env="SYSL_LIB=$SYSL_ORACLE_LIB"
+else
+    theirs_env="-u SYSL_LIB"
 fi
 
 case $ours_bin in
@@ -91,7 +101,6 @@ limited() {
     ' "${SYSL_CENSUS_TIMEOUT:-600}" "$@"
 }
 
-root=$(cd "$(dirname "$0")/.." && pwd)
 org=$(dirname "$root")
 work=$(mktemp -d "${TMPDIR:-/tmp}/sysl-org-build.XXXXXX")
 
@@ -313,7 +322,7 @@ for dir in "$org"/*/; do
 
     theirs_ok=0
 
-    ( cd "$theirs" && limited "$theirs_bin" $command $flags ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
+    ( cd "$theirs" && limited env $theirs_env "$theirs_bin" $command $flags ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
 
     # **A board row that stops where the reference stops is a PASS, and the row says so.** The
     # header is one the SDK generates during a CMake configure, so neither compiler can reach it

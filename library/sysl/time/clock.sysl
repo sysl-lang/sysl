@@ -1,0 +1,82 @@
+module sysl.time
+
+// Reading a clock without naming one: the two symbols a program asks for and something else defines.
+//
+// **`sysl.time` cannot read a clock and this file does not change that.** It declares two `extern`s
+// and defines neither, which costs the module nothing -- an `extern` is a name and a signature, so
+// this file asks for no capability and the calendar goes on running on a bare machine. What decides
+// where the numbers come from is what the program is linked against:
+//
+// | linked with | what defines the symbols |
+// |---|---|
+// | a host program | `sysl.posix.time`, over `clock_gettime(2)` |
+// | a board with an RTC chip | a package binding that chip, over whatever bus it is on |
+// | a board with only a tick | the board's own package, over its timer |
+//
+// So the application writes `now()` and names no chip, no package and no capability, and moving the
+// same program between a laptop and a board is a change to `package.hocon` rather than to any line
+// of it.
+//
+// ## Nothing imports the supplier, which is the point and is what the compiler had to learn
+//
+// A consumer that had to `import` whichever module defines these would be naming the chip in its own
+// source, which is the friction this exists to remove. But an `@export` is only a reachability root
+// where the program reaches its module (`reference/ffi.md § @export`), so a supplier nothing imports
+// was pruned -- and the program then failed at the link, naming a symbol no line of it contains.
+//
+// **A function supplying a symbol an `extern` the program calls has declared is a root.** That is the
+// rule `reference/ffi.md § A module may supply another module's extern` states, and it is the
+// accounting an archive member already gets: the definition is taken because something asked the
+// linker for that name, and left out otherwise.
+//
+// ## One supplier per image
+//
+// Two definitions of a symbol is a refusal rather than a link error, because the compiler can see
+// both and name them (`Exports.check`). A program gets exactly one clock, which is what it should
+// get.
+//
+// ## The seam is decided where the DECLARING module is compiled, and that is not always the program
+//
+// **A host build links a prebuilt standard module, and the library was compiled whole** -- so
+// `now`'s body was bound to the library's own supplier at the moment the artifact was built, and a
+// package supplying these symbols in a *later* compilation cannot displace it. On a host you get the
+// host clock, which is what a host program wants and is why one needs no package at all.
+//
+// **Where a board is served, the library has no prebuilt artifact to be bound in**: `sysl build-c`
+// and every freestanding target compile `library/` from source into the program, so the declaration
+// and the supplier meet in one compilation and the package's definition is the one that answers.
+// That is the arrangement this exists for, and it is measured both ways rather than argued -- a
+// `--lib` package supplying the seam is ignored under a prebuilt std and used under a source one.
+//
+// So overriding the clock is a thing a board does and not a thing a host does. A host program that
+// wants a different clock is not asking for a seam; it is asking to call something else.
+//
+// ## Why these are `long` microseconds rather than the library's own types
+//
+// A seam is a **C** symbol, so what crosses it has to be a shape C can spell -- and the narrower
+// reason is that whoever answers it is usually not written in sysl at all. A count of microseconds is
+// the one representation an RTC driver, an SDK and a `clock_gettime` shim can all produce without
+// agreeing about anything else, and the two library types are built from it here where the units are
+// already known.
+private extern "sysl_wall_us" c_wall_us() -> long
+private extern "sysl_monotonic_us" c_mono_us() -> long
+
+/** The wall clock: where whatever is keeping time thinks it is on the timeline.
+ *
+ * **Two readings of this may differ by anything at all**, including a negative amount, because it is
+ * the clock a person and an `ntpd` are both allowed to set. Use it to stamp something, and use
+ * `monotonic` to measure something.
+ *
+ * `sysl.posix.time.now` is the same reading on a host and needs no seam, so a program that is only
+ * ever going to run on one is free to import that instead. What this one buys is that the same source
+ * compiles against a board's clock as well.
+ */
+now() -> Instant = Instant(c_wall_us())
+
+/** A monotonic counter, as a length of time from an origin this deliberately does not name.
+ *
+ * One reading answers nothing. **Two readings subtracted answer how long something took**, and that
+ * is the only question it can be asked. It never goes backwards and nothing can set it, which is the
+ * difference from `now` and the reason a measurement wants this one.
+ */
+monotonic() -> Duration = micros(c_mono_us())

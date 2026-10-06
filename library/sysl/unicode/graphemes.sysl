@@ -1,0 +1,108 @@
+module sysl.unicode
+
+/** Where one *user-perceived character* ends and the next begins, which is a third answer to *how
+ * long is this text* and the one a person would give.
+ *
+ * `"é"` written as `e` and a combining acute is two code points and one grapheme cluster; a flag is
+ * two; a family emoji joined with zero-width joiners is one. A program that moves a cursor, wraps a
+ * line, truncates a field or counts "characters" for a user is asking this question, and every
+ * other measurement in the standard library answers a different one -- `s.len` is bytes and a
+ * `Chars` walk is code points.
+ *
+ * **It walks bytes and answers views onto them, so nothing here allocates.** A cluster is a run of
+ * the input rather than a new string, which is what lets this be used on a caller's buffer and
+ * inside a `no alloc` module; a caller that wants each cluster as a `string` of its own can build
+ * one from the view.
+ *
+ * The decoding is utf8proc's rather than `sysl.text`'s for the same layering reason `unicode.sysl`
+ * walks its own NUL: `sysl.text` imports this module, so this module may not import it back.
+ */
+
+
+private[sysl] extern "utf8proc_iterate" c_iterate(s: *u8, len: isize, out: *i32) -> isize
+private[sysl] extern "utf8proc_grapheme_break_stateful" c_break(a: int, b: int, state: *i32) -> bool
+
+/** A cursor over the grapheme clusters of a run of bytes.
+ *
+ * **The state field is not an optimization and cannot be dropped.** Unicode's segmentation rules are
+ * not a function of two adjacent code points -- a regional indicator pairs with the one before it
+ * only if that one was not already paired, and an emoji sequence's extenders depend on what opened
+ * it -- so the boundary algorithm carries state across the whole string. Two `Graphemes` over the
+ * same bytes started at different offsets may therefore disagree, exactly as restarting a regular
+ * expression halfway through would.
+ */
+struct Graphemes
+    rest: []const u8
+    at: usize
+    state: i32
+
+    /** Where the cursor is, in bytes from the start of the run it was made over -- the same
+     * property `Chars` carries, and for the same reason: a `for` walks a copy, so a program that
+     * needs the offset drives the cursor by hand.
+     */
+    offset -> usize = self.at
+end Graphemes
+
+/** A walk over `b`, which is what a caller holding a `string` reaches as `graphemes_of(s.bytes)`. */
+graphemes_of(b: []const u8) -> Graphemes = Graphemes(b, 0, 0)
+
+/** How many grapheme clusters `b` holds -- what a person would call its length in characters.
+ *
+ * It is a walk, because nothing in the representation knows: the same argument `Chars.count` makes
+ * one level down. What it is worth is that this is the number a field width, a truncation and a
+ * cursor step should all be counted in.
+ */
+grapheme_count(b: []const u8) -> usize
+    var g = graphemes_of(b)
+    var n: usize = 0
+
+    for _ in g do n += 1
+
+    n
+end grapheme_count
+
+impl Iterate for Graphemes
+    type Item = []const u8
+
+    /** The next cluster, as a view onto the bytes this cursor was made over.
+     *
+     * The loop reads one code point ahead of where it will stop: a boundary is a property of a
+     * *pair*, so the cluster ends at the first pair the algorithm breaks between, and the second
+     * half of that pair belongs to the cluster after this one.
+     */
+    next(*self) -> Option[[]const u8]
+        if self.at >= self.rest.len then return None
+
+        val start = self.at
+        var prev: i32 = 0
+        var here = self.at
+
+        loop
+            var cp: i32 = 0
+            val used = c_iterate(&self.rest[here], isize(self.rest.len - here), &cp)
+
+            // A negative answer is malformed UTF-8, which a `string` cannot hold and a caller's
+            // arbitrary bytes can. It is a cluster of its own rather than the tail of the one being
+            // gathered -- a byte that is not a character cannot be part of one -- so a bad byte
+            // reached partway through ends the cluster *before* it and is taken by the next call.
+            // That is `Chars`' answer one level down, where each bad byte is one replacement
+            // character rather than being folded into its neighbour.
+            if used <= 0 then
+                self.at = if here > start then here else here + 1
+                break
+
+            if here > start && c_break(int(prev), int(cp), &self.state) then
+                self.at = here
+                break
+
+            prev = cp
+            here += usize(used)
+
+            if here >= self.rest.len then
+                self.at = here
+                break
+        end loop
+
+        Some(self.rest[start..<self.at])
+    end next
+end Graphemes

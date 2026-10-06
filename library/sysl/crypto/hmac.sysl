@@ -1,0 +1,140 @@
+module sysl.crypto
+@no_alloc
+
+import sysl.slices.copy
+
+// HMAC over any of the five, written once.
+//
+// The interesting part is not the construction — two hashes and two pads — but what it takes to
+// say "a hash function" here. A trait would be the obvious way, and it is the wrong one: an
+// implementation would have to hand back a *new* hasher, and a bound cannot promise a value any
+// more than it can promise a constant. What works instead is that a hasher is an ordinary struct,
+// so a started one is a value, and copying it is starting another. `proto` is that value, and the
+// three hashes below are three copies of it.
+
+// The tag is written into storage the caller owns, which is the same shape `Sha.finish` has and the
+// same reason: an HMAC is a fixed number of bytes the caller almost always already has somewhere to
+// put, and a function that allocated one would put this module behind an allocator for no gain.
+// **Generic over the compression rather than over the word width**, which is what lets one
+// implementation serve SHA-1 as well as the four SHA-2 digests: they compress differently and are
+// keyed identically, and `Compression` is the axis they differ on.
+// A keyed hash in progress: both halves of the construction, each with its pad already in it.
+//
+// **It is a value, so copying one is keying another with the same key** — which is the same thing
+// `Sha` promises one line down the module and is what makes a derivation affordable. PBKDF2 runs
+// tens of thousands of HMACs under one password, and the pad work is a hash of a block each way;
+// keying once and copying per iteration halves the work rather than being a micro-optimization.
+//
+// It is also what lets a message arrive in **pieces**, which is the whole reason it exists as a
+// type: `sysl.crypto`'s derivations hash a salt and a counter, or a chaining block and a label and
+// a counter, and a one-shot `hmac` cannot say that without a parameter per piece.
+private[crypto] struct Hmac[C: Compression]
+    private inner: Sha[C]
+    private outer: Sha[C]
+
+    update(*self, data: []const u8) = self.inner.update(data)
+
+    finish(*self, tag: []u8) -> Result[unit, Fault]
+        var n = self.inner.dlen
+        var id: [64]u8
+
+        if tag.len < n then return Err(DigestTooSmall)
+
+        self.inner.finish(id[0..<n])?
+        self.outer.update(id[0..<n])
+        self.outer.finish(tag[0..<n])
+end Hmac
+
+// The key schedule: a key longer than a block is replaced by its own digest, a shorter one is padded
+// with zeroes, and the two pads go into the two hashers.
+private[crypto] keyed[C: Compression](proto: Sha[C], key: []const u8) -> Result[Hmac[C], Fault]
+    var bs = C.block_bytes()
+    var n = proto.dlen
+
+    if n == 0 then return Err(NotStarted)
+
+    var k: [128]u8
+
+    if key.len > bs
+        var h = proto
+        var kd: [64]u8
+
+        h.update(key)
+        h.finish(kd[0..<n])?
+
+        copy(k[..], kd[0..<n])
+    else
+        copy(k[..], key)
+
+    var ipad: [128]u8
+    var opad: [128]u8
+
+    for i in 0..<bs
+        ipad[i] = k[i] ^ 0x36
+        opad[i] = k[i] ^ 0x5c
+
+    var inner = proto
+    var outer = proto
+
+    inner.update(ipad[0..<bs])
+    outer.update(opad[0..<bs])
+
+    Ok(Hmac(inner, outer))
+end keyed
+
+private[crypto] hmac[C: Compression](proto: Sha[C], key: []const u8, msg: []const u8,
+        tag: []u8) -> Result[unit, Fault]
+    var h = keyed(proto, key)?
+
+    h.update(msg)
+    h.finish(tag)
+
+/** HMAC-MD5, answering a sixteen-byte tag. A key longer than a block is replaced by its own digest;
+ * a shorter one is padded with zeroes.
+ *
+ * **The same weaker warning `hmac1` carries applies here, and for the same reason.** HMAC's security
+ * does not rest on the hash being collision resistant, so HMAC-MD5 is not broken the way `md5` is --
+ * RFC 6151 says as much, while advising against it for anything new. It is here for what already
+ * asks: HTTP Digest with `qop`, CRAM-MD5, and RADIUS, none of which lets a client choose. A protocol
+ * being written now wants `hmac256`.
+ */
+hmacmd5(key: []const u8, msg: []const u8) -> [16]u8
+    var tag: [16]u8
+    hmac(new_md5().inner, key, msg, tag[0..<16]).expect("a tag buffer sized from the hasher itself")
+    tag
+
+/** HMAC-SHA-1, answering a twenty-byte tag. A key longer than a block is replaced by its own
+ * digest; a shorter one is padded with zeroes.
+ *
+ * **This is a weaker warning than `sha1` carries, and deliberately so.** HMAC's security does not
+ * rest on the hash being collision resistant, so HMAC-SHA-1 is not broken the way SHA-1 is -- which
+ * is why RFC 6238 still specifies it as TOTP's default and why a great deal of deployed request
+ * signing still uses it. It is here to talk to those. A protocol being written now wants `hmac256`.
+ */
+hmac1(key: []const u8, msg: []const u8) -> [20]u8
+    var tag: [20]u8
+    hmac(new_sha1().inner, key, msg, tag[0..<20]).expect("a tag buffer sized from the hasher itself")
+    tag
+
+// HMAC over each of the four SHA-2 digests, answering a tag the size of that digest.
+//
+// A key longer than a block is replaced by its own digest; a shorter one is padded with zeroes.
+hmac224(key: []const u8, msg: []const u8) -> [28]u8
+    var tag: [28]u8
+    hmac(new_sha224().inner, key, msg, tag[0..<28]).expect("a tag buffer sized from the hasher itself")
+    tag
+
+hmac256(key: []const u8, msg: []const u8) -> [32]u8
+    var tag: [32]u8
+    hmac(new_sha256().inner, key, msg, tag[0..<32]).expect("a tag buffer sized from the hasher itself")
+    tag
+
+hmac384(key: []const u8, msg: []const u8) -> [48]u8
+    var tag: [48]u8
+    hmac(new_sha384().inner, key, msg, tag[0..<48]).expect("a tag buffer sized from the hasher itself")
+    tag
+
+hmac512(key: []const u8, msg: []const u8) -> [64]u8
+    var tag: [64]u8
+    hmac(new_sha512().inner, key, msg, tag[0..<64]).expect("a tag buffer sized from the hasher itself")
+    tag

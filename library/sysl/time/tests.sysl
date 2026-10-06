@@ -1,0 +1,503 @@
+module sysl.time
+@tests
+
+// What `sysl.time` computes, asserted in sysl.
+//
+// Calendar arithmetic is the strongest case in the library for tests written here rather than in
+// Scala: every claim is a fact about the Gregorian calendar, the answers are constants a reader can
+// check against a wall calendar, and none of it is about the compiler. A `days_from_civil` that had
+// drifted by a day would be caught by a date whose weekday everybody knows, and by nothing else.
+
+// -- the civil <-> serial round trip ---------------------------------------------------------------
+//
+// The whole of the date machinery rests on Howard Hinnant's `days_from_civil`, which is a closed
+// form rather than a table -- so the way it fails is by being off by one somewhere far from the
+// epoch, in a leap year, or across a century boundary. Each case below is one of those places.
+
+@test("the epoch is day zero")
+epoch_is_zero()
+    assert_eq(date_at(1970, 1, 1).day, 0)
+
+@test("a date and its serial round-trip")
+civil_round_trip()
+    var d = date_at(2026, 8, 6)
+
+    assert_eq(year_of(d), 2026)
+    assert_eq(month_of(d), 8)
+    assert_eq(day_of(d), 6)
+end civil_round_trip
+
+// Before the epoch the serial goes negative, which is where a formula using truncating division
+// instead of flooring division comes apart -- `floor_div` exists for exactly this.
+@test("a date before the epoch round-trips too")
+before_epoch_round_trip()
+    var d = date_at(1900, 2, 28)
+
+    assert(d.day < 0)
+    assert_eq(year_of(d), 1900)
+    assert_eq(month_of(d), 2)
+    assert_eq(day_of(d), 28)
+end before_epoch_round_trip
+
+// -- leap years ------------------------------------------------------------------------------------
+//
+// The three rules, each with the case that distinguishes it from the rule above. 1900 and 2000 are
+// the pair that matters: both divisible by 100, and only one of them a leap year.
+
+@test("the divisible-by-four rule")
+leap_by_four()
+    assert(leap_year(2024))
+    assert(!leap_year(2023))
+
+@test("the century exception, and the exception to it")
+leap_centuries()
+    assert(!leap_year(1900))
+    assert(leap_year(2000))
+
+@test("February has the day only in a leap year")
+february_length()
+    assert_eq(days_in_month(2024, 2), 29)
+    assert_eq(days_in_month(2023, 2), 28)
+    assert_eq(days_in_month(1900, 2), 28)
+    assert_eq(days_in_month(2000, 2), 29)
+
+@test("the other months do not vary")
+month_lengths()
+    assert_eq(days_in_month(2023, 1), 31)
+    assert_eq(days_in_month(2023, 4), 30)
+    assert_eq(days_in_month(2023, 12), 31)
+
+// The 29th of February exists as a date only in a leap year, and the serial round trip is what says
+// so -- a formula that admitted it in 2023 would answer with the 1st of March.
+@test("the leap day round-trips in a leap year")
+leap_day_round_trip()
+    var d = date_at(2024, 2, 29)
+
+    assert_eq(month_of(d), 2)
+    assert_eq(day_of(d), 29)
+
+// `checked_date` is the other constructor, and what these cases pin is the pair rather than either
+// half: `date_at` must go on answering for a date the calendar does not have, because a walk depends
+// on the arithmetic, and `checked_date` must refuse the same input.
+@test("an impossible date is a day count to date_at and None to checked_date")
+checked_date_refuses()
+    assert_eq(month_of(date_at(2026, 2, 30)), 3)
+    assert_eq(day_of(date_at(2026, 2, 30)), 2)
+
+    assert(checked_date(2026, 2, 30).is_none())
+    assert(checked_date(2023, 2, 29).is_none())
+
+@test("and it takes the leap day in a leap year")
+checked_date_takes_the_leap_day()
+    checked_date(2024, 2, 29) match
+        Some(d) ->
+            assert_eq(month_of(d), 2)
+            assert_eq(day_of(d), 29)
+        None -> assert(false, "the 29th of February 2024 was refused")
+
+// Each bound of each field, on both sides, since an off-by-one in either test is the way this
+// function fails: a month of 12 and a day of 31 are legal and a month of 13 and a 31st of April are
+// not.
+@test("the month and the day are checked at their bounds")
+checked_date_bounds()
+    assert(checked_date(2026, 0, 1).is_none())
+    assert(checked_date(2026, 13, 1).is_none())
+    assert(checked_date(2026, 1, 0).is_none())
+    assert(checked_date(2026, 4, 31).is_none())
+
+    assert(checked_date(2026, 1, 1).is_some())
+    assert(checked_date(2026, 12, 31).is_some())
+    assert(checked_date(2026, 4, 30).is_some())
+
+// A year outside anything a calendar prints is still a year, because the proleptic Gregorian
+// calendar has no first or last one -- so the check is of the month and the day and of nothing else.
+@test("the year is not bounded")
+checked_date_year_is_open()
+    assert(checked_date(-4712, 1, 1).is_some())
+    assert(checked_date(99999, 12, 31).is_some())
+
+// -- day of year and weekday ------------------------------------------------------------------------
+
+@test("the day of the year counts from one")
+day_of_year_counts()
+    assert_eq(day_of_year(date_at(2023, 1, 1)), 1)
+    assert_eq(day_of_year(date_at(2023, 12, 31)), 365)
+    assert_eq(day_of_year(date_at(2024, 12, 31)), 366)
+
+// The first of March is where the leap day has already happened or has not, so it is the one date
+// whose ordinal says which kind of year it is in. A count that ignored February's real length would
+// give the same answer for both.
+@test("and the leap day shifts every ordinal after it")
+day_of_year_shifts_after_the_leap_day()
+    assert_eq(day_of_year(date_at(2026, 3, 1)), 60)
+    assert_eq(day_of_year(date_at(2024, 3, 1)), 61)
+
+// The epoch was a Thursday. That single fact is what anchors the weekday computation, and it is
+// checkable against any calendar, which is what makes it worth asserting rather than deriving.
+@test("the epoch was a Thursday")
+epoch_weekday()
+    assert_eq(weekday_name(weekday(date_at(1970, 1, 1))), "Thursday")
+
+@test("and the weekday advances with the date")
+weekday_advances()
+    assert_eq(weekday_name(weekday(date_at(1970, 1, 2))), "Friday")
+    assert_eq(weekday_name(weekday(date_at(1970, 1, 4))), "Sunday")
+
+// -- durations ---------------------------------------------------------------------------------------
+//
+// A duration is microseconds under the surface, and the pair of accessors is where that shows: the
+// `whole_*` family says how many of a unit fit in the whole span, and `odd_*` says what is left over
+// after the unit above it. Asserting only one of the two would leave a `%` and a `/` swapped.
+
+@test("the units convert as they say")
+duration_units()
+    assert_eq(whole_seconds(minutes(2)), 120)
+    assert_eq(whole_minutes(hours(3)), 180)
+    assert_eq(whole_hours(days(2)), 48)
+
+// The two short units, which are the ones no other constructor can spell: 120 milliseconds rounds to
+// nothing in `seconds`, and it is the length an embedded program most often means.
+@test("the sub-second units are lengths the second cannot state")
+duration_short_units()
+    assert_eq(whole_millis(millis(120)), 120)
+    assert_eq(whole_micros(millis(1)), 1000)
+    assert_eq(whole_micros(micros(7)), 7)
+
+    // The discriminating pair: it is a hundred and twenty milliseconds and it is zero seconds.
+    assert_eq(whole_seconds(millis(120)), 0)
+end duration_short_units
+
+@test("the whole count and the odd remainder are different questions")
+duration_whole_and_odd()
+    var d = seconds(3661)
+
+    assert_eq(whole_hours(d), 1)
+    assert_eq(odd_minutes(d), 1)
+    assert_eq(odd_seconds(d), 1)
+
+    // The discriminating pair: 3661 seconds is one hour, but it is also 3661 seconds.
+    assert_eq(whole_seconds(d), 3661)
+end duration_whole_and_odd
+
+// The same distinction at two more magnitudes, where a `/` and a `%` swapped would still give a
+// plausible-looking pair. Three and a half hours is 210 minutes whole and 30 minutes odd; fifty
+// hours is two days whole and two hours odd.
+@test("at every unit, and across the one above it")
+duration_whole_and_odd_across_units()
+    var d = hours(3) + minutes(30)
+
+    assert_eq(whole_minutes(d), 210)
+    assert_eq(odd_minutes(d), 30)
+
+    assert_eq(whole_days(hours(50)), 2)
+    assert_eq(odd_hours(hours(50)), 2)
+end duration_whole_and_odd_across_units
+
+@test("the span between two instants is their difference")
+duration_since()
+    var start = from_offset(datetime_at(2026, 1, 1, 0, 0, 0), Offset(0))
+    var later = from_offset(datetime_at(2026, 1, 1, 1, 0, 0), Offset(0))
+
+    assert_eq(whole_minutes(since(later, start)), 60)
+
+// Both rows of `Sub` on `Instant`, which are told apart by the type of the right operand and
+// nothing else: one lands further along the timeline and answers an `Instant`, the other measures
+// across it and answers a `Duration`.
+@test("subtracting two instants is a duration, and subtracting a duration is an instant")
+instant_sub_selects_on_the_right_operand()
+    var start = from_offset(datetime_at(2026, 1, 1, 0, 0, 0), Offset(0))
+    var later = start + hours(3)
+
+    assert_eq(whole_hours(later - start), 3)
+    assert_eq(whole_hours(start - later), -3)
+    assert_eq(whole_hours(since(later, start)), 3)
+    assert(later - hours(3) == start)
+end instant_sub_selects_on_the_right_operand
+
+@test("a weekday names itself")
+weekday_names_itself()
+    assert_eq(weekday_name(Sunday), "Sunday")
+    assert_eq(weekday_name(Wednesday), "Wednesday")
+    assert_eq(weekday_name(weekday(date_at(1970, 1, 1))), "Thursday")
+
+// -- parsing ------------------------------------------------------------------------------------------
+
+@test("a date parses from its written form")
+parse_date_value()
+    var d = parse_date("2026-08-06").unwrap()
+
+    assert_eq(year_of(d), 2026)
+    assert_eq(month_of(d), 8)
+    assert_eq(day_of(d), 6)
+end parse_date_value
+
+// A date that is well-formed and does not exist is the interesting refusal -- the shape is right and
+// only the calendar says no, which a parser checking syntax alone would let through.
+//
+// **The message is asserted, not just the refusal.** A parser that answered "day is out of range" to
+// a bad month would be refusing the right inputs for the wrong reason, and `is_err()` cannot see the
+// difference.
+@test("a date that the calendar does not have is refused, and says which field")
+parse_date_refuses_impossible()
+    assert_eq(str(parse_date("2026-02-30").unwrap_err()), "day is out of range")
+    assert_eq(str(parse_date("2024-02-30").unwrap_err()), "day is out of range")
+    assert_eq(str(parse_date("2026-13-01").unwrap_err()), "month is out of range")
+
+// The leap day accepted in the year that has one and refused in the year that does not, which is
+// what says the check reads February's real length rather than a constant 29 or 28.
+@test("while the leap day is a date exactly when it is one")
+parse_leap_day()
+    assert(parse_date("2024-02-29").is_ok())
+    assert(!parse_date("2026-02-29").is_ok())
+
+@test("and so is one that is not a date at all")
+parse_date_refuses_malformed()
+    assert(parse_date("").is_err())
+    assert(parse_date("2026-08").is_err())
+    assert(parse_date("today").is_err())
+
+@test("a time parses from its written form")
+parse_time_value()
+    var t = parse_time("13:45:07").unwrap()
+
+    assert_eq(hour_of(t), 13)
+    assert_eq(minute_of(t), 45)
+    assert_eq(second_of(t), 7)
+end parse_time_value
+
+@test("an hour the clock does not have is refused, and says which field")
+parse_time_refuses()
+    assert_eq(str(parse_time("24:00").unwrap_err()), "hour is out of range")
+    assert_eq(str(parse_time("12:60").unwrap_err()), "minute is out of range")
+    assert_eq(str(parse_time("12:00:60").unwrap_err()), "second is out of range")
+
+@test("the leap-year rules, as a predicate and as a month length")
+leap_year_predicate_and_length()
+    assert(leap_year(2000))
+    assert(!leap_year(1900))
+    assert(leap_year(2024))
+    assert(!leap_year(2023))
+
+    assert_eq(days_in_month(2000, 2), 29)
+    assert_eq(days_in_month(1900, 2), 28)
+end leap_year_predicate_and_length
+
+// The units, which are the whole family rather than the two that would have been enough: a property
+// that returned the wrong constant would be caught by exactly one of these and by none of the
+// others, since every one of them is a different multiplier.
+@test("a duration is written number-first, in every unit there is")
+unit_properties()
+    assert_eq(whole_micros(5.us), 5)
+    assert_eq(whole_millis(5.ms), 5)
+    assert_eq(whole_seconds(5.s), 5)
+    assert_eq(whole_minutes(5.minutes), 5)
+    assert_eq(whole_hours(5.hours), 5)
+    assert_eq(whole_days(5.days), 5)
+end unit_properties
+
+// The block is written over the whole integer family, so a receiver narrower than `int` has to
+// widen on the way in rather than overflow at its own width: 200 milliseconds is 200,000 microseconds,
+// which does not fit the `u8` the receiver was.
+@test("a unit property reads a receiver narrower than the representation")
+unit_properties_widen()
+    val n: u8 = 200
+
+    assert_eq(whole_millis(n.ms), 200)
+    assert_eq(whole_micros(n.ms), 200000)
+
+@test("and one wider than a plain literal, at the top of what a duration reaches")
+unit_properties_wide_receiver()
+    val n: long = 100000
+
+    assert_eq(whole_days(n.days), 100000)
+
+// Scaling reads both ways round, and the count is an ordinary literal rather than something that has
+// to be told it is a `long` -- which is what `impl Mul[long] for Duration` and the blanket beside it
+// say between them. The blanket covers every integer width, so the left-hand side is not limited to
+// the two a pair of written-out blocks would have reached.
+@test("a duration scales by a count, on either side")
+duration_scales()
+    var d = 250.ms
+    val n: long = 3
+
+    assert_eq(whole_millis(d * 3), 750)
+    assert_eq(whole_millis(d * n), 750)
+    assert_eq(whole_millis(3 * d), 750)
+    assert_eq(whole_millis(n * d), 750)
+
+    // Any width on the left, which is what one block over the family buys over a block per width:
+    // `int` and `long` are what two written-out blocks would have reached, and these are not.
+    var w: u8 = 3
+    var h: i16 = 3
+
+    assert_eq(whole_millis(w * d), 750)
+    assert_eq(whole_millis(h * d), 750)
+
+    // And an integer's own multiplication is still the compiler's, which is the thing the block
+    // above would have taken had it been filed under the plain member name.
+    assert_eq(5.mul(2), 10)
+
+    d *= 4
+    assert_eq(whole_seconds(d), 1)
+end duration_scales
+
+// The arithmetic the module has always had, which nothing here exercised until now: a duration adds
+// to itself, subtracts, negates and orders.
+@test("durations add, subtract, negate and order")
+duration_arithmetic()
+    val a = 90.minutes
+    val b = 30.minutes
+
+    assert_eq(whole_minutes(a + b), 120)
+    assert_eq(whole_minutes(a - b), 60)
+    assert_eq(whole_minutes(-b), -30)
+    assert(b < a)
+    assert(a == 90.minutes)
+end duration_arithmetic
+
+// An instant moves by a duration and two of them measure the gap between, which is the one place the
+// two types meet -- and `since` is the same subtraction under a name that says which end is which.
+@test("an instant moves by a duration, and two instants make one")
+instant_and_duration()
+    val t = Instant(0)
+    val later = t + 2.hours
+
+    assert_eq(whole_hours(later - t), 2)
+    assert_eq(whole_hours(since(later, t)), 2)
+    assert_eq(whole_hours(later - 1.hours - t), 1)
+end instant_and_duration
+
+// -- resolving a wall clock reading against a zone --------------------------------------------------
+//
+// **These need no host and no table, which is the point of `resolve` taking the zone as a function.**
+// The zone below is US Eastern in 2023, written as the two instants at which its clocks moved, and
+// every expected value is a number a reader can check by hand against those two.
+//
+// It is also the axis `guide/datetime` used to own before card 0213 retired it: a reading is usually
+// one instant, sometimes none, and sometimes two. That program spent 8,760 hourly round trips per
+// zone proving it; six transitions' worth of readings prove the same thing, because the answer only
+// ever changes within hours of a transition.
+
+// US Eastern in 2023: `-04:00` between the two moments its clocks moved and `-05:00` outside them.
+// Those moments are 2023-03-12T07:00:00Z and 2023-11-05T06:00:00Z -- the transitions are named in UTC
+// because that is the only reading of them that is not itself ambiguous.
+private eastern_2023(t: Instant) -> Offset
+    val dst_from: long = 1678604400 * us_per_second
+    val dst_until: long = 1699164000 * us_per_second
+
+    if t.us >= dst_from && t.us < dst_until then Offset(-240) else Offset(-300)
+
+// A zone that never moves its clocks, at an offset that is not a whole number of hours.
+private kathmandu(t: Instant) -> Offset = Offset(345)
+
+@test("an ordinary reading resolves to exactly one instant")
+zone_resolves_uniquely()
+    val r = resolve(datetime_at(2023, 6, 15, 12, 0, 0), eastern_2023)
+
+    r match
+        Unique(at) -> assert_eq(at.us, 1686844800 * us_per_second)
+        _ -> assert(false, "a June reading did not resolve to one instant")
+end zone_resolves_uniquely
+
+@test("the hour the clocks go back happens twice, and both instants are answered")
+zone_resolves_ambiguously()
+    val r = resolve(datetime_at(2023, 11, 5, 1, 30, 0), eastern_2023)
+
+    r match
+        Ambiguous(earlier, later) ->
+            // 05:30Z, with the clocks still at -04:00, and 06:30Z with them at -05:00. The host's own
+            // `mktime` answers the second of these and says nothing about the first.
+            assert_eq(earlier.us, 1699162200 * us_per_second)
+            assert_eq(later.us, 1699165800 * us_per_second)
+        _ -> assert(false, "the repeated hour did not resolve to two instants")
+end zone_resolves_ambiguously
+
+@test("the hour the clocks skip never happened, and the offsets either side say so")
+zone_resolves_to_a_gap()
+    val r = resolve(datetime_at(2023, 3, 12, 2, 30, 0), eastern_2023)
+
+    r match
+        Gap(before, after) ->
+            assert_eq(before.minutes, -300)
+            assert_eq(after.minutes, -240)
+        _ -> assert(false, "the skipped hour resolved to an instant")
+end zone_resolves_to_a_gap
+
+@test("a reading either side of a transition is ordinary, however close it is")
+zone_edges_are_unique()
+    // One minute before the clocks go back, and one minute after they finish going back. Both are
+    // inside the day the transition happens and neither is ambiguous.
+    val before = resolve(datetime_at(2023, 11, 5, 0, 59, 0), eastern_2023)
+    val after = resolve(datetime_at(2023, 11, 5, 2, 0, 0), eastern_2023)
+
+    before match
+        Unique(at) -> assert_eq(at.us, (1699164000 - 3660) * us_per_second)
+        _ -> assert(false, "00:59 was not unique")
+
+    after match
+        Unique(at) -> assert_eq(at.us, (1699164000 + 3600) * us_per_second)
+        _ -> assert(false, "02:00 was not unique")
+end zone_edges_are_unique
+
+@test("a zone that never moves its clocks answers every reading exactly once")
+zone_without_transitions()
+    val ldt = datetime_at(2026, 3, 12, 2, 30, 0)
+
+    resolve(ldt, kathmandu) match
+        // Round-tripped rather than compared against a constant, because what is being asserted is
+        // that a fixed zone is total -- the arithmetic of +05:45 is `at_offset`'s business and is
+        // asserted there.
+        Unique(at) -> assert(at_offset(at, Offset(345)) == ldt)
+        _ -> assert(false, "a zone with no transitions did not resolve uniquely")
+end zone_without_transitions
+
+// Every half hour for three hours either side of a transition, which is the only stretch where the
+// answer can be anything but `Unique` -- so a sweep of the whole year would assert the same three
+// facts 17,500 times over.
+private assert_round_trips(x: long)
+    var t = Instant(x - 3 * us_per_hour)
+
+    while t.us <= x + 3 * us_per_hour
+        // The reading a clock in that zone was showing at `t`. Resolving it must find `t` again --
+        // as the only answer, or as one of the two where the clocks had gone back. It can never be a
+        // gap, because a reading taken *from* an instant is one a clock did show.
+        val ldt = at_offset(t, eastern_2023(t))
+
+        val found = resolve(ldt, eastern_2023) match
+            Unique(at) -> at == t
+            Ambiguous(earlier, later) -> earlier == t || later == t
+            Gap(before, after) -> false
+
+        assert(found, "an instant did not survive its own wall clock reading")
+
+        t = t + 30.minutes
+end assert_round_trips
+
+@test("an instant near a transition survives the round trip through its own wall clock reading")
+zone_round_trips()
+    assert_round_trips(1678604400 * us_per_second)
+    assert_round_trips(1699164000 * us_per_second)
+
+// -- the clock seam --------------------------------------------------------------------------------
+//
+// `now` and `monotonic` read symbols this module declares and does not define (`clock.sysl`), so what
+// these two assert is that a supplier was linked and that the numbers it answered are the right
+// *shape*. They cannot assert a value: the whole point of the seam is that this module does not know
+// where the reading came from, and on a board it would not be a host clock at all.
+//
+// **Running at all is most of the claim.** A seam nothing supplied is a link failure naming a symbol
+// no line of this file contains, so a green run here is the evidence that the standard library's own
+// `#if posix` supplier answered.
+
+@test("the wall clock reads a plausible point on the timeline")
+seam_now_is_after_2020()
+    val y2020 = Instant(1577836800 * us_per_second)
+
+    assert(whole_micros(since(now(), y2020)) > 0, "the wall clock is before 2020")
+
+@test("the monotonic counter does not go backwards")
+seam_monotonic_does_not_retreat()
+    val first = monotonic()
+    val second = monotonic()
+
+    assert(whole_micros(second - first) >= 0, "a later reading was smaller than an earlier one")

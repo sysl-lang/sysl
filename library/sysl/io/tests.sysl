@@ -1,0 +1,85 @@
+module sysl.io
+@tests
+
+// What the whole-stream reads promise, asserted in sysl rather than beside it in Scala.
+//
+// The reading surface had no test file of its own until these were written: `Lines` is covered
+// indirectly through `sysl.term.edit`, and `BytesReader` was covered by being used. A reader that
+// answers SHORT is the case every one of these is really about, and it is the case a hand-rolled
+// loop gets wrong -- so the fixture below is a reader that never fills what it is offered.
+
+// -- a reader that answers short ------------------------------------------------------------------
+
+// `bytes_reader_at_most` is the one already in the module: it hands back at most `most` bytes per
+// call whatever it was offered, which is what a pipe with one write in it, a socket, or a terminal
+// does. Nothing here would notice the difference against a reader that always fills.
+
+@test("read_all gathers a stream that arrives in one piece")
+read_all_one_piece()
+    var r = bytes_reader([u8('h'), u8('i')])
+
+    assert_eq(read_all(&r).len(), 2)
+
+@test("read_all keeps going past a short read, which is not the end of anything")
+read_all_past_short()
+    var r = bytes_reader_at_most([u8('a'), u8('b'), u8('c'), u8('d'), u8('e')], 2)
+
+    val got = read_all(&r)
+
+    assert_eq(got.len(), 5)
+    assert_eq(got[0], u8('a'))
+    assert_eq(got[4], u8('e'))
+
+@test("read_all of an empty stream is an empty buffer rather than a failure")
+read_all_empty()
+    var r = bytes_reader([])
+
+    assert(read_all(&r).is_empty())
+
+@test("read_all_text answers the text where the bytes are UTF-8")
+read_all_text_ok()
+    var r = bytes_reader_at_most([u8('h'), u8('e'), u8('y')], 1)
+
+    read_all_text(&r) match
+        Ok(s) -> assert_eq(s, "hey")
+        Err(_) -> assert(false)
+
+// The severity that is NOT taken: a whole stream is what arrives off a wire or out of a file
+// somebody else wrote, so a caller is told rather than stopped.
+@test("and reports rather than stopping where they are not")
+read_all_text_bad()
+    var r = bytes_reader([u8('h'), 255])
+
+    read_all_text(&r) match
+        Ok(_) -> assert(false)
+        Err(e) -> assert_eq(e.offset, 1)
+
+// -- filling a slice ------------------------------------------------------------------------------
+
+@test("read_exact fills the whole slice across as many reads as it takes")
+read_exact_fills()
+    var r = bytes_reader_at_most([u8('a'), u8('b'), u8('c'), u8('d')], 1)
+    var into: [4]u8 = [0; 4]
+
+    val got = read_exact(&r, into)
+
+    assert_eq(got.len, 4)
+    assert_eq(got[3], u8('d'))
+
+// The distinction the function exists for: `read` answering short is not the end of input, and
+// `read_exact` stops only when there is genuinely nothing more.
+@test("and stops at the end of input, handing back the prefix it did fill")
+read_exact_short_stream()
+    var r = bytes_reader([u8('a'), u8('b')])
+    var into: [4]u8 = [0; 4]
+
+    val got = read_exact(&r, into)
+
+    assert_eq(got.len, 2)
+
+@test("an empty request reads nothing and asks the reader for nothing")
+read_exact_empty_request()
+    var r = bytes_reader([u8('a')])
+    var into: [1]u8 = [0; 1]
+
+    assert_eq(read_exact(&r, into[0..<0]).len, 0)

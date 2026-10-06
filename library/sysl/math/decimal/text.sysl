@@ -1,0 +1,112 @@
+module sysl.math.decimal
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{abs, parse as parse_big, to_string as big_text}
+import sysl.text.from_utf8_unchecked
+
+// Reading a decimal and writing one, at the scale it was written to.
+//
+// **The round trip is the whole promise**: `parse("12.340")` keeps its trailing zero, and rendering
+// it gives `"12.340"` back. That is what makes the scale part of the value rather than an artefact
+// of how it was computed, and it is what a price quoted to three places needs.
+//
+// The one input that does not survive is `"-0"`, which parses to zero and renders as `"0"` -- there
+// being no negative zero here, exactly as there is none in `sysl.math.bigint`.
+
+/** The value written out, with a point where the scale asks for one.
+ *
+ * A scale larger than the coefficient has digits pads with zeros after the point and writes a
+ * leading `0` before it, so `of(big_of(5), 3)` is `"0.005"` rather than `".005"`. A scale of zero
+ * writes no point at all.
+ */
+to_string(d: Decimal) -> string
+    val places = int(d.places)
+    val digits = big_text(abs(d.coef)).bytes
+    var out: Buf[u8] = buf()
+
+    if d.coef.sign() < 0 then out.push(u8('-'))
+
+    if places == 0
+        out.extend(digits)
+    elif digits.len <= usize(places)
+        out.push(u8('0'))
+        out.push(u8('.'))
+
+        for _ in 0..<(usize(places) - digits.len)
+            out.push(u8('0'))
+
+        out.extend(digits)
+    else
+        val cut = digits.len - usize(places)
+
+        out.extend(digits[0..<cut])
+        out.push(u8('.'))
+        out.extend(digits[cut..])
+
+    // Every byte written is an ASCII digit, a point or a hyphen, so the result is valid UTF-8 by
+    // construction.
+    from_utf8_unchecked(out.view())
+end to_string
+
+impl Display for Decimal
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(to_string(self), out, fmt)
+
+/** The value `s` names, or `None`.
+ *
+ * An optional sign, then digits with at most one point among them -- and the scale is however many
+ * digits came after it, so `"12.340"` is a scale of three and `"12.34"` a scale of two. `".5"` is
+ * read as a half; `"1."` is not read at all, a point with no digit after it being a mistake rather
+ * than a spelling.
+ *
+ * **There is no exponent form**, deliberately. `1e-3` names a value and says nothing about the scale
+ * it should be written to, so accepting it would mean this module choosing one -- and the scale is
+ * the thing a caller is trusting the round trip with. A program reading exponent notation splits it
+ * and calls `rescale`.
+ *
+ * Nothing else: no underscores, no spaces, no thousands separator. What a document permits is the
+ * document's business, and stripping is one call before this one.
+ */
+parse(s: string) -> Option[Decimal]
+    val b = s.bytes
+    var i: usize = 0
+    var minus = false
+
+    if i < b.len && (b[i] == u8('-') || b[i] == u8('+'))
+        minus = b[i] == u8('-')
+        i += 1
+
+    var digits: Buf[u8] = buf()
+    var places = 0
+    var dot = false
+    var seen = false
+
+    while i < b.len
+        val c = b[i]
+
+        if c == u8('.')
+            if dot then return None
+
+            dot = true
+        elif c >= u8('0') && c <= u8('9')
+            digits.push(c)
+            seen = true
+
+            if dot then places += 1
+        else
+            return None
+
+        i += 1
+
+    if !seen then return None
+    if dot && places == 0 then return None
+
+    var text: Buf[u8] = buf()
+
+    if minus then text.push(u8('-'))
+
+    text.extend(digits.view())
+
+    parse_big(from_utf8_unchecked(text.view())) match
+        Some(c) -> Some(Decimal(c, i32(places)))
+        None -> None
+end parse

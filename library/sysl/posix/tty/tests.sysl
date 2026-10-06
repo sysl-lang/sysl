@@ -1,0 +1,64 @@
+module sysl.posix.tty
+@requires(posix)
+@tests
+
+// What the terminal-mode facility promises where there is no terminal, which is where a test runs.
+//
+// **These cannot put a terminal into cbreak mode and assert that it happened** — the suite's standard
+// input is a pipe, so there is nothing to configure and `raw` says so. What they *can* do is the half
+// that used to be untestable and now matters: the shim under `__macos__`/`__linux__` is real C that
+// has to compile and link, and a program calling `raw` that could not resolve `sysl_tty_raw` does not
+// build at all. Every assertion below is reached only by a binary that linked it.
+//
+// That is the same shape as `sysl.fs`'s: the interesting claim is *the C is there*, and the way to
+// assert it is to call through it and get an answer.
+
+@test("raw reports rather than pretending, where standard input is not a terminal")
+raw_answers_without_a_terminal()
+    // The suite's input is a pipe. `raw` checks `is_tty` before it touches the terminal, so this is
+    // `false` and not an error -- a program whose input is redirected wants `sysl.io.console_lines`
+    // instead, which is a different situation rather than a failure.
+    assert(!is_tty(0), "the suite's standard input should not be a terminal")
+    assert(!raw(), "raw should answer false where there is no terminal to change")
+end raw_answers_without_a_terminal
+
+@test("cooked does nothing when raw was never called")
+cooked_is_a_no_op_unentered()
+    // It is guarded on the module's own `entered`, so this must not reach the shim at all -- a
+    // program that never changed the terminal must not have it "restored" to settings it never chose.
+    cooked()
+    cooked()
+
+    assert(!raw(), "the guard is unchanged by a restore that had nothing to undo")
+end cooked_is_a_no_op_unentered
+
+@test("a terminal's own descriptor is what is asked about, not a global")
+is_tty_answers_per_descriptor()
+    // `is_tty` is the check `raw` leans on, and it takes a descriptor rather than assuming one. A
+    // descriptor nothing has opened is not a terminal, which is the answer that keeps `raw` from
+    // configuring something it does not own.
+    assert(!is_tty(9999), "an unopened descriptor is not a terminal")
+
+@test("the terminal sink flushes through a shim, which is a symbol that has to link")
+sink_flush_reaches_its_shim()
+    // **Nothing visible is written** -- the slice is empty -- so what this asserts is the half that
+    // used to be `fflush(null)` and is now one line of C beside this file. `sysl_tty_flush_out` is
+    // an ordinary symbol: a binary that could not resolve it does not link, so reaching the
+    // assertion below at all is most of the claim.
+    //
+    // The rest of it is that the sink does not latch. `TtyWriter` implements `Fallible` with an
+    // empty block, taking every default, because a write to a terminal that has already been
+    // checked for is not a thing this layer can fail at -- and a latch that came back true here
+    // would mean the shim had reported something the sink cannot see.
+    //
+    // **What this deliberately does not pin is which stream gets flushed**, that being the change it
+    // was written for. A process cannot observe the difference between `fflush(NULL)` and
+    // `fflush(stdout)` from inside itself: both return zero and both leave the terminal's stream
+    // pushed. The claim available to a test is that the shim is there and reachable, and removing
+    // it fails the whole suite at the link rather than here.
+    val out = tty_writer()
+
+    out.write("".bytes)
+
+    assert(!out.failed(), "the terminal sink should not latch a failure on an empty write")
+end sink_flush_reaches_its_shim
