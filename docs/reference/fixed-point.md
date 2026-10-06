@@ -1,6 +1,6 @@
 ---
 title: Fixed-point numbers
-summary: `q31`, `i32q16`, `u32q32` — an integer counted in units of 2^-F, with the arithmetic a DSP wants: saturating, rounding to nearest, mixed formats read from where a result goes, and literals that are constant data on a board with no FPU.
+summary: "`q31`, `i32q16`, `u32q32` — an integer counted in units of 2^-F, with the arithmetic a DSP wants: saturating, rounding to nearest, mixed formats read from where a result goes, and literals that are constant data on a board with no FPU."
 weight: 76
 ---
 
