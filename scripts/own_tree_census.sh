@@ -38,11 +38,12 @@ case $ours_bin in
     *) ours_bin=$(cd "$(dirname "$ours_bin")" && pwd)/$(basename "$ours_bin") ;;
 esac
 
-if [ -n "$SYSL_ORACLE_LIB" ]; then
-    ( cd "$project" && SYSL_LIB=$SYSL_ORACLE_LIB "$theirs_bin" emit-llvm . ) > "$work/theirs.ll"
-else
-    ( cd "$project" && env -u SYSL_LIB "$theirs_bin" emit-llvm . ) > "$work/theirs.ll"
-fi
+# The reference is also handed, as a source root, the modules `library/` adds (`reference_overlay.sh`):
+# the tree imports `sysl.testing`, which no reference library carries.
+theirs_lib=${SYSL_ORACLE_LIB:-$(cd "$(dirname "$(command -v "$theirs_bin")")/../share/sysl/library" && pwd)}
+overlay=$(sh "$root/scripts/reference_overlay.sh" "$theirs_lib" "$work/overlay")
+
+( cd "$project" && SYSL_LIB=$theirs_lib "$theirs_bin" emit-llvm . --lib "$overlay" ) > "$work/theirs.ll"
 
 ( cd "$project" && "$ours_bin" emit-llvm . ) > "$work/ours.ll"
 
