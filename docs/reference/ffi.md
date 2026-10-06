@@ -484,6 +484,44 @@ begin() -> i32 = start
 
 A `const` has no storage at all and never arises.
 
+#### What constant data is
+
+**An initializer is constant data when every scalar in it is a constant expression** — the same
+expressions a `const` may be written as ([modules § const](/reference/modules/)): a literal, a
+`const`, a conversion, a unary `-`, `!` or `~`, or an arithmetic, bitwise, shift, comparison or
+logical operator over those — **and the arrays, structs and variants carrying nothing that are built
+from them, at any depth.** A pointer written as `ptr_cast` of such an integer is one too. The compiler
+works the value out and the object file carries it, so nothing runs to fill the storage:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+const SCALE: i32 = 1 << 4
+
+struct Q31
+    raw: i32
+
+val gain: Q31 = Q31(i32(0.6 * 2147483648.0))
+val taps: [3]i32 = [SCALE, -(SCALE / 2), ~0]
+val rate: f64 = 48000.0 / 3.0
+
+@export
+begin() -> i32 = gain.raw + taps[0] + i32(rate)
+```
+
+**A call is constant data only when it calls a
+[`const` function](/reference/declarations/#a-const-function-runs-while-compiling)** over constant
+arguments, which the compiler runs while compiling. Any other call is module storage whatever it is
+called with — `val start: i32 = counter()` below is storage even where `counter` is `= 7`, because
+nothing marked it as code the compiler may run.
+
+**The value laid down is the value the same initializer computes at run time, and where the two
+could differ it is not laid down.** An integer operation whose result its type does not hold, a
+division by zero, a shift by the operand's width or more: each of these leaves the initializer as code, run before the program's
+statements like any other computed one — so on a freestanding archive it is refused below rather
+than given a value the program would never have computed. A `f32` is rounded after every operation,
+as the machine rounds it, so `val g: f32 = 16777216.0 + 1.0 + 1.0` holds `16777216`.
+
 #### The one case with nowhere to fill
 
 **A freestanding target has no loader.** Nothing walks `.init_array` on bare metal unless the image's

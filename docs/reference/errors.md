@@ -454,6 +454,30 @@ than to arithmetic.
 `NDEBUG`. A check that is in the language is in every build, because a switch that removed one would
 make a program's meaning depend on how it was compiled.
 
+**A trap while a constant is being worked out is a compile error.** A
+[`const` function](/reference/declarations/#a-const-function-runs-while-compiling) called where a
+constant is wanted is run by the compiler, and every source in the table above stops that run as it
+would stop the program — so the constant is refused, at the call written in it, with the trap's own
+words, where it happened, and every call the run was inside:
+
+```sysl
+const per(n: int, k: int) -> int = n / k
+
+const buckets(n: int, k: int) -> int = per(n, k) + 1
+
+const steps: int = buckets(1024, 0)
+
+print(steps)
+```
+
+```error
+'steps' traps while it is being compiled: integer division by zero
+```
+
+The program never runs, so nothing of it is lost the way buffered output is lost at a run-time trap;
+the full message names the division, then each call the run was inside — `inside 'per(1024, 0)'`,
+`inside 'buckets(1024, 0)'` — with where each was called.
+
 ### What stopping looks like
 
 The *decision* to stop is the language's; the *action* on stopping is the environment's. Under the
@@ -596,7 +620,8 @@ Everything in the rest of this section is about the other four rows, and the fir
 the clearest way to tell them apart: an alias's base may be **any** type, and a constrained
 subtype's may not.
 
-**A constrained subtype's base must be a scalar** — an integer, a float, or a `char`:
+**A constrained subtype's base must be a scalar** — an integer, a float, a `char`, or a
+[fixed-point type](/reference/fixed-point/#a-range), whose `within` ends are decimals:
 
 ```sysl
 struct Point
@@ -670,6 +695,62 @@ print(i)
 
 ```error
 the lower bound of 'Inverted' is above its upper bound
+```
+
+A bound that folds to a float is ordered like a literal one, so `f64 within 2.0..(0.5 * 2.0)` is an
+inverted range. A bound whose fold itself refuses — `1/0` — is refused in the fold's words, at the
+division: *"a constant divided by zero"*.
+
+### A float range may end at an infinity
+
+Over a float base an end may be `infinity` or `-infinity` — the
+[constants no literal spells](/reference/types/#the-two-values-no-literal-spells) — which is how a
+range open at one end is written. **An infinite end is still a check**: every comparison with a NaN
+is false, so even `-infinity..infinity` refuses exactly one thing, and `0.0..<infinity` refuses
+`infinity` itself.
+
+```sysl
+type Distance = real within 0.0..infinity
+type Finite = real within -infinity..<infinity
+
+var far: Distance = infinity
+var d: Finite = -1.0e300
+
+print(f64(far) > 1.0e308, f64(d) < 0.0)
+```
+
+```output
+true true
+```
+
+A NaN arriving at either is refused where it is produced, as any out-of-range value is — the program
+traps there. **A NaN bound is refused at the declaration**, a range ending at one admitting no value
+at all:
+
+```sysl
+type Broken = real within 0.0..nan
+
+print(1)
+```
+
+```error
+a 'within' bound may not be NaN — every comparison with one is false, so a range ending at a NaN admits no value
+```
+
+An integer or `char` range has no infinity to end at; `int within 0..infinity` is refused as *"an
+integer subtype needs integer bounds, not a floating-point literal"*. A constant declared at such a
+type is held to it while compiling, and the end is spelled the way it was written:
+
+```sysl
+type Distance = real within 0.0..infinity
+
+const back: Distance = -1.0
+
+print(1)
+```
+
+```error
+'back' is -1.0, which Distance does not admit — it holds 0.0 to infinity
 ```
 
 ### Predicates

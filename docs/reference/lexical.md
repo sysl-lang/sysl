@@ -733,6 +733,10 @@ print(f1, f2, f3)
 Note the rendering: a float prints in the shortest form that round-trips, so `2.5e3` shows as `2500`
 and carries no `.0`. Hexadecimal, binary and octal have no floating-point form.
 
+A [fixed-point](/reference/fixed-point/) suffix (`0.6i32q31`, `1i32q16`) is the one integer-family
+suffix a fraction may carry. An unsuffixed decimal literal written where a fixed-point type is
+expected adopts it, converted exactly from its digits; outside the range it is a compile error.
+
 ### Characters
 
 A `char` literal is one Unicode scalar value in single quotes. Nine escapes are named, and anything

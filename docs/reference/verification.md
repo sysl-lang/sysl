@@ -255,6 +255,11 @@ call other pure functions; recurse; use every control-flow form; **allocate**; a
 `*T`, into a `&T`'s field, or into any storage it did not create; perform I/O; contain an `asm` block;
 call through a closure, or dispatch through a trait object.
 
+**A [`const` function](/reference/declarations/#a-const-function-runs-while-compiling) is pure as
+well**, being held to more than this — it may not allocate either, nor read storage filled while the
+program runs — so a pure function may call one, and `@pure` written on a `const` function says one
+thing twice and is accepted as such.
+
 A write is examined through its *path*, not its root — so storage the call made is the call's,
 however deep the indexing goes:
 

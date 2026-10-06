@@ -1473,7 +1473,9 @@ print(nil.raw.len)
 ```
 
 That is `sysl.encoding.nil` exactly: the nil UUID is a module-level `val` for this reason and no
-other. A `const` whose *type* is a scalar and whose *value* is genuinely not constant still gets the
+other. [What constant data is](/reference/ffi/#what-constant-data-is) says which initializers are
+laid down that way — arrays, structs and variants over constant expressions, at any depth. A `const`
+whose *type* is a scalar and whose *value* is genuinely not constant still gets the
 older wording, which is the case it was written for and is the `size()` example below.
 
 ```sysl
@@ -1496,13 +1498,14 @@ is refused too, because a predicate is checked where a value is *made* and a con
 its uses rather than made anywhere — admitting one would be a check the declaration claims and the
 program never gets.
 
-**A constant expression** is a literal; a `const`; a conversion; a unary `-`, `!` or `~`; or a binary
-arithmetic, bitwise, shift, or comparison operator applied to constant expressions. Integers, floats,
-`bool` and `char` fold.
+**A constant expression** is a literal; a `const`; a conversion; a unary `-`, `!` or `~`; a binary
+arithmetic, bitwise, shift, or comparison operator applied to constant expressions; or **a call to
+a [`const` function](/reference/declarations/#a-const-function-runs-while-compiling)** whose
+arguments are constant expressions. Integers, floats, `bool` and `char` fold.
 
-**There are no calls**, and a `string` constant's initializer must be a **literal** — since `+` on
-strings allocates, and a compile-time concatenation would be a different operation wearing the same
-spelling:
+**A call to any other function is refused**, and a `string` constant's initializer must be a
+**literal** — since `+` on strings allocates, and a compile-time concatenation would be a different
+operation wearing the same spelling:
 
 ```sysl
 size() -> int = 4
@@ -1513,11 +1516,68 @@ print(called)
 ```
 
 ```error
-the value of 'called' is not a constant expression
+the value of 'called' is not a constant expression — 'size' is not 'const', so it runs only when the program does; mark it 'const' to call it here
 ```
 
-A function call in a constant expression is a request for compile-time evaluation of arbitrary code,
-which is a language of its own.
+A `const` function is the one kind of code the compiler runs while it compiles, so marking it is
+all the call needs:
+
+```sysl
+const size() -> int = 4
+
+const called: int = size()
+
+print(called)
+```
+
+```output
+4
+```
+
+**The call is run, not guessed at.** The compiler runs the function's body over the arguments, at
+the target's widths — a `usize` wraps at 32 bits when the target's `usize` is 32 bits — with every
+integer operation wrapping as it does at run time and every `f32` operation rounded as it is at run
+time, so the constant is the bits the same call makes when the program runs. A module `val`
+initialized by such a call is laid into the object file as data on every target, a freestanding
+one included, rather than computed before the program's statements:
+
+```sysl
+const fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)
+
+static val V: int = fact(10)
+
+print(V)
+```
+
+```output
+3628800
+```
+
+**Every run is bounded**: 16,000,000 steps — one per expression and statement the run visits — and
+calls 512 deep. Running out of either is an error naming the constant, not a warning, and there is
+no setting that raises them:
+
+```sysl
+const spin() -> int
+    loop
+        continue
+
+const k: int = spin()
+
+print(k)
+```
+
+```error
+'k' did not finish within 16,000,000 steps while compiling — the loop at
+```
+
+**What a body may hold while it runs is narrower than what it may hold**: integers of every width,
+`f32` and `real`, `bool`, `char` and `unit`, and constrained types of them, with their checks run.
+A struct, an array, an enum value, a field or an element stops the run with *"a 'P' is not
+evaluated while compiling yet — integers, floats, 'bool' and 'char' are"*; the program's own
+run-time call is unaffected. A `const` call where a **type** is read — an array bound, a `within` —
+is not evaluated yet either, and is refused with *"'four' is a 'const' function, but this value is
+read while declarations are, before any body can be run"*.
 
 **"A `const`" above means the declaration, not a spelling of it.** A constant reached by its full path
 is the same constant as one reached by an import, and the two fold alike in every position below —

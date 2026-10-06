@@ -115,6 +115,12 @@ and nothing special-cases it: `abs` at `i1` answers `-1` because `-1` is that wi
 value, exactly as `abs` at any width answers its own minimum, and `signum` never returns `+1` because
 no value of the type is positive. If you want a bit, write `u1` or `bool`.
 
+### Fixed point is the integers read in units
+
+`iWqF` and `uWqF` (`q7`, `q15`, `q31`) are a W-bit integer counting units of 2^-F — see
+[fixed-point numbers](/reference/fixed-point/). They are the one scalar family whose arithmetic
+saturates rather than wraps, unless a type is declared `wrapping`: a fixed-point value models a real number in a range, as a float does.
+
 ## Floating point is a closed set
 
 `fN` is **not** open — only real formats exist, because there is no meaningful `f37`. The set is
@@ -138,6 +144,62 @@ print(a + 1.0, b / 2.0)
 
 A float renders in the shortest form that round-trips, so a value with no fractional part prints
 without one.
+
+### The two values no literal spells
+
+An infinity and a NaN have no decimal to write down, so each float type names them: **`real.infinity`
+and `real.nan`**, and the same on every width — `f32.infinity`, `f16.nan`, `bf16.infinity`. They are
+read **without parentheses**, because they are constants rather than functions: a `const` initializer
+takes one, and so does a `within` bound.
+
+`infinity` and `nan` written on their own are the `real` ones. Negative infinity is a minus in front,
+as for any other value:
+
+```sysl
+const top: real = infinity
+val low: f32 = -f32.infinity
+
+print(top > 1.0e308, low < f32(-3.0e38), nan != nan, -infinity < 0.0)
+```
+
+```output
+true true true true
+```
+
+A NaN compares false with everything, itself included, which is what the third answer shows — and why
+`is_nan()` is how one is looked for.
+
+**The bare names are the outermost there are.** Anything the program declares or imports under the
+spelling answers first — a local, a parameter, a `const`, a function — so a program that already has
+an `infinity` keeps it:
+
+```sysl
+f(nan: int) -> int = nan + 1
+
+print(f(2))
+```
+
+```output
+3
+```
+
+Where a declared **function** has taken the name, reading it bare is the usual refusal, and the
+message says which spelling no declaration can hide:
+
+```sysl
+infinity() -> real = 2.0
+
+val x: real = infinity
+
+print(x)
+```
+
+```error
+The built-in constant this declaration hides is spelled 'real.infinity'
+```
+
+`real.infinity()` and `real.nan()` — the `Float` trait's associated functions, which a routine generic
+over the width calls as `T.infinity()` — are unchanged, as are `sysl.math`'s `infinity()` and `nan()`.
 
 ### The two sixteen-bit formats
 
