@@ -978,6 +978,23 @@ private ask_oracle_llvm(binary: string, path: string) -> Answer
                    first_error(answer.err.unwrap_or("")))
 end ask_oracle_llvm
 
+// The reference's LLVM text for THIS tree, read against the library this tree is built with rather
+// than the reference's own. Every other sweep asks about a program written for the reference's
+// library; this one asks about a tree that names what `library/` declares (`sysl.skip`, which the
+// reference's library has not got), so handed its own library the reference refuses the tree outright.
+// Both compilers then read one library, and what the two texts can differ on is the compiler alone.
+private ask_oracle_llvm_own(binary: string) -> Answer
+    val held = std_root() match
+        Ok(root) -> capture(binary, ["emit-llvm", "."], "", [Var("SYSL_LIB", root)], true)
+        Err(_) -> capture_oracle(binary, ["emit-llvm", "."])
+
+    held match
+        Err(_) -> Answer(false, "", "the oracle could not be run")
+        Ok(answer) ->
+            Answer(answer.status.ok(), without_trailing_newlines(answer.text),
+                   first_error(answer.err.unwrap_or("")))
+end ask_oracle_llvm_own
+
 // The reference's type definitions, less the ones a **body's** lowering introduces.
 //
 // `%arc.header`, `%arc.reaper` and the box a counted value is held in are the ownership runtime's
@@ -1417,10 +1434,13 @@ the_two_agree_on_this_compilers_own_tree()
                 return
             end if
 
-            val theirs = ask_oracle_llvm(binary, ".")
+            val theirs = ask_oracle_llvm_own(binary)
 
+            // The reference lowering this compiler's own tree is the whole of the sweep, so its
+            // refusal is a failure rather than a skip: a skip here once passed over a tree the
+            // reference could not read at all.
             if !theirs.ok
-                print(s"skipped: the reference would not lower this tree: ${theirs.message}")
+                assert(false, s"the reference would not lower this tree: ${theirs.message}")
                 return
             end if
 
