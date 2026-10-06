@@ -1,0 +1,84 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_temp_dir, remove_dir_all, symlink}
+import sysl.text.{cstring, Search}
+
+// **The refusal for a missing `llvm-ar` gives advice the compiler takes.** It used to say "name one
+// with --ar", and this compiler's command line has no `--ar`: an unknown option is refused, so the
+// advice led straight to a second refusal. What a reader can do is put an `llvm-ar` on the `PATH`,
+// which is the first place `find_ar` looks -- so the second case follows that advice and watches it
+// work, and watches it fail with the archiver taken away again.
+//
+// `PATH` is what is under test and `sysl.env` sets nothing, so a case sets it through libc and puts
+// the old value back before it returns.
+
+private extern "setenv" arx_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+
+private arx_set_path(value: string)
+    val k = cstring("PATH")
+    val v = cstring(value)
+
+    arx_c_setenv(k.ptr, v.ptr, 1)
+
+private arx_bare() -> Buf[string]
+    var tried: Buf[string] = buf()
+
+    tried.push("llvm-ar")
+    tried
+
+@test("a missing llvm-ar is refused with advice that names no option the command line lacks")
+arx_the_refusal_names_the_path()
+    var tried: Buf[string] = buf()
+
+    tried.push("/nonexistent/sysl-arx/llvm-ar")
+
+    find_ar_in(None, tried) match
+        Ok(p) -> assert(false, s"found '$p' where there is nothing")
+        Err(why) ->
+            assert(why.index_of("cannot find llvm-ar").is_some(), why)
+            assert(why.index_of("on the PATH").is_some(), why)
+            assert(why.index_of("--ar").is_none(), why)
+end arx_the_refusal_names_the_path
+
+@test("and putting an llvm-ar on the PATH, as the refusal says, is what finds one")
+arx_the_advice_is_followed()
+    val real = find_ar(None) match
+        Err(_) ->
+            print("skipped: no llvm-ar on this machine to put on the PATH")
+            return
+        Ok(p) -> p
+
+    if !real.starts_with("/")
+        print("skipped: the llvm-ar here is already found on the PATH, so there is no path to link to")
+        return
+
+    val empty = make_temp_dir("sysl-arx-empty").unwrap()
+    val holding = make_temp_dir("sysl-arx-bin").unwrap()
+
+    symlink(real, s"$holding/llvm-ar").unwrap()
+
+    val saved = env_var("PATH").unwrap_or("")
+
+    arx_set_path(empty)
+
+    val missing = find_ar_in(None, arx_bare())
+
+    arx_set_path(holding)
+
+    val found = find_ar_in(None, arx_bare())
+
+    arx_set_path(saved)
+    remove_dir_all(empty).unwrap()
+    remove_dir_all(holding).unwrap()
+
+    missing match
+        Ok(p) -> assert(false, s"found '$p' on a PATH holding no archiver")
+        Err(why) -> assert(why.index_of("on the PATH").is_some(), why)
+
+    found match
+        Ok(p) -> assert(p == "llvm-ar", p)
+        Err(why) -> assert(false, s"an llvm-ar on the PATH was not found: $why")
+end arx_the_advice_is_followed
