@@ -1,6 +1,6 @@
 module sh.sysl.compiler
 
-import sh.sysl.parsing.Span
+import sh.sysl.parsing.{Source, Span}
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map, Set, set}
 import sysl.math.bigint.from_int
@@ -228,6 +228,13 @@ struct Emit
     // body is one, which is what the coroutine intrinsics are declared for (`emit_async.sysl`).
     coro: Option[CoroCtx]
     uses_coro: bool
+
+    // The file the body being written came from, which a failed bounds check names; whether any
+    // check here reports through `sysl_bounds_fail`; and the locations it names, one constant each
+    // (`bounds_fail.sysl`).
+    src: Option[Source]
+    bounds_fails: bool
+    locs: Buf[string]
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -251,6 +258,10 @@ enum HelperReq
     // The hook of storage `slot_storage` made: the buffer walk under a `weak_odr` symbol, so its
     // address -- which is how the slot forms recognise such storage -- is one address everywhere.
     HrSlotBuf(elem: Type)
+
+    // What a `slot_place` of an element holding a count does anywhere but the first free slot of such
+    // storage (`slots.sysl`'s `gen_slot_place_rest`), out of line, `noinline` and `cold`.
+    HrSlotPlace(elem: Type)
 
     // A block written out by hand as LLVM, which is text and can only be **named** by anything that
     // is not LLVM. It shares the queue with the generated ones so that a module writes its helpers
@@ -378,7 +389,8 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          "", self_params, None, ghost_funcs, destructors, false, false, false,
          false, boxes, bufs, requested, requested_set, queue, temps, temp_marks, owned_slots, owned_marks, defers,
          defer_marks, set(), relaid, promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
-         set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None, None, false)
+         set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None, None, false,
+         None, false, buf())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -403,6 +415,7 @@ has_gap(e: *Emit) -> bool = e.gap.is_some()
 
 // Resets everything that is one function's, which is everything but the module-level lists.
 start_function(e: *Emit)
+    e.src = None
     e.prologue.clear()
     e.blocks.clear()
     e.current.clear()

@@ -1,7 +1,5 @@
 module sysl.buf
 
-import sysl.slices.copy
-
 /** The growable sequence and the sink built on it.
  *
  * A module of its own because nothing in the language reaches either: an array literal makes a `[]T`
@@ -16,6 +14,14 @@ import sysl.slices.copy
  * It is ordinary sysl rather than a built-in because a `[]T` that can be sized while running is all
  * it needs: `push` allocates a slice twice the size and copies, so the amortized cost is the one a
  * growable sequence has anywhere, and none of it is underneath the language.
+ *
+ * **The spare capacity holds nothing.** The storage comes from `slot_storage`, whose slots start out
+ * empty: a buffer box releases only its *live prefix*, and `slot_place` is what fills the first slot
+ * past it. So a push of a counted value takes exactly one count for the buffer, and a slot this
+ * buffer has given up -- by `pop`, `truncate`, `clear` or `remove` -- is let go of by `slot_vacate`
+ * there and then, which is when a destructor behind it runs. The one exception is storage somebody
+ * else is still reading: a `view()` held elsewhere, or a copy of this buffer, keeps those slots
+ * alive until it lets go, and the next shortening after that releases them.
  *
  * The bounds-checked members panic rather than returning an `Option`, which is the same bargain
  * `unwrap` makes -- an index past the end is a mistake in the program, not a value it meant to
@@ -91,7 +97,7 @@ struct Buf[T]
         else
             val n = self.count
 
-            self.elems[n] = v
+            slot_place(self.elems, n, v)
             self.count = n + 1
 
     /** Storage grown by one element's worth, with that element written into the slot the count
@@ -112,9 +118,9 @@ struct Buf[T]
     private grow_store(*self, v: T)
         ensure self.count < self.elems.len
 
-        self.grow(self.count + 1, v)
+        self.grow(self.count + 1)
 
-        self.elems[self.count] = v
+        slot_place(self.elems, self.count, v)
     end grow_store
 
     /** Storage replaced by storage that holds at least `need` elements, with everything already
@@ -130,9 +136,11 @@ struct Buf[T]
      * almost never taken. The marks are on the declaration, so every element type a program asks
      * for carries them.
      *
-     * **The fill is a parameter because a generic `T` has no zero**: an array is made by repeating
-     * a value, and nothing about `T` says what an unused slot should hold. None of those slots is
-     * read -- `count` is what says which elements are real.
+     * **The new storage's slots start out empty** (`slot_storage`), and the elements already here
+     * are placed into it one by one, each taking a count of its own. Nothing fills the rest: a
+     * repeated fill value would hold a count in every spare slot, keeping whatever it refers to alive
+     * until the storage itself goes. The old storage is not emptied, since a view handed out earlier
+     * may still be reading it; it lets go of its elements when its last holder does.
      *
      * **The contract is what carries the growth back out to the caller.** A postcondition is
      * repeated at every call site as a fact the optimizer may use, so the store `grow_store` makes
@@ -145,7 +153,7 @@ struct Buf[T]
      */
     @noinline
     @cold
-    private grow(*self, need: usize, fill: T)
+    private grow(*self, need: usize)
         require need > self.count
         ensure self.count < self.elems.len
         ensure need <= self.elems.len
@@ -155,9 +163,10 @@ struct Buf[T]
         while bigger_len < need
             bigger_len *= 2
 
-        var bigger: []T = [fill; bigger_len]
+        var bigger: []T = slot_storage(bigger_len)
 
-        copy(bigger, self.elems[0..<self.count])
+        for i in 0..<self.count
+            slot_place(bigger, i, self.elems[i])
 
         self.elems = bigger
     end grow
@@ -167,30 +176,47 @@ struct Buf[T]
      * times and may reallocate several times along the way; this asks once, grows once to a size
      * that fits the whole run, and copies.
      *
-     * The empty case leaves early because the fill `grow` repeats is `xs[0]`, and a run of no
-     * elements has none to offer -- which costs nothing, since a run of no elements has nothing to
-     * append either.
+     * The empty case leaves early because `grow` promises more room than the count, and a run of
+     * no elements asks for none -- which costs nothing, since it has nothing to append either.
      */
     extend(*self, xs: []const T)
         if xs.len == 0 then return
 
         var need = self.count + xs.len
 
-        if need > self.elems.len then self.grow(need, xs[0])
+        if need > self.elems.len then self.grow(need)
 
-        copy(self.elems[self.count..], xs)
+        // The run is cut once, so each place is tested against its length -- which is `xs.len`, the
+        // loop's own bound -- and the cut's own test is what settles the count's re-check below.
+        val run = self.elems[self.count..<need]
+
+        for i in 0..<xs.len
+            slot_place(run, i, xs[i])
 
         self.count = need
     end extend
 
+    /** The last element, taken out. The buffer gives up its own count of it here, so what the
+     * caller is handed is the only one left unless something else holds the value too.
+     */
     pop(*self) -> Option[T]
         if self.count == 0 then return None
 
-        self.count -= 1
-        Some(self.elems[self.count])
+        val n = self.count - 1
+        val v = self.elems[n]
 
+        self.count = n
+        slot_vacate(self.elems, n)
+        Some(v)
+    end pop
+
+    /** The elements from `n` on, given up -- each let go of now rather than when the storage goes,
+     * which is when a destructor behind one runs. The storage is kept.
+     */
     truncate(*self, n: usize)
-        if n < self.count then self.count = n
+        if n < self.count
+            self.count = n
+            slot_vacate(self.elems, n)
 
     clear(*self)
         self.truncate(0)
@@ -285,13 +311,12 @@ buf[T]() -> Buf[T]
  * many are coming. What it saves is the reallocation-and-copy at each doubling on the way up, which
  * is the one cost a growable sequence has that an exactly-sized array does not.
  *
- * **The fill is a parameter because a generic `T` has no zero**, and an array is made by repeating a
- * value. It is written rather than inferred for the same reason the language asks for it anywhere
- * else: nothing about `T` says what an unused slot should hold, and none of these slots is read --
- * `count` starts at zero, so every one of them is written before anything can see it.
+ * **`fill` is not stored anywhere.** The slots start out empty (`slot_storage`), so a counted `fill`
+ * is not kept alive by the room it would once have been repeated into. The parameter stays because
+ * callers write it, and because it is what lets a call say the element type without brackets.
  */
 buf_with_capacity[T](n: usize, fill: T) -> Buf[T]
-    var b: Buf[T] = Buf([fill; n], 0)
+    var b: Buf[T] = Buf(slot_storage(n), 0)
 
     b
 

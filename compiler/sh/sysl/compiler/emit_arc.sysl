@@ -187,6 +187,25 @@ hook_params() -> Buf[(string, LType)]
     out
 end hook_params
 
+// The owner, the slot and the value `arc.slotplace.<T>` takes.
+private slot_place_params(e: *Emit, elem: Type) -> Buf[(string, LType)]
+    var out: Buf[(string, LType)] = buf()
+
+    out.push(("o", LPtr))
+    out.push(("p", LPtr))
+    out.push(("v", lty(e, elem)))
+    out
+end slot_place_params
+
+// What keeps a helper out of its callers: it is the rare arm of something they do in line.
+private rarely() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("noinline")
+    out.push("cold")
+    out
+end rarely
+
 // -- the walks themselves -------------------------------------------------------------------------
 
 // Walks the reference-carrying fields of an aggregate **value**, reaching each with `extractvalue`.
@@ -434,6 +453,7 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrPlainDrop -> helper_sig(name, hook_params())
         HrTaskDrop(_) -> helper_sig(name, hook_params())
         HrSlotBuf(_) -> helper_sig(name, hook_params()) with { linkage = LinkWeakOdr }
+        HrSlotPlace(elem) -> helper_sig(name, slot_place_params(e, elem)) with { bare = rarely() }
 
         // A hand-written block is text rather than a function: the drain writes it down as it
         // stands, so nothing brings one here.
@@ -453,6 +473,7 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrPlainDrop -> gen_plain_hook(e)
         HrTaskDrop(result) -> gen_task_hook(e, result)
         HrSlotBuf(elem) -> gen_drop_buf_hook(e, elem)
+        HrSlotPlace(elem) -> gen_slot_place_rest(e, elem)
         HrText(_) -> gap_here(e, "a hand-written runtime block asked of the generator")
         HrAdapter(table, slot) -> gen_adapter(e, table, slot)
 

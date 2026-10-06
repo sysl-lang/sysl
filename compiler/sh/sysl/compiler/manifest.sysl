@@ -95,12 +95,29 @@ struct Manifest
 
     // A key this compiler does not understand is said out loud and then ignored, once per key.
     warnings: Buf[string]
+
+    // Whether a failed bounds check names its `file:line:column` (`bounds_fail.sysl`). Only the root
+    // project's applies, as only its `optimization` does.
+    bounds_locations: Option[bool]
+
+    // Whether the file has a `package` block at all. A workspace root without one is no project of
+    // its own (`workspace.sysl`).
+    has_package: bool
+
+    // `package.repository`: the coordinate this package is published at, or `""`. It is what a
+    // workspace member is named by when another member depends on it, so that its modules carry the
+    // prefix a fetch by that coordinate would give them.
+    repository: string
+
+    // The `workspace` list, as written: each member's directory relative to this file, `*` standing
+    // for one directory level. `None` where the file declares no workspace.
+    workspace: Option[Buf[string]]
 end Manifest
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
-             buf(), None, None, None, buf())
+             buf(), None, None, None, buf(), None, false, "", None)
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -225,20 +242,31 @@ check_floor(who: string, floor: string, compiler: string) -> Option[string]
         s"hand is $compiler")
 end check_floor
 
-// **Whether this compiler's own version is a release of the line package floors are written
-// against.** It is not, and saying so is what keeps a floor from turning away every package there
-// is.
+// The number a development build of this compiler carries. No release is ever numbered this low.
+const DevVersion: string = "0.0.1"
+
+// **Whether a compiler of this version is a release of the line package floors are written
+// against** -- which every release is, and a development build is not.
 //
 // A floor states the oldest *released* compiler a package builds with, and every floor in the
-// ecosystem is a point on the reference compiler's line. `Version` here is `0.0.1`: this compiler
-// is numbered from its own beginning and has never been released under that line at all, so
-// comparing the two reads a number as saying something it is not saying -- and the answer it
-// reaches, that a package needing 0.0.76 cannot be built by 0.0.1, is wrong about every package in
-// the org. The reference makes no claim at all about a version it cannot read as a release, for
-// exactly this reason; this is the same answer with the reason spelled out rather than left to an
-// accident of spelling. It flips with this one line the day this compiler ships under a number of
-// its own.
-const OnTheReleaseLine: bool = false
+// ecosystem is a point on that line. A development build holds `Version` at `0.0.1` while the
+// compiler under it changes, so comparing the two reads a number as saying something it is not
+// saying -- and the answer it reaches, that a package needing 0.0.76 cannot be built by 0.0.1, is
+// wrong about every package in the org. So a development build makes no claim, which is the
+// reference's own answer for a version it cannot read as a release. A release (`0.1.0-alpha.1` and
+// on) is stamped into `Version` and is held to every floor.
+on_the_release_line(version: string) -> bool = version != DevVersion
+
+// A version a test stands in for, in place of `Version`. Empty is none.
+private var version_pinned: string = ""
+
+// The version this compiler answers a floor with: `Version`, or the one a test has pinned.
+compiler_version() -> string = if version_pinned != "" then version_pinned else Version
+
+// Run as though this compiler were numbered `v` -- which is how a test asks what a release would
+// say about a floor without a release being built. `None` puts the real version back.
+pin_compiler_version(v: Option[string])
+    version_pinned = v.unwrap_or("")
 
 // The refusal the project being built earns, against a compiler of the given version.
 //
@@ -250,11 +278,16 @@ project_floor_refusal(floor: string, compiler: string) -> Option[string] =
 
 // The refusal the project being built earns against this compiler, or nothing where it is in no
 // position to make one.
-root_floor_refusal(floor: string) -> Option[string] =
-    if OnTheReleaseLine then project_floor_refusal(floor, Version) else None
+root_floor_refusal(floor: string) -> Option[string]
+    val v = compiler_version()
 
-// Whether one release came before another, compared a number at a time. A pre-release suffix is cut
-// away first: `0.0.66-fcf4e33a` is dev heading for 0.0.66 and has everything 0.0.65 shipped.
+    if on_the_release_line(v) then project_floor_refusal(floor, v) else None
+
+// Whether one version came before another, in semver's order: the three numbers first, compared a
+// number at a time, and where they are equal **a pre-release comes before the release it leads to**
+// -- `0.1.0-alpha.1` is above every `0.0.x` and below `0.1.0`, so a floor of `0.1.0` refuses the
+// alpha. `0.0.66-fcf4e33a` is above 0.0.65 for the same reason it is below 0.0.66. A `+build` suffix
+// takes no part, as semver says.
 older(a: string, b: string) -> bool
     val left = numbers_of(a)
     val right = numbers_of(b)
@@ -268,8 +301,61 @@ older(a: string, b: string) -> bool
 
         i += 1
 
-    false
+    pre_release_older(pre_release_of(a), pre_release_of(b))
 end older
+
+// What follows a version's first `-`, up to any `+`, or nothing for a release.
+private pre_release_of(text: string) -> string
+    val plain = text.index_of("+") match
+        Some(at) -> text[0..<at]
+        None -> text
+
+    plain.index_of("-") match
+        Some(at) -> plain[(at + 1)..<plain.bytes.len]
+        None -> ""
+
+// Semver's order over two pre-release parts of one version: none at all is the release, above every
+// pre-release; otherwise field by field, a number below a word, numbers by value, words byte by byte,
+// and where one runs out first it is the lower.
+private pre_release_older(a: string, b: string) -> bool
+    if a == "" then return false
+
+    if b == "" then return true
+
+    val left = split(a, ".")
+    val right = split(b, ".")
+
+    for i in 0..<left.len
+        if i >= right.len then return false
+
+        if left[i] != right[i] then return field_older(left[i], right[i])
+
+    left.len < right.len
+end pre_release_older
+
+private field_older(a: string, b: string) -> bool
+    val x = all_digits(a)
+    val y = all_digits(b)
+
+    if x && y then return numbers_of(a).at(0) < numbers_of(b).at(0)
+
+    if x != y then return x
+
+    for i in 0..<a.bytes.len
+        if i >= b.bytes.len then return false
+
+        if a.bytes[i] != b.bytes[i] then return a.bytes[i] < b.bytes[i]
+
+    a.bytes.len < b.bytes.len
+end field_older
+
+private all_digits(text: string) -> bool
+    if text.bytes.len == 0 then return false
+
+    for i in 0..<text.bytes.len
+        if text.bytes[i] < u8('0') || text.bytes[i] > u8('9') then return false
+
+    true
 
 private numbers_of(text: string) -> Buf[usize]
     var out: Buf[usize] = buf()
@@ -279,7 +365,7 @@ private numbers_of(text: string) -> Buf[usize]
     for i in 0..<text.bytes.len
         val c = text.bytes[i]
 
-        if c == u8('-') then break
+        if c == u8('-') || c == u8('+') then break
 
         if c >= u8('0') && c <= u8('9')
             held = held * 10 + usize(c - u8('0'))
@@ -307,6 +393,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     var name = ""
     var version = ""
     var floor = ""
+    var repository = ""
     var warnings: Buf[string] = buf()
 
     conf_at(root, "package") match
@@ -315,6 +402,7 @@ read_manifest(text: string) -> Result[Manifest, string]
             name = conf_text(pkg, "name")
             version = conf_text(pkg, "version")
             floor = conf_text(pkg, "sysl")
+            repository = conf_text(pkg, "repository")
 
             val keys = conf_keys(pkg)
 
@@ -381,6 +469,15 @@ read_manifest(text: string) -> Result[Manifest, string]
     val optimization = read_optimization(root)?
     val link = read_link(root)?
     val lto = read_lto(root)?
+    val bounds_locations = read_bounds_locations(root)?
+    val has_package = conf_at(root, "package").is_some()
+    val workspace = read_workspace(root)?
+
+    // **A workspace root with no `package` block compiles nothing of its own**, so a dependency
+    // named there would reach no code -- and a reader would believe every member had it.
+    if workspace.is_some() && !has_package && (!dependencies.is_empty() || !dev.is_empty())
+        return Err("'dependencies' in a workspace with no 'package' block reaches nothing — the " +
+            "root compiles nothing of its own, so name each dependency in the member that imports it")
 
     val keys = conf_keys(root)
 
@@ -389,8 +486,49 @@ read_manifest(text: string) -> Result[Manifest, string]
 
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
                 target_capabilities, pkg_config, headers, defines, targets, allocator, features,
-                optimization, link, lto, warnings))
+                optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace))
 end read_manifest
+
+// The `bounds_locations` key: `true`, the default, or `false` to leave every failed bounds check's
+// `file:line:column` out of the image.
+private read_bounds_locations(root: &Conf) -> Result[Option[bool], string]
+    val value = conf_at(root, "bounds_locations") match
+        None -> return Ok(None)
+        Some(v) -> v
+
+    *value match
+        Flag(on) -> return Ok(Some(on))
+        _ -> ()
+
+    Err("'bounds_locations' says whether a failed bounds check names the file, line and column it " +
+        "was written at, so it is true or false")
+end read_bounds_locations
+
+// The `workspace` list: the members' directories, relative to the file. **A list and nothing else**
+// -- the members are the whole of what a workspace says, and a value of any other shape was written
+// by somebody who believes they declared members the reader cannot see.
+private read_workspace(root: &Conf) -> Result[Option[Buf[string]], string]
+    val written = conf_at(root, "workspace") match
+        None -> return Ok(None)
+        Some(v) -> v
+
+    val bad = "'workspace' is not a list of directories — a workspace is written " +
+        "'workspace = [\"compiler\", \"tools/*\"]', each entry a member's directory relative to " +
+        "this file"
+
+    *written match
+        Items(values) ->
+            var out: Buf[string] = buf()
+
+            for i in 0..<values.len()
+                *values.at(i) match
+                    Text(s) -> out.push(s)
+                    Word(s) -> out.push(s)
+                    _ -> return Err(bad)
+
+            Ok(Some(out))
+        _ -> Err(bad)
+end read_workspace
 
 // The warning a key this compiler does not know draws. **Said and then ignored, not refused**: a
 // manifest written for a newer compiler must still build with this one wherever the parts it uses
@@ -1304,4 +1442,5 @@ private known_package_key(key: string) -> bool =
 private known_top_key(key: string) -> bool =
     key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
     key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
-    key == "links" || key == "features" || key == "optimization" || key == "link" || key == "lto"
+    key == "links" || key == "features" || key == "optimization" || key == "link" || key == "lto" ||
+    key == "bounds_locations" || key == "workspace"

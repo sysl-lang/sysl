@@ -1,0 +1,477 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, is_file, read_text}
+import sysl.text.{join, split, Search}
+
+// **A workspace: several projects in one repository, resolved as one.** The root manifest lists the
+// members, and that list is the whole declaration:
+//
+//     workspace = ["compiler", "tools/*", "examples/board-probe"]
+//
+// Each member is an ordinary project with a `package.hocon` of its own. What the workspace adds is
+// one version selection over every member's dependencies (`workspace_selection`), one `sysl.sum` and
+// one `vendor/` at the root (`resolution_root`), and dependencies between members written by name,
+// `kairos { workspace = true }` (`bind_members`). **The walk needs nothing from here**: a directory
+// holding its own manifest is never part of the tree above it (`project.sysl`'s `walked_into`), and
+// every member has one.
+//
+// A root that also has a `package` block is a member itself, as Cargo's and pnpm's are; one with no
+// `package` block compiles nothing of its own.
+
+// One member: where it is, how the workspace's list reaches it, and what it calls itself.
+struct WorkspaceMember
+    // Absolute.
+    dir: string
+
+    // The directory relative to the workspace root, `.` for the root itself -- what a refusal names.
+    path: string
+
+    // `package.name`, which is what `-p` picks and what another member's `{ workspace = true }`
+    // entry is written under.
+    name: string
+
+    // The prefix its modules carry when another member depends on it: its `package.repository`'s,
+    // which is the one a fetch by that coordinate gives, or its `name` where it states none.
+    canonical: string
+
+    manifest: Manifest
+end WorkspaceMember
+
+struct Workspace
+    // Absolute: the directory holding the manifest that declares the workspace.
+    root: string
+
+    // In the order the list wrote them, globs expanded in name order; the root first where it is a
+    // member.
+    members: Buf[WorkspaceMember]
+end Workspace
+
+// The workspace a project directory belongs to, where it belongs to one: the nearest manifest at or
+// above it declaring a `workspace`, provided the directory is that root or one of its members.
+//
+// **A project below a workspace root that the list does not name belongs to none**, and is built as
+// it would be anywhere else -- pnpm's answer rather than Cargo's refusal, since the walk already keeps
+// it out of the root's tree and nothing is gained by refusing a probe nobody listed.
+workspace_around(dir: string) -> Result[Option[Workspace], string]
+    val here = absolute_path(dir)
+    var at = here
+
+    loop
+        val file = join_path(at, ManifestName)
+
+        if is_file(file)
+            // A manifest above the project that will not read is not this project's to report: only
+            // the directory asked about is held to its own file, and that is read elsewhere.
+            val read = read_text(file) match
+                Err(_) -> None
+                Ok(text) -> read_manifest(text) match
+                    Err(why) -> if at == here then return Err(manifest_refusal(why)) else None
+                    Ok(m) -> Some(m)
+
+            if read.is_some() && read.unwrap().workspace.is_some()
+                val ws = workspace_declared(at, read.unwrap())?
+
+                if at == here then return Ok(Some(ws))
+
+                for i in 0..<ws.members.len()
+                    if ws.members.at(i).dir == here then return Ok(Some(ws))
+
+                return Ok(None)
+            end if
+        end if
+
+        if at == "/" then return Ok(None)
+
+        at = parent_of(at) match
+            None -> return Ok(None)
+            Some(up) -> up
+end workspace_around
+
+// Where a project's one resolution keeps its `sysl.sum` and its `vendor/`: the workspace root inside
+// a workspace, the project itself everywhere else.
+resolution_root(dir: string) -> Result[string, string]
+    val around = workspace_around(dir)?
+
+    around match
+        None -> Ok(dir)
+        Some(ws) -> Ok(ws.root)
+end resolution_root
+
+// The workspace a root manifest declares, every member read and the whole held to the rules.
+workspace_declared(root: string, m: Manifest) -> Result[Workspace, string]
+    val home = absolute_path(root)
+    var members: Buf[WorkspaceMember] = buf()
+
+    if m.has_package
+        members.push(WorkspaceMember(home, ".", m.name, member_canonical(".", m)?, m))
+
+    val listed = m.workspace.unwrap_or(buf())
+    var dirs: Buf[string] = buf()
+
+    for i in 0..<listed.len()
+        val found = member_dirs(home, listed.at(i))?
+
+        for j in 0..<found.len()
+            if !holds_string(dirs, found.at(j)) then dirs.push(found.at(j))
+
+    for i in 0..<dirs.len()
+        val dir = dirs.at(i)
+        val path = below(home, dir)
+
+        val text = read_text(join_path(dir, ManifestName)) match
+            Err(_) -> return Err(s"cannot read ${join_path(dir, ManifestName)}")
+            Ok(t) -> t
+
+        val theirs = read_manifest(text) match
+            Err(why) -> return Err(s"workspace member '$path': ${manifest_refusal(why)}")
+            Ok(got) -> got
+
+        if theirs.workspace.is_some()
+            return Err(s"workspace member '$path' declares a workspace of its own — workspaces do " +
+                "not nest, so its members belong in the root's list")
+
+        if theirs.name.is_empty()
+            return Err(s"workspace member '$path' has no 'package.name' — a member is picked with " +
+                "'-p' and depended on by that name")
+
+        members.push(WorkspaceMember(dir, path, theirs.name, member_canonical(path, theirs)?, theirs))
+
+    no_member_inside_another(members)?
+    no_shared_name(members)?
+    only_members_named(members)?
+    no_member_cycle(members)?
+
+    Ok(Workspace(home, members))
+end workspace_declared
+
+// **A member is named by the coordinate it says it is published at**, so its modules carry exactly
+// the prefix a consumer fetching that coordinate gives them, and moving a package into a workspace
+// or out of one renames nothing. A member stating no `repository` has no identity beyond the
+// workspace and is named by its `package.name`, which is what a path dependency's label is.
+private member_canonical(path: string, m: Manifest) -> Result[string, string]
+    if m.repository.is_empty() then return Ok(m.name)
+
+    val repo = m.repository
+
+    if repo.index_of("://").is_some() || repo.index_of("/").is_none() || repo.starts_with("/") ||
+       repo.ends_with("/")
+        return Err(s"workspace member '$path' gives 'package.repository' as '$repo', which is not a " +
+            "coordinate — it is written as a consumer writes 'git', 'github.com/you/thing', since it " +
+            "is what the member's modules are named by")
+
+    Ok(canonical_prefix(repo))
+end member_canonical
+
+// The directories one entry of the list names: a path, or a path with `*` standing for one level.
+private member_dirs(home: string, written: string) -> Result[Buf[string], string]
+    val segments = split(written, "/")
+    var parts: Buf[string] = buf()
+
+    for i in 0..<segments.len
+        if segments[i] != "" then parts.push(segments[i])
+
+    var wild = false
+
+    for i in 0..<parts.len()
+        val part = parts.at(i)
+
+        if part == "." || part == ".." || part.index_of("**").is_some()
+            return Err(not_below(written))
+
+        if part.index_of("*").is_some() then wild = true
+
+    if written.starts_with("/") || parts.is_empty() then return Err(not_below(written))
+
+    var out: Buf[string] = buf()
+
+    if !wild
+        val dir = join_path(home, join(parts.view(), "/"))
+
+        if !is_directory(dir)
+            return Err(s"workspace member '$written' does not exist — '$dir' is not a directory")
+
+        if !is_file(join_path(dir, ManifestName))
+            return Err(s"workspace member '$written' has no $ManifestName — a member is a project, " +
+                "and a project is a directory holding one")
+
+        out.push(dir)
+        return Ok(out)
+    end if
+
+    // **A glob takes the directories it reaches that are projects, and passes over the rest** --
+    // `tools/*` over a directory that also holds a README's images is the ordinary case.
+    var reached: Buf[string] = buf()
+
+    expand_members(parts, 0, home, &reached)
+
+    for i in 0..<reached.len()
+        if is_file(join_path(reached.at(i), ManifestName)) then out.push(reached.at(i))
+
+    Ok(out)
+end member_dirs
+
+private not_below(written: string) -> string =
+    s"'workspace' names '$written', which is not a directory below the workspace — a member is " +
+    "written relative to the file declaring the workspace, inside it, with '*' standing for one " +
+    "directory level"
+
+private expand_members(parts: Buf[string], at: usize, base: string, out: *Buf[string])
+    if at == parts.len()
+        out.push(base)
+        return
+    end if
+
+    val part = parts.at(at)
+
+    if part.index_of("*").is_none()
+        val next = join_path(base, part)
+
+        if is_directory(next) then expand_members(parts, at + 1, next, out)
+
+        return
+    end if
+
+    val names = sort_names(entries(base).unwrap_or(buf()))
+
+    for i in 0..<names.len()
+        val name = names.at(i)
+
+        if name.starts_with(".") then continue
+
+        val next = join_path(base, name)
+
+        if is_directory(next) && wildcard_matches(part, name)
+            expand_members(parts, at + 1, next, out)
+end expand_members
+
+// Whether `name` is what `pattern` says, `*` standing for any run of characters within the one
+// segment.
+wildcard_matches(pattern: string, name: string) -> bool =
+    wildcard_from(pattern, 0, name, 0)
+
+private wildcard_from(pattern: string, p: usize, name: string, n: usize) -> bool
+    if p == pattern.bytes.len then return n == name.bytes.len
+
+    if pattern.bytes[p] == u8('*')
+        for k in n..<(name.bytes.len + 1)
+            if wildcard_from(pattern, p + 1, name, k) then return true
+
+        return false
+    end if
+
+    if n == name.bytes.len || pattern.bytes[p] != name.bytes[n] then return false
+
+    wildcard_from(pattern, p + 1, name, n + 1)
+end wildcard_from
+
+// A directory below the root, written from the root.
+private below(home: string, dir: string) -> string =
+    if dir == home then "." else dir[(home.bytes.len + 1)..<dir.bytes.len]
+
+private no_member_inside_another(members: &Buf[WorkspaceMember]) -> Result[unit, string]
+    for i in 0..<members.len()
+        for j in 0..<members.len()
+            val outer = members.at(i)
+            val inner = members.at(j)
+
+            if i == j || outer.path == "." then continue
+
+            if inner.dir.starts_with(outer.dir + "/")
+                return Err(s"workspace member '${inner.path}' is inside member '${outer.path}' — " +
+                    "each member's tree is its own, so one member cannot hold another")
+
+    Ok(())
+end no_member_inside_another
+
+private no_shared_name(members: &Buf[WorkspaceMember]) -> Result[unit, string]
+    for i in 0..<members.len()
+        for j in (i + 1)..<members.len()
+            if members.at(i).name == members.at(j).name
+                return Err(s"workspace members '${members.at(i).path}' and '${members.at(j).path}' " +
+                    s"are both named '${members.at(i).name}' — a member is picked and depended on " +
+                    "by its 'package.name', so each needs its own")
+
+    Ok(())
+end no_shared_name
+
+// The member named `name`, where there is one.
+member_named(ws: &Workspace, name: string) -> Option[WorkspaceMember]
+    for i in 0..<ws.members.len()
+        if ws.members.at(i).name == name then return Some(ws.members.at(i))
+
+    None
+end member_named
+
+// The members' names, quoted and sorted, for a refusal that has to say what there was to choose.
+member_names(members: &Buf[WorkspaceMember]) -> string
+    var names: Buf[string] = buf()
+
+    for i in 0..<members.len()
+        names.push(s"'${members.at(i).name}'")
+
+    join(sorted_labels(names).view(), ", ")
+end member_names
+
+private member_edges(m: &Manifest) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<m.dependencies.len()
+        if is_member_dependency(m.dependencies.at(i)) then out.push(m.dependencies.at(i).label)
+
+    for i in 0..<m.dev_dependencies.len()
+        if is_member_dependency(m.dev_dependencies.at(i)) then out.push(m.dev_dependencies.at(i).label)
+
+    out
+end member_edges
+
+private only_members_named(members: &Buf[WorkspaceMember]) -> Result[unit, string]
+    for i in 0..<members.len()
+        val named = member_edges(members.at(i).manifest)
+
+        for j in 0..<named.len()
+            var found = false
+
+            for k in 0..<members.len()
+                if members.at(k).name == named.at(j) then found = true
+
+            if !found
+                return Err(not_a_member(members.at(i).name, named.at(j), members))
+
+    Ok(())
+end only_members_named
+
+private not_a_member(who: string, named: string, members: &Buf[WorkspaceMember]) -> string =
+    s"'$who' names '$named' as a workspace dependency, and no member of the workspace is called " +
+    s"'$named' — the members are ${member_names(members)}"
+
+// **Members depend on each other as packages do, so the edges have to be a tree a build can climb**:
+// each is compiled into the one that names it, and a member reached from itself is a program that
+// contains itself. `dev_dependencies` count, since a test build compiles them in exactly as it does
+// `dependencies`.
+private no_member_cycle(members: &Buf[WorkspaceMember]) -> Result[unit, string]
+    for i in 0..<members.len()
+        var trail: Buf[string] = buf()
+
+        trail.push(members.at(i).name)
+
+        cycle_through(members, members.at(i).name, &trail)?
+
+    Ok(())
+end no_member_cycle
+
+private cycle_through(members: &Buf[WorkspaceMember], at: string, trail: *Buf[string]) -> Result[unit, string]
+    var edges: Buf[string] = buf()
+
+    for i in 0..<members.len()
+        if members.at(i).name == at then edges = member_edges(members.at(i).manifest)
+
+    for i in 0..<edges.len()
+        val next = edges.at(i)
+
+        if next == trail.at(0)
+            var shown: Buf[string] = buf()
+
+            for k in 0..<trail.len()
+                shown.push(trail.at(k))
+
+            shown.push(next)
+            return Err(s"workspace members depend on each other in a cycle: " +
+                s"${join(shown.view(), " -> ")} — a member is compiled into the one that depends on " +
+                "it, so one of these edges has to go")
+        end if
+
+        if holds_string(*trail, next) then continue
+
+        trail.push(next)
+        cycle_through(members, next, trail)?
+        trail.truncate(trail.len() - 1)
+
+    Ok(())
+end cycle_through
+
+// A manifest whose `{ workspace = true }` entries are bound to the members they name -- read against
+// the workspace `dir` belongs to, which is why it takes the directory. A manifest naming no member is
+// handed back as it came, and nothing above it is read.
+bind_members(m: Manifest, dir: string) -> Result[Manifest, string]
+    if member_edges(m).is_empty() then return Ok(m)
+
+    val around = workspace_around(dir)?
+
+    val ws = around match
+        Some(found) -> found
+        None ->
+            val first = member_edges(m).at(0)
+
+            return Err(s"'$first' is a workspace dependency, and '${absolute_path(dir)}' is in no " +
+                "workspace — 'workspace = true' names a member of the workspace this project is " +
+                "listed in")
+
+    var out = m
+
+    out.dependencies = bound_in(m.dependencies, ws, m.name)?
+    out.dev_dependencies = bound_in(m.dev_dependencies, ws, m.name)?
+    Ok(out)
+end bind_members
+
+private bound_in(deps: &Buf[Dependency], ws: &Workspace, who: string) -> Result[Buf[Dependency], string]
+    var out: Buf[Dependency] = buf()
+
+    for i in 0..<deps.len()
+        val dep = deps.at(i)
+
+        if !is_member_dependency(dep)
+            out.push(dep)
+            continue
+        end if
+
+        member_named(ws, dep.label) match
+            None -> return Err(not_a_member(if who.is_empty() then "this project" else who,
+                                            dep.label, ws.members))
+            Some(mb) ->
+                out.push(Dependency(dep.label, Member(mb.dir, mb.canonical), dep.mount, dep.optional,
+                                    dep.features, dep.default_features))
+
+    Ok(out)
+end bound_in
+
+// **The projects a command acts on, where the path is a workspace or `-p` picks a member of one.**
+// `None` is the ordinary case: the path is a project and is acted on as it always was. At a
+// workspace root with nothing picked it is every member, the root first where it is a package.
+workspace_projects(path: string, picked: Option[string]) -> Result[Option[Buf[WorkspaceMember]], string]
+    val dir = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+    val ws = workspace_around(dir)?
+
+    picked match
+        Some(name) -> ws match
+            None -> Err(s"'-p $name' picks a member of a workspace, and '${absolute_path(dir)}' is " +
+                "in none")
+            Some(found) -> member_named(found, name) match
+                None -> Err(s"the workspace at '${found.root}' has no member called '$name' — its " +
+                    s"members are ${member_names(found.members)}")
+                Some(mb) ->
+                    var one: Buf[WorkspaceMember] = buf()
+
+                    one.push(mb)
+                    Ok(Some(one))
+        None -> ws match
+            None -> Ok(None)
+            Some(found) ->
+                if found.root != absolute_path(dir) || !is_directory(path) then Ok(None)
+                else Ok(Some(found.members))
+end workspace_projects
+
+// The refusal for a command that compiles one project, pointed at a workspace root that is none.
+virtual_root_refusal(root: string) -> string =
+    s"'$root' is a workspace with no 'package' block, so it is no project of its own — point at a " +
+    "member's directory, or pick one with '-p <member>'"
+
+// `-p <member>` / `--package <member>` at `args[i]`: how many arguments it took (0 where it is not
+// one, -1 where the name is missing) and the name.
+took_package_flag(args: []string, i: usize) -> (int, string)
+    if args[i] != "-p" && args[i] != "--package" then return (0, "")
+
+    if i + 1 >= args.len then return (-1, "")
+
+    (2, args[i + 1])
+end took_package_flag

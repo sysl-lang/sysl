@@ -1,0 +1,363 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+import sysl.text.{replace_all, Search, split}
+
+// **What a failed bounds check says before it stops the program.**
+//
+// The check itself is the comparison and the branch it always was; only the block the branch takes
+// when the check fails is longer. That block hands what it knows -- which form failed, the values it
+// compared, and where the subscript was written -- to ONE function, `sysl_bounds_fail`, and then
+// traps exactly as before, so the exit status is still SIGTRAP's and `@test(should_trap)` reads it
+// the same way.
+//
+// **The function is a WEAK default**, emitted into every module that has a check, so a program may
+// define its own under the same symbol (`@export("sysl_bounds_fail")`) and every check in the program
+// -- the standard module's included -- reports through it instead. That is how a board prints over a
+// UART. Its C signature is
+//
+//     void sysl_bounds_fail(uint32_t kind, size_t a, size_t b, size_t length, const char *at);
+//
+// `kind` is one of the `Bounds*` forms below, with `BoundsASigned`/`BoundsBSigned` or-ed in where `a`
+// or `b` came from a signed integer and is to be read as one; `at` is `file:line:column`,
+// NUL-terminated, or null where the build dropped the locations or the body has none to give.
+//
+// **The call is followed by the trap rather than relying on the callee never to return**, so an
+// override that returns -- one that only counts, say -- still stops the program where it was.
+//
+// **On a hosted target the default renders the message itself and writes it to standard error** with
+// one `write`, then traps. It renders its own digits rather than calling `snprintf`, so a program
+// that formats nothing still links no C formatter -- and `write` is the one thing it asks of libc.
+// **On a freestanding target it returns at once and the trap at the call site stops the program**,
+// exactly as before this existed: there is no standard error to write to. The call is kept rather
+// than dropped, since an override supplied in C or by another archive is something no compilation
+// can see, and the cost of keeping it is a call on a path that never returns.
+//
+// **The locations can be dropped** -- the manifest's `bounds_locations = false`, or the flag
+// `--no-bounds-locations` -- which leaves `at` null and lays down no `file:line:column` strings at
+// all; the message keeps its values.
+
+// The symbol a failed check reports through, and the one an override defines.
+bounds_fail_symbol() -> string = "sysl_bounds_fail"
+
+// The forms a failure takes. The number is what an override is handed, so it is part of the C
+// surface and does not move.
+const BoundsIndex: int = 0
+const BoundsRange: int = 1
+const BoundsRangeInclusive: int = 2
+const BoundsStartPastEnd: int = 3
+const BoundsStartPastInclusiveEnd: int = 4
+const BoundsStartPastLength: int = 5
+const BoundsStartSplitsChar: int = 6
+const BoundsEndSplitsChar: int = 7
+const BoundsTooWide: int = 8
+const BoundsRun: int = 9
+const BoundsCountTooWide: int = 10
+
+// Or-ed into the form where the value in `a` -- or `b` -- is a signed integer's, widened with its
+// sign, so the message prints `-1` rather than eighteen quintillion.
+const BoundsASigned: int = 256
+const BoundsBSigned: int = 512
+
+// What each form says, in order: the text with a `%s` for each value, and which values fill them --
+// `a`, `b` or `n` (the length). The location, where there is one, follows as ` (file:line:col)`.
+private val BoundsForms: []const (string, string) = [
+    ("index %s out of bounds for length %s", "an"),
+    ("range %s..<%s out of bounds for length %s", "abn"),
+    ("range %s..%s out of bounds for length %s", "abn"),
+    ("range start %s is past its end %s", "ab"),
+    ("range start %s is more than one past its end %s", "ab"),
+    ("range start %s is past length %s", "an"),
+    ("range start %s is not on a character boundary", "a"),
+    ("range end %s is not on a character boundary", "b"),
+    ("index does not fit in usize", ""),
+    ("%s elements from index %s out of bounds for length %s", "ban"),
+    ("count does not fit in usize", "")]
+
+// -- whether locations are laid down --------------------------------------------------------------
+
+// Settled once per command by the driver, beside the allocator and for the same reason: every check
+// in the build, the standard module's artifact included, has to agree.
+private var locations_on: bool = true
+
+bounds_locations() -> bool = locations_on
+
+use_bounds_locations(on: bool)
+    locations_on = on
+end use_bounds_locations
+
+// What the choice adds to an artifact's key: nothing for the default, so an ordinary build's path is
+// unchanged.
+bounds_locations_key() -> string = if locations_on then "" else "-nl"
+
+// -- how a location names its file -----------------------------------------------------------------
+
+// **A location names a file by where it sits in what was built, never by where that was on the
+// building machine**, so no home directory or build path is laid into an image. A file's name is
+// the absolute path the tree was walked from (which is what `__FILE__` and a diagnostic quote, and
+// they keep it); a location strips the longest of these roots off the front and puts what each is
+// paired with in its place. A library file is already named by its place (`library/sysl/…`) and
+// matches none of them.
+private var location_roots: Buf[(string, string)] = buf()
+
+// The roots one compilation's files are named under, set by the driver as the compilation is
+// gathered: the project's own directory (shown as nothing, so `src/main.sysl`), the directory
+// fetched packages live under (so `github.com/o/p/@v1.2.0/…`), and each other root it read.
+use_location_roots(roots: Buf[(string, string)])
+    location_roots = roots
+end use_location_roots
+
+// A file's name as a location shows it.
+location_file(name: string) -> string
+    var best: usize = 0
+    var shown = name
+
+    for i in 0..<location_roots.len()
+        val (dir, instead) = location_roots.at(i)
+
+        if dir.bytes.len > best && name.bytes.len > dir.bytes.len && bytes_at(name, 0, dir)
+            best = dir.bytes.len
+            shown = instead + name[dir.bytes.len..<name.bytes.len]
+
+    shown
+end location_file
+
+// -- the check -------------------------------------------------------------------------------------
+
+// Traps unless `ok` holds, having first reported the failure through `sysl_bounds_fail`. The labels
+// are the ones `trap_unless` takes, and the values are ones the check already computed, so nothing
+// before the failure block is any different.
+bounds_unless(e: *Emit, ok: Val, what: string, kind: int, a: Val, b: Val, n: Val, site: Span)
+    e.traps = true
+    e.bounds_fails = true
+
+    val ok_l = fresh_label(e, s"$what.ok")
+    val bad_l = fresh_label(e, s"$what.bad")
+
+    emit_term(e, InCondBr(ok, ok_l, bad_l))
+    emit_label(e, bad_l)
+
+    val w = word_lty(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(l_i32(), VInt(from_int(long(kind)))))
+    args.push(ir_arg(w, a))
+    args.push(ir_arg(w, b))
+    args.push(ir_arg(w, n))
+    args.push(ir_arg(LPtr, location_of(e, site)))
+    emit(e, ir_call(None, LVoid, VGlobal(bounds_fail_symbol()), args))
+    emit(e, ir_call(None, LVoid, VGlobal(llvm_trap()), no_ir_args()))
+    emit_term(e, InUnreachable)
+    emit_label(e, ok_l)
+end bounds_unless
+
+// A value a form does not use.
+bounds_none() -> Val = VInt(from_int(0))
+
+// The form with the sign of each value it carries marked.
+bounds_kind(kind: int, a_signed: bool, b_signed: bool) -> int =
+    kind + (if a_signed then BoundsASigned else 0) + (if b_signed then BoundsBSigned else 0)
+
+// Whether an index expression is a signed integer's, which is whether its widened value is to be
+// read with its sign.
+signed_index(x: TExpr) -> bool = underlying(texpr_type(x)) match
+    Integer(_, signed, _) -> signed
+    _ -> false
+
+// Where the subscript was written, as the constant the module lays down for it -- one per distinct
+// location -- or null where the build dropped locations or the body came from no file.
+private location_of(e: *Emit, site: Span) -> Val
+    if !locations_on then return VNull
+
+    val src = e.src match
+        Some(s) -> s
+        None -> return VNull
+
+    val loc = src.locate(site.start)
+    val text = s"${location_file(src.name)}:${loc.line}:${loc.col}"
+
+    for i in 0..<e.locs.len()
+        if e.locs.at(i) == text then return VGlobal(bounds_location_name(i))
+
+    e.locs.push(text)
+    VGlobal(bounds_location_name(e.locs.len() - 1))
+end location_of
+
+private bounds_location_name(i: usize) -> string = s".loc$i"
+
+// The constants the locations are, in the order the bodies asked for them.
+bounds_location_globals(e: *Emit) -> Buf[IrGlobal]
+    var out: Buf[IrGlobal] = buf()
+
+    for i in 0..<e.locs.len()
+        val text = e.locs.at(i)
+
+        var bytes: Buf[u8] = buf()
+
+        for j in 0..<text.bytes.len
+            bytes.push(text.bytes[j])
+
+        bytes.push(u8(0))
+        out.push(ir_global(bounds_location_name(i), true, LArr(int(bytes.len()), LInt(8)),
+                           VBytes(bytes)))
+
+    out
+end bounds_location_globals
+
+// -- the default -----------------------------------------------------------------------------------
+
+// Whether the default writes a message, which is whether the target has somewhere to write it.
+bounds_default_prints(t: Target) -> bool = t.os != Freestanding
+
+// The weak default, as the text the module carries.
+bounds_runtime(t: Target) -> string
+    val word = s"i${t.pointer_bits()}"
+    val params = s"(i32 %kind, $word %a, $word %b, $word %n, ptr %at)"
+
+    if !bounds_default_prints(t)
+        return s"define weak void @${bounds_fail_symbol()}$params {\nentry:\n  ret void\n}\n\n"
+
+    var text = cstring_global("sysl.bounds.open", " (") + cstring_global("sysl.bounds.close", ")")
+
+    // Each form's text, cut at its holes: piece `j` is written, then the `j`th value it names.
+    for k in 0..<BoundsForms.len
+        val pieces = split(BoundsForms[k].0, "%s")
+
+        for j in 0..<pieces.len
+            if !pieces[j].is_empty() then text = text + cstring_global(s"sysl.bounds.f${k}.${j}", pieces[j])
+
+    text = text + "\n" + bounds_put(word) + bounds_digits(word) +
+        s"define weak void @${bounds_fail_symbol()}$params {\n" +
+        "entry:\n" +
+        "  %msg = alloca [512 x i8]\n" +
+        s"  %lim = getelementptr i8, ptr %msg, $word 510\n" +
+        "  %sa = and i32 %kind, 256\n" +
+        "  %asg = icmp ne i32 %sa, 0\n" +
+        "  %sb = and i32 %kind, 512\n" +
+        "  %bsg = icmp ne i32 %sb, 0\n" +
+        "  %form = and i32 %kind, 255\n" +
+        "  switch i32 %form, label %k0 ["
+
+    for k in 1..<BoundsForms.len
+        text = text + s" i32 $k, label %k$k"
+
+    text = text + " ]\n"
+
+    var arrivals = ""
+
+    for k in 0..<BoundsForms.len
+        val pieces = split(BoundsForms[k].0, "%s")
+        val fills = BoundsForms[k].1
+        var at = "%msg"
+
+        text = text + s"k$k:\n"
+
+        for j in 0..<pieces.len
+            if !pieces[j].is_empty()
+                text = text + s"  %k${k}.s${j} = call ptr @sysl.bounds.put(ptr $at, " +
+                    s"ptr @sysl.bounds.f${k}.${j}, ptr %lim)\n"
+                at = s"%k${k}.s${j}"
+
+            if j < fills.bytes.len
+                val which = fills[j..<j + 1]
+                val sign = if which == "a" then "%asg" else if which == "b" then "%bsg" else "false"
+
+                text = text + s"  %k${k}.v${j} = call ptr @sysl.bounds.num(ptr $at, $word %${which}, " +
+                    s"i1 $sign, ptr %lim)\n"
+                at = s"%k${k}.v${j}"
+
+        text = text + "  br label %tail\n"
+        arrivals = arrivals + (if k == 0 then "" else ", ") + s"[ $at, %k$k ]"
+
+    text + "tail:\n" +
+        s"  %e = phi ptr $arrivals\n" +
+        "  %has = icmp ne ptr %at, null\n" +
+        "  br i1 %has, label %loc, label %nl\n" +
+        "loc:\n" +
+        "  %l1 = call ptr @sysl.bounds.put(ptr %e, ptr @sysl.bounds.open, ptr %lim)\n" +
+        "  %l2 = call ptr @sysl.bounds.put(ptr %l1, ptr %at, ptr %lim)\n" +
+        "  %l3 = call ptr @sysl.bounds.put(ptr %l2, ptr @sysl.bounds.close, ptr %lim)\n" +
+        "  br label %nl\n" +
+        "nl:\n" +
+        "  %f = phi ptr [ %e, %tail ], [ %l3, %loc ]\n" +
+        "  store i8 10, ptr %f\n" +
+        s"  %f1 = getelementptr i8, ptr %f, $word 1\n" +
+        s"  %fi = ptrtoint ptr %f1 to $word\n" +
+        s"  %mi = ptrtoint ptr %msg to $word\n" +
+        s"  %len = sub $word %fi, %mi\n" +
+        s"  %w = call $word @write(i32 2, ptr %msg, $word %len)\n" +
+        "  call void @llvm.trap()\n" +
+        "  unreachable\n" +
+        "}\n\n"
+end bounds_runtime
+
+// Copies a NUL-terminated text to `d`, stopping at `lim`, and answers where it stopped.
+private bounds_put(word: string) -> string =
+    "define private ptr @sysl.bounds.put(ptr %d, ptr %s, ptr %lim) {\n" +
+    "entry:\n" +
+    "  br label %loop\n" +
+    "loop:\n" +
+    "  %o = phi ptr [ %d, %entry ], [ %o1, %body ]\n" +
+    "  %p = phi ptr [ %s, %entry ], [ %p1, %body ]\n" +
+    "  %c = load i8, ptr %p\n" +
+    "  %z = icmp eq i8 %c, 0\n" +
+    "  %full = icmp uge ptr %o, %lim\n" +
+    "  %stop = or i1 %z, %full\n" +
+    "  br i1 %stop, label %done, label %body\n" +
+    "body:\n" +
+    "  store i8 %c, ptr %o\n" +
+    s"  %o1 = getelementptr i8, ptr %o, $word 1\n" +
+    s"  %p1 = getelementptr i8, ptr %p, $word 1\n" +
+    "  br label %loop\n" +
+    "done:\n" +
+    "  ret ptr %o\n" +
+    "}\n\n"
+
+// Writes a word's decimal digits to `d` -- with a minus sign where `signed` holds and the value is
+// negative -- stopping at `lim`. The digits are laid down backwards in a scratch buffer, a word
+// being at most twenty of them.
+private bounds_digits(word: string) -> string =
+    s"define private ptr @sysl.bounds.num(ptr %d, $word %v, i1 %signed, ptr %lim) {\n" +
+    "entry:\n" +
+    "  %tmp = alloca [24 x i8]\n" +
+    s"  %end = getelementptr i8, ptr %tmp, $word 23\n" +
+    "  store i8 0, ptr %end\n" +
+    s"  %below = icmp slt $word %v, 0\n" +
+    "  %neg = and i1 %signed, %below\n" +
+    s"  %flip = sub $word 0, %v\n" +
+    s"  %mag = select i1 %neg, $word %flip, $word %v\n" +
+    "  br label %loop\n" +
+    "loop:\n" +
+    "  %at = phi ptr [ %end, %entry ], [ %at1, %loop ]\n" +
+    s"  %m = phi $word [ %mag, %entry ], [ %q, %loop ]\n" +
+    s"  %q = udiv $word %m, 10\n" +
+    s"  %r = urem $word %m, 10\n" +
+    s"  %r8 = trunc $word %r to i8\n" +
+    "  %ch = add i8 %r8, 48\n" +
+    s"  %at1 = getelementptr i8, ptr %at, $word -1\n" +
+    "  store i8 %ch, ptr %at1\n" +
+    s"  %more = icmp ne $word %q, 0\n" +
+    "  br i1 %more, label %loop, label %sign\n" +
+    "sign:\n" +
+    "  br i1 %neg, label %minus, label %copy\n" +
+    "minus:\n" +
+    s"  %at2 = getelementptr i8, ptr %at1, $word -1\n" +
+    "  store i8 45, ptr %at2\n" +
+    "  br label %copy\n" +
+    "copy:\n" +
+    "  %from = phi ptr [ %at1, %sign ], [ %at2, %minus ]\n" +
+    "  %out = call ptr @sysl.bounds.put(ptr %d, ptr %from, ptr %lim)\n" +
+    "  ret ptr %out\n" +
+    "}\n\n"
+
+// A private NUL-terminated constant, as a line of module text. Only a newline needs escaping in the
+// texts above.
+private cstring_global(name: string, text: string) -> string
+    val body = replace_all(text, "\n", "\\0A")
+    val n = text.bytes.len + 1
+
+    s"@$name = private unnamed_addr constant [$n x i8] c\"$body\\00\"\n"
+end cstring_global

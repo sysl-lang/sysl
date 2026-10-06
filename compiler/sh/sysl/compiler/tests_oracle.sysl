@@ -3,10 +3,11 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.env.{get as env_var}
 import sysl.fs.{IoError, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, walk, write_text}
 import sysl.process.{capture, Output, Var}
-import sysl.text.{split, str_builder, Search}
+import sysl.text.{replace_all, split, str_builder, Search}
 
 // The differential proof: this parser's tree against the reference compiler's, on the same input.
 //
@@ -78,6 +79,261 @@ private present(path: string) -> bool = metadata(path).is_ok()
 
 private is_sysl_source(path: string) -> bool = path.ends_with(".sysl") || path.ends_with(".lsysl")
 
+// -- what `scripts/library_patches.tsv` excuses ----------------------------------------------------
+
+// A source root holding a copy of every file `scripts/library_patches.tsv` lists that the reference's
+// own library has not got -- a module `library/` ADDS rather than changes -- for the reference to
+// compile this tree with (`--lib`). Nothing where the reference's library is unknown or nothing is
+// added. The caller removes the directory.
+reference_overlay(binary: string) -> Option[string] = oracle_library(binary) match
+    None -> None
+    Some(lib) -> reference_overlay_from(lib, "../scripts/library_patches.tsv", "../library")
+
+reference_overlay_from(lib: string, patches: string, library: string) -> Option[string]
+    val text = read_text(patches) match
+        Err(_) -> return None
+        Ok(t) -> t
+
+    val rows = lines_of(text)
+    var root: Option[string] = None
+
+    for i in 0..<rows.len()
+        val row = rows.at(i)
+
+        if row == "" || row.starts_with("#") then continue
+
+        val file = split(row, "\t")[0]
+
+        if present(s"$lib/$file") || !present(s"$library/$file") then continue
+
+        if root.is_none() then root = make_temp_dir("sysl-overlay").ok()
+
+        if root.is_none() then return None
+
+        val dest = s"${root.unwrap()}/$file"
+
+        parent_of(dest) match
+            Some(dir) -> make_dir_all(dir).unwrap_or(())
+            None -> ()
+
+        write_text(dest, read_text(s"$library/$file").unwrap_or("")).unwrap_or(())
+
+    root
+end reference_overlay_from
+
+// The modules `scripts/library_patches.tsv` lists, read where the suite runs (`compiler/`), so the
+// file is the only place the list is written. No file, or no rows, excuses nothing.
+patched_modules() -> Buf[string] = patched_modules_in("../scripts/library_patches.tsv")
+
+patched_modules_in(file: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    val text = read_text(file) match
+        Err(_) -> return out
+        Ok(t) -> t
+
+    val rows = lines_of(text)
+
+    for i in 0..<rows.len()
+        val row = rows.at(i)
+
+        if row == "" || row.starts_with("#") then continue
+
+        val fields = split(row, "\t")
+
+        if fields.len >= 2 && fields[1] != "" && !holds_name(out, fields[1]) then out.push(fields[1])
+
+    out
+end patched_modules_in
+
+// Whether a symbol -- a function's, an instantiation's, a named type's -- belongs to a listed module:
+// the text before its first `$`, read inside the quotes of a quoted symbol. A symbol with no `$`
+// belongs to no module and is never in a listed one. This is the first clause of `patch_confined`.
+in_patched_module(symbol: string, patched: Buf[string]) -> bool
+    val start: usize = if symbol.starts_with("\"") then 1 else 0
+
+    for i in start..<symbol.bytes.len
+        if symbol.bytes[i] == u8('$') then return holds_name(patched, symbol[start..<i])
+
+    false
+end in_patched_module
+
+/** **The excuse rule: which symbols of two LLVM texts a difference may be CONFINED to.** A symbol is
+ * confined when either
+ *
+ * 1. its module is one `library_patches.tsv` lists (`in_patched_module`), whatever its instantiation;
+ *    or
+ * 2. ONE of the two texts defines it and the other does not, and every use of it in the text that
+ *    defines it sits inside the body of a symbol that is itself confined -- it is reached only
+ *    through a listed module (the reference's `sysl.slices` instantiations only the old `Buf.grow`
+ *    called, our `arc.slotbuf.*` helpers only `slot_storage` asks for). Taken to a fixpoint.
+ *
+ * Nothing else is. A body BOTH texts define outside a listed module is never confined, whatever
+ * calls it; a one-sided symbol used from any unconfined place -- another body, a global, a vtable --
+ * or used nowhere at all is not confined either. A difference at a confined symbol is excused and
+ * counted; every other difference stays a failure.
+ */
+patch_confined(theirs: string, ours: string, patched: Buf[string]) -> Set[string]
+    var confined: Set[string] = set()
+
+    if patched.is_empty() then return confined
+
+    val their_defs = defined_set(theirs)
+    val our_defs = defined_set(ours)
+
+    for name in their_defs.walk()
+        if in_patched_module(name, patched) then confined.add(name)
+
+    for name in our_defs.walk()
+        if in_patched_module(name, patched) then confined.add(name)
+
+    val their_alone = set_less(their_defs, our_defs)
+    val our_alone = set_less(our_defs, their_defs)
+    var uses = uses_of(theirs, their_alone)
+    val our_uses = uses_of(ours, our_alone)
+
+    for i in 0..<our_uses.len()
+        uses.push(our_uses.at(i))
+
+    // A one-sided symbol joins once every use of it is inside a confined body; a round that adds
+    // nothing ends it.
+    loop
+        var used: Set[string] = set()
+        var held: Set[string] = set()
+
+        for i in 0..<uses.len()
+            used.add(uses.at(i).1)
+
+            if !confined.has(uses.at(i).0) then held.add(uses.at(i).1)
+
+        var grew = false
+
+        for name in used.walk()
+            if !held.has(name) && !confined.has(name)
+                confined.add(name)
+                grew = true
+
+        if !grew then break
+
+    confined
+end patch_confined
+
+private defined_set(text: string) -> Set[string]
+    var out: Set[string] = set()
+    val fs = func_texts(text)
+
+    for i in 0..<fs.len()
+        out.add(fs.at(i).0)
+
+    out
+end defined_set
+
+private set_less(a: Set[string], b: Set[string]) -> Set[string]
+    var out: Set[string] = set()
+
+    for name in a.walk()
+        if !b.has(name) then out.add(name)
+
+    out
+end set_less
+
+// Every use of a symbol in `wanted` in a text, as (the body it is used in, the symbol). A use
+// outside any body -- a global, a vtable -- is used from "", which nothing confines; a `declare`
+// line is not a use, and a `define` line's own name is not one either.
+private uses_of(text: string, wanted: Set[string]) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    if wanted.is_empty() then return out
+
+    val all = lines_of(text)
+    var inside = ""
+
+    for i in 0..<all.len()
+        val line = all.at(i)
+
+        if line.starts_with("declare ") then continue
+
+        var from: usize = 0
+
+        if line.starts_with("define ")
+            inside = symbol_on(line)
+            from = line.index_of("(").unwrap_or(0)
+        end if
+
+        val user = inside
+        var k = from
+
+        while k < line.bytes.len
+            if line.bytes[k] == u8('@')
+                val name = symbol_at(line, k + 1)
+
+                if wanted.has(name) then out.push((user, name))
+
+                k += name.bytes.len + 1
+            else
+                k += 1
+
+        if line == "}" then inside = ""
+
+    out
+end uses_of
+
+// The symbol written at `at` (just past an `@`): a quoted one with its quotes, or the run of the
+// characters a mangled name is made of.
+private symbol_at(line: string, at: usize) -> string
+    if at >= line.bytes.len then return ""
+
+    if line.bytes[at] == u8('"')
+        for i in (at + 1)..<line.bytes.len
+            if line.bytes[i] == u8('"') then return line[at..<(i + 1)]
+
+        return line[at..<line.bytes.len]
+    end if
+
+    var end = at
+
+    while end < line.bytes.len && symbol_byte(line.bytes[end])
+        end += 1
+
+    line[at..<end]
+end symbol_at
+
+private symbol_byte(b: u8) -> bool
+    if b >= u8('a') && b <= u8('z') then return true
+    if b >= u8('A') && b <= u8('Z') then return true
+    if b >= u8('0') && b <= u8('9') then return true
+
+    b == u8('_') || b == u8('.') || b == u8('$') || b == u8('-')
+end symbol_byte
+
+// A text with every confined definition and every confined declaration taken out, which is what the
+// whole-file comparison holds the rest of the two texts to.
+private without_confined(text: string, confined: Set[string]) -> string
+    val all = lines_of(text)
+    var out = str_builder()
+    var skipping = false
+
+    for i in 0..<all.len()
+        val line = all.at(i)
+
+        if skipping
+            if line == "}" then skipping = false
+            continue
+        end if
+
+        if line.starts_with("define ") && confined.has(symbol_on(line))
+            skipping = true
+            continue
+        end if
+
+        if line.starts_with("declare ") && confined.has(symbol_on(line)) then continue
+
+        out.push(line)
+        out.push_char('\n')
+
+    out.finish()
+end without_confined
+
 // The trailing newline `say` adds to what it is given, taken off both sides before they are
 // compared: the tree's own last line ends in one either way.
 private without_trailing_newlines(text: string) -> string
@@ -88,6 +344,137 @@ private without_trailing_newlines(text: string) -> string
 
     text[0..<end]
 end without_trailing_newlines
+
+// -- what the bounds report adds, taken out of OUR text before it meets the reference's --------------
+
+// **This compiler reports a failed bounds check before trapping and the pinned reference (0.0.162)
+// traps silently**, so every body holding a check differs by exactly what `bounds_fail.sysl` adds.
+// That is taken out of OUR text, and only that: each rule below names the one construct it removes,
+// matched by a prefix only that construct writes, so it cannot swallow anything the reference also
+// emits. Everything else -- the check, its branch, its labels, every register -- is still compared.
+// `tests_bfm_bounds_message.sysl`'s `bfm_the_normalisation_can_still_fail` holds it to that.
+//
+// The fourth difference is ordering, not content -- the `write` declaration lands where the bounds
+// default asked for it -- so the whole-file comparison reads `declare` lines as a set
+// (`same_text_but_declare_order`) rather than this rewriting them.
+ours_without_the_bounds_report(ours: string, theirs: string) -> string
+    val lines = lines_of(ours)
+    val theirs_writes = declares_write(theirs)
+
+    var out = str_builder()
+    var kept: Buf[string] = buf()
+    var inside = false
+    var dropped = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+        var drop = false
+
+        if inside
+            // RULE 3b, continued: the rest of a bounds function's body, through its closing brace.
+            drop = true
+            if line == "}" then inside = false
+        // RULE 1: the report a failed check makes before its trap -- the one line the failure block
+        // gains. The `llvm.trap` and `unreachable` after it stay and are compared.
+        else if line.starts_with("  call void @sysl_bounds_fail(")
+            drop = true
+        // RULE 2: the `file:line:column` constant each report names (`.loc<n>`, numbered apart from
+        // the interned strings so no other constant moves).
+        else if is_location_constant(line)
+            drop = true
+        // RULE 3a: the default's own constants, every one under the `sysl.bounds.` prefix.
+        else if line.starts_with("@sysl.bounds.")
+            drop = true
+        // RULE 3b: the weak default and its two private helpers, from the `define` line on.
+        else if line.starts_with("define weak void @sysl_bounds_fail(") ||
+                line.starts_with("define private ptr @sysl.bounds.put(") ||
+                line.starts_with("define private ptr @sysl.bounds.num(")
+            drop = true
+            inside = true
+        // RULE 4: the `write` the default writes through, where the reference declares none -- the
+        // default is then its only user.
+        else if !theirs_writes && is_write_declaration(line)
+            drop = true
+        // The blank line the removed run leaves doubled: each runtime block ends in one, and a
+        // section made of nothing but location constants has its own.
+        else if line == "" && dropped && !kept.is_empty() && kept.at(kept.len() - 1) == ""
+            drop = true
+
+        if !drop
+            kept.push(line)
+            out.push(line)
+            out.push_char('\n')
+
+        // Only a removed CONSTRUCT owns the blank after it; a blank this rule took is not one, or the
+        // printer's own separator after the last runtime block would go with it.
+        dropped = drop && line != ""
+
+    out.finish()
+end ours_without_the_bounds_report
+
+// `@.loc<digits> = private constant …`, the shape `bounds_location_globals` writes and nothing else.
+private is_location_constant(line: string) -> bool
+    if !line.starts_with("@.loc") then return false
+
+    var i: usize = 5
+
+    if i >= line.bytes.len || line.bytes[i] < u8('0') || line.bytes[i] > u8('9') then return false
+
+    while i < line.bytes.len && line.bytes[i] >= u8('0') && line.bytes[i] <= u8('9')
+        i += 1
+
+    bytes_at(line, i, " = private constant [")
+end is_location_constant
+
+private is_write_declaration(line: string) -> bool =
+    line.starts_with("declare ") && line.index_of(" @write(i32, ptr, ").is_some()
+
+private declares_write(text: string) -> bool
+    val lines = lines_of(text)
+
+    for i in 0..<lines.len()
+        if is_write_declaration(lines.at(i)) then return true
+
+    false
+end declares_write
+
+// Two texts that are one text but for the order of their `declare` lines, which are compared as a
+// set: every other line in place, and the same declarations, each as often.
+same_text_but_declare_order(theirs: string, ours: string) -> bool
+    val a = lines_of(theirs)
+    val b = lines_of(ours)
+
+    if a.len() != b.len() then return false
+
+    var a_declares: Buf[string] = buf()
+    var b_declares: Buf[string] = buf()
+
+    for i in 0..<a.len()
+        val x = a.at(i)
+        val y = b.at(i)
+
+        if x.starts_with("declare ") || y.starts_with("declare ")
+            if !(x.starts_with("declare ") && y.starts_with("declare ")) then return false
+
+            a_declares.push(x)
+            b_declares.push(y)
+        else if x != y then return false
+
+    for i in 0..<a_declares.len()
+        if count_of(a_declares, a_declares.at(i)) != count_of(b_declares, a_declares.at(i))
+            return false
+
+    true
+end same_text_but_declare_order
+
+private count_of(items: Buf[string], item: string) -> usize
+    var n: usize = 0
+
+    for i in 0..<items.len()
+        if items.at(i) == item then n += 1
+
+    n
+end count_of
 
 // What the reference compiler printed for one file, and whether it was willing to parse it at all.
 struct Answer
@@ -307,6 +694,9 @@ struct TypedAgreement
     // complains about is skipped rather than compared -- which is the safe direction for a proof and
     // the blind one for whoever has to make the count go down, so the reasons are carried out.
     first_unresolved: string
+
+    // Bodies that differ only in a module `library_patches.tsv` lists (`patch_confined`).
+    excused: usize
 end TypedAgreement
 
 // The reference compiler's typed tree for one file, or nothing where it would not analyze it.
@@ -460,7 +850,7 @@ the_typed_trees_agree()
             val dir = make_temp_dir("sysl-typed").unwrap()
             val scratch = dir + "/block.sysl"
 
-            var found = TypedAgreement(0, 0, 0, 0, 0, 0, "", "")
+            var found = TypedAgreement(0, 0, 0, 0, 0, 0, "", "", 0)
 
             for item in walk(root)
                 item match
@@ -796,9 +1186,11 @@ private in_set(names: Buf[string], name: string) -> bool
     false
 end in_set
 
-// One block compiled as a whole program, function by function.
+// One block compiled as a whole program, function by function. Every function compared here is one
+// both compilers print, so of `patch_confined`'s two clauses only the module one can apply: a block
+// is excused only where every function of it that differs is in a listed module.
 private compare_whole(binary: string, path: string, label: string, text: string,
-                      found: *TypedAgreement)
+                      patched: Buf[string], found: *TypedAgreement)
     val parsed = parse(source_of(path, text))
 
     if !parsed.ok() then return
@@ -855,6 +1247,8 @@ private compare_whole(binary: string, path: string, label: string, text: string,
         // would have said, from a walk that produced a value instead of saying it.
         else if names_a_fallback(where)
             found.skipped_unresolved += 1
+        else if in_patched_module(f.name, patched)
+            found.excused += 1
         else
             found.mismatched += 1
 
@@ -892,7 +1286,8 @@ the_typed_trees_agree_over_whole_programs()
             val dir = make_temp_dir("sysl-whole").unwrap()
             val scratch = dir + "/block.sysl"
 
-            var found = TypedAgreement(0, 0, 0, 0, 0, 0, "", "")
+            var found = TypedAgreement(0, 0, 0, 0, 0, 0, "", "", 0)
+            val patched = patched_modules()
 
             for item in walk(root)
                 item match
@@ -907,12 +1302,14 @@ the_typed_trees_agree_over_whole_programs()
                                     for i in 0..<blocks.len()
                                         write_text(scratch, blocks.at(i)).unwrap()
                                         compare_whole(binary, scratch,
-                                            s"${entry.path} block ${i + 1}", blocks.at(i), &found)
+                                            s"${entry.path} block ${i + 1}", blocks.at(i), patched,
+                                            &found)
 
             remove_file(scratch)
 
             val summary = s"whole programs: ${found.matched} bodies matched, " +
                 s"${found.mismatched} mismatched, " +
+                s"${found.excused} excused by library_patches.tsv, " +
                 s"${found.skipped_unresolved} in modules this stage could not finish, " +
                 s"${found.skipped_absent} blocks the reference refused"
 
@@ -967,6 +1364,12 @@ struct TypeAgreement
     // Why the bodies that are absent are absent, most often first. It is the census a next stage
     // works down, and it is read out of the lowering itself rather than guessed at from the symbol.
     reasons: Buf[(string, usize)]
+
+    // What `library_patches.tsv` excused (`patch_confined`), in each of the three comparisons: type
+    // definitions of a listed module, function bodies (differing or one-sided), and whole files.
+    excused_types: usize
+    fn_excused: usize
+    whole_excused: usize
 end TypeAgreement
 
 // The reference compiler's LLVM text for one program, and whether it was willing to lower it.
@@ -983,10 +1386,19 @@ end ask_oracle_llvm
 // library; this one asks about a tree that names what `library/` declares (`sysl.testing.skip`, which the
 // reference's library has not got), so handed its own library the reference refuses the tree outright.
 // Both compilers then read one library, and what the two texts can differ on is the compiler alone.
+//
+// **The reference gets its own library and, as a source root, the modules `library/` ADDS** — this
+// tree imports `sysl.testing`, which no reference library carries, and `library/`'s other patches
+// (`sysl.buf`'s slot forms) are ones the reference cannot compile. A difference in a patched module's
+// bodies is then `patch_confined`'s to excuse, as in every other sweep.
 private ask_oracle_llvm_own(binary: string) -> Answer
-    val held = std_root() match
-        Ok(root) -> capture(binary, ["emit-llvm", "."], "", [Var("SYSL_LIB", root)], true)
-        Err(_) -> capture_oracle(binary, ["emit-llvm", "."])
+    val held = reference_overlay(binary) match
+        Some(root) ->
+            val answer = capture_oracle(binary, ["emit-llvm", ".", "--lib", root])
+
+            remove_dir_all(root).unwrap_or(())
+            answer
+        None -> capture_oracle(binary, ["emit-llvm", "."])
 
     held match
         Err(_) -> Answer(false, "", "the oracle could not be run")
@@ -1011,7 +1423,8 @@ private declared_type_lines(text: string) -> Buf[string]
     out
 end declared_type_lines
 
-private compare_types(binary: string, path: string, label: string, found: *TypeAgreement)
+private compare_types(binary: string, path: string, label: string, patched: Buf[string],
+                      found: *TypeAgreement)
     val theirs = ask_oracle_llvm(binary, path)
 
     if !theirs.ok
@@ -1028,8 +1441,9 @@ private compare_types(binary: string, path: string, label: string, found: *TypeA
                 return
             end if
 
+            val ours = ours_without_the_bounds_report(mine.text, theirs.text)
             val want = declared_type_lines(theirs.text)
-            val got = declared_type_lines(mine.text)
+            val got = declared_type_lines(ours)
 
             found.compared += 1
             found.definitions += want.len()
@@ -1037,15 +1451,44 @@ private compare_types(binary: string, path: string, label: string, found: *TypeA
             val where = first_difference(want, got)
 
             if where.is_some()
-                found.mismatched += 1
+                // Excused only where the two lists agree once every type of a listed module is out.
+                if first_difference(types_outside(want, patched), types_outside(got, patched)).is_none()
+                    found.excused_types += 1
+                else
+                    found.mismatched += 1
 
-                if found.mismatched <= 4
-                    found.first_bad = s"${found.first_bad}\n$label: ${where.unwrap()}"
+                    if found.mismatched <= 4
+                        found.first_bad = s"${found.first_bad}\n$label: ${where.unwrap()}"
+            end if
 
-            compare_boxes(theirs.text, mine.text, label, found)
-            compare_funcs(theirs.text, mine.text, mine.gaps, label, found)
-            compare_whole_text(theirs.text, mine.text, label, found)
+            val confined = patch_confined(theirs.text, ours, patched)
+
+            compare_boxes(theirs.text, ours, label, found)
+            compare_funcs(theirs.text, ours, mine.gaps, label, confined, found)
+            compare_whole_text(theirs.text, ours, label, confined, found)
 end compare_types
+
+// The type definition lines whose type is not of a listed module: `%struct.<symbol> = type …`, the
+// symbol read as `in_patched_module` reads a function's.
+private types_outside(lines: Buf[string], patched: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+        val at = line.index_of(" = type ").unwrap_or(line.bytes.len)
+        var name = line[0..<at]
+
+        if name.starts_with("%") then name = name[1..<name.bytes.len]
+
+        val dot = name.index_of(".")
+
+        if dot.is_some() && in_patched_module(name[(dot.unwrap() + 1)..<name.bytes.len], patched)
+            continue
+
+        out.push(line)
+
+    out
+end types_outside
 
 // The ownership runtime's own type definitions, matched by name -- and **every** name the reference
 // defines, since the two modules now box the same set of payloads. It was the names both texts
@@ -1099,7 +1542,7 @@ end box_lines
 // counted with them -- they are hand-written LLVM templates rather than lowered bodies, so they
 // arrive with the ownership runtime rather than with a function.
 private compare_funcs(theirs: string, mine: string, gaps: Buf[(string, string)], label: string,
-                      found: *TypeAgreement)
+                      confined: Set[string], found: *TypeAgreement)
     val ours = func_texts(mine)
     val wanted = func_texts(theirs)
 
@@ -1108,11 +1551,16 @@ private compare_funcs(theirs: string, mine: string, gaps: Buf[(string, string)],
 
         text_for(ours, name) match
             None ->
-                found.fn_absent += 1
-                tally(&found.reasons, reason_for(gaps, name))
+                if confined.has(name)
+                    found.fn_excused += 1
+                else
+                    found.fn_absent += 1
+                    tally(&found.reasons, reason_for(gaps, name))
             Some(body) ->
                 if body == wanted.at(i).1
                     found.fn_matched += 1
+                else if confined.has(name)
+                    found.fn_excused += 1
                 else
                     found.fn_mismatched += 1
 
@@ -1129,14 +1577,22 @@ end compare_funcs
 // programs differ for the reason the census already names -- a library body nothing here can lower
 // is a body the artifact cannot advertise -- and where it does not, the difference is a defect and
 // the first differing line is quoted.
-private compare_whole_text(theirs: string, raw: string, label: string, found: *TypeAgreement)
+private compare_whole_text(theirs: string, raw: string, label: string, confined: Set[string],
+                           found: *TypeAgreement)
     // **Both sides are read to the same end**, which is the one thing about the two texts that is
     // not the compilers' doing: the reference's arrives through a captured process and this one's as
     // a string, so what a shell would have shown as the last line differs in whether it is there.
     val ours = without_trailing_newlines(raw)
 
-    if theirs == ours
+    if same_text_but_declare_order(theirs, ours)
         found.whole_matched += 1
+        return
+    end if
+
+    // A file is excused only where the two texts are the same text once every confined definition
+    // and declaration is out of both (`patch_confined`).
+    if !confined.is_empty() && without_confined(theirs, confined) == without_confined(ours, confined)
+        found.whole_excused += 1
         return
     end if
 
@@ -1339,7 +1795,8 @@ the_emitted_types_agree()
 
             var reasons: Buf[(string, usize)] = buf()
             var found = TypeAgreement(0, 0, 0, 0, 0, "", 0, 0, 0, "", 0, 0, 0, 0, 0, 0, "",
-                                      reasons)
+                                      reasons, 0, 0, 0)
+            val patched = patched_modules()
 
             for item in walk(root)
                 item match
@@ -1355,20 +1812,24 @@ the_emitted_types_agree()
                                         if declares_a_type(blocks.at(i))
                                             write_text(scratch, blocks.at(i)).unwrap()
                                             compare_types(binary, scratch,
-                                                s"${entry.path} block ${i + 1}", &found)
+                                                s"${entry.path} block ${i + 1}", patched, &found)
 
             remove_file(scratch)
 
             val summary = s"emitted types: ${found.compared} programs compared, " +
                 s"${found.definitions} definitions, ${found.mismatched} mismatched, " +
+                s"${found.excused_types} excused by library_patches.tsv, " +
                 s"${found.skipped_absent} the reference refused, " +
                 s"${found.skipped_unresolved} this compiler could not finish"
 
             val fn_summary = s"emitted functions: ${found.fn_matched} matched, " +
-                s"${found.fn_mismatched} mismatched, ${found.fn_absent} not lowered yet; " +
+                s"${found.fn_mismatched} mismatched, " +
+                s"${found.fn_excused} excused by library_patches.tsv, " +
+                s"${found.fn_absent} not lowered yet; " +
                 s"boxes: ${found.box_matched} matched, ${found.box_mismatched} mismatched"
 
             val whole_summary = s"whole files: ${found.whole_matched} identical, " +
+                s"${found.whole_excused} excused by library_patches.tsv, " +
                 s"${found.whole_absent} short a body this compiler has not built, " +
                 s"${found.whole_precompiled} differing only in what is declared rather than " +
                 s"defined, ${found.whole_other} otherwise"
@@ -1420,6 +1881,10 @@ struct OwnTree
     // Why the bodies only the reference emits are absent, most often first. It is the census a next
     // stage works down, read out of the lowering rather than guessed at from the symbol.
     reasons: Buf[(string, usize)]
+
+    // Definitions `library_patches.tsv` excused (`patch_confined`): shared bodies that differ, and
+    // bodies one text has alone. None of them is counted in `differing` or the two `only_` counts.
+    excused: usize
 end OwnTree
 
 @test("the two compilers emit the same LLVM text for every body of this compiler's own tree")
@@ -1454,13 +1919,16 @@ the_two_agree_on_this_compilers_own_tree()
                    s"this compiler reported on its own tree: ${analysis_report(mine.report)}")
 
             var reasons: Buf[(string, usize)] = buf()
-            var found = OwnTree(0, 0, 0, 0, 0, 0, "", reasons)
+            var found = OwnTree(0, 0, 0, 0, 0, 0, "", reasons, 0)
 
-            census_over(theirs.text, without_trailing_newlines(mine.text), mine.gaps, &found)
+            val ours = ours_without_the_bounds_report(mine.text, theirs.text)
+
+            census_over(theirs.text, without_trailing_newlines(ours), mine.gaps, patched_modules(), &found)
 
             val summary = s"own tree: ${found.theirs} definitions theirs, ${found.ours} ours, " +
                 s"${found.shared} shared of which ${found.differing} differ, " +
-                s"${found.only_theirs} theirs alone, ${found.only_ours} ours alone"
+                s"${found.only_theirs} theirs alone, ${found.only_ours} ours alone, " +
+                s"${found.excused} excused by library_patches.tsv"
 
             val by_reason = census(found.reasons)
 
@@ -1477,9 +1945,11 @@ end the_two_agree_on_this_compilers_own_tree
 // in the order the lowering reached it, so a phase that moves -- module storage laid down before the
 // entry point rather than after the drain -- renumbers a whole body, and that is the difference this
 // census is here to catch.
-private census_over(theirs: string, ours: string, gaps: Buf[(string, string)], found: *OwnTree)
+private census_over(theirs: string, ours: string, gaps: Buf[(string, string)],
+                     patched: Buf[string], found: *OwnTree)
     val wanted = func_texts(theirs)
     val mine = func_texts(ours)
+    val confined = patch_confined(theirs, ours, patched)
 
     found.theirs = wanted.len()
     found.ours = mine.len()
@@ -1489,8 +1959,11 @@ private census_over(theirs: string, ours: string, gaps: Buf[(string, string)], f
 
         text_for(mine, name) match
             None ->
-                found.only_theirs += 1
-                tally(&found.reasons, reason_for(gaps, name))
+                if confined.has(name)
+                    found.excused += 1
+                else
+                    found.only_theirs += 1
+                    tally(&found.reasons, reason_for(gaps, name))
             Some(body) ->
                 found.shared += 1
 
@@ -1498,14 +1971,309 @@ private census_over(theirs: string, ours: string, gaps: Buf[(string, string)], f
                 val got = body
 
                 if want != got
-                    found.differing += 1
+                    if confined.has(name)
+                        found.excused += 1
+                    else
+                        found.differing += 1
 
-                    if found.differing <= 4
-                        found.first_bad = s"${found.first_bad}\n'@$name' differs" +
-                            s"${first_body_difference(want, got)}"
+                        if found.differing <= 4
+                            found.first_bad = s"${found.first_bad}\n'@$name' differs" +
+                                s"${first_body_difference(want, got)}"
+                end if
 
-    val theirs_names = defined_symbols(theirs)
+    val theirs_names = defined_set(theirs)
 
     for i in 0..<mine.len()
-        if !holds_name(theirs_names, mine.at(i).0) then found.only_ours += 1
+        if theirs_names.has(mine.at(i).0) then continue
+
+        if confined.has(mine.at(i).0)
+            found.excused += 1
+        else
+            found.only_ours += 1
 end census_over
+
+// -- the bounds normalisation, held to taking out only what the report adds ---------------------------
+
+// A function 0.0.162 writes for `ix(xs: [3]int, i: usize) -> int = xs[i]`, in a module with one
+// interned string -- the shape the reference lays down around a bounds check.
+private bfm_reference_module() -> string = raw"""
+    target triple = "arm64-apple-macosx"
+
+    declare void @llvm.trap()
+
+    @.str1 = private constant [3 x i8] c"hi\00"
+
+    define i32 @ix([3 x i32] %xs.param, i64 %i.param) {
+    entry:
+      %xs.addr = alloca [3 x i32]
+      %i.addr = alloca i64
+      store [3 x i32] %xs.param, ptr %xs.addr
+      store i64 %i.param, ptr %i.addr
+      %t1 = load i64, ptr %i.addr
+      %t2 = icmp ult i64 %t1, 3
+      br i1 %t2, label %bounds.ok1, label %bounds.bad2
+    bounds.bad2:
+      call void @llvm.trap()
+      unreachable
+    bounds.ok1:
+      %t3 = getelementptr i32, ptr %xs.addr, i64 %t1
+      %t4 = load i32, ptr %t3
+      ret i32 %t4
+    }
+    """
+
+// The same module as this compiler writes it: the report's call in the failure block, its location
+// constant, the `write` the default needs, and the default itself -- the real runtime text.
+private bfm_our_module(theirs: string) -> string =
+    replace_all(replace_all(replace_all(theirs,
+        "declare void @llvm.trap()\n",
+        "declare i64 @write(i32, ptr, i64)\ndeclare void @llvm.trap()\n"),
+        "c\"hi\\00\"\n\n",
+        "c\"hi\\00\"\n@.loc0 = private constant [15 x i8] c\"main.sysl:1:38\\00\"\n\n" +
+            bounds_runtime(host_target())),
+        "bounds.bad2:\n",
+        "bounds.bad2:\n  call void @sysl_bounds_fail(i32 0, i64 %t1, i64 0, i64 3, ptr @.loc0)\n")
+
+// How many bodies two texts disagree on, by the own-tree census's own reading.
+private bfm_differing(theirs: string, ours: string) -> usize
+    var found = OwnTree(0, 0, 0, 0, 0, 0, "", buf(), 0)
+
+    census_over(theirs, without_trailing_newlines(ours_without_the_bounds_report(ours, theirs)),
+                buf(), buf(), &found)
+    found.differing
+end bfm_differing
+
+@test("the bounds normalisation takes out exactly what the report adds, and a changed instruction still differs")
+bfm_the_normalisation_can_still_fail()
+    val theirs = bfm_reference_module()
+    val ours = bfm_our_module(theirs)
+
+    // The fixture is what it claims: every construct the report adds is in it.
+    assert(ours.contains("call void @sysl_bounds_fail("), ours)
+    assert(ours.contains("define weak void @sysl_bounds_fail("), ours)
+    assert(ours.contains("@.loc0 = "), ours)
+
+    // Taken out, the two are one text, whole and body by body.
+    val normal = without_trailing_newlines(ours_without_the_bounds_report(ours, theirs))
+
+    assert(same_text_but_declare_order(without_trailing_newlines(theirs), normal), normal)
+    assert_eq(bfm_differing(theirs, ours), 0)
+
+    // The default laid down after another runtime block, the printer's own blank after the last of
+    // them: that blank is the reference's too and stays.
+    val arc = "define private void @arc.x() {\nentry:\n  ret void\n}\n\n"
+    val theirs_after = replace_all(theirs, "define i32 @ix", arc + "\ndefine i32 @ix")
+    val ours_after = replace_all(theirs_after, arc, arc + bounds_runtime(host_target()))
+
+    assert(same_text_but_declare_order(without_trailing_newlines(theirs_after),
+           without_trailing_newlines(ours_without_the_bounds_report(ours_after, theirs_after))))
+
+    // One unrelated instruction changed in OUR text -- the check's own comparison -- and the census
+    // goes red, as does the whole-file reading.
+    val mutated = replace_all(ours, "icmp ult i64 %t1, 3", "icmp ule i64 %t1, 3")
+
+    assert_eq(bfm_differing(theirs, mutated), 1)
+    assert(!same_text_but_declare_order(without_trailing_newlines(theirs),
+           without_trailing_newlines(ours_without_the_bounds_report(mutated, theirs))))
+
+    // The trap after the report is compared too: dropping it is a difference, not a normalisation.
+    val untrapped = replace_all(ours, "  call void @llvm.trap()\n  unreachable\nbounds.ok1:",
+                                "  unreachable\nbounds.ok1:")
+
+    assert_eq(bfm_differing(theirs, untrapped), 1)
+
+    // A call that only looks like the report's -- another symbol -- is not taken out.
+    val lookalike = replace_all(ours, "call void @sysl_bounds_fail(", "call void @sysl_bounds_failed(")
+
+    assert_eq(bfm_differing(theirs, lookalike), 1)
+
+    // Nor is a constant that only begins like a location.
+    val constant = replace_all(theirs, "@.str1 = ", "@.locale = ")
+
+    assert(!same_text_but_declare_order(without_trailing_newlines(theirs),
+           without_trailing_newlines(ours_without_the_bounds_report(constant, theirs))))
+
+    // And the declarations are a set, not a free pass: one the reference has not got still differs.
+    val extra = replace_all(ours, "declare void @llvm.trap()\n",
+                            "declare void @llvm.trap()\ndeclare void @abort()\n")
+
+    assert(!same_text_but_declare_order(without_trailing_newlines(theirs),
+           without_trailing_newlines(ours_without_the_bounds_report(extra, theirs))))
+end bfm_the_normalisation_can_still_fail
+
+// -- the excuse rule, held to failing ----------------------------------------------------------------
+
+// A pair of texts in the shape the patch leaves: a listed module's body differs, the reference alone
+// defines an instantiation only that body calls, and this compiler alone defines a helper only that
+// body calls. `extra_theirs` and `extra_ours` are appended to each side.
+private lpx_texts(extra_theirs: string, extra_ours: string) -> (string, string)
+    val main = "define void @app$main() {\n  call void @sysl.buf$Buf.push.int(ptr null)\n  ret void\n}\n"
+
+    val theirs = "define void @sysl.buf$Buf.push.int(ptr %self) {\n" +
+        "  call void @sysl.slices$move_elems.int(ptr %self)\n  ret void\n}\n" +
+        "define void @sysl.slices$move_elems.int(ptr %p) {\n  ret void\n}\n" + main + extra_theirs
+
+    val ours = "define void @sysl.buf$Buf.push.int(ptr %self) {\n" +
+        "  call void @arc.slotbuf.int(ptr %self)\n  ret void\n}\n" +
+        "define void @arc.slotbuf.int(ptr %p) {\n  ret void\n}\n" + main + extra_ours
+
+    (theirs, ours)
+end lpx_texts
+
+private lpx_census(theirs: string, ours: string, patched: Buf[string]) -> OwnTree
+    var reasons: Buf[(string, usize)] = buf()
+    var found = OwnTree(0, 0, 0, 0, 0, 0, "", reasons, 0)
+
+    census_over(theirs, ours, buf(), patched, &found)
+    found
+end lpx_census
+
+private lpx_listed() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("sysl.buf")
+    out
+end lpx_listed
+
+@test("library patches: a difference confined to a listed module is excused, and counted")
+lpx_a_listed_module_is_excused_and_counted()
+    val (theirs, ours) = lpx_texts("", "")
+    val found = lpx_census(theirs, ours, lpx_listed())
+
+    assert_eq(found.differing, 0)
+    assert_eq(found.only_theirs, 0)
+    assert_eq(found.only_ours, 0)
+    assert_eq(found.excused, 3)
+
+@test("library patches: the same difference with nothing listed is a failure")
+lpx_nothing_listed_excuses_nothing()
+    val (theirs, ours) = lpx_texts("", "")
+    var none: Buf[string] = buf()
+    val found = lpx_census(theirs, ours, none)
+
+    assert_eq(found.differing, 1)
+    assert_eq(found.only_theirs, 1)
+    assert_eq(found.only_ours, 1)
+    assert_eq(found.excused, 0)
+
+@test("library patches: a body of an UNLISTED module that differs is still a failure")
+lpx_an_unlisted_module_still_fails()
+    val (theirs, ours) = lpx_texts("define void @app$other() {\n  ret void\n}\n",
+                                   "define void @app$other() {\n  unreachable\n}\n")
+    val found = lpx_census(theirs, ours, lpx_listed())
+
+    assert_eq(found.differing, 1)
+    assert_eq(found.excused, 3)
+    assert(found.first_bad.index_of("@app$other").is_some(), found.first_bad)
+
+@test("library patches: a one-sided body reached from outside a listed module is not excused")
+lpx_a_one_sided_body_reached_from_outside_is_not_excused()
+    // The reference alone defines a helper that the listed module calls AND an unlisted body calls:
+    // it is not reached only through the listed module, so its absence here still counts.
+    val shared = "define void @app$uses() {\n  call void @sysl.slices$copy.int(ptr null)\n  ret void\n}\n"
+    val (theirs, ours) = lpx_texts(
+        shared + "define void @sysl.slices$copy.int(ptr %p) {\n  ret void\n}\n", shared)
+    val found = lpx_census(theirs, ours, lpx_listed())
+
+    assert_eq(found.differing, 0)
+    assert_eq(found.only_theirs, 1)
+    assert_eq(found.excused, 3)
+
+@test("library patches: a one-sided body used by nothing, or only from a global, is not excused")
+lpx_a_one_sided_body_used_by_nothing_is_not_excused()
+    val (theirs, ours) = lpx_texts(
+        "@table = constant ptr @sysl.slices$fill.int\n" +
+        "define void @sysl.slices$fill.int(ptr %p) {\n  ret void\n}\n" +
+        "define void @sysl.slices$orphan.int(ptr %p) {\n  ret void\n}\n",
+        "@table = constant ptr @sysl.slices$fill.int\n")
+    val found = lpx_census(theirs, ours, lpx_listed())
+
+    assert_eq(found.only_theirs, 2)
+    assert_eq(found.excused, 3)
+
+@test("library patches: a symbol is in a listed module by the text before its first '$'")
+lpx_the_module_is_the_text_before_the_first_dollar()
+    val listed = lpx_listed()
+
+    assert(in_patched_module("sysl.buf$Buf.push.sh.sysl.compiler$Binding", listed))
+    assert(in_patched_module("\"sysl.buf$Buf.push.a b\"", listed))
+    assert(!in_patched_module("sysl.buffer$Buf.push.int", listed))
+    assert(!in_patched_module("arc.slotbuf.sysl.buf$Buf.int", listed))
+    assert(!in_patched_module("main", listed))
+
+@test("library patches: the listed modules are read from the file, comments and blank lines aside")
+lpx_the_modules_are_read_from_the_file()
+    val dir = make_temp_dir("sysl-lpx").unwrap()
+    val file = dir + "/library_patches.tsv"
+
+    val rows = "# <file>\t<module>\t<what>\n\nsysl/buf/buf.sysl\tsysl.buf\tslots\n" +
+        "sysl/buf/tests.sysl\tsysl.buf\ttests\nsysl/container/deque.sysl\tsysl.container\tring\n"
+
+    write_text(file, rows).unwrap()
+
+    val modules = patched_modules_in(file)
+
+    remove_dir_all(dir).unwrap_or(())
+    assert_eq(modules.len(), 2)
+    assert_eq(modules.at(0), "sysl.buf")
+    assert_eq(modules.at(1), "sysl.container")
+    assert(patched_modules_in(dir + "/absent.tsv").is_empty())
+
+@test("library patches: the repository's own file is what the sweeps read")
+lpx_the_repository_file_is_read()
+    val modules = patched_modules()
+
+    assert(holds_name(modules, "sysl.buf"), "sysl.buf is listed")
+    assert(holds_name(modules, "sysl.container"), "sysl.container is listed")
+
+@test("library patches: a whole file is excused only where the rest of it is the same text")
+lpx_a_whole_file_is_excused_only_where_the_rest_agrees()
+    val (theirs, ours) = lpx_texts("", "")
+    val confined = patch_confined(theirs, ours, lpx_listed())
+
+    assert_eq(without_confined(theirs, confined), without_confined(ours, confined))
+
+    val (theirs2, ours2) = lpx_texts("@g = global i64 1\n", "@g = global i64 2\n")
+    val confined2 = patch_confined(theirs2, ours2, lpx_listed())
+
+    assert(without_confined(theirs2, confined2) != without_confined(ours2, confined2))
+
+// -- the reference's source root for this tree ------------------------------------------------------
+
+@test("the reference's overlay holds the modules library/ adds, and none it changes")
+rov_the_overlay_holds_only_added_modules()
+    val dir = make_temp_dir("sysl-rov").unwrap()
+    val lib = s"$dir/theirs"
+    val ours = s"$dir/ours"
+
+    make_dir_all(s"$lib/sysl/buf").unwrap()
+    write_text(s"$lib/sysl/buf/buf.sysl", "module sysl.buf\n").unwrap()
+    make_dir_all(s"$ours/sysl/buf").unwrap()
+    make_dir_all(s"$ours/sysl/testing").unwrap()
+    write_text(s"$ours/sysl/buf/buf.sysl", "module sysl.buf\n// patched\n").unwrap()
+    write_text(s"$ours/sysl/testing/testing.sysl", "module sysl.testing\n").unwrap()
+    write_text(s"$dir/patches.tsv", "# a comment\n\nsysl/buf/buf.sysl\tsysl.buf\tchanged\n" +
+               "sysl/testing/testing.sysl\tsysl.testing\tadded\n").unwrap()
+
+    val root = reference_overlay_from(lib, s"$dir/patches.tsv", ours)
+
+    assert(root.is_some(), "no overlay was made for an added module")
+    assert_eq(read_text(s"${root.unwrap()}/sysl/testing/testing.sysl").unwrap_or(""), "module sysl.testing\n")
+    assert(!present(s"${root.unwrap()}/sysl/buf/buf.sysl"), "a changed module reached the reference")
+    remove_dir_all(root.unwrap()).unwrap_or(())
+    remove_dir_all(dir).unwrap_or(())
+end rov_the_overlay_holds_only_added_modules
+
+@test("with nothing added there is no overlay")
+rov_nothing_added_is_no_overlay()
+    val dir = make_temp_dir("sysl-rov").unwrap()
+
+    make_dir_all(s"$dir/theirs/sysl/buf").unwrap()
+    make_dir_all(s"$dir/ours/sysl/buf").unwrap()
+    write_text(s"$dir/theirs/sysl/buf/buf.sysl", "module sysl.buf\n").unwrap()
+    write_text(s"$dir/ours/sysl/buf/buf.sysl", "module sysl.buf\n").unwrap()
+    write_text(s"$dir/patches.tsv", "sysl/buf/buf.sysl\tsysl.buf\tchanged\n").unwrap()
+
+    assert(reference_overlay_from(s"$dir/theirs", s"$dir/patches.tsv", s"$dir/ours").is_none())
+    assert(reference_overlay_from(s"$dir/theirs", s"$dir/missing.tsv", s"$dir/ours").is_none())
+    remove_dir_all(dir).unwrap_or(())

@@ -25,39 +25,41 @@ import sysl.text.Search
 // manifests, so a project that cannot be built on this machine can still be tidied.
 tidy_command(args: []string, say: string -> unit) -> int =
     tidy_arguments(args) match
-        None ->
-            say(tidy_usage())
+        Err(mistakes) ->
+            say(if mistakes.len() > 0 then misused(mistakes, tidy_usage()) else tidy_usage())
             Misused
-        Some(read) -> tidy_project(read.0, read.1, say)
+        Ok(read) -> tidy_project(read.0, read.1, say)
 
 // What a `sysl tidy` command line asks for: the project, which is the working directory where no path
-// is given, and whether it is `--check`. A `--lib` and the other search flags are taken on the way.
-tidy_arguments(args: []string) -> Option[(string, bool)]
+// is given, and whether it is `--check`. A `--lib` and the flags every command takes are taken on the
+// way. `Err` carries the mistakes in the command line, and is empty where the mistake is a second
+// path.
+tidy_arguments(args: []string) -> Result[(string, bool), Buf[string]]
     var path = "."
     var given = false
     var check = false
+    var mistakes: Buf[string] = buf()
     var i: usize = 2
 
     while i < args.len
-        val took = took_search_flag(args, i)
-
-        if took == 0 then return None
-
-        if took > 0
-            i += usize(took)
-            continue
-
         if args[i] == "--check"
             check = true
-        else if !given && !args[i].starts_with("-")
-            path = args[i]
-            given = true
         else
-            return None
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken > 0
+                i += taken - 1
+            else if given
+                return Err(mistakes)
+            else
+                path = args[i]
+                given = true
 
         i += 1
 
-    Some((path, check))
+    if mistakes.len() > 0 then return Err(mistakes)
+
+    Ok((path, check))
 end tidy_arguments
 
 private tidy_usage() -> string = "usage: sysl tidy [--check] [<path>]"
@@ -71,12 +73,19 @@ end tidy_root
 
 // The whole command once the command line has been read.
 tidy_project(path: string, check: bool, say: string -> unit) -> int
-    val root = tidy_root(path)
+    // **Inside a workspace there is one `sysl.sum`, at its root**, and tidying it from any member
+    // tidies it for all of them.
+    val root = resolution_root(tidy_root(path)) match
+        Err(why) ->
+            say(refused(why))
+            return Failed
+        Ok(dir) -> dir
+
     val file = join_path(root, SumsName)
 
     if !is_file(join_path(root, ManifestName))
-        say(s"error: '$root' has no $ManifestName — 'sysl tidy' tidies a project's $SumsName, and " +
-            "only a project with a manifest resolves anything to record")
+        say(refused(s"'$root' has no $ManifestName — 'sysl tidy' tidies a project's $SumsName, and " +
+            "only a project with a manifest resolves anything to record"))
         return Failed
 
     var text = ""
@@ -84,14 +93,14 @@ tidy_project(path: string, check: bool, say: string -> unit) -> int
     if is_file(file)
         text = read_text(file) match
             Err(_) ->
-                say(s"error: cannot read $file")
+                say(refused(s"cannot read $file"))
                 return Failed
             Ok(got) -> got
     end if
 
     val answered = tidy_answer(root, text) match
         Err(why) ->
-            say(s"error: $why")
+            say(refused(why))
             return Failed
         Ok(got) -> got
 
@@ -103,13 +112,13 @@ tidy_project(path: string, check: bool, say: string -> unit) -> int
     if check
         tidy_say(say, "would remove", answered.removed)
         tidy_say(say, "would add", answered.added)
-        say(s"error: $SumsName is not tidy — 'sysl tidy' rewrites it to what this project resolves to")
+        say(refused(s"$SumsName is not tidy — 'sysl tidy' rewrites it to what this project resolves to"))
         return Failed
 
     val wrote = if answered.text.is_empty() then remove_file(file) else write_text(file, answered.text)
 
     if wrote.is_err()
-        say(s"error: cannot write $file")
+        say(refused(s"cannot write $file"))
         return Failed
 
     tidy_say(say, "removed", answered.removed)
@@ -124,6 +133,17 @@ private tidy_say(say: string -> unit, verb: string, keys: &Buf[(string, Release)
 // What the file would be after tidying, resolved over the whole graph.
 private tidy_answer(root: string, text: string) -> Result[Tidied, string]
     val before = sums_read(text)?
+
+    // A workspace's lines are what its one selection reads, which is every member's whole graph.
+    val around = workspace_around(root)?
+
+    around match
+        Some(ws) ->
+            val s = workspace_selection(ws, before, cache_root(ws.root)?)?
+
+            return Ok(sums_tidied(text, s.sums, s.read))
+        None -> ()
+
     val m = manifest_of_package(root)?
     var declared: Buf[Dependency] = buf()
 
