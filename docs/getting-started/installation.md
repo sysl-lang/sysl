@@ -68,13 +68,13 @@ sysl build hello.sysl -o hello
 
 ## Build from source
 
-The compiler is a Scala 3 cross-project, so the path in is a clone and an sbt build. You want this if
-you are working *on* sysl, or if you are on a platform the tap has no binary for.
+**The compiler is written in sysl and builds itself**, so the path in is a clone and a `sysl build`
+by a compiler you already have. You want this if you are working *on* sysl, or if you are on a
+platform the tap has no binary for.
 
 | | why |
 |---|---|
-| **JDK 17+** | the compiler is written in Scala and runs on the JVM |
-| **sbt 1.12+** | builds it |
+| **an installed `sysl`** | the compiler is a sysl program, so building it takes a sysl — the seed |
 | **clang** | sysl emits textual LLVM IR; clang assembles and links it |
 | **llvm-ar** | the standard module's compiled half is an `ar` archive of objects |
 | **pkg-config** | only for a package that names an installed C library; without it, say where the library is with `--include-path` and `--link-path` |
@@ -87,38 +87,38 @@ one; on Debian and Ubuntu it is the `clang` package.
 built *for*, and a platform archiver indexes only its own format and silently drops the rest. On a Mac, Homebrew keeps its LLVM deliberately off the
 `PATH`, so sysl looks in `/opt/homebrew/opt/llvm/bin` as well.
 
+The repository holds two things side by side: **`compiler/`**, the compiler's own project, and
+**`library/`**, the standard library it ships. Every build of the compiler runs from `compiler/` —
+the repository root is not a project, and a build there reads the library's files as though they were
+the program's.
+
+The build is the one a release makes, in two stages. The seed builds the tree against **its own**
+library, since `library/` may use forms the seed's library has not got; what that produces then
+builds the tree again against `library/`, and **the second is the compiler**:
+
 ```bash
-git clone https://github.com/sysl-lang/sysl-bootstrap.git
-cd sysl-bootstrap
-sbt syslJVM/compile
+git clone https://github.com/sysl-lang/sysl.git
+cd sysl/compiler
+sysl build . -o stage1
+SYSL_LIB=$(cd ../library; pwd) ./stage1 build . -o sysl
 ```
 
-The JVM target is the one to develop against. JS and Native cross-targets exist in the build, and the
-Native one is what the released binary is built from:
-
-```bash
-SYSL_RELEASE=1 sbt syslNative/nativeLink
-```
-
-Without `SYSL_RELEASE` that links in debug mode, which is much faster and is what you want while
-working on the compiler.
+Each stage takes several minutes. Debug or release is
+the optimization level and nothing else: the compiler's default is `-O1`, and a release passes the
+same `-O` to both stages.
 
 ### Check it
 
 ```bash
-sbt "syslJVM/run run guide/ring"
+./sysl --version
+./sysl run hello.sysl
 ```
 
-That compiles one of the guide programs all the way to a native binary and runs it. Each guide
-program checks itself, so what you should see is a run of `-- section` headers and `ok` lines and
-nothing saying `FAIL` — at which point everything is in place.
-
-Any of the directories in `guide/` works the same way. Where a program declares
-`main(args: []string)`, anything after a `--` goes to it rather than to sysl:
-
-```bash
-sbt "syslJVM/run run <program> -- one two"
-```
+A compiler built from a checkout answers `sysl 0.0.1` — it is a development build, not a release, and
+it [checks no version floor](/reference/packages/#the-oldest-compiler-a-package-builds-with). Run from
+`compiler/` it finds the standard library as `../library` with nothing set; anywhere else, set
+`SYSL_LIB` to the checkout's `library/`. An install is the same two things laid out as a prefix —
+`bin/sysl` and `share/sysl/library` beside it — which is where the compiler looks first.
 
 ## The standard library
 
