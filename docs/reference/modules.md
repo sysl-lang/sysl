@@ -1775,6 +1775,56 @@ An artifact **named** on the command line is never rebuilt, and one that cannot 
 compilation — corrupt, truncated, built by another sysl, or built from other sources. Someone who
 wrote down which standard module to compile against is owed the truth about that one.
 
+## Source roots
+
+<!-- Each claim below is pinned by a test in compiler/sh/sysl/compiler/: tests_lib_root.sysl
+     (lbr_the_flag_is_read, lbr_every_command_takes_it, lbr_two_roots_both_called, lbr_two_roots_run,
+     lbr_a_shared_module_merges, lbr_a_root_calls_the_project, lbr_a_name_declared_on_both_sides,
+     lbr_a_strayed_root_file, lbr_a_roots_body_is_checked, lbr_refuses_an_empty_root,
+     lbr_refuses_a_missing_root, lbr_c_beside_a_root, lbr_a_roots_defines_reach_its_c,
+     lbr_a_roots_c_reaches_the_archive), tests_lib_root_manifest.sysl (lbm_a_roots_allocator_is_the_programs,
+     lbm_a_root_with_no_manifest_keeps_libcs_pair, lbm_two_roots_naming_different_pairs,
+     lbm_a_roots_header_requirement_is_asked, lbm_a_roots_pkg_config_is_probed,
+     lbm_a_root_with_no_manifest_requires_nothing) and tests_lib_root_deps.sysl
+     (lbd_two_roots_dependencies_claim_one_module, lbd_a_roots_dependency_and_the_projects_module,
+     lbd_build_lib_refuses_a_roots_dependencies). A page cannot run a build of two directories, so
+     the command line is a `text` block and the tests are the evidence. -->
+
+A directory handed to `--lib` is a **source root**: a tree of modules that joins the compilation
+beside the project's own. The flag may be given more than once, and `build`, `emit-typed` and
+`emit-llvm` all take it:
+
+```text
+sysl build main.sysl --lib ../geom --lib ../units
+```
+
+**A root is simply more modules.** Its files join the compilation under the names they wrote, with
+no prefix of their own — which is the whole difference between a root and a package, whose modules
+are named by its coordinate. So a module the project and a root both declare is **one** module: the
+root's code may call what only the project's files declare, and one name declared on both sides is
+the ordinary duplicate.
+
+**A root is a tree, held to the rules the project is held to.** A file whose `module` header
+disagrees with the directory it sits in is refused, and a root's bodies are checked as a program's
+are. A root that is not there, or that holds no sysl source, is refused.
+
+**A root's `package.hocon` is read**, so what it declares reaches the build exactly as a dependency's
+would, named as the root was given: its allocator becomes the pair the program allocates through
+(two roots naming different pairs are refused rather than resolved by order), its header
+requirements are asked, and the installed libraries its `pkg_config` block names are probed and
+linked. A root with no manifest declares nothing. The C beside a root's modules is compiled under the
+macros the root's manifest defines for it and linked with the program's — into the archive, under
+`build-c`.
+
+**A root's `dependencies` resolve in the one graph** with the project's, under the same rule: two
+packages offering one module are refused, and so is a root's dependency offering a module the project
+declares. `build-lib` fetches nothing, so it refuses a root that declares dependencies by name.
+
+A root that *is* one of the project's dependencies — its manifest names the package the coordinate
+does — stands in for that dependency instead;
+[`reference/packages.md` § A source root stands in for the package it is](/reference/packages/#a-source-root-stands-in-for-the-package-it-is)
+has that rule.
+
 ## What is deliberately absent
 
 | absent | why |

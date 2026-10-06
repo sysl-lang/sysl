@@ -1,0 +1,1124 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, read_bytes, remove_dir_all, walk, write_text}
+import sysl.slices.sort
+import sysl.text.{from_utf8, join, split, str_builder, Search}
+import sysl.unicode
+
+// Three checks over the documentation that no compiler test makes, ported from the two repositories
+// the documentation used to sit between.
+//
+// **A cross-reference is the one kind of prose that rots without saying so**, and there are three
+// kinds here, each pointing across a line nothing else checks:
+//
+// - **A heading pointer** -- `reference/<page>.md § <Section>` in a comment of the compiler or the
+//   library -- names its section by TITLE, so retitling a heading kills every pointer at it and both
+//   halves stay individually correct prose. Ported from the bootstrap's `check-pointers.py`, rule for
+//   rule: wrapped comment lines are collapsed first, and a pointer may name a heading's LEADING
+//   words (`§ Platform selection` for *Platform selection -- `__<machines>__`*).
+// - **The written library index** (`docs/library/_index.md`) names modules by path, and a module that
+//   left the library leaves its row pointing at nothing. Ported from sysl.sh's `LibraryIndexTests`, in
+//   its one direction: every module the table names is one the library declares. A module does not
+//   have to have a row -- which modules earn a written page is an editorial decision.
+// - **An anchored link** -- `](/reference/errors/#a-section)` -- lands a reader at the top of the
+//   right page, reading the wrong section, when the heading it named was reworded. Ported from
+//   sysl.sh's `AnchorTests`: the destination is folded the way a browser folds it, each page's
+//   headings are slugged the way juicer slugs them, and a miss offers the near ones.
+//
+// They read `../docs` and `../library` from `compiler/`, as `tests_docs.sysl` does, or the pages of
+// the `sysl.sh` checkout `SYSL_SITE` names. `SYSL_DOCCHECK_SUMMARY` names a file prefix each check
+// writes its counts to, the runner showing nothing a passing test says.
+
+// -- reading the trees ------------------------------------------------------------------------------
+
+// Where the pages are: this repository's own `docs/`, or the pages of a `sysl.sh` checkout.
+private dck_docs_root() -> string
+    val named = env_var("SYSL_SITE")
+    val root = if named.is_none() then "../docs"
+    else named.unwrap() + "/docs/content"
+
+    if metadata(root).is_ok() then root else ""
+end dck_docs_root
+
+// A file's text, or nothing where it is not UTF-8. `read_text` ends the process over such a file, and
+// a tree walked whole holds whatever a build left in it -- the script this ports skipped the same
+// files the same way.
+private dck_text(file: string) -> Option[string] = read_bytes(file) match
+    Err(_) -> None
+    Ok(b) -> from_utf8(b).ok()
+
+// Every file under `root` whose name ends in `suffix`, sorted so a complaint list reads the same way
+// on every run.
+private dck_files(root: string, suffix: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in walk(root)
+        item match
+            Err(_) -> ()
+            Ok(e) ->
+                if !e.is_dir() && e.path.ends_with(suffix) then out.push(e.path)
+
+    sort(out.view())
+    out
+end dck_files
+
+private dck_relative(root: string, file: string) -> string =
+    if file.starts_with(root + "/") then file[root.len + 1..] else file
+
+// A file's lines, with the `\r` of a line ending taken off as a line reader takes it.
+private dck_lines(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for line in split(text, "\n")
+        out.push(if line.ends_with("\r") then line[0..<(line.len - 1)] else line)
+
+    out
+end dck_lines
+
+// `\s` as both regular-expression engines the ported checks were written in read it.
+private dck_is_space(b: u8) -> bool =
+    b == u8(' ') || b == u8('\t') || b == u8('\n') || b == u8('\r') || b == 11 || b == 12
+
+private dck_bytes_at(b: []const u8, at: usize, part: string) -> bool
+    if at + part.len > b.len then return false
+
+    for i in 0..<part.len
+        if b[at + i] != part.bytes[i] then return false
+
+    true
+end dck_bytes_at
+
+// Where a summary file was asked for, the counts a check came to.
+private dck_record(kind: string, line: string)
+    val where = env_var("SYSL_DOCCHECK_SUMMARY")
+
+    if where.is_some() then write_text(s"${where.unwrap()}.$kind", line + "\n").unwrap_or(())
+
+// -- the heading pointers ---------------------------------------------------------------------------
+
+// A pointer's section name may be wrapped across two comment lines, which puts a `//` -- or a ` * `,
+// where a block comment is written that way -- in the middle of it. A newline, the whitespace after
+// it, a comment marker and one space after that become one space, as `check-pointers.py`'s
+// `CONTINUATION` has it; collapsing first is what separates about a hundred false failures from the
+// real ones.
+private dck_collapse(text: string) -> string
+    val b = text.bytes
+    var out = str_builder()
+    var from: usize = 0
+    var i: usize = 0
+
+    while i < b.len
+        if b[i] == u8('\n')
+            var j = i + 1
+
+            while j < b.len && dck_is_space(b[j])
+                j += 1
+
+            val mark = dck_marker(b, j)
+
+            if mark > 0
+                var k = j + mark
+
+                if k < b.len && b[k] == u8(' ') then k += 1
+
+                out.push(text[from..<i])
+                out.push(" ")
+                from = k
+                i = k
+                continue
+            end if
+        end if
+
+        i += 1
+    end while
+
+    out.push(text[from..])
+    out.finish()
+end dck_collapse
+
+// The comment marker at `at`, as its length: `*/`, `*`, `//` or `/*`, tried in that order.
+private dck_marker(b: []const u8, at: usize) -> usize
+    if dck_bytes_at(b, at, "*/") then return 2
+    if dck_bytes_at(b, at, "*") then return 1
+    if dck_bytes_at(b, at, "//") || dck_bytes_at(b, at, "/*") then return 2
+
+    0
+end dck_marker
+
+private dck_page_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('0') && c <= u8('9')) || c == u8('.') || c == u8('_') ||
+    c == u8('-')
+
+// One pointer as written: the page it names, the section if it names one, and where it ends.
+private struct DckPointer
+    page: string
+    section: Option[string]
+    ends: usize
+
+// The pointer opening at the backtick at `at`, if one does:
+// `` `(reference|library|getting-started|guides|tour)/[a-z0-9._-]+\.md( § [^`]+)?` ``.
+private dck_pointer_at(text: string, at: usize) -> Option[DckPointer]
+    val b = text.bytes
+    var i = at + 1
+    var dir = false
+
+    for d in ["reference/", "library/", "getting-started/", "guides/", "tour/"]
+        if !dir && dck_bytes_at(b, i, d)
+            dir = true
+            i += d.len
+
+    if !dir then return None
+
+    val name_from = i
+
+    while i < b.len && dck_page_byte(b[i])
+        i += 1
+
+    // The run is a name and then `.md`, so it ends in `.md` with something in front of it: no `.md`
+    // inside the run can be the one, since what follows it is still part of the run.
+    if i - name_from < 4 || !dck_bytes_at(b, i - 3, ".md") then return None
+
+    val page = text[(at + 1)..<i]
+
+    if i < b.len && b[i] == u8('`') then return Some(DckPointer(page, None, i + 1))
+
+    if !dck_bytes_at(b, i, " § ") then return None
+
+    val from = i + " § ".len
+    var j = from
+
+    while j < b.len && b[j] != u8('`')
+        j += 1
+
+    if j >= b.len || j == from then return None
+
+    Some(DckPointer(page, Some(text[from..<j]), j + 1))
+end dck_pointer_at
+
+// The headings `check-pointers.py` reads off one page: a line of two to four `#`s and whitespace,
+// trimmed, with its backticks taken out. **Not fence-aware, as the script is not** -- a fenced `## x`
+// is one more heading a pointer may name, which costs nothing.
+private dck_pointer_headings(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for line in split(text, "\n")
+        val b = line.bytes
+        var n: usize = 0
+
+        while n < b.len && b[n] == u8('#')
+            n += 1
+
+        if n >= 2 && n <= 4 && (n == b.len || dck_is_space(b[n]))
+            out.push(dck_without(line[n..].trim(), u8('`')))
+    end for
+
+    out
+end dck_pointer_headings
+
+private dck_without(s: string, gone: u8) -> string
+    var out = str_builder()
+    var from: usize = 0
+
+    for i in 0..<s.len
+        if s.bytes[i] == gone
+            out.push(s[from..<i])
+            from = i + 1
+
+    out.push(s[from..])
+    out.finish()
+end dck_without
+
+// One page's headings, under the name a pointer gives the page.
+private struct DckSections
+    page: string
+    headings: Buf[string]
+
+private dck_sections(root: string) -> Buf[DckSections]
+    var out: Buf[DckSections] = buf()
+
+    for file in dck_files(root, ".md").view()
+        val text = dck_text(file).unwrap_or("")
+
+        out.push(DckSections(dck_relative(root, file), dck_pointer_headings(text)))
+
+    out
+end dck_sections
+
+// What a pointer resolves to: why it is dead, or nothing where it lands. A citation may name a
+// heading's leading words, so a prefix counts as a match.
+private dck_dead(p: DckPointer, pages: Buf[DckSections]) -> Option[string]
+    for i in 0..<pages.len()
+        val at = pages[i]
+
+        if at.page == p.page
+            if p.section.is_none() then return None
+
+            val section = p.section.unwrap()
+
+            for h in at.headings.view()
+                if h.starts_with(section) then return None
+
+            return Some("no such section")
+        end if
+    end for
+
+    Some("no such page")
+end dck_dead
+
+// What one file's pointers came to: how many there are, and a line for each dead one.
+private struct DckPointerCount
+    checked: int
+    dead: Buf[string]
+
+private dck_pointers_in(text: string, where: string, pages: Buf[DckSections]) -> DckPointerCount
+    val t = dck_collapse(text)
+    val b = t.bytes
+    var checked = 0
+    var dead: Buf[string] = buf()
+    var i: usize = 0
+
+    while i < b.len
+        if b[i] == u8('`')
+            dck_pointer_at(t, i) match
+                Some(p) ->
+                    checked += 1
+
+                    dck_dead(p, pages) match
+                        Some(why) -> dead.push(s"$why: $where\n  ${t[i..<p.ends]}")
+                        None -> ()
+
+                    i = p.ends
+                    continue
+                None -> ()
+        end if
+
+        i += 1
+    end while
+
+    DckPointerCount(checked, dead)
+end dck_pointers_in
+
+@test("every heading pointer the compiler and the library write names a section the docs carry")
+dck_every_pointer_resolves()
+    val docs = dck_docs_root()
+
+    if docs == ""
+        print("skipped: no pages at '../docs' (run from 'compiler/') or at what SYSL_SITE names")
+        return
+    end if
+
+    val pages = dck_sections(docs)
+    var checked = 0
+    var dead: Buf[string] = buf()
+
+    for tree in [".", "../library"]
+        val shown = if tree == "." then "compiler/" else "library/"
+
+        for file in dck_files(tree, "").view()
+            dck_text(file) match
+                Some(text) ->
+                    val count = dck_pointers_in(text, shown + dck_relative(tree, file), pages)
+
+                    checked += count.checked
+                    dead.extend(count.dead.view())
+                None -> ()
+    end for
+
+    dck_record("pointers", s"$checked pointers, ${dead.len()} unresolvable")
+
+    // A walk that found nothing to read would pass the check below over nothing at all.
+    // 397 when this was written; the floor catches collection breaking, not a census.
+    assert(checked >= 300, s"the compiler and the library carry their pointers: only $checked")
+    assert(dead.is_empty(),
+           s"$checked pointers, ${dead.len()} unresolvable:\n\n" + join(dead.view(), "\n") + "\n")
+end dck_every_pointer_resolves
+
+@test("a pointer is read across a wrapped comment line and may name a heading's leading words")
+dck_a_pointer_wraps_and_names_a_prefix()
+    var pages: Buf[DckSections] = buf()
+
+    pages.push(DckSections("reference/ffi.md",
+                           dck_pointer_headings("## A library may carry C beside a module\n")))
+
+    // The backtick is spliced in, or this file would carry four pointers of its own, two of them dead.
+    val q = "`"
+    val text = s"// see ${q}reference/ffi.md § A library may\n    // carry C$q and ${q}reference/ffi.md § A\n" +
+               s"// library may carry Rust$q and ${q}reference/gone.md$q and ${q}reference/ffi.md$q"
+    val count = dck_pointers_in(text, "x.sysl", pages)
+
+    assert_eq(count.checked, 4)
+    assert_eq(count.dead.len(), 2)
+    assert_eq(count.dead[0], s"no such section: x.sysl\n  ${q}reference/ffi.md § A library may carry Rust$q")
+    assert_eq(count.dead[1], s"no such page: x.sysl\n  ${q}reference/gone.md$q")
+end dck_a_pointer_wraps_and_names_a_prefix
+
+// -- the written library index ----------------------------------------------------------------------
+
+private dck_module_byte(c: u8) -> bool = (c >= u8('a') && c <= u8('z')) || c == u8('_')
+
+// The module path a row of the index is about, which is its first cell: a link whose text is the path
+// in a code span -- `` ^\|\s*\[`(sysl(?:\.[a-z_]+)*)`\] ``. The header and the rule under it match
+// nothing, which is the whole of the parsing.
+private dck_index_row(line: string) -> Option[string]
+    val b = line.bytes
+
+    if b.len == 0 || b[0] != u8('|') then return None
+
+    var i: usize = 1
+
+    while i < b.len && dck_is_space(b[i])
+        i += 1
+
+    if !dck_bytes_at(b, i, "[`sysl") then return None
+
+    val from = i + 2
+
+    i += 6
+
+    while i < b.len && b[i] == u8('.')
+        var j = i + 1
+
+        while j < b.len && dck_module_byte(b[j])
+            j += 1
+
+        if j == i + 1 then return None
+
+        i = j
+    end while
+
+    if !dck_bytes_at(b, i, "`]") then return None
+
+    Some(line[from..<i])
+end dck_index_row
+
+private dck_index_rows(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for line in dck_lines(text).view()
+        dck_index_row(line) match
+            Some(m) -> out.push(m)
+            None -> ()
+
+    out
+end dck_index_rows
+
+private dck_has(xs: Buf[string], x: string) -> bool
+    for y in xs.view()
+        if y == x then return true
+
+    false
+
+// Every module the library declares, read off the header each of its files states. A header and a
+// directory are two statements of one fact, which the compiler holds them to, so either would do;
+// the header is what a reader of the file sees.
+private dck_declared(root: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for file in dck_files(root, "").view()
+        if file.ends_with(".sysl") || file.ends_with(".lsysl")
+            for line in dck_lines(dck_text(file).unwrap_or("")).view()
+                val t = line.trim()
+
+                if t.starts_with("module ")
+                    val name = t[7..].trim()
+                    val word = name[0..<name.index_of(" ").unwrap_or(name.len)]
+
+                    if !dck_has(out, word) then out.push(word)
+                    break
+                end if
+            end for
+        end if
+    end for
+
+    out
+end dck_declared
+
+@test("every module the written library index names is one the library declares")
+dck_the_index_names_only_modules()
+    val docs = dck_docs_root()
+
+    if docs == "" || !metadata("../library/sysl").is_ok()
+        print("skipped: no pages at '../docs' or no library at '../library'")
+        return
+    end if
+
+    val modules = dck_declared("../library")
+    val named = dck_index_rows(dck_text(docs + "/library/_index.md").unwrap_or(""))
+    var gone: Buf[string] = buf()
+
+    for m in named.view()
+        if !dck_has(modules, m) then gone.push(m)
+
+    dck_record("library-index", s"${named.len()} modules indexed, ${modules.len()} declared")
+
+    assert(modules.len() >= 20, s"the library declared its modules: only ${modules.len()}")
+    assert(gone.is_empty(),
+           "named in the index and not declared by the library: " + join(gone.view(), ", "))
+end dck_the_index_names_only_modules
+
+// The half that makes the half above mean anything: a table nobody could parse passes it.
+@test("the written library index carries a row for the modules it has always carried")
+dck_the_index_carries_its_rows()
+    val docs = dck_docs_root()
+
+    if docs == ""
+        print("skipped: no pages at '../docs' (run from 'compiler/') or at what SYSL_SITE names")
+        return
+    end if
+
+    val named = dck_index_rows(dck_text(docs + "/library/_index.md").unwrap_or(""))
+
+    assert(named.len() >= 20, s"module rows found: ${named.len()}")
+    assert(dck_has(named, "sysl.math"), "the index has a row for sysl.math")
+    assert(dck_has(named, "sysl.text"), "the index has a row for sysl.text")
+end dck_the_index_carries_its_rows
+
+@test("a library index row is read for its module path and nothing else is")
+dck_an_index_row()
+    assert_eq(dck_index_row("| [`sysl.math`](/library/math/) | the numbers | — |"), Some("sysl.math"))
+    assert_eq(dck_index_row("|  [`sysl`](/library/core/) | the core |"), Some("sysl"))
+    assert_eq(dck_index_row("| [`sysl.posix.time`](/library/time/) |"), Some("sysl.posix.time"))
+    assert_eq(dck_index_row("| module | what it is |"), None)
+    assert_eq(dck_index_row("|---|---|"), None)
+    assert_eq(dck_index_row("| [`sysl.Math`](/library/math/) |"), None)
+    assert_eq(dck_index_row("[`sysl.math`](/library/math/)"), None)
+
+// -- the anchors ------------------------------------------------------------------------------------
+
+// Where a page is published: `_index.md` is a section's own page and takes its directory's address,
+// anything else takes its own name as a directory of its own. Both end in a slash, because that is
+// how the pages link to each other.
+private dck_url_of(page: string) -> string
+    val s = if page.ends_with(".md") then page[0..<(page.len - 3)] else page
+
+    if s == "_index" then return "/"
+    if s.ends_with("/_index") then return s"/${s[0..<(s.len - 7)]}/"
+
+    s"/$s/"
+end dck_url_of
+
+// A page's `slugStyle`, if its frontmatter names one, and the empty string otherwise. The frontmatter
+// here is flat and one key deep, so a line match is the whole of reading it.
+private dck_slug_style(lines: Buf[string]) -> string
+    if lines.is_empty() || lines[0] != "---" then return ""
+
+    for i in 1..<lines.len()
+        val l = lines[i]
+
+        if l == "---" then return ""
+
+        if l.starts_with("slugStyle:")
+            val v = l[10..].trim()
+            val open = if v.starts_with("\"") then v[1..] else v
+
+            return if open.ends_with("\"") then open[0..<(open.len - 1)] else open
+        end if
+    end for
+
+    ""
+end dck_slug_style
+
+// A page without its frontmatter. Not cosmetic: the `---` fences read as a thematic break and a setext
+// underline, so a page left whole gains a heading made of its own metadata, with an id to match.
+private dck_body(lines: Buf[string]) -> Buf[string]
+    if lines.is_empty() || lines[0] != "---" then return lines
+
+    var out: Buf[string] = buf()
+    var i: usize = 1
+
+    while i < lines.len() && lines[i] != "---"
+        i += 1
+
+    if i >= lines.len() then return out
+
+    for j in (i + 1)..<lines.len()
+        out.push(lines[j])
+
+    out
+end dck_body
+
+private dck_indent(line: string) -> usize
+    var n: usize = 0
+
+    while n < line.len && line.bytes[n] == u8(' ')
+        n += 1
+
+    n
+end dck_indent
+
+private dck_run(b: []const u8, at: usize, c: u8) -> usize
+    var n: usize = 0
+
+    while at + n < b.len && b[at + n] == c
+        n += 1
+
+    n
+end dck_run
+
+private dck_blank_from(b: []const u8, at: usize) -> bool
+    for i in at..<b.len
+        if b[i] != u8(' ') && b[i] != u8('\t') then return false
+
+    true
+end dck_blank_from
+
+// The text of an ATX heading with the opening run and an optional closing run of `#`s taken off, or
+// nothing where the line is not one: at most three spaces in, one to six `#`s, then a space or the end.
+private dck_atx(line: string) -> Option[string]
+    val ind = dck_indent(line)
+    val b = line.bytes
+
+    if ind > 3 then return None
+
+    val n = dck_run(b, ind, u8('#'))
+
+    if n == 0 || n > 6 then return None
+    if ind + n < b.len && b[ind + n] != u8(' ') && b[ind + n] != u8('\t') then return None
+
+    val content = line[(ind + n)..].trim()
+    val cb = content.bytes
+    var k = cb.len
+
+    while k > 0 && cb[k - 1] == u8('#')
+        k -= 1
+
+    if k == 0 then return Some("")
+    if k < cb.len && (cb[k - 1] == u8(' ') || cb[k - 1] == u8('\t')) then return Some(content[0..<k].trim())
+
+    Some(content)
+end dck_atx
+
+// Whether a line could be the paragraph a setext underline turns into a heading: not blank, not
+// indented into code, and not the opening of a heading, a quote, a table row or a list item.
+private dck_paragraph(line: string) -> bool
+    val ind = dck_indent(line)
+    val b = line.bytes
+
+    if ind > 3 || ind >= b.len || dck_blank_from(b, ind) then return false
+
+    val c = b[ind]
+
+    if c == u8('#') || c == u8('>') || c == u8('|') then return false
+    if (c == u8('-') || c == u8('*') || c == u8('+')) && (ind + 1 == b.len || b[ind + 1] == u8(' '))
+        return false
+
+    var d = ind
+
+    while d < b.len && b[d] >= u8('0') && b[d] <= u8('9')
+        d += 1
+
+    !(d > ind && d < b.len && (b[d] == u8('.') || b[d] == u8(')')))
+end dck_paragraph
+
+// A setext underline: at most three spaces in, a run of `=` or of `-`, and nothing after it.
+private dck_underline(line: string) -> bool
+    val ind = dck_indent(line)
+    val b = line.bytes
+
+    if ind > 3 || ind >= b.len || (b[ind] != u8('=') && b[ind] != u8('-')) then return false
+
+    dck_blank_from(b, ind + dck_run(b, ind, b[ind]))
+end dck_underline
+
+// The raw text of every heading on a page body, in order, as a CommonMark reader finds them: an ATX
+// line or a paragraph line over a setext underline, never inside a fenced block. A fence opens with
+// three or more backticks or tildes at most three spaces in, and closes with a run of the same
+// character at least as long.
+private dck_heading_texts(lines: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+    var fence: u8 = 0
+    var fence_len: usize = 0
+    var prev = ""
+
+    for line in lines.view()
+        val ind = dck_indent(line)
+        val b = line.bytes
+        val c = if ind < b.len then b[ind] else 0
+        val run = if c == u8('`') || c == u8('~') then dck_run(b, ind, c) else 0
+
+        if fence != 0
+            if ind <= 3 && c == fence && run >= fence_len && dck_blank_from(b, ind + run) then fence = 0
+
+            prev = ""
+            continue
+        end if
+
+        if ind <= 3 && run >= 3 && !(c == u8('`') && line[(ind + run)..].contains("`"))
+            fence = c
+            fence_len = run
+            prev = ""
+            continue
+        end if
+
+        dck_atx(line) match
+            Some(h) ->
+                out.push(h)
+                prev = ""
+                continue
+            None -> ()
+
+        if prev != "" && dck_underline(line)
+            out.push(prev.trim())
+            prev = ""
+            continue
+        end if
+
+        prev = if dck_paragraph(line) then line else ""
+    end for
+
+    out
+end dck_heading_texts
+
+private dck_ascii_punct(c: u8) -> bool =
+    (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126)
+
+private dck_char_len(lead: u8) -> usize
+    if lead < 0x80 then return 1
+    if lead < 0xE0 then return 2
+    if lead < 0xF0 then return 3
+
+    4
+
+// A heading's inline text as the renderer hands it to the slug function: a code span is its content,
+// a backslash escape its character, a link its text, and -- `smartPunctuation` -- a run of two or
+// more hyphens outside code a dash. The rest of the punctuation it rewrites (an apostrophe to `’`,
+// quotes to curly ones, `...` to `…`) is deleted by the GitHub slug and a separator to the default
+// one either way, so both slugs read it the same rewritten or not; emphasis markers likewise.
+private dck_plain(raw: string) -> string
+    val b = raw.bytes
+    var out = str_builder()
+    var i: usize = 0
+
+    while i < b.len
+        val c = b[i]
+
+        if c == u8('\\') && i + 1 < b.len && dck_ascii_punct(b[i + 1])
+            out.push(raw[(i + 1)..<(i + 2)])
+            i += 2
+        elif c == u8('`')
+            val n = dck_run(b, i, c)
+            val close = dck_closing_ticks(b, i + n, n)
+
+            if close.is_none()
+                out.push(raw[i..<(i + n)])
+                i += n
+            else
+                val k = close.unwrap()
+                val code = raw[(i + n)..<k]
+                val padded = code.len >= 2 && code.starts_with(" ") && code.ends_with(" ") &&
+                             code.trim() != ""
+
+                out.push(if padded then code[1..<(code.len - 1)] else code)
+                i = k + n
+            end if
+        elif c == u8('-') && i + 1 < b.len && b[i + 1] == u8('-')
+            out.push("—")
+            i += dck_run(b, i, c)
+        elif c == u8('[') && dck_link_end(b, i).is_some()
+            val text_end = raw.index_of_from("](", i).unwrap()
+
+            out.push(dck_plain(raw[(i + 1)..<text_end]))
+            i = dck_link_end(b, i).unwrap()
+        else
+            val n = dck_char_len(c)
+
+            out.push(raw[i..<(i + n)])
+            i += n
+        end if
+    end while
+
+    out.finish()
+end dck_plain
+
+// The closing run of exactly `n` backticks from `at`, if there is one.
+private dck_closing_ticks(b: []const u8, at: usize, n: usize) -> Option[usize]
+    var i = at
+
+    while i < b.len
+        if b[i] == u8('`')
+            val run = dck_run(b, i, u8('`'))
+
+            if run == n then return Some(i)
+
+            i += run
+        else
+            i += 1
+        end if
+    end while
+
+    None
+end dck_closing_ticks
+
+// Where an inline link opening at `at` ends -- `[text](destination)` -- if one does.
+private dck_link_end(b: []const u8, at: usize) -> Option[usize]
+    var i = at + 1
+
+    while i < b.len && b[i] != u8(']')
+        i += 1
+
+    if i + 1 >= b.len || b[i + 1] != u8('(') then return None
+
+    var j = i + 2
+
+    while j < b.len && b[j] != u8(')')
+        j += 1
+
+    if j >= b.len then None else Some(j + 1)
+end dck_link_end
+
+// juicer's default slug: lowercase, every run of what is not a letter or a digit one `-`, and none
+// at either end. An em dash in a heading therefore contributes one hyphen, and `struct's` -- an
+// apostrophe, `’` by then -- is `struct-s`.
+private dck_default_slug(text: string) -> string
+    var out = str_builder()
+    var dash = false
+    var any = false
+
+    for c in text.chars
+        val l = unicode.to_lower(c)
+
+        if unicode.is_alpha(l) || unicode.is_digit(l)
+            out.push_char(l)
+            dash = false
+            any = true
+        elif !dash && any
+            out.push_char('-')
+            dash = true
+    end for
+
+    val s = out.finish()
+
+    if s.ends_with("-") then s[0..<(s.len - 1)] else s
+end dck_default_slug
+
+// The id one heading is given: an explicit `{#id}` at its end where it writes one, and otherwise its
+// text slugged the way its page asks -- `slugStyle: github`, which every generated `api/` page sets,
+// is `doc_slug`, the generator's own copy of GitHub's rule.
+private dck_heading_id(raw: string, style: string) -> string
+    val t = raw.trim()
+
+    if t.ends_with("}")
+        t.last_index_of("{") match
+            Some(k) ->
+                for word in split(t[(k + 1)..<(t.len - 1)], " ")
+                    if word.starts_with("#") then return word[1..]
+            None -> ()
+    end if
+
+    val text = dck_plain(t)
+
+    if style == "github" then doc_slug(text) else dck_default_slug(text)
+end dck_heading_id
+
+// The site builder gives a repeated id a numeric suffix, the way GitHub does -- the first `Buf` keeps
+// `buf`, the second becomes `buf-1` -- and walks past a suffix already taken, so a page carrying `buf`
+// twice and a literal `buf-1` does not hand `buf-1` out twice.
+private dck_deduped(ids: Buf[string]) -> Buf[string]
+    var seen: Buf[string] = buf()
+    var counts: Buf[int] = buf()
+
+    for id in ids.view()
+        var at: Option[usize] = None
+
+        for i in 0..<seen.len()
+            if at.is_none() && seen[i] == id then at = Some(i)
+
+        if at.is_none()
+            seen.push(id)
+            counts.push(0)
+        else
+            var next = counts[at.unwrap()] + 1
+
+            while dck_has(seen, s"$id-$next")
+                next += 1
+
+            counts.set(at.unwrap(), next)
+            seen.push(s"$id-$next")
+            counts.push(0)
+        end if
+    end for
+
+    seen
+end dck_deduped
+
+// Every id a page's headings carry, which is the whole set an anchor may name. An empty slug -- a
+// heading of punctuation alone -- gives the heading no id.
+private dck_heading_ids(lines: Buf[string]) -> Buf[string]
+    val style = dck_slug_style(lines)
+    var ids: Buf[string] = buf()
+
+    for h in dck_heading_texts(dck_body(lines)).view()
+        val id = dck_heading_id(h, style)
+
+        if id != "" then ids.push(id)
+
+    dck_deduped(ids)
+end dck_heading_ids
+
+// A page's prose, with the fenced blocks taken out: a program that prints `](#0)` is not a link, and
+// neither is a shell transcript. A line at the left margin opening with three backticks toggles a
+// block, the rule `tests_docs.sysl` reads fences by.
+private dck_prose(lines: Buf[string]) -> string
+    var kept: Buf[string] = buf()
+    var open = false
+
+    for line in lines.view()
+        if line.starts_with("```")
+            open = !open
+        elif !open
+            kept.push(line)
+
+    join(kept.view(), "\n")
+end dck_prose
+
+// Every destination a page's prose links to: `\]\(\s*([^)\s]+)`.
+private dck_destinations(prose: string) -> Buf[string]
+    val b = prose.bytes
+    var out: Buf[string] = buf()
+    var i: usize = 0
+
+    while i + 1 < b.len
+        if b[i] == u8(']') && b[i + 1] == u8('(')
+            var j = i + 2
+
+            while j < b.len && dck_is_space(b[j])
+                j += 1
+
+            var k = j
+
+            while k < b.len && b[k] != u8(')') && !dck_is_space(b[k])
+                k += 1
+
+            if k > j
+                out.push(prose[j..<k])
+                i = k
+                continue
+            end if
+        end if
+
+        i += 1
+    end while
+
+    out
+end dck_destinations
+
+// One published page: where it is, the name a complaint quotes, its ids, and what it links to.
+private struct DckPage
+    url: string
+    page: string
+    ids: Buf[string]
+    links: Buf[string]
+
+// Every page under `root`, generated ones included -- links into the API section are resolved too, so
+// a page missing here would be reported as one that is not published.
+private dck_published(root: string) -> Buf[DckPage]
+    var out: Buf[DckPage] = buf()
+
+    for file in dck_files(root, ".md").view()
+        val lines = dck_lines(dck_text(file).unwrap_or(""))
+        val page = dck_relative(root, file)
+
+        out.push(DckPage(dck_url_of(page), page, dck_heading_ids(lines), dck_destinations(dck_prose(lines))))
+
+    out
+end dck_published
+
+// The page a destination names, as an address, resolved the way a browser would: a fragment alone is
+// this page, a root-relative path is what the cross-page links are written as, and anything else is
+// relative to this page. `.` and `..` are folded; an excess `..` is kept rather than clamped, so a
+// path walking off the top fails as a page that is not published -- which is what it is.
+private dck_target(here: string, dest: string) -> string
+    val path = dest[0..<dest.index_of("#").unwrap_or(dest.len)]
+
+    if path == "" then return here
+
+    val absolute = if path.starts_with("/") then path else here + path
+    var walked: Buf[string] = buf()
+
+    for seg in split(absolute, "/")
+        if seg == ".." && !walked.is_empty() && walked[walked.len() - 1] != ".."
+            walked.truncate(walked.len() - 1)
+        elif seg != "" && seg != "."
+            walked.push(seg)
+    end for
+
+    if walked.is_empty() then "/" else "/" + join(walked.view(), "/") + "/"
+end dck_target
+
+private dck_dashless(s: string) -> string = dck_without(s, u8('-'))
+
+// What is wrong with one link, if anything. **Only a link carrying a `#` is checked**: whether every
+// page a link names exists is a wider sweep and a different job, while an anchor is free to check,
+// the page it names being read for its headings anyway.
+private dck_complaint(from: DckPage, dest: string, pages: Buf[DckPage]) -> Option[string]
+    val hash = dest.index_of("#")
+
+    if hash.is_none() then return None
+
+    val anchor = dest[(hash.unwrap() + 1)..]
+    val shown = s"${from.page}: [..]($dest)"
+
+    if anchor == "" then return Some(s"$shown names no heading at all")
+
+    val target = dck_target(from.url, dest)
+
+    for p in pages.view()
+        if p.url == target
+            if dck_has(p.ids, anchor) then return None
+
+            var near: Buf[string] = buf()
+            val a = dck_dashless(anchor)
+
+            for id in p.ids.view()
+                val d = dck_dashless(id)
+
+                if d.contains(a) || a.contains(d) then near.push(id)
+
+            sort(near.view())
+
+            val hint = if near.is_empty() then "" else " — did you mean " + join(near.view(), ", ") + "?"
+
+            return Some(s"$shown names no heading on $target$hint")
+        end if
+    end for
+
+    Some(s"$shown is on no page — $target is not published")
+end dck_complaint
+
+// Every complaint the pages under `root` earn, all of them rather than the first: one reworded
+// heading breaks the links from several pages at once.
+private dck_broken(pages: Buf[DckPage]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for p in pages.view()
+        for dest in p.links.view()
+            dck_complaint(p, dest, pages) match
+                Some(why) -> out.push(why)
+                None -> ()
+
+    out
+end dck_broken
+
+@test("every anchor a page links to is a heading on the page it names")
+dck_every_anchor_lands()
+    val docs = dck_docs_root()
+
+    if docs == ""
+        print("skipped: no pages at '../docs' (run from 'compiler/') or at what SYSL_SITE names")
+        return
+    end if
+
+    val broken = dck_broken(dck_published(docs))
+
+    assert(broken.is_empty(),
+           s"${broken.len()} anchors land nowhere:\n\n    " + join(broken.view(), "\n    ") + "\n")
+end dck_every_anchor_lands
+
+// The other half, and the reason the half above means anything: a check over links alone passes on a
+// site with no links in it, and a run that found no headings anywhere would report every anchor as
+// fine. **The floors sit far under the counts** -- their job is to catch collection breaking outright,
+// and a number that has to be raised whenever a page gains a link is a number somebody raises without
+// reading.
+@test("the pages carry the cross-references and the headings they are supposed to")
+dck_the_pages_carry_links_and_headings()
+    val docs = dck_docs_root()
+
+    if docs == ""
+        print("skipped: no pages at '../docs' (run from 'compiler/') or at what SYSL_SITE names")
+        return
+    end if
+
+    val pages = dck_published(docs)
+    var anchored = 0
+    var headings: usize = 0
+
+    for p in pages.view()
+        headings += p.ids.len()
+
+        for dest in p.links.view()
+            if dest.contains("#") then anchored += 1
+    end for
+
+    dck_record("anchors", s"${pages.len()} pages, $anchored anchored links, $headings headings")
+    assert(anchored >= 40, s"anchored links found: $anchored")
+    assert(headings >= 600, s"headings found: $headings")
+end dck_the_pages_carry_links_and_headings
+
+@test("a heading's id is its text slugged the way its page asks, smart punctuation first")
+dck_a_heading_id()
+    assert_eq(dck_heading_id("Checking a C struct's layout", ""), "checking-a-c-struct-s-layout")
+    assert_eq(dck_heading_id("Platform selection — `__<machines>__`", ""), "platform-selection-machines")
+    assert_eq(dck_heading_id("A block comment **nests**", ""), "a-block-comment-nests")
+    assert_eq(dck_heading_id("a -- b", ""), "a-b")
+    // GitHub's rule keeps an underscore and a hyphen and deletes the rest, so a `--` the renderer has
+    // made a dash is gone where a `--` it left alone would be two hyphens.
+    assert_eq(dck_heading_id("`parse_int`", "github"), "parse_int")
+    assert_eq(dck_heading_id("a -- b", "github"), "a--b")
+    assert_eq(dck_heading_id("`a--b`", "github"), "a--b")
+    assert_eq(dck_heading_id("`Buf[T]`", "github"), "buft")
+    assert_eq(dck_heading_id("See [the guide](/x/) \\*now\\*", ""), "see-the-guide-now")
+    assert_eq(dck_heading_id("Odd {#explicit}", ""), "explicit")
+
+// The `buf-1` comes FIRST: only then is the second `buf` walked past a taken candidate rather than
+// handed the counter's answer, which would be `buf-1` a second time.
+@test("a repeated heading id takes the next suffix nothing on the page has taken")
+dck_a_repeated_id()
+    var ids: Buf[string] = buf()
+
+    for id in ["buf-1", "buf", "buf", "map"]
+        ids.push(id)
+
+    val out = dck_deduped(ids)
+
+    assert_eq(out.len(), 4)
+    assert(dck_has(out, "buf-1") && dck_has(out, "buf") && dck_has(out, "buf-2") && dck_has(out, "map"),
+           "buf-1, buf, buf-2 and map")
+end dck_a_repeated_id
+
+@test("a page's headings are read past its frontmatter and around its fenced blocks")
+dck_a_pages_headings()
+    val page = "---\ntitle: Traits\nslugStyle: \"github\"\n---\n# The `Buf` type\n\n````text\n" +
+               "# Halving\n```\n## not this\n```\n````\n\nA paragraph\n---\n\n## Closing ##\n"
+    val ids = dck_heading_ids(dck_lines(page))
+
+    assert_eq(join(ids.view(), " "), "the-buf-type a-paragraph closing")
+end dck_a_pages_headings
+
+@test("a link's destination is folded to the page it names")
+dck_a_destination_folds()
+    assert_eq(dck_target("/tour/traits/", "#a"), "/tour/traits/")
+    assert_eq(dck_target("/tour/traits/", "/reference/errors/#a"), "/reference/errors/")
+    assert_eq(dck_target("/tour/traits/", "../generics/#a"), "/tour/generics/")
+    assert_eq(dck_target("/tour/traits/", "./../../library/buf/#a"), "/library/buf/")
+    assert_eq(dck_target("/", "../../z/#a"), "/../../z/")
+    assert_eq(dck_target("/tour/", "/#a"), "/")
+
+// The check broken on purpose, over a site of two pages: a reworded heading's link is named with the
+// heading it nearly matches, a link to a page that is not there says so, and neither a link without a
+// `#` nor one inside a fenced block is looked at.
+@test("a link to a reworded heading is named, with the heading it nearly matches")
+dck_a_broken_anchor_is_named()
+    val dir = make_temp_dir("sysl-dck").unwrap()
+
+    make_dir_all(dir + "/reference").unwrap()
+    make_dir_all(dir + "/tour").unwrap()
+    write_text(dir + "/reference/errors.md",
+               "---\ntitle: Errors\n---\n## Guarded arms\n\n## Other\n").unwrap()
+    write_text(dir + "/tour/_index.md",
+               "See [arms](/reference/errors/#guarded-arm), [other](../reference/errors/#other),\n" +
+               "[gone](/reference/gone/#x), [plain](/reference/nowhere/) and [top](#).\n\n" +
+               "```\n[fenced](#nowhere)\n```\n").unwrap()
+
+    val broken = dck_broken(dck_published(dir))
+
+    remove_dir_all(dir).unwrap()
+
+    assert_eq(join(broken.view(), "\n"),
+              "tour/_index.md: [..](/reference/errors/#guarded-arm) names no heading on /reference/errors/" +
+              " — did you mean guarded-arms?\n" +
+              "tour/_index.md: [..](/reference/gone/#x) is on no page — /reference/gone/ is not published\n" +
+              "tour/_index.md: [..](#) names no heading at all")
+end dck_a_broken_anchor_is_named
