@@ -542,8 +542,10 @@ ends the process, and none of them had to know it was running under a test.
 
 `should_trap` inverts the reading, for a test whose subject *is* the check. With a string it
 additionally requires that the run printed it, which is what tells a trap from the **right** trap. A
-silent trap satisfies `should_trap` and can satisfy no string, because a compiler-inserted check
-raises a signal and says nothing — see [what stopping looks like](/reference/errors/).
+bounds check says what failed before it traps — `@test(should_trap: "out of bounds for length 3")`
+asks for exactly that — while every other compiler-inserted check raises a signal and says nothing,
+so it satisfies `should_trap` and can satisfy no string — see
+[what stopping looks like](/reference/errors/#what-stopping-looks-like).
 
 ### A test may be written and not run
 

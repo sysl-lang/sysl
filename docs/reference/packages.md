@@ -471,6 +471,21 @@ name it in a list: 'link = ["libuv"]'
 `sysl run`'s cache carries the choice, so changing `link` over a tree that did not otherwise move
 relinks rather than replaying the other kind of binary.
 
+## Leaving the bounds locations out
+
+A failed bounds check [says what failed and where](/reference/errors/#what-stopping-looks-like),
+and the *where* is a `file:line:column` string per check carried in the image. A board short of
+flash can drop them:
+
+```hocon
+bounds_locations = false
+```
+
+The report keeps its values — `index 5 out of bounds for length 3` — and loses only the location;
+no location string reaches the module at all. `--no-bounds-locations` on the command line does the
+same for one build. The key is `true` or `false` and nothing else, and anything else is refused when
+the file is read.
+
 ## Capabilities
 
 **Whether the machine has a heap, an operating system or POSIX is a project engineering

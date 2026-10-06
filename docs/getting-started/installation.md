@@ -29,7 +29,8 @@ tap once covers both, and covers every upgrade after it.
 
 That is a native binary — there is no JVM under it and nothing to start up. It brings **LLVM** with
 it, which sysl needs at runtime: the compiler emits textual LLVM IR and hands it to `clang` to
-assemble and link, and `llvm-ar` is what builds a library into a `.syslib`.
+assemble and link, and `llvm-ar` is what archives the standard module's compiled half into the
+compiler's cache.
 
 It also brings **pkgconf**. A package that binds an installed C library can name it — `requires {
 pkg_config { sdl3 = "…" } }` — and sysl asks `pkg-config` where that library's headers and link line
@@ -80,17 +81,16 @@ you are working *on* sysl, or if you are on a platform the tap has no binary for
 | **JDK 17+** | the compiler is written in Scala and runs on the JVM |
 | **sbt 1.12+** | builds it |
 | **clang** | sysl emits textual LLVM IR; clang assembles and links it |
-| **llvm-ar** | only for building a library — a `.syslib` is an `ar` archive of objects |
+| **llvm-ar** | the standard module's compiled half is an `ar` archive of objects |
 | **pkg-config** | only for a package that names an installed C library; without it, say where the library is with `--include-path` and `--link-path` |
 
 `clang` is the only one most systems already have — `pkg-config` is common on Linux and absent from a
 stock macOS. On macOS the Xcode command-line tools supply
 one; on Debian and Ubuntu it is the `clang` package.
 
-`llvm-ar` matters only when you build a library of your own, and it has to be the LLVM one: a
-`.syslib` holds objects for the machine it was built *for*, and a platform archiver indexes only
-its own format and silently drops the rest. On a Mac, Homebrew keeps its LLVM deliberately off the
-`PATH`, so sysl looks in `/opt/homebrew/opt/llvm/bin` as well. `--ar` names one anywhere else.
+`llvm-ar` has to be the LLVM one: the standard module's archive holds objects for the machine it was
+built *for*, and a platform archiver indexes only its own format and silently drops the rest. On a Mac, Homebrew keeps its LLVM deliberately off the
+`PATH`, so sysl looks in `/opt/homebrew/opt/llvm/bin` as well.
 
 ```bash
 git clone https://github.com/sysl-lang/sysl-bootstrap.git

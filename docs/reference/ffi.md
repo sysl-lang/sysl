@@ -461,12 +461,11 @@ happens, and nothing needs to — the constructor is `@llvm.global_ctors`, which
 on ELF, `__mod_init_func` on Mach-O and `.CRT$XCU` on COFF. A `.so` loaded with `dlopen` runs it at
 load, which is what makes this work on Android.
 
-**Which build fills it is the whole rule, and there are three of them:**
+**Which build fills it is the whole rule, and there are two of them:**
 
 | build | who fills the module storage |
 |---|---|
-| `sysl build`, `sysl test` | its own entry point, before the first statement |
-| `sysl build-lib` | the **program** that links the artifact, which has an entry point |
+| `sysl build`, `sysl test` | its own entry point, before the first statement — a library's storage included, since a library joins the program as source |
 | `sysl build-c` | a constructor the platform runs before the C project's `main` |
 
 **A `val` whose initializer is constant data is not in the question at all**, because nothing runs to
@@ -772,8 +771,9 @@ $ clang main.c libmylib.a -o app
 ```
 
 **The archive is self-contained.** Whatever of the standard library the module reaches is compiled
-into it, because a `.syslib` is not something a C link line can be handed — an archive referring to
-one would fail at that link naming a `sysl$` symbol its author has no way to place. So `--std-lib` is
+into it, because the compiler's cached standard module is not something a C link line can be handed
+— an archive referring to it would fail at that link naming a `sysl$` symbol its author has no way to
+place. So `--std-lib` is
 refused here and `--no-std-lib` asks for what already happens. The cost, which is accepted: two
 `build-c` archives linked into one program each carry the part of the library they reach. Its members
 are native objects whatever the manifest's `lto` key says — bitcode would link only under
@@ -963,10 +963,11 @@ in the other produces one naming a *function*, on a platform the author does not
 
 Four more rules:
 
-- **The requirement travels in the artifact.** The clauses are part of the tree a `.syslib` carries,
-  so a program depending on a prebuilt library learns to pass `-lz` without reading that library's
-  source. Leaving them out would mean a binding that works from source and stops working the moment
-  it ships — the worst available shape, since the build that breaks is one its author never ran.
+- **The requirement travels with the library.** The clauses are part of its source, so a program
+  depending on a library learns to pass `-lz` without its author writing that down anywhere else.
+  Leaving them out would mean a binding that works in its own repository and stops working the
+  moment it ships — the worst available shape, since the build that breaks is one its author never
+  ran.
 - **A module's requirement is the union of its files', and its files are not held to agreeing.**
   This is where the directive differs from a [capability clause](/reference/modules/), which it is
   otherwise shaped like: a capability describes what the whole module may do, so files that
@@ -1824,8 +1825,8 @@ for, and that building it for another fails loudly.
 
 **A `.c` file dropped in any module of a library's tree is compiled with it and archived beside it.**
 Nothing declares it and nothing lists it: the build already walks every directory, and a C file found
-in one that holds source is compiled for the same target and becomes one more member of the
-`.syslib`. The sysl side reaches it through the `extern` that was already the way to name a symbol
+in one that holds source is compiled for the same target and linked with the program that uses the
+library. The sysl side reaches it through the `extern` that was already the way to name a symbol
 the linker has — so the *language* gains nothing, and the whole of the feature is in the build.
 
 **A module, and not merely a directory.** A project is not the only thing that writes into its own

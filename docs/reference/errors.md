@@ -484,18 +484,44 @@ The *decision* to stop is the language's; the *action* on stopping is the enviro
 `os` capability a hosted program stops the process and exits non-zero; a kernel installs its own
 panic handler and enters that.
 
-On a hosted target there are two observably different shapes, and the difference is worth knowing
+On a hosted target there are three observably different shapes, and the difference is worth knowing
 before you debug one:
 
 | stopped by | what you see | exit status |
 |---|---|---|
-| a **compiler-inserted check** — a bound, a cast, a range, a contract | nothing at all, and **buffered output already written by the program is lost** | the platform's signal status for a trap instruction |
+| a **bounds check** — an index, a range, a substring cut inside a character | one line on stderr saying what failed and where, then the trap; **buffered output already written by the program is lost** | the platform's signal status for a trap instruction |
+| any other **compiler-inserted check** — a cast, a constrained range, a contract | nothing at all, and buffered output is lost the same way | the same |
 | a **library forcing member** — `unwrap`, `expect` | `panic: <message>` on stdout, after everything the program printed before it | 1 |
 
-The library's route goes through `exit`, which flushes on its way out; a compiler check goes straight
-to the target's trap instruction, which does not. So a program that printed diagnostics right up to
-the failing line will appear to have printed **none** of them if a bounds check is what stopped it.
-Reconciling the two so that every stop says why it stopped is an open question in the design.
+The library's route goes through `exit`, which flushes on its way out; a compiler check goes to the
+target's trap instruction, which does not. So a program that printed diagnostics right up to the
+failing line will appear to have printed **none** of them if a check is what stopped it.
+
+**A bounds check says what failed before it traps**, written straight to standard error so that it
+survives the trap:
+
+```text
+index 5 out of bounds for length 3 (main.sysl:2:9)
+range 2..<9 out of bounds for length 3 (main.sysl:2:9)
+range start 3 is past its end 2 (main.sysl:2:9)
+range end 2 is not on a character boundary (main.sysl:2:8)
+```
+
+The location is the bracket's line and column, naming the file by its path inside what was built — a
+fetched package's file by its coordinate — so no build directory appears in it. The status is still
+the trap's, so a [`should_trap`](/reference/attributes/#a-test-passes-by-returning) test reads it as
+it always did, and can now ask for the words. Every failure goes through one weak function,
+`sysl_bounds_fail`, which a program may replace with an `@export` of its own — a board writing the
+report to a UART — and the trap still follows whatever it does. On a freestanding target the default
+writes nothing and returns, so the trap is what stops it. The locations cost a string per check in
+the image; `bounds_locations = false` in the manifest, or `--no-bounds-locations` on the command line,
+leaves them out and keeps the values:
+
+```text
+index 5 out of bounds for length 3
+```
+
+Making every other check say why it stopped is an open question in the design.
 
 ### Running out of stack, which is the third shape
 
