@@ -9,19 +9,21 @@ module sysl.buf
  * `ByteSink` -- which is why the sink can sit here beside the buffer it wraps.
  */
 
-/** A sequence that grows, over a `[]T` it replaces when it runs out.
+/** The storage and count behind a `Buf`, and everything that keeps the two in step.
  *
  * It is ordinary sysl rather than a built-in because a `[]T` that can be sized while running is all
  * it needs: `push` allocates a slice twice the size and copies, so the amortized cost is the one a
- * growable sequence has anywhere, and none of it is underneath the language.
+ * growable sequence has anywhere, and none of it is underneath the language. A program never names
+ * it: a `Buf` holds one in a box, and every `Buf` assigned, passed or captured from that one holds
+ * the same box.
  *
  * **The spare capacity holds nothing.** The storage comes from `slot_storage`, whose slots start out
  * empty: a buffer box releases only its *live prefix*, and `slot_place` is what fills the first slot
  * past it. So a push of a counted value takes exactly one count for the buffer, and a slot this
  * buffer has given up -- by `pop`, `truncate`, `clear` or `remove` -- is let go of by `slot_vacate`
  * there and then, which is when a destructor behind it runs. The one exception is storage somebody
- * else is still reading: a `view()` held elsewhere, or a copy of this buffer, keeps those slots
- * alive until it lets go, and the next shortening after that releases them.
+ * else is still reading: a `view()` held elsewhere, or storage a growth replaced while a view of it
+ * was out, keeps those slots alive until it lets go.
  *
  * The bounds-checked members panic rather than returning an `Option`, which is the same bargain
  * `unwrap` makes -- an index past the end is a mistake in the program, not a value it meant to
@@ -34,16 +36,10 @@ module sysl.buf
  * the index is tested against `count` for the panic, and the slice's own test against `elems.len`
  * is then implied by it and folds.
  */
-struct Buf[T]
+private[buf] struct BufCore[T]
     elems: []T
     count: usize
     invariant count <= elems.len
-
-    len(self) -> usize = self.count
-
-    cap(self) -> usize = self.elems.len
-
-    is_empty(self) -> bool = self.count == 0
 
     at(self, i: usize) -> T
         if i >= self.count then past_end(i, self.count)
@@ -261,6 +257,80 @@ struct Buf[T]
      * a view of the storage rather than a copy, so it is only valid while nothing pushes.
      */
     view(self) -> []T = self.elems[..<self.count]
+end BufCore
+
+/** A sequence that grows, and the name every holder of it shares.
+ *
+ * **A `Buf` is a reference, the way a collection is in most languages a program will have met.**
+ * Assigning one, passing it, capturing it in a closure, keeping it in a struct and reading it back
+ * out of another container all hand over a second name for the *same* buffer, so a push through any
+ * of them is seen through every other -- `Buf[Buf[int]]` included, where `outer.at(0).push(x)`
+ * grows the inner buffer the outer one holds. A program that wants a second buffer asks for one with
+ * `buf()` and fills it.
+ *
+ * What it holds is one counted reference to a `BufCore`, which carries the storage, the count and
+ * the clause tying them together; every member here delegates to it. So the price of sharing is one
+ * load per access and one allocation per buffer made, and `push` keeps the shape that lets a caller
+ * absorb it -- marked `@inline` here as on the core, so a push through the handle is still a store.
+ * The elements are let go of when the *last* name for the buffer dies, or earlier, by `pop`,
+ * `truncate`, `clear` and `remove`, exactly as before.
+ *
+ * **It has no zero value.** A buffer is a box, and a box is made by somebody, so `var b: Buf[int]`
+ * with nothing after it is refused -- write `= buf()`.
+ *
+ * The bounds-checked members panic rather than returning an `Option`, which is the same bargain
+ * `unwrap` makes -- an index past the end is a mistake in the program, not a value it meant to
+ * handle -- while `pop` returns one, because taking from an empty sequence is a question a caller
+ * asks on purpose.
+ */
+struct Buf[T]
+    private core: &BufCore[T]
+
+    /** The storage, spare capacity included -- for a reader that wants the address of an element,
+     * as `&b.elems[i]` is. It is read-only as a field: the storage is replaced only by the buffer's
+     * own growth, which is what keeps the count from passing it.
+     */
+    elems -> []T = self.core.elems
+
+    len(self) -> usize = self.core.count
+
+    cap(self) -> usize = self.core.elems.len
+
+    is_empty(self) -> bool = self.core.count == 0
+
+    at(self, i: usize) -> T = self.core.at(i)
+
+    set(*self, i: usize, v: T) = self.core.set(i, v)
+
+    @inline
+    push(*self, v: T) = self.core.push(v)
+
+    extend(*self, xs: []const T) = self.core.extend(xs)
+
+    pop(*self) -> Option[T] = self.core.pop()
+
+    truncate(*self, n: usize) = self.core.truncate(n)
+
+    clear(*self) = self.core.truncate(0)
+
+    insert(*self, i: usize, v: T) = self.core.insert(i, v)
+
+    remove(*self, i: usize) -> T = self.core.remove(i)
+
+    /** A second buffer holding the same elements, sized to them -- the one way to get a buffer that
+     * is not this one, every other way of handing a `Buf` on handing on this one.
+     */
+    copy(self) -> Buf[T]
+        var out: Buf[T] = Buf(BufCore(slot_storage(self.core.count), 0))
+
+        out.extend(self.view())
+        out
+
+    /** The elements as a slice, which is what everything reading a `Buf` in bulk goes through. It is
+     * a view of the storage rather than a copy, so it is only valid while nothing pushes -- through
+     * this name or any other for the same buffer.
+     */
+    view(self) -> []T = self.core.view()
 end Buf
 
 // The report an index past the end makes, out of line because of what a bounds-checked member costs
@@ -302,10 +372,7 @@ impl[T] Index[usize, T] for Buf[T]
 impl[T] IndexSet[usize, T] for Buf[T]
     index_set(*self, i: usize, v: T) = self.set(i, v)
 
-buf[T]() -> Buf[T]
-    var b: Buf[T] = Buf([], 0)
-
-    b
+buf[T]() -> Buf[T] = Buf(BufCore([], 0))
 
 /** A buffer that has already been given room for `n` elements, for a caller that knows roughly how
  * many are coming. What it saves is the reallocation-and-copy at each doubling on the way up, which
@@ -315,10 +382,7 @@ buf[T]() -> Buf[T]
  * is not kept alive by the room it would once have been repeated into. The parameter stays because
  * callers write it, and because it is what lets a call say the element type without brackets.
  */
-buf_with_capacity[T](n: usize, fill: T) -> Buf[T]
-    var b: Buf[T] = Buf(slot_storage(n), 0)
-
-    b
+buf_with_capacity[T](n: usize, fill: T) -> Buf[T] = Buf(BufCore(slot_storage(n), 0))
 
 /** A writer that gathers, and the reason it is supplied rather than left to each program is the rule
  * that a specifier describes the field the *whole* value occupies (`library/core.md § A specifier

@@ -1,0 +1,108 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.str_builder
+
+// A `Buf` is a reference: one counted box holds its storage and count, and every name for the buffer
+// holds that box. What the library's own suite cannot say is what that costs at a declaration -- the
+// refusals are about the program, so they are asserted here, over the library this tree carries.
+
+private brf_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+// Every diagnostic a one-file program earns, one message to a line in source order.
+private brf_diags(text: string) -> string
+    val root = make_temp_dir("sysl-brf").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    var b = str_builder()
+
+    emit_llvm_text(src, None) match
+        Err(why) -> b.push(s"refused: ${why.message}")
+        Ok(made) ->
+            val ordered = in_source_order(made.report)
+
+            for i in 0..<ordered.len()
+                if i > 0 then b.push("\n")
+
+                b.push(ordered.at(i).diag.message)
+
+    remove_dir_all(root).unwrap_or(())
+    b.finish()
+end brf_diags
+
+@test("a Buf declared with no initial value is refused, a buffer being a box somebody makes")
+brf_a_buf_has_no_zero()
+    if !brf_ready() then return
+
+    assert_eq(brf_diags("import sysl.buf.Buf\n\nvar b: Buf[int]\n\nprint(b.len())\n"),
+              "sysl.buf.Buf[int] has no zero value, so 'b' needs an initial value")
+end brf_a_buf_has_no_zero
+
+@test("and one written with its buffer compiles")
+brf_a_buf_with_its_buffer_compiles()
+    if !brf_ready() then return
+
+    assert_eq(brf_diags("import sysl.buf.{Buf, buf}\n\nvar b: Buf[int] = buf()\n\nprint(b.len())\n"), "")
+end brf_a_buf_with_its_buffer_compiles
+
+@test("a write to a Buf's storage from outside is refused")
+brf_the_storage_is_not_writable()
+    if !brf_ready() then return
+
+    assert_eq(brf_diags("import sysl.buf.{Buf, buf}\n\nvar b: Buf[int] = buf()\n\nb.count = 3\nb.elems = []\n"),
+              "'sysl.buf.Buf[int]' has no field or property 'count'\n" +
+              "'elems' is a property of 'sysl.buf.Buf[int]', which computes rather than naming storage, so " +
+              "there is nothing to assign through — write 'set elems(…)' on 'sysl.buf.Buf[int]' to give it a setter")
+end brf_the_storage_is_not_writable
+
+@test("a Buf behind a '&sync' is still refused")
+brf_a_sync_buf_is_refused()
+    if !brf_ready() then return
+
+    assert_eq(brf_diags("import sysl.buf.{Buf, buf}\n\nval b: &sync Buf[int] = buf()\n\nprint(b.len())\n"),
+              "'&sync sysl.buf.Buf[int]' may be reached from two domains at once, so every count inside it has " +
+              "to be atomic — but its 'core' reaches a '&sysl.buf.BufCore[int]', whose count is not. Hold it " +
+              "as a '&sync sysl.buf.BufCore[int]' ('06')")
+end brf_a_sync_buf_is_refused
+
+// What a one-file program built and run in this process prints, or why it did not.
+private brf_ran(text: string) -> string
+    val root = make_temp_dir("sysl-brf").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    val out = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Err(_) -> "it could not be run"
+            Ok(said) -> said.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end brf_ran
+
+// The link list is the program's objects with the standard module's archive pushed on, and the
+// objects are discarded once the link is done -- so a list that shared them took the archive too,
+// and every later build in the process linked against a file that was gone.
+@test("a build leaves the standard module's artifact where the next build finds it")
+brf_a_build_keeps_the_std_artifact()
+    if !brf_ready() then return
+
+    val program = "import sysl.buf.{Buf, buf}\n\nvar b: Buf[int] = buf()\n\nb.push(7)\nprint(b.at(0))\n"
+
+    assert_eq(brf_ran(program), "7\n")
+    assert_eq(brf_ran(program), "7\n")
+    assert_eq(brf_ran(program), "7\n")
+end brf_a_build_keeps_the_std_artifact

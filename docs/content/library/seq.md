@@ -138,15 +138,16 @@ xs[..].filter(n -> n % 2 == 1).each(n -> print(n))
 3
 ```
 
-**A closure captures by value**, so a record kept outside the call has to be storage rather than a
-copy of one: a captured `Buf` is filled and thrown away, and a `&Buf` is the buffer itself.
+**A closure captures by value, and a `Buf` captured is still the buffer** — a `Buf` is a reference,
+so the copy the closure holds is a second name for the one outside, and what it pushes is there when
+the call returns.
 
 ```sysl
 import sysl.seq.Sequence
 import sysl.buf.{Buf, buf}
 
 val xs = [1, 2, 3]
-var seen: &Buf[int] = buf()
+var seen: Buf[int] = buf()
 
 xs[..].each(n -> seen.push(n * 2))
 

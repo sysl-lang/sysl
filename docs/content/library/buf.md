@@ -7,9 +7,9 @@ weight: 30
 **Every declaration in `sysl.buf`, with its signature:** [the generated API page](/api/sysl-buf/#index). This page is the argument — what the module is for, and how its pieces fit; that one is the list.
 
 `sysl.buf` holds two types and three functions, and the interesting thing about the larger of them is
-what it is *not*: **`Buf[T]` is not a type the compiler knows.** It is a `[]T` field for the storage,
-a `usize` for how much of it is live, and a dozen members — ordinary sysl, in a file a program could
-have written.
+what it is *not*: **`Buf[T]` is not a type the compiler knows.** It is a `[]T` for the storage and
+a `usize` for how much of it is live, kept in one box that every name for the buffer shares, and a
+dozen members — ordinary sysl, in a file a program could have written.
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -48,8 +48,8 @@ way to write another.
 
 All three were the wrong answer, and none of the three is an absence now — a
 [destructor](/reference/memory/) is writable. **A container does not need one if its storage is a
-value that already has one** — the `[]T` field is an ARC-owned buffer, so when a `Buf` goes, its storage
-goes with it, and nothing in the container has to say so. The one thing genuinely missing was the
+value that already has one** — the `[]T` field is an ARC-owned buffer, so when the last name for a
+`Buf` goes, its storage goes with it, and nothing in the container has to say so. The one thing genuinely missing was the
 ability to ask for storage at a length worked out while running, and once a `[]T` could be sized that
 way, `Buf[T]` was a hundred lines with no unsafe primitive in them.
 
@@ -60,8 +60,7 @@ comes up.
 
 ```sysl
 struct Buf[T]
-    elems: []T
-    count: usize
+    elems -> []T
 
     len(self) -> usize
     cap(self) -> usize
@@ -174,8 +173,7 @@ to read — and that is where the off-by-one lives.
 
 **What none of `truncate`, `clear` and `remove` does is give storage back.** The `cap()` of `8`
 survives the `truncate`
-above. The elements above the count are still values in a `[]T` that ARC owns — which is also why a
-**copy** of a `Buf` taken before a removal reads the shifted elements at the length it was copied at.
+above. The slots above the count hold nothing; what a removal gives up is let go of there and then.
 
 ## Subscripting goes through the checked members
 
@@ -378,12 +376,12 @@ false true
 [1, 2, 3]
 ```
 
-That is not a rule about buffers — it is true of every `&T` whose referent is `Eq` — but a `Buf` is
-usually held by reference, so it is where the question comes up.
+That is not a rule about buffers — it is true of every `&T` whose referent is `Eq`. A `&Buf` is
+seldom worth writing now, a `Buf` being shared without one (below), but it still means what it says.
 
 ## How a push is seen follows from how the `Buf` is held
 
-sysl does not have to choose here, and that is the point:
+It does not, any more — **a `Buf` is a reference, so every way of holding one holds the same buffer:**
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -398,13 +396,50 @@ print(q.len(), c.len())
 ```
 
 ```output
-1 0
+1 1
 ```
 
-`q` is a second name for one buffer, so it sees the push. `c` is a copy, because copying a struct is
-what `*p` means. Neither is a rule about growable sequences — both are the [memory
-modes](/reference/memory/) doing exactly what they do for any struct, and the author wrote which one
-they wanted.
+`q` is a second name for the box, and `c` — the struct `*p` reads out of it — is a second name for
+the buffer, because what a `Buf` holds is a counted reference to its storage and count rather than
+the two themselves. The same is true without a `&` anywhere: assigning a `Buf`, passing it by value,
+capturing it in a closure, keeping it in a struct or reading it back out of another container hands
+on the buffer, never a copy of it.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var outer: Buf[Buf[int]] = buf()
+
+outer.push(buf())
+
+var inner = outer.at(0)
+
+inner.push(1)
+
+print(outer.at(0).len())
+```
+
+```output
+1
+```
+
+That is what a growable collection is in most languages a program has met — Scala's `ArrayBuffer`,
+Java's `ArrayList`, a Python list — and it is what a program reaching for one expects: a function that
+fills the buffer it was handed fills the caller's. A program that wants a second buffer makes one with
+`buf()` and fills it from the first.
+
+**A `Buf` has no zero value, because a buffer is a box and a box is made by somebody.** A declaration
+has to say which buffer it starts as:
+
+```sysl
+import sysl.buf.Buf
+
+var b: Buf[int]
+```
+
+```error
+Buf[int] has no zero value, so 'b' needs an initial value
+```
 
 ## Capacity, and what it costs
 
@@ -467,17 +502,15 @@ print(b.len())
 ```
 
 ```error
-this reaches 'sysl.buf.Buf.grow.int', which makes heap storage, and this module declared '@no_alloc'
+this reaches 'sysl.buf.buf.int', which makes heap storage, and this module declared '@no_alloc'
 ```
 
-**`grow` is named and `buf()` is not, and the difference is worth reading.** `push`'s own growth path
-— the allocation, the copy, and the release of the storage it replaced — is out of line in a `grow`
-it shares with `extend`, kept there so a hot `push` stays a compare, a store and a bump. [`alloc` is
+**The refusal names `buf()`, and that is the box.** A `Buf` is a reference, so making one makes the
+counted box every name for it will share — an allocation before a single element is pushed. [`alloc` is
 checked on what a module *calls*](/reference/modules/), at the smallest expression that still reaches
-an allocator, so the refusal names `grow` rather than `push` — and **an empty `Buf` reaches neither**.
-`buf()` is `Buf([], 0)`, and an empty view is `{null, null, 0}`: the zero value of what a view is made
-of, with no elements, no length and nobody owning them. So building one costs nothing and the refusal
-falls where the storage is really made.
+an allocator, so it falls on the first thing that really makes storage: here the constructor, and in
+a module that was handed its buffer, the `grow` that `push` and `extend` share, kept out of line so a
+hot `push` stays a compare, a store and a bump.
 
 There is still no allocator-free `Buf` and there cannot be one: growing is the whole of what it does.
 What an allocator-free module may now do is *hold* an empty one — which is what a function answering
@@ -605,10 +638,10 @@ b.push("x")
 ```
 
 ```error
-'v' of 'Buf.push.int' is int, but string was given
+'v' of 'sysl.buf.Buf.push.int' is int, but string was given
 ```
 
-`Buf.push.int` is the `push` of a `Buf[int]` — one function, emitted for that instantiation.
+`sysl.buf.Buf.push.int` is the `push` of a `Buf[int]` — one function, emitted for that instantiation.
 [Generics](/reference/generics/) has the rest of that story.
 
 ---

@@ -358,43 +358,36 @@ removing_past_the_count_traps()
 
 // -- the count never passes the storage -----------------------------------------------------------
 //
-// The clause every member is told on entry, and so the one every write has to keep. The fields are
-// public, so the writes that could break it are a caller's as much as the module's -- and each is
-// refused where it is made rather than left for the next read to find.
-
-@test("a buffer with no initializer is the empty one, and grows")
-a_zero_buffer_is_empty()
-    var b: Buf[int]
-
-    assert_eq(b.len(), 0)
-    b.push(7)
-    assert_eq(b.at(0), 7)
-end a_zero_buffer_is_empty
+// The clause every member of the core is told on entry, and so the one every write has to keep. A
+// program cannot write either field -- a `Buf` hands out `elems` read-only and the count not at all --
+// so the writes that could break it are this module's, and each is refused where it is made rather
+// than left for the next read to find. They are made here on a core directly, which only this module
+// can name.
 
 @test(should_trap)
 moving_the_count_past_the_storage_traps()
-    var b: Buf[int] = buf()
+    var c: BufCore[int] = BufCore([], 0)
 
-    b.push(1)
-    b.count = b.elems.len + 1
+    c.push(1)
+    c.count = c.elems.len + 1
 
 @test("but moving it within the storage is not refused")
 moving_the_count_within_the_storage_is_fine()
-    var b: Buf[int] = buf()
+    var c: BufCore[int] = BufCore([], 0)
 
-    b.extend([1, 2, 3])
-    b.truncate(1)
-    b.count = 3
+    c.extend([1, 2, 3])
+    c.truncate(1)
+    c.count = 3
 
-    assert_eq(b.at(2), 3)
+    assert_eq(c.at(2), 3)
 end moving_the_count_within_the_storage_is_fine
 
 @test(should_trap)
 taking_the_storage_from_under_the_count_traps()
-    var b: Buf[int] = buf()
+    var c: BufCore[int] = BufCore([], 0)
 
-    b.push(1)
-    b.elems = []
+    c.push(1)
+    c.elems = []
 
 // -- a buffer is the sequence it holds ------------------------------------------------------------
 //
@@ -579,3 +572,189 @@ with_capacity_keeps_no_fill()
     assert(w.get().is_none())
     assert_eq(b.cap(), 4)
 end with_capacity_keeps_no_fill
+
+// -- every name for a buffer is the same buffer ------------------------------------------------------
+//
+// A `Buf` is a reference: whatever hands one on -- an assignment, a parameter, a capture, a field,
+// another container -- hands on a second name for the one buffer, so a push through either name is
+// seen through both. Each case pushes through the second name and reads through the first.
+
+@test("an assigned buffer is the same buffer")
+assignment_shares()
+    var a: Buf[int] = buf()
+
+    a.push(1)
+
+    var b = a
+
+    b.push(2)
+
+    assert_eq(a.len(), 2)
+    assert_eq(b.len(), 2)
+    assert_eq(a.at(1), 2)
+end assignment_shares
+
+private push_nine(b: Buf[int])
+    var mine = b
+
+    mine.push(9)
+
+@test("a buffer passed by value is the caller's buffer")
+parameter_shares()
+    var a: Buf[int] = buf()
+
+    a.push(1)
+    push_nine(a)
+
+    assert_eq(a.len(), 2)
+    assert_eq(a.at(1), 9)
+end parameter_shares
+
+@test("a buffer a closure captured is the buffer it was captured from")
+capture_shares()
+    var a: Buf[int] = buf()
+
+    val add = (x: int) -> a.push(x)
+
+    add(3)
+    add(4)
+
+    assert_eq(a.len(), 2)
+    assert_eq(a.at(0), 3)
+end capture_shares
+
+@test("a push into a buffer read out of another one sticks")
+nested_push_sticks()
+    var outer: Buf[Buf[int]] = buf()
+
+    outer.push(buf())
+
+    var inner = outer.at(0)
+
+    inner.push(5)
+
+    assert_eq(outer.at(0).len(), 1)
+    assert_eq(outer.at(0).at(0), 5)
+end nested_push_sticks
+
+struct Bag
+    items: Buf[int]
+
+@test("a struct holding a buffer, copied, holds the same buffer")
+struct_copy_shares()
+    var s1 = Bag(buf())
+    var s2 = s1
+
+    s2.items.push(4)
+
+    assert_eq(s1.items.len(), 1)
+    assert_eq(s1.items.at(0), 4)
+end struct_copy_shares
+
+@test("the buffer behind a reference, read out of it, is the same buffer")
+deref_shares()
+    val r: &Buf[int] = buf()
+    var v = *r
+
+    v.push(1)
+
+    assert_eq(r.len(), 1)
+end deref_shares
+
+@test("growth through one name is seen through the other")
+growth_is_shared()
+    var a: Buf[int] = buf()
+    var b = a
+
+    for i in 0..<20
+        b.push(i)
+
+    assert_eq(a.len(), 20)
+    assert(a.cap() >= 20)
+    assert_eq(a.at(19), 19)
+    assert_eq(a.cap(), b.cap())
+end growth_is_shared
+
+@test("a view taken before a growth through another name still reads the old storage")
+view_survives_growth_elsewhere()
+    var a: Buf[int] = buf()
+
+    a.extend([1, 2, 3, 4, 5, 6, 7, 8])
+
+    val v = a.view()
+    var b = a
+
+    b.push(9)
+    b.set(0, 100)
+
+    assert_eq(v.len, 8)
+    assert_eq(v[0], 1)
+    assert_eq(a.at(0), 100)
+    assert_eq(a.len(), 9)
+end view_survives_growth_elsewhere
+
+// A second name for a buffer of counted elements, dying while the first lives on, lets go of nothing.
+private second_name_dies(b: Buf[&Probe])
+    var mine = b
+
+    assert_eq(mine.len(), 1)
+
+@test("an element outlives every name for its buffer but the last")
+elements_live_until_the_last_name()
+    var a: Buf[&Probe] = buf()
+    val w = push_probe(&a, 1)
+
+    second_name_dies(a)
+
+    assert(w.get().is_some())
+
+    a.pop()
+
+    assert(w.get().is_none())
+end elements_live_until_the_last_name
+
+// Two names for one buffer, both gone by the time this returns -- so what the probe reads afterwards
+// is whether the last of them took the elements with it.
+private two_names_then_none() -> weak Probe
+    var a: Buf[&Probe] = buf()
+    val w = push_probe(&a, 1)
+    var b = a
+
+    assert_eq(b.len(), 1)
+    w
+end two_names_then_none
+
+@test("the elements go when the last name for the buffer does")
+elements_go_with_the_last_name()
+    val w = two_names_then_none()
+
+    assert(w.get().is_none())
+end elements_go_with_the_last_name
+
+@test("copy is a second buffer, and a push to either is not seen by the other")
+copy_is_a_second_buffer()
+    var a: Buf[int] = buf()
+
+    a.extend([1, 2, 3])
+
+    var b = a.copy()
+
+    b.push(4)
+    a.set(0, 10)
+
+    assert_eq(a.len(), 3)
+    assert_eq(b.len(), 4)
+    assert_eq(b.at(0), 1)
+    assert_eq(a.at(0), 10)
+end copy_is_a_second_buffer
+
+@test("a copy of an empty buffer is empty, and grows")
+copy_of_empty()
+    var a: Buf[int] = buf()
+    var b = a.copy()
+
+    b.push(1)
+
+    assert_eq(a.len(), 0)
+    assert_eq(b.at(0), 1)
+end copy_of_empty
