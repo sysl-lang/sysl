@@ -644,6 +644,7 @@ end frame_holding
 
 private enum Tail
     TailType(ty: Type)
+    TailSealed
     TailUnmade
     TailParks
 
@@ -652,24 +653,47 @@ private task_shown(key: string) -> string = s"a task of '${qualified_name(key)}'
 private member_at(member: string, path: Buf[string]) -> string =
     if path.is_empty() then s"$member, " else s"$member, whose '${joined(path, ".")}' is "
 
-// What one frame holds, as the end of a sentence, and what the sentence ends on.
-private holding_text(h: Holding) -> (string, Tail) = h match
+// What one frame holds, as the end of a sentence, and what the sentence ends on. A part whose count
+// lives in a type the reader cannot name -- a container's core -- is said as the container, the type
+// the frame's member was written as (`sharing.sysl`'s `sealed_holder`).
+private holding_text(h: Holding, a: &Analysis, scope: Scope) -> (string, Tail) = h match
     HeldPart(member, p, mty) ->
+        val sealed = sealed_holder(p, a, scope)
+
+        if sealed.is_some() then return (sealed_member(member, p, sealed.unwrap(), mty), TailSealed)
+
         val what = if p.path.is_empty() && p.ty == mty then s"$member, a '${type_show(p.ty)}'"
         else if p.path.is_empty() then s"$member, which holds a '${type_show(p.ty)}'"
         else s"$member, whose '${joined(p.path, ".")}' reaches a '${type_show(p.ty)}'"
 
         (what, TailType(p.ty))
     HeldTask(member, path, g, inner) ->
-        val rest = holding_text(*inner)
+        val rest = holding_text(*inner, a, scope)
 
         (member_at(member, path) + s"${task_shown(g)}, whose frame holds ${rest.0}", rest.1)
     HeldUnmade(member, path) ->
         (member_at(member, path) + "a task nothing here says the making of", TailUnmade)
     HeldParks -> ("the 'park' it awaits", TailParks)
 
+// A frame member holding a container whose core is out of reach: the container, and where in the
+// member it sits.
+private sealed_member(member: string, p: Unshareable, holder: Type, mty: Type) -> string
+    var steps: Buf[string] = buf()
+
+    for i in 0..<p.path.len() - 1
+        steps.push(p.path.at(i))
+
+    val shown = type_show(holder)
+
+    if steps.is_empty() && holder == mty then return s"$member, a '$shown'"
+    if steps.is_empty() then return s"$member, which holds a '$shown'"
+
+    s"$member, whose '${joined(steps, ".")}' is a '$shown'"
+end sealed_member
+
 private finished(text: string, tail: Tail) -> string = tail match
     TailType(ty) -> share_remedy(text + ", ", ty)
+    TailSealed -> text + ", which is " + sealed_rest()
     TailUnmade -> text + unmade_remedy()
     TailParks ->
         text + " — a task that parks is handed a waker, and a waker is a '&Fn() -> unit' belonging to " +
@@ -694,8 +718,9 @@ private cross_subject(kind: CrossKind, path: Buf[string]) -> string = kind match
     CrossClosure -> s"the '${joined(path, ".")}' it captures"
     _ -> if path.is_empty() then "it" else s"its '${joined(path, ".")}'"
 
-private cross_message(kind: CrossKind, path: Buf[string], key: string, why: Holding) -> string
-    val said = holding_text(why)
+private cross_message(kind: CrossKind, path: Buf[string], key: string, why: Holding, a: &Analysis,
+                      scope: Scope) -> string
+    val said = holding_text(why, a, scope)
     val head = cross_head(kind) + s"but ${cross_subject(kind, path)} is ${task_shown(key)}, " +
                s"whose frame holds ${said.0}"
 
@@ -741,7 +766,7 @@ check_task_crossings(a: &Analysis, funcs: Buf[TFunc])
             val why = task_answer(w, hit.1, buf()) match
                 Clear -> None
                 Unmade -> Some(unmade_message(c.kind, hit.0))
-                Holds(g, h) -> Some(cross_message(c.kind, hit.0, g, *h))
+                Holds(g, h) -> Some(cross_message(c.kind, hit.0, g, *h, a, c.scope))
 
             if why.is_some()
                 a.fault(c.scope, c.span, why.unwrap())
