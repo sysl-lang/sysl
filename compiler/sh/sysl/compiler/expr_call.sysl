@@ -2086,20 +2086,24 @@ private narrowed(cx: &Analyzer, fitting: Buf[string], fitted: Buf[Buf[Type]],
         declared.push(d.params.len())
         generic.push(!d.tparams.is_empty())
 
-    keys_at(fitting, narrowed_at(declared, generic, fitted, args.len(), natural_types(cx, args)))
+    keys_at(fitting, narrowed_at(declared, generic, fitted, args, natural_types(cx, args)))
 end narrowed
 
-// The three tie-breaks over candidates described rather than named, answering the indices that
-// survive: `declared` is each candidate's parameter count, `generic` whether it was solved for its
+// The tie-breaks over candidates described rather than named, answering the indices that survive:
+// `declared` is each candidate's parameter count, `generic` whether it was solved for its
 // parameters, `fitted` the types it took the call at, and `natural` each argument's own type. It is
 // the whole of the rule, so a member answered by several implementations of one trait
 // (`member_call.sysl`'s `chosen_member`) is decided by it too.
-narrowed_at(declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]], given: usize,
+//
+// Between exactness and the written-out step sits **a bare integer literal's preference for the
+// signed widening** (`signed_literal_preference`): where nothing is exact, `f(3)` over `f(x: long)`
+// and `f(x: u64)` means the `long` one.
+narrowed_at(declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]], args: Buf[Expr],
             natural: Buf[Option[Type]]) -> Buf[usize]
     var written: Buf[usize] = buf()
 
     for i in 0..<declared.len()
-        if declared.at(i) == given then written.push(i)
+        if declared.at(i) == args.len() then written.push(i)
 
     var ranked: Buf[usize] = buf()
 
@@ -2115,6 +2119,12 @@ narrowed_at(declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]], gi
 
     if exact.len() == 1 then return exact
 
+    if exact.is_empty()
+        val preferred = signed_literal_preference(fitted, ranked, args)
+
+        if preferred.len() == 1 then return preferred
+    end if
+
     var pool: Buf[usize] = buf()
 
     if !exact.is_empty()
@@ -2129,6 +2139,83 @@ narrowed_at(declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]], gi
 
     if spelled.len() == 1 then spelled else ranked
 end narrowed_at
+
+// **A bare integer literal prefers the signed widening.** Where the candidates still standing differ
+// only at positions holding a bare integer literal, and none of them takes the literal there at its
+// own type `int`, a candidate whose parameter at each such position is a signed integer at least as
+// wide as `int` beats every other -- unsigned, narrower signed, float -- and among several of those
+// the narrowest wins. So `BigInt.from(3)` over `From[long]` and `From[u64]` is the `long` one, while
+// `u64` beside `u32` offers nothing signed and stays ambiguous. Empty where the rule does not apply.
+private signed_literal_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize],
+                                  args: Buf[Expr]) -> Buf[usize]
+    var none: Buf[usize] = buf()
+
+    if ranked.len() < 2 then return none
+
+    var differ: Buf[usize] = buf()
+
+    for j in 0..<args.len()
+        var differs = false
+
+        for r in 0..<ranked.len()
+            val here = fitted.at(ranked.at(r))
+            val first = fitted.at(ranked.at(0))
+
+            if j >= here.len() || j >= first.len() || !type_eq(here.at(j), first.at(j))
+                differs = true
+
+        if differs
+            if !bare_int_literal(args.at(j)) then return none
+
+            for r in 0..<ranked.len()
+                val here = fitted.at(ranked.at(r))
+
+                if j < here.len() && type_eq(here.at(j), Integer(32, true, false)) then return none
+
+            differ.push(j)
+        end if
+
+    if differ.is_empty() then return none
+
+    var signed: Buf[usize] = buf()
+
+    for r in 0..<ranked.len()
+        var all = true
+
+        for d in 0..<differ.len()
+            if signed_bits(fitted.at(ranked.at(r)), differ.at(d)) < 32 then all = false
+
+        if all then signed.push(ranked.at(r))
+
+    var narrowest: Buf[usize] = buf()
+
+    for s in 0..<signed.len()
+        var least = true
+
+        for d in 0..<differ.len()
+            val mine = signed_bits(fitted.at(signed.at(s)), differ.at(d))
+
+            for o in 0..<signed.len()
+                if signed_bits(fitted.at(signed.at(o)), differ.at(d)) < mine then least = false
+
+        if least then narrowest.push(signed.at(s))
+
+    narrowest
+end signed_literal_preference
+
+// An integer literal written with no suffix, which is what has no type until a position gives one.
+private bare_int_literal(e: Expr) -> bool = *e.kind match
+    IntLit(_, _, suffix) -> suffix == ""
+    _ -> false
+
+// The width of a signed integer parameter at a position, and 0 for anything else.
+private signed_bits(params: Buf[Type], j: usize) -> int
+    if j >= params.len() then return 0
+
+    params.at(j) match
+        Integer(bits, true, _) -> bits
+        _ -> 0
+end signed_bits
 
 // The written-out candidates a call's position-typed arguments leave tied: empty where no argument
 // is typed by its position or the candidates agree at every one that is, the one candidate whose

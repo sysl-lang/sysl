@@ -111,22 +111,96 @@ tiw_a_typed_int_is_not_widened()
     assert(e.contains("'from' comes from 2 implementations of one trait on Rat, and none of them takes " +
                       "(int) — write the argument at the type of the implementation that was meant"), e)
 
-@test("two implementations a literal reaches only by conversion are still ambiguous")
+// A bare integer literal prefers the signed widening (the user's ruling, 2026-10-07): `long` beside
+// `u64` is the `long` one, `long` beside `i16` too, and `u64` beside `u32` offers nothing signed.
+@test("a literal reaching two implementations by conversion prefers the signed one")
 tiw_two_conversions_are_ambiguous()
     if !tiw_ready() then return
 
-    val e = tiw_err(raw"""
+    assert_eq(tiw_ran(raw"""
         struct Rat
             n: long
         impl From[long] for Rat
             from(x: long) -> Rat = Rat(x)
         impl From[u64] for Rat
+            from(x: u64) -> Rat = Rat(long(x) + 100)
+        print(Rat.from(3).n)
+        """), "3\n")
+
+@test("and a wide signed implementation beats a narrower signed one")
+tiw_wide_signed_beats_narrow_signed()
+    if !tiw_ready() then return
+
+    assert_eq(tiw_ran(raw"""
+        struct Rat
+            n: long
+        impl From[long] for Rat
+            from(x: long) -> Rat = Rat(x)
+        impl From[i16] for Rat
+            from(x: i16) -> Rat = Rat(long(x) + 100)
+        print(Rat.from(3).n)
+        """), "3\n")
+
+@test("two unsigned implementations a literal reaches by conversion are still ambiguous")
+tiw_two_unsigned_are_ambiguous()
+    if !tiw_ready() then return
+
+    val e = tiw_err(raw"""
+        struct Rat
+            n: long
+        impl From[u64] for Rat
             from(x: u64) -> Rat = Rat(long(x))
+        impl From[u32] for Rat
+            from(x: u32) -> Rat = Rat(long(x))
         print(Rat.from(3).n)
         """)
 
     assert(e.contains("'from' comes from 2 implementations of one trait on Rat, and the arguments do not " +
                       "say which was meant"), e)
+
+// ---- the same rule over a free overload set
+
+@test("a free overload set prefers the signed widening for a literal")
+tiw_free_long_beside_u64()
+    if !tiw_ready() then return
+
+    assert_eq(tiw_ran(raw"""
+        f(x: long) -> int = 1
+        f(x: u64) -> int = 2
+        g(x: i16) -> int = 1
+        g(x: long) -> int = 2
+        h(x: long) -> int = 1
+        h(x: int) -> int = 2
+        print(f(3))
+        print(g(3))
+        print(h(3))
+        print(f(3u64))
+        """), "1\n2\n2\n2\n")
+
+@test("and leaves two unsigned widenings ambiguous")
+tiw_free_u64_beside_u32()
+    if !tiw_ready() then return
+
+    val e = tiw_err(raw"""
+        f(x: u64) -> int = 1
+        f(x: u32) -> int = 2
+        print(f(3))
+        """)
+
+    assert(e.contains("'f' is ambiguous here — 2 of its declarations take these arguments"), e)
+
+@test("a typed argument is not a literal, so it gains no preference")
+tiw_free_typed_unsigned_is_not_preferred()
+    if !tiw_ready() then return
+
+    val e = tiw_err(raw"""
+        f(x: long) -> int = 1
+        f(x: u64) -> int = 2
+        val k: u32 = 3
+        print(f(k))
+        """)
+
+    assert(e.contains("no 'f' takes these arguments"), e)
 
 @test("an argument no implementation takes is refused")
 tiw_nothing_applies()
