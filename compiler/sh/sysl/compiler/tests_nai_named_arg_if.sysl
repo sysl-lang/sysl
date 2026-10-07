@@ -1,0 +1,178 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An inline `if` inside a bracket ends at the bracket's comma (`reference/declarations.md § Default
+// parameters and named arguments`: `name = value` takes an expression). The `else` branch is read as
+// an inline statement, and an inline statement may assign to several places -- so `f(a = if c then 1
+// else 2, b = 3)` used to read `2, b = 3` as the branch's assignment and leave `b` with no value. A
+// comma inside a bracket is always the bracket's; a block opened inside one starts afresh.
+
+private nai_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end nai_ready
+
+private nai_ran(text: string) -> string
+    val root = make_temp_dir("sysl-nai").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end nai_ran
+
+private nai_err(text: string) -> string
+    val root = make_temp_dir("sysl-nai").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end nai_err
+
+private nai_pick() -> string = "pick(a: int, b: int) -> int = a * 10 + b\n"
+
+@test("an inline if as a named argument leaves the next argument to the call")
+nai_a_named_if_before_another_named_argument()
+    if !nai_ready() then return
+
+    assert_eq(nai_ran(nai_pick() + raw"""
+        positional(c: bool) -> int = pick(a = if c then 1 else 2, b = 3)
+        print(positional(true))
+        print(positional(false))
+        """), "13\n23\n")
+
+@test("an inline if as the last named argument still reads")
+nai_a_named_if_last()
+    if !nai_ready() then return
+
+    assert_eq(nai_ran(nai_pick() + "print(pick(b = 3, a = if true then 1 else 2))\n"), "13\n")
+
+@test("an inline if as a positional argument leaves the next argument to the call")
+nai_a_positional_if_before_a_named_argument()
+    if !nai_ready() then return
+
+    assert_eq(nai_ran(nai_pick() + raw"""
+        print(pick(if false then 1 else 2, 3))
+        print(pick(if false then 1 else 2, b = 4))
+        """), "23\n24\n")
+
+@test("an else-if chain as a named argument ends at the comma")
+nai_an_else_if_chain_as_a_named_argument()
+    if !nai_ready() then return
+
+    assert_eq(nai_ran(nai_pick() + raw"""
+        chain(n: int) -> int = pick(a = if n == 0 then 1 else if n == 1 then 2 else 3, b = 4)
+        print(chain(0))
+        print(chain(1))
+        print(chain(2))
+        """), "14\n24\n34\n")
+
+@test("an inline if as a struct constructor's named field leaves the next field to it")
+nai_a_named_field_if()
+    if !nai_ready() then return
+
+    assert_eq(nai_ran(raw"""
+        struct P
+            x: int
+            y: int
+        val c = true
+        val p = P(x = if c then 1 else 2, y = 3)
+        print(p.x)
+        print(p.y)
+        """), "1\n3\n")
+
+@test("an inline if in an array literal and in a tuple is one element")
+nai_an_if_in_an_array_and_a_tuple()
+    if !nai_ready() then return
+
+    assert_eq(nai_ran(raw"""
+        val c = false
+        val xs: [2]int = [if c then 1 else 2, 3]
+        print(xs[0] + xs[1])
+        val t = (if c then 1 else 2, 3)
+        print(t.0 + t.1)
+        """), "5\n5\n")
+
+@test("an inline if in a 'with' leaves the next field to the braces")
+nai_an_if_in_a_with()
+    if !nai_ready() then return
+
+    assert_eq(nai_ran(raw"""
+        struct P
+            x: int
+            y: int
+        val c = true
+        val p = P(0, 0) with { x = if c then 1 else 2, y = 3 }
+        print(p.x * 10 + p.y)
+        """), "13\n")
+
+@test("an assignment to several places still reads as a statement")
+nai_a_multi_assignment_still_reads()
+    if !nai_ready() then return
+
+    assert_eq(nai_ran(raw"""
+        var a = 1
+        var b = 2
+        a, b = b, a
+        print(a * 10 + b)
+        if true then a, b = 7, 8
+        print(a * 10 + b)
+        """), "21\n78\n")
+
+@test("an inline if inside a closure's block, itself a named argument, reads")
+nai_an_if_in_a_block_inside_a_bracket()
+    if !nai_ready() then return
+
+    assert_eq(nai_ran(raw"""
+        run(f: () -> int, k: int) -> int = f() + k
+        print(run(f = () ->
+            var a = 1
+            if true then a = 5 else a = 6
+            a * 10, k = if false then 1 else 2))
+        """), "52\n")
+
+@test("a genuinely missing argument is still refused")
+nai_a_missing_argument_is_still_refused()
+    if !nai_ready() then return
+
+    val e = nai_err(nai_pick() + "positional(c: bool) -> int = pick(a = if c then 1 else 2)\nprint(positional(true))\n")
+
+    assert(e.contains("function 'pick' was given no value for 'b', and that parameter declares no default"), e)
+
+@test("the parse gives the comma after an inline branch to the bracket")
+nai_the_parse_shape()
+    assert_eq(pe("f(a = if c then 1 else 2, b = 3)"),
+        "(call f (named a (if c (then 1) (else 2))) (named b 3))")
+    assert_eq(pf("if c then a, b = 1, 2\n"), "(if c (then (= (a b) (1 2))))")
