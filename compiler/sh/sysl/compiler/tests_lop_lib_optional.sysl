@@ -1,0 +1,226 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// **A `--lib` root that stands in for a coordinate is that package in every respect, features and
+// optional dependencies included** (`reference/packages.md § A source root stands in for the package
+// it is`: "What the root's own manifest depends on comes with it, as the coordinate's would have").
+//
+// The root used to be read whole, so an optional dependency nothing turned on joined the graph — a
+// consumer of a package with an optional `libuv` behind a `uv` feature fetched and compiled libuv
+// under `--lib` and not when the package arrived by path — and its own `#if feature_x` lines were
+// read with no feature on at all. Each case here lays the package two ways, as a `--lib` root and
+// as a path dependency, and asks the two the same question.
+
+private lop_temp() -> string = absolute_path(make_temp_dir("sysl-lop").unwrap())
+
+private lop_manifest(name: string, deps: string, feats: string) -> string =
+    s"package { name = \"$name\", version = \"1.0.0\" }\n" +
+    (if deps.is_empty() then "" else s"dependencies { $deps }\n") +
+    (if feats.is_empty() then "" else s"features { $feats }\n")
+
+// `extra`, published in the project's `vendor/` as a fetch would have left it.
+private lop_publish_extra(project: string)
+    val dir = s"$project/vendor/github.com/e/extra/@v1.0.0"
+
+    make_dir_all(s"$dir/extra").unwrap()
+    write_text(s"$dir/package.hocon", lop_manifest("extra", "", "")).unwrap()
+    write_text(s"$dir/extra/extra.sysl", "module extra\n").unwrap()
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+end lop_publish_extra
+
+// The package `geom`, whose `extra` is optional and turned on by the feature `x`; `feats` is its
+// whole `features` block, and `text` its one module's body.
+private lop_geom(feats: string, text: string) -> string
+    val dir = lop_temp()
+
+    make_dir_all(s"$dir/geom").unwrap()
+    write_text(s"$dir/package.hocon",
+               lop_manifest("geom", "extra { git = \"github.com/e/extra\", version = \"1.0.0\", " +
+                            "optional = true }", feats)).unwrap()
+    write_text(s"$dir/geom/geom.sysl", s"module geom\n\n$text\n").unwrap()
+    dir
+end lop_geom
+
+// The project's entry naming `geom` by its coordinate, `extra` added to the entry.
+private lop_coordinate(extra: string) -> string =
+    "g { git = \"github.com/e/geom\", version = \"1.0.0\"" +
+    (if extra.is_empty() then "" else s", $extra") + " }"
+
+private lop_path(dir: string, extra: string) -> string =
+    s"g { path = \"$dir\"" + (if extra.is_empty() then "" else s", $extra") + " }"
+
+// The graph of a project whose `dependencies` block is `deps`, with `libs` handed over as `--lib`.
+private lop_graph(project: string, deps: string, libs: []string) -> Result[Graph, string]
+    reset_search_paths()
+    reset_feature_request()
+
+    for l in libs
+        add_lib_root(l)
+
+    val got = resolve_graph(project, read_manifest(lop_manifest("app", deps, "")).unwrap(),
+                            empty_sums(), s"$project/vendor", no_feature_request(), false)
+
+    reset_search_paths()
+    got
+end lop_graph
+
+// Every package the graph holds but the project, by canonical name, sorted and comma-joined.
+private lop_selected(g: Graph) -> string
+    var names: Buf[string] = buf()
+
+    for i in 0..<g.packages.len()
+        if !is_root_package(g.packages.at(i)) then names.push(g.packages.at(i).canonical)
+
+    join(sorted_labels(names).view(), ",")
+end lop_selected
+
+private lop_drop(dirs: []string)
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+// -- the graph ---------------------------------------------------------------------------------------
+
+// The case kairos found: `sysl deps <probe> --lib <kairos>` listed libuv with no feature on.
+@test("a --lib root standing in for a coordinate leaves out an optional dependency no feature turned on")
+lop_an_untouched_optional_is_left_out()
+    val project = lop_temp()
+    val geom = lop_geom("x = [extra]", "v() -> int = 1")
+
+    lop_publish_extra(project)
+
+    val g = lop_graph(project, lop_coordinate(""), [geom]).unwrap()
+
+    assert_eq(lop_selected(g), "")
+    assert_eq(join(enabled_of(g.features, lib_root_key(geom)).view(), ","), "")
+    lop_drop([project, geom])
+
+@test("and brings it in where the consumer turns the feature on")
+lop_the_consumers_feature_brings_it_in()
+    val project = lop_temp()
+    val geom = lop_geom("x = [extra]", "v() -> int = 1")
+
+    lop_publish_extra(project)
+
+    val g = lop_graph(project, lop_coordinate("features = [x]"), [geom]).unwrap()
+
+    assert_eq(lop_selected(g), "github.com.e.extra")
+    assert_eq(join(enabled_of(g.features, lib_root_key(geom)).view(), ","), "x")
+    lop_drop([project, geom])
+
+@test("and where its own default turns the feature on, unless the consumer turns default off")
+lop_its_default_brings_it_in()
+    val project = lop_temp()
+    val geom = lop_geom("default = [x], x = [extra]", "v() -> int = 1")
+
+    lop_publish_extra(project)
+
+    assert_eq(lop_selected(lop_graph(project, lop_coordinate(""), [geom]).unwrap()),
+              "github.com.e.extra")
+    assert_eq(lop_selected(lop_graph(project, lop_coordinate("default_features = false"),
+                                     [geom]).unwrap()), "")
+    lop_drop([project, geom])
+
+@test("a request for a feature the root does not declare is refused, as one of the coordinate would be")
+lop_an_undeclared_feature_is_refused()
+    val project = lop_temp()
+    val geom = lop_geom("x = [extra]", "v() -> int = 1")
+
+    lop_publish_extra(project)
+
+    lop_graph(project, lop_coordinate("features = [nope]"), [geom]) match
+        Ok(_) -> assert(false, "a feature 'geom' does not declare was taken")
+        Err(why) -> assert(why.index_of("'nope'").is_some(), why)
+
+    lop_drop([project, geom])
+
+@test("a root no dependency names has its default on and nothing else")
+lop_an_unnamed_root_has_its_default()
+    val project = lop_temp()
+    val off = lop_geom("x = [extra]", "v() -> int = 1")
+    val on = lop_geom("default = [x], x = [extra]", "v() -> int = 1")
+
+    lop_publish_extra(project)
+
+    assert_eq(lop_selected(lop_graph(project, "", [off]).unwrap()), "")
+    assert_eq(lop_selected(lop_graph(project, "", [on]).unwrap()), "github.com.e.extra")
+    lop_drop([project, off, on])
+
+// The answer the two cases above are held to: the same package by path, which was always right.
+@test("the same package as a path dependency answers the same, both ways")
+lop_a_path_dependency_answers_the_same()
+    val project = lop_temp()
+    val geom = lop_geom("x = [extra]", "v() -> int = 1")
+
+    lop_publish_extra(project)
+
+    val plain = lop_selected(lop_graph(project, lop_path(geom, ""), []).unwrap())
+    val asked = lop_selected(lop_graph(project, lop_path(geom, "features = [x]"), []).unwrap())
+
+    assert(plain.index_of("extra").is_none(), plain)
+    assert(asked.index_of("github.com.e.extra").is_some(), asked)
+    lop_drop([project, geom])
+
+// -- the root's own lines ------------------------------------------------------------------------------
+
+private lop_ready() -> bool = std_root().is_ok() && clang_available()
+
+private lop_gated() -> string =
+    "#if feature_x\ntag() -> string = \"x\"\n#else\ntag() -> string = \"plain\"\n#endif"
+
+// What the program a build of a project depending on `entry` makes prints, with `libs` handed over.
+private lop_run(entry: string, libs: []string) -> string
+    reset_search_paths()
+    reset_feature_request()
+
+    for l in libs
+        add_lib_root(l)
+
+    val project = lop_temp()
+
+    lop_publish_extra(project)
+    write_text(s"$project/package.hocon", lop_manifest("app", entry, "")).unwrap()
+    write_text(s"$project/main.sysl", "print(geom.tag())\n").unwrap()
+
+    val out_dir = lop_temp()
+    val said = build_native_program(project, None, None, DefaultOptimization,
+                                    Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    reset_search_paths()
+    lop_drop([project, out_dir])
+    said
+end lop_run
+
+@test("a root's own #if lines see the features its consumer turned on, as a path dependency's do")
+lop_a_roots_lines_see_its_features()
+    if !lop_ready() then return
+
+    val geom = lop_geom("x = [extra]", lop_gated())
+
+    assert_eq(lop_run(lop_coordinate("features = [x]"), [geom]), "x\n")
+    assert_eq(lop_run(lop_coordinate(""), [geom]), "plain\n")
+    assert_eq(lop_run(lop_path(geom, "features = [x]"), []), "x\n")
+    assert_eq(lop_run(lop_path(geom, ""), []), "plain\n")
+    lop_drop([geom])
+
+@test("and a root with no graph to resolve sees its own default")
+lop_a_root_with_no_graph_sees_its_default()
+    if !lop_ready() then return
+
+    val geom = lop_temp()
+
+    make_dir_all(s"$geom/geom").unwrap()
+    write_text(s"$geom/package.hocon", lop_manifest("geom", "", "default = [x], x = []")).unwrap()
+    write_text(s"$geom/geom/geom.sysl", s"module geom\n\n${lop_gated()}\n").unwrap()
+
+    assert_eq(lop_run("", [geom]), "x\n")
+    lop_drop([geom])

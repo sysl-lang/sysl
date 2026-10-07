@@ -117,18 +117,15 @@ syslib_named_refusal(given: string) -> string =
 //
 // **A root is a tree**, so each file's header is held to where the file sits exactly as the
 // project's are.
-private lib_root_units(t: Target) -> Result[Buf[Program], Failure]
+//
+// **A root's files are gated by its own features** (`PackageSources.lib_features`), as a fetched
+// package's are by its own: the root stands in for that package, `#if feature_x` lines included.
+private lib_root_units(t: Target, fetched: &PackageSources) -> Result[Buf[Program], Failure]
     var out: Buf[Program] = buf()
     val libs = lib_roots()
 
     for i in 0..<libs.len()
         val given = libs.at(i)
-
-        if is_artifact(given) then return Err(said(Refusal(syslib_named_refusal(given))))
-
-        if !exists(given)
-            return Err(said(Refusal(s"cannot read a library: '$given' does not exist")))
-
         val found = collect(given, Some(t.os)) match
             Err(e) -> return Err(said(Refusal(e.message)))
             Ok(f) -> f
@@ -139,7 +136,7 @@ private lib_root_units(t: Target) -> Result[Buf[Program], Failure]
         var unparsed: Buf[string] = buf()
 
         for j in 0..<found.len()
-            val parsed = parse(found.at(j).src, t)
+            val parsed = parse(found.at(j).src, t, lib_feature_symbols(fetched, given))
 
             if !parsed.ok() then unparsed.push(parse_report(parsed))
             else theirs.push(parsed.program)
@@ -165,6 +162,22 @@ private lib_root_units(t: Target) -> Result[Buf[Program], Failure]
 
     Ok(out)
 end lib_root_units
+
+// Every `--lib` is a directory that is there: a mistake on the command line says so ahead of
+// whatever the graph would.
+private lib_roots_present() -> Result[unit, Failure]
+    val libs = lib_roots()
+
+    for i in 0..<libs.len()
+        val given = libs.at(i)
+
+        if is_artifact(given) then return Err(said(Refusal(syslib_named_refusal(given))))
+
+        if !exists(given)
+            return Err(said(Refusal(s"cannot read a library: '$given' does not exist")))
+
+    Ok(())
+end lib_roots_present
 
 // The modules a set of files declares, each once.
 private modules_written(units: Buf[Program]) -> Buf[string]
@@ -236,7 +249,7 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
 
     // What each `--lib` named, read before anything is resolved on its account: a root that is not
     // there is a mistake on the command line, and says so ahead of whatever the graph would.
-    val handed = lib_root_units(t)?
+    lib_roots_present()?
 
     var units: Buf[Program] = buf()
 
@@ -261,6 +274,7 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     // Then the packages -- the graph resolved, fetched, and read off disk. They join the compilation
     // once the project's own modules are known, below, which is what decides whose tests are read.
     val fetched = package_sources(root, manifest, t)?
+    val handed = lib_root_units(t, fetched)?
 
     use_location_roots(location_roots_of(root, fetched.roots))
 

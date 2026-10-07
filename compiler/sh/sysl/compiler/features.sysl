@@ -270,49 +270,114 @@ end enabled_of
 // take a feature away from a sibling that asked for the package the ordinary way.
 //
 // The root is left out: what it has enabled is the caller's answer rather than anybody's request.
-enabled_from(packages: &Buf[ResolvedPackage]) -> Result[Buf[(string, Buf[string])], string]
+//
+// **A `--lib` root is a package too, both ways round** (`reference/packages.md § A source root stands
+// in for the package it is`). As a consumer, its manifest -- pruned to what `enabled` gave it -- asks
+// as a dependency's would. As a target, it answers every edge naming the coordinate it stands in for
+// (`stood_in_by`), filed under `lib_root_key`; and a root no edge names has `default` on, as one
+// consumer asking the ordinary way would have given it.
+enabled_from(packages: &Buf[ResolvedPackage], roots: Buf[(string, Manifest)],
+             enabled: &Buf[(string, Buf[string])]) -> Result[Buf[(string, Buf[string])], string]
     var out: Buf[(string, Buf[string])] = buf()
+    val consumers = consumers_of(packages, pruned_roots(roots, enabled))
 
     for t in 0..<packages.len()
         val target = packages.at(t)
 
         if is_root_package(target) then continue
 
-        var named: Buf[string] = buf()
-        var wants_default = false
-        var asked_at_all = false
+        var asked = no_asking()
 
-        for p in 0..<packages.len()
-            val consumer = packages.at(p)
-            val deps = consumer.manifest.dependencies
+        for c in 0..<consumers.len()
+            val (who, deps) = consumers.at(c)
 
             for d in 0..<deps.len()
                 val dep = deps.at(d)
 
-                if dependency_canonical(dep) != target.canonical then continue
+                if dependency_canonical(dep) == target.canonical
+                    asking(&asked, who, dep, target.manifest)?
 
-                asked_at_all = true
+        if !asked.at_all then continue
 
-                if dep.default_features then wants_default = true
+        out.push((target.canonical, asked_closure(asked, target.manifest)))
 
-                for f in 0..<dep.features.len()
-                    val feature = dep.features.at(f)
+    for r in 0..<roots.len()
+        val (dir, theirs) = roots.at(r)
+        var asked = no_asking()
 
-                    if !feature_named(target.manifest.features, feature)
-                        return Err(no_such_feature(consumer_named(consumer), dep, feature,
-                                                   declared_features(target.manifest)))
+        for c in 0..<consumers.len()
+            val (who, deps) = consumers.at(c)
 
-                    named.push(feature)
+            for d in 0..<deps.len()
+                val dep = deps.at(d)
 
-        if !asked_at_all then continue
+                if stood_in_by(roots, dep).unwrap_or(roots.len()) == r
+                    asking(&asked, who, dep, theirs)?
 
-        if wants_default then named.push("default")
+        if !asked.at_all then asked.wants_default = true
 
-        out.push((target.canonical, feature_closure(target.manifest.features, named,
-                                                     target.manifest.dependencies)))
+        out.push((lib_root_key(dir), asked_closure(asked, theirs)))
 
     Ok(out)
 end enabled_from
+
+// The key a `--lib` root's enabled features are filed under, beside the packages' canonical names.
+// The space keeps it from ever being one: a canonical prefix is a coordinate, which holds none.
+lib_root_key(dir: string) -> string = s"--lib $dir"
+
+// What the consumers of one target asked of it, gathered edge by edge.
+private struct Asking
+    named: Buf[string]
+    wants_default: bool
+    at_all: bool
+end Asking
+
+private no_asking() -> Asking = Asking(buf(), false, false)
+
+// One edge's request, held to the features the target declares.
+private asking(into: *Asking, who: string, dep: &Dependency, target: &Manifest) -> Result[unit, string]
+    into.at_all = true
+
+    if dep.default_features then into.wants_default = true
+
+    for f in 0..<dep.features.len()
+        val feature = dep.features.at(f)
+
+        if !feature_named(target.features, feature)
+            return Err(no_such_feature(who, dep, feature, declared_features(target)))
+
+        into.named.push(feature)
+
+    Ok(())
+end asking
+
+private asked_closure(asked: Asking, target: &Manifest) -> Buf[string]
+    var named: Buf[string] = buf()
+
+    for i in 0..<asked.named.len()
+        named.push(asked.named.at(i))
+
+    if asked.wants_default then named.push("default")
+
+    feature_closure(target.features, named, target.dependencies)
+end asked_closure
+
+// Every manifest that asks anything of a dependency, each with how a refusal names it: the packages
+// of the graph, the project among them, and the `--lib` roots.
+private consumers_of(packages: &Buf[ResolvedPackage],
+                     roots: Buf[(string, Manifest)]) -> Buf[(string, Buf[Dependency])]
+    var out: Buf[(string, Buf[Dependency])] = buf()
+
+    for p in 0..<packages.len()
+        val consumer = packages.at(p)
+
+        out.push((consumer_named(consumer), consumer.manifest.dependencies))
+
+    for r in 0..<roots.len()
+        out.push((s"the source root '${roots.at(r).0}'", roots.at(r).1.dependencies))
+
+    out
+end consumers_of
 
 // How a consumer is named in a refusal: a dependency by its canonical prefix, the root by itself.
 private consumer_named(p: &ResolvedPackage) -> string =
