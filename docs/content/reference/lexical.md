@@ -951,6 +951,25 @@ print(apply((x) ->
 The bracket rule resumes at the dedent, so an argument written after the block is read at the outer
 level and its own margin means nothing again.
 
+**A comma on the block's own level ends the block — unless the line is a multi-assignment.** A line
+that is a list of places followed by an assignment operator is a statement of the block, and every
+comma on it, the values' included, is the statement's:
+
+```sysl
+call(f: () -> unit) = f()
+
+var a = 1
+var b = 2
+
+call(() ->
+    a, b = 5, 6
+    print(a + b))
+```
+
+```output
+11
+```
+
 **`then`, `else` and `do` are not among the two, and neither is the trailing block's `:`.** An `if`
 written across lines puts its `else` back at the *outer* margin, which is a dedent belonging to the
 bracket rather than to the block — a different mechanism rather than more of this one. A branch used

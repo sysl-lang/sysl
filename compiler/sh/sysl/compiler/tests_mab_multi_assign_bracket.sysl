@@ -1,0 +1,184 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A block opened by `->` or `match` inside brackets ends at a comma on its own level, so that the
+// bracket's next item follows it (`reference/lexical.md § Except where a block opens inside them`).
+// A line of such a block that is a multi-assignment -- a comma list of places and an assignment
+// operator -- is a statement of the block, and its commas are its own: `a, b = 5, 6` used to end the
+// closure at the first comma and fail with `')' expected` on the line after it.
+
+private mab_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end mab_ready
+
+private mab_ran(text: string) -> string
+    val root = make_temp_dir("sysl-mab").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end mab_ran
+
+private mab_err(text: string) -> string
+    val root = make_temp_dir("sysl-mab").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end mab_err
+
+private mab_call() -> string = "call(f: () -> unit) = f()\nvar a = 1\nvar b = 2\n"
+
+@test("a multi-assignment line inside a bracketed closure is a statement of the closure")
+mab_the_reported_case()
+    if !mab_ready() then return
+
+    assert_eq(mab_ran(mab_call() + raw"""
+        call(() ->
+            a, b = 5, 6
+            print(a + b))
+        """), "11\n")
+
+@test("a multi-assignment as the closure's last line, followed by the bracket")
+mab_the_last_line()
+    if !mab_ready() then return
+
+    // A closure captures by value, so the places are written through pointers to be seen outside.
+    assert_eq(mab_ran(mab_call() + raw"""
+        val pa = &a
+        val pb = &b
+        call(() ->
+            print(a + b)
+            *pa, *pb = 20, 10)
+        print(a * 10 + b)
+        """), "3\n210\n")
+
+@test("a multi-assignment through fields, a subscript and a compound operator")
+mab_places_of_every_shape()
+    if !mab_ready() then return
+
+    assert_eq(mab_ran(raw"""
+        call(f: () -> unit) = f()
+        struct P
+            x: int
+            y: int
+        var p = P(1, 2)
+        var xs: [2]int = [0, 0]
+        call(() ->
+            p.x, xs[1] = 7, 8
+            p.y, xs[0] += 10, 20
+            print(p.x + p.y + xs[0] + xs[1]))
+        """), "47\n")
+
+@test("a multi-assignment line in a match arm's block inside a call")
+mab_in_a_match_arm()
+    if !mab_ready() then return
+
+    assert_eq(mab_ran(raw"""
+        show(n: int) = print(n)
+        var a = 1
+        var b = 2
+        show(3 match
+            3 ->
+                a, b = 30, 40
+                a + b
+            _ -> 0)
+        """), "70\n")
+
+@test("an expression line followed by a comma still hands the next argument to the call")
+mab_an_expression_line_ends_the_block()
+    if !mab_ready() then return
+
+    assert_eq(mab_ran(raw"""
+        apply(f: int -> int, x: int) -> int = f(x)
+        print(apply((x) ->
+            val doubled = x * 2
+
+            doubled + 1, 5))
+        """), "11\n")
+
+@test("a single assignment followed by a comma still hands the next argument to the call")
+mab_a_single_assignment_ends_the_block()
+    if !mab_ready() then return
+
+    assert_eq(mab_ran(raw"""
+        twice(f: () -> unit, n: int) -> int
+            f()
+            f()
+            n
+        print(twice(() ->
+            var x = 0
+            print(x)
+            x = 5, 7))
+        """), "0\n0\n7\n")
+
+@test("two places meeting three values is the ordinary arity refusal")
+mab_more_values_than_places()
+    if !mab_ready() then return
+
+    val said = mab_err(mab_call() + raw"""
+        call(() ->
+            a, b = 5, 6, 7)
+        """)
+
+    assert(said.contains("this assignment has 2 places on the left and 3 values on the right"), said)
+    assert(!said.contains("')' expected"), said)
+
+@test("a destructuring val inside a bracketed closure reads as before")
+mab_a_destructuring_val()
+    if !mab_ready() then return
+
+    assert_eq(mab_ran(mab_call() + raw"""
+        call(() ->
+            val (x, y) = (5, 6)
+            print(x + y))
+        """), "11\n")
+
+// The 0.0.162 reference refuses the shape (`')' expected`), so the emit-ast sweep over the reference
+// pages excuses a block written in it through `scripts/self_hosted_only.tsv` -- and only that block:
+// a multi-assignment at statement level is not the construct.
+@test("the self-hosted-only row names a multi-assignment opening a bracketed block, and nothing else")
+mab_the_sweep_excuse_is_narrow()
+    val listed = self_hosted_only()
+
+    val inside = self_hosted_construct("call(() ->\n    a, b = 5, 6\n    print(a + b))\n", listed)
+
+    assert(inside.is_some(), "the bracketed block is not excused")
+    assert_eq(inside.unwrap().feature, "multi-assignment in a bracketed block")
+
+    assert(self_hosted_construct("var a = 1\nvar b = 2\na, b = 5, 6\n", listed).is_none(),
+           "a statement-level multi-assignment is excused")
