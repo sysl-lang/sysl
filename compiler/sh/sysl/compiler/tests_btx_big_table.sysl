@@ -1,0 +1,200 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A large array literal of constants is laid down as data and copied into place**
+// (`emit_static.sysl`'s `constant_table`). Built element by element, a 4,000-row table of string
+// pairs was 8,000 stores in one function and ten seconds of LLVM at `-O1`, growing faster than the
+// table; as a constant it is one `memcpy`, whatever its length. Timing is not asserted -- what is
+// asserted is the property that made it slow: the number of stores a body carries no longer grows
+// with the table.
+
+private btx_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return false
+        Ok(_) -> ()
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end btx_ready
+
+// The LLVM text a program lowers to -- or, where it is refused, what it was refused with.
+private btx_ir(text: string) -> string
+    val root = make_temp_dir("sysl-btx-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end btx_ir
+
+// What a program PRINTS.
+private btx_ran(text: string) -> string
+    val root = make_temp_dir("sysl-btx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end btx_ran
+
+// An entry file holding an `n`-row table of string pairs as a local `val`, and a lookup over it --
+// the shape an HTML entity or emoji table is written in.
+private btx_pairs(n: int) -> string
+    var b = str_builder()
+
+    b.push(s"val table: [$n](string, string) = [\n")
+
+    for i in 0..<n
+        if i > 0 then b.push(",\n")
+
+        b.push(s"    (\"name$i\", \"text$i\")")
+
+    b.push("]\n\n")
+    b.push("for e in table\n")
+    b.push("    if e.0 == \"name7\" then print(e.1)\n")
+    b.push("print(table.len, table[0].0, table[")
+    b.push(s"${n - 1}].1)\n")
+    b.finish()
+end btx_pairs
+
+// An `n`-element literal of integers bound to a local, every one of them read back.
+private btx_ints(n: int, declared: int, trailing: string) -> string
+    var b = str_builder()
+
+    b.push(s"var xs: [$declared]int = [")
+
+    for i in 0..<n
+        if i > 0 then b.push(", ")
+
+        b.push(s"${i * 3}")
+
+    b.push(s"$trailing]\n")
+    b.push("var sum = 0\nfor x in xs\n    sum += x\nprint(sum, xs[1], xs.len)\n")
+    b.finish()
+end btx_ints
+
+private btx_stores(text: string) -> usize = text.count_of("  store ")
+
+@test("a table's stores do not grow with the table")
+btx_a_tables_stores_do_not_grow_with_the_table()
+    if !btx_ready() then return
+
+    val small = btx_ir(btx_pairs(100))
+    val large = btx_ir(btx_pairs(4000))
+
+    assert(small.contains("@.table1 = private constant [100 x "))
+    assert(large.contains("@.table1 = private constant [4000 x "))
+    assert_eq(btx_stores(large), btx_stores(small))
+
+@test("a table is copied into its local with one memcpy")
+btx_a_table_is_copied_into_its_local_with_one_memcpy()
+    if !btx_ready() then return
+
+    val ir = btx_ir(btx_pairs(100))
+
+    assert(ir.contains("call void @llvm.memcpy.p0.p0.i64(ptr align 8 %table.addr, ptr align 8 @.table1, i64 4800, i1 false)"))
+
+@test("a table reads back every row it was written with")
+btx_a_table_reads_back_every_row_it_was_written_with()
+    if !btx_ready() then return
+
+    assert_eq(btx_ran(btx_pairs(2000)), "text7\n2000 name0 text1999\n")
+
+@test("a table of integers sums to what was written")
+btx_a_table_of_integers_sums_to_what_was_written()
+    if !btx_ready() then return
+
+    // 3 * (0 + 1 + ... + 99) = 14850
+    assert_eq(btx_ran(btx_ints(100, 100, "")), "14850 3 100\n")
+
+@test("a copied table is the local's own, so writing it leaves the next copy whole")
+btx_a_copied_table_is_the_locals_own()
+    if !btx_ready() then return
+
+    var b = str_builder()
+
+    b.push("fill() -> int\n    var xs: [64]int = [")
+
+    for i in 0..<64
+        if i > 0 then b.push(", ")
+
+        b.push(s"$i")
+
+    b.push("]\n    val before = xs[5]\n    xs[5] = 1000\n    before + xs[5]\n\n")
+    b.push("print(fill(), fill())\n")
+
+    assert_eq(btx_ran(b.finish()), "1005 1005\n")
+
+@test("a literal of mixed constants is laid down field for field")
+btx_a_literal_of_mixed_constants_is_laid_down_field_for_field()
+    if !btx_ready() then return
+
+    var b = str_builder()
+
+    b.push("struct Row\n    id: u8\n    on: bool\n    w: f32\n    r: real\n    name: string\n    xs: [2]i64\n\n")
+    b.push("val rows: [70]Row = [")
+
+    for i in 0..<70
+        if i > 0 then b.push(",\n    ")
+
+        b.push(s"Row($i, ${if i % 2 == 0 then "true" else "false"}, ${i}.5, -${i}.25, \"r$i\", [$i, -$i])")
+
+    b.push("]\n")
+    b.push("val r = rows[69]\nprint(r.id, r.on, r.w, r.r, r.name, r.xs[0], r.xs[1], rows[4].on)\n")
+
+    val text = b.finish()
+
+    assert(btx_ir(text).contains("@.table1 = private constant [70 x "))
+    assert_eq(btx_ran(text), "69 false 69.5 -69.25 r69 69 -69 true\n")
+
+@test("a literal one short of a table keeps its stores")
+btx_a_literal_one_short_of_a_table_keeps_its_stores()
+    if !btx_ready() then return
+
+    val short = btx_ir(btx_ints(63, 63, ""))
+    val long = btx_ir(btx_ints(64, 64, ""))
+
+    assert(!short.contains("@.table"))
+    assert(long.contains("@.table1 = private constant [64 x i32]"))
+    assert_eq(btx_ran(btx_ints(63, 63, "")), "5859 3 63\n")
+
+@test("an element that is not constant keeps the whole literal as stores")
+btx_an_element_that_is_not_constant_keeps_the_literal_as_stores()
+    if !btx_ready() then return
+
+    // The last element is a call, so nothing about the literal is data.
+    val text = s"seven() -> int = 7\n\n${btx_ints(100, 101, ", seven()")}"
+
+    assert(!btx_ir(text).contains("@.table"))
+    assert_eq(btx_ran(text), "14857 3 101\n")
