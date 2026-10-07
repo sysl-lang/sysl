@@ -1,0 +1,348 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **Reading a compilation as data** (`IrModule`), which is what the representation exists for. Every
+// other codegen suite asserts on the text; none of them could say whether a consumer that is not LLVM
+// could do anything with the result. **So nothing here renders anything**: what is asked is what a
+// back end asks -- which functions are there, what is in their blocks, what the globals hold, what
+// the module is for. The programs and claims are the reference compiler's (0.0.162) `IrModuleTests`.
+
+// The module a program of several files lowers to, the way the driver lowers it.
+irp_module_for(files: []const (string, string), t: Target) -> Result[IrModule, string]
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(why) -> return Err(why)
+        Ok(root) -> std_units(root, t) match
+            Err(why) -> return Err(why)
+            Ok(lib) ->
+                for i in 0..<lib.len()
+                    units.push(lib.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return Err(parse_report(parsed))
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    if !errors_of(done.an.diagnostics()).is_empty()
+        return Err(analysis_report(errors_of(done.an.diagnostics())))
+
+    Ok(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end irp_module_for
+
+// Two LLVM types, or two values, are the same when they are written the same -- the IR's types have no
+// equality of their own, and LLVM's own notion of one is its spelling.
+private irp_lt(a: LType, b: LType) -> bool = l_render(a) == l_render(b)
+
+private irp_is(v: Option[Val], text: string) -> bool = v match
+    Some(x) -> v_render(x) == text
+    None -> false
+
+private irp_module(text: string) -> IrModule = irp_module_for([("main.sysl", text)], host_target()).unwrap()
+
+// A module `m` beside an entry file, so a question about MODULE storage can be asked at all: a `val`
+// at the top of a headerless program is a local of the entry point.
+private irp_with_module(m: string, main: string) -> IrModule =
+    irp_module_for([("m/m.sysl", m), ("main.sysl", main)], host_target()).unwrap()
+
+private irp_find(m: IrModule, name: string) -> Option[IrFunc]
+    for i in 0..<m.funcs.len()
+        if m.funcs.at(i).sig.name == name then return Some(m.funcs.at(i))
+
+    None
+end irp_find
+
+// Every instruction of a function, terminators included.
+private irp_instrs(f: IrFunc) -> Buf[Inst]
+    var out: Buf[Inst] = buf()
+
+    for i in 0..<f.blocks.len()
+        val b = f.blocks.at(i)
+
+        for j in 0..<b.instrs.len()
+            out.push(b.instrs.at(j))
+
+        if b.terminator.is_some() then out.push(b.terminator.unwrap())
+
+    out
+end irp_instrs
+
+private irp_twice() -> string = "twice(n: int) -> int = n * 2\nprint(twice(21))\n"
+
+@test("the module records the machine it was built for")
+irp_mod_triple()
+    if xvr_no_library() then return
+
+    assert_eq(irp_module("print(1)\n").triple, host_target().triple)
+
+    val riscv = target_named("riscv64-freestanding").unwrap()
+    val m = irp_module_for([("main.sysl", "print(1)\n")], riscv)
+
+    assert(m.is_ok() && m.unwrap().triple.contains("riscv64"), "the riscv64 triple")
+
+@test("a function comes back as its signature and its blocks, with no text anywhere")
+irp_mod_function()
+    if xvr_no_library() then return
+
+    val f = irp_find(irp_module(irp_twice()), "twice").unwrap()
+
+    assert(irp_lt(f.sig.ty.ret, LInt(32)), "the result")
+    assert_eq(f.sig.ty.params.len(), 1)
+    assert(irp_lt(f.sig.ty.params.at(0).ty, LInt(32)), "the parameter")
+    assert(irp_is(f.sig.ty.params.at(0).name, "%n.param"), "the parameter's name")
+
+    // The entry block holds the parameter's slot, and the body multiplies what it reads back.
+    var slot = ""
+
+    for i in 0..<f.blocks.at(0).instrs.len()
+        f.blocks.at(0).instrs.at(i) match
+            InAlloca(VReg(n), _, _) -> if slot == "" then slot = n
+            _ -> ()
+
+    assert_eq(slot, "n.addr")
+
+    var times = false
+    val all = irp_instrs(f)
+
+    for i in 0..<all.len()
+        all.at(i) match
+            InBin(_, OpMul, _, _, b) -> if v_render(b) == "2" then times = true
+            _ -> ()
+
+    assert(times, "the multiplication by 2")
+
+    // Every block ends somewhere, which is the one thing a consumer must not have to work out.
+    for i in 0..<f.blocks.len()
+        val t = f.blocks.at(i).terminator
+
+        assert(t.is_some() && inst_terminates(t.unwrap()), f.blocks.at(i).label)
+end irp_mod_function
+
+// The entry point is its own field rather than one of `funcs`, because a library has none.
+@test("a call names its callee as a symbol rather than as characters")
+irp_mod_call_symbol()
+    if xvr_no_library() then return
+
+    val main = irp_module(irp_twice()).entry.unwrap()
+    val all = irp_instrs(main)
+    var called = false
+
+    for i in 0..<all.len()
+        all.at(i) match
+            InCall(_, _, VGlobal(n), _, _, _, _, _) -> if n == "twice" then called = true
+            _ -> ()
+
+    assert(called, "the entry point calls @twice")
+end irp_mod_call_symbol
+
+private irp_find_struct(m: IrModule, name: string) -> Option[IrTypeDef]
+    for i in 0..<m.structs.len()
+        if m.structs.at(i).name == name then return Some(m.structs.at(i))
+
+    None
+end irp_find_struct
+
+@test("a declared struct is a type definition, and its fields are types")
+irp_mod_struct()
+    if xvr_no_library() then return
+
+    val m = irp_module("struct Point\n    x: int\n    y: int\n\nvar p = Point(1, 2)\nprint(p.x)\n")
+    val d = irp_find_struct(m, "%struct.Point").unwrap()
+
+    assert_eq(d.fields.len(), 2)
+    assert(irp_lt(d.fields.at(0), LInt(32)) && irp_lt(d.fields.at(1), LInt(32)), "two i32 fields")
+    assert(!d.packed, "an ordinary layout")
+
+// `@packed` is the one thing a type DEFINITION says that a use of the same type does not.
+@test("and a packed one says so on the definition")
+irp_mod_packed()
+    if xvr_no_library() then return
+
+    val m = irp_module("@packed\nstruct Raw\n    tag: u8\n    n: u32\n\nvar r = Raw(1, 2)\nprint(r.n)\n")
+
+    assert(irp_find_struct(m, "%struct.Raw").unwrap().packed, "packed")
+
+private irp_global_in(m: IrModule, section: string) -> Option[IrGlobal]
+    for i in 0..<m.globals.len()
+        if m.globals.at(i).section.unwrap_or("") == section then return Some(m.globals.at(i))
+
+    None
+end irp_global_in
+
+// A linker script gathers a placed object, so nothing in the program reads it and `@llvm.used` is
+// what keeps the optimizer from deleting it (`reference/attributes.md § @section("...")`).
+@test("module storage is a constant expression and carries where the linker is to put it")
+irp_mod_placed_storage()
+    if xvr_no_library() then return
+
+    val m = irp_with_module("module m\n\n@section(\".cmd\")\nval marker: int = 7\n", "print(m.marker)\n")
+    val g = irp_global_in(m, ".cmd").unwrap()
+
+    assert(g.constant, "a constant")
+    assert(irp_lt(g.ty, LInt(32)), "an i32")
+    assert(irp_is(g.value, "7"), "the value 7")
+
+    val used = m.used.unwrap()
+
+    assert_eq(linkage_prefix(used.linkage), "appending ")
+
+    var listed = false
+
+    used.value match
+        Some(VArray(refs)) ->
+            for i in 0..<refs.len()
+                if v_render(refs.at(i).value) == v_render(VGlobal(g.name)) then listed = true
+        _ -> ()
+
+    assert(listed, "@llvm.used names the placed global")
+end irp_mod_placed_storage
+
+private irp_storage(ty: string, init: string, elem: LType, len: int) -> Option[Val]
+    val m = irp_with_module(s"module m\n\nvar cells: [$len]$ty = $init\n", "print(m.cells[0])\n")
+
+    for i in 0..<m.globals.len()
+        if irp_lt(m.globals.at(i).ty, LArr(len, elem)) then return m.globals.at(i).value
+
+    None
+end irp_storage
+
+// The size is paid entirely in compiling: an all-zero array written element by element made a 16 MiB
+// array a 100 MB `.ll`. Asserted on the model -- which of the two forms the global holds.
+@test("a zero fill is one word of storage and a non-zero fill is still every element")
+irp_mod_zero_fill()
+    if xvr_no_library() then return
+
+    irp_storage("u8", "[0u8; 4096]", LInt(8), 4096) match
+        Some(VZero) -> ()
+        _ -> assert(false, "a zero fill is one word of zero")
+
+    irp_storage("u8", "[7u8; 4]", LInt(8), 4) match
+        Some(VArray(elems)) ->
+            assert_eq(elems.len(), 4)
+
+            for i in 0..<elems.len()
+                assert_eq(v_render(elems.at(i).value), "7")
+        _ -> assert(false, "a non-zero fill collapsed")
+
+// A float is zero at bit pattern zero alone, so an array of `-0.0` is not a zero fill.
+@test("a fill of negative zero is not a zero fill")
+irp_mod_negative_zero()
+    if xvr_no_library() then return
+
+    irp_storage("real", "[-0.0; 4]", LFloat(64, false), 4) match
+        Some(VArray(elems)) ->
+            for i in 1..<elems.len()
+                assert_eq(v_render(elems.at(i).value), v_render(elems.at(0).value))
+        Some(VZero) -> assert(false, "'-0.0' was collapsed to zeroinitializer, which is a different value")
+        _ -> assert(false, "an unexpected initializer")
+
+// The interned bytes carry the terminator a C caller reads by, and they are BYTES rather than one
+// back end's escaping of them.
+@test("a string literal is the bytes of one, in a global of its own")
+irp_mod_string_bytes()
+    if xvr_no_library() then return
+
+    val m = irp_module("print(\"h\u{e9}\")\n")
+    var utf8: Buf[u8] = buf()
+
+    utf8.push(0x68)
+    utf8.push(0xc3)
+    utf8.push(0xa9)
+    utf8.push(0)
+
+    var found = false
+
+    for i in 0..<m.globals.len()
+        val g = m.globals.at(i)
+
+        g.value match
+            Some(VBytes(bs)) -> if irp_lt(g.ty, LArr(4, LInt(8))) && irp_same_bytes(bs, utf8) then found = true
+            _ -> ()
+
+    assert(found, "a [4 x i8] global holding h, the two bytes of e-acute, and a zero")
+    assert_eq(v_render(VBytes(utf8)), "c\"h\\C3\\A9\\00\"")
+end irp_mod_string_bytes
+
+private irp_same_bytes(a: Buf[u8], b: Buf[u8]) -> bool
+    if a.len() != b.len() then return false
+
+    for i in 0..<a.len()
+        if a.at(i) != b.at(i) then return false
+
+    true
+end irp_same_bytes
+
+// The `sret` case: the attribute names a TYPE and the parameter is still a `ptr`.
+@test("a large result is an out-parameter whose attributes are values")
+irp_mod_sret()
+    if xvr_no_library() then return
+
+    val m = irp_module("struct Big\n    cells: [64]i64\n    tag: int\n\n" +
+                       "make(t: int) -> Big = Big([0; 64], t)\nprint(make(3).tag)\n")
+    val f = irp_find(m, "make").unwrap()
+    val out = f.sig.ty.params.at(0)
+    var noalias = false
+    var sret = false
+
+    for i in 0..<out.attrs.len()
+        out.attrs.at(i) match
+            AttrNoAlias -> noalias = true
+            AttrSRet(t) -> if irp_lt(t, LNamed("%struct.Big")) then sret = true
+            _ -> ()
+
+    assert(irp_lt(out.ty, LPtr), "a pointer")
+    assert(noalias, "noalias")
+    assert(sret, "sret(%struct.Big)")
+    assert(irp_lt(f.sig.ty.ret, LVoid), "nothing comes back")
+end irp_mod_sret
+
+// A generated helper is a function a consumer reads; a hand-written one is LLVM text, and all a
+// consumer gets is its name -- which is what a back end that is not LLVM matches on.
+@test("the runtime is data where it was generated and a name where it was written by hand")
+irp_mod_runtime()
+    if xvr_no_library() then return
+
+    val m = irp_module("print(\"a\" + \"b\")\n")
+    var templates = ""
+    var emitted = 0
+
+    for i in 0..<m.runtime.len()
+        m.runtime.at(i) match
+            RtTemplate(n, _) ->
+                assert(n != "", "every template is named")
+                templates = templates + n + " "
+            RtEmitted(_) -> emitted += 1
+
+    assert(templates.contains("sysl.str.concat "), templates)
+    assert(emitted > 0, "the generated half is data")
+end irp_mod_runtime
+
+@test("an extern the program calls is declared as a signature like any other")
+irp_mod_extern()
+    if xvr_no_library() then return
+
+    val m = irp_module("extern f(a: int, b: real, c: bool) -> u8\nprint(f(1, 2.0, true))\n")
+    var d: Option[IrFuncSig] = None
+
+    for i in 0..<m.declares.len()
+        if m.declares.at(i).name == "f" then d = Some(m.declares.at(i))
+
+    val s = d.unwrap()
+
+    assert(irp_lt(s.ty.ret, LInt(8)), "a u8 result")
+    assert_eq(s.ty.params.len(), 3)
+    assert(irp_lt(s.ty.params.at(0).ty, LInt(32)), "an int")
+    assert(irp_lt(s.ty.params.at(1).ty, LFloat(64, false)), "a real")
+    assert(irp_lt(s.ty.params.at(2).ty, LInt(1)), "a bool")
+    assert(!s.ty.variadic, "a closed list")
+end irp_mod_extern

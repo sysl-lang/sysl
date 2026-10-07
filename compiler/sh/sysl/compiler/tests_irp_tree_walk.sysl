@@ -1,0 +1,111 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// The one walk the analysis passes share, `walk_texpr`, over the vector family: a node it does not
+// descend into hides its operands, silently, from every check built on it -- the call in `g()[0]`
+// was once invisible that way. So these hand the walk the nodes directly and read back, in order,
+// what it reached under each one.
+
+private struct IrpSeen
+    names: Buf[string]
+
+private irp_e(k: TExprKind) -> TExpr = TExpr(Span(0, 0), k)
+
+// A stand-in operand distinguishable from every other one in a test.
+private irp_mark(n: long) -> TExpr = irp_e(TIntLit(from_int(n), usize_type(64)))
+
+private irp_v4() -> Type = Vector(4, Floating(32, false))
+
+private irp_load(name: string, t: Type) -> TExpr = irp_e(TLoad(name, t))
+
+private irp_label(e: TExpr) -> string = *e.kind match
+    TIntLit(v, _) -> s"mark $v"
+    TLoad(n, _) -> n
+    _ -> "other"
+
+private irp_note(seen: &IrpSeen, e: TExpr) = seen.names.push(irp_label(e))
+
+// What the walk reached under `root`, outermost first, the root itself left out.
+private irp_children(root: TExpr) -> string
+    val seen: &IrpSeen = IrpSeen(buf())
+
+    walk_texpr(root, expr_walk(true, e -> irp_note(seen, e)))
+
+    var out = ""
+
+    for i in 1..<seen.names.len()
+        out = if out == "" then seen.names.at(i) else s"$out, ${seen.names.at(i)}"
+
+    out
+end irp_children
+
+@test("every operand of a vector literal is reached")
+irp_vector_literal_operands()
+    var lanes: Buf[TExpr] = buf()
+
+    lanes.push(irp_mark(1))
+    lanes.push(irp_mark(2))
+    assert_eq(irp_children(irp_e(TVectorLit(lanes, irp_v4()))), "mark 1, mark 2")
+
+@test("a splat's value is reached")
+irp_splat_value()
+    assert_eq(irp_children(irp_e(TSplat(irp_mark(1), irp_v4()))), "mark 1")
+
+@test("both sides of a lane-wise comparison are reached")
+irp_vec_compare_sides()
+    val mask = Vector(4, Bool)
+    val node = TVecCompare("<", irp_load("a", irp_v4()), irp_load("b", irp_v4()), mask)
+
+    assert_eq(irp_children(irp_e(node)), "a, b")
+
+@test("a select reaches its mask and both arms")
+irp_select_arms()
+    val m = irp_load("m", Vector(4, Bool))
+    val node = TSelect(m, irp_load("a", irp_v4()), irp_load("b", irp_v4()), irp_v4())
+
+    assert_eq(irp_children(irp_e(node)), "m, a, b")
+
+@test("a reduction reaches what it reduces")
+irp_reduce_operand()
+    val node = TReduce("fadd", irp_load("a", irp_v4()), Floating(32, false))
+
+    assert_eq(irp_children(irp_e(node)), "a")
+
+// The one that was missing: `g()[0]` is a lane read over a call.
+@test("a lane read reaches the vector it reads from")
+irp_lane_receiver()
+    assert_eq(irp_children(irp_e(TLane(irp_load("a", irp_v4()), 0, Floating(32, false)))), "a")
+
+@test("a load reaches the elements it reads and the index it starts at")
+irp_vec_load_operands()
+    val s = irp_load("s", Slice(Floating(32, false), false))
+
+    assert_eq(irp_children(irp_e(TVecLoad(s, irp_mark(3), irp_v4()))), "s, mark 3")
+
+@test("a store reaches the elements, the index and the value")
+irp_vec_store_operands()
+    val s = irp_load("s", Slice(Floating(32, false), false))
+    val node = TVecStore(s, irp_mark(3), irp_load("a", irp_v4()))
+
+    assert_eq(irp_children(irp_e(node)), "s, mark 3, a")
+
+// An operand the walk misses also loses every statement written inside it, so a block nested in a
+// load's index has to be reached too.
+@test("a block nested inside a load's index is reached")
+irp_block_inside_load_index()
+    var stmts: Buf[TStmt] = buf()
+
+    stmts.push(TExprStmt(irp_mark(7)))
+
+    var cond: Buf[TCondTerm] = buf()
+
+    cond.push(TCondTest(irp_e(TBoolLit(true))))
+
+    val inside = irp_e(TIf(cond, TBlock(stmts, None, usize_type(64)), None, usize_type(64)))
+    val s = irp_load("s", Slice(Floating(32, false), false))
+
+    assert_eq(irp_children(irp_e(TVecLoad(s, inside, irp_v4()))), "s, other, other, mark 7")

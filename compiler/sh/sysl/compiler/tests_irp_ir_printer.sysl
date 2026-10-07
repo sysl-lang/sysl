@@ -1,0 +1,122 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// Writing a function down: the shape of a printed function, which every codegen test reads by
+// substring -- a lost indent or a stray blank line between blocks is a suite of failures naming the
+// wrong culprit. The blocks are built by hand rather than emitted, so the printer cannot agree with
+// an emitter about something the two got wrong together. Every expected text is the reference
+// compiler's (0.0.162) `IrPrinterTests`.
+
+private irp_sig(name: string, ret: LType) -> IrFuncSig = ir_sig(name, ir_fn_type(ret, no_params()))
+
+private irp_block(label: string, instrs: Buf[Inst], term: Option[Inst]) -> IrBlock =
+    IrBlock(label, instrs, term)
+
+private irp_no_instrs() -> Buf[Inst]
+    var out: Buf[Inst] = buf()
+
+    out
+end irp_no_instrs
+
+private irp_one(i: Inst) -> Buf[Inst]
+    var out: Buf[Inst] = buf()
+
+    out.push(i)
+    out
+end irp_one
+
+@test("a function is its header, a brace, its blocks, and a closing brace on its own line")
+irp_function_shape()
+    val add = InBin(VReg("t1"), OpAdd, LInt(32), VInt(from_int(1)), VInt(from_int(2)))
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(irp_block("entry", irp_one(add), Some(InRet(Some(LInt(32)), Some(VReg("t1"))))))
+    assert_eq(ir_print_func(IrFunc(irp_sig("main", LInt(32)), blocks)),
+              "define i32 @main() {\nentry:\n  %t1 = add i32 1, 2\n  ret i32 %t1\n}\n")
+
+@test("an instruction is indented two spaces and a label is not, which is what makes one findable")
+irp_indent_and_label()
+    val store = InStore(LInt(32), VInt(from_int(0)), VReg("p"), AccPlain, None)
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(irp_block("entry", irp_no_instrs(), Some(InBr("body"))))
+    blocks.push(irp_block("body", irp_one(store), Some(InRet(None, None))))
+    assert_eq(ir_print_func(IrFunc(irp_sig("f", LVoid), blocks)),
+              "define void @f() {\nentry:\n  br label %body\nbody:\n  store i32 0, ptr %p\n  ret void\n}\n")
+
+@test("blocks run together, with the label as the only separator")
+irp_blocks_run_together()
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(irp_block("entry", irp_no_instrs(), Some(InBr("a"))))
+    blocks.push(irp_block("a", irp_no_instrs(), Some(InBr("b"))))
+    blocks.push(irp_block("b", irp_no_instrs(), Some(InRet(None, None))))
+    assert_eq(ir_print_func(IrFunc(irp_sig("f", LVoid), blocks)),
+              "define void @f() {\nentry:\n  br label %a\na:\n  br label %b\nb:\n  ret void\n}\n")
+
+// A block with no terminator is malformed and the back end says so; the printer writes what the
+// emitters produced rather than inventing a `br` that would hide the bug.
+@test("an unterminated block is printed unterminated rather than repaired")
+irp_unterminated_block()
+    val load = InLoad(VReg("t1"), LInt(32), VReg("p"), AccPlain, None)
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(irp_block("entry", irp_one(load), None))
+    assert_eq(ir_print_func(IrFunc(irp_sig("f", LVoid), blocks)),
+              "define void @f() {\nentry:\n  %t1 = load i32, ptr %p\n}\n")
+
+@test("and a block with nothing in it at all is its label and its terminator")
+irp_empty_block()
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(irp_block("entry", irp_no_instrs(), Some(InUnreachable)))
+    assert_eq(ir_print_func(IrFunc(irp_sig("f", LVoid), blocks)), "define void @f() {\nentry:\n  unreachable\n}\n")
+
+// The order is the list's -- LLVM's grammar's, and the order the conventions were measured writing
+// them: `noalias` before `sret`, `align` after it.
+@test("writes a parameter as its type, then its attributes, then the name a definition gives it")
+irp_parameter_text()
+    val point = LNamed("%struct.Point")
+    var three: Buf[IrAttr] = buf()
+    var two: Buf[IrAttr] = buf()
+
+    three.push(AttrNoAlias)
+    three.push(AttrSRet(point))
+    three.push(AttrAlign(8))
+    two.push(AttrSRet(point))
+    two.push(AttrAlign(8))
+
+    assert_eq(param_render(IrParam(LPtr, three, Some(VReg("sret.out")))),
+              "ptr noalias sret(%struct.Point) align 8 %sret.out")
+    assert_eq(param_render(IrParam(LPtr, two, None)), "ptr sret(%struct.Point) align 8")
+    assert_eq(param_render(ir_param(LInt(32))), "i32")
+
+// A `declare` is not a `define` with the body left off: it drops the linkage, the convention, the
+// function attributes and the section, all properties of the definition.
+@test("prints as a declare or a define from the one value, and the two differ in what they carry")
+irp_declare_and_define()
+    var params: Buf[IrParam] = buf()
+    var rets: Buf[IrAttr] = buf()
+    var attrs: Buf[(string, string)] = buf()
+
+    params.push(IrParam(LInt(32), no_ir_attrs(), Some(VReg("n"))))
+    rets.push(AttrZeroExt)
+    attrs.push(("interrupt", "machine"))
+
+    val s = IrFuncSig("f", IrFnType(LInt(1), params, false, rets), LinkInternal, Some("x86_intrcc"), attrs,
+                      Some(".text.hot"), buf())
+
+    assert_eq(sig_define(s),
+              "define internal x86_intrcc zeroext i1 @f(i32 %n) \"interrupt\"=\"machine\" section \".text.hot\"")
+    assert_eq(sig_declare(s), "declare zeroext i1 @f(i32 %n)")
+
+@test("puts the ellipsis last, where a variadic call has to name the whole type")
+irp_ellipsis_last()
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(LPtr))
+    assert_eq(fn_render(IrFnType(LInt(32), params, true, no_ir_attrs())), "i32 (ptr, ...)")
+    assert_eq(fn_render(ir_fn_type(LVoid, no_params())), "void ()")

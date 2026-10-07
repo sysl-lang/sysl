@@ -1,0 +1,904 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// `sysl emit-ast`'s printer (`show_oracle.sysl`): the untyped tree as deterministic text, in the
+// reference compiler's own notation, so that two parsers are compared by one `diff`. **Every expected
+// text here is the reference's (0.0.162) `emit-ast` output on the same input** -- the golden tree is
+// its whole output for the fixture, byte for byte.
+
+private irp_fixture() -> string = raw"""
+    module demo
+
+    const limit: int = 10
+
+    struct Point
+        x: int
+        y: int
+
+    enum Color
+        Red
+        Green
+
+    double(n: int) -> int = n * 2
+
+    larger[T: Ord](a: T, b: T) -> T = if a < b then b else a
+
+    add(a: int, b: int) -> int
+        val sum = a + b
+        return sum
+    """
+
+// The reference's whole output for the fixture with spans off. A node with children prints its field
+// name as `name: ` -- with a trailing space -- and no other line ends in a colon, so the text below
+// is written without that space and `irp_restore_colons` puts it back.
+private irp_golden_bare() -> string = irp_restore_colons(raw"""
+    Program
+      body:
+        - ConstDecl
+            name: "limit"
+            typ: NamedType
+              name: "int"
+              args: []
+            value: IntLit
+              value: 10
+              suffix: None
+            vis: Public
+        - StructDecl
+            name: "Point"
+            tparams: []
+            fields:
+              - Param
+                  name: "x"
+                  typ: NamedType
+                    name: "int"
+                    args: []
+                  vis: Public
+                  default: None
+                  byName: false
+                  rest: false
+              - Param
+                  name: "y"
+                  typ: NamedType
+                    name: "int"
+                    args: []
+                  vis: Public
+                  default: None
+                  byName: false
+                  rest: false
+            members: []
+            bounds: {}
+            invariants: []
+            vis: Public
+            tdefaults: {}
+            opaque: false
+            tvalues: {}
+            packed: false
+            alignment: None
+            cname: None
+            deriving: []
+        - EnumDecl
+            name: "Color"
+            tparams: []
+            underlying: None
+            variants:
+              - EnumVariantDecl
+                  name: "Red"
+                  value: None
+                  fields: []
+              - EnumVariantDecl
+                  name: "Green"
+                  value: None
+                  fields: []
+            members: []
+            bounds: {}
+            vis: Public
+            tdefaults: {}
+            tvalues: {}
+            deriving: []
+        - FuncDecl
+            name: "double"
+            tparams: []
+            params:
+              - Param
+                  name: "n"
+                  typ: NamedType
+                    name: "int"
+                    args: []
+                  vis: Public
+                  default: None
+                  byName: false
+                  rest: false
+            retType: NamedType
+              name: "int"
+              args: []
+            body:
+              - ExprStmt
+                  expr: Binary
+                    op: "*"
+                    left: Ident
+                      name: "n"
+                    right: IntLit
+                      value: 2
+                      suffix: None
+            bounds: {}
+            variadic: false
+            vis: Public
+            tdefaults: {}
+            tvalues: {}
+            tpacks: []
+            test: None
+            hook: None
+            conv: None
+            tailrec: false
+            pure: false
+            ghost: false
+            reads: None
+            writes: None
+            exported: None
+            section: None
+            crossing: []
+            needs: []
+            noinline: false
+            cold: false
+            inline: false
+        - FuncDecl
+            name: "larger"
+            tparams: ["T"]
+            params:
+              - Param
+                  name: "a"
+                  typ: NamedType
+                    name: "T"
+                    args: []
+                  vis: Public
+                  default: None
+                  byName: false
+                  rest: false
+              - Param
+                  name: "b"
+                  typ: NamedType
+                    name: "T"
+                    args: []
+                  vis: Public
+                  default: None
+                  byName: false
+                  rest: false
+            retType: NamedType
+              name: "T"
+              args: []
+            body:
+              - ExprStmt
+                  expr: IfExpr
+                    cond: Compare
+                      operands:
+                        - Ident
+                            name: "a"
+                        - Ident
+                            name: "b"
+                      ops: ["<"]
+                    thenBody:
+                      - ExprStmt
+                          expr: Ident
+                            name: "b"
+                    elseBody:
+                      - ExprStmt
+                          expr: Ident
+                            name: "a"
+            bounds:
+              "T":
+                - BoundRef
+                    name: "Ord"
+                    args: []
+            variadic: false
+            vis: Public
+            tdefaults: {}
+            tvalues: {}
+            tpacks: []
+            test: None
+            hook: None
+            conv: None
+            tailrec: false
+            pure: false
+            ghost: false
+            reads: None
+            writes: None
+            exported: None
+            section: None
+            crossing: []
+            needs: []
+            noinline: false
+            cold: false
+            inline: false
+        - FuncDecl
+            name: "add"
+            tparams: []
+            params:
+              - Param
+                  name: "a"
+                  typ: NamedType
+                    name: "int"
+                    args: []
+                  vis: Public
+                  default: None
+                  byName: false
+                  rest: false
+              - Param
+                  name: "b"
+                  typ: NamedType
+                    name: "int"
+                    args: []
+                  vis: Public
+                  default: None
+                  byName: false
+                  rest: false
+            retType: NamedType
+              name: "int"
+              args: []
+            body:
+              - ValDecl
+                  name: "sum"
+                  typ: None
+                  value: Binary
+                    op: "+"
+                    left: Ident
+                      name: "a"
+                    right: Ident
+                      name: "b"
+                  vis: Public
+                  align: None
+                  section: None
+              - Return
+                  value: Ident
+                    name: "sum"
+            bounds: {}
+            variadic: false
+            vis: Public
+            tdefaults: {}
+            tvalues: {}
+            tpacks: []
+            test: None
+            hook: None
+            conv: None
+            tailrec: false
+            pure: false
+            ghost: false
+            reads: None
+            writes: None
+            exported: None
+            section: None
+            crossing: []
+            needs: []
+            noinline: false
+            cold: false
+            inline: false
+      module: ModuleName
+        parts: ["demo"]
+      capabilities: []
+      links: []
+      source: fixture.sysl
+      testOnly: false
+      includes: []
+      docs: []
+    """)
+
+irp_restore_colons(text: string) -> string
+    val lines = irp_lines(text)
+    var out = ""
+
+    for i in 0..<lines.len()
+        val l = lines.at(i)
+
+        out = out + (if l.ends_with(":") then l + " " else l) + "\n"
+
+    out
+end irp_restore_colons
+
+// The tree of `text`, read as the file `name`.
+irp_tree(name: string, text: string, spans: bool) -> string
+    val parsed = parse(source_of(name, text))
+
+    if !parsed.ok() then return s"the input does not parse: ${parse_report(parsed)}"
+
+    emit_ast(parsed.program, spans)
+end irp_tree
+
+// Every line of `text`, without its newline.
+irp_lines(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var from: usize = 0
+
+    loop
+        text.index_of_byte_from(u8('\n'), from) match
+            Some(at) ->
+                out.push(text[from..<at])
+                from = at + 1
+            None ->
+                if from < text.len then out.push(text[from..<text.len])
+                break
+
+    out
+end irp_lines
+
+private irp_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
+
+// The digits at `at` and how many there are.
+private irp_digits(s: string, at: usize) -> usize
+    var n: usize = 0
+
+    loop
+        if at + n >= s.len || !irp_digit(s.bytes[at + n]) then break
+
+        n += 1
+
+    n
+end irp_digits
+
+// Whether a `line:col-line:col` span starts at `at`.
+irp_span_at(s: string, at: usize) -> bool
+    var i = at
+
+    for part in 0..<4
+        val n = irp_digits(s, i)
+
+        if n == 0 then return false
+
+        i += n
+
+        if part < 3
+            if i >= s.len then return false
+
+            val sep = if part == 1 then u8('-') else u8(':')
+
+            if s.bytes[i] != sep then return false
+
+            i += 1
+
+    true
+end irp_span_at
+
+// Whether any span appears anywhere in `text`.
+irp_any_span(text: string) -> bool
+    for i in 0..<text.len
+        if irp_span_at(text, i) then return true
+
+    false
+end irp_any_span
+
+// The line each node of `kind` was reported on, in the order they print -- `<kind> L:C-L:C`.
+private irp_lines_of(kind: string, printed: string) -> string
+    val lines = irp_lines(printed)
+    var out = ""
+
+    for i in 0..<lines.len()
+        val l = lines.at(i)
+
+        l.index_of(kind + " ") match
+            Some(at) ->
+                val start = at + kind.len + 1
+
+                if irp_span_at(l, start)
+                    val n = l[start..<(start + irp_digits(l, start))]
+
+                    out = if out == "" then n else s"$out, $n"
+            None -> ()
+
+    out
+end irp_lines_of
+
+// Node header lines printed with no span: a capitalised word alone on its line, after a list's
+// `- `. `Program` is the file rather than anything in it and carries none by design.
+private irp_positionless(printed: string) -> string
+    val lines = irp_lines(printed)
+    var out = ""
+
+    for i in 0..<lines.len()
+        var l = lines.at(i).trim()
+
+        if l.starts_with("- ") then l = l[2..<l.len]
+
+        if l != "" && l != "Program" && irp_one_word(l) then out = out + l + " "
+
+    out
+end irp_positionless
+
+private irp_one_word(l: string) -> bool
+    if l.bytes[0] < u8('A') || l.bytes[0] > u8('Z') then return false
+
+    for i in 0..<l.len
+        val c = l.bytes[i]
+        val ok = (c >= u8('A') && c <= u8('Z')) || (c >= u8('a') && c <= u8('z')) || irp_digit(c)
+
+        if !ok then return false
+
+    true
+end irp_one_word
+
+// -- the format -------------------------------------------------------------------------------------
+
+@test("prints the golden text for a small program, exactly, with spans off")
+irp_ast_golden()
+    assert_eq(irp_tree("fixture.sysl", irp_fixture(), false), irp_golden_bare())
+
+@test("is deterministic: the same tree prints the same text twice")
+irp_ast_deterministic()
+    val parsed = parse(source_of("<t>", irp_fixture()))
+
+    assert(parsed.ok(), "the fixture parses")
+    assert_eq(emit_ast(parsed.program, true), emit_ast(parsed.program, true))
+
+@test("with spans on, every node's line carries one, as 'line:col-line:col'")
+irp_ast_spans_on()
+    val printed = irp_tree("fixture.sysl", irp_fixture(), true)
+
+    assert(irp_lines_of("FuncDecl", printed) != "", printed)
+    assert(irp_lines_of("StructDecl", printed) != "", printed)
+    assert(!irp_any_span(irp_tree("fixture.sysl", irp_fixture(), false)), "spans off prints none")
+
+@test("decodes a character literal's codepoint rather than printing the bare Int")
+irp_ast_codepoint()
+    val printed = irp_tree("<t>", "const c: char = 'A'\n", false)
+
+    assert(printed.contains("codepoint: 65 'A'"), printed)
+
+// -- every node carries its own position ------------------------------------------------------------
+
+@test("two 'true' literals on different lines each report their own line")
+irp_ast_two_trues()
+    assert_eq(irp_lines_of("BoolLit", irp_tree("<t>", "val a = true\nval b = false\nval c = true\n", true)),
+              "1, 2, 3")
+
+@test("and the span is the literal itself, not merely the right line")
+irp_ast_literal_span()
+    val printed = irp_tree("<t>", "val a = true\nval b = true\n", true)
+
+    assert(printed.contains("BoolLit 1:9-1:13"), printed)
+    assert(printed.contains("BoolLit 2:9-2:13"), printed)
+
+@test("so do two 'null's")
+irp_ast_two_nulls()
+    assert_eq(irp_lines_of("NullLit", irp_tree("<t>", "val a = null\nval b = null\nval c = null\n", true)),
+              "1, 2, 3")
+
+@test("so do two '()'s")
+irp_ast_two_units()
+    assert_eq(irp_lines_of("UnitLit", irp_tree("<t>", "val a = ()\nval b = ()\n", true)), "1, 2")
+
+@test("and two 'self's, in different methods")
+irp_ast_two_selfs()
+    val printed = irp_tree("<t>", raw"""
+        struct S
+            n: int
+
+            a(self) -> int = self.n
+            b(self) -> int = self.n
+        end S
+        """, true)
+    val lines = irp_lines(printed)
+    var found = ""
+
+    for i in 0..<(lines.len() - 1)
+        if lines.at(i + 1).trim() == "name: \"self\""
+            val one = irp_lines_of("Ident", lines.at(i))
+
+            if one != "" then found = if found == "" then one else s"$found, $one"
+
+    assert_eq(found, "4, 5")
+end irp_ast_two_selfs
+
+@test("an interpolated string's concatenation is positioned throughout")
+irp_ast_interpolation_positioned()
+    val text = "val n = 1\nval s = s\"a${n}b${n}c\"\nval g = f\"${n}%04d\"\n"
+
+    assert_eq(irp_positionless(irp_tree("<t>", text, true)), "")
+
+private irp_elif_chain() -> string = raw"""
+    f(n: int) -> int =
+        if n < 1
+            10
+        elif n < 2
+            20
+        elif n < 3
+            30
+        else
+            40
+    """
+
+@test("an if/elif/else chain is positioned throughout")
+irp_ast_elif_positioned()
+    assert_eq(irp_positionless(irp_tree("<t>", irp_elif_chain(), true)), "")
+
+// Each `elif` is an `if` in the else branch of the one before it, and stands at its `elif`.
+@test("and each nested 'if' points at the 'elif' that introduced it")
+irp_ast_elif_lines()
+    assert_eq(irp_lines_of("IfExpr", irp_tree("<t>", irp_elif_chain(), true)), "2, 4, 6")
+
+@test("a type pack's tuple form is positioned throughout")
+irp_ast_pack_positioned()
+    val printed = irp_tree("<t>", "count[..A](t: (..A)) -> usize = 0\n", true)
+
+    assert_eq(irp_positionless(printed), "")
+    // The pack is the whole of `..A`, its dots included.
+    assert(printed.contains("PackType 1:16-1:19"), printed)
+
+// -- the five enums the tree carries print every case by name ---------------------------------------
+
+private irp_enums() -> string = raw"""
+    module m
+    @no_alloc
+    @requires(os)
+
+    var a = 1
+    private var b = 1
+    private[m] var c = 1
+
+    struct S
+        n: int
+
+        a(self) -> int = self.n
+        b(*self) -> int = self.n
+        c(&sync self) -> int = self.n
+
+    @setup
+    s0() = ()
+
+    @teardown
+    s1() = ()
+
+    @setup_all
+    s2() = ()
+
+    @teardown_all
+    s3() = ()
+
+    g()
+        asm
+            [aarch64]
+                "mov {b}, {a}"
+                in a : reg
+                out b : reg
+    """
+
+@test("Visibility: Public, File, Scoped")
+irp_ast_visibility()
+    val printed = irp_tree("<t>", irp_enums(), false)
+
+    assert(printed.contains("vis: Public"), printed)
+    assert(printed.contains("vis: File"), printed)
+    assert(printed.contains("vis: Scoped"), printed)
+    assert(printed.contains("module: \"m\""), printed)
+    assert(!printed.contains("vis: 1") && !printed.contains("vis: 2"), printed)
+
+@test("RecvMode: ByValue, ByPtr, ByRef")
+irp_ast_recv_mode()
+    val printed = irp_tree("<t>", irp_enums(), false)
+
+    assert(printed.contains("receiver: ByValue"), printed)
+    assert(printed.contains("receiver: ByPtr"), printed)
+    assert(printed.contains("receiver: ByRef"), printed)
+    assert(printed.contains("sync: true"), printed)
+
+@test("AsmDir: In, Out")
+irp_ast_asm_dir()
+    val printed = irp_tree("<t>", irp_enums(), false)
+
+    assert(printed.contains("dir: In\n"), printed)
+    assert(printed.contains("dir: Out\n"), printed)
+
+@test("HookKind: Setup, Teardown, SetupAll, TeardownAll")
+irp_ast_hook_kind()
+    val printed = irp_tree("<t>", irp_enums(), false)
+
+    assert(printed.contains("kind: Setup\n"), printed)
+    assert(printed.contains("kind: Teardown\n"), printed)
+    assert(printed.contains("kind: SetupAll\n"), printed)
+    assert(printed.contains("kind: TeardownAll\n"), printed)
+
+@test("CapabilityDirection: Narrows, Requires")
+irp_ast_capability_direction()
+    val printed = irp_tree("<t>", irp_enums(), false)
+
+    assert(printed.contains("direction: Narrows"), printed)
+    assert(printed.contains("direction: Requires"), printed)
+
+// -- every node kind the tree can hold is reachable --------------------------------------------------
+
+// The reference's 103 node kinds -- its `Expr` (46), `Stmt` (31), `AsmBody` (2), `TypeRef` (15) and
+// `Pattern` (9) -- plus `AwaitExpr`, the one this tree adds (`async`, a user-approved addition the
+// reference has not got). This tree's `Bad` is left out: it stands where a parse failed, and a tree
+// with one in it is never printed.
+private irp_node_kinds() -> []const string = [
+    "IntLit", "FloatLit", "CharLit", "StrLit", "CStrLit", "BoolLit", "UnitLit", "NullLit", "Ident",
+    "Unary", "PreIncDec", "PostIncDec", "Binary", "Compare", "RangeExpr", "Assign", "Call",
+    "NamedArg", "Spread", "DefaultArg", "Index", "Field", "TypeArgs", "TypeAttr", "WithExpr",
+    "ImplicitMember", "LayoutOf", "OffsetOf", "TryExpr", "Tuple", "Lambda", "BlockArg", "ArrayLit",
+    "ArrayFill", "Block", "IfExpr", "MatchExpr", "IsPattern", "ResultList", "While", "DoWhile",
+    "Loop", "For", "ConstFor", "CFor", "Quantifier",
+    "ImportDecl", "VarDecl", "ConstDecl", "ValDecl", "StaticDecl", "CConstBlock", "CTypeBlock",
+    "RefDecl", "MultiAssign", "MultiDecl", "PatternDecl", "ExprStmt", "Return", "Become", "Break",
+    "Continue", "Defer", "AsmStmt", "AssertDecl", "Require", "Ensure", "Invariant", "Variant",
+    "FuncDecl", "ExternDecl", "ExternVarDecl", "StructDecl", "EnumDecl", "TypeDecl", "TraitDecl",
+    "ImplDecl",
+    "NamedType", "ValueArgType", "PtrType", "RefType", "WeakType", "ArrayType", "VectorType",
+    "VolatileType", "TupleType", "PackType", "FnType", "CFnType", "AssocType", "AssocArgType",
+    "SomeType",
+    "LitPattern", "RangePattern", "WildcardPattern", "IdentPattern", "EqPattern", "VariantPattern",
+    "StructPattern", "TuplePattern", "BindPattern",
+    "AsmCode", "AsmUnavailable",
+    "AwaitExpr"]
+
+// One file reaching every kind the grammar builds. The reference's `emit-ast` reaches every one of
+// its 103 but `DefaultArg` on this file with the `async` line taken out: a default is spliced in at
+// a call that left the argument out, so it is never parsed, and is added to the tree directly.
+private irp_coverage() -> string = raw"""
+    module cov
+
+    import sysl.buf.Buf
+
+    c const
+        LIMIT: int = "10"
+
+    c type
+        word_t = "uint32_t"
+
+    const limit: int = 10
+
+    static var hits: int = 0
+
+    @assert(limit > 0)
+
+    extern "write" c_write(fd: int, p: *u8, n: usize) -> int
+
+    extern errno: int
+
+    struct Point
+        x: int
+        y: int
+
+        invariant x >= 0
+
+    enum Shape
+        Circle(r: int)
+        Dot
+
+    type Small = int within 0..10
+
+    trait Sized
+        type Item
+        size(self) -> int
+
+    impl Sized for Point
+        type Item = int
+        size(self) -> int = self.x
+
+    pair() -> int, int = 1, 2
+
+    total(first: int, rest: ...int) -> int = first
+
+    wrap[T, const N: usize](xs: [N]T) -> usize = N
+
+    named[..A](t: (..A)) -> usize = 0
+
+    maker() -> some Sized = Point(1, 2)
+
+    fwd(xs: []int) -> int = total(1, xs...)
+
+    count(n: int) -> int
+        require n >= 0
+        ensure result >= 0
+
+        var i = 0
+        var a = 0
+        var b = 0
+        val q = 'A'
+        val s = "s"
+        val cs = c"s"
+        val f = 1.0
+        val u = ()
+        val p: *int = null
+        val t = (1, 2)
+        val arr = [1, 2]
+        val at0 = arr[0]
+        val yes = true
+        val fill = [0; 4]
+        val r = 0..<4
+        val lam = (x: int) -> x + 1
+        val bits = sizeof(Point)
+        val off = offsetof(Point, x)
+        val m = int::MAX
+        val w = Point(1, 2) with { x = 3 }
+        val sh: Shape = .Dot
+        val tr = wrap[int, 2]([1, 2])
+        val ok = 1 < 2 < 3
+        var c, d = 1, 2
+        val (e, g) = (1, 2)
+        ref alias = a
+        a, b = b, a
+        i++
+        ++i
+        a = -a
+        a += 1
+        defer print(a)
+
+        while i < 3
+            invariant i >= 0
+            variant 3 - i
+            i += 1
+
+        do
+            i -= 1
+        while i > 0
+
+        loop
+            break
+
+        for k in 0..<3
+            continue
+
+        for const j in 0..<2
+            print(j)
+
+        for var z = 0; z < 2; z++
+            print(z)
+
+        val all_pos = for all k in 0..<3 do k >= 0
+
+        if sh is Dot then print(1)
+
+        val blk =
+            print(2)
+            3
+
+        sh match
+            Circle(rr) -> print(rr)
+            `limit` -> print(0)
+            nn @ Dot -> print(0)
+            _ -> print(0)
+
+        a match
+            1 -> print(1)
+            2..9 -> print(2)
+            x -> print(x)
+
+        t match
+            (aa, bb) -> print(aa)
+
+        Point(1, 2) match
+            Point { x, y } -> print(x)
+
+        asm
+            [aarch64] "nop"
+            [x86_64] unavailable "none"
+
+        named_call(n = 1)
+        run(default)
+        each([1]):
+            print(3)
+
+        val got = maybe()?
+        become count(n - 1)
+        return n
+
+    types(a: &int, b: weak Point, c: [4]u8, d: <4>f32, e: volatile u32, f: *extern(int) -> int, g: (int, int) -> int, h: Sized::Item, k: Buf[int]::Item, v: Grid[3], o: &Sized[Item = int]) = ()
+
+    async later() -> int = await go()
+    """
+
+// The coverage file's tree, with a `DefaultArg` added where the analyzer would have spliced one.
+private irp_coverage_printed() -> string
+    val parsed = parse(source_of("cov.sysl", irp_coverage()))
+
+    if !parsed.ok() then return s"the coverage file does not parse: ${parse_report(parsed)}"
+
+    var program = parsed.program
+    val nowhere = Span(0, 0)
+    val one = expr(nowhere, IntLit("1", 10, ""))
+
+    program.body.push(stmt(nowhere, ExprStmt(expr(nowhere, DefaultArg(None, one)))))
+    emit_ast(program, false)
+end irp_coverage_printed
+
+@test("the reference count is 103, the same total the AST files themselves grep to")
+irp_ast_reference_count()
+    val kinds = irp_node_kinds()
+
+    // 103 of the reference's and the one this tree adds, every one named once.
+    assert_eq(kinds.len, 104)
+
+    for i in 0..<kinds.len
+        for j in (i + 1)..<kinds.len
+            assert(kinds[i] != kinds[j], kinds[i])
+
+@test("the reachable set is exactly the 103 node kinds the tree can hold")
+irp_ast_every_kind_reachable()
+    val printed = irp_coverage_printed()
+    val kinds = irp_node_kinds()
+    var missing = ""
+
+    for i in 0..<kinds.len
+        if !irp_holds_word(printed, kinds[i]) then missing = missing + kinds[i] + " "
+
+    assert_eq(missing, "")
+end irp_ast_every_kind_reachable
+
+// Whether `word` stands in `text` as a whole word -- `For` is not found inside `ConstFor`.
+irp_holds_word(text: string, word: string) -> bool
+    var from: usize = 0
+
+    loop
+        text.index_of_from(word, from) match
+            None -> return false
+            Some(at) ->
+                val end = at + word.len
+                val before_ok = at == 0 || !irp_word_byte(text.bytes[at - 1])
+                val after_ok = end >= text.len || !irp_word_byte(text.bytes[end])
+
+                if before_ok && after_ok then return true
+
+                from = at + 1
+end irp_holds_word
+
+private irp_word_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || irp_digit(c) || c == u8('_')
+
+// A `c type` or `c const` line that stops short of its `=` or `:` is reported once and stepped over;
+// it was once read again from the token it stopped at, for ever, so a malformed block hung the parse.
+// The diagnostics are the reference's (0.0.162) on the same files.
+@test("a malformed 'c type' or 'c const' line is reported where it stops, and the parse ends")
+irp_c_block_line_is_stepped_over()
+    val ct = parse(source_of("ct.sysl", "c type\n    word_t: u32\n\nval x = 1\n"))
+    val cc = parse(source_of("cc.sysl", "c const\n    LIMIT = \"10\"\n    MAX: int 5\n\nval x = 1\n"))
+
+    assert(!ct.ok() && !cc.ok(), "both are refused")
+    assert(parse_report(ct).contains("error: '=' expected\n --> ct.sysl:2:11"), parse_report(ct))
+    assert(parse_report(cc).contains("error: ':' expected\n --> cc.sysl:2:11"), parse_report(cc))
+end irp_c_block_line_is_stepped_over
+
+// -- a parse error ----------------------------------------------------------------------------------
+
+// What a command line printed on standard output and on standard error, and its exit code.
+irp_cli(command: string, text: string) -> (int, string, string)
+    val root = make_temp_dir("sysl-irp").unwrap()
+    val file = s"$root/bad.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(file, text).unwrap()
+
+    var out: Buf[string] = buf()
+    val said = &out
+    var err: Buf[string] = buf()
+    val noted = &err
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push(command)
+    args.push(file)
+
+    val code = run_cli_noted(args.view(), (line) -> said.push(line), (line) -> noted.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+
+    var o = ""
+    var e = ""
+
+    for i in 0..<out.len()
+        o = o + out.at(i) + "\n"
+
+    for i in 0..<err.len()
+        e = e + err.at(i) + "\n"
+
+    (code, o, e)
+end irp_cli
+
+@test("exits non-zero, prints the ordinary diagnostic on stderr, and prints nothing on stdout")
+irp_ast_parse_error()
+    val r = irp_cli("emit-ast", "f(x: int -> int\n")
+
+    assert(r.0 != 0, "the exit code")
+    assert_eq(r.1, "")
+    assert(r.2.contains("error: ')' expected"), r.2)
+end irp_ast_parse_error

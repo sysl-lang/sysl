@@ -1,0 +1,331 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Every `llvm.` name this compiler emits comes from one place, `llvm_registry.sysl`. **What is
+// asserted is a census rather than a spelling**: a program compiled here reaches nothing in LLVM's
+// namespace the registry does not declare, and the registry declares nothing no program reaches. The
+// programs are the reference compiler's (0.0.162) `LlvmRegistryTests`, plus one for each family this
+// compiler emits that the reference has not got -- fixed point's saturations and `async`'s coroutine
+// operations, both user-approved additions.
+
+private irp_big() -> string = "struct Big\n    cells: [64]i64\n    tag: int\n"
+
+// One program per family, named by what it is here to reach.
+private irp_programs() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push(("the runtime trap", "var n: int = 65\nprint(char(n))\n"))
+    out.push(("the saturating casts", "print(int(1.5), u8(1.5))\n"))
+    out.push(("an aggregate copy", irp_big() + "var a = Big([0; 64], 1)\nvar b = a\nprint(b.tag)\n"))
+    out.push(("an allocation's size", "f(n: usize) -> []i64 = [0; n]\nprint(f(2usize).len)\n"))
+    // All six overflow overloads: the range has to be wide enough that the result could leave the
+    // base width, or the plain instruction is emitted and the intrinsic never appears.
+    out.push(("checked arithmetic",
+              "type Wide = int within -2000000000..2000000000\ntype Room = int within 0..100000\n" +
+              "type Small = uint within 0..10\nvar a: Wide = 1\nvar b: Wide = 2\nvar c: Room = 3\n" +
+              "var d: Room = 4\nvar e: Small = 5\nvar f: Small = 6\nprint(a + b, a - b, c * d)\n" +
+              "print(e + f, e - f, e * f)\n"))
+    out.push(("the bit operations",
+              "import sysl.math.Bits\n\nvar x: u32 = 0b10110000\n" +
+              "print(x.count_ones(), x.leading_zeros(), x.trailing_zeros())\n" +
+              "print(x.reverse_bits(), x.rotate_left(1), x.rotate_right(1))\n"))
+    out.push(("the vector reductions",
+              "val f: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nval i: <4>i32 = [1, 2, 3, 4]\n" +
+              "val u: <4>u32 = [1, 2, 3, 4]\nval b: <4>bool = [true, false, true, false]\n" +
+              "print(f.sum(), f.min(), f.max())\nprint(i.sum(), i.min(), i.max())\n" +
+              "print(u.sum(), u.min(), u.max())\nprint(b.any(), b.all())\n"))
+    out.push(("the library's floats", "import sysl.math.*\n\nprint((144.0).sqrt(), (-2.5).abs())\n"))
+    out.push(("the varargs walk",
+              "total(first: int, ...) -> int\n    var ap: va_list\n    var bp: va_list\n    va_start(ap)\n" +
+              "    va_copy(bp, ap)\n    va_end(bp)\n    va_end(ap)\n    return first\nprint(total(1, 2))\n"))
+    out.push(("a placed symbol", "@section(\".noinit\")\nstatic var reason: u32 = 0u32\nprint(reason)\n"))
+    // The callee is `@noinline` so the call is still a call when the assume is laid down beside it.
+    out.push(("a contract at a call",
+              "@noinline\nwide(n: usize) -> usize\n    ensure result >= n\n    n + 8usize\n" +
+              "print(wide(3usize))\n"))
+    out.push(("fixed point's saturations",
+              "val a: q31 = 0.5\nval b: q31 = 0.25\nval c: u32q32 = 0.75\nval d: u32q32 = 0.125\n" +
+              "print(a + b, a - b, -a, a << 1)\nprint(c + d, c - d, c << 1)\n"))
+    out.push(("an async function", "async load(n: int) -> int = n\n\nprint(block_on(load(2)))\n"))
+    out
+end irp_programs
+
+// Every name in LLVM's namespace a module reaches: the globals and calls it writes with an `@`, and
+// the sections it puts them in.
+irp_llvm_names(ir: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var from: usize = 0
+
+    loop
+        ir.index_of_from("llvm.", from) match
+            None -> break
+            Some(at) ->
+                var end = at
+
+                loop
+                    if end >= ir.len || !irp_name_byte(ir.bytes[end]) then break
+
+                    end += 1
+
+                val before = if at == 0 then u8(' ') else ir.bytes[at - 1]
+                val name = ir[at..<end]
+
+                // Only a symbol (`@llvm.trap`) or a section (`section "llvm.metadata"`); a name
+                // written inside some other identifier is not one.
+                if (before == u8('@') || before == u8('"')) && !irp_holds(out, name) then out.push(name)
+
+                from = end
+
+    out
+end irp_llvm_names
+
+private irp_name_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || (c >= u8('0') && c <= u8('9')) ||
+    c == u8('_') || c == u8('.')
+
+private irp_holds(xs: Buf[string], x: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == x then return true
+
+    false
+end irp_holds
+
+private irp_unaccounted(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if !llvm_accounts(names.at(i)) then out = out + names.at(i) + " "
+
+    out
+end irp_unaccounted
+
+private irp_reaching(what: string) -> string
+    val ps = irp_programs()
+
+    for i in 0..<ps.len()
+        if ps.at(i).0 == what
+            val ir = xvr_ir([("main.sysl", ps.at(i).1)])
+
+            // A program that did not compile reaches nothing, which would pass for the wrong reason.
+            if !ir.contains("define ") then return ir
+
+            return irp_unaccounted(irp_llvm_names(ir))
+        end if
+
+    s"no program reaches $what"
+end irp_reaching
+
+private var irp_emitted_cache: Buf[string] = buf()
+private var irp_emitted_read: bool = false
+
+// The union over every program above, the library artifact's metadata, and a computed module `val`
+// in an archive -- the one shape that lays down a constructor list.
+private irp_emitted() -> Buf[string]
+    if irp_emitted_read then return irp_emitted_cache
+
+    irp_emitted_read = true
+
+    var texts: Buf[string] = buf()
+    val ps = irp_programs()
+
+    for i in 0..<ps.len()
+        texts.push(xvr_ir([("main.sysl", ps.at(i).1)]))
+
+    texts.push(syslib_metadata_ir("{}", host_target()))
+    texts.push(ex_archive_ir("module demo\n\ncounter() -> i32 = 7\n\nval start: i32 = counter()\n\n" +
+                             "@export\nbegin() -> i32 = start\n"))
+
+    for i in 0..<texts.len()
+        val names = irp_llvm_names(texts.at(i))
+
+        for j in 0..<names.len()
+            if !irp_holds(irp_emitted_cache, names.at(j)) then irp_emitted_cache.push(names.at(j))
+
+    irp_emitted_cache
+end irp_emitted
+
+private irp_reached(base: string) -> bool
+    val all = irp_emitted()
+
+    for i in 0..<all.len()
+        if all.at(i) == base || all.at(i).starts_with(base + ".") then return true
+
+    false
+end irp_reached
+
+// -- the registry accounts for every name a program reaches -----------------------------------------
+
+@test("over every family at once")
+irp_reg_every_family_at_once()
+    if xvr_no_library() then return
+
+    assert_eq(irp_unaccounted(irp_emitted()), "")
+
+@test("reaching the runtime trap")
+irp_reg_reaching_trap()
+    if xvr_no_library() then return
+
+    assert_eq(irp_reaching("the runtime trap"), "")
+
+@test("reaching an aggregate copy")
+irp_reg_reaching_copy()
+    if xvr_no_library() then return
+
+    assert_eq(irp_reaching("an aggregate copy"), "")
+
+@test("reaching an allocation's size")
+irp_reg_reaching_allocation()
+    if xvr_no_library() then return
+
+    assert_eq(irp_reaching("an allocation's size"), "")
+
+@test("reaching checked arithmetic")
+irp_reg_reaching_checked()
+    if xvr_no_library() then return
+
+    assert_eq(irp_reaching("checked arithmetic"), "")
+
+@test("reaching the bit operations")
+irp_reg_reaching_bits()
+    if xvr_no_library() then return
+
+    assert_eq(irp_reaching("the bit operations"), "")
+
+@test("reaching the vector reductions")
+irp_reg_reaching_reductions()
+    if xvr_no_library() then return
+
+    assert_eq(irp_reaching("the vector reductions"), "")
+
+@test("reaching the library's floats")
+irp_reg_reaching_floats()
+    if xvr_no_library() then return
+
+    assert_eq(irp_reaching("the library's floats"), "")
+
+@test("reaching the varargs walk")
+irp_reg_reaching_varargs()
+    if xvr_no_library() then return
+
+    assert_eq(irp_reaching("the varargs walk"), "")
+
+@test("reaching a placed symbol")
+irp_reg_reaching_placed()
+    if xvr_no_library() then return
+
+    assert_eq(irp_reaching("a placed symbol"), "")
+
+@test("reaching a contract at a call")
+irp_reg_reaching_contract()
+    if xvr_no_library() then return
+
+    assert_eq(irp_reaching("a contract at a call"), "")
+
+@test("reaching fixed point's saturations and an async function's coroutine")
+irp_reg_reaching_self_hosted_families()
+    if xvr_no_library() then return
+
+    assert_eq(irp_reaching("fixed point's saturations"), "")
+    assert_eq(irp_reaching("an async function"), "")
+
+// -- the census is wide enough to be worth taking ---------------------------------------------------
+
+@test("every family the compiler emits for is reached")
+irp_reg_every_family_reached()
+    if xvr_no_library() then return
+
+    val bases = [llvm_trap_entry().base, llvm_memcpy_entry().base, llvm_va_start_entry().base,
+                 llvm_va_copy_entry().base, llvm_assume_entry().base, llvm_fptosi_sat_entry().base,
+                 llvm_fptoui_sat_entry().base, llvm_with_overflow_entry("mul", false).unwrap().base,
+                 llvm_with_overflow_entry("add", true).unwrap().base, llvm_bits_entry("ctpop").unwrap().base,
+                 llvm_bits_entry("fshl").unwrap().base, llvm_reduce_entry("fadd").unwrap().base,
+                 llvm_reduce_entry("umin").unwrap().base, "llvm.sqrt", "llvm.fabs", llvm_global_ctors(),
+                 llvm_used(), llvm_compiler_used(), llvm_metadata_section(),
+                 llvm_sat_entry("sadd").unwrap().base, llvm_coro_entry("begin").unwrap().base]
+    var missing = ""
+
+    for i in 0..<bases.len
+        if !irp_reached(bases[i]) then missing = missing + bases[i] + " "
+
+    assert_eq(missing, "")
+end irp_reg_every_family_reached
+
+// The complement, which keeps the list honest as the compiler changes. The library's floats are
+// excepted: reaching all seven takes seven `extern`s a program has no other reason to write.
+@test("no callable entry is declared and never emitted")
+irp_reg_no_entry_unreached()
+    if xvr_no_library() then return
+
+    val callable = llvm_callable()
+    val floats = llvm_library_floats()
+    var missing = ""
+
+    for i in 0..<callable.len()
+        val b = callable.at(i)
+        var library = false
+
+        for j in 0..<floats.len
+            if floats[j] == b then library = true
+
+        if !library && !irp_reached(b) then missing = missing + b + " "
+
+    assert_eq(missing, "")
+end irp_reg_no_entry_unreached
+
+// -- the entries themselves -------------------------------------------------------------------------
+
+@test("are all in the namespace that makes them recognisable")
+irp_reg_namespace()
+    val callable = llvm_callable()
+    val globals = llvm_globals()
+
+    assert(!callable.is_empty() && !globals.is_empty(), "the registry declares something")
+
+    for i in 0..<callable.len()
+        assert(callable.at(i).starts_with(LlvmPrefix), callable.at(i))
+
+    for i in 0..<globals.len()
+        assert(globals.at(i).starts_with(LlvmPrefix), globals.at(i))
+
+// The suffix is LLVM's spelling of a type -- `f32`, not `float`.
+@test("complete a base name with the operand types, in LLVM's order")
+irp_reg_complete_names()
+    assert_eq(LlvmIntrinsic("llvm.sqrt").at([LFloat(64, false)]), "llvm.sqrt.f64")
+    assert_eq(llvm_fptosi_sat_entry().at([LInt(32), LFloat(64, false)]), "llvm.fptosi.sat.i32.f64")
+    assert_eq(llvm_with_overflow_entry("mul", false).unwrap().at([LInt(64)]), "llvm.umul.with.overflow.i64")
+    assert_eq(llvm_with_overflow_entry("add", true).unwrap().at([LInt(32)]), "llvm.sadd.with.overflow.i32")
+    assert_eq(llvm_reduce_entry("fadd").unwrap().at([LVec(4, LFloat(32, false))]),
+              "llvm.vector.reduce.fadd.v4f32")
+    assert_eq(llvm_bits_entry("ctlz").unwrap().at([LInt(8)]), "llvm.ctlz.i8")
+    assert_eq(llvm_va_start_entry().at([LPtr]), "llvm.va_start.p0")
+    assert_eq(memcpy_symbol(), "llvm.memcpy.p0.p0.i64")
+    assert_eq(llvm_trap(), "llvm.trap")
+
+@test("account for a suffixed name and not for a neighbour that shares a prefix")
+irp_reg_accounts()
+    assert(llvm_accounts("llvm.sqrt"), "the base")
+    assert(llvm_accounts("llvm.sqrt.f64"), "the base with a suffix")
+    assert(!llvm_accounts("llvm.sqrtx.f64"), "a neighbour")
+    assert(!llvm_accounts("llvm.frobnicate"), "a name nothing declares")
+    assert(llvm_accounts("llvm.metadata"), "a section")
+
+@test("refuse a name no entry declares")
+irp_reg_refuses()
+    assert(llvm_bits_entry("frobnicate").is_err(), "a bit operation")
+    assert(llvm_reduce_entry("frobnicate").is_err(), "a reduction")
+    assert(llvm_with_overflow_entry("div", true).is_err(), "an overflow check")
+
+// The table of the seven `extern`s the library may declare reads the registry, so there is one
+// declaration site across both.
+@test("the library's own table names entries from the registry")
+irp_reg_library_table()
+    assert_eq(IntrinsicPrefix, LlvmPrefix)
+
+    val supported = supported_intrinsics()
+    val callable = llvm_callable()
+
+    for i in 0..<supported.len
+        assert(irp_holds(callable, supported[i]), supported[i])
