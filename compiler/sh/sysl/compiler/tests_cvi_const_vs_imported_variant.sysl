@@ -1,0 +1,103 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A module's own constant and a variant a wildcard import offers under the same spelling are two
+// names at two levels of resolution (`reference/modules.md § The three steps rank a name by where it
+// was written`): the module's own answers a bare read, whatever kind each one is, and the variant is
+// still constructed where the expected type names its enum. Inside ONE module the pair is refused at
+// whichever declaration comes second, a bare variant being a value in its module's scope.
+
+private var cvi_library_cache: Buf[Program] = buf()
+private var cvi_library_read: bool = false
+
+private cvi_library() -> Buf[Program]
+    if cvi_library_read then return cvi_library_cache
+
+    cvi_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> cvi_library_cache = units
+
+    cvi_library_cache
+end cvi_library
+
+private cvi_no_library() -> bool
+    if cvi_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end cvi_no_library
+
+// The whole report a program of several files is refused with -- empty where it is accepted.
+private cvi_err(files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+    val library = cvi_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return parsed.report.at(0).message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    post_analysis_checks(done.an, program_of(done, ""), buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end cvi_err
+
+private cvi_enum() -> (string, string) =
+    ("e.sysl", "module m.ast\nenum Expr\n    Arith(n: int)\n    Lit\n")
+
+@test("a module's own private constant answers a bare read over a wildcard's variant of its name")
+cvi_a_private_constant_is_read()
+    if cvi_no_library() then return
+
+    val out = cvi_err([("main.sysl", "print(m.f())\n"), cvi_enum(),
+                       ("b.sysl", "module m\nimport m.ast.*\nprivate const Arith: string = \"x\"\n" +
+                                  "f() -> string = Arith + \"!\"\n")])
+
+    assert_eq(out, "")
+
+@test("and so does a public one")
+cvi_a_public_constant_is_read()
+    if cvi_no_library() then return
+
+    val out = cvi_err([("main.sysl", "print(m.f())\n"), cvi_enum(),
+                       ("b.sysl", "module m\nimport m.ast.*\nconst Arith: string = \"x\"\n" +
+                                  "f() -> string = Arith + \"!\"\n")])
+
+    assert_eq(out, "")
+
+@test("where the expected type is the enum, the call still constructs the variant")
+cvi_the_variant_is_constructed_at_its_enum()
+    if cvi_no_library() then return
+
+    val out = cvi_err([("main.sysl", "print(m.g())\n"), cvi_enum(),
+                       ("b.sysl", "module m\nimport m.ast.*\nprivate const Arith: string = \"x\"\n" +
+                                  "g() -> int\n    val e: Expr = Arith(3)\n    e match\n" +
+                                  "        Arith(n) -> n\n        Lit -> 0\n")])
+
+    assert_eq(out, "")
+
+@test("inside one module the pair is refused at the enum, a private constant included")
+cvi_one_module_refuses_the_pair()
+    if cvi_no_library() then return
+
+    val out = cvi_err([("main.sysl", "print(m.f())\n"),
+                       ("a.sysl", "module m\nprivate const Arith: string = \"x\"\nf() -> string = Arith + \"!\"\n"),
+                       ("b.sysl", "module m\nenum Expr\n    Arith(n: int)\n    Lit\n")])
+
+    assert(out.contains("error: variant name 'Arith' is already used by a constant\n --> b.sysl:2:1"), out)

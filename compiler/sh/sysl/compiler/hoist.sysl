@@ -489,7 +489,7 @@ private out_of_reach_tail(scope: Scope, vis: Visibility) -> string = vis match
 private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vis: Visibility,
                         kind: DeclKind)
     val plain = module_qualify(scope.module_name, name)
-    val key = decl_key(a, scope, plain, vis, a.tables.types.has(plain))
+    val key = decl_key(a, scope, plain, vis)
 
     if type_name_taken(a, key, name) && type_contested(a, scope, vis, key) then
         a.fault(scope, span, type_taken_message(kind, name))
@@ -586,7 +586,7 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
                     align: Option[Expr] = None, section: Option[string] = None,
                     thread_local: bool = false, link: Option[string] = None)
     val plain = module_qualify(scope.module_name, name)
-    val key = decl_key(a, scope, plain, vis, value_scope_of(a, plain).is_some())
+    val key = decl_key(a, scope, plain, vis)
     val holder = if contested(a, scope, vis, key) then value_name_holder(a, key) else None
 
     // A second constant of one name is the duplicate it is, and said the way a second type is; a
@@ -1032,7 +1032,7 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
     // slot -- and the second would overwrite the first. Every question below is asked of that key:
     // a declaration in a slot of its own shadows what the plain key holds rather than contending
     // with it.
-    val base = decl_key(a, scope, plain, d.vis, a.tables.funcs.has(plain))
+    val base = decl_key(a, scope, plain, d.vis)
     val holder = value_name_holder(a, base)
 
     if holder.is_some() then
@@ -1182,11 +1182,11 @@ private runner_signature(a: &Analysis, scope: Scope, at: Span, d: FuncDecl, what
 // comes back and the caller's duplicate check reports it -- one file declaring a spelling twice,
 // whatever the two visibilities, is the ordinary duplicate.
 //
-// `taken` is the question "does something already hold the plain key", asked by the caller because
-// each kind of declaration asks it of a different table -- a function of the functions, a name that
-// stands for storage of the three that hold storage. Passing it in keeps this from having to know
-// which namespace it is being asked about, which is the thing that would go stale.
-private decl_key(a: &Analysis, scope: Scope, plain: string, vis: Visibility, taken: bool) -> string
+// "Holding the key" is asked of the access table, which every namespace shares: a sibling's
+// file-private struct and this file's file-private const of one spelling live in different tables,
+// but a key has one `Access`, so sharing the plain key would let the later file's overwrite the
+// earlier's and refuse each file its own declaration.
+private decl_key(a: &Analysis, scope: Scope, plain: string, vis: Visibility) -> string
     if !is_file_private(vis) then return plain
 
     val mine = file_slot_key(scope.src.name, plain)
@@ -1200,7 +1200,7 @@ private decl_key(a: &Analysis, scope: Scope, plain: string, vis: Visibility, tak
     val held = a.tables.access.get(plain)
     var key = plain
 
-    if shadows || taken && held.is_some() && is_file_private(held.unwrap().vis) &&
+    if shadows || held.is_some() && is_file_private(held.unwrap().vis) &&
             held.unwrap().file != scope.src.name
         var n: usize = 1
 
