@@ -1,0 +1,148 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Two files of one module may each keep a name to themselves **whatever kind of declaration each
+// one is** (`reference/modules.md § A file-private name is scoped to its file`). A constant and a
+// struct are filed in different tables, but a key carries one reach, so two file-private
+// declarations of one spelling in two files take two keys even when they are of different kinds --
+// otherwise the second file's reach overwrites the first's, and each file is refused its own name
+// (or, the other way about, handed the sibling's).
+
+private var ppk_library_cache: Buf[Program] = buf()
+private var ppk_library_read: bool = false
+
+private ppk_library() -> Buf[Program]
+    if ppk_library_read then return ppk_library_cache
+
+    ppk_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> ppk_library_cache = units
+
+    ppk_library_cache
+end ppk_library
+
+private ppk_no_library() -> bool
+    if ppk_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end ppk_no_library
+
+// The whole report a program of several files is refused with -- empty where it is accepted.
+private ppk_err(files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+    val library = ppk_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return parsed.report.at(0).message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    post_analysis_checks(done.an, program_of(done, ""), buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end ppk_err
+
+// Each body's result type is the one only its own file's declaration gives, so an answer reached
+// through the sibling's declaration is a type error rather than a pass.
+
+@test("a private constant beside a sibling's private struct of its name is the file's own")
+ppk_a_constant_beside_a_struct()
+    if ppk_no_library() then return
+
+    val out = ppk_err([("main.sysl", "print(m.show())\n"),
+                       ("a.sysl", "module m\nprivate const Thing: string = \"b\"\nshow() -> string = Thing + \"!\"\n"),
+                       ("b.sysl", "module m\nprivate struct Thing\n    x: int\n")])
+
+    assert_eq(out, "")
+
+@test("and the struct is its own file's, the other way about")
+ppk_a_struct_beside_a_constant()
+    if ppk_no_library() then return
+
+    val out = ppk_err([("main.sysl", "print(m.show(), m.from_b())\n"),
+                       ("a.sysl", "module m\nprivate const Thing: string = \"b\"\nshow() -> string = Thing + \"!\"\n"),
+                       ("b.sysl", "module m\nprivate struct Thing\n    x: int\nfrom_b() -> int = Thing(7).x\n")])
+
+    assert_eq(out, "")
+
+@test("a private function beside a sibling's private struct of its name")
+ppk_a_function_beside_a_struct()
+    if ppk_no_library() then return
+
+    val out = ppk_err([("main.sysl", "print(m.from_a(), m.from_b())\n"),
+                       ("a.sysl", "module m\nprivate Thing() -> string = \"a\"\nfrom_a() -> string = Thing()\n"),
+                       ("b.sysl", "module m\nprivate struct Thing\n    x: int\nfrom_b() -> int = Thing(7).x\n")])
+
+    assert_eq(out, "")
+
+@test("two private constants of one name and two types")
+ppk_two_constants()
+    if ppk_no_library() then return
+
+    val out = ppk_err([("main.sysl", "print(m.from_a(), m.from_b())\n"),
+                       ("a.sysl", "module m\nprivate const Thing: string = \"a\"\nfrom_a() -> string = Thing\n"),
+                       ("b.sysl", "module m\nprivate const Thing: int = 2\nfrom_b() -> int = Thing\n")])
+
+    assert_eq(out, "")
+
+// A sibling's private constant is still refused across the file boundary, with the sentence that
+// names the file declaring it -- whether or not the reading file has a private struct of the name.
+
+@test("a sibling's private constant is still refused where the reader declares nothing of its name")
+ppk_a_cross_file_constant_is_refused()
+    if ppk_no_library() then return
+
+    val out = ppk_err([("main.sysl", "print(m.from_b())\n"),
+                       ("a.sysl", "module m\nprivate const Thing: string = \"a\"\n"),
+                       ("b.sysl", "module m\nfrom_b() -> string = Thing\n")])
+
+    assert(out.contains("error: 'm.Thing' is private to 'a.sysl', the file that declares it\n --> b.sysl:2:22"), out)
+
+@test("and where the reader keeps a private struct of the name")
+ppk_a_cross_file_constant_is_refused_beside_a_struct()
+    if ppk_no_library() then return
+
+    val out = ppk_err([("main.sysl", "print(m.from_b())\n"),
+                       ("a.sysl", "module m\nprivate const Thing: string = \"a\"\n"),
+                       ("b.sysl", "module m\nprivate struct Thing\n    x: int\nfrom_b() -> string = Thing\n")])
+
+    assert(out.contains("error: 'm.Thing' is private to 'a.sysl', the file that declares it\n --> b.sysl:4:22"), out)
+
+// The plain key goes to whichever file is hoisted first, so both answers are asked again with the
+// struct's file arriving first.
+
+@test("and the same with the struct's file hoisted first")
+ppk_a_constant_beside_a_struct_hoisted_after()
+    if ppk_no_library() then return
+
+    val out = ppk_err([("main.sysl", "print(m.show(), m.from_b())\n"),
+                       ("b.sysl", "module m\nprivate struct Thing\n    x: int\nfrom_b() -> int = Thing(7).x\n"),
+                       ("a.sysl", "module m\nprivate const Thing: string = \"b\"\nshow() -> string = Thing + \"!\"\n")])
+
+    assert_eq(out, "")
+
+@test("and the cross-file read is still refused with the struct's file hoisted first")
+ppk_a_cross_file_constant_is_refused_hoisted_after()
+    if ppk_no_library() then return
+
+    val out = ppk_err([("main.sysl", "print(m.from_b())\n"),
+                       ("b.sysl", "module m\nprivate struct Thing\n    x: int\nfrom_b() -> string = Thing\n"),
+                       ("a.sysl", "module m\nprivate const Thing: string = \"a\"\n")])
+
+    assert(out.contains("error: ") && out.contains(" --> b.sysl:4:22"), out)
