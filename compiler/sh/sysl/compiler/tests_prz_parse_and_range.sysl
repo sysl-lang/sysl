@@ -1,0 +1,312 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What a file that will not parse is told and where, the reserved words of the layout forms, and a
+// range as a form in four positions and a value everywhere else. Every message and position here is
+// the reference's own output for the same text.
+
+// -- a comparison with no value on its right wants a value, not a range ---------------------------
+
+@test("nothing at all after a comparison operator")
+prz_nothing_after_a_comparison()
+    assert_eq(pf_err("print(1 < )\n"), "expression expected")
+    assert_eq(pf_at("print(1 < )\n"), "1:11")
+
+@test("an 'if' as the right operand, which is not an operand")
+prz_an_if_is_not_an_operand()
+    val src = "val c = true\nvar z = 1 < if c then 1 else 2\n"
+
+    assert_eq(pf_err(src), "expression expected")
+    assert_eq(pf_at(src), "2:13")
+
+@test("every comparison operator, and the second link of a chain")
+prz_every_comparison_operator()
+    for o in ["==", "!=", "<=", ">=", "<", ">"]
+        val src = s"print(1 $o )\n"
+
+        assert_eq(pf_err(src), "expression expected")
+        assert_eq(pf_at(src), s"1:${10 + o.len}")
+
+    assert_eq(pf_err("print(1 < 2 < )\n"), "expression expected")
+    assert_eq(pf_at("print(1 < 2 < )\n"), "1:15")
+
+@test("while a range's own refusal still names the range")
+prz_a_range_names_itself()
+    assert_eq(pf_err("for i in 0..=3\n    print(i)\n"),
+              "'..=' is not a range — inclusive is 'a..b' and exclusive is 'a..<b'")
+
+// -- the refusals that name a place a header or attribute could have gone -------------------------
+
+@test("a file that opens badly, under a header or an attribute, is told what a statement begins with")
+prz_a_file_that_opens_badly()
+    for src in [")\nprint(1)\n", "module m\n)\nprint(1)\n", "@no_alloc\n)\nprint(1)\n"]
+        assert_eq(pf_err(src), "expression expected")
+
+    assert_eq(pf_at(")\nprint(1)\n"), "1:1")
+    assert_eq(pf_at("module m\n)\nprint(1)\n"), "2:1")
+    assert_eq(pf_at("@no_alloc\n)\nprint(1)\n"), "2:1")
+
+@test("a value left off a binding in a body is asked for there, not at the signature")
+prz_a_value_left_off_in_a_body()
+    val src = "f(a: int) -> int\n    val b =\n    a + 1\n\n    b\nend f\n\nprint(str(f(1)))\n"
+
+    assert_eq(pf_err(src), "expression expected")
+    assert_eq(pf_at(src), "2:12")
+
+@test("a by-name parameter and an ordinary one both still parse")
+prz_both_parameter_spellings_parse()
+    assert_eq(pf_err("f(x: -> int) -> int = x\ng(x: int) -> int = x\nprint(1)\n"), "")
+
+@test("a specific token still names itself rather than becoming 'expression'")
+prz_a_specific_token_names_itself()
+    assert_eq(pf_err("var x = (1, 2\n"), "')' expected")
+
+// -- sizeof, alignof and offsetof in a whole file -------------------------------------------------
+
+@test("a missing field name, and a missing operand list, are refused by name")
+prz_offsetof_absences()
+    val said = "'offsetof' takes a struct type and a field name in parentheses, as 'offsetof(Header, length)'"
+
+    assert_eq(pf_err("print(offsetof(Header))"), said)
+    assert_eq(pf_err("var n = 3\nprint(offsetof n)"), said)
+
+@test("a value operand is refused by name, by each of the two words")
+prz_a_value_operand()
+    val why = "there is no form that takes a value, since a value's type is what would be measured anyway"
+
+    assert_eq(pf_err("var n = 3\nprint(sizeof n)"), s"'sizeof' takes a type in parentheses, as 'sizeof(int)' — $why")
+    assert_eq(pf_err("var n = 3\nprint(alignof n)"), s"'alignof' takes a type in parentheses, as 'alignof(int)' — $why")
+
+@test("none of the three words may be used as a name")
+prz_the_layout_words_are_reserved()
+    for w in ["sizeof", "alignof", "offsetof"]
+        assert_eq(pf_err(s"var $w = 1"),
+                  s"'$w' is a reserved word, so it cannot stand as the name a 'var' binds — write it '`$w`' " +
+                  "if that is the name you want, which is what the backticks are for: a quoted word is an " +
+                  "ordinary name wherever one may be written")
+        assert_eq(pf_at(s"var $w = 1"), "1:5")
+
+// -- a range is a form in four positions and a value everywhere else ------------------------------
+
+private prz_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end prz_ready
+
+private prz_ran(text: string) -> string
+    val root = make_temp_dir("sysl-prz").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end prz_ran
+
+// The module's IR where it analyzes cleanly, and the analysis report where it does not.
+private prz_ir(text: string) -> string
+    val root = make_temp_dir("sysl-prz").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end prz_ir
+
+@test("a 'for' header counts over one")
+prz_a_for_header_takes_a_range()
+    if !prz_ready() then return
+
+    assert_eq(prz_ran("val xs = [1, 2, 3]\nfor i in 0..<xs.len\n    print(i)\n"), "0\n1\n2\n")
+
+@test("a slice index takes one")
+prz_a_slice_index_takes_a_range()
+    if !prz_ready() then return
+
+    assert_eq(prz_ran("val xs = [1, 2, 3]\nprint(xs[0..<2].len)\n"), "2\n")
+
+@test("a quantifier takes one")
+prz_a_quantifier_takes_a_range()
+    if !prz_ready() then return
+
+    assert_eq(prz_ran("print(for all i in 0..<3 do i < 3, for some i in 0..<3 do i == 2)\n"), "true true\n")
+
+@test("a 'match' pattern takes one")
+prz_a_match_pattern_takes_a_range()
+    if !prz_ready() then return
+
+    val src = "f(n: int) -> string = n match\n    0..<2 -> \"low\"\n    else \"high\"\n\nprint(f(1), f(9))\n"
+
+    assert_eq(prz_ran(src), "low high\n")
+
+@test("and the counted loop calls no cursor, where walking a value does")
+prz_a_counted_loop_calls_no_cursor()
+    if !prz_ready() then return
+
+    val counted = prz_ir("for i in 0..<3\n    print(i)\n")
+    val walked = prz_ir("val r = 0..<3\nfor i in r\n    print(i)\n")
+
+    assert(counted.contains("define"), counted)
+    assert(!counted.contains("Range.next"), "a counted loop is a counter and a comparison")
+    assert(walked.contains("Range.next"), "a range value is walked through its cursor")
+
+@test("a range with both ends written is bound to a name and walked")
+prz_a_range_value_is_walked()
+    if !prz_ready() then return
+
+    assert_eq(prz_ran("val r = 0..<4\nvar total = 0\n\nfor i in r\n    total += i\n\nprint(total)\n"), "6\n")
+
+@test("it is passed to a function and returned from one")
+prz_a_range_is_passed_and_returned()
+    if !prz_ready() then return
+
+    val src = raw"""
+        total(r: Range[int]) -> int
+            var acc = 0
+
+            for i in r
+                acc += i
+
+            acc
+
+        upto(n: int) -> Range[int] = 0..<n
+
+        print(total(upto(4)))
+        """
+
+    assert_eq(prz_ran(src), "6\n")
+
+@test("the inclusive form carries its own flag")
+prz_the_inclusive_flag()
+    if !prz_ready() then return
+
+    val src = raw"""
+        val a = 0..3
+        val b = 0..<3
+        var m = 0
+        var n = 0
+
+        for i in a
+            m += 1
+
+        for i in b
+            n += 1
+
+        print(m, n)
+        """
+
+    assert_eq(prz_ran(src), "4 3\n")
+
+@test("its bounds must agree with each other")
+prz_the_bounds_must_agree()
+    if !prz_ready() then return
+
+    val said = prz_ir("f(a: int, b: u8) -> int\n    val r = a..<b\n    0\n\nprint(f(0, 3))\n")
+
+    assert(said.contains("a range needs matching bounds, got int and byte"), said)
+
+@test("and must be integers")
+prz_the_bounds_must_be_integers()
+    if !prz_ready() then return
+
+    val said = prz_ir("f(a: real, b: real) -> int\n    val r = a..<b\n    0\n\nprint(f(0.0, 3.0))\n")
+
+    assert(said.contains("a range runs between integer bounds, not real"), said)
+
+// -- an inclusive range ending at the width's maximum ---------------------------------------------
+
+@test("finishes, in a counted loop")
+prz_a_top_inclusive_loop_finishes()
+    if !prz_ready() then return
+
+    val src = "var n = 0\nvar last: u8 = 0\n\nfor b in 250u8..255u8\n    n += 1\n    last = b\n\nprint(n, last)\n"
+
+    assert_eq(prz_ran(src), "6 255\n")
+
+@test("finishes, in a quantifier")
+prz_a_top_inclusive_quantifier_finishes()
+    if !prz_ready() then return
+
+    assert_eq(prz_ran("print(for all i in 250u8..255u8 do i >= 250)\n"), "true\n")
+
+@test("finishes, walked as a value")
+prz_a_top_inclusive_value_finishes()
+    if !prz_ready() then return
+
+    assert_eq(prz_ran("val top = 250u8..255u8\nvar n = 0\n\nfor b in top\n    n += 1\n\nprint(n)\n"), "6\n")
+
+@test("and the signed end of a width is the same case")
+prz_the_signed_top_finishes()
+    if !prz_ready() then return
+
+    assert_eq(prz_ran("var n = 0\n\nfor b in 125i8..127i8\n    n += 1\n\nprint(n)\n"), "3\n")
+
+@test("while an exclusive loop gains no second compare")
+prz_an_exclusive_loop_gains_no_compare()
+    if !prz_ready() then return
+
+    val ir = prz_ir("for i in 0..<3\n    print(i)\n")
+
+    assert(ir.contains("define"), ir)
+    assert(!ir.contains("for.more"), "the guard is on the inclusive form only")
+
+// -- an open end stays a form ---------------------------------------------------------------------
+
+private prz_open_end() -> string =
+    "a range with an open end is only allowed in a slice index — as a value it would have to say what " +
+    "the missing bound is, and only the thing being indexed knows that. Write both ends"
+
+@test("an open end is refused where a value was wanted, naming the one place it is legal")
+prz_an_open_end_is_refused()
+    if !prz_ready() then return
+
+    val said = prz_ir("val r = 1..\nprint(1)")
+
+    assert(said.contains(prz_open_end()), said)
+
+@test("in every open spelling")
+prz_every_open_spelling()
+    if !prz_ready() then return
+
+    for src in ["val r = ..2\nprint(1)", "val r = ..\nprint(1)"]
+        val said = prz_ir(src)
+
+        assert(said.contains(prz_open_end()), said)
+
+@test("while a slice index still takes all three")
+prz_a_slice_takes_every_open_spelling()
+    if !prz_ready() then return
+
+    val src = "val xs = [1, 2, 3, 4]\n\nprint(xs[..].len, xs[1..].len, xs[..2].len, xs[..<2].len)\n"
+
+    assert_eq(prz_ran(src), "4 3 3 2\n")
