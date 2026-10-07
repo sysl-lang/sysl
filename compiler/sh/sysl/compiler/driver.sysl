@@ -1426,6 +1426,17 @@ build_library_of(path: string, named_target: Option[string],
     // A `--lib` root is there to type-check against, its C not compiled, so its own are not asked.
     val probed = supplied_or_refused(path, t, false)?
     val c = packaged_compilation_of(path, t)?
+
+    // **A library is reached by naming its module**, so a file of the tree that declares none sits in
+    // the anonymous root module: no program could write a path to what it declares, and its keys would
+    // be the consuming program's own.
+    for i in 0..<c.units.len()
+        val u = c.units.at(i)
+
+        if u.module_name.is_none() && !u.src.name.starts_with(s"$StdPrefix/")
+            return Err(said(Refusal(s"a library is reached by naming its module, and ${u.src.name} " +
+                "is in none — put the library's files in a directory under the root it is built from")))
+
     val named = if manifest.name == "" then basename(root) else manifest.name
 
     build_library(root, t, c.units, c.own, s"'$named'", probed, level)?
@@ -1442,6 +1453,30 @@ build_std_artifact_of(path: string, named_target: Option[string], out: Option[st
         Err(why) -> Err(Refusal(why))
         Ok(where) -> Ok(where)
 end build_std_artifact_of
+
+// What `build-lib --std` adds where the tree it built is not the library a compilation here resolves,
+// or nothing where it is.
+//
+// **The entry is keyed to the tree that was compiled**, so a worktree's library built by an installed
+// sysl -- which resolves the library installed beside it -- lands under a key no compilation here
+// asks for. Said rather than refused: the run is mostly wanted as a type-check of a library being
+// worked on, and that happened. The reference's sentence offers `-o` as the second way to use the
+// file; `-o` is refused here, so `SYSL_LIB` is the one way offered.
+std_tree_note(path: string, named_target: Option[string]) -> Option[string]
+    val t = target_for(path, named_target) match
+        Err(_) -> return None
+        Ok(found) -> found
+
+    val resolved = std_root() match
+        Err(_) -> return None
+        Ok(found) -> found
+
+    if std_fingerprint(path, t).unwrap_or("") == std_fingerprint(resolved, t).unwrap_or("") then return None
+
+    Some(s"note: this is not the library a compilation here resolves — that one is at $resolved, " +
+        s"and this artifact is keyed to $path, so nothing will read it. Set SYSL_LIB to this tree " +
+        "if it was meant to be used rather than only checked.")
+end std_tree_note
 
 // The key for one command over one tree, or nothing where the machine it names cannot be settled --
 // in which case the compilation this stands in front of is about to say so in its own words.

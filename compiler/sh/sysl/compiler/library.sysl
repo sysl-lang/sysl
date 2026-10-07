@@ -52,8 +52,29 @@ end LibraryBuild
 // **Ownership and linkage are separate facts.** Two units each call their fourth closure by one
 // name, so a closure body -- and every instantiation made at one -- is `internal`: the library's
 // copy and the program's are two symbols, and neither is advertised.
-library_build(given: Buf[Program], own: Buf[string], t: Target) -> LibraryBuild
-    library_build_of(without_tests(given), own, t)
+//
+// **`producing` names the files this build is OF**, every file handed over where it says nothing --
+// right for the standard module, whose tree is the whole compilation. A package root is built
+// against the standard module rather than as it, so it names its own files alone, and the library's
+// stay what they are in any program: carried, and closed to a file of the root declaring one of
+// their modules.
+library_build(given: Buf[Program], own: Buf[string], t: Target,
+              producing: Option[Buf[string]] = None) -> LibraryBuild
+    val units = without_tests(given)
+
+    library_build_of(units, own, t, producing.unwrap_or(file_names(units)))
+end library_build
+
+// The files of a compilation that are not the standard module's: what a build of a package root
+// produces.
+project_files(units: Buf[Program]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<units.len()
+        if !units.at(i).src.name.starts_with(s"$StdPrefix/") then out.push(units.at(i).src.name)
+
+    out
+end project_files
 
 // The units a library is built from, its tests taken out: every `@tests` file whole, and from every
 // other file the `@test` functions and the hooks around them. Nothing else may be scaffolding -- an
@@ -83,13 +104,14 @@ without_tests(units: Buf[Program]) -> Buf[Program]
     out
 end without_tests
 
-private library_build_of(units: Buf[Program], own: Buf[string], t: Target) -> LibraryBuild
+private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
+                         producing: Buf[string]) -> LibraryBuild
     // **A library's tests are parsed and never analyzed** (`reference/attributes.md § @tests — a file
     // of scaffolding`): analysis is not a passive reading, and a test naming `Buf[int]` makes `Buf` at
     // `int` -- an instantiation that is an ordinary library function afterwards, with nothing in it
     // saying a test asked for it. So a `@tests` file and every `@test` function and hook leave before
     // the analysis, and `sysl test` is where their mistakes are reported.
-    val done = analyze_produced(units, t, file_names(units))
+    val done = analyze_produced(units, t, producing)
     val checked = program_of(done, done.main_module)
     val promotions = post_analysis_checks(done.an, checked, own)
 
