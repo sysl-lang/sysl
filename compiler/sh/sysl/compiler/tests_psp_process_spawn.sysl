@@ -1,0 +1,107 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_bytes}
+import sysl.process.capture
+import sysl.text.{fields, parse_long, Search}
+
+// `sysl.process` starts a child with `posix_spawnp`, not `fork`. A `fork` copies the parent's
+// address space, and what that costs grows with how many pages the parent's heap spans: the test
+// runner, which has just compiled a large program when it starts one child per test, paid about
+// twenty milliseconds a test against the reference's four (slate's 2474 tests, 2026-10-06). These
+// build a program against this tree's library and ask it.
+
+private psp_built(src: string) -> Option[(string, string)]
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+
+    val root = make_temp_dir("sysl-psp-").unwrap()
+
+    write_bytes(s"$root/main.sysl", src.bytes).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            None
+        Ok(_) -> Some((root, exe))
+end psp_built
+
+// A program that captures a child forty times from an empty heap and forty times holding six million
+// small strings, and prints the two mean times in microseconds and how many strings it held.
+private psp_capturing() -> string = """
+import sysl.process.capture
+import sysl.time.{monotonic, whole_micros}
+import sysl.buf.{Buf, buf}
+
+// The mean time to capture a child, in microseconds, over `n` children.
+mean_capture(n: long) -> long
+    var total: long = 0
+
+    for i in 0..<n
+        val t0 = monotonic()
+        val o = capture("/usr/bin/true", [], "", [], true)
+        total += whole_micros(monotonic() - t0)
+
+    total / n
+end mean_capture
+
+val bare = mean_capture(40)
+var hold: Buf[string] = buf()
+
+for i in 0..<6000000
+    hold.push(s"object number $i, padded out a little further")
+
+val held = mean_capture(40)
+
+print(s"$bare $held ${hold.len()}")
+"""
+
+@test("a child is started by posix_spawnp, which copies nothing of the parent")
+psp_a_child_is_spawned()
+    val built = psp_built(psp_capturing()) match
+        None -> return
+        Some(b) -> b
+
+    val undefined = capture("nm", ["-u", built.1], "", [], true)
+
+    remove_dir_all(built.0).unwrap_or(())
+
+    undefined match
+        Err(_) -> assert(false, "nm could not be run")
+        Ok(out) -> assert(out.text.contains("posix_spawnp"), s"no posix_spawnp in:\n${out.text}")
+end psp_a_child_is_spawned
+
+// Six million small strings is about a gigabyte of heap in many pages: a `fork` from under it took
+// four and a half times as long as one from an empty heap (6.4 ms against 1.4), and a spawn takes the
+// same either way (about 1 ms).
+@test("a parent holding a large heap of small objects starts a child as fast as an empty one")
+psp_a_large_heap_costs_a_child_nothing()
+    val built = psp_built(psp_capturing()) match
+        None -> return
+        Some(b) -> b
+
+    val said = capture(built.1, [], "", [], true)
+
+    remove_dir_all(built.0).unwrap_or(())
+
+    val out = said match
+        Err(_) ->
+            assert(false, "the program that was built could not be run")
+            return
+        Ok(o) -> o
+
+    assert(out.status.ok(), out.text + out.err.unwrap_or(""))
+
+    val parts = fields(out.text)
+
+    assert(parts.len == 3 && parts[2] == "6000000", out.text)
+
+    val bare = parse_long(parts[0].bytes).unwrap_or(0)
+    val held = parse_long(parts[1].bytes).unwrap_or(0)
+
+    assert(bare > 0 && held < 2 * bare, s"bare ${bare}us, holding the heap ${held}us")
+end psp_a_large_heap_costs_a_child_nothing
