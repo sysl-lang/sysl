@@ -139,6 +139,56 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
 
     _ -> gap_at(e, s"a constant ${texpr_kind_name(t)}")
 
+// **A large array literal of constants is DATA, copied into place with one `memcpy`.** Built element
+// by element it is two stores per string and a store per scalar, all in one function, and LLVM's
+// passes over a body that size are worse than linear: a 4,000-row table of string pairs took ten
+// seconds of `-O1` for a program whose own code is a dozen lines. Laid down as a private constant,
+// the same table is one initializer the object file carries and one call -- which is what clang does
+// for a `const` aggregate initializer in C. A short literal keeps the stores, which the optimizer
+// folds into whatever reads them.
+const table_elements: usize = 64
+
+// Whether an array literal is built by copying a constant table: long enough for the stores to
+// cost, and every element something `constant_value` lays down exactly as the stores would write it.
+is_constant_table(elems: Buf[TExpr]) -> bool = elems.len() >= table_elements && all_constant(elems)
+
+// The constant table an array literal is copied out of, laid down at the alignment its type wants
+// so the copy may claim it at both ends.
+constant_table(e: *Emit, t: TExpr, ty: Type) -> Val
+    e.table_id += 1
+
+    val name = s".table${e.table_id}"
+    val image = constant_value(e, t)
+
+    e.globals.push(IrGlobal(name, true, lty(e, ty), Some(image), LinkPrivate, None,
+                            Some(int(e.layout.align(ty))), false))
+    VGlobal(name)
+end constant_table
+
+// Whether `constant_value` writes this value as the bytes the element-by-element lowering would
+// store. Deliberately narrow: an integer, a `bool`, a `real` or `f32`, a string, a null, and arrays
+// and plain structs of those. A bitfield struct packs its fields into one container and an enum
+// has a representation of its own, so neither is claimed.
+private is_constant_image(t: TExpr) -> bool = *t.kind match
+    TIntLit(_, ty) ->
+        underlying(ty) match
+            Integer(_, _, _) -> true
+            _ -> false
+    TBoolLit(_) -> true
+    TFloatLit(_, ty) -> ty == real_type() || ty == Floating(32, false)
+    TStrLit(_) -> true
+    TNullLit(_) -> true
+    TArrayLit(items, _) -> all_constant(items)
+    TStructNew(decl, args) -> bitfield_ranges_of(Struct(decl)).is_none() && all_constant(args)
+    _ -> false
+
+private all_constant(items: Buf[TExpr]) -> bool
+    for i in 0..<items.len()
+        if !is_constant_image(items.at(i)) then return false
+
+    true
+end all_constant
+
 // A string as a value: the owner nothing frees, the bytes, and how many there are.
 string_const(e: *Emit, s: string) -> Val
     var fields: Buf[IrArg] = buf()
