@@ -1,0 +1,258 @@
+module sysl.math.rational
+@tests
+
+import sysl.math.bigint.{BigInt, add as add_big, from_int as big_of, mul as mul_big, pow,
+                         shl, sub as sub_big, to_string as big_text}
+
+// What `sysl.math.rational` claims, asserted in sysl.
+//
+// **The conversion cases are the ones worth reading.** Arithmetic on fractions is hard to get wrong
+// once the form is canonical; `to_real` is easy to get wrong in a way no ordinary value shows, so its
+// cases sit at the places a double rounding or a lost sticky bit would land: an exact tie, a value a
+// hair either side of one, the subnormal range, and the edge of the largest `real`.
+
+private big_pow2(k: usize) -> BigInt = shl(big_of(1), k)
+
+private q(n: long, d: long) -> Rational = ratio(n, d)
+
+// -- the canonical form -------------------------------------------------------------------------------
+
+@test("a fraction is kept in lowest terms with the sign on the numerator")
+lowest_terms()
+    assert_eq(to_string(q(6, -4)), "-3/2")
+    assert_eq(to_string(q(-6, -4)), "3/2")
+    assert_eq(to_string(of(big_of(2), big_of(4))), "1/2")
+    assert_eq(q(6, -4).numerator(), big_of(-3))
+    assert_eq(q(6, -4).denominator(), big_of(2))
+
+@test("zero is 0/1 whatever it was built from")
+zero_is_one_value()
+    assert_eq(q(0, -5), zero())
+    assert_eq(to_string(q(0, -5)), "0/1")
+    assert_eq(sub(q(1, 3), q(2, 6)), zero())
+    assert(q(0, 7).is_zero())
+
+@test("a whole number prints over one")
+whole_numbers_print_over_one()
+    assert_eq(to_string(from_int(7)), "7/1")
+    assert_eq(to_string(from_big(big_of(-12))), "-12/1")
+    assert_eq(s"${q(10, 5)}", "2/1")
+    assert(q(10, 5).is_integer())
+    assert(!q(1, 2).is_integer())
+
+@test("From reads a machine integer and a BigInt")
+from_conversions()
+    val a: Rational = Rational.from(long(3))
+    val b: Rational = Rational.from(big_of(-4))
+
+    assert_eq(a, from_int(3))
+    assert_eq(b, from_int(-4))
+
+@test(should_trap)
+a_zero_denominator_traps()
+    of(big_of(1), big_of(0))
+
+@test("but any other denominator is accepted, a negative one included")
+a_nonzero_denominator_is_fine()
+    assert_eq(of(big_of(1), big_of(-1)), from_int(-1))
+
+// -- arithmetic ---------------------------------------------------------------------------------------
+
+@test("the four operations are exact")
+arithmetic()
+    assert_eq(q(1, 3) + q(1, 6), q(1, 2))
+    assert_eq(q(1, 2) - q(3, 4), q(-1, 4))
+    assert_eq(q(2, 3) * q(9, 4), q(3, 2))
+    assert_eq(q(1, 2) / q(-1, 4), from_int(-2))
+    assert_eq(-q(2, 5), q(-2, 5))
+    assert_eq(abs(q(-2, 5)), q(2, 5))
+    assert_eq(add(q(1, 10), q(2, 10)), q(3, 10))
+
+@test("a long sum of fractions stays in lowest terms")
+harmonic()
+    var h = zero()
+
+    for k in 1..<11
+        h = h + q(1, long(k))
+
+    assert_eq(to_string(h), "7381/2520")
+
+@test(should_trap)
+division_by_zero_traps()
+    q(1, 2) / zero()
+
+@test("but dividing zero by something is zero")
+zero_divided_is_zero()
+    assert_eq(zero() / q(3, 7), zero())
+
+// -- order --------------------------------------------------------------------------------------------
+
+@test("comparison is the order of the numbers, the signs included")
+ordering()
+    assert(q(1, 3) < q(1, 2))
+    assert(q(-1, 2) < q(1, 3))
+    assert(q(-1, 2) < q(-1, 3))
+    assert(q(7, 2) > from_int(3))
+    assert_eq(cmp(q(2, 4), q(1, 2)), 0)
+    assert_eq(cmp(q(-5, 3), q(-3, 2)), -1)
+    assert(q(2, 4) <= q(1, 2))
+
+@test("values that compare equal hash alike")
+hashing()
+    assert_eq(q(2, 4).hash(), q(1, 2).hash())
+    assert_eq(q(-3, 6).hash(), q(1, -2).hash())
+    assert(q(1, 2).hash() != q(2, 1).hash())
+
+// -- to integers --------------------------------------------------------------------------------------
+
+@test("floor, ceil and trunc round down, up and toward zero")
+rounding_to_integers()
+    assert_eq(floor(q(7, 2)), big_of(3))
+    assert_eq(ceil(q(7, 2)), big_of(4))
+    assert_eq(trunc(q(7, 2)), big_of(3))
+    assert_eq(floor(q(-7, 2)), big_of(-4))
+    assert_eq(ceil(q(-7, 2)), big_of(-3))
+    assert_eq(trunc(q(-7, 2)), big_of(-3))
+    assert_eq(floor(from_int(-5)), big_of(-5))
+    assert_eq(ceil(from_int(-5)), big_of(-5))
+    assert_eq(trunc(from_int(-5)), big_of(-5))
+
+// -- from a real --------------------------------------------------------------------------------------
+
+@test("a real is read at its exact binary value")
+from_real_is_exact()
+    assert_eq(to_string(from_real(0.1).unwrap()), "3602879701896397/36028797018963968")
+    assert_eq(from_real(0.5).unwrap(), q(1, 2))
+    assert_eq(from_real(-3.0).unwrap(), from_int(-3))
+    assert_eq(from_real(0.0).unwrap(), zero())
+    assert_eq(from_real(1e300).unwrap().denominator(), big_of(1))
+
+@test("the smallest subnormal is one over two to the 1074")
+from_real_subnormal()
+    assert_eq(from_real(4.9406564584124654e-324).unwrap(), of(big_of(1), big_pow2(1074)))
+    assert_eq(from_real(-4.9406564584124654e-324).unwrap(), of(big_of(-1), big_pow2(1074)))
+
+@test("a NaN and an infinity are no rational")
+from_real_refuses_the_rest()
+    assert(from_real(real.nan()).is_none())
+    assert(from_real(real.infinity()).is_none())
+    assert(from_real(-real.infinity()).is_none())
+
+// -- comparing against a real -------------------------------------------------------------------------
+
+@test("a third is not the double nearest it, and a tenth is not 0.1")
+cmp_real_is_exact()
+    // 0.3333333333333333 is a little below a third, and 0.1 a little above a tenth.
+    assert_eq(cmp_real(q(1, 3), 0.3333333333333333), Some(1))
+    assert_eq(cmp_real(q(1, 10), 0.1), Some(-1))
+    assert_eq(cmp_real(q(1, 2), 0.5), Some(0))
+    assert(eq_real(from_int(-3), -3.0))
+    assert(!eq_real(q(1, 10), 0.1))
+    assert(lt_real(q(1, 10), 0.1))
+    assert(gt_real(q(1, 3), 0.3333333333333333))
+
+@test("one past 2^53 is above the double it rounds to")
+cmp_real_past_the_mantissa()
+    val x = from_big(add_big(big_pow2(53), big_of(1)))
+
+    assert_eq(cmp_real(x, 9007199254740992.0), Some(1))
+    assert_eq(cmp_real(x, 9007199254740994.0), Some(-1))
+
+@test("a NaN is unordered, and an infinity is beyond every rational")
+cmp_real_special()
+    assert(cmp_real(q(1, 2), real.nan()).is_none())
+    assert(!eq_real(q(1, 2), real.nan()))
+    assert(!lt_real(q(1, 2), real.nan()))
+    assert(!gt_real(q(1, 2), real.nan()))
+    assert_eq(cmp_real(from_big(pow(big_of(10), 400)), real.infinity()), Some(-1))
+    assert_eq(cmp_real(from_big(pow(big_of(-10), 401)), -real.infinity()), Some(1))
+
+@test("the smallest subnormal compares against its own exact value")
+cmp_real_subnormal()
+    val tiny = of(big_of(1), big_pow2(1074))
+
+    assert_eq(cmp_real(tiny, 4.9406564584124654e-324), Some(0))
+    assert_eq(cmp_real(of(big_of(1), big_pow2(1075)), 4.9406564584124654e-324), Some(-1))
+    assert_eq(cmp_real(zero(), -0.0), Some(0))
+
+// -- to a real, correctly rounded ---------------------------------------------------------------------
+
+@test("ordinary fractions round to the double nearest them")
+to_real_ordinary()
+    assert_eq(to_real(q(1, 3)), 0.3333333333333333)
+    assert_eq(to_real(q(2, 3)), 0.6666666666666666)
+    assert_eq(to_real(q(-1, 3)), -0.3333333333333333)
+    assert_eq(to_real(q(1, 10)), 0.1)
+    assert_eq(to_real(q(7, 1)), 7.0)
+    assert_eq(to_real(zero()), 0.0)
+
+@test("an exact tie past 2^53 goes to the even neighbour, down and up")
+to_real_ties()
+    // 2^53 + 1 is halfway between 2^53 and 2^53 + 2 and goes down to the even one; 2^53 + 3 is
+    // halfway between 2^53 + 2 and 2^53 + 4 and goes up.
+    assert_eq(to_real(from_big(add_big(big_pow2(53), big_of(1)))), 9007199254740992.0)
+    assert_eq(to_real(from_big(add_big(big_pow2(53), big_of(3)))), 9007199254740996.0)
+
+@test("a hair either side of a tie is not a tie, however far down the hair is")
+to_real_near_ties()
+    // The hair is 1/3^200, about 2^-317 -- far below anything the quotient's own bits can see, so
+    // only the remainder of the division says the value is not exactly halfway.
+    val third = pow(big_of(3), 200)
+    val tie = mul_big(add_big(big_pow2(53), big_of(1)), third)
+
+    assert_eq(to_real(of(add_big(tie, big_of(1)), third)), 9007199254740994.0)
+    assert_eq(to_real(of(sub_big(tie, big_of(1)), third)), 9007199254740992.0)
+
+@test("huge numerators and denominators of equal bit length")
+to_real_huge_parts()
+    val p = big_pow2(2000)
+
+    assert_eq(to_real(of(add_big(p, big_of(1)), sub_big(p, big_of(1)))), 1.0)
+    assert_eq(to_real(of(add_big(mul_big(big_of(3), p), big_of(1)), add_big(mul_big(big_of(2), p), big_of(1)))), 1.5)
+    assert_eq(to_real(of(pow(big_of(7), 500), pow(big_of(7), 499))), 7.0)
+
+@test("subnormals round once, at their own last place")
+to_real_subnormals()
+    val min_sub = 4.9406564584124654e-324
+
+    assert_eq(to_real(of(big_of(1), big_pow2(1074))), min_sub)
+    assert_eq(to_real(of(big_of(-1), big_pow2(1074))), -min_sub)
+    // 3 * 2^-1075 is halfway between one and two of the smallest subnormal: two is even.
+    assert_eq(to_real(of(big_of(3), big_pow2(1075))), 2.0 * min_sub)
+    // 2^-1075 is halfway between zero and the smallest subnormal: zero is even.
+    assert_eq(to_real(of(big_of(1), big_pow2(1075))), 0.0)
+    // And a hair above that half is the smallest subnormal, a hair below it zero.
+    val third = pow(big_of(3), 700)
+
+    assert_eq(to_real(of(add_big(third, big_of(1)), mul_big(third, big_pow2(1075)))), min_sub)
+    assert_eq(to_real(of(sub_big(third, big_of(1)), mul_big(third, big_pow2(1075)))), 0.0)
+    // The smallest normal and the largest subnormal sit either side of the boundary.
+    assert_eq(to_real(of(big_of(1), big_pow2(1022))), 2.2250738585072014e-308)
+    assert_eq(to_real(of(sub_big(big_pow2(52), big_of(1)), big_pow2(1074))), 2.225073858507201e-308)
+
+@test("a negative value too small for any subnormal is a negative zero")
+to_real_negative_zero()
+    val v = to_real(of(big_of(-1), big_pow2(2000)))
+
+    assert_eq(v, 0.0)
+    assert_eq(1.0 / v, -real.infinity())
+
+@test("past the largest real is an infinity, and the tie at the edge goes there too")
+to_real_overflow()
+    val max = 1.7976931348623157e308
+    val edge = sub_big(big_pow2(1024), big_pow2(970))
+
+    assert_eq(to_real(from_big(sub_big(big_pow2(1024), big_pow2(971)))), max)
+    // Halfway between the largest real and 2^1024: the largest real's mantissa is odd, so the tie
+    // goes up, and 2^1024 is an infinity.
+    assert_eq(to_real(from_big(edge)), real.infinity())
+    assert_eq(to_real(from_big(sub_big(edge, big_of(1)))), max)
+    assert_eq(to_real(from_big(pow(big_of(10), 400))), real.infinity())
+    assert_eq(to_real(from_big(pow(big_of(-10), 401))), -real.infinity())
+    assert_eq(to_real(of(big_of(1), pow(big_of(10), 400))), 0.0)
+
+@test("every finite real comes back from its exact value unchanged")
+to_real_round_trips()
+    for f in [0.1, -123.456, 1e300, 1.7976931348623157e308, 2.2250738585072014e-308,
+              4.9406564584124654e-324, 3.141592653589793, 1e-310, -2.5e-320]
+        assert_eq(to_real(from_real(f).unwrap()), f)

@@ -1,0 +1,115 @@
+module sysl.math.rational
+
+import sysl.math.bigint.{abs as abs_big, bit_length, div_rem, from_real as big_from_real, one as big_one,
+                         shl, shr, test_bit, to_u64, trailing_zeros}
+
+/** The exact value `f` holds, or `None` for a NaN or an infinity.
+ *
+ * **Exact, never the shortest decimal that reads back as `f`**: `from_real(0.1)` is
+ * `3602879701896397/36028797018963968`, which is the number the double actually is. Every finite
+ * `real` is an integer times a power of two, and that is the fraction this answers -- the denominator
+ * is always a power of two, up to `2^1074` for the smallest subnormal.
+ *
+ * Doubling is exact for every finite `real` that is not a whole number, those all lying below
+ * `2^52`, so `f` is doubled until it is whole and the count of doublings is the power of two.
+ */
+from_real(f: real) -> Option[Rational]
+    if f.is_nan() || f.is_infinite() then return None
+
+    var v = f
+    var e: usize = 0
+
+    while v.trunc() != v
+        v = v * 2.0
+        e += 1
+
+    Some(reduced(big_from_real(v).unwrap(), shl(big_one(), e)))
+end from_real
+
+/** How `a` stands against `f` at `f`'s exact binary value: `Some(-1)`, `Some(0)` or `Some(1)` as `a`
+ * is below, equal to or above it, and `None` where `f` is a NaN, which is unordered against
+ * everything.
+ *
+ * **Never by converting `a` to a `real`**, which rounds and so can call two different numbers equal:
+ * `1/3` is not `0.3333333333333333`, and this says so. An infinity is above or below every rational.
+ */
+cmp_real(a: Rational, f: real) -> Option[int]
+    if f.is_nan() then return None
+    if f.is_infinite() then return Some(if f > 0.0 then -1 else 1)
+
+    Some(cmp(a, from_real(f).unwrap()))
+
+/** Whether `a` is exactly the value `f` holds; `false` for a NaN. */
+eq_real(a: Rational, f: real) -> bool = cmp_real(a, f) == Some(0)
+
+/** Whether `a` is below `f`'s exact value; `false` for a NaN. */
+lt_real(a: Rational, f: real) -> bool = cmp_real(a, f) == Some(-1)
+
+/** Whether `a` is above `f`'s exact value; `false` for a NaN. */
+gt_real(a: Rational, f: real) -> bool = cmp_real(a, f) == Some(1)
+
+/** The nearest `real` to `x`, a tie to the even one -- correctly rounded, subnormals included, and an
+ * infinity past the largest finite `real`.
+ *
+ * **One integer division, one rounding.** The numerator is scaled by a power of two so the quotient
+ * carries two or three bits more than the 53 a `real` keeps; the bits below those 53 and the
+ * remainder of the division are the guard and the sticky bit, and the rounding is decided on the
+ * integer side where it is exact. Below the normal range fewer bits are kept, so the rounding happens
+ * once, at the subnormal's own last place, rather than once to 53 bits and again on the way down.
+ * The result is assembled from a mantissa of at most 53 bits and a power of two, which cannot round.
+ */
+to_real(x: Rational) -> real
+    if x.num.is_zero() then return 0.0
+
+    val n = abs_big(x.num)
+    val s = 55 - (long(bit_length(n)) - long(bit_length(x.den)))
+    val (q, r) = if s >= 0 then div_rem(shl(n, usize(s)), x.den) else div_rem(n, shl(x.den, usize(-s)))
+
+    // `x` is `q * 2^-s` and a little more, `q` holding 55 or 56 bits, so its top bit is at `2^top`.
+    val qb = long(bit_length(q))
+    val top = qb - 1 - s
+
+    if top > 1023 then return if x.num.sign() < 0 then -real.infinity() else real.infinity()
+
+    // Keep 53 bits, or fewer where the last kept bit would fall below the smallest subnormal's.
+    var drop = qb - 53
+
+    if s - 1074 > drop then drop = s - 1074
+
+    var m: u64 = if drop >= qb then 0 else to_u64(shr(q, usize(drop))).unwrap()
+    val guard = test_bit(q, usize(drop - 1))
+    val sticky = !r.is_zero() || long(trailing_zeros(q)) < drop - 1
+
+    if guard && (sticky || m & 1 == 1) then m += 1
+
+    val v = if m == 0 then 0.0 else scaled(real(m), drop - s)
+
+    if x.num.sign() < 0 then -v else v
+end to_real
+
+/** `v * 2^e`, by steps that are each exact: going up, until the product leaves the range and becomes
+ * the infinity it is; going down, never below `2^e`, which `to_real` keeps at or above the smallest
+ * subnormal so that no step rounds.
+ */
+private scaled(v: real, e: long) -> real
+    var out = v
+    var k = e
+
+    while k >= 32
+        out = out * 4294967296.0
+        k -= 32
+
+    while k <= -32
+        out = out / 4294967296.0
+        k += 32
+
+    while k > 0
+        out = out * 2.0
+        k -= 1
+
+    while k < 0
+        out = out / 2.0
+        k += 1
+
+    out
+end scaled

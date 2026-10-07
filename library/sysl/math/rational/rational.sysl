@@ -1,0 +1,187 @@
+module sysl.math.rational
+
+import sysl.math.bigint.{BigInt, abs as abs_big, add as add_big, cmp as cmp_big, div as div_big,
+                         div_floor, div_rem, from_int as big_of, gcd, mul as mul_big,
+                         negate as negate_big, one as big_one, sub as sub_big, to_string as big_text,
+                         zero as big_zero}
+
+/** Exact fractions: a numerator and a denominator, both `BigInt`s, so a third is a third.
+ *
+ * **A language that has an integer with no width has, one division later, a fraction with no
+ * error.** `BigInt` makes `+`, `-` and `*` exact over the integers; the rationals are the smallest set
+ * that keeps `/` exact as well, and every numeric tower that has one -- Scheme's, Haskell's
+ * `Rational`, Python's `fractions` -- builds it out of exactly these two integers. A program that
+ * needs it and does not find it here writes its own, and the hard half of that is not the arithmetic
+ * but the conversion to and from `real`, which is where this module spends its care.
+ *
+ * ## The representation
+ *
+ * A **numerator** and a **denominator**, kept in lowest terms with the denominator positive. So every
+ * number has exactly one representation: `2/4` is built as `1/2`, `1/-2` as `-1/2`, and zero is
+ * `0/1` whatever it was computed from. That is what lets `==` compare the two fields, `Hash` hash
+ * them, and `n/d` print without anybody having to normalize first.
+ *
+ * **A zero denominator traps**, as division by zero does on `BigInt` and on a machine integer -- the
+ * mistake is the same one and the language's answer for it is the same answer. A caller that cannot
+ * rule out a zero divisor checks for one.
+ *
+ * ## What it costs
+ *
+ * **Every operation reduces its result by a `gcd`**, which is Euclid's algorithm over `BigInt`s and
+ * is most of the cost of a sum. That is the price of the canonical form; without it a running sum of
+ * fractions grows its denominator without bound even when the value does not.
+ *
+ * ## The two conversions to and from `real`
+ *
+ * **Both are exact where exactness is possible and correctly rounded where it is not.** Every finite
+ * `real` is a rational -- an integer times a power of two -- so `from_real` and `cmp_real` take the
+ * double at its exact binary value, and `0.1` is `3602879701896397/36028797018963968` rather than
+ * `1/10`. `to_real` goes the other way and has to round; it gives the nearest `real`, ties to even,
+ * subnormals included, which is what a division of the two integers in infinite precision followed by
+ * one rounding would give. **Neither direction ever passes through a `real` computed from the
+ * fraction**, which is the shortcut that rounds twice.
+ */
+
+/** A fraction in lowest terms, the denominator positive.
+ *
+ * Both parts are `BigInt`s, so copying a `Rational` costs two retains rather than a copy of either.
+ */
+struct Rational
+    private[rational] num: BigInt
+    private[rational] den: BigInt
+
+    /** The numerator, which carries the sign. */
+    numerator(self) -> BigInt = self.num
+
+    /** The denominator, which is always positive and is `1` for a whole number. */
+    denominator(self) -> BigInt = self.den
+
+    /** Whether this is zero, which is `0/1` and nothing else. */
+    is_zero(self) -> bool = self.num.is_zero()
+
+    /** Whether the denominator is one -- the value is a whole number. */
+    is_integer(self) -> bool = self.den == big_one()
+
+    /** `-1`, `0` or `1`, which is the numerator's, the denominator being positive. */
+    sign(self) -> int = self.num.sign()
+end Rational
+
+/** Zero, `0/1`. */
+zero() -> Rational = Rational(big_zero(), big_one())
+
+/** One, `1/1`. */
+one() -> Rational = Rational(big_one(), big_one())
+
+/** The whole number `n`, over one. */
+from_int(n: long) -> Rational = Rational(big_of(n), big_one())
+
+/** The whole number `n`, over one. */
+from_big(n: BigInt) -> Rational = Rational(n, big_one())
+
+/** `num / den` in lowest terms, the sign moved to the numerator.
+ *
+ * **A zero denominator traps** -- the one representation rule enforced at the one place a caller
+ * could break it.
+ */
+of(num: BigInt, den: BigInt) -> Rational
+    if den.is_zero() then panic("sysl.math.rational: a zero denominator")
+
+    reduced(num, den)
+
+/** `n / d` over machine integers, in lowest terms -- `ratio(6, -4)` is `-3/2`. A zero `d` traps. */
+ratio(n: long, d: long) -> Rational = of(big_of(n), big_of(d))
+
+impl From[long] for Rational
+    from(value: long) -> Rational = from_int(value)
+
+impl From[BigInt] for Rational
+    from(value: BigInt) -> Rational = from_big(value)
+
+/** The same value with the other sign. */
+negate(x: Rational) -> Rational = Rational(negate_big(x.num), x.den)
+
+impl Neg for Rational
+    neg(self) -> Rational = negate(self)
+
+/** The magnitude. */
+abs(x: Rational) -> Rational = Rational(abs_big(x.num), x.den)
+
+/** `a + b`, exactly. Allocates, and reduces the sum by a `gcd`. */
+add(a: Rational, b: Rational) -> Rational =
+    reduced(add_big(mul_big(a.num, b.den), mul_big(b.num, a.den)), mul_big(a.den, b.den))
+
+impl Add for Rational
+    add(self, rhs: Rational) -> Rational = add(self, rhs)
+
+/** `a - b`, exactly. */
+sub(a: Rational, b: Rational) -> Rational =
+    reduced(sub_big(mul_big(a.num, b.den), mul_big(b.num, a.den)), mul_big(a.den, b.den))
+
+impl Sub for Rational
+    sub(self, rhs: Rational) -> Rational = sub(self, rhs)
+
+/** `a * b`, exactly. */
+mul(a: Rational, b: Rational) -> Rational = reduced(mul_big(a.num, b.num), mul_big(a.den, b.den))
+
+impl Mul for Rational
+    mul(self, rhs: Rational) -> Rational = mul(self, rhs)
+
+/** `a / b`, exactly -- the operation the type exists to keep exact.
+ *
+ * **Division by zero traps**, as it does on `BigInt`.
+ */
+div(a: Rational, b: Rational) -> Rational
+    if b.num.is_zero() then panic("sysl.math.rational: division by zero")
+
+    reduced(mul_big(a.num, b.den), mul_big(a.den, b.num))
+
+impl Div for Rational
+    div(self, rhs: Rational) -> Rational = div(self, rhs)
+
+/** `-1`, `0` or `1` as `a` is below, equal to or above `b`.
+ *
+ * Cross-multiplied, which is exact and is the comparison the positive denominators make sound: `a/b <
+ * c/d` is `a*d < c*b` exactly when `b` and `d` are both above zero.
+ */
+cmp(a: Rational, b: Rational) -> int = cmp_big(mul_big(a.num, b.den), mul_big(b.num, a.den))
+
+/** **Field by field, because the form is canonical**: two equal values are reduced to the same
+ * numerator and the same positive denominator, so nothing has to be multiplied out.
+ */
+impl Eq for Rational
+    eq(self, rhs: Rational) -> bool = self.num == rhs.num && self.den == rhs.den
+
+impl Ord for Rational
+    lt(self, rhs: Rational) -> bool = cmp(self, rhs) < 0
+
+impl Hash for Rational
+    /** Over both parts, which is sound because equal values hold identical parts. */
+    hash(self) -> u64 = self.num.hash() * 0x100000001b3u64 ^ self.den.hash()
+
+/** The greatest integer not above `x`: `floor(-7/2)` is `-4`. */
+floor(x: Rational) -> BigInt = div_floor(x.num, x.den)
+
+/** The least integer not below `x`: `ceil(-7/2)` is `-3`, `ceil(7/2)` is `4`. */
+ceil(x: Rational) -> BigInt = negate_big(div_floor(negate_big(x.num), x.den))
+
+/** `x` with its fraction discarded, toward zero: `trunc(-7/2)` is `-3`. */
+trunc(x: Rational) -> BigInt = div_rem(x.num, x.den).0
+
+/** `n/d` in base ten, the sign on the numerator -- and a whole number is still `n/1`, so the text
+ * says which type it came from.
+ */
+to_string(x: Rational) -> string = s"${big_text(x.num)}/${big_text(x.den)}"
+
+impl Display for Rational
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(to_string(self), out, fmt)
+
+/** `num / den` in lowest terms with the denominator positive; `den` is not zero at any call site. */
+private[rational] reduced(num: BigInt, den: BigInt) -> Rational
+    if num.is_zero() then return zero()
+
+    val g = gcd(num, den)
+    val n = div_big(num, g)
+    val d = div_big(den, g)
+
+    if d.sign() < 0 then Rational(negate_big(n), negate_big(d)) else Rational(n, d)
+end reduced
