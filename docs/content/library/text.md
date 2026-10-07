@@ -676,7 +676,7 @@ print(join(words, "-"))
 ```
 
 ```error
-this reaches 'sysl.buf.Buf.grow.byte', which makes heap storage, and this module declared '@no_alloc'
+this reaches 'sysl.buf.BufCore.grow.byte', which makes heap storage, and this module declared '@no_alloc'
 ```
 
 That diagnostic names `sysl.buf`, three calls down, because [`alloc` is checked on what a module
