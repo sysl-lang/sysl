@@ -1,0 +1,360 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.testing.skip
+
+// Running a freestanding program **on the machine it was built for**, under QEMU -- the support the
+// board suites share (`tests_qmu_qemu_run.sysl`, `tests_qmu_qemu_harness.sysl`), and any other suite
+// whose claim needs an image that boots.
+//
+// Every tier below this one reads what the compiler wrote: the ABI tables against clang, the module
+// against the verifier and the assembler. None of them can see valid IR that computes the wrong
+// thing -- a length loaded at the wrong width, an index widened to a size the machine does not have
+// -- because all of those are text, and text is what a miscompile also is. So this tier executes: it
+// links the module against a startup written for the board, boots it in an emulator, and reads two
+// channels. **The exit status** says whether anything failed, through a device the board has for the
+// purpose; **standard output** says what did, through the board's UART.
+//
+// The boot files -- a startup per board that gives the program a stack and reports what `main`
+// returned, the support C a freestanding program owes the board (`putchar`, `malloc`, `free`), and a
+// linker script saying where memory is -- are in `testdata/qemu/` at the repository's root, whose
+// README explains each. They sit outside `compiler/` because a directory under a project root that
+// holds C is read as a module's.
+//
+// **Nothing here passes for want of a tool.** A missing emulator, linker or back end SKIPS the test
+// by name, which the runner counts where a pass would be silent, and the reason says which tool and
+// which board.
+
+// What it takes to boot one board: the machine, the target whose code it runs, the emulator, the
+// arguments before the image, and the three boot files. A board carries its target rather than being
+// found by one -- a target is an architecture and an architecture has many machines, so two boards may
+// name the same target (`thumbv7em-freestanding` serves both the AN500's Cortex-M7 and the AN386's
+// Cortex-M4).
+struct QemuBoard
+    name: string
+    target: string
+    qemu: string
+    machine: Buf[string]
+    startup: string
+    bsp: string
+    script: string
+end QemuBoard
+
+// What a boot came to: how the emulator ended, and everything it printed -- the guest's UART and the
+// emulator's own complaints, so a board that died explains itself.
+struct QemuRun
+    status: Status
+    out: string
+
+private qemu_words(xs: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for x in xs do out.push(x)
+
+    out
+end qemu_words
+
+// The Arm boards report through semihosting, which has to be asked for: a run without
+// `-semihosting-config` reports nothing and exits as though the program had said zero.
+private qemu_semihosted(machine: string) -> Buf[string] =
+    qemu_words(["-M", machine, "-nographic", "-semihosting-config", "enable=on,target=native", "-kernel"])
+
+private qemu_arm(name: string, target: string, files: string) -> QemuBoard =
+    QemuBoard(name, target, "qemu-system-arm", qemu_semihosted(name), s"start_$files.s",
+              s"bsp_$files.c", s"$files.ld")
+
+/** Every board this tier boots, in the reference's order.
+ *
+ * `virt` is RV32 with no floating extension and a 16550 UART, reporting through `sifive_test`. The
+ * AN505 is Armv8-M Mainline. The micro:bit's nRF51822 is the Cortex-M0 QEMU has, which is the
+ * *architecture* the RP2040 runs -- no Thumb-2, no divider, no unaligned access. The AN500 (Cortex-M7)
+ * and the AN386 (Cortex-M4) are Armv7E-M sharing one memory map, so what differs between their runs is
+ * the processor and nothing else. The AN385's Cortex-M3 is Armv7-M with no floating-point unit at all.
+ */
+qemu_boards() -> Buf[QemuBoard]
+    var out: Buf[QemuBoard] = buf()
+
+    out.push(QemuBoard("virt", "riscv32-freestanding", "qemu-system-riscv32",
+                       qemu_words(["-M", "virt", "-bios", "none", "-nographic", "-kernel"]),
+                       "start_rv32.s", "bsp_rv32.c", "rv32.ld"))
+    out.push(QemuBoard("mps2-an505", "thumb-freestanding", "qemu-system-arm",
+                       qemu_semihosted("mps2-an505"), "start_thumb.s", "bsp_thumb.c", "thumb.ld"))
+    out.push(qemu_arm("microbit", "thumbv6m-freestanding", "thumbv6m"))
+    out.push(qemu_arm("mps2-an500", "thumbv7em-freestanding", "thumbv7em"))
+    out.push(qemu_arm("mps2-an386", "thumbv7em-freestanding", "thumbv7em"))
+    out.push(qemu_arm("mps2-an385", "thumbv7m-freestanding", "thumbv7m"))
+    out
+end qemu_boards
+
+/** The board's console as a sysl module, `board`, which a program imports.
+ *
+ * **It is a module rather than part of the program's root file, and it has to be**: a root file's
+ * top-level `val` and `var` are bindings in the statement stream, and an `impl` member can reach
+ * neither them nor a root function that touches one -- so a `Writer` whose `write` needs the device
+ * pointer cannot be written there. One directory down it is ordinary code.
+ *
+ * `console()` both enables the device and hands back the sink. `virt`'s 16550 takes a byte at offset
+ * zero and needs no setting up; the MPS2's CMSDK takes a word and **transmits nothing until it is
+ * enabled**; the nRF51's transmitter is started rather than enabled, and its ready flag is an event
+ * cleared before each byte. `extra` is appended to the module.
+ */
+qemu_board_module(b: QemuBoard, extra: string = "") -> string
+    val regs = b.name match
+        "virt" -> raw"""
+            struct Uart
+                data: volatile u8
+
+            val UART: usize = 0x10000000
+            val regs: *Uart = ptr_cast(UART)
+
+            putc(c: u8)
+                regs.data = c
+
+            console() -> *Writer = uart
+            """
+        "mps2-an505" -> qemu_cmsdk("0x40200000")
+        "microbit" -> raw"""
+            struct Reg
+                v: volatile u32
+
+            val UART: usize = 0x40002000
+
+            val starttx: *Reg = ptr_cast(UART + 0x008)
+            val txdrdy: *Reg = ptr_cast(UART + 0x11c)
+            val enable: *Reg = ptr_cast(UART + 0x500)
+            val pseltxd: *Reg = ptr_cast(UART + 0x50c)
+            val txd: *Reg = ptr_cast(UART + 0x51c)
+            val baudrate: *Reg = ptr_cast(UART + 0x524)
+
+            putc(c: u8)
+                txdrdy.v = 0
+                txd.v = u32(c)
+
+                while txdrdy.v == 0
+                    ()
+
+            console() -> *Writer
+                pseltxd.v = 24
+                baudrate.v = 0x01d7e000
+                enable.v = 4
+                starttx.v = 1
+                uart
+            """
+        _ -> qemu_cmsdk("0x40004000")
+
+    val console = raw"""
+
+        struct Console
+        end Console
+
+        impl Fallible for Console
+
+        impl Writer for Console
+            write(*self, bytes: []const u8)
+                for b in bytes do putc(b)
+        end Console
+
+        val uart: *Console = ptr_cast(0usize)
+        """
+
+    s"module board\n\n$regs$console$extra"
+end qemu_board_module
+
+// The CMSDK UART the three MPS2 boards share, at the board's own address: the AN505's at 0x40200000,
+// the AN500's, AN386's and AN385's at 0x40004000 (measured with `info mtree -f` on each).
+private qemu_cmsdk(at: string) -> string = raw"""
+    struct Uart
+        data: volatile u32
+        state: volatile u32
+        ctrl: volatile u32
+        intstatus: volatile u32
+        bauddiv: volatile u32
+
+    """ + s"val UART: usize = $at\n" + raw"""
+    val regs: *Uart = ptr_cast(UART)
+
+    putc(c: u8)
+        regs.data = u32(c)
+
+    console() -> *Writer
+        regs.bauddiv = 16
+        regs.ctrl = 1
+        uart
+    """
+
+// Whether a program exists to be run: `--version` rather than a PATH lookup, because a name that
+// will not start is the failure this is meant to catch (Homebrew's `lld` has done exactly that,
+// installed and broken against a newer LLVM).
+private qemu_present(program: string) -> bool = capture(program, ["--version"], "", [], true, 10000) match
+    Ok(o) -> o.status.ok()
+    Err(_) -> false
+
+// The boot files' directory, from `compiler/`.
+private qemu_files() -> string
+    val dir = absolute_path("../testdata/qemu")
+
+    if !is_directory(dir) then skip(s"the board files are not at '$dir'")
+
+    dir
+end qemu_files
+
+// One tool run; `Err` carries what it said.
+private qemu_tool(program: string, args: Buf[string], what: string) -> Result[unit, string] =
+    capture(program, args.view(), "", [], true, 120000) match
+        Err(_) -> Err(s"$what: '$program' could not be started")
+        Ok(o) -> if o.status.ok() then Ok(()) else Err(s"$what:\n${o.text}${o.err.unwrap_or("")}")
+
+// The library's own C compiled for `t` and ARCHIVED, which is what a real link is handed. An archive
+// member is pulled in only to resolve a symbol something left undefined, so a program that calls into
+// the Unicode database pays for its tables and every other program links exactly what it did before
+// -- where naming the objects outright put 330 KB of tables into every image and overflowed the
+// micro:bit's flash. `None` where the library carries no C for this machine.
+private qemu_library_c(cc: string, t: Target, dir: string) -> Result[Option[string], string]
+    val root = std_root().map_err((why) -> s"the standard module's source: $why")?
+
+    val sources = c_sources(root, Some(t.os)) match
+        Err(e) -> return Err(e.message)
+        Ok(cs) -> cs
+
+    if sources.is_empty() then return Ok(None)
+
+    var objects: Buf[string] = buf()
+
+    for i in 0..<sources.len()
+        val obj = s"$dir/lib$i.o"
+
+        compile_c(cc, sources.at(i), obj, t, DefaultOptimization, no_probe())?
+        objects.push(obj)
+
+    val ar = find_ar(None)?
+    val out = s"$dir/library.a"
+
+    archive(ar, objects, out)?
+    Ok(Some(out))
+end qemu_library_c
+
+/** Builds `files` -- `(path, text)` pairs, relative to a fresh project root -- for `b`, boots it, and
+ * answers with how the emulator ended and what it printed. `Err` is a program that did not build,
+ * carrying the compiler's or the toolchain's own message and the program.
+ *
+ * The program is compiled with the standard module's source lowered into it, pruned to what it
+ * reaches, and the library's C beside it as an archive -- the arrangement a board build has, with no
+ * prebuilt artifact whose every member a link would have to satisfy. The startup is assembled by the
+ * same clang for the same triple; the link is `-nostdlib` (a bare board has no libc, and asking for
+ * one finds the host's) and `-fuse-ld=lld` (these are ELF images). The archive goes last, after
+ * everything that might leave one of its symbols undefined.
+ *
+ * **QEMU has no wall-clock limit of its own**, and a program that never reaches the exit device runs
+ * until something kills it, so the emulator runs under a `seconds` timeout: a hung guest is a
+ * `TimedOut` status, not a hung suite. `SYSL_QEMU_KEEP=<dir>` copies each linked image there before it
+ * is discarded, which is the only way to disassemble a board program that misbehaved.
+ */
+qemu_boot(b: QemuBoard, files: Buf[(string, string)], seconds: int = 20) -> Result[QemuRun, string]
+    val t = target_named(b.target).unwrap()
+
+    val cc = find_clang(t, None) match
+        Err(why) -> skip(s"no clang here has a back end for ${t.name}: $why")
+        Ok(found) -> found
+
+    if !qemu_present(b.qemu) then skip(s"${b.qemu} is not installed, so ${b.name} cannot be booted")
+
+    if !qemu_present("ld.lld") then skip(s"ld.lld is not installed, so a ${t.name} image cannot be linked")
+
+    val boot = qemu_files()
+    val dir = make_temp_dir("sysl-qmu").unwrap()
+    val made = qemu_built(b, t, cc, boot, dir, files, seconds)
+
+    remove_dir_all(dir).unwrap_or(())
+    made
+end qemu_boot
+
+private qemu_built(b: QemuBoard, t: Target, cc: string, boot: string, dir: string,
+                   files: Buf[(string, string)], seconds: int) -> Result[QemuRun, string]
+    val root = s"$dir/program"
+    var shown = ""
+
+    for i in 0..<files.len()
+        val file = files.at(i)
+        val at = s"$root/${file.0}"
+
+        make_dir_all(parent_of(at).unwrap_or(root)).unwrap()
+        write_text(at, file.1).unwrap()
+        shown = s"$shown---- ${file.0}\n${file.1}\n"
+    end for
+
+    val emitted = emit_llvm_text(root, Some(t.name), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) ->
+            return Err(s"did not compile for ${t.name}:\n${failure_text(why)}\n\nthe program was:\n$shown")
+        Ok(e) -> e
+
+    if !emitted.report.is_empty()
+        return Err(s"did not compile for ${t.name}:\n${analysis_report(emitted.report)}\n\n" +
+                   s"the program was:\n$shown")
+
+    val prog = s"$dir/program.o"
+    val start = s"$dir/start.o"
+    val bsp = s"$dir/bsp.o"
+    val image = s"$dir/image.elf"
+    val triple = s"--target=${t.triple}"
+
+    compile_object(cc, emitted.text, prog, t, DefaultOptimization)
+        .map_err((why) -> s"compiling the module for ${t.triple}: $why")?
+
+    qemu_tool(cc, qemu_words([triple, "-c", s"$boot/${b.startup}", "-o", start]),
+              s"assembling ${b.startup}")?
+
+    // `-ffreestanding` is what makes it legal to define `putchar` and `malloc`; `-Os` because the
+    // arena and the UART are the whole file and none of it is hot.
+    qemu_tool(cc, qemu_words([triple, "-ffreestanding", "-Os", "-c", s"$boot/${b.bsp}", "-o", bsp]),
+              s"compiling ${b.bsp}")?
+
+    val library = qemu_library_c(cc, t, dir)?
+
+    var link = qemu_words([triple, "-nostdlib", "-fuse-ld=lld", "-T", s"$boot/${b.script}", start, prog,
+                           bsp])
+
+    library match
+        Some(a) -> link.push(a)
+        None -> ()
+
+    link.push("-o")
+    link.push(image)
+
+    qemu_tool(cc, link, "linking the image")?
+
+    val kept = env_var("SYSL_QEMU_KEEP")
+
+    if kept.is_some()
+        val copy = s"${kept.unwrap()}/${b.name}-${basename(dir)}.elf"
+
+        if capture("cp", [image, copy]).is_ok() then print(s"[qemu] kept $copy")
+
+    var args = b.machine.copy()
+
+    args.push(image)
+
+    capture(b.qemu, args.view(), "", [], true, seconds * 1000) match
+        Err(_) -> Err(s"'${b.qemu}' could not be started")
+        Ok(o) -> Ok(QemuRun(o.status, o.text + o.err.unwrap_or("")))
+end qemu_built
+
+// The status a run ended with, as a number: the exit code, or -1 for a run that was stopped -- by a
+// signal, or by outlasting its timeout.
+qemu_code(r: QemuRun) -> int = r.status match
+    Exited(c) -> c
+    Signalled(_) -> -1
+    TimedOut -> -1
+
+// A one-line account of a run, for an assertion's message.
+qemu_said(b: QemuBoard, r: QemuRun) -> string
+    val how = r.status match
+        Exited(c) -> s"exited $c"
+        Signalled(n) -> s"killed by signal $n"
+        TimedOut -> "timed out"
+
+    s"${b.name} (${b.target}) $how -- the board said: '${r.out}'"
+end qemu_said
