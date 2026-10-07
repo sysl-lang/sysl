@@ -1353,7 +1353,7 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
     var generic: Buf[bool] = buf()
 
     for i in 0..<cands.len()
-        val params = member_accepts(cx, rty, base, cands.at(i), args)
+        val params = member_accepts(cx, rty, base, cands.at(i), args, arg_tys)
 
         if params.is_some()
             fits.push(cands.at(i))
@@ -1461,7 +1461,7 @@ end out_of_scope
 // none, so what it may be told apart by stops where they do. A default widens the same count
 // downwards, and for the same reason -- a call may stop where the defaults begin.
 private member_accepts(cx: &Analyzer, rty: Type, base: string, filed: string,
-                       args: Buf[Expr]) -> Option[Buf[Type]]
+                       args: Buf[Expr], arg_tys: Buf[Option[Type]]) -> Option[Buf[Type]]
     val m = member_at(cx.an, base, filed)
 
     if m.is_none() then return None
@@ -1494,11 +1494,24 @@ private member_accepts(cx: &Analyzer, rty: Type, base: string, filed: string,
 
     if !counted then return None
 
+    // **A closure or a trailing block tells no candidate apart, and neither does a reading that was
+    // refused** -- a closure takes its whole shape from the parameter it is read at, so it would fit
+    // every callable candidate it could be read at. It fits none, and a call it alone would have to
+    // settle is reported as not settled rather than handed to whichever one it was read at first.
     for i in 0..<params.len()
-        if i < args.len() && !reads_at(cx, args.at(i), params.at(i)) then return None
+        if i < args.len()
+            if arg_tys.at(i).is_none() || declines(args.at(i)) then return None
+            if !reads_at(cx, args.at(i), params.at(i)) then return None
+        end if
 
     Some(params)
 end member_accepts
+
+// An argument that is a closure or a trailing block, which no implementation is chosen by.
+private declines(e: Expr) -> bool = *e.kind match
+    Lambda(_, _, _) -> true
+    BlockArg(_) -> true
+    _ -> false
 
 // Whether an argument read at a parameter's type comes out at that type with nothing said -- the
 // question a call of one candidate answers for each argument. Every trace of the reading is put back,
