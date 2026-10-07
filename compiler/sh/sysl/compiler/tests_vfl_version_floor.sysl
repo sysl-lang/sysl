@@ -76,6 +76,95 @@ vfl_the_refusal_reaches_the_command_line()
                      "newer, while the compiler in hand is 0.1.0-alpha.1")
     remove_dir_all(root).unwrap_or(())
 
+// -- a floor that names a pre-release -----------------------------------------------------------
+
+private vfl_floor_refused(floor: string) -> string =
+    read_manifest(s"package { name = \"app\", sysl = \"$floor\" }\n") match
+        Err(why) -> why
+        Ok(_) -> "(read)"
+
+@test("a manifest's floor may name a pre-release")
+vfl_a_floor_may_be_a_pre_release()
+    assert_eq(vfl_floor_refused("0.1.0-alpha.1"), "(read)")
+    assert_eq(read_manifest("package { name = \"app\", sysl = \"0.1.0-alpha.1\" }\n").unwrap().floor,
+              "0.1.0-alpha.1")
+    assert_eq(vfl_floor_refused("1.0.0-x-y.0.rc-2"), "(read)")
+
+@test("pre-release floors order by semver: alpha.1, alpha.2, beta.1, then the release")
+vfl_pre_release_floors_order()
+    assert(older("0.1.0-alpha.1", "0.1.0-alpha.2"), "alpha.1 before alpha.2")
+    assert(older("0.1.0-alpha.2", "0.1.0-beta.1"), "alpha.2 before beta.1")
+    assert(older("0.1.0-beta.1", "0.1.0"), "beta.1 before the release")
+    assert(older("0.1.0-9", "0.1.0-10"), "numbers by value")
+    assert(older("0.1.0-10", "0.1.0-a"), "a number below a word")
+
+@test("an alpha compiler is held to a later alpha's floor and meets its own")
+vfl_an_alpha_against_alpha_floors()
+    pin_compiler_version(Some("0.1.0-alpha.1"))
+    defer pin_compiler_version(None)
+
+    assert_eq(root_floor_refusal("0.1.0-alpha.2").unwrap_or("(nothing)"),
+              "this project cannot be built because it requires sysl 0.1.0-alpha.2 or newer, while the " +
+              "compiler in hand is 0.1.0-alpha.1")
+    assert(root_floor_refusal("0.1.0-alpha.1").is_none(), "its own number is met")
+    assert(root_floor_refusal("0.1.0-alpha.0").is_none(), "an earlier alpha is met")
+
+@test("and a project stating the later alpha is refused at the command line")
+vfl_a_later_alpha_floor_at_the_command_line()
+    pin_compiler_version(Some("0.1.0-alpha.1"))
+    defer pin_compiler_version(None)
+
+    val root = make_temp_dir("sysl-vfl-").unwrap()
+
+    write_text(s"$root/package.hocon", "package { name = \"app\", sysl = \"0.1.0-alpha.2\" }\n").unwrap()
+    write_text(s"$root/main.sysl", "print(\"hi\")\n").unwrap()
+
+    val got = vfl_run(["sysl", "build", root, "-o", s"$root/out"])
+
+    assert_eq(got.0, Failed, got.1)
+    assert_eq(got.1, "sysl: error: this project cannot be built because it requires sysl 0.1.0-alpha.2 " +
+                     "or newer, while the compiler in hand is 0.1.0-alpha.1")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a development build makes no claim against a pre-release floor either")
+vfl_a_development_build_and_a_pre_release_floor()
+    pin_compiler_version(Some(DevVersion))
+    defer pin_compiler_version(None)
+
+    assert(root_floor_refusal("0.1.0-alpha.2").is_none(), "no claim")
+
+@test("a pre-release floor is refused where semver refuses it, the field named")
+vfl_a_malformed_pre_release_floor_is_refused()
+    val field = "'package.sysl' names the oldest compiler this package builds with, and "
+
+    assert_eq(vfl_floor_refused("0.1.0-"),
+              field + "'0.1.0-' is not a version — a '-' is followed by a pre-release, as in " +
+              "'0.1.0-alpha.1'")
+    assert_eq(vfl_floor_refused("0.1.0-alpha..1"),
+              field + "'0.1.0-alpha..1' is not a version — a pre-release is identifiers separated by " +
+              "single dots, as in '0.1.0-alpha.1'")
+    assert_eq(vfl_floor_refused("0.1.0-alpha."),
+              field + "'0.1.0-alpha.' is not a version — a pre-release is identifiers separated by " +
+              "single dots, as in '0.1.0-alpha.1'")
+    assert_eq(vfl_floor_refused("0.1.0-01"),
+              field + "'0.1.0-01' is not a version — a numeric pre-release identifier has no leading " +
+              "zero, as in '0.1.0-1'")
+    assert_eq(vfl_floor_refused("0.1.0-alpha_1"),
+              field + "'0.1.0-alpha_1' is not a version — a pre-release identifier is letters, digits " +
+              "and '-', as in '0.1.0-alpha.1'")
+    assert_eq(vfl_floor_refused("0.1.0+build"),
+              field + "'0.1.0+build' is not a version — a version is three numbers, as in '1.4.2'")
+    assert_eq(vfl_floor_refused("0.1-alpha.1"),
+              field + "'0.1-alpha.1' is not a version — a version is three numbers, as in '1.4.2'")
+
+@test("a dependency's version stays three numbers: a pre-release there is still refused")
+vfl_a_dependency_version_stays_a_release()
+    val said = release_of("0.1.0-alpha.1") match
+        Err(why) -> why
+        Ok(_) -> "(read)"
+
+    assert_eq(said, "'0.1.0-alpha.1' is not a version — a version is three numbers, as in '1.4.2'")
+
 @test("a development build checks no floor at all")
 vfl_a_development_build_checks_nothing()
     pin_compiler_version(Some(DevVersion))

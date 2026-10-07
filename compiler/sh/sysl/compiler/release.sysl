@@ -1,6 +1,6 @@
 module sh.sysl.compiler
 
-import sysl.text.split
+import sysl.text.{split, Search}
 
 // A version, as a package states one: semver, three numbers, and nothing else.
 //
@@ -95,3 +95,58 @@ end release_number
 
 private not_a_version(text: string) -> string =
     s"'$text' is not a version — a version is three numbers, as in '1.4.2'"
+
+// **A compiler floor, which unlike a package's version may name a pre-release** -- the compiler's
+// own releases begin at `0.1.0-alpha.1`, and a package needing something an alpha added has to be
+// able to say so. A floor is only ever compared, never selected between, so semver's pre-release
+// order (`manifest.sysl`'s `older`) is all it needs; a dependency's version, which version selection
+// takes a maximum over, stays three numbers.
+//
+// So semver 2.0's spelling, `MAJOR.MINOR.PATCH-<identifiers>`: the three numbers as `release_of`
+// reads them, then identifiers separated by single dots, each made of letters, digits and `-`, and a
+// numeric one without a leading zero. A `+build` suffix is not taken.
+floor_of(text: string) -> Result[unit, string]
+    val dash = text.index_of("-")
+    val core = if dash.is_some() then text[0..<dash.unwrap()] else text
+
+    if release_of(core).is_err() then return Err(not_a_version(text))
+
+    dash match
+        None -> Ok(())
+        Some(at) -> pre_release_refusal(text, text[(at + 1)..<text.bytes.len])
+end floor_of
+
+// What is wrong with the part of a floor after its `-`, or nothing.
+private pre_release_refusal(text: string, pre: string) -> Result[unit, string]
+    if pre.bytes.len == 0
+        return Err(s"'$text' is not a version — a '-' is followed by a pre-release, as in " +
+                   "'0.1.0-alpha.1'")
+
+    val fields = split(pre, ".")
+
+    for i in 0..<fields.len
+        val field = fields[i]
+
+        if field.bytes.len == 0
+            return Err(s"'$text' is not a version — a pre-release is identifiers separated by single " +
+                       "dots, as in '0.1.0-alpha.1'")
+
+        var numeric = true
+
+        for j in 0..<field.bytes.len
+            val c = field.bytes[j]
+            val digit = c >= u8('0') && c <= u8('9')
+            val letter = (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z'))
+
+            if !digit && !letter && c != u8('-')
+                return Err(s"'$text' is not a version — a pre-release identifier is letters, digits " +
+                           "and '-', as in '0.1.0-alpha.1'")
+
+            if !digit then numeric = false
+
+        if numeric && field.bytes.len > 1 && field.bytes[0] == u8('0')
+            return Err(s"'$text' is not a version — a numeric pre-release identifier has no leading " +
+                       "zero, as in '0.1.0-1'")
+
+    Ok(())
+end pre_release_refusal
