@@ -544,9 +544,14 @@ end typed_compilation
 //
 // **The level decides which standard-module archive is resolved** -- the text declares the same
 // symbols at every level, but the archive a later link takes them from is the level's own.
+//
+// `against` names the library functions to declare rather than define, in place of the archive's
+// own list: a caller holding a library half it built itself (`std_library_half`) compiles a program
+// against that half exactly as a build compiles one against the artifact, with nothing looked up.
 emit_llvm_text(path: string, named_target: Option[string],
                level: string = DefaultOptimization,
-               also_auto_imported: Buf[string] = buf()) -> Result[Emitted, Failure]
+               also_auto_imported: Buf[string] = buf(),
+               against: Option[Buf[string]] = None) -> Result[Emitted, Failure]
     val t = target_for(path, named_target)?
     val program = packaged_compilation_of(path, t)?
     val done = analyze_bodies(program.units, program.target, also_auto_imported)
@@ -579,10 +584,13 @@ emit_llvm_text(path: string, named_target: Option[string],
     // library's bodies are lowered here while its C is compiled beside the program's.
     var linked = StdArtifact(buf(), "")
 
-    std_linked(t, level, !t.builds_with_clang()) match
-        Err(why) -> return Err(said(Refusal(why)))
-        Ok(Some(found)) -> linked = found
-        Ok(None) -> ()
+    against match
+        Some(names) -> linked = StdArtifact(names, "")
+        None ->
+            std_linked(t, level, !t.builds_with_clang()) match
+                Err(why) -> return Err(said(Refusal(why)))
+                Ok(Some(found)) -> linked = found
+                Ok(None) -> ()
 
     val lowered = codegen_with_gaps(kept with { precompiled = linked.precompiled }, t, promotions)
 

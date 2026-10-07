@@ -1,0 +1,576 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, split, Search}
+
+// That every target in the registry produces an **object file**, not merely IR text.
+//
+// The other cross-target tests read the emitted module and check what it says, which cannot catch a
+// module that is internally inconsistent -- an `icmp` between an `i64` and a value that is an `i32`
+// on that machine is text like any other, and only something that *verifies* the module says so. So
+// each module goes to a clang with the target's back end and an object has to come back. Nothing here
+// asks whether the program computes the right answer there; that is the QEMU tier's job.
+//
+// The programs are chosen for the shapes whose width is a target's answer rather than a constant: a
+// slice, an index and its bounds check, a `usize` local, a heap value, a foreign call taking an
+// aggregate, the run-time string helpers, the growable render buffer, and `bf16`.
+//
+// CRAFT is not swept: there is no clang to assemble what it lowers to (its back end is an out-of-tree
+// `llc`), and `x86-linux` is a target this compiler names and does not build for.
+
+private xtb_swept() -> Buf[Target]
+    var out: Buf[Target] = buf()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.supported() && t.builds_with_clang() then out.push(t)
+
+    out
+end xtb_swept
+
+private xtb_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+// A program's LLVM text for `t`, the library lowered from its source beside it -- no machine but
+// this one has an archive here, and nothing is going to link.
+private xtb_emitted(t: Target, text: string) -> Result[string, string]
+    val root = make_temp_dir("sysl-xtb").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", t.name, s"$root/main.sysl"],
+                       (line) -> sink.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+
+    if code != 0 then return Err(s"did not compile for ${t.name}: ${join(said.view(), "\n")}")
+
+    Ok(join(said.view(), "\n"))
+end xtb_emitted
+
+// The text assembled into an object by `cc`, or what clang said.
+private xtb_assembled(cc: string, ir: string, t: Target, level: string) -> Result[unit, string]
+    val root = make_temp_dir("sysl-xtb-obj").unwrap()
+
+    make_dir_all(root).unwrap()
+
+    val said = compile_object(cc, ir, s"$root/p.o", t, level)
+
+    remove_dir_all(root).unwrap_or(())
+    said.map_err((e) -> s"$cc, ${t.triple}: $e")
+end xtb_assembled
+
+// That a step came back with nothing to say, or what it said.
+private xtb_ok(r: Result[unit, string]) = r match
+    Ok(_) -> ()
+    Err(why) -> assert(false, why)
+
+// The sweep: one program, every target, each verified and assembled by a clang with its back end.
+private xtb_sweep(text: string)
+    if !xtb_ready() then return
+
+    val targets = xtb_swept()
+
+    assert_eq(targets.len(), 20)
+
+    for i in 0..<targets.len()
+        val t = targets.at(i)
+
+        // The back end and not the toolchain: a `.ll` names its own triple and includes no header,
+        // so no sysroot is involved and an Android row needs no NDK.
+        val cc = find_backend_clang(t) match
+            Ok(c) -> c
+            Err(why) ->
+                print(s"skipped ${t.name}: $why")
+                continue
+
+        val ir = xtb_emitted(t, text) match
+            Ok(ir) -> ir
+            Err(why) ->
+                assert(false, why)
+                continue
+
+        xtb_assembled(cc, ir, t, DefaultOptimization) match
+            Ok(_) -> ()
+            Err(why) -> assert(false, why)
+end xtb_sweep
+
+@test("verifies and assembles: a slice and its length")
+xtb_a_slice_and_its_length() = xtb_sweep(raw"""
+    var total: usize = 0
+    add(xs: []const usize)
+        for x in xs
+            total += x
+    add([1, 2, 3])
+    """)
+
+@test("verifies and assembles: an index, and the bounds check around it")
+xtb_an_index_and_its_bounds_check() = xtb_sweep(raw"""
+    pick(xs: []const int, i: usize) -> int
+        xs[i]
+    var got = pick([4, 5, 6], 1)
+    """)
+
+@test("verifies and assembles: a string, which is a view with a usize in it")
+xtb_a_string_view() = xtb_sweep(raw"""
+    var n: usize = 0
+    count(s: string)
+        n = s.len
+    count("hello")
+    """)
+
+@test("verifies and assembles: an aggregate crossing to a C function")
+xtb_an_aggregate_crossing_to_c() = xtb_sweep(raw"""
+    struct Pair
+        a: int
+        b: int
+    extern "take" take(p: Pair) -> int
+    var r = take(Pair(1, 2))
+    """)
+
+// A string that exists at run time rather than as a literal reaches the runtime helpers instead --
+// concatenation, `from_bytes`, the per-width renderers, comparison and the `snprintf` wrappers.
+@test("verifies and assembles: a string built at run time, and the renderers behind it")
+xtb_a_string_built_at_run_time() = xtb_sweep(raw"""
+    import sysl.text.from_utf8_unchecked
+    var greeting = "he" + "llo"
+    var counted = str(greeting.len) + str('!')
+    var padded = f"${greeting}%8s ${greeting.len}%d ${0.5}%6.2f"
+    var same = greeting == "hello"
+    var back = from_utf8_unchecked(greeting.bytes)
+    """)
+
+// `str` of a value that is not a primitive writes itself through its `Display` into a stack slot
+// that grows on the heap: the one sink the compiler writes rather than the library.
+@test("verifies and assembles: a value that renders itself into a growable buffer")
+xtb_a_value_rendering_into_a_buffer() = xtb_sweep(raw"""
+    struct P
+        x: int
+    impl Display for P
+        display(self, w: *Writer, spec: FormatSpec) = str(self.x).display(w, spec)
+    var s = str(P(6))
+    """)
+
+// `bf16` is the one scalar a back end may be unable to convert at all (WebAssembly has no selection
+// for its widening to `float`). It sits in a function of parameters because a body of top-level
+// `var`s folds to constants before the back end sees a conversion.
+@test("verifies and assembles: bf16 arithmetic, its conversions, and a vector of it")
+xtb_bf16_arithmetic() = xtb_sweep(raw"""
+    mix(a: bf16, r: real, n: i64, h: f16, v: <4>bf16) -> bool
+        val b = a * bf16(r) + bf16(n) - bf16(h)
+        b > a && (v * v).sum() > b && i32(b) != 0
+
+    var a: bf16 = 1.5
+    var v: <4>bf16 = [1.0, 2.0, 3.0, 4.0]
+    var ok = mix(a, 0.1, 123456789, 0.25, v)
+    """)
+
+// -- the reaper slot -------------------------------------------------------------------------------
+
+private xtb_reaper_program() -> string = raw"""
+    struct Node
+        v: int
+    var p: &sync Node = Node(1)
+    """
+
+// The symbol-table lines naming the reaper slot, from `nm` over `obj`; None where nm cannot run.
+private xtb_reaper_lines(obj: string) -> Option[Buf[string]]
+    var listed = ""
+
+    capture("nm", [obj], "", [], true) match
+        Ok(r) ->
+            if !r.status.ok() then return None
+            listed = r.text
+        Err(_) -> return None
+
+    var out: Buf[string] = buf()
+    val lines = lines_of(listed)
+
+    for i in 0..<lines.len()
+        if lines.at(i).contains(reaper_slot_symbol()) then out.push(lines.at(i))
+
+    Some(out)
+end xtb_reaper_lines
+
+// `define weak` is what lets a scheduler's port define `__sysl_arc_reaper` and win the link while a
+// program with no scheduler links against the module's own slot. Read out of the symbol table it is
+// the linkage the linker acts on: `W`, a weak DEFINITION -- `w` would be a weak reference and would
+// leave the single-slot default undefined.
+@test("the reaper slot a port may define is weak in the object, not merely in the text")
+xtb_the_reaper_slot_is_weak()
+    if !xtb_ready() then return
+
+    val t = target_named("aarch64-freestanding").unwrap()
+    val cc = find_clang(t, None) match
+        Ok(c) -> c
+        Err(why) ->
+            print(s"skipped: $why")
+            return
+
+    val ir = xtb_emitted(t, xtb_reaper_program()).unwrap()
+    val root = make_temp_dir("sysl-xtb-reaper").unwrap()
+    val obj = s"$root/p.o"
+
+    make_dir_all(root).unwrap()
+    xtb_ok(compile_object(cc, ir, obj, t, DefaultOptimization))
+
+    val lines = xtb_reaper_lines(obj)
+
+    remove_dir_all(root).unwrap_or(())
+
+    lines match
+        None -> print("skipped: nm not available")
+        Some(found) ->
+            assert_eq(found.len(), 1)
+            assert(found.at(0).contains(" W "), found.at(0))
+end xtb_the_reaper_slot_is_weak
+
+// And a port's definition WINS: the module's object and a C object defining the slot outright,
+// merged by a relocatable link, leave one definition and that one strong. A `W` surviving would mean
+// the port's storage was never used -- two tasks sharing a worklist rather than a link error.
+@test("and a port's own definition takes over from it at the link")
+xtb_a_ports_definition_wins()
+    if !xtb_ready() then return
+
+    val t = target_named("aarch64-freestanding").unwrap()
+    val cc = find_clang(t, None) match
+        Ok(c) -> c
+        Err(why) ->
+            print(s"skipped: $why")
+            return
+
+    val ir = xtb_emitted(t, xtb_reaper_program()).unwrap()
+    val root = make_temp_dir("sysl-xtb-port").unwrap()
+
+    make_dir_all(root).unwrap()
+    xtb_ok(compile_object(cc, ir, s"$root/p.o", t, DefaultOptimization))
+
+    // What an RTOS port writes: storage per task, handed back by the symbol the reaper asks.
+    write_text(s"$root/port.c",
+               "struct sysl_arc_reaper { void *head; unsigned char draining; };\n" +
+               "static struct sysl_arc_reaper task;\n" +
+               s"struct sysl_arc_reaper *${reaper_slot_symbol()}(void) { return &task; }\n").unwrap()
+
+    val compiled = capture(cc, [s"--target=${t.triple}", "-c", s"$root/port.c", "-o", s"$root/port.o"],
+                           "", [], true).unwrap()
+
+    assert(compiled.status.ok(), compiled.text)
+
+    val linked = capture("ld.lld", ["-r", s"$root/p.o", s"$root/port.o", "-o", s"$root/merged.o"],
+                         "", [], true)
+
+    val ok = linked match
+        Ok(r) -> r.status.ok()
+        Err(_) -> false
+
+    val lines = if ok then xtb_reaper_lines(s"$root/merged.o") else None
+
+    remove_dir_all(root).unwrap_or(())
+
+    if !ok
+        print("skipped: ld.lld not available")
+        return
+    end if
+
+    lines match
+        None -> print("skipped: nm not available")
+        Some(found) ->
+            assert_eq(found.len(), 1)
+            assert(found.at(0).contains(" T "), found.at(0))
+end xtb_a_ports_definition_wins
+
+// -- Android: position independence ---------------------------------------------------------------
+
+// `objdump -r` over `obj` from the first dumper that names AArch64's relocations. Running is not the
+// test: GNU objdump built for another host opens the ELF, exits 0 and prints `UNKNOWN` for every
+// record. macOS's `/usr/bin/objdump` is llvm-objdump.
+private xtb_relocations(obj: string) -> Option[string]
+    for d in ["llvm-objdump", "objdump", "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+              "/usr/local/opt/llvm/bin/llvm-objdump"]
+        capture(d, ["-r", obj], "", [], true) match
+            Ok(r) -> if r.status.ok() && r.text.contains("R_AARCH64_") then return Some(r.text)
+            Err(_) -> ()
+
+    None
+end xtb_relocations
+
+// The C a package carries holds ordinary preemptible globals, so without `-fPIC` clang refers to one
+// by an absolute page address and the shared link an Android program always ends in refuses it. The
+// assertion is on the relocation rather than on the flag: a reference through the GOT.
+@test("the C a package carries is position-independent for Android, so a .so can link it")
+xtb_carried_c_is_pic_for_android()
+    val t = target_named("aarch64-android").unwrap()
+    val cc = find_backend_clang(t) match
+        Ok(c) -> c
+        Err(why) ->
+            print(s"skipped: $why")
+            return
+
+    val root = make_temp_dir("sysl-xtb-pic").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/c.c", "int carried_global = 7;\nint carried_read(void) { return carried_global; }\n")
+        .unwrap()
+
+    xtb_ok(compile_c(cc, s"$root/c.c", s"$root/c.o", t, DefaultOptimization, no_probe()))
+
+    val listed = xtb_relocations(s"$root/c.o")
+
+    remove_dir_all(root).unwrap_or(())
+
+    listed match
+        None -> print("skipped: no objdump here names AArch64 relocations")
+        Some(text) ->
+            assert(text.contains("R_AARCH64_ADR_GOT_PAGE"), text)
+            assert(!text.contains("R_AARCH64_ADR_PREL_PG_HI21"), text)
+end xtb_carried_c_is_pic_for_android
+
+// The relocation kinds `objdump -r` lists under executable sections.
+private xtb_code_relocations(listed: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var section = ""
+    val lines = lines_of(listed)
+
+    for i in 0..<lines.len()
+        val row = lines.at(i).trim()
+
+        if row.starts_with("RELOCATION RECORDS FOR [")
+            section = row["RELOCATION RECORDS FOR [".len..<row.len]
+        else if section.starts_with(".text")
+            for word in split(row, " ")
+                if word.starts_with("R_AARCH64_") then out.push(word)
+
+    out
+end xtb_code_relocations
+
+// sysl's globals are all private, so not preemptible, and lower to a PC-relative pair against a local
+// section; calls out are `CALL26` through a PLT. So an Android object carries no ABSOLUTE relocation
+// in code. Asked of the object, which is what the linker is handed; the positive half first, so a
+// build emitting no code relocations at all cannot pass by having nothing to be wrong about.
+@test("an Android object carries no absolute relocation in code, so an archive of them links into a .so")
+xtb_android_code_has_no_absolute_relocation()
+    if !xtb_ready() then return
+
+    val t = target_named("aarch64-android").unwrap()
+    val cc = find_backend_clang(t) match
+        Ok(c) -> c
+        Err(why) ->
+            print(s"skipped: $why")
+            return
+
+    val ir = xtb_emitted(t, raw"""
+        var total: int = 0
+        bump(n: int)
+            total += n
+        bump(2)
+        print("total is " + str(total))
+        """).unwrap()
+
+    val root = make_temp_dir("sysl-xtb-android").unwrap()
+
+    make_dir_all(root).unwrap()
+    xtb_ok(compile_object(cc, ir, s"$root/p.o", t, DefaultOptimization))
+
+    val listed = xtb_relocations(s"$root/p.o")
+
+    remove_dir_all(root).unwrap_or(())
+
+    val text = listed match
+        None ->
+            print("skipped: no objdump here names AArch64 relocations")
+            return
+        Some(text) -> text
+
+    val code = xtb_code_relocations(text)
+
+    assert(!code.is_empty(), text)
+    assert(holds_string(code, "R_AARCH64_ADR_PREL_PG_HI21"), text)
+    assert(!holds_string(code, "R_AARCH64_ABS64") && !holds_string(code, "R_AARCH64_ABS32"), text)
+end xtb_android_code_has_no_absolute_relocation
+
+// -- the whole standard library, and a program touching every main area, for every target --------
+//
+// A program brings in only the part of the library it reaches, so nothing above compiles the WHOLE
+// library for any machine but this one, and a body no program reached could stop a target's build
+// outright (every `Float for bf16` body once failed instruction selection on WebAssembly). Each
+// target's object half is built ONCE -- what `build-lib --std` compiles, without its C -- and the
+// program is compiled against the functions that half advertises, which is how a build uses the
+// artifact. Everything is assembled at `-O0`: the question is whether the back end can select every
+// instruction. The program computes inside functions of their parameters, so nothing folds away
+// before instruction selection.
+
+private xtb_smoke() -> string = raw"""
+    import sysl.buf.*
+
+    struct Point
+        x: int
+        y: int
+
+        sum(self) -> int = self.x + self.y
+
+    enum Shape
+        Circle(r: real)
+        Square(side: real)
+
+    area(s: Shape) -> real =
+        s match
+            Circle(r) -> 3.0 * r * r
+            Square(a) -> a * a
+
+    trait Named
+        name(self) -> string
+
+    impl Named for Point
+        name(self) -> string = f"(${self.x}, ${self.y})"
+
+    largest[T: Ord](a: T, b: T) -> T = if a > b then a else b
+
+    half(n: int) -> Result[int, string] =
+        if n % 2 == 0 then Ok(n / 2) else Err(f"${n} is odd")
+
+    quarter(n: int) -> Result[int, string] = Ok(half(half(n)?)?)
+
+    val p = Point(3, 4)
+    val k = 10
+    val scale = (n: int) -> n * k
+
+    var b: &Buf[int] = buf()
+    for i in 0..<4 do b.push(scale(i))
+
+    val q = quarter(12) match
+        Ok(v) -> v
+        Err(_) -> -1
+    val odd = quarter(6) match
+        Ok(_) -> "even"
+        Err(e) -> e
+
+    print(f"${p.name()} ${p.sum()} ${largest(7, 9)} ${b.at(3)} ${area(Square(1.5))} ${q} ${odd}")
+    """
+
+// One target's row: why it could not be asked ("" where it could), then what the library's object
+// and the program's said ("" for an object that came back).
+struct XtbRow
+    target: string
+    absent: string
+    library: string
+    program: string
+end XtbRow
+
+private var xtb_rows_built: bool = false
+private var xtb_rows: Buf[XtbRow] = buf()
+
+private xtb_row_for(t: Target) -> XtbRow
+    val cc = find_backend_clang(t) match
+        Ok(c) -> c
+        Err(why) -> return XtbRow(t.name, why, "", "")
+
+    val half = std_library_half(t) match
+        Ok(h) -> h
+        Err(why) -> return XtbRow(t.name, "", s"the library did not compile: $why", "no library to build on")
+
+    val library = xtb_assembled(cc, half.text, t, "0") match
+        Ok(_) -> ""
+        Err(why) -> why
+
+    val root = make_temp_dir("sysl-xtb-smoke").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, xtb_smoke()).unwrap()
+
+    val emitted = emit_llvm_text(src, Some(t.name), "0", buf(), Some(half.advertised))
+
+    remove_dir_all(root).unwrap_or(())
+
+    val program = emitted match
+        Err(why) -> failure_text(why)
+        Ok(made) ->
+            if !made.report.is_empty() then analysis_report(made.report)
+            else xtb_assembled(cc, made.text, t, "0") match
+                Ok(_) -> ""
+                Err(why) -> why
+
+    XtbRow(t.name, "", library, program)
+end xtb_row_for
+
+// Every swept target's row, built the first time a case asks and one target after another.
+private xtb_std_rows() -> Buf[XtbRow]
+    if !xtb_rows_built
+        val targets = xtb_swept()
+
+        for i in 0..<targets.len()
+            xtb_rows.push(xtb_row_for(targets.at(i)))
+
+        xtb_rows_built = true
+    end if
+
+    xtb_rows
+end xtb_std_rows
+
+@test("assembles to an object")
+xtb_the_standard_library_assembles_for_every_target()
+    if !xtb_ready() then return
+
+    val rows = xtb_std_rows()
+
+    assert_eq(rows.len(), 20)
+
+    for i in 0..<rows.len()
+        val r = rows.at(i)
+
+        if r.absent != "" then print(s"skipped ${r.target}: ${r.absent}")
+        else assert(r.library == "", s"${r.target}: ${r.library}")
+end xtb_the_standard_library_assembles_for_every_target
+
+@test("and a program touching every main area of the language assembles against it")
+xtb_a_program_assembles_against_it_for_every_target()
+    if !xtb_ready() then return
+
+    val rows = xtb_std_rows()
+
+    for i in 0..<rows.len()
+        val r = rows.at(i)
+
+        if r.absent != "" then print(s"skipped ${r.target}: ${r.absent}")
+        else assert(r.program == "", s"${r.target}: ${r.program}")
+end xtb_a_program_assembles_against_it_for_every_target
+
+// Running is asserted only where a runner costs nothing -- this machine.
+@test("the same program, run on this machine, prints what it computed")
+xtb_the_program_runs_here()
+    if !xtb_ready() then return
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return
+    end if
+
+    val root = make_temp_dir("sysl-xtb-run").unwrap()
+    val exe = s"$root/built"
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", xtb_smoke()).unwrap()
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    val out = built match
+        Err(why) -> failure_text(why)
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Err(_) -> "the program that was built could not be run"
+            Ok(r) -> r.text
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(out, "(3, 4) 7 9 30 2.25 3 3 is odd\n")
+end xtb_the_program_runs_here
