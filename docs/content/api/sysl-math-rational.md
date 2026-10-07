@@ -43,7 +43,7 @@ fraction**, which is the shortcut that rounds twice.
 
 ## Index
 
-[`abs`](#abs) [`add`](#add) [`ceil`](#ceil) [`cmp`](#cmp) [`cmp_real`](#cmp_real) [`div`](#div) [`eq_real`](#eq_real) [`floor`](#floor) [`from_big`](#from_big) [`from_int`](#from_int) [`from_real`](#from_real) [`gt_real`](#gt_real) [`lt_real`](#lt_real) [`mul`](#mul) [`negate`](#negate) [`of`](#of) [`one`](#one) [`ratio`](#ratio) [`sub`](#sub) [`to_real`](#to_real) [`to_string`](#to_string) [`trunc`](#trunc) [`zero`](#zero) [`Rational`](#rational) [Add for Rational](#add-for-rational) [Display for Rational](#display-for-rational) [Div for Rational](#div-for-rational) [Eq for Rational](#eq-for-rational) [From for Rational](#from-for-rational) [From for Rational](#from-for-rational-1) [Hash for Rational](#hash-for-rational) [Mul for Rational](#mul-for-rational) [Neg for Rational](#neg-for-rational) [Ord for Rational](#ord-for-rational) [Sub for Rational](#sub-for-rational)
+[`abs`](#abs) [`add`](#add) [`ceil`](#ceil) [`checked_of`](#checked_of) [`cmp`](#cmp) [`cmp_real`](#cmp_real) [`div`](#div) [`eq_real`](#eq_real) [`floor`](#floor) [`from_big`](#from_big) [`from_int`](#from_int) [`from_real`](#from_real) [`gt_real`](#gt_real) [`lt_real`](#lt_real) [`mul`](#mul) [`negate`](#negate) [`of`](#of) [`one`](#one) [`ratio`](#ratio) [`sub`](#sub) [`to_real`](#to_real) [`to_string`](#to_string) [`trunc`](#trunc) [`zero`](#zero) [`Rational`](#rational) [Add for Rational](#add-for-rational) [Display for Rational](#display-for-rational) [Div for Rational](#div-for-rational) [Eq for Rational](#eq-for-rational) [From for Rational](#from-for-rational) [From for Rational](#from-for-rational-1) [Hash for Rational](#hash-for-rational) [Mul for Rational](#mul-for-rational) [Neg for Rational](#neg-for-rational) [Ord for Rational](#ord-for-rational) [Sub for Rational](#sub-for-rational)
 
 ## Functions
 
@@ -70,6 +70,15 @@ ceil(x: Rational) -> BigInt
 ```
 
 The least integer not below `x`: `ceil(-7/2)` is `-3`, `ceil(7/2)` is `4`.
+
+### `checked_of`
+
+```sysl
+checked_of(num: BigInt, den: BigInt) -> Option[Rational]
+```
+
+`num / den` in lowest terms as `of` builds it, or `None` where `den` is zero -- the constructor
+for a caller that cannot rule out a zero denominator and would rather branch than trap.
 
 ### `cmp`
 

@@ -40,7 +40,21 @@ says which type it came from.
 `from_int` and `from_big` take a whole number, and `From[long]` and `From[BigInt]` are implemented.
 **A zero denominator traps**, and so does division by zero, as both do for a `BigInt` and for a
 machine integer: the mistake is the same one and the language's answer for it is the same answer. A
-caller that cannot rule out a zero divisor checks for one.
+caller that cannot rule out a zero denominator builds with `checked_of`, which answers `None` for one
+and otherwise exactly what `of` does:
+
+```sysl
+import sysl.math.bigint.from_int
+import sysl.math.rational.{checked_of, to_string}
+
+print(checked_of(from_int(1), from_int(0)).is_none())
+print(to_string(checked_of(from_int(6), from_int(-4)).unwrap()))
+```
+
+```output
+true
+-3/2
+```
 
 **Every operation reduces its result**, which is Euclid's algorithm over `BigInt`s and most of the
 cost of a sum. Without it a running sum of fractions grows its denominator without bound even when
