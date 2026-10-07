@@ -532,10 +532,12 @@ private parse_if_expr(p: *Parser, at: Span) -> Expr
     val then_body = parse_body(p, "then")
     var conds: Buf[Expr] = buf()
     var bodies: Buf[Buf[Stmt]] = buf()
+    var elifs: Buf[Span] = buf()
 
     loop
         if !accept_on_next_line_kw(p, "elif") then break
 
+        elifs.push(p.just_taken())
         conds.push(parse_expr(p))
         bodies.push(parse_body(p, "then"))
 
@@ -546,7 +548,8 @@ private parse_if_expr(p: *Parser, at: Span) -> Expr
 
     accept_end_marker(p, "if")
 
-    // Each `elif` is an `if` in the `else` of the one before it, built from the last one back.
+    // Each `elif` is an `if` in the `else` of the one before it, built from the last one back, and it
+    // stands where its `elif` was written.
     var i = conds.len()
 
     loop
@@ -555,7 +558,7 @@ private parse_if_expr(p: *Parser, at: Span) -> Expr
         i -= 1
 
         var wrapped: Buf[Stmt] = buf()
-        val inner = expr(at.to(p.just_taken()), IfExpr(conds.at(i), bodies.at(i), else_body))
+        val inner = expr(elifs.at(i).to(p.just_taken()), IfExpr(conds.at(i), bodies.at(i), else_body))
 
         wrapped.push(stmt(inner.span, ExprStmt(inner)))
         else_body = Some(wrapped)

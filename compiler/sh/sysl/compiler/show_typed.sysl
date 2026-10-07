@@ -20,10 +20,23 @@ import sysl.text.{str_builder, StrBuilder}
 
 // One function, as the `funcs:` section of `sysl emit-typed --no-spans` writes it: a `- ` item at
 // four spaces, with everything under it.
+//
+// With spans on, the function's header and every expression in it carry where they were written, as
+// `line:col-line:col` in the file the body came from; a function nothing wrote has no file and
+// carries none.
 show_typed_func(f: TFunc) -> string
     var out = str_builder()
+    val placed = if typed_spans_on then f.src else None
+    val outer = typed_spans_in
 
-    out.push("    - TFunc\n")
+    typed_spans_in = placed
+    out.push("    - TFunc")
+
+    placed match
+        Some(src) -> out.push(span_text(src, f.span))
+        None -> ()
+
+    out.push("\n")
     scalar_field(&out, "        ", "name", quoted_text(f.name))
     pair_list(&out, "        ", "params", f.params)
     scalar_field(&out, "        ", "retTy", type_show(f.ret_ty))
@@ -52,6 +65,7 @@ show_typed_func(f: TFunc) -> string
     // function has to read exactly as it does there.
     if f.const_fn then scalar_field(&out, "        ", "const", flag(true))
 
+    typed_spans_in = outer
     out.finish()
 end show_typed_func
 
@@ -573,9 +587,50 @@ end type_list
 
 // -- one node ---------------------------------------------------------------------------------------
 
-// A typed expression, written out. The header line's tag has already been positioned by the caller;
-// what this writes is that tag, a newline, and every field two spaces deeper.
+// A typed expression, written out, with its span after the tag where spans are being printed: the
+// node is written apart and the span spliced in front of the first line's newline, so every arm
+// below writes its tag the one way whether spans are on or off.
 private expr_node(out: *StrBuilder, indent: string, e: TExpr)
+    typed_spans_in match
+        None -> expr_node_bare(out, indent, e)
+        Some(src) ->
+            var one = str_builder()
+
+            expr_node_bare(&one, indent, e)
+
+            val text = one.finish()
+            val line = first_line_of(text)
+
+            out.push(line)
+            out.push(span_text(src, e.span))
+            out.push(text[line.len..<text.len])
+end expr_node
+
+// ` line:col-line:col`, the end being where the node stops -- the space in front included.
+private span_text(src: Source, at: Span) -> string
+    val a = src.locate(at.start)
+    val b = src.locate(at.end)
+
+    s" ${a.line}:${a.col}-${b.line}:${b.col}"
+end span_text
+
+// What spans are placed in while a function is printed with them: the file its body was written in.
+// `None` while spans are off, and for a node nothing placed in a file.
+private var typed_spans_in: Option[Source] = None
+
+// Whether spans are printed at all -- the reference's `emit-typed` default, turned off by `--no-spans`.
+private var typed_spans_on: bool = false
+
+// Turns span printing on or off and answers what it was, so a caller puts it back.
+set_typed_spans(on: bool) -> bool
+    val before = typed_spans_on
+
+    typed_spans_on = on
+    before
+end set_typed_spans
+
+// The typed expression's tag and every field two spaces deeper.
+private expr_node_bare(out: *StrBuilder, indent: string, e: TExpr)
     val inner = indent + "  "
 
     *e.kind match

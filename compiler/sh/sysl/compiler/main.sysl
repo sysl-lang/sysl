@@ -78,8 +78,8 @@ run_cli_noted(args: []string, say: string -> unit, note: string -> unit) -> int
     end if
 
     args[1] match
-        "emit-ast" -> emit_ast_command(args, say)
-        "emit-typed" -> emit_typed_command(args, say)
+        "emit-ast" -> emit_ast_command(args, say, note)
+        "emit-typed" -> emit_typed_command(args, say, note)
         "emit-llvm" -> emit_llvm_command(args, say)
         "build" -> build_command(args, say)
         "build-lib" -> build_lib_command(args, say)
@@ -103,8 +103,9 @@ run_cli_noted(args: []string, say: string -> unit, note: string -> unit) -> int
 // **It exists so that two compilers can be diffed rather than compared by hand.** The reference
 // compiler answers the same command line with the same tree in the same notation, so agreement
 // between them is one `diff` over whatever corpus is to hand, and a disagreement names the node.
-// Nothing is analyzed: this stops where the parser does.
-private emit_ast_command(args: []string, say: string -> unit) -> int
+// Nothing is analyzed: this stops where the parser does. A file that does not parse is reported on
+// `note` -- standard error -- so standard output holds a tree or nothing at all.
+private emit_ast_command(args: []string, say: string -> unit, note: string -> unit) -> int
     var spans = true
     var file = ""
     var mistakes: Buf[string] = buf()
@@ -137,7 +138,7 @@ private emit_ast_command(args: []string, say: string -> unit) -> int
             val parsed = parse(source_of(file, text))
 
             if !parsed.ok()
-                say(parse_report(parsed))
+                note(parse_report(parsed))
                 return Failed
 
             // Every node's line ends in a newline of its own, and `say` ends the line it is given,
@@ -156,9 +157,11 @@ private emit_ast_usage() -> string = "usage: sysl emit-ast [--no-spans] <file>"
 // **The path is a program and not a file.** A directory is the project root and everything below it
 // is compiled; a single file is compiled alone, as the root module. Either way the standard module
 // is read from source and analyzed with the program, so a free `print` and an `Option` mean what the
-// library says they mean.
-private emit_typed_command(args: []string, say: string -> unit) -> int
+// library says they mean. A program that does not compile is reported on `note`, standard error, so
+// standard output holds a tree or nothing at all.
+private emit_typed_command(args: []string, say: string -> unit, note: string -> unit) -> int
     var tables = false
+    var spans = true
     var named: Option[string] = None
     var file = ""
     var mistakes: Buf[string] = buf()
@@ -180,10 +183,7 @@ private emit_typed_command(args: []string, say: string -> unit) -> int
         else if args[i] == "--tables"
             tables = true
         else if args[i] == "--no-spans"
-            // The typed tree carries no spans yet, so the flag is taken and changes nothing. It is
-            // accepted rather than refused because the whole point of this command is that two
-            // compilers answer one command line.
-            tables = tables
+            spans = false
         else if args[i] == "--target"
             if i + 1 >= args.len
                 mistakes.push(missing_value(args[i]))
@@ -209,15 +209,15 @@ private emit_typed_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
-    emit_typed_text(file, named, tables) match
+    emit_typed_text_spanned(file, named, tables, spans) match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             Failed
         Ok(emitted) ->
             // An analysis error is reported exactly as any other compiling command reports one,
             // with nothing on standard output.
             if !emitted.report.is_empty()
-                say(analysis_report(emitted.report))
+                note(analysis_report(emitted.report))
                 return Failed
             end if
 

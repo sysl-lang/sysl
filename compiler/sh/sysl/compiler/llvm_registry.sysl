@@ -1,0 +1,193 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **Every name in LLVM's namespace this compiler writes down is declared here, and nowhere else.**
+//
+// An intrinsic or a reserved global is a name a back end that is not LLVM has to supply something
+// for, so the question a port asks first is "which of them are there?" -- and a name written as a
+// literal inside an emitter is one only a search would find. Here each entry is a base name; the
+// emitters complete a base with its operand types (`at`), and `llvm_accounts` says whether a name a
+// module reaches is one of these.
+//
+// A family the language decides the members of -- the overflow checks, the bit operations, the
+// reductions -- is reached through a function that refuses a member the family does not have, so a
+// misspelt operation is an error where it was asked for rather than a call to a function LLVM has
+// never heard of.
+
+// The namespace LLVM reserves, which is the whole of how an intrinsic is told from a linked symbol.
+const LlvmPrefix: string = "llvm."
+
+// One intrinsic, by its base name.
+struct LlvmIntrinsic
+    base: string
+
+    // The name with each overloaded operand's suffix after it, in LLVM's order --
+    // `llvm.fptosi.sat.i32.f64`. A suffix is LLVM's spelling of a type (`f32`, `v4f32`, `p0`), which
+    // is not the type's own text.
+    at(self, types: []const LType) -> string
+        var out = self.base
+
+        for i in 0..<types.len
+            out = out + "." + overload_suffix_of(types[i])
+
+        out
+    end at
+end LlvmIntrinsic
+
+private overload_suffix_of(t: LType) -> string = l_overload_suffix(t) match
+    Some(s) -> s
+    None -> l_render(t)
+
+// -- the entries ------------------------------------------------------------------------------------
+
+// Stops the program: what every failed run-time check ends in.
+llvm_trap_entry() -> LlvmIntrinsic = LlvmIntrinsic("llvm.trap")
+
+// A copy of bytes, which is what a large aggregate's assignment is.
+llvm_memcpy_entry() -> LlvmIntrinsic = LlvmIntrinsic("llvm.memcpy")
+
+// The varargs walk: the three operations a `...` parameter list is made of.
+llvm_va_start_entry() -> LlvmIntrinsic = LlvmIntrinsic("llvm.va_start")
+
+llvm_va_copy_entry() -> LlvmIntrinsic = LlvmIntrinsic("llvm.va_copy")
+
+llvm_va_end_entry() -> LlvmIntrinsic = LlvmIntrinsic("llvm.va_end")
+
+// What a caller is told a postcondition established.
+llvm_assume_entry() -> LlvmIntrinsic = LlvmIntrinsic("llvm.assume")
+
+// The float-to-integer conversions that saturate rather than being poison out of range.
+llvm_fptosi_sat_entry() -> LlvmIntrinsic = LlvmIntrinsic("llvm.fptosi.sat")
+
+llvm_fptoui_sat_entry() -> LlvmIntrinsic = LlvmIntrinsic("llvm.fptoui.sat")
+
+// The arithmetic that reports whether it overflowed: `add`, `sub` or `mul`, either signedness.
+llvm_with_overflow_entry(op: string, signed: bool) -> Result[LlvmIntrinsic, string]
+    if op != "add" && op != "sub" && op != "mul"
+        return Err(s"no overflow-checked '$op' is declared; there are 'add', 'sub' and 'mul'")
+
+    Ok(LlvmIntrinsic(s"llvm.${if signed then "s" else "u"}$op.with.overflow"))
+end llvm_with_overflow_entry
+
+// The bit operations `sysl.math.Bits` lowers to.
+llvm_bits_entry(op: string) -> Result[LlvmIntrinsic, string] =
+    if contains_name(bit_ops(), op) then Ok(LlvmIntrinsic(s"llvm.$op"))
+    else Err(s"no bit operation '$op' is declared")
+
+private bit_ops() -> []const string = ["ctpop", "ctlz", "cttz", "bitreverse", "fshl", "fshr"]
+
+// One vector folded to one lane.
+llvm_reduce_entry(op: string) -> Result[LlvmIntrinsic, string] =
+    if contains_name(reduce_ops(), op) then Ok(LlvmIntrinsic(s"llvm.vector.reduce.$op"))
+    else Err(s"no vector reduction '$op' is declared")
+
+private reduce_ops() -> []const string =
+    ["fadd", "fmin", "fmax", "add", "smin", "smax", "umin", "umax", "and", "or"]
+
+// The saturating integer arithmetic fixed point is made of.
+llvm_sat_entry(op: string) -> Result[LlvmIntrinsic, string] =
+    if contains_name(sat_ops(), op) then Ok(LlvmIntrinsic(s"llvm.$op.sat"))
+    else Err(s"no saturating '$op' is declared")
+
+private sat_ops() -> []const string = ["sadd", "uadd", "ssub", "usub", "sshl", "ushl"]
+
+// The coroutine operations an `async` function is lowered through.
+llvm_coro_entry(op: string) -> Result[LlvmIntrinsic, string] =
+    if contains_name(coro_ops(), op) then Ok(LlvmIntrinsic(s"llvm.coro.$op"))
+    else Err(s"no coroutine operation '$op' is declared")
+
+private coro_ops() -> []const string =
+    ["id", "alloc", "begin", "suspend", "end", "free", "done", "resume", "destroy", "size"]
+
+// The seven float operations the library declares an `extern` for.
+llvm_library_floats() -> []const string =
+    ["llvm.ceil", "llvm.copysign", "llvm.fabs", "llvm.floor", "llvm.round", "llvm.sqrt", "llvm.trunc"]
+
+// -- the reserved globals ---------------------------------------------------------------------------
+
+// The list the platform's loader runs before `main`.
+llvm_global_ctors() -> string = "llvm.global_ctors"
+
+// What keeps a symbol nothing references from being deleted, by the optimizer and the linker both.
+llvm_used() -> string = "llvm.used"
+
+// What keeps it from the optimizer alone.
+llvm_compiler_used() -> string = "llvm.compiler.used"
+
+// The section the two lists above live in.
+llvm_metadata_section() -> string = "llvm.metadata"
+
+// -- the census -------------------------------------------------------------------------------------
+
+// Every callable entry, by base name.
+llvm_callable() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(llvm_trap_entry().base)
+    out.push(llvm_memcpy_entry().base)
+    out.push(llvm_va_start_entry().base)
+    out.push(llvm_va_copy_entry().base)
+    out.push(llvm_va_end_entry().base)
+    out.push(llvm_assume_entry().base)
+    out.push(llvm_fptosi_sat_entry().base)
+    out.push(llvm_fptoui_sat_entry().base)
+
+    val ops = ["add", "sub", "mul"]
+
+    for i in 0..<ops.len
+        out.push(llvm_with_overflow_entry(ops[i], true).unwrap().base)
+        out.push(llvm_with_overflow_entry(ops[i], false).unwrap().base)
+
+    push_family(&out, bit_ops(), "llvm.")
+    push_family(&out, reduce_ops(), "llvm.vector.reduce.")
+    push_family(&out, coro_ops(), "llvm.coro.")
+
+    for i in 0..<sat_ops().len
+        out.push(s"llvm.${sat_ops()[i]}.sat")
+
+    val floats = llvm_library_floats()
+
+    for i in 0..<floats.len
+        out.push(floats[i])
+
+    out
+end llvm_callable
+
+private push_family(out: *Buf[string], ops: []const string, prefix: string)
+    for i in 0..<ops.len
+        out.push(prefix + ops[i])
+end push_family
+
+// Every reserved global, and the section they are placed in.
+llvm_globals() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(llvm_global_ctors())
+    out.push(llvm_used())
+    out.push(llvm_compiler_used())
+    out.push(llvm_metadata_section())
+    out
+end llvm_globals
+
+// Whether `name` is an entry, or an entry's base with an overload suffix after it. A name that only
+// begins with the same letters -- `llvm.sqrtx.f64` -- is not, which is what keeps this from being a
+// substring test.
+llvm_accounts(name: string) -> bool
+    val all = llvm_callable()
+
+    for i in 0..<all.len()
+        val b = all.at(i)
+
+        if name == b || name.starts_with(b + ".") then return true
+
+    contains_name(llvm_globals().view(), name)
+end llvm_accounts
+
+private contains_name(xs: []const string, name: string) -> bool
+    for i in 0..<xs.len
+        if xs[i] == name then return true
+
+    false
+end contains_name
