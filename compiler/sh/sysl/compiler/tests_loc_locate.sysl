@@ -1,0 +1,124 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Resolving a place in a file to the constructs it is inside -- the query an editor makes and no pass
+// of the compiler ever does (`locate.sysl`). The reference's `LocateTests`, whose expected chains are
+// its own assertions: the reference has no command for this, only the function, so there is nothing
+// to run it on but its suite. The assertions are about *which* node comes back rather than about
+// spans, the spans being the diagnostic tests' subject.
+
+private loc_program(name: string, text: string) -> Program
+    val p = parse(source_of(name, text))
+
+    assert(!p.report.has_errors(), "the fixture does not parse")
+    p.program
+end loc_program
+
+// The chain of constructs at a place, by name, which is far easier to read than the nodes.
+private loc_chain(text: string, line: usize, col: usize) -> string =
+    loc_names(locate(loc_program("t.sysl", text), line, col))
+
+private loc_names(cs: Buf[Construct]) -> string
+    var out = ""
+
+    for i in 0..<cs.len()
+        out = if i == 0 then cs.at(i).name else s"$out, ${cs.at(i).name}"
+
+    out
+end loc_names
+
+private const LocSrc: string = "var x = 1 + 2\nprint(alpha)\n"
+
+@test("loc: runs from the statement down to the smallest thing the cursor is in")
+loc_runs_from_the_statement_down() = assert_eq(loc_chain(LocSrc, 1, 9), "VarDecl, Binary, IntLit")
+
+@test("loc: and names the innermost one last, which is what hover wants")
+loc_names_the_innermost_last()
+    val c = innermost(loc_program("t.sysl", LocSrc), 1, 9).unwrap()
+
+    assert_eq(c.name, "IntLit")
+
+    c.node match
+        AtExpr(e) ->
+            *e.kind match
+                IntLit(digits, _, suffix) -> assert_eq(s"$digits/$suffix", "1/")
+                _ -> assert(false, "the innermost construct is not the integer literal")
+        _ -> assert(false, "the innermost construct is not an expression")
+end loc_names_the_innermost_last
+
+@test("loc: is empty where nothing covers the place at all")
+loc_is_empty_where_nothing_covers()
+    assert_eq(loc_chain(LocSrc, 9, 1), "")
+    assert(innermost(loc_program("t.sysl", LocSrc), 9, 1).is_none())
+
+@test("loc: on the callee, where the two agree")
+loc_on_the_callee() = assert_eq(innermost(loc_program("t.sysl", LocSrc), 2, 2).unwrap().name, "Ident")
+
+@test("loc: on the closing bracket, where nothing points a diagnostic and the call still covers it")
+loc_on_the_closing_bracket() = assert_eq(loc_chain(LocSrc, 2, 12), "ExprStmt, Call")
+
+@test("loc: and inside an argument, which is inside the call in turn")
+loc_inside_an_argument() = assert_eq(loc_chain(LocSrc, 2, 8), "ExprStmt, Call, Ident")
+
+// `alpha` occupies columns 7 to 11, so its span ends at 12.
+@test("loc: the last character of a name is inside it")
+loc_the_last_character_is_inside() = assert_eq(loc_chain(LocSrc, 2, 11), "ExprStmt, Call, Ident")
+
+@test("loc: and the place just past it is not")
+loc_just_past_is_not() = assert(!loc_chain(LocSrc, 2, 12).contains("Ident"))
+
+// A type is written where no expression may stand, so a cursor in one reaches a family of node the
+// walk would miss if it only ever descended through expressions.
+@test("loc: a type in a declaration")
+loc_a_type_in_a_declaration() = assert(loc_chain("var x: int = 1\n", 1, 8).contains("NamedType"))
+
+@test("loc: a whole function, from its name to the end of its body")
+loc_a_whole_function() =
+    assert(loc_chain("add(a: int, b: int) -> int =\n    a + b\n", 2, 5).starts_with("FuncDecl, "))
+
+@test("loc: a nested call, whose chain has both calls in it")
+loc_a_nested_call() =
+    assert_eq(loc_chain("add(a: int, b: int) -> int = a + b\nprint(add(1, 2))\n", 2, 11),
+              "ExprStmt, Call, Call, IntLit")
+
+// A literate file's program is lexed with its left margin removed, so the compiler's columns are
+// not the file's. A caller holding the file says so, and this is the arithmetic it does.
+@test("loc: a literate file counts columns without its margin")
+loc_a_literate_file_counts_without_its_margin()
+    val p = loc_program("t.lsysl", "    var x = 1\n")
+    val shift = literate_shift(p.src)
+
+    assert_eq(shift, 4)
+    assert_eq(loc_names(locate(p, 1, 5 - shift)), "VarDecl")
+end loc_a_literate_file_counts_without_its_margin
+
+// -- beyond the reference's cases: one construct from each family the hand-written walk descends
+// into, so a family it stopped reaching shows, and the column counted in characters.
+
+@test("loc: a match arm's pattern, and the literal inside it")
+loc_a_match_arms_pattern() =
+    assert_eq(loc_chain("f(n: int) -> int = n match\n    0 -> 1\n    _ -> 2\n", 2, 5),
+              "FuncDecl, ExprStmt, MatchExpr, MatchArm, LitPattern, IntLit")
+
+@test("loc: a struct's field and its method")
+loc_a_structs_field_and_method()
+    val text = "struct P\n    x: int\n    get(self) -> int = self.x\n"
+
+    assert_eq(loc_chain(text, 2, 5), "StructDecl, Param")
+    assert(loc_chain(text, 3, 5).starts_with("StructDecl, MethodDecl"))
+end loc_a_structs_field_and_method
+
+// A field's span here is its name and a subscript's starts at its `[` -- each an anchor for a
+// diagnostic -- so these two are where reading the extent is the whole difference.
+@test("loc: a field read and a subscript cover their receivers")
+loc_a_field_read_and_a_subscript_cover_their_receivers()
+    assert_eq(loc_chain("print(alpha.beta)\n", 1, 7), "ExprStmt, Call, Field, Ident")
+    assert_eq(loc_chain("print(alpha[0])\n", 1, 7), "ExprStmt, Call, Index, Ident")
+end loc_a_field_read_and_a_subscript_cover_their_receivers
+
+@test("loc: a column counts characters, not bytes")
+loc_a_column_counts_characters() = assert_eq(loc_chain("print(\"éé\", alpha)\n", 1, 13), "ExprStmt, Call, Ident")

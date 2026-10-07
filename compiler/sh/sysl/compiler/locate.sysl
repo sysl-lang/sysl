@@ -1,0 +1,739 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Which constructs a place in a file is inside.
+//
+// This is the question an editor asks and no pass of the compiler ever does: the compiler walks a
+// tree it already has in hand, while an editor has a cursor and has to find the tree. Hover, the
+// expanding selection, "what am I looking at" and the first half of go-to-definition are all this
+// one query -- and it is the seed of `sysl lsp`, which calls it rather than anything on the command
+// line. The reference compiler's `Locate`.
+//
+// **It reads a node's EXTENT** -- from the first character the node was parsed from to just past the
+// last -- which is exactly what a cursor is inside. A node's span in this tree is its extent nearly
+// everywhere, and where it is a diagnostic's anchor instead (a `Field` is its name, a subscript
+// starts at its `[`) the walk widens it over what the node holds (`Walk.close`). The reference keeps
+// the two as two positions and reads the extent for the same reason: a cursor on `xs` in
+// `xs.foo(1)` is inside the selection and the call whether or not it is anywhere near `foo`.
+//
+// **The answer is the nodes themselves, not their spans**, each with the name of the construct it
+// is -- the reference compiler's node names, `VarDecl`, `Call`, `NamedType` -- so a caller matches on
+// `node` for what it wants to read, and on `name` for what it wants to say.
+
+// One construct a place is inside: its span, what it is called, and the node.
+struct Construct
+    span: Span
+    name: string
+    node: Node
+end Construct
+
+// Every kind of positioned thing in the tree. An expression, a statement, a type and a pattern are
+// the four that recur; the rest are the parts of a declaration or a file header that carry a span of
+// their own.
+enum Node
+    AtExpr(e: Expr)
+    AtStmt(s: Stmt)
+    AtType(t: TypeRef)
+    AtPattern(p: Pattern)
+    AtArm(a: MatchArm)
+    AtParam(p: Param)
+    AtLambdaParam(p: LambdaParam)
+    AtWithField(w: WithField)
+    AtMethod(m: MethodDecl)
+    AtBound(b: BoundRef)
+    AtSelector(s: ImportSelector)
+    AtCConst(c: CConstDecl)
+    AtCType(c: CTypeDecl)
+    AtAsmArm(a: AsmArm)
+    AtAsmOperand(o: AsmOperand)
+    AtEnumVariant(v: EnumVariantDecl)
+    AtRangeBound(r: RangeBound)
+    AtAssocDecl(a: AssocDecl)
+    AtAssocBind(a: AssocBind)
+    AtExportAttr(a: ExportAttr)
+    AtTestAttr(a: TestAttr)
+    AtHookAttr(a: HookAttr)
+    AtCallConv(c: CallConv)
+    AtModuleName(m: ModuleName)
+    AtCapability(c: CapabilityClause)
+    AtLink(c: LinkClause)
+    AtInclude(c: IncludeClause)
+end Node
+
+// Every construct covering `line`/`col`, outermost first -- the path from the file down to the
+// smallest thing the place is in. The last is what hover wants; the whole list is what an expanding
+// selection wants.
+//
+// Both are counted from one, as everything that reports a position is, and the column counts
+// characters. They are the program's columns: **a literate file's program was lexed with its margin
+// removed**, so a caller holding the document subtracts `literate_shift(program.src)` first. A line
+// the file does not have is inside nothing; a column past the end of its line is at the line's end,
+// which is inside whatever spans the line break.
+//
+// The end of a span is **exclusive**, as it is everywhere in the compiler, so a place just past the
+// last character of a name is not in it -- which is what keeps two adjacent tokens apart. A caller
+// wanting an editor's more forgiving reading asks again at `col - 1`.
+locate(p: Program, line: usize, col: usize) -> Buf[Construct]
+    place_offset(p.src, line, col) match
+        Some(at) -> locate_offset(p, at)
+        None -> buf()
+end locate
+
+// The smallest construct covering `line`/`col` -- hover's question, and the one a name is read from
+// before asking what it refers to.
+innermost(p: Program, line: usize, col: usize) -> Option[Construct]
+    val all = locate(p, line, col)
+
+    if all.is_empty() then None else Some(all.at(all.len() - 1))
+end innermost
+
+// The same question asked at a byte offset into `p.src`, which is what a caller holding spans
+// already has.
+//
+// **It walks the whole tree per question**, which is right for one file and one cursor and is not an
+// index: a caller answering a hover per mouse-move over a large file builds one from `constructs`
+// rather than calling this in a loop.
+locate_offset(p: Program, at: usize) -> Buf[Construct]
+    val all = constructs(p)
+    var out: Buf[Construct] = buf()
+
+    for i in 0..<all.len()
+        if all.at(i).span.contains(at) then out.push(all.at(i))
+
+    // Outermost first: start ascending, then end descending, which puts a node before everything
+    // nested in it. An insertion sort, so stable -- a statement and the expression that is the whole
+    // of it share one extent and keep the order the walk found them in, enclosing first -- and the
+    // list is a nesting depth long.
+    for i in 1..<out.len()
+        val c = out.at(i)
+        var j = i
+
+        while j > 0 && encloses_first(c.span, out.at(j - 1).span)
+            out.set(j, out.at(j - 1))
+            j -= 1
+
+        out.set(j, c)
+
+    out
+end locate_offset
+
+// Every positioned construct in the file, each before everything inside it -- the walk `locate` is
+// a filter over, and what an index over one file is built from.
+//
+// **The walk is written out over every node of the tree**, there being no reflection to walk a
+// product with as the reference does. What that costs is that a field added to a node is a field
+// this walk has to be told about; `tests_loc_locate.sysl` asserts a construct from each family so a
+// family the walk stopped reaching shows.
+constructs(p: Program) -> Buf[Construct]
+    var w = Walk(buf())
+
+    walk_all(&w, p.body, walk_stmt)
+
+    p.module_name match
+        Some(m) -> w.see(m.span, "ModuleName", AtModuleName(m))
+        None -> ()
+
+    for i in 0..<p.capabilities.len()
+        w.see(p.capabilities.at(i).span, "CapabilityClause", AtCapability(p.capabilities.at(i)))
+
+    for i in 0..<p.links.len()
+        w.see(p.links.at(i).span, "LinkClause", AtLink(p.links.at(i)))
+
+    for i in 0..<p.includes.len()
+        w.see(p.includes.at(i).span, "IncludeClause", AtInclude(p.includes.at(i)))
+
+    w.found
+end constructs
+
+// The byte offset of a line and column of `src`, or nothing where the file has no such line.
+place_offset(src: Source, line: usize, col: usize) -> Option[usize]
+    if line == 0 || col == 0 || line > src.line_count() then return None
+
+    val row = src.line_span(line)
+    var at = row.start
+    var left = col - 1
+
+    // A column counts characters, so a continuation byte of a multi-byte one moves the offset and
+    // not the count.
+    while left > 0 && at < row.end
+        at += 1
+
+        while at < row.end && (src.bytes[at] & 0xC0) == 0x80
+            at += 1
+
+        left -= 1
+
+    Some(at)
+end place_offset
+
+// Whether `a` sorts before `b`: it starts earlier, or starts together and ends later.
+private encloses_first(a: Span, b: Span) -> bool =
+    a.start < b.start || (a.start == b.start && a.end > b.end)
+
+// The constructs met so far, in the order the walk met them.
+private struct Walk
+    found: Buf[Construct]
+
+    see(*self, span: Span, name: string, node: Node) = self.found.push(Construct(span, name, node))
+
+    // Widens the construct met at `first` to cover everything met inside it since, which turns the
+    // span the parser kept into the node's extent. **The two differ where the span is a diagnostic's
+    // anchor**: a `Field` is its name and a subscript starts at its `[` (`parse_expr.sysl`'s
+    // `led_field`, `led_index`), so a cursor on the receiver of `alpha.beta` would otherwise be
+    // inside the receiver and not inside the selection it is the receiver of. An empty span is a
+    // node that was never written, and is not counted.
+    close(*self, first: usize)
+        var lo = self.found.at(first).span.start
+        var hi = self.found.at(first).span.end
+
+        for i in first + 1..<self.found.len()
+            val s = self.found.at(i).span
+
+            if !s.is_empty()
+                if s.start < lo then lo = s.start
+                if s.end > hi then hi = s.end
+
+        var c = self.found.at(first)
+
+        c.span = Span(lo, hi)
+        self.found.set(first, c)
+    end close
+end Walk
+
+private walk_all[T](w: *Walk, xs: Buf[T], each: (*Walk, T) -> unit)
+    for i in 0..<xs.len()
+        each(w, xs.at(i))
+
+private walk_opt[T](w: *Walk, o: Option[T], each: (*Walk, T) -> unit)
+    o match
+        Some(x) -> each(w, x)
+        None -> ()
+
+private walk_opt_all[T](w: *Walk, o: Option[Buf[T]], each: (*Walk, T) -> unit)
+    o match
+        Some(xs) -> walk_all(w, xs, each)
+        None -> ()
+
+// -- expressions -----------------------------------------------------------------------------------
+
+private walk_expr(w: *Walk, e: Expr)
+    val first = w.found.len()
+
+    expr_parts(w, e)
+    w.close(first)
+
+private expr_parts(w: *Walk, e: Expr)
+    val at = e.span
+
+    *e.kind match
+        IntLit(_, _, _) -> w.see(at, "IntLit", AtExpr(e))
+        FloatLit(_, _) -> w.see(at, "FloatLit", AtExpr(e))
+        CharLit(_) -> w.see(at, "CharLit", AtExpr(e))
+        StrLit(_) -> w.see(at, "StrLit", AtExpr(e))
+        CStrLit(_) -> w.see(at, "CStrLit", AtExpr(e))
+        BoolLit(_) -> w.see(at, "BoolLit", AtExpr(e))
+        UnitLit -> w.see(at, "UnitLit", AtExpr(e))
+        NullLit -> w.see(at, "NullLit", AtExpr(e))
+        Ident(_) -> w.see(at, "Ident", AtExpr(e))
+        Unary(_, x) ->
+            w.see(at, "Unary", AtExpr(e))
+            walk_expr(w, x)
+        PreIncDec(_, x) ->
+            w.see(at, "PreIncDec", AtExpr(e))
+            walk_expr(w, x)
+        PostIncDec(_, x) ->
+            w.see(at, "PostIncDec", AtExpr(e))
+            walk_expr(w, x)
+        Binary(_, l, r) ->
+            w.see(at, "Binary", AtExpr(e))
+            walk_expr(w, l)
+            walk_expr(w, r)
+        Compare(xs, _) ->
+            w.see(at, "Compare", AtExpr(e))
+            walk_all(w, xs, walk_expr)
+        RangeExpr(lo, hi, _) ->
+            w.see(at, "RangeExpr", AtExpr(e))
+            walk_opt(w, lo, walk_expr)
+            walk_opt(w, hi, walk_expr)
+        Assign(_, t, v) ->
+            w.see(at, "Assign", AtExpr(e))
+            walk_expr(w, t)
+            walk_expr(w, v)
+        Call(f, args) ->
+            w.see(at, "Call", AtExpr(e))
+            walk_expr(w, f)
+            walk_all(w, args, walk_expr)
+        NamedArg(_, v) ->
+            w.see(at, "NamedArg", AtExpr(e))
+            walk_expr(w, v)
+        Spread(v) ->
+            w.see(at, "Spread", AtExpr(e))
+            walk_expr(w, v)
+        DefaultArg(_, v) ->
+            w.see(at, "DefaultArg", AtExpr(e))
+            walk_expr(w, v)
+        Index(r, i) ->
+            w.see(at, "Index", AtExpr(e))
+            walk_expr(w, r)
+            walk_expr(w, i)
+        Field(r, _) ->
+            w.see(at, "Field", AtExpr(e))
+            walk_expr(w, r)
+        TypeArgs(r, args) ->
+            w.see(at, "TypeArgs", AtExpr(e))
+            walk_expr(w, r)
+            walk_all(w, args, walk_expr)
+        TypeAttr(r, _) ->
+            w.see(at, "TypeAttr", AtExpr(e))
+            walk_expr(w, r)
+        WithExpr(b, fields, _) ->
+            w.see(at, "WithExpr", AtExpr(e))
+            walk_expr(w, b)
+            walk_all(w, fields, walk_with_field)
+        ImplicitMember(_) -> w.see(at, "ImplicitMember", AtExpr(e))
+        LayoutOf(_, t) ->
+            w.see(at, "LayoutOf", AtExpr(e))
+            walk_type(w, t)
+        OffsetOf(t, _) ->
+            w.see(at, "OffsetOf", AtExpr(e))
+            walk_type(w, t)
+        TryExpr(x) ->
+            w.see(at, "TryExpr", AtExpr(e))
+            walk_expr(w, x)
+        AwaitExpr(x) ->
+            w.see(at, "AwaitExpr", AtExpr(e))
+            walk_expr(w, x)
+        Tuple(xs) ->
+            w.see(at, "Tuple", AtExpr(e))
+            walk_all(w, xs, walk_expr)
+        Lambda(ps, body, _) ->
+            w.see(at, "Lambda", AtExpr(e))
+            walk_all(w, ps, walk_lambda_param)
+            walk_all(w, body, walk_stmt)
+        BlockArg(body) ->
+            w.see(at, "BlockArg", AtExpr(e))
+            walk_all(w, body, walk_stmt)
+        ArrayLit(xs) ->
+            w.see(at, "ArrayLit", AtExpr(e))
+            walk_all(w, xs, walk_expr)
+        ArrayFill(v, n) ->
+            w.see(at, "ArrayFill", AtExpr(e))
+            walk_expr(w, v)
+            walk_expr(w, n)
+        Block(body) ->
+            w.see(at, "Block", AtExpr(e))
+            walk_all(w, body, walk_stmt)
+        IfExpr(c, t, f) ->
+            w.see(at, "IfExpr", AtExpr(e))
+            walk_expr(w, c)
+            walk_all(w, t, walk_stmt)
+            walk_opt_all(w, f, walk_stmt)
+        MatchExpr(s, arms) ->
+            w.see(at, "MatchExpr", AtExpr(e))
+            walk_expr(w, s)
+            walk_all(w, arms, walk_arm)
+        IsPattern(s, pats, _) ->
+            w.see(at, "IsPattern", AtExpr(e))
+            walk_expr(w, s)
+            walk_all(w, pats, walk_pattern)
+        ResultList(xs) ->
+            w.see(at, "ResultList", AtExpr(e))
+            walk_all(w, xs, walk_expr)
+        While(_, c, body, f) ->
+            w.see(at, "While", AtExpr(e))
+            walk_expr(w, c)
+            walk_all(w, body, walk_stmt)
+            walk_opt_all(w, f, walk_stmt)
+        DoWhile(_, body, c, f) ->
+            w.see(at, "DoWhile", AtExpr(e))
+            walk_all(w, body, walk_stmt)
+            walk_expr(w, c)
+            walk_opt_all(w, f, walk_stmt)
+        Loop(_, body) ->
+            w.see(at, "Loop", AtExpr(e))
+            walk_all(w, body, walk_stmt)
+        For(_, _, it, body, f) ->
+            w.see(at, "For", AtExpr(e))
+            walk_expr(w, it)
+            walk_all(w, body, walk_stmt)
+            walk_opt_all(w, f, walk_stmt)
+        ConstFor(_, it, body) ->
+            w.see(at, "ConstFor", AtExpr(e))
+            walk_expr(w, it)
+            walk_all(w, body, walk_stmt)
+        CFor(_, init, c, step, body, f) ->
+            w.see(at, "CFor", AtExpr(e))
+            walk_opt(w, init, walk_stmt)
+            walk_opt(w, c, walk_expr)
+            walk_opt(w, step, walk_stmt)
+            walk_all(w, body, walk_stmt)
+            walk_opt_all(w, f, walk_stmt)
+        Quantifier(_, _, it, pred) ->
+            w.see(at, "Quantifier", AtExpr(e))
+            walk_expr(w, it)
+            walk_expr(w, pred)
+        Bad -> w.see(at, "Bad", AtExpr(e))
+end expr_parts
+
+private walk_with_field(w: *Walk, f: WithField)
+    w.see(f.span, "WithField", AtWithField(f))
+    walk_expr(w, f.value)
+
+private walk_lambda_param(w: *Walk, p: LambdaParam)
+    w.see(p.span, "LambdaParam", AtLambdaParam(p))
+    walk_opt(w, p.typ, walk_type)
+
+private walk_arm(w: *Walk, a: MatchArm)
+    w.see(a.span, "MatchArm", AtArm(a))
+    walk_all(w, a.patterns, walk_pattern)
+    walk_opt(w, a.guard, walk_expr)
+    walk_all(w, a.body, walk_stmt)
+end walk_arm
+
+// -- patterns and types ----------------------------------------------------------------------------
+
+private walk_pattern(w: *Walk, p: Pattern)
+    val first = w.found.len()
+
+    pattern_parts(w, p)
+    w.close(first)
+
+private pattern_parts(w: *Walk, p: Pattern)
+    val at = p.span
+
+    *p.kind match
+        LitPattern(v) ->
+            w.see(at, "LitPattern", AtPattern(p))
+            walk_expr(w, v)
+        RangePattern(lo, hi, _) ->
+            w.see(at, "RangePattern", AtPattern(p))
+            walk_expr(w, lo)
+            walk_expr(w, hi)
+        WildcardPattern -> w.see(at, "WildcardPattern", AtPattern(p))
+        IdentPattern(_) -> w.see(at, "IdentPattern", AtPattern(p))
+        EqPattern(_) -> w.see(at, "EqPattern", AtPattern(p))
+        VariantPattern(_, args) ->
+            w.see(at, "VariantPattern", AtPattern(p))
+            walk_all(w, args, walk_pattern)
+        StructPattern(_, fields) ->
+            w.see(at, "StructPattern", AtPattern(p))
+
+            for i in 0..<fields.len()
+                walk_pattern(w, fields.at(i).pat)
+        TuplePattern(args) ->
+            w.see(at, "TuplePattern", AtPattern(p))
+            walk_all(w, args, walk_pattern)
+        BindPattern(_, inner) ->
+            w.see(at, "BindPattern", AtPattern(p))
+            walk_pattern(w, inner)
+end pattern_parts
+
+private walk_type(w: *Walk, t: TypeRef)
+    val first = w.found.len()
+
+    type_parts(w, t)
+    w.close(first)
+
+private type_parts(w: *Walk, t: TypeRef)
+    val at = t.span
+
+    *t.kind match
+        NamedType(_, args) ->
+            w.see(at, "NamedType", AtType(t))
+            walk_all(w, args, walk_type)
+        ValueArgType(v) ->
+            w.see(at, "ValueArgType", AtType(t))
+            walk_expr(w, v)
+        PtrType(inner) ->
+            w.see(at, "PtrType", AtType(t))
+            walk_type(w, inner)
+        RefType(inner, _) ->
+            w.see(at, "RefType", AtType(t))
+            walk_type(w, inner)
+        WeakType(inner) ->
+            w.see(at, "WeakType", AtType(t))
+            walk_type(w, inner)
+        ArrayType(n, elem, _) ->
+            w.see(at, "ArrayType", AtType(t))
+            walk_opt(w, n, walk_expr)
+            walk_type(w, elem)
+        VectorType(lanes, elem) ->
+            w.see(at, "VectorType", AtType(t))
+            walk_expr(w, lanes)
+            walk_type(w, elem)
+        VolatileType(inner) ->
+            w.see(at, "VolatileType", AtType(t))
+            walk_type(w, inner)
+        TupleType(parts, _) ->
+            w.see(at, "TupleType", AtType(t))
+            walk_all(w, parts, walk_type)
+        PackType(_) -> w.see(at, "PackType", AtType(t))
+        FnType(ps, r, _) ->
+            w.see(at, "FnType", AtType(t))
+            walk_all(w, ps, walk_type)
+            walk_type(w, r)
+        CFnType(ps, r) ->
+            w.see(at, "CFnType", AtType(t))
+            walk_all(w, ps, walk_type)
+            walk_type(w, r)
+        AssocType(base, _) ->
+            w.see(at, "AssocType", AtType(t))
+            walk_type(w, base)
+        AssocArgType(_, inner) ->
+            w.see(at, "AssocArgType", AtType(t))
+            walk_type(w, inner)
+        SomeType(bounds) ->
+            w.see(at, "SomeType", AtType(t))
+            walk_all(w, bounds, walk_bound)
+end type_parts
+
+private walk_bound(w: *Walk, b: BoundRef)
+    w.see(b.span, "BoundRef", AtBound(b))
+    walk_all(w, b.args, walk_type)
+
+private walk_named_bounds(w: *Walk, nb: NamedBounds) = walk_all(w, nb.bounds, walk_bound)
+
+private walk_binding(w: *Walk, b: TypeBinding) = walk_type(w, b.typ)
+
+private walk_param(w: *Walk, p: Param)
+    w.see(p.span, "Param", AtParam(p))
+    walk_type(w, p.typ)
+    walk_opt(w, p.default, walk_expr)
+
+// -- statements and declarations -------------------------------------------------------------------
+
+private walk_stmt(w: *Walk, s: Stmt)
+    val first = w.found.len()
+
+    stmt_parts(w, s)
+    w.close(first)
+
+private stmt_parts(w: *Walk, s: Stmt)
+    val at = s.span
+
+    *s.kind match
+        ImportDecl(d) ->
+            w.see(at, "ImportDecl", AtStmt(s))
+            walk_all(w, d.selectors, walk_selector)
+        VarDecl(_, typ, init, _, align, _, _) ->
+            w.see(at, "VarDecl", AtStmt(s))
+            walk_opt(w, typ, walk_type)
+            walk_opt(w, init, walk_expr)
+            walk_opt(w, align, walk_expr)
+        ConstDecl(_, typ, v, _) ->
+            w.see(at, "ConstDecl", AtStmt(s))
+            walk_type(w, typ)
+            walk_expr(w, v)
+        CConstBlock(cs) ->
+            w.see(at, "CConstBlock", AtStmt(s))
+            walk_all(w, cs, walk_cconst)
+        CTypeBlock(ts) ->
+            w.see(at, "CTypeBlock", AtStmt(s))
+
+            for i in 0..<ts.len()
+                w.see(ts.at(i).span, "CTypeDecl", AtCType(ts.at(i)))
+        AssertDecl(c, _) ->
+            w.see(at, "AssertDecl", AtStmt(s))
+            walk_expr(w, c)
+        StaticDecl(inner) ->
+            w.see(at, "StaticDecl", AtStmt(s))
+            walk_stmt(w, inner)
+        ValDecl(_, typ, v, _, align, _) ->
+            w.see(at, "ValDecl", AtStmt(s))
+            walk_opt(w, typ, walk_type)
+            walk_expr(w, v)
+            walk_opt(w, align, walk_expr)
+        RefDecl(_, place) ->
+            w.see(at, "RefDecl", AtStmt(s))
+            walk_expr(w, place)
+        MultiAssign(_, ts, vs) ->
+            w.see(at, "MultiAssign", AtStmt(s))
+            walk_all(w, ts, walk_expr)
+            walk_all(w, vs, walk_expr)
+        MultiDecl(_, _, vs) ->
+            w.see(at, "MultiDecl", AtStmt(s))
+            walk_all(w, vs, walk_expr)
+        PatternDecl(pat, _, v) ->
+            w.see(at, "PatternDecl", AtStmt(s))
+            walk_pattern(w, pat)
+            walk_expr(w, v)
+        ExprStmt(x) ->
+            w.see(at, "ExprStmt", AtStmt(s))
+            walk_expr(w, x)
+        Return(v) ->
+            w.see(at, "Return", AtStmt(s))
+            walk_opt(w, v, walk_expr)
+        Become(c) ->
+            w.see(at, "Become", AtStmt(s))
+            walk_expr(w, c)
+        Break(_, v) ->
+            w.see(at, "Break", AtStmt(s))
+            walk_opt(w, v, walk_expr)
+        Continue(_) -> w.see(at, "Continue", AtStmt(s))
+        Defer(inner) ->
+            w.see(at, "Defer", AtStmt(s))
+            walk_stmt(w, inner)
+        Require(c, _) ->
+            w.see(at, "Require", AtStmt(s))
+            walk_expr(w, c)
+        Ensure(c, _) ->
+            w.see(at, "Ensure", AtStmt(s))
+            walk_expr(w, c)
+        Invariant(c, _) ->
+            w.see(at, "Invariant", AtStmt(s))
+            walk_expr(w, c)
+        Variant(m) ->
+            w.see(at, "Variant", AtStmt(s))
+            walk_expr(w, m)
+        AsmStmt(arms) ->
+            w.see(at, "AsmStmt", AtStmt(s))
+            walk_all(w, arms, walk_asm_arm)
+        FuncDecl(d) ->
+            w.see(at, "FuncDecl", AtStmt(s))
+            walk_func(w, d)
+        ExternDecl(d) ->
+            w.see(at, "ExternDecl", AtStmt(s))
+            walk_all(w, d.params, walk_param)
+            walk_opt(w, d.ret_type, walk_type)
+        ExternVarDecl(_, typ, _, _) ->
+            w.see(at, "ExternVarDecl", AtStmt(s))
+            walk_type(w, typ)
+        StructDecl(d) ->
+            w.see(at, "StructDecl", AtStmt(s))
+            walk_struct(w, d)
+        EnumDecl(d) ->
+            w.see(at, "EnumDecl", AtStmt(s))
+            walk_enum(w, d)
+        TraitDecl(d) ->
+            w.see(at, "TraitDecl", AtStmt(s))
+            walk_trait(w, d)
+        ImplDecl(d) ->
+            w.see(at, "ImplDecl", AtStmt(s))
+            walk_impl(w, d)
+        TypeDecl(d) ->
+            w.see(at, "TypeDecl", AtStmt(s))
+            walk_type_decl(w, d)
+        Bad -> w.see(at, "Bad", AtStmt(s))
+end stmt_parts
+
+private walk_selector(w: *Walk, s: ImportSelector) = w.see(s.span, "ImportSelector", AtSelector(s))
+
+private walk_cconst(w: *Walk, c: CConstDecl)
+    w.see(c.span, "CConstDecl", AtCConst(c))
+    walk_type(w, c.typ)
+
+private walk_asm_arm(w: *Walk, a: AsmArm)
+    w.see(a.span, "AsmArm", AtAsmArm(a))
+
+    a.body match
+        AsmCode(_, operands, _) ->
+            for i in 0..<operands.len()
+                w.see(operands.at(i).span, "AsmOperand", AtAsmOperand(operands.at(i)))
+        AsmUnavailable(_) -> ()
+end walk_asm_arm
+
+private walk_func(w: *Walk, d: FuncDecl)
+    walk_all(w, d.params, walk_param)
+    walk_opt(w, d.ret_type, walk_type)
+    walk_all(w, d.body, walk_stmt)
+    walk_all(w, d.bounds, walk_named_bounds)
+    walk_all(w, d.tdefaults, walk_binding)
+    walk_all(w, d.tvalues, walk_binding)
+
+    d.test match
+        Some(t) -> w.see(t.span, "TestAttr", AtTestAttr(t))
+        None -> ()
+
+    d.hook match
+        Some(h) -> w.see(h.span, "HookAttr", AtHookAttr(h))
+        None -> ()
+
+    d.conv match
+        Some(c) -> w.see(c.span, "CallConv", AtCallConv(c))
+        None -> ()
+
+    walk_opt(w, d.exported, walk_export)
+end walk_func
+
+private walk_export(w: *Walk, a: ExportAttr) = w.see(a.span, "ExportAttr", AtExportAttr(a))
+
+private walk_method(w: *Walk, m: MethodDecl)
+    w.see(m.span, "MethodDecl", AtMethod(m))
+    walk_all(w, m.params, walk_param)
+    walk_opt(w, m.ret_type, walk_type)
+    walk_all(w, m.body, walk_stmt)
+    walk_all(w, m.bounds, walk_named_bounds)
+    walk_all(w, m.tdefaults, walk_binding)
+    walk_all(w, m.tvalues, walk_binding)
+end walk_method
+
+private walk_struct(w: *Walk, d: StructDecl)
+    walk_all(w, d.fields, walk_param)
+    walk_all(w, d.members, walk_method)
+    walk_all(w, d.bounds, walk_named_bounds)
+    walk_all(w, d.invariants, walk_expr)
+    walk_all(w, d.tdefaults, walk_binding)
+    walk_all(w, d.tvalues, walk_binding)
+    walk_opt(w, d.alignment, walk_expr)
+    walk_opt(w, d.cname, walk_export)
+    walk_all(w, d.deriving, walk_bound)
+end walk_struct
+
+private walk_enum(w: *Walk, d: EnumDecl)
+    walk_opt(w, d.underlying, walk_type)
+    walk_all(w, d.variants, walk_enum_variant)
+    walk_all(w, d.members, walk_method)
+    walk_all(w, d.bounds, walk_named_bounds)
+    walk_all(w, d.tdefaults, walk_binding)
+    walk_all(w, d.tvalues, walk_binding)
+    walk_all(w, d.deriving, walk_bound)
+end walk_enum
+
+private walk_enum_variant(w: *Walk, v: EnumVariantDecl)
+    w.see(v.span, "EnumVariantDecl", AtEnumVariant(v))
+    walk_opt(w, v.value, walk_expr)
+    walk_all(w, v.fields, walk_param)
+
+private walk_trait(w: *Walk, d: TraitDecl)
+    walk_all(w, d.methods, walk_method)
+    walk_all(w, d.bounds, walk_named_bounds)
+    walk_all(w, d.supers, walk_bound)
+    walk_all(w, d.tdefaults, walk_binding)
+    walk_all(w, d.assocs, walk_assoc_decl)
+    walk_all(w, d.tvalues, walk_binding)
+end walk_trait
+
+private walk_assoc_decl(w: *Walk, a: AssocDecl)
+    w.see(a.span, "AssocDecl", AtAssocDecl(a))
+    walk_all(w, a.bounds, walk_bound)
+
+private walk_impl(w: *Walk, d: ImplDecl)
+    walk_type(w, d.for_type)
+    walk_all(w, d.methods, walk_method)
+    walk_all(w, d.bounds, walk_named_bounds)
+    walk_all(w, d.trait_args, walk_type)
+    walk_all(w, d.tdefaults, walk_binding)
+    walk_all(w, d.tvalues, walk_binding)
+    walk_all(w, d.assocs, walk_assoc_bind)
+end walk_impl
+
+private walk_assoc_bind(w: *Walk, a: AssocBind)
+    w.see(a.span, "AssocBind", AtAssocBind(a))
+    walk_type(w, a.typ)
+
+private walk_type_decl(w: *Walk, d: TypeDecl)
+    walk_type(w, d.base)
+    walk_opt(w, d.range, walk_range_bound)
+    walk_opt(w, d.pred, walk_expr)
+    walk_opt(w, d.cname, walk_export)
+    walk_all(w, d.tp.bounds, walk_named_bounds)
+    walk_all(w, d.tp.defaults, walk_binding)
+    walk_all(w, d.tp.values, walk_binding)
+end walk_type_decl
+
+private walk_range_bound(w: *Walk, r: RangeBound)
+    w.see(r.span, "RangeBound", AtRangeBound(r))
+    walk_expr(w, r.lo)
+    walk_expr(w, r.hi)
