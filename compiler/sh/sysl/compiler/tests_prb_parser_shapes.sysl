@@ -1,0 +1,224 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.Search
+
+// The parser's shapes, case by case as the reference's parser suites pin them: closures, the
+// declaration forms, the memory-mode sigils in a declaration, methods, generics, struct invariants,
+// constrained types and plain statements. Each input is the reference's own, given the newline a
+// file ends with; each expected tree is the reference's, printed in `show.sysl`'s shape notation.
+
+// -- closures (ClosureParserTests) ----------------------------------------------------------------
+
+@test("a closure's parameters: none is the empty pair, one may keep them, two or more need them")
+prb_closure_parameter_lists()
+    assert_eq(pe("(x, y) -> x + y"), "(lambda (x y) (+ x y))")
+    assert_eq(pe("() -> next_id()"), "(lambda () (call next_id))")
+    assert_eq(pe("(x) -> x"), "(lambda (x) x)")
+
+@test("an annotation outside a closure's parentheses is not a second spelling")
+prb_an_annotation_outside_is_not_a_closure()
+    assert(pe_err("x: int -> x") != "", "'x: int -> x' does not parse")
+
+@test("two closures in one argument list stay apart")
+prb_two_closures_stay_apart()
+    assert_eq(pe("fold(x -> x, y -> y)"), "(call fold (lambda (x) x) (lambda (y) y))")
+
+@test("a closure bound to a name takes a block body")
+prb_a_bound_closure_takes_a_block()
+    assert_eq(pf("var f = x ->\n    log(x)\n    x\n"), "(var f (lambda (x) (call log x) x))")
+
+@test("inside an argument list a closure takes a block too, since an arrow opens one anywhere")
+prb_a_closure_takes_a_block_inside_an_argument_list()
+    assert_eq(pf("xs.each(x ->\n    log(x)\n    print(x))\n"),
+        "(call (field xs each) (lambda (x) (call log x) (call print x)))")
+
+@test("a closure body left off asks for the body, not for an indent on the line after")
+prb_a_body_left_off_asks_for_the_body()
+    val said = pf_err("var g = x ->\nprint(1)\n")
+
+    assert_eq(said, "expression expected")
+    assert_eq(pf_at("var g = x ->\nprint(1)\n"), "1:13")
+
+@test("a match arm's left side is a pattern, and its body may itself be a closure")
+prb_a_match_arm_is_not_a_closure()
+    assert_eq(pf("x match\n    n -> n * 2\n"), "(match x (arm n -> (* n 2)))")
+    assert_eq(pf("x match\n    0 -> y -> y\n"), "(match x (arm 0 -> (lambda (y) y)))")
+
+@test("a callable's type: the bare arrow takes one domain, several are parenthesized, none is ()")
+prb_the_bare_arrow_callable_type()
+    assert_eq(pf("f(g: int -> int)\n    0\n"), "(fn f (g:int -> int) 0)")
+    assert_eq(pf("f(g: (int, string) -> bool)\n    0\n"), "(fn f (g:(int, string) -> bool) 0)")
+    assert_eq(pf("f(g: () -> int)\n    0\n"), "(fn f (g:() -> int) 0)")
+
+// -- declarations (DeclarationParserTests) -------------------------------------------------------
+
+@test("a block-bodied function returns its trailing expression")
+prb_a_block_bodied_function()
+    assert_eq(pf("f(n: int) -> int\n    n + 1\n"), "(fn f (n:int) -> int (+ n 1))")
+
+@test("a function with no return type takes unit")
+prb_a_function_with_no_return_type()
+    assert_eq(pf("greet(name: string)\n    print(name)\n"), "(fn greet (name:string) (call print name))")
+
+@test("a bare call is not a declaration")
+prb_a_bare_call_is_not_a_declaration()
+    assert_eq(pf("foo(1)\n"), "(call foo 1)")
+
+@test("the same name is a call above and a declaration below, told apart by the block")
+prb_a_call_above_and_a_declaration_below()
+    assert_eq(pf("start()\n\nstart()\n    print(1)\n"), "(call start) (fn start () (call print 1))")
+
+@test("a declaration below the script takes its parameters as any other does")
+prb_a_declaration_below_the_script()
+    assert_eq(pf("insert(db: int, name: string)\n    print(name)\n"),
+        "(fn insert (db:int name:string) (call print name))")
+
+@test("an expression-bodied declaration, a comment, and then a block-bodied one")
+prb_an_expression_body_then_a_comment_then_a_block()
+    assert_eq(pf("f(n: int) -> int = n + 1\n\n// a note\n\ng(n: int) -> int\n    n * 2\n"),
+        "(fn f (n:int) -> int (+ n 1)) (fn g (n:int) -> int (* n 2))")
+
+@test("a for over an inclusive range")
+prb_a_for_over_an_inclusive_range()
+    assert_eq(pf("for i in 1..10\n    print(i)\n"), "(for i (.. 1 10) (call print i))")
+
+@test("a bare return and a return with a value")
+prb_a_bare_return_and_a_return_with_a_value()
+    assert_eq(pf("return\nreturn 42\n"), "(return) (return 42)")
+
+// -- memory modes in a declaration (MemoryModeParserTests) --------------------------------------
+
+@test("a raw pointer, and a reference plain and atomic, on a var")
+prb_the_sigils_on_a_var()
+    assert_eq(pf("var x: *int = p\n"), "(var x : (ptr int) p)")
+    assert_eq(pf("var x: &Point = p\n"), "(var x : (ref Point) p)")
+    assert_eq(pf("var x: &sync Point = p\n"), "(var x : (ref-sync Point) p)")
+
+@test("a sigil in a signature, on a parameter and a result")
+prb_a_sigil_in_a_signature()
+    assert_eq(pf("head(list: *Node) -> &Node = list\n"), "(fn head (list:*Node) -> (ref Node) list)")
+
+@test("a sigil in a struct field, which is what makes a type recursive")
+prb_a_sigil_in_a_struct_field()
+    assert_eq(pf("struct Node\n    value: int\n    next: *Node\n"), "(struct Node (value:int next:*Node))")
+
+@test("'weak' applies to a declared type, and nests inside the others")
+prb_weak_on_a_var()
+    assert_eq(pf("var w: weak Node = a\n"), "(var w : (weak Node) a)")
+    assert_eq(pf("var w: []weak Node = a\n"), "(var w : (array _ (weak Node)) a)")
+
+@test("null is a primary")
+prb_null_is_a_primary()
+    assert_eq(pe("null"), "null")
+    assert_eq(pe("p == null"), "(cmp p == null)")
+
+// -- methods (MethodParserTests) -----------------------------------------------------------------
+
+@test("a value-receiver method")
+prb_a_value_receiver_method()
+    assert_eq(pf("struct Point\n    x: int\n    sum(self) -> int = self.x\n"),
+        "(struct Point (x:int) (method self sum () -> int (field self x)))")
+
+@test("a pointer-receiver method with parameters")
+prb_a_pointer_receiver_method()
+    assert_eq(pf("struct P\n    x: int\n    shift(*self, dx: int)\n        self.x += dx\n"),
+        "(struct P (x:int) (method *self shift (dx:int) (+= (field self x) dx)))")
+
+@test("a reference receiver, plain and sync")
+prb_a_reference_receiver()
+    assert_eq(pf("struct C\n    n: int\n    a(&self) = self.n\n    b(&sync self) = self.n\n"),
+        "(struct C (n:int) (method &self a () (field self n)) (method &sync self b () (field self n)))")
+
+@test("a computed property")
+prb_a_computed_property()
+    assert_eq(pf("struct P\n    x: int\n    doubled -> int = self.x * 2\n"),
+        "(struct P (x:int) (prop doubled -> int (* (field self x) 2)))")
+
+@test("a property may open a block, with an '=' or without one")
+prb_a_property_may_open_a_block()
+    val tree = "(struct P (x:int) (prop doubled -> int (var t (field self x)) (* t 2)))"
+
+    assert_eq(pf("struct P\n    x: int\n    doubled -> int\n        var t = self.x\n        t * 2\n"), tree)
+    assert_eq(pf("struct P\n    x: int\n    doubled -> int =\n        var t = self.x\n        t * 2\n"), tree)
+
+@test("an associated function has no receiver")
+prb_an_associated_function()
+    assert_eq(pf("struct P\n    x: int\n    origin() -> P = P(0)\n"),
+        "(struct P (x:int) (method origin () -> P (call P 0)))")
+
+@test("fields and members intermix, and a field still parses after a member")
+prb_fields_and_members_intermix()
+    assert_eq(pf("struct P\n    x: int\n    sum(self) -> int = self.x\n    y: int\n"),
+        "(struct P (x:int y:int) (method self sum () -> int (field self x)))")
+
+// -- generics (GenericsParserTests) --------------------------------------------------------------
+
+@test("a generic function, struct and enum")
+prb_generic_declarations()
+    assert_eq(pf("id[T](x: T) -> T = x\n"), "(fn id (T) (x:T) -> T x)")
+    assert_eq(pf("struct Pair[A, B]\n    first: A\n    second: B\nend Pair\n"),
+        "(struct Pair (A B) (first:A second:B))")
+    assert_eq(pf("enum Maybe[T]\n    Just(value: T)\n    Nothing\n"), "(enum Maybe (T) (Just (value:T)) (Nothing))")
+
+@test("a struct's and an enum's parameters carry bounds")
+prb_bounded_type_parameters()
+    assert_eq(pf("struct SortedList[T: Ord + Eq]\n    head: T\n"), "(struct SortedList (T:Ord+Eq) (head:T))")
+    assert_eq(pf("enum Maybe[T: Show]\n    Just(value: T)\n    Nothing\n"),
+        "(enum Maybe (T:Show) (Just (value:T)) (Nothing))")
+
+@test("a type reference applied to one argument, and nested")
+prb_type_arguments()
+    assert_eq(pf("f(b: Box[int])\n    print(1)\n"), "(fn f (b:Box[int]) (call print 1))")
+    assert_eq(pf("var x: Result[Box[int], string] = y\n"), "(var x : (Result (Box int) string) y)")
+
+// -- struct invariants (StructInvariantParserTests) ----------------------------------------------
+
+@test("a struct's invariants collect in source order, and the fields are left alone")
+prb_struct_invariants()
+    assert_eq(pf("struct Account\n    balance: int\n    invariant balance >= 0\n"),
+        "(struct Account (balance:int) (invariant (cmp balance >= 0)))")
+    assert_eq(pf("struct Range\n    lo: int\n    hi: int\n    invariant lo <= hi\n    invariant lo >= 0\n"),
+        "(struct Range (lo:int hi:int) (invariant (cmp lo <= hi)) (invariant (cmp lo >= 0)))")
+    assert_eq(pf("struct Point\n    x: int\n    y: int\n"), "(struct Point (x:int y:int))")
+
+// -- constrained types (SubtypeParserTests) ------------------------------------------------------
+
+@test("a 'within' range: integer inclusive, float exclusive, character, and a negative bound")
+prb_within_ranges()
+    assert_eq(pf("type Age = int within 0..150\n"), "(type Age = int within 0 .. 150)")
+    assert_eq(pf("type Prob = f64 within 0.0..<1.0\n"), "(type Prob = f64 within 0.0 ..< 1.0)")
+    assert_eq(pf("type Letter = char within 'a'..'z'\n"), "(type Letter = char within 'a' .. 'z')")
+    assert_eq(pf("type Delta = int within -5..5\n"), "(type Delta = int within (- 5) .. 5)")
+
+@test("'where' carries the predicate, and 'new' needs neither clause")
+prb_where_and_new()
+    assert_eq(pf("type Even = int where value % 2 == 0\n"), "(type Even = int where (cmp (% value 2) == 0))")
+    assert_eq(pf("type Meters = new f64\n"), "(type Meters = new f64)")
+
+@test("'within' and 'where' remain identifiers outside a type declaration")
+prb_within_and_where_stay_identifiers()
+    assert_eq(pf("where(within: int) -> int\n    within\n"), "(fn where (within:int) -> int within)")
+
+@test("a 'within' bound naming a const parses, as an array bound does")
+prb_a_within_bound_naming_a_const()
+    assert_eq(pf("const n: usize = 8\ntype Slot = new u8 within 0..<n\n"),
+        "(const n : usize 8) (type Slot = new u8 within 0 ..< n)")
+
+// -- statements (StatementParserTests, ExpressionParserTests) ------------------------------------
+
+@test("a sequence of statements, and a var with a type annotation")
+prb_a_sequence_of_statements()
+    assert_eq(pf("var x = 1\nprint(x)\n"), "(var x 1) (call print x)")
+    assert_eq(pf("var n: int = 0\n"), "(var n : int 0)")
+
+@test("a parse error reports a location")
+prb_a_parse_error_reports_a_location()
+    val said = parse_report(parse(source_of("sample.sysl", "var = 5")))
+
+    assert(said.contains("--> sample.sysl:1:5"), said)
+
+@test("'..=' in a for header points at the '..', not past the '='")
+prb_inclusive_eq_points_at_the_dots_in_a_file()
+    assert_eq(pf_at("main()\n    val a = 1\n    for i in a..=3\n        print(i)\n"), "3:15")
