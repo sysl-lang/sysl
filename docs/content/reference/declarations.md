@@ -947,6 +947,26 @@ What is deliberately absent is any ranking *between* conversions. Two candidates
 different one are ambiguous, and saying so beats a ladder of precedences nobody could predict from
 the source.
 
+**The one exception is a bare integer literal, which prefers the signed widening.** Where the
+candidates differ only at positions holding an integer literal with no suffix, and none takes it at
+`int`, a candidate whose parameter there is a signed integer at least as wide as `int` beats an
+unsigned, a narrower signed or a float one, and among several the narrowest wins. Two unsigned
+candidates offer nothing signed and stay ambiguous. The rule is the same for a member several
+implementations of one trait answer, so `BigInt.from(3)` is its `From[long]`:
+
+```sysl
+pick(x: long) -> string = "long"
+pick(x: u64) -> string = "u64"
+
+print(pick(3))
+print(pick(3u64))
+```
+
+```output
+long
+u64
+```
+
 **Exactness is asked of the types a candidate was fitted at, which for a generic one is what the call
 solved it to.** `g[T]` below takes the `[]int` at `T = []int`, as it was written; the other takes it
 only by giving up the ability to write. So the generic declaration is the exact one:

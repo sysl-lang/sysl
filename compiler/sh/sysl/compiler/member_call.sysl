@@ -1341,10 +1341,32 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
                 return None
             _ -> ()
 
+    // **Which candidates apply, and which of several is meant, is the overload rule and no other**
+    // (`reference/declarations.md § Overloading`): an argument applies where its reading AT the
+    // candidate's parameter comes out at that parameter, which is what lets a bare `3` stand at a
+    // `long`; and among several that apply, `narrowed_at` -- the tie-breaks an overload set is
+    // decided by -- picks the one written at the arguments' own types, and leaves two reached only
+    // by conversion ambiguous.
     var fits: Buf[string] = buf()
+    var fitted: Buf[Buf[Type]] = buf()
+    var declared: Buf[usize] = buf()
+    var generic: Buf[bool] = buf()
 
     for i in 0..<cands.len()
-        if member_accepts(cx, rty, base, cands.at(i), arg_tys) then fits.push(cands.at(i))
+        val params = member_accepts(cx, rty, base, cands.at(i), args)
+
+        if params.is_some()
+            fits.push(cands.at(i))
+            fitted.push(params.unwrap())
+            declared.push(member_at(cx.an, base, cands.at(i)).unwrap().params.len())
+            generic.push(cx.an.tables.members.generic.get(member_key_of(base, cands.at(i))).is_some())
+        end if
+
+    if fits.len() > 1
+        val chosen = narrowed_at(declared, generic, fitted, args, arg_tys)
+
+        if chosen.len() == 1 then return Some(fits.at(chosen.at(0)))
+    end if
 
     if fits.len() == 1 then return Some(fits.at(0))
 
@@ -1431,24 +1453,26 @@ private out_of_scope(cx: &Analyzer, span: Span, base: string, mname: string, can
     cx.fault(span, s"$subject has '$mname' from ${conjoin(named)}, and $tail")
 end out_of_scope
 
-// Whether one candidate's declared parameters accept the arguments a call wrote.
+// The parameter types one candidate takes a call's arguments at, or nothing where it does not take
+// them: each argument is read at its parameter, as a call of that candidate would read it, and has to
+// come out at that parameter's type with nothing said on the way.
 //
 // A candidate that takes a `...` is answered for by its declared parameters alone: the tail stands at
 // none, so what it may be told apart by stops where they do. A default widens the same count
 // downwards, and for the same reason -- a call may stop where the defaults begin.
 private member_accepts(cx: &Analyzer, rty: Type, base: string, filed: string,
-                       arg_tys: Buf[Option[Type]]) -> bool
+                       args: Buf[Expr]) -> Option[Buf[Type]]
     val m = member_at(cx.an, base, filed)
 
-    if m.is_none() then return false
+    if m.is_none() then return None
 
     val fname = member_func_name_quiet(cx, rty, filed)
 
-    if fname == "" then return false
+    if fname == "" then return None
 
     val sig = cx.an.tables.members.func_insts.get(fname)
 
-    if sig.is_none() then return false
+    if sig.is_none() then return None
 
     var params: Buf[Type] = buf()
     // **The receiver is a parameter of the lowered function and not of the member**, so it is
@@ -1464,19 +1488,39 @@ private member_accepts(cx: &Analyzer, rty: Type, base: string, filed: string,
     for i in 0..<m.unwrap().params.len()
         if m.unwrap().params.at(i).default.is_none() then least += 1
 
-    var counted = arg_tys.len() <= params.len() && arg_tys.len() >= least
+    var counted = args.len() <= params.len() && args.len() >= least
 
-    if m.unwrap().variadic then counted = arg_tys.len() >= params.len()
+    if m.unwrap().variadic then counted = args.len() >= params.len()
 
-    if !counted then return false
+    if !counted then return None
 
     for i in 0..<params.len()
-        if i < arg_tys.len()
-            if arg_tys.at(i).is_none() then return false
-            if !type_eq(arg_tys.at(i).unwrap(), params.at(i)) then return false
+        if i < args.len() && !reads_at(cx, args.at(i), params.at(i)) then return None
 
-    true
+    Some(params)
 end member_accepts
+
+// Whether an argument read at a parameter's type comes out at that type with nothing said -- the
+// question a call of one candidate answers for each argument. Every trace of the reading is put back,
+// the instantiations and closures it made included, since the candidate may not be the one chosen.
+private reads_at(cx: &Analyzer, e: Expr, want: Type) -> bool
+    val sandbox = cx.an.sandboxed()
+    val queued = cx.an.tables.members.pending.len()
+    val tables = cx.an.tables.members.vtables.len()
+    val mark = cx.an.complaints()
+    val lowered = cx.an.closure_count
+    val made = cx.an.closure_funcs.len()
+    val t = analyze_expected(cx, e, Some(want))
+    val refused = cx.an.complaints() > mark
+
+    cx.an.restore_complaints(mark)
+    cx.an.closure_count = lowered
+    cx.an.closure_funcs.truncate(made)
+    cx.an.release(sandbox)
+    rewind_instantiations(cx.an, queued, tables)
+
+    !refused && type_eq(texpr_type(t), want)
+end reads_at
 
 // The lowered name a candidate goes under, with nothing said where it has none: this is asked while
 // candidates are being weighed, and a complaint about one that was not chosen is one nobody asked
