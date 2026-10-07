@@ -2077,26 +2077,43 @@ private narrowed(cx: &Analyzer, fitting: Buf[string], fitted: Buf[Buf[Type]],
                  args: Buf[Expr]) -> Buf[string]
     if fitting.len() <= 1 then return fitting
 
-    var written: Buf[usize] = buf()
+    var declared: Buf[usize] = buf()
+    var generic: Buf[bool] = buf()
 
     for i in 0..<fitting.len()
-        if cx.an.tables.funcs.get(fitting.at(i)).unwrap().decl.params.len() == args.len()
-            written.push(i)
+        val d = cx.an.tables.funcs.get(fitting.at(i)).unwrap().decl
+
+        declared.push(d.params.len())
+        generic.push(!d.tparams.is_empty())
+
+    keys_at(fitting, narrowed_at(declared, generic, fitted, args.len(), natural_types(cx, args)))
+end narrowed
+
+// The three tie-breaks over candidates described rather than named, answering the indices that
+// survive: `declared` is each candidate's parameter count, `generic` whether it was solved for its
+// parameters, `fitted` the types it took the call at, and `natural` each argument's own type. It is
+// the whole of the rule, so a member answered by several implementations of one trait
+// (`member_call.sysl`'s `chosen_member`) is decided by it too.
+narrowed_at(declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]], given: usize,
+            natural: Buf[Option[Type]]) -> Buf[usize]
+    var written: Buf[usize] = buf()
+
+    for i in 0..<declared.len()
+        if declared.at(i) == given then written.push(i)
 
     var ranked: Buf[usize] = buf()
 
-    for i in 0..<fitting.len()
+    for i in 0..<declared.len()
         if written.len() != 1 || written.at(0) == i then ranked.push(i)
 
-    if ranked.len() == 1 then return keys_at(fitting, ranked)
+    if ranked.len() == 1 then return ranked
 
-    val natural = natural_types(cx, args)
     var exact: Buf[usize] = buf()
 
     for r in 0..<ranked.len()
         if fitted_exactly(fitted.at(ranked.at(r)), natural) then exact.push(ranked.at(r))
 
-    if exact.len() == 1 then return keys_at(fitting, exact)
+    if exact.len() == 1 then return exact
 
     var pool: Buf[usize] = buf()
 
@@ -2108,11 +2125,10 @@ private narrowed(cx: &Analyzer, fitting: Buf[string], fitted: Buf[Buf[Type]],
     var spelled: Buf[usize] = buf()
 
     for p in 0..<pool.len()
-        if cx.an.tables.funcs.get(fitting.at(pool.at(p))).unwrap().decl.tparams.is_empty()
-            spelled.push(pool.at(p))
+        if !generic.at(pool.at(p)) then spelled.push(pool.at(p))
 
-    if spelled.len() == 1 then keys_at(fitting, spelled) else keys_at(fitting, ranked)
-end narrowed
+    if spelled.len() == 1 then spelled else ranked
+end narrowed_at
 
 // The written-out candidates a call's position-typed arguments leave tied: empty where no argument
 // is typed by its position or the candidates agree at every one that is, the one candidate whose
