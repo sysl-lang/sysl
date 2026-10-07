@@ -1,0 +1,219 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// Members of *generic* types as programs run them -- the reference's `GenericMemberRunTests`. A
+// method or property on a generic struct is instantiated from the receiver's type arguments, so one
+// member compiled against two element types is two monomorphized functions; these check the
+// receiver mode, the parameter in the signature and body, and the per-instantiation `T`. The
+// building and running are `tests_rng_impl_composed_run.sysl`'s.
+
+@test("a value-receiver method returns the element type")
+rng_gm_a_value_receiver_returns_the_element()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Box[T]
+            value: T
+            get(self) -> T = self.value
+        var a = Box(41)
+        var b = Box("boxed")
+        print(a.get(), b.get())
+        """, "41 boxed\n")
+
+@test("a method takes a parameter of the element type")
+rng_gm_a_parameter_of_the_element_type()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Box[T: Add]
+            value: T
+            plus(self, other: T) -> T = self.value + other
+        var a = Box(10)
+        print(a.plus(5))
+        """, "15\n")
+
+@test("a pointer-receiver method mutates the element in place")
+rng_gm_a_pointer_receiver_mutates()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Box[T]
+            value: T
+            set(*self, x: T)
+                self.value = x
+            get(self) -> T = self.value
+        var a = Box(1)
+        a.set(99)
+        print(a.get())
+        """, "99\n")
+
+@test("a reference-receiver method mutates the shared heap object")
+rng_gm_a_reference_receiver_mutates()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Box[T: Add]
+            value: T
+            bump(&self, by: T)
+                self.value = self.value + by
+            get(&self) -> T = self.value
+        var a: &Box[int] = Box(0)
+        a.bump(3)
+        a.bump(4)
+        print(a.get())
+        """, "7\n")
+
+@test("a computed property on a generic struct reads with no parentheses")
+rng_gm_a_computed_property()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Box[T: Add]
+            value: T
+            doubled -> T = self.value + self.value
+        var a = Box(21)
+        var b = Box(1.25)
+        print(a.doubled, b.doubled)
+        """, "42 2.5\n")
+
+private rng_gm_two_boxes() -> string = raw"""
+    struct Box[T]
+        value: T
+        get(self) -> T = self.value
+    var a = Box(1)
+    var b = Box(2.5)
+    print(a.get(), b.get())
+    """
+
+// How many functions a text defines under the member's own name -- the rest of the module is the
+// counting runtime and the library renderers `print` reached.
+private rng_gm_defines(ir: string) -> int
+    var n = 0
+
+    for line in lines_of(ir).view()
+        if line.starts_with("define") && line.contains("@Box.get.") then n += 1
+
+    n
+end rng_gm_defines
+
+// `Box.get.int` and `Box.get.real`: the member is compiled once per element type, exactly as a
+// free generic function is, not shared across the two instantiations.
+@test("the same generic method is monomorphized once per element type")
+rng_gm_monomorphized_once_per_element_type()
+    if !rng_ready() then return
+
+    assert_eq(rng_gm_defines(enm_ir(rng_gm_two_boxes())), 2)
+
+    env_var("SYSL_ORACLE") match
+        Some(bin) ->
+            val root = make_temp_dir("sysl-rng").unwrap()
+
+            make_dir_all(root).unwrap()
+            write_text(s"$root/main.sysl", rng_gm_two_boxes()).unwrap()
+
+            val said = capture_oracle(bin, ["emit-llvm", s"$root/main.sysl"])
+
+            remove_dir_all(root).unwrap_or(())
+            val ir = said match
+                Ok(o) -> o.text
+                Err(_) -> ""
+
+            assert_eq(rng_gm_defines(ir), 2, rng_label(Some(bin)))
+        None -> ()
+end rng_gm_monomorphized_once_per_element_type
+
+@test("a method uses both parameters of a two-parameter generic struct")
+rng_gm_both_parameters()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Pair[A, B]
+            first: A
+            second: B
+            show(self) -> B = self.second
+        var p = Pair(1, "one")
+        print(p.show())
+        """, "one\n")
+
+@test("a generic method calls another method on self")
+rng_gm_calls_another_method_on_self()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Box[T: Add]
+            value: T
+            raw(self) -> T = self.value
+            twice(self) -> T = self.raw() + self.raw()
+        var a = Box(6)
+        print(a.twice())
+        """, "12\n")
+
+@test("a recursive generic type exposes a method that reaches through the pointer")
+rng_gm_a_recursive_generic_type()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Node[T]
+            value: T
+            next: *Node[T]
+            head(self) -> T = self.value
+        var tail: Node[int] = Node(2, null)
+        var list = Node(1, &tail)
+        print(list.head(), tail.head())
+        """, "1 2\n")
+
+// A body that adds to the element needs the type to say so, and `T: Add` is where it says it. The
+// `1` is checked against `T` per instantiation rather than at the definition.
+@test("a method whose body needs a numeric element compiles at a numeric instantiation")
+rng_gm_a_numeric_body_at_a_numeric_instantiation()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Box[T: Add]
+            value: T
+            inc(self) -> T = self.value + 1
+        var a = Box(41)
+        print(a.inc())
+        """, "42\n")
+
+// `Self` inside a generic type's own body is the type applied to its parameters, resolved
+// alongside them rather than ahead of them.
+@test("a member may write 'Self' for the type it belongs to")
+rng_gm_a_member_may_write_self()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Box[T]
+            v: T
+            same(self) -> Self = self
+        var b = Box(41)
+        print(b.same().v)
+        """, "41\n")
+
+// A `&self` method handing out a `&T` field: the returned reference outlives the receiver dropped
+// when `extract` returns, and over a long loop each boxed value is freed exactly once.
+@test("a &self generic method returns a &T field that outlives the dropped receiver")
+rng_gm_a_reference_field_outlives_its_receiver()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Inner
+            v: int
+        struct Holder[T]
+            item: T
+            peek(&self) -> T = self.item
+        extract(seed: int) -> &Inner
+            var h: &Holder[&Inner] = Holder(Inner(seed))
+            h.peek()
+        var i = 0
+        var total = 0
+        while i < 500000
+            var got = extract(i % 4)
+            total += got.v
+            i++
+        print(total)
+        """, "750000\n")

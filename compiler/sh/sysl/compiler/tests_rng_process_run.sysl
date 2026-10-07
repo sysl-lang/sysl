@@ -1,0 +1,199 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.posix.tty.flush
+import sysl.process.{capture, Status, Var}
+import sysl.text.{cstring, from_cstring}
+
+// A program and the processes around it -- the reference's `ProcessRunTests` and
+// `RunCommandTests`.
+//
+// **`sysl.process`'s own tests cover the module**; what a `@test` there cannot see is the ORDER of a
+// program's output against its children's, since both go to one place. These build a program, run
+// it, and read its standard output as one stream. The building and running are
+// `tests_rng_impl_composed_run.sysl`'s.
+
+// ---- a program's output against its children's ----
+
+// A C library buffers standard output fully rather than by line whenever it is not a terminal --
+// every pipe, file and CI log. The child writes to the same file description directly, so a parent
+// that had not flushed would have its own earlier text arrive after the child's.
+@test("a program's own output is flushed before a child it starts can write")
+rng_pr_output_is_flushed_before_a_child_writes()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.process.run
+
+        print("parent first")
+        run("echo", ["child second"])
+        print("parent last")
+        """, "parent first\nchild second\nparent last\n")
+
+// The same asked of two children, so a fix that happened to flush once cannot pass.
+@test("each child lands where the parent's output says it should")
+rng_pr_each_child_lands_in_order()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.process.run
+
+        print("one")
+        run("echo", ["two"])
+        print("three")
+        run("echo", ["four"])
+        print("five")
+        """, "one\ntwo\nthree\nfour\nfive\n")
+
+// A capture writes to a file of the module's own rather than to this program's output, so nothing
+// of the child's appears in the stream until the parent prints it.
+@test("a captured child says nothing on its own account")
+rng_pr_a_captured_child_says_nothing()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.process.capture
+
+        print("before")
+        val out = capture("echo", ["captured"]).unwrap()
+        print("after")
+        prints(out.text)
+        """, "before\nafter\ncaptured\n")
+
+// ---- what `sysl run` gives the program it built ----
+//
+// The command once ran a program the way the compiler runs a TOOL -- with its input closed, which is
+// right for `clang` and wrong for a program somebody asked to run: every sysl program that read was
+// handed end-of-input at once. So the driver's own `run` path is driven here IN PROCESS, as the
+// reference drives its `execute`, with this process's descriptor 0 pointed at the input for the
+// length of the call and descriptor 1 at a file the output is read back from.
+
+private extern "open" rng_c_open(path: *u8, flags: int) -> int
+private extern "mkstemp" rng_c_mkstemp(template: *u8) -> int
+private extern "dup" rng_c_dup(fd: int) -> int
+private extern "dup2" rng_c_dup2(from: int, to: int) -> int
+private extern "close" rng_c_close(fd: int) -> int
+
+// What the driver's `run` answers for `text` given `input`: the status and what the program printed.
+private rng_rc_driven(root: string, src: string, input: string) -> (int, string)
+    write_text(s"$root/input", input).unwrap()
+
+    val in_fd = rng_c_open(cstring(s"$root/input").ptr, 0)
+    val template = cstring(s"$root/out-XXXXXX")
+    val out_fd = rng_c_mkstemp(template.ptr)
+
+    assert(in_fd >= 0 && out_fd >= 0, "the input and the capture should both open")
+
+    // Whatever the runner had already buffered goes to the runner's stream, not into the capture.
+    flush()
+
+    val saved_in = rng_c_dup(0)
+    val saved_out = rng_c_dup(1)
+
+    rng_c_dup2(in_fd, 0)
+    rng_c_dup2(out_fd, 1)
+    rng_c_close(in_fd)
+    rng_c_close(out_fd)
+
+    val args: Buf[string] = buf()
+    val code = run_native_program(src, None, None, DefaultOptimization, args) match
+        Ok(n) -> n
+        Err(why) ->
+            print(failure_text(why))
+            -1
+
+    flush()
+    rng_c_dup2(saved_in, 0)
+    rng_c_dup2(saved_out, 1)
+    rng_c_close(saved_in)
+    rng_c_close(saved_out)
+
+    (code, read_text(from_cstring(template.ptr).unwrap()).unwrap_or(""))
+end rng_rc_driven
+
+// The reference's `sysl run` over the same file, its input piped in by a shell.
+private rng_rc_referenced(bin: string, src: string, input: string) -> (int, string)
+    val script = "printf '%s' \"$2\" | \"$0\" run \"$1\""
+    val args = ["-c", script, bin, src, input]
+    val ran = oracle_library(bin) match
+        Some(lib) -> capture("sh", args, "", [Var("SYSL_LIB", lib)], true)
+        None -> capture("sh", args, "", [], true)
+
+    val said = ran match
+        Err(_) -> return (-1, "the reference could not be run")
+        Ok(o) -> o
+
+    val code = said.status match
+        Status.Exited(c) -> c
+        _ -> -1
+
+    (code, said.text)
+end rng_rc_referenced
+
+// The claim each case makes: `sysl run` over `text`, given `input`, exits zero and prints `want` --
+// here, and under the reference where `SYSL_ORACLE` names one.
+private rng_rc_runs(text: string, input: string, want: string)
+    val root = make_temp_dir("sysl-rng").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val ours = rng_rc_driven(root, src, input)
+
+    assert_eq(ours.0, 0, "this compiler's status")
+    assert_eq(ours.1, want, "this compiler")
+
+    env_var("SYSL_ORACLE") match
+        Some(bin) ->
+            val theirs = rng_rc_referenced(bin, src, input)
+
+            assert_eq(theirs.0, 0, "the reference's status")
+            assert_eq(theirs.1, want, rng_label(Some(bin)))
+        None -> ()
+
+    remove_dir_all(root).unwrap_or(())
+end rng_rc_runs
+
+@test("a program run by the driver reads what the driver was given")
+rng_rc_a_program_reads_what_the_driver_was_given()
+    if !rng_ready() then return
+
+    rng_rc_runs(raw"""
+        import sysl.io.{stdin, lines}
+
+        main()
+            var input = stdin()
+            var count = 0
+
+            for line in lines(&input)
+                count += 1
+
+            print(count)
+        """, "one\ntwo\nthree\n", "3\n")
+
+// The bytes and not merely the count: what a program reads is what was written, in order.
+@test("and what it reads is what was written")
+rng_rc_what_it_reads_is_what_was_written()
+    if !rng_ready() then return
+
+    rng_rc_runs(raw"""
+        import sysl.io.{stdin, lines}
+
+        main()
+            var input = stdin()
+
+            for line in lines(&input)
+                print(line)
+        """, "alpha\nbeta\n", "alpha\nbeta\n")
+
+// A program that reads nothing is unaffected -- and is the one that would notice a driver waiting
+// on an input nobody sends.
+@test("a program that reads nothing still runs and still answers")
+rng_rc_a_program_that_reads_nothing()
+    if !rng_ready() then return
+
+    rng_rc_runs("print(21 * 2)\n", "", "42\n")
