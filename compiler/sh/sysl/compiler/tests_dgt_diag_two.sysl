@@ -1,0 +1,134 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_bytes}
+import sysl.text.Search
+
+// Two refusals a reader meets before any analysis: a visibility bracket written as a path, and a
+// source file that is not UTF-8. The first is the reference's message at the reference's position;
+// the second was a panic inside the library's `read_text` and is now the lexer's `illegal character`
+// at the offending byte, the compiler returning its ordinary refusal status.
+
+private dgt_ready() -> bool = std_root().is_ok()
+
+// A project holding one `main.sysl` of exactly these bytes, run through `sysl <command>`: the first
+// line said, the absolute root a diagnostic quotes, and the status.
+private dgt_run(command: string, bytes: []const u8) -> (string, string, int)
+    val root = make_temp_dir("sysl-dgt").unwrap()
+
+    write_bytes(s"$root/main.sysl", bytes).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", command, root], (line) -> sink.push(line))
+    val out = if lines.is_empty() then "" else lines.at(0)
+
+    remove_dir_all(root).unwrap_or(())
+    (out, absolute_path(root), code)
+end dgt_run
+
+// Text with one run of raw bytes spliced in, which no string literal can hold.
+private dgt_with(before: string, bad: []const u8, after: string) -> []u8
+    var b: Buf[u8] = buf()
+
+    for x in before.bytes do b.push(x)
+    for x in bad do b.push(x)
+    for x in after.bytes do b.push(x)
+
+    b.view()
+end dgt_with
+
+private dgt_private_words(name: string) -> string =
+    "'private[…]' names one enclosing module by its simple name rather than by a path — the name " +
+    s"is matched against the modules around this declaration, innermost first, so write 'private[$name]'"
+
+@test("a path of three segments in a visibility bracket is refused at its first dot, naming the last")
+dgt_a_long_bracket_path_names_its_last_segment()
+    if !dgt_ready() then return
+
+    val (out, root, code) = dgt_run("build", "private[a.b.c] f() -> int = 1\n\nmain() -> unit\n    print(f())\n".bytes)
+
+    assert_eq(code, 1)
+    assert_eq(out, s"error: ${dgt_private_words("c")}\n --> $root/main.sysl:1:10\n  |\n" +
+                   "1 | private[a.b.c] f() -> int = 1\n  |          ^")
+end dgt_a_long_bracket_path_names_its_last_segment
+
+@test("a bracket path missing its last segment is 'identifier expected' at the bracket, as the reference says")
+dgt_a_bracket_path_missing_a_segment()
+    if !dgt_ready() then return
+
+    val (out, root, code) = dgt_run("build", "private[a.] f() -> int = 1\n\nmain() -> unit\n    print(f())\n".bytes)
+
+    assert_eq(code, 1)
+    assert_eq(out, s"error: identifier expected\n --> $root/main.sysl:1:11\n  |\n" +
+                   "1 | private[a.] f() -> int = 1\n  |           ^")
+end dgt_a_bracket_path_missing_a_segment
+
+@test("a bracket holding one simple name parses with nothing said")
+dgt_a_simple_bracket_is_not_refused()
+    val parsed = parse(source_of("t.sysl", "private[math] f() -> int = 1\n"))
+
+    assert(parsed.ok())
+
+@test("a byte that is not UTF-8 is an illegal character at its line and column, not a panic")
+dgt_a_stray_byte_is_refused()
+    if !dgt_ready() then return
+
+    val (out, root, code) = dgt_run("build", dgt_with("main() -> unit\n    print(1) ", [0xFF], "\n"))
+
+    assert_eq(code, 1)
+    assert(out.starts_with("error: illegal character: the byte 0xFF does not start a well-formed UTF-8 character"))
+    assert(out.contains(s"\n --> $root/main.sysl:2:14\n"))
+end dgt_a_stray_byte_is_refused
+
+@test("a lone surrogate inside a string literal is refused at its first byte")
+dgt_a_surrogate_in_a_string_is_refused()
+    if !dgt_ready() then return
+
+    val (out, root, code) = dgt_run("build", dgt_with("main() -> unit\n    print(\"a", [0xED, 0xA0, 0x80], "b\")\n"))
+
+    assert_eq(code, 1)
+    assert(out.starts_with("error: illegal character: the byte 0xED"))
+    assert(out.contains(s"\n --> $root/main.sysl:2:13\n"))
+end dgt_a_surrogate_in_a_string_is_refused
+
+@test("a stray byte inside a comment is refused too, the whole file being read as UTF-8")
+dgt_a_stray_byte_in_a_comment_is_refused()
+    if !dgt_ready() then return
+
+    val (out, root, code) = dgt_run("build", dgt_with("// caf", [0xE9], "\nmain() -> unit\n    print(1)\n"))
+
+    assert_eq(code, 1)
+    assert(out.starts_with("error: illegal character: the byte 0xE9"))
+    assert(out.contains(s"\n --> $root/main.sysl:1:7\n"))
+end dgt_a_stray_byte_in_a_comment_is_refused
+
+@test("a sequence cut off by the end of the file is refused at its lead byte, by 'emit-ast' too")
+dgt_a_truncated_sequence_at_the_end_is_refused()
+    val root = make_temp_dir("sysl-dgt").unwrap()
+    val file = s"$root/cut.sysl"
+
+    write_bytes(file, dgt_with("main() -> unit\n    print(1)\n", [0xC3], "")).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "emit-ast", file], (line) -> sink.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(code, 1)
+    assert(lines.at(0).starts_with("error: illegal character: the byte 0xC3"))
+    assert(lines.at(0).contains(s"\n --> $file:3:1\n"))
+end dgt_a_truncated_sequence_at_the_end_is_refused
+
+@test("a file whose every byte is UTF-8, accents included, builds")
+dgt_well_formed_utf8_builds()
+    if !dgt_ready() then return
+
+    val (out, _, code) = dgt_run("build", "// café\nmain() -> unit\n    print(\"naïve ☃\")\n".bytes)
+
+    assert_eq(out.starts_with("error"), false)
+    assert_eq(code, 0)
+end dgt_well_formed_utf8_builds
