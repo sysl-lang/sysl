@@ -1,0 +1,357 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `sysl.posix.tty` -- whether escapes should be written at all, and cbreak mode.
+//
+// **The split from `sysl.term` is itself under test**: a capability requirement is module-wide, so
+// `isatty` beside the constants would have taken all of them away from an allocator-free, OS-free
+// program. A run hands the program a pipe, so `is_tty` is false for every descriptor and anything
+// gated on it is false with it -- which is why `color_wanted`, the environment's half, is asked
+// directly, the program setting its own environment through `setenv`. The last section runs the
+// program **on a real terminal**, made by the system's `script`, which is the only way to reach the
+// branch of `raw` that changes a terminal's settings. `twp_prints` is in `tests_twp_width.sysl`.
+
+// A program with the module imported and `set`/`clear` over the environment. Both variables start
+// unset, so no test inherits the runner's own TERM.
+private twp_tty(src: string) -> string = raw"""
+    import sysl.posix.tty.*
+    import sysl.text.cstring
+
+    extern "setenv" c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+    extern "unsetenv" c_unsetenv(name: *u8) -> int
+
+    set(name: string, value: string)
+        val n = cstring(name)
+        val v = cstring(value)
+
+        c_setenv(n.ptr, v.ptr, 1)
+    end set
+
+    clear(name: string)
+        val n = cstring(name)
+
+        c_unsetenv(n.ptr)
+    end clear
+
+    clear("NO_COLOR")
+    clear("TERM")
+
+    """ + src + "\n"
+
+@test("is not one, and neither standard stream is under the harness")
+twp_y_no_standard_stream_is_a_terminal()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("print(is_tty(1), is_tty(2))"), "false false\n")
+
+@test("and neither is a descriptor that is not open at all")
+twp_y_an_unopened_descriptor_is_not_a_terminal()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("print(is_tty(37))"), "false\n")
+
+@test("so colour is off, however much the environment wants it")
+twp_y_colour_is_off_without_a_terminal()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("set(\"TERM\", \"xterm-256color\")\n\nprint(color(), color_err(), color_on(1))"), "false false false\n")
+
+// NO_COLOR is about presence, not value.
+@test("so any non-empty value turns colour off, including '0'")
+twp_y_no_color_zero_turns_colour_off()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("set(\"NO_COLOR\", \"0\")\n\nprint(color_wanted())"), "false\n")
+
+@test("and so does a value nobody would call true")
+twp_y_no_color_no_turns_colour_off()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("set(\"NO_COLOR\", \"no\")\n\nprint(color_wanted())"), "false\n")
+
+@test("while an empty value does not, which is the difference from merely being set")
+twp_y_an_empty_no_color_does_not()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("set(\"NO_COLOR\", \"\")\n\nprint(color_wanted())"), "true\n")
+
+@test("and unset does not either")
+twp_y_an_unset_no_color_does_not()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("print(color_wanted())"), "true\n")
+
+@test("a dumb one cannot, so colour is not wanted")
+twp_y_a_dumb_terminal_wants_no_colour()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("set(\"TERM\", \"dumb\")\n\nprint(color_wanted())"), "false\n")
+
+// An exact match, not a prefix.
+@test("and the match is the whole value, not a prefix of it")
+twp_y_dumber_is_not_dumb()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("set(\"TERM\", \"dumber\")\n\nprint(color_wanted())"), "true\n")
+
+@test("an ordinary one can")
+twp_y_an_ordinary_terminal_wants_colour()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("set(\"TERM\", \"xterm-256color\")\n\nprint(color_wanted())"), "true\n")
+
+// `isatty` answers whether there is a terminal; this is only asked what kind.
+@test("and unset is not dumb — that is the other question")
+twp_y_an_unset_term_is_not_dumb()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("print(color_wanted())"), "true\n")
+
+@test("binds the two escapes first, and writes nothing when output is not a terminal")
+twp_y_the_documented_diagnostic()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty(raw"""
+        import sysl.term.{red, reset}
+
+        val paint = color()
+        val on    = if paint then red else ""
+        val off   = if paint then reset else ""
+
+        print(f"${on}error${off}: not found")
+        """), "error: not found\n")
+
+// A `"` inside `${…}` closes nothing.
+@test("and says the same inline, where the escape is chosen inside the interpolation")
+twp_y_the_documented_diagnostic_inline()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty(raw"""
+        import sysl.term.{red, reset}
+
+        val paint = color()
+
+        print(f"${if paint then red else ""}error${if paint then reset else ""}: not found")
+        """), "error: not found\n")
+
+@test("NO_COLOR beats a capable terminal")
+twp_y_no_color_beats_a_capable_terminal()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("set(\"TERM\", \"xterm-256color\")\nset(\"NO_COLOR\", \"1\")\n\nprint(color_wanted())"), "false\n")
+
+@test("a module with no allocator and no OS may still name a colour")
+twp_y_a_bare_module_may_name_a_colour()
+    if !twp_ready() then return
+
+    twp_prints("@no_alloc\n@no_os\n@no_posix\n\nimport sysl.term.red\n\nprint(red.len)\n", "5\n")
+
+// What this compiler says about `text`, or -- given the reference -- what the reference says.
+private twp_refusal(text: string, reference: Option[string]) -> string
+    val root = make_temp_dir("sysl-twp").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = reference match
+        None ->
+            emit_llvm_text(src, None) match
+                Err(why) -> why.message
+                Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+        Some(bin) ->
+            capture_oracle(bin, ["build", src, "-o", s"$root/built"]) match
+                Err(_) -> "the reference could not be run"
+                Ok(o) -> o.err.unwrap_or(o.text)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end twp_refusal
+
+@test("while the same module may not ask whether to use it")
+twp_y_a_bare_module_may_not_ask()
+    if !twp_ready() then return
+
+    val text = "@no_posix\n\nimport sysl.posix.tty.color\n\nprint(color())\n"
+    val want = "this reaches 'sysl.posix.tty', which requires 'posix', and this module declared 'no posix' — an " +
+               "environment capability gates which modules exist, so a module that gave one up may not reach one " +
+               "that needs it"
+    val e = twp_refusal(text, None)
+
+    assert(e.contains(want), e)
+
+    env_var("SYSL_ORACLE") match
+        Some(bin) ->
+            val r = twp_refusal(text, Some(bin))
+
+            assert(r.contains(want), r)
+        None -> ()
+
+// Every run above hands the program a pipe, so `raw` takes its early exit -- which is why these are
+// safe to have at all.
+@test("raw() refuses, because there is nothing to change")
+twp_y_raw_refuses_without_a_terminal()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("print(raw())"), "false\n")
+
+// A refused `raw` leaves nothing behind for `cooked` to undo.
+@test("and cooked() afterwards does nothing, having nothing to put back")
+twp_y_cooked_after_a_refused_raw()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("raw()\ncooked()\nprint(\"done\")"), "done\n")
+
+@test("as does cooked() on its own")
+twp_y_cooked_on_its_own()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("cooked()\nprint(\"done\")"), "done\n")
+
+@test("and asking twice answers the same and costs nothing more")
+twp_y_raw_asked_twice()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("print(raw(), raw())"), "false false\n")
+
+@test("so a program picks its reader from the answer")
+twp_y_a_program_picks_its_reader()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty(raw"""
+        import sysl.io.{stdin, console_lines}
+
+        if raw()
+            print("editing")
+        else
+            var input = stdin()
+            var cursor = console_lines(&input)
+
+            print("cooked")
+        """), "cooked\n")
+
+// Whether this machine has a `script` to make a terminal with.
+private twp_script_available() -> bool = capture("sh", ["-c", "command -v script"]) match
+    Ok(o) -> o.text.len > 0
+    Err(_) -> false
+
+// Runs `text` attached to a pseudo-terminal made by `script`, with `typed` typed at it, then `after`
+// in the same terminal once the program has left it; answers everything the terminal showed.
+//
+// **The input is delayed by a second, inside the subshell**: anything arriving before the program
+// calls `stty` is handled by a line discipline still in canonical mode and then discarded. BSD
+// `script` takes the command as trailing words, util-linux's through `-c`.
+private twp_on_tty(text: string, typed: string, after: string, reference: Option[string]) -> string
+    val root = make_temp_dir("sysl-twp").unwrap()
+
+    make_dir_all(root).unwrap()
+
+    val out = twp_build(root, text, reference) match
+        Err(why) -> why
+        Ok(exe) ->
+            write_text(s"$root/typed", typed).unwrap()
+            write_text(s"$root/session.sh", s"$exe\n$after\n").unwrap()
+
+            val bsd = capture("uname", []).map((o) -> o.text.starts_with("Darwin")).unwrap_or(false)
+            var under = s"script -qc 'sh $root/session.sh' /dev/null"
+
+            if bsd then under = s"script -q /dev/null sh $root/session.sh"
+
+            capture("sh", ["-c", s"( sleep 1; cat $root/typed ) | $under"], "", [], true, 60000) match
+                Err(_) -> "script could not be run"
+                Ok(o) -> o.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end twp_on_tty
+
+// The claim of a terminal case: what the terminal showed holds every one of `wants`, here and under
+// the reference. `script` adds its own noise, so the claim is containment rather than equality.
+private twp_tty_shows(text: string, typed: string, after: string, wants: []const string)
+    val here = twp_on_tty(text, typed, after, None)
+
+    for w in wants do assert(here.contains(w), here)
+
+    env_var("SYSL_ORACLE") match
+        Some(bin) ->
+            val there = twp_on_tty(text, typed, after, Some(bin))
+
+            for w in wants do assert(there.contains(w), there)
+        None -> ()
+end twp_tty_shows
+
+@test("raw() succeeds, where the tests above could only watch it decline")
+twp_y_raw_succeeds_on_a_terminal()
+    if !twp_ready() then return
+
+    if !twp_script_available()
+        print("skipped: there is no 'script' on this machine to make a terminal with")
+        return
+
+    twp_tty_shows("import sysl.posix.tty.{is_tty, raw, cooked}\n\nprint(\"tty:\", is_tty(0))\nprint(\"raw:\", raw())\ncooked()\n",
+                  "", "", ["raw: true"])
+
+// Bytes arrive as they are typed, and nothing but the editor echoes them.
+@test("and the editor then reads what is typed, a keystroke at a time")
+twp_y_the_editor_reads_a_terminal()
+    if !twp_ready() then return
+
+    if !twp_script_available()
+        print("skipped: there is no 'script' on this machine to make a terminal with")
+        return
+
+    twp_tty_shows(raw"""
+        import sysl.term.edit.editor
+        import sysl.io.stdin
+        import sysl.posix.tty.{raw, cooked}
+
+        var input = stdin()
+
+        if raw()
+            var ed = editor(&input, stdout())
+
+            for line in ed do print("got", line)
+            cooked()
+        """, "abc\r\u{4}", "", ["got abc"])
+
+// The regression for the deadlock: Ctrl-C is a byte here rather than a signal, so the program is
+// still alive afterwards and goes on reading.
+@test("Ctrl-C abandons the line without ending the program")
+twp_y_ctrl_c_abandons_the_line()
+    if !twp_ready() then return
+
+    if !twp_script_available()
+        print("skipped: there is no 'script' on this machine to make a terminal with")
+        return
+
+    twp_tty_shows(raw"""
+        import sysl.term.edit.editor
+        import sysl.io.stdin
+        import sysl.posix.tty.{raw, cooked}
+
+        var input = stdin()
+
+        if raw()
+            var ed = editor(&input, stdout())
+
+            for line in ed do print("got [" + line + "]")
+            cooked()
+            print("ended")
+        """, "abc\u{3}xy\r\u{4}", "", ["got []", "got [xy]", "ended"])
+
+// `after` asks the terminal itself once the program has left it: no `-echo` means echo is on.
+@test("and the terminal is put back when the program leaves it")
+twp_y_the_terminal_is_put_back()
+    if !twp_ready() then return
+
+    if !twp_script_available()
+        print("skipped: there is no 'script' on this machine to make a terminal with")
+        return
+
+    twp_tty_shows("import sysl.posix.tty.{raw, cooked}\n\nif raw() then cooked()\n", "",
+                  raw"stty -a | tr ' ' '\n' | grep -c '^-echo$'", ["0"])
