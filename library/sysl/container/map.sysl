@@ -29,7 +29,8 @@ module sysl.container
  * anything, since the number it needs is already sitting beside the key.
  *
  * **An empty map has no table**, which is the fourth piece and the only one that is about what a map
- * costs when nothing is in it. `map()` allocates nothing; the first `put` makes the table. A program
+ * costs when nothing is in it. `map()` allocates only the small cell every name for the map shares;
+ * the first `put` makes the table. A program
  * that builds a map per loop iteration, or holds one in a struct that is usually empty, or makes one
  * on a branch that turns out not to be taken, pays nothing for any of them -- and none of those
  * callers could see that they were paying before, which is why the fix belongs here rather than at
@@ -142,27 +143,100 @@ end Slot
 
 /** A mapping from keys to values, with a key found in constant time on average.
  *
- * `dead` is carried rather than recomputed because it decides when to rehash and is asked for on
- * every insert; counting tombstones would be a walk of the whole table to answer a question about
- * one slot.
+ * **A `Map` is a reference to one table, like Scala's `mutable.HashMap`.** Assigning it, passing it,
+ * capturing it in a closure or reading it out of another container gives a second name for the same
+ * map, so a `put` through either name is seen through both:
+ *
+ * ```sysl
+ * var m: Map[int, int] = map()
+ * var n = m
+ *
+ * n.put(1, 10)
+ * print(m.len(), m.get(1).unwrap_or(0))      // 1 10
+ * ```
+ *
+ * **It has no zero value**, the table it names having to exist, so a declaration says where its map
+ * comes from: `var m: Map[string, int] = map()`.
+ *
+ * What a `Map` holds is one counted reference to a `MapCore`, which carries the table and its two
+ * counts. Holding the counts beside the table is what makes the sharing whole: a map whose copies
+ * each carried their own counts over one shared table would let a `put` through one copy write an
+ * entry the other's count never learned of.
  */
 struct Map[K: Hash + Eq, V]
-    cell: []Slot[K, V]
-    count: usize
-    dead: usize
+    private core: &MapCore[K, V]
 
-    len(self) -> usize = self.count
+    /** The table itself, every slot of it, for a reader that wants to look rather than ask. Read
+     * only: the map owns its table, and the counts beside it say what is in it.
+     */
+    cell -> []Slot[K, V] = self.core.cell
 
-    is_empty(self) -> bool = self.count == 0
+    /** How many entries are live. The same number `len()` answers. */
+    count -> usize = self.core.count
+
+    /** How many tombstones the table is carrying. */
+    dead -> usize = self.core.dead
+
+    len(self) -> usize = self.core.count
+
+    is_empty(self) -> bool = self.core.count == 0
 
     /** How many slots the table has, which is what the load factor is measured against. It is not a
      * promise about how many entries fit -- the map rehashes at three quarters of this.
      *
      * **A map that has never been put into answers zero**, because it has no table: one is made by
      * the first insert. That is the one number here a caller might be surprised by, and it is the
-     * whole of what "an empty map does not allocate" looks like from outside.
+     * whole of what "an empty map holds no table" looks like from outside.
      */
-    capacity(self) -> usize = self.cell.len
+    capacity(self) -> usize = self.core.cell.len
+
+    @inline
+    get(self, k: K) -> Option[V] = self.core.get(k)
+
+    /** The value a key names, or the one the caller supplies where it names none. The common shape
+     * of reading a counter or an accumulator that may not have been started yet.
+     */
+    get_or(self, k: K, default: V) -> V = self.core.get(k).unwrap_or(default)
+
+    @inline
+    has(self, k: K) -> bool = self.core.find(k).is_some()
+
+    /** A key given a value: the entry it already had takes the new one, or a fresh entry is placed.
+     * Every name for this map sees it.
+     */
+    @inline
+    put(*self, k: K, v: V) = self.core.put(k, v)
+
+    /** A key taken out, answering whether it was there. */
+    remove(*self, k: K) -> bool = self.core.remove(k)
+
+    /** Every entry dropped and the table let go entirely; see `MapCore.clear`. */
+    clear(*self) = self.core.clear()
+
+    /** A cursor over the entries, in no particular order -- the order is the table's, which changes
+     * when it rehashes and is not something a program may rely on.
+     *
+     * **Do not modify the map while a cursor over it is live.** Doing so is memory-safe and nothing
+     * more: the cursor holds the table as a view, so it keeps that storage alive and can never read
+     * freed memory even when a `put` rehashes and hands the map different storage entirely. What it
+     * *yields* in that case is unspecified. A `put` before the rehash writes into the very table the
+     * cursor is walking and may be yielded; one after it goes somewhere the cursor cannot see and
+     * will not be. Which side of the line a given `put` falls on depends on the load factor, so
+     * there is no rule here worth learning -- collect what is wanted first, then modify.
+     */
+    walk(self) -> Cursor[K, V] = Cursor(self.core.cell, 0)
+end Map
+
+/** The table a `Map` names, and the two counts that describe it.
+ *
+ * `dead` is carried rather than recomputed because it decides when to rehash and is asked for on
+ * every insert; counting tombstones would be a walk of the whole table to answer a question about
+ * one slot.
+ */
+private[container] struct MapCore[K: Hash + Eq, V]
+    cell: []Slot[K, V]
+    count: usize
+    dead: usize
 
     /** The index a key's entry sits at, or `None`.
      *
@@ -174,7 +248,7 @@ struct Map[K: Hash + Eq, V]
      * first `put`, so `cell` is empty until then, and `cell.len - 1` on an empty run is not a mask
      * of no bits -- it is every bit, and the index it makes is off the end.
      */
-    private find(self, k: K) -> Option[usize]
+    find(self, k: K) -> Option[usize]
         if self.cell.len == 0 then return None
 
         val h = k.hash()
@@ -194,13 +268,6 @@ struct Map[K: Hash + Eq, V]
         self.find(k) match
             None -> None
             Some(i) -> self.cell[i].value()
-
-    /** The value a key names, or the one the caller supplies where it names none. The common shape
-     * of reading a counter or an accumulator that may not have been started yet.
-     */
-    get_or(self, k: K, default: V) -> V = self.get(k).unwrap_or(default)
-
-    has(self, k: K) -> bool = self.find(k).is_some()
 
     /** A key given a value: the entry it already had takes the new one, or a fresh entry is placed.
      *
@@ -308,41 +375,30 @@ struct Map[K: Hash + Eq, V]
 
         self.cell[i] = Slot.Live(h, k, v)
     end place
-
-    /** A cursor over the entries, in no particular order -- the order is the table's, which changes
-     * when it rehashes and is not something a program may rely on.
-     *
-     * **Do not modify the map while a cursor over it is live.** Doing so is memory-safe and nothing
-     * more: the cursor holds the table as a view, so it keeps that storage alive and can never read
-     * freed memory even when a `put` rehashes and hands the map different storage entirely. What it
-     * *yields* in that case is unspecified. A `put` before the rehash writes into the very table the
-     * cursor is walking and may be yielded; one after it goes somewhere the cursor cannot see and
-     * will not be. Which side of the line a given `put` falls on depends on the load factor, so
-     * there is no rule here worth learning -- collect what is wanted first, then modify.
-     */
-    walk(self) -> Cursor[K, V] = Cursor(self.cell, 0)
-end Map
+end MapCore
 
 /** An empty map, which holds **no table at all** until something is put in it.
  *
- * **An empty map does not allocate**, which matters far more than it looks: a map built inside a
- * loop, held in a struct that is usually empty, or made and dropped on a branch that turns out not
- * to be taken costs a `malloc` and the `free` behind it every time, and no caller can see that it is
- * paying. The first `put` finds the table over its load -- nothing is over nothing -- and rehashes
- * to `initial_slots` before it places anything, which is the path `put` already took for a table
- * that had filled up. So there is no separate "grow from empty" case to get wrong.
+ * **An empty map allocates one small cell and no table**, which matters far more than it looks: a
+ * map built inside a loop, held in a struct that is usually empty, or made and dropped on a branch
+ * that turns out not to be taken would otherwise pay for a table of slots every time, and no caller
+ * can see that it is paying. The cell is the `MapCore` every name for the map shares -- three words,
+ * whatever the key and value. The first `put` finds the table over its load -- nothing is over
+ * nothing -- and rehashes to `initial_slots` before it places anything, which is the path `put`
+ * already took for a table that had filled up. So there is no separate "grow from empty" case to get
+ * wrong.
  *
  * Reach for `map_with_capacity` where entries are known to be coming: a caller who names a size is
  * saying so, and gets its table immediately.
  *
- * **The annotation on `m` is required and is not noise.** `Map`'s parameters would have to come from
- * the constructor's arguments while the empty table waits to hear what it is a table of, and neither
- * can go first.
+ * **The annotation on `core` is required and is not noise.** `MapCore`'s parameters would have to
+ * come from the constructor's arguments while the empty table waits to hear what it is a table of,
+ * and neither can go first.
  */
 map[K: Hash + Eq, V]() -> Map[K, V]
-    var m: Map[K, V] = Map([], 0, 0)
+    val core: &MapCore[K, V] = MapCore([], 0, 0)
 
-    m
+    Map(core)
 
 /** A map whose table is already big enough for `n` entries without rehashing, for a caller that knows
  * roughly how many are coming. The table is sized to twice `n` because the map rehashes at three
@@ -354,9 +410,9 @@ map_with_capacity[K: Hash + Eq, V](n: usize) -> Map[K, V]
     while want < n * 2
         want *= 2
 
-    var m: Map[K, V] = Map([Slot.Empty; want], 0, 0)
+    val core: &MapCore[K, V] = MapCore([Slot.Empty; want], 0, 0)
 
-    m
+    Map(core)
 end map_with_capacity
 
 // ------------------------------------------------------------------------------------- walking
