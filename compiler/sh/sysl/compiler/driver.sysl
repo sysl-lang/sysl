@@ -329,6 +329,13 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
 
     if !strayed.is_empty() then return Err(Reported(joined_reports(strayed)))
 
+    // **Before the analysis, because it is about what a CONSUMER would compile.** A dev dependency
+    // is in scope for the whole of a test build, so an ordinary module importing one type-checks
+    // here and is refused for everybody else (`check_dev_imports`).
+    val dev_refused = dev_import_reports(mine_units, fetched.dev_modules)
+
+    if !dev_refused.is_empty() then return Err(Reported(analysis_report(dev_refused)))
+
     for i in 0..<mine_units.len()
         own.push(module_written(mine_units.at(i)))
 
@@ -444,6 +451,27 @@ private location_reports(found: Buf[Found], units: Buf[Program]) -> Buf[string]
 
     out
 end location_reports
+
+// Every import of a dev dependency the project's own files make outside its tests, each placed in
+// the file that wrote it. Nothing where the build resolved no dev dependency.
+private dev_import_reports(units: Buf[Program], dev: Buf[string]) -> Buf[Placed]
+    var out: Buf[Placed] = buf()
+
+    if dev.is_empty() then return out
+
+    for i in 0..<units.len()
+        var one: Buf[Program] = buf()
+
+        one.push(units.at(i))
+
+        check_dev_imports(one, dev) match
+            Ok(_) -> ()
+            Err(found) ->
+                for j in 0..<found.len()
+                    out.push(Placed(units.at(i).src, found.at(j)))
+
+    out
+end dev_import_reports
 
 // Several rendered reports, one blank line between each, as an analysis report separates them.
 joined_reports(all: Buf[string]) -> string

@@ -1,0 +1,206 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// **`dev_dependencies` are RESOLVED, and only by `sysl test` of the project that names them**
+// (`reference/packages.md § Dependencies a test alone needs`): a test build folds them into the one
+// graph, so a `@tests` file may import one and `sysl.sum` records it; every other command leaves the
+// block unread; a dependency's own dev block is never fetched; and an ordinary module importing one
+// is refused, in the reference's words, before anything is analyzed. The import check's own cases
+// are `tests_fea_features.sysl`'s `fea_dev_`; these are the resolution around it.
+
+private ddp_ready() -> bool = std_root().is_ok() && clang_available()
+
+private ddp_temp() -> string = absolute_path(make_temp_dir("sysl-ddp").unwrap())
+
+private ddp_drop(dirs: []string)
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+// The package `github.com/e/extra` at 1.0.0, whose one module is `sh.sysl.extra`, published in the
+// project's `vendor/` as a fetch would have left it -- so nothing here reaches the network.
+private ddp_publish_extra(project: string)
+    val dir = s"$project/vendor/github.com/e/extra/@v1.0.0"
+
+    make_dir_all(s"$dir/sh/sysl/extra").unwrap()
+    write_text(s"$dir/package.hocon", "package { name = \"extra\", version = \"1.0.0\" }\n").unwrap()
+    write_text(s"$dir/sh/sysl/extra/extra.sysl", "module sh.sysl.extra\n\nseven() -> int = 7\n").unwrap()
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+end ddp_publish_extra
+
+private ddp_extra_entry() -> string = "extra { git = \"github.com/e/extra\", version = \"1.0.0\" }"
+
+// A project `app` with the given blocks, its module `app` holding `lib` and its `@tests` file `tests`.
+private ddp_project(blocks: string, lib: string, tests: string) -> string
+    val dir = ddp_temp()
+
+    make_dir_all(s"$dir/app").unwrap()
+    write_text(s"$dir/package.hocon", s"package { name = \"app\", version = \"1.0.0\" }\n$blocks").unwrap()
+    write_text(s"$dir/app/app.sysl", s"module app\n\n$lib\n").unwrap()
+
+    if !tests.is_empty() then write_text(s"$dir/app/tests.sysl", s"module app\n@tests\n\n$tests\n").unwrap()
+
+    dir
+end ddp_project
+
+// A command line, run in process, with the test flag and the search paths put back afterwards.
+private ddp_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    reset_feature_request()
+    reset_search_paths()
+    (code, join(lines.view(), "\n"))
+end ddp_cli
+
+private ddp_labels(deps: Buf[Dependency]) -> string
+    var out: Buf[string] = buf()
+
+    for i in 0..<deps.len()
+        out.push(deps.at(i).label)
+
+    join(out.view(), ",")
+end ddp_labels
+
+private ddp_reaching_test() -> string =
+    "import sh.sysl.extra\n\n@test(\"reaches the dev dependency\")\nreaches()\n" +
+    "    assert(extra.seven() == 7, \"seven\")"
+
+// -- the graph -------------------------------------------------------------------------------------
+
+@test("a dev dependency asks for a graph under 'sysl test' and under nothing else")
+ddp_wants_a_graph_only_under_test()
+    reset_feature_request()
+
+    val m = read_manifest(s"dev_dependencies { ${ddp_extra_entry()} }\n").unwrap()
+
+    assert(!wants_graph(m), "a build wanted a graph for a dev dependency")
+    assert(with_dev_dependencies(m).dependencies.is_empty(), "a build folded the dev block in")
+
+    set_feature_testing()
+
+    assert(wants_graph(m), "a test build did not want the graph")
+    assert_eq(ddp_labels(with_dev_dependencies(m).dependencies), "extra")
+    reset_feature_request()
+
+@test("a test build folds the dev block in after the ordinary one")
+ddp_folds_after_the_ordinary_block()
+    reset_feature_request()
+    set_feature_testing()
+
+    val m = read_manifest("dependencies { a { path = \"../a\" } }\n" +
+                          "dev_dependencies { b { path = \"../b\" } }\n").unwrap()
+
+    assert_eq(ddp_labels(with_dev_dependencies(m).dependencies), "a,b")
+    reset_feature_request()
+
+// -- sysl test ---------------------------------------------------------------------------------------
+
+// The FunL session's case: a `@tests` file importing a package only the dev block names was refused
+// as `no module is called 'sh.sysl.pcre2', and nothing declares it`.
+@test("'sysl test' resolves a dev dependency, and a '@tests' file imports it")
+ddp_test_resolves_a_dev_dependency()
+    if !ddp_ready() then return
+
+    val project = ddp_project(s"dev_dependencies { ${ddp_extra_entry()} }\n", "one() -> int = 1",
+                              ddp_reaching_test())
+
+    ddp_publish_extra(project)
+
+    val (code, said) = ddp_cli(["sysl", "test", project])
+
+    // The suite reports on the terminal rather than through `say`, so its exit is the verdict: a
+    // failing or unbuilt test answers `Failed`.
+    assert(code == Fine, said)
+    ddp_drop([project])
+
+@test("and 'sysl.sum' records it")
+ddp_the_sum_records_a_dev_dependency()
+    if !ddp_ready() then return
+
+    val project = ddp_project(s"dev_dependencies { ${ddp_extra_entry()} }\n", "one() -> int = 1",
+                              ddp_reaching_test())
+
+    ddp_publish_extra(project)
+
+    val (code, said) = ddp_cli(["sysl", "test", project])
+
+    assert_eq(code, Fine)
+    assert(is_file(s"$project/$SumsName"), s"no $SumsName was written: $said")
+    assert(read_text(s"$project/$SumsName").unwrap().index_of("github.com/e/extra v1.0.0").is_some(),
+           read_text(s"$project/$SumsName").unwrap())
+    ddp_drop([project])
+
+@test("an ordinary module importing a dev dependency is refused by 'sysl test', in the reference's words")
+ddp_an_ordinary_import_is_refused()
+    if !ddp_ready() then return
+
+    val project = ddp_project(s"dev_dependencies { ${ddp_extra_entry()} }\n",
+                              "import sh.sysl.extra\n\none() -> int = extra.seven()",
+                              ddp_reaching_test())
+
+    ddp_publish_extra(project)
+
+    val (code, said) = ddp_cli(["sysl", "test", project])
+
+    assert_eq(code, Failed)
+    assert(said.index_of(dev_import_refusal("sh.sysl.extra", "sh.sysl.extra")).is_some(), said)
+    ddp_drop([project])
+
+// -- every other command -----------------------------------------------------------------------------
+
+// A dev block naming a directory that is not there: a command that read it would be refused.
+@test("'sysl build' does not resolve a dev dependency, where 'sysl test' does")
+ddp_build_leaves_the_dev_block_unread()
+    if !ddp_ready() then return
+
+    val gone = s"${ddp_temp()}/not-there"
+    val blocks = s"dev_dependencies { gone { path = \"$gone\" } }\n"
+    val program = ddp_temp()
+    val out_dir = ddp_temp()
+
+    write_text(s"$program/package.hocon", s"package { name = \"prog\", version = \"1.0.0\" }\n$blocks")
+        .unwrap()
+    write_text(s"$program/main.sysl", "print(1)\n").unwrap()
+
+    val built = ddp_cli(["sysl", "build", program, "-o", s"$out_dir/program"])
+
+    assert_eq(built.0, Fine)
+
+    val project = ddp_project(blocks, "one() -> int = 1",
+                              "@test(\"one\")\nis_one()\n    assert(one() == 1, \"one\")")
+    val tested = ddp_cli(["sysl", "test", project])
+
+    assert_eq(tested.0, Failed)
+    assert(tested.1.index_of(gone).is_some(), tested.1)
+    ddp_drop([program, out_dir, project, parent_of(gone).unwrap()])
+end ddp_build_leaves_the_dev_block_unread
+
+// -- a dependency's dev block ------------------------------------------------------------------------
+
+@test("a dependency's own dev dependencies are never fetched")
+ddp_a_dependencys_dev_block_is_never_read()
+    if !ddp_ready() then return
+
+    val lib = ddp_temp()
+    val gone = s"${ddp_temp()}/not-there"
+
+    make_dir_all(s"$lib/lib").unwrap()
+    write_text(s"$lib/package.hocon", "package { name = \"lib\", version = \"1.0.0\" }\n" +
+               s"dev_dependencies { gone { path = \"$gone\" } }\n").unwrap()
+    write_text(s"$lib/lib/lib.sysl", "module lib\n\nthree() -> int = 3\n").unwrap()
+
+    val project = ddp_project(s"dependencies { lib { path = \"$lib\" } }\n", "one() -> int = 1",
+                              "import lib\n\n@test(\"reaches lib\")\nreaches()\n" +
+                              "    assert(lib.three() == 3, \"three\")")
+    val (code, said) = ddp_cli(["sysl", "test", project])
+
+    // The suite reports on the terminal rather than through `say`, so its exit is the verdict: a
+    // failing or unbuilt test answers `Failed`.
+    assert(code == Fine, said)
+    ddp_drop([lib, project, parent_of(gone).unwrap()])
+end ddp_a_dependencys_dev_block_is_never_read
