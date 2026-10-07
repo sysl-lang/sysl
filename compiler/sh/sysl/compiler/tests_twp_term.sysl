@@ -1,0 +1,135 @@
+module sh.sysl.compiler
+@tests
+
+// `sysl.term` -- the escape sequences a terminal understands. A module of transcribed constants has
+// one interesting failure, a wrong number, and restating each constant would copy it from the thing
+// being checked. So what is asserted is the **arithmetic between** them, which is the specification:
+// a background is its foreground plus ten and a bright colour is its ordinary one plus sixty, across
+// all eight colours in both families. `twp_prints` is in `tests_twp_width.sysl`.
+
+private twp_term(src: string) -> string = "import sysl.term.*\n\n" + src + "\n"
+
+// The SGR parameter out of a sequence, so a test does arithmetic on what the constants actually say.
+private twp_code() -> string = raw"""
+    code(s: string) -> int
+        var n = 0
+
+        for b in s.bytes
+            if b >= u8('0') && b <= u8('9') then n = n * 10 + int(b - u8('0'))
+
+        n
+
+    """
+
+@test("start at 30 and run to 37, in the order the specification gives them")
+twp_t_the_colours_run_30_to_37()
+    if !twp_ready() then return
+
+    twp_prints(twp_term(twp_code() + raw"""
+        val fg = [black, red, green, yellow, blue, magenta, cyan, white]
+        var n = 0
+
+        for i in 0..<8 do if code(fg[i]) == 30 + i then n += 1
+
+        print(n)
+        """), "8\n")
+
+@test("and a bright colour is its own plus sixty")
+twp_t_a_bright_colour_is_plus_sixty()
+    if !twp_ready() then return
+
+    twp_prints(twp_term(twp_code() + raw"""
+        val fg = [black, red, green, yellow, blue, magenta, cyan, white]
+        val br = [bright_black, bright_red, bright_green, bright_yellow, bright_blue,
+                  bright_magenta, bright_cyan, bright_white]
+        var n = 0
+
+        for i in 0..<8 do if code(br[i]) == code(fg[i]) + 60 then n += 1
+
+        print(n)
+        """), "8\n")
+
+@test("and a background is its foreground plus ten, bright ones included")
+twp_t_a_background_is_plus_ten()
+    if !twp_ready() then return
+
+    twp_prints(twp_term(twp_code() + raw"""
+        val fg = [black, red, green, yellow, blue, magenta, cyan, white]
+        val bg = [on_black, on_red, on_green, on_yellow, on_blue, on_magenta, on_cyan, on_white]
+        val br = [on_bright_black, on_bright_red, on_bright_green, on_bright_yellow,
+                  on_bright_blue, on_bright_magenta, on_bright_cyan, on_bright_white]
+        var n = 0
+
+        for i in 0..<8
+            if code(bg[i]) == code(fg[i]) + 10 then n += 1
+            if code(br[i]) == code(fg[i]) + 70 then n += 1
+
+        print(n)
+        """), "16\n")
+
+@test("and the defaults sit ten apart, at the end of each family")
+twp_t_the_defaults_sit_ten_apart()
+    if !twp_ready() then return
+
+    twp_prints(twp_term(twp_code() + "print(code(default_color), code(on_default))"), "39 49\n")
+
+@test("are the SGR parameters they are named for")
+twp_t_the_attributes_are_their_parameters()
+    if !twp_ready() then return
+
+    twp_prints(twp_term(twp_code() + raw"""
+        print(code(reset), code(bold), code(dim), code(italic), code(underline))
+        print(code(blink), code(reverse), code(hidden), code(strike))
+        """), "0 1 2 3 4\n5 7 8 9\n")
+
+// A constant that lost its escape or its terminator would still be a string, and would print its
+// own text into the middle of the output.
+@test("is introduced by the control sequence introducer")
+twp_t_every_sequence_starts_with_csi()
+    if !twp_ready() then return
+
+    twp_prints(twp_term(raw"""
+        val all = [reset, bold, dim, italic, underline, blink, reverse, hidden, strike,
+                   black, red, green, yellow, blue, magenta, cyan, white, default_color,
+                   bright_black, bright_red, bright_green, bright_yellow, bright_blue,
+                   bright_magenta, bright_cyan, bright_white,
+                   on_black, on_red, on_green, on_yellow, on_blue, on_magenta, on_cyan, on_white,
+                   on_default, on_bright_black, on_bright_red, on_bright_green, on_bright_yellow,
+                   on_bright_blue, on_bright_magenta, on_bright_cyan, on_bright_white,
+                   clear_screen, clear_line, clear_below, clear_to_line_end, home,
+                   hide_cursor, show_cursor, save_cursor, restore_cursor]
+        var n = 0
+
+        for s in all do if s.len > 2 && s.bytes[0] == 27u8 && s.bytes[1] == u8('[') then n += 1
+
+        print(n, all.len)
+        """), "52 52\n")
+
+@test("ends the way its family ends — a colour with 'm', a screen sequence with its own letter")
+twp_t_a_colour_ends_with_m()
+    if !twp_ready() then return
+
+    twp_prints(twp_term(raw"""
+        val sgr = [reset, bold, red, on_bright_white, default_color]
+        var n = 0
+
+        for s in sgr do if s.bytes[s.len - 1] == u8('m') then n += 1
+
+        print(n)
+        """), "5\n")
+
+@test("a coloured word is the sequence, the text, and the reset")
+twp_t_a_coloured_word()
+    if !twp_ready() then return
+
+    twp_prints(twp_term(raw"""
+        print(f"${red}error${reset}")
+        """), "\u{1b}[31merror\u{1b}[0m\n")
+
+@test("and an emphasis composes with a colour by being written beside it")
+twp_t_an_emphasis_composes_with_a_colour()
+    if !twp_ready() then return
+
+    twp_prints(twp_term(raw"""
+        print(f"${bold}${on_blue}${white}!${reset}")
+        """), "\u{1b}[1m\u{1b}[44m\u{1b}[37m!\u{1b}[0m\n")

@@ -1,0 +1,174 @@
+module sh.sysl.compiler
+@tests
+
+// `sysl.term.edit` -- the line editor, reached the way a program reaches it. The module's own
+// `tests.sysl` carries the behaviour, every key and every redraw; what it structurally cannot say is
+// that a program outside the library can import the editor and link against it. The fixtures are
+// `sysl.io`'s `bytes_reader` and `bytes_writer` -- public library types, so a program can be written
+// exactly like these. `twp_prints` is in `tests_twp_width.sysl`.
+
+// A program with the editor and the two in-memory streams in scope.
+private twp_edit(src: string) -> string
+    val head = "import sysl.term.edit.editor\nimport sysl.io.{bytes_reader, bytes_reader_at_most, bytes_writer}\n\n"
+
+    head + src + "\n"
+
+@test("reading the lines a byte source yields")
+twp_e_reads_the_lines_a_source_yields()
+    if !twp_ready() then return
+
+    twp_prints(twp_edit(raw"""
+        var src = bytes_reader("one\rtwo\r".bytes)
+        var out = bytes_writer()
+        var ed = editor(&src, &out)
+
+        for line in ed do print(line)
+        """), "one\ntwo\n")
+
+// A `for` over the editor is an `Iterate[string]` walk, which is what makes it interchangeable with
+// `console_lines` at a call site.
+@test("and walks it with the same loop console_lines is walked with")
+twp_e_walks_like_console_lines()
+    if !twp_ready() then return
+
+    twp_prints(twp_edit(raw"""
+        import sysl.io.{stdin, console_lines}
+
+        var src = bytes_reader("a\rb\r".bytes)
+        var out = bytes_writer()
+        var ed = editor(&src, &out)
+        var n = 0
+
+        for line in ed do n += 1
+
+        print(n)
+        """), "2\n")
+
+@test("backspace removes what was typed before it")
+twp_e_backspace_removes()
+    if !twp_ready() then return
+
+    twp_prints(twp_edit(raw"""
+        var src = bytes_reader("abx\u{8}c\r".bytes)
+        var out = bytes_writer()
+        var ed = editor(&src, &out)
+
+        for line in ed do print(line)
+        """), "abc\n")
+
+@test("an arrow key moves the cursor, and typing inserts where it stands")
+twp_e_an_arrow_key_moves_the_cursor()
+    if !twp_ready() then return
+
+    twp_prints(twp_edit(raw"""
+        var src = bytes_reader("ac\u{1b}[Db\r".bytes)
+        var out = bytes_writer()
+        var ed = editor(&src, &out)
+
+        for line in ed do print(line)
+        """), "abc\n")
+
+// The echo is the half of an editor a caller never sees.
+@test("is the line as it is typed, ended by CRLF")
+twp_e_the_echo_ends_in_crlf()
+    if !twp_ready() then return
+
+    twp_prints(twp_edit(raw"""
+        import sysl.text.from_utf8
+
+        var src = bytes_reader("ab\r".bytes)
+        var out = bytes_writer()
+        var ed = editor(&src, &out)
+
+        for line in ed do ()
+
+        print(from_utf8(out.view()).unwrap_or("?") == "ab\r\n")
+        """), "true\n")
+
+// The two bytes of a CRLF in different reads: the debt outlives the call that returned the line.
+@test("does not turn one CRLF into two line endings")
+twp_e_a_split_crlf_is_one_ending()
+    if !twp_ready() then return
+
+    twp_prints(twp_edit(raw"""
+        var src = bytes_reader_at_most("a\r\nb\r\n".bytes, 1)
+        var out = bytes_writer()
+        var ed = editor(&src, &out)
+        var n = 0
+
+        for line in ed do n += 1
+
+        print(n)
+        """), "2\n")
+
+@test("does not lose an escape sequence cut in half")
+twp_e_a_split_escape_is_kept()
+    if !twp_ready() then return
+
+    twp_prints(twp_edit(raw"""
+        var src = bytes_reader_at_most("ac\u{1b}[Db\r".bytes, 1)
+        var out = bytes_writer()
+        var ed = editor(&src, &out)
+
+        for line in ed do print(line)
+        """), "abc\n")
+
+// One session loop serves a board and a cooked terminal only if `Iterate` is object-safe and a `for`
+// walks one through a pointer.
+@test("because Iterate[string] is a trait object, and an Editor and a Lines are both one")
+twp_e_one_loop_serves_either_cursor()
+    if !twp_ready() then return
+
+    twp_prints(twp_edit(raw"""
+        import sysl.io.console_lines
+
+        count(cursor: *Iterate[string]) -> int
+            var n = 0
+
+            for line in cursor do n += 1
+
+            n
+        end count
+
+        var typed = bytes_reader("x\ry\r".bytes)
+        var out = bytes_writer()
+        var ed = editor(&typed, &out)
+
+        var piped = bytes_reader("p\nq\nr\n".bytes)
+        var cursor = console_lines(&piped)
+
+        print(count(&ed), count(&cursor))
+        """), "2 3\n")
+
+// The editor hands its sink a zero-length write before it waits for a key, so a buffering sink can
+// put a prompt on the screen; only a sink that counts its calls can see it.
+@test("so a buffering sink can put a prompt on the screen before a key is pressed")
+twp_e_the_editor_pokes_its_sink()
+    if !twp_ready() then return
+
+    twp_prints(twp_edit(raw"""
+        struct Counting
+            n: int
+        end Counting
+
+        impl Fallible for Counting
+
+        impl Writer for Counting
+            write(*self, bytes: []const u8)
+                self.n += 1
+        end Counting
+
+        var src = bytes_reader("".bytes)
+        var out = Counting(0)
+        var ed = editor(&src, &out)
+
+        for line in ed do ()
+
+        print(out.n)
+        """), "1\n")
+
+@test("so a program with no OS and no allocator may still name it")
+twp_e_the_editor_requires_nothing()
+    if !twp_ready() then return
+
+    twp_prints("@no_os\n@no_posix\n\nimport sysl.term.edit.Editor\n\nprint(\"named\")\n", "named\n")

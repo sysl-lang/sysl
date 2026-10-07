@@ -1,0 +1,244 @@
+module sh.sysl.compiler
+@tests
+
+// `parse_*` -- reading a value back out of text (`library/text.md`), reached the way a program
+// reaches it. What these are about is the edges: the most negative value, whose magnitude does not fit
+// the width holding it; the overflow caught before the arithmetic wraps; the empty string; the lone
+// sign; the trailing garbage that makes `"12abc"` not a number. The round trips at the end hold the
+// rendering half and the reading half to each other. `twp_prints` is in `tests_twp_width.sysl`.
+
+private twp_parsing(src: string) -> string = "import sysl.text.*\n\n" + src
+
+@test("read the digits, with or without a sign")
+twp_p_read_the_digits()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_int("42").unwrap(), parse_int("-42").unwrap(), parse_int("+42").unwrap())
+        """), "42 -42 42\n")
+
+@test("zero, and leading zeros, are ordinary")
+twp_p_zero_and_leading_zeros()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_int("0").unwrap(), parse_int("007").unwrap(), parse_int("-0").unwrap())
+        """), "0 7 0\n")
+
+@test("the signed range is reached at both ends")
+twp_p_the_signed_range_at_both_ends()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_long("9223372036854775807").unwrap())
+        print(parse_long("-9223372036854775808").unwrap())
+        """), "9223372036854775807\n-9223372036854775808\n")
+
+// The case the negative accumulation exists for, with both neighbours.
+@test("including the value whose magnitude will not fit, and its neighbours")
+twp_p_the_most_negative_value_and_its_neighbours()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_long("-9223372036854775807").is_ok())
+        print(parse_long("-9223372036854775808").is_ok())
+        print(parse_long("-9223372036854775809").is_ok())
+        print(parse_long("9223372036854775808").is_ok())
+        """), "true\ntrue\nfalse\nfalse\n")
+
+@test("a value far past the range overflows rather than wrapping")
+twp_p_far_past_the_range_overflows()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        parse_long("99999999999999999999999999") match
+            Ok(v) -> print(f"wrongly accepted $v%d")
+            Err(e) -> print(e)
+        """), "value too large for its type\n")
+
+@test("an int is narrower than a long, and says so")
+twp_p_an_int_is_narrower_than_a_long()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_int("2147483647").is_ok(), parse_int("2147483648").is_ok())
+        print(parse_int("-2147483648").is_ok(), parse_int("-2147483649").is_ok())
+        print(parse_long("2147483648").is_ok())
+        """), "true false\ntrue false\ntrue\n")
+
+@test("the empty string has no digits to read")
+twp_p_the_empty_string_has_no_digits()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_int("").unwrap_err(), parse_int("-").unwrap_err(), parse_int("+").unwrap_err())
+        """), "no digits to read no digits to read no digits to read\n")
+
+@test("trailing garbage is not silently dropped, and the offset names it")
+twp_p_trailing_garbage_is_refused()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_int("12abc").unwrap_err(), parse_int("1 2").unwrap_err())
+        """), "not a digit at byte 2 not a digit at byte 1\n")
+
+@test("a sign in the middle is not a sign")
+twp_p_a_sign_in_the_middle()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_int("1-2").unwrap_err())
+        """), "not a digit at byte 1\n")
+
+@test("and nothing that is not a number at all")
+twp_p_nothing_that_is_not_a_number()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_int("abc").unwrap_err(), parse_int(" 1").unwrap_err())
+        """), "not a digit at byte 0 not a digit at byte 0\n")
+
+@test("hex reads in either case")
+twp_p_hex_in_either_case()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_long_base("ff", 16).unwrap(), parse_long_base("FF", 16).unwrap())
+        """), "255 255\n")
+
+@test("binary, octal and base 36")
+twp_p_binary_octal_and_base_36()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_long_base("1011", 2).unwrap(), parse_long_base("777", 8).unwrap(),
+              parse_long_base("zz", 36).unwrap())
+        """), "11 511 1295\n")
+
+@test("a sign works in any base")
+twp_p_a_sign_in_any_base()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_long_base("-ff", 16).unwrap())
+        """), "-255\n")
+
+// `8` is a digit and is not one in base 8, and `2` is not one in binary.
+@test("a digit out of range for the base is refused")
+twp_p_a_digit_out_of_range_for_the_base()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_long_base("18", 8).unwrap_err(), parse_long_base("12", 2).unwrap_err())
+        """), "not a digit at byte 1 not a digit at byte 1\n")
+
+@test("a base nothing could be written in is the caller's error")
+twp_p_an_impossible_base()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_long_base("1", 1).unwrap_err(), parse_long_base("1", 37).unwrap_err())
+        """), "1 is not a base between 2 and 36 37 is not a base between 2 and 36\n")
+
+@test("reaches the top of the range, where every signed parse overflows")
+twp_p_unsigned_reaches_the_top()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_ulong_base("ffffffffffffffff", 16).unwrap())
+        print(parse_long_base("ffffffffffffffff", 16).is_ok())
+        """), "18446744073709551615\nfalse\n")
+
+@test("one past the top overflows")
+twp_p_one_past_the_top()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_ulong("18446744073709551615").is_ok())
+        print(parse_ulong("18446744073709551616").is_ok())
+        """), "true\nfalse\n")
+
+@test("no sign is accepted, in either direction")
+twp_p_unsigned_takes_no_sign()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_ulong("-1").unwrap_err(), parse_ulong("+1").unwrap_err())
+        """), "not a digit at byte 0 not a digit at byte 0\n")
+
+@test("a uint is narrower than a ulong")
+twp_p_a_uint_is_narrower()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_uint("4294967295").is_ok(), parse_uint("4294967296").is_ok())
+        """), "true false\n")
+
+@test("exactly the two spellings 'str' produces")
+twp_p_bool_reads_the_two_spellings()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_bool("true").unwrap(), parse_bool("false").unwrap())
+        """), "true false\n")
+
+@test("and nothing else, however conventional")
+twp_p_bool_reads_nothing_else()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_bool("True").is_ok(), parse_bool("1").is_ok(),
+              parse_bool("yes").is_ok(), parse_bool("").is_ok())
+        """), "false false false false\n")
+
+@test("read the ordinary spellings")
+twp_p_floats_read_the_ordinary_spellings()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_real("1.5").unwrap(), parse_real("-0.25").unwrap(), parse_real("3").unwrap())
+        """), "1.5 -0.25 3\n")
+
+@test("and the exponent form")
+twp_p_floats_read_the_exponent_form()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_real("1e3").unwrap(), parse_real("1.5e-2").unwrap())
+        """), "1000 0.015\n")
+
+// C's `strtod` stops at the first byte it cannot use; the end pointer is what makes this strict.
+@test("trailing garbage is refused, which C's own parse would not do")
+twp_p_floats_refuse_trailing_garbage()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_real("1.5x").unwrap_err(), parse_real("abc").unwrap_err(), parse_real("").unwrap_err())
+        """), "not a digit at byte 3 not a digit at byte 0 no digits to read\n")
+
+@test("every integer edge survives being written and read back")
+twp_p_every_integer_edge_round_trips()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        var lo: long = -9223372036854775807 - 1
+        var hi: long = 9223372036854775807
+        print(parse_long(str(lo)).unwrap() == lo, parse_long(str(hi)).unwrap() == hi)
+        print(parse_long(str(0)).unwrap() == 0, parse_long(str(-1)).unwrap() == -1)
+        """), "true true\ntrue true\n")
+
+@test("so does a bool")
+twp_p_a_bool_round_trips()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_bool(str(true)).unwrap(), parse_bool(str(false)).unwrap())
+        """), "true false\n")
+
+@test("and a float that 'str' renders exactly")
+twp_p_an_exact_float_round_trips()
+    if !twp_ready() then return
+
+    twp_prints(twp_parsing(raw"""
+        print(parse_real(str(2.5)).unwrap() == 2.5, parse_real(str(-0.125)).unwrap() == -0.125)
+        """), "true true\n")

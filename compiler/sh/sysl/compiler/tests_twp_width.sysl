@@ -1,0 +1,226 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `sysl.text.char_columns` and `sysl.text.columns` -- how much room text takes on a terminal, the
+// measurement neither `s.len` (bytes) nor a `Chars` walk (scalar values) gives.
+//
+// **The cases are about the tables, not the rule**: the exact first and last code point of a range
+// with the ones either side, the blocks whose unassigned code points default to wide, and the code
+// points in both source tables that must come out of only one. Every value is written as a code
+// point number, since most of the interesting ones do not print.
+//
+// The helpers here serve every `twp_` file: a library module is reached the way a program reaches
+// it, by building one and running it. **Where `SYSL_ORACLE` names the reference, its own build of the
+// same program must print the same thing**, so every expectation below is the reference's actual
+// output rather than a transcription of it.
+
+twp_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end twp_ready
+
+// Builds `text` into `<root>/built` with this compiler, or with the reference where `reference`
+// names one, and answers the executable -- or what was said instead of making it.
+twp_build(root: string, text: string, reference: Option[string]) -> Result[string, string]
+    val src = s"$root/main.sysl"
+    val exe = s"$root/built"
+
+    write_text(src, text).unwrap()
+
+    reference match
+        None ->
+            build_native_program(src, None, None, DefaultOptimization, Some(exe)) match
+                Err(why) -> return Err(failure_text(why))
+                Ok(_) -> ()
+        Some(bin) ->
+            val said = capture_oracle(bin, ["build", src, "-o", exe])
+
+            if metadata(exe).is_err()
+                return Err(said match
+                    Err(_) -> "the reference could not be run"
+                    Ok(o) -> o.err.unwrap_or(o.text))
+
+    Ok(exe)
+end twp_build
+
+// What `text` prints as a program, built by this compiler or by the reference.
+twp_output(text: string, reference: Option[string]) -> string
+    val root = make_temp_dir("sysl-twp").unwrap()
+
+    make_dir_all(root).unwrap()
+
+    val out = twp_build(root, text, reference) match
+        Err(why) -> why
+        Ok(exe) ->
+            capture(exe, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(o) -> o.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end twp_output
+
+// The claim every run case makes: `text` prints `want`, here and -- where there is one -- under the
+// reference.
+twp_prints(text: string, want: string)
+    assert_eq(twp_output(text, None), want)
+
+    env_var("SYSL_ORACLE") match
+        Some(bin) -> assert_eq(twp_output(text, Some(bin)), want)
+        None -> ()
+end twp_prints
+
+private twp_width(src: string) -> string = "import sysl.text.{char_columns, columns}\n\n" + src + "\n"
+
+// How wide each of some code points is, as one line of numbers -- each given as its hex digits.
+private twp_columns_of(cps: []const string) -> string
+    var src = "print("
+
+    for i in 0..<cps.len
+        if i > 0 then src = src + ", "
+        src = src + s"char_columns(char(0x${cps[i]}u32))"
+
+    twp_width(src + ")")
+end twp_columns_of
+
+@test("ASCII is one column, and so is the rest of Latin-1 that prints")
+twp_w_ascii_and_latin1_are_one_column()
+    if !twp_ready() then return
+
+    twp_prints(twp_width("print(char_columns('a'), char_columns('~'), char_columns(char(0x00e9u32)))"), "1 1 1\n")
+
+// U+65E5 and U+672C are the two characters of 日本: two scalar values, six bytes, four columns.
+@test("an East Asian ideograph is two")
+twp_w_an_ideograph_is_two()
+    if !twp_ready() then return
+
+    twp_prints(twp_width("print(char_columns(char(0x65e5u32)), char_columns(char(0x672cu32)))"), "2 2\n")
+
+@test("a combining mark takes no column of its own")
+twp_w_a_combining_mark_is_zero()
+    if !twp_ready() then return
+
+    twp_prints(twp_columns_of(["0301", "0483"]), "0 0\n")
+
+@test("and neither does a format character")
+twp_w_a_format_character_is_zero()
+    if !twp_ready() then return
+
+    twp_prints(twp_columns_of(["200b", "200e"]), "0 0\n")
+
+// U+00AD is `Cf` and every terminal draws it; asserted beside a `Cf` that is genuinely invisible, so
+// this cannot pass by the whole category having been forgotten.
+@test("except the soft hyphen, which terminals draw")
+twp_w_the_soft_hyphen_is_one()
+    if !twp_ready() then return
+
+    twp_prints(twp_columns_of(["00ad", "200b"]), "1 0\n")
+
+@test("a control character has no column, because a terminal acts on it rather than drawing it")
+twp_w_a_control_character_is_zero()
+    if !twp_ready() then return
+
+    twp_prints(twp_width(raw"print(char_columns('\n'), char_columns('\t'), char_columns(char(0u32)))"), "0 0 0\n")
+
+// A binary search that is off by one is off at exactly these code points: each pair is the last
+// outside a range and the first inside it, or the reverse.
+@test("the first wide code point, and the one before it")
+twp_w_the_first_wide_code_point()
+    if !twp_ready() then return
+
+    twp_prints(twp_columns_of(["10ff", "1100"]), "1 2\n")
+
+@test("the last of that range, and the one after")
+twp_w_the_last_of_that_range()
+    if !twp_ready() then return
+
+    twp_prints(twp_columns_of(["115f", "1160"]), "2 1\n")
+
+// Adjacent code points in one block with opposite answers.
+@test("fullwidth forms stop where the halfwidth ones start")
+twp_w_fullwidth_stops_where_halfwidth_starts()
+    if !twp_ready() then return
+
+    twp_prints(twp_columns_of(["ff00", "ff01", "ff60", "ff61"]), "1 2 2 1\n")
+
+@test("and the currency forms at the end of the block")
+twp_w_the_currency_forms()
+    if !twp_ready() then return
+
+    twp_prints(twp_columns_of(["ffe0", "ffe6", "ffe7"]), "2 2 1\n")
+
+// `EastAsianWidth.txt` lists no line for these; its header says the unassigned code points of these
+// blocks default to `W`.
+@test("the whole of plane 2, to its last code point")
+twp_w_plane_2_is_wide()
+    if !twp_ready() then return
+
+    twp_prints(twp_columns_of(["20000", "2fffd", "2fffe"]), "2 2 1\n")
+
+@test("and plane 3")
+twp_w_plane_3_is_wide()
+    if !twp_ready() then return
+
+    twp_prints(twp_columns_of(["30000", "3fffd", "40000"]), "2 2 1\n")
+
+// U+302A..U+302D are nonspacing marks and East Asian wide; the wide range starts at U+302E.
+@test("a code point in both source tables is a mark, not a wide character")
+twp_w_a_code_point_in_both_tables_is_a_mark()
+    if !twp_ready() then return
+
+    twp_prints(twp_columns_of(["3029", "302a", "302d", "302e"]), "2 0 0 2\n")
+
+@test("is the sum of what its characters take")
+twp_w_a_run_is_the_sum()
+    if !twp_ready() then return
+
+    twp_prints(twp_width("print(columns(\"hello\".bytes), columns(\"\".bytes))"), "5 0\n")
+
+// `naïveté` is nine bytes, seven characters and seven columns.
+@test("differs from the byte count wherever the text is not ASCII")
+twp_w_differs_from_the_byte_count()
+    if !twp_ready() then return
+
+    twp_prints(twp_width(raw"""
+        val s = "na" + str(char(0x00efu32)) + "vet" + str(char(0x00e9u32))
+        print(s.bytes.len, columns(s.bytes))
+        """), "9 7\n")
+
+@test("and from the character count wherever it is East Asian")
+twp_w_differs_from_the_character_count()
+    if !twp_ready() then return
+
+    twp_prints(twp_width(raw"""
+        val s = str(char(0x65e5u32)) + str(char(0x672cu32))
+        print(s.bytes.len, s.chars.count(), columns(s.bytes))
+        """), "6 2 4\n")
+
+@test("a decomposed vowel adds a character and no column")
+twp_w_a_decomposed_vowel_adds_no_column()
+    if !twp_ready() then return
+
+    twp_prints(twp_width(raw"""
+        val nfc = "caf" + str(char(0x00e9u32))
+        val nfd = "cafe" + str(char(0x0301u32))
+        print(nfc.chars.count(), columns(nfc.bytes), nfd.chars.count(), columns(nfd.bytes))
+        """), "4 4 5 4\n")
+
+@test("and mixed scripts add up the way the borders fall")
+twp_w_mixed_scripts_add_up()
+    if !twp_ready() then return
+
+    twp_prints(twp_width(raw"""
+        val s = "a" + str(char(0x65e5u32)) + "b" + str(char(0x0301u32))
+        print(columns(s.bytes))
+        """), "4\n")
