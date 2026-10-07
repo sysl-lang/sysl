@@ -1,0 +1,122 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.process.Status
+
+// The basic blocks and branches control flow lowers to, and what happens to code written after
+// control has already left. The IR lines were read out of the reference compiler's `emit-llvm` (0.0.162)
+// for the same programs; the outputs and exit statuses are what its `sysl run` printed.
+
+@test("while emits cond/body/end labels and a back-edge")
+cgz_while_emits_its_labels()
+    if xvr_no_library() then return
+
+    val main = cgz_main("var i = 0\nwhile i < 3\n    i++\n")
+
+    for want in ["while.cond", "while.body", "while.end", "icmp slt i32"]
+        assert(main.contains(want), s"$want in:\n$main")
+
+// No condition block and no test, just a body that branches to itself.
+@test("loop emits a body that branches back to itself, with no test")
+cgz_loop_branches_back_to_itself()
+    if xvr_no_library() then return
+
+    val main = cgz_main("var i = 0\nloop\n    i++\n    if i == 3 then break\n")
+
+    assert(main.contains("loop.body"), main)
+    assert(main.contains("loop.end"), main)
+    assert(main.contains("br label %loop.body"), main)
+    assert(!main.contains("loop.cond"), main)
+
+@test("a loop with no break ends in unreachable")
+cgz_a_loop_with_no_break_ends_in_unreachable()
+    if xvr_no_library() then return
+
+    val main = cgz_main("loop\n    print(1)\n")
+
+    assert(main.contains("loop.end"), main)
+    assert(main.contains("unreachable"), main)
+
+@test("if with else emits both arms")
+cgz_if_with_else_emits_both_arms()
+    if xvr_no_library() then return
+
+    val main = cgz_main("if true\n    print(1)\nelse\n    print(2)\n")
+
+    for want in ["if.then", "if.else", "if.end"]
+        assert(main.contains(want), s"$want in:\n$main")
+
+// -- code after a divergence ----------------------------------------------------------------------
+//
+// Nothing refuses it, so the emitters walk it and drop what they produce -- and the dropping has to
+// reach the blocks a value opens as well as its instructions, or the module reads registers defined
+// in a block that was dropped and clang refuses it. A slice repeat is a small expression that lowers
+// to an allocation, a fill loop and four labels.
+
+// The IR reads no register it does not define, and the program prints `want`.
+private cgz_diverges_cleanly(src: string, want: string)
+    val regs = cgz_undefined_registers(cgz_ir(src))
+
+    assert_eq(regs, "")
+    assert_eq(enm_ran(src), want)
+
+@test("a match arm's value is dropped with its blocks")
+cgz_a_match_arms_value_is_dropped()
+    if xvr_no_library() || !enm_ready() then return
+
+    cgz_diverges_cleanly("enum Answer\n    Yes(n: int)\n    No\n\npick(a: Answer) -> []u8\n    a match\n" +
+                         "        Yes(n) -> [u8(n); 2]\n        No ->\n            exit(1)\n            [0; 0]\n" +
+                         "end pick\n\nprint(pick(Yes(7)).len)\n", "2\n")
+
+@test("as is an if-expression's")
+cgz_as_is_an_if_expressions()
+    if xvr_no_library() || !enm_ready() then return
+
+    cgz_diverges_cleanly("pick(n: int) -> []u8\n    if n == 0\n        exit(1)\n        [0; 0]\n    else\n" +
+                         "        [7; 3]\nend pick\n\nprint(pick(2).len)\n", "3\n")
+
+@test("and a plain statement after one, with no arm anywhere")
+cgz_a_plain_statement_after_one()
+    if xvr_no_library() || !enm_ready() then return
+
+    val src = "main() -> unit =\n    exit(3)\n    var n = 3\n    var xs: []u8 = [0; n]\n    print(xs.len)\n"
+
+    assert_eq(cgz_undefined_registers(cgz_ir(src)), "")
+
+    cgz_exit(src) match
+        Ok(s) -> assert_eq(s, Status.Exited(3))
+        Err(why) -> assert(false, why)
+
+// A body that diverges leaves the loop's back edge in the dropped region.
+@test("a loop body that diverges takes the rest of its round with it")
+cgz_a_diverging_loop_body()
+    if xvr_no_library() || !enm_ready() then return
+
+    cgz_diverges_cleanly("drain(n: int) -> usize\n    var total: usize = 0\n\n    while total < usize(n)\n" +
+                         "        exit(1)\n        var xs: []u8 = [0; total]\n        total += xs.len\n\n" +
+                         "    total\nend drain\n\nprint(drain(0))\n", "0\n")
+
+// What the arm computed is gone, so a dead region cannot allocate.
+@test("the blocks it leaves behind hold nothing but 'unreachable'")
+cgz_the_dead_blocks_hold_only_unreachable()
+    if xvr_no_library() then return
+
+    val main = cgz_main("exit(1)\nvar n = 3\nvar xs: []u8 = [0; n]\nprint(xs.len)\n")
+
+    assert(!main.contains("@malloc"), main)
+    assert(main.contains("unreachable"), main)
+
+@test("while a value that opens no block after one was always fine")
+cgz_a_scalar_after_a_divergence()
+    if xvr_no_library() || !enm_ready() then return
+
+    cgz_diverges_cleanly("pick(n: int) -> int\n    if n == 0\n        exit(1)\n        0\n    else\n        7\n" +
+                         "end pick\n\nprint(pick(2))\n", "7\n")
+
+@test("and so was the same value with nothing diverging before it")
+cgz_the_same_value_without_a_divergence()
+    if xvr_no_library() || !enm_ready() then return
+
+    cgz_diverges_cleanly("pick(n: int) -> []u8\n    if n == 0\n        [0; 0]\n    else\n        [7; 3]\n" +
+                         "end pick\n\nprint(pick(0).len)\n", "0\n")

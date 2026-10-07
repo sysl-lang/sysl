@@ -1,0 +1,195 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The IR a vector lowers to -- the half the run tier cannot see, since a program computes the same
+// numbers whether the back end used one register or scalarized into four. These pin that the type
+// reaches LLVM as `<N x T>` and that the operations are single instructions. Every expected line was
+// read out of the reference compiler's `emit-llvm` (0.0.162) for the same program.
+
+private cgz_four() -> string = "val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\n"
+
+@test("the type reaches LLVM as a vector, not an array")
+cgz_the_type_is_a_vector()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(v[0])\n")
+
+    assert(out.contains("<4 x float>"), out)
+    assert(!out.contains("[4 x float]"), out)
+
+@test("a literal is an insertelement chain")
+cgz_a_literal_is_an_insertelement_chain()
+    if xvr_no_library() then return
+
+    val main = cgz_main("val v: <4>i32 = [1, 2, 3, 4]\nprint(v[0])\n")
+
+    assert(main.contains("insertelement <4 x i32>"), main)
+
+@test("arithmetic is one instruction at the register's width")
+cgz_arithmetic_is_one_instruction()
+    if xvr_no_library() then return
+
+    val main = cgz_main(cgz_four() + "val b: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint((a + b)[0])\n")
+
+    assert(main.contains("fadd <4 x float>"), main)
+
+@test("the splat is a shufflevector with a zero mask")
+cgz_the_splat_is_a_shufflevector()
+    if xvr_no_library() then return
+
+    val main = cgz_main(cgz_four() + "print((a * 2.0)[0])\n")
+
+    assert(main.contains("shufflevector <4 x float>"), main)
+    assert(main.contains("<4 x i32> zeroinitializer"), main)
+
+@test("a mask is a vector of i1")
+cgz_a_mask_is_a_vector_of_i1()
+    if xvr_no_library() then return
+
+    val main = cgz_main(cgz_four() + "print((a < 2.0).any())\n")
+
+    assert(main.contains("fcmp olt <4 x float>"), main)
+    assert(main.contains("<4 x i1>"), main)
+
+@test("select is one instruction, not a branch")
+cgz_select_is_one_instruction()
+    if xvr_no_library() then return
+
+    val main = cgz_main(cgz_four() + "print((a < 2.0).select(a, a)[0])\n")
+
+    assert(main.contains("select <4 x i1> "), main)
+
+// The suffix is `v4f32`, not the rendered `<4 x float>` with its spaces removed.
+@test("a reduction names the intrinsic with LLVM's overload suffix")
+cgz_a_reduction_names_the_overload_suffix()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(v.sum())\n")
+
+    assert(cgz_body(out, "main").contains("@llvm.vector.reduce.fadd.v4f32"), out)
+    assert(out.contains("declare float @llvm.vector.reduce.fadd.v4f32(float, <4 x float>)"), out)
+
+@test("an integer reduction takes no accumulator")
+cgz_an_integer_reduction_takes_no_accumulator()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("val v: <4>i32 = [1, 2, 3, 4]\nprint(v.sum())\n")
+
+    assert(out.contains("declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)"), out)
+
+// Without `reassoc` the intrinsic is a left fold, costing exactly what a loop costs.
+@test("a float sum is reassociable")
+cgz_a_float_sum_is_reassociable()
+    if xvr_no_library() then return
+
+    val main = cgz_main("val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(v.sum())\n")
+
+    assert(main.contains("call reassoc float @llvm.vector.reduce.fadd"), main)
+
+@test("a signed minimum picks the signed intrinsic and an unsigned one the unsigned")
+cgz_a_minimum_picks_by_signedness()
+    if xvr_no_library() then return
+
+    val s = cgz_main("val v: <4>i32 = [1, 2, 3, 4]\nprint(v.min())\n")
+    val u = cgz_main("val v: <4>u32 = [1, 2, 3, 4]\nprint(v.min())\n")
+
+    assert(s.contains("reduce.smin.v4i32"), s)
+    assert(u.contains("reduce.umin.v4i32"), u)
+
+@test("a mask reduces with and/or rather than a loop")
+cgz_a_mask_reduces_with_and_or()
+    if xvr_no_library() then return
+
+    val main = cgz_main("val a: <4>i32 = [1, 2, 3, 4]\nprint((a < 2).all(), (a < 2).any())\n")
+
+    assert(main.contains("reduce.and.v4i1"), main)
+    assert(main.contains("reduce.or.v4i1"), main)
+
+@test("a lane is extractelement, with no address and no bounds test")
+cgz_a_lane_is_extractelement()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(v[2])\n")
+
+    assert(cgz_body(out, "main").contains("extractelement <4 x float>"), out)
+    assert(!out.contains("getelementptr <4 x float>"), out)
+
+// Two instantiations of one generic are two bodies, kept apart by the mangled lane count.
+@test("a generic kernel emits one body per width")
+cgz_a_generic_kernel_emits_one_body_per_width()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("scale[const W: usize](v: <W>f32, by: f32) -> <W>f32 = v * by\n\n" +
+                     "val four: <4>f32 = [1.0, 2.0, 3.0, 4.0]\n" +
+                     "val eight: <8>f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]\n" +
+                     "print(scale(four, 2.0)[0], scale(eight, 2.0)[0])\n")
+
+    assert(out.contains("fmul <4 x float>"), out)
+    assert(out.contains("fmul <8 x float>"), out)
+
+@test("a vector in a struct is laid out as one field")
+cgz_a_vector_in_a_struct_is_one_field()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("struct Body\n    vel: <4>f32\n\nval b = Body([1.0, 2.0, 3.0, 4.0])\nprint(b.vel[0])\n")
+
+    assert(out.contains("%struct.Body = type { <4 x float> }"), out)
+
+// -- load and store -------------------------------------------------------------------------------
+
+private cgz_eight() -> string = "var xs: [8]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]\n"
+
+@test("a load is one instruction at the register's width")
+cgz_a_load_is_one_instruction()
+    if xvr_no_library() then return
+
+    val main = cgz_main(cgz_eight() + "val v: <4>f32 = xs.load(1)\nprint(v[0])\n")
+
+    assert(main.contains("load <4 x float>"), main)
+
+@test("a store is one instruction at the register's width")
+cgz_a_store_is_one_instruction()
+    if xvr_no_library() then return
+
+    val main = cgz_main(cgz_eight() + "val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nxs.store(0, v)\nprint(xs[0])\n")
+
+    assert(main.contains("store <4 x float>"), main)
+
+// A `[]f32` promises its elements are four-byte aligned and nothing about where a run begins, so
+// `align 16` would be a claim the type does not support.
+@test("a load claims only the alignment a slice can promise")
+cgz_a_load_claims_only_the_elements_alignment()
+    if xvr_no_library() then return
+
+    val out = cgz_ir(cgz_eight() + "val v: <4>f32 = xs[1..<5].load(0)\nprint(v[0])\n")
+    val main = cgz_body(out, "main")
+
+    assert(main.contains("load <4 x float>, ptr"), main)
+    assert(main.contains("align 4"), main)
+    assert(!out.contains("align 16"), out)
+
+// A pair of comparisons rather than an addition, which would wrap at the top of `usize` and pass.
+@test("the run is bounds-checked without an addition that could wrap")
+cgz_the_run_is_bounds_checked_without_wrapping()
+    if xvr_no_library() then return
+
+    val f = cgz_body(cgz_ir("f(xs: []const f32, i: usize) -> f32\n    val v: <4>f32 = xs.load(i)\n    v[0]\n\n" +
+                            "var a: [8]f32\nprint(f(a[..], 0))\n"), "f")
+
+    assert(f.contains("icmp uge"), f)
+    assert(f.contains("icmp ule"), f)
+
+@test("one kernel emits a load and a store at each width it is instantiated at")
+cgz_one_kernel_loads_and_stores_at_each_width()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("scale[const W: usize](xs: []const f32, out: []f32, by: <W>f32)\n" +
+                     "    var i: usize = 0\n    while i + W <= xs.len\n        val v: <W>f32 = xs.load(i)\n" +
+                     "        out.store(i, v * by)\n        i += W\nend scale\n\n" +
+                     "var src: [8]f32\nvar out: [8]f32\nval by4: <4>f32 = 1.0\nval by8: <8>f32 = 1.0\n" +
+                     "scale(src[..], out[..], by4)\nscale(src[..], out[..], by8)\n")
+
+    for want in ["load <4 x float>", "store <4 x float>", "load <8 x float>", "store <8 x float>"]
+        assert(out.contains(want), s"$want in:\n$out")
