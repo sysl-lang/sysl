@@ -521,12 +521,216 @@ private scan_punct(s: *Scanner, lay: *Layout, out: *Buf[Spanned[Tok]], m: usize)
                 lay.open_bracket()
             elif op == ")" || op == "]" || op == "}"
                 emit_drain(out, lay.close_bracket(), at)
-            elif op == ","
+            elif op == "," && !in_a_multi_assignment(s, lay, out)
                 emit_drain(out, lay.close_blocks_in_bracket(), at)
 
             out.push(Spanned(Keyword(op), at))
             Ok(())
 end scan_punct
+
+// -- a multi-assignment inside a bracketed block ---------------------------------------------------
+
+// Whether the `,` just read is one of a multi-assignment's own commas, written as a line of a block
+// that opened inside brackets, so that it ends nothing.
+//
+// **A comma at a bracketed block's level ends the block**, so that `apply((x) -> ... doubled + 1, 5)`
+// hands `5` to the call. **A line that is a multi-assignment is the exception**: `a, b = 5, 6` is a
+// statement of the block, and its commas are the statement's. The line is one when what it holds
+// so far is a comma list of places followed by an assignment operator (so this comma is among the
+// values), or is a list of places with an assignment operator still ahead on the same line (so this
+// comma is among the places). A place is a name, `self`, a field or tuple index, a subscript and a
+// `*`; anything else on the line -- an operator, a call, a literal -- makes it an expression, whose
+// comma ends the block as before.
+private in_a_multi_assignment(s: *Scanner, lay: *Layout, out: *Buf[Spanned[Tok]]) -> bool
+    if !comma_closes_a_block(lay) then return false
+
+    line_start(out) match
+        None -> false
+        Some(from) -> line_so_far(out, from) match
+            ValueList -> true
+            NoPlaceList -> false
+            PlaceList -> assigns_ahead(s.rest())
+end in_a_multi_assignment
+
+// Whether a comma here would end a block, which is the only time the question above is asked.
+private comma_closes_a_block(lay: *Layout) -> bool =
+    lay.brackets > 0 && lay.depth() > 0 && lay.blocks.at(lay.blocks.len() - 1).brackets == lay.brackets
+
+// What a line read so far is, as far as a comma on it is concerned.
+private enum LineSoFar
+    NoPlaceList
+    PlaceList
+    ValueList
+
+// The index of the first token of the line the cursor is on, stepping back over brackets the line
+// itself opened and closed; `None` where the walk leaves a bracket the line did not open.
+private line_start(out: *Buf[Spanned[Tok]]) -> Option[usize]
+    var i = out.len()
+    var depth: usize = 0
+
+    while i > 0
+        out.at(i - 1).value match
+            Keyword(w) ->
+                if w == ")" || w == "]" || w == "}"
+                    depth += 1
+                elif w == "(" || w == "[" || w == "{"
+                    if depth == 0 then return None
+
+                    depth -= 1
+                end if
+            Newline -> if depth == 0 then return Some(i)
+            Indent -> if depth == 0 then return Some(i)
+            Dedent -> if depth == 0 then return Some(i)
+            _ -> ()
+
+        i -= 1
+    end while
+
+    None
+end line_start
+
+// Whether the tokens from `from` on are a list of places, a list of places and an assignment
+// operator (the values have begun), or neither.
+private line_so_far(out: *Buf[Spanned[Tok]], from: usize) -> LineSoFar
+    var depth: usize = 0
+    var commas: usize = 0
+    var after_dot = false
+    var at_place_start = true
+
+    for i in from..<out.len()
+        val t = out.at(i).value
+
+        if depth > 0
+            t match
+                Keyword(w) ->
+                    if w == "(" || w == "[" || w == "{" then depth += 1
+                    elif w == ")" || w == "]" || w == "}" then depth -= 1
+                _ -> ()
+
+            continue
+        end if
+
+        t match
+            Ident(_) -> ()
+            QuotedIdent(_) -> ()
+            IntLit(_, _, _) -> if !after_dot then return NoPlaceList
+            Keyword(w) ->
+                if w == "["
+                    depth = 1
+                elif w == ","
+                    commas += 1
+                elif is_assign_op(w)
+                    return if commas > 0 then ValueList else NoPlaceList
+                elif w == "*"
+                    if !at_place_start then return NoPlaceList
+                elif w != "." && w != "self"
+                    return NoPlaceList
+                end if
+            _ -> return NoPlaceList
+
+        after_dot = t == Keyword(".")
+        at_place_start = t == Keyword(",") || t == Keyword("*")
+    end for
+
+    PlaceList
+end line_so_far
+
+// Whether the rest of the line, from just past a comma, is more places and then an assignment
+// operator -- read off the bytes, since the tokens are not there yet.
+private assigns_ahead(rest: []const u8) -> bool
+    var i: usize = 0
+    var depth: usize = 0
+
+    while i < rest.len
+        val c = rest[i]
+
+        if c == u8('"') || c == u8('\'')
+            if depth == 0 then return false
+
+            i = past_quote(rest, i)
+            continue
+        end if
+
+        if c == u8('[') || (depth > 0 && (c == u8('(') || c == u8('{')))
+            depth += 1
+        elif depth > 0 && (c == u8(']') || c == u8(')') || c == u8('}'))
+            depth -= 1
+        elif depth == 0
+            if is_operator_byte(c)
+                var j = i
+
+                while j < rest.len && is_operator_byte(rest[j])
+                    j += 1
+
+                if j - i == 1 && c == u8('*')
+                    i = j
+                    continue
+                end if
+
+                return is_assign_run(rest[i..<j])
+            end if
+
+            if c == u8('`')
+                i = past_backtick(rest, i)
+                continue
+            end if
+
+            if !is_place_byte(c) then return false
+        end if
+
+        i += 1
+    end while
+
+    false
+end assigns_ahead
+
+// The index just past the quoted literal opening at `at`, its escapes stepped over.
+private past_quote(rest: []const u8, at: usize) -> usize
+    val q = rest[at]
+    var i = at + 1
+
+    while i < rest.len && rest[i] != q
+        if rest[i] == u8('\\') then i += 1
+
+        i += 1
+
+    if i < rest.len then i + 1 else i
+end past_quote
+
+// The index just past the backquoted name opening at `at`.
+private past_backtick(rest: []const u8, at: usize) -> usize
+    var i = at + 1
+
+    while i < rest.len && rest[i] != u8('`') && rest[i] != u8('\n')
+        i += 1
+
+    if i < rest.len then i + 1 else i
+end past_backtick
+
+// A byte an operator is spelled with.
+private is_operator_byte(c: u8) -> bool =
+    c == u8('=') || c == u8('+') || c == u8('-') || c == u8('*') || c == u8('/') || c == u8('%') ||
+        c == u8('&') || c == u8('|') || c == u8('^') || c == u8('<') || c == u8('>') || c == u8('!') ||
+        c == u8('~') || c == u8('?') || c == u8(':')
+
+// A byte a list of places may hold outside its subscripts: a name's, a `.`, a `,` and blanks.
+private is_place_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || (c >= u8('0') && c <= u8('9')) ||
+        c == u8('_') || c >= 128 || c == u8('.') || c == u8(',') || c == u8(' ') || c == u8('\t')
+
+// Whether a run of operator bytes is exactly an assignment operator.
+private is_assign_run(run: []const u8) -> bool
+    if run.len == 1 then return run[0] == u8('=')
+    if run.len == 2 then return run[1] == u8('=') && is_compound_head(run[0])
+    if run.len == 3 then return run[2] == u8('=') && run[0] == run[1] && (run[0] == u8('<') || run[0] == u8('>'))
+
+    false
+end is_assign_run
+
+// The first byte of a two-byte compound assignment.
+private is_compound_head(c: u8) -> bool =
+    c == u8('+') || c == u8('-') || c == u8('*') || c == u8('/') || c == u8('%') || c == u8('&') ||
+        c == u8('|') || c == u8('^')
 
 // The `Dedent`s a bracket or a separator closed, with the `Newline` that ends the statement they
 // were the last line of. There is no line ending here to stand for it, which is the whole reason
