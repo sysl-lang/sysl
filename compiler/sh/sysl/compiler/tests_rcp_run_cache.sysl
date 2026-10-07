@@ -4,12 +4,12 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.env.get as env_get
 import sysl.fs.{entries, exists, make_dir_all, make_temp_dir, metadata, pending_name, publish_file, read_text,
-                remove_dir_all, write_text, write_text_atomic}
+                remove_dir_all, remove_file, write_text, write_text_atomic}
 import sysl.posix.threads.{spawn, Thread}
 import sysl.process.capture
 import sysl.slices.{as_mut_ptr, as_ptr, sort}
 import sysl.sync.Atomic
-import sysl.text.{cstring, str_builder, Search}
+import sysl.text.{cstring, from_cstring, str_builder, Search}
 
 // **`sysl run` keeps what it built, and what a cache has to be right about is the MISS, not the hit**
 // (the reference's `RunCacheTests`). A hit that should have been a miss is a stale binary, a program
@@ -62,6 +62,40 @@ private rcp_cli(args: []string) -> (int, string)
 end rcp_cli
 
 private rcp_run(root: string) -> int = rcp_cli(["sysl", "run", root]).0
+
+private extern "mkstemp" rcp_c_mkstemp(template: *u8) -> int
+private extern "dup" rcp_c_dup(fd: int) -> int
+private extern "dup2" rcp_c_dup2(from: int, to: int) -> int
+private extern "close" rcp_c_close(fd: int) -> int
+private extern "fflush" rcp_c_fflush(stream: *u8) -> int
+
+// `sysl test <args>` with what it reported: a suite's report is streamed to standard output as each
+// test finishes rather than said, so descriptor 1 is pointed at a file for the length of the command
+// and read back -- `sysl.posix.tty`'s own tests capture output the same way.
+private rcp_tested(args: []string) -> (int, string)
+    val template = cstring("/tmp/sysl-rcp-report-XXXXXX")
+    val fd = rcp_c_mkstemp(template.ptr)
+
+    assert(fd >= 0, "no file to capture the report into")
+    rcp_c_fflush(null)
+
+    val saved = rcp_c_dup(1)
+
+    rcp_c_dup2(fd, 1)
+    rcp_c_close(fd)
+
+    val said = rcp_cli(args)
+
+    rcp_c_fflush(null)
+    rcp_c_dup2(saved, 1)
+    rcp_c_close(saved)
+
+    val file = from_cstring(template.ptr).unwrap()
+    val report = read_text(file).unwrap()
+
+    remove_file(file).unwrap_or(())
+    (said.0, report + said.1)
+end rcp_tested
 
 // An environment variable set, or taken away, through libc -- `sysl.env` sets nothing.
 private rcp_set(name: string, value: Option[string])
@@ -218,12 +252,12 @@ rcp_a_suite_run_twice_is_built_once()
             assert(1 + 1 == 2)
         """)
 
-    val first = rcp_cli(["sysl", "test", root])
+    val first = rcp_tested(["sysl", "test", root])
 
     assert_eq(first.0, 0, first.1)
     assert_eq(rcp_entries(cache), 2)
 
-    val second = rcp_cli(["sysl", "test", root])
+    val second = rcp_tested(["sysl", "test", root])
 
     // Compared with the timings taken out, the one part of a report that is a clock.
     assert_eq(runner_timeless(second.1), runner_timeless(first.1))
@@ -243,14 +277,17 @@ rcp_an_identical_tree_elsewhere_is_another_program()
     val text = "@test\nfour() =\n    assert(2 * 2 == 4)\n"
     val one = runner_project("main.sysl", text)
     val two = runner_project("main.sysl", text)
-    val first = rcp_cli(["sysl", "test", one])
+    // A report names a file by its absolute path, which has no doubled separator in it.
+    val one_at = absolute_path(one)
+    val two_at = absolute_path(two)
+    val first = rcp_tested(["sysl", "test", one])
 
-    assert(first.1.contains(s"$one/main.sysl"), first.1)
+    assert(first.1.contains(s"$one_at/main.sysl"), first.1)
 
-    val second = rcp_cli(["sysl", "test", two])
+    val second = rcp_tested(["sysl", "test", two])
 
-    assert(second.1.contains(s"$two/main.sysl"), second.1)
-    assert(!second.1.contains(one), second.1)
+    assert(second.1.contains(s"$two_at/main.sysl"), second.1)
+    assert(!second.1.contains(one_at), second.1)
     assert_eq(rcp_entries(cache), 4)
     rcp_done([cache, one, two])
 end rcp_an_identical_tree_elsewhere_is_another_program
@@ -271,11 +308,11 @@ rcp_a_filter_reaches_a_cached_suite()
             assert(1 + 1 == 2)
         """)
 
-    val all = rcp_cli(["sysl", "test", root])
+    val all = rcp_tested(["sysl", "test", root])
 
     assert(all.1.contains("2 passed"), all.1)
 
-    val filtered = rcp_cli(["sysl", "test", root, "--filter", "doubling"])
+    val filtered = rcp_tested(["sysl", "test", root, "--filter", "doubling"])
 
     assert(filtered.1.contains("1 passed"), filtered.1)
     assert(!filtered.1.contains("adding"), filtered.1)
@@ -298,7 +335,7 @@ rcp_a_run_and_a_test_are_two_entries()
 
     assert_eq(rcp_run(root), 42)
 
-    val tested = rcp_cli(["sysl", "test", root])
+    val tested = rcp_tested(["sysl", "test", root])
 
     assert(tested.1.contains("1 passed"), tested.1)
     assert_eq(rcp_entries(cache), 3)
