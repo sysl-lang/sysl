@@ -1,0 +1,244 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// The instruction selection the scalar table drives -- width, signedness and the conversions --
+// asserted on the emitted IR text. Every expected line was read out of the reference compiler's own
+// `emit-llvm --no-std-lib` (0.0.162) for the same program, which lowers the library from source beside
+// it exactly as these do; a claim is checked inside the function it is about, so a match in a library
+// body cannot answer for the program's.
+
+// -- the helpers the cgz_ files share -------------------------------------------------------------
+
+// The module a one-file program lowers to, with the library compiled from source beside it.
+cgz_ir(src: string) -> string = xvr_ir([("main.sysl", src)])
+
+// One function's emitted text, from its `define` to the brace that closes it.
+cgz_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out).view()
+        val names = line.contains("@" + name + "(") || line.contains("$" + name + "(")
+
+        if !inside && line.starts_with("define ") && names then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end cgz_body
+
+cgz_main(src: string) -> string = cgz_body(cgz_ir(src), "main")
+
+private cgz_is_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
+
+// The temporaries a function reads and never defines, across every function of a module -- what clang
+// refuses a module for, and what the analyzer has no objection to make about.
+cgz_undefined_registers(out: string) -> string
+    var missing = ""
+    var defined = ""
+    var inside = false
+    var body: Buf[string] = buf()
+
+    for line in lines_of(out).view()
+        if line.starts_with("define ")
+            inside = true
+            body = buf()
+            defined = " "
+
+        if inside
+            val t = line.trim()
+
+            if t.starts_with("%t")
+                t.index_of(" = ") match
+                    Some(at) -> defined = defined + t[0..<at] + " "
+                    None -> ()
+
+            body.push(line)
+
+            if line == "}"
+                inside = false
+
+                for l in body.view()
+                    val bs = l.bytes
+                    var i: usize = 0
+
+                    while i + 2 < bs.len
+                        if bs[i] == u8('%') && bs[i + 1] == u8('t') && cgz_is_digit(bs[i + 2])
+                            var j = i + 2
+
+                            while j < bs.len && cgz_is_digit(bs[j])
+                                j += 1
+
+                            val reg = l[i..<j]
+
+                            if !defined.contains(" " + reg + " ") then missing = missing + reg + " "
+                            i = j
+                        else
+                            i += 1
+
+    missing
+end cgz_undefined_registers
+
+// How a program that was built and run ended, or why it could not be built.
+cgz_exit(src: string) -> Result[Status, string]
+    val root = make_temp_dir("sysl-cgz").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", src).unwrap()
+
+    val exe = s"$root/built"
+
+    val said: Result[Status, string] = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                                            Some(exe)) match
+        Err(why) -> Err(failure_text(why))
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Err(_) -> Err("the program that was built could not be run")
+            Ok(out) -> Ok(out.status)
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end cgz_exit
+
+// -- ScalarCodegenTests ---------------------------------------------------------------------------
+
+@test("a declared width becomes the LLVM integer width")
+cgz_a_declared_width_becomes_the_llvm_width()
+    if xvr_no_library() then return
+
+    val main = cgz_main("var n: u12 = 7\nprint(n + 1)\n")
+
+    assert(main.contains("add i12"), main)
+
+@test("signedness picks between the division pairs")
+cgz_signedness_picks_the_division()
+    if xvr_no_library() then return
+
+    val u = cgz_main("var u: uint = 9\nprint(u / 2)\n")
+    val s = cgz_main("var s: int = 9\nprint(s / 2)\n")
+
+    assert(u.contains("udiv i32"), u)
+    assert(s.contains("sdiv i32"), s)
+
+@test("signedness picks between the right shifts")
+cgz_signedness_picks_the_right_shift()
+    if xvr_no_library() then return
+
+    val u = cgz_main("var u: byte = 9\nprint(u >> 1)\n")
+    val s = cgz_main("var s: i8 = 9\nprint(s >> 1)\n")
+
+    assert(u.contains("lshr i8"), u)
+    assert(s.contains("ashr i8"), s)
+
+@test("an unsigned comparison uses the unsigned predicate")
+cgz_an_unsigned_comparison_is_unsigned()
+    if xvr_no_library() then return
+
+    val main = cgz_main("var u: uint = 9\nprint(u < 10)\n")
+
+    assert(main.contains("icmp ult i32"), main)
+
+@test("a narrower target truncates")
+cgz_a_narrower_target_truncates()
+    if xvr_no_library() then return
+
+    val main = cgz_main("var n: int = 9\nprint(byte(n))\n")
+
+    assert(main.contains("trunc i32"), main)
+
+@test("a wider target extends by the source's signedness")
+cgz_a_wider_target_extends_by_signedness()
+    if xvr_no_library() then return
+
+    val s = cgz_main("var n: i8 = 9\nprint(i32(n))\n")
+    val u = cgz_main("var n: byte = 9\nprint(u32(n))\n")
+
+    assert(s.contains("sext i8"), s)
+    assert(u.contains("zext i8"), u)
+
+@test("between integer and float")
+cgz_between_integer_and_float()
+    if xvr_no_library() then return
+
+    val s = cgz_main("var n: int = 9\nprint(real(n))\n")
+    val u = cgz_main("var n: uint = 9\nprint(real(n))\n")
+
+    assert(s.contains("sitofp i32"), s)
+    assert(u.contains("uitofp i32"), u)
+
+@test("a checked char conversion traps on a value that is not a scalar value")
+cgz_a_checked_char_conversion_traps()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("var n: int = 65\nprint(char(n))\n")
+
+    assert(out.contains("declare void @llvm.trap()"), out)
+    assert(cgz_body(out, "main").contains("call void @llvm.trap()"), out)
+
+@test("a narrower float constant is the double rounded down to it")
+cgz_a_narrower_float_constant_is_rounded()
+    if xvr_no_library() then return
+
+    val main = cgz_main("var f: f32 = 1.5\nprint(f)\n")
+
+    assert(main.contains("fptrunc double 0x3FF8000000000000 to float"), main)
+
+// `print` picks one library renderer per kind of value and widens to the width that renderer takes.
+@test("printing widens each value to the width its renderer takes")
+cgz_printing_widens_to_the_renderer()
+    if xvr_no_library() then return
+
+    val b = cgz_main("var b: byte = 9\nprint(b)\n")
+
+    assert(b.contains("%t2 = zext i8 %t1 to i64"), b)
+    assert(b.contains("call void @sysl$printu(i64 %t2)"), b)
+
+    val n = cgz_main("var n: long = 9\nprint(n)\n")
+    val u = cgz_main("var u: ulong = 9\nprint(u)\n")
+    val f = cgz_main("var f: f32 = 1.5\nprint(f)\n")
+
+    assert(n.contains("call void @sysl$printi(i64 %t"), n)
+    assert(u.contains("call void @sysl$printu(i64 %t"), u)
+    assert(f.contains("call void @sysl$printr(double %t"), f)
+end cgz_printing_widens_to_the_renderer
+
+@test("the renderer a value reaches carries the matching conversion")
+cgz_the_renderer_carries_the_conversion()
+    if xvr_no_library() then return
+
+    val unsigned = cgz_body(cgz_ir("var b: byte = 9\nprint(b)\n"), "printu")
+    val signed = cgz_body(cgz_ir("var n: long = 9\nprint(n)\n"), "printi")
+    val real = cgz_ir("var x = 2.5\nprint(x)\n")
+
+    assert(unsigned.contains("@sysl$digits_ulong("), unsigned)
+    assert(signed.contains("@sysl$digits_long("), signed)
+    assert(real.contains("c\"%g\\00\""), real)
+
+// Encoding a code point is sysl in the library, not a runtime helper the compiler emits. The module
+// text is read before the `#99` (nounwind) group is attached on the way to clang and `emit-llvm`, so
+// the define reads exactly as the reference's.
+@test("printing a char goes to the library's encoder")
+cgz_printing_a_char_goes_to_the_encoder()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("print('A')\n")
+
+    assert(cgz_body(out, "main").contains("call void @sysl$printc(i32 65)"), out)
+    assert(out.contains("define void @sysl$printc(i32 %ch.param) {"), out)
+    assert(!out.contains("@sysl.utf8"), out)
+
+@test("stack slots are hoisted into the entry block")
+cgz_stack_slots_are_hoisted()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("for i in 1..3\n    var x = i * 2\n    print(x)\n")
+
+    assert(out.contains("entry:\n  %i.addr = alloca i32\n  %x.addr = alloca i32"), out)

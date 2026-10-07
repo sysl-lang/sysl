@@ -1,0 +1,271 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The lowering of trait objects: the shape of a method table, the two words of the pointer, and the
+// indirect call -- the part a correct program cannot tell you about, that a slot whose receiver
+// already is the data word holds the implementation itself, and that the counted flavour steps over
+// the box header while the raw one does not. Every expected line was read out of the reference
+// compiler's `emit-llvm` (0.0.162) for the same program, and the temporaries it numbers are the same.
+
+private cgz_raw() -> string = raw"""
+    trait Shape
+        area(self) -> int
+        scale(*self, by: int)
+    struct Rect
+        w: int
+        h: int
+    impl Shape for Rect
+        area(self) -> int = self.w * self.h
+        scale(*self, by: int)
+            self.w += by
+    var r = Rect(3, 4)
+    var s: *Shape = &r
+    s.scale(1)
+    print(s.area())
+    """
+
+private cgz_counted() -> string = raw"""
+    trait T
+        go(&self)
+        v(self) -> int
+    struct S
+        n: int
+    impl T for S
+        go(&self)
+            self.n += 1
+        v(self) -> int = self.n
+    var o: &T = S(41)
+    o.go()
+    print(o.v())
+    """
+
+private cgz_with_property() -> string = raw"""
+    trait Sized
+        size -> int
+    struct Box
+        n: int
+    impl Sized for Box
+        size -> int = self.n
+    var b = Box(7)
+    var s: *Sized = &b
+    print(s.size)
+    """
+
+private cgz_generic() -> string = raw"""
+    trait Total
+        total(self) -> int
+    struct Box[T]
+        v: T
+        n: int
+    impl[T] Total for Box[T]
+        total(self) -> int = self.n
+    var a: &Total = Box("x", 7)
+    var b: &Total = Box(1, 8)
+    print(a.total(), b.total())
+    """
+
+private cgz_slice() -> string = raw"""
+    trait Total
+        total(self) -> int
+    impl Total for []int
+        total(self) -> int = 0
+    var a: &[2]int = [1, 2]
+    var t: &Total = a[0..]
+    print(t.total())
+    """
+
+private cgz_shape() -> string = raw"""
+    trait Total
+        total(self) -> int
+    impl[T] Total for []T
+        total(self) -> int = 1
+    var a: &[2]int = [1, 2]
+    var b: &[3]bool = [true, false, true]
+    var s: &Total = a[0..]
+    var t: &Total = b[0..]
+    print(s.total(), t.total())
+    """
+
+// -- the table --------------------------------------------------------------------------------------
+
+@test("holds one pointer per method, adapting only where the receiver differs")
+cgz_the_table_holds_one_pointer_per_method()
+    if xvr_no_library() then return
+
+    val out = cgz_ir(cgz_raw())
+
+    assert(out.contains("@vt.Shape.Rect = private constant { i64, [2 x ptr] }"), out)
+
+@test("of a counted object names a '&self' method directly instead")
+cgz_a_counted_table_names_a_ref_self_method()
+    if xvr_no_library() then return
+
+    val out = cgz_ir(cgz_counted())
+
+    assert(out.contains("@vt.ref.T.S = private constant { i64, [2 x ptr] }"), out)
+
+@test("is emitted only for a type something actually erased")
+cgz_a_table_only_for_an_erased_type()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("trait Shape\n    area(self) -> int\nstruct Rect\n    w: int\n    h: int\nstruct Sq\n    s: int\n" +
+                     "impl Shape for Rect\n    area(self) -> int = self.w * self.h\n" +
+                     "impl Shape for Sq\n    area(self) -> int = self.s * self.s\n" +
+                     "var r = Rect(3, 4)\nvar s: *Shape = &r\nprint(s.area())\n")
+
+    assert(out.contains("@vt.Shape.Rect"), out)
+    assert(!out.contains("@vt.Shape.Sq"), out)
+
+// -- the adapter ------------------------------------------------------------------------------------
+
+@test("loads the value the data word addresses")
+cgz_the_adapter_loads_the_value()
+    if xvr_no_library() then return
+
+    val body = cgz_body(cgz_ir(cgz_raw()), "vt.adapt.Rect.area")
+
+    assert(body.contains("%t1 = load %struct.Rect, ptr %d"), body)
+
+// The counted object's data word is the box, so the payload is one step further in.
+@test("of a counted object steps over the box header first")
+cgz_a_counted_adapter_steps_over_the_header()
+    if xvr_no_library() then return
+
+    val body = cgz_body(cgz_ir(cgz_counted()), "vt.adapt.ref.S.v")
+
+    assert(body.contains("%t1 = getelementptr %arc.S, ptr %d, i32 0, i32 3"), body)
+    assert(body.contains("%t2 = load %struct.S, ptr %t1"), body)
+
+// -- a property -------------------------------------------------------------------------------------
+
+@test("takes a slot like a method, with the by-value adapter one needs")
+cgz_a_property_takes_a_slot()
+    if xvr_no_library() then return
+
+    val out = cgz_ir(cgz_with_property())
+
+    assert(out.contains("@vt.Sized.Box = private constant { i64, [1 x ptr] }"), out)
+    assert(cgz_body(out, "vt.adapt.Box.size").contains("%t1 = load %struct.Box, ptr %d"), out)
+
+// The reference's own line is `%t9 = call i32 %t8(ptr %t6)`: nothing after the data word.
+@test("reads through the slot, passing the data word and no arguments")
+cgz_a_property_reads_through_the_slot()
+    if xvr_no_library() then return
+
+    val main = cgz_body(cgz_ir(cgz_with_property()), "main")
+
+    assert(main.contains("= call i32 %t8(ptr %t6)"), main)
+
+// -- a type with no name of its own -------------------------------------------------------------
+
+@test("emits its members under the mangled type")
+cgz_a_slice_member_is_mangled()
+    if xvr_no_library() then return
+
+    val out = cgz_ir(cgz_slice())
+
+    assert(out.contains("define i32 @slice.int.total("), out)
+
+@test("names its table by the same mangling, and fills the slot from it")
+cgz_a_slice_table_is_mangled_the_same_way()
+    if xvr_no_library() then return
+
+    val out = cgz_ir(cgz_slice())
+
+    assert(out.contains("@vt.ref.Total.slice.int = private constant { i64, [1 x ptr] }"), out)
+    assert(out.contains("@vt.adapt.ref.slice.int.total"), out)
+    assert(cgz_body(out, "vt.adapt.ref.slice.int.total").contains("call i32 @slice.int.total("), out)
+
+@test("mangles an array's length into the name too")
+cgz_an_arrays_length_is_mangled()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("trait Total\n    total(self) -> int\nimpl Total for [3]int\n    total(self) -> int = self[0]\n" +
+                     "var a: [3]int = [1, 2, 3]\nprint(a.total())\n")
+
+    assert(out.contains("define i32 @arr3.int.total("), out)
+
+// -- a generic type's table: named by the instantiated member, Box.total.string ----------------
+
+@test("names the slot as the instantiated member, not as the type with the name appended")
+cgz_a_generic_slot_names_the_instantiated_member()
+    if xvr_no_library() then return
+
+    val out = cgz_ir(cgz_generic())
+
+    assert(out.contains("define i32 @Box.total.string("), out)
+    assert(cgz_body(out, "vt.adapt.ref.Box.total.string").contains("call i32 @Box.total.string("), out)
+
+@test("gives two instantiations two tables of their own")
+cgz_two_instantiations_two_tables()
+    if xvr_no_library() then return
+
+    val out = cgz_ir(cgz_generic())
+
+    assert(out.contains("@vt.ref.Total.Box.string = private constant { i64, [1 x ptr] }"), out)
+    assert(out.contains("@vt.ref.Total.Box.int = private constant { i64, [1 x ptr] }"), out)
+
+// -- a shape's table: `slice.total` at `int` is `slice.total.int` -------------------------------
+
+@test("names the slot as the member instantiated at the element type")
+cgz_a_shape_slot_names_the_member_at_the_element()
+    if xvr_no_library() then return
+
+    val out = cgz_ir(cgz_shape())
+
+    assert(out.contains("define i32 @slice.total.int("), out)
+    assert(cgz_body(out, "vt.adapt.ref.slice.total.int").contains("call i32 @slice.total.int("), out)
+
+@test("gives two element types two tables of their own")
+cgz_two_element_types_two_tables()
+    if xvr_no_library() then return
+
+    val out = cgz_ir(cgz_shape())
+
+    assert(out.contains("@vt.ref.Total.slice.int = private constant { i64, [1 x ptr] }"), out)
+    assert(out.contains("@vt.ref.Total.slice.bool = private constant { i64, [1 x ptr] }"), out)
+
+// -- the object ---------------------------------------------------------------------------------------
+
+@test("is a pair of the table and the value")
+cgz_the_object_is_a_pair()
+    if xvr_no_library() then return
+
+    val main = cgz_body(cgz_ir(cgz_raw()), "main")
+
+    assert(main.contains("%s.addr = alloca { ptr, ptr }"), main)
+    assert(main.contains("insertvalue { ptr, ptr } undef, ptr @vt.Shape.Rect, 0"), main)
+
+@test("calls through the slot its method sits in, passing the data word first")
+cgz_the_object_calls_through_its_slot()
+    if xvr_no_library() then return
+
+    val main = cgz_body(cgz_ir(cgz_raw()), "main")
+
+    assert(main.contains("getelementptr { i64, [0 x ptr] }, ptr %t11, i32 0, i32 1, i64 0"), main)
+    assert(main.contains("call i32 %t14(ptr %t12)"), main)
+
+// The table owns nothing, so releasing an object is releasing exactly what its `&T` would have: the
+// line after the second word is extracted releases that same temporary.
+@test("counts the box in its second word, and nothing else")
+cgz_the_object_counts_its_second_word()
+    if xvr_no_library() then return
+
+    val main = cgz_body(cgz_ir(cgz_counted()), "main")
+    val lines = lines_of(main)
+    var released = false
+
+    for i in 0..<lines.len()
+        val l = lines.at(i).trim()
+
+        if l.starts_with("%t") && i + 1 < lines.len()
+            l.index_of(" = extractvalue { ptr, ptr } %t") match
+                Some(at) ->
+                    if l.ends_with(", 1") && lines.at(i + 1).trim() == s"call void @arc.release(ptr ${l[0..<at]})"
+                        released = true
+                None -> ()
+
+    assert(released, main)
+end cgz_the_object_counts_its_second_word
