@@ -1183,8 +1183,7 @@ graph that somehow did not settle is refused rather than built against whichever
 ### Choosing them on the command line
 
 Three flags, and [`run`, `build`, `build-c`, `test` and
-`deps`](/getting-started/cli/#the-feature-flags) take them — `vendor` too, once it is in this
-compiler:
+`deps`](/getting-started/cli/#the-feature-flags) take them, and so does `vendor`:
 
 | | |
 |---|---|
@@ -1529,10 +1528,6 @@ manifest is rewritten one run of bytes at a time, which is why your comments and
 and the result is read back before it is written — a rewrite that produced something unreadable
 leaves the file exactly as it was. Nothing is fetched; the next build does that.
 
-*`sysl vendor` is not yet in this compiler — it answers "`vendor` is not a command this compiler can
-carry out yet". A `vendor/` directory already there is read as described below; what follows is the
-command that will write one.*
-
 `sysl vendor` puts everything the project resolves to into a `vendor/` directory beside the manifest:
 
 ```text
@@ -1540,7 +1535,8 @@ sysl vendor .
 ```
 
 **It is the machine's package cache moved into the project** — the same layout, the same resolution,
-the same `sysl.sum`. A project that has a `vendor/` builds with the network off, and the directory
+the same `sysl.sum`. Each package is copied out of the machine's cache, fetched there first if it
+was not, and the copy is checked against its `sysl.sum` line before it is put in place. A project that has a `vendor/` builds with the network off, and the directory
 being there is the whole of what turns that on: nobody has to be told, and no flag has to be passed.
 It is not part of the project's own source, exactly as [`examples/`](#a-package-may-carry-examples)
 is not, so nothing in it is compiled as one of your modules.

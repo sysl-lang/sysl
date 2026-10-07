@@ -1,0 +1,239 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{copy_dir_all, is_file, make_dir_all, pending_name, publish_dir, remove_dir_all, write_text_atomic}
+
+// `sysl vendor <path>` -- every package this project depends on, copied into `vendor/` beside the
+// manifest, so that a build fetches nothing.
+//
+// **A `vendor/` is the machine's cache moved into the project, not a second mechanism beside it.**
+// `cache_root` prefers that directory when it is there, and it is laid out exactly as the cache is --
+// `vendor/<coordinate>/@v<version>/` with its tree hash in a sibling `.hash` -- so every later build
+// resolves, checks `sysl.sum` and reads source through the code that was already there. All this
+// command adds is the copy.
+//
+// **The graph is resolved against the machine's cache, then copied out of it.** Resolving fetches
+// whatever the machine has not got and records a `sysl.sum` line for whatever had none, exactly as a
+// build would; each package the resolution READ is then copied, and the copy's tree hash is checked
+// against its line before it is put in place, so a cache somebody edited after the fetch is refused
+// rather than frozen into the project. What is read is wider than what is selected -- a version read
+// on the way to a higher floor is read again by every resolution of the same manifests -- and
+// copying less would send a vendored build to the network for a manifest it only looks at.
+//
+// The graph is the one `sysl test` resolves: every feature the root declares unless the feature flags
+// say otherwise, and the project's `dev_dependencies` as well as its `dependencies`, so a vendored project's own tests fetch nothing
+// either. A repository's `.git` is left behind, being no part of what the hash covers, and a nested
+// repository is what `git add vendor/` would otherwise record in place of the files.
+//
+// **A path dependency is not vendored and cannot be.** It is a directory somebody is editing beside
+// this one -- `sysl.sum` keeps no line for it precisely because it is expected to change -- so a copy
+// would freeze the thing whose purpose is not to be frozen. It is named in what this prints, so that
+// a reader is told rather than left to notice.
+vendor_command(args: []string, say: string -> unit) -> int
+    var dir = ""
+    var paths: usize = 0
+    var mistakes: Buf[string] = buf()
+    var i: usize = 2
+
+    while i < args.len
+        val featured = took_feature_flag(args, i)
+
+        if featured == 0
+            mistakes.push(missing_value(args[i]))
+            break
+        end if
+
+        if featured > 0
+            if featured == 2 then i += 1
+        else
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken > 0
+                i += taken - 1
+            else
+                dir = args[i]
+                paths += 1
+
+        i += 1
+
+    if mistakes.len() > 0
+        say(misused(mistakes, vendor_usage()))
+        return Misused
+    end if
+
+    if paths != 1
+        say(vendor_usage())
+        return Misused
+    end if
+
+    if refused_features(say) then return Failed
+
+    machine_cache_root() match
+        Err(why) ->
+            say(refused(why))
+            Failed
+        Ok(machine) -> vendor_project(dir, machine, say)
+end vendor_command
+
+vendor_usage() -> string = "usage: sysl vendor " + feature_flags() + " <path>"
+
+// What one run did: how many packages the graph selected, which is the count the command reports,
+// and how many directories it copied this time, a package already vendored being left where it is.
+struct Vendored
+    selected: usize
+    copied: usize
+    paths: usize
+
+// The whole command once the command line has been read, copying out of `machine`.
+//
+// **Inside a workspace there is one `vendor/`, at its root**, beside its one `sysl.sum`, and what goes
+// into it is the workspace's one selection over every member.
+vendor_project(path: string, machine: string, say: string -> unit) -> int
+    val project = project_dir_of(path)
+
+    if !is_file(join_path(project, ManifestName))
+        say(refused(s"'$project' has no $ManifestName — 'sysl vendor' copies in what a project's " +
+            "manifest depends on, and there is no manifest here"))
+        return Failed
+    end if
+
+    vendor_into(project, machine) match
+        Err(why) ->
+            say(refused(why))
+            Failed
+        Ok(done) ->
+            val n = done.selected
+
+            say(s"vendored $n package${if n == 1 then "" else "s"} into $VendorDir/")
+
+            if done.paths > 0
+                val p = done.paths
+
+                say("")
+                say(s"$p path dependenc${if p == 1 then "y is" else "ies are"} not vendored — a path " +
+                    "is a directory you are editing, and freezing a copy of it is the one thing it " +
+                    "is there not to do")
+            end if
+
+            Fine
+end vendor_project
+
+// Resolves `project` against the machine's cache and copies every package that read into the
+// resolution root's `vendor/`.
+vendor_into(project: string, machine: string) -> Result[Vendored, string]
+    val home = resolution_root(project)?
+    val m = manifest_of_package(project)?
+    val sums = sums_at(home)?
+    var declared: Buf[Dependency] = buf()
+    var paths: usize = 0
+
+    for i in 0..<m.dependencies.len()
+        declared.push(m.dependencies.at(i))
+
+        m.dependencies.at(i).origin match
+            Local(_) -> paths += 1
+            _ -> ()
+
+    for i in 0..<m.dev_dependencies.len()
+        declared.push(m.dev_dependencies.at(i))
+
+    var whole = m
+
+    whole.dependencies = declared
+
+    var read: Buf[(string, Release)] = buf()
+    var after = sums
+    var changed = false
+    var selected: usize = 0
+
+    workspace_around(home)? match
+        Some(ws) ->
+            val s = workspace_selection(ws, sums, machine)?
+
+            read = s.read
+            after = s.sums
+            changed = s.changed
+            selected = s.selected.len()
+        None ->
+            if wants_graph(whole)
+                val g = resolve_graph(project, whole, sums, machine, current_feature_request(), true)?
+
+                read = g.read
+                after = g.sums
+                changed = g.sums_changed
+
+                for i in 0..<g.packages.len()
+                    val p = g.packages.at(i)
+
+                    if !is_root_package(p) && p.version.is_some() then selected += 1
+            end if
+
+    if changed then write_sums(home, after)
+
+    val into = join_path(home, VendorDir)
+
+    if make_dir_all(into).is_err() then return Err(s"cannot make '$into'")
+
+    var copied: usize = 0
+
+    for i in 0..<read.len()
+        if vendor_one(machine, into, read.at(i).0, read.at(i).1, after)? then copied += 1
+
+    Ok(Vendored(selected, copied, paths))
+end vendor_into
+
+// One package copied from the machine's cache into `vendor/`, checked against its `sysl.sum` line on
+// the way. Whether it was copied: a directory already there and recorded as that line is left alone.
+private vendor_one(machine: string, into: string, coordinate: string, version: Release,
+                   sums: &Sums) -> Result[bool, string]
+    val from = fetch_directory(machine, coordinate, version)
+    val to = fetch_directory(into, coordinate, version)
+    val tag = release_tag(version)
+
+    val want = sum_of(sums, coordinate, version) match
+        None -> return Err(s"$SumsName has no line for $coordinate $tag, so a copy of '$from' " +
+            "could not be checked against anything — remove that directory and vendor again, so " +
+            "that it is fetched and recorded")
+        Some(h) -> h
+
+    if is_directory(to)
+        recorded_hash(to) match
+            Some(h) -> if h == want then return Ok(false)
+            None -> ()
+
+        return Err(s"'$to' already holds $coordinate $tag, and not what $SumsName records for it " +
+            "— remove that directory and vendor again")
+    end if
+
+    val pending = pending_name(to)
+
+    make_dir_all(parent_of(to).unwrap_or(".")).unwrap_or(())
+
+    if copy_dir_all(from, pending).is_err()
+        remove_dir_all(pending).unwrap_or(())
+        return Err(s"cannot copy '$from' into '$to'")
+    end if
+
+    remove_dir_all(join_path(pending, ".git")).unwrap_or(())
+
+    val got = tree_hash(pending) match
+        Err(why) ->
+            remove_dir_all(pending).unwrap_or(())
+            return Err(why)
+        Ok(h) -> h
+
+    if got != want
+        remove_dir_all(pending).unwrap_or(())
+        return Err(s"'$from' does not hash to what $SumsName records for $coordinate $tag\n" +
+            s"  recorded: $want\n  cached:   $got\n" +
+            "The machine's copy has changed since it was fetched. Remove that directory, and the " +
+            "next 'sysl vendor' fetches it again.")
+    end if
+
+    if write_text_atomic(s"$to.hash", s"$want\n").is_err() || publish_dir(pending, to).is_err()
+        remove_dir_all(pending).unwrap_or(())
+        return Err(s"cannot put $coordinate $tag into '$to'")
+    end if
+
+    Ok(true)
+end vendor_one
