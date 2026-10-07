@@ -565,10 +565,51 @@ private resolve_named_subtypes(a: &Analysis)
                 if alias_cycle(a, decl.scope, key, d) then
                     a.fault(decl.scope, decl.span,
                             s"'${d.name}' is an alias for itself, through a chain of aliases")
+                elif !d.tp.names.is_empty() then
+                    read_generic_alias(a, decl.scope, decl.span, d)
                 else
                     instantiate_named_subtype(a, decl.scope, decl.span, d.name, key, d, decl.scope,
                                               buf())
             _ -> ()
+
+// A generic alias has no type of its own to make until it is applied, so what is checked here is the
+// declaration: only a transparent alias may take parameters, and its right-hand side is read at
+// stand-ins -- the way a generic function's signature is -- so a name it gets wrong is reported
+// whether or not anything applies it. What that reading registers is taken back, as a generic
+// signature's is: the stand-ins are not types the program has.
+private read_generic_alias(a: &Analysis, scope: Scope, span: Span, d: TypeDecl)
+    if !is_plain_alias(d)
+        a.fault(scope, span, s"'${d.name}' takes type parameters, and only a transparent alias may — " +
+                "a 'new', 'within', 'where', 'wrapping' or '@export' type is one type of its own, " +
+                "with one range, one check and one name in a header, so there is nothing for an " +
+                "argument to fill")
+        return
+    end if
+
+    if !d.tp.packs.is_empty()
+        a.fault(scope, span, s"'${d.name}' is an alias, and an alias's parameter stands for one type " +
+                s"— '..${d.tp.packs.at(0)}' would stand for a list of them")
+        return
+    end if
+
+    check_bound_names(a, scope, d.name, d.tp.bounds)
+
+    val trial = a.sandboxed()
+    val structs = a.tables.struct_insts.len()
+    val enums = a.tables.enum_insts.len()
+    val constrained = a.tables.constrained_insts.len()
+    val subst = abstract_subst(a, scope, d.tp.names, d.tp.bounds, d.tp.values, d.tp.packs, buf())
+    val before = a.settled
+
+    a.settled = subst
+    resolve_type(a, scope, d.base, subst)
+    a.settled = before
+
+    a.release(trial)
+    rewind_registered(a.tables.struct_insts, structs)
+    rewind_registered(a.tables.enum_insts, enums)
+    rewind_registered(a.tables.constrained_insts, constrained)
+end read_generic_alias
 
 // Whether following a named subtype's base leads back to the name itself.
 //
@@ -578,11 +619,15 @@ private alias_cycle(a: &Analysis, scope: Scope, key: string, d: TypeDecl) -> boo
     var seen: Buf[string] = buf()
     var here = key
     var base = d.base
+    var params = d.tp.names
 
     for _step in 0..<64
         val name = plain_alias_target(base)
 
         if name.is_none() then return false
+
+        // A generic alias's own parameter is whatever it is applied to, never a declaration.
+        if holds_string(params, name.unwrap()) then return false
 
         val next = lookup_type_key(a, scope, name.unwrap())
 
@@ -596,6 +641,7 @@ private alias_cycle(a: &Analysis, scope: Scope, key: string, d: TypeDecl) -> boo
                 if !is_plain_alias(inner) then return false
 
                 base = inner.base
+                params = inner.tp.names
             _ -> return false
 
     false
@@ -603,8 +649,12 @@ end alias_cycle
 
 // The bare name a written type is, where it is one -- an alias chain is followed through names and
 // through nothing else.
+//
+// **A name applied to arguments is followed too**, so `type A[T] = B[T]` over `type B[T] = A[T]` is
+// the same chain written through parameters. Where the name is a struct or an enum the walk stops,
+// as it does for a bare one: a nominal type is where an alias chain ends.
 private plain_alias_target(t: TypeRef) -> Option[string] = *t.kind match
-    NamedType(name, args) -> if args.is_empty() then Some(name) else None
+    NamedType(name, _) -> Some(name)
     _ -> None
 
 // Every signature, resolved: the functions, the externs, the storage, and the members of every type.

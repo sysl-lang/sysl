@@ -311,6 +311,30 @@ private unify_named(a: &Analysis, scope: Scope, n: string, arg_refs: Buf[TypeRef
 
     if key.is_none() then return
 
+    // **A generic alias is matched as what it expands to**: its right-hand side is unified against
+    // the actual type in the alias's own terms, binding the alias's parameters, and each argument
+    // written here is then unified against what its parameter bound -- so `swap[A, B](p: Pair[A,
+    // B])` over `type Pair[A, B] = (A, B)` infers from a tuple exactly as `(A, B)` written out does.
+    a.tables.types.get(key.unwrap()) match
+        Some(decl) -> decl.kind match
+            TypeOf(d) ->
+                if !d.tp.names.is_empty() && is_plain_alias(d)
+                    var inner: Buf[Binding] = buf()
+
+                    unify(a, decl.scope, d.base, actual, d.tp.names, &inner)
+
+                    for i in 0..<arg_refs.len()
+                        if i < d.tp.names.len()
+                            bound_type(inner, d.tp.names.at(i)) match
+                                Some(t) -> unify(a, scope, arg_refs.at(i), t, tparams, sub)
+                                None -> ()
+                        end if
+
+                    return
+                end if
+            _ -> ()
+        None -> ()
+
     actual match
         Struct(d) ->
             if d.base == key.unwrap() && d.targs.len() == arg_refs.len()
