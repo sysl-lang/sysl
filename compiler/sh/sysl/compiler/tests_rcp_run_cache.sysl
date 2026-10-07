@@ -1,0 +1,732 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_get
+import sysl.fs.{entries, exists, make_dir_all, make_temp_dir, metadata, pending_name, publish_file, read_text,
+                remove_dir_all, write_text, write_text_atomic}
+import sysl.posix.threads.{spawn, Thread}
+import sysl.process.capture
+import sysl.slices.{as_mut_ptr, as_ptr, sort}
+import sysl.sync.Atomic
+import sysl.text.{cstring, str_builder, Search}
+
+// **`sysl run` keeps what it built, and what a cache has to be right about is the MISS, not the hit**
+// (the reference's `RunCacheTests`). A hit that should have been a miss is a stale binary, a program
+// running the code it had before the edit, so most of what is below perturbs one input at a time and
+// counts the entries to see whether the key noticed. Every case keeps its entries in a directory of
+// its own (`use_run_cache_dir`), which is what makes counting them mean anything.
+//
+// **`run` shares this process's streams** -- the program's output is the reader's, not something a
+// caller collects -- so where the reference reads what a run printed, these programs `exit` with it
+// and the case reads the status `run` answers with.
+//
+// The last part is `sysl.fs`'s publishing calls, which every cache write arrives through: the
+// reference's `Publish`, and its promises, asked of the library this compiler writes with.
+
+private extern "setenv" rcp_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" rcp_c_unsetenv(name: *u8) -> int
+
+private rcp_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A run cache of the case's own.
+private rcp_cache() -> string
+    val dir = make_temp_dir("sysl-rcp-cache").unwrap()
+
+    use_run_cache_dir(Some(dir))
+    dir
+end rcp_cache
+
+private rcp_done(dirs: []string)
+    use_run_cache_dir(None)
+
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+// How many entries the cache holds, the test lists beside the binaries included.
+private rcp_entries(cache: string) -> usize = entries(s"$cache/sysl/run") match
+    Ok(names) -> names.len()
+    Err(_) -> 0
+
+// `sysl <args>` as the command line answers it: the status, and everything it said.
+private rcp_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for i in 0..<said.len()
+        text = text + said.at(i) + "\n"
+
+    (code, text)
+end rcp_cli
+
+private rcp_run(root: string) -> int = rcp_cli(["sysl", "run", root]).0
+
+// An environment variable set, or taken away, through libc -- `sysl.env` sets nothing.
+private rcp_set(name: string, value: Option[string])
+    val n = cstring(name)
+
+    value match
+        Some(v) ->
+            val c = cstring(v)
+
+            rcp_c_setenv(n.ptr, c.ptr, 1)
+        None -> rcp_c_unsetenv(n.ptr)
+end rcp_set
+
+// The six variables that reach the toolchain, each as it was, then taken away.
+private rcp_cleared() -> Buf[(string, Option[string])]
+    val names = ["SYSL_EXTRA_CFLAGS", "WASI_SDK_PATH", "ANDROID_NDK_ROOT", "ANDROID_NDK_HOME",
+                 "ANDROID_HOME", "ANDROID_SDK_ROOT"]
+    var saved: Buf[(string, Option[string])] = buf()
+
+    for n in names
+        saved.push((n, env_get(n)))
+        rcp_set(n, None)
+
+    saved
+end rcp_cleared
+
+private rcp_restored(saved: Buf[(string, Option[string])])
+    for i in 0..<saved.len()
+        rcp_set(saved.at(i).0, saved.at(i).1)
+
+// -- what a run keeps ------------------------------------------------------------------------------
+
+@test("the same program run twice is built once")
+rcp_run_twice_is_built_once()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", "exit(21 * 2)\n")
+
+    assert_eq(rcp_run(root), 42)
+    assert_eq(rcp_entries(cache), 1)
+    assert_eq(rcp_run(root), 42)
+    assert_eq(rcp_entries(cache), 1)
+    rcp_done([cache, root])
+end rcp_run_twice_is_built_once
+
+@test("and the arguments it is given are not part of the key, which is the point")
+rcp_arguments_are_not_in_the_key()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", "main(args: []string)\n    exit(int(args[1].bytes[0]))\n")
+
+    assert_eq(rcp_cli(["sysl", "run", root, "--", "a"]).0, 97)
+    assert_eq(rcp_cli(["sysl", "run", root, "--", "b"]).0, 98)
+    assert_eq(rcp_entries(cache), 1)
+    rcp_done([cache, root])
+end rcp_arguments_are_not_in_the_key
+
+@test("an edit is a different program")
+rcp_an_edit_is_another_program()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", "exit(21 * 2)\n")
+
+    assert_eq(rcp_run(root), 42)
+    write_text(s"$root/main.sysl", "exit(21 * 3)\n").unwrap()
+    assert_eq(rcp_run(root), 63)
+    assert_eq(rcp_entries(cache), 2)
+    rcp_done([cache, root])
+end rcp_an_edit_is_another_program
+
+// **A comment is an edit.** The key is over the file's text rather than over anything the parser
+// decided, which is the conservative direction.
+@test("including one the program's behaviour does not depend on")
+rcp_a_comment_is_an_edit()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", "exit(21 * 2)\n")
+
+    assert_eq(rcp_run(root), 42)
+    write_text(s"$root/main.sysl", "// a note\nexit(21 * 2)\n").unwrap()
+    assert_eq(rcp_run(root), 42)
+    assert_eq(rcp_entries(cache), 2)
+    rcp_done([cache, root])
+end rcp_a_comment_is_an_edit
+
+@test("and so is a second file beside it, which the first one's text says nothing about")
+rcp_a_second_file_is_in_the_key()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", "import m.*\n\nexit(double(21))\n")
+
+    make_dir_all(s"$root/m").unwrap()
+    write_text(s"$root/m/m.sysl", "module m\n\ndouble(n: int) -> int = n * 2\n").unwrap()
+    assert_eq(rcp_run(root), 42)
+    write_text(s"$root/m/m.sysl", "module m\n\ndouble(n: int) -> int = n * 3\n").unwrap()
+    assert_eq(rcp_run(root), 63)
+    assert_eq(rcp_entries(cache), 2)
+    rcp_done([cache, root])
+end rcp_a_second_file_is_in_the_key
+
+@test("the optimization level changes what is emitted, so it changes the key")
+rcp_the_level_is_in_the_key()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", "exit(21 * 2)\n")
+
+    assert_eq(rcp_run(root), 42)
+    assert_eq(rcp_cli(["sysl", "run", root, "-O2"]).0, 42)
+    assert_eq(rcp_entries(cache), 2)
+    rcp_done([cache, root])
+end rcp_the_level_is_in_the_key
+
+// The escape hatch, which is for working on the compiler or timing a compile.
+@test("'SYSL_NO_CACHE' builds every time and keeps nothing")
+rcp_no_cache_keeps_nothing()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", "exit(21 * 2)\n")
+    val was = env_get("SYSL_NO_CACHE")
+
+    rcp_set("SYSL_NO_CACHE", Some("1"))
+
+    val first = rcp_run(root)
+    val second = rcp_run(root)
+
+    rcp_set("SYSL_NO_CACHE", was)
+    assert_eq(first, 42)
+    assert_eq(second, 42)
+    assert_eq(rcp_entries(cache), 0)
+    rcp_done([cache, root])
+end rcp_no_cache_keeps_nothing
+
+// `sysl test` needs TWO things from the cache, the executable not carrying what to call in it, so the
+// list is kept beside it.
+@test("a test suite run twice is built once, and the report is the same either way")
+rcp_a_suite_run_twice_is_built_once()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", raw"""
+        @test("two doubled is four")
+        doubling() =
+            assert(2 * 2 == 4)
+
+        @test
+        adding() =
+            assert(1 + 1 == 2)
+        """)
+
+    val first = rcp_cli(["sysl", "test", root])
+
+    assert_eq(first.0, 0, first.1)
+    assert_eq(rcp_entries(cache), 2)
+
+    val second = rcp_cli(["sysl", "test", root])
+
+    // Compared with the timings taken out, the one part of a report that is a clock.
+    assert_eq(runner_timeless(second.1), runner_timeless(first.1))
+    assert(first.1.contains("two doubled is four"), first.1)
+    assert(first.1.contains("2 passed"), first.1)
+    assert_eq(rcp_entries(cache), 2)
+    rcp_done([cache, root])
+end rcp_a_suite_run_twice_is_built_once
+
+// The fingerprint is over each file's place in its tree, and a report heads each file with its full
+// path -- so the key carries the root too, or the second tree reports the first one's directory.
+@test("an identical tree in another directory is another program, and reports its own path")
+rcp_an_identical_tree_elsewhere_is_another_program()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val text = "@test\nfour() =\n    assert(2 * 2 == 4)\n"
+    val one = runner_project("main.sysl", text)
+    val two = runner_project("main.sysl", text)
+    val first = rcp_cli(["sysl", "test", one])
+
+    assert(first.1.contains(s"$one/main.sysl"), first.1)
+
+    val second = rcp_cli(["sysl", "test", two])
+
+    assert(second.1.contains(s"$two/main.sysl"), second.1)
+    assert(!second.1.contains(one), second.1)
+    assert_eq(rcp_entries(cache), 4)
+    rcp_done([cache, one, two])
+end rcp_an_identical_tree_elsewhere_is_another_program
+
+// The filter picks from the list rather than deciding what is compiled, so it is not in the key.
+@test("and a filter is applied to a cached suite as it is to a fresh one")
+rcp_a_filter_reaches_a_cached_suite()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", raw"""
+        @test
+        doubling() =
+            assert(2 * 2 == 4)
+
+        @test
+        adding() =
+            assert(1 + 1 == 2)
+        """)
+
+    val all = rcp_cli(["sysl", "test", root])
+
+    assert(all.1.contains("2 passed"), all.1)
+
+    val filtered = rcp_cli(["sysl", "test", root, "--filter", "doubling"])
+
+    assert(filtered.1.contains("1 passed"), filtered.1)
+    assert(!filtered.1.contains("adding"), filtered.1)
+    assert_eq(rcp_entries(cache), 2)
+    rcp_done([cache, root])
+end rcp_a_filter_reaches_a_cached_suite
+
+@test("a 'run' and a 'test' of one tree are two entries, since they are two builds")
+rcp_a_run_and_a_test_are_two_entries()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", raw"""
+        exit(21 * 2)
+
+        @test
+        arithmetic() =
+            assert(1 + 1 == 2)
+        """)
+
+    assert_eq(rcp_run(root), 42)
+
+    val tested = rcp_cli(["sysl", "test", root])
+
+    assert(tested.1.contains("1 passed"), tested.1)
+    assert_eq(rcp_entries(cache), 3)
+    rcp_done([cache, root])
+end rcp_a_run_and_a_test_are_two_entries
+
+// `build` writes a binary somebody named; nothing but `run` and `test` consults the cache.
+@test("no other command keeps anything")
+rcp_no_other_command_keeps_anything()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", "print(21 * 2)\n")
+    val out = make_temp_dir("sysl-rcp-out").unwrap()
+
+    assert_eq(rcp_cli(["sysl", "build", root, "-o", s"$out/app"]).0, 0)
+    assert_eq(rcp_entries(cache), 0)
+    rcp_done([cache, root, out])
+end rcp_no_other_command_keeps_anything
+
+// -- the environment that reaches the toolchain ----------------------------------------------------
+
+// `-fno-omit-frame-pointer` stands in for a sanitizer: it reaches every clang the build drives as
+// `-fsanitize=address` does, and links no runtime.
+@test("are part of the key, so a run under a new value builds again")
+rcp_extra_flags_are_in_the_key()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", "exit(21 * 2)\n")
+    val was = env_get("SYSL_EXTRA_CFLAGS")
+
+    rcp_set("SYSL_EXTRA_CFLAGS", None)
+    assert_eq(rcp_run(root), 42)
+    assert_eq(rcp_entries(cache), 1)
+    rcp_set("SYSL_EXTRA_CFLAGS", Some("-fno-omit-frame-pointer"))
+
+    val flagged = rcp_run(root)
+
+    rcp_set("SYSL_EXTRA_CFLAGS", was)
+    assert_eq(flagged, 42)
+    assert_eq(rcp_entries(cache), 2)
+    rcp_done([cache, root])
+end rcp_extra_flags_are_in_the_key
+
+@test("and the same value twice is still one build")
+rcp_the_same_flags_twice_are_one_build()
+    if !rcp_ready() then return
+
+    val cache = rcp_cache()
+    val root = runner_project("main.sysl", "exit(21 * 2)\n")
+    val was = env_get("SYSL_EXTRA_CFLAGS")
+
+    rcp_set("SYSL_EXTRA_CFLAGS", Some("-fno-omit-frame-pointer"))
+
+    val first = rcp_run(root)
+    val second = rcp_run(root)
+
+    rcp_set("SYSL_EXTRA_CFLAGS", was)
+    assert_eq(first, 42)
+    assert_eq(second, 42)
+    assert_eq(rcp_entries(cache), 1)
+    rcp_done([cache, root])
+end rcp_the_same_flags_twice_are_one_build
+
+@test("contribute nothing to the key when nothing is set")
+rcp_nothing_set_is_nothing()
+    val saved = rcp_cleared()
+    val said = build_environment()
+
+    rcp_restored(saved)
+    assert_eq(said, "")
+
+@test("and are named with their value, so two settings cannot share an entry")
+rcp_a_setting_is_named_with_its_value()
+    val saved = rcp_cleared()
+
+    rcp_set("SYSL_EXTRA_CFLAGS", Some("-fno-omit-frame-pointer"))
+
+    val said = build_environment()
+
+    rcp_restored(saved)
+    assert_eq(said, "SYSL_EXTRA_CFLAGS=-fno-omit-frame-pointer")
+end rcp_a_setting_is_named_with_its_value
+
+// It names where the library source is, and the key already carries that library's contents.
+@test("and 'SYSL_LIB' is not among them, because the library's contents are already in the key")
+rcp_sysl_lib_is_not_among_them()
+    val saved = rcp_cleared()
+    val lib = env_get("SYSL_LIB")
+
+    rcp_set("SYSL_LIB", Some("/somewhere"))
+
+    val said = build_environment()
+
+    rcp_set("SYSL_LIB", lib)
+    rcp_restored(saved)
+    assert_eq(said, "")
+end rcp_sysl_lib_is_not_among_them
+
+@test("and a cross toolchain's location is in the key too, since it decides which compiler answers")
+rcp_a_cross_toolchain_is_in_the_key()
+    val saved = rcp_cleared()
+
+    rcp_set("ANDROID_HOME", Some("/sdk"))
+
+    val android = build_environment()
+
+    rcp_set("ANDROID_HOME", None)
+    rcp_set("WASI_SDK_PATH", Some("/wasi"))
+
+    val wasi = build_environment()
+
+    rcp_restored(saved)
+    assert_eq(android, "ANDROID_HOME=/sdk")
+    assert_eq(wasi, "WASI_SDK_PATH=/wasi")
+end rcp_a_cross_toolchain_is_in_the_key
+
+// -- the test list beside a cached suite ----------------------------------------------------------
+
+// The reference's three: one with no hooks, one that traps with two hooks around it, one ignored.
+private rcp_suite() -> Buf[TTest]
+    var suite: Buf[TTest] = buf()
+
+    suite.push(TTest("m$plain", "a test with no hooks around it", false, None, "m.sysl", 3, no_hooks(),
+                     None))
+    suite.push(TTest("m$traps", "one that should trap", true, Some("past the end"), "m.sysl", 9,
+                     THooks(Some(THook(Setup, "m$up", "m.sysl", 12)), None, None,
+                            Some(THook(TeardownAll, "m$halt", "m.sysl", 20))), None))
+    suite.push(TTest("m$waits", "one that is ignored", false, None, "m.sysl", 30, no_hooks(),
+                     Some("the parser drops the second arm")))
+    suite
+end rcp_suite
+
+private rcp_hook(h: Option[THook]) -> string = h match
+    Some(one) -> s"${one.func}@${one.file}:${one.line}"
+    None -> "-"
+
+// Every field of a test, as one line, so two lists compare field for field.
+private rcp_shown(t: TTest) -> string =
+    s"${t.func}|${t.display}|${t.should_trap}|${t.expected.unwrap_or("<none>")}|${t.expected.is_some()}|" +
+    s"${t.file}|${t.line}|${rcp_hook(t.hooks.setup)}|${rcp_hook(t.hooks.teardown)}|" +
+    s"${rcp_hook(t.hooks.setup_all)}|${rcp_hook(t.hooks.teardown_all)}|" +
+    s"${t.ignored.unwrap_or("<none>")}|${t.ignored.is_some()}"
+
+@test("every field comes back")
+rcp_every_field_comes_back()
+    val suite = rcp_suite()
+    val read = decode_test_list(encode_test_list(suite)).unwrap()
+
+    assert_eq(read.len(), suite.len())
+
+    for i in 0..<suite.len()
+        assert_eq(rcp_shown(read.at(i)), rcp_shown(suite.at(i)))
+end rcp_every_field_comes_back
+
+@test("a test with no hooks comes back with none")
+rcp_no_hooks_come_back_as_none()
+    val h = decode_test_list(encode_test_list(rcp_suite())).unwrap().at(0).hooks
+
+    assert(h.setup.is_none() && h.teardown.is_none(), "a hook came back")
+    assert(h.setup_all.is_none() && h.teardown_all.is_none(), "a hook came back")
+
+// A list written before the hooks existed has fewer fields per line, and the read has to notice.
+@test("a line of the wrong shape is no cache at all")
+rcp_a_line_of_the_wrong_shape_is_no_cache()
+    assert(decode_test_list("m$plain\u{0}a test\u{0}false\u{0}\u{0}0\u{0}m.sysl\u{0}3").is_none(),
+           "a line of seven fields was read")
+
+// -- publishing into the cache --------------------------------------------------------------------
+
+private rcp_names(dir: string) -> Buf[string] = entries(dir) match
+    Ok(names) -> names
+    Err(_) -> buf()
+
+// Whether no two of `xs` are equal, read off the sorted list.
+private rcp_distinct(xs: Buf[string]) -> bool
+    var sorted = xs.view()
+
+    sort(sorted)
+
+    for i in 1..<sorted.len
+        if sorted[i] == sorted[i - 1] then return false
+
+    true
+end rcp_distinct
+
+@test("a pending name is beside its target, and no two calls share one")
+rcp_a_pending_name_is_beside_its_target()
+    val dir = make_temp_dir("sysl-rcp-publish").unwrap()
+    var names: Buf[string] = buf()
+
+    for _ in 0..<200
+        names.push(pending_name(s"$dir/slot"))
+
+    for i in 0..<names.len()
+        assert_eq(parent_of(names.at(i)), Some(dir))
+        assert(basename(names.at(i)).starts_with("slot."), names.at(i))
+
+    assert(rcp_distinct(names), "two calls were handed one name")
+    remove_dir_all(dir).unwrap_or(())
+end rcp_a_pending_name_is_beside_its_target
+
+// A thread's share of the names, written as each name's FNV-1a digest: a `string` may not cross into
+// another thread, and two different digests are two different names.
+struct RcpMint
+    digests: *u64
+    count: usize
+
+private rcp_digest(s: string) -> u64
+    var h: u64 = 0xcbf29ce484222325
+
+    for c in s.bytes
+        h = (h ^ u64(c)) * 0x100000001b3
+
+    h
+end rcp_digest
+
+private rcp_mint(m: *RcpMint)
+    for i in 0..<m.count
+        m.digests[i] = rcp_digest(pending_name("/rcp/slot"))
+
+@test("and none shared between threads either")
+rcp_no_pending_name_is_shared_between_threads()
+    var digests: [2000]u64 = [0; 2000]
+    var shares: [8]RcpMint = [RcpMint(null, 0); 8]
+
+    for k in 0..<shares.len
+        shares[k] = RcpMint(as_mut_ptr(digests[(k * 250)..<((k + 1) * 250)]), 250)
+
+    var threads: Buf[Thread] = buf()
+
+    for k in 0..<shares.len
+        threads.push(spawn(&rcp_mint, &shares[k]).unwrap())
+
+    for k in 0..<threads.len()
+        assert(threads.at(k).join(), "a thread did not join")
+
+    sort(digests[..])
+
+    for i in 1..<2000
+        assert(digests[i] != digests[i - 1], "two threads were handed one name")
+end rcp_no_pending_name_is_shared_between_threads
+
+@test("a published file is exactly what was written, and nothing is left beside it")
+rcp_a_published_file_is_whole()
+    val dir = make_temp_dir("sysl-rcp-publish").unwrap()
+
+    assert(write_text_atomic(s"$dir/slot.tests", "one\ntwo\n").is_ok(), "the publish failed")
+    assert_eq(read_text(s"$dir/slot.tests").unwrap(), "one\ntwo\n")
+
+    val names = rcp_names(dir)
+
+    assert_eq(names.len(), 1)
+    assert_eq(names.at(0), "slot.tests")
+    remove_dir_all(dir).unwrap_or(())
+end rcp_a_published_file_is_whole
+
+@test("publishing over an entry replaces the whole of it")
+rcp_publishing_over_an_entry_replaces_it()
+    val dir = make_temp_dir("sysl-rcp-publish").unwrap()
+
+    write_text_atomic(s"$dir/slot", "a much longer first version of the entry\n").unwrap()
+    assert(write_text_atomic(s"$dir/slot", "short\n").is_ok(), "the second publish failed")
+    assert_eq(read_text(s"$dir/slot").unwrap(), "short\n")
+    assert_eq(rcp_names(dir).len(), 1)
+    remove_dir_all(dir).unwrap_or(())
+end rcp_publishing_over_an_entry_replaces_it
+
+@test("a rename keeps the executable bit the linker gave the pending file")
+rcp_a_rename_keeps_the_executable_bit()
+    val dir = make_temp_dir("sysl-rcp-publish").unwrap()
+    val pending = pending_name(s"$dir/app")
+
+    write_text(pending, "#!/bin/sh\necho kept\n").unwrap()
+    assert(capture("chmod", ["+x", pending]).unwrap().status.ok(), "chmod failed")
+    assert(publish_file(pending, s"$dir/app").is_ok(), "the publish failed")
+    assert((metadata(s"$dir/app").unwrap().mode & 0x49) != 0, "the executable bit was lost")
+    assert(!exists(pending), "the pending name is still there")
+    remove_dir_all(dir).unwrap_or(())
+end rcp_a_rename_keeps_the_executable_bit
+
+@test("a publish that cannot land leaves no pending file behind")
+rcp_a_publish_that_cannot_land_leaves_nothing()
+    val dir = make_temp_dir("sysl-rcp-publish").unwrap()
+    val pending = pending_name(s"$dir/app")
+
+    write_text(pending, "x").unwrap()
+    // A directory with something in it cannot be replaced by a file, so the rename refuses.
+    make_dir_all(s"$dir/app/occupied").unwrap()
+    assert(publish_file(pending, s"$dir/app").is_err(), "the publish landed")
+    assert(!exists(pending), "the pending file was left behind")
+
+    val names = rcp_names(dir)
+
+    assert_eq(names.len(), 1)
+    assert_eq(names.at(0), "app")
+    remove_dir_all(dir).unwrap_or(())
+end rcp_a_publish_that_cannot_land_leaves_nothing
+
+@test("a text that cannot be written leaves nothing either")
+rcp_a_text_that_cannot_be_written_leaves_nothing()
+    val dir = make_temp_dir("sysl-rcp-publish").unwrap()
+
+    assert(write_text_atomic(s"$dir/no/such/directory/slot", "x").is_err(), "the write landed")
+    assert_eq(rcp_names(dir).len(), 0)
+    remove_dir_all(dir).unwrap_or(())
+
+// The writer's side of the race: the target's bytes, since a `string` may not cross into a thread,
+// and the flag the reader stops on.
+struct RcpRace
+    path: *u8
+    len: usize
+    writing: Atomic[u32]
+
+private rcp_repeated(piece: string, n: usize) -> string
+    var b = str_builder()
+
+    for _ in 0..<n
+        b.push(piece)
+
+    b.finish()
+end rcp_repeated
+
+private rcp_writer(r: *RcpRace)
+    val target = str_cast(r.path[0..<r.len])
+    val short = rcp_repeated("s\n", 10)
+    val long = rcp_repeated("l\n", 200000)
+
+    for i in 1..<41
+        write_text_atomic(target, if i % 2 == 0 then short else long).unwrap_or(())
+
+    r.writing.store(0)
+end rcp_writer
+
+@test("a reader racing a writer sees one whole version or the other, never a prefix")
+rcp_a_reader_sees_one_whole_version()
+    val dir = make_temp_dir("sysl-rcp-publish").unwrap()
+    val target = s"$dir/slot.tests"
+    val short = rcp_repeated("s\n", 10)
+    val long = rcp_repeated("l\n", 200000)
+
+    write_text_atomic(target, short).unwrap()
+
+    var race = RcpRace(as_ptr(target.bytes), target.bytes.len, Atomic(1))
+    var writer = spawn(&rcp_writer, &race).unwrap()
+    var seen: Buf[string] = buf()
+
+    while race.writing.load() == 1
+        read_text(target) match
+            Ok(text) -> if text != short && text != long then seen.push(s"${text.bytes.len} bytes")
+            Err(_) -> seen.push("no file")
+
+    assert(writer.join(), "the writer did not join")
+    remove_dir_all(dir).unwrap_or(())
+    assert_eq(seen.len(), 0, if seen.len() > 0 then seen.at(0) else "")
+end rcp_a_reader_sees_one_whole_version
+
+// A kept test build is the two steps the driver takes: the link published onto the slot, then the
+// list written beside it.
+@test("a kept test build puts the binary in its slot and the list beside it")
+rcp_a_kept_test_build_has_both()
+    val cache = rcp_cache()
+    val slot = run_cache_reserve("k").unwrap()
+    val linked = pending_name(slot)
+    var suite: Buf[TTest] = buf()
+
+    suite.push(TTest("m$t", "a test", false, None, "m.sysl", 1, no_hooks(), None))
+    write_text(linked, "binary").unwrap()
+    assert(publish_file(linked, slot).is_ok(), "the publish failed")
+    write_test_list("k", suite)
+    assert_eq(read_text(slot).unwrap(), "binary")
+
+    val back = read_test_list("k").unwrap()
+
+    assert_eq(back.len(), 1)
+    assert_eq(rcp_shown(back.at(0)), rcp_shown(suite.at(0)))
+
+    var names = rcp_names(s"$cache/sysl/run").view()
+
+    sort(names)
+    assert_eq(names.len, 2)
+    assert_eq(names[0], "k")
+    assert_eq(names[1], "k.tests")
+    rcp_done([cache])
+end rcp_a_kept_test_build_has_both
+
+// -- a level refused before the standard module's cache is touched ---------------------------------
+
+// The reference's five: each command with a level clang lacks, the standard module's directory for
+// that level removed first and required to be absent after.
+@test("a level clang lacks is refused, on each command, before the standard module's cache is touched")
+rcp_a_refused_level_touches_no_cache()
+    if std_root().is_err() || cache_directory().is_none() then return
+
+    val t = host_target()
+    val fingerprint = std_fingerprint(std_root().unwrap(), t).unwrap()
+    val asked = [("build", "7"), ("run", "-1"), ("test", "nonsense"), ("emit-llvm", "q"), ("build-lib", "9x")]
+    val program = runner_project("main.sysl", "print(1)\n\n@test(\"one\")\none() =\n    assert(1 == 1)\n")
+    val package = runner_project("package.hocon", "package { name = \"geom\", version = \"0.1.0\" }\n")
+
+    make_dir_all(s"$package/geom").unwrap()
+    write_text(s"$package/geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 2\n").unwrap()
+
+    for one in asked
+        val dir = parent_of(std_artifact_path(t, fingerprint, one.1)).unwrap()
+        val root = if one.0 == "build-lib" then package else program
+
+        remove_dir_all(dir).unwrap_or(())
+
+        var args: Buf[string] = buf()
+
+        args.push("sysl")
+        args.push(one.0)
+        args.push(root)
+        args.push(s"-O${one.1}")
+
+        if one.0 == "build"
+            args.push("-o")
+            args.push(s"$program/out")
+
+        val got = rcp_cli(args.view())
+
+        assert_eq(got.0, Failed, got.1)
+        assert_eq(got.1, s"sysl: error: '-O${one.1}' names no level clang has — it is one of 0, 1, 2, 3, " +
+                         "s, z, fast, g\n")
+        assert(metadata(dir).is_err(), s"'$dir' was made for a level that was refused")
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(package).unwrap_or(())
+end rcp_a_refused_level_touches_no_cache

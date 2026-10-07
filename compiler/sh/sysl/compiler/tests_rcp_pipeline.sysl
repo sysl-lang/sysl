@@ -1,0 +1,446 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, split, Search}
+
+// **What a build asks of LLVM beyond the level, at the seams the reference's `PipelineCliTests`
+// asks about**: what an argument list and a manifest say, what reaches each clang a build drives
+// (the C a project carries, the link, the standard module it links), and the profile-guided round
+// trip end to end. `tests_ltp_lto_pipeline.sysl` holds the rest of the feature.
+//
+// The reference reads the clang lines out of its `--verbose` trace; here the build records them
+// (`c_compile_commands`, `last_link_command`), which is the same text the trace prints. `run` shares
+// this process's streams, so a program whose answer is asserted `exit`s with it.
+
+// The command line `args` taken the way a command takes it, from nothing asked for.
+private rcp_pl_took(args: []string)
+    reset_search_paths()
+
+    var i: usize = 0
+
+    while i < args.len
+        if took_search_flag(args, i) == 2 then i += 1
+
+        i += 1
+end rcp_pl_took
+
+private rcp_pl_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for i in 0..<said.len()
+        text = text + said.at(i) + "\n"
+
+    (code, text)
+end rcp_pl_cli
+
+private rcp_pl_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A project with a program in it, and -- where `carries_c` -- a C file beside it, so a build drives
+// the C compiler as well as the link.
+private rcp_pl_project(says: string, carries_c: bool = false) -> string
+    val root = runner_project("main.sysl", "main()\n    print(1)\n")
+
+    write_text(s"$root/package.hocon", s"package { name = \"prog\", version = \"0.1.0\" }\n$says\n").unwrap()
+
+    if carries_c then write_text(s"$root/shim.c", "int sysl_pipeline_shim(void) { return 7; }\n").unwrap()
+
+    root
+end rcp_pl_project
+
+// `sysl build <root> -o <root>/out <more>`, with the clang lines it drove recorded from nothing.
+private rcp_pl_build(root: string, more: []string) -> (int, string)
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("build")
+    args.push(root)
+    args.push("-o")
+    args.push(s"$root/out")
+
+    for m in more
+        args.push(m)
+
+    forget_last_link()
+    forget_c_compiles()
+    rcp_pl_cli(args.view())
+end rcp_pl_build
+
+private rcp_pl_link(t: string) -> Buf[string] =
+    link_command("clang", "prog.ll", buf(), "prog", target_named(t).unwrap(), "1", buf(), no_probe())
+
+private rcp_pl_index(line: Buf[string], word: string) -> int
+    for i in 0..<line.len()
+        if line.at(i) == word then return int(i)
+
+    -1
+
+// -- link-time optimization: what an argument list says --------------------------------------------
+
+@test("a build that asks for none asks for none, and the pipeline is empty")
+rcp_no_lto_asked_is_none()
+    rcp_pl_took(["build", "prog.sysl"])
+
+    val flag = lto_flag()
+    val flags = pipeline_flags()
+
+    reset_search_paths()
+    assert(flag.is_none(), "an lto mode was taken from nothing")
+    assert(flags.is_empty(), join(flags.view(), " "))
+
+@test("and each mode clang has may be named")
+rcp_each_lto_mode_may_be_named()
+    for mode in LtoModes
+        assert(pipeline_flag_refusal(["build", "prog.sysl", "--lto", mode]).is_none(), mode)
+        rcp_pl_took(["build", "prog.sysl", "--lto", mode])
+
+        val flag = lto_flag()
+        val flags = pipeline_flags()
+
+        reset_search_paths()
+        assert_eq(flag, Some(mode))
+        assert_eq(join(flags.view(), " "), s"-flto=$mode")
+end rcp_each_lto_mode_may_be_named
+
+// Taken by every command that produces code: each answers about the path it was handed, the flag
+// having been read -- the reference's own answer for each, quoted.
+@test("every command that emits code accepts it")
+rcp_every_command_takes_lto()
+    for command in ["run", "build", "build-lib", "test"]
+        val got = rcp_pl_cli(["sysl", command, "/nonexistent/rcp", "--lto", "thin"])
+
+        assert_eq(got.0, Failed, command)
+        assert_eq(got.1, "sysl: error: cannot read /nonexistent/rcp: '/nonexistent/rcp' does not exist\n")
+
+// -- what a manifest says --------------------------------------------------------------------------
+
+@test("the mode it names is the mode the project is linked with")
+rcp_the_manifest_names_the_mode()
+    assert_eq(read_manifest("lto = \"thin\"\n").unwrap().lto, Some("thin"))
+    assert_eq(read_manifest("lto = \"full\"\n").unwrap().lto, Some("full"))
+
+@test("'false' says the same as saying nothing")
+rcp_false_is_nothing()
+    assert_eq(read_manifest("lto = false\n").unwrap().lto, None)
+    assert_eq(read_manifest("package { name = \"thing\", version = \"0.1.0\" }\n").unwrap().lto, None)
+
+// -- what reaches clang ----------------------------------------------------------------------------
+
+@test("the link carries the mode asked for, and carries nothing when none was")
+rcp_the_link_carries_the_mode()
+    for mode in LtoModes
+        rcp_pl_took(["--lto", mode])
+
+        val line = rcp_pl_link("aarch64-macos")
+
+        reset_search_paths()
+        assert(rcp_pl_index(line, s"-flto=$mode") >= 0, join(line.view(), " "))
+
+    rcp_pl_took([])
+
+    val plain = rcp_pl_link("aarch64-macos")
+
+    for i in 0..<plain.len()
+        assert(!plain.at(i).starts_with("-flto"), join(plain.view(), " "))
+end rcp_the_link_carries_the_mode
+
+// A driver flag, so it goes in front of the inputs it applies to, as the level does.
+@test("and states it before the module it applies to")
+rcp_the_mode_comes_before_the_module()
+    rcp_pl_took(["--lto", "thin"])
+
+    val line = rcp_pl_link("x86_64-linux")
+
+    reset_search_paths()
+    assert(rcp_pl_index(line, "-flto=thin") >= 0, join(line.view(), " "))
+    assert(rcp_pl_index(line, "-flto=thin") < rcp_pl_index(line, "prog.ll"), join(line.view(), " "))
+
+// **The half that is the whole point of the feature**: the C a package carries is a different clang
+// invocation, the one a flag threaded through the link alone would silently miss.
+@test("including the C the project carries, which is the seam LTO exists to cross")
+rcp_the_carried_c_is_compiled_under_the_mode()
+    if !rcp_pl_ready() then return
+
+    val root = rcp_pl_project("lto = \"thin\"", true)
+    val got = rcp_pl_build(root, [])
+    val compiles = c_compile_commands()
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    assert(compiles.len() > 0, "no C was compiled")
+
+    var shim = false
+
+    for i in 0..<compiles.len()
+        assert(compiles.at(i).contains(" -flto=thin "), compiles.at(i))
+
+        if compiles.at(i).contains("/shim.c ") then shim = true
+
+    assert(shim, join(compiles.view(), "\n"))
+end rcp_the_carried_c_is_compiled_under_the_mode
+
+// A dependency's key is a property of ITS link, and the link happens once, for the whole program.
+@test("a dependency's key is not applied, and is not an error either")
+rcp_a_dependencys_lto_is_not_applied()
+    if !rcp_pl_ready() then return
+
+    val geom = runner_project("package.hocon", "package { name = \"geom\", version = \"0.1.0\" }\nlto = \"full\"\n")
+
+    make_dir_all(s"$geom/geom").unwrap()
+    write_text(s"$geom/geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 2\n").unwrap()
+
+    val root = runner_project("main.sysl", "main()\n    print(geom.double(21))\n")
+
+    write_text(s"$root/package.hocon", s"package { name = \"app\", version = \"0.1.0\" }\n" +
+               s"dependencies { g { path = \"$geom\" } }\n").unwrap()
+
+    val got = rcp_pl_build(root, [])
+    val link = last_link_command()
+    val compiles = c_compile_commands()
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(geom).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    assert(!link.contains("-flto"), link)
+
+    for i in 0..<compiles.len()
+        assert(!compiles.at(i).contains("-flto"), compiles.at(i))
+end rcp_a_dependencys_lto_is_not_applied
+
+@test("and a program built with it still answers what the program says")
+rcp_an_lto_program_answers()
+    if !rcp_pl_ready() then return
+
+    val cache = make_temp_dir("sysl-rcp-pl-cache").unwrap()
+    val root = runner_project("main.sysl", "main()\n    exit(6 * 7)\n")
+
+    use_run_cache_dir(Some(cache))
+
+    val got = rcp_pl_cli(["sysl", "run", s"$root/main.sysl", "--no-std-lib", "--lto", "thin"])
+
+    use_run_cache_dir(None)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
+    assert_eq(got.0, 42, got.1)
+end rcp_an_lto_program_answers
+
+// The standard module is the largest body of code a program links, so its archive is made at the
+// build's level and under its mode, and the link names which one it took.
+private rcp_pl_linked_std(root: string, more: []string) -> string
+    val got = rcp_pl_build(root, more)
+
+    assert_eq(got.0, 0, got.1)
+
+    for word in split(last_link_command(), " ")
+        if word.ends_with("std.syslib") then return word
+
+    panic(s"the link named no standard module: ${last_link_command()}")
+end rcp_pl_linked_std
+
+@test("the standard module a build links is one made at its level and under its mode")
+rcp_the_std_is_made_at_the_level_and_mode()
+    if !rcp_pl_ready() || cache_directory().is_none() then return
+
+    val root = rcp_pl_project("")
+    val plain = rcp_pl_linked_std(root, [])
+    val o2 = rcp_pl_linked_std(root, ["-O2"])
+    val thin = rcp_pl_linked_std(root, ["-O2", "--lto", "thin"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(plain != o2 && o2 != thin && plain != thin, s"$plain $o2 $thin")
+    assert(plain.contains(s"-O$DefaultOptimization/"), plain)
+    assert(o2.contains("-O2/"), o2)
+    assert(thin.contains("-O2-lto-thin/"), thin)
+end rcp_the_std_is_made_at_the_level_and_mode
+
+@test("and a program linked against that standard module still answers what the program says")
+rcp_a_program_on_the_lto_std_answers()
+    if !rcp_pl_ready() then return
+
+    val cache = make_temp_dir("sysl-rcp-pl-cache").unwrap()
+    val root = runner_project("main.sysl", "main()\n    exit(6 * 7)\n")
+
+    use_run_cache_dir(Some(cache))
+
+    val got = rcp_pl_cli(["sysl", "run", s"$root/main.sysl", "-O2", "--lto", "thin"])
+
+    use_run_cache_dir(None)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
+    assert_eq(got.0, 42, got.1)
+end rcp_a_program_on_the_lto_std_answers
+
+// `run` replays a cached binary without reaching clang, so a lever the key does not carry is a lever
+// that silently does nothing on the second run of an unchanged tree.
+@test("asking for it is a different program to the run cache")
+rcp_lto_is_another_run_cache_entry()
+    if !rcp_pl_ready() then return
+
+    val cache = make_temp_dir("sysl-rcp-pl-cache").unwrap()
+    val root = rcp_pl_project("")
+
+    use_run_cache_dir(Some(cache))
+
+    val plain = rcp_pl_cli(["sysl", "run", root])
+    val after_plain = entries(s"$cache/sysl/run").unwrap().len()
+    val thin = rcp_pl_cli(["sysl", "run", root, "--lto", "thin"])
+    val after_thin = entries(s"$cache/sysl/run").unwrap().len()
+
+    use_run_cache_dir(None)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
+    assert_eq(plain.0, 0, plain.1)
+    assert_eq(thin.0, 0, thin.1)
+    assert_eq(after_plain, 1)
+    assert_eq(after_thin, 2)
+end rcp_lto_is_another_run_cache_entry
+
+// -- profile-guided optimization -------------------------------------------------------------------
+
+@test("a build that asks for neither asks for neither")
+rcp_no_profile_asked_is_none()
+    rcp_pl_took(["build", "prog.sysl"])
+
+    val generate = profile_generate()
+    val use = profile_use()
+    val flags = pipeline_flags()
+
+    reset_search_paths()
+    assert(generate.is_none() && use.is_none(), "a profile was taken from nothing")
+    assert(flags.is_empty(), join(flags.view(), " "))
+end rcp_no_profile_asked_is_none
+
+@test("generating names the directory the counters are written into")
+rcp_generating_names_the_directory()
+    rcp_pl_took(["build", "prog.sysl", "--profile-generate", "/tmp/p"])
+
+    val generate = profile_generate()
+
+    reset_search_paths()
+    assert_eq(generate, Some("/tmp/p"))
+
+@test("and using names the merged profile the optimizer reads")
+rcp_using_names_the_profile()
+    rcp_pl_took(["build", "prog.sysl", "--profile-use", "/tmp/p.profdata"])
+
+    val use = profile_use()
+
+    reset_search_paths()
+    assert_eq(use, Some("/tmp/p.profdata"))
+
+@test("an instrumented build says so on every command line it drives")
+rcp_an_instrumented_build_says_so_everywhere()
+    if !rcp_pl_ready() then return
+
+    val dir = make_temp_dir("sysl-rcp-profraw").unwrap()
+    val root = rcp_pl_project("", true)
+    // The standard module compiled in: a prebuilt one is keyed by this fresh directory, and would be a
+    // new archive in the cache on every run.
+    val got = rcp_pl_build(root, ["--profile-generate", dir, "--no-std-lib"])
+    var lines = c_compile_commands()
+
+    lines.push(last_link_command())
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dir).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    assert(lines.len() >= 2, join(lines.view(), "\n"))
+
+    for i in 0..<lines.len()
+        assert(lines.at(i).contains(s"-fprofile-generate=$dir"), lines.at(i))
+end rcp_an_instrumented_build_says_so_everywhere
+
+// The absence the whole feature depends on: an ordinary build carrying the instrumentation would pay
+// for counters nobody asked for, and nothing about it would look wrong.
+@test("and a build that did not ask for it carries no profile runtime at all")
+rcp_an_ordinary_build_carries_no_profile_runtime()
+    if !rcp_pl_ready() then return
+
+    val root = rcp_pl_project("")
+    val got = rcp_pl_build(root, [])
+    val symbols = capture("nm", [s"$root/out"]).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    assert(symbols.status.ok(), "nm failed")
+    assert(!symbols.text.contains("__llvm_profile"), "an ordinary build links the profile runtime")
+end rcp_an_ordinary_build_carries_no_profile_runtime
+
+// The `llvm-profdata` clang itself would use, asked of the clang a build here runs: a `.profraw`
+// carries a format version only its own LLVM's tool reads, so the one on the PATH may not be it.
+private rcp_pl_profdata() -> Option[string]
+    val cc = find_clang(host_target(), None) match
+        Ok(c) -> c
+        Err(_) -> return None
+
+    val asked = capture(cc, ["-print-prog-name=llvm-profdata"]) match
+        Ok(o) -> o.text.trim()
+        Err(_) -> return None
+
+    if asked == "" then return None
+
+    capture(asked, ["--version"]) match
+        Ok(o) -> if o.status.ok() then Some(asked) else None
+        Err(_) -> None
+end rcp_pl_profdata
+
+// The round trip, the only thing that says the three steps fit together.
+@test("a profile written by a training run is one a later build can be optimized against")
+rcp_a_trained_profile_builds()
+    if !rcp_pl_ready() then return
+
+    val merge = rcp_pl_profdata() match
+        Some(m) -> m
+        None -> return
+
+    val dir = make_temp_dir("sysl-rcp-training").unwrap()
+    val root = rcp_pl_project("")
+    val exe = s"$root/trained"
+
+    // 1. Instrumented, with the standard module compiled in, here and at step 4.
+    forget_c_compiles()
+    assert_eq(rcp_pl_cli(["sysl", "build", root, "-o", exe, "--profile-generate", dir, "--no-std-lib"]).0, 0)
+    assert(capture("nm", [exe]).unwrap().text.contains("__llvm_profile"), "nothing was instrumented")
+
+    // 2. Trained -- one run of the program, which is what writes the counters.
+    assert(capture(exe).unwrap().status.ok(), "the instrumented program failed")
+
+    var raw: Buf[string] = buf()
+
+    for name in entries(dir).unwrap()
+        if name.ends_with(".profraw") then raw.push(s"$dir/$name")
+
+    assert(raw.len() > 0, s"nothing was written into $dir")
+
+    // 3. Merged, which is LLVM's own tool and not sysl's.
+    val profile = s"$dir/merged.profdata"
+    var merging: Buf[string] = buf()
+
+    merging.push("merge")
+    merging.push("-output")
+    merging.push(profile)
+
+    for i in 0..<raw.len()
+        merging.push(raw.at(i))
+
+    assert(capture(merge, merging.view()).unwrap().status.ok(), "llvm-profdata merge failed")
+
+    // 4. Built against it, and the optimizer is told where to read it.
+    val got = rcp_pl_build(root, ["--profile-use", profile, "--no-std-lib"])
+
+    assert_eq(got.0, 0, got.1)
+    assert(last_link_command().contains(s"-fprofile-use=$profile"), last_link_command())
+
+    // And the result is an ordinary program again: the counters are gone, and it still runs.
+    val out = capture(s"$root/out").unwrap()
+
+    assert(out.status.ok(), "the optimized program failed")
+    assert_eq(out.text.trim(), "1")
+    assert(!capture("nm", [s"$root/out"]).unwrap().text.contains("__llvm_profile"), "still instrumented")
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dir).unwrap_or(())
+end rcp_a_trained_profile_builds
