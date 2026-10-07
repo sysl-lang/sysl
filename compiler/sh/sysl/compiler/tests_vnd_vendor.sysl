@@ -1,0 +1,312 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{current_dir, is_file, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.text.{split, Search}
+
+// `sysl vendor` -- a project's own copy of what it depends on, copied out of the machine's cache.
+//
+// **A `vendor/` is the cache moved into the project rather than a second mechanism beside it**, so
+// the reference's claims are two: `cache_root` prefers it when it is there, and the project walk goes
+// past it (`tests_project.sysl` and `tests_deps.sysl` hold those). The rest is the command: what it
+// copies, that the copy is checked against `sysl.sum` before it is put in place, and that a vendored
+// project then resolves with the machine's cache gone.
+//
+// **Every machine cache here is a temporary directory laid out as a fetch leaves one** -- a package's
+// tree with its hash in a sibling `.hash`, and a `.git` inside it as a clone has -- so nothing reaches
+// the network and nothing touches this machine's real cache.
+
+private vnd_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+private vnd_manifest(name: string, version: string, deps: string) -> string =
+    s"package { name = \"$name\", version = \"$version\" }\n" +
+    (if deps.is_empty() then "" else s"dependencies { $deps }\n")
+
+private vnd_dep(label: string, coordinate: string, version: string) -> string =
+    s"$label { git = \"$coordinate\", version = \"$version\" }"
+
+// A project on disk holding `config` and one module of its own, `app`.
+private vnd_project(config: string) -> string = vnd_named(config, "app")
+
+private vnd_named(config: string, name: string) -> string
+    val root = vnd_temp("sysl-vnd-project")
+
+    write_text(s"$root/package.hocon", config).unwrap()
+    make_dir_all(s"$root/$name").unwrap()
+    write_text(s"$root/$name/$name.sysl", s"module $name\n").unwrap()
+    root
+end vnd_named
+
+// A package in a machine cache, as a fetch leaves it. Answers its tree hash.
+private vnd_cached(machine: string, coordinate: string, version: string, deps: string) -> string
+    val leaf = basename(coordinate)
+    val dir = s"$machine/$coordinate/@v$version"
+
+    make_dir_all(s"$dir/$leaf").unwrap()
+    make_dir_all(s"$dir/.git").unwrap()
+    write_text(s"$dir/.git/HEAD", "ref: refs/heads/main\n").unwrap()
+    write_text(s"$dir/package.hocon", vnd_manifest(leaf, version, deps)).unwrap()
+    write_text(s"$dir/$leaf/$leaf.sysl", s"module $leaf\n").unwrap()
+
+    val hash = tree_hash(dir).unwrap()
+
+    write_text(s"$dir.hash", s"$hash\n").unwrap()
+    hash
+end vnd_cached
+
+// The command over `root`, copying out of `machine`: its status, and every line it said.
+private vnd_run(root: string, machine: string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    reset_feature_request()
+
+    val code = vendor_project(root, machine, (line) -> sink.push(line))
+    var said = ""
+
+    for i in 0..<lines.len()
+        said = said + lines.at(i) + "\n"
+
+    (code, said)
+end vnd_run
+
+private vnd_sums(root: string) -> string = read_text(s"$root/sysl.sum").unwrap_or("<none>")
+
+private vnd_drop(a: string, b: string)
+    remove_dir_all(a).unwrap_or(())
+    remove_dir_all(b).unwrap_or(())
+
+// A relative spelling of `target`, climbing from the working directory with `..` and back down -- the
+// same kind of argument `sysl vendor .` types, without the suite changing its working directory.
+private vnd_relative_to(target: string) -> string
+    val cwd = vnd_segments(current_dir().unwrap())
+    val to = vnd_segments(target)
+    var common: usize = 0
+
+    while common < cwd.len() && common < to.len() && cwd.at(common) == to.at(common)
+        common += 1
+
+    var out = ""
+
+    for _ in common..<cwd.len()
+        out = if out.is_empty() then ".." else out + "/.."
+
+    for i in common..<to.len()
+        out = if out.is_empty() then to.at(i) else out + "/" + to.at(i)
+
+    out
+end vnd_relative_to
+
+private vnd_segments(dir: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val parts = split(dir, "/")
+
+    for i in 0..<parts.len
+        if !parts[i].is_empty() then out.push(parts[i])
+
+    out
+end vnd_segments
+
+// -- the reference's claims ---------------------------------------------------------------------------
+
+// A project without one is exactly where it was: the machine's cache, shared between every project on
+// it, which is what keeps N projects from holding N copies of one library.
+@test("and the machine's where it has not")
+vnd_the_machines_cache_where_it_has_not()
+    val root = vnd_temp("sysl-vnd-plain")
+    val got = cache_root(root).unwrap_or("")
+
+    assert(got.index_of(VendorDir).is_none())
+    assert_eq(got, machine_cache_root().unwrap_or("<none>"))
+    remove_dir_all(root).unwrap_or(())
+
+// Found on slate with the reference: `sysl vendor .` reported freshly fetched packages as not hashing
+// to what `sysl.sum` recorded, while the absolute spelling reproduced them -- a `.`-rooted path cannot
+// strip itself off the absolute paths a directory walk returns.
+@test("a project root reached by a relative path resolves to the same absolute root as its absolute spelling")
+vnd_a_relative_root_is_the_absolute_one()
+    val root = vnd_project(vnd_manifest("demo", "0.1.0", ""))
+    val rel = vnd_relative_to(root)
+
+    assert(!rel.starts_with("/"))
+    assert_eq(project_dir_of(rel), project_dir_of(root))
+    assert(project_dir_of(rel).starts_with("/"))
+    remove_dir_all(root).unwrap_or(())
+
+@test("and a fetched package hashes the same whether the project it was fetched for was named relatively or absolutely")
+vnd_a_package_hashes_the_same_either_way()
+    val root = vnd_temp("sysl-vnd-relroot")
+    val rel = vnd_relative_to(root)
+    val tail = s"$VendorDir/github.com/sysl-lang/demo/@v1.0.0.partial"
+    val pkg = s"$root/$tail"
+
+    make_dir_all(s"$pkg/sh/sysl/demo").unwrap()
+    write_text(s"$pkg/sh/sysl/demo/demo.sysl", "module sh.sysl.demo\n\nfour() -> int = 4\n").unwrap()
+    assert_eq(tree_hash(s"${project_dir_of(rel)}/$tail").unwrap(),
+              tree_hash(s"${project_dir_of(root)}/$tail").unwrap())
+    remove_dir_all(root).unwrap_or(())
+
+// -- the command --------------------------------------------------------------------------------------
+
+@test("vendor copies a cached package into vendor/, with its hash beside it and its sysl.sum line written")
+vnd_copies_a_cached_package()
+    val machine = vnd_temp("sysl-vnd-machine")
+    val root = vnd_project(vnd_manifest("app", "0.1.0", vnd_dep("geom", "github.com/e/geom", "1.0.0")))
+    val hash = vnd_cached(machine, "github.com/e/geom", "1.0.0", "")
+    val got = vnd_run(root, machine)
+    val there = s"$root/vendor/github.com/e/geom/@v1.0.0"
+
+    assert_eq(got.1, "vendored 1 package into vendor/\n")
+    assert_eq(got.0, Fine)
+    assert_eq(read_text(s"$there/geom/geom.sysl").unwrap_or(""), "module geom\n")
+    assert_eq(read_text(s"$there.hash").unwrap_or("").trim(), hash)
+    assert_eq(tree_hash(there).unwrap(), hash)
+    assert_eq(vnd_sums(root), s"github.com/e/geom v1.0.0 $hash\n")
+    vnd_drop(root, machine)
+
+// A clone's `.git` is no part of the package's hash, and inside a project it is a nested repository
+// that `git add vendor/` records in place of the files.
+@test("a cached clone's .git is not copied")
+vnd_leaves_git_behind()
+    val machine = vnd_temp("sysl-vnd-machine")
+    val root = vnd_project(vnd_manifest("app", "0.1.0", vnd_dep("geom", "github.com/e/geom", "1.0.0")))
+
+    vnd_cached(machine, "github.com/e/geom", "1.0.0", "")
+    assert_eq(vnd_run(root, machine).0, Fine)
+    assert(is_file(s"$machine/github.com/e/geom/@v1.0.0/.git/HEAD"))
+    assert(!is_directory(s"$root/vendor/github.com/e/geom/@v1.0.0/.git"))
+    vnd_drop(root, machine)
+
+// The whole of what vendoring is for: with the machine's cache gone, the project resolves -- every
+// sum checked -- from what it holds itself.
+@test("a vendored project resolves with the machine's cache gone")
+vnd_resolves_without_the_machines_cache()
+    val machine = vnd_temp("sysl-vnd-machine")
+    val root = vnd_project(vnd_manifest("app", "0.1.0", vnd_dep("geom", "github.com/e/geom", "1.0.0")))
+
+    vnd_cached(machine, "github.com/e/geom", "1.0.0", "")
+    assert_eq(vnd_run(root, machine).0, Fine)
+    remove_dir_all(machine).unwrap()
+
+    val cache = cache_root(root).unwrap()
+    val m = manifest_of_package(root).unwrap()
+    val g = resolve_graph(root, m, sums_at(root).unwrap(), cache).unwrap()
+
+    assert_eq(cache, s"$root/$VendorDir")
+    assert(!g.sums_changed)
+
+    var found = ""
+
+    for i in 0..<g.packages.len()
+        if !is_root_package(g.packages.at(i)) then found = g.packages.at(i).root
+
+    assert_eq(found, s"$root/vendor/github.com/e/geom/@v1.0.0")
+    remove_dir_all(root).unwrap_or(())
+end vnd_resolves_without_the_machines_cache
+
+// `zed` asks for geom 1.1.0 after the project's own 1.0.0 has been read (the walk goes in name order,
+// so `geom` is read first): 1.0.0 is unselected and is still read by every resolution of these
+// manifests, so a vendored build needs it there too. The count is of what was selected.
+@test("a version read on the way to a higher one is vendored too")
+vnd_a_version_read_on_the_way()
+    val machine = vnd_temp("sysl-vnd-machine")
+    val root = vnd_project(vnd_manifest("app", "0.1.0", vnd_dep("geom", "github.com/e/geom", "1.0.0") +
+                                        "\n" + vnd_dep("zed", "github.com/e/zed", "1.0.0")))
+
+    vnd_cached(machine, "github.com/e/geom", "1.0.0", "")
+    vnd_cached(machine, "github.com/e/geom", "1.1.0", "")
+    vnd_cached(machine, "github.com/e/zed", "1.0.0", vnd_dep("geom", "github.com/e/geom", "1.1.0"))
+    assert_eq(vnd_run(root, machine).1, "vendored 2 packages into vendor/\n")
+    assert(is_directory(s"$root/vendor/github.com/e/geom/@v1.0.0"))
+    assert(is_directory(s"$root/vendor/github.com/e/geom/@v1.1.0"))
+    assert(is_directory(s"$root/vendor/github.com/e/zed/@v1.0.0"))
+    vnd_drop(root, machine)
+
+@test("the project's dev dependencies are vendored, so its own tests fetch nothing")
+vnd_dev_dependencies_too()
+    val machine = vnd_temp("sysl-vnd-machine")
+    val root = vnd_project(vnd_manifest("app", "0.1.0", "") +
+                           s"dev_dependencies { ${vnd_dep("probe", "github.com/e/probe", "0.2.0")} }\n")
+
+    vnd_cached(machine, "github.com/e/probe", "0.2.0", "")
+    assert_eq(vnd_run(root, machine).1, "vendored 1 package into vendor/\n")
+    assert(is_directory(s"$root/vendor/github.com/e/probe/@v0.2.0"))
+    vnd_drop(root, machine)
+
+// Running it twice is running it once: what is already vendored as recorded is left where it is.
+@test("vendoring again copies nothing and says the same")
+vnd_again_is_the_same()
+    val machine = vnd_temp("sysl-vnd-machine")
+    val root = vnd_project(vnd_manifest("app", "0.1.0", vnd_dep("geom", "github.com/e/geom", "1.0.0")))
+
+    vnd_cached(machine, "github.com/e/geom", "1.0.0", "")
+
+    val first = vnd_run(root, machine)
+    val sums = vnd_sums(root)
+    val second = vnd_run(root, machine)
+
+    assert_eq(second.1, first.1)
+    assert_eq(second.0, Fine)
+    assert_eq(vendor_into(root, machine).unwrap().copied, 0)
+    assert_eq(vnd_sums(root), sums)
+    vnd_drop(root, machine)
+
+// The resolver trusts the hash recorded beside a cached package, which is right for a build and is
+// exactly what a copy must not: a cache edited since its fetch would be frozen into the project.
+@test("a cached package that no longer hashes to its sysl.sum line is refused, and nothing is put in place")
+vnd_an_edited_cache_is_refused()
+    val machine = vnd_temp("sysl-vnd-machine")
+    val root = vnd_project(vnd_manifest("app", "0.1.0", vnd_dep("geom", "github.com/e/geom", "1.0.0")))
+    val hash = vnd_cached(machine, "github.com/e/geom", "1.0.0", "")
+    val from = s"$machine/github.com/e/geom/@v1.0.0"
+
+    write_text(s"$root/sysl.sum", s"github.com/e/geom v1.0.0 $hash\n").unwrap()
+    write_text(s"$from/geom/geom.sysl", "module geom\n\nedited() -> int = 1\n").unwrap()
+
+    val edited = tree_hash(from).unwrap()
+
+    assert_eq(vnd_run(root, machine), (Failed, refused(
+        s"'$from' does not hash to what sysl.sum records for github.com/e/geom v1.0.0\n" +
+        s"  recorded: $hash\n  cached:   $edited\n" +
+        "The machine's copy has changed since it was fetched. Remove that directory, and the next " +
+        "'sysl vendor' fetches it again.") + "\n"))
+    assert(!is_directory(s"$root/vendor/github.com/e/geom/@v1.0.0"))
+    assert(!is_file(s"$root/vendor/github.com/e/geom/@v1.0.0.hash"))
+    vnd_drop(root, machine)
+end vnd_an_edited_cache_is_refused
+
+// Quoted from the reference's output on the same project.
+@test("a path dependency is not vendored, and the command says so")
+vnd_a_path_dependency_is_named()
+    val machine = vnd_temp("sysl-vnd-machine")
+    val lib = vnd_named(vnd_manifest("lib", "0.1.0", ""), "lib")
+    val root = vnd_project(vnd_manifest("app", "0.1.0", s"lib { path = \"$lib\" }"))
+
+    assert_eq(vnd_run(root, machine), (Fine,
+        "vendored 0 packages into vendor/\n\n1 path dependency is not vendored — a path is a " +
+        "directory you are editing, and freezing a copy of it is the one thing it is there not to do\n"))
+    assert(is_directory(s"$root/vendor"))
+    vnd_drop(root, machine)
+    remove_dir_all(lib).unwrap_or(())
+
+@test("a directory with no manifest is refused")
+vnd_no_manifest_is_refused()
+    val root = vnd_temp("sysl-vnd-bare")
+
+    assert_eq(vnd_run(root, root).0, Failed)
+    assert_eq(vnd_run(root, root).1, refused(s"'$root' has no package.hocon — 'sysl vendor' copies in " +
+        "what a project's manifest depends on, and there is no manifest here") + "\n")
+    assert(!is_directory(s"$root/vendor"))
+    remove_dir_all(root).unwrap_or(())
+
+@test("vendor takes exactly one path")
+vnd_takes_one_path()
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    assert_eq(run_cli(["sysl", "vendor"], (line) -> sink.push(line)), Misused)
+    assert_eq(lines.at(0), "usage: sysl vendor [--features <list>] [--no-default-features] " +
+        "[--all-features] <path>")
+    assert_eq(run_cli(["sysl", "vendor", "a", "b"], (line) -> sink.push(line)), Misused)
+    assert_eq(lines.len(), 2)

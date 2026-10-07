@@ -27,7 +27,7 @@ the path is standing on.
 | `sysl tangle <path>` | print the program a literate source holds — *not yet in this compiler* |
 | `sysl deps <path>` | print the dependency graph the project resolves to |
 | `sysl add <coordinate>` | add a dependency to the project's manifest |
-| `sysl vendor <path>` | put what the project depends on into `vendor/` — *not yet in this compiler* |
+| `sysl vendor <path>` | put what the project depends on into `vendor/` |
 | `sysl tidy [<path>]` | drop the `sysl.sum` lines for versions the project no longer resolves |
 | `sysl doc <path>` | generate an API reference from declarations and their doc comments |
 | `sysl targets` | list the machines sysl can build for — *not yet in this compiler* |
@@ -37,7 +37,7 @@ A subcommand is required; sysl with none exits 2 and prints its usage.
 
 A word that is not one of these is refused with the usage, and exits 2.
 
-**Four of these are not in this compiler yet**: `weave`, `tangle`, `vendor` and `targets`. Each is
+**Three of these are not in this compiler yet**: `weave`, `tangle` and `targets`. Each is
 described below as it will work, and until it is added each is refused in the same words, with the
 usage under them and exit status 2:
 
@@ -491,25 +491,34 @@ something unreadable leaves the file exactly as it was.
 
 ### `vendor`
 
-*Not yet in this compiler — it answers "`vendor` is not a command this compiler can carry out yet".
-What follows is the command as it will be.*
-
 Every package the project depends on, put in a `vendor/` directory beside the manifest.
 
-```
+```text
 sysl vendor .
 ```
 
-```
-fetching github.com/sysl-lang/json v0.1.2
-fetching github.com/sysl-lang/parsing v0.2.0
-vendored 2 packages into vendor/
+```text
+fetching github.com/sysl-lang/parsing v0.12.0
+vendored 1 package into vendor/
 ```
 
 **It is the machine's package cache moved into the project, rather than a second mechanism beside
 it** — the same layout, the same resolution, the same `sysl.sum`. A project that has a `vendor/`
 builds with the network off, and somebody who clones it needs to know none of this: the directory
 being there is the whole of what turns it on.
+
+The graph is resolved against the machine's cache first, so anything the machine has not got is
+fetched (the `fetching` line, on standard error) and anything `sysl.sum` has no line for gets one,
+exactly as a build would. Each package is then **copied** out of the cache, and the copy's hash is
+checked against its `sysl.sum` line before it is put in place: a cached package that somebody edited
+after it was fetched is refused rather than frozen into your project. A repository's `.git` is left
+behind. Running it again copies only what is not there yet.
+
+What goes in is the graph `sysl test` resolves — every feature the project declares, unless the
+[feature flags](#the-feature-flags) say otherwise, and its `dev_dependencies` as well as its
+`dependencies` — so a vendored project's own tests fetch nothing either. Inside a
+[workspace](/reference/packages/#workspaces) there is one `vendor/`, at the workspace root, holding
+every member's packages.
 
 `vendor/` is not part of the project's own source, exactly as
 [`examples/`](/reference/packages/#a-package-may-carry-examples) is not, so nothing in it is compiled
@@ -935,8 +944,7 @@ training looked like, expect less.
 
 ### The feature flags
 
-`run`, `build`, `build-c`, `test` and `deps` take three more (and `vendor` will, once it is in this
-compiler), which choose the root
+`run`, `build`, `build-c`, `test`, `deps` and `vendor` take three more, which choose the root
 project's [features](/reference/packages/#features) — and so which optional dependencies are fetched
 at all:
 
