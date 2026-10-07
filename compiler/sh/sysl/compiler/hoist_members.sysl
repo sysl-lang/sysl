@@ -169,11 +169,16 @@ private drain_deferred_bounds(a: &Analysis)
 
     a.tables.members.deferred = buf()
 
+    // An entry is held after the one it was met inside (`DeferredBound.after`), so its answer is in
+    // by the time this one is asked.
+    var refused: Buf[bool] = buf()
+
     for i in 0..<held.len()
         val d = held.at(i)
+        val quiet = d.after.is_some() && d.after.unwrap() < refused.len() && refused.at(d.after.unwrap())
 
-        check_param_bounds(a, d.scope, d.span, d.what, d.tparams, d.bounds, d.targs, buf(), d.noun,
-                           d.at)
+        refused.push(!check_param_bounds(a, d.scope, d.span, d.what, d.tparams, d.bounds, d.targs,
+                                         buf(), d.noun, d.at, quiet))
 end drain_deferred_bounds
 
 // Whether the type arguments a generic declaration was applied to implement what it asked of its
@@ -187,9 +192,12 @@ end drain_deferred_bounds
 // member's owner, whose arguments the receiver settled. They are resolved against and never iterated,
 // which is the distinction that matters: the owner's bounds were checked where its type was made, and
 // checking them again here would report one unmet bound twice.
+//
+// `quiet` asks the question and says nothing: what the caller wants is whether the arguments meet
+// the bounds, the refusal having been made -- or being made -- somewhere else.
 check_param_bounds(a: &Analysis, scope: Scope, span: Span, what: string, tparams: Buf[string],
                    bounds: Buf[NamedBounds], targs: Buf[Type], seed: Buf[Binding],
-                   noun: string, at: Scope) -> bool
+                   noun: string, at: Scope, quiet: bool = false) -> bool
     if bounds.is_empty() then return true
 
     var subst: Buf[Binding] = buf()
@@ -216,7 +224,8 @@ check_param_bounds(a: &Analysis, scope: Scope, span: Span, what: string, tparams
                                        bound_terms(subst, nb.name, arg.unwrap()))
 
                 if !satisfies(a, tr, arg.unwrap())
-                    report_unmet(a, at, span, what, nb.name, tr, arg.unwrap(), noun)
+                    if !quiet then report_unmet(a, at, span, what, nb.name, tr, arg.unwrap(), noun)
+
                     met = false
 
     met
@@ -254,7 +263,7 @@ deferred_bounds(a: &Analysis, scope: Scope, span: Span, what: string, tparams: B
     if a.tables.members.hoisted then
         check_param_bounds(a, scope, span, what, tparams, bounds, targs, buf(), noun, scope)
     else a.tables.members.deferred.push(DeferredBound(what, tparams, bounds, targs, span, scope,
-                                                      scope, noun))
+                                                      scope, noun, None))
 end deferred_bounds
 
 // A type's own members: everything a struct or an enum declared in its body.

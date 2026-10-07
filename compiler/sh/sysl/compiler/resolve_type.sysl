@@ -1592,23 +1592,54 @@ end filled_targs
 // **A type made real at no written place is not asked** -- `reinstantiate` substituting through a
 // type already resolved, whose application was held to these bounds where it was written. Asked again
 // there, the refusal lands at the top of the file and says one mistake twice.
+//
+// **Nor is an application inside the fields of an instantiation whose own arguments failed**
+// (`Analysis.quiet_bounds`): `struct T2[D] { cb: *L[D] }` over `struct L[D: Dr] { next: *L[D] }` is
+// refused at T2's field, and laying out `L` at T2's unbounded `D` meets `*L[D]` again at L's own
+// field -- where `D` IS bounded, so a refusal there blames a declaration that is right. Such an
+// application is still asked, quietly, since whether IT failed decides the same for its own fields.
+//
+// Answers whether the arguments were refused now, and where the check was held instead, its place
+// in the held list -- the two things the fields of this instantiation are laid out under.
 private applied_bounds(a: &Analysis, scope: Scope, span: Span, key: string, home: Scope,
-                       tparams: Buf[string], bounds: Buf[NamedBounds], targs: Buf[Type])
-    if bounds.is_empty() || tparams.len() != targs.len() then return
-    if span.start == 0 && span.end == 0 then return
+                       tparams: Buf[string], bounds: Buf[NamedBounds],
+                       targs: Buf[Type]) -> (bool, Option[usize])
+    if bounds.is_empty() || tparams.len() != targs.len() then return (false, None)
+    if span.start == 0 && span.end == 0 then return (false, None)
 
     for i in 0..<targs.len()
-        if targs.at(i) == Unknown then return
+        if targs.at(i) == Unknown then return (false, None)
 
         targs.at(i) match
             Abstract(_, _) -> ()
-            other -> if mentions_abstract(other) then return
+            other -> if mentions_abstract(other) then return (false, None)
 
-    if a.tables.members.hoisted then
-        check_param_bounds(a, home, span, key, tparams, bounds, targs, buf(), "type parameter", scope)
-    else a.tables.members.deferred.push(DeferredBound(key, tparams, bounds, targs, span, home, scope,
-                                                      "type parameter"))
+    if a.tables.members.hoisted
+        val met = check_param_bounds(a, home, span, key, tparams, bounds, targs, buf(),
+                                     "type parameter", scope, a.quiet_bounds)
+
+        return (!met, None)
+    end if
+
+    val at = a.tables.members.deferred.len()
+
+    a.tables.members.deferred.push(DeferredBound(key, tparams, bounds, targs, span, home, scope,
+                                                 "type parameter", a.bound_after))
+    (false, Some(at))
 end applied_bounds
+
+// Lays out an instantiation's fields under what its own check answered (`applied_bounds`).
+private enter_fields(a: &Analysis, checked: (bool, Option[usize])) -> (bool, Option[usize])
+    val outer = (a.quiet_bounds, a.bound_after)
+
+    a.quiet_bounds = checked.0
+    a.bound_after = checked.1
+    outer
+end enter_fields
+
+private leave_fields(a: &Analysis, outer: (bool, Option[usize]))
+    a.quiet_bounds = outer.0
+    a.bound_after = outer.1
 
 // A struct at these arguments.
 //
@@ -1627,7 +1658,7 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     // IS `Buf[u64]`, one instantiation with one layout and one set of bodies.
     val targs = nameless_all(fill.unwrap())
 
-    applied_bounds(a, scope, span, key, home, d.tparams, d.bounds, targs)
+    val checked = applied_bounds(a, scope, span, key, home, d.tparams, d.bounds, targs)
 
     val inst = instance_key(key, targs)
     val already = a.tables.struct_insts.get(inst)
@@ -1656,11 +1687,16 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     a.resolving.push((inst, a.indirection, a.type_arg_depth))
 
     val subst = bindings_for(d.tparams, targs)
+    // An application inside these fields is asked quietly when the arguments were refused -- the
+    // refusal is the arguments', made where they were written (see `applied_bounds`).
+    val outer = enter_fields(a, checked)
 
     for i in 0..<d.fields.len()
         val f = d.fields.at(i)
 
         made.fields.push((f.name, resolve_qualified(a, home, f.typ, subst)))
+
+    leave_fields(a, outer)
 
     check_bitfields(a, scope, span, made)
 
@@ -1683,7 +1719,7 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
     // The same, for the same reason.
     val targs = nameless_all(fill.unwrap())
 
-    applied_bounds(a, scope, span, key, home, d.tparams, d.bounds, targs)
+    val checked = applied_bounds(a, scope, span, key, home, d.tparams, d.bounds, targs)
 
     val inst = instance_key(key, targs)
     val already = a.tables.enum_insts.get(inst)
@@ -1748,8 +1784,13 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
         val v = d.variants.at(i)
         var fields: Buf[(string, Type)] = buf()
 
+        // Quiet where the arguments were refused, as a struct's fields are.
+        val outer = enter_fields(a, checked)
+
         for j in 0..<v.fields.len()
             fields.push((v.fields.at(j).name, resolve_type(a, home, v.fields.at(j).typ, subst)))
+
+        leave_fields(a, outer)
 
         var tag = next_tag
 
