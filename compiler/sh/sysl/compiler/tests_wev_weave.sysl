@@ -1,0 +1,385 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.{Source, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, read_text, write_text}
+import sysl.text.{Search, from_utf8_unchecked, str_builder}
+
+// `sysl weave`: a literate source rendered as the document it already is (`weave.sysl`).
+//
+// **The load-bearing assertion is a round trip, not a golden file**: the code in the rendered
+// document is exactly the program the compiler reads, in order. A golden document would also break
+// on every edit to the prose it quotes. It is asked of the five-file `sysl.regex` -- the library's
+// own literate module -- as well as of the small cases.
+//
+// **`wev_coded` reads the code back out by its own rule rather than the renderer's**, because a
+// helper sharing the renderer's idea of where a block begins would agree with it by construction.
+
+private wev_rendered(text: string) -> string =
+    weave_render(source_of("weave.lsysl", text)).unwrap()
+
+// The program a literate source holds, blank lines dropped -- what the compiler is handed.
+wev_program(src: Source) -> Buf[string]
+    val text = from_utf8_unchecked(tangle(src).unwrap().bytes)
+
+    wev_nonblank(wev_split(text))
+end wev_program
+
+// The code inside a document's sysl blocks, blank lines dropped, the colouring's markup taken back off.
+wev_coded(document: string) -> Buf[string]
+    val open = s"<pre><code class=\"language-${WeaveLanguage}\">"
+    var out: Buf[string] = buf()
+    var from: usize = 0
+
+    loop
+        val at = document.index_of_from(open, from) match
+            Some(a) -> a + open.bytes.len
+            None -> break
+
+        val close = document.index_of_from("</code></pre>", at).unwrap()
+
+        for line in wev_split(document[at..<close]).view()
+            val bare = wev_strip(line)
+
+            if !bare.trim().is_empty() then out.push(bare)
+
+        from = close
+
+    out
+end wev_coded
+
+// A line of rendered code read back as the program wrote it: tags removed, then the entities undone
+// -- `&amp;` last, so a program that itself contains `&lt;` is not turned into one containing `<`.
+private wev_strip(line: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for c in line.bytes
+        if c == u8('<')
+            inside = true
+        elif c == u8('>') && inside
+            inside = false
+        elif !inside
+            b.bytes.push(c)
+
+    var t = b.finish()
+
+    t = wev_replace(t, "&quot;", "\"")
+    t = wev_replace(t, "&#39;", "'")
+    t = wev_replace(t, "&lt;", "<")
+    t = wev_replace(t, "&gt;", ">")
+    wev_replace(t, "&amp;", "&")
+end wev_strip
+
+wev_replace(s: string, from: string, to: string) -> string
+    var out = str_builder()
+    var at: usize = 0
+
+    loop
+        s.index_of_from(from, at) match
+            Some(k) ->
+                out.push(s[at..<k])
+                out.push(to)
+                at = k + from.bytes.len
+            None ->
+                out.push(s[at..<s.bytes.len])
+                break
+
+    out.finish()
+end wev_replace
+
+wev_split(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var from: usize = 0
+
+    for k in 0..<text.bytes.len
+        if text.bytes[k] == u8('\n')
+            out.push(text[from..<k])
+            from = k + 1
+
+    if from < text.bytes.len then out.push(text[from..<text.bytes.len])
+
+    out
+end wev_split
+
+private wev_nonblank(lines: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for k in 0..<lines.len()
+        if !lines.at(k).trim().is_empty() then out.push(lines.at(k))
+
+    out
+end wev_nonblank
+
+private wev_count(text: string, part: string) -> usize
+    var n: usize = 0
+    var from: usize = 0
+
+    loop
+        text.index_of_from(part, from) match
+            Some(k) ->
+                n += 1
+                from = k + part.bytes.len
+            None -> break
+
+    n
+end wev_count
+
+private wev_same(a: Buf[string], b: []const string)
+    assert_eq(a.len(), b.len)
+
+    for k in 0..<a.len()
+        assert_eq(a.at(k), b[k])
+end wev_same
+
+// What the driver said and answered.
+wev_said(args: []string) -> (Buf[string], int)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line: string) -> sink.push(line))
+
+    (lines, code)
+
+// The library's own literate module, which is on disk where the library is.
+wev_regex_dir() -> Option[string] = std_root() match
+    Ok(root) -> Some(s"$root/sysl/regex")
+    Err(_) -> None
+
+private wev_regex_sources(dir: string) -> Buf[Source]
+    var out: Buf[Source] = buf()
+
+    for f in collect(dir, None).unwrap().view()
+        if is_literate(f.src.name) then out.push(f.src)
+
+    out
+end wev_regex_sources
+
+// The whole of what the command does, on the smallest file that shows it. The four columns are
+// gone -- they were Markdown's way of saying "code" -- and the block carries the language they could
+// not.
+@test("the program is rendered as code and the prose as prose")
+wev_program_and_prose()
+    val out = wev_rendered("# The greeting\n\nA program of one statement.\n\n    print(\"hi\")\n")
+
+    assert(out.contains("<h1 id=\"the-greeting\">The greeting</h1>"))
+    assert(out.contains("<p>A program of one statement.</p>"))
+    assert(out.contains(s"<pre><code class=\"language-${WeaveLanguage}\">"))
+    wev_same(wev_coded(out), ["print(\"hi\")"])
+
+// Consecutive indented lines are one block whether or not there is air between them, so a function
+// with a paragraph break in it is one function -- and renders as one block.
+@test("a blank line between two program lines stays inside one block")
+wev_blank_line_stays_inside()
+    val out = wev_rendered("Text\n\n    a()\n\n    b()\n")
+
+    assert_eq(wev_count(out, s"class=\"language-${WeaveLanguage}\""), 1)
+    wev_same(wev_coded(out), ["a()", "b()"])
+
+// A table, an emphasis and a link are the renderer's business, and nothing touches them on the way.
+@test("the source reaches the renderer verbatim, so its Markdown is its own")
+wev_markdown_is_its_own()
+    val out = wev_rendered("A *word* and a [link](https://sysl.sh).\n\n| a | b |\n|---|---|\n| 1 | 2 |\n")
+
+    assert(out.contains("<em>word</em>"))
+    assert(out.contains("<a href=\"https://sysl.sh\">link</a>"))
+    assert(out.contains("<table>"))
+
+// The delimiters are what KaTeX's auto-render reads -- the contract between the document and the
+// script it links, asserted because a change to either side leaves the equations set as TeX source.
+@test("mathematics reaches the reader as mathematics")
+wev_mathematics()
+    val out = wev_rendered("The area is $\\pi r^2$, and:\n\n$$\nE = mc^2\n$$\n")
+
+    assert(out.contains("<span class=\"math inline\">\\(\\pi r^2\\)</span>"))
+    assert(out.contains("<div class=\"math display\">\\[E = mc^2\\]</div>"))
+    assert(out.contains("katex.min.js"))
+    assert(out.contains("renderMathInElement"))
+
+// The spans are what the document's own stylesheet colours, so a reader needs no script for code.
+@test("the code is coloured by the grammar the site uses")
+wev_code_is_coloured()
+    val out = wev_rendered("Text\n\n    // a note\n    val x = \"hi\"\n")
+
+    assert(out.contains("<span class=\"hl-keyword\">val</span>"))
+    assert(out.contains("<span class=\"hl-string\">"))
+    assert(out.contains("<span class=\"hl-comment\">// a note</span>"))
+
+// The reference compiles a TextMate grammar in and degrades to uncoloured code where it would not
+// parse. The colouring here reads characters and has nothing to fail on: what this pins is the same
+// promise -- the colouring never costs the document -- over fragments a block can end in.
+@test("a grammar that would not parse would cost the colouring and not the document")
+wev_colouring_never_costs_the_document()
+    val out = wev_rendered("Text\n\n    val s = \"never closed\n    /* nor this\n\nMore.\n\n    'x\n")
+
+    assert(out.starts_with("<!doctype html>"))
+    wev_same(wev_coded(out), ["val s = \"never closed", "/* nor this", "'x"])
+
+// A leaf artifact: something to open, move or mail, not a directory that has to stay together.
+@test("the document carries its own styling and stands on its own")
+wev_stands_on_its_own()
+    val out = wev_rendered("# Title\n\n    print(\"hi\")\n")
+
+    assert(out.starts_with("<!doctype html>"))
+    assert(out.contains("<meta charset=\"utf-8\">"))
+    assert(out.contains("<style>"))
+    assert(!out.contains("<link rel=\"stylesheet\" href=\"style.css\">"))
+
+// A colour is named once and the dark palette re-answers it, so the two cannot drift apart.
+@test("both palettes answer the same names")
+wev_both_palettes()
+    val out = wev_rendered("Text\n\n    print(\"hi\")\n")
+
+    assert(out.contains("prefers-color-scheme: dark"))
+
+    for name in ["--bg", "--fg", "--code-bg", "--hl-keyword", "--hl-string", "--hl-comment",
+                 "--hl-number", "--hl-type", "--hl-function", "--hl-variable", "--hl-punctuation"]
+        assert_eq(wev_count(out, s"$name:"), 2)
+
+// The categories are the colouring's and the rules are the stylesheet's, so a category added to one
+// would otherwise render as unstyled text with nothing to say so.
+@test("every class the highlighter can emit is one the stylesheet colours")
+wev_every_class_is_styled()
+    val out = wev_rendered("Text\n\n    print(\"hi\")\n")
+    val coloured = hl_sysl("// c\nfn(x) val s = \"t\" 42 Type int + y\n")
+
+    for category in ["keyword", "string", "comment", "number", "type", "function", "variable", "punctuation"]
+        assert(out.contains(s".hl-$category"))
+
+    // And every class the colouring wrote is one of those.
+    var from: usize = 0
+
+    loop
+        val at = coloured.index_of_from("class=\"hl-", from) match
+            Some(a) -> a + 10
+            None -> break
+
+        val close = coloured.index_of_from("\"", at).unwrap()
+
+        assert(out.contains(s".hl-${coloured[at..<close]} "))
+        from = close
+
+// `sysl.regex` is five literate files, so this is also the multi-file case: each holds its own
+// program.
+@test("for the library module written this way")
+wev_round_trip_over_the_library()
+    val dir = wev_regex_dir() match
+        Some(d) -> d
+        None -> return
+
+    val sources = wev_regex_sources(dir)
+
+    assert(sources.len() > 1)
+
+    for k in 0..<sources.len()
+        val src = sources.at(k)
+
+        wev_same(wev_coded(weave_render(src).unwrap()), wev_program(src).view())
+
+// Refused rather than rendered as a document with nothing in it: a `.sysl` file is all code.
+@test("an ordinary program has no prose to render")
+wev_ordinary_program_refused()
+    weave_render(source_of("plain.sysl", "print(\"hi\")\n")) match
+        Ok(_) -> assert(false)
+        Err(why) -> assert(why.contains("ordinary sysl program"))
+
+// The reading is the compiler's: a document woven out of a file the compiler refuses would document
+// a program that does not exist.
+@test("a file the compiler refuses is not woven")
+wev_refused_file_not_woven()
+    assert(weave_render(source_of("weave.lsysl", "Text\n\n\tprint(\"hi\")\n")).is_err())
+
+// Its directories are dropped, so a nested tree lands flat under the output directory.
+@test("a document is named for the source it came from")
+wev_document_name()
+    assert_eq(weave_document_name(s"vm${LiterateExtension}"), "vm.html")
+    assert_eq(weave_document_name(s"library/sysl/regex/vm${LiterateExtension}"), "vm.html")
+
+@test("to standard output when there is nowhere else")
+wev_driver_to_stdout()
+    val dir = wev_regex_dir() match
+        Some(d) -> d
+        None -> return
+
+    val path = s"$dir/vm${LiterateExtension}"
+    val (lines, code) = wev_said(["sysl", "weave", path])
+
+    assert_eq(code, Fine)
+    assert_eq(lines.len(), 1)
+    assert(lines.at(0).starts_with("<!doctype html>"))
+    wev_same(wev_coded(lines.at(0)), wev_program(source_of(path, read_text(path).unwrap())).view())
+
+@test("to a file when it is asked to")
+wev_driver_to_a_file()
+    val dir = wev_regex_dir() match
+        Some(d) -> d
+        None -> return
+
+    val out = s"${absolute_path(make_temp_dir("sysl-weave-").unwrap())}/vm.html"
+    val (lines, code) = wev_said(["sysl", "weave", s"$dir/vm${LiterateExtension}", "-o", out])
+
+    assert_eq(code, Fine)
+    assert_eq(lines.at(0), s"wrote $out")
+    assert(read_text(out).unwrap().contains(s"class=\"language-${WeaveLanguage}\""))
+
+// A woven document is a leaf artifact, so the unit is the file that was written -- a tree rendered
+// end to end would put five modules under one title.
+@test("one document per source when the path holds several")
+wev_driver_one_document_per_source()
+    val dir = wev_regex_dir() match
+        Some(d) -> d
+        None -> return
+
+    val out = s"${absolute_path(make_temp_dir("sysl-weave-tree-").unwrap())}/regex"
+    val sources = wev_regex_sources(dir)
+    val (_, code) = wev_said(["sysl", "weave", dir, "-o", out])
+
+    assert_eq(code, Fine)
+    assert(sources.len() > 1)
+
+    for k in 0..<sources.len()
+        val document = s"$out/${weave_document_name(sources.at(k).name)}"
+
+        assert(is_file(document))
+        assert(read_text(document).unwrap().starts_with("<!doctype html>"))
+
+// They cannot be told apart on a stream, and concatenating them would make one file with several
+// `<html>` elements in it.
+@test("and refuses to put several documents on one stream")
+wev_driver_refuses_several_on_one_stream()
+    val dir = wev_regex_dir() match
+        Some(d) -> d
+        None -> return
+
+    val (lines, code) = wev_said(["sysl", "weave", dir])
+
+    assert_eq(code, Failed)
+    assert_eq(lines.at(0), s"sysl: error: $dir holds 5 literate sources — 'weave' writes one document each, so give '-o' a directory to write them into")
+
+@test("and refuses a tree with no literate source in it")
+wev_driver_refuses_a_plain_tree()
+    val dir = absolute_path(make_temp_dir("sysl-weave-plain-").unwrap())
+
+    write_text(s"$dir/main.sysl", "main() = print(1)\n").unwrap()
+
+    val (lines, code) = wev_said(["sysl", "weave", dir])
+
+    assert_eq(code, Failed)
+    assert_eq(lines.at(0), s"sysl: error: $dir holds no '.lsysl' files — 'weave' reads the prose a literate source is written around, and an ordinary sysl program has none")
+
+// From the reference's IoRefusalTests: an output path under an existing FILE is refused, naming the
+// file -- a status of 1 and the driver's own lead, never a trace.
+@test("for weave and tangle")
+wev_output_under_a_file_is_refused()
+    val dir = absolute_path(make_temp_dir("sysl-io-").unwrap())
+
+    make_dir_all(s"$dir/p4").unwrap()
+    write_text(s"$dir/p4/main.sysl", "@export(\"f\")\nf() -> int = 1\n").unwrap()
+    make_dir_all(s"$dir/lit").unwrap()
+    write_text(s"$dir/lit/main.lsysl", "# Title\n\n```sysl\nprint(1)\n```\n").unwrap()
+
+    for verb in ["weave", "tangle"]
+        val (lines, code) = wev_said(["sysl", verb, s"$dir/lit", "-o", s"$dir/p4/main.sysl/x"])
+
+        assert_eq(code, Failed)
+        assert_eq(lines.at(0), s"sysl: error: cannot write $dir/p4/main.sysl/x: cannot make the directory '$dir/p4/main.sysl': a file is already there, and a directory is needed")

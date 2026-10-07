@@ -1,0 +1,1081 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Ascii, Search, StrBuilder, str_builder}
+import sysl.unicode
+
+// The prose of a woven document: Markdown rendered as HTML.
+//
+// **The dialect is the site's** -- CommonMark's blocks and inlines with the extensions juicer turns
+// on for `sysl.sh`: headings carry ids (`md_slug`), pipe tables, strikethrough, bare links, and
+// mathematics as `$…$` and `$$…$$`, written out in the delimiters KaTeX's auto-render reads. So prose written for a page of the site and prose
+// written around a program read the same way.
+//
+// **What it leaves out, said rather than approximated**: footnotes, definition lists, callouts,
+// attribute blocks, emoji shortcodes, task-list boxes and raw HTML (which is
+// escaped and so shown as written). Each renders as the text it was typed as, which is readable,
+// rather than as something it was not.
+//
+// **Emphasis is read by a simpler rule than CommonMark's delimiter stack**: a run opens where the
+// character after it is not a space, closes at the next run of the same character with no space
+// before it, and an underscore inside a word is a character. Prose written to be read unrendered --
+// which is what a literate file's prose is -- does not lean on the corners where the two differ.
+
+// A document being rendered: the markup so far.
+struct Md
+    out: StrBuilder
+end Md
+
+md_new() -> Md = Md(str_builder())
+
+// One run of prose lines, rendered as blocks.
+md_blocks(m: *Md, lines: Buf[string])
+    var i: usize = 0
+    val n = lines.len()
+
+    while i < n
+        val line = lines.at(i)
+        val margin = md_margin(line)
+        val bare = line[margin..<line.bytes.len]
+
+        if bare.trim().is_empty()
+            i += 1
+        elif margin >= 4
+            i = md_indented_code(m, lines, i)
+        elif md_heading_level(bare) > 0
+            md_heading(m, md_heading_level(bare), md_heading_text(bare))
+            i += 1
+        elif md_fence_run(bare) != ""
+            i = md_fenced(m, lines, i, margin)
+        elif bare.starts_with("$$")
+            i = md_display_math(m, lines, i)
+        elif md_is_rule(bare)
+            m.out.push("<hr />\n")
+            i += 1
+        elif bare.starts_with(">")
+            i = md_quote(m, lines, i)
+        elif md_marker(bare).is_some()
+            i = md_list(m, lines, i)
+        elif i + 1 < n && bare.contains("|") && md_is_delimiter_row(lines.at(i + 1))
+            i = md_table(m, lines, i)
+        else
+            i = md_paragraph(m, lines, i, false)
+end md_blocks
+
+// The columns of spaces a line opens with. A tab counts as the four columns Markdown gives it; a
+// literate file's prose may hold one, which only its program text may not.
+md_margin(line: string) -> usize
+    var k: usize = 0
+
+    for b in line.bytes
+        if b != u8(' ') && b != u8('\t') then break
+
+        k += 1
+
+    k
+end md_margin
+
+// `#` to `######` and a space, or nothing -- which is 0.
+private md_heading_level(bare: string) -> usize
+    val bs = bare.bytes
+    var k: usize = 0
+
+    while k < bs.len && bs[k] == u8('#')
+        k += 1
+
+    if k == 0 || k > 6 then return 0
+    if k < bs.len && bs[k] != u8(' ') then return 0
+
+    k
+end md_heading_level
+
+// An ATX heading's text: the marks and any closing run of them taken off.
+private md_heading_text(bare: string) -> string
+    var text = bare.trim_start_matches("#").trim()
+
+    if text.ends_with("#")
+        val cut = text.trim_end_matches("#")
+
+        if cut.is_empty() || cut.ends_with(" ") then text = cut.trim()
+    end if
+
+    text
+end md_heading_text
+
+private md_heading(m: *Md, level: usize, text: string)
+    val id = md_slug(md_plain(text))
+
+    m.out.push(if id.is_empty() then s"<h$level>" else s"<h$level id=\"$id\">")
+    md_inline(m, text)
+    m.out.push(s"</h$level>\n")
+end md_heading
+
+// A heading's id, by the renderer's own rule (`markdown`'s `defaultSlugify`, which the site's pages
+// get too): lowercase, every run of characters that are not a letter or a digit one `-`, none at
+// either end. A heading with no letter or digit in it gets no id.
+md_slug(text: string) -> string
+    var out = str_builder()
+    var dash = false
+
+    for c in text.chars
+        val l = unicode.to_lower(c)
+
+        if unicode.is_alpha(l) || unicode.is_digit(l)
+            out.push_char(l)
+            dash = false
+        elif !dash && out.len > 0
+            out.push_char('-')
+            dash = true
+
+    val s = out.finish()
+
+    if s.ends_with("-") then s[0..<s.bytes.len - 1] else s
+end md_slug
+
+// A heading's text as a reader sees it, the marks taken off, which is what its id is made from.
+private md_plain(text: string) -> string
+    var out = str_builder()
+    val bs = text.bytes
+    var i: usize = 0
+
+    while i < bs.len
+        val b = bs[i]
+
+        if b == u8(']') && i + 1 < bs.len && bs[i + 1] == u8('(')
+            i = md_index_from(text, ")", i + 2).map(at -> at + 1).unwrap_or(bs.len)
+        else
+            if b != u8('`') && b != u8('*') && b != u8('[') && b != u8('$') then out.bytes.push(b)
+
+            i += 1
+
+    out.finish()
+end md_plain
+
+// The run of three or more backticks or tildes a fence opens with, or the empty string.
+private md_fence_run(bare: string) -> string
+    val bs = bare.bytes
+
+    if bs.len < 3 then return ""
+
+    val c = bs[0]
+
+    if c != u8('`') && c != u8('~') then return ""
+
+    var k: usize = 0
+
+    while k < bs.len && bs[k] == c
+        k += 1
+
+    if k < 3 then return ""
+
+    // A backtick fence's info string may not hold a backtick; that line is inline code instead.
+    if c == u8('`') && bare[k..<bs.len].contains("`") then return ""
+
+    bare[0..<k]
+end md_fence_run
+
+// A fenced block: an illustration, set as code and coloured where its info string says sysl.
+private md_fenced(m: *Md, lines: Buf[string], start: usize, margin: usize) -> usize
+    val opener = lines.at(start)
+    val bare = opener[margin..<opener.bytes.len]
+    val run = md_fence_run(bare)
+    val info = bare[run.bytes.len..<bare.bytes.len].trim()
+    val lang = md_first_word(info)
+    var body = str_builder()
+    var i = start + 1
+
+    loop
+        if i >= lines.len() then break
+
+        val line = lines.at(i)
+        val t = line.trim()
+
+        if t.starts_with(run) && t.trim_matches(run[0..<1]).is_empty()
+            i += 1
+            break
+        end if
+
+        body.push(md_unindent(line, margin))
+        body.push_char('\n')
+        i += 1
+
+    md_code_block(m, lang, body.finish())
+    i
+end md_fenced
+
+// A code block's markup. Only the program's own language is coloured; any other is escaped.
+md_code_block(m: *Md, lang: string, code: string)
+    if lang.is_empty()
+        m.out.push("<pre><code>")
+        hl_escape_into(&m.out, code)
+    elif lang == WeaveLanguage
+        m.out.push(s"<pre><code class=\"language-${hl_escape(lang)}\">")
+        m.out.push(hl_sysl(code))
+    else
+        m.out.push(s"<pre><code class=\"language-${hl_escape(lang)}\">")
+        hl_escape_into(&m.out, code)
+
+    m.out.push("</code></pre>\n")
+end md_code_block
+
+private md_first_word(info: string) -> string
+    val bs = info.bytes
+    var k: usize = 0
+
+    while k < bs.len && bs[k] != u8(' ') && bs[k] != u8('{')
+        k += 1
+
+    info[0..<k]
+end md_first_word
+
+// A line with up to `margin` columns of its indentation taken off.
+private md_unindent(line: string, margin: usize) -> string
+    val m = md_margin(line)
+    val cut = if m < margin then m else margin
+
+    line[cut..<line.bytes.len]
+end md_unindent
+
+// An indented block inside the prose: an example under a list or a quote, set as code without a
+// language, since only a literate file's own program text is the program.
+private md_indented_code(m: *Md, lines: Buf[string], start: usize) -> usize
+    var body = str_builder()
+    var i = start
+    var end_at = start
+
+    while i < lines.len()
+        val line = lines.at(i)
+
+        if !line.trim().is_empty() && md_margin(line) < 4 then break
+        if !line.trim().is_empty() then end_at = i + 1
+
+        i += 1
+
+    for k in start..<end_at
+        body.push(md_unindent(lines.at(k), 4))
+        body.push_char('\n')
+
+    md_code_block(m, "", body.finish())
+    end_at
+end md_indented_code
+
+// Display mathematics: `$$` to `$$`, written inside `\[` and `\]` for KaTeX to set.
+private md_display_math(m: *Md, lines: Buf[string], start: usize) -> usize
+    val first = lines.at(start).trim()
+    var body = str_builder()
+    var i = start + 1
+
+    if first.bytes.len > 4 && first.ends_with("$$")
+        body.push(first[2..<first.bytes.len - 2])
+    else
+        body.push(first[2..<first.bytes.len])
+
+        loop
+            if i >= lines.len() then break
+
+            val t = lines.at(i).trim()
+
+            i += 1
+
+            if t.ends_with("$$")
+                body.push_char('\n')
+                body.push(t[0..<t.bytes.len - 2])
+                break
+            end if
+
+            body.push_char('\n')
+            body.push(t)
+
+    m.out.push("<div class=\"math display\">\\[")
+    hl_escape_into(&m.out, body.finish().trim())
+    m.out.push("\\]</div>\n")
+    i
+end md_display_math
+
+// A thematic break: three or more of one of `-`, `*`, `_`, with spaces between and nothing else.
+private md_is_rule(bare: string) -> bool
+    val bs = bare.bytes
+    val c = bs[0]
+
+    if c != u8('-') && c != u8('*') && c != u8('_') then return false
+
+    var count = 0
+
+    for b in bs
+        if b == c
+            count += 1
+        elif b != u8(' ') && b != u8('\t')
+            return false
+
+    count >= 3
+end md_is_rule
+
+// A block quote: its lines with their `>` taken off, rendered as blocks of their own.
+private md_quote(m: *Md, lines: Buf[string], start: usize) -> usize
+    var inner: Buf[string] = buf()
+    var i = start
+
+    while i < lines.len()
+        val line = lines.at(i)
+        val bare = line.trim_start()
+
+        if bare.starts_with(">")
+            val rest = bare[1..<bare.bytes.len]
+
+            inner.push(if rest.starts_with(" ") then rest[1..<rest.bytes.len] else rest)
+        elif !bare.is_empty() && inner.len() > 0 && !inner.at(inner.len() - 1).trim().is_empty()
+            inner.push(bare)
+        else
+            break
+
+        i += 1
+
+    m.out.push("<blockquote>\n")
+    md_blocks(m, inner)
+    m.out.push("</blockquote>\n")
+    i
+end md_quote
+
+// A list marker at the start of a line: its kind (`-`, `*`, `+`, or `.`/`)` for an ordered one), the
+// number an ordered one carries, and how many columns the marker and the space after it take.
+struct MdMarker
+    kind: u8
+    number: int
+    width: usize
+end MdMarker
+
+private md_marker(bare: string) -> Option[MdMarker]
+    val bs = bare.bytes
+
+    if bs.len < 2 then return None
+
+    val c = bs[0]
+
+    if c == u8('-') || c == u8('*') || c == u8('+')
+        if bs[1] != u8(' ') then return None
+
+        return Some(MdMarker(c, 0, md_marker_width(bs, 1)))
+    end if
+
+    var k: usize = 0
+    var n = 0
+
+    while k < bs.len && k < 9 && bs[k].is_digit()
+        n = n * 10 + int(bs[k] - u8('0'))
+        k += 1
+
+    if k == 0 || k + 1 >= bs.len then return None
+    if bs[k] != u8('.') && bs[k] != u8(')') then return None
+    if bs[k + 1] != u8(' ') then return None
+
+    Some(MdMarker(bs[k], n, md_marker_width(bs, k + 1)))
+end md_marker
+
+// The columns from the marker's start to its item's text: the marker and between one and four
+// spaces -- five or more being one space and an indented block.
+private md_marker_width(bs: []const u8, after: usize) -> usize
+    var k = after
+
+    while k < bs.len && bs[k] == u8(' ')
+        k += 1
+
+    if k == bs.len || k - after > 4 then after + 1 else k
+end md_marker_width
+
+// A list: its items, each item's lines with the item's indent taken off and rendered as blocks of
+// their own. A list is loose -- its paragraphs set as paragraphs -- where a blank line separates two
+// of its items or two blocks of one item, and tight otherwise.
+private md_list(m: *Md, lines: Buf[string], start: usize) -> usize
+    val first_line = lines.at(start)
+    val first_margin = md_margin(first_line)
+    val first = md_marker(first_line[first_margin..<first_line.bytes.len]).unwrap()
+    var items: Buf[Buf[string]] = buf()
+    var loose = false
+    var i = start
+
+    loop
+        if i >= lines.len() then break
+
+        val line = lines.at(i)
+        val margin = md_margin(line)
+
+        if margin > first_margin + 3 then break
+
+        val marker = md_marker(line[margin..<line.bytes.len])
+
+        if marker.is_none() || marker.unwrap().kind != first.kind then break
+
+        val mk = marker.unwrap()
+        val offset = margin + mk.width
+        var item: Buf[string] = buf()
+
+        item.push(if offset <= line.bytes.len then line[offset..<line.bytes.len] else "")
+        i += 1
+
+        loop
+            if i >= lines.len() then break
+
+            val next = lines.at(i)
+
+            if next.trim().is_empty()
+                // A blank line stays in the item only where something indented to the item follows.
+                var j = i
+
+                while j < lines.len() && lines.at(j).trim().is_empty()
+                    j += 1
+
+                if j < lines.len() && md_margin(lines.at(j)) >= offset
+                    while i < j
+                        item.push("")
+                        i += 1
+
+                    loose = true
+                    continue
+                end if
+
+                break
+            end if
+
+            val nm = md_margin(next)
+
+            if nm >= offset
+                item.push(next[offset..<next.bytes.len])
+            elif md_lazy(item, next)
+                item.push(next.trim_start())
+            else
+                break
+
+            i += 1
+
+        items.push(item)
+
+        // Air before the next item of this list makes it loose.
+        if i < lines.len() && lines.at(i).trim().is_empty()
+            var j = i
+
+            while j < lines.len() && lines.at(j).trim().is_empty()
+                j += 1
+
+            if j < lines.len()
+                val after = lines.at(j)
+                val am = md_margin(after)
+                val again = md_marker(after[am..<after.bytes.len])
+
+                if am <= first_margin + 3 && again.is_some() && again.unwrap().kind == first.kind
+                    loose = true
+                    i = j
+                end if
+            end if
+        end if
+
+    val ordered = first.kind == u8('.') || first.kind == u8(')')
+
+    if ordered
+        m.out.push(if first.number == 1 then "<ol>\n" else s"<ol start=\"${first.number}\">\n")
+    else
+        m.out.push("<ul>\n")
+
+    for k in 0..<items.len()
+        m.out.push("<li>")
+        md_item(m, items.at(k), loose)
+        m.out.push("</li>\n")
+
+    m.out.push(if ordered then "</ol>\n" else "</ul>\n")
+    i
+end md_list
+
+// Whether a line no further in than its item continues the paragraph the item ends with -- a lazy
+// continuation, which is what lets an item's paragraph be wrapped at the margin.
+private md_lazy(item: Buf[string], line: string) -> bool
+    if item.len() == 0 || item.at(item.len() - 1).trim().is_empty() then return false
+
+    val bare = line.trim_start()
+
+    !(md_marker(bare).is_some() || md_heading_level(bare) > 0 || md_fence_run(bare) != "" ||
+        bare.starts_with(">") || md_is_rule(bare))
+end md_lazy
+
+// One item's blocks. In a tight list a paragraph is set as its text alone, as CommonMark has it.
+private md_item(m: *Md, lines: Buf[string], loose: bool)
+    if loose
+        m.out.push("\n")
+        md_blocks(m, lines)
+        return
+    end if
+
+    var i: usize = 0
+
+    while i < lines.len()
+        val line = lines.at(i)
+        val bare = line.trim_start()
+
+        if bare.is_empty()
+            i += 1
+        elif md_margin(line) < 4 && md_starts_block(bare)
+            var rest: Buf[string] = buf()
+
+            for k in i..<lines.len()
+                rest.push(lines.at(k))
+
+            m.out.push("\n")
+            md_blocks(m, rest)
+            return
+        else
+            i = md_paragraph(m, lines, i, true)
+end md_item
+
+// Whether a line opens a block other than a paragraph.
+private md_starts_block(bare: string) -> bool =
+    md_marker(bare).is_some() || md_heading_level(bare) > 0 || md_fence_run(bare) != "" ||
+        bare.starts_with(">") || bare.starts_with("$$") || md_is_rule(bare)
+
+// A pipe table's delimiter row: cells of dashes, each perhaps with a colon at either end.
+private md_is_delimiter_row(line: string) -> bool
+    val t = line.trim()
+
+    if !t.contains("-") then return false
+
+    val cells = md_cells(t)
+
+    if cells.len() == 0 then return false
+
+    for k in 0..<cells.len()
+        val c = cells.at(k).trim().trim_matches(":")
+
+        if c.is_empty() || !c.trim_matches("-").is_empty() then return false
+
+    true
+end md_is_delimiter_row
+
+// A table row's cells, the bounding pipes taken off and an escaped pipe kept as text.
+private md_cells(row: string) -> Buf[string]
+    var t = row.trim()
+
+    if t.starts_with("|") then t = t[1..<t.bytes.len]
+    if t.ends_with("|") && !t.ends_with("\\|") then t = t[0..<t.bytes.len - 1]
+
+    var out: Buf[string] = buf()
+    val bs = t.bytes
+    var from: usize = 0
+    var k: usize = 0
+
+    while k < bs.len
+        if bs[k] == u8('\\') && k + 1 < bs.len
+            k += 2
+        elif bs[k] == u8('|')
+            out.push(t[from..<k].trim())
+            from = k + 1
+            k += 1
+        else
+            k += 1
+
+    out.push(t[from..<bs.len].trim())
+    out
+end md_cells
+
+// The alignment a delimiter cell asks for, as the attribute that says it, or the empty string.
+private md_align(cell: string) -> string
+    val c = cell.trim()
+    val left = c.starts_with(":")
+    val right = c.ends_with(":")
+
+    if left && right then return " style=\"text-align: center\""
+    if right then return " style=\"text-align: right\""
+    if left then return " style=\"text-align: left\""
+
+    ""
+end md_align
+
+private md_table(m: *Md, lines: Buf[string], start: usize) -> usize
+    val head = md_cells(lines.at(start))
+    val aligns = md_cells(lines.at(start + 1))
+    var i = start + 2
+
+    m.out.push("<table>\n<thead>\n<tr>\n")
+
+    for k in 0..<head.len()
+        val align = if k < aligns.len() then md_align(aligns.at(k)) else ""
+
+        m.out.push(s"<th$align>")
+        md_inline(m, head.at(k))
+        m.out.push("</th>\n")
+
+    m.out.push("</tr>\n</thead>\n")
+
+    var body = false
+
+    while i < lines.len() && !lines.at(i).trim().is_empty() && lines.at(i).contains("|")
+        if !body then m.out.push("<tbody>\n")
+
+        body = true
+
+        val row = md_cells(lines.at(i))
+
+        m.out.push("<tr>\n")
+
+        for k in 0..<head.len()
+            val align = if k < aligns.len() then md_align(aligns.at(k)) else ""
+            val cell = if k < row.len() then row.at(k) else ""
+
+            m.out.push(s"<td$align>")
+            md_inline(m, cell)
+            m.out.push("</td>\n")
+
+        m.out.push("</tr>\n")
+        i += 1
+
+    if body then m.out.push("</tbody>\n")
+
+    m.out.push("</table>\n")
+    i
+end md_table
+
+// A paragraph: its lines up to a blank line or a line that opens another block -- or, where the
+// line that stops it is an underline of `=` or `-`, a heading.
+private md_paragraph(m: *Md, lines: Buf[string], start: usize, bare: bool) -> usize
+    var text = str_builder()
+    var i = start
+
+    loop
+        if i >= lines.len() then break
+
+        val line = lines.at(i)
+        val t = line.trim()
+
+        if t.is_empty() then break
+
+        if i > start && md_margin(line) < 4
+            val level = md_underline(t)
+
+            if level > 0
+                md_heading(m, level, text.finish().trim())
+                return i + 1
+            end if
+
+            if md_starts_block(t) && !(md_marker(t).is_some() && !md_interrupts(t)) then break
+        end if
+
+        if i > start then text.push_char('\n')
+
+        text.push(t)
+        i += 1
+
+    if bare
+        md_inline(m, text.finish())
+        m.out.push("\n")
+    else
+        m.out.push("<p>")
+        md_inline(m, text.finish())
+        m.out.push("</p>\n")
+
+    i
+end md_paragraph
+
+// Which underline a line is: 1 for `===`, 2 for `---`, 0 for neither.
+private md_underline(t: string) -> usize
+    if t.trim_matches("=").is_empty() then return 1
+    if t.trim_matches("-").is_empty() then return 2
+
+    0
+end md_underline
+
+// Whether a list marker may interrupt a paragraph: a bullet may, and so may an ordered list only
+// where it starts at 1 -- so a sentence wrapped onto a line beginning "1984." stays a sentence.
+private md_interrupts(t: string) -> bool
+    val mk = md_marker(t).unwrap()
+
+    mk.kind == u8('-') || mk.kind == u8('*') || mk.kind == u8('+') || mk.number == 1
+end md_interrupts
+
+// The text of a paragraph, a heading or a cell, with its inline markup rendered.
+md_inline(m: *Md, text: string)
+    val bs = text.bytes
+    var i: usize = 0
+
+    while i < bs.len
+        val b = bs[i]
+
+        if b == u8('\\') && i + 1 < bs.len && bs[i + 1] == u8('\n')
+            m.out.push("<br />\n")
+            i += 2
+        elif b == u8('\\') && i + 1 < bs.len && bs[i + 1].is_punct()
+            hl_escape_into(&m.out, text[i + 1..<i + 2])
+            i += 2
+        elif b == u8('`')
+            i = md_code_span(m, text, i)
+        elif b == u8('$')
+            i = md_inline_math(m, text, i)
+        elif b == u8('<')
+            i = md_autolink(m, text, i)
+        elif b == u8('!') && i + 1 < bs.len && bs[i + 1] == u8('[')
+            i = md_link(m, text, i + 1, true)
+        elif b == u8('[')
+            i = md_link(m, text, i, false)
+        elif b == u8('*') || b == u8('_')
+            i = md_emphasis(m, text, i)
+        elif b == u8('~') && i + 1 < bs.len && bs[i + 1] == u8('~')
+            i = md_strike(m, text, i)
+        elif (b == u8('h') || b == u8('w')) && md_bare_link_end(text, i) > i
+            val e = md_bare_link_end(text, i)
+            val url = text[i..<e]
+            val href = if url.starts_with("www.") then "http://" + url else url
+
+            m.out.push(s"<a href=\"${hl_escape(href)}\">${hl_escape(url)}</a>")
+            i = e
+        elif b == u8('\'') || b == u8('"') || b == u8('-') || b == u8('.')
+            i = md_smart(m, text, i)
+        else
+            var e = i + 1
+
+            while e < bs.len && (bs[e] & 192) == 128
+                e += 1
+
+            hl_escape_into(&m.out, text[i..<e])
+            i = e
+end md_inline
+
+// Smart punctuation, as the site has it: a quote curled by what stands before it, `--` an en dash,
+// `---` an em dash and `...` an ellipsis. A code span never reaches here, so code keeps its quotes.
+private md_smart(m: *Md, text: string, at: usize) -> usize
+    val bs = text.bytes
+    val b = bs[at]
+    val after_word = at > 0 && !md_space(bs[at - 1]) && bs[at - 1] != u8('(') && bs[at - 1] != u8('[')
+
+    if b == u8('\'')
+        m.out.push(if after_word then "’" else "‘")
+        return at + 1
+    end if
+
+    if b == u8('"')
+        m.out.push(if after_word then "”" else "“")
+        return at + 1
+    end if
+
+    if b == u8('-') && md_at(text, at, "---")
+        m.out.push("—")
+        return at + 3
+    end if
+
+    if b == u8('-') && md_at(text, at, "--")
+        m.out.push("–")
+        return at + 2
+    end if
+
+    if b == u8('.') && md_at(text, at, "...")
+        m.out.push("…")
+        return at + 3
+    end if
+
+    m.out.bytes.push(b)
+    at + 1
+end md_smart
+
+// A code span: a run of backticks to the next run of the same length, its text set as code. With no
+// closing run the backticks are text.
+private md_code_span(m: *Md, text: string, at: usize) -> usize
+    val bs = text.bytes
+    var e = at
+
+    while e < bs.len && bs[e] == u8('`')
+        e += 1
+
+    val run = e - at
+    var k = e
+
+    while k < bs.len
+        if bs[k] != u8('`')
+            k += 1
+            continue
+        end if
+
+        var r = k
+
+        while r < bs.len && bs[r] == u8('`')
+            r += 1
+
+        if r - k == run
+            var inner = md_newlines_to_spaces(text[e..<k])
+
+            if inner.bytes.len >= 2 && inner.starts_with(" ") && inner.ends_with(" ") && !inner.trim().is_empty()
+                inner = inner[1..<inner.bytes.len - 1]
+
+            m.out.push("<code>")
+            hl_escape_into(&m.out, inner)
+            m.out.push("</code>")
+            return r
+        end if
+
+        k = r
+
+    m.out.push(text[at..<e])
+    e
+end md_code_span
+
+private md_newlines_to_spaces(s: string) -> string
+    if !s.contains("\n") then return s
+
+    var out = str_builder()
+
+    for b in s.bytes
+        out.bytes.push(if b == u8('\n') then u8(' ') else b)
+
+    out.finish()
+end md_newlines_to_spaces
+
+// Inline mathematics: `$` up to the next `$`, where the first is not followed by a space and the
+// last is neither preceded by one nor followed by a digit -- so `$5 and $10` stays money.
+private md_inline_math(m: *Md, text: string, at: usize) -> usize
+    val bs = text.bytes
+
+    if at + 1 < bs.len && bs[at + 1] != u8(' ') && bs[at + 1] != u8('$') && bs[at + 1] != u8('\n')
+        var k = at + 1
+
+        while k < bs.len
+            if bs[k] == u8('\\')
+                k += 2
+                continue
+            end if
+
+            if bs[k] == u8('$') && bs[k - 1] != u8(' ') && !(k + 1 < bs.len && bs[k + 1].is_digit())
+                m.out.push("<span class=\"math inline\">\\(")
+                hl_escape_into(&m.out, text[at + 1..<k])
+                m.out.push("\\)</span>")
+                return k + 1
+            end if
+
+            k += 1
+    end if
+
+    m.out.push("$")
+    at + 1
+end md_inline_math
+
+// `<scheme:...>` or `<name@host>` as a link; any other `<` is text, escaped.
+private md_autolink(m: *Md, text: string, at: usize) -> usize
+    md_index_from(text, ">", at + 1) match
+        Some(close) ->
+            val inner = text[at + 1..<close]
+
+            if !inner.contains(" ") && !inner.contains("<") && !inner.is_empty()
+                if inner.contains("://") || inner.starts_with("mailto:")
+                    m.out.push(s"<a href=\"${hl_escape(inner)}\">${hl_escape(inner)}</a>")
+                    return close + 1
+                end if
+
+                if inner.contains("@") && !inner.contains(":")
+                    m.out.push(s"<a href=\"mailto:${hl_escape(inner)}\">${hl_escape(inner)}</a>")
+                    return close + 1
+                end if
+            end if
+        None -> ()
+
+    m.out.push("&lt;")
+    at + 1
+end md_autolink
+
+// `[text](url)` as a link, or with `!` before it an image. Anything else is the bracket as text.
+private md_link(m: *Md, text: string, at: usize, image: bool) -> usize
+    val bs = text.bytes
+    var depth = 0
+    var k = at
+    var close: usize = 0
+    var found = false
+
+    while k < bs.len
+        if bs[k] == u8('\\')
+            k += 2
+            continue
+        end if
+
+        if bs[k] == u8('`')
+            // A code span inside the text is stepped over whole, brackets and all.
+            var r = k
+
+            while r < bs.len && bs[r] == u8('`')
+                r += 1
+
+            val run = text[k..<r]
+
+            k = md_index_from(text, run, r).map(c -> c + run.bytes.len).unwrap_or(r)
+            continue
+        end if
+
+        if bs[k] == u8('[') then depth += 1
+
+        if bs[k] == u8(']')
+            depth -= 1
+
+            if depth == 0
+                close = k
+                found = true
+                break
+            end if
+        end if
+
+        k += 1
+
+    if found && close + 1 < bs.len && bs[close + 1] == u8('(')
+        md_index_from(text, ")", close + 2) match
+            Some(end_at) ->
+                val target = text[close + 2..<end_at].trim()
+                val url = md_first_word(target.trim_start_matches("<")).trim_end_matches(">")
+                val label = text[at + 1..<close]
+
+                if image
+                    m.out.push(s"<img src=\"${hl_escape(url)}\" alt=\"${hl_escape(md_plain(label))}\" />")
+                else
+                    m.out.push(s"<a href=\"${hl_escape(url)}\">")
+                    md_inline(m, label)
+                    m.out.push("</a>")
+
+                return end_at + 1
+            None -> ()
+    end if
+
+    m.out.push(if image then "![" else "[")
+    at + 1
+end md_link
+
+// Emphasis or strong emphasis, or the marks as text where they open or close nothing.
+private md_emphasis(m: *Md, text: string, at: usize) -> usize
+    val bs = text.bytes
+    val c = bs[at]
+    var e = at
+
+    while e < bs.len && bs[e] == c
+        e += 1
+
+    val run = e - at
+    val opens = e < bs.len && !md_space(bs[e]) && !(c == u8('_') && at > 0 && bs[at - 1].is_alnum())
+
+    if opens && run >= 2
+        md_closer(text, c, 2, e) match
+            Some(close) ->
+                // A third mark is emphasis inside the strong.
+                m.out.push("<strong>")
+                md_inline(m, text[at + 2..<close])
+                m.out.push("</strong>")
+                return close + 2
+            None -> ()
+    end if
+
+    if opens
+        md_closer(text, c, 1, at + 1) match
+            Some(close) ->
+                m.out.push("<em>")
+                md_inline(m, text[at + 1..<close])
+                m.out.push("</em>")
+                return close + 1
+            None -> ()
+    end if
+
+    m.out.push(text[at..<e])
+    e
+end md_emphasis
+
+// Where a run of `want` marks closes emphasis opened before `from`: no space before it, and for an
+// underscore no letter after it. A strong pair met on the way to a single mark is stepped over.
+private md_closer(text: string, c: u8, want: usize, from: usize) -> Option[usize]
+    val bs = text.bytes
+    var k = from
+
+    while k < bs.len
+        if bs[k] == u8('`')
+            var r = k
+
+            while r < bs.len && bs[r] == u8('`')
+                r += 1
+
+            val run = text[k..<r]
+
+            k = md_index_from(text, run, r).map(x -> x + run.bytes.len).unwrap_or(r)
+            continue
+        end if
+
+        if bs[k] != c
+            k += 1
+            continue
+        end if
+
+        var r = k
+
+        while r < bs.len && bs[r] == c
+            r += 1
+
+        val len = r - k
+        val closes = k > from && !md_space(bs[k - 1]) && !(c == u8('_') && r < bs.len && bs[r].is_alnum())
+
+        if closes && len >= want
+            return Some(if want == 1 then r - 1 else k)
+
+        if want == 1 && len >= 2
+            // A strong pair inside emphasis: step past its close as well as its open.
+            md_closer(text, c, 2, r) match
+                Some(inner) -> k = inner + 2
+                None -> k = r
+        else
+            k = r
+
+    None
+end md_closer
+
+private md_space(b: u8) -> bool = b == u8(' ') || b == u8('\n') || b == u8('\t')
+
+private md_strike(m: *Md, text: string, at: usize) -> usize
+    md_index_from(text, "~~", at + 2) match
+        Some(close) if close > at + 2 ->
+            m.out.push("<del>")
+            md_inline(m, text[at + 2..<close])
+            m.out.push("</del>")
+            close + 2
+        _ ->
+            m.out.push("~~")
+            at + 2
+end md_strike
+
+// Just past a bare link starting at `at` -- `https://`, `http://` or `www.` at the start of a word,
+// to the next space, with a closing punctuation mark left to the sentence -- or `at` where there is
+// none.
+private md_bare_link_end(text: string, at: usize) -> usize
+    val bs = text.bytes
+
+    if at > 0 && !md_space(bs[at - 1]) && bs[at - 1] != u8('(') then return at
+
+    var opens = false
+
+    for p in ["https://", "http://", "www."]
+        if md_at(text, at, p) then opens = true
+
+    if !opens then return at
+
+    var e = at
+
+    while e < bs.len && !md_space(bs[e]) && bs[e] != u8('<')
+        e += 1
+
+    while e > at
+        val last = bs[e - 1]
+
+        if last == u8('.') || last == u8(',') || last == u8(':') || last == u8(';') || last == u8(')') ||
+            last == u8('!') || last == u8('?') || last == u8('*') || last == u8('_')
+            e -= 1
+        else
+            break
+
+    e
+end md_bare_link_end
+
+private md_at(text: string, at: usize, part: string) -> bool
+    val bs = text.bytes
+    val ps = part.bytes
+
+    if at + ps.len > bs.len then return false
+
+    for k in 0..<ps.len
+        if bs[at + k] != ps[k] then return false
+
+    true
+end md_at
+
+private md_index_from(text: string, needle: string, from: usize) -> Option[usize] =
+    if from > text.bytes.len then None else text.index_of_from(needle, from)

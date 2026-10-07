@@ -23,8 +23,8 @@ the path is standing on.
 | `sysl emit-ast <path>` | print one file's untyped parse tree, as deterministic text |
 | `sysl emit-typed <path>` | print one module's typed tree, as deterministic text |
 | `sysl emit-header <path>` | print the C header for what a module exports |
-| `sysl weave <path>` | render a literate source as an HTML document — *not yet in this compiler* |
-| `sysl tangle <path>` | print the program a literate source holds — *not yet in this compiler* |
+| `sysl weave <path>` | render a literate source as an HTML document |
+| `sysl tangle <path>` | print the program a literate source holds |
 | `sysl deps <path>` | print the dependency graph the project resolves to |
 | `sysl add <coordinate>` | add a dependency to the project's manifest |
 | `sysl vendor <path>` | put what the project depends on into `vendor/` — *not yet in this compiler* |
@@ -37,12 +37,12 @@ A subcommand is required; sysl with none exits 2 and prints its usage.
 
 A word that is not one of these is refused with the usage, and exits 2.
 
-**Four of these are not in this compiler yet**: `weave`, `tangle`, `vendor` and `targets`. Each is
-described below as it will work, and until it is added each is refused in the same words, with the
-usage under them and exit status 2:
+**Two of these are not in this compiler yet**: `vendor` and `targets`. Each is described below as it
+will work, and until it is added each is refused in the same words, with the usage under them and
+exit status 2:
 
 ```text
-sysl: `weave` is not a command this compiler can carry out yet
+sysl: `vendor` is not a command this compiler can carry out yet
 ```
 
 ### `run`
@@ -338,24 +338,28 @@ error, exits non-zero and prints the ordinary diagnostic instead, with nothing o
 
 ### `weave`
 
-*Not yet in this compiler — it answers "`weave` is not a command this compiler can carry out yet".
-What follows is the command as it will be.*
-
 ```bash
-sysl weave guide/slab/slab.lsysl -o slab.html
+sysl weave library/sysl/regex/vm.lsysl -o vm.html
 sysl weave library/sysl/regex -o documents/
 ```
 
-A **literate** source rendered as an HTML document. A `.lsysl` file is a Markdown document whose
-four-column-indented part is the program, which is what makes one readable with nothing rendering it
-— and an indented code block carries no *language*, so nothing can highlight it. `weave` tells the
-renderer that an indented block is sysl, which is the whole of the transformation: the source reaches
-the renderer exactly as written, and prose, tables, illustrations and heading levels are its own
-business.
+`weave [-o <path>] <path>`. A **literate** source rendered as an HTML document. A `.lsysl` file is a
+Markdown document whose four-column-indented part is the program, which is what makes one readable
+with nothing rendering it — and an indented code block carries no *language*, so nothing can
+highlight it. `weave` sets exactly the lines the compiler reads as program text as sysl code, one
+block through any blank lines between them, and renders every other line as Markdown: prose, tables,
+illustrations and heading levels are the document's own business.
+
+The Markdown is the site's dialect — CommonMark's blocks and inlines, with heading ids, pipe tables,
+strikethrough, bare links, smart punctuation, and mathematics as `$…$` and `$$…$$`. Footnotes,
+definition lists, callouts, attribute blocks, emoji shortcodes and task-list boxes are not rendered,
+and raw HTML is shown as written rather than passed through; each comes out as the text it was typed
+as.
 
 What comes out is one file that opens by itself. It carries its own styling, in a light and a dark
-palette; its code is coloured by the same grammar this site highlights with; and its mathematics is
-set by KaTeX, which the page links. That last is the one thing a woven document needs the network
+palette; its code is coloured by keyword, type, function, string, number, comment and punctuation,
+the keywords being the lexer's own reserved words; and its mathematics is set by KaTeX, which the
+page links. That last is the one thing a woven document needs the network
 for — the prose and the code are markup in the file, so a document read offline loses its equations
 to TeX source and nothing else.
 
@@ -377,15 +381,15 @@ the declarations *say* — so a tree usually wants both, and neither is a substi
 
 ### `tangle`
 
-*Not yet in this compiler — it answers "`tangle` is not a command this compiler can carry out yet".
-What follows is the command as it will be.*
-
 ```bash
-sysl tangle guide/slab/slab.lsysl
-sysl tangle guide/slab/slab.lsysl -o slab.sysl
+sysl tangle library/sysl/regex/vm.lsysl
+sysl tangle library/sysl/regex/vm.lsysl -o vm.sysl
 ```
 
-The other half of a literate system: the program, with the prose stripped. A build tangles anyway —
+`tangle [-o <path>] <path>`. The other half of a literate system: the program, with the prose
+stripped, written to standard output or to what `-o` names. A path holding several literate sources
+gives their programs one after another; the ordinary `.sysl` files beside them are passed over, and a
+tree with none is refused. A build tangles anyway —
 that is how a `.lsysl` file compiles at all — so what this adds is a way to **see** it.
 
 That is worth having when a literate file misbehaves. A block indented that should not have been, a

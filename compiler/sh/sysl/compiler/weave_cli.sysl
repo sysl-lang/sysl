@@ -1,0 +1,220 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Source
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, write_text}
+import sysl.text.{Search, from_utf8_unchecked}
+
+// `sysl weave` and `sysl tangle`: the two halves of a literate system, as commands.
+//
+// **Both are source-level and stop above everything a compilation needs.** Neither asks for a
+// target, a standard module or a library: a package's prose is worth reading on a machine that
+// could not build it, and a document that only a successful build could produce would be missing
+// exactly when somebody wanted it. So the tree is read with every per-OS directory in it -- two
+// implementations of one function are two things worth reading.
+//
+// **The ordinary `.sysl` files of a tree are passed over rather than refused**, because a directory
+// holding both is the normal shape of a literate module -- `library/sysl/regex` is five `.lsysl`
+// files and its tests are not. What is refused is a tree with no literate source at all.
+
+weave_usage() -> string = "usage: sysl weave [-o <path>] <path>"
+
+tangle_usage() -> string = "usage: sysl tangle [-o <path>] <path>"
+
+// `sysl weave [-o <path>] <path>` -- each literate source as its own HTML document. **One source is
+// one document**: a woven document is a leaf artifact somebody opens, so a tree rendered end to end
+// would put five modules under one title. Where the path holds several, `-o` names a directory and
+// each document is written into it under its own name (`weave_document_name`).
+weave_command(args: []string, say: string -> unit) -> int
+    val (path, output) = literate_arguments(args) match
+        Ok(read) -> read
+        Err(said) ->
+            say(if said == "" then weave_usage() else said)
+            return Misused
+
+    val sources = literate_sources(path, "weave") match
+        Ok(s) -> s
+        Err(why) ->
+            say(refused(why))
+            return Failed
+
+    var documents: Buf[(string, string)] = buf()
+
+    for k in 0..<sources.len()
+        val src = sources.at(k)
+
+        weave_render(src) match
+            Ok(html) -> documents.push((src.name, html))
+            Err(why) ->
+                say(refused(why))
+                return Failed
+
+    output match
+        None ->
+            if documents.len() > 1
+                say(refused(s"$path holds ${documents.len()} literate sources — 'weave' writes one " +
+                    "document each, so give '-o' a directory to write them into"))
+                return Failed
+            end if
+
+            say(wv_unended(documents.at(0).1))
+            Fine
+        Some(to) ->
+            if documents.len() == 1 then return wv_write(to, documents.at(0).1, say)
+
+            wv_directory(to) match
+                Some(why) ->
+                    say(refused(why))
+                    return Failed
+                None -> ()
+
+            for k in 0..<documents.len()
+                val (name, html) = documents.at(k)
+                val code = wv_write(join_path(to, weave_document_name(name)), html, say)
+
+                if code != Fine then return code
+
+            Fine
+end weave_command
+
+// `sysl tangle [-o <path>] <path>` -- the program a literate source holds, with the prose stripped.
+//
+// **This is what the compiler reads**, which is the whole of why it is worth a command: when a
+// literate file misbehaves the question is always what tangling produced. Prose is blanked rather
+// than removed, so line 100 of the tangle is line 100 of the document. A tree's programs are joined,
+// being all the same kind of thing.
+tangle_command(args: []string, say: string -> unit) -> int
+    val (path, output) = literate_arguments(args) match
+        Ok(read) -> read
+        Err(said) ->
+            say(if said == "" then tangle_usage() else said)
+            return Misused
+
+    val sources = literate_sources(path, "tangle") match
+        Ok(s) -> s
+        Err(why) ->
+            say(refused(why))
+            return Failed
+
+    var text = ""
+
+    for k in 0..<sources.len()
+        val src = sources.at(k)
+
+        tangle(src) match
+            Ok(program) ->
+                val one = from_utf8_unchecked(program.bytes)
+
+                text = if k == 0 then one else text + "\n" + one
+            Err(d) ->
+                say(refused(wv_rendered(src, d)))
+                return Failed
+
+    output match
+        None ->
+            say(wv_unended(text))
+            Fine
+        Some(to) -> wv_write(to, text, say)
+end tangle_command
+
+// What a weave or tangle command line asks for: the path, and where `-o` sends the result. `Err`
+// carries what to say -- the empty string where the usage alone says it.
+literate_arguments(args: []string) -> Result[(string, Option[string]), string]
+    var path = ""
+    var output: Option[string] = None
+    var mistakes: Buf[string] = buf()
+    var i: usize = 2
+
+    while i < args.len
+        if args[i] == "-o" || args[i] == "--output"
+            if i + 1 >= args.len then return Err(missing_value(args[i]))
+
+            output = Some(args[i + 1])
+            i += 1
+        else
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken > 0
+                i += taken - 1
+            elif path != ""
+                return Err("")
+            else
+                path = args[i]
+
+        i += 1
+
+    if mistakes.len() > 0
+        return Err(misused(mistakes, if args[1] == "weave" then weave_usage() else tangle_usage()))
+
+    if path == "" then return Err("")
+
+    Ok((path, output))
+end literate_arguments
+
+// The literate sources a path holds, or why there is nothing to render.
+literate_sources(path: string, verb: string) -> Result[Buf[Source], string]
+    val found = collect(path, None) match
+        Ok(f) -> f
+        Err(sel) -> return Err(sel.message)
+
+    if found.len() == 0 then return Err(s"$path holds no sysl source files")
+
+    var out: Buf[Source] = buf()
+
+    for k in 0..<found.len()
+        val src = found.at(k).src
+
+        if is_literate(src.name) then out.push(src)
+
+    if out.len() == 0
+        return Err(s"$path holds no '${LiterateExtension}' files — '$verb' reads the prose a " +
+            "literate source is written around, and an ordinary sysl program has none")
+    end if
+
+    Ok(out)
+end literate_sources
+
+// A rendered thing written where it was asked for, and said so -- or the reason it could not be.
+wv_write(path: string, text: string, say: string -> unit) -> int
+    parent_of(path) match
+        Some(dir) ->
+            wv_directory(dir) match
+                Some(why) ->
+                    say(refused(s"cannot write $path: $why"))
+                    return Failed
+                None -> ()
+        None -> ()
+
+    write_text(path, text) match
+        Ok(_) ->
+            say(s"wrote $path")
+            Fine
+        Err(e) ->
+            say(refused(s"cannot write $path: ${e.message()}"))
+            Failed
+end wv_write
+
+// Why a directory cannot be made at `dir`, or nothing where it is there or has been made. **A file
+// standing where a directory is needed is named outright** -- the nearest one on the way up -- since
+// the platform's own answer would be a bare "not a directory" about a path the reader never typed.
+wv_directory(dir: string) -> Option[string]
+    var at = dir
+
+    loop
+        if is_directory(at) then break
+
+        if is_file(at)
+            return Some(s"cannot make the directory '$at': a file is already there, and a directory is needed")
+
+        parent_of(at) match
+            Some(up) if up != at -> at = up
+            _ -> break
+
+    make_dir_all(dir) match
+        Ok(_) -> None
+        Err(e) -> Some(s"cannot make the directory '$dir': ${e.message()}")
+end wv_directory
+
+// A text handed to `say`, which ends every line it is given: one final newline is the printing's.
+private wv_unended(text: string) -> string =
+    if text.ends_with("\n") then text[0..<text.bytes.len - 1] else text

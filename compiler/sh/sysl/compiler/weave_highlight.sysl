@@ -1,0 +1,289 @@
+module sh.sysl.compiler
+
+import sysl.text.{Ascii, Search, StrBuilder, str_builder}
+
+// The colouring `sysl weave` gives a woven document's program: the code set as markup, each piece
+// wrapped in a span whose class names what it is.
+//
+// **The classes are the stylesheet's whole vocabulary** -- `hl-keyword`, `hl-string`, `hl-comment`,
+// `hl-number`, `hl-type`, `hl-function`, `hl-punctuation` -- and `weave.sysl`'s style colours each one
+// in both palettes, so the document needs no script to show its code. A name that is none of those
+// is left as text.
+//
+// **It reads characters, not the grammar.** A block of a literate program is a fragment -- a body
+// whose function began two blocks up, a string that is closed in the next one -- and colouring has
+// to survive anything a fragment can hold, so nothing here can fail: whatever it does not recognise
+// it writes out escaped and unwrapped. The keywords are the lexer's own reserved words
+// (`lex_tables.sysl`), so the two cannot disagree about which words those are.
+
+// The words coloured as keywords beside the reserved ones: the contextual words, special only where
+// the grammar expects one, which a reader still reads as part of the language.
+private val SoftWords: []const string = [
+    "is", "not", "end", "become", "opaque", "derives", "invariant", "new", "set", "some", "with",
+    "within", "where", "async", "await",
+]
+
+// The predeclared type names that are not spelled with a capital: everything else coloured as a
+// type is either capitalised or one of the open `iN` / `uN` / `fN` / `qN` families.
+private val TypeWords: []const string = [
+    "int", "uint", "long", "ulong", "short", "ushort", "isize", "usize", "byte", "bool", "char",
+    "string", "real", "float", "double", "unit", "never",
+]
+
+// The code of one block, coloured.
+hl_sysl(code: string) -> string
+    var out = str_builder()
+    val bs = code.bytes
+    var i: usize = 0
+
+    while i < bs.len
+        val b = bs[i]
+
+        if b == u8('/') && i + 1 < bs.len && bs[i + 1] == u8('/')
+            val e = hl_line_end(bs, i)
+
+            hl_span(&out, "comment", code[i..<e])
+            i = e
+        elif b == u8('/') && i + 1 < bs.len && bs[i + 1] == u8('*')
+            val e = hl_after(code, "*/", i + 2)
+
+            hl_span(&out, "comment", code[i..<e])
+            i = e
+        elif hl_triple_at(code, i) > 0
+            val open = hl_triple_at(code, i)
+            val e = hl_after(code, "\"\"\"", i + open)
+
+            hl_span(&out, "string", code[i..<e])
+            i = e
+        elif hl_quote_at(code, i) > 0
+            val e = hl_string_end(bs, i + hl_quote_at(code, i))
+
+            hl_span(&out, "string", code[i..<e])
+            i = e
+        elif b == u8('\'') && hl_char_end(bs, i) > i
+            val e = hl_char_end(bs, i)
+
+            hl_span(&out, "string", code[i..<e])
+            i = e
+        elif b.is_digit()
+            val e = hl_number_end(bs, i)
+
+            hl_span(&out, "number", code[i..<e])
+            i = e
+        elif hl_word_byte(b)
+            var e = i
+
+            while e < bs.len && (hl_word_byte(bs[e]) || bs[e].is_digit())
+                e += 1
+
+            val word = code[i..<e]
+            val kind = hl_word_kind(word, bs, e)
+
+            if kind == "" then hl_escape_into(&out, word) else hl_span(&out, kind, word)
+
+            i = e
+        elif hl_punct_byte(b)
+            var e = i
+
+            while e < bs.len && hl_punct_byte(bs[e]) && !hl_comment_opens(bs, e)
+                e += 1
+
+            if e == i then e = i + 1
+
+            hl_span(&out, "punctuation", code[i..<e])
+            i = e
+        else
+            var e = i + 1
+
+            // A character of more than one byte is copied whole, so nothing below ever cuts one.
+            while e < bs.len && (bs[e] & 192) == 128
+                e += 1
+
+            hl_escape_into(&out, code[i..<e])
+            i = e
+
+    out.finish()
+end hl_sysl
+
+// What a word is: a keyword, a type, a function -- a name followed by its arguments -- or nothing in
+// particular, which is answered as the empty string.
+private hl_word_kind(word: string, bs: []const u8, after: usize) -> string
+    if is_reserved(word) || hl_holds(SoftWords, word) then return "keyword"
+    if hl_holds(TypeWords, word) || hl_family(word) then return "type"
+
+    val first = word.bytes[0]
+
+    if first >= u8('A') && first <= u8('Z') then return "type"
+    if after < bs.len && bs[after] == u8('(') then return "function"
+
+    ""
+end hl_word_kind
+
+// Whether a word is one of the open width families -- `i32`, `u8`, `f64`, `q15` -- which no list can
+// hold.
+private hl_family(word: string) -> bool
+    val bs = word.bytes
+
+    if bs.len < 2 then return false
+
+    val head = bs[0]
+
+    if head != u8('i') && head != u8('u') && head != u8('f') && head != u8('q') then return false
+
+    for k in 1..<bs.len
+        if !bs[k].is_digit() then return false
+
+    true
+end hl_family
+
+private hl_holds(words: []const string, w: string) -> bool
+    for x in words
+        if x == w then return true
+
+    false
+end hl_holds
+
+private hl_word_byte(b: u8) -> bool = b.is_alpha() || b == u8('_') || b >= 128 || b == u8('`')
+
+private hl_punct_byte(b: u8) -> bool =
+    b.is_punct() && b != u8('"') && b != u8('\'') && b != u8('_') && b != u8('`')
+
+private hl_comment_opens(bs: []const u8, at: usize) -> bool =
+    bs[at] == u8('/') && at + 1 < bs.len && (bs[at + 1] == u8('/') || bs[at + 1] == u8('*'))
+
+// Where the line holding `at` ends: the offset of its newline, or the end of the text.
+private hl_line_end(bs: []const u8, at: usize) -> usize
+    var e = at
+
+    while e < bs.len && bs[e] != u8('\n')
+        e += 1
+
+    e
+end hl_line_end
+
+// Just past the first `close` at or after `from`, or the end of the text where there is none -- a
+// comment or a string a fragment leaves open runs to the end of the block.
+private hl_after(code: string, close: string, from: usize) -> usize
+    if from >= code.bytes.len then return code.bytes.len
+
+    code.index_of_from(close, from) match
+        Some(at) -> at + close.bytes.len
+        None -> code.bytes.len
+end hl_after
+
+// The length of a triple-quoted string's opening at `at` (`"""`, `raw"""`, `s"""`), or 0.
+private hl_triple_at(code: string, at: usize) -> usize
+    for open in ["\"\"\"", "raw\"\"\"", "s\"\"\""]
+        if hl_starts_at(code, at, open) && hl_word_start(code.bytes, at) then return open.bytes.len
+
+    0
+end hl_triple_at
+
+// The length of a one-line string's opening at `at` (`"`, `s"`, `raw"`), or 0.
+private hl_quote_at(code: string, at: usize) -> usize
+    for open in ["\"", "s\"", "raw\""]
+        if hl_starts_at(code, at, open) && hl_word_start(code.bytes, at) then return open.bytes.len
+
+    0
+end hl_quote_at
+
+// Whether `at` is not in the middle of a word, which is what keeps the `s` ending a name from being
+// read as a string's prefix.
+private hl_word_start(bs: []const u8, at: usize) -> bool =
+    at == 0 || !(hl_word_byte(bs[at - 1]) || bs[at - 1].is_digit())
+
+private hl_starts_at(code: string, at: usize, part: string) -> bool
+    val bs = code.bytes
+    val ps = part.bytes
+
+    if at + ps.len > bs.len then return false
+
+    for k in 0..<ps.len
+        if bs[at + k] != ps[k] then return false
+
+    true
+end hl_starts_at
+
+// Just past the quote closing a one-line string whose text starts at `from`, stepping over a
+// backslash's escape; a string the line does not close ends with it.
+private hl_string_end(bs: []const u8, from: usize) -> usize
+    var e = from
+
+    while e < bs.len && bs[e] != u8('\n')
+        if bs[e] == u8('\\') && e + 1 < bs.len && bs[e + 1] != u8('\n')
+            e += 2
+        elif bs[e] == u8('"')
+            return e + 1
+        else
+            e += 1
+
+    e
+end hl_string_end
+
+// Just past a character literal opened at `at`, or `at` itself where what follows is not one.
+private hl_char_end(bs: []const u8, at: usize) -> usize
+    var e = at + 1
+
+    if e < bs.len && bs[e] == u8('\\')
+        e += 2
+    else
+        e += 1
+
+        while e < bs.len && (bs[e] & 192) == 128
+            e += 1
+
+    loop
+        if e >= bs.len || e > at + 12 || bs[e] == u8('\n') then return at
+        if bs[e] == u8('\'') then return e + 1
+
+        e += 1
+end hl_char_end
+
+// Just past a number: its digits, letters (a base, an exponent, a suffix), underscores, and a point
+// that is not the start of a range.
+private hl_number_end(bs: []const u8, at: usize) -> usize
+    var e = at
+
+    while e < bs.len
+        val c = bs[e]
+
+        if c.is_alnum() || c == u8('_')
+            e += 1
+        elif c == u8('.') && e + 1 < bs.len && bs[e + 1].is_digit()
+            e += 1
+        else
+            break
+
+    e
+end hl_number_end
+
+// One piece of code wrapped in its class.
+private hl_span(out: *StrBuilder, kind: string, text: string)
+    out.push(s"<span class=\"hl-$kind\">")
+    hl_escape_into(out, text)
+    out.push("</span>")
+end hl_span
+
+// Text made safe to put in markup: the five characters HTML gives a meaning, and nothing else.
+hl_escape_into(out: *StrBuilder, text: string)
+    for b in text.bytes
+        if b == u8('&')
+            out.push("&amp;")
+        elif b == u8('<')
+            out.push("&lt;")
+        elif b == u8('>')
+            out.push("&gt;")
+        elif b == u8('"')
+            out.push("&quot;")
+        elif b == u8('\'')
+            out.push("&#39;")
+        else
+            out.bytes.push(b)
+end hl_escape_into
+
+hl_escape(text: string) -> string
+    var out = str_builder()
+
+    hl_escape_into(&out, text)
+    out.finish()
+end hl_escape

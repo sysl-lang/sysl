@@ -133,11 +133,12 @@ ask for each half by name:
   should not have been, or a fence that swallowed a function, otherwise leaves unanswerable.
 - **`sysl weave`** renders the document as HTML. A `.lsysl` file is already Markdown, so the one
   thing a renderer would otherwise lose is the highlighting: an indented block carries no language,
-  so nothing can colour it and nothing scanning for the code can find it. `weave` tells the renderer
-  that an indented block is sysl and passes the source through verbatim.
+  so nothing can colour it and nothing scanning for the code can find it. `weave` sets exactly the
+  lines the compiler reads as program text as sysl code and renders the rest as the Markdown it is.
 
-*Neither command is in this compiler yet — each answers "is not a command this compiler can carry
-out yet". A build still tangles a `.lsysl` file, which is how one compiles.*
+**Both read the file the way a build does**, so a file the compiler refuses — a tab in an indent, a
+fence that is never closed — is refused by either command with the same diagnostic, and the program
+`tangle` prints is the program a build compiles.
 
 Both are covered under the [CLI](/getting-started/cli/). Weaving asks for no target, no standard
 module and no library, which is what makes a package's prose worth reading on a machine that could
