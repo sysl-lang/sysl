@@ -25,26 +25,74 @@ module sysl.container
  * every index calculation here assumes -- there is no `%` anywhere below, and a growth path that
  * produced a non-power-of-two length would break all of them at once rather than visibly.
  *
+ * **A `Deque` is a reference to its ring, not the ring.** Assigning one, passing it, capturing it in a
+ * closure or reading it out of another container gives a second name for the same deque: a
+ * `push_front` through either is seen by both, a growth included. A destructor behind an element runs
+ * when the element is taken out, or when the last name for the deque goes.
+ *
  * The bounds-checked members panic rather than answering an `Option`, which is the bargain `Buf`
  * makes for the same reason: an index past the end is a mistake in the program. `pop_front` and
  * `pop_back` answer an `Option`, because taking from an empty sequence is a question a caller asks
  * on purpose.
  */
 struct Deque[T]
-    private elems: []Option[T]
+    private core: &DequeCore[T]
+
+    /** Where the first element sits in the storage. Read-only: the ring is the core's to move. */
+    head -> usize = self.core.head
+
+    /** How many elements there are -- `len()` under the name the field had. */
+    count -> usize = self.core.count
+
+    len(self) -> usize = self.core.count
+
+    cap(self) -> usize = self.core.elems.len
+
+    is_empty(self) -> bool = self.core.count == 0
+
+    @inline
+    at(self, i: usize) -> T = self.core.at(i)
+
+    set(*self, i: usize, v: T) = self.core.set(i, v)
+
+    first(self) -> Option[T] = self.core.first()
+
+    last(self) -> Option[T] = self.core.last()
+
+    @inline
+    push_back(*self, v: T) = self.core.push_back(v)
+
+    /** The end `Buf` has no answer for at all. */
+    @inline
+    push_front(*self, v: T) = self.core.push_front(v)
+
+    @inline
+    pop_front(*self) -> Option[T] = self.core.pop_front()
+
+    @inline
+    pop_back(*self) -> Option[T] = self.core.pop_back()
+
+    /** The elements dropped and the head put back at the start. The storage is kept, which is what
+     * makes a deque reused across passes of a loop allocate once rather than once per pass.
+     */
+    clear(*self) = self.core.clear()
+
+    walk(self) -> DequeCursor[T] = DequeCursor(self.core.elems, self.core.head, self.core.count, 0)
+end Deque
+
+/** The ring itself, which every `Deque` naming it shares. Everything that moves the head, the count
+ * or the storage lives here, so a push through one handle -- a growth included -- is what every other
+ * handle reads next.
+ */
+private[container] struct DequeCore[T]
+    elems: []Option[T]
     head: usize
     count: usize
-
-    len(self) -> usize = self.count
-
-    cap(self) -> usize = self.elems.len
-
-    is_empty(self) -> bool = self.count == 0
 
     /** Where the `i`th element from the front actually lives. Every accessor goes through this, which
      * is what keeps the wrapping in one place instead of at each end.
      */
-    private seat(self, i: usize) -> usize = (self.head + i) & (self.elems.len - 1)
+    seat(self, i: usize) -> usize = (self.head + i) & (self.elems.len - 1)
 
     at(self, i: usize) -> T
         if i >= self.count
@@ -65,9 +113,12 @@ struct Deque[T]
     last(self) -> Option[T] = if self.count == 0 then None else self.elems[self.seat(self.count - 1)]
 
     /** Storage twice the size with the elements laid down **unwrapped**, so the new ring starts at
-     * zero and the head is back at the beginning. Every slot of the new storage starts as `None`.
+     * zero and the head is back at the beginning. Every slot of the new storage starts as `None`. The
+     * rare half of both pushes, kept out of line so a push that has room is a store and a count.
      */
-    private grow(*self)
+    @noinline
+    @cold
+    grow(*self)
         val bigger_len = if self.elems.len == 0 then 8usize else self.elems.len * 2
         var bigger: []Option[T] = [None; bigger_len]
 
@@ -78,6 +129,7 @@ struct Deque[T]
         self.head = 0
     end grow
 
+    @inline
     push_back(*self, v: T)
         if self.count == self.elems.len then self.grow()
 
@@ -87,10 +139,11 @@ struct Deque[T]
         self.count += 1
     end push_back
 
-    /** The end `Buf` has no answer for at all. `head` steps backwards by adding the storage length
-     * before subtracting one, so that the arithmetic never goes below zero on the way -- a `usize`
-     * that wraps would name a slot at the far end of memory rather than the far end of the ring.
+    /** `head` steps backwards by adding the storage length before subtracting one, so that the
+     * arithmetic never goes below zero on the way -- a `usize` that wraps would name a slot at the far
+     * end of memory rather than the far end of the ring.
      */
+    @inline
     push_front(*self, v: T)
         if self.count == self.elems.len then self.grow()
 
@@ -122,9 +175,6 @@ struct Deque[T]
         v
     end pop_back
 
-    /** The elements dropped and the head put back at the start. The storage is kept, which is what
-     * makes a deque reused across passes of a loop allocate once rather than once per pass.
-     */
     clear(*self)
         for i in 0..<self.count
             self.elems[self.seat(i)] = None
@@ -132,9 +182,7 @@ struct Deque[T]
         self.head = 0
         self.count = 0
     end clear
-
-    walk(self) -> DequeCursor[T] = DequeCursor(self.elems, self.head, self.count, 0)
-end Deque
+end DequeCore
 
 /** Subscripting reaches the bounds-checked members rather than the storage, so `d[i]` counts from the
  * **front** of the deque and cannot read a slot the ring is not currently using.
@@ -145,10 +193,7 @@ impl[T] Index[usize, T] for Deque[T]
 impl[T] IndexSet[usize, T] for Deque[T]
     index_set(*self, i: usize, v: T) = self.set(i, v)
 
-deque[T]() -> Deque[T]
-    var d: Deque[T] = Deque([], 0, 0)
-
-    d
+deque[T]() -> Deque[T] = Deque(DequeCore([], 0, 0))
 
 /** A deque with room for `n` elements already under it. Every slot starts as `None`, so `fill` is
  * not stored anywhere; the parameter stays because callers write it, and because it is what lets a
@@ -164,9 +209,8 @@ deque_with_capacity[T](n: usize, fill: T) -> Deque[T]
         want *= 2
 
     val slots: []Option[T] = [None; want]
-    var d: Deque[T] = Deque(slots, 0, 0)
 
-    d
+    Deque(DequeCore(slots, 0, 0))
 end deque_with_capacity
 
 // ------------------------------------------------------------------------------------- walking

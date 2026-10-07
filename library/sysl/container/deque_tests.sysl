@@ -291,3 +291,122 @@ deque_clear_lets_go()
     assert(w.get().is_none())
     assert_eq(d.len(), 0)
 end deque_clear_lets_go
+
+// -------------------------------------------------------------------------- a deque is a reference
+
+/** A `Deque` is a name for a ring rather than the ring, so every way of making a second name -- an
+ * assignment, a parameter, a capture, a read out of another container, a copied struct -- reaches the
+ * same elements. Each test pushes through the second name and reads through the first.
+ */
+@test("a deque assigned is the same deque: push_front through the copy is seen by the original")
+deque_assignment_shares()
+    var a: Deque[int] = deque()
+
+    a.push_back(1)
+
+    var b = a
+
+    b.push_front(0)
+    b.push_back(2)
+
+    assert_eq(a.len(), 3)
+    assert_eq(b.len(), 3)
+    assert_eq(a.first(), Some(0))
+    assert_eq(a.at(2), 2)
+
+    a.pop_front()
+
+    assert_eq(b.first(), Some(1))
+end deque_assignment_shares
+
+private deque_push_nine(d: Deque[int]) = d.push_front(9)
+
+@test("a deque passed by value is the caller's deque")
+deque_parameter_shares()
+    var d: Deque[int] = deque()
+
+    d.push_back(1)
+    deque_push_nine(d)
+
+    assert_eq(d.len(), 2)
+    assert_eq(d.first(), Some(9))
+
+@test("a deque captured by a closure is the deque outside it")
+deque_capture_shares()
+    var d: Deque[int] = deque()
+    val add = (x: int) -> d.push_back(x)
+
+    add(3)
+    add(4)
+
+    assert_eq(d.len(), 2)
+    assert_eq(d.last(), Some(4))
+
+@test("a deque read out of another deque is the one inside it")
+deque_nested_push_sticks()
+    var outer: Deque[Deque[int]] = deque()
+
+    outer.push_back(deque())
+
+    var inner = outer.at(0)
+
+    inner.push_back(5)
+
+    assert_eq(outer.at(0).len(), 1)
+    assert_eq(outer.at(0).first(), Some(5))
+
+struct DequeHolder
+    items: Deque[int]
+
+@test("a struct holding a deque, copied, holds the same deque")
+deque_in_a_copied_struct_shares()
+    var s1 = DequeHolder(deque())
+    var s2 = s1
+
+    s2.items.push_front(7)
+
+    assert_eq(s1.items.len(), 1)
+    assert_eq(s1.items.first(), Some(7))
+
+@test("growth through one name is seen through the other")
+deque_growth_is_shared()
+    var a: Deque[int] = deque()
+    var b = a
+
+    for i in 0..<20
+        b.push_front(i)
+
+    assert_eq(a.cap(), 32)
+    assert_eq(a.len(), 20)
+    assert_eq(a.first(), Some(19))
+    assert_eq(a.last(), Some(0))
+    assert_eq(a[10], 9)
+
+    var total = 0
+
+    for x in a.walk()
+        total += x
+
+    assert_eq(total, 190)
+end deque_growth_is_shared
+
+@test("an element's destructor waits for the last name for the deque")
+deque_last_name_lets_go()
+    var p: &DequeProbe = DequeProbe(1)
+    val w: weak DequeProbe = p
+    var a: Deque[&DequeProbe] = deque()
+
+    a.push_back(p)
+    p = DequeProbe(2)
+
+    var b = a
+
+    a = deque()
+
+    assert(w.get().is_some())
+    assert_eq(b.len(), 1)
+
+    b = deque()
+
+    assert(w.get().is_none())
+end deque_last_name_lets_go
