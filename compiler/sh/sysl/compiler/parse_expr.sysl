@@ -352,8 +352,15 @@ private nud_word(p: *Parser, at: Span, w: string) -> Expr
 
             return expr(at.to(p.just_taken()), PreIncDec(u, operand))
 
-    if w == "(" then return parse_paren_tail(p, at)
-    if w == "[" then return parse_array_literal(p, at)
+    if w == "(" || w == "["
+        p.nest += 1
+
+        val inner = if w == "(" then parse_paren_tail(p, at) else parse_array_literal(p, at)
+
+        p.nest -= 1
+        return inner
+    end if
+
     if w == "." then return parse_implicit_member(p, at)
     // **A control-flow form is an expression only where an expression begins** -- at the top of one,
     // on an assignment's right, or inside brackets. `1 + if c then 2 else 3` is refused where it
@@ -564,7 +571,7 @@ private led(lhs: Expr, t: Spanned[Tok], p: *Parser) -> Expr
 
     t.value match
         Ident(n) ->
-            if n == "is" then led_is(lhs, p) else led_with(lhs, at, p)
+            if n == "is" then led_is(lhs, p) else with_nested(lhs, at, p)
         Keyword(w) -> led_word(lhs, at, w, p)
         _ -> lhs
 end led
@@ -595,8 +602,15 @@ private led_word(lhs: Expr, at: Span, w: string, p: *Parser) -> Expr
 
     if is_compare_op(w) then return led_compare(lhs, w, p)
     if w == ".." || w == "..<" then return led_range(lhs, at, w == "..", p)
-    if w == "(" then return led_call(lhs, p)
-    if w == "[" then return led_index(lhs, at, p)
+    if w == "(" || w == "["
+        p.nest += 1
+
+        val inner = if w == "(" then led_call(lhs, p) else led_index(lhs, at, p)
+
+        p.nest -= 1
+        return inner
+    end if
+
     if w == "." then return led_field(lhs, p)
     if w == "::" then return led_type_attr(lhs, p)
     if w == "?" then return expr(from.to(at), TryExpr(lhs))
@@ -835,6 +849,15 @@ end led_is
 
 // `base with { bg = ACCENT }` -- a tail rather than a binary operator, so it binds as tightly as a
 // field selection and `a + b with { ... }` changes `b` rather than the sum.
+// The braces of a `with` are a bracket like any other, so a comma in them is theirs.
+private with_nested(lhs: Expr, at: Span, p: *Parser) -> Expr
+    p.nest += 1
+
+    val inner = led_with(lhs, at, p)
+
+    p.nest -= 1
+    inner
+
 private led_with(lhs: Expr, at: Span, p: *Parser) -> Expr
     var fields: Buf[WithField] = buf()
 
@@ -886,6 +909,11 @@ parse_match_arms(p: *Parser) -> Buf[MatchArm]
     p.skip_newlines()
     p.depth += 1
 
+    // The arms are lines of their own, so a bracket the `match` sits in is not theirs.
+    val outer = p.nest
+
+    p.nest = 0
+
     loop
         if p.at(Dedent) || p.at(Eof) then break
 
@@ -897,6 +925,7 @@ parse_match_arms(p: *Parser) -> Buf[MatchArm]
 
         p.skip_newlines()
 
+    p.nest = outer
     p.depth -= 1
 
     if !p.accept(Dedent) then p.want("dedent")
