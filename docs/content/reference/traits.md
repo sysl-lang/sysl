@@ -121,6 +121,58 @@ check rather than a formality — a property and an associated function both hav
 compare, so `size(self) -> int` would otherwise quietly stand in for `size -> int`. A **static**
 property is a third member with no receiver, and the word is what tells it from the other two.
 
+**An implementation may take by value what the trait takes by address.** A trait's `*self` says what
+every caller has to be able to hand over — an address, so a generic body or a table may let the
+member write through it — and an implementation that needs less may ask for less: written `self`,
+the call hands it a copy of the receiver instead, and a `val` will do. It is what a **handle** wants,
+a type whose fields share their storage, since a copy of it writes the one thing the original names:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+trait Bump
+    bump(*self)
+
+struct Tally
+    b: Buf[int]
+
+impl Bump for Tally
+    bump(self) = self.b.push(1)
+
+val t = Tally(buf())
+
+t.bump()
+t.bump()
+
+print(t.b.len())
+```
+
+```output
+2
+```
+
+That is how `b[i] = x` works on a `val` holding a [`Buf`](/library/buf/): `IndexSet` declares
+`index_set(*self, …)` and the `Buf`'s implementation takes `self`. A generic body is read again at
+each instantiation, so a call there is held to the receiver of the implementation it reaches; a
+table slot for such a member points at an adapter that loads the value. **Every other receiver has
+to match**, the converse included — an implementation that wants an address where the trait promised
+only a value would be asking for something no caller agreed to give:
+
+```sysl
+trait Show
+    show(self)
+
+struct P
+    v: int
+
+impl Show for P
+    show(*self) = print(self.v)
+```
+
+```error
+method 'show' of 'impl Show for P' takes a different receiver than the trait declares
+```
+
 **`Self` is the implementing type**, written wherever a signature has to name it. Inside a generic
 `impl` it is the subject applied to that block's parameters, so `-> Self` and `-> Box[T]` are the one
 signature conformance compares.

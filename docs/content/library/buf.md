@@ -183,13 +183,33 @@ impl[T] Index[usize, T] for Buf[T]
     index(self, i: usize) -> T = self.at(i)
 
 impl[T] IndexSet[usize, T] for Buf[T]
-    index_set(*self, i: usize, v: T) = self.set(i, v)
+    index_set(self, i: usize, v: T) = self.set(i, v)
 ```
 
 `b[i]` on a `Buf` means `b.at(i)`, and that is worth more than the syntax. The backing slice is
 longer than the count — subscripting the *storage* would happily read a slot the buffer does not
 consider live, and every bounds check in the language would pass. Routing `[]` through `at` is what
 makes `b[i]` unable to see spare capacity.
+
+**`index_set` takes `self`, where the trait declares `*self`**, which an implementation may do
+([traits](/reference/traits/)): a `Buf` is a handle, so a copy of one writes the buffer the original
+names, and `b[i] = x` works on a `val` as `b(i) = x` does on a Scala `val ArrayBuffer`:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+val b: Buf[int] = buf()
+val c = b
+
+b.push(1)
+b[0] = 5
+
+print(c[0])
+```
+
+```output
+5
+```
 
 The cost is that reading through [`Index`](/library/core/) is a **call**, so it yields a value rather
 than a place:

@@ -1,0 +1,245 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **An implementation may take `self` where its trait takes `*self`.** The trait's `*self` says what a
+// generic caller has to be able to hand over -- an address -- and an implementation that wants less
+// may ask for less: the call hands it a copy of the receiver instead. That is what lets `b[i] = x`
+// work on a `val` holding a `Buf` or a `Deque`, whose `index_set` takes `self` because the value is a
+// handle and a copy of it writes the one container. A value type keeps `*self`, so a `val` of one
+// still refuses the store. The rule is general, so it is asserted for an ordinary trait as well,
+// through a type parameter (whose body is read per instantiation, so the implementation reached
+// decides), and through a trait object, whose table slot points at an adapter that loads the value
+// rather than at the body itself.
+
+// What a program said, and whether it exited zero — a refusal is the build's failure text.
+private ixv_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-ixv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", "import sysl.buf.*\nimport sysl.container.*\n\n" + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture("/bin/sh", ["-c", s"'$exe' < /dev/null"], "", [], true, 60000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end ixv_outcome
+
+private ixv_can_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end ixv_can_run
+
+private ixv_ran(text: string) -> string
+    val out = ixv_outcome(text)
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+
+private ixv_refused(text: string, part: string)
+    val out = ixv_outcome(text)
+
+    assert(!out.1, s"it built and ran: ${out.0}")
+    assert(out.0.contains(part), out.0)
+
+// A trait whose one member takes `*self`, and a type that is a handle: its one field is a `Buf`, so a
+// copy of it pushes into the buffer the original holds.
+private ixv_tally() -> string = raw"""
+    trait Bump
+        bump(*self)
+    struct Tally
+        b: Buf[int]
+    impl Bump for Tally
+        bump(self) = self.b.push(1)
+    """
+
+@test("a val Buf is written with a subscript, and the write is seen through a second name")
+ixv_a_val_buf_is_written()
+    if !ixv_can_run() then return
+
+    assert_eq(ixv_ran(raw"""
+        val b: Buf[int] = buf()
+        b.push(1)
+        val c = b
+        b[0] = 5
+        print(c[0])
+        """), "5\n")
+
+@test("a Buf parameter taken by value is written with a subscript, and the caller sees it")
+ixv_a_by_value_parameter_is_written()
+    if !ixv_can_run() then return
+
+    assert_eq(ixv_ran(raw"""
+        f(b: Buf[int])
+            b[0] = 9
+
+        val b: Buf[int] = buf()
+        b.push(1)
+        f(b)
+        print(b[0])
+        """), "9\n")
+
+@test("a val Deque is written with a subscript, and the write is seen through a second name")
+ixv_a_val_deque_is_written()
+    if !ixv_can_run() then return
+
+    assert_eq(ixv_ran(raw"""
+        val d: Deque[int] = deque()
+        d.push_back(1)
+        d.push_back(2)
+        val e = d
+        d[1] = 7
+        print(e[0], e[1])
+        """), "1 7\n")
+
+@test("a Deque parameter taken by value is written with a subscript, and the caller sees it")
+ixv_a_by_value_deque_parameter_is_written()
+    if !ixv_can_run() then return
+
+    assert_eq(ixv_ran(raw"""
+        f(d: Deque[int])
+            d[0] = 4
+
+        val d: Deque[int] = deque()
+        d.push_back(1)
+        f(d)
+        print(d[0])
+        """), "4\n")
+
+@test("a value type whose index_set takes *self still refuses a store through a val")
+ixv_a_value_type_keeps_star_self()
+    if !ixv_can_run() then return
+
+    ixv_refused(raw"""
+        struct Cell
+            v: int
+        impl IndexSet[usize, int] for Cell
+            index_set(*self, i: usize, x: int)
+                self.v = x
+        val c = Cell(1)
+        c[0] = 5
+        print(c.v)
+        """, "'index_set' takes '*self', so it writes through what it is called on, and a 'val' is " +
+            "written once — write 'var c' if it is meant to change")
+
+@test("an ordinary trait's *self member may be implemented with self, and is callable on a val")
+ixv_an_ordinary_member_may_take_self()
+    if !ixv_can_run() then return
+
+    assert_eq(ixv_ran(ixv_tally() + raw"""
+        val t = Tally(buf())
+        t.bump()
+        t.bump()
+        print(t.b.len())
+        """), "2\n")
+
+@test("a call through a type parameter reaches the implementation that takes self")
+ixv_through_a_type_parameter()
+    if !ixv_can_run() then return
+
+    assert_eq(ixv_ran(ixv_tally() + raw"""
+        twice[T: Bump](t: *T)
+            t.bump()
+            t.bump()
+
+        var t = Tally(buf())
+        twice(&t)
+        print(t.b.len())
+        """), "2\n")
+
+// A generic body is read again at each instantiation, so what a receiver may be is settled by the
+// implementation the instantiation reaches: a `val` serves one that takes `self`, and is refused for
+// one that takes `*self`.
+@test("a generic body's val receiver serves an implementation taking self")
+ixv_a_generic_body_reaches_the_self_implementation()
+    if !ixv_can_run() then return
+
+    assert_eq(ixv_ran(ixv_tally() + raw"""
+        once[T: Bump](t: T)
+            val u = t
+            u.bump()
+
+        val b: Buf[int] = buf()
+        once(Tally(b))
+        print(b.len())
+        """), "1\n")
+
+@test("and is refused where the instantiation reaches one taking *self")
+ixv_a_generic_body_reaching_star_self_is_refused()
+    if !ixv_can_run() then return
+
+    ixv_refused(raw"""
+        trait Bump
+            bump(*self)
+        struct N
+            n: int
+        impl Bump for N
+            bump(*self)
+                self.n += 1
+        once[T: Bump](t: T)
+            val u = t
+            u.bump()
+
+        once(N(0))
+        """, "'bump' takes '*self', so it writes through what it is called on, and a 'val' is " +
+            "written once — write 'var u' if it is meant to change")
+
+@test("a raw trait object's slot loads the value for an implementation that takes self")
+ixv_through_a_raw_object()
+    if !ixv_can_run() then return
+
+    assert_eq(ixv_ran(ixv_tally() + raw"""
+        var t = Tally(buf())
+        val o: *Bump = &t
+        o.bump()
+        o.bump()
+        o.bump()
+        print(t.b.len())
+        """), "3\n")
+
+@test("and a counted one's slot steps over the box and loads the value")
+ixv_through_a_counted_object()
+    if !ixv_can_run() then return
+
+    assert_eq(ixv_ran(ixv_tally() + raw"""
+        val b: Buf[int] = buf()
+        val o: &Bump = Tally(b)
+        o.bump()
+        print(b.len())
+        """), "1\n")
+
+@test("the converse stays refused: a trait's self is not implemented with *self")
+ixv_the_converse_is_refused()
+    if !ixv_can_run() then return
+
+    ixv_refused(raw"""
+        trait Show
+            show(self)
+        struct P
+            v: int
+        impl Show for P
+            show(*self) = print(self.v)
+        P(1).show()
+        """, "method 'show' of 'impl Show for P' takes a different receiver than the trait declares")
