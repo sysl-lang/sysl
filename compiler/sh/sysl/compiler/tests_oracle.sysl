@@ -528,12 +528,19 @@ end first_difference
 // -- every file of the three corpora ---------------------------------------------------------
 
 // What a sweep found: how many files it compared, and the first file the two disagreed about.
+//
+// `excused` counts the inputs `scripts/self_hosted_only.tsv` excused (`self_hosted_feature`), and
+// `excused_blocks` names each one with its feature, a line apiece, for the summary.
 struct Agreement
     files: usize
     mismatches: usize
     first_bad: string
+    excused: usize
+    excused_blocks: string
 end Agreement
 
+// The corpora are this compiler's own sources, the library and `parsing`, which the reference has to
+// read as they stand -- so nothing is excused there, and the list handed over is empty.
 private sweep_against(binary: string, root: string, found: *Agreement)
     for item in walk(root)
         item match
@@ -542,15 +549,41 @@ private sweep_against(binary: string, root: string, found: *Agreement)
                 if is_sysl_source(entry.path)
                     read_text(entry.path) match
                         Err(_) -> ()
-                        Ok(text) -> compare_one(binary, entry.path, entry.path, text, found)
+                        Ok(text) -> compare_one(binary, entry.path, entry.path, text, buf(), found)
 end sweep_against
 
 private compare_one(binary: string, path: string, label: string, text: string,
-                    found: *Agreement)
-    val ours = ask_ourselves(path, text)
-    val theirs = ask_oracle(binary, path)
+                    listed: Buf[OnlyHere], found: *Agreement)
+    judge(label, text, ask_ourselves(path, text), ask_oracle(binary, path), listed, found)
 
+// The verdict on one input, given both compilers' answers.
+//
+// **A block the reference refuses is excused only where it is written in a feature that exists here
+// alone** -- the reference cannot parse what it was never taught, and that is the approved design
+// rather than a disagreement. What decides is a construct of `scripts/self_hosted_only.tsv` found
+// among the block's TOKENS, so a reader can check any excuse against the file, and a page edit moving
+// the block changes nothing. Two shapes qualify:
+//
+// 1. this compiler reads the block -- the feature used as designed;
+// 2. this compiler refuses it too, and its refusal QUOTES a word of the construct (`'async'`,
+//    `'const'`) -- a page showing one of the feature's own refusals, which the reference can only
+//    answer with a parse error about some token. A refusal here that is not about the feature (a
+//    block broken in both compilers) is compared as before.
+//
+// Every other disagreement is judged as before.
+private judge(label: string, text: string, ours: Answer, theirs: Answer, listed: Buf[OnlyHere],
+              found: *Agreement)
     found.files += 1
+
+    if !theirs.ok
+        self_hosted_construct(text, listed) match
+            Some(c) ->
+                if ours.ok || quotes_construct(ours.message, c)
+                    found.excused += 1
+                    found.excused_blocks = s"${found.excused_blocks}\n  ${label} (${c.feature})"
+                    return
+            None -> ()
+    end if
 
     if ours.ok != theirs.ok
         found.mismatches += 1
@@ -577,7 +610,100 @@ private compare_one(binary: string, path: string, label: string, text: string,
         found.mismatches += 1
 
         if found.first_bad == "" then found.first_bad = s"${label}: ${where}"
-end compare_one
+end judge
+
+// -- what `scripts/self_hosted_only.tsv` excuses --------------------------------------------------
+
+// One construct a self-hosted-only feature is written with: the feature's name and the run of token
+// words that identifies it (`self_hosted_only.tsv` says what a word matches).
+struct OnlyHere
+    feature: string
+    words: Buf[string]
+
+// The constructs `scripts/self_hosted_only.tsv` lists, read where the suite runs (`compiler/`), so the
+// file is the only place the list is written. No file, or no rows, excuses nothing.
+self_hosted_only() -> Buf[OnlyHere] = self_hosted_only_in("../scripts/self_hosted_only.tsv")
+
+self_hosted_only_in(file: string) -> Buf[OnlyHere]
+    var out: Buf[OnlyHere] = buf()
+
+    val text = read_text(file) match
+        Err(_) -> return out
+        Ok(t) -> t
+
+    val rows = lines_of(text)
+
+    for i in 0..<rows.len()
+        val row = rows.at(i)
+
+        if row == "" || row.starts_with("#") then continue
+
+        val fields = split(row, "\t")
+
+        if fields.len >= 2 && fields[1] != ""
+            var words: Buf[string] = buf()
+
+            for w in split(fields[1], " ")
+                if w != "" then words.push(w)
+
+            out.push(OnlyHere(fields[0], words))
+
+    out
+end self_hosted_only_in
+
+// The construct a block is written in: the first listed one whose words match a run of the block's
+// tokens, read by this compiler's own lexer. A block that does not lex is written in none.
+self_hosted_construct(text: string, listed: Buf[OnlyHere]) -> Option[OnlyHere]
+    val tokens = lex(source_of("block.sysl", text)) match
+        Err(_) -> return None
+        Ok(t) -> t
+
+    for c in 0..<listed.len()
+        val words = listed.at(c).words
+        val n = words.len()
+
+        if n == 0 then continue
+
+        var i: usize = 0
+
+        while i + n <= tokens.len()
+            var all = true
+
+            for k in 0..<n
+                if !token_fits(words.at(k), tokens.at(i + k).value)
+                    all = false
+                    break
+
+            if all then return Some(listed.at(c))
+
+            i += 1
+
+    None
+end self_hosted_construct
+
+// Whether a refusal is about a construct: it quotes one of the construct's WORDS, as `'async'`. An
+// operator is not one (a parse error quotes `'('` about anything), and a class (`<name>`) spells
+// nothing, so a construct of classes alone is never quoted.
+private quotes_construct(message: string, c: OnlyHere) -> bool
+    for k in 0..<c.words.len()
+        val w = c.words.at(k)
+        val word = w.bytes.len > 0 && w.bytes[0] >= u8('a') && w.bytes[0] <= u8('z')
+
+        if word && message.contains(s"'$w'") then return true
+
+    false
+
+// Whether one token is what one word of a construct asks for.
+private token_fits(word: string, t: Tok) -> bool = t match
+    Ident(name) -> word == name || word == "<name>" || (word == "<fixed-type>" && fixed_spelling(name))
+    Keyword(text) -> word == text
+    IntLit(_, _, suffix) -> word == "<fixed-literal>" && fixed_spelling(suffix)
+    FloatLit(_, suffix) -> word == "<fixed-literal>" && fixed_spelling(suffix)
+    _ -> false
+
+// A fixed-point type's spelling: the `iWqF`/`uWqF` shape, or one of the three named ones.
+private fixed_spelling(name: string) -> bool =
+    fixed_suffix(name) || name == "q7" || name == "q15" || name == "q31"
 
 @test("the two compilers build the same tree for every sysl file on this machine")
 the_trees_agree_over_every_corpus()
@@ -586,7 +712,7 @@ the_trees_agree_over_every_corpus()
             print("skipped: SYSL_ORACLE names no reference compiler on this machine")
             return
         Some(binary) ->
-            var found = Agreement(0, 0, "")
+            var found = Agreement(0, 0, "", 0, "")
 
             sweep_against(binary, "sh", &found)
 
@@ -643,7 +769,8 @@ the_two_agree_on_the_reference_pages()
             val dir = make_temp_dir("sysl-oracle").unwrap()
             val scratch = dir + "/block.sysl"
 
-            var found = Agreement(0, 0, "")
+            val listed = self_hosted_only()
+            var found = Agreement(0, 0, "", 0, "")
 
             for item in walk(root)
                 item match
@@ -658,9 +785,15 @@ the_two_agree_on_the_reference_pages()
                                     for i in 0..<blocks.len()
                                         write_text(scratch, blocks.at(i)).unwrap()
                                         compare_one(binary, scratch,
-                                            s"${entry.path} block ${i + 1}", blocks.at(i), &found)
+                                            s"${entry.path} block ${i + 1}", blocks.at(i), listed, &found)
 
             remove_file(scratch)
+
+            val summary = s"reference pages (emit-ast): ${found.files} blocks, " +
+                s"${found.mismatches} differing, ${found.excused} excused by self_hosted_only.tsv"
+
+            print(summary)
+            record_summary(s"$summary${found.excused_blocks}")
 
             assert(found.files >= 500, s"the pages showed the blocks: ${found.files} of them")
             assert_eq(found.first_bad, "")
@@ -2237,6 +2370,120 @@ lpx_a_whole_file_is_excused_only_where_the_rest_agrees()
     val confined2 = patch_confined(theirs2, ours2, lpx_listed())
 
     assert(without_confined(theirs2, confined2) != without_confined(ours2, confined2))
+
+// -- self-hosted-only constructs: what `self_hosted_only.tsv` excuses --------------------------------
+
+// The reference's answer to a block it cannot parse, as 0.0.162 gives it for `const sq(x: int)`.
+private shx_refused() -> Answer = Answer(false, "", "':' expected")
+
+// The verdict on one block whose reference answer is `theirs`, against the repository's own list.
+private shx_judged(text: string, theirs: Answer) -> Agreement
+    var found = Agreement(0, 0, "", 0, "")
+
+    judge("page.md block 1", text, ask_ourselves("block.sysl", text), theirs, self_hosted_only(), &found)
+    found
+
+@test("self-hosted only: a block written in a listed feature the reference refuses is excused, and counted")
+shx_a_listed_feature_is_excused_and_counted()
+    val blocks = ["const sq(x: int) -> int = x * x\n\nprint(sq(7))\n",
+                  "const twice[T: Add](x: T) -> T = x + x\n",
+                  "async double(n: int) -> int = n * 2\n\nprint(block_on(double(3)))\n",
+                  "type Acc = new i8q4 wrapping\n",
+                  "print((0.5i32q31).bits)\n"]
+    val features = ["const functions", "const functions", "async/await", "fixed point", "fixed point"]
+    var all = Agreement(0, 0, "", 0, "")
+
+    for i in 0..<blocks.len
+        val found = shx_judged(blocks[i], shx_refused())
+
+        assert_eq(found.mismatches, 0)
+        assert_eq(found.first_bad, "")
+        assert_eq(found.excused, 1)
+        assert_eq(found.excused_blocks, s"\n  page.md block 1 (${features[i]})")
+
+        judge(s"page.md block ${i + 1}", blocks[i], ask_ourselves("block.sysl", blocks[i]), shx_refused(),
+              self_hosted_only(), &all)
+
+    assert_eq(all.files, 5)
+    assert_eq(all.excused, 5)
+    assert_eq(all.mismatches, 0)
+end shx_a_listed_feature_is_excused_and_counted
+
+@test("self-hosted only: an ordinary block the reference refuses and this one reads is still a failure")
+shx_an_ordinary_block_is_still_a_failure()
+    // The features only named -- in a comment, a string, an ordinary `const` -- are not their constructs.
+    val blocks = ["val x = 1\nprint(x)\n",
+                  "// const sq(x: int) -> int\nval s = \"async go wrapping\"\nprint(s)\n",
+                  "const n: int = 4\nprint(n)\n"]
+
+    for text in blocks
+        val found = shx_judged(text, shx_refused())
+
+        assert_eq(found.excused, 0)
+        assert_eq(found.mismatches, 1)
+        assert_eq(found.first_bad, "page.md block 1: the reference compiler refused it and this one read it")
+
+@test("self-hosted only: a listed construct this compiler refuses too is not excused")
+shx_a_construct_refused_here_is_not_excused()
+    // Refused here for a reason that is not the feature -- the block is broken in both compilers.
+    val text = "const sq(x: int) -> int =\n"
+    val ours = ask_ourselves("block.sysl", text)
+
+    assert(!ours.ok, "this compiler read an unfinished declaration")
+    assert(!ours.message.contains("'const'"), ours.message)
+
+    val found = shx_judged(text, shx_refused())
+
+    assert_eq(found.excused, 0)
+    assert_eq(found.mismatches, 1)
+
+@test("self-hosted only: a page showing a listed feature's own refusal is excused where ours quotes it")
+shx_a_feature_refusal_is_excused()
+    // What the reference says of each is a parse error about a token; ours is about the feature.
+    val blocks = ["struct Adc\n    channel: int\n\n    async reading -> int = self.channel * 100\n",
+                  "async extern \"getpid\" c_pid() -> int\n",
+                  "trait Shape\n    const area(self) -> int\n"]
+
+    for text in blocks
+        val ours = ask_ourselves("block.sysl", text)
+
+        assert(!ours.ok, s"this compiler read [$text]")
+
+        val found = shx_judged(text, Answer(false, "", "newline expected"))
+
+        assert_eq(found.excused, 1)
+        assert_eq(found.mismatches, 0)
+
+@test("self-hosted only: the constructs are read from the file, comments and blank lines aside")
+shx_the_constructs_are_read_from_the_file()
+    val dir = make_temp_dir("sysl-shx").unwrap()
+    val file = dir + "/self_hosted_only.tsv"
+
+    write_text(file, "# <feature>\t<construct>\n\nconst functions\tconst <name> (\nasync/await\t  async   <name>\n").unwrap()
+
+    val listed = self_hosted_only_in(file)
+
+    remove_dir_all(dir).unwrap_or(())
+    assert_eq(listed.len(), 2)
+    assert_eq(listed.at(0).feature, "const functions")
+    assert_eq(listed.at(0).words.len(), 3)
+    assert_eq(listed.at(1).words.len(), 2)
+    assert_eq(listed.at(1).words.at(0), "async")
+    assert(self_hosted_only_in(dir + "/absent.tsv").is_empty())
+    assert(self_hosted_construct("const sq(x: int) -> int = x\n", buf()).is_none())
+
+@test("self-hosted only: the repository's own file lists the three features with a syntax")
+shx_the_repository_file_is_read()
+    val listed = self_hosted_only()
+    var features: Buf[string] = buf()
+
+    for i in 0..<listed.len()
+        if !holds_name(features, listed.at(i).feature) then features.push(listed.at(i).feature)
+
+    assert_eq(features.len(), 3)
+    assert(holds_name(features, "const functions"), "const functions are listed")
+    assert(holds_name(features, "async/await"), "async/await is listed")
+    assert(holds_name(features, "fixed point"), "fixed point is listed")
 
 // -- the reference's source root for this tree ------------------------------------------------------
 
