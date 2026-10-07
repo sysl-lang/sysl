@@ -168,10 +168,12 @@ at three quarters full, so the storage is twice `n`.
 
 A `Set` is a `Map` and inherits all of this, including the empty table and being a reference.
 
-Walking hands back a pair per entry, in no particular order:
+A `for` walks a map directly, a pair per entry, in no particular order. Every container here except
+the heap implements [`Walk`](/library/core/), so `for x in c` walks the cursor `c.walk()` answers —
+asked once, before the first turn:
 
 ```sysl
-for (name, age) in ages.walk()
+for (name, age) in ages
     print(name, age)
 ```
 
@@ -288,7 +290,8 @@ root.
 
 **A heap cannot be walked, on purpose.** Its storage order is not its priority order — only the first
 element is guaranteed to be anything in particular — so a cursor would hand back elements in an order
-that looks meaningful and is not. Draining with `pop` is the only reading that answers truthfully.
+that looks meaningful and is not. Draining with `pop` is the only reading that answers truthfully,
+which is why `Heap` implements no `Walk` and `for x in h` is refused.
 
 ## The immutable list
 
@@ -306,10 +309,10 @@ main()
 
     print(outer.len(), f.len(), g.len())
 
-    for name in f.walk()
+    for name in f
         print("f:", name)
 
-    for name in g.walk()
+    for name in g
         print("g:", name)
 ```
 

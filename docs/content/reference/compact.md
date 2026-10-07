@@ -255,7 +255,7 @@ enclosing module and everything under it. The bracket takes a **simple name, not
 |---|---|
 | `while c` / `do … while c` | test before / after |
 | `loop` | no test; something inside leaves it. **Never write `while true`** |
-| `for x in seq` | a range, an array, a slice, or an `Iterate`; `x` may be a full pattern in parentheses |
+| `for x in seq` | a range, an array, a slice, an `Iterate`, or a `Walk` (a container); `x` may be a full pattern in parentheses |
 | `for init; cond; step` | a stride, a descent, several variables |
 | `for const i in 0..<N` | **unrolled** while compiling — for walking a type pack; no label, no `break`, no `else` |
 
@@ -364,6 +364,7 @@ of a `struct` or `enum`.
 | `Hash` | hashing |
 | `Index`, `IndexSet` | `x[i]` and `x[i] = v` |
 | `Iterate` | what `for x in` walks |
+| `Walk` | how `for x in` walks a container: through what its `walk()` answers |
 | `From` | `T.from(u)`, and what `?` converts an error through |
 | `Drop` | destruction |
 | `Fn0` … `Fn4` | calling a value |

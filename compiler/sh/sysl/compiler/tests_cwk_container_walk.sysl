@@ -1,0 +1,124 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// `for x in c` over a CONTAINER: a type implementing the library's `sysl.Walk` is walked through what
+// its `walk` answers, asked once before the first turn (`expr_flow.sysl`'s `walked_through`). A `Buf`
+// answers its view, so it is walked by index as a slice is; `Deque`, `Map`, `Set` and `List` answer
+// their cursors. The harness is `tests_enm_enum_run.sysl`'s.
+
+@test("a 'Buf' is walked directly, and an empty one not at all")
+cwk_a_buf_is_walked()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.*
+        var b: Buf[int] = buf()
+        b.push(3)
+        b.push(4)
+        var t = 0
+        for x in b do t += x
+        val e: Buf[int] = buf()
+        var n = 0
+        for x in e do n += 1
+        print(t, n)
+        """), "7 0\n")
+
+@test("a 'Buf' grown during the walk is walked as it was when the loop began")
+cwk_a_buf_grown_during_the_walk()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.*
+        var b: Buf[int] = buf()
+        b.push(1)
+        b.push(2)
+        for x in b do b.push(x * 10)
+        print(b)
+        """), "[1, 2, 10, 20]\n")
+
+@test("a 'Map' is walked as the pairs its cursor yields, and a pattern takes them apart")
+cwk_a_map_yields_pairs()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.container.*
+        val m: Map[string, int] = map()
+        m.put("a", 1)
+        m.put("b", 2)
+        var t = 0
+        for (_, v) in m do t += v
+        var keys: usize = 0
+        for e in m do keys += e.0.bytes.len
+        print(t, keys)
+        """), "3 2\n")
+
+@test("a 'Deque', a 'Set' and a 'List' are walked through their cursors")
+cwk_the_cursor_containers()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.container.*
+        val d: Deque[int] = deque()
+        d.push_back(2)
+        d.push_front(1)
+        for x in d do print(x)
+        val s = set_of([5, 5, 6])
+        var t = 0
+        for k in s do t += k
+        print(t)
+        for x in list_of([7, 8]) do print(x)
+        """), "1\n2\n11\n7\n8\n")
+
+@test("a type of the program's own that implements 'Walk' is walked through it, break value and all")
+cwk_a_walk_of_the_programs_own()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Bag
+            xs: []int
+        end Bag
+        impl Walk for Bag
+            type Walker = []int
+            walk(self) -> []int = self.xs
+        val found = for x in Bag([1, 4, 9])
+            if x > 3 then break x
+        else 0
+        print(found)
+        """), "4\n")
+
+@test("a cursor that implements 'Walk' too is still walked by 'next'")
+cwk_a_cursor_is_not_rerouted()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Two
+            at: int
+        end Two
+        impl Iterate for Two
+            type Item = int
+            next(*self) -> Option[int]
+                if self.at >= 2 then return None
+                self.at += 1
+                Some(self.at)
+            end next
+        impl Walk for Two
+            type Walker = []int
+            walk(self) -> []int = [100]
+        for x in Two(0) do print(x)
+        """), "1\n2\n")
+
+@test("a 'Heap' implements no 'Walk' and is refused, its order not being its storage's")
+cwk_a_heap_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        import sysl.container.*
+        val h: Heap[int] = heap()
+        for x in h do print(x)
+        """).0
+
+    assert(said.contains("error: 'for' iterates an integer range, an array, a slice, or a type " +
+                         "that implements 'sysl.Iterate', and sysl.container.Heap[int] is none of " +
+                         "those\n"), said)
