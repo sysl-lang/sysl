@@ -266,7 +266,7 @@ build_stage1() {
     # The gate's form: `SYSL_LIB` unset, so the seed finds the library beside itself. Only a library
     # named outright (`SYSL_RELEASE_SEED_LIB`, a seed with none beside it) is handed over.
     local lib_env=(-u SYSL_LIB)
-    [[ -n $SYSL_RELEASE_SEED_LIB ]] && lib_env=(SYSL_LIB=$seed_lib)
+    [[ -n ${SYSL_RELEASE_SEED_LIB:-} ]] && lib_env=(SYSL_LIB=$seed_lib)
     heavy $proj env $lib_env $seed build . $lib_args $opt -o $out/stage1
 }
 
