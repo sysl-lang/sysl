@@ -1,0 +1,296 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.env.{get as env_var}
+
+// The edges a run-time check or an integer's width puts in a program, run -- the reference's
+// `TrapEdgeRunTests`, `IntegerEdgeRunTests` and `StringEdgeRunTests`. Each trap is paired with the
+// adjacent valid case that must *not* trap, so an off-by-one in a bounds check is caught in both
+// directions. The building and running are `tests_rng_impl_composed_run.sysl`'s.
+
+// ---- array index ----
+
+@test("the last valid index reads")
+rng_edge_the_last_valid_index_reads()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var a = [10, 20, 30]
+        print(a[2])
+        """, "30\n")
+
+@test("one past the end traps")
+rng_edge_one_past_the_end_traps()
+    if !rng_ready() then return
+
+    rng_traps(raw"""
+        var a = [10, 20, 30]
+        print(a[3])
+        """)
+
+@test("a negative index traps rather than wrapping to a huge one")
+rng_edge_a_negative_index_traps()
+    if !rng_ready() then return
+
+    rng_traps(raw"""
+        var a = [10, 20, 30]
+        var i: int = -1
+        print(a[i])
+        """)
+
+// ---- slice range ----
+
+@test("an inclusive high at the last element reads")
+rng_edge_an_inclusive_high_at_the_last_reads()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var b: &[4]int = [1, 2, 3, 4]
+        var s = b[0..3]
+        print(s.len, s[3])
+        """, "4 4\n")
+
+@test("an inclusive high one past the last traps")
+rng_edge_an_inclusive_high_past_the_last_traps()
+    if !rng_ready() then return
+
+    rng_traps(raw"""
+        var b: &[4]int = [1, 2, 3, 4]
+        var s = b[0..4]
+        print(s.len)
+        """)
+
+@test("an exclusive high past the length traps")
+rng_edge_an_exclusive_high_past_the_length_traps()
+    if !rng_ready() then return
+
+    rng_traps(raw"""
+        var b: &[4]int = [1, 2, 3, 4]
+        var s = b[0..<5]
+        print(s.len)
+        """)
+
+@test("an inverted range traps")
+rng_edge_an_inverted_range_traps()
+    if !rng_ready() then return
+
+    rng_traps(raw"""
+        var b: &[4]int = [1, 2, 3, 4]
+        var s = b[3..<1]
+        print(s.len)
+        """)
+
+@test("an empty slice at the very end is legal")
+rng_edge_an_empty_slice_at_the_end_is_legal()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var b: &[4]int = [1, 2, 3, 4]
+        var s = b[4..]
+        print(s.len)
+        """, "0\n")
+
+// ---- char conversion ----
+
+@test("the maximum scalar value converts and round-trips")
+rng_edge_the_maximum_scalar_value_round_trips()
+    if !rng_ready() then return
+
+    rng_prints("print(u32(char(1114111)))\n", "1114111\n")
+
+@test("one past the maximum traps")
+rng_edge_one_past_the_maximum_scalar_traps()
+    if !rng_ready() then return
+
+    rng_traps("print(char(1114112))\n")
+
+@test("a surrogate value traps")
+rng_edge_a_surrogate_traps()
+    if !rng_ready() then return
+
+    rng_traps("print(char(55296))\n")
+
+// ---- integers ----
+
+@test("addition wraps past the maximum, signed and unsigned, at each width")
+rng_edge_addition_wraps_past_the_maximum()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var a: i8 = 127
+        var b: u8 = 255
+        var c: i16 = 32767
+        var d: u16 = 65535
+        print(a + 1, b + 1, c + 1, d + 1)
+        """, "-128 0 -32768 0\n")
+
+@test("subtraction wraps below the minimum")
+rng_edge_subtraction_wraps_below_the_minimum()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var a: i8 = -128
+        var b: u8 = 0
+        print(a - 1, b - 1)
+        """, "127 255\n")
+
+@test("multiplication overflow keeps the low bits of the width")
+rng_edge_multiplication_keeps_the_low_bits()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var a: i8 = 127
+        var b: u8 = 255
+        print(a * 2, b * 2)
+        """, "-2 254\n")
+
+@test("negating the signed minimum wraps back to the minimum")
+rng_edge_negating_the_minimum_wraps()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var m: i8 = -128
+        print(-m)
+        """, "-128\n")
+
+@test("division truncates toward zero for every sign combination")
+rng_edge_division_truncates_toward_zero()
+    if !rng_ready() then return
+
+    rng_prints("print(7 / 3, -7 / 3, 7 / -3, -7 / -3)\n", "2 -2 -2 2\n")
+
+@test("remainder takes the sign of the dividend for every sign combination")
+rng_edge_remainder_takes_the_dividends_sign()
+    if !rng_ready() then return
+
+    rng_prints("print(7 % 3, -7 % 3, 7 % -3, -7 % -3)\n", "1 -1 1 -1\n")
+
+@test("a left shift can reach the sign bit")
+rng_edge_a_left_shift_reaches_the_sign_bit()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var one: i8 = 1
+        print(one << 7)
+        """, "-128\n")
+
+@test("comparison uses the signedness of the type at the sign boundary")
+rng_edge_comparison_uses_the_types_signedness()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var s: i8 = -1
+        var u: u8 = 255
+        print(s < 0, s > 0, u > 128, u < 128)
+        """, "true false true false\n")
+
+// NaN has no integer value, so the saturating conversion defines it as zero -- for both a signed
+// and an unsigned target.
+@test("NaN converts to zero")
+rng_edge_nan_converts_to_zero()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var z = 0.0
+        var nan = z / z
+        print(int(nan), u32(nan))
+        """, "0 0\n")
+
+@test("an in-range float still truncates toward zero")
+rng_edge_an_in_range_float_truncates()
+    if !rng_ready() then return
+
+    rng_prints("print(int(2.9), int(-2.9), int(0.9), int(-0.9))\n", "2 -2 0 0\n")
+
+// ---- strings ----
+
+// The encoder branches at 128 / 2048 / 65536, and these code points sit just under and just over
+// each. The bytes printed pin each character's length -- 1+2+2+3+3+4+4, six spaces and a newline --
+// and fourteen characters coming back confirms every one round-tripped intact.
+private rng_edge_encodes_under(reference: Option[string])
+    val who = rng_label(reference)
+    val src = raw"""
+        print('\u{7F}', '\u{80}', '\u{7FF}', '\u{800}', '\u{FFFF}', '\u{10000}', '\u{10FFFF}')
+        """
+
+    rng_ran(src, reference) match
+        Err(why) -> assert(false, s"$who: $why")
+        Ok(r) ->
+            var n = 0
+
+            for _ in r.out.chars do n += 1
+
+            assert(r.ok, s"$who: it did not exit zero")
+            assert_eq(r.out.len, 26, who)
+            assert_eq(n, 14, who)
+end rng_edge_encodes_under
+
+@test("a char encodes as UTF-8 at each byte-length boundary")
+rng_edge_a_char_encodes_at_each_boundary()
+    if !rng_ready() then return
+
+    rng_edge_encodes_under(None)
+
+    env_var("SYSL_ORACLE") match
+        Some(bin) -> rng_edge_encodes_under(Some(bin))
+        None -> ()
+
+// "a€😀b" is 1 + 3 + 4 + 1 = 9 bytes, with character boundaries at byte offsets 0, 1, 4, 8, 9.
+@test("substrings cut only at character boundaries, keeping byte lengths")
+rng_edge_substrings_cut_at_boundaries()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var s = "a€😀b"
+        print(s.len, s[0..<1].len, s[1..<4].len, s[4..<8].len, s[8..<9].len)
+        print(s[1..<4] == "€", s[4..<8] == "😀", s[1..<8].len)
+        """, "9 1 3 4 1\ntrue true 7\n")
+
+// A cut of no width -- a span between two events that turned out to be the same event. It is a
+// string, it is empty, and it is not a trap.
+@test("a substring of no width is the empty string")
+rng_edge_a_substring_of_no_width()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var s = "abcdef"
+        print(s[2..<2].len, s[2..<2] == "", s[0..<0] == "", s[6..<6] == "")
+        """, "0 true true true\n")
+
+// a=97, € = e2 82 ac = 226 130 172, b=98
+@test("byte indexing reaches each byte of a multi-byte character")
+rng_edge_byte_indexing_reaches_each_byte()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        var s = "a€b"
+        print(s[0], s[1], s[2], s[3], s[4])
+        """, "97 226 130 172 98\n")
+
+@test("a substring cut one byte inside a multi-byte character traps")
+rng_edge_a_cut_inside_a_character_traps()
+    if !rng_ready() then return
+
+    rng_traps(raw"""
+        var s = "a€😀b"
+        print(s[0..<2].len)
+        """)
+
+@test("a substring starting inside a multi-byte character traps")
+rng_edge_a_start_inside_a_character_traps()
+    if !rng_ready() then return
+
+    rng_traps(raw"""
+        var s = "a€😀b"
+        print(s[5..<8].len)
+        """)
+
+// € (U+20AC) begins with byte 0xE2 = 226, above 'b' (0x62 = 98), so byte order agrees with code
+// point order; the comparison gives both a true and a false.
+@test("strings order by byte, which is codepoint order for UTF-8")
+rng_edge_strings_order_by_byte()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        print("a" < "€", "€" < "b", "€" == "€")
+        """, "true false true\n")

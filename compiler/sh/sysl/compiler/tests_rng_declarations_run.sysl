@@ -1,0 +1,306 @@
+module sh.sysl.compiler
+@tests
+
+// Structs, functions, an exported type and a `@crossing` parameter as programs run them -- the
+// reference's `StructRunTests`, `FunctionRunTests`, `ExportTypeRunTests` and
+// `CrossingAttrRunTests`. The building and running are `tests_rng_impl_composed_run.sysl`'s.
+
+// ---- structs ----
+
+@test("a struct is constructed and its fields read")
+rng_dr_a_struct_is_constructed()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Point
+            x: int
+            y: int
+        var p = Point(10, 20)
+        print(p.x, p.y)
+        """, "10 20\n")
+
+@test("a field can be assigned in place")
+rng_dr_a_field_is_assigned_in_place()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Point
+            x: int
+            y: int
+        var p = Point(1, 2)
+        p.x = 99
+        print(p.x, p.y)
+        """, "99 2\n")
+
+// A type argument is not containment, and what decides is how the generic uses it: `Buf[T]`
+// reaches its elements through storage it owns, which breaks a cycle exactly as `*T` does -- so a
+// node whose children are a growable sequence of itself is an ordinary finite type.
+@test("a struct whose children are a growable sequence of itself")
+rng_dr_a_struct_holding_a_buf_of_itself()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.buf.{Buf, buf}
+        struct Node
+            tag: int
+            kids: Buf[Node]
+        var root = Node(1, buf())
+        var child = Node(3, buf())
+        child.kids.push(Node(4, buf()))
+        root.kids.push(Node(2, buf()))
+        root.kids.push(child)
+        print(root.tag, root.kids.at(0).tag, root.kids.at(1).tag, root.kids.at(1).kids.at(0).tag)
+        """, "1 2 3 4\n")
+
+// The same for a data enum, the other half of a syntax tree: a variant carrying a sequence of the
+// enum it belongs to.
+@test("an enum variant carrying a growable sequence of its own enum")
+rng_dr_an_enum_variant_holding_a_buf_of_its_enum()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.buf.{Buf, buf}
+        enum Json
+            Num(v: int)
+            Arr(items: Buf[Json])
+        total(j: Json) -> int
+            j match
+                Num(v) -> v
+                Arr(items) ->
+                    var sum = 0
+                    for i in 0..<items.len()
+                        sum += total(items.at(i))
+                    sum
+        var xs: Buf[Json] = buf()
+        xs.push(Num(1))
+        xs.push(Num(2))
+        var inner: Buf[Json] = buf()
+        inner.push(Num(39))
+        xs.push(Arr(inner))
+        print(total(Arr(xs)))
+        """, "42\n")
+
+@test("a struct is passed to a function by value")
+rng_dr_a_struct_is_passed_by_value()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Point
+            x: int
+            y: int
+        manhattan(p: Point) -> int = p.x + p.y
+        print(manhattan(Point(10, 32)))
+        """, "42\n")
+
+@test("a struct may hold mixed field types")
+rng_dr_a_struct_holds_mixed_fields()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Mix
+            n: int
+            r: real
+            ok: bool
+        var m = Mix(3, 1.5, true)
+        print(m.n, m.r, m.ok)
+        """, "3 1.5 true\n")
+
+// ---- functions ----
+
+@test("an expression-bodied function is called")
+rng_dr_an_expression_bodied_function()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        add(a: int, b: int) -> int = a + b
+        print(add(3, 4))
+        """, "7\n")
+
+@test("a block-bodied function returns its trailing expression")
+rng_dr_a_block_bodied_function()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        square(n: int) -> int
+            var s = n * n
+            s
+        print(square(6))
+        """, "36\n")
+
+@test("an explicit return exits early")
+rng_dr_an_explicit_return_exits_early()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        classify(n: int) -> int
+            if n < 0 then return -1
+            if n == 0 then return 0
+            1
+        print(classify(-5), classify(0), classify(9))
+        """, "-1 0 1\n")
+
+@test("a recursive function computes factorial")
+rng_dr_a_recursive_function()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        fact(n: int) -> int =
+            if n <= 1 then 1 else n * fact(n - 1)
+        print(fact(5))
+        """, "120\n")
+
+@test("mutually recursive functions resolve regardless of order")
+rng_dr_mutually_recursive_functions()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        isEven(n: int) -> bool = if n == 0 then true else isOdd(n - 1)
+        isOdd(n: int) -> bool = if n == 0 then false else isEven(n - 1)
+        print(isEven(10), isOdd(10))
+        """, "true false\n")
+
+@test("a function may be declared after the code that calls it")
+rng_dr_a_function_declared_after_its_call()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        print(twice(21))
+        twice(n: int) -> int = n * 2
+        """, "42\n")
+
+@test("a unit-returning function runs for its effect")
+rng_dr_a_unit_function_runs_for_its_effect()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        greet(name: string)
+            print("hi", name)
+        greet("sysl")
+        """, "hi sysl\n")
+
+// ---- an exported type (`reference/ffi.md § Naming a type`) ----
+
+// `@export` keeps the type's name so a generated header can spell it, and that is the whole of the
+// difference it may make: the program reads, writes, selects, indexes and calls through it exactly
+// as through what it stands for.
+@test("an exported pointer is selected through, indexed, dereferenced and handed on as the pointer it is")
+rng_dr_an_exported_pointer_is_the_pointer_it_is()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Vm
+            base: u64
+            xs: [4]i32
+
+        @export("vm_ref")
+        type VmRef = *Vm
+
+        @export("bytes_t")
+        type Bytes = *u8
+
+        plain(v: *Vm) -> u64 = v.base
+
+        var vm: Vm = Vm(100, [1, 2, 3, 4])
+        val p: VmRef = &vm
+        p.base = p.base + 1
+        p.xs[2] = 30
+        print(p.base, p.xs[2], (*p).base, plain(p))
+
+        var arr: [3]u8 = [7, 8, 9]
+        val b: Bytes = &arr[0]
+        b[1] = 80
+        print(b[1], arr[1])
+        val view = b[0..<3]
+        print(view.len, view[2])
+        """, "101 30 101 101\n80 80\n3 9\n")
+
+// ---- what a `@crossing` parameter accepts (`reference/memory.md § @crossing -- where the rule is
+// asked`) ----
+//
+// The annotation adds a refusal and nothing else: a program that satisfies it is the program it
+// would have been without the line. These are the half of the rule an over-strict walk would break.
+
+@test("a scalar at the far end")
+rng_dr_crossing_a_scalar_at_the_far_end()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        @crossing(state)
+        start(state: *int) -> int = state[0]
+        var n = 7
+        print(start(&n))
+        """, "7\n")
+
+@test("an object whose every count is atomic")
+rng_dr_crossing_an_object_whose_counts_are_atomic()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Node
+            v: int
+        struct Job
+            node: &sync Node
+        @crossing(state)
+        start(state: *Job) -> int = state[0].node.v
+        var n: &sync Node = Node(41)
+        var j = Job(n)
+        print(start(&j) + 1)
+        """, "42\n")
+
+// A `*T` has no count to make atomic, so there is nothing to say about one reached through the
+// pointer rather than through a field.
+@test("an object holding another raw pointer")
+rng_dr_crossing_an_object_holding_a_raw_pointer()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Job
+            slot: *int
+        @crossing(state)
+        start(state: *Job) -> int = state[0].slot[0]
+        var n = 7
+        var j = Job(&n)
+        print(start(&j))
+        """, "7\n")
+
+@test("a plain value")
+rng_dr_crossing_a_plain_value()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Reading
+            n: int
+            ok: bool
+        @crossing(r)
+        start(r: Reading) -> int = if r.ok then r.n else 0
+        print(start(Reading(7, true)))
+        """, "7\n")
+
+@test("an atomic reference")
+rng_dr_crossing_an_atomic_reference()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Node
+            v: int
+        @crossing(state)
+        start(state: &sync Node) -> int = state.v
+        var n: &sync Node = Node(9)
+        print(start(n))
+        """, "9\n")
+
+// A generic facility is asked afresh per instantiation, so one that shares nothing is unaffected
+// by a sibling instantiation that would have been refused.
+@test("a generic parameter, at an instantiation that shares nothing")
+rng_dr_crossing_a_generic_parameter()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        @crossing(state)
+        start[T](state: *T) -> unit = ()
+        var n = 7
+        var c = 'x'
+        start(&n)
+        start(&c)
+        print(n)
+        """, "7\n")

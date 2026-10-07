@@ -1,0 +1,150 @@
+module sh.sysl.compiler
+@tests
+
+// Tearing down recursive `&T` structures -- the reference's `RecursiveTeardownRunTests`. A
+// destructor releases the references its payload holds, so without an iterative reaper a long chain
+// would recurse one C stack frame per node and overflow the stack. These build structures deep and
+// wide enough that a recursive teardown would crash, and check they come apart cleanly, once each.
+// The building and running are `tests_rng_impl_composed_run.sysl`'s.
+
+private rng_td_node() -> string = raw"""
+    struct Node
+        value: int
+        next: Option[&Node]
+    """
+
+@test("a short list builds, sums, and tears down")
+rng_td_a_short_list()
+    if !rng_ready() then return
+
+    rng_prints(rng_td_node() + raw"""
+        sum(n: &Node) -> int
+            n.next match
+                Some(nx) -> n.value + sum(nx)
+                None -> n.value
+        build3() -> &Node
+            var a: &Node = Node(3, None)
+            var b: &Node = Node(2, Some(a))
+            Node(1, Some(b))
+        print(sum(build3()))
+        """, "6\n")
+
+// 200,000 deep: a recursive teardown overflows the stack here. The iterative reaper unwinds it in
+// constant stack.
+@test("a very long list tears down without overflowing the stack")
+rng_td_a_very_long_list()
+    if !rng_ready() then return
+
+    rng_prints(rng_td_node() + raw"""
+        build(n: int) -> &Node
+            var head: &Node = Node(0, None)
+            var i = 1
+            while i < n
+                head = Node(i, Some(head))
+                i++
+            head
+        var list = build(200000)
+        print(list.value)
+        """, "199999\n")
+
+// The same chain through the atomic release path, the one the per-thread worklist exists for. A
+// `thread_local` is not an ordinary symbol, so "the text says thread_local" and "it links, and a
+// drain still finds its list" are two claims, and this is the second.
+@test("a long atomic chain drains through the worklist the reaper keeps per thread")
+rng_td_a_long_atomic_chain()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Node
+            value: int
+            next: Option[&sync Node]
+        build(n: int) -> &sync Node
+            var head: &sync Node = Node(0, None)
+            var i = 1
+            while i < n
+                head = Node(i, Some(head))
+                i++
+            head
+        var list = build(200000)
+        print(list.value)
+        """, "199999\n")
+
+// A monomorphized generic recursive type's drop hook is generated per instantiation, so this checks
+// `Stack[int]`'s releases its `rest` iteratively too.
+@test("a generic recursive type tears down without overflowing the stack")
+rng_td_a_generic_recursive_type()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Stack[T]
+            top: T
+            rest: Option[&Stack[T]]
+        build(n: int) -> &Stack[int]
+            var s: &Stack[int] = Stack(0, None)
+            var i = 1
+            while i < n
+                s = Stack(i, Some(s))
+                i++
+            s
+        var list = build(200000)
+        print(list.top)
+        """, "199999\n")
+
+// A shared node in a diamond, dropped 100,000 times: a double free would crash, and the total
+// confirms every build ran.
+@test("a shared node in a diamond is freed exactly once")
+rng_td_a_shared_node_in_a_diamond()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Cell
+            tag: int
+            left: Option[&Cell]
+            right: Option[&Cell]
+        make() -> int
+            var d: &Cell = Cell(4, None, None)
+            var b: &Cell = Cell(2, Some(d), None)
+            var c: &Cell = Cell(3, None, Some(d))
+            var a: &Cell = Cell(1, Some(b), Some(c))
+            a.tag
+        var i = 0
+        var total = 0
+        while i < 100000
+            total += make()
+            i++
+        print(total)
+        """, "100000\n")
+
+// Two types that reach each other, one through a growable list -- a scheduler's wait graph, where a
+// lock's waiter list holds tasks and each task points back at what it waits for. The edge closing
+// the loop is cleared before the objects go, so counting reclaims them and nothing is freed twice.
+@test("two types that hold each other are reclaimed once the loop is cleared")
+rng_td_two_types_holding_each_other()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.buf.*
+
+        struct Waiter
+            id: int
+            on: Option[&Held]
+        struct Held
+            tag: int
+            queue: &Buf[&Waiter]
+        round() -> int
+            var h: &Held = Held(7, buf())
+            var w: &Waiter = Waiter(1, Some(h))
+            var v: &Waiter = Waiter(2, Some(h))
+            h.queue.push(w)
+            h.queue.push(v)
+            var n = int(h.queue.len()) + h.tag
+            w.on = None
+            v.on = None
+            n
+        var i = 0
+        var total = 0
+        while i < 100000
+            total += round()
+            i++
+        print(total)
+        """, "900000\n")

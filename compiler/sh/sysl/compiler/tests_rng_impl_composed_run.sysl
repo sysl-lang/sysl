@@ -1,0 +1,440 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A trait implemented for a type with no name of its own -- a slice, a string's bytes, an array, a
+// slice of slices -- run rather than inspected: `impl Show for []int` is as ordinary as
+// `impl Show for Point`, reached by a call, a bound or a table the same way.
+//
+// **The helpers here serve every `rng_` file**, the ports of the reference's whole-program run
+// suites. Every claim is about what a program *does*, so each builds the program with this compiler
+// and runs it -- and **where `SYSL_ORACLE` names the reference, builds and runs it with that one
+// too and holds it to the same answer**, so every expectation is the reference's actual output
+// rather than a transcription of it.
+
+rng_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end rng_ready
+
+// Builds `text` into `<root>/built` with this compiler, or with the reference where `reference`
+// names one, and answers the executable -- or what was said instead of making it.
+private rng_build(root: string, text: string, reference: Option[string]) -> Result[string, string]
+    val src = s"$root/main.sysl"
+    val exe = s"$root/built"
+
+    write_text(src, text).unwrap()
+
+    reference match
+        None ->
+            build_native_program(src, None, None, DefaultOptimization, Some(exe)) match
+                Err(why) -> return Err(failure_text(why))
+                Ok(_) -> ()
+        Some(bin) ->
+            val said = capture_oracle(bin, ["build", src, "-o", exe])
+
+            if metadata(exe).is_err()
+                return Err(said match
+                    Err(_) -> "the reference could not be run"
+                    Ok(o) -> o.err.unwrap_or(o.text))
+
+    Ok(exe)
+end rng_build
+
+// What a program did when it ran: what it wrote to each stream, and whether it exited zero.
+struct RngRan
+    out: string
+    err: string
+    ok: bool
+
+// Builds `text` and runs it, by this compiler or by the reference -- or says why it could not.
+rng_ran(text: string, reference: Option[string]) -> Result[RngRan, string]
+    val root = make_temp_dir("sysl-rng").unwrap()
+
+    make_dir_all(root).unwrap()
+
+    val out: Result[RngRan, string] = rng_build(root, text, reference) match
+        Err(why) -> Err(s"it did not build: $why")
+        Ok(exe) ->
+            capture(exe, [], "", [], true) match
+                Err(_) -> Err("the program that was built could not be run")
+                Ok(o) -> Ok(RngRan(o.text, o.err.unwrap_or(""), o.status.ok()))
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rng_ran
+
+rng_label(reference: Option[string]) -> string = reference match
+    Some(bin) -> s"the reference ($bin)"
+    None -> "this compiler"
+
+// The claim a run case makes under one compiler: `text` builds, exits zero and prints `want`.
+private rng_prints_under(text: string, want: string, reference: Option[string])
+    val who = rng_label(reference)
+
+    rng_ran(text, reference) match
+        Err(why) -> assert(false, s"$who: $why")
+        Ok(r) ->
+            assert(r.ok, s"$who: it did not exit zero: ${r.out}${r.err}")
+            assert_eq(r.out, want, who)
+
+// `text` prints `want`, here and -- where there is one -- under the reference.
+rng_prints(text: string, want: string)
+    rng_prints_under(text, want, None)
+
+    env_var("SYSL_ORACLE") match
+        Some(bin) -> rng_prints_under(text, want, Some(bin))
+        None -> ()
+
+// The claim a trap case makes under one compiler: `text` builds, and the program stops itself.
+private rng_traps_under(text: string, reference: Option[string])
+    val who = rng_label(reference)
+
+    rng_ran(text, reference) match
+        Err(why) -> assert(false, s"$who: $why")
+        Ok(r) -> assert(!r.ok, s"$who: it exited cleanly: ${r.out}")
+
+// `text` builds and stops itself rather than running past a failed check, here and under the
+// reference. Every run-time check traps, so the status is what is observable, not the output.
+rng_traps(text: string)
+    rng_traps_under(text, None)
+
+    env_var("SYSL_ORACLE") match
+        Some(bin) -> rng_traps_under(text, Some(bin))
+        None -> ()
+
+// ---- a slice ----
+
+@test("carries an impl whose method resolves on a value of it")
+rng_ic_a_slice_carries_an_impl()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Total
+            total(self) -> int
+        impl Total for []int
+            total(self) -> int
+                var sum = 0
+                for x in self do sum += x
+                sum
+        var a = [1, 2, 3, 4]
+        print(a[0..].total())
+        """, "10\n")
+
+@test("carries a property, read with no parentheses")
+rng_ic_a_slice_carries_a_property()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Ends
+            first -> int
+        impl Ends for []int
+            first -> int = self[0]
+        var a = [7, 8, 9]
+        print(a[0..].first)
+        """, "7\n")
+
+// The element type is part of the type, so two slices with different elements are two
+// implementations and each member call finds its own.
+@test("of two element types carries two independent impls")
+rng_ic_two_element_types_two_impls()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Tag
+            tag(self) -> string
+        impl Tag for []int
+            tag(self) -> string = "ints"
+        impl Tag for []bool
+            tag(self) -> string = "bools"
+        var a = [1, 2]
+        var b = [true]
+        print(a[0..].tag())
+        print(b[0..].tag())
+        """, "ints\nbools\n")
+
+@test("renders through Display, so print and f-strings reach it")
+rng_ic_a_slice_renders_through_display()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct N
+            v: int
+        impl Display for N
+            display(self, out: *Writer, fmt: FormatSpec) = display_int(i64(self.v), out, fmt)
+        override impl Display for []N
+            display(self, out: *Writer, fmt: FormatSpec)
+                out.write("[".bytes)
+                for i in 0..<self.len do
+                    if i > 0usize then out.write(", ".bytes)
+                    self[i].display(out, FormatSpec(0, -1, false))
+                out.write("]".bytes)
+        var a = [N(3), N(1), N(4)]
+        print(a[0..])
+        print(f"${a[0..]}%8s|")
+        """, "[3, 1, 4]\n[3, 1, 4]|\n")
+
+@test("satisfies a bound, so a generic takes one by value")
+rng_ic_a_slice_satisfies_a_bound()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Total
+            total(self) -> int
+        impl Total for []int
+            total(self) -> int
+                var sum = 0
+                for x in self do sum += x
+                sum
+        twice[T: Total](x: T) -> int = x.total() * 2
+        var a = [5, 6]
+        print(twice(a[0..]))
+        """, "22\n")
+
+// The object outlives the frame, so the elements the slice views have to as well -- escape
+// analysis's ordinary rule about a slice, met here by putting the array on the heap.
+@test("erases to a counted trait object and dispatches through the table")
+rng_ic_a_slice_erases_to_a_trait_object()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Total
+            total(self) -> int
+        struct Cell
+            v: int
+        impl Total for Cell
+            total(self) -> int = self.v
+        impl Total for []int
+            total(self) -> int
+                var sum = 0
+                for x in self do sum += x
+                sum
+        sum_of(t: &Total) -> int = t.total()
+        var a: &[2]int = [10, 20]
+        print(sum_of(a[0..]))
+        print(sum_of(Cell(7)))
+        """, "30\n7\n")
+
+@test("inherits a trait default like any other implementing type")
+rng_ic_a_slice_inherits_a_default()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Total
+            total(self) -> int
+            doubled(self) -> int = self.total() * 2
+        impl Total for []int
+            total(self) -> int
+                var sum = 0
+                for x in self do sum += x
+                sum
+        var a = [1, 2, 3]
+        print(a[0..].doubled())
+        """, "12\n")
+
+// A slice's elements belong to whoever made them, so a member taking one by value borrows it --
+// the same contract every other function taking a `[]T` parameter has.
+@test("taken by value in a loop neither leaks nor frees twice")
+rng_ic_a_slice_taken_by_value_in_a_loop()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Total
+            total(self) -> int
+        impl Total for []int
+            total(self) -> int
+                var sum = 0
+                for x in self do sum += x
+                sum
+        var a = [1, 2, 3]
+        var acc = 0
+        for i in 0..<1000 do acc += a[0..].total()
+        print(acc)
+        """, "6000\n")
+
+// ---- a string ----
+
+// `string` was already implementable; a slice of its bytes is too, so the two can carry the same
+// trait and be told apart by it.
+@test("and a slice of its bytes are two distinct implementations")
+rng_ic_a_string_and_its_bytes()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Tag
+            tag(self) -> string
+        impl Tag for string
+            tag(self) -> string = "text"
+        impl Tag for []const u8
+            tag(self) -> string = "bytes"
+        var s = "hi"
+        print(s.tag())
+        print(s.bytes.tag())
+        """, "text\nbytes\n")
+
+// ---- an array ----
+
+@test("carries an impl, and its length is part of the type it is for")
+rng_ic_an_array_length_is_part_of_the_type()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Tag
+            tag(self) -> string
+        impl Tag for [2]int
+            tag(self) -> string = "pair"
+        impl Tag for [3]int
+            tag(self) -> string = "triple"
+        var a: [2]int = [1, 2]
+        var b: [3]int = [1, 2, 3]
+        print(a.tag())
+        print(b.tag())
+        """, "pair\ntriple\n")
+
+// A `self` receiver copies, which for an array copies every element -- so writing through the copy
+// is invisible to the caller, exactly as it is for a struct.
+@test("takes its receiver by value, so a member sees a copy")
+rng_ic_an_array_receiver_is_a_copy()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Bump
+            bumped(self) -> int
+        impl Bump for [2]int
+            bumped(self) -> int
+                self[0] += 100
+                self[0]
+        var a: [2]int = [1, 2]
+        print(a.bumped())
+        print(a[0])
+        """, "101\n1\n")
+
+@test("of a struct element carries one too")
+rng_ic_an_array_of_a_struct_element()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct P
+            v: int
+        trait Total
+            total(self) -> int
+        impl Total for [2]P
+            total(self) -> int = self[0].v + self[1].v
+        var a: [2]P = [P(3), P(4)]
+        print(a.total())
+        """, "7\n")
+
+// ---- a nested composed type ----
+
+@test("is one type, and one implementation")
+rng_ic_a_nested_composed_type_is_one_type()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Tag
+            tag(self) -> string
+        impl Tag for [][]int
+            tag(self) -> string = "rows"
+        impl Tag for []int
+            tag(self) -> string = "row"
+        var a = [1, 2]
+        print(a[0..].tag())
+        """, "row\n")
+
+// What an `impl` may not be for is a *generic* type -- one whose parameters are still open. A
+// generic type already applied is a type like any other, and a slice of one is too.
+@test("may hold an instantiated generic, which is concrete")
+rng_ic_a_nested_type_holds_an_instantiated_generic()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Box[T]
+            v: T
+        trait Total
+            total(self) -> int
+        impl Total for []Box[int]
+            total(self) -> int = self[0].v + self[1].v
+        var a = [Box(3), Box(4)]
+        print(a[0..].total())
+        """, "7\n")
+
+// ---- the rest of the member surface reaches a composed type unchanged ----
+
+// `Self` is bound to whatever the `impl` is for, and a slice is no different.
+@test("Self in a signature means the type the impl is for")
+rng_ic_self_means_the_composed_type()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Head
+            head(self) -> Self
+        impl Head for []int
+            head(self) -> Self = self[0..<1]
+        var a = [4, 5, 6]
+        var h = a[0..].head()
+        print(h.len)
+        print(h[0])
+        """, "1\n4\n")
+
+// A `*self` receiver takes the instance's address, so it needs a place to point at -- which a slice
+// held in a `var` is. The receiver is a `*[]int` like any other raw pointer.
+@test("a pointer receiver writes through to the slice it was called on")
+rng_ic_a_pointer_receiver_writes_through()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Retake
+            drop_first(*self)
+        impl Retake for []int
+            drop_first(*self)
+                *self = (*self)[1..]
+        var a = [1, 2, 3]
+        var s = a[0..]
+        s.drop_first()
+        print(s.len)
+        print(s[0])
+        """, "2\n2\n")
+
+@test("str renders one through its Display exactly as print does")
+rng_ic_str_renders_through_display()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct N
+            v: int
+        override impl Display for []N
+            display(self, out: *Writer, fmt: FormatSpec)
+                display_int(i64(self.len), out, fmt)
+        var a = [N(1), N(2), N(3)]
+        var s = str(a[0..])
+        print(s)
+        """, "3\n")
+
+// Two traits over one type put their members in the one table, so the second implementation sees
+// the first's -- the same rule an inherent member and an `impl` method share.
+@test("two traits may be implemented for one composed type")
+rng_ic_two_traits_for_one_composed_type()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait A
+            a(self) -> int
+        trait B
+            b(self) -> int
+        impl A for []int
+            a(self) -> int = self[0]
+        impl B for []int
+            b(self) -> int = self.a() + 1
+        var xs = [9, 9]
+        print(xs[0..].b())
+        """, "10\n")
