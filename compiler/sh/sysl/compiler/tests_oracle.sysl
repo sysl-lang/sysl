@@ -3,7 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.container.{Set, set}
+import sysl.container.{Map, map, Set, set}
 import sysl.env.{get as env_var}
 import sysl.fs.{IoError, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, walk, write_text}
 import sysl.process.{capture, Output, Var}
@@ -168,6 +168,11 @@ end in_patched_module
  *    through a listed module (the reference's `sysl.slices` instantiations only the old `Buf.grow`
  *    called, our `arc.slotbuf.*` helpers only `slot_storage` asks for). Taken to a fixpoint.
  *
+ * 3. ONE of the two texts defines it and the other only DECLARES it -- the declaring side's library
+ *    artifact holds the body and the defining side's does not. The two libraries differ only in the
+ *    files `library_patches.tsv` lists, so an instantiation one artifact has and the other lacks is
+ *    one only a listed module asks for (`sysl.math.rational` puts `Option.unwrap[BigInt]` in ours).
+ *
  * Nothing else is. A body BOTH texts define outside a listed module is never confined, whatever
  * calls it; a one-sided symbol used from any unconfined place -- another body, a global, a vtable --
  * or used nowhere at all is not confined either. A difference at a confined symbol is excused and
@@ -186,6 +191,9 @@ patch_confined(theirs: string, ours: string, patched: Buf[string]) -> Set[string
 
     for name in our_defs.walk()
         if in_patched_module(name, patched) then confined.add(name)
+
+    precompiled_on_one_side(their_defs, our_defs, declared_symbols(ours), &confined)
+    precompiled_on_one_side(our_defs, their_defs, declared_symbols(theirs), &confined)
 
     val their_alone = set_less(their_defs, our_defs)
     val our_alone = set_less(our_defs, their_defs)
@@ -217,6 +225,14 @@ patch_confined(theirs: string, ours: string, patched: Buf[string]) -> Set[string
 
     confined
 end patch_confined
+
+// Rule 3 of `patch_confined`, one way round: what `defining` defines and the other text only declares.
+private precompiled_on_one_side(defining: Set[string], other: Set[string], other_declares: Buf[string],
+                                confined: *Set[string])
+    for i in 0..<other_declares.len()
+        val name = other_declares.at(i)
+
+        if defining.has(name) && !other.has(name) then confined.add(name)
 
 private defined_set(text: string) -> Set[string]
     var out: Set[string] = set()
@@ -306,9 +322,10 @@ private symbol_byte(b: u8) -> bool
     b == u8('_') || b == u8('.') || b == u8('$') || b == u8('-')
 end symbol_byte
 
-// A text with every confined definition and every confined declaration taken out, which is what the
-// whole-file comparison holds the rest of the two texts to.
-private without_confined(text: string, confined: Set[string]) -> string
+// A text with every confined definition and every confined declaration taken out, and every type
+// definition `type_confined` to a listed module, which is what the whole-file comparison holds the
+// rest of the two texts to.
+private without_confined(text: string, confined: Set[string], patched: Buf[string] = buf()) -> string
     val all = lines_of(text)
     var out = str_builder()
     var skipping = false
@@ -327,6 +344,7 @@ private without_confined(text: string, confined: Set[string]) -> string
         end if
 
         if line.starts_with("declare ") && confined.has(symbol_on(line)) then continue
+        if type_confined(line, patched) then continue
 
         out.push(line)
         out.push_char('\n')
@@ -1598,30 +1616,55 @@ private compare_types(binary: string, path: string, label: string, patched: Buf[
 
             compare_boxes(theirs.text, ours, label, found)
             compare_funcs(theirs.text, ours, mine.gaps, label, confined, found)
-            compare_whole_text(theirs.text, ours, label, confined, found)
+            compare_whole_text(theirs.text, ours, label, confined, patched, found)
 end compare_types
 
-// The type definition lines whose type is not of a listed module: `%struct.<symbol> = type …`, the
-// symbol read as `in_patched_module` reads a function's.
+// The type definition lines whose type is not confined to a listed module (`type_confined`).
 private types_outside(lines: Buf[string], patched: Buf[string]) -> Buf[string]
     var out: Buf[string] = buf()
 
     for i in 0..<lines.len()
-        val line = lines.at(i)
-        val at = line.index_of(" = type ").unwrap_or(line.bytes.len)
-        var name = line[0..<at]
-
-        if name.starts_with("%") then name = name[1..<name.bytes.len]
-
-        val dot = name.index_of(".")
-
-        if dot.is_some() && in_patched_module(name[(dot.unwrap() + 1)..<name.bytes.len], patched)
-            continue
-
-        out.push(line)
+        if !type_confined(lines.at(i), patched) then out.push(lines.at(i))
 
     out
 end types_outside
+
+// A text with every type definition `type_confined` to a listed module taken out -- for a test that
+// holds a whole text to the reference's outside the sweeps.
+without_patched_types(text: string, patched: Buf[string]) -> string
+    val all = lines_of(text)
+    var out = str_builder()
+
+    for i in 0..<all.len()
+        if !type_confined(all.at(i), patched)
+            out.push(all.at(i))
+            out.push_char('\n')
+
+    out.finish()
+end without_patched_types
+
+/** Whether a type definition line, `%<name> = type …`, defines a type that exists only because of a
+ * listed module: a type OF one (`%struct.sysl.math.rational$Rational`), or an instantiation taking
+ * one as an argument (`%enum.sysl$Option.sysl.math.rational$Rational` and its variant's
+ * `%sysl$Option.sysl.math.rational$Rational.Some`). Every library type is laid down in every
+ * program, so a module the reference's library lacks adds these lines to every text; any other line
+ * stays in the comparison. A name is matched at a segment start, `<module>$` after the `%` or a `.`.
+ */
+type_confined(line: string, patched: Buf[string]) -> bool
+    if !line.starts_with("%") then return false
+
+    val end = line.index_of(" = type ").unwrap_or(line.bytes.len)
+
+    for k in 0..<patched.len()
+        val want = patched.at(k) + "$"
+
+        for i in 0..<end
+            val segment = line.bytes[i] == u8('%') || line.bytes[i] == u8('.')
+
+            if segment && i + 1 + want.bytes.len <= end && bytes_at(line, i + 1, want) then return true
+
+    false
+end type_confined
 
 // The ownership runtime's own type definitions, matched by name -- and **every** name the reference
 // defines, since the two modules now box the same set of payloads. It was the names both texts
@@ -1711,7 +1754,7 @@ end compare_funcs
 // is a body the artifact cannot advertise -- and where it does not, the difference is a defect and
 // the first differing line is quoted.
 private compare_whole_text(theirs: string, raw: string, label: string, confined: Set[string],
-                           found: *TypeAgreement)
+                           patched: Buf[string], found: *TypeAgreement)
     // **Both sides are read to the same end**, which is the one thing about the two texts that is
     // not the compilers' doing: the reference's arrives through a captured process and this one's as
     // a string, so what a shell would have shown as the last line differs in whether it is there.
@@ -1724,7 +1767,9 @@ private compare_whole_text(theirs: string, raw: string, label: string, confined:
 
     // A file is excused only where the two texts are the same text once every confined definition
     // and declaration is out of both (`patch_confined`).
-    if !confined.is_empty() && without_confined(theirs, confined) == without_confined(ours, confined)
+    val held = !confined.is_empty() || !patched.is_empty()
+
+    if held && without_confined(theirs, confined, patched) == without_confined(ours, confined, patched)
         found.whole_excused += 1
         return
     end if
@@ -1984,7 +2029,11 @@ the_emitted_types_agree()
             assert(found.fn_matched > 0, "the sweep compared a function")
             assert(found.fn_mismatched == 0, s"$fn_summary${found.first_bad_fn}")
             assert(found.box_mismatched == 0, s"$fn_summary${found.first_bad}")
-            assert(found.whole_matched > 0, "the sweep found a program the two agree on whole")
+            // A file excused by `library_patches.tsv` is one the two agree on whole once the listed
+            // modules' definitions are out -- and with a module ADDED to the library, whose types every
+            // program lays down, that is every file.
+            assert(found.whole_matched + found.whole_excused > 0,
+                   "the sweep found a program the two agree on whole")
             assert(found.whole_other == 0, s"$whole_summary${found.first_bad_whole}")
 end the_emitted_types_agree
 
@@ -2084,6 +2133,12 @@ private census_over(theirs: string, ours: string, gaps: Buf[(string, string)],
     val mine = func_texts(ours)
     val confined = patch_confined(theirs, ours, patched)
 
+    // A confined body defined on one side only that interns a string moves the number of every string
+    // interned after it, so a shared body naming one differs in the number alone (`strings_moved`).
+    val moved = strings_moved(wanted, mine, defined_set(theirs), defined_set(ours), confined)
+    val their_strings = string_constants(theirs)
+    val our_strings = string_constants(ours)
+
     found.theirs = wanted.len()
     found.ours = mine.len()
 
@@ -2106,6 +2161,8 @@ private census_over(theirs: string, ours: string, gaps: Buf[(string, string)],
                 if want != got
                     if confined.has(name)
                         found.excused += 1
+                    else if moved && renumbered_alone(want, got, their_strings, our_strings)
+                        found.excused += 1
                     else
                         found.differing += 1
 
@@ -2124,6 +2181,73 @@ private census_over(theirs: string, ours: string, gaps: Buf[(string, string)],
         else
             found.only_ours += 1
 end census_over
+
+// Whether a confined body that only one of the two texts defines names an interned string -- the one
+// way a listed module's difference renumbers the strings of bodies outside it.
+strings_moved(theirs: Buf[(string, string)], ours: Buf[(string, string)], their_names: Set[string],
+              our_names: Set[string], confined: Set[string]) -> bool
+    val theirs_moved = one_sided_names_a_string(theirs, our_names, confined)
+
+    theirs_moved || one_sided_names_a_string(ours, their_names, confined)
+
+private one_sided_names_a_string(these: Buf[(string, string)], those: Set[string],
+                                 confined: Set[string]) -> bool
+    for i in 0..<these.len()
+        val (name, body) = these.at(i)
+
+        if confined.has(name) && !those.has(name) && body.index_of("@.str").is_some() then return true
+
+    false
+end one_sided_names_a_string
+
+// Whether two bodies differ only in the numbers their interned strings go by.
+private renumbered_alone(want: string, got: string, theirs: Map[string, string],
+                         ours: Map[string, string]) -> bool
+    strings_spelled(want, theirs) == strings_spelled(got, ours)
+
+// Each interned string's name, with the constant it names: `@.str14 = private constant …`.
+string_constants(text: string) -> Map[string, string]
+    var out: Map[string, string] = map()
+    val all = lines_of(text)
+
+    for i in 0..<all.len()
+        val line = all.at(i)
+
+        if line.starts_with("@.str")
+            line.index_of(" = ") match
+                Some(at) -> out.put(line[0..<at], line[(at + 3)..<line.bytes.len])
+                None -> ()
+
+    out
+end string_constants
+
+// A body with every interned string it names written as the constant itself rather than its number,
+// so two bodies naming the same text under two numbers read alike and two texts never do.
+strings_spelled(body: string, table: Map[string, string]) -> string
+    var out = str_builder()
+    var from: usize = 0
+    var i: usize = 0
+
+    while i < body.bytes.len
+        if bytes_at(body, i, "@.str")
+            var j = i + 5
+
+            while j < body.bytes.len && body.bytes[j] >= u8('0') && body.bytes[j] <= u8('9')
+                j += 1
+
+            val token = body[i..<j]
+
+            out.push(body[from..<i])
+            out.push(s"@<${table.get(token).unwrap_or(token)}>")
+            from = j
+            i = j
+        else
+            i += 1
+    end while
+
+    out.push(body[from..<body.bytes.len])
+    out.finish()
+end strings_spelled
 
 // -- the bounds normalisation, held to taking out only what the report adds ---------------------------
 
@@ -2370,6 +2494,96 @@ lpx_a_whole_file_is_excused_only_where_the_rest_agrees()
     val confined2 = patch_confined(theirs2, ours2, lpx_listed())
 
     assert(without_confined(theirs2, confined2) != without_confined(ours2, confined2))
+
+// A pair of texts in the shape `sysl.math.rational` leaves on this compiler's own tree: the reference
+// defines `Option.unwrap[BigInt]`, which this compiler's library artifact holds and its text only
+// declares; the body interns a string, so `g`'s string is `@.str2` there and `@.str1` here.
+// `declared` says whether ours declares it, and `g_text` is the constant `g` names on our side.
+private lpx_precompiled(declared: bool, g_text: string) -> (string, string)
+    val unwrap = "define i64 @sysl$Option.unwrap.big(i64 %o) {\n" +
+        "  call void @sysl$prints(ptr @.str1)\n  ret i64 %o\n}\n"
+    val g_theirs = "define void @app$g() {\n  call void @sysl$prints(ptr @.str2)\n  ret void\n}\n"
+    val g_ours = "define void @app$g() {\n  call void @sysl$prints(ptr @.str1)\n  ret void\n}\n"
+    val main = "define void @app$main() {\n  %x = call i64 @sysl$Option.unwrap.big(i64 1)\n" +
+        "  ret void\n}\n"
+    val theirs = "@.str1 = private constant [2 x i8] c\"u\\00\"\n" +
+        "@.str2 = private constant [2 x i8] c\"g\\00\"\n" + unwrap + g_theirs + main
+    val decl = if declared then "declare i64 @sysl$Option.unwrap.big(i64)\n" else ""
+    val ours = decl + s"@.str1 = private constant [2 x i8] c\"$g_text\\00\"\n" + g_ours + main
+
+    (theirs, ours)
+end lpx_precompiled
+
+@test("library patches: a body one library artifact holds and the other's lacks is excused, and the strings it moved")
+lpx_a_precompiled_body_and_the_strings_it_moved()
+    val (theirs, ours) = lpx_precompiled(true, "g")
+    val found = lpx_census(theirs, ours, lpx_listed())
+
+    assert_eq(found.only_theirs, 0)
+    assert_eq(found.differing, 0)
+    assert_eq(found.excused, 2)
+
+    // Defined by the reference and not even declared here is a body this compiler left out.
+    val (theirs2, ours2) = lpx_precompiled(false, "g")
+    val found2 = lpx_census(theirs2, ours2, lpx_listed())
+
+    assert_eq(found2.only_theirs, 1)
+
+    // The number may move; the string may not -- `g` naming another text is a difference.
+    val (theirs3, ours3) = lpx_precompiled(true, "h")
+    val found3 = lpx_census(theirs3, ours3, lpx_listed())
+
+    assert_eq(found3.differing, 1)
+
+    // And with nothing listed, nothing is excused.
+    var none: Buf[string] = buf()
+    val found4 = lpx_census(theirs, ours, none)
+
+    assert_eq(found4.excused, 0)
+    assert(found4.only_theirs + found4.differing > 0, "a difference with nothing listed is a failure")
+
+@test("library patches: a type of a listed module, or instantiated on one, is confined, and no other")
+lpx_a_type_of_a_listed_module_is_confined()
+    var listed: Buf[string] = buf()
+
+    listed.push("sysl.math.rational")
+
+    val rational = "%struct.sysl.math.rational$Rational = type { %struct.sysl.math.bigint$BigInt }"
+
+    assert(type_confined(rational, listed), rational)
+    assert(type_confined("%enum.sysl$Option.sysl.math.rational$Rational = type { i32, [8 x i64] }",
+                         listed), "an instantiation on a listed module's type")
+    assert(type_confined("%sysl$Option.sysl.math.rational$Rational.Some = type { i64 }", listed),
+           "an instantiation's variant")
+    assert(!type_confined("%struct.sysl$Counting = type { i64 }", listed), "another module's type")
+    assert(!type_confined("%struct.sysl.math.bigint$BigInt = type { i1 }", listed),
+           "a type a listed module's type HOLDS is not confined by that")
+    assert(!type_confined("%struct.sysl.math.rationals$R = type { i64 }", listed), "a longer name")
+    assert(!type_confined("define void @sysl.math.rational$f() {", listed), "not a type definition")
+
+@test("library patches: a whole file differing only in a listed module's types is excused, and only then")
+lpx_a_whole_file_differing_in_listed_types_alone()
+    var listed: Buf[string] = buf()
+
+    listed.push("sysl.math.rational")
+
+    val none: Set[string] = set()
+    val head = "target triple = \"arm64-apple-macosx\"\n\n%struct.sysl$Counting = type { i64 }\n"
+    val extra = "%struct.sysl.math.rational$Rational = type { i64 }\n" +
+        "%enum.sysl$Option.sysl.math.rational$Rational = type { i32, [1 x i64] }\n"
+    val body = "define i32 @main() {\n  ret i32 0\n}\n"
+
+    assert_eq(without_confined(head + body, none, listed), without_confined(head + extra + body, none, listed))
+
+    // The same shape, but the line only one side has is another module's: that is a difference.
+    val other = "%struct.sysl$Counting2 = type { i64 }\n"
+
+    assert(without_confined(head + body, none, listed) != without_confined(head + other + body, none, listed))
+
+    // With the listed types present, a changed line of any other type is still a difference.
+    val changed = "target triple = \"arm64-apple-macosx\"\n\n%struct.sysl$Counting = type { i32 }\n"
+
+    assert(without_confined(head + body, none, listed) != without_confined(changed + extra + body, none, listed))
 
 // -- self-hosted-only constructs: what `self_hosted_only.tsv` excuses --------------------------------
 
