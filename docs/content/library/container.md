@@ -97,10 +97,39 @@ true false
 **The annotation on `var ages` is required.** `map()` is a nullary generic, so its type arguments come
 from what receives it, and there is nothing else in that line to take them from.
 
-**An empty map holds no table at all, and does not allocate.** `map()` costs nothing; the first
-`put` makes the table. That matters far more than it looks, because no caller can see that they are
-paying: a map built inside a loop, held in a struct that is usually empty, or made on a branch that
-turns out not to be taken is a `malloc` and the `free` behind it, every time. A profile of an
+**A `Map` is a reference to one map, like Scala's `mutable.HashMap`.** Assigning it, passing it to a
+function, capturing it in a closure or reading it out of another container gives a second name for
+the same map, so what is put through one name is there through every other:
+
+```sysl
+import sysl.container.{Map, map}
+
+note(m: Map[string, int])
+    var here = m
+
+    here.put("seen", 1)
+
+var counts: Map[string, int] = map()
+var alias = counts
+
+alias.put("a", 1)
+note(counts)
+
+print(counts.len(), counts.get("a"), counts.get("seen"))
+```
+
+```output
+2 Some(1) Some(1)
+```
+
+So **a map has no zero value**: a declaration says where its map comes from, `= map()`, and a struct
+holding one is built with one.
+
+**An empty map holds no table at all.** `map()` allocates only the small cell every name for the map
+shares — three words, whatever the key and value — and the first `put` makes the table. That matters
+far more than it looks, because no caller can see that they are paying: a map built inside a loop,
+held in a struct that is usually empty, or made on a branch that turns out not to be taken would
+otherwise be a table of slots and the `free` behind it, every time. A profile of an
 interpreter that gave every block its own scope — two maps per scope, one entry each — put **27% of
 its running time** in constructing and destroying maps nothing was ever read out of.
 
@@ -129,13 +158,13 @@ print(m.capacity())
 ```
 
 `clear` lets the table go entirely for the same reason, so a map used as scratch across a loop keeps
-nothing between passes and one that is cleared and never used again costs nothing at all.
+nothing between passes and one that is cleared and never used again costs no table at all.
 
 `map_with_capacity(n)` **still allocates up front**, which is the point of writing it: a caller who
 names a size is saying entries are coming. It sizes the table for `n` entries, and the table is grown
 at three quarters full, so the storage is twice `n`.
 
-A `Set` is a `Map` and inherits all of this, including the empty table.
+A `Set` is a `Map` and inherits all of this, including the empty table and being a reference.
 
 Walking hands back a pair per entry, in no particular order:
 

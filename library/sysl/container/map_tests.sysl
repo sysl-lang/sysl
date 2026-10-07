@@ -381,3 +381,179 @@ integer_widths_agree()
     assert_eq(m.len(), 1)
     assert_eq(m.get(1u32), Some("uno"))
 end integer_widths_agree
+
+// -- a map is a reference: every name for it is the same map ----------------------------------------
+
+/** **The case that corrupted a map when it was a value**: a copy shared the table and kept counts of
+ * its own, so a `put` into the copy that did not rehash wrote an entry the original's count never
+ * learned of. Now both names are one map, and both see the entry and the count.
+ */
+@test("a put into a second name for a map is seen through the first")
+put_into_a_copy_is_shared()
+    var m: Map[int, int] = map()
+
+    m.put(1, 1)
+
+    var n = m
+
+    n.put(2, 2)
+
+    assert_eq(m.len(), 2)
+    assert_eq(n.len(), 2)
+    assert_eq(m.get(2), Some(2))
+    assert(m.has(1))
+end put_into_a_copy_is_shared
+
+@test("a map grown through one name is grown through the other, every entry kept")
+growth_through_one_name_is_seen_by_the_other()
+    var m: Map[int, int] = map()
+    var n = m
+
+    for i in 0..<100
+        n.put(i, i * 3)
+
+    assert_eq(m.len(), 100)
+    assert_eq(m.capacity(), n.capacity())
+
+    for i in 0..<100
+        assert_eq(m.get(i), Some(i * 3))
+end growth_through_one_name_is_seen_by_the_other
+
+@test("a remove and a clear through one name are seen through the other")
+remove_and_clear_are_shared()
+    var m: Map[string, int] = map()
+    var n = m
+
+    m.put("a", 1)
+    m.put("b", 2)
+
+    assert(n.remove("a"))
+    assert(!m.has("a"))
+    assert_eq(m.len(), 1)
+
+    n.clear()
+
+    assert_eq(m.len(), 0)
+    assert_eq(m.capacity(), 0)
+end remove_and_clear_are_shared
+
+private put_nine(m: Map[int, int])
+    var here = m
+
+    here.put(9, 9)
+
+@test("a map handed to a function by value is the caller's map")
+by_value_parameter_shares()
+    var m: Map[int, int] = map()
+
+    put_nine(m)
+
+    assert_eq(m.len(), 1)
+    assert_eq(m.get(9), Some(9))
+end by_value_parameter_shares
+
+@test("a map captured by a closure is the map outside it")
+closure_capture_shares()
+    var m: Map[int, int] = map()
+    var inside = m
+    val add = (k: int) -> inside.put(k, k * 2)
+
+    add(3)
+    add(4)
+
+    assert_eq(m.len(), 2)
+    assert_eq(m.get(4), Some(8))
+end closure_capture_shares
+
+@test("a map read out of another map is the one stored there, so a put into it sticks")
+nested_map_put_sticks()
+    var outer: Map[int, Map[int, int]] = map()
+
+    outer.put(1, map())
+
+    var inner = outer.get(1).unwrap()
+
+    inner.put(5, 50)
+
+    assert_eq(outer.get(1).unwrap().len(), 1)
+    assert_eq(outer.get(1).unwrap().get(5), Some(50))
+end nested_map_put_sticks
+
+struct MapHolder
+    names: Map[string, int]
+
+@test("a struct holding a map, copied, holds the same map")
+copied_holder_shares_its_map()
+    val a = MapHolder(map())
+    var b = a
+
+    b.names.put("x", 1)
+
+    assert_eq(a.names.len(), 1)
+    assert_eq(a.names.get("x"), Some(1))
+end copied_holder_shares_its_map
+
+@test("a walk through one name sees what was put through the other")
+walk_sees_puts_through_the_other_name()
+    var m: Map[int, int] = map()
+    var n = m
+
+    n.put(1, 10)
+    n.put(2, 20)
+
+    var sum = 0
+
+    for (k, v) in m.walk()
+        sum += k + v
+
+    assert_eq(sum, 33)
+end walk_sees_puts_through_the_other_name
+
+// -- when a value is let go ---------------------------------------------------------------------------
+
+struct MapProbe
+    n: int
+
+@test("a value is let go when the last name for its map dies, not the first")
+values_live_until_the_last_name_dies()
+    var p: &MapProbe = MapProbe(1)
+    val w: weak MapProbe = p
+    var m: Map[int, &MapProbe] = map()
+    var n = m
+
+    m.put(1, p)
+    p = MapProbe(2)
+    m = map()
+
+    assert(w.get().is_some())
+    assert_eq(n.len(), 1)
+
+    n = map()
+
+    assert(w.get().is_none())
+end values_live_until_the_last_name_dies
+
+@test("a replaced or removed value is let go at the call, whichever name made it")
+replace_and_remove_let_go_at_the_call()
+    var p: &MapProbe = MapProbe(1)
+    var q: &MapProbe = MapProbe(2)
+    val wp: weak MapProbe = p
+    val wq: weak MapProbe = q
+    var m: Map[int, &MapProbe] = map()
+    var n = m
+
+    m.put(1, p)
+    m.put(2, q)
+    p = MapProbe(3)
+    q = MapProbe(4)
+
+    n.put(1, MapProbe(5))
+
+    assert(wp.get().is_none())
+    assert(wq.get().is_some())
+
+    n.remove(2)
+
+    assert(wq.get().is_none())
+    assert_eq(m.len(), 1)
+end replace_and_remove_let_go_at_the_call
