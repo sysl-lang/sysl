@@ -550,6 +550,38 @@ conversion reads the value at its own width — `%x` of an `i32 -1` is `ffffffff
 `ff` — while `%d` keeps the value's sign. A string is copied NUL-terminated so that C's `%s` can
 apply width and precision, which means an interior NUL ends the field there, as it does for any `%s`.
 
+**A width or a precision may be a hole of its own**, read when the line runs — C's `%*d` and `%.*f`,
+written where the digits would go. Flags stay as they are, and either count, or both, may be a hole:
+
+```sysl
+val x = 3.14159265
+
+for n in [0, 2, 6]
+    print(f"[${x}%.${n}f] [${42}%0${n + 3}d]")
+```
+
+```output
+[3] [042]
+[3.14] [00042]
+[3.141593] [000000042]
+```
+
+The count may be any integer up to 64 bits, saturated at C's `int`. **A negative count is read as C
+reads one**: a negative width left-justifies the field at its magnitude, and a negative precision is
+as though none was written. A negative *constant* is refused, the `-` flag being how a field is
+written left-justified. A value whose type renders itself is handed the counts in its `FormatSpec`,
+exactly as it is handed written digits. A count that is not an integer is refused:
+
+```sysl
+val x = 1.5
+
+print(f"${x}%.${x}f")
+```
+
+```error
+a width or precision written as a hole is a count, so it has to be an integer — but this one has type real
+```
+
 `s`, `raw` and `f` are only prefixes when written directly against the opening quote. Used as
 ordinary names they are unaffected, so `s + raw` and `f + 1` are ordinary expressions.
 

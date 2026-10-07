@@ -372,12 +372,49 @@ end spec_value
 
 // `str(x)` with a specifier of the reader's own -- the node `str_render` makes, at a `f"…"` hole's
 // width, precision and justification instead of at none.
-spec_render(cx: &Analyzer, span: Span, t: TExpr, spec: string) -> TExpr
+//
+// **A width or a precision a hole computed is read at run time** (`counts`, one per `*` in the
+// specifier), so the `FormatSpec` is then built by the library's `format_spec_of`, which applies C's
+// reading of a negative count. A specifier written out in full is still a constant.
+spec_render(cx: &Analyzer, span: Span, t: TExpr, spec: string, counts: Buf[TExpr]) -> TExpr
     val found = renderer(cx, span, t, "make a string of", "str")
     val parts = spec_parts(spec)
+    val fmt = if counts.is_empty() then spec_value(cx, span, parts.0, parts.1, parts.2)
+    else counted_spec(cx, span, spec, parts, counts)
 
-    TExpr(span, TRender(t, found.0, spec_value(cx, span, parts.0, parts.1, parts.2), found.1))
+    TExpr(span, TRender(t, found.0, fmt, found.1))
 end spec_render
+
+// The `FormatSpec` of a specifier with a `*` for its width, its precision or both: each `*` is the
+// next count, and a part written in digits is the constant it always was.
+private counted_spec(cx: &Analyzer, span: Span, spec: string, parts: (int, int, bool),
+                     counts: Buf[TExpr]) -> TExpr
+    val int_ty = texpr_type(counts.at(0))
+    var seen_dot = false
+    var width_star = false
+    var prec_star = false
+
+    for c in spec.chars
+        if c == '.' then seen_dot = true
+
+        if c == '*'
+            if seen_dot then prec_star = true else width_star = true
+
+    var next: usize = 0
+    var args: Buf[TExpr] = buf()
+
+    if width_star
+        args.push(counts.at(next))
+        next += 1
+    else
+        args.push(TExpr(span, TIntLit(from_int(long(parts.0)), int_ty)))
+
+    if prec_star then args.push(counts.at(next))
+    else args.push(TExpr(span, TIntLit(from_int(long(parts.1)), int_ty)))
+
+    args.push(TExpr(span, TBoolLit(parts.2)))
+    library_result_call_of(cx, span, "format_spec_of", args)
+end counted_spec
 
 // The separator and the terminator `print` puts around its values.
 private print_char(cx: &Analyzer, span: Span, c: char) -> TExpr =
@@ -427,6 +464,14 @@ end library_key
 // A call to a library function the compiler named for itself, at the result the library declares
 // for it -- which is what a member the compiler provides but does not implement comes to.
 library_result_call(cx: &Analyzer, span: Span, name: string, arg: TExpr) -> TExpr
+    var args: Buf[TExpr] = buf()
+
+    args.push(arg)
+    library_result_call_of(cx, span, name, args)
+end library_result_call
+
+// The same, over any number of arguments.
+library_result_call_of(cx: &Analyzer, span: Span, name: string, args: Buf[TExpr]) -> TExpr
     val key = library_key(cx, name)
 
     if key.is_none()
@@ -437,14 +482,11 @@ library_result_call(cx: &Analyzer, span: Span, name: string, arg: TExpr) -> TExp
 
     if f.is_none() then return bad_expr(span)
 
-    var args: Buf[TExpr] = buf()
-
-    args.push(arg)
     cx.an.uses(key.unwrap())
     TExpr(span, TCall(key.unwrap(), args,
                       declared_result(cx, f.unwrap().scope, f.unwrap().decl.ret_type,
                                       f.unwrap().decl.needs), false))
-end library_result_call
+end library_result_call_of
 
 // `str_cast(bytes)` -- the bytes taken as a string, with nothing checked.
 //

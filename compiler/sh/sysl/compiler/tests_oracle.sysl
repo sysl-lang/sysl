@@ -588,15 +588,19 @@ private compare_one(binary: string, path: string, label: string, text: string,
 //    answer with a parse error about some token. A refusal here that is not about the feature (a
 //    block broken in both compilers) is compared as before.
 //
+// **A construct the reference READS AS SOMETHING ELSE is excused whatever either side answers** -- an
+// `f"…"` specifier whose count is a hole (`<counted-spec>`) is ordinary text and a hole to the
+// reference, so the two trees cannot agree and neither can the two verdicts on a refused count.
+//
 // Every other disagreement is judged as before.
 private judge(label: string, text: string, ours: Answer, theirs: Answer, listed: Buf[OnlyHere],
               found: *Agreement)
     found.files += 1
 
-    if !theirs.ok
+    if !theirs.ok || ours.ok != theirs.ok || ours.text != theirs.text
         self_hosted_construct(text, listed) match
             Some(c) ->
-                if ours.ok || quotes_construct(ours.message, c)
+                if read_otherwise(c) || (!theirs.ok && (ours.ok || quotes_construct(ours.message, c)))
                     found.excused += 1
                     found.excused_blocks = s"${found.excused_blocks}\n  ${label} (${c.feature})"
                     return
@@ -711,13 +715,29 @@ private quotes_construct(message: string, c: OnlyHere) -> bool
 
     false
 
-// Whether one token is what one word of a construct asks for.
+// Whether a construct is one the reference parses, as something else -- so a block written in it
+// is excused whichever way either compiler answers.
+private read_otherwise(c: OnlyHere) -> bool
+    for k in 0..<c.words.len()
+        if c.words.at(k) == "<counted-spec>" then return true
+
+    false
+
+// Whether one token is what one word of a construct asks for. `<counted-spec>` is an `f"…"` literal
+// one of whose specifiers reads a count from a hole, which the lexer writes as a `*`.
 private token_fits(word: string, t: Tok) -> bool = t match
+    StrInterp(_, _, specs, _, _, _) -> word == "<counted-spec>" && counts_a_hole(specs)
     Ident(name) -> word == name || word == "<name>" || (word == "<fixed-type>" && fixed_spelling(name))
     Keyword(text) -> word == text
     IntLit(_, _, suffix) -> word == "<fixed-literal>" && fixed_spelling(suffix)
     FloatLit(_, suffix) -> word == "<fixed-literal>" && fixed_spelling(suffix)
     _ -> false
+
+private counts_a_hole(specs: Buf[string]) -> bool
+    for i in 0..<specs.len()
+        if spec_stars(specs.at(i)) > 0 then return true
+
+    false
 
 // A fixed-point type's spelling: the `iWqF`/`uWqF` shape, or one of the three named ones.
 private fixed_spelling(name: string) -> bool =
@@ -2686,7 +2706,34 @@ shx_the_constructs_are_read_from_the_file()
     assert(self_hosted_only_in(dir + "/absent.tsv").is_empty())
     assert(self_hosted_construct("const sq(x: int) -> int = x\n", buf()).is_none())
 
-@test("self-hosted only: the repository's own file lists the four features with a syntax")
+// A count read from a hole is ordinary text and a hole to the reference: it reads the block, as
+// something else, and the trees differ -- or this compiler refuses a count the reference never saw.
+@test("self-hosted only: a counted specifier the reference reads otherwise is excused either way")
+shx_a_counted_specifier_is_excused()
+    val run = "val n = 2\nprint(f\"${1.5}%.${n}f\")\n"
+    val refused = "print(f\"${1.5}%.${1.5}f\")\n"
+
+    var found = Agreement(0, 0, "", 0, "")
+
+    judge("page.md block 1", run, ask_ourselves("block.sysl", run), Answer(true, "theirs", ""),
+          self_hosted_only(), &found)
+    assert_eq(found.excused, 1)
+    assert_eq(found.mismatches, 0)
+    assert_eq(found.excused_blocks, "\n  page.md block 1 (counted specifiers)")
+
+    // Without a counted specifier the same disagreement is a failure.
+    val plain = "print(f\"${1.5}%.2f\")\n"
+    var other = Agreement(0, 0, "", 0, "")
+
+    judge("page.md block 1", plain, ask_ourselves("block.sysl", plain), Answer(true, "theirs", ""),
+          self_hosted_only(), &other)
+    assert_eq(other.excused, 0)
+    assert_eq(other.mismatches, 1)
+
+    assert(self_hosted_construct(refused, self_hosted_only()).is_some(), "a refused count is found")
+end shx_a_counted_specifier_is_excused
+
+@test("self-hosted only: the repository's own file lists the five features with a syntax")
 shx_the_repository_file_is_read()
     val listed = self_hosted_only()
     var features: Buf[string] = buf()
@@ -2694,7 +2741,8 @@ shx_the_repository_file_is_read()
     for i in 0..<listed.len()
         if !holds_name(features, listed.at(i).feature) then features.push(listed.at(i).feature)
 
-    assert_eq(features.len(), 4)
+    assert_eq(features.len(), 5)
+    assert(holds_name(features, "counted specifiers"), "counted specifiers are listed")
     assert(holds_name(features, "const functions"), "const functions are listed")
     assert(holds_name(features, "generic aliases"), "generic aliases are listed")
     assert(holds_name(features, "async/await"), "async/await is listed")

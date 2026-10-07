@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, from_int}
+import sysl.math.bigint.{BigInt, cmp, from_int, to_string as big_text}
 
 // What a pair of parentheses means, which is six different things told apart by what stands in
 // front of them: a conversion, a variant, a struct's constructor, a simple enum read out of an
@@ -722,9 +722,18 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
 
         return Some(str_render(cx, span, v))
 
-    if name == "format" && args.len() == 2 then
+    // A count read at run time is a `*` in the specifier with its hole after it, so a call carrying
+    // any other number of trailing values is not this form and resolves as an ordinary call.
+    if name == "format" && args.len() >= 2 then
         *args.at(1).kind match
-            StrLit(spec) -> return Some(format_call(cx, span, args.at(0), spec))
+            StrLit(spec) ->
+                if spec_stars(spec) == args.len() - 2
+                    var counts: Buf[Expr] = buf()
+
+                    for i in 2..<args.len()
+                        counts.push(args.at(i))
+
+                    return Some(format_call(cx, span, args.at(0), spec, counts))
             _ -> ()
 
     if name == "ptr_cast" then return Some(ptr_cast_call(cx, span, args, expected))
@@ -1275,11 +1284,19 @@ private written_floating(t: Type) -> bool = t match
     Floating(_, _) -> true
     _ -> false
 
-private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string) -> TExpr
+private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written: Buf[Expr]) -> TExpr
     val v = type_expr_bare(cx, arg)
     val ty = texpr_type(v)
+    var counts: Buf[TExpr] = buf()
 
-    if ty == Unknown then return TExpr(span, TFormat(v, spec))
+    for w in written.view()
+        val n = format_count(cx, w)
+
+        if texpr_type(n) == Unknown then return n
+
+        counts.push(n)
+
+    if ty == Unknown then return TExpr(span, TFormat(v, spec, counts))
 
     val c = spec_conversion(spec)
 
@@ -1303,14 +1320,48 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string) -> TExpr
                           "'str' instead")
     end if
 
-    if fits then return TExpr(span, TFormat(v, spec))
+    if fits then return TExpr(span, TFormat(v, spec, counts))
 
     if spec_is_str(c) && !scalar_render(ty) && renders_itself(cx, ty) then
-        return spec_render(cx, span, v, spec)
+        return spec_render(cx, span, v, spec, counts)
 
     cx.err(span, s"format '$spec' expects ${spec_expects(c)}, but the value has type " +
            type_show(ty))
 end format_call
+
+// A width or a precision computed by a hole -- the `n` in `${x}%.${n}f` -- read as the count C's
+// `*` takes.
+//
+// **Any integer will do, at any width up to 64 bits**, and it is handed over as an `i128` so that
+// every one of them arrives exactly; the library's `format_count` saturates it to C's `int`. A
+// **negative** count follows C: a negative width left-justifies the field at its magnitude, and a
+// negative precision is as though none was written. A count that is negative while compiling is
+// refused, since nobody writes `-3` to mean "left-justify" when `%-3` says it.
+private format_count(cx: &Analyzer, w: Expr) -> TExpr
+    val t = type_expr_bare(cx, w)
+    val ty = texpr_type(t)
+
+    if ty == Unknown then return t
+
+    if !written_integer(ty)
+        return cx.err(w.span, "a width or precision written as a hole is a count, so it has to be " +
+                      s"an integer — but this one has type ${type_show(ty)}")
+
+    val bits = core_measure("width", ty)
+
+    if bits.is_some() && bits.unwrap() > 64
+        return cx.err(w.span, "a width or precision written as a hole is read as C's 'int', and " +
+                      s"${type_show(ty)} is wider than any count it could hold")
+
+    val fixed = const_int(cx, w)
+
+    if fixed.is_some() && cmp(fixed.unwrap(), from_int(0)) < 0
+        return cx.err(w.span, "a width or precision may not be a negative constant, and this one " +
+                      s"is ${big_text(fixed.unwrap())} — the '-' flag is what left-justifies a field")
+
+    library_result_call(cx, w.span, "format_count",
+                        TExpr(w.span, TCast(t, Integer(128, true, false))))
+end format_count
 
 // What a plain alias stands for, where the resolution has already made it real.
 //
