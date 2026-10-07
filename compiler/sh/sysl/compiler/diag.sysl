@@ -130,16 +130,32 @@ analysis_report(all: Buf[Placed]) -> string
 end analysis_report
 
 // A file that did not parse, reported in the one shape every error has: `error:`, the `-->` line,
-// the quoted line and a caret. Only the first complaint is reported -- the grammar's first reaction
-// is the one worth reading -- and **it points at a position rather than an extent**: the caret
-// covers the token that begins there, which is what the reference underlines, and is one column
-// wide where no written token does -- at a line's layout, the end of the file, or inside a token
-// the lexer itself refused.
+// the quoted line and a caret. **Every line recovery could not read is reported**, in source order
+// and separated by a blank line, as the reference's build is handed them: the first is the grammar's
+// own reaction, and each after it a line further down that recovery skipped. **A line is reported
+// once**: a complaint on the line of the one before it is the same mistake's echo (`(1 +` at the end
+// of a file is an expression and a `)` both missing at one point), which the reference, recovering a
+// statement at a time, never says twice. Each **points at a position rather than an extent**: the
+// caret covers the token that begins there, which is what the reference underlines, and is one
+// column wide where no written token does -- at a line's layout, the end of the file, or inside a
+// token the lexer itself refused.
 parse_report(p: Parsed) -> string
-    val at = p.first().span.start
-    val message = p.first().message
+    var b = str_builder()
+    var last_line: usize = 0
 
-    ended(Placed(p.src, error(token_at(p.src, at, message == "dedent expected"), message)))
+    for i in 0..<p.report.len()
+        val d = p.report.at(i)
+        val line = p.src.locate(d.span.start).line
+
+        if i > 0 && line <= last_line then continue
+
+        if i > 0 then b.push("\n\n")
+
+        last_line = line
+        b.push(ended(Placed(p.src, error(token_at(p.src, d.span.start, d.message == "dedent expected"),
+            d.message))))
+
+    b.finish()
 end parse_report
 
 // The written token that begins at `at`, or the point itself where none does. **An indent or a
