@@ -1,0 +1,331 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Generic type aliases: `type Callback[D] = &Fn(*Loop[D]) -> unit`.
+//
+// An alias that takes parameters is as TRANSPARENT as one that does not: an application is its
+// right-hand side with the arguments put in, so `Callback[Board]` and `&Fn(*Loop[Board]) -> unit` are
+// one type with one instantiation and one mangled name. The arity, the defaults and the bounds are a
+// generic struct's, checked by the same functions in the same words; a parameter the right-hand side
+// never uses is allowed, as it is on a struct. Only a transparent alias takes parameters -- a `new`,
+// `within`, `where`, `wrapping` or `@export` type is refused at its declaration.
+
+private gta_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end gta_skip
+
+private gta_skip_run() -> bool
+    if gta_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end gta_skip_run
+
+// A project holding `main.sysl` and, where one is given, a module `geo` in `geo/geo.sysl`.
+private gta_write(main: string, geo: string) -> string
+    val root = make_temp_dir("sysl-gta").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    if geo != ""
+        make_dir_all(root + "/geo").unwrap()
+        write_text(root + "/geo/geo.sysl", geo).unwrap()
+    end if
+
+    root
+end gta_write
+
+// What the program PRINTS, or what the build had to say about it.
+private gta_ran_with(main: string, geo: string) -> string
+    val root = gta_write(main, geo)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end gta_ran_with
+
+private gta_prints(main: string, expected: string)
+    if gta_skip_run() then return
+
+    val out = gta_ran_with(main, "")
+
+    assert(out == expected, s"expected '$expected', got: $out")
+
+// The LLVM text of the program, or everything the analysis had to say about it.
+private gta_report_with(main: string, geo: string) -> string
+    val root = gta_write(main, geo)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gta_report_with
+
+// The program is refused with exactly this message, first, at this line and column of `file`.
+private gta_refused_in(main: string, geo: string, message: string, file: string, at: string)
+    if gta_skip() then return
+
+    val out = gta_report_with(main, geo)
+    val first = out.index_of("\n\n") match
+        Some(n) -> out[0..<n]
+        None -> out
+
+    assert(out.starts_with(s"error: $message\n "), s"expected 'error: $message' first, got: $out")
+    assert(first.index_of(s"/$file:$at\n").is_some(), s"expected it first at $file:$at, got: $out")
+end gta_refused_in
+
+private gta_refused(main: string, message: string, at: string) =
+    gta_refused_in(main, "", message, "main.sysl", at)
+
+// How many lines of the LLVM text start with `prefix`.
+private gta_lines_starting(main: string, prefix: string) -> usize
+    val lines = lines_of(gta_report_with(main, ""))
+    var n: usize = 0
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with(prefix) then n += 1
+
+    n
+end gta_lines_starting
+
+// The one declaration in `src`, rendered by `sysl doc`.
+private gta_doc_of(src: string) -> string
+    val r = parse(source_of("t.sysl", s"module m\n\n${src}\n"))
+
+    if !r.ok() then return s"!${r.first().message}"
+
+    var found: Buf[string] = buf()
+
+    for i in 0..<r.program.body.len()
+        doc_signature(r.program.body.at(i)) match
+            Some(t) -> found.push(t)
+            None -> ()
+
+    if found.len() != 1 then return s"!${found.len()} declarations"
+
+    found.at(0)
+end gta_doc_of
+
+private gta_loop() -> string =
+    "struct Loop[D]\n    data: D\n\ntype Callback[D] = &Fn(*Loop[D]) -> unit\n\n"
+
+// -- the parser and the printers ------------------------------------------------------------------
+
+@test("a type declaration may take a parameter list, which the test spelling shows")
+gta_parses_and_shows() =
+    assert_eq(pf("type Pair[A, B: Display = int] = (A, B)\n"), "(type Pair (A B:Display=int) = (tuple A B))")
+
+@test("emit-ast prints a generic alias's parameters, its bounds and its defaults")
+gta_emit_ast_prints_the_parameters()
+    val r = parse(source_of("t.sysl", "type Pair[A: Display, B = int] = (A, B)\n"))
+
+    assert(r.ok(), "the declaration parses")
+
+    val out = emit_ast(r.program, false)
+
+    assert(out.index_of("tparams: [\"A\", \"B\"]").is_some(), s"tparams, got: $out")
+    assert(out.index_of("bounds:").is_some(), s"bounds, got: $out")
+    assert(out.index_of("tdefaults:").is_some(), s"tdefaults, got: $out")
+
+@test("emit-ast prints nothing new for an alias with no parameters")
+gta_emit_ast_unchanged_for_a_plain_alias()
+    val r = parse(source_of("t.sysl", "type Id = int\n"))
+    val out = emit_ast(r.program, false)
+
+    assert(out.index_of("tparams").is_none(), s"no tparams, got: $out")
+
+@test("sysl doc renders a generic alias with its parameters, bounds and defaults")
+gta_doc_renders_the_parameters()
+    assert_eq(gta_doc_of("type Callback[D] = &Fn(*Loop[D]) -> unit"), "type Callback[D] = &Fn(*Loop[D]) -> unit")
+    assert_eq(gta_doc_of("type Table[K: Hash + Eq, V = int] = Map[K, V]"),
+              "type Table[K: Hash + Eq, V = int] = Map[K, V]")
+
+// -- every position --------------------------------------------------------------------------------
+
+@test("a generic alias of a callable is exactly what it names, as a parameter")
+gta_a_callable_alias_as_a_parameter() =
+    gta_prints(gta_loop() + "fire(l: *Loop[int], cb: Callback[int]) = cb(l)\n\nvar l = Loop(41)\n" +
+               "fire(&l, (x) -> print(x.data + 1))\n", "42\n")
+
+@test("as a result, a field and a local")
+gta_a_result_a_field_and_a_local() =
+    gta_prints("type Pair[A, B] = (A, B)\n\nstruct Holder\n    p: Pair[int, string]\n\n" +
+               "make(n: int) -> Pair[int, string] = (n, \"b\")\n\nval h = Holder(make(2))\n" +
+               "val q: Pair[string, int] = (h.p.1, h.p.0)\nprint(q.0, q.1)\n", "b 2\n")
+
+@test("an alias of an alias, handed to a function written in the expansion")
+gta_an_alias_of_an_alias() =
+    gta_prints("type Pair[A, B] = (A, B)\ntype Twice[T] = Pair[T, T]\n\n" +
+               "sum(t: (int, int)) -> int = t.0 + t.1\n\nval t: Twice[int] = (3, 4)\nprint(sum(t))\n", "7\n")
+
+@test("a bound the arguments meet, over a library type")
+gta_a_bound_that_holds() =
+    gta_prints("import sysl.container.{Map, map}\n\ntype Table[K: Hash + Eq, V] = Map[K, V]\n\n" +
+               "var m: Table[string, int] = map()\nm.put(\"k\", 5)\nprint(m.get(\"k\").unwrap())\n", "5\n")
+
+@test("a parameter's default fills an argument left out")
+gta_a_default() =
+    gta_prints("type Opt[T = int] = Option[T]\n\nval o: Opt = Some(6)\nval p: Opt[string] = Some(\"s\")\n" +
+               "print(o.unwrap(), p.unwrap())\n", "6 s\n")
+
+@test("a parameter the right-hand side never uses is allowed, as on a struct")
+gta_an_unused_parameter() =
+    gta_prints("type Phantom[T] = int\n\nf(p: Phantom[string]) -> int = p + 1\nprint(f(1))\n", "2\n")
+
+@test("an impl may name its target through a generic alias")
+gta_an_impl_target() =
+    gta_prints("struct Box[T]\n    v: T\n\ntype Bx[T] = Box[T]\n\ntrait Show\n    show(self) -> string\n\n" +
+               "impl Show for Bx[int]\n    show(self) -> string = s\"box ${self.v}\"\n\n" +
+               "val b: Box[int] = Box(1)\nprint(b.show())\n", "box 1\n")
+
+@test("a type argument is inferred through a generic alias as through what it names")
+gta_inferred_through_the_alias() =
+    gta_prints("type Pair[A, B] = (A, B)\n\nswap[A, B](p: Pair[A, B]) -> Pair[B, A] = (p.1, p.0)\n\n" +
+               "val p: Pair[int, string] = (1, \"one\")\nval q: (string, int) = swap(p)\nprint(q.0, q.1)\n",
+               "one 1\n")
+
+@test("a generic alias declared in another module, reached qualified and by import")
+gta_across_modules()
+    if gta_skip_run() then return
+
+    val geo = "module geo\n\ntype Pair[A, B] = (A, B)\n\nswap[A, B](p: Pair[A, B]) -> Pair[B, A] = (p.1, p.0)\n"
+    val main = "import geo.{Pair, swap}\n\nval p: Pair[int, string] = (1, \"x\")\n" +
+               "val q: geo.Pair[string, int] = swap(p)\nprint(q.0)\n"
+
+    assert_eq(gta_ran_with(main, geo), "x\n")
+
+@test("a private generic alias is out of reach of another module")
+gta_a_private_alias_is_out_of_reach()
+    if gta_skip() then return
+
+    val out = gta_report_with("val h: geo.Hidden[int] = (1, 2)\nprint(h.0)\n",
+                              "module geo\n\nprivate type Hidden[T] = (T, T)\n")
+
+    assert(out.starts_with("error: 'geo.Hidden' is private to '"), s"expected the privacy refusal, got: $out")
+    assert(out.index_of("/geo/geo.sysl', the file that declares it\n").is_some(), s"naming the file, got: $out")
+    assert(out.index_of("/main.sysl:1:8\n").is_some(), s"at the application, got: $out")
+
+// -- one type, one instantiation -------------------------------------------------------------------
+
+@test("an application and its expansion are one instantiation, with one layout")
+gta_one_instantiation()
+    if gta_skip() then return
+
+    val main = "struct Box[T]\n    v: T\n\ntype Bx[T] = Box[T]\n\nfirst(b: Box[int]) -> int = b.v\n" +
+               "second(b: Bx[int]) -> int = b.v\n\nval a: Bx[int] = Box(1)\nval b: Box[int] = a\n" +
+               "print(first(a) + second(b))\n"
+
+    assert_eq(gta_lines_starting(main, "%struct.Box.int = type"), 1)
+
+@test("a function taking the expansion accepts the application, and the reverse")
+gta_the_two_spellings_are_interchangeable() =
+    gta_prints("type Pair[A, B] = (A, B)\n\nf(p: Pair[int, int]) -> (int, int) = p\n" +
+               "g(p: (int, int)) -> Pair[int, int] = p\n\nprint(f(g((1, 2))).1)\n", "2\n")
+
+// -- the refusals -----------------------------------------------------------------------------------
+
+@test("too few type arguments are refused, naming the alias and its count")
+gta_too_few() =
+    gta_refused("type Pair[A, B] = (A, B)\n\nf(p: Pair[int]) = ()\n",
+                "alias 'Pair' takes 2 type arguments, but 1 type argument was given", "3:6")
+
+@test("too many as well")
+gta_too_many() =
+    gta_refused("type Box1[A] = Option[A]\n\nf(p: Box1[int, int]) = ()\n",
+                "alias 'Box1' takes 1 type argument, but 2 type arguments were given", "3:6")
+
+@test("a bare generic alias with no arguments is refused")
+gta_bare() =
+    gta_refused("type Pair[A, B] = (A, B)\n\nf(p: Pair) = ()\n",
+                "alias 'Pair' takes 2 type arguments, but 0 type arguments were given", "3:6")
+
+@test("with defaults the count is a range")
+gta_defaults_make_a_range() =
+    gta_refused("type Two[A, B = int] = (A, B)\n\nf(p: Two) = ()\n",
+                "alias 'Two' takes between 1 and 2 type arguments, but 0 type arguments were given", "3:6")
+
+@test("an argument that misses a bound is refused in a generic struct's words")
+gta_an_unmet_bound() =
+    gta_refused("type Table[K: Hash, V] = (K, V)\n\nstruct NoHash\n    x: int\n\n" +
+                "f(t: Table[NoHash, int]) = ()\n",
+                "'Table' requires its type parameter 'K' to implement 'sysl.Hash', but NoHash does not", "6:6")
+
+@test("a 'new' type may not take parameters")
+gta_a_new_type_is_refused() =
+    gta_refused("type M[T] = new int\n",
+                "'M' takes type parameters, and only a transparent alias may — a 'new', 'within', " +
+                "'where', 'wrapping' or '@export' type is one type of its own, with one range, one " +
+                "check and one name in a header, so there is nothing for an argument to fill", "1:1")
+
+@test("nor may a 'within' type")
+gta_a_within_type_is_refused() =
+    gta_refused("type R[T] = int within 0..10\n",
+                "'R' takes type parameters, and only a transparent alias may — a 'new', 'within', " +
+                "'where', 'wrapping' or '@export' type is one type of its own, with one range, one " +
+                "check and one name in a header, so there is nothing for an argument to fill", "1:1")
+
+@test("a pack parameter on an alias is refused")
+gta_a_pack_is_refused() =
+    gta_refused("type All[..A] = (..A)\n",
+                "'All' is an alias, and an alias's parameter stands for one type — '..A' would stand " +
+                "for a list of them", "1:1")
+
+@test("two generic aliases naming each other are a cycle")
+gta_a_cycle_through_parameters() =
+    gta_refused("type Cyc[T] = Cyc2[T]\ntype Cyc2[T] = Cyc[T]\n",
+                "'Cyc' is an alias for itself, through a chain of aliases", "1:1")
+
+@test("and so is one that names itself inside what it names")
+gta_a_cycle_inside_a_type() =
+    gta_refused("type Deep[T] = Option[Deep[T]]\n\nf(x: Deep[int]) = ()\n",
+                "'Deep' is an alias for itself, through a chain of aliases", "1:1")
+
+@test("an alias's parameter is never mistaken for a declaration of its name")
+gta_a_parameter_is_not_a_declaration() =
+    gta_prints("type T = int\ntype Id[T] = T\n\nval s: Id[string] = \"s\"\nprint(s)\n", "s\n")
+
+@test("a name the right-hand side gets wrong is refused though nothing applies the alias")
+gta_an_unused_alias_is_still_read() =
+    gta_refused("type Bad[T] = Missing[T]\n", "unknown type 'Missing'", "1:15")
+
+@test("a generic alias of a callable, named again by the fields of the struct it names")
+gta_reentry_through_a_generic_struct() =
+    gta_prints("import sysl.buf.{Buf, buf}\n\ntype Callback[D] = &Fn(*Loop[D]) -> unit\n\n" +
+               "struct Slots[T]\n    entries: Buf[T]\n\nstruct Loop[D]\n    data: D\n" +
+               "    idles: Slots[Callback[D]]\n\nvar l = Loop(7, Slots(buf()))\n" +
+               "l.idles.entries.push((x) -> print(x.data))\nl.idles.entries.at(0)(&l)\n", "7\n")
+
+@test("a generic alias is not called")
+gta_not_called() =
+    gta_refused("type Pair[A, B] = (A, B)\n\nprint(Pair(1, 2).0)\n",
+                "'Pair' is an alias, and an alias is not something that is called", "3:7")

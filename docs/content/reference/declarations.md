@@ -1909,6 +1909,42 @@ print(w[2].at, w[2].value)
 2 3.5
 ```
 
+An alias may take type parameters, written in brackets after its name as a struct's are. A generic
+alias is just as transparent: `Pair[int, string]` **is** `(int, string)`, the same type with the same
+instantiation, so a value of one goes wherever the other is asked for, and a type argument is inferred
+through it as through what it names. A bound on a parameter is held at every application, and a
+default may be given as on a struct:
+
+```sysl
+type Pair[A, B] = (A, B)
+
+swap[A, B](p: Pair[A, B]) -> Pair[B, A] = (p.1, p.0)
+
+val p: Pair[int, string] = (1, "one")
+val q: (string, int) = swap(p)
+
+print(q.0, q.1)
+```
+
+```output
+one 1
+```
+
+An application gives exactly as many arguments as the alias takes, less any it has defaults for:
+
+```sysl
+type Pair[A, B] = (A, B)
+
+first(p: Pair[int]) -> int = p.0
+```
+
+```error
+alias 'Pair' takes 2 type arguments, but 1 type argument was given
+```
+
+Only an alias takes parameters. A `new`, `within` or `where` type is one type of its own, so writing
+it with a parameter list is refused.
+
 Adding `new` makes it a genuinely distinct type, and `within` and `where` add checked bounds:
 
 ```sysl

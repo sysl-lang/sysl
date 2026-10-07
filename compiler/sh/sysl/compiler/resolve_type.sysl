@@ -2070,6 +2070,8 @@ end assoc_bindings
 // stack runs out.
 instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: string, key: string,
                           d: TypeDecl, home: Scope, targs: Buf[Type]) -> Type
+    if !d.tp.names.is_empty() then return instantiate_generic_alias(a, scope, span, key, d, home, targs)
+
     if !targs.is_empty() then
         a.fault(scope, span, s"'$written' is ${if is_plain_alias(d) then "an alias" else "a constrained subtype"} " +
                 "and takes no type arguments")
@@ -2176,6 +2178,64 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
     a.tables.broken.remove(key)
     made
 end instantiate_named_subtype
+
+// A generic alias at these arguments: **its right-hand side with the arguments put in**, and nothing
+// else. `Callback[Board]` over `type Callback[D] = &Fn(*Loop[D]) -> unit` IS `&Fn(*Loop[Board]) ->
+// unit` -- one type, one instantiation of `Loop`, one mangled name -- so no nominal type is made here
+// and the answer is filed only so that a second application is not read twice.
+//
+// The arity, the defaults and the bounds are a generic struct's, by the same functions, so a wrong
+// count and an argument that misses a bound are refused in the words a struct's are. A declaration
+// that is not a transparent alias, or that takes a pack, was refused where it was declared
+// (`read_generic_alias`), and applying one answers nothing more.
+//
+// **Following one has to terminate** by the plain alias's rule: the mark is keyed on the application,
+// so `type L[T] = Option[L[T]]` comes round to `L[T]` again and is refused rather than unrolled.
+private instantiate_generic_alias(a: &Analysis, scope: Scope, span: Span, key: string, d: TypeDecl,
+                                  home: Scope, written_targs: Buf[Type]) -> Type
+    if !is_plain_alias(d) || !d.tp.packs.is_empty() then return Unknown
+
+    if !check_arity(a, scope, span, qualified_name(key), d.tp.names, d.tp.defaults, written_targs,
+                    "alias") then
+        return Unknown
+
+    val fill = filled_targs(a, scope, span, key, home, d.tp.names, d.tp.defaults, d.tp.values,
+                            written_targs)
+
+    if fill.is_none() then return Unknown
+
+    val targs = fill.unwrap()
+
+    val checked = applied_bounds(a, scope, span, key, home, d.tp.names, d.tp.bounds, targs)
+
+    val inst = instance_key(key, targs)
+    val already = a.tables.constrained_insts.get(inst)
+
+    if already.is_some() then return already.unwrap()
+
+    a.tables.broken.get(inst) match
+        Some(first) ->
+            if !first
+                a.fault(home, declared_at(a, key, span),
+                        s"'${d.name}' is an alias for itself, through a chain of aliases")
+                return Unknown
+            end if
+
+            a.tables.broken.put(inst, false)
+        None -> a.tables.broken.put(inst, true)
+
+    // Read quietly where the arguments were refused, as a struct's fields are (`applied_bounds`).
+    val outer = enter_fields(a, checked)
+    val made = resolve_type(a, home, d.base, bindings_for(d.tp.names, targs))
+
+    leave_fields(a, outer)
+    a.tables.broken.remove(inst)
+
+    if type_eq(made, Unknown) then return Unknown
+
+    a.tables.constrained_insts.put(inst, made)
+    made
+end instantiate_generic_alias
 
 // The number a written range end stands for, where it settles at all. A `within` may be written over
 // floats as well as integers, so a decimal literal is read as the text it is -- `0.1` the decimal
