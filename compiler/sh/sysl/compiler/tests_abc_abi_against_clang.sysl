@@ -1,0 +1,273 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_var
+import sysl.text.{parse_int_base, replace_all, str_builder, Search}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+
+// **That sysl's calling conventions are what clang says they are, asked of clang rather than
+// remembered from having asked it once.** `tests_cabi.sysl` pins the classifier against strings read
+// off clang, so a misreading is pinned as firmly as a reading; this asks the authority directly. For
+// each shape and each machine it compiles the same aggregate in C for the same triple, reads the
+// `declare` clang produced for a function returning it and one taking it, and requires sysl's to say
+// the same thing.
+//
+// **One clang answers for every target, chosen rather than found**: `SYSL_ABI_CLANG`, then the
+// Homebrew LLVM, then whatever `clang` names — and it must be LLVM 23 or newer, the convention sysl
+// lowers to. The C includes no header and is never linked, so no sysroot has anything to say; a
+// machine whose back end that clang lacks is named and passed over, never silently passed. CRAFT has
+// no clang at all and a machine sysl cannot build for has no convention, so neither is asked.
+//
+// The sysl half is compiled in-process with the standard module read from source for each machine,
+// which is the path a machine without a prebuilt library (`riscv64-linux`, `x86_64-windows`,
+// `wasm32-wasi` here) still has.
+//
+// Ported from the reference's `AbiAgainstClangTests` (0.0.162), whose shapes these are.
+
+private struct AbcShape
+    what: string
+    sysl: string
+    c: string
+    packed: bool
+
+private abc_shapes() -> Buf[AbcShape]
+    var out: Buf[AbcShape] = buf()
+    val sh = (w: string, s: string, c: string) -> AbcShape(w, s, c, false)
+    val pk = (w: string, s: string, c: string) -> AbcShape(w, s, c, true)
+
+    out.push(sh("one byte", "    a: u8", "unsigned char a;"))
+    out.push(sh("three bytes", "    a: u8\n    b: u8\n    c: u8", "unsigned char a; unsigned char b; unsigned char c;"))
+    out.push(sh("one word", "    a: i32", "int a;"))
+    out.push(sh("five bytes, aligned to one", "    a: [5]u8", "unsigned char a[5];"))
+    out.push(sh("two words", "    a: i32\n    b: i32", "int a; int b;"))
+    out.push(sh("eight bytes aligned to eight", "    a: i64", "long long a;"))
+    out.push(sh("sixteen bytes aligned to eight", "    a: i64\n    b: i32", "long long a; int b;"))
+    out.push(sh("two pointers", "    p: *u8\n    q: *u8", "char *p; char *q;"))
+    out.push(sh("sixty-four bytes", "    a: [64]u8", "unsigned char a[64];"))
+    out.push(sh("one float", "    a: f32", "float a;"))
+    out.push(sh("two floats", "    a: f32\n    b: f32", "float a; float b;"))
+    out.push(sh("four doubles", "    a: f64\n    b: f64\n    c: f64\n    d: f64", "double a; double b; double c; double d;"))
+    out.push(sh("five doubles", "    a: f64\n    b: f64\n    c: f64\n    d: f64\n    e: f64",
+                "double a; double b; double c; double d; double e;"))
+    out.push(sh("a double beside an integer", "    a: f64\n    b: i64", "double a; long long b;"))
+    out.push(sh("a float beside an integer", "    a: f32\n    b: i32", "float a; int b;"))
+
+    // `@packed` is the one thing a layout attribute changes about a call: System V classifies an
+    // aggregate with a member off its own alignment as MEMORY whatever its size.
+    out.push(pk("a packed header", "    a: u8\n    b: u32", "unsigned char a; unsigned int b;"))
+
+    // And the bitfields inside one. **The C is one unsigned integer of the container's width, not C
+    // bitfields**: a bitfield struct IS one integer, and C leaves bitfield allocation
+    // implementation-defined (MSVC and Itanium disagree on the size), which is the reason sysl pins
+    // it. Three bytes has no C integer to name it, and there the byte array is what clang itself
+    // models a three-byte bitfield struct as.
+    out.push(pk("a byte of bitfields", "    a: u1\n    b: u3\n    c: u4", "unsigned char x;"))
+    out.push(pk("bitfields straddling a byte", "    a: u3\n    b: u16\n    c: u5", "unsigned char x[3];"))
+    out.push(pk("a word of bitfields", "    a: u3\n    b: u29", "unsigned int x;"))
+    out.push(pk("eight bytes of bitfields", "    a: u5\n    b: u59", "unsigned long long x;"))
+    out
+end abc_shapes
+
+// Everything a `declare` carries that is not the convention's answer: linkage, attribute groups and
+// optimizer facts. `byval align N` stays — it is the stack slot's alignment, which IS the answer. A
+// coercion array of addresses is `[N x ptr]` in one LLVM and `[N x iW]` in another, W the pointer
+// width; only inside the brackets, so a real `ptr` argument is untouched.
+private abc_normalize(t: Target, line: string) -> string
+    var s = line
+
+    for junk in ["dso_local ", " #0", " #1", " #2", "noundef ", " noundef", "dead_on_unwind ",
+                 "writable ", "dead_on_return ", " dead_on_return"]
+        s = replace_all(s, junk, "")
+
+    replace_all(abc_squeeze(s), " x ptr]", s" x i${t.pointer_bits()}]")
+end abc_normalize
+
+// Every run of blanks as one space, and none at either end.
+private abc_squeeze(s: string) -> string
+    var b = str_builder()
+    var gap = false
+    var started = false
+
+    for i in 0..<s.bytes.len
+        val c = s.bytes[i]
+
+        if c == u8(' ') || c == u8('\t') || c == u8('\r') then gap = true
+        else
+            if gap && started then b.push_char(' ')
+
+            gap = false
+            started = true
+            b.push(s.slice(i, i + 1))
+
+    b.finish()
+end abc_squeeze
+
+private abc_declaring(t: Target, ir: string, symbol: string) -> Option[string]
+    val lines = lines_of(ir)
+
+    for i in 0..<lines.len()
+        val l = lines.at(i)
+
+        if l.starts_with("declare") && l.contains(s"@$symbol(") then return Some(abc_normalize(t, l))
+
+    None
+end abc_declaring
+
+// The major version a clang reports on its first line — `clang version 23.1.2`.
+private abc_major(cc: string) -> Option[int]
+    val got = capture(cc, ["--version"], "", [], true) match
+        Err(_) -> return None
+        Ok(out) -> out
+
+    if !got.status.ok() then return None
+
+    val at = got.text.index_of("version ")?
+    val rest = got.text.slice(at + 8, got.text.bytes.len)
+    val dot = rest.index_of_byte(u8('.'))?
+
+    parse_int_base(rest.slice(0, dot), 10).ok()
+end abc_major
+
+// The convention sysl lowers to is LLVM 23's, so an older clang measures against one sysl stopped
+// implementing and every answer it gives is a false red.
+private const AbcFloor: int = 23
+
+private abc_oracle() -> string
+    var candidates: Buf[string] = buf()
+
+    env_var("SYSL_ABI_CLANG") match
+        Some(p) -> candidates.push(p)
+        None -> ()
+
+    candidates.push("/opt/homebrew/opt/llvm/bin/clang")
+    candidates.push("/usr/local/opt/llvm/bin/clang")
+    candidates.push("clang")
+
+    for i in 0..<candidates.len()
+        val p = candidates.at(i)
+
+        abc_major(p) match
+            None -> ()
+            Some(v) ->
+                if v < AbcFloor
+                    skip(s"'$p' is clang $v and this oracle needs $AbcFloor or newer — sysl's conventions " +
+                         s"follow LLVM $AbcFloor's. Install a newer LLVM, or name one with SYSL_ABI_CLANG")
+
+                return p
+
+    skip("no clang answered '--version' among SYSL_ABI_CLANG, the Homebrew LLVM and 'clang'")
+end abc_oracle
+
+// What clang makes of the shape, as its `declare` lines. The `go` body is what forces both to be
+// emitted. `machine_flags` and not the triple alone: an FPU-less row carries `-mfpu=none`.
+private abc_clang_says(cc: string, t: Target, dir: string, s: AbcShape) -> string
+    val src = s"$dir/x.c"
+    val attr = if s.packed then " __attribute__((packed))" else ""
+
+    write_text(src, s"struct$attr S { ${s.c} };\nextern struct S give(void);\nextern void take(struct S v);\n" +
+                    "void go(void) { take(give()); }\n").unwrap()
+
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${t.triple}")
+    args.extend(machine_flags(t).view())
+    args.extend(["-S", "-emit-llvm", "-O0", "-o", "-", src])
+
+    val got = capture(cc, args.view(), "", [], true).unwrap()
+
+    assert(got.status.ok(), s"clang refused the C for ${t.triple}")
+    got.text
+end abc_clang_says
+
+private abc_has(xs: Buf[string], x: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == x then return true
+
+    false
+end abc_has
+
+// sysl's half, compiled in-process against the standard module parsed for this machine.
+private abc_sysl_says(t: Target, library: Buf[Program], s: AbcShape) -> string
+    val text = (if s.packed then "@packed\n" else "") +
+               s"struct S\n${s.sysl}\nextern give() -> S\nextern take(v: S)\ntake(give())\n"
+    val parsed = parse(source_of("t.sysl", text), t)
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end abc_sysl_says
+
+@test("every machine agrees with clang about every shape, returning it and passing it")
+abc_every_machine_agrees_with_clang()
+    val root = std_root() match
+        Err(why) -> skip(s"the standard module's source is not on this machine: $why")
+        Ok(r) -> r
+
+    val cc = abc_oracle()
+    val backends = clang_backends(cc)
+    val shapes = abc_shapes()
+    val all = all_targets()
+    val dir = make_temp_dir("sysl-abi-").unwrap()
+    var asked: usize = 0
+    var machines: usize = 0
+    var passed_over: usize = 0
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if !t.supported() || !t.builds_with_clang() then continue
+
+        if !abc_has(backends, cpu_backend(t.cpu))
+            print(s"not asked: '$cc' has no '${cpu_backend(t.cpu)}' back end, which '${t.name}' needs")
+            passed_over += 1
+            continue
+        end if
+
+        machines += 1
+
+        val library = std_units(root, t).unwrap()
+
+        for j in 0..<shapes.len()
+            val s = shapes.at(j)
+            val c = abc_clang_says(cc, t, dir, s)
+            val m = abc_sysl_says(t, library, s)
+            val what = s"${t.name} agrees with clang about ${s.what}"
+
+            assert(abc_declaring(t, c, "give").is_some(), s"$what: clang declared no 'give'")
+            assert_eq(s"$what, returning it: ${abc_declaring(t, m, "give")}",
+                      s"$what, returning it: ${abc_declaring(t, c, "give")}")
+            assert_eq(s"$what, passing it: ${abc_declaring(t, m, "take")}",
+                      s"$what, passing it: ${abc_declaring(t, c, "take")}")
+            asked += 1
+
+    remove_dir_all(dir).unwrap_or(())
+
+    // Twenty shapes on each of the twenty machines sysl builds for with clang. A machine whose back
+    // end this clang lacks was named above; where that is every one, nothing was measured at all.
+    if machines == 0 then skip(s"'$cc' has none of the back ends these machines need")
+
+    assert_eq(machines + passed_over, 20)
+    assert_eq(shapes.len(), 20)
+    assert_eq(asked, machines * 20)
+end abc_every_machine_agrees_with_clang
