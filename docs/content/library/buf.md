@@ -67,17 +67,18 @@ struct Buf[T]
     is_empty(self) -> bool
 
     at(self, i: usize) -> T
-    set(*self, i: usize, v: T)
+    set(self, i: usize, v: T)
 
-    push(*self, v: T)
-    extend(*self, xs: []const T)
-    pop(*self) -> Option[T]
+    push(self, v: T)
+    extend(self, xs: []const T)
+    pop(self) -> Option[T]
 
-    insert(*self, i: usize, v: T)
-    remove(*self, i: usize) -> T
-    truncate(*self, n: usize)
-    clear(*self)
+    insert(self, i: usize, v: T)
+    remove(self, i: usize) -> T
+    truncate(self, n: usize)
+    clear(self)
 
+    copy(self) -> Buf[T]
     view(self) -> []T
 ```
 
@@ -411,10 +412,7 @@ import sysl.buf.{Buf, buf}
 var outer: Buf[Buf[int]] = buf()
 
 outer.push(buf())
-
-var inner = outer.at(0)
-
-inner.push(1)
+outer.at(0).push(1)
 
 print(outer.at(0).len())
 ```
@@ -425,8 +423,32 @@ print(outer.at(0).len())
 
 That is what a growable collection is in most languages a program has met — Scala's `ArrayBuffer`,
 Java's `ArrayList`, a Python list — and it is what a program reaching for one expects: a function that
-fills the buffer it was handed fills the caller's. A program that wants a second buffer makes one with
-`buf()` and fills it from the first.
+fills the buffer it was handed fills the caller's.
+
+**So every member that changes a buffer takes it by value**, a copy of the handle being the same
+buffer, and **a `val` buffer is pushed into like any other.** What `val` promises is about the name: it
+always refers to the same buffer, which is exactly what a parameter or a field holding one wants to
+say. A program that wants a *second* buffer asks for one with `copy()`:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+fill(b: Buf[int]) = b.push(9)
+
+val a: Buf[int] = buf()
+
+fill(a)
+
+val b = a.copy()
+
+b.push(10)
+
+print(a.len(), b.len())
+```
+
+```output
+1 2
+```
 
 **A `Buf` has no zero value, because a buffer is a box and a box is made by somebody.** A declaration
 has to say which buffer it starts as:

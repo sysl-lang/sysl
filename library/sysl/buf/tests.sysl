@@ -594,10 +594,7 @@ assignment_shares()
     assert_eq(a.at(1), 2)
 end assignment_shares
 
-private push_nine(b: Buf[int])
-    var mine = b
-
-    mine.push(9)
+private push_nine(b: Buf[int]) = b.push(9)
 
 @test("a buffer passed by value is the caller's buffer")
 parameter_shares()
@@ -628,10 +625,7 @@ nested_push_sticks()
     var outer: Buf[Buf[int]] = buf()
 
     outer.push(buf())
-
-    var inner = outer.at(0)
-
-    inner.push(5)
+    outer.at(0).push(5)
 
     assert_eq(outer.at(0).len(), 1)
     assert_eq(outer.at(0).at(0), 5)
@@ -642,8 +636,8 @@ struct Bag
 
 @test("a struct holding a buffer, copied, holds the same buffer")
 struct_copy_shares()
-    var s1 = Bag(buf())
-    var s2 = s1
+    val s1 = Bag(buf())
+    val s2 = s1
 
     s2.items.push(4)
 
@@ -654,7 +648,7 @@ end struct_copy_shares
 @test("the buffer behind a reference, read out of it, is the same buffer")
 deref_shares()
     val r: &Buf[int] = buf()
-    var v = *r
+    val v = *r
 
     v.push(1)
 
@@ -663,8 +657,8 @@ end deref_shares
 
 @test("growth through one name is seen through the other")
 growth_is_shared()
-    var a: Buf[int] = buf()
-    var b = a
+    val a: Buf[int] = buf()
+    val b = a
 
     for i in 0..<20
         b.push(i)
@@ -692,6 +686,43 @@ view_survives_growth_elsewhere()
     assert_eq(a.at(0), 100)
     assert_eq(a.len(), 9)
 end view_survives_growth_elsewhere
+
+@test("a buffer bound with val is pushed into, every mutator taking the handle by value")
+val_bound_mutates()
+    val b: Buf[int] = buf()
+
+    b.push(1)
+    b.extend([2, 3, 4])
+    b.set(0, 10)
+    b.insert(1, 5)
+
+    assert_eq(b.remove(2), 2)
+    assert_eq(b.pop().unwrap(), 4)
+
+    b.truncate(2)
+
+    assert_eq(b.len(), 2)
+    assert_eq(b.at(0), 10)
+    assert_eq(b.at(1), 5)
+
+    b.clear()
+
+    assert(b.is_empty())
+end val_bound_mutates
+
+private push_through(p: *Buf[int], v: int) = p.push(v)
+
+@test("a mutator is still reached through a pointer to the buffer")
+pointer_receiver_mutates()
+    var a: Buf[int] = buf()
+
+    push_through(&a, 7)
+    (&a).push(8)
+
+    assert_eq(a.len(), 2)
+    assert_eq(a.at(0), 7)
+    assert_eq(a.at(1), 8)
+end pointer_receiver_mutates
 
 // A second name for a buffer of counted elements, dying while the first lives on, lets go of nothing.
 private second_name_dies(b: Buf[&Probe])

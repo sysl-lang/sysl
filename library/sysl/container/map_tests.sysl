@@ -437,10 +437,7 @@ remove_and_clear_are_shared()
     assert_eq(m.capacity(), 0)
 end remove_and_clear_are_shared
 
-private put_nine(m: Map[int, int])
-    var here = m
-
-    here.put(9, 9)
+private put_nine(m: Map[int, int]) = m.put(9, 9)
 
 @test("a map handed to a function by value is the caller's map")
 by_value_parameter_shares()
@@ -454,9 +451,8 @@ end by_value_parameter_shares
 
 @test("a map captured by a closure is the map outside it")
 closure_capture_shares()
-    var m: Map[int, int] = map()
-    var inside = m
-    val add = (k: int) -> inside.put(k, k * 2)
+    val m: Map[int, int] = map()
+    val add = (k: int) -> m.put(k, k * 2)
 
     add(3)
     add(4)
@@ -471,9 +467,7 @@ nested_map_put_sticks()
 
     outer.put(1, map())
 
-    var inner = outer.get(1).unwrap()
-
-    inner.put(5, 50)
+    outer.get(1).unwrap().put(5, 50)
 
     assert_eq(outer.get(1).unwrap().len(), 1)
     assert_eq(outer.get(1).unwrap().get(5), Some(50))
@@ -485,7 +479,7 @@ struct MapHolder
 @test("a struct holding a map, copied, holds the same map")
 copied_holder_shares_its_map()
     val a = MapHolder(map())
-    var b = a
+    val b = a
 
     b.names.put("x", 1)
 
@@ -557,3 +551,60 @@ replace_and_remove_let_go_at_the_call()
     assert(wq.get().is_none())
     assert_eq(m.len(), 1)
 end replace_and_remove_let_go_at_the_call
+
+@test("a map bound with val is put into, every mutator taking the handle by value")
+val_bound_map_mutates()
+    val m: Map[int, int] = map()
+
+    m.put(1, 10)
+    m.put(2, 20)
+
+    assert(m.remove(1))
+    assert_eq(m.len(), 1)
+
+    m.clear()
+
+    assert(m.is_empty())
+end val_bound_map_mutates
+
+private put_through(p: *Map[int, int]) = p.put(3, 30)
+
+@test("a map's mutator is still reached through a pointer to it")
+map_pointer_receiver_mutates()
+    var m: Map[int, int] = map()
+
+    put_through(&m)
+
+    assert_eq(m.get(3), Some(30))
+end map_pointer_receiver_mutates
+
+@test("copy is a second map, and a put into either is not seen by the other")
+map_copy_is_a_second_map()
+    val a: Map[int, int] = map()
+
+    a.put(1, 10)
+    a.put(2, 20)
+
+    val b = a.copy()
+
+    b.put(3, 30)
+    a.put(1, 11)
+
+    assert_eq(a.len(), 2)
+    assert_eq(b.len(), 3)
+    assert(!a.has(3))
+    assert_eq(b.get(1), Some(10))
+    assert_eq(b.get(2), Some(20))
+    assert_eq(a.get(1), Some(11))
+end map_copy_is_a_second_map
+
+@test("a copy of an empty map is empty, and takes entries")
+map_copy_of_empty()
+    val a: Map[string, int] = map()
+    val b = a.copy()
+
+    b.put("x", 1)
+
+    assert(a.is_empty())
+    assert_eq(b.get("x"), Some(1))
+end map_copy_of_empty

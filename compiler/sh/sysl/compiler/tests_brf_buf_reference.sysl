@@ -71,9 +71,40 @@ brf_a_sync_buf_is_refused()
 
     assert_eq(brf_diags("import sysl.buf.{Buf, buf}\n\nval b: &sync Buf[int] = buf()\n\nprint(b.len())\n"),
               "'&sync sysl.buf.Buf[int]' may be reached from two domains at once, so every count inside it has " +
-              "to be atomic — but its 'core' reaches a '&sysl.buf.BufCore[int]', whose count is not. Hold it " +
-              "as a '&sync sysl.buf.BufCore[int]' ('06')")
+              "to be atomic — but a 'sysl.buf.Buf[int]' is shared through a count that is not atomic, and no " +
+              "spelling of it can cross into a '&sync' ('06')")
 end brf_a_sync_buf_is_refused
+
+@test("a Map behind a '&sync' is refused in words about the Map, its core being nothing a program can name")
+brf_a_sync_map_is_refused()
+    if !brf_ready() then return
+
+    assert_eq(brf_diags("import sysl.container.{Map, map}\n\nval m: &sync Map[int, int] = map()\n\nprint(m.len())\n"),
+              "'&sync sysl.container.Map[int, int]' may be reached from two domains at once, so every count " +
+              "inside it has to be atomic — but a 'sysl.container.Map[int, int]' is shared through a count " +
+              "that is not atomic, and no spelling of it can cross into a '&sync' ('06')")
+end brf_a_sync_map_is_refused
+
+@test("a Deque held in a field names the field and the Deque, not the core behind it")
+brf_a_sync_struct_holding_a_deque_is_refused()
+    if !brf_ready() then return
+
+    assert_eq(brf_diags("import sysl.container.{Deque, deque}\n\nstruct Jobs\n    queue: Deque[int]\n\n" +
+                        "val j: &sync Jobs = Jobs(deque())\n\nprint(j.queue.len())\n"),
+              "'&sync Jobs' may be reached from two domains at once, so every count inside it has to be " +
+              "atomic — but its 'queue' is a 'sysl.container.Deque[int]', which is shared through a count " +
+              "that is not atomic, and no spelling of it can cross into a '&sync' ('06')")
+end brf_a_sync_struct_holding_a_deque_is_refused
+
+@test("a struct of the program's own behind a reference is still told to hold it as a '&sync'")
+brf_a_nameable_core_keeps_the_advice()
+    if !brf_ready() then return
+
+    assert_eq(brf_diags("struct Cell\n    n: int\n\nstruct Holder\n    c: &Cell\n\n" +
+                        "val h: &sync Holder = Holder(Cell(1))\n\nprint(h.c.n)\n"),
+              "'&sync Holder' may be reached from two domains at once, so every count inside it has to be " +
+              "atomic — but its 'c' reaches a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')")
+end brf_a_nameable_core_keeps_the_advice
 
 // What a one-file program built and run in this process prints, or why it did not.
 private brf_ran(text: string) -> string

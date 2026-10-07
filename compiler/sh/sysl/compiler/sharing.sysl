@@ -21,32 +21,34 @@ import sysl.buf.{Buf, buf}
 // crossable list shows a view is about a channel that copies its bytes, and its leniency towards a
 // `*T` is exactly what the annotation suspends.
 
-// What stops an object being shareable: the field path that reaches it, and its type. An empty path
-// means the object asked about is itself the thing in the way.
+// What stops an object being shareable: the field path that reaches it, its type, and the struct or
+// enum whose field it is -- nothing where the object asked about is itself the thing in the way,
+// which is also what an empty path means.
 struct Unshareable
     path: Buf[string]
     ty: Type
+    holder: Option[Type]
 end Unshareable
 
 // The part of a type that may not be shared, or nothing where every count it reaches is atomic.
-unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf())
+unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None)
 
-private share_walk(t: Type, path: Buf[string]) -> Option[Unshareable] = t match
-    Ref(_, sync) -> if sync then None else Some(Unshareable(path, t))
+private share_walk(t: Type, path: Buf[string], holder: Option[Type]) -> Option[Unshareable] = t match
+    Ref(_, sync) -> if sync then None else Some(Unshareable(path, t, holder))
     Ptr(_) -> None
-    Weak(_) -> Some(Unshareable(path, t))
-    Slice(_, _) -> Some(Unshareable(path, t))
-    Str -> Some(Unshareable(path, t))
+    Weak(_) -> Some(Unshareable(path, t, holder))
+    Slice(_, _) -> Some(Unshareable(path, t, holder))
+    Str -> Some(Unshareable(path, t, holder))
 
     // An array *is* its elements, so sharing one shares each of them; the path stops at the field,
     // since naming the element is what the reported type already does.
-    Array(_, elem) -> share_walk(*elem, path)
+    Array(_, elem) -> share_walk(*elem, path, holder)
 
-    Constrained(d) -> share_walk(d.base, path)
-    Struct(d) -> share_walk_fields(d.fields, path, "")
+    Constrained(d) -> share_walk(d.base, path, holder)
+    Struct(d) -> share_walk_fields(d.fields, path, "", t)
 
     // A data enum shares one payload region, so every variant's fields are reachable from it.
-    Enum(d) -> share_walk_variants(d.variants, path)
+    Enum(d) -> share_walk_variants(d.variants, path, t)
 
     // A type parameter promises nothing about its counts, and nothing is decided here: the
     // instantiation resolves this type again with an argument in its place, and that is where the
@@ -55,19 +57,20 @@ private share_walk(t: Type, path: Buf[string]) -> Option[Unshareable] = t match
     _ -> None
 
 private share_walk_fields(fields: Buf[(string, Type)], path: Buf[string],
-                          prefix: string) -> Option[Unshareable]
+                          prefix: string, holder: Type) -> Option[Unshareable]
     for i in 0..<fields.len()
         val named = if prefix == "" then fields.at(i).0 else s"$prefix(${fields.at(i).0})"
-        val found = share_walk(fields.at(i).1, extended_path(path, named))
+        val found = share_walk(fields.at(i).1, extended_path(path, named), Some(holder))
 
         if found.is_some() then return found
 
     None
 end share_walk_fields
 
-private share_walk_variants(variants: Buf[EnumVariant], path: Buf[string]) -> Option[Unshareable]
+private share_walk_variants(variants: Buf[EnumVariant], path: Buf[string],
+                            holder: Type) -> Option[Unshareable]
     for i in 0..<variants.len()
-        val found = share_walk_fields(variants.at(i).fields, path, variants.at(i).name)
+        val found = share_walk_fields(variants.at(i).fields, path, variants.at(i).name, holder)
 
         if found.is_some() then return found
 
@@ -92,26 +95,70 @@ end extended_path
 // **A closure is a struct a program wrote and did not name**, so nothing said about one repeats the
 // name the compiler filed it under: it is "a closure", and what is in the way is something "it
 // captures" (`reference/types.md § Function types`).
-share_complaint(inner: Type) -> Option[string]
+share_complaint(inner: Type, a: &Analysis, scope: Scope) -> Option[string]
     val part = unshareable(inner)
 
     if part.is_none() then return None
 
     val p = part.unwrap()
     val named = !is_closure_literal(inner)
+    var head = "a closure shared between two domains may be called from either, so every count it " +
+               "captures has to be atomic — "
 
     if named
-        return Some(share_remedy(s"'&sync ${type_show(inner)}' may be reached from two domains at " +
-                                 s"once, so every count inside it has to be atomic — " +
-                                 s"${share_where(p, inner)}, ", p.ty))
-    end if
+        head = s"'&sync ${type_show(inner)}' may be reached from two domains at once, so every count " +
+               "inside it has to be atomic — "
 
-    val where = if p.path.is_empty() then share_where(p, inner)
+    val sealed = sealed_holder(p, a, scope)
+
+    if sealed.is_some() then return Some(head + sealed_where(p, sealed.unwrap(), inner, !named))
+
+    val where = if named || p.path.is_empty() then share_where(p, inner)
     else s"but the '${joined(p.path, ".")}' it captures reaches a '${type_show(p.ty)}'"
 
-    Some(share_remedy("a closure shared between two domains may be called from either, so every " +
-                      s"count it captures has to be atomic — $where, ", p.ty))
+    Some(share_remedy(head + s"$where, ", p.ty))
 end share_complaint
+
+// The type a program wrote whose count is the one in the way, where that count lives in a type the
+// program cannot name -- a container's core, declared `private` in the library -- or nothing where
+// the reference is one the program can spell as a `&sync` itself.
+//
+// **The advice "hold it as a `&sync` core" names a declaration the reader may not write**, so where
+// the box behind the reference is out of the reader's reach, what is said is about the holder: a
+// `Buf` is shared through a count that is not atomic, and there is no spelling of one that crosses.
+sealed_holder(p: Unshareable, a: &Analysis, scope: Scope) -> Option[Type]
+    if p.holder.is_none() then return None
+
+    val key = p.ty match
+        Ref(inner, _) -> (*inner) match
+            Struct(d) -> d.base
+            Enum(d) -> d.base
+            _ -> ""
+        _ -> ""
+
+    if key == "" || reachable_key(a, key, scope) then return None
+
+    p.holder
+end sealed_holder
+
+// Where the sealed holder sits, said as `share_where` says a part: the object itself, something it
+// holds directly, or something a named path inside it reaches -- and then why it cannot cross.
+sealed_where(p: Unshareable, holder: Type, whole: Type, captured: bool) -> string
+    var steps: Buf[string] = buf()
+
+    for i in 0..<p.path.len() - 1
+        steps.push(p.path.at(i))
+
+    val shown = type_show(holder)
+    val rest = "shared through a count that is not atomic, and no spelling of it can cross into a " +
+               "'&sync' ('06')"
+
+    if steps.is_empty() && holder == whole then return s"but a '$shown' is $rest"
+    if steps.is_empty() then return s"but it holds a '$shown', which is $rest"
+    if captured then return s"but the '${joined(steps, ".")}' it captures is a '$shown', which is $rest"
+
+    s"but its '${joined(steps, ".")}' is a '$shown', which is $rest"
+end sealed_where
 
 // Holds a `&sync T` written at `span` to the rule about what `T` may contain -- now if every type's
 // fields are in, and once they are if not.
@@ -123,7 +170,7 @@ check_shared(a: &Analysis, scope: Scope, span: Span, inner: Type)
         return
     end if
 
-    val why = share_complaint(inner)
+    val why = share_complaint(inner, a, scope)
 
     if why.is_some() then a.fault(scope, span, why.unwrap())
 end check_shared
@@ -160,15 +207,18 @@ end settle_shared_checks
 // something this walk can see. Everything after it is the same sentence a `&sync T` gets, and
 // deliberately so: the question is the same one, and the answer a reader needs is the spelling that
 // would have been sound.
-crossing_complaint(subject: string, crossed: Type) -> Option[string]
+crossing_complaint(subject: string, crossed: Type, a: &Analysis, scope: Scope) -> Option[string]
     val part = unshareable(crossed)
 
     if part.is_none() then return None
 
     val p = part.unwrap()
+    val head = s"$subject reaches another concurrency domain, so every count inside it has to be atomic — "
+    val sealed = sealed_holder(p, a, scope)
 
-    Some(share_remedy(s"$subject reaches another concurrency domain, so every count inside it has " +
-                      s"to be atomic — ${share_where(p, crossed)}, ", p.ty))
+    if sealed.is_some() then return Some(head + sealed_where(p, sealed.unwrap(), crossed, false))
+
+    Some(share_remedy(head + s"${share_where(p, crossed)}, ", p.ty))
 end crossing_complaint
 
 // Which part is in the way, said three ways: the object itself, something it holds directly, and
@@ -227,8 +277,8 @@ private check_crossing(cx: &Analyzer, arg: TExpr, pname: string, shown: string, 
         _ -> s"'$pname' of '$shown'"
 
     val why = pty match
-        Ptr(inner) -> crossing_complaint(subject, *inner)
-        _ -> crossing_complaint(subject, pty)
+        Ptr(inner) -> crossing_complaint(subject, *inner, cx.an, cx.scope)
+        _ -> crossing_complaint(subject, pty, cx.an, cx.scope)
 
     if why.is_some() then cx.fault(arg.span, why.unwrap())
     else note_task_crossing(cx, arg.span, CrossArg(subject), arg)

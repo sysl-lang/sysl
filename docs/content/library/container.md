@@ -104,13 +104,10 @@ the same map, so what is put through one name is there through every other:
 ```sysl
 import sysl.container.{Map, map}
 
-note(m: Map[string, int])
-    var here = m
+note(m: Map[string, int]) = m.put("seen", 1)
 
-    here.put("seen", 1)
-
-var counts: Map[string, int] = map()
-var alias = counts
+val counts: Map[string, int] = map()
+val alias = counts
 
 alias.put("a", 1)
 note(counts)
@@ -121,6 +118,11 @@ print(counts.len(), counts.get("a"), counts.get("seen"))
 ```output
 2 Some(1) Some(1)
 ```
+
+Every member that changes a map — `put`, `remove`, `clear` — takes it by value, so a `val` map is put
+into like any other: `val` says the name always refers to the same map. **`copy()` is the way to a
+second map**, holding the same entries and sized to them; a `Deque` has one too, and the same rule
+holds for `Deque`, `Set` and `Heap`.
 
 So **a map has no zero value**: a declaration says where its map comes from, `= map()`, and a struct
 holding one is built with one.
