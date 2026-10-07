@@ -120,18 +120,26 @@ new_resolve_state(sums: Sums, enabled: Buf[(string, Buf[string])], roots: Buf[(s
 // manifests may spell differently, so the answer would depend on which edge the walk read first.
 //
 // A function of the coordinate alone, so every edge naming it gets the same answer.
-private stand_in_for(state: &ResolveState, dep: &Dependency) -> Option[(string, Manifest)]
+private stand_in_for(state: &ResolveState, dep: &Dependency) -> Option[(string, Manifest)] =
+    stood_in_by(state.roots, dep) match
+        None -> None
+        Some(i) -> Some(state.roots.at(i))
+
+// Which of `roots` stands in for the coordinate `dep` names, by its position: the first whose
+// `package.name` is the coordinate's repository name. The one rule both the selection and the
+// features a root is asked for (`enabled_from`) go by, so the two cannot name different roots.
+stood_in_by(roots: &Buf[(string, Manifest)], dep: &Dependency) -> Option[usize]
     val coordinate = dependency_coordinate(dep) match
         None -> return None
         Some(c) -> c
 
     val repository = repository_name(coordinate)
 
-    for i in 0..<state.roots.len()
-        if state.roots.at(i).1.name == repository then return Some(state.roots.at(i))
+    for i in 0..<roots.len()
+        if roots.at(i).1.name == repository then return Some(i)
 
     None
-end stand_in_for
+end stood_in_by
 
 // A manifest that has been read, and where it was read from. The coordinate is the empty string for
 // a package that arrived as a directory, which has none.
@@ -183,7 +191,7 @@ resolve_graph(root: string, written: &Manifest, sums: Sums, cache: string,
 
     loop
         var built = resolve_once(root, config, start_sums, cache, enabled, floors)?
-        var next = enabled_from(built.packages)?
+        var next = enabled_from(built.packages, root_packages()?, enabled)?
 
         next.push(("", root_set))
 
@@ -296,7 +304,10 @@ private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string
                      enabled: Buf[(string, Buf[string])],
                      floors: Buf[(string, Release)]) -> Result[Graph, string]
     val config = pruned_manifest(written, enabled, "")
-    val roots = root_packages()?
+
+    // **A root is read as the package it is**: its optional dependencies are the ones the
+    // features this round enabled for it turned on, and no others (`enabled_from`).
+    val roots = pruned_roots(root_packages()?, enabled)
     var state = new_resolve_state(sums, enabled, roots, floors, false)
 
     read_locals(config.dependencies, &state, cache)?
@@ -557,6 +568,19 @@ root_packages() -> Result[Buf[(string, Manifest)], string]
 
     Ok(out)
 end root_packages
+
+// The roots' manifests as one round reads them, each pruned to what that round enabled for it under
+// `lib_root_key` -- exactly what `pruned_manifest` does to a fetched package's.
+pruned_roots(roots: Buf[(string, Manifest)], enabled: &Buf[(string, Buf[string])]) -> Buf[(string, Manifest)]
+    var out: Buf[(string, Manifest)] = buf()
+
+    for i in 0..<roots.len()
+        val (dir, m) = roots.at(i)
+
+        out.push((dir, pruned_manifest(m, enabled, lib_root_key(dir))))
+
+    out
+end pruned_roots
 
 // Whether a build has a graph to resolve at all: the project's own `dependencies`, or a source
 // root's.
@@ -1136,10 +1160,22 @@ struct PackageSources
 
     // The `#if` symbols the project's own enabled features define, for its own files.
     root_features: Buf[string]
+
+    // The `#if` symbols each `--lib` root's enabled features define, for its own files, keyed by the
+    // root as it was written.
+    lib_features: Buf[(string, Buf[string])]
 end PackageSources
 
 // A project that depends on nothing, which is what an empty `dependencies` block means.
-no_package_sources() -> PackageSources = PackageSources(buf(), buf(), buf(), buf())
+no_package_sources() -> PackageSources = PackageSources(buf(), buf(), buf(), buf(), buf())
+
+// The symbols one `--lib` root's files are gated by.
+lib_feature_symbols(s: &PackageSources, dir: string) -> Buf[string]
+    for i in 0..<s.lib_features.len()
+        if s.lib_features.at(i).0 == dir then return s.lib_features.at(i).1
+
+    buf()
+end lib_feature_symbols
 
 // The graph resolved, fetched and read, for one project at one machine, each dependency's modules
 // under the canonical prefix its coordinate gives them -- for every command, `emit-typed` included,
@@ -1159,11 +1195,30 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
         var none = no_package_sources()
 
         none.root_features = feature_symbols(mine)
+
+        // With no graph nothing names a root's coordinate, so each has its `default` on.
+        val roots = root_packages() match
+            Err(why) -> return Err(said(Refusal(why)))
+            Ok(got) -> got
+
+        for i in 0..<roots.len()
+            val (dir, theirs) = roots.at(i)
+            var asked: Buf[string] = buf()
+
+            asked.push("default")
+            none.lib_features.push((dir, feature_symbols(feature_closure(theirs.features, asked,
+                                                                         theirs.dependencies))))
+
         return Ok(none)
     end if
 
     val graph = resolved_graph(root, m)?
     var out = no_package_sources()
+    val libs = lib_roots()
+
+    for i in 0..<libs.len()
+        out.lib_features.push((libs.at(i),
+                               feature_symbols(enabled_of(graph.features, lib_root_key(libs.at(i))))))
 
     for i in 0..<graph.packages.len()
         val p = graph.packages.at(i)
