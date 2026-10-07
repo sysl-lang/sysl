@@ -295,7 +295,8 @@ private nud(t: Spanned[Tok], p: *Parser) -> Expr
         CharLit(c) -> expr(at, CharLit(c))
         StrLit(v) -> expr(at, StrLit(v))
         CStrLit(v) -> expr(at, CStrLit(v))
-        StrInterp(parts, exprs, specs, starts) -> desugar_interp(p, at, parts, exprs, specs, starts)
+        StrInterp(parts, exprs, specs, starts, spec_exprs, spec_starts) ->
+            desugar_interp(p, at, parts, exprs, specs, starts, spec_exprs, spec_starts)
         Ident(n) ->
             if n == "_" then expr(at, Ident(fresh_placeholder(p)))
             else if n == "await" && awaits_here(p) then parse_await(p, at)
@@ -323,7 +324,7 @@ private awaits_here(p: *Parser) -> bool = p.peek() match
     StrLit(_) -> true
     CStrLit(_) -> true
     CharLit(_) -> true
-    StrInterp(_, _, _, _) -> true
+    StrInterp(_, _, _, _, _, _) -> true
     _ -> false
 
 // `await e`. The operand is read at `TryPower`, which takes every call, index and member access and
@@ -1004,9 +1005,14 @@ can_begin_pattern(t: Tok) -> bool = t match
 // **What a hole holds is positioned where it was written, and everything built around it is
 // positioned at the literal**: the `str` call, the `+` and the pieces of text are nothing a reader
 // wrote, so a complaint about one of them has only the literal to point at.
+//
+// **A hole inside a specifier becomes an argument after it** -- `${x}%.${n}f` is
+// `format(x, "%.*f", n)`, one argument per `*`, in the order C reads them.
 private desugar_interp(p: *Parser, at: Span, parts: Buf[string], exprs: Buf[string],
-        specs: Buf[string], starts: Buf[usize]) -> Expr
+        specs: Buf[string], starts: Buf[usize], spec_exprs: Buf[string],
+        spec_starts: Buf[usize]) -> Expr
     var terms: Buf[Expr] = buf()
+    var counted: usize = 0
 
     if parts.len() > 0 && parts.at(0) != "" then terms.push(expr(at, StrLit(parts.at(0))))
 
@@ -1022,6 +1028,12 @@ private desugar_interp(p: *Parser, at: Span, parts: Buf[string], exprs: Buf[stri
             terms.push(expr(at, Call(expr(at, Ident("str")), args)))
         else
             args.push(expr(at, StrLit(spec)))
+
+            for c in spec.chars
+                if c == '*'
+                    args.push(parse_embedded(p, at, spec_exprs.at(counted), spec_starts.at(counted)))
+                    counted += 1
+
             terms.push(expr(at, Call(expr(at, Ident("format")), args)))
 
         val tail = parts.at(i + 1)

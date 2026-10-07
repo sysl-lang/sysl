@@ -330,7 +330,7 @@ interp(parts: []const string, exprs: []const string, specs: []const string,
     for s in starts
         at.push(s)
 
-    StrInterp(of_text(parts), of_text(exprs), of_text(specs), at)
+    StrInterp(of_text(parts), of_text(exprs), of_text(specs), at, buf(), buf())
 end interp
 
 @test("a hole separates the surrounding literals")
@@ -357,6 +357,32 @@ a_doubled_sigil()
 @test("an f-string captures a printf specifier after a hole")
 an_f_string_captures_a_specifier()
     assert_eq(bare("f\"n=${x}%04d!\""), of([interp(["n=", "!"], ["x"], ["%04d"], [6])]))
+
+// A width or a precision written as a hole is a `*` in the specifier, its source carried beside the
+// value holes in the order the `*`s come.
+@test("an f-string specifier's counts may be holes, written as '*'")
+an_f_string_specifier_counts_from_holes()
+    val toks = bare("f\"${x}%0${w}.${p + 1}f|\"")
+
+    toks.at(0) match
+        StrInterp(parts, exprs, specs, _, spec_exprs, spec_starts) ->
+            assert_eq(of_text(["", "|"]), parts)
+            assert_eq(of_text(["x"]), exprs)
+            assert_eq(of_text(["%0*.*f"]), specs)
+            assert_eq(of_text(["w", "p + 1"]), spec_exprs)
+            assert_eq(spec_starts.len(), 2)
+            assert_eq(spec_starts.at(0), 10)
+        _ -> assert(false, "not an interpolation")
+
+@test("a counted specifier with no conversion is text, and its holes ordinary holes")
+a_counted_specifier_without_conversion_is_text()
+    bare("f\"${x}%${w}!\"").at(0) match
+        StrInterp(parts, exprs, specs, _, spec_exprs, _) ->
+            assert_eq(of_text(["", "%", "!"]), parts)
+            assert_eq(of_text(["x", "w"]), exprs)
+            assert_eq(of_text(["", ""]), specs)
+            assert(spec_exprs.is_empty())
+        _ -> assert(false, "not an interpolation")
 
 @test("a specifier binds only after a hole; a stray percent is text")
 a_stray_percent_is_text()

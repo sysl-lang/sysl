@@ -629,6 +629,8 @@ scan_interpolated(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize,
     var exprs: Buf[string] = buf()
     var specs: Buf[string] = buf()
     var starts: Buf[usize] = buf()
+    var spec_exprs: Buf[string] = buf()
+    var spec_starts: Buf[usize] = buf()
     var part = str_builder()
     var pending = str_builder()
 
@@ -681,7 +683,7 @@ scan_interpolated(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize,
                 exprs.push(read_braced(s, m)?)
                 parts.push(part.finish())
                 part = str_builder()
-                specs.push(read_spec(s, allow_spec))
+                specs.push(read_spec(s, allow_spec, m, &spec_exprs, &spec_starts)?)
                 continue
 
             val starts_a_name = s.peek_char() match
@@ -697,7 +699,7 @@ scan_interpolated(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize,
             exprs.push(from_utf8_unchecked(s.text_from(name_at)))
             parts.push(part.finish())
             part = str_builder()
-            specs.push(read_spec(s, allow_spec))
+            specs.push(read_spec(s, allow_spec, m, &spec_exprs, &spec_starts)?)
             continue
         end if
 
@@ -706,7 +708,7 @@ scan_interpolated(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize,
         part.push_char(read_one_char(s)?)
     end loop
 
-    out.push(Spanned(StrInterp(parts, exprs, specs, starts), s.span_from(m)))
+    out.push(Spanned(StrInterp(parts, exprs, specs, starts, spec_exprs, spec_starts), s.span_from(m)))
     Ok(())
 end scan_interpolated
 
@@ -764,16 +766,31 @@ end step_over_quoted
 //
 // **It commits only on a complete specifier ending in a conversion letter**, so a bare percent in an
 // `f"..."` literal prints literally and a `%` that does not form one stays ordinary text.
-private read_spec(s: *Scanner, allow_spec: bool) -> string
-    if !allow_spec || s.peek() != Some(u8('%')) then return ""
+//
+// **A width or a precision may be a hole of its own** -- `${x}%${w}.${n}f` -- and is then written
+// into the specifier as a `*`, C's spelling of a count read at run time, with the hole's source
+// added to `holes`. A specifier that does not commit takes its holes back with it, so they are read
+// again as ordinary holes in the text.
+private read_spec(s: *Scanner, allow_spec: bool, m: usize, holes: *Buf[string],
+                  starts: *Buf[usize]) -> Result[string, Diagnostic]
+    if !allow_spec || s.peek() != Some(u8('%')) then return Ok("")
 
     val save = s.mark()
+    val held = holes.len()
+    var out = str_builder()
 
     s.bump()
-    s.accept_while((c) -> c == u8('-') || c == u8('+') || c == u8(' ') || c == u8('0') || c == u8('#'))
-    s.accept_while(is_digit)
 
-    if s.accept(u8('.')) then s.accept_while(is_digit)
+    val flags_at = s.offset
+
+    s.accept_while((c) -> c == u8('-') || c == u8('+') || c == u8(' ') || c == u8('0') || c == u8('#'))
+    out.push("%")
+    out.push(from_utf8_unchecked(s.text_from(flags_at)))
+    read_count(s, m, &out, holes, starts)?
+
+    if s.accept(u8('.'))
+        out.push(".")
+        read_count(s, m, &out, holes, starts)?
 
     val conversion = s.peek() match
         Some(c) -> is_conversion(c)
@@ -781,11 +798,31 @@ private read_spec(s: *Scanner, allow_spec: bool) -> string
 
     if !conversion
         s.reset(save)
-        return ""
+        holes.truncate(held)
+        starts.truncate(held)
+        return Ok("")
 
+    out.push_char(s.peek_char().unwrap())
     s.bump()
-    from_utf8_unchecked(s.text_from(save))
+    Ok(out.finish())
 end read_spec
+
+// One count of a specifier: digits, or a `${...}` hole written as `*`.
+private read_count(s: *Scanner, m: usize, out: *StrBuilder, holes: *Buf[string],
+                   starts: *Buf[usize]) -> Result[unit, Diagnostic]
+    if s.peek() == Some(u8('$')) && s.peek_at(1) == Some(u8('{'))
+        s.skip(2)
+        starts.push(s.offset)
+        holes.push(read_braced(s, m)?)
+        out.push("*")
+        return Ok(())
+
+    val from = s.offset
+
+    s.accept_while(is_digit)
+    out.push(from_utf8_unchecked(s.text_from(from)))
+    Ok(())
+end read_count
 
 private is_conversion(c: u8) -> bool =
     c == u8('d') || c == u8('i') || c == u8('o') || c == u8('u') || c == u8('x') || c == u8('X') ||

@@ -245,20 +245,30 @@ end gen_from_bytes
 // A numeric value is widened and handed to `snprintf` with the C form of the specifier; a string is
 // copied NUL-terminated and handed to `snprintf` as a `%s`, so width, precision and justification
 // are C's to apply. The result is always a fresh buffer this statement owns.
-gen_format(e: *Emit, arg: TExpr, spec: string) -> Val
+//
+// **A count read at run time is one more `i32` before the value**, which is where C's `*` reads it,
+// and is handed to a helper of its own per number of counts -- so a specifier written out in full
+// emits exactly what it did before there were any.
+gen_format(e: *Emit, arg: TExpr, spec: string, counts: Buf[TExpr]) -> Val
     e.heap = true
     e.uses_snprintf = true
 
     val c = spec_conversion(spec)
     val fmt = string_global(e, c_format(spec))
     val r = fresh_reg(e)
+    val k = counts.len()
+    val suffix = if k == 0 then "" else s".$k"
 
     var args: Buf[IrArg] = buf()
 
     args.push(ir_arg(LPtr, fmt))
 
+    for n in counts.view()
+        args.push(ir_arg(LInt(32), gen_expr(e, n)))
+
     if spec_is_str(c)
-        val fn = request_text(e, "sysl.str.fmt_s", str_fmt_str_text(word_llvm_of(e), str_llvm(e)))
+        val fn = request_text(e, s"sysl.str.fmt_s$suffix",
+                              str_fmt_str_text(word_llvm_of(e), str_llvm(e), k))
         val parts = str_bytes(e, gen_expr(e, arg))
 
         args.push(ir_arg(LPtr, parts.0))
@@ -268,7 +278,8 @@ gen_format(e: *Emit, arg: TExpr, spec: string) -> Val
     end if
 
     if spec_is_float(c)
-        val fn = request_text(e, "sysl.str.fmt_f", str_fmt_float_text(word_llvm_of(e), str_llvm(e)))
+        val fn = request_text(e, s"sysl.str.fmt_f$suffix",
+                              str_fmt_float_text(word_llvm_of(e), str_llvm(e), k))
         val v = convert(e, underlying(texpr_type(arg)), real_type(), gen_expr(e, arg))
 
         args.push(ir_arg(LFloat(64, false), v))
@@ -279,7 +290,8 @@ gen_format(e: *Emit, arg: TExpr, spec: string) -> Val
     // A signed conversion widens by the value's own signedness, so a decimal keeps its value; an
     // unsigned one reads the bits as unsigned, so `%x` shows exactly the value's own width. Both end
     // at 64 bits and print through a `%ll...`.
-    val fn = request_text(e, "sysl.str.fmt_i", str_fmt_int_text(word_llvm_of(e), str_llvm(e)))
+    val fn = request_text(e, s"sysl.str.fmt_i$suffix",
+                          str_fmt_int_text(word_llvm_of(e), str_llvm(e), k))
     val from = underlying(texpr_type(arg))
     val bits = int_bits_of(from)
     val v = if spec_is_signed_int(c) then
@@ -313,6 +325,17 @@ spec_conversion(spec: string) -> char
 
     last
 end spec_conversion
+
+// How many counts a specifier reads at run time: one per `*`, each a hole the reader wrote where a
+// width or a precision goes.
+spec_stars(spec: string) -> usize
+    var n: usize = 0
+
+    for c in spec.chars
+        if c == '*' then n += 1
+
+    n
+end spec_stars
 
 spec_is_int(c: char) -> bool = one_of("diouxX", c)
 

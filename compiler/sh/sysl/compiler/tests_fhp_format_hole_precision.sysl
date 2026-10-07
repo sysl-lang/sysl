@@ -1,0 +1,144 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// An `f"…"` specifier whose width or precision is a hole of its own — `${x}%.${n}f`,
+// `${x}%${w}.${p}f` — the run-time `*` of C's printf (`reference/strings.md § Format specifiers`).
+//
+// **Every printed value was checked against the shell's `printf`** with the same count in a `*`:
+// `printf '[%.*f]' 2 3.14159265` and so on, so what C makes of a count is the oracle, a negative one
+// included.
+
+// What a whole program prints.
+private fhp_prints(text: string, expected: string)
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("main.sysl", text)]), expected)
+
+// What a whole program's lowering says: the LLVM text, or the first complaint.
+private fhp_lowered(text: string) -> (string, string)
+    val root = make_temp_dir("sysl-fhp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> ("", why.message)
+        Ok(made) -> (made.text, if made.report.is_empty() then "" else analysis_report(made.report))
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fhp_lowered
+
+// Refused, with this message.
+private fhp_refused(text: string, message: string)
+    if xvr_no_library() then return
+
+    val said = fhp_lowered(text).1
+
+    assert(said.contains(s"error: $message\n"), said)
+
+// -- precision -------------------------------------------------------------------------------------
+
+@test("a precision from a hole is C's '%.*f', at zero, two and six digits")
+fhp_precision_on_a_real()
+    fhp_prints("val x = 3.14159265\nfor n in [0, 2, 6]\n    print(f\"[${x}%.${n}f]\")\n",
+               "[3]\n[3.14]\n[3.141593]\n")
+
+@test("a precision from a hole reaches '%e' and '%g'")
+fhp_precision_on_e_and_g()
+    fhp_prints("val p = 3\nprint(f\"[${12345.678}%.${p}e] [${0.000123456}%.${p}g]\")\n",
+               "[1.235e+04] [0.000123]\n")
+
+@test("a precision from a hole cuts a string as '%.*s' does")
+fhp_precision_on_a_string()
+    fhp_prints("val p = 3\nprint(f\"[${\"hello\"}%.${p}s]\")\n", "[hel]\n")
+
+// -- width -----------------------------------------------------------------------------------------
+
+@test("a width from a hole pads an integer, with and without the zero flag")
+fhp_width_on_an_int()
+    fhp_prints("val w = 5\nprint(f\"[${42}%${w}d] [${42}%0${w}d] [${\"hi\"}%${w}s]\")\n",
+               "[   42] [00042] [   hi]\n")
+
+@test("a width and a precision may both be holes")
+fhp_width_and_precision()
+    fhp_prints("val w = 8\nval p = 3\nprint(f\"[${3.14159265}%${w}.${p}f] [${2.5}%-${w}.${p}f]\")\n",
+               "[   3.142] [2.500   ]\n")
+
+@test("a hole's count may be any integer, a usize among them")
+fhp_any_integer_width()
+    fhp_prints("val k: usize = 4\nval b: u8 = 2\nprint(f\"[${7}%${k}d] [${1.0}%.${b}f]\")\n",
+               "[   7] [1.00]\n")
+
+@test("a hole's count may be a call and arithmetic")
+fhp_count_is_an_expression()
+    fhp_prints("digits() -> int = 2\nprint(f\"[${3.14159265}%${digits() * 4}.${digits() + 1}f]\")\n",
+               "[   3.142]\n")
+
+// C's own rule for a `*`, and so this one: a negative width left-justifies at its magnitude, and a
+// negative precision is as though none was written (`%f`'s six digits).
+@test("a negative count at run time is read as C reads it")
+fhp_negative_at_run_time()
+    fhp_prints("val w = -6\nval p = -1\nprint(f\"[${42}%${w}d] [${3.14159265}%.${p}f]\")\n",
+               "[42    ] [3.141593]\n")
+
+// -- a value that renders itself -------------------------------------------------------------------
+
+@test("a type rendering itself is handed the count, negative width and all")
+fhp_display_takes_the_count()
+    fhp_prints("struct W\n    n: int\nimpl Display for W\n" +
+               "    display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)\n" +
+               "val k = 4\nval neg = -4\nprint(f\"[${W(7)}%${k}s] [${W(7)}%${neg}s]\")\n",
+               "[   7] [7   ]\n")
+
+// -- what is not a specifier -----------------------------------------------------------------------
+
+@test("a percent and a hole that end in no conversion are ordinary text and an ordinary hole")
+fhp_no_conversion_is_text()
+    fhp_prints("val w = 5\nprint(f\"[${7}%${w}]\")\nprint(s\"[${7}%.${w}f]\")\n", "[7%5]\n[7%.5f]\n")
+
+// -- refusals --------------------------------------------------------------------------------------
+
+@test("a count that is not an integer is refused")
+fhp_non_integer_refused()
+    fhp_refused("val x = 1.5\nprint(f\"${x}%.${x}f\")\n",
+                "a width or precision written as a hole is a count, so it has to be an integer — " +
+                "but this one has type real")
+
+@test("a count wider than 64 bits is refused")
+fhp_wide_refused()
+    fhp_refused("val w: i128 = 3\nprint(f\"${1}%${w}d\")\n",
+                "a width or precision written as a hole is read as C's 'int', and i128 is wider " +
+                "than any count it could hold")
+
+@test("a negative constant count is refused, a literal and a folded one alike")
+fhp_negative_constant_refused()
+    fhp_refused("print(f\"${1}%${-3}d\")\n",
+                "a width or precision may not be a negative constant, and this one is -3 — the " +
+                "'-' flag is what left-justifies a field")
+    fhp_refused("print(f\"${1.0}%.${0 - 2}f\")\n",
+                "a width or precision may not be a negative constant, and this one is -2 — the " +
+                "'-' flag is what left-justifies a field")
+
+// -- what the literal form still emits -------------------------------------------------------------
+
+// A specifier written out in full calls the helper it always called, at the signature it always had;
+// only a count read at run time asks for the helper that takes it, and guards `snprintf`'s refusal.
+@test("a literal specifier lowers as before, and a counted one to a helper of its own")
+fhp_literal_form_unchanged()
+    if xvr_no_library() then return
+
+    val plain = fhp_lowered("print(f\"${2.5}%08.2f\")\n").0
+
+    assert(plain.contains("@sysl.str.fmt_f(ptr %fmt, double %v) {"), plain)
+    assert(!plain.contains("%raw"), plain)
+    assert(!plain.contains("@sysl.str.fmt_f.1"), plain)
+
+    val counted = fhp_lowered("val n = 2\nprint(f\"${2.5}%.${n}f\")\n").0
+
+    assert(counted.contains("@sysl.str.fmt_f.1(ptr %fmt, i32 %c0, double %v)"), counted)
+    assert(counted.contains("%short = icmp slt i32 %raw, 0"), counted)
+    assert(!counted.contains("@sysl.str.fmt_f(ptr"), counted)
