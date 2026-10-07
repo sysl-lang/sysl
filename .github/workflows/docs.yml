@@ -1,0 +1,155 @@
+# Build & deploy the sysl documentation site, sysl.sh.
+#
+#   Push to `dev`            → builds only, so a page is never written blind.
+#   PR targeting `dev`       → builds only, as a sanity check.
+#   Push of a tag `v*`       → builds and deploys to GitHub Pages.
+#   workflow_dispatch        → manual trigger; deploys only when run on a `v*` tag.
+#
+# The site is this repository's `docs/`: `site.toml`, the themes, the static files (the `CNAME`
+# among them) and the grammar, with the pages under `docs/content/` — the same pages the compiler's
+# own gate compiles, so a page and the change it documents land in one commit.
+#
+# The site is built by juicer, which lives in its own repository and has no published launcher — so
+# this workflow checks juicer out beside the repository and runs it from its own sbt project. When
+# juicer ships a runnable artifact, the two checkout steps collapse into one and the build step loses
+# its `working-directory`.
+
+name: Docs
+
+# **Every push to dev builds; only a release tag deploys.** `dev` documents the language as it is on
+# dev and is built here so a page that does not render is found the day it is written — a page can
+# compile every fenced program and still fail to build, which is how 0.0.35 shipped: a literal `[=`
+# in a table opened a juicer shortcode and nothing in the test suite had any reason to look. The
+# site the world reads documents a RELEASE, so it is published from the tag and never from dev.
+#
+# Path filters apply to the branch push and the pull request only; GitHub does not evaluate them for
+# a tag push, so every release tag builds and deploys whatever it touched.
+on:
+  push:
+    branches: ["dev"]
+    tags: ["v*"]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    branches: ["dev"]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# **A dev build is keyed by SHA; every deploy shares one group.**
+#
+# `cancel-in-progress: false` protects a run that has STARTED and does nothing for one that is merely
+# QUEUED — GitHub keeps one pending run per concurrency group, so a shared dev group would let a third
+# push evict the second commit's build before it ever began, and a page that never rendered leaves no
+# trace in the run list. Per-sha groups mean every commit gets its build.
+#
+# A deploy is the opposite case: superseding is what a deploy wants, the newest release being what
+# the world should read. One group for every tag keeps two deploys from running side by side and
+# publishing out of order — a skipped deploy can be re-run, a stale one looks finished.
+concurrency:
+  group: "docs-${{ startsWith(github.ref, 'refs/tags/v') && 'deploy' || github.sha }}"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out sysl
+        uses: actions/checkout@v6
+        with:
+          path: sysl
+
+      - name: Check out juicer
+        uses: actions/checkout@v6
+        with:
+          repository: edadma/juicer
+          ref: stable
+          path: juicer
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # actions/setup-java does NOT ship sbt — the runner image only has the
+      # JDK after the previous step.
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Cache sbt
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.sbt
+            ~/.cache/coursier
+          key: ${{ runner.os }}-sbt-${{ hashFiles('juicer/**/build.sbt', 'juicer/project/**') }}
+          restore-keys: ${{ runner.os }}-sbt-
+
+      # juicer's asset pipeline shells out to `sass` and `esbuild`. Without them
+      # on PATH it degrades to the committed `static/` copies and skips
+      # fingerprinting, which ships stale CSS and defeats cache busting.
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install asset toolchain (sass + esbuild)
+        run: npm install -g sass esbuild
+
+      - name: Build the site
+        working-directory: juicer
+        run: >
+          sbt 'juicerJVM/run build
+          -s ${{ github.workspace }}/sysl/docs
+          -d ${{ github.workspace }}/_site
+          -b https://sysl.sh/'
+
+      - name: Upload site artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs-site
+          path: _site
+
+      # **This guard has to name the same refs `deploy` does**, and it is easy to miss when they
+      # change: the deploy job's own `if:` is the obvious one, and a build that skips this step is
+      # perfectly green. What fails is `deploy`, on *"No artifacts named github-pages were found for
+      # this workflow run"* — which reads as a problem with the deploy action rather than as a step
+      # that never ran.
+      - name: Upload Pages artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  # **A release tag, never `dev`** — the site the world reads documents the released language. A
+  # `workflow_dispatch` deploys only when it is run on a `v*` tag, which is how a release's site is
+  # re-published without cutting a new tag.
+  deploy:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # **Ten minutes is this action's hard maximum and cannot be raised.** Asking for more is not an
+      # error and not a failure -- it is silently clamped, and the only trace is a line in the log:
+      #
+      #     Warning: timeout value is greater than the allowed maximum -
+      #     timeout set to the maximum of 600000 milliseconds.
+      #
+      # So the obvious repair for a slow Pages service is not available, and writing `timeout:` here
+      # buys nothing but a comment that lies. When Pages is slow, wait for it and re-run; nothing in
+      # this repository fixes it.
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
