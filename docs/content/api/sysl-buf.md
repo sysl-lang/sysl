@@ -35,10 +35,9 @@ A buffer that has already been given room for `n` elements, for a caller that kn
 many are coming. What it saves is the reallocation-and-copy at each doubling on the way up, which
 is the one cost a growable sequence has that an exactly-sized array does not.
 
-**The fill is a parameter because a generic `T` has no zero**, and an array is made by repeating a
-value. It is written rather than inferred for the same reason the language asks for it anywhere
-else: nothing about `T` says what an unused slot should hold, and none of these slots is read --
-`count` starts at zero, so every one of them is written before anything can see it.
+**`fill` is not stored anywhere.** The slots start out empty (`slot_storage`), so a counted `fill`
+is not kept alive by the room it would once have been repeated into. The parameter stays because
+callers write it, and because it is what lets a call say the element type without brackets.
 
 ### `byte_sink`
 
@@ -62,6 +61,14 @@ It is ordinary sysl rather than a built-in because a `[]T` that can be sized whi
 it needs: `push` allocates a slice twice the size and copies, so the amortized cost is the one a
 growable sequence has anywhere, and none of it is underneath the language.
 
+**The spare capacity holds nothing.** The storage comes from `slot_storage`, whose slots start out
+empty: a buffer box releases only its *live prefix*, and `slot_place` is what fills the first slot
+past it. So a push of a counted value takes exactly one count for the buffer, and a slot this
+buffer has given up -- by `pop`, `truncate`, `clear` or `remove` -- is let go of by `slot_vacate`
+there and then, which is when a destructor behind it runs. The one exception is storage somebody
+else is still reading: a `view()` held elsewhere, or a copy of this buffer, keeps those slots
+alive until it lets go, and the next shortening after that releases them.
+
 The bounds-checked members panic rather than returning an `Option`, which is the same bargain
 `unwrap` makes -- an index past the end is a mistake in the program, not a value it meant to
 handle -- while `pop` returns one, because taking from an empty sequence is a question a caller
@@ -82,8 +89,8 @@ is then implied by it and folds.
 | `set` | `set(*self, i: usize, v: T)` |  |
 | `push` | `push(*self, v: T)` | One element appended, after growing the storage where there is no room left for it. |
 | `extend` | `extend(*self, xs: []const T)` | Every element of a slice appended at once, which is what `push` in a loop was costing more than it looked like. |
-| `pop` | `pop(*self) -> Option[T]` |  |
-| `truncate` | `truncate(*self, n: usize)` |  |
+| `pop` | `pop(*self) -> Option[T]` | The last element, taken out. |
+| `truncate` | `truncate(*self, n: usize)` | The elements from `n` on, given up -- each let go of now rather than when the storage goes, which is when a destructor behind one runs. |
 | `clear` | `clear(*self)` |  |
 | `insert` | `insert(*self, i: usize, v: T)` | An element put at `i`, with everything from there on moved up one. |
 | `remove` | `remove(*self, i: usize) -> T` |  |

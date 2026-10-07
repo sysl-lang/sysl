@@ -34,9 +34,9 @@ deque[T]() -> Deque[T]
 deque_with_capacity[T](n: usize, fill: T) -> Deque[T]
 ```
 
-A deque with room for `n` elements already under it. The fill is written rather than inferred for
-the reason it is on `buf_with_capacity`: nothing about `T` says what an unused slot should hold,
-and none of these slots is read.
+A deque with room for `n` elements already under it. Every slot starts as `None`, so `fill` is
+not stored anywhere; the parameter stays because callers write it, and because it is what lets a
+call say the element type without brackets.
 
 The storage is rounded **up** to a power of two, because the mask every index goes through is only
 correct for those lengths.
@@ -195,7 +195,7 @@ walking a table hashes nothing and compares nothing, so a cursor asks nothing of
 
 ```sysl
 struct Deque[T]
-    elems: []T
+    private elems: []Option[T]
     head: usize
     count: usize
 ```
@@ -212,6 +212,13 @@ it is the one place the library was quietly teaching an accident.
 and both ends wrap around the end of the storage rather than moving anything. Taking from the
 front advances `head` and touches nothing else; adding to the front steps it backwards into the
 space that leaves. Neither end shifts, which is the whole point.
+
+**A slot the ring is not using holds `None`**, which holds nothing. That is what lets the storage
+be made before there is anything to put in it, and what makes taking an element out let go of it
+there and then: the slot it leaves is written `None`, so a destructor behind the element runs when
+the deque gives it up rather than when the storage goes. `Buf` keeps its spare slots empty a
+different way -- a buffer's live slots are a *prefix*, which `slot_storage` and `slot_vacate`
+describe -- and a ring's are not, since `push_front` writes the far end of the storage first.
 
 **The storage length is always a power of two**, because it starts at eight and only ever doubles,
 so wrapping is a mask rather than a division. That invariant is worth stating because it is what
@@ -243,14 +250,15 @@ on purpose.
 
 ```sysl
 struct DequeCursor[T]
-    elems: []T
+    private elems: []Option[T]
     head: usize
     count: usize
     at: usize
 ```
 
 A walk from the front to the back. It holds the storage rather than the deque, so pushing onto the
-deque while a cursor is live leaves the cursor reading the ring it started on.
+deque while a cursor is live leaves the cursor reading the ring it started on; an element the deque
+gives up meanwhile is a slot that reads `None`, and the walk ends there.
 
 ### `Heap`
 

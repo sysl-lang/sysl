@@ -44,6 +44,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.sys`](sysl-sys/) | The platform seam: everything the library asks of what it is hosted on, and nothing else. |
 | [`sysl.term`](sysl-term/) | What a terminal understands: the escape sequences that colour text, emphasise it, and move the cursor about. |
 | [`sysl.term.edit`](sysl-term-edit/) | Reading a line from a terminal that will not do it for you. |
+| [`sysl.testing`](sysl-testing/) | What a test may say about itself while it runs, beyond passing or failing. |
 | [`sysl.text`](sysl-text/) | The whole text surface: what a `string` is made of, and every operation over one. |
 | [`sysl.time`](sysl-time/) | Points on the timeline, lengths of it, and the calendar that turns one into a date. |
 | [`sysl.time.tzif`](sysl-time-tzif/) | Reading a zone out of the bytes of a TZif file (RFC 8536), which is what the IANA time zone database is distributed as. |
