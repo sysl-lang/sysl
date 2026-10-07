@@ -1,0 +1,224 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+
+// What a program built for a bare board actually CALLS, which is a different question from what it is
+// allowed to write (`reference/modules.md § Capabilities are a module property`). A call to a function
+// nothing defines makes a perfectly good object; only the link finds it. Every module here is lowered
+// for `riscv32-freestanding` with the library compiled from source beside it, as the reference's
+// `Compiler.compile` does; the expected calls were read out of its `emit-llvm --no-std-lib --target
+// riscv32-freestanding` (0.0.162) for the same programs.
+
+private const cgb_uart: string = "struct Uart\n    data: volatile u8\n\nval UART: usize = 0x10000000\n" +
+                       "val regs: *Uart = ptr_cast(UART)\n\nputc(c: u8)\n    regs.data = c\n"
+
+private const cgb_bare: string = "riscv32-freestanding"
+
+private var cgb_bare_library: Buf[Program] = buf()
+private var cgb_bare_read: bool = false
+
+// The standard module's units for the bare board, parsed once.
+private cgb_bare_units() -> Buf[Program]
+    if cgb_bare_read then return cgb_bare_library
+
+    cgb_bare_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, target_named(cgb_bare).unwrap()) match
+            Err(_) -> ()
+            Ok(units) -> cgb_bare_library = units
+
+    cgb_bare_library
+end cgb_bare_units
+
+// The LLVM text of a one-file program lowered for the bare board, or the analysis's report.
+private cgb_bare_ir(src: string) -> string
+    val t = target_named(cgb_bare).unwrap()
+    val library = cgb_bare_units()
+    var units: Buf[Program] = buf()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    val parsed = parse(source_of("p.sysl", src))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    if !errors_of(done.an.diagnostics()).is_empty()
+        return analysis_report(errors_of(done.an.diagnostics()))
+
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, t, promotions).0)
+end cgb_bare_ir
+
+// The allocator functions a module CALLS, not the ones it declares: an unreferenced `declare` costs a
+// link nothing. Written out space-separated, in this order.
+private cgb_calls_of(src: string) -> string
+    val ir = cgb_bare_ir(src)
+
+    assert(ir.contains("define i32 @main("), s"did not compile for $cgb_bare:\n$ir")
+
+    var said = ""
+
+    for f in ["@free", "@malloc", "@realloc"]
+        var called = false
+
+        for line in lines_of(ir).view()
+            if line.contains(f) && line.contains(" call ") then called = true
+
+        if called then said = said + f + " "
+
+    said
+end cgb_calls_of
+
+private cgb_no_library_for_the_board() -> bool
+    if cgb_bare_units().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end cgb_no_library_for_the_board
+
+// The no-alloc subset's simplest half: a fixed array and an index into it, constant or computed.
+@test("reaches no allocator for a fixed array and an index into it")
+cgb_no_allocator_for_a_fixed_array()
+    if cgb_no_library_for_the_board() then return
+
+    assert_eq(cgb_calls_of(cgb_uart + "\nvar a = [u8('a'), u8('b')]\nputc(a[0])\n"), "")
+    assert_eq(cgb_calls_of(cgb_uart + "\nvar a = [u8('a'), u8('b')]\nvar i: usize = 1\nputc(a[i])\n"), "")
+
+// Releasing a view goes through ARC, and the free is in the object's own hook rather than in the
+// release path, so a view of storage on the frame names no allocator.
+@test("reaches no allocator for a slice of storage it did not allocate")
+cgb_no_allocator_for_a_slice_it_did_not_allocate()
+    if cgb_no_library_for_the_board() then return
+
+    assert_eq(cgb_calls_of(cgb_uart + "\nvar a = [u8('a'), u8('b')]\nval s = a[..]\nputc(u8(s.len))\n"), "")
+
+@test("and none through a function that takes one")
+cgb_no_allocator_through_a_function_taking_one()
+    if cgb_no_library_for_the_board() then return
+
+    assert_eq(cgb_calls_of(cgb_uart + "\npick(xs: []const u8, i: usize) -> u8\n    xs[i]\n" +
+                           "var a = [u8('a'), u8('b')]\nputc(pick(a[..], 1))\n"), "")
+
+// The same programs with the claim written down: `@no_alloc`'s headline promise.
+@test("an @no_alloc module reaches no allocator, a slice being in its subset")
+cgb_a_no_alloc_module_reaches_no_allocator()
+    if cgb_no_library_for_the_board() then return
+
+    assert_eq(cgb_calls_of("@no_alloc\n" + cgb_uart + "\nvar a = [u8('a'), u8('b')]\nval s = a[..]\n" +
+                           "putc(u8(s.len))\n"), "")
+    assert_eq(cgb_calls_of("@no_alloc\n" + cgb_uart + "\npick(xs: []const u8, i: usize) -> u8\n    xs[i]\n" +
+                           "var a = [u8('a'), u8('b')]\nputc(pick(a[..], 1))\n"), "")
+
+// The contrast that keeps the cases above from being vacuous: a view of a local array outliving its
+// frame is promoted to the heap, and the program calls both.
+private const cgb_allocating: string = "keep() -> []const u8\n    var a = [u8('a'), u8('b')]\n    a[..]\n" +
+                             "putc(keep()[0])\n"
+
+@test("a program that does allocate calls both, which is what the cases above are the absence of")
+cgb_a_program_that_allocates_calls_both()
+    if cgb_no_library_for_the_board() then return
+
+    val calls = cgb_calls_of(cgb_uart + "\n" + cgb_allocating)
+
+    assert(calls.contains("@malloc"), calls)
+    assert(calls.contains("@free"), calls)
+
+// The startup a board image needs to link, and nothing else: an entry that calls `main`.
+private const cgb_start: string = raw"""
+    .globl _start
+_start:
+    call main
+1:
+    j 1b
+"""
+
+// Links the program for the bare board with `cgb_start` and nothing else -- no support package, so
+// no `malloc` and no `free` -- and answers the linker's status and what it said, or why it could not
+// be asked.
+private cgb_link_alone(src: string) -> Result[(bool, string), string]
+    val t = target_named(cgb_bare).unwrap()
+
+    val cc = find_backend_clang(t) match
+        Ok(c) -> c
+        Err(why) -> return Err(why)
+
+    val lld = capture("ld.lld", ["--version"]) match
+        Ok(c) -> c.status.ok()
+        Err(_) -> false
+
+    if !lld then return Err(s"ld.lld is not installed, so a $cgb_bare image cannot be linked")
+
+    val ir = cgb_bare_ir(src)
+
+    if !ir.contains("define i32 @main(") then return Err(s"did not compile for $cgb_bare:\n$ir")
+
+    val root = make_temp_dir("sysl-cgb").unwrap()
+    val said = cgb_link_in(root, cc, t, ir)
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end cgb_link_alone
+
+// The object, the startup and the link, in `root`.
+private cgb_link_in(root: string, cc: string, t: Target, ir: string) -> Result[(bool, string), string]
+    val prog = s"$root/p.o"
+    val start = s"$root/start.s"
+
+    write_text(start, cgb_start).unwrap()
+
+    compile_object(cc, ir, prog, t, "1") match
+        Err(why) -> return Err(s"compiling the module for ${t.triple}: $why")
+        Ok(_) -> ()
+
+    val asm = capture(cc, [s"--target=${t.triple}", "-c", start, "-o", s"$root/start.o"], "", [], true) match
+        Err(_) -> return Err("the assembler could not be run")
+        Ok(o) -> o
+
+    if !asm.status.ok() then return Err(s"assembling the startup:\n${asm.err.unwrap_or("")}")
+
+    val link = capture(cc, [s"--target=${t.triple}", "-nostdlib", "-fuse-ld=lld", "-Wl,-e,_start",
+                            s"$root/start.o", prog, "-o", s"$root/image.elf"], "", [], true) match
+        Err(_) -> return Err("the linker could not be run")
+        Ok(o) -> o
+
+    Ok((link.status.ok(), link.text + link.err.unwrap_or("")))
+end cgb_link_in
+
+// The link is the only step that can fail on a symbol nothing defines. The reference links against
+// its QEMU board's startup and linker script; this links against a two-instruction startup of its own
+// and lld's default layout, which is the same claim -- nothing beyond the startup defines an allocator.
+// The allocating program is the contrast that shows the link can fail here.
+@test("and it links against the board's startup alone, with no allocator anywhere")
+cgb_it_links_against_the_startup_alone()
+    if cgb_no_library_for_the_board() then return
+
+    val clean = cgb_link_alone("@no_alloc\n" + cgb_uart + "\nvar a = [u8('a'), u8('b')]\nval s = a[..]\n" +
+                               "putc(u8(s.len))\n")
+
+    clean match
+        Err(why) -> skip(why)
+        Ok(r) -> assert(r.0, r.1)
+
+    cgb_link_alone(cgb_uart + "\n" + cgb_allocating) match
+        Err(why) -> assert(false, why)
+        Ok(r) ->
+            assert(!r.0, "an allocating program linked with no allocator")
+            assert(r.1.contains("undefined symbol: malloc"), r.1)
+end cgb_it_links_against_the_startup_alone

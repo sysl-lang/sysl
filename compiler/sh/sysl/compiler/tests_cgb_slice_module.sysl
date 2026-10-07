@@ -1,0 +1,269 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// Slices, the module scaffolding and `print`, the claims about the emitted text nothing else
+// measures, and the loop `sysl.crypto.verify` depends on. Every expected line was read out of the
+// reference compiler's own `emit-llvm --no-std-lib` (0.0.162) for the same program.
+
+private const cgb_buf: string = "var buf: &[8]u8 = [1, 2, 3, 4, 5, 6, 7, 8]\n"
+
+// -- slices: the three-word layout, where the owner comes from, and the share a view takes --------
+
+@test("a slice is the owner, the first element, and the count")
+cgb_a_slice_is_three_words()
+    if xvr_no_library() then return
+
+    val out = cgb_ir(cgb_buf + "var s = buf[..]\nprint(s.len)")
+
+    assert(out.contains("%s.addr = alloca { ptr, ptr, i64 }"), out)
+
+    for want in ["insertvalue { ptr, ptr, i64 } zeroinitializer, ptr %tN, 0",
+                 "insertvalue { ptr, ptr, i64 } %tN, ptr %tN, 1",
+                 "insertvalue { ptr, ptr, i64 } %tN, i64 %tN, 2"]
+        assert(cgb_has(out, want), s"$want in:\n$out")
+
+@test("the owner of a view of a heap array is the reference to it")
+cgb_the_owner_of_a_view_of_a_heap_array()
+    if xvr_no_library() then return
+
+    val out = cgb_ir(cgb_buf + "var s = buf[..]\nprint(s.len)")
+
+    assert(cgb_has(out, "getelementptr %arc.arr8.byte, ptr %tN, i32 0, i32 2"), out)
+    assert(cgb_has(out, "call void @arc.retain_maybe(ptr %tN)"), out)
+
+@test("a view of a view inherits the owner rather than the buffer")
+cgb_a_view_of_a_view_inherits_the_owner()
+    if xvr_no_library() then return
+
+    val out = cgb_ir(cgb_buf + "var s = buf[2..<6]\nvar t = s[1..<3]\nprint(t.len)")
+
+    assert(cgb_has(out, "extractvalue { ptr, ptr, i64 } %tN, 0"), out)
+
+// The text is the module as lowered, before `#99` (nounwind) is marked on the defines for clang.
+@test("an owner may be absent, so its count is taken null-tolerantly")
+cgb_an_owner_may_be_absent()
+    if xvr_no_library() then return
+
+    val out = cgb_ir(cgb_buf + "var s = buf[..]\nprint(s.len)")
+
+    assert(out.contains("define private void @arc.retain_maybe(ptr %p) {"), out)
+    assert(out.contains("%null = icmp eq ptr %p, null"), out)
+
+@test("a slice's length is a word of the value, not a constant")
+cgb_a_slices_length_is_a_word()
+    if xvr_no_library() then return
+
+    val out = cgb_ir(cgb_buf + "var s = buf[..]\nprint(s.len)")
+
+    assert(cgb_has(out, "extractvalue { ptr, ptr, i64 } %tN, 2"), out)
+
+@test("indexing a slice starts from the pointer it carries")
+cgb_indexing_a_slice_starts_from_its_pointer()
+    if xvr_no_library() then return
+
+    val out = cgb_ir(cgb_buf + "var s = buf[..]\nvar i = 0\nprint(s[i])")
+
+    assert(cgb_has(out, "extractvalue { ptr, ptr, i64 } %tN, 1"), out)
+    assert(cgb_has(out, "getelementptr i8, ptr %tN, i64 %tN"), out)
+
+@test("a slice held in a local gives its count back when the scope ends")
+cgb_a_slice_in_a_local_gives_its_count_back()
+    if xvr_no_library() then return
+
+    val out = cgb_ir(cgb_buf + "var s = buf[..]\nprint(s.len)")
+
+    assert(out.contains("load { ptr, ptr, i64 }, ptr %s.addr"), out)
+    assert(cgb_has(out, "call void @arc.release_maybe(ptr %tN)"), out)
+
+@test("an exclusive high end is checked against the length, an inclusive one against the last")
+cgb_an_exclusive_and_an_inclusive_high_end()
+    if xvr_no_library() then return
+
+    val exclusive = cgb_ir(cgb_buf + "var n = 3\nvar s = buf[0..<n]\nprint(s.len)")
+    val inclusive = cgb_ir(cgb_buf + "var n = 3\nvar s = buf[0..n]\nprint(s.len)")
+
+    assert(cgb_has(exclusive, "icmp ule i64 %tN, 8"), exclusive)
+    assert(cgb_has(inclusive, "icmp ult i64 %tN, 8"), inclusive)
+    assert(cgb_has(inclusive, "%tN = add i64 %tN, 1"), inclusive)
+
+@test("the two ends are checked against each other as well")
+cgb_the_two_ends_are_checked_against_each_other()
+    if xvr_no_library() then return
+
+    val out = cgb_ir(cgb_buf + "var s = buf[2..<6]\nprint(s.len)")
+
+    assert(out.contains("icmp ule i64 2, 6"), out)
+
+// -- the module scaffolding, string interning, and which renderer `print` reaches -----------------
+
+// The signature is C's, the platform's start-up code passing a count and a vector whether or not the
+// program asks for them.
+@test("defines main, with the pair the platform passes")
+cgb_defines_main_with_the_platforms_pair()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("print(1)")
+
+    assert(out.contains("define i32 @main(i32 %argc, ptr %argv) {"), out)
+    assert(out.contains("ret i32 0"), out)
+
+// Nothing emits a call to `printf`, so nothing may declare it either.
+@test("declares no printf of its own")
+cgb_declares_no_printf()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("print(1)")
+
+    assert(!out.contains("@printf"), out)
+
+@test("an extern may still take the name")
+cgb_an_extern_may_still_take_printf()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("extern printf(fmt: *u8, ...) -> int\nprintf(c\"hi\\n\")")
+
+    assert(out.contains("declare i32 @printf(ptr, ...)"), out)
+
+@test("a string constant is interned NUL-terminated")
+cgb_a_string_constant_is_interned_nul_terminated()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("print(\"hi\")")
+
+    assert(out.contains("c\"hi\\00\""), out)
+
+@test("an int goes to the signed renderer, widened to its width")
+cgb_an_int_goes_to_the_signed_renderer()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("print(42)")
+    val main = cgb_body(out, "main")
+
+    assert(main.contains("call void @sysl$printi(i64 %t1)"), main)
+    assert(main.contains("sext i32 42 to i64"), main)
+    assert(out.contains("define i64 @sysl$digits_long("), out)
+
+@test("a float is emitted as a hex double and rendered via %g")
+cgb_a_float_is_a_hex_double()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("print(1.5)")
+    val main = cgb_body(out, "main")
+
+    assert(main.contains("call void @sysl$printr(double 0x3FF8000000000000)"), main)
+    assert(out.contains("c\"%g\\00\""), out)
+
+@test("multiple args are separated by a printed space")
+cgb_multiple_args_are_separated_by_a_space()
+    if xvr_no_library() then return
+
+    val main = cgb_main("print(1, 2)")
+
+    assert(main.contains("call void @sysl$printc(i32 32)"), main)
+    assert_eq(main.count_of("@sysl$printi"), 2)
+
+// -- claims about the emitted text: the counted box's header, and two deliberate shortcuts --------
+
+private const cgb_boxed: string = "struct P\n    x: int\nvar r: &P = P(1)\nprint(r.x)"
+
+// The third word is the weak count, and it is what makes the storage outlive the object.
+@test("named on its own, since the runtime walks it without knowing the payload")
+cgb_a_counted_box_header_is_named_on_its_own()
+    if xvr_no_library() then return
+
+    val out = cgb_ir(cgb_boxed)
+
+    assert(out.contains("%arc.header = type { i64, ptr, i64 }"), out)
+    assert(out.contains("%arc.P = type { i64, ptr, i64, %struct.P }"), out)
+
+@test("so reading the payload starts after the third word")
+cgb_reading_the_payload_starts_after_the_third_word()
+    if xvr_no_library() then return
+
+    val out = cgb_ir(cgb_boxed)
+
+    assert(out.contains("getelementptr %arc.P, ptr"), out)
+
+// Making a slice turns the ARC runtime on even where the owner is statically null, so the smallest
+// program carries an allocator it never reaches.
+@test("a program that prints one integer still declares an allocator")
+cgb_one_integer_still_declares_an_allocator()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("print(1)")
+
+    assert(out.contains("declare ptr @malloc(i64)"), out)
+    assert(out.contains("declare void @free(ptr)"), out)
+
+@test("and never calls it")
+cgb_and_never_calls_it()
+    if xvr_no_library() then return
+
+    val main = cgb_main("print(1)")
+
+    assert(!main.contains("@malloc"), main)
+
+// A non-generic type is instantiated eagerly wherever it is declared. The negative is spelled with the
+// standard module's prefix, `display_pad` bare being a substring of `sysl$display_pad`.
+@test("FormatSpec's layout is emitted although nothing renders through one")
+cgb_format_specs_layout_is_emitted()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("print(1)")
+
+    assert(out.contains("%struct.sysl$FormatSpec = type { i32, i32, i1 }"), out)
+    assert(!out.contains("@sysl$display_pad("), out)
+
+// The counterweight: what is emitted on demand is absent from the same program.
+@test("while what is emitted on demand is absent from that same module")
+cgb_what_is_emitted_on_demand_is_absent()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("print(1)")
+
+    assert(!out.contains("@arc.retain_sync"), out)
+    assert(!out.contains("@sysl.str.cmp"), out)
+
+// -- the shape `sysl.crypto.verify` depends on: every byte read, nothing decided on one -----------
+//
+// The comparison as `library/sysl/crypto/verify.sysl` writes it. The counts are written down rather
+// than derived, and an early exit is what each would catch: a third read of the accumulator, a fifth
+// conditional branch, a second comparison.
+
+private const cgb_verify: string = "verify(a: []const u8, b: []const u8) -> bool\n" +
+                         "    if a.len != b.len then return false\n\n" +
+                         "    var diff: u8 = 0\n\n" +
+                         "    for i in 0..<a.len do diff |= a[i] ^ b[i]\n\n" +
+                         "    diff == 0\nend verify\n\n" +
+                         "main()\n    print(verify(\"a\".bytes, \"a\".bytes))\n"
+
+private cgb_verify_body() -> string = cgb_body(cgb_ir(cgb_verify), "verify")
+
+@test("the accumulator is read twice: folded into once, and asked once at the end")
+cgb_the_accumulator_is_read_twice()
+    if xvr_no_library() then return
+
+    val body = cgb_verify_body()
+
+    assert_eq(body.count_of("load i8, ptr %diff.addr"), 2)
+    assert(body.contains("xor i8"), body)
+    assert(body.contains("or i8"), body)
+
+// The length check, the loop condition, and one bounds check for each of the two slices.
+@test("four conditional branches, and every one of them is on a length or an index")
+cgb_four_conditional_branches()
+    if xvr_no_library() then return
+
+    val body = cgb_verify_body()
+
+    assert_eq(body.count_of("br i1 "), 4)
+
+@test("the verdict is a single comparison against zero, taken after the loop")
+cgb_the_verdict_is_one_comparison()
+    if xvr_no_library() then return
+
+    val body = cgb_verify_body()
+
+    assert_eq(body.count_of("icmp eq i8"), 1)

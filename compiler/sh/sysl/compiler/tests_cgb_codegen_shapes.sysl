@@ -1,0 +1,287 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, str_builder}
+
+// The shape of the emitted module for the smallest programs: statements, expressions, the memory
+// modes, slices, the module scaffolding and `print`, the claims about the text nothing else measures,
+// what a bare board's program calls, and the loop `sysl.crypto.verify` depends on. Every expected
+// line was read out of the reference compiler's own `emit-llvm --no-std-lib` (0.0.162) for the same
+// program, which lowers the library from source beside it exactly as these do. A claim about one
+// function is asked inside that function, so a match in a library body cannot answer for it.
+
+// -- the helpers the cgb_ files share -------------------------------------------------------------
+
+// The module a one-file program lowers to, with the library compiled from source beside it; a
+// program the analysis refuses answers with its report instead.
+cgb_ir(src: string) -> string = xvr_ir([("main.sysl", src)])
+
+// One function's emitted text, from its `define` to the brace that closes it.
+cgb_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out).view()
+        val names = line.contains("@" + name + "(") || line.contains("$" + name + "(")
+
+        if !inside && line.starts_with("define ") && names then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end cgb_body
+
+cgb_main(src: string) -> string = cgb_body(cgb_ir(src), "main")
+
+private cgb_is_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
+
+// The text with every temporary's number written `N` -- `%t17` is `%tN` -- so a line the reference
+// matched with `%t\d+` is asked for as one substring.
+cgb_norm(text: string) -> string
+    var b = str_builder()
+    val bs = text.bytes
+    var i: usize = 0
+    var from: usize = 0
+
+    while i + 2 < bs.len
+        if bs[i] == u8('%') && bs[i + 1] == u8('t') && cgb_is_digit(bs[i + 2])
+            var j = i + 2
+
+            while j < bs.len && cgb_is_digit(bs[j])
+                j += 1
+
+            b.push(text[from..<i])
+            b.push("%tN")
+            from = j
+            i = j
+        else
+            i += 1
+
+    b.push(text[from..<bs.len])
+    b.finish()
+end cgb_norm
+
+// Whether `want` is in `out` once every temporary's number is set aside.
+cgb_has(out: string, want: string) -> bool = cgb_norm(out).contains(want)
+
+// The labels of a body, in the order they are laid out.
+private cgb_labels(body: string, prefix: string) -> string
+    var said = ""
+
+    for line in lines_of(body).view()
+        val t = line.trim()
+
+        if t.starts_with(prefix) && t.ends_with(":") then said = said + t + " "
+
+    said
+end cgb_labels
+
+// -- statements: variable storage and assignment --------------------------------------------------
+
+@test("a var lowers to alloca + store, a read to load")
+cgb_a_var_lowers_to_alloca_and_store()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("var x = 5\nprint(x)")
+
+    for want in ["%x.addr = alloca i32", "store i32 5, ptr %x.addr", "load i32, ptr %x.addr"]
+        assert(out.contains(want), s"$want in:\n$out")
+
+@test("reassignment stores again")
+cgb_reassignment_stores_again()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("var x = 1\nx = 2")
+
+    assert(out.contains("store i32 2, ptr %x.addr"), out)
+
+@test("a compound assignment loads, operates, and stores back")
+cgb_a_compound_assignment_loads_operates_and_stores()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("var x = 10\nx += 5")
+
+    for want in ["load i32, ptr %x.addr", "add i32", "store i32"]
+        assert(out.contains(want), s"$want in:\n$out")
+
+// -- programs the analysis refuses, and the diagnostic each produces ------------------------------
+
+@test("an undefined name is rejected")
+cgb_an_undefined_name_is_rejected()
+    if xvr_no_library() then return
+
+    val said = cgb_ir("print(nope)")
+
+    assert(said.contains("undefined name 'nope'"), said)
+
+@test("calling an undefined function is rejected")
+cgb_calling_an_undefined_function_is_rejected()
+    if xvr_no_library() then return
+
+    val said = cgb_ir("foo(1)")
+
+    assert(said.contains("undefined function 'foo'"), said)
+
+// The reference: "'+' needs matching types, got int and real".
+@test("mixing int and real in arithmetic is rejected")
+cgb_mixing_int_and_real_is_rejected()
+    if xvr_no_library() then return
+
+    val said = cgb_ir("print(1 + 2.0)")
+
+    assert(said.contains("'+' needs matching types, got int and real"), said)
+
+// -- expressions: instruction selection, precedence, comparison chains ----------------------------
+
+@test("precedence shows in instruction order — mul before add")
+cgb_precedence_shows_in_instruction_order()
+    if xvr_no_library() then return
+
+    val main = cgb_main("print(1 + 2 * 3)")
+
+    assert(main.contains("mul i32 2, 3"), main)
+    assert(cgb_has(main, "add i32 1, %tN"), main)
+
+@test("integer division uses signed sdiv")
+cgb_integer_division_uses_sdiv()
+    if xvr_no_library() then return
+
+    val main = cgb_main("print(7 / 2)")
+
+    assert(main.contains("sdiv i32 7, 2"), main)
+
+@test("float arithmetic uses the fadd family")
+cgb_float_arithmetic_uses_fadd()
+    if xvr_no_library() then return
+
+    val main = cgb_main("print(1.5 + 2.5)")
+
+    assert(main.contains("fadd double"), main)
+
+// Still two comparisons, but the right one sits in a conditionally-entered block rather than being
+// eagerly `and`ed with the left.
+@test("an explicit && short-circuits its right side behind a branch")
+cgb_an_and_short_circuits_its_right_side()
+    if xvr_no_library() then return
+
+    val main = cgb_main("print(1 < 2 && 2 < 3)")
+
+    assert_eq(main.count_of("icmp"), 2)
+    assert(main.contains("sc.rhs"), main)
+    assert(main.contains("sc.end"), main)
+    assert(!main.contains("and i1"), main)
+
+// A chain lowers to the same shape as `&&`: each comparison branches, and the ones after it sit in
+// conditionally-entered blocks.
+@test("a chained comparison branches between its comparisons")
+cgb_a_chained_comparison_branches()
+    if xvr_no_library() then return
+
+    val main = cgb_main("print(1 < 2 < 3)")
+
+    assert_eq(main.count_of("icmp"), 2)
+    assert(main.contains("cmp.next"), main)
+    assert(main.contains("cmp.exit"), main)
+    assert(!main.contains("and i1"), main)
+
+// The exits unwind in reverse, so an operand built in a later block is released before the regions
+// entered ahead of it; two operands are always built and released at the outer exit.
+@test("the exits of a chain unwind in reverse")
+cgb_the_exits_of_a_chain_unwind_in_reverse()
+    if xvr_no_library() then return
+
+    val main = cgb_main("f(s: string) -> string = s + \"!\"\nprint(f(\"a\") < f(\"b\") < f(\"c\"))")
+
+    assert_eq(cgb_labels(main, "cmp."), "cmp.next4: cmp.exit2: cmp.exit1: cmp.end3: ")
+
+    val outer = main.index_of("cmp.exit1:").unwrap()
+    val end = main.index_of("cmp.end3:").unwrap()
+
+    assert_eq(main[outer..<end].count_of("@arc.release_maybe"), 2)
+
+// A single comparison has nothing to short-circuit, so it stays straight-line.
+@test("a lone comparison emits no branch at all")
+cgb_a_lone_comparison_emits_no_branch()
+    if xvr_no_library() then return
+
+    val main = cgb_main("print(1 < 2)")
+
+    assert(main.contains("icmp"), main)
+    assert(!main.contains("cmp.next"), main)
+    assert(!main.contains("cmp.exit"), main)
+
+// -- the memory modes: a place's address, an opaque `ptr`, a mangled reference type ---------------
+
+@test("a pointer is an opaque ptr, and address-of is the slot itself")
+cgb_a_pointer_is_an_opaque_ptr()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("var n = 1\nvar p = &n\nprint(*p)")
+
+    for want in ["%n.addr = alloca i32", "%p.addr = alloca ptr", "store ptr %n.addr, ptr %p.addr"]
+        assert(out.contains(want), s"$want in:\n$out")
+
+@test("a store through a dereference goes to the loaded address")
+cgb_a_store_through_a_dereference()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("var n = 1\nvar p = &n\n*p = 7")
+
+    assert(cgb_has(out, "%tN = load ptr, ptr %p.addr"), out)
+    assert(cgb_has(out, "store i32 7, ptr %tN"), out)
+
+@test("a field through a pointer is one getelementptr from the pointer value")
+cgb_a_field_through_a_pointer()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("struct P\n    x: int\n    y: int\nvar v = P(1, 2)\nvar p = &v\np.y = 9")
+
+    assert(cgb_has(out, "%tN = load ptr, ptr %p.addr"), out)
+    assert(cgb_has(out, "getelementptr %struct.P, ptr %tN, i32 0, i32 1"), out)
+
+@test("a field of a local is addressed from its own slot, with no load")
+cgb_a_field_of_a_local()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("struct P\n    x: int\n    y: int\nvar v = P(1, 2)\nv.x = 9")
+
+    assert(out.contains("getelementptr %struct.P, ptr %v.addr, i32 0, i32 0"), out)
+
+@test("a recursive struct lowers its self-reference to a pointer")
+cgb_a_recursive_struct()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("struct Node\n    value: int\n    next: *Node\nvar n = Node(1, null)")
+
+    assert(out.contains("%struct.Node = type { i32, ptr }"), out)
+    assert(out.contains("insertvalue %struct.Node %t1, ptr null, 1"), out)
+
+@test("null lowers to the LLVM null constant")
+cgb_null_lowers_to_null()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("var p: *int = null\nprint(p == null)")
+
+    assert(out.contains("store ptr null, ptr %p.addr"), out)
+
+@test("pointer and bool equality use the equality predicates")
+cgb_pointer_and_bool_equality()
+    if xvr_no_library() then return
+
+    val ptrs = cgb_ir("var n = 1\nvar p = &n\nprint(p == null)")
+    val bools = cgb_ir("var b = true\nprint(b == false)")
+
+    assert(cgb_has(ptrs, "icmp eq ptr %tN, null"), ptrs)
+    assert(cgb_has(bools, "icmp eq i1 %tN, 0"), bools)
+
+@test("a memory mode is mangled as a word, since a sigil is not an LLVM name")
+cgb_a_memory_mode_is_mangled_as_a_word()
+    if xvr_no_library() then return
+
+    val out = cgb_ir("id[T](x: T) -> T = x\nvar n = 1\nvar p = &n\nvar q = id(p)")
+
+    assert(out.contains("@id.ptr.int("), out)
