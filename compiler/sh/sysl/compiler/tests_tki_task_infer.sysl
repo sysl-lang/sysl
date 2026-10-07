@@ -1,0 +1,192 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A type parameter solved from a `Task[T]`, wherever the declaration wrote one: a parameter, a field,
+// inside an `Option`, a member's own parameter. `Task` is the compiler's and no declaration table
+// holds it, so `generic.sysl`'s `unify_named` matches the written name against an argument's task
+// through `task_key` rather than through a lookup that answers nothing.
+
+private var tki_library_cache: Buf[Program] = buf()
+private var tki_library_read: bool = false
+
+private tki_library() -> Buf[Program]
+    if tki_library_read then return tki_library_cache
+
+    tki_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tki_library_cache = units
+
+    tki_library_cache
+end tki_library
+
+private tki_no_library() -> bool
+    if tki_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+    end if
+
+    false
+end tki_no_library
+
+// The whole report a one-file program is refused with, or `""` where it analyzes clean.
+private tki_refused(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.report.render(parsed.src)
+
+    var units: Buf[Program] = buf()
+    val library = tki_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end tki_refused
+
+// What a one-file program prints, or why it did not build or run.
+private tki_ran(text: string) -> string
+    val root = make_temp_dir("sysl-tki").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, "0", Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else
+            s"it did not run to the end: ${out.text}${out.err.unwrap_or("")}"
+end tki_ran
+
+@test("a parameter written Task[T] solves T from the task it is handed")
+tki_a_parameter_solves_from_its_task()
+    if tki_no_library() then return
+
+    assert_eq(tki_ran(raw"""
+        async seven() -> int = 7
+
+        free[T](t: Task[T]) -> T = block_on(t)
+
+        print(free(seven()))
+        """), "7\n")
+
+@test("a struct field written Task[T] solves the struct's T at its construction")
+tki_a_field_solves_at_construction()
+    if tki_no_library() then return
+
+    assert_eq(tki_refused(raw"""
+        async seven() -> int = 7
+
+        struct Box[T]
+            t: Task[T]
+
+        held() -> int
+            val b = Box(seven())
+            block_on(b.t)
+        """), "")
+
+@test("a Task[T] inside an Option solves T through both")
+tki_inside_an_option()
+    if tki_no_library() then return
+
+    assert_eq(tki_refused(raw"""
+        async seven() -> int = 7
+
+        first[T](o: Option[Task[T]]) -> T = block_on(o.unwrap())
+
+        val n: int = first(Some(seven()))
+        """), "")
+
+@test("a generic struct's member solves its own parameter from a Task, and the struct's from a field")
+tki_a_member_of_a_generic_struct()
+    if tki_no_library() then return
+
+    assert_eq(tki_refused(raw"""
+        async seven() -> int = 7
+
+        struct Runner[T]
+            n: T
+
+            run[U](self, t: Task[U]) -> U = block_on(t)
+
+        struct Holder[T]
+            t: Task[T]
+
+            take(self) -> T = block_on(self.t)
+
+        val a: int = Runner("x").run(seven())
+        val b: int = Holder(seven()).take()
+        """), "")
+
+// The second symptom of the same hole: inside a generic over `Task[T]`, a field's `None` was asked to
+// settle its own `T` because the call that should have settled it never did.
+@test("a None in an Option[Task[T]] field is settled inside a generic over Task[T]")
+tki_none_in_a_task_field()
+    if tki_no_library() then return
+
+    assert_eq(tki_ran(raw"""
+        async seven() -> int = 7
+
+        struct Slot[T]
+            t: Option[Task[T]]
+
+        empty[T](t: Task[T]) -> Slot[T] = Slot(None)
+
+        fill[T](t: Task[T]) -> Slot[T]
+            var s = empty(t)
+            s.t = Some(t)
+            s
+
+        print(block_on(fill(seven()).t.unwrap()))
+        """), "7\n")
+
+@test("a program's own Task is the nearer name, and a parameter written with it solves against it")
+tki_a_programs_own_task()
+    if tki_no_library() then return
+
+    assert_eq(tki_refused(raw"""
+        struct Task[T]
+            v: T
+
+        free[T](t: Task[T]) -> T = t.v
+
+        val n: int = free(Task(3))
+        """), "")
+
+@test("an argument that is no task solves nothing, and the call is refused for it")
+tki_no_task_solves_nothing()
+    if tki_no_library() then return
+
+    val said = tki_refused(raw"""
+        free[T](t: Task[T]) -> T = block_on(t)
+
+        print(free(5))
+        """)
+
+    assert(said.contains("error: cannot infer the type argument 'T' of 'free' here"), said)
