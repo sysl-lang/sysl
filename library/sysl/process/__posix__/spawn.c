@@ -24,6 +24,23 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Whether a child is started with `posix_spawnp` rather than `fork` and `execvp` -- see
+ * `start_spawned`. It needs `posix_spawn_file_actions_addchdir_np` for a child's directory, which
+ * macOS has had since 10.15 and glibc since 2.29; anywhere else keeps the `fork` path. */
+#if defined(__APPLE__) || (defined(__GLIBC__) && \
+    (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29)))
+#define SYSL_PROC_SPAWNS 1
+#include <spawn.h>
+#include <string.h>
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#else
+extern char **environ;
+#endif
+#else
+#define SYSL_PROC_SPAWNS 0
+#endif
+
 /* How long a child that has been asked to stop is given before it is made to.
  *
  * Deliberately short. A child that means to tidy up on `SIGTERM` has already had the whole of its
@@ -220,29 +237,11 @@ static int stop(pid_t pid, int *status) {
  * same answer -- and "no such file or directory" is the single most likely thing to go wrong when a
  * tool shells out.
  */
-int sysl_proc_start(const char *program, char *const *argv,
-                    const char *const *env_names, const char *const *env_values,
-                    const char *dir, const char *out_path, const char *err_path,
-                    int *pid_out, long long *started_ms) {
-    /* **Everything this program has written, written, before anything else can write.**
-     *
-     * A C library buffers standard output, and it buffers it *fully* rather than by line whenever
-     * the destination is not a terminal -- a pipe, a file, a CI log. The child writes to the same
-     * file description directly and is not buffered by anything of ours, so without this its output
-     * lands ahead of text the parent printed first and the log reads in the wrong order. It looks
-     * like the parent forgot to say what it was doing.
-     *
-     * `NULL` flushes every output stream rather than just `stdout`, which is what makes it correct
-     * for a program writing to both channels: they are separately buffered and would otherwise be
-     * separately out of order.
-     *
-     * It is also the reason this belongs to the fork rather than to the caller. Any buffered bytes
-     * still held here are duplicated into the child by `fork`, and a child that did something other
-     * than `exec` immediately would print them a second time -- flushing first is what makes that
-     * unreachable rather than merely unlikely.
-     */
-    fflush(NULL);
-
+__attribute__((unused))
+static int start_forked(const char *program, char *const *argv,
+                        const char *const *env_names, const char *const *env_values,
+                        const char *dir, const char *out_path, const char *err_path,
+                        int *pid_out, long long *started_ms) {
     int report[2];
 
     if (pipe(report) != 0) return errno;
@@ -306,6 +305,232 @@ int sysl_proc_start(const char *program, char *const *argv,
     *pid_out = (int) pid;
     *started_ms = started_at;
     return 0;
+}
+
+#if SYSL_PROC_SPAWNS
+
+/* Whether `entry` (`NAME=value`) sets the variable `name`. */
+static int sets(const char *entry, const char *name) {
+    size_t n = strlen(name);
+
+    return strncmp(entry, name, n) == 0 && entry[n] == '=';
+}
+
+/* The environment a child is handed: this process's own, with each named variable added or
+ * replaced -- what `setenv` in the child did on the `fork` path, the last of two equal names winning
+ * as the second `setenv` would. Answers NULL when nothing is named, meaning "this one, unchanged";
+ * `*made` collects what was allocated, for `release_environment`. */
+static char **child_environment(const char *const *names, const char *const *values,
+                                char **current, char ***made, int *err) {
+    *made = NULL;
+
+    if (!names || !values || !names[0]) return NULL;
+
+    size_t have = 0;
+    size_t named = 0;
+
+    while (current && current[have]) have++;
+    while (names[named]) named++;
+
+    char **env = calloc(have + named + 1, sizeof *env);
+    char **owned = calloc(named + 1, sizeof *owned);
+
+    if (!env || !owned) {
+        free(env);
+        free(owned);
+        *err = ENOMEM;
+        return NULL;
+    }
+
+    size_t at = 0;
+
+    for (size_t i = 0; i < have; i++) {
+        int replaced = 0;
+
+        for (size_t j = 0; j < named && !replaced; j++) replaced = sets(current[i], names[j]);
+
+        if (!replaced) env[at++] = current[i];
+    }
+
+    size_t made_n = 0;
+
+    for (size_t j = 0; j < named; j++) {
+        int later = 0;
+
+        for (size_t k = j + 1; k < named && !later; k++) later = strcmp(names[j], names[k]) == 0;
+
+        if (later) continue;
+
+        size_t len = strlen(names[j]) + 1 + strlen(values[j]) + 1;
+        char *line = malloc(len);
+
+        if (!line) {
+            for (size_t m = 0; m < made_n; m++) free(owned[m]);
+            free(owned);
+            free(env);
+            *err = ENOMEM;
+            return NULL;
+        }
+
+        snprintf(line, len, "%s=%s", names[j], values[j]);
+        owned[made_n++] = line;
+        env[at++] = line;
+    }
+
+    *made = owned;
+    return env;
+}
+
+/* Where `program` is found on the `PATH` the CHILD is given, written into `buf`. Answers 0, or an
+ * `errno`: ENOENT where nothing on it is called that, EACCES where something is and may not be run.
+ *
+ * `posix_spawnp` searches the parent's `PATH`, while `execvp` after a `setenv` searched the child's,
+ * so a caller setting `PATH` is asking for this search -- and is only reached then. */
+static int found_on(const char *program, const char *dirs, char *buf, size_t n) {
+    int refused = 0;
+    const char *at = dirs;
+
+    for (;;) {
+        const char *end = strchr(at, ':');
+        size_t len = end ? (size_t) (end - at) : strlen(at);
+        int wrote = len == 0 ? snprintf(buf, n, "./%s", program)
+                             : snprintf(buf, n, "%.*s/%s", (int) len, at, program);
+
+        if (wrote > 0 && (size_t) wrote < n) {
+            if (access(buf, X_OK) == 0) return 0;
+
+            if (errno == EACCES) refused = 1;
+        }
+
+        if (!end) break;
+
+        at = end + 1;
+    }
+
+    return refused ? EACCES : ENOENT;
+}
+
+static void release_environment(char **env, char **made) {
+    if (made) {
+        for (size_t m = 0; made[m]; m++) free(made[m]);
+    }
+
+    free(made);
+    free(env);
+}
+
+/* The same child `start_forked` makes, made by `posix_spawnp`.
+ *
+ * **`fork` copies the parent's address space, and what that costs grows with the parent's heap.**
+ * Copy-on-write spares the bytes but not the map: every page of a heap made of many small objects
+ * has to be marked, so a parent holding a gigabyte and a half of them paid about ten milliseconds a
+ * child and one holding six paid forty -- a test runner that has just compiled a large program pays
+ * it once per test. `posix_spawn` starts the child without copying anything, at the same price
+ * whatever the parent holds.
+ *
+ * What the child is handed is what the `fork` path gave it, in the same order: the environment with
+ * the named variables added or replaced, then the directory, then each stream opened onto its file.
+ * A program that cannot be run is the `errno` `posix_spawnp` answers, so there is nothing to reap.
+ */
+static int start_spawned(const char *program, char *const *argv,
+                         const char *const *env_names, const char *const *env_values,
+                         const char *dir, const char *out_path, const char *err_path,
+                         int *pid_out, long long *started_ms) {
+#if defined(__APPLE__)
+    char **current = *_NSGetEnviron();
+#else
+    char **current = environ;
+#endif
+    char **made = NULL;
+    int err = 0;
+    char **env = child_environment(env_names, env_values, current, &made, &err);
+
+    if (err != 0) return err;
+
+    posix_spawn_file_actions_t actions;
+    int e = posix_spawn_file_actions_init(&actions);
+
+    if (e != 0) {
+        release_environment(env, made);
+        return e;
+    }
+
+    /* The `_np` spelling is the one every macOS since 10.15 and glibc since 2.29 has; macOS 26
+     * deprecates it for a plain name older systems lack. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (dir && dir[0]) e = posix_spawn_file_actions_addchdir_np(&actions, dir);
+#pragma clang diagnostic pop
+
+    const int opened = O_WRONLY | O_CREAT | O_TRUNC;
+
+    if (e == 0 && out_path && out_path[0])
+        e = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, out_path, opened, 0600);
+
+    if (e == 0 && err_path && err_path[0])
+        e = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, err_path, opened, 0600);
+
+    pid_t pid = 0;
+    const char *child_path = NULL;
+
+    for (size_t i = 0; env_names && env_values && env_names[i]; i++) {
+        if (strcmp(env_names[i], "PATH") == 0) child_path = env_values[i];
+    }
+
+    if (e == 0 && child_path && !strchr(program, '/')) {
+        char where[4096];
+
+        e = found_on(program, child_path, where, sizeof where);
+
+        if (e == 0) e = posix_spawn(&pid, where, &actions, NULL, argv, env);
+    } else if (e == 0) {
+        e = posix_spawnp(&pid, program, &actions, NULL, argv, env ? env : current);
+    }
+
+    long long started_at = now_ms();
+
+    posix_spawn_file_actions_destroy(&actions);
+    release_environment(env, made);
+
+    if (e != 0) return e;
+
+    *pid_out = (int) pid;
+    *started_ms = started_at;
+    return 0;
+}
+
+#endif
+
+int sysl_proc_start(const char *program, char *const *argv,
+                    const char *const *env_names, const char *const *env_values,
+                    const char *dir, const char *out_path, const char *err_path,
+                    int *pid_out, long long *started_ms) {
+    /* **Everything this program has written, written, before anything else can write.**
+     *
+     * A C library buffers standard output, and it buffers it *fully* rather than by line whenever
+     * the destination is not a terminal -- a pipe, a file, a CI log. The child writes to the same
+     * file description directly and is not buffered by anything of ours, so without this its output
+     * lands ahead of text the parent printed first and the log reads in the wrong order. It looks
+     * like the parent forgot to say what it was doing.
+     *
+     * `NULL` flushes every output stream rather than just `stdout`, which is what makes it correct
+     * for a program writing to both channels: they are separately buffered and would otherwise be
+     * separately out of order.
+     *
+     * It is also the reason this belongs to the fork rather than to the caller. Any buffered bytes
+     * still held here are duplicated into the child by `fork`, and a child that did something other
+     * than `exec` immediately would print them a second time -- flushing first is what makes that
+     * unreachable rather than merely unlikely.
+     */
+    fflush(NULL);
+
+#if SYSL_PROC_SPAWNS
+    return start_spawned(program, argv, env_names, env_values, dir, out_path, err_path, pid_out,
+                         started_ms);
+#else
+    return start_forked(program, argv, env_names, env_values, dir, out_path, err_path, pid_out,
+                        started_ms);
+#endif
 }
 
 /* Wait for a child `sysl_proc_start` began, and say how it ended.
