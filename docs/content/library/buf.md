@@ -35,7 +35,7 @@ print(b.view().len, b.view()[1])
 ```
 
 Nothing in the language reaches it. An array literal makes a `[]T`, a `for` walks whatever implements
-`Iterate`, and neither of those is a growable sequence — so a program that wants one asks, and the
+`Iterate` or `Walk`, and neither of those is a growable sequence — so a program that wants one asks, and the
 `import` is where it asked. That is the [core module's](/library/core/) rule applied from the other
 side: what a program cannot avoid needing arrives free, and what it has to ask for it asks for.
 
@@ -245,25 +245,11 @@ print(b.len)
 'len' is a method of 'sysl.buf.Buf[int]' — call it with 'len(…)'
 ```
 
-And a `Buf` is not itself iterable — it implements `Index`, not `Iterate`:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-var b: Buf[int] = buf()
-
-b.push(1)
-
-for x in b
-    print(x)
-```
-
-```error
-'for' iterates an integer range, an array, a slice, or a type that implements 'sysl.Iterate', and sysl.buf.Buf[int] is none of those — what it does have is 'view()', which answers with something a 'for' walks, so 'for x in b.view()' is the loop
-```
-
-`for x in b.view()` is how it is walked, and that is not a workaround — it names the thing being
-iterated, which is *the live prefix at the moment the loop started*:
+A `for` walks a `Buf` directly. A `Buf` is not a cursor — it implements `Index`, not `Iterate` — but
+it implements [`Walk`](/library/core/), whose `walk()` answers `view()`, and a `for` over a type
+implementing `Walk` walks what `walk()` answers. So the loop reads *the live prefix at the moment it
+started*, by index as a slice's elements are read, and an element pushed during the walk is not
+visited:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -273,19 +259,19 @@ var b: Buf[int] = buf()
 b.push(1)
 b.push(2)
 
-for x in b.view()
-    print(x)
+for x in b
+    b.push(x * 10)
+
+print(b)
 ```
 
 ```output
-1
-2
+[1, 2, 10, 20]
 ```
 
-The refusal says so itself: it looks for a member of the receiver whose answer a `for` **does** walk,
-so a container that hands out a cursor from [`walk()`](/library/container/) is told to use that
-instead. It offers only a member you could have called — no arguments, and visible from where you
-are.
+A type that implements neither is refused, and the refusal looks for a member of the receiver whose
+answer a `for` **does** walk, so a type of your own that hands out a view or a cursor is told to use
+it. It offers only a member you could have called — no arguments, and visible from where you are.
 
 **What a buffer answers without being walked at all is [`sysl.seq`](/library/seq/)** — `map`,
 `filter`, `fold` and the seven questions beside them, implemented for a `Buf` as well as for a slice,

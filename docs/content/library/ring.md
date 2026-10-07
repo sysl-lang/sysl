@@ -163,7 +163,7 @@ there is no slot for the value, so `overwrite` evicts it at once and answers `So
 ## The subscript counts from the front, whatever the ring is doing underneath
 
 `r[i]` is the `i`th value from the front, not the `i`th slot, and the wrapping is invisible to a
-caller — which is what `walk()` iterates in as well.
+caller — which is the order a `for` walks a ring in as well, through the cursor its `walk()` answers.
 
 ```sysl
 import sysl.container.ring.ring
@@ -179,7 +179,7 @@ r.pop_front()
 r.push_back(4)
 r.push_back(5)
 
-for v in r.walk()
+for v in r
     print(v)
 ```
 

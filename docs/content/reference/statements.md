@@ -241,7 +241,7 @@ Five forms, and each is an expression.
 | `while cond` | test before each iteration |
 | `do … while cond` | test after each iteration, so the body runs at least once |
 | `loop` | no test at all; something inside leaves it |
-| `for x in seq` | walk a range, an array, a slice, or an `Iterate` |
+| `for x in seq` | walk a range, an array, a slice, an `Iterate`, or a container through its `Walk` |
 | `for init; cond; step` | a stride, a descent, a compound test, several variables |
 
 **A fourth thing may follow `for`, and it is not a loop.** `for const i in 0..<A.len` is *unrolled*
@@ -273,6 +273,30 @@ for i in 0..<2
 6
 0
 1
+```
+
+**A container is walked through `Walk`.** Where `seq`'s type implements the library's
+[`Walk`](/library/core/) and is not itself a cursor, the loop is `for x in seq.walk()`: `walk` is
+called once, before the first turn, and what it answers is walked by the rules above — so a `Buf`,
+whose `walk` answers its view, is walked by index as a slice is, and a `Map` through its cursor, a
+`(key, value)` pair apiece. A type implementing `Iterate` is walked by `next` even if it implements
+`Walk` too.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.push(4)
+b.push(5)
+
+for x in b
+    print(x)
+```
+
+```output
+4
+5
 ```
 
 #### The loop variable may be a pattern

@@ -819,9 +819,10 @@ directly in the header lives for the whole loop rather than being rebuilt each s
 
 **Storage is walked by index, and that is why a container is not an iterator.** A `for` also accepts
 a cursor — a value implementing `Iterate` — but no built-in sequence implements it, and `Buf`
-deliberately does not: `for x in b.view()` reads elements already sitting in memory, which costs an
-index where a cursor would cost a call apiece. The protocol is for sequences whose elements have to
-be *computed*, which a container's never are.
+deliberately does not: its elements are already sitting in memory, and reading them costs an index
+where a cursor would cost a call apiece. The protocol is for sequences whose elements have to be
+*computed*, which a container's never are. What `Buf` implements instead is `Walk`, whose `walk()`
+answers the view, so `for x in b` asks for it once and then walks the slice by index.
 
 ## What a view keeps alive
 

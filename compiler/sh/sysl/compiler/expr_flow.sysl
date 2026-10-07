@@ -603,7 +603,7 @@ for_expr(cx: &Analyzer, span: Span, label: Option[string], name: string, iter: E
                             TExpr(span, TFor(u, vty, tlo, thi, inclusive, tb, telse, ty)))
     end if
 
-    val seq = auto_deref(cx, type_expr_bare(cx, iter))
+    val seq = walked_through(cx, span, auto_deref(cx, type_expr_bare(cx, iter)))
     val cursor = iterated(cx, span, seq, name, body, expected, label, else_body, discarded)
 
     if cursor.is_some() then return cursor.unwrap()
@@ -704,6 +704,33 @@ private walked_by_index(t: Type) -> bool = t match
     Array(_, _) -> true
     Slice(_, _) -> true
     _ -> false
+
+// `for x in c` where `c` is a **container** -- a value whose type implements `Walk` -- is
+// `for x in c.walk()`: the call is made once, before the first turn, and what it answers is walked by
+// the rules above and below, so a `Buf` is walked as the slice its `walk` answers (by index, no call
+// per element) and a `Map` through its cursor (`(k, v)` pairs).
+//
+// **A cursor is not re-routed**: a type implementing `Iterate` is walked by `next` even where it
+// implements `Walk` too, and the built-in sequences are never asked. Anything else comes back as it
+// went in, leaving the refusal to `walked_element`.
+private walked_through(cx: &Analyzer, span: Span, seq: TExpr) -> TExpr
+    val key = catalog_key(cx.an, "Walk")
+    val cty = texpr_type(seq)
+
+    if key.is_none() || walked_by_index(cty) then return seq
+
+    val iterate = catalog_key(cx.an, "Iterate")
+
+    if iterate.is_some()
+        if walks_through_a_table(cx, cty, iterate.unwrap()) then return seq
+        if conforms(cx.an, Bound(iterate.unwrap(), buf()), cty) then return seq
+
+    if !conforms(cx.an, Bound(key.unwrap(), buf()), cty) then return seq
+
+    var none_args: Buf[Expr] = buf()
+
+    auto_deref(cx, call_member(cx, span, seq, "walk", none_args, None))
+end walked_through
 
 // Whether a `for` walks its cursor through a table rather than by name: an erased pointer made
 // against `Iterate` or against a trait requiring it.
@@ -865,8 +892,11 @@ private road_offered(cx: &Analyzer, seq: TExpr, iter: Expr, name: string) -> str
 
         if !answers_a_walk(cx, seq, m.name, key) then continue
 
+        // A pattern header was parsed into a loop over `ElemName`, a name nobody wrote, so there is
+        // no spelling of the header to hand back and the member is named alone.
         val loop_line = *iter.kind match
-            Ident(subject) -> s", so 'for $name in $subject.${m.name}()' is the loop"
+            Ident(subject) if name != ElemName ->
+                s", so 'for $name in $subject.${m.name}()' is the loop"
             _ -> ""
 
         return s" — what it does have is '${m.name}()', which answers with something a 'for' " +

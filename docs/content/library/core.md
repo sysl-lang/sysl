@@ -42,7 +42,7 @@ print(maybe.unwrap_or(0), "— and not one import above this line")
 | their identities | `Zero`, `One` | [expressions](/reference/expressions/), and [math](/library/math/) |
 | conversion between two types | `From` | [errors and contracts](/reference/errors/#a-converts-through-from) |
 | a range as a value | `Range` | [expressions](/reference/expressions/), and [seq](/library/seq/) |
-| subscripting and walking | `Index`, `IndexSet`, `Iterate` | below |
+| subscripting and walking | `Index`, `IndexSet`, `Iterate`, `Walk` | below |
 | calling | `Fn0` … `Fn4` | below |
 | the platform | `os`, `cpu`, `cpu_count` | below |
 
@@ -1446,6 +1446,39 @@ for x in it do print(x)
 That is the same rule that lets a trait object satisfy a bound — a `for` asks what may be *called* on
 the value, and a table is an answer to that. It means a function may hand back a cursor without
 saying which one it built.
+
+## Walking a container
+
+```sysl
+trait Walk
+    type Walker
+    walk(self) -> Self::Walker
+```
+
+A container is not a cursor — a cursor is consumed as it is walked, and walking a buffer should not
+use it up — so a container implements `Walk` instead: `walk` answers *something a `for` walks*, and
+`for x in c` over a type implementing it is `for x in c.walk()`, the call made once before the first
+turn. `Buf` answers its view, so its elements are read by index; `Map`, `Set`, `Deque`, `List` and
+`Ring` answer their cursors. A type of your own takes part the same way:
+
+```sysl
+struct Bag
+    xs: []int
+
+impl Walk for Bag
+    type Walker = []int
+    walk(self) -> []int = self.xs
+
+var t = 0
+
+for x in Bag([1, 2, 3]) do t += x
+
+print(t)
+```
+
+```output
+6
+```
 
 ## Calling a value
 
