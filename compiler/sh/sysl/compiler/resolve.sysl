@@ -582,10 +582,11 @@ pruned_roots(roots: Buf[(string, Manifest)], enabled: &Buf[(string, Buf[string])
     out
 end pruned_roots
 
-// Whether a build has a graph to resolve at all: the project's own `dependencies`, or a source
-// root's.
+// Whether a build has a graph to resolve at all: the project's own `dependencies` -- and under
+// `sysl test` its `dev_dependencies` (`with_dev_dependencies`) -- or a source root's.
 wants_graph(m: &Manifest) -> bool
     if !m.dependencies.is_empty() then return true
+    if feature_testing() && !m.dev_dependencies.is_empty() then return true
 
     val libs = lib_roots()
 
@@ -1164,10 +1165,74 @@ struct PackageSources
     // The `#if` symbols each `--lib` root's enabled features define, for its own files, keyed by the
     // root as it was written.
     lib_features: Buf[(string, Buf[string])]
+
+    // The module paths, as the project's own files write them, that arrive only through a
+    // `dev_dependencies` entry -- what `check_dev_imports` holds an ordinary module to. Empty for
+    // every command but `sysl test`, which is the only one that resolves the block.
+    dev_modules: Buf[string]
 end PackageSources
 
 // A project that depends on nothing, which is what an empty `dependencies` block means.
-no_package_sources() -> PackageSources = PackageSources(buf(), buf(), buf(), buf(), buf())
+no_package_sources() -> PackageSources = PackageSources(buf(), buf(), buf(), buf(), buf(), buf())
+
+// The project's manifest as this build resolves it (`reference/packages.md § Dependencies a test
+// alone needs`): under `sysl test` its `dev_dependencies` join its `dependencies` in the one graph,
+// and under every other command they are not read at all. **Only the project's own** -- a fetched
+// package is walked through its `dependencies` alone, so a dependency's dev block is never fetched,
+// and the pruning is an omission rather than a filter.
+with_dev_dependencies(m: &Manifest) -> Manifest
+    var out = *m
+
+    if !feature_testing() || m.dev_dependencies.is_empty() then return out
+
+    var all: Buf[Dependency] = buf()
+
+    for i in 0..<m.dependencies.len()
+        all.push(m.dependencies.at(i))
+
+    for i in 0..<m.dev_dependencies.len()
+        all.push(m.dev_dependencies.at(i))
+
+    out.dependencies = all
+    out
+end with_dev_dependencies
+
+// Which module paths a file of the project writes to reach a dev dependency: every name in the
+// root's import table whose package is one the `dev_dependencies` block named. A coordinate is no
+// module path (a hyphen is not an identifier character), so the table is what relates the two. The
+// root's entries are read off the RESOLVED root, whose workspace members are bound to the canonical
+// name a mount would give them, and matched by label -- a label being in one block or the other.
+private dev_module_paths(m: &Manifest, graph: &Graph) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if m.dev_dependencies.is_empty() then return out
+
+    var canonicals: Buf[string] = buf()
+
+    for i in 0..<graph.packages.len()
+        val p = graph.packages.at(i)
+
+        if !is_root_package(p) then continue
+
+        for j in 0..<p.manifest.dependencies.len()
+            val dep = p.manifest.dependencies.at(j)
+
+            for k in 0..<m.dev_dependencies.len()
+                if m.dev_dependencies.at(k).label == dep.label
+                    canonicals.push(dependency_canonical(dep))
+
+        for j in 0..<p.imports.len()
+            val (written, canonical) = p.imports.at(j)
+
+            for k in 0..<canonicals.len()
+                val c = canonicals.at(k)
+
+                if canonical == c || canonical.starts_with(c + ".")
+                    out.push(written)
+                    break
+
+    out
+end dev_module_paths
 
 // The symbols one `--lib` root's files are gated by.
 lib_feature_symbols(s: &PackageSources, dir: string) -> Buf[string]
@@ -1215,6 +1280,8 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
     val graph = resolved_graph(root, m)?
     var out = no_package_sources()
     val libs = lib_roots()
+
+    if feature_testing() then out.dev_modules = dev_module_paths(m, graph)
 
     for i in 0..<libs.len()
         out.lib_features.push((libs.at(i),
@@ -1279,7 +1346,10 @@ resolved_graph(root: string, m: &Manifest) -> Result[Graph, Refusal]
         Err(why) -> return Err(Refusal(why))
         Ok(got) -> got
 
-    val graph = resolve_graph(root, m, sums, cache, current_feature_request(), feature_testing()) match
+    // A test build's graph holds the project's dev dependencies too, so its sums record them.
+    val whole = with_dev_dependencies(m)
+
+    val graph = resolve_graph(root, whole, sums, cache, current_feature_request(), feature_testing()) match
         Err(why) -> return Err(Refusal(why))
         Ok(got) -> got
 
@@ -1307,8 +1377,8 @@ all_feature_trees(root: string, m: &Manifest, roots: bool) -> Result[Buf[string]
             Err(why) -> return Err(Refusal(why))
             Ok(got) -> got
 
-        val graph = resolve_graph(root, m, sums, cache, FeatureRequest(buf(), false, true),
-                                  feature_testing()) match
+        val graph = resolve_graph(root, with_dev_dependencies(m), sums, cache,
+                                  FeatureRequest(buf(), false, true), feature_testing()) match
             Err(why) -> return Err(Refusal(why))
             Ok(got) -> got
 
