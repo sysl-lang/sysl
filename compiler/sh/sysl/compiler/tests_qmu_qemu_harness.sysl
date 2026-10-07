@@ -1,0 +1,111 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// `sysl.harness` **running on the board**, which is the whole reason it is in the library -- the
+// reference's `QemuHarnessTests`, over every board `qemu_boards()` names but the micro:bit.
+//
+// A codegen claim reads single characters a program printed by hand; a suite of twenty checks
+// written that way is twenty characters, and a run printing `abcdyx4` says nothing about which was
+// wrong. So this tier runs a real suite: the framework names each test, reports the check that failed
+// with both values, and prints a tally -- on a bare board, through a UART, with no C library beneath
+// it. **What is asserted is the framework, not the arithmetic**: each program fails on purpose,
+// because a suite that only passes cannot show that a failure is detected, located and reported.
+//
+// The micro:bit is left out as the reference leaves it out: the Armv6-M target was excluded when it
+// was added and nothing recorded why, so the exclusion is carried rather than justified.
+
+// A whole program: the board's module, and a root file that declares its tests, points the framework
+// at the board's console, and then runs them.
+private qmu_h_program(b: QemuBoard, decls: string, stmts: string) -> Buf[(string, string)]
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("p.sysl", s"import sysl.harness.*\nimport board.*\n\n$decls\nattach(console())\n$stmts"))
+    files.push(("board/board.sysl", qemu_board_module(b)))
+    files
+end qmu_h_program
+
+// Runs one suite on every board but the micro:bit's, and asserts each exited zero having printed
+// every one of `wants`.
+private qmu_h_sweep(decls: string, stmts: string, wants: Buf[string])
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+    val boards = qemu_boards()
+
+    for i in 0..<boards.len()
+        val b = boards.at(i)
+
+        if b.target == "thumbv6m-freestanding" then continue
+
+        ran += 1
+
+        qemu_boot(b, qmu_h_program(b, decls, stmts)) match
+            Err(why) -> bad.push(s"${b.name}: $why")
+            Ok(r) ->
+                if !r.status.ok() then bad.push(qemu_said(b, r))
+
+                for j in 0..<wants.len()
+                    val want = wants.at(j)
+
+                    if !r.out.contains(want) then bad.push(s"wanted '$want': ${qemu_said(b, r)}")
+    end for
+
+    assert(ran > 0, "no board was booted")
+    assert(bad.is_empty(), joined(bad, "\n"))
+end qmu_h_sweep
+
+private qmu_h_wants(xs: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for x in xs do out.push(x)
+
+    out
+end qmu_h_wants
+
+// The claim everything else rests on: the framework links for a bare board at all. It holds module
+// storage, renders through a trait object, and takes the address of a function -- none of which may
+// reach an allocator, a C library or the host.
+@test("names each test, reports its verdict, and tallies what it ran")
+qmu_h_names_each_test_and_tallies()
+    qmu_h_sweep("passes()\n    check(true)\n", "run(\"passes\", &passes)\nfinish()\n",
+              qmu_h_wants(["passes:PASS", "1 tests, 0 failed"]))
+
+// A failure says which check, where, and what the values were.
+@test("reports a failed equality with both values and the line it was written on")
+qmu_h_reports_a_failed_equality()
+    qmu_h_sweep("adds()\n    check_eq(2 + 2, 5)\n", "run(\"adds\", &adds)\nfinish()\n",
+              qmu_h_wants(["adds:FAIL: got 4, want 5", "1 tests, 1 failed"]))
+
+// The digits were computed by the code under test on a 32-bit machine: `Display` for the integers is
+// sysl all the way down to the sink.
+@test("renders a value wider than one digit, on the machine that computed it")
+qmu_h_renders_a_value_wider_than_one_digit()
+    qmu_h_sweep("counts()\n    var n: usize = 0\n    for i in 0..<1000 do n += 1\n    check_eq(n, 999)\n",
+              "run(\"counts\", &counts)\nfinish()\n", qmu_h_wants(["got 1000, want 999"]))
+
+// A slice crosses a call boundary, and the framework's whole report path passes `[]const u8` to the
+// sink.
+@test("compares two slices and says which index differs")
+qmu_h_compares_two_slices()
+    qmu_h_sweep("bytes()\n    check_slice_eq([u8(1), u8(2), u8(3)][..], [u8(1), u8(9), u8(3)][..])\n",
+              "run(\"bytes\", &bytes)\nfinish()\n", qmu_h_wants(["got 2, want 9 at index 1"]))
+
+// The counters survive across tests -- module storage on a board is a fixed area of the image. Three
+// verdicts in one run, the largest image this suite builds.
+@test("runs several tests and counts passes, failures and skips apart")
+qmu_h_counts_passes_failures_and_skips()
+    qmu_h_sweep("good()\n    check(true)\n\nbad()\n    check(false, \"on purpose\")\n",
+              "run(\"good\", &good)\nrun(\"bad\", &bad)\n" +
+              "skip(\"needs_an_adc\", \"no part fitted\")\nfinish()\n",
+              qmu_h_wants(["good:PASS", "bad:FAIL: on purpose", "needs_an_adc:SKIP: no part fitted",
+                         "2 tests, 1 failed, 1 skipped"]))
+
+// The same failure with a statement written above the declarations rather than below them: where a
+// statement sits among the declarations is not something a program's meaning depends on. (It once
+// failed on the MPS2 alone, from a linker script pointing at the wrong alias -- `thumb.ld` has it.)
+@test("reports the same failure when a statement is written above the declarations")
+qmu_h_reports_the_same_failure_with_a_statement_above()
+    qmu_h_sweep("", "adds()\n    check_eq(2 + 2, 5)\n\nrun(\"adds\", &adds)\nfinish()\n",
+              qmu_h_wants(["adds:FAIL: got 4, want 5"]))

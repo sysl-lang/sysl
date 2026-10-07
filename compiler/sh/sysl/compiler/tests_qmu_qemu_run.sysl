@@ -1,0 +1,311 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Programs that **ran** on a 32-bit machine, rather than programs that compiled for one -- the
+// reference's `QemuRunTests`, every case over every board `qemu_boards()` names
+// (`tests_qmu_support.sysl` has the mechanism, `testdata/qemu/README.md` the reasoning).
+//
+// Everything below this tier reads text, and **a miscompile is text too**: a length loaded at the
+// wrong width, an index widened to a size the machine does not have, an aggregate coerced into the
+// wrong register -- each produces a module that verifies, assembles, and computes the wrong answer.
+// So each case here says what it computed through the UART, and the startup reports what `main`
+// returned through the board's exit device; reading only the status would say a run failed without
+// saying which value was wrong.
+
+// `putc` for a board, as root-file source: the device's registers, and on the boards that need it
+// the statements that switch the transmitter on. A UART is a device, so its register is `volatile` --
+// a store to it is an effect an optimizer may not drop (`reference/memory.md § Device memory`).
+private qmu_uart(b: QemuBoard) -> string = b.name match
+    "virt" -> raw"""
+        struct Uart
+            data: volatile u8
+
+        val UART: usize = 0x10000000
+        val regs: *Uart = ptr_cast(UART)
+
+        putc(c: u8)
+            regs.data = c
+        """
+    "microbit" -> raw"""
+        struct Reg
+            v: volatile u32
+
+        val UART: usize = 0x40002000
+
+        val starttx: *Reg = ptr_cast(UART + 0x008)
+        val txdrdy: *Reg = ptr_cast(UART + 0x11c)
+        val enable: *Reg = ptr_cast(UART + 0x500)
+        val pseltxd: *Reg = ptr_cast(UART + 0x50c)
+        val txd: *Reg = ptr_cast(UART + 0x51c)
+        val baudrate: *Reg = ptr_cast(UART + 0x524)
+
+        putc(c: u8)
+            txdrdy.v = 0
+            txd.v = u32(c)
+
+            while txdrdy.v == 0
+                ()
+
+        pseltxd.v = 24
+        baudrate.v = 0x01d7e000
+        enable.v = 4
+        starttx.v = 1
+        """
+    "mps2-an505" -> qmu_cmsdk("0x40200000")
+    _ -> qmu_cmsdk("0x40004000")
+
+// The CMSDK UART, which transmits nothing until `bauddiv` and `ctrl` are set. The AN500, the AN386
+// and the AN385 share the AN500's source, so the three cannot drift into testing different programs.
+private qmu_cmsdk(at: string) -> string = raw"""
+    struct Uart
+        data: volatile u32
+        state: volatile u32
+        ctrl: volatile u32
+        intstatus: volatile u32
+        bauddiv: volatile u32
+
+    """ + s"val UART: usize = $at\n" + raw"""
+    val regs: *Uart = ptr_cast(UART)
+
+    putc(c: u8)
+        regs.data = u32(c)
+
+    regs.bauddiv = 16
+    regs.ctrl = 1
+    """
+
+// A one-file program on `b`: the board's `putc`, a `digit` helper written in terms of it, and `body`.
+private qmu_root(b: QemuBoard, body: string) -> Buf[(string, string)]
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("p.sysl", qmu_uart(b) + "\ndigit(n: usize)\n    putc(u8('0') + u8(n))\n\n" + body))
+    files
+end qmu_root
+
+// A program whose console is the `board` module, `extra` appended to it.
+private qmu_boarded(b: QemuBoard, root: string, extra: string = "") -> Buf[(string, string)]
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("p.sysl", root))
+    files.push(("board/board.sysl", qemu_board_module(b, extra)))
+    files
+end qmu_boarded
+
+// Boots `files` on `b`, and records a complaint unless it exited zero having printed `want`.
+private qmu_expect(bad: Buf[string], b: QemuBoard, files: Buf[(string, string)], want: string)
+    qemu_boot(b, files) match
+        Err(why) -> bad.push(s"${b.name}: $why")
+        Ok(r) ->
+            if !r.status.ok() || !r.out.contains(want) then bad.push(s"wanted '$want': ${qemu_said(b, r)}")
+
+private qmu_verdict(bad: Buf[string], boards: usize)
+    assert(boards > 0, "no board was booted")
+    assert(bad.is_empty(), joined(bad, "\n"))
+
+// One case over every board `only` admits.
+private qmu_sweep(only: &Fn(QemuBoard) -> bool, files: &Fn(QemuBoard) -> Buf[(string, string)],
+                  want: string)
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+    val boards = qemu_boards()
+
+    for i in 0..<boards.len()
+        val b = boards.at(i)
+
+        if only(b)
+            qmu_expect(bad, b, files(b), want)
+            ran += 1
+
+    qmu_verdict(bad, ran)
+end qmu_sweep
+
+private qmu_every(b: QemuBoard) -> bool = true
+
+// The smallest claim this tier makes: the startup assembles, the image is placed where the script
+// says, the board boots it, `main` runs, and what it returned reaches the emulator's exit status.
+@test("boots, runs, and reports what it returned")
+qmu_boots_runs_and_reports_what_it_returned()
+    qmu_sweep(qmu_every, (b) -> qmu_root(b, "putc(u8('o'))\nputc(u8('k'))\n"), "ok")
+
+// A `usize` is four bytes here where the host's is eight, and a length computed at the wrong width
+// verifies, assembles, and loads rubbish.
+@test("computes a length and a slice's length at the machine's width")
+qmu_computes_a_length_at_the_machines_width()
+    qmu_sweep(qmu_every, (b) -> qmu_root(b, raw"""
+        var xs = [u8(10), u8(20), u8(30), u8(40), u8(50)]
+        val s = xs[1..<4]
+
+        digit(xs.len)
+        digit(s.len)
+        """), "53")
+
+// Indices and the bounds check around them -- an index widened to a fixed sixty-four bits before the
+// comparison is the shape that verifies and then compares two different numbers. Passing a slice
+// makes its release reachable, so this image names `free`, which the board supplies.
+@test("indexes through a bounds check the machine can express")
+qmu_indexes_through_a_bounds_check()
+    qmu_sweep(qmu_every, (b) -> qmu_root(b, raw"""
+        pick(xs: []const u8, i: usize) -> u8
+            xs[i]
+
+        var letters = [u8('a'), u8('b'), u8('c'), u8('d')]
+
+        for i in 0..<letters.len
+            putc(pick(letters[..], i))
+        """), "abcd")
+
+// An aggregate crossing a call is where a wrong ABI table shows up as a wrong answer: a table with
+// the two words the wrong way round puts the second field where the callee looks for the first.
+@test("hands an aggregate to a function and gets the same bytes back")
+qmu_hands_an_aggregate_through_a_call()
+    qmu_sweep(qmu_every, (b) -> qmu_root(b, raw"""
+        struct Pair
+            a: u8
+            b: u8
+
+        swap(p: Pair) -> Pair
+            Pair(p.b, p.a)
+
+        val q = swap(Pair(u8('x'), u8('y')))
+
+        putc(q.a)
+        putc(q.b)
+        """), "yx")
+
+// The largest `usize` here is 2^32 - 1, which the machine running this suite cannot say of itself.
+@test("wraps a usize at the width the machine actually has")
+qmu_wraps_a_usize_at_the_machines_width()
+    qmu_sweep(qmu_every, (b) -> qmu_root(b, raw"""
+        var top: usize = 0
+        top -= 1
+
+        if top == 4294967295 then putc(u8('y')) else putc(u8('n'))
+        """), "y")
+
+// A `Writer` of the program's own, which everything above a `putc` is built on. The integers are the
+// case worth pinning: `Display` for them is sysl all the way down and divides, which is where a
+// 32-bit machine differs from the host.
+@test("renders through a Writer of its own, on the machine that computed the digits")
+qmu_renders_through_a_writer_of_its_own()
+    qmu_sweep(qmu_every, (b) -> qmu_boarded(b, raw"""
+        import board.*
+
+        val w = console()
+
+        w.write("n=".bytes)
+        val n: usize = 1000
+        n.display(w, FormatSpec(0, -1, false))
+        """), "n=1000")
+
+// A string the program did not have when it started reaches the runtime helpers -- concatenation,
+// `from_bytes`, the integer renderer and the comparison -- and only reading the bytes back says a
+// length was loaded at the right width.
+@test("builds a string at run time and reads back what it built")
+qmu_builds_a_string_at_run_time()
+    qmu_sweep(qmu_every, (b) -> qmu_boarded(b, raw"""
+        import board.*
+
+        val w = console()
+
+        val greeting = "he" + "llo"
+        val counted = greeting + "=" + str(greeting.len)
+
+        w.write(counted.bytes)
+        if counted == "hello=5" then w.write(" same".bytes) else w.write(" differs".bytes)
+        """), "hello=5 same")
+
+// The Unicode Character Database on a board: its tables are data the linker places, and a copy
+// compiled for the wrong pointer width would answer a plausible wrong character. **The micro:bit is
+// excluded**: its nRF51 has 256 KB of flash and the database is about 330 KB, so the link overflows
+// -- the size of the database against the size of that part, not a defect.
+@test("maps case out of the Unicode database, which the board has to have linked")
+qmu_maps_case_out_of_the_unicode_database()
+    qmu_sweep((b) -> b.name != "microbit", (b) -> qmu_boarded(b, raw"""
+        import board.*
+        import sysl.unicode.{to_upper, category, Category}
+
+        val w = console()
+
+        var b: [4]u8
+        val n = encode_utf8(to_upper('\u{e9}'), b[0..<4])
+
+        w.write(b[0..<n])
+        if category('\u{e9}') == Category.Ll then w.write(" Ll".bytes) else w.write(" ??".bytes)
+        """), "\u{c9} Ll")
+
+// A `long` is sixty-four bits on a machine whose registers are thirty-two, so rendering one divides
+// through a compiler-rt builtin the board has to supply.
+@test("renders a long, whose division the board has to supply")
+qmu_renders_a_long()
+    qmu_sweep(qmu_every, (b) -> qmu_boarded(b, raw"""
+        import board.*
+
+        val w = console()
+        val n: long = 9007199254740993
+
+        n.display(w, FormatSpec(0, -1, false))
+        """), "9007199254740993")
+
+// Module storage that starts at zero is `.bss`, which occupies no bytes in the file -- the startup
+// zeroes it, or the program finds whatever the RAM held.
+@test("finds a module var that starts at zero already zero")
+qmu_finds_a_zeroed_module_var_zero()
+    qmu_sweep(qmu_every, (b) -> qmu_boarded(b, raw"""
+        import board.*
+
+        val w = console()
+
+        if zeroed() then w.write("zero".bytes) else w.write("junk".bytes)
+        """, "\nvar counter: int = 0\n\nzeroed() -> bool = counter == 0\n"), "zero")
+
+// The FPU, which a Cortex-M denies access to out of reset until the startup writes `CPACR`. The
+// operand is a volatile read (the UART divisor `console()` just set to 16) so the arithmetic cannot
+// fold away; `16 * 0.5 + 3` is exact in binary32. `f32` because these units are single-precision.
+@test("computes with the FPU, which the startup had to enable first")
+qmu_computes_with_the_fpu()
+    qmu_sweep((b) -> !target_named(b.target).unwrap().soft_float, (b) -> qmu_boarded(b, raw"""
+        import board.*
+
+        val w = console()
+
+        if scaled() == 11.0 then w.write("fpu".bytes) else w.write("bad".bytes)
+        """, "\nscaled() -> f32 = f32(regs.bauddiv) * 0.5 + 3.0\n"), "fpu")
+
+// **The one case expecting a status other than zero**, without which a working exit channel and one
+// that reports zero whatever happened are indistinguishable. A store to an unmapped address faults,
+// the vector table's handler is reached, and it reports 99. `virt` is excluded because it reports
+// through `sifive_test` rather than a fault vector; the AN505 because its TrustZone controller claims
+// the whole address space, so the store is swallowed and the program honestly exits zero.
+@test("reports a fault as a status of its own rather than as success")
+qmu_reports_a_fault_as_a_status_of_its_own()
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+    val boards = qemu_boards()
+
+    for i in 0..<boards.len()
+        val b = boards.at(i)
+
+        if b.name == "virt" || b.name == "mps2-an505" then continue
+
+        ran += 1
+
+        val files = qmu_root(b, raw"""
+            struct Bad
+                v: volatile u32
+
+            val BAD: usize = 0x80000000
+            val bad: *Bad = ptr_cast(BAD)
+
+            bad.v = 1
+            """)
+
+        qemu_boot(b, files) match
+            Err(why) -> bad.push(s"${b.name}: $why")
+            Ok(r) -> if qemu_code(r) != 99 then bad.push(s"wanted 99: ${qemu_said(b, r)}")
+    end for
+
+    qmu_verdict(bad, ran)
+end qmu_reports_a_fault_as_a_status_of_its_own
