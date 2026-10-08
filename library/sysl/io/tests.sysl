@@ -1,6 +1,8 @@
 module sysl.io
 @tests
 
+import sysl.buf.{Buf, buf}
+
 // What the whole-stream reads promise, asserted in sysl rather than beside it in Scala.
 //
 // The reading surface had no test file of its own until these were written: `Lines` is covered
@@ -83,3 +85,107 @@ read_exact_empty_request()
     var into: [1]u8 = [0; 1]
 
     assert_eq(read_exact(&r, into[0..<0]).len, 0)
+
+// -- lines that are not text ----------------------------------------------------------------------
+
+// "ok\n", then "a" 0xFF "b\n", then "z\n" -- a bad byte in the middle of the middle line.
+private bad_middle() -> []const u8 =
+    [u8('o'), u8('k'), 10, u8('a'), 255, u8('b'), 10, u8('z'), 10]
+
+@test("line_text answers an ill-formed line as an error at its offset, rather than stopping")
+line_text_answers()
+    line_text([u8('h'), u8('i'), 13]) match
+        Ok(s) -> assert_eq(s, "hi")
+        Err(_) -> assert(false, "a well-formed line with its \\r trimmed")
+
+    line_text([u8('a'), u8('b'), 255, 13]) match
+        Ok(_) -> assert(false, "0xFF is never UTF-8")
+        Err(e) ->
+            assert_eq(e.offset, 2)
+            assert(!e.truncated, "a byte no continuation could rescue")
+
+@test("a 'for' over a cursor ends at a bad line, and the cursor it walked says where")
+lines_end_at_a_bad_line()
+    var r = bytes_reader(bad_middle())
+    var c = lines(&r)
+    var got: Buf[string] = buf()
+
+    for line in c
+        got.push(line)
+
+    assert_eq(got.len(), 1)
+    assert_eq(got[0], "ok")
+
+    c.error() match
+        None -> assert(false, "the loop ended early, and the cursor has to say why")
+        Some(e) ->
+            assert_eq(e.offset, 1)
+            assert(!e.truncated, "0xFF is not a cut-short sequence")
+
+@test("and the cursor stays ended: getline does not read past the bad line")
+lines_stay_ended()
+    var r = bytes_reader(bad_middle())
+    var c = lines(&r)
+
+    assert_eq(c.getline(), Some("ok"))
+    assert(c.getline().is_none(), "the bad line")
+    assert(c.getline().is_none(), "and 'z', which follows it, is not handed over")
+    assert(c.error().is_some(), "the reason is kept")
+
+@test("try_getline reads past the bad line, answering each line's own verdict")
+try_getline_continues()
+    var r = bytes_reader_at_most(bad_middle(), 2)
+    var c = lines(&r)
+    var said: Buf[string] = buf()
+
+    loop
+        c.try_getline() match
+            None -> break
+            Some(line) ->
+                line match
+                    Ok(s) -> said.push(s)
+                    Err(e) -> said.push(s"bad at ${e.offset}")
+
+    assert_eq(said.len(), 3)
+    assert_eq(said[0], "ok")
+    assert_eq(said[1], "bad at 1")
+    assert_eq(said[2], "z")
+    assert(c.error().is_none(), "try_getline answers; it sets no latch")
+
+// "ok\n", then "x" and the first two bytes of the three-byte U+20AC, and the input ends there.
+@test("a final line cut short inside a sequence is an error with 'truncated' set")
+lines_truncated_at_the_end()
+    val cut: []const u8 = [u8('o'), u8('k'), 10, u8('x'), 0xE2, 0x82]
+
+    var r = bytes_reader(cut)
+    var c = lines(&r)
+
+    assert_eq(c.getline(), Some("ok"))
+    assert(c.getline().is_none(), "the cut-short line")
+
+    c.error() match
+        None -> assert(false, "a truncated sequence is not text")
+        Some(e) ->
+            assert_eq(e.offset, 1)
+            assert(e.truncated, "more bytes would have fixed it")
+
+    var again = bytes_reader(cut)
+    var d = lines(&again)
+
+    assert(d.try_getline().is_some(), "ok")
+
+    d.try_getline() match
+        Some(Err(e)) -> assert(e.truncated, "the same verdict through the reporting walk")
+        _ -> assert(false, "the cut-short line is an Err")
+
+    assert(d.try_getline().is_none(), "and then the input has ended")
+
+@test("a cursor that reached the end cleanly has no error")
+lines_clean_end()
+    var r = bytes_reader([u8('a'), 10, u8('b')])
+    var c = lines(&r)
+
+    assert_eq(c.getline(), Some("a"))
+    assert_eq(c.getline(), Some("b"))
+    assert(c.getline().is_none(), "the end")
+    assert(c.error().is_none(), "the end is not an error")

@@ -17,7 +17,7 @@ literal in a test, and nothing in it has to be written twice.
 
 ## Index
 
-[`bytes_reader`](#bytes_reader) [`bytes_reader_at_most`](#bytes_reader_at_most) [`bytes_writer`](#bytes_writer) [`console_lines`](#console_lines) [`fd_reader`](#fd_reader) [`find_byte`](#find_byte) [`line_text`](#line_text) [`lines`](#lines) [`lines_ending`](#lines_ending) [`read_all`](#read_all) [`read_all_text`](#read_all_text) [`read_exact`](#read_exact) [`stdin`](#stdin) [`try_line_text`](#try_line_text) [`BytesReader`](#bytesreader) [`BytesWriter`](#byteswriter) [`FdReader`](#fdreader) [`LineEnding`](#lineending) [`Lines`](#lines-1) [`Reader`](#reader) [Fallible for BytesReader](#fallible-for-bytesreader) [Fallible for BytesWriter](#fallible-for-byteswriter) [Fallible for FdReader](#fallible-for-fdreader) [Iterate for Lines](#iterate-for-lines) [Reader for BytesReader](#reader-for-bytesreader) [Reader for FdReader](#reader-for-fdreader) [Writer for BytesWriter](#writer-for-byteswriter)
+[`bytes_reader`](#bytes_reader) [`bytes_reader_at_most`](#bytes_reader_at_most) [`bytes_writer`](#bytes_writer) [`console_lines`](#console_lines) [`fd_reader`](#fd_reader) [`find_byte`](#find_byte) [`line_text`](#line_text) [`lines`](#lines) [`lines_ending`](#lines_ending) [`read_all`](#read_all) [`read_all_text`](#read_all_text) [`read_exact`](#read_exact) [`stdin`](#stdin) [`BytesReader`](#bytesreader) [`BytesWriter`](#byteswriter) [`FdReader`](#fdreader) [`LineEnding`](#lineending) [`Lines`](#lines-1) [`Reader`](#reader) [Fallible for BytesReader](#fallible-for-bytesreader) [Fallible for BytesWriter](#fallible-for-byteswriter) [Fallible for FdReader](#fallible-for-fdreader) [Iterate for Lines](#iterate-for-lines) [Reader for BytesReader](#reader-for-bytesreader) [Reader for FdReader](#reader-for-fdreader) [Writer for BytesWriter](#writer-for-byteswriter)
 
 ## Functions
 
@@ -84,21 +84,18 @@ with an address, and an index is that address minus the first.
 ### `line_text`
 
 ```sysl
-line_text(b: []const u8) -> string
+line_text(b: []const u8) -> Result[string, Utf8Error]
 ```
 
 Bytes to text at the boundary they arrive at, which is where `04` puts the check. A trailing `\r`
 goes with the `\n`, so input written on one system reads the same on the other --
 `bufio.Scanner`'s choice rather than C `getline`'s.
 
-Ill-formed input stops the program the way an ill-formed argument does, and that is the right
-severity for a program reading a file it expects to be text: there is nothing sensible for it to
-do with the rest, and carrying on would put the mistake a long way from its cause.
-
-**Where that is the wrong severity, `try_line_text` is the same conversion without it.** Input off
-a wire, out of a serial port, or from a file somebody else wrote carries whatever was sent, and a
-program reading that wants to be told rather than stopped -- as does anything running where there
-is nowhere to exit *to*, since a freestanding `exit` is a halt with no supervisor to notice it.
+**Ill-formed input is answered, never fatal**: the `Utf8Error` carries the offset of the first bad
+byte *within the line* (the `\r` trim cannot move it, being at the end). Input off a wire, out of
+a serial port, or from a file somebody else wrote carries whatever was sent, and on a freestanding
+target a stop is a halt with no supervisor to notice it -- so the caller decides, and a program
+that does want to stop writes its own `exit` where it can say what it was reading.
 
 ### `lines`
 
@@ -139,12 +136,9 @@ larger than it is read in as many passes as it takes.
 read_all_text(r: *Reader) -> Result[string, Utf8Error]
 ```
 
-The same, as text.
-
-**There is no panicking twin, and that is deliberate** -- `line_text` has one because a program
-reading a file it expects to be text has nothing sensible to do with a bad line, while a whole
-stream is exactly what arrives off a wire, out of a serial port, or from a file somebody else
-wrote. A caller who wants the other severity has `line_text`'s shape to copy in one line.
+The same, as text. Bytes that are not UTF-8 are answered as an `Err` whose offset is into the
+whole stream, as `line_text`'s and `getline`'s are into the line -- nothing in this module stops
+the program over input.
 
 ### `read_exact`
 
@@ -165,18 +159,6 @@ count it might forget to apply.
 ```sysl
 stdin() -> FdReader
 ```
-
-### `try_line_text`
-
-```sysl
-try_line_text(b: []const u8) -> Result[string, Utf8Error]
-```
-
-The same conversion, reporting rather than stopping.
-
-It exists so that the choice is the caller's without their having to drop to `Reader` and
-re-implement line splitting to get it. Which of the two is right is a property of where the bytes
-came from, and the library cannot know that -- so both are here and the caller says which.
 
 ## Types
 
@@ -257,6 +239,7 @@ struct Lines
     done: bool
     ending: LineEnding
     owed_lf: bool
+    private fault: &LineFault
 ```
 
 A cursor that yields one line at a time.
@@ -284,8 +267,9 @@ caller wanting to read again past the end gets `None` every time rather than a s
 
 | Member | Signature | Description |
 |---|---|---|
+| `error` | `error(self) -> Option[Utf8Error]` | Why `getline` stopped before the input ended: the line at the cursor was not UTF-8, and the error's `offset` is into that line, not into the stream. |
 | `line_end` | `line_end(self, b: []const u8) -> Option[usize]` | Where the next line ends in `b`, which is the whole of what the policy decides. |
-| `getline` | `getline(*self) -> Option[string]` | The next line, or nothing once the input has ended. |
+| `getline` | `getline(*self) -> Option[string]` | The next line, or nothing once the input has ended -- **or once a line was not text.** |
 | `try_getline` | `try_getline(*self) -> Option[Result[string, Utf8Error]]` | The whole of the line-finding, so that the two forms cannot come to disagree about where a line ends. |
 | `held_line` | `held_line(*self) -> Result[string, Utf8Error]` |  |
 | `refill` | `refill(*self)` |  |

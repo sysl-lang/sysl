@@ -112,29 +112,13 @@ impl Fallible for FdReader
  * goes with the `\n`, so input written on one system reads the same on the other --
  * `bufio.Scanner`'s choice rather than C `getline`'s.
  *
- * Ill-formed input stops the program the way an ill-formed argument does, and that is the right
- * severity for a program reading a file it expects to be text: there is nothing sensible for it to
- * do with the rest, and carrying on would put the mistake a long way from its cause.
- *
- * **Where that is the wrong severity, `try_line_text` is the same conversion without it.** Input off
- * a wire, out of a serial port, or from a file somebody else wrote carries whatever was sent, and a
- * program reading that wants to be told rather than stopped -- as does anything running where there
- * is nowhere to exit *to*, since a freestanding `exit` is a halt with no supervisor to notice it.
+ * **Ill-formed input is answered, never fatal**: the `Utf8Error` carries the offset of the first bad
+ * byte *within the line* (the `\r` trim cannot move it, being at the end). Input off a wire, out of
+ * a serial port, or from a file somebody else wrote carries whatever was sent, and on a freestanding
+ * target a stop is a halt with no supervisor to notice it -- so the caller decides, and a program
+ * that does want to stop writes its own `exit` where it can say what it was reading.
  */
-line_text(b: []const u8) -> string
-    try_line_text(b) match
-        Ok(s) -> s
-        Err(e) ->
-            print("panic: a line read from input is not UTF-8 at byte", e.offset, "of the line")
-            exit(1)
-
-/** The same conversion, reporting rather than stopping.
- *
- * It exists so that the choice is the caller's without their having to drop to `Reader` and
- * re-implement line splitting to get it. Which of the two is right is a property of where the bytes
- * came from, and the library cannot know that -- so both are here and the caller says which.
- */
-try_line_text(b: []const u8) -> Result[string, Utf8Error]
+line_text(b: []const u8) -> Result[string, Utf8Error]
     var n = if b.len > 0 && b[b.len - 1] == 13 then b.len - 1 else b.len
 
     from_utf8(b[0..<n])
@@ -174,6 +158,16 @@ struct Lines
     // field rather than a local because the two bytes of a `\r\n` can arrive in different reads, and
     // that is the case a hand-rolled console reader gets wrong.
     owed_lf: bool
+    // Why `getline` ended early, if it did. Boxed so that every copy of the cursor shares it: a `for`
+    // loop walks a copy, and the caller asks `error()` of the one it named.
+    private fault: &LineFault
+
+    /** Why `getline` stopped before the input ended: the line at the cursor was not UTF-8, and the
+     * error's `offset` is into that line, not into the stream. `None` while every line has been
+     * text, which includes a cursor that simply reached the end -- `failed()` on the reader is the
+     * question for input that ended *badly*.
+     */
+    error(self) -> Option[Utf8Error] = self.fault.err
 
     /** Where the next line ends in `b`, which is the whole of what the policy decides.
      *
@@ -192,24 +186,36 @@ struct Lines
                     None -> find_byte(b, 13)
     end line_end
 
-    /** The next line, or nothing once the input has ended. Ill-formed bytes stop the program, which
-     * is `line_text`'s severity and its reasoning -- `try_getline` below is the same walk without it.
+    /** The next line, or nothing once the input has ended -- **or once a line was not text.** A line
+     * that is not UTF-8 ends the cursor for good rather than stopping the program: `getline` answers
+     * `None` there and on every call after, and `error()` says which byte of that line it was. So a
+     * `for` loop over a cursor ends at the bad line with every line before it handed over, and a
+     * caller that cares names the cursor and asks afterwards.
+     *
+     * **It does not read past the bad line**, because a loop that silently skipped one would hand a
+     * program a file with a line missing. A caller that wants to carry on uses `try_getline`, which
+     * answers each line's own verdict and keeps walking.
      */
     getline(*self) -> Option[string]
+        if self.fault.err.is_some() then return None
+
         self.try_getline() match
             None -> None
             Some(line) ->
                 line match
                     Ok(s) -> Some(s)
                     Err(e) ->
-                        print("panic: a line read from input is not UTF-8 at byte", e.offset,
-                          "of the line")
-                        exit(1)
+                        self.fault.err = Some(e)
+                        None
     end getline
 
     /** The whole of the line-finding, so that the two forms cannot come to disagree about where a
      * line ends. There are two answers to distinguish and they nest: the outer `Option` says whether
      * there was a line at all, and the inner `Result` says whether it was text.
+     *
+     * **A bad line is consumed like any other**, so the next call answers the line after it: this is
+     * the walk that reads past ill-formed input. A final line cut short inside a sequence answers
+     * `Err` with `truncated` set.
      */
     try_getline(*self) -> Option[Result[string, Utf8Error]]
         loop
@@ -230,7 +236,7 @@ struct Lines
                     self.owed_lf = rest[i] == 13
                     self.at += i + 1
 
-                    if self.held.is_empty() then return Some(try_line_text(rest[0..<i]))
+                    if self.held.is_empty() then return Some(line_text(rest[0..<i]))
 
                     for b in rest[0..<i] do self.held.push(b)
                     return Some(self.held_line())
@@ -248,7 +254,7 @@ struct Lines
     end try_getline
 
     held_line(*self) -> Result[string, Utf8Error]
-        var s = try_line_text(self.held.view())
+        var s = line_text(self.held.view())
 
         self.held.clear()
         s
@@ -290,12 +296,9 @@ read_all(r: *Reader) -> Buf[u8]
 
     out
 
-/** The same, as text.
- *
- * **There is no panicking twin, and that is deliberate** -- `line_text` has one because a program
- * reading a file it expects to be text has nothing sensible to do with a bad line, while a whole
- * stream is exactly what arrives off a wire, out of a serial port, or from a file somebody else
- * wrote. A caller who wants the other severity has `line_text`'s shape to copy in one line.
+/** The same, as text. Bytes that are not UTF-8 are answered as an `Err` whose offset is into the
+ * whole stream, as `line_text`'s and `getline`'s are into the line -- nothing in this module stops
+ * the program over input.
  */
 read_all_text(r: *Reader) -> Result[string, Utf8Error] = from_utf8(read_all(r).view())
 
@@ -331,4 +334,8 @@ lines(r: *Reader) -> Lines = lines_ending(r, Lf)
 console_lines(r: *Reader) -> Lines = lines_ending(r, CrOrLf)
 
 lines_ending(r: *Reader, ending: LineEnding) -> Lines =
-    Lines(r, [0; 4096], [], 0, buf(), false, ending, false)
+    Lines(r, [0; 4096], [], 0, buf(), false, ending, false, LineFault(None))
+
+// The latch `getline` sets on a line that is not text; see `Lines.error`.
+private struct LineFault
+    err: Option[Utf8Error]

@@ -23,8 +23,7 @@ fd_reader(fd: int) -> FdReader
 stdin() -> FdReader
 
 find_byte(b: []const u8, c: u8) -> Option[usize]
-line_text(b: []const u8) -> string
-try_line_text(b: []const u8) -> Result[string, Utf8Error]
+line_text(b: []const u8) -> Result[string, Utf8Error]
 
 read_all(r: *Reader) -> Buf[u8]
 read_all_text(r: *Reader) -> Result[string, Utf8Error]
@@ -37,6 +36,7 @@ enum LineEnding
 struct Lines
     getline(*self) -> Option[string]
     try_getline(*self) -> Option[Result[string, Utf8Error]]
+    error(self) -> Option[Utf8Error]
 
 lines(r: *Reader) -> Lines
 console_lines(r: *Reader) -> Lines
@@ -83,10 +83,9 @@ always fills, which is exactly why the loops are worth having written once — t
 hand-rolled version are stopping at the first short read, and taking the length from the slice you
 offered rather than from the one you were handed.
 
-`read_all_text` has **no panicking twin**, and that is deliberate. `line_text` has one because a
-program reading a file it expects to be text has nothing sensible to do with a bad line; a whole
-stream is exactly what arrives off a wire, out of a serial port, or from a file somebody else wrote,
-so the caller is told rather than stopped.
+`read_all_text` answers bytes that are not UTF-8 as an `Err` whose offset is into the whole stream.
+**Nothing in `sysl.io` stops the program over its input** — a line that is not text is answered
+too, as below.
 
 `read_exact` hands back a prefix of `into` exactly as `read` does, so a caller compares `got.len`
 against what it asked for rather than being given a count it might forget to apply.
@@ -340,25 +339,47 @@ time rather than a second chance, which is right for the sources `read(2)` serve
 ### Validation happens where the bytes arrive
 
 `getline` yields a `string`, not bytes — so input is checked for well-formed UTF-8 at the boundary it
-came in at, which is [where the language puts that check](/reference/types/). Ill-formed input stops
-the program, naming the byte offset within the line.
+came in at, which is [where the language puts that check](/reference/types/). **A line that is not
+text ends the cursor rather than the program**: `getline` answers `None` there and on every call
+after, and the cursor's `error()` says which byte of that line was wrong. A `for` loop over a cursor
+therefore stops at the bad line with every line before it handed over, and a program that wants to
+know why names the cursor and asks once the loop is done:
 
-That severity is affordable **because the layer underneath is public**. A caller who would rather
-inspect than trap reads bytes through `Reader` and validates them itself with
-[`from_utf8`](/library/text/), which is what having two layers is for. `line_text` is exported for the
-same reason: a program doing its own framing can still get the `\r` handling and the validation
-without reimplementing either.
+```sysl
+import sysl.io.{bytes_reader, lines}
 
-### When stopping is the wrong severity
+val input: []const u8 = [u8('o'), u8('k'), 10, u8('a'), 255, u8('b'), 10, u8('z'), 10]
 
-Reading a file you expect to be text, stopping is right — there is nothing sensible to do with the
-rest, and carrying on puts the mistake a long way from its cause. Reading a serial port it is not,
-and on a freestanding target it is worse than not: `exit` there is a halt with no supervisor to
-notice it, so one mistyped byte hangs the board.
+var r = bytes_reader(input)
+var c = lines(&r)
 
-`try_getline` is the same walk reporting instead, and `try_line_text` the same conversion. Two
+for line in c
+    print("[", line, "]")
+
+c.error() match
+    Some(e) -> print("not UTF-8 at byte", e.offset, "of the line")
+    None -> print("all text")
+```
+
+```output
+[ ok ]
+not UTF-8 at byte 1 of the line
+```
+
+**It does not read past the bad line** — `z` is never handed over — because a loop that skipped one
+silently would give a program a file with a line missing. Stopping the *program* was the old answer,
+and it was the wrong one: on a freestanding target `exit` is a halt with no supervisor to notice it,
+so one mistyped byte on a serial port hung the board. `error()` is `None` for a cursor that simply
+reached the end; `failed()` on the reader stays the question for input that ended badly.
+
+`line_text` is the conversion on its own, for a program doing its own framing: the `\r` handling and
+the validation, answered as a `Result`.
+
+### Reading past a line that is not text
+
+`try_getline` is the same walk answering each line's own verdict and carrying on past a bad one. Two
 answers nest — the `Option` says whether there was a line at all, the `Result` says whether it was
-text:
+text, and an input that ends partway through a sequence answers `Err` with `truncated` set:
 
 ```sysl
 import sysl.io.{lines, stdin}
