@@ -1,0 +1,626 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Five of the reference's analyzer suites, ported: a struct named through its module
+// (`AnalyzerDeclErrorTests`), the annotations a member may carry (`MemberAttrTests`), a `val` handed
+// to a method that writes through it (`ValReceiverTests`), `@borrows` (`BorrowsAttrTests`), and what
+// a refused `impl` member takes with it (`ImplMemberRefusalTests`). Every message is quoted from
+// 0.0.162 over the same tree, and held of the reference too where `SYSL_ORACLE` names it.
+
+// -- a struct declared in another module ----------------------------------------------------------
+
+private azc_plain_b() -> (string, string) = ("b/b.sysl", raw"""
+    module b
+
+    struct T
+        x: int
+
+    struct G[A]
+        x: A
+        y: int
+    """)
+
+@test("a generic one imported by name is built at a written instantiation")
+azc_a_generic_imported_by_name_is_built()
+    if !rng_ready() then return
+
+    azc_prints([("main.sysl", raw"""
+        import b.G
+
+        val g = G[int](1)
+        val h = G[string]("two")
+        print(g.x)
+        print(h.x)
+        """), ("b/b.sysl", raw"""
+        module b
+
+        struct G[T]
+            x: T
+        """)], "1\ntwo\n")
+
+@test("a field's mismatch names it qualified, reached through its module")
+azc_a_fields_mismatch_names_it_qualified()
+    if !rng_ready() then return
+
+    azc_says([("main.sysl", "import b\n\nprint(b.T(\"s\").x)\n"), azc_plain_b()],
+             "error: 'x' of 'b.T' is int, but string was given")
+
+@test("and the same when it was imported by name")
+azc_and_the_same_imported_by_name()
+    if !rng_ready() then return
+
+    azc_says([("main.sysl", "import b.T\n\nprint(T(\"s\").x)\n"), azc_plain_b()],
+             "error: 'x' of 'b.T' is int, but string was given")
+
+@test("and the same where a field is given by name")
+azc_and_the_same_given_by_name()
+    if !rng_ready() then return
+
+    azc_says([("main.sysl", "import b\n\nprint(b.T(x = \"s\").x)\n"), azc_plain_b()],
+             "error: 'x' of 'b.T' is int, but string was given")
+
+@test("and the same inside the module that declares it")
+azc_and_the_same_inside_its_module()
+    if !rng_ready() then return
+
+    azc_says([("main.sysl", "import b\n\nprint(b.mk().x)\n"), ("b/b.sysl", raw"""
+        module b
+
+        struct T
+            x: int
+
+        mk() -> T = T("s")
+        """)], "error: 'x' of 'b.T' is int, but string was given")
+
+@test("a generic one's mismatch names it at its instantiation")
+azc_a_generic_ones_mismatch_names_its_instantiation()
+    if !rng_ready() then return
+
+    azc_says([("main.sysl", "import b\n\nprint(b.G(1, \"s\").x)\n"), azc_plain_b()],
+             "error: 'y' of 'b.G[int]' is int, but string was given")
+
+@test("no refusal shows the module separator")
+azc_no_refusal_shows_the_module_separator()
+    if !rng_ready() then return
+
+    val said = azc_reports([("main.sysl", "import b\n\nprint(b.T(\"s\").x)\n"), azc_plain_b()])
+
+    for i in 0..<said.len()
+        assert(said.at(i).1.contains("error:"), s"${said.at(i).0}: it compiled")
+        assert(!said.at(i).1.contains("$"), s"${said.at(i).0}: ${said.at(i).1}")
+
+@test("a struct declared in the entry file is named bare")
+azc_a_struct_in_the_entry_file_is_named_bare()
+    if !rng_ready() then return
+
+    azc_refuses("struct L\n    x: int\nprint(L(\"s\").x)",
+                "error: 'x' of 'L' is int, but string was given")
+
+@test("while one in the root module is named bare")
+azc_an_undefined_root_function_is_named_bare()
+    if !rng_ready() then return
+
+    val said = azc_reports([("main.sysl", "width() -> int = 3\nprint(size())")])
+
+    for i in 0..<said.len()
+        assert(said.at(i).1.contains("error: undefined function 'size'\n"), said.at(i).1)
+        assert_eq(xvr_count(said.at(i).1, "error:"), 1, said.at(i).0)
+
+// -- the annotations a member may carry ------------------------------------------------------------
+
+@test("on a method of a struct, where the value satisfies it")
+azc_crossing_on_a_struct_method()
+    if !rng_ready() then return
+
+    azc_main_prints(raw"""
+        struct Chan
+            open: bool
+
+            @crossing(v)
+            send(*self, v: *int) -> int = v[0]
+
+        var c = Chan(true)
+        var n = 7
+        print(c.send(&n))
+        """, "7\n")
+
+@test("and the refusal fires where the value does not")
+azc_crossing_refuses_at_the_call()
+    if !rng_ready() then return
+
+    azc_refuses(raw"""
+        struct Node
+            v: int
+
+        struct Job
+            node: &Node
+
+        struct Chan
+            open: bool
+
+            @crossing(v)
+            send(*self, v: *Job) -> int = v[0].node.v
+
+        var c = Chan(true)
+        var n: &Node = Node(1)
+        var j = Job(n)
+        print(c.send(&j))
+        """, "error: what 'v' of 'method 'Chan.send'' points at reaches another concurrency domain, " +
+        "so every count inside it has to be atomic — but its 'node' reaches a '&Node', whose count " +
+        "is not. Hold it as a '&sync Node' ('06')")
+
+@test("on an associated function, which has no receiver at all")
+azc_crossing_on_an_associated_function()
+    if !rng_ready() then return
+
+    azc_main_prints(raw"""
+        struct Chan
+            open: bool
+
+            @crossing(v)
+            of(v: *int) -> int = v[0]
+
+        var n = 9
+        print(Chan.of(&n))
+        """, "9\n")
+
+@test("on a member of an enum")
+azc_crossing_on_an_enum_member()
+    if !rng_ready() then return
+
+    azc_main_prints(raw"""
+        enum Slot
+            Full
+            Empty
+
+            @crossing(v)
+            put(self, v: *int) -> int = v[0]
+
+        var n = 3
+        print(Slot.Full.put(&n))
+        """, "3\n")
+
+@test("and on a member of an 'impl' block, which is where a trait's is supplied")
+azc_crossing_on_an_impl_member()
+    if !rng_ready() then return
+
+    azc_main_prints(raw"""
+        trait Sink
+            take(self, v: *int) -> int
+
+        struct S
+            base: int
+
+        impl Sink for S
+            @crossing(v)
+            take(self, v: *int) -> int = self.base + v[0]
+
+        var s = S(10)
+        var n = 5
+        print(s.take(&n))
+        """, "15\n")
+
+@test("a word that is not one is refused by name")
+azc_crossing_a_word_that_is_no_parameter()
+    if !rng_ready() then return
+
+    azc_refuses(raw"""
+        struct Chan
+            open: bool
+
+            @crossing(w)
+            send(*self, v: *int) -> int = v[0]
+
+        print(1)
+        """, "error: '@crossing' names 'w', which is not a parameter of 'Chan.send' — its " +
+        "parameters are 'self', 'v'")
+
+// Not the reference's own case -- the same rule asked of a free function, and of a name written
+// twice, both of which this compiler left unchecked until the member case above was ported.
+@test("a free function's misspelt or repeated '@crossing' name is refused at the declaration")
+azc_crossing_on_a_free_function()
+    if !rng_ready() then return
+
+    azc_refuses("@crossing(w)\nsend(v: *int) -> int = v[0]\n\nprint(1)\n",
+                "error: '@crossing' names 'w', which is not a parameter of 'send' — its parameters " +
+                "are 'v'")
+    azc_refuses("@crossing(v, v)\nsend(v: *int) -> int = v[0]\n\nprint(1)\n",
+                "error: '@crossing' names 'v' twice, and a parameter crosses a boundary once — the " +
+                "second says nothing the first does not")
+
+@test("'@reads' and '@writes' name parameters and module storage alike")
+azc_a_member_frame_runs()
+    if !rng_ready() then return
+
+    azc_main_prints(raw"""
+        static var counter: int = 0
+
+        struct Tick
+            step: int
+
+            @writes(counter)
+            bump(self) = counter += self.step
+
+            @reads(counter)
+            peek(self) -> int = counter
+
+        var t = Tick(2)
+        t.bump()
+        t.bump()
+        print(t.peek())
+        """, "4\n")
+
+// The reference says this once: a compound update reads what it writes, and one place is one
+// message. This compiler said it twice -- once for the write and once for the read.
+@test("an empty '@writes()' on a member that writes something is refused")
+azc_an_empty_writes_is_refused_once()
+    if !rng_ready() then return
+
+    val said = azc_reports([("main.sysl", raw"""
+        static var counter: int = 0
+
+        struct Tick
+            step: int
+
+            @writes()
+            bump(self) = counter += self.step
+
+        print(1)
+        """)])
+
+    for i in 0..<said.len()
+        assert(said.at(i).1.contains("error: a function with a frame writes 'counter', which its " +
+                                     "'@writes' does not name"), said.at(i).1)
+        assert_eq(xvr_count(said.at(i).1, "error:"), 1, said.at(i).0)
+
+// -- a val receiver -------------------------------------------------------------------------------
+
+private azc_counter() -> string = raw"""
+    struct Counter
+        n: int
+
+        bump(*self) = self.n += 1
+
+        read(self) -> int = self.n
+    end Counter
+
+    """
+
+@test("is refused where the method writes through it")
+azc_a_val_receiver_is_refused()
+    if !rng_ready() then return
+
+    azc_refuses(azc_counter() + "val c: Counter = Counter(0)\nc.bump()",
+                "error: 'bump' takes '*self', so it writes through what it is called on, and a " +
+                "'val' is written once")
+
+@test("and says which member wanted to write")
+azc_a_val_receiver_names_the_member()
+    if !rng_ready() then return
+
+    azc_refuses(azc_counter() + "val c: Counter = Counter(0)\nc.bump()", "'bump'")
+
+@test("and names the binding to change, which is the whole fix")
+azc_a_val_receiver_names_the_fix()
+    if !rng_ready() then return
+
+    azc_refuses(azc_counter() + "val c: Counter = Counter(0)\nc.bump()",
+                "— write 'var c' if it is meant to change")
+
+@test("including a local one, which is where it was found")
+azc_a_local_val_receiver_is_refused()
+    if !rng_ready() then return
+
+    azc_refuses(azc_counter() + "main()\n    val c = Counter(0)\n\n    c.bump()",
+                "a 'val' is written once — write 'var c' if it is meant to change")
+
+@test("and a module-level one, whose storage really is read-only")
+azc_a_module_val_receiver_is_refused()
+    if !rng_ready() then return
+
+    azc_refuses(azc_counter() + "val shared: Counter = Counter(0)\nshared.bump()",
+                "a 'val' is written once — write 'var shared' if it is meant to change")
+
+@test("a var receiver, which is what the refusal asks for instead")
+azc_a_var_receiver_runs()
+    if !rng_ready() then return
+
+    azc_main_prints(azc_counter() + "main()\n    var c = Counter(0)\n\n    c.bump()\n    c.bump()\n\n" +
+                    "    print(c.n)", "2\n")
+
+@test("a read-only method on a val")
+azc_a_read_only_method_on_a_val()
+    if !rng_ready() then return
+
+    azc_main_prints(azc_counter() + "main()\n    val c = Counter(7)\n\n    print(c.read())", "7\n")
+
+@test("and mutable content reached through a reference the val holds")
+azc_a_val_holding_a_reference()
+    if !rng_ready() then return
+
+    azc_main_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Holder
+            xs: &Buf[int]
+
+            push(*self, v: int) = self.xs.push(v)
+        end Holder
+
+        main()
+            val h = Holder(buf())
+
+            h.xs.push(1)
+            h.xs.push(2)
+
+            print(h.xs.len())
+        """, "2\n")
+
+// -- @borrows -------------------------------------------------------------------------------------
+
+private azc_sink(promise: bool) -> string
+    val head = if promise then "trait Sink\n    @borrows(bytes)\n" else "trait Sink\n"
+
+    head + raw"""
+            put(*self, bytes: []const u8)
+
+        struct Counter
+            n: usize
+
+        impl Sink for Counter
+            put(*self, bytes: []const u8)
+                self.n += bytes.len
+
+        """
+end azc_sink
+
+private azc_lends() -> string = raw"""
+    var c: Counter
+    var s: *Sink = &c
+    var buf: [8]u8
+
+    buf[0] = 7u8
+    s.put(buf[0..<4])
+    print(c.n)
+    """
+
+// What `--explain-escapes` reports for `text` under every compiler -- the promotion notes, which go
+// to the report channel and nowhere else.
+private azc_escapes(text: string) -> Buf[(string, string)]
+    val all = azc_compilers()
+    var out: Buf[(string, string)] = buf()
+
+    for i in 0..<all.len()
+        val s = azc_cli(["emit-llvm", "--explain-escapes"], [("main.sysl", text)], all.at(i))
+
+        assert(s.ok, s"${rng_label(all.at(i))}: ${s.said()}")
+        out.push((rng_label(all.at(i)), s.err))
+
+    out
+end azc_escapes
+
+@test("a local array passed through the object stays in the frame")
+azc_a_borrowed_array_stays_in_the_frame()
+    if !rng_ready() then return
+
+    val src = azc_sink(true) + azc_lends()
+    val notes = azc_escapes(src)
+
+    for i in 0..<notes.len()
+        assert(notes.at(i).1.contains("no arrays were promoted to the heap"), notes.at(i).0)
+        assert(!notes.at(i).1.contains("is promoted"), notes.at(i).1)
+
+    azc_main_prints(src, "4\n")
+
+// Not a reference case: the `--explain-escapes` channel a command line hands over used to outlive
+// it, so the next build in the same process reported through a closure whose frame had gone -- a
+// segfault in the test above, which builds after asking for the report.
+@test("the channel a command line hands over is taken back when it is answered")
+azc_the_explain_channel_is_taken_back()
+    if !rng_ready() then return
+
+    val s = azc_cli(["emit-llvm", "--explain-escapes"], [("main.sysl", azc_sink(true) + azc_lends())],
+                    None)
+
+    assert(s.err.contains("no arrays were promoted to the heap"), s.err)
+    assert(!explaining(), "the report is still asked for after the command line was answered")
+
+@test("and is promoted where the trait does not promise")
+azc_an_unpromised_array_is_promoted()
+    if !rng_ready() then return
+
+    val notes = azc_escapes(azc_sink(false) + azc_lends())
+
+    for i in 0..<notes.len()
+        assert_eq(xvr_count(notes.at(i).1, "is promoted"), 1, notes.at(i).0)
+        assert(notes.at(i).1.contains("main.sysl:16:10: 'buf' is promoted to the heap, because this " +
+                                      "view of it is passed through a trait object, which may hold on " +
+                                      "to it"), notes.at(i).1)
+
+@test("one that keeps what it was lent is refused, by the name the trait gave it")
+azc_an_implementation_that_keeps_is_refused()
+    if !rng_ready() then return
+
+    azc_refuses(azc_sink(true) + raw"""
+        struct Bad
+            held: []const u8
+
+        impl Sink for Bad
+            put(*self, bytes: []const u8)
+                self.held = bytes
+
+        var b: Bad
+        var s: *Sink = &b
+        var buf: [8]u8
+
+        s.put(buf[0..<4])
+        """, "error: 'Bad.put' keeps what it is passed as 'bytes', but 'Sink' declares that " +
+        "parameter borrowed for the call — it may be a view of the caller's stack, so copy what " +
+        "this needs into storage of its own")
+
+@test("and one that only reads out of it is not")
+azc_an_implementation_that_reads_compiles()
+    if !rng_ready() then return
+
+    val texts = azc_texts(["emit-llvm"], [("main.sysl", azc_sink(true) + raw"""
+        var c: Counter
+        var s: *Sink = &c
+
+        s.put([1u8, 2u8][..])
+        """)])
+
+    for i in 0..<texts.len()
+        assert(texts.at(i).1.contains("@main"), texts.at(i).0)
+
+@test("sysl.Writer is an ordinary user of it")
+azc_writer_is_an_ordinary_user()
+    if !rng_ready() then return
+
+    azc_refuses(raw"""
+        struct Bad
+            held: []const u8
+        impl Fallible for Bad
+
+        impl Writer for Bad
+            write(*self, bytes: []const u8)
+                self.held = bytes
+        var b: Bad
+        var w: *Writer = &b
+        display_int(1, w, FormatSpec(0, -1, false))
+        """, "error: 'Bad.write' keeps what it is passed as 'bytes', but 'sysl.Writer' declares that " +
+        "parameter borrowed for the call")
+
+@test("a free function is refused, and told why rather than told the word is unknown")
+azc_borrows_on_a_free_function()
+    if !rng_ready() then return
+
+    azc_refuses("@borrows(xs)\ntake(xs: []const u8) -> usize = xs.len\nprint(take([1u8][..]))",
+                "error: '@borrows' is about a call whose body the compiler cannot see, so it says " +
+                "something only on a trait's method.")
+
+@test("a name that is not a parameter is refused by name")
+azc_borrows_names_a_non_parameter()
+    if !rng_ready() then return
+
+    azc_refuses("trait Sink\n    @borrows(byets)\n    put(*self, bytes: []const u8)\n",
+                "error: '@borrows' names 'byets', which is not a parameter of 'Sink.put' — its " +
+                "parameters are 'bytes'")
+
+@test("and there is no empty form")
+azc_borrows_has_no_empty_form()
+    if !rng_ready() then return
+
+    azc_refuses("trait Sink\n    @borrows\n    put(*self, bytes: []const u8)\n",
+                "There is no empty form: a method that may keep what it is handed says so by not " +
+                "writing the annotation")
+
+// -- a refused impl member ------------------------------------------------------------------------
+
+private azc_stream() -> string = raw"""
+    trait Stream
+        look(self) -> int
+        take(*self) -> int
+        both(*self) -> int = self.look() + self.take()
+    struct P
+        n: int
+        look(self) -> int = self.n
+    """
+
+@test("and it is the only error, though the block's other members and the trait's default are called")
+azc_a_colliding_member_is_the_only_error()
+    if !rng_ready() then return
+
+    val said = azc_reports([("main.sysl", azc_stream() + raw"""
+        impl Stream for P
+            look(self) -> int = self.n
+            take(*self) -> int = self.n
+        var p = P(1)
+        print(p.both())
+        print(p.take())
+        """)])
+
+    for i in 0..<said.len()
+        assert(said.at(i).1.contains("error: type 'P' already has a member named 'look'"), said.at(i).1)
+        assert(!said.at(i).1.contains("has no method"), said.at(i).1)
+        assert_eq(xvr_count(said.at(i).1, "error:"), 1, said.at(i).0)
+
+// The second error is anchored at line 10 by both; the column differs, this compiler's span being
+// the body's extent where the reference's anchor is the member -- the open spans divergence.
+@test("and the block's other members are still checked")
+azc_the_blocks_other_members_are_checked()
+    if !rng_ready() then return
+
+    val said = azc_reports([("main.sysl", azc_stream() + raw"""
+        impl Stream for P
+            look(self) -> int = self.n
+            take(*self) -> int = "no"
+        print(P(1).n)
+        """)])
+
+    for i in 0..<said.len()
+        assert(said.at(i).1.contains("already has a member named 'look'"), said.at(i).1)
+        assert(said.at(i).1.contains("error: function 'P.take' should return int, but its body yields " +
+                                     "string\n  --> "), said.at(i).1)
+        assert(said.at(i).1.contains("main.sysl:10:"), said.at(i).1)
+        assert_eq(xvr_count(said.at(i).1, "error:"), 2, said.at(i).0)
+
+@test("and a generic body in the module declaring the trait still finds the other members")
+azc_a_generic_body_still_finds_the_members()
+    if !rng_ready() then return
+
+    val said = azc_reports([("main.sysl", raw"""
+        struct P
+            n: int
+            look(self) -> int = self.n
+        impl parsing.Stream for P
+            look(self) -> int = self.n
+            take(self) -> int = self.n + 1
+        print(parsing.drive(P(1)))
+        """), ("parsing/pratt.sysl", raw"""
+        module parsing
+        trait Stream
+            look(self) -> int
+            take(self) -> int
+            both(self) -> int = self.look() + self.take()
+        drive[S: Stream](s: S) -> int = s.take() + s.both()
+        """)])
+
+    for i in 0..<said.len()
+        assert(said.at(i).1.contains("error: type 'P' already has a member named 'look'"), said.at(i).1)
+        assert(!said.at(i).1.contains("pratt.sysl"), said.at(i).1)
+        assert_eq(xvr_count(said.at(i).1, "error:"), 1, said.at(i).0)
+
+private azc_arity(declared: string, written: string) -> string =
+    s"trait T\n    f(self$declared) -> int\nstruct S\n    n: int\nimpl T for S\n" +
+    s"    f(self$written) -> int = 0\nprint(S(1).n)\n"
+
+@test("one written where the trait has two")
+azc_one_written_where_the_trait_has_two()
+    if !rng_ready() then return
+
+    azc_refuses(azc_arity(", a: int, b: int", ", a: int"),
+                "error: method 'f' of 'impl T for S' takes 1 parameter, but the trait declares 2")
+
+@test("none written where the trait has one")
+azc_none_written_where_the_trait_has_one()
+    if !rng_ready() then return
+
+    azc_refuses(azc_arity(", a: int", ""),
+                "error: method 'f' of 'impl T for S' takes 0 parameters, but the trait declares 1")
+
+@test("two written where the trait has none")
+azc_two_written_where_the_trait_has_none()
+    if !rng_ready() then return
+
+    azc_refuses(azc_arity("", ", a: int, b: int"),
+                "error: method 'f' of 'impl T for S' takes 2 parameters, but the trait declares 0")
+
+@test("two written where the trait has one")
+azc_two_written_where_the_trait_has_one()
+    if !rng_ready() then return
+
+    azc_refuses(azc_arity(", a: int", ", a: int, b: int"),
+                "error: method 'f' of 'impl T for S' takes 2 parameters, but the trait declares 1")
