@@ -1,0 +1,94 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, write_text}
+import sysl.text.Search
+
+// The reference's `SeamSupplierTests`: a module supplying a symbol another module's `extern` declared,
+// the fifth reachability root (`reference/ffi.md § A module may supply another module's extern`). The
+// question only exists for a module that is not the program's own, so every supplier is handed over in
+// a `--lib` root, which is how a fetched package arrives too. The consumer imports the DECLARING module
+// and never names the supplier, which is the whole point.
+
+private azd_ss_clock() -> string =
+    "module clock\n\nprivate extern \"seam_wall_us\" c_wall_us() -> long\n\nnow() -> long = c_wall_us()\n"
+
+private azd_ss_chip() -> string = "module chip\n\n@export(\"seam_wall_us\")\nwall_us() -> long = 7\n"
+
+private azd_ss_asks() -> string = "import clock.now\n\nprint(now())\n"
+
+// `emit-llvm` of `program` with a `--lib` root holding `modules` (each a module name and its text):
+// the status, and what was said.
+private azd_ss_emit(modules: [](string, string), program: string) -> (int, string)
+    val lib = azd_temp("sysl-seam-lib")
+    val prog = azd_temp("sysl-seam-prog")
+
+    for m in modules
+        make_dir_all(s"$lib/${m.0}").unwrap()
+        write_text(s"$lib/${m.0}/${m.0}.sysl", m.1).unwrap()
+
+    write_text(s"$prog/main.sysl", program).unwrap()
+    azd_cli(["sysl", "emit-llvm", prog, "--no-std-lib", "--lib", lib])
+end azd_ss_emit
+
+private azd_ss_text(modules: [](string, string), program: string) -> string
+    val (code, said) = azd_ss_emit(modules, program)
+
+    assert_eq(code, 0, said)
+    said
+end azd_ss_text
+
+@test("is kept although nothing imports its module")
+azd_ss_kept()
+    if !azd_ready() then return
+    assert(azd_ss_text([("clock", azd_ss_clock()), ("chip", azd_ss_chip())], azd_ss_asks()).contains("define i64 @seam_wall_us"))
+
+// A `declare` beside a `define` of one symbol is LLVM's `invalid redefinition of function`.
+@test("leaves no declaration of the symbol beside its definition")
+azd_ss_no_declaration()
+    if !azd_ready() then return
+    assert(!azd_ss_text([("clock", azd_ss_clock()), ("chip", azd_ss_chip())], azd_ss_asks()).contains("declare i64 @seam_wall_us"))
+
+// A supplier is kept because something already asks the linker for its symbol, not because it is
+// exported: a program that never asks the time carries no clock.
+@test("is dropped where the program never calls the extern it answers")
+azd_ss_dropped_where_never_called()
+    if !azd_ready() then return
+    assert(!azd_ss_text([("clock", azd_ss_clock()), ("chip", azd_ss_chip())], "print(1)\n").contains("seam_wall_us"))
+
+@test("is dropped where its symbol answers no extern at all")
+azd_ss_dropped_where_nothing_declares_it()
+    if !azd_ready() then return
+
+    val stray = "module stray\n\n@export(\"stray_entry\")\nentry() -> long = 3\n"
+
+    assert(!azd_ss_text([("clock", azd_ss_clock()), ("stray", stray)], azd_ss_asks()).contains("stray_entry"))
+end azd_ss_dropped_where_nothing_declares_it
+
+// The fixpoint a single pass would miss: the chip calls a module of its own through an `extern`, and
+// nothing imports either of them.
+@test("reaches a second seam through the supplier's own body")
+azd_ss_second_seam()
+    if !azd_ready() then return
+
+    val chained = "module chip\n\nprivate extern \"seam_drift_us\" c_drift() -> long\n\n" +
+        "@export(\"seam_wall_us\")\nwall_us() -> long = 7 + c_drift()\n"
+    val drift = "module drift\n\n@export(\"seam_drift_us\")\ndrift() -> long = 11\n"
+    val out = azd_ss_text([("clock", azd_ss_clock()), ("chip", chained), ("drift", drift)], azd_ss_asks())
+
+    assert(out.contains("define i64 @seam_wall_us"), out)
+    assert(out.contains("define i64 @seam_drift_us"), out)
+end azd_ss_second_seam
+
+// One supplier per image; said here, it names both declarations rather than a symbol in no sysl file.
+@test("is reported rather than left to the linker where two modules claim one symbol")
+azd_ss_two_suppliers()
+    if !azd_ready() then return
+
+    val other = "module other\n\n@export(\"seam_wall_us\")\nwall_us() -> long = 9\n"
+    val (code, said) = azd_ss_emit([("clock", azd_ss_clock()), ("chip", azd_ss_chip()), ("other", other)], azd_ss_asks())
+
+    assert_eq(code, Failed)
+    assert(said.contains("error: 'seam_wall_us' is exported by 'chip.wall_us' and 'other.wall_us' — one symbol " +
+        "is one definition, and the linker has no way to tell which was meant"), said)
+end azd_ss_two_suppliers

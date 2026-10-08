@@ -1,0 +1,37 @@
+module sh.sysl.compiler
+
+import sysl.fs.{IoError, PermissionDenied, is_file, make_dir_all}
+
+// A path the filesystem refuses, said as an answer rather than a failure: the path the reader gave,
+// then what was wrong with it. Each is the reader's or the environment's path, so each refusal names
+// it -- a bare "cannot write" leaves the reader guessing which of the paths a command took was meant.
+
+// `'<path>': <why>`, the platform's reason in the terms the operation was asked in.
+io_refusal(path: string, e: IoError) -> string = s"'$path': ${e.message()}"
+
+// Why a directory cannot be made at `dir`, or nothing where it is there or has been made.
+//
+// **A file standing where a directory is needed is named outright** -- the nearest one on the way up
+// -- since the platform's own answer would be a bare "not a directory" about a path the reader never
+// typed. **A directory that may not be written is named too**: the nearest one that exists, which is
+// the one whose permissions the reader has to change.
+directory_refusal(dir: string) -> Option[string]
+    var at = dir
+
+    loop
+        if is_directory(at) then break
+
+        if is_file(at)
+            return Some(s"cannot make the directory '$at': a file is already there, and a directory is needed")
+
+        parent_of(at) match
+            Some(up) if up != at -> at = up
+            _ -> break
+
+    make_dir_all(dir) match
+        Ok(_) -> None
+        Err(e) ->
+            if e == PermissionDenied && is_directory(at)
+                Some(s"cannot make the directory '$dir': '$at' is not writable")
+            else Some(s"cannot make the directory '$dir': ${e.message()}")
+end directory_refusal

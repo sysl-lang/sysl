@@ -1,0 +1,122 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// Four of the reference's suites whose claims are about what is EMITTED, so the IR is where they are
+// asked -- of this compiler's text and, where `SYSL_ORACLE` names one, the reference's (`azd_irs`) --
+// plus the runs that say the answer is right either way: `SeqAllocationTests`, `SliceCopyTests`,
+// `CompilationModelClaimTests` and `ChannelCrossingTests`.
+
+private azd_mallocs_all(text: string, want: usize)
+    for ir in azd_irs(text, None)
+        assert_eq(azd_lines_with(ir, "call", "@malloc"), want, ir)
+
+private azd_holds_all(text: string, target: Option[string], part: string, held: bool)
+    for ir in azd_irs(text, target)
+        assert_eq(ir.contains(part), held, ir)
+
+// -- SeqAllocationTests: a callable handed to a `sysl.seq` member is a type argument, not a box ------
+
+private azd_folding() -> string = "import sysl.seq.Sequence\n\nval xs = [1, 2, 3]\n\nprint(xs[..].fold(0, (a, n) -> a + n))\n"
+
+@test("folding a slice allocates nothing, exactly as the loop it replaces does not")
+azd_sa_fold_allocates_nothing()
+    if azd_ready() then azd_mallocs_all(azd_folding(), 0)
+
+@test("and the same walk written as a loop is the comparison that says so")
+azd_sa_loop_allocates_nothing()
+    if azd_ready() then azd_mallocs_all("val xs = [1, 2, 3]\nvar acc = 0\n\nfor i in 0..<xs.len\n    acc = acc + xs[i]\n\nprint(acc)\n", 0)
+
+// The boxed spelling written out by hand: one `malloc` for the closure, before an element is touched.
+@test("while the spelling it replaced allocates once per call")
+azd_sa_boxed_allocates_once()
+    if !azd_ready() then return
+
+    val text = "trait Folding\n    folded(self, init: int, f: &Fn(int, int) -> int) -> int\n" +
+        "impl Folding for []const int\n    folded(self, init: int, f: &Fn(int, int) -> int) -> int\n" +
+        "        var acc = init\n        for i in 0..<self.len\n            acc = f(acc, self[i])\n        acc\n" +
+        "val xs = [1, 2, 3]\nprint(xs[..].folded(0, (a, n) -> a + n))\n"
+
+    azd_mallocs_all(text, 1)
+end azd_sa_boxed_allocates_once
+
+@test("the answer is right either way, which is why only the code can say this")
+azd_sa_answer_is_right()
+    if azd_ready() then twp_prints(azd_folding(), "6\n")
+
+// `map` builds a sequence, which is the one cost the arrow does not remove.
+@test("and a member that builds a sequence still allocates for the sequence")
+azd_sa_map_allocates()
+    if !azd_ready() then return
+
+    for ir in azd_irs("import sysl.seq.Sequence\n\nval xs = [1, 2, 3]\n\nprint(xs[..].map(n -> n * 2))\n", None)
+        assert(azd_lines_with(ir, "call", "@malloc") > 0, ir)
+end azd_sa_map_allocates
+
+// -- SliceCopyTests: which declaration of `sysl.slices.copy` took the call -----------------------------
+
+private azd_copy(ty: string, printed: bool) -> string
+    val call = if printed then "print(copy(dst[..], src[..]))" else "copy(dst[..], src[..])"
+
+    s"import sysl.slices.copy\n\nvar dst: [4]$ty = [0, 0, 0, 0]\nvar src: [3]$ty = [1, 2, 3]\n\n$call\n"
+end azd_copy
+
+@test("a byte copy reaches the platform's move")
+azd_sc_byte_copy_moves()
+    if azd_ready() then azd_holds_all(azd_copy("u8", true), None, "@memmove(", true)
+
+// An element may carry a count, which a bitwise move would neither retain nor release.
+@test("and a copy at any other element type does not, because an element may carry a count")
+azd_sc_wider_copy_does_not()
+    if azd_ready() then azd_holds_all(azd_copy("u32", true), None, "@memmove(", false)
+
+@test("and a freestanding target names no memmove at all, because there is nothing to link against")
+azd_sc_freestanding_names_none()
+    if !azd_ready() then return
+
+    azd_holds_all(azd_copy("u8", false), Some("aarch64-freestanding"), "@memmove(", false)
+    azd_holds_all(azd_copy("u8", false), Some("riscv64-freestanding"), "@memmove(", false)
+end azd_sc_freestanding_names_none
+
+@test("a copy of counted elements keeps the counts, so the source may go out of scope")
+azd_sc_counted_copy()
+    if !azd_ready() then return
+
+    twp_prints("import sysl.slices.copy\n\nfill_from_temp(dst: []string)\n    var s = [\"one\", \"two\", \"three\"]\n\n" +
+               "    copy(dst, s[..])\n\nvar d = [\"a\", \"b\", \"c\"]\n\nfill_from_temp(d[..])\nprint(d[0], d[1], d[2])\n",
+               "one two three\n")
+end azd_sc_counted_copy
+
+// -- CompilationModelClaimTests: layout is declaration order; reachability decides what is emitted -----
+
+@test("a field order that wastes space is emitted as written — packing the i64 first would save eight bytes and is exactly what the guarantee forbids")
+azd_cm_wasteful_order_kept()
+    if azd_ready() then azd_holds_all("struct Wasteful\n    a: u8\n    big: i64\n    b: u8\nvar w = Wasteful(1u8, 2i64, 3u8)\nprint(w.b)", None, "%struct.Wasteful = type { i8, i64, i8 }", true)
+
+@test("and a private field is not nameable downstream but is still there, because the ABI needs it")
+azd_cm_private_field_kept()
+    if azd_ready() then azd_holds_all("struct Mixed\n    shown: i32\n    private hidden: i64\nvar m = Mixed(4, 5i64)\nprint(m.shown)", None, "%struct.Mixed = type { i32, i64 }", true)
+
+@test("an 'extern' is the exception to mangling and emits the raw C symbol")
+azd_cm_extern_raw_symbol()
+    if !azd_ready() then return
+
+    val text = "extern strlen(s: *u8) -> usize\nvar s = c\"hello\"\nprint(strlen(s))"
+
+    azd_holds_all(text, None, "declare i64 @strlen(ptr)", true)
+    azd_holds_all(text, None, "call i64 @strlen(", true)
+end azd_cm_extern_raw_symbol
+
+@test("a declaration nothing can arrive at is not written out — nor the extern it would have called")
+azd_cm_unreached_not_emitted()
+    if azd_ready() then azd_holds_all("extern puts(s: *u8) -> i32\nprint(1)", None, "@puts", false)
+
+@test("but its body is still analyzed, because a mistake is a mistake for what the line says and not for whether the program would have run it")
+azd_cm_unreached_still_analyzed()
+    if !azd_ready() then return
+
+    val said = azd_err("never_called() -> int = \"not an int\"\nprint(1)")
+
+    assert(said.contains("function 'never_called' should return int, but its body yields string"), said)
+end azd_cm_unreached_still_analyzed

@@ -1,0 +1,144 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, write_text}
+import sysl.text.Search
+
+// The single cases several reference suites still owed, each asked of the whole compiler as its suite
+// asks it: `IntegerAttrErrorTests`, `TypePackTests`, `VisibilityTests`, `VariantNamespaceTests`,
+// `ComputedValTests` and `ChannelCrossingTests`. Every quoted message is the reference's own output.
+
+private azd_says(text: string, part: string)
+    val said = azd_err(text)
+
+    assert(said.contains(part), said)
+end azd_says
+
+// -- IntegerAttrErrorTests ---------------------------------------------------------------------------
+
+@test("an unknown attribute names the two that exist")
+azd_ia_unknown_attribute()
+    if !azd_ready() then return
+
+    azd_says("print(u8::Middle)", "has no attribute 'Middle'")
+    azd_says("print(u8::Middle)", "'u8::Min'")
+end azd_ia_unknown_attribute
+
+@test("First points at Min")
+azd_ia_first()
+    if !azd_ready() then return
+
+    azd_says("print(u8::First)", "'u8::Min'")
+    azd_says("print(u8::First)", "not a declared sequence")
+end azd_ia_first
+
+@test("Last points at Max")
+azd_ia_last()
+    if azd_ready() then azd_says("print(i16::Last)", "'i16::Max'")
+
+@test("they take no arguments")
+azd_ia_no_arguments()
+    if azd_ready() then azd_says("print(u8::Max(1))", "takes no arguments")
+
+// Refused, as `reference/attributes.md` says (only integers have them). What is asserted is the
+// reference's own claim, that the report names the type; the two compilers word the refusal apart.
+@test("a float has none")
+azd_ia_a_float_has_none()
+    if !azd_ready() then return
+
+    val said = azd_err("print(f64::Max)")
+
+    assert(said.starts_with("error: "), said)
+    assert(said.contains("f64"), said)
+end azd_ia_a_float_has_none
+
+@test("nor does bool")
+azd_ia_nor_does_bool()
+    if !azd_ready() then return
+
+    val said = azd_err("print(bool::Max)")
+
+    assert(said.starts_with("error: "), said)
+    assert(said.contains("bool"), said)
+end azd_ia_nor_does_bool
+
+// -- TypePackTests: a pack binds from the first argument naming it, and a later one is blamed ----------
+
+private azd_zip3() -> string = "zip3[..A: Display](x: (..A), y: (..A), z: (..A)) -> usize = A.len\n"
+
+@test("binds a pack from the first of three arguments, whichever later one disagrees")
+azd_tp_first_of_three()
+    if !azd_ready() then return
+
+    twp_prints(azd_zip3() + "print(zip3((1, 2), (3, 4), (5, 6)))", "2\n")
+    azd_says(azd_zip3() + "print(zip3((1, 2), (3, 4), (5, 6, 7)))", "'z' of 'zip3' is (int, int), but (int, int, int) was given")
+    azd_says(azd_zip3() + "print(zip3((1, 2), (3, 4), (5, 6, 7)))", "main.sysl:2:28")
+    azd_says(azd_zip3() + "print(zip3((1, 2), (3, 4, 5), (6, 7)))", "'y' of 'zip3' is (int, int), but (int, int, int) was given")
+    azd_says(azd_zip3() + "print(zip3((1, 2), (3, 4, 5), (6, 7)))", "main.sysl:2:20")
+end azd_tp_first_of_three
+
+@test("binds a pack beside a scalar parameter by the same rule")
+azd_tp_beside_a_scalar()
+    if !azd_ready() then return
+
+    val tagged = "tagged[T: Display, ..A: Display](k: T, x: (..A), j: T, y: (..A)) -> usize = A.len\n"
+
+    twp_prints(tagged + "print(tagged(\"k\", (1, true), \"j\", (2, false)))", "2\n")
+    azd_says(tagged + "print(tagged(\"k\", (1, 2), \"j\", (3, 4, 5)))", "'y' of 'tagged' is (int, int), but (int, int, int) was given")
+    azd_says(tagged + "print(tagged(\"k\", (1, 2), 7, (3, 4)))", "'j' of 'tagged' is string, but int was given")
+end azd_tp_beside_a_scalar
+
+// The first argument is no tuple, so it binds nothing: the pack is read off the second and the first
+// is blamed for being no tuple, which is the true complaint.
+@test("blames a first argument that is no tuple, against the arity the second gave")
+azd_tp_first_is_no_tuple()
+    if !azd_ready() then return
+
+    val text = "zip_len[..A: Display](x: (..A), y: (..A)) -> usize = A.len\nprint(zip_len(5, (3, 4)))"
+
+    azd_says(text, "'x' of 'zip_len' is (int, int), but int was given")
+    azd_says(text, "main.sysl:2:15")
+end azd_tp_first_is_no_tuple
+
+// -- VisibilityTests: the scope argument is one segment, and the refusal offers the last --------------
+
+@test("three segments, where the offer is still the last")
+azd_vis_three_segments()
+    if !azd_ready() then return
+
+    azd_says("module a.b.c\nprivate[a.b.c] struct S\n    n: int\n", "write 'private[c]'")
+    azd_says("module a.b.c\nprivate[a.b.c] struct S\n    n: int\n", "main.sysl:2:10")
+end azd_vis_three_segments
+
+@test("and in front of an 'impl', which reads the modifier only to refuse it")
+azd_vis_in_front_of_an_impl()
+    if azd_ready() then azd_says("private[a.b] impl T for S\n", "write 'private[b]'")
+
+// -- VariantNamespaceTests: the tag is read off the INSTANTIATED enum, so it reaches the right one ----
+
+@test("a simple enum's variant as a value argument picks the right enum")
+azd_vn_value_argument()
+    if !azd_ready() then return
+
+    twp_prints("enum Level\n    Low\n    High\nenum Tide\n    Low\n    Slack\nstruct Gauge[const L: Level]\n    reading: int\n" +
+               "at(g: Gauge[High]) -> int = g.reading\nval g: Gauge[High] = Gauge(3)\nprint(at(g))\n", "3\n")
+end azd_vn_value_argument
+
+// -- ComputedValTests: the edge a `val` reference makes is an ordinary module edge --------------------
+
+@test("two modules reading each other's tables is a module cycle")
+azd_cv_tables_cycle()
+    if !azd_ready() then return
+
+    val root = azd_temp("sysl-azd-cv")
+
+    make_dir_all(s"$root/up").unwrap()
+    make_dir_all(s"$root/down").unwrap()
+    write_text(s"$root/main.sysl", "print(up.a)").unwrap()
+    write_text(s"$root/up/up.sysl", "module up\nfrom_down() -> int = down.b + 1\nstatic val a: int = from_down()\n").unwrap()
+    write_text(s"$root/down/down.sysl", "module down\nfrom_up() -> int = up.a + 1\nstatic val b: int = from_up()\n").unwrap()
+
+    val said = azd_built_output(root)
+
+    assert(said.contains("modules may not depend on each other"), said)
+end azd_cv_tables_cycle

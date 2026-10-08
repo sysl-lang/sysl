@@ -1,0 +1,109 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.text.Search
+
+// The reference's `PackageCapabilityTests`: the two capability rules of `reference/modules.md §
+// Capabilities are a module property`, asked of a module that arrives through a `dependencies` block.
+// A package's modules are filed under its canonical prefix, and a clause recorded under the name its
+// header wrote was one no reference ever reached. Each claim is asked of a `path` dependency and a
+// `git` one, the two being filed under different prefixes; the `git` package is VENDORED, which is
+// where a build finds a coordinate without asking the network.
+
+private azd_pc_package(dir: string)
+    make_dir_all(s"$dir/demo/probe").unwrap()
+    write_text(s"$dir/package.hocon", "package { name = \"demo\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$dir/demo/probe/probe.sysl", "module demo.probe\n@requires(posix)\n\nsize() -> usize = 32\n").unwrap()
+
+private azd_pc_manifest(root: string, config: string, dep: string) =
+    write_text(s"$root/package.hocon",
+               s"package { name = \"app\", version = \"0.1.0\" }\n$config\ndependencies { $dep }\n").unwrap()
+
+private azd_pc_path_dep(pkg: string) -> string = s"demo { path = \"$pkg\" }"
+
+// A program depending on `demo` by `kind` (`path` or `git`), whose config says `config` besides.
+private azd_pc_app(kind: string, config: string, program: string) -> string
+    val root = azd_temp("sysl-app-")
+    var dep = "demo { git = \"github.com/e/demo\", version = \"0.1.0\" }"
+
+    if kind == "path"
+        val pkg = azd_temp("sysl-pkg-demo-")
+
+        azd_pc_package(pkg)
+        dep = azd_pc_path_dep(pkg)
+    else azd_pc_package(s"$root/vendor/github.com/e/demo/@v0.1.0")
+
+    azd_pc_manifest(root, config, dep)
+    write_text(s"$root/main.sysl", program).unwrap()
+    root
+end azd_pc_app
+
+private azd_pc_module(kind: string) -> string = if kind == "path" then "demo.demo.probe" else "github.com.e.demo.demo.probe"
+
+private azd_pc_not_provided(module_name: string) -> string =
+    s"this reaches '$module_name', which requires 'posix', and '${host_target().name}' does not provide it — " +
+    "a target's capabilities are what 'package.hocon' declares"
+
+private azd_pc_declared_no(module_name: string) -> string =
+    s"this reaches '$module_name', which requires 'posix', and this module declared 'no posix' — an " +
+    "environment capability gates which modules exist"
+
+private azd_pc_no_posix() -> string = "capabilities { posix = false }"
+
+@test("is refused where a target without the capability reaches it")
+azd_pc_target_without_it()
+    if !azd_ready() then return
+
+    for kind in ["path", "git"]
+        val said = azd_built_output(azd_pc_app(kind, azd_pc_no_posix(), "print(demo.probe.size())\n"))
+
+        assert(said.contains(azd_pc_not_provided(azd_pc_module(kind))), said)
+end azd_pc_target_without_it
+
+@test("is refused where a module that gave the capability up reaches it")
+azd_pc_module_that_gave_it_up()
+    if !azd_ready() then return
+
+    for kind in ["path", "git"]
+        val said = azd_built_output(azd_pc_app(kind, "", "@no_posix\n\nprint(demo.probe.size())\n"))
+
+        assert(said.contains(azd_pc_declared_no(azd_pc_module(kind))), said)
+        assert(!said.contains("does not provide it"), said)
+end azd_pc_module_that_gave_it_up
+
+@test("and is reached as before on a target that provides it")
+azd_pc_reached_as_before()
+    if !azd_ready() then return
+
+    for kind in ["path", "git"]
+        assert_eq(azd_built_output(azd_pc_app(kind, "", "print(demo.probe.size())\n")), "32\n")
+
+// `sysl run` replays a binary keyed over what reaches it; what the target provides is in the key, or
+// the second run here would be handed the first one's binary.
+@test("and a run the config has since narrowed is not answered by the run before it")
+azd_pc_narrowed_run()
+    if !azd_ready() then return
+
+    val cache = azd_temp("sysl-azd-run-cache")
+    val pkg = azd_temp("sysl-pkg-demo-")
+    val app = azd_temp("sysl-app-")
+
+    azd_pc_package(pkg)
+    azd_pc_manifest(app, "", azd_pc_path_dep(pkg))
+    // A statement that prints nothing, so the run says nothing into this suite's own report.
+    write_text(s"$app/main.sysl", "if demo.probe.size() == 0 then print(\"none\")\n").unwrap()
+    use_run_cache_dir(Some(cache))
+
+    val first = azd_cli(["sysl", "run", app])
+
+    azd_pc_manifest(app, azd_pc_no_posix(), azd_pc_path_dep(pkg))
+
+    val second = azd_cli(["sysl", "run", app])
+
+    use_run_cache_dir(None)
+    remove_dir_all(cache).unwrap_or(())
+    assert_eq(first.0, 0, first.1)
+    assert_eq(second.0, Failed)
+    assert(second.1.contains(azd_pc_not_provided("demo.demo.probe")), second.1)
+end azd_pc_narrowed_run

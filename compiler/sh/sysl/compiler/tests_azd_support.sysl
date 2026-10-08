@@ -1,0 +1,99 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, split, Search}
+
+// The harness every `azd_` file shares: a program compiled from text, asked for its diagnostics or its
+// LLVM text, and a command line driven through the same `run_cli` a shell reaches. **Where
+// `SYSL_ORACLE` names the reference, an IR claim is asked of its text too**, so a claim that holds
+// here and not there is a disagreement rather than a pass.
+
+azd_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end azd_ready
+
+azd_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+// What one command line came to: the status the shell hears, and every line the driver said.
+azd_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    reset_search_paths()
+    (code, join(lines.view(), "\n"))
+end azd_cli
+
+// `text` as the one file of a scratch program; the directory holding it is handed back beside it.
+azd_program(text: string) -> (string, string)
+    val root = azd_temp("sysl-azd")
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    (root, s"$root/main.sysl")
+end azd_program
+
+// Every diagnostic a program earns, rendered, or nothing where it compiles.
+azd_err(text: string) -> string
+    val (root, src) = azd_program(text)
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end azd_err
+
+// The LLVM text of a program for `target` (the host where it is `None`), and the reference's where
+// `SYSL_ORACLE` names one.
+azd_irs(text: string, target: Option[string]) -> Buf[string]
+    val (root, src) = azd_program(text)
+    var out: Buf[string] = buf()
+
+    emit_llvm_text(src, target) match
+        Err(why) -> out.push(failure_text(why))
+        Ok(made) -> out.push(made.text)
+
+    env_var("SYSL_ORACLE") match
+        Some(bin) ->
+            var args: Buf[string] = buf()
+
+            args.push("emit-llvm")
+            args.push(src)
+
+            target match
+                Some(t) ->
+                    args.push("--target")
+                    args.push(t)
+                None -> ()
+
+            capture_oracle(bin, args.view()) match
+                Err(_) -> out.push("the reference could not be run")
+                Ok(o) -> out.push(o.text)
+        None -> ()
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end azd_irs
+
+// How many lines of `ir` hold both `a` and `b`.
+azd_lines_with(ir: string, a: string, b: string) -> usize
+    val lines = split(ir, "\n")
+    var n: usize = 0
+
+    for i in 0..<lines.len
+        if lines[i].contains(a) && lines[i].contains(b) then n += 1
+
+    n
+end azd_lines_with
