@@ -7,7 +7,7 @@ import sysl.container.{Map, map, Set, set}
 import sysl.env.{get as env_var}
 import sysl.fs.{IoError, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, walk, write_text}
 import sysl.process.{capture, Output, Var}
-import sysl.text.{replace_all, split, str_builder, Search}
+import sysl.text.{join, replace_all, split, str_builder, Search}
 
 // The differential proof: this parser's tree against the reference compiler's, on the same input.
 //
@@ -187,10 +187,10 @@ patch_confined(theirs: string, ours: string, patched: Buf[string]) -> Set[string
     val our_defs = defined_set(ours)
 
     for name in their_defs.walk()
-        if in_patched_module(name, patched) then confined.add(name)
+        if in_patched_module(name, patched) || helper_of_patched_type(name, patched) then confined.add(name)
 
     for name in our_defs.walk()
-        if in_patched_module(name, patched) then confined.add(name)
+        if in_patched_module(name, patched) || helper_of_patched_type(name, patched) then confined.add(name)
 
     precompiled_on_one_side(their_defs, our_defs, declared_symbols(ours), &confined)
     precompiled_on_one_side(our_defs, their_defs, declared_symbols(theirs), &confined)
@@ -225,6 +225,202 @@ patch_confined(theirs: string, ours: string, patched: Buf[string]) -> Set[string
 
     confined
 end patch_confined
+
+/** Rule 1's second half: an ownership helper (`arc.copy.<type>`, `arc.dispose.<type>`, …) for a type
+ * of a listed module (`@arc.copy.sysl.buf$Buf.Json`). Its body is that type's layout read field by
+ * field, so it is the listed module's as much as a member is; the module is read at a segment start
+ * of the type, as `type_confined` reads it. A helper for any other type is not confined.
+ */
+helper_of_patched_type(symbol: string, patched: Buf[string]) -> bool
+    val bare = if symbol.starts_with("\"") then symbol[1..] else symbol
+
+    bare.starts_with("arc.") && type_confined("%" + bare, patched)
+
+/** **The receiver rule, in LLVM text: a body may differ only in HOW it hands a receiver to a listed
+ * module's function.** Where a listed module's member takes its receiver by value here and by address
+ * there (`Buf.push(self)` against `Buf.push(*self)`), the reference passes the place's address,
+ * `call … @sysl.buf$Buf.push.T(ptr P, …)`, and this compiler loads the handle first and passes it,
+ * `%r = load %struct.sysl.buf$Buf.T, ptr P` then `call … @sysl.buf$Buf.push.T(%struct.… %r, …)`. This
+ * rewrites every such call's FIRST argument back to `ptr P` and drops the load (where nothing else
+ * reads `%r`), then numbers the `%tN` registers afresh in order of appearance, since one load fewer
+ * moves every number after it. Two bodies are excused only where at least one such rewrite was made
+ * and the rewritten texts are the same; a body differing anywhere else still fails.
+ */
+receiver_confined_llvm(theirs: string, ours: string, patched: Buf[string]) -> bool
+    if patched.is_empty() then return false
+
+    val (a, made_a) = llvm_receivers_unwrapped(theirs, patched)
+    val (b, made_b) = llvm_receivers_unwrapped(ours, patched)
+
+    made_a + made_b > 0 && a == b
+end receiver_confined_llvm
+
+// A body with every by-value receiver of a listed module's function made a `ptr` again, its `%tN`
+// registers renumbered, and how many receivers it rewrote.
+llvm_receivers_unwrapped(body: string, patched: Buf[string]) -> (string, usize)
+    val lines = split(body, "\n")
+    var kept: Buf[string] = buf()
+    var dropped: Set[usize] = set()
+    var made: usize = 0
+
+    for j in 0..<lines.len
+        var line = lines[j]
+        val callee = called_symbol(line)
+
+        if callee != "" && in_patched_module(callee, patched)
+            val open = line.index_of("(").unwrap()
+            val first = first_operand(line[open + 1..])
+            val space = first.index_of(" %")
+
+            val listed_value = first.starts_with("%struct.") && space.is_some()
+
+            if listed_value && type_confined(first[..<space.unwrap()], patched)
+                val reg = first[space.unwrap() + 1..]
+                val def = loaded_from(lines, reg, first[..<space.unwrap()])
+
+                if def.is_some() && register_uses(lines, reg) == 2
+                    val (at, place) = def.unwrap()
+
+                    line = line[..<open + 1] + "ptr " + place + line[open + 1 + first.bytes.len..]
+                    dropped.add(at)
+                    made += 1
+                end if
+            end if
+        end if
+
+        kept.push(line)
+
+    var out: Buf[string] = buf()
+
+    for j in 0..<kept.len()
+        if !dropped.has(j) then out.push(kept.at(j))
+
+    (renumbered(join(out.view(), "\n")), made)
+end llvm_receivers_unwrapped
+
+// The symbol a `call` line calls, `sysl.buf$Buf.push.int` out of `call void @sysl.buf$Buf.push.int(…)`,
+// or "" for any other line.
+private called_symbol(line: string) -> string
+    val call = line.index_of("call ")
+
+    if call.is_none() then return ""
+
+    val at = line[call.unwrap()..].index_of(" @")
+
+    if at.is_none() then return ""
+
+    val from = call.unwrap() + at.unwrap() + 2
+    val open = line[from..].index_of("(")
+
+    if open.is_none() then return ""
+
+    line[from..<from + open.unwrap()]
+end called_symbol
+
+// The text of an argument list's first operand: up to its `,` or the closing `)`.
+private first_operand(args: string) -> string
+    var depth: usize = 0
+
+    for i in 0..<args.bytes.len
+        val b = args.bytes[i]
+
+        if depth == 0 && (b == u8(',') || b == u8(')')) then return args[..<i]
+
+        if b == u8('{') || b == u8('(') || b == u8('[')
+            depth += 1
+        else if b == u8('}') || b == u8(']') || b == u8(')')
+            depth -= 1
+
+    args
+end first_operand
+
+// Where `reg` is defined as `reg = load <ty>, ptr P`: that line's index and `P`.
+private loaded_from(lines: []string, reg: string, ty: string) -> Option[(usize, string)]
+    val head = reg + " = load " + ty + ", ptr "
+
+    for i in 0..<lines.len
+        val line = after_indent(lines[i])
+
+        if line.starts_with(head) then return Some((i, line[head.bytes.len..]))
+
+    None
+end loaded_from
+
+// How many times a register is named in a body, its definition included.
+private register_uses(lines: []string, reg: string) -> usize
+    var n: usize = 0
+
+    for i in 0..<lines.len
+        val line = lines[i]
+        var from: usize = 0
+
+        loop
+            val at = line[from..].index_of(reg)
+
+            if at.is_none() then break
+
+            val end = from + at.unwrap() + reg.bytes.len
+
+            if end >= line.bytes.len || !continues_a_name(line.bytes[end]) then n += 1
+
+            from = end
+
+    n
+end register_uses
+
+private continues_a_name(b: u8) -> bool
+    if b >= u8('0') && b <= u8('9') then return true
+    if b >= u8('a') && b <= u8('z') then return true
+    if b >= u8('A') && b <= u8('Z') then return true
+
+    b == u8('_') || b == u8('.')
+
+// A body with its `%tN` registers numbered from zero in order of first appearance.
+private renumbered(text: string) -> string
+    var seen: Buf[string] = buf()
+    var out = str_builder()
+    var i: usize = 0
+
+    while i < text.bytes.len
+        if starts_a_register(text, i)
+            var j = i + 2
+
+            while j < text.bytes.len && text.bytes[j] >= u8('0') && text.bytes[j] <= u8('9')
+                j += 1
+
+            if j < text.bytes.len && continues_a_name(text.bytes[j])
+                out.push(text[i..<j])
+            else
+                val name = text[i..<j]
+                var k: usize = 0
+
+                while k < seen.len() && seen.at(k) != name
+                    k += 1
+
+                if k == seen.len() then seen.push(name)
+
+                out.push(s"%t$k")
+            end if
+
+            i = j
+        else
+            val start = i
+
+            i += 1
+
+            while i < text.bytes.len && text.bytes[i] != u8('%')
+                i += 1
+
+            out.push(text[start..<i])
+
+    out.finish()
+end renumbered
+
+// Whether a `%tN` register begins at `i`.
+private starts_a_register(text: string, i: usize) -> bool
+    if text.bytes[i] != u8('%') || i + 2 >= text.bytes.len || text.bytes[i + 1] != u8('t') then return false
+
+    text.bytes[i + 2] >= u8('0') && text.bytes[i + 2] <= u8('9')
 
 // Rule 3 of `patch_confined`, one way round: what `defining` defines and the other text only declares.
 private precompiled_on_one_side(defining: Set[string], other: Set[string], other_declares: Buf[string],
@@ -1420,7 +1616,7 @@ private compare_whole(binary: string, path: string, label: string, text: string,
         // would have said, from a walk that produced a value instead of saying it.
         else if names_a_fallback(where)
             found.skipped_unresolved += 1
-        else if in_patched_module(f.name, patched)
+        else if in_patched_module(f.name, patched) || receiver_confined(block.unwrap(), mine, patched)
             found.excused += 1
         else
             found.mismatched += 1
@@ -1436,6 +1632,104 @@ private names_a_fallback(where: string) -> bool
 
     where[at.unwrap()..].index_of("TZero").is_some()
 end names_a_fallback
+
+/** **The receiver rule: a body outside a listed module may differ only in HOW it hands a receiver to
+ * a listed module's member.** A listed module's member may take its receiver differently in the two
+ * libraries -- `Buf.push(*self)` there, `Buf.push(self)` here, a container being a reference -- so a
+ * call to it is `TCall(m$T.f, [TAddrOf(b), …])` in one tree and `TCall(m$T.f, [b, …])` in the other,
+ * or `[p, …]` against `[TDeref(p), …]` through a pointer. This rewrites the FIRST argument of every
+ * `TCall` whose callee is in a listed module down to the place it names, every `TAddrOf` and `TDeref`
+ * around it taken off (and their `ty:` with them). Two bodies whose rewrites are the same text differ
+ * at such receivers and nowhere else; anything else -- another argument, the receiver's place, a call
+ * into an unlisted module, any other node -- is left alone and still fails.
+ */
+receivers_unwrapped(text: string, patched: Buf[string]) -> string
+    val lines = split(text, "\n")
+    var out: Buf[string] = buf()
+    var i: usize = 0
+
+    while i < lines.len
+        val line = lines[i]
+
+        out.push(line)
+        i += 1
+
+        if !line.ends_with("TCall") || i + 2 >= lines.len then continue
+
+        val callee = after_indent(lines[i])
+
+        if !callee.starts_with("name: ") || !in_patched_module(callee[6..], patched) then continue
+        if after_indent(lines[i + 1]) != "args: " then continue
+
+        val dash = indent_of(lines[i + 2])
+
+        if dash != indent_of(lines[i + 1]) + 2 || !after_indent(lines[i + 2]).starts_with("- ") then continue
+
+        out.push(lines[i])
+        out.push(lines[i + 1])
+        i += 2
+
+        // The first argument's lines: its `- ` line and everything indented under it.
+        var item: Buf[string] = buf()
+
+        item.push(lines[i])
+        i += 1
+
+        while i < lines.len && indent_of(lines[i]) > dash
+            item.push(lines[i])
+            i += 1
+
+        item = without_address_steps(item, dash)
+
+        for k in 0..<item.len()
+            out.push(item.at(k))
+
+    join(out.view(), "\n")
+end receivers_unwrapped
+
+// Whether two renderings of one body differ only at receivers `receivers_unwrapped` rewrites.
+receiver_confined(theirs: string, ours: string, patched: Buf[string]) -> bool
+    val a = receivers_unwrapped(without_trailing_newlines(theirs), patched)
+
+    a == receivers_unwrapped(without_trailing_newlines(ours), patched)
+
+// One list item (`- TAddrOf` at column `dash`, its fields two deeper than the node) with every
+// `TAddrOf`/`TDeref` at its head replaced by the node it wraps, moved out to the item's column.
+private without_address_steps(item: Buf[string], dash: usize) -> Buf[string]
+    var now = item
+
+    loop
+        val node = now.at(0)[dash + 2..]
+
+        if (node != "TAddrOf" && node != "TDeref") || now.len() < 2 then return now
+
+        val field = after_indent(now.at(1))
+        val colon = field.index_of(": ")
+
+        if indent_of(now.at(1)) != dash + 4 || colon.is_none() then return now
+
+        var next: Buf[string] = buf()
+
+        next.push(now.at(0)[..<dash] + "- " + field[colon.unwrap() + 2..])
+
+        var k: usize = 2
+
+        while k < now.len() && indent_of(now.at(k)) > dash + 4
+            next.push(now.at(k)[2..])
+            k += 1
+
+        now = next
+end without_address_steps
+
+private indent_of(line: string) -> usize
+    var n: usize = 0
+
+    while n < line.bytes.len && line.bytes[n] == u8(' ')
+        n += 1
+
+    n
+
+private after_indent(line: string) -> string = line[indent_of(line)..]
 
 @test("the two analyzers agree on a whole program, with the library's own bodies in it")
 the_typed_trees_agree_over_whole_programs()
@@ -1625,7 +1919,10 @@ private compare_types(binary: string, path: string, label: string, patched: Buf[
 
             if where.is_some()
                 // Excused only where the two lists agree once every type of a listed module is out.
-                if first_difference(types_outside(want, patched), types_outside(got, patched)).is_none()
+                val holding = holders_on_both(want, got, patched)
+                val rest_theirs = types_outside(want, patched, holding)
+
+                if first_difference(rest_theirs, types_outside(got, patched, holding)).is_none()
                     found.excused_types += 1
                 else
                     found.mismatched += 1
@@ -1637,19 +1934,105 @@ private compare_types(binary: string, path: string, label: string, patched: Buf[
             val confined = patch_confined(theirs.text, ours, patched)
 
             compare_boxes(theirs.text, ours, label, found)
-            compare_funcs(theirs.text, ours, mine.gaps, label, confined, found)
+            compare_funcs(theirs.text, ours, mine.gaps, label, confined, patched, found)
             compare_whole_text(theirs.text, ours, label, confined, patched, found)
 end compare_types
 
 // The type definition lines whose type is not confined to a listed module (`type_confined`).
-private types_outside(lines: Buf[string], patched: Buf[string]) -> Buf[string]
+// A holder (`holders_on_both`) is left out as well.
+private types_outside(lines: Buf[string], patched: Buf[string], holding: Set[string]) -> Buf[string]
     var out: Buf[string] = buf()
 
     for i in 0..<lines.len()
-        if !type_confined(lines.at(i), patched) then out.push(lines.at(i))
+        val line = lines.at(i)
+
+        if !type_confined(line, patched) && !holding.has(type_def_name(line)) then out.push(line)
 
     out
 end types_outside
+
+// The name a type definition line defines: `%enum.Json` out of `%enum.Json = type { … }`.
+type_def_name(line: string) -> string = line[..<line.index_of(" = type ").unwrap_or(line.bytes.len)]
+
+/** **The holder rule: a type outside a listed module whose LAYOUT moved because it holds one by
+ * value.** A listed module's type may change its layout -- `Buf[T]` is `{ { ptr, ptr, i64 }, i64 }`
+ * there and a one-pointer handle `{ ptr }` here -- and every type holding one inline changes size
+ * with it: `enum Json { Arr(items: Buf[Json]) }` is `{ i32, [4 x i64] }` there and `{ i32, [1 x i64]
+ * }` here. A holder is a type whose definition names a `type_confined` type or another holder, and an
+ * enum whose variant payload (`%Json.Arr` for `%enum.Json`) is one -- to a fixpoint, in one text. A
+ * name is excused only where it is a holder in BOTH texts; a type that holds nothing of a listed
+ * module stays in the comparison, however its layout differs.
+ */
+holders_on_both(theirs: Buf[string], ours: Buf[string], patched: Buf[string]) -> Set[string]
+    val a = holders_in(theirs, patched)
+    val b = holders_in(ours, patched)
+    var out: Set[string] = set()
+
+    for name in a.walk()
+        if b.has(name) then out.add(name)
+
+    out
+end holders_on_both
+
+private holders_in(lines: Buf[string], patched: Buf[string]) -> Set[string]
+    var held: Set[string] = set()
+
+    if patched.is_empty() then return held
+
+    loop
+        var grew = false
+
+        for i in 0..<lines.len()
+            val line = lines.at(i)
+            val name = type_def_name(line)
+
+            if held.has(name) || type_confined(line, patched) then continue
+
+            if names_a_held_type(line[name.bytes.len..], patched, held) || holds_a_variant(name, held)
+                held.add(name)
+                grew = true
+            end if
+
+        if !grew then return held
+end holders_in
+
+// Whether a definition's right-hand side names a `type_confined` type or a holder.
+private names_a_held_type(rhs: string, patched: Buf[string], held: Set[string]) -> bool
+    var i: usize = 0
+
+    while i < rhs.bytes.len
+        if rhs.bytes[i] != u8('%')
+            i += 1
+            continue
+        end if
+
+        var j = i + 1
+
+        while j < rhs.bytes.len && !ends_a_type_name(rhs.bytes[j])
+            j += 1
+
+        val token = rhs[i..<j]
+
+        if type_confined(token, patched) || held.has(token) then return true
+
+        i = j
+
+    false
+end names_a_held_type
+
+private ends_a_type_name(b: u8) -> bool = b == u8(',') || b == u8(' ') || b == u8('}') || b == u8(']')
+
+// Whether `%enum.N`'s variant payloads, `%N.<variant>`, include a holder.
+private holds_a_variant(name: string, held: Set[string]) -> bool
+    if !name.starts_with("%enum.") then return false
+
+    val prefix = "%" + name[6..] + "."
+
+    for h in held.walk()
+        if h.starts_with(prefix) then return true
+
+    false
+end holds_a_variant
 
 // A text with every type definition `type_confined` to a listed module taken out -- for a test that
 // holds a whole text to the reference's outside the sweeps.
@@ -1740,7 +2123,7 @@ end box_lines
 // counted with them -- they are hand-written LLVM templates rather than lowered bodies, so they
 // arrive with the ownership runtime rather than with a function.
 private compare_funcs(theirs: string, mine: string, gaps: Buf[(string, string)], label: string,
-                      confined: Set[string], found: *TypeAgreement)
+                      confined: Set[string], patched: Buf[string], found: *TypeAgreement)
     val ours = func_texts(mine)
     val wanted = func_texts(theirs)
 
@@ -1757,7 +2140,7 @@ private compare_funcs(theirs: string, mine: string, gaps: Buf[(string, string)],
             Some(body) ->
                 if body == wanted.at(i).1
                     found.fn_matched += 1
-                else if confined.has(name)
+                else if confined.has(name) || receiver_confined_llvm(wanted.at(i).1, body, patched)
                     found.fn_excused += 1
                 else
                     found.fn_mismatched += 1
@@ -2113,7 +2496,14 @@ the_two_agree_on_this_compilers_own_tree()
                 return
             end if
 
-            val mine = emit_llvm_text(".", None) match
+            // **This compiler reads the reference's library too**, with the same overlay of the
+            // modules `library/` adds: a listed module that changes a layout (`Buf` a one-pointer
+            // handle here) changes every type of this tree holding one and every body touching
+            // those, so against two libraries the census would measure the libraries rather than
+            // the compilers.
+            val emitted = emit_own_against(oracle_library(binary), reference_overlay(binary))
+
+            val mine = emitted match
                 Err(refusal) ->
                     assert(false, s"this compiler refused its own tree: ${refusal.message}")
                     return
@@ -2142,6 +2532,40 @@ the_two_agree_on_this_compilers_own_tree()
             assert(found.shared > 0, "the census compared something")
             assert(found.differing == 0, s"$summary${found.first_bad}")
 end the_two_agree_on_this_compilers_own_tree
+
+// This tree's LLVM text, compiled against `library` (in place of `SYSL_LIB`) with `overlay` as a
+// source root, both as the reference is handed them; the overlay directory is removed afterwards.
+private emit_own_against(library: Option[string], overlay: Option[string]) -> Result[Emitted, Failure]
+    pin_std_root(library)
+
+    overlay match
+        Some(root) -> add_lib_root(root)
+        None -> ()
+
+    val out = emit_llvm_text(".", None)
+
+    pin_std_root(None)
+    reset_search_paths()
+
+    overlay match
+        Some(root) -> remove_dir_all(root).unwrap_or(())
+        None -> ()
+
+    out
+end emit_own_against
+
+@test("a pinned library root stands in for SYSL_LIB, and None puts it back")
+a_pinned_std_root_stands_in()
+    val before = std_root()
+    val dir = make_temp_dir("sysl-pin").unwrap()
+
+    pin_std_root(Some(dir))
+    assert_eq(std_root().unwrap_or(""), dir)
+    pin_std_root(None)
+
+    assert_eq(std_root().is_ok(), before.is_ok())
+    assert_eq(std_root().unwrap_or(""), before.unwrap_or(""))
+    remove_dir_all(dir).unwrap_or(())
 
 // The two texts, matched by symbol: what each defines alone, and what both define and disagree on.
 //
@@ -2181,7 +2605,7 @@ private census_over(theirs: string, ours: string, gaps: Buf[(string, string)],
                 val got = body
 
                 if want != got
-                    if confined.has(name)
+                    if confined.has(name) || receiver_confined_llvm(want, got, patched)
                         found.excused += 1
                     else if moved && renumbered_alone(want, got, their_strings, our_strings)
                         found.excused += 1
@@ -2479,6 +2903,147 @@ lpx_the_module_is_the_text_before_the_first_dollar()
     assert(!in_patched_module("sysl.buffer$Buf.push.int", listed))
     assert(!in_patched_module("arc.slotbuf.sysl.buf$Buf.int", listed))
     assert(!in_patched_module("main", listed))
+
+// A body calling `callee` with `receiver` (a list item at column 6) and a second argument `arg`.
+private lpx_call(callee: string, receiver: string, arg: string) -> string =
+    "TExprStmt\n  expr: TCall\n    name: \"" + callee + "\"\n    args: \n" + receiver + arg +
+    "    ty: unit\n    results: false\n"
+
+private lpx_by_address(name: string) -> string =
+    "      - TAddrOf\n          place: TLoad\n            name: \"" + name + "\"\n" +
+    "            ty: sysl.buf.Buf[int]\n          ty: *sysl.buf.Buf[int]\n"
+
+private lpx_by_value(name: string) -> string =
+    "      - TLoad\n          name: \"" + name + "\"\n          ty: sysl.buf.Buf[int]\n"
+
+private lpx_through(name: string) -> string =
+    "      - TDeref\n          operand: TLoad\n            name: \"" + name + "\"\n" +
+    "            ty: *sysl.buf.Buf[int]\n          ty: sysl.buf.Buf[int]\n"
+
+private lpx_pointer(name: string) -> string =
+    "      - TLoad\n          name: \"" + name + "\"\n          ty: *sysl.buf.Buf[int]\n"
+
+private lpx_n() -> string = "      - TLoad\n          name: \"n\"\n          ty: int\n"
+
+@test("library patches: a receiver handed by address there and by value here is excused")
+lpx_a_receiver_mode_at_a_listed_call_is_excused()
+    val push = "sysl.buf$Buf.push.int"
+
+    assert(receiver_confined(lpx_call(push, lpx_by_address("b"), lpx_n()),
+                             lpx_call(push, lpx_by_value("b"), lpx_n()), lpx_listed()))
+    assert(receiver_confined(lpx_call(push, lpx_pointer("p"), lpx_n()),
+                             lpx_call(push, lpx_through("p"), lpx_n()), lpx_listed()))
+
+@test("library patches: a receiver's mode is excused only at a listed call, and nothing else is")
+lpx_a_receiver_mode_elsewhere_still_fails()
+    val push = "sysl.buf$Buf.push.int"
+
+    // An unlisted callee, or nothing listed.
+    assert(!receiver_confined(lpx_call("sysl.buffer$Buf.push.int", lpx_by_address("b"), lpx_n()),
+                              lpx_call("sysl.buffer$Buf.push.int", lpx_by_value("b"), lpx_n()),
+                              lpx_listed()))
+    assert(!receiver_confined(lpx_call(push, lpx_by_address("b"), lpx_n()),
+                              lpx_call(push, lpx_by_value("b"), lpx_n()), buf()))
+
+    // A different place under the step, and a step at an argument that is not the receiver.
+    assert(!receiver_confined(lpx_call(push, lpx_by_address("b"), lpx_n()),
+                              lpx_call(push, lpx_by_value("c"), lpx_n()), lpx_listed()))
+    assert(!receiver_confined(lpx_call(push, lpx_by_value("b"), lpx_by_address("n")),
+                              lpx_call(push, lpx_by_value("b"), lpx_by_value("n")), lpx_listed()))
+
+    // Any other difference in the body.
+    assert(!receiver_confined(lpx_call(push, lpx_by_address("b"), lpx_n()),
+                              replace_all(lpx_call(push, lpx_by_value("b"), lpx_n()), "unit", "int"),
+                              lpx_listed()))
+
+// The shape memory.md's block 40 leaves in `@main`: the reference passes the place, this compiler
+// loads the handle and passes it, and every register after the load is one higher.
+private lpx_by_address_ll(callee: string, tail: string) -> string =
+    "define i32 @main() {\nentry:\n  %t0 = alloca i64\n" +
+    "  call void @" + callee + "(ptr %xs.addr, i64 1)\n  %t1 = load i64, ptr %t0\n" + tail + "}"
+
+private lpx_by_value_ll(callee: string, tail: string) -> string =
+    "define i32 @main() {\nentry:\n  %t0 = alloca i64\n" +
+    "  %t1 = load %struct.sysl.buf$Buf.int, ptr %xs.addr\n" +
+    "  call void @" + callee + "(%struct.sysl.buf$Buf.int %t1, i64 1)\n  %t2 = load i64, ptr %t0\n" +
+    replace_all(tail, "%t1", "%t2") + "}"
+
+@test("library patches: an LLVM receiver loaded and passed here, addressed there, is excused")
+lpx_an_llvm_receiver_is_excused()
+    val push = "sysl.buf$Buf.push.int"
+    val tail = "  ret i32 0\n"
+
+    assert(receiver_confined_llvm(lpx_by_address_ll(push, tail), lpx_by_value_ll(push, tail), lpx_listed()))
+
+    // Through a pointer: the reference passes the pointer it loaded, this compiler loads through it.
+    val theirs = "  %t0 = load ptr, ptr %p.addr\n  call void @" + push + "(ptr %t0, i64 1)\n  ret void"
+    val ours = "  %t0 = load ptr, ptr %p.addr\n  %t1 = load %struct.sysl.buf$Buf.int, ptr %t0\n" +
+               "  call void @" + push + "(%struct.sysl.buf$Buf.int %t1, i64 1)\n  ret void"
+
+    assert(receiver_confined_llvm(theirs, ours, lpx_listed()))
+
+@test("library patches: an LLVM body differing other than at a listed receiver still fails")
+lpx_an_llvm_body_elsewhere_still_fails()
+    val push = "sysl.buf$Buf.push.int"
+    val tail = "  ret i32 0\n"
+
+    // An unlisted callee, nothing listed, a different place, and another instruction changed.
+    val other = "sysl.buffer$Buf.push.int"
+
+    assert(!receiver_confined_llvm(lpx_by_address_ll(other, tail), lpx_by_value_ll(other, tail), lpx_listed()))
+    assert(!receiver_confined_llvm(lpx_by_address_ll(push, tail), lpx_by_value_ll(push, tail), buf()))
+    assert(!receiver_confined_llvm(lpx_by_address_ll(push, tail),
+                                   replace_all(lpx_by_value_ll(push, tail), "ptr %xs.addr", "ptr %ys.addr"),
+                                   lpx_listed()))
+    assert(!receiver_confined_llvm(lpx_by_address_ll(push, tail), lpx_by_value_ll(push, "  ret i32 1\n"),
+                                   lpx_listed()))
+
+    // A loaded handle that is read again is not a receiver handed over, and renumbering alone is not
+    // a rewrite.
+    val again = replace_all(lpx_by_value_ll(push, tail), "  ret i32 0\n",
+                            "  call void @g(%struct.sysl.buf$Buf.int %t1)\n  ret i32 0\n")
+
+    assert(!receiver_confined_llvm(lpx_by_address_ll(push, tail), again, lpx_listed()))
+    assert(!receiver_confined_llvm("  %t1 = add i64 1, 2\n", "  %t7 = add i64 1, 2\n", lpx_listed()))
+
+@test("library patches: a type holding a listed type by value is excused, and no other")
+lpx_a_holder_type_is_excused()
+    var theirs: Buf[string] = buf()
+    var ours: Buf[string] = buf()
+
+    theirs.push("%struct.sysl.buf$Buf.Json = type { { ptr, ptr, i64 }, i64 }")
+    theirs.push("%Json.Arr = type { %struct.sysl.buf$Buf.Json }")
+    theirs.push("%enum.Json = type { i32, [4 x i64] }")
+    theirs.push("%struct.Plain = type { i64, i64 }")
+    ours.push("%struct.sysl.buf$BufCore.Json = type { { ptr, ptr, i64 }, i64 }")
+    ours.push("%struct.sysl.buf$Buf.Json = type { ptr }")
+    ours.push("%Json.Arr = type { %struct.sysl.buf$Buf.Json }")
+    ours.push("%enum.Json = type { i32, [1 x i64] }")
+    ours.push("%struct.Plain = type { i64, i64 }")
+
+    val holding = holders_on_both(theirs, ours, lpx_listed())
+
+    assert(holding.has("%enum.Json"))
+    assert(holding.has("%Json.Arr"))
+    assert(!holding.has("%struct.Plain"))
+    assert(first_difference(types_outside(theirs, lpx_listed(), holding),
+                            types_outside(ours, lpx_listed(), holding)).is_none())
+
+    // A type holding nothing listed whose layout moved still fails, and nothing listed holds nothing.
+    ours.push("%struct.Other = type { i32 }")
+    theirs.push("%struct.Other = type { i64 }")
+
+    assert(first_difference(types_outside(theirs, lpx_listed(), holding),
+                            types_outside(ours, lpx_listed(), holding)).is_some())
+    assert(holders_on_both(theirs, ours, buf()).is_empty())
+
+@test("library patches: an ownership helper is confined by its type's module, and no other")
+lpx_a_helper_of_a_listed_type_is_confined()
+    assert(helper_of_patched_type("arc.copy.sysl.buf$Buf.Json", lpx_listed()))
+    assert(helper_of_patched_type("arc.dispose.sysl.buf$Buf.sysl.regex$Match", lpx_listed()))
+    assert(!helper_of_patched_type("arc.copy.Json", lpx_listed()))
+    assert(!helper_of_patched_type("arc.copy.sysl.buffer$Buf.Json", lpx_listed()))
+    assert(!helper_of_patched_type("main.sysl.buf$Buf.Json", lpx_listed()))
 
 @test("library patches: the listed modules are read from the file, comments and blank lines aside")
 lpx_the_modules_are_read_from_the_file()
