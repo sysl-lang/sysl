@@ -110,6 +110,29 @@ clx_wrote_is_on_stderr()
     remove_dir_all(root).unwrap_or(())
 end clx_wrote_is_on_stderr
 
+// `build-c`'s two paths and its link advice are what a C project's build script reads off standard
+// error (slate's `embed-check.sh` does), so they go there and standard output stays empty -- as
+// `getting-started/cli.md` says and the reference does. 0.1.0-alpha.4 wrote all three to stdout.
+@test("what build-c wrote and what to link it against are said on standard error")
+clx_build_c_advice_is_on_stderr()
+    if !clx_ready() then return
+
+    val root = clx_project("@export(\"twice\")\ntwice(n: int) -> int = n * 2\n")
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "-o", s"$root/libx.a"])
+
+    assert_eq(code, Fine, err)
+    assert_eq(out, "")
+    assert_eq(err, s"wrote $root/libx.a\nwrote $root/libx.a.h\nsysl: link this against: m")
+
+    clx_oracle_streams(["build-c", root, "-o", s"$root/liby.a"]) match
+        None -> ()
+        Some((theirs, their_err)) ->
+            assert_eq(theirs, "")
+            assert_eq(their_err, s"wrote $root/liby.a\nwrote $root/liby.a.h\nsysl: link this against: m\n")
+
+    remove_dir_all(root).unwrap_or(())
+end clx_build_c_advice_is_on_stderr
+
 @test("a command line missing its path is answered with the usage, on standard error")
 clx_a_misuse_is_on_stderr()
     for command in ["build", "run", "test", "emit-llvm", "emit-ast", "build-c", "emit-header", "build-lib"]
