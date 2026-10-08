@@ -469,6 +469,53 @@ var b: Buf[int]
 Buf[int] has no zero value, so 'b' needs an initial value
 ```
 
+### In storage the program zeroed itself, a `Buf` is empty until it is assigned
+
+The refusal is about a *declaration*. A program can still lay a `Buf` in memory the language did not
+initialise — a `calloc`ed block, a garbage collector's arena, a struct of an interpreter's objects
+reached through a `*T` — and there the handle names no buffer at all. **That handle is an empty
+buffer**: `len()` is 0, `view()` is empty, `for` visits nothing, `at` reports the index past the end,
+and assigning into it gives back nothing, so `p.items = buf()` is how it gets storage. What it cannot
+do is grow where it stands: `push`, `extend` and `insert` take the handle by value and have nowhere to
+put a buffer they made, so they panic, naming the fix, rather than adding to nothing.
+
+**`release()` is the way back to that state without allocating**, and it is what a finalizer for
+such storage calls: it gives back this name's share — the elements go when the last name does — and
+leaves the handle naming nothing. Assigning `buf()` there instead would give the old buffer back too,
+but make a fresh one that is lost the moment the storage is freed.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+extern "calloc" c_calloc(n: usize, size: usize) -> *u8
+extern "free" c_free(p: *u8)
+
+struct Obj
+    items: Buf[int]
+
+val o: *Obj = ptr_cast(c_calloc(1, sizeof(Obj)))
+
+print(o.items.len(), o.items.view())
+
+o.items = buf()
+o.items.push(7)
+print(o.items.count, o.items)
+
+o.items.release()
+print(o.items.len())
+
+c_free(ptr_cast(o))
+```
+
+```output
+0 []
+1 [7]
+0
+```
+
+`Map`, `Deque`, `Set` and `Heap` behave the same way and each has its own `release()`
+([containers](/library/container/)).
+
 ## Capacity, and what it costs
 
 ```sysl

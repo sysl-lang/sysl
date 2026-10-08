@@ -1,0 +1,205 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A counted handle in storage the program zeroed itself -- a `calloc`ed block, a collector's arena --
+// names nothing until it is assigned. A container is such a handle (`Buf`, `Map`, `Deque` each hold
+// one counted reference to their core), so a struct of containers laid in zeroed memory is a struct of
+// null references. Assigning into one gives back the previous occupant, and giving back a share of
+// nothing has to be nothing, as a string's null owner already is; the containers read as empty there
+// and refuse, in words, to grow. Each program runs unoptimized and at the default level.
+
+// What a one-file program prints, built at `level` and run, with how it ended on the last line.
+private zsh_ran_at(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-zsh").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Signalled(n) -> s"${out.text}signal $n\n"
+            Exited(n) -> s"${out.text}exit $n\n"
+end zsh_ran_at
+
+private zsh_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+// The program prints `want` unoptimized and optimized alike.
+private zsh_both(text: string, want: string)
+    if !zsh_ready() then return
+
+    assert_eq(zsh_ran_at(text, "0"), want)
+    assert_eq(zsh_ran_at(text, DefaultOptimization), want)
+end zsh_both
+
+private zsh_calloc() -> string = raw"""
+    extern "calloc" c_calloc(n: usize, size: usize) -> *u8
+    extern "free" c_free(p: *u8)
+
+    struct Noisy
+        n: int
+
+    impl Drop for Noisy
+        drop(self)
+            print("drop", self.n)
+
+    """
+
+@test("assigning a Buf into a zeroed struct gives back the null it held rather than faulting")
+zsh_the_reduction_prints_both_lines()
+    zsh_both(raw"""
+        import sysl.buf.{Buf, buf}
+
+        extern "calloc" c_calloc(n: usize, size: usize) -> *u8
+
+        struct Holder
+            s: string
+            items: Buf[int]
+
+        val p: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))
+        p.s = "fine"
+        print(p.s)
+        p.items = buf()
+        print("printed")
+        """, "fine\nprinted\nexit 0\n")
+end zsh_the_reduction_prints_both_lines
+
+@test("every container in a zeroed struct reads as empty, takes an assignment, and releases")
+zsh_zeroed_containers_read_empty()
+    zsh_both(zsh_calloc() + raw"""
+        import sysl.buf.{Buf, buf}
+        import sysl.container.{Map, map, Deque, deque, Set, set, Heap}
+
+        struct Holder
+            b: Buf[int]
+            m: Map[string, int]
+            d: Deque[int]
+            s: Set[int]
+            h: Heap[int]
+
+        val p: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))
+        print(p.b.len(), p.b.count, p.b.view().len, p.b.pop(), p.b.copy().len())
+        print(p.m.len(), p.m.get("a"), p.m.has("a"), p.m.remove("a"))
+        print(p.d.len(), p.d.first(), p.d.pop_front())
+        print(p.s.len(), p.s.has(1), p.h.len(), p.h.peek(), p.h.pop())
+
+        for x in p.b
+            print("never", x)
+
+        for (k, v) in p.m
+            print("never", k)
+
+        p.b = buf()
+        p.b.push(1)
+        p.m = map()
+        p.m.put("a", 2)
+        p.d = deque()
+        p.d.push_back(3)
+        p.s = set()
+        p.s.add(4)
+        print(p.b, p.m.get("a"), p.d.at(0), p.s.has(4))
+        p.b.release()
+        p.m.release()
+        p.d.release()
+        p.s.release()
+        p.h.release()
+        print(p.b.len(), p.m.len(), p.d.len(), p.s.len(), p.h.len())
+        c_free(ptr_cast(p))
+        print("freed")
+        """, "0 0 0 None 0\n0 None false false\n0 None None\n0 false 0 None None\n" +
+             "[1] Some(2) 3 true\n0 0 0 0 0\nfreed\nexit 0\n")
+end zsh_zeroed_containers_read_empty
+
+@test("release in a finalizer lets go of the elements once, and the freed storage holds nothing")
+zsh_release_drops_the_elements_once()
+    zsh_both(zsh_calloc() + raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Obj
+            items: Buf[&Noisy]
+
+        val o: *Obj = ptr_cast(c_calloc(1, sizeof(Obj)))
+        o.items = buf()
+        o.items.push(Noisy(1))
+        o.items.push(Noisy(2))
+        print("finalize")
+        o.items.release()
+        print("released")
+        c_free(ptr_cast(o))
+        print("freed")
+        """, "finalize\ndrop 1\ndrop 2\nreleased\nfreed\nexit 0\n")
+end zsh_release_drops_the_elements_once
+
+@test("a zeroed struct of handles copied out and dropped gives back nothing")
+zsh_a_zeroed_struct_drops_safely()
+    zsh_both(zsh_calloc() + raw"""
+        import sysl.buf.Buf
+        import sysl.container.Map
+
+        struct Holder
+            b: Buf[int]
+            m: Map[string, int]
+            r: &Noisy
+
+        val p: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))
+
+        if true
+            val copy = *p
+            print(copy.b.len())
+
+        print("dropped")
+        """, "0\ndropped\nexit 0\n")
+end zsh_a_zeroed_struct_drops_safely
+
+@test("a plain reference field in zeroed storage takes its first assignment and gives back the second")
+zsh_a_reference_field_is_assigned()
+    zsh_both(zsh_calloc() + raw"""
+        struct Holder
+            r: &Noisy
+
+        val p: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))
+        p.r = Noisy(1)
+        print("first", p.r.n)
+        p.r = Noisy(2)
+        print("second", p.r.n)
+        """, "first 1\ndrop 1\nsecond 2\nexit 0\n")
+end zsh_a_reference_field_is_assigned
+
+@test("growing a container nobody gave storage panics, saying so, rather than faulting")
+zsh_growing_a_zeroed_container_panics()
+    if !zsh_ready() then return
+
+    val kinds = [("Buf", "import sysl.buf.Buf", "Buf[int]", "p.c.push(1)", "buf()"),
+                 ("Map", "import sysl.container.Map", "Map[int, int]", "p.c.put(1, 2)", "map()"),
+                 ("Deque", "import sysl.container.Deque", "Deque[int]", "p.c.push_front(1)", "deque()")]
+
+    for i in 0..<kinds.len
+        val k = kinds[i]
+        val text = s"${k.1}\n\nextern \"calloc\" c_calloc(n: usize, size: usize) -> *u8\n\nstruct Holder\n" +
+                   s"    c: ${k.2}\n\nval p: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))\n${k.3}\nprint(\"never\")\n"
+        val said = zsh_ran_at(text, DefaultOptimization)
+
+        assert(said.contains(s"panic: this ${k.0} was never given storage -- assign `${k.4}` to it first"), said)
+        assert(said.ends_with("exit 1\n") && !said.contains("never\n"), said)
+end zsh_growing_a_zeroed_container_panics

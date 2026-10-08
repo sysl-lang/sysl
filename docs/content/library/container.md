@@ -127,6 +127,41 @@ holds for `Deque`, `Set` and `Heap`.
 So **a map has no zero value**: a declaration says where its map comes from, `= map()`, and a struct
 holding one is built with one.
 
+**A container in storage the program zeroed itself is empty until it is assigned.** A `calloc`ed
+block or a collector's arena holds a handle naming nothing, and every container reads that as
+empty — `len()` 0, `get` and `first` `None`, `has` false, `for` visiting nothing — while assigning
+`map()`, `deque()` or `set()` into it gives it storage. Growing one in place (`put`, `push_back`,
+`push_front`, `add`) panics, saying to assign it first. **To empty one in a finalizer without
+allocating, call `release()`**: it gives back this name's share and leaves the handle naming nothing,
+where assigning a fresh `map()` would make a table nobody will free.
+
+```sysl
+import sysl.container.{Map, map, Deque, deque}
+
+extern "calloc" c_calloc(n: usize, size: usize) -> *u8
+
+struct Scope
+    names: Map[string, int]
+    pending: Deque[int]
+
+val s: *Scope = ptr_cast(c_calloc(1, sizeof(Scope)))
+
+print(s.names.len(), s.names.get("x"), s.pending.pop_front())
+
+s.names = map()
+s.names.put("x", 1)
+print(s.names.get("x"))
+
+s.names.release()
+print(s.names.len())
+```
+
+```output
+0 None None
+Some(1)
+0
+```
+
 **An empty map holds no table at all.** `map()` allocates only the small cell every name for the map
 shares — three words, whatever the key and value — and the first `put` makes the table. That matters
 far more than it looks, because no caller can see that they are paying: a map built inside a loop,
