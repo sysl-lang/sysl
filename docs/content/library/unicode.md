@@ -34,8 +34,10 @@ so a character the database has no mapping for comes back as itself and a whole 
 through it without asking first.
 
 The one that surprises people is `ß`. Most languages uppercase it to `SS`, which is *full* casing and
-is two characters; the simple mapping has one to give and gives `ẞ`, the capital sharp s, which
-round-trips back.
+is two characters; the simple mapping has no uppercase for it at all, so it comes back as itself. The
+capital sharp s `ẞ` lowercases to `ß`, but the database does not map the other way — simple case
+mapping is not symmetric, and the Kelvin sign lowercasing to a `k` that uppercases to `K` is the same
+shape.
 
 ```sysl
 import sysl.unicode.{to_upper, to_lower, fold}
@@ -45,7 +47,7 @@ print(fold("Straße"), fold("ﬁt"))
 ```
 
 ```output
-ẞ ß
+ß ß
 strasse fit
 ```
 

@@ -15,7 +15,7 @@ and after characters.
 
 **What is here is the encoding and what is the character database is `sysl.unicode`.** This module
 knows that UTF-8 says where a character begins and what `Ascii` makes of a byte; it does not know
-that `ß` upper-cases to `ẞ`, and it is the other module that does.
+that `ẞ` lower-cases to `ß`, and it is the other module that does.
 
 ## Index
 
@@ -579,8 +579,8 @@ operation a caller comparing two strings wanted anyway. *Locale-sensitive* casin
 of locale this library does not have.
 
 **`ß` is the one worth knowing before calling this.** Most languages uppercase it to `SS`, which
-is full casing and two characters; the simple mapping has one to give and gives `ẞ`, the capital
-sharp s, which lowercases back. `sysl.unicode.to_upper` carries the detail.
+is full casing and two characters; the simple mapping has none, so `to_upper("straße")` is
+`STRAßE`. `sysl.unicode.to_upper` carries the detail.
 
 **A program that never calls this links no table.** The database is 330 KB and `sysl.text` is not
 optional -- it is what places a diagnostic's caret -- so the two facts have to be stated together

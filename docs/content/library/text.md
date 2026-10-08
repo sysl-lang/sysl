@@ -620,8 +620,8 @@ Kelvin sign lowercases to a plain `k` — so two identifiers that were not equal
 either is lowered.
 
 **What is still true is the shape of the mapping.** It is the *simple* one, character for character,
-so `ß` uppercases to the capital sharp s `ẞ` rather than to `SS` — the full casing most languages
-answer with. A caller who wanted `SS` was comparing two strings, and
+so `ß`, which has no simple uppercase, stays `ß` rather than becoming `SS` — the full casing most
+languages answer with. A caller who wanted `SS` was comparing two strings, and
 [`fold`](/library/unicode/#case-mapping-is-a-character-at-a-time-and-folding-is-not) is that
 operation. *Locale-sensitive* casing — Turkish dotless `ı` — still needs a notion of locale the
 library does not have.
