@@ -2,6 +2,9 @@ module sysl.env
 @requires(os)
 @tests
 
+import sysl.slices.as_mut_ptr
+import sysl.text.cstring
+
 // What `sysl.env` claims, asserted against whatever environment the suite happens to run in.
 //
 // **Nothing here may assume a particular value**, since this tree is compiled and run on a
@@ -43,3 +46,32 @@ env_reaches_the_process()
     // absence. This is the one that fails if `getenv` is never actually reached: `PATH` is set for
     // every process either of the machines that run this suite can start.
     assert(is_set("PATH"), "PATH is unset, so either this environment is bare or getenv is not being reached")
+
+@test("every variable vars lists is one get answers with the same value, and PATH is among them")
+env_vars_agree_with_get()
+    // `getenv` and `environ` are two readings of one environment, so each pair has to be what the
+    // other reading says -- whatever this machine's environment holds.
+    val all = vars()
+    var saw_path = false
+
+    for (name, value) in all
+        assert_eq(get(name), Some(value))
+        if name == "PATH" then saw_path = true
+
+    assert(saw_path, "vars() did not list PATH, which is set for every process this suite runs in")
+end env_vars_agree_with_get
+
+// An entry with no `=`, a value holding one, an empty value and bytes that are not UTF-8 cannot be
+// put into this process's environment without `setenv`, which the library does not offer, so the
+// splitting is asked about directly.
+@test("an entry splits at its first =, keeps an empty value, and skips no = or bytes that are not text")
+env_entry_splits()
+    assert_eq(entry(cstring("A=b=c").ptr), Some(("A", "b=c")))
+    assert_eq(entry(cstring("EMPTY=").ptr), Some(("EMPTY", "")))
+    assert_eq(entry(cstring("=v").ptr), Some(("", "v")))
+    assert(entry(cstring("NOEQUALS").ptr) == None, "an entry with no '=' was read as a variable")
+
+    var bad: [5]u8 = [u8('A'), u8('='), 255, u8('x'), 0]
+
+    assert(entry(as_mut_ptr(bad[..])) == None, "a value that is not UTF-8 was read as text")
+end env_entry_splits

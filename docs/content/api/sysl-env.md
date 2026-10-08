@@ -17,6 +17,11 @@ It asks for `os` rather than `posix`, which is the weaker of the two and the tru
 ISO C rather than a POSIX addition, so any target with a C library and a process environment can
 answer it.
 
+**`vars` is the exception, and carries `@needs(posix)` on its own.** Listing every variable needs
+`environ`, which POSIX declares and ISO C does not, so the module as a whole stays at `os` and only
+a caller of `vars` is asked for `posix` -- `get` keeps working on a target with a C library and no
+POSIX.
+
 ## Reading only
 
 **Nothing here sets a variable, and that is a decision rather than an omission.** `setenv` mutates
@@ -36,7 +41,7 @@ by being **present**, whatever it contains, so `NO_COLOR=0` means no colour and 
 
 ## Index
 
-[`get`](#get) [`get_or`](#get_or) [`is_set`](#is_set)
+[`get`](#get) [`get_or`](#get_or) [`is_set`](#is_set) [`vars`](#vars)
 
 ## Functions
 
@@ -75,3 +80,23 @@ Whether a name is present at all, whatever it holds.
 **Set-to-empty answers `true` here and `Some("")` from `get`**, which is what makes the two
 functions worth having separately: `VAR=` is a name that is set, and a convention reading presence
 rather than content is entitled to say so.
+
+### `vars`
+
+```sysl
+vars() -> Buf[(string, string)]
+```
+
+Every variable in the environment, as `(name, value)` pairs, in the order the process holds them.
+
+**It is the one function here that needs `posix`**, the rest of the module being ISO C: C can
+answer what one name is set to, and only POSIX's `environ` can say which names there are. A module
+that has given up `posix` is refused at the call rather than at the link.
+
+**The value is everything after the FIRST `=`**, so `A=b=c` is `("A", "b=c")` -- a name cannot hold
+an `=` and a value can. `VAR=` is kept as `("VAR", "")`, set-to-empty being a variable that is set,
+as `is_set` says. An entry with no `=` at all names nothing and is passed over, and so is one whose
+name or value is not UTF-8, which is `get`'s answer to the same bytes.
+
+**Both halves are copied out**: what `environ` points at is the process's own storage, and a later
+`setenv` from C may move or free it, so nothing returned here is a view of it.

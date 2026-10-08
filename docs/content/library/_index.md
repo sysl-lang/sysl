@@ -43,7 +43,7 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 | [`sysl.time`](/library/time/) | `Instant` and `Duration` — with `5.ms` and `5.hours` on any integer — the civil calendar — `LocalDate`, `LocalTime`, `LocalDateTime`, `Offset` — the fixed-offset conversions, `resolve` for a zone whose clocks move, and the ISO 8601 renderers and parsers — and [`now`/`monotonic`](/library/time/#the-portable-spelling-sysl-time-now), which read a clock the linker supplies rather than one this module knows about | — |
 | [`sysl.time.tzif`](/library/time/#decoding-a-zone) | a zone decoded from the bytes of a TZif file — no copy, no allocator, and no filesystem | — |
 | [`sysl.posix.time`](/library/time/#reading-a-clock-sysl-posix-time) | the two clocks the host keeps — `now` for a wall reading, `monotonic` for measuring — the zone it is set to, and the zone database by name | `posix` |
-| [`sysl.env`](/library/env/) | the environment a program was started with — `get`, `get_or`, `is_set`. Reading only | `os` |
+| [`sysl.env`](/library/env/) | the environment a program was started with — `get`, `get_or`, `is_set`, and `vars` to list it. Reading only | `os` (`vars`: `posix`) |
 | [`sysl.process`](/library/process/) | starting another program and waiting for it — `run`, `capture`, `Status`, a timeout so a child that never ends cannot hold its caller, and no shell anywhere in it | `posix` |
 | [`sysl.posix.net`](/library/net/) | blocking TCP — `resolve`, `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `shutdown`, `close`, and a timeout so a blocking call cannot wait forever | `posix` |
 | [`sysl.sync`](/library/sync/) | `Atomic[T]`, `SpinLock`, and the five memory orderings | — |

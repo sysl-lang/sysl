@@ -2,8 +2,11 @@ module sysl.process
 @requires(posix)
 @tests
 
+import sysl.buf.{Buf, buf}
+import sysl.env.vars
 import sysl.fs.IoError
 import sysl.posix.time.{monotonic, sleep}
+import sysl.text.{Search, split}
 import sysl.time.{millis, whole_millis}
 
 // What the tests below ask the kernel directly, rather than the module: whether a pid still names a
@@ -448,3 +451,27 @@ cpu_count_agrees_with_getconf()
     val out = capture("getconf", ["_NPROCESSORS_ONLN"]).unwrap()
 
     assert_eq(out.text, f"${cpu_count()}\n")
+
+// `sysl.env.vars` is checked here rather than beside it, since `sysl.env` cannot import this module
+// (`sysl.process` reaches `sysl.env` through `sysl.fs`). `env -0` in a child that inherits this
+// process's environment prints it entry by entry, in `environ`'s own order, from outside the library.
+@test("sysl.env.vars lists what a child's env prints, in the same order")
+env_vars_match_env()
+    val out = capture("env", ["-0"]).unwrap()
+
+    assert(out.status.ok(), "env -0 did not exit cleanly")
+
+    var theirs: Buf[(string, string)] = buf()
+
+    for line in split(out.text, "\0")
+        line.index_of("=") match
+            Some(k) -> theirs.push((line[0..<k], line[k + 1..]))
+            None -> ()
+
+    val ours = vars()
+
+    assert_eq(ours.len(), theirs.len())
+
+    for i in 0..<ours.len()
+        assert_eq(ours[i], theirs[i])
+end env_vars_match_env

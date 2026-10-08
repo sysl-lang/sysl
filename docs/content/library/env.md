@@ -1,12 +1,12 @@
 ---
 title: The env module
-summary: "`sysl.env` — reading the environment a program was started with: `get`, `get_or`, `is_set`, and why nothing here writes one."
+summary: "`sysl.env` — reading the environment a program was started with: `get`, `get_or`, `is_set`, `vars`, and why nothing here writes one."
 weight: 72
 ---
 
 **Every declaration in `sysl.env`, with its signature:** [the generated API page](/api/sysl-env/#index). This page is the argument — what the module is for, and how its pieces fit; that one is the list.
 
-`sysl.env` reads the environment a program was started with. It is three functions and no state.
+`sysl.env` reads the environment a program was started with. It is four functions and no state.
 
 ```sysl
 import sysl.env.{get, get_or, is_set}
@@ -29,6 +29,43 @@ true
 It requires `os` — not `posix`. `getenv` is ISO C rather than a POSIX addition, so any target with a
 C library and a process environment can answer it, and filing it under the stronger capability would
 have made the module unreachable on a machine that has an operating system and is not POSIX.
+
+## Every variable at once
+
+`vars` lists the whole environment as `(name, value)` pairs, in the order the process holds them —
+what a program reporting its configuration, or a language runtime offering its own `env()`, needs
+and `get` cannot give, since `get` has to be told a name first.
+
+```sysl
+import sysl.env.{get, vars}
+
+val all = vars()
+
+// What this prints is the same on every machine, so the page asks a question rather than listing
+// somebody's environment: each pair is the one `get` answers for its name.
+var agree = true
+
+for (name, value) in all
+    if get(name) != Some(value) then agree = false
+
+print(all.len() > 0)
+print(agree)
+```
+
+```output
+true
+true
+```
+
+**It is the one function here that needs `posix`**, and carries `@needs(posix)` on its own: C can
+answer what one name is set to, and only POSIX's `environ` can say which names there are. The module
+stays at `os`, so `get` still works where there is a C library and no POSIX, and a caller of `vars` in
+a module that has given `posix` up is refused at the call.
+
+**The value is everything after the first `=`**, so `A=b=c` is `("A", "b=c")`; `VAR=` is kept as
+`("VAR", "")`, a set-to-empty variable being set. An entry with no `=` names nothing and is passed
+over, and so is one that is not UTF-8 — `get`'s answer to the same bytes. Both halves are copied out of
+`environ`, whose storage a later `setenv` from C may move.
 
 ## Unset, empty, and not text are three different answers
 
