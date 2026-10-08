@@ -1,0 +1,521 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{copy_dir_all, remove_dir_all, write_text}
+import sysl.text.Search
+
+// **`sysl build-lib` and `--lib`, through the command line** -- the reference's `LibraryBuildCliTests`
+// and `LibraryCliTests`, where they build a named artifact and hand it to a compilation. The artifact
+// is retired here by design (user, 2026-09-30): `build-lib` checks a root and writes nothing, and
+// `--lib` names a source root. So the library is handed over as its root, and each case asserts the
+// answer the reference's program gave -- what it prints, what it refuses, which name a C file is
+// archived under -- quoted from 0.0.162 run over the same trees as directory roots.
+
+private lfa_c_root(module_name: string, sysl: string, c_name: string, c_text: string) -> string =
+    lbr_tree(lbr_two(s"$module_name/lib.sysl", sysl, s"$module_name/$c_name", c_text))
+
+private lfa_shim() -> string = "int demo_seven(void) { return 7; }\n"
+
+private lfa_using_shim() -> string =
+    "module demo\n\nextern \"demo_seven\" c_seven() -> int\n\nseven_times(n: int) -> int = c_seven() * n\n"
+
+// `build-lib` over a root answers that it checked it, and nothing else.
+private lfa_checks(root: string, libs: []string)
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("build-lib")
+    args.push(root)
+
+    for l in libs
+        args.push("--lib")
+        args.push(l)
+
+    val got = lbr_cli(args.view())
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $root")
+end lfa_checks
+
+// Whether the walk that gathers a tree's C found this file.
+private lfa_carries(root: string, path: string) -> bool = c_sources(root, Some(host_target().os)) match
+    Err(_) -> false
+    Ok(found) -> holds_string(found, path)
+
+// -- a library built on another library --------------------------------------------------------------
+
+private lfa_extra() -> string = lfa_root("extra", "module extra\n\ntriple(n: int) -> int = n * 3\n")
+
+private lfa_sixfold() -> string =
+    lfa_root("skin", "module skin\n\nimport extra.triple\n\nsixfold(n: int) -> int = triple(triple(n))\n")
+
+// A `--lib` accepted and dropped refuses a bad path exactly as loudly while compiling every library
+// against nothing, so the refusal without it is what says the flag was used.
+@test("and cannot be built without it")
+lfa_a_dependent_cannot_be_built_without_its_root()
+    if !lbr_ready() then return
+
+    val skin = lfa_sixfold()
+    val got = lbr_cli(["sysl", "build-lib", skin])
+
+    assert_eq(got.0, Failed, got.1)
+    assert(got.1.starts_with("error: no module is called 'extra.triple', and nothing declares it\n" +
+                             s" --> $skin/skin/lib.sysl:3:1\n"), got.1)
+    lbr_drop([skin])
+end lfa_a_dependent_cannot_be_built_without_its_root
+
+@test("and a program links the pair and runs")
+lfa_a_program_links_the_pair()
+    if !lbr_ready() then return
+
+    val extra = lfa_extra()
+    val skin = lfa_sixfold()
+    val prog = lbr_program("print(skin.sixfold(2))\n")
+
+    lfa_checks(skin, [extra])
+    assert_eq(lbr_run(prog, [skin, extra]), "18\n")
+    lbr_drop([extra, skin, prog])
+end lfa_a_program_links_the_pair
+
+// -- a library carrying C ----------------------------------------------------------------------------
+
+// The directory is kept in the name, which is what makes it unique across the library.
+@test("is archived as a member of its own, named after where it was found")
+lfa_a_c_file_is_named_after_where_it_was_found()
+    if !lbr_ready() then return
+
+    val root = lfa_c_root("demo", lfa_using_shim(), "shim.c", lfa_shim())
+
+    assert(lfa_carries(root, s"$root/demo/shim.c"), "the shim is carried")
+    assert_eq(native_member(root, s"$root/demo/shim.c"), "demo.shim.o")
+    lfa_checks(root, [])
+    lbr_drop([root])
+end lfa_a_c_file_is_named_after_where_it_was_found
+
+// `demo$seven_times` is the library's and leaves `demo_seven` to the C beside it.
+@test("and a program calling through the library reaches it")
+lfa_a_program_reaches_the_librarys_c()
+    if !lbr_ready() then return
+
+    val root = lfa_c_root("demo", lfa_using_shim(), "shim.c", lfa_shim())
+    val prog = lbr_program("print(demo.seven_times(3))\n")
+
+    assert_eq(lbr_run(prog, [root]), "21\n")
+    lbr_drop([root, prog])
+end lfa_a_program_reaches_the_librarys_c
+
+private lfa_regex_shim() -> string =
+    "#include <regex.h>\n#include <stdlib.h>\n\n" +
+    "void *demo_regex_new(void) { return malloc(sizeof(regex_t)); }\n\n" +
+    "int demo_regex_compile(void *re, const char *pattern) {\n" +
+    "    return regcomp((regex_t *)re, pattern, REG_EXTENDED);\n}\n\n" +
+    "int demo_regex_matches(void *re, const char *s) {\n" +
+    "    return regexec((regex_t *)re, s, 0, NULL, 0) == 0;\n}\n\n" +
+    "void demo_regex_free(void *re) {\n    regfree((regex_t *)re);\n    free(re);\n}\n"
+
+// `regex_t`'s size is known only to the target's headers, and `REG_EXTENDED` is a `#define`: the
+// shim holds both, and the sysl side never learns either. A match and a non-match of one pattern.
+@test("which is what makes a caller-allocated C type bindable")
+lfa_a_caller_allocated_type_is_bindable()
+    if !lbr_ready() then return
+
+    val binding = "module rx\n\nextern \"demo_regex_new\" regex_new() -> *u8\n" +
+        "extern \"demo_regex_compile\" regex_compile(re: *u8, pattern: *u8) -> int\n" +
+        "extern \"demo_regex_matches\" regex_matches(re: *u8, s: *u8) -> int\n" +
+        "extern \"demo_regex_free\" regex_free(re: *u8)\n"
+    val root = lfa_c_root("rx", binding, "regex.c", lfa_regex_shim())
+    val prog = lbr_program("var re = rx.regex_new()\nprint(rx.regex_compile(re, c\"^a+b$\") == 0)\n" +
+        "print(rx.regex_matches(re, c\"aaab\") == 1)\nprint(rx.regex_matches(re, c\"xyz\") == 1)\n" +
+        "rx.regex_free(re)\n")
+
+    assert_eq(lbr_run(prog, [root]), "true\ntrue\nfalse\n")
+    lbr_drop([root, prog])
+end lfa_a_caller_allocated_type_is_bindable
+
+// The root is the one place that is not a module's directory, and the member takes the bare name.
+@test("is found at the root of the tree as well as beside a module")
+lfa_c_at_the_root_is_found()
+    if !lbr_ready() then return
+
+    val root = lbr_tree(lbr_two("demo/lib.sysl",
+        "module demo\n\nextern \"demo_root\" c_root() -> int\n\nfrom_root() -> int = c_root()\n",
+        "shared.c", "int demo_root(void) { return 13; }\n"))
+    val prog = lbr_program("print(demo.from_root())\n")
+
+    assert(lfa_carries(root, s"$root/shared.c"), "the root's C is carried")
+    assert_eq(native_member(root, s"$root/shared.c"), "shared.o")
+    assert_eq(lbr_run(prog, [root]), "13\n")
+    lbr_drop([root, prog])
+end lfa_c_at_the_root_is_found
+
+// `ar r` replaces by name, so a basename alone would have the second silently evict the first.
+@test("and two modules may each hold a file of the same name")
+lfa_two_modules_may_hold_one_file_name()
+    if !lbr_ready() then return
+
+    var files = lbr_two("one/lib.sysl", "module one\n\nextern \"one_util\" util() -> int\n",
+                        "one/util.c", "int one_util(void) { return 1; }\n")
+
+    files.push(("two/lib.sysl", "module two\n\nextern \"two_util\" util() -> int\n"))
+    files.push(("two/util.c", "int two_util(void) { return 2; }\n"))
+
+    val root = lbr_tree(files)
+    val prog = lbr_program("print(one.util() + two.util())\n")
+    var carried: Buf[string] = buf()
+
+    carried.push(s"$root/one/util.c")
+    carried.push(s"$root/two/util.c")
+    assert_eq(native_member(root, carried.at(0)), "one.util.o")
+    assert_eq(native_member(root, carried.at(1)), "two.util.o")
+    assert(member_collision(root, carried).is_none(), "the two were taken for one member")
+    lfa_checks(root, [])
+    assert_eq(lbr_run(prog, [root]), "3\n")
+    lbr_drop([root, prog])
+end lfa_two_modules_may_hold_one_file_name
+
+// Archived, the stray C would have taken `sysl.code.o` and evicted the compiled half; a program
+// running off the library says it did not.
+@test("while a C file in a directory that declares no module is skipped rather than archived")
+lfa_c_beside_no_module_is_skipped()
+    if !lbr_ready() then return
+
+    val root = lbr_tree(lbr_two("demo/lib.sysl", "module demo\n\ndouble(n: int) -> int = n * 2\n\n" +
+                                "larger[T: Ord](a: T, b: T) -> T = if a < b then b else a\n",
+                                "sysl/code.c", "int f(void) { return 0; }\n"))
+    val prog = lbr_program("print(demo.double(21))\n")
+
+    assert(!lfa_carries(root, s"$root/sysl/code.c"), "the stray C was carried")
+    lfa_checks(root, [])
+    assert_eq(lbr_run(prog, [root]), "42\n")
+    lbr_drop([root, prog])
+end lfa_c_beside_no_module_is_skipped
+
+private lfa_probe_shim() -> string =
+    "#include <regex.h>\n#include <stdlib.h>\n\n" +
+    "void *probe_rx_new(void) { return calloc(1, sizeof(regex_t)); }\n\n" +
+    "void probe_rx_free(void *re) {\n    if (re) { regfree((regex_t *)re); free(re); }\n}\n\n" +
+    "int probe_rx_compile(void *re, const char *pattern) {\n" +
+    "    return regcomp((regex_t *)re, pattern, REG_EXTENDED);\n}\n\n" +
+    "int probe_rx_exec(void *re, const char *s, long *so, long *eo) {\n    regmatch_t m;\n\n" +
+    "    if (regexec((regex_t *)re, s, 1, &m, 0) != 0) return 0;\n\n" +
+    "    *so = (long)m.rm_so;\n    *eo = (long)m.rm_eo;\n\n    return 1;\n}\n\n" +
+    "void probe_rx_error(void *re, int code, char *buf, unsigned long n) {\n" +
+    "    regerror(code, (regex_t *)re, buf, (size_t)n);\n}\n"
+
+private lfa_probe_binding() -> string =
+    "module rx\n\nimport sysl.text.{cstring, from_cstring}\n\n" +
+    "extern \"probe_rx_new\" c_new() -> *u8\nextern \"probe_rx_free\" c_free(re: *u8)\n" +
+    "extern \"probe_rx_compile\" c_compile(re: *u8, pattern: *u8) -> int\n" +
+    "extern \"probe_rx_exec\" c_exec(re: *u8, s: *u8, so: *i64, eo: *i64) -> int\n" +
+    "extern \"probe_rx_error\" c_error(re: *u8, code: int, buf: *u8, n: u64)\n\n" +
+    "struct Match\n    start: usize\n    end: usize\n\nstruct Regex\n    handle: *u8\n\n" +
+    "    find(self, s: string) -> Option[Match]\n        val subject = cstring(s)\n\n" +
+    "        var so: i64 = 0i64\n        var eo: i64 = 0i64\n\n" +
+    "        if c_exec(self.handle, subject.ptr, &so, &eo) == 1 then\n" +
+    "            Some(Match(usize(so), usize(eo)))\n        else\n            None\n    end find\n\n" +
+    "    free(self) = c_free(self.handle)\nend Regex\n\n" +
+    "compile(pattern: string) -> Result[Regex, string]\n    val re   = c_new()\n" +
+    "    val p    = cstring(pattern)\n    val code = c_compile(re, p.ptr)\n\n" +
+    "    if code == 0 then\n        Ok(Regex(re))\n    else\n        var buf: [256]u8\n\n" +
+    "        c_error(re, code, &buf[0], 256u64)\n        c_free(re)\n" +
+    "        Err(from_cstring(&buf[0]).unwrap_or(\"not a pattern\"))\nend compile\n"
+
+private lfa_probe_program() -> string =
+    "import rx.*\n\nshow(pat: string, s: string) =\n    compile(pat) match\n        Ok(re) ->\n" +
+    "            re.find(s) match\n                Some(m) -> print(f\"${m.start}..${m.end}\")\n" +
+    "                None -> print(\"none\")\n            re.free()\n\n" +
+    "        Err(why) -> print(f\"error: ${why}\")\n\n" +
+    "show(\"[0-9]+\", \"abc123def\")\nshow(\"cat|dog\", \"hotdog stand\")\nshow(\"a{2,3}\", \"aaaa\")\n" +
+    "show(\"^abc$\", \"xabcx\")\nshow(\"^abc$\", \"abc\")\nshow(\"[^aeiou]+\", \"aeixyzou\")\n" +
+    "show(\"ABC\", \"xxabcxx\")\nshow(\"(ab)+\", \"zzababab!!\")\nshow(\"x*\", \"yyy\")\n" +
+    "show(\"a{3,1}\", \"aaa\")\n"
+
+// Every case is chosen so only real POSIX matching gives the number: a match mid-string, a bounded
+// repeat stopping at its ceiling, an anchor refusing, a negated class, case, a quantified group, an
+// empty match. The bad pattern's message is the C library's own, so only its presence is pinned.
+@test("and the binding it makes possible really matches, at offsets nothing could have guessed")
+lfa_the_binding_matches_at_real_offsets()
+    if !lbr_ready() then return
+
+    val root = lfa_c_root("rx", lfa_probe_binding(), "regex.c", lfa_probe_shim())
+    val prog = lbr_program(lfa_probe_program())
+    val said = lbr_run(prog, [root])
+    val lines = lines_of(said)
+
+    assert_eq(lines.len(), 10)
+    assert(said.starts_with("3..6\n3..6\n0..3\nnone\n0..3\n3..6\nnone\n2..8\n0..0\nerror: "), said)
+    assert(lines.at(9).bytes.len > "error: ".bytes.len, said)
+    lbr_drop([root, prog])
+end lfa_the_binding_matches_at_real_offsets
+
+// -- a closure written inside a generic, which nothing in the library instantiates --------------------
+
+// The abstract closure is the only copy there is in a library, and it must not reach a back end.
+@test("is dropped rather than reaching a backend that has no layout for its type parameter")
+lfa_a_closure_inside_an_uninstantiated_generic_is_dropped()
+    if !lbr_ready() then return
+
+    val root = lfa_root("cmp", "module cmp\n\n" +
+        "sorted[T: Ord](xs: []const T) -> bool = sorted_by(xs, (a, b) -> a < b)\n\n" +
+        "sorted_by[T](xs: []const T, lt: (T, T) -> bool) -> bool\n    for i in 1..<xs.len\n" +
+        "        if lt(xs[i], xs[i - 1]) then return false\n\n    true\n")
+
+    lfa_checks(root, [])
+    assert(lfa_half(root, [], host_target()).is_ok(), "the half was refused")
+    lbr_drop([root])
+end lfa_a_closure_inside_an_uninstantiated_generic_is_dropped
+
+// -- build-lib --std -----------------------------------------------------------------------------------
+
+// A name keyed under a module other than the library's -- not a member of a built-in type, which names
+// none, and not a blanket implementation's `bound.<trait>`.
+private lfa_keyed_elsewhere(name: string) -> bool
+    if name.starts_with("bound.") then return false
+
+    name.index_of("$") match
+        None -> false
+        Some(at) ->
+            val m = name[0..<at]
+
+            m != "sysl" && !m.starts_with("sysl.")
+end lfa_keyed_elsewhere
+
+// Every symbol is one of the library's own modules', a built-in type's member is the library's too,
+// a closure's key is never here, and more than one module contributed.
+@test("builds the standard module, which nothing else may declare")
+lfa_the_standard_module_builds()
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    var modules: Buf[string] = buf()
+
+    assert(!half.advertised.is_empty(), "nothing advertised")
+    assert(holds_string(half.advertised, "char.is_digit"), "char.is_digit is not advertised")
+
+    for i in 0..<half.advertised.len()
+        val name = half.advertised.at(i)
+
+        assert(!lfa_keyed_elsewhere(name), name)
+        assert(!mentions_closure(name), name)
+
+        name.index_of("$") match
+            Some(at) -> if !holds_string(modules, name[0..<at]) then modules.push(name[0..<at])
+            None -> ()
+
+    assert(modules.len() > 1, s"${modules.len()} module(s)")
+end lfa_the_standard_module_builds
+
+// The worktree's library built by an installed compiler is the case: the type-check happened, and the
+// entry it filled is keyed to a library nothing here resolves.
+@test("says so when the tree given is not the library a compilation here resolves")
+lfa_another_tree_is_noted()
+    val here = std_root() match
+        Err(_) -> return
+        Ok(r) -> r
+
+    val dir = lbr_temp("sysl-lfa-std")
+    val copy = s"$dir/library"
+
+    copy_dir_all(here, copy).unwrap()
+    write_text(s"$copy/sysl/marker.sysl", "module sysl\n\nprivate[sysl] a_marker() -> int = 1\n").unwrap()
+
+    val note = std_tree_note(copy, None).unwrap_or("nothing said")
+
+    assert(note.contains("not the library a compilation here resolves"), note)
+    assert(note.contains(here), note)
+    remove_dir_all(dir).unwrap_or(())
+end lfa_another_tree_is_noted
+
+@test("and says nothing when it is")
+lfa_the_resolved_tree_is_not_noted()
+    std_root() match
+        Err(_) -> ()
+        Ok(here) -> assert(std_tree_note(here, None).is_none(), "a note for the library itself")
+
+// Inferring `--std` from the module names would turn this refusal into an artifact that collides with
+// the built-in copy at whatever link used it.
+@test("and without it the same root is refused, because the module is the library's")
+lfa_the_std_root_without_std_is_refused()
+    if !lbr_ready() then return
+
+    val here = absolute_path(std_root().unwrap())
+    val got = lbr_cli(["sysl", "build-lib", here])
+
+    assert_eq(got.0, Failed)
+    assert(got.1.contains(s"error: 'sysl.args' is the module every program is compiled against, so " +
+                          s"$here/sysl/args/args.sysl cannot declare it — its declarations would join " +
+                          "the library's rather than sit beside them"), s"${got.1.bytes.len} bytes said")
+end lfa_the_std_root_without_std_is_refused
+
+// -- LibraryCliTests: a program handed a library ---------------------------------------------------
+
+private lfa_demo() -> string = lfa_root("demo", "module demo\n\ndouble(n: int) -> int = n * 2\n\n" +
+    "larger[T: Ord](a: T, b: T) -> T = if a < b then b else a\n")
+
+// Every line the command says reaches the sink it was handed, and the module is the whole of them.
+@test("a run nobody captured prints nothing, and a captured one still gets the module")
+lfa_emit_llvm_hands_its_module_to_the_sink()
+    if !lbr_ready() then return
+
+    val root = lfa_demo()
+    val prog = lbr_program("print(demo.double(21))\n")
+    val got = lbr_cli(["sysl", "emit-llvm", "--lib", root, prog])
+
+    assert_eq(got.0, Fine, got.1)
+    assert(got.1.starts_with("target triple"), got.1)
+    lbr_drop([root, prog])
+end lfa_emit_llvm_hands_its_module_to_the_sink
+
+@test("compiles a program against it")
+lfa_a_program_compiles_against_a_root()
+    if !lbr_ready() then return
+
+    val root = lfa_demo()
+    val prog = lbr_program("print(demo.double(21))\nprint(demo.larger(3, 7))\n")
+
+    assert_eq(lbr_cli(["sysl", "emit-llvm", "--lib", root, prog]).0, Fine)
+    lbr_drop([root, prog])
+end lfa_a_program_compiles_against_a_root
+
+@test("runs one, with the precompiled body linked from the artifact")
+lfa_a_program_runs_against_a_root()
+    if !lbr_ready() then return
+
+    val root = lfa_demo()
+    val prog = lbr_program("print(demo.double(21))\n")
+
+    assert_eq(lbr_cli(["sysl", "run", "--lib", root, prog]).0, Fine)
+    lbr_drop([root, prog])
+end lfa_a_program_runs_against_a_root
+
+// One library the program links and one it compiles, in one compilation: a partition that dropped
+// either half shows here and nowhere else.
+@test("and mixes an artifact with a source root, which is the other shape of the same flag")
+lfa_a_linked_half_beside_a_compiled_root()
+    if !lbr_ready() then return
+
+    val demo = lfa_demo()
+    val extra = lfa_extra()
+    val ir = lfa_against("print(demo.double(21))\nprint(extra.triple(2))\n", [demo, extra],
+                         lfa_half_here(demo, []).advertised)
+
+    assert(lfa_declares(ir, "demo$double"), ir)
+    assert(lfa_defines(ir, "extra$triple"), ir)
+    assert(!lfa_defines(ir, "demo$double"), "double is defined as well as declared")
+    lbr_drop([demo, extra])
+end lfa_a_linked_half_beside_a_compiled_root
+
+// Everything the compiler does succeeds and the link does not: the linker's own words, not a fault in
+// cleaning up after it.
+@test("reports a link that fails rather than falling over cleaning up after it")
+lfa_a_failed_link_is_reported()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", "module demo\n\nextern \"lfa_defined_nowhere\" nowhere() -> int\n\n" +
+                        "reach() -> int = nowhere()\n")
+    val prog = lbr_program("print(demo.reach())\n")
+    val got = lbr_cli(["sysl", "run", "--lib", root, prog])
+
+    assert_eq(got.0, Failed, got.1)
+    assert(got.1.starts_with("sysl: error: clang failed (exit 1):\n"), got.1)
+    assert(got.1.contains("\"_lfa_defined_nowhere\", referenced from:"), got.1)
+    lbr_drop([root, prog])
+end lfa_a_failed_link_is_reported
+
+@test("builds a library against one too, which is the other thing that gets compiled")
+lfa_a_library_builds_against_the_standard_module()
+    if !lbr_ready() then return
+
+    val root = lfa_demo()
+
+    lfa_checks(root, [])
+    lbr_drop([root])
+end lfa_a_library_builds_against_the_standard_module
+
+// -- what the standard module's cache entry is keyed by -----------------------------------------------
+
+private lfa_std_path(flags: []string, level: string) -> string
+    reset_search_paths()
+
+    if flags.len > 0 then took_search_flag(flags, 0)
+
+    val at = std_artifact_path(host_target(), "0123456789abcdef", level)
+
+    reset_search_paths()
+    at
+end lfa_std_path
+
+// Under LTO the archive's code is bitcode, and without it an object.
+@test("and by the link-time optimization mode, so an LTO build links a library that can take part")
+lfa_the_std_path_carries_the_lto_mode()
+    if cache_directory().is_none() then return
+
+    val plain = lfa_std_path([], "2")
+    val thin = lfa_std_path(["--lto", "thin"], "2")
+    val full = lfa_std_path(["--lto", "full"], "2")
+
+    assert(plain != thin && thin != full && plain != full, s"$plain $thin $full")
+    assert(thin.contains("-O2-lto-thin/"), thin)
+end lfa_the_std_path_carries_the_lto_mode
+
+// A profile is merged over the old one at the same path, so the key follows what it says.
+@test("and by what a profile says, not where it is, so a re-merged profile rebuilds the library")
+lfa_the_std_path_carries_the_profiles_bytes()
+    if cache_directory().is_none() then return
+
+    val dir = lbr_temp("sysl-lfa-prof")
+    val file = s"$dir/one.profdata"
+
+    write_text(file, "one measurement").unwrap()
+
+    val first = lfa_std_path(["--profile-use", file], "2")
+
+    assert_eq(lfa_std_path(["--profile-use", file], "2"), first)
+    write_text(file, "another measurement").unwrap()
+    assert(lfa_std_path(["--profile-use", file], "2") != first, first)
+    assert(first.contains("-O2-puse-"), first)
+    remove_dir_all(dir).unwrap_or(())
+end lfa_the_std_path_carries_the_profiles_bytes
+
+@test("and by where an instrumented build writes its counters")
+lfa_the_std_path_carries_the_counters_directory()
+    if cache_directory().is_none() then return
+
+    val one = lfa_std_path(["--profile-generate", "/tmp/one"], DefaultOptimization)
+
+    assert(one != lfa_std_path(["--profile-generate", "/tmp/two"], DefaultOptimization), one)
+    assert(one != lfa_std_path([], DefaultOptimization), one)
+    assert(one.contains("-pgen-"), one)
+end lfa_the_std_path_carries_the_counters_directory
+
+// Pinned whole: a layout putting the parts in separate segments would satisfy every case above.
+@test("and names all of them in one path, in that order")
+lfa_the_std_path_names_everything_in_one_segment()
+    val dir = cache_directory() match
+        None -> return
+        Some(d) -> d
+
+    val t = host_target()
+    val head = s"$dir/sysl/${compiler_identity()}-0123456789abcdef-${t.name}-${malloc_symbol()}-${free_symbol()}"
+
+    assert_eq(lfa_std_path([], DefaultOptimization), s"$head-O$DefaultOptimization/std$SyslibExtension")
+    assert_eq(lfa_std_path(["--lto", "thin"], "3"), s"$head-O3-lto-thin/std$SyslibExtension")
+end lfa_the_std_path_names_everything_in_one_segment
+
+// The same files read the same way twice say the same thing.
+@test("and the same library built twice from disk agrees with itself")
+lfa_one_library_twice_is_one_half()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", "module demo\n\ntrait Widen\n    base(self) -> int\n\n" +
+        "    scaled(self) -> int = tripled(self.base())\n\nimpl Widen for int\n    base(self) -> int = self\n\n" +
+        "tripled(n: int) -> int = n * 3\n")
+    val first = lfa_half_here(root, []).advertised
+    val second = lfa_half_here(root, []).advertised
+
+    assert(!first.is_empty(), "nothing advertised")
+    assert_eq(lfa_listed(second), lfa_listed(first))
+    lbr_drop([root])
+end lfa_one_library_twice_is_one_half

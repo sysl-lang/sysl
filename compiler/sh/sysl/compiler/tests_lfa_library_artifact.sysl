@@ -1,0 +1,702 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, make_temp_dir, read_bytes, remove_dir_all}
+import sysl.text.{from_utf8_unchecked, join, Search}
+
+// **Separate compilation, over a source root** -- the reference's `LibraryArtifactTests` and
+// `LibraryCapabilityTests`. The reference builds a named `.syslib` from a library and links a program
+// against it; a named artifact is retired here by design (user, 2026-09-30), so each case asks the same
+// question of the machinery that remains:
+//
+// - **the split** -- what a library compiles ahead of time and what it leaves to the program -- is
+//   read off `root_library_half`, the object half `build-lib <root>` assembles and throws away;
+// - **a program compiled against a half** goes through `emit_llvm_text`'s `against`, the road a
+//   program takes to the standard module's cache entry;
+// - **the container** is `syslib_metadata_of`, the reader of that cache entry;
+// - **a program that runs** is built over the root itself, the library's own source joining the
+//   compilation, which is what `--lib <dir>` is.
+//
+// Every expected diagnostic is the reference's (0.0.162, run over the same trees as directory roots),
+// less the `sysl: error: ` this command line puts in front of a refusal.
+
+// -- trees and halves ------------------------------------------------------------------------------
+
+lfa_root(module_name: string, text: string) -> string =
+    lbr_tree(lbr_one(s"$module_name/lib.sysl", text))
+
+// The object half `build-lib` would assemble for the library at `root`, compiled against `libs`.
+lfa_half(root: string, libs: []string, t: Target) -> Result[LibraryHalf, string]
+    lbr_hand(libs)
+
+    val got = packaged_compilation_of(root, t) match
+        Err(why) -> Err(failure_text(why))
+        Ok(c) -> root_library_half(c.units, c.own, t)
+
+    reset_search_paths()
+    got
+end lfa_half
+
+// The same, where a case cannot go on without it.
+lfa_half_here(root: string, libs: []string) -> LibraryHalf = lfa_half(root, libs, host_target()) match
+    Err(why) -> LibraryHalf(s"refused: $why", buf())
+    Ok(h) -> h
+
+// A program's text compiled against a half: the roots join the compilation, and the names `names`
+// lists are declared rather than defined, exactly as a program declares the standard module's.
+lfa_against(program: string, libs: []string, names: Buf[string]) -> string
+    val path = lbr_program(program)
+
+    lbr_hand(libs)
+
+    val text = emit_llvm_text(path, None, DefaultOptimization, buf(), Some(names)) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    reset_search_paths()
+    lbr_drop([path])
+    text
+end lfa_against
+
+lfa_defines(ir: string, name: string) -> bool = holds_string(sta_defines(ir), name)
+
+lfa_declares(ir: string, name: string) -> bool = holds_string(sta_declares(ir), name)
+
+lfa_closures(names: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<names.len()
+        if mentions_closure(names.at(i)) then out.push(names.at(i))
+
+    out
+end lfa_closures
+
+private lfa_library() -> string =
+    "module demo\n\ndouble(n: int) -> int = n * 2\n\n" +
+    "larger[T: Ord](a: T, b: T) -> T = if a < b then b else a\n\n" +
+    "val squares: [4]int = [0, 1, 4, 9]\n\nlookup(i: int) -> int = squares[i]\n\n" +
+    "struct Money\n    cents: int\nend Money\n\n" +
+    "impl Eq for Money\n    eq(self, rhs: Money) -> bool = self.cents == rhs.cents\nend Money\n\n" +
+    "impl Ord for Money\n    lt(self, rhs: Money) -> bool = self.cents < rhs.cents\nend Money\n\n" +
+    "impl Add for Money\n    add(self, rhs: Money) -> Money = Money(self.cents + rhs.cents)\nend Money\n"
+
+// -- what a library compiles ahead of time -------------------------------------------------------------
+
+@test("a declaration with no type parameters is compiled once, by the library")
+lfa_a_plain_declaration_is_the_librarys()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", lfa_library())
+
+    assert(holds_string(lfa_half_here(root, []).advertised, "demo$double"), "double is advertised")
+    lbr_drop([root])
+end lfa_a_plain_declaration_is_the_librarys
+
+@test("a generic is not, because there is nothing to compile until a caller fixes its arguments")
+lfa_a_generic_is_not_the_librarys()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", lfa_library())
+    val half = lfa_half_here(root, [])
+
+    assert(!half.advertised.is_empty(), half.text)
+
+    for i in 0..<half.advertised.len()
+        assert(!half.advertised.at(i).starts_with("demo$larger"), half.advertised.at(i))
+
+    lbr_drop([root])
+end lfa_a_generic_is_not_the_librarys
+
+// The honest boundary: a `val`'s storage is written by the entry point, and a library has none.
+@test("nor is one that reads module-level storage, which no library initializes")
+lfa_a_reader_of_storage_is_not_the_librarys()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", lfa_library())
+    val half = lfa_half_here(root, [])
+
+    assert(holds_string(half.advertised, "demo$double"), half.text)
+    assert(!holds_string(half.advertised, "demo$lookup"), "lookup reads module storage")
+    lbr_drop([root])
+end lfa_a_reader_of_storage_is_not_the_librarys
+
+// -- the container -------------------------------------------------------------------------------------
+
+private lfa_push_text(out: Buf[u8], text: string)
+    for i in 0..<text.bytes.len
+        out.push(text.bytes[i])
+
+private lfa_push_padded(out: Buf[u8], text: string, width: usize)
+    lfa_push_text(out, text)
+
+    for _ in text.bytes.len..<width
+        out.push(u8(' '))
+
+private lfa_bytes(text: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    lfa_push_text(out, text)
+    out
+end lfa_bytes
+
+// An archive holding these members in this order, laid out the way an archiver writes one.
+lfa_ar(members: Buf[(string, Buf[u8])]) -> Buf[u8]
+    var out = lfa_bytes(ArMagic)
+
+    for i in 0..<members.len()
+        val body = members.at(i).1
+
+        lfa_push_padded(out, members.at(i).0, 16)
+        lfa_push_padded(out, "0", 12)
+        lfa_push_padded(out, "0", 6)
+        lfa_push_padded(out, "0", 6)
+        lfa_push_padded(out, "644", 8)
+        lfa_push_padded(out, s"${body.len()}", 10)
+        lfa_push_text(out, "`\n")
+
+        for k in 0..<body.len()
+            out.push(body.at(k))
+
+        if body.len() % 2 == 1 then out.push(u8('\n'))
+
+    out
+end lfa_ar
+
+private lfa_pair(a: string, x: Buf[u8], b: string, y: Buf[u8]) -> Buf[(string, Buf[u8])]
+    var out: Buf[(string, Buf[u8])] = buf()
+
+    out.push((a, x))
+    out.push((b, y))
+    out
+end lfa_pair
+
+private lfa_single(name: string, body: Buf[u8]) -> Buf[(string, Buf[u8])]
+    var out: Buf[(string, Buf[u8])] = buf()
+
+    out.push((name, body))
+    out
+end lfa_single
+
+// An artifact carrying this metadata beside a compiled half the linker would have taken seriously.
+private lfa_artifact(meta: string) -> Buf[u8] =
+    lfa_ar(lfa_pair(SyslibCodeMember, lfa_bytes("\u{1}\u{2}\u{3}"), SyslibMetadataMember, syslib_frame(meta)))
+
+private lfa_read(bytes: Buf[u8]) -> string = lfa_read_of(bytes.view())
+
+private lfa_read_of(bytes: []const u8) -> string = syslib_metadata_of("x.syslib", bytes) match
+    Ok(meta) -> meta
+    Err(why) -> s"refused: $why"
+
+@test("hands back the metadata buried in it")
+lfa_the_container_hands_back_its_metadata()
+    assert_eq(lfa_read(lfa_artifact("meta")), "meta")
+
+// Member order is the archiver's to choose, and the reader must not depend on having chosen it.
+@test("finds it wherever in the archive it happens to sit")
+lfa_the_metadata_is_found_in_either_order()
+    val reversed = lfa_ar(lfa_pair(SyslibMetadataMember, syslib_frame("meta"), SyslibCodeMember,
+                                   lfa_bytes("\u{1}\u{2}\u{3}")))
+
+    assert_eq(lfa_read(reversed), "meta")
+
+@test("keeps a boundary that holds when the metadata is not ASCII")
+lfa_the_boundary_is_in_bytes()
+    assert_eq(lfa_read(lfa_artifact("π≈3")), "π≈3")
+
+// The compiled half carries the library's own string literals, so a library that spelled the marker
+// out would be read from the middle of its text; the impostor goes first so order cannot pass this.
+@test("reads its own member rather than a marker the compiled half happens to contain")
+lfa_its_own_member_is_read_first()
+    val impostor = syslib_framed("syslib 1 4", "junk")
+    val mixed = lfa_ar(lfa_pair(SyslibCodeMember, impostor, SyslibMetadataMember, syslib_frame("the real one")))
+
+    assert_eq(lfa_read(mixed), "the real one")
+
+@test("keeps one that holds when the metadata itself contains the marker")
+lfa_a_marker_inside_the_metadata_is_payload()
+    val inner = syslib_framed("syslib 99 4", "junk")
+    val awkward = "before " + from_utf8_unchecked(inner.view()) + " after"
+
+    assert_eq(lfa_read(lfa_artifact(awkward)), awkward)
+
+@test("refuses a file that is not an archive rather than reading it as one")
+lfa_a_file_that_is_not_an_archive_is_refused()
+    val got = lfa_read(lfa_bytes("not a library at all\n"))
+
+    assert(got.contains("is not a sysl library"), got)
+
+// A `.a` from a C project is a real archive, and every part of reading it works until the part that
+// looks for something only this compiler put there.
+@test("refuses an archive that carries no metadata, which is any other library")
+lfa_an_archive_with_no_metadata_is_refused()
+    var seven: Buf[u8] = buf()
+
+    seven.push(7)
+    seven.push(7)
+
+    val got = lfa_read(lfa_ar(lfa_single("foreign.o", seven)))
+
+    assert(got.contains("carries no metadata"), got)
+end lfa_an_archive_with_no_metadata_is_refused
+
+@test("refuses one built by a different compiler, and says to rebuild it")
+lfa_another_compilers_artifact_is_refused()
+    val stale = syslib_framed(s"syslib ${SyslibVersion + 1} 0", "")
+    val got = lfa_read(lfa_ar(lfa_single(SyslibMetadataMember, stale)))
+
+    assert(got.contains("rebuild it with 'sysl build-lib'"), got)
+
+// The version comes from the constant, so a bump to the format leaves this testing truncation.
+@test("refuses a truncated one rather than handing back half the metadata")
+lfa_a_truncated_artifact_is_refused()
+    val short = syslib_framed(s"syslib $SyslibVersion 500", "short")
+    val got = lfa_read(lfa_ar(lfa_single(SyslibMetadataMember, short)))
+
+    assert(got.contains("truncated"), got)
+
+// -- the artifact a real toolchain writes ------------------------------------------------------------
+
+// A library's two halves compiled by clang for `t`, archived by the platform's archiver: the archive's
+// bytes, the metadata that went in, and what came back out.
+private lfa_round_trip(t: Target) -> Option[(Buf[u8], string, string)]
+    val root = lfa_root("demo", lfa_library())
+
+    val half = lfa_half(root, [], t) match
+        Err(why) ->
+            assert(false, why)
+            return None
+        Ok(h) -> h
+
+    lbr_drop([root])
+
+    val clang = find_backend_clang(t).unwrap()
+    val archiver = find_ar(None).unwrap()
+    val staging = make_temp_dir("sysl-lfa-ar").unwrap()
+    val code = s"$staging/$SyslibCodeMember"
+    val smeta = s"$staging/$SyslibMetadataMember"
+    val out = s"$staging/demo$SyslibExtension"
+    val meta = syslib_metadata(t, "feedfacecafebeef", half.advertised)
+
+    compile_object(clang, half.text, code, t, DefaultOptimization).unwrap()
+    compile_object(clang, syslib_metadata_ir(meta, t), smeta, t, DefaultOptimization, false).unwrap()
+
+    var members: Buf[string] = buf()
+
+    members.push(code)
+    members.push(smeta)
+    archive(archiver, members, out).unwrap()
+
+    val bytes = read_bytes(out).unwrap()
+
+    remove_dir_all(staging).unwrap_or(())
+    var held: Buf[u8] = buf()
+
+    for b in bytes
+        held.push(b)
+
+    Some((held, meta, lfa_read(held)))
+end lfa_round_trip
+
+// Byte for byte: a payload truncated at its first NUL, or padded by the assembler, decodes far enough
+// to look fine.
+@test("carries metadata that survives being buried in an object file")
+lfa_the_metadata_survives_an_object_file()
+    if !lbr_ready() then return
+
+    lfa_round_trip(host_target()) match
+        None -> ()
+        Some(got) -> assert_eq(got.2, got.1)
+
+// The ELF half of every per-format decision -- the section, the long-name convention, the layout --
+// exercised without a Linux; the code member's magic says it really was cross-built.
+@test("carries it out of one cross-built for a machine whose objects this one cannot even run")
+lfa_a_cross_built_artifact_carries_it_too()
+    if !lbr_ready() then return
+
+    val elf = target_named(if host_target().name == "x86_64-linux" then "aarch64-macos" else "x86_64-linux")
+        .unwrap()
+
+    if find_backend_clang(elf).is_err()
+        print("skipped: no clang here lowers for that machine")
+        return
+
+    val got = lfa_round_trip(elf) match
+        None -> return
+        Some(g) -> g
+
+    assert_eq(got.2, got.1)
+
+    val members = ar_members(got.0.view()).unwrap()
+    var magic = ""
+
+    for i in 0..<members.len()
+        if members.at(i).name == SyslibCodeMember
+            val b = members.at(i).body
+
+            magic = s"${b.at(0)} ${b.at(1)} ${b.at(2)} ${b.at(3)}"
+
+    assert_eq(magic, if elf.name == "x86_64-linux" then "127 69 76 70" else "207 250 237 254")
+end lfa_a_cross_built_artifact_carries_it_too
+
+// -- what a library does NOT compile, however much it uses it ----------------------------------------
+
+private lfa_printing(module_name: string, fn: string) -> string =
+    lfa_root(module_name, s"module $module_name\n\n$fn(n: int)\n    print(n)\nend $fn\n")
+
+// Emitting the printing surface would put a copy of it in every artifact.
+@test("the shipped library's own functions are declared, not defined a second time here")
+lfa_the_shipped_librarys_functions_are_declared()
+    if !lbr_ready() then return
+
+    val root = lfa_printing("say", "hello")
+    val half = lfa_half_here(root, [])
+
+    assert_eq(lfa_listed(half.advertised), "say$hello")
+    assert(half.text.contains("define void @say$hello("), half.text)
+    assert(half.text.contains("declare void @sysl$printi("), half.text)
+    assert(!half.text.contains("define void @sysl$printi("), "printi is defined in the library half")
+    lbr_drop([root])
+end lfa_the_shipped_librarys_functions_are_declared
+
+// Each library defining the printing surface would be three duplicate symbols at the link.
+@test("so two libraries that both print can be linked into one program")
+lfa_two_printing_libraries_link_together()
+    if !lbr_ready() then return
+
+    val say = lfa_printing("say", "hello")
+    val shout = lfa_printing("shout", "loud")
+    val prog = lbr_program("say.hello(1)\nshout.loud(3)\nprint(2)\n")
+
+    assert_eq(lbr_run(prog, [say, shout]), "1\n3\n2\n")
+    lbr_drop([say, shout, prog])
+end lfa_two_printing_libraries_link_together
+
+// -- a library built on another library ---------------------------------------------------------------
+
+private lfa_base() -> string = lfa_root("base",
+    "module base\n\nstruct Colour\n    red: int\nend Colour\n\n" +
+    "brighten(c: Colour) -> Colour = Colour(c.red + 1)\n")
+
+private lfa_skin() -> string = lfa_root("skin",
+    "module skin\n\nimport base.{Colour, brighten}\n\ntwice(c: Colour) -> Colour = brighten(brighten(c))\n")
+
+@test("compiles against a dependency given as a source root")
+lfa_a_dependency_root_is_compiled_against()
+    if !lbr_ready() then return
+
+    val base = lfa_base()
+    val skin = lfa_skin()
+
+    assert(lfa_defines(lfa_half_here(skin, [base]).text, "skin$twice"), "twice is defined")
+    lbr_drop([base, skin])
+end lfa_a_dependency_root_is_compiled_against
+
+// Folded in with the dependent's own files, the dependency would be a duplicate at whatever program
+// later links both.
+@test("declares the dependency's compiled half rather than emitting a second copy of it")
+lfa_the_dependency_is_declared()
+    if !lbr_ready() then return
+
+    val base = lfa_base()
+    val skin = lfa_skin()
+    val text = lfa_half_here(skin, [base]).text
+
+    assert(!lfa_defines(text, "base$brighten"), "brighten is defined in the dependent")
+    assert(lfa_declares(text, "base$brighten"), text)
+    lbr_drop([base, skin])
+end lfa_the_dependency_is_declared
+
+@test("advertises only its own, so a program is never told this artifact holds the other's")
+lfa_only_its_own_is_advertised()
+    if !lbr_ready() then return
+
+    val base = lfa_base()
+    val skin = lfa_skin()
+    val names = lfa_half_here(skin, [base]).advertised
+
+    assert(holds_string(names, "skin$twice"), lfa_listed(names))
+
+    for i in 0..<names.len()
+        assert(!names.at(i).starts_with("base$"), names.at(i))
+
+    lbr_drop([base, skin])
+end lfa_only_its_own_is_advertised
+
+// -- what build-lib refuses ----------------------------------------------------------------------------
+
+// The root module has no name, so nothing could write a path to what it declares.
+@test("a library may not sit in the module a program's own headerless files are in")
+lfa_a_headerless_library_is_refused()
+    if !lbr_ready() then return
+
+    val root = lbr_tree(lbr_one("lib.sysl", "double(n: int) -> int = n * 2\n"))
+    val got = lbr_cli(["sysl", "build-lib", root])
+
+    assert_eq(got.0, Failed, got.1)
+    assert(got.1.contains(s"a library is reached by naming its module, and $root/lib.sysl is in none — " +
+                          "put the library's files in a directory under the root it is built from"), got.1)
+    lbr_drop([root])
+end lfa_a_headerless_library_is_refused
+
+// The reference names the function bare ('f'); this compiler names it qualified, on purpose.
+@test("a library that does not check is refused before anything is written")
+lfa_a_library_that_does_not_check_is_refused()
+    if !lbr_ready() then return
+
+    val root = lbr_tree(lbr_one("demo/bad.sysl", "module demo\n\nf() -> int = \"no\"\n"))
+    val got = lbr_cli(["sysl", "build-lib", root])
+
+    assert_eq(got.0, Failed, got.1)
+    assert(got.1.contains("should return int, but its body yields string\n" +
+                          s" --> $root/demo/bad.sysl:3:1\n"), got.1)
+    assert_eq(lfa_listing(root), "demo")
+    lbr_drop([root])
+end lfa_a_library_that_does_not_check_is_refused
+
+// What a directory holds, which for one entry is the whole answer.
+lfa_listing(dir: string) -> string = join(entries(dir).unwrap().view(), " ")
+
+lfa_listed(names: Buf[string]) -> string = join(names.view(), ", ")
+
+// -- a program compiled against a library's half ------------------------------------------------------
+
+// Defining it here as well would be a duplicate symbol at the link.
+@test("declares the precompiled half rather than defining it a second time")
+lfa_the_precompiled_half_is_declared()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", lfa_library())
+    val ir = lfa_against("print(demo.double(21))\n", [root], lfa_half_here(root, []).advertised)
+
+    assert(ir.contains("declare i32 @demo$double(i32)"), ir)
+    assert(!ir.contains("define i32 @demo$double("), "double is defined twice")
+    lbr_drop([root])
+end lfa_the_precompiled_half_is_declared
+
+@test("defines a generic here, at each type the program uses it at")
+lfa_a_generic_is_defined_by_the_program()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", lfa_library())
+    val ir = lfa_against("print(demo.larger(3, 7))\nprint(demo.larger(\"a\", \"b\"))\n", [root],
+                         lfa_half_here(root, []).advertised)
+
+    assert(ir.contains("define i32 @demo$larger.int("), ir)
+    assert(ir.contains("define { ptr, ptr, i64 } @demo$larger.string("), ir)
+    lbr_drop([root])
+end lfa_a_generic_is_defined_by_the_program
+
+@test("runs, with the precompiled body coming from the library's object file")
+lfa_a_program_over_the_library_runs()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", lfa_library())
+    val prog = lbr_program("print(demo.double(21))\nprint(demo.larger(3, 7))\n")
+
+    assert_eq(lbr_run(prog, [root]), "42\n7\n")
+    lbr_drop([root, prog])
+end lfa_a_program_over_the_library_runs
+
+private lfa_money() -> string =
+    "var a = demo.Money(5)\nvar b = demo.Money(7)\n\nprint(a < b)\nprint(a + b == demo.Money(12))\n\n" +
+    "a += b\n\nprint(a == demo.Money(12))\n"
+
+// A comparison chain and a compound assignment hand the method over as a name rather than building a
+// call around it, so the three spellings are three resolutions.
+@test("reaches the member an operator on a library type dispatches to")
+lfa_an_operator_reaches_the_librarys_member()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", lfa_library())
+    val ir = lfa_against(lfa_money(), [root], lfa_half_here(root, []).advertised)
+
+    assert(ir.contains("@demo$Money.lt("), ir)
+    assert(ir.contains("@demo$Money.eq("), ir)
+    assert(ir.contains("declare %struct.demo$Money @demo$Money.add("), ir)
+    lbr_drop([root])
+end lfa_an_operator_reaches_the_librarys_member
+
+@test("and runs, with those bodies coming from the library's object file too")
+lfa_the_operators_run()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", lfa_library())
+    val prog = lbr_program("var a = demo.Money(5)\n\nprint(a < demo.Money(7))\n\na += demo.Money(7)\n\n" +
+                           "print(a == demo.Money(12))\n")
+
+    assert_eq(lbr_run(prog, [root]), "true\ntrue\n")
+    lbr_drop([root, prog])
+end lfa_the_operators_run
+
+@test("and the library carries no entry point of its own to collide with the program's")
+lfa_the_library_has_no_main()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", lfa_library())
+    val half = lfa_half_here(root, [])
+
+    assert(!half.advertised.is_empty(), half.text)
+    assert(!half.text.contains("define i32 @main("), "the library defines a main")
+    lbr_drop([root])
+end lfa_the_library_has_no_main
+
+// -- the member name a library's own compiled half uses ------------------------------------------------
+
+@test("is refused to a C file that would take it")
+lfa_a_c_file_taking_the_code_member_is_refused()
+    var carried: Buf[string] = buf()
+
+    carried.push("library/sysl/code.c")
+    assert_eq(native_member("library", carried.at(0)), SyslibCodeMember)
+
+    val why = member_collision("library", carried).unwrap_or("allowed through")
+
+    assert(why.contains(SyslibCodeMember), why)
+end lfa_a_c_file_taking_the_code_member_is_refused
+
+@test("and so is one that would take the metadata member's")
+lfa_a_c_file_taking_the_metadata_member_is_refused()
+    var carried: Buf[string] = buf()
+
+    carried.push("library/sysl/smeta.c")
+    assert(member_collision("library", carried).is_some(), "smeta.c was allowed through")
+
+@test("while the same file one directory over is ordinary")
+lfa_the_same_file_elsewhere_is_ordinary()
+    var carried: Buf[string] = buf()
+
+    carried.push("library/sysl/text/code.c")
+    assert_eq(native_member("library", carried.at(0)), "sysl.text.code.o")
+    assert(member_collision("library", carried).is_none(), "an ordinary member was refused")
+
+// -- a closure the library lowered for itself ----------------------------------------------------------
+
+// `house` passes the named `fixed` to a bare-arrow parameter, which wraps it in a closure -- whose name
+// is a counter in the compilation that lowered it, so it must not leave its object file.
+private lfa_zone() -> string = lfa_root("zone",
+    "module zone\n\nstruct Off\n    mins: int\n\nfixed(t: int) -> Off = Off(0 - 300)\n\n" +
+    "pick(t: int, at: int -> Off) -> Off = at(t)\n\nhouse(t: int) -> Off = pick(t, fixed)\n")
+
+@test("is compiled into the artifact rather than left for the linker")
+lfa_a_librarys_closure_is_defined_there()
+    if !lbr_ready() then return
+
+    val root = lfa_zone()
+    val text = lfa_half_here(root, []).text
+
+    assert(!lfa_closures(sta_defines(text)).is_empty(), text)
+    assert_eq(lfa_listed(lfa_closures(sta_declares(text))), "")
+    lbr_drop([root])
+end lfa_a_librarys_closure_is_defined_there
+
+@test("and is internal, so a consumer's closure of the same name is a different symbol")
+lfa_a_librarys_closure_is_internal()
+    if !lbr_ready() then return
+
+    val root = lfa_zone()
+    val text = lfa_half_here(root, []).text
+
+    assert(!lfa_closures(sta_defines(text)).is_empty(), text)
+    assert_eq(lfa_listed(lfa_closures(sta_external(text))), "")
+    lbr_drop([root])
+end lfa_a_librarys_closure_is_internal
+
+// Discriminating: the library does advertise its ordinary functions.
+@test("and is not advertised, so a consumer builds its own instantiation")
+lfa_a_librarys_closure_is_not_advertised()
+    if !lbr_ready() then return
+
+    val root = lfa_zone()
+    val names = lfa_half_here(root, []).advertised
+
+    assert(holds_string(names, "zone$house"), lfa_listed(names))
+    assert_eq(lfa_listed(lfa_closures(names)), "")
+    lbr_drop([root])
+end lfa_a_librarys_closure_is_not_advertised
+
+// -- LibraryCapabilityTests: the capability passes see through a linked library -----------------------
+
+private lfa_build(root: string, prog: string, flags: []string) -> (int, string)
+    val out = lbr_temp("sysl-lfa-out")
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("build")
+    args.push("--lib")
+    args.push(root)
+
+    for f in flags
+        args.push(f)
+
+    args.push(prog)
+    args.push("-o")
+    args.push(s"$out/program")
+
+    val got = lbr_cli(args.view())
+
+    remove_dir_all(out).unwrap_or(())
+    got
+end lfa_build
+
+private lfa_allocating() -> string =
+    lfa_root("demo", "module demo\n\nboxed(n: int) -> &int = n\n\nplain(n: int) -> int = n * 2\n")
+
+// The view of `a` leaves the frame through the library's function, so the array has to be promoted.
+@test("so an array whose view escapes THROUGH a library function is promoted")
+lfa_an_escape_through_a_library_is_promoted()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", "module demo\n\nkeep(xs: []const int) -> []const int = xs\n")
+    val prog = lbr_program("import demo\nleak() -> []const int\n    var a = [1, 2, 3]\n" +
+                           "    demo.keep(a[0..<3])\nmain()\n    print(leak()[0])\n")
+    val got = lfa_build(root, prog, ["--explain-escapes", "--no-std-lib"])
+
+    assert_eq(got.0, Fine, got.1)
+    assert(got.1.contains(s"$prog:4:10: 'a' is promoted to the heap, because this view of it is returned"),
+           got.1)
+    lbr_drop([root, prog])
+end lfa_an_escape_through_a_library_is_promoted
+
+// The control: a walk that promoted on sight, or could not read the library, fails here.
+@test("and one whose view does not escape is left in its frame")
+lfa_a_view_that_stays_is_left_in_its_frame()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", "module demo\n\nfirst(xs: []const int) -> int = xs[0]\n")
+    val prog = lbr_program("import demo\npeek() -> int\n    var a = [1, 2, 3]\n" +
+                           "    demo.first(a[0..<3])\nmain()\n    print(peek())\n")
+    val got = lfa_build(root, prog, ["--explain-escapes", "--no-std-lib"])
+
+    assert_eq(got.0, Fine, got.1)
+    assert(got.1.contains("no arrays were promoted to the heap"), got.1)
+    lbr_drop([root, prog])
+end lfa_a_view_that_stays_is_left_in_its_frame
+
+@test("may call a linked library function that does not allocate")
+lfa_no_alloc_may_call_a_plain_library_function()
+    if !lbr_ready() then return
+
+    val root = lfa_allocating()
+    val prog = lbr_program("@no_alloc\nimport demo\nmain()\n    print(demo.plain(21))\n")
+    val got = lfa_build(root, prog, ["--no-std-lib"])
+
+    assert_eq(got.0, Fine, got.1)
+    lbr_drop([root, prog])
+end lfa_no_alloc_may_call_a_plain_library_function
+
+// The refusal has to name the allocation, or this would pass on any failure at all.
+@test("and is refused when it calls one that does, naming what it reached")
+lfa_no_alloc_refuses_an_allocating_library_function()
+    if !lbr_ready() then return
+
+    val root = lfa_allocating()
+    val prog = lbr_program("@no_alloc\nimport demo\nmain()\n    val b = demo.boxed(21)\n    print(*b)\n")
+    val got = lfa_build(root, prog, ["--no-std-lib"])
+
+    assert(got.0 != Fine, got.1)
+    assert(got.1.contains("error: this reaches 'demo.boxed', which makes heap storage, and this module " +
+                          "declared '@no_alloc' — an allocator-free module may only call what is " +
+                          "allocator-free itself"), got.1)
+    lbr_drop([root, prog])
+end lfa_no_alloc_refuses_an_allocating_library_function
