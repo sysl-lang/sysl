@@ -47,8 +47,8 @@ import sysl.text.{CString, cstring, from_cstring}
  */
 
 private extern "sysl_proc_start" c_start(program: *u8, argv: **u8, names: **u8, values: **u8,
-                                         dir: *u8, out_path: *u8, err_path: *u8, pid: *i32,
-                                         started_ms: *i64) -> int
+                                         inherit: int, dir: *u8, out_path: *u8, err_path: *u8,
+                                         pid: *i32, started_ms: *i64) -> int
 
 private extern "sysl_proc_wait" c_wait(pid: i32, started_ms: i64, timeout_ms: i32, code: *i32,
                                        sig: *i32, timed_out: *i32) -> int
@@ -108,18 +108,24 @@ end Status
  *
  * **This is on the call rather than in `sysl.env`, and that module says why**: `setenv` mutates
  * state a whole process shares and is not safe against a concurrent read, so a program that wants a
- * child to see something different asks for it here. The variables are *added* to what this program
- * already has rather than replacing it -- a child that lost `PATH` and `HOME` because its parent
- * wanted to set one thing is a surprise, and the caller who genuinely wants an empty environment is
- * rare enough to be told this is not the call for it.
+ * child to see something different asks for it here. By default the variables are *added* to what
+ * this program already has rather than replacing it -- a child that lost `PATH` and `HOME` because
+ * its parent wanted to set one thing is a surprise. The caller who genuinely wants a child to see
+ * only what it was given -- an interpreter whose `run` replaces the environment, a test that must
+ * not see its runner's variables -- says so: **`inherit_env = false` hands the child exactly these
+ * variables and nothing else**, an empty list being an empty environment.
  *
- * They are set in the child, in the window between the fork and the exec, where the process is
- * single-threaded by construction and this program's own environment is untouched.
+ * Neither way touches this program's own environment: the child's is built for it and handed over
+ * as it starts.
  *
- * **`PATH` is the one whose effect starts before the child does.** Because the variables are in
- * place before `execvp` runs, setting it decides where the program itself is looked for -- so a
- * caller handing a child a `PATH` meant for *its* children should name the program by an absolute
- * path. Consistent, and surprising exactly once.
+ * **`PATH` is the one whose effect starts before the child does.** A `PATH` among the variables
+ * decides where the program itself is looked for, as `execvp` in the child would look -- so a caller
+ * handing a child a `PATH` meant for *its* children should name the program by an absolute path.
+ * Consistent, and surprising exactly once. **A replaced environment with no `PATH` in it leaves the
+ * child none**, and a bare program name is then looked for on the system's default search path
+ * (`confstr(_CS_PATH)`: `/usr/bin:/bin:/usr/sbin:/sbin` on macOS, `/bin:/usr/bin` on glibc), which
+ * is where `execvp` looks in a process with no `PATH` -- never on this program's, since the child
+ * was asked to inherit nothing.
  */
 struct Var
     name: string
@@ -200,8 +206,8 @@ end pairs_of
  * the shim does not return until the child has either become the other program -- holding copies of
  * its own -- or failed to, in which case it has already been reaped.
  */
-private begun(program: string, args: []const string, env: []const Var, dir: string,
-              out_path: string, err_path: string) -> Result[(i32, i64), IoError]
+private begun(program: string, args: []const string, env: []const Var, inherit_env: bool,
+              dir: string, out_path: string, err_path: string) -> Result[(i32, i64), IoError]
     val (owned, ptrs) = vector_of(program, args)
     val (env_owned, names, values) = pairs_of(env)
     val d = cstring(dir)
@@ -215,7 +221,8 @@ private begun(program: string, args: []const string, env: []const Var, dir: stri
     // which the shim reads as "not asked for" -- so none needs a null pointer and none is optional
     // here.
     val e = c_start(owned.at(0).ptr, as_ptr(ptrs.elems), as_ptr(names.elems),
-                    as_ptr(values.elems), d.ptr, o.ptr, er.ptr, &pid, &at)
+                    as_ptr(values.elems), if inherit_env then 1 else 0, d.ptr, o.ptr, er.ptr,
+                    &pid, &at)
 
     if e != 0 then return Err(from_errno(e))
 
@@ -240,9 +247,9 @@ private ended(pid: i32, at: i64, timeout: int) -> Result[Status, IoError]
     Ok(if sig != 0 then Status.Signalled(int(sig)) else Status.Exited(int(code)))
 end ended
 
-private started(program: string, args: []const string, env: []const Var, dir: string,
-                timeout: int) -> Result[Status, IoError]
-    val (pid, at) = begun(program, args, env, dir, "", "")?
+private started(program: string, args: []const string, env: []const Var, inherit_env: bool,
+                dir: string, timeout: int) -> Result[Status, IoError]
+    val (pid, at) = begun(program, args, env, inherit_env, dir, "", "")?
 
     ended(pid, at, timeout)
 
@@ -259,6 +266,11 @@ private started(program: string, args: []const string, env: []const Var, dir: st
  * take as long as it likes. A child that outstays it is asked to stop and then made to, and the
  * answer is `TimedOut`.
  *
+ * `env` is added to this program's environment, unless `inherit_env` is `false`, in which case it
+ * is the child's whole environment -- see `Var` for which `PATH` the program is then looked for on.
+ * It is the last parameter rather than beside `env` so that a call already passing `stderr` or
+ * `timeout` by position keeps meaning what it meant.
+ *
  * The error half is for a child that could not be *started*: a program that is not there reports
  * `NotFound`, one that is not executable reports `PermissionDenied`. **A program that ran and
  * failed is `Ok`**, carrying a non-zero `Status`, because it did start and its exit status is an
@@ -267,8 +279,8 @@ private started(program: string, args: []const string, env: []const Var, dir: st
  * child.
  */
 run(program: string, args: []const string = [], dir: string = "",
-    env: []const Var = [], timeout: int = 0) -> Result[Status, IoError] =
-    started(program, args, env, dir, timeout)
+    env: []const Var = [], timeout: int = 0, inherit_env: bool = true) -> Result[Status, IoError] =
+    started(program, args, env, inherit_env, dir, timeout)
 
 /** Run a program, wait for it, and collect what it wrote to its standard output.
  *
@@ -294,12 +306,15 @@ run(program: string, args: []const string = [], dir: string = "",
  *
  * The files are removed before this returns, whether the child succeeded or not.
  *
+ * `env` and `inherit_env` mean what they mean for `run`: added to this program's environment by
+ * default, the whole of the child's with `inherit_env = false`.
+ *
  * It is `start` followed at once by `wait`, and is written as exactly that, so the two can never
  * come to answer differently.
  */
 capture(program: string, args: []const string = [], dir: string = "", env: []const Var = [],
-        stderr: bool = false, timeout: int = 0) -> Result[Output, IoError]
-    val child = start(program, args, dir, env, stderr, timeout)?
+        stderr: bool = false, timeout: int = 0, inherit_env: bool = true) -> Result[Output, IoError]
+    val child = start(program, args, dir, env, stderr, timeout, inherit_env)?
 
     child.wait()
 end capture
@@ -390,7 +405,7 @@ impl Drop for Child
  * stopped for outstaying it while somebody is waiting for it, or when its `Child` is dropped.
  */
 start(program: string, args: []const string = [], dir: string = "", env: []const Var = [],
-      stderr: bool = false, timeout: int = 0) -> Result[&Child, IoError]
+      stderr: bool = false, timeout: int = 0, inherit_env: bool = true) -> Result[&Child, IoError]
     val out_path = temp_path()?
     val err_path = if stderr then temp_path() else Ok("")
 
@@ -400,7 +415,7 @@ start(program: string, args: []const string = [], dir: string = "", env: []const
 
     val e = err_path.unwrap()
 
-    begun(program, args, env, dir, out_path, e) match
+    begun(program, args, env, inherit_env, dir, out_path, e) match
         Ok((pid, at)) -> Ok(Child(pid, at, timeout, out_path, e, None))
         Err(x) ->
             remove_file(out_path)

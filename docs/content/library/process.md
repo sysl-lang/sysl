@@ -144,13 +144,37 @@ hello
 ```
 
 The variables are **added** to what this program has rather than replacing it, so the child keeps its
-`PATH` and its `HOME`. They are set in the child, in the window between the fork and the exec, where
-the process is single-threaded and this program's own environment is untouched — which is why
-[`sysl.env`](/library/env/) has no `set` and does not want one.
+`PATH` and its `HOME`. The child's environment is built for it and handed over as it starts, and this
+program's own environment is untouched — which is why [`sysl.env`](/library/env/) has no `set` and
+does not want one.
 
 **`PATH` is the one whose effect starts before the child does.** Because the variables are in place
 before the program is looked up, setting it decides *where the program is looked for*. A caller
 handing a child a `PATH` meant for its own children should name the program by an absolute path.
+
+**`inherit_env = false` makes the list the child's whole environment** — nothing of this program's
+comes with it, and an empty list is an empty environment. It is what an interpreter's `run` wants, or
+a test that must not see the variables of whatever started it. `run`, `capture` and `start` all take
+it, as their last parameter:
+
+```sysl
+import sysl.process.{capture, Var}
+import sysl.text.Search
+
+val out = capture("/usr/bin/env", env = [Var("GREETING", "hello")], inherit_env = false).unwrap()
+
+print(out.text.trim())
+```
+
+```output
+GREETING=hello
+```
+
+A replaced environment with a `PATH` in it is searched as above. **One without a `PATH` leaves the
+child none**, and a bare program name is then looked for on the system's default search path
+(`confstr(_CS_PATH)` — `/usr/bin:/bin:/usr/sbin:/sbin` on macOS, `/bin:/usr/bin` with glibc), which
+is where `execvp` looks in a process that has no `PATH`. It is never this program's `PATH`: the child
+was asked to inherit nothing, and where its program is found is part of that.
 
 ## Capture goes through a file, not a pipe
 

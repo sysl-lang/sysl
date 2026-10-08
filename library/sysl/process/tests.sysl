@@ -161,6 +161,100 @@ path_decides_the_lookup()
     assert(r.is_err(), "there is no printenv under /nowhere")
     assert_eq(r.unwrap_err(), IoError.NotFound)
 
+// ## A replaced environment
+//
+// `inherit_env = false` makes the list the child's whole environment. The programs are named by an
+// absolute path wherever the lookup is not what is being asserted, for the reason the tests at the
+// end of this section exist.
+
+@test("a replaced environment does not carry PATH over")
+a_replaced_environment_has_no_path()
+    val out = capture("/usr/bin/printenv", ["PATH"], env = [Var("SYSL_PROCESS_TEST", "present")],
+                      inherit_env = false).unwrap()
+
+    assert_eq(out.status, Status.Exited(1))
+    assert_eq(out.text, "")
+
+@test("a replaced environment holds the variable it was given")
+a_replaced_environment_holds_what_was_given()
+    val out = capture("/usr/bin/printenv", ["SYSL_PROCESS_TEST"],
+                      env = [Var("SYSL_PROCESS_TEST", "present")], inherit_env = false).unwrap()
+
+    assert_eq(out.text, "present\n")
+
+// `env` with no arguments prints every variable it was started with, so this is the whole
+// environment compared at once -- nothing of this program's, nothing added on the way.
+@test("a replaced environment is exactly the variables given, in order")
+a_replaced_environment_is_exactly_the_list()
+    val out = capture("/usr/bin/env", env = [Var("SYSL_A", "1"), Var("SYSL_B", "two=2")],
+                      inherit_env = false).unwrap()
+
+    assert_eq(out.text, "SYSL_A=1\nSYSL_B=two=2\n")
+
+@test("an empty list replacing the environment is an empty environment")
+an_empty_list_is_an_empty_environment()
+    val out = capture("/usr/bin/env", inherit_env = false).unwrap()
+
+    assert(out.status.ok())
+    assert_eq(out.text, "")
+
+// The same rule as the additive case: the second of two values for one name is the one the child
+// sees, and the name is there once.
+@test("a variable named twice in a replaced environment holds the second value")
+a_replaced_variable_named_twice_takes_the_second()
+    val out = capture("/usr/bin/env", env = [Var("SYSL_TWICE", "first"), Var("SYSL_TWICE", "second")],
+                      inherit_env = false).unwrap()
+
+    assert_eq(out.text, "SYSL_TWICE=second\n")
+
+@test("run and start replace the environment as capture does")
+run_and_start_replace_it_too()
+    val ran = run("/bin/sh", ["-c", "test -z \"$HOME\" && test \"$SYSL_ONLY\" = yes"],
+                  env = [Var("SYSL_ONLY", "yes")], inherit_env = false).unwrap()
+
+    assert(ran.ok(), "HOME is gone and SYSL_ONLY is there")
+
+    val child = start("/usr/bin/env", env = [Var("SYSL_ONLY", "yes")], inherit_env = false).unwrap()
+    val out = child.wait().unwrap()
+
+    assert_eq(out.text, "SYSL_ONLY=yes\n")
+
+// **With no `PATH` in a replaced environment, a bare name is looked for on the system's default
+// search path** -- `confstr(_CS_PATH)`, where `execvp` looks in a process that has no `PATH` -- and
+// `printenv` is on it everywhere.
+@test("a bare name is found on the default search path when the replaced environment has no PATH")
+a_bare_name_uses_the_default_search_path()
+    val out = capture("printenv", ["SYSL_PROCESS_TEST"], env = [Var("SYSL_PROCESS_TEST", "found")],
+                      inherit_env = false).unwrap()
+
+    assert_eq(out.text, "found\n")
+
+// A `PATH` among the variables is the child's, and so it is the one searched, as it is when the
+// environment is added to.
+@test("a PATH in a replaced environment is where a bare name is looked for")
+a_given_path_is_searched()
+    val r = capture("printenv", env = [Var("PATH", "/nowhere")], inherit_env = false)
+
+    assert(r.is_err(), "there is no printenv under /nowhere")
+    assert_eq(r.unwrap_err(), IoError.NotFound)
+
+    val out = capture("sh", ["-c", "echo $PATH"], env = [Var("PATH", "/bin")],
+                      inherit_env = false).unwrap()
+
+    assert_eq(out.text, "/bin\n")
+
+@test("a program that is not there is NotFound under a replaced environment too")
+a_missing_program_is_not_found_when_replaced()
+    val c = capture("sysl-no-such-program", inherit_env = false)
+
+    assert(c.is_err())
+    assert_eq(c.unwrap_err(), IoError.NotFound)
+
+    val r = run("sysl-no-such-program", env = [Var("SYSL_PROCESS_TEST", "x")], inherit_env = false)
+
+    assert(r.is_err())
+    assert_eq(r.unwrap_err(), IoError.NotFound)
+
 // ## Status itself
 
 @test("ok is exited zero and nothing else")
