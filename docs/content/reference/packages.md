@@ -486,6 +486,83 @@ no location string reaches the module at all. `--no-bounds-locations` on the com
 same for one build. The key is `true` or `false` and nothing else, and anything else is refused when
 the file is read.
 
+## What the generated code may use of the machine
+
+A kernel wants two things a program does not: code that never touches the floating-point and SIMD
+registers — so exception entry and a context switch need not save that file, and code that runs before
+the unit is switched on cannot trap on it — and code whose every access is aligned, since with the MMU
+off all memory is Device memory and an unaligned access faults. The `codegen` block says so:
+
+```hocon
+codegen {
+  general_regs_only = true
+  strict_align      = true
+}
+```
+
+They are clang's `-mgeneral-regs-only` and `-mstrict-align`, and they reach **every** place code is
+generated for the build: the LLVM text's function attributes (`emit-llvm` shows
+`"target-features"="+strict-align,-fp-armv8,-neon"` on aarch64), every clang that compiles that text,
+a package's carried C and a `c const` probe, and the standard module, which is compiled under the same
+settings and kept in a cache directory of its own (its name ends `-gro`, `-sa` or `-gro-sa`).
+`--general-regs-only` and `--strict-align` turn a setting on for one build; nothing on the command
+line turns one off.
+
+The block may also be written inside a [`targets`](#capabilities) entry, where it layers over the
+project's as `capabilities` does — useful when the same tree is tested on the host and built for a
+board:
+
+```hocon
+targets {
+  aarch64-freestanding {
+    codegen {
+      general_regs_only = true
+      strict_align      = true
+    }
+  }
+}
+```
+
+### Only the root project's block applies
+
+What registers an image may touch is a property of the whole image, so a dependency cannot turn them
+back on under its consumer, and its own `codegen` block is ignored, as its `optimization` is.
+
+### What each machine does with it
+
+| | `general_regs_only` | `strict_align` |
+|---|---|---|
+| aarch64 (every system) | no FP/SIMD register: `-fp-armv8,-neon` | `+strict-align` |
+| x86_64 | no x87, MMX or SSE register | refused — x86 has no strict mode |
+| Thumb | refused — build for a row with no unit | `-mno-unaligned-access` |
+| RISC-V | refused — the F and D extensions are the triple's ABI | `-mstrict-align` |
+| wasm32 | refused | refused |
+
+A setting a machine has no meaning for is **refused**, before anything is built, rather than
+dropped. On Thumb the floating-point unit is part of the calling convention the row names, so turning
+it off is a different machine — and the registry has it: `thumb-freestanding-soft` and
+`thumbv6m-freestanding` already never touch a floating-point register.
+
+### A float under `general_regs_only` is refused
+
+With the unit's features off, LLVM does not complain: it quietly moves every float to the soft-float
+convention, a multiply becomes a call to `__muldf3`, and the image fails to link or links against code
+built for the other convention. So the compiler refuses instead, once per function, at its signature
+where a parameter or the result is a float and otherwise at the first floating expression in its body:
+
+```text
+error: 'scale' computes with 'real' here, and this build keeps to the general-purpose registers
+('codegen.general_regs_only' in package.hocon, or '--general-regs-only') — a floating-point value has
+no register to live in. Compute in integers or fixed point, or build without the setting
+ --> main.sysl:3:13
+  |
+3 |     val x = real(n) * 1.5
+  |             ^^^^^^^^^^^^^
+```
+
+Every function the build emits is asked, the standard module's included. A struct that merely holds a
+float and is copied whole is not a float use; reading the field out is.
+
 ## Capabilities
 
 **Whether the machine has a heap, an operating system or POSIX is a project engineering
