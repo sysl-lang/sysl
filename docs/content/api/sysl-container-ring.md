@@ -42,7 +42,7 @@ So wrapping is a compare and a subtract instead of a mask, which is what `seat` 
 
 ## Index
 
-[`ring`](#ring) [`Ring`](#ring-1) [`RingCursor`](#ringcursor) [Index for Ring[T]](#index-for-ringt) [IndexSet for Ring[T]](#indexset-for-ringt) [Iterate for RingCursor[T]](#iterate-for-ringcursort)
+[`ring`](#ring) [`Ring`](#ring-1) [`RingCursor`](#ringcursor) [Index for Ring[T]](#index-for-ringt) [IndexSet for Ring[T]](#indexset-for-ringt) [Iterate for RingCursor[T]](#iterate-for-ringcursort) [Walk for Ring[T]](#walk-for-ringt)
 
 ## Functions
 
@@ -93,7 +93,6 @@ it.
 | `pop_back` | `pop_back(*self) -> Option[T]` | Takes from the back. |
 | `overwrite` | `overwrite(*self, v: T) -> Option[T]` | Adds to the back, **dropping the oldest value to make room** where the ring is full, and answers whatever was dropped. |
 | `clear` | `clear(*self)` | Forgets every value. |
-| `walk` | `walk(self) -> RingCursor[T]` | A walk from the front to the back. |
 
 ### `RingCursor`
 
@@ -131,3 +130,11 @@ impl[T] IndexSet[usize, T] for Ring[T]
 ```sysl
 impl[T] Iterate for RingCursor[T]
 ```
+
+### Walk for Ring[T]
+
+```sysl
+impl[T] Walk for Ring[T]
+```
+
+`for x in r` walks a ring from the front to the back, through the cursor `walk` answers.

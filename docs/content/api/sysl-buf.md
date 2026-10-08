@@ -15,7 +15,7 @@ sink is `str(x)`, and that goes through storage the compiler lays out rather tha
 
 ## Index
 
-[`buf`](#buf) [`buf_with_capacity`](#buf_with_capacity) [`byte_sink`](#byte_sink) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [Display for Buf[T]](#display-for-buft) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Writer for ByteSink](#writer-for-bytesink)
+[`buf`](#buf) [`buf_with_capacity`](#buf_with_capacity) [`byte_sink`](#byte_sink) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [Display for Buf[T]](#display-for-buft) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Walk for Buf[T]](#walk-for-buft) [Writer for ByteSink](#writer-for-bytesink)
 
 ## Functions
 
@@ -51,49 +51,49 @@ byte_sink() -> ByteSink
 
 ```sysl
 struct Buf[T]
-    elems: []T
-    count: usize
+    private core: &BufCore[T]
 ```
 
-A sequence that grows, over a `[]T` it replaces when it runs out.
+A sequence that grows, and the name every holder of it shares.
 
-It is ordinary sysl rather than a built-in because a `[]T` that can be sized while running is all
-it needs: `push` allocates a slice twice the size and copies, so the amortized cost is the one a
-growable sequence has anywhere, and none of it is underneath the language.
+**A `Buf` is a reference, the way a collection is in most languages a program will have met.**
+Assigning one, passing it, capturing it in a closure, keeping it in a struct and reading it back
+out of another container all hand over a second name for the *same* buffer, so a push through any
+of them is seen through every other -- `Buf[Buf[int]]` included, where `outer.at(0).push(x)`
+grows the inner buffer the outer one holds. A program that wants a second buffer asks for one with
+`buf()` and fills it.
 
-**The spare capacity holds nothing.** The storage comes from `slot_storage`, whose slots start out
-empty: a buffer box releases only its *live prefix*, and `slot_place` is what fills the first slot
-past it. So a push of a counted value takes exactly one count for the buffer, and a slot this
-buffer has given up -- by `pop`, `truncate`, `clear` or `remove` -- is let go of by `slot_vacate`
-there and then, which is when a destructor behind it runs. The one exception is storage somebody
-else is still reading: a `view()` held elsewhere, or a copy of this buffer, keeps those slots
-alive until it lets go, and the next shortening after that releases them.
+What it holds is one counted reference to a `BufCore`, which carries the storage, the count and
+the clause tying them together; every member here delegates to it. So the price of sharing is one
+load per access and one allocation per buffer made, and `push` keeps the shape that lets a caller
+absorb it -- marked `@inline` here as on the core, so a push through the handle is still a store.
+The elements are let go of when the *last* name for the buffer dies, or earlier, by `pop`,
+`truncate`, `clear` and `remove`, exactly as before.
+
+**It has no zero value.** A buffer is a box, and a box is made by somebody, so `var b: Buf[int]`
+with nothing after it is refused -- write `= buf()`.
 
 The bounds-checked members panic rather than returning an `Option`, which is the same bargain
 `unwrap` makes -- an index past the end is a mistake in the program, not a value it meant to
 handle -- while `pop` returns one, because taking from an empty sequence is a question a caller
 asks on purpose.
 
-**The count never passes the storage, and the type says so.** The clause is checked wherever
-either field is written, which in this module is at a handful of places the storage has just made
-room at -- and in return every member is told it on entry. That is what makes `at` one compare:
-the index is tested against `count` for the panic, and the slice's own test against `elems.len`
-is then implied by it and folds.
-
 | Member | Signature | Description |
 |---|---|---|
+| `elems` | `elems -> []T` | The storage, spare capacity included -- for a reader that wants the address of an element, as `&b.elems[i]` is. |
 | `len` | `len(self) -> usize` |  |
 | `cap` | `cap(self) -> usize` |  |
 | `is_empty` | `is_empty(self) -> bool` |  |
 | `at` | `at(self, i: usize) -> T` |  |
-| `set` | `set(*self, i: usize, v: T)` |  |
-| `push` | `push(*self, v: T)` | One element appended, after growing the storage where there is no room left for it. |
-| `extend` | `extend(*self, xs: []const T)` | Every element of a slice appended at once, which is what `push` in a loop was costing more than it looked like. |
-| `pop` | `pop(*self) -> Option[T]` | The last element, taken out. |
-| `truncate` | `truncate(*self, n: usize)` | The elements from `n` on, given up -- each let go of now rather than when the storage goes, which is when a destructor behind one runs. |
-| `clear` | `clear(*self)` |  |
-| `insert` | `insert(*self, i: usize, v: T)` | An element put at `i`, with everything from there on moved up one. |
-| `remove` | `remove(*self, i: usize) -> T` |  |
+| `set` | `set(self, i: usize, v: T)` |  |
+| `push` | `push(self, v: T)` |  |
+| `extend` | `extend(self, xs: []const T)` |  |
+| `pop` | `pop(self) -> Option[T]` |  |
+| `truncate` | `truncate(self, n: usize)` |  |
+| `clear` | `clear(self)` |  |
+| `insert` | `insert(self, i: usize, v: T)` |  |
+| `remove` | `remove(self, i: usize) -> T` |  |
+| `copy` | `copy(self) -> Buf[T]` | A second buffer holding the same elements, sized to them -- the one way to get a buffer that is not this one, every other way of handing a `Buf` on handing on this one. |
 | `view` | `view(self) -> []T` | The elements as a slice, which is what everything reading a `Buf` in bulk goes through. |
 
 ### `ByteSink`
@@ -167,6 +167,16 @@ means what `b.at(i)` means and cannot read a slot past the count that the backin
 ```sysl
 impl[T] IndexSet[usize, T] for Buf[T]
 ```
+
+### Walk for Buf[T]
+
+```sysl
+impl[T] Walk for Buf[T]
+```
+
+`for x in b` walks `view()`: the elements the buffer held when the loop began, read by index as a
+slice's are, rather than through a cursor that would cost a call apiece. An element pushed during
+the walk is not visited, the view having been taken before the first turn.
 
 ### Writer for ByteSink
 

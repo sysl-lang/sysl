@@ -60,7 +60,7 @@ to prefer — RFC 6724 says how a machine sorts them, and second-guessing it her
 module inventing policy that is not its to have. So the ordinary client is a loop:
 
 ```
-for a in resolve("example.com", 80)?.view()
+for a in resolve("example.com", 80)?
     var s = socket(a)?
     if s.connect(a).is_ok() then break
     s.close()

@@ -18,7 +18,7 @@ and when to reach for it instead of its neighbour.
 
 ## Index
 
-[`deque`](#deque) [`deque_with_capacity`](#deque_with_capacity) [`difference`](#difference) [`heap`](#heap) [`heap_of`](#heap_of) [`heap_with_capacity`](#heap_with_capacity) [`intersection`](#intersection) [`is_subset`](#is_subset) [`list`](#list) [`list_of`](#list_of) [`map`](#map) [`map_with_capacity`](#map_with_capacity) [`set`](#set) [`set_of`](#set_of) [`set_with_capacity`](#set_with_capacity) [`union`](#union) [`Cursor`](#cursor) [`Deque`](#deque-1) [`DequeCursor`](#dequecursor) [`Heap`](#heap-1) [`List`](#list-1) [`ListCursor`](#listcursor) [`Map`](#map-1) [`Set`](#set-1) [`SetCursor`](#setcursor) [`Slot`](#slot) [Index for Deque[T]](#index-for-dequet) [IndexSet for Deque[T]](#indexset-for-dequet) [Iterate for Cursor[K, V]](#iterate-for-cursork-v) [Iterate for DequeCursor[T]](#iterate-for-dequecursort) [Iterate for ListCursor[T]](#iterate-for-listcursort) [Iterate for SetCursor[K]](#iterate-for-setcursork)
+[`deque`](#deque) [`deque_with_capacity`](#deque_with_capacity) [`difference`](#difference) [`heap`](#heap) [`heap_of`](#heap_of) [`heap_with_capacity`](#heap_with_capacity) [`intersection`](#intersection) [`is_subset`](#is_subset) [`list`](#list) [`list_of`](#list_of) [`map`](#map) [`map_with_capacity`](#map_with_capacity) [`set`](#set) [`set_of`](#set_of) [`set_with_capacity`](#set_with_capacity) [`union`](#union) [`Cursor`](#cursor) [`Deque`](#deque-1) [`DequeCursor`](#dequecursor) [`Heap`](#heap-1) [`List`](#list-1) [`ListCursor`](#listcursor) [`Map`](#map-1) [`Set`](#set-1) [`SetCursor`](#setcursor) [`Slot`](#slot) [Index for Deque[T]](#index-for-dequet) [IndexSet for Deque[T]](#indexset-for-dequet) [Iterate for Cursor[K, V]](#iterate-for-cursork-v) [Iterate for DequeCursor[T]](#iterate-for-dequecursort) [Iterate for ListCursor[T]](#iterate-for-listcursort) [Iterate for SetCursor[K]](#iterate-for-setcursork) [Walk for Deque[T]](#walk-for-dequet) [Walk for List[T]](#walk-for-listt) [Walk for Map[K, V]](#walk-for-mapk-v) [Walk for Set[K]](#walk-for-setk)
 
 ## Functions
 
@@ -123,19 +123,21 @@ map[K: Hash + Eq, V]() -> Map[K, V]
 
 An empty map, which holds **no table at all** until something is put in it.
 
-**An empty map does not allocate**, which matters far more than it looks: a map built inside a
-loop, held in a struct that is usually empty, or made and dropped on a branch that turns out not
-to be taken costs a `malloc` and the `free` behind it every time, and no caller can see that it is
-paying. The first `put` finds the table over its load -- nothing is over nothing -- and rehashes
-to `initial_slots` before it places anything, which is the path `put` already took for a table
-that had filled up. So there is no separate "grow from empty" case to get wrong.
+**An empty map allocates one small cell and no table**, which matters far more than it looks: a
+map built inside a loop, held in a struct that is usually empty, or made and dropped on a branch
+that turns out not to be taken would otherwise pay for a table of slots every time, and no caller
+can see that it is paying. The cell is the `MapCore` every name for the map shares -- three words,
+whatever the key and value. The first `put` finds the table over its load -- nothing is over
+nothing -- and rehashes to `initial_slots` before it places anything, which is the path `put`
+already took for a table that had filled up. So there is no separate "grow from empty" case to get
+wrong.
 
 Reach for `map_with_capacity` where entries are known to be coming: a caller who names a size is
 saying so, and gets its table immediately.
 
-**The annotation on `m` is required and is not noise.** `Map`'s parameters would have to come from
-the constructor's arguments while the empty table waits to hear what it is a table of, and neither
-can go first.
+**The annotation on `core` is required and is not noise.** `MapCore`'s parameters would have to
+come from the constructor's arguments while the empty table waits to hear what it is a table of,
+and neither can go first.
 
 ### `map_with_capacity`
 
@@ -195,9 +197,7 @@ walking a table hashes nothing and compares nothing, so a cursor asks nothing of
 
 ```sysl
 struct Deque[T]
-    private elems: []Option[T]
-    head: usize
-    count: usize
+    private core: &DequeCore[T]
 ```
 
 A sequence that grows and that is cheap to take from at **either** end.
@@ -225,6 +225,11 @@ so wrapping is a mask rather than a division. That invariant is worth stating be
 every index calculation here assumes -- there is no `%` anywhere below, and a growth path that
 produced a non-power-of-two length would break all of them at once rather than visibly.
 
+**A `Deque` is a reference to its ring, not the ring.** Assigning one, passing it, capturing it in a
+closure or reading it out of another container gives a second name for the same deque: a
+`push_front` through either is seen by both, a growth included. A destructor behind an element runs
+when the element is taken out, or when the last name for the deque goes.
+
 The bounds-checked members panic rather than answering an `Option`, which is the bargain `Buf`
 makes for the same reason: an index past the end is a mistake in the program. `pop_front` and
 `pop_back` answer an `Option`, because taking from an empty sequence is a question a caller asks
@@ -232,19 +237,21 @@ on purpose.
 
 | Member | Signature | Description |
 |---|---|---|
+| `head` | `head -> usize` | Where the first element sits in the storage. |
+| `count` | `count -> usize` | How many elements there are -- `len()` under the name the field had. |
 | `len` | `len(self) -> usize` |  |
 | `cap` | `cap(self) -> usize` |  |
 | `is_empty` | `is_empty(self) -> bool` |  |
 | `at` | `at(self, i: usize) -> T` |  |
-| `set` | `set(*self, i: usize, v: T)` |  |
+| `set` | `set(self, i: usize, v: T)` |  |
 | `first` | `first(self) -> Option[T]` |  |
 | `last` | `last(self) -> Option[T]` |  |
-| `push_back` | `push_back(*self, v: T)` |  |
-| `push_front` | `push_front(*self, v: T)` | The end `Buf` has no answer for at all. |
-| `pop_front` | `pop_front(*self) -> Option[T]` |  |
-| `pop_back` | `pop_back(*self) -> Option[T]` |  |
-| `clear` | `clear(*self)` | The elements dropped and the head put back at the start. |
-| `walk` | `walk(self) -> DequeCursor[T]` |  |
+| `push_back` | `push_back(self, v: T)` |  |
+| `push_front` | `push_front(self, v: T)` | The end `Buf` has no answer for at all. |
+| `pop_front` | `pop_front(self) -> Option[T]` |  |
+| `pop_back` | `pop_back(self) -> Option[T]` |  |
+| `clear` | `clear(self)` | The elements dropped and the head put back at the start. |
+| `copy` | `copy(self) -> Deque[T]` | A second deque holding the same elements in the same order, the front put back at the start of its storage -- the one way to get a deque that is not this one, every other way of handing a `Deque` on handing on this one. |
 
 ### `DequeCursor`
 
@@ -295,9 +302,9 @@ is read in order, and it is the only way that answers truthfully.
 | `len` | `len(self) -> usize` |  |
 | `is_empty` | `is_empty(self) -> bool` |  |
 | `peek` | `peek(self) -> Option[T]` | The smallest element, left where it is. |
-| `push` | `push(*self, v: T)` | An element added, then carried up past every parent it is smaller than. |
-| `pop` | `pop(*self) -> Option[T]` | The smallest element removed and returned. |
-| `clear` | `clear(*self)` |  |
+| `push` | `push(self, v: T)` | An element added, then carried up past every parent it is smaller than. |
+| `pop` | `pop(self) -> Option[T]` | The smallest element removed and returned. |
+| `clear` | `clear(self)` |  |
 
 ### `List`
 
@@ -324,7 +331,6 @@ constant time for the rest of the list's life.
 | `uncons` | `uncons(self) -> Option[(T, List[T])]` | The first element and the rest, in one question. |
 | `prepend` | `prepend(self, v: T) -> List[T]` | A new list with `v` on the front, sharing the whole of this one. |
 | `reverse` | `reverse(self) -> List[T]` | The same elements in the opposite order, which costs a cell each because nothing of the original can be shared: a reversed list's tails are not tails of the original. |
-| `walk` | `walk(self) -> ListCursor[T]` |  |
 
 ### `ListCursor`
 
@@ -343,29 +349,46 @@ through a list that nothing else refers to still owns the cells it has not reach
 
 ```sysl
 struct Map[K: Hash + Eq, V]
-    cell: []Slot[K, V]
-    count: usize
-    dead: usize
+    private core: &MapCore[K, V]
 ```
 
 A mapping from keys to values, with a key found in constant time on average.
 
-`dead` is carried rather than recomputed because it decides when to rehash and is asked for on
-every insert; counting tombstones would be a walk of the whole table to answer a question about
-one slot.
+**A `Map` is a reference to one table, like Scala's `mutable.HashMap`.** Assigning it, passing it,
+capturing it in a closure or reading it out of another container gives a second name for the same
+map, so a `put` through either name is seen through both:
+
+```sysl
+var m: Map[int, int] = map()
+var n = m
+
+n.put(1, 10)
+print(m.len(), m.get(1).unwrap_or(0))      // 1 10
+```
+
+**It has no zero value**, the table it names having to exist, so a declaration says where its map
+comes from: `var m: Map[string, int] = map()`.
+
+What a `Map` holds is one counted reference to a `MapCore`, which carries the table and its two
+counts. Holding the counts beside the table is what makes the sharing whole: a map whose copies
+each carried their own counts over one shared table would let a `put` through one copy write an
+entry the other's count never learned of.
 
 | Member | Signature | Description |
 |---|---|---|
+| `cell` | `cell -> []Slot[K, V]` | The table itself, every slot of it, for a reader that wants to look rather than ask. |
+| `count` | `count -> usize` | How many entries are live. |
+| `dead` | `dead -> usize` | How many tombstones the table is carrying. |
 | `len` | `len(self) -> usize` |  |
 | `is_empty` | `is_empty(self) -> bool` |  |
 | `capacity` | `capacity(self) -> usize` | How many slots the table has, which is what the load factor is measured against. |
 | `get` | `get(self, k: K) -> Option[V]` |  |
 | `get_or` | `get_or(self, k: K, default: V) -> V` | The value a key names, or the one the caller supplies where it names none. |
 | `has` | `has(self, k: K) -> bool` |  |
-| `put` | `put(*self, k: K, v: V)` | A key given a value: the entry it already had takes the new one, or a fresh entry is placed. |
-| `remove` | `remove(*self, k: K) -> bool` | A key taken out, answering whether it was there. |
-| `clear` | `clear(*self)` | Every entry dropped and the table let go entirely, so that a map used as scratch across a loop does not keep the largest table any pass through it needed -- and a map that is cleared and never used again costs nothing at all. |
-| `walk` | `walk(self) -> Cursor[K, V]` | A cursor over the entries, in no particular order -- the order is the table's, which changes when it rehashes and is not something a program may rely on. |
+| `put` | `put(self, k: K, v: V)` | A key given a value: the entry it already had takes the new one, or a fresh entry is placed. |
+| `remove` | `remove(self, k: K) -> bool` | A key taken out, answering whether it was there. |
+| `clear` | `clear(self)` | Every entry dropped and the table let go entirely; see `MapCore.clear`. |
+| `copy` | `copy(self) -> Map[K, V]` | A second map holding the same entries, its table sized to them -- the one way to get a map that is not this one, every other way of handing a `Map` on handing on this one. |
 
 ### `Set`
 
@@ -396,10 +419,9 @@ the key is in the map at all.
 | `is_empty` | `is_empty(self) -> bool` |  |
 | `capacity` | `capacity(self) -> usize` |  |
 | `has` | `has(self, k: K) -> bool` |  |
-| `add` | `add(*self, k: K) -> bool` | A key put in, answering whether it was **new**. |
-| `remove` | `remove(*self, k: K) -> bool` | A key taken out, answering whether it was there. |
-| `clear` | `clear(*self)` |  |
-| `walk` | `walk(self) -> SetCursor[K]` |  |
+| `add` | `add(self, k: K) -> bool` | A key put in, answering whether it was **new**. |
+| `remove` | `remove(self, k: K) -> bool` | A key taken out, answering whether it was there. |
+| `clear` | `clear(self)` |  |
 
 ### `SetCursor`
 
@@ -480,3 +502,35 @@ impl[T] Iterate for ListCursor[T]
 ```sysl
 impl[K] Iterate for SetCursor[K]
 ```
+
+### Walk for Deque[T]
+
+```sysl
+impl[T] Walk for Deque[T]
+```
+
+`for x in d` walks a deque from the front to the back, through the cursor `walk` answers.
+
+### Walk for List[T]
+
+```sysl
+impl[T] Walk for List[T]
+```
+
+`for x in l` walks a list from its head, through the cursor `walk` answers.
+
+### Walk for Map[K, V]
+
+```sysl
+impl[K: Hash + Eq, V] Walk for Map[K, V]
+```
+
+`for (k, v) in m` walks the entries, a pair apiece, through the cursor `walk` answers.
+
+### Walk for Set[K]
+
+```sysl
+impl[K: Hash + Eq] Walk for Set[K]
+```
+
+`for k in s` walks the keys, in the map's order, through the cursor `walk` answers.

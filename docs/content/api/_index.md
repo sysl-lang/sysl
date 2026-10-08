@@ -20,6 +20,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.crypto`](sysl-crypto/) | Cryptographic hashing: the SHA-2 family, SHA-1 and MD5, HMAC over any of them, and PBKDF2. |
 | [`sysl.encoding`](sysl-encoding/) | Bytes as text and text as bytes: hexadecimal, base64, UUIDs, and fixed-width integers at either byte order. |
 | [`sysl.env`](sysl-env/) | Reading the environment a program was started with. |
+| [`sysl.fmt`](sysl-fmt/) | What an `f"…"` hole's computed width or precision comes to — `${x}%.${n}f`, `${s}%${w}s`. |
 | [`sysl.fs`](sysl-fs/) | What is at the end of a path: reading and writing whole files, metadata, directories, links, and the errors any of it can answer with. |
 | [`sysl.harness`](sysl-harness/) | A test framework that runs on the target. |
 | [`sysl.io`](sysl-io/) | The byte surface a program reads through, and the line cursor over it. |
