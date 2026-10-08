@@ -1,0 +1,182 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+
+// CRAFT -- the first row in the registry that is **sixteen bits wide** and the first that no clang
+// can build for.
+//
+// Both take it out of every sweep that hands a module to clang, so this reads the module instead and
+// states the facts about the machine that reach the *types* the compiler writes. That `llc
+// -march=craft` accepts the module is the CRAFT repository's own suite, against a toolchain this one
+// has no way to require.
+
+private tgz_craft() -> Target = target_named("craft-freestanding").unwrap()
+
+// The LLVM text `emit-llvm --target craft-freestanding` prints for one file, or what it said instead.
+private tgz_craft_ir(text: string) -> string
+    val root = make_temp_dir("sysl-tgz-craft").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", Some("craft-freestanding")) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tgz_craft_ir
+
+// -- the machine ----------------------------------------------------------------------------------
+
+@test("is sixteen bits, which is the whole of what makes it different")
+tgz_craft_is_sixteen_bits()
+    val craft = tgz_craft()
+
+    assert_eq(cpu_bits(craft.cpu), 16)
+    assert_eq(craft.pointer_bits(), 16)
+    assert_eq(layout_for(craft).word_bits, 16)
+    assert_eq(craft.pointer_bytes(), 2)
+end tgz_craft_is_sixteen_bits
+
+// The bare word rather than a three-field triple, because that is what the out-of-tree back end
+// registers itself under.
+@test("names itself to LLVM as 'craft', with no vendor and no system")
+tgz_craft_names_itself_craft()
+    assert_eq(tgz_craft().triple, "craft")
+    assert_eq(cpu_backend(Craft), "craft")
+
+// One spelling serves `#if` and an `asm` arm alike, and the coverage rule is exhaustive over the
+// processors the compiler lowers for -- so every assembly statement owes this arm.
+@test("is a processor a program can gate on and write assembly for")
+tgz_craft_can_be_gated_on()
+    val craft = tgz_craft()
+
+    assert_eq(cpu_symbol(craft.cpu), "craft")
+    assert(craft.supported(), "CRAFT is among the processors the compiler lowers for")
+    assert(has(symbols(), "craft"), "a condition may name it")
+    assert(has(defined(craft), "craft"), "and it is true when building for CRAFT")
+end tgz_craft_can_be_gated_on
+
+@test("has no floating-point unit and no convention about one")
+tgz_craft_has_no_unit()
+    val craft = tgz_craft()
+
+    assert(craft.no_fpu, "no unit")
+    assert(craft.soft_float, "the soft convention")
+    assert(!craft.hard_float(), "and not the hard one")
+    assert_eq(craft.fpu, "")
+end tgz_craft_has_no_unit
+
+// A trap arrives at one vector with the reason in `cause`, so what the hardware reaches is the
+// kernel's decoder rather than a handler.
+@test("has traps and still no interrupt form")
+tgz_craft_has_no_interrupt_form()
+    interrupt_form(Craft) match
+        FormAbsent(why) -> assert(why.contains("cause"), why)
+        _ -> assert(false, "CRAFT was given an interrupt form")
+
+// -- the toolchain ---------------------------------------------------------------------------------
+
+@test("is the one target sysl will not drive a build for")
+tgz_craft_is_the_one_without_a_build()
+    assert(!tgz_craft().builds_with_clang(), "CRAFT has no clang")
+
+    val all = all_targets()
+    var refused: Buf[string] = buf()
+
+    for i in 0..<all.len()
+        if !all.at(i).builds_with_clang() then refused.push(all.at(i).name)
+
+    assert_eq(refused.len(), 1)
+    assert_eq(refused.at(0), "craft-freestanding")
+end tgz_craft_is_the_one_without_a_build
+
+// The refusal is about the driver, not about the compiler -- a reader told otherwise would go looking
+// for a missing back end.
+@test("lowers, so it is named rather than refused at the registry")
+tgz_craft_lowers()
+    val craft = tgz_craft()
+
+    assert(craft.supported(), "CRAFT lowers")
+    assert(craft.unsupported().is_none(), "and nothing is said to be missing")
+    assert(target_resolved("craft-freestanding").is_ok(), "the name resolves")
+    assert_eq(target_resolved("craft-freestanding").unwrap().triple, craft.triple)
+end tgz_craft_lowers
+
+// An artifact is an archive of objects, so a machine with no object format has nowhere to put one:
+// the library's bodies are lowered into the program's own text, which is the road that needs no
+// toolchain at all. Every other machine links an artifact.
+@test("takes the standard module as source, having nowhere to put an artifact")
+tgz_craft_takes_the_library_as_source()
+    if std_root().is_err() then return
+
+    val craft = tgz_craft()
+
+    assert(std_linked(craft, DefaultOptimization, !craft.builds_with_clang()).unwrap().is_none(),
+           "CRAFT links no artifact")
+    assert(host_target().builds_with_clang(), "the default machine takes the artifact road")
+
+    // And the road is taken: a library body is defined in the program's own module.
+    val ir = tgz_craft_ir(raw"""
+        import sysl.slices.sort
+
+        var xs: [3]int = [3, 1, 2]
+        sort(xs[..])
+        """)
+
+    assert(ir.contains("target triple = \"craft\""), ir)
+    assert(ir.contains("define void @sysl.slices$sort.int("), ir)
+end tgz_craft_takes_the_library_as_source
+
+@test("says what does work when it refuses")
+tgz_craft_says_what_works()
+    val said = tgz_craft().no_toolchain()
+
+    assert(said.contains("emit-llvm"), said)
+    assert(said.contains("llc -march=craft"), said)
+    assert(said.contains("craft as"), said)
+end tgz_craft_says_what_works
+
+// -- the module it writes --------------------------------------------------------------------------
+
+@test("states the triple the back end is registered under")
+tgz_craft_module_states_its_triple()
+    if std_root().is_err() then return
+
+    val ir = tgz_craft_ir("var n = 1\n")
+
+    assert(ir.contains("target triple = \"craft\""), ir)
+end tgz_craft_module_states_its_triple
+
+// The one fact about the machine that reaches the *types*: a view's length is a `usize`, so a slice
+// and everything holding one is written differently here.
+@test("gives a view a sixteen-bit length")
+tgz_craft_view_length_is_sixteen_bits()
+    if std_root().is_err() then return
+
+    val ir = tgz_craft_ir(raw"""
+        add(xs: []const int) -> int
+            var total = 0
+            for x in xs
+                total += x
+            total
+        var got = add([1, 2, 3])
+        """)
+
+    assert(ir.contains("{ ptr, ptr, i16 }"), ir)
+    assert(!ir.contains("{ ptr, ptr, i64 }"), ir)
+end tgz_craft_view_length_is_sixteen_bits
+
+// `int` is 32 bits on every machine, a width being the language's answer and not the target's -- so
+// here ordinary arithmetic is wider than a register, and the back end below expands it.
+@test("keeps an int at thirty-two bits, which is wider than the machine")
+tgz_craft_int_is_thirty_two_bits()
+    if std_root().is_err() then return
+
+    val ir = tgz_craft_ir("var a = 6\nvar b = a * 7\n")
+
+    assert(ir.contains("i32"), ir)
+end tgz_craft_int_is_thirty_two_bits
