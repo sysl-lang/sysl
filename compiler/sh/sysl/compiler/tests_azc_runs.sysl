@@ -1,0 +1,595 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Five more of the reference's suites, ported, whose claims are about what a program DOES or what
+// its text IS rather than what it is refused with: a data enum's payload region (`LayoutTests`), a
+// module slot holding a variant that carries nothing (`StaticEnumStorageTests`), a by-name
+// parameter read inside a closure or a nested function (`ByNameTests`), what a program says when it
+// overflows its stack (`StackGuardTests`), and a `main` answering a `Result` (`MainResultTests`).
+// Every expected text was read off 0.0.162 over the same program, and is held of it again where
+// `SYSL_ORACLE` names it.
+
+// `head` begins a line of the LLVM text every compiler emits for `files`.
+private azc_emits(files: []const (string, string), head: string)
+    val texts = azc_texts(["emit-llvm"], files)
+
+    for i in 0..<texts.len()
+        assert(azc_line(texts.at(i).1, head) != "", s"${texts.at(i).0}: no line '$head'")
+
+// -- the payload region ---------------------------------------------------------------------------
+
+private azc_packed(values: string) -> string = raw"""
+    enum Packed
+        Four(a: u12, b: u12, c: u12, d: u12)
+        One(v: u8)
+
+    """ + s"var p = Four($values)\n" + raw"""
+    p match
+        Four(a, b, c, d) -> print(a, b, c, d)
+        One(v) -> print(v)
+    """
+
+@test("a payload region wide enough for a variant of odd-width fields")
+azc_a_region_wide_enough_for_odd_widths()
+    if !rng_ready() then return
+
+    azc_emits([("main.sysl", azc_packed("1, 2, 3, 4"))], "%enum.Packed = type { i32, [4 x i16] }")
+
+@test("and the values come back out of one")
+azc_odd_width_values_come_back()
+    if !rng_ready() then return
+
+    azc_main_prints(azc_packed("4095, 1, 4095, 2"), "4095 1 4095 2\n")
+
+@test("a simple enum is not an aggregate")
+azc_a_simple_enum_is_not_an_aggregate()
+    if !rng_ready() then return
+
+    val texts = azc_texts(["emit-llvm"], [("main.sysl", raw"""
+        enum Color
+            Red
+            Green
+        which(c: Color) -> int
+            c match
+                Red -> 0
+                Green -> 1
+        print(which(Red))
+        """)])
+
+    for i in 0..<texts.len()
+        assert(!texts.at(i).1.contains("%enum.Color = type"), texts.at(i).0)
+
+@test("one variant, one region the size of it")
+azc_one_variant_one_region()
+    if !rng_ready() then return
+
+    azc_emits([("main.sysl", raw"""
+        enum Box
+            Full(n: int)
+            Empty
+        held(b: Box) -> int
+            b match
+                Full(n) -> n
+                Empty -> 0
+        print(held(Full(1)))
+        """)], "%enum.Box = type { i32, [1 x i32] }")
+
+@test("a variant carrying a struct is as wide as the struct")
+azc_a_variant_carrying_a_struct()
+    if !rng_ready() then return
+
+    val files = [("main.sysl", raw"""
+        struct P
+            x: i64
+            y: u8
+        enum E
+            One(p: P)
+            Two(n: int)
+        which(e: E) -> int
+            e match
+                One(p) -> int(p.y)
+                Two(n) -> n
+        print(which(One(P(1i64, 2u8))))
+        """)]
+
+    azc_emits(files, "%struct.P = type { i64, i8 }")
+    azc_emits(files, "%enum.E = type { i32, [2 x i64] }")
+
+@test("a payload of nothing asks for no region")
+azc_a_payload_of_nothing()
+    if !rng_ready() then return
+
+    val files = [("main.sysl", raw"""
+        enum E
+            Nothing(n: unit)
+            Something
+        which(e: E) -> int
+            e match
+                Nothing(n) -> 1
+                Something -> 2
+        print(which(Something))
+        """)]
+
+    azc_emits(files, "%E.Nothing = type {  }")
+    azc_emits(files, "%enum.E = type { i32, [0 x i8] }")
+
+private azc_answer() -> string = raw"""
+    struct Moment
+        us: i64
+    struct Span
+        us: i64
+    enum Answer
+        Once(at: Moment)
+        Skipped(gap: Span, at: Moment, shifted: Moment)
+        Twice(earlier: Moment, later: Moment)
+    which(a: Answer) -> i64
+        a match
+            Once(at) -> at.us
+            Skipped(gap, at, shifted) -> gap.us + at.us + shifted.us
+            Twice(earlier, later) -> earlier.us + later.us
+    """
+
+@test("the widest variant sizes the region and the others share it")
+azc_the_widest_variant_sizes_the_region()
+    if !rng_ready() then return
+
+    azc_emits([("main.sysl", azc_answer() + raw"""
+        print(which(Skipped(Span(1i64), Moment(2i64), Moment(4i64))))
+        print(which(Twice(Moment(8i64), Moment(16i64))))
+        print(which(Once(Moment(32i64))))
+        """)], "%enum.Answer = type { i32, [3 x i64] }")
+
+@test("and every one of them reads back what it wrote")
+azc_every_variant_reads_back()
+    if !rng_ready() then return
+
+    azc_main_prints(azc_answer() + raw"""
+        var t: [3]Answer = [Once(Moment(32i64)); 3]
+        t[1usize] = Skipped(Span(1i64), Moment(2i64), Moment(4i64))
+        t[2usize] = Twice(Moment(8i64), Moment(16i64))
+        for i in 0..<3
+            print(which(t[usize(i)]))
+        """, "32\n7\n24\n")
+
+// -- a module slot holding a variant that carries nothing ----------------------------------------
+
+// A program whose entry file is `entry`, beside the module `slot` holding `held`: a line its text
+// begins with, and what it prints.
+private azc_slot_emits(entry: string, text: string, head: string) =
+    azc_emits([("main.sysl", entry), ("slot/s.sysl", text)], head)
+
+private azc_slot_prints(entry: string, text: string, want: string) =
+    azc_prints([("main.sysl", entry), ("slot/s.sysl", text)], want)
+
+private azc_option_none() -> string = raw"""
+    module slot
+
+    val held: Option[int] = None
+
+    peek() -> int = held match
+        Some(v) -> v
+        None -> 7
+    """
+
+private azc_where(nowhere_first: bool) -> string
+    val variants = if nowhere_first then "    Nowhere\n    Carried(n: int)\n"
+    else "    Carried(n: int)\n    Nowhere\n"
+
+    "module slot\n\nenum Where\n" + variants + raw"""
+        end Where
+
+        val held: Where = Where.Nowhere
+
+        peek() -> int = held match
+            Carried(n) -> n
+            Nowhere -> 7
+        """
+end azc_where
+
+@test("'None' at a payload-carrying enum, which is the case that blocked a board")
+azc_none_is_constant_data()
+    if !rng_ready() then return
+
+    azc_slot_emits("print(slot.peek())", azc_option_none(),
+                   "@slot$held = private constant %enum.sysl$Option.int { i32 1, [1 x i32] zeroinitializer }")
+
+@test("and at a trait pointer, which has no null a program could have written instead")
+azc_none_at_a_trait_pointer_is_constant()
+    if !rng_ready() then return
+
+    azc_slot_emits("print(slot.peek())", raw"""
+        module slot
+
+        val held: Option[*Display] = None
+
+        peek() -> int = held match
+            Some(_) -> 1
+            None -> 7
+        """, "@slot$held = private constant %enum.sysl$Option.ptr.sysl$Display { i32 1, [2 x i64] " +
+        "zeroinitializer }")
+
+@test("a variant whose tag is not zero, which cannot be 'zeroinitializer'")
+azc_a_nonzero_tag_is_written_out()
+    if !rng_ready() then return
+
+    azc_slot_emits("print(slot.peek())", azc_where(false),
+                   "@slot$held = private constant %enum.slot$Where { i32 1, [1 x i32] zeroinitializer }")
+
+@test("a variant whose tag IS zero, which is the whole-zero form")
+azc_a_zero_tag_is_zeroinitializer()
+    if !rng_ready() then return
+
+    azc_slot_emits("print(slot.peek())", azc_where(true),
+                   "@slot$held = private constant %enum.slot$Where zeroinitializer")
+
+@test("'None' rather than whatever a zeroed payload would be taken for")
+azc_none_reads_back_as_none()
+    if !rng_ready() then return
+
+    azc_slot_prints("print(slot.peek())", azc_option_none(), "7\n")
+
+@test("a non-zero tag rather than the variant sitting at zero")
+azc_a_nonzero_tag_reads_back()
+    if !rng_ready() then return
+
+    azc_slot_prints("print(slot.peek())", azc_where(false), "7\n")
+
+@test("a 'var' the program then writes, which is the shape a settable slot has")
+azc_a_settable_slot()
+    if !rng_ready() then return
+
+    azc_slot_prints("slot.install(4)\nprint(slot.peek())", raw"""
+        module slot
+
+        var held: Option[int] = None
+
+        install(n: int) = held = Some(n)
+
+        peek() -> int = held match
+            Some(v) -> v
+            None -> 7
+        """, "4\n")
+
+@test("so a slot holding one is filled by the prologue rather than laid down")
+azc_a_carried_variant_is_computed()
+    if !rng_ready() then return
+
+    azc_slot_emits("print(slot.peek())", raw"""
+        module slot
+
+        val held: Option[int] = Some(3)
+
+        peek() -> int = held match
+            Some(v) -> v
+            None -> 7
+        """, "@slot$held = private global %enum.sysl$Option.int zeroinitializer")
+
+// -- a by-name parameter read inside a body written in the body ------------------------------------
+
+@test("a closure of the body calls it")
+azc_by_name_in_a_closure()
+    if !rng_ready() then return
+
+    azc_main_prints(raw"""
+        in_closure(x: -> int) -> int
+            val g = () -> x + 1
+            g()
+
+        print(in_closure(41))
+        """, "42\n")
+
+@test("a nested function of the body calls it")
+azc_by_name_in_a_nested_function()
+    if !rng_ready() then return
+
+    azc_main_prints(raw"""
+        in_nested(x: -> int) -> int
+            inner() -> int = x + 2
+            inner()
+
+        print(in_nested(40))
+        """, "42\n")
+
+private azc_tick() -> string = raw"""
+    static var calls: int = 0
+
+    tick() -> int
+        calls += 1
+        print("eval")
+        calls
+
+    """
+
+@test("a closure evaluates the argument at every call of it")
+azc_a_closure_evaluates_at_every_call()
+    if !rng_ready() then return
+
+    azc_main_prints(azc_tick() + raw"""
+        closure_twice(x: -> int) -> int
+            val g = () -> x
+            g() + g()
+
+        print(closure_twice(tick()))
+        print(calls)
+        """, "eval\neval\n3\n2\n")
+
+@test("a nested function evaluates the argument at every read")
+azc_a_nested_function_evaluates_at_every_read()
+    if !rng_ready() then return
+
+    azc_main_prints(azc_tick() + raw"""
+        nested_twice(x: -> int) -> int
+            inner() -> int = x * 10
+            inner() + inner()
+
+        print(nested_twice(tick()))
+        print(calls)
+        """, "eval\neval\n30\n2\n")
+
+@test("a closure that outlives the call evaluates the argument when it is called")
+azc_a_closure_outliving_the_call()
+    if !rng_ready() then return
+
+    azc_main_prints(azc_tick() + raw"""
+        later(x: -> int) -> &Fn() -> int = () -> x * 100
+
+        val f = later(tick())
+        print("made")
+        print(f())
+        print(f())
+        print(calls)
+        """, "made\neval\n100\neval\n200\n2\n")
+
+@test("a closure inside a nested function reaches it through both")
+azc_a_closure_inside_a_nested_function()
+    if !rng_ready() then return
+
+    azc_main_prints(raw"""
+        deep(x: -> int) -> int
+            inner() -> int
+                val g = () -> x * 2
+                g()
+            inner()
+
+        print(deep(21))
+        """, "42\n")
+
+@test("the body still calls it after a closure is written")
+azc_the_body_still_calls_it()
+    if !rng_ready() then return
+
+    azc_main_prints(raw"""
+        after(x: -> int) -> int
+            val g = () -> 1
+            x + g()
+
+        print(after(41))
+        """, "42\n")
+
+// This compiler used to call the argument's callable for `x()`, where a by-name parameter names its
+// value: `x()` calls an `int`.
+@test("calling it inside a closure is refused, as it is in the body")
+azc_calling_a_by_name_parameter_is_refused()
+    if !rng_ready() then return
+
+    azc_refuses("in_body(x: -> int) -> int = x() + 1\n\nprint(in_body(41))\n",
+                "error: type 'int' has no method 'call'")
+    azc_refuses(raw"""
+        in_closure(x: -> int) -> int
+            val g = () -> x() + 1
+            g()
+
+        print(in_closure(41))
+        """, "error: type 'int' has no method 'call'")
+
+// -- the stack guard ------------------------------------------------------------------------------
+
+private azc_unbounded() -> string = raw"""
+    static var one: int = 1
+
+    deep(n: int) -> int
+        var pad: [256]int = [0; 256]
+
+        pad[0] = n
+
+        val r = deep(n + one)
+
+        pad[usize(r % 7)] + 1
+
+    print("about to recurse")
+    print(deep(1))
+    """
+
+private azc_wild() -> string = raw"""
+    static var addr: usize = 0x10
+
+    print("about to reach")
+    val p: *int = ptr_cast(addr)
+    print(*p)
+    """
+
+// What every compiler's build of `text` did when it ran.
+private azc_outcomes(text: string) -> Buf[(string, AzcSaid)]
+    val all = azc_compilers()
+    var out: Buf[(string, AzcSaid)] = buf()
+
+    for i in 0..<all.len()
+        val r = azc_ran([("main.sysl", text)], all.at(i))
+
+        assert(r.built, s"${rng_label(all.at(i))}: it did not build: ${r.err}")
+        out.push((rng_label(all.at(i)), r))
+
+    out
+end azc_outcomes
+
+@test("and names recursion rather than leaving a bare segfault")
+azc_an_overflow_names_recursion()
+    if !rng_ready() then return
+
+    val runs = azc_outcomes(azc_unbounded())
+
+    for i in 0..<runs.len()
+        assert(!runs.at(i).1.ok, runs.at(i).0)
+        assert(runs.at(i).1.err.contains("sysl: this program has overflowed its stack -- a recursion " +
+                                         "with no base case, or a walk over a structure that " +
+                                         "contains itself"), runs.at(i).1.err)
+
+@test("and what it had already printed comes out, which it did not before")
+azc_an_overflow_recovers_the_output()
+    if !rng_ready() then return
+
+    val runs = azc_outcomes(azc_unbounded())
+
+    for i in 0..<runs.len()
+        assert_eq(runs.at(i).1.out, "about to recurse\n", runs.at(i).0)
+
+@test("which is what makes the first message worth trusting")
+azc_a_wild_fault_is_not_an_overflow()
+    if !rng_ready() then return
+
+    val runs = azc_outcomes(azc_wild())
+
+    for i in 0..<runs.len()
+        assert(!runs.at(i).1.ok, runs.at(i).0)
+        assert(runs.at(i).1.err.contains("sysl: this program faulted on an address it does not own"),
+               runs.at(i).1.err)
+        assert(!runs.at(i).1.err.contains("overflowed"), runs.at(i).1.err)
+
+@test("and its buffered output is recovered too")
+azc_a_wild_fault_recovers_the_output()
+    if !rng_ready() then return
+
+    val runs = azc_outcomes(azc_wild())
+
+    for i in 0..<runs.len()
+        assert_eq(runs.at(i).1.out, "about to reach\n", runs.at(i).0)
+
+@test("a program that does not fault is untouched")
+azc_a_sound_program_is_untouched()
+    if !rng_ready() then return
+
+    val runs = azc_outcomes("print(\"fine\")")
+
+    for i in 0..<runs.len()
+        assert(runs.at(i).1.ok, runs.at(i).0)
+        assert_eq(runs.at(i).1.out, "fine\n", runs.at(i).0)
+        assert_eq(runs.at(i).1.err, "", runs.at(i).0)
+
+@test("first thing in a hosted program's entry point")
+azc_the_guard_is_installed_first()
+    if !rng_ready() then return
+
+    val texts = azc_texts(["emit-llvm"], [("main.sysl", "print(1)")])
+
+    for i in 0..<texts.len()
+        val text = texts.at(i).1
+        val main = text.index_of("define i32 @main(")
+
+        assert(main.is_some(), texts.at(i).0)
+
+        val body = text[main.unwrap()..]
+        val first = body.index_of("\n  call ")
+
+        assert(first.is_some(), texts.at(i).0)
+        assert(body[first.unwrap()..].starts_with("\n  call void @sysl_install_stack_guard()"),
+               s"${texts.at(i).0}: ${body}")
+
+@test("and not at all for a machine with no operating system")
+azc_no_guard_on_a_bare_machine()
+    if !rng_ready() then return
+
+    val texts = azc_texts(["emit-llvm", "--target", "aarch64-freestanding"], [("main.sysl", "print(1)")])
+
+    for i in 0..<texts.len()
+        assert(!texts.at(i).1.contains("sysl_install_stack_guard"), texts.at(i).0)
+
+// -- a main answering a Result --------------------------------------------------------------------
+
+@test("runs, and exits nothing")
+azc_an_ok_main_runs()
+    if !rng_ready() then return
+
+    val runs = azc_outcomes("main() -> Result[unit, string]\n    print(\"worked\")\n\n    Ok(())\n")
+
+    for i in 0..<runs.len()
+        assert(runs.at(i).1.ok, runs.at(i).0)
+        assert_eq(runs.at(i).1.out, "worked\n", runs.at(i).0)
+
+@test("reports the error on stderr and exits non-zero")
+azc_an_err_main_reports()
+    if !rng_ready() then return
+
+    val runs = azc_outcomes("main() -> Result[unit, string]\n    print(\"starting\")\n\n" +
+                            "    Err(\"the disk is on fire\")\n")
+
+    for i in 0..<runs.len()
+        assert(!runs.at(i).1.ok, runs.at(i).0)
+        assert_eq(runs.at(i).1.out, "starting\n", runs.at(i).0)
+        assert_eq(runs.at(i).1.err, "error: the disk is on fire\n", runs.at(i).0)
+
+@test("including one that '?' carried out of a call")
+azc_an_err_carried_by_try()
+    if !rng_ready() then return
+
+    val runs = azc_outcomes(raw"""
+        import sysl.fs.{read_text, IoError}
+
+        main() -> Result[unit, IoError]
+            val s = read_text("/nonexistent/file")?
+
+            print(s)
+
+            Ok(())
+        """)
+
+    for i in 0..<runs.len()
+        assert(!runs.at(i).1.ok, runs.at(i).0)
+        assert_eq(runs.at(i).1.out, "", runs.at(i).0)
+        assert(runs.at(i).1.err.contains("error: no such file or directory"), runs.at(i).1.err)
+
+@test("and the arguments form answers the same way")
+azc_an_err_main_with_arguments()
+    if !rng_ready() then return
+
+    val runs = azc_outcomes(raw"""
+        main(args: []string) -> Result[unit, string]
+            if args.len > 99 then return Ok(())
+
+            Err("too few arguments")
+        """)
+
+    for i in 0..<runs.len()
+        assert(!runs.at(i).1.ok, runs.at(i).0)
+        assert(runs.at(i).1.err.contains("error: too few arguments"), runs.at(i).1.err)
+
+@test("a main that answers something other than a Result")
+azc_a_main_answering_an_int()
+    if !rng_ready() then return
+
+    azc_refuses("main() -> int = 3", "error: 'main' yields nothing or a 'Result[unit, E]', so it " +
+                "may not result in int — a program's exit status is not something a signature can " +
+                "say. 'exit(code)' is how a program chooses its own, and prints nothing")
+
+@test("a Result carrying a value on the Ok side")
+azc_a_main_answering_a_value()
+    if !rng_ready() then return
+
+    azc_refuses("main() -> Result[int, string] = Ok(3)", "error: 'main' yields nothing or a " +
+                "'Result[unit, E]', so it may not result in sysl.Result[int, string]")
+
+// This compiler used to instantiate the reporter unasked and refuse inside the library's body.
+@test("and an error type that cannot be rendered")
+azc_an_unrenderable_error_type()
+    if !rng_ready() then return
+
+    azc_refuses(raw"""
+        struct Silent
+            n: int
+        end Silent
+
+        main() -> Result[unit, Silent] = Err(Silent(1))
+        """, "error: 'sysl.main_result' requires its type parameter 'E' to implement " +
+        "'sysl.Display', but Silent does not\n --> ")

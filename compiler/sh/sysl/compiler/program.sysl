@@ -68,7 +68,7 @@ declared_entry(a: &Analysis) -> Option[TEntry]
         return None
     end if
 
-    val reporter = entry_reporter(a, fallible)
+    val reporter = entry_reporter(a, fallible, f)
 
     if f.decl.params.is_empty() then return Some(TEntry(key, None, reporter, fallible))
 
@@ -121,7 +121,11 @@ private result_entry(a: &Analysis, ret: Type) -> Option[Type] = ret match
 
 // The library function an entry's failure is reported through, instantiated at what the entry
 // carries. It is a function the program never wrote, so reaching it is recorded here.
-private entry_reporter(a: &Analysis, fallible: Option[Type]) -> Option[string]
+//
+// **Its bound is asked here, at `main`, before anything is instantiated**: the bound is what holds
+// the error type to being renderable, and left to the instantiation an error nobody can print is
+// refused inside the library's body, in a file the program never wrote.
+private entry_reporter(a: &Analysis, fallible: Option[Type], entry: Func) -> Option[string]
     if fallible.is_none() then return None
 
     val key = a_library_key(a, "main_result")
@@ -139,6 +143,12 @@ private entry_reporter(a: &Analysis, fallible: Option[Type]) -> Option[string]
             var targs: Buf[Type] = buf()
 
             targs.push(d.targs.at(1))
+
+            val decl = f.unwrap().decl
+
+            if !check_param_bounds(a, f.unwrap().scope, entry.span, key.unwrap(), decl.tparams,
+                                   decl.bounds, targs, buf(), "type parameter", entry.scope)
+                return None
 
             val sym = instantiate_func(a, f.unwrap().scope, f.unwrap().decl, targs, false)
 

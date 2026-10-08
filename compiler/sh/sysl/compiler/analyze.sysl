@@ -663,6 +663,7 @@ private resolve_signatures(a: &Analysis)
         val f = a.tables.funcs.at(i)
 
         check_bound_names(a, f.scope, f.decl.name, f.decl.bounds)
+        check_crossing_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
 
         // **A GENERIC SIGNATURE IS READ AT STAND-INS, AND WHAT THAT READING BUILDS IS NOT A TYPE THE
         // PROGRAM HAS.** `spawn[T](…) -> Option[Thread]` names an `Option[Thread]` at every
@@ -748,6 +749,7 @@ private resolve_signatures(a: &Analysis)
             TraitOf(d) ->
                 check_bound_names(a, decl.scope, d.name, d.bounds)
                 check_trait_supers(a, key, d)
+                check_borrow_names(a, decl.scope, decl.span, qualified_name(key), d.methods)
                 resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.tvalues, d.methods, true)
             _ -> ()
 
@@ -855,6 +857,79 @@ private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string],
     a.settled = before
     result
 end resolve_func_signature
+
+// What `@crossing` may name: parameters of the function it is written above, each once
+// (`reference/memory.md § @crossing — where the rule is asked`). A member's is asked of the function
+// it lowers to, whose receiver is a parameter like any other. Settled here, once, at the declaration
+// -- a name matching no parameter would otherwise mark nothing and read exactly like a rule being
+// enforced.
+check_crossing_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: string)
+    val c = d.crossing
+    val ps = d.params
+
+    for i in 0..<c.len()
+        var declared = false
+
+        for j in 0..<ps.len()
+            if ps.at(j).name == c.at(i) then declared = true
+
+        var twice = false
+
+        for j in 0..<i
+            if c.at(j) == c.at(i) then twice = true
+
+        if !declared
+            var listed = ""
+
+            for j in 0..<ps.len()
+                listed = if j == 0 then s"'${ps.at(j).name}'" else s"$listed, '${ps.at(j).name}'"
+
+            val tail = if ps.is_empty() then " — it takes none" else s" — its parameters are $listed"
+
+            a.fault(scope, span, s"'@crossing' names '${c.at(i)}', which is not a parameter of " +
+                    s"'$shown'$tail")
+        else if twice
+            a.fault(scope, span, s"'@crossing' names '${c.at(i)}' twice, and a parameter crosses " +
+                    "a boundary once — the second says nothing the first does not")
+end check_crossing_names
+
+// `@borrows` names a trait method's own parameters, each once. **A misspelling would otherwise promise
+// nothing and say nothing**: the annotation reads as a rule being enforced, every implementation is
+// free to keep what it likes, and the call sites counting on the exemption quietly go back to
+// promoting. The receiver is not among them -- a receiver is borrowed or not by its declared mode.
+private check_borrow_names(a: &Analysis, scope: Scope, span: Span, owner: string, ms: Buf[MethodDecl])
+    for k in 0..<ms.len()
+        val m = ms.at(k)
+        val b = m.borrows
+
+        for i in 0..<b.len()
+            var declared = false
+
+            for j in 0..<m.params.len()
+                if m.params.at(j).name == b.at(i) then declared = true
+
+            var twice = false
+
+            for j in 0..<i
+                if b.at(j) == b.at(i) then twice = true
+
+            if !declared
+                var listed = ""
+
+                for j in 0..<m.params.len()
+                    val p = m.params.at(j).name
+
+                    listed = if j == 0 then s"'$p'" else s"$listed, '$p'"
+
+                val tail = if m.params.is_empty() then " — it takes none"
+                else s" — its parameters are $listed"
+
+                a.fault(scope, span, s"'@borrows' names '${b.at(i)}', which is not a parameter of " +
+                        s"'$owner.${m.name}'$tail")
+            else if twice
+                a.fault(scope, span, s"'@borrows' names '${b.at(i)}' twice, and a parameter is " +
+                        "borrowed or it is not — the second says nothing the first does not")
+end check_borrow_names
 
 // **A `@test` or a hook returns nothing**: the runner reads its verdict off whether it came back, so
 // a value returned beside that is one nothing is going to read. Asked of the RESOLVED result rather
