@@ -523,9 +523,9 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
 
         val hidden = p.at_word("opaque")
 
-        if hidden then return laid_out(parse_opaque_struct(p, at, vis), attrs)
+        if hidden then return from_first(start, laid_out(parse_opaque_struct(p, at, vis), attrs))
 
-        return laid_out(parse_struct_decl(p, at, vis, false), attrs)
+        return from_first(start, laid_out(parse_struct_decl(p, at, vis, false), attrs))
     end if
 
     // A layout beside `@export` marks a struct and only a struct: a `type` takes `@export` alone,
@@ -540,7 +540,7 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     // and between them they are what a binding may carry.
     if storage
         refuse_unless(p, at, attrs, "binding")
-        return placed(p, parse_stmt_at(p, false), attrs)
+        return from_first(start, placed(p, parse_stmt_at(p, false), attrs))
     end if
 
     // `@needs(...)` is the one annotation an `extern` takes -- it is the declaration the annotation
@@ -549,13 +549,13 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
 
     if p.at_kw("extern")
         refuse_unless(p, at, attrs, "extern")
-        return parse_extern_decl(p, at, vis, capabilities_of(attrs))
+        return from_first(start, parse_extern_decl(p, at, vis, capabilities_of(attrs)))
     end if
 
     // A `type` names a scalar or a pointer for a generated header, which is the struct's request made
     // of a declaration with no fields -- so it takes `@export` alone and nothing that lays out.
     if p.at_kw("type") && all_are(attrs, "export")
-        return exported_type(parse_type_decl(p, at, vis), attrs)
+        return from_first(start, exported_type(parse_type_decl(p, at, vis), attrs))
 
     // At the end of the file there is no declaration below for the annotations to be about, so
     // nothing an annotation's own sentence says is true of it: the grammar refuses it, at the word
@@ -585,6 +585,11 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     skip_line(p)
     stmt(start.to(p.just_taken()), Bad)
 end parse_attributed_decl
+
+// **A declaration's extent begins at its first annotation**, whatever kind of declaration the
+// annotations turned out to be about -- a struct, an `extern`, a `type` or a binding as much as a
+// function -- as the reference's does.
+private from_first(start: Span, s: Stmt) -> Stmt = Stmt(start.to(s.span), s.kind)
 
 // That every annotation above this declaration is one the declaration may carry.
 private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)

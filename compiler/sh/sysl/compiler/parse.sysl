@@ -56,6 +56,12 @@ struct Parser
     // one (a closure's body, a trailing block) starts again at zero, its lines being statements.
     nest: usize
 
+    // Where the expression being read at the current level began -- its first token, an opening
+    // parenthesis included. **Every form with an expression on its left begins here**, which is what
+    // the left operand cannot say for itself: `(a + b) * c`'s left operand is the sum, whose span is
+    // inside the parentheses. Set and put back by `parse_expr_bp` around each level.
+    lead: Span
+
     // The kind of the next token. `Eof` where there is none, so that no caller unwraps.
     peek(self) -> Tok = self.toks.peek() match
         Some(t) -> t.value
@@ -69,8 +75,15 @@ struct Parser
     // Where the next token is.
     here(self) -> Span = self.toks.here()
 
-    // Where the token just taken was.
-    just_taken(self) -> Span = self.toks.previous()
+    // Where the token just taken was. **A block's closing `Dedent` is where the next token begins**,
+    // and that is where a form ending with the block ends: inside brackets the layout hands the
+    // `Dedent` the closing bracket's own span, so `f((t) -> t match ... _ -> false)` would otherwise
+    // end its `match`, its closure and their arms one column late, on the `)` they sit inside.
+    just_taken(self) -> Span
+        val s = self.toks.previous()
+
+        if self.prev() == Dedent then Span(s.start, s.start) else s
+    end just_taken
 
     // The kind of the token just taken, which is what says whether a block has only now closed.
     prev(self) -> Tok = self.toks.looked_back() match
@@ -351,7 +364,7 @@ end Parsed
 // report: everything after an unterminated literal is being read in the wrong language, so a second
 // complaint about it is noise at best and a wrong line number at worst.
 parser_over(src: Source) -> Result[Parser, Diagnostic] =
-    Ok(Parser(tokens_of(lex(src)?), src, report(), 0, 0, 0, 0, 0))
+    Ok(Parser(tokens_of(lex(src)?), src, report(), 0, 0, 0, 0, 0, Span(0, 0)))
 
 // One expression, read from text.
 //
@@ -373,7 +386,7 @@ parse_expr_within(src: Source, from: usize, to: usize) -> ParsedExpr
         Ok(ts) -> ts
         Err(d) -> return one_expr(src, Err(d))
 
-    one_expr(src, Ok(Parser(tokens_of(toks), src, report(), 0, 0, 0, 0, 0)))
+    one_expr(src, Ok(Parser(tokens_of(toks), src, report(), 0, 0, 0, 0, 0, Span(0, 0))))
 end parse_expr_within
 
 private one_expr(src: Source, over: Result[Parser, Diagnostic]) -> ParsedExpr

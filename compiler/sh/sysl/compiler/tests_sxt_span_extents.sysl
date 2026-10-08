@@ -1,0 +1,173 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A node's span is its EXTENT -- from the first character it was parsed from to just past the last
+// -- wherever the reference's printed position is the extent too. These are the nodes whose span used
+// to be cut short or start late: a form with an expression on its left that began at the left
+// operand's anchor (a field's name, a subscript's `[`) rather than at the operand, and a form whose
+// span was taken before the part after its keyword had been read.
+//
+// **Every span here was read out of the reference compiler** (0.0.162) with `sysl emit-ast` on the
+// same input.
+
+// The untyped tree of one file, with every node's span, as `sysl emit-ast` prints it.
+private sxt_tree(text: string) -> string = emit_ast(parse(source_of("t.sysl", text)).program, true)
+
+private sxt_has(text: string, line: string)
+    val tree = sxt_tree(text)
+
+    assert(tree.contains(line), s"no '$line' in:\n$tree")
+
+@test("a sum and a comparison begin at their left operand, not at the field or subscript it ends in")
+sxt_left_led_begins_at_the_operand()
+    val text = "val c = p.x + q.y > 0 && a[1] < n\n"
+
+    sxt_has(text, "value: Binary 1:9-1:34")
+    sxt_has(text, "left: Compare 1:9-1:22")
+    sxt_has(text, "- Binary 1:9-1:18")
+    sxt_has(text, "right: Compare 1:26-1:34")
+
+@test("a form over a parenthesised left operand begins at the parenthesis, the operand inside it")
+sxt_parenthesised_left_operand()
+    val text = "val x = (a + b) * 2\nval c = (m & k) == v\nval s = xs[(p + 1)..]\n"
+
+    sxt_has(text, "value: Binary 1:9-1:20")
+    sxt_has(text, "left: Binary 1:10-1:15")
+    sxt_has(text, "value: Compare 2:9-2:21")
+    sxt_has(text, "index: RangeExpr 3:12-3:21")
+
+@test("a range begins at its lower bound's receiver")
+sxt_range_begins_at_the_receiver() = sxt_has("val r = p.x..<q.y\n", "value: RangeExpr 1:9-1:18")
+
+@test("an '= expr' body's statement begins where its comparison does")
+sxt_body_statement_begins_at_the_receiver()
+    val text = "use(p: P) -> bool = p.x == 1\n"
+
+    sxt_has(text, "- ExprStmt 1:21-1:29")
+    sxt_has(text, "expr: Compare 1:21-1:29")
+
+@test("a sum over a type's attribute begins at the type")
+sxt_attribute_begins_at_the_type() = sxt_has("val t = T::Min + 1\n", "value: Binary 1:9-1:19")
+
+// The reference prints a `?` at the `?` itself, its anchor; the extent is what the walk-up of
+// `begins_at` gives, from the receiver of the subscript to the `?`.
+@test("a '?' over a subscript begins at the subscript's receiver")
+sxt_try_begins_at_the_receiver() = sxt_has("val u = xs[1]?\n", "value: TryExpr 1:9-1:15")
+
+@test("a closure runs to the end of its body, an indented one included")
+sxt_closure_runs_to_the_end_of_its_body()
+    val text = "val g = (n: int) ->\n    val m = n + 1\n    m\nval h = x -> x * 2\n"
+
+    sxt_has(text, "value: Lambda 1:9-4:1")
+    sxt_has(text, "value: Lambda 4:9-4:19")
+
+@test("a closure ending in a block inside brackets ends where the bracket begins, not past it")
+sxt_block_inside_brackets_ends_at_the_bracket()
+    val text = "val r = f((t) -> t match\n    A -> 1\n    _ -> 2)\n"
+
+    sxt_has(text, "- Lambda 1:11-3:11")
+    sxt_has(text, "- MatchArm 3:5-3:11")
+
+@test("a parameter runs to the end of its default")
+sxt_parameter_covers_its_default()
+    val text = "use(a: int = 1, b: string = \"s\") -> int = a\n"
+
+    sxt_has(text, "- Param 1:5-1:15")
+    sxt_has(text, "- Param 1:17-1:32")
+
+@test("a parameter with no default is its name and type")
+sxt_parameter_without_a_default() = sxt_has("use(p: P) -> bool = p.x == 1\n", "- Param 1:5-1:9")
+
+@test("a 'defer' covers the statement it defers, and a 'continue' its label")
+sxt_defer_and_continue_cover_what_follows()
+    val text = "use()\n    defer print(\"x\")\n    'outer for i in 0..<3\n        if i > 1 then continue 'outer\n"
+
+    sxt_has(text, "- Defer 2:5-2:21")
+    sxt_has(text, "- Continue 4:23-4:38")
+
+@test("a trailing block argument runs from its ':' to the end of the block")
+sxt_block_argument_covers_the_block() = sxt_has("val c = column:\n    1\n    2\n", "- BlockArg 1:15-4:1")
+
+@test("a field a 'with' changes is the whole change, name and value")
+sxt_with_field_is_the_whole_change()
+    val text = "val q = p with { x = 1, y = 2 }\n"
+
+    sxt_has(text, "- WithField 1:18-1:23")
+    sxt_has(text, "- WithField 1:25-1:30")
+
+@test("an annotated declaration begins at its first annotation, whatever it declares")
+sxt_annotated_declarations_begin_at_the_annotation()
+    val text = "@packed\nprivate struct R\n    x: int\n\n@needs(os)\nprivate extern \"getpid\" c_pid() -> int\n\n" +
+        "@export(\"tt\")\ntype T = int\n\n@align(8)\nvar a: [4]u8 = [1, 2, 3, 4]\n"
+
+    sxt_has(text, "- StructDecl 1:1-5:1")
+    sxt_has(text, "- ExternDecl 5:1-6:39")
+    sxt_has(text, "- TypeDecl 8:1-9:13")
+    sxt_has(text, "- VarDecl 11:1-12:28")
+
+@test("two annotations: the declaration begins at the first")
+sxt_two_annotations_begin_at_the_first() =
+    sxt_has("@packed\n@align(4)\nstruct U\n    x: u8\n", "- StructDecl 1:1-5:1")
+
+// -- what a reader sees -------------------------------------------------------------------------------
+
+private var sxt_library_cache: Buf[Program] = buf()
+private var sxt_library_read: bool = false
+
+private sxt_library() -> Buf[Program]
+    if sxt_library_read then return sxt_library_cache
+
+    sxt_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> sxt_library_cache = units
+
+    sxt_library_cache
+end sxt_library
+
+// The whole report one file is refused with, rendered the way a reader sees it.
+private sxt_rendered(text: string) -> string
+    var units: Buf[Program] = buf()
+    val library = sxt_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parse(source_of("t.sysl", text)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end sxt_rendered
+
+@test("a field changed twice is underlined whole, as the reference underlines it")
+sxt_field_changed_twice_caret()
+    if sxt_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return
+    end if
+
+    assert_eq(sxt_rendered("struct P\n    x: int\nval p = P(1)\nval q = p with { x = 1, x = 2 }\nprint(q.x)\n"),
+              "error: 'x' is changed twice in one 'with', so the first change is thrown away \u{2014} write the " +
+              "value it should end with, once\n --> t.sysl:4:25\n  |\n4 | val q = p with { x = 1, x = 2 }\n" +
+              "  |                         ^^^^^")
+end sxt_field_changed_twice_caret
+
+@test("and so is a field the struct has not got")
+sxt_unknown_field_caret()
+    if sxt_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return
+    end if
+
+    assert_eq(sxt_rendered("struct P\n    x: int\nval p = P(1)\nval q = p with { y = 1 }\nprint(q.x)\n"),
+              "error: 'P' has no field or property 'y'\n --> t.sysl:4:18\n  |\n4 | val q = p with { y = 1 }\n" +
+              "  |                  ^^^^^")
+end sxt_unknown_field_caret
