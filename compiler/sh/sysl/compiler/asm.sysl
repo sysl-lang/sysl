@@ -40,6 +40,82 @@ type_asm(cx: &Analyzer, span: Span, arms: Buf[AsmArm]) -> TStmt
             TAsm(lines, bound, clobbers, span)
 end type_asm
 
+// **Every `asm` block written at the top of a file**, its arm chosen for the target and filed in the
+// tables, in the order the files were read.
+//
+// The arms are checked exactly as a function's are -- named processors, one arm each, every processor
+// answered -- so a block missing an architecture is found on the build that has one. What is refused
+// in addition is everything that talks to surrounding code, because there is none: an operand, a
+// `clobbers` line and a `{name}` placeholder, in EVERY arm, the mistake being the same whichever
+// machine is being built for.
+check_module_asm(a: &Analysis, units: Buf[Program])
+    for i in 0..<units.len()
+        val unit = units.at(i)
+
+        for j in 0..<unit.body.len()
+            val s = unit.body.at(j)
+
+            *s.kind match
+                ModuleAsm(arms, section, align) ->
+                    val cx = analyzer_for(a, scope_of_unit(a, unit))
+                    val made = type_module_asm(cx, s.span, arms, section, align, unit.test_only)
+
+                    if made.is_some() then a.tables.module_asm.push(made.unwrap())
+                _ -> ()
+end check_module_asm
+
+private type_module_asm(cx: &Analyzer, span: Span, arms: Buf[AsmArm], section: Option[string],
+                        align: Option[Expr], scaffolding: bool) -> Option[TModuleAsm]
+    check_arch_names(cx, arms)
+    check_no_overlap(cx, arms)
+    check_exhaustive(cx, span, arms)
+
+    for i in 0..<arms.len()
+        arms.at(i).body match
+            AsmCode(lines, operands, clobbers) ->
+                refuse_module_operands(cx, arms.at(i).span, lines, operands, clobbers)
+            AsmUnavailable(_) -> ()
+
+    val boundary_at = boundary(cx, "asm", align)
+    val here = cpu_symbol(cx.an.tables.target.cpu)
+    val arm = arm_for(arms, here)
+
+    if arm.is_none() then return None
+
+    arm.unwrap().body match
+        AsmUnavailable(reason) ->
+            cx.fault(arm.unwrap().span, s"this operation has no answer on $here: $reason")
+            None
+        AsmCode(lines, _, _) -> Some(TModuleAsm(lines, section, boundary_at, scaffolding))
+end type_module_asm
+
+// What only a block inside a function can mean. Each refusal says what to write instead, since the
+// reader's intent -- reaching a value, or keeping a register -- has a spelling at module level too.
+private refuse_module_operands(cx: &Analyzer, span: Span, lines: Buf[string],
+                               operands: Buf[AsmOperand], clobbers: Buf[string])
+    for i in 0..<operands.len()
+        cx.fault(operands.at(i).span, s"'${operands.at(i).name}' cannot be an operand here: an " +
+                 "'asm' block at the top of a file is outside every function, so there is no " +
+                 "variable for an operand to be and no code around the block to hand one over. " +
+                 "Name a symbol in the instructions instead — module storage the program " +
+                 "'@export's, or a label the block defines and sysl declares 'extern'")
+
+    if !clobbers.is_empty()
+        cx.fault(span, "'clobbers' tells the code around an 'asm' block which registers it " +
+                 "destroys, and a block at the top of a file has no code around it — nothing runs " +
+                 "it in the middle of a function. Delete the line; whatever calls into these " +
+                 "instructions keeps its own registers by the calling convention")
+
+    for i in 0..<lines.len()
+        var names: Buf[string] = buf()
+
+        placeholders(&names, lines.at(i))
+
+        for j in 0..<names.len()
+            cx.fault(span, s"'{${names.at(j)}}' names an operand, and an 'asm' block at the top " +
+                     "of a file has none. Write '{{' and '}}' for a brace the assembler is to see")
+end refuse_module_operands
+
 private arm_for(arms: Buf[AsmArm], here: string) -> Option[AsmArm]
     for i in 0..<arms.len()
         val arm = arms.at(i)

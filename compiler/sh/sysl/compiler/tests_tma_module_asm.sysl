@@ -1,0 +1,605 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// Module-level assembly (`reference/inline-assembly.md § Assembly at the top of a file`): an `asm`
+// block written outside every function, emitted as LLVM `module asm`, placed by `@section("...")`
+// and started on an `@align(n)` boundary. It exists only in this compiler, so nothing here was read
+// out of the reference: the expectations are the design's.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private var tma_library_names: Buf[string] = buf()
+private var tma_library_units: Buf[Buf[Program]] = buf()
+
+// The library as one machine reads it, read once per machine.
+private tma_library(t: Target) -> Buf[Program]
+    for i in 0..<tma_library_names.len()
+        if tma_library_names.at(i) == t.name then return tma_library_units.at(i)
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    tma_library_names.push(t.name)
+    tma_library_units.push(out)
+    out
+end tma_library
+
+private tma_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+// The program's own errors, leaving out anything the library had to say.
+private tma_own(said: Buf[Placed]) -> Buf[Placed]
+    var out: Buf[Placed] = buf()
+    val errs = errors_of(said)
+
+    for i in 0..<errs.len()
+        if !errs.at(i).src.name.starts_with("library/") then out.push(errs.at(i))
+
+    out
+end tma_own
+
+// What a compilation of several files came to on a machine: the whole report it was refused with,
+// or nothing and its LLVM text. `test_build` keeps the scaffolding, as `sysl test` does.
+private tma_build_files(files: []const (string, string), machine: string,
+                        test_build: bool) -> (string, string)
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+    val library = tma_library(t)
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1), t)
+
+        if !parsed.ok() then return (parsed.report.at(0).message, "")
+
+        units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), true)
+    val early = tma_own(done.reported)
+
+    if !early.is_empty() then return (analysis_report(early), "")
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = tma_own(done.an.diagnostics())
+
+    if !late.is_empty() then return (analysis_report(late), "")
+
+    val shaped = if test_build then whole else strip_tests(whole)
+    val kept = prune(shaped, own)
+
+    ("", ir_print_module(codegen_with_gaps(kept, t, pr).0))
+end tma_build_files
+
+private tma_build(text: string, machine: string) -> (string, string) =
+    tma_build_files([("main.sysl", text)], machine, false)
+
+private tma_ir(machine: string, text: string) -> string
+    val b = tma_build(text, machine)
+
+    assert(b.0 == "", s"expected the program to compile for $machine, and it was refused:\n${b.0}")
+    b.1
+
+private tma_err(machine: string, text: string) -> string = tma_build(text, machine).0
+
+private tma_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+private tma_never_says(text: string, part: string) =
+    assert(!text.contains(part), s"expected no '$part' in:\n$text")
+
+// That a report holds this diagnostic at this position, and exactly `count` errors in all.
+private tma_refused(report: string, message: string, line: int, col: int, count: usize)
+    val head = s"error: $message"
+    val at = s" --> main.sysl:$line:$col\n"
+
+    assert(report.contains(head), s"expected\n$head\nin\n$report")
+    assert(report.contains(at), s"expected\n$at\nin\n$report")
+    assert_eq(report.count_of("error: "), count)
+
+private val tma_intel: string = "x86_64-linux"
+private val tma_arm: string = "aarch64-freestanding"
+private val tma_risc: string = "riscv64-freestanding"
+
+// A block that answers on every processor, with something to tell them apart.
+private val tma_every_arch: string = raw"""
+    asm
+        [x86_64]  "intel_marker: hlt"
+        [aarch64] "arm_marker: wfi"
+        [riscv64] "risc_marker: wfi"
+        [thumb, riscv32, craft, wasm32] unavailable "not this test's business"
+
+    print(1)
+    """
+
+// -- selecting an arm -----------------------------------------------------------------------------
+
+@test("each processor takes its own instructions as module asm and carries none of the others")
+tma_each_processor_takes_its_own()
+    if !tma_ready() then return
+
+    val intel = tma_ir(tma_intel, tma_every_arch)
+    val arm = tma_ir(tma_arm, tma_every_arch)
+    val risc = tma_ir(tma_risc, tma_every_arch)
+
+    tma_says(intel, "\n\nmodule asm \"intel_marker: hlt\"\n\n")
+    tma_never_says(intel, "arm_marker")
+    tma_never_says(intel, "risc_marker")
+    tma_says(arm, "\n\nmodule asm \"arm_marker: wfi\"\n\n")
+    tma_never_says(arm, "intel_marker")
+    tma_says(risc, "\n\nmodule asm \"risc_marker: wfi\"\n\n")
+    tma_never_says(risc, "arm_marker")
+end tma_each_processor_takes_its_own
+
+@test("it is the module's even in the file a program starts in: no statement of the body runs it")
+tma_not_a_statement_of_the_body()
+    if !tma_ready() then return
+
+    val arm = tma_ir(tma_arm, tma_every_arch)
+
+    tma_never_says(arm, "asm sideeffect")
+end tma_not_a_statement_of_the_body
+
+@test("several lines are several module asm lines, in the order written, after the triple")
+tma_several_lines_in_order()
+    if !tma_ready() then return
+
+    val src = raw"""
+        asm
+            [aarch64]
+                ".globl entry_here"
+                "entry_here:"
+                "b entry_here"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(1)
+        """
+    val arm = tma_ir(tma_arm, src)
+
+    val after_triple = lines_of(arm).at(2)
+
+    assert_eq(after_triple, "module asm \".globl entry_here\"")
+    tma_says(arm, "\"\n\nmodule asm \".globl entry_here\"\nmodule asm \"entry_here:\"\n" +
+             "module asm \"b entry_here\"\n\n")
+end tma_several_lines_in_order
+
+@test("an arm with nothing under it lays down nothing")
+tma_an_empty_arm_lays_down_nothing()
+    if !tma_ready() then return
+
+    val src = raw"""
+        asm
+            [aarch64]
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] "nop"
+
+        print(1)
+        """
+
+    tma_never_says(tma_ir(tma_arm, src), "module asm")
+    tma_says(tma_ir(tma_intel, src), "module asm \"nop\"")
+end tma_an_empty_arm_lays_down_nothing
+
+// -- the text -------------------------------------------------------------------------------------
+
+@test("a label is laid down as written, since a module block is emitted once and defines the symbol")
+tma_a_label_is_not_renamed()
+    if !tma_ready() then return
+
+    val src = raw"""
+        asm
+            [aarch64]
+                "1: b 1b"
+                "vectors:"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(1)
+        """
+    val arm = tma_ir(tma_arm, src)
+
+    tma_says(arm, "module asm \"1: b 1b\"\n")
+    tma_says(arm, "module asm \"vectors:\"\n")
+end tma_a_label_is_not_renamed
+
+@test("a dollar stays one, a doubled brace is one brace, and a quote is escaped for LLVM")
+tma_the_text_reaches_the_assembler()
+    if !tma_ready() then return
+
+    val src = raw"""
+        asm
+            [x86_64]
+                "movq $1, %rsi"
+                ".ascii \"keel\""
+            [aarch64] "stp x0, x1, [sp, #-16]!"
+            [thumb] "push {{lr}}"
+            [riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        print(1)
+        """
+
+    tma_says(tma_ir(tma_intel, src), "module asm \"movq $1, %rsi\"\nmodule asm \".ascii \\22keel\\22\"\n")
+    tma_says(tma_ir("thumbv7m-freestanding", src), "module asm \"push {lr}\"\n")
+end tma_the_text_reaches_the_assembler
+
+// -- placement ------------------------------------------------------------------------------------
+
+@test("'@section' brackets the block in pushsection and popsection")
+tma_section_brackets_the_block()
+    if !tma_ready() then return
+
+    val src = raw"""
+        @section(".text.boot")
+        asm
+            [aarch64]
+                ".globl _start"
+                "_start:"
+                "b kmain"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(1)
+        """
+
+    tma_says(tma_ir(tma_arm, src), "module asm \".pushsection .text.boot\"\nmodule asm \".globl _start\"\n" +
+             "module asm \"_start:\"\nmodule asm \"b kmain\"\nmodule asm \".popsection\"\n")
+end tma_section_brackets_the_block
+
+@test("'@align' begins the block on the boundary, inside the section, in either order")
+tma_align_inside_the_section()
+    if !tma_ready() then return
+
+    val first = raw"""
+        @align(2048)
+        @section(".text.vectors")
+        asm
+            [aarch64] "vectors: b ."
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(1)
+        """
+    val second = raw"""
+        @section(".text.vectors")
+        @align(2048)
+        asm
+            [aarch64] "vectors: b ."
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(1)
+        """
+    val want = "module asm \".pushsection .text.vectors\"\nmodule asm \".balign 2048\"\n" +
+        "module asm \"vectors: b .\"\nmodule asm \".popsection\"\n"
+
+    tma_says(tma_ir(tma_arm, first), want)
+    tma_says(tma_ir(tma_arm, second), want)
+end tma_align_inside_the_section
+
+@test("'@align' alone aligns where the block stands")
+tma_align_alone()
+    if !tma_ready() then return
+
+    val src = raw"""
+        const SLOT: int = 128
+
+        @align(SLOT)
+        asm
+            [aarch64] "slot: nop"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(1)
+        """
+    val arm = tma_ir(tma_arm, src)
+
+    tma_says(arm, "module asm \".balign 128\"\nmodule asm \"slot: nop\"\n")
+    tma_never_says(arm, "pushsection")
+end tma_align_alone
+
+// -- never pruned ---------------------------------------------------------------------------------
+
+@test("a block in a module nothing calls into is still laid down, and a file of one starts nothing")
+tma_never_pruned()
+    if !tma_ready() then return
+
+    val boot = raw"""
+        module boot
+
+        @section(".text.boot")
+        asm
+            [aarch64] "boot_marker: nop"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        unused() -> int = 3
+        """
+    val built = tma_build_files([("main.sysl", "print(1)\n"), ("boot/boot.sysl", boot)], tma_arm, false)
+
+    assert_eq(built.0, "")
+    tma_says(built.1, "module asm \"boot_marker: nop\"\n")
+    tma_never_says(built.1, "unused")
+end tma_never_pruned
+
+@test("a block a '@tests' file wrote is scaffolding: a test build keeps it and a program does not")
+tma_a_tests_file_block_is_scaffolding()
+    if !tma_ready() then return
+
+    val scaffold = raw"""
+        module boot
+        @tests
+
+        asm
+            [aarch64] "scaffold_marker: nop"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+        """
+    val files = [("main.sysl", "print(1)\n"), ("boot/boot.sysl", "module boot\n\nf() -> int = 1\n"),
+                 ("boot/tests.sysl", scaffold)]
+    val program = tma_build_files(files, tma_arm, false)
+    val tested = tma_build_files(files, tma_arm, true)
+
+    assert_eq(program.0, "")
+    assert_eq(tested.0, "")
+    tma_never_says(program.1, "scaffold_marker")
+    tma_says(tested.1, "module asm \"scaffold_marker: nop\"\n")
+end tma_a_tests_file_block_is_scaffolding
+
+// -- refusals -------------------------------------------------------------------------------------
+
+@test("an operand is refused: there is no variable outside every function for one to be")
+tma_an_operand_is_refused()
+    if !tma_ready() then return
+
+    val src = raw"""
+        var n: u64 = 0
+
+        asm
+            [aarch64]
+                "mov {n}, #1"
+                out n : reg
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(n)
+        """
+    val report = tma_err(tma_arm, src)
+
+    tma_says(report, "'n' cannot be an operand here: an 'asm' block at the top of a file is outside every function")
+    tma_says(report, "'{n}' names an operand, and an 'asm' block at the top of a file has none")
+end tma_an_operand_is_refused
+
+@test("an operand is refused in an arm this build does not choose, too")
+tma_an_operand_in_another_arm()
+    if !tma_ready() then return
+
+    val src = raw"""
+        var n: u64 = 0
+
+        asm
+            [x86_64]
+                "nop"
+                in n : reg
+            [aarch64] "nop"
+            [thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        print(n)
+        """
+
+    tma_refused(tma_err(tma_arm, src), "'n' cannot be an operand here", 6, 9, 1)
+end tma_an_operand_in_another_arm
+
+@test("'clobbers' is refused, since no code surrounds the block")
+tma_clobbers_is_refused()
+    if !tma_ready() then return
+
+    val src = raw"""
+        asm
+            [aarch64]
+                "nop"
+                clobbers "x0"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(1)
+        """
+
+    tma_refused(tma_err(tma_arm, src), "'clobbers' tells the code around an 'asm' block which registers it destroys", 2, 5, 1)
+end tma_clobbers_is_refused
+
+@test("a placeholder is refused, and the doubled brace is offered")
+tma_a_placeholder_is_refused()
+    if !tma_ready() then return
+
+    val src = raw"""
+        asm
+            [thumb] "push {lr}"
+            [x86_64, aarch64, riscv64, riscv32, craft, wasm32] "nop"
+
+        print(1)
+        """
+
+    tma_refused(tma_err(tma_arm, src), "'{lr}' names an operand, and an 'asm' block at the top of a file has none. Write '{{' and '}}'", 2, 5, 1)
+end tma_a_placeholder_is_refused
+
+@test("'unavailable' carries its reason to the processor that has none")
+tma_unavailable_carries_its_reason()
+    if !tma_ready() then return
+
+    val src = raw"""
+        asm
+            [aarch64] "nop"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "boots on aarch64 only"
+
+        print(1)
+        """
+
+    tma_refused(tma_err(tma_intel, src), "this operation has no answer on x86_64: boots on aarch64 only", 3, 5, 1)
+    assert_eq(tma_err(tma_arm, src), "")
+end tma_unavailable_carries_its_reason
+
+@test("a missing arm, an unknown processor and a doubled one are refused as in a function")
+tma_the_arms_are_checked()
+    if !tma_ready() then return
+
+    val missing = "asm\n    [aarch64] \"nop\"\n\nprint(1)\n"
+    val unknown = "asm\n    [aarch64, sparc] \"nop\"\n    [x86_64, thumb, riscv64, riscv32, craft, wasm32] \"nop\"\n\nprint(1)\n"
+    val twice = "asm\n    [aarch64] \"nop\"\n    [aarch64, x86_64, thumb, riscv64, riscv32, craft, wasm32] \"nop\"\n\nprint(1)\n"
+
+    tma_says(tma_err(tma_arm, missing), "this assembly has no arm for 'x86_64'")
+    tma_says(tma_err(tma_arm, unknown), "'sparc' is not a processor")
+    tma_says(tma_err(tma_arm, twice), "'aarch64' already has an arm above this one")
+end tma_the_arms_are_checked
+
+@test("'@align' that is not a power of two is refused")
+tma_align_not_a_power_of_two()
+    if !tma_ready() then return
+
+    val src = raw"""
+        @align(48)
+        asm
+            [aarch64] "nop"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] "nop"
+
+        print(1)
+        """
+
+    tma_refused(tma_err(tma_arm, src), "'@align(48)' on 'asm' is not an alignment", 1, 8, 1)
+end tma_align_not_a_power_of_two
+
+@test("an annotation other than the two placing ones is refused above an 'asm' block")
+tma_another_annotation_is_refused()
+    if !tma_ready() then return
+
+    val src = raw"""
+        @inline
+        asm
+            [aarch64] "nop"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] "nop"
+
+        print(1)
+        """
+
+    tma_says(tma_err(tma_arm, src), "an 'asm' block takes '@section(\"...\")' and '@align(n)' and nothing else")
+end tma_another_annotation_is_refused
+
+@test("an annotated 'asm' block inside a function is refused: it is that function's code")
+tma_annotated_inside_a_function()
+    if !tma_ready() then return
+
+    val src = raw"""
+        f()
+            @section(".text.boot")
+            asm
+                [aarch64] "nop"
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] "nop"
+
+        f()
+        """
+
+    tma_says(tma_err(tma_arm, src), "an 'asm' block inside a function is part of that function's code")
+end tma_annotated_inside_a_function
+
+@test("a function's own 'asm' is still a statement, and a quote in it is escaped for LLVM")
+tma_a_statement_quote_is_escaped()
+    if !tma_ready() then return
+
+    val src = raw"""
+        f()
+            asm
+                [aarch64] ".ascii \"x\""
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] "nop"
+
+        f()
+        """
+    val arm = tma_ir(tma_arm, src)
+
+    tma_says(arm, "call void asm sideeffect \".ascii \\22x\\22\"")
+    tma_never_says(arm, "module asm")
+end tma_a_statement_quote_is_escaped
+
+// -- the object file ------------------------------------------------------------------------------
+
+private tma_tool(name: string, args: []const string) -> Option[string]
+    for d in [s"/opt/homebrew/opt/llvm/bin/$name", s"/usr/local/opt/llvm/bin/$name", name]
+        capture(d, args, "", [], true) match
+            Ok(r) -> if r.status.ok() then return Some(r.text)
+            Err(_) -> ()
+
+    None
+end tma_tool
+
+@test("a freestanding archive carries the symbol, defined in the section the block named")
+tma_the_archive_carries_the_symbol()
+    if !tma_ready() then return
+
+    val src = raw"""
+        @section(".text.boot")
+        @align(2048)
+        asm
+            [aarch64]
+                ".globl vectors"
+                "vectors:"
+                "b ."
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        extern "vectors" vectors()
+
+        @export("kmain")
+        kmain() -> int = 7
+        """
+    val dir = make_temp_dir("sysl-tma").unwrap()
+    val main = s"$dir/main.sysl"
+    val archive = s"$dir/libk.a"
+
+    write_text(main, src).unwrap()
+
+    build_c_archive(main, Some(tma_arm), None, "0", Some(archive), None, (m) -> ()) match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            assert(false, s"the archive did not build:\n${failure_text(why)}")
+        Ok(_) -> ()
+
+    val symbols = tma_tool("llvm-objdump", ["-t", archive])
+    val headers = tma_tool("llvm-objdump", ["-h", archive])
+    val names = tma_tool("llvm-nm", [archive])
+    val elf_table = tma_tool("llvm-readelf", ["-S", archive])
+
+    remove_dir_all(dir).unwrap_or(())
+
+    if symbols.is_none() || headers.is_none() || names.is_none()
+        print("skipped: no llvm-objdump and llvm-nm here")
+        return
+    end if
+
+    tma_says(names.unwrap(), " T vectors\n")
+    assert(tma_any_line(symbols.unwrap(), " g ", ".text.boot", " vectors"), symbols.unwrap())
+    assert(tma_any_line(headers.unwrap(), ".text.boot", "", ""), headers.unwrap())
+
+    // The boundary is the section's alignment, the last column of the ELF section table.
+    elf_table match
+        None -> ()
+        Some(table) -> assert(tma_any_line(table, ".text.boot", "AX", " 2048"), table)
+end tma_the_archive_carries_the_symbol
+
+// Whether a line of a listing holds the first two texts and ends with the third.
+private tma_any_line(listing: string, a: string, b: string, last: string) -> bool
+    val lines = lines_of(listing)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.contains(a) && line.contains(b) && line.ends_with(last) then return true
+
+    false
+end tma_any_line

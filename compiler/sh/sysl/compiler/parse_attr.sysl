@@ -533,6 +533,21 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         return placed(p, parse_stmt_at(p, false), attrs)
     end if
 
+    // `@section("...")` and `@align(n)` above an `asm` block place instructions written at the top of
+    // a file: the section the assembler lays them down in and the boundary they begin on. Inside a
+    // function the same block is that function's code, which the analysis refuses to place.
+    if at_asm(p)
+        for i in 0..<attrs.len()
+            val word = attr_word(attrs.at(i))
+
+            if word != "section" && word != "align"
+                p.fault(at, "an 'asm' block takes '@section(\"...\")' and '@align(n)' and nothing else — they say where its instructions are laid down and the boundary they begin on, and every other annotation is about a function or a struct, which an 'asm' block is not")
+                break
+            end if
+
+        return placed_asm(parse_asm(p, at), attrs)
+    end if
+
     // `@needs(...)` is the one annotation an `extern` takes -- it is the declaration the annotation
     // exists for, every other having a body the compiler reads instead.
     refuse_async_extern(p)
@@ -893,6 +908,24 @@ private placed(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
         PatternDecl(_, _, _) -> refuse_several(p, s, attrs)
         _ -> s
 end placed
+
+// `@section("...")` and `@align(n)` folded onto the `asm` block they were written above, which is
+// module-level wherever it stands: an annotated block inside a function is refused by the analysis
+// rather than read as that function's code with the annotations dropped.
+private placed_asm(s: Stmt, attrs: Buf[Attr]) -> Stmt
+    var align: Option[Expr] = None
+    var section: Option[string] = None
+
+    for i in 0..<attrs.len()
+        attrs.at(i) match
+            Align(n) -> align = Some(n)
+            Section(name) -> section = Some(name)
+            _ -> ()
+
+    *s.kind match
+        AsmStmt(arms) -> stmt(s.span, ModuleAsm(arms, section, align))
+        _ -> s
+end placed_asm
 
 // Two sentences rather than one about "an annotation", each naming the thing it is about: `@align`'s
 // when that is all there is, `@section`'s otherwise.

@@ -148,10 +148,79 @@ private asm_text(lines: Buf[string], site: int, slots: Buf[(string, int)]) -> st
     for i in 0..<unique.len()
         if i > 0 then b.push("\\0A")
 
-        b.push(asm_render(unique.at(i), slots))
+        b.push(ir_string_escape(asm_render(unique.at(i), slots)))
 
     b.finish()
 end asm_text
+
+// Text as it may stand between the quotes of an LLVM string: a quote, a backslash and every byte
+// outside printable ASCII written as `\XX`. An instruction may well hold a quote -- `.ascii "hi"`,
+// a section's flags -- and written bare it would end the string in the middle of the line.
+ir_string_escape(text: string) -> string
+    var b = str_builder()
+
+    for i in 0..<text.bytes.len
+        val c = text.bytes[i]
+
+        if c == u8('"') || c == u8('\\') || c < 32 || c > 126
+            b.push(s"\\${hex_upper(u64(c), 2)}")
+        else
+            b.push(text[i..<(i + 1)])
+
+    b.finish()
+end ir_string_escape
+
+// **Every `asm` block written at the top of a file, as the lines the assembler reads**, in the order
+// the files were read.
+//
+// A placed block is bracketed by `.pushsection` and `.popsection`, so the section it names is the
+// one its instructions land in and whatever follows is back where it was. Nothing else is done to
+// the text: it is laid down once, so a label is already the only one of its name -- which is the
+// point, since it is how a symbol like `_start` is defined -- and with no operands there is no `$`
+// for LLVM to read. Only a doubled brace collapses, as it does in a function's block, so that one
+// spelling means one thing wherever it is written.
+module_asm_lines(blocks: Buf[TModuleAsm]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<blocks.len()
+        val block = blocks.at(i)
+
+        block.section match
+            Some(name) -> out.push(s".pushsection $name")
+            None -> ()
+
+        block.align match
+            Some(n) -> out.push(s".balign $n")
+            None -> ()
+
+        for j in 0..<block.lines.len()
+            out.push(collapse_braces(block.lines.at(j)))
+
+        if block.section.is_some() then out.push(".popsection")
+
+    out
+end module_asm_lines
+
+// A line with each doubled brace made a single one. It is copied in runs cut only at a brace, so a
+// cut never lands inside a character the line spells in more than one byte.
+private collapse_braces(line: string) -> string
+    var b = str_builder()
+    var from: usize = 0
+    var i: usize = 0
+
+    while i < line.bytes.len
+        val c = line.bytes[i]
+
+        if (c == u8('{') || c == u8('}')) && i + 1 < line.bytes.len && line.bytes[i + 1] == c
+            b.push(line[from..<(i + 1)])
+            i += 2
+            from = i
+        else
+            i += 1
+
+    b.push(line[from..<line.bytes.len])
+    b.finish()
+end collapse_braces
 
 // One line, with the escapes the compiler owns resolved.
 //

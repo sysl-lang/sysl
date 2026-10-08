@@ -473,7 +473,7 @@ parse_stmts(p: *Parser, in_block: bool) -> Buf[Stmt]
 
         if p.report.len() == before
             if p.end_of_statement()
-                stmts.push(s)
+                stmts.push(at_file_level(s, in_block))
             else
                 // It ran on past where a statement has to end. Say so once, then step over whatever
                 // is there so the loop cannot spin on a token nothing consumes.
@@ -484,7 +484,7 @@ parse_stmts(p: *Parser, in_block: bool) -> Buf[Stmt]
             // the statement the reader wrote with one line missing out of it.
             if !p.end_of_statement() then drop_line(p)
 
-            stmts.push(s)
+            stmts.push(at_file_level(s, in_block))
         else if p.prev() == Newline
             // The statement already stepped over the rest of its own line (`private impl …`, an
             // `override` with nothing to replace), so the next line is the reader's next statement
@@ -499,6 +499,18 @@ parse_stmts(p: *Parser, in_block: bool) -> Buf[Stmt]
 
     stmts
 end parse_stmts
+
+// **An `asm` block at the top of a file is the module's, in every file** -- the one a program starts
+// in as much as any other. There it is not inside a function, so nothing would run it as a statement:
+// the assembler lays its instructions down where the object file puts them, and a symbol they define
+// is reached from sysl through an `extern`.
+private at_file_level(s: Stmt, in_block: bool) -> Stmt
+    if in_block then return s
+
+    *s.kind match
+        AsmStmt(arms) -> stmt(s.span, ModuleAsm(arms, None, None))
+        _ -> s
+end at_file_level
 
 // Step past the rest of an unreadable line, without leaving the block it was written in.
 //
