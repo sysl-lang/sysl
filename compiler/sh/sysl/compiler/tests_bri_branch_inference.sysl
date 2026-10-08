@@ -1,0 +1,105 @@
+module sh.sysl.compiler
+@tests
+
+// An `if` or a `match` written with no annotation takes its type from the branch that knows it: a
+// bare literal in the other branch has no type of its own and takes the sibling's. Each program uses
+// the value where only that type compiles -- `a + n` over a `usize` `n` is refused for an `int` `a` --
+// so a branch that fell to `int` is a compile error rather than a quietly different number.
+//
+// The helpers are `tests_enm_enum_run.sysl`'s.
+
+@test("an if takes its type from the branch that knows it, whichever side that is")
+bri_an_if_takes_the_knowing_branch()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        val c = true
+        val n: usize = 7
+        val a = if c then n else 1
+        val b = if c then 1 else n
+        print(a + n, b + n)
+        """), "14 8\n")
+
+@test("a match takes its type from the arm that knows it")
+bri_a_match_takes_the_knowing_arm()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        val n: usize = 7
+        val k = 0
+        val m = k match
+            0 -> 1
+            _ -> n
+        print(m + n)
+        """), "8\n")
+
+@test("an element read out of a Buf[u8] makes the literal beside it a u8")
+bri_a_buf_element_types_the_literal()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var xs: Buf[u8] = buf()
+        xs.push(200)
+        val c = true
+        val w: u8 = 55
+        val v = if c then xs[0] else 1
+        val u = if !c then 1 else xs[0]
+        print(v + w, u + w)
+        """), "255 255\n")
+
+@test("a var over an else-if chain takes its type from the branch that knows it")
+bri_an_else_if_chain_with_a_var()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        val n: usize = 7
+        var f = if n > 10 then 2 elif n > 5 then n else 3
+        var h = if n > 10 then 2 else if n > 5 then n else 3
+        print(f + n, h + n)
+        """), "14 14\n")
+
+@test("and so do the literal arms after the one that knows, in an elif or an else if")
+bri_the_literal_tail_of_a_chain()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        val n: usize = 7
+        var i = if n > 10 then n elif n > 5 then 1 else 2
+        var j = if n > 10 then n else if n > 5 then 1 else 2
+        print(i + n, j + n)
+        """), "8 8\n")
+
+@test("an if whose branches are all literals still falls to int")
+bri_all_literal_branches_fall_to_int()
+    if !enm_ready() then return
+
+    val out = enm_err(raw"""
+        val n: usize = 7
+        val c = true
+        var i = if c then 1 elif !c then 2 else 3
+        print(i + n)
+        """)
+
+    assert(enm_says(out, "'+' needs matching types, got int and usize"), out)
+
+@test("the multi-line block form takes its type from the branch that knows it")
+bri_the_block_form()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        val c = true
+        val n: usize = 7
+        var g = if c
+            1
+        else
+            n
+        val h = if c
+            n
+        elif n > 5
+            1
+        else
+            2
+        print(g + n, h + n)
+        """), "8 14\n")

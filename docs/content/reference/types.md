@@ -54,6 +54,40 @@ exactly 64 — so **precise FFI should use the explicit-width names**, which mat
 `int64_t` on every target. Note also that `i8` has no alias: there is no settled C-style name for a
 signed byte worth adopting.
 
+**An integer literal has no maximum of its own.** Its value is exact at any size and has to fit the
+type it takes, so a literal is as wide as the widest type you can write:
+
+```sysl
+val c: u256 = 115792089237316195423570985008687907853269984665640564039457584007913129639935
+
+print(c)
+```
+
+```output
+115792089237316195423570985008687907853269984665640564039457584007913129639935
+```
+
+A value that does not fit the type is refused rather than wrapped:
+
+```sysl
+val z: u8 = 300
+```
+
+```error
+the literal 300 does not fit byte
+```
+
+A literal with no type from its context is an `int`, and one too large for `int` is refused rather
+than widened — give it a type, with a suffix or on the declaration:
+
+```sysl
+val big = 4294967295
+```
+
+```error
+the literal 4294967295 does not fit int
+```
+
 ### Arithmetic wraps
 
 Integer arithmetic wraps at the **declared** width, and this is defined behaviour rather than a

@@ -1102,9 +1102,18 @@ guessing(cx: &Analyzer, stmts: Buf[Stmt]) -> bool
     if stmts.is_empty() then return false
 
     *stmts.at(stmts.len() - 1).kind match
-        ExprStmt(e) -> is_literal(e) || typed_by_position(cx, e)
+        ExprStmt(e) -> is_literal(e) || typed_by_position(cx, e) || every_branch_guesses(cx, e)
         _ -> false
 end guessing
+
+// An `if` whose every branch is guessing has no type of its own either. It is what the tail of an
+// `elif` chain is, the parser nesting each `elif` into the branch before it: in
+// `if a then n elif b then 1 else 2` the three arms are siblings, and the two literal ones take the
+// type the first one knows, exactly as three arms of a `match` would.
+private every_branch_guesses(cx: &Analyzer, e: Expr) -> bool = *e.kind match
+    IfExpr(_, then_body, else_body, _) ->
+        else_body.is_some() && guessing(cx, then_body) && guessing(cx, else_body.unwrap())
+    _ -> false
 
 // What a branch or an arm **settles** for whichever of its siblings is guessing, or nothing where
 // it settles nothing.
