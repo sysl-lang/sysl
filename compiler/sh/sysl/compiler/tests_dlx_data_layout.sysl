@@ -1,0 +1,228 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.text.{replace_all, split, Search}
+
+// The data layout every compiled text carries (`data_layout.sysl`), and the one printed text that
+// does not. Each machine where a missing layout changed the code is disassembled: riscv64, which split
+// every 64-bit access in two; wasm32, which encoded each one as four-byte aligned; and a Cortex-M0+,
+// whose copy called the four-byte `memcpy`.
+
+private dlx_ready() -> bool = std_root().is_ok() && clang_available()
+
+private dlx_objdump() -> Option[string]
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end dlx_objdump
+
+// A store, a load and a copy of 64-bit words through pointers whose alignment only the type says;
+// the copy, out of a module array, is the one clang turns into a `memcpy`.
+private dlx_program() -> string =
+    "@export(\"poke\")\npoke(p: *u64, n: u64)\n    *p = n\n\n" +
+    "@export(\"peek\")\npeek(p: *u64) -> u64 = *p\n\n" +
+    "var table: [16]u64 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]\n\n" +
+    "@export(\"copy_table\")\ncopy_table(dst: *u64)\n    for i in 0..<table.len\n        dst[i] = table[i]\n"
+
+private dlx_project(main: string) -> string
+    val root = make_temp_dir("sysl-dlx").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    root
+end dlx_project
+
+// `sysl <args>` as the command line answers it: the status, and everything it said.
+private dlx_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for i in 0..<said.len()
+        text = text + said.at(i) + "\n"
+
+    reset_search_paths()
+    (code, text)
+end dlx_cli
+
+// The instructions of each of `symbols` in the archive `build-c` wrote for `target`, one list each.
+private dlx_disassembled(objdump: string, target: string, symbols: []string, relocs: bool) -> Buf[Buf[string]]
+    val root = dlx_project(dlx_program())
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "--target", target, "-o", archive, root]
+    val built = dlx_cli(args[..])
+
+    assert_eq(built.0, 0)
+
+    var out: Buf[Buf[string]] = buf()
+
+    for k in 0..<symbols.len
+        var body: Buf[string] = buf()
+
+        var flags: Buf[string] = buf()
+
+        flags.push("-d")
+        if relocs then flags.push("-r")
+        flags.push("--no-show-raw-insn")
+        flags.push("--no-leading-addr")
+        flags.push(archive)
+
+        capture(objdump, flags.view()) match
+            Err(_) -> assert(false, "llvm-objdump did not run")
+            Ok(dis) ->
+                val lines = split(dis.text, "\n")
+                var inside = false
+
+                for i in 0..<lines.len
+                    val line = lines[i]
+
+                    if line.contains(s"<${symbols[k]}>:") then inside = true
+                    elif inside && line.contains(">:") then inside = false
+                    elif inside && line.contains("Disassembly of section") then inside = false
+                    elif inside && line.trim() != "" then body.push(line.trim())
+
+        out.push(body)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end dlx_disassembled
+
+// Every instruction's mnemonic, the first word of its line.
+private dlx_mnemonics(code: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<code.len()
+        val words = split(replace_all(code.at(i), "\t", " "), " ")
+
+        if words.len > 0 then out.push(words[0])
+
+    out
+end dlx_mnemonics
+
+private dlx_count(xs: Buf[string], want: string) -> usize
+    var n: usize = 0
+
+    for i in 0..<xs.len()
+        if xs.at(i) == want then n += 1
+
+    n
+end dlx_count
+
+private dlx_text(code: Buf[string]) -> string
+    var text = ""
+
+    for i in 0..<code.len()
+        text = text + code.at(i) + "\n"
+
+    text
+end dlx_text
+
+@test("every text clang compiles carries clang's data layout, with no codegen setting asked for")
+dlx_every_text_is_laid_out()
+    if !clang_available() then return
+
+    use_codegen_features(no_codegen_features())
+
+    var names: [3]string = ["aarch64-macos", "riscv64-freestanding", "wasm32-freestanding"]
+
+    for i in 0..<names.len
+        val text = laid_out("clang", target_named(names[i]).unwrap(), "target triple = \"x\"\n")
+
+        assert(text.starts_with("target datalayout = \""), text)
+        assert(text.contains("i64:64"), text)
+        assert(text.ends_with("\ntarget triple = \"x\"\n"), text)
+end dlx_every_text_is_laid_out
+
+@test("a clang that answers no layout leaves the text as it was")
+dlx_no_answer_no_line()
+    val t = target_named("aarch64-macos").unwrap()
+
+    assert_eq(laid_out("/nonexistent/clang", t, "target triple = \"x\"\n"), "target triple = \"x\"\n")
+end dlx_no_answer_no_line
+
+@test("emit-llvm prints the text with no data layout line, its header the triple alone")
+dlx_emit_llvm_prints_no_layout()
+    if !dlx_ready() then return
+
+    val root = dlx_project(dlx_program())
+    var args: [5]string = ["sysl", "emit-llvm", "--target", "riscv64-freestanding", root]
+    val got = dlx_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0)
+    assert(got.1.starts_with("target triple = \"riscv64-unknown-elf\"\n"), got.1)
+    assert(!got.1.contains("target datalayout"), got.1)
+end dlx_emit_llvm_prints_no_layout
+
+@test("a codegen unit's cache key is over the laid-out text, so an object kept from the bare text is not reused")
+dlx_unit_key_follows_the_layout()
+    if !clang_available() then return
+
+    val t = target_named("aarch64-macos").unwrap()
+    val bare = "target triple = \"arm64-apple-macosx\"\n"
+    val args = ir_object_args(t, "-O1", false)
+    val before = unit_object_key("clang", bare, args)
+    val after = unit_object_key("clang", laid_out("clang", t, bare), args)
+
+    if before == "" then return
+
+    assert(before != after, before)
+end dlx_unit_key_follows_the_layout
+
+@test("on riscv64 a 64-bit store and load through a pointer are one sd and one ld, not two word accesses")
+dlx_riscv64_accesses_are_whole()
+    if !dlx_ready() then return
+
+    val objdump = dlx_objdump() match
+        Some(p) -> p
+        None -> return
+
+    var symbols: [2]string = ["poke$$sysl", "peek$$sysl"]
+    val bodies = dlx_disassembled(objdump, "riscv64-freestanding", symbols[..], false)
+    val poke = dlx_mnemonics(bodies.at(0))
+    val peek = dlx_mnemonics(bodies.at(1))
+
+    assert_eq(dlx_count(poke, "sd"), 1)
+    assert_eq(dlx_count(poke, "sw"), 0)
+    assert_eq(dlx_count(peek, "ld"), 1)
+    assert(dlx_count(peek, "lw") + dlx_count(peek, "lwu") == 0, dlx_text(bodies.at(1)))
+end dlx_riscv64_accesses_are_whole
+
+@test("on wasm32 a 64-bit store and load carry their natural alignment, not four bytes")
+dlx_wasm32_accesses_are_aligned()
+    if !dlx_ready() then return
+
+    val objdump = dlx_objdump() match
+        Some(p) -> p
+        None -> return
+
+    var symbols: [2]string = ["poke$$sysl", "peek$$sysl"]
+    val bodies = dlx_disassembled(objdump, "wasm32-freestanding", symbols[..], false)
+    val poke = dlx_text(bodies.at(0))
+    val peek = dlx_text(bodies.at(1))
+
+    assert(poke.contains("i64.store") && !poke.contains("p2align=2"), poke)
+    assert(peek.contains("i64.load") && !peek.contains("p2align=2"), peek)
+end dlx_wasm32_accesses_are_aligned
+
+@test("on a Cortex-M0+ a copy of 64-bit words calls the eight-byte memcpy")
+dlx_thumbv6m_copy_is_eight_byte()
+    if !dlx_ready() then return
+
+    val objdump = dlx_objdump() match
+        Some(p) -> p
+        None -> return
+
+    var symbols: [1]string = ["copy_table$$sysl"]
+    val bodies = dlx_disassembled(objdump, "thumbv6m-freestanding", symbols[..], true)
+    val copy = dlx_text(bodies.at(0))
+
+    assert(copy.contains("__aeabi_memcpy8") && !copy.contains("__aeabi_memcpy4"), copy)
+end dlx_thumbv6m_copy_is_eight_byte

@@ -2,7 +2,6 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
-import sysl.process.capture
 import sysl.text.Search
 
 // What the generated code may use of the machine: the project's `codegen` block and the two flags
@@ -235,69 +234,3 @@ private general_regs_refusal(what: string) -> string =
     s"$what, and this build keeps to the general-purpose registers ('codegen.general_regs_only' in " +
     "package.hocon, or '--general-regs-only') — a floating-point value has no register to live in. " +
     "Compute in integers or fixed point, or build without the setting"
-
-// -- the data layout under `strict_align` -----------------------------------------------------------
-
-// The text clang is handed, carrying the target's data layout where the build is strict about
-// alignment, and as it was otherwise.
-//
-// **The sysl text names no `target datalayout`, so LLVM parses it under its DEFAULT layout**, in which
-// a 64-bit integer is aligned to four bytes -- and an access the text writes without an `align` is
-// given the parsed layout's answer then and there. Where unaligned access is allowed that costs
-// nothing; under `strict_align` it splits every 64-bit load and store the text wrote into two 32-bit
-// ones, which is wrong for a device register and turned a `[64]u64` copy into 128 word loads and a
-// spilled frame. So the layout is asked of the very clang that will compile the text, once per
-// process and machine, and laid in front of it.
-laid_out(cc: string, t: Target, ir: string) -> string
-    if !cf_strict_align then return ir
-
-    val line = clang_layout(cc, t)
-
-    if line == "" then ir else line + "\n" + ir
-end laid_out
-
-private var cf_layouts: Buf[(string, string, string)] = buf()
-
-// clang's `target datalayout = "..."` line for `t`, or `""` where it gave none.
-clang_layout(cc: string, t: Target) -> string
-    for i in 0..<cf_layouts.len()
-        val row = cf_layouts.at(i)
-
-        if row.0 == cc && row.1 == t.triple then return row.2
-
-    var args: Buf[string] = buf()
-
-    args.push(s"--target=${t.triple}")
-
-    val machine = machine_flags(t)
-
-    for i in 0..<machine.len()
-        args.push(machine.at(i))
-
-    args.push("-S")
-    args.push("-emit-llvm")
-    args.push("-x")
-    args.push("c")
-    args.push("/dev/null")
-    args.push("-o")
-    args.push("-")
-
-    var found = ""
-
-    capture(cc, args.view()) match
-        Err(_) -> ()
-        Ok(out) ->
-            val text = out.text
-            var start: usize = 0
-
-            for i in 0..<text.bytes.len
-                if text.bytes[i] == u8('\n')
-                    val one = text[start..<i]
-
-                    if one.starts_with("target datalayout = ") then found = one
-
-                    start = i + 1
-
-    cf_layouts.push((cc, t.triple, found))
-    found
-end clang_layout
