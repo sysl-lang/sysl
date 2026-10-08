@@ -1003,8 +1003,10 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
     // The libraries this object still needs, which the C project's link line has to carry. Said here
     // because nothing downstream will say it: an unresolved sysl symbol at that link reads as a
     // missing definition rather than as a missing archive.
-    if !lowered.emitted.links.is_empty()
-        say(s"sysl: link this against: ${joined(lowered.emitted.links, ", ")}")
+    val hinted = link_hint(lowered.emitted.links, t)
+
+    if !hinted.is_empty()
+        say(s"sysl: link this against: ${joined(hinted, ", ")}")
 
     // **A package binds an installed library through `pkg_config` and need say `@link` nowhere**, so
     // the directives alone are not the link line: the C author would meet the library's symbols as
@@ -1089,8 +1091,16 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
     // project's linker ever notices.
     val trees = c_trees_of(path)
 
+    // The standard module's C is the one tree pruned by reachability: a package's C is compiled
+    // whole, but `utf8proc.c` and its siblings are only worth carrying when the program reaches them.
+    val std_tree = std_root() match
+        Ok(library) -> library
+        Err(_) -> ""
+
     for i in 0..<trees.len()
         val root = trees.at(i)
+        val is_std = root == std_tree
+        var built: Buf[string] = buf()
 
         val found = c_sources(root, Some(t.os)) match
             Err(e) -> return Err(Refusal(e.message))
@@ -1114,14 +1124,48 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
                 Err(why) -> return Err(Refusal(why))
                 Ok(_) -> ()
 
-            members.push(obj)
+            if is_std then built.push(obj) else members.push(obj)
+
+        if is_std
+            val kept = reached_std_objects(archiver, built, ir, t)
+
+            for j in 0..<kept.len()
+                members.push(kept.at(j))
 
     make_dir_all(parent_of(out).unwrap_or("."))
+
+    // `ar rcs` adds to an archive already there, so members a previous build left behind would stay.
+    remove_file(out).unwrap_or(())
 
     archive(archiver, *members, out) match
         Err(why) -> Err(Refusal(why))
         Ok(_) -> Ok(())
 end build_c_members
+
+// The standard module's C objects the program can reach (`c_reach.sysl`). Where the symbols of an
+// object cannot be read, every object is kept: an archive with too much in it links, one with too
+// little does not.
+private reached_std_objects(archiver: string, built: Buf[string], ir: string,
+                            t: Target) -> Buf[string]
+    val nm = find_nm(archiver) match
+        Some(found) -> found
+        None -> return built
+
+    var symbols: Buf[ObjectSymbols] = buf()
+
+    for i in 0..<built.len()
+        object_symbols(nm, built.at(i), t.os == MacOS) match
+            Err(_) -> return built
+            Ok(found) -> symbols.push(found)
+
+    val keep = reached_objects(symbols, ir_globals(ir))
+    var out: Buf[string] = buf()
+
+    for i in 0..<built.len()
+        if keep.at(i) then out.push(built.at(i))
+
+    out
+end reached_std_objects
 
 // A `defines` block that names C its tree does not carry, as the refusal reads: where the tree is a
 // package's, its canonical prefix goes in front, since the consumer meets the mistake and has to be
