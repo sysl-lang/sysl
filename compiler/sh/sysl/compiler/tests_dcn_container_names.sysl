@@ -1,0 +1,128 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// Two refusals that name a container, as the reader wrote it.
+//
+// A `for` over something it cannot walk names both traits that make a type walkable: `Iterate`, which
+// a cursor implements, and `Walk`, which a container implements -- a container being deliberately not
+// a cursor. And a `@no_alloc` module that grows a container is told the container's name rather than
+// that of the core a container keeps behind its one counted reference, which no program can write.
+
+private dcn_ready() -> bool
+    if xvr_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end dcn_ready
+
+// Builds `main.sysl` alone, answering the refusal; a build that succeeds fails the test.
+private dcn_refusal(text: string) -> string
+    val root = make_temp_dir("sysl-dcn").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                   Some(s"$root/built"))
+
+    remove_dir_all(root).unwrap_or(())
+
+    out match
+        Ok(_) -> ""
+        Err(why) -> failure_text(why)
+end dcn_refusal
+
+// The program is refused with this message, anchored at this `line:column` of `main.sysl`.
+private dcn_refused(text: string, message: string, at: string)
+    val said = dcn_refusal(text)
+
+    assert(said != "", "it compiled")
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+end dcn_refused
+
+private const NoAllocTail: string = "which makes heap storage, and this module declared '@no_alloc' " +
+    "— an allocator-free module may only call what is allocator-free itself"
+
+@test("a 'for' over a struct names Walk as what a container implements to be walked")
+dcn_for_names_walk()
+    if !dcn_ready() then return
+
+    dcn_refused(raw"""
+        struct P
+            x: int
+
+        for x in P(1) do print(x)
+        """, "'for' iterates an integer range, an array, a slice, a type that implements " +
+             "'sysl.Iterate', or a container that implements 'sysl.Walk', and P is none of those",
+        "4:1")
+end dcn_for_names_walk
+
+@test("a '@no_alloc' push onto a Buf names the Buf, not the core behind it")
+dcn_no_alloc_names_buf()
+    if !dcn_ready() then return
+
+    dcn_refused(raw"""
+        @no_alloc
+
+        import sysl.buf.Buf
+
+        fill(b: Buf[int])
+            b.push(1)
+        """, s"this reaches 'sysl.buf.Buf.grow.int', $NoAllocTail", "6:7")
+end dcn_no_alloc_names_buf
+
+@test("a '@no_alloc' put into a Map names the Map, not its core or its unassigned report")
+dcn_no_alloc_names_map()
+    if !dcn_ready() then return
+
+    dcn_refused(raw"""
+        @no_alloc
+
+        import sysl.container.Map
+
+        put(m: Map[string, int])
+            m.put("a", 1)
+        """, s"this reaches 'sysl.container.Map.rehash.string.int', $NoAllocTail", "6:7")
+end dcn_no_alloc_names_map
+
+@test("a '@no_alloc' push onto a Buf held in a struct's field names the Buf")
+dcn_no_alloc_names_a_field_buf()
+    if !dcn_ready() then return
+
+    dcn_refused(raw"""
+        @no_alloc
+
+        import sysl.buf.Buf
+
+        struct Holder
+            items: Buf[string]
+
+        add(h: Holder)
+            h.items.push("x")
+        """, s"this reaches 'sysl.buf.Buf.grow.string', $NoAllocTail", "9:13")
+end dcn_no_alloc_names_a_field_buf
+
+@test("a '@no_alloc' push onto a Deque names the Deque")
+dcn_no_alloc_names_deque()
+    if !dcn_ready() then return
+
+    val said = dcn_refusal(raw"""
+        @no_alloc
+
+        import sysl.container.Deque
+
+        add(d: Deque[int])
+            d.push_back(1)
+        """)
+
+    assert(said.contains("this reaches 'sysl.container.Deque."), said)
+    assert(!said.contains("Core"), said)
+    assert(!said.contains("unassigned"), said)
+end dcn_no_alloc_names_deque
