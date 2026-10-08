@@ -89,12 +89,32 @@ and anything whose length is not a fact until the read ends. The loop stops on t
 and asks *afterwards* whether the reading ended badly, which is the split
 [`Reader`](/library/io/) was built around.
 
-**Bytes that are not UTF-8 stop the program** rather than becoming an error case. That is deliberate:
-answering with an error instead would put a case in `IoError` that no filesystem ever reports, and
-would make every program reading its own configuration handle a failure that means its build is
-broken. The severity is affordable because the layer underneath is public — a caller who would rather
-inspect than trap reads `read_bytes` and validates it with
-[`from_utf8`](/library/text/).
+**Bytes that are not UTF-8 are an error, `InvalidUtf8`, carrying the offset of the first one that
+is not.** A file is input, and a program reading one it did not write cannot have ruled out the byte
+that breaks it — so this is a `Result` and not a trap, as [errors](/reference/errors/) draws the line.
+The offset counts from the start of the file:
+
+```sysl
+import sysl.fs.{read_text, remove_file, write_bytes}
+
+val f = "/tmp/sysl-fs-doc-not-utf8.txt"
+
+write_bytes(f, [u8('o'), u8('k'), 255]).unwrap()
+
+read_text(f) match
+    Ok(s) -> print("read", s)
+    Err(e) -> print("refused:", e)
+
+remove_file(f).unwrap()
+```
+
+```output
+refused: not UTF-8 at byte 2
+```
+
+A caller that wants the text anyway — replacing what does not decode, or reading the file as some other
+encoding — reads `read_bytes` and decides for itself, with [`from_utf8`](/library/text/) or anything
+else.
 
 ### Writing where somebody else is reading
 
@@ -171,6 +191,7 @@ enum IoError
     NoSpaceLeft
     Interrupted
     NotOpen
+    InvalidUtf8(offset: usize)
     Other(code: int)
 
     code(self) -> int
@@ -187,6 +208,11 @@ guess that compiled.
 **The cases are the ones a program branches on, and everything else arrives as `Other` carrying the
 number.** A library that mapped every `errno` to a name of its own would be a table nobody could keep
 current and a program could not extend — and the number is what a reader looks up anyway.
+
+**`InvalidUtf8` is the one case no `errno` produces.** It is what `read_text`, `entries`, `read_link`,
+`canonicalize`, `current_dir` and `make_temp_dir` answer when bytes that had to be text are not UTF-8,
+and its `offset` is the byte at which the decode stopped. Its `code()` is `EILSEQ` (92 on macOS, 84 on
+Linux); two of them are equal when they stopped at the same byte, and one is never equal to an `Other`.
 
 `code()` answers for every case, not only `Other`: the named ones hand back the code they were
 recognised from, which keeps the question answerable without a second table. `message()` is a sentence
@@ -708,9 +734,32 @@ asking what is *in* it, and a recursive walk that forgets the filter does not te
 is the filesystem's** — not sorted, and not stable between two listings of one directory. A program
 that wants an order applies one.
 
-**A name that is not UTF-8 stops the program**, exactly as `read_text` does with a file's contents
-and for the same reason: answering with an error would put a case in `IoError` that no filesystem
-ever reports. POSIX names are bytes, so this is reachable rather than theoretical.
+**A name that is not UTF-8 makes the whole listing answer `InvalidUtf8`**, the offset counted within
+that name. POSIX names are bytes — Linux stores any of them, though macOS's APFS refuses to create one —
+so this is reachable rather than theoretical. The whole call fails rather than the name being skipped,
+because a listing with a name silently missing is a wrong answer that looks like a right one: a copy
+that leaves a file behind, a clean-up that leaves it in place. **`entry_bytes` is the listing for a
+directory whose names need not be text** — every name as the bytes the filesystem holds, the same
+`.`-and-`..` rule, never `InvalidUtf8`:
+
+```sysl
+import sysl.fs.{entry_bytes, make_temp_dir, remove_dir_all, write_text}
+import sysl.path.join
+import sysl.text.from_utf8
+
+val dir = make_temp_dir("sysl-fs-doc-bytes").unwrap()
+
+write_text(join(dir, "only"), "x").unwrap()
+
+for name in entry_bytes(dir).unwrap().view()
+    print(name.len, from_utf8(name).unwrap_or("?"))
+
+remove_dir_all(dir).unwrap()
+```
+
+```output
+4 only
+```
 
 **This is the one thing in the module answered by C rather than by a bare `extern`.** `readdir` hands
 back a `struct dirent` whose name field sits at an offset the two platforms disagree about, which is

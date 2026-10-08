@@ -157,14 +157,6 @@ private rds_reading(body: string, input: string) -> string
     out.0
 end rds_reading
 
-// A program that stops: it must not exit zero, and what it said must hold `message`.
-private rds_panics(text: string, message: string)
-    val out = rds_outcome(text, None)
-
-    assert(!out.1, s"expected the program to stop, but it exited cleanly: ${out.0}")
-    assert(out.0.contains(message), out.0)
-end rds_panics
-
 // The LLVM text of a program, as `sysl emit-llvm` prints it.
 private rds_ir(text: string) -> string
     val root = make_temp_dir("sysl-reading-ir").unwrap()
@@ -534,11 +526,19 @@ rds_many_lines_come_back_in_order()
 
 // -- text that is not text -----------------------------------------------------------------------
 
-@test("ill-formed input stops the program and says where in the line")
+// The cursor's verdict, printed once a loop over it has ended -- the program goes on running.
+private rds_verdict() -> string = raw"""
+
+    c.error() match
+        Some(e) -> print("not UTF-8 at byte", e.offset, "of the line")
+        None -> print("all text")
+    """
+
+@test("ill-formed input ends the cursor, which says where in the line, and the program carries on")
 rds_ill_formed_input_stops_the_program()
     if !rds_ready() then return
 
-    rds_panics(rds_bytes_reader() + raw"""
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
         var raw: [4]u8
 
         raw[0] = 97u8
@@ -547,16 +547,17 @@ rds_ill_formed_input_stops_the_program()
         raw[3] = 10u8
 
         var r = bytes_reader(raw[..])
+        var c = lines(&r)
 
-        for line in lines(&r)
+        for line in c
             print("[", line, "]")
-        """, "not UTF-8 at byte 1 of the line")
+        """ + rds_verdict()), "not UTF-8 at byte 1 of the line\n")
 
 @test("the offset is into the line, not into the file")
 rds_the_offset_is_into_the_line()
     if !rds_ready() then return
 
-    rds_panics(rds_bytes_reader() + raw"""
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
         var raw: [7]u8
 
         raw[0] = 111u8
@@ -568,16 +569,17 @@ rds_the_offset_is_into_the_line()
         raw[6] = 10u8
 
         var r = bytes_reader(raw[..])
+        var c = lines(&r)
 
-        for line in lines(&r)
+        for line in c
             print("[", line, "]")
-        """, "not UTF-8 at byte 2 of the line")
+        """ + rds_verdict()), "[ ok ]\nnot UTF-8 at byte 2 of the line\n")
 
-@test("the lines before it were handed over before it stopped")
+@test("the lines before it were handed over before the cursor ended")
 rds_the_lines_before_it_were_handed_over()
     if !rds_ready() then return
 
-    rds_panics(rds_bytes_reader() + raw"""
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
         var raw: [4]u8
 
         raw[0] = 111u8
@@ -586,10 +588,11 @@ rds_the_lines_before_it_were_handed_over()
         raw[3] = 255u8
 
         var r = bytes_reader(raw[..])
+        var c = lines(&r)
 
-        for line in lines(&r)
+        for line in c
             print("[", line, "]")
-        """, "[ ok ]")
+        """ + rds_verdict()), "[ ok ]\nnot UTF-8 at byte 0 of the line\n")
 
 @test("the same bytes read as bytes are not fatal")
 rds_the_same_bytes_read_as_bytes()
@@ -640,7 +643,7 @@ rds_the_reporting_cursor_continues()
                         Err(e) -> print("< bad at", e.offset, ">")
         """), "[ ok ]\n< bad at 1 >\n[ z ]\n")
 
-@test("try_line_text is line_text without the trap, and answers the same on good input")
+@test("line_text answers an ill-formed line rather than stopping, and the text of a good one")
 rds_try_line_text_is_line_text_without_the_trap()
     if !rds_ready() then return
 
@@ -648,10 +651,9 @@ rds_try_line_text_is_line_text_without_the_trap()
         var good: [4]u8 = [104, 105, 13, 0]
         var bad: [2]u8 = [97, 255]
 
-        print(try_line_text(good[0..<3]).unwrap())
-        print(try_line_text(bad[..]).is_err())
-        print(line_text(good[0..<3]))
-        """), "hi\ntrue\nhi\n")
+        print(line_text(good[0..<3]).unwrap())
+        print(line_text(bad[..]).is_err())
+        """), "hi\ntrue\n")
 
 // -- the cursor borrows the reader ---------------------------------------------------------------
 

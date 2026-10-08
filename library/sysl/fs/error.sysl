@@ -59,6 +59,15 @@ private[sysl] not_empty() -> int = 66
 private[sysl] not_empty() -> int = 39
 #endif
 
+// `EILSEQ`, the code a platform reports for bytes that are not the text they were meant to be: 92 on
+// a BSD, 84 under glibc. It is what `InvalidUtf8` answers to `code()`, and what APFS reports when it
+// is asked to create a name that is not UTF-8.
+#if bsd
+private[sysl] ilseq() -> int = 92
+#else
+private[sysl] ilseq() -> int = 84
+#endif
+
 /** Why a filesystem operation did not happen. */
 enum IoError
     NotFound
@@ -71,6 +80,19 @@ enum IoError
     NoSpaceLeft
     Interrupted
     NotOpen
+
+    /** Bytes that had to be text and are not UTF-8: a file `read_text` was asked for, a name in a
+     * listing `entries` was asked for, a path the platform handed back. `offset` is the byte at which
+     * the decode stopped, counted from the start of whatever was being decoded -- the file, or the one
+     * name -- which is `sysl.text.Utf8Error`'s offset carried across unchanged.
+     *
+     * **It is the one case no `errno` produces**, and it is here anyway because the alternative was a
+     * trap: a program reading a file or a directory it did not write is one byte away from it, and
+     * that is a fact about the input rather than about the program, which is the line
+     * `reference/errors.md` draws between a `Result` and a panic.
+     */
+    InvalidUtf8(offset: usize)
+
     Other(code: int)
 
     /** The number this came from, so a program can report or compare one the set does not name.
@@ -88,6 +110,7 @@ enum IoError
         NoSpaceLeft      -> 28
         Interrupted      -> 4
         NotOpen          -> 9
+        InvalidUtf8(_)   -> ilseq()
         Other(c)         -> c
 
     /** A sentence, in the terms the operation was asked in rather than in C's. */
@@ -102,6 +125,7 @@ enum IoError
         NoSpaceLeft       -> "no space left on the device"
         Interrupted       -> "interrupted"
         NotOpen           -> "the file is not open"
+        InvalidUtf8(at)   -> f"not UTF-8 at byte $at%d"
         Other(c)          -> f"error $c%d"
 end IoError
 
@@ -119,9 +143,20 @@ end IoError
  * are the same condition wearing two spellings, and `from_errno` never produces the first. Comparing
  * on the shape instead would make an error that came from a platform sysl does not have a named case
  * for unequal to itself after a round trip through a number.
+ *
+ * **`InvalidUtf8` is the exception, because its payload is not a code**: two of them are equal when
+ * they stopped at the same byte, and one is never equal to anything else -- `from_errno` cannot
+ * produce it, so there is no second spelling for it to agree with, and comparing it on `code()` would
+ * make `InvalidUtf8(3) == InvalidUtf8(40)`.
  */
 impl Eq for IoError
-    eq(self, other: IoError) -> bool = self.code() == other.code()
+    eq(self, other: IoError) -> bool = self match
+        InvalidUtf8(a) -> other match
+            InvalidUtf8(b) -> a == b
+            _ -> false
+        _ -> other match
+            InvalidUtf8(_) -> false
+            _ -> self.code() == other.code()
 
 /** So that `print(e)` and `f"$e%s"` say the sentence rather than the shape of the value. */
 impl Display for IoError

@@ -185,10 +185,26 @@ recursive walk that forgets the filter does not terminate.
 stable between two listings of one directory. A program that wants an order applies one; there is
 no order here to be relied on by accident.
 
-**A name that is not UTF-8 stops the program**, exactly as `read_text` does with a file's contents
-and for the reason written there: answering with an error would put a case in `IoError` that no
-filesystem ever reports. A POSIX name is bytes, so this is reachable — and a program that would
-rather inspect than trap is one this module does not serve yet.
+**A name that is not UTF-8 makes the whole call answer `InvalidUtf8`**, carrying the offset within
+that name. A POSIX name is bytes, and Linux will store any of them, so a program listing a directory
+it did not make can meet one. The whole call fails rather than the name being skipped, because a
+listing with a name silently missing is a wrong answer that looks like a right one -- a copy that
+leaves a file behind, a clean-up that leaves it in place. A program that has to carry on through
+such a directory lists it with `entry_bytes`, which answers every name as the bytes it is.
+
+### `entry_bytes`
+
+```sysl
+entry_bytes(path: string) -> Result[Buf[[]u8], IoError]
+```
+
+Every name in a directory as the bytes the filesystem holds, with `.` and `..` left out and in the
+same unpromised order as `entries`.
+
+**This is `entries` for a directory whose names need not be text** -- the one a program did not
+make, on a filesystem that stores whatever bytes it was given. It never answers `InvalidUtf8`; a
+caller decodes each name itself with `sysl.text.from_utf8`, and decides what a name that does not
+decode should become. The bytes are a copy, so they outlive the listing.
 
 ### `exists`
 
@@ -400,13 +416,13 @@ that has a target". Ask `is_link` first where the difference matters.
 read_text(path: string) -> Result[string, IoError]
 ```
 
-The file as text.
+The file as text, or `InvalidUtf8` carrying the offset of the first byte that is not.
 
-**Bytes that are not UTF-8 stop the program**, the way an ill-formed command-line argument does,
-and for the reason `sysl.io`'s `line_text` gives: the layer underneath is public, so a caller who
-would rather inspect than trap reads `read_bytes` and validates it. Answering with an error
-instead would put a case in `IoError` that no filesystem ever reports, and would make every
-program that reads its own configuration handle a failure that means its build is broken.
+**Bytes that are not UTF-8 are an error, not a trap**, for the reason `reference/errors.md` gives
+for every failure that comes from outside the program: a file is input, and a program reading one
+it did not write cannot have ruled out the byte that breaks it. The offset is counted from the start
+of the file. A caller that wants the text anyway -- replacing what does not decode, or treating the
+file as Latin-1 -- reads `read_bytes` and decides for itself.
 
 ### `readable`
 
@@ -664,6 +680,7 @@ enum IoError
     NoSpaceLeft
     Interrupted
     NotOpen
+    InvalidUtf8(offset: usize)
     Other(code: int)
 ```
 

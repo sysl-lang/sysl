@@ -2,7 +2,7 @@ module sysl.fs
 @requires(os)
 
 import sysl.buf.{Buf, buf}
-import sysl.text.{cstring, from_cstring}
+import sysl.text.{cstring, from_utf8}
 
 // What a program can ask and change about a path without opening what is at the end of it.
 //
@@ -113,34 +113,65 @@ end is_dir
  * stable between two listings of one directory. A program that wants an order applies one; there is
  * no order here to be relied on by accident.
  *
- * **A name that is not UTF-8 stops the program**, exactly as `read_text` does with a file's contents
- * and for the reason written there: answering with an error would put a case in `IoError` that no
- * filesystem ever reports. A POSIX name is bytes, so this is reachable — and a program that would
- * rather inspect than trap is one this module does not serve yet.
+ * **A name that is not UTF-8 makes the whole call answer `InvalidUtf8`**, carrying the offset within
+ * that name. A POSIX name is bytes, and Linux will store any of them, so a program listing a directory
+ * it did not make can meet one. The whole call fails rather than the name being skipped, because a
+ * listing with a name silently missing is a wrong answer that looks like a right one -- a copy that
+ * leaves a file behind, a clean-up that leaves it in place. A program that has to carry on through
+ * such a directory lists it with `entry_bytes`, which answers every name as the bytes it is.
  */
 entries(path: string) -> Result[Buf[string], IoError]
+    var names: Buf[string] = buf()
+
+    for name in entry_bytes(path)?.view() do names.push(name_text(name)?)
+
+    Ok(names)
+end entries
+
+/** Every name in a directory as the bytes the filesystem holds, with `.` and `..` left out and in the
+ * same unpromised order as `entries`.
+ *
+ * **This is `entries` for a directory whose names need not be text** -- the one a program did not
+ * make, on a filesystem that stores whatever bytes it was given. It never answers `InvalidUtf8`; a
+ * caller decodes each name itself with `sysl.text.from_utf8`, and decides what a name that does not
+ * decode should become. The bytes are a copy, so they outlive the listing.
+ */
+entry_bytes(path: string) -> Result[Buf[[]u8], IoError]
     var d = c_opendir(cstring(path).ptr)
 
     if d == null then return Err(why())
 
     defer c_closedir(d)
 
-    var names: Buf[string] = buf()
+    var names: Buf[[]u8] = buf()
     var next = c_dir_next(d)
 
     while next != null
-        val name = from_cstring(next) match
-            Ok(s) -> s
-            Err(e) ->
-                print("panic: a name in", path, "is not UTF-8 at byte", e.offset)
-                exit(1)
+        var n: usize = 0
 
-        if name != "." && name != ".." then names.push(name)
+        while next[n] != 0
+            n += 1
+
+        if !dots(next, n)
+            var name: []u8 = [0; n]
+
+            for i in 0..<n do name[i] = next[i]
+
+            names.push(name)
 
         next = c_dir_next(d)
 
     Ok(names)
-end entries
+end entry_bytes
+
+/** Whether a name is `.` or `..`, asked of the bytes before anything is copied. */
+private dots(p: *u8, n: usize) -> bool = p[0] == u8('.') && (n == 1 || (n == 2 && p[1] == u8('.')))
+
+/** One listed name as text, or `InvalidUtf8` at the offset within it where it stops being UTF-8. */
+private[sysl] name_text(name: []const u8) -> Result[string, IoError]
+    from_utf8(name) match
+        Ok(s) -> Ok(s)
+        Err(e) -> Err(InvalidUtf8(e.offset))
 
 /** Whether the path names something that is not a directory. A device or a socket answers `true`
  * here, which is right for what callers use it for: the question is whether opening it as a file
