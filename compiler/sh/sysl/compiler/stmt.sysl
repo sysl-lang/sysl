@@ -497,6 +497,15 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
 
     AsmStmt(arms) -> one(type_asm(cx, stmt.span, arms))
 
+    // Only an annotated block reaches a body as module-level assembly: a bare one is the function's
+    // own statement. A section and a boundary are facts about where the assembler lays instructions
+    // down by themselves, and a function's block is laid down wherever the function's code is.
+    ModuleAsm(_, _, _) ->
+        refuse(cx, stmt.span, "an 'asm' block inside a function is part of that function's code, " +
+               "so '@section(\"...\")' and '@align(n)' have nothing of their own to place — they " +
+               "place an 'asm' block written at the top of a file, outside every function. Move it " +
+               "there, or place the whole function with '@section(\"...\")'")
+
     // An import binds a name for the statements after it and emits nothing. The declaration pass
     // reads a **file's** imports, which is every one written at the top of it; one written inside a
     // body is this walk's to bind, and the scope it was written in gives it back at the dedent.
@@ -723,7 +732,7 @@ private no_thread_local(cx: &Analyzer, span: Span, name: string, thread_local: b
 
 // `@align(n)` above a binding, folded to the boundary it named. A refusal costs the annotation and
 // not the declaration, which is what lets the rest of the function still be read.
-private boundary(cx: &Analyzer, name: string, align: Option[Expr]) -> Option[usize]
+boundary(cx: &Analyzer, name: string, align: Option[Expr]) -> Option[usize]
     if align.is_none() then return None
 
     val folded = const_fold(cx, align.unwrap())

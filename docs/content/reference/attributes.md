@@ -1826,7 +1826,9 @@ address the processor fetches from, storage in `.noinit` that survives a warm re
 the RAM bank the engine can reach, a function copied into RAM so it can run while flash is being
 erased.
 
-It marks whatever occupies an address — a module `var`, a module `val`, and a function.
+It marks whatever occupies an address — a module `var`, a module `val`, a function, and an `asm`
+block written at the top of a file, which is how code that runs before there is a stack is placed
+(see [inline assembly](/reference/inline-assembly/); such a block also takes `@align(n)`).
 
 ```sysl
 @section(".noinit")
@@ -2230,7 +2232,8 @@ because the trees a library ships are now a per-target answer.
 
 | absent | why |
 |---|---|
-| a general annotation mechanism | the set is closed: `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)`, `@crossing(...)`, `@noinline`, `@inline`, `@cold`, `@setup`, `@teardown`, `@setup_all` and `@teardown_all` on a free function, `@packed`, `@align(n)` and `@export("...")` on a struct, `@section("...")` on a binding or a function, `@no_<capability>`, `@requires`, `@link`, `@include` and `@tests` on a file, and `@assert` on nothing at all. Each was designed and added on its own evidence; there is no way to write one the compiler does not already know |
+| a general annotation mechanism | the set is closed: `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)`, `@crossing(...)`, `@noinline`, `@inline`, `@cold`, `@setup`, `@teardown`, `@setup_all` and `@teardown_all` on a free function, `@packed`, `@align(n)` and `@export("...")` on a struct, `@section("...")` on a binding or a function, `@section("...")` and `@align(n)` on an `asm` block at the top of a file, `@no_<capability>`, `@requires`, `@link`, `@include` and `@tests` on a file, and `@assert` on nothing at all. Each was designed and added on its own evidence; there is no way to write one the compiler does not already know |
+| `@naked`, a function with no frame | code that must run before there is a stack — a reset entry, a vector table — is an [`asm` block at the top of a file](/reference/inline-assembly/), which is not a function and so has no frame to leave out |
 | bitfield syntax | there is nothing to write: inside `@packed` an `iN` field already occupies exactly N bits, so a five-bit register field is `u5` and needs no `: 5` beside it. The open integer family does the work C's declarator syntax was invented for |
 | `#define`, or any project-supplied symbol | the `#if` vocabulary is derived from the target and closed, which is what makes an unknown symbol an error rather than a false |
 | a `#if` that asks about a capability | a condition asks what the *target* says; what a project permits is a different question, left with the config that would define it |

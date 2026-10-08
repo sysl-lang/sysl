@@ -427,6 +427,115 @@ arch_reset() -> never
 
 The promise is yours to keep here, which is true of the instructions themselves anyway.
 
+## Assembly at the top of a file
+
+Some code has to run before there is a function to run it in. The first instructions a processor
+executes after reset have no stack yet, and a function — even one whose body is a single `asm`
+block — may save a register on the stack before its first instruction. An exception vector table is
+not a function at all: it is sixteen 128-byte slots on a 2 KiB boundary. Both are written as an
+`asm` block at the **top of a file**, outside every function:
+
+```sysl build=c target=aarch64-freestanding
+@section(".text.boot")
+asm
+    [aarch64]
+        ".globl _start"
+        "_start:"
+        "adrp x0, __stack_top"
+        "add x0, x0, :lo12:__stack_top"
+        "mov sp, x0"
+        "b kmain"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "this kernel boots on aarch64 only"
+
+@align(2048)
+@section(".text.vectors")
+asm
+    [aarch64]
+        ".globl vectors"
+        "vectors:"
+        ".rept 16"
+        "b ."
+        ".balign 128"
+        ".endr"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "this kernel boots on aarch64 only"
+
+extern "vectors" vectors()
+
+@export("kmain")
+kmain() -> int = 0
+```
+
+The block has the same arms as one inside a function, chosen the same way, and every processor still
+needs an answer. What changes is that **nothing surrounds it**: the assembler lays the instructions
+down by themselves, once, in the order the files were read.
+
+- **A label is a symbol, as written.** A block at the top of a file is emitted exactly once, so its
+  labels are not renamed — which is the point: `_start` and `vectors` above are the names a linker
+  script, the processor and sysl code reach. sysl reaches one through an `extern`.
+- **`$` is an ordinary character** — there are no operands for it to mark — and **a doubled brace
+  is still a literal one**, so `push {{lr}}` means the same thing at the top of a file as inside a
+  function.
+- **It is never left out.** Nothing in the program names a block, so reachability has nothing to
+  ask of one: every block in every file of the build is laid down, including in a `build-c` archive.
+  A block in a [`@tests` file](/reference/attributes/) is scaffolding, and only a test build carries
+  it.
+- **It belongs to the module even in the file a program starts in**, so a file holding nothing but a
+  block and declarations does not become that file.
+
+`@section("...")` places the instructions: they are bracketed by `.pushsection` and `.popsection`,
+so whatever follows is back where it was. As everywhere else the name is the target's spelling, and
+the assembler gives the section its flags from that name — `.text.boot` is code — so a section of
+code is named under `.text`. `@align(n)` begins the block on an `n`-byte boundary, inside the section
+when there is one; `n` is a constant power of two. Those two are the only annotations a block takes.
+
+**What only a block inside a function can mean is refused**, on every arm and not only on the one
+being built, since the mistake does not depend on the machine. An operand has no variable to be:
+
+```sysl target=aarch64-freestanding
+var ticks: u64 = 0
+
+asm
+    [aarch64]
+        "mrs {ticks}, cntvct_el0"
+        out ticks : reg
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+print(ticks)
+```
+
+```error
+'ticks' cannot be an operand here: an 'asm' block at the top of a file is outside every function
+```
+
+A `clobbers` line tells surrounding code what the block destroys, and there is no surrounding code:
+
+```sysl target=aarch64-freestanding
+asm
+    [aarch64]
+        "nop"
+        clobbers "x0"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+```
+
+```error
+'clobbers' tells the code around an 'asm' block which registers it destroys, and a block at the top of a file has no code around it
+```
+
+And a block inside a function is that function's code, so it cannot be placed apart from it — place
+the function, or move the block to the top of the file:
+
+```sysl target=aarch64-freestanding
+halt()
+    @section(".text.boot")
+    asm
+        [aarch64] "wfi"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+```
+
+```error
+an 'asm' block inside a function is part of that function's code
+```
+
 ## What is not here yet
 
 - **`inout`** — a read-modify-write operand. The instructions wanting one are the exchange and
