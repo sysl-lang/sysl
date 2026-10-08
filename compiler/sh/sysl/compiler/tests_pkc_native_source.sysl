@@ -1,0 +1,195 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.remove_dir_all
+import sysl.text.Search
+
+// `reference/ffi.md § A library may carry C` for the trees a compilation walks: the project's own,
+// and a source tree named with `--lib`; the reference's `NativeSourceTests`. **The rule is about a
+// source tree, not about a library** -- a `.c` belonging to a module is compiled with it, and a
+// directory holding no sysl contributes none of its own.
+
+// Seven is a number only the C knows and the multiplication is only the sysl's, so neither half can
+// be dropped without the answer changing.
+private const PkcShim: string = "int demo_seven(void) { return 7; }\n"
+
+// C that cannot compile, for the cases whose claim is that it is never offered to clang.
+private const PkcRefuses: string = "#error this file is not part of any module\n"
+
+private const PkcCalling: string = "extern \"demo_seven\" c_seven() -> int\n\n" +
+    "seven_times(n: int) -> int = c_seven() * n\n"
+
+private pkc_native(files: []string) -> string = pkc_tree("sysl-pkc-native", files)
+
+// What the tree's program printed, the tree removed after.
+private pkc_ran_tree(root: string, path: string, extra: []string = []) -> string
+    val said = pkc_ran(path, extra)
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end pkc_ran_tree
+
+// What `sysl test` over the tree came to: its status, which is 0 only where every test passed.
+private pkc_tested(root: string) -> (int, string)
+    val said = pkc_cli(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end pkc_tested
+
+// -- a project's own C -----------------------------------------------------------------------------
+
+@test("is compiled and linked with it")
+pkc_own_c_is_linked()
+    if !pkc_ready() then return
+
+    val root = pkc_native(["main.sysl", "print(demo.seven_times(6))\n",
+                           "demo/demo.sysl", s"module demo\n\n$PkcCalling", "demo/shim.c", PkcShim])
+
+    assert_eq(pkc_ran_tree(root, root), "42\n")
+
+@test("including one at the root, where no module is declared")
+pkc_own_c_at_the_root()
+    if !pkc_ready() then return
+
+    val root = pkc_native(["main.sysl", "print(demo.seven_times(6))\n",
+                           "demo/demo.sysl", s"module demo\n\n$PkcCalling", "shim.c", PkcShim])
+
+    assert_eq(pkc_ran_tree(root, root), "42\n")
+
+// The tests that exercise a shim are in the package that ships it, so a test build dropping the C
+// fails on the one tree most likely to hold any.
+@test("and a test build gets it on the same footing as a run")
+pkc_own_c_in_a_test_build()
+    if !pkc_ready() then return
+
+    val root = pkc_native(["demo/demo.sysl", s"module demo\n\n$PkcCalling\n@test\nseven_is_seven() =\n" +
+                                             "    assert(seven_times(6) == 42, \"the shim was linked\")\n",
+                           "demo/shim.c", PkcShim])
+    val said = pkc_tested(root)
+
+    assert_eq(said.0, 0, said.1)
+
+// Naming a file compiles that file alone, so there is no tree for C to have travelled with -- and the
+// link says so by naming the symbol nothing defined.
+@test("is not gathered when a single file was named rather than a tree")
+pkc_not_gathered_for_one_file()
+    if !pkc_ready() then return
+
+    val root = pkc_native(["main.sysl", s"$PkcCalling\nprint(seven_times(6))\n", "shim.c", PkcShim])
+    val said = pkc_ran_tree(root, s"$root/main.sysl")
+
+    assert(said.starts_with("build failed: sysl: error: clang failed (exit 1):\n") &&
+           said.contains("\"_demo_seven\", referenced from:"), said)
+
+// -- C in a directory that holds no sysl -----------------------------------------------------------
+
+// A build directory inside the project -- CMake's default -- fills with generated C written for
+// another toolchain; compiling it would stop the build on an `#error` that is neither sysl's nor
+// the project's.
+@test("is not compiled, however deep it sits")
+pkc_c_with_no_sysl_is_skipped()
+    if !pkc_ready() then return
+
+    val root = pkc_native(["main.sysl", "print(demo.seven_times(6))\n",
+                           "demo/demo.sysl", s"module demo\n\n$PkcCalling", "demo/shim.c", PkcShim,
+                           "build/generated.c", PkcRefuses, "build/deep/nested.c", PkcRefuses])
+
+    assert_eq(pkc_ran_tree(root, root), "42\n")
+
+@test("including where the project root itself holds sysl")
+pkc_skipped_beside_a_root_with_sysl()
+    if !pkc_ready() then return
+
+    val root = pkc_native(["main.sysl", s"$PkcCalling\nprint(seven_times(6))\n", "shim.c", PkcShim,
+                           "build/generated.c", PkcRefuses])
+
+    assert_eq(pkc_ran_tree(root, root), "42\n")
+
+// The root is the tree rather than a directory in it, so it carries C whether or not it holds sysl
+// -- and the exemption must not reach the build directory beside it.
+@test("though the root itself carries C with no sysl of its own")
+pkc_the_root_carries_c()
+    if !pkc_ready() then return
+
+    val root = pkc_native(["demo/demo.sysl", s"module demo\n\n$PkcCalling\n@test\nseven_is_seven() =\n" +
+                                             "    assert(seven_times(6) == 42, \"the root's shim was " +
+                                             "linked\")\n",
+                           "shim.c", PkcShim, "build/generated.c", PkcRefuses])
+    val said = pkc_tested(root)
+
+    assert_eq(said.0, 0, said.1)
+
+// `sh/` and `sh/sysl/` hold nothing in every package namespaced by reverse DNS, and the module
+// three levels down is the whole package.
+@test("while a module below such a directory still carries its own")
+pkc_a_module_below_carries_its_own()
+    if !pkc_ready() then return
+
+    val root = pkc_native(["main.sysl", "print(sh.sysl.demo.seven_times(6))\n",
+                           "sh/sysl/demo/demo.sysl", s"module sh.sysl.demo\n\n$PkcCalling",
+                           "sh/sysl/demo/shim.c", PkcShim, "sh/stray.c", PkcRefuses,
+                           "sh/sysl/stray.c", PkcRefuses])
+
+    assert_eq(pkc_ran_tree(root, root), "42\n")
+
+// -- a library given as a source tree --------------------------------------------------------------
+
+// The reference compares this road with its `.syslib` one; here a source tree is the only way a
+// library is handed over, so the claim is that it carries its C at all.
+@test("carries its C exactly as the artifact built from it does")
+pkc_a_lib_root_carries_its_c()
+    if !pkc_ready() then return
+
+    val lib = pkc_native(["demo/demo.sysl", s"module demo\n\n$PkcCalling", "demo/shim.c", PkcShim])
+    val root = pkc_native(["main.sysl", "print(demo.seven_times(6))\n"])
+
+    assert_eq(pkc_ran_tree(root, root, ["--lib", lib]), "42\n")
+    remove_dir_all(lib).unwrap_or(())
+
+@test("and two source trees each carrying a file of one name stay two objects")
+pkc_two_lib_roots_stay_two()
+    if !pkc_ready() then return
+
+    val left = pkc_native(["left/left.sysl", "module left\n\nextern \"left_util\" c() -> int\n\n" +
+                                             "value() -> int = c()\n",
+                           "left/util.c", "int left_util(void) { return 40; }\n"])
+    val right = pkc_native(["right/right.sysl", "module right\n\nextern \"right_util\" c() -> int\n\n" +
+                                                "value() -> int = c()\n",
+                            "right/util.c", "int right_util(void) { return 2; }\n"])
+    val root = pkc_native(["main.sysl", "print(left.value() + right.value())\n"])
+
+    assert_eq(pkc_ran_tree(root, root, ["--lib", left, "--lib", right]), "42\n")
+    remove_dir_all(left).unwrap_or(())
+    remove_dir_all(right).unwrap_or(())
+
+// -- C that will not compile -----------------------------------------------------------------------
+
+@test("C that will not compile stops the build, naming the file")
+pkc_bad_c_stops_the_build()
+    if !pkc_ready() then return
+
+    val root = pkc_native(["main.sysl", "print(demo.seven_times(6))\n",
+                           "demo/demo.sysl", s"module demo\n\n$PkcCalling",
+                           "demo/shim.c", "int demo_seven(void) { return\n"])
+    val said = pkc_ran(root)
+
+    assert(said.starts_with("build failed: sysl: error: ") &&
+           said.contains("/demo/shim.c did not compile (clang, exit 1):"),
+           said)
+    remove_dir_all(root).unwrap_or(())
+
+// `emit-llvm` prints a module and has nothing to do with an object file, so a tree whose C does not
+// compile still emits -- had the driver compiled it anyway, this would fail with clang's complaint.
+@test("a command that never links does not compile the tree's C at all")
+pkc_emit_llvm_compiles_no_c()
+    if std_root().is_err() then return
+
+    val root = pkc_native(["main.sysl", "print(demo.seven_times(6))\n",
+                           "demo/demo.sysl", s"module demo\n\n$PkcCalling",
+                           "demo/shim.c", "int demo_seven(void) { return\n"])
+    val said = pkc_cli(["sysl", "emit-llvm", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said.0, 0)
+    assert(said.1.contains("declare i32 @demo_seven()"), said.1)

@@ -46,6 +46,39 @@ link_required(units: Buf[Program]) -> Buf[string]
     out
 end link_required
 
+// Refuses a malformed library name, and a file that asks for the same library twice.
+//
+// **The library's own headers are not read**, matching `read_capabilities`: they were checked when
+// the library was built, and a complaint about one would point at a file the program's author did
+// not write. They still reach the command line through `link_required`, which reads every unit.
+//
+// Within one file a repeat says nothing the first said, exactly as a repeated capability does. Across
+// the files of a module it is not a repeat at all: each file states what its own `extern`s need, and
+// two files needing the same library is the ordinary case.
+read_link_directives(a: &Analysis, units: Buf[Program])
+    for i in 0..<units.len()
+        val unit = units.at(i)
+        val scope = scope_of_unit(a, unit)
+
+        if from_library(a, scope) then continue
+
+        for j in 0..<unit.links.len()
+            val l = unit.links.at(j)
+            val why = link_complaint(l.name)
+
+            if why != "" then a.fault(scope, l.span, why)
+
+            // Said once per name, at its second appearance -- a third says nothing a second did not.
+            var earlier = 0
+
+            for k in 0..<j
+                if unit.links.at(k).name == l.name then earlier += 1
+
+            if earlier == 1
+                a.fault(scope, l.span, s"'${l.name}' is already linked by this file, and asking " +
+                        "twice links it once")
+end read_link_directives
+
 private holds(names: Buf[string], name: string) -> bool
     for i in 0..<names.len()
         if names.at(i) == name then return true

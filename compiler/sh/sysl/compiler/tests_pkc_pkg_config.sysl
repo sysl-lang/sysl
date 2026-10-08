@@ -1,0 +1,238 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// A package that names an installed library, answered by asking this machine where it is
+// (`reference/packages.md § Capabilities`); the reference's `PkgConfigTests`.
+//
+// **The reference asks the machine's own `pkg-config` and picks whichever module it lists first**;
+// these ask a `pkg-config` of their own, put first on `PATH`, which knows exactly one module
+// (`pkcfake`). So a case is the same on every machine, and the end-to-end one links a library the
+// test builds rather than skipping where cairo is not installed.
+
+private pkc_project(needs: string, caps: string = "os = true, heap = true",
+                    program: string = "print(42)\n") -> string
+    val wants = if caps == "" then "" else s"$caps, "
+
+    pkc_tree("sysl-pkc-pkgc", ["package.hocon",
+        s"package { name = \"app\", version = \"0.1.0\" }\nrequires { ${wants}pkg_config { $needs } }\n",
+        "main.sysl", program])
+end pkc_project
+
+// A package on disk whose manifest declares a `pkg_config` requirement, and one module.
+private pkc_declaring(needs: string) -> string =
+    pkc_tree("sysl-pkc-dep", ["package.hocon",
+        s"package { name = \"dep\", version = \"1.0.0\" }\nrequires { pkg_config { $needs } }\n",
+        "dep/dep.sysl", "module dep\n\ndouble(n: int) -> int = n * 2\n"])
+
+// A project that depends on one, by path so nothing reaches the network.
+private pkc_depending(dep: string) -> string =
+    pkc_tree("sysl-pkc-app", ["package.hocon",
+        s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { d { path = \"$dep\" } }\n",
+        "main.sysl", "print(dep.double(21))\n"])
+
+// The tool every case here asks, answering `pkcfake` with flags that need nothing installed.
+private pkc_tool() -> string = pkc_fake_tool("-DPKC_FAKE=1  -I/nonexistent/pkc/include", "")
+
+// -- a library this machine does not have ----------------------------------------------------------
+
+@test("is refused by name, with the package's own reason and both ways to answer it")
+pkc_refused_by_name()
+    if !pkc_ready() then return
+
+    val tool = pkc_tool()
+    val root = pkc_project("kayro = \"the Kayro graphics library, which does not exist\"")
+    val said = pkc_ran(root)
+
+    pkc_drop_tool(tool)
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "build failed: sysl: error: this project needs the 'kayro' library and 'pkg-config' " +
+              "knows no 'kayro' — the Kayro graphics library, which does not exist. Install it, or say " +
+              "where it is with '--include-path kayro=<dir>' and '--link-path <dir>'")
+
+// -- a library the command line answered -----------------------------------------------------------
+
+@test("is not asked about at all, even where pkg-config has never heard of it")
+pkc_not_asked_when_answered()
+    if !pkc_ready() then return
+
+    val tool = pkc_tool()
+    val root = pkc_project("kayro = \"a library nothing has\"")
+    val said = pkc_ran(root, ["--include-path", "kayro=/nonexistent/include"])
+
+    pkc_drop_tool(tool)
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "42\n")
+
+// **The whole chain, from the flag's text, over a name with a dot in it**: the manifest takes it,
+// `--include-path` reads it as a name rather than a directory, and the probe matches the two.
+@test("a '.pc' name with a dot in it is answered by the flag the refusal names")
+pkc_a_dotted_name_is_answered()
+    if !pkc_ready() then return
+
+    val tool = pkc_tool()
+    val root = pkc_project("\"yaml-0.1\" = \"libyaml, which this machine need not have\"")
+    val said = pkc_ran(root, ["--include-path", "yaml-0.1=/nonexistent/include"])
+    val names = join(supplied_names().view(), " ")
+    val flags = join(include_flags().view(), " ")
+
+    reset_search_paths()
+    pkc_drop_tool(tool)
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(names, "yaml-0.1")
+    assert_eq(flags, "-I/nonexistent/include")
+    assert_eq(said, "42\n")
+
+// -- a build for another machine -------------------------------------------------------------------
+
+// `pkg-config` answers for the machine it runs on, so a freestanding build that silently took this
+// machine's headers would link and be wrong somewhere nobody can see.
+@test("is refused rather than answered with this machine's paths")
+pkc_another_machine_is_refused()
+    if std_root().is_err() then return
+
+    val tool = pkc_tool()
+    val root = pkc_project("sdl3 = \"SDL3 — brew install sdl3\"", "", "answer() -> int = 42")
+    val said = pkc_cli(["sysl", "build", "--target", "thumbv7m-freestanding", root, "-o", s"$root/out"])
+
+    pkc_drop_tool(tool)
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said.0, 1)
+    assert_eq(said.1, "sysl: error: this project needs the 'sdl3' library and this is a build for " +
+              "'thumbv7m-freestanding' rather than for this machine, so there is nothing to ask where " +
+              "it is — SDL3 — brew install sdl3. Say where it is with '--include-path sdl3=<dir>' and " +
+              "'--link-path <dir>'")
+
+// The same declaration on the same machine, for the host: what differs is only the target.
+@test("where the same package for the host asks this machine and is answered")
+pkc_the_host_is_answered()
+    if !pkc_ready() then return
+
+    val tool = pkc_tool()
+    val root = pkc_project("pkcfake = \"a library this machine has\"")
+    val said = pkc_ran(root)
+
+    pkc_drop_tool(tool)
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "42\n")
+
+// -- a package that arrived some other way ---------------------------------------------------------
+
+@test("is asked when it came through dependencies, and the refusal names it rather than the project")
+pkc_asked_through_dependencies()
+    if !pkc_ready() then return
+
+    val tool = pkc_tool()
+    val dep = pkc_declaring("kayro = \"a library nothing has\"")
+    val root = pkc_depending(dep)
+    val said = pkc_ran(root)
+
+    pkc_drop_tool(tool)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+    assert_eq(said, "build failed: sysl: error: d needs the 'kayro' library and 'pkg-config' knows no " +
+              "'kayro' — a library nothing has. Install it, or say where it is with '--include-path " +
+              "kayro=<dir>' and '--link-path <dir>'")
+
+@test("and builds when the library it named is one this machine has")
+pkc_builds_through_dependencies()
+    if !pkc_ready() then return
+
+    val tool = pkc_tool()
+    val dep = pkc_declaring("pkcfake = \"one this machine has\"")
+    val root = pkc_depending(dep)
+    val said = pkc_ran(root)
+
+    pkc_drop_tool(tool)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+    assert_eq(said, "42\n")
+
+@test("is asked when it came as a --lib source root")
+pkc_asked_through_a_lib_root()
+    if !pkc_ready() then return
+
+    val tool = pkc_tool()
+    val dep = pkc_declaring("kayro = \"a library nothing has\"")
+    val root = pkc_tree("sysl-pkc-plain", ["main.sysl", "print(42)\n"])
+    val said = pkc_ran(root, ["--lib", dep])
+
+    pkc_drop_tool(tool)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+    assert_eq(said, s"build failed: sysl: error: $dep needs the 'kayro' library and 'pkg-config' knows " +
+              "no 'kayro' — a library nothing has. Install it, or say where it is with '--include-path " +
+              "kayro=<dir>' and '--link-path <dir>'")
+
+// -- the answer this machine gives -----------------------------------------------------------------
+
+// Measured against the tool rather than against a shape: the tokens are exactly what it printed,
+// the run of two spaces included.
+@test("is the tokens pkg-config printed, split the way a shell would split them")
+pkc_the_tokens_printed()
+    val tool = pkc_tool()
+    val got = pkc_config_query_text("pkcfake")
+    val printed = capture("pkg-config", ["--cflags", "pkcfake"]).unwrap().text
+
+    pkc_drop_tool(tool)
+    assert_eq(printed, "-DPKC_FAKE=1  -I/nonexistent/pkc/include\n")
+    assert_eq(got, "cflags: -DPKC_FAKE=1 | -I/nonexistent/pkc/include; ldflags: ")
+
+@test("is the same on a second asking, because it is memoized")
+pkc_the_same_twice()
+    val tool = pkc_tool()
+    val first = pkc_config_query_text("pkcfake")
+    val second = pkc_config_query_text("pkcfake")
+
+    pkc_drop_tool(tool)
+    assert_eq(first, second)
+
+@test("and a module nothing knows is a reason rather than an exception")
+pkc_an_unknown_module_is_a_reason()
+    val tool = pkc_tool()
+    val got = pkg_config_query("kayro-no-such-module")
+
+    pkc_drop_tool(tool)
+
+    got match
+        Err(why) -> assert_eq(why, "'pkg-config' knows no 'kayro-no-such-module'")
+        Ok(_) -> panic("pkg-config answered for a module that does not exist")
+
+// This compiler asks the tool again rather than keeping its first answer; what the case pins is that
+// the two answers are one answer.
+private pkc_config_query_text(pc: string) -> string = pkg_config_query(pc) match
+    Ok(a) -> s"cflags: ${join(a.cflags.view(), " | ")}; ldflags: ${join(a.ldflags.view(), " | ")}"
+    Err(why) -> s"refused: $why"
+
+// -- the probed flags reach the tools --------------------------------------------------------------
+
+// **End to end with no flags on the command line**: a `c const` is measured out of a header only
+// `--cflags` can find, and the program calls a function only `--libs` can resolve. The library is
+// one this test builds, where the reference's is cairo.
+@test("so a c const is measured and the library links, with nothing on the command line")
+pkc_the_probed_flags_reach_the_tools()
+    if !pkc_ready() then return
+
+    val lib = pkc_tree("sysl-pkc-lib", ["pkcfake.h", "#define PKC_VERSION 4242\nint pkc_version(void);\n",
+                                        "pkcfake.c", "#include \"pkcfake.h\"\n" +
+                                                     "int pkc_version(void) { return PKC_VERSION; }\n"])
+
+    assert(capture("clang", ["-c", s"$lib/pkcfake.c", "-o", s"$lib/pkcfake.o"]).unwrap().status.ok(),
+           "the library did not compile")
+    assert(capture("ar", ["rcs", s"$lib/libpkcfake.a", s"$lib/pkcfake.o"]).unwrap().status.ok(),
+           "the library did not archive")
+
+    val tool = pkc_fake_tool(s"-I$lib", s"-L$lib -lpkcfake")
+    val root = pkc_project("pkcfake = \"pkcfake — a library this test builds\"", "os = true, heap = true",
+        "@link(\"pkcfake\")\n@include(\"pkcfake.h\")\n\nc const\n    VERSION: int = \"PKC_VERSION\"\n\n" +
+        "extern pkc_version() -> int\n\nprint(VERSION == pkc_version())\n")
+    val said = pkc_ran(root)
+
+    pkc_drop_tool(tool)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+    assert_eq(said, "true\n")
