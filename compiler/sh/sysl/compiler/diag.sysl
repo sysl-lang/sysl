@@ -104,11 +104,9 @@ end earlier
 // them. The reference separates one diagnostic from the next by exactly one blank line and ends the
 // last one at its caret; the newline is dropped here rather than in the renderer, which is the
 // parsing package's and is right to end a diagnostic it hands out on its own.
-private ended(where: Placed) -> string
-    val text = where.render()
+private ended(where: Placed) -> string = ended_text(where.render())
 
-    if text.ends_with("\n") then text[0..<text.bytes.len - 1] else text
-end ended
+private ended_text(text: string) -> string = if text.ends_with("\n") then text[0..<text.bytes.len - 1] else text
 
 // A compilation's diagnostics, assembled: at most the limit of them, separated by a blank line, with
 // a closing count where there were more. The ones kept are the **first** -- the list arrives in
@@ -138,7 +136,9 @@ end analysis_report
 // statement at a time, never says twice. Each **points at a position rather than an extent**: the
 // caret covers the token that begins there, which is what the reference underlines, and is one
 // column wide where no written token does -- at a line's layout, the end of the file, or inside a
-// token the lexer itself refused.
+// token the lexer itself refused. **The column is shifted by the `Parsed`'s own `col_shift`**, not
+// asked of the file's name: a literate file's tangle refusal (an unclosed fence, a tab in the
+// indent) is placed in the DOCUMENT, which nothing removed four columns from.
 parse_report(p: Parsed) -> string
     var b = str_builder()
     var last_line: usize = 0
@@ -152,8 +152,9 @@ parse_report(p: Parsed) -> string
         if i > 0 then b.push("\n\n")
 
         last_line = line
-        b.push(ended(Placed(p.src, error(token_at(p.src, d.span.start, d.message == "dedent expected"),
-            d.message))))
+        val at = token_at(p.src, d.span.start, d.message == "dedent expected")
+
+        b.push(ended_text(error(at, d.message).render(p.src, p.col_shift)))
 
     b.finish()
 end parse_report

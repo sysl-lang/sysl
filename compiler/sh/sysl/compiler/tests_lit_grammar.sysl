@@ -1,0 +1,368 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_text
+import sysl.text.{join, Search, StrBuilder, str_builder}
+
+// The syntax-highlighting grammar, `docs/grammars/sysl.tmLanguage.json`, checked against the lexer it
+// is supposed to describe. It is a second, hand-written statement of which words are keywords, and
+// nothing else makes the two agree: a word added to the lexer's reserved list and not to the grammar is
+// a keyword every renderer sets as an ordinary identifier, which looks like a line with little to
+// highlight rather than like a fault.
+//
+// The reference (0.0.162) `GrammarTests`' word-list half. **Its other half -- how the grammar STYLES a
+// name through an Oniguruma/TextMate engine -- is not ported**: sysl carries no such engine, and that
+// half's map rows say so. Both directions are checked against the grammar's `keyword` section only;
+// the predeclared scalars have a section of their own and are deliberately not reserved words.
+
+private lit_grammar_file() -> string = "../docs/grammars/sysl.tmLanguage.json"
+
+// The grammar's text, or None where the tests are not being run from `compiler/`.
+private lit_grammar() -> Option[string]
+    read_text(lit_grammar_file()) match
+        Ok(text) -> Some(text)
+        Err(_) ->
+            print(s"skipped: no grammar at '${lit_grammar_file()}' (run from 'compiler/')")
+            None
+end lit_grammar
+
+// A JSON reader that keeps every string leaf with the path that reached it -- `scopeName`,
+// `repository.keyword.patterns.0.match` -- which is all these claims ask of the document.
+private struct LitJson
+    text: string
+    at: usize
+    leaves: Buf[(string, string)]
+
+private lit_json(text: string) -> Result[Buf[(string, string)], string]
+    var leaves: Buf[(string, string)] = buf()
+    var r = LitJson(text, 0, leaves)
+
+    if !lit_value(&r, "") then return Err(s"not JSON at byte ${r.at}")
+
+    lit_blank(&r)
+
+    if r.at != text.bytes.len then return Err(s"text after the document at byte ${r.at}")
+
+    Ok(r.leaves)
+end lit_json
+
+private lit_peek(r: *LitJson) -> u8 = if r.at < r.text.bytes.len then r.text.bytes[r.at] else 0
+
+private lit_blank(r: *LitJson)
+    loop
+        val c = lit_peek(r)
+
+        if c != u8(' ') && c != u8('\n') && c != u8('\r') && c != u8('\t') then return
+
+        r.at += 1
+end lit_blank
+
+private lit_eat(r: *LitJson, c: u8) -> bool
+    lit_blank(r)
+
+    if lit_peek(r) != c then return false
+
+    r.at += 1
+    true
+end lit_eat
+
+private lit_under(path: string, step: string) -> string = if path == "" then step else s"$path.$step"
+
+private lit_value(r: *LitJson, path: string) -> bool
+    lit_blank(r)
+
+    val c = lit_peek(r)
+
+    if c == u8('{') then return lit_object(r, path)
+    if c == u8('[') then return lit_array(r, path)
+
+    if c == u8('"')
+        lit_string(r) match
+            None -> return false
+            Some(s) ->
+                r.leaves.push((path, s))
+                return true
+
+    if lit_word(r, "true") || lit_word(r, "false") || lit_word(r, "null") then return true
+
+    lit_number(r)
+end lit_value
+
+private lit_object(r: *LitJson, path: string) -> bool
+    r.at += 1
+
+    if lit_eat(r, u8('}')) then return true
+
+    loop
+        lit_blank(r)
+
+        val key = lit_string(r)
+
+        if key.is_none() || !lit_eat(r, u8(':')) then return false
+        if !lit_value(r, lit_under(path, key.unwrap())) then return false
+        if lit_eat(r, u8('}')) then return true
+        if !lit_eat(r, u8(',')) then return false
+end lit_object
+
+private lit_array(r: *LitJson, path: string) -> bool
+    r.at += 1
+
+    if lit_eat(r, u8(']')) then return true
+
+    var i: usize = 0
+
+    loop
+        if !lit_value(r, lit_under(path, s"$i")) then return false
+        if lit_eat(r, u8(']')) then return true
+        if !lit_eat(r, u8(',')) then return false
+
+        i += 1
+end lit_array
+
+// A string, its escapes decoded. A `\u` escape is checked for its four digits and kept as written,
+// none of the claims here being about a character spelled that way.
+private lit_string(r: *LitJson) -> Option[string]
+    if lit_peek(r) != u8('"') then return None
+
+    r.at += 1
+
+    var out = str_builder()
+    var run = r.at
+
+    loop
+        val c = lit_peek(r)
+
+        if r.at >= r.text.bytes.len || c < 32 then return None
+
+        if c == u8('"')
+            out.push(r.text[run..<r.at])
+            r.at += 1
+            return Some(out.finish())
+
+        if c == u8('\\')
+            out.push(r.text[run..<r.at])
+            r.at += 1
+
+            if !lit_escape(r, &out) then return None
+
+            run = r.at
+            continue
+
+        r.at += 1
+end lit_string
+
+// The escape after a backslash, `r` at its letter: decoded onto `out` and stepped over, or false
+// where JSON has no such escape.
+private lit_escape(r: *LitJson, out: *StrBuilder) -> bool
+    val e = lit_peek(r)
+
+    if e == u8('u')
+        var k: usize = 1
+
+        while k <= 4
+            if !lit_hex(lit_peek_at(r, r.at + k)) then return false
+
+            k += 1
+
+        out.push(r.text[r.at - 1..<r.at + 5])
+        r.at += 5
+        return true
+
+    if e == u8('n') then out.push("\n")
+    if e == u8('t') then out.push("\t")
+    if e == u8('r') then out.push("\r")
+    if e == u8('b') || e == u8('f') then out.push(" ")
+    if e == u8('"') || e == u8('\\') || e == u8('/') then out.push(r.text[r.at..<r.at + 1])
+
+    val known = e == u8('n') || e == u8('t') || e == u8('r') || e == u8('b') || e == u8('f') ||
+        e == u8('"') || e == u8('\\') || e == u8('/')
+
+    r.at += 1
+    known
+end lit_escape
+
+private lit_peek_at(r: *LitJson, i: usize) -> u8 = if i < r.text.bytes.len then r.text.bytes[i] else 0
+
+private lit_hex(c: u8) -> bool =
+    (c >= u8('0') && c <= u8('9')) || (c >= u8('a') && c <= u8('f')) || (c >= u8('A') && c <= u8('F'))
+
+private lit_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
+
+private lit_word(r: *LitJson, w: string) -> bool
+    if r.at + w.bytes.len > r.text.bytes.len then return false
+    if r.text[r.at..<r.at + w.bytes.len] != w then return false
+
+    r.at += w.bytes.len
+    true
+end lit_word
+
+private lit_digits(r: *LitJson) -> bool
+    val from = r.at
+
+    while lit_digit(lit_peek(r))
+        r.at += 1
+
+    r.at > from
+end lit_digits
+
+private lit_number(r: *LitJson) -> bool
+    if lit_peek(r) == u8('-') then r.at += 1
+    if !lit_digits(r) then return false
+
+    if lit_peek(r) == u8('.')
+        r.at += 1
+
+        if !lit_digits(r) then return false
+
+    if lit_peek(r) == u8('e') || lit_peek(r) == u8('E')
+        r.at += 1
+
+        if lit_peek(r) == u8('+') || lit_peek(r) == u8('-') then r.at += 1
+        if !lit_digits(r) then return false
+
+    true
+end lit_number
+
+// Every word one section of the grammar styles with: the `match`, `begin` and `end` regexes, their
+// escapes blanked out -- `\b` is a boundary, not the letter `b` -- and the runs of two or more of
+// `[a-z_]` that are left. `comment` and `name` fields are left out, because a comment beside a
+// keyword group nearly always names the very words in it, which is how this kind of test passes by
+// accident.
+private lit_styled_in(leaves: Buf[(string, string)], section: string) -> Buf[string]
+    var words: Buf[string] = buf()
+    val under = s"repository.$section."
+
+    for i in 0..<leaves.len()
+        val leaf = leaves.at(i)
+        val field = leaf.0.ends_with(".match") || leaf.0.ends_with(".begin") || leaf.0.ends_with(".end")
+
+        if leaf.0.starts_with(under) && field then lit_words_of(leaf.1, &words)
+
+    words
+end lit_styled_in
+
+private lit_words_of(regex: string, words: *Buf[string])
+    val b = regex.bytes
+    var i: usize = 0
+    var from: usize = 0
+
+    while i <= b.len
+        val c: u8 = if i < b.len then b[i] else 0
+
+        if c == u8('\\')
+            lit_keep(regex, from, i, words)
+            i += 2
+            from = i
+            continue
+
+        if (c >= u8('a') && c <= u8('z')) || c == u8('_')
+            i += 1
+            continue
+
+        lit_keep(regex, from, i, words)
+        i += 1
+        from = i
+end lit_words_of
+
+private lit_keep(regex: string, from: usize, to: usize, words: *Buf[string])
+    if to < from + 2 then return
+
+    val w = regex[from..<to]
+
+    for i in 0..<words.len()
+        if words.at(i) == w then return
+
+    words.push(w)
+end lit_keep
+
+private lit_holds(words: []const string, w: string) -> bool
+    for i in 0..<words.len
+        if words[i] == w then return true
+
+    false
+end lit_holds
+
+// Words the grammar styles as keywords without the lexer reserving them: special only where the
+// grammar expects one, an ordinary identifier everywhere else. Adding to this list is a decision about
+// the language, not a way to fix a red test.
+private val lit_soft: []const string =
+    ["is", "not", "invariant", "new", "within", "where", "with", "opaque", "derives", "become"]
+
+// The reference asks this of the constant `weave` embeds. `sysl weave` is not built here, so nothing
+// is compiled in, and the grammar this repository carries is the one asked.
+@test("is the one the compiler carries")
+lit_is_the_one_the_compiler_carries()
+    val text = lit_grammar()
+
+    if text.is_none() then return
+
+    assert(text.unwrap().contains("source.sysl"), "the grammar names no 'source.sysl' scope")
+    assert(text.unwrap().contains("\"keyword\": {"), "the grammar has no 'keyword' section")
+end lit_is_the_one_the_compiler_carries
+
+// `true`, `false` and `null` are styled as constants rather than as keywords -- they are values -- so
+// a reserved word is satisfied by either section.
+@test("styles every word the lexer reserves")
+lit_styles_every_word_the_lexer_reserves()
+    val text = lit_grammar()
+
+    if text.is_none() then return
+
+    val leaves = lit_json(text.unwrap()).unwrap()
+    val keyword = lit_styled_in(leaves, "keyword")
+    val constant = lit_styled_in(leaves, "constant")
+    val reserved = reserved_words()
+    var missing: Buf[string] = buf()
+
+    for i in 0..<reserved.len
+        val w = reserved[i]
+
+        if !lit_holds(keyword.view(), w) && !lit_holds(constant.view(), w) then missing.push(w)
+
+    assert(missing.is_empty(), "reserved by the lexer but unstyled by the grammar: " + join(missing.view(), ", "))
+end lit_styles_every_word_the_lexer_reserves
+
+// The disagreement half: without it a keyword section listing every lowercase word imaginable would
+// pass the case above and prove nothing.
+@test("and styles nothing else, beyond the soft keywords")
+lit_and_styles_nothing_else_beyond_the_soft_keywords()
+    val text = lit_grammar()
+
+    if text.is_none() then return
+
+    val keyword = lit_styled_in(lit_json(text.unwrap()).unwrap(), "keyword")
+    var unknown: Buf[string] = buf()
+
+    for i in 0..<keyword.len()
+        val w = keyword.at(i)
+
+        if !is_reserved(w) && !lit_holds(lit_soft, w) then unknown.push(w)
+
+    assert(unknown.is_empty(), "styled as a keyword but neither reserved nor soft: " + join(unknown.view(), ", "))
+    assert(lit_holds(keyword.view(), "become"), "the soft keywords are read at all")
+end lit_and_styles_nothing_else_beyond_the_soft_keywords
+
+// That the file is JSON at all, which no agreement with the lexer implies. The reference goes on to
+// highlight `val x = 1` through the grammar, which is the engine half that is not ported; what is kept
+// is the parse, and that the reader would have said so of a document that is not one.
+@test("and parses as one")
+lit_and_parses_as_one()
+    val text = lit_grammar()
+
+    if text.is_none() then return
+
+    val t = text.unwrap()
+    val leaves = lit_json(t)
+
+    assert(leaves.is_ok(), leaves.err().unwrap_or(""))
+    assert(lit_json(t[0..<t.bytes.len - 3]).is_err(), "a truncated grammar parses")
+    assert(lit_json("{\"a\": [1, 2,]}").is_err(), "a trailing comma parses")
+
+    var scope = ""
+
+    for i in 0..<leaves.unwrap().len()
+        if leaves.unwrap().at(i).0 == "scopeName" then scope = leaves.unwrap().at(i).1
+
+    assert_eq(scope, "source.sysl")
+end lit_and_parses_as_one
