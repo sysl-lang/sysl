@@ -1,0 +1,184 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.Search
+
+// `anchor.sysl`: each node kind whose anchor is not its extent, printed by `emit-ast` and compared with
+// the line 0.0.162's `emit-ast` prints for the same input -- the expected text below IS the
+// reference's output, line for line.
+
+// The first line of the tree `text` parses to that holds `needle`, with its indentation taken off.
+private anc_line(text: string, needle: string) -> string
+    val all = lines_of(emit_ast(parse(source_of("k.sysl", text)).program, true))
+
+    for i in 0..<all.len()
+        if all.at(i).contains(needle) then return all.at(i).trim()
+
+    ""
+end anc_line
+
+// The `n`th line holding `needle`, counted from zero.
+private anc_nth(text: string, needle: string, n: usize) -> string
+    val all = lines_of(emit_ast(parse(source_of("k.sysl", text)).program, true))
+    var seen: usize = 0
+
+    for i in 0..<all.len()
+        if all.at(i).contains(needle)
+            if seen == n then return all.at(i).trim()
+
+            seen += 1
+
+    ""
+end anc_nth
+
+@test("anchor: a call is anchored at its callee's anchor, a field selection's name")
+anc_a_call_at_its_callee()
+    assert_eq(anc_line("a.b.c(x)\n", "expr: Call"), "expr: Call 1:5-1:6")
+
+@test("anchor: a subscript is anchored at its '['")
+anc_an_index_at_its_bracket()
+    assert_eq(anc_line("xs[i]\n", "expr: Index"), "expr: Index 1:3-1:4")
+
+@test("anchor: a written type-argument list is anchored at its '['")
+anc_type_args_at_the_bracket()
+    assert_eq(anc_line("f[A, B]\n", "expr: TypeArgs"), "expr: TypeArgs 1:2-1:3")
+
+@test("anchor: a type attribute is anchored at its '::'")
+anc_a_type_attr_at_the_colons()
+    assert_eq(anc_line("T::Max\n", "expr: TypeAttr"), "expr: TypeAttr 1:2-1:4")
+
+@test("anchor: a field selection is anchored at the member's name")
+anc_a_field_at_its_name()
+    assert_eq(anc_line("p.name\n", "expr: Field"), "expr: Field 1:3-1:7")
+
+@test("anchor: a '?' is anchored at the question mark")
+anc_a_try_at_the_mark()
+    assert_eq(anc_line("f()?\n", "expr: TryExpr"), "expr: TryExpr 1:4-1:5")
+
+@test("anchor: a postfix '++' is anchored at the operator, and its statement where it is")
+anc_a_post_increment_at_the_operator()
+    assert_eq(anc_line("i++\n", "ExprStmt"), "- ExprStmt 1:2-1:4")
+    assert_eq(anc_line("i++\n", "expr: PostIncDec"), "expr: PostIncDec 1:2-1:4")
+
+@test("anchor: a match is anchored at its scrutinee, and so is the statement it stands as")
+anc_a_match_at_its_scrutinee()
+    val text = "x match\n    1 -> 2\n    _ -> 3\n"
+
+    assert_eq(anc_line(text, "ExprStmt"), "- ExprStmt 1:1-1:2")
+    assert_eq(anc_line(text, "expr: MatchExpr"), "expr: MatchExpr 1:1-1:2")
+
+@test("anchor: a literal inside a pattern has no position, and an arm's value keeps its own")
+anc_a_pattern_literal_is_unplaced()
+    val text = "x match\n    1 -> 2\n    _ -> 3\n"
+
+    assert_eq(anc_line(text, "value: IntLit"), "value: IntLit")
+    assert_eq(anc_line(text, "expr: IntLit"), "expr: IntLit 2:10-2:11")
+
+@test("anchor: a 'with' is anchored at the word")
+anc_a_with_at_the_word()
+    assert_eq(anc_line("base with { a = 1 }\n", "expr: WithExpr"), "expr: WithExpr 1:6-1:10")
+
+@test("anchor: an 'if' an 'elif' became is anchored at the keyword; the first 'if' covers it all")
+anc_an_elif_at_its_keyword()
+    val text = "if a then 1\nelif b then 2\nelse 3\n"
+
+    assert_eq(anc_nth(text, "expr: IfExpr", 0), "expr: IfExpr 1:1-3:7")
+    assert_eq(anc_nth(text, "expr: IfExpr", 1), "expr: IfExpr 2:1-2:5")
+    assert_eq(anc_nth(text, "ExprStmt", 2), "- ExprStmt 2:1-2:5")
+
+@test("anchor: the left operand of a same-level sum has no position, a parenthesised one does")
+anc_a_folded_sum_is_unplaced()
+    assert_eq(anc_line("a + b + c\n", "left: Binary"), "left: Binary")
+    assert_eq(anc_line("(a + b) + c\n", "left: Binary"), "left: Binary 1:2-1:7")
+    assert_eq(anc_line("a * b + c\n", "left: Binary"), "left: Binary 1:1-1:6")
+
+@test("anchor: an interpolated string's desugared sum is positioned at the whole literal")
+anc_an_interpolation_keeps_its_positions()
+    assert_eq(anc_line("print(s\"a${x}b\")\n", "- Binary"), "- Binary 1:7-1:16")
+    assert_eq(anc_line("print(s\"a${x}b\")\n", "left: Binary"), "left: Binary 1:7-1:16")
+
+@test("anchor: a member is anchored past its 'private'")
+anc_a_member_past_its_visibility()
+    assert_eq(anc_line("struct S\n    private f(self) -> int = 1\n", "MethodDecl"), "- MethodDecl 2:13-2:31")
+
+@test("anchor: a result list is its first value's, and a bare result tuple has no position")
+anc_a_result_list_and_a_bare_tuple()
+    val text = "f() -> int, int = 1, 2\n"
+
+    assert_eq(anc_line(text, "retType: TupleType"), "retType: TupleType")
+    assert_eq(anc_line(text, "expr: ResultList"), "expr: ResultList 1:19-1:20")
+
+@test("anchor: a result list written as a line is covered whole by its statement")
+anc_a_standing_result_list()
+    val text = "f() -> int, int\n    1, 2\n"
+
+    assert_eq(anc_line(text, "ExprStmt"), "- ExprStmt 2:5-2:9")
+    assert_eq(anc_line(text, "expr: ResultList"), "expr: ResultList 2:5-2:6")
+
+@test("anchor: the binding inside a 'static' has no position, the wrapper has")
+anc_a_static_inner_is_unplaced()
+    assert_eq(anc_line("static val limit: usize = 4\n", "StaticDecl"), "- StaticDecl 1:1-1:28")
+    assert_eq(anc_line("static val limit: usize = 4\n", "inner: ValDecl"), "inner: ValDecl")
+
+@test("anchor: a subtype's range, a rest parameter's array and a by-name arrow have no position")
+anc_built_types_are_unplaced()
+    assert_eq(anc_line("type Age = int within 0..150\n", "range: RangeBound"), "range: RangeBound")
+    assert_eq(anc_line("f(xs: ...int) = 1\n", "typ: ArrayType"), "typ: ArrayType")
+    assert_eq(anc_line("g(m: -> int) = 1\n", "typ: FnType"), "typ: FnType")
+
+@test("anchor: a value among a type's arguments has no position")
+anc_a_value_type_argument_is_unplaced()
+    assert_eq(anc_line("var a: Buf[8] = 1\n", "ValueArgType"), "- ValueArgType")
+    assert_eq(anc_line("impl Small[300] for S\n", "ValueArgType"), "- ValueArgType")
+
+@test("anchor: a setter's made parameter has no position, nor its type")
+anc_a_setter_parameter_is_unplaced()
+    val text = "struct T\n    c: int\n    f -> int = self.c\n    set f(v)\n        self.c = v\n"
+
+    assert_eq(anc_nth(text, "- Param", 0), "- Param 2:5-2:11")
+    assert_eq(anc_nth(text, "- Param", 1), "- Param")
+    assert_eq(anc_nth(text, "typ: NamedType", 1), "typ: NamedType")
+
+@test("anchor: a range pattern's ends have no position")
+anc_a_range_pattern_is_unplaced()
+    val text = "x match\n    1..10 -> 2\n    _ -> 3\n"
+
+    assert_eq(anc_line(text, "lo: IntLit"), "lo: IntLit")
+    assert_eq(anc_line(text, "hi: IntLit"), "hi: IntLit")
+
+@test("anchor: an associated type's base has no position")
+anc_an_assoc_base_is_unplaced()
+    assert_eq(anc_line("val y: T::Out = 1\n", "typ: AssocType"), "typ: AssocType 1:8-1:14")
+    assert_eq(anc_line("val y: T::Out = 1\n", "base: NamedType"), "base: NamedType")
+
+@test("anchor: a column is counted in UTF-16 units, so a character past the BMP counts two")
+anc_a_column_counts_utf16_units()
+    assert_eq(anc_line("print(\"\u{1F600}\", x)\n", "- Ident"), "- Ident 1:13-1:14")
+
+@test("anchor: the node keeps its extent; only the anchor is computed")
+anc_the_span_stays_the_extent()
+    val p = parse(source_of("k.sysl", "f(x)?\n")).program
+    val s = p.body.at(0)
+
+    *s.kind match
+        ExprStmt(e) ->
+            assert_eq(e.span.start, 0)
+            assert_eq(e.span.end, 5)
+            assert_eq(anchor_of(e).start, 4)
+            assert_eq(anchor_of(e).end, 5)
+            assert_eq(stmt_anchor(s).start, 4)
+        _ -> assert(false, "a '?' statement")
+
+@test("anchor: the extent printer prints every node's own span")
+anc_the_extent_printer()
+    val tree = emit_ast_extents(parse(source_of("k.sysl", "f(x)?\nx match\n    1 -> 2\n")).program)
+
+    assert(tree.contains("expr: TryExpr 1:1-1:6"), tree)
+    assert(tree.contains("expr: Call 1:1-1:5"), tree)
+    assert(tree.contains("value: IntLit 3:5-3:6"), tree)
+
+@test("anchor: what the anchors are kept in leaves an expression three words")
+anc_an_expression_stays_three_words()
+    assert_eq(sizeof(Expr), 24)
+    assert_eq(sizeof(Stmt), 24)

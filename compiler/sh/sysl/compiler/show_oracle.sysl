@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.slices.binary_search
-import sysl.text.{chars_of, str_builder, StrBuilder}
+import sysl.text.{str_builder, Search, StrBuilder}
 
 // The untyped parse tree, written out as deterministic, human-readable text -- `sysl emit-ast`'s
 // whole job, and the one thing this compiler and the reference compiler can be diffed on.
@@ -39,22 +39,39 @@ import sysl.text.{chars_of, str_builder, StrBuilder}
 //
 // **The source is held as two slices rather than as a `Source`**, because this is threaded through
 // every node of the walk and a struct holding a `Buf` is copied at each hop.
+//
+// **A span printed is the node's ANCHOR** (`anchor.sysl`), as the reference prints `pos`. Where the
+// reference has no position at all the parent says so, setting `unplaced` for the one child it is
+// about to print: the left operand of a same-level `Binary`, a literal in a pattern, an associated
+// type's base. With `anchored` false every node prints its own span, the extent, instead.
 struct AstFmt
     spans: bool
     bytes: []const u8
     starts: []const usize
+    unplaced: bool
+    anchored: bool
+    // Inside a type's argument list, where a value argument has no position.
+    in_type_args: bool
+    // Printing a setter's parameters, which the parser made rather than read.
+    made_params: bool
 end AstFmt
 
 // One file's parse, printed. `spans` is false for `sysl emit-ast --no-spans`: a tree with no
 // positions in it diffs cleanly across an edit that only moves lines around, which is what a parser
 // under construction spends most of its time doing.
-emit_ast(p: Program, spans: bool) -> string
+emit_ast(p: Program, spans: bool) -> string = emit_ast_as(p, spans, true)
+
+// The same tree with every node's EXTENT where `emit-ast` prints its anchor -- what a test asks about
+// the text a node covers, which the reference reads as `extent` and never prints.
+emit_ast_extents(p: Program) -> string = emit_ast_as(p, true, false)
+
+private emit_ast_as(p: Program, spans: bool, anchored: bool) -> string
     var out = str_builder()
-    var f = AstFmt(spans, p.src.bytes, p.src.starts.view())
+    var f = AstFmt(spans, p.src.bytes, p.src.starts.view(), false, anchored, false, false)
 
     emit_program(&out, &f, p, "")
     out.finish()
-end emit_ast
+end emit_ast_as
 
 // -- the pieces every node is written out of -------------------------------------------------
 
@@ -78,6 +95,44 @@ private head(out: *StrBuilder, f: *AstFmt, tag: string, at: Span, positioned: bo
     out.push_char('\n')
 end head
 
+// Whether the node about to be printed has a position, which its parent may have said it has not.
+// Asking clears the mark, so it reaches the one child it was set for.
+private take_placed(f: *AstFmt) -> bool
+    val placed = !f.unplaced || !f.anchored
+
+    f.unplaced = false
+    placed
+end take_placed
+
+// Where a node is printed at: its anchor, or its own span where extents were asked for.
+private printed_at(f: *AstFmt, own: Span, anchor: Span) -> Span = if f.anchored then anchor else own
+
+// The binding level a `Binary` operator is folded at, as the reference's grammar groups them.
+private binary_level(op: string) -> int
+    if op == "||" then return 1
+    if op == "&&" then return 2
+    if op == "|" then return 3
+    if op == "^" then return 4
+    if op == "&" then return 5
+    if op == "+" || op == "-" then return 6
+
+    7
+end binary_level
+
+// Whether `left`, the left operand of a `Binary` over `op` spanning `whole`, was folded into it
+// without a position: a `Binary` of the same level that starts where the whole does. The `+` chain
+// an interpolated string desugars to is positioned at the whole literal, every link of it -- and
+// every link carries the literal's span, its left operand included, which no written sum does.
+private folded_left(op: string, left: Expr, whole: Span) -> bool = *left.kind match
+    Binary(inner, first, _) ->
+        val desugared = first.span.start == left.span.start && first.span.end == left.span.end
+
+        binary_level(inner) == binary_level(op) && left.span.start == whole.start && !desugared
+    _ -> false
+
+// Whether the text at `s` begins with the byte `b`.
+private opens_with(f: *AstFmt, s: Span, b: u8) -> bool = s.start < f.bytes.len && f.bytes[s.start] == b
+
 // A node with no position of its own, which is every pattern and the file itself.
 private head_bare(out: *StrBuilder, tag: string)
     out.push(tag)
@@ -97,8 +152,23 @@ private loc_of(f: *AstFmt, offset: usize) -> (usize, usize)
     val line = if found then i else i - 1
     val start = f.starts[line]
 
-    (line + 1, chars_of(f.bytes[start..<at]).count() + 1)
+    (line + 1, utf16_units(f.bytes[start..<at]) + 1)
 end loc_of
+
+// How many UTF-16 code units a run of UTF-8 encodes, which is what the reference counts a column in:
+// one per character, and two for a character beyond the Basic Multilingual Plane (`😀`), whose
+// UTF-8 form is the one that starts with a byte of `0xF0` or above.
+private utf16_units(bytes: []const u8) -> usize
+    var n: usize = 0
+
+    for i in 0..<bytes.len
+        val b = bytes[i]
+
+        if (b & 0xC0) != 0x80 then n += 1
+        if b >= 0xF0 then n += 1
+
+    n
+end utf16_units
 
 // A double-quoted string with control characters, quotes and backslashes escaped, so that no
 // field's value can introduce a raw newline into what is otherwise one node per line.
@@ -397,10 +467,15 @@ end emit_bound
 private emit_param(out: *StrBuilder, f: *AstFmt, p: Param, ind: string)
     val kid = ind + "  "
 
-    head(out, f, "Param", p.span, true)
+    val made = f.made_params && f.anchored
+
+    head(out, f, "Param", p.span, !made)
     fld(out, kid, "name")
     text_val(out, p.name)
     fld(out, kid, "typ")
+
+    // A by-name parameter's `-> T` is a function type built with no position.
+    f.unplaced = made || (p.by_name && f.anchored)
     emit_type(out, f, p.typ, kid)
     fld(out, kid, "vis")
     emit_vis(out, p.vis, kid)
@@ -534,7 +609,8 @@ end emit_enum_variant
 private emit_range_bound(out: *StrBuilder, f: *AstFmt, r: RangeBound, ind: string)
     val kid = ind + "  "
 
-    head(out, f, "RangeBound", r.span, true)
+    // A subtype's `within` range is built with no position.
+    head(out, f, "RangeBound", r.span, !f.anchored)
     fld(out, kid, "lo")
     emit_expr(out, f, r.lo, kid)
     fld(out, kid, "hi")
@@ -614,16 +690,23 @@ private emit_recv_mode(out: *StrBuilder, m: RecvMode, ind: string)
 
 private emit_type(out: *StrBuilder, f: *AstFmt, t: TypeRef, ind: string)
     val kid = ind + "  "
+    val placed = take_placed(f)
 
     *t.kind match
         NamedType(name, args) ->
-            head(out, f, "NamedType", t.span, true)
+            head(out, f, "NamedType", t.span, placed)
             fld(out, kid, "name")
             text_val(out, name)
             fld(out, kid, "args")
+
+            val outer = f.in_type_args
+
+            f.in_type_args = true
             list_val(out, f, args, kid, emit_type)
+            f.in_type_args = outer
         ValueArgType(value) ->
-            head(out, f, "ValueArgType", t.span, true)
+            // A value written among a type's arguments has no position; a default's keeps one.
+            head(out, f, "ValueArgType", t.span, placed && (!f.anchored || !f.in_type_args))
             fld(out, kid, "value")
             emit_expr(out, f, value, kid)
         PtrType(inner) ->
@@ -641,7 +724,9 @@ private emit_type(out: *StrBuilder, f: *AstFmt, t: TypeRef, ind: string)
             fld(out, kid, "inner")
             emit_type(out, f, inner, kid)
         ArrayType(length, elem, read_only) ->
-            head(out, f, "ArrayType", t.span, true)
+            // A rest parameter's `...T` is an array type nobody wrote brackets for, built with no
+            // position.
+            head(out, f, "ArrayType", t.span, placed && (!f.anchored || opens_with(f, t.span, u8('['))))
             fld(out, kid, "length")
             opt_node_val(out, f, length, kid, emit_expr)
             fld(out, kid, "elem")
@@ -659,7 +744,8 @@ private emit_type(out: *StrBuilder, f: *AstFmt, t: TypeRef, ind: string)
             fld(out, kid, "inner")
             emit_type(out, f, inner, kid)
         TupleType(parts, results) ->
-            head(out, f, "TupleType", t.span, true)
+            // A result list written without parentheses (`-> T, T`) is folded with no position.
+            head(out, f, "TupleType", t.span, placed && (!f.anchored || opens_with(f, t.span, u8('('))))
             fld(out, kid, "parts")
             list_val(out, f, parts, kid, emit_type)
             fld(out, kid, "results")
@@ -669,7 +755,7 @@ private emit_type(out: *StrBuilder, f: *AstFmt, t: TypeRef, ind: string)
             fld(out, kid, "name")
             text_val(out, name)
         FnType(params, ret, bare) ->
-            head(out, f, "FnType", t.span, true)
+            head(out, f, "FnType", t.span, placed)
             fld(out, kid, "params")
             list_val(out, f, params, kid, emit_type)
             fld(out, kid, "ret")
@@ -683,8 +769,9 @@ private emit_type(out: *StrBuilder, f: *AstFmt, t: TypeRef, ind: string)
             fld(out, kid, "ret")
             emit_type(out, f, ret, kid)
         AssocType(base, member) ->
-            head(out, f, "AssocType", t.span, true)
+            head(out, f, "AssocType", t.span, placed)
             fld(out, kid, "base")
+            f.unplaced = true
             emit_type(out, f, base, kid)
             fld(out, kid, "member")
             text_val(out, member)
@@ -711,12 +798,15 @@ private emit_pattern(out: *StrBuilder, f: *AstFmt, p: Pattern, ind: string)
         LitPattern(value) ->
             head_bare(out, "LitPattern")
             fld(out, kid, "value")
+            f.unplaced = true
             emit_expr(out, f, value, kid)
         RangePattern(lo, hi, inclusive) ->
             head_bare(out, "RangePattern")
             fld(out, kid, "lo")
+            f.unplaced = true
             emit_expr(out, f, lo, kid)
             fld(out, kid, "hi")
+            f.unplaced = true
             emit_expr(out, f, hi, kid)
             fld(out, kid, "inclusive")
             bool_val(out, inclusive)
@@ -779,77 +869,84 @@ end emit_field_patterns
 
 private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
     val kid = ind + "  "
+    val placed = take_placed(f)
+    val anchor = printed_at(f, e.span, anchor_of(e))
 
     *e.kind match
         IntLit(digits, base, suffix) ->
-            head(out, f, "IntLit", e.span, true)
+            head(out, f, "IntLit", anchor, placed)
             fld(out, kid, "value")
             out.push(decimal_of(digits, base))
             out.push_char('\n')
             fld(out, kid, "suffix")
             opt_text_val(out, if suffix == "" then None else Some(suffix))
         FloatLit(text, suffix) ->
-            head(out, f, "FloatLit", e.span, true)
+            head(out, f, "FloatLit", anchor, placed)
             fld(out, kid, "text")
             text_val(out, text)
             fld(out, kid, "suffix")
             opt_text_val(out, if suffix == "" then None else Some(suffix))
         CharLit(codepoint) ->
-            head(out, f, "CharLit", e.span, true)
+            head(out, f, "CharLit", anchor, placed)
             fld(out, kid, "codepoint")
             emit_codepoint(out, codepoint)
         StrLit(value) ->
-            head(out, f, "StrLit", e.span, true)
+            head(out, f, "StrLit", anchor, placed)
             fld(out, kid, "value")
             text_val(out, value)
         CStrLit(value) ->
-            head(out, f, "CStrLit", e.span, true)
+            head(out, f, "CStrLit", anchor, placed)
             fld(out, kid, "value")
             text_val(out, value)
         BoolLit(value) ->
-            head(out, f, "BoolLit", e.span, true)
+            head(out, f, "BoolLit", anchor, placed)
             fld(out, kid, "value")
             bool_val(out, value)
-        UnitLit -> head(out, f, "UnitLit", e.span, true)
-        NullLit -> head(out, f, "NullLit", e.span, true)
+        UnitLit -> head(out, f, "UnitLit", anchor, placed)
+        NullLit -> head(out, f, "NullLit", anchor, placed)
         Ident(name) ->
-            head(out, f, "Ident", e.span, true)
+            head(out, f, "Ident", anchor, placed)
             fld(out, kid, "name")
             text_val(out, name)
         Unary(op, operand) ->
-            head(out, f, "Unary", e.span, true)
+            head(out, f, "Unary", anchor, placed)
             fld(out, kid, "op")
             text_val(out, op)
             fld(out, kid, "operand")
             emit_expr(out, f, operand, kid)
         PreIncDec(op, operand) ->
-            head(out, f, "PreIncDec", e.span, true)
+            head(out, f, "PreIncDec", anchor, placed)
             fld(out, kid, "op")
             text_val(out, op)
             fld(out, kid, "operand")
             emit_expr(out, f, operand, kid)
         PostIncDec(op, operand) ->
-            head(out, f, "PostIncDec", e.span, true)
+            head(out, f, "PostIncDec", anchor, placed)
             fld(out, kid, "op")
             text_val(out, op)
             fld(out, kid, "operand")
             emit_expr(out, f, operand, kid)
         Binary(op, left, right) ->
-            head(out, f, "Binary", e.span, true)
+            head(out, f, "Binary", anchor, placed)
             fld(out, kid, "op")
             text_val(out, op)
             fld(out, kid, "left")
+
+            // The reference folds a run of one level's operators without positioning the folds, so
+            // `a + b` inside `a + b + c` has no span. A parenthesised one begins at its `(`, before
+            // where its own span does, so `(a + b) + c` keeps it.
+            f.unplaced = folded_left(op, left, e.span)
             emit_expr(out, f, left, kid)
             fld(out, kid, "right")
             emit_expr(out, f, right, kid)
         Compare(operands, ops) ->
-            head(out, f, "Compare", e.span, true)
+            head(out, f, "Compare", anchor, placed)
             fld(out, kid, "operands")
             list_val(out, f, operands, kid, emit_expr)
             fld(out, kid, "ops")
             texts_val(out, ops)
         RangeExpr(lo, hi, inclusive) ->
-            head(out, f, "RangeExpr", e.span, true)
+            head(out, f, "RangeExpr", anchor, placed)
             fld(out, kid, "lo")
             opt_node_val(out, f, lo, kid, emit_expr)
             fld(out, kid, "hi")
@@ -857,7 +954,7 @@ private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
             fld(out, kid, "inclusive")
             bool_val(out, inclusive)
         Assign(op, target, value) ->
-            head(out, f, "Assign", e.span, true)
+            head(out, f, "Assign", anchor, placed)
             fld(out, kid, "op")
             text_val(out, op)
             fld(out, kid, "target")
@@ -865,89 +962,89 @@ private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
             fld(out, kid, "value")
             emit_expr(out, f, value, kid)
         Call(callee, args) ->
-            head(out, f, "Call", e.span, true)
+            head(out, f, "Call", anchor, placed)
             fld(out, kid, "callee")
             emit_expr(out, f, callee, kid)
             fld(out, kid, "args")
             list_val(out, f, args, kid, emit_expr)
         NamedArg(name, value) ->
-            head(out, f, "NamedArg", e.span, true)
+            head(out, f, "NamedArg", anchor, placed)
             fld(out, kid, "name")
             text_val(out, name)
             fld(out, kid, "value")
             emit_expr(out, f, value, kid)
         Spread(value) ->
-            head(out, f, "Spread", e.span, true)
+            head(out, f, "Spread", anchor, placed)
             fld(out, kid, "value")
             emit_expr(out, f, value, kid)
         DefaultArg(owner, value) ->
-            head(out, f, "DefaultArg", e.span, true)
+            head(out, f, "DefaultArg", anchor, placed)
             fld(out, kid, "owner")
             opt_text_val(out, owner)
             fld(out, kid, "value")
             emit_expr(out, f, value, kid)
         Index(receiver, index) ->
-            head(out, f, "Index", e.span, true)
+            head(out, f, "Index", anchor, placed)
             fld(out, kid, "receiver")
             emit_expr(out, f, receiver, kid)
             fld(out, kid, "index")
             emit_expr(out, f, index, kid)
         Field(receiver, name) ->
-            head(out, f, "Field", e.span, true)
+            head(out, f, "Field", anchor, placed)
             fld(out, kid, "receiver")
             emit_expr(out, f, receiver, kid)
             fld(out, kid, "name")
             text_val(out, name)
         TypeArgs(receiver, args) ->
-            head(out, f, "TypeArgs", e.span, true)
+            head(out, f, "TypeArgs", anchor, placed)
             fld(out, kid, "receiver")
             emit_expr(out, f, receiver, kid)
             fld(out, kid, "args")
             list_val(out, f, args, kid, emit_expr)
-        TypeAttr(receiver, attr) ->
-            head(out, f, "TypeAttr", e.span, true)
+        TypeAttr(receiver, attr, _) ->
+            head(out, f, "TypeAttr", anchor, placed)
             fld(out, kid, "receiver")
             emit_expr(out, f, receiver, kid)
             fld(out, kid, "attr")
             text_val(out, attr)
         WithExpr(base, fields, _) ->
-            head(out, f, "WithExpr", e.span, true)
+            head(out, f, "WithExpr", anchor, placed)
             fld(out, kid, "base")
             emit_expr(out, f, base, kid)
             fld(out, kid, "fields")
             list_val(out, f, fields, kid, emit_with_field)
         ImplicitMember(name) ->
-            head(out, f, "ImplicitMember", e.span, true)
+            head(out, f, "ImplicitMember", anchor, placed)
             fld(out, kid, "name")
             text_val(out, name)
         LayoutOf(op, typ) ->
-            head(out, f, "LayoutOf", e.span, true)
+            head(out, f, "LayoutOf", anchor, placed)
             fld(out, kid, "op")
             text_val(out, op)
             fld(out, kid, "typ")
             emit_type(out, f, typ, kid)
         OffsetOf(typ, field) ->
-            head(out, f, "OffsetOf", e.span, true)
+            head(out, f, "OffsetOf", anchor, placed)
             fld(out, kid, "typ")
             emit_type(out, f, typ, kid)
             fld(out, kid, "field")
             text_val(out, field)
         TryExpr(inner) ->
-            head(out, f, "TryExpr", e.span, true)
+            head(out, f, "TryExpr", anchor, placed)
             fld(out, kid, "expr")
             emit_expr(out, f, inner, kid)
         // The reference has no `await`, so this rendering is this compiler's own; no sweep compares
         // it, the reference refusing every program that writes one.
         AwaitExpr(inner) ->
-            head(out, f, "AwaitExpr", e.span, true)
+            head(out, f, "AwaitExpr", anchor, placed)
             fld(out, kid, "expr")
             emit_expr(out, f, inner, kid)
         Tuple(elements) ->
-            head(out, f, "Tuple", e.span, true)
+            head(out, f, "Tuple", anchor, placed)
             fld(out, kid, "elements")
             list_val(out, f, elements, kid, emit_expr)
         Lambda(params, body, implicit_params) ->
-            head(out, f, "Lambda", e.span, true)
+            head(out, f, "Lambda", anchor, placed)
             fld(out, kid, "params")
             list_val(out, f, params, kid, emit_lambda_param)
             fld(out, kid, "body")
@@ -955,25 +1052,25 @@ private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
             fld(out, kid, "implicitParams")
             bool_val(out, implicit_params)
         BlockArg(body) ->
-            head(out, f, "BlockArg", e.span, true)
+            head(out, f, "BlockArg", anchor, placed)
             fld(out, kid, "body")
             list_val(out, f, body, kid, emit_stmt)
         ArrayLit(elements) ->
-            head(out, f, "ArrayLit", e.span, true)
+            head(out, f, "ArrayLit", anchor, placed)
             fld(out, kid, "elements")
             list_val(out, f, elements, kid, emit_expr)
         ArrayFill(value, count) ->
-            head(out, f, "ArrayFill", e.span, true)
+            head(out, f, "ArrayFill", anchor, placed)
             fld(out, kid, "value")
             emit_expr(out, f, value, kid)
             fld(out, kid, "count")
             emit_expr(out, f, count, kid)
         Block(stmts) ->
-            head(out, f, "Block", e.span, true)
+            head(out, f, "Block", anchor, placed)
             fld(out, kid, "stmts")
             list_val(out, f, stmts, kid, emit_stmt)
-        IfExpr(cond, then_body, else_body) ->
-            head(out, f, "IfExpr", e.span, true)
+        IfExpr(cond, then_body, else_body, _) ->
+            head(out, f, "IfExpr", anchor, placed)
             fld(out, kid, "cond")
             emit_expr(out, f, cond, kid)
             fld(out, kid, "thenBody")
@@ -981,25 +1078,25 @@ private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
             fld(out, kid, "elseBody")
             opt_list_val(out, f, else_body, kid, emit_stmt)
         MatchExpr(scrutinee, arms) ->
-            head(out, f, "MatchExpr", e.span, true)
+            head(out, f, "MatchExpr", anchor, placed)
             fld(out, kid, "scrutinee")
             emit_expr(out, f, scrutinee, kid)
             fld(out, kid, "arms")
             list_val(out, f, arms, kid, emit_match_arm)
         IsPattern(subject, patterns, negated) ->
-            head(out, f, "IsPattern", e.span, true)
+            head(out, f, "IsPattern", anchor, placed)
             fld(out, kid, "subject")
             emit_expr(out, f, subject, kid)
             fld(out, kid, "patterns")
             list_val(out, f, patterns, kid, emit_pattern)
             fld(out, kid, "negated")
             bool_val(out, negated)
-        ResultList(values) ->
-            head(out, f, "ResultList", e.span, true)
+        ResultList(values, _) ->
+            head(out, f, "ResultList", anchor, placed)
             fld(out, kid, "values")
             list_val(out, f, values, kid, emit_expr)
         While(label, cond, body, else_body) ->
-            head(out, f, "While", e.span, true)
+            head(out, f, "While", anchor, placed)
             fld(out, kid, "label")
             opt_text_val(out, label)
             fld(out, kid, "cond")
@@ -1009,7 +1106,7 @@ private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
             fld(out, kid, "elseBody")
             opt_list_val(out, f, else_body, kid, emit_stmt)
         DoWhile(label, body, cond, else_body) ->
-            head(out, f, "DoWhile", e.span, true)
+            head(out, f, "DoWhile", anchor, placed)
             fld(out, kid, "label")
             opt_text_val(out, label)
             fld(out, kid, "body")
@@ -1019,13 +1116,13 @@ private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
             fld(out, kid, "elseBody")
             opt_list_val(out, f, else_body, kid, emit_stmt)
         Loop(label, body) ->
-            head(out, f, "Loop", e.span, true)
+            head(out, f, "Loop", anchor, placed)
             fld(out, kid, "label")
             opt_text_val(out, label)
             fld(out, kid, "body")
             list_val(out, f, body, kid, emit_stmt)
         For(label, name, iter, body, else_body) ->
-            head(out, f, "For", e.span, true)
+            head(out, f, "For", anchor, placed)
             fld(out, kid, "label")
             opt_text_val(out, label)
             fld(out, kid, "name")
@@ -1037,7 +1134,7 @@ private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
             fld(out, kid, "elseBody")
             opt_list_val(out, f, else_body, kid, emit_stmt)
         ConstFor(name, iter, body) ->
-            head(out, f, "ConstFor", e.span, true)
+            head(out, f, "ConstFor", anchor, placed)
             fld(out, kid, "name")
             text_val(out, name)
             fld(out, kid, "iter")
@@ -1045,7 +1142,7 @@ private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
             fld(out, kid, "body")
             list_val(out, f, body, kid, emit_stmt)
         CFor(label, init, cond, step, body, else_body) ->
-            head(out, f, "CFor", e.span, true)
+            head(out, f, "CFor", anchor, placed)
             fld(out, kid, "label")
             opt_text_val(out, label)
             fld(out, kid, "init")
@@ -1059,7 +1156,7 @@ private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
             fld(out, kid, "elseBody")
             opt_list_val(out, f, else_body, kid, emit_stmt)
         Quantifier(universal, name, iter, pred) ->
-            head(out, f, "Quantifier", e.span, true)
+            head(out, f, "Quantifier", anchor, placed)
             fld(out, kid, "universal")
             bool_val(out, universal)
             fld(out, kid, "name")
@@ -1068,7 +1165,7 @@ private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
             emit_expr(out, f, iter, kid)
             fld(out, kid, "pred")
             emit_expr(out, f, pred, kid)
-        Bad -> head(out, f, "Bad", e.span, true)
+        Bad -> head(out, f, "Bad", anchor, placed)
 end emit_expr
 
 // A character literal is the one raw number in the tree that means something other than a count, so
@@ -1138,10 +1235,11 @@ end digit_value
 
 private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
     val kid = ind + "  "
+    val placed = take_placed(f)
 
     *s.kind match
         ImportDecl(d) ->
-            head(out, f, "ImportDecl", s.span, true)
+            head(out, f, "ImportDecl", s.span, placed)
             fld(out, kid, "path")
             texts_val(out, d.path)
             fld(out, kid, "selectors")
@@ -1151,7 +1249,7 @@ private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
             fld(out, kid, "alias")
             opt_text_val(out, d.alias)
         VarDecl(name, typ, init, vis, align, section, thread_local) ->
-            head(out, f, "VarDecl", s.span, true)
+            head(out, f, "VarDecl", s.span, placed)
             fld(out, kid, "name")
             text_val(out, name)
             fld(out, kid, "typ")
@@ -1167,7 +1265,7 @@ private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
             fld(out, kid, "threadLocal")
             bool_val(out, thread_local)
         ConstDecl(name, typ, value, vis) ->
-            head(out, f, "ConstDecl", s.span, true)
+            head(out, f, "ConstDecl", s.span, placed)
             fld(out, kid, "name")
             text_val(out, name)
             fld(out, kid, "typ")
@@ -1177,25 +1275,28 @@ private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
             fld(out, kid, "vis")
             emit_vis(out, vis, kid)
         CConstBlock(consts) ->
-            head(out, f, "CConstBlock", s.span, true)
+            head(out, f, "CConstBlock", s.span, placed)
             fld(out, kid, "consts")
             list_val(out, f, consts, kid, emit_cconst)
         CTypeBlock(types) ->
-            head(out, f, "CTypeBlock", s.span, true)
+            head(out, f, "CTypeBlock", s.span, placed)
             fld(out, kid, "types")
             list_val(out, f, types, kid, emit_ctype)
         AssertDecl(cond, message) ->
-            head(out, f, "AssertDecl", s.span, true)
+            head(out, f, "AssertDecl", s.span, placed)
             fld(out, kid, "cond")
             emit_expr(out, f, cond, kid)
             fld(out, kid, "message")
             opt_text_val(out, message)
         StaticDecl(inner) ->
-            head(out, f, "StaticDecl", s.span, true)
+            head(out, f, "StaticDecl", s.span, placed)
             fld(out, kid, "inner")
+
+            // The `static` wrapper takes the position; the binding inside it has none.
+            f.unplaced = true
             emit_stmt(out, f, inner, kid)
         ValDecl(name, typ, value, vis, align, section) ->
-            head(out, f, "ValDecl", s.span, true)
+            head(out, f, "ValDecl", s.span, placed)
             fld(out, kid, "name")
             text_val(out, name)
             fld(out, kid, "typ")
@@ -1209,13 +1310,13 @@ private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
             fld(out, kid, "section")
             opt_text_val(out, section)
         RefDecl(name, place) ->
-            head(out, f, "RefDecl", s.span, true)
+            head(out, f, "RefDecl", s.span, placed)
             fld(out, kid, "name")
             text_val(out, name)
             fld(out, kid, "place")
             emit_expr(out, f, place, kid)
         MultiAssign(op, targets, values) ->
-            head(out, f, "MultiAssign", s.span, true)
+            head(out, f, "MultiAssign", s.span, placed)
             fld(out, kid, "op")
             text_val(out, op)
             fld(out, kid, "targets")
@@ -1223,7 +1324,7 @@ private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
             fld(out, kid, "values")
             list_val(out, f, values, kid, emit_expr)
         MultiDecl(names, mutable, values) ->
-            head(out, f, "MultiDecl", s.span, true)
+            head(out, f, "MultiDecl", s.span, placed)
             fld(out, kid, "names")
             texts_val(out, names)
             fld(out, kid, "mutable")
@@ -1231,7 +1332,7 @@ private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
             fld(out, kid, "values")
             list_val(out, f, values, kid, emit_expr)
         PatternDecl(pat, mutable, value) ->
-            head(out, f, "PatternDecl", s.span, true)
+            head(out, f, "PatternDecl", s.span, placed)
             fld(out, kid, "pattern")
             emit_pattern(out, f, pat, kid)
             fld(out, kid, "mutable")
@@ -1239,59 +1340,59 @@ private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
             fld(out, kid, "value")
             emit_expr(out, f, value, kid)
         ExprStmt(inner) ->
-            head(out, f, "ExprStmt", s.span, true)
+            head(out, f, "ExprStmt", printed_at(f, s.span, stmt_anchor(s)), true)
             fld(out, kid, "expr")
             emit_expr(out, f, inner, kid)
         Return(value) ->
-            head(out, f, "Return", s.span, true)
+            head(out, f, "Return", s.span, placed)
             fld(out, kid, "value")
             opt_node_val(out, f, value, kid, emit_expr)
         Become(call) ->
-            head(out, f, "Become", s.span, true)
+            head(out, f, "Become", s.span, placed)
             fld(out, kid, "call")
             emit_expr(out, f, call, kid)
         Break(label, value) ->
-            head(out, f, "Break", s.span, true)
+            head(out, f, "Break", s.span, placed)
             fld(out, kid, "label")
             opt_text_val(out, label)
             fld(out, kid, "value")
             opt_node_val(out, f, value, kid, emit_expr)
         Continue(label) ->
-            head(out, f, "Continue", s.span, true)
+            head(out, f, "Continue", s.span, placed)
             fld(out, kid, "label")
             opt_text_val(out, label)
         Defer(inner) ->
-            head(out, f, "Defer", s.span, true)
+            head(out, f, "Defer", s.span, placed)
             fld(out, kid, "stmt")
             emit_stmt(out, f, inner, kid)
         Require(cond, msg) ->
-            head(out, f, "Require", s.span, true)
+            head(out, f, "Require", s.span, placed)
             fld(out, kid, "cond")
             emit_expr(out, f, cond, kid)
             fld(out, kid, "msg")
             opt_text_val(out, msg)
         Ensure(cond, msg) ->
-            head(out, f, "Ensure", s.span, true)
+            head(out, f, "Ensure", s.span, placed)
             fld(out, kid, "cond")
             emit_expr(out, f, cond, kid)
             fld(out, kid, "msg")
             opt_text_val(out, msg)
         Invariant(cond, msg) ->
-            head(out, f, "Invariant", s.span, true)
+            head(out, f, "Invariant", s.span, placed)
             fld(out, kid, "cond")
             emit_expr(out, f, cond, kid)
             fld(out, kid, "msg")
             opt_text_val(out, msg)
         Variant(measure) ->
-            head(out, f, "Variant", s.span, true)
+            head(out, f, "Variant", s.span, placed)
             fld(out, kid, "expr")
             emit_expr(out, f, measure, kid)
         AsmStmt(arms) ->
-            head(out, f, "AsmStmt", s.span, true)
+            head(out, f, "AsmStmt", s.span, placed)
             fld(out, kid, "arms")
             list_val(out, f, arms, kid, emit_asm_arm)
         ExternVarDecl(name, typ, link, vis) ->
-            head(out, f, "ExternVarDecl", s.span, true)
+            head(out, f, "ExternVarDecl", s.span, placed)
             fld(out, kid, "name")
             text_val(out, name)
             fld(out, kid, "typ")
@@ -1307,7 +1408,7 @@ private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
         TraitDecl(d) -> emit_trait(out, f, d, s.span, kid)
         ImplDecl(d) -> emit_impl(out, f, d, s.span, kid)
         TypeDecl(d) -> emit_typedecl(out, f, d, s.span, kid)
-        Bad -> head(out, f, "Bad", s.span, true)
+        Bad -> head(out, f, "Bad", s.span, placed)
 end emit_stmt
 
 private emit_func(out: *StrBuilder, f: *AstFmt, d: FuncDecl, at: Span, kid: string)
@@ -1374,7 +1475,10 @@ end emit_marks
 private emit_method(out: *StrBuilder, f: *AstFmt, d: MethodDecl, ind: string)
     val kid = ind + "  "
 
-    head(out, f, "MethodDecl", d.span, true)
+    head(out, f, "MethodDecl", printed_at(f, d.span, method_anchor(d)), true)
+
+    // A setter's parameter is made from the property, not written: it and its type have no position.
+    f.made_params = d.name.ends_with("$set")
     fld(out, kid, "name")
     text_val(out, d.name)
     fld(out, kid, "receiver")
@@ -1389,6 +1493,7 @@ private emit_method(out: *StrBuilder, f: *AstFmt, d: MethodDecl, ind: string)
     texts_val(out, d.tparams)
     fld(out, kid, "params")
     list_val(out, f, d.params, kid, emit_param)
+    f.made_params = false
     fld(out, kid, "retType")
     opt_node_val(out, f, d.ret_type, kid, emit_type)
     fld(out, kid, "body")
@@ -1529,7 +1634,9 @@ private emit_impl(out: *StrBuilder, f: *AstFmt, d: ImplDecl, at: Span, kid: stri
     fld(out, kid, "bounds")
     bounds_map_val(out, f, d.bounds, kid)
     fld(out, kid, "traitArgs")
+    f.in_type_args = true
     list_val(out, f, d.trait_args, kid, emit_type)
+    f.in_type_args = false
     fld(out, kid, "tdefaults")
     types_map_val(out, f, d.tdefaults, kid)
     fld(out, kid, "overrides")

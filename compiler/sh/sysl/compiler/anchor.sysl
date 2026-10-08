@@ -1,0 +1,55 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+
+// Where a node is ANCHORED: the place a complaint about it points, as distinct from the text it
+// covers.
+//
+// **The reference compiler keeps two positions on every node** -- `pos`, the anchor, and `extent`,
+// the run of text the rule consumed -- and `emit-ast` prints the anchor. They differ on purpose: a
+// call is anchored at its callee, a subscript at its `[`, a `match` at its scrutinee, a `?` at the
+// question mark. This tree keeps ONE span per node and computes the anchor from it, from the node's
+// children, and from the few tokens a variant stores because nothing else can say where they were:
+// `TypeAttr`'s `::`, `WithExpr`'s `with`, `IfExpr`'s `elif` flag, and `MethodDecl.named_at`.
+//
+// **Three node spans are anchors already rather than extents**, and so answer for themselves here: a
+// `Field` is its name, an `Index` and a `TypeArgs` run from their `[`, and a `TypeAttr` is its name.
+// Where the anchor is the node's own first or last token, it is cut out of the span.
+//
+// **What this cannot say is where the reference has NO position**, and that is a fact about the
+// node's parent rather than the node: the left operand of a same-level `Binary` folded without one,
+// a literal inside a pattern, the base of an associated type. `show_oracle.sysl` asks those of the
+// context it is printing in.
+
+// The anchor of an expression.
+anchor_of(e: Expr) -> Span = *e.kind match
+    // A call is its callee's anchor, all the way down: `a.b.c(x)` is anchored at `c`.
+    Call(callee, _) -> anchor_of(callee)
+    Index(_, _) -> span_head(e.span, 1)
+    TypeArgs(_, _) -> span_head(e.span, 1)
+    TypeAttr(_, _, colons) -> colons
+    WithExpr(_, _, at) -> at
+    TryExpr(_) -> span_tail(e.span, 1)
+    PostIncDec(_, _) -> span_tail(e.span, 2)
+    MatchExpr(scrutinee, _) -> anchor_of(scrutinee)
+    ResultList(values, _) -> if values.is_empty() then e.span else anchor_of(values.at(0))
+    Block(stmts) -> if stmts.is_empty() then e.span else stmt_anchor(stmts.at(0))
+    IfExpr(_, _, _, from_elif) -> if from_elif then span_head(e.span, 4) else e.span
+    _ -> e.span
+
+// The anchor of a statement: an expression standing as one is anchored where the expression is --
+// except a result list written as a line of its own, which the statement covers whole.
+stmt_anchor(s: Stmt) -> Span = *s.kind match
+    ExprStmt(inner) -> *inner.kind match
+        ResultList(_, true) -> s.span
+        _ -> anchor_of(inner)
+    _ -> s.span
+
+// A member is anchored at its own words, past any `private` or `override` written in front of it,
+// and runs to where its declaration ends.
+method_anchor(d: MethodDecl) -> Span = Span(d.named_at.start, d.span.end)
+
+// The first `n` bytes of a span, and the last -- a token the node begins or ends with.
+private span_head(s: Span, n: usize) -> Span = Span(s.start, if s.start + n <= s.end then s.start + n else s.end)
+
+private span_tail(s: Span, n: usize) -> Span = Span(if s.end >= s.start + n then s.end - n else s.start, s.end)
