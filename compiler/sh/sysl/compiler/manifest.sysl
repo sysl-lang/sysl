@@ -116,12 +116,20 @@ struct Manifest
     // What each `targets.<name>` block says about how that machine's image is linked -- its
     // `linker`, `linker_script` and `entry` (`image_link.sysl`). Only the root project's apply.
     images: Buf[ImageLink]
+
+    // The `codegen` block: what the generated code may use of the machine, as `(setting, on)` --
+    // `general_regs_only` and `strict_align` (`codegen_features.sysl`) -- and the same block written
+    // inside a `targets.<name>` block, which layers over it for that machine as `capabilities` does.
+    // **Only the root project's applies**: what registers an image may touch is a property of the
+    // whole image, so a dependency's block is read for its shape and otherwise ignored.
+    codegen: Buf[(string, bool)]
+    target_codegen: Buf[(string, string, bool)]
 end Manifest
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
-             buf(), None, None, None, buf(), None, false, "", None, buf())
+             buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -438,6 +446,7 @@ read_manifest(text: string) -> Result[Manifest, string]
         Some(block) -> read_capabilities(block, "capabilities")?
 
     var target_capabilities: Buf[(string, string, bool)] = buf()
+    var target_codegen: Buf[(string, string, bool)] = buf()
     var targets: Buf[(string, string)] = buf()
     var images: Buf[ImageLink] = buf()
 
@@ -468,6 +477,14 @@ read_manifest(text: string) -> Result[Manifest, string]
                         for j in 0..<flags.len()
                             target_capabilities.push((named.at(i), flags.at(j).0, flags.at(j).1))
 
+                conf_at(entry, "codegen") match
+                    None -> ()
+                    Some(block) ->
+                        val settings = read_codegen(block, s"targets.${named.at(i)}.codegen")?
+
+                        for j in 0..<settings.len()
+                            target_codegen.push((named.at(i), settings.at(j).0, settings.at(j).1))
+
     val dependencies = read_dependencies(root, "dependencies")?
     val dev = read_dependencies(root, "dev_dependencies")?
 
@@ -479,6 +496,11 @@ read_manifest(text: string) -> Result[Manifest, string]
     val link = read_link(root)?
     val lto = read_lto(root)?
     val bounds_locations = read_bounds_locations(root)?
+
+    val codegen = conf_at(root, "codegen") match
+        None -> buf()
+        Some(block) -> read_codegen(block, "codegen")?
+
     val has_package = conf_at(root, "package").is_some()
     val workspace = read_workspace(root)?
 
@@ -496,7 +518,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
                 target_capabilities, pkg_config, headers, defines, targets, allocator, features,
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
-                images))
+                images, codegen, target_codegen))
 end read_manifest
 
 // The `bounds_locations` key: `true`, the default, or `false` to leave every failed bounds check's
@@ -513,6 +535,43 @@ private read_bounds_locations(root: &Conf) -> Result[Option[bool], string]
     Err("'bounds_locations' says whether a failed bounds check names the file, line and column it " +
         "was written at, so it is true or false")
 end read_bounds_locations
+
+// A `codegen` block, at the top of the file or inside a `targets.<name>` block: each setting
+// `codegen_features.sysl` knows, `true` or `false`. **A name it does not know is refused rather than
+// warned about**, unlike a top-level key -- a misspelled `general_reg_only` would otherwise build an
+// image that touches the floating-point registers its author believed were off.
+private read_codegen(block: &Conf, where: string) -> Result[Buf[(string, bool)], string]
+    if !conf_is_block(block)
+        return Err(s"'$where' is not a block — it is written 'codegen { general_regs_only = true }'")
+
+    var out: Buf[(string, bool)] = buf()
+    val keys = conf_keys(block)
+
+    for i in 0..<keys.len()
+        if !is_codegen_setting(keys.at(i))
+            return Err(s"'$where.${keys.at(i)}' is not a code generation setting — the settings are " +
+                "'general_regs_only' and 'strict_align'")
+
+        *conf_at(block, keys.at(i)).unwrap() match
+            Flag(on) -> out.push((keys.at(i), on))
+            _ -> return Err(s"'$where.${keys.at(i)}' must be true or false")
+
+    Ok(out)
+end read_codegen
+
+// What the manifest says about one code generation setting on the machine `target`: the target's
+// own `codegen` block over the project's, and off where neither says anything.
+codegen_given(m: &Manifest, target: string, setting: string) -> bool
+    for i in 0..<m.target_codegen.len()
+        val row = m.target_codegen.at(i)
+
+        if row.0 == target && row.1 == setting then return row.2
+
+    for i in 0..<m.codegen.len()
+        if m.codegen.at(i).0 == setting then return m.codegen.at(i).1
+
+    false
+end codegen_given
 
 // The `workspace` list: the members' directories, relative to the file. **A list and nothing else**
 // -- the members are the whole of what a workspace says, and a value of any other shape was written
@@ -1504,4 +1563,4 @@ private known_top_key(key: string) -> bool =
     key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
     key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
     key == "links" || key == "features" || key == "optimization" || key == "link" || key == "lto" ||
-    key == "bounds_locations" || key == "workspace"
+    key == "bounds_locations" || key == "workspace" || key == "codegen"

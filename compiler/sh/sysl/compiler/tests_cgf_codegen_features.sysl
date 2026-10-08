@@ -1,0 +1,414 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.text.{replace_all, split, Search}
+
+// The `codegen` block and its flags (`codegen_features.sysl`): `general_regs_only` keeps the code out
+// of the floating-point and SIMD registers, `strict_align` makes every access aligned. Each is
+// asserted where a reader meets it -- the manifest, the command line, the LLVM text, clang's flags,
+// the artifact's cache key, the refusals -- and the copy that started it all is disassembled.
+
+private cgf_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A project holding `main.sysl` and a manifest with `extra` after its `package` block.
+private cgf_project(extra: string, main: string) -> string
+    val root = make_temp_dir("sysl-cgf").unwrap()
+
+    write_text(s"$root/package.hocon", s"package {\n  name = \"probe\"\n}\n\n$extra").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    root
+end cgf_project
+
+// `sysl <args>` as the command line answers it: the status, and everything it said.
+private cgf_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for i in 0..<said.len()
+        text = text + said.at(i) + "\n"
+
+    reset_search_paths()
+    use_codegen_features(no_codegen_features())
+    (code, text)
+end cgf_cli
+
+private cgf_both() -> CodegenFeatures = CodegenFeatures(true, true)
+
+private cgf_row(name: string) -> Target = target_named(name).unwrap()
+
+private cgf_has(xs: Buf[string], want: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == want then return true
+
+    false
+end cgf_has
+
+private cgf_big_copy() -> string =
+    "struct Big\n    words: [64]u64\n\n@export(\"copy_big\")\ncopy_big(dst: *Big, src: *Big)\n" +
+    "    *dst = *src\n"
+
+private cgf_both_on() -> string = "codegen {\n  general_regs_only = true\n  strict_align = true\n}\n"
+
+// -- the manifest ----------------------------------------------------------------------------------------
+
+@test("a codegen block is read, and a target's own block layers over it")
+cgf_manifest_layers()
+    val text = "package {\n  name = \"p\"\n}\n\ncodegen {\n  general_regs_only = true\n}\n\n" +
+        "targets {\n  aarch64-macos {\n    codegen {\n      general_regs_only = false\n" +
+        "      strict_align = true\n    }\n  }\n}\n"
+
+    read_manifest(text) match
+        Err(why) -> assert(false, why)
+        Ok(m) ->
+            assert(codegen_given(m, "aarch64-freestanding", "general_regs_only"), "project's")
+            assert(!codegen_given(m, "aarch64-freestanding", "strict_align"), "unsaid is off")
+            assert(!codegen_given(m, "aarch64-macos", "general_regs_only"), "target's over project's")
+            assert(codegen_given(m, "aarch64-macos", "strict_align"), "target's own")
+end cgf_manifest_layers
+
+@test("a setting the block does not know is refused, naming the two it does")
+cgf_unknown_setting_refused()
+    read_manifest("codegen {\n  general_reg_only = true\n}\n") match
+        Ok(_) -> assert(false, "a misspelled setting was accepted")
+        Err(why) ->
+            assert(why.contains("'codegen.general_reg_only' is not a code generation setting"), why)
+            assert(why.contains("'general_regs_only' and 'strict_align'"), why)
+end cgf_unknown_setting_refused
+
+@test("a codegen setting is true or false")
+cgf_setting_is_boolean()
+    read_manifest("targets {\n  x {\n    codegen {\n      strict_align = \"yes\"\n    }\n  }\n}\n") match
+        Ok(_) -> assert(false, "a string was taken as a boolean")
+        Err(why) -> assert(why.contains("'targets.x.codegen.strict_align' must be true or false"), why)
+end cgf_setting_is_boolean
+
+// -- what each machine is told ---------------------------------------------------------------------------
+
+@test("aarch64 is told -mgeneral-regs-only and -mstrict-align, and its functions carry the features")
+cgf_aarch64_flags_and_attribute()
+    val t = cgf_row("aarch64-freestanding")
+
+    assert(machine_flags(t).is_empty(), "nothing asked, nothing said")
+    assert(codegen_feature_attribute(t).is_none(), "nothing asked, no attribute")
+
+    use_codegen_features(cgf_both())
+
+    val flags = machine_flags(t)
+    val attrs = function_attributes(t, buf())
+
+    use_codegen_features(no_codegen_features())
+    assert(cgf_has(flags, "-mgeneral-regs-only"), "general regs")
+    assert(cgf_has(flags, "-mstrict-align"), "strict align")
+    assert(cgf_has(attrs, "\"target-features\"=\"+strict-align,-fp-armv8,-neon\""), "attribute")
+    assert(cgf_has(attrs, "nounwind"), "nounwind stays")
+end cgf_aarch64_flags_and_attribute
+
+@test("x86_64 keeps out of x87 and SSE under general_regs_only")
+cgf_x86_flags()
+    val t = cgf_row("x86_64-linux")
+
+    use_codegen_features(CodegenFeatures(true, false))
+
+    val flags = machine_flags(t)
+    val attr = codegen_feature_attribute(t)
+
+    use_codegen_features(no_codegen_features())
+    assert(cgf_has(flags, "-mgeneral-regs-only"), "flag")
+    assert_eq(attr, Some("\"target-features\"=\"-x87,-mmx,-sse\""))
+end cgf_x86_flags
+
+@test("Thumb and RISC-V take strict_align as a flag alone, their feature strings being the row's")
+cgf_flag_only_rows()
+    use_codegen_features(CodegenFeatures(false, true))
+
+    val thumb = machine_flags(cgf_row("thumb-freestanding"))
+    val riscv = machine_flags(cgf_row("riscv64-linux"))
+    val thumb_attr = codegen_feature_attribute(cgf_row("thumb-freestanding"))
+    val riscv_attr = codegen_feature_attribute(cgf_row("riscv32-freestanding"))
+
+    use_codegen_features(no_codegen_features())
+    assert(cgf_has(thumb, "-mno-unaligned-access"), "thumb")
+    assert(cgf_has(thumb, "-mfpu=fpv5-sp-d16") || cgf_has(thumb, "-mfpu=none") || thumb.len() > 1,
+           "the unit is still said")
+    assert(cgf_has(riscv, "-mstrict-align"), "riscv")
+    assert(thumb_attr.is_none(), "no attribute replaces Thumb's -mfpu features")
+    assert(riscv_attr.is_none(), "no attribute replaces RISC-V's extensions")
+end cgf_flag_only_rows
+
+// -- what is refused --------------------------------------------------------------------------------------
+
+@test("general_regs_only is refused where the unit is part of the row's convention, or absent")
+cgf_general_regs_refusals()
+    val gro = CodegenFeatures(true, false)
+
+    assert(codegen_feature_refusal(cgf_row("aarch64-freestanding"), gro).is_none(), "aarch64")
+    assert(codegen_feature_refusal(cgf_row("aarch64-macos"), gro).is_none(), "hosted aarch64")
+    assert(codegen_feature_refusal(cgf_row("x86_64-linux"), gro).is_none(), "x86_64")
+
+    val thumb = codegen_feature_refusal(cgf_row("thumb-freestanding"), gro).unwrap_or("")
+
+    assert(thumb.contains("'general_regs_only' does not apply to 'thumb-freestanding'"), thumb)
+    assert(thumb.contains("'thumb-freestanding-soft'"), thumb)
+
+    val riscv = codegen_feature_refusal(cgf_row("riscv64-linux"), gro).unwrap_or("")
+
+    assert(riscv.contains("the F and D extensions"), riscv)
+
+    val wasm = codegen_feature_refusal(cgf_row("wasm32-freestanding"), gro).unwrap_or("")
+
+    assert(wasm.contains("does not apply to 'wasm32-freestanding'"), wasm)
+end cgf_general_regs_refusals
+
+@test("strict_align is refused on x86, which has no such mode, and on wasm")
+cgf_strict_align_refusals()
+    val sa = CodegenFeatures(false, true)
+
+    assert(codegen_feature_refusal(cgf_row("aarch64-freestanding"), sa).is_none(), "aarch64")
+    assert(codegen_feature_refusal(cgf_row("thumbv6m-freestanding"), sa).is_none(), "thumb")
+    assert(codegen_feature_refusal(cgf_row("riscv32-freestanding"), sa).is_none(), "riscv")
+
+    val x86 = codegen_feature_refusal(cgf_row("x86_64-linux"), sa).unwrap_or("")
+
+    assert(x86.contains("'strict_align' does not apply to 'x86_64-linux': x86 has no strict-alignment"),
+           x86)
+    assert(codegen_feature_refusal(cgf_row("wasm32-freestanding"), sa).is_some(), "wasm")
+end cgf_strict_align_refusals
+
+@test("a build for a machine the setting means nothing on is refused before anything is built")
+cgf_build_refused_at_the_cli()
+    if !cgf_ready() then return
+
+    val root = cgf_project(cgf_both_on(), cgf_big_copy())
+    var args: [5]string = ["sysl", "emit-llvm", "--target", "thumb-freestanding", root]
+    val got = cgf_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 1)
+    assert(got.1.contains("'general_regs_only' does not apply to 'thumb-freestanding'"), got.1)
+end cgf_build_refused_at_the_cli
+
+// -- the LLVM text, the flags, the cache key --------------------------------------------------------------
+
+@test("emit-llvm shows the target-features attribute the manifest asked for, and nothing without it")
+cgf_emit_llvm_shows_the_attribute()
+    if !cgf_ready() then return
+
+    val on = cgf_project(cgf_both_on(), cgf_big_copy())
+    val off = cgf_project("", cgf_big_copy())
+    var with_it: [5]string = ["sysl", "emit-llvm", "--target", "aarch64-freestanding", on]
+    var without: [5]string = ["sysl", "emit-llvm", "--target", "aarch64-freestanding", off]
+    val a = cgf_cli(with_it[..])
+    val b = cgf_cli(without[..])
+
+    remove_dir_all(on).unwrap_or(())
+    remove_dir_all(off).unwrap_or(())
+    assert_eq(a.0, 0)
+    assert(a.1.contains("attributes #99 = { nounwind \"target-features\"=\"+strict-align,-fp-armv8,-neon\" }"),
+           a.1)
+    assert(a.1.contains("define void @copy_big$$sysl(ptr %dst.param, ptr %src.param) #99 {"), a.1)
+    assert_eq(b.0, 0)
+    assert(!b.1.contains("target-features"), b.1)
+end cgf_emit_llvm_shows_the_attribute
+
+@test("--general-regs-only and --strict-align turn their settings on over a manifest that says nothing")
+cgf_flags_turn_settings_on()
+    if !cgf_ready() then return
+
+    var flags: [2]string = ["--general-regs-only", "--strict-align"]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+    assert_eq(took_search_flag(flags[..], 1), 1)
+    assert(general_regs_only_flag() && strict_align_flag(), "both flags recorded")
+    reset_search_paths()
+    assert(!general_regs_only_flag() && !strict_align_flag(), "reset forgets them")
+
+    val root = cgf_project("", cgf_big_copy())
+    var args: [6]string = ["sysl", "emit-llvm", "--general-regs-only", "--target", "aarch64-freestanding", root]
+    val got = cgf_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0)
+    assert(got.1.contains("\"target-features\"=\"-fp-armv8,-neon\""), got.1)
+end cgf_flags_turn_settings_on
+
+@test("the standard module's artifact and the run cache are keyed by the settings")
+cgf_cache_keys_differ()
+    val t = cgf_row("aarch64-freestanding")
+    val plain = std_artifact_path(t, "f00d")
+
+    use_codegen_features(CodegenFeatures(true, false))
+
+    val gro = std_artifact_path(t, "f00d")
+
+    use_codegen_features(cgf_both())
+
+    val both = std_artifact_path(t, "f00d")
+    val key = codegen_features_key()
+
+    use_codegen_features(no_codegen_features())
+    assert_eq(codegen_features_key(), "")
+    assert_eq(key, "-gro-sa")
+    assert(plain != gro && gro != both && plain != both, s"$plain $gro $both")
+    assert(both.contains("-aarch64-freestanding-") && both.contains("-gro-sa/std"), both)
+end cgf_cache_keys_differ
+
+@test("under strict_align the text clang compiles carries clang's data layout")
+cgf_strict_align_lays_out_the_text()
+    if !clang_available() then return
+
+    val t = cgf_row("aarch64-freestanding")
+
+    assert_eq(laid_out("clang", t, "target triple = \"x\"\n"), "target triple = \"x\"\n")
+
+    use_codegen_features(CodegenFeatures(false, true))
+
+    val text = laid_out("clang", t, "target triple = \"x\"\n")
+
+    use_codegen_features(no_codegen_features())
+    assert(text.starts_with("target datalayout = \""), text)
+    assert(text.contains("i64:64"), text)
+    assert(text.ends_with("\ntarget triple = \"x\"\n"), text)
+end cgf_strict_align_lays_out_the_text
+
+// -- the disassembly -----------------------------------------------------------------------------------
+
+private cgf_objdump() -> Option[string]
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end cgf_objdump
+
+// The instructions of `symbol`'s body in the archive `build-c` wrote for `extra`, one to a line.
+private cgf_disassembled(objdump: string, extra: string, symbol: string) -> Buf[string]
+    val root = cgf_project(extra, cgf_big_copy())
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root]
+    val built = cgf_cli(args[..])
+
+    assert_eq(built.0, 0)
+
+    var out: Buf[string] = buf()
+
+    capture(objdump, ["-d", "--no-show-raw-insn", "--no-leading-addr", archive]) match
+        Err(_) -> assert(false, "llvm-objdump did not run")
+        Ok(dis) ->
+            val lines = split(dis.text, "\n")
+            var inside = false
+
+            for i in 0..<lines.len
+                val line = lines[i]
+
+                if line.contains(s"<$symbol>:") then inside = true
+                elif inside && line.trim() == "" then inside = false
+                elif inside then out.push(line)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cgf_disassembled
+
+// How many instructions name a floating-point or SIMD register (`q`, `v`, `d`).
+private cgf_vector_uses(code: Buf[string]) -> usize
+    var n: usize = 0
+
+    for i in 0..<code.len()
+        val spaced = replace_all(replace_all(replace_all(code.at(i), ",", " "), "[", " "), "]", " ")
+        val words = split(replace_all(spaced, "\t", " "), " ")
+        var hit = false
+
+        for j in 0..<words.len
+            val w = words[j].trim()
+
+            if w.bytes.len >= 2 && (w.bytes[0] == u8('q') || w.bytes[0] == u8('v') || w.bytes[0] == u8('d'))
+                var digits = true
+
+                for k in 1..<w.bytes.len
+                    if w.bytes[k] < u8('0') || w.bytes[k] > u8('9') then digits = false
+
+                if digits then hit = true
+
+        if hit then n += 1
+
+    n
+end cgf_vector_uses
+
+@test("the [64]u64 copy uses q registers by default and none under general_regs_only")
+cgf_copy_keeps_to_general_registers()
+    if !cgf_ready() then return
+
+    val objdump = cgf_objdump() match
+        Some(p) -> p
+        None -> return
+
+    val plain = cgf_disassembled(objdump, "", "copy_big$$sysl")
+    val kept = cgf_disassembled(objdump, cgf_both_on(), "copy_big$$sysl")
+
+    assert(!plain.is_empty() && !kept.is_empty(), "both bodies found")
+    assert(cgf_vector_uses(plain) > 0, s"the default copy uses SIMD registers: ${plain.len()} lines")
+    assert_eq(cgf_vector_uses(kept), 0)
+
+    var paired = false
+
+    for i in 0..<kept.len()
+        if kept.at(i).contains("ldp\tx") then paired = true
+
+    assert(paired, "under strict_align with the data layout, eight-byte pairs rather than word loads")
+end cgf_copy_keeps_to_general_registers
+
+// -- floating point under general_regs_only ------------------------------------------------------------
+
+@test("a float computed under general_regs_only is refused at the expression, naming the type")
+cgf_float_expression_refused()
+    if !cgf_ready() then return
+
+    val root = cgf_project("codegen {\n  general_regs_only = true\n}\n",
+        "@export(\"scale\")\nscale(n: u64) -> u64\n    val x = real(n) * 1.5\n    u64(x)\n")
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", s"$root/p.a", root]
+    val got = cgf_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 1)
+    assert(got.1.contains("'scale' computes with 'real' here, and this build keeps to the " +
+        "general-purpose registers"), got.1)
+    assert(got.1.contains("main.sysl:3:13"), got.1)
+end cgf_float_expression_refused
+
+@test("a float parameter under general_regs_only is refused at the function")
+cgf_float_parameter_refused()
+    if !cgf_ready() then return
+
+    val root = cgf_project("codegen {\n  general_regs_only = true\n}\n",
+        "@export(\"half\")\nhalf(x: f32) -> u32 = 7\n")
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", s"$root/p.a", root]
+    val got = cgf_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 1)
+    assert(got.1.contains("'half' takes 'x' as 'f32'"), got.1)
+end cgf_float_parameter_refused
+
+@test("the same float builds where the setting is off, and an integer program builds where it is on")
+cgf_floats_only_refused_under_the_setting()
+    if !cgf_ready() then return
+
+    val floats = cgf_project("",
+        "@export(\"scale\")\nscale(n: u64) -> u64\n    val x = real(n) * 1.5\n    u64(x)\n")
+    val ints = cgf_project("codegen {\n  general_regs_only = true\n}\n",
+        "@export(\"scale\")\nscale(n: u64) -> u64 = n * 3 / 2\n")
+    var a: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", s"$floats/p.a", floats]
+    var b: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", s"$ints/p.a", ints]
+    val got_a = cgf_cli(a[..])
+    val got_b = cgf_cli(b[..])
+
+    remove_dir_all(floats).unwrap_or(())
+    remove_dir_all(ints).unwrap_or(())
+    assert_eq(got_a.0, 0)
+    assert_eq(got_b.0, 0)
+end cgf_floats_only_refused_under_the_setting
