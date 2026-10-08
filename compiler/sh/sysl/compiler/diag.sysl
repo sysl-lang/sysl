@@ -16,9 +16,15 @@ import sysl.text.{str_builder, Search}
 // analysis reads many files at once, so a span alone says nothing.
 
 // One complaint, and the file it is about.
+//
+// **A complaint about the program as a whole has no place in it** (`at_place` false): two exports
+// claiming one C name collide in the header, not at either declaration, so the reference prints the
+// message alone -- no `-->` line, no quoted source, no caret. Its span is still kept, since a
+// report is ordered by where its complaints sit.
 struct Placed
     src: Source
     diag: Diagnostic
+    at_place: bool
 
     is_error(self) -> bool = self.diag.is_error()
 
@@ -26,15 +32,27 @@ struct Placed
     // literate file's source is the tangled program, four columns short of what the reader has open,
     // so the `-->` line adds them back, and the quoted line and caret stay the text that was read --
     // which is what the reference prints.
-    render(self) -> string = self.diag.render(self.src, literate_shift(self.src))
+    render(self) -> string
+        if !self.at_place
+            val kind = if self.is_error() then "error" else "warning"
+
+            return s"$kind: ${self.diag.message}\n"
+
+        self.diag.render(self.src, literate_shift(self.src))
+    end render
 
     // Where it is, in the one-line form a build log wants.
     location(self) -> string
+        if !self.at_place then return self.src.name
+
         val at = self.src.locate(self.diag.span.start)
 
         s"${self.src.name}:${at.line}:${at.col + literate_shift(self.src)}"
     end location
 end Placed
+
+// A complaint as the parsing package hands it out, about a place in a file.
+placed_at(src: Source, d: Diagnostic) -> Placed = Placed(src, d, true)
 
 // An error about a place in a file.
 //
@@ -42,11 +60,16 @@ end Placed
 // -- never by the key a table holds it under, and this is where that is settled for every
 // complaint the analysis makes (`readable_keys`).
 placed_error(src: Source, span: Span, message: string) -> Placed =
-    Placed(src, error(span, readable_keys(message)))
+    Placed(src, error(span, readable_keys(message)), true)
+
+// An error about the program as a whole, which is rendered with no position at all. `span` only
+// orders it among the rest of the report.
+unplaced_error(src: Source, span: Span, message: string) -> Placed =
+    Placed(src, error(span, readable_keys(message)), false)
 
 // A warning about one, which is not a reason to stop.
 placed_warning(src: Source, span: Span, message: string) -> Placed =
-    Placed(src, Diagnostic(Warning, span, readable_keys(message), "", ""))
+    Placed(src, Diagnostic(Warning, span, readable_keys(message), "", ""), true)
 
 // How many errors one compilation reports.
 //
