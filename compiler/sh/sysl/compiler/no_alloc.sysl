@@ -370,8 +370,38 @@ private first_seen(found: &FirstSpan, e: TExpr)
     if found.span.is_none() then found.span = Some(e.span)
 
 private reaches_fault(a: &Analysis, scope: Scope, at: Span, who: string, why: string) =
-    a.fault(scope, at, s"this reaches '${qualified_name(who)}', which makes heap storage, and $why — " +
-            "an allocator-free module may only call what is allocator-free itself")
+    a.fault(scope, at, s"this reaches '${qualified_name(handle_side(a, who))}', which makes heap " +
+            s"storage, and $why — an allocator-free module may only call what is allocator-free itself")
+
+// **A member of a handle's core is named as the handle's.** A container is a struct whose one field
+// is a counted reference to the struct that does the work -- `Buf[T]` over `BufCore[T]`, `Map[K, V]`
+// over `MapCore[K, V]` -- and the core is the library's own business: a program writes `Buf[int]` and
+// can neither name nor reach a `BufCore`. So `BufCore[int]`'s `grow` is reported as `Buf[int]`'s,
+// the type the reader wrote, which is also how the refusal read before the containers had a core.
+private handle_side(a: &Analysis, who: string) -> string
+    val insts = a.tables.struct_insts
+
+    for i in 0..<insts.len()
+        val pair = held_core(insts.at(i))
+
+        if pair.is_none() then continue
+
+        val (handle, core) = pair.unwrap()
+
+        if who.starts_with(s"$core.") then return handle + who[core.bytes.len..<who.bytes.len]
+
+    who
+end handle_side
+
+// The core a handle holds, with the handle's own base: a struct of one field, that field a counted
+// reference to another struct.
+private held_core(t: Type) -> Option[(string, string)] = t match
+    Struct(d) if d.fields.len() == 1 -> d.fields.at(0).1 match
+        Ref(inner, _) -> *inner match
+            Struct(c) -> Some((d.base, c.base))
+            _ -> None
+        _ -> None
+    _ -> None
 
 private blame_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, why: string, said: &Counted)
     val mine = least_seed(walk, own_refs(e))
