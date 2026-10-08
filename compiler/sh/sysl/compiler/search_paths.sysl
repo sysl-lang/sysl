@@ -56,6 +56,7 @@ reset_search_paths()
     sp_std_from_source = false
     sp_verbose = false
     sp_explain = false
+    sp_cc = None
     sp_say = None
     sp_link_mode = None
     sp_no_bounds_locations = false
@@ -179,6 +180,60 @@ end lib_roots
 private var sp_verbose: bool = false
 
 verbose() -> bool = sp_verbose
+
+// One line of what `--verbose` reports, said beside the command's output under the reference's
+// `sysl: ` lead -- on standard error from the terminal, and on the note channel a test hands over.
+// Nothing without the flag.
+trace(line: string)
+    if sp_verbose then say_note(s"sysl: $line")
+
+// What `--verbose` says about where a build looks and what it allocates through: every `--lib`, link
+// path, include path and macro as written, then the heap -- said even when it is libc's, since "which
+// allocator is this program using" has an answer whatever the answer is.
+trace_search_paths()
+    for i in 0..<sp_libs.len()
+        trace(s"library: ${sp_libs.at(i)}")
+
+    for i in 0..<sp_link.len()
+        trace(s"link path: ${sp_link.at(i)}")
+
+    for i in 0..<sp_include.len()
+        trace(s"include path: ${sp_include.at(i)}")
+
+    for i in 0..<sp_defines.len()
+        trace(s"define: ${sp_defines.at(i)}")
+
+    val who = allocator_named_by() match
+        Some(name) -> s" (named by $name)"
+        None -> " (the C default)"
+
+    trace(s"allocator: ${malloc_symbol()} / ${free_symbol()}$who")
+end trace_search_paths
+
+// The clang a `--cc` named, read once per command line wherever it was written.
+//
+// **Held here because one build reaches clang by roads no argument list travels** -- the standard
+// module rebuilt underneath it, a library's own C -- and a flag honoured by the program's link and
+// dropped by those would change compiler halfway through one build.
+private var sp_cc: Option[string] = None
+
+name_cc(cc: Option[string])
+    sp_cc = cc
+
+named_cc() -> Option[string] = sp_cc
+
+// The operand of the last `--cc` in a command line, up to a `--`, past which the arguments are a
+// program's.
+named_cc_of(args: []string) -> Option[string]
+    var found: Option[string] = None
+
+    for i in 1..<args.len
+        if args[i] == "--" then return found
+
+        if args[i] == "--cc" && i + 1 < args.len then found = Some(args[i + 1])
+
+    found
+end named_cc_of
 
 // Whether `--no-std-lib` was given: the standard module is compiled from its source into this build
 // rather than linked from a prebuilt artifact, and whatever artifact is on disk is not looked for.

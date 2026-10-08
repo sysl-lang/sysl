@@ -1,0 +1,94 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, write_text}
+import sysl.text.Search
+
+// `sysl test` driven through the command line itself -- the seam a user meets: the status it leaves,
+// what it says when there is nothing to run, and that a test build refuses what every build refuses.
+// The report is standard output and the command's own complaints standard error, so a test about
+// "what does it say when there is nothing to run" reads the second.
+
+// A program in a file of its own, as the reference's suite writes one, and the file's path.
+private clx_program(text: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-clx-test").unwrap())
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/prog.sysl", text).unwrap()
+    s"$root/prog.sysl"
+end clx_program
+
+private clx_passing() -> string =
+    "@test\narithmetic_holds() =\n    assert(1 + 1 == 2, \"two\")\n\n" +
+    "@test(\"a trap is what a broken promise leaves\")\na_broken_promise() =\n    assert(false, \"down\")\n"
+
+@test("a run where everything passes exits 0")
+clx_all_passing_exits_0()
+    if !clx_ready() then return
+
+    val (code, _, err) = clx_ran(["sysl", "test", clx_program("@test\nt() =\n    assert(true, \"up\")\n")])
+
+    assert_eq(code, Fine, err)
+
+@test("a run with a failure exits 1")
+clx_a_failure_exits_1()
+    if !clx_ready() then return
+
+    val (code, _, _) = clx_ran(["sysl", "test", clx_program(clx_passing())])
+
+    assert_eq(code, Failed)
+
+// A file-private test is emitted with internal linkage, and the runner reaches it from inside.
+@test("a file-private test is still one the runner reaches")
+clx_a_private_test_is_reached()
+    if !clx_ready() then return
+
+    val (code, _, err) = clx_ran(["sysl", "test", clx_program("@test\nprivate t() =\n    assert(true, \"up\")\n")])
+
+    assert_eq(code, Fine, err)
+end clx_a_private_test_is_reached
+
+@test("a tree with no tests exits 0 and says so")
+clx_no_tests_says_so()
+    if std_root().is_err() then return
+
+    val file = clx_program("print(\"nothing to test\")\n")
+    val (code, out, err) = clx_ran(["sysl", "test", file])
+
+    assert_eq(code, Fine)
+    assert_eq(out, "")
+    assert_eq(err, s"no '@test' functions in $file")
+end clx_no_tests_says_so
+
+@test("a filter that matches nothing says how many there were")
+clx_an_empty_filter_counts()
+    if std_root().is_err() then return
+
+    val (code, out, err) = clx_ran(["sysl", "test", clx_program(clx_passing()), "--filter", "no such test"])
+
+    assert_eq(code, Fine)
+    assert_eq(out, "")
+    assert_eq(err, "no test matches 'no such test' — 2 to choose from")
+end clx_an_empty_filter_counts
+
+@test("it names each test and counts the outcome")
+clx_the_report_names_and_counts()
+    if !clx_ready() then return
+
+    val (_, out, _) = clx_ran(["sysl", "test", clx_program(clx_passing())])
+
+    assert(out.contains("arithmetic_holds"), out)
+    assert(out.contains("a trap is what a broken promise leaves"), out)
+    assert(out.contains("1 passed, 1 failed"), out)
+end clx_the_report_names_and_counts
+
+@test("a filter narrows both the run and the count")
+clx_a_filter_narrows()
+    if !clx_ready() then return
+
+    val (code, out, _) = clx_ran(["sysl", "test", clx_program(clx_passing()), "--filter", "arithmetic"])
+
+    assert_eq(code, Fine, out)
+    assert(out.contains("running 1 test of 2"), out)
+    assert(!out.contains("broken promise"), out)
+end clx_a_filter_narrows

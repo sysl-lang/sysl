@@ -30,20 +30,25 @@ the path is standing on.
 | `sysl vendor <path>` | put what the project depends on into `vendor/` |
 | `sysl tidy [<path>]` | drop the `sysl.sum` lines for versions the project no longer resolves |
 | `sysl doc <path>` | generate an API reference from declarations and their doc comments |
-| `sysl targets` | list the machines sysl can build for — *not yet in this compiler* |
+| `sysl targets` | list the machines sysl can build for |
 | `sysl prove <path>` | discharge the contracts with Why3 — see [verification](/reference/verification/#sysl-prove) |
 
-A subcommand is required; sysl with none exits 2 and prints its usage.
+A subcommand is required; sysl with none says so on stderr, with its usage, and exits 2.
 
-A word that is not one of these is refused with the usage, and exits 2.
+A word that is not one of these is refused on stderr, naming the commands there are, and exits 2.
+Every command is sysl's own — nothing is looked for on the `PATH`.
 
-**Two of these are not in this compiler yet**: `weave` and `targets`. Each is described below as it
-will work, and until it is added each is refused in the same words, with the usage under them and exit
-status 2:
+**One of these is not in this compiler yet**: `weave`. It is described below as it will work, and
+until it is added it is refused as any other word that names no command is:
 
 ```text
-sysl: `weave` is not a command this compiler can carry out yet
+sysl: error: 'weave' is not a sysl command — the commands are run, build, build-lib, build-c, emit-header, tangle, test, emit-llvm, emit-ast, emit-typed, prove, deps, add, vendor, tidy, doc, targets
 ```
+
+**What a command was run for goes to stdout, and everything it says about the run goes to stderr** —
+a diagnostic, a refusal, a mistake in the command line with the usage under it, `wrote <exe>`, and
+what `--verbose` reports. So `sysl emit-llvm hello.sysl > hello.ll` holds a module or nothing at all.
+`sysl --help` and `sysl --version` were asked for, so they answer on stdout with status 0.
 
 ### `run`
 
@@ -338,8 +343,8 @@ error, exits non-zero and prints the ordinary diagnostic instead, with nothing o
 
 ### `weave`
 
-*Not yet in this compiler — it answers "`weave` is not a command this compiler can carry out yet".
-What follows is the command as it will be.*
+*Not yet in this compiler — it answers "'weave' is not a sysl command". What follows is the command
+as it will be.*
 
 ```bash
 sysl weave guide/slab/slab.lsysl -o slab.html
@@ -620,10 +625,6 @@ business carrying any of that. Without a `juicer` it says so and where one comes
 
 ### `targets`
 
-*Not yet in this compiler — it answers "`targets` is not a command this compiler can carry out yet".
-What follows is the command as it will be; meanwhile the names a `--target` takes are listed by the
-refusal of one it does not know, quoted under `--target` below.*
-
 The registry, one line per machine — the name to write after `--target`, the LLVM triple it stands
 for, and, for a target sysl knows and cannot build for, why not:
 
@@ -652,10 +653,10 @@ craft-freestanding           craft
 x86-linux                    i386-unknown-linux-gnu  (no C calling convention has been measured for x86)
 ```
 
-The line for the machine you are on is marked `(this machine)`, and a last line repeats what that
-machine's own runtime called itself. That last line is there for the case the rest of the list
-cannot help with: on a machine sysl has no entry for, it is the only place to read what the machine
-actually said.
+The line for the machine you are on is marked `(this machine)`, and a last line says which processor
+and system sysl reads this machine as — `this machine reports: aarch64 / macos` on an Apple Silicon
+Mac. That last line is there for the case the rest of the list cannot help with: on a machine sysl
+has no entry for, it is the only place to read what sysl took it for.
 
 **`aarch64-android` is the one row whose triple carries a version number, and the one that needs
 something set in your environment.** The `24` is an Android API level — which of Bionic's declarations
@@ -852,7 +853,7 @@ __aeabi_ldivmod` at the link, which is the one place anybody will come looking f
 | `--profile-use <file>` | build against a merged profile |
 | `--no-bounds-locations` | leave the `file:line:column` out of a failed bounds check's report — the [`bounds_locations` key](/reference/packages/#leaving-the-bounds-locations-out) for one build |
 | `-p <member>`, `--package <member>` | in a [workspace](/reference/packages/#workspaces), the member to build, test or run |
-| `-v`, `--verbose` | report the link line handed to clang |
+| `-v`, `--verbose` | report what the build decided: the files read, the standard module and how it was reached, the search paths, the allocator, and the clang and linker command lines |
 | `--explain-escapes` | report every local array promoted to the heap |
 
 **An option no command takes is refused, never passed over.** Each mistake is named on a line of its
@@ -1039,17 +1040,25 @@ sysl: error: unknown target 'arm-linux' — sysl knows aarch64-macos, x86_64-mac
 
 ### `-v`, `--verbose`
 
-The link line the build handed to clang, on stderr — `wrote <exe>` stays on stdout, so the two can
-be read apart:
+What the build decided, on stderr, each line led `sysl:` — the files it read, which standard module
+it got and by which route, where it looks and which heap it allocates through, then every command
+line it handed to clang:
 
 ```
+sysl: 1 source file(s) under hello.sysl
+sysl:   read hello.sysl
+sysl: standard module linked from ~/Library/Caches/sysl/<version>+…/std.syslib
+sysl: allocator: malloc / free (the C default)
 sysl: link: clang --target=arm64-apple-macosx -Wno-override-module -O1 -Wl,-dead_strip hello.ll ~/Library/Caches/sysl/<version>+…/std.syslib -o hello
+wrote hello
 ```
 
-That one line answers the question that has most often been asked of a build: **which standard
-module** it got — a cached `std.syslib` on the line, or, under `--no-std-lib`, the objects compiled
-from its source in its place — and with which flags, search paths and libraries it was linked. There
-are no phase timings: a build that is slow is diagnosed by asking what it *did*.
+Under `--no-std-lib` the third line is `standard module compiled from source, not linked from an
+artifact`, and a `compile:` line follows for each of the library's C files. Each `--lib`,
+`--link-path`, `--include-path` and `-D` is said too (`library:`, `link path:`, `include path:`,
+`define:`), ahead of the allocator — which names who chose it where a package or the project did. A
+test suite links like any other build and says the same. There are no phase timings: a build that
+is slow is diagnosed by asking what it *did*.
 
 ### `--explain-escapes`
 
@@ -1092,7 +1101,8 @@ sysl: error: --std-lib names a '.syslib', and a '.syslib' is this compiler's cac
 | **2** | the command line did not parse — an unknown option, a missing value, no subcommand |
 | *the program's* | `run` only, once the program has started |
 
-A compiler diagnostic is printed exactly as the compiler wrote it: the message, the location, the
+A compiler diagnostic is printed on standard error, by every command, exactly as the compiler wrote
+it: the message, the location, the
 line it happened on, and what went wrong underlined beneath it. The underline is as wide as the thing
 being complained about — a name, a literal, or a whole expression where the expression is what is
 wrong — and stops at the end of the line, since only the one line is quoted.

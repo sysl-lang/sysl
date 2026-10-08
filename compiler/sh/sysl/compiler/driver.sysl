@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Source
 import sysl.buf.{Buf, buf}
 import sysl.text.{join, str_builder, Search}
-import sysl.fs.{exists, is_file, make_temp_dir, remove_dir_all, remove_file, current_dir, make_dir_all, pending_name, publish_file, write_text}
+import sysl.fs.{exists, is_file, make_temp_dir, remove_dir_all, remove_file, make_dir_all, pending_name, publish_file, write_text}
 import sysl.process.{run as run_child, Status}
 import sysl.env.{get as env_var}
 
@@ -296,6 +296,12 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
 
     if mine.is_empty()
         return Err(said(Refusal(s"$path holds no sysl source files")))
+
+    // The files, in the order the walk found them, which is the order the compiler reads them in.
+    trace(s"${mine.len()} source file(s) under $path")
+
+    for i in 0..<mine.len()
+        trace(s"  read ${mine.at(i).src.name}")
 
     // What each `--lib` named, read before anything is resolved on its account: a root that is not
     // there is a mistake on the command line, and says so ahead of whatever the graph would.
@@ -717,9 +723,11 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
     // command that lowers anything comes through, and it comes through before the standard module's
     // artifact is looked for -- whose path, metadata and object half are all the pair's. Two packages
     // naming different pairs are refused on every target rather than only where no libc stands in.
-    choose_allocator(allocator_claims(root, manifest)) match
+    val claims = allocator_claims(root, manifest)
+
+    choose_allocator(claims) match
         Err(why) -> return Err(Refusal(why))
-        Ok(pair) -> use_allocator(pair)
+        Ok(pair) -> use_named_allocator(pair, first_claimant(claims, pair))
 
     // **And whether a failed bounds check names where it was written**, settled here for the same
     // reason: the standard module's artifact is built the same way as the program, and keyed by it.
@@ -826,6 +834,17 @@ end heap_refusal
 // whether a coordinate or the flag handed it over (`reference/packages.md § One heap`). Read from a
 // coordinate alone, the package's own objects came out of its heap and every string beside them out
 // of libc's, with nothing said. A root with no `package.hocon` has nothing to claim.
+// The first who named the pair chosen -- the project ahead of its packages, as the claims are
+// gathered -- and `None` where nobody did, the pair then being libc's.
+private first_claimant(claims: Buf[(string, (string, string))], pair: (string, string)) -> Option[string]
+    for i in 0..<claims.len()
+        val named = claims.at(i).1
+
+        if named.0 == pair.0 && named.1 == pair.1 then return Some(claims.at(i).0)
+
+    None
+end first_claimant
+
 private allocator_claims(root: string, m: Manifest) -> Buf[(string, (string, string))]
     var claims: Buf[(string, (string, string))] = buf()
 
@@ -1278,6 +1297,22 @@ private link_lowered_text(path: string, text: string, t: Target, cc: Option[stri
     // and the `-L`, `-l` and `-Wl,-rpath` its archive is linked with.
     val probed = supplied_or_refused(path, t, true, true)?
 
+    // **Nothing is linked where the tree being built IS the library**, which is `--std`: its bodies
+    // are in the text above rather than in an archive, and an artifact on the line would put a
+    // second copy of every one of them in front of the linker.
+    // **Nor where the build was told to compile it from source** (`--no-std-lib`): its bodies are in
+    // the text too, and its C is among the objects below.
+    val linked_std = std_linked(t, level, standalone).map_err((why) -> Refusal(why))?
+
+    // **Which standard module this build got, and by which route**, then where it looks and which
+    // heap it allocates through -- what `--verbose` says ahead of the command lines, in the
+    // reference's order and words.
+    linked_std match
+        Some(found) -> trace(s"standard module linked from ${found.archive}")
+        None -> if !standalone then trace("standard module compiled from source, not linked from an artifact")
+
+    trace_search_paths()
+
     val objects = native_objects(clang, path, exe, t, level, probed)?
 
     // **The standard module is linked rather than compiled**, which is `precompiled` seen from the
@@ -1293,17 +1328,9 @@ private link_lowered_text(path: string, text: string, t: Target, cc: Option[stri
 
     link_with.extend(objects.view())
 
-    // **Nothing is linked where the tree being built IS the library**, which is `--std`: its bodies
-    // are in the text above rather than in an archive, and an artifact on the line would put a
-    // second copy of every one of them in front of the linker.
-    // **Nor where the build was told to compile it from source** (`--no-std-lib`): its bodies are in
-    // the text too, and its C is among the objects above.
-    std_linked(t, level, standalone) match
-        Err(why) ->
-            discard_objects(objects)
-            return Err(Refusal(why))
-        Ok(Some(found)) -> link_with.push(found.archive)
-        Ok(None) -> ()
+    linked_std match
+        Some(found) -> link_with.push(found.archive)
+        None -> ()
 
     build_native(clang, text, link_with, exe, t, level, links, probed) match
         Err(why) ->
@@ -1722,14 +1749,14 @@ default_executable(path: string) -> string
     s"./${name[0..<at]}"
 end default_executable
 
-// The last segment of a directory's path, with `.` and a trailing separator resolved against where
-// the caller is standing -- so that a project built as `.` is named for the directory it is in
-// rather than for the dot that named it.
-private directory_name(path: string) -> string
-    val here = if path == "." || path == "" then current_dir().unwrap_or(".") else path
-    val name = basename(here)
+// What a directory project is called where its manifest names nothing: the last segment of where it
+// IS, which is not always the last segment of the path -- `.`, `./`, `test/..` and a trailing
+// separator all carry the name somewhere else. So the path is resolved against where the caller is
+// standing, `.` and `..` with it, and the name read off that. Only the filesystem's root has none.
+directory_name(path: string) -> string
+    val name = basename(absolute_path(if path == "" then "." else path))
 
-    if name == "" || name == "." || name == ".." then "a.out" else name
+    if name == "" || name == "/" then "a.out" else name
 end directory_name
 
 // Every `.c` the program's own tree carries, compiled for this machine.
