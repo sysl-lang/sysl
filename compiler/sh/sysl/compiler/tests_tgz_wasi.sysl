@@ -1,0 +1,116 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// `wasm32-wasi` -- WebAssembly with a libc under it (`getting-started/cli.md § targets`).
+//
+// The bare row has no libc and no convention for what the host supplies; WASI is a standardised table
+// of imports a module asks its host for, and wasi-libc is a real libc built on it. **What is asserted
+// here is everything answerable without wasi-sdk installed**: the row's decisions, two of which would
+// silently produce an unrunnable module.
+
+private tgz_wasi() -> Target = target_named("wasm32-wasi").unwrap()
+private tgz_bare() -> Target = target_named("wasm32-freestanding").unwrap()
+
+private tgz_holds(xs: Buf[string], x: string) -> bool = has(xs, x)
+
+// -- the row ---------------------------------------------------------------------------------------
+
+// Named for the family, with the modern triple: bare `wasm32-wasi` is clang's deprecated alias.
+@test("is named for what somebody types and hands clang the modern triple")
+tgz_wasi_name_and_triple()
+    assert_eq(tgz_wasi().name, "wasm32-wasi")
+    assert_eq(tgz_wasi().triple, "wasm32-wasip1")
+
+@test("is the same machine as the bare one")
+tgz_wasi_is_the_bare_machine()
+    assert(tgz_wasi().cpu == tgz_bare().cpu, "the processor differs")
+    assert_eq(tgz_wasi().pointer_bytes(), tgz_bare().pointer_bytes())
+
+@test("and is reachable by name")
+tgz_wasi_is_reachable_by_name()
+    assert(target_resolved("wasm32-wasi").is_ok(), "the name does not resolve")
+    assert_eq(target_resolved("wasm32-wasi").unwrap().triple, "wasm32-wasip1")
+
+// -- what a WASI machine has -------------------------------------------------------------------------
+
+// Files, a clock, randomness, arguments and exit, so it is not freestanding; no fork, no sockets and
+// no threads, so it is not POSIX. That rung was already occupied, and by Windows.
+@test("is an operating system without POSIX, which is the rung Windows stands on")
+tgz_wasi_is_the_windows_rung()
+    val wasi = inherent_capabilities(tgz_wasi())
+
+    assert(tgz_holds(wasi, CapOs), "WASI is an operating system")
+    assert(!tgz_holds(wasi, CapPosix), "and not a POSIX one")
+    assert_eq(join(wasi.view(), " "),
+              join(inherent_capabilities(target_named("x86_64-windows").unwrap()).view(), " "))
+end tgz_wasi_is_the_windows_rung
+
+// `#if wasm32` is true of both wasm rows; the system's symbol is what tells them apart.
+@test("and a source file can gate on it by name")
+tgz_wasi_can_be_gated_on()
+    val wasi = defined(tgz_wasi())
+
+    assert(tgz_holds(wasi, "wasi"), "wasi is not defined for WASI")
+    assert(tgz_holds(wasi, "hosted"), "WASI is hosted")
+    assert(!tgz_holds(wasi, "posix"), "WASI is not POSIX")
+    assert(!tgz_holds(defined(tgz_bare()), "wasi"), "the bare row is not WASI")
+end tgz_wasi_can_be_gated_on
+
+// -- the link line -----------------------------------------------------------------------------------
+
+// **Both halves of the bare row's linking would break this one, silently**: `-nostdlib` drops the
+// very libc that makes the row worth having, and `--entry=main` replaces the `_start` wasi-libc
+// supplies and a runtime looks for.
+@test("keeps the libc that the bare row has to do without")
+tgz_wasi_keeps_its_libc()
+    reset_search_paths()
+
+    val bare = link_command("clang", "a.ll", buf(), "a.wasm", tgz_bare(), DefaultOptimization, buf(),
+                            no_probe())
+    val wasi = link_command("clang", "a.ll", buf(), "a.wasm", tgz_wasi(), DefaultOptimization, buf(),
+                            no_probe())
+
+    assert(tgz_holds(bare, "-nostdlib"), join(bare.view(), " "))
+    assert(tgz_holds(bare, "-Wl,--entry=main"), join(bare.view(), " "))
+    assert(!tgz_holds(wasi, "-nostdlib"), join(wasi.view(), " "))
+    assert(!tgz_holds(wasi, "-Wl,--entry=main"), join(wasi.view(), " "))
+end tgz_wasi_keeps_its_libc
+
+// -- finding the toolchain ---------------------------------------------------------------------------
+
+// A clang picked for having the wasm32 back end carries no sysroot, so it succeeds at the search and
+// fails at the first `#include`. A refusal naming the variable is a sentence somebody can act on.
+@test("refuses with the variable to set rather than guessing")
+tgz_wasi_refuses_naming_the_variable()
+    val said = wasi_clang_in(None).unwrap_err()
+
+    assert(said.contains("WASI_SDK_PATH"), said)
+    assert(said.contains("sysroot"), said)
+end tgz_wasi_refuses_naming_the_variable
+
+// The path and not the variable, because what somebody set is what they have to look at.
+@test("and names the directory when it holds no clang")
+tgz_wasi_names_the_empty_directory()
+    val empty = make_temp_dir("sysl-nowasi-").unwrap()
+    val said = wasi_clang_in(Some(empty)).unwrap_err()
+
+    remove_dir_all(empty).unwrap_or(())
+    assert(said.contains(empty), said)
+end tgz_wasi_names_the_empty_directory
+
+@test("taking the clang under a directory that has one")
+tgz_wasi_takes_the_sdk_clang()
+    val sdk = make_temp_dir("sysl-wasi-").unwrap()
+
+    make_dir_all(s"$sdk/bin").unwrap()
+    write_text(s"$sdk/bin/clang", "").unwrap()
+
+    val got = wasi_clang_in(Some(sdk))
+
+    remove_dir_all(sdk).unwrap_or(())
+    assert_eq(got.unwrap(), s"$sdk/bin/clang")
+end tgz_wasi_takes_the_sdk_clang

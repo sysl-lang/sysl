@@ -1,0 +1,129 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, from_utf8_unchecked, split}
+
+// `sysl.os()` and `sysl.cpu()` against the registry they have to agree with.
+//
+// The two are `#if` ladders in `library/sysl/platform.sysl`, and so **hand-written**, where the
+// symbols a condition may name are derived from `Os` and `Cpu`. A ladder missing a branch is the
+// failure this file is for: the compiler grows a machine, the library answers nothing for it, and
+// nothing notices but somebody building for that machine.
+//
+// **The assertions name no variant**: for each member of the registry the gated body must hold
+// exactly one line, and the lines across the registry must all differ. A machine with no branch
+// leaves an empty body; one wired to somebody else's branch collides.
+
+// `platform.sysl` as the walk reads it for an operating system, before any gating -- the same file
+// for every one of them.
+private tgz_platform_source() -> Source
+    val root = std_root().unwrap()
+    val found = std_sources(root, Some(MacOS)).unwrap()
+
+    for i in 0..<found.len()
+        if found.at(i).src.name.ends_with("platform.sysl") then return found.at(i).src
+
+    panic("library/sysl/platform.sysl is not among the standard library's sources")
+end tgz_platform_source
+
+// The body of one function as `target` sees it: the lines between its declaration and its `end`
+// marker, with the blanks a gated-out line leaves behind dropped. Reading the gated text rather than
+// compiling is the point -- a compile answers for this machine, and the question is about the rest.
+private tgz_body(target: Target, func: string) -> Buf[string]
+    val gated = gate(tgz_platform_source(), target) match
+        Err(d) -> panic(s"platform.sysl does not gate for ${target.name}: ${d.message}")
+        Ok(s) -> s
+
+    var out: Buf[string] = buf()
+    var inside = false
+
+    for line in split(from_utf8_unchecked(gated.bytes), "\n")
+        if !inside
+            if line.starts_with(s"$func() -> ") then inside = true
+        elif line.starts_with(s"end $func")
+            break
+        elif line.trim() != ""
+            out.push(line.trim())
+
+    out
+end tgz_body
+
+// One registered target per operating system, or per processor.
+private tgz_for_os(os: Os) -> Target
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        if all.at(i).os == os then return all.at(i)
+
+    panic(s"no registered target for ${os_symbol(os)}")
+end tgz_for_os
+
+private tgz_for_cpu(cpu: Cpu) -> Target
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        if all.at(i).cpu == cpu then return all.at(i)
+
+    panic(s"no registered target for ${cpu_symbol(cpu)}")
+end tgz_for_cpu
+
+private tgz_distinct(answers: Buf[string]) -> usize
+    var seen: Buf[string] = buf()
+
+    for i in 0..<answers.len()
+        if !has(seen, answers.at(i)) then seen.push(answers.at(i))
+
+    seen.len()
+end tgz_distinct
+
+@test("every operating system the compiler knows has an answer from 'os()'")
+tgz_every_os_has_an_answer()
+    if std_root().is_err() then return
+
+    val systems = all_os()
+
+    for i in 0..<systems.len()
+        val got = tgz_body(tgz_for_os(systems.at(i)), "os")
+
+        assert_eq(got.len(), 1, s"${os_symbol(systems.at(i))}: ${got.len()} lines")
+end tgz_every_os_has_an_answer
+
+@test("and no two operating systems answer the same thing")
+tgz_no_two_systems_answer_alike()
+    if std_root().is_err() then return
+
+    val systems = all_os()
+    var answers: Buf[string] = buf()
+
+    for i in 0..<systems.len()
+        answers.extend(tgz_body(tgz_for_os(systems.at(i)), "os").view())
+
+    assert_eq(tgz_distinct(answers), systems.len())
+end tgz_no_two_systems_answer_alike
+
+@test("every processor the compiler knows has an answer from 'cpu()'")
+tgz_every_cpu_has_an_answer()
+    if std_root().is_err() then return
+
+    val processors = all_cpus()
+
+    for i in 0..<processors.len()
+        val got = tgz_body(tgz_for_cpu(processors.at(i)), "cpu")
+
+        assert_eq(got.len(), 1, s"${cpu_symbol(processors.at(i))}: ${got.len()} lines")
+end tgz_every_cpu_has_an_answer
+
+@test("and no two processors answer the same thing")
+tgz_no_two_processors_answer_alike()
+    if std_root().is_err() then return
+
+    val processors = all_cpus()
+    var answers: Buf[string] = buf()
+
+    for i in 0..<processors.len()
+        answers.extend(tgz_body(tgz_for_cpu(processors.at(i)), "cpu").view())
+
+    assert_eq(tgz_distinct(answers), processors.len())
+end tgz_no_two_processors_answer_alike

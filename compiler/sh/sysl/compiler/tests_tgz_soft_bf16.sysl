@@ -1,0 +1,196 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+
+// `bf16` on WebAssembly, whose back end cannot convert one (`bf16_as_bits`, `soft_bf16.sysl`).
+//
+// **Two claims, and neither stands in for the other.** That the rewritten module *assembles* for wasm
+// is asserted against the whole standard library, which is what failed before the rewrite. That it
+// computes the *same answers* is asserted on the host, where there is a second implementation to
+// disagree with: one program run once as LLVM lowers `bfloat` here and once through the rewrite, both
+// matching the values written below -- the cases where a careless narrowing rounds twice.
+
+// -- the standard library assembles for WebAssembly ---------------------------------------------------
+
+private tgz_std_assembles(name: string)
+    if std_root().is_err() then return
+
+    val t = target_named(name).unwrap()
+    val cc = find_backend_clang(t) match
+        Err(why) -> skip(s"no clang for $name: $why")
+        Ok(found) -> found
+
+    val half = std_library_half(t) match
+        Err(why) -> panic(s"the standard module did not build for $name: $why")
+        Ok(h) -> h
+
+    val root = make_temp_dir("sysl-bf16-").unwrap()
+
+    compile_object(cc, half.text, s"$root/std.o", t, DefaultOptimization, false) match
+        Ok(_) -> ()
+        Err(why) -> assert(false, s"$cc, ${t.triple}: $why")
+
+    remove_dir_all(root).unwrap_or(())
+    assert(!half.text.contains("bfloat"), "a bfloat left in the module")
+end tgz_std_assembles
+
+@test("for wasm32-freestanding")
+tgz_std_assembles_for_wasm32_freestanding()
+    tgz_std_assembles("wasm32-freestanding")
+
+@test("for wasm32-wasi")
+tgz_std_assembles_for_wasm32_wasi()
+    tgz_std_assembles("wasm32-wasi")
+
+// -- carried as bits, a bf16 computes what the machine's own lowering computes ------------------------
+
+// Every operation the rewrite has a case for, and the inputs where each could go wrong: a sum that
+// ties at `bf16` and must go to even, a `real` and an integer that each land on a midpoint if rounded
+// to binary32 first, the largest and smallest integers of several widths, a NaN and both infinities,
+// the saturating conversions back, and a vector through all three reductions.
+private val tgz_bf16_program: string = raw"""
+    import sysl.math.Float
+
+    var a: bf16 = 1.5
+    var b: bf16 = 0.1
+    print(a + b, a - b, a * b, a / b, -b, a < b, a == a, b > a)
+    var t: bf16 = 1.0078125
+    var q: bf16 = 0.00390625
+    print(t + q, (t - q) + q, 1.0bf16 + q)
+    var d: real = 1.0039062509313226
+    print(bf16(d), bf16(-d), bf16(1e300), bf16(-1e-300), bf16(3.3961e38))
+    var i: i32 = 16842753
+    var j: i64 = 4629700416936869889
+    var k: u64 = 18446744073709551615
+    var m: i64 = -9223372036854775807 - 1
+    var s: i8 = -128
+    var w: u16 = 65535
+    var z: i32 = 0
+    print(bf16(i), bf16(-i), bf16(j), bf16(k), bf16(m), bf16(s), bf16(w), bf16(z))
+    var big: u128 = 340282366920938463463374607431768211455
+    var low: i128 = -170141183460469231731687303715884105728
+    print(bf16(big), bf16(low))
+    var nan: bf16 = 0.0 / 0.0
+    var inf: bf16 = 1.0 / 0.0
+    print(nan, inf, -inf, nan == nan, nan < a, i32(bf16(-3.75)), u8(bf16(300.0)), i64(inf), u32(nan))
+    var h: f16 = 0.1
+    print(bf16(h), f16(b), f32(b), real(b))
+    print(bf16(2.0).sqrt(), a.floor(), b.abs(), (-a).abs(), a.copysign(-1.0))
+    var v: <4>bf16 = [1.0, 2.0, 3.0, 4.0]
+    var u = v * v + v
+    print(u[0], u[3], u.sum(), u.min(), u.max(), (v < u).any())
+    """
+
+// What 0.0.162 prints for the program above, read off `sysl run`.
+private val tgz_bf16_expected: string = raw"""
+    1.60156 1.39844 0.150391 15 -0.100098 false true false
+    1.01562 1 1
+    1.00781 -1.00781 inf -0 3.38953e+38
+    1.69083e+07 -1.69083e+07 4.64771e+18 1.84467e+19 -9.22337e+18 -128 65536 0
+    inf -1.70141e+38
+    nan inf -inf false false -3 255 9223372036854775807 0
+    0.100098 0.100098 0.100098 0.100098
+    1.41406 1 0.100098 1.5 -1.5
+    2 20 40 2 20 true
+    """
+
+// The program's module for this machine, the library's bodies lowered into it as `--no-std-lib`
+// lowers them -- so that the rewrite reaches every `bf16` body the program runs, the library's
+// included -- and the libraries it links.
+private tgz_bf16_module(path: string) -> (IrModule, Buf[string])
+    val t = host_target()
+    val program = packaged_compilation_of(path, t).unwrap()
+    val done = analyze_bodies(program.units, program.target)
+
+    assert(done.reported.is_empty(), "the program does not compile")
+
+    val whole = program_of(done, done.main_module)
+    val promotions = post_analysis_checks(done.an, whole, program.own)
+    val kept = prune(strip_tests(whole), program.own)
+
+    (codegen_with_gaps(kept, t, promotions).0, link_required(program.units))
+end tgz_bf16_module
+
+// What `ir` prints, built for this machine. The standard module's archive goes on the line only for
+// its C: every sysl body the program reaches is already defined in the text.
+private tgz_bf16_ran(ir: string, links: Buf[string], root: string, exe: string) -> string
+    val t = host_target()
+    val cc = find_clang(t, None).unwrap()
+    var objects: Buf[string] = buf()
+
+    std_linked(t, DefaultOptimization, false).unwrap() match
+        Some(found) -> objects.push(found.archive)
+        None -> ()
+
+    build_native(cc, ir, objects, s"$root/$exe", t, DefaultOptimization, links, no_probe()) match
+        Ok(_) -> ()
+        Err(why) -> panic(s"the program did not build: $why")
+
+    capture(s"$root/$exe", [], "", [], true) match
+        Err(_) -> panic("the program that was built could not be run")
+        Ok(out) -> out.text
+end tgz_bf16_ran
+
+@test("the rewritten module holds no bfloat at all")
+tgz_rewritten_module_holds_no_bfloat()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-tgz-bf16").unwrap()
+
+    write_text(s"$root/main.sysl", tgz_bf16_program).unwrap()
+
+    val m = tgz_bf16_module(s"$root/main.sysl").0
+
+    remove_dir_all(root).unwrap_or(())
+    assert(ir_print_module(m).contains("bfloat"), "the host module carries bfloat")
+    assert(!ir_print_module(soft_bf16_lower(m)).contains("bfloat"), "the rewrite left a bfloat")
+end tgz_rewritten_module_holds_no_bfloat
+
+@test("and prints the same answers as the native lowering, which are the correctly rounded ones")
+tgz_rewrite_prints_the_native_answers()
+    if std_root().is_err() then return
+    if !clang_available() then skip("clang not available")
+
+    val root = make_temp_dir("sysl-tgz-bf16").unwrap()
+
+    write_text(s"$root/main.sysl", tgz_bf16_program).unwrap()
+
+    val (m, links) = tgz_bf16_module(s"$root/main.sysl")
+    val native = tgz_bf16_ran(ir_print_module(m), links, root, "native")
+    val soft = tgz_bf16_ran(ir_print_module(soft_bf16_lower(m)), links, root, "soft")
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(native, tgz_bf16_expected)
+    assert_eq(soft, tgz_bf16_expected)
+end tgz_rewrite_prints_the_native_answers
+
+// -- a constant's bits -------------------------------------------------------------------------------
+
+// A constant is its sixteen bits at compile time -- the narrowing done once in the compiler, and so the
+// one copy of the rounding checkable against numbers written down by hand.
+private tgz_of(d: real) -> int = bf16_bits_of(real_bits(d))
+
+@test("an exact value is its top sixteen bits")
+tgz_exact_value_is_its_top_bits()
+    assert_eq(tgz_of(1.0), 0x3f80)
+    assert_eq(tgz_of(-2.0), 0xc000)
+    assert_eq(tgz_of(-0.0), 0x8000)
+
+@test("a tie goes to even, and a value just past one does not")
+tgz_tie_goes_to_even()
+    assert_eq(tgz_of(1.00390625), 0x3f80)
+    assert_eq(tgz_of(1.01171875), 0x3f82)
+    assert_eq(tgz_of(1.0039062509313226), 0x3f81)
+
+@test("a value past the largest bf16's midpoint is infinity, and a NaN stays one")
+tgz_past_the_largest_is_infinity()
+    val zero = 0.0
+
+    assert_eq(tgz_of(3.4e38), 0x7f80)
+    assert_eq(tgz_of(zero / zero) & 0x7fc0, 0x7fc0)
+end tgz_past_the_largest_is_infinity

@@ -1,0 +1,182 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+
+// That a target saying it has **no floating-point unit** produces code and compiles headers for a
+// machine that has not got one (`Target.no_fpu`, `machine_flags`).
+//
+// **The row it has to be told apart from is `thumb-freestanding-softfp`, which shares its triple**:
+// `thumbv8m.main-none-eabi` names the soft-float *convention* and says nothing about the *presence*
+// of the unit. So every case is a **pair** -- a probe that would come out the same either way proves
+// nothing, and the sibling row is asserted to give the other answer.
+//
+// The two halves are two different failures on a board. **The header half**: `__ARM_FP` is what
+// CMSIS reads, and it refuses the build against a `__FPU_PRESENT 0` device. **The instruction
+// half**: with the unit believed present, LLVM selects `vmul.f32`, and the image takes a usage fault
+// on the first floating-point instruction it reaches.
+
+private tgz_row(name: string) -> Target = target_named(name).unwrap()
+
+private tgz_clang(t: Target) -> string = find_backend_clang(t) match
+    Err(why) -> skip(s"no clang here has a back end for ${t.name}: $why")
+    Ok(cc) -> cc
+
+// Whether a translation unit compiles that compiles only if the target's C compiler believes what
+// `expected` says about the unit. `__ARM_FP` is the macro a header actually reads.
+private tgz_sees(name: string, expected: bool) -> Result[unit, string]
+    val t = tgz_row(name)
+    val cc = tgz_clang(t)
+    val root = make_temp_dir("sysl-fpu-").unwrap()
+    val test = if expected then "#ifndef __ARM_FP" else "#ifdef __ARM_FP"
+
+    write_text(s"$root/probe.c", s"$test\n#error \"the compiler does not agree about the " +
+               "floating-point unit\"\n#endif\nint use(void) { return 0; }\n").unwrap()
+
+    val said = compile_c(cc, s"$root/probe.c", s"$root/probe.o", t, DefaultOptimization, no_probe())
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end tgz_sees
+
+private tgz_agrees(name: string, expected: bool)
+    tgz_sees(name, expected) match
+        Ok(_) -> ()
+        Err(why) -> assert(false, s"$name: $why")
+end tgz_agrees
+
+// The module these files lower to for `t`, the library's bodies included as `--no-std-lib` lowers
+// them.
+private tgz_module(t: Target, text: string) -> string
+    var units = std_units(std_root().unwrap(), t).unwrap()
+    val parsed = parse(source_of("p.sysl", text))
+
+    assert(parsed.ok(), "the probe does not parse")
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    assert(done.reported.is_empty(), s"did not compile for ${t.name}")
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end tgz_module
+
+// Whether the object sysl produced for the row **calls out** for a multiply of `width`: a machine
+// with no unit has no `vmul.f32` to select, so the back end emits `bl __aeabi_fmul` and the symbol is
+// undefined in the object. **`f64` asks the same of the other half of the unit**, and on the M33 rows
+// the two differ: an `fpv5-sp-d16` does single precision in hardware and double by libcall.
+//
+// `@export` is load-bearing: a function nothing reaches is never emitted, and an object with no
+// multiply in it says nothing either way.
+private tgz_calls_out(name: string, width: string = "f32") -> bool
+    val t = tgz_row(name)
+    val cc = tgz_clang(t)
+    val ir = tgz_module(t, s"@export\nproduct(a: $width, b: $width) -> $width = a * b\n")
+    val root = make_temp_dir("sysl-fpu-").unwrap()
+    val obj = s"$root/p.o"
+
+    compile_object(cc, ir, obj, t, DefaultOptimization, false) match
+        Ok(_) -> ()
+        Err(why) -> assert(false, s"$cc, ${t.triple}: $why")
+
+    val listed = capture("nm", [obj], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val text = listed match
+        Err(_) -> skip("nm is not available")
+        Ok(out) -> out.text
+
+    assert(text.contains("product"), s"the object holds no multiply to ask about: $text")
+    text.contains(if width == "f64" then "__aeabi_dmul" else "__aeabi_fmul")
+end tgz_calls_out
+
+// -- the header half ---------------------------------------------------------------------------------
+
+// Zephyr's own MPS2 defconfigs are this case, not the exotic one: none sets `CONFIG_FPU`.
+@test("the Armv8-M row for an FPU-less board defines no __ARM_FP")
+tgz_armv8m_soft_defines_no_arm_fp()
+    tgz_agrees("thumb-freestanding-soft", false)
+
+// Same triple, opposite answer -- the whole reason the row exists.
+@test("and its softfp sibling, on the same triple, defines one")
+tgz_armv8m_softfp_defines_arm_fp()
+    tgz_agrees("thumb-freestanding-softfp", true)
+
+@test("the Armv7E-M row for an FPU-less board defines no __ARM_FP")
+tgz_armv7em_soft_defines_no_arm_fp()
+    tgz_agrees("thumbv7em-freestanding-soft", false)
+
+@test("and its hard-float sibling defines one")
+tgz_armv7em_hard_defines_arm_fp()
+    tgz_agrees("thumbv7em-freestanding", true)
+
+// Armv7-M needs no flag, the architecture having no unit -- asserted anyway, because "it needs no
+// flag" is a claim about clang's defaults, and a clang that changed its mind would go unnoticed.
+@test("Armv7-M says it in the triple, having no unit in the architecture")
+tgz_armv7m_defines_no_arm_fp()
+    tgz_agrees("thumbv7m-freestanding", false)
+
+// -- the instruction half ----------------------------------------------------------------------------
+
+@test("the Armv8-M row for an FPU-less board calls the EABI routine for a multiply")
+tgz_armv8m_soft_calls_out()
+    if std_root().is_err() then return
+
+    assert(tgz_calls_out("thumb-freestanding-soft"), "a multiply was given to a unit that is not there")
+
+// The pair again, and the one that shows `softfp` was never enough alone: the same triple, the same
+// convention, and `vmul.f32` in the object regardless.
+@test("and its softfp sibling uses the unit, the convention being no business of the instructions")
+tgz_armv8m_softfp_uses_the_unit()
+    if std_root().is_err() then return
+
+    assert(!tgz_calls_out("thumb-freestanding-softfp"), "the unit that is there went unused")
+
+@test("the Armv7E-M row for an FPU-less board calls the EABI routine too")
+tgz_armv7em_soft_calls_out()
+    if std_root().is_err() then return
+
+    assert(tgz_calls_out("thumbv7em-freestanding-soft"), "a multiply was given to a unit that is not there")
+
+@test("and its hard-float sibling uses the unit")
+tgz_armv7em_hard_uses_the_unit()
+    if std_root().is_err() then return
+
+    assert(!tgz_calls_out("thumbv7em-freestanding"), "the unit that is there went unused")
+
+// -- the unit named is the row's, not the toolchain's --------------------------------------------------
+
+// Until the rows named their unit, the answer was clang's default for the triple, which is not the
+// same default twice: `thumbv8m.main-none-eabi` with no `-mfpu` defines `__ARM_FP` under one clang and
+// nothing under another. And a Cortex-M33's unit is an `fpv5-sp-d16`, where clang's default of
+// `fpv5-d16` lowers a `f64` multiply to a `vmul.f64` the part does not implement.
+@test("a double multiply calls out on the M33's single-precision unit")
+tgz_m33_softfp_double_calls_out()
+    if std_root().is_err() then return
+
+    assert(tgz_calls_out("thumb-freestanding-softfp", "f64"), "a double went to a single-precision unit")
+
+@test("and on its hard-float sibling, which is the same part")
+tgz_m33_hard_double_calls_out()
+    if std_root().is_err() then return
+
+    assert(tgz_calls_out("thumb-freestanding", "f64"), "a double went to a single-precision unit")
+
+// The float half of the same pair, so a row losing its unit altogether cannot pass the two above by
+// calling out for everything.
+@test("while a float multiply on those two still uses it")
+tgz_m33_float_still_uses_the_unit()
+    if std_root().is_err() then return
+
+    assert(!tgz_calls_out("thumb-freestanding-softfp"), "softfp's unit went unused")
+    assert(!tgz_calls_out("thumb-freestanding"), "the hard-float row's unit went unused")
+end tgz_m33_float_still_uses_the_unit
