@@ -37,6 +37,7 @@ print(maybe.unwrap_or(0), "— and not one import above this line")
 | rendering to standard error | `eprints`, `eputbytes`; the sink itself, `Stderr` and `stderr` | below |
 | rendering to a sink | `Display`, `FormatSpec`, `Writer`, `Counting`, the `display_*` family | below |
 | hashing | `Hash`, `hash_u64`, `hash_u128`, `hash_bool`, `hash_str` | below |
+| a float's encoding | `FloatBits`: `bits`, `from_bits` | below |
 | destruction | `Drop` | [the memory model](/reference/memory/) |
 | operators | `Add`, `Sub`, `Mul`, `Div`, `Rem`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, `Neg`, `Not`, `Eq`, `Ord` | [expressions](/reference/expressions/) |
 | their identities | `Zero`, `One` | [expressions](/reference/expressions/), and [math](/library/math/) |
@@ -1176,6 +1177,39 @@ is not yours — `override impl Display for []int` is refused, because `[]int` n
 program's and [coherence](/reference/traits/) puts that block in the library or nowhere. And it does
 not silence the ordinary duplicate: leave the keyword off and the second implementation is refused
 exactly as it always was, which is how a block written twice by accident still gets found.
+
+## A float's encoding — `bits` and `from_bits`
+
+```
+x.bits()            the IEEE 754 encoding of x: a u64 for a real, a u32 for an f32, a u16 for f16 and bf16
+real.from_bits(b)   the real whose encoding is b; f32.from_bits, f16.from_bits and bf16.from_bits likewise
+```
+
+**This is a reinterpretation, not a conversion.** `u64(1.0)` carries the value across and is `1`;
+`1.0.bits()` is the sign, exponent and fraction as the machine lays them out. Nothing is rounded and
+nothing is refused in either direction — every pattern is some float, and a negative zero, an
+infinity or a NaN with a payload of its own comes back from `from_bits` as the bits it went out as.
+It is what a decimal printer, a hash of a float, or a `nextafter` written on the encoding reaches
+for.
+
+```sysl
+print(1.0.bits() == 0x3ff0000000000000, (-0.0).bits() == 0x8000000000000000)
+print(1.0f32.bits() == 0x3f800000, real.from_bits(0x4000000000000000) == 2.0)
+
+val payload: u64 = 0x7ff800000000beef
+val x = real.from_bits(payload)
+print(x != x, x.bits() == payload)
+```
+
+```output
+true true
+true true
+true true
+```
+
+**A comparison of values cannot tell `0.0` from `-0.0`, and a comparison of bits can** — which is why
+`(-0.0).bits() != 0.0.bits()` while `-0.0 == 0.0`. `FloatBits` is a trait of the standard module, so
+nothing is imported; its associated type `Word` is the unsigned integer of the float's own width.
 
 ## Hashing
 
