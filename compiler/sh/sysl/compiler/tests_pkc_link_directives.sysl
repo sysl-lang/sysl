@@ -1,0 +1,299 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.text.{join, replace_all, Search}
+
+// `@link("z")` -- the directive by which a module of `extern`s tells the driver which library
+// resolves them (`reference/ffi.md § @link`); the reference's `LinkDirectiveTests`. It has to parse
+// where a header goes and nowhere else, and it has to reach the command line through every path that
+// links. The third part of the reference's suite -- surviving its `AstCodec` -- has no subject here,
+// since this compiler reads every library from source.
+
+private pkc_project(files: []string) -> string
+    var all: Buf[string] = buf()
+
+    all.push("package.hocon")
+    all.push("package { name = \"probe\" }\n")
+
+    for i in 0..<files.len
+        all.push(files[i])
+
+    pkc_tree("sysl-pkc-link", all.view())
+end pkc_project
+
+// What a program of these files would be linked against, for the machine named.
+private pkc_links_for(files: []string, target: string) -> Buf[string]
+    val root = pkc_project(files)
+
+    val out = packaged_compilation_of(root, target_named(target).unwrap()) match
+        Ok(c) -> link_required(c.units)
+        Err(why) -> panic(s"did not compile: ${failure_text(why)}")
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end pkc_links_for
+
+private pkc_links(files: []string) -> Buf[string] = pkc_links_for(files, host_target().name)
+
+// What the standard module asks for on its own, with nothing added by the program.
+private pkc_library_links() -> Buf[string] = pkc_links(["main.sysl", "print(1)\n"])
+
+// The links a program asked for beyond the library's, in order.
+private pkc_own(links: Buf[string]) -> string
+    val lib = pkc_library_links()
+    var out: Buf[string] = buf()
+
+    for i in 0..<links.len()
+        if !pkc_has(lib, links.at(i)) then out.push(links.at(i))
+
+    join(out.view(), " ")
+end pkc_own
+
+private pkc_has(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end pkc_has
+
+// What a project that must not compile said.
+private pkc_err(files: []string) -> string
+    val root = pkc_project(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, root, "<root>")
+end pkc_err
+
+// The parse tree `emit-ast` prints for one file, spans and all.
+private pkc_tree_of(src: string) -> string
+    val root = pkc_project(["main.sysl", src])
+    val said = pkc_cli(["sysl", "emit-ast", s"$root/main.sysl"])
+
+    remove_dir_all(root).unwrap_or(())
+    said.1
+end pkc_tree_of
+
+// -- the directive is read in the file's header ----------------------------------------------------
+
+@test("beside a module header")
+pkc_beside_a_module_header()
+    if std_root().is_err() then return
+
+    assert(pkc_has(pkc_links(["thing/a.sysl", "module thing\n@link(\"z\")\n\nextern zlibVersion() -> *u8\n",
+                              "main.sysl", "print(1)"]), "z"), "no 'z'")
+
+@test("a file with no module header may name one, since the root module is a module")
+pkc_a_headerless_file_may_name_one()
+    if std_root().is_err() then return
+
+    assert(pkc_has(pkc_links(["main.sysl", "@link(\"z\")\n\nextern zlibVersion() -> *u8\n\nprint(1)\n"]),
+                   "z"), "no 'z'")
+
+@test("interleaved with capability clauses, in whatever order they were written")
+pkc_interleaved_with_capability_clauses()
+    if std_root().is_err() then return
+
+    val src = "module thing\n@requires(os)\n@link(\"z\")\n@no_alloc\n@link(\"png\")\n\nf() -> int = 1\n"
+
+    assert_eq(pkc_own(pkc_links(["thing/a.sysl", src, "main.sysl", "print(thing.f())"])), "z png")
+
+@test("several on their own lines, each naming one library")
+pkc_several_on_their_own_lines()
+    if std_root().is_err() then return
+
+    assert_eq(pkc_own(pkc_links(["main.sysl", "@link(\"png\")\n@link(\"z\")\n\nprint(1)\n"])), "png z")
+
+@test("and one written below the statements says where it belongs")
+pkc_one_below_the_statements()
+    if std_root().is_err() then return
+
+    val e = pkc_err(["main.sysl", "f() -> int = 1\n@link(\"z\")\n"])
+
+    assert(e.contains("error: this attribute belongs in the file's header, on the lines directly after " +
+                      "'module' and before everything else — it is a property of the whole module, not " +
+                      "of the statements below it"), e)
+    assert(!e.contains("newline expected"), e)
+
+@test("one on the header's own line is refused")
+pkc_one_on_the_headers_own_line()
+    if std_root().is_err() then return
+
+    val e = pkc_err(["m/a.sysl", "module m @link(\"z\")\n\nf() -> int = 1\n", "main.sysl", "print(1)\n"])
+
+    assert(e.contains("error: this attribute belongs in the file's header"), e)
+
+// -- a directive can be gated on the target, like any other line -----------------------------------
+
+@test("present for the target the branch is for")
+pkc_gated_present()
+    if std_root().is_err() then return
+
+    val src = "#if macos\n@link(\"framework-ish\")\n#endif\n\nprint(1)\n"
+
+    assert(pkc_has(pkc_links_for(["main.sysl", src], "aarch64-macos"), "framework-ish"), "absent")
+
+@test("and absent for one it is not")
+pkc_gated_absent()
+    if std_root().is_err() then return
+
+    val src = "#if macos\n@link(\"framework-ish\")\n#endif\n\nprint(1)\n"
+
+    assert(!pkc_has(pkc_links_for(["main.sysl", src], "x86_64-linux"), "framework-ish"), "present")
+
+// -- 'link' is still an ordinary name everywhere else ----------------------------------------------
+
+@test("a function may be called it, and called")
+pkc_a_function_called_link()
+    if !pkc_ready() then return
+
+    val root = pkc_project(["main.sysl", "link(b: *int) -> int = *b + 1\n\nvar n = 4\nprint(link(&n))\n"])
+
+    assert_eq(pkc_ran(root), "5\n")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a variable may be called it")
+pkc_a_variable_called_link()
+    if !pkc_ready() then return
+
+    val root = pkc_project(["main.sysl", "var link = 3\nprint(link * 2)\n"])
+
+    assert_eq(pkc_ran(root), "6\n")
+    remove_dir_all(root).unwrap_or(())
+
+@test("and a field may be, which is what the slab guide actually does")
+pkc_a_field_called_link()
+    if !pkc_ready() then return
+
+    val root = pkc_project(["main.sysl",
+                            "struct Node\n    link: int\nend Node\n\nvar n = Node(7)\nprint(n.link)\n"])
+
+    assert_eq(pkc_ran(root), "7\n")
+    remove_dir_all(root).unwrap_or(())
+
+// -- a directive that names no library is refused --------------------------------------------------
+
+@test("the empty name")
+pkc_the_empty_name()
+    if std_root().is_err() then return
+
+    val e = pkc_err(["main.sysl", "@link(\"\")\n\nprint(1)\n"])
+
+    assert(e.contains("error: a link directive names a library, and '' is not a name"), e)
+
+    // Anchored at the word, not at the `@`, as the reference's clause is (`emit-ast`: `1:2-1:10`).
+    val tree = pkc_tree_of("@link(\"\")\n\nprint(1)\n")
+
+    assert(tree.contains("LinkClause 1:2-1:10"), tree)
+
+@test("a linker flag written where the library goes")
+pkc_a_linker_flag()
+    if std_root().is_err() then return
+
+    val e = pkc_err(["main.sysl", "@link(\"-lz\")\n\nprint(1)\n"])
+
+    assert(e.contains("error: '-lz' begins with a dash, so it is a linker flag rather than a library — a " +
+                      "directive names the library itself and the target decides what that becomes on " +
+                      "a command line"), e)
+
+@test("two libraries in one directive")
+pkc_two_libraries_in_one()
+    if std_root().is_err() then return
+
+    val e = pkc_err(["main.sysl", "@link(\"png z\")\n\nprint(1)\n"])
+
+    assert(e.contains("error: 'png z' holds a space, so it is more than one word — a directive names " +
+                      "one library, and a file needing two writes two of them"), e)
+
+@test("and asking one file for the same library twice, which links it once")
+pkc_the_same_library_twice()
+    if std_root().is_err() then return
+
+    val e = pkc_err(["main.sysl", "@link(\"z\")\n@link(\"z\")\n\nprint(1)\n"])
+
+    assert(e.contains("error: 'z' is already linked by this file, and asking twice links it once"), e)
+
+    // Told at the SECOND clause, which is where the reference's `emit-ast` puts it: `2:2-2:11`.
+    val tree = pkc_tree_of("@link(\"z\")\n@link(\"z\")\n\nprint(1)\n")
+
+    assert(tree.contains("LinkClause 2:2-2:11"), tree)
+
+// -- the files of a module need not agree, unlike a capability -------------------------------------
+
+@test("one file may name a library the others do not")
+pkc_one_file_may_name_one()
+    if std_root().is_err() then return
+
+    assert(pkc_has(pkc_links(["thing/a.sysl", "module thing\n@link(\"z\")\n\nextern zlibVersion() -> *u8\n",
+                              "thing/b.sysl", "module thing\n\ng() -> int = 2\n",
+                              "main.sysl", "print(thing.g())"]), "z"), "no 'z'")
+
+@test("and two files naming the same one ask for it once")
+pkc_two_files_ask_once()
+    if std_root().is_err() then return
+
+    val links = pkc_links(["thing/a.sysl", "module thing\n@link(\"z\")\n\nf() -> int = 1\n",
+                           "thing/b.sysl", "module thing\n@link(\"z\")\n\ng() -> int = 2\n",
+                           "main.sysl", "print(thing.g())"])
+    var count = 0
+
+    for i in 0..<links.len()
+        if links.at(i) == "z" then count += 1
+
+    assert_eq(count, 1)
+
+// -- what reaches the command line -----------------------------------------------------------------
+
+@test("the standard module's own directive is in every compilation")
+pkc_the_library_asks_for_m()
+    if std_root().is_err() then return
+
+    assert(pkc_has(pkc_library_links(), "m"), "no 'm'")
+
+@test("and it is what puts '-lm' on an ELF link")
+pkc_it_puts_lm_on_elf()
+    if std_root().is_err() then return
+
+    val lib = pkc_library_links()
+
+    assert(pkc_has(library_flags(lib, target_named("x86_64-linux").unwrap()), "-lm"), "no -lm on ELF")
+    assert(!pkc_has(library_flags(lib, target_named("aarch64-macos").unwrap()), "-lm"), "-lm on Darwin")
+
+@test("a program's own directive arrives beside the library's")
+pkc_own_beside_the_librarys()
+    if std_root().is_err() then return
+
+    val links = pkc_links(["main.sysl", "@link(\"z\")\n\nextern zlibVersion() -> *u8\n\nprint(1)\n"])
+
+    assert(pkc_has(links, "z") && pkc_has(links, "m"), join(links.view(), " "))
+
+@test("a test build asks for the same libraries a program build does")
+pkc_a_test_build_asks_the_same()
+    if std_root().is_err() then return
+
+    val root = pkc_project(["main.sysl", "@link(\"z\")\n\n@test\nt() = ()\n"])
+
+    val links = test_build_of(root, None) match
+        Ok(b) -> b.emitted.links
+        Err(why) -> panic(s"did not compile: ${failure_text(why)}")
+
+    remove_dir_all(root).unwrap_or(())
+    assert(pkc_has(links, "z") && pkc_has(links, "m"), join(links.view(), " "))
+
+// Everything above reads a list this compiler built. This one watches the linker read it: a library
+// that does not exist has to fail the link and name itself.
+@test("the flag reaches the linker, not just the command list")
+pkc_the_flag_reaches_the_linker()
+    if !pkc_ready() then return
+
+    val root = pkc_project(["main.sysl", "@link(\"sysl-no-such-library\")\n\nprint(1)\n"])
+    val said = pkc_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(said.starts_with("build failed: ") &&
+           said.contains("ld: library 'sysl-no-such-library' not found"), said)

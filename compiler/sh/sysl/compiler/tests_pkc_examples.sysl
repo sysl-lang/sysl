@@ -1,0 +1,139 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.text.{join, Search}
+
+// `examples/` -- the one directory a package root gives up, so that a package can carry a program
+// (`reference/packages.md § A package may carry examples`); the reference's `PackageExamplesTests`.
+// Two halves: the directory is left out of the package's own builds and of `sysl test .`'s walk,
+// **and** a program in it finds the package it sits under without the caller naming it with `--lib`.
+
+private const PkcDemo: string = "import geom.*\n\nprint(double(21))\n"
+
+// A package with a module and whatever else the case asks for.
+private pkc_package(files: []string) -> string
+    var all: Buf[string] = buf()
+
+    all.push("package.hocon")
+    all.push("package { name = \"geom-lib\", version = \"1.0.0\" }\n\n")
+    all.push("geom/geom.sysl")
+    all.push("module geom\n\ndouble(n: int) -> int = n * 2\n")
+
+    for i in 0..<files.len
+        all.push(files[i])
+
+    pkc_tree("sysl-pkc-ex", all.view())
+end pkc_package
+
+// The module directories `collect` found under the root, one path per file.
+private pkc_dirs(root: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    collect(root, Some(host_target().os)) match
+        Err(_) -> ()
+        Ok(found) ->
+            for i in 0..<found.len()
+                out.push(join(found.at(i).dir.view(), "/"))
+
+    out
+end pkc_dirs
+
+// -- the directory is not part of the tree it sits in ----------------------------------------------
+
+// A `.sysl` with no `module` header in a package root is the anonymous root module, and a library
+// may not have one.
+@test("a library builds with a program sitting in it")
+pkc_a_library_builds_beside_an_example()
+    if std_root().is_err() then return
+
+    val root = pkc_package(["examples/demo.sysl", PkcDemo])
+    val said = pkc_cli(["sysl", "build-lib", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said.0, 0, said.1)
+
+@test("and 'sysl test .' does not walk it either")
+pkc_test_does_not_walk_it()
+    if !pkc_ready() then return
+
+    val root = pkc_package(["examples/demo.sysl", PkcDemo,
+                            "geom/tests.sysl", "module geom\n@tests\n\n@test\ndoubling() =\n" +
+                                               "    assert(double(2) == 4)\n"])
+    val said = pkc_cli(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said.0, 0, said.1)
+
+// **The exclusion is at the root and nowhere else**, so a package that wants the word for a module
+// still has it.
+@test("a nested 'examples' directory is an ordinary module")
+pkc_a_nested_examples_is_a_module()
+    val root = pkc_package(["geom/examples/examples.sysl",
+                            "module geom.examples\n\ntriple(n: int) -> int = n * 3\n"])
+    val dirs = pkc_dirs(root)
+    var seen = false
+
+    for i in 0..<dirs.len()
+        if dirs.at(i) == "geom/examples" then seen = true
+
+    remove_dir_all(root).unwrap_or(())
+    assert(seen, "no 'geom/examples'")
+
+@test("and the root's is in no module at all")
+pkc_the_roots_is_in_no_module()
+    val root = pkc_package(["examples/demo.sysl", PkcDemo])
+    val dirs = pkc_dirs(root)
+
+    remove_dir_all(root).unwrap_or(())
+
+    for i in 0..<dirs.len()
+        assert(!dirs.at(i).contains("examples"), dirs.at(i))
+
+// -- a program in it compiles against the package with nothing on the command line -----------------
+
+@test("written as one file")
+pkc_an_example_file()
+    if !pkc_ready() then return
+
+    val root = pkc_package(["examples/demo.sysl", PkcDemo])
+
+    assert_eq(pkc_ran(s"$root/examples/demo.sysl"), "42\n")
+    remove_dir_all(root).unwrap_or(())
+
+// The shape a demo with more than one file has to take: a directory of its own inside `examples/`.
+@test("and as a directory of its own")
+pkc_an_example_directory()
+    if !pkc_ready() then return
+
+    val root = pkc_package(["examples/demo/main.sysl", PkcDemo])
+
+    assert_eq(pkc_ran(s"$root/examples/demo"), "42\n")
+    remove_dir_all(root).unwrap_or(())
+
+// **The manifest has to be there.** A directory called `examples` beside a tree that is not a
+// package is somebody's ordinary folder.
+@test("but only where the parent is a package")
+pkc_only_under_a_package()
+    if !pkc_ready() then return
+
+    val root = pkc_tree("sysl-pkc-plain", ["geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 2\n",
+                                           "examples/demo.sysl", PkcDemo])
+
+    assert(owning_package(s"$root/examples").is_none(), "a package was found")
+
+    val said = pkc_ran(s"$root/examples/demo.sysl")
+
+    remove_dir_all(root).unwrap_or(())
+    assert(said.starts_with("build failed: error: no module is called 'geom'"), said)
+
+@test("and a program that is not in one is unaffected")
+pkc_a_program_elsewhere_is_unaffected()
+    if !pkc_ready() then return
+
+    val root = pkc_tree("sysl-pkc-app", ["main.sysl", "print(21 * 2)\n"])
+
+    assert(owning_package(root).is_none(), "a package was found")
+    assert_eq(pkc_ran(root), "42\n")
+    remove_dir_all(root).unwrap_or(())

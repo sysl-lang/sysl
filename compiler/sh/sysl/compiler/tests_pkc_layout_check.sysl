@@ -1,0 +1,95 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.remove_dir_all
+import sysl.text.{replace_all, Search}
+
+// The checked C struct layout, end to end -- `@assert` on the sysl side and `_Static_assert` on the
+// C side, pinned to the same number; the reference's `LayoutCheckTests`. Transcribing a C struct is
+// unverifiable on its own, since sysl's `sizeof` reports what sysl laid out; it stops being a
+// tautology when both sides name the same literal and a build survives only while the two agree.
+
+private const PkcPairSysl: string = "struct Pair\n    a: i32\n    b: i32\nend Pair\n\n" +
+    "@assert(sizeof(Pair) == 8, \"Pair must match struct pair\")\n" +
+    "@assert(offsetof(Pair, b) == 4, \"struct pair.b moved\")\n\n" +
+    "extern \"pair_size\" c_pair_size() -> usize\n\nprint(c_pair_size() == sizeof(Pair))\n"
+
+private const PkcPairC: string = "#include <stddef.h>\nstruct pair { int a; int b; };\n" +
+    "_Static_assert(sizeof(struct pair) == 8, \"struct pair size moved\");\n" +
+    "_Static_assert(offsetof(struct pair, b) == 4, \"struct pair.b moved\");\n" +
+    "size_t pair_size(void) { return sizeof(struct pair); }\n"
+
+private pkc_layout(files: []string) -> string = pkc_tree("sysl-pkc-layout", files)
+
+private pkc_layout_ran(root: string) -> string
+    val said = pkc_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(said, root, "<root>")
+end pkc_layout_ran
+
+// A binding is a library, so a layout check survives the library's build and the consumer settles
+// it again for the target it builds for. The reference hands the library over as a `.syslib`; here
+// a library is always a source tree.
+@test("a true one, built and consumed")
+pkc_a_true_one_built_and_consumed()
+    if !pkc_ready() then return
+
+    val lib = pkc_layout(["shape/shape.sysl",
+                          "module shape\n\nstruct Pair\n    a: i32\n    b: i32\nend Pair\n\n" +
+                          "@assert(sizeof(Pair) == 8, \"Pair must match struct pair\")\n\n" +
+                          "width() -> usize = sizeof(Pair)\n"])
+    val root = pkc_layout(["main.sysl", "print(shape.width())\n"])
+    val said = pkc_ran(root, ["--lib", lib])
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+    assert_eq(said, "8\n")
+
+@test("both halves agree")
+pkc_both_halves_agree()
+    if !pkc_ready() then return
+
+    assert_eq(pkc_layout_ran(pkc_layout(["main.sysl", PkcPairSysl, "pair.c", PkcPairC])), "true\n")
+
+// The struct gained a field and the assertion did not move, so the build stops here rather than at
+// whatever reads past the end of C's storage.
+@test("the sysl half stops a struct that no longer matches")
+pkc_the_sysl_half_stops_a_grown_struct()
+    if !pkc_ready() then return
+
+    val said = pkc_layout_ran(pkc_layout(["main.sysl", "struct Pair\n    a: i32\n    b: i32\n    c: i32\n" +
+                                          "end Pair\n\n@assert(sizeof(Pair) == 8, \"Pair must match struct " +
+                                          "pair\")\n\nprint(1)\n", "pair.c", PkcPairC]))
+
+    assert(said.contains("error: assertion failed: Pair must match struct pair — the left side is 12"), said)
+
+// The failure `sizeof` cannot see: the same two fields in the other order are the same eight bytes,
+// so every size assertion passes while every read of `a` returns `b`. `offsetof` objects.
+@test("the sysl half stops two same-width fields transposed, which sizeof cannot see")
+pkc_the_sysl_half_stops_a_transposition()
+    if !pkc_ready() then return
+
+    val said = pkc_layout_ran(pkc_layout(["main.sysl", "struct Pair\n    b: i32\n    a: i32\nend Pair\n\n" +
+                                          "@assert(sizeof(Pair) == 8, \"Pair must match struct pair\")\n" +
+                                          "@assert(offsetof(Pair, b) == 4, \"struct pair.b moved\")\n\n" +
+                                          "print(1)\n", "pair.c", PkcPairC]))
+
+    assert(said.contains("error: assertion failed: struct pair.b moved — the left side is 0"), said)
+    assert(!said.contains("Pair must match struct pair"), said)
+
+// The header moved, so `_Static_assert` fails while the sysl is still internally consistent. The two
+// halves are not redundant -- neither finds this alone.
+@test("the C half stops a header that no longer matches")
+pkc_the_c_half_stops_a_moved_header()
+    if !pkc_ready() then return
+
+    val said = pkc_layout_ran(pkc_layout(["main.sysl", PkcPairSysl,
+        "pair.c", "#include <stddef.h>\nstruct pair { int a; int b; int c; };\n" +
+                  "_Static_assert(sizeof(struct pair) == 8, \"struct pair size moved\");\n" +
+                  "size_t pair_size(void) { return sizeof(struct pair); }\n"]))
+
+    assert(said.starts_with("build failed: sysl: error: ") &&
+           said.contains("/pair.c did not compile (clang, exit 1):\n") &&
+           said.contains("error: static assertion failed due to requirement 'sizeof(struct pair) == 8': " +
+                         "struct pair size moved"), said)

@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Source
 import sysl.buf.{Buf, buf}
 import sysl.text.{join, str_builder, Search}
-import sysl.fs.{exists, make_temp_dir, remove_dir_all, remove_file, current_dir, make_dir_all, pending_name, publish_file, write_text}
+import sysl.fs.{exists, is_file, make_temp_dir, remove_dir_all, remove_file, current_dir, make_dir_all, pending_name, publish_file, write_text}
 import sysl.process.{run as run_child, Status}
 import sysl.env.{get as env_var}
 
@@ -221,6 +221,53 @@ private location_roots_of(root: string, packages: Buf[string]) -> Buf[(string, s
     out
 end location_roots_of
 
+// The package an **example** belongs to: the root two levels above a program that sits in a
+// package's `examples/` directory, or nothing (`reference/packages.md § A package may carry
+// examples`). `root` is the project root a command was given -- the directory named, or the one a
+// named file sits in.
+//
+// **It is not an upward search.** It looks at exactly two levels and only where the intervening one
+// is literally `examples` -- a rule about the shape of a path that a reader can apply by looking, so
+// nothing outside a package's own tree is picked up by accident. And the manifest has to be there: a
+// directory called `examples` beside a tree that is not a package is somebody's ordinary folder.
+owning_package(root: string) -> Option[string]
+    val at = absolute_path(root)
+
+    // **An example with a manifest of its own is a project**, and says what it depends on -- a
+    // workspace member naming the package `{ workspace = true }` already has it, and a second road to
+    // the same modules would be one too many.
+    if is_file(join_path(at, ManifestName)) then return None
+
+    // Two shapes reach here: `examples/demo.sysl`, whose root is `examples` itself, and
+    // `examples/demo/`, whose root is a directory inside it.
+    var pkg = parent_of(at)
+
+    if basename(at) != ExamplesDir
+        pkg = pkg match
+            Some(up) -> if basename(up) == ExamplesDir then parent_of(up) else None
+            None -> None
+
+    pkg match
+        Some(p) -> if is_file(join_path(p, ManifestName)) then Some(p) else None
+        None -> None
+end owning_package
+
+// **A program in a package's `examples/` compiles against that package**, with nothing on the
+// command line saying so. It joins as a `--lib` source root rather than being handled anywhere
+// special, so everything downstream -- the package's own `dependencies`, the C it carries, its
+// requirements -- is what a `--lib` already gets; a root already named is not named twice.
+adopt_owning_package(root: string)
+    owning_package(root) match
+        None -> ()
+        Some(pkg) ->
+            val libs = lib_roots()
+
+            for i in 0..<libs.len()
+                if libs.at(i) == pkg || absolute_path(libs.at(i)) == pkg then return
+
+            add_lib_root(pkg)
+end adopt_owning_package
+
 // Everything one invocation reads, given the path the command line named and the machine it is for,
 // with each fetched package's modules under the canonical prefix its coordinate gives them -- which
 // is what makes two consumers naming one package differently link one copy of it.
@@ -230,6 +277,9 @@ end location_roots_of
 // what it is.
 packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+
+    adopt_owning_package(root)
+
     val manifest = manifest_at(root)?
 
     // What the package says it cannot be built without, asked of the machine it is being built for.

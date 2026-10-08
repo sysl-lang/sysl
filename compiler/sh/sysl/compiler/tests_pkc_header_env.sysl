@@ -1,0 +1,112 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.join
+
+// A `requires { headers { … } }` entry answered by the environment variable the package named; the
+// reference's `HeaderEnvTests`. **What is pinned is a precedence and a fallback**: which of a flag
+// and a variable wins, and what happens where the variable is not set. The variable is set in this
+// test's own process, so a developer's shell with `PICO_SDK_PATH` set changes nothing here.
+
+private pkc_pico(who: string = "this project") -> HeaderNeed =
+    HeaderNeed(who, "pico_sdk", "the pico-sdk's headers", "PICO_SDK_PATH")
+
+// A requirement with no variable named, which is every requirement written before this existed.
+private pkc_plain() -> HeaderNeed = HeaderNeed("this project", "lwip", "lwIP's headers", "")
+
+private pkc_needs(a: HeaderNeed) -> Buf[HeaderNeed]
+    var out: Buf[HeaderNeed] = buf()
+
+    out.push(a)
+    out
+end pkc_needs
+
+// What the environment answered: the names the build now holds as supplied, and their `-I`.
+private pkc_answered(needs: Buf[HeaderNeed]) -> string
+    answer_headers_from_env(needs)
+
+    val got = s"${join(supplied_names().view(), " ")} | ${join(include_flags().view(), " ")}"
+
+    reset_search_paths()
+    got
+end pkc_answered
+
+// -- a headers requirement answered by an environment variable -------------------------------------
+
+@test("is resolved when the variable is set")
+pkc_resolved_when_set()
+    reset_search_paths()
+    pkc_set_env("PICO_SDK_PATH", "/opt/pico-sdk")
+    assert_eq(pkc_answered(pkc_needs(pkc_pico())), "pico_sdk | -I/opt/pico-sdk")
+    pkc_unset_env("PICO_SDK_PATH")
+
+@test("is not resolved when it is unset, so the build stops as it did before")
+pkc_unresolved_when_unset()
+    reset_search_paths()
+    pkc_unset_env("PICO_SDK_PATH")
+    assert_eq(pkc_answered(pkc_needs(pkc_pico())), " | ")
+
+// `PICO_SDK_PATH=` in a shell profile is somebody clearing it, not somebody naming the root.
+@test("an empty variable is unset rather than a path")
+pkc_an_empty_variable_is_unset()
+    reset_search_paths()
+    pkc_set_env("PICO_SDK_PATH", "   ")
+    assert_eq(pkc_answered(pkc_needs(pkc_pico())), " | ")
+    pkc_unset_env("PICO_SDK_PATH")
+
+// **The precedence, which is the part a reader would guess wrong**: an explicit flag beats an
+// inherited environment, so a machine with the variable set can still be told to build against a
+// different SDK without unsetting anything.
+@test("an explicit --include-path beats a variable that is set")
+pkc_the_flag_beats_the_variable()
+    reset_search_paths()
+    add_include_path("pico_sdk=/my/pico-sdk")
+    pkc_set_env("PICO_SDK_PATH", "/opt/pico-sdk")
+    assert_eq(pkc_answered(pkc_needs(pkc_pico())), "pico_sdk | -I/my/pico-sdk")
+    pkc_unset_env("PICO_SDK_PATH")
+
+@test("a requirement naming no variable is never resolved from the environment")
+pkc_no_variable_named()
+    reset_search_paths()
+    pkc_set_env("LWIP", "/opt/lwip")
+    assert_eq(pkc_answered(pkc_needs(pkc_plain())), " | ")
+    pkc_unset_env("LWIP")
+
+// Two packages may need the same headers; the flag would have been given once, so this is once.
+@test("one name is answered once even when two packages ask for it")
+pkc_one_name_answered_once()
+    reset_search_paths()
+    pkc_set_env("PICO_SDK_PATH", "/opt/pico-sdk")
+
+    var both = pkc_needs(pkc_pico())
+
+    both.push(pkc_pico("github.com/sysl-lang/pico2"))
+    assert_eq(pkc_answered(both), "pico_sdk | -I/opt/pico-sdk")
+    pkc_unset_env("PICO_SDK_PATH")
+
+// -- the refusal a consumer is shown ---------------------------------------------------------------
+
+// Where the package named a variable, setting it is done once and answers every build in that tree,
+// while the flag is typed every time -- so the variable is named first, and the flag still named.
+@test("names the variable, and the flag as well")
+pkc_names_the_variable_and_the_flag()
+    reset_search_paths()
+    assert_eq(unmet_headers(pkc_needs(pkc_pico())).unwrap_or("nothing refused"),
+              "this project needs the 'pico_sdk' headers and nothing supplied them — the pico-sdk's " +
+              "headers. Set PICO_SDK_PATH, which is where this package's own ecosystem looks for it, " +
+              "or say where they are with '--include-path pico_sdk=<dir>'")
+
+@test("and where none was named it is the message it always was")
+pkc_the_message_it_always_was()
+    reset_search_paths()
+    assert_eq(unmet_headers(pkc_needs(pkc_plain())).unwrap_or("nothing refused"),
+              "this project needs the 'lwip' headers and nothing supplied them — lwIP's headers. Say " +
+              "where they are with '--include-path lwip=<dir>'")
+
+@test("nothing is refused once the name is supplied, whichever answered it")
+pkc_nothing_refused_once_supplied()
+    reset_search_paths()
+    add_include_path("pico_sdk=/opt/pico-sdk")
+    assert(unmet_headers(pkc_needs(pkc_pico())).is_none(), "refused a supplied name")
+    reset_search_paths()

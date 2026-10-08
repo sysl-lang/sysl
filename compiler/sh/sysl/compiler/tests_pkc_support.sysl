@@ -1,0 +1,144 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as pkc_env}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, join, Search}
+
+// What the `pkc_` ports share: the reference's `LinkDirectiveTests`, `PkgConfigTests`,
+// `NativeSourceTests`, `HeaderEnvTests`, `PackageExamplesTests` and `LayoutCheckTests`. Each builds a
+// project on disk and asks the command line about it in-process, the way a user would.
+
+// Whether a whole program can be built here: the standard module's source, and a clang.
+pkc_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end pkc_ready
+
+// A project on disk, from a flat list of `path, text` pairs. Nothing writes a manifest unless the
+// list names one.
+pkc_tree(prefix: string, files: []string) -> string
+    val root = make_temp_dir(prefix).unwrap()
+    var i: usize = 0
+
+    while i + 1 < files.len
+        files[i].last_index_of("/") match
+            Some(k) -> make_dir_all(s"$root/${files[i][0..<k]}").unwrap()
+            None -> ()
+
+        write_text(s"$root/${files[i]}", files[i + 1]).unwrap()
+        i += 2
+
+    root
+end pkc_tree
+
+// What one command line came to: its status and every line it said.
+pkc_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end pkc_cli
+
+// **What the program PRINTS** once `sysl build` has made it, or what the build said instead. The
+// executable goes to a directory of its own, outside the tree the build walked.
+pkc_ran(path: string, extra: []string = []) -> string
+    val out = make_temp_dir("sysl-pkc-out").unwrap()
+    val exe = s"$out/prog"
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("build")
+    args.push(path)
+    args.push("-o")
+    args.push(exe)
+
+    for i in 0..<extra.len
+        args.push(extra[i])
+
+    val built = pkc_cli(args.view())
+
+    if built.0 != 0
+        remove_dir_all(out).unwrap_or(())
+        return s"build failed: ${built.1}"
+
+    val said = capture(exe, [], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> "the program could not be run"
+
+    remove_dir_all(out).unwrap_or(())
+    said
+end pkc_ran
+
+// -- the environment, set in this test's own process -----------------------------------------------
+
+// `sysl.env` sets nothing, so a case that has to change what a child sees -- the `PATH` a fake
+// `pkg-config` is found on, a variable a header requirement names -- sets it through libc. Every
+// test runs in a process of its own, so nothing leaks into the next.
+private extern "setenv" pkc_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" pkc_c_unsetenv(name: *u8) -> int
+
+pkc_set_env(name: string, value: string)
+    val n = cstring(name)
+    val v = cstring(value)
+
+    pkc_c_setenv(n.ptr, v.ptr, 1)
+end pkc_set_env
+
+pkc_unset_env(name: string)
+    val n = cstring(name)
+
+    pkc_c_unsetenv(n.ptr)
+end pkc_unset_env
+
+// A `pkg-config` that knows exactly one module, `pkcfake`, answering `--cflags` and `--libs` with the
+// text given, put first on `PATH`. **No case asks the machine's own tool**, so none depends on what
+// happens to be installed. The answer is the directory holding it, removed by `pkc_drop_tool`.
+pkc_fake_tool(cflags: string, libs: string) -> string
+    val dir = make_temp_dir("sysl-pkc-tool").unwrap()
+
+    write_text(s"$dir/pkg-config", "#!/bin/sh\n" +
+        "case \"$1\" in --version) echo 0.29.2; exit 0 ;; esac\n" +
+        "for a in \"$@\"; do last=\"$a\"; done\n" +
+        "[ \"$last\" = pkcfake ] || exit 1\n" +
+        "case \"$1\" in\n" +
+        "--exists) exit 0 ;;\n" +
+        s"--cflags) echo \"$cflags\" ;;\n" +
+        s"--libs) echo \"$libs\" ;;\n" +
+        "esac\n" +
+        "exit 0\n").unwrap()
+
+    assert(capture("chmod", ["+x", s"$dir/pkg-config"]).unwrap().status.ok(), "chmod failed")
+
+    val old = pkc_env("PATH").unwrap_or("/usr/bin:/bin")
+
+    pkc_set_env("PKC_OLD_PATH", old)
+    pkc_set_env("PATH", s"$dir:$old")
+    dir
+end pkc_fake_tool
+
+pkc_drop_tool(dir: string)
+    pkc_env("PKC_OLD_PATH") match
+        Some(old) -> pkc_set_env("PATH", old)
+        None -> ()
+
+    remove_dir_all(dir).unwrap_or(())
+end pkc_drop_tool
+
+// Whether a text holds every one of the pieces, in order of no importance.
+pkc_holds(text: string, pieces: []string) -> bool
+    for i in 0..<pieces.len
+        if !text.contains(pieces[i]) then return false
+
+    true
+end pkc_holds
