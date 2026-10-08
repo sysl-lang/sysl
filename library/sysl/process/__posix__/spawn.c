@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -31,7 +32,6 @@
     (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29)))
 #define SYSL_PROC_SPAWNS 1
 #include <spawn.h>
-#include <string.h>
 #if defined(__APPLE__)
 #include <crt_externs.h>
 #else
@@ -221,94 +221,6 @@ static int stop(pid_t pid, int *status) {
     return wait_out(pid, status);
 }
 
-/* Start `program` and answer which child it became, without waiting for it.
- *
- * Returns 0 having set `*pid_out` and `*started_ms`, or an `errno` if the child could not be
- * started at all -- in which case there is no child left over: the one that failed to exec has
- * already been reaped here, so a caller has nothing to wait for and nothing to clean up.
- *
- * `*started_ms` is the monotonic clock at the fork, which is what a timeout is measured from, so
- * that a bound covers the child's whole life rather than only the part after somebody began waiting.
- *
- * **The pipe is how a failed `execvp` is told from a program that ran and exited 127**, which is
- * the distinction a caller most wants and the one `system(3)` cannot make. It is close-on-exec, so
- * a successful exec closes it and the parent's read sees end-of-file; a failure writes the `errno`
- * into it first. Without this, a missing program and a program whose own exit status is 127 are the
- * same answer -- and "no such file or directory" is the single most likely thing to go wrong when a
- * tool shells out.
- */
-__attribute__((unused))
-static int start_forked(const char *program, char *const *argv,
-                        const char *const *env_names, const char *const *env_values,
-                        const char *dir, const char *out_path, const char *err_path,
-                        int *pid_out, long long *started_ms) {
-    int report[2];
-
-    if (pipe(report) != 0) return errno;
-
-    if (fcntl(report[1], F_SETFD, FD_CLOEXEC) != 0) {
-        int e = errno;
-
-        close(report[0]);
-        close(report[1]);
-        return e;
-    }
-
-    pid_t pid = fork();
-
-    /* The clock starts here, so the timeout covers the child's whole life rather than only the
-     * part of it after the exec. */
-    long long started_at = now_ms();
-
-    if (pid < 0) {
-        int e = errno;
-
-        close(report[0]);
-        close(report[1]);
-        return e;
-    }
-
-    if (pid == 0) {
-        close(report[0]);
-
-        int e = child_setup(env_names, env_values, dir, out_path, err_path);
-
-        if (e == 0) {
-            execvp(program, argv);
-            e = errno;
-        }
-
-        /* The parent is about to learn why from the pipe; the status is the shell's convention for
-         * a command that could not be run, and is what a caller sees if the write is lost. */
-        ssize_t ignored = write(report[1], &e, sizeof e);
-
-        (void) ignored;
-        _exit(127);
-    }
-
-    close(report[1]);
-
-    int child_errno = 0;
-    ssize_t got = read(report[0], &child_errno, sizeof child_errno);
-
-    close(report[0]);
-
-    if (got == (ssize_t) sizeof child_errno && child_errno != 0) {
-        /* The child wrote why and is exiting straight after, so this wait is short; reaping it
-         * here is what makes "could not be started" leave nothing behind for anybody to wait on. */
-        int status = 0;
-
-        (void) wait_out(pid, &status);
-        return child_errno;
-    }
-
-    *pid_out = (int) pid;
-    *started_ms = started_at;
-    return 0;
-}
-
-#if SYSL_PROC_SPAWNS
-
 /* Whether `entry` (`NAME=value`) sets the variable `name`. */
 static int sets(const char *entry, const char *name) {
     size_t n = strlen(name);
@@ -316,21 +228,25 @@ static int sets(const char *entry, const char *name) {
     return strncmp(entry, name, n) == 0 && entry[n] == '=';
 }
 
-/* The environment a child is handed: this process's own, with each named variable added or
- * replaced -- what `setenv` in the child did on the `fork` path, the last of two equal names winning
- * as the second `setenv` would. Answers NULL when nothing is named, meaning "this one, unchanged";
- * `*made` collects what was allocated, for `release_environment`. */
-static char **child_environment(const char *const *names, const char *const *values,
+/* The environment a child is handed. Inheriting, it is this process's own with each named variable
+ * added or replaced -- what `setenv` in the child did on the `fork` path, the last of two equal
+ * names winning as the second `setenv` would -- and NULL when nothing is named, meaning "this one,
+ * unchanged". Not inheriting, it is the named variables and nothing else, and never NULL: an empty
+ * list is an environment with nothing in it, which is a different answer from "this one". `*made`
+ * collects what was allocated, for `release_environment`. */
+static char **child_environment(const char *const *names, const char *const *values, int inherit,
                                 char **current, char ***made, int *err) {
     *made = NULL;
 
-    if (!names || !values || !names[0]) return NULL;
+    int none = !names || !values || !names[0];
+
+    if (inherit && none) return NULL;
 
     size_t have = 0;
     size_t named = 0;
 
-    while (current && current[have]) have++;
-    while (names[named]) named++;
+    while (inherit && current && current[have]) have++;
+    while (!none && names[named]) named++;
 
     char **env = calloc(have + named + 1, sizeof *env);
     char **owned = calloc(named + 1, sizeof *owned);
@@ -385,7 +301,8 @@ static char **child_environment(const char *const *names, const char *const *val
  * `errno`: ENOENT where nothing on it is called that, EACCES where something is and may not be run.
  *
  * `posix_spawnp` searches the parent's `PATH`, while `execvp` after a `setenv` searched the child's,
- * so a caller setting `PATH` is asking for this search -- and is only reached then. */
+ * so a caller setting `PATH`, or replacing the environment, is asking for this search -- and is only
+ * reached then. */
 static int found_on(const char *program, const char *dirs, char *buf, size_t n) {
     int refused = 0;
     const char *at = dirs;
@@ -419,6 +336,164 @@ static void release_environment(char **env, char **made) {
     free(env);
 }
 
+/* The directories a bare program name is looked for in when the parent's own search will not do,
+ * or NULL when it will.
+ *
+ * A `PATH` the caller named is the child's, so it is searched -- the last one, as the last `setenv`
+ * would have left it. **Replacing the environment without naming one leaves the child with no
+ * `PATH` at all**, and then the program is looked for on the system's default search path,
+ * `confstr(_CS_PATH)` -- where `execvp` itself looks when a process has no `PATH`, and what libuv,
+ * Python's `subprocess` and Rust's `Command` all do with a replaced environment. Never the parent's
+ * `PATH`: the caller asked for a child that inherits nothing, and where its program comes from is
+ * part of what it inherits. */
+static const char *search_dirs(const char *const *names, const char *const *values, int inherit,
+                               char *buf, size_t n) {
+    const char *named = NULL;
+
+    for (size_t i = 0; names && values && names[i]; i++) {
+        if (strcmp(names[i], "PATH") == 0) named = values[i];
+    }
+
+    if (named || inherit) return named;
+
+    size_t need = confstr(_CS_PATH, buf, n);
+
+    if (need == 0 || need > n) snprintf(buf, n, "%s", "/usr/bin:/bin");
+
+    return buf;
+}
+
+/* Start `program` and answer which child it became, without waiting for it.
+ *
+ * Returns 0 having set `*pid_out` and `*started_ms`, or an `errno` if the child could not be
+ * started at all -- in which case there is no child left over: the one that failed to exec has
+ * already been reaped here, so a caller has nothing to wait for and nothing to clean up.
+ *
+ * `*started_ms` is the monotonic clock at the fork, which is what a timeout is measured from, so
+ * that a bound covers the child's whole life rather than only the part after somebody began waiting.
+ *
+ * **The pipe is how a failed `execvp` is told from a program that ran and exited 127**, which is
+ * the distinction a caller most wants and the one `system(3)` cannot make. It is close-on-exec, so
+ * a successful exec closes it and the parent's read sees end-of-file; a failure writes the `errno`
+ * into it first. Without this, a missing program and a program whose own exit status is 127 are the
+ * same answer -- and "no such file or directory" is the single most likely thing to go wrong when a
+ * tool shells out.
+ *
+ * **A replaced environment is built here, in the parent, and handed to `execve` whole** -- the
+ * child may not allocate, and `setenv` can only add. The program is looked for here too, on the
+ * directories `search_dirs` names, so a program that is not there is answered before anything is
+ * forked, exactly as `posix_spawn` answers it on the other path.
+ */
+__attribute__((unused))
+static int start_forked(const char *program, char *const *argv,
+                        const char *const *env_names, const char *const *env_values, int inherit,
+                        const char *dir, const char *out_path, const char *err_path,
+                        int *pid_out, long long *started_ms) {
+    char **env = NULL;
+    char **made = NULL;
+    char where[4096];
+    const char *run = program;
+
+    if (!inherit) {
+        int err = 0;
+
+        env = child_environment(env_names, env_values, 0, NULL, &made, &err);
+
+        if (err != 0) return err;
+
+        char dirs[1024];
+
+        if (!strchr(program, '/')) {
+            int e = found_on(program, search_dirs(env_names, env_values, 0, dirs, sizeof dirs),
+                             where, sizeof where);
+
+            if (e != 0) {
+                release_environment(env, made);
+                return e;
+            }
+
+            run = where;
+        }
+    }
+
+    int report[2];
+
+    if (pipe(report) != 0) {
+        int e = errno;
+
+        release_environment(env, made);
+        return e;
+    }
+
+    if (fcntl(report[1], F_SETFD, FD_CLOEXEC) != 0) {
+        int e = errno;
+
+        close(report[0]);
+        close(report[1]);
+        release_environment(env, made);
+        return e;
+    }
+
+    pid_t pid = fork();
+
+    /* The clock starts here, so the timeout covers the child's whole life rather than only the
+     * part of it after the exec. */
+    long long started_at = now_ms();
+
+    if (pid < 0) {
+        int e = errno;
+
+        close(report[0]);
+        close(report[1]);
+        release_environment(env, made);
+        return e;
+    }
+
+    if (pid == 0) {
+        close(report[0]);
+
+        int e = inherit ? child_setup(env_names, env_values, dir, out_path, err_path)
+                        : child_setup(NULL, NULL, dir, out_path, err_path);
+
+        if (e == 0) {
+            if (inherit) execvp(program, argv);
+            else execve(run, argv, env);
+
+            e = errno;
+        }
+
+        /* The parent is about to learn why from the pipe; the status is the shell's convention for
+         * a command that could not be run, and is what a caller sees if the write is lost. */
+        ssize_t ignored = write(report[1], &e, sizeof e);
+
+        (void) ignored;
+        _exit(127);
+    }
+
+    close(report[1]);
+    release_environment(env, made);
+
+    int child_errno = 0;
+    ssize_t got = read(report[0], &child_errno, sizeof child_errno);
+
+    close(report[0]);
+
+    if (got == (ssize_t) sizeof child_errno && child_errno != 0) {
+        /* The child wrote why and is exiting straight after, so this wait is short; reaping it
+         * here is what makes "could not be started" leave nothing behind for anybody to wait on. */
+        int status = 0;
+
+        (void) wait_out(pid, &status);
+        return child_errno;
+    }
+
+    *pid_out = (int) pid;
+    *started_ms = started_at;
+    return 0;
+}
+
+#if SYSL_PROC_SPAWNS
+
 /* The same child `start_forked` makes, made by `posix_spawnp`.
  *
  * **`fork` copies the parent's address space, and what that costs grows with the parent's heap.**
@@ -429,11 +504,12 @@ static void release_environment(char **env, char **made) {
  * whatever the parent holds.
  *
  * What the child is handed is what the `fork` path gave it, in the same order: the environment with
- * the named variables added or replaced, then the directory, then each stream opened onto its file.
- * A program that cannot be run is the `errno` `posix_spawnp` answers, so there is nothing to reap.
+ * the named variables added or replaced (or, not inheriting, the named variables alone), then the
+ * directory, then each stream opened onto its file. A program that cannot be run is the `errno`
+ * `posix_spawnp` answers, so there is nothing to reap.
  */
 static int start_spawned(const char *program, char *const *argv,
-                         const char *const *env_names, const char *const *env_values,
+                         const char *const *env_names, const char *const *env_values, int inherit,
                          const char *dir, const char *out_path, const char *err_path,
                          int *pid_out, long long *started_ms) {
 #if defined(__APPLE__)
@@ -443,7 +519,7 @@ static int start_spawned(const char *program, char *const *argv,
 #endif
     char **made = NULL;
     int err = 0;
-    char **env = child_environment(env_names, env_values, current, &made, &err);
+    char **env = child_environment(env_names, env_values, inherit, current, &made, &err);
 
     if (err != 0) return err;
 
@@ -471,11 +547,8 @@ static int start_spawned(const char *program, char *const *argv,
         e = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, err_path, opened, 0600);
 
     pid_t pid = 0;
-    const char *child_path = NULL;
-
-    for (size_t i = 0; env_names && env_values && env_names[i]; i++) {
-        if (strcmp(env_names[i], "PATH") == 0) child_path = env_values[i];
-    }
+    char dirs[1024];
+    const char *child_path = search_dirs(env_names, env_values, inherit, dirs, sizeof dirs);
 
     if (e == 0 && child_path && !strchr(program, '/')) {
         char where[4096];
@@ -502,7 +575,7 @@ static int start_spawned(const char *program, char *const *argv,
 #endif
 
 int sysl_proc_start(const char *program, char *const *argv,
-                    const char *const *env_names, const char *const *env_values,
+                    const char *const *env_names, const char *const *env_values, int inherit,
                     const char *dir, const char *out_path, const char *err_path,
                     int *pid_out, long long *started_ms) {
     /* **Everything this program has written, written, before anything else can write.**
@@ -525,11 +598,11 @@ int sysl_proc_start(const char *program, char *const *argv,
     fflush(NULL);
 
 #if SYSL_PROC_SPAWNS
-    return start_spawned(program, argv, env_names, env_values, dir, out_path, err_path, pid_out,
-                         started_ms);
+    return start_spawned(program, argv, env_names, env_values, inherit, dir, out_path, err_path,
+                         pid_out, started_ms);
 #else
-    return start_forked(program, argv, env_names, env_values, dir, out_path, err_path, pid_out,
-                        started_ms);
+    return start_forked(program, argv, env_names, env_values, inherit, dir, out_path, err_path,
+                        pid_out, started_ms);
 #endif
 }
 
