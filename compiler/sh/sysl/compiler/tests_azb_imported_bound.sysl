@@ -1,0 +1,230 @@
+module sh.sysl.compiler
+@tests
+
+// A type parameter bounded by a trait from ANOTHER module, however the bound spells it
+// (`reference/modules.md § Imports`, `reference/generics.md § Bounds`). An `import` shortens a
+// reference and changes nothing else, so a bound written with the short name asks what the qualified
+// one asks -- and a bound written in another file is read in that file's terms.
+
+private val azb_num_text: string = raw"""
+    module num
+
+    trait Scale
+        double(self) -> Self
+
+    impl Scale for int
+        double(self) -> int = self * 2
+    """
+
+private val azb_wrap_text: string = raw"""
+    module wrap
+
+    import num.Scale
+
+    struct Box[T]
+        v: T
+    end Box
+
+    impl[T: Scale] Add for Box[T]
+        add(self, rhs: Box[T]) -> Box[T] = Box(self.v.double())
+    """
+
+// The program beside `num`.
+private azb_with_num(text: string) -> [](string, string, string) =
+    [("", "main.sysl", text), ("num", "n.sysl", azb_num_text)]
+
+// The program beside `wrap` and `num`.
+private azb_with_wrap(text: string) -> [](string, string, string) =
+    [("", "main.sysl", text), ("wrap", "w.sysl", azb_wrap_text), ("num", "n.sysl", azb_num_text)]
+
+@test("bounds a struct's parameter")
+azb_ibd_a_structs_parameter()
+    if !azb_ready() then return
+
+    azb_prints(azb_with_num(raw"""
+        import num.Scale
+
+        struct Box[T: Scale]
+            v: T
+        end Box
+
+        var b = Box(21)
+
+        print(b.v.double())
+        """), "42\n")
+
+@test("bounds a function's parameter")
+azb_ibd_a_functions_parameter()
+    if !azb_ready() then return
+
+    azb_prints(azb_with_num(raw"""
+        import num.Scale
+
+        twice[T: Scale](x: T) -> T = x.double()
+
+        print(twice(21))
+        """), "42\n")
+
+@test("bounds an enum's parameter")
+azb_ibd_an_enums_parameter()
+    if !azb_ready() then return
+
+    azb_prints(azb_with_num(raw"""
+        import num.Scale
+
+        enum Maybe[T: Scale]
+            Nothing
+            Just(v: T)
+        end Maybe
+
+        var m: Maybe[int] = Maybe.Just(21)
+
+        m match
+            Nothing -> print(0)
+            Just(v) -> print(v.double())
+        """), "42\n")
+
+@test("bounds an 'impl' block's parameter, which is a conditional conformance")
+azb_ibd_an_impl_blocks_parameter()
+    if !azb_ready() then return
+
+    azb_prints(azb_with_num(raw"""
+        import num.Scale
+
+        struct Box[T]
+            v: T
+        end Box
+
+        impl[T: Scale] Scale for Box[T]
+            double(self) -> Box[T] = Box(self.v.double())
+
+        print(Box(21).double().v)
+        """), "42\n")
+
+@test("asks the same thing the qualified spelling asks")
+azb_ibd_short_and_qualified_agree()
+    if !azb_ready() then return
+
+    azb_prints(azb_with_num(raw"""
+        import num.Scale
+
+        struct Short[T: Scale]
+            v: T
+        end Short
+
+        struct Long[T: num.Scale]
+            v: T
+        end Long
+
+        pass[T: Scale](x: Long[T]) -> T = x.v.double()
+
+        print(Short(3).v, pass(Long(21)))
+        """), "3 42\n")
+
+// The bound is met and the type built; reaching the member is the separate question of scope.
+@test("bounds a struct's parameter with no import at all")
+azb_ibd_a_path_with_no_import()
+    if !azb_ready() then return
+
+    azb_prints(azb_with_num(raw"""
+        struct Box[T: num.Scale]
+            v: T
+        end Box
+
+        var b = Box(21)
+
+        print(b.v)
+        """), "21\n")
+
+// A trait's own parameters are read in the file that declared the trait.
+@test("carries the bound into the types its members name")
+azb_ibd_a_traits_own_parameter()
+    if !azb_ready() then return
+
+    azb_prints(azb_with_num(raw"""
+        import num.Scale
+
+        struct Box[T: Scale]
+            v: T
+        end Box
+
+        trait Holder[T: Scale]
+            take(self, b: Box[T]) -> T
+
+        struct Keep
+            n: int
+        end Keep
+
+        impl Holder[int] for Keep
+            take(self, b: Box[int]) -> int = b.v.double() + self.n
+
+        print(Keep(1).take(Box(20)))
+        """), "41\n")
+
+// A conditional conformance is a condition the BLOCK wrote, asked wherever the trait is used.
+@test("is conformed to from a module that imported neither the trait nor the bound's")
+azb_ibd_a_conditional_impl_read_in_its_own_terms()
+    if !azb_ready() then return
+
+    azb_prints(azb_with_wrap("import wrap.Box\n\nprint((Box(21) + Box(0)).v)\n"), "42\n")
+
+@test("and still refuses an argument that does not meet it, naming the trait it asked for")
+azb_ibd_a_conditional_impl_refuses_by_its_own_name()
+    if !azb_ready() then return
+
+    azb_refused(azb_with_wrap(raw"""
+        import wrap.Box
+
+        struct Tag
+            n: int
+        end Tag
+
+        print((Box(Tag(1)) + Box(Tag(2))).v.n)
+        """), ["asks 'num.Scale' of Tag"])
+
+// Each link of a chain of requirements is read in the file that wrote it.
+@test("is reached from a trait two modules away")
+azb_ibd_a_required_trait_two_modules_away()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+                    import mid.Mid
+
+                    trait Top: mid.Mid
+                        top(self) -> int
+
+                    impl Top for int
+                        top(self) -> int = self.mid() + 1
+
+                    print(20.top())
+                    """),
+                ("mid", "m.sysl", raw"""
+                    module mid
+
+                    import num.Scale
+
+                    trait Mid: Scale
+                        mid(self) -> int
+
+                    impl Mid for int
+                        mid(self) -> int = self.double()
+                    """),
+                ("num", "n.sysl", azb_num_text)], "41\n")
+
+@test("a type argument that does not implement the imported trait is still refused")
+azb_ibd_an_argument_that_does_not_implement_it()
+    if !azb_ready() then return
+
+    azb_refused(azb_with_num(raw"""
+        import num.Scale
+
+        struct Box[T: Scale]
+            v: T
+        end Box
+
+        struct Tag
+            n: int
+        end Tag
+
+        var b = Box(Tag(1))
+        """), ["'Box' requires its type parameter 'T' to implement 'num.Scale'"])

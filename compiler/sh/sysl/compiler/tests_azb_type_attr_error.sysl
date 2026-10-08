@@ -1,0 +1,86 @@
+module sh.sysl.compiler
+@tests
+
+// A misused type attribute (`reference/errors.md § What the type's own name offers: :: attributes`):
+// an unknown one, one needing a range on a type that has none, the wrong arity, `::` on something that
+// is not a type, `Range` outside a `for`, and what a derived subtype's steps take. The quoted words are
+// the reference's; its caret is an anchor where this compiler's is the extent, so only the words are
+// compared.
+
+private val azb_age: string = "type Age = int within 0..150\n"
+private val azb_slot: string = "type Slot = new u8 within 0..<8\n"
+
+@test("an unknown attribute is rejected")
+azb_tae_unknown_attribute()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(azb_age + "print(Age::Middle)\n"), ["has no attribute 'Middle'"])
+
+@test("an attribute needing a range on a predicate-only type is rejected")
+azb_tae_needs_a_range()
+    if !azb_ready() then return
+
+    azb_refused(azb_main("type Even = int where value % 2 == 0\nprint(Even::First)\n"),
+                ["needs a 'within' range"])
+
+// A predicate narrows the type without saying to what, so a bound read off the base would be a value
+// the produce site traps on.
+@test("and so is a bound on a predicate-only type, which narrows without saying where to")
+azb_tae_bound_on_a_predicate()
+    if !azb_ready() then return
+
+    azb_refused(azb_main("type Small = int where value < 10\nprint(Small::Max)\n"),
+                ["needs a 'within' range"])
+
+@test("First takes no arguments")
+azb_tae_first_takes_none()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(azb_age + "print(Age::First(1))\n"), ["takes no arguments"])
+
+@test("Succ takes exactly one")
+azb_tae_succ_takes_one()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(azb_age + "print(Age::Succ())\n"), ["takes exactly one argument"])
+
+@test("`::` on something that is not a type is rejected")
+azb_tae_not_a_type()
+    if !azb_ready() then return
+
+    azb_refused(azb_main("var x = 3\nprint(x::First)\n"), ["left side must be a type name"])
+
+@test("Range outside a for loop is rejected")
+azb_tae_range_outside_a_for()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(azb_age + "print(Age::Range)\n"),
+                ["only meaningful as the iterable of a 'for' loop"])
+
+// A derived subtype is nominally distinct from its base, and its steps are typed as the subtype, so
+// the base is what a step refuses; `Valid` keeps the base and refuses the subtype.
+@test("Succ wants the subtype")
+azb_tae_succ_wants_the_subtype()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(azb_slot + "print(Slot::Succ(3u8))\n"), ["'Slot::Succ' takes a Slot, not byte"])
+
+@test("Pred wants the subtype")
+azb_tae_pred_wants_the_subtype()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(azb_slot + "print(Slot::Pred(3u8))\n"), ["'Slot::Pred' takes a Slot, not byte"])
+
+@test("and Valid, alone, wants the base")
+azb_tae_valid_wants_the_base()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(azb_slot + "print(Slot::Valid(Slot(3u8)))\n"),
+                ["'Slot::Valid' takes a byte, not Slot"])
+
+@test("a subtype over a non-integer base has no attributes, and the message names the base")
+azb_tae_a_non_integer_base()
+    if !azb_ready() then return
+
+    azb_refused(azb_main("type Meters = new f64\nprint(Meters::First)\n"),
+                ["needs an integer subtype, not real"])

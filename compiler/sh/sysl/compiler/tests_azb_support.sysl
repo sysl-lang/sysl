@@ -1,0 +1,217 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The helpers every `azb_` file shares -- the ports of eight analyzer suites, each of which asks a
+// whole program a question: what it prints, what it is refused with, what its IR holds, or what an
+// analysis for a machine with no heap says. **Every claim made here is made of this compiler and,
+// where `SYSL_ORACLE` names the reference, of that one too**, so each expectation is the reference's
+// own output rather than a transcription of it.
+//
+// A program is a list of `(directory, file, text)` -- the reference suites' `runIn` shape -- laid
+// down at a fresh root and built as a directory, so a module in `num/n.sysl` is the program's own.
+
+azb_ready() -> bool = rng_ready()
+
+// This compiler, and the reference where there is one.
+azb_compilers() -> Buf[Option[string]]
+    var out: Buf[Option[string]] = buf()
+
+    out.push(None)
+
+    env_var("SYSL_ORACLE") match
+        Some(bin) -> out.push(Some(bin))
+        None -> ()
+
+    out
+end azb_compilers
+
+azb_who(reference: Option[string]) -> string = rng_label(reference)
+
+// The files laid down at a fresh root, which is answered.
+azb_tree(files: [](string, string, string)) -> string
+    val root = absolute_path(make_temp_dir("sysl-azb").unwrap())
+
+    for i in 0..<files.len
+        val dir = if files[i].0.is_empty() then root else s"$root/${files[i].0}"
+
+        make_dir_all(dir).unwrap()
+        write_text(s"$dir/${files[i].1}", files[i].2).unwrap()
+
+    root
+end azb_tree
+
+// Builds the project at `root` with these source roots, by this compiler or by the reference, and
+// answers the executable -- or what was said instead of making it.
+azb_build(root: string, libs: []string, reference: Option[string]) -> Result[string, string]
+    reference match
+        None ->
+            val exe = s"$root/built-here"
+
+            reset_feature_request()
+            reset_search_paths()
+
+            for l in libs
+                add_lib_root(l)
+
+            val made = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+            reset_search_paths()
+
+            made match
+                Err(why) -> Err(failure_text(why))
+                Ok(_) -> Ok(exe)
+        Some(bin) ->
+            val exe = s"$root/built-there"
+            var args: Buf[string] = buf()
+
+            args.push("build")
+            args.push(root)
+
+            for l in libs
+                args.push("--lib")
+                args.push(l)
+
+            args.push("-o")
+            args.push(exe)
+
+            val said = capture_oracle(bin, args.view())
+
+            if metadata(exe).is_err()
+                return Err(said match
+                    Err(_) -> "the reference could not be run"
+                    Ok(o) -> o.err.unwrap_or(o.text))
+
+            Ok(exe)
+end azb_build
+
+// What the program at `root` printed under one compiler, or why there is nothing to read.
+azb_output(root: string, libs: []string, reference: Option[string]) -> Result[string, string]
+    azb_build(root, libs, reference) match
+        Err(why) -> Err(s"it did not build: $why")
+        Ok(exe) ->
+            capture(exe, [], "", [], true) match
+                Err(_) -> Err("the program that was built could not be run")
+                Ok(o) -> if o.status.ok() then Ok(o.text) else Err(s"it exited badly: ${o.text}")
+
+// The files build and print `want`, here and under the reference.
+azb_prints_with(files: [](string, string, string), libs: []string, want: string)
+    val cs = azb_compilers()
+
+    for i in 0..<cs.len()
+        val root = azb_tree(files)
+
+        azb_output(root, libs, cs.at(i)) match
+            Err(why) -> assert(false, s"${azb_who(cs.at(i))}: $why")
+            Ok(said) -> assert_eq(said, want, azb_who(cs.at(i)))
+
+        remove_dir_all(root).unwrap_or(())
+end azb_prints_with
+
+azb_prints(files: [](string, string, string), want: string) = azb_prints_with(files, [], want)
+
+// One program file and nothing beside it.
+azb_main(text: string) -> [](string, string, string) = [("", "main.sysl", text)]
+
+// What a refused build said under one compiler, or a note that it built.
+azb_refusal(files: [](string, string, string), reference: Option[string]) -> string
+    val root = azb_tree(files)
+    val said = azb_build(root, [], reference) match
+        Err(why) -> why
+        Ok(_) -> "<it built>"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end azb_refusal
+
+// The files are refused, here and under the reference, with every one of `parts` in what was said
+// and none of `absent`.
+azb_refused_without(files: [](string, string, string), parts: []string, absent: []string)
+    val cs = azb_compilers()
+
+    for i in 0..<cs.len()
+        val said = azb_refusal(files, cs.at(i))
+        val who = azb_who(cs.at(i))
+
+        assert(said != "<it built>", s"$who: expected a refusal, and it built")
+
+        for p in parts
+            assert(said.contains(p), s"$who: expected '$p' in\n$said")
+
+        for p in absent
+            assert(!said.contains(p), s"$who: did not expect '$p' in\n$said")
+end azb_refused_without
+
+azb_refused(files: [](string, string, string), parts: []string) = azb_refused_without(files, parts, [])
+
+// The whole module text `emit-llvm` prints for one program, under one compiler.
+azb_ir(text: string, reference: Option[string]) -> string
+    val root = absolute_path(make_temp_dir("sysl-azb").unwrap())
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    val out = reference match
+        None -> emit_llvm_text(src, None) match
+            Err(why) -> s"refused: ${failure_text(why)}"
+            Ok(made) -> made.text
+        Some(bin) -> capture_oracle(bin, ["emit-llvm", src]) match
+            Err(_) -> "the reference could not be run"
+            Ok(o) -> o.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end azb_ir
+
+// -- a machine with capabilities taken away ---------------------------------------------------------
+
+private var azb_std_cache: Buf[Program] = buf()
+private var azb_std_read: bool = false
+
+private azb_std() -> Buf[Program]
+    if azb_std_read then return azb_std_cache
+
+    azb_std_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> azb_std_cache = units
+
+    azb_std_cache
+end azb_std
+
+// Everything an analysis of these files says for this machine with the named capabilities taken
+// away -- what a project whose `package.hocon` turned them off is told. Each line is `file: message`.
+azb_reported(lacking: []string, files: [](string, string)) -> string
+    var units: Buf[Program] = buf()
+    val std = azb_std()
+
+    for i in 0..<std.len()
+        units.push(std.at(i))
+
+    for i in 0..<files.len
+        units.push(parse(source_of(files[i].0, files[i].1)).program)
+
+    var lacks: Buf[string] = buf()
+
+    for i in 0..<lacking.len
+        lacks.push(lacking[i])
+
+    val done = analyze_bodies(units, host_target() with { lacks = lacks })
+    var out = ""
+
+    for i in 0..<done.reported.len()
+        val r = done.reported.at(i)
+
+        out = out + (if i > 0 then "\n" else "") + s"${r.src.name}: ${r.diag.message}"
+
+    out
+end azb_reported

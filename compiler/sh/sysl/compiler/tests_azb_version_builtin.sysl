@@ -1,0 +1,63 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.remove_dir_all
+import sysl.text.Search
+
+// The two `VersionBuiltinTests` cases `tests_ver_version.sysl` does not already answer: a `--lib`
+// source root's own manifest, and a default of `__VERSION__` beside a default of `__FILE__`. The rest of
+// the suite is mapped to the `ver_` tests. `__VERSION__` is the PACKAGE's version, never the
+// compiler's, so this tree's release stamp has no part in any of it.
+
+private azb_manifest(name: string, version: string, deps: string) -> string =
+    s"package { name = \"$name\", version = \"$version\" }\n" +
+    (if deps.is_empty() then "" else s"dependencies { $deps }\n")
+
+// A package called `name` at `version`, declaring one module, `verlib`, holding `text`.
+private azb_verlib(name: string, version: string, text: string) -> string =
+    azb_tree([("", "package.hocon", azb_manifest(name, version, "")),
+              ("verlib", "verlib.sysl", s"module verlib\n\n$text\n")])
+
+@test("a --lib source root with a manifest answers with that manifest's version")
+azb_ver_a_lib_root_answers_its_own_version()
+    if !azb_ready() then return
+
+    val cs = azb_compilers()
+
+    for i in 0..<cs.len()
+        val lib = azb_verlib("ver-lib", "7.8.9", "version() -> string = __VERSION__")
+        val root = azb_tree([("", "package.hocon", azb_manifest("app", "0.1.0", "")),
+                             ("", "main.sysl", "print(verlib.version())\n")])
+
+        azb_output(root, [lib], cs.at(i)) match
+            Err(why) -> assert(false, s"${azb_who(cs.at(i))}: $why")
+            Ok(said) -> assert_eq(said, "7.8.9\n", azb_who(cs.at(i)))
+
+        remove_dir_all(root).unwrap_or(())
+        remove_dir_all(lib).unwrap_or(())
+end azb_ver_a_lib_root_answers_its_own_version
+
+// A default stands where the argument would have been written, so `__FILE__` and `__VERSION__` in
+// one both answer for the caller.
+@test("a library's default of __VERSION__ is the caller's version, as __FILE__ there is the caller's file")
+azb_ver_a_default_answers_for_the_caller()
+    if !azb_ready() then return
+
+    val cs = azb_compilers()
+
+    for i in 0..<cs.len()
+        val lib = azb_verlib("ver-lib", "4.5.6",
+                             "stamp(v: string = __VERSION__, f: string = __FILE__) -> string = v + \" \" + f")
+        val root = azb_tree([("", "package.hocon", azb_manifest("app", "0.1.0", s"v { path = \"$lib\" }")),
+                             ("", "main.sysl", "print(verlib.stamp())\n")])
+        val who = azb_who(cs.at(i))
+
+        azb_output(root, [], cs.at(i)) match
+            Err(why) -> assert(false, s"$who: $why")
+            Ok(said) ->
+                assert(said.starts_with("0.1.0 "), s"$who: $said")
+                assert(said.contains("main.sysl"), s"$who: $said")
+
+        remove_dir_all(root).unwrap_or(())
+        remove_dir_all(lib).unwrap_or(())
+end azb_ver_a_default_answers_for_the_caller

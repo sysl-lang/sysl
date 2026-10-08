@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.text.Search
 
 // A module that gave the allocator up, and what that costs it.
 //
@@ -105,11 +106,12 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
     if !any then return
 
     var seeds: Buf[string] = buf()
+    val graph = with_abstract_callees(a, funcs)
 
-    for i in 0..<funcs.len()
-        if first_allocation(funcs.at(i).body).is_some() then seeds.push(funcs.at(i).name)
+    for i in 0..<graph.len()
+        if first_allocation(graph.at(i).body).is_some() then seeds.push(graph.at(i).name)
 
-    val walk = reaches_over(funcs, vtables, seeds)
+    val walk = reaches_over(graph, vtables, seeds)
 
     for i in 0..<funcs.len()
         val f = funcs.at(i)
@@ -127,8 +129,13 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         // generic that allocates is reported at *its* call, which is the line its author can change.
         if a.tables.members.func_origin.has(f.name) then continue
 
-        val module_name = module_of(f.name)
         val scope = func_home(a, f.name)
+
+        // **A trait's default is the trait module's conduct**, the same at every implementing type:
+        // the copy is lowered under the receiver's symbol, but its body was written beside the trait
+        // and is read in the trait's file, so that module's clause is the one it answers to.
+        val copied = a.tables.members.default_origin.has(f.name)
+        val module_name = if copied then scope.module_name else module_of(f.name)
 
         // **Asked of the FILE the declaration was written in, not of the emitted name.** An
         // instantiation is filed under a name of its own -- `sysl.crypto$streamed.Md5C` -- which is
@@ -191,6 +198,51 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         walk_texpr(v.init.unwrap(), TWalk(false, e -> blame_one(a, walk, scope, e, why, said),
                                           w -> blame_write(a, walk, scope, w, why, said), st -> ()))
 end check_no_alloc
+
+// The program's functions, and beside them every generic body a generic's own body calls at its
+// stand-ins, filed under the name that call wrote.
+//
+// **A call in a generic body to another generic leads to the body that was written**, exactly as a
+// call to a concrete function leads to its. The definition-time reading names an instantiation at the
+// caller's stand-ins (`lib$grow.U{U:sysl$Display}`) that the rewind took back out, so without these
+// a module could give the allocator up and reach one through a second generic, and the walk from its
+// body would arrive nowhere.
+private with_abstract_callees(a: &Analysis, funcs: Buf[TFunc]) -> Buf[TFunc]
+    var out: Buf[TFunc] = buf()
+
+    for i in 0..<funcs.len()
+        out.push(funcs.at(i))
+
+    var keys: Buf[(string, usize)] = buf()
+
+    for i in 0..<a.tables.abstracts.len()
+        val f = a.tables.abstracts.at(i)
+        val home = func_home(a, f.name).module_name
+        val key = if f.name.contains("$") then f.name else module_qualify(home, f.name)
+
+        keys.push((key + ".", i))
+
+    var named: Buf[string] = buf()
+
+    for i in 0..<a.tables.abstracts.len()
+        val calls = refs_of_block(a.tables.abstracts.at(i).body).calls
+
+        for j in 0..<calls.len()
+            val c = calls.at(j)
+
+            if holds_string(named, c) || !c.contains("{") then continue
+
+            for k in 0..<keys.len()
+                if c.starts_with(keys.at(k).0)
+                    var g = a.tables.abstracts.at(keys.at(k).1)
+
+                    g.name = c
+                    out.push(g)
+                    named.push(c)
+                    break
+
+    out
+end with_abstract_callees
 
 // The file a module's storage was declared in.
 private val_home(a: &Analysis, symbol: string) -> Scope
