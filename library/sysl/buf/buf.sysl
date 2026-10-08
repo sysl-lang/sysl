@@ -303,50 +303,50 @@ struct Buf[T]
      * as `&b.elems[i]` is. It is read-only as a field: the storage is replaced only by the buffer's
      * own growth, which is what keeps the count from passing it.
      */
-    elems -> []T = if stored(&self.core) then self.core.elems else []
+    elems -> []T = if stored(&*self.core) then self.core.elems else []
 
     /** How many elements there are -- `len()` under the name the field had. Read-only: the count is
      * the buffer's to move.
      */
     count -> usize = self.len()
 
-    len(self) -> usize = if stored(&self.core) then self.core.count else 0
+    len(self) -> usize = if stored(&*self.core) then self.core.count else 0
 
-    cap(self) -> usize = if stored(&self.core) then self.core.elems.len else 0
+    cap(self) -> usize = if stored(&*self.core) then self.core.elems.len else 0
 
     is_empty(self) -> bool = self.len() == 0
 
     at(self, i: usize) -> T
-        if !stored(&self.core) then past_end(i, 0)
+        if !stored(&*self.core) then past_end(i, 0)
         self.core.at(i)
 
     set(self, i: usize, v: T)
-        if !stored(&self.core) then past_end(i, 0)
+        if !stored(&*self.core) then past_end(i, 0)
         self.core.set(i, v)
 
     @inline
     push(self, v: T)
-        if !stored(&self.core) then unassigned("Buf", "buf()")
+        if !stored(&*self.core) then unassigned(BufUnassigned)
         self.core.push(v)
 
     extend(self, xs: []const T)
-        if !stored(&self.core) then unassigned("Buf", "buf()")
+        if !stored(&*self.core) then unassigned(BufUnassigned)
         self.core.extend(xs)
 
-    pop(self) -> Option[T] = if stored(&self.core) then self.core.pop() else None
+    pop(self) -> Option[T] = if stored(&*self.core) then self.core.pop() else None
 
     truncate(self, n: usize)
-        if stored(&self.core) then self.core.truncate(n)
+        if stored(&*self.core) then self.core.truncate(n)
 
     clear(self)
-        if stored(&self.core) then self.core.truncate(0)
+        if stored(&*self.core) then self.core.truncate(0)
 
     insert(self, i: usize, v: T)
-        if !stored(&self.core) then unassigned("Buf", "buf()")
+        if !stored(&*self.core) then unassigned(BufUnassigned)
         self.core.insert(i, v)
 
     remove(self, i: usize) -> T
-        if !stored(&self.core) then past_end(i, 0)
+        if !stored(&*self.core) then past_end(i, 0)
         self.core.remove(i)
 
     /** A second buffer holding the same elements, sized to them -- the one way to get a buffer that
@@ -362,7 +362,7 @@ struct Buf[T]
      * a view of the storage rather than a copy, so it is only valid while nothing pushes -- through
      * this name or any other for the same buffer.
      */
-    view(self) -> []T = if stored(&self.core) then self.core.view() else []
+    view(self) -> []T = if stored(&*self.core) then self.core.view() else []
 
     /** This name's share of the buffer given back, and the handle left naming nothing -- the state
      * zeroed storage starts in, where every reader answers as an empty buffer does. Nothing is
@@ -372,14 +372,20 @@ struct Buf[T]
     release(*self) = forget(self)
 end Buf
 
-/** Whether a counted handle names anything. One the language made always does; one read out of
- * storage the program zeroed itself -- a `calloc`ed block, a collector's arena -- names nothing until
- * it is assigned, and the containers answer as empty there rather than reading through it. The test
- * is on the handle's own word, because a reference has no spelling for "none" of its own.
+/** Whether a counted handle names anything, asked of the address its payload would have
+ * (`&*handle`). One the language made always names a box; one read out of storage the program zeroed
+ * itself -- a `calloc`ed block, a collector's arena -- names nothing until it is assigned, and the
+ * containers answer as empty there rather than reading through it.
+ *
+ * **The test is on the payload's address because that is the one thing a reference hands over
+ * without being taken a share of.** A reference has no spelling for "none", and asking for the
+ * address of the handle itself makes a by-value receiver a local whose share is taken on entry and
+ * given back on exit -- a retain and a release on every `push`. A payload sits just past its box's
+ * header, so a handle naming nothing puts it at the header's size: a number far below any address an
+ * allocation hands out, on every target here.
  */
-private[sysl] stored[T](r: *&T) -> bool
-    val word: *usize = ptr_cast(r)
-    *word != 0
+@inline
+private[sysl] stored[T](payload: *T) -> bool = usize(payload) >= 256
 
 /** The handle at `p` given back and left naming nothing, as zeroed storage does. The assignment is
  * what gives the share back -- releasing a handle that names nothing being nothing, which is what lets
@@ -390,11 +396,27 @@ private[sysl] forget[H](p: *H)
     val zero: *H = ptr_cast(&nothing[0])
     *p = *zero
 
-/** The report a container makes when it is asked to grow in storage nobody gave it. */
-private[sysl] unassigned(kind: string, maker: string) -> never
-    print(s"panic: this $kind was never given storage -- assign `$maker` to it first (a container in zeroed memory is empty until it is assigned)")
+/** The report a container makes when it is asked to grow in storage nobody gave it. Out of line and
+ * cold, and handed nothing, so the test a growing member carries for it is a compare and a branch the
+ * member's inlining budget hardly notices.
+ */
+@noinline
+@cold
+private[sysl] unassigned(kind: Unassigned) -> never
+    val (name, maker) = kind match
+        BufUnassigned -> ("Buf", "buf()")
+        DequeUnassigned -> ("Deque", "deque()")
+        MapUnassigned -> ("Map", "map()")
+
+    print(s"panic: this $name was never given storage -- assign `$maker` to it first (a container in zeroed memory is empty until it is assigned)")
     exit(1)
 end unassigned
+
+/** Which container `unassigned` is speaking for. */
+private[sysl] enum Unassigned
+    BufUnassigned
+    DequeUnassigned
+    MapUnassigned
 
 // The report an index past the end makes, out of line because of what a bounds-checked member costs
 // when it is not. Written inline, the report is a dozen calls in the middle of a two-instruction

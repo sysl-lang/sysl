@@ -1,6 +1,6 @@
 module sysl.container
 
-import sysl.buf.{stored, forget, unassigned}
+import sysl.buf.{stored, forget, unassigned, Unassigned}
 
 /** A sequence that grows and that is cheap to take from at **either** end.
  *
@@ -41,52 +41,52 @@ struct Deque[T]
     private core: &DequeCore[T]
 
     /** Where the first element sits in the storage. Read-only: the ring is the core's to move. */
-    head -> usize = if stored(&self.core) then self.core.head else 0
+    head -> usize = if stored(&*self.core) then self.core.head else 0
 
     /** How many elements there are -- `len()` under the name the field had. */
     count -> usize = self.len()
 
-    len(self) -> usize = if stored(&self.core) then self.core.count else 0
+    len(self) -> usize = if stored(&*self.core) then self.core.count else 0
 
-    cap(self) -> usize = if stored(&self.core) then self.core.elems.len else 0
+    cap(self) -> usize = if stored(&*self.core) then self.core.elems.len else 0
 
     is_empty(self) -> bool = self.len() == 0
 
     @inline
     at(self, i: usize) -> T
-        if !stored(&self.core) then past_end(i)
+        if !stored(&*self.core) then past_end(i)
         self.core.at(i)
 
     set(self, i: usize, v: T)
-        if !stored(&self.core) then past_end(i)
+        if !stored(&*self.core) then past_end(i)
         self.core.set(i, v)
 
-    first(self) -> Option[T] = if stored(&self.core) then self.core.first() else None
+    first(self) -> Option[T] = if stored(&*self.core) then self.core.first() else None
 
-    last(self) -> Option[T] = if stored(&self.core) then self.core.last() else None
+    last(self) -> Option[T] = if stored(&*self.core) then self.core.last() else None
 
     @inline
     push_back(self, v: T)
-        if !stored(&self.core) then unassigned("Deque", "deque()")
+        if !stored(&*self.core) then unassigned(Unassigned.DequeUnassigned)
         self.core.push_back(v)
 
     /** The end `Buf` has no answer for at all. */
     @inline
     push_front(self, v: T)
-        if !stored(&self.core) then unassigned("Deque", "deque()")
+        if !stored(&*self.core) then unassigned(Unassigned.DequeUnassigned)
         self.core.push_front(v)
 
     @inline
-    pop_front(self) -> Option[T] = if stored(&self.core) then self.core.pop_front() else None
+    pop_front(self) -> Option[T] = if stored(&*self.core) then self.core.pop_front() else None
 
     @inline
-    pop_back(self) -> Option[T] = if stored(&self.core) then self.core.pop_back() else None
+    pop_back(self) -> Option[T] = if stored(&*self.core) then self.core.pop_back() else None
 
     /** The elements dropped and the head put back at the start. The storage is kept, which is what
      * makes a deque reused across passes of a loop allocate once rather than once per pass.
      */
     clear(self)
-        if stored(&self.core) then self.core.clear()
+        if stored(&*self.core) then self.core.clear()
 
     /** A second deque holding the same elements in the same order, the front put back at the start
      * of its storage -- the one way to get a deque that is not this one, every other way of handing a
@@ -116,7 +116,7 @@ private past_end(i: usize) -> never
 impl[T] Walk for Deque[T]
     type Walker = DequeCursor[T]
     walk(self) -> DequeCursor[T]
-        if !stored(&self.core) then return DequeCursor([], 0, 0, 0)
+        if !stored(&*self.core) then return DequeCursor([], 0, 0, 0)
         DequeCursor(self.core.elems, self.core.head, self.core.count, 0)
 
 /** The ring itself, which every `Deque` naming it shares. Everything that moves the head, the count
