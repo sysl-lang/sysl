@@ -1,0 +1,114 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// The seam every question about the shipped library goes through -- the reference's `LibraryTests`.
+// The reference asks a `Library` object; here the same questions are asked of what stands in for it:
+// `library_key` and `library_spelling` (members.sysl), `from_library` (whose declaration it is), the
+// auto-import `gather_imports` makes, and the catalog in `core_traits.sysl`.
+
+private lfb_lib_root() -> Option[string] = std_root() match
+    Ok(r) -> Some(r)
+    Err(_) ->
+        print("skipped: the standard module's source is not on this machine")
+        None
+
+private lfb_lib_units(root: string) -> Buf[Program] = std_units(root, host_target()).unwrap()
+
+// The library's declarations read into one analysis, as every compilation reads them.
+private lfb_lib_analysis(units: Buf[Program]) -> &Analysis
+    val a = analysis_for(host_target())
+
+    read_decls(a, units, false)
+    a
+end lfb_lib_analysis
+
+private lfb_program(text: string) -> Program = parse(source_of("<input>", text)).program
+
+// Every name a file declares at its top level.
+private lfb_decl_names(u: Program) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<u.body.len()
+        *u.body.at(i).kind match
+            FuncDecl(d) -> out.push(d.name)
+            ExternDecl(d) -> out.push(d.name)
+            StructDecl(d) -> out.push(d.name)
+            TypeDecl(d) -> out.push(d.name)
+            TraitDecl(d) -> out.push(d.name)
+            EnumDecl(d) -> out.push(d.name)
+            _ -> ()
+
+    out
+end lfb_decl_names
+
+// The library's modules, each once.
+private lfb_lib_modules(units: Buf[Program]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<units.len()
+        val m = module_of_unit(units.at(i))
+
+        if !holds_string(out, m) then out.push(m)
+
+    out
+end lfb_lib_modules
+
+// ---- whose declaration it is ----
+
+@test("every declaration the library ships is its own")
+lfb_every_library_declaration_is_its_own()
+    val root = lfb_lib_root() match
+        None -> return
+        Some(r) -> r
+
+    val units = lfb_lib_units(root)
+    val a = lfb_lib_analysis(units)
+    var counted: usize = 0
+
+    for i in 0..<units.len()
+        counted += lfb_decl_names(units.at(i)).len()
+        assert(from_library(a, scope_of_unit(a, units.at(i))), units.at(i).src.name)
+
+    assert(counted > 0, "the library declares nothing")
+
+@test("nothing a program declares is")
+lfb_nothing_a_program_declares_is_the_librarys()
+    val mine = lfb_program("struct Ok\n    n: int\n\ndouble(n: int) -> int = n * 2\n")
+    val a = analysis_for(host_target())
+
+    assert_eq(lfb_decl_names(mine).len(), 2)
+    assert(!from_library(a, scope_of_unit(a, mine)), "a program's file is not the library's")
+
+// A file with no name at all -- what a declaration the compiler made up would be read in.
+@test("a declaration with no position at all is not the library's")
+lfb_no_position_is_not_the_librarys()
+    val a = analysis_for(host_target())
+
+    assert(!from_library(a, scope_of_unit(a, parse(source_of("", "f() -> int = 1\n")).program)), "''")
+
+// ---- a key and the spelling it stands for ----
+
+@test("a library spelling makes a key in the standard module, never in the root one")
+lfb_a_library_spelling_keys_the_standard_module()
+    assert_eq(module_of(library_key("Option")), StdModule)
+    assert(module_of(library_key("Option")) != ModuleRoot, "the root module")
+
+@test("a spelling the standard module holds makes that module's key")
+lfb_a_held_spelling_makes_that_modules_key()
+    assert_eq(library_key("FormatSpec"), module_qualify(StdModule, "FormatSpec"))
+
+@test("and the key gives the spelling back, from either part")
+lfb_the_key_gives_the_spelling_back()
+    assert_eq(library_spelling(library_key("Option")).unwrap_or("(none)"), "Option")
+    assert_eq(library_spelling(library_key("FormatSpec")).unwrap_or("(none)"), "FormatSpec")
+
+@test("a key belonging to another module has no library spelling")
+lfb_another_modules_key_has_no_spelling()
+    assert(library_spelling(module_qualify("geom", "Option")).is_none(), "geom.Option")
+
+@test("and neither has a program's own declaration of a name the library also declares")
+lfb_a_programs_own_key_has_no_spelling()
+    assert(library_spelling("FormatSpec").is_none(), "a headerless program's FormatSpec")

@@ -1,0 +1,193 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// The rest of the reference's `LibraryTests`: the standard module every program is compiled against,
+// what `?` unwraps, and the names the compiler spells for itself. `?`'s two enums are asked through a
+// program, since this compiler answers them inside `try_expr` rather than at a table of its own; every
+// refusal is 0.0.162's own text.
+
+private lfb_kn_root() -> Option[string] = std_root() match
+    Ok(r) -> Some(r)
+    Err(_) ->
+        print("skipped: the standard module's source is not on this machine")
+        None
+
+private lfb_kn_names(u: Program) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<u.body.len()
+        *u.body.at(i).kind match
+            FuncDecl(d) -> out.push(d.name)
+            StructDecl(d) -> out.push(d.name)
+            TraitDecl(d) -> out.push(d.name)
+            EnumDecl(d) -> out.push(d.name)
+            _ -> ()
+
+    out
+end lfb_kn_names
+
+// What a program's compilation said, or "" where it said nothing.
+private lfb_kn_refusal(text: string) -> string
+    val root = make_temp_dir("sysl-lfb").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end lfb_kn_refusal
+
+// ---- the standard module, which every program is compiled against ----
+
+@test("says in one of the library's headers what `Std.module` says")
+lfb_a_header_says_the_standard_module()
+    val root = lfb_kn_root() match
+        None -> return
+        Some(r) -> r
+
+    val units = std_units(root, host_target()).unwrap()
+    var said = false
+
+    for i in 0..<units.len()
+        units.at(i).module_name match
+            Some(m) -> if m.show() == StdModule then said = true
+            None -> ()
+
+    assert(!units.is_empty(), "the library parsed to nothing")
+    assert(said, s"no file of the library declares '$StdModule'")
+
+@test("is made of more than one file, each of which the driver would build the same way")
+lfb_the_standard_module_is_several_files()
+    val root = lfb_kn_root() match
+        None -> return
+        Some(r) -> r
+
+    val found = std_sources(root, Some(host_target().os)).unwrap()
+    var n: usize = 0
+
+    for i in 0..<found.len()
+        if found.at(i).dir.len() == 1 && found.at(i).dir.at(0) == StdModule then n += 1
+
+    assert(n > 1, s"$n files")
+
+// Read twice and compared by spelling, since two parses are two sets of sources.
+@test("declares the whole of what the library declares")
+lfb_the_module_declares_the_whole_library()
+    val root = lfb_kn_root() match
+        None -> return
+        Some(r) -> r
+
+    val first = std_units(root, host_target()).unwrap()
+    val second = std_units(root, host_target()).unwrap()
+    var a: Buf[string] = buf()
+    var b: Buf[string] = buf()
+
+    for i in 0..<first.len() do a.push(join(lfb_kn_names(first.at(i)).view(), " "))
+    for i in 0..<second.len() do b.push(join(lfb_kn_names(second.at(i)).view(), " "))
+
+    assert(!first.is_empty(), "the library declares nothing")
+    assert_eq(join(a.view(), "\n"), join(b.view(), "\n"))
+
+@test("is a module every file may write the names of without importing it")
+lfb_the_standard_module_is_auto_imported()
+    val a = analysis_for(host_target())
+    val unit = parse(source_of("<input>", "print(1)\n")).program
+
+    assert(holds_string(scope_of_unit(a, unit).imports.wildcards, StdModule), "no auto-import")
+
+// A submodule's names are asked for: `Buf` without its import is an unknown type.
+@test("which the library's submodules are not")
+lfb_the_submodules_are_not_auto_imported()
+    val root = lfb_kn_root() match
+        None -> return
+        Some(r) -> r
+
+    val units = std_units(root, host_target()).unwrap()
+    val a = analysis_for(host_target())
+    val wild = scope_of_unit(a, parse(source_of("<input>", "print(1)\n")).program).imports.wildcards
+    var others: usize = 0
+
+    for i in 0..<units.len()
+        val m = module_of_unit(units.at(i))
+
+        if m != StdModule
+            others += 1
+            assert(!holds_string(wild, m), s"$m is auto-imported")
+
+    assert(others > 0, "the library has no submodules")
+
+    val said = lfb_kn_refusal("var b: Buf[int] = buf()\n\nprint(b.len())\n")
+
+    assert(said.index_of("error: unknown type 'Buf'").is_some(), said)
+    assert(said.index_of("1 | var b: Buf[int] = buf()").is_some(), said)
+
+// ---- what `?` unwraps ----
+
+@test("the two enums, by the key each is filed under")
+lfb_question_unwraps_result_and_option()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        half(n: int) -> Result[int, string] = if n % 2 == 0 then Ok(n / 2) else Err("odd")
+        first(xs: []int) -> Option[int] = if xs.len == 0 then None else Some(xs[0])
+
+        quarter(n: int) -> Result[int, string]
+            val h = half(n)?
+            half(h)
+        end quarter
+
+        head_plus(xs: []int) -> Option[int]
+            val x = first(xs)?
+            Some(x + 1)
+        end head_plus
+
+        print(quarter(8).unwrap(), quarter(6).is_err())
+        print(head_plus([4, 5]).unwrap(), head_plus([]).is_none())
+        """, "2 true\n5 true\n")
+
+@test("nothing else")
+lfb_question_unwraps_nothing_else()
+    val said = lfb_kn_refusal(raw"""
+        import sysl.buf.{Buf, buf}
+
+        f() -> Option[int]
+            var b: Buf[int] = buf()
+            val x = b?
+            Some(1)
+        end f
+
+        print(1)
+        """)
+
+    assert(said.index_of("error: '?' needs an Option or Result value, not sysl.buf.Buf[int]").is_some(), said)
+    assert(said.index_of("5 |     val x = b?").is_some(), said)
+
+@test("and not another module's enum of the same name")
+lfb_question_does_not_unwrap_a_programs_option()
+    val said = lfb_kn_refusal(raw"""
+        enum Option
+            Some(v: int)
+            None
+
+        h() -> Option = Some(1)
+
+        f() -> Option
+            val x = h()?
+            Some(x)
+        end f
+
+        print(1)
+        """)
+
+    assert(said.index_of("error: '?' needs an Option or Result value, not Option").is_some(), said)
+    assert(said.index_of("8 |     val x = h()?").is_some(), said)

@@ -1,0 +1,185 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// Every name the compiler spells for itself is one the library declares, in exactly one of its
+// modules -- the reference's `LibraryTests`, its catalog half. **This compiler has no one table of
+// those names** (`Library.known`): each is written where it is used, as `library_key("Option")` or a
+// lookup like `library_key(cx, "args_of")`. The list below is the one `tests_cdx_conditional.sysl`
+// holds every target to, without the variants, which are not top-level names.
+
+private lfb_known() -> []string = ["Option", "Result", "FormatSpec", "Display", "Hash", "From", "Drop",
+    "Integer", "Signed", "Bits", "Ordering", "Writer", "putbytes", "printi", "printu", "printr", "printb",
+    "printc", "prints", "Index", "IndexSet", "Iterate", "Range", "args_of", "chars_of", "Add", "Sub",
+    "Mul", "Div", "Rem", "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "Neg", "Not", "Eq", "Ord"]
+
+private lfb_cat_units() -> Option[Buf[Program]] = std_root() match
+    Ok(root) -> Some(std_units(root, host_target()).unwrap())
+    Err(_) ->
+        print("skipped: the standard module's source is not on this machine")
+        None
+
+// The modules that declare `name` at their top level.
+private lfb_declaring(units: Buf[Program], name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<units.len()
+        val u = units.at(i)
+
+        for j in 0..<u.body.len()
+            val named = *u.body.at(j).kind match
+                FuncDecl(d) -> d.name
+                StructDecl(d) -> d.name
+                TraitDecl(d) -> d.name
+                EnumDecl(d) -> d.name
+                _ -> ""
+
+            if named == name && !holds_string(out, module_of_unit(u)) then out.push(module_of_unit(u))
+
+    out
+end lfb_declaring
+
+@test("each in exactly one of the library's modules")
+lfb_each_known_name_in_exactly_one_module()
+    val units = lfb_cat_units() match
+        None -> return
+        Some(u) -> u
+
+    val known = lfb_known()
+
+    for k in 0..<known.len
+        val at = lfb_declaring(units, known[k])
+
+        assert_eq(at.len(), 1)
+
+// The one that moved: a `main` taking arguments reaches it from inside the compiler.
+@test("and `key` names that module, wherever in the library it turned out to be")
+lfb_key_names_the_declaring_module()
+    val units = lfb_cat_units() match
+        None -> return
+        Some(u) -> u
+
+    val a = analysis_for(host_target())
+
+    read_decls(a, units, false)
+
+    val cx = analyzer_for(a, scope_of_unit(a, units.at(0)))
+
+    assert_eq(library_key(cx, "args_of").unwrap_or("(none)"), module_qualify("sysl.args", "args_of"))
+    assert_eq(library_key("Option"), module_qualify(StdModule, "Option"))
+
+@test("and the traits the operator catalog names")
+lfb_the_operator_catalog_is_declared()
+    val units = lfb_cat_units() match
+        None -> return
+        Some(u) -> u
+
+    val ops = ["Add", "Sub", "Mul", "Div", "Rem", "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "Neg", "Not",
+               "Eq", "Ord"]
+
+    for i in 0..<ops.len
+        assert(core_required(ops[i]).is_some(), ops[i])
+        assert_eq(lfb_declaring(units, ops[i]).len(), 1)
+
+private lfb_builtins() -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    out.push(Integer(4, false, false))
+    out.push(Integer(8, true, false))
+    out.push(Integer(64, true, false))
+    out.push(Integer(64, false, false))
+    out.push(Integer(128, false, false))
+    out.push(Integer(256, false, false))
+    out.push(real_type())
+    out.push(Bool)
+    out.push(Char)
+    out.push(Str)
+    out
+end lfb_builtins
+
+@test("no built-in has 'Display' by the compiler's rule, at any width or in any closed family")
+lfb_no_builtin_has_display_by_rule()
+    val ts = lfb_builtins()
+
+    for i in 0..<ts.len()
+        assert(!core_builtin("Display", ts.at(i)), type_show(ts.at(i)))
+
+@test("'Integer' is every integer width and nothing else")
+lfb_integer_is_every_width_and_nothing_else()
+    val ints = [Integer(1, false, false), Integer(4, false, false), Integer(32, true, false),
+                Integer(256, false, false)]
+    val others = [real_type(), Floating(32, false), Bool, Char, Str]
+
+    for i in 0..<ints.len do assert(core_builtin("Integer", ints[i]), type_show(ints[i]))
+    for i in 0..<others.len do assert(!core_builtin("Integer", others[i]), type_show(others[i]))
+
+@test("and the family it names is a trait the library declares")
+lfb_the_closed_family_is_declared()
+    val units = lfb_cat_units() match
+        None -> return
+        Some(u) -> u
+
+    assert(core_closed("Integer"), "Integer is closed")
+    assert_eq(lfb_declaring(units, "Integer").len(), 1)
+
+    // And it is the only closed one: no other trait the compiler knows by name is a family.
+    val known = lfb_known()
+
+    for k in 0..<known.len
+        if known[k] != "Integer" then assert(!core_closed(known[k]), known[k])
+
+@test("and the mixer, for the types whose `Hash` the compiler provides")
+lfb_the_hash_mixers_are_declared()
+    val units = lfb_cat_units() match
+        None -> return
+        Some(u) -> u
+
+    val hashable = [Integer(64, true, false), Integer(128, false, false), Char, Bool, Str]
+
+    for i in 0..<hashable.len
+        core_hash(hashable[i]) match
+            None -> assert(false, s"no mixer for ${type_show(hashable[i])}")
+            Some(m) -> assert_eq(lfb_declaring(units, m.0).len(), 1)
+
+@test("a float has neither membership, and the two reasons are different")
+lfb_a_float_has_neither_membership()
+    assert(core_hash(real_type()).is_none(), "a float has a mixer")
+    assert(!core_builtin("Hash", real_type()), "Hash")
+    assert(!core_builtin("Display", real_type()), "Display")
+    assert(!core_builtin("Integer", real_type()), "Integer")
+
+// ---- the seam is what a program actually resolves through ----
+
+@test("a library name arrives unqualified, and its key is the library's")
+lfb_a_library_name_arrives_unqualified()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        f(n: int) -> Option[int] = Some(n)
+        print(f(1).unwrap())
+        """, "1\n")
+
+@test("and a program may declare its own 'Option', which '?' does not reach")
+lfb_a_program_may_declare_its_own_option()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        enum Option
+            Yes
+            No
+
+        mine() -> Option = Yes
+
+        g() -> sysl.Option[int] = Some(3)
+
+        f() -> sysl.Option[int]
+            var x = g()?
+            Some(x + 1)
+        end f
+
+        print(f().unwrap())
+        mine() match
+            Yes -> print("yes")
+            No -> print("no")
+        """, "4\nyes\n")
