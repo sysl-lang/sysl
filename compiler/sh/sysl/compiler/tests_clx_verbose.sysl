@@ -1,0 +1,110 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.remove_dir_all
+import sysl.text.Search
+
+// `-v` / `--verbose` -- what a build decided, on standard error under the reference's `sysl: ` lead:
+// the files it read, which standard module it got and by which route, where it looks and which heap
+// it allocates through, and the command lines it handed to clang. Each line below is quoted from the
+// reference's own `--verbose` over the same project. (Its fifth line, where `build-lib` staged an
+// artifact's members, has nothing to say here: `build-lib` writes no artifact.)
+
+@test("is spelled both ways, and is off unless asked for")
+clx_verbose_both_spellings()
+    if !clx_ready() then return
+
+    for flag in ["--verbose", "-v"]
+        val root = clx_project("main()\n    print(1)\n")
+        val (code, _, err) = clx_ran(["sysl", "build", root, "-o", s"$root/out", flag])
+
+        assert_eq(code, Fine, err)
+        assert(err.contains("\nsysl: link: "), s"$flag: $err")
+        remove_dir_all(root).unwrap_or(())
+
+    val quiet = clx_project("main()\n    print(1)\n")
+    val (_, _, said) = clx_ran(["sysl", "build", quiet, "-o", s"$quiet/out"])
+
+    assert_eq(said, s"wrote $quiet/out")
+    remove_dir_all(quiet).unwrap_or(())
+end clx_verbose_both_spellings
+
+@test("the files it read, and how many")
+clx_verbose_files()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+    val (code, _, err) = clx_ran(["sysl", "build", root, "-o", s"$root/out", "--verbose"])
+
+    assert_eq(code, Fine, err)
+    assert(err.starts_with(s"sysl: 1 source file(s) under $root\nsysl:   read $root/main.sysl\n"), err)
+    remove_dir_all(root).unwrap_or(())
+end clx_verbose_files
+
+// An artifact read and one rebuilt reach the end looking identical; which happened is the first
+// thing anybody diagnosing a stale library wants to know.
+@test("which standard module it got, and by which route")
+clx_verbose_standard_module()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+    val (_, _, linked) = clx_ran(["sysl", "build", root, "-o", s"$root/out", "-v"])
+    val (_, _, compiled) = clx_ran(["sysl", "build", root, "-o", s"$root/out", "-v", "--no-std-lib"])
+
+    assert(linked.contains("\nsysl: standard module linked from "), linked)
+    assert(compiled.contains("\nsysl: standard module compiled from source, not linked from an artifact\n"),
+           compiled)
+    remove_dir_all(root).unwrap_or(())
+end clx_verbose_standard_module
+
+@test("the whole command line it handed to clang")
+clx_verbose_link_line()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+    val (_, _, err) = clx_ran(["sysl", "build", root, "-o", s"$root/out", "-v"])
+
+    assert(err.contains("\nsysl: link: clang"), err)
+    assert(err.contains(s"-o $root/out"), err)
+    remove_dir_all(root).unwrap_or(())
+end clx_verbose_link_line
+
+@test("and the search paths, which are the other half of a link that failed")
+clx_verbose_search_paths()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+    val (_, _, err) = clx_ran(["sysl", "build", root, "-o", s"$root/out", "-v", "--link-path",
+                               "/opt/somewhere/lib", "--include-path", "/opt/somewhere/include"])
+
+    assert(err.contains("\nsysl: link path: /opt/somewhere/lib\nsysl: include path: /opt/somewhere/include\n" +
+                        "sysl: allocator: malloc / free (the C default)\n"), err)
+    remove_dir_all(root).unwrap_or(())
+end clx_verbose_search_paths
+
+// A suite links like anything else, and a question about what clang was handed most often starts
+// from a suite that failed to link. The project is fresh, so no cached test binary stands in.
+@test("the command line a test suite was linked with, which is a build like any other")
+clx_verbose_test_link_line()
+    if !clx_ready() then return
+
+    val root = clx_project("@test(\"one is one\")\none() =\n    assert(1 == 1, \"one\")\n")
+    val (_, _, err) = clx_ran(["sysl", "test", root, "--verbose"])
+
+    assert(err.contains("sysl: link: clang"), err)
+    remove_dir_all(root).unwrap_or(())
+end clx_verbose_test_link_line
+
+// The default stays quiet: `wrote <exe>` is the whole of what a build says.
+@test("a build says only what it wrote")
+clx_quiet_by_default()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+    val (_, _, err) = clx_ran(["sysl", "build", root, "-o", s"$root/out"])
+
+    assert(!err.contains("source file(s)"), err)
+    assert(!err.contains("link: clang"), err)
+    assert(!err.contains("standard module"), err)
+    remove_dir_all(root).unwrap_or(())
+end clx_quiet_by_default

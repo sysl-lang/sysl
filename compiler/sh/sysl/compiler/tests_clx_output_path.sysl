@@ -1,0 +1,126 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{current_dir, make_temp_dir, metadata, remove_dir_all, set_current_dir, write_text}
+
+// Where a build writes when the caller named no output -- an answer that must not depend on where the
+// caller was standing. A directory project's executable is inside it, named after it (or after the
+// package its manifest names); a file project's is beside the caller, named for the file. A
+// `build-lib` artifact has no place here: this compiler's `build-lib` writes nothing anybody names.
+
+private clx_is_file(at: string) -> bool = metadata(at) match
+    Ok(m) -> m.is_file()
+    Err(_) -> false
+
+// `body` run from a fresh, empty working directory, which is removed afterwards with whatever a file
+// project's build left in it.
+private clx_from_elsewhere(body: string -> unit)
+    val here = current_dir().unwrap()
+    val there = absolute_path(make_temp_dir("sysl-clx-cwd").unwrap())
+
+    set_current_dir(there).unwrap()
+    body(there)
+    set_current_dir(here).unwrap()
+    remove_dir_all(there).unwrap_or(())
+end clx_from_elsewhere
+
+private clx_named_tool(root: string) = write_text(s"$root/package.hocon", "package {\n  name = \"tool\"\n}\n").unwrap()
+
+@test("is the last segment of where it is, for a path that ends in one")
+clx_named_for_the_last_segment()
+    assert_eq(directory_name("/tmp/scratch/test"), "test")
+    assert_eq(directory_name("/tmp/scratch/test/"), "test")
+
+// `.` matters most, being how a person standing in their own project names it.
+@test("and is worked out where the path does not end in one")
+clx_named_where_the_path_does_not_say()
+    val here = basename(current_dir().unwrap())
+
+    assert_eq(directory_name("."), here)
+    assert_eq(directory_name("./"), here)
+    assert_eq(directory_name("/tmp/scratch/test/.."), "scratch")
+    assert_eq(directory_name("/tmp/scratch/../scratch/test"), "test")
+end clx_named_where_the_path_does_not_say
+
+@test("and a relative path is resolved against the working directory rather than guessed at")
+clx_a_relative_path_is_resolved()
+    assert_eq(directory_name("sub"), "sub")
+    assert_eq(directory_name("a/b/c"), "c")
+
+@test("is inside a directory project, named after it — from wherever the build was started")
+clx_inside_a_directory_project()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+
+    clx_from_elsewhere((_) -> assert_eq(clx_ran(["sysl", "build", root]).0, Fine))
+    assert(clx_is_file(s"$root/${basename(root)}"), root)
+    remove_dir_all(root).unwrap_or(())
+end clx_inside_a_directory_project
+
+// The case that could not be built at all: `.` named the directory, which no linker can open.
+@test("including when the project is named as the working directory")
+clx_inside_a_project_named_as_dot()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+
+    assert_eq(clx_ran(["sysl", "build", s"$root/."]).0, Fine)
+    assert(clx_is_file(s"$root/${basename(root)}"), root)
+    remove_dir_all(root).unwrap_or(())
+end clx_inside_a_project_named_as_dot
+
+@test("and beside the caller for a file project, which is what it always was")
+clx_beside_the_caller_for_a_file()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+
+    clx_from_elsewhere((there) ->
+        assert_eq(clx_ran(["sysl", "build", s"$root/main.sysl"]).0, Fine)
+        assert(clx_is_file(s"$there/main"), there))
+
+    assert(!clx_is_file(s"$root/main"), root)
+    remove_dir_all(root).unwrap_or(())
+end clx_beside_the_caller_for_a_file
+
+@test("rather than what its directory happens to be called")
+clx_a_named_project_is_called_what_it_says()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+
+    clx_named_tool(root)
+    clx_from_elsewhere((_) -> assert_eq(clx_ran(["sysl", "build", root]).0, Fine))
+    assert(clx_is_file(s"$root/tool"), root)
+    assert(!clx_is_file(s"$root/${basename(root)}"), root)
+    remove_dir_all(root).unwrap_or(())
+end clx_a_named_project_is_called_what_it_says
+
+@test("from wherever the build was started")
+clx_a_named_project_from_dot()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+
+    clx_named_tool(root)
+    assert_eq(clx_ran(["sysl", "build", s"$root/."]).0, Fine)
+    assert(clx_is_file(s"$root/tool"), root)
+    remove_dir_all(root).unwrap_or(())
+end clx_a_named_project_from_dot
+
+// A config beside a file project moving its executable would be a worse surprise than the bug above.
+@test("while a file project is untouched by one")
+clx_a_file_project_ignores_the_name()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+
+    clx_named_tool(root)
+    clx_from_elsewhere((there) ->
+        assert_eq(clx_ran(["sysl", "build", s"$root/main.sysl"]).0, Fine)
+        assert(clx_is_file(s"$there/main"), there)
+        assert(!clx_is_file(s"$there/tool"), there))
+
+    remove_dir_all(root).unwrap_or(())
+end clx_a_file_project_ignores_the_name

@@ -1,0 +1,127 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// Which stream a command writes to, held apart as `main` holds them.
+//
+// **Standard output is what the command was run for, and nothing else**: a module's text, a tree, a
+// header, a test report, the usage somebody asked for. A diagnostic, a refusal, a mistake in the
+// command line with the usage under it, and `wrote <exe>` go to standard error, as the reference
+// writes every one of them -- so `sysl emit-llvm p > p.ll` holds a module or nothing, and a failed
+// build's errors reach the terminal whatever its output was redirected into. Where `SYSL_ORACLE`
+// names the reference, the same command line is run there and its two streams read the same way.
+//
+// The helpers here serve every `clx_` file.
+
+// One command line: its status, what it said on standard output, and what on standard error, each
+// channel's lines joined. The `sysl test` report is standard output too, streamed in pieces.
+clx_ran(args: []string) -> (int, string, string)
+    var out: Buf[string] = buf()
+    var err: Buf[string] = buf()
+    var pieces: Buf[string] = buf()
+    val o = &out
+    val e = &err
+    val p = &pieces
+    val code = run_cli_reported(args, (line) -> o.push(line), (line) -> e.push(line),
+                                (piece) -> p.push(piece))
+
+    (code, join(pieces.view(), "") + join(out.view(), "\n"), join(err.view(), "\n"))
+end clx_ran
+
+// Whether a whole program can be built here: the library's source, and a clang.
+clx_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end clx_ready
+
+// A fresh project directory, absolute, holding `main.sysl` with `text`.
+clx_project(text: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-clx").unwrap())
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end clx_project
+
+clx_undefined() -> string = "main()\n    print(undefined_name)\n"
+
+// What the reference wrote on each stream for the same command line, or `None` without one.
+clx_oracle_streams(args: []string) -> Option[(string, string)]
+    val bin = env_var("SYSL_ORACLE") match
+        None -> return None
+        Some(b) -> b
+
+    capture_oracle(bin, args) match
+        Err(_) -> None
+        Ok(o) -> Some((o.text, o.err.unwrap_or("")))
+end clx_oracle_streams
+
+@test("a program that does not compile is reported on standard error by every compiling command")
+clx_every_command_reports_on_stderr()
+    if !clx_ready() then return
+
+    val root = clx_project(clx_undefined())
+    val wanted = "error: undefined name 'undefined_name'"
+
+    for command in ["build", "run", "emit-llvm", "emit-typed", "emit-header", "build-c", "test", "prove"]
+        val (code, out, err) = clx_ran(["sysl", command, root])
+
+        assert_eq(code, Failed, s"$command: $err")
+        assert_eq(out, "", command)
+        assert(err.starts_with(wanted), s"$command: $err")
+
+        clx_oracle_streams([command, root]) match
+            None -> ()
+            Some((theirs, their_err)) ->
+                assert_eq(theirs, "", s"the reference's $command")
+                assert(their_err.starts_with(wanted), s"the reference's $command: $their_err")
+
+    remove_dir_all(root).unwrap_or(())
+end clx_every_command_reports_on_stderr
+
+@test("what a build wrote is said on standard error, and nothing reaches standard output")
+clx_wrote_is_on_stderr()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+    val (code, out, err) = clx_ran(["sysl", "build", root, "-o", s"$root/out"])
+
+    assert_eq(code, Fine, err)
+    assert_eq(out, "")
+    assert_eq(err, s"wrote $root/out")
+
+    clx_oracle_streams(["build", root, "-o", s"$root/again"]) match
+        None -> ()
+        Some((theirs, their_err)) ->
+            assert_eq(theirs, "")
+            assert_eq(their_err, s"wrote $root/again\n")
+
+    remove_dir_all(root).unwrap_or(())
+end clx_wrote_is_on_stderr
+
+@test("a command line missing its path is answered with the usage, on standard error")
+clx_a_misuse_is_on_stderr()
+    for command in ["build", "run", "test", "emit-llvm", "emit-ast", "build-c", "emit-header", "build-lib"]
+        val (code, out, err) = clx_ran(["sysl", command])
+
+        assert_eq(code, Misused, command)
+        assert_eq(out, "", command)
+        assert(err.starts_with(s"usage: sysl $command "), s"$command: $err")
+
+    clx_oracle_streams(["build"]) match
+        None -> ()
+        Some((theirs, their_err)) ->
+            assert_eq(theirs, "")
+            assert(their_err.starts_with("Error: Missing argument <path>\n"), their_err)
+end clx_a_misuse_is_on_stderr

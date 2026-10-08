@@ -1,0 +1,102 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, write_text}
+import sysl.text.Search
+
+// `sysl test` is a build, refused for the same reasons, and `--std` is what lets it test the
+// standard module's own tree; then the hooks a module writes, as the command a user runs reports them.
+
+private clx_suite(text: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-clx-suite").unwrap())
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/prog.sysl", text).unwrap()
+    s"$root/prog.sysl"
+end clx_suite
+
+@test("a program that does not compile is reported rather than run")
+clx_a_test_build_that_does_not_compile()
+    if std_root().is_err() then return
+
+    val (code, out, err) = clx_ran(["sysl", "test", clx_suite("@test\nt() =\n    print(undefined_name)\n")])
+
+    assert_eq(code, Failed)
+    assert_eq(out, "")
+    assert(err.contains("undefined name 'undefined_name'"), err)
+end clx_a_test_build_that_does_not_compile
+
+// `test` runs what it builds, so a machine that is not this one has nothing to run it -- refused
+// before the compile rather than after it.
+@test("a cross target is refused, since there would be nothing here to run it")
+clx_a_cross_target_is_refused()
+    if std_root().is_err() then return
+
+    val all = all_targets()
+    var other = ""
+
+    for i in 0..<all.len()
+        if other == "" && all.at(i).name != host_target().name && all.at(i).supported()
+            other = all.at(i).name
+
+    val (code, _, err) = clx_ran(["sysl", "test", clx_suite("@test\nt() =\n    assert(true, \"up\")\n"),
+                                  "--target", other])
+
+    assert_eq(code, Failed)
+    assert(err.contains("not this machine"), err)
+end clx_a_cross_target_is_refused
+
+// The refusal is the whole reason `--std` exists, so it is asserted rather than assumed.
+@test("without it, the library's own tree collides with the copy the compiler supplies")
+clx_the_library_without_std_collides()
+    if std_root().is_err() then return
+
+    val (code, _, err) = clx_ran(["sysl", "test", std_root().unwrap()])
+
+    assert_eq(code, Failed)
+    assert(err.contains("is the module every program is compiled against"), err)
+end clx_the_library_without_std_collides
+
+// The whole tree is compiled as the standard module and its tests built; one of them is run, the
+// claim being that the tree compiles and its tests run rather than how many there are.
+@test("with it, the same tree compiles and its tests run")
+clx_the_library_with_std_runs()
+    if !clx_ready() then return
+
+    val (code, out, err) = clx_ran(["sysl", "test", std_root().unwrap(), "--std", "--filter",
+                                    "the working directory is absolute"])
+
+    assert_eq(code, Fine, s"$out\n$err")
+    assert(out.contains("1 passed, 0 failed"), out)
+end clx_the_library_with_std_runs
+
+@test("a suite whose hooks all return leaves the status a passing suite leaves")
+clx_returning_hooks_pass()
+    if !clx_ready() then return
+
+    val (code, out, _) = clx_ran(["sysl", "test", clx_suite(
+        "@setup_all\nboot() =\n    print(\"up\")\n\n@setup\ns() =\n    print(\"before\")\n\n" +
+        "@test\nt() =\n    assert(1 + 1 == 2, \"arithmetic\")\n\n@teardown\nd() =\n    print(\"after\")\n\n" +
+        "@teardown_all\nhalt() =\n    print(\"down\")\n")])
+
+    assert_eq(code, Fine, out)
+    assert(out.contains("running 1 test\n"), out)
+    assert(out.contains("1 passed, 0 failed"), out)
+end clx_returning_hooks_pass
+
+// The row names the hook rather than a test, the status is a failure, and the count above still says
+// how many tests were selected.
+@test("a hook that does not return is a failure the command reports and exits on")
+clx_a_hook_that_does_not_return()
+    if !clx_ready() then return
+
+    val (code, out, _) = clx_ran(["sysl", "test", clx_suite(
+        "@test\nt() =\n    print(\"the test was fine\")\n\n" +
+        "@teardown_all\nhalt() =\n    assert(false, \"the module's teardown broke\")\n")])
+
+    assert_eq(code, Failed)
+    assert(out.contains("running 1 test\n"), out)
+    assert(out.contains("halt"), out)
+    assert(out.contains("the module's '@teardown_all', 'halt', did not return"), out)
+    assert(out.contains("1 passed, 1 failed"), out)
+end clx_a_hook_that_does_not_return

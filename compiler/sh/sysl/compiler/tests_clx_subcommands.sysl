@@ -1,0 +1,78 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The built-in commands, and what a word that is not one of them is told.
+//
+// **Every command is sysl's own.** The reference runs an unknown subcommand as `sysl-<name>` from the
+// PATH, git's way; this compiler does not (the user's decision, 2026-10-07): `doc` is built in, and a
+// word that names no command is refused with the commands there are, so a typo is answerable from
+// the refusal alone. `weave` is the reference's and is not built here yet, so it is not listed.
+
+@test("the ones sysl has are all there")
+clx_the_builtins_are_all_there()
+    val have = builtin_commands()
+
+    for wanted in ["run", "build", "build-lib", "build-c", "test", "emit-llvm", "emit-header", "tangle",
+                   "prove", "deps", "targets"]
+        var found = false
+
+        for i in 0..<have.len()
+            if have.at(i) == wanted then found = true
+
+        assert(found, s"'$wanted' is not a built-in")
+end clx_the_builtins_are_all_there
+
+@test("and nothing that is an option or an argument")
+clx_no_builtin_is_an_option()
+    val have = builtin_commands()
+
+    for i in 0..<have.len()
+        assert(!have.at(i).starts_with("-"), have.at(i))
+        assert(!have.at(i).starts_with("<"), have.at(i))
+end clx_no_builtin_is_an_option
+
+// The list and the dispatch are two halves written apart, so each name on the list is asked of the
+// dispatch: none of them is answered as a word sysl does not have.
+@test("every built-in the list names is one the command line carries out")
+clx_every_builtin_is_dispatched()
+    val have = builtin_commands()
+
+    for i in 0..<have.len()
+        val (_, _, err) = clx_ran(["sysl", have.at(i), "--clx-not-an-option"])
+
+        assert(!err.contains("is not a sysl command"), s"${have.at(i)}: $err")
+end clx_every_builtin_is_dispatched
+
+// `targets` needs no file and no toolchain, so it is the cheap proof that a built-in was let through.
+@test("a command sysl has is never looked for externally")
+clx_a_builtin_runs()
+    val (code, out, err) = clx_ran(["sysl", "targets"])
+
+    assert_eq(code, Fine, err)
+    assert(out.contains("aarch64-macos"), out)
+
+@test("'--version' is answered by sysl rather than looked for as 'sysl---version'")
+clx_version_is_not_a_command()
+    val (code, out, _) = clx_ran(["sysl", "--version"])
+
+    assert_eq(code, Fine)
+    assert(out.contains("sysl "), out)
+
+@test("and an empty command line is still the usage failure it always was")
+clx_an_empty_line_fails()
+    val (code, _, _) = clx_ran(["sysl"])
+
+    assert(code != Fine, "an empty command line succeeded")
+
+@test("and it lists what sysl does have, so a typo is still answerable")
+clx_a_typo_lists_the_commands()
+    val (code, out, err) = clx_ran(["sysl", "biuld"])
+
+    assert_eq(code, Misused)
+    assert_eq(out, "")
+    assert(err.starts_with("sysl: error: 'biuld' is not a sysl command — the commands are "), err)
+    assert(err.contains("build"), err)
+    assert(err.contains("run"), err)
+end clx_a_typo_lists_the_commands

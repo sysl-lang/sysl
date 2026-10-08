@@ -1,0 +1,152 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{current_dir, make_temp_dir, remove_dir_all, set_current_dir}
+import sysl.text.{split, Search}
+
+// `sysl --version` and `sysl --help`, which exist for a reader who has a binary and does not know
+// what it is, and the built-in commands they name.
+//
+// **What is pinned is the contract, not merely that a number appears**: the version goes to
+// standard output so a script can read it, alone on its line, and it stands on its own rather than
+// being an option to a subcommand. `--help` is the same shape -- asked for, it is an answer on
+// standard output with a zero status, where the same commands reach standard error under a mistake.
+
+// Whether `v` is a version -- `N.N.N`, optionally with a `-` and a suffix -- rather than a
+// placeholder or an empty string.
+private clx_is_version(v: string) -> bool
+    val parts = split(split(v, "-")[0], ".")
+
+    if parts.len != 3 || v.ends_with("-") then return false
+
+    for i in 0..<parts.len
+        if parts[i].bytes.len == 0 then return false
+
+        for j in 0..<parts[i].bytes.len
+            if parts[i].bytes[j] < u8('0') || parts[i].bytes[j] > u8('9') then return false
+
+    true
+end clx_is_version
+
+@test("--version stands on its own, no subcommand and no path")
+clx_version_stands_alone()
+    val (code, out, err) = clx_ran(["sysl", "--version"])
+
+    assert_eq(code, Fine, err)
+    assert_eq(out, s"sysl ${Version}")
+
+@test("and nothing else has to be supplied with it")
+clx_version_needs_nothing_else()
+    val (code, _, err) = clx_ran(["sysl", "--version"])
+
+    assert_eq(code, Fine)
+    assert_eq(err, "")
+
+@test("while an invocation naming nothing at all is still refused")
+clx_nothing_is_still_refused()
+    val (code, out, err) = clx_ran(["sysl"])
+
+    assert_eq(code, Misused)
+    assert_eq(out, "")
+    assert(err.starts_with("Error: a subcommand is required\n"), err)
+end clx_nothing_is_still_refused
+
+@test("the version the build was cut at, on stdout, alone on its line")
+clx_version_alone_on_its_line()
+    val (_, out, _) = clx_ran(["sysl", "--version"])
+
+    assert_eq(out, "sysl " + Version)
+    assert(!out.contains("\n"), out)
+
+@test("and that version is one, rather than a placeholder or an empty string")
+clx_version_is_a_version()
+    assert(clx_is_version(Version), Version)
+    assert(clx_is_version("0.0.162"), "0.0.162")
+    assert(!clx_is_version(""), "the empty string")
+    assert(!clx_is_version("0.1"), "two parts")
+    assert(!clx_is_version("x.y.z"), "letters")
+end clx_version_is_a_version
+
+// The invocation somebody makes before anything works: no project and nothing to read, from a
+// directory holding no sysl at all.
+@test("and it answers without a toolchain, a project, or anything else on disk")
+clx_version_needs_nothing_on_disk()
+    val here = current_dir().unwrap()
+    val empty = make_temp_dir("sysl-clx-empty").unwrap()
+
+    set_current_dir(empty).unwrap()
+
+    val (code, _, _) = clx_ran(["sysl", "--version"])
+
+    set_current_dir(here).unwrap()
+    remove_dir_all(empty).unwrap_or(())
+    assert_eq(code, Fine)
+end clx_version_needs_nothing_on_disk
+
+@test("stands on its own, like --version")
+clx_help_stands_alone()
+    val (code, _, err) = clx_ran(["sysl", "--help"])
+
+    assert_eq(code, Fine, err)
+    assert_eq(err, "")
+
+@test("prints the usage, on stdout and with a zero status")
+clx_help_is_on_stdout()
+    val (code, out, _) = clx_ran(["sysl", "--help"])
+
+    assert_eq(code, Fine)
+    assert(out.contains("Usage: sysl"), out)
+
+@test("and the usage it prints lists every subcommand, being generated rather than written out")
+clx_help_lists_every_command()
+    val (_, out, _) = clx_ran(["sysl", "--help"])
+
+    for command in ["run", "build", "build-lib", "test", "emit-llvm", "prove", "targets"]
+        assert(out.contains(command), s"'$command' missing from the usage")
+
+    // Every built-in has its own line, written as it is used.
+    val commands = builtin_commands()
+
+    for i in 0..<commands.len()
+        assert(out.contains(s"\n  sysl ${commands.at(i)}"), s"no line for '${commands.at(i)}'")
+end clx_help_lists_every_command
+
+@test("and it names the two flags that stand alone")
+clx_help_names_version_and_help()
+    val (_, out, _) = clx_ran(["sysl", "--help"])
+
+    assert(out.contains("--version"), out)
+    assert(out.contains("--help"), out)
+
+// The line an option is DECLARED on is the one that counts: `--lib` is named in the commands'
+// usages above the heading too. `--std-lib` and `--ar` are the reference's and are retired here (a
+// named artifact is not built), so they are not listed; every other option the reference asks about is.
+@test("and puts the options that belong to no command under a heading of their own")
+clx_help_options_under_a_heading()
+    val (_, out, _) = clx_ran(["sysl", "--help"])
+    val lines = split(out, "\n")
+    var heading: Option[usize] = None
+
+    for i in 0..<lines.len
+        if lines[i].starts_with("Options, which any command takes:") then heading = Some(i)
+
+    assert(heading.is_some(), out)
+
+    for flag in ["--version", "--help", "--explain-escapes", "--target", "--lib", "--no-std-lib", "--optimize"]
+        var declared: Option[usize] = None
+
+        for i in 0..<lines.len
+            if declared.is_none() && lines[i].starts_with("  -") && lines[i].contains(flag)
+                declared = Some(i)
+
+        assert(declared.is_some() && declared.unwrap() > heading.unwrap(),
+               s"'$flag' is not declared under the heading")
+end clx_help_options_under_a_heading
+
+@test("while an invocation naming nothing still fails rather than helpfully succeeding")
+clx_nothing_still_fails()
+    val (code, out, _) = clx_ran(["sysl"])
+
+    assert(code != Fine, "a bare 'sysl' succeeded")
+    assert_eq(out, "")

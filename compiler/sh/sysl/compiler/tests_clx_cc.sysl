@@ -1,0 +1,145 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, metadata, remove_dir_all}
+import sysl.text.Search
+
+// `--cc`, at the seams a flag naming a compiler can quietly stop applying at -- and the order the
+// driver does things in, seen through what it says when one of them fails.
+//
+// **A path that cannot be run is what every reach test uses**: no machine has a clang at
+// `/nonexistent/clang`, so a message naming it proves the argument travelled rather than that
+// something plausible happened.
+
+private clx_absent() -> string = "/nonexistent/clang"
+
+@test("a build that names no compiler carries none, so the search still decides")
+clx_no_cc_is_none()
+    assert(named_cc_of(["sysl", "build", "prog.sysl"]).is_none(), "a compiler nobody named")
+
+@test("and one that names a compiler carries it")
+clx_a_named_cc_is_carried()
+    assert_eq(named_cc_of(["sysl", "build", "prog.sysl", "--cc", "/opt/homebrew/opt/llvm/bin/clang"]),
+              Some("/opt/homebrew/opt/llvm/bin/clang"))
+
+    // What follows `--` is the program's, and a `--cc` there names nothing to this compiler.
+    assert(named_cc_of(["sysl", "run", "p.sysl", "--", "--cc", "x"]).is_none(), "a program's --cc")
+end clx_a_named_cc_is_carried
+
+// The flag belongs to every command that reaches a C compiler, not to `build` alone.
+@test("every command that reaches clang accepts it")
+clx_every_command_takes_cc()
+    if !clx_ready() then return
+
+    val root = clx_project("@test\nt() =\n    assert(true, \"up\")\nmain()\n    print(1)\n")
+
+    for command in ["run", "build", "build-c", "test"]
+        val (code, _, err) = clx_ran(["sysl", command, root, "--cc", clx_absent()])
+
+        assert_eq(code, Failed, s"$command: $err")
+        assert(err.contains(s"cannot run '${clx_absent()}'"), s"$command: $err")
+
+    // `build-lib` takes it too, among the options every command takes.
+    val (_, _, said) = clx_ran(["sysl", "build-lib", root, "--cc", clx_absent()])
+
+    assert(!said.contains("Unknown option"), said)
+    remove_dir_all(root).unwrap_or(())
+end clx_every_command_takes_cc
+
+// A named compiler is not searched past and not fallen back from.
+@test("a named compiler that cannot run is refused rather than searched past")
+clx_a_named_cc_is_not_searched_past()
+    find_clang(host_target(), Some(clx_absent())) match
+        Ok(cc) -> assert(false, s"searched past a named compiler and found '$cc'")
+        Err(why) -> assert(why.contains(clx_absent()), why)
+
+@test("the link step takes it from the search paths")
+clx_the_link_takes_cc()
+    if !clx_ready() then return
+
+    val root = clx_project("main()\n    print(1)\n")
+    val (code, _, err) = clx_ran(["sysl", "build", root, "-o", s"$root/out", "--cc", clx_absent()])
+
+    assert_eq(code, Failed)
+    assert_eq(err, s"sysl: error: cannot run '${clx_absent()}' — --cc names the clang to build with")
+    remove_dir_all(root).unwrap_or(())
+end clx_the_link_takes_cc
+
+// The road no argument list travels: the standard module rebuilt underneath a build. Pointed at a
+// path where no artifact is, the rebuild is forced, and it has to use the compiler that was named.
+@test("and so does the standard module's own rebuild, which carries no search paths")
+clx_the_std_rebuild_takes_cc()
+    if std_root().is_err() then return
+
+    val dir = make_temp_dir("sysl-clx-cc").unwrap()
+
+    name_cc(Some(clx_absent()))
+    set_std_search(Some(s"$dir/std.syslib"))
+
+    val got = std_artifact(host_target(), "1")
+
+    set_std_search(None)
+    name_cc(None)
+    remove_dir_all(dir).unwrap_or(())
+
+    got match
+        Ok(_) -> assert(false, "rebuilt the standard module with a compiler that does not exist")
+        Err(why) -> assert(why.contains(clx_absent()), why)
+end clx_the_std_rebuild_takes_cc
+
+// The negative control: the compiler a search would have found, named, builds.
+@test("while naming the one a search would have found builds exactly as not naming it does")
+clx_naming_the_found_cc_builds()
+    if !clx_ready() then return
+
+    val found = find_clang(host_target(), None).unwrap()
+    val root = clx_project("main()\n    print(1)\n")
+    val (code, _, err) = clx_ran(["sysl", "build", root, "-o", s"$root/out", "--cc", found])
+
+    assert_eq(code, Fine, err)
+    assert(metadata(s"$root/out").is_ok(), "no executable")
+    remove_dir_all(root).unwrap_or(())
+end clx_naming_the_found_cc_builds
+
+// A target whose OPERATING SYSTEM is not this one's, so the library's per-OS C cannot compile here --
+// which is what lets a test see which failure is reported first.
+private clx_cross_system() -> Option[string]
+    val all = all_targets()
+    val host = host_target()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.supported() && t.builds_with_clang() && os_symbol(t.os) != os_symbol(host.os)
+            return Some(t.name)
+
+    None
+end clx_cross_system
+
+@test("rather than what is wrong with a shim it was never going to reach")
+clx_the_program_is_reported_first()
+    if !clx_ready() then return
+
+    val other = clx_cross_system().unwrap()
+    val root = clx_project(clx_undefined())
+    val (code, _, err) = clx_ran(["sysl", "build", root, "--target", other, "-o", s"$root/out", "--no-std-lib"])
+
+    assert(code != Fine, "built")
+    assert(err.contains("undefined name 'undefined_name'"), err)
+    assert(!err.contains("did not compile"), err)
+    remove_dir_all(root).unwrap_or(())
+end clx_the_program_is_reported_first
+
+@test("and says so in the words of the refusal")
+clx_a_cross_test_is_refused_first()
+    if !clx_ready() then return
+
+    val other = clx_cross_system().unwrap()
+    val root = clx_project("@test\nworks() =\n    assert_eq(1, 1)\n")
+    val (code, _, err) = clx_ran(["sysl", "test", root, "--target", other, "--no-std-lib"])
+
+    assert(code != Fine, "tested")
+    assert(err.contains("not this machine"), err)
+    assert(!err.contains("did not compile"), err)
+    remove_dir_all(root).unwrap_or(())
+end clx_a_cross_test_is_refused_first
