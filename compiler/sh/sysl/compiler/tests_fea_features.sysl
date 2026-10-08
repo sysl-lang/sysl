@@ -703,3 +703,229 @@ fea_dev_with_nothing_declared()
 fea_dev_every_offending_file_is_named()
     assert_eq(fea_refused(fea_pair(fea_unit("a.sysl", "module p\n\nimport sh.sysl.quickjs\n"),
                                    fea_unit("b.sysl", "module p\n\nimport sh.sysl.quickjs\n"))).len(), 2)
+
+// -- a feature asking a dependency for one of its features -------------------------------------------
+//
+// `<dependency>/<feature>` in a feature's list (Cargo's spelling): the dependency is turned on where it
+// is optional, and the feature joins every other request made of that package. These have no
+// counterpart in the reference, which refuses the form; the expected texts are this compiler's own.
+
+// `b`, declaring `y` and `z` and no `default`.
+private dpf_with_b(root: string)
+    fea_publish(root, "github.com/e/b", "b", "", "y = [], z = []")
+
+private dpf_b(extra: string) -> string = fea_entry("b", "github.com/e/b", extra)
+
+@test("a feature naming '<dependency>/<feature>' turns that feature on in the dependency")
+dpf_a_feature_turns_on_a_dependencys_feature()
+    val root = fea_temp()
+
+    dpf_with_b(root)
+
+    val g = fea_graph(root, dpf_b(""), "default = [x], x = [\"b/y\"]", fea_silent())
+
+    assert_eq(fea_on(g, ""), "default,x")
+    assert_eq(fea_on(g, "github.com.e.b"), "y")
+    remove_dir_all(root).unwrap_or(())
+
+// Freedom to disagree: the same graph with the root's `default` off asks `b` for nothing.
+@test("and --no-default-features leaves the dependency's feature off")
+dpf_no_default_leaves_it_off()
+    val root = fea_temp()
+
+    dpf_with_b(root)
+
+    val g = fea_graph(root, dpf_b(""), "default = [x], x = [\"b/y\"]", fea_request([], true, false))
+
+    assert_eq(fea_on(g, ""), "")
+    assert_eq(fea_on(g, "github.com.e.b"), "")
+    remove_dir_all(root).unwrap_or(())
+
+@test("and asking for the feature by name turns it on without default")
+dpf_asking_by_name_turns_it_on()
+    val root = fea_temp()
+
+    dpf_with_b(root)
+
+    val g = fea_graph(root, dpf_b(""), "default = [], x = [\"b/y\"]", fea_request(["x"], true, false))
+
+    assert_eq(fea_on(g, "github.com.e.b"), "y")
+    remove_dir_all(root).unwrap_or(())
+
+@test("two members asking one dependency for two features get the union")
+dpf_two_members_union()
+    val root = fea_temp()
+
+    dpf_with_b(root)
+
+    val g = fea_graph(root, dpf_b(""), "default = [x, w], x = [\"b/y\"], w = [\"b/z\"]", fea_silent())
+
+    assert_eq(fea_on(g, "github.com.e.b"), "y,z")
+    remove_dir_all(root).unwrap_or(())
+
+@test("and a member's request joins the one the dependency entry writes")
+dpf_member_joins_the_entrys_request()
+    val root = fea_temp()
+
+    dpf_with_b(root)
+
+    val g = fea_graph(root, dpf_b("features = [z]"), "default = [x], x = [\"b/y\"]", fea_silent())
+
+    assert_eq(fea_on(g, "github.com.e.b"), "y,z")
+    remove_dir_all(root).unwrap_or(())
+
+@test("an optional dependency is pulled in by the member alone")
+dpf_an_optional_dependency_is_pulled_in()
+    val root = fea_temp()
+
+    dpf_with_b(root)
+
+    val on = fea_graph(root, dpf_b("optional = true"), "x = [\"b/y\"]", fea_request(["x"], false, false))
+
+    assert_eq(fea_selected(on), "github.com.e.b")
+    assert_eq(fea_on(on, "github.com.e.b"), "y")
+
+    val off = fea_graph(root, dpf_b("optional = true"), "x = [\"b/y\"]", fea_silent())
+
+    assert_eq(fea_selected(off), "")
+    remove_dir_all(root).unwrap_or(())
+
+// A dependency is a consumer too: `a`'s own feature asks `b` for `y`, and the root only asks `a`.
+@test("a dependency's own feature asks its dependency, through the same resolution")
+dpf_a_dependencys_feature_asks_its_dependency()
+    val root = fea_temp()
+
+    dpf_with_b(root)
+    fea_publish(root, "github.com/e/a", "a", dpf_b("optional = true"), "default = [], x = [\"b/y\"]")
+
+    val g = fea_graph(root, fea_entry("a", "github.com/e/a", "features = [x]"), "", fea_silent())
+
+    assert_eq(fea_selected(g), "github.com.e.a,github.com.e.b")
+    assert_eq(fea_on(g, "github.com.e.b"), "y")
+    remove_dir_all(root).unwrap_or(())
+
+@test("the dependency has to declare the feature: the refusal names who asked, the dependency, and lists its features")
+dpf_the_dependency_has_to_declare_it()
+    val root = fea_temp()
+
+    dpf_with_b(root)
+
+    assert_eq(fea_resolved(root, dpf_b(""), "default = [x], x = [\"b/q\"]", fea_silent(), false).unwrap_err(),
+              "the feature 'x' of this project names 'b/q', but 'github.com.e.b' declares no feature " +
+              "'q' — a '<dependency>/<feature>' member may only name a feature that package's own " +
+              "manifest names. It declares 'y', 'z'")
+    remove_dir_all(root).unwrap_or(())
+
+@test("and a dependency declaring no features says so")
+dpf_a_dependency_declaring_none()
+    val root = fea_temp()
+
+    fea_publish(root, "github.com/e/b", "b", "", "")
+
+    assert_eq(fea_resolved(root, dpf_b(""), "default = [x], x = [\"b/y\"]", fea_silent(), false).unwrap_err(),
+              "the feature 'x' of this project names 'b/y', but 'github.com.e.b' declares no feature " +
+              "'y' — a '<dependency>/<feature>' member may only name a feature that package's own " +
+              "manifest names, and it declares none")
+    remove_dir_all(root).unwrap_or(())
+
+// The manifest's own refusals, at the read.
+private dpf_read(deps: string, feats: string) -> string =
+    read_manifest(fea_manifest("app", "0.1.0", deps, feats)).unwrap_err()
+
+@test("the first half has to be a dependency of this manifest")
+dpf_not_a_dependency()
+    assert_eq(dpf_read("", "x = [\"kairos/uv\"]"),
+              "'features.x' names 'kairos/uv', but this package has no dependency 'kairos' — a member " +
+              "written '<dependency>/<feature>' turns on a feature of a dependency this manifest " +
+              "declares, so write that entry in the 'dependencies' block")
+
+@test("a dev dependency is refused, a feature being read by builds that never resolve one")
+dpf_a_dev_dependency()
+    val m = "package { name = \"app\", version = \"0.1.0\" }\n" +
+            "dev_dependencies { kairos { git = \"github.com/e/kairos\", version = \"1.0.0\" } }\n" +
+            "features { x = [\"kairos/uv\"] }\n"
+
+    assert_eq(read_manifest(m).unwrap_err(),
+              "'features.x' names 'kairos/uv', but 'kairos' is declared in 'dev_dependencies' — a " +
+              "feature is read by every build of this package, and a dev dependency is resolved only " +
+              "by 'sysl test' on this package, so no other build would have it to turn the feature on " +
+              "in. Declare it in 'dependencies' to name it from a feature")
+
+@test("Cargo's weak '<dependency>?/<feature>' form is refused")
+dpf_the_weak_form()
+    assert_eq(dpf_read(dpf_b("optional = true"), "x = [\"b?/y\"]"),
+              "'features.x' names 'b?/y', Cargo's weak form, which sysl does not support — write " +
+              "'b/y', which turns on the dependency as well as its feature")
+
+@test("an empty dependency half is refused")
+dpf_an_empty_dependency_half()
+    assert_eq(dpf_read(dpf_b(""), "x = [\"/y\"]"),
+              "'features.x' names '/y', which leaves out the dependency — a member written " +
+              "'<dependency>/<feature>' turns on a feature of a dependency this manifest declares, so " +
+              "both halves have to be there")
+
+@test("an empty feature half is refused")
+dpf_an_empty_feature_half()
+    assert_eq(dpf_read(dpf_b(""), "x = [\"b/\"]"),
+              "'features.x' names 'b/', which leaves out the feature — a member written " +
+              "'<dependency>/<feature>' turns on a feature of a dependency this manifest declares, so " +
+              "both halves have to be there")
+
+// An optional dependency reached only through '<dependency>/<feature>' is named by a feature, so the
+// "no feature names it" refusal does not fire.
+@test("an optional dependency named only by '<dependency>/<feature>' counts as named")
+dpf_counts_as_named()
+    assert(read_manifest(fea_manifest("app", "0.1.0", dpf_b("optional = true"), "x = [\"b/y\"]")).is_ok())
+
+// The source half: `engine`'s `fast`-gated body compiles into the root's program exactly where the
+// root's own feature asked for it.
+private dpf_engine() -> string =
+    fea_dependency("engine", "#if feature_fast\ntag() -> string = \"fast\"\n#else\ntag() -> string = \"plain\"\n#endif",
+                   "fast = [], slow = []")
+
+@test("the dependency's gated code is compiled in where the root's feature asks for it")
+dpf_gated_code_is_compiled_in()
+    if !fea_ready() then return
+
+    val dep = dpf_engine()
+
+    assert_eq(fea_run(fea_app(fea_saying(s"e { path = \"$dep\" }", "default = [quick], quick = [\"e/fast\"]"),
+                              "print(engine.tag())\n")), "fast\n")
+    remove_dir_all(dep).unwrap_or(())
+
+@test("and left out where nothing turns the root's feature on")
+dpf_gated_code_is_left_out()
+    if !fea_ready() then return
+
+    val dep = dpf_engine()
+
+    assert_eq(fea_run(fea_app(fea_saying(s"e { path = \"$dep\" }", "default = [], quick = [\"e/fast\"]"),
+                              "print(engine.tag())\n")), "plain\n")
+    remove_dir_all(dep).unwrap_or(())
+
+// The run cache keys each tree's `features` block by what it declares, so changing which feature of the
+// dependency a member asks for is another program.
+@test("changing which dependency feature a member asks for changes the run key")
+dpf_the_run_key_follows_the_member()
+    val dep = dpf_engine()
+    val asking_fast = fea_saying(s"e { path = \"$dep\" }", "default = [quick], quick = [\"e/fast\"]")
+    val root = fea_app(asking_fast, "print(engine.tag())\n")
+
+    reset_feature_request()
+
+    val fast = run_cache_key_of("run", root, host_target(), DefaultOptimization, None)
+
+    write_text(s"$root/package.hocon",
+               fea_saying(s"e { path = \"$dep\" }", "default = [quick], quick = [\"e/slow\"]")).unwrap()
+
+    val slow = run_cache_key_of("run", root, host_target(), DefaultOptimization, None)
+
+    write_text(s"$root/package.hocon", asking_fast).unwrap()
+
+    val again = run_cache_key_of("run", root, host_target(), DefaultOptimization, None)
+
+    assert(fast.is_some() && slow.is_some())
+    assert(fast.unwrap() != slow.unwrap())
+    assert_eq(again.unwrap_or("no key"), fast.unwrap())
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())

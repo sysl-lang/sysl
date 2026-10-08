@@ -465,7 +465,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     not_in_both(dependencies, dev)?
 
     val allocator = read_allocator(root)?
-    val features = read_features(root, dependencies)?
+    val features = read_features(root, dependencies, dev)?
     val optimization = read_optimization(root)?
     val link = read_link(root)?
     val lto = read_lto(root)?
@@ -845,11 +845,16 @@ end link_word
 
 // The `features` block, checked against the dependencies it turns on.
 //
-// A member is a feature of this package, an optional dependency, or `dep:` and a dependency's
-// label. **A member naming another feature is that feature** even where a dependency shares its
-// label; a member naming its *own* feature is the dependency of that label where there is one, which
-// is what lets a package name a feature after the dependency it turns on.
-private read_features(root: &Conf, deps: &Buf[Dependency]) -> Result[Buf[(string, Buf[string])], string]
+// A member is a feature of this package, an optional dependency, `dep:` and a dependency's label, or
+// a dependency's label, `/` and one of that dependency's features. **A member naming another feature
+// is that feature** even where a dependency shares its label; a member naming its *own* feature is
+// the dependency of that label where there is one, which is what lets a package name a feature after
+// the dependency it turns on.
+//
+// A `<dependency>/<feature>` member is checked here only for its first half: whether the dependency's
+// manifest declares the feature is answered once that manifest is read, during resolution.
+private read_features(root: &Conf, deps: &Buf[Dependency],
+                      dev: &Buf[Dependency]) -> Result[Buf[(string, Buf[string])], string]
     var out: Buf[(string, Buf[string])] = buf()
 
     conf_at(root, "features") match
@@ -888,6 +893,11 @@ private read_features(root: &Conf, deps: &Buf[Dependency]) -> Result[Buf[(string
 
                 optional_or_refuse(dep.unwrap(), where)?
                 named.push(label)
+                continue
+            end if
+
+            if m.index_of("/").is_some()
+                named.push(dependency_feature_label(m, where, deps, dev)?)
                 continue
             end if
 
@@ -948,6 +958,47 @@ private optional_or_refuse(dep: Dependency, where: string) -> Result[unit, strin
         "optional dependency on, and this one is taken whatever is asked for. Write " +
         "'optional = true' in that dependency's entry, or drop it from the feature")
 end optional_or_refuse
+
+// A `<dependency>/<feature>` member split at its first `/`, or `None` for a member of any other form.
+dependency_feature(member: string) -> Option[(string, string)] = member.index_of("/") match
+    None -> None
+    Some(at) -> Some((member[0..<at], member[(at + 1)..]))
+
+// The dependency a `<dependency>/<feature>` member turns on, refused where the member cannot be
+// answered: Cargo's weak `<dependency>?/<feature>` form, a half left empty, and a first half that is
+// not a dependency of this manifest.
+//
+// **A `dev_dependencies` entry is refused too**: a feature is read by every build of the package,
+// while a dev dependency is resolved only by `sysl test` on the package itself, so no other build has
+// the package the member asks a feature of.
+private dependency_feature_label(m: string, where: string, deps: &Buf[Dependency],
+                                 dev: &Buf[Dependency]) -> Result[string, string]
+    val (label, feature) = dependency_feature(m).unwrap()
+
+    if label.ends_with("?")
+        return Err(s"'$where' names '$m', Cargo's weak form, which sysl does not support — write " +
+            s"'${label[0..<(label.len - 1)]}/$feature', which turns on the dependency as well as its " +
+            "feature")
+
+    if label.is_empty() || feature.is_empty()
+        val missing = if label.is_empty() then "dependency" else "feature"
+
+        return Err(s"'$where' names '$m', which leaves out the $missing — a member written " +
+            "'<dependency>/<feature>' turns on a feature of a dependency this manifest declares, so " +
+            "both halves have to be there")
+
+    if dependency_labelled(deps, label).is_some() then return Ok(label)
+
+    if dependency_labelled(dev, label).is_some()
+        return Err(s"'$where' names '$m', but '$label' is declared in 'dev_dependencies' — a feature " +
+            "is read by every build of this package, and a dev dependency is resolved only by " +
+            "'sysl test' on this package, so no other build would have it to turn the feature on in. " +
+            "Declare it in 'dependencies' to name it from a feature")
+
+    Err(s"'$where' names '$m', but this package has no dependency '$label' — a member written " +
+        "'<dependency>/<feature>' turns on a feature of a dependency this manifest declares, so write " +
+        "that entry in the 'dependencies' block")
+end dependency_feature_label
 
 // The features a feature turns on, which are its members that read as features rather than as
 // dependencies.
