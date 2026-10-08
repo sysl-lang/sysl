@@ -45,6 +45,20 @@ The functions switched off are the ones that ask C to allocate. `sysl.unicode` b
 `utf8proc_reencode` over it — which is what `utf8proc_map` does internally, with the allocation on
 the side that has an allocator.
 
+## Where the case tables depart from the database
+
+**One code point, corrected in sysl rather than in the data.** utf8proc's generator gives `ß`
+(U+00DF) the simple uppercase and titlecase `ẞ` (U+1E9E); UnicodeData.txt leaves both fields of
+U+00DF empty, `ẞ` lowercasing to `ß` with no mapping back. `to_upper` and `to_title` in
+`unicode.sysl` answer `ß` for it. The vendored entry is left as shipped because `utf8proc_islower`
+derives "lowercase" from the same fields, and emptying them would make `is_lower('ß')` false.
+
+Every code point's `utf8proc_toupper`, `utf8proc_tolower` and `utf8proc_totitle` was compared with
+fields 12, 13 and 14 of `https://www.unicode.org/Public/17.0.0/ucd/UnicodeData.txt` (SHA-256
+`2e1efc1dcb59c575eedf5ccae60f95229f706ee6d031835247d843c11d96470c`; an empty titlecase field means
+the uppercase one), and U+00DF was the only disagreement. A refresh repeats that comparison: a C
+loop over 0..0x10FFFF printing the three answers, diffed against the file.
+
 ## Refreshing it
 
 ```

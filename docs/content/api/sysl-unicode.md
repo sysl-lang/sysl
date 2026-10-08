@@ -234,11 +234,12 @@ signature can promise and all that most text needs. The mappings that change a s
 -- `ﬃ` uppercasing to `FFI` -- are *special* casing, and a caller who wants them wants `fold` in
 `map.sysl`, which is the operation defined to produce them.
 
-**`ß` is the one worth knowing about, because the simple answer is not the famous one.** Full
-casing gives `SS`, which is what most languages' `upper` answers and what a reader expects; the
-simple mapping has one character to give and gives `ẞ`, U+1E9E, the capital sharp s. It round
-trips -- `to_lower('ẞ')` is `'ß'` -- which `SS` could not. `fold` is where `ss` comes from, and
-comparing is what a caller wanting it was doing.
+**`ß` is the one worth knowing about, because it has no simple uppercase at all.** Full casing
+gives `SS`, which is what most languages' `upper` answers; the Unicode Character Database gives
+`ß` no simple uppercase mapping, so `to_upper('ß')` is `'ß'` and `"straße"` uppercases to
+`"STRAßE"`. The mapping is not symmetric: `ẞ`, U+1E9E, the capital sharp s, lowercases to `ß`,
+but `ß` does not uppercase to it. `fold` is where `ss` comes from, and comparing is what a caller
+wanting it was doing.
 
 `to_upper('é')` is `'É'`, which is the whole point of this module: the ASCII answer was `'é'`.
 
