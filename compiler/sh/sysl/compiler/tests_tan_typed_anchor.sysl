@@ -1,0 +1,261 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// **The typed tree is built at each node's ANCHOR**, as the reference types every node at its `pos`:
+// a call at its callee, a member at its name, a subscript at its `[`, a `T::Attr` at its `::`. The
+// untyped tree keeps the extent (`dgn_`, `sxt_`), and `anchor.sysl`'s `anchor_of` is the one place
+// the two meet.
+//
+// **Every caret and every span here was read out of 0.0.162** by handing it the same source. Before
+// the typed tree took the anchor, a subscript was refused across `[1]` rather than at the `[`, a
+// `@no_alloc` reach underlined `push(1)` rather than `push`, and an `asm` arm was refused across its
+// brackets alone rather than the whole arm.
+
+private var tan_library_cache: Buf[Program] = buf()
+private var tan_library_read: bool = false
+
+private tan_library() -> Buf[Program]
+    if tan_library_read then return tan_library_cache
+
+    tan_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tan_library_cache = units
+
+    tan_library_cache
+end tan_library
+
+private tan_no_library() -> bool
+    if tan_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end tan_no_library
+
+// The whole report one file is refused with, after every check a build runs.
+private tan_err(text: string) -> string
+    var units: Buf[Program] = buf()
+    val library = tan_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parse(source_of("t.sysl", text)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    post_analysis_checks(done.an, program_of(done, ""), buf())
+
+    // The report drops its last newline; one put back lets every excerpt be quoted whole.
+    analysis_report(errors_of(done.an.diagnostics())) + "\n"
+end tan_err
+
+private tan_says(said: string, part: string) = assert(said.contains(part), said)
+
+private tan_calls() -> string = raw"""
+    struct P
+        x: int
+
+        get(self, k: int) -> int = self.x + k
+
+    g(n: int) -> int = n + 1
+
+    h(p: P, n: int) -> int
+        val a = g(1, 2)
+        val b = p.get()
+        val c = n[1]
+        val d = p.y
+        a + b + c + d
+
+    print(h(P(1), 2))
+    """
+
+@test("a call is refused at its callee, a member call at the member, a subscript at its '['")
+tan_call_member_and_subscript_carets()
+    if tan_no_library() then return
+
+    val said = tan_err(tan_calls())
+
+    tan_says(said, "error: function 'g' takes 1 argument, but 2 arguments were given\n --> t.sysl:9:13\n")
+    tan_says(said, "9 |     val a = g(1, 2)\n  |             ^\n")
+    tan_says(said, "10 |     val b = p.get()\n   |               ^^^\n")
+    tan_says(said, "error: cannot index int\n")
+    tan_says(said, "t.sysl:11:14\n")
+    tan_says(said, "11 |     val c = n[1]\n   |              ^\n")
+    tan_says(said, "12 |     val d = p.y\n   |               ^\n")
+
+@test("a type attribute is refused at its '::', and a call through parentheses at the name inside")
+tan_type_attribute_and_parenthesised_callee()
+    if tan_no_library() then return
+
+    val said = tan_err(raw"""
+        struct P
+            x: int
+
+        h(p: P) -> int
+            val a = int::Bogus
+            val r = p.x()
+            val s = (h)(p, 1)
+            a
+
+        print(h(P(1)))
+        """)
+
+    tan_says(said, "5 |     val a = int::Bogus\n  |                ^^\n")
+    tan_says(said, "6 |     val r = p.x()\n  |               ^\n")
+    tan_says(said, "7 |     val s = (h)(p, 1)\n  |              ^\n")
+
+@test("what a '@no_alloc' module reaches through a member call is shown at the member")
+tan_no_alloc_reach_at_the_member()
+    if tan_no_library() then return
+
+    val said = tan_err("@no_alloc\n\nimport sysl.buf.{Buf, buf}\n\nvar b: Buf[int] = buf()\n\nb.push(1)\n")
+
+    tan_says(said, " --> t.sysl:7:3\n")
+    tan_says(said, "7 | b.push(1)\n  |   ^^^^\n")
+
+// -- an `asm` arm covers what answers for it ---------------------------------------------------------
+
+@test("an asm arm naming one processor twice is refused across the whole second arm")
+tan_asm_second_arm()
+    if tan_no_library() then return
+
+    val said = tan_err(raw"""
+        f() -> unit
+            asm
+                [aarch64]
+                    "nop"
+                [aarch64] "nop"
+                [x86_64]  unavailable "no"
+                [craft, thumb, x86, riscv32, riscv64, wasm32]
+
+        f()
+        """)
+
+    tan_says(said, "5 |         [aarch64] \"nop\"\n  |         ^^^^^^^^^^^^^^^\n")
+
+@test("an arm with no answer is refused across its reason too")
+tan_asm_unavailable_arm()
+    if tan_no_library() then return
+
+    val said = tan_err(raw"""
+        f() -> unit
+            asm
+                [aarch64]  unavailable "nope"
+                [x86_64]  "nop"
+                [craft, thumb, x86, riscv32, riscv64, wasm32]
+
+        f()
+        """)
+
+    tan_says(said, "error: this operation has no answer on aarch64: nope\n")
+    tan_says(said, "3 |         [aarch64]  unavailable \"nope\"\n  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n")
+
+@test("an operand nobody declared is refused across the arm's instruction")
+tan_asm_undeclared_operand()
+    if tan_no_library() then return
+
+    val said = tan_err(raw"""
+        f(x: int) -> unit
+            asm
+                [aarch64]  "add {y}"
+                [x86_64]  "nop"
+                [craft, thumb, x86, riscv32, riscv64, wasm32]
+
+        f(1)
+        """)
+
+    tan_says(said, "3 |         [aarch64]  \"add {y}\"\n  |         ^^^^^^^^^^^^^^^^^^^^\n")
+
+@test("a name that is no processor is refused at the first line of a block arm")
+tan_asm_block_arm()
+    if tan_no_library() then return
+
+    val said = tan_err(raw"""
+        f() -> unit
+            asm
+                [aarch64, bogus]
+                    "nop"
+                    "nop"
+                [aarch64] "nop"
+                [x86_64]  unavailable "no"
+                [craft, thumb, x86, riscv32, riscv64, wasm32]
+
+        f()
+        """)
+
+    tan_says(said, "error: 'bogus' is not a processor")
+    tan_says(said, "3 |         [aarch64, bogus]\n  |         ^^^^^^^^^^^^^^^^\n")
+
+@test("an asm arm's span runs to the end of its block, and an empty arm's to its ']'")
+tan_asm_arm_extent()
+    val tree = emit_ast(parse(source_of("t.sysl", raw"""
+        f() -> unit
+            asm
+                [aarch64]
+                    "nop"
+                    "nop"
+                [x86_64] "nop"
+                [riscv64, wasm32]  unavailable "no"
+                [craft, thumb, x86, riscv32]
+        """)).program, true)
+
+    tan_says(tree, "AsmArm 3:9-6:9\n")
+    tan_says(tree, "AsmArm 6:9-6:23\n")
+    tan_says(tree, "AsmArm 7:9-7:44\n")
+    tan_says(tree, "AsmArm 8:9-8:37\n")
+
+// -- the typed tree's own spans -----------------------------------------------------------------------
+
+@test("the typed tree carries a call, a subscript and a member at the reference's anchors")
+tan_typed_spans_are_anchors()
+    if tan_no_library() then return
+
+    val root = make_temp_dir("sysl-tan-typed").unwrap()
+    val file = s"$root/fixture.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(file, raw"""
+        struct P
+            x: int
+
+            get(self, k: int) -> int = self.x + k
+
+        g(n: int) -> int = n + 1
+
+        h(p: P, xs: [3]int) -> int
+            val a = g(1)
+            val b = p.get(2)
+            val c = xs[1]
+            val d = p.x
+            a + b + c + d
+
+        print(h(P(1), [1, 2, 3]))
+        """).unwrap()
+
+    val (whole, _) = typed_program(typed_compilation(file, None).unwrap())
+
+    remove_dir_all(root).unwrap_or(())
+
+    var text = ""
+    val was = set_typed_spans(true)
+
+    for i in 0..<whole.funcs.len()
+        if whole.funcs.at(i).name == "h" then text = show_typed_func(whole.funcs.at(i))
+
+    set_typed_spans(was)
+
+    tan_says(text, "init: TCall 9:13-9:14\n")
+    tan_says(text, "init: TCall 10:15-10:18\n")
+    tan_says(text, "- TLoad 10:13-10:14\n")
+    tan_says(text, "init: TIndex 11:15-11:16\n")
+    tan_says(text, "init: TField 12:15-12:16\n")
