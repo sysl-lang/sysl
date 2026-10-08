@@ -24,7 +24,7 @@ the path is standing on.
 | `sysl emit-typed <path>` | print one module's typed tree, as deterministic text |
 | `sysl emit-header <path>` | print the C header for what a module exports |
 | `sysl weave <path>` | render a literate source as an HTML document — *not yet in this compiler* |
-| `sysl tangle <path>` | print the program a literate source holds — *not yet in this compiler* |
+| `sysl tangle <path>` | print the program a literate source holds |
 | `sysl deps <path>` | print the dependency graph the project resolves to |
 | `sysl add <coordinate>` | add a dependency to the project's manifest |
 | `sysl vendor <path>` | put what the project depends on into `vendor/` — *not yet in this compiler* |
@@ -37,9 +37,9 @@ A subcommand is required; sysl with none exits 2 and prints its usage.
 
 A word that is not one of these is refused with the usage, and exits 2.
 
-**Four of these are not in this compiler yet**: `weave`, `tangle`, `vendor` and `targets`. Each is
-described below as it will work, and until it is added each is refused in the same words, with the
-usage under them and exit status 2:
+**Three of these are not in this compiler yet**: `weave`, `vendor` and `targets`. Each is described
+below as it will work, and until it is added each is refused in the same words, with the usage under
+them and exit status 2:
 
 ```text
 sysl: `weave` is not a command this compiler can carry out yet
@@ -377,15 +377,15 @@ the declarations *say* — so a tree usually wants both, and neither is a substi
 
 ### `tangle`
 
-*Not yet in this compiler — it answers "`tangle` is not a command this compiler can carry out yet".
-What follows is the command as it will be.*
-
 ```bash
-sysl tangle guide/slab/slab.lsysl
-sysl tangle guide/slab/slab.lsysl -o slab.sysl
+sysl tangle library/sysl/regex/vm.lsysl
+sysl tangle library/sysl/regex/vm.lsysl -o vm.sysl
 ```
 
-The other half of a literate system: the program, with the prose stripped. A build tangles anyway —
+`tangle [-o <path>] <path>`. The other half of a literate system: the program, with the prose
+stripped, written to standard output or to what `-o` names. A path holding several literate sources
+gives their programs one after another; the ordinary `.sysl` files beside them are passed over, and a
+tree with none is refused. A build tangles anyway —
 that is how a `.lsysl` file compiles at all — so what this adds is a way to **see** it.
 
 That is worth having when a literate file misbehaves. A block indented that should not have been, a
