@@ -5,7 +5,7 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map, Set, set}
 import sysl.env.{get as env_var}
-import sysl.fs.{IoError, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, walk, write_text}
+import sysl.fs.{entries, IoError, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, walk, write_text}
 import sysl.process.{capture, Output, Var}
 import sysl.text.{join, replace_all, split, str_builder, Search}
 
@@ -85,6 +85,12 @@ private is_sysl_source(path: string) -> bool = path.ends_with(".sysl") || path.e
 // own library has not got -- a module `library/` ADDS rather than changes -- for the reference to
 // compile this tree with (`--lib`). Nothing where the reference's library is unknown or nothing is
 // added. The caller removes the directory.
+//
+// **A new FILE is not a new MODULE.** A module's files are its directory's, so a file listed beside
+// files the reference's library already has in that directory (`sysl/math/nextafter.sysl` in
+// `sysl.math`) adds to a module the reference has -- and the reference refuses a `--lib` root
+// declaring a standard module at all. Such a file is left out, as a changed file is: neither compiler
+// sees it, and what reaches it is excused by its row like any other patched module.
 reference_overlay(binary: string) -> Option[string] = oracle_library(binary) match
     None -> None
     Some(lib) -> reference_overlay_from(lib, "../scripts/library_patches.tsv", "../library")
@@ -106,6 +112,10 @@ reference_overlay_from(lib: string, patches: string, library: string) -> Option[
 
         if present(s"$lib/$file") || !present(s"$library/$file") then continue
 
+        val dir = parent_of(file).unwrap_or("")
+
+        if dir != "" && holds_sources(s"$lib/$dir") then continue
+
         if root.is_none() then root = make_temp_dir("sysl-overlay").ok()
 
         if root.is_none() then return None
@@ -120,6 +130,19 @@ reference_overlay_from(lib: string, patches: string, library: string) -> Option[
 
     root
 end reference_overlay_from
+
+// Whether `dir` holds a source file of its own -- a module lives there -- rather than only the
+// directories of the modules nested under it.
+private holds_sources(dir: string) -> bool
+    val names = entries(dir) match
+        Err(_) -> return false
+        Ok(n) -> n
+
+    for i in 0..<names.len()
+        if is_sysl_source(names.at(i)) then return true
+
+    false
+end holds_sources
 
 // The modules `scripts/library_patches.tsv` lists, read where the suite runs (`compiler/`), so the
 // file is the only place the list is written. No file, or no rows, excuses nothing.
@@ -2224,10 +2247,16 @@ private compare_whole_text(theirs: string, raw: string, label: string, confined:
     end if
 
     // A file is excused only where the two texts are the same text once every confined definition
-    // and declaration is out of both (`patch_confined`).
+    // and declaration is out of both (`patch_confined`), and every HOLDER's definition too -- a
+    // program's own type whose layout moved because it holds a listed module's type by value
+    // (`enum Failure { Io(e: IoError) }` once `IoError` gained a wider variant), which the type
+    // comparison above already excuses by the same rule (`holders_on_both`).
     val held = !confined.is_empty() || !patched.is_empty()
+    val holding = holders_on_both(declared_type_lines(theirs), declared_type_lines(ours), patched)
+    val their_rest = without_holders(without_confined(theirs, confined, patched), holding)
+    val our_rest = without_holders(without_confined(ours, confined, patched), holding)
 
-    if held && without_confined(theirs, confined, patched) == without_confined(ours, confined, patched)
+    if held && their_rest == our_rest
         found.whole_excused += 1
         return
     end if
@@ -2255,6 +2284,24 @@ private compare_whole_text(theirs: string, raw: string, label: string, confined:
         found.first_bad_whole = s"${found.first_bad_whole}\n$label: " +
             s"${where.unwrap_or("the texts differ in length alone")}"
 end compare_whole_text
+
+// A text with the definition line of every type `holding` names taken out; every other line kept.
+without_holders(text: string, holding: Set[string]) -> string
+    if holding.is_empty() then return text
+
+    val all = lines_of(text)
+    var out = str_builder()
+
+    for i in 0..<all.len()
+        val line = all.at(i)
+
+        if line.starts_with("%") && line.contains(" = type ") && holding.has(type_def_name(line)) then continue
+
+        out.push(line)
+        out.push_char('\n')
+
+    out.finish()
+end without_holders
 
 // The symbols a text **declares**, which is every `declare` line it carries.
 private declared_symbols(text: string) -> Buf[string]
@@ -3267,6 +3314,34 @@ lpx_a_whole_file_differing_in_listed_types_alone()
 
     assert(without_confined(head + body, none, listed) != without_confined(changed + extra + body, none, listed))
 
+@test("library patches: a whole file whose own enum moved only because it holds a listed type is excused")
+lpx_a_whole_file_differing_in_a_holder_alone()
+    var listed: Buf[string] = buf()
+
+    listed.push("sysl.fs")
+
+    val none: Set[string] = set()
+    val head = "target triple = \"arm64-apple-macosx\"\n\n"
+    val body = "define i32 @main() {\n  ret i32 0\n}\n"
+    val theirs = head + "%enum.sysl.fs$IoError = type { i32, [1 x i32] }\n" +
+        "%Failure.Io = type { %enum.sysl.fs$IoError }\n%enum.Failure = type { i32, [2 x i32] }\n" + body
+    val ours = head + "%enum.sysl.fs$IoError = type { i32, [1 x i64] }\n" +
+        "%Failure.Io = type { %enum.sysl.fs$IoError }\n%enum.Failure = type { i32, [2 x i64] }\n" + body
+
+    var found = TypeAgreement(0, 0, 0, 0, 0, "", 0, 0, 0, "", 0, 0, 0, 0, 0, 0, "", buf(), 0, 0, 0)
+
+    compare_whole_text(theirs, ours, "holder", none, listed, &found)
+    assert_eq(found.whole_excused, 1)
+    assert_eq(found.whole_other, 0)
+
+    // An enum that holds nothing listed and moved anyway is still a difference.
+    val loose_theirs = theirs + "%enum.Loose = type { i32, [1 x i32] }\n"
+    val loose_ours = ours + "%enum.Loose = type { i32, [1 x i64] }\n"
+
+    compare_whole_text(loose_theirs, loose_ours, "loose", none, listed, &found)
+    assert_eq(found.whole_other, 1)
+end lpx_a_whole_file_differing_in_a_holder_alone
+
 // -- self-hosted-only constructs: what `self_hosted_only.tsv` excuses --------------------------------
 
 // The reference's answer to a block it cannot parse, as 0.0.162 gives it for `const sq(x: int)`.
@@ -3436,6 +3511,34 @@ rov_the_overlay_holds_only_added_modules()
     remove_dir_all(root.unwrap()).unwrap_or(())
     remove_dir_all(dir).unwrap_or(())
 end rov_the_overlay_holds_only_added_modules
+
+@test("a new file in a module the reference already has is not overlaid, and a new module beside it is")
+rov_a_new_file_in_an_existing_module_is_left_out()
+    val dir = make_temp_dir("sysl-rov").unwrap()
+    val lib = s"$dir/theirs"
+    val ours = s"$dir/ours"
+
+    make_dir_all(s"$lib/sysl/math").unwrap()
+    write_text(s"$lib/sysl/math/math.sysl", "module sysl.math\n").unwrap()
+    make_dir_all(s"$ours/sysl/math/rational").unwrap()
+    write_text(s"$ours/sysl/math/math.sysl", "module sysl.math\n").unwrap()
+    write_text(s"$ours/sysl/math/nextafter.sysl", "module sysl.math\n").unwrap()
+    write_text(s"$ours/sysl/math/rational/rational.sysl", "module sysl.math.rational\n").unwrap()
+    write_text(s"$dir/patches.tsv", "sysl/math/nextafter.sysl\tsysl.math\tnew file\n" +
+               "sysl/math/rational/rational.sysl\tsysl.math.rational\tnew module\n").unwrap()
+
+    val root = reference_overlay_from(lib, s"$dir/patches.tsv", ours)
+
+    assert(root.is_some(), "no overlay was made for the added module")
+    assert(present(s"${root.unwrap()}/sysl/math/rational/rational.sysl"), "the added module was left out")
+    assert(!present(s"${root.unwrap()}/sysl/math/nextafter.sysl"),
+           "a file adding to sysl.math reached the reference, which refuses a --lib root declaring it")
+    remove_dir_all(root.unwrap()).unwrap_or(())
+
+    write_text(s"$dir/only.tsv", "sysl/math/nextafter.sysl\tsysl.math\tnew file\n").unwrap()
+    assert(reference_overlay_from(lib, s"$dir/only.tsv", ours).is_none())
+    remove_dir_all(dir).unwrap_or(())
+end rov_a_new_file_in_an_existing_module_is_left_out
 
 @test("with nothing added there is no overlay")
 rov_nothing_added_is_no_overlay()
