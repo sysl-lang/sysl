@@ -28,9 +28,23 @@ run_cli(args: []string, say: string -> unit) -> int = run_cli_noted(args, say, s
 // The same, with the `--explain-escapes` report handed to a channel of its own. `main` hands it the
 // program's standard error, as the reference writes it, so what a build, an `emit-llvm` or a run
 // writes to standard output is the same with the flag as without it.
-run_cli_noted(args: []string, say: string -> unit, note: string -> unit) -> int
+//
+// **`say` is standard output and holds only what the command was run FOR** -- a tree, a module's
+// text, a header, a test report, a dependency graph, the usage somebody asked for. Everything the
+// compiler says ABOUT the run goes to `note`, standard error, as the reference writes it: a
+// diagnostic, a refusal, a mistake in the command line and the usage under it, `wrote <exe>`, and
+// a C archive's link advice. So `sysl emit-llvm p > p.ll` holds a module or nothing at all, and a
+// failed build's errors reach a terminal whatever its output was redirected into.
+run_cli_noted(args: []string, say: string -> unit, note: string -> unit) -> int =
+    run_cli_reported(args, say, note, (piece) -> stream_out(piece))
+
+// The same, with the report `sysl test` streams handed to a channel of its own. **The report is
+// pieces, not lines** -- each verdict is written and flushed as it lands, carrying its own newline --
+// so it cannot travel on `say`, which ends every line it is given. `main` sends it to standard
+// output; a test reads it.
+run_cli_reported(args: []string, say: string -> unit, note: string -> unit, report: string -> unit) -> int
     if args.len < 2
-        say(usage())
+        note(usage())
         return Misused
 
     // **Where things are on this machine is read afresh for every command line.** One process
@@ -43,14 +57,14 @@ run_cli_noted(args: []string, say: string -> unit, note: string -> unit) -> int
     // A flag that named a `.syslib` is refused by every command in one sentence, before any of them
     // reads its own flags -- none of them takes it, whatever it was handed.
     if names_std_lib(args[1..<args.len])
-        say(refused(std_lib_refusal()))
+        note(refused(std_lib_refusal()))
         return Misused
     end if
 
     // A `--link` naming an empty library is refused where it was typed, by every command alike.
     link_flag_refusal(args[1..<args.len]) match
         Some(why) ->
-            say(refused(why))
+            note(refused(why))
             return Misused
         None -> ()
 
@@ -58,7 +72,7 @@ run_cli_noted(args: []string, say: string -> unit, note: string -> unit) -> int
     // command line's mistakes, said as the reference's option parser says them, the usage under them.
     pipeline_flag_refusal(args[1..<args.len]) match
         Some(why) ->
-            say(OptionLead + why + "\n" + usage())
+            note(OptionLead + why + "\n" + usage())
             return Misused
         None -> ()
 
@@ -80,23 +94,23 @@ run_cli_noted(args: []string, say: string -> unit, note: string -> unit) -> int
     args[1] match
         "emit-ast" -> emit_ast_command(args, say, note)
         "emit-typed" -> emit_typed_command(args, say, note)
-        "emit-llvm" -> emit_llvm_command(args, say)
-        "build" -> build_command(args, say)
-        "build-lib" -> build_lib_command(args, say)
-        "build-c" -> build_c_command(args, say)
-        "emit-header" -> emit_header_command(args, say)
-        "run" -> run_command(args, say)
-        "test" -> test_command(args, say)
-        "add" -> add_command(args, say)
-        "deps" -> deps_command(args, say)
+        "emit-llvm" -> emit_llvm_command(args, say, note)
+        "build" -> build_command(args, note)
+        "build-lib" -> build_lib_command(args, note)
+        "build-c" -> build_c_command(args, note)
+        "emit-header" -> emit_header_command(args, say, note)
+        "run" -> run_command(args, note)
+        "test" -> test_command(args, say, note, report)
+        "add" -> add_command(args, say, note)
+        "deps" -> deps_command(args, say, note)
         "tidy" -> tidy_command(args, say)
         "vendor" -> vendor_command(args, say)
         "doc" -> doc_command(args, say)
         "tangle" -> tangle_command(args, say)
         "prove" -> prove_command(args, say, note)
         other ->
-            say(s"sysl: `${other}` is not a command this compiler can carry out yet")
-            say(usage())
+            note(s"sysl: `${other}` is not a command this compiler can carry out yet")
+            note(usage())
             Misused
 
 // `sysl emit-ast [--no-spans] <file>` -- one file's untyped parse tree, written out as deterministic
@@ -124,17 +138,17 @@ private emit_ast_command(args: []string, say: string -> unit, note: string -> un
         i += 1
 
     if mistakes.len() > 0
-        say(misused(mistakes, emit_ast_usage()))
+        note(misused(mistakes, emit_ast_usage()))
         return Misused
     end if
 
     if file == ""
-        say(emit_ast_usage())
+        note(emit_ast_usage())
         return Misused
 
     read_bytes(file) match
         Err(_) ->
-            say(s"sysl: '${file}' cannot be read")
+            note(s"sysl: '${file}' cannot be read")
             Failed
         Ok(bytes) ->
             val parsed = parse(source(file, bytes))
@@ -202,12 +216,12 @@ private emit_typed_command(args: []string, say: string -> unit, note: string -> 
         i += 1
 
     if mistakes.len() > 0
-        say(misused(mistakes, emit_typed_usage()))
+        note(misused(mistakes, emit_typed_usage()))
         return Misused
     end if
 
     if file == ""
-        say(emit_typed_usage())
+        note(emit_typed_usage())
         return Misused
     end if
 
@@ -242,7 +256,7 @@ end emit_typed_command
 // symbol and the form it reached. A partial lowering owes a census of what it did not say, and the
 // difference between the two texts is only readable next to it: a symbol the reference defines and
 // this compiler does not is an absence, and this is what names the reason.
-private emit_llvm_command(args: []string, say: string -> unit) -> int
+private emit_llvm_command(args: []string, say: string -> unit, note: string -> unit) -> int
     var named: Option[string] = None
     var level: Option[string] = None
     var gaps = false
@@ -289,28 +303,28 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
         i += 1
 
     if mistakes.len() > 0
-        say(misused(mistakes, emit_llvm_usage()))
+        note(misused(mistakes, emit_llvm_usage()))
         return Misused
     end if
 
     if file == ""
-        say(emit_llvm_usage())
+        note(emit_llvm_usage())
         return Misused
     end if
 
     val at = build_level(file, level) match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             return Failed
         Ok(resolved) -> resolved
 
     emit_llvm_text(file, named, at) match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             Failed
         Ok(emitted) ->
             if !emitted.report.is_empty()
-                say(analysis_report(emitted.report))
+                note(analysis_report(emitted.report))
                 return Failed
             end if
 
@@ -326,7 +340,7 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
             // binary.
             val t = target_for(file, named) match
                 Err(why) ->
-                    say_failure(Said(why), say)
+                    say_failure(Said(why), note)
                     return Failed
                 Ok(resolved) -> resolved
 
@@ -346,7 +360,7 @@ private emit_llvm_usage() -> string =
 // twice; what this adds is the toolchain the text is handed to. `--cc` names the clang instead of
 // searching for one, and a person who wrote one down is owed an error rather than a different
 // compiler.
-private build_command(args: []string, say: string -> unit) -> int
+private build_command(args: []string, note: string -> unit) -> int
     var named: Option[string] = None
     var cc: Option[string] = None
     var out: Option[string] = None
@@ -417,7 +431,7 @@ private build_command(args: []string, say: string -> unit) -> int
         i += 1
 
     if mistakes.len() > 0
-        say(misused(mistakes, build_usage()))
+        note(misused(mistakes, build_usage()))
         return Misused
     end if
 
@@ -425,32 +439,32 @@ private build_command(args: []string, say: string -> unit) -> int
     if file == "" && picked.is_some() then file = "."
 
     if file == ""
-        say(build_usage())
+        note(build_usage())
         return Misused
     end if
 
-    if refused_features(say) then return Failed
+    if refused_features(note) then return Failed
 
     // **At a workspace root, every member is built**, the root first where it is a package; `-p`
     // narrows that to one. Each is an ordinary build of its own directory, the first refusal ending
     // the run as a build's refusal always does.
     val projects = workspace_projects(file, picked) match
         Err(why) ->
-            say(refused(why))
+            note(refused(why))
             return Failed
         Ok(found) -> found
 
     projects match
-        None -> build_project(file, named, cc, level, out, say)
+        None -> build_project(file, named, cc, level, out, note)
         Some(members) ->
             if out.is_some() && members.len() > 1
-                say(refused(s"'-o' names one file, and this workspace builds ${members.len()} " +
+                note(refused(s"'-o' names one file, and this workspace builds ${members.len()} " +
                     "members — pick one with '-p <member>'"))
                 return Failed
             end if
 
             for k in 0..<members.len()
-                val code = build_project(members.at(k).dir, named, cc, level, out, say)
+                val code = build_project(members.at(k).dir, named, cc, level, out, note)
 
                 if code != Fine then return code
 
@@ -459,19 +473,19 @@ end build_command
 
 // One project's build, once the command line has been read.
 private build_project(file: string, named: Option[string], cc: Option[string], level: Option[string],
-                      out: Option[string], say: string -> unit) -> int
+                      out: Option[string], note: string -> unit) -> int
     val at = build_level(file, level) match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             return Failed
         Ok(resolved) -> resolved
 
     build_native_program(file, named, cc, at, out) match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             Failed
         Ok(exe) ->
-            say(s"wrote $exe")
+            note(s"wrote $exe")
             Fine
 end build_project
 
@@ -558,10 +572,10 @@ end asked_outright
 // **because only one of them is a sentence**: a refusal about the project has no `error: ` on it and
 // takes the command's lead here, where an analysis report is already rendered and every diagnostic
 // in it carries its own. Prefixing both is what printed `error: error:`.
-private say_failure(why: Failure, say: string -> unit)
+private say_failure(why: Failure, note: string -> unit)
     why match
-        Said(refusal) -> say(refused(refusal.message))
-        Reported(report) -> say(report)
+        Said(refusal) -> note(refused(refusal.message))
+        Reported(report) -> note(report)
 
 // An optimization level at `args[i]`, spelled the way clang spells it -- `-O2` joined, `-O 2` apart
 // -- or as `--optimize 2`: how many arguments it took and the level they named. `0` is "not a level
@@ -587,9 +601,9 @@ private pipeline_usage() -> string =
 
 // The one refusal a feature request is given before any manifest is read: `--all-features` beside
 // either of the flags that say something narrower. Whether it fired.
-refused_features(say: string -> unit) -> bool = feature_conflict() match
+refused_features(note: string -> unit) -> bool = feature_conflict() match
     Some(why) ->
-        say(refused(why))
+        note(refused(why))
         true
     None -> false
 
@@ -598,7 +612,7 @@ refused_features(say: string -> unit) -> bool = feature_conflict() match
 //
 // **It is what CMake and Gradle call**, which is why the two paths it writes are both reported: a
 // build script names one of them and has to be able to find the other.
-private build_c_command(args: []string, say: string -> unit) -> int
+private build_c_command(args: []string, note: string -> unit) -> int
     var named: Option[string] = None
     var cc: Option[string] = None
     var out: Option[string] = None
@@ -658,29 +672,30 @@ private build_c_command(args: []string, say: string -> unit) -> int
         i += 1
 
     if mistakes.len() > 0
-        say(misused(mistakes, build_c_usage()))
+        note(misused(mistakes, build_c_usage()))
         return Misused
     end if
 
     if file == ""
-        say(build_c_usage())
+        note(build_c_usage())
         return Misused
     end if
 
-    if refused_features(say) then return Failed
+    if refused_features(note) then return Failed
 
     // **The manifest's `lto` is not this command's**: the key is how the project's own link is done,
     // and an archive's members are native objects unless `--lto` asks.
     val at = build_level(file, level, false) match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             return Failed
         Ok(resolved) -> resolved
 
-    // The two paths written are said by the build, ahead of the advice about what to link them with.
-    build_c_archive(file, named, cc, at, out, header, say, lto_flag()) match
+    // The two paths written are said by the build, ahead of the advice about what to link them with
+    // -- all three on standard error, where a C project's build script reads them.
+    build_c_archive(file, named, cc, at, out, header, note, lto_flag()) match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             Failed
         Ok(_) -> Fine
 end build_c_command
@@ -694,7 +709,7 @@ private build_c_usage() -> string =
     "'lto' key does not change that"
 
 // `sysl emit-header <path>` -- the header `build-c` would write, printed, with nothing built.
-private emit_header_command(args: []string, say: string -> unit) -> int
+private emit_header_command(args: []string, say: string -> unit, note: string -> unit) -> int
     var named: Option[string] = None
     var file = ""
     var mistakes: Buf[string] = buf()
@@ -728,18 +743,18 @@ private emit_header_command(args: []string, say: string -> unit) -> int
         i += 1
 
     if mistakes.len() > 0
-        say(misused(mistakes, emit_header_usage()))
+        note(misused(mistakes, emit_header_usage()))
         return Misused
     end if
 
     if file == ""
-        say(emit_header_usage())
+        note(emit_header_usage())
         return Misused
     end if
 
     c_header_of(file, named) match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             Failed
         Ok(text) ->
             say(text.trim_end())
@@ -755,7 +770,7 @@ private emit_header_usage() -> string =
 // **Everything after `--` is the program's**, which is what keeps a program free to take an option
 // this compiler also takes. The program is handed its own path as its first argument, as a program
 // started any other way is.
-private run_command(args: []string, say: string -> unit) -> int
+private run_command(args: []string, note: string -> unit) -> int
     var named: Option[string] = None
     var cc: Option[string] = None
     var level: Option[string] = None
@@ -826,7 +841,7 @@ private run_command(args: []string, say: string -> unit) -> int
         i += 1
 
     if mistakes.len() > 0
-        say(misused(mistakes, run_usage()))
+        note(misused(mistakes, run_usage()))
         return Misused
     end if
 
@@ -834,7 +849,7 @@ private run_command(args: []string, say: string -> unit) -> int
     if file == "" && picked.is_some() then file = "."
 
     if file == ""
-        say(run_usage())
+        note(run_usage())
         return Misused
     end if
 
@@ -843,21 +858,21 @@ private run_command(args: []string, say: string -> unit) -> int
     if picked.is_some()
         file = workspace_projects(file, picked) match
             Err(why) ->
-                say(refused(why))
+                note(refused(why))
                 return Failed
             Ok(found) -> found.unwrap().at(0).dir
 
-    if refused_features(say) then return Failed
+    if refused_features(note) then return Failed
 
     val at = build_level(file, level) match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             return Failed
         Ok(resolved) -> resolved
 
     run_native_program(file, named, cc, at, program_args) match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             Failed
         Ok(code) -> code
 end run_command
@@ -883,7 +898,8 @@ private emit_typed_usage() -> string =
 // that is killed partway still has a report of everything up to the kill. Every decision the command
 // makes is still somewhere a test can reach -- `run_selected` takes the sink it writes through, and
 // the four pieces it writes are each a function of their own.
-private test_command(args: []string, say: string -> unit) -> int
+private test_command(args: []string, say: string -> unit, note: string -> unit,
+                     report: string -> unit) -> int
     var named: Option[string] = None
     var cc: Option[string] = None
     var filter: Option[string] = None
@@ -954,7 +970,7 @@ private test_command(args: []string, say: string -> unit) -> int
         i += 1
 
     if mistakes.len() > 0
-        say(misused(mistakes, test_usage()))
+        note(misused(mistakes, test_usage()))
         return Misused
     end if
 
@@ -962,11 +978,11 @@ private test_command(args: []string, say: string -> unit) -> int
     if file == "" && picked.is_some() then file = "."
 
     if file == ""
-        say(test_usage())
+        note(test_usage())
         return Misused
     end if
 
-    if refused_features(say) then return Failed
+    if refused_features(note) then return Failed
 
     // A silent request under test turns on every feature the root declares: gated code the ordinary
     // build never compiles is code the suite would otherwise never see.
@@ -974,13 +990,14 @@ private test_command(args: []string, say: string -> unit) -> int
 
     val projects = workspace_projects(file, picked) match
         Err(why) ->
-            say(refused(why))
+            note(refused(why))
             return Failed
         Ok(found) -> found
 
     projects match
-        None -> test_project(file, named, cc, filter, fail_fast, std, named_level, say)
-        Some(members) -> test_members(members, named, cc, filter, fail_fast, std, named_level, say)
+        None -> test_project(file, named, cc, filter, fail_fast, std, named_level, note, report)
+        Some(members) -> test_members(members, named, cc, filter, fail_fast, std, named_level, say, note,
+                                      report)
 end test_command
 
 // **Every member's suite, each reported under its own name**, and a line at the end saying how the
@@ -988,7 +1005,7 @@ end test_command
 // the point of testing a workspace at once is to hear about all of it.
 private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: Option[string],
                      filter: Option[string], fail_fast: bool, std: bool, named_level: Option[string],
-                     say: string -> unit) -> int
+                     say: string -> unit, note: string -> unit, report: string -> unit) -> int
     var failed: Buf[string] = buf()
     var tested: usize = 0
 
@@ -998,7 +1015,7 @@ private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: O
         say(s"testing ${mb.name} (${mb.dir})")
         tested += 1
 
-        if test_project(mb.dir, named, cc, filter, fail_fast, std, named_level, say) != Fine
+        if test_project(mb.dir, named, cc, filter, fail_fast, std, named_level, note, report) != Fine
             failed.push(mb.name)
 
             if fail_fast then break
@@ -1015,10 +1032,11 @@ end test_members
 
 // One project's suite, once the command line has been read.
 private test_project(file: string, named: Option[string], cc: Option[string], filter: Option[string],
-                     fail_fast: bool, std: bool, named_level: Option[string], say: string -> unit) -> int
+                     fail_fast: bool, std: bool, named_level: Option[string], note: string -> unit,
+                     report: string -> unit) -> int
     val level = build_level(file, named_level) match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             return Failed
         Ok(resolved) -> resolved
 
@@ -1030,7 +1048,7 @@ private test_project(file: string, named: Option[string], cc: Option[string], fi
     val key = run_cache_key_for(if std then "test --std" else "test", file, named, level, cc)
 
     cached_test_build(key) match
-        Some(hit) -> return tests_run(file, hit.0, hit.1, filter, fail_fast, false, say)
+        Some(hit) -> return tests_run(file, hit.0, hit.1, filter, fail_fast, false, note, report)
         None -> ()
 
     val made_build = if std then std_test_build_of(file, named)
@@ -1038,23 +1056,23 @@ private test_project(file: string, named: Option[string], cc: Option[string], fi
 
     val build = made_build match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             return Failed
         Ok(made) -> made
 
     if !build.emitted.report.is_empty()
-        say(analysis_report(build.emitted.report))
+        note(analysis_report(build.emitted.report))
         return Failed
     end if
 
     // Asked before anything is linked, so a tree with nothing to run pays for no toolchain.
-    nothing_to_run(file, build.tests, filter, say) match
+    nothing_to_run(file, build.tests, filter, note) match
         Some(code) -> return code
         None -> ()
 
     val made = build_test_binary_cached(file, build, cc, level, key) match
         Err(refusal) ->
-            say(refused(refusal.message))
+            note(refused(refusal.message))
             return Failed
         Ok(built) -> built
 
@@ -1062,21 +1080,21 @@ private test_project(file: string, named: Option[string], cc: Option[string], fi
     // died between the two leaves a slot the next one rebuilds rather than one it half believes.
     if made.1 then write_test_list(key.unwrap(), build.tests)
 
-    tests_run(file, made.0, build.tests, filter, fail_fast, !made.1, say)
+    tests_run(file, made.0, build.tests, filter, fail_fast, !made.1, note, report)
 end test_project
 
 // Nothing to run is not nothing to say. A tree with no tests at all and a filter that matched none of
 // the tests there are lead to the same empty report and are different mistakes, so each is named.
 // Neither is a failure: a program is allowed to have no tests.
 private nothing_to_run(file: string, all: Buf[TTest], filter: Option[string],
-                       say: string -> unit) -> Option[int]
+                       note: string -> unit) -> Option[int]
     if all.is_empty()
-        say(s"no '@test' functions in $file")
+        note(s"no '@test' functions in $file")
         return Some(Fine)
     end if
 
     if selected_tests(all, filter).is_empty()
-        say(s"no test matches '${filter.unwrap_or("")}' — ${all.len()} to choose from")
+        note(s"no test matches '${filter.unwrap_or("")}' — ${all.len()} to choose from")
         return Some(Fine)
     end if
 
@@ -1086,14 +1104,14 @@ end nothing_to_run
 // The chosen tests, run and reported. `discard` is false for a binary in the cache, which is the
 // whole point of it being there.
 private tests_run(file: string, exe: string, all: Buf[TTest], filter: Option[string],
-                  fail_fast: bool, discard: bool, say: string -> unit) -> int
-    nothing_to_run(file, all, filter, say) match
+                  fail_fast: bool, discard: bool, note: string -> unit, report: string -> unit) -> int
+    nothing_to_run(file, all, filter, note) match
         Some(code) -> return code
         None -> ()
 
     val chosen = selected_tests(all, filter)
     val outcomes = run_selected(exe, chosen, TestOptions(filter, fail_fast),
-                                all.len() - chosen.len(), piece -> stream_out(piece))
+                                all.len() - chosen.len(), report)
 
     if discard then discard_test_binary(exe)
 
@@ -1120,7 +1138,7 @@ private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fas
 // is written: `checked <root>` is the whole answer. What the command is run for is the analysis --
 // it type-checks a package for a machine this one is not, which is the only check a board package
 // gets.
-private build_lib_command(args: []string, say: string -> unit) -> int
+private build_lib_command(args: []string, note: string -> unit) -> int
     var named: Option[string] = None
     var level: Option[string] = None
     var std = false
@@ -1139,7 +1157,7 @@ private build_lib_command(args: []string, say: string -> unit) -> int
         if took > 0
             if took == 2 then i += 1
         else if args[i] == "-o" || args[i] == "--output"
-            say(refused(build_lib_output_refusal()))
+            note(refused(build_lib_output_refusal()))
             return Misused
         else if args[i] == "--target"
             if i + 1 >= args.len
@@ -1172,37 +1190,37 @@ private build_lib_command(args: []string, say: string -> unit) -> int
         i += 1
 
     if mistakes.len() > 0
-        say(misused(mistakes, build_lib_usage()))
+        note(misused(mistakes, build_lib_usage()))
         return Misused
     end if
 
     if file == ""
-        say(build_lib_usage())
+        note(build_lib_usage())
         return Misused
     end if
 
     val at = build_level(file, level) match
         Err(why) ->
-            say_failure(why, say)
+            say_failure(why, note)
             return Failed
         Ok(resolved) -> resolved
 
     if !std
         return build_library_of(file, named, at) match
             Err(why) ->
-                say_failure(why, say)
+                say_failure(why, note)
                 Failed
             Ok(root) ->
-                say(s"checked $root")
+                note(s"checked $root")
                 Fine
     end if
 
     build_std_artifact_of(file, named, None, at) match
         Err(refusal) ->
-            say(refused(refusal.message))
+            note(refused(refusal.message))
             Failed
         Ok(where) ->
-            say(s"wrote $where")
+            note(s"wrote $where")
             Fine
 end build_lib_command
 
@@ -1235,7 +1253,7 @@ private extern "fflush" c_flush_all(stream: *u8) -> int
 // The version is what the repository's newest release tag says where the command line pins none, and
 // the manifest is rewritten by changing the smallest run of bytes that has to change. Nothing is
 // fetched: the next build is what goes and gets it.
-private add_command(args: []string, say: string -> unit) -> int
+private add_command(args: []string, say: string -> unit, note: string -> unit) -> int
     var spec = ""
     var root = "."
     var extra: usize = 0
@@ -1251,18 +1269,18 @@ private add_command(args: []string, say: string -> unit) -> int
             root = args[i]
             extra += 1
         else
-            say(add_usage())
+            note(add_usage())
             return Misused
 
         i += 1
 
     if mistakes.len() > 0
-        say(misused(mistakes, add_usage()))
+        note(misused(mistakes, add_usage()))
         return Misused
     end if
 
     if spec.is_empty()
-        say(add_usage())
+        note(add_usage())
         return Misused
 
     // A workspace root with no `package` block refuses a `dependencies` block, so writing one there
@@ -1270,7 +1288,7 @@ private add_command(args: []string, say: string -> unit) -> int
     manifest_at(root) match
         Ok(m) ->
             if m.workspace.is_some() && !m.has_package
-                say(refused(s"'${absolute_path(root)}' is a workspace with no 'package' block, so " +
+                note(refused(s"'${absolute_path(root)}' is a workspace with no 'package' block, so " +
                     "it takes no dependencies — add it to the member that imports it, " +
                     "'sysl add <coordinate> <member directory>'"))
                 return Failed
@@ -1278,7 +1296,7 @@ private add_command(args: []string, say: string -> unit) -> int
 
     add_to_project(root, spec) match
         Err(why) ->
-            say(refused(why))
+            note(refused(why))
             Failed
         Ok(said) ->
             say(said)
@@ -1292,7 +1310,7 @@ private add_usage() -> string = "usage: sysl add <coordinate>[@<version>] [<path
 // **It is a question about a particular project, so the path is required**, and it stops above the
 // target: nothing in it asks anything of a machine, so a project pinned to one this machine cannot
 // build for is still inspectable.
-private deps_command(args: []string, say: string -> unit) -> int
+private deps_command(args: []string, say: string -> unit, note: string -> unit) -> int
     var root = ""
     var paths: usize = 0
     var mistakes: Buf[string] = buf()
@@ -1321,29 +1339,29 @@ private deps_command(args: []string, say: string -> unit) -> int
         i += 1
 
     if mistakes.len() > 0
-        say(misused(mistakes, deps_usage()))
+        note(misused(mistakes, deps_usage()))
         return Misused
     end if
 
     if paths != 1
-        say(deps_usage())
+        note(deps_usage())
         return Misused
     end if
 
-    if refused_features(say) then return Failed
+    if refused_features(note) then return Failed
 
     // **At a workspace root, every member's graph in turn**, each resolved as its build would be --
     // with the workspace's versions -- and separated by a blank line.
     workspace_projects(root, None) match
         Err(why) ->
-            say(refused(why))
+            note(refused(why))
             return Failed
-        Ok(None) -> deps_of(root, say)
+        Ok(None) -> deps_of(root, say, note)
         Ok(Some(members)) ->
             for k in 0..<members.len()
                 if k > 0 then say("")
 
-                val code = deps_of(members.at(k).dir, say)
+                val code = deps_of(members.at(k).dir, say, note)
 
                 if code != Fine then return code
 
@@ -1351,16 +1369,16 @@ private deps_command(args: []string, say: string -> unit) -> int
 end deps_command
 
 // One project's listing.
-private deps_of(root: string, say: string -> unit) -> int
+private deps_of(root: string, say: string -> unit, note: string -> unit) -> int
     val m = manifest_of_package(root) match
         Err(why) ->
-            say(refused(why))
+            note(refused(why))
             return Failed
         Ok(got) -> got
 
     resolved_graph(root, m) match
         Err(refusal) ->
-            say(refused(refusal.message))
+            note(refused(refusal.message))
             Failed
         Ok(g) ->
             val text = deps_listing(m, g)
