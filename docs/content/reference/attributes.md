@@ -780,11 +780,59 @@ the_fixture_holds() =
 It goes when the file goes, too, which is the half that makes the naming safe: the program that ships
 carries no body for it.
 
-**An `impl` block may not sit in one.** It declares no name; it fills a slot in a method table, which
-the rest of the program reads without naming anything. Kept in a test build and dropped everywhere
-else, it would mean a trait answering one way while the tests ran and another way in the program that
-ships. The impl belongs beside the type. A closure is the one exception the compiler makes for
-itself, and it is not a hole: the table it writes is dropped with the closure.
+**An `impl` block sits in one only for a type that same file declares.** An `impl` declares no name;
+it fills a slot in a method table, which the rest of the program reads without naming anything. Kept
+in a test build and dropped everywhere else, an `impl` for a type the program has would mean a trait
+answering one way while the tests ran and another way in the program that ships, so it belongs beside
+the type. A type the `@tests` file declares itself has no such second answer — no other build has the
+type at all — so its `impl` may sit beside it, and that is how a test gets a stand-in to hand to code
+written against a trait:
+
+```sysl
+@tests
+
+trait Area
+    area(self) -> int
+
+    described(self) -> string = s"area ${self.area()}"
+
+measured(s: &Area) -> int = s.area()
+
+struct Square
+    side: int
+
+impl Area for Square
+    area(self) -> int = self.side * self.side
+
+@test("a stand-in answers through the trait")
+a_square_measures()
+    val s: &Area = Square(3)
+
+    assert_eq(measured(s), 9)
+    assert_eq(s.described(), "area 9")
+```
+
+Where the trait is declared does not enter into it: a trait of the module and a trait of the test file
+are equally fine. What is still refused is an `impl` for any type the file did not declare — one of
+the module's, a builtin, a blanket `impl[T] … for T`, and a type another `@tests` file declares, since
+which files a build keeps is decided file by file:
+
+```sysl
+@tests
+
+trait Area
+    area(self) -> int
+
+impl Area for int
+    area(self) -> int = self
+```
+
+```error
+error: an 'impl' block in a file that said '@tests' has to be for a type that file declares, and 'int' is not declared in it — a test build would keep this block and every other build would drop it, so a trait would answer one way while the tests ran and another way in the program that ships. Write the block beside the type's own declaration, or declare a type for the tests in this file
+```
+
+A closure is the one exception the compiler makes for itself, and it is not a hole: the table it
+writes is dropped with the closure.
 
 **It stops at the package boundary.** A package is compiled from source and a library arrives as an
 artifact whose test files were never encoded, so a rule that let the reference cross would compile

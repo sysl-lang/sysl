@@ -166,7 +166,9 @@ hoist_units(a: &Analysis, units: Buf[Program])
     // Which files said `@tests`, recorded before anything is registered: what a `@tests` file
     // declares is scaffolding, and that is asked of every declaration below.
     for i in 0..<units.len()
-        if units.at(i).test_only then a.tables.test_only_files.push(units.at(i).src.name)
+        if units.at(i).test_only
+            a.tables.test_only_files.push(units.at(i).src.name)
+            note_test_file_types(a, units.at(i))
 
     // **Every module name is registered before a single scope is built**, because a scope reads its
     // file's import paths through the package layer and that layer asks which paths lead anywhere.
@@ -330,16 +332,20 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // A bare-arrow parameter is sugar for a bounded type parameter, and the rewrite happens
         // at the declaration so that everything after it is the generic machinery that exists.
         FuncDecl(d) -> hoist_func(a, scope, s.span, with_call_bounds(d))
-        // **A `@tests` file may not hold an `impl`**: a test build keeps the file and every other
-        // build drops it, so the trait would answer differently in the tests than in the program
-        // that ships. Refused rather than registered, so nothing is analyzed against an answer that
-        // will not be there.
+        // **A `@tests` file may hold an `impl` only for a type it declares itself**: a test build
+        // keeps the file and every other build drops it, so an `impl` there for any other type would
+        // make a trait answer differently in the tests than in the program that ships. A type the
+        // same file declares exists in no other build, so there is nothing for its `impl` to
+        // disagree with. Refused rather than registered, so nothing is analyzed against an answer
+        // that will not be there.
         ImplDecl(d) ->
-            if test_only_file(a, scope.src.name)
-                a.fault(scope, s.span, "an 'impl' block may not sit in a file that said '@tests' — a " +
-                        "test build would keep it and every other build would drop it, so a trait " +
-                        "would answer one way while the tests ran and another way in the program " +
-                        "that ships. It belongs beside the type")
+            if test_only_file(a, scope.src.name) && !impl_subject_local(a, scope.src.name, d)
+                a.fault(scope, s.span, "an 'impl' block in a file that said '@tests' has to be for " +
+                        s"a type that file declares, and ${impl_subject(d)} — a test build would keep " +
+                        "this block and every other build would drop it, so a trait would answer one " +
+                        "way while the tests ran and another way in the program that ships. Write the " +
+                        "block beside the type's own declaration, or declare a type for the tests " +
+                        "in this file")
             else
                 a.tables.impls.push(Impl(with_impl_call_bounds(d), s.span, scope))
         // **`static` says outright what a header would have said**, so what is under one is
@@ -1397,6 +1403,38 @@ private indistinguishable_lists(plain: string, ps: Buf[Param], others: Buf[Param
     "declaration a call means is decided by its arguments and never by what it returns. Two " +
     "declarations of one name have to differ in a way a call site can show"
 end indistinguishable_lists
+
+// Files every type a `@tests` file declares under that file's name: a struct, an enum, a trait and
+// a `new` type. A transparent alias is left out, since it is another spelling of a type declared
+// somewhere else.
+private note_test_file_types(a: &Analysis, unit: Program)
+    for j in 0..<unit.body.len()
+        val name = *unit.body.at(j).kind match
+            StructDecl(d) -> d.name
+            EnumDecl(d) -> d.name
+            TraitDecl(d) -> d.name
+            TypeDecl(d) -> if d.derived then d.name else ""
+            _ -> ""
+
+        if name != "" then a.tables.test_file_types.push(s"${unit.src.name}\0$name")
+end note_test_file_types
+
+// What an `impl` is for, said as the reason it is not a type its `@tests` file declares.
+private impl_subject(d: ImplDecl) -> string = *d.for_type.kind match
+    NamedType(name, _) ->
+        if holds_string(d.tparams, name)
+            s"'$name' is a parameter of the block, which stands for every type at once"
+        else
+            s"'$name' is not declared in it"
+    _ -> "the type this one is for is not declared in it"
+
+// Whether an `impl` written in the file `src` is for a type that same file declares. Only a plain
+// name can be one: a type parameter of the block stands for every type, a pointer or a slice is a
+// type no file declares, and a dotted name reaches another module.
+private impl_subject_local(a: &Analysis, src: string, d: ImplDecl) -> bool = *d.for_type.kind match
+    NamedType(name, _) ->
+        !holds_string(d.tparams, name) && holds_string(a.tables.test_file_types, s"$src\0$name")
+    _ -> false
 
 // Whether the file a scope belongs to said `@tests`, so that what it declares is the module's tests'
 // and no build but a test build keeps it.
