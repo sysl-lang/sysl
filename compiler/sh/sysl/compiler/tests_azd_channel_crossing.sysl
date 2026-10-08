@@ -1,0 +1,59 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The reference's `ChannelCrossingTests`: what a `Channel[T]` may carry, which is the rule about
+// leaving a concurrency domain asked of a VALUE (`library/sync.md`, `reference/memory.md § Crossing a
+// concurrency domain`). `send`'s `@crossing(value)` is what asks; the ring and closing are the
+// library's own tests.
+
+private azd_ch(body: string) -> string = "import sysl.posix.threads.*\n\n" + body
+
+private azd_ch_node(call: string) -> string =
+    azd_ch(s"struct Node\n    n: int\n\nvar slots: [2]&Node = [Node(0); 2]\nvar ch = channel(slots[..])\n\nprint(ch.$call(Node(1)))\n")
+
+private azd_ch_says(text: string, part: string)
+    val said = azd_err(text)
+
+    assert(said.contains(part), said)
+end azd_ch_says
+
+@test("a scalar crosses, which is the ordinary case")
+azd_ch_scalar()
+    if !azd_ready() then return
+    twp_prints(azd_ch("var slots: [2]int = [0; 2]\nvar ch = channel(slots[..])\n\nprint(ch.try_send(7), ch.try_receive())\n"), "true Some(7)\n")
+
+// A plain count is not atomic, and the object arrives on a thread the count knows nothing about.
+@test("a counted reference does not, and the message names the atomic spelling")
+azd_ch_counted_reference()
+    if azd_ready() then azd_ch_says(azd_ch_node("send"), "reaches another concurrency domain, so every count inside it has to be atomic")
+
+@test("and the refusal lands on the value, which is the thing that could have been written differently")
+azd_ch_refusal_on_the_value()
+    if !azd_ready() then return
+
+    val said = azd_err(azd_ch_node("send"))
+
+    assert(said.contains("Hold it as a '&sync Node'"), said)
+    assert(said.contains("main.sysl:9:15"), said)
+end azd_ch_refusal_on_the_value
+
+@test("`try_send` is held to the same rule, since it puts a value in by the same door")
+azd_ch_try_send()
+    if azd_ready() then azd_ch_says(azd_ch_node("try_send"), "has to be atomic")
+
+// A struct holding a `[]T` may not reach another domain at all, so a channel that kept the slice
+// would have been refused at the `spawn` that shares it.
+@test("the channel itself crosses, which a slice-holding one could not have")
+azd_ch_channel_crosses()
+    if !azd_ready() then return
+
+    val text = azd_ch("struct Feed\n    ch: Channel[int]\n\nfeeder(f: *Feed) -> unit\n    for i in 1..5\n        f.ch.send(i)\n\n" +
+        "    f.ch.close()\n\nvar slots: [2]int = [0; 2]\nvar f = Feed(channel(slots[..]))\n" +
+        "var running = spawn(&feeder, &f) match\n    Some(t) -> t\n    None -> panic(\"the thread did not start\")\n\n" +
+        "var total = 0\n\nloop\n    f.ch.receive() match\n        Some(v) -> total += v\n        None -> break\n\n" +
+        "print(running.join(), total)\n")
+
+    twp_prints(text, "true 15\n")
+end azd_ch_channel_crosses

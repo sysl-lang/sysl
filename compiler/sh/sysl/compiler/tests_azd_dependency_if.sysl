@@ -1,0 +1,126 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The reference's `DependencyConditionalTests`: `#if` gates the lines of the branch not taken and
+// nothing else, so a module of TWO files, one gating a declaration, keeps every other declaration --
+// whether it is a dependency's, a `--lib` root's or the project's own. A module of one file cannot
+// show it, the misfiled module then being the whole of it. Every case asks for the declaration in the
+// file with no `#if` in it; `android` is false on this machine and `hosted` true.
+
+private azd_dc_plain() -> string = "module sh.x.lib\n\nbar() -> int = 3\n"
+
+private azd_dc_gated(cond: string) -> string = s"module sh.x.lib\n\n#if $cond\nfoo() -> int = 1\n#endif\n"
+
+private azd_dc_module(root: string, b: string, b_name: string)
+    make_dir_all(s"$root/sh/x/lib").unwrap()
+    write_text(s"$root/sh/x/lib/a.sysl", azd_dc_plain()).unwrap()
+    write_text(s"$root/sh/x/lib/$b_name", b).unwrap()
+
+// A program depending by path on a package that holds the module, with a manifest of its own.
+private azd_dc_app(b: string, b_name: string, program: string) -> string
+    val dep = azd_temp("sysl-dep-if-")
+    val root = azd_temp("sysl-dep-if-app-")
+
+    write_text(s"$dep/package.hocon", "package { name = \"lib\", version = \"0.1.0\" }\n").unwrap()
+    azd_dc_module(dep, b, b_name)
+    write_text(s"$root/package.hocon",
+               s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { lib { path = \"$dep\" } }\n").unwrap()
+    write_text(s"$root/main.sysl", program).unwrap()
+    root
+end azd_dc_app
+
+// What a build of `root` prints when run, or `refused: ` and why it was not built.
+azd_built_output(root: string) -> string
+    val out_dir = azd_temp("sysl-azd-exe")
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> out.text
+
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end azd_built_output
+
+private azd_dc_imports_bar() -> string = "import sh.x.lib.bar\n\nprint(bar())\n"
+
+@test("keeps the declarations of a module one of whose files has an '#if' at top level")
+azd_dc_top_level()
+    if !azd_ready() then return
+    assert_eq(azd_built_output(azd_dc_app(azd_dc_gated("android"), "b.sysl", azd_dc_imports_bar())), "3\n")
+
+@test("and the gated declaration resolves where its condition holds")
+azd_dc_condition_holds()
+    if !azd_ready() then return
+
+    val app = azd_dc_app(azd_dc_gated("hosted"), "b.sysl",
+                         "import sh.x.lib.bar\nimport sh.x.lib.foo\n\nprint(bar() + foo())\n")
+
+    assert_eq(azd_built_output(app), "4\n")
+end azd_dc_condition_holds
+
+@test("and only there")
+azd_dc_and_only_there()
+    if !azd_ready() then return
+
+    val said = azd_built_output(azd_dc_app(azd_dc_gated("android"), "b.sysl", "import sh.x.lib.foo\n\nprint(foo())\n"))
+
+    assert(said.contains("sh.x.lib' declares no 'foo'"), said)
+end azd_dc_and_only_there
+
+@test("keeps them when the '#if' is inside a function body, and gates the body's lines")
+azd_dc_in_a_body()
+    if !azd_ready() then return
+
+    val body = "module sh.x.lib\n\nbaz() -> int\n    var n = 10\n#if android\n    n = 20\n#endif\n    n\n"
+    val app = azd_dc_app(body, "b.sysl", "import sh.x.lib.bar\nimport sh.x.lib.baz\n\nprint(bar())\nprint(baz())\n")
+
+    assert_eq(azd_built_output(app), "3\n10\n")
+end azd_dc_in_a_body
+
+@test("keeps them when one of its files is literate")
+azd_dc_literate()
+    if !azd_ready() then return
+
+    val literate = "The module's second file, written as prose with the program indented.\n\n" +
+        "    module sh.x.lib\n\n    qux() -> int = 5\n"
+    val app = azd_dc_app(literate, "b.lsysl", "import sh.x.lib.bar\nimport sh.x.lib.qux\n\nprint(bar() + qux())\n")
+
+    assert_eq(azd_built_output(app), "8\n")
+end azd_dc_literate
+
+@test("named as a '--lib' root")
+azd_dc_lib_root()
+    if !azd_ready() then return
+
+    val lib = azd_temp("sysl-dep-if-lib-")
+    val prog = azd_temp("sysl-dep-if-prog-")
+
+    azd_dc_module(lib, azd_dc_gated("android"), "b.sysl")
+    write_text(s"$prog/main.sysl", azd_dc_imports_bar()).unwrap()
+    reset_search_paths()
+    add_lib_root(lib)
+
+    val said = azd_built_output(prog)
+
+    reset_search_paths()
+    assert_eq(said, "3\n")
+end azd_dc_lib_root
+
+@test("as the project's own")
+azd_dc_own()
+    if !azd_ready() then return
+
+    val root = azd_temp("sysl-dep-if-root-")
+
+    write_text(s"$root/package.hocon", "package { name = \"app\", version = \"0.1.0\" }\n").unwrap()
+    azd_dc_module(root, azd_dc_gated("android"), "b.sysl")
+    write_text(s"$root/main.sysl", azd_dc_imports_bar()).unwrap()
+    assert_eq(azd_built_output(root), "3\n")
+end azd_dc_own

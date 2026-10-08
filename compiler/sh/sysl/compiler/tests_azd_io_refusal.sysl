@@ -1,0 +1,125 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, read_text, remove_dir_all, set_permissions, write_text}
+
+// The reference's `IoRefusalTests`: a path the filesystem refuses is answered with `sysl: error: …`
+// naming the path and what was wrong with it, at status 1 -- never a bare "cannot write", which leaves
+// the reader guessing which of a command's paths was meant (`io_refusal.sysl`). Every expected line is
+// the reference's own output for the same command line.
+
+// A scratch directory holding an exported C function at `p4`, a directory nobody may write at
+// `locked`, and `p4/main.sysl` as the file every "under a file" case aims through.
+private azd_io_scratch() -> string
+    val dir = azd_temp("sysl-io-")
+
+    make_dir_all(s"$dir/p4").unwrap()
+    write_text(s"$dir/p4/main.sysl", "@export(\"f\")\nf() -> int = 1\n").unwrap()
+    make_dir_all(s"$dir/locked").unwrap()
+    set_permissions(s"$dir/locked", 0o555).unwrap()
+    dir
+end azd_io_scratch
+
+// Permissions put back before the tree is removed, or the removal would be refused too.
+private azd_io_drop(dir: string, opened: []string)
+    for p in opened
+        set_permissions(p, 0o755).unwrap_or(())
+
+    set_permissions(s"$dir/locked", 0o755).unwrap_or(())
+    remove_dir_all(dir).unwrap_or(())
+end azd_io_drop
+
+private azd_io_refused(args: []string, want: string)
+    val (code, said) = azd_cli(args)
+
+    assert_eq(code, Failed)
+    assert_eq(said, want)
+end azd_io_refused
+
+private azd_io_under_a_file(dir: string) -> string =
+    s"sysl: error: cannot make the directory '$dir/p4/main.sysl': a file is already there, and a directory is needed"
+
+@test("for build-c's archive — the case that was reported")
+azd_io_build_c_archive_under_a_file()
+    if !azd_ready() then return
+
+    val dir = azd_io_scratch()
+
+    azd_io_refused(["sysl", "build-c", s"$dir/p4", "-o", s"$dir/p4/main.sysl/lib.a"], azd_io_under_a_file(dir))
+    azd_io_drop(dir, [])
+end azd_io_build_c_archive_under_a_file
+
+@test("for build-c's header")
+azd_io_build_c_header_under_a_file()
+    if !azd_ready() then return
+
+    val dir = azd_io_scratch()
+
+    azd_io_refused(["sysl", "build-c", s"$dir/p4", "-o", s"$dir/out.a", "--header", s"$dir/p4/main.sysl/f.h"],
+                   azd_io_under_a_file(dir))
+    azd_io_drop(dir, [])
+end azd_io_build_c_header_under_a_file
+
+@test("when a directory has to be made there")
+azd_io_directory_under_an_unwritable_one()
+    if !azd_ready() then return
+
+    val dir = azd_io_scratch()
+
+    azd_io_refused(["sysl", "build-c", s"$dir/p4", "-o", s"$dir/locked/sub/lib.a"],
+                   s"sysl: error: cannot make the directory '$dir/locked/sub': '$dir/locked' is not writable")
+    azd_io_drop(dir, [])
+end azd_io_directory_under_an_unwritable_one
+
+@test("when a file has to be written there")
+azd_io_file_in_an_unwritable_directory()
+    if !azd_ready() then return
+
+    val dir = azd_io_scratch()
+
+    azd_io_refused(["sysl", "build-c", s"$dir/p4", "-o", s"$dir/out.a", "--header", s"$dir/locked/f.h"],
+                   s"sysl: error: '$dir/locked/f.h': permission denied")
+    azd_io_drop(dir, [])
+end azd_io_file_in_an_unwritable_directory
+
+@test("a header path that is a DIRECTORY is refused, naming it")
+azd_io_header_that_is_a_directory()
+    if !azd_ready() then return
+
+    val dir = azd_io_scratch()
+
+    azd_io_refused(["sysl", "build-c", s"$dir/p4", "-o", s"$dir/out.a", "--header", s"$dir/locked"],
+                   s"sysl: error: '$dir/locked': is a directory")
+    azd_io_drop(dir, [])
+end azd_io_header_that_is_a_directory
+
+// The version is written, so nothing is asked of the network: the manifest is read, edited and
+// refused at the write, and left exactly as it was.
+@test("sysl add refuses a manifest nobody may write, and leaves it as it was")
+azd_io_add_to_a_read_only_manifest()
+    val dir = azd_io_scratch()
+
+    make_dir_all(s"$dir/proj").unwrap()
+    write_text(s"$dir/proj/package.hocon", "dependencies {\n}\n").unwrap()
+    write_text(s"$dir/proj/main.sysl", "print(1)\n").unwrap()
+    set_permissions(s"$dir/proj/package.hocon", 0o444).unwrap()
+
+    azd_io_refused(["sysl", "add", "github.com/sysl-lang/table@0.1.3", s"$dir/proj"],
+                   s"sysl: error: '$dir/proj/package.hocon': permission denied")
+    assert_eq(read_text(s"$dir/proj/package.hocon").unwrap(), "dependencies {\n}\n")
+    azd_io_drop(dir, [s"$dir/proj/package.hocon"])
+end azd_io_add_to_a_read_only_manifest
+
+// Left out, the modules below an unreadable directory would vanish from the build with nothing said.
+@test("a project holding a directory nobody may read is refused rather than thrown")
+azd_io_unreadable_directory_in_a_project()
+    val dir = azd_io_scratch()
+
+    make_dir_all(s"$dir/prog/hidden").unwrap()
+    write_text(s"$dir/prog/main.sysl", "print(1)\n").unwrap()
+    set_permissions(s"$dir/prog/hidden", 0o000).unwrap()
+
+    azd_io_refused(["sysl", "build", s"$dir/prog", "-o", s"$dir/a"],
+                   s"sysl: error: cannot read $dir/prog: '$dir/prog/hidden': permission denied")
+    azd_io_drop(dir, [s"$dir/prog/hidden"])
+end azd_io_unreadable_directory_in_a_project
