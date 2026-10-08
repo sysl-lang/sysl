@@ -738,8 +738,54 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
 
     if name == "ptr_cast" then return Some(ptr_cast_call(cx, span, args, expected))
 
+    if null_test_form(cx, name) then return Some(null_test_call(cx, span, args))
+
     None
 end special_form
+
+// `is_null(r)` -- whether a counted reference names nothing, which one the language made never does.
+// It is for storage the language did not initialise: a `calloc`ed block, a collector's payload, a
+// struct of handles some other allocator zeroed, where a `&T` field reads as null until it is
+// assigned. Like the slot forms, a function or a local of the name is what a call reaches, and the
+// form applies only where nothing else claims it.
+null_test_form(cx: &Analyzer, name: string) -> bool =
+    name == "is_null" && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
+
+// **The reference is read as an address and compared with null, and nothing else is done to it**: no
+// share is taken and none given back, so the test is one compare wherever it is written -- a member
+// on a hot path included.
+private null_test_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 1 then
+        return cx.err(span, "'is_null' takes exactly one value, the reference to ask about")
+
+    val t = type_expr_bare(cx, args.at(0))
+    val fault = null_test_fault(underlying(texpr_type(t)))
+
+    if fault.is_some() then return cx.err(span, fault.unwrap())
+
+    val raw = Ptr(byte_type())
+    var operands: Buf[TExpr] = buf()
+    var cmps: Buf[TCmp] = buf()
+
+    operands.push(TExpr(span, TCast(t, raw)))
+    operands.push(TExpr(span, TNullLit(raw)))
+    cmps.push(TCmp("==", None))
+    TExpr(span, TCompare(operands, cmps))
+end null_test_call
+
+// What 'is_null' may not be asked of. A trait object is two words and a weak reference already has
+// its own answer for "nothing there", so neither is a plain counted address.
+private null_test_fault(t: Type) -> Option[string] = t match
+    Ref(inner, _) ->
+        if !is_trait_type(*inner) then return None
+
+        Some("'is_null' asks about a reference's address, and a reference to a trait is two words — " +
+             "the address and the table of the type it was erased from")
+    Weak(_) -> Some("'is_null' asks about a counted reference, and a weak one already answers " +
+                    "\"nothing there\" through '.get()', which is 'None' for an empty one")
+    Unknown -> None
+    other -> Some(s"'is_null' asks whether a reference names nothing, and ${type_show(other)} is " +
+                  "not a reference — a '*T' is compared with 'null' directly")
 
 // `ptr_cast(p)` and `ptr_cast[T](p)` -- an address read as a pointer to some type, which is either
 // the type the position gives it or the one written in the brackets.
@@ -813,7 +859,8 @@ private is_trait_type(t: Type) -> bool = t match
 // decide what a **type argument** written after one means, so the atomics are in it too: they take
 // none either, and saying so is better than reporting the name as uncallable.
 private special_form_name(cx: &Analyzer, name: string) -> bool =
-    special_form_word(name) || atomic_form(cx, name) || task_form(cx, name) || slot_form(cx, name)
+    special_form_word(name) || atomic_form(cx, name) || task_form(cx, name) || slot_form(cx, name) ||
+    null_test_form(cx, name)
 
 // The words the compiler answers itself, the atomics aside: a form belongs to no module, so an import
 // naming one is told so rather than that the module lacks it.

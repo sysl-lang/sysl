@@ -1,6 +1,6 @@
 module sysl.container
 
-import sysl.buf.{stored, forget, unassigned, Unassigned}
+import sysl.buf.{forget, unassigned, Unassigned}
 
 /** A hash map, generic in its key and its value.
  *
@@ -171,15 +171,15 @@ struct Map[K: Hash + Eq, V]
     /** The table itself, every slot of it, for a reader that wants to look rather than ask. Read
      * only: the map owns its table, and the counts beside it say what is in it.
      */
-    cell -> []Slot[K, V] = if stored(&*self.core) then self.core.cell else []
+    cell -> []Slot[K, V] = if !is_null(self.core) then self.core.cell else []
 
     /** How many entries are live. The same number `len()` answers. */
     count -> usize = self.len()
 
     /** How many tombstones the table is carrying. */
-    dead -> usize = if stored(&*self.core) then self.core.dead else 0
+    dead -> usize = if !is_null(self.core) then self.core.dead else 0
 
-    len(self) -> usize = if stored(&*self.core) then self.core.count else 0
+    len(self) -> usize = if !is_null(self.core) then self.core.count else 0
 
     is_empty(self) -> bool = self.len() == 0
 
@@ -190,10 +190,10 @@ struct Map[K: Hash + Eq, V]
      * the first insert. That is the one number here a caller might be surprised by, and it is the
      * whole of what "an empty map holds no table" looks like from outside.
      */
-    capacity(self) -> usize = if stored(&*self.core) then self.core.cell.len else 0
+    capacity(self) -> usize = if !is_null(self.core) then self.core.cell.len else 0
 
     @inline
-    get(self, k: K) -> Option[V] = if stored(&*self.core) then self.core.get(k) else None
+    get(self, k: K) -> Option[V] = if !is_null(self.core) then self.core.get(k) else None
 
     /** The value a key names, or the one the caller supplies where it names none. The common shape
      * of reading a counter or an accumulator that may not have been started yet.
@@ -201,22 +201,22 @@ struct Map[K: Hash + Eq, V]
     get_or(self, k: K, default: V) -> V = self.get(k).unwrap_or(default)
 
     @inline
-    has(self, k: K) -> bool = stored(&*self.core) && self.core.find(k).is_some()
+    has(self, k: K) -> bool = !is_null(self.core) && self.core.find(k).is_some()
 
     /** A key given a value: the entry it already had takes the new one, or a fresh entry is placed.
      * Every name for this map sees it.
      */
     @inline
     put(self, k: K, v: V)
-        if !stored(&*self.core) then unassigned(Unassigned.MapUnassigned)
+        if is_null(self.core) then unassigned(Unassigned.MapUnassigned)
         self.core.put(k, v)
 
     /** A key taken out, answering whether it was there. */
-    remove(self, k: K) -> bool = stored(&*self.core) && self.core.remove(k)
+    remove(self, k: K) -> bool = !is_null(self.core) && self.core.remove(k)
 
     /** Every entry dropped and the table let go entirely; see `MapCore.clear`. */
     clear(self)
-        if stored(&*self.core) then self.core.clear()
+        if !is_null(self.core) then self.core.clear()
 
     /** A second map holding the same entries, its table sized to them -- the one way to get a map
      * that is not this one, every other way of handing a `Map` on handing on this one.

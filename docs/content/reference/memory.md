@@ -227,6 +227,10 @@ a (none)
 The `match` is not ceremony around a null check. It is the only route to the item, so the absent case
 cannot be forgotten rather than merely being unwise to forget.
 
+The one place a `&T` reads as null is storage the language did not lay out and the program zeroed —
+[below](#storage-the-compiler-did-not-lay-out-may-not-hold-a-counted-value), with `is_null`, the raw
+tier's question for it.
+
 ### What a heap object costs
 
 Every ARC object carries **three header words**: the strong count, a pointer to the function that
@@ -1597,15 +1601,51 @@ slice or a `string` may not be written into memory reached that way** — nor ma
 that carries one.
 
 The reason is what an assignment to such a field *does*. It releases whatever occupied the slot
-before writing the new value, and a `&T` is non-nullable, so there is no empty state to guard raw
-bytes with: the release walks whatever the bytes happened to look like. Zeroing the storage first
-does not help either — a zeroed slot is not an empty box, it is a null the release still follows.
+before writing the new value, so the release walks whatever the bytes happened to look like.
 
 **Nothing refuses this**, and that is why it is written here. The compiler knows the field's type but
 not where the pointer came from: `p.next = other` through a `p` that is `&local` writes a field it
 laid out, whose previous occupant is a real box, and the release is correct; through a `p` that is
 `ptr_cast` over an arena the same line walks raw bytes. Telling the two apart needs provenance the
 front end does not track.
+
+**Zeroed storage is the exception, and it is the one a collector or a `calloc` gives.** A counted
+reference that is all zero bits names nothing, and giving back a share of nothing is nothing — so a
+`&T` field (or a `Buf`, `Map` or `Deque`, each of which is one) in storage zeroed before its first use
+takes its first assignment safely, and `string` and slice fields already did. Until it is assigned it
+is the one `&T` that is null, and **`is_null(r)` is how a program asks**: one compare of the address
+with null, no share taken. An ordinary `&T` — one the language made — is never null, and `is_null`
+answers `false` for it; a trait object and a `weak T` are refused, the latter answering through
+`.get()`, and anything that is not a reference is refused naming its type.
+
+```sysl
+extern "calloc" c_calloc(n: usize, size: usize) -> *u8
+extern "free" c_free(p: *u8)
+
+struct Item
+    label: string
+
+struct Slot
+    item: &Item
+
+val s: *Slot = ptr_cast(c_calloc(1, sizeof(Slot)))
+
+print(is_null(s.item))
+
+s.item = Item("a")
+
+print(is_null(s.item), s.item.label)
+
+c_free(ptr_cast(s))
+```
+
+```output
+true
+false a
+```
+
+The storage is still the program's to free, and freeing it releases nothing: a counted field there is
+given back by assigning over it, or — for a container — by its `release()`, before the block goes.
 
 **Keep an index, a raw pointer, or a copy instead.** An arena of nodes linked by index is the
 ordinary answer, and it costs nothing a box was buying:

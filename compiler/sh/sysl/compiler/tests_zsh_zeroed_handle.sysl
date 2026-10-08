@@ -204,3 +204,80 @@ zsh_growing_a_zeroed_container_panics()
         assert(said.contains(s"panic: this ${k.0} was never given storage -- assign `${k.4}` to it first"), said)
         assert(said.ends_with("exit 1\n") && !said.contains("never\n"), said)
 end zsh_growing_a_zeroed_container_panics
+
+// -- is_null --------------------------------------------------------------------------------------
+
+// The emitted text of a one-file program, or every diagnostic it earned, one to a line.
+private zsh_emitted(text: string) -> string
+    val root = make_temp_dir("sysl-zsh").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"refused: ${why.message}"
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end zsh_emitted
+
+// The lines of one `define` in an emitted text, up to its closing brace.
+private zsh_body(text: string, name: string) -> string
+    val at = text.index_of(s"@$name(")
+
+    if at.is_none() then return ""
+
+    val rest = text[at.unwrap()..]
+    val close = rest.index_of("\n}\n")
+
+    if close.is_none() then rest else rest[0..<close.unwrap()]
+end zsh_body
+
+private zsh_null_program() -> string = raw"""
+    extern "calloc" c_calloc(n: usize, size: usize) -> *u8
+
+    struct Node
+        v: int
+
+    struct Holder
+        r: &Node
+
+    @noinline
+    absent(h: Holder) -> bool = is_null(h.r)
+
+    val p: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))
+    print(is_null(p.r), absent(*p))
+    p.r = Node(3)
+    print(is_null(p.r), absent(*p))
+    val n: &Node = Node(1)
+    print(is_null(n))
+    """
+
+@test("is_null answers true for a reference in zeroed storage and false for one the language made")
+zsh_is_null_tells_a_zeroed_reference()
+    zsh_both(zsh_null_program(), "true true\nfalse false\nfalse\nexit 0\n")
+
+@test("is_null is one compare with null, taking no share of the reference")
+zsh_is_null_takes_no_share()
+    if !zsh_ready() then return
+
+    val body = zsh_body(zsh_emitted(zsh_null_program()), "absent")
+
+    assert(body.contains("icmp eq ptr"), body)
+    assert(body.contains(", null"), body)
+    assert(!body.contains("@arc.retain") && !body.contains("@arc.release"), body)
+
+@test("is_null is refused on what is not a counted reference")
+zsh_is_null_is_refused_on_a_value()
+    if !zsh_ready() then return
+
+    val said = zsh_emitted("val x = 3\nprint(is_null(x))\nprint(is_null(\"s\"))\n")
+
+    assert(said.contains("'is_null' asks whether a reference names nothing, and int is not a reference"), said)
+    assert(said.contains("and string is not a reference"), said)
+
+@test("a function of the name is what a call reaches")
+zsh_a_function_named_is_null_wins()
+    zsh_both("is_null(n: int) -> bool = n == 0\n\nprint(is_null(0), is_null(4))\n", "true false\nexit 0\n")
