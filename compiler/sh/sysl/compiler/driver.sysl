@@ -638,7 +638,12 @@ emit_llvm_text(path: string, named_target: Option[string],
     // that does not compile is an error in a build that would never have run it, which is what makes
     // it safe to leave one beside the code it tests. Pruning is then the last thing that happens to
     // the tree and the only thing between the checks and the lowering.
-    val kept = prune(strip_tests(whole), program.own)
+    val pruned = prune(strip_tests(whole), program.own)
+
+    // **A bare image that names its own entry and has nothing for `main` to do gets no `main`**
+    // (`image_emits_main`).
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+    val kept = pruned with { entry_point = pruned.entry_point && image_emits_main(root, t, pruned) }
 
     // **What the library already compiled**, so this module declares those rather than defining them
     // a second time; their bodies arrive from the artifact at link time. It is asked after the
@@ -750,6 +755,12 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
     // **And whether a failed bounds check names where it was written**, settled here for the same
     // reason: the standard module's artifact is built the same way as the program, and keyed by it.
     use_bounds_locations(!no_bounds_locations_flag() && manifest.bounds_locations.unwrap_or(true))
+
+    // **And how the machine's image is linked**, refused here where the keys cannot apply -- a
+    // dependency naming them, a hosted target, a script that is not there (`image_link.sysl`).
+    image_refusal(root, manifest, t) match
+        Some(why) -> return Err(Refusal(why))
+        None -> ()
 
     // The machine as the project describes it, which is what the analysis holds a module to.
     Ok(as_declared(manifest, t))
@@ -998,10 +1009,48 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
             "the directory, or say where the binary goes with '-o <path>'")))
     end if
 
-    link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links,
-                      emitted.archives).map_err(said)?
+    settle_image_link(path, t, cc).map_err(said)?
+
+    val linked = link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links,
+                                   emitted.archives)
+    val entry = settled_image_entry()
+
+    settle_image("", "", "")
+
+    linked match
+        Err(why) -> return Err(said(Refusal(image_link_failure(why.message, t, entry))))
+        Ok(_) -> ()
+
     Ok(exe)
 end build_native_program
+
+// **What the root manifest says about this machine's image, settled for the link `build` runs**:
+// the linker found (`find_image_linker`), the script and the entry. A target that is not a bare
+// image settles nothing.
+private settle_image_link(path: string, t: Target, cc: Option[string]) -> Result[unit, Refusal]
+    if !links_an_image(t) then return Ok(())
+
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+    val manifest = manifest_at(root)?
+    val img = image_for(manifest, t.name)
+
+    val clang = find_clang(t, cc) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(found) -> found
+
+    val linker = find_image_linker(img, root, t, clang) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(found) -> found
+
+    img match
+        Some(i) ->
+            val script = if i.script == "" then "" else image_path(root, i.script)
+
+            settle_image(linker, script, i.entry)
+        None -> settle_image(linker, "", "")
+
+    Ok(())
+end settle_image_link
 
 // `sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] <path>`
 // -- the static archive and the C header a C project is handed.

@@ -1,0 +1,365 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, remove_dir_all}
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **`sysl build` links a freestanding image** (`image_link.sysl`): the root manifest's
+// `targets.<machine>` block names the `linker`, the `linker_script` and the `entry`; a bare ELF
+// target links `-nostdlib` through `ld.lld` whatever the block says; a program with nothing for
+// `main` to do and an entry of its own gets no `main`; and the keys are refused in a dependency, on a
+// hosted target, and where the file they name is not there.
+
+private val fsl_target: string = "aarch64-freestanding"
+
+// A manifest whose block for the image's machine says these lines.
+private fsl_manifest(lines: string) -> string =
+    s"package { name = \"img\", version = \"0.0.1\" }\ntargets {\n  $fsl_target {\n$lines  }\n}\n"
+
+private val fsl_script: string =
+    "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+// A program that is all functions: one exported start that never returns.
+private val fsl_functions: string =
+    "@export(\"kstart\")\nkstart() -> never\n    loop\n        ()\n"
+
+// A project holding this program and this manifest, and the script beside them where asked.
+private fsl_tree(program: string, manifest: string, script: bool) -> string
+    var files = lbr_two("main.sysl", program, "package.hocon", manifest)
+
+    if script then files.push(("link.ld", fsl_script))
+
+    lbr_tree(files)
+end fsl_tree
+
+private fsl_ok_manifest() -> string =
+    fsl_manifest("    linker_script = \"link.ld\"\n    entry = \"kstart\"\n")
+
+private fsl_has(line: Buf[string], word: string) -> bool
+    for i in 0..<line.len()
+        if line.at(i) == word then return true
+
+    false
+end fsl_has
+
+private fsl_index(line: Buf[string], word: string) -> int
+    for i in 0..<line.len()
+        if line.at(i) == word then return int(i)
+
+    -1
+end fsl_index
+
+private fsl_line(t: Target) -> Buf[string] =
+    link_command("clang", "prog.ll", buf(), "prog", t, DefaultOptimization, buf(), no_probe())
+
+private fsl_t(name: string) -> Target = target_named(name).unwrap()
+
+// The LLVM text of a project, built for the image's machine.
+private fsl_text(project: string) -> string = emit_llvm_text(project, Some(fsl_target)) match
+    Err(why) -> s"refused: ${failure_text(why)}"
+    Ok(emitted) -> emitted.text
+
+private fsl_defines_main(text: string) -> bool
+    val lines = lines_of(text)
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with("define ") && lines.at(i).contains("@main(") then return true
+
+    false
+end fsl_defines_main
+
+// -- the manifest ----------------------------------------------------------------------------------
+
+@test("a target block's linker, linker_script and entry are read under the machine's name")
+fsl_reads_the_three_keys()
+    val m = read_manifest(fsl_manifest("    linker = \"ld.lld\"\n    linker_script = \"k/link.ld\"\n" +
+        "    entry = \"_start\"\n")).unwrap()
+
+    assert(m.images.len() == 1, "one image")
+
+    val img = image_for(m, fsl_target).unwrap()
+
+    assert(img.linker == "ld.lld", img.linker)
+    assert(img.script == "k/link.ld", img.script)
+    assert(img.entry == "_start", img.entry)
+    assert(image_for(m, "aarch64-macos").is_none(), "another machine's block says nothing")
+    assert(m.warnings.is_empty(), "the keys are known")
+end fsl_reads_the_three_keys
+
+@test("a block that names none of them describes no image")
+fsl_no_keys_no_image()
+    val m = read_manifest(fsl_manifest("    capabilities { heap = false }\n")).unwrap()
+
+    assert(m.images.is_empty(), "no image")
+end fsl_no_keys_no_image
+
+@test("a value that is not a string is refused, naming the key")
+fsl_refuses_a_number()
+    read_manifest(fsl_manifest("    entry = 42\n")) match
+        Ok(_) -> assert(false, "accepted a number")
+        Err(why) ->
+            assert(why.contains(s"'targets.$fsl_target.entry'"), why)
+            assert(why.contains("non-empty string"), why)
+end fsl_refuses_a_number
+
+@test("and an entry holding a space or a comma is refused when the file is read")
+fsl_refuses_an_entry_with_a_comma()
+    read_manifest(fsl_manifest("    entry = \"a,b\"\n")) match
+        Ok(_) -> assert(false, "accepted a comma")
+        Err(why) -> assert(why.contains("is not a symbol a linker can start"), why)
+end fsl_refuses_an_entry_with_a_comma
+
+// -- the link line ---------------------------------------------------------------------------------
+
+@test("a bare image is linked -nostdlib through the linker, script and entry the block named")
+fsl_link_line_with_the_keys()
+    reset_search_paths()
+    settle_image("/tools/ld.lld", "/proj/link.ld", "_start")
+
+    val line = fsl_line(fsl_t(fsl_target))
+
+    settle_image("", "", "")
+
+    assert(fsl_has(line, "-nostdlib"), "no -nostdlib")
+    assert(fsl_has(line, "--ld-path=/tools/ld.lld"), "not linked by the named linker")
+
+    val at = fsl_index(line, "-T")
+
+    assert(at >= 0 && line.at(usize(at) + 1) == "/proj/link.ld", "no -T <script>")
+    assert(fsl_has(line, "-Wl,--entry=_start"), "no entry")
+    assert(fsl_has(line, "-Wl,--defsym=__sysl_entry=_start"), "the entry is not required")
+    assert(at < fsl_index(line, "prog.ll"), "the script comes after the module")
+end fsl_link_line_with_the_keys
+
+@test("with nothing settled it is still -nostdlib through ld.lld, never the host's linker")
+fsl_link_line_without_keys()
+    reset_search_paths()
+
+    val line = fsl_line(fsl_t(fsl_target))
+
+    assert(fsl_has(line, "-nostdlib"), "no -nostdlib")
+    assert(fsl_has(line, "--ld-path=ld.lld"), "not ld.lld")
+    assert(!fsl_has(line, "-T"), "a script nobody named")
+
+    for i in 0..<line.len()
+        assert(!line.at(i).starts_with("-Wl,--entry"), "an entry nobody named")
+end fsl_link_line_without_keys
+
+@test("every bare ELF target links that way, and no hosted target and no wasm target does")
+fsl_link_line_by_target()
+    reset_search_paths()
+
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+        val line = fsl_line(t)
+        val bare = t.os == Freestanding && t.cpu != Wasm32 && t.builds_with_clang()
+
+        assert(links_an_image(t) == bare, t.name)
+        assert(fsl_has(line, "--ld-path=ld.lld") == bare, s"${t.name} and ld.lld")
+        if os_hosted(t.os) then assert(!fsl_has(line, "-nostdlib"), s"${t.name} was told -nostdlib")
+end fsl_link_line_by_target
+
+// -- when `main` is emitted ------------------------------------------------------------------------
+
+@test("an image of functions alone, naming its own entry, gets no main")
+fsl_no_main_for_functions_and_an_entry()
+    if !lbr_ready() then return
+
+    val p = fsl_tree(fsl_functions, fsl_ok_manifest(), true)
+    val text = fsl_text(p)
+
+    assert(!text.starts_with("refused"), text)
+    assert(!fsl_defines_main(text), "a main nothing calls")
+    assert(text.contains("@kstart("), "the entry is not there")
+    lbr_drop([p])
+end fsl_no_main_for_functions_and_an_entry
+
+@test("but one with a top-level statement keeps its main, for the entry to call")
+fsl_main_kept_for_statements()
+    if !lbr_ready() then return
+
+    val p = fsl_tree(fsl_functions + "\nprint(1)\n", fsl_ok_manifest(), true)
+    val text = fsl_text(p)
+
+    assert(!text.starts_with("refused"), text)
+    assert(fsl_defines_main(text), "the statements have nowhere to run")
+    lbr_drop([p])
+end fsl_main_kept_for_statements
+
+@test("and so does one whose block names no entry, or names main")
+fsl_main_kept_without_an_entry()
+    if !lbr_ready() then return
+
+    val bare = fsl_tree(fsl_functions, fsl_manifest("    linker_script = \"link.ld\"\n"), true)
+    val named = fsl_tree(fsl_functions, fsl_manifest("    entry = \"main\"\n"), true)
+
+    assert(fsl_defines_main(fsl_text(bare)), "no entry named, and no main")
+    assert(fsl_defines_main(fsl_text(named)), "the entry is main, and there is none")
+    lbr_drop([bare, named])
+end fsl_main_kept_without_an_entry
+
+// -- a real link -----------------------------------------------------------------------------------
+
+private val fsl_readelf: string = "/opt/homebrew/opt/llvm/bin/llvm-readelf"
+
+@test("sysl build links an aarch64 image that starts at the entry, laid out by the script")
+fsl_links_a_real_image()
+    if !lbr_ready() then return
+    if !fsl_lld_present() then skip("ld.lld is not installed, so no image can be linked")
+    if !is_file(fsl_readelf) then skip(s"there is no llvm-readelf at $fsl_readelf to read the image")
+
+    val p = fsl_tree(fsl_functions, fsl_ok_manifest(), true)
+    val out = lbr_temp("sysl-fsl-elf")
+    val said = lbr_cli(["sysl", "build", "--target", fsl_target, "-o", s"$out/img.elf", p])
+
+    assert(said.0 == 0, said.1)
+
+    val read = capture(fsl_readelf, ["-h", "-S", "-s", s"$out/img.elf"], "", [], true).unwrap()
+
+    assert(read.text.contains("AArch64"), read.text)
+    assert(read.text.contains("EXEC (Executable file)"), read.text)
+    assert(read.text.contains(s"Entry point address:               0x${fsl_symbol_at(read.text, "kstart")}"),
+           read.text)
+    assert(fsl_symbol_at(read.text, "kstart").starts_with("4008"), "not laid out at the script's base")
+    assert(read.text.contains(" .text "), read.text)
+    assert(!read.text.contains(" main\n"), "the image carries a main")
+    assert(!read.text.contains(".interp"), "the image asks for a loader")
+    lbr_drop([p, out])
+end fsl_links_a_real_image
+
+// A symbol's value as `llvm-readelf -s` prints it, its leading zeros dropped as the header's entry
+// address drops them; `""` where the table has no such symbol.
+private fsl_symbol_at(table: string, name: string) -> string
+    val lines = lines_of(table)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.ends_with(s" $name")
+            val words = fsl_words(line)
+
+            if words.len() < 2 then return ""
+
+            val value = words.at(1)
+            var at: usize = 0
+
+            while at + 1 < value.bytes.len && value.bytes[at] == u8('0')
+                at += 1
+
+            return value[at..<value.bytes.len]
+        end if
+
+    ""
+end fsl_symbol_at
+
+private fsl_words(line: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var start: usize = 0
+    var at: usize = 0
+
+    while at <= line.bytes.len
+        if at == line.bytes.len || line.bytes[at] == u8(' ')
+            if at > start then out.push(line[start..<at])
+
+            start = at + 1
+
+        at += 1
+
+    out
+end fsl_words
+
+private fsl_lld_present() -> bool = capture("ld.lld", ["--version"], "", [], true) match
+    Ok(o) -> o.status.ok()
+    Err(_) -> false
+
+@test("an entry nothing defines is refused at the link, naming the key")
+fsl_refuses_an_undefined_entry()
+    if !lbr_ready() then return
+    if !fsl_lld_present() then skip("ld.lld is not installed, so no image can be linked")
+
+    val p = fsl_tree(fsl_functions, fsl_manifest("    entry = \"kstrat\"\n"), false)
+    val out = lbr_temp("sysl-fsl-elf")
+    val said = lbr_cli(["sysl", "build", "--target", fsl_target, "-o", s"$out/img.elf", p])
+
+    assert(said.0 != 0, "linked an image with nowhere to start")
+    assert(said.1.contains(s"'targets.$fsl_target.entry' names 'kstrat', and nothing the program " +
+        "links defines it"), said.1)
+    lbr_drop([p, out])
+end fsl_refuses_an_undefined_entry
+
+// -- the refusals ----------------------------------------------------------------------------------
+
+@test("a linker script that is not there is refused before anything is compiled")
+fsl_refuses_a_missing_script()
+    if !lbr_ready() then return
+
+    val p = fsl_tree(fsl_functions, fsl_ok_manifest(), false)
+    val said = lbr_cli(["sysl", "build", "--target", fsl_target, "-o", s"$p/img.elf", p])
+
+    assert(said.0 != 0, "built with no script")
+    assert(said.1.contains(s"'targets.$fsl_target.linker_script' names 'link.ld', and there is no " +
+        s"such file at '$p/link.ld'"), said.1)
+    lbr_drop([p])
+end fsl_refuses_a_missing_script
+
+@test("and so is a linker named by a path that is not there")
+fsl_refuses_a_missing_linker()
+    if !lbr_ready() then return
+
+    val p = fsl_tree(fsl_functions, fsl_manifest("    linker = \"tools/ld.lld\"\n"), false)
+    val said = lbr_cli(["sysl", "emit-llvm", "--target", fsl_target, p])
+
+    assert(said.0 != 0, "accepted a linker that is not there")
+    assert(said.1.contains(s"'targets.$fsl_target.linker' names 'tools/ld.lld', and there is no " +
+        s"such file at '$p/tools/ld.lld'"), said.1)
+    lbr_drop([p])
+end fsl_refuses_a_missing_linker
+
+@test("the keys are refused for a hosted target, which the platform's own linker links")
+fsl_refuses_the_keys_on_a_hosted_target()
+    if !lbr_ready() then return
+
+    val host = host_target().name
+    val manifest = s"package { name = \"img\", version = \"0.0.1\" }\n" +
+        s"targets {\n  $host {\n    entry = \"_start\"\n  }\n}\n"
+    val p = fsl_tree("print(1)\n", manifest, false)
+    val said = lbr_cli(["sysl", "build", "-o", s"$p/prog", p])
+
+    assert(said.0 != 0, "linked a hosted program at an entry of its own")
+    assert(said.1.contains(s"'targets.$host.entry' says how a freestanding image is linked, and " +
+        s"'$host' is hosted"), said.1)
+    lbr_drop([p])
+end fsl_refuses_the_keys_on_a_hosted_target
+
+@test("while a block for a machine the build is not for is not consulted")
+fsl_other_machines_block_is_left_alone()
+    if !lbr_ready() then return
+
+    val p = fsl_tree("print(7)\n", fsl_ok_manifest(), false)
+
+    assert(lbr_run(p, []) == "7\n", "the host build read the image's block")
+    lbr_drop([p])
+end fsl_other_machines_block_is_left_alone
+
+@test("and they are refused in a dependency, which does not say how a program is linked")
+fsl_refuses_the_keys_in_a_dependency()
+    if !lbr_ready() then return
+
+    val dep = lbr_tree(lbr_two("dep/dep.sysl", "module dep\n\none() -> int = 1\n", "package.hocon",
+        "package { name = \"dep\" }\n" +
+        s"targets {\n  $fsl_target {\n    linker_script = \"link.ld\"\n  }\n}\n"))
+    val p = fsl_tree("print(dep.one())\n", "package { name = \"app\" }\n", false)
+    val said = lbr_cli(["sysl", "emit-llvm", p, "--lib", dep])
+
+    assert(said.0 != 0, "a dependency's linker script was accepted")
+    assert(said.1.contains(s"sets 'targets.$fsl_target.linker_script' in its package.hocon"), said.1)
+    assert(said.1.contains("Only the root project's package.hocon may name them"), said.1)
+    lbr_drop([dep, p])
+end fsl_refuses_the_keys_in_a_dependency

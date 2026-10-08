@@ -112,12 +112,16 @@ struct Manifest
     // The `workspace` list, as written: each member's directory relative to this file, `*` standing
     // for one directory level. `None` where the file declares no workspace.
     workspace: Option[Buf[string]]
+
+    // What each `targets.<name>` block says about how that machine's image is linked -- its
+    // `linker`, `linker_script` and `entry` (`image_link.sysl`). Only the root project's apply.
+    images: Buf[ImageLink]
 end Manifest
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
-             buf(), None, None, None, buf(), None, false, "", None)
+             buf(), None, None, None, buf(), None, false, "", None, buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -435,6 +439,7 @@ read_manifest(text: string) -> Result[Manifest, string]
 
     var target_capabilities: Buf[(string, string, bool)] = buf()
     var targets: Buf[(string, string)] = buf()
+    var images: Buf[ImageLink] = buf()
 
     conf_at(root, "targets") match
         None -> ()
@@ -450,6 +455,10 @@ read_manifest(text: string) -> Result[Manifest, string]
                     return Err(s"'targets.${named.at(i)}' is not a block describing a target")
 
                 targets.push((named.at(i), conf_text(entry, "triple")))
+
+                val image = read_image(entry, named.at(i))?
+
+                if image.is_some() then images.push(image.unwrap())
 
                 conf_at(entry, "capabilities") match
                     None -> ()
@@ -486,7 +495,8 @@ read_manifest(text: string) -> Result[Manifest, string]
 
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
                 target_capabilities, pkg_config, headers, defines, targets, allocator, features,
-                optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace))
+                optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
+                images))
 end read_manifest
 
 // The `bounds_locations` key: `true`, the default, or `false` to leave every failed bounds check's
