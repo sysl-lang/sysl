@@ -599,24 +599,11 @@ private led(lhs: Expr, t: Spanned[Tok], p: *Parser) -> Expr
         _ -> lhs
 end led
 
-// Where an expression BEGINS in the text. A `Field`'s span is its name, a subscript's starts at its
-// `[` and a `T::Attr`'s is the attribute -- each the anchor a complaint about it wants -- so a node
-// built with one on its left (`p.a + 1`, `arr[1] < n`, `f().a..<b`) would otherwise start at that
-// anchor rather than at the first thing the reader wrote. Every form that takes an expression on its
-// left starts where this says.
-private begins_at(e: Expr) -> Span = *e.kind match
-    Field(receiver, _) -> begins_at(receiver)
-    Index(receiver, _) -> begins_at(receiver)
-    TypeArgs(receiver, _) -> begins_at(receiver)
-    TypeAttr(receiver, _, _) -> begins_at(receiver)
-    Call(callee, _) -> begins_at(callee)
-    _ -> e.span
-
 // Where a form with `lhs` on its left begins: where the level it is read at began (`Parser.lead`),
 // which is where the left operand began -- its opening parenthesis included, a parenthesised operand's
 // own span being inside them. The operand's own start is the answer where the level began after it.
 private left_start(lhs: Expr, p: *Parser) -> Span
-    val own = begins_at(lhs)
+    val own = lhs.span
 
     if p.lead.start <= own.start then Span(p.lead.start, own.end) else own
 end left_start
@@ -774,15 +761,16 @@ end parse_trailing_block
 // two readings apart without asking what the name is, and the multi-argument form exists for `&f[A,
 // B]`, the address of an instantiation.
 //
-// **The span starts at the `[`, not at the receiver**, as the reference's does: a complaint about a
-// subscript -- what cannot be indexed, what cannot be sliced -- points at the brackets, the receiver
-// having a span of its own.
+// **The span covers the receiver too, and the `[` is kept beside it** as the reference's anchor: a
+// complaint about a subscript -- what cannot be indexed, what cannot be sliced -- points at the
+// bracket (`anchor.sysl`'s `anchor_of`), the receiver having a span of its own.
 private led_index(lhs: Expr, at: Span, p: *Parser) -> Expr
+    val from = left_start(lhs, p)
     val first = parse_expr(p)
 
     if !p.at_kw(",")
         p.expect_kw("]")
-        return expr(at.to(p.just_taken()), Index(lhs, first))
+        return expr(from.to(p.just_taken()), Index(lhs, first, at))
     end if
 
     var args: Buf[Expr] = buf()
@@ -796,30 +784,31 @@ private led_index(lhs: Expr, at: Span, p: *Parser) -> Expr
         args.push(parse_expr(p))
 
     p.expect_kw("]")
-    expr(at.to(p.just_taken()), TypeArgs(lhs, args))
+    expr(from.to(p.just_taken()), TypeArgs(lhs, args, at))
 end led_index
 
 // `a.b`, and `a.0` -- a tuple's parts are selected by number and are fields like any other.
 //
-// **The span is taken after the dot**, so a diagnostic points at the member rather than at the
-// punctuation: every message about a member names the member, and a caret under the `.` sends the
-// reader looking one column to the left of what was said.
+// **The node covers the receiver, and the member's own span is kept beside it**, so a diagnostic
+// points at the member rather than at the punctuation: every message about a member names the
+// member, and a caret under the `.` sends the reader looking one column to the left of what was said.
 private led_field(lhs: Expr, p: *Parser) -> Expr
+    val from = left_start(lhs, p)
     val at = p.here()
 
     p.peek() match
         Ident(n) ->
             p.bump()
-            expr(at, Field(lhs, n))
+            expr(from.to(at), Field(lhs, n, at))
         QuotedIdent(n) ->
             p.bump()
-            expr(at, Field(lhs, n))
+            expr(from.to(at), Field(lhs, n, at))
         IntLit(digits, _, suffix) ->
             p.bump()
 
             if suffix != "" then p.want("tuple index")
 
-            expr(at, Field(lhs, digits))
+            expr(from.to(at), Field(lhs, digits, at))
 
         // `x.0.1` lexes as a number, and reading it as two indices would be reading a token that is
         // not there. The reader is told what to write instead.
@@ -867,10 +856,11 @@ end split_at_point
 // `T::Attr` -- metadata the type itself exposes, which is why it is not a `.`. `colons` is the `::`
 // the loop has just taken, kept for the node's anchor.
 private led_type_attr(lhs: Expr, colons: Span, p: *Parser) -> Expr
+    val from = left_start(lhs, p)
     val at = p.here()
 
     p.name() match
-        Some(n) -> expr(at, TypeAttr(lhs, n, colons))
+        Some(n) -> expr(from.to(at), TypeAttr(lhs, n, colons, at))
         None -> expr(at, Bad)
 end led_type_attr
 

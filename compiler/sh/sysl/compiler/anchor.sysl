@@ -8,26 +8,27 @@ import sh.sysl.parsing.*
 // **The reference compiler keeps two positions on every node** -- `pos`, the anchor, and `extent`,
 // the run of text the rule consumed -- and `emit-ast` prints the anchor. They differ on purpose: a
 // call is anchored at its callee, a subscript at its `[`, a `match` at its scrutinee, a `?` at the
-// question mark. This tree keeps ONE span per node and computes the anchor from it, from the node's
-// children, and from the few tokens a variant stores because nothing else can say where they were:
-// `TypeAttr`'s `::`, `WithExpr`'s `with`, `IfExpr`'s `elif` flag, and `MethodDecl.named_at`.
-//
-// **Three node spans are anchors already rather than extents**, and so answer for themselves here: a
-// `Field` is its name, an `Index` and a `TypeArgs` run from their `[`, and a `TypeAttr` is its name.
-// Where the anchor is the node's own first or last token, it is cut out of the span.
+// question mark. This tree keeps ONE span per node, the extent, and computes the anchor from it, from
+// the node's children, and from the few tokens a variant stores because nothing else can say where
+// they were: a `Field`'s and a `TypeAttr`'s name, a subscript's `[`, `TypeAttr`'s `::`,
+// `WithExpr`'s `with`, `IfExpr`'s `elif` flag, and `MethodDecl.named_at`.
 //
 // **What this cannot say is where the reference has NO position**, and that is a fact about the
 // node's parent rather than the node: the left operand of a same-level `Binary` folded without one,
 // a literal inside a pattern, the base of an associated type. `show_oracle.sysl` asks those of the
 // context it is printing in.
 
-// The anchor of an expression.
+// The anchor of an expression. **The analysis reads it too**: a call, a subscript, a member and a
+// `T::Attr` are typed at their anchor, as the reference types every node at its `pos`, so a refusal
+// read off the typed node -- and everything a later pass reports at one -- points where the
+// reference's does.
 anchor_of(e: Expr) -> Span = *e.kind match
     // A call is its callee's anchor, all the way down: `a.b.c(x)` is anchored at `c`.
     Call(callee, _) -> anchor_of(callee)
-    Index(_, _) -> span_head(e.span, 1)
-    TypeArgs(_, _) -> span_head(e.span, 1)
-    TypeAttr(_, _, colons) -> colons
+    Field(_, _, name_at) -> name_at
+    Index(_, _, open) -> open
+    TypeArgs(_, _, open) -> open
+    TypeAttr(_, _, colons, _) -> colons
     WithExpr(_, _, at) -> at
     TryExpr(_) -> span_tail(e.span, 1)
     PostIncDec(_, _) -> span_tail(e.span, 2)

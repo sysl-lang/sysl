@@ -66,32 +66,11 @@ private pending_named(cx: &Analyzer, name: string) -> bool
     false
 end pending_named
 
-// A call, with every complaint written at the whole call shown at its callee's name for as long as
-// it is being read -- and the call around it given its anchor back afterwards, an argument being a
-// call of its own.
+// A call. `span` is the call's anchor -- its callee's, as the reference types a call at its `pos`
+// (`anchor.sysl`) -- so a complaint about the call, the name that does not exist or does not take
+// these arguments, is shown at the name written in front of the parentheses.
 call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
-          expected: Option[Type]) -> TExpr
-    val outer = cx.call_anchor
-    val named = callee_anchor(callee)
-
-    if named.is_some() then cx.call_anchor = Some((span, named.unwrap()))
-
-    val out = call_read(cx, span, callee, args, expected)
-
-    cx.call_anchor = outer
-    out
-end call_expr
-
-// Where a complaint about a call to this callee points: a name at itself, a member at its name (a
-// `Field`'s span is already that), a written instantiation at its `[`, and a call of a call where
-// the inner one does. Any other callee keeps the whole call.
-private callee_anchor(callee: Expr) -> Option[Span] = *callee.kind match
-    Ident(_) -> Some(callee.span)
-    Field(_, _) -> Some(callee.span)
-    Index(_, _) -> Some(Span(callee.span.start, callee.span.start + 1))
-    TypeArgs(_, _) -> Some(Span(callee.span.start, callee.span.start + 1))
-    Call(inner, _) -> callee_anchor(inner)
-    _ -> None
+          expected: Option[Type]) -> TExpr = call_read(cx, span, callee, args, expected)
 
 private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                   expected: Option[Type]) -> TExpr
@@ -111,18 +90,18 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             named_call(cx, span, callee, name, args, expected)
         // `f[A, B](x)` -- the instantiation the reader named, which is what brackets mean in a
         // **type** and what a call borrows them for.
-        TypeArgs(head, targs) ->
+        TypeArgs(head, targs, open) ->
             val written_member = written_method(cx, head)
 
             if written_member.is_some() then
                 return written_member_call(cx, span, written_member.unwrap().0,
                                            written_member.unwrap().1, targs, args, expected)
 
-            written_call(cx, span, head, targs, args, expected)
+            written_call(cx, span, head, open, targs, args, expected)
         // `f[A](x)` has no comma to tell its brackets from a subscript, so it arrives as an index
         // and is re-read here where the name is one a generic declares -- and only where nothing
         // nearer holds the name: a local shadowing the function is what is indexed.
-        Index(head, one) ->
+        Index(head, one, open) ->
             val name = written_name_of(head)
 
             if name.is_some() && cx.lookup(name.unwrap()).is_none() &&
@@ -130,7 +109,7 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                 var targs: Buf[Expr] = buf()
 
                 targs.push(one)
-                return written_call(cx, span, head, targs, args, expected)
+                return written_call(cx, span, head, open, targs, args, expected)
             end if
 
             // **A special form written with a type argument, which `va_arg[int](ap)` is what this
@@ -171,8 +150,7 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                 var one_targ: Buf[Expr] = buf()
 
                 one_targ.push(one)
-                return applied_type_call(cx, span, bracket_after(head), name.unwrap(), one_targ,
-                                         args, expected)
+                return applied_type_call(cx, span, open, name.unwrap(), one_targ, args, expected)
             end if
 
             // `x.m[T](…)` -- the same list on a METHOD.
@@ -194,7 +172,7 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
         // A member call. A module path folded into a name is a plain call under another spelling,
         // so it is asked about first.
         // `T::Attr(x)` -- a type attribute that carries an operand.
-        TypeAttr(subject, attr, _) ->
+        TypeAttr(subject, attr, _, _) ->
             val name = attr_type_name(subject)
 
             if name.is_none() || cx.lookup(name.unwrap()).is_some() then
@@ -202,7 +180,7 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                               "type name")
 
             type_attr_call(cx, span, name.unwrap(), attr, args)
-        Field(receiver, member) ->
+        Field(receiver, member, named_at) ->
             // `Maybe[int].Just(3)` and `b.Maybe[int].Just(3)` -- a selection from a generic type
             // the reader wrote the instantiation of.
             val on_type_args = written_on_generic_type(cx, receiver)
@@ -218,8 +196,7 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
             // `T.f(x)` -- a member called off a TRAIT's name, which is no value and no type of its
             // own, so it is refused at the member's name in the words the same read is.
-            val on_trait = trait_name_call(cx, Span(callee.span.end - member.bytes.len,
-                                                    callee.span.end), receiver, member)
+            val on_trait = trait_name_call(cx, named_at, receiver, member)
 
             if on_trait.is_some() then return on_trait.unwrap()
 
@@ -253,8 +230,6 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             // meant is worked out from what the variant carries -- exactly as it is for the bare
             // name, and for the same reason: `Slot.Live(h, k, v)` is a `Slot[K, V]` because that is
             // what the values say.
-            val named_at = Span(callee.span.end - member.bytes.len, callee.span.end)
-
             qualified_variant_solved(cx, span, named_at, receiver, member, args, expected) match
                 VsFound(en, v) -> return variant_call(cx, span, en, v, args)
                 VsSaid -> return bad_expr(span)
@@ -367,13 +342,13 @@ end call_value
 // not: the nearest binding wins.
 private local_head(cx: &Analyzer, e: Expr) -> bool = *e.kind match
     Ident(head) -> cx.lookup(head).is_some()
-    Field(inner, _) -> local_head(cx, inner)
+    Field(inner, _, _) -> local_head(cx, inner)
     _ -> true
 
 // The receiver and member of `recv.m[…]`, where `m` is a method of what `recv` is -- and neither a
 // function nor a type reached through a module, which a dotted path is asked about first.
 private written_method(cx: &Analyzer, head: Expr) -> Option[(Expr, string)] = *head.kind match
-    Field(recv, member) ->
+    Field(recv, member, _) ->
         val dotted = module_path_of(recv, member)
 
         if dotted.is_some() && (names_a_function(cx, dotted.unwrap()) ||
@@ -395,11 +370,11 @@ end written_member_call
 // The name a written type application was made on, where it is one a call could be written through.
 private written_name_of(head: Expr) -> Option[string] = *head.kind match
     Ident(n) -> Some(n)
-    Field(inner, name) -> module_path_of(inner, name)
+    Field(inner, name, _) -> module_path_of(inner, name)
     _ -> None
 
-private written_call(cx: &Analyzer, span: Span, head: Expr, targs: Buf[Expr], args: Buf[Expr],
-                     expected: Option[Type]) -> TExpr
+private written_call(cx: &Analyzer, span: Span, head: Expr, bracket: Span, targs: Buf[Expr],
+                     args: Buf[Expr], expected: Option[Type]) -> TExpr
     val name = written_name_of(head)
 
     if name.is_none() then return cx.err(span, "this is not something that can be called")
@@ -408,8 +383,7 @@ private written_call(cx: &Analyzer, span: Span, head: Expr, targs: Buf[Expr], ar
     // plainly as an annotation on what receives it would.
     if cx.lookup(name.unwrap()).is_none() && !names_a_function(cx, name.unwrap()) &&
        lookup_type_key(cx.an, cx.scope, name.unwrap()).is_some() then
-        return applied_type_call(cx, span, bracket_after(head), name.unwrap(), targs, args,
-                                 expected)
+        return applied_type_call(cx, span, bracket, name.unwrap(), targs, args, expected)
 
     written_generic_call(cx, span, name.unwrap(), targs, args, expected)
 end written_call
@@ -438,11 +412,6 @@ private applied_type_call(cx: &Analyzer, span: Span, bracket: Span, name: string
                    s"is what carries a value, as '$name[…].Name(…)'")
         _ -> cx.err(span, "this is not something that can be called")
 end applied_type_call
-
-// Where the `[` of a list written straight after `head` sits, which is the anchor a refusal of the
-// list takes. An index node's own span runs from its head, so the bracket is the offset the head
-// ends at.
-private bracket_after(head: Expr) -> Span = Span(head.span.end, head.span.end + 1)
 
 // The generic struct or enum a type-argument list is written on -- bare, or reached through the
 // module that declares it -- as the key it is filed under and the spelling a refusal quotes back. A
@@ -475,10 +444,10 @@ written_on_generic_type(cx: &Analyzer, e: Expr) -> Option[((string, string), Buf
     var targs: Buf[Expr] = buf()
 
     *e.kind match
-        Index(h, one) ->
+        Index(h, one, _) ->
             head = h
             targs.push(one)
-        TypeArgs(h, list) ->
+        TypeArgs(h, list, _) ->
             head = h
             targs = list
         _ -> return None
@@ -530,7 +499,7 @@ no_written_targs() -> Buf[Type] = buf()
 
 private module_path_of(receiver: Expr, name: string) -> Option[string] = *receiver.kind match
     Ident(head) -> Some(s"$head.$name")
-    Field(inner, mid) -> module_path_of(inner, mid).map(head -> s"$head.$name")
+    Field(inner, mid, _) -> module_path_of(inner, mid).map(head -> s"$head.$name")
     _ -> None
 
 // **An `extern` is one too**, and leaving it out is what sent `c.surface_destroy(h)` down the
@@ -671,7 +640,7 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
         lookup_value_key(cx, cx.an.tables.extern_vars, name).is_some()) then
         return call_value(cx, span, callee, args, expected)
 
-    function_call(cx, span, callee.span, name, args, expected)
+    function_call(cx, span, anchor_of(callee), name, args, expected)
 end named_call
 
 // -- the forms the compiler answers by name ------------------------------------------------------
@@ -1725,10 +1694,10 @@ private applied_variant(cx: &Analyzer, receiver: Expr, member: string) -> Varian
     var targ_exprs: Buf[Expr] = buf()
 
     val head = *receiver.kind match
-        Index(h, one) ->
+        Index(h, one, _) ->
             targ_exprs.push(one)
             h
-        TypeArgs(h, many) ->
+        TypeArgs(h, many, _) ->
             targ_exprs = many
             h
         _ -> return VsNone
@@ -1760,7 +1729,7 @@ private applied_variant(cx: &Analyzer, receiver: Expr, member: string) -> Varian
 
                 targs.push(t)
 
-            reinstantiate_at(cx.an, cx.scope, receiver.span, key.unwrap(), targs) match
+            reinstantiate_at(cx.an, cx.scope, anchor_of(receiver), key.unwrap(), targs) match
                 Enum(d) -> d.variant(member) match
                     Some(v) -> VsFound(Enum(d), v)
                     None -> VsNone
@@ -2751,7 +2720,7 @@ private packed_tail(cx: &Analyzer, rest: Param, tail: Buf[Expr], report: bool) -
     // type from, where the bare literal is answered by the parameter's own `[]const T`.
     if tail.is_empty() then return lit
 
-    expr(at, Index(lit, expr(at, RangeExpr(None, None, true))))
+    expr(at, Index(lit, expr(at, RangeExpr(None, None, true)), at))
 end packed_tail
 
 private is_spread(e: Expr) -> bool = *e.kind match

@@ -12,11 +12,11 @@ import sysl.buf.{Buf, buf}
 // line. The reference compiler's `Locate`.
 //
 // **It reads a node's EXTENT** -- from the first character the node was parsed from to just past the
-// last -- which is exactly what a cursor is inside. A node's span in this tree is its extent nearly
-// everywhere, and where it is a diagnostic's anchor instead (a `Field` is its name, a subscript
-// starts at its `[`) the walk widens it over what the node holds (`Walk.close`). The reference keeps
-// the two as two positions and reads the extent for the same reason: a cursor on `xs` in
-// `xs.foo(1)` is inside the selection and the call whether or not it is anywhere near `foo`.
+// last -- which is exactly what a cursor is inside. A node's span in this tree IS its extent, the
+// anchor a diagnostic points at being computed beside it (`anchor.sysl`), and the walk still widens
+// each node over what it holds (`Walk.close`) so that no node can be found outside its own parent.
+// The reference keeps the two as two positions and reads the extent for the same reason: a cursor on
+// `xs` in `xs.foo(1)` is inside the selection and the call whether or not it is anywhere near `foo`.
 //
 // **The answer is the nodes themselves, not their spans**, each with the name of the construct it
 // is -- the reference compiler's node names, `VarDecl`, `Call`, `NamedType` -- so a caller matches on
@@ -178,12 +178,11 @@ private struct Walk
 
     see(*self, span: Span, name: string, node: Node) = self.found.push(Construct(span, name, node))
 
-    // Widens the construct met at `first` to cover everything met inside it since, which turns the
-    // span the parser kept into the node's extent. **The two differ where the span is a diagnostic's
-    // anchor**: a `Field` is its name and a subscript starts at its `[` (`parse_expr.sysl`'s
-    // `led_field`, `led_index`), so a cursor on the receiver of `alpha.beta` would otherwise be
-    // inside the receiver and not inside the selection it is the receiver of. An empty span is a
-    // node that was never written, and is not counted.
+    // Widens the construct met at `first` to cover everything met inside it since. Every span the
+    // parser keeps is already the node's extent -- a `Field` covers its receiver and a subscript
+    // starts where what it indexes starts -- so this is the guarantee rather than the repair: a
+    // cursor on the receiver of `alpha.beta` is inside the selection it is the receiver of. An empty
+    // span is a node that was never written, and is not counted.
     close(*self, first: usize)
         var lo = self.found.at(first).span.start
         var hi = self.found.at(first).span.end
@@ -274,18 +273,18 @@ private expr_parts(w: *Walk, e: Expr)
         DefaultArg(_, v) ->
             w.see(at, "DefaultArg", AtExpr(e))
             walk_expr(w, v)
-        Index(r, i) ->
+        Index(r, i, _) ->
             w.see(at, "Index", AtExpr(e))
             walk_expr(w, r)
             walk_expr(w, i)
-        Field(r, _) ->
+        Field(r, _, _) ->
             w.see(at, "Field", AtExpr(e))
             walk_expr(w, r)
-        TypeArgs(r, args) ->
+        TypeArgs(r, args, _) ->
             w.see(at, "TypeArgs", AtExpr(e))
             walk_expr(w, r)
             walk_all(w, args, walk_expr)
-        TypeAttr(r, _, _) ->
+        TypeAttr(r, _, _, _) ->
             w.see(at, "TypeAttr", AtExpr(e))
             walk_expr(w, r)
         WithExpr(b, fields, _) ->
