@@ -1,0 +1,240 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// `xs: ...T` -- the parameter that collects a call's trailing arguments into a `[]const T`
+// (`reference/declarations.md § A parameter may collect the rest of the call`). The packing is a
+// rewrite of the argument list and nothing else, so the callee is an ordinary function taking a slice;
+// the array is the caller's frame, which is what lets an allocator-free module call one.
+//
+// The reference's `RestParamTests`. Every run case is built and run by this compiler and, where
+// `SYSL_ORACLE` names the reference, by the reference too (`twp_prints`); every refusal quotes the
+// reference's own words. The helpers here serve every `aza_` file.
+
+aza_ready() -> bool = twp_ready()
+
+// Everything a one-file program has to say for itself, taken through the lowering.
+aza_err(text: string) -> string
+    val root = make_temp_dir("sysl-aza").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end aza_err
+
+// The LLVM text of a program that must compile.
+aza_ir(text: string) -> string
+    val root = make_temp_dir("sysl-aza").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end aza_ir
+
+aza_refuses(text: string, part: string)
+    val said = aza_err(text)
+
+    assert(said.index_of(part).is_some(), s"expected '$part', got: $said")
+
+private aza_total() -> string = raw"""
+    total(xs: ...int) -> int
+        var s = 0
+
+        for x in xs
+            s += x
+
+        s
+
+    """
+
+// ---- the trailing arguments are collected ---------------------------------------------------------
+
+@test("the trailing arguments are collected into a slice the body walks")
+aza_rp_into_a_slice()
+    if !aza_ready() then return
+
+    twp_prints(aza_total() + "print(total(1, 2, 3))\n", "6\n")
+
+@test("and a call with none gets the empty slice")
+aza_rp_none_is_the_empty_slice()
+    if !aza_ready() then return
+
+    twp_prints(aza_total() + "print(total(), total(1))\n", "0 1\n")
+
+@test("the parameters in front of it are ordinary, and may be named")
+aza_rp_parameters_in_front()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        label(tag: string, xs: ...int) -> string
+            var out = tag
+
+            for x in xs
+                out = out + " " + str(x)
+
+            out
+
+        print(label("sum", 1, 2))
+        print(label(tag = "none"))
+        """, "sum 1 2\nnone\n")
+
+@test("and a method takes one, with the receiver in front")
+aza_rp_a_method_takes_one()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        struct Adder
+            base: int
+
+            total(self, xs: ...int) -> int
+                var s = self.base
+
+                for x in xs
+                    s += x
+
+                s
+
+        var a = Adder(10)
+        print(a.total(1, 2, 3), a.total())
+        """, "16 10\n")
+
+@test("the heterogeneous form is the same parameter at a trait object")
+aza_rp_heterogeneous_form()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        show(xs: ...&Display) -> unit
+            for x in xs
+                print(x)
+
+        show(1, "hi", true)
+        """, "1\nhi\ntrue\n")
+
+// ---- `xs...` hands an existing slice through ------------------------------------------------------
+
+@test("a spread is what lets a function forward its own tail")
+aza_rp_forward_its_own_tail()
+    if !aza_ready() then return
+
+    twp_prints(aza_total() + "forward(xs: ...int) -> int = total(xs...)\n\nprint(forward(4, 5, 6))\n",
+               "15\n")
+
+@test("and it hands through an ordinary slice from anywhere else")
+aza_rp_an_ordinary_slice()
+    if !aza_ready() then return
+
+    twp_prints(aza_total() + "var xs = [7, 8]\n\nprint(total(xs[..]...))\n", "15\n")
+
+// ---- the packed array is the caller's frame, not the heap ----------------------------------------
+
+@test("so an allocator-free module may call one")
+aza_rp_no_alloc_caller()
+    if !aza_ready() then return
+
+    twp_prints("@no_alloc\n\n" + aza_total() + "print(total(1, 2, 3), total())\n", "6 0\n")
+
+@test("and the empty slice literal it rests on needs no allocator either")
+aza_rp_empty_slice_needs_no_allocator()
+    if !aza_ready() then return
+
+    twp_prints("@no_alloc\n\nval e: []const int = []\nvar w: []int = []\nprint(e.len, w.len)\n",
+               "0 0\n")
+
+@test("a sliced array literal takes its element type from the view that was asked for")
+aza_rp_sliced_array_literal()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        show(xs: []const &Display) -> unit
+            for x in xs
+                print(x)
+
+        show([1, "hi", true][..])
+        """, "1\nhi\ntrue\n")
+
+// ---- where it may stand ---------------------------------------------------------------------------
+
+@test("nothing may follow it, because the arguments that would be its are already inside it")
+aza_rp_nothing_may_follow()
+    if !aza_ready() then return
+
+    aza_refuses("f(xs: ...int, last: int) -> int = last\n\nprint(f(1))\n",
+                "'xs' collects the rest of the call, so nothing can follow it — the arguments that " +
+                "would be 'last' are already inside it")
+
+@test("and it may not stand beside C's ellipsis, which is a different tail")
+aza_rp_not_beside_the_ellipsis()
+    if !aza_ready() then return
+
+    aza_refuses("f(xs: ...int, ...) -> int = 1\n\nprint(f(1))\n",
+                "'f' has two tails: 'xs: ...T' collects the rest of the call into a slice, and " +
+                "'...' is C's ellipsis, walked with 'va_arg'. A call has one tail, so a declaration " +
+                "may write one of them")
+
+@test("an 'extern' may not carry one: what it hands over is a sysl slice")
+aza_rp_not_on_an_extern()
+    if !aza_ready() then return
+
+    aza_refuses("extern f(xs: ...int) -> int\n\nprint(f(1))\n",
+                "'f' is an 'extern', and 'xs: ...T' hands over a sysl slice — which is three words " +
+                "with an owner in them, and not what a C function was compiled to read. C's own " +
+                "tail is the bare '...' with no name and no type")
+
+@test("and it declares no default — a call that leaves it out gets the empty slice")
+aza_rp_declares_no_default()
+    if !aza_ready() then return
+
+    aza_refuses("f(xs: ...int = [1][..]) -> int = 1\n\nprint(f())\n",
+                "a parameter that collects the rest of the call declares no default — a call that " +
+                "leaves it out gets the empty slice, which is what 'the rest' means when there is " +
+                "none, and a default beside that is a second answer to a settled question")
+
+// ---- what a call may write ------------------------------------------------------------------------
+
+@test("its arguments are positional: a name picks out one parameter and this takes what is left")
+aza_rp_arguments_are_positional()
+    if !aza_ready() then return
+
+    aza_refuses(aza_total() + "print(total(xs = 1))\n",
+                "'xs' collects the rest of the call, so its arguments are positional — a name picks " +
+                "out one parameter and this one takes as many as are left")
+
+@test("a spread is the whole of the tail or none of it")
+aza_rp_spread_is_the_whole_tail()
+    if !aza_ready() then return
+
+    aza_refuses(aza_total() + "var xs = [1, 2]\n\nprint(total(1, xs[..]...))\n",
+                "'...' hands the whole of 'xs' over, so it is the only argument there — a slice and " +
+                "a value cannot both be part of one tail")
+
+@test("and a spread at a call that collects nothing is refused, naming the callee")
+aza_rp_spread_at_a_call_collecting_nothing()
+    if !aza_ready() then return
+
+    aza_refuses("f(a: int) -> int = a\n\nvar xs = [1]\n\nprint(f(xs[..]...))\n",
+                "'...' says this argument is already the slice a '...T' parameter collects, and " +
+                "function 'f' has no such parameter")
+
+@test("and outside an argument list the grammar does not read it")
+aza_rp_outside_an_argument_list()
+    if !aza_ready() then return
+
+    aza_refuses("var xs = [1]\nval y = xs[..]...\nprint(1)\n", "newline expected")

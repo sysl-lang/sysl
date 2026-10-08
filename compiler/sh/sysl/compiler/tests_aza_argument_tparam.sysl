@@ -1,0 +1,158 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// A default naming its declaration's type parameters (`reference/declarations.md § Default
+// parameters and named arguments`): the type parameters are part of the signature rather than local
+// to it, so a default may write `T.zero()` or `T(1.5)`. It is read at each call, at what the call
+// solved them to from the arguments it wrote and the type it is expected to have -- and it plays no
+// part in that solve.
+//
+// The reference's `ArgumentTests` group of that name, input for input; `tests_tpd_tparam_default.sysl`
+// carries the same rules over inputs of its own. Helpers are `tests_aza_rest_param.sysl`'s.
+
+private aza_zero_step() -> string = "f[T: Zero + Add](x: T, step: T = T.zero()) -> T = x + step\n"
+
+private aza_half() -> string = "g[T: Add](x: T, half: T = T(1.5)) -> T = x + half\n"
+
+@test("a default naming a type parameter reaches an associated function, at whatever the call settles")
+aza_tp_associated_function()
+    if !aza_ready() then return
+
+    twp_prints(aza_zero_step() + "print(f(2.5))\nprint(f(7))\n", "2.5\n7\n")
+
+// `int(1.5)` is 1 and `real(1.5)` is 1.5, so the two lines agree with the expected output only if the
+// conversion was made at each call's own `T`.
+@test("and a conversion written at the parameter's name")
+aza_tp_conversion()
+    if !aza_ready() then return
+
+    twp_prints(aza_half() + "print(g(1.0))\nprint(g(3))\n", "2.5\n4\n")
+
+@test("at both float widths")
+aza_tp_both_float_widths()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        import sysl.math.Float
+
+        tuned[F: Float](f: F, a4: F = F(440.0)) -> F = f + a4
+        val h: f32 = 0.5
+        val d: f64 = 0.25
+        print(tuned(h))
+        print(tuned(d))
+        """, "440.5\n440.25\n")
+
+@test("and an explicit argument still stands in its place")
+aza_tp_explicit_argument()
+    if !aza_ready() then return
+
+    twp_prints(aza_zero_step() + aza_half() + "print(f(7, 3))\nprint(g(1.0, half = 0.25))\n", "10\n1.25\n")
+
+@test("a generic struct's method may name the struct's parameter")
+aza_tp_struct_method()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        struct Acc[T: Zero + Add]
+            v: T
+
+            plus(self, by: T = T.zero()) -> T = self.v + by
+            mix[U: Add](self, u: U, extra: U = U(1.5), base: T = T(2.5)) -> U = u + extra
+        end Acc
+
+        print(Acc(2.5).plus())
+        print(Acc(4).plus())
+        print(Acc(4).plus(5))
+        print(Acc(4).mix(1.0))
+        print(Acc(4).mix(1))
+        """, "2.5\n4\n9\n2.5\n2\n")
+
+@test("and an associated function of a generic type its own")
+aza_tp_generic_type_associated_function()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        struct Acc[T: Zero]
+            v: T
+
+            start(v: T = T.zero()) -> Acc[T] = Acc(v)
+        end Acc
+
+        val a: Acc[real] = Acc.start()
+        print(a.v)
+        print(Acc.start(3).v)
+        """, "0\n3\n")
+
+// The expected type is one of the two things that may settle `T`, and the default is not.
+@test("a 'T' only the expected type settles is read there")
+aza_tp_expected_type_settles()
+    if !aza_ready() then return
+
+    twp_prints("f[T: Zero](x: T = T.zero()) -> T = x\nval n: u8 = f()\nprint(n)\n", "0\n")
+
+@test("while one nothing but the default could settle is refused as uninferable")
+aza_tp_only_the_default_is_uninferable()
+    if !aza_ready() then return
+
+    aza_refuses("f[T: Zero](x: T = T.zero()) -> T = x\nprint(f())\n",
+                "cannot infer the type argument 'T' of 'f' here — annotate the expected type")
+
+// The callee's `T`, never the caller's: `g` is generic over a `T` of its own, a `string` here, and the
+// default it fills for `f` is read at the `int` that `f(5)` settles.
+@test("the parameter is the callee's even inside a caller generic over a 'T' of its own")
+aza_tp_the_callees_parameter()
+    if !aza_ready() then return
+
+    twp_prints("f[T: Zero + Add](x: T, y: T = T.zero()) -> T = x + y\ng[T](t: T) -> int = f(5)\n" +
+               "print(g(\"s\"))\n", "5\n")
+
+@test("is evaluated only by a call that takes it, once each")
+aza_tp_evaluated_once_per_call()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        loud[T](v: T) -> T
+            print("filled")
+            v
+
+        f[T: Zero](x: T, y: T = loud(T.zero())) -> T = y
+        print(f(1, 2))
+        print(f(3))
+        print(f(4.5))
+        """, "2\nfilled\n0\nfilled\n0\n")
+
+@test("a default naming a type parameter may still not name another parameter")
+aza_tp_not_another_parameter()
+    if !aza_ready() then return
+
+    aza_refuses("f[T](x: T, y: T = x) -> T = y\nprint(f(1))\n", "undefined name 'x'")
+
+// Held to `T`'s bounds where it is written, as a body would be -- nothing calls `f` here.
+@test("a member the bounds do not promise is refused at the declaration")
+aza_tp_member_the_bounds_do_not_promise()
+    if !aza_ready() then return
+
+    aza_refuses("f[T](x: T, step: T = T.zero()) -> T = x\nprint(1)\n", "'zero' needs 'T: sysl.Zero'")
+
+// A trait member's signature may say `Self::Item`, which a bare arrow carries into a bound of its
+// own; reading the defaults' type parameters must not lose the `Self` that bound means.
+@test("on a trait member whose arrow names 'Self::Item'")
+aza_tp_trait_member_arrow_self_item()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        trait Mapper
+            type Item
+            first(self) -> Self::Item
+            over[N: Zero + Add](self, f: Self::Item -> N, base: N = N.zero()) -> N = base + f(self.first())
+        struct One
+            v: int
+        impl Mapper for One
+            type Item = int
+            first(self) -> int = self.v
+        print(One(20).over(n -> n + 1))
+        print(One(20).over(n -> n + 1, 100))
+        print(One(2).over(n -> real(n) + 0.5))
+        """, "21\n121\n2.5\n")

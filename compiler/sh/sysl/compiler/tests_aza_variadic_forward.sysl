@@ -1,0 +1,332 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// Handing a walk over the tail to another function, and duplicating one (`reference/ffi.md §
+// Variadic functions`). This is C's `vprintf` shape: the parameter type is `*va_list` and the call
+// writes `&ap`, because a parameter is a by-value binding and a copy of a walk advances nothing the
+// caller can see -- which is the one thing the form exists to do. The cases that carry the weight are
+// the ones that RUN: a lent walk advancing the lender's own list is not something the IR can be read
+// for.
+//
+// The reference's `VariadicForwardTests`; helpers are `tests_aza_rest_param.sysl`'s.
+
+private aza_tail_sum() -> string = raw"""
+    tail_sum(n: int, ap: *va_list) -> int
+        var total = 0
+        for i in 0..<n
+            var v: int = va_arg(ap)
+            total += v
+        total
+    end tail_sum
+    """
+
+// `sum` hands its whole tail to `tail_sum` and reads none of it itself.
+private aza_lending_sum(callee: string) -> string = aza_tail_sum() + raw"""
+    sum(n: int, ...) -> int
+        var ap: va_list
+        va_start(ap)
+    """ + s"    var t = $callee(n, &ap)\n" + raw"""
+        va_end(ap)
+        t
+    end sum
+    """
+
+// ---- lending a walk -------------------------------------------------------------------------------
+
+@test("a lent walk reaches the whole tail from the function that received it")
+aza_vf_reaches_the_whole_tail()
+    if !aza_ready() then return
+
+    twp_prints(aza_lending_sum("tail_sum") + "print(sum(3, 10, 20, 30))\n", "60\n")
+
+// A `va_list` parameter passing a copy would print 707 here -- both reading the first argument.
+@test("a lent walk advances the lender's own list, which is why it is lent by address")
+aza_vf_advances_the_lenders_list()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        take(ap: *va_list) -> int
+            var v: int = va_arg(ap)
+            v
+        end take
+        lend(n: int, ...) -> int
+            var ap: va_list
+            va_start(ap)
+            var a = take(&ap)
+            var b: int = va_arg(ap)
+            va_end(ap)
+            a * 100 + b
+        end lend
+        print(lend(2, 7, 9))
+        """, "709\n")
+
+@test("a lent walk may be handed on again, unchanged")
+aza_vf_handed_on_again()
+    if !aza_ready() then return
+
+    twp_prints("middle(n: int, ap: *va_list) -> int = tail_sum(n, ap)\n" + aza_lending_sum("middle") +
+               "print(sum(4, 1, 2, 3, 4))\n", "10\n")
+
+// `va_start` needs a tail of this function's own; `va_arg` needs only a walk, and that is what lets a
+// borrower exist at all. This compiler marks every `define` `#99` (the `nounwind` group), so the line
+// is matched up to its closing parenthesis.
+@test("a borrower reads a tail without having one")
+aza_vf_a_borrower_has_no_tail()
+    if !aza_ready() then return
+
+    val src = aza_lending_sum("tail_sum") + "print(sum(2, 21, 21))\n"
+    val out = aza_ir(src)
+
+    assert(out.index_of("define i32 @tail_sum(i32 %n.param, ptr %ap.param)").is_some(), out)
+    assert(out.index_of("define i32 @tail_sum(i32 %n.param, ptr %ap.param, ...").is_none(), out)
+    twp_prints(src, "42\n")
+
+@test("a walk may be carried in a struct")
+aza_vf_carried_in_a_struct()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        struct Cursor
+            ap: *va_list
+
+            take(self) -> int
+                var v: int = va_arg(self.ap)
+                v
+            end take
+        end Cursor
+        sum(n: int, ...) -> int
+            var ap: va_list
+            va_start(ap)
+            var c = Cursor(&ap)
+            var t = 0
+            for i in 0..<n
+                t += c.take()
+            va_end(ap)
+            t
+        end sum
+        print(sum(3, 1, 2, 3))
+        """, "6\n")
+
+@test("and a walk may be returned, since it is a pointer like any other")
+aza_vf_may_be_returned()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        lend(ap: *va_list) -> *va_list = ap
+
+        take(n: int, ap: *va_list) -> int
+            var t = 0
+            for i in 0..<n
+                var v: int = va_arg(ap)
+                t += v
+            t
+
+        go(n: int, ...) -> int
+            var ap: va_list
+            va_start(ap)
+            var t = take(n, lend(&ap))
+            va_end(ap)
+            t
+        end go
+
+        print(go(3, 4, 5, 6))
+        """, "15\n")
+
+@test("reading one too narrow is diagnosed through a lent walk too")
+aza_vf_too_narrow_through_a_lent_walk()
+    if !aza_ready() then return
+
+    aza_refuses("narrow(ap: *va_list) -> int\n    var v: u8 = va_arg(ap)\n    int(v)\nend narrow\nprint(1)\n",
+                "a variadic argument is promoted to at least 32 bits, so it cannot be read as byte — " +
+                "read it as 'uint' and convert")
+
+@test("each type still comes back at the width it went in at")
+aza_vf_each_type_at_its_width()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        show(n: int, ap: *va_list)
+            var i: int  = va_arg(ap)
+            var d: real = va_arg(ap)
+            var c: char = va_arg(ap)
+            var l: long = va_arg(ap)
+            print(i, d, c, l)
+        end show
+        go(n: int, ...)
+            var ap: va_list
+            va_start(ap)
+            show(n, &ap)
+            va_end(ap)
+        end go
+        go(4, 42, 2.5, 'A', 9000000000i64)
+        """, "42 2.5 A 9000000000\n")
+
+@test("a borrower may recurse down the tail")
+aza_vf_a_borrower_may_recurse()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        drain(n: int, ap: *va_list) -> int
+            if n <= 0 then
+                0
+            else
+                var v: int = va_arg(ap)
+                v + drain(n - 1, ap)
+        end drain
+        sum(n: int, ...) -> int
+            var ap: va_list
+            va_start(ap)
+            var t = drain(n, &ap)
+            va_end(ap)
+            t
+        end sum
+        print(sum(5, 1, 2, 3, 4, 5))
+        """, "15\n")
+
+// ---- duplicating a walk ---------------------------------------------------------------------------
+
+// The copy is taken after the `1`, so both walks hand back the `2`.
+@test("a copy starts where the original has reached")
+aza_vf_copy_starts_where_the_original_is()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        both(n: int, ...) -> int
+            var ap: va_list
+            va_start(ap)
+            var first: int = va_arg(ap)
+            var bp: va_list
+            va_copy(bp, ap)
+            var a: int = va_arg(ap)
+            var b: int = va_arg(bp)
+            va_end(bp)
+            va_end(ap)
+            first * 10000 + a * 100 + b
+        end both
+        print(both(3, 1, 2, 3))
+        """, "10202\n")
+
+@test("a copy is what lets a tail be read twice over")
+aza_vf_a_tail_read_twice()
+    if !aza_ready() then return
+
+    twp_prints(aza_tail_sum() + raw"""
+        twice(n: int, ...) -> int
+            var ap: va_list
+            va_start(ap)
+            var bp: va_list
+            va_copy(bp, ap)
+            var a = tail_sum(n, &ap)
+            var b = tail_sum(n, &bp)
+            va_end(bp)
+            va_end(ap)
+            a + b
+        end twice
+        print(twice(3, 1, 2, 3))
+        """, "12\n")
+
+// The original reached the third argument; the copy is still on the first.
+@test("the two walks are independent afterwards")
+aza_vf_walks_are_independent()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        apart(n: int, ...) -> int
+            var ap: va_list
+            va_start(ap)
+            var bp: va_list
+            va_copy(bp, ap)
+            var a1: int = va_arg(ap)
+            var a2: int = va_arg(ap)
+            var b1: int = va_arg(bp)
+            va_end(bp)
+            va_end(ap)
+            a1 * 10000 + a2 * 100 + b1
+        end apart
+        print(apart(3, 1, 2, 3))
+        """, "10201\n")
+
+// `peek` looked at the first argument through a copy, so the lender's own walk is untouched.
+@test("a borrower may copy the walk it was lent")
+aza_vf_a_borrower_may_copy()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        peek(ap: *va_list) -> int
+            var save: va_list
+            va_copy(save, ap)
+            var v: int = va_arg(save)
+            va_end(save)
+            v
+        end peek
+        look(n: int, ...) -> int
+            var ap: va_list
+            va_start(ap)
+            var seen = peek(&ap)
+            var first: int = va_arg(ap)
+            va_end(ap)
+            seen * 100 + first
+        end look
+        print(look(2, 7, 9))
+        """, "707\n")
+
+@test("the va_copy intrinsic is declared where it is used and nowhere else")
+aza_vf_va_copy_declared_where_used()
+    if !aza_ready() then return
+
+    val copies = aza_ir(raw"""
+        f(n: int, ...) -> int
+            var ap: va_list
+            va_start(ap)
+            var bp: va_list
+            va_copy(bp, ap)
+            var v: int = va_arg(bp)
+            va_end(bp)
+            va_end(ap)
+            v
+        end f
+        print(f(1, 5))
+        """)
+
+    assert(copies.index_of("declare void @llvm.va_copy.p0(ptr, ptr)").is_some(), copies)
+    assert(copies.index_of("call void @llvm.va_copy.p0(ptr %bp.addr, ptr %ap.addr)").is_some(), copies)
+
+    val none = aza_ir("f(n: int, ...)\n    var ap: va_list\n    va_start(ap)\n    va_end(ap)\nf(1)\n")
+
+    assert(none.index_of("did not compile").is_none(), none)
+    assert(none.index_of("llvm.va_copy").is_none(), none)
+end aza_vf_va_copy_declared_where_used
+
+// ---- what the forms refuse ------------------------------------------------------------------------
+
+@test("va_copy takes two lists")
+aza_vf_va_copy_takes_two()
+    if !aza_ready() then return
+
+    aza_refuses("f(n: int, ...)\n    var ap: va_list\n    va_start(ap)\n    va_copy(ap)\n    va_end(ap)\nend f\nf(1, 2)\n",
+                "'va_copy' takes two arguments, the va_list to start and the one to copy")
+
+@test("each of va_copy's arguments has to be a list")
+aza_vf_each_has_to_be_a_list()
+    if !aza_ready() then return
+
+    aza_refuses("f(n: int, ...)\n    var ap: va_list\n    va_start(ap)\n    var x = 1\n    va_copy(x, ap)\n    va_end(ap)\nend f\nf(1, 2)\n",
+                "'va_copy' needs a va_list, not int")
+
+@test("a borrower still has no tail of its own to start")
+aza_vf_a_borrower_cannot_start()
+    if !aza_ready() then return
+
+    aza_refuses("f(ap: *va_list)\n    va_start(ap)\nvar p: *va_list = null\nf(p)\n",
+                "'va_start' is only allowed in a function declared with '...' — there is no tail here")
+
+// The reference's case asserts only that the refusal names `va_copy`; its own words for a literal
+// destination are these.
+@test("a copy needs somewhere to go")
+aza_vf_a_copy_needs_a_destination()
+    if !aza_ready() then return
+
+    aza_refuses("f(n: int, ...)\n    var ap: va_list\n    va_start(ap)\n    va_copy(1, ap)\n    va_end(ap)\nend f\nf(1, 2)\n",
+                "'va_copy' needs a va_list, not int")
