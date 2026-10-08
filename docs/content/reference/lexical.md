@@ -694,8 +694,10 @@ A manifest may state either field without the other: one with a `name` and no `v
 
 ### Integers
 
-Decimal, hexadecimal (`0x`), binary (`0b`), and octal (`0o`). An underscore may appear between digits
-and is ignored, so long groupings stay readable. A canonical type name may be written as a **suffix**;
+Decimal, hexadecimal (`0x`), binary (`0b`), and octal (`0o`). The prefix letter may be written in
+either case, so `0XFF`, `0B1010` and `0O755` are the same literals as `0xFF`, `0b1010` and `0o755`;
+the hexadecimal digits are case-insensitive too. An underscore may appear between digits and is
+ignored, so long groupings stay readable. A canonical type name may be written as a **suffix**;
 without one the literal takes its type from context.
 
 ```sysl
@@ -703,7 +705,7 @@ var dec = 1_000_000
 var hex = 0xFF
 var bin = 0b1010_1010
 var oct = 0o755
-var suffixed = 42
+var suffixed = 42u16
 
 print(dec, hex, bin, oct, suffixed)
 ```
