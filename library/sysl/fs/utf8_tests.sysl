@@ -1,0 +1,147 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.path.join
+import sysl.text.from_utf8_unchecked
+
+// Bytes that had to be text and are not: what `read_text` and `entries` answer when a file's contents
+// or a directory's name is not UTF-8. Both used to stop the program, so every test here is one that
+// would have ended the run rather than failed it.
+
+private utf8_scratch(name: string) -> string
+    val dir = "/tmp/sysl-fs-utf8-" + name
+
+    ignore_err(remove_dir_all(dir))
+    make_dir(dir).unwrap()
+    dir
+end utf8_scratch
+
+private ignore_err(r: Result[unit, IoError]) = ()
+
+/** The file holding exactly these bytes, read back as text. */
+private read_back(dir: string, bytes: []const u8) -> Result[string, IoError]
+    val f = join(dir, "f")
+
+    write_bytes(f, bytes).unwrap()
+    read_text(f)
+end read_back
+
+@test("a byte that never begins UTF-8 is InvalidUtf8 at its offset, not a trap")
+read_text_refuses_ff()
+    val dir = utf8_scratch("ff")
+    val bad: [3]u8 = [u8('o'), u8('k'), 255]
+
+    assert_eq(read_back(dir, bad).unwrap_err(), InvalidUtf8(2))
+
+    ignore_err(remove_dir_all(dir))
+end read_text_refuses_ff
+
+@test("a lone surrogate, which is well-formed bytes for a code point UTF-8 forbids, is InvalidUtf8")
+read_text_refuses_a_surrogate()
+    val dir = utf8_scratch("surrogate")
+    val bad: [5]u8 = [u8('a'), 237, 160, 128, u8('z')]
+
+    assert_eq(read_back(dir, bad).unwrap_err(), InvalidUtf8(1))
+
+    ignore_err(remove_dir_all(dir))
+end read_text_refuses_a_surrogate
+
+@test("a sequence cut off by the end of the file is InvalidUtf8 at the byte that began it")
+read_text_refuses_a_truncated_tail()
+    val dir = utf8_scratch("truncated")
+    val bad: [4]u8 = [u8('a'), u8('b'), 226, 130]
+
+    assert_eq(read_back(dir, bad).unwrap_err(), InvalidUtf8(2))
+
+    ignore_err(remove_dir_all(dir))
+end read_text_refuses_a_truncated_tail
+
+@test("a file that is UTF-8 reads back unchanged, multi-byte characters and all")
+read_text_keeps_valid_text()
+    val dir = utf8_scratch("valid")
+    val f = join(dir, "f")
+
+    write_text(f, "héllo, wörld — ✓").unwrap()
+
+    assert_eq(read_text(f).unwrap(), "héllo, wörld — ✓")
+
+    ignore_err(remove_dir_all(dir))
+end read_text_keeps_valid_text
+
+@test("InvalidUtf8 says where, reports EILSEQ as its code, and is equal only to itself at one offset")
+invalid_utf8_reads_as_an_error()
+    assert_eq(InvalidUtf8(5).message(), "not UTF-8 at byte 5")
+    assert_eq(f"${InvalidUtf8(5)}%s", "not UTF-8 at byte 5")
+    assert_eq(InvalidUtf8(5).code(), ilseq())
+
+    assert(InvalidUtf8(3) == InvalidUtf8(3), "one offset is not equal to itself")
+    assert(InvalidUtf8(3) != InvalidUtf8(4), "two offsets compare equal")
+    assert(InvalidUtf8(3) != Other(ilseq()), "a decode failure equals a bare EILSEQ")
+    assert(Other(ilseq()) != InvalidUtf8(3), "a bare EILSEQ equals a decode failure")
+    assert(NotFound != InvalidUtf8(2), "NotFound equals a decode failure at its code")
+end invalid_utf8_reads_as_an_error
+
+@test("a listed name that is not UTF-8 decodes to InvalidUtf8 at the offset within the name")
+a_bad_name_is_invalid_utf8()
+    val bad: [4]u8 = [u8('a'), u8('b'), 255, u8('c')]
+    val cut: [2]u8 = [u8('x'), 195]
+    val good: [3]u8 = [u8('n'), 195, 169]
+
+    assert_eq(name_text(bad).unwrap_err(), InvalidUtf8(2))
+    assert_eq(name_text(cut).unwrap_err(), InvalidUtf8(1))
+    assert_eq(name_text(good).unwrap(), "né")
+
+@test("entry_bytes answers every name as bytes, leaving out '.' and '..' as entries does")
+entry_bytes_lists_bytes()
+    val dir = utf8_scratch("bytes")
+
+    write_text(join(dir, "one"), "").unwrap()
+    write_text(join(dir, "né"), "").unwrap()
+    make_dir(join(dir, "..x")).unwrap()
+
+    val raw = entry_bytes(dir).unwrap()
+    val names = entries(dir).unwrap()
+
+    assert_eq(raw.len(), 3)
+    assert_eq(names.len(), 3)
+
+    for b in raw.view()
+        val s = from_utf8_unchecked(b)
+
+        assert(s == "one" || s == "né" || s == "..x", "an unexpected name came back")
+
+    assert_eq(entry_bytes("/tmp/sysl-fs-utf8-nothing-is-here").unwrap_err(), NotFound)
+
+    ignore_err(remove_dir_all(dir))
+end entry_bytes_lists_bytes
+
+// A name that is not UTF-8, made on disk where the filesystem allows one. **APFS does not**: it
+// refuses the create with `EILSEQ`, so on macOS this test asserts that refusal and the decode path is
+// covered by the test above through `name_text`, which is what `entries` calls for every name. On
+// Linux the name is made and the whole listing is asserted.
+@test("a directory holding a name that is not UTF-8 lists as InvalidUtf8, and entry_bytes still lists it")
+a_bad_name_on_disk()
+    val dir = utf8_scratch("on-disk")
+    val bad: [3]u8 = [u8('q'), 255, u8('r')]
+
+    write_bytes(join(dir, from_utf8_unchecked(bad)), [u8('x')]) match
+        Err(e) -> assert_eq(e, Other(ilseq()), "the filesystem refused the name for some other reason")
+        Ok(_) ->
+            write_text(join(dir, "fine"), "").unwrap()
+
+            assert_eq(entries(dir).unwrap_err(), InvalidUtf8(1))
+
+            val raw = entry_bytes(dir).unwrap()
+
+            assert_eq(raw.len(), 2)
+
+            var saw = false
+
+            for b in raw.view()
+                if b.len == 3 && b[0] == u8('q') && b[1] == 255 && b[2] == u8('r') then saw = true
+
+            assert(saw, "entry_bytes lost the name that is not UTF-8")
+
+    ignore_err(remove_dir_all(dir))
+end a_bad_name_on_disk
