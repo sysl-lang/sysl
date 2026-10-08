@@ -1,0 +1,216 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// `?` widening a callee's error into the caller's through `From` (`reference/errors.md § A ? converts
+// through From`). The conversion is looked up rather than written, so two layers of a program are
+// joined once, in the block that says how.
+
+private val azb_layers: string = raw"""
+    enum Io
+        NotFound
+        Denied
+
+    enum Fault
+        Disk(cause: Io)
+        Parse(what: string)
+
+    impl From[Io] for Fault
+        from(value: Io) -> Fault = Fault.Disk(value)
+
+    open(ok: bool) -> Result[int, Io] = if ok then Ok(7) else Err(Io.NotFound)
+
+    read(ok: bool) -> Result[int, Fault]
+        val n = open(ok)?
+
+        Ok(n * 2)
+
+    describe(r: Result[int, Fault]) -> string = r match
+        Ok(n) -> "ok " + str(n)
+        Err(Fault.Disk(_)) -> "disk"
+        Err(Fault.Parse(s)) -> "parse " + s
+
+    """
+
+@test("the success path is untouched")
+azb_tcv_the_success_path()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(azb_layers + "print(describe(read(true)))\n"), "ok 14\n")
+
+@test("and the failure arrives wrapped in the caller's own type")
+azb_tcv_the_failure_is_wrapped()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(azb_layers + "print(describe(read(false)))\n"), "disk\n")
+
+@test("a '?' whose error types already agree makes no call at all")
+azb_tcv_agreeing_types_make_no_call()
+    if !azb_ready() then return
+
+    val cs = azb_compilers()
+
+    for i in 0..<cs.len()
+        val out = azb_ir(raw"""
+            f(ok: bool) -> Result[int, string] = if ok then Ok(1) else Err("no")
+
+            g() -> Result[int, string]
+                val n = f(true)?
+
+                Ok(n)
+
+            print(g().unwrap_or(0))
+            """, cs.at(i))
+
+        assert(out.contains("define"), s"${azb_who(cs.at(i))}: no module in\n$out")
+        assert(!out.contains("from"), azb_who(cs.at(i)))
+end azb_tcv_agreeing_types_make_no_call
+
+// `None` carries nothing, so there is nothing for a conversion to be about.
+@test("an Option is unaffected, having no error to convert")
+azb_tcv_an_option_is_unaffected()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        f(ok: bool) -> Option[int] = if ok then Some(3) else None
+
+        g(ok: bool) -> Option[int]
+            val n = f(ok)?
+
+            Some(n * 2)
+
+        print(g(true), g(false))
+        """), "Some(6) None\n")
+
+@test("and the two enums must still agree — an Option does not become a Result")
+azb_tcv_an_option_does_not_become_a_result()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        f() -> Option[int] = Some(1)
+
+        g() -> Result[int, string]
+            val n = f()?
+
+            Ok(n)
+
+        print(1)
+        """), ["may only be used in a function returning"])
+
+// The message names the block to write rather than only the mismatch.
+@test("the refusal says what would join the two layers")
+azb_tcv_the_refusal_says_what_joins()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        f() -> Result[int, string] = Ok(1)
+
+        g() -> Result[int, bool]
+            val n = f()?
+
+            Ok(n)
+
+        print(1)
+        """), ["a '?' converts through 'sysl.From', so 'impl From[string] for bool' is what joins"])
+
+// An inherent `from` of the right signature is a function that happens to be spelled the same.
+@test("an inherent 'from' of the right shape is not a conversion")
+azb_tcv_an_inherent_from_is_not_a_conversion()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        struct Wrap
+            n: int
+
+            from(value: int) -> Wrap = Wrap(value)
+
+        f() -> Result[int, int] = Ok(1)
+
+        g() -> Result[int, Wrap]
+            val n = f()?
+
+            Ok(n)
+
+        print(1)
+        """), ["converts through"])
+
+@test("a type may accept conversions from several sources")
+azb_tcv_several_sources()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        enum Fault
+            FromInt(n: int)
+            FromText(s: string)
+
+        impl From[int] for Fault
+            from(value: int) -> Fault = Fault.FromInt(value)
+
+        impl From[string] for Fault
+            from(value: string) -> Fault = Fault.FromText(value)
+
+        numeric() -> Result[int, int] = Err(4)
+        textual() -> Result[int, string] = Err("bad")
+
+        both(which: bool) -> Result[int, Fault]
+            if which then
+                val a = numeric()?
+
+                Ok(a)
+            else
+                val b = textual()?
+
+                Ok(b)
+
+        show(r: Result[int, Fault]) -> string = r match
+            Ok(n) -> str(n)
+            Err(Fault.FromInt(n)) -> "int " + str(n)
+            Err(Fault.FromText(s)) -> "text " + s
+
+        print(show(both(true)))
+        print(show(both(false)))
+        """), "int 4\ntext bad\n")
+
+// The conversion's result arrives owned, so the early return carries the count it already took; a
+// destructor counting releases is what tells a right count from one that merely runs.
+@test("a converted payload's count is exactly right, which a destructor is what can say")
+azb_tcv_a_converted_payloads_count()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        static var dropped: int = 0
+
+        struct Note
+            text: string
+
+        impl Drop for Note
+            drop(self)
+                dropped += 1
+
+        enum Low
+            Bad(note: &Note)
+
+        enum High
+            Wrapped(note: &Note)
+
+        impl From[Low] for High
+            from(value: Low) -> High = value match
+                Low.Bad(n) -> High.Wrapped(n)
+
+        deep() -> Result[int, Low] = Err(Low.Bad(Note("boom")))
+
+        shallow() -> Result[int, High]
+            val n = deep()?
+
+            Ok(n)
+
+        run() -> unit
+            for i in 0..<10
+                shallow() match
+                    Ok(_) -> print("ok")
+                    Err(High.Wrapped(n)) -> print(n.text)
+
+        run()
+        print(dropped)
+        """), "boom\nboom\nboom\nboom\nboom\nboom\nboom\nboom\nboom\nboom\n10\n")

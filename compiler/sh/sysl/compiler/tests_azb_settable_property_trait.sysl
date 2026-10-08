@@ -1,0 +1,157 @@
+module sh.sysl.compiler
+@tests
+
+// A trait that asks for a settable property (`reference/declarations.md § A property may be
+// settable`). A setter is an ordinary `*self` method under a name a program cannot spell, so the three
+// ways a member is reached reach it too -- a bound, a method table, and the type's own body -- and
+// `x.count = v` means the setter at each.
+
+private val azb_counter: string = raw"""
+    trait Counter
+        count -> int
+        set count(n)
+
+    struct Cell
+        v: int
+
+    """
+
+@test("a bound licenses writing the property")
+azb_spx_a_bound_licenses_the_write()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(azb_counter + raw"""
+        impl Counter for Cell
+            count -> int = self.v
+            set count(n)
+                self.v = n * 2
+
+        bump[C: Counter](c: *C)
+            c.count = 21
+
+        var cell = Cell(0)
+        bump(&cell)
+        print(cell.count)
+        """), "42\n")
+
+@test("a compound form through a bound reads and writes the property")
+azb_spx_a_compound_form_through_a_bound()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(azb_counter + raw"""
+        impl Counter for Cell
+            count -> int = self.v
+            set count(n)
+                self.v = n
+
+        twice[C: Counter](c: *C)
+            c.count += c.count
+
+        var cell = Cell(21)
+        twice(&cell)
+        print(cell.count)
+        """), "42\n")
+
+@test("a trait object writes through its table")
+azb_spx_a_trait_object_writes_through_its_table()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(azb_counter + raw"""
+        impl Counter for Cell
+            count -> int = self.v
+            set count(n)
+                self.v = n + 1
+
+        var c: &Counter = Cell(0)
+        c.count = 41
+        print(c.count)
+        """), "42\n")
+
+@test("a trait supplies a default setter")
+azb_spx_a_default_setter()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        trait Counter
+            raw -> int
+            set raw(n)
+
+            count -> int = self.raw
+            set count(n)
+                self.raw = n * 10
+
+        struct Cell
+            v: int
+
+        impl Counter for Cell
+            raw -> int = self.v
+            set raw(n)
+                self.v = n
+
+        var cell = Cell(0)
+        cell.count = 4
+        print(cell.count)
+        """), "40\n")
+
+@test("an impl need not restate the property to supply its setter")
+azb_spx_only_the_setter()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        trait Counter
+            count -> int = 7
+            set count(n)
+
+        struct Cell
+            v: int
+
+        impl Counter for Cell
+            set count(n)
+                self.v = n
+
+        var cell = Cell(0)
+        cell.count = 1
+        print(cell.count, cell.v)
+        """), "7 1\n")
+
+@test("an implementation that omits the setter is refused, and the setter is named as one")
+azb_spx_an_omitted_setter()
+    if !azb_ready() then return
+
+    azb_refused_without(azb_main(azb_counter + "impl Counter for Cell\n    count -> int = self.v\nprint(1)\n"),
+                        ["count"], ["$"])
+
+private val azb_read_only: string = raw"""
+    trait Counter
+        count -> int
+
+    struct Cell
+        v: int
+
+    impl Counter for Cell
+        count -> int = self.v
+
+    """
+
+// What lacks the setter is the trait, at every instantiation, so the generic's definition says so.
+@test("a bound with no setter refuses the write")
+azb_spx_a_bound_with_no_setter()
+    if !azb_ready() then return
+
+    azb_refused_without(azb_main(azb_read_only + "bump[C: Counter](c: *C)\n    c.count = 1\n\n" +
+                                 "var cell = Cell(0)\nbump(&cell)\n"),
+                        ["in trait 'Counter'"], ["$"])
+
+@test("a trait object with no setter is refused, and named as the trait's")
+azb_spx_a_trait_object_with_no_setter()
+    if !azb_ready() then return
+
+    azb_refused_without(azb_main(azb_read_only + "var c: &Counter = Cell(0)\nc.count = 1\n"),
+                        ["in trait 'Counter'"], ["$"])
+
+// Nothing else is said: the setter's parameter has no type to be refused for.
+@test("a trait asking for a setter must declare the property")
+azb_spx_a_setter_needs_its_property()
+    if !azb_ready() then return
+
+    azb_refused_without(azb_main("trait Counter\n    set count(n)\nprint(1)\n"), ["declares none"], ["$value"])

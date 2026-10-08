@@ -1,0 +1,209 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// `@no_alloc` meeting a generic (`reference/modules.md § A generic answers for what it wrote, not for
+// what its caller chose`). An instance is charged for what it CONSTRUCTS, which is written in the
+// library's own text, and not for what it REACHES through a bound, which its caller chose. A call in
+// a generic body to a concrete function, or to another generic, is the declaring module's conduct at
+// every instantiation. On a machine with no heap every module is allocator-free, so the caller is
+// checked too and the walk from its body goes straight through the instance.
+
+private val azb_sink_body: string = raw"""
+
+    trait Sink
+        put(*self, s: string)
+
+    twice[S: Sink](s: *S, msg: string)
+        s.put(msg)
+        s.put(msg)
+    """
+
+private val azb_hosted: string = raw"""
+    import lib.*
+    import sysl.text.cstring
+
+    struct Loud
+        n: int
+
+    impl Sink for Loud
+        put(*self, s: string)
+            val c = cstring(s)
+            self.n += 1
+
+    main()
+        var l = Loud(0)
+        twice(&l, "hi")
+        print(l.n)
+    """
+
+// The allocator-free library, with its clause written or not.
+private azb_sink_lib(clause: string) -> string = "module lib\n" + clause + azb_sink_body
+
+private azb_pair(lib: string) -> [](string, string, string) =
+    [("lib", "lib.sysl", lib), ("", "main.sysl", azb_hosted)]
+
+@test("a hosted program may instantiate an allocator-free library's generic at a type that allocates")
+azb_nag_the_caller_chose_the_type()
+    if !azb_ready() then return
+
+    azb_prints(azb_pair(azb_sink_lib("@no_alloc\n")), "2\n")
+
+@test("and the same program compiles identically with the library's clause removed")
+azb_nag_the_same_without_the_clause()
+    if !azb_ready() then return
+
+    azb_prints(azb_pair(azb_sink_lib("")), "2\n")
+
+// `&x` boxes at every instantiation, so a construction is still charged where it is written.
+@test("but a construction in the generic's own body is still the library's, at every instantiation")
+azb_nag_a_construction_is_the_librarys()
+    if !azb_ready() then return
+
+    azb_refused([("lib", "lib.sysl", "module lib\n@no_alloc\n\nboxed[T](x: T) -> &T = x\n"),
+                 ("", "main.sysl", "import lib.*\n\nprint(*boxed(3))\n")],
+                ["a reference needs an allocator", "lib/lib.sysl"])
+
+// The argument the whole decision rests on: the module that chose the type is itself checked.
+@test("on a target with no heap the instantiating module is refused, since it is checked too")
+azb_nag_no_heap_checks_the_caller()
+    if !azb_ready() then return
+
+    val said = azb_reported(["heap"], [("lib/lib.sysl", azb_sink_lib("@no_alloc\n")), ("main.sysl", azb_hosted)])
+
+    assert(said.contains("makes heap storage"), said)
+
+// The counter-example that killed a blunter fix: `cstring` here has nothing to do with `T`.
+@test("a generic that allocates outright is still its own module's, since no type argument chose it")
+azb_nag_an_outright_allocation()
+    if !azb_ready() then return
+
+    val said = azb_reported(["heap"], [("main.sysl", raw"""
+        import sysl.text.cstring
+
+        thru[T](x: T, s: string) -> usize = cstring(s).len
+
+        main()
+            print(thru(1, "hi"))
+        """)])
+
+    assert(said.contains("makes heap storage"), said)
+
+@test("while the same pair compiles for a target that has one")
+azb_nag_a_machine_with_a_heap()
+    if !azb_ready() then return
+
+    val said = azb_reported([], [("lib/lib.sysl", azb_sink_lib("@no_alloc\n")), ("main.sysl", azb_hosted)])
+
+    assert(said.is_empty(), said)
+
+// A call in a generic body to another generic leads to the body that was written.
+@test("a generic that reaches an allocator through another generic is still its own module's")
+azb_nag_through_another_generic()
+    if !azb_ready() then return
+
+    azb_refused([("lib", "lib.sysl", "module lib\n\ngrow[T: Display](x: T) -> string = s\"$x!\"\n"),
+                 ("a", "a.sysl", "module a\n@no_alloc\n\nimport lib.*\n\nf[U: Display](u: U) -> usize = grow(u).len\n"),
+                 ("", "main.sysl", "import a.*\n\nprint(f(1))\n")],
+                ["a/a.sysl"])
+
+@test("a generic type's own member is charged where it is written")
+azb_nag_a_generic_types_member()
+    if !azb_ready() then return
+
+    azb_refused([("lib", "lib.sysl", raw"""
+                     module lib
+                     @no_alloc
+
+                     struct Cell[T]
+                         v: T
+
+                         boxed(self) -> &T = self.v
+                     """),
+                 ("", "main.sysl", "import lib.*\n\nprint(*Cell(3).boxed())\n")],
+                ["a reference needs an allocator", "lib/lib.sysl"])
+
+// A default body is written in the trait's module and is the same at every instantiation.
+@test("a trait default that allocates is the library's, not the caller's")
+azb_nag_a_trait_default()
+    if !azb_ready() then return
+
+    azb_refused([("lib", "lib.sysl", raw"""
+                     module lib
+                     @no_alloc
+
+                     import sysl.text.cstring
+
+                     trait Chatty
+                         say(*self) -> usize = cstring("spoken").len
+
+                     use[C: Chatty](c: *C) -> usize = c.say()
+                     """),
+                 ("", "main.sysl", raw"""
+                     import lib.*
+
+                     struct Quiet
+                         n: int
+
+                     impl Chatty for Quiet
+
+                     main()
+                         var q = Quiet(0)
+                         print(use(&q))
+                     """)],
+                ["lib/lib.sysl"])
+
+// The argument is itself an instantiation, so its members are emitted under the mangled name.
+@test("a type argument that is itself generic is still the caller's choice")
+azb_nag_a_generic_type_argument()
+    if !azb_ready() then return
+
+    azb_prints([("lib", "lib.sysl", raw"""
+                    module lib
+                    @no_alloc
+
+                    trait Sink
+                        put(*self, s: string)
+
+                    once[S: Sink](s: *S, msg: string)
+                        s.put(msg)
+                    """),
+                ("", "main.sysl", raw"""
+                    import lib.*
+                    import sysl.text.cstring
+
+                    struct Box[T]
+                        v: T
+                        n: int
+
+                    impl[T] Sink for Box[T]
+                        put(*self, s: string)
+                            val c = cstring(s)
+                            self.n += 1
+
+                    main()
+                        var b = Box(1, 0)
+                        once(&b, "hi")
+                        print(b.n)
+                    """)], "1\n")
+
+// Two allocator-free modules calling ONE instantiation, which is memoized: the verdict must not be
+// whichever caller the walk reached first.
+private azb_two(second: string) -> [](string, string, string) =
+    [("lib", "lib.sysl", "module lib\n\ngrow[T: Display](x: T) -> string = s\"$x!\"\n"),
+     ("a", "a.sysl", "module a\n@no_alloc\n\nimport lib.*\n\nf() -> usize = grow(1).len\n"),
+     ("b", "b.sysl", s"module b\n$second\n\nimport lib.*\n\ng() -> usize = grow(1).len\n"),
+     ("", "main.sysl", "import a.*\nimport b.*\n\nprint(f() + g())\n")]
+
+@test("both are reported, rather than whichever got there first")
+azb_nag_both_are_reported()
+    if !azb_ready() then return
+
+    azb_refused(azb_two("@no_alloc"), ["a/a.sysl", "b/b.sysl"])
+
+@test("and marking the second does not silence the first")
+azb_nag_the_second_does_not_silence_the_first()
+    if !azb_ready() then return
+
+    azb_refused(azb_two(""), ["a/a.sysl"])
