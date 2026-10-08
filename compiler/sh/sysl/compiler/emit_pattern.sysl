@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int}
+import sysl.slices.sort_by
 
 // **What a pattern tests, and what it binds** -- the two halves of an arm, kept apart because they
 // happen at different moments: a binding is established only once the arm has been taken, and a
@@ -522,69 +523,184 @@ end gen_arm_body
 // is, and a guard runs between the two.
 private gen_arm_chain(e: *Emit, arms: Buf[TArm], sv: Val, at: Option[Val], ty: Type, slot: Merge,
                       end_l: string)
-    for i in 0..<arms.len()
-        val arm = arms.at(i)
-        val body_l = fresh_label(e, "match.arm")
-        val next_l = fresh_label(e, "match.next")
+    var i: usize = 0
 
-        var pat_cond: Val = pattern_test(e, arm.patterns.at(0), sv)
+    while i < arms.len()
+        val run = string_run(arms, i)
 
-        for j in 1..<arm.patterns.len()
-            pat_cond = or_i1(e, pat_cond, pattern_test(e, arm.patterns.at(j), sv))
-
-        // **An arm's bindings are its own ownership region.** A name bound out of the scrutinee
-        // holds a share of what it names, and the arm is where that share goes back -- so the region
-        // opens where the bindings are made and closes where the arm hands its value over.
-        //
-        // An arm that only hands a payload back has done all of its work once it is written.
-        var moved = false
-
-        arm.guard match
-            None ->
-                emit_term(e, InCondBr(pat_cond, body_l, next_l))
-                emit_label(e, body_l)
-                push_owned(e)
-
-                moved = payload_move(e, arm, slot, at)
-
-                if !moved && arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
-            Some(g) ->
-                val guard_l = fresh_label(e, "match.guard")
-
-                emit_term(e, InCondBr(pat_cond, guard_l, next_l))
-                emit_label(e, guard_l)
-                push_owned(e)
-
-                if arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
-
-                push_temps(e)
-
-                val gv = gen_expr(e, g)
-
-                pop_temps(e)
-
-                // A guard that fails leaves an arm whose bindings were already made, so they are
-                // given back before falling through to the next one.
-                val unbind_l = fresh_label(e, "match.unbind")
-
-                emit_term(e, InCondBr(gv, body_l, unbind_l))
-                emit_label(e, unbind_l)
-                release_owned(e)
-                emit_term(e, InBr(next_l))
-                emit_label(e, body_l)
-
-        if !moved
-            if no_value(ty) then gen_block_void(e, arm.body)
-            else store_merged(e, arm.body, ty, slot)
-
-        pop_owned(e)
-        emit_term(e, InBr(end_l))
-        emit_label(e, next_l)
+        if run >= string_table_arms
+            gen_string_table(e, arms, i, i + run, sv, at, ty, slot, end_l)
+            i += run
+        else
+            gen_chain_arm(e, arms.at(i), sv, at, ty, slot, end_l)
+            i += 1
 
     // Fallthrough with no matching arm: a value or enum match is exhaustive, so this point is
     // unreachable; a plain scalar statement match simply proceeds.
     if no_value(ty) then emit_term(e, InBr(end_l)) else emit_term(e, InUnreachable)
 end gen_arm_chain
+
+// One arm of the chain: its test, its guard where it has one, and its body, ending at the label the
+// next arm is tested under.
+private gen_chain_arm(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, slot: Merge,
+                      end_l: string)
+    val body_l = fresh_label(e, "match.arm")
+    val next_l = fresh_label(e, "match.next")
+
+    var pat_cond: Val = pattern_test(e, arm.patterns.at(0), sv)
+
+    for j in 1..<arm.patterns.len()
+        pat_cond = or_i1(e, pat_cond, pattern_test(e, arm.patterns.at(j), sv))
+
+    // **An arm's bindings are its own ownership region.** A name bound out of the scrutinee holds a
+    // share of what it names, and the arm is where that share goes back -- so the region opens where
+    // the bindings are made and closes where the arm hands its value over.
+    //
+    // An arm that only hands a payload back has done all of its work once it is written.
+    var moved = false
+
+    arm.guard match
+        None ->
+            emit_term(e, InCondBr(pat_cond, body_l, next_l))
+            emit_label(e, body_l)
+            push_owned(e)
+
+            moved = payload_move(e, arm, slot, at)
+
+            if !moved && arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
+        Some(g) ->
+            val guard_l = fresh_label(e, "match.guard")
+
+            emit_term(e, InCondBr(pat_cond, guard_l, next_l))
+            emit_label(e, guard_l)
+            push_owned(e)
+
+            if arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
+
+            push_temps(e)
+
+            val gv = gen_expr(e, g)
+
+            pop_temps(e)
+
+            // A guard that fails leaves an arm whose bindings were already made, so they are given
+            // back before falling through to the next one.
+            val unbind_l = fresh_label(e, "match.unbind")
+
+            emit_term(e, InCondBr(gv, body_l, unbind_l))
+            emit_label(e, unbind_l)
+            release_owned(e)
+            emit_term(e, InBr(next_l))
+            emit_label(e, body_l)
+
+    if !moved
+        if no_value(ty) then gen_block_void(e, arm.body)
+        else store_merged(e, arm.body, ty, slot)
+
+    pop_owned(e)
+    emit_term(e, InBr(end_l))
+    emit_label(e, next_l)
+end gen_chain_arm
+
+// **A long run of string-literal arms is one search and one `switch`, not a chain of comparisons.**
+// The chain asks `==` once per arm, so an input reaching the last of N arms pays N comparisons, and
+// LLVM's passes over a body holding thousands of them are worse than linear: 4,000 arms took twelve
+// seconds of `-O1`. Laid down as a sorted constant table, the run is one binary search
+// (`sysl.str.search`, asking the comparison `==` asks) answering the entry's position, and one
+// `switch` on that position to the arm it belongs to -- which LLVM makes a jump table.
+//
+// **The meaning is the chain's.** Only arms whose every pattern is a string literal and which carry
+// no guard are taken, so nothing in the run can fail after the branch to it; the arms around the run
+// keep their order, the switch's default edge going on to whatever follows. An input written in two
+// arms of the run is the first one's, as the chain tested the first one first. A short run keeps the
+// chain, whose few comparisons the optimizer folds.
+const string_table_arms: usize = 16
+
+// How many arms from `from` on form a run the table can answer.
+private string_run(arms: Buf[TArm], from: usize) -> usize
+    var n: usize = 0
+
+    while from + n < arms.len() && table_arm(arms.at(from + n))
+        n += 1
+
+    n
+end string_run
+
+private table_arm(arm: TArm) -> bool
+    if arm.guard.is_some() then return false
+
+    for j in 0..<arm.patterns.len()
+        if string_literal(arm.patterns.at(j)).is_none() then return false
+
+    true
+end table_arm
+
+// The string a pattern compares against, where it is a string literal and nothing else.
+private string_literal(p: TPattern) -> Option[string] = p match
+    TLitPattern(v) ->
+        if underlying(texpr_type(v)) != Str then None
+        else *v.kind match
+            TStrLit(s) -> Some(s)
+            _ -> None
+    _ -> None
+
+// The arms `from..<to` dispatched through one table. Each string is entered once, for the first arm
+// that names it; an arm none of whose strings survives is unreachable, and its label is opened with
+// nothing branching to it, so emission stays suppressed through its body as it would for any other
+// block nothing reaches.
+private gen_string_table(e: *Emit, arms: Buf[TArm], from: usize, to: usize, sv: Val,
+                         at: Option[Val], ty: Type, slot: Merge, end_l: string)
+    var entries: Buf[(string, usize)] = buf()
+
+    for k in from..<to
+        val arm = arms.at(k)
+
+        for j in 0..<arm.patterns.len()
+            entries.push((string_literal(arm.patterns.at(j)).unwrap(), k - from))
+
+    sort_by(entries.view(), (a, b) -> a.0 < b.0 || (a.0 == b.0 && a.1 < b.1))
+
+    var keys: Buf[IrArg] = buf()
+    var owners: Buf[usize] = buf()
+    var last: Option[string] = None
+
+    for k in 0..<entries.len()
+        val entry = entries.at(k)
+
+        if last.is_none() || last.unwrap() != entry.0
+            keys.push(ir_arg(lty(e, Str), string_const(e, entry.0)))
+            owners.push(entry.1)
+            last = Some(entry.0)
+
+    e.table_id += 1
+
+    val name = s".table${e.table_id}"
+
+    e.globals.push(IrGlobal(name, true, LArr(int(keys.len()), lty(e, Str)), Some(VArray(keys)),
+                            LinkPrivate, None, Some(int(e.layout.align(Str))), false))
+
+    val found = str_search(e, VGlobal(name), keys.len(), sv)
+
+    var arm_ls: Buf[string] = buf()
+
+    for k in from..<to
+        arm_ls.push(fresh_label(e, "match.arm"))
+
+    val next_l = fresh_label(e, "match.next")
+
+    var cases: Buf[(BigInt, string)] = buf()
+
+    for k in 0..<owners.len()
+        cases.push((from_int(long(k)), arm_ls.at(owners.at(k))))
+
+    emit_term(e, InSwitch(word_lty(e), found, next_l, cases))
+
+    for k in from..<to
+        emit_label(e, arm_ls.at(k - from))
+        gen_arm_body(e, arms.at(k), sv, at, ty, slot, end_l)
+
+    emit_label(e, next_l)
+end gen_string_table
 
 // An arm that hands back one large payload unchanged (`moved_payload`), written straight from where
 // the scrutinee holds it (`at`) to where the value is going, rather than bound into a slot of its own

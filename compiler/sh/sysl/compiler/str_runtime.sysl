@@ -133,6 +133,47 @@ str_cmp_text(word: string) -> string
     }
     """
 
+// Where a string sits in a sorted table of strings: the position of the entry holding the same bytes,
+// or the table's length where none does. The table is an array of strings in the order `str_cmp`
+// gives them, so a binary search over it asks the very comparison the chain of `==`s would have
+// asked, a logarithmic number of times rather than once per entry. It is what a `match` with many
+// string-literal arms branches on (`emit_pattern.sysl`'s `gen_string_table`).
+str_search_text(word: string, str: string) -> string
+    s"""
+    define private $word @sysl.str.search(ptr %t, $word %count, ptr %p, $word %n) {
+    entry:
+      br label %cond
+    cond:
+      %lo = phi $word [ 0, %entry ], [ %lo, %left ], [ %above, %right ]
+      %hi = phi $word [ %count, %entry ], [ %mid, %left ], [ %hi, %right ]
+      %more = icmp ult $word %lo, %hi
+      br i1 %more, label %probe, label %miss
+    probe:
+      %span = sub $word %hi, %lo
+      %half = lshr $word %span, 1
+      %mid = add $word %lo, %half
+      %bp = getelementptr $str, ptr %t, $word %mid, i32 1
+      %b = load ptr, ptr %bp
+      %bnp = getelementptr $str, ptr %t, $word %mid, i32 2
+      %bn = load $word, ptr %bnp
+      %c = call i32 @sysl.str.cmp(ptr %p, $word %n, ptr %b, $word %bn)
+      %same = icmp eq i32 %c, 0
+      br i1 %same, label %hit, label %step
+    step:
+      %before = icmp slt i32 %c, 0
+      br i1 %before, label %left, label %right
+    left:
+      br label %cond
+    right:
+      %above = add $word %mid, 1
+      br label %cond
+    hit:
+      ret $word %mid
+    miss:
+      ret $word %count
+    }
+    """
+
 // Concatenation. A `StrBuf` sized for both halves is allocated the way every heap object is, with
 // the header size taken portably from `%arc.header` so a 32-bit target lays it out the same way.
 // The two halves are copied in a byte at a time, and the returned view names the buffer as its
