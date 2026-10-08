@@ -1,0 +1,114 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.{Search}
+
+// **Where a refusal before analysis points, as 0.0.162 points it.** Each case is a refusal both
+// compilers make in the same words whose `-->` line or caret disagreed (the caret sweep,
+// `tests_crt_caret_sweep.sysl`); the expected place and caret are quoted from the reference's own
+// report on the same input.
+
+// The `line:col` of the first report this compiler renders for a source that does not parse, and its
+// caret, as `1:9 ^`.
+private placed(text: string) -> string
+    val r = first_report(parse_report(parse(source_of("block.sysl", text))))
+
+    if r.len() < 5 then return s"no report: ${r.len()} lines"
+
+    val caret = r.at(r.len() - 1)
+    val bar = caret.index_of("|").unwrap_or(0)
+
+    s"${report_place(r.at(1))} ${caret[bar + 1..].trim()}"
+end placed
+
+// `@borrows(xs)` over a free function: r162 `--> c1.sysl:1:9`, `^` under the `(`.
+@test("anchors: '@borrows' on a free function is refused at its argument list")
+cra_borrows_at_its_argument_list()
+    assert_eq(placed("@borrows(xs)\nfirst(xs: []const u8) -> u8 = xs[0]\n"), "1:9 ^")
+
+// `var esc = '\e'`: r162 `--> 1:11`, one column under the opening quote.
+@test("anchors: an unknown escape is refused at the literal's opening quote")
+cra_escape_at_the_literal()
+    assert_eq(placed("var esc = '\\e'\n"), "1:11 ^")
+    assert_eq(placed("val s = \"ab\\ecd\"\n"), "1:9 ^")
+
+// `'\u{110000}'`, an interpolated string and a text block: r162 puts all three at the literal's first
+// character -- `1:9`, `1:9`, and the text block's opening `"""` on line 1.
+@test("anchors: every escape refusal inside a literal sits at the literal's start")
+cra_every_escape_at_the_literal()
+    assert_eq(placed("val c = '\\u{110000}'\n"), "1:9 ^")
+    assert_eq(placed("val s = \"x \u{24}{1} \\q\"\n"), "1:9 ^")
+    assert_eq(placed("val s = \"\"\"\n    a\\e\n    \"\"\"\n"), "1:9 ^")
+
+// `where U: Display = str(x)`: r162 `--> 1:42`, at the `=` after the clause; with the body on the
+// next line, `--> 1:41`, one column at the line's end.
+@test("anchors: a 'where' clause naming no type parameter is refused after the clause")
+cra_where_after_the_clause()
+    assert_eq(placed("show[T](x: T) -> string where U: Display = str(x)\n"), "1:42 ^")
+    assert_eq(placed("show[T](x: T) -> string where U: Display\n    str(x)\n"), "1:41 ^")
+
+// `where N: Display = 0` over a value parameter: r162 `--> 1:57`, at the `=`.
+@test("anchors: a 'where' bound on a value parameter is refused after the clause")
+cra_value_where_after_the_clause()
+    assert_eq(placed("sum[const N: usize](xs: [N]int) -> int where N: Display = 0\n"), "1:57 ^")
+
+// `else -> "other"`: r162 `--> 3:13` under the whole body `^^^^^^^`; with the body below, `--> 3:12`
+// at the line's end.
+@test("anchors: an 'else' arm's arrow is refused at the body after it")
+cra_else_arrow_at_the_body()
+    assert_eq(placed("f(n: int) -> string = n match\n    0 -> \"zero\"\n    else -> \"other\"\n"), "3:13 ^^^^^^^")
+    assert_eq(placed("f(n: int) -> string = n match\n    0 -> \"zero\"\n    else ->\n        \"other\"\n"), "3:12 ^")
+
+// `@section` over a `const`: r162 `--> 2:1`, `^^^^^` under the `const` the annotation stands above.
+@test("anchors: an annotation no declaration below may carry is refused at the declaration")
+cra_section_at_the_declaration()
+    assert_eq(placed("@section(\".rodata\")\nconst N: int = 4\n"), "2:1 ^^^^^")
+
+// `#if darwin` and `#if aarch64-macos`: r162 `--> 1:5`, one column wide.
+@test("anchors: a condition the gate refuses is drawn one column wide")
+cra_condition_one_column()
+    assert_eq(placed("#if darwin\nval x = 1\n#endif\n"), "1:5 ^")
+    assert_eq(placed("#if aarch64-macos\nval x = 1\n#endif\n"), "1:5 ^")
+
+// The `-->` line and caret of the first report `emit-typed` makes of `text` as a program's one file.
+private emitted_place(text: string) -> string
+    val program = azd_program(text)
+    val said = azd_cli(["emit-typed", "--no-spans", program.1])
+    val r = first_report(said.1)
+
+    if r.len() < 5 then return s"no report: ${said.1}"
+
+    val caret = r.at(r.len() - 1)
+    val bar = caret.index_of("|").unwrap_or(0)
+
+    s"${report_place(r.at(1))} ${caret[bar + 1..].trim()}"
+end emitted_place
+
+// A `c const` or `c type` entry the probe refuses is placed in its file, under the whole entry: r162
+// `--> 2:5` with the caret under `h: f16 = "0.5"`, `huge: f32 = "1e300"` and `Handle = "void *"`.
+// These had no file at all here, the `-->` line reading ` --> :1:1`.
+@test("anchors: a 'c const' or 'c type' entry the probe refuses is placed in its file")
+cra_probe_refusals_are_placed()
+    if !azd_ready() then return
+
+    assert_eq(emitted_place("c const\n    h: f16 = \"0.5\"\n\nprint(h)\n"), "2:5 ^^^^^^^^^^^^^^")
+    assert_eq(emitted_place("c const\n    huge: f32 = \"1e300\"\n\nprint(huge)\n"), "2:5 ^^^^^^^^^^^^^^^^^^^")
+    assert_eq(emitted_place("c type\n    Handle = \"void *\"\n\nval x: Handle = 0\n"), "2:5 ^^^^^^^^^^^^^^^^^")
+
+// `override` on a member answering a trait's bodiless property: r162 `--> 8:14`, the caret from the
+// member's name to its end, the `override` before it left out; a missing `override` is `8:5` the same
+// way.
+@test("anchors: a member's override marking is refused at its name, not at its 'override'")
+cra_override_marking_at_the_name()
+    if !azd_ready() then return
+
+    val head = "trait Sized\n    size -> int\n\nstruct Box\n    w: int\n\nimpl Sized for Box\n"
+
+    assert_eq(emitted_place(head + "    override size -> int = self.w\n\nprint(Box(1).size)\n"),
+              "8:14 ^^^^^^^^^^^^^^^^^^^^")
+
+    val bodied = "trait Sized\n    size(self) -> int = 0\n\nstruct Box\n    w: int\n\nimpl Sized for Box\n"
+
+    assert_eq(emitted_place(bodied + "    size(self) -> int = self.w\n\nprint(Box(1).size())\n"),
+              "8:5 ^^^^^^^^^^^^^^^^^^^^^^^^^^")

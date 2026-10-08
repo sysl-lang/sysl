@@ -274,7 +274,7 @@ private scan_char(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit
         s.bump()
         return Err(error(point(m), "empty character literal"))
 
-    val cp = read_one_char(s)?
+    val cp = read_one_char(s, m)?
 
     if s.accept(u8('\''))
         out.push(Spanned(CharLit(cp), s.span_from(m)))
@@ -285,9 +285,10 @@ private scan_char(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit
     Err(error(point(m), "character literal must hold exactly one character"))
 end scan_char
 
-// One character of a character or string literal: an escape sequence, or the character itself.
-private read_one_char(s: *Scanner) -> Result[char, Diagnostic]
-    if s.peek() == Some(u8('\\')) then return read_escape_char(s)
+// One character of a character or string literal beginning at `m`: an escape sequence, or the
+// character itself.
+private read_one_char(s: *Scanner, m: usize) -> Result[char, Diagnostic]
+    if s.peek() == Some(u8('\\')) then return read_escape_char(s, m)
 
     s.next_char() match
         Some(c) -> Ok(c)
@@ -302,12 +303,14 @@ end read_one_char
 // notable absence is `\e` for the escape character, which ANSI terminal code wants more than it
 // wants any of the above: it is a GNU extension rather than standard C, and Rust and Go both refuse
 // it. A program that needs it writes `'\u{1b}'` once and gives it a name.
-private read_escape_char(s: *Scanner) -> Result[char, Diagnostic]
-    val start = s.offset
-
+//
+// **A bad escape is reported at the literal's first character `m`**, not at the backslash, which is
+// where the reference points: the complaint is about the literal, and a caret under its opening quote
+// is what a reader sees there.
+private read_escape_char(s: *Scanner, m: usize) -> Result[char, Diagnostic]
     s.bump()
 
-    if s.at_end() then return Err(error(point(start), "incomplete escape sequence"))
+    if s.at_end() then return Err(error(point(m), "incomplete escape sequence"))
 
     val c = s.peek() match
         Some(b) -> b
@@ -336,13 +339,13 @@ private read_escape_char(s: *Scanner) -> Result[char, Diagnostic]
         Ok(char(u32(c)))
     elif c == u8('u') then
         s.bump()
-        read_braced_codepoint(s, start)
+        read_braced_codepoint(s, m)
     else
         val written = s.next_char() match
             Some(ch) -> ch
             None -> '?'
 
-        Err(error(point(start), s"unknown escape sequence '\\${written}'"))
+        Err(error(point(m), s"unknown escape sequence '\\${written}'"))
 end read_escape_char
 
 // `\u{...}` is braced rather than a fixed four hex digits because a Unicode scalar value needs up to
@@ -409,7 +412,7 @@ scan_string(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize, kind: Quoted) -> Res
             break
 
         if escapes then
-            b.push_char(read_one_char(s)?)
+            b.push_char(read_one_char(s, m)?)
         else
             s.next_char() match
                 Some(c) -> b.push_char(c)
@@ -474,7 +477,7 @@ private scan_text_block(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize, kind: Qu
         pending.clear()
 
         if escapes then
-            b.push_char(read_one_char(s)?)
+            b.push_char(read_one_char(s, m)?)
         else
             s.next_char() match
                 Some(c) -> b.push_char(c)
@@ -705,7 +708,7 @@ scan_interpolated(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize,
 
         part.push(pending.finish())
         pending.clear()
-        part.push_char(read_one_char(s)?)
+        part.push_char(read_one_char(s, m)?)
     end loop
 
     out.push(Spanned(StrInterp(parts, exprs, specs, starts, spec_exprs, spec_starts), s.span_from(m)))

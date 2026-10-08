@@ -170,13 +170,14 @@ struct SpanTally
     // `<class> <kind>` against how many lines, for the summary.
     kinds: Buf[(string, usize)]
 
-    // The first few lines of the `other` class, quoted from both sides.
-    first_other: string
+    // The first few differing lines of every class, quoted from both sides with the class beside them,
+    // so a row of the ratchet can be traced to the nodes it counts.
+    first_lines: string
 end SpanTally
 
 private empty_tally() -> SpanTally = SpanTally(0, 0, 0, 0, 0, buf(), "")
 
-private tally_kind(counts: *Buf[(string, usize)], what: string)
+tally_kind(counts: *Buf[(string, usize)], what: string)
     for i in 0..<counts.len()
         if counts.at(i).0 == what
             counts.set(i, (what, counts.at(i).1 + 1))
@@ -190,11 +191,10 @@ private count_gap(found: *SpanTally, gap: SpanGap, kind: string, label: string, 
     gap match
         ExtentWrong -> found.extent += 1
         AnchorNotExtent -> found.anchor += 1
-        SpanOther ->
-            found.other += 1
+        SpanOther -> found.other += 1
 
-            if found.other <= 12 then
-                found.first_other = s"${found.first_other}\n  $label: reference [$theirs] ours [$ours]"
+    if found.extent + found.anchor + found.other <= 12 then
+        found.first_lines = s"${found.first_lines}\n  $label (${span_gap_word(gap)}): reference [$theirs] ours [$ours]"
 
     tally_kind(&found.kinds, s"${span_gap_word(gap)} ${if kind == "" then "?" else kind}")
 end count_gap
@@ -314,8 +314,9 @@ private row_of(text: string, sweep: string, key: string) -> Option[usize]
 end row_of
 
 // Every `<class> <kind>` of one sweep against the repository's ratchet; answers the failures, one to
-// a line.
-private hold_to_ratchet(sweep: string, found: SpanTally) -> string
+// a line. `lines` is what the counts were taken over -- tree lines for a spans sweep, reports
+// compared for a caret sweep (`tests_crt_caret_sweep.sysl`).
+hold_to_ratchet(sweep: string, lines: usize, kinds: Buf[(string, usize)]) -> string
     val text = read_text("../scripts/spans_ratchet.tsv").unwrap_or("")
     var failures = str_builder()
 
@@ -327,18 +328,18 @@ private hold_to_ratchet(sweep: string, found: SpanTally) -> string
 
     var asked: Buf[string] = buf()
 
-    for i in 0..<found.kinds.len()
-        asked.push(found.kinds.at(i).0)
+    for i in 0..<kinds.len()
+        asked.push(kinds.at(i).0)
 
     val listed = ratchet_rows(text, sweep)
 
     for i in 0..<listed.len()
-        if count_of_kind(found.kinds, listed.at(i)) == 0 then asked.push(listed.at(i))
+        if count_of_kind(kinds, listed.at(i)) == 0 then asked.push(listed.at(i))
 
     for i in 0..<asked.len()
         val key = asked.at(i)
-        val verdict = ratchet_verdict(s"$sweep $key", count_of_kind(found.kinds, key),
-                                      row_of(text, sweep, key), found.lines, base)
+        val verdict = ratchet_verdict(s"$sweep $key", count_of_kind(kinds, key),
+                                      row_of(text, sweep, key), lines, base)
 
         if verdict.1 != ""
             print(verdict.1)
@@ -348,6 +349,7 @@ private hold_to_ratchet(sweep: string, found: SpanTally) -> string
 
     failures.finish()
 end hold_to_ratchet
+
 private summary_of(sweep: string, unit: string, found: SpanTally) -> string =
     s"spans ($sweep): ${found.files} $unit, ${found.lines} lines, ${found.extent} extent, " +
     s"${found.anchor} anchor, ${found.other} other"
@@ -433,10 +435,10 @@ spn_the_ast_spans_hold_the_ratchet()
             val summary = summary_of("emit-ast", "inputs", found)
 
             print(summary)
-            record_summary(s"$summary${kind_rows(found)}${found.first_other}")
+            record_summary(s"$summary${kind_rows(found)}${found.first_lines}")
 
             assert(found.files >= 500, s"the sweep read the corpora and the pages: ${found.files} inputs")
-            assert_eq(hold_to_ratchet("emit-ast", found), "")
+            assert_eq(hold_to_ratchet("emit-ast", found.lines, found.kinds), "")
 end spn_the_ast_spans_hold_the_ratchet
 
 // -- emit-typed, with spans -----------------------------------------------------------------------
@@ -517,10 +519,10 @@ spn_the_typed_spans_hold_the_ratchet()
             val summary = summary_of("emit-typed", "functions", found)
 
             print(summary)
-            record_summary(s"$summary${kind_rows(found)}${found.first_other}")
+            record_summary(s"$summary${kind_rows(found)}${found.first_lines}")
 
             assert(found.files > 0, "the sweep compared something")
-            assert_eq(hold_to_ratchet("emit-typed", found), "")
+            assert_eq(hold_to_ratchet("emit-typed", found.lines, found.kinds), "")
 end spn_the_typed_spans_hold_the_ratchet
 
 // -- the classifier and the ratchet, without a reference ------------------------------------------
@@ -707,14 +709,15 @@ spn_the_ratchet_is_read()
 end spn_the_ratchet_is_read
 
 // A sweep with no kind left to differ has no row but its size: `emit-ast` agrees with the reference
-// span for span since the typed tree took the anchor and an `asm` arm its whole extent.
-@test("spans: the repository's ratchet carries the size of both sweeps' trees")
+// span for span since the typed tree took the anchor and an `asm` arm its whole extent, and
+// `emit-typed` since a member's function took its declaration's span.
+@test("spans: the repository's ratchet carries the size of every sweep it holds")
 spn_the_repository_ratchet_is_complete()
     val text = read_text("../scripts/spans_ratchet.tsv").unwrap_or("")
 
-    for sweep in ["emit-ast", "emit-typed"]
+    for sweep in ["emit-ast", "emit-typed", "carets-ast", "carets-whole"]
         assert(ratchet_of(text, sweep, "lines", "-").is_some(), s"a '$sweep lines' row")
 
-    assert(ratchet_rows(text, "emit-ast").is_empty(), "no emit-ast kind differs")
-    assert(!ratchet_rows(text, "emit-typed").is_empty(), "'emit-typed' rows")
+    for sweep in ["emit-ast", "emit-typed"]
+        assert(ratchet_rows(text, sweep).is_empty(), s"no $sweep kind differs")
 end spn_the_repository_ratchet_is_complete

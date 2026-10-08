@@ -772,13 +772,15 @@ struct Answer
     message: string
 end Answer
 
-// The reference compiler's answer for one file.
-private ask_oracle(binary: string, path: string) -> Answer
+// The reference compiler's answer for one file, and the whole of what it wrote on standard error,
+// which is the rendered refusal the caret sweep compares.
+private ask_oracle(binary: string, path: string) -> (Answer, string)
     capture_oracle(binary, ["emit-ast", "--no-spans", path]) match
-        Err(_) -> Answer(false, "", "the oracle could not be run")
+        Err(_) -> (Answer(false, "", "the oracle could not be run"), "")
         Ok(answer) ->
-            Answer(answer.status.ok(), without_trailing_newlines(answer.text),
-                   first_error(answer.err.unwrap_or("")))
+            val err = answer.err.unwrap_or("")
+
+            (Answer(answer.status.ok(), without_trailing_newlines(answer.text), first_error(err)), err)
 end ask_oracle
 
 // The one message out of a refusal the reference compiler wrote, without the frame around it.
@@ -831,6 +833,8 @@ end Agreement
 // The corpora are this compiler's own sources, the library and `parsing`, which the reference has to
 // read as they stand -- so nothing is excused there, and the list handed over is empty.
 private sweep_against(binary: string, root: string, found: *Agreement)
+    var carets = empty_carets()
+
     for item in walk(root)
         item match
             Err(_) -> ()
@@ -838,12 +842,23 @@ private sweep_against(binary: string, root: string, found: *Agreement)
                 if is_sysl_source(entry.path)
                     read_text(entry.path) match
                         Err(_) -> ()
-                        Ok(text) -> compare_one(binary, entry.path, entry.path, text, buf(), found)
+                        Ok(text) -> compare_one(binary, entry.path, entry.path, text, buf(), found, &carets)
 end sweep_against
 
+// One input judged, and where both compilers refused it in the same words and it is written in
+// nothing only this compiler reads, the two rendered refusals compared whole (`compare_reports`).
 private compare_one(binary: string, path: string, label: string, text: string,
-                    listed: Buf[OnlyHere], found: *Agreement)
-    judge(label, text, ask_ourselves(path, text), ask_oracle(binary, path), listed, found)
+                    listed: Buf[OnlyHere], found: *Agreement, carets: *CaretTally)
+    val ours = ask_ourselves(path, text)
+    val theirs = ask_oracle(binary, path)
+
+    judge(label, text, ours, theirs.0, listed, found)
+
+    val alike = !ours.ok && !theirs.0.ok && ours.message == theirs.0.message
+
+    if alike && self_hosted_construct(text, listed).is_none()
+        compare_reports(theirs.1, parse_report(parse(source_of(path, text))), label, carets)
+end compare_one
 
 // The verdict on one input, given both compilers' answers.
 //
@@ -1082,6 +1097,7 @@ the_two_agree_on_the_reference_pages()
 
             val listed = self_hosted_only()
             var found = Agreement(0, 0, "", 0, "")
+            var carets = empty_carets()
 
             for item in walk(root)
                 item match
@@ -1096,7 +1112,8 @@ the_two_agree_on_the_reference_pages()
                                     for i in 0..<blocks.len()
                                         write_text(scratch, blocks.at(i)).unwrap()
                                         compare_one(binary, scratch,
-                                            s"${entry.path} block ${i + 1}", blocks.at(i), listed, &found)
+                                            s"${entry.path} block ${i + 1}", blocks.at(i), listed, &found,
+                                            &carets)
 
             remove_file(scratch)
 
@@ -1105,10 +1122,13 @@ the_two_agree_on_the_reference_pages()
 
             print(summary)
             record_summary(s"$summary${found.excused_blocks}")
+            record_summary(caret_summary("carets-ast", carets))
 
             assert(found.files >= 500, s"the pages showed the blocks: ${found.files} of them")
             assert_eq(found.first_bad, "")
             assert_eq(found.mismatches, 0)
+            assert(carets.compared > 0, "both compilers refused some block")
+            assert_eq(hold_to_ratchet("carets-ast", carets.compared, carets.kinds), "")
 end the_two_agree_on_the_reference_pages
 
 // -- the typed tree, one single-expression body at a time ------------------------------------------
@@ -1635,7 +1655,8 @@ end in_set
 // both compilers print, so of `patch_confined`'s two clauses only the module one can apply: a block
 // is excused only where every function of it that differs is in a listed module.
 private compare_whole(binary: string, path: string, label: string, text: string,
-                      patched: Buf[string], found: *TypedAgreement)
+                      patched: Buf[string], listed: Buf[OnlyHere], found: *TypedAgreement,
+                      carets: *CaretTally)
     val parsed = parse(source_of(path, text))
 
     if !parsed.ok() then return
@@ -1657,10 +1678,26 @@ private compare_whole(binary: string, path: string, label: string, text: string,
     // The block's own module is the anonymous root one, so a complaint anywhere in the block takes
     // every function it declared out of the comparison -- which is the same coarse rule the
     // single-file sweep uses, and errs towards skipping.
-    val theirs = ask_oracle_typed(binary, path)
+    val asked = capture_oracle(binary, ["emit-typed", "--no-spans", path])
 
+    val theirs = asked match
+        Err(_) -> None
+        Ok(answer) -> if answer.status.ok() then Some(answer.text) else None
+
+    // **Where both refuse, the two first reports are compared whole** -- the reference's standard
+    // error against what this compiler's own command line says of the same file, which is the
+    // rendering a reader sees and includes the checks a driver makes around the analysis (a `module`
+    // header at the project root). Only a block this analysis also refused is asked.
     if theirs.is_none()
         found.skipped_absent += 1
+
+        if has_error(ours.reported) && self_hosted_construct(text, listed).is_none()
+            asked match
+                Err(_) -> ()
+                Ok(answer) ->
+                    val said = azd_cli(["emit-typed", "--no-spans", path])
+
+                    if said.0 != 0 then compare_reports(answer.err.unwrap_or(""), said.1, label, carets)
 
         return
     end if
@@ -1700,6 +1737,14 @@ private compare_whole(binary: string, path: string, label: string, text: string,
             if found.mismatched <= 12 then
                 found.first_bad = s"${found.first_bad}\n$label ${f.name}: $where"
 end compare_whole
+
+// Whether an analysis reported an error, a warning being nothing a refusal is made of.
+private has_error(reported: Buf[Placed]) -> bool
+    for i in 0..<reported.len()
+        if reported.at(i).is_error() then return true
+
+    false
+end has_error
 
 private names_a_fallback(where: string) -> bool
     val at = where.index_of("ours [")
@@ -1830,7 +1875,9 @@ the_typed_trees_agree_over_whole_programs()
             val scratch = dir + "/block.sysl"
 
             var found = TypedAgreement(0, 0, 0, 0, 0, 0, "", "", 0)
+            var carets = empty_carets()
             val patched = patched_modules()
+            val listed = self_hosted_only()
 
             for item in walk(root)
                 item match
@@ -1846,7 +1893,7 @@ the_typed_trees_agree_over_whole_programs()
                                         write_text(scratch, blocks.at(i)).unwrap()
                                         compare_whole(binary, scratch,
                                             s"${entry.path} block ${i + 1}", blocks.at(i), patched,
-                                            &found)
+                                            listed, &found, &carets)
 
             remove_file(scratch)
 
@@ -1858,8 +1905,11 @@ the_typed_trees_agree_over_whole_programs()
 
             print(summary)
             record_summary(s"$summary${found.first_bad}")
+            record_summary(caret_summary("carets-whole", carets))
             assert(found.matched > 0, "the sweep compared something")
             assert(found.mismatched == 0, s"$summary${found.first_bad}")
+            assert(carets.compared > 0, "both compilers refused some block")
+            assert_eq(hold_to_ratchet("carets-whole", carets.compared, carets.kinds), "")
 end the_typed_trees_agree_over_whole_programs
 
 // -- the LLVM text, restricted to the section this stage lowers ------------------------------------

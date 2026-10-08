@@ -133,6 +133,9 @@ private lower_unit(a: &Analysis, unit: Program, t: Target) -> Program
 
     var plan: Buf[CDeclared] = buf()
 
+    // Every refusal about an entry is placed in the file that wrote it, as the reference places it.
+    val at = probe_scope(unit)
+
     for i in 0..<consts.len()
         plan.push(declared_type(a, unit, consts.at(i), types))
 
@@ -147,12 +150,12 @@ private lower_unit(a: &Analysis, unit: Program, t: Target) -> Program
     var folded: Buf[Stmt] = buf()
 
     for i in 0..<consts.len()
-        folded.push(measured_const(a, consts.at(i), plan.at(i), answers, i))
+        folded.push(measured_const(a, at, consts.at(i), plan.at(i), answers, i))
 
     var aliases: Buf[Stmt] = buf()
 
     for i in 0..<types.len()
-        aliases.push(measured_type(a, types.at(i), answers.1.at(i), answers.2))
+        aliases.push(measured_type(a, at, types.at(i), answers.1.at(i), answers.2))
 
     var body: Buf[Stmt] = buf()
     var next_const: usize = 0
@@ -394,17 +397,20 @@ end manifest_above
 // than running for ever.
 const ClimbCap: usize = 64
 
+// The scope a refusal about one file's blocks is placed in: the file, so the `-->` line names it.
+private probe_scope(unit: Program) -> Scope = empty_scope() with { src = unit.src }
+
 // A refusal placed in the file whose blocks were being measured, so that the `-->` line names it.
 private probe_fault(a: &Analysis, unit: Program, where: Span,
                     why: string) -> Option[(Buf[CGlobal], Buf[CMeasured], bool)]
-    a.fault(empty_scope() with { src = unit.src }, where, why)
+    a.fault(probe_scope(unit), where, why)
     None
 
 // The C compiled and the probe emitted nothing for a line, which is sysl's bug and not the
 // programmer's -- so the message says so rather than sending them back to their own C.
 private silent(a: &Analysis, unit: Program, where: Span,
                what: string) -> Option[(Buf[CGlobal], Buf[CMeasured], bool)]
-    a.fault(empty_scope() with { src = unit.src }, where, s"the C compiler accepted $what and then emitted nothing for it, " +
+    a.fault(probe_scope(unit), where, s"the C compiler accepted $what and then emitted nothing for it, " +
         "so there is no answer to read — this is a bug in sysl's probe rather than in what was " +
         "written")
     None
@@ -590,6 +596,7 @@ private decimal_of(text: string) -> i64
 // this one can use.
 private declared_type(a: &Analysis, unit: Program, c: CConstDecl,
                       types: Buf[CTypeDecl]) -> CDeclared
+    val at = probe_scope(unit)
     var seen: Buf[string] = buf()
     var written_ref = c.typ
 
@@ -599,24 +606,24 @@ private declared_type(a: &Analysis, unit: Program, c: CConstDecl,
             _ -> ""
 
         if name == ""
-            return not_a_number(a, c)
+            return not_a_number(a, at, c)
 
         scalar_named(name, int(a.tables.layout.word_bits)) match
             Some(found) -> found match
                 Integer(bits, signed, _) -> return KnownNow(bits, signed, false, name)
-                Floating(bits, _) -> return floating_kind(a, c, bits, name)
-                _ -> return not_a_number(a, c)
+                Floating(bits, _) -> return floating_kind(a, at, c, bits, name)
+                _ -> return not_a_number(a, at, c)
             None -> ()
 
         plain_width(name) match
             Some(found) -> found match
                 Integer(bits, signed, _) -> return KnownNow(bits, signed, false, name)
-                Floating(bits, _) -> return floating_kind(a, c, bits, name)
-                _ -> return not_a_number(a, c)
+                Floating(bits, _) -> return floating_kind(a, at, c, bits, name)
+                _ -> return not_a_number(a, at, c)
             None -> ()
 
         if holds_string(seen, name)
-            a.fault(empty_scope(), c.span,
+            a.fault(at, c.span,
                     s"'$name' is declared in terms of itself, so which number it is has no answer")
             return KnownNow(32, true, false, name)
 
@@ -638,7 +645,7 @@ private declared_type(a: &Analysis, unit: Program, c: CConstDecl,
                 _ -> ()
 
         if base.is_none()
-            a.fault(empty_scope(), c.span, s"'$name' is not a type this file declares, and a " +
+            a.fault(at, c.span, s"'$name' is not a type this file declares, and a " +
                     "'c const' is measured against its own file — so its type is an integer or a " +
                     "float, a 'c type' written beside it, or a subtype of one declared here")
             return KnownNow(32, true, false, name)
@@ -646,8 +653,8 @@ private declared_type(a: &Analysis, unit: Program, c: CConstDecl,
         written_ref = base.unwrap()
 end declared_type
 
-private not_a_number(a: &Analysis, c: CConstDecl) -> CDeclared
-    a.fault(empty_scope(), c.span, s"'${type_text(c.typ)}' is not a number, and a 'c const' " +
+private not_a_number(a: &Analysis, at: Scope, c: CConstDecl) -> CDeclared
+    a.fault(at, c.span, s"'${type_text(c.typ)}' is not a number, and a 'c const' " +
             "reads a number — the value is read back out of the C compiler's own output, where a " +
             "number is a number and a string is a block of storage. A string from C is not written " +
             "this way")
@@ -655,11 +662,11 @@ private not_a_number(a: &Analysis, c: CConstDecl) -> CDeclared
 
 // Narrower than the widths a C constant expression is written at, and narrow enough that rounding
 // onto it is not something the value could survive being read back through.
-private floating_kind(a: &Analysis, c: CConstDecl, bits: int, name: string) -> CDeclared
+private floating_kind(a: &Analysis, at: Scope, c: CConstDecl, bits: int, name: string) -> CDeclared
     // Both sixteen-bit formats are refused, and by the written name rather than by a shared one: the
     // reader who wrote `bf16` is not helped by a message about `f16`.
     if bits == 16
-        a.fault(empty_scope(), c.span, s"'$name' is not a width a 'c const' is measured at — C writes " +
+        a.fault(at, c.span, s"'$name' is not a width a 'c const' is measured at — C writes " +
                 "a constant expression as a 'float', a 'double' or a 'long double', so the two " +
                 "widths that read back without guessing are 'f32' and 'f64'")
         return KnownNow(32, true, false, name)
@@ -692,7 +699,7 @@ end plain_width
 
 // -- turning an answer into a declaration ------------------------------------------------------
 
-private measured_const(a: &Analysis, c: CConstDecl, d: CDeclared,
+private measured_const(a: &Analysis, home: Scope, c: CConstDecl, d: CDeclared,
                        answers: (Buf[CGlobal], Buf[CMeasured], bool), at: usize) -> Stmt
     val raw = answers.0.at(at)
 
@@ -702,12 +709,12 @@ private measured_const(a: &Analysis, c: CConstDecl, d: CDeclared,
             integer_kind(answers.1.at(i), answers.2) match
                 Some(found) -> (found.0, found.1, false, written)
                 None ->
-                    a.fault(empty_scope(), c.span, s"'$written' is what the C compiler calls " +
+                    a.fault(home, c.span, s"'$written' is what the C compiler calls " +
                             s"'$c_type', which is not an integer here, and a 'c const' reads an " +
                             "integer")
                     return held(c, expr(c.span, IntLit("0", 10, "")))
 
-    if kind.2 then fraction(a, c, kind.0, kind.3, raw) else whole(a, c, kind.0, kind.1, kind.3, raw)
+    if kind.2 then fraction(a, home, c, kind.0, kind.3, raw) else whole(a, home, c, kind.0, kind.1, kind.3, raw)
 end measured_const
 
 // The declaration a measured line becomes, which is an ordinary constant holding an ordinary
@@ -721,10 +728,10 @@ private held(c: CConstDecl, value: Expr) -> Stmt =
 // it used to: a macro read into a `u16` is the transcription error made against the real number
 // instead of against a remembered one. The message quotes both the C and the value, because neither
 // alone tells the reader which end was wrong.
-private whole(a: &Analysis, c: CConstDecl, bits: int, signed: bool, name: string,
+private whole(a: &Analysis, at: Scope, c: CConstDecl, bits: int, signed: bool, name: string,
               raw: CGlobal) -> Stmt
     if raw.ty != "i64"
-        a.fault(empty_scope(), c.span, s"the C compiler answered for '${c.c}' with a " +
+        a.fault(at, c.span, s"the C compiler answered for '${c.c}' with a " +
                 s"'${raw.ty}', and this line asks for a whole number")
         return held(c, expr(c.span, IntLit("0", 10, "")))
 
@@ -737,7 +744,7 @@ private whole(a: &Analysis, c: CConstDecl, bits: int, signed: bool, name: string
             val low = -(1 << (i64(bits) - 1))
 
             if printed < low || printed > high
-                return out_of_range(a, c, s"$printed", name, s"$low", s"$high")
+                return out_of_range(a, at, c, s"$printed", name, s"$low", s"$high")
 
         val digits = if printed < 0 then s"${-printed}" else s"$printed"
         val lit = expr(c.span, IntLit(digits, 10, ""))
@@ -754,14 +761,14 @@ private whole(a: &Analysis, c: CConstDecl, bits: int, signed: bool, name: string
     if bits < 64
         val high = u64((1 << i64(bits)) - 1)
 
-        if value > high then return out_of_range(a, c, s"$value", name, "0", s"$high")
+        if value > high then return out_of_range(a, at, c, s"$value", name, "0", s"$high")
 
     held(c, expr(c.span, IntLit(s"$value", 10, "")))
 end whole
 
-private out_of_range(a: &Analysis, c: CConstDecl, value: string, name: string, low: string,
+private out_of_range(a: &Analysis, at: Scope, c: CConstDecl, value: string, name: string, low: string,
                      high: string) -> Stmt
-    a.fault(empty_scope(), c.span,
+    a.fault(at, c.span,
             s"'${c.c}' is $value here, which '$name' cannot hold — it holds $low to $high")
     held(c, expr(c.span, IntLit("0", 10, "")))
 
@@ -772,18 +779,18 @@ private out_of_range(a: &Analysis, c: CConstDecl, value: string, name: string, l
 // `float x = M_PI;`. What is refused is a value the width does not hold at all -- a measurement that
 // is not finite, or a finite one that narrows to an infinity or to a zero it was not, which has been
 // thrown away rather than rounded.
-private fraction(a: &Analysis, c: CConstDecl, bits: int, name: string, raw: CGlobal) -> Stmt
+private fraction(a: &Analysis, at: Scope, c: CConstDecl, bits: int, name: string, raw: CGlobal) -> Stmt
     if raw.ty != "double"
-        a.fault(empty_scope(), c.span, s"the C compiler answered for '${c.c}' with a " +
+        a.fault(at, c.span, s"the C compiler answered for '${c.c}' with a " +
                 s"'${raw.ty}', and this line asks for a float")
         return held(c, expr(c.span, FloatLit("0.0", "")))
 
     val value = float_operand(raw.operand) match
-        None -> return silent_float(a, c)
+        None -> return silent_float(a, at, c)
         Some(found) -> found
 
     if value != value
-        a.fault(empty_scope(), c.span, s"'${c.c}' is not a number here, and a 'c const' carries " +
+        a.fault(at, c.span, s"'${c.c}' is not a number here, and a 'c const' carries " +
                 "one — a value the C compiler settles as a NaN has no constant to be folded into a " +
                 "program")
         return held(c, expr(c.span, FloatLit("0.0", "")))
@@ -793,7 +800,7 @@ private fraction(a: &Analysis, c: CConstDecl, bits: int, name: string, raw: CGlo
     val shown = float_text(value)
 
     if value > MaxFinite || value < -MaxFinite
-        a.fault(empty_scope(), c.span, s"'${c.c}' is $shown here, and a 'c const' carries a finite " +
+        a.fault(at, c.span, s"'${c.c}' is $shown here, and a 'c const' carries a finite " +
                 "number — either the C expression overflowed while it was being worked out, or it " +
                 "names an infinity outright")
         return held(c, expr(c.span, FloatLit("0.0", "")))
@@ -802,12 +809,12 @@ private fraction(a: &Analysis, c: CConstDecl, bits: int, name: string, raw: CGlo
     val narrowed = if bits == 64 then value else real(f32(value))
 
     if narrowed > MaxFinite || narrowed < -MaxFinite
-        a.fault(empty_scope(), c.span, s"'${c.c}' is $shown here, which '$name' cannot hold — the " +
+        a.fault(at, c.span, s"'${c.c}' is $shown here, which '$name' cannot hold — the " +
                 s"largest it holds is $F32Largest")
         return held(c, expr(c.span, FloatLit("0.0", "")))
 
     if narrowed == 0.0 && value != 0.0
-        a.fault(empty_scope(), c.span, s"'${c.c}' is $shown here, which '$name' cannot tell from " +
+        a.fault(at, c.span, s"'${c.c}' is $shown here, which '$name' cannot tell from " +
                 s"zero — the smallest it holds that is not zero is $F32Smallest")
         return held(c, expr(c.span, FloatLit("0.0", "")))
 
@@ -894,8 +901,8 @@ private zeros(n: int) -> string
 
     out
 
-private silent_float(a: &Analysis, c: CConstDecl) -> Stmt
-    a.fault(empty_scope(), c.span, s"the C compiler wrote '${c.c}' in a spelling sysl's probe does " +
+private silent_float(a: &Analysis, at: Scope, c: CConstDecl) -> Stmt
+    a.fault(at, c.span, s"the C compiler wrote '${c.c}' in a spelling sysl's probe does " +
         "not read — this is a bug in sysl's probe rather than in what was written")
     held(c, expr(c.span, FloatLit("0.0", "")))
 
@@ -978,7 +985,7 @@ end real_bits
 // **A type C does not describe as an integer is refused by name rather than approximated.** A
 // pointer, a float, a struct and an array all reach the `default` arm, and each already has an
 // answer in sysl that is better than a same-width integer standing in for it.
-private measured_type(a: &Analysis, t: CTypeDecl, m: CMeasured, char_signed: bool) -> Stmt
+private measured_type(a: &Analysis, at: Scope, t: CTypeDecl, m: CMeasured, char_signed: bool) -> Stmt
     // `_Bool` is the one answer that is not an integer and is still resolved, because sysl's `bool`
     // *is* what C means by it.
     if m.kind == 1 then return alias_to(t, "bool")
@@ -986,7 +993,7 @@ private measured_type(a: &Analysis, t: CTypeDecl, m: CMeasured, char_signed: boo
     integer_kind(m, char_signed) match
         Some(found) -> alias_to(t, s"${if found.1 then "i" else "u"}${found.0}")
         None ->
-            a.fault(empty_scope(), t.span, s"the C compiler says '${t.c}' is not an integer type, " +
+            a.fault(at, t.span, s"the C compiler says '${t.c}' is not an integer type, " +
                     "and a 'c type' names an integer — what comes back from one is a width and a " +
                     "signedness, which a float, a pointer, a struct or an array has not got. An " +
                     "address is written '*T', a float by name, and a struct arrives as an " +
