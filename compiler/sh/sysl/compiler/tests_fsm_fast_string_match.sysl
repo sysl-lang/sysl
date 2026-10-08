@@ -1,0 +1,235 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A long run of string-literal arms is one binary search and one `switch`** (`emit_pattern.sysl`'s
+// `gen_string_table`). As a chain of `==`s, a 4,000-arm `match` was 4,000 calls to the comparison in
+// one function and twelve seconds of LLVM at `-O1`. Timing is not asserted -- what is asserted is the
+// property that made it slow: the number of comparisons a body carries no longer grows with the arms,
+// and every arm still answers exactly what the chain would have answered.
+
+private fsm_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return false
+        Ok(_) -> ()
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end fsm_ready
+
+// The LLVM text a program lowers to -- or, where it is refused, what it was refused with.
+private fsm_ir(text: string) -> string
+    val root = make_temp_dir("sysl-fsm-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fsm_ir
+
+// What a program PRINTS.
+private fsm_ran(text: string) -> string
+    val root = make_temp_dir("sysl-fsm").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end fsm_ran
+
+// A function `f` matching `n` arms `"k0"` .. `"k<n-1>"`, each answering its own number, and `-1`
+// for anything else.
+private fsm_keys(n: int) -> string
+    var b = str_builder()
+
+    b.push("f(s: string) -> int = s match\n")
+
+    for i in 0..<n
+        b.push(s"    \"k$i\" -> $i\n")
+
+    b.push("    else -1\n\n")
+    b.finish()
+end fsm_keys
+
+// Calls to the string comparison in a text, the helper's own definition and its one call inside the
+// search included.
+private fsm_compares(text: string) -> usize = text.count_of("@sysl.str.cmp(")
+
+@test("every arm of a long string match answers its own number, and a miss falls to else")
+fsm_every_arm_of_a_long_match_answers()
+    if !fsm_ready() then return
+
+    // The subject is built at run time, so it is not the literal's own bytes -- and a miss shares a
+    // prefix with an arm, is a prefix of one, is longer than every one, and is empty.
+    val text = fsm_keys(300) + """
+var bad = 0
+for i in 0..<300
+    if f("k" + str(i)) != i then bad += 1
+print(bad, f("k300"), f("k"), f("k2999"), f(""), f("K1"))
+"""
+
+    assert(fsm_ran(text) == "0 -1 -1 -1 -1 -1\n", fsm_ran(text))
+end fsm_every_arm_of_a_long_match_answers
+
+@test("a string written in two arms of a long run is the first arm's")
+fsm_the_first_of_two_equal_arms_wins()
+    if !fsm_ready() then return
+
+    var b = str_builder()
+
+    b.push("f(s: string) -> int = s match\n    \"dup\" -> 1000\n")
+
+    for i in 0..<20
+        b.push(s"    \"k$i\" -> $i\n")
+
+    b.push("    \"dup\" -> 2000\n    \"k3\" -> 3000\n    else -1\n\nprint(f(\"dup\"), f(\"k3\"), f(\"k19\"))\n")
+
+    val said = fsm_ran(b.finish())
+
+    assert(said == "1000 3 19\n", said)
+end fsm_the_first_of_two_equal_arms_wins
+
+@test("a guard or a binding between two runs keeps its place in the order")
+fsm_a_guard_between_runs_keeps_its_place()
+    if !fsm_ready() then return
+
+    var b = str_builder()
+
+    b.push("f(s: string) -> int = s match\n")
+
+    for i in 0..<20
+        b.push(s"    \"a$i\" -> $i\n")
+
+    // Every `b..` below is three bytes long, so the guard takes all of them before their own arms.
+    b.push("    x if x.len == 3 -> 77\n")
+
+    for i in 10..<30
+        b.push(s"    \"b$i\" -> ${100 + i}\n")
+
+    for i in 0..<20
+        b.push(s"    \"long$i\" -> ${200 + i}\n")
+
+    b.push("    else 5000\n\n")
+    b.push("print(f(\"a5\"), f(\"a19\"), f(\"b15\"), f(\"long7\"), f(\"zzzzz\"), f(\"abc\"))\n")
+
+    val said = fsm_ran(b.finish())
+
+    assert(said == "5 19 77 207 5000 77\n", said)
+end fsm_a_guard_between_runs_keeps_its_place
+
+@test("an or-pattern of string literals sends every one of its strings to its arm")
+fsm_an_or_pattern_of_literals_is_one_arm()
+    if !fsm_ready() then return
+
+    var b = str_builder()
+
+    b.push("f(s: string) -> int = s match\n")
+
+    for i in 0..<20
+        b.push(s"    \"k$i\" -> $i\n")
+
+    b.push("    \"red\" | \"green\" | \"blue\" -> 500\n    \"k4\" | \"cyan\" -> 600\n    else -1\n\n")
+    b.push("print(f(\"red\"), f(\"green\"), f(\"blue\"), f(\"cyan\"), f(\"k4\"), f(\"gre\"))\n")
+
+    val said = fsm_ran(b.finish())
+
+    assert(said == "500 500 500 600 4 -1\n", said)
+end fsm_an_or_pattern_of_literals_is_one_arm
+
+@test("the empty string, shared prefixes and non-ASCII strings are told apart by their bytes")
+fsm_prefixes_empty_and_non_ascii_are_told_apart()
+    if !fsm_ready() then return
+
+    var b = str_builder()
+
+    b.push("f(s: string) -> int = s match\n")
+    b.push("    \"\" -> 1\n    \"a\" -> 2\n    \"ab\" -> 3\n    \"abc\" -> 4\n    \"abd\" -> 5\n")
+    b.push("    \"b\" -> 6\n    \"é\" -> 7\n    \"e\" -> 8\n    \"日本\" -> 9\n    \"日\" -> 10\n")
+    b.push("    \"日本語\" -> 11\n    \"\\u{0}\" -> 12\n    \"a\\u{0}\" -> 13\n    \"zz\" -> 14\n")
+    b.push("    \"ÿ\" -> 15\n    \"Z\" -> 16\n    else -1\n\n")
+    b.push("print(f(\"\"), f(\"a\"), f(\"ab\"), f(\"abc\"), f(\"abd\"), f(\"b\"), f(\"é\"), f(\"e\"))\n")
+    b.push("print(f(\"日本\"), f(\"日\"), f(\"日本語\"), f(\"\\u{0}\"), f(\"a\\u{0}\"), f(\"zz\"), f(\"ÿ\"), f(\"Z\"))\n")
+    b.push("print(f(\"abcd\"), f(\"本\"), f(\"z\"), f(\"aa\"))\n")
+
+    val said = fsm_ran(b.finish())
+
+    assert(said == "1 2 3 4 5 6 7 8\n9 10 11 12 13 14 15 16\n-1 -1 -1 -1\n", said)
+end fsm_prefixes_empty_and_non_ascii_are_told_apart
+
+@test("a statement match over a long run falls through when nothing matches")
+fsm_a_statement_match_falls_through()
+    if !fsm_ready() then return
+
+    var b = str_builder()
+
+    b.push("g(s: string)\n    s match\n")
+
+    for i in 0..<20
+        b.push(s"        \"k$i\" -> print(\"arm $i\")\n")
+
+    b.push("    print(\"after\")\n\ng(\"k12\")\ng(\"nope\")\n")
+
+    val said = fsm_ran(b.finish())
+
+    assert(said == "arm 12\nafter\nafter\n", said)
+end fsm_a_statement_match_falls_through
+
+@test("a match one arm short of the threshold keeps its chain of comparisons")
+fsm_a_short_match_keeps_its_chain()
+    if !fsm_ready() then return
+
+    val short = fsm_ir(fsm_keys(15) + "print(f(\"k3\"))\n")
+
+    assert(!short.contains("@sysl.str.search"), short)
+
+    // One call per arm, and the helper's own definition.
+    assert(fsm_compares(short) == 16, s"${fsm_compares(short)}")
+
+    val at = fsm_ir(fsm_keys(16) + "print(f(\"k3\"))\n")
+
+    assert(at.contains("call i64 @sysl.str.search(ptr @.table"), at)
+end fsm_a_short_match_keeps_its_chain
+
+@test("the comparisons a long string match carries do not grow with its arms")
+fsm_comparisons_do_not_grow_with_the_arms()
+    if !fsm_ready() then return
+
+    val small = fsm_ir(fsm_keys(100) + "print(f(\"k3\"))\n")
+    val large = fsm_ir(fsm_keys(4000) + "print(f(\"k3\"))\n")
+
+    // The comparison's definition and the one call inside the search, whatever the arm count.
+    assert(fsm_compares(small) == 2, s"${fsm_compares(small)}")
+    assert(fsm_compares(large) == 2, s"${fsm_compares(large)}")
+    assert(large.count_of("call i64 @sysl.str.search(") == 1, "one search")
+    assert(large.contains("@.table1 = private constant [4000 x "), "the table holds every arm's string")
+end fsm_comparisons_do_not_grow_with_the_arms
