@@ -484,6 +484,45 @@ print(min(1, 2.0))
 'b' of 'sysl.math.min' is int, but real was given
 ```
 
+## `nextafter` and `ulp` — the neighbours of a float
+
+```
+nextafter(x, y)     the closest value to x that is not x, on y's side of it
+ulp(x)              the gap from |x| to the next representable magnitude
+```
+
+Both exist at `real` and at `f32`, and both are written on the bits rather than bound to libm, so
+they answer the same on a freestanding target as on a hosted one.
+
+```sysl
+import sysl.math.{nextafter, ulp, infinity, nan, Float}
+
+val up = nextafter(1.0, 2.0)
+print(up > 1.0, up - 1.0 == ulp(1.0), nextafter(up, 0.0) == 1.0)
+print(nextafter(0.0, 1.0) > 0.0, nextafter(2.0, 2.0) == 2.0)
+print(nextafter(1.7976931348623157e308, infinity()) == infinity(), ulp(infinity()) == infinity())
+print(nextafter(nan(), 1.0).is_nan(), ulp(nan()).is_nan())
+```
+
+```output
+true true true
+true true
+true true
+true true
+```
+
+**The edges follow C.** A NaN in either argument answers a NaN; equal arguments answer `y`, so
+`nextafter(-0.0, 0.0)` is `+0.0`; from a zero the answer is the smallest subnormal, carrying the
+sign of `y`; stepping outward from the largest finite value reaches infinity. `ulp` is the smallest
+subnormal at zero, doubles at each power of two, and is infinity at an infinity. At the largest
+finite value there is no magnitude above to measure to, so it answers the gap below, as Java's
+`Math.ulp` does.
+
+**There is no `nexttoward`.** C has one because `nextafter` takes its target as a `double`, and a
+program holding a `long double` direction needs it taken at that width. sysl has no type wider than
+`real`, and an `f32` widens to `real` exactly, so the comparison `nexttoward` exists to make is
+already the one `nextafter` makes. A program porting a `nexttoward` call writes `nextafter`.
+
 ## `Signed` and `Bits` — a different mechanism
 
 ```sysl

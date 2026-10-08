@@ -1,0 +1,100 @@
+module sysl.math
+@no_alloc
+
+/** The neighbours of a float, and the size of the gap to the nearest one.
+ *
+ * **These are written on the bits, not bound to libm.** `nextafter` is a libm function on a
+ * hosted machine and absent from a freestanding one, and the algorithm is four lines on the
+ * encoding: IEEE 754 orders the positive floats the way it orders their bit patterns, so the
+ * next magnitude up is the pattern plus one -- across a binade, from the largest subnormal into
+ * the smallest normal, and from the largest finite value into infinity, with no case of its own.
+ * The result is the same on every target and does not depend on the C library's rounding mode.
+ *
+ * **There is no `nexttoward`.** C has it because `nextafter` takes both arguments as `double` and
+ * a program holding a `long double` target needs the direction without narrowing it first. sysl
+ * has no wider type than `real`, and every `f32` widens to `real` exactly, so the only thing
+ * `nexttoward(x, y)` could add -- a direction taken at a wider width than `x` -- is already what
+ * `nextafter(x, y)` does: comparing `x` with `y` loses nothing. `nextafter` is the one name.
+ *
+ * Each is written once per width, `real` and `f32`.
+ */
+
+/** The `real` after `x` in the direction of `y`: the closest value to `x` that is not `x`, on
+ * `y`'s side of it.
+ *
+ * A NaN in either argument answers a NaN; equal arguments answer `y` (so `nextafter(-0.0, 0.0)`
+ * is `0.0`); from a zero the answer is the smallest subnormal carrying the sign of `y`; and the
+ * largest finite value stepping outward answers infinity, as an infinity stepping inward answers
+ * the largest finite value.
+ */
+nextafter(x: real, y: real) -> real
+    if x != x || y != y then return x + y
+    if x == y then return y
+
+    if x == 0.0
+        return real_from_bits(1 | (real_bits(y) & 0x8000000000000000))
+
+    val up = (x < y) == (x > 0.0)
+    real_from_bits(if up then real_bits(x) + 1 else real_bits(x) - 1)
+end nextafter
+
+/** The `f32` after `x` in the direction of `y`; see the `real` form for the edges. */
+nextafter(x: f32, y: f32) -> f32
+    if x != x || y != y then return x + y
+    if x == y then return y
+
+    if x == 0.0f32
+        return f32_from_bits(1 | (f32_bits(y) & 0x80000000))
+
+    val up = (x < y) == (x > 0.0f32)
+    f32_from_bits(if up then f32_bits(x) + 1 else f32_bits(x) - 1)
+end nextafter
+
+/** The gap between `|x|` and the next representable magnitude: the value of the last place.
+ *
+ * It is `2^-1074` at zero and throughout the subnormals, doubles at each power of two, and is
+ * infinity at an infinity and NaN at a NaN. At the largest finite value there is no finite
+ * magnitude above to measure to, so the answer is the gap below it -- the width of that binade's
+ * last place, as Java's `Math.ulp` answers -- rather than infinity.
+ */
+ulp(x: real) -> real
+    if x != x then return x
+    if x > 1.7976931348623157e308 || x < -1.7976931348623157e308 then return infinity()
+
+    val a = real_from_bits(real_bits(x) & 0x7fffffffffffffff)
+    if a == 1.7976931348623157e308 then return a - nextafter(a, 0.0)
+
+    nextafter(a, infinity()) - a
+end ulp
+
+/** The value of the last place of an `f32`; see the `real` form for the edges. */
+ulp(x: f32) -> f32
+    if x != x then return x
+    if x > 3.4028235e38f32 || x < -3.4028235e38f32 then return 1.0f32 / 0.0f32
+
+    val a = f32_from_bits(f32_bits(x) & 0x7fffffff)
+    if a == 3.4028235e38f32 then return a - nextafter(a, 0.0f32)
+
+    nextafter(a, 1.0f32 / 0.0f32) - a
+end ulp
+
+// A float's bits, read through its address -- the reinterpretation the value has no conversion for.
+private real_bits(x: real) -> u64
+    var held = x
+    val p: *u64 = ptr_cast(&held)
+    *p
+
+private real_from_bits(b: u64) -> real
+    var held = b
+    val p: *real = ptr_cast(&held)
+    *p
+
+private f32_bits(x: f32) -> u32
+    var held = x
+    val p: *u32 = ptr_cast(&held)
+    *p
+
+private f32_from_bits(b: u32) -> f32
+    var held = b
+    val p: *f32 = ptr_cast(&held)
+    *p
