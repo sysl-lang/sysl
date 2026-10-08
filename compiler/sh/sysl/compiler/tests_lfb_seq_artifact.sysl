@@ -1,0 +1,128 @@
+module sh.sysl.compiler
+@tests
+
+// `sysl.seq` exercised through the standard module's artifact, which is the road a user's build takes
+// and the one the library's own `@tests` files (`sysl test library --std`, compiled from source) cannot
+// reach -- the reference's `SeqArtifactTests`. `rng_prints` builds with `build_native_program`, which
+// links this compiler's `.syslib`, and holds the reference to the same output where `SYSL_ORACLE` is
+// set. The three capturing closures returning an aggregate are each run twice, since the miscompile
+// they guard against was not deterministic across runs of one binary.
+
+private lfb_seq(body: string) -> string = "import sysl.seq.Sequence\n\n" + body
+
+// ---- the surface answers correctly through the artifact ----
+
+@test("map, filter and fold")
+lfb_seq_map_filter_fold()
+    if !rng_ready() then return
+
+    rng_prints(lfb_seq(raw"""
+        val xs = [1, 2, 3, 4, 5]
+
+        print(xs[..].map(n -> n * 2)[4])
+        print(xs[..].filter(n -> n % 2 == 1).len)
+        print(xs[..].fold(0, (a, n) -> a + n))
+        """), "10\n3\n15\n")
+
+@test("the searching half")
+lfb_seq_the_searching_half()
+    if !rng_ready() then return
+
+    rng_prints(lfb_seq(raw"""
+        val xs = [3, 0, 7]
+
+        print(xs[..].any(n -> n == 0), xs[..].all(n -> n > 0))
+        print(xs[..].count_where(n -> n > 1))
+        print(xs[..].find(n -> n > 5).unwrap())
+        print(xs[..].position(n -> n > 5).unwrap())
+        """), "true false\n2\n7\n2\n")
+
+@test("the stages chain")
+lfb_seq_the_stages_chain()
+    if !rng_ready() then return
+
+    rng_prints(lfb_seq(raw"""
+        val xs = [1, 2, 3, 4, 5, 6]
+        val out = xs[..].filter(n -> n % 2 == 0).map(n -> n * n)
+
+        print(out.len, out[0], out[2])
+        """), "3 4 36\n")
+
+// The creator has no receiver, so it arrives as a plain generic function rather than through a table.
+@test("generate, and what it makes is an ordinary sequence")
+lfb_seq_generate()
+    if !rng_ready() then return
+
+    rng_prints(lfb_seq(raw"""
+        import sysl.seq.generate
+
+        val squares = generate(5, i -> int(i * i))
+
+        print(squares.len, squares[0], squares[4])
+        print(generate(3, i -> s"row ${i}")[2])
+        print(generate(0, i -> i + 1).len)
+        print(squares.fold(0, (a, n) -> a + n))
+        """), "5 0 16\nrow 2\n0\n30\n")
+
+// ---- a capturing closure returning an aggregate is not miscompiled here ----
+
+@test("returning a string")
+lfb_seq_a_closure_returning_a_string()
+    if !rng_ready() then return
+
+    val src = lfb_seq(raw"""
+        val tag = "<"
+        val xs = [1, 2, 3]
+        val out = xs[..].map(n -> tag + str(n) + ">")
+
+        print(out[0], out[1], out[2])
+        """)
+
+    rng_prints(src, "<1> <2> <3>\n")
+    rng_prints(src, "<1> <2> <3>\n")
+
+@test("returning a struct")
+lfb_seq_a_closure_returning_a_struct()
+    if !rng_ready() then return
+
+    val src = lfb_seq(raw"""
+        struct Off
+            mins: int
+            flag: bool
+
+        val base = 0 - 300
+        val xs = [1, 2, 3]
+        val out = xs[..].map(n -> Off(base + n, true))
+
+        print(out[0].mins, out[1].mins, out[2].mins)
+        """)
+
+    rng_prints(src, "-299 -298 -297\n")
+    rng_prints(src, "-299 -298 -297\n")
+
+// `pair` is declared before any statement, so it is a module-level function a closure may reach; the
+// capture under test is `bump`, which the closure holds and `pair` never sees.
+@test("returning a slice, which is what flat_map's closure hands back")
+lfb_seq_a_closure_returning_a_slice()
+    if !rng_ready() then return
+
+    val src = lfb_seq(raw"""
+        import sysl.buf.{Buf, buf}
+
+        pair(n: int) -> []int
+            var b: Buf[int] = buf()
+
+            b.push(n)
+            b.push(n * 10)
+
+            b.view()
+
+        val bump = 1
+        val xs = [1, 2]
+        val out = xs[..].flat_map(n -> pair(n + bump))
+
+        print(out.len, out[0], out[1], out[3])
+        """)
+
+    rng_prints(src, "4 2 20 30\n")
+    rng_prints(src, "4 2 20 30\n")

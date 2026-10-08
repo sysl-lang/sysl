@@ -1,0 +1,143 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Where the standard module's source is, as seen from wherever a compilation was started -- the
+// reference's `StdLibraryTests`. **The resolution is driven over made-up inputs** (`std_root_among`
+// with the set of roots that hold the library handed in), so every branch of it is reachable from any
+// machine; the ambient one can only exercise whichever case happens to hold here. Every refusal is
+// quoted from 0.0.162 run with `SYSL_LIB` aimed the same way, and from a copy of its binary standing
+// where no library is.
+
+// The resolution over the roots `present` names, each holding the standard module.
+private lfb_resolve(named: Option[string], exe: Option[string], present: Buf[string]) -> Result[string, string]
+    var holding: Buf[string] = buf()
+
+    for i in 0..<present.len()
+        holding.push(s"${present.at(i)}/$StdModule")
+
+    std_root_among(named, exe, root -> holds_string(holding, s"$root/$StdModule"))
+end lfb_resolve
+
+private lfb_roots(xs: []string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for x in xs do out.push(x)
+    out
+end lfb_roots
+
+private lfb_found(r: Result[string, string]) -> string = r match
+    Ok(root) -> root
+    Err(why) -> s"refused: $why"
+
+private lfb_refusal(r: Result[string, string]) -> string = r match
+    Ok(root) -> s"resolved to $root"
+    Err(why) -> why
+
+// ---- finding the library ----
+
+@test("takes an installed compiler to the tree installed beside it")
+lfb_takes_an_installed_compiler_beside_it()
+    assert_eq(lfb_found(lfb_resolve(None, Some("/opt/homebrew/Cellar/sysl/0.0.2/bin/sysl"),
+                                     lfb_roots(["/opt/homebrew/Cellar/sysl/0.0.2/share/sysl/library"]))),
+              "/opt/homebrew/Cellar/sysl/0.0.2/share/sysl/library")
+
+@test("and two installs of different versions each find their own")
+lfb_two_installs_each_find_their_own()
+    val both = lfb_roots(["/opt/sysl/0.0.1/share/sysl/library", "/opt/sysl/0.0.2/share/sysl/library"])
+
+    assert_eq(lfb_found(lfb_resolve(None, Some("/opt/sysl/0.0.1/bin/sysl"), both)), both.at(0))
+    assert_eq(lfb_found(lfb_resolve(None, Some("/opt/sysl/0.0.2/bin/sysl"), both)), both.at(1))
+
+@test("while a compiler run out of a checkout finds the tree it was built from")
+lfb_a_checkout_finds_its_own_tree()
+    assert_eq(lfb_found(lfb_resolve(None, None, lfb_roots(["library"]))), "library")
+
+@test("from a directory or two below it, since a suite need not run at the root")
+lfb_from_a_directory_or_two_below()
+    assert_eq(lfb_found(lfb_resolve(None, None, lfb_roots(["../library"]))), "../library")
+    assert_eq(lfb_found(lfb_resolve(None, None, lfb_roots(["../../library"]))), "../../library")
+
+@test("and still finds a tree that has not been renamed yet, at either kind of path")
+lfb_still_finds_the_old_name()
+    assert_eq(lfb_found(lfb_resolve(None, None, lfb_roots(["lib"]))), "lib")
+    assert_eq(lfb_found(lfb_resolve(None, None, lfb_roots(["../lib"]))), "../lib")
+    assert_eq(lfb_found(lfb_resolve(None, Some("/opt/sysl/0.0.40/bin/sysl"),
+                                     lfb_roots(["/opt/sysl/0.0.40/share/sysl/lib"]))),
+              "/opt/sysl/0.0.40/share/sysl/lib")
+
+@test("and prefers the new spelling where a tree carries both")
+lfb_prefers_the_new_spelling()
+    assert_eq(lfb_found(lfb_resolve(None, None, lfb_roots(["lib", "library"]))), "library")
+
+@test("and prefers the installed tree to whatever the working directory happens to hold")
+lfb_prefers_the_installed_tree()
+    assert_eq(lfb_found(lfb_resolve(None, Some("/usr/local/bin/sysl"),
+                                     lfb_roots(["/usr/local/share/sysl/library", "library"]))),
+              "/usr/local/share/sysl/library")
+
+// The roots exist and hold no `sysl`: a C project's `lib` is not a library root.
+@test("and a directory of that name that is not a sysl library is not a candidate at all")
+lfb_a_directory_of_that_name_is_not_a_candidate()
+    val there = lfb_roots(["library", "lib"])
+    val said = lfb_refusal(std_root_among(None, None, root -> holds_string(there, s"$root/$StdModule")))
+
+    assert(said.index_of("cannot find the standard module's source").is_some(), said)
+    assert(said.index_of("library").is_some(), said)
+
+// ---- SYSL_LIB ----
+
+@test("names the library outright, beating everything else")
+lfb_sysl_lib_beats_everything_else()
+    assert_eq(lfb_found(lfb_resolve(Some("/tmp/mine"), Some("/usr/local/bin/sysl"),
+                                     lfb_roots(["/tmp/mine", "/usr/local/share/sysl/library", "lib"]))),
+              "/tmp/mine")
+
+@test("aimed at the module rather than at the root, says which of the two is wanted")
+lfb_sysl_lib_aimed_at_the_module()
+    // What exists is `/tmp/library/sysl` itself, the module, with no `sysl` inside it.
+    val there = lfb_roots(["/tmp/library/sysl"])
+
+    assert_eq(lfb_refusal(std_root_among(Some("/tmp/library/sysl"), None,
+                                         root -> holds_string(there, s"$root/$StdModule"))),
+              "SYSL_LIB names '/tmp/library/sysl', which does not hold a 'sysl' directory — it should be " +
+              "the library root, which is the directory *above* 'sysl' rather than 'sysl' itself")
+
+@test("and one that is not a library root at all is refused rather than fallen back from")
+lfb_sysl_lib_naming_nothing_is_refused()
+    assert_eq(lfb_refusal(lfb_resolve(Some("/tmp/typo"), None, lfb_roots(["lib"]))),
+              "SYSL_LIB names '/tmp/typo', which does not hold a 'sysl' directory — it should be the " +
+              "library root, which is the directory *above* 'sysl' rather than 'sysl' itself")
+
+// ---- a compiler that cannot find its library ----
+
+private lfb_nowhere() -> string =
+    lfb_refusal(std_root_among(None, Some("/opt/sysl/0.0.2/bin/sysl"), root -> false))
+
+@test("says so, and names every place it looked")
+lfb_a_missing_library_names_every_place()
+    assert_eq(lfb_nowhere(), raw"""
+        cannot find the standard module's source, which every program is compiled against. Looked for a library root holding 'sysl' at:
+          /opt/sysl/0.0.2/share/sysl/library (beside this compiler)
+          /opt/sysl/0.0.2/share/sysl/lib (beside this compiler)
+          library (from the working directory)
+          ../library (from the working directory)
+          ../../library (from the working directory)
+          lib (from the working directory)
+          ../lib (from the working directory)
+          ../../lib (from the working directory)
+
+        A sysl installed from a package has it beside the binary; one run out of a checkout finds it in the tree. Set SYSL_LIB to the library root to name it outright.
+        """.trim_end())
+
+@test("and lists them in the order it tried them")
+lfb_a_missing_library_lists_in_order()
+    val said = lfb_nowhere()
+    val at = (part: string) -> said.index_of(part).unwrap_or(said.bytes.len)
+
+    assert(at("/opt/sysl/0.0.2/share/sysl/library") < at("  library ("), said)
+    assert(at("  library (") < at("  ../library ("), said)
+    assert(at("  ../library (") < at("  ../../library ("), said)
+    assert(at("  ../../library (") < at("  lib ("), said)

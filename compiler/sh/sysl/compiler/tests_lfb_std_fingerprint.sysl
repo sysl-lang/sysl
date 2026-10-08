@@ -1,0 +1,196 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{copy_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.join
+
+// Where the library was found does not change what it is, and the driver reads every file into the
+// module its header names -- the reference's `StdLibraryTests`, its fingerprint and driver halves.
+// The artifact this compiler keeps is keyed by the fingerprint (`std_artifact_path`), so a tree read
+// from elsewhere has to key the same entry and an edited one another.
+
+private lfb_fp_root() -> Option[string] = std_root() match
+    Ok(r) -> Some(r)
+    Err(_) ->
+        print("skipped: the standard module's source is not on this machine")
+        None
+
+// A copy of the library at a fresh path; the caller removes the directory it is in.
+private lfb_copy(root: string) -> (string, string)
+    val dir = make_temp_dir("sysl-lfb-copy").unwrap()
+    val copy = s"$dir/elsewhere"
+
+    copy_dir_all(root, copy).unwrap()
+    (dir, copy)
+end lfb_copy
+
+private lfb_places(found: Buf[Found]) -> string
+    var out: Buf[string] = buf()
+
+    for i in 0..<found.len()
+        out.push(s"${join(found.at(i).dir.view(), "/")}/${basename(found.at(i).src.name)}")
+
+    join(out.view(), " ")
+end lfb_places
+
+@test("so the same tree read from somewhere else fingerprints the same")
+lfb_a_moved_tree_fingerprints_the_same()
+    val root = lfb_fp_root() match
+        None -> return
+        Some(r) -> r
+
+    val t = host_target()
+    val moved = lfb_copy(root)
+
+    assert_eq(lfb_places(std_sources(moved.1, Some(t.os)).unwrap()), lfb_places(std_sources(root, Some(t.os)).unwrap()))
+
+    // The C moves with it, and the fingerprint is over both -- whichever way the root is spelled,
+    // since a carried C file is named under the root's absolute spelling.
+    assert_eq(std_fingerprint(moved.1, t).unwrap(), std_fingerprint(root, t).unwrap())
+    assert_eq(std_fingerprint(s"${moved.0}/./elsewhere", t).unwrap(), std_fingerprint(root, t).unwrap())
+    remove_dir_all(moved.0).unwrap_or(())
+
+@test("and the same hash read off a named root agrees with it")
+lfb_a_named_root_agrees_with_the_resolved_one()
+    val root = lfb_fp_root() match
+        None -> return
+        Some(r) -> r
+
+    val t = host_target()
+    val moved = lfb_copy(root)
+    val named = std_fingerprint(moved.1, t).unwrap()
+
+    assert_eq(named, std_fingerprint(std_root().unwrap(), t).unwrap())
+    assert_eq(std_artifact_path(t, named), std_artifact_path(t, std_fingerprint(std_root().unwrap(), t).unwrap()))
+    remove_dir_all(moved.0).unwrap_or(())
+
+@test("so a different tree keys a different artifact")
+lfb_a_different_tree_keys_a_different_artifact()
+    val root = lfb_fp_root() match
+        None -> return
+        Some(r) -> r
+
+    val t = host_target()
+    val moved = lfb_copy(root)
+
+    write_text(s"${moved.1}/sysl/marker.sysl", "module sysl\n\nprivate[sysl] a_marker() -> int = 1\n").unwrap()
+
+    val theirs = std_fingerprint(moved.1, t).unwrap()
+    val ours = std_fingerprint(root, t).unwrap()
+
+    assert(theirs != ours, "a tree with a file added fingerprints as the one without it")
+    assert(std_artifact_path(t, theirs) != std_artifact_path(t, ours), "two trees keyed one artifact")
+    remove_dir_all(moved.0).unwrap_or(())
+
+@test("while naming no root at all is still the resolved library's key")
+lfb_naming_no_root_is_the_resolved_key()
+    val root = lfb_fp_root() match
+        None -> return
+        Some(r) -> r
+
+    val t = host_target()
+    val found = std_artifact(t).unwrap()
+
+    assert_eq(found.archive, std_artifact_path(t, std_fingerprint(root, t).unwrap()))
+
+@test("while an edit to it does, so a changed library cannot take a stale artifact")
+lfb_an_edit_changes_the_fingerprint()
+    val root = lfb_fp_root() match
+        None -> return
+        Some(r) -> r
+
+    val t = host_target()
+    val files = std_files(root, t).unwrap()
+    var edited: Buf[(string, string)] = buf()
+
+    for i in 0..<files.len()
+        edited.push(if i == 0 then (files.at(i).0, files.at(i).1 + "\n") else files.at(i))
+
+    assert(library_fingerprint(edited) != library_fingerprint(files), "an edited library fingerprints the same")
+
+// ---- the library as the driver reads it ----
+
+@test("puts every file in the module its own header names")
+lfb_every_file_in_its_headers_module()
+    val root = lfb_fp_root() match
+        None -> return
+        Some(r) -> r
+
+    val found = std_sources(root, Some(host_target().os)).unwrap()
+
+    for i in 0..<found.len()
+        val f = found.at(i)
+        val header = parse(f.src).program.module_name match
+            Some(m) -> m.show()
+            None -> "(none)"
+
+        assert_eq(header, join(f.dir.view(), "."))
+
+@test("and every module those headers name is one the library says it declares")
+lfb_every_header_module_is_declared()
+    val root = lfb_fp_root() match
+        None -> return
+        Some(r) -> r
+
+    val found = std_sources(root, Some(host_target().os)).unwrap()
+    val units = std_units(root, host_target()).unwrap()
+    var by_dir: Buf[string] = buf()
+    var by_header: Buf[string] = buf()
+
+    for i in 0..<found.len()
+        val m = join(found.at(i).dir.view(), ".")
+
+        if !holds_string(by_dir, m) then by_dir.push(m)
+
+    for i in 0..<units.len()
+        val m = module_of_unit(units.at(i))
+
+        if !holds_string(by_header, m) then by_header.push(m)
+
+    for i in 0..<by_dir.len()
+        assert(holds_string(by_header, by_dir.at(i)), s"${by_dir.at(i)} has files and no declarations")
+
+    for i in 0..<by_header.len()
+        assert(holds_string(by_dir, by_header.at(i)), s"${by_header.at(i)} is declared and has no directory")
+
+private lfb_traits(u: Program) -> string
+    var out: Buf[string] = buf()
+
+    for i in 0..<u.body.len()
+        *u.body.at(i).kind match
+            TraitDecl(d) -> out.push(d.name)
+            _ -> ()
+
+    join(out.view(), " ")
+end lfb_traits
+
+// `Display.display` names `Writer`, which the other file declares, and neither imports the other:
+// a module's members are one set however many files they came from.
+@test("two files of one module reach each other with nothing imported")
+lfb_two_files_of_one_module_reach_each_other()
+    val root = lfb_fp_root() match
+        None -> return
+        Some(r) -> r
+
+    val units = std_units(root, host_target()).unwrap()
+
+    for i in 0..<units.len()
+        val u = units.at(i)
+
+        if u.src.name == "library/sysl/write.sysl" then assert_eq(lfb_traits(u), "Writer")
+        if u.src.name == "library/sysl/display.sysl" then assert_eq(lfb_traits(u), "Display Integer")
+
+        val own = module_of_unit(u)
+
+        for j in 0..<u.body.len()
+            *u.body.at(j).kind match
+                ImportDecl(d) ->
+                    // A bare path names the module with the imported name still on the end.
+                    val keep = if d.selectors.is_empty() && !d.wildcard then d.path.len() - 1 else d.path.len()
+                    var named: Buf[string] = buf()
+
+                    for k in 0..<keep do named.push(d.path.at(k))
+
+                    assert(join(named.view(), ".") != own, s"${u.src.name} imports its own module")
+                _ -> ()

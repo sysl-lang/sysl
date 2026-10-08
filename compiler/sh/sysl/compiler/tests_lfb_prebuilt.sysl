@@ -1,0 +1,214 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, metadata, read_bytes, remove_dir_all, remove_file, write_bytes}
+import sysl.text.Search
+
+// The standard module a program links rather than compiles -- the reference's `PrebuiltStdTests`,
+// plus `StdArtifactTests`' LTO case. **The reference names it `Stdlib.resolve(Choice.Default())`;
+// here it is `std_artifact`**, this compiler's private `.syslib` at the cache path keyed by its
+// identity, the library's fingerprint, the machine, the allocating pair and the level. The point is
+// the same: the suite really takes that road, rather than every call quietly compiling the source.
+
+private lfb_pb_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    if find_ar(None).is_err()
+        print("skipped: llvm-ar is not available")
+        return false
+
+    true
+end lfb_pb_ready
+
+private lfb_prebuilt() -> Option[StdArtifact] = std_artifact(host_target()) match
+    Ok(found) -> Some(found)
+    Err(why) ->
+        assert(false, why)
+        None
+
+// ---- the artifact the run tier compiles against ----
+
+@test("is built wherever a toolchain can build one")
+lfb_pb_is_built_wherever_it_can_be()
+    if !lfb_pb_ready() then return
+
+    std_artifact(host_target()) match
+        Ok(_) -> ()
+        Err(why) -> assert(false, why)
+
+@test("arrives with the archive to link it from")
+lfb_pb_arrives_with_its_archive()
+    if !lfb_pb_ready() then return
+
+    val found = lfb_prebuilt() match
+        None -> return
+        Some(f) -> f
+
+    assert(!found.archive.is_empty(), "no archive")
+    assert(metadata(found.archive).is_ok(), s"${found.archive} is not there")
+
+// Printing is the surface every program reaches, so an empty set here means the object half compiled
+// nothing in a way nothing else notices.
+@test("says which symbols it has already compiled, so a program need not emit them again")
+lfb_pb_says_what_it_compiled()
+    if !lfb_pb_ready() then return
+
+    val found = lfb_prebuilt() match
+        None -> return
+        Some(f) -> f
+
+    var printing = false
+
+    for i in 0..<found.precompiled.len()
+        if found.precompiled.at(i).index_of("print").is_some() then printing = true
+
+    assert(!found.precompiled.is_empty(), "nothing precompiled")
+    assert(printing, "no printing symbol among what the artifact compiled")
+
+// Routed to a copy of its own and the copy then removed: a second resolution that read or rebuilt it
+// would find nothing there, or put it back.
+@test("is resolved once, however many times it is asked for")
+lfb_pb_is_resolved_once()
+    if !lfb_pb_ready() then return
+
+    val t = host_target()
+
+    val shared = lfb_prebuilt() match
+        None -> return
+        Some(f) -> f
+
+    val dir = make_temp_dir("sysl-lfb-once").unwrap()
+    val own = s"$dir/std$SyslibExtension"
+
+    write_bytes(own, read_bytes(shared.archive).unwrap().view()).unwrap()
+    set_std_search(Some(own))
+
+    val first = std_artifact(t)
+
+    remove_file(own).unwrap_or(())
+
+    val second = std_artifact(t)
+
+    set_std_search(None)
+
+    val rebuilt = metadata(own).is_ok()
+
+    remove_dir_all(dir).unwrap_or(())
+
+    assert(first.is_ok() && second.is_ok(), "a resolution failed")
+    assert(!rebuilt, "the second resolution built the artifact again")
+    assert_eq(second.unwrap().archive, own)
+    assert_eq(second.unwrap().precompiled.len(), first.unwrap().precompiled.len())
+
+// ---- compiling the library in, instead ----
+
+@test("needs nothing built and links nothing")
+lfb_pb_from_source_links_nothing()
+    if std_root().is_err() then return
+
+    reset_search_paths()
+    took_search_flag(["--no-std-lib"], 0)
+
+    val linked = std_linked(host_target(), DefaultOptimization, false)
+
+    reset_search_paths()
+
+    linked match
+        Err(why) -> assert(false, why)
+        Ok(found) -> assert(found.is_none(), "the library compiled from source still links an archive")
+
+    assert(!std_units(std_root().unwrap(), host_target()).unwrap().is_empty(), "no library to compile in")
+
+// ---- a program compiled against it ----
+
+private lfb_defines(ir: string) -> usize
+    var n: usize = 0
+
+    val lines = lines_of(ir)
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with("define") then n += 1
+
+    n
+end lfb_defines
+
+@test("declares the library's functions where the carried copy defines them")
+lfb_pb_a_program_declares_what_the_artifact_defines()
+    if !lfb_pb_ready() then return
+
+    val linked = sta_emit("print(\"hello\")\n", false) match
+        None -> return
+        Some(t) -> t
+
+    val emitted = sta_emit("print(\"hello\")\n", true) match
+        None -> return
+        Some(t) -> t
+
+    // The program keeps its own definition and every one of the library's becomes a declaration.
+    assert_eq(lfb_defines(linked), 1)
+    assert(lfb_defines(emitted) > lfb_defines(linked), "compiling the library in defined no more")
+    assert(linked.bytes.len < emitted.bytes.len, "the linked program is no smaller")
+
+@test("runs, and prints what the same program prints without it")
+lfb_pb_a_linked_program_runs()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        print("hello")
+        """, "hello\n")
+
+// ---- the standard module written to disk, under link-time optimization ----
+
+private lfb_is_bitcode(body: Buf[u8]) -> bool =
+    body.len() >= 4 && ((body.at(0) == 0x42 && body.at(1) == 0x43 && body.at(2) == 0xc0 &&
+                         body.at(3) == 0xde) ||
+                        (body.at(0) == 0xde && body.at(1) == 0xc0 && body.at(2) == 0x17 &&
+                         body.at(3) == 0x0b))
+
+// The metadata is found by its marker in a member's bytes, which a bitstream would scatter -- so it
+// stays an ordinary object, and the artifact is still one this compiler reads.
+@test("compiled under LTO, its code is bitcode and it still reads back as the standard module")
+lfb_pb_an_lto_artifact_is_bitcode_and_reads_back()
+    if !lfb_pb_ready() then return
+
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    val t = host_target()
+    val dir = make_temp_dir("sysl-lfb-lto").unwrap()
+    val out = s"$dir/std$SyslibExtension"
+
+    settle_lto(Some("thin"))
+
+    val built = build_std_library(std_root().unwrap(), t, Some(out), "2")
+
+    reset_pipeline()
+
+    if built.is_err()
+        remove_dir_all(dir).unwrap_or(())
+        assert(false, built.unwrap_err())
+        return
+    end if
+
+    val members = ar_members(read_bytes(out).unwrap().view()).unwrap()
+    var code: Option[Buf[u8]] = None
+
+    for i in 0..<members.len()
+        if members.at(i).name == SyslibCodeMember then code = Some(members.at(i).body)
+
+    val back = syslib_read(out, syslib_metadata_at(out).unwrap(), t)
+
+    remove_dir_all(dir).unwrap_or(())
+
+    assert(code.is_some(), "no code member")
+    assert(lfb_is_bitcode(code.unwrap()), "the code member is not LLVM bitcode")
+    assert(back.is_ok(), "the LTO artifact does not read back")
+    assert_eq(back.unwrap().0.len(), half.advertised.len())
