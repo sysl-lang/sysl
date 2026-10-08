@@ -796,8 +796,38 @@ private check_signature_rules(a: &Analysis, scope: Scope, span: Span, name: stri
     if variadic && params.is_empty() then
         a.fault(scope, span, s"'$name' needs at least one named parameter before '...'")
 
+    check_rest_position(a, scope, name, params, variadic, foreign)
     check_va_list_positions(a, scope, name, params, ret, foreign)
 end check_signature_rules
+
+// Where a `...T` parameter may stand, which is last and only last (`reference/declarations.md § A
+// parameter may collect the rest of the call`). It collects everything the call has left, so a
+// parameter after it could never be given anything; it may not stand beside C's ellipsis, which is
+// a different tail walked with `va_arg`; and an `extern` may not carry one, since what the packing
+// hands over is a sysl slice -- three words with an owner in them -- and not what a C function was
+// compiled to read. Asked of the first such parameter only, at that parameter.
+private check_rest_position(a: &Analysis, scope: Scope, name: string, params: Buf[Param],
+                            variadic: bool, foreign: bool)
+    for i in 0..<params.len()
+        val p = params.at(i)
+
+        if !p.rest then continue
+
+        if foreign
+            a.fault(scope, p.span, s"'$name' is an 'extern', and '${p.name}: ...T' hands over a sysl " +
+                    "slice — which is three words with an owner in them, and not what a C function " +
+                    "was compiled to read. C's own tail is the bare '...' with no name and no type")
+        else if variadic
+            a.fault(scope, p.span, s"'$name' has two tails: '${p.name}: ...T' collects the rest of the " +
+                    "call into a slice, and '...' is C's ellipsis, walked with 'va_arg'. A call has " +
+                    "one tail, so a declaration may write one of them")
+        else if i + 1 < params.len()
+            a.fault(scope, p.span, s"'${p.name}' collects the rest of the call, so nothing can follow " +
+                    s"it — the arguments that would be '${params.at(params.len() - 1).name}' are " +
+                    "already inside it")
+
+        return
+end check_rest_position
 
 // **A member is held to the same rules, its receiver counting as the named parameter a `...` anchors
 // on** -- so `only(self, ...)` is complete and a receiverless `make(...)` is not. `name` is the

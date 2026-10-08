@@ -1,0 +1,177 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// What `reference/declarations.md`'s methods sections claim, run rather than read: a member the
+// compiler provides may not be hidden by one a program declares (on a written-out sequence and on a
+// shape alike), a call reaches through one level of indirection as selection does, the receiver rules,
+// and a property read through every memory mode a method is called through.
+//
+// The reference's `MethodClaimTests`; helpers are `tests_aza_rest_param.sysl`'s.
+
+private aza_sized() -> string = "trait Sized\n    len -> usize\n"
+
+private aza_point() -> string = raw"""
+    struct Point
+        x: int
+        y: int
+
+        dist(self) -> int = self.x + self.y
+    """
+
+private aza_node() -> string = raw"""
+    struct Node
+        n: int
+
+        doubled -> int = self.n * 2
+
+        scaled(self, k: int) -> int = self.n * k
+    """
+
+// ---- a compiler-provided member may not be hidden by one a program declares ----------------------
+
+@test("a provided member may not be declared on a slice written out")
+aza_mc_not_on_a_slice()
+    if !aza_ready() then return
+
+    aza_refuses(aza_sized() + "impl Sized for []int\n    len -> usize = 99usize\n",
+                "'len' is a member the compiler provides for []int — a member of this name would hide it")
+
+@test("nor on a fixed array, nor on a string")
+aza_mc_nor_on_an_array_or_a_string()
+    if !aza_ready() then return
+
+    aza_refuses(aza_sized() + "impl Sized for [3]int\n    len -> usize = 99usize\n",
+                "'len' is a member the compiler provides for [3]int")
+    aza_refuses(aza_sized() + "impl Sized for string\n    len -> usize = 99usize\n",
+                "'len' is a member the compiler provides for string")
+
+@test("and not on the shape either, which would leave the declared member unreachable")
+aza_mc_not_on_the_shape()
+    if !aza_ready() then return
+
+    aza_refuses(aza_sized() + "impl[T] Sized for []T\n    len -> usize = 99usize\n",
+                "'len' is a member the compiler provides for every slice — a member of this name " +
+                "would hide it")
+
+@test("an array shape is the same answer")
+aza_mc_an_array_shape()
+    if !aza_ready() then return
+
+    aza_refuses(aza_sized() + "impl[T] Sized for [3]T\n    len -> usize = 99usize\n",
+                "'len' is a member the compiler provides for every array of 3")
+
+@test("a string's other provided members are refused the same way")
+aza_mc_a_strings_other_members()
+    if !aza_ready() then return
+
+    aza_refuses("trait Raw\n    bytes -> []u8\nimpl Raw for string\n    bytes -> []u8 = [0u8]\n",
+                "'bytes' is a member the compiler provides for string")
+
+@test("while a name the compiler does not provide is an ordinary member of the shape")
+aza_mc_an_ordinary_member_of_the_shape()
+    if !aza_ready() then return
+
+    twp_prints("trait Total\n    total(self) -> int\nimpl[T] Total for []T\n    total(self) -> int = 7\n" +
+               "var xs: []int = [1, 2, 3]\nprint(xs.total(), xs.len)\n", "7 3\n")
+
+// ---- a call reaches through one level of indirection, as selection does -------------------------
+
+@test("so a method is reached through a '&T' and a '*T' with nothing written")
+aza_mc_reached_through_one_level()
+    if !aza_ready() then return
+
+    twp_prints(aza_point() + "var v = Point(1, 2)\nvar p = &v\nvar r: &Point = Point(3, 4)\n" +
+               "print(p.dist(), r.dist())\n", "3 7\n")
+
+@test("and a '**T' is told the reach stops short, not that the method is missing")
+aza_mc_two_levels_stop_short()
+    if !aza_ready() then return
+
+    val said = aza_err(aza_point() + "var v = Point(1, 2)\nvar p = &v\nvar pp = &p\nprint(pp.dist())\n")
+
+    assert(said.index_of("a method call reaches through one level of indirection and **Point has " +
+                         "more, so the rest is written: '(*x).dist(…)' calls 'dist' on the *Point " +
+                         "it leaves").is_some(), said)
+    assert(said.index_of("has no method").is_none(), said)
+
+@test("while the written dereference gets through")
+aza_mc_written_dereference()
+    if !aza_ready() then return
+
+    twp_prints(aza_point() + "var v = Point(1, 2)\nvar p = &v\nvar pp = &p\nprint((*pp).dist())\n", "3\n")
+
+@test("and a type that genuinely has no such method keeps the plain complaint")
+aza_mc_no_such_method()
+    if !aza_ready() then return
+
+    aza_refuses(aza_point() + "var v = Point(1, 2)\nprint(v.nope())\n", "type 'Point' has no method 'nope'")
+
+// ---- the receiver rules the chapter states, probed and holding ----------------------------------
+
+@test("a '*self' method on a temporary has nothing to point at, and says so")
+aza_mc_star_self_on_a_temporary()
+    if !aza_ready() then return
+
+    aza_refuses("struct P\n    x: int\n    bump(*self)\n        self.x += 1\nmk() -> P = P(1)\nmk().bump()\n",
+                "'*self' needs a variable, field, or dereference to point at — this receiver has no " +
+                "address")
+
+@test("'self' is reserved, so it is not a name a program may bind")
+aza_mc_self_is_reserved()
+    if !aza_ready() then return
+
+    aza_refuses("var self = 5\nprint(self)\n",
+                "'self' is a reserved word, so it cannot stand as the name a 'var' binds")
+
+@test("a property declares no type parameters, there being no read to fix them at")
+aza_mc_property_takes_no_type_parameters()
+    if !aza_ready() then return
+
+    aza_refuses("struct Box[T]\n    v: T\n    zero[U] -> int = 7\nvar b = Box(1)\nprint(b.zero)\n",
+                "a property takes no type parameters")
+
+@test("an associated function needs a name in call position, which a composed type has not")
+aza_mc_associated_function_on_a_shape()
+    if !aza_ready() then return
+
+    aza_refuses("trait Make\n    kind() -> int\nimpl[T] Make for []T\n    kind() -> int = 3\n",
+                "'kind' has no receiver, and '[]T' is not a name a call could reach it through — " +
+                "give it a 'self' parameter")
+
+@test("a member may declare its own type parameters even where its type declares none")
+aza_mc_member_type_parameters()
+    if !aza_ready() then return
+
+    twp_prints("struct Counter\n    n: int\n    make[T](x: T) -> Counter = Counter(1)\n" +
+               "var c = Counter.make(5)\nprint(c.n)\n", "1\n")
+
+// ---- a property is read through whatever a method is called through ------------------------------
+
+@test("a counted reference answers a property and a method both")
+aza_mc_counted_reference_answers_both()
+    if !aza_ready() then return
+
+    twp_prints(aza_node() + "prop(x: &Node) -> int = x.doubled\nmeth(x: &Node) -> int = x.scaled(2)\n" +
+               "var r: &Node = Node(7)\nprint(prop(r), meth(r))\n", "14 14\n")
+
+@test("a raw pointer answers both")
+aza_mc_raw_pointer_answers_both()
+    if !aza_ready() then return
+
+    twp_prints(aza_node() + "prop(p: *Node) -> int = p.doubled\nmeth(p: *Node) -> int = p.scaled(2)\n" +
+               "var owned = Node(9)\nprint(prop(&owned), meth(&owned))\n", "18 18\n")
+
+// `get()` is the only thing to ask a weak reference, so both forms are refused -- each in its own
+// words rather than one falling through to a message about a name that does not exist.
+@test("a weak reference answers neither, and says the same thing about both")
+aza_mc_weak_reference_answers_neither()
+    if !aza_ready() then return
+
+    aza_refuses(aza_node() + "prop(w: weak Node) -> int = w.doubled\nvar r: &Node = Node(7)\nprint(prop(r))\n",
+                "a weak Node may be gone, so nothing is read off one directly — 'get()' hands back " +
+                "'Option[&Node]', and 'doubled' is read off what is inside it")
+    aza_refuses(aza_node() + "meth(w: weak Node) -> int = w.scaled(2)\nvar r: &Node = Node(7)\nprint(meth(r))\n",
+                "a weak Node has no method 'scaled' — a weak reference may be gone, so 'get()' is " +
+                "the only thing to ask one, and what it hands back is what has methods")
