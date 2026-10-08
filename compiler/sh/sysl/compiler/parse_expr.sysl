@@ -577,12 +577,12 @@ private parse_if_expr(p: *Parser, at: Span) -> Expr
         i -= 1
 
         var wrapped: Buf[Stmt] = buf()
-        val inner = expr(elifs.at(i).to(p.just_taken()), IfExpr(conds.at(i), bodies.at(i), else_body))
+        val inner = expr(elifs.at(i).to(p.just_taken()), IfExpr(conds.at(i), bodies.at(i), else_body, true))
 
         wrapped.push(stmt(inner.span, ExprStmt(inner)))
         else_body = Some(wrapped)
 
-    expr(at.to(p.just_taken()), IfExpr(cond, then_body, else_body))
+    expr(at.to(p.just_taken()), IfExpr(cond, then_body, else_body, false))
 end parse_if_expr
 
 // -- infix and postfix position -----------------------------------------------------------------
@@ -608,7 +608,7 @@ private begins_at(e: Expr) -> Span = *e.kind match
     Field(receiver, _) -> begins_at(receiver)
     Index(receiver, _) -> begins_at(receiver)
     TypeArgs(receiver, _) -> begins_at(receiver)
-    TypeAttr(receiver, _) -> begins_at(receiver)
+    TypeAttr(receiver, _, _) -> begins_at(receiver)
     Call(callee, _) -> begins_at(callee)
     _ -> e.span
 
@@ -648,7 +648,7 @@ private led_word(lhs: Expr, at: Span, w: string, p: *Parser) -> Expr
     end if
 
     if w == "." then return led_field(lhs, p)
-    if w == "::" then return led_type_attr(lhs, p)
+    if w == "::" then return led_type_attr(lhs, at, p)
     if w == "?" then return expr(from.to(at), TryExpr(lhs))
     if w == "++" || w == "--" then return expr(from.to(at), PostIncDec(w, lhs))
 
@@ -864,12 +864,13 @@ private split_at_point(text: string) -> Buf[string]
     out
 end split_at_point
 
-// `T::Attr` -- metadata the type itself exposes, which is why it is not a `.`.
-private led_type_attr(lhs: Expr, p: *Parser) -> Expr
+// `T::Attr` -- metadata the type itself exposes, which is why it is not a `.`. `colons` is the `::`
+// the loop has just taken, kept for the node's anchor.
+private led_type_attr(lhs: Expr, colons: Span, p: *Parser) -> Expr
     val at = p.here()
 
     p.name() match
-        Some(n) -> expr(at, TypeAttr(lhs, n))
+        Some(n) -> expr(at, TypeAttr(lhs, n, colons))
         None -> expr(at, Bad)
 end led_type_attr
 
