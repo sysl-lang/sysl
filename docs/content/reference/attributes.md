@@ -780,11 +780,59 @@ the_fixture_holds() =
 It goes when the file goes, too, which is the half that makes the naming safe: the program that ships
 carries no body for it.
 
-**An `impl` block may not sit in one.** It declares no name; it fills a slot in a method table, which
-the rest of the program reads without naming anything. Kept in a test build and dropped everywhere
-else, it would mean a trait answering one way while the tests ran and another way in the program that
-ships. The impl belongs beside the type. A closure is the one exception the compiler makes for
-itself, and it is not a hole: the table it writes is dropped with the closure.
+**An `impl` block sits in one only for a type that same file declares.** An `impl` declares no name;
+it fills a slot in a method table, which the rest of the program reads without naming anything. Kept
+in a test build and dropped everywhere else, an `impl` for a type the program has would mean a trait
+answering one way while the tests ran and another way in the program that ships, so it belongs beside
+the type. A type the `@tests` file declares itself has no such second answer — no other build has the
+type at all — so its `impl` may sit beside it, and that is how a test gets a stand-in to hand to code
+written against a trait:
+
+```sysl
+@tests
+
+trait Area
+    area(self) -> int
+
+    described(self) -> string = s"area ${self.area()}"
+
+measured(s: &Area) -> int = s.area()
+
+struct Square
+    side: int
+
+impl Area for Square
+    area(self) -> int = self.side * self.side
+
+@test("a stand-in answers through the trait")
+a_square_measures()
+    val s: &Area = Square(3)
+
+    assert_eq(measured(s), 9)
+    assert_eq(s.described(), "area 9")
+```
+
+Where the trait is declared does not enter into it: a trait of the module and a trait of the test file
+are equally fine. What is still refused is an `impl` for any type the file did not declare — one of
+the module's, a builtin, a blanket `impl[T] … for T`, and a type another `@tests` file declares, since
+which files a build keeps is decided file by file:
+
+```sysl
+@tests
+
+trait Area
+    area(self) -> int
+
+impl Area for int
+    area(self) -> int = self
+```
+
+```error
+error: an 'impl' block in a file that said '@tests' has to be for a type that file declares, and 'int' is not declared in it — a test build would keep this block and every other build would drop it, so a trait would answer one way while the tests ran and another way in the program that ships. Write the block beside the type's own declaration, or declare a type for the tests in this file
+```
+
+A closure is the one exception the compiler makes for itself, and it is not a hole: the table it
+writes is dropped with the closure.
 
 **It stops at the package boundary.** A package is compiled from source and a library arrives as an
 artifact whose test files were never encoded, so a rule that let the reference cross would compile
@@ -1778,7 +1826,9 @@ address the processor fetches from, storage in `.noinit` that survives a warm re
 the RAM bank the engine can reach, a function copied into RAM so it can run while flash is being
 erased.
 
-It marks whatever occupies an address — a module `var`, a module `val`, and a function.
+It marks whatever occupies an address — a module `var`, a module `val`, a function, and an `asm`
+block written at the top of a file, which is how code that runs before there is a stack is placed
+(see [inline assembly](/reference/inline-assembly/); such a block also takes `@align(n)`).
 
 ```sysl
 @section(".noinit")
@@ -2182,7 +2232,8 @@ because the trees a library ships are now a per-target answer.
 
 | absent | why |
 |---|---|
-| a general annotation mechanism | the set is closed: `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)`, `@crossing(...)`, `@noinline`, `@inline`, `@cold`, `@setup`, `@teardown`, `@setup_all` and `@teardown_all` on a free function, `@packed`, `@align(n)` and `@export("...")` on a struct, `@section("...")` on a binding or a function, `@no_<capability>`, `@requires`, `@link`, `@include` and `@tests` on a file, and `@assert` on nothing at all. Each was designed and added on its own evidence; there is no way to write one the compiler does not already know |
+| a general annotation mechanism | the set is closed: `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)`, `@crossing(...)`, `@noinline`, `@inline`, `@cold`, `@setup`, `@teardown`, `@setup_all` and `@teardown_all` on a free function, `@packed`, `@align(n)` and `@export("...")` on a struct, `@section("...")` on a binding or a function, `@section("...")` and `@align(n)` on an `asm` block at the top of a file, `@no_<capability>`, `@requires`, `@link`, `@include` and `@tests` on a file, and `@assert` on nothing at all. Each was designed and added on its own evidence; there is no way to write one the compiler does not already know |
+| `@naked`, a function with no frame | code that must run before there is a stack — a reset entry, a vector table — is an [`asm` block at the top of a file](/reference/inline-assembly/), which is not a function and so has no frame to leave out |
 | bitfield syntax | there is nothing to write: inside `@packed` an `iN` field already occupies exactly N bits, so a five-bit register field is `u5` and needs no `: 5` beside it. The open integer family does the work C's declarator syntax was invented for |
 | `#define`, or any project-supplied symbol | the `#if` vocabulary is derived from the target and closed, which is what makes an unknown symbol an error rather than a false |
 | a `#if` that asks about a capability | a condition asks what the *target* says; what a project permits is a different question, left with the config that would define it |

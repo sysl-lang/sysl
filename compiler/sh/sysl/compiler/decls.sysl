@@ -474,6 +474,15 @@ struct Tables
     // names instantiations, and whether one of them is `const` is a fact about its declaration.
     const_fns: &Table[bool]
 
+    // Every type a `@tests` file declares, as `file` and `name` joined by a NUL: an `impl` in such a
+    // file is allowed only for a type this table holds under that same file, since a type no build
+    // but a test build keeps cannot answer differently in the program that ships.
+    test_file_types: Buf[string]
+
+    // Every `asm` block written at the top of a file, its arm chosen for the target, in the order the
+    // files were read (`asm.sysl`'s `check_module_asm`).
+    module_asm: Buf[TModuleAsm]
+
     // Whether a key is one this compilation has a declaration for, whatever kind.
     declares_type(self, key: string) -> bool = self.types.has(key)
 
@@ -506,7 +515,9 @@ tables_for(t: Target) -> &Tables =
            buf(),
            buf(),
            buf(),
-           table())
+           table(),
+           buf(),
+           buf())
 
 // One `override impl` still to be held to there being something for it to override: the type as a
 // reader spelled it, the promise the block makes, the type it covers, and where to point.
@@ -793,6 +804,13 @@ struct Analysis
 
         if self.regions > 0 && self.poison.is_none() then self.poison = Some((before, self.found.len()))
     end fault
+
+    // Records an error about the program as a whole, which is printed with no position: `span`
+    // orders it in the report and is never shown. Nothing that calls it is inside a region.
+    fault_unplaced(*self, scope: Scope, span: Span, message: string)
+        val d = unplaced_error(scope.src, span, message)
+
+        if !already_said(self.found, d) then self.found.push(d)
 
     // Records a mistake about where something was WRITTEN rather than about what it means, which
     // abandons nothing: the region carries on reading, so a second such clause in it is told too.

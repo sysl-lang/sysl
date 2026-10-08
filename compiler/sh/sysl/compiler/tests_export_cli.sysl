@@ -371,6 +371,72 @@ ecl_writes_archive_and_header()
            said)
     remove_dir_all(root).unwrap_or(())
 
+// A freestanding target has no libc and no libm, so the hint a C project would act on names neither;
+// the host test above is the other half, where `m` is named.
+@test("build-c for a freestanding target names no library to link against")
+ecl_freestanding_names_no_library()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_boundary())
+    val got = ecl_run(["sysl", "build-c", root, "-o", s"$root/libmylib.a", "--target",
+                       "aarch64-freestanding"])
+
+    assert(got.0 == 0, got.1)
+    assert(!ecl_has(got.1, "link this against"), got.1)
+    remove_dir_all(root).unwrap_or(())
+
+// The standard module's C is carried only when the program reaches the module that holds it.
+private ecl_unicode() -> string = raw"""
+    module mylib
+
+    import sysl.unicode.to_upper
+
+    @export("mylib_up")
+    up(a: i32) -> i32 = i32(u32(to_upper(char(u32(a)))))
+    """
+
+@test("an archive from a program that never touches unicode carries no utf8proc")
+ecl_archive_without_unicode_has_no_utf8proc()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_boundary())
+
+    ecl_build_c(root)
+
+    val names = ecl_members(s"$root/libmylib.a")
+
+    for i in 0..<names.len()
+        assert(!ecl_has(names.at(i), "utf8proc"), names.at(i))
+
+    assert(ecl_holds(names, "sysl.code.o"), "the code member is missing")
+    remove_dir_all(root).unwrap_or(())
+
+@test("an archive from a program that uses unicode still carries utf8proc")
+ecl_archive_with_unicode_has_utf8proc()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_unicode())
+
+    ecl_build_c(root)
+    assert(ecl_holds(ecl_members(s"$root/libmylib.a"), "sysl.unicode.utf8proc.o"),
+           "utf8proc.o is missing")
+    remove_dir_all(root).unwrap_or(())
+
+// C beside the project is compiled whole and may call a standard-module C symbol the sysl code never
+// names, so the object defining it has to stay.
+@test("a std C object the project's own C calls stays in the archive")
+ecl_archive_keeps_std_object_its_c_calls()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_boundary())
+
+    write_text(s"$root/mylib/shim.c",
+               "int utf8proc_toupper(int c);\nint shim_up(int c) { return utf8proc_toupper(c); }\n").unwrap()
+    ecl_build_c(root)
+    assert(ecl_holds(ecl_members(s"$root/libmylib.a"), "sysl.unicode.utf8proc.o"),
+           "utf8proc.o is missing")
+    remove_dir_all(root).unwrap_or(())
+
 @test("the header declares each export under the symbol it named")
 ecl_header_declares_each_export()
     if !ecl_ready() then return

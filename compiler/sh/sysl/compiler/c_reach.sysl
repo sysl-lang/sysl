@@ -1,0 +1,126 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+import sysl.process.capture
+import sysl.text.{split, Search}
+
+// Which of the standard module's C objects a `build-c` archive has to carry.
+//
+// **Reachability decides, the same as it does for sysl code.** The program's code object declares
+// only the `extern`s the program reaches, so an object of the standard module's C that defines none
+// of the symbols the code names -- directly, or through another object that is kept -- is one nothing
+// can ask for. `utf8proc.c` alone is a few hundred kilobytes of tables, and a program that never
+// touches `sysl.unicode` has no use for it.
+//
+// A package's C is not subject to this: it is compiled whole, because its author wrote it for the
+// program that depends on it and an object the archive left out is one the C project has no way to
+// supply.
+
+// The external symbols one object file defines and the ones it leaves for another to define.
+struct ObjectSymbols
+    defined: Buf[string]
+    wanted: Buf[string]
+end ObjectSymbols
+
+// What `nm` says about an object: its external symbols, the platform's leading underscore removed
+// where the object format adds one.
+object_symbols(nm: string, obj: string, underscore: bool) -> Result[ObjectSymbols, string]
+    val ran = capture(nm, ["-g", "-P", obj], "", [], true) match
+        Err(_) -> return Err(s"cannot run '$nm'")
+        Ok(out) -> out
+
+    if !ran.status.ok() then return Err(s"'$nm' could not read $obj")
+
+    var out = ObjectSymbols(buf(), buf())
+    val lines = split(ran.text, "\n")
+
+    for i in 0..<lines.len
+        val words = split(lines[i], " ")
+
+        if words.len >= 2
+            var name = words[0]
+
+            if underscore && name.starts_with("_") then name = name[1..<name.bytes.len]
+
+            if words[1] == "U" then out.wanted.push(name) else out.defined.push(name)
+
+    Ok(out)
+end object_symbols
+
+// Every name the IR text uses as a global, `@name`.
+ir_globals(ir: string) -> Set[string]
+    var names: Set[string] = set()
+    var i: usize = 0
+
+    while i < ir.bytes.len
+        if ir.bytes[i] == u8('@') && i + 1 < ir.bytes.len && ir.bytes[i + 1] != u8('"')
+            var j = i + 1
+
+            while j < ir.bytes.len && symbol_byte(ir.bytes[j])
+                j += 1
+
+            names.add(ir[(i + 1)..<j])
+            i = j
+        else
+            i += 1
+
+    names
+end ir_globals
+
+private symbol_byte(b: u8) -> bool =
+    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) ||
+        (b >= u8('0') && b <= u8('9')) || b == u8('_') || b == u8('.') || b == u8('$')
+
+// Which of `objects` are needed: those defining something `named` holds, then those defining
+// something a needed object leaves undefined, until nothing more is added.
+reached_objects(objects: Buf[ObjectSymbols], named: Set[string]) -> Buf[bool]
+    var keep: Buf[bool] = buf()
+    var wanted: Set[string] = set()
+
+    for i in 0..<objects.len()
+        keep.push(false)
+
+    var grew = true
+
+    while grew
+        grew = false
+
+        for i in 0..<objects.len()
+            if !keep.at(i)
+                var hit = false
+                val defined = objects.at(i).defined
+
+                for j in 0..<defined.len()
+                    if named.has(defined.at(j)) || wanted.has(defined.at(j)) then hit = true
+
+                if hit
+                    keep.set(i, true)
+                    grew = true
+
+                    val more = objects.at(i).wanted
+
+                    for j in 0..<more.len()
+                        wanted.add(more.at(j))
+
+    keep
+end reached_objects
+
+// The `nm` to read an object with: the one beside the archiver where that was named by path, else
+// the places an LLVM install keeps it. Nothing where none runs.
+find_nm(archiver: string) -> Option[string]
+    var tried: Buf[string] = buf()
+
+    if archiver.ends_with("llvm-ar") then tried.push(archiver[0..<(archiver.bytes.len - 2)] + "nm")
+
+    tried.push("llvm-nm")
+    tried.push("/opt/homebrew/opt/llvm/bin/llvm-nm")
+    tried.push("/usr/local/opt/llvm/bin/llvm-nm")
+
+    for i in 0..<tried.len()
+        capture(tried.at(i), ["--version"], "", [], true) match
+            Ok(out) -> if out.status.ok() then return Some(tried.at(i))
+            Err(_) -> ()
+
+    None
+end find_nm

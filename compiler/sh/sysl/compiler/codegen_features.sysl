@@ -1,0 +1,303 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.process.capture
+import sysl.text.Search
+
+// What the generated code may use of the machine: the project's `codegen` block and the two flags
+// beside it.
+//
+// **Two settings, both a kernel's**: `general_regs_only` keeps every value in the general-purpose
+// registers -- no floating-point or SIMD register is read or written, so exception entry and a
+// context switch need not save that file, and code that runs before the unit is enabled cannot
+// trap on it -- and `strict_align` makes every access naturally aligned, which is what memory mapped
+// as Device (an MMU that is off) demands. They are clang's `-mgeneral-regs-only` and `-mstrict-align`.
+//
+// **A setting is a property of the whole image, so only the root project's applies**: a dependency
+// cannot turn the registers back on under its consumer, and the standard module is compiled under
+// the same answer. It reaches every place code is generated: the LLVM text's function attributes,
+// every clang that compiles that text or a package's carried C or measures a `c const`, the standard
+// module's artifact (whose cache directory carries `codegen_features_key`), the C object cache and
+// codegen-unit cache (both keyed over the arguments), and the run cache.
+//
+// **A setting that means nothing on a machine is refused rather than dropped**, naming what the
+// machine does instead -- a build that silently ignored `general_regs_only` would be the one result
+// worse than a refusal.
+
+// The two settings, as one value.
+struct CodegenFeatures
+    general_regs_only: bool
+    strict_align: bool
+end CodegenFeatures
+
+// The settings a build asked for nothing of.
+no_codegen_features() -> CodegenFeatures = CodegenFeatures(false, false)
+
+// Whether `word` names a setting a `codegen` block may hold.
+is_codegen_setting(word: string) -> bool = word == "general_regs_only" || word == "strict_align"
+
+// What this process is building under. **Settled by `target_for`**, the one funnel every building
+// command comes through, before the standard module's artifact is looked for -- the artifact's
+// directory is named by it.
+private var cf_general_regs_only: bool = false
+private var cf_strict_align: bool = false
+
+codegen_features() -> CodegenFeatures = CodegenFeatures(cf_general_regs_only, cf_strict_align)
+
+use_codegen_features(f: CodegenFeatures)
+    cf_general_regs_only = f.general_regs_only
+    cf_strict_align = f.strict_align
+end use_codegen_features
+
+// What the settings add to a cache key: nothing where both are off, so an ordinary build's paths are
+// unchanged.
+codegen_features_key() -> string
+    var out = ""
+
+    if cf_general_regs_only then out = out + "-gro"
+    if cf_strict_align then out = out + "-sa"
+
+    out
+end codegen_features_key
+
+// Why `f` cannot be built for `t`, or nothing where it can.
+//
+// | | `general_regs_only` | `strict_align` |
+// |---|---|---|
+// | aarch64 | `-fp-armv8,-neon` | `+strict-align` |
+// | x86_64 | `-x87,-mmx,-sse` | refused: x86 has no strict mode |
+// | thumb | refused: pick a row with no unit | `-mno-unaligned-access` |
+// | riscv | refused: the float ABI is the triple's | `-mstrict-align` |
+// | wasm32, craft | refused | refused |
+//
+// **Thumb and RISC-V are refused rather than mapped for `general_regs_only`** because their
+// floating-point unit is part of the calling convention the row names: turning it off under a
+// hard-float row would change where every float argument travels, which is a different machine --
+// and the registry already has it (`thumb-freestanding-soft`, `thumbv6m-freestanding`).
+codegen_feature_refusal(t: Target, f: CodegenFeatures) -> Option[string]
+    if f.general_regs_only
+        val why: Option[string] = t.cpu match
+            Aarch64 -> None
+            X86_64 -> None
+            Thumb -> Some(s"an Arm row names its floating-point unit as part of its calling " +
+                "convention, so turning the unit off is a different machine — build for one with no " +
+                "unit ('thumb-freestanding-soft', 'thumbv6m-freestanding'), whose code never touches a " +
+                "floating-point register")
+            Riscv64 -> Some(riscv_general_regs())
+            Riscv32 -> Some(riscv_general_regs())
+            _ -> Some("the machine has no separate floating-point or vector register file to keep out of")
+
+        if why.is_some()
+            return Some(s"'general_regs_only' does not apply to '${t.name}': ${why.unwrap()}")
+    end if
+
+    if f.strict_align
+        val why: Option[string] = t.cpu match
+            Aarch64 -> None
+            Thumb -> None
+            Riscv64 -> None
+            Riscv32 -> None
+            X86_64 -> Some("x86 has no strict-alignment mode — every access may be unaligned there, " +
+                "and the hardware performs it")
+            _ -> Some("the machine has no strict-alignment mode to select")
+
+        if why.is_some() then return Some(s"'strict_align' does not apply to '${t.name}': ${why.unwrap()}")
+    end if
+
+    None
+end codegen_feature_refusal
+
+private riscv_general_regs() -> string =
+    "the F and D extensions are part of the ABI the row's triple names, so turning them off is a " +
+    "different machine — a 'riscv32-freestanding' build already has none"
+
+// What clang is told on every command line producing code for `t`, under the settings in force:
+// the sysl text's compile, a package's carried C, the `c const` probe and the link.
+codegen_feature_flags(t: Target) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if cf_general_regs_only && (t.cpu == Aarch64 || t.cpu == X86_64)
+        out.push("-mgeneral-regs-only")
+
+    if cf_strict_align
+        if t.cpu == Thumb
+            out.push("-mno-unaligned-access")
+        elif t.cpu == Aarch64 || t.cpu == Riscv64 || t.cpu == Riscv32
+            out.push("-mstrict-align")
+
+    out
+end codegen_feature_flags
+
+// The `"target-features"` function attribute every sysl definition carries under the settings, or
+// nothing.
+//
+// **Only where the machine's features come from its processor**: aarch64 and x86_64. An LLVM
+// function's `target-features` REPLACES the feature string the command line built rather than adding
+// to it, and on Thumb the string carries the unit `-mfpu` named and on RISC-V the extensions the
+// triple names -- replaced, a function would lose them. There the clang flag alone carries the
+// setting, applying to every function, none of which then carries an attribute of its own.
+codegen_feature_attribute(t: Target) -> Option[string]
+    var parts: Buf[string] = buf()
+
+    if cf_strict_align && t.cpu == Aarch64 then parts.push("+strict-align")
+
+    if cf_general_regs_only
+        if t.cpu == Aarch64
+            parts.push("-fp-armv8")
+            parts.push("-neon")
+        elif t.cpu == X86_64
+            parts.push("-x87")
+            parts.push("-mmx")
+            parts.push("-sse")
+
+    if parts.is_empty() then return None
+
+    var text = ""
+
+    for i in 0..<parts.len()
+        if i > 0 then text = text + ","
+
+        text = text + parts.at(i)
+
+    Some(s"\"target-features\"=\"$text\"")
+end codegen_feature_attribute
+
+// -- floating point under `general_regs_only` ---------------------------------------------------------
+
+// Every body that computes with a floating-point value, refused where the build keeps to the general
+// registers.
+//
+// **LLVM does not refuse it, and that is why this does.** With the unit's features off it quietly
+// lowers every float to the soft-float convention: an `f64` parameter moves to an integer register, a
+// multiply becomes a call to `__muldf3`, and the image either fails to link for want of a runtime a
+// kernel does not carry or links against code compiled for the other convention. clang refuses the
+// same C in its front end ("requires 'double' type support"), so the sysl refusal is the C one, said
+// at the first thing in the body that has a floating type.
+//
+// **One complaint per body**, at its signature where a parameter or the result is a float and
+// otherwise at the outermost floating expression the walk meets first; every function the build emits
+// is asked, the standard module's included, since a library body computing with a float is code in
+// this image too. A build OF a library is not asked: it is compiled for whichever program reaches it,
+// and that program is held to this.
+check_general_regs(a: &Analysis, p: TProgram)
+    if !cf_general_regs_only || !a.producing.is_empty() then return
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        float_use_in(a, func_home(a, f.name), s"'${qualified_name(f.name)}'", f.params, f.ret_ty,
+                     f.span, f.body.stmts, f.body.result)
+
+    float_use_in(a, entry_home(a), "the program's statements", buf(), Unit, Span(0, 0), p.main, None)
+end check_general_regs
+
+private float_use_in(a: &Analysis, home: Scope, who: string, params: Buf[(string, Type)],
+                     result: Type, at: Span, stmts: Buf[TStmt], tail: Option[TExpr])
+    for i in 0..<params.len()
+        if floating_value(params.at(i).1)
+            a.fault(home, at, general_regs_refusal(s"$who takes '${params.at(i).0}' as " +
+                s"'${type_show(params.at(i).1)}'"))
+            return
+        end if
+
+    if floating_value(result)
+        a.fault(home, at, general_regs_refusal(s"$who returns '${type_show(result)}'"))
+        return
+    end if
+
+    var found: Buf[TExpr] = buf()
+    val sink = &found
+
+    val walk = expr_walk(false, (e) -> note_floating(sink, e))
+
+    walk_stmts(stmts, walk)
+
+    if tail.is_some() then walk_texpr(tail.unwrap(), walk)
+
+    if found.is_empty() then return
+
+    val e = found.at(0)
+
+    a.fault(home, e.span, general_regs_refusal(s"$who computes with '${type_show(texpr_type(e))}' here"))
+end float_use_in
+
+// The first floating expression a walk meets, kept; the rest are inside it or later.
+private note_floating(sink: *Buf[TExpr], e: TExpr)
+    if sink.is_empty() && floating_value(texpr_type(e)) then sink.push(e)
+
+// Whether a value of `t` lives in a floating-point register: a float, or a vector of them.
+floating_value(t: Type) -> bool = op_subject(t) match
+    Floating(_, _) -> true
+    _ -> false
+
+private general_regs_refusal(what: string) -> string =
+    s"$what, and this build keeps to the general-purpose registers ('codegen.general_regs_only' in " +
+    "package.hocon, or '--general-regs-only') — a floating-point value has no register to live in. " +
+    "Compute in integers or fixed point, or build without the setting"
+
+// -- the data layout under `strict_align` -----------------------------------------------------------
+
+// The text clang is handed, carrying the target's data layout where the build is strict about
+// alignment, and as it was otherwise.
+//
+// **The sysl text names no `target datalayout`, so LLVM parses it under its DEFAULT layout**, in which
+// a 64-bit integer is aligned to four bytes -- and an access the text writes without an `align` is
+// given the parsed layout's answer then and there. Where unaligned access is allowed that costs
+// nothing; under `strict_align` it splits every 64-bit load and store the text wrote into two 32-bit
+// ones, which is wrong for a device register and turned a `[64]u64` copy into 128 word loads and a
+// spilled frame. So the layout is asked of the very clang that will compile the text, once per
+// process and machine, and laid in front of it.
+laid_out(cc: string, t: Target, ir: string) -> string
+    if !cf_strict_align then return ir
+
+    val line = clang_layout(cc, t)
+
+    if line == "" then ir else line + "\n" + ir
+end laid_out
+
+private var cf_layouts: Buf[(string, string, string)] = buf()
+
+// clang's `target datalayout = "..."` line for `t`, or `""` where it gave none.
+clang_layout(cc: string, t: Target) -> string
+    for i in 0..<cf_layouts.len()
+        val row = cf_layouts.at(i)
+
+        if row.0 == cc && row.1 == t.triple then return row.2
+
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${t.triple}")
+
+    val machine = machine_flags(t)
+
+    for i in 0..<machine.len()
+        args.push(machine.at(i))
+
+    args.push("-S")
+    args.push("-emit-llvm")
+    args.push("-x")
+    args.push("c")
+    args.push("/dev/null")
+    args.push("-o")
+    args.push("-")
+
+    var found = ""
+
+    capture(cc, args.view()) match
+        Err(_) -> ()
+        Ok(out) ->
+            val text = out.text
+            var start: usize = 0
+
+            for i in 0..<text.bytes.len
+                if text.bytes[i] == u8('\n')
+                    val one = text[start..<i]
+
+                    if one.starts_with("target datalayout = ") then found = one
+
+                    start = i + 1
+
+    cf_layouts.push((cc, t.triple, found))
+    found
+end clang_layout

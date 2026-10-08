@@ -498,6 +498,12 @@ function_attributes(t: Target, flags: Buf[string] = extra_cflags()) -> Buf[strin
     for i in 0..<sanitizers.len()
         out.push(sanitizers.at(i))
 
+    // What the project's `codegen` block keeps the code away from, where the machine's features are
+    // its processor's to begin with (`codegen_feature_attribute`).
+    codegen_feature_attribute(t) match
+        Some(a) -> out.push(a)
+        None -> ()
+
     out
 end function_attributes
 
@@ -642,7 +648,21 @@ end link_command
 // `soft`+`none`, `softfp`+its unit, or `hard`+its unit -- and none of the three is left for a
 // default to decide. It is Arm's flag because Arm is where the triple is silent: RISC-V says it in
 // the triple, so `riscv32-unknown-elf` has no F extension to turn off and nothing is passed.
+//
+// **And the project's `codegen` settings** (`codegen_features.sysl`), which are a statement about the
+// machine the image runs on in the same sense: `-mgeneral-regs-only`, `-mstrict-align`.
 machine_flags(t: Target) -> Buf[string]
+    var out = unit_flags(t)
+    val features = codegen_feature_flags(t)
+
+    for i in 0..<features.len()
+        out.push(features.at(i))
+
+    out
+end machine_flags
+
+// The floating-point unit and its convention, said outright on a Thumb row.
+private unit_flags(t: Target) -> Buf[string]
     var out: Buf[string] = buf()
 
     if t.cpu != Thumb then return out
@@ -658,7 +678,7 @@ machine_flags(t: Target) -> Buf[string]
     out.push(if t.soft_float then "-mfloat-abi=softfp" else "-mfloat-abi=hard")
     out.push(s"-mfpu=${t.fpu}")
     out
-end machine_flags
+end unit_flags
 
 // What a package's carried C is compiled with **because of the machine**: the unit and its
 // convention, the Arm embedded ABI's narrow enums where the row follows it, and position-independent
@@ -685,7 +705,13 @@ end c_target_flags
 // **None of it applies to `wasm32-wasi`**, which is the same processor with a libc under it: wasi-libc
 // supplies the `_start` a runtime calls. The condition is therefore the operating system and not the
 // processor.
+//
+// **Every other freestanding target links a bare ELF image** (`image_link.sysl`): `-nostdlib`, `ld.lld`
+// by path rather than the host's `ld`, and the linker script and entry the root manifest's block for
+// the machine names.
 linker_flags(t: Target) -> Buf[string]
+    if links_an_image(t) then return image_link_flags()
+
     var out: Buf[string] = buf()
 
     if t.cpu == Wasm32 && t.os == Freestanding
@@ -777,7 +803,7 @@ compile_object(cc: string, ir: string, obj: string, target: Target,
                level: string, piped: bool = true) -> Result[unit, string]
     val ll = s"$obj.ll"
 
-    write_text(ll, in_coro_dialect(cc, for_clang(ir, target))) match
+    write_text(ll, laid_out(cc, target, in_coro_dialect(cc, for_clang(ir, target)))) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 
@@ -940,7 +966,7 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
 
     val ll = s"$exe.ll"
 
-    write_text(ll, in_coro_dialect(cc, for_clang(ir, target))) match
+    write_text(ll, laid_out(cc, target, in_coro_dialect(cc, for_clang(ir, target)))) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 

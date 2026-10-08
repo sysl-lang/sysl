@@ -499,22 +499,103 @@ tfx_a_public_test_declaration_shadows_nothing()
     assert_eq(tfx_ran(tfx_tree([("main.sysl", tfx_use()), ("m/a.sysl", tfx_ordinary_pick()),
                                 ("m/b.sysl", "module m\n@tests\n\npick(s: string) -> string = s")])), "3\n")
 
-// -- an 'impl' block may not sit in one --------------------------------------------------------------
+// -- an 'impl' block sits in one only for a type the file declares ---------------------------------
 
-@test("because a test build would keep it and every other build would drop it")
-tfx_an_impl_may_not_sit_in_one()
-    if !tfx_ready() then return
+private tfx_scale() -> string =
+    "module m\n\ntrait Scale\n    scale(self, k: int) -> int\n\n    twice(self) -> int = self.scale(2)\n\n" +
+    "struct P\n    n: int\n\nscaled(s: &Scale, k: int) -> int = s.scale(k)\n"
 
-    val root = tfx_tree([("main.sysl", "import m.*\nprint(1)"),
-                         ("m/m.sysl", "module m\n\ntrait Scale\n    scale(self, k: int) -> int\n\nstruct P\n    n: int"),
-                         ("m/tests.sysl", "module m\n@tests\n\nimpl Scale for P\n    scale(self, k: int) -> int = self.n * k\n")])
+// The refusal, its reason, where it points and the line it quotes.
+private tfx_impl_refused(root: string, reason: string, line: int, text: string) -> bool
     val (code, out) = tfx_cli("build", root)
 
-    assert_eq(code, 1, out)
-    assert(tfx_says(out, "an 'impl' block may not sit in a file that said '@tests' — a test build would " +
-                    "keep it and every other build would drop it, so a trait would answer one way while " +
-                    "the tests ran and another way in the program that ships. It belongs beside the type",
-                    s"$root/m/tests.sysl:4:1", "4 | impl Scale for P"), out)
+    code == 1 && tfx_says(out, s"an 'impl' block in a file that said '@tests' has to be for a type " +
+                          s"that file declares, and $reason — a test build would keep this block and " +
+                          "every other build would drop it, so a trait would answer one way while the " +
+                          "tests ran and another way in the program that ships. Write the block beside " +
+                          "the type's own declaration, or declare a type for the tests in this file",
+                          s"$root/m/tests.sysl:$line:1", s"$line | $text")
+end tfx_impl_refused
+
+@test("a type the file declares may implement the module's trait, and is used through it")
+tfx_an_impl_for_a_type_the_file_declares()
+    if !tfx_ready() then return
+
+    val (names, code) = tfx_tested(tfx_tree([
+        ("main.sysl", "import m.*\nprint(1)"), ("m/m.sysl", tfx_scale()),
+        ("m/tests.sysl", "module m\n@tests\n\nprivate struct Probe\n    n: int\n\n    halved(self) -> int = self.n / 2\n\n" +
+                         "impl Scale for Probe\n    scale(self, k: int) -> int = self.n * k\n\n" +
+                         "@test\nprobe_answers_through_the_trait()\n    val s: &Scale = Probe(4)\n\n" +
+                         "    assert(scaled(s, 3) == 12)\n    assert(s.twice() == 8)\n" +
+                         "    assert(Probe(4).halved() == 2)\n")]))
+
+    assert_eq(names, "probe_answers_through_the_trait")
+    assert_eq(code, 0)
+
+@test("and so may a generic one, and a trait the file declares too")
+tfx_a_generic_test_type_and_a_test_trait()
+    if !tfx_ready() then return
+
+    val (names, code) = tfx_tested(tfx_tree([
+        ("main.sysl", "import m.*\nprint(1)"), ("m/m.sysl", tfx_scale()),
+        ("m/tests.sysl", "module m\n@tests\n\nstruct Boxed[T]\n    v: T\n\ntrait Label\n    label(self) -> string\n\n" +
+                         "impl[T] Scale for Boxed[T]\n    scale(self, k: int) -> int = k + 1\n\n" +
+                         "impl[T] Label for Boxed[T]\n    label(self) -> string = \"boxed\"\n\n" +
+                         "@test\nboxed_answers()\n    assert(Boxed(7).scale(2) == 3)\n" +
+                         "    assert(Boxed(7).label() == \"boxed\")\n")]))
+
+    assert_eq(names, "boxed_answers")
+    assert_eq(code, 0)
+
+@test("a program built beside such a file never sees the type or its 'impl'")
+tfx_the_program_drops_the_test_types_impl()
+    if !tfx_ready() then return
+
+    assert_eq(tfx_ran(tfx_tree([("main.sysl", "import m.*\nval s: &Scale = P(5)\nprint(scaled(s, 2))"),
+                                ("m/m.sysl", tfx_scale() + "\nimpl Scale for P\n    scale(self, k: int) -> int = self.n * k\n"),
+                                ("m/tests.sysl", "module m\n@tests\n\nstruct Probe\n    n: int\n\n" +
+                                                 "impl Scale for Probe\n    scale(self, k: int) -> int = 0\n")])),
+              "10\n")
+
+@test("an 'impl' for a type another file declares is still refused")
+tfx_an_impl_for_a_type_from_elsewhere()
+    if !tfx_ready() then return
+
+    assert(tfx_impl_refused(tfx_tree([("main.sysl", "import m.*\nprint(1)"), ("m/m.sysl", tfx_scale()),
+                                      ("m/tests.sysl", "module m\n@tests\n\nimpl Scale for P\n" +
+                                                       "    scale(self, k: int) -> int = self.n * k\n")]),
+                            "'P' is not declared in it", 4, "impl Scale for P"))
+
+@test("and one for a builtin")
+tfx_an_impl_for_a_builtin()
+    if !tfx_ready() then return
+
+    assert(tfx_impl_refused(tfx_tree([("main.sysl", "import m.*\nprint(1)"), ("m/m.sysl", tfx_scale()),
+                                      ("m/tests.sysl", "module m\n@tests\n\nimpl Scale for int\n" +
+                                                       "    scale(self, k: int) -> int = self * k\n")]),
+                            "'int' is not declared in it", 4, "impl Scale for int"))
+
+@test("and a blanket one, whose parameter stands for every type")
+tfx_a_blanket_impl()
+    if !tfx_ready() then return
+
+    assert(tfx_impl_refused(tfx_tree([("main.sysl", "import m.*\nprint(1)"), ("m/m.sysl", tfx_scale()),
+                                      ("m/tests.sysl", "module m\n@tests\n\nimpl[T] Scale for T\n" +
+                                                       "    scale(self, k: int) -> int = k\n")]),
+                            "'T' is a parameter of the block, which stands for every type at once", 4,
+                            "impl[T] Scale for T"))
+
+// The same file is the one that declares the type, not any file that said '@tests': each is its own
+// piece of scaffolding, and which of them a build keeps is decided file by file.
+@test("and one for a type a different '@tests' file of the module declares")
+tfx_an_impl_for_another_test_files_type()
+    if !tfx_ready() then return
+
+    assert(tfx_impl_refused(tfx_tree([("main.sysl", "import m.*\nprint(1)"), ("m/m.sysl", tfx_scale()),
+                                      ("m/fixtures.sysl", "module m\n@tests\n\nstruct Q\n    n: int\n"),
+                                      ("m/tests.sysl", "module m\n@tests\n\nimpl Scale for Q\n" +
+                                                       "    scale(self, k: int) -> int = self.n * k\n")]),
+                            "'Q' is not declared in it", 4, "impl Scale for Q"))
 
 // -- a library ships none of it ----------------------------------------------------------------------
 

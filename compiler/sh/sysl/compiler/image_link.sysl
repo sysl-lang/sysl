@@ -1,0 +1,299 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{split, Search}
+import sysl.fs.is_file
+import sysl.env.{get as env_var}
+
+// **How a freestanding image is linked**: by which linker, laid out by which script, starting at
+// which symbol. A kernel or a board's firmware is an ELF image a loader never reads -- QEMU or a
+// debug probe puts it at the address its script names and jumps to its entry -- so the three
+// questions a hosted program leaves to the platform are the project's to answer, and its
+// `package.hocon` is where it answers them, in the block for the machine they are about:
+//
+//     targets {
+//       aarch64-freestanding {
+//         linker        = "ld.lld"        // the default; a name looked up, or a path
+//         linker_script = "link.ld"       // relative to package.hocon
+//         entry         = "_start"
+//       }
+//     }
+//
+// **A freestanding target never reaches the host's linker, keys or none.** The driver's own choice
+// for a bare ELF triple is whatever `ld` the host has, which on a Mac is Apple's: it refuses every
+// GNU option the driver hands it (`-Bstatic -EL --gc-sections`), and taught to use lld instead it
+// opens `crt0.o`, `libclang_rt.builtins.a` and `-lc`, none of which a bare machine has. So such a
+// link is always `-nostdlib` through `ld.lld`; a library is on the line only where a `@link`
+// directive or a `pkg_config` block named it.
+
+// What one `targets.<name>` block says about the image. Each is `""` where the block says nothing.
+struct ImageLink
+    // The block's name, which is the machine's.
+    target: string
+
+    // The program that links the image, as written: a name looked up beside the clang and then on
+    // the PATH, or a path, relative to the manifest where it is not absolute.
+    linker: string
+
+    // The linker script, as written, relative to the manifest where it is not absolute.
+    script: string
+
+    // The symbol the image starts at.
+    entry: string
+end ImageLink
+
+// The three keys, as a target block spells them, in the order a refusal names the first one set.
+val ImageKeys: []const string = ["linker", "linker_script", "entry"]
+
+// The linker a freestanding image is linked by where the manifest names none.
+val DefaultImageLinker: string = "ld.lld"
+
+// What one target block says about the image, or `None` where it names none of the three.
+//
+// **Each value is a string, and a non-empty one**: a script path or a symbol written as a number, a
+// block or a list is a mistake about the key, and it is refused here, naming the key, rather than
+// arriving from inside the linker with nothing pointing at the manifest.
+read_image(entry: &Conf, target: string) -> Result[Option[ImageLink], string]
+    val linker = image_value(entry, target, "linker")?
+    val script = image_value(entry, target, "linker_script")?
+    val start = image_value(entry, target, "entry")?
+
+    if linker == "" && script == "" && start == "" then return Ok(None)
+
+    for i in 0..<start.bytes.len
+        val b = start.bytes[i]
+
+        if b == u8(' ') || b == u8('\t') || b == u8(',') || b == u8('=')
+            return Err(s"'targets.$target.entry = \"$start\"' is not a symbol a linker can start " +
+                "an image at — it names one symbol, with no space, comma or '=' in it")
+
+    Ok(Some(ImageLink(target, linker, script, start)))
+end read_image
+
+// One key's string, or `""` where the block does not set it.
+private image_value(entry: &Conf, target: string, key: string) -> Result[string, string]
+    val value = conf_at(entry, key) match
+        None -> return Ok("")
+        Some(v) -> v
+
+    val text = *value match
+        Text(s) -> s
+        Word(s) -> if conf_is_prose(value) then s else ""
+        _ -> ""
+
+    if text != "" then return Ok(text)
+
+    Err(s"'targets.$target.$key' ${image_key_says(key)}, so it is a non-empty string — not a " +
+        "number, a block or a list")
+end image_value
+
+private image_key_says(key: string) -> string
+    if key == "linker" then return "names the program that links this target's image, 'ld.lld' or a path to one"
+
+    if key == "linker_script"
+        return "names the linker script this target's image is laid out by, as a path relative to " +
+            "package.hocon"
+
+    "names the symbol this target's image starts at"
+end image_key_says
+
+// The first of the three keys a block sets, for a refusal to name.
+image_first_key(img: ImageLink) -> string
+    if img.linker != "" then return "linker"
+    if img.script != "" then return "linker_script"
+
+    "entry"
+end image_first_key
+
+// What the manifest says about the image of the machine of this name.
+image_for(m: &Manifest, target: string) -> Option[ImageLink]
+    for i in 0..<m.images.len()
+        if m.images.at(i).target == target then return Some(m.images.at(i))
+
+    None
+end image_for
+
+// Whether a target's program is a bare ELF image, linked by `ld.lld` with nothing of the host's: a
+// freestanding machine clang builds for, WebAssembly aside -- `wasm-ld` is not a variation on `ld`
+// and has no script, and `linker_flags` already says what a bare wasm link needs.
+links_an_image(t: Target) -> bool = t.os == Freestanding && t.cpu != Wasm32 && t.builds_with_clang()
+
+// A path the manifest wrote, as the link is handed it: relative to the manifest's directory.
+image_path(root: string, written: string) -> string =
+    if written.starts_with("/") then written else absolute_path(join_path(root, written))
+
+// **What the root manifest's image keys are refused for**, asked by `target_for`, the funnel every
+// building command comes through, before anything is read:
+//
+// - **in a dependency**, whatever the target: how an image is linked is the program's to say, and a
+//   library's script would be laid over a program it never saw;
+// - **on a machine that is not a bare image** -- a hosted target, linked by the platform's own linker
+//   and started at `main` by its C runtime, or WebAssembly;
+// - **a script, or a linker named by path, that is not there** -- said here, naming the key and the
+//   file it looked for, rather than by the linker after a whole compile.
+//
+// Only the block for the machine being built is held to the second and third: a project building a
+// kernel for one machine and its tests for the host carries both blocks, and the host's build is not
+// about the kernel's image.
+image_refusal(root: string, m: Manifest, t: Target) -> Option[string]
+    val trees = handed_trees(root, m)
+
+    for i in 0..<trees.len()
+        manifest_at(trees.at(i).dir) match
+            Err(_) -> ()
+            Ok(theirs) ->
+                if !theirs.images.is_empty()
+                    val said = theirs.images.at(0)
+
+                    return Some(s"'${trees.at(i).who}' sets 'targets.${said.target}." +
+                        s"${image_first_key(said)}' in its package.hocon, and how an image is linked " +
+                        "is the program's own to say — a dependency's linker, script or entry would " +
+                        "be laid over a program it never saw. Only the root project's package.hocon " +
+                        "may name them")
+
+    val img = image_for(m, t.name) match
+        None -> return None
+        Some(found) -> found
+
+    val key = image_first_key(img)
+
+    if !links_an_image(t)
+        var what = "not one this compiler links an image for"
+
+        if t.cpu == Wasm32
+            what = "a WebAssembly target, linked by wasm-ld with no script and started at 'main'"
+        else if os_hosted(t.os)
+            what = "hosted — its program is linked by the platform's own linker and started at " +
+                "'main' by its C runtime"
+
+        return Some(s"'targets.${t.name}.$key' says how a freestanding image is linked, and " +
+            s"'${t.name}' is $what. Remove the key, or build for a freestanding target")
+    end if
+
+    if img.script != ""
+        val at = image_path(root, img.script)
+
+        if !is_file(at)
+            return Some(s"'targets.${t.name}.linker_script' names '${img.script}', and there is " +
+                s"no such file at '$at'")
+
+    if img.linker.contains("/")
+        val at = image_path(root, img.linker)
+
+        if !is_file(at)
+            return Some(s"'targets.${t.name}.linker' names '${img.linker}', and there is no such " +
+                s"file at '$at'")
+
+    None
+end image_refusal
+
+// The linker an image is linked by: the one the key named, or `ld.lld` -- a name looked for beside
+// the clang the build drives and then along the PATH, a path taken as it stands.
+find_image_linker(img: Option[ImageLink], root: string, t: Target,
+                  cc: string) -> Result[string, string]
+    val named = img match
+        Some(i) -> i.linker
+        None -> ""
+
+    val wanted = if named == "" then DefaultImageLinker else named
+
+    if wanted.contains("/") then return Ok(image_path(root, wanted))
+
+    var tried: Buf[string] = buf()
+
+    if cc.contains("/") then tried.push(join_path(parent_of(cc).unwrap_or("."), wanted))
+
+    val dirs = split(env_var("PATH").unwrap_or(""), ":")
+
+    for i in 0..<dirs.len
+        if dirs[i] != "" then tried.push(join_path(dirs[i], wanted))
+
+    for i in 0..<tried.len()
+        if is_file(tried.at(i)) then return Ok(tried.at(i))
+
+    var whose = s"'targets.${t.name}.linker' names '$wanted'"
+
+    if named == "" then whose = s"a freestanding image for '${t.name}' is linked by '$wanted'"
+
+    Err(s"$whose, and there is none beside '$cc' or on the PATH — install LLVM's lld, or name the " +
+        s"linker's path with 'targets.${t.name}.linker' in package.hocon")
+end find_image_linker
+
+// **The image a `sysl build` links, settled for the one link that is about to run** and put back
+// after it (`settle_image("", "", "")`), so a later command in the same process links as it would
+// have. Read by `linker_flags`; a link nothing settled -- a test build, `run` -- still never reaches
+// the host's linker, taking `ld.lld` by name for the driver to find.
+private var image_linker: string = ""
+private var image_script: string = ""
+private var image_entry: string = ""
+
+settle_image(linker: string, script: string, entry: string)
+    image_linker = linker
+    image_script = script
+    image_entry = entry
+end settle_image
+
+// What a bare image's link line carries: no start files, no libc and no compiler runtime; the
+// linker, by path; the script; and the entry, required to be defined. **`--entry` alone only warns**
+// when nothing defines the symbol, and links an image that starts at address zero; lld has no
+// `--require-defined`, so the entry is also the value of an absolute symbol, `__sysl_entry`, and a
+// `--defsym` naming a symbol nothing defines is an error.
+image_link_flags() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    val linker = if image_linker == "" then DefaultImageLinker else image_linker
+
+    out.push("-nostdlib")
+    out.push(s"--ld-path=$linker")
+
+    if image_script != ""
+        out.push("-T")
+        out.push(image_script)
+
+    if image_entry != ""
+        out.push(s"-Wl,--entry=$image_entry")
+        out.push(s"-Wl,--defsym=__sysl_entry=$image_entry")
+
+    out
+end image_link_flags
+
+// The entry the settled link names, which is what a failed link's refusal is read against.
+settled_image_entry() -> string = image_entry
+
+// **Whether a program for this machine gets a `main`.** It does -- the computed `val`s, the entry
+// file's statements and a declared `main` all run from it -- unless all three hold:
+//
+// - the program is a bare image (`links_an_image`);
+// - the root manifest's block for the machine names an `entry` other than `main`;
+// - there is nothing for a `main` to do: no top-level statement, no declared `main`, and no module
+//   storage filled at run time.
+//
+// Then nothing would call it and nothing is in it, and an image carrying it is an unused function
+// in the one kind of program that counts its bytes. **Where there is something to do, `main` is
+// emitted whatever the entry is**, and it is the entry's to call -- a `_start` that sets the stack up
+// and branches to `main` is the ordinary shape of a C runtime's start file.
+image_emits_main(root: string, t: Target, p: TProgram) -> bool
+    if !links_an_image(t) then return true
+
+    val m = manifest_at(root) match
+        Err(_) -> return true
+        Ok(found) -> found
+
+    val img = image_for(m, t.name) match
+        None -> return true
+        Some(found) -> found
+
+    if img.entry == "" || img.entry == "main" then return true
+
+    !p.main.is_empty() || p.entry.is_some() || has_computed_val(p.vals)
+end image_emits_main
+
+// A failed link of an image that named its entry, said in the manifest's terms where the failure is
+// that nothing defines the entry -- lld's line names the symbol and not the key that asked for it.
+image_link_failure(why: string, t: Target, entry: string) -> string
+    if entry == "" || !why.contains(s"symbol not found: $entry") then return why
+
+    s"'targets.${t.name}.entry' names '$entry', and nothing the program links defines it — the " +
+        s"image would have nowhere to start. Define it (an '@export(\"$entry\")' function, or a " +
+        s"root-module function of that name), or name the symbol that starts the image.\n$why"
+end image_link_failure

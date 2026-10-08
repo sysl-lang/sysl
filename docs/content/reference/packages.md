@@ -486,6 +486,144 @@ no location string reaches the module at all. `--no-bounds-locations` on the com
 same for one build. The key is `true` or `false` and nothing else, and anything else is refused when
 the file is read.
 
+## Linking a freestanding image
+
+A kernel, or a board's firmware, is an ELF image nothing loads: an emulator or a debug probe puts it
+at the address its linker script names and jumps to its entry. The three questions a hosted program
+leaves to the platform — which linker, what layout, where it starts — are the project's, and it
+answers them in the block for the machine they are about:
+
+```hocon
+package { name = "keel", version = "0.0.1" }
+
+targets {
+  aarch64-freestanding {
+    linker_script = "link.ld"
+    entry         = "_start"
+  }
+}
+```
+
+With that, `sysl build --target aarch64-freestanding -o keel.elf .` is the whole build — no archive
+to link by hand and no flags in the environment.
+
+| key | says | default |
+|---|---|---|
+| `linker` | the program that links the image: a name, looked for beside the clang the build drives and then on the `PATH`, or a path relative to `package.hocon` | `ld.lld` |
+| `linker_script` | the script the image is laid out by, relative to `package.hocon`; handed over as `-T <script>` | none — the linker's own layout |
+| `entry` | the symbol the image starts at; handed over as `--entry`, and required to be defined | none — the script's `ENTRY`, if it has one |
+
+**A freestanding target never reaches the host's linker, whether or not the block says anything.**
+Its image is linked with `-nostdlib` through `ld.lld` (or the `linker` named), so no start file, no
+libc and no compiler runtime is on the line; a library is there only because a `@link` directive or a
+`pkg_config` block named it. WebAssembly is the exception and keeps its own link: `wasm-ld` has no
+script, and a module starts at `main`.
+
+### When the image has a `main`
+
+A program's `main` is where its computed module storage is filled, its top-level statements run and
+a declared `main` is called. **A freestanding image gets no `main` exactly when its block names an
+`entry` other than `main` and there is nothing for one to do** — no top-level statement, no declared
+`main`, and no module `val` computed at run time. A kernel whose entry is an assembly `_start` and
+whose code is all functions links with nothing it never calls.
+
+Where there *is* something to do, `main` is emitted whatever the entry is, and calling it is the
+entry's job — a `_start` that sets the stack up and branches to `main` is the ordinary shape of a C
+runtime's start file.
+
+### What is refused
+
+- **The keys in a dependency.** How an image is linked is the program's own to say; a library's
+  script would be laid over a program it never saw. Only the root project's `package.hocon` may name
+  them, and a dependency or `--lib` root that does is refused, naming the package and the key.
+- **The keys for a hosted target, or WebAssembly**, when that is the machine being built — a hosted
+  program is linked by the platform's own linker and started at `main` by its C runtime. A block for a
+  machine the build is not for is not consulted, so a kernel can keep its image block beside a host
+  target it runs its tests on.
+- **A script, or a linker named by path, that is not there** — refused before anything is compiled,
+  naming the key and the file it looked for.
+- **An entry nothing defines.** `--entry` alone only warns and links an image that starts at address
+  zero, so the symbol is required as well; the refusal names `targets.<machine>.entry` above the
+  linker's own line.
+- **A value that is not a non-empty string**, and an `entry` holding a space, a comma or `=`, when the
+  file is read.
+## What the generated code may use of the machine
+
+A kernel wants two things a program does not: code that never touches the floating-point and SIMD
+registers — so exception entry and a context switch need not save that file, and code that runs before
+the unit is switched on cannot trap on it — and code whose every access is aligned, since with the MMU
+off all memory is Device memory and an unaligned access faults. The `codegen` block says so:
+
+```hocon
+codegen {
+  general_regs_only = true
+  strict_align      = true
+}
+```
+
+They are clang's `-mgeneral-regs-only` and `-mstrict-align`, and they reach **every** place code is
+generated for the build: the LLVM text's function attributes (`emit-llvm` shows
+`"target-features"="+strict-align,-fp-armv8,-neon"` on aarch64), every clang that compiles that text,
+a package's carried C and a `c const` probe, and the standard module, which is compiled under the same
+settings and kept in a cache directory of its own (its name ends `-gro`, `-sa` or `-gro-sa`).
+`--general-regs-only` and `--strict-align` turn a setting on for one build; nothing on the command
+line turns one off.
+
+The block may also be written inside a [`targets`](#capabilities) entry, where it layers over the
+project's as `capabilities` does — useful when the same tree is tested on the host and built for a
+board:
+
+```hocon
+targets {
+  aarch64-freestanding {
+    codegen {
+      general_regs_only = true
+      strict_align      = true
+    }
+  }
+}
+```
+
+### Only the root project's block applies
+
+What registers an image may touch is a property of the whole image, so a dependency cannot turn them
+back on under its consumer, and its own `codegen` block is ignored, as its `optimization` is.
+
+### What each machine does with it
+
+| | `general_regs_only` | `strict_align` |
+|---|---|---|
+| aarch64 (every system) | no FP/SIMD register: `-fp-armv8,-neon` | `+strict-align` |
+| x86_64 | no x87, MMX or SSE register | refused — x86 has no strict mode |
+| Thumb | refused — build for a row with no unit | `-mno-unaligned-access` |
+| RISC-V | refused — the F and D extensions are the triple's ABI | `-mstrict-align` |
+| wasm32 | refused | refused |
+
+A setting a machine has no meaning for is **refused**, before anything is built, rather than
+dropped. On Thumb the floating-point unit is part of the calling convention the row names, so turning
+it off is a different machine — and the registry has it: `thumb-freestanding-soft` and
+`thumbv6m-freestanding` already never touch a floating-point register.
+
+### A float under `general_regs_only` is refused
+
+With the unit's features off, LLVM does not complain: it quietly moves every float to the soft-float
+convention, a multiply becomes a call to `__muldf3`, and the image fails to link or links against code
+built for the other convention. So the compiler refuses instead, once per function, at its signature
+where a parameter or the result is a float and otherwise at the first floating expression in its body:
+
+```text
+error: 'scale' computes with 'real' here, and this build keeps to the general-purpose registers
+('codegen.general_regs_only' in package.hocon, or '--general-regs-only') — a floating-point value has
+no register to live in. Compute in integers or fixed point, or build without the setting
+ --> main.sysl:3:13
+  |
+3 |     val x = real(n) * 1.5
+  |             ^^^^^^^^^^^^^
+```
+
+Every function the build emits is asked, the standard module's included. A struct that merely holds a
+float and is copied whole is not a float use; reading the field out is.
+
 ## Capabilities
 
 **Whether the machine has a heap, an operating system or POSIX is a project engineering
@@ -1161,6 +1299,44 @@ names who asked for it:
 this project asks 'helper' for the feature 'fancy', which 'helper' does not declare — a consumer
 may only ask for a feature that package's own manifest names, and it declares none
 ```
+
+### A feature may turn on a feature of a dependency
+
+A dependency entry's `features` is asked for whatever this package's own features are; a member of a
+feature's list written **`"<dependency>/<feature>"`** asks only while that feature is on. It turns on
+`<feature>` of the dependency this manifest labels `<dependency>`, and turns the dependency itself on
+too where it is `optional`:
+
+```hocon
+dependencies {
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.1", optional = true }
+}
+
+features {
+  default = [async]
+  async   = ["kairos/uv"]
+}
+```
+
+A build with `default` on takes `kairos` with its `uv` feature; one with `--no-default-features`
+takes neither. The quotes are required, as they are for `"dep:"`. The request joins every other one
+made of that package — the entries' `features` and other members alike — and the union is what the
+package gets.
+
+The first half has to be a dependency this manifest declares in `dependencies`, which is checked when
+the file is read. **A `dev_dependencies` entry is refused**: a feature is read by every build of the
+package, and a dev dependency is resolved only by `sysl test` on the package itself, so every other
+build would be naming a package it does not have. The second half is checked once the dependency's
+own manifest is read, and the refusal lists what it offers:
+
+```
+the feature 'async' of this project names 'kairos/uvx', but 'github.com.sysl-lang.kairos' declares
+no feature 'uvx' — a '<dependency>/<feature>' member may only name a feature that package's own
+manifest names. It declares 'uv'
+```
+
+Cargo's weak form, `"kairos?/uv"` — the feature only if something else turned the dependency on — is
+not supported, and is refused saying so.
 
 ### Every request is added together, and a feature only ever adds
 

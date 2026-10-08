@@ -1,0 +1,164 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Whole reports, byte for byte, for the places a refusal is anchored that once differed from the
+// reference: an attribute's own line, the second of two changes to one field, and a complaint about
+// the program as a whole, which has no place in it.
+//
+// **Every expected report was read out of 0.0.162's `sysl build` on the same file**, its standard
+// error quoted whole -- the `-->` line, the quoted source and the caret, or their absence. A report
+// ends at its last caret: the CLI's own newline is the only one after it, with no blank line.
+
+private var spl_library_cache: Buf[Program] = buf()
+private var spl_library_read: bool = false
+
+private spl_library() -> Buf[Program]
+    if spl_library_read then return spl_library_cache
+
+    spl_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> spl_library_cache = units
+
+    spl_library_cache
+end spl_library
+
+private spl_no_library() -> bool
+    if spl_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end spl_no_library
+
+// The whole report `sysl build <name>` prints for one source, once every check has run.
+private spl_report(name: string, text: string) -> string
+    val parsed = parse(source_of(name, text))
+
+    if !parsed.ok() then return parse_report(parsed)
+
+    var units: Buf[Program] = buf()
+    val library = spl_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    post_analysis_checks(done.an, program_of(done, ""), buf())
+    analysis_report(errors_of(done.an.diagnostics()))
+end spl_report
+
+@test("two exports claiming one C name are refused with no position, the collision being in the header")
+spl_the_names_refusal_has_no_position()
+    if spl_no_library() then return
+
+    assert_eq(spl_report("nm.sysl", "@export(\"Point\")\nstruct Point\n    x: i32\n    y: i32\n\n" +
+                                    "@export(\"Point\")\ntakes(p: Point) -> i32 = p.x\n"),
+              "error: 'Point' is the C name of the function 'takes' and the type 'Point' — a header " +
+              "declares both in one namespace, so a C project including it would see the name twice. " +
+              "Give each the name it should carry, '@export(\"...\")'")
+
+@test("and a refusal with no position still ends at its message, with nothing after it")
+spl_an_unplaced_refusal_ends_at_its_message()
+    if spl_no_library() then return
+
+    val said = spl_report("nm.sysl", "struct Point\n    x: i32\n\n@export(\"Point\")\n" +
+                                     "takes(p: Point) -> i32 = p.x\n")
+
+    assert_eq(said.ends_with("'@export(\"...\")'"), true)
+    assert_eq(said.index_of("-->").is_none(), true)
+
+@test("'@tailrec' that is never a tail call is refused at the annotation's own line")
+spl_tailrec_anchors_at_the_annotation()
+    if spl_no_library() then return
+
+    assert_eq(spl_report("tr.sysl", "@tailrec\nf(n: int) -> int = if n == 0 then 0 else 1 + f(n - 1)\n" +
+                                    "print(f(3))\n"),
+              "error: 'f' is marked '@tailrec' but calls itself nowhere the jump can replace — a tail " +
+              "call is the last thing the function does, so nothing may wait on its result and no " +
+              "'defer' may be in scope where it stands\n" +
+              " --> tr.sysl:1:1\n" +
+              "  |\n" +
+              "1 | @tailrec\n" +
+              "  | ^^^^^^^^")
+
+@test("a generic '@export' is refused at the annotation, the whole of it underlined")
+spl_generic_export_anchors_at_the_annotation()
+    if spl_no_library() then return
+
+    assert_eq(spl_report("ex.sysl", "@export\nf[T](x: T) -> T = x\nprint(1)\n"),
+              "error: an exported symbol is one function at one signature, so 'f' cannot be generic — " +
+              "there would be no way to say which instantiation the linker holds. Export a wrapper per " +
+              "instantiation, each naming its own symbol\n" +
+              " --> ex.sysl:1:1\n" +
+              "  |\n" +
+              "1 | @export\n" +
+              "  | ^^^^^^^")
+
+@test("an exported signature C cannot spell is refused at the annotation too")
+spl_unspellable_export_anchors_at_the_annotation()
+    if spl_no_library() then return
+
+    assert_eq(spl_report("es.sysl", "@export\nf(s: string) -> int = 1\nprint(1)\n"),
+              "error: 's' of the exported 'f' is string, which C has no way to spell — an exported " +
+              "function takes an integer, a float, a 'bool', a 'char', a pointer, a function pointer, a " +
+              "simple enum, or a struct built out of those. A slice is an address and a length, so C " +
+              "takes them as two parameters — a pointer and a 'usize' — which is the shape its own " +
+              "string and buffer functions already have\n" +
+              " --> es.sysl:1:1\n" +
+              "  |\n" +
+              "1 | @export\n" +
+              "  | ^^^^^^^")
+
+@test("two functions exporting one symbol are refused at the first one's annotation")
+spl_duplicate_export_anchors_at_the_first_annotation()
+    if spl_no_library() then return
+
+    assert_eq(spl_report("ed.sysl", "@export(\"dup\")\nf() -> int = 1\n\n@export(\"dup\")\ng() -> int = 2\n" +
+                                    "print(1)\n"),
+              "error: 'dup' is exported by 'f' and 'g' — one symbol is one definition, and the linker " +
+              "has no way to tell which was meant\n" +
+              " --> ed.sysl:1:1\n" +
+              "  |\n" +
+              "1 | @export(\"dup\")\n" +
+              "  | ^^^^^^^^^^^^^^")
+
+@test("a field changed twice in one 'with' is refused at the second change, across all of it")
+spl_twice_changed_field_underlines_the_second_change()
+    if spl_no_library() then return
+
+    assert_eq(spl_report("tw.sysl", "struct P\n    x: int\nval p = P(1)\nval q = p with { x = 1, x = 2 }\n" +
+                                    "print(q.x)\n"),
+              "error: 'x' is changed twice in one 'with', so the first change is thrown away — write the " +
+              "value it should end with, once\n" +
+              " --> tw.sysl:4:25\n" +
+              "  |\n" +
+              "4 | val q = p with { x = 1, x = 2 }\n" +
+              "  |                         ^^^^^")
+
+@test("two refusals are separated by one blank line, and the report ends at the last caret")
+spl_two_refusals_and_no_trailing_blank_line()
+    if spl_no_library() then return
+
+    assert_eq(spl_report("bad.sysl", "val x: int = \"a\"\nprint(nope)\n"),
+              "error: cannot initialize 'x': declared int but the value is string\n" +
+              " --> bad.sysl:1:1\n" +
+              "  |\n" +
+              "1 | val x: int = \"a\"\n" +
+              "  | ^^^^^^^^^^^^^^^^\n" +
+              "\n" +
+              "error: undefined name 'nope'\n" +
+              " --> bad.sysl:2:7\n" +
+              "  |\n" +
+              "2 | print(nope)\n" +
+              "  |       ^^^^")
