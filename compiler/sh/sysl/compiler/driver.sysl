@@ -1127,7 +1127,7 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
             if is_std then built.push(obj) else members.push(obj)
 
         if is_std
-            val kept = reached_std_objects(archiver, built, ir, t)
+            val kept = reached_std_objects(archiver, built, *members, ir, t)
 
             for j in 0..<kept.len()
                 members.push(kept.at(j))
@@ -1145,7 +1145,7 @@ end build_c_members
 // The standard module's C objects the program can reach (`c_reach.sysl`). Where the symbols of an
 // object cannot be read, every object is kept: an archive with too much in it links, one with too
 // little does not.
-private reached_std_objects(archiver: string, built: Buf[string], ir: string,
+private reached_std_objects(archiver: string, built: Buf[string], others: Buf[string], ir: string,
                             t: Target) -> Buf[string]
     val nm = find_nm(archiver) match
         Some(found) -> found
@@ -1158,7 +1158,18 @@ private reached_std_objects(archiver: string, built: Buf[string], ir: string,
             Err(_) -> return built
             Ok(found) -> symbols.push(found)
 
-    val keep = reached_objects(symbols, ir_globals(ir))
+    // What the program names, and what the C already in the archive (a package's, compiled whole)
+    // leaves undefined: either can be asking for one of these objects.
+    val named = ir_globals(ir)
+
+    for i in 0..<others.len()
+        object_symbols(nm, others.at(i), t.os == MacOS) match
+            Err(_) -> return built
+            Ok(found) ->
+                for j in 0..<found.wanted.len()
+                    named.add(found.wanted.at(j))
+
+    val keep = reached_objects(symbols, named)
     var out: Buf[string] = buf()
 
     for i in 0..<built.len()
