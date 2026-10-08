@@ -1,0 +1,142 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, write_text}
+import sysl.text.{Search, from_utf8_unchecked}
+
+// `sysl tangle`: the program a literate source holds, with the prose stripped.
+//
+// The machinery is `tangle` (`literate.sysl`), which a build has used for as long as the format has
+// existed. What is asserted here is the COMMAND: that what it prints is what the compiler reads, that
+// it reaches a whole tree, and that it refuses what it cannot answer -- and the line correspondence,
+// which is the property worth pinning: prose is blanked rather than removed, so line 100 of the
+// tangle is line 100 of the document, and a diagnostic about the program points into the document.
+
+// What the driver said and answered.
+private tng_said(args: []string) -> (Buf[string], int)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line: string) -> sink.push(line))
+
+    (lines, code)
+
+private tng_split(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var from: usize = 0
+
+    for k in 0..<text.bytes.len
+        if text.bytes[k] == u8('\n')
+            out.push(text[from..<k])
+            from = k + 1
+
+    if from < text.bytes.len then out.push(text[from..<text.bytes.len])
+
+    out
+end tng_split
+
+// The library's own literate module's `vm`, which is on disk where the library is.
+private tng_vm() -> Option[string] = std_root() match
+    Ok(root) -> Some(s"$root/sysl/regex/vm${LiterateExtension}")
+    Err(_) -> None
+
+@test("the prose goes and the program stays")
+tng_prose_goes()
+    val path = tng_vm() match
+        Some(p) -> p
+        None -> return
+
+    val (lines, code) = tng_said(["sysl", "tangle", path])
+
+    assert_eq(code, Fine)
+    assert(!lines.at(0).trim().is_empty())
+    // Whatever the prose said, none of it is program.
+    assert(!lines.at(0).contains("##"))
+
+// The correspondence is what makes the command worth having: a diagnostic about the program points
+// into the document it was written in.
+@test("a line of the program keeps its line number")
+tng_line_keeps_its_number()
+    val text = "Some prose about it.\n\nAnd more.\n\n    print(\"hi\")\n"
+    val program = from_utf8_unchecked(tangle(source_of("tangle.lsysl", text)).unwrap().bytes)
+    val lines = tng_split(program)
+
+    assert_eq(lines.len(), tng_split(text).len())
+    assert_eq(lines.at(4).trim(), "print(\"hi\")")
+
+    for k in 0..<lines.len()
+        if k < 4 then assert(lines.at(k).trim().is_empty())
+
+// The two must not be separately computed: the driver hands over the reader's own output.
+@test("what it prints is what the compiler reads")
+tng_prints_what_the_compiler_reads()
+    val path = tng_vm() match
+        Some(p) -> p
+        None -> return
+
+    val (lines, code) = tng_said(["sysl", "tangle", path])
+    val program = tangle(source_of(path, read_text(path).unwrap())).unwrap()
+
+    assert_eq(code, Fine)
+    assert_eq(lines.at(0).trim(), from_utf8_unchecked(program.bytes).trim())
+
+@test("it writes to a file when it is asked to")
+tng_writes_to_a_file()
+    val path = tng_vm() match
+        Some(p) -> p
+        None -> return
+
+    val out = s"${absolute_path(make_temp_dir("sysl-tangle-").unwrap())}/vm.sysl"
+    val (lines, code) = tng_said(["sysl", "tangle", path, "-o", out])
+
+    assert_eq(code, Fine)
+    assert_eq(lines.at(0), s"wrote $out")
+    assert(read_text(out).unwrap().contains("Thread"))
+
+@test("an ordinary program has nothing to tangle")
+tng_ordinary_program()
+    val dir = absolute_path(make_temp_dir("sysl-tangle-plain-").unwrap())
+
+    write_text(s"$dir/main.sysl", "main() = print(1)\n").unwrap()
+
+    val (lines, code) = tng_said(["sysl", "tangle", dir])
+
+    assert_eq(code, Failed)
+    assert_eq(lines.at(0), s"sysl: error: $dir holds no '.lsysl' files — 'tangle' reads the prose a literate source is written around, and an ordinary sysl program has none")
+
+@test("a file the compiler refuses is not tangled")
+tng_refused_file()
+    assert(tangle(source_of("tangle.lsysl", "Text\n\n\tprint(\"hi\")\n")).is_err())
+
+// The refusal the command prints is the tangle's diagnostic, rendered against the document -- the
+// same text the reference prints, quoted from 0.0.162.
+@test("a refused file is refused by the command, naming the line in the document")
+tng_command_refuses_with_the_diagnostic()
+    val dir = absolute_path(make_temp_dir("sysl-tangle-tab-").unwrap())
+    val path = s"$dir/tab.lsysl"
+
+    write_text(path, "Text\n\n\tprint(\"hi\")\n").unwrap()
+
+    val (lines, code) = tng_said(["sysl", "tangle", path])
+
+    assert_eq(code, Failed)
+    assert_eq(lines.at(0), "sysl: error: error: a tab in the indentation of a literate file — what makes a line program text is four columns of indent, and a tab is as wide as whatever happens to be displaying it, so this line is code in one editor and prose in another\n" +
+        s" --> $path:3:1\n  |\n3 | \tprint(\"hi\")\n  | ^")
+
+// From the reference's IoRefusalTests: an output path under an existing FILE is refused, naming the
+// file -- a status of 1 and the driver's own lead, never a trace. The reference asks it of `weave`
+// too; this compiler has no `weave` yet, so the tangle half is the whole of it here.
+@test("for weave and tangle")
+tng_output_under_a_file_is_refused()
+    val dir = absolute_path(make_temp_dir("sysl-io-").unwrap())
+
+    make_dir_all(s"$dir/p4").unwrap()
+    write_text(s"$dir/p4/main.sysl", "@export(\"f\")\nf() -> int = 1\n").unwrap()
+    make_dir_all(s"$dir/lit").unwrap()
+    write_text(s"$dir/lit/main.lsysl", "# Title\n\n```sysl\nprint(1)\n```\n").unwrap()
+
+    val (lines, code) = tng_said(["sysl", "tangle", s"$dir/lit", "-o", s"$dir/p4/main.sysl/x"])
+
+    assert_eq(code, Failed)
+    assert_eq(lines.at(0), s"sysl: error: cannot write $dir/p4/main.sysl/x: cannot make the directory '$dir/p4/main.sysl': a file is already there, and a directory is needed")

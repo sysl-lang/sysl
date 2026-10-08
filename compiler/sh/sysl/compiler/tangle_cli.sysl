@@ -1,0 +1,164 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.{Diagnostic, Source}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, write_text}
+import sysl.text.{Search, from_utf8_unchecked}
+
+// `sysl tangle`: the half of a literate system that hands back the program, as a command.
+//
+// **It is source-level and stops above everything a compilation needs.** It asks for no target, no
+// standard module and no library, so the tree is read with every per-OS directory in it -- two
+// implementations of one function are two programs worth seeing.
+//
+// **The ordinary `.sysl` files of a tree are passed over rather than refused**, because a directory
+// holding both is the normal shape of a literate module -- `library/sysl/regex` is five `.lsysl`
+// files and its tests are not. What is refused is a tree with no literate source at all.
+
+tangle_usage() -> string = "usage: sysl tangle [-o <path>] <path>"
+
+// `sysl tangle [-o <path>] <path>` -- the program a literate source holds, with the prose stripped.
+//
+// **This is what the compiler reads**, which is the whole of why it is worth a command: when a
+// literate file misbehaves the question is always what tangling produced. Prose is blanked rather
+// than removed, so line 100 of the tangle is line 100 of the document. A tree's programs are joined,
+// being all the same kind of thing.
+tangle_command(args: []string, say: string -> unit) -> int
+    val (path, output) = literate_arguments(args) match
+        Ok(read) -> read
+        Err(said) ->
+            say(if said == "" then tangle_usage() else said)
+            return Misused
+
+    val sources = literate_sources(path, "tangle") match
+        Ok(s) -> s
+        Err(why) ->
+            say(refused(why))
+            return Failed
+
+    var text = ""
+
+    for k in 0..<sources.len()
+        val src = sources.at(k)
+
+        tangle(src) match
+            Ok(program) ->
+                val one = from_utf8_unchecked(program.bytes)
+
+                text = if k == 0 then one else text + "\n" + one
+            Err(d) ->
+                say(refused(literate_diagnostic(src, d)))
+                return Failed
+
+    output match
+        None ->
+            say(literate_unended(text))
+            Fine
+        Some(to) -> literate_write(to, text, say)
+end tangle_command
+
+// What a literate command line asks for: the path, and where `-o` sends the result. `Err` carries
+// what to say -- the empty string where the usage alone says it.
+literate_arguments(args: []string) -> Result[(string, Option[string]), string]
+    var path = ""
+    var output: Option[string] = None
+    var mistakes: Buf[string] = buf()
+    var i: usize = 2
+
+    while i < args.len
+        if args[i] == "-o" || args[i] == "--output"
+            if i + 1 >= args.len then return Err(missing_value(args[i]))
+
+            output = Some(args[i + 1])
+            i += 1
+        else
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken > 0
+                i += taken - 1
+            elif path != ""
+                return Err("")
+            else
+                path = args[i]
+
+        i += 1
+
+    if mistakes.len() > 0 then return Err(misused(mistakes, tangle_usage()))
+
+    if path == "" then return Err("")
+
+    Ok((path, output))
+end literate_arguments
+
+// The literate sources a path holds, or why there is nothing to read.
+literate_sources(path: string, verb: string) -> Result[Buf[Source], string]
+    val found = collect(path, None) match
+        Ok(f) -> f
+        Err(sel) -> return Err(sel.message)
+
+    if found.len() == 0 then return Err(s"$path holds no sysl source files")
+
+    var out: Buf[Source] = buf()
+
+    for k in 0..<found.len()
+        val src = found.at(k).src
+
+        if is_literate(src.name) then out.push(src)
+
+    if out.len() == 0
+        return Err(s"$path holds no '${LiterateExtension}' files — '$verb' reads the prose a " +
+            "literate source is written around, and an ordinary sysl program has none")
+    end if
+
+    Ok(out)
+end literate_sources
+
+// A diagnostic about the document, rendered against the document as it stands -- the tangle's spans
+// are offsets into the file the reader has open -- without the newline that ends it.
+literate_diagnostic(src: Source, d: Diagnostic) -> string = literate_unended(d.render(src, 0))
+
+// What a command produced, written where it was asked for, and said so -- or the reason it could
+// not be.
+literate_write(path: string, text: string, say: string -> unit) -> int
+    parent_of(path) match
+        Some(dir) ->
+            literate_directory(dir) match
+                Some(why) ->
+                    say(refused(s"cannot write $path: $why"))
+                    return Failed
+                None -> ()
+        None -> ()
+
+    write_text(path, text) match
+        Ok(_) ->
+            say(s"wrote $path")
+            Fine
+        Err(e) ->
+            say(refused(s"cannot write $path: ${e.message()}"))
+            Failed
+end literate_write
+
+// Why a directory cannot be made at `dir`, or nothing where it is there or has been made. **A file
+// standing where a directory is needed is named outright** -- the nearest one on the way up -- since
+// the platform's own answer would be a bare "not a directory" about a path the reader never typed.
+literate_directory(dir: string) -> Option[string]
+    var at = dir
+
+    loop
+        if is_directory(at) then break
+
+        if is_file(at)
+            return Some(s"cannot make the directory '$at': a file is already there, and a directory is needed")
+
+        parent_of(at) match
+            Some(up) if up != at -> at = up
+            _ -> break
+
+    make_dir_all(dir) match
+        Ok(_) -> None
+        Err(e) -> Some(s"cannot make the directory '$dir': ${e.message()}")
+end literate_directory
+
+// A text handed to `say`, which ends every line it is given: one final newline is the printing's.
+private literate_unended(text: string) -> string =
+    if text.ends_with("\n") then text[0..<text.bytes.len - 1] else text
