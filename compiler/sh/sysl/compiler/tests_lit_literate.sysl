@@ -1,0 +1,234 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, replace_all, Search}
+
+// A `.lsysl` file: a Markdown document whose indented blocks are the program. Two things are asserted
+// throughout. The program is the indented text and nothing else -- that is the feature. And **a
+// position still points at the file the reader has open** -- the half a tangler that only
+// concatenates its code blocks gets wrong, silently.
+//
+// Every case is driven through `sysl build` as a shell reaches it, and run. **Where `SYSL_ORACLE`
+// names the reference, its own build of the same files must come to the same thing**, so every
+// expectation below is the reference's (0.0.162) actual output, its root directory written `<root>`.
+
+// What building `files` comes to: the program's output where it built, or what was said instead.
+// `entry` is the file handed to the build, or "" for the directory holding them all.
+private lit_outcome(files: []const (string, string), entry: string, reference: Option[string]) -> string
+    val root = absolute_path(make_temp_dir("sysl-lit").unwrap())
+    val src = s"$root/src"
+    val exe = s"$root/built"
+
+    for i in 0..<files.len
+        val file = s"$src/${files[i].0}"
+
+        make_dir_all(parent_of(file).unwrap()).unwrap()
+        write_text(file, files[i].1).unwrap()
+
+    val target = if entry == "" then src else s"$src/$entry"
+    var said = ""
+
+    reference match
+        None ->
+            var lines: Buf[string] = buf()
+            val sink = &lines
+
+            run_cli(["sysl", "build", target, "-o", exe], (line) -> sink.push(line))
+            said = join(lines.view(), "\n")
+        Some(bin) -> capture_oracle(bin, ["build", target, "-o", exe]) match
+            Err(_) -> said = "the reference could not be run"
+            Ok(o) -> said = o.err.unwrap_or(o.text)
+
+    if metadata(exe).is_ok()
+        said = capture(exe, [], "", [], true) match
+            Err(_) -> "the program that was built could not be run"
+            Ok(o) -> o.text
+
+    remove_dir_all(root).unwrap_or(())
+    lit_chomp(replace_all(said, src, "<root>"))
+end lit_outcome
+
+private lit_chomp(s: string) -> string = if s.ends_with("\n") then s[0..<s.bytes.len - 1] else s
+
+// The claim every case makes: these files come to `want`, here and -- where there is one -- under the
+// reference.
+private lit_says(files: []const (string, string), entry: string, want: string)
+    if !twp_ready() then return
+
+    assert_eq(lit_outcome(files, entry, None), want)
+
+    env_var("SYSL_ORACLE") match
+        Some(bin) -> assert_eq(lit_outcome(files, entry, Some(bin)), want)
+        None -> ()
+end lit_says
+
+// One file, built by name.
+private lit_one(file: string, text: string, want: string) = lit_says([(file, text)], file, want)
+
+@test("and the prose around it is not")
+lit_and_the_prose_around_it_is_not()
+    lit_one("hello.lsysl", "The greeting\n------------\n\nA program is a list of statements. This one has a " +
+        "single statement in it, and every word\nof this paragraph would be a syntax error if any of it " +
+        "reached the compiler.\n\n    print(\"Hello, sysl!\")\n", "Hello, sysl!")
+
+// `__LINE__` and `__COLUMN__` report the position in the file the reader has open, as a diagnostic
+// about the same place would: `__COLUMN__` sits 16 columns into the tangled line and 20 into the file.
+@test("a built-in reports the column of the file, margin included")
+lit_a_builtin_reports_the_column_of_the_file()
+    lit_one("where.lsysl", "Locating\n--------\n\n    print(__LINE__, __COLUMN__)\n", "4 21")
+
+// The case the format exists for: a body explained a step at a time.
+@test("a paragraph inside a function body leaves one function")
+lit_a_paragraph_inside_a_function_body_leaves_one_function()
+    lit_one("sum.lsysl", "Summing\n-------\n\n    total(n: int) -> int\n        var acc = 0\n\n" +
+        "The loop is inclusive at both ends, so `total(3)` counts three, two and one.\n\n" +
+        "        for i in 1..n do acc += i\n\nAnd the last expression of a body is what it answers with.\n\n" +
+        "        acc\n    end total\n\n    print(total(3))\n", "6")
+
+// The fenced block holds sysl that would not compile, which is the point of fencing it.
+@test("an unindented line between two blocks does not end a block, and a fenced one is not code")
+lit_an_unindented_line_does_not_end_a_block_and_a_fenced_one_is_not_code()
+    lit_one("fenced.lsysl", "Fences\n------\n\nThis does not work, and the compiler says why:\n\n```\n" +
+        "print(1 +)\n```\n\nThis does:\n\n    print(1 + 1)\n", "2")
+
+// Four columns in, the backticks are program text, and program text they are not valid in.
+@test("a fence indented to code depth is code, since that is what the indent means")
+lit_a_fence_indented_to_code_depth_is_code()
+    lit_one("bad.lsysl", "Not a fence\n\n    ```\n    print(1)\n",
+        "error: a quoted identifier needs a name between the backticks\n --> <root>/bad.lsysl:3:5\n  |\n" +
+        "3 | ```\n  | ^")
+
+// It would not compile if it were compiled, which is the discriminating part.
+@test("an indented block inside a list item is the example the bullet is about")
+lit_an_indented_block_inside_a_list_item_is_the_bullets_example()
+    lit_one("bullets.lsysl", "Two things worth knowing\n\n- The first, whose example is written out here:\n\n" +
+        "      this is not sysl at all\n\n- The second.\n\nWhich is the end of the list, and this is the " +
+        "program.\n\n    print(5)\n", "5")
+
+@test("an ordered list does the same")
+lit_an_ordered_list_does_the_same()
+    lit_one("ordered.lsysl", "Steps\n\n1. First, which is illustrated by\n\n       nonsense goes here\n\n" +
+        "2. Second.\n\nThen the program.\n\n    print(6)\n", "6")
+
+// At four columns in the line was code before anything asked whether it looked like a bullet.
+@test("a bullet opens nothing when it is already inside program text")
+lit_a_bullet_opens_nothing_inside_program_text()
+    lit_one("minus.lsysl", "Arithmetic across a line break\n\n    var n = (10\n        - 4)\n\n    print(n)\n", "6")
+
+// The fence is prose, at column 1 of the document: nothing took four columns from it.
+@test("because everything below it would be silently not compiled")
+lit_an_unclosed_fence_is_refused()
+    lit_one("open.lsysl", "An illustration\n\n```\nprint(\"shown\")\n\n    print(\"meant to run\")\n",
+        "error: this fence is never closed, so everything below it is an illustration and none of it is " +
+        "compiled — close it, or indent the lines that are meant to run\n --> <root>/open.lsysl:3:1\n" +
+        "  |\n3 | ```\n  | ^")
+
+@test("and a closing fence may carry trailing spaces, which are invisible")
+lit_a_closing_fence_may_carry_trailing_spaces()
+    lit_one("trail.lsysl", "Shown, then run\n\n```\nnot code\n```   \n\n    print(7)\n", "7")
+
+@test("a longer fence closes what a shorter one opened, and the shorter does not")
+lit_a_longer_fence_closes_what_a_shorter_one_opened()
+    lit_one("nested.lsysl", "Quoting a fence\n\n````\n```\nstill inside\n```\n````\n\n    print(8)\n", "8")
+
+@test("the line is the line it was written on")
+lit_the_line_is_the_line_it_was_written_on()
+    lit_one("where.lsysl", "A title\n=======\n\nFour lines of prose, so that a tangler that dropped them " +
+        "would report line one.\n\n    print(nosuch)\n",
+        "error: undefined name 'nosuch'\n --> <root>/where.lsysl:6:11\n  |\n6 | print(nosuch)\n" +
+        "  |       ^^^^^^")
+
+// Four columns of indent and `print(` six more: the name is at column 11, not the lexer's 7.
+@test("and the column counts the indent the reader can see")
+lit_the_column_counts_the_indent_the_reader_can_see()
+    lit_one("col.lsysl", "    print(nosuch)\n",
+        "error: undefined name 'nosuch'\n --> <root>/col.lsysl:1:11\n  |\n1 | print(nosuch)\n" +
+        "  |       ^^^^^^")
+
+@test("a run of prose between two errors does not shift the second")
+lit_a_run_of_prose_between_two_errors_does_not_shift_the_second()
+    lit_one("two.lsysl", "    var a: int = \"one\"\n\nProse between them, which occupies lines of its own.\n\n" +
+        "    var b: int = \"two\"\n",
+        "error: cannot initialize 'a': declared int but the value is string\n --> <root>/two.lsysl:1:5\n" +
+        "  |\n1 | var a: int = \"one\"\n  | ^^^^^^^^^^^^^^^^^^\n\n" +
+        "error: cannot initialize 'b': declared int but the value is string\n --> <root>/two.lsysl:5:5\n" +
+        "  |\n5 | var b: int = \"two\"\n  | ^^^^^^^^^^^^^^^^^^")
+
+// The format is chosen by the NAME: this is a valid program whose author indented a continuation.
+@test("indented lines in a .sysl file are the program they always were")
+lit_indented_lines_in_a_sysl_file_are_the_program()
+    lit_one("plain.sysl", "print(1 +\n    1)\n", "2")
+
+@test("and its columns are reported with no offset")
+lit_and_its_columns_are_reported_with_no_offset()
+    lit_one("plain.sysl", "print(nosuch)\n",
+        "error: undefined name 'nosuch'\n --> <root>/plain.sysl:1:7\n  |\n1 | print(nosuch)\n" +
+        "  |       ^^^^^^")
+
+@test("because how wide it is depends on what is displaying it")
+lit_a_tab_in_the_indentation_is_refused()
+    lit_one("tabbed.lsysl", "    print(1)\n\t print(2)\n",
+        "error: a tab in the indentation of a literate file — what makes a line program text is four " +
+        "columns of indent, and a tab is as wide as whatever happens to be displaying it, so this line is " +
+        "code in one editor and prose in another\n --> <root>/tabbed.lsysl:2:1\n  |\n2 | \t print(2)\n  | ^")
+
+@test("while a tab inside a line is the author's business")
+lit_a_tab_inside_a_line_is_the_authors_business()
+    lit_one("inner.lsysl", "    print(\"a\tb\")\n", "a\tb")
+
+@test("a project may mix the two kinds of file")
+lit_a_project_may_mix_the_two_kinds_of_file()
+    lit_says([("main.lsysl", "The entry point\n\n    import geom.*\n\n    print(area(3, 4))\n"),
+              ("geom/area.sysl", "module geom\n\narea(w: int, h: int) -> int = w * h\n")], "", "12")
+
+// The `which` a compilation for x86-64 Linux kept, as the IR it lowered to.
+private lit_which(reference: Option[string]) -> string
+    val root = absolute_path(make_temp_dir("sysl-lit").unwrap())
+    val file = s"$root/cond.lsysl"
+
+    write_text(file, "Two machines\n\n    #if macos\n    which() -> int = 1\n    #else\n    which() -> int = 2\n" +
+        "    #endif\n\n    print(which())\n").unwrap()
+
+    val args = ["emit-llvm", "--no-std-lib", "--target", "x86_64-linux", file]
+    var ir = ""
+
+    reference match
+        None ->
+            var lines: Buf[string] = buf()
+            val sink = &lines
+
+            run_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", file], (line) -> sink.push(line))
+            ir = join(lines.view(), "\n")
+        Some(bin) -> ir = capture_oracle(bin, args).map((o) -> o.text).unwrap_or("")
+
+    remove_dir_all(root).unwrap_or(())
+
+    val at = ir.index_of("@which()")
+
+    if at.is_none() then return ir
+
+    val body = ir[at.unwrap()..<ir.bytes.len]
+
+    body[0..<body.index_of("}").unwrap_or(body.bytes.len)]
+end lit_which
+
+// Tangling runs before the `#if` gate, so what the gate sees is ordinary sysl.
+@test("conditional compilation works inside a literate file")
+lit_conditional_compilation_works_inside_a_literate_file()
+    if std_root().is_err() then return
+
+    val ours = lit_which(None)
+
+    assert(ours.contains("ret i32 2"), ours)
+
+    env_var("SYSL_ORACLE") match
+        Some(bin) ->
+            val theirs = lit_which(Some(bin))
+
+            assert(theirs.contains("ret i32 2"), theirs)
+        None -> ()
+end lit_conditional_compilation_works_inside_a_literate_file
