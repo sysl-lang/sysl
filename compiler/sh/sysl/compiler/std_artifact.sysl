@@ -315,6 +315,62 @@ private write_built(built: LibraryBuild, root: string, out: string, fingerprint:
     write_half(half_of(built, t, who)?, root, out, fingerprint, t, probed, level)
 end write_built
 
+// A source root's kept half (`root_artifact.sysl`): the root's object half and the metadata naming
+// what it advertises, archived at `out` under a pending name and renamed onto it, in the standard
+// module's container exactly.
+//
+// **It carries no C.** A root's C is compiled by the build that links it, through the C object cache,
+// as a package's is -- a member here as well would put a second definition of every shim in front of
+// the linker.
+write_root_artifact(built: LibraryBuild, out: string, key: string, t: Target,
+                    level: string) -> Result[Buf[string], string]
+    if !t.builds_with_clang() then return Err(t.no_toolchain())
+
+    val half = half_of(built, t, "the source root")?
+    val clang = find_clang(t, named_cc())?
+    val archiver = find_ar(None)?
+    val staging = make_temp_dir("sysl-root-") match
+        Err(_) -> return Err("cannot make a directory to build the source root in")
+        Ok(dir) -> dir
+
+    val made = root_members(clang, archiver, staging, out, half.text,
+                            syslib_metadata_ir(syslib_metadata(t, key, half.advertised), t), t, level)
+
+    remove_dir_all(staging).unwrap_or(())
+    made?
+    Ok(half.advertised)
+end write_root_artifact
+
+private root_members(clang: string, archiver: string, staging: string, out: string, ir: string,
+                     meta_ir: string, t: Target, level: string) -> Result[unit, string]
+    val code = s"$staging/$SyslibCodeMember"
+    val smeta = s"$staging/$SyslibMetadataMember"
+
+    compile_object(clang, ir, code, t, level)?
+    compile_object(clang, meta_ir, smeta, t, level, false)?
+
+    var members: Buf[string] = buf()
+
+    members.push(code)
+    members.push(smeta)
+
+    val pending = pending_name(out)
+
+    make_dir_all(parent_of(out).unwrap_or("."))
+
+    archive(archiver, members, pending) match
+        Err(why) ->
+            remove_file(pending)
+            return Err(why)
+        Ok(_) -> ()
+
+    publish_file(pending, out) match
+        Err(_) ->
+            remove_file(pending)
+            Err(s"cannot put the source root's kept half at $out")
+        Ok(_) -> Ok(())
+end root_members
+
 // The archive assembled around an object half: the code member, the metadata beside it, and one
 // member for each C file the tree carries.
 private write_half(half: LibraryHalf, root: string, out: string, fingerprint: string, t: Target,

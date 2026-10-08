@@ -117,7 +117,26 @@ run_cache_parts(command: string, path: string, t: Target, level: string,
     var parts: Buf[string] = buf()
 
     parts.push(command)
+    toolchain_parts(&parts, t, level, cc)?
 
+    // **Where the tree stands is part of what reaches the bytes**, so it is in the key beside what
+    // the files hold. A tree is walked from an absolute root and that root is what `__FILE__`, every
+    // test's record and every diagnostic's anchor carry -- two copies of one tree at two paths
+    // compile to two different binaries. Keyed on the contents alone, the second copy is handed the
+    // first's binary and reports a directory the reader is not standing in.
+    parts.push(absolute_path(path))
+    parts.push(program_fingerprint(path, t)?)
+    settings_parts(&parts, path)
+
+    Ok(parts)
+end run_cache_parts
+
+// The parts of a key that are about the compiler and the machine rather than any tree: which build of
+// the compiler, for which target, through which heap, at which level, with which C compiler, what the
+// target provides and which standard module. Shared by every cache keyed over a build
+// (`root_artifact.sysl` too), so the two cannot disagree about what reaches the bytes.
+toolchain_parts(parts: *Buf[string], t: Target, level: string,
+                cc: Option[string]) -> Result[unit, Refusal]
     // A build this machine will not name is every build of this version at once, which is the stale
     // key this part exists to remove -- so it is a miss rather than a guess.
     if !compiler_build_known() then return Err(Refusal("this compiler cannot say which build it is"))
@@ -142,13 +161,14 @@ run_cache_parts(command: string, path: string, t: Target, level: string,
     // A library compiled into the binary rather than linked from an artifact is different bytes.
     if std_from_source() then parts.push("std:from-source")
 
-    // **Where the tree stands is part of what reaches the bytes**, so it is in the key beside what
-    // the files hold. A tree is walked from an absolute root and that root is what `__FILE__`, every
-    // test's record and every diagnostic's anchor carry -- two copies of one tree at two paths
-    // compile to two different binaries. Keyed on the contents alone, the second copy is handed the
-    // first's binary and reports a directory the reader is not standing in.
-    parts.push(absolute_path(path))
-    parts.push(program_fingerprint(path, t)?)
+    Ok(())
+end toolchain_parts
+
+// The parts of a key that are the build's settings rather than a file: the environment a build reads,
+// the flags naming headers, libraries and macros, the feature request, the link mode, what is asked of
+// LLVM beyond the level, and whether a bounds trap names its place. `path` is the project, whose
+// manifest says the link mode.
+settings_parts(parts: *Buf[string], path: string)
     parts.push(build_environment())
 
     // **Where a command line said the headers and libraries are reaches the bytes**, and is the one
@@ -183,9 +203,7 @@ run_cache_parts(command: string, path: string, t: Target, level: string,
     // **Whether failed bounds checks name their locations is a different binary** too; the default
     // adds nothing, so every key made before the choice existed still matches.
     if !bounds_locations() then parts.push("bounds_locations:false")
-
-    Ok(parts)
-end run_cache_parts
+end settings_parts
 
 // What the machine provides, as the manifest declared it: sorted, so the part is one string for one
 // set however the file ordered it or whichever block said it.
