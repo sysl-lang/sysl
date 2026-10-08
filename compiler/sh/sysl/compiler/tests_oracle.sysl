@@ -623,8 +623,60 @@ ours_without_the_bounds_report(ours: string, theirs: string) -> string
         // printer's own separator after the last runtime block would go with it.
         dropped = drop && line != ""
 
-    out.finish()
+    without_arc_null_guards(out.finish())
 end ours_without_the_bounds_report
+
+// -- the null guard the ownership entry points carry here and not in the reference ----------------
+
+// **This compiler's `arc.retain`, `arc.release` and their `_sync` pair take or give back a share of a
+// null reference as nothing** (`arc_runtime.sysl`: a container in storage the program zeroed itself
+// holds one), where 0.0.162 loads through it. Each of the four opens with exactly three lines the
+// reference does not write -- the compare, its branch and the label it falls to -- and a retain ends
+// with the `done:` block that branch reaches. Those are taken out of OUR text, matched line for line
+// at the start of one of those four bodies and nowhere else, so a body differing in anything more
+// still differs.
+without_arc_null_guards(text: string) -> string
+    val lines = lines_of(text)
+
+    var out = str_builder()
+    var i: usize = 0
+    var guarded_retain = false
+
+    while i < lines.len()
+        val line = lines.at(i)
+
+        if is_null_guarded_helper(line) && i + 4 < lines.len() && lines.at(i + 1) == "entry:" &&
+                lines.at(i + 2) == "  %null = icmp eq ptr %p, null" &&
+                lines.at(i + 3).starts_with("  br i1 %null, label %") &&
+                (lines.at(i + 4) == "live:" || lines.at(i + 4) == "count:")
+            out.push(line)
+            out.push_char('\n')
+            out.push("entry:\n")
+            guarded_retain = lines.at(i + 3).starts_with("  br i1 %null, label %done,")
+            i += 5
+            continue
+
+        if guarded_retain && line == "done:" && i + 2 < lines.len() && lines.at(i + 1) == "  ret void" &&
+                lines.at(i + 2) == "}"
+            guarded_retain = false
+            i += 2
+            continue
+
+        if line == "}" then guarded_retain = false
+
+        out.push(line)
+        out.push_char('\n')
+        i += 1
+
+    out.finish()
+end without_arc_null_guards
+
+// The `define` line of one of the four entry points `without_arc_null_guards` reads.
+is_null_guarded_helper(line: string) -> bool =
+    line.starts_with("define private void @arc.retain(ptr %p)") ||
+    line.starts_with("define private void @arc.release(ptr %p)") ||
+    line.starts_with("define private void @arc.retain_sync(ptr %p)") ||
+    line.starts_with("define private void @arc.release_sync(ptr %p)")
 
 // `@.loc<digits> = private constant …`, the shape `bounds_location_globals` writes and nothing else.
 private is_location_constant(line: string) -> bool
@@ -2810,6 +2862,42 @@ bfm_the_normalisation_can_still_fail()
     assert(!same_text_but_declare_order(without_trailing_newlines(theirs),
            without_trailing_newlines(ours_without_the_bounds_report(extra, theirs))))
 end bfm_the_normalisation_can_still_fail
+
+// The four entry points as 0.0.162 writes them: this compiler's own text with the null guard taken
+// out by hand, which is the reference's body line for line.
+ang_reference_form(ours: string) -> string
+    var text = replace_all(ours, "entry:\n  %null = icmp eq ptr %p, null\n  br i1 %null, label %done, label %live\nlive:\n",
+                           "entry:\n")
+
+    text = replace_all(text, "entry:\n  %null = icmp eq ptr %p, null\n  br i1 %null, label %live, label %count\ncount:\n",
+                       "entry:\n")
+    text = replace_all(text, "  store i64 %n, ptr %p\n  ret void\ndone:\n  ret void\n}", "  store i64 %n, ptr %p\n  ret void\n}")
+    replace_all(text, "monotonic\n  ret void\ndone:\n  ret void\n}", "monotonic\n  ret void\n}")
+end ang_reference_form
+
+@test("the null-guard normalisation takes out exactly the guard, and a changed instruction still differs")
+ang_the_normalisation_can_still_fail()
+    val ours = arc_core(host_target()) + arc_atomic(host_target())
+    val theirs = ang_reference_form(ours)
+
+    // The fixture is what it claims: all four guards are there, and the reference's form has none.
+    assert_eq(split(ours, "%null = icmp eq ptr %p, null").len - 1, 4)
+    assert(!theirs.contains("%null = icmp eq ptr %p, null"), theirs)
+
+    // Taken out, the two are one text.
+    assert_eq(without_arc_null_guards(ours), without_arc_null_guards(theirs))
+    assert_eq(without_arc_null_guards(ours), theirs)
+
+    // One instruction of a guarded body changed in OUR text still differs.
+    val mutated = replace_all(ours, "%n = add i64 %c, 1", "%n = add i64 %c, 2")
+
+    assert(without_arc_null_guards(mutated) != theirs)
+
+    // The same three lines opening any other body are not taken out.
+    val elsewhere = replace_all(ours, "define private void @arc.retain(ptr %p)", "define private void @arc.retain2(ptr %p)")
+
+    assert(without_arc_null_guards(elsewhere).contains("%null = icmp eq ptr %p, null"))
+end ang_the_normalisation_can_still_fail
 
 // -- the excuse rule, held to failing ----------------------------------------------------------------
 
