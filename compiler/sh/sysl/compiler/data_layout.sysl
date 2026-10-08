@@ -1,0 +1,82 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.process.capture
+import sysl.text.Search
+
+// The data layout every text handed to clang carries.
+//
+// **The text sysl emits names no `target datalayout`, and `emit-llvm` prints it that way**: its header
+// is `target triple` alone, which is what the oracle comparisons read. But LLVM fills in a missing
+// `align` on a `load` or `store` at the moment it PARSES the text, from the layout the module names
+// then -- and a module naming none is parsed under LLVM's default layout, in which a 64-bit integer is
+// aligned to four bytes. clang applies the target's layout only afterwards, so every 64-bit access the
+// text wrote without an `align` reached the back end promising four.
+//
+// What that cost depended on the machine. Where unaligned access is cheap (aarch64, x86-64) it changed
+// nothing but the hints an optimizer reads; on wasm32 every `i64.load` and `i64.store` was encoded as
+// four-byte aligned, and a Cortex-M0+ copy called `__aeabi_memcpy4` rather than `__aeabi_memcpy8`; on
+// riscv64, which has no unaligned access by default, **every 64-bit load and store through a pointer
+// was split into two 32-bit ones** -- a `*p = n` of a `u64` written as two `sw`, which another hart can
+// observe half done. Under `strict_align` on aarch64 the same split doubled every access.
+//
+// So the text clang compiles is the printed text with the layout line in front of it, asked of the very
+// clang that will compile it, for the machine and its flags, once per process. A text whose clang gave
+// no answer (a target that clang does not know) is handed over as it was.
+laid_out(cc: string, t: Target, ir: string) -> string
+    val line = clang_layout(cc, t)
+
+    if line == "" then ir else line + "\n" + ir
+end laid_out
+
+// What each `(clang, triple and machine flags)` answered, so a build asks once.
+private var dl_layouts: Buf[(string, string, string)] = buf()
+
+// clang's `target datalayout = "..."` line for `t`, or `""` where it gave none.
+clang_layout(cc: string, t: Target) -> string
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${t.triple}")
+
+    val machine = machine_flags(t)
+
+    for i in 0..<machine.len()
+        args.push(machine.at(i))
+
+    var asked = ""
+
+    for i in 0..<args.len()
+        asked = asked + args.at(i) + " "
+
+    for i in 0..<dl_layouts.len()
+        val row = dl_layouts.at(i)
+
+        if row.0 == cc && row.1 == asked then return row.2
+
+    args.push("-S")
+    args.push("-emit-llvm")
+    args.push("-x")
+    args.push("c")
+    args.push("/dev/null")
+    args.push("-o")
+    args.push("-")
+
+    var found = ""
+
+    capture(cc, args.view()) match
+        Err(_) -> ()
+        Ok(out) ->
+            val text = out.text
+            var start: usize = 0
+
+            for i in 0..<text.bytes.len
+                if text.bytes[i] == u8('\n')
+                    val one = text[start..<i]
+
+                    if one.starts_with("target datalayout = ") then found = one
+
+                    start = i + 1
+
+    dl_layouts.push((cc, asked, found))
+    found
+end clang_layout
