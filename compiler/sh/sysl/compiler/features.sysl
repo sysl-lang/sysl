@@ -218,7 +218,8 @@ end quoted_names
 // The dependencies of one package that are in the graph, given what that package has enabled: every
 // entry that is not `optional`, and an optional one exactly where an enabled feature names its label.
 // A member written `dep:X` reaches the dependency `X`, so the prefix comes off before labels are
-// matched.
+// matched; one written `X/f` reaches it too, as well as asking it for its feature `f`
+// (`dependency_requests`).
 //
 // **The filtering happens before anything is fetched**, so an optional dependency nothing turned on is
 // not downloaded, not asked for the libraries its manifest requires, and adds nothing to the link line
@@ -234,7 +235,12 @@ active_dependencies(m: &Manifest, enabled: &Buf[string]) -> Buf[Dependency]
         for j in 0..<members.len()
             val member = members.at(j)
 
-            turned_on.push(if member.starts_with("dep:") then member[4..<member.len] else member)
+            if member.starts_with("dep:")
+                turned_on.push(member[4..<member.len])
+            else
+                dependency_feature(member) match
+                    Some((label, _)) -> turned_on.push(label)
+                    None -> turned_on.push(member)
 
     var out: Buf[Dependency] = buf()
 
@@ -245,6 +251,26 @@ active_dependencies(m: &Manifest, enabled: &Buf[string]) -> Buf[Dependency]
 
     out
 end active_dependencies
+
+// What a package's enabled features ask of its dependencies through `<dependency>/<feature>`
+// members, each as the dependency's label, the feature asked of it and the feature that asked. They
+// join the requests the dependency entries write (`enabled_from`), so a package reached both ways gets
+// the union.
+dependency_requests(m: &Manifest, enabled: &Buf[string]) -> Buf[(string, string, string)]
+    var out: Buf[(string, string, string)] = buf()
+
+    for i in 0..<m.features.len()
+        val (name, members) = m.features.at(i)
+
+        if !holds_string(*enabled, name) then continue
+
+        for j in 0..<members.len()
+            dependency_feature(members.at(j)) match
+                Some((label, feature)) -> out.push((label, feature, name))
+                None -> ()
+
+    out
+end dependency_requests
 
 // A manifest as one round reads it: the optional dependencies nothing has turned on removed. Pruning
 // at the read rather than at each use keeps the rest of the resolution ignorant of features --
@@ -279,7 +305,7 @@ end enabled_of
 enabled_from(packages: &Buf[ResolvedPackage], roots: Buf[(string, Manifest)],
              enabled: &Buf[(string, Buf[string])]) -> Result[Buf[(string, Buf[string])], string]
     var out: Buf[(string, Buf[string])] = buf()
-    val consumers = consumers_of(packages, pruned_roots(roots, enabled))
+    val consumers = consumers_of(packages, pruned_roots(roots, enabled), enabled)
 
     for t in 0..<packages.len()
         val target = packages.at(t)
@@ -289,13 +315,14 @@ enabled_from(packages: &Buf[ResolvedPackage], roots: Buf[(string, Manifest)],
         var asked = no_asking()
 
         for c in 0..<consumers.len()
-            val (who, deps) = consumers.at(c)
+            val consumer = consumers.at(c)
 
-            for d in 0..<deps.len()
-                val dep = deps.at(d)
+            for d in 0..<consumer.deps.len()
+                val dep = consumer.deps.at(d)
 
                 if dependency_canonical(dep) == target.canonical
-                    asking(&asked, who, dep, target.manifest)?
+                    asking(&asked, consumer.who, dep, target.manifest)?
+                    asking_through(&asked, consumer.who, dep, consumer.through, target.manifest)?
 
         if !asked.at_all then continue
 
@@ -306,13 +333,14 @@ enabled_from(packages: &Buf[ResolvedPackage], roots: Buf[(string, Manifest)],
         var asked = no_asking()
 
         for c in 0..<consumers.len()
-            val (who, deps) = consumers.at(c)
+            val consumer = consumers.at(c)
 
-            for d in 0..<deps.len()
-                val dep = deps.at(d)
+            for d in 0..<consumer.deps.len()
+                val dep = consumer.deps.at(d)
 
                 if stood_in_by(roots, dep).unwrap_or(roots.len()) == r
-                    asking(&asked, who, dep, theirs)?
+                    asking(&asked, consumer.who, dep, theirs)?
+                    asking_through(&asked, consumer.who, dep, consumer.through, theirs)?
 
         if !asked.at_all then asked.wants_default = true
 
@@ -351,6 +379,33 @@ private asking(into: *Asking, who: string, dep: &Dependency, target: &Manifest) 
     Ok(())
 end asking
 
+// What the consumer's own enabled features ask of the dependency `dep` names, through
+// `<dependency>/<feature>` members, held to the features the target declares as an entry's are.
+private asking_through(into: *Asking, who: string, dep: &Dependency,
+                       through: &Buf[(string, string, string)], target: &Manifest) -> Result[unit, string]
+    for i in 0..<through.len()
+        val (label, feature, from) = through.at(i)
+
+        if label != dep.label then continue
+
+        if !feature_named(target.features, feature)
+            return Err(no_such_dependency_feature(who, from, dep, feature, declared_features(target)))
+
+        into.named.push(feature)
+
+    Ok(())
+end asking_through
+
+private no_such_dependency_feature(who: string, from: string, dep: &Dependency, feature: string,
+                                   declared: Buf[string]) -> string
+    val tail = if declared.is_empty() then ", and it declares none"
+    else s". It declares ${quoted_names(declared)}"
+
+    s"the feature '$from' of $who names '${dep.label}/$feature', but '${dependency_canonical(dep)}' " +
+        s"declares no feature '$feature' — a '<dependency>/<feature>' member may only name a feature " +
+        s"that package's own manifest names$tail"
+end no_such_dependency_feature
+
 private asked_closure(asked: Asking, target: &Manifest) -> Buf[string]
     var named: Buf[string] = buf()
 
@@ -362,19 +417,30 @@ private asked_closure(asked: Asking, target: &Manifest) -> Buf[string]
     feature_closure(target.features, named, target.dependencies)
 end asked_closure
 
-// Every manifest that asks anything of a dependency, each with how a refusal names it: the packages
-// of the graph, the project among them, and the `--lib` roots.
-private consumers_of(packages: &Buf[ResolvedPackage],
-                     roots: Buf[(string, Manifest)]) -> Buf[(string, Buf[Dependency])]
-    var out: Buf[(string, Buf[Dependency])] = buf()
+private struct Consumer
+    who: string
+    deps: Buf[Dependency]
+    through: Buf[(string, string, string)]
+
+// Every manifest that asks anything of a dependency, each with how a refusal names it and what its
+// enabled features ask through `<dependency>/<feature>`: the packages of the graph, the project among
+// them, and the `--lib` roots.
+private consumers_of(packages: &Buf[ResolvedPackage], roots: Buf[(string, Manifest)],
+                     enabled: &Buf[(string, Buf[string])]) -> Buf[Consumer]
+    var out: Buf[Consumer] = buf()
 
     for p in 0..<packages.len()
         val consumer = packages.at(p)
+        val on = enabled_of(enabled, consumer.canonical)
 
-        out.push((consumer_named(consumer), consumer.manifest.dependencies))
+        out.push(Consumer(consumer_named(consumer), consumer.manifest.dependencies,
+                          dependency_requests(consumer.manifest, on)))
 
     for r in 0..<roots.len()
-        out.push((s"the source root '${roots.at(r).0}'", roots.at(r).1.dependencies))
+        val (dir, m) = roots.at(r)
+        val on = enabled_of(enabled, lib_root_key(dir))
+
+        out.push(Consumer(s"the source root '$dir'", m.dependencies, dependency_requests(m, on)))
 
     out
 end consumers_of

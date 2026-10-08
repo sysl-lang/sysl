@@ -1162,6 +1162,44 @@ this project asks 'helper' for the feature 'fancy', which 'helper' does not decl
 may only ask for a feature that package's own manifest names, and it declares none
 ```
 
+### A feature may turn on a feature of a dependency
+
+A dependency entry's `features` is asked for whatever this package's own features are; a member of a
+feature's list written **`"<dependency>/<feature>"`** asks only while that feature is on. It turns on
+`<feature>` of the dependency this manifest labels `<dependency>`, and turns the dependency itself on
+too where it is `optional`:
+
+```hocon
+dependencies {
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.1", optional = true }
+}
+
+features {
+  default = [async]
+  async   = ["kairos/uv"]
+}
+```
+
+A build with `default` on takes `kairos` with its `uv` feature; one with `--no-default-features`
+takes neither. The quotes are required, as they are for `"dep:"`. The request joins every other one
+made of that package — the entries' `features` and other members alike — and the union is what the
+package gets.
+
+The first half has to be a dependency this manifest declares in `dependencies`, which is checked when
+the file is read. **A `dev_dependencies` entry is refused**: a feature is read by every build of the
+package, and a dev dependency is resolved only by `sysl test` on the package itself, so every other
+build would be naming a package it does not have. The second half is checked once the dependency's
+own manifest is read, and the refusal lists what it offers:
+
+```
+the feature 'async' of this project names 'kairos/uvx', but 'github.com.sysl-lang.kairos' declares
+no feature 'uvx' — a '<dependency>/<feature>' member may only name a feature that package's own
+manifest names. It declares 'uv'
+```
+
+Cargo's weak form, `"kairos?/uv"` — the feature only if something else turned the dependency on — is
+not supported, and is refused saying so.
+
 ### Every request is added together, and a feature only ever adds
 
 A package reached by two consumers gets the features **both** of them asked for. Each is compiled
