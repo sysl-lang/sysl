@@ -610,12 +610,19 @@ end typed_compilation
 // `against` names the library functions to declare rather than define, in place of the archive's
 // own list: a caller holding a library half it built itself (`std_library_half`) compiles a program
 // against that half exactly as a build compiles one against the artifact, with nothing looked up.
+//
+// **`linking` is set by the commands that link what this returns** (`build`, `run`), and only there
+// are the `--lib` roots' kept halves declared rather than defined: the text `emit-llvm` prints is the
+// whole program's, the roots' bodies included, since it is what the reference prints and what a diff
+// against it reads.
 emit_llvm_text(path: string, named_target: Option[string],
                level: string = DefaultOptimization,
                also_auto_imported: Buf[string] = buf(),
-               against: Option[Buf[string]] = None) -> Result[Emitted, Failure]
+               against: Option[Buf[string]] = None,
+               linking: bool = false) -> Result[Emitted, Failure]
     val t = target_for(path, named_target)?
     val program = packaged_compilation_of(path, t)?
+    val roots = if linking then roots_linked(program, path, level) else no_roots_linked()
     val done = analyze_bodies(program.units, program.target, also_auto_imported)
 
     // Everything a program is held to on the way to being lowered runs on the **unpruned** tree: a
@@ -654,13 +661,24 @@ emit_llvm_text(path: string, named_target: Option[string],
                 Ok(Some(found)) -> linked = found
                 Ok(None) -> ()
 
-    val lowered = codegen_with_gaps(kept with { precompiled = linked.precompiled }, t, promotions)
+    val lowered = codegen_with_gaps(kept with { precompiled = joined_names(linked.precompiled,
+                                                                           roots.precompiled) },
+                                    t, promotions)
 
     // Read back out of the analysis rather than off the snapshot the body pass answered with: the
     // checks above have just added to it.
     Ok(Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1,
-              link_required(program.units)))
+              link_required(program.units), roots.archives))
 end emit_llvm_text
+
+// Two lists of symbols as one, the first's order kept, in a buffer of its own.
+private joined_names(a: Buf[string], b: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.extend(a.view())
+    out.extend(b.view())
+    out
+end joined_names
 
 // What `--explain-escapes` reports about the program's own files: one line per array the escape
 // analysis moved to the heap. A program that failed to compile reports nothing, since it was never
@@ -882,6 +900,10 @@ struct Emitted
     // is the one holding every unit. A driver with the text alone could not work it out by reading
     // it: an `extern` says which symbol it wants and never which library has it.
     links: Buf[string]
+
+    // The `--lib` roots' kept halves the text declares rather than defines (`root_artifact.sysl`),
+    // each an archive for the link. Empty for every command but the ones that link.
+    archives: Buf[string]
 end Emitted
 
 // The typed tree: every body this compilation could type, in the `funcs:` section the reference
@@ -904,7 +926,7 @@ private typed_text(c: Compilation, tables: bool, spans: bool) -> Emitted
     val text = if tables then show_tables(shown) else show_typed_program(shown)
 
     set_typed_spans(was)
-    Emitted(text, report, buf(), buf())
+    Emitted(text, report, buf(), buf(), buf())
 end typed_text
 
 // The typed tree a compilation answers with, and what its analysis reported -- the tree `emit-typed`
@@ -954,7 +976,7 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
 
     headers_refused(path).map_err(said)?
 
-    val emitted = emit_llvm_text(path, named_target, level, also_auto_imported)?
+    val emitted = emit_llvm_text(path, named_target, level, also_auto_imported, None, true)?
 
     if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
 
@@ -976,7 +998,8 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
             "the directory, or say where the binary goes with '-o <path>'")))
     end if
 
-    link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links).map_err(said)?
+    link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links,
+                      emitted.archives).map_err(said)?
     Ok(exe)
 end build_native_program
 
@@ -1274,7 +1297,7 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
     val lowered = codegen_with_gaps(kept, t, promotions)
 
     Ok(LoweredForC(Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1,
-                           link_required(program.units)),
+                           link_required(program.units), buf()),
                    exports_by_symbol(kept.funcs)))
 end lower_for_c
 
@@ -1286,8 +1309,8 @@ end lower_for_c
 // line would fail on the one tree most likely to have one -- which is the tree whose author is
 // running `sysl test`.
 private link_lowered_text(path: string, text: string, t: Target, cc: Option[string], level: string,
-                          exe: string, standalone: bool,
-                          links: Buf[string]) -> Result[unit, Refusal]
+                          exe: string, standalone: bool, links: Buf[string],
+                          archives: Buf[string]) -> Result[unit, Refusal]
     val clang = find_clang(t, cc) match
         Err(why) -> return Err(Refusal(why))
         Ok(found) -> found
@@ -1327,6 +1350,11 @@ private link_lowered_text(path: string, text: string, t: Target, cc: Option[stri
     var link_with: Buf[string] = buf()
 
     link_with.extend(objects.view())
+
+    // **The roots' kept halves go before the standard module's archive**, since what they define
+    // calls into it and a linker that scans each archive once, left to right, has to meet the caller
+    // first.
+    link_with.extend(archives.view())
 
     linked_std match
         Some(found) -> link_with.push(found.archive)
@@ -1372,7 +1400,7 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
             None -> ()
         None -> ()
 
-    val emitted = emit_llvm_text(path, named_target, level)?
+    val emitted = emit_llvm_text(path, named_target, level, buf(), None, true)?
 
     if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
 
@@ -1384,7 +1412,8 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
 
     slot match
         Some(kept) ->
-            link_into_cache(path, emitted.text, t, cc, level, kept, false, emitted.links).map_err(said)?
+            link_into_cache(path, emitted.text, t, cc, level, kept, false, emitted.links,
+                            emitted.archives).map_err(said)?
             started(kept, args, None).map_err(said)
         None ->
             val dir = make_temp_dir("sysl-run-") match
@@ -1394,7 +1423,8 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
             val staging = Some(dir)
             val exe = join_path(dir, "program")
 
-            link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links) match
+            link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links,
+                              emitted.archives) match
                 Err(why) ->
                     discard_staging(staging)
                     return Err(Said(why))
@@ -1409,11 +1439,11 @@ end run_native_program
 // **The linker still writes the file**, which is what the cache has always relied on for the
 // executable bit -- a rename moves a name and leaves the mode the linker gave the file alone.
 private link_into_cache(path: string, text: string, t: Target, cc: Option[string], level: string,
-                        slot: string, standalone: bool,
-                        links: Buf[string]) -> Result[unit, Refusal]
+                        slot: string, standalone: bool, links: Buf[string],
+                        archives: Buf[string]) -> Result[unit, Refusal]
     val pending = pending_name(slot)
 
-    link_lowered_text(path, text, t, cc, level, pending, standalone, links) match
+    link_lowered_text(path, text, t, cc, level, pending, standalone, links, archives) match
         Err(why) ->
             remove_file(pending)
             return Err(why)
@@ -1615,7 +1645,7 @@ test_build_of(path: string, named_target: Option[string],
 
     headers_refused(path)?
 
-    Ok(test_build_from(packaged_compilation_of(path, t)?, false, level)?)
+    Ok(test_build_from(packaged_compilation_of(path, t)?, false, level, path)?)
 end test_build_of
 
 // The same for a tree that **is** the standard module (`sysl test <root> --std`), which is how the
@@ -1640,9 +1670,13 @@ private test_target_of(path: string, named_target: Option[string]) -> Result[Tar
     Ok(t)
 end test_target_of
 
-private test_build_from(program: Compilation, standalone: bool,
-                        level: string) -> Result[TestBuild, Refusal]
+private test_build_from(program: Compilation, standalone: bool, level: string,
+                        project: string = "") -> Result[TestBuild, Refusal]
     val t = program.target
+
+    // A test binary links the roots' kept halves as a program does. A root whose own tests this build
+    // runs is one the project declares into, which is exactly a root that is compiled from source.
+    val roots = if standalone then no_roots_linked() else roots_linked(program, project, level)
 
     // **Every body the library declares is typed when the library is what is being built**, not only
     // the ones a test happens to reach. It is the same reading `library_build` asks for, and the
@@ -1662,9 +1696,11 @@ private test_build_from(program: Compilation, standalone: bool,
         Ok(Some(found)) -> precompiled = found.precompiled
         Ok(None) -> ()
 
-    val lowered = codegen_with_gaps(kept with { precompiled = precompiled }, t, promotions)
+    val lowered = codegen_with_gaps(kept with { precompiled = joined_names(precompiled,
+                                                                           roots.precompiled) },
+                                    t, promotions)
     val emitted = Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1,
-                          link_required(program.units))
+                          link_required(program.units), roots.archives)
 
     Ok(TestBuild(emitted, kept.tests, t, standalone))
 end test_build_from
@@ -1683,7 +1719,7 @@ build_test_binary(path: string, build: TestBuild, cc: Option[string],
     val exe = join_path(staging, "tests")
 
     link_lowered_text(path, build.emitted.text, build.target, cc, level, exe, build.standalone,
-                      build.emitted.links) match
+                      build.emitted.links, build.emitted.archives) match
         Err(why) ->
             remove_dir_all(staging).unwrap_or(())
             return Err(why)
@@ -1704,7 +1740,7 @@ build_test_binary_cached(path: string, build: TestBuild, cc: Option[string], lev
     slot match
         Some(exe) ->
             link_into_cache(path, build.emitted.text, build.target, cc, level, exe,
-                            build.standalone, build.emitted.links)?
+                            build.standalone, build.emitted.links, build.emitted.archives)?
             Ok((exe, true))
         None ->
             val made = build_test_binary(path, build, cc, level)?
