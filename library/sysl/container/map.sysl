@@ -1,5 +1,7 @@
 module sysl.container
 
+import sysl.buf.{stored, forget, unassigned}
+
 /** A hash map, generic in its key and its value.
  *
  * The table is **one flat run of slots** and an entry lives inside it, so a map of a thousand keys
@@ -169,17 +171,17 @@ struct Map[K: Hash + Eq, V]
     /** The table itself, every slot of it, for a reader that wants to look rather than ask. Read
      * only: the map owns its table, and the counts beside it say what is in it.
      */
-    cell -> []Slot[K, V] = self.core.cell
+    cell -> []Slot[K, V] = if stored(&self.core) then self.core.cell else []
 
     /** How many entries are live. The same number `len()` answers. */
-    count -> usize = self.core.count
+    count -> usize = self.len()
 
     /** How many tombstones the table is carrying. */
-    dead -> usize = self.core.dead
+    dead -> usize = if stored(&self.core) then self.core.dead else 0
 
-    len(self) -> usize = self.core.count
+    len(self) -> usize = if stored(&self.core) then self.core.count else 0
 
-    is_empty(self) -> bool = self.core.count == 0
+    is_empty(self) -> bool = self.len() == 0
 
     /** How many slots the table has, which is what the load factor is measured against. It is not a
      * promise about how many entries fit -- the map rehashes at three quarters of this.
@@ -188,41 +190,51 @@ struct Map[K: Hash + Eq, V]
      * the first insert. That is the one number here a caller might be surprised by, and it is the
      * whole of what "an empty map holds no table" looks like from outside.
      */
-    capacity(self) -> usize = self.core.cell.len
+    capacity(self) -> usize = if stored(&self.core) then self.core.cell.len else 0
 
     @inline
-    get(self, k: K) -> Option[V] = self.core.get(k)
+    get(self, k: K) -> Option[V] = if stored(&self.core) then self.core.get(k) else None
 
     /** The value a key names, or the one the caller supplies where it names none. The common shape
      * of reading a counter or an accumulator that may not have been started yet.
      */
-    get_or(self, k: K, default: V) -> V = self.core.get(k).unwrap_or(default)
+    get_or(self, k: K, default: V) -> V = self.get(k).unwrap_or(default)
 
     @inline
-    has(self, k: K) -> bool = self.core.find(k).is_some()
+    has(self, k: K) -> bool = stored(&self.core) && self.core.find(k).is_some()
 
     /** A key given a value: the entry it already had takes the new one, or a fresh entry is placed.
      * Every name for this map sees it.
      */
     @inline
-    put(self, k: K, v: V) = self.core.put(k, v)
+    put(self, k: K, v: V)
+        if !stored(&self.core) then unassigned("Map", "map()")
+        self.core.put(k, v)
 
     /** A key taken out, answering whether it was there. */
-    remove(self, k: K) -> bool = self.core.remove(k)
+    remove(self, k: K) -> bool = stored(&self.core) && self.core.remove(k)
 
     /** Every entry dropped and the table let go entirely; see `MapCore.clear`. */
-    clear(self) = self.core.clear()
+    clear(self)
+        if stored(&self.core) then self.core.clear()
 
     /** A second map holding the same entries, its table sized to them -- the one way to get a map
      * that is not this one, every other way of handing a `Map` on handing on this one.
      */
     copy(self) -> Map[K, V]
-        val out: Map[K, V] = map_with_capacity(self.core.count)
+        val out: Map[K, V] = map_with_capacity(self.len())
 
         for (k, v) in self
             out.put(k, v)
 
         out
+    end copy
+
+    /** This name's share of the table given back, and the handle left naming nothing -- the state
+     * zeroed storage starts in, where every reader answers as an empty map does. Nothing is
+     * allocated, which is why a finalizer for raw storage calls this rather than assigning `map()`.
+     */
+    release(*self) = forget(self)
 end Map
 
 /** `for (k, v) in m` walks the entries, a pair apiece, through the cursor `walk` answers. */
@@ -240,7 +252,7 @@ impl[K: Hash + Eq, V] Walk for Map[K, V]
      * will not be. Which side of the line a given `put` falls on depends on the load factor, so
      * there is no rule here worth learning -- collect what is wanted first, then modify.
      */
-    walk(self) -> Cursor[K, V] = Cursor(self.core.cell, 0)
+    walk(self) -> Cursor[K, V] = Cursor(self.cell, 0)
 
 /** The table a `Map` names, and the two counts that describe it.
  *

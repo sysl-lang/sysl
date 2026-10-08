@@ -7,8 +7,16 @@ module sh.sysl.compiler
 // the atomic form is a relaxed increment. Giving one back publishes with release ordering and
 // acquires before destroying, so the thread that frees sees every other domain's writes. The
 // `_maybe` pair is for views -- slices and strings -- whose owner is null when the elements are
-// static, on a frame, or reached through a `*T`; the plain pair stays branch-free, since a reference
-// is non-null by construction.
+// static, on a frame, or reached through a `*T`.
+//
+// **The plain and atomic pairs tolerate a null reference too, and that is not redundant.** A
+// reference made by the language is never null, but a struct holding one may live in storage the
+// program zeroed itself -- a `calloc`ed block, a collector's arena -- and a `Buf`, a `Map` or a
+// `Deque` there is a struct holding a counted handle. Assigning into such a field gives back the
+// previous occupant, which is the null the zeroing left, so a release that loaded through it first
+// faulted on the first store into perfectly ordinary code. Taking or giving back a share of nothing
+// is nothing, exactly as a string's null owner already is; the test is one compare the branch
+// predictor settles once.
 //
 // **Teardown is iterative, not recursive.** A destructor releases the references its payload holds,
 // so a chain of `&T` -- a linked list, a degenerate tree -- would otherwise recurse one C stack
@@ -63,9 +71,14 @@ arc_core(t: Target) -> string
     "\n" +
     s"define private void @arc.retain(ptr %p) {\n" +
     "entry:\n" +
+    "  %null = icmp eq ptr %p, null\n" +
+    "  br i1 %null, label %done, label %live\n" +
+    "live:\n" +
     s"  %c = load $word, ptr %p\n" +
     s"  %n = add $word %c, 1\n" +
     s"  store $word %n, ptr %p\n" +
+    "  ret void\n" +
+    "done:\n" +
     "  ret void\n" +
     "}\n" +
     "\n" +
@@ -138,6 +151,9 @@ arc_core(t: Target) -> string
     "\n" +
     "define private void @arc.release(ptr %p) {\n" +
     "entry:\n" +
+    "  %null = icmp eq ptr %p, null\n" +
+    "  br i1 %null, label %live, label %count\n" +
+    "count:\n" +
     s"  %c = load $word, ptr %p\n" +
     s"  %n = sub $word %c, 1\n" +
     s"  store $word %n, ptr %p\n" +
@@ -210,12 +226,20 @@ arc_atomic(t: Target) -> string
 
     "define private void @arc.retain_sync(ptr %p) {\n" +
     "entry:\n" +
+    "  %null = icmp eq ptr %p, null\n" +
+    "  br i1 %null, label %done, label %live\n" +
+    "live:\n" +
     s"  %o = atomicrmw add ptr %p, $word 1 monotonic\n" +
+    "  ret void\n" +
+    "done:\n" +
     "  ret void\n" +
     "}\n" +
     "\n" +
     "define private void @arc.release_sync(ptr %p) {\n" +
     "entry:\n" +
+    "  %null = icmp eq ptr %p, null\n" +
+    "  br i1 %null, label %live, label %count\n" +
+    "count:\n" +
     s"  %o = atomicrmw sub ptr %p, $word 1 release\n" +
     s"  %z = icmp eq $word %o, 1\n" +
     "  br i1 %z, label %reap, label %live\n" +

@@ -1,5 +1,7 @@
 module sysl.container
 
+import sysl.buf.{stored, forget, unassigned}
+
 /** A sequence that grows and that is cheap to take from at **either** end.
  *
  * **The reason this exists beside `Buf` is one line of cost.** A queue written over a growable
@@ -39,61 +41,83 @@ struct Deque[T]
     private core: &DequeCore[T]
 
     /** Where the first element sits in the storage. Read-only: the ring is the core's to move. */
-    head -> usize = self.core.head
+    head -> usize = if stored(&self.core) then self.core.head else 0
 
     /** How many elements there are -- `len()` under the name the field had. */
-    count -> usize = self.core.count
+    count -> usize = self.len()
 
-    len(self) -> usize = self.core.count
+    len(self) -> usize = if stored(&self.core) then self.core.count else 0
 
-    cap(self) -> usize = self.core.elems.len
+    cap(self) -> usize = if stored(&self.core) then self.core.elems.len else 0
 
-    is_empty(self) -> bool = self.core.count == 0
-
-    @inline
-    at(self, i: usize) -> T = self.core.at(i)
-
-    set(self, i: usize, v: T) = self.core.set(i, v)
-
-    first(self) -> Option[T] = self.core.first()
-
-    last(self) -> Option[T] = self.core.last()
+    is_empty(self) -> bool = self.len() == 0
 
     @inline
-    push_back(self, v: T) = self.core.push_back(v)
+    at(self, i: usize) -> T
+        if !stored(&self.core) then past_end(i)
+        self.core.at(i)
+
+    set(self, i: usize, v: T)
+        if !stored(&self.core) then past_end(i)
+        self.core.set(i, v)
+
+    first(self) -> Option[T] = if stored(&self.core) then self.core.first() else None
+
+    last(self) -> Option[T] = if stored(&self.core) then self.core.last() else None
+
+    @inline
+    push_back(self, v: T)
+        if !stored(&self.core) then unassigned("Deque", "deque()")
+        self.core.push_back(v)
 
     /** The end `Buf` has no answer for at all. */
     @inline
-    push_front(self, v: T) = self.core.push_front(v)
+    push_front(self, v: T)
+        if !stored(&self.core) then unassigned("Deque", "deque()")
+        self.core.push_front(v)
 
     @inline
-    pop_front(self) -> Option[T] = self.core.pop_front()
+    pop_front(self) -> Option[T] = if stored(&self.core) then self.core.pop_front() else None
 
     @inline
-    pop_back(self) -> Option[T] = self.core.pop_back()
+    pop_back(self) -> Option[T] = if stored(&self.core) then self.core.pop_back() else None
 
     /** The elements dropped and the head put back at the start. The storage is kept, which is what
      * makes a deque reused across passes of a loop allocate once rather than once per pass.
      */
-    clear(self) = self.core.clear()
+    clear(self)
+        if stored(&self.core) then self.core.clear()
 
     /** A second deque holding the same elements in the same order, the front put back at the start
      * of its storage -- the one way to get a deque that is not this one, every other way of handing a
      * `Deque` on handing on this one.
      */
     copy(self) -> Deque[T]
-        var slots: []Option[T] = [None; self.core.elems.len]
+        var slots: []Option[T] = [None; self.cap()]
 
-        for i in 0..<self.core.count
+        for i in 0..<self.len()
             slots[i] = Some(self.core.at(i))
 
-        Deque(DequeCore(slots, 0, self.core.count))
+        Deque(DequeCore(slots, 0, self.len()))
+    end copy
+
+    /** This name's share of the ring given back, and the handle left naming nothing -- the state
+     * zeroed storage starts in, where every reader answers as an empty deque does. Nothing is
+     * allocated, which is why a finalizer for raw storage calls this rather than assigning `deque()`.
+     */
+    release(*self) = forget(self)
 end Deque
+
+private past_end(i: usize) -> never
+    print("panic: index", i, "past the 0 elements of a Deque")
+    exit(1)
 
 /** `for x in d` walks a deque from the front to the back, through the cursor `walk` answers. */
 impl[T] Walk for Deque[T]
     type Walker = DequeCursor[T]
-    walk(self) -> DequeCursor[T] = DequeCursor(self.core.elems, self.core.head, self.core.count, 0)
+    walk(self) -> DequeCursor[T]
+        if !stored(&self.core) then return DequeCursor([], 0, 0, 0)
+        DequeCursor(self.core.elems, self.core.head, self.core.count, 0)
 
 /** The ring itself, which every `Deque` naming it shares. Everything that moves the head, the count
  * or the storage lives here, so a push through one handle -- a growth included -- is what every other

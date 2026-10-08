@@ -821,3 +821,65 @@ for_walks_the_buffer_as_it_was()
     assert_eq(b.len(), 4)
     assert_eq(b.at(3), 20)
 end for_walks_the_buffer_as_it_was
+
+// -- zeroed storage -------------------------------------------------------------------------------
+
+// A buffer in storage the program zeroed itself, as a `calloc`ed block or a collector's arena holds
+// one: a handle naming no buffer at all.
+private zeroed_word() -> [1]usize = [0]
+
+@test("a buffer in zeroed storage answers as an empty one")
+zeroed_reads_empty()
+    var raw = zeroed_word()
+    val p: *Buf[int] = ptr_cast(&raw[0])
+
+    assert_eq(p.len(), 0)
+    assert_eq(p.count, 0)
+    assert_eq(p.cap(), 0)
+    assert(p.is_empty())
+    assert_eq(p.view().len, 0)
+    assert_eq(p.elems.len, 0)
+    assert(p.pop().is_none())
+    assert_eq(p.copy().len(), 0)
+
+    var walked = 0
+
+    for x in *p
+        walked += 1
+
+    assert_eq(walked, 0)
+end zeroed_reads_empty
+
+@test("a buffer in zeroed storage takes an assignment, and release leaves it empty again")
+zeroed_assign_then_release()
+    var raw = zeroed_word()
+    val p: *Buf[int] = ptr_cast(&raw[0])
+
+    *p = buf()
+    p.push(3)
+    assert_eq(p.count, 1)
+
+    p.release()
+    assert_eq(raw[0], 0)
+    assert_eq(p.len(), 0)
+
+    p.release()
+    assert_eq(p.len(), 0)
+end zeroed_assign_then_release
+
+@test("release gives back only this name's share")
+release_keeps_other_names()
+    var a: Buf[int] = buf()
+    var b = a
+
+    a.push(1)
+    b.release()
+    assert_eq(b.len(), 0)
+    assert_eq(a.len(), 1)
+
+@test(should_trap)
+zeroed_push_panics()
+    var raw = zeroed_word()
+    val p: *Buf[int] = ptr_cast(&raw[0])
+
+    p.push(1)

@@ -278,6 +278,19 @@ end BufCore
  * **It has no zero value.** A buffer is a box, and a box is made by somebody, so `var b: Buf[int]`
  * with nothing after it is refused -- write `= buf()`.
  *
+ * **A `Buf` in storage the program zeroed itself is EMPTY until it is assigned.** A `calloc`ed block,
+ * a collector's arena or any other memory the language did not initialise holds a handle naming no
+ * buffer at all. Every reader answers as an empty buffer does -- `len()` is 0, `view()` is empty,
+ * `at` reports the index past the end, `for` visits nothing, `copy()` makes a fresh empty buffer --
+ * and assigning `buf()` into it gives it storage. What cannot work is growing it in place: a member
+ * that adds an element (`push`, `extend`, `insert`) is handed the handle by value and has nowhere to
+ * put a buffer it made, so it panics, saying so, rather than adding to nothing.
+ *
+ * **`release()` is the way back to that state without allocating**: it lets go of this name's share
+ * of the buffer -- the elements go when the last name does -- and leaves the handle naming nothing,
+ * as zeroed storage does. It is what a finalizer for raw storage calls, where assigning `buf()` would
+ * make a fresh buffer that is lost when the storage is freed.
+ *
  * The bounds-checked members panic rather than returning an `Option`, which is the same bargain
  * `unwrap` makes -- an index past the end is a mistake in the program, not a value it meant to
  * handle -- while `pop` returns one, because taking from an empty sequence is a question a caller
@@ -290,38 +303,57 @@ struct Buf[T]
      * as `&b.elems[i]` is. It is read-only as a field: the storage is replaced only by the buffer's
      * own growth, which is what keeps the count from passing it.
      */
-    elems -> []T = self.core.elems
+    elems -> []T = if stored(&self.core) then self.core.elems else []
 
-    len(self) -> usize = self.core.count
+    /** How many elements there are -- `len()` under the name the field had. Read-only: the count is
+     * the buffer's to move.
+     */
+    count -> usize = self.len()
 
-    cap(self) -> usize = self.core.elems.len
+    len(self) -> usize = if stored(&self.core) then self.core.count else 0
 
-    is_empty(self) -> bool = self.core.count == 0
+    cap(self) -> usize = if stored(&self.core) then self.core.elems.len else 0
 
-    at(self, i: usize) -> T = self.core.at(i)
+    is_empty(self) -> bool = self.len() == 0
 
-    set(self, i: usize, v: T) = self.core.set(i, v)
+    at(self, i: usize) -> T
+        if !stored(&self.core) then past_end(i, 0)
+        self.core.at(i)
+
+    set(self, i: usize, v: T)
+        if !stored(&self.core) then past_end(i, 0)
+        self.core.set(i, v)
 
     @inline
-    push(self, v: T) = self.core.push(v)
+    push(self, v: T)
+        if !stored(&self.core) then unassigned("Buf", "buf()")
+        self.core.push(v)
 
-    extend(self, xs: []const T) = self.core.extend(xs)
+    extend(self, xs: []const T)
+        if !stored(&self.core) then unassigned("Buf", "buf()")
+        self.core.extend(xs)
 
-    pop(self) -> Option[T] = self.core.pop()
+    pop(self) -> Option[T] = if stored(&self.core) then self.core.pop() else None
 
-    truncate(self, n: usize) = self.core.truncate(n)
+    truncate(self, n: usize)
+        if stored(&self.core) then self.core.truncate(n)
 
-    clear(self) = self.core.truncate(0)
+    clear(self)
+        if stored(&self.core) then self.core.truncate(0)
 
-    insert(self, i: usize, v: T) = self.core.insert(i, v)
+    insert(self, i: usize, v: T)
+        if !stored(&self.core) then unassigned("Buf", "buf()")
+        self.core.insert(i, v)
 
-    remove(self, i: usize) -> T = self.core.remove(i)
+    remove(self, i: usize) -> T
+        if !stored(&self.core) then past_end(i, 0)
+        self.core.remove(i)
 
     /** A second buffer holding the same elements, sized to them -- the one way to get a buffer that
      * is not this one, every other way of handing a `Buf` on handing on this one.
      */
     copy(self) -> Buf[T]
-        var out: Buf[T] = Buf(BufCore(slot_storage(self.core.count), 0))
+        var out: Buf[T] = Buf(BufCore(slot_storage(self.len()), 0))
 
         out.extend(self.view())
         out
@@ -330,8 +362,39 @@ struct Buf[T]
      * a view of the storage rather than a copy, so it is only valid while nothing pushes -- through
      * this name or any other for the same buffer.
      */
-    view(self) -> []T = self.core.view()
+    view(self) -> []T = if stored(&self.core) then self.core.view() else []
+
+    /** This name's share of the buffer given back, and the handle left naming nothing -- the state
+     * zeroed storage starts in, where every reader answers as an empty buffer does. Nothing is
+     * allocated, which is why a finalizer for raw storage calls this rather than assigning `buf()`.
+     * Assign `buf()` to grow it again.
+     */
+    release(*self) = forget(self)
 end Buf
+
+/** Whether a counted handle names anything. One the language made always does; one read out of
+ * storage the program zeroed itself -- a `calloc`ed block, a collector's arena -- names nothing until
+ * it is assigned, and the containers answer as empty there rather than reading through it. The test
+ * is on the handle's own word, because a reference has no spelling for "none" of its own.
+ */
+private[sysl] stored[T](r: *&T) -> bool
+    val word: *usize = ptr_cast(r)
+    *word != 0
+
+/** The handle at `p` given back and left naming nothing, as zeroed storage does. The assignment is
+ * what gives the share back -- releasing a handle that names nothing being nothing, which is what lets
+ * the all-zero value be assigned at all.
+ */
+private[sysl] forget[H](p: *H)
+    var nothing: [1]usize = [0]
+    val zero: *H = ptr_cast(&nothing[0])
+    *p = *zero
+
+/** The report a container makes when it is asked to grow in storage nobody gave it. */
+private[sysl] unassigned(kind: string, maker: string) -> never
+    print(s"panic: this $kind was never given storage -- assign `$maker` to it first (a container in zeroed memory is empty until it is assigned)")
+    exit(1)
+end unassigned
 
 // The report an index past the end makes, out of line because of what a bounds-checked member costs
 // when it is not. Written inline, the report is a dozen calls in the middle of a two-instruction
