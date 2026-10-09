@@ -1,0 +1,214 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@no_alloc` above ONE function or method (`reference/attributes.md § @no_alloc on a function`): the
+// module's two rules -- what a body makes, at the outermost allocation, and what it reaches, at the
+// smallest sub-tree that still arrives at an allocating function -- applied to that body alone, its
+// callees held through the second. A sibling in the same module may allocate; a function under a
+// module that declared the clause answers to the module's, exactly as before.
+//
+// **In the header the word is still the module's**, so every fixture puts a declaration above the
+// annotated function: the header is read first and a `@no_alloc` directly under `module` is the
+// clause, however many blank lines follow it.
+
+private var fna_library_checked: bool = false
+private var fna_library_there: bool = false
+
+private fna_ready() -> bool
+    if !fna_library_checked
+        fna_library_checked = true
+        fna_library_there = std_root().is_ok()
+
+    if !fna_library_there
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end fna_ready
+
+private fna_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+private fna_check(said: string, part: string) = assert(fna_says(said, part), said)
+
+// A project: `thing/a.sysl` holding the text given, under `module thing`, and a main calling into it.
+private fna_write(thing: string, main: string) -> string
+    val root = make_temp_dir("sysl-fn-no-alloc").unwrap()
+
+    make_dir_all(s"$root/thing").unwrap()
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/thing/a.sysl", s"module thing\n\n$thing").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    root
+end fna_write
+
+// Everything the project has to say for itself, the lowering included.
+private fna_err(thing: string, main: string) -> string
+    val root = fna_write(thing, main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fna_err
+
+// What the project prints, or what the build had to say about it.
+private fna_ran(thing: string, main: string) -> string
+    val root = fna_write(thing, main)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end fna_ran
+
+private fna_tail() -> string =
+    "an allocator-free function may only call what is allocator-free itself"
+
+// The allocating helper every case reaches: it boxes, which is a reference.
+private const fna_helper: string = "helper(n: int) -> &int = n\n\n"
+
+@test("a '@no_alloc' function calling an allocating helper is refused, naming itself and what is made")
+fna_calling_an_allocating_helper()
+    if !fna_ready() then return
+
+    val said = fna_err(fna_helper + "@no_alloc\non_irq(n: int) -> int = *helper(n)\n",
+                       "print(thing.on_irq(3))\n")
+
+    fna_check(said, "this reaches 'thing.helper', which makes a reference, and 'thing.on_irq' " +
+                    "declared '@no_alloc' — " + fna_tail())
+    fna_check(said, "thing/a.sysl:6:")
+
+@test("a sibling in the same module may allocate")
+fna_a_sibling_may_allocate()
+    if !fna_ready() then return
+
+    assert_eq(fna_ran(fna_helper + "@no_alloc\nadd(n: int) -> int = n + 1\n\n" +
+                      "sibling(n: int) -> int = *helper(n) + 1\n",
+                      "print(thing.add(1), thing.sibling(5))\n"),
+              "2 6\n")
+
+@test("a callee's callee is followed, and the refusal quotes the call path")
+fna_the_transitive_case()
+    if !fna_ready() then return
+
+    val said = fna_err(fna_helper + "middle(n: int) -> int = *helper(n)\n\n" +
+                       "@no_alloc\non_irq(n: int) -> int = middle(n) + 1\n",
+                       "print(thing.on_irq(3))\n")
+
+    fna_check(said, "this reaches 'thing.helper', which makes a reference, by the call path " +
+                    "'thing.on_irq' → 'thing.middle' → 'thing.helper', and 'thing.on_irq' declared " +
+                    "'@no_alloc' — " + fna_tail())
+
+@test("what the body itself makes is refused at the outermost allocation, naming the function")
+fna_what_the_body_makes()
+    if !fna_ready() then return
+
+    val said = fna_err(fna_helper + "@no_alloc\nshown(n: int) -> int = str(n).len\n",
+                       "print(thing.shown(3))\n")
+
+    fna_check(said, "the string a value renders as needs an allocator, and 'thing.shown' declared " +
+                    "'@no_alloc' — it may hold and release storage made elsewhere, and may make none " +
+                    "of its own")
+
+@test("a view that would be promoted to the heap is refused in a '@no_alloc' function")
+fna_a_promoted_view()
+    if !fna_ready() then return
+
+    val said = fna_err(fna_helper + "@no_alloc\nf() -> []int\n    var a: [3]int = [1, 2, 3]\n" +
+                       "    a[0..<3]\n",
+                       "print(thing.f()[0])\n")
+
+    fna_check(said, "so the array would move to the heap to outlive the frame — and 'thing.f' " +
+                    "declared '@no_alloc', so there is nothing to move it into")
+
+@test("a method may carry it, and is held to it")
+fna_a_method()
+    if !fna_ready() then return
+
+    val said = fna_err(fna_helper + "struct Counter\n    n: int\n\n    @no_alloc\n" +
+                       "    boxed(self) -> int = *helper(self.n)\n",
+                       "print(thing.Counter(2).boxed())\n")
+
+    fna_check(said, "this reaches 'thing.helper', which makes a reference")
+    fna_check(said, "'thing.Counter.boxed' declared '@no_alloc' — " + fna_tail())
+
+@test("and a method that keeps it compiles and runs")
+fna_a_method_that_keeps_it()
+    if !fna_ready() then return
+
+    assert_eq(fna_ran(fna_helper + "struct Counter\n    n: int\n\n    @no_alloc\n" +
+                      "    next(self) -> int = self.n + 1\n",
+                      "print(thing.Counter(2).next())\n"),
+              "3\n")
+
+@test("a function declared inside another is a closure, and is refused the annotation")
+fna_a_nested_function()
+    if !fna_ready() then return
+
+    val said = fna_err(fna_helper + "outer(n: int) -> int\n    @no_alloc\n    inner(k: int) -> int = k + n\n\n" +
+                       "    inner(1)\n",
+                       "print(thing.outer(3))\n")
+
+    fna_check(said, "'@no_alloc' holds a top-level function or a method, and 'inner' is declared " +
+                    "inside another function, which makes it a closure")
+
+@test("above a struct below the header it is refused, naming both readings")
+fna_above_a_struct()
+    if !fna_ready() then return
+
+    val said = fna_err(fna_helper + "@no_alloc\nstruct P\n    x: int\n", "print(1)\n")
+
+    fna_check(said, "this attribute belongs in the file's header")
+    fna_check(said, "Above a function or a method, '@no_alloc' holds that one definition instead, " +
+                    "and this declares neither")
+
+@test("above a field it is refused, a field having no body")
+fna_above_a_field()
+    if !fna_ready() then return
+
+    val said = fna_err(fna_helper + "struct P\n    @no_alloc\n    x: int\n", "print(1)\n")
+
+    fna_check(said, "'@no_alloc' holds a method to a promise about what its body does")
+
+@test("directly under the header it is still the module's clause, and holds every sibling")
+fna_under_the_header_it_is_the_module()
+    if !fna_ready() then return
+
+    val said = fna_err("@no_alloc\n\nadd(n: int) -> int = n + 1\n\nboxed(n: int) -> &int = n\n",
+                       "print(thing.add(1), *thing.boxed(2))\n")
+
+    fna_check(said, "a reference needs an allocator, and this module declared '@no_alloc'")
+
+@test("under a module that declared the clause, a function's own annotation changes no message")
+fna_under_a_module_clause()
+    if !fna_ready() then return
+
+    val said = fna_err("@no_alloc\n\nimport sysl.io.line_text\n\n" +
+                       "@no_alloc\ntext(b: []const u8) -> string = line_text(b).unwrap_or(\"\")\n",
+                       "var bytes: [2]u8 = [104, 105]\nprint(thing.text(bytes[0..<2]))\n")
+
+    fna_check(said, "this reaches 'sysl.text.from_utf8', which makes heap storage, and this module " +
+                    "declared '@no_alloc' — an allocator-free module may only call what is " +
+                    "allocator-free itself")
+    assert(!fna_says(said, "'thing.text' declared"), said)

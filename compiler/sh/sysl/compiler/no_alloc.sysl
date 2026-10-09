@@ -92,6 +92,12 @@ allocates(e: TExpr) -> Option[string] = *e.kind match
 // a type is chosen -- by somebody else, in a module of their own. An instantiation is passed over
 // rather than dropped, so a module calling a generic that allocates is reported at *its* call, which
 // is the line its author can change.
+//
+// **A function may make the promise for itself** (`reference/attributes.md § @no_alloc on a
+// function`): `@no_alloc` above one definition holds that body to both rules exactly as the module's
+// clause holds each of its bodies, and its callees through the second -- so a sibling in the same
+// module may allocate, and a function under a module that already declared the clause answers to the
+// module's, the stronger of the two.
 check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
     var any = machine_has_no_heap(a)
 
@@ -101,15 +107,26 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
     for module_test_narrow in a.tables.module_test_narrows
         if module_test_narrow.1 == CapHeap then any = true
 
+    for i in 0..<funcs.len()
+        if funcs.at(i).marks.gives_up(NoAllocWord) then any = true
+
+    for f in a.tables.abstracts
+        if f.marks.gives_up(NoAllocWord) then any = true
+
     // Lazily, because building the call graph walks every body in the program: a compilation with
     // no clause anywhere -- which is almost all of them -- should pay nothing at all for this pass.
     if !any then return
 
     var seeds: Buf[string] = buf()
+    var made: Buf[(string, string)] = buf()
     val graph = with_abstract_callees(a, funcs)
 
     for item in graph
-        if first_allocation(item.body).is_some() then seeds.push(item.name)
+        first_allocation(item.body) match
+            Some(what) ->
+                seeds.push(item.name)
+                made.push((item.name, what))
+            None -> ()
 
     val walk = reaches_over(graph, vtables, seeds)
 
@@ -148,12 +165,11 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         // seam through the middle of one module's tests.
         val scaffolding = test_only_file(a, scope.src.name) || runner_func(a, f.name)
 
-        if !no_alloc_here(a, scope, module_name, scaffolding) then continue
-
-        val why = because(a, module_name, scaffolding)
-
-        scan_allocations(a, scope, f.body, why)
-        blame_block(a, walk, scope, f.body, why)
+        held_to(a, scope, module_name, scaffolding, f, made) match
+            Some(held) ->
+                scan_allocations(a, scope, f.body, held.why)
+                blame_block(a, walk, scope, f.body, held)
+            None -> ()
 
     // **And the generic declarations, by the body each was written as.** The loop above passed every
     // instantiation over, so without this a module could give the allocator up and then box a value
@@ -168,12 +184,11 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         val module_name = scope.module_name
         val scaffolding = test_only_file(a, scope.src.name)
 
-        if !no_alloc_here(a, scope, module_name, scaffolding) then continue
-
-        val why = because(a, module_name, scaffolding)
-
-        scan_allocations(a, scope, f.body, why)
-        blame_block(a, walk, scope, f.body, why)
+        held_to(a, scope, module_name, scaffolding, f, made) match
+            Some(held) ->
+                scan_allocations(a, scope, f.body, held.why)
+                blame_block(a, walk, scope, f.body, held)
+            None -> ()
 
     // The module storage is code like any other: an initializer that makes heap storage makes it in
     // the module that wrote the declaration.
@@ -190,13 +205,43 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         if !no_alloc_here(a, scope, module_name, scaffolding) then continue
 
         val why = because(a, module_name, scaffolding)
+        val held = Held(why, None, made)
         val skip: &Skipped = Skipped(buf())
         val said: &Counted = Counted(0)
 
         walk_texpr(v.init.unwrap(), expr_walk(false, e -> scan_one(a, scope, skip, e, why)))
-        walk_texpr(v.init.unwrap(), TWalk(false, e -> blame_one(a, walk, scope, e, why, said),
-                                          w -> blame_write(a, walk, scope, w, why, said), st -> ()))
+        walk_texpr(v.init.unwrap(), TWalk(false, e -> blame_one(a, walk, scope, e, held, said),
+                                          w -> blame_write(a, walk, scope, w, held, said), st -> ()))
 end check_no_alloc
+
+// The word `@no_alloc` is recorded under on a function's marks: what follows `no_`.
+const NoAllocWord: string = "alloc"
+
+// Whose promise one body answers to, and how its refusals say so.
+//
+// **`func` is the function that made the promise itself**, and nothing where the promise is the
+// module's or the machine's: a function's refusals name it, and quote the chain of calls by which the
+// body arrives at an allocation, since the allocation is in somebody else's code and possibly
+// somebody else's module, where a module's refusal has always named only the far end.
+private struct Held
+    why: string
+    func: Option[string]
+    made: Buf[(string, string)]
+
+// The promise a body is held to, or nothing where it made none. **The module's comes first**: it
+// holds every body in the module, so a function there carrying `@no_alloc` as well says nothing the
+// module did not, and the refusal names the clause that would still hold were the annotation gone.
+private held_to(a: &Analysis, scope: Scope, module_name: string, scaffolding: bool, f: TFunc,
+                made: Buf[(string, string)]) -> Option[Held]
+    if no_alloc_here(a, scope, module_name, scaffolding) then
+        return Some(Held(because(a, module_name, scaffolding), None, made))
+
+    if !f.marks.gives_up(NoAllocWord) then return None
+
+    val name = qualified_name(f.name)
+
+    Some(Held(s"'$name' declared '@no_alloc'", Some(f.name), made))
+end held_to
 
 // The program's functions, and beside them every generic body a generic's own body calls at its
 // stand-ins, filed under the name that call wrote.
@@ -250,19 +295,19 @@ private val_home(a: &Analysis, symbol: string) -> Scope
     empty_scope()
 end val_home
 
-// The first construction under a body that makes heap storage, wherever it is.
+// What the first construction under a body that makes heap storage makes, wherever it is.
 private first_allocation(b: TBlock) -> Option[string]
-    val found: &Counted = Counted(0)
+    val found: &FirstMade = FirstMade(None)
 
     walk_block_stmts(b, expr_walk(false, e -> note_allocation(found, e)))
-
-    if found.n == 0 then return None
-
-    Some("yes")
+    found.what
 end first_allocation
 
-private note_allocation(found: &Counted, e: TExpr)
-    if allocates(e).is_some() then found.n = 1
+private struct FirstMade
+    what: Option[string]
+
+private note_allocation(found: &FirstMade, e: TExpr)
+    if found.what.is_none() then found.what = allocates(e)
 end note_allocation
 
 // Walks a body, reporting the OUTERMOST allocation on each path and going no deeper into one.
@@ -315,31 +360,33 @@ end scan_one
 // together, the erasure opening the table and the call opening the slot. The reference descends from
 // the whole body into whichever parts still arrive and reports where none of them does, so such a
 // body is reported at the first statement that arrives on its own, or where the body begins.
-private blame_block(a: &Analysis, walk: &Reaches, scope: Scope, b: TBlock, why: string)
+private blame_block(a: &Analysis, walk: &Reaches, scope: Scope, b: TBlock, held: Held)
     val said: &Counted = Counted(0)
 
-    walk_block_stmts(b, TWalk(false, e -> blame_one(a, walk, scope, e, why, said),
-                              w -> blame_write(a, walk, scope, w, why, said), st -> ()))
+    walk_block_stmts(b, TWalk(false, e -> blame_one(a, walk, scope, e, held, said),
+                              w -> blame_write(a, walk, scope, w, held, said), st -> ()))
 
     if said.n > 0 then return
 
-    val whole = least_seed(walk, refs_of_block(b))
+    val all = refs_of_block(b)
+    val whole = least_seed(walk, all)
 
     if whole.is_none() then return
 
     for stmt in b.stmts
-        val one = least_seed(walk, refs_of_stmt(stmt))
+        val refs = refs_of_stmt(stmt)
+        val one = least_seed(walk, refs)
 
         if one.is_some()
             first_span_of(stmt) match
-                Some(at) -> reaches_fault(a, scope, at, one.unwrap(), why)
+                Some(at) -> reaches_fault(a, walk, scope, at, refs, one.unwrap(), held)
                 None -> ()
             return
 
     val start = if b.stmts.is_empty() then None else first_span_of(b.stmts.at(0))
     val at = if start.is_some() then start else b.result.map(r -> r.span)
 
-    if at.is_some() then reaches_fault(a, scope, at.unwrap(), whole.unwrap(), why)
+    if at.is_some() then reaches_fault(a, walk, scope, at.unwrap(), all, whole.unwrap(), held)
 end blame_block
 
 // Everything one statement names, following nothing.
@@ -364,9 +411,37 @@ private struct FirstSpan
 private first_seen(found: &FirstSpan, e: TExpr)
     if found.span.is_none() then found.span = Some(e.span)
 
-private reaches_fault(a: &Analysis, scope: Scope, at: Span, who: string, why: string) =
-    a.fault(scope, at, s"this reaches '${qualified_name(handle_side(a, who))}', which makes heap " +
-            s"storage, and $why — an allocator-free module may only call what is allocator-free itself")
+private reaches_fault(a: &Analysis, walk: &Reaches, scope: Scope, at: Span, refs: &Refs, who: string,
+                      held: Held)
+    val far = qualified_name(handle_side(a, who))
+
+    if held.func.is_none()
+        a.fault(scope, at, s"this reaches '$far', which makes heap storage, and ${held.why} — an " +
+                "allocator-free module may only call what is allocator-free itself")
+        return
+    end if
+
+    // **A function's refusal says what is made and by which calls**: the far end is somebody else's
+    // code, often in somebody else's module, and the line to change is in the middle of the chain as
+    // often as at either end of it.
+    var what = "heap storage"
+
+    for item in held.made
+        if item.0 == who then what = item.1
+
+    val chain = call_path(walk, refs, who)
+    var route = ""
+
+    if chain.len() > 1
+        route = s", by the call path '${qualified_name(held.func.unwrap())}'"
+
+        for step in chain
+            route = route + s" → '${qualified_name(handle_side(a, step))}'"
+    end if
+
+    a.fault(scope, at, s"this reaches '$far', which makes $what$route, and ${held.why} — an " +
+            "allocator-free function may only call what is allocator-free itself")
+end reaches_fault
 
 // **A member of a handle's core is named as the handle's.** A container is a struct whose one field
 // is a counted reference to the struct that does the work -- `Buf[T]` over `BufCore[T]`, `Map[K, V]`
@@ -398,19 +473,20 @@ private held_core(t: Type) -> Option[(string, string)] = t match
         _ -> None
     _ -> None
 
-private blame_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, why: string, said: &Counted)
-    val mine = least_seed(walk, own_refs(e))
+private blame_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, held: Held, said: &Counted)
+    val own = own_refs(e)
+    val mine = least_seed(walk, own)
 
     if mine.is_none() then return
     if reaches_a_seed(walk, strict_refs(e)) then return
 
     said.n += 1
-    reaches_fault(a, scope, e.span, mine.unwrap(), why)
+    reaches_fault(a, walk, scope, e.span, own, mine.unwrap(), held)
 end blame_one
 
 // A write's own names -- the dispatched operator it goes through, and the invariant it re-establishes
 // -- are reported at the place it writes, which is the nearest thing it has to a position of its own.
-private blame_write(a: &Analysis, walk: &Reaches, scope: Scope, w: TWrite, why: string,
+private blame_write(a: &Analysis, walk: &Reaches, scope: Scope, w: TWrite, held: Held,
                     said: &Counted)
     val out = no_refs()
 
@@ -421,5 +497,5 @@ private blame_write(a: &Analysis, walk: &Reaches, scope: Scope, w: TWrite, why: 
     if mine.is_none() then return
 
     said.n += 1
-    reaches_fault(a, scope, w.place.span, mine.unwrap(), why)
+    reaches_fault(a, walk, scope, w.place.span, out, mine.unwrap(), held)
 end blame_write
