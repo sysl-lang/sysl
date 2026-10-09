@@ -930,23 +930,43 @@ meant, and the two readings are different programs: at column 8 the second `prin
 positive `n`, at column 4 it runs for every one. An `end` marker is a line like any other and is held to
 the same rule. A tab counts as one column.
 
-The same holds for an `else` written under its `if` when the `if` sits to the right of a `=`: the `if`'s
-column is no block's margin. Put the `else` at the statement's margin, or open the value as a block of
-its own:
+**One ragged line is not refused: an `else` or `elif` lined up exactly under the `if` it continues.**
+An `if` written to the right of a `=` sits at a column no block opened, and the branch lined up under it
+is the layout everyone reaches for:
 
 ```sysl
 sign(n: int) -> string
-    val word =
-        if n < 0 then "negative"
-        else "not negative"
+    val word = if n < 0 then
+                   "negative"
+               elif n == 0 then
+                   "zero"
+               else "positive"
 
     word
 
-print(sign(-3))
+print(sign(-3), sign(0), sign(5))
 ```
 
 ```output
-negative
+negative zero positive
+```
+
+It is read exactly as the same branch written at the statement's margin, and it holds for an `else if`,
+for an `if` nested in another's branch, and for a statement `if` after an arm's `->`. The `if` has to be
+the one the line continues — in the same statement — and the column has to be the `if` word's own; an
+`else` anywhere else that no block opened is refused as above:
+
+```sysl
+sign(n: int) -> string
+    val word = if n < 0 then
+                   "negative"
+                 else "not negative"
+
+    word
+```
+
+```error
+a line indented 17 columns lines up with no open block: it sits between the block indented 19 and the one indented 4 — indent it to one of the two
 ```
 
 ### Brackets suspend the rule
