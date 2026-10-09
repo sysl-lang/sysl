@@ -224,11 +224,59 @@ enf_a_nested_helper_has_no_address() =
                 "travel beside the address is the frame it reads, and a '*extern' is one word. A " +
                 "top-level function is what has an address")
 
-@test("and may not be generic")
+@test("and may not be generic, the refusal naming the binding that made it nested")
 enf_a_nested_helper_may_not_be_generic() =
     enf_refused("val base = 2\nscaled[T](n: T) -> int = base\nprint(str(scaled(1)))\n",
-                "error: 'scaled' is declared inside a function body and cannot be generic — the type " +
-                "arguments would have nowhere to come from, since nothing outside the body calls it")
+                "error: 'scaled' reads 'base', which the entry file's statements bind, so it is a nested " +
+                "function of them, and a nested function cannot be generic — it is lowered once, into " +
+                "the frame it reads. Declaring 'base' 'static', with its type, makes it the module's and " +
+                "leaves 'scaled' an ordinary function that may be generic; otherwise take the type " +
+                "parameters off 'scaled'")
+
+// The case the keel kernel met: a generic helper counting failures into a `var` of the body. The
+// refusal is the one thing said -- neither the binding it reads nor the calls to it are reported as
+// names standing for nothing.
+@test("a generic helper reading a 'var' of the body is refused once, naming the 'var'")
+enf_a_generic_helper_reading_a_var_is_refused_once()
+    if !enf_ready() then return
+
+    val out = enf_outcome([("", "main.sysl",
+                            "var failures = 0\n\nfailed[T](r: Result[T, int])\n" +
+                            "    if !r.is_ok() then failures += 1\n\n" +
+                            "val r: Result[string, int] = Err(1)\nfailed(r)\nprint(failures)\n")])
+
+    assert(!out.1, s"it ran: ${out.0}")
+    assert(out.0.contains("error: 'failed' reads 'failures', which the entry file's statements bind, " +
+                          "so it is a nested function of them, and a nested function cannot be " +
+                          "generic — it is lowered once, into the frame it reads. Declaring " +
+                          "'failures' 'static', with its type, makes it the module's and leaves " +
+                          "'failed' an ordinary function that may be generic; otherwise take the " +
+                          "type parameters off 'failed'"), out.0)
+    assert(!out.0.contains("undefined"), out.0)
+end enf_a_generic_helper_reading_a_var_is_refused_once
+
+@test("one nested only through the sibling it calls is told which sibling")
+enf_a_generic_helper_calling_a_nested_one_is_told_which() =
+    enf_refused("var seen = 0\nnote()\n    seen += 1\n\nnoted[T](x: T) -> T\n    note()\n    x\n\n" +
+                "print(noted(1))\n",
+                "error: 'noted' calls 'note', which reads what the entry file's statements bind, so " +
+                "'noted' is a nested function of them too, and a nested function cannot be generic — " +
+                "it is lowered once, into the frame it reads. Declaring what 'note' reads 'static', " +
+                "with its type, makes it the module's and leaves 'noted' an ordinary function that " +
+                "may be generic; otherwise take the type parameters off 'noted'")
+
+@test("and the 'static' the refusal names makes it generic at as many types as it is called at")
+enf_a_static_binding_leaves_the_helper_generic() =
+    enf_prints("static var failures: int = 0\n\nfailed[T](r: Result[T, int])\n" +
+               "    if !r.is_ok() then failures += 1\n\n" +
+               "val r: Result[string, int] = Err(1)\nval q: Result[bool, int] = Ok(true)\n" +
+               "val s: Result[real, int] = Err(3)\nfailed(r)\nfailed(q)\nfailed(s)\nprint(failures)\n",
+               "2\n")
+
+@test("while a generic helper that reads nothing stays generic beside one that does")
+enf_a_generic_helper_beside_a_nested_one() =
+    enf_prints("var count = 0\nbump()\n    count += 1\n\nfirst[A, B](a: A, b: B) -> A = a\n" +
+               "bump()\nprint(first(count, \"x\"), first(\"y\", 2))\n", "1 y\n")
 
 // `main` is the platform's symbol, not a name the program calls, so it is never one of the body's
 // nested functions -- and a file running a statement is a body whatever else it declares.

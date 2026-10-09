@@ -59,9 +59,14 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
 
     // **A refusal ends the lowering.** What a nested function may not be is a property of the
     // declaration, so a group holding one is not a group: binding the names anyway would report the
-    // one mistake and then everything that followed from a body nothing could analyze.
+    // one mistake and then everything that followed from a body nothing could analyze. The names are
+    // remembered instead, so a call to one says nothing more than the refusal already did.
     for i in 0..<group.len()
-        if refuse_nested_shape(cx, span, group.at(i), names) then return buf()
+        if refuse_nested_shape(cx, span, group.at(i), names)
+            for j in 0..<names.len()
+                cx.refused_nested.push(names.at(j))
+
+            return buf()
 
     // A sibling is reached through the shared receiver rather than captured, so the names of the
     // group are bound here and are not free in each other's bodies.
@@ -190,13 +195,50 @@ private refuse_nested_shape(cx: &Analyzer, span: Span, d: FuncDecl, names: Buf[s
         return true
 
     if !d.tparams.is_empty()
-        cx.fault(span, s"'${d.name}' is declared inside a function body and cannot be generic — " +
-                 "the type arguments would have nowhere to come from, since nothing outside the " +
-                 "body calls it")
+        cx.fault(span, generic_nested_refusal(cx, d))
         return true
 
     false
 end refuse_nested_shape
+
+// Why a nested function may not be generic, said in the terms of how it came to be nested.
+//
+// **A function at the top of the entry file is nested only because of what it reads**, so there the
+// refusal names that -- the body's binding, or the sibling it calls that reads one -- and the
+// `static` that would make the binding the module's and leave the function an ordinary one, generic
+// if it says so. Written inside any other body, a function is nested by where it stands.
+private generic_nested_refusal(cx: &Analyzer, d: FuncDecl) -> string
+    val group = cx.an.tables.entry_captures
+
+    if cx.await_site == AwaitInEntry && holds_string(group, d.name)
+        var bindings: Buf[string] = buf()
+
+        for i in 0..<cx.block_declares.len()
+            bindings.push(cx.block_declares.at(i).name)
+
+        val why = entry_capture_of(d, bindings, group)
+
+        if why.is_some()
+            val name = why.unwrap().0
+            val binding = why.unwrap().1
+            val cost = "and a nested function cannot be generic — it is lowered once, into the frame " +
+                       "it reads."
+
+            if binding then
+                return s"'${d.name}' reads '$name', which the entry file's statements bind, so it is " +
+                       s"a nested function of them, $cost Declaring '$name' 'static', with its type, " +
+                       s"makes it the module's and leaves '${d.name}' an ordinary function that may " +
+                       s"be generic; otherwise take the type parameters off '${d.name}'"
+
+            return s"'${d.name}' calls '$name', which reads what the entry file's statements bind, so " +
+                   s"'${d.name}' is a nested function of them too, $cost Declaring what '$name' reads " +
+                   s"'static', with its type, makes it the module's and leaves '${d.name}' an " +
+                   s"ordinary function that may be generic; otherwise take the type parameters off " +
+                   s"'${d.name}'"
+
+    s"'${d.name}' is declared inside a function body and cannot be generic — the type arguments " +
+        "would have nowhere to come from, since nothing outside the body calls it"
+end generic_nested_refusal
 
 // What the group reads from **this** block, whether or not it has been bound yet.
 //
