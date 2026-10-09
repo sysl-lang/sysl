@@ -365,8 +365,18 @@ private first_seen(found: &FirstSpan, e: TExpr)
     if found.span.is_none() then found.span = Some(e.span)
 
 private reaches_fault(a: &Analysis, scope: Scope, at: Span, who: string, why: string) =
+    reaches_fault_through(a, scope, at, (who, who), why)
+
+// `named.0` is what the reader's code reached and `named.1` the allocating function that makes it
+// allocate; where the two differ, the second is said after the first as the reason.
+private reaches_fault_through(a: &Analysis, scope: Scope, at: Span, named: (string, string), why: string)
+    val (who, seed) = named
+    val through = if who == seed then "" else s" through '${qualified_name(handle_side(a, seed))}'"
+
     a.fault(scope, at, s"this reaches '${qualified_name(handle_side(a, who))}', which makes heap " +
-            s"storage, and $why — an allocator-free module may only call what is allocator-free itself")
+            s"storage$through, and $why — an allocator-free module may only call what is " +
+            "allocator-free itself")
+end reaches_fault_through
 
 // **A member of a handle's core is named as the handle's.** A container is a struct whose one field
 // is a counted reference to the struct that does the work -- `Buf[T]` over `BufCore[T]`, `Map[K, V]`
@@ -389,23 +399,24 @@ private handle_side(a: &Analysis, who: string) -> string
 end handle_side
 
 // The core a handle holds, with the handle's own base: a struct of one field, that field a counted
-// reference to another struct.
+// reference to another struct -- which is not itself a handle. A struct wrapping a `Buf` (`ByteSink`)
+// has that shape too, `Buf` being a reference, but `Buf` is what a program writes and never a core.
 private held_core(t: Type) -> Option[(string, string)] = t match
     Struct(d) if d.fields.len() == 1 -> d.fields.at(0).1 match
         Ref(inner, _) -> *inner match
-            Struct(c) -> Some((d.base, c.base))
+            Struct(c) -> if held_core(*inner).is_some() then None else Some((d.base, c.base))
             _ -> None
         _ -> None
     _ -> None
 
 private blame_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, why: string, said: &Counted)
-    val mine = least_seed(walk, own_refs(e))
+    val mine = named_reach(walk, own_refs(e))
 
     if mine.is_none() then return
     if reaches_a_seed(walk, strict_refs(e)) then return
 
     said.n += 1
-    reaches_fault(a, scope, e.span, mine.unwrap(), why)
+    reaches_fault_through(a, scope, e.span, mine.unwrap(), why)
 end blame_one
 
 // A write's own names -- the dispatched operator it goes through, and the invariant it re-establishes
@@ -416,10 +427,10 @@ private blame_write(a: &Analysis, walk: &Reaches, scope: Scope, w: TWrite, why: 
 
     write_refs(out, w)
 
-    val mine = least_seed(walk, out)
+    val mine = named_reach(walk, out)
 
     if mine.is_none() then return
 
     said.n += 1
-    reaches_fault(a, scope, w.place.span, mine.unwrap(), why)
+    reaches_fault_through(a, scope, w.place.span, mine.unwrap(), why)
 end blame_write
