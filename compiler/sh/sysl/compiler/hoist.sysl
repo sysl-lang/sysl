@@ -793,7 +793,7 @@ private check_signature_rules(a: &Analysis, scope: Scope, span: Span, name: stri
         a.fault(scope, span, s"'$name' needs at least one named parameter before '...'")
 
     check_rest_position(a, scope, name, params, variadic, foreign)
-    check_va_list_positions(a, scope, name, params, ret, foreign)
+    check_va_list_positions(a, scope, name, ret)
 end check_signature_rules
 
 // Where a `...T` parameter may stand, which is last and only last (`reference/declarations.md § A
@@ -833,7 +833,7 @@ check_member_signature(a: &Analysis, scope: Scope, span: Span, name: string, m: 
     if m.variadic && m.params.is_empty() && m.recv_mode().is_none() then
         a.fault(scope, span, s"'$name' needs at least one named parameter before '...'")
 
-    check_va_list_positions(a, scope, name, m.params, m.ret_type, false)
+    check_va_list_positions(a, scope, name, m.ret_type)
 end check_member_signature
 
 // A name spread as a pack has to have been DECLARED as one, and a pack may only be written as the
@@ -1003,30 +1003,18 @@ end declared_pack
 
 // Where a `va_list` may stand in a signature (`reference/ffi.md § Handing a walk on`).
 //
-// In a **sysl** signature a walk is handed on **by address**: `*va_list` is the parameter type, and
-// `&ap` is what the caller writes. A bare `va_list` parameter is refused because a parameter is a
-// by-value binding and a copy of a walk is not a walk -- advancing it would advance nothing the
-// caller could see, which is the one thing the form exists to do.
+// **A parameter may be one, in a sysl signature as in an `extern`'s.** It is C's by-value
+// `va_list`, the one `vprintf` takes: the callee walks on from wherever the caller had reached, and
+// the call writes `&ap`, because the address is the only thing sysl has and what every target's
+// answer is formed from (`TVaPass`). What crosses is the target's C convention on both sides -- the
+// value in the walk's storage, its address, or the address of a copy (`emit_func.sysl`) -- so a sysl
+// body taking one is a body a C caller can hand its own `va_list` to. A `*va_list` is the other way
+// to hand a walk on: by address, so the callee advances the caller's own.
 //
-// An **`extern`** transcribes a C header, so it is written in C's spellings and both are allowed:
-// `va_list` is C's by-value parameter, the one `vprintf` takes, and `*va_list` is C's `va_list *`.
-// What a call hands the first of those is a different thing on every target and is `TVaPass`'s
-// business; the call writes `&ap` for either, because the address is the only thing sysl has and it
-// is what both are formed from.
-//
-// **Returning a bare `va_list` is refused everywhere**, foreign or not: sysl has no by-value
-// `va_list` at all -- the type names the storage a walk lives in -- so there would be nothing to put
-// the result in. A `*va_list` return is an ordinary pointer and is allowed.
-private check_va_list_positions(a: &Analysis, scope: Scope, name: string, params: Buf[Param],
-                                ret: Option[TypeRef], foreign: bool)
-    if !foreign
-        for p in params.view()
-            if written_va_list(p.typ) then
-                a.fault(scope, p.span, "a va_list is a parameter as '*va_list', not as 'va_list' " +
-                        "— a parameter is a by-value binding, and a copy of a walk advances " +
-                        s"nothing '$name''s caller can see, so the walk is handed over by address " +
-                        "and the call writes '&ap'")
-
+// **Returning a bare `va_list` is refused everywhere**, foreign or not: the type names the storage a
+// walk lives in, so there would be nothing to put the result in. A `*va_list` return is an ordinary
+// pointer and is allowed.
+private check_va_list_positions(a: &Analysis, scope: Scope, name: string, ret: Option[TypeRef])
     ret match
         None -> ()
         Some(r) ->

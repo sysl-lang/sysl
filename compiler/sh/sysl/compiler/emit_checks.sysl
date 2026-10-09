@@ -728,16 +728,52 @@ private export_signature(a: &Analysis, f: TFunc)
     val scope = func_home(a, f.name)
 
     for p in f.params
-        if !export_crosses(p.1)
-            a.fault(scope, f.span, s"'${p.0}' of the exported '${qualified_name(f.name)}' is " +
-                    s"${type_show(p.1)}, which C has no way to spell — an exported function takes " +
-                    s"${export_spellable()}. ${export_advice(p.1)}")
+        if !export_crosses(p.1) && !is_va_list(p.1)
+            a.fault(scope, f.span, advised(s"'${p.0}' of the exported '${qualified_name(f.name)}' " +
+                                           s"is ${type_show(p.1)}, which C has no way to spell — an " +
+                                           s"exported function takes ${export_spellable()}",
+                                           export_advice(p.1)))
+        else if f.variadic && export_aggregate(p.1)
+            a.fault(scope, f.span, s"'${p.0}' of the variadic export '${qualified_name(f.name)}' is " +
+                    s"${type_show(p.1)}, an aggregate — ${variadic_export_reason()}. Take a pointer " +
+                    "to it")
 
-    if !no_value(f.ret_ty) && !export_crosses(f.ret_ty)
-        a.fault(scope, f.span, s"the exported '${qualified_name(f.name)}' returns " +
-                s"${type_show(f.ret_ty)}, which C has no way to spell — an exported function " +
-                s"returns that or nothing at all. ${export_advice(f.ret_ty)}")
+    // A `va_list` result was refused where the signature was read, for every function.
+    if !no_value(f.ret_ty) && !export_crosses(f.ret_ty) && !is_va_list(f.ret_ty)
+        a.fault(scope, f.span, advised(s"the exported '${qualified_name(f.name)}' returns " +
+                                       s"${type_show(f.ret_ty)}, which C has no way to spell — an " +
+                                       "exported function returns that or nothing at all",
+                                       export_advice(f.ret_ty)))
+    else if f.variadic && export_aggregate(f.ret_ty)
+        a.fault(scope, f.span, s"the variadic export '${qualified_name(f.name)}' returns " +
+                s"${type_show(f.ret_ty)}, an aggregate — ${variadic_export_reason()}. Return it " +
+                "through a pointer parameter")
 end export_signature
+
+// **A variadic export has no thunk in front of it, so its named parameters are scalars.** An
+// ordinary export's symbol is a thunk that gathers each argument out of the registers C put it in
+// and calls the definition (`emit_export.sysl`); a variadic one cannot be, since no function can hand
+// a C tail it was given on to another. So the definition IS the symbol, and a parameter or result
+// is admitted only where sysl's lowering and C's already agree -- a scalar, a pointer, a function
+// pointer, a simple enum, and a `va_list`. An aggregate is where they part.
+private variadic_export_reason() -> string =
+    "a variadic export is the definition itself, with no thunk in front of it to gather an aggregate " +
+    "out of the registers C spread it across, because no function can hand on a C tail it was given"
+
+// Whether a type that crosses does so as an aggregate: a struct, a tuple, or a data enum.
+private export_aggregate(t: Type) -> bool = repr(t) match
+    Struct(_) -> true
+    Enum(d) -> !d.simple
+    _ -> false
+
+private is_va_list(t: Type) -> bool = repr(t) match
+    VaList -> true
+    _ -> false
+
+// A refusal and the advice after it, joined -- or the refusal alone where there is no advice to give,
+// rather than a sentence that ends in a full stop and nothing.
+advised(said: string, advice: string) -> string =
+    if advice == "" then said else s"$said. $advice"
 
 // Two definitions exporting one symbol.
 //
@@ -866,8 +902,8 @@ export_advice(t: Type) -> string = repr(t) match
     Struct(d) -> struct_advice(t, d)
     Array(_, elem) ->
         if !export_carried(*elem)
-            s"its element is ${type_show(*elem)}, which is what C has no declaration for — the " +
-            s"array around it is fine. ${export_advice(*elem)}"
+            advised(s"its element is ${type_show(*elem)}, which is what C has no declaration for " +
+                    "— the array around it is fine", export_advice(*elem))
         else
             "C decays an array parameter to a pointer, so there is no prototype that passes one by " +
             "value. Wrap it in a struct, which is how C hands an array over as a value and lays out " +
@@ -878,6 +914,12 @@ export_advice(t: Type) -> string = repr(t) match
             "shape a C union has. Export the tag and the payload as separate parameters, or a " +
             "pointer to the whole"
         else ""
+    Unit -> "A 'unit' carries nothing and takes no room, so C has nothing to hand over — leave it out"
+    Never -> "No value of 'never' exists, so nothing could ever be handed over as one — leave it out"
+    Vector(_, _) -> "A vector travels in whatever registers the target's vector extension names, " +
+                    "and C has no portable type for one. Take a pointer to its lanes, or a struct of them"
+    VaList -> "A 'va_list' is the storage a walk lives in, laid out differently on every machine — " +
+              "a parameter may be one, and anything else holds a '*va_list'"
     _ -> ""
 
 private slice_advice() -> string =
@@ -896,9 +938,9 @@ private struct_advice(t: Type, d: &StructType) -> string
 
     for item in fields
         if !export_carried(item.1)
-            return s"'${item.0}' of ${type_show(t)} is ${type_show(item.1)}, which " +
-                   s"is what C has no declaration for — the aggregate around it is fine. " +
-                   s"${export_advice(item.1)}"
+            return advised(s"'${item.0}' of ${type_show(t)} is ${type_show(item.1)}, which " +
+                           "is what C has no declaration for — the aggregate around it is fine",
+                           export_advice(item.1))
 
     ""
 end struct_advice

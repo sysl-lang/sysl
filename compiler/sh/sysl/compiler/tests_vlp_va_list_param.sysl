@@ -1,0 +1,333 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A `va_list` parameter by value -- C's `vprintf(const char *, va_list)` -- in a sysl signature
+// (`reference/ffi.md § Handing a walk on`). The call writes `&ap`, the callee walks on from wherever
+// the caller had reached, and what crosses is the target's C convention on both sides: the value in
+// the walk's storage (Darwin arm64), the address of the caller's own storage (x86-64 System V), or
+// the address of a copy the caller made (AAPCS64). The runs are on the host; the other two answers
+// are read off the IR for their targets.
+
+// The LLVM text of one program lowered for a named target, against that target's own library.
+private vlp_ir_for(name: string, text: string) -> string
+    val t = target_named(name).unwrap()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("main.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    if !errors_of(done.an.diagnostics()).is_empty()
+        return analysis_report(errors_of(done.an.diagnostics()))
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end vlp_ir_for
+
+// The receiving body and a lender, in one program.
+private vlp_total() -> string = raw"""
+    total(n: int, ap: va_list) -> int
+        var sum = 0
+
+        for i in 0..<n do sum += va_arg(ap)
+
+        sum
+
+    relay(n: int, ...) -> int
+        var ap: va_list
+
+        va_start(ap)
+
+        val t = total(n, &ap)
+
+        va_end(ap)
+
+        t
+    end relay
+    """
+
+// -- what runs -------------------------------------------------------------------------------------
+
+@test("a va_list parameter reads the tail its caller lent it")
+vlp_a_walk_by_value_runs()
+    if !aza_ready() then return
+
+    twp_prints(vlp_total() + "print(relay(3, 4, 5, 6))\n", "15\n")
+
+// The callee starts where the lender had reached, not at the beginning of the tail.
+@test("it walks on from wherever the caller had reached")
+vlp_it_starts_where_the_caller_is()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        rest(ap: va_list) -> int
+            val x: int = va_arg(ap)
+
+            x
+
+        lend(n: int, ...) -> int
+            var ap: va_list
+
+            va_start(ap)
+
+            val first: int = va_arg(ap)
+            val second = rest(&ap)
+
+            va_end(ap)
+
+            first * 100 + second
+        end lend
+
+        print(lend(2, 7, 9))
+        """, "709\n")
+
+@test("the walk may be handed on again, by value or by address")
+vlp_handed_on_again()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        deep(ap: *va_list) -> int
+            val x: int = va_arg(ap)
+
+            x
+
+        middle(ap: va_list) -> int
+            val a: int = va_arg(ap)
+            val b = deep(&ap)
+
+            a + b
+
+        outer(ap: va_list) -> int = middle(&ap)
+
+        lend(n: int, ...) -> int
+            var ap: va_list
+
+            va_start(ap)
+
+            val t = outer(&ap)
+
+            va_end(ap)
+
+            t
+        end lend
+
+        print(lend(2, 30, 12))
+        """, "42\n")
+
+@test("and copied inside the callee, which reads it twice")
+vlp_copied_inside_the_callee()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        twice(ap: va_list) -> int
+            var again: va_list
+
+            va_copy(again, ap)
+
+            val a: int = va_arg(ap)
+            val b: int = va_arg(again)
+
+            va_end(again)
+
+            a + b
+
+        lend(n: int, ...) -> int
+            var ap: va_list
+
+            va_start(ap)
+
+            val t = twice(&ap)
+
+            va_end(ap)
+
+            t
+        end lend
+
+        print(lend(1, 21))
+        """, "42\n")
+
+@test("a member may take one")
+vlp_a_member_takes_one()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        struct Acc
+            base: int
+
+            add(self, n: int, ap: va_list) -> int
+                var sum = self.base
+
+                for i in 0..<n do sum += va_arg(ap)
+
+                sum
+
+        lend(n: int, ...) -> int
+            var ap: va_list
+
+            va_start(ap)
+
+            val t = Acc(100).add(n, &ap)
+
+            va_end(ap)
+
+            t
+        end lend
+
+        print(lend(2, 3, 4))
+        """, "107\n")
+
+@test("and so may a generic function")
+vlp_a_generic_takes_one()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        tagged[T](tag: T, ap: va_list) -> int
+            val x: int = va_arg(ap)
+
+            x
+
+        lend(n: int, ...) -> int
+            var ap: va_list
+
+            va_start(ap)
+
+            val t = tagged(1.5, &ap)
+
+            va_end(ap)
+
+            t
+        end lend
+
+        print(lend(1, 77))
+        """, "77\n")
+
+// A real C `vprintf` takes the walk a sysl function lends it, by the same rule a sysl callee does.
+@test("a sysl body and C's own vsnprintf take one walk alike")
+vlp_c_and_sysl_take_one_alike()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        import sysl.slices.as_ptr
+
+        extern vsnprintf(buf: *u8, n: usize, fmt: *u8, ap: va_list) -> int
+
+        first(ap: va_list) -> int
+            val x: int = va_arg(ap)
+
+            x
+
+        both(fmt: *u8, ...) -> int
+            var ap: va_list
+            var copy: va_list
+            var room: [32]u8 = [0; 32]
+
+            va_start(ap)
+            va_copy(copy, ap)
+
+            val written = vsnprintf(&room[0], 32, fmt, &ap)
+            val read = first(&copy)
+
+            va_end(copy)
+            va_end(ap)
+            print(str_cast(room[0..<usize(written)]))
+
+            read
+        end both
+
+        print(both(as_ptr("%d!".bytes), 42))
+        """, "42!\n42\n")
+
+// -- what crosses, per target ----------------------------------------------------------------------
+
+// Darwin arm64 passes the value in the walk's storage, so the callee puts it in a slot of its own and
+// the caller loads it.
+@test("on Darwin arm64 the callee receives the pointer in the walk and stores it in a slot")
+vlp_darwin_arm64_receives_the_value()
+    val out = vlp_ir_for("aarch64-macos", vlp_total() + "print(relay(1, 2))\n")
+
+    assert(out.contains("ptr %ap.param)"), out)
+    assert(out.contains("store ptr %ap.param, ptr %ap.addr"), out)
+end vlp_darwin_arm64_receives_the_value
+
+// x86-64 System V passes the address of the caller's own storage, and the callee walks it there.
+@test("on x86-64 the callee walks the storage whose address it was handed")
+vlp_x86_64_receives_the_address()
+    val out = vlp_ir_for("x86_64-linux", vlp_total() + "print(relay(1, 2))\n")
+
+    assert(out.contains("%ap.addr = getelementptr i8, ptr %ap.param, i32 0"), out)
+    assert(!out.contains("store ptr %ap.param"), out)
+end vlp_x86_64_receives_the_address
+
+// AAPCS64 makes the caller copy the walk and pass the copy's address -- the freestanding row keel
+// builds for, and the caller's half is the 32-byte copy.
+@test("on AAPCS64 the caller hands over a copy, and the callee walks it where it arrived")
+vlp_aapcs64_receives_a_copy()
+    val out = vlp_ir_for("aarch64-freestanding", vlp_total() + "print(relay(1, 2))\n")
+
+    assert(out.contains("%ap.addr = getelementptr i8, ptr %ap.param, i32 0"), out)
+    assert(out.contains("i64 32, i1 false)"), out)
+end vlp_aapcs64_receives_a_copy
+
+// -- what is refused -------------------------------------------------------------------------------
+
+@test("the argument is the walk's address, and the walk itself is refused")
+vlp_the_walk_itself_is_refused()
+    aza_refuses(raw"""
+        total(ap: va_list) -> int = 0
+
+        relay(n: int, ...) -> int
+            var ap: va_list
+
+            va_start(ap)
+
+            val t = total(ap)
+
+            va_end(ap)
+
+            t
+        end relay
+
+        print(relay(1, 2))
+        """, "'ap' of 'total' is *va_list, but va_list was given")
+
+@test("a callee with a va_list and no tail still has no tail to start")
+vlp_no_tail_to_start()
+    aza_refuses(raw"""
+        total(ap: va_list) -> int
+            va_start(ap)
+
+            0
+
+        print(1)
+        """, "'va_start' is only allowed in a function declared with '...'")
+
+@test("a va_list is still not something to return")
+vlp_still_not_returned()
+    aza_refuses("give(ap: va_list) -> va_list = ap\n\nprint(1)\n",
+                "a va_list cannot be returned from 'give'")
+
+// The slot the body reads may be the caller's own storage, so a jump back to the entry would write
+// the next walk over the one it was handed.
+@test("a function taking a va_list is no '@tailrec' candidate")
+vlp_no_tailrec()
+    aza_refuses(raw"""
+        @tailrec
+        count(n: int, ap: va_list) -> int = if n == 0 then 0 else count(n - 1, &ap)
+
+        print(1)
+        """, "is marked '@tailrec' but 'ap' is a va_list, received where the caller's walk is")

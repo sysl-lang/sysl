@@ -725,13 +725,207 @@ ex_the_header_leaves_a_private_export_out()
     assert(!h.contains("demo_back"), h)
 end ex_the_header_leaves_a_private_export_out
 
-@test("nor variadic")
-ex_a_variadic_export_is_refused()
+// **A variadic export is the definition itself, under the exported symbol**, with no thunk: no
+// function can hand on a C tail it was given, so the entry C calls has to be the frame `va_start`
+// reads.
+@test("but a variadic one is allowed, and its definition is the exported symbol")
+ex_a_variadic_export_is_the_definition()
     if ex_no_library() then return
 
-    val said = ex_err("module demo\n\n@export\nf(n: i32, ...) -> i32 = n\n")
+    val out = ex_archive_ir("module demo\n\n@export(\"vx_sum\")\nsum(n: i32, ...) -> i32\n" +
+                            "    var ap: va_list\n    va_start(ap)\n    val x: i32 = va_arg(ap)\n" +
+                            "    va_end(ap)\n    n + x\n")
 
-    assert(said.contains("take a 'va_list' parameter instead"), said)
+    assert(out.contains("define i32 @vx_sum(i32 %n.param, ...)"), out)
+    assert(!out.contains("@demo$sum"), out)
+    assert(out.contains("@llvm.va_start"), out)
+end ex_a_variadic_export_is_the_definition
+
+@test("a sysl caller of a variadic export reaches it under the exported symbol")
+ex_a_sysl_caller_reaches_a_variadic_export()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\n@export(\"vx_first\")\nfirst(n: i32, ...) -> i32 = n\n\n" +
+                    "print(demo.first(1, 2, 3))\n")
+
+    assert(out.contains("define i32 @vx_first(i32 %n.param, ...)"), out)
+    assert(out.contains("@vx_first(i32 1, i32 2, i32 3)"), out)
+end ex_a_sysl_caller_reaches_a_variadic_export
+
+// In the root module the key and the symbol are one name, and nothing has to move aside: there is
+// no thunk to collide with.
+@test("in the root module a variadic export keeps its own name and moves nothing aside")
+ex_a_root_variadic_export()
+    if ex_no_library() then return
+
+    val out = ex_ir("@export\nsix(a: i32, ...) -> i32 = a\n\nprint(six(6, 7))\n")
+
+    assert(out.contains("define i32 @six(i32 %a.param, ...)"), out)
+    assert(!out.contains("six$$sysl"), out)
+end ex_a_root_variadic_export
+
+@test("a private variadic export is hidden, as a private thunk is")
+ex_a_private_variadic_export_is_hidden()
+    if ex_no_library() then return
+
+    val out = ex_archive_ir("module demo\n\n@export(\"vx_hid\")\nprivate hid(n: i32, ...) -> i32 = n\n")
+
+    assert(out.contains("define hidden i32 @vx_hid(i32 %n.param, ...)"), out)
+end ex_a_private_variadic_export_is_hidden
+
+// No thunk gathers an aggregate out of C's registers in front of a variadic export, so a struct is
+// refused where an ordinary export would take it.
+@test("a variadic export's parameter may not be an aggregate")
+ex_a_variadic_export_takes_no_aggregate()
+    if ex_no_library() then return
+
+    assert_eq(ex_err("module demo\n\nstruct Pair\n    a: i32\n    b: i32\n\n@export\n" +
+                     "log(p: Pair, ...) -> i32 = p.a\n"),
+              "'p' of the variadic export 'demo.log' is demo.Pair, an aggregate — a variadic " +
+              "export is the definition itself, with no thunk in front of it to gather an " +
+              "aggregate out of the registers C spread it across, because no function can hand on " +
+              "a C tail it was given. Take a pointer to it")
+
+@test("nor return one")
+ex_a_variadic_export_returns_no_aggregate()
+    if ex_no_library() then return
+
+    assert_eq(ex_err("module demo\n\nstruct Pair\n    a: i32\n    b: i32\n\n@export\n" +
+                     "make(n: i32, ...) -> Pair = Pair(n, n)\n"),
+              "the variadic export 'demo.make' returns demo.Pair, an aggregate — a variadic " +
+              "export is the definition itself, with no thunk in front of it to gather an " +
+              "aggregate out of the registers C spread it across, because no function can hand on " +
+              "a C tail it was given. Return it through a pointer parameter")
+
+// A tuple is an aggregate too, and so is a data enum -- each refused at the one parameter.
+@test("a tuple parameter is an aggregate too")
+ex_a_variadic_export_takes_no_tuple()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export\nlog(p: (i32, i32), ...) -> i32 = p.0\n")
+
+    assert(said.contains("'p' of the variadic export 'demo.log' is (int, int), an aggregate"), said)
+end ex_a_variadic_export_takes_no_tuple
+
+// Scalars, pointers, a function pointer, a simple enum, a `bool` and a `char` are passed alike by
+// both conventions, so every one of them is admitted.
+@test("a variadic export takes any scalar or pointer")
+ex_a_variadic_export_takes_scalars()
+    if ex_no_library() then return
+
+    val out = ex_archive_ir("module demo\n\nenum Mode: u8\n    A\n    B\n\n@export\n" +
+                            "f(a: u8, b: bool, c: char, d: f32, e: *u8, g: Mode, " +
+                            "h: *extern(i32) -> i32, ...) -> u16 = 1\n")
+
+    assert(out.contains("define zeroext i16 @f("), out)
+    assert(out.contains(", ...)"), out)
+end ex_a_variadic_export_takes_scalars
+
+// The tail arrives as C's default promotions leave it, so the narrow reads `va_arg` already refuses
+// are refused in an export's body too -- the one place a C caller's tail is read.
+@test("an exported body reading a promoted float as f32 is refused")
+ex_a_variadic_export_reads_no_f32()
+    if ex_no_library() then return
+
+    assert_eq(ex_err("module demo\n\n@export\nfirst(n: i32, ...) -> f32\n    var ap: va_list\n" +
+                     "    va_start(ap)\n    val x: f32 = va_arg(ap)\n    va_end(ap)\n    x\n"),
+              "a variadic argument is promoted to double, so it cannot be read as f32 — read it " +
+              "as 'real' and convert")
+
+@test("nor a promoted integer as u8, nor a bool")
+ex_a_variadic_export_reads_no_narrow_int()
+    if ex_no_library() then return
+
+    val narrow = ex_err("module demo\n\n@export\nfirst(n: i32, ...) -> u8\n    var ap: va_list\n" +
+                        "    va_start(ap)\n    val x: u8 = va_arg(ap)\n    va_end(ap)\n    x\n")
+
+    assert(narrow.contains("cannot be read as byte — read it as 'uint' and convert"), narrow)
+
+    val flag = ex_err("module demo\n\n@export\nfirst(n: i32, ...) -> bool\n    var ap: va_list\n" +
+                      "    va_start(ap)\n    val x: bool = va_arg(ap)\n    va_end(ap)\n    x\n")
+
+    assert(flag.contains("a variadic argument cannot be read as bool"), flag)
+end ex_a_variadic_export_reads_no_narrow_int
+
+@test("the header declares a variadic export with C's ellipsis")
+ex_the_header_has_the_ellipsis()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export(\"vx_printf\")\nprintf(fmt: *u8, ...) -> i32 = 0\n")
+
+    assert(h.contains("int32_t vx_printf(uint8_t * fmt, ...);"), h)
+    assert(!h.contains("stdarg"), h)
+end ex_the_header_has_the_ellipsis
+
+// A `va_list` is `<stdarg.h>`'s, so the header that names one includes it, and only that header.
+@test("a va_list parameter is spelled 'va_list' and the header includes <stdarg.h>")
+ex_the_header_spells_va_list()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export(\"vx_vprintf\")\nvprintf(fmt: *u8, ap: va_list) -> " +
+                      "i32 = 0\n\n@export(\"vx_vnext\")\nvnext(ap: *va_list) -> i32 = 0\n")
+
+    assert(h.contains("#include <stdarg.h>\n"), h)
+    assert(h.contains("int32_t vx_vprintf(uint8_t * fmt, va_list ap);"), h)
+    assert(h.contains("int32_t vx_vnext(va_list * ap);"), h)
+end ex_the_header_spells_va_list
+
+// The thunk in front of a `va_list`-taking export hands the one pointer C passed straight on, since
+// the definition receives it as C does.
+@test("an export taking a va_list hands C's pointer through its thunk unchanged")
+ex_a_va_list_export_thunk()
+    if ex_no_library() then return
+
+    val out = ex_archive_ir("module demo\n\n@export(\"vx_vsum\")\nvsum(n: i32, ap: va_list) -> i32\n" +
+                            "    val x: i32 = va_arg(ap)\n    n + x\n")
+
+    assert(out.contains("define i32 @vx_vsum(i32 %c.0, ptr %c.1)"), out)
+    assert(out.contains("define i32 @demo$vsum(i32 %n.param, ptr %ap.param)"), out)
+end ex_a_va_list_export_thunk
+
+// An export refusal ends at its advice, or at its last word where there is none to give -- never
+// at a full stop with nothing after it.
+@test("an export refusal with no advice of its own does not end in an empty sentence")
+ex_a_refusal_never_ends_empty()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export\nf(u: unit) -> i32 = 0\n")
+
+    assert_eq(said, "'u' of the exported 'demo.f' is unit, which C has no way to spell — an " +
+                    "exported function takes an integer, a float, a 'bool', a 'char', a pointer, a " +
+                    "function pointer, a simple enum, or a struct built out of those. A 'unit' " +
+                    "carries nothing and takes no room, so C has nothing to hand over — leave it out")
+end ex_a_refusal_never_ends_empty
+
+@test("a vector parameter is told what to write instead")
+ex_a_vector_parameter_is_advised()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export\nf(v: <4>f32) -> i32 = 0\n")
+
+    assert(said.ends_with("Take a pointer to its lanes, or a struct of them"), said)
+end ex_a_vector_parameter_is_advised
+
+// The same holds one level in, where the field is what C has no declaration for.
+@test("a struct field with no advice of its own ends at the field")
+ex_a_field_refusal_never_ends_empty()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\nstruct W\n    x: i32\n    v: <4>f32\n\n@export\nf(w: W) -> i32 = 0\n")
+
+    assert(said.ends_with("the aggregate around it is fine. A vector travels in whatever registers " +
+                          "the target's vector extension names, and C has no portable type for one. " +
+                          "Take a pointer to its lanes, or a struct of them"), said)
+end ex_a_field_refusal_never_ends_empty
+
+@test("a va_list field is told to hold a '*va_list'")
+ex_a_va_list_field_is_advised()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\nstruct W\n    ap: va_list\n\n@export\nf(w: W) -> i32 = 0\n")
+
+    assert(said.ends_with("a parameter may be one, and anything else holds a '*va_list'"), said)
+end ex_a_va_list_field_is_advised
 
 @test("nor '@ghost', which is erased before there is a symbol at all")
 ex_a_ghost_export_is_refused()
@@ -1505,14 +1699,14 @@ ex_a_test_build_refuses_a_generic_export()
     assert(said.contains("cannot be generic"), said)
 end ex_a_test_build_refuses_a_generic_export
 
-@test("and a variadic one")
+@test("and a variadic one's aggregate parameter")
 ex_a_test_build_refuses_a_variadic_export()
     if ex_no_library() then return
 
-    val said = ex_test_err("module demo\n\n@export\nf(n: i32, ...) -> i32 = n\n\n" +
+    val said = ex_test_err("module demo\n\n@export\nf(p: (i32, i32), ...) -> i32 = p.0\n\n" +
                            "@test(\"one\")\nt() = assert(1 == 1, \"one\")\n")
 
-    assert(said.contains("take a 'va_list' parameter instead"), said)
+    assert(said.contains("an aggregate — a variadic export is the definition itself"), said)
 end ex_a_test_build_refuses_a_variadic_export
 
 @test("and a parameter C has no declaration for")

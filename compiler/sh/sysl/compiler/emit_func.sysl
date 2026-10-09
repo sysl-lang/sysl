@@ -60,6 +60,10 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
             val ty = p.1
             val owned = owns.has(p.0)
 
+            if underlying(ty) == VaList
+                receive_walk(e, p.0)
+                continue
+
             // A large one nothing but reading reaches is read where it arrived (`reads_in_place`):
             // the slot *is* the caller's storage, and only a name for it is made here. A task's
             // never is, the caller's storage being gone by the time the body reads it.
@@ -182,7 +186,11 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     // A file-private declaration has every caller in the module that defines it, so its symbol is
     // `internal`: nothing outside may resolve it, and the linker is free to discard it when nothing
     // inside calls it either.
-    val linkage = if f.internal then LinkInternal else LinkDefault
+    //
+    // A variadic export is published under its exported symbol by the definition itself
+    // (`codegen.sysl`'s `record_symbols`), so it takes the linkage and visibility a thunk would have.
+    val entry = f.variadic && f.exported.is_some()
+    val linkage = if entry then export_linkage(f) else if f.internal then LinkInternal else LinkDefault
 
     // LLVM's coroutine passes split a function only where it says it is one.
     var bare = bare_attributes(f.marks)
@@ -195,8 +203,26 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     Some(finish_func(e, IrFuncSig(symbol_of(e, f.name),
                                   sysl_fn_type(e, sig_result, f.params, f.variadic, Some(f)),
                                   linkage, convention_of(e, f), attribute_of(e, f), f.section,
-                                  bare, binds_locally(e), false)))
+                                  bare, binds_locally(e), entry && f.export_hidden)))
 end gen_function
+
+// **A `va_list` parameter is received as C receives one**, so the body walks on from wherever its
+// caller -- sysl or C -- had reached. The slot the body reads as `ap` is the walk's storage: where the
+// target passes the value in the storage (Darwin arm64, every `char *` target), a fresh slot holding
+// it; where it passes an address -- of the caller's own storage on x86-64 System V, of a copy the
+// caller made on AAPCS64 -- that address, used where it arrived. The caller's walk is then advanced
+// or not depending on the machine, which is C's own rule: after the call it may only be ended.
+private receive_walk(e: *Emit, name: string)
+    e.target.va_list match
+        VaLoaded ->
+            alloca(e, VReg(s"$name.addr"), lty(e, VaList))
+            emit(e, InStore(LPtr, VReg(s"$name.param"), VReg(s"$name.addr"), AccPlain, None))
+        _ ->
+            var idx: Buf[IrArg] = buf()
+
+            idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+            emit(e, InGep(VReg(s"$name.addr"), LInt(8), VReg(s"$name.param"), idx))
+end receive_walk
 
 // An async body's last expression, put in its task, and the blocks every coroutine ends with.
 private coro_result(e: *Emit, f: TFunc)

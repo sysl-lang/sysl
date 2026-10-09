@@ -429,39 +429,87 @@ vmx_not_through_a_trait_object()
                     "reaching — a slot in a method table is a word and names none, so there is no '&Log' to form"))
 end vmx_not_through_a_trait_object
 
-// A trait's members lower to nothing, so a promise nothing keeps is where a signature rule has to be
-// asked at the declaration or nowhere.
-@test("a trait promise nothing implements is held to the same rules")
+// A trait's member may take C's by-value `va_list` as any function may.
+@test("a trait promise may take a va_list by value")
 vmx_an_unimplemented_promise_is_checked()
     if !vmx_ready() then return
 
-    assert(vmx_says(vmx_err("trait T\n    hold(self, ap: va_list) -> int\nprint(1)\n"),
-                    "a va_list is a parameter as '*va_list', not as 'va_list' — a parameter is a by-value " +
-                    "binding, and a copy of a walk advances nothing 'T.hold''s caller can see, so the walk is " +
-                    "handed over by address and the call writes '&ap'"))
+    val said = vmx_err("trait T\n    hold(self, ap: va_list) -> int\nprint(1)\n")
 
-// Not a reference case: what the fix above reaches beyond the trait. The reference asks the rule of a
-// type's own member, of an implementation's, and again of an inherited default's copy under the
-// implementing type's name.
-@test("every member is held to the va_list parameter rule, an inherited default's copy included")
+    assert(!vmx_says(said, "va_list"), said)
+
+// The walk reaches a member taking a `va_list` through every way a member is called: a bound, a
+// trait object's table, and an inherited default's copy under the implementing type's name.
+@test("a va_list member is reached through a bound, a trait object and an inherited default")
 vmx_every_member_is_held_to_the_va_list_rule()
     if !vmx_ready() then return
 
-    val rule = "a va_list is a parameter as '*va_list', not as 'va_list' — a parameter is a by-value " +
-               "binding, and a copy of a walk advances nothing "
-    val written = vmx_err("trait T\n    hold(self, ap: va_list) -> int\nstruct W\n    v: int\n" +
-                          "impl T for W\n    hold(self, ap: va_list) -> int = 1\nend W\n" +
-                          "struct S\n    v: int\n    take(self, ap: va_list) -> int = 1\nprint(1)\n")
+    assert_eq(vmx_ran(raw"""
+        trait T
+            hold(self, ap: va_list) -> int
+                val x: int = va_arg(ap)
 
-    assert(vmx_says(written, rule + "'T.hold''s caller can see"))
-    assert(vmx_says(written, rule + "'W.hold''s caller can see"))
-    assert(vmx_says(written, rule + "'S.take''s caller can see"))
+                x + 1000
+            end hold
 
-    val inherited = vmx_err("trait T\n    hold(self, ap: va_list) -> int\n        1\n    end hold\n" +
-                            "struct W\n    v: int\nimpl T for W\nend W\nprint(1)\n")
+        struct W
+            v: int
 
-    assert(vmx_says(inherited, rule + "'T.hold''s caller can see"))
-    assert(vmx_says(inherited, rule + "'W.hold''s caller can see"))
+        impl T for W
+            override hold(self, ap: va_list) -> int
+                val x: int = va_arg(ap)
+
+                x + self.v
+
+        struct D
+            v: int
+
+        impl T for D
+
+        through[X: T](x: X, ap: *va_list) -> int = x.hold(ap)
+
+        dyn(x: &T, ap: *va_list) -> int = x.hold(ap)
+
+        bound(n: int, ...) -> int
+            var ap: va_list
+
+            va_start(ap)
+
+            val t = through(W(10), &ap)
+
+            va_end(ap)
+
+            t
+        end bound
+
+        object(n: int, ...) -> int
+            var ap: va_list
+
+            va_start(ap)
+
+            val t = dyn(W(20), &ap)
+
+            va_end(ap)
+
+            t
+        end object
+
+        inherited(n: int, ...) -> int
+            var ap: va_list
+
+            va_start(ap)
+
+            val t = D(0).hold(&ap)
+
+            va_end(ap)
+
+            t
+        end inherited
+
+        print(bound(1, 1))
+        print(object(1, 2))
+        print(inherited(1, 3))
+        """), "11\n22\n1003\n")
 end vmx_every_member_is_held_to_the_va_list_rule
 
 // A variadic member's tail reaches the callee through every way a member is called.

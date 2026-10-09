@@ -2662,7 +2662,7 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
 
     for i in 0..<slots.len()
         val p = f.decl.params.at(i)
-        val want = param_type(cx, f, p)
+        val want = walk_wanted(p, param_type(cx, f, p))
 
         wants.push(want)
 
@@ -2674,6 +2674,9 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
     val refused = refused_argument(cx, span, s"'$shown'", f.decl.params, slots, ts, wants, before)
 
     if refused.is_some() then return refused.unwrap()
+
+    for i in 0..<slots.len()
+        ts.set(i, handed_walk(f.decl.params.at(i), slots.at(i), ts.at(i)))
 
     // The tail of a variadic definition, which no parameter names: the body reads it with `va_arg`,
     // so each argument is analyzed at whatever type it has and passed as C's promotions leave it.
@@ -2761,6 +2764,19 @@ refused_argument(cx: &Analyzer, span: Span, shown: string, params: Buf[Param],
 
     None
 end refused_argument
+
+// **A by-value `va_list` parameter takes the address of the walk**, at a sysl callee as at an
+// `extern`: that is what sysl has to give and what every target's answer is formed from, so the
+// argument is checked as a `*va_list`, and whether the callee receives the walk's value, its
+// address or a copy's is `TVaPass`'s business (`hoist.sysl`'s `check_va_list_positions`).
+walk_wanted(p: Param, declared: Type) -> Type =
+    if written_va_list(p.typ) then Ptr(VaList) else declared
+
+// The argument a by-value `va_list` parameter is handed, once every argument is known to be what
+// its parameter wanted -- the check reads the argument's own type.
+handed_walk(p: Param, slot: Option[Expr], t: TExpr) -> TExpr = slot match
+    Some(e) -> if written_va_list(p.typ) then TExpr(e.span, TVaPass(t)) else t
+    None -> t
 
 // Which written argument fills which parameter.
 //
