@@ -221,8 +221,8 @@ recognised from, which keeps the question answerable without a second table. `me
 in the terms the operation was asked in rather than in C's, and the `Display` impl is what makes
 `print(e)` say it. **An `Other` says the platform's sentence for its code** — what the C library's
 `strerror_r` gives, so `EILSEQ` is "Illegal byte sequence" on macOS — and a code the library does not
-know comes back in its words for that ("Unknown error: 4242"); only a target with no `posix` C library
-under it says `error N`:
+know comes back in its words for that ("Unknown error: 4242"). A target with no C library says what
+[the words for an error number](#the-words-for-an-error-number) below give:
 
 ```sysl
 import sysl.fs.read_text
@@ -240,6 +240,52 @@ refused: no such file or directory 2
 read is the hosted answer to `sysl.fs.sys`'s hooks, straight after the C call that failed, and what
 crosses back is the number; `sysl.fs` turns it into an `IoError` once. A `File` that latches a
 failure keeps the code it failed with, so a close afterwards cannot overwrite it.
+
+### The words for an error number
+
+**An `Other`'s words are asked of whatever answers the filesystem**, through one more hook of
+`sysl.fs.sys`, `sysl_fs_error_text(code, into, room, got) -> int`: zero having copied the words into
+`into` and their length to `got`, anything else having none to give. **It is the one hook a program
+never has to answer** — the library answers it on every target, over `strerror_r` on a POSIX host and
+with no words on a machine with no C library — so a kernel whose error numbers are its own can say
+what they mean, and one that never thought about it is asked nothing.
+
+**A code the supplier has no words for goes to the library's own table, and only then to `error
+N`.** The table holds the numbers every platform agrees on and nothing past them: V7 Unix's 1 to 34,
+which have meant the same thing on every Unix since (11 aside, which a BSD spends on `EDEADLK`), and
+`EAGAIN`, `ENOTEMPTY` and `EILSEQ` at this target's own number. A table claiming more would put
+Linux's words to a BSD's codes. So on a bare machine `EBUSY` says "device or resource busy" with no
+help from anybody. A hosted target that is not POSIX numbers its errors its own way and is not given
+the table.
+
+A program's own answer displaces the library's, here on a host as on a board — so `16`, which it
+declines, comes from the table rather than from the C library:
+
+```sysl
+import sysl.fs.IoError
+
+@export("sysl_fs_error_text")
+words(code: int, into: *u8, room: usize, got: *usize) -> int
+    if code != 77 then return -1
+
+    val w = "the disk is resting"
+
+    for i in 0..<w.bytes.len do into[i] = w.bytes[i]
+
+    *got = w.bytes.len
+    0
+end words
+
+print(IoError.Other(77).message())
+print(IoError.Other(16).message())
+print(IoError.Other(4242).message())
+```
+
+```output
+the disk is resting
+device or resource busy
+error 4242
+```
 
 ## `File`
 
