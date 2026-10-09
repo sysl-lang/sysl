@@ -1,0 +1,246 @@
+module sysl.signal
+
+import sysl.fs.{IoError, from_status}
+import sysl.signal.sys as ssys
+import sysl.sync.SpinLock
+
+/** Signals as flags: a program asks to be told that one arrived, and asks again later whether it has.
+ *
+ * **No sysl code ever runs inside a signal handler, and that is the whole design.** A handler runs
+ * between two instructions of whatever the program was doing, so a body that allocates, releases a
+ * counted reference or takes a lock is one that can deadlock or corrupt the very thing it interrupted
+ * -- and that is nearly every sysl body. So `watch` installs the *target's* handler, whose one act is
+ * to count the arrival with a lock-free atomic, and the program reads the count where it chooses: at
+ * the top of a loop, between two jobs, before a prompt. It is the shape of Rust's `signal-hook` flag
+ * and Go's `os/signal` without the channel, and it is the one shape that is safe everywhere.
+ *
+ * **The numbers are the target's own.** `TSTP`, `CONT`, `CHLD`, `USR1` and `USR2` are different
+ * numbers on Linux and on a BSD, so each constant here is written per platform rather than once; a
+ * program that writes `signal.TSTP` means what the machine it was compiled for means. A target with
+ * no C library takes Linux's numbering, which is the one a kernel written for a POSIX-shaped user
+ * space usually copies; one that numbers differently passes its own integers -- every function here
+ * takes a plain `int`, the type `sysl.process`'s `Child.kill` and `Status.Signalled` speak too.
+ *
+ * Everything it asks of the machine goes through the hooks of `sysl.signal.sys`, which the library
+ * answers over `sigaction` on a POSIX host and a program answers itself, with an `@export` per hook,
+ * on a target with no C library.
+ */
+
+/** Hangup: the terminal the program was started from has gone. */
+const HUP: int = 1
+
+/** Interrupt: Ctrl-C at the terminal. */
+const INT: int = 2
+
+/** Quit: Ctrl-\ at the terminal, which by default also leaves a core file. */
+const QUIT: int = 3
+
+/** Kill: ends the program and cannot be watched, ignored or caught. `send` is the only thing here
+ * that takes it.
+ */
+const KILL: int = 9
+
+/** A write into a pipe or socket nobody is reading any more. */
+const PIPE: int = 13
+
+/** Alarm: a timer the program set has run out. */
+const ALRM: int = 14
+
+/** Terminate: asks the program to stop, which `Child.kill` sends by default. */
+const TERM: int = 15
+
+/** Ttin: a background job tried to read from its terminal. */
+const TTIN: int = 21
+
+/** Ttou: a background job tried to write to its terminal, or change it. */
+const TTOU: int = 22
+
+/** Window change: the terminal was resized. */
+const WINCH: int = 28
+
+#if bsd
+/** User-defined signal 1: no meaning but the one a program gives it. */
+const USR1: int = 30
+
+/** User-defined signal 2. */
+const USR2: int = 31
+
+/** A child of the program stopped or ended. */
+const CHLD: int = 20
+
+/** Continue: resumes a stopped program. */
+const CONT: int = 19
+
+/** Stop: stops the program and, like `KILL`, cannot be watched, ignored or caught. */
+const STOP: int = 17
+
+/** Terminal stop: Ctrl-Z at the terminal. */
+const TSTP: int = 18
+
+// The highest signal the platform numbers: the BSDs stop at 31.
+private const highest: int = 31
+#else
+/** User-defined signal 1: no meaning but the one a program gives it. */
+const USR1: int = 10
+
+/** User-defined signal 2. */
+const USR2: int = 12
+
+/** A child of the program stopped or ended. */
+const CHLD: int = 17
+
+/** Continue: resumes a stopped program. */
+const CONT: int = 18
+
+/** Stop: stops the program and, like `KILL`, cannot be watched, ignored or caught. */
+const STOP: int = 19
+
+/** Terminal stop: Ctrl-Z at the terminal. */
+const TSTP: int = 20
+
+// The highest signal the platform numbers: Linux's real-time signals run to 64.
+private const highest: int = 64
+#endif
+
+// How many `Watch`es each signal has, and the lock that keeps a count and the disposition it decides
+// in step: the first watch installs the counting handler, the last one dropped puts back what was
+// there. Indexed by the signal itself, so one more than the highest.
+private var watchers: [65]u32
+private var guard: SpinLock = SpinLock(0)
+
+// What every refusal of a signal number is: `EINVAL`, the same code on every platform.
+private invalid() -> IoError = IoError.Other(22)
+
+// `EBUSY`: a disposition a live `Watch` owns.
+private const busy: int = -16
+
+// A signal whose disposition a program may set: on this platform's table, and neither of the two
+// POSIX keeps out of every program's hands.
+private settable(sig: int) -> bool = sig >= 1 && sig <= highest && sig != KILL && sig != STOP
+
+/** A signal being counted for this program, from `watch`.
+ *
+ * **`take` is the whole interface**: it answers whether the signal has arrived since the last `take`
+ * -- or since the watch began -- and marks every arrival so far as seen. Arrivals that come between
+ * two `take`s are one `true`, not several, which is what a flag is; an arrival during a `take` is
+ * never lost, only left for the next one, since what is compared is a count that only goes up.
+ *
+ * **Two watches of one signal each see it.** Each keeps the count it last saw, so a library watching
+ * `WINCH` for its own reasons takes nothing from the program that watches it too.
+ *
+ * **Dropping the last watch of a signal puts back what was there before the first** -- the default,
+ * an ignore a parent left, or a handler C code installed. It is a counted reference so that the drop
+ * happens once, where the last holder lets go of it.
+ */
+struct Watch
+    private sig: int
+    private seen: i64
+
+    /** The signal this watch counts. */
+    signal(self) -> int = self.sig
+
+    /** Whether the signal has arrived since the last `take`, marking it seen. */
+    take(*self) -> bool
+        val now = ssys.arrivals(self.sig)
+
+        if now < 0 || now == self.seen then return false
+
+        self.seen = now
+        true
+end Watch
+
+impl Drop for Watch
+    drop(self) = released(self.sig)
+
+private released(sig: int)
+    guard.lock()
+    watchers[sig] -= 1
+
+    if watchers[sig] == 0 then ssys.disposition(sig, ssys.set_restored)
+
+    guard.unlock()
+end released
+
+/** Starts counting `sig` for this program, answering the `Watch` to ask about it.
+ *
+ * Refused as `IoError.Other(22)` (`EINVAL`) for a number this platform does not have, and for `KILL`
+ * and `STOP`, which nothing may catch.
+ */
+@needs(os)
+watch(sig: int) -> Result[&Watch, IoError]
+    if !settable(sig) then return Err(invalid())
+
+    guard.lock()
+
+    // Read before the handler goes in, so an arrival the moment it does is one `take` sees.
+    val seen = ssys.arrivals(sig)
+    var e = 0
+
+    if seen < 0
+        e = int(seen)
+    elif watchers[sig] == 0
+        e = ssys.watch(sig)
+
+    if e == 0 then watchers[sig] += 1
+
+    guard.unlock()
+
+    if e != 0 then Err(from_status(e)) else Ok(Watch(sig, seen))
+end watch
+
+private disposed(sig: int, how: int) -> Result[unit, IoError]
+    if !settable(sig) then return Err(invalid())
+
+    guard.lock()
+
+    val e = if watchers[sig] > 0 then busy else ssys.disposition(sig, how)
+
+    guard.unlock()
+
+    if e != 0 then Err(from_status(e)) else Ok(())
+end disposed
+
+/** Makes `sig` do nothing when it arrives -- what a shell does with `TTOU`, `TTIN`, `TSTP` and `INT`
+ * for itself, so that only the job in the foreground hears them.
+ *
+ * Refused as `EINVAL` where `watch` would be, and as `IoError.Other(16)` (`EBUSY`) for a signal a
+ * `Watch` is alive for: the watch owns the disposition until it is dropped.
+ */
+@needs(os)
+ignore(sig: int) -> Result[unit, IoError] = disposed(sig, ssys.set_ignored)
+
+/** Gives `sig` back the action the system takes when nobody has said otherwise -- what a shell does
+ * for a child it is about to start, which inherits the parent's ignores. Refused as `ignore` is.
+ */
+@needs(os)
+restore_default(sig: int) -> Result[unit, IoError] = disposed(sig, ssys.set_default)
+
+/** Sends `sig` to the process `pid`, read as POSIX's `kill(2)` reads it: zero is this program's
+ * process group, and a negative number the group `-pid`. A `sig` of zero sends nothing and answers
+ * whether one could have been sent.
+ *
+ * A pid that names no process is `IoError.Other(3)` (`ESRCH`); one this program may not signal is
+ * `NotPermitted`; a signal number this platform does not have is `EINVAL`, refused before anything
+ * is sent. `Child.kill` is the same call aimed at a child `sysl.process` started.
+ */
+@needs(os)
+send(pid: i64, sig: int) -> Result[unit, IoError]
+    if sig < 0 || sig > highest then return Err(invalid())
+
+    val e = ssys.send(pid, sig)
+
+    if e != 0 then Err(from_status(e)) else Ok(())
+end send
+
+/** Sends `sig` to this program itself -- to the thread that calls it -- and, unless the signal is
+ * blocked, has it handled before returning: a watched one is counted, an ignored one discarded, and
+ * one left at its default does what the default does. Refused as `send` is.
+ */
+@needs(os)
+raise(sig: int) -> Result[unit, IoError]
+    if sig < 1 || sig > highest then return Err(invalid())
+
+    val e = ssys.raise(sig)
+
+    if e != 0 then Err(from_status(e)) else Ok(())
+end raise

@@ -1,0 +1,47 @@
+module sysl.signal.hosted
+@requires(posix)
+
+import sysl.sys.host_status
+
+// `sysl.signal.sys`'s hooks answered over a POSIX host -- `sigaction`, `kill` and `raise`. **Call
+// `sysl.signal` instead** -- nothing here is meant to be called: each function below exists to be
+// linked under a hook's symbol, and is public for the reason `sysl.process.hosted`'s are (a private
+// export's symbol is hidden).
+//
+// **Nothing imports this module, and nothing has to.** A hook a program reaches is answered by the
+// library's own supplier (`reference/ffi.md § A module may supply another module's extern`), and its
+// exports are `weak`, so a program answering a hook itself is the one the link keeps. It requires
+// `posix`, so a target without POSIX never takes it; there the program answers the hooks it reaches,
+// and one it leaves unanswered is refused by name when it is compiled.
+//
+// **The handler itself is C, in `signal.c` beside this file**, and that is the design rather than a
+// gap: what runs inside a handler is the one place no sysl body may go (`sysl.signal.sys` says why).
+// Each of its functions answers zero or an `errno`, and the hook here negates it.
+
+#if hosted
+private extern "sysl_sig_posix_watch" c_watch(sig: int) -> int
+private extern "sysl_sig_posix_arrivals" c_arrivals(sig: int) -> long
+private extern "sysl_sig_posix_disposition" c_disposition(sig: int, how: int) -> int
+private extern "sysl_sig_posix_send" c_send(pid: long, sig: int) -> int
+private extern "sysl_sig_posix_raise" c_raise(sig: int) -> int
+
+private status(e: int) -> int = if e != 0 then host_status(e) else 0
+
+@export("sysl_sig_watch")
+sig_watch(sig: int) -> int = status(c_watch(sig))
+
+@export("sysl_sig_arrivals")
+sig_arrivals(sig: int) -> i64
+    val n = c_arrivals(sig)
+
+    if n < 0 then i64(host_status(int(-n))) else i64(n)
+
+@export("sysl_sig_disposition")
+sig_disposition(sig: int, how: int) -> int = status(c_disposition(sig, how))
+
+@export("sysl_sig_send")
+sig_send(pid: i64, sig: int) -> int = status(c_send(long(pid), sig))
+
+@export("sysl_sig_raise")
+sig_raise(sig: int) -> int = status(c_raise(sig))
+#endif
