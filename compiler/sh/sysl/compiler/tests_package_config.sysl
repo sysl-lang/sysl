@@ -146,7 +146,7 @@ pkgcfg_dependency_misspelling_is_refused()
 
 @test("a project may have no file at all, and every capability is then provided")
 pkgcfg_no_file_provides_everything()
-    assert_eq(joined(manifest_provides(empty_manifest(), "aarch64-macos")), "heap,os,posix")
+    assert_eq(joined(manifest_provides(empty_manifest(), "aarch64-macos")), "heap,os,posix,libc")
 
 @test("an empty file is a project that said nothing")
 pkgcfg_empty_file_is_empty()
@@ -295,20 +295,20 @@ pkgcfg_a_declared_machine()
 pkgcfg_a_capability_set()
     assert_eq(provided("targets {\n  aarch64-kernel {\n    triple = \"aarch64-none-elf\"\n" +
                        "    capabilities { os = false, posix = false }\n  }\n}\n", "aarch64-kernel"),
-              "heap")
+              "heap,libc")
 
 @test("a target the file says nothing about provides everything")
 pkgcfg_an_unmentioned_target()
     val text = "targets {\n  aarch64-kernel { capabilities { heap = false } }\n}\n"
 
-    assert_eq(provided(text, "x86_64-linux"), "heap,os,posix")
-    assert_eq(provided(text, "aarch64-kernel"), "os,posix")
+    assert_eq(provided(text, "x86_64-linux"), "heap,os,posix,libc")
+    assert_eq(provided(text, "aarch64-kernel"), "os,posix,libc")
 
 // Whether a heap exists is a project engineering decision, so it is stated once for the project
 // rather than once per machine it is built for.
 @test("a project states its own capability policy, for every target it builds for")
 pkgcfg_a_project_policy()
-    assert_eq(provided("capabilities { heap = false }\n", "aarch64-macos"), "os,posix")
+    assert_eq(provided("capabilities { heap = false }\n", "aarch64-macos"), "os,posix,libc")
     assert_eq(provided("capabilities { heap = false }\n", "thumbv7em-freestanding"), "os,posix")
 
 @test("and a target block layers over it, for the one machine where it is not so")
@@ -323,7 +323,7 @@ pkgcfg_a_target_layers_over()
 pkgcfg_layering_is_per_capability()
     assert_eq(provided("capabilities { heap = false, posix = false }\ntargets {\n" +
                        "  kernel { capabilities { posix = true } }\n}\n", "kernel"),
-              "os,posix")
+              "os,posix,libc")
 
 // `alloc` is what a *module* promises about its conduct and `heap` is the facility, so the config
 // wants `heap`. The old word is accepted and mapped because **a tag is immutable**: every package
@@ -337,7 +337,8 @@ pkgcfg_alloc_is_mapped_to_heap()
 @test("while a capability word that is neither is still refused")
 pkgcfg_a_capability_word_that_is_neither()
     assert_eq(refused("capabilities { treads = false }\n"),
-              "'treads' in 'capabilities' is not a capability — the set is 'heap', 'os', 'posix'")
+              "'treads' in 'capabilities' is not a capability — the set is 'heap', 'os', 'posix', " +
+              "'libc'")
 
 // It parsed cleanly and was then dropped, so the file read as though the project had said something.
 // It is the spelling reached for first.
@@ -353,7 +354,7 @@ pkgcfg_requires_false_says_nothing()
 pkgcfg_a_target_capability_that_is_not_one()
     assert_eq(refused("targets {\n  kernel { capabilities { treads = false } }\n}\n"),
               "'treads' in 'targets.kernel.capabilities' is not a capability — the set is 'heap', " +
-              "'os', 'posix'")
+              "'os', 'posix', 'libc'")
 
 @test("a capability that is not true or false")
 pkgcfg_a_capability_that_is_not_a_flag()
@@ -387,7 +388,43 @@ pkgcfg_requires_cannot_ask_for_an_absence()
 @test("a requires entry naming something that is not a capability")
 pkgcfg_requires_a_non_capability()
     assert_eq(refused("requires { sockets = true }"),
-              "'sockets' in 'requires' is not a capability — the set is 'heap', 'os', 'posix'")
+              "'sockets' in 'requires' is not a capability — the set is 'heap', 'os', 'posix', 'libc'")
+
+// -- a C library: the one capability a freestanding machine starts without ---------------------------
+
+@test("libc stands on a hosted target and not on a freestanding one, before any file speaks")
+pkgcfg_libc_follows_the_machine()
+    assert(provided("", "aarch64-macos").index_of("libc").is_some(), "hosted")
+    assert_eq(provided("", "thumb-freestanding-softfp"), "heap,os,posix")
+
+@test("a target block grants libc to a freestanding machine, and only to that one")
+pkgcfg_libc_granted_per_target()
+    val text = "targets {\n  thumb-freestanding-softfp { capabilities { libc = true } }\n}\n"
+
+    assert_eq(provided(text, "thumb-freestanding-softfp"), "heap,os,posix,libc")
+    assert_eq(provided(text, "thumbv6m-freestanding"), "heap,os,posix")
+
+@test("the project's own block grants it to every target, and a hosted one may take it away")
+pkgcfg_libc_project_policy()
+    assert_eq(provided("capabilities { libc = true }\n", "thumbv6m-freestanding"), "heap,os,posix,libc")
+    assert_eq(provided("capabilities { libc = false }\n", "aarch64-macos"), "heap,os,posix")
+
+@test("the machine as declared lacks libc on a freestanding target unless the manifest grants it")
+pkgcfg_libc_as_declared()
+    val bare = target_resolved("thumb-freestanding-softfp").unwrap()
+    val granted = read("targets {\n  thumb-freestanding-softfp { capabilities { libc = true } }\n}\n")
+
+    assert(!as_declared(read(""), bare).provides_libc(), "freestanding, nothing said")
+    assert(as_declared(granted, bare).provides_libc(), "granted")
+    assert(as_declared(read(""), host_target()).provides_libc(), "hosted")
+    assert(!bare.provides_libc(), "the registry's own row")
+
+@test("'requires { libc = false }' is refused without pointing at a module mark that does not exist")
+pkgcfg_requires_libc_false()
+    assert_eq(refused("requires { libc = false }"),
+              "'requires { libc = false }' says nothing — 'requires' is what this package needs its " +
+              "host to have. To say the machine has no libc, write it in the project's own " +
+              "'capabilities { libc = false }'")
 
 // -- the headers a package requires ------------------------------------------------------------------
 
