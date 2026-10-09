@@ -735,9 +735,9 @@ views elements it may not write, so there is nothing to assign through
 Two writable views are untouched — nothing is read-only, so there is nothing to meet — and a form with
 only one branch keeps that branch's view whichever it is.
 
-**What produces one.** Slicing a `val`, since read-only storage gives a read-only view — and so is
-a `val` array standing where a view is asked for, which is the same rule reached without the
-brackets. `s.bytes`, whose elements are a string's own and may be a literal's. Re-slicing one,
+**What produces one.** Slicing a `val` array, since read-only storage gives a read-only view — and so
+is a `val` array standing where a view is asked for, which is the same rule reached without the
+brackets. An array inside a `val` struct value is the binding's storage too. `s.bytes`, whose elements are a string's own and may be a literal's. Re-slicing one,
 because a bit a second subscript dropped would make `xs[..]` the way around `xs`. And a buffer
 literal written where one is wanted, since storage an expression makes has no other holder to
 disagree with it.
@@ -758,6 +758,31 @@ print(readonly(a), first(a))
 
 ```output
 3 1
+```
+
+**A `val` holding an address is not read-only storage of elements.** `val` is a promise about the
+name's own bytes, and a `*T`, a `&[N]T` or a `[]T` is an address: the elements it leads to belong to
+whoever laid them down, so a view taken through one is exactly as writable as that owner allows.
+
+```sysl
+fill(s: []int, v: int)
+    for i in 0..<s.len do s[i] = v
+
+var store = [1, 2, 3, 4]
+
+val p: *int = &store[0]
+val whole: []int = store[..]
+val heap: &[2]int = [5, 6]
+
+fill(p[0..<1], 7)
+fill(whole[2..], 8)
+fill(heap, 9)
+
+print(store[0], store[3], heap[1])
+```
+
+```output
+7 8 9
 ```
 
 **What it does not refuse is `&`.** `&xs[0]` is a `*T` the moment it is written, which is the tier
