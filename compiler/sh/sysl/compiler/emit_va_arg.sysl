@@ -1,0 +1,232 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **Reading the next variadic argument.** LLVM has an instruction for it, `va_arg`, and on most
+// machines its lowering is the walk C's own `va_arg` does: a `va_list` there is a pointer into one
+// contiguous run of argument slots -- the registers having been spilled in front of the stack ones --
+// and each read bumps it past one slot, rounded to the type's boundary.
+//
+// **Two machines keep the registers apart from the stack, and there the instruction is not enough.**
+// AAPCS64 (every Arm 64-bit system but Apple's) hands a callee a five-field `va_list` -- the stack
+// cursor, the tops of the general and the vector register save areas, and a negative offset into
+// each -- and LLVM's AArch64 back end lowers the instruction as though the list were Apple's single
+// pointer, so it reads only the stack and every argument that arrived in a register is skipped. The
+// x86-64 System V list is the same shape and LLVM does walk it, but it splits a 128-bit integer into
+// two 64-bit reads, which takes one half from the last register and the other from the stack when a
+// single register is left -- where the convention puts the pair in two registers or wholly on the
+// stack. On both, this writes the walk out the way clang's own `va_arg` does.
+//
+// **RV32 keeps the single pointer but not every argument in it**: a 128-bit integer is wider than a
+// register pair, so the caller passes its address, and the instruction would read the address's
+// bytes as the integer.
+gen_va_arg(e: *Emit, ap: Val, ty: Type) -> Val
+    if e.target.cpu == Aarch64 && e.target.os != MacOS then return aapcs64_va_arg(e, ap, ty)
+    if e.target.cpu == X86_64 && e.target.os != Windows && va_wide(ty)
+        return sysv_pair_va_arg(e, ap, ty)
+
+    // RV32 passes a scalar wider than two registers by address, a variadic one included, so the
+    // slot holds a pointer to the 128-bit integer rather than the integer itself.
+    if e.target.cpu == Riscv32 && va_wide(ty)
+        val at = fresh_reg(e)
+
+        emit(e, InVaArg(at, ap, LPtr))
+
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, ty), at, AccPlain, None))
+        return r
+
+    val r = fresh_reg(e)
+
+    emit(e, InVaArg(r, ap, lty(e, ty)))
+    r
+end gen_va_arg
+
+// Whether a variadic argument is a 128-bit integer: sixteen bytes on a sixteen-byte boundary, which
+// is the one width that takes a register pair and the one boundary wider than a slot. Every integer
+// between 64 and 128 bits is widened to it at the call, and reading one at its own width is refused.
+private va_wide(ty: Type) -> bool = ty match
+    Integer(bits, _, _) -> bits == 128
+    _ -> false
+
+// AAPCS64's walk. The list is `{__stack, __gr_top, __vr_top, __gr_offs, __vr_offs}`: an integer, a
+// character or an address comes from the general registers' save area at `__gr_top + __gr_offs` while
+// that offset is negative, a `real` from the vector registers' at `__vr_top + __vr_offs`, sixteen
+// bytes apart, and once an offset reaches zero every later argument of that class is on the stack. A
+// 128-bit integer starts on an even register and on a sixteen-byte stack boundary.
+//
+// The offset is advanced even when the argument does not fit, so a pair that missed the last register
+// leaves the class exhausted, as the convention says it is.
+private aapcs64_va_arg(e: *Emit, ap: Val, ty: Type) -> Val
+    val fp = ty match
+        Floating(_, _) -> true
+        _ -> false
+    val wide = va_wide(ty)
+    val size = if wide then 16 else 8
+
+    val offs_at = va_field(e, ap, if fp then 28 else 24)
+    val slot = alloca(e, fresh_reg(e), LPtr)
+    val maybe_l = fresh_label(e, "va.maybe_reg")
+    val reg_l = fresh_label(e, "va.in_reg")
+    val stack_l = fresh_label(e, "va.on_stack")
+    val end_l = fresh_label(e, "va.end")
+
+    val offs = fresh_reg(e)
+
+    emit(e, InLoad(offs, l_i32(), offs_at, AccPlain, Some(4)))
+
+    val spent = fresh_reg(e)
+
+    emit(e, InIntCmp(spent, ISge, l_i32(), offs, va_const(0)))
+    emit_term(e, InCondBr(spent, stack_l, maybe_l))
+
+    emit_label(e, maybe_l)
+
+    var at = offs
+
+    if wide
+        val up = fresh_reg(e)
+
+        emit(e, InBin(up, OpAdd, l_i32(), offs, va_const(15)))
+
+        val even = fresh_reg(e)
+
+        emit(e, InBin(even, OpAnd, l_i32(), up, va_const(-16)))
+        at = even
+
+    val next = fresh_reg(e)
+
+    emit(e, InBin(next, OpAdd, l_i32(), at, va_const(if fp then 16 else size)))
+    emit(e, InStore(l_i32(), next, offs_at, AccPlain, Some(4)))
+
+    val fits = fresh_reg(e)
+
+    emit(e, InIntCmp(fits, ISle, l_i32(), next, va_const(0)))
+    emit_term(e, InCondBr(fits, reg_l, stack_l))
+
+    emit_label(e, reg_l)
+
+    val top = fresh_reg(e)
+
+    emit(e, InLoad(top, LPtr, va_field(e, ap, if fp then 16 else 8), AccPlain, Some(8)))
+
+    val wide_at = fresh_reg(e)
+
+    emit(e, InCast(wide_at, CastSExt, l_i32(), at, LInt(64)))
+    emit(e, InStore(LPtr, va_step(e, top, wide_at), slot, AccPlain, None))
+    emit_term(e, InBr(end_l))
+
+    emit_label(e, stack_l)
+    emit(e, InStore(LPtr, va_stack_next(e, ap, size, wide), slot, AccPlain, None))
+    emit_term(e, InBr(end_l))
+
+    emit_label(e, end_l)
+    va_read(e, slot, ty)
+end aapcs64_va_arg
+
+// The x86-64 System V walk for a 128-bit integer. The list is `{gp_offset, fp_offset,
+// overflow_arg_area, reg_save_area}`: the pair is read from two consecutive general registers'
+// slots while at least two are left of the six, and otherwise wholly from the stack on a sixteen-byte
+// boundary, leaving the register offset where it was.
+private sysv_pair_va_arg(e: *Emit, ap: Val, ty: Type) -> Val
+    val slot = alloca(e, fresh_reg(e), LPtr)
+    val reg_l = fresh_label(e, "va.in_reg")
+    val stack_l = fresh_label(e, "va.on_stack")
+    val end_l = fresh_label(e, "va.end")
+
+    val gp = fresh_reg(e)
+
+    emit(e, InLoad(gp, l_i32(), ap, AccPlain, Some(4)))
+
+    val fits = fresh_reg(e)
+
+    emit(e, InIntCmp(fits, IUle, l_i32(), gp, va_const(48 - 16)))
+    emit_term(e, InCondBr(fits, reg_l, stack_l))
+
+    emit_label(e, reg_l)
+
+    val area = fresh_reg(e)
+
+    emit(e, InLoad(area, LPtr, va_field(e, ap, 16), AccPlain, Some(8)))
+
+    val wide_gp = fresh_reg(e)
+
+    emit(e, InCast(wide_gp, CastZExt, l_i32(), gp, LInt(64)))
+    emit(e, InStore(LPtr, va_step(e, area, wide_gp), slot, AccPlain, None))
+
+    val next = fresh_reg(e)
+
+    emit(e, InBin(next, OpAdd, l_i32(), gp, va_const(16)))
+    emit(e, InStore(l_i32(), next, ap, AccPlain, Some(4)))
+    emit_term(e, InBr(end_l))
+
+    emit_label(e, stack_l)
+    emit(e, InStore(LPtr, va_stack_next(e, va_field(e, ap, 8), 16, true), slot, AccPlain, None))
+    emit_term(e, InBr(end_l))
+
+    emit_label(e, end_l)
+    va_read(e, slot, ty)
+end sysv_pair_va_arg
+
+// Takes the next argument off a stack cursor held at `cursor`: rounds it up to sixteen bytes where
+// the argument wants that boundary, moves the cursor past the argument's slot, and answers where the
+// argument is.
+private va_stack_next(e: *Emit, cursor: Val, size: int, wide: bool) -> Val
+    val sp = fresh_reg(e)
+
+    emit(e, InLoad(sp, LPtr, cursor, AccPlain, Some(8)))
+
+    var at = sp
+
+    if wide
+        val n = fresh_reg(e)
+
+        emit(e, InCast(n, CastPtrToInt, LPtr, sp, LInt(64)))
+
+        val up = fresh_reg(e)
+
+        emit(e, InBin(up, OpAdd, LInt(64), n, va_const(15)))
+
+        val even = fresh_reg(e)
+
+        emit(e, InBin(even, OpAnd, LInt(64), up, va_const(-16)))
+
+        val p = fresh_reg(e)
+
+        emit(e, InCast(p, CastIntToPtr, LInt(64), even, LPtr))
+        at = p
+
+    emit(e, InStore(LPtr, va_step(e, at, va_const(size)), cursor, AccPlain, Some(8)))
+    at
+end va_stack_next
+
+// The argument itself, read from wherever the walk found it. A register save slot is eight bytes
+// apart, so even a pair is read on an eight-byte boundary.
+private va_read(e: *Emit, slot: Val, ty: Type) -> Val
+    val at = fresh_reg(e)
+
+    emit(e, InLoad(at, LPtr, slot, AccPlain, None))
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, ty), at, AccPlain, Some(8)))
+    r
+end va_read
+
+// The address `bytes` past `base`.
+private va_step(e: *Emit, base: Val, bytes: Val) -> Val
+    val r = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(LInt(64), bytes))
+    emit(e, InGep(r, LInt(8), base, idx))
+    r
+end va_step
+
+// The address of the field `offset` bytes into the list.
+private va_field(e: *Emit, ap: Val, offset: int) -> Val = va_step(e, ap, va_const(offset))
+
+private va_const(n: int) -> Val = VInt(from_int(long(n)))

@@ -1717,6 +1717,72 @@ an ABI primitive that no sysl body could implement, so there is nothing to put i
 is the line the "no functions built into the compiler" rule actually draws — no program could write
 `va_arg`.
 
+**The walk is the target's C walk, every class of argument included.** On most machines a `va_list`
+is one pointer bumped past each slot; on AArch64 outside Apple's platforms it is a five-field
+structure keeping the general registers, the vector registers and the stack apart, and on x86-64
+System V a 128-bit integer travels as a register pair or not at all, and on 32-bit RISC-V by address.
+`va_arg` reads each one where
+the machine's C compiler would, so a function reads the same arguments at `aarch64-linux` or
+`aarch64-freestanding` as it does here.
+
+**Past 64 bits an integer travels at one width, 128.** That is the widest a register pair holds, so
+an integer between the two is widened to it at the call — as a narrow one is widened to 32 — and read
+back as an `i128` or a `u128`:
+
+```sysl
+top(n: int, ...) -> long
+    var ap: va_list
+
+    va_start(ap)
+
+    val w: i128 = va_arg(ap)
+
+    va_end(ap)
+    long(w >> 64)
+end top
+
+val big: i96 = i96(3) << 64
+
+print(top(1, big))
+```
+
+```output
+3
+```
+
+Reading it at its own width is refused, since that is not the width it arrived at:
+
+```sysl
+first(n: int, ...) -> long
+    var ap: va_list
+
+    va_start(ap)
+
+    val w: i96 = va_arg(ap)
+
+    va_end(ap)
+    long(w)
+end first
+
+print(first(0))
+```
+
+```error
+a variadic argument wider than 64 bits is promoted to 128, so it cannot be read as
+```
+
+and an integer wider than 128 bits cannot go in a tail at all — C passes one by address:
+
+```sysl
+extern printf(fmt: *u8, ...) -> int
+
+print(printf(null, i256(1)))
+```
+
+```error
+cannot be passed to '...' — C passes an integer wider than 128 bits by address
+```
+
 **`va_arg` reads its type from context, or from the brackets.** C writes the type as a second
 argument, which is not a thing a sysl expression can hold; here it comes from the place the value is
 read into — `var v: int = va_arg(ap)`, `total += va_arg(ap)`, `take(va_arg(ap))` — the same place

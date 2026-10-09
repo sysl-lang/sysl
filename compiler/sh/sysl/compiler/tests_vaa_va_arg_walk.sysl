@@ -1,0 +1,421 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.Search
+
+// `va_arg` where LLVM's instruction is not C's walk (`emit_va_arg.sysl`). On AAPCS64 other than
+// Apple's, the instruction read only the stack, so `sum(3, 10, 20, 30)` answered 12 rather than 60 at
+// `aarch64-freestanding`, `aarch64-linux` and `aarch64-android`, with no diagnostic; on x86-64 System
+// V it split a 128-bit integer across the last register and the stack. The text tests say which
+// lowering each machine gets; the run tests say the answer is right, on an AArch64 board under QEMU
+// and on x86-64 under Rosetta, which is the only evidence a walk is the convention's rather than a
+// plausible one.
+
+// ffi.md's own function.
+private vaa_sum() -> string = raw"""
+    sum(n: int, ...) -> int
+        var ap: va_list
+
+        va_start(ap)
+
+        var total = 0
+
+        for i in 0..<n do total += va_arg(ap)
+
+        va_end(ap)
+
+        total
+    """
+
+// -- which lowering each machine gets ---------------------------------------------------------------
+
+// The text of `text` for `target`, with `call` printed so that what it defines is reached. Lowered
+// against the target's library sources rather than a built artifact, so a hosted machine whose C
+// headers are not on this one still answers.
+private vaa_ir(target: string, text: string, call: string) -> string =
+    cab_ir_for(target, text + s"\nprint($call)\n")
+
+private vaa_define(ir: string, symbol: string) -> string
+    for item in func_texts(ir)
+        if item.0 == symbol then return item.1
+
+    s"nothing defines '$symbol' in:\n$ir"
+end vaa_define
+
+@test("an AAPCS64 machine other than Apple's walks the register save areas")
+vaa_aapcs64_walks_the_register_save_areas()
+    for target in ["aarch64-freestanding", "aarch64-linux", "aarch64-android"]
+        val body = vaa_define(vaa_ir(target, vaa_sum(), "sum(1, 2)"), "sum")
+
+        assert(!body.contains("va_arg ptr"), s"$target still emits the instruction:\n$body")
+        // `__gr_offs` is 24 bytes in, `__gr_top` 8, and the stack cursor at the list's own address.
+        assert(body.contains("i64 24"), s"$target never reaches __gr_offs:\n$body")
+        assert(body.contains("i64 8"), s"$target never reaches __gr_top:\n$body")
+        assert(body.contains("va.on_stack"), s"$target has no way to the stack:\n$body")
+
+@test("a real comes from the vector registers' save area, sixteen bytes apart")
+vaa_a_real_comes_from_the_vector_save_area()
+    val body = vaa_define(vaa_ir("aarch64-freestanding", raw"""
+        first(n: int, ...) -> real
+            var ap: va_list
+
+            va_start(ap)
+
+            val x: real = va_arg(ap)
+
+            va_end(ap)
+            x
+        """, "first(1, 2.0)"), "first")
+
+    // `__vr_offs` at 28, `__vr_top` at 16, and each register's slot sixteen bytes wide.
+    assert(body.contains("i64 28"), body)
+    assert(body.contains("i64 16"), body)
+    assert(body.contains("add i32") && body.contains(", 16\n"), body)
+
+@test("Apple's AArch64, x86-64 and RISC-V keep LLVM's own va_arg, which is their walk")
+vaa_the_single_pointer_machines_keep_the_instruction()
+    for target in ["aarch64-macos", "x86_64-linux", "x86_64-freestanding", "riscv64-linux",
+                   "riscv32-freestanding", "thumb-freestanding"]
+        val body = vaa_define(vaa_ir(target, vaa_sum(), "sum(1, 2)"), "sum")
+
+        assert(body.contains("va_arg ptr"), s"$target:\n$body")
+
+@test("a 128-bit integer on x86-64 System V is read as one pair, not two halves")
+vaa_a_pair_is_one_read_on_sysv()
+    val text = raw"""
+        wide(n: int, ...) -> i128
+            var ap: va_list
+
+            va_start(ap)
+
+            val w: i128 = va_arg(ap)
+
+            va_end(ap)
+            w
+        """
+
+    val body = vaa_define(vaa_ir("x86_64-linux", text, "long(wide(1, i128(2)))"), "wide")
+
+    assert(!body.contains("va_arg ptr"), body)
+    assert(body.contains("icmp ule i32") && body.contains(", 32\n"), body)
+
+    // RV32 passes it by address: the slot is read as a pointer and the integer loaded through it.
+    val rv = vaa_define(vaa_ir("riscv32-freestanding", text, "long(wide(1, i128(2)))"), "wide")
+
+    assert(rv.contains("va_arg ptr") && rv.contains("load i128, ptr"), rv)
+
+    // Windows' list is a single pointer, so there the instruction stays.
+    assert(vaa_define(vaa_ir("x86_64-windows", text, "long(wide(1, i128(2)))"), "wide").contains("va_arg ptr"))
+
+// -- past 64 bits, one width -----------------------------------------------------------------------
+
+private vaa_read_as(ty: string) -> string =
+    "first(n: int, ...) -> long\n" +
+    "    var ap: va_list\n" +
+    "    va_start(ap)\n" +
+    s"    val w: $ty = va_arg(ap)\n" +
+    "    va_end(ap)\n" +
+    "    long(w)\n" +
+    "end first\n" +
+    "print(first(0))\n"
+
+@test("an integer between 64 and 128 bits is not read at its own width")
+vaa_a_width_between_is_refused_at_the_read()
+    for ty in ["i96", "u65", "i127"]
+        val said = azd_err(vaa_read_as(ty))
+
+        assert(said.contains(s"a variadic argument wider than 64 bits is promoted to 128, so it cannot be read as $ty"),
+               said)
+
+    assert(azd_err(vaa_read_as("u96")).contains("read it as 'u128' and convert"))
+
+@test("an integer wider than 128 bits is refused at the read and at the call")
+vaa_a_width_past_128_is_refused()
+    val read = azd_err(vaa_read_as("i256"))
+
+    assert(read.contains("a variadic argument is at most 128 bits wide, so it cannot be read as i256"), read)
+
+    for callee in ["extern printf(fmt: *u8, ...) -> int\n", vaa_sum()]
+        val call = if callee.contains("printf") then "printf(null, i256(1))" else "sum(1, u129(1))"
+        val said = azd_err(callee + s"\nprint($call)\n")
+
+        assert(said.contains("cannot be passed to '...' — C passes an integer wider than 128 bits by address"),
+               said)
+
+@test("64, 128 and the widths a call promotes still read")
+vaa_the_widths_that_cross_still_read()
+    for ty in ["int", "long", "u64", "i48", "i128", "u128"]
+        assert_eq(azd_err(vaa_read_as(ty)), "")
+
+// -- the answer, on the machines themselves --------------------------------------------------------
+
+// Every case at once: more of each class than the registers hold, the classes interleaved, a pointer,
+// a 128-bit integer on an even register, one that finds a single register left and so goes wholly to
+// the stack (and takes the rest of its class with it), and a list copied part-way through.
+private vaa_decls() -> string = vaa_sum() + raw"""
+
+    longs(n: int, ...) -> long
+        var ap: va_list
+
+        va_start(ap)
+
+        var total: long = 0
+
+        for i in 0..<n
+            val k: int = va_arg(ap)
+            val l: long = va_arg(ap)
+
+            total = total * 5 + long(k) * 100 + l
+
+        va_end(ap)
+        total
+    end longs
+
+    ints(n: int, ...) -> long
+        var ap: va_list
+
+        va_start(ap)
+
+        var total: long = 0
+
+        for i in 0..<n
+            val v: int = va_arg(ap)
+
+            total = total * 3 + long(v)
+
+        va_end(ap)
+        total
+    end ints
+
+    reals(n: int, ...) -> real
+        var ap: va_list
+
+        va_start(ap)
+
+        var total = 0.0
+
+        for i in 0..<n
+            val v: real = va_arg(ap)
+
+            total = total * 2.0 + v
+
+        va_end(ap)
+        total
+    end reals
+
+    mixed(n: int, ...) -> long
+        var ap: va_list
+
+        va_start(ap)
+
+        var total: long = 0
+
+        for i in 0..<n
+            val k: int = va_arg(ap)
+            val x: real = va_arg(ap)
+            val p: *long = va_arg(ap)
+
+            total = total * 7 + long(k) * 1000 + long(x * 10.0) + *p
+
+        va_end(ap)
+        total
+    end mixed
+
+    pairs(n: int, ...) -> long
+        var ap: va_list
+
+        va_start(ap)
+
+        val a: int = va_arg(ap)
+        val w: i128 = va_arg(ap)
+        val b: int = va_arg(ap)
+        val v: i128 = va_arg(ap)
+        val c: int = va_arg(ap)
+        val u: i128 = va_arg(ap)
+
+        va_end(ap)
+
+        val hi = long(w >> 64) + long(v >> 64) * 10 + long(u >> 64) * 100
+        val lo = long(w & 0xffff) + long(v & 0xffff) * 10 + long(u & 0xffff) * 100
+
+        long(a) * 100000000 + long(b) * 1000000 + long(c) * 10000 + hi * 1000 + lo
+    end pairs
+
+    late_pair(n: int, ...) -> long
+        var ap: va_list
+
+        va_start(ap)
+
+        var total: long = 0
+
+        for i in 0..<n
+            val k: int = va_arg(ap)
+
+            total = total * 10 + long(k)
+
+        val w: i128 = va_arg(ap)
+        val after: int = va_arg(ap)
+
+        va_end(ap)
+        total * 1000 + long(w >> 64) * 100 + long(w & 0xff) * 10 + long(after)
+    end late_pair
+
+    widened(n: int, ...) -> long
+        var ap: va_list
+
+        va_start(ap)
+
+        val w: i128 = va_arg(ap)
+        val after: int = va_arg(ap)
+
+        va_end(ap)
+        long(w >> 64) * 10 + long(after)
+    end widened
+
+    copied(n: int, ...) -> long
+        var ap: va_list
+        var bp: va_list
+
+        va_start(ap)
+
+        val first: int = va_arg(ap)
+        val half: real = va_arg(ap)
+
+        va_copy(bp, ap)
+
+        val a: int = va_arg(ap)
+        val b: int = va_arg(bp)
+        val x: real = va_arg(ap)
+        val y: real = va_arg(bp)
+
+        va_end(bp)
+        va_end(ap)
+        long(first) * 10000 + long(half * 2.0) * 1000 + long(a + b) * 10 + long(x + y)
+    end copied
+    """
+
+// The calls every machine makes, reals left out: the M-profile and RV32 boards carry no soft-float
+// runtime to link, and a function nothing calls is not lowered.
+private vaa_integer_calls() -> string = raw"""
+
+    print(sum(3, 10, 20, 30))
+    print(ints(12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12))
+    print(longs(3, 1, long(2), 3, long(4), 5, long(6)))
+    print(pairs(0, 1, (i128(1) << 64) + 7, 2, (i128(2) << 64) + 8, 3, (i128(3) << 64) + 9))
+    print(late_pair(6, 1, 2, 3, 4, 5, 6, (i128(6) << 64) + 7, 8))
+    print(late_pair(4, 1, 2, 3, 4, (i128(6) << 64) + 7, 8))
+
+    val odd: i96 = (i96(3) << 64) + 1
+
+    print(widened(0, odd, 4))
+    """
+
+private vaa_program() -> string = vaa_decls() + vaa_integer_calls() + raw"""
+
+    var nine: long = 9
+    var forty: long = 40
+
+    print(long(reals(11, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0)))
+    print(mixed(4, 1, 0.5, &nine, 2, 1.5, &forty, 3, 2.5, &nine, 4, 3.5, &forty))
+    print(copied(0, 5, 1.5, 4, 2.5))
+    """
+
+// What the programs print, worked out by hand: each line is the function's own arithmetic over the
+// arguments it was handed, so a value read from the wrong slot changes its line.
+private vaa_integer_expected() -> string =
+    "60\n" +           // ffi.md's own answer
+    "398574\n" +       // twelve ints folded base 3: five past the last register
+    "4576\n" +         // (int, long) pairs: on a 32-bit machine each long on an even register
+    "102351987\n" +    // three ints and three pairs, each pair on an even register or the stack
+    "123456678\n" +    // a pair that finds one register left on AArch64 goes wholly to the stack
+    "1234678\n" +      // ...and the same on x86-64, where the int after it still takes r9
+    "34\n"             // a 96-bit integer widened to 128 at the call, and the int after it
+
+private vaa_expected() -> string =
+    vaa_integer_expected() +
+    "1431\n" +         // eleven reals read as the bits 10110010111: three past the last register
+    "473810\n" +       // four (int, real, pointer) triples, interleaved, folded base 7
+    "53085\n"          // a list copied part-way: both copies read the same next arguments
+
+private vaa_aarch64_board() -> QemuBoard =
+    QemuBoard("aarch64-virt", "aarch64-freestanding", "qemu-system-aarch64",
+              qemu_words_of(["-M", "virt", "-cpu", "cortex-a53", "-nographic", "-semihosting-config",
+                             "enable=on,target=native", "-kernel"]),
+              "start_aarch64.s", "bsp_aarch64.c", "aarch64.ld")
+
+private qemu_words_of(xs: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for x in xs do out.push(x)
+
+    out
+end qemu_words_of
+
+@test("ffi.md's sum and every class of argument read back right on an AArch64 board")
+vaa_reads_back_right_on_an_aarch64_board()
+    val b = vaa_aarch64_board()
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("p.sysl", vaa_program()))
+
+    qemu_boot(b, files) match
+        Err(why) -> assert(false, why)
+        Ok(r) ->
+            assert(r.status.ok(), qemu_said(b, r))
+            assert_eq(r.out, vaa_expected())
+
+// The single-pointer machines keep LLVM's instruction, so the same program has to come out the same on
+// each of them too: RV32 and Armv8-M, Armv7E-M and Armv7-M, where a `long` takes an aligned register
+// pair and a 128-bit integer is wider than any pair. The micro:bit is left out, as the harness's own
+// sweep leaves it out.
+@test("every integer and pointer width reads back right on the RISC-V and Arm M-profile boards")
+vaa_reads_back_right_on_every_board()
+    var bad: Buf[string] = buf()
+
+    for b in qemu_boards()
+        if b.target == "thumbv6m-freestanding" then continue
+
+        var files: Buf[(string, string)] = buf()
+
+        files.push(("p.sysl", vaa_decls() + vaa_integer_calls()))
+
+        qemu_boot(b, files) match
+            Err(why) -> bad.push(s"${b.name}: $why")
+            Ok(r) ->
+                if !r.status.ok() || r.out != vaa_integer_expected()
+                    bad.push(s"${b.name} printed:\n${r.out}\n${qemu_said(b, r)}")
+
+    assert(bad.is_empty(), joined(bad, "\n"))
+end vaa_reads_back_right_on_every_board
+
+// x86-64 System V, run where Rosetta can run it. The same program and the same answers.
+@test("every class of argument reads back right on x86-64 System V")
+vaa_reads_back_right_on_x86_64()
+    if !capture("/usr/bin/arch", ["-x86_64", "/usr/bin/true"]).map((o) -> o.status.ok()).unwrap_or(false)
+        skip("this machine cannot run an x86-64 program")
+
+    val root = make_temp_dir("sysl-vaa").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", vaa_program()).unwrap()
+
+    val exe = s"$root/built"
+    val built = build_native_program(s"$root/main.sysl", Some("x86_64-macos"), None, DefaultOptimization,
+                                     Some(exe))
+
+    if built.is_err()
+        remove_dir_all(root).unwrap_or(())
+        assert(false, failure_text(built.unwrap_err()))
+
+    val said = capture("/usr/bin/arch", ["-x86_64", exe], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) -> assert_eq(out.text, vaa_expected())
+end vaa_reads_back_right_on_x86_64
