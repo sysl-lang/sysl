@@ -651,13 +651,79 @@ ex_a_member_export_is_refused()
            said)
 end ex_a_member_export_is_refused
 
-@test("nor private, which is the two promises a definition cannot both make")
-ex_a_private_export_is_refused()
+// -- a private export ------------------------------------------------------------------------------
+
+// **`private` is about the sysl name and an export about a symbol**, so the two are not opposite
+// promises: the definition stays internal to its file, and the entry C calls is published hidden --
+// every object of the image resolves it, module `asm` and a package's own C among them, and a shared
+// object built from it does not offer it to a loader.
+@test("a private export keeps its symbol, hidden, in front of a definition that stays internal")
+ex_a_private_export_is_hidden()
     if ex_no_library() then return
 
-    val said = ex_err("module demo\n\n@export\nprivate add(a: i32, b: i32) -> i32 = a + b\n")
+    val out = ex_ir("module demo\n\n@export(\"demo_add\")\nprivate add(a: i32, b: i32) -> i32 = a + b\n")
 
-    assert(said.contains("cannot make both claims"), said)
+    assert(out.contains("define hidden i32 @demo_add("), out)
+    assert(out.contains("define internal i32 @demo$add("), out)
+    assert(out.contains("call i32 @demo$add("), out)
+end ex_a_private_export_is_hidden
+
+@test("a module-private export is hidden too, and its definition keeps the module's linkage")
+ex_a_module_private_export_is_hidden()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\n@export(\"demo_add\")\nprivate[demo] add(a: i32, b: i32) -> i32 = " +
+                    "a + b\n")
+
+    assert(out.contains("define hidden i32 @demo_add("), out)
+    assert(out.contains("define i32 @demo$add("), out)
+end ex_a_module_private_export_is_hidden
+
+@test("and a public export is not hidden")
+ex_a_public_export_is_not_hidden()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\n@export(\"demo_add\")\nadd(a: i32, b: i32) -> i32 = a + b\n")
+
+    assert(out.contains("define i32 @demo_add("), out)
+    assert(!out.contains("hidden"), out)
+end ex_a_public_export_is_not_hidden
+
+@test("a private export in the root module moves its definition aside, as a public one does")
+ex_a_private_root_export_moves_aside()
+    if ex_no_library() then return
+
+    val out = ex_ir("@export\nprivate product(a: f32, b: f32) -> f32 = a * b\n\nprint(1)\n")
+
+    assert(out.contains("define hidden float @product("), out)
+    assert(out.contains("call float @product$$sysl("), out)
+end ex_a_private_root_export_moves_aside
+
+@test("the name stays file-private: another file of the module may not call it")
+ex_a_private_export_name_stays_private()
+    if ex_no_library() then return
+
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("demo/a.sysl", "module demo\n\n@export(\"demo_add\")\nprivate add(a: i32, b: i32) -> i32 = " +
+                "a + b\n"))
+    files.push(("demo/b.sysl", "module demo\n\ntwice(a: i32) -> i32 = add(a, a)\n"))
+
+    val said = ex_build_files(files, host_target(), false, false).said
+
+    assert(said.contains("add"), said)
+end ex_a_private_export_name_stays_private
+
+@test("the header leaves a private export out, being the API a C project is handed")
+ex_the_header_leaves_a_private_export_out()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export(\"demo_add\")\nadd(a: i32, b: i32) -> i32 = a + b\n\n" +
+                      "@export(\"demo_back\")\nprivate back(a: i32) -> i32 = a\n")
+
+    assert(h.contains("demo_add("), h)
+    assert(!h.contains("demo_back"), h)
+end ex_the_header_leaves_a_private_export_out
 
 @test("nor variadic")
 ex_a_variadic_export_is_refused()
@@ -1405,9 +1471,9 @@ ex_a_type_name_is_held_to_the_rules()
               "'no-good' is not a name C can declare — a type's name in a header is a C identifier, " +
               "so it is a letter or '_' followed by letters, digits and '_'")
     assert_eq(ex_err("module demo\n\n@export(\"h\")\nprivate type H = u64\n"),
-              "'demo.H' is private, so no exported function may name it — an export is public, and " +
-              "a declaration may not be more visible than the types it names. No header can carry " +
-              "this type at all, so there is no name in one for it to take")
+              "'demo.H' is private, and a header declares only public exports, none of which may " +
+              "name it — a declaration may not be more visible than the types it names. No header " +
+              "can carry this type at all, so there is no name in one for it to take")
 end ex_a_type_name_is_held_to_the_rules
 
 // C has one namespace for a `typedef` name and a function name, which nothing on the sysl side hints
@@ -1429,15 +1495,15 @@ end ex_a_type_name_claims_against_a_function
 // silent under `sysl test` -- the loop a package's author actually runs. The same source a `sysl
 // build` refused compiled, linked and ran, reporting a pass.
 
-@test("a test build refuses a private export, which is the two promises a definition cannot both make")
-ex_a_test_build_refuses_a_private_export()
+@test("a test build refuses a generic export, which has no one instantiation for the linker")
+ex_a_test_build_refuses_a_generic_export()
     if ex_no_library() then return
 
-    val said = ex_test_err("module demo\n\n@export\nprivate add(a: i32) -> i32 = a\n\n" +
+    val said = ex_test_err("module demo\n\n@export\nid[T](x: T) -> T = x\n\n" +
                            "@test(\"one\")\nt() = assert(1 == 1, \"one\")\n")
 
-    assert(said.contains("cannot make both claims"), said)
-end ex_a_test_build_refuses_a_private_export
+    assert(said.contains("cannot be generic"), said)
+end ex_a_test_build_refuses_a_generic_export
 
 @test("and a variadic one")
 ex_a_test_build_refuses_a_variadic_export()
