@@ -533,6 +533,38 @@ qd_export_is_spelled_or_refused()
     assert_eq(shown.0, 0)
     qd_has(shown.1, "long double twice(long double x);")
 
+@test("an extern taking an f128 is refused where C's long double is not binary128")
+qd_extern_param_is_refused()
+    val text = "extern \"half\" half(x: f128) -> real\n\nprint(half(1.0))\n"
+    val said = qd_err_for(Some("aarch64-macos"), text)
+
+    qd_has(said, "'x' of the 'extern' 'half' is f128, and C on 'aarch64-macos' has no binary128 type " +
+           "to spell it with — its 'long double' is a 'double' there")
+    qd_has(qd_err_for(Some("x86_64-linux"), text), "its 'long double' is the x87 80-bit extended format there")
+    assert_eq(qd_err_for(Some("aarch64-linux"), text), "")
+
+@test("an extern answering an f128 is refused where C's long double is not binary128")
+qd_extern_result_is_refused()
+    val text = "extern \"third\" third() -> f128\n\nprint(real(third()) > 0.0)\n"
+    val said = qd_err_for(Some("aarch64-macos"), text)
+
+    qd_has(said, "the 'extern' 'third' returns f128, and C on 'aarch64-macos' has no binary128 type")
+    qd_lacks(said, "of the 'extern' 'third'")
+    assert_eq(qd_err_for(Some("riscv64-linux"), text), "")
+
+@test("an extern taking a struct with an f128 field by value is refused the same way")
+qd_extern_struct_field_is_refused()
+    val text = "struct H\n    a: f128\n    b: real\n\nextern \"g\" g(h: H) -> real\n\nprint(g(H(1.0, 2.0)))\n"
+    val said = qd_err_for(Some("aarch64-macos"), text)
+
+    qd_has(said, "'h' of the 'extern' 'g' is ")
+    qd_has(said, ", and C on 'aarch64-macos' has no binary128 type")
+    assert_eq(qd_err_for(Some("aarch64-linux"), text), "")
+
+@test("an extern over f128 that nothing calls binds the program to nothing, and is not refused")
+qd_an_uncalled_quad_extern_is_not_refused()
+    assert_eq(qd_err_for(Some("aarch64-macos"), "extern \"half\" half(x: f128) -> f128\n\nprint(1)\n"), "")
+
 // -- the runtime, on a bare machine -----------------------------------------------------------------
 
 private qd_nm() -> Option[string]

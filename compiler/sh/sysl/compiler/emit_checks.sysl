@@ -40,6 +40,7 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
     check_shared_storage(a, p)
     check_pinning(a, p)
     check_exports_emitted(a, emitted, own)
+    check_quad_externs(a, emitted)
     check_general_regs(a, emitted)
     promotions
 end checks_before_lowering
@@ -841,6 +842,42 @@ private export_signature(a: &Analysis, f: TFunc)
         a.fault(scope, f.span, s"the exported '${qualified_name(f.name)}' returns " +
                 s"${type_show(f.ret_ty)}, ${quad_unspellable(target)}")
 end export_signature
+
+// An `extern` whose signature holds an `f128`, on a machine where C has no binary128 type -- the
+// export refusal read the other way. The C function it names was compiled by a C compiler, and on
+// that machine no C compiler wrote a function taking or answering binary128, so the call would hand
+// it sixteen bytes in registers it reads as something else.
+//
+// It is asked of the externs the program reached, as the exports are of the ones it emits: a
+// declaration nothing calls is never declared to LLVM and binds the program to nothing.
+check_quad_externs(a: &Analysis, p: TProgram)
+    val t = a.tables.target
+
+    if c_long_double_is_quad(t) then return
+
+    for x in p.externs
+        val home = a.tables.extern_scopes.get(x.name)
+        val decl = a.tables.externs.get(x.name)
+
+        if home.is_none() || decl.is_none() then continue
+
+        val at = home.unwrap()
+        val d = decl.unwrap()
+
+        for i in 0..<x.params.len()
+            val ty = x.params.at(i)
+
+            if mentions_unknown(ty) || !holds_quad(ty) then continue
+
+            val name = if i < d.params.len() then d.params.at(i).name else s"parameter ${i + 1}"
+
+            a.fault(at.scope, at.span, s"'$name' of the 'extern' '${d.name}' is ${type_show(ty)}, " +
+                    quad_unspellable(t))
+
+        if !mentions_unknown(x.ret_ty) && holds_quad(x.ret_ty)
+            a.fault(at.scope, at.span, s"the 'extern' '${d.name}' returns ${type_show(x.ret_ty)}, " +
+                    quad_unspellable(t))
+end check_quad_externs
 
 // Whether an `f128` in `f`'s signature is something C on `t` can call it with. The quad runtime's
 // routines are the exception: LLVM is their only caller, and it passes `fp128` the same way on every

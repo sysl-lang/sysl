@@ -2370,7 +2370,20 @@ is a 'long double' with 64 bits of significand on 'x86_64-freestanding' — the 
 `f128` itself crosses to C as `fp128`, as clang passes a binary128 `long double`, and an exported
 function taking one is declared `long double` in the header — on the machines where that is what
 `long double` is. Elsewhere the export is refused, since C there has no binary128 type to spell it
-with.
+with — and so is an `extern` that takes or answers one, a struct holding one included, because no C
+compiler on that machine wrote the function it names:
+
+```sysl target=aarch64-macos
+extern "half" half(x: f128) -> real
+
+print(half(1.0))
+```
+
+```error
+'x' of the 'extern' 'half' is f128, and C on 'aarch64-macos' has no binary128 type to spell it with
+```
+
+The `c type` above is the declaration that is right on both kinds of machine.
 
 **A type C does not describe as an integer or a float is refused by name:**
 
