@@ -2,6 +2,7 @@ module sysl.fs.hosted
 @requires(os)
 
 import sysl.fs.sys.Stat
+import sysl.sys.{UNSUPPORTED, host_status}
 
 // `sysl.fs.sys`'s hooks answered over the platform's C library, which is what every hosted target
 // links. **Call `sysl.fs` instead** -- nothing here is meant to be called: each function below exists
@@ -16,14 +17,14 @@ import sysl.fs.sys.Stat
 //
 // **This is the only code in the library that reads `errno`**, and it reads it straight after the
 // call that failed, with nothing between the two that could overwrite it. What it hands back is the
-// number; `sysl.fs` turns it into an `IoError` once, in `from_errno`.
+// number, negated; `sysl.fs` turns it into an `IoError` once, in `from_status`.
 //
 // **What only C can answer is answered by C beside this file**: the `O_*` values `open` takes, which
 // differ between C libraries; `struct stat` and `struct dirent`, which every platform lays out its own
 // way; `off_t`, whose width is the platform's; and the two calls that write into a buffer of
 // `PATH_MAX`, which is a `#define`. Each shim does one call and hands back the plain answer, and the
 // `errno` it leaves is read here. The shims under `__hosted__/` use only what wasi-libc has too; the
-// two under `__posix__/` need a POSIX C library, and on any other target their hooks answer -1, "not
+// two under `__posix__/` need a POSIX C library, and on any other target their hooks answer `UNSUPPORTED`, "not
 // supported on this target".
 
 // `errno` is a **function** on every platform this builds for, not a variable -- C spells it as a
@@ -41,18 +42,23 @@ private extern "__errno" errno_location() -> *i32
 private extern "__errno_location" errno_location() -> *i32
 #endif
 
-/** What a hook answers for a C call that reports failure as a non-zero result: zero, or the number
- * the failure left behind. Asked straight after the call, so nothing can have overwritten it.
+/** What a hook answers for a failed C call: the number the failure left behind, negated. Asked
+ * straight after the call, so nothing can have overwritten it.
  */
-private status(rc: int) -> int = if rc != 0 then errno_location()[0] else 0
+private failed() -> int = host_status(errno_location()[0])
+
+/** What a hook answers for a C call that reports failure as a non-zero result: zero, or the number
+ * the failure left behind, negated.
+ */
+private status(rc: int) -> int = if rc != 0 then failed() else 0
 
 /** `ENAMETOOLONG`: 63 on a BSD, 36 under glibc and Bionic, which is what a path too long for the
  * terminated copy below is answered with -- the code the C library would have given for it.
  */
 #if bsd
-private const name_too_long: int = 63
+private const name_too_long: int = -63
 #else
-private const name_too_long: int = 36
+private const name_too_long: int = -36
 #endif
 
 /** How long a path may be once a terminator is put after it. 4,096 bytes is what every Linux allows
@@ -137,7 +143,7 @@ supply_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int
 
     val opened = c_open(&c[0], flags, mode)
 
-    if opened < 0 then return errno_location()[0]
+    if opened < 0 then return failed()
 
     *fd = opened
     0
@@ -147,7 +153,7 @@ end supply_open
 supply_read(fd: int, into: *u8, room: usize, got: *usize) -> int
     val n = c_read(fd, into, room)
 
-    if n < 0 then return errno_location()[0]
+    if n < 0 then return failed()
 
     *got = usize(n)
     0
@@ -157,7 +163,7 @@ end supply_read
 supply_write(fd: int, from: *u8, len: usize, put: *usize) -> int
     val n = c_write(fd, from, len)
 
-    if n < 0 then return errno_location()[0]
+    if n < 0 then return failed()
 
     *put = usize(n)
     0
@@ -170,7 +176,7 @@ supply_close(fd: int) -> int = status(c_close(fd))
 supply_seek(fd: int, offset: long, whence: int, at: *long) -> int
     val to = c_lseek(fd, offset, whence)
 
-    if to < 0 then return errno_location()[0]
+    if to < 0 then return failed()
 
     *at = to
     0
@@ -257,7 +263,7 @@ supply_chmod(path: *u8, len: usize, mode: u32) -> int
 
     status(changed_mode(&c[0], mode))
 #else
-    -1
+    UNSUPPORTED
 #endif
 end supply_chmod
 
@@ -271,7 +277,7 @@ supply_opendir(path: *u8, len: usize, dir: *usize) -> int
 
     val d = c_opendir(&c[0])
 
-    if d == null then return errno_location()[0]
+    if d == null then return failed()
 
     *dir = usize(d)
     0
@@ -286,7 +292,7 @@ supply_readdir(dir: usize, into: *u8, room: usize, got: *usize) -> int
     if name == null
         val why = errno_location()[0]
 
-        if why != 0 then return why
+        if why != 0 then return host_status(why)
 
         *got = 0
         return 0
@@ -310,7 +316,7 @@ supply_closedir(dir: usize) -> int = status(c_closedir(ptr_cast(dir)))
 
 @export("sysl_fs_getcwd")
 supply_getcwd(into: *u8, room: usize, got: *usize) -> int
-    if c_getcwd(into, room) == null then return errno_location()[0]
+    if c_getcwd(into, room) == null then return failed()
 
     var n: usize = 0
 
@@ -339,7 +345,7 @@ supply_temp_dir(prefix: *u8, len: usize, into: *u8, room: usize, got: *usize) ->
 
     val code = c_temp_dir(&c[0], into, room)
 
-    if code != 0 then return code
+    if code != 0 then return host_status(code)
 
     var n: usize = 0
 
@@ -349,7 +355,7 @@ supply_temp_dir(prefix: *u8, len: usize, into: *u8, room: usize, got: *usize) ->
     *got = n
     0
 #else
-    -1
+    UNSUPPORTED
 #endif
 end supply_temp_dir
 
@@ -384,7 +390,7 @@ supply_readlink(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> i
 
     val n = c_readlink(&c[0], into, room)
 
-    if n < 0 then return errno_location()[0]
+    if n < 0 then return failed()
 
     *got = usize(n)
     0
@@ -399,11 +405,11 @@ supply_realpath(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> i
 
     val n = c_realpath(&c[0], into, u64(room))
 
-    if n < 0 then return errno_location()[0]
+    if n < 0 then return failed()
 
     *got = usize(n)
     0
 #else
-    -1
+    UNSUPPORTED
 #endif
 end supply_realpath

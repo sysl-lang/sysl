@@ -4,7 +4,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.fs.is_file
 import sysl.process.capture
-import sysl.text.Search
+import sysl.text.{Search, replace_all}
 import sysl.testing.skip
 
 // **`sysl.fs` over `sysl.fs.sys`, and a program answering it on a target with no C library.**
@@ -107,7 +107,7 @@ private fsh_hooks(left_out: []string) -> string
         for name in left_out
             if name == row.0 then kept = false
 
-        if kept then out = out + s"@export(\"sysl_fs_${row.0}\")\nk_${row.0}(${row.1}) -> int = -1\n\n"
+        if kept then out = out + s"@export(\"sysl_fs_${row.0}\")\nk_${row.0}(${row.1}) -> int = -38\n\n"
 
     out
 end fsh_hooks
@@ -251,10 +251,10 @@ fsh_unanswered_hooks_are_refused()
     val (said, out) = fsh_build(p)
 
     assert(said.0 != 0, "built with two hooks unanswered")
-    assert(said.1.contains(s"this program reaches 'sysl.fs', and '$fsh_target' has no C library " +
-        "under it for the standard library to answer a filesystem with, so the program answers it: " +
+    assert(said.1.contains(s"this program reaches 'sysl.fs', and '$fsh_target' has no operating " +
+        "system under it for the standard library to answer a filesystem with, so the program answers it: " +
         "define 'sysl_fs_close', 'sysl_fs_read' with '@export', each taking what its 'extern' in " +
-        "'sysl.fs.sys' declares and answering zero or the code of an 'IoError'"), said.1)
+        "'sysl.fs.sys' declares and answering zero or the code of an 'IoError' negated"), said.1)
 
     // It is told before the link, so no linker names a symbol.
     assert(!said.1.contains("undefined symbol"), said.1)
@@ -633,7 +633,7 @@ fsh_reading_surface_links_freestanding()
     lbr_drop([p, out])
 end fsh_reading_surface_links_freestanding
 
-@test("a hook answering -1 reaches metadata, the walk, remove_dir_all and canonicalize as 'not supported'")
+@test("a hook answering UNSUPPORTED reaches metadata, the walk, remove_dir_all and canonicalize as 'not supported'")
 fsh_unsupported_hook_is_an_io_error()
     if !lbr_ready() then return
 
@@ -643,10 +643,10 @@ fsh_unsupported_hook_is_an_io_error()
         import sysl.fs.sys.Stat
 
         @export("sysl_fs_stat")
-        no_stat(path: *u8, len: usize, follow: int, out: *Stat) -> int = -1
+        no_stat(path: *u8, len: usize, follow: int, out: *Stat) -> int = -38
 
         @export("sysl_fs_realpath")
-        no_realpath(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int = -1
+        no_realpath(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int = -38
 
         val d = make_temp_dir("fsh").unwrap()
 
@@ -682,3 +682,163 @@ fsh_unsupported_hook_is_an_io_error()
               "still there: true\ncanonicalize: not supported on this target\ntrue\n")
     lbr_drop([p])
 end fsh_unsupported_hook_is_an_io_error
+
+@test("copy_dir_all on a target whose chmod hook answers UNSUPPORTED copies the tree and carries nothing")
+fsh_copy_dir_all_without_permission_bits()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.{make_temp_dir, make_dir_all, write_text, read_text, copy_dir_all, remove_dir_all, is_dir}
+        import sysl.path.join
+
+        @export("sysl_fs_chmod")
+        no_chmod(path: *u8, len: usize, mode: u32) -> int = -38
+
+        val d = make_temp_dir("fsh").unwrap()
+        val from = join(d, "src")
+        val to = join(d, "dst")
+
+        make_dir_all(join(from, "a/b")).unwrap()
+        write_text(join(from, "top"), "1").unwrap()
+        write_text(join(from, "a/b/deep"), "2").unwrap()
+
+        copy_dir_all(from, to) match
+            Ok(_) -> print("copied")
+            Err(e) -> print(s"copy: $e")
+
+        print(is_dir(join(to, "a/b")))
+        print(read_text(join(to, "top")).unwrap())
+        print(read_text(join(to, "a/b/deep")).unwrap())
+
+        remove_dir_all(d).unwrap()
+        """)
+
+    assert_eq(lbr_run(p, []), "copied\ntrue\n1\n2\n")
+    lbr_drop([p])
+end fsh_copy_dir_all_without_permission_bits
+
+@test("copy_dir_all still fails when the chmod hook answers a real error")
+fsh_copy_dir_all_chmod_real_error_fails()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.{make_temp_dir, make_dir_all, write_text, copy_dir_all, remove_dir_all}
+        import sysl.path.join
+
+        @export("sysl_fs_chmod")
+        deny_chmod(path: *u8, len: usize, mode: u32) -> int = -13
+
+        val d = make_temp_dir("fsh").unwrap()
+        val from = join(d, "src")
+
+        make_dir_all(from).unwrap()
+        write_text(join(from, "top"), "1").unwrap()
+
+        copy_dir_all(from, join(d, "dst")) match
+            Ok(_) -> print("copied")
+            Err(e) -> print(s"copy failed: ${e.code()}")
+
+        remove_dir_all(d).unwrap()
+        """)
+
+    assert_eq(lbr_run(p, []), "copy failed: 13\n")
+    lbr_drop([p])
+end fsh_copy_dir_all_chmod_real_error_fails
+
+@test("one hook from each of fs, process and io answering -13 surfaces as the same permission-denied error")
+fsh_one_negated_contract_across_hook_modules()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.{remove_file, PermissionDenied}
+        import sysl.io.{stdin, Reader}
+        import sysl.process.run
+        import sysl.process.sys.Text
+
+        @export("sysl_fs_unlink")
+        deny_unlink(path: *u8, len: usize) -> int = -13
+
+        @export("sysl_proc_spawn")
+        deny_spawn(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, envc: usize,
+                   inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int,
+                   stderr_fd: int, started: *i64) -> i64 = -13
+
+        @export("sysl_io_read")
+        deny_read(fd: int, into: *u8, room: usize) -> isize = -13
+
+        remove_file("x") match
+            Ok(_) -> print("fs answered")
+            Err(e) -> print(s"fs: ${e.code()} ${e == PermissionDenied}")
+
+        run("x") match
+            Ok(_) -> print("process answered")
+            Err(e) -> print(s"process: ${e.code()} ${e == PermissionDenied}")
+
+        var input = stdin()
+        var room: [4]u8 = [0; 4]
+
+        input.read(room[..])
+        print(s"io failed: ${input.failed()}")
+        """)
+
+    assert_eq(lbr_run(p, []), "fs: 13 true\nprocess: 13 true\nio failed: true\n")
+    lbr_drop([p])
+end fsh_one_negated_contract_across_hook_modules
+
+// A hosted program whose fs, process and io hooks each answer `status`, and what each reports.
+private fsh_status_program(status: string, shows: string) -> string
+    val text = raw"""
+    import sysl.fs.{remove_file, PermissionDenied, NotPermitted}
+    import sysl.io.{stdin, Reader}
+    import sysl.process.run
+    import sysl.process.sys.Text
+
+    @export("sysl_fs_unlink")
+    answer_unlink(path: *u8, len: usize) -> int = STATUS
+
+    @export("sysl_proc_spawn")
+    answer_spawn(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, envc: usize,
+                 inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int,
+                 stderr_fd: int, started: *i64) -> i64 = STATUS
+
+    @export("sysl_io_read")
+    answer_read(fd: int, into: *u8, room: usize) -> isize = STATUS
+
+    remove_file("x") match
+        Ok(_) -> print("fs answered")
+        Err(e) -> print(s"fs: SHOWS")
+
+    run("x") match
+        Ok(_) -> print("process answered")
+        Err(e) -> print(s"process: SHOWS")
+
+    var input = stdin()
+    var room: [4]u8 = [0; 4]
+
+    input.read(room[..])
+    print(s"io failed: ${input.failed()}")
+    """
+
+    replace_all(replace_all(text, "STATUS", status), "SHOWS", shows)
+end fsh_status_program
+
+@test("hooks of fs, process and io answering -1 are EPERM: NotPermitted, code 1, not PermissionDenied")
+fsh_eperm_round_trips_through_all_three_hook_modules()
+    if !lbr_ready() then return
+
+    val p = lbr_program(fsh_status_program("-1", "${e.code()} ${e == NotPermitted} ${e == PermissionDenied}"))
+
+    assert_eq(lbr_run(p, []), "fs: 1 true false\nprocess: 1 true false\nio failed: true\n")
+    lbr_drop([p])
+end fsh_eperm_round_trips_through_all_three_hook_modules
+
+@test("hooks of fs and process answering UNSUPPORTED (-38) are 'not supported on this target'")
+fsh_unsupported_status_is_one_value_in_all_three_hook_modules()
+    if !lbr_ready() then return
+
+    val p = lbr_program(fsh_status_program("-38", "${e.message()}"))
+
+    assert_eq(lbr_run(p, []), "fs: not supported on this target\nprocess: not supported on this target\n" +
+                              "io failed: true\n")
+    lbr_drop([p])
+end fsh_unsupported_status_is_one_value_in_all_three_hook_modules
