@@ -128,6 +128,55 @@ lic_hosted_is_unchanged()
     assert_eq(printed, "1.50 1.5\n")
 end lic_hosted_is_unchanged
 
+// A box of a page-aligned struct, reached from an export: the lowering asks `sysl_alloc_aligned` for
+// it, and the defaults over `posix_memalign` and `free` are written only where a C library stands.
+private val lic_aligned_box: string = raw"""
+    @align(4096)
+    struct Page
+        e: [512]u64
+
+    @export("probe")
+    probe() -> int
+        var t: Page
+        t.e[1] = 3
+        val b: &Page = t
+
+        int(b.e[1])
+    end probe
+    """
+
+@test("with libc granted, a freestanding over-aligned box takes the posix_memalign default and is not refused")
+lic_granted_libc_defaults_the_aligned_pair()
+    if !lbr_ready() then return
+    if !is_file(lic_nm) then skip(s"there is no llvm-nm at $lic_nm to read the archive")
+
+    val root = lic_project(lic_aligned_box, lic_granted)
+    val (said, archive) = lic_build_c(root)
+
+    assert(said.0 == 0, said.1)
+
+    val undefined = lic_undefined(archive)
+
+    lbr_drop([root])
+    assert(lic_names(undefined, "posix_memalign") || lic_names(undefined, "_posix_memalign"), undefined)
+    assert(!lic_names(undefined, "sysl_alloc_aligned"), undefined)
+    assert(!lic_names(undefined, "sysl_free_aligned"), undefined)
+end lic_granted_libc_defaults_the_aligned_pair
+
+@test("without libc, a freestanding over-aligned box is refused, naming both aligned hooks")
+lic_no_libc_refuses_the_aligned_box()
+    if !lbr_ready() then return
+
+    val root = lic_project(lic_aligned_box, "")
+    val (said, _) = lic_build_c(root)
+
+    lbr_drop([root])
+    assert(said.0 != 0, "built an over-aligned box with no C library and no aligned hook")
+    assert(said.1.contains(s"'$lic_target' has no C library with an aligned allocation to answer it. " +
+        "Define 'sysl_alloc_aligned(size: usize, align: usize) -> *u8' and " +
+        "'sysl_free_aligned(p: *u8)' with '@export'"), said.1)
+end lic_no_libc_refuses_the_aligned_box
+
 @test("the run cache keys a freestanding build with libc granted apart from one without")
 lic_libc_changes_the_key()
     if !std_root().is_ok() then return

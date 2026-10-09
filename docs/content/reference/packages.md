@@ -715,7 +715,10 @@ targets {
 What it makes legal is **C's own functions** and nothing more. A float conversion, a `%s` and a plain
 hole of a float are rendered by C's `snprintf`, so without the capability each one a program reaches
 is refused where it is written ([formatted strings](/reference/strings/)); with it they build, and
-`snprintf` is left for the board's link to find.
+`snprintf` is left for the board's link to find. The same goes for storage aligned beyond what the
+allocating pair promises: where `libc` stands and the pair is libc's own, `sysl_alloc_aligned` and
+`sysl_free_aligned` default to `posix_memalign` and `free`; where it does not, the program defines
+them.
 
 **It is not an operating system**, and the library's hooks are about one. newlib's `read` and `fopen`
 are stubs a board answers, not a filesystem, so a program reaching [`sysl.fs`](/library/fs/) or
@@ -776,6 +779,43 @@ declare a pair too, which covers an application with its own arena and no depend
 **Whichever road the package arrived by.** A package named in `dependencies` and the same package
 handed over as a `--lib` source root declare the same thing and settle the same question — this is a
 property of the package, not of the flag that reached it.
+
+### A type aligned beyond what the pair promises
+
+The pair is held to `malloc`'s promise: a block begins on a boundary of two words — sixteen bytes on
+a 64-bit machine, eight on a 32-bit one. A box, a buffer or a task's frame holding a type that asks
+for more (an [`@align(n)`](/reference/attributes/#alignn--where-the-aggregate-begins) struct, or a
+`u128` on a 32-bit machine) is taken from a second pair instead:
+
+```sysl
+@export("sysl_alloc_aligned")
+my_alloc_aligned(size: usize, align: usize) -> *u8 = ...
+
+@export("sysl_free_aligned")
+my_free_aligned(p: *u8) = ...
+```
+
+The first answers `size` bytes beginning on `align` — a power of two, larger than the pair's own
+boundary — or null, and the second gives such a block back; the storage's destruction hook knows
+which pair made it.
+
+Where the allocating pair is libc's, the compiler writes `weak` defaults over the C library's own
+aligned allocation — `posix_memalign` and `free` on a POSIX system and WASI, `_aligned_malloc` and
+`_aligned_free` on Windows — and a program's own definitions displace them. Anywhere else — a pair
+the manifest named, or a machine with no C library under it — only the program knows how its heap
+answers a boundary, so a program that puts such a type on the heap and does not define both is
+refused when it is compiled, naming the storage and the two hooks:
+
+```
+a box of 'Page' asks for the 4096-byte boundary its type is aligned on, and the allocating pair
+('img_alloc' and 'img_free') promises only 16 — 'aarch64-freestanding' has no C library with an
+aligned allocation to answer it. Define 'sysl_alloc_aligned(size: usize, align: usize) -> *u8'
+and 'sysl_free_aligned(p: *u8)' with '@export', the first answering a block on that boundary and
+the second giving one back
+```
+
+A program that never puts such a type on the heap never names either, so a pair alone is still the
+whole of what a heap needs to supply.
 
 ### The compiled standard module is built for one allocator
 

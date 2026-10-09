@@ -37,6 +37,7 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
 
     check_tail_calls(a, p.funcs)
     check_tail_jumps(a, p)
+    check_shared_storage(a, p)
     check_exports_emitted(a, emitted, own)
     check_general_regs(a, emitted)
     promotions
@@ -368,6 +369,8 @@ private hook_modules() -> Buf[HookModule]
                          "zero or the code of an 'IoError'"))
     rows.push(HookModule("sysl.io.sys", "sysl.io", "reads or flushes a descriptor", "one",
                          "a count or zero, or the code of an 'IoError' negated"))
+    rows.push(HookModule("sysl.process.sys", "sysl.process", "starts or waits for a process", "one",
+                         "a process id, a length or zero, or the code of an 'IoError' negated"))
     rows
 end hook_modules
 
@@ -424,6 +427,44 @@ end check_hook_module
 
 private const LibcIsNoOs: string =
     " — the C library its 'libc' capability grants is not an operating system —"
+
+// **Storage on the heap of a type aligned beyond what the allocating pair promises, with nothing to
+// answer the aligned hook.**
+//
+// The lowering asks `sysl_alloc_aligned(size, align)` for such a block and gives it back through
+// `sysl_free_aligned(p)` (`emit_box.sysl`'s `heap_call`), and writes defaults for the two only
+// where the pair is libc's and the C library has an aligned allocation. Anywhere else the program
+// answers them itself, and one it left unanswered would otherwise surface at the link as an
+// undefined symbol named nowhere in its source -- so it is refused here, naming the storage, its
+// boundary and both hooks. Asked straight after the lowering that recorded it (`unaligned_heap`).
+check_aligned_heap(a: &Analysis, p: TProgram)
+    val found = unaligned_heap() match
+        Some(x) -> x
+        None -> return
+
+    val t = a.tables.target
+    val pair = s"'${malloc_symbol()}' and '${free_symbol()}'"
+
+    val no_libc = s"'${t.name}' has no C library with an aligned allocation to answer it"
+    val named = "the program named a heap of its own, so nothing but the program can say how that heap " +
+        "answers a boundary"
+    val why = if aligned_heap_has_libc(t) then named else no_libc
+
+    val msg = s"${found.0}, and the allocating pair ($pair) promises only ${t.heap_align()} — $why. " +
+        s"Define '${aligned_alloc_symbol()}(size: usize, align: usize) -> *u8' and " +
+        s"'${aligned_free_symbol()}(p: *u8)' with '@export', the first answering a block on that " +
+        "boundary and the second giving one back"
+
+    for f in p.funcs
+        if f.name == found.1
+            a.fault(func_home(a, f.name), f.span, msg)
+            return
+        end if
+
+    if p.funcs.is_empty() then return
+
+    a.fault_unplaced(func_home(a, p.funcs.at(0).name), p.funcs.at(0).span, msg)
+end check_aligned_heap
 
 // **A specifier the program reaches that only C's `snprintf` can apply, on a target with no C library
 // to supply one.**

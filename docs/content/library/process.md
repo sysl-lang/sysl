@@ -31,10 +31,12 @@ hello from a child
 true
 ```
 
-It requires `posix`. The whole of the mechanism is `fork` and `execvp` — the `PATH` search below is
-`execvp`'s own — and neither exists outside POSIX: a freestanding target has no processes to start,
-and a hosted target that is not POSIX has no way to start one. WASI preview1 is the case that made
-that visible, having files and a clock and no way to spawn at all.
+It requires `posix`. On a hosted target the whole of the mechanism is `posix_spawn`, or `fork` and
+`execvp` — the `PATH` search below is `execvp`'s own — and neither exists outside POSIX: a hosted
+target that is not POSIX has no way to start a program. WASI preview1 is the case that made that
+visible, having files and a clock and no way to spawn at all. **A target with no C library can still
+start one, if the program says how** — a kernel with its own process calls answers the module's four
+hooks itself, [below](#on-a-target-with-no-c-library).
 
 ## A program that fails is not a failure
 
@@ -125,6 +127,30 @@ really was killed by a signal, so reporting `Signalled` would be true and useles
 the bound and knows what stopped it, and what it wants to say is "it took too long" rather than "it
 crashed" — one of those is worth retrying and the other is not.
 
+**A child ended for a fault is `Signalled`**, with the number POSIX raises for that fault — 11
+(`SIGSEGV`) for an address it could not touch, 4 (`SIGILL`) for an instruction it could not run.
+That is what a POSIX host reports, and what a kernel answering the hooks itself is asked to report
+too, so `Signalled(11)` means the same thing on both.
+
+**A started child can be sent a signal of your own choosing**: `Child.kill(signal)`, 15 by default,
+which asks it to stop, and 9 to make it. Its `wait` then says the signal ended it:
+
+```sysl
+import sysl.process.start
+
+val c = start("sleep", ["5"]).unwrap()
+
+c.kill(9).unwrap()
+print(c.wait().unwrap().status)
+```
+
+```output
+killed by signal 9
+```
+
+A child already waited for is not signalled — the kernel forgot it at the wait, and its pid may by
+then be somebody else's — and `kill` answers `Ok` without doing anything.
+
 ## Where it starts, and what it can see
 
 Both calls take a directory and a list of variables. The directory is where the child starts —
@@ -186,6 +212,46 @@ returns.
 **Standard error is left alone unless it is asked for.** By default it goes wherever this program's
 does, which is what a shell's `$(...)` leaves it doing — a tool asking a program a question wants the
 answer without a warning mixed into the middle of it, and the warning is still worth seeing.
+
+## Sending a child's output to a file
+
+`run` takes `stdout` and `stderr`, each a `Stdio`: `Inherit` — the default, this program's own
+stream — or a file. `ToPath` names one by its path and starts it empty, a shell's `>`; `ToFile`
+hands over a file this program already has open, opened with `create` to start it afresh or `append`
+to add to it, and stays this program's to close.
+
+```sysl
+import sysl.fs.{append, read_text, remove_file}
+import sysl.process.{Stdio, run}
+import sysl.text.Search
+
+val listing = "process-page-listing.txt"
+
+run("echo", ["first"], stdout = Stdio.ToPath(listing)).unwrap()
+
+// Both streams onto one open file, as a shell's `>> f 2>&1`.
+var log = append(listing).unwrap()
+
+log.write("between\n".bytes)
+run("sh", ["-c", "echo second; echo third >&2"], stdout = Stdio.ToFile(log),
+    stderr = Stdio.ToFile(log)).unwrap()
+log.close().unwrap()
+
+print(read_text(listing).unwrap().trim())
+remove_file(listing)
+```
+
+```output
+first
+between
+second
+third
+```
+
+**What this program wrote to a `ToFile` file and had not yet handed over is handed over first**, so
+the child's output follows it rather than landing in the middle of it — `between` above was still in
+the file's buffer when `sh` started. A path that cannot be opened is an error before anything is
+started, and nothing is run.
 
 ## Starting now, waiting later
 
@@ -341,10 +407,44 @@ A timeout costs nothing to have and is worth setting wherever the child is somet
 program you wrote: `run` and `capture` with no bound are the right calls for a build you are
 watching, and the wrong ones for a tool that has hung on somebody's machine once already.
 
+## On a target with no C library
+
+Everything the module asks of the machine goes through four hooks in `sysl.process.sys` — start a
+program, wait for it, send it a signal, name a file for a captured stream. On a hosted POSIX target
+the library answers them; **on a target with no C library the program answers each one it reaches
+with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `start` and `Child`
+work unchanged above them:
+
+| hook | what it answers |
+|---|---|
+| `sysl_proc_spawn(path, path_len, argv, argc, envp, envc, inherit_env, dir, dir_len, stdin_fd, stdout_fd, stderr_fd, started) -> i64` | the child's process id |
+| `sysl_proc_wait(pid, started, timeout_ms, how, value) -> int` | zero, having written how it ended |
+| `sysl_proc_kill(pid, signal) -> int` | zero |
+| `sysl_proc_temp_path(into, room) -> isize` | the length of the path it wrote |
+
+**Each answers zero or more for success and the `IoError` code negated for a failure**, and `-1` for
+a call the target cannot make at all — the contract of `sysl.io.sys`. Text crosses as a pointer and
+a length, never a C string: `argv` and `envp` point at runs of `Text`, each a pointer and a length,
+`envp`'s entries reading `NAME=VALUE`. A descriptor of `-1` leaves the child the stream this program
+has. `wait` writes `0` into `how` for an exit (its code in `value`), `1` for a signal or a fault (its
+number), and `2` for a child it stopped at its deadline; a supplier that cannot bound a wait answers
+`-1` when handed a timeout. `sysl.process.sys`'s own comments say the rest.
+
+A program that reaches a hook and leaves it unanswered is refused when it is compiled, naming every
+hook it reached:
+
+```
+error: this program starts or waits for a process, and 'aarch64-freestanding' has no C library under
+it for the standard library to answer one with, so the program answers it: define 'sysl_proc_kill',
+'sysl_proc_spawn', 'sysl_proc_temp_path', 'sysl_proc_wait' with '@export', each taking what its
+'extern' in 'sysl.process.sys' declares and answering a process id, a length or zero, or the code of
+an 'IoError' negated
+```
+
 ## What is not here
 
-**Process *supervision*.** A running child can be held — that is `start` — but no pid is handed out,
-no process group is made, and no signal of your own choosing can be sent. That covers what a build
+**Process *supervision*.** A running child can be held — that is `start` — and sent a signal, but no
+pid is handed out and no process group is made. That covers what a build
 tool, an installer or a command-line front end does, including one running several compilers at once.
 A program that wants to supervise children wants a different surface, and it would belong under
 `sysl.posix`, where a binding goes when it *is* POSIX rather than merely implemented with it.

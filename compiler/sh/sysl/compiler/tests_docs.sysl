@@ -5,7 +5,7 @@ import sysl.buf.{Buf, buf}
 import sysl.env.{get as env_var}
 import sysl.fs.{make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, walk, write_text}
 import sysl.process.capture
-import sysl.text.{split, str_builder, Search}
+import sysl.text.{replace_all, split, str_builder, Search}
 
 // The site's executable documentation, run against this compiler.
 //
@@ -246,12 +246,35 @@ private docs_prints(src: string, exe: string, b: DocsBlock, where: string) -> Op
             if !said.status.ok()
                 return Some(s"$where: expected it to run, but it exited with ${shell_status(said.status)}")
 
-            if docs_normalize(said.text) != docs_normalize(b.expected)
+            val printed = docs_paged(said.text, src)
+
+            if docs_normalize(printed) != docs_normalize(b.expected)
                 return Some(s"$where: what it printed is not what the page says.\npage:\n" +
-                            docs_indent(b.expected) + "program:\n" + docs_indent(said.text))
+                            docs_indent(b.expected) + "program:\n" + docs_indent(printed))
 
     None
 end docs_prints
+
+// **A block on a page has no file name, so where a program prints its own path the page writes
+// `<page>`** (`library/harness.md`'s test reports), and the path the block was built from is put
+// back to that before comparing. Both spellings are replaced: a `TMPDIR` ending in `/` makes the
+// temporary directory `.../T//sysl-docs…`, and a program may print the path either way.
+private docs_paged(text: string, src: string) -> string
+    var single = src
+
+    while single.contains("//")
+        single = replace_all(single, "//", "/")
+
+    replace_all(replace_all(text, src, "<page>"), single, "<page>")
+end docs_paged
+
+@test("a program's own path in what a page's block printed reads as <page>, whichever way the slashes came")
+docs_paged_names_the_page()
+    val src = "/var/folders/x/T//sysl-docsAb12/main.sysl"
+
+    assert_eq(docs_paged(s"$src:9:adds:PASS\n", src), "<page>:9:adds:PASS\n")
+    assert_eq(docs_paged("/var/folders/x/T/sysl-docsAb12/main.sysl:4:x:FAIL\n", src), "<page>:4:x:FAIL\n")
+    assert_eq(docs_paged("main.sysl:4\n", src), "main.sysl:4\n")
 
 // A block the page says is refused: compiled, required to fail, and the diagnostic required to
 // **contain** what the page quotes.
