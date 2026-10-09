@@ -1752,9 +1752,9 @@ private static_image(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
     TArrayLit(elems, ty) -> static_images(cx, elems).map(xs -> TExpr(t.span, TArrayLit(xs, ty)))
     TArrayFill(value, ty) -> static_image(cx, value).map(x -> TExpr(t.span, TArrayFill(x, ty)))
     TStructNew(decl, args) -> static_images(cx, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
-    TCast(inner, to) -> cast_image(t, inner, to)
+    TCast(inner, to) -> cast_image(t, inner, to, cx.an.tables.layout.little_endian)
     TConstrainedCheck(value, target) -> constrained_image(cx, t, value, target)
-    _ -> if laid_down(t) then Some(t) else scalar_image(t)
+    _ -> if laid_down(t) then Some(t) else scalar_image(t, cx.an.tables.layout.little_endian)
 
 // A constant made into a constrained subtype. **A name-only subtype -- a `new` type, or one with no
 // range -- checks nothing**, so `PhysAddr(0)` is the constant it converts and is laid down as one. A
@@ -1773,7 +1773,7 @@ private constrained_image(cx: &Analyzer, t: TExpr, value: TExpr, target: Type) -
     if inner.is_none() then return None
 
     if d.lo.is_some() || d.hi.is_some()
-        val v = const_fold_typed(inner.unwrap())
+        val v = const_fold_typed(inner.unwrap(), cx.an.tables.layout.little_endian)
 
         if v.is_none() then return None
 
@@ -1790,15 +1790,15 @@ end constrained_image
 
 // A conversion: to a scalar it is folded like any other operator, and to a pointer it is a device
 // address -- written as arithmetic over constants, it is still one number.
-private cast_image(t: TExpr, inner: TExpr, to: Type) -> Option[TExpr]
+private cast_image(t: TExpr, inner: TExpr, to: Type, little: bool) -> Option[TExpr]
     val pointerish = to match
         Ptr(_) -> true
         CFn(_, _) -> true
         _ -> false
 
-    if !pointerish then return scalar_image(t)
+    if !pointerish then return scalar_image(t, little)
 
-    const_fold_typed(inner) match
+    const_fold_typed(inner, little) match
         Some(ConstInt(n)) -> Some(TExpr(t.span, TCast(TExpr(inner.span, TIntLit(n, texpr_type(inner))), to)))
         _ -> None
 end cast_image
@@ -1817,8 +1817,8 @@ private static_images(cx: &Analyzer, xs: Buf[TExpr]) -> Option[Buf[TExpr]]
 end static_images
 
 // A scalar initializer as the literal it folds to.
-private scalar_image(t: TExpr) -> Option[TExpr]
-    val v = const_fold_typed(t)
+private scalar_image(t: TExpr, little: bool) -> Option[TExpr]
+    val v = const_fold_typed(t, little)
 
     if v.is_none() then return None
 

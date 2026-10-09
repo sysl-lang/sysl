@@ -64,6 +64,25 @@ gen_used(names: Buf[string]) -> Option[IrGlobal]
                   LinkAppending, Some(llvm_metadata_section()), None, false, false))
 end gen_used
 
+// A constant integer with its bytes reversed at `bits`, for a field of a `@byte_order` struct laid
+// down as data -- the image holds the bytes the format does, exactly as a store at run time would
+// have left them. A zero reversed is zero.
+private reversed_constant(v: Val, bits: int, ty: Type) -> Val
+    if bits == 0 then return v
+
+    val signed = underlying(ty) match
+        Integer(_, s, _) -> s
+        Fixed(_, _, s) -> s
+        Enum(d) -> underlying(d.underlying) match
+            Integer(_, s, _) -> s
+            _ -> false
+        _ -> false
+
+    v match
+        VInt(n) -> VInt(swapped_bytes(n, bits, signed))
+        _ -> v
+end reversed_constant
+
 // A `val`'s initializer as a **constant expression**.
 constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
     TIntLit(v, _) -> VInt(v)
@@ -120,10 +139,16 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
         for i in 0..<args.len()
             val ft = decl.fields.at(i).1
 
-            if !zero_sized(ft) then fields.push(ir_arg(lty(e, ft), constant_value(e, args.at(i))))
+            if !zero_sized(ft)
+                val bits = reversed_width(decl, ft, e.target.little_endian())
 
-        // A raised boundary's gaps are fields of the definition, so they are zeros here.
-        VAgg(gapped_values(fields, struct_gaps(e.layout, decl)))
+                fields.push(ir_arg(lty(e, ft), reversed_constant(constant_value(e, args.at(i)), bits, ft)))
+
+        // A raised boundary's gaps are fields of the definition, so they are zeros here. A `@packed`
+        // struct's type is LLVM's `<{ }>`, and a constant of it has to be written in the same brackets.
+        val laid = gapped_values(fields, struct_gaps(e.layout, decl))
+
+        if decl.packed then VPackedAgg(laid) else VAgg(laid)
 
     // A device address written as a number: `inttoptr` is a constant expression, so the pointer is in
     // the object file rather than stored into it by a prologue.
@@ -225,6 +250,7 @@ private is_zero_const(v: Val) -> bool = v match
     VNull -> true
     VZero -> true
     VAgg(fields) -> all_zero(fields)
+    VPackedAgg(fields) -> all_zero(fields)
     VArray(elems) -> all_zero(elems)
     _ -> false
 

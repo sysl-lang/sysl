@@ -128,7 +128,7 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
         if !member_attr_word(word)
             if word == "assert"
                 p.fault(at, "'@assert' stands where a declaration stands, and a type's body holds its members — write it beside the type rather than inside it, where 'sizeof' and 'offsetof' still name what it is about")
-            else if word == "align" || word == "packed"
+            else if word == "align" || word == "packed" || word == "byte_order"
                 p.fault(at, layout_attr_on_member(word))
             else
                 p.fault(at, member_attr_refusal())
@@ -155,6 +155,9 @@ private member_attr_refusal() -> string =
 // storage. A field begins on its own type's boundary, so one that needs a wider boundary takes a type
 // declared with it -- the boundary travels with every value of that type, fields included.
 private layout_attr_on_member(word: string) -> string
+    if word == "byte_order"
+        return "'@byte_order(...)' is the order every integer field of a struct keeps its bytes in, so it stands above the struct — a format whose fields disagree is two structs, one of them held as a field of the other"
+
     if word == "packed"
         return "'@packed' says how a struct's fields are laid out, so it stands above the struct — a field or another member has no fields of its own to pack"
 
@@ -222,6 +225,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "reads" then return Some(Reads(parse_frame_names(p, "reads")))
     if word == "writes" then return Some(Writes(parse_frame_names(p, "writes")))
     if word == "align" then return Some(parse_align_attr(p))
+    if word == "byte_order" then return parse_byte_order_attr(p)
     if word == "export" then return Some(parse_export_attr(p, at))
     if word == "section" then return Some(parse_section_attr(p))
     if word == "crossing" then return Some(Crossing(parse_named_list(p, "crossing")))
@@ -246,7 +250,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     end if
 
     // Anchored after the word, as `@ignore`'s is: the reference's point for both.
-    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, '@packed' and '@align(n)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
+    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
     skip_line(p)
     None
 end parse_attribute
@@ -346,6 +350,33 @@ private parse_align_attr(p: *Parser) -> Attr
     p.expect_kw(")")
     Align(bound)
 end parse_align_attr
+
+// `@byte_order(big)` or `@byte_order(little)` -- the order a struct's integer fields keep their bytes
+// in. The word is read as a word rather than as an expression: it names one of two orders, and
+// neither is a value a program has.
+private parse_byte_order_attr(p: *Parser) -> Option[Attr]
+    val bad = "'@byte_order' names the order in parentheses — '@byte_order(big)' for a network header, which keeps the most significant byte first, or '@byte_order(little)' for a format that keeps the least significant first"
+
+    if !p.accept_kw("(")
+        p.fault(p.here(), bad)
+        skip_line(p)
+        return None
+    end if
+
+    val word = p.peek() match
+        Ident(n) -> n
+        _ -> ""
+
+    if word != "big" && word != "little"
+        p.fault(p.here(), bad)
+        skip_line(p)
+        return None
+    end if
+
+    p.bump()
+    p.expect_kw(")")
+    Some(ByteOrder(word == "big"))
+end parse_byte_order_attr
 
 // `@export`, `@export("mylib_parse")` -- the symbol a function is visible under from C, or the name
 // a struct's `typedef` carries in a generated header.
@@ -666,6 +697,9 @@ end may_carry
 private attributed_refusal(attrs: Buf[Attr]) -> string
     if forgo_of(attrs).is_some() then return forgo_refusal(forgo_of(attrs).unwrap())
 
+    if all_are(attrs, "byte_order")
+        return "'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'sysl.math.ByteOrder' gives every whole-byte integer"
+
     if all_are(attrs, "needs")
         return "'@needs(...)' names what reaching a declaration requires, so it marks a function or an 'extern' — and this declares neither"
 
@@ -884,6 +918,7 @@ end all_storage
 private is_layout(a: Attr) -> bool = a match
     Packed -> true
     Align(_) -> true
+    ByteOrder(_) -> true
     _ -> false
 
 private all_layout(attrs: Buf[Attr]) -> bool
@@ -928,6 +963,7 @@ private laid_out(s: Stmt, attrs: Buf[Attr]) -> Stmt
                 attr match
                     Packed -> decl.packed = true
                     Align(n) -> decl.alignment = Some(n)
+                    ByteOrder(big) -> decl.byte_order = Some(big)
                     Export(e) -> decl.cname = Some(e)
                     _ -> ()
 

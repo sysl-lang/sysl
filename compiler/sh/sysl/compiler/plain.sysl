@@ -1,0 +1,541 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// `sysl.encoding.Plain` -- a type whose value is its bytes and nothing else, read out of a
+// `[]const u8` with every byte that could be wrong checked, and written back into a `[]u8`.
+//
+// **The membership is the compiler's**, as `Bits`' is: it is a question about what the type is made
+// of, every part of it, which no `impl` could state truthfully and which a program's own type should
+// not have to declare. A type is plain where every part of it is an integer of whole bytes, a float,
+// a fixed-point number, a `bool`, a simple enum, an array of plain things or a struct of them. What
+// is left out is everything whose bytes would mean something only inside this one running program
+// -- an address, a counted reference, a string, a view -- and the two kinds of value whose rule is
+// not a byte rule (a `char`, and a subtype with a range or a predicate).
+//
+// **Reading checks the bytes that can be wrong**: a `bool` holding anything but `0` or `1`, an enum
+// holding a number none of its variants is. Any other byte is a value of its field. A field of a
+// `@byte_order` struct is checked in that order, since that is the order the format wrote it in.
+// **Writing writes zeros into the padding** a layout has, so the same value always encodes to the
+// same bytes -- which is what makes an encoded block comparable and its checksum stable.
+
+// Whether a type is plain data.
+is_plain(t: Type) -> bool = plain_refusal(t).is_none()
+
+// Why a type is not plain data, naming the first part of it that is not, or nothing where it is.
+plain_refusal(t: Type) -> Option[string] = t match
+    Constrained(d) ->
+        if d.lo.is_some() || d.hi.is_some() || d.pred_fn.is_some() then
+            Some(s"'${type_show(t)}' checks the values it admits, and the check runs where a value is " +
+                 "made rather than over bytes. Read the type it narrows and convert, which runs the " +
+                 "check")
+        else plain_refusal(d.base)
+    Volatile(inner) -> plain_refusal(*inner)
+    Integer(bits, _, _) ->
+        if bits % 8 == 0 then None
+        else Some(s"'${type_show(t)}' is not a whole number of bytes, so some of the bits it is " +
+                  "stored in are not its own")
+    Fixed(bits, _, _) ->
+        if bits % 8 == 0 then None
+        else Some(s"'${type_show(t)}' is not a whole number of bytes, so some of the bits it is " +
+                  "stored in are not its own")
+    Floating(_, _) -> None
+    Bool -> None
+    Unit -> None
+    Enum(d) ->
+        if d.simple then plain_refusal(d.underlying)
+        else Some(s"'${type_show(t)}' carries data, so which variant it is decides what its other " +
+                  "bytes mean. Hold the tag as an integer field and read the payload by it")
+    Array(_, elem) -> plain_refusal(*elem)
+    Struct(d) -> struct_plain_refusal(d)
+    Char ->
+        Some("a 'char' is a Unicode scalar value, and most of the numbers its four bytes can hold " +
+             "are not one. Hold it as a 'u32' and convert with 'char(...)', which checks it")
+    Str -> Some(address_refusal("a string"))
+    Slice(_, _) -> Some(address_refusal("a slice"))
+    Ref(_, _) -> Some(address_refusal("a counted reference"))
+    Weak(_) -> Some(address_refusal("a weak reference"))
+    Ptr(_) -> Some(address_refusal("a pointer"))
+    CFn(_, _) -> Some(address_refusal("a function pointer"))
+    _ -> Some(s"'${type_show(t)}' is not a value its bytes can stand for")
+
+private address_refusal(what: string) -> string =
+    s"$what holds an address, and an address read off a disk or a wire points nowhere this " +
+        "program allocated. Hold an offset or an index instead"
+
+private struct_plain_refusal(d: &StructType) -> Option[string]
+    if d.opaque || d.base == TaskBase then
+        return Some(s"'${type_show(Struct(d))}' has no layout this program can see")
+
+    // A bitfield struct is one integer, and an enum range in it would be an unchecked read.
+    bitfield_ranges(d) match
+        Some(_) ->
+            for item in d.fields
+                underlying(item.1) match
+                    Enum(_) ->
+                        return Some(s"'${type_show(Struct(d))}.${item.0}' is an enum held in a few " +
+                                    "bits, which is read unchecked. Hold the field as an integer and " +
+                                    "convert it with 'try'")
+                    _ -> ()
+
+            return None
+        None -> ()
+
+    for item in d.fields
+        val why = plain_refusal(item.1)
+
+        if why.is_some() then
+            return Some(s"its field '${item.0}' is ${type_show(item.1)} — ${why.unwrap()}")
+
+    None
+end struct_plain_refusal
+
+// `T.decode(bytes)`, where `T` is plain and `sysl.encoding.Plain` can be named here. Nothing where the
+// call is not this form, so a type's own `decode` and a program that never imported the trait are
+// left to the ordinary lookup.
+plain_decode_call(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]) -> Option[TExpr]
+    if name != "decode" || !plain_in_reach(cx) then return None
+
+    val why = plain_refusal(ty)
+
+    if why.is_some()
+        cx.fault(span, s"'${type_show(ty)}' is not plain data, so 'Plain.decode' cannot make one out " +
+                 s"of bytes: ${why.unwrap()}")
+        return Some(bad_expr(span))
+    end if
+
+    if args.len() != 1
+        cx.fault(span, s"associated function 'Plain.decode' takes 1 argument, the bytes, but " +
+                 s"${supplied_phrase(args.len(), "argument")}")
+        return Some(bad_expr(span))
+    end if
+
+    val want = Slice(byte_type(), true)
+    val bytes = type_expr(cx, args.at(0), Some(want))
+
+    if texpr_type(bytes) == Unknown then return Some(bad_expr(span))
+
+    if disagree(texpr_type(bytes), want)
+        cx.fault(span, s"'Plain.decode' reads a '${type_show(want)}', but the argument is " +
+                 type_show(texpr_type(bytes)))
+        return Some(bad_expr(span))
+    end if
+
+    var targs: Buf[Type] = buf()
+
+    targs.push(ty)
+
+    val opt = reinstantiate(cx.an, library_key("Option"), targs)
+
+    opt match
+        Enum(od) ->
+            val some = od.variant("Some")
+            val none = od.variant("None")
+
+            if some.is_none() || none.is_none() then return Some(bad_expr(span))
+
+            Some(TExpr(span, TDecode(bytes, ty, opt, some.unwrap(), none.unwrap())))
+        _ -> Some(bad_expr(span))
+end plain_decode_call
+
+// `value.encode(out)`, by the same rule.
+plain_encode_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string,
+                  args: Buf[Expr]) -> Option[TExpr]
+    if name != "encode" || !plain_in_reach(cx) then return None
+
+    val why = plain_refusal(rty)
+
+    if why.is_some()
+        cx.fault(span, s"'${type_show(rty)}' is not plain data, so 'Plain.encode' cannot write it as " +
+                 s"bytes: ${why.unwrap()}")
+        return Some(bad_expr(span))
+    end if
+
+    if args.len() != 1
+        cx.fault(span, s"method 'Plain.encode' takes 1 argument, where the bytes go, but " +
+                 s"${supplied_phrase(args.len(), "argument")}")
+        return Some(bad_expr(span))
+    end if
+
+    val want = Slice(byte_type(), false)
+    val out = type_expr(cx, args.at(0), Some(want))
+
+    if texpr_type(out) == Unknown then return Some(bad_expr(span))
+
+    if disagree(texpr_type(out), want)
+        cx.fault(span, s"'Plain.encode' writes into a '${type_show(want)}', but the argument is " +
+                 type_show(texpr_type(out)))
+        return Some(bad_expr(span))
+    end if
+
+    Some(TExpr(span, TEncode(receiver, out)))
+end plain_encode_call
+
+// Whether the trait is declared in this compilation and may be named where the call is written --
+// what every member a trait gives a built-in asks first.
+private plain_in_reach(cx: &Analyzer) -> bool = catalog_key(cx.an, "Plain") match
+    Some(key) -> names_trait(cx, key)
+    None -> false
+
+// -- lowering ------------------------------------------------------------------------------------
+
+// `T.decode(bytes)`: the length is asked first, the bytes are copied into storage of the type's own
+// alignment (the slice need not be aligned at all), and the copy is checked where it lies. `Some`
+// of the copy where every check held, `None` otherwise.
+gen_decode(e: *Emit, bytes: TExpr, subject: Type, opt_ty: Type, some: EnumVariant,
+           none: EnumVariant) -> Val
+    val d = enum_decl(opt_ty)
+
+    if d.is_none() then return gap_at(e, "a decode whose option is not an enum")
+
+    val view = gen_expr(e, bytes)
+    val vty = lty(e, texpr_type(bytes))
+    val data = fresh_reg(e)
+    val len = fresh_reg(e)
+
+    emit(e, InExtract(data, vty, view, index_list(1)))
+    emit(e, InExtract(len, vty, view, index_list(2)))
+
+    val size = int(e.layout.size(subject))
+    val wl = word_lty(e)
+    val long_enough = fresh_reg(e)
+
+    emit(e, InIntCmp(long_enough, IUge, wl, len, VInt(from_int(long(size)))))
+
+    val st = lty(e, subject)
+    val slot = alloca(e, fresh_reg(e), st)
+    val out = alloca(e, fresh_reg(e), lty(e, opt_ty))
+    val copy_l = fresh_label(e, "decode.copy")
+    val some_l = fresh_label(e, "decode.some")
+    val none_l = fresh_label(e, "decode.none")
+    val end_l = fresh_label(e, "decode.end")
+
+    emit_term(e, InCondBr(long_enough, copy_l, none_l))
+    emit_label(e, copy_l)
+
+    if size > 0 then emit_memcpy(e, slot, data, size, 1)
+
+    val ok = plain_check(e, slot, subject, 0)
+
+    emit_term(e, InCondBr(ok, some_l, none_l))
+    emit_label(e, some_l)
+
+    val v = fresh_reg(e)
+
+    emit(e, InLoad(v, st, slot, AccPlain, None))
+
+    var carried: Buf[Val] = buf()
+
+    carried.push(v)
+    emit(e, InStore(lty(e, opt_ty), enum_value(e, opt_ty, d.unwrap(), some, carried), out, AccPlain,
+                    None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, none_l)
+
+    var empty: Buf[Val] = buf()
+
+    emit(e, InStore(lty(e, opt_ty), enum_value(e, opt_ty, d.unwrap(), none, empty), out, AccPlain,
+                    None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, end_l)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, opt_ty), out, AccPlain, None))
+    r
+end gen_decode
+
+// Whether the value of type `t` lying at `p` is one its type can hold, as an `i1`. `reversed` is the
+// width an enum here is held reversed at -- the field's, inside a `@byte_order` struct.
+private plain_check(e: *Emit, p: Val, t: Type, reversed: int) -> Val
+    if !needs_check(t) then return VBool(true)
+
+    underlying(t) match
+        Bool ->
+            val b = fresh_reg(e)
+
+            emit(e, InLoad(b, LInt(8), p, AccPlain, None))
+
+            val ok = fresh_reg(e)
+
+            emit(e, InIntCmp(ok, IUle, LInt(8), b, VInt(from_int(1))))
+            ok
+        Enum(d) ->
+            val vt = repr(d.underlying)
+            val raw = fresh_reg(e)
+
+            emit(e, InLoad(raw, lty(e, vt), p, AccPlain, None))
+            enum_membership(e, underlying(t), vt, reordered(e, reversed, raw))
+        Struct(d) ->
+            var acc: Val = VBool(true)
+
+            for i in 0..<d.fields.len()
+                val ft = d.fields.at(i).1
+
+                if !zero_sized(ft) && needs_check(ft)
+                    val fp = fresh_reg(e)
+
+                    var idx: Buf[IrArg] = buf()
+
+                    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+                    idx.push(ir_arg(l_i32(), VInt(from_int(long(struct_field_index(e.layout, d, d.slot(i)))))))
+                    emit(e, InGep(fp, struct_lty(d), p, idx))
+
+                    val ok = plain_check(e, fp, ft, reversed_width(d, ft, e.target.little_endian()))
+
+                    acc = both(e, acc, ok)
+
+            acc
+        Array(n, elem) -> each_element(e, p, n, *elem, (ep) -> plain_check(e, ep, *elem, 0))
+        _ -> VBool(true)
+end plain_check
+
+// Whether anything in a type has bytes that may not be a value of it.
+private needs_check(t: Type) -> bool = underlying(t) match
+    Bool -> true
+    Enum(_) -> true
+    Array(_, elem) -> needs_check(*elem)
+    Struct(d) ->
+        if bitfield_ranges(d).is_some() then false
+        else any_field_needs_check(d)
+    _ -> false
+
+private any_field_needs_check(d: &StructType) -> bool
+    for item in d.fields
+        if needs_check(item.1) then return true
+
+    false
+end any_field_needs_check
+
+private both(e: *Emit, a: Val, b: Val) -> Val
+    a match
+        VBool(true) -> return b
+        _ -> ()
+
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, OpAnd, l_i1(), a, b))
+    r
+end both
+
+// A loop over the `n` elements of an array at `p`, and-ing together what `body` answers for each
+// element's address. A loop rather than `n` copies of the body, since an array of a thousand
+// records is an ordinary thing for a block on a disk to hold.
+private each_element(e: *Emit, p: Val, n: int, elem: Type, body: Val -> Val) -> Val
+    if n == 0 then return VBool(true)
+
+    val wl = word_lty(e)
+    val at = alloca(e, fresh_reg(e), wl)
+    val acc = alloca(e, fresh_reg(e), l_i1())
+    val head_l = fresh_label(e, "plain.head")
+    val body_l = fresh_label(e, "plain.body")
+    val exit_l = fresh_label(e, "plain.exit")
+
+    emit(e, InStore(wl, VInt(from_int(0)), at, AccPlain, None))
+    emit(e, InStore(l_i1(), VBool(true), acc, AccPlain, None))
+    emit_term(e, InBr(head_l))
+    emit_label(e, head_l)
+
+    val i = fresh_reg(e)
+
+    emit(e, InLoad(i, wl, at, AccPlain, None))
+
+    val more = fresh_reg(e)
+
+    emit(e, InIntCmp(more, IUlt, wl, i, VInt(from_int(long(n)))))
+    emit_term(e, InCondBr(more, body_l, exit_l))
+    emit_label(e, body_l)
+
+    val ep = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(wl, i))
+    emit(e, InGep(ep, lty(e, elem), p, idx))
+
+    val ok = body(ep)
+    val so_far = fresh_reg(e)
+
+    emit(e, InLoad(so_far, l_i1(), acc, AccPlain, None))
+
+    val now = fresh_reg(e)
+
+    emit(e, InBin(now, OpAnd, l_i1(), so_far, ok))
+    emit(e, InStore(l_i1(), now, acc, AccPlain, None))
+
+    val next = fresh_reg(e)
+
+    emit(e, InBin(next, OpAdd, wl, i, VInt(from_int(1))))
+    emit(e, InStore(wl, next, at, AccPlain, None))
+    emit_term(e, InBr(head_l))
+    emit_label(e, exit_l)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, l_i1(), acc, AccPlain, None))
+    r
+end each_element
+
+// `value.encode(out)`: `false` where `out` is shorter than the type, and otherwise the value's bytes
+// at the front of it, every byte of padding written as a zero.
+gen_encode(e: *Emit, value: TExpr, out: TExpr) -> Val
+    val ty = texpr_type(value)
+    val slot = alloca(e, fresh_reg(e), lty(e, ty))
+
+    // Plain data carries no count, so the value is only ever bytes in the slot; a large one is built
+    // there rather than produced as a value first.
+    if e.layout.indirect(ty) then gen_borrowed_into(e, slot, value)
+    else emit(e, InStore(lty(e, ty), gen_expr(e, value), slot, AccPlain, None))
+
+    val view = gen_expr(e, out)
+    val vty = lty(e, texpr_type(out))
+    val data = fresh_reg(e)
+    val len = fresh_reg(e)
+
+    emit(e, InExtract(data, vty, view, index_list(1)))
+    emit(e, InExtract(len, vty, view, index_list(2)))
+
+    val size = int(e.layout.size(ty))
+    val wl = word_lty(e)
+    val long_enough = fresh_reg(e)
+
+    emit(e, InIntCmp(long_enough, IUge, wl, len, VInt(from_int(long(size)))))
+
+    val write_l = fresh_label(e, "encode.write")
+    val end_l = fresh_label(e, "encode.end")
+    val answer = alloca(e, fresh_reg(e), l_i1())
+
+    emit(e, InStore(l_i1(), VBool(false), answer, AccPlain, None))
+    emit_term(e, InCondBr(long_enough, write_l, end_l))
+    emit_label(e, write_l)
+
+    if size > 0
+        if padded(e, ty) then emit(e, InStore(LArr(size, LInt(8)), VZero, data, AccPlain, None))
+
+        copy_dense(e, slot, data, ty)
+    end if
+
+    emit(e, InStore(l_i1(), VBool(true), answer, AccPlain, None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, end_l)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, l_i1(), answer, AccPlain, None))
+    r
+end gen_encode
+
+// The bytes of a value of type `t` at `src` copied to `dst`, every byte that is the value's own and
+// none that is padding -- so a `dst` cleared first keeps its zeros where the layout has gaps. A type
+// with no gap anywhere is one copy.
+private copy_dense(e: *Emit, src: Val, dst: Val, t: Type)
+    if !padded(e, t)
+        emit_memcpy(e, dst, src, int(e.layout.size(t)), 1)
+        return
+    end if
+
+    underlying(t) match
+        Struct(d) ->
+            for i in 0..<d.fields.len()
+                val ft = d.fields.at(i).1
+
+                if !zero_sized(ft)
+                    val at = struct_field_index(e.layout, d, d.slot(i))
+                    val sp = field_address(e, d, src, at)
+                    val dp = field_address(e, d, dst, at)
+
+                    copy_dense(e, sp, dp, ft)
+        Array(n, elem) ->
+            each_element_pair(e, src, dst, n, *elem)
+        // A scalar narrower than its storage -- a `u24` in four bytes -- is its own bytes and no more.
+        _ -> emit_memcpy(e, dst, src, own_bytes(t), 1)
+end copy_dense
+
+private field_address(e: *Emit, d: &StructType, base: Val, at: int) -> Val
+    val r = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(at)))))
+    emit(e, InGep(r, struct_lty(d), base, idx))
+    r
+end field_address
+
+// The elements of two arrays walked together, each copied densely.
+private each_element_pair(e: *Emit, src: Val, dst: Val, n: int, elem: Type)
+    if n == 0 then return
+
+    val wl = word_lty(e)
+    val at = alloca(e, fresh_reg(e), wl)
+    val head_l = fresh_label(e, "plain.copy.head")
+    val body_l = fresh_label(e, "plain.copy.body")
+    val exit_l = fresh_label(e, "plain.copy.exit")
+
+    emit(e, InStore(wl, VInt(from_int(0)), at, AccPlain, None))
+    emit_term(e, InBr(head_l))
+    emit_label(e, head_l)
+
+    val i = fresh_reg(e)
+
+    emit(e, InLoad(i, wl, at, AccPlain, None))
+
+    val more = fresh_reg(e)
+
+    emit(e, InIntCmp(more, IUlt, wl, i, VInt(from_int(long(n)))))
+    emit_term(e, InCondBr(more, body_l, exit_l))
+    emit_label(e, body_l)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(wl, i))
+
+    val sp = fresh_reg(e)
+
+    emit(e, InGep(sp, lty(e, elem), src, idx))
+
+    val dp = fresh_reg(e)
+
+    emit(e, InGep(dp, lty(e, elem), dst, idx))
+    copy_dense(e, sp, dp, elem)
+
+    val next = fresh_reg(e)
+
+    emit(e, InBin(next, OpAdd, wl, i, VInt(from_int(1))))
+    emit(e, InStore(wl, next, at, AccPlain, None))
+    emit_term(e, InBr(head_l))
+    emit_label(e, exit_l)
+end each_element_pair
+
+// Whether any byte of a value of the type is padding rather than a byte of some part of it.
+private padded(e: *Emit, t: Type) -> bool
+    underlying(t) match
+        Struct(d) ->
+            if bitfield_ranges(d).is_some() then return int(e.layout.size(t)) != own_bytes(t)
+
+            var used = 0
+
+            for item in d.fields
+                if padded(e, item.1) then return true
+
+                used += int(e.layout.size(item.1))
+
+            used != int(e.layout.size(t))
+        Array(_, elem) -> padded(e, *elem)
+        _ -> own_bytes(t) != int(e.layout.size(t))
+end padded
+
+// How many bytes of its storage a scalar's value occupies: its width in whole bytes, which is what a
+// store of it writes.
+private own_bytes(t: Type) -> int = underlying(t) match
+    Integer(bits, _, _) -> (bits + 7) / 8
+    Fixed(bits, _, _) -> (bits + 7) / 8
+    Floating(bits, _) -> (bits + 7) / 8
+    Bool -> 1
+    Enum(d) -> own_bytes(d.underlying)
+    Struct(d) -> bitfield_ranges(d) match
+        Some(ranges) -> (bitfield_bits(ranges) + 7) / 8
+        None -> 0
+    _ -> 0

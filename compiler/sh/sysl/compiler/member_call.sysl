@@ -146,6 +146,12 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
     val m = member_at(cx.an, found.0, picked)
 
     if m.is_none()
+        // `Header.decode(bytes)` -- the one receiverless member the compiler provides that takes an
+        // argument, given to every plain-data type by `sysl.encoding.Plain`.
+        val decoded = plain_decode_call(cx, span, ty, name, args)
+
+        if decoded.is_some() then return decoded
+
         // A receiverless member the compiler provides is reached through the type, which is exactly
         // the spelling this form is: `uint.zero()` and `u32.width()` are calls with no arguments.
         val provided = builtin_constant_read(cx, span, ty, name)
@@ -1564,7 +1570,7 @@ end member_reachable
 
 // Whether the file the expression is written in can name a trait: its own module's, one it imported,
 // or one a bound in force promised.
-private names_trait(cx: &Analyzer, key: string) -> bool
+names_trait(cx: &Analyzer, key: string) -> bool
     val home = module_of(key)
 
     if home == cx.scope.module_name then return true
@@ -1977,6 +1983,10 @@ private builtin_method(cx: &Analyzer, span: Span, written: TExpr, rty: Type,
     val operator = builtin_operator_method(cx, span, receiver, rty, name, args)
 
     if operator.is_some() then return operator
+
+    val encoded = plain_encode_call(cx, span, receiver, rty, name, args)
+
+    if encoded.is_some() then return encoded
 
     val numeric = core_numeric(name)
 

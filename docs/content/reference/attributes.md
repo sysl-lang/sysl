@@ -1670,8 +1670,9 @@ The rule is stated over the **integer's value** and never over memory bytes. Wri
 "the low bits of byte 0" — it would be a claim about endianness, which nothing in sysl is allowed to
 make. Written this way it costs nothing: the struct is an integer, so how it reaches memory is the
 target's ordinary byte order for an integer of that width. A wire format's byte order belongs to the
-protocol rather than to the CPU, and stays with
-[`sysl.encoding.binary`](/library/encoding/)'s `get_u16_le` and the rest.
+protocol rather than to the CPU, and a struct of whole-byte fields states it with
+[`@byte_order`](#byte_orderbig-and-byte_orderlittle-the-order-a-structs-integers-keep-their-bytes-in)
+below.
 
 **Being one integer, it goes to and from that integer with nothing in between.** `T::Bits(n)` makes
 the struct from the integer it is stored as and `x.bits` reads that integer back — the same pair a
@@ -2141,6 +2142,208 @@ print(a, b)
 
 The bound is held to the same rule a struct's is — a power of two, folded rather than lexed, so a
 `const` or arithmetic over one is what a program writes.
+
+## `@byte_order(big)` and `@byte_order(little)` — the order a struct's integers keep their bytes in
+
+A protocol header or an on-disk record has a byte order of its own, and it is the format's rather
+than the machine's: IPv4, UDP and TCP keep the most significant byte first, on every machine that
+reads them. `@byte_order` says so once, above the struct, and every integer field of it is then
+**stored** in that order and **read and written** as an ordinary integer.
+
+```sysl
+@packed
+@byte_order(big)
+struct Udp
+    src: u16
+    dst: u16
+    len: u16
+    sum: u16
+
+var h = Udp(5353, 53, 8, 0)
+
+h.len += 4
+
+val raw: *u8 = ptr_cast(&h)
+
+print(h.src, h.dst, h.len)
+print(raw[0], raw[1], raw[4], raw[5])
+```
+
+```output
+5353 53 12
+20 233 0 12
+```
+
+`5353` is `0x14E9`, and the first byte in memory is `0x14` — the order the wire wants, though the
+machine running this is little-endian. **The struct's storage is the bytes of the format**, so a
+whole value is copied, cast over a frame, compared or handed to C exactly as those bytes, and the
+reversal happens only where a field turns into a value and back: a read, a write, a construction, a
+destructuring. On a machine whose own order is the one stated, nothing is reversed at all.
+
+`@byte_order(little)` is the other word, for a format that keeps the least significant byte first —
+most file formats, and every one written by a little-endian machine. On today's targets it reverses
+nothing, since every machine sysl targets is little-endian; it is written so the struct still means
+what it says on the first one that is not.
+
+**It is a separate axis from `@packed` and `@align(n)`**, and composes with both. A byte order says
+nothing about gaps between fields, so a header whose fields are not already on their own boundaries
+is `@packed` as well — `Udp` above is four `u16`s and would lay out the same either way.
+
+What a field may be, inside one:
+
+- **an integer of a whole number of bytes** — `u16`, `i32`, `u24` — or a fixed-point number, or a
+  simple enum (whose discriminant is the integer that is stored), or a name for any of these: these
+  are the fields whose bytes are reversed;
+- **a byte, a `bool`, or an array of either** — one byte has no order to keep;
+- **a struct that states its own `@byte_order`**, or that holds only bytes, which is how a format
+  whose fields disagree is written: two structs, one a field of the other.
+
+A field is read through the struct and nowhere else, so **its address is refused** — a `*u16` is
+read in the machine's order, and would hand every later read the bytes backwards:
+
+```sysl
+@byte_order(big)
+struct Hdr
+    len: u16
+
+var h = Hdr(1)
+val p = &h.len
+
+print(1)
+```
+
+```error
+'&' here would reach a 'ushort' inside Hdr, which is '@byte_order(big)' — the field holds its bytes most significant first whatever the machine does, and a '*ushort' is read in the machine's order. Read or write the field through the struct, which is where the order is applied, or take the address of the Hdr itself
+```
+
+A `ref` is refused in the same words, for the same reason. The address of the struct itself is
+untouched — it is an ordinary pointer to the bytes of the format, which is what a frame is.
+
+**Every other kind of field is refused, and the refusal says what to hold instead.** A float's bytes
+are put in an order through its bits:
+
+```sysl
+@byte_order(big)
+struct Sample
+    level: f32
+
+print(sizeof(Sample))
+```
+
+```error
+'Sample.level' is f32, and 'Sample' is '@byte_order(big)' — a float is put in an order through its bits, which the language does not do behind a field read. Hold it as the unsigned integer of its width and convert with '.bits()' and 'from_bits'
+```
+
+An array of wider integers has elements, which are read by index rather than as fields:
+
+```sysl
+@byte_order(big)
+struct Table
+    slots: [4]u16
+
+print(sizeof(Table))
+```
+
+```error
+'Table.slots' is [4]ushort, and 'Table' is '@byte_order(big)' — an element is reached by index rather than read as a field, and the order is applied where a field is read. Hold it as bytes, '[N]u8', or make the element a '@byte_order' struct of its own
+```
+
+A struct held as a field keeps its own order, so one that states none would be read in the
+machine's:
+
+```sysl
+struct Pair
+    a: u16
+    b: u16
+
+@byte_order(big)
+struct Outer
+    p: Pair
+
+print(sizeof(Outer))
+```
+
+```error
+'Outer.p' is Pair, and 'Outer' is '@byte_order(big)' — 'Pair' keeps its integers in the machine's order, so a field of it would be read in the wrong one. Mark it '@byte_order' too
+```
+
+An address means nothing in the memory of whatever reads the bytes:
+
+```sysl
+@byte_order(big)
+struct Link
+    next: *u8
+
+print(sizeof(Link))
+```
+
+```error
+'Link.next' is *byte, and 'Link' is '@byte_order(big)' — an address means nothing outside the memory it points into, and a struct with a byte order is laid out to be written somewhere else. Hold an offset or an index instead
+```
+
+**A bitfield struct takes one too, and the order is its container's.** Its fields are ranges of one
+integer, so the integer is what is stored in the stated order — IPv4's sixteen bits of flags and
+fragment offset are exactly this:
+
+```sysl
+@packed
+@byte_order(big)
+struct Frag
+    offset: u13
+    more: u1
+    dont: u1
+    reserved: u1
+
+@packed
+@byte_order(big)
+struct Ipv4Tail
+    ident: u16
+    frag: Frag
+    ttl: u8
+
+var t = Ipv4Tail(0x1c46, Frag(0, 0, 1, 0), 64)
+val raw: *u8 = ptr_cast(&t)
+
+print(raw[2], raw[3], t.frag.dont, t.frag.bits)
+```
+
+```output
+64 0 1 16384
+```
+
+The ranges are taken from the integer, as they are for any bitfield struct, so `dont` is bit 14 of
+`0x4000` and the wire holds `0x40 0x00`. A bitfield struct with no order of its own is refused as a
+field of one that has an order, its integer being in the machine's.
+
+The order is one of two words, and the attribute marks a struct and nothing else:
+
+```sysl
+@byte_order(middle)
+struct Odd
+    a: u16
+
+print(1)
+```
+
+```error
+'@byte_order' names the order in parentheses — '@byte_order(big)' for a network header, which keeps the most significant byte first, or '@byte_order(little)' for a format that keeps the least significant first
+```
+
+```sysl
+@byte_order(big)
+var n: u16 = 1
+
+print(n)
+```
+
+```error
+'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'sysl.math.ByteOrder' gives every whole-byte integer
+```
+
+A value that is not in a struct is put in an order with
+[`sysl.math.ByteOrder`](/library/math/)'s `to_be` and `from_be`, and a byte-ordered struct is read
+out of bytes, every `bool` and enum in it checked, with
+[`sysl.encoding.Plain`](/library/encoding/)'s `decode`.
 
 ## `@section("...")` — where a symbol lands
 
