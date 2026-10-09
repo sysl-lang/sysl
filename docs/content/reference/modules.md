@@ -1153,6 +1153,46 @@ an ordinary module function: generic if it says so, addressable, passable as a v
 from another file. Only one that reads a binding is nested, and only that one takes the nested
 function's limits.
 
+One of those limits is that a nested function cannot be generic: it is lowered once, into the frame
+it reads. So a helper with type parameters that reads a binding of the body is refused, and the
+refusal names the binding:
+
+```sysl
+var failures = 0
+
+failed[T](r: Result[T, int])
+    if !r.is_ok() then failures += 1
+
+val r: Result[string, int] = Err(1)
+failed(r)
+print(failures)
+```
+
+```error
+'failed' reads 'failures', which the entry file's statements bind, so it is a nested function of them, and a nested function cannot be generic
+```
+
+Declaring the binding `static` (below) makes it the module's, which
+leaves the helper reading nothing of the body's — an ordinary function again, generic at every type it
+is called at:
+
+```sysl
+static var failures: int = 0
+
+failed[T](r: Result[T, int])
+    if !r.is_ok() then failures += 1
+
+val r: Result[string, int] = Err(1)
+val q: Result[bool, int] = Err(2)
+failed(r)
+failed(q)
+print(failures)
+```
+
+```output
+2
+```
+
 #### It may read anything the block binds, wherever that is written
 
 "The bindings above it" is the usual case rather than the rule. A nested function may read **anything
