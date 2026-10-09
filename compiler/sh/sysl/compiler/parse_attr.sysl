@@ -237,6 +237,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "export" then return Some(parse_export_attr(p, at))
     if word == "section" then return Some(parse_section_attr(p))
     if word == "crossing" then return Some(Crossing(parse_named_list(p, "crossing")))
+    if word == "domain" then return parse_domain_attr(p)
     if word == "borrows" then return Some(Borrows(parse_named_list(p, "borrows")))
     if word == "lends" then return Some(Lends(parse_named_list(p, "lends")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
@@ -269,7 +270,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     end if
 
     // Anchored after the word, as `@ignore`'s is: the reference's point for both.
-    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)', '@lends(...)' and '@crossing(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
+    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)', '@lends(...)', '@crossing(...)' and '@domain(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
     skip_line(p)
     None
 end parse_attribute
@@ -350,8 +351,83 @@ private parse_named_list(p: *Parser, word: string) -> Buf[string]
     out
 end parse_named_list
 
+// The domains a function may say it is entered in. One today; the annotation is a name rather than a
+// bare word so that a second (a signal handler, a second core's own loop) is a row here and not a
+// new spelling.
+private const InterruptDomain: string = "interrupt"
+
+private known_domains() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(InterruptDomain)
+    out
+end known_domains
+
+// `@domain(interrupt)` -- the concurrency domain a function is entered in. **It names exactly one**:
+// a function entered in two domains at once is entered in whichever is the stricter, and there is
+// only one to name. What is refused is told what the domains are, as an unknown annotation is told
+// what the annotations are.
+private parse_domain_attr(p: *Parser) -> Option[Attr]
+    if !p.accept_kw("(") || p.at_kw(")")
+        p.fault(p.here(), named_list_refusal("domain"))
+        skip_line(p)
+        return None
+    end if
+
+    val at = p.here()
+    val name = p.peek() match
+        Ident(n) -> n
+        QuotedIdent(n) -> n
+        _ -> ""
+
+    if name == ""
+        p.fault(at, named_list_refusal("domain"))
+        skip_line(p)
+        return None
+    end if
+
+    p.bump()
+
+    if p.at_kw(",")
+        p.fault(p.here(), "'@domain' names the one domain a function is entered in — a function " +
+                "the processor may enter in either of two is entered in the stricter, so name that one")
+        skip_line(p)
+        return None
+    end if
+
+    p.expect_kw(")")
+
+    val known = known_domains()
+
+    if !holds_string(known, name)
+        val which = if known.len() == 1 then s"${quoted_list(known)} is the one there is"
+        else s"a function may name ${quoted_list(known)}"
+
+        p.fault(at, s"'$name' is not a domain a function is entered in — $which, for a function a " +
+                "vector table or a trap stub calls on top of whatever was running. A function the program " +
+                "calls itself is in the program's own domain, and says so by not writing the annotation")
+        return None
+    end if
+
+    Some(Domain(name))
+end parse_domain_attr
+
+// `'a'`, `'a' and 'b'`, `'a', 'b' and 'c'`.
+private quoted_list(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + (if i == names.len() - 1 then " and " else ", ")
+
+        out = out + s"'${names.at(i)}'"
+
+    out
+end quoted_list
+
 private named_list_refusal(word: string) -> string
     if word == "crossing" then return "'@crossing' names the parameters a value reaches another concurrency domain through, in parentheses — '@crossing(state)'. There is no empty form: a function that hands nothing across a boundary says so by not writing the annotation"
+
+    if word == "domain" then return "'@domain' names the domain a function is entered in, in parentheses — '@domain(interrupt)' for a handler a vector table calls, on top of whatever was running. There is no empty form: a function in the program's own domain says so by not writing the annotation"
 
     if word == "lends" then return "'@lends' names the callable parameters a function hands a pointer that is valid only during the call, in parentheses — '@lends(body)'. There is no empty form: a function that lends nothing says so by not writing the annotation"
 
@@ -544,6 +620,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Export(e) -> f.exported = Some(e)
             Section(s) -> f.section = Some(s)
             Crossing(ns) -> f.crossing = ns
+            Domain(d) -> f.marks.domain = Some(d)
             Needs(cs) -> f.needs = cs
             Lends(ns) -> f.marks.lends = ns
             NoInline -> f.marks.noinline = true

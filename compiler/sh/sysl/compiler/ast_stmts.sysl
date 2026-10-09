@@ -230,6 +230,11 @@ end RecvMode
 //
 // `blocks` is `@blocks`, the other side of `@no_block`: this definition may wait -- sleep, take a
 // lock, read a device -- so every promise not to block is refused a way here (`no_block.sysl`).
+//
+// `domain` is `@domain(...)`: the concurrency domain the function is entered in, where that is not
+// the program's own -- `interrupt` for a handler a vector table written in assembly calls. It changes
+// nothing about how the function is called; it makes the function a root of that domain for every
+// check that asks what crosses one (`sharing.sysl`'s `domain_roots`).
 struct FuncMarks
     noinline: bool
     cold: bool
@@ -237,6 +242,7 @@ struct FuncMarks
     async_at: Option[Span]
     forgoes: Buf[string]
     blocks: bool
+    domain: Option[string]
 
     // `@pinned` and `@pins` (`reference/attributes.md § @per_cpu`): the body runs where the core
     // cannot change under it -- because every caller already holds it there, or because the body
@@ -265,7 +271,7 @@ struct FuncMarks
 end FuncMarks
 
 // A definition nothing was said about.
-no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, false, false, buf())
+no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, None, false, false, buf())
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -404,6 +410,7 @@ enum Attr
     Export(attr: ExportAttr)
     Section(name: string)
     Crossing(names: Buf[string])
+    Domain(name: string)
     Borrows(names: Buf[string])
     Lends(names: Buf[string])
     Needs(caps: Buf[string])
@@ -435,6 +442,7 @@ attr_word(a: Attr) -> string = a match
     Export(_) -> "export"
     Section(_) -> "section"
     Crossing(_) -> "crossing"
+    Domain(_) -> "domain"
     Borrows(_) -> "borrows"
     Lends(_) -> "lends"
     Needs(_) -> "needs"

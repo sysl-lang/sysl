@@ -10,7 +10,7 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@lends`, `@noinline`, `@inline`, `@cold`, `@no_alloc`, `@no_block`, `@blocks` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@lends`, `@noinline`, `@inline`, `@cold`, `@no_alloc`, `@no_block`, `@blocks` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@borrows` | an **annotation** on a trait's method — see [`@borrows`](/reference/traits/#a-method-may-promise-to-borrow) | the grammar |
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; the one an `extern` takes | the grammar |
@@ -2919,6 +2919,84 @@ print(count())
 
 ```error
 'n' is a local, and a local is already one call's
+```
+
+## `@domain(interrupt)` — a function entered on top of whatever was running
+
+An [`interrupt`](/reference/ffi/) handler is a function the processor enters directly, in the frame
+it pushed. Most kernels do not write one: a **vector table in assembly** saves the interrupted
+registers itself and then calls an ordinary function, exactly as C would. That function is
+`@export`ed, and an export is how C enters sysl at all — almost always on the program's one thread —
+so nothing about it says a second domain exists.
+
+**`@domain(interrupt)` says so.** It changes nothing about how the function is called; it makes the
+function a root of the interrupt domain, held to what an `interrupt` handler is held to: every count
+it reaches, however many calls down, has to be atomic
+([memory § Module storage reached from another domain](/reference/memory/#module-storage-reached-from-another-domain)).
+
+```sysl build=c target=aarch64-freestanding
+import sysl.sync.Atomic
+
+var done: Atomic[u32] = Atomic(0)
+
+@domain(interrupt)
+@export("disk_irq")
+disk_irq()
+    done.store(1)
+
+@export("disk_wait")
+disk_wait()
+    while done.load() == 0 do ()
+```
+
+The handler and the program share one word, and every touch of it is one atomic instruction. A
+handler that reaches a counted reference instead is refused at the handler, naming what it reached:
+
+```sysl build=c target=aarch64-freestanding
+struct Request
+    sector: u64
+
+var pending: Option[&Request] = None
+
+@domain(interrupt)
+@export("disk_irq")
+disk_irq()
+    pending = None
+```
+
+```error
+'disk_irq' is entered in the 'interrupt' domain, on top of whatever was running, so every count it reaches has to be atomic — but the module storage 'pending' it reaches holds a '&Request' in its 'Some(value)', whose count is not. Hold it as a '&sync Request' ('06')
+```
+
+A **waker** is the case a kernel meets first, and it has no atomic spelling at all — see
+[async § A task that parks stays in its domain](/reference/async/#a-task-that-parks-stays-in-its-domain).
+
+### It names one domain, and `interrupt` is the one there is
+
+```sysl
+@domain(thread)
+worker() = ()
+```
+
+```error
+'thread' is not a domain a function is entered in — 'interrupt' is the one there is
+```
+
+A function the program calls itself is in the program's own domain and says so by not writing the
+annotation, so there is no empty form, and a function the processor may enter in either of two is
+entered in the stricter, so there is no list.
+
+### It is not `async`
+
+Whatever enters the function calls it directly, and calling an `async` function only makes its task:
+
+```sysl
+@domain(interrupt)
+async on_irq() = ()
+```
+
+```error
+a function entered in the 'interrupt' domain cannot be 'async': whatever enters it calls it directly, and calling an async function only makes its task, which nothing there can drive
 ```
 
 ## `#if` — gating lines before the lexer
