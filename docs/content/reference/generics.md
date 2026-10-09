@@ -1113,6 +1113,50 @@ dictionary passed at runtime.
 - **Recursion is fine.** A recursive generic function recurses at a *fixed* instantiation, so it
   monomorphizes like any other.
 
+### A nested function may be generic
+
+A function declared inside a body takes type parameters, bounds and the bare-arrow sugar exactly as a
+top-level one does, and each call instantiates it the same way. What it adds is the frame: every
+instantiation is one more function over the environment its block shares, so each reads and writes
+the body's variables as any nested function does.
+
+```sysl
+tally() -> int
+    var total = 0
+
+    noted[T: Display](x: T, n: int) -> string
+        total += n
+        s"$x"
+
+    print(noted("a", 2), noted(true, 3), noted(1.5, 4))
+    total
+
+print(tally())
+```
+
+```output
+a true 1.5
+9
+```
+
+Two bodies may each declare a nested generic of one name: an instantiation is named for the frame it
+belongs to as well as for its type arguments, so the two are never one function. A type argument the
+call cannot settle is written out, `sized[u32]()`, and a bound is held at the call:
+
+```sysl
+struct Point
+    x: int
+
+describe() -> string
+    shown[T: Display](x: T) -> string = s"<$x>"
+
+    shown(Point(1))
+```
+
+```error
+'shown' requires its type parameter 'T' to implement 'sysl.Display', but Point does not
+```
+
 ## Variance does not arise
 
 There is no variance question in sysl, by construction. Variance is about when `G[A]` may stand in for
