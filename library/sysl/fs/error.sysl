@@ -1,8 +1,9 @@
 module sysl.fs
 @requires(os)
 
+import sysl.fs.sys as fsys
 import sysl.sys.UNSUPPORTED
-import sysl.text.from_utf8_lossy
+import sysl.text.from_utf8
 
 /** What a filesystem call reports when it does not succeed, and the one number it comes from.
  *
@@ -100,7 +101,9 @@ enum IoError
      * sentence its C library gives that code (`EILSEQ` is "Illegal byte sequence" on macOS), since a
      * code no case names is one only the platform has words for, and a bare number was a thing the
      * reader then had to go and look up. A code the library does not know comes back in the library's
-     * own words for that ("Unknown error: 4242"). A target with no `posix` C library under it says
+     * own words for that ("Unknown error: 4242"). On a target with no C library the program's
+     * supplier is asked (`sysl_fs_error_text`), then the library's own table of the numbers every
+     * platform agrees on (`EBUSY` is "device or resource busy"), and only a code neither knows says
      * `error N`.
      */
     message(self) -> string = self match
@@ -119,27 +122,107 @@ enum IoError
         Other(c)          -> system_text(c)
 end IoError
 
-// The shim. Declared on every target and defined only where a `__posix__` directory supplies it; the
-// `#if posix` below is what keeps anything else from linking it.
-private[sysl] extern "sysl_fs_strerror" c_strerror(code: int, out: *u8, room: u64) -> long
-
-/** What the platform calls `code`, copied out of the buffer the C library wrote it into. `unsupported`
- * is the one code no platform reports, and is said here rather than handed to a library that would
- * call it an unknown error.
+/** What the words for `code` are, where no case names it: the supplier's (`sysl.fs.sys`'s
+ * `sysl_fs_error_text` -- the C library's `strerror_r` on a POSIX host, or a program's own on a target
+ * with none), then this module's table of the numbers every platform agrees on, then `error N`.
+ * `unsupported` is the one code no platform reports, and is said here rather than handed to a supplier
+ * that would call it an unknown error.
  */
-#if posix
 private system_text(code: int) -> string
     if code == unsupported_code then return "not supported on this target"
 
     var into: [256]u8 = [0; 256]
-    val n = c_strerror(code, &into[0], 256)
+    var got: usize = 0
 
-    if n < 0 then s"error $code" else from_utf8_lossy(into[0..<usize(n)])
+    val at: *u8 = &into[0]
+
+    // The length is the supplier's word and is held to the room it was given; the view is then taken
+    // through the pointer, so a bare image reaching this carries no bounds failure, which would ask it
+    // for a `putchar` and an `exit` merely to say what an error number means. Words that are not
+    // UTF-8 are no words at all: they fall to the table rather than being rebuilt, which would pull
+    // a growing buffer into an image that only wanted a sentence.
+    if fsys.error_text(code, at, 256, &got) == 0
+        if got > 256 then got = 256
+
+        from_utf8(at[0..<got]) match
+            Ok(words) -> return words
+            Err(_) -> ()
+
+    agreed_words(code) match
+        Some(words) -> words
+        None -> s"error $code"
 end system_text
+
+// Where the table is consulted: everywhere but a hosted target that is not POSIX, whose C library
+// numbers its errors its own way (wasi-libc's `ENOENT` is 44), so the table would put the wrong
+// words to its numbers.
+#if posix
+private agreed_words(code: int) -> Option[string] = errno_words(code)
+#elif hosted
+private agreed_words(code: int) -> Option[string] = None
 #else
-private system_text(code: int) -> string
-    if code == unsupported_code then "not supported on this target" else s"error $code"
+private agreed_words(code: int) -> Option[string] = errno_words(code)
 #endif
+
+// `EAGAIN`, the code for a call that would have had to wait: 35 on a BSD, 11 under glibc, where a BSD
+// spends 11 on `EDEADLK`.
+#if bsd
+private[sysl] again() -> int = 35
+#else
+private[sysl] again() -> int = 11
+#endif
+
+/** The words for an error number, from the one table the library carries -- needing no C library, so
+ * a target with none still says what a code means.
+ *
+ * **It holds the numbers every platform agrees on and nothing past them**: V7 Unix's 1 to 34, which
+ * have meant the same thing on every Unix since (11 aside, which a BSD spends on `EDEADLK`), and the
+ * three this module names whose value differs between the two families (`EAGAIN`, `ENOTEMPTY`,
+ * `EILSEQ`), each at this target's number. Beyond them the numbers part company, and a table claiming
+ * them would put Linux's words to a BSD's codes; a supplier that knows its own answers
+ * `sysl_fs_error_text`. A code it does not hold is `None`.
+ */
+private[sysl] errno_words(code: int) -> Option[string]
+    if code == again() then return Some("resource temporarily unavailable")
+    if code == not_empty() then return Some("directory not empty")
+    if code == ilseq() then return Some("illegal byte sequence")
+
+    code match
+        1 -> Some("operation not permitted")
+        2 -> Some("no such file or directory")
+        3 -> Some("no such process")
+        4 -> Some("interrupted system call")
+        5 -> Some("input/output error")
+        6 -> Some("no such device or address")
+        7 -> Some("argument list too long")
+        8 -> Some("exec format error")
+        9 -> Some("bad file descriptor")
+        10 -> Some("no child processes")
+        12 -> Some("cannot allocate memory")
+        13 -> Some("permission denied")
+        14 -> Some("bad address")
+        15 -> Some("block device required")
+        16 -> Some("device or resource busy")
+        17 -> Some("file exists")
+        18 -> Some("invalid cross-device link")
+        19 -> Some("no such device")
+        20 -> Some("not a directory")
+        21 -> Some("is a directory")
+        22 -> Some("invalid argument")
+        23 -> Some("too many open files in system")
+        24 -> Some("too many open files")
+        25 -> Some("inappropriate ioctl for device")
+        26 -> Some("text file busy")
+        27 -> Some("file too large")
+        28 -> Some("no space left on device")
+        29 -> Some("illegal seek")
+        30 -> Some("read-only file system")
+        31 -> Some("too many links")
+        32 -> Some("broken pipe")
+        33 -> Some("numerical argument out of domain")
+        34 -> Some("numerical result out of range")
+        _ -> None
+end errno_words
 
 /** So that a caller can say `e == NotFound` rather than `e.code() == 2`.
  *

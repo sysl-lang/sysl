@@ -1,0 +1,35 @@
+module sysl.fs.errtext
+
+// The library's answer to `sysl.fs.sys`'s `sysl_fs_error_text`: the words for an error number, which
+// `IoError.message` asks for a code no case of it names. **Call `sysl.fs` instead** -- nothing here is
+// meant to be called; the one function below exists to be linked under the hook's symbol, and is
+// public only because an `@export` may not be `private`.
+//
+// **It is the one hook the library answers on every target, which is what makes it the one a program
+// never has to.** Every other hook of `sysl.fs.sys` is answered by `sysl.fs.hosted`, which requires
+// `os`, so a freestanding program supplies them all; this module requires nothing, so the library's
+// answer is there on a bare machine too and a program that has no words of its own is asked for
+// none. Where the program does answer the hook with an `@export`, its definition is the one taken and
+// this one is left out (`reference/ffi.md § A module may supply another module's extern`).
+//
+// On a POSIX host the words are the C library's, through the `strerror_r` shim beside `sysl.fs`
+// (`sysl/fs/__posix__/errtext.c`), so `EILSEQ` is "Illegal byte sequence" on macOS. Anywhere else
+// this has no words to give, and `sysl.fs` falls back to its own table of the numbers every platform
+// agrees on.
+
+#if posix
+private extern "sysl_fs_strerror" c_strerror(code: int, out: *u8, room: u64) -> long
+
+@export("sysl_fs_error_text")
+supply_error_text(code: int, into: *u8, room: usize, got: *usize) -> int
+    val n = c_strerror(code, into, u64(room))
+
+    if n < 0 then return -1
+
+    *got = usize(n)
+    0
+end supply_error_text
+#else
+@export("sysl_fs_error_text")
+supply_error_text(code: int, into: *u8, room: usize, got: *usize) -> int = -1
+#endif
