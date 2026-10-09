@@ -3,8 +3,9 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.env.{get as env_var}
-import sysl.fs.remove_dir_all
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
+import sysl.text.Search
 
 // **The self-build's oracle: stage 1 and stage 2 must emit the same text for the same input.**
 //
@@ -24,6 +25,60 @@ import sysl.process.capture
 // Where the stage-2 binary is, or nothing where this machine has not built one.
 private stage_two() -> Option[string] = env_var("SYSL_STAGE2")
 
+// **What `sysl emit-llvm <path>` prints, made in process** -- the lowered text with every definition
+// marked by `for_clang`, as the command marks it. `emit_llvm_text` alone is the text before that
+// marking, so held against a stage's printed answer it differs at every `define` line and says
+// nothing about whether the two stages agree.
+private printed_llvm(path: string) -> Result[string, string]
+    val at = build_level(path, None) match
+        Err(why) -> return Err(failure_text(why))
+        Ok(level) -> level
+
+    val emitted = emit_llvm_text(path, None, at) match
+        Err(why) -> return Err(why.message)
+        Ok(made) -> made
+
+    if !emitted.report.is_empty() then return Err(analysis_report(emitted.report))
+
+    target_for(path, None) match
+        Err(why) -> Err(why.message)
+        Ok(t) -> Ok(for_clang(emitted.text, t))
+end printed_llvm
+
+// The stand-in has to be the command's own answer, or the stage comparison compares two printers.
+@test("the in-process text the stages are held to is what emit-llvm prints, attribute group and all")
+self_in_process_text_is_the_printed_text()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-self").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", "twice(n: int) -> int = n * 2\n\nprint(twice(21))\n").unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(["sysl", "emit-llvm", root], piece -> sink.push(piece))
+    var printed = ""
+
+    for item in said
+        printed = printed + item + "\n"
+
+    reset_search_paths()
+    assert_eq(code, 0)
+
+    val mine = printed_llvm(root).unwrap()
+    val one = func_texts(mine)
+    val two = func_texts(printed)
+
+    assert(mine.contains(") #99 {"), mine)
+    assert(one.len() > 0 && one.len() == two.len(), s"${one.len()} in process, ${two.len()} printed")
+
+    for item in one
+        assert_eq(text_for(two, item.0).unwrap_or(""), item.1)
+
+    remove_dir_all(root).unwrap_or(())
+end self_in_process_text_is_the_printed_text
+
 @test("stage 2 emits the text stage 1 does, over the whole of this compiler's own tree")
 stage_one_and_stage_two_emit_the_same_text()
     stage_two() match
@@ -42,16 +97,16 @@ stage_one_and_stage_two_emit_the_same_text()
                     return
                 Ok(answer) -> answer
 
-            val mine = emit_llvm_text(".", None) match
-                Err(refusal) ->
-                    assert(false, s"stage 1 refused this tree: ${refusal.message}")
+            val mine = printed_llvm(".") match
+                Err(why) ->
+                    assert(false, s"stage 1 refused this tree: $why")
                     return
-                Ok(emitted) -> emitted
+                Ok(text) -> text
 
             assert(theirs.status.ok(), s"stage 2 refused this tree: ${theirs.err.unwrap_or("")}")
 
             val two = func_texts(theirs.text)
-            val one = func_texts(mine.text)
+            val one = func_texts(mine)
             var differing: usize = 0
             var first_bad = ""
 
@@ -70,7 +125,7 @@ stage_one_and_stage_two_emit_the_same_text()
 
                             if differing <= 4
                                 first_bad = s"$first_bad\n'@$name' differs" +
-                                    s"${first_body_difference(item.1, body)}"
+                                    s"${first_body_difference(body, item.1)}"
 
             val summary = s"the two stages: ${one.len()} definitions from stage 1, " +
                 s"${two.len()} from stage 2, $differing differing"
