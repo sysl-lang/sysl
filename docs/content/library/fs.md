@@ -43,7 +43,7 @@ decides which modules exist at all — there is no half of `sysl.fs` that works 
 |---|---|---|
 | whole file | `read_text`, `read_bytes`, `write_text`, `write_bytes`, `append_text`, `append_bytes`, `write_text_atomic`, `write_bytes_atomic` | storage the size of the file — allocates by nature |
 | open file | `open`, `create`, `append`, `open_update`, `create_update`, and `File`'s members | a buffer the caller already has |
-| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
+| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
 
 **Reading a whole file *is* asking for storage the size of the file**, so the top tier could not have
 been written any other way. Keeping it apart from `File` is what lets the middle tier stay honest:
@@ -577,6 +577,42 @@ behaviour available.
 `Meta.same_file` is the inode and the device together, which is what says two paths name one file.
 Neither identifies a file on its own: inode numbers are reused, and are unique only within a device.
 
+### Who owns it
+
+**`Meta.owner` and `Meta.group` are `u32`s, the type [`sysl.process.user()`](/library/process/#who-the-program-is)
+answers**, so "is this file mine" is one comparison with nothing converted on either side.
+`set_owner(path, owner, group)` is the writing half, beside `set_permissions` and over one `chown`:
+it sets both, so a program changing only one passes the other as `metadata` read it.
+
+```sysl
+import sysl.fs.{write_text, metadata, set_owner, remove_file}
+import sysl.process.user
+
+val path = "/tmp/sysl-fs-doc-owner.txt"
+
+write_text(path, "mine").unwrap()
+
+val m = metadata(path).unwrap()
+
+print(m.owner == user())
+
+set_owner(path, m.owner, m.group).unwrap()
+print(metadata(path).unwrap().owner == m.owner)
+
+remove_file(path).unwrap()
+```
+
+```output
+true
+true
+```
+
+**Giving a file away is privileged**, as `chown(2)` makes it: a program not acting as user 0 that
+hands one to somebody else is refused with `NotPermitted`. Giving a file to the owner and group it
+already has is the one change anybody may make. A symbolic link is followed, as `set_permissions`
+follows one, and there is no variant that changes the link itself, there being none for its
+permissions either. A target whose filesystem has no owners answers *not supported on this target*.
+
 ### Links, and the path the filesystem agrees on
 
 ```sysl
@@ -923,7 +959,7 @@ way to get atomicity from a filesystem.
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
 `extern` per call — `sysl_fs_open`, `_read`, `_write`, `_close`, `_seek`, `_fstat`, `_ftruncate`,
-`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_opendir`,
+`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_chown`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`. Each answers an `int` by the contract every `*.sys` module has
 (`sysl.io.sys` and `sysl.process.sys` too): zero or more is success, a negative answer is the `code()`
@@ -958,7 +994,7 @@ The question is asked only of what the program reaches, so a freestanding progra
 a file is asked nothing.
 
 **Every call on this page is there for such a program**, the reading ones included: `metadata`,
-`link_metadata` and `set_permissions` are one `stat` or `chmod` hook, the walk and `remove_dir_all`,
+`link_metadata`, `set_permissions` and `set_owner` are one `stat`, `chmod` or `chown` hook, the walk and `remove_dir_all`,
 `copy_dir_all` and `publish_dir` are `entries` and `link_metadata` with a leaf action, and
 `make_temp_dir` and `canonicalize` are the `temp_dir` and `realpath` hooks. A supplier fills `Stat`'s
 thirteen numbers in POSIX's shape and leaves zero what it has nothing to say about; a hook it answers

@@ -1,8 +1,9 @@
 module sysl.process.sys
 
 // The calls `sysl.process` makes of whatever starts programs underneath it: start one, wait for it,
-// send it a signal, name a file nothing else holds for a captured stream to go into, and make a pipe
-// for one child's output to be another's input.
+// send it a signal, name a file nothing else holds for a captured stream to go into, make a pipe for
+// one child's output to be another's input, and say -- or change -- which user and group the program
+// runs as.
 //
 // **Each is an `extern` naming a symbol no module here defines**, so what answers it is decided by
 // what the program is linked with (`reference/ffi.md § A module may supply another module's extern`),
@@ -20,7 +21,8 @@ module sysl.process.sys
 //
 // **A hook answers one integer: what it did, or what went wrong** -- the contract of every `*.sys`
 // module (`sysl.fs.sys`, `sysl.io.sys`).
-// Zero or more is success: a process id for `spawn`, a length for `temp_path`, zero for the others.
+// Zero or more is success: a process id for `spawn`, a length for `temp_path`, a user or group id for
+// `get_id`, zero for the others.
 // A negative answer is the code of the failure negated -- the `IoError` code `sysl.fs` uses, which on
 // a POSIX host is the `errno` -- so a kernel's system call that already answers a negative error
 // number is the hook as it stands. **A target that cannot perform a call at all answers `UNSUPPORTED`** (`sysl.sys`, -38 on every
@@ -109,3 +111,32 @@ private[sysl] extern "sysl_proc_temp_path" temp_path(into: *u8, room: usize) -> 
  * would be a writer the reader waits for and never hears from.
  */
 private[sysl] extern "sysl_proc_pipe" pipe(read_end: *int, write_end: *int) -> int
+
+/** What `get_id` and `set_id` are asked about: the user the program acts as -- the **effective** user,
+ * the one a filesystem checks a permission against and makes a new file's owner.
+ */
+const id_user: int = 0
+
+/** The group the program acts as: the effective group. */
+const id_group: int = 1
+
+/** The user who started the program -- the **real** user. It differs from `id_user` only in a
+ * program that changed who it acts as, a set-user-ID one or one that called `set_id`; on a target
+ * that keeps one user per process the two are the same number.
+ */
+const id_real_user: int = 2
+
+/** The group of the user who started the program: the real group. */
+const id_real_group: int = 3
+
+/** Which user or group the program is, `which` being one of the `id_` constants: the id, which is
+ * zero or more, or the failure's code negated. A target with no users at all answers `UNSUPPORTED`.
+ */
+private[sysl] extern "sysl_proc_get_id" get_id(which: int) -> i64
+
+/** The program made to act as user or group `id`, `which` being `id_user` or `id_group`, answering zero
+ * or the failure's code negated. It is POSIX's `setuid` and `setgid`: privileged, so a program that is
+ * not acting as user 0 may only move between the ids it already has, and anything else is `-1`,
+ * `EPERM`. A target with no users answers `UNSUPPORTED`.
+ */
+private[sysl] extern "sysl_proc_set_id" set_id(which: int, id: u32) -> int

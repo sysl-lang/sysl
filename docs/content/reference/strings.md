@@ -547,9 +547,9 @@ format '%s' expects a string, but the value has type int
 
 `%d %i %x %X %o %u %b` want an integer, `%f %e %g %E %G` a float, and `%s` a string. An unsigned
 conversion reads the value at its own width — `%x` of an `i32 -1` is `ffffffff`, of a `u8 255` is
-`ff` — while `%d` keeps the value's sign; `%b` is binary, and `#` gives it a `0b`. A string is
-copied NUL-terminated so that C's `%s` can apply width and precision, which means an interior NUL
-ends the field there, as it does for any `%s`.
+`ff` — while `%d` keeps the value's sign; `%b` is binary, and `#` gives it a `0b`. Under `%s` a
+width and a precision count **bytes**, as C's do, and an interior NUL ends the field there, as it
+does for any `%s`.
 
 ```sysl
 val n: i8 = -6
@@ -561,11 +561,29 @@ print(f"[${n}%+05d] [${n}%x] [${n}%#o] [${255}%#b] [${42}%-6u]")
 [-0006] [fa] [0372] [0b11111111] [42    ]
 ```
 
-**An integer conversion is rendered by sysl itself** (`sysl.fmt.format_int`), flag for flag as C
-renders it, so it works the same on a target with no C library. A float conversion and `%s` over a
-string are applied by C's `snprintf`, so on a target without the [`libc`](/reference/packages/#capabilities)
-capability — a freestanding one whose manifest does not grant it — a reached one is refused where it
-is written:
+```sysl
+val name = "zoë"
+val cut = 2
+
+print(f"[${name}%-6s] [${name}%6s] [${name}%.${cut}s] [${name}%-8.${cut}s]")
+```
+
+```output
+[zoë  ] [  zoë] [zo] [zo      ]
+```
+
+**An integer conversion and `%s` are rendered by sysl itself** (`sysl.fmt.format_int` and
+`sysl.fmt.format_str`), flag for flag as C renders them, so they work the same on a target with no C
+library — a bare board pads a column as a hosted program does:
+
+```sysl target=aarch64-freestanding build=c
+@export("probe")
+probe(n: int) -> usize = f"[${str(n)}%-6s]".bytes.len
+```
+
+A float conversion is applied by C's `snprintf`, so on a target without the
+[`libc`](/reference/packages/#capabilities) capability — a freestanding one whose manifest does not
+grant it — a reached one is refused where it is written:
 
 ```sysl target=aarch64-freestanding build=c
 @export("probe")

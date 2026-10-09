@@ -1,6 +1,6 @@
 ---
 title: The process module
-summary: "`sysl.process` — starting another program and waiting for it: `run`, `capture`, `start` and `Child`, `spawn` and `pipe` for a pipeline, `Status`, how long a child may take, and why there is no shell anywhere in it."
+summary: "`sysl.process` — starting another program and waiting for it: `run`, `capture`, `start` and `Child`, `spawn` and `pipe` for a pipeline, `Status`, how long a child may take, why there is no shell anywhere in it, and which user the program runs as."
 weight: 74
 ---
 
@@ -37,7 +37,8 @@ It requires `posix`. On a hosted target the whole of the mechanism is `posix_spa
 target that is not POSIX has no way to start a program. WASI preview1 is the case that made that
 visible, having files and a clock and no way to spawn at all. **A target with no C library can still
 start one, if the program says how** — a kernel with its own process calls answers the module's
-hooks itself, [below](#on-a-target-with-no-c-library).
+hooks itself, [below](#on-a-target-with-no-c-library). The module also says
+[which user the program is](#who-the-program-is).
 
 ## A program that fails is not a failure
 
@@ -506,10 +507,59 @@ Like a `Child`, a `Spawned` dropped without being waited for is ended and reaped
 pipeline abandoned halfway leaves no stage running and no zombie; `spawn` takes `dir`, `env`,
 `timeout` and `inherit_env` meaning what they mean for `run`, the `timeout` kept by `wait`.
 
+## Who the program is
+
+**`user()` and `group()` answer the ids the program acts as**, as `u32`s — the type
+[`sysl.fs`'s `Meta.owner` and `Meta.group`](/library/fs/#who-owns-it) already have, so whether a file
+is the program's own is one comparison:
+
+```sysl
+import sysl.fs.{write_text, metadata, remove_file}
+import sysl.process.{user, group, real_user, real_group}
+
+val path = "/tmp/sysl-process-doc-id.txt"
+
+write_text(path, "mine").unwrap()
+
+print(metadata(path).unwrap().owner == user())
+print(user() == real_user(), group() == real_group())
+
+remove_file(path).unwrap()
+```
+
+```output
+true
+true true
+```
+
+**They are the *effective* ids** — the ones a filesystem checks a permission against and makes a new
+file's owner, which is what a program asking "who am I" is asking. `real_user()` and `real_group()`
+are who *started* it, and differ only in a program that changed who it acts as: one installed
+set-user-ID, or one that called `set_user`. A target that keeps one user per process answers the same
+number for both, and **a target with no users at all answers 0 for every one** — its filesystem
+leaves `Meta.owner` zero for the same reason, so `Meta.owner == user()` still says yes.
+
+`set_user(id)` and `set_group(id)` are POSIX's `setuid` and `setgid`, and **privileged**: a program
+acting as user 0 becomes `id` for good — real, effective and saved together, so the privilege is given
+up rather than set aside — and any other may only move between the ids it already has. Anything else
+is `NotPermitted`. **A program giving up root calls `set_group` first**: once it is no longer user 0 it
+may not change its group either.
+
+```
+import sysl.process.{set_group, set_user}
+
+set_group(100)?
+set_user(1000)?
+```
+
+Mapping a number to a name — `/etc/passwd`, `/etc/group` — is not here: that is a system database, and
+a program that reads one reads the system's own.
+
 ## On a target with no C library
 
-Everything the module asks of the machine goes through the hooks in `sysl.process.sys` — start a
-program, make a pipe, wait for it, send it a signal, name a file for a captured stream. On a hosted POSIX target
+Everything the module asks of the machine goes through seven hooks in `sysl.process.sys` — start a
+program, make a pipe, wait for it, send it a signal, name a file for a captured stream, and read or
+change who the program is. On a hosted POSIX target
 the library answers them; **on a target with no C library the program answers each one it reaches
 with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `start`, `spawn` and
 `pipe` work unchanged above them:
@@ -521,6 +571,8 @@ with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `s
 | `sysl_proc_wait(pid, started, timeout_ms, how, value) -> int` | zero, having written how it ended |
 | `sysl_proc_kill(pid, signal) -> int` | zero |
 | `sysl_proc_temp_path(into, room) -> isize` | the length of the path it wrote |
+| `sysl_proc_get_id(which) -> i64` | the id: `which` is `id_user` 0 or `id_group` 1 (effective), `id_real_user` 2 or `id_real_group` 3 |
+| `sysl_proc_set_id(which, id: u32) -> int` | zero, having made the program act as user or group `id` (`which` 0 or 1) |
 
 **Each answers zero or more for success and the `IoError` code negated for a failure**, and
 `UNSUPPORTED` (`sysl.sys`, -38 on every platform, not the host's `ENOSYS`; `-1` is `EPERM`) for a
@@ -529,17 +581,21 @@ a length, never a C string: `argv` and `envp` point at runs of `Text`, each a po
 `envp`'s entries reading `NAME=VALUE`. A descriptor of `-1` leaves the child the stream this program
 has. `wait` writes `0` into `how` for an exit (its code in `value`), `1` for a signal or a fault (its
 number), and `2` for a child it stopped at its deadline; a supplier that cannot bound a wait answers
-`UNSUPPORTED` when handed a timeout. `sysl.process.sys`'s own comments say the rest.
+`UNSUPPORTED` when handed a timeout. A target with no users answers `get_id` and `set_id` with
+`UNSUPPORTED`, and a refused `set_id` answers `-1`, `EPERM`, which comes back as `NotPermitted`.
+**`kill` and `wait` are reached by any program that reaches the module**, `Child`'s destructor being
+kept wherever `sysl.process` is, so a program asking only who it is answers those two as well.
+`sysl.process.sys`'s own comments say the rest.
 
 A program that reaches a hook and leaves it unanswered is refused when it is compiled, naming every
 hook it reached:
 
 ```
-error: this program starts or waits for a process, and 'aarch64-freestanding' has no C library under
-it for the standard library to answer one with, so the program answers it: define 'sysl_proc_kill',
-'sysl_proc_spawn', 'sysl_proc_temp_path', 'sysl_proc_wait' with '@export', each taking what its
-'extern' in 'sysl.process.sys' declares and answering a process id, a length or zero, or the code of
-an 'IoError' negated
+error: this program reaches 'sysl.process', and 'aarch64-freestanding' has no operating system under
+it for the standard library to answer a process or a user with, so the program answers it: define
+'sysl_proc_kill', 'sysl_proc_spawn', 'sysl_proc_temp_path', 'sysl_proc_wait' with '@export', each
+taking what its 'extern' in 'sysl.process.sys' declares and answering a process id, a user or group
+id, a length or zero, or the code of an 'IoError' negated
 ```
 
 ## What is not here

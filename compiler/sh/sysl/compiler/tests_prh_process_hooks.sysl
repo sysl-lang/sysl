@@ -217,12 +217,12 @@ prh_unanswered_hooks_are_refused()
     val (said, out) = prh_build(p)
 
     assert(said.0 != 0, "built with every process hook unanswered")
-    assert(said.1.contains(s"error: this program starts or waits for a process, and '$prh_target' " +
-        "has no operating system under it for the standard library to answer one with, so the program " +
-        "answers it: define 'sysl_proc_kill', 'sysl_proc_spawn', 'sysl_proc_temp_path', " +
-        "'sysl_proc_wait' with '@export', each taking what its 'extern' in 'sysl.process.sys' " +
-        "declares and answering a process id, a length or zero, or the code of an 'IoError' negated"),
-        said.1)
+    assert(said.1.contains(s"error: this program reaches 'sysl.process', and '$prh_target' " +
+        "has no operating system under it for the standard library to answer a process or a user " +
+        "with, so the program answers it: define 'sysl_proc_kill', 'sysl_proc_spawn', " +
+        "'sysl_proc_temp_path', 'sysl_proc_wait' with '@export', each taking what its 'extern' in " +
+        "'sysl.process.sys' declares and answering a process id, a user or group id, a length or " +
+        "zero, or the code of an 'IoError' negated"), said.1)
 
     // Told before the link, so no linker names a symbol; and the filesystem's hooks, answered, are
     // not asked for.
@@ -264,3 +264,113 @@ prh_hosted_library_answers_weakly()
 
     assert(said.1.contains("@sysl_proc_posix_start("), "the hosted answer does not call the shim")
 end prh_hosted_library_answers_weakly
+
+// -- who the program is, and a file's owner ---------------------------------------------------------
+
+// `id`, `su` and `chown` between them: who the program is, a file given to it, and a move to another
+// user -- the two identity hooks of `sysl.process.sys` and the `chown` hook of `sysl.fs.sys`.
+private val prh_identity_program: string = raw"""
+    import sysl.fs.set_owner
+    import sysl.process.{group, real_user, set_group, set_user, user}
+
+    go() -> int
+        var n = 0
+
+        if user() == real_user() then n += 1
+        if set_owner("/home/alice/note", user(), group()).is_ok() then n += 2
+        if set_group(100).is_ok() && set_user(1000).is_ok() then n += 4
+
+        n
+    end go
+    """
+
+// The three hooks, answered as a kernel with one user per process would answer them -- and `kill`
+// and `wait`, which `Child`'s destructor reaches: a library destructor is a root wherever its module
+// is reached, so a program reaching `sysl.process` for its identity alone still answers those two.
+private val prh_identity_hooks: string = raw"""
+    @export("sysl_proc_kill")
+    k_kill(pid: i64, signal: int) -> int = 0
+
+    @export("sysl_proc_wait")
+    k_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int = 0
+
+    @export("sysl_proc_get_id")
+    k_get_id(which: int) -> i64 = 1000
+
+    @export("sysl_proc_set_id")
+    k_set_id(which: int, id: u32) -> int = -1
+
+    @export("sysl_fs_chown")
+    k_chown(path: *u8, len: usize, owner: u32, group: u32) -> int = -38
+    """
+
+@test("a freestanding program that asks who it is and gives a file away links with only its own hooks")
+prh_identity_hooks_link()
+    if !prh_link_ready() then return
+
+    val p = prh_tree(prh_identity_program + prh_runtime + prh_identity_hooks)
+    val (said, out) = prh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = prh_symbols(elf, false)
+
+    assert_eq(prh_symbols(elf, true).trim(), "")
+
+    for hook in ["sysl_proc_get_id", "sysl_proc_set_id", "sysl_fs_chown"]
+        assert(all.contains(s" T $hook"), all)
+
+    for name in ["getuid", "geteuid", "getgid", "getegid", "setuid", "setgid", "chown"]
+        assert(!prh_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end prh_identity_hooks_link
+
+@test("a freestanding program that asks who it is with no hooks is refused, naming the ones it reaches")
+prh_identity_hooks_unanswered()
+    if !lbr_ready() then return
+
+    val p = prh_tree(prh_identity_program + prh_runtime)
+    val (said, out) = prh_build(p)
+
+    assert(said.0 != 0, "built with the identity hooks unanswered")
+    assert(said.1.contains(s"error: this program reaches 'sysl.process', and '$prh_target' has no " +
+        "operating system under it for the standard library to answer a process or a user with, so " +
+        "the program answers it: define 'sysl_proc_get_id', 'sysl_proc_kill', 'sysl_proc_set_id', " +
+        "'sysl_proc_wait' with '@export'"), said.1)
+    assert(said.1.contains(s"error: this program reaches 'sysl.fs', and '$prh_target' has no " +
+        "operating system under it for the standard library to answer a filesystem with, so the " +
+        "program answers it: define 'sysl_fs_chown' with '@export'"), said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end prh_identity_hooks_unanswered
+
+@test("on a hosted target the library answers the identity and chown hooks under weak exports")
+prh_hosted_identity_answers_weakly()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.set_owner
+        import sysl.process.{group, set_user, user}
+
+        print(set_owner("x", user(), group()).is_ok(), set_user(user()).is_ok())
+        """)
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
+
+    lbr_drop([p])
+    assert(said.0 == 0, said.1)
+
+    for hook in ["sysl_proc_get_id", "sysl_proc_set_id", "sysl_fs_chown"]
+        var defined = ""
+
+        for line in lines_of(said.1)
+            if line.starts_with("define ") && line.contains(s" @$hook(") then defined = line
+
+        assert(defined.starts_with("define weak "), s"$hook: $defined")
+    end for
+
+    for c in ["@geteuid(", "@setuid(", "@chown("]
+        assert(said.1.contains(c), s"the hosted answer does not call $c")
+end prh_hosted_identity_answers_weakly
