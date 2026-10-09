@@ -1,6 +1,6 @@
 ---
 title: Attributes, annotations, and compile time
-summary: `::` attributes a type answers, the fifteen annotations a function takes, the three that lay out or place what they mark, the five a file's header takes, `@assert` which stands on its own, and the `#if` directive that gates lines before the lexer sees them.
+summary: `::` attributes a type answers, the sixteen annotations a function takes, the three that lay out or place what they mark, the five a file's header takes, `@assert` which stands on its own, and the `#if` directive that gates lines before the lexer sees them.
 weight: 130
 ---
 
@@ -10,7 +10,7 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@noinline`, `@inline`, `@cold` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@noinline`, `@inline`, `@cold`, `@no_alloc` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@borrows` | an **annotation** on a trait's method — see [`@borrows`](/reference/traits/#a-method-may-promise-to-borrow) | the grammar |
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; the one an `extern` takes | the grammar |
@@ -34,7 +34,7 @@ with. That is a rule about directives, not the thing that distinguishes them.
 Annotations come in groups, by what they attach to — and the last of them is the empty one, which is
 as much a rule as the others.
 
-**On a function** there are fifteen, each written on its own line above the declaration. More than
+**On a function** there are sixteen, each written on its own line above the declaration. More than
 one may be stacked, and writing the same one twice is refused. `@test` and `@tailrec` are below, and
 so are the four hooks a module's tests may declare — `@setup`, `@teardown`, `@setup_all` and
 `@teardown_all` — and the three that tell the optimizer what a definition is for, `@noinline`,
@@ -43,7 +43,8 @@ so are the four hooks a module's tests may declare — `@setup`, `@teardown`, `@
 [verification](/reference/verification/) page; `@export` makes the definition C-callable and is on
 the [FFI](/reference/ffi/) page, beside the `extern` it is the mirror image of; `@crossing(...)` says
 a parameter hands a value to another concurrency domain and is on the
-[memory](/reference/memory/) page, beside the crossing rule it asks.
+[memory](/reference/memory/) page, beside the crossing rule it asks; `@no_alloc`, the one header word a
+function may also carry, holds that one definition to making no heap storage and is below.
 
 **On a type, or on storage** there are four, and three of them are about *where* rather than about
 what the declaration does. `@packed` and `@align(n)` lay out a struct — no interior padding, and the
@@ -57,7 +58,8 @@ rather than placing it, and is on the [FFI](/reference/ffi/) page with the other
 first two say what the whole module may do; `@link` says what its `extern`s need at the linker and
 `@include` what its `c const` and `c type` blocks need at the C compiler; the last says it is scaffolding
 for the module's tests. All five attach to the file rather than to any declaration in it — and
-writing one further down is refused with a message saying where it belongs. The first four are
+writing one further down is refused with a message saying where it belongs, except `@no_alloc` above
+a function or a method, which holds that one definition instead (below). The first four are
 covered under [modules](/reference/modules/) and [FFI](/reference/ffi/), where what they *mean* is;
 `@tests` is below.
 
@@ -87,8 +89,9 @@ print(c.send(&n))
 7
 ```
 
-Everything else is refused, and the line is what the annotation is **about** rather than where it is
-written. "A function" in the list above means a *free* function: what `sysl test` calls, what
+Beside them a member takes the four about the function it lowers to — `@noinline`, `@inline`, `@cold`
+and `@no_alloc`. Everything else is refused, and the line is what the annotation is **about** rather
+than where it is written. "A function" in the list above means a *free* function: what `sysl test` calls, what
 recurses, what a symbol names, how a type is laid out — none of which a member supplies.
 
 ```sysl
@@ -1181,6 +1184,106 @@ and the width is not wrong there — it is not being measured yet. The claim is 
 call, which is the first moment there is anything to settle. A condition that could *never* fold is
 still refused inside a generic, exactly as it is outside one.
 
+## `@no_alloc` on a function — one entry point that makes no heap storage
+
+In a file's header `@no_alloc` gives the allocator up for the whole module
+([modules](/reference/modules/)). **Above one function or method it gives it up for that definition
+alone**, checked by the same two rules through every call the body makes: what the body itself
+*makes* is refused at the outermost allocation, and a call that *reaches* a function that allocates
+is refused at the smallest piece of the body that still arrives there. It is the form for a module
+that has one path that must not allocate beside others that must — an interrupt entry beside the
+system calls that share its file:
+
+```sysl
+boxed(n: int) -> &int = n
+
+@no_alloc
+on_irq(n: int) -> int = n + 1
+
+print(on_irq(1), *boxed(2))
+```
+
+```output
+2 2
+```
+
+`boxed` allocates and is not refused: the promise is `on_irq`'s, not the module's. When the
+promised function reaches an allocation the refusal names the function that made the promise, what
+the far end makes, and the calls between the two — the far end is somebody else's code, and the line
+to change is as often in the middle of the chain as at either end:
+
+```sysl
+boxed(n: int) -> &int = n
+
+middle(n: int) -> int = *boxed(n)
+
+@no_alloc
+on_irq(n: int) -> int = middle(n) + 1
+
+print(on_irq(3))
+```
+
+```error
+which makes a reference, by the call path 'on_irq' → 'middle' → 'boxed', and 'on_irq' declared '@no_alloc'
+```
+
+What the body makes on its own line is refused the same way the module's clause refuses it, naming
+the function instead of the module:
+
+```sysl
+boxed(n: int) -> &int = n
+
+@no_alloc
+shown(n: int) -> usize = str(n).len
+
+print(shown(42))
+```
+
+```error
+the string a value renders as needs an allocator, and 'shown' declared '@no_alloc'
+```
+
+**Directly under the header the word is still the module's clause.** The header is read first, and
+blank lines do not end it, so a file whose first declaration is the promised function has the
+module's clause instead; an `import` or another declaration above the function is what makes it the
+function's. A function in a module that already declared `@no_alloc` is held to the module's clause,
+which says everything the annotation would.
+
+**A method may carry it** — it lowers to a function like any other and is held the same way.
+**A function declared inside another may not**: it is a closure by another spelling, and what it
+captures is boxed by the function around it, outside the body the promise would be written on.
+
+```sysl
+outer(n: int) -> int
+    @no_alloc
+    inner(k: int) -> int = k + n
+
+    inner(1)
+
+print(outer(3))
+```
+
+```error
+'@no_alloc' holds a top-level function or a method, and 'inner' is declared inside another function
+```
+
+Above anything that is not a function — a struct, a binding, an `extern` — it is the module's word
+written in the wrong place, and the refusal says so before naming the other reading:
+
+```sysl
+f() -> int = 1
+
+@no_alloc
+struct P
+    x: int
+
+print(f())
+```
+
+```error
+Above a function or a method, '@no_alloc' holds that one definition instead, and this declares neither
+```
+
 ## `@tailrec` — an assertion that the frame is reused
 
 A function whose last act is a call to itself compiles to a branch back to its own entry rather than
@@ -1844,10 +1947,34 @@ only raise**: asking for less than the fields already need changes nothing, sinc
 The boundary travels with every value of the type the compiler lays down: a module `var` or `val`,
 a `static`, a local, an element of an array, a field of another struct — which begins on the
 boundary and raises its holder's to match — and the payload of an enum variant carrying one.
-**A value on the heap is the exception.** A box (`&T`) or a buffer takes its storage from the
-allocating pair, which promises only what `malloc` does — sixteen bytes — so a boxed value of a type
-aligned beyond that is not guaranteed its boundary, and the compiler claims no more than sixteen
-for any access through an address that might be one.
+**A value on the heap keeps it too.** A box (`&T`), a buffer or a task's frame takes its storage
+from the allocating pair, which promises only what `malloc` does — two words, sixteen bytes on a
+64-bit machine and eight on a 32-bit one — so storage of a type aligned beyond that comes from the
+aligned pair, `sysl_alloc_aligned(size, align)` and `sysl_free_aligned(p)`, and the payload is laid
+after the box's header on the boundary:
+
+```sysl
+@align(4096)
+struct Page
+    e: [512]u64
+
+var p: Page
+p.e[3] = 9
+
+val b: &Page = p
+
+print(usize(&*b) % 4096, b.e[3])
+```
+
+```output
+0 9
+```
+
+Every access through an address of the type claims its whole boundary. With libc's `malloc` and
+`free` on a POSIX system, WASI or Windows the aligned pair needs nothing from the program; anywhere
+else the program answers it,
+as [`packages.md` § A type aligned beyond what the pair promises](/reference/packages/#a-type-aligned-beyond-what-the-pair-promises)
+says.
 
 **The bound is folded rather than lexed**, so a program writes the name it already has for the number,
 and arithmetic over one works:

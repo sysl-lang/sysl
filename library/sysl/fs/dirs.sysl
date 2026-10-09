@@ -36,7 +36,7 @@ current_dir() -> Result[string, IoError]
     var n: usize = 0
     val code = fsys.getcwd(as_mut_ptr(into), into.len, &n)
 
-    if code != 0 then return Err(from_errno(code))
+    if code != 0 then return Err(from_status(code))
 
     from_utf8(into[0..<n]) match
         Ok(s) -> Ok(s)
@@ -147,7 +147,7 @@ make_temp_dir(prefix: string) -> Result[string, IoError]
     var n: usize = 0
     val code = fsys.temp_dir(bytes_at(prefix), prefix.bytes.len, as_mut_ptr(into), into.len, &n)
 
-    if code != 0 then return Err(from_errno(code))
+    if code != 0 then return Err(from_status(code))
 
     from_utf8(into[0..<n]) match
         Ok(s) -> Ok(s)
@@ -186,7 +186,7 @@ end make_dir_all
 // the only reading in the library that answers that is `link_metadata`, one `stat` hook of
 // `sysl.fs.sys`. Following the link instead is not an option: the whole point of the test is that a
 // link pointing out of the tree is unlinked rather than walked into, so a version without it deletes
-// things nobody asked it to. A target whose `stat` hook answers `-1` therefore gets "not supported on
+// things nobody asked it to. A target whose `stat` hook answers `UNSUPPORTED` therefore gets "not supported on
 // this target" from it, never a removal that guessed.
 
 /** A directory and everything under it removed.
@@ -229,7 +229,9 @@ end remove_dir_all
  *
  * **Permissions are carried**, which is where this differs from `copy_file` -- an executable copied
  * with that one stops being executable, and this org copies build inputs. A symbolic link is copied
- * *as a link*, pointing wherever it pointed, which may be nothing and may be outside the tree.
+ * *as a link*, pointing wherever it pointed, which may be nothing and may be outside the tree. A
+ * target whose `chmod` is unsupported has no permission bits to carry, and the copy goes on without
+ * them; any other error from setting them fails the copy.
  *
  * **A failure part way through leaves what it has already written.** Nothing here removes a tree on
  * the way out, because it cannot know whether the destination existed before it started, and
@@ -265,7 +267,11 @@ copy_dir_all(from: string, to: string) -> Result[unit, IoError]
 
             copy_file(e.path, dst)?
 
-        set_permissions(dst, e.meta.permissions())?
+        // A target whose filesystem has no permission bits answers `chmod` as unsupported; there is
+        // nothing to carry there, so that one answer is not a failure. Any other error is.
+        set_permissions(dst, e.meta.permissions()) match
+            Err(err) -> if err != unsupported() then return Err(err)
+            Ok(_) -> ()
 
     Ok(())
 end copy_dir_all

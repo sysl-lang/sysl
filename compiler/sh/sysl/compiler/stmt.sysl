@@ -82,7 +82,9 @@ open_block_group(cx: &Analyzer, stmts: Buf[Stmt])
 
     for item in stmts
         *item.kind match
-            FuncDecl(d) -> cx.pending_nested.push(with_call_bounds(d))
+            FuncDecl(d) ->
+                refuse_nested_forgo(cx, item.span, d)
+                cx.pending_nested.push(with_call_bounds(d))
             _ -> ()
 
     // Every name the block binds, whether or not it has been reached yet. A name bound further down
@@ -115,6 +117,21 @@ open_block_group(cx: &Analyzer, stmts: Buf[Stmt])
 
     cx.awaiting_needs = false
 end open_block_group
+
+// **A `@no_<cap>` is a promise a top-level function or a method makes, and a nested one is refused.**
+// A function declared inside another is a closure by another spelling: what it captures is boxed by
+// the function around it, at the point the group is lowered, so the allocation the promise is about
+// happens outside the body the promise was written on. The function around it is the one whose
+// conduct includes that, so it is the one to mark.
+private refuse_nested_forgo(cx: &Analyzer, at: Span, d: FuncDecl)
+    if d.marks.forgoes.is_empty() then return
+
+    val word = s"@no_${d.marks.forgoes.at(0)}"
+
+    cx.fault(at, s"'$word' holds a top-level function or a method, and '${d.name}' is declared inside " +
+             "another function, which makes it a closure — what it captures is boxed by the function " +
+             s"around it, outside this body. Write '$word' above the function that declares it")
+end refuse_nested_forgo
 
 // Strikes off what a statement just bound, and lowers the pending group once it has them all.
 //

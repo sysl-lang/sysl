@@ -214,20 +214,35 @@ end RecvMode
 // three, so `any` does not count it. An async function's written result has already been made
 // `Task[T]` by the parser (`async_result`), so every caller reads the task; only its own body reads
 // the `T` (`body_result`).
+//
+// `forgoes` rides here for the same reason: `@no_alloc` above a function or a method is said of the
+// declaration, and every lowered copy of it -- a member's free function, a generic's body -- has to
+// carry the promise to where the whole-program check reads it. It holds the word after `no_`
+// (`"alloc"`), one entry per capability the definition gives up, and is not one of the optimizer's
+// three either.
 struct FuncMarks
     noinline: bool
     cold: bool
     inline: bool
     async_at: Option[Span]
+    forgoes: Buf[string]
 
     // Whether any of the three was written.
     any(self) -> bool = self.noinline || self.cold || self.inline
 
     is_async(self) -> bool = self.async_at.is_some()
+
+    // Whether this definition gave up the capability written `@no_<cap>` above it.
+    gives_up(self, cap: string) -> bool
+        for item in self.forgoes
+            if item == cap then return true
+
+        false
+    end gives_up
 end FuncMarks
 
 // A definition nothing was said about.
-no_marks() -> FuncMarks = FuncMarks(false, false, false, None)
+no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf())
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -372,6 +387,8 @@ enum Attr
     Inline
     Cold
     ThreadLocal
+    // `@no_alloc` above a function or a method: the capability it gives up, as the word after `no_`.
+    Forgoes(cap: string)
 end Attr
 
 // The word an attribute is written as, which is what a complaint about it names.
@@ -395,6 +412,7 @@ attr_word(a: Attr) -> string = a match
     Inline -> "inline"
     Cold -> "cold"
     ThreadLocal -> "thread_local"
+    Forgoes(cap) -> s"no_$cap"
 
 // A foreign function's declaration.
 struct ExternDecl

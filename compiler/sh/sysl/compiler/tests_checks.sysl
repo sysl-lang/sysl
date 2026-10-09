@@ -551,6 +551,55 @@ a_call_that_reaches_an_allocation()
                 "'@no_alloc' — an allocator-free module may only call what is allocator-free itself"),
            listed_of(out))
 
+// **The reader is told about what they called**: the function written at the call, with the
+// allocating function under it as the reason -- never only an internal they did not write.
+@test("a call arriving through another function names the function it called, and why")
+rnc_names_the_function_called()
+    if checks_no_library() then return
+
+    val out = complaints_of(allocator_free() + "private mk() -> &int = 1\n\n" +
+                            "private outer() -> int = *mk()\n\ngo()\n    val x = outer()\n")
+
+    assert(says(out, "this reaches 'mm.outer', which makes heap storage through 'mm.mk', and this " +
+                "module declared '@no_alloc' — an allocator-free module may only call what is " +
+                "allocator-free itself"),
+           listed_of(out))
+
+// The least SEED overall would be `aa_mk` for both, which is what each refusal used to say.
+@test("two calls in one body each name the function they called")
+rnc_two_calls_name_their_own()
+    if checks_no_library() then return
+
+    val out = complaints_of(allocator_free() + "private aa_mk() -> &int = 1\n\n" +
+                            "private zz_mk() -> &int = 2\n\n" +
+                            "private beta() -> int = *zz_mk()\n\n" +
+                            "private alpha() -> int = *aa_mk() + *zz_mk()\n\n" +
+                            "go()\n    val x = beta()\n    val y = alpha()\n")
+
+    assert(says(out, "this reaches 'mm.beta', which makes heap storage through 'mm.zz_mk', and " +
+                "this module declared '@no_alloc' — an allocator-free module may only call what is " +
+                "allocator-free itself"),
+           listed_of(out))
+    assert(says(out, "this reaches 'mm.alpha', which makes heap storage through 'mm.aa_mk', and " +
+                "this module declared '@no_alloc' — an allocator-free module may only call what is " +
+                "allocator-free itself"),
+           listed_of(out))
+
+// A function that allocates in its own body is what was called and what allocates, so nothing
+// follows it -- and the allocation the body makes is told at the allocation, as before.
+@test("a call of a function that allocates itself names it alone")
+rnc_a_direct_allocation_is_unchanged()
+    if checks_no_library() then return
+
+    val out = complaints_of(allocator_free() + "private mk() -> &int = 1\n\n" +
+                            "private zz() -> int = 3\n\ngo()\n    val x = *mk() + zz()\n")
+
+    assert(says(out, needs_one("a reference")), listed_of(out))
+    assert(says(out, "this reaches 'mm.mk', which makes heap storage, and this module declared " +
+                "'@no_alloc' — an allocator-free module may only call what is allocator-free itself"),
+           listed_of(out))
+    assert(!listed_of(out).contains(" through "), listed_of(out))
+
 @test("a module that gave nothing up may allocate as it likes")
 a_module_with_no_clause()
     if checks_no_library() then return
@@ -806,9 +855,10 @@ a_reference_that_arrives_through_another()
     val out = stmt_diagnostics("module mm\n@no_os\n\n@needs(os)\nprivate opens() -> int = 1\n\n" +
                                "private mid() -> int = opens()\n\ngo()\n    val n = mid()\n")
 
-    // The SEED is what a message names, and `mid` declares nothing: what a reader has to change is
-    // the reference, and what it reaches is the declaration that asked for the capability.
-    assert(says(out, "this reaches 'mm.opens', which needs 'os', and 'mm' declared '@no_os'"),
+    // What the reference CALLED is what a message names, and the declaration that asked for the
+    // capability follows it as the reason: `mid` declares nothing, but it is what the reader wrote.
+    assert(says(out, "this reaches 'mm.mid', which needs 'os' through 'mm.opens', and 'mm' declared " +
+                "'@no_os'"),
            listed_of(out))
 
 @test("giving up 'os' gives up 'posix' with it, since posix needs os")
