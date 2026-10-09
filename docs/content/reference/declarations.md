@@ -579,6 +579,168 @@ tail lives in that frame. An `extern` is refused too — its frame is C's — an
 large to come back in a register, which travels through a pointer the replaced frame's caller
 supplied.
 
+### `@abandons` — a call that leaves its caller for good
+
+A call to a function answering `never` does not come back, and two kinds of departure look alike at
+the call. A trap, a `panic`, C's `exit`: the program is over, and what its frames hold is left exactly
+as it is — the state a debugger or a core file wants to see, which is why a trap runs nothing. A
+thread that ends, or a jump back to a context saved earlier: the program **goes on**, and the stack
+the call was made on is never resumed, so every count a frame on it holds is storage nothing will
+ever free.
+
+`@abandons` says a function is the second kind. **A call to one ends the caller's frame first,
+exactly as a `return` would** — its deferred statements run, then its counts are given back — and
+then the call is made:
+
+```sysl
+struct Node
+    v: int
+
+impl Drop for Node
+    drop(self)
+        print("dropped", self.v)
+
+@abandons
+finish() -> never
+    exit(0)
+
+work()
+    val n: &Node = Node(7)
+
+    defer print("deferred", n.v)
+
+    print("working")
+    finish()
+
+work()
+```
+
+```output
+working
+deferred 7
+dropped 7
+```
+
+Without the annotation the same program prints `working` and nothing else: `exit` ends the process
+with the node still counted, which is what a trap should do. That is why `panic`, `assert` and the
+library's `exit` are not `@abandons`, and why nothing changes for a program that never writes it.
+
+It marks an `extern` as well, which is where a context switch or a `longjmp` written in assembly is
+declared:
+
+```sysl
+@abandons
+extern "leave_user" leave_user(kernel: *u64, status: u64) -> never
+```
+
+#### What an `@abandons` function requires
+
+It answers `never`, since a call that comes back has left nothing:
+
+```sysl
+@abandons
+finish() -> int = 0
+
+print(finish())
+```
+
+```error
+'@abandons' says a call to 'finish' never comes back, so 'finish' answers 'never' — this one answers 'int'
+```
+
+**No parameter may carry a count.** The caller's frame is given back before the call, and the
+callee never returns to give back what its own parameters hold, so nothing would. Pass what it needs
+as a value that carries no count, or through a `*T` — `become`'s rule, for `become`'s reason. A type
+parameter is refused for the same one, since it may be such a type:
+
+```sysl
+@abandons
+finish(why: string) -> never
+    exit(1)
+
+finish("done")
+```
+
+```error
+nothing is left to give back the count its parameter 'why' holds
+```
+
+#### A frame further down holds nothing across the call
+
+The caller is given back; the frames below it are abandoned too, and cannot be, because a function
+that merely *reaches* an `@abandons` call may also come back. So the compiler follows the calls — as
+it does for [`@no_alloc`](/reference/modules/) — and refuses a frame that holds something across a
+call that can arrive at one: a counted local, a binding a `match` took a share of, a counted
+temporary the enclosing expression made, or a `defer` still to run.
+
+```sysl
+@abandons
+leave(code: int) -> never
+    exit(code)
+
+handle(n: int)
+    if n == 0 then leave(1)
+
+run()
+    val s = str(1) + "x"
+
+    handle(2)
+    print(s)
+
+run()
+```
+
+```error
+'handle' can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call
+```
+
+The repair is the one the message names: hold the value in a function that returns before the call
+is made, which leaves the frame that makes it holding nothing.
+
+```sysl
+@abandons
+leave(code: int) -> never
+    exit(code)
+
+handle(n: int)
+    if n == 0 then leave(1)
+
+show()
+    val s = str(1) + "x"
+
+    print(s)
+
+run()
+    show()
+    handle(2)
+    print("done")
+
+run()
+```
+
+```output
+1x
+done
+```
+
+**A call through a value or a trait object cannot be followed**, so nothing that can arrive at an
+`@abandons` call may become one — not the function's address, not a closure or function that reaches
+it, and not a type whose table for a trait object holds one:
+
+```sysl
+@abandons
+leave(code: int) -> never
+    exit(code)
+
+val p = &leave
+
+print(1)
+```
+
+```error
+'leave' is '@abandons', and a call through a value cannot be followed to it
+```
+
 ### Several results
 
 A signature may declare more than one result, and the trailing expression or `return` supplies them

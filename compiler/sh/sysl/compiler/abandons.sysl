@@ -1,0 +1,545 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+
+// `@abandons` -- a call that never comes back, after which the program goes on without the frames
+// below it (`reference/declarations.md § A call that abandons its caller`).
+//
+// **Two kinds of `-> never` look alike at the call and are opposites.** A trap, a `panic`, C's
+// `exit`: the program is over, and the counts its frames hold are left exactly as they are, which is
+// what a debugger and a core file want to see -- `defer` runs nothing there either. A thread's `exit`
+// or a `longjmp` back to a saved context: the program goes on, the stack the call was made on is
+// never resumed, and every count a frame on it holds is a block nothing will ever free. The
+// annotation is what tells the second kind from the first, so a program that writes none of it pays
+// nothing and changes nothing.
+//
+// What it does is two things, one for each place a frame can stand:
+//
+//   1. **The caller of an `@abandons` function ends its frame before the call** (`emit_expr.sysl`'s
+//      `gen_call`): deferred statements, then counts, exactly as a `return` would, once the arguments
+//      are in hand. So no parameter of one may carry a count -- nothing would give it back.
+//   2. **A frame further down is refused rather than repaired.** A function that can REACH an
+//      `@abandons` call through others may also come back, so nothing can be given back before
+//      calling it; what is refused is holding something across that call -- a counted local, a
+//      binding a `match` took a share of, a counted temporary of the enclosing expression, a pending
+//      `defer`. Which functions can reach one is the call graph's answer, as `@no_alloc`'s is.
+//
+// **A call through a value is not followed, so nothing that can abandon may become a value**: not an
+// `@abandons` function's address, not a function or closure that reaches one, and not a type whose
+// table for a trait object holds one.
+
+// The keys of every `@abandons` function and `extern` this program reaches.
+private abandoning_names(funcs: Buf[TFunc], externs: Buf[TExtern]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for f in funcs
+        if f.marks.abandons then out.push(f.name)
+
+    for x in externs
+        if x.abandons then out.push(x.name)
+
+    out
+end abandoning_names
+
+// -- the declaration --------------------------------------------------------------------------------
+
+// What an `@abandons` declaration owes, asked where its signature is resolved: a result of `never`,
+// no type parameter, and no parameter that carries a count.
+check_abandons_signature(a: &Analysis, scope: Scope, at: Span, name: string, generic: bool,
+                         params: Buf[(string, Type)], result: Type)
+    if !(result == Never)
+        a.fault(scope, at, s"'@abandons' says a call to '${name}' never comes back, so '${name}' answers 'never' — this one answers '${type_show(result)}'")
+        return
+
+    if generic
+        a.fault(scope, at, s"'${name}' is '@abandons', so its caller's frame is given back before the call — and a type parameter may be a type that carries a count, which nothing would then give back. Write it for the types it takes")
+        return
+
+    for p in params
+        if contains_counted(p.1)
+            a.fault(scope, at, s"'${name}' is '@abandons', so its caller's frame is given back before the call and nothing is left to give back the count its parameter '${p.0}' holds — a '${type_show(p.1)}' carries one. Pass what it needs as a value that carries no count, or through a '*T'")
+            return
+end check_abandons_signature
+
+// -- the program --------------------------------------------------------------------------------------
+
+// Which functions can arrive at an abandoning call, worked out over the call graph until nothing new
+// joins: an abandoning function itself, and every function whose body names one that can.
+private may_abandon(funcs: Buf[TFunc], seeds: Buf[string]) -> Set[string]
+    var out: Set[string] = set()
+
+    for item in seeds
+        out.add(item)
+
+    var calls: Buf[(string, Buf[string])] = buf()
+
+    for f in funcs
+        calls.push((f.name, refs_of_block(f.body).calls))
+
+    var growing = true
+
+    while growing
+        growing = false
+
+        for item in calls
+            if out.has(item.0) then continue
+
+            for callee in item.1
+                if out.has(callee)
+                    out.add(item.0)
+                    growing = true
+                    break
+
+    out
+end may_abandon
+
+// What one body's walk needs: the two sets, where to report, and which places have been reported.
+struct Abandoning
+    seeds: Set[string]
+    reach: Set[string]
+    vtables: Buf[TVtable]
+    scope: Scope
+    is_async: bool
+    said: Set[string]
+end Abandoning
+
+// Holds every body to what an abandoning call needs of it.
+check_abandons(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern], vtables: Buf[TVtable])
+    val names = abandoning_names(funcs, externs)
+
+    // A program that declares nothing `@abandons` -- almost all of them -- pays for no walk at all.
+    if names.is_empty() then return
+
+    var seeds: Set[string] = set()
+
+    for item in names
+        seeds.add(item)
+
+    val cx: &Abandoning = Abandoning(seeds, may_abandon(funcs, names), vtables, empty_scope(), false,
+                                     set())
+
+    for f in funcs
+        cx.scope = func_home(a, f.name)
+        cx.is_async = f.marks.is_async()
+
+        scan_block(a, cx, f.body, held_on_entry(f))
+end check_abandons
+
+// What a frame holds before its body has run: nothing, because a parameter is its caller's to hold
+// (`borrowing.sysl`) -- except where something outside sysl's convention may call it, when the
+// count it arrived with is the frame's own.
+private held_on_entry(f: TFunc) -> string
+    if f.exported.is_none() && f.conv.is_none() then return ""
+
+    for p in f.params
+        if contains_counted(p.1) then return s"the parameter '${shown_local(p.0)}'"
+
+    ""
+end held_on_entry
+
+// A local's unique name as its reader wrote it: a second binding of one name in a frame is `x.1`.
+private shown_local(name: string) -> string
+    val b = name.bytes
+
+    for i in 0..<b.len
+        if b[i] == u8('.') then return name[0..<i]
+
+    name
+end shown_local
+
+// -- the walk ---------------------------------------------------------------------------------------
+//
+// `held` says what the frame is holding at the point being read, the empty string for nothing. It
+// grows down a block as counted locals and `defer`s are declared, into a branch with what the branch
+// binds, and along an expression with each counted temporary an earlier operand left -- so a call is
+// asked about with exactly what is live across it.
+
+private scan_block(a: &Analysis, cx: &Abandoning, b: TBlock, held: string)
+    val h = scan_stmts(a, cx, b.stmts, held)
+
+    if b.result.is_some() then scan(a, cx, b.result.unwrap(), h)
+
+// The statements of one block, answering what the frame holds after the last of them.
+private scan_stmts(a: &Analysis, cx: &Abandoning, stmts: Buf[TStmt], held: string) -> string
+    var h = held
+
+    for s in stmts
+        s match
+            TVarDecl(name, ty, init, _) ->
+                scan(a, cx, init, h)
+
+                if h == "" && contains_counted(ty) then h = s"'${shown_local(name)}'"
+            TExprStmt(e) -> scan(a, cx, e, h)
+            TInvariant(cond, _) -> scan(a, cx, cond, h)
+            TVariantCheck(_, _, e) -> scan(a, cx, e, h)
+            TRefDecl(_, _, place) -> scan(a, cx, place, h)
+            TWriteStmt(w) -> scan_write(a, cx, w, h)
+            TMultiAssign(writes) ->
+                for w in writes
+                    scan_write(a, cx, w, h)
+            TReturn(value) -> if value.is_some() then scan(a, cx, value.unwrap(), h)
+
+            // A `become` gives the frame back before it jumps, so the call it makes holds nothing;
+            // only what its arguments do on the way is asked about.
+            TBecome(call) -> scan_kids(a, cx, call, h)
+            TBreak(value, _) -> if value.is_some() then scan(a, cx, value.unwrap(), h)
+            TContinue(_) -> ()
+
+            // A deferred statement runs when the block is left, so the frame owes it from here on --
+            // and it is itself read with what the block holds by then, which is at least this.
+            TDefer(body) ->
+                val _ = scan_stmts(a, cx, body, h)
+
+                if h == "" then h = "a 'defer' still to run"
+            TAsm(_, _, _, _) -> ()
+
+    h
+end scan_stmts
+
+private scan_write(a: &Analysis, cx: &Abandoning, w: TWrite, held: string)
+    scan(a, cx, w.place, held)
+    scan(a, cx, w.value, held)
+
+// One expression and everything under it.
+private scan(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
+    *e.kind match
+        TIf(cond, then_block, else_block, _) ->
+            val h = scan_terms(a, cx, cond, held)
+
+            scan_block(a, cx, then_block, h)
+
+            if else_block.is_some() then scan_block(a, cx, else_block.unwrap(), h)
+        TMatch(scrutinee, arms, _) ->
+            scan(a, cx, scrutinee, held)
+
+            val sty = texpr_type(scrutinee)
+            val after = with_temp(held, scrutinee)
+
+            for arm in arms
+                var h = after
+
+                if h == ""
+                    for p in arm.patterns
+                        if binds_counted(p, sty) then h = "a binding this arm took a share of"
+
+                if arm.guard.is_some() then scan(a, cx, arm.guard.unwrap(), h)
+
+                scan_block(a, cx, arm.body, h)
+        TBlockExpr(block) -> scan_block(a, cx, block, held)
+        TWhile(cond, body, else_block, _) ->
+            val h = scan_terms(a, cx, cond, held)
+            val _ = scan_stmts(a, cx, body, h)
+
+            if else_block.is_some() then scan_block(a, cx, else_block.unwrap(), held)
+        TDoWhile(body, cond, else_block, _) ->
+            val _ = scan_stmts(a, cx, body, held)
+
+            scan(a, cx, cond, held)
+
+            if else_block.is_some() then scan_block(a, cx, else_block.unwrap(), held)
+        TLoop(body, _) ->
+            val _ = scan_stmts(a, cx, body, held)
+        TFor(_, _, lo, hi, _, body, else_block, _) ->
+            scan(a, cx, lo, held)
+            scan(a, cx, hi, held)
+
+            val _ = scan_stmts(a, cx, body, held)
+
+            if else_block.is_some() then scan_block(a, cx, else_block.unwrap(), held)
+        TCFor(init, cond, step, body, else_block, _) ->
+            val h = scan_stmts(a, cx, init, held)
+
+            if cond.is_some() then scan(a, cx, cond.unwrap(), h)
+
+            val _ = scan_stmts(a, cx, step, h)
+            val _ = scan_stmts(a, cx, body, h)
+
+            if else_block.is_some() then scan_block(a, cx, else_block.unwrap(), h)
+        TForEach(name, elem_ty, seq, body, else_block, _) ->
+            scan(a, cx, seq, held)
+
+            var h = with_temp(held, seq)
+
+            if h == "" && contains_counted(elem_ty) then h = s"'${shown_local(name)}'"
+
+            val _ = scan_stmts(a, cx, body, h)
+
+            if else_block.is_some() then scan_block(a, cx, else_block.unwrap(), held)
+        TIterate(cursor, cursor_ty, init, next, bind, body, else_block, _) ->
+            scan(a, cx, init, held)
+
+            var h = held
+
+            if h == "" && contains_counted(cursor_ty) then h = s"'${shown_local(cursor)}'"
+
+            scan(a, cx, next, h)
+
+            if h == "" && binds_counted(bind, texpr_type(next)) then h = "a binding this loop took a share of"
+
+            val _ = scan_stmts(a, cx, body, h)
+
+            if else_block.is_some() then scan_block(a, cx, else_block.unwrap(), held)
+        TQuantifier(_, _, _, lo, hi, _, pred) ->
+            scan(a, cx, lo, held)
+            scan(a, cx, hi, held)
+            scan(a, cx, pred, held)
+        TCheckedLoop(_, _, loop_expr) -> scan(a, cx, loop_expr, held)
+        _ -> scan_kids(a, cx, e, held)
+end scan
+
+// A node with no block under it: its operands in the order they run, then the node itself, with what
+// the earlier operands left behind.
+private scan_kids(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
+    var h = held
+
+    for k in kids(e)
+        scan(a, cx, k, h)
+        h = with_temp(h, k)
+
+    check_node(a, cx, e, h)
+end scan_kids
+
+// A condition's terms in order; what an `is` binds is held by everything after it, the branch it
+// guards included.
+private scan_terms(a: &Analysis, cx: &Abandoning, terms: Buf[TCondTerm], held: string) -> string
+    var h = held
+
+    for t in terms
+        t match
+            TCondTest(c) ->
+                scan(a, cx, c, h)
+                h = with_temp(h, c)
+            TCondIs(subject, patterns, _) ->
+                scan(a, cx, subject, h)
+                h = with_temp(h, subject)
+
+                if h == ""
+                    for p in patterns
+                        if binds_counted(p, texpr_type(subject)) then h = "a binding this condition took a share of"
+
+    h
+end scan_terms
+
+// What the frame holds once `x` has been evaluated: a counted value read straight out of a local is
+// the local's own count, which the block already says; anything else counted is a temporary.
+private with_temp(held: string, x: TExpr) -> string
+    if held != "" then return held
+    if !contains_counted(texpr_type(x)) then return ""
+
+    *x.kind match
+        TLoad(_, _) -> ""
+        _ -> "a counted temporary the enclosing expression is still holding"
+end with_temp
+
+// Whether a pattern binds anything that carries a count, read against the type of what it matches.
+private binds_counted(p: TPattern, ty: Type) -> bool = p match
+    TBindPattern(_, t) -> contains_counted(t)
+    TAtPattern(_, inner) -> contains_counted(ty) || binds_counted(*inner, ty)
+    TVariantPattern(_, variant, args) -> args_bind_counted(args, variant.fields)
+    TStructPattern(decl, args) -> args_bind_counted(args, decl.fields)
+    _ -> false
+
+private args_bind_counted(args: Buf[TPattern], fields: Buf[(string, Type)]) -> bool
+    for i in 0..<args.len()
+        val ty = if i < fields.len() then fields.at(i).1 else Unknown
+
+        if binds_counted(args.at(i), ty) then return true
+
+    false
+end args_bind_counted
+
+// -- the node itself ---------------------------------------------------------------------------------
+
+private check_node(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
+    *e.kind match
+        TFuncAddr(name, _, _) ->
+            if cx.reach.has(name) then say(a, cx, e.span, made_a_value(cx, name))
+            return
+        TErase(_, vtable, _) ->
+            val reached = erased_reach(cx, vtable)
+
+            if reached.is_some() then say(a, cx, e.span, erased_refusal(cx, reached.unwrap()))
+            return
+        _ -> ()
+
+    for name in own_refs(e).calls
+        if cx.seeds.has(name)
+            if cx.is_async then say(a, cx, e.span, async_refusal(name))
+        else if cx.reach.has(name) && held != ""
+            say(a, cx, e.span, held_refusal(name, held))
+end check_node
+
+// A refusal said once per place, an instantiation of a generic body being the same lines again.
+private say(a: &Analysis, cx: &Abandoning, at: Span, message: string)
+    if !cx.said.add(s"${cx.scope.src.name}:${at.start}:${at.end}") then return
+
+    a.fault(cx.scope, at, message)
+
+// The first function in a trait object's table that can arrive at an abandoning call.
+private erased_reach(cx: &Abandoning, vtable: string) -> Option[string]
+    for t in cx.vtables
+        if t.name != vtable then continue
+
+        for slot in t.slots
+            if cx.reach.has(slot.target) then return Some(slot.target)
+
+    None
+end erased_reach
+
+private held_refusal(name: string, held: string) -> string =
+    s"'${qualified_name(name)}' can reach a call that abandons every frame below it and never comes back, and this frame holds ${held} across the call — its count would never be given back. Give it back first: hold it in a function that returns before this call is made, or as a '*T'"
+
+private made_a_value(cx: &Abandoning, name: string) -> string
+    if cx.seeds.has(name)
+        return s"'${qualified_name(name)}' is '@abandons', and a call through a value cannot be followed to it, so its caller would not give its frame back first — call it by name"
+
+    s"'${qualified_name(name)}' can reach a call that abandons every frame below it, and a call through a value cannot be followed there, so whoever calls this value could hold a count across it unseen — call it by name"
+
+private erased_refusal(cx: &Abandoning, name: string) -> string =
+    s"'${qualified_name(name)}' can reach a call that abandons every frame below it, and a call through a trait object cannot be followed there, so whoever calls through this object could hold a count across it unseen — call it on the type itself"
+
+private async_refusal(name: string) -> string =
+    s"'${qualified_name(name)}' is '@abandons', so its caller gives back its frame before the call — and an 'async' function's frame is its task's, which may still be awaited. Call it from an ordinary function"
+
+// -- the operands of a node with no block under it, in the order they run ------------------------------
+
+private kids(e: TExpr) -> Buf[TExpr]
+    var out: Buf[TExpr] = buf()
+
+    *e.kind match
+        TBox(value, _) -> out.push(value)
+        TDowngrade(value, _) -> out.push(value)
+        TUpgrade(value, _, _, _) -> out.push(value)
+        TArrayLit(elems, _) -> push_all(&out, elems)
+        TArrayFill(value, _) -> out.push(value)
+        TVectorLit(lanes, _) -> push_all(&out, lanes)
+        TSplat(value, _) -> out.push(value)
+        TLane(receiver, _, _) -> out.push(receiver)
+        TVecCompare(_, left, right, _) ->
+            out.push(left)
+            out.push(right)
+        TSelect(mask, when_true, when_false, _) ->
+            out.push(mask)
+            out.push(when_true)
+            out.push(when_false)
+        TReduce(_, receiver, _) -> out.push(receiver)
+        TVecLoad(receiver, index, _) ->
+            out.push(receiver)
+            out.push(index)
+        TVecStore(receiver, index, value) ->
+            out.push(receiver)
+            out.push(index)
+            out.push(value)
+        TBufLit(elems, _) -> push_all(&out, elems)
+        TBufFill(value, count, _) ->
+            out.push(value)
+            out.push(count)
+        TIndex(receiver, index, _) ->
+            out.push(receiver)
+            out.push(index)
+        TLen(receiver, _) -> out.push(receiver)
+        TBytes(receiver) -> out.push(receiver)
+        TSlice(base, lo, hi, _, _) ->
+            out.push(base)
+            push_opt(&out, lo)
+            push_opt(&out, hi)
+        TCast(operand, _) -> out.push(operand)
+        TConstrainedCheck(value, _) -> out.push(value)
+        TConstrainedValid(value, _) -> out.push(value)
+        TConstrainedStep(value, _, _, _) -> out.push(value)
+        TDeref(operand, _) -> out.push(operand)
+        TTypeId(receiver, _) -> out.push(receiver)
+        TAddrOf(place, _) -> out.push(place)
+        TTempAddr(value, _) -> out.push(value)
+        TStore(place, value, _) ->
+            out.push(place)
+            out.push(value)
+        TUpdate(place, _, value, _, _, _) ->
+            out.push(place)
+            out.push(value)
+        TIncDec(place, _, _, _, _) -> out.push(place)
+        TBinary(_, left, right, _) ->
+            out.push(left)
+            out.push(right)
+        TUnary(_, operand, _) -> out.push(operand)
+        TIntOp(_, operand, amount, _, _) ->
+            out.push(operand)
+            push_opt(&out, amount)
+        TAtomic(_, addr, ops, _, _, _) ->
+            out.push(addr)
+            push_all(&out, ops)
+        TSlots(_, args, _, _) -> push_all(&out, args)
+        TSysOp(_, _, args) -> push_all(&out, args)
+        TLogical(_, left, right) ->
+            out.push(left)
+            out.push(right)
+        TCompare(operands, _) -> push_all(&out, operands)
+        TSeq(exprs) -> push_all(&out, exprs)
+        TStr(arg) -> out.push(arg)
+        TFromBytes(arg) -> out.push(arg)
+        TStrView(arg) -> out.push(arg)
+        TConstView(arg) -> out.push(arg)
+        TFormat(arg, _, counts) ->
+            out.push(arg)
+            push_all(&out, counts)
+        TRender(value, _, spec, _) ->
+            out.push(value)
+            out.push(spec)
+        TCall(_, args, _, _) -> push_all(&out, args)
+        TCallPtr(callee, args, _, _) ->
+            out.push(callee)
+            push_all(&out, args)
+        TErase(operand, _, _) -> out.push(operand)
+        TVCall(receiver, _, args, _, _) ->
+            out.push(receiver)
+            push_all(&out, args)
+        TVaStart(ap) -> out.push(ap)
+        TVaEnd(ap) -> out.push(ap)
+        TVaArg(ap, _) -> out.push(ap)
+        TVaCopy(dst, src) ->
+            out.push(dst)
+            out.push(src)
+        TVaPass(ap) -> out.push(ap)
+        TStructNew(_, args) -> push_all(&out, args)
+        TStructInvCheck(value, _, _) -> out.push(value)
+        TRecheck(after, recv, _, _) ->
+            out.push(after)
+            out.push(recv)
+        TEnumNew(_, _, args) -> push_all(&out, args)
+        TEnumFromInt(value, _) -> out.push(value)
+        TEnumTry(value, _, _, _, _) -> out.push(value)
+        TEnumAttr(_, _, arg, _) -> out.push(arg)
+        TTry(operand, _, _, _, _, _, _) -> out.push(operand)
+        TAwait(operand, _) -> out.push(operand)
+        TBlockOn(operand, _) -> out.push(operand)
+        TStep(task, wake) ->
+            out.push(task)
+            out.push(wake)
+        TPark(register) -> out.push(register)
+        TField(receiver, _, _) -> out.push(receiver)
+        _ -> ()
+
+    out
+end kids
+
+private push_all(out: *Buf[TExpr], es: Buf[TExpr])
+    for item in es
+        out.push(item)
+
+private push_opt(out: *Buf[TExpr], e: Option[TExpr])
+    if e.is_some() then out.push(e.unwrap())
+
+// A function's parameters at the types they were written as, for the signature check; a generic one
+// is refused before its parameters are asked about, so they are not read.
+resolved_params(a: &Analysis, scope: Scope, params: Buf[Param], generic: bool) -> Buf[(string, Type)]
+    var out: Buf[(string, Type)] = buf()
+
+    if generic then return out
+
+    for p in params
+        out.push((p.name, resolve_type(a, scope, p.typ, no_bindings())))
+
+    out
+end resolved_params

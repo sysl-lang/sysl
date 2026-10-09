@@ -707,7 +707,8 @@ end parse_func_body
 //
 // **An `extern` declares no type parameters**: there is no body to monomorphize, and a foreign
 // symbol is one function at one signature.
-parse_extern_decl(p: *Parser, start: Span, vis: Visibility, needs: Buf[string]) -> Stmt
+parse_extern_decl(p: *Parser, start: Span, vis: Visibility, needs: Buf[string],
+                  abandons: bool) -> Stmt
     p.bump()
 
     var link: Option[string] = None
@@ -717,6 +718,8 @@ parse_extern_decl(p: *Parser, start: Span, vis: Visibility, needs: Buf[string]) 
             p.bump()
             link = Some(v)
         _ -> ()
+
+    if abandons && (p.at_kw("var") || p.kw_at(1, ":")) then p.fault(start, abandoned_storage())
 
     if p.at_kw("var") then return parse_extern_var(p, start, vis, link, needs)
 
@@ -761,8 +764,11 @@ parse_extern_decl(p: *Parser, start: Span, vis: Visibility, needs: Buf[string]) 
     if p.accept_kw("->") then ret = Some(parse_type(p))
 
     stmt(start.to(p.just_taken()), ExternDecl(ExternDecl(name, params, ret, variadic, link, vis,
-        needs)))
+        needs, abandons)))
 end parse_extern_decl
+
+private abandoned_storage() -> string =
+    "'@abandons' says a call never comes back and the program goes on without the caller's frame, and an 'extern' variable is storage, which nothing calls — it marks an 'extern' function"
 
 private parse_extern_var(p: *Parser, start: Span, vis: Visibility, link: Option[string],
                          needs: Buf[string]) -> Stmt

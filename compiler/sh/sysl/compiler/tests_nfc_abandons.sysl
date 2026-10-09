@@ -1,0 +1,411 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `@abandons` (`reference/declarations.md § @abandons — a call that leaves its caller for good`):
+// a call to such a function gives the caller's frame back first -- deferred statements, then
+// counts -- and a frame further down that can reach one is refused if it holds anything across the
+// call. The run-time claims are made on the counted heap, which says at exit what was never given
+// back; a plain `-> never` call is the control, keeping every count as a trap does.
+
+private struct NfcRun
+    ok: bool
+    out: string
+    err: string
+
+private nfc_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end nfc_ready
+
+// The program built with the counted heap and run.
+private nfc_run(text: string) -> NfcRun
+    val root = make_temp_dir("sysl-nfc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return NfcRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> NfcRun(false, "could not be started", "")
+        Ok(o) -> NfcRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end nfc_run
+
+private nfc_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+// A refusal carries this message, anchored at this `line:column` of `main.sysl`.
+private nfc_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> main.sysl:$at\n"), said)
+
+// A frame holding a box with a destructor and a pending `defer`, ending in a call to `finish`;
+// `mark` is written above `finish`.
+private nfc_frame(mark: string) -> string = s"""
+    struct Node
+        v: int
+
+    impl Drop for Node
+        drop(self)
+            print("dropped", self.v)
+
+    $mark
+    finish() -> never
+        exit(0)
+
+    work()
+        val n: &Node = Node(7)
+
+        defer print("deferred", n.v)
+
+        print("working")
+        finish()
+
+    work()
+    """
+
+@test("a call to an '@abandons' function runs the frame's deferred statements and gives its counts back first")
+nfc_the_frame_is_given_back_before_the_call()
+    if !nfc_ready() then return
+
+    val run = nfc_run(nfc_frame("@abandons"))
+
+    assert(run.ok, run.out)
+    assert(run.out == "working\ndeferred 7\ndropped 7\n", run.out)
+    assert(alloc_count_reported(run.err) == 0, run.err)
+
+@test("a plain '-> never' call keeps every count, as a trap does")
+nfc_a_plain_never_call_keeps_the_counts()
+    if !nfc_ready() then return
+
+    val run = nfc_run(nfc_frame(""))
+
+    assert(run.ok, run.out)
+    assert(run.out == "working\n", run.out)
+    assert(alloc_count_reported(run.err) == 1, run.err)
+
+// Keel's thread entry: the closure is taken out of the thread, called, and the thread ends. The share
+// the `match` took and the local holding the job are both given back before `finish`.
+private nfc_thread(mark: string) -> string = s"""
+    struct Thread
+        entry: Option[&Fn() -> unit]
+
+    static var th = Thread(None)
+
+    $mark
+    finish() -> never
+        exit(0)
+
+    thread_entry(t: *Thread) -> never
+        val job = t.entry
+
+        t.entry = None
+
+        job match
+            Some(f) ->
+                f()
+                finish()
+            None -> finish()
+
+    val n = 3
+
+    th.entry = Some(() -> print("ran", n))
+    thread_entry(&th)
+    """
+
+@test("a thread that ends by an '@abandons' call gives back the closure it ran")
+nfc_a_thread_entry_leaks_nothing()
+    if !nfc_ready() then return
+
+    val run = nfc_run(nfc_thread("@abandons"))
+
+    assert(run.ok, run.out)
+    assert(run.out == "ran 3\n", run.out)
+    assert(alloc_count_reported(run.err) == 0, run.err)
+
+@test("without the mark the same thread entry leaks the closure, which is what keel found")
+nfc_a_thread_entry_without_the_mark_leaks()
+    if !nfc_ready() then return
+
+    val run = nfc_run(nfc_thread(""))
+
+    assert(run.ok, run.out)
+    assert(run.out == "ran 3\n", run.out)
+    assert(alloc_count_reported(run.err) > 0, run.err)
+
+// The text of one function out of a module, from its `define` to its closing brace.
+private nfc_body(ir: string, symbol: string) -> string
+    val start = ir.find(s"@$symbol(")
+
+    if start.is_none() then return ""
+
+    val rest = ir[start.unwrap()..]
+    val close = rest.find("\n}\n")
+
+    if close.is_none() then rest else rest[0..<close.unwrap()]
+end nfc_body
+
+@test("the release is emitted before the call, for a sysl callee and for an 'extern' alike")
+nfc_the_release_precedes_the_call()
+    val ir = nfc_ir(raw"""
+        @abandons
+        extern "exit" leave(code: int) -> never
+
+        @abandons
+        finish() -> never
+            leave(0)
+
+        first()
+            val s = str(1) + "x"
+
+            print(s)
+            finish()
+
+        second()
+            val s = str(2) + "y"
+
+            print(s)
+            leave(1)
+
+        first()
+        second()
+        """)
+
+    for name in ["first", "second"]
+        val body = nfc_body(ir, name)
+        val released = body.find("release")
+        val called = if name == "first" then body.find("@finish(") else body.find("@exit(")
+
+        assert(released.is_some(), body)
+        assert(called.is_some(), body)
+        assert(released.unwrap() < called.unwrap(), body)
+
+@test("a frame holding a counted local across a call that can reach an '@abandons' call is refused")
+nfc_a_local_held_across_is_refused()
+    nfc_refused(nfc_ir(raw"""
+        @abandons
+        leave(code: int) -> never
+            exit(code)
+
+        handle(n: int)
+            if n == 0 then leave(1)
+
+        run()
+            val s = str(1) + "x"
+
+            handle(2)
+            print(s)
+
+        run()
+        """), "'handle' can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call — its count would never be given back. Give it back first: hold it in a function that returns before this call is made, or as a '*T'", "11:13")
+
+@test("a binding a 'match' arm took a share of is held across the call")
+nfc_an_arm_binding_is_held()
+    val said = nfc_ir(raw"""
+        @abandons
+        leave(code: int) -> never
+            exit(code)
+
+        handle(n: usize)
+            if n == 0 then leave(1)
+
+        run(o: Option[string])
+            o match
+                Some(s) -> handle(s.bytes.len)
+                None -> ()
+
+        run(Some("x"))
+        """)
+
+    assert(said.contains("this frame holds a binding this arm took a share of across the call"), said)
+
+@test("a pending 'defer' is held across the call, since it would never run")
+nfc_a_defer_is_held()
+    val said = nfc_ir(raw"""
+        @abandons
+        leave(code: int) -> never
+            exit(code)
+
+        handle(n: int)
+            if n == 0 then leave(1)
+
+        run()
+            defer print("closing")
+
+            handle(2)
+
+        run()
+        """)
+
+    assert(said.contains("this frame holds a 'defer' still to run across the call"), said)
+
+@test("a counted temporary an earlier operand left, and a counted argument, are held across the call")
+nfc_temporaries_are_held()
+    val said = nfc_ir(raw"""
+        @abandons
+        leave(code: int) -> never
+            exit(code)
+
+        pick(n: int) -> int
+            if n == 0 then leave(1)
+            n
+
+        keep(s: string)
+            if s.bytes.len == 0 then leave(1)
+
+        show(s: string, n: int)
+            print(s, n)
+
+        show(str(1), pick(2))
+        keep(str(3))
+        """)
+
+    assert(said.contains("'pick' can reach a call that abandons every frame below it and never comes back, and this frame holds a counted temporary the enclosing expression is still holding across the call"), said)
+    assert(said.contains("'keep' can reach a call"), said)
+
+@test("what is passed through, declared after, or held in a frame that returns first is not refused")
+nfc_what_is_not_held_compiles()
+    val said = nfc_ir(raw"""
+        @abandons
+        leave(code: int) -> never
+            exit(code)
+
+        handle(n: int)
+            if n == 0 then leave(1)
+
+        relay(s: string)
+            handle(s.bytes.len)
+
+        helper()
+            val s = str(1) + "x"
+
+            print(s)
+
+        run()
+            helper()
+            handle(2)
+
+            val t = str(2)
+
+            print(t)
+
+        run()
+        relay("y")
+        """)
+
+    assert(!said.contains("error:"), said)
+
+@test("an '@abandons' declaration answers 'never'")
+nfc_the_result_is_never()
+    nfc_refused(nfc_ir(raw"""
+        @abandons
+        finish() -> int = 0
+
+        print(finish())
+        """), "'@abandons' says a call to 'finish' never comes back, so 'finish' answers 'never' — this one answers 'int'", "1:1")
+
+@test("an '@abandons' function may take no parameter that carries a count")
+nfc_no_counted_parameter()
+    nfc_refused(nfc_ir(raw"""
+        @abandons
+        finish(why: string) -> never
+            exit(1)
+
+        finish("done")
+        """), "'finish' is '@abandons', so its caller's frame is given back before the call and nothing is left to give back the count its parameter 'why' holds — a 'string' carries one. Pass what it needs as a value that carries no count, or through a '*T'", "1:1")
+
+@test("an '@abandons' function takes no type parameter")
+nfc_no_type_parameter()
+    nfc_refused(nfc_ir(raw"""
+        @abandons
+        finish[T](x: T) -> never
+            exit(1)
+
+        finish(1)
+        """), "'finish' is '@abandons', so its caller's frame is given back before the call — and a type parameter may be a type that carries a count, which nothing would then give back. Write it for the types it takes", "1:1")
+
+@test("an '@abandons' extern is held to the same signature")
+nfc_an_extern_signature()
+    nfc_refused(nfc_ir(raw"""
+        @abandons
+        extern "puts" say(s: *u8) -> int
+
+        print(1)
+        """), "'@abandons' says a call to 'say' never comes back, so 'say' answers 'never' — this one answers 'int'", "1:1")
+
+@test("'@abandons' marks a function or an extern, takes no arguments, and marks no member")
+nfc_what_it_marks()
+    assert_eq(pf_err("@abandons\nextern errno: i32\n"),
+        "'@abandons' says a call never comes back and the program goes on without the caller's frame, and an 'extern' variable is storage, which nothing calls — it marks an 'extern' function")
+    assert_eq(pf_err("@abandons\nstruct S\n    x: int\n"),
+        "'@abandons' says a call never comes back and the program goes on without the caller's frame, so it marks a function or an 'extern' — and this declares neither")
+    assert_eq(pf_err("@abandons(now)\nf() -> never = f()\n"),
+        "'@abandons' takes no arguments — a call to the function either comes back or it does not, and this says it does not")
+    assert(pf_err("struct S\n    x: int\n\n    @abandons\n    f(self) -> int = 1\n").contains("the only annotations a member may carry"))
+
+@test("an '@abandons' function, or one that reaches one, may not become a value")
+nfc_not_a_value()
+    nfc_refused(nfc_ir(raw"""
+        @abandons
+        leave(code: int) -> never
+            exit(code)
+
+        val p = &leave
+
+        print(1)
+        """), "'leave' is '@abandons', and a call through a value cannot be followed to it, so its caller would not give its frame back first — call it by name", "5:9")
+
+    val said = nfc_ir(raw"""
+        @abandons
+        leave(code: int) -> never
+            exit(code)
+
+        run(f: &Fn() -> unit)
+            f()
+
+        run(() -> leave(1))
+        """)
+
+    assert(said.contains("can reach a call that abandons every frame below it, and a call through a value cannot be followed there"), said)
+
+@test("a type whose trait table holds a function that can abandon may not be put behind the trait")
+nfc_not_erased()
+    val said = nfc_ir(raw"""
+        @abandons
+        leave(code: int) -> never
+            exit(code)
+
+        trait Stop
+            stop(self)
+
+        struct Now
+
+        impl Stop for Now
+            stop(self) = leave(1)
+
+        val s: &Stop = Now()
+
+        s.stop()
+        """)
+
+    assert(said.contains("can reach a call that abandons every frame below it, and a call through a trait object cannot be followed there"), said)

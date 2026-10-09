@@ -224,6 +224,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // `@thread_local` takes no parentheses for `@packed`'s reason: which thread-local model the
     // object gets is the back end's answer for the target, not something a program picks.
     if word == "thread_local" then return Some(ThreadLocal)
+    if word == "abandons" then return no_inlining_args(p, Abandons, "a call to the function either comes back or it does not, and this says it does not")
 
     // `@ignore` is the spelling other test frameworks use, answered with this one's: ignoring is
     // something a test is, so it is an argument to `@test` rather than an annotation of its own.
@@ -234,7 +235,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     end if
 
     // Anchored after the word, as `@ignore`'s is: the reference's point for both.
-    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, '@packed' and '@align(n)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
+    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, '@packed' and '@align(n)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' and '@abandons' mark a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
     skip_line(p)
     None
 end parse_attribute
@@ -484,6 +485,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             NoInline -> f.marks.noinline = true
             Inline -> f.marks.inline = true
             Cold -> f.marks.cold = true
+            Abandons -> f.marks.abandons = true
             _ -> ()
 end apply_func_attrs
 
@@ -574,13 +576,15 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         return placed_asm(parse_asm(p, at), attrs)
     end if
 
-    // `@needs(...)` is the one annotation an `extern` takes -- it is the declaration the annotation
-    // exists for, every other having a body the compiler reads instead.
+    // `@needs(...)` and `@abandons` are the annotations an `extern` takes -- it is the declaration
+    // each exists for as much as a function is, a symbol C defines being able to reach a capability
+    // or to leave its caller for good as readily as a body can.
     refuse_async_extern(p)
 
     if p.at_kw("extern")
         refuse_unless(p, at, attrs, "extern")
-        return from_first(start, parse_extern_decl(p, at, vis, capabilities_of(attrs)))
+        return from_first(start, parse_extern_decl(p, at, vis, capabilities_of(attrs),
+                                                   has_word(attrs, "abandons")))
     end if
 
     // A `type` names a scalar or a pointer for a generated header, which is the struct's request made
@@ -638,15 +642,25 @@ private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)
 private may_carry(form: string, a: Attr) -> bool
     if form == "struct" then return is_layout(a) || attr_word(a) == "export"
     if form == "binding" then return is_storage(a)
-    if form == "extern" then return attr_word(a) == "needs"
+    if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "abandons"
 
     !is_layout(a) && attr_word(a) != "borrows"
 end may_carry
+
+private has_word(attrs: Buf[Attr], word: string) -> bool
+    for attr in attrs
+        if attr_word(attr) == word then return true
+
+    false
+end has_word
 
 // The sentence a declaration that carries none of these gets, chosen by what was written above it.
 private attributed_refusal(attrs: Buf[Attr]) -> string
     if all_are(attrs, "needs")
         return "'@needs(...)' names what reaching a declaration requires, so it marks a function or an 'extern' — and this declares neither"
+
+    if all_are(attrs, "abandons")
+        return "'@abandons' says a call never comes back and the program goes on without the caller's frame, so it marks a function or an 'extern' — and this declares neither"
 
     // `@align` beside `@section` is a binding and only a binding: a struct takes the first and not
     // the second, and a function the second and not the first. It is the pair a statically placed

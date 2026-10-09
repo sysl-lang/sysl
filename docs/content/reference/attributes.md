@@ -1,6 +1,6 @@
 ---
 title: Attributes, annotations, and compile time
-summary: `::` attributes a type answers, the fifteen annotations a function takes, the three that lay out or place what they mark, the five a file's header takes, `@assert` which stands on its own, and the `#if` directive that gates lines before the lexer sees them.
+summary: `::` attributes a type answers, the sixteen annotations a function takes, the three that lay out or place what they mark, the five a file's header takes, `@assert` which stands on its own, and the `#if` directive that gates lines before the lexer sees them.
 weight: 130
 ---
 
@@ -10,10 +10,10 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@noinline`, `@inline`, `@cold` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@noinline`, `@inline`, `@cold`, `@abandons` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@borrows` | an **annotation** on a trait's method — see [`@borrows`](/reference/traits/#a-method-may-promise-to-borrow) | the grammar |
-| `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; the one an `extern` takes | the grammar |
+| `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; with `@abandons`, one of the two an `extern` takes | the grammar |
 | `@packed`, `@align(n)`, `@section("...")` | an **annotation** — where the declaration under it is laid out, or where it lands | the grammar |
 | `@export("...")` on a `struct` | an **annotation** — the name the type carries in a generated C header | the grammar |
 | `@no_alloc`, `@requires`, `@link`, `@include`, `@tests` | an **annotation** — a fact about the whole file, in its header | the grammar |
@@ -34,7 +34,7 @@ with. That is a rule about directives, not the thing that distinguishes them.
 Annotations come in groups, by what they attach to — and the last of them is the empty one, which is
 as much a rule as the others.
 
-**On a function** there are fifteen, each written on its own line above the declaration. More than
+**On a function** there are sixteen, each written on its own line above the declaration. More than
 one may be stacked, and writing the same one twice is refused. `@test` and `@tailrec` are below, and
 so are the four hooks a module's tests may declare — `@setup`, `@teardown`, `@setup_all` and
 `@teardown_all` — and the three that tell the optimizer what a definition is for, `@noinline`,
@@ -43,7 +43,10 @@ so are the four hooks a module's tests may declare — `@setup`, `@teardown`, `@
 [verification](/reference/verification/) page; `@export` makes the definition C-callable and is on
 the [FFI](/reference/ffi/) page, beside the `extern` it is the mirror image of; `@crossing(...)` says
 a parameter hands a value to another concurrency domain and is on the
-[memory](/reference/memory/) page, beside the crossing rule it asks.
+[memory](/reference/memory/) page, beside the crossing rule it asks; and `@abandons` says a call to
+the function never comes back while the program goes on, so the caller's frame is given back first —
+it marks an `extern` too, and is on the [declarations](/reference/declarations/) page beside
+`become`.
 
 **On a type, or on storage** there are four, and three of them are about *where* rather than about
 what the declaration does. `@packed` and `@align(n)` lay out a struct — no interior padding, and the
