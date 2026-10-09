@@ -1,0 +1,148 @@
+module sh.sysl.compiler
+@tests
+
+// **`@align(n)` on a struct reaches every place storage of the type is laid down** —
+// `reference/attributes.md § @align(n) on a binding`: "a boundary put on a type travels with every
+// value of it". A module `var` and `val`, a `static`, a local, a field of another struct, an array
+// element and a data enum's payload each carry it, in the IR (`align N`, the gaps the layout puts
+// in front of a field and at the end) and at run time (the address itself, read back).
+//
+// Found by the keel kernel (FINDINGS 12): a 4 KiB translation table typed `@align(4096)` landed at
+// offsets like 64 and 2272 while `alignof` answered 4096, and a `[4]Head` of a 64-byte-aligned
+// struct strode by eight while `sizeof` said 256.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private als_table() -> string = "@align(4096)\nstruct Table\n    e: [512]u64\n\n"
+
+private als_head() -> string = "@align(64)\nstruct Head\n    tag: u8\n    len: u32\n\n"
+
+// -- module storage -------------------------------------------------------------------------------
+
+@test("a module 'var' of an aligned struct is laid down on its boundary")
+als_a_module_var_lands_on_the_boundary()
+    if !enm_ready() then return
+
+    val src = als_table() + "var pad: u8\nvar one: Table\n\nmain()\n    pad = 1\n    one.e[1] = 7\n" +
+        "    print(usize(&one) % 4096, one.e[1], pad)\n"
+
+    assert(enm_says(enm_ir(src), "@one = private global %struct.Table zeroinitializer, align 4096"),
+           enm_ir(src))
+    assert_eq(enm_ran(src), "0 7 1\n")
+
+@test("a module 'val' of an aligned struct is constant data on its boundary, its gaps written out")
+als_a_module_val_lands_on_the_boundary()
+    if !enm_ready() then return
+
+    // A `val` takes no `&`, so the boundary is read off the IR alone.
+    val src = als_head() + "var pad: u8\nval HEAD: Head = Head(3u8, 9u32)\n\nmain()\n    pad = 1\n" +
+        "    print(HEAD.tag, HEAD.len, pad)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%struct.Head = type { i8, [3 x i8], i32, [56 x i8] }"), ir)
+    assert(enm_says(ir, "@HEAD = private constant %struct.Head { i8 3, [3 x i8] zeroinitializer, " +
+                        "i32 9, [56 x i8] zeroinitializer }, align 64"), ir)
+    assert_eq(enm_ran(src), "3 9 1\n")
+
+@test("a 'static' in the file a program starts in is laid down on its boundary")
+als_a_static_lands_on_the_boundary()
+    if !enm_ready() then return
+
+    val src = als_table() + "static var pad: u8\nstatic var st: Table\n\npad = 1\nst.e[0] = 3\n" +
+        "print(usize(&st) % 4096, st.e[0], pad)\n"
+
+    assert(enm_says(enm_ir(src), "global %struct.Table zeroinitializer, align 4096"), enm_ir(src))
+    assert_eq(enm_ran(src), "0 3 1\n")
+
+// -- a local --------------------------------------------------------------------------------------
+
+@test("a local of an aligned struct is a stack slot on its boundary")
+als_a_local_lands_on_the_boundary()
+    if !enm_ready() then return
+
+    val src = als_table() + "main()\n    var a: u8 = 1\n    var local: Table\n    local.e[3] = 9\n" +
+        "    print(usize(&local) % 4096, local.e[3], a)\n"
+
+    assert(enm_says(enm_ir(src), "%local.addr = alloca %struct.Table, align 4096"), enm_ir(src))
+    assert_eq(enm_ran(src), "0 9 1\n")
+
+// -- inside another aggregate ---------------------------------------------------------------------
+
+@test("a field of an aligned struct sits at the offset the layout gives it, and raises its holder")
+als_a_field_sits_at_its_layout_offset()
+    if !enm_ready() then return
+
+    val src = als_table() + "struct Outer\n    tag: u8\n    t: Table\n\nvar o: Outer\n\nmain()\n" +
+        "    o.tag = 2\n    o.t.e[0] = 5\n    var local: Outer\n    local.t.e[1] = 6\n" +
+        "    print(sizeof(Outer), alignof(Outer), offsetof(Outer, t), usize(&o.t) - usize(&o))\n" +
+        "    print(usize(&o.t) % 4096, usize(&local.t) % 4096, o.tag, o.t.e[0], local.t.e[1])\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%struct.Outer = type { i8, [4095 x i8], %struct.Table }"), ir)
+    assert(enm_says(ir, "@o = private global %struct.Outer zeroinitializer, align 4096"), ir)
+    assert(enm_says(ir, "%local.addr = alloca %struct.Outer, align 4096"), ir)
+    assert_eq(enm_ran(src), "8192 4096 4096 4096\n0 0 2 5 6\n")
+
+@test("an array of an aligned struct strides by the size the layout says")
+als_an_array_strides_by_the_layout_size()
+    if !enm_ready() then return
+
+    val src = als_head() + "var hs: [4]Head\n\nmain()\n    hs[2].len = 9\n    var copy = hs[2]\n" +
+        "    copy.tag = 4\n    hs[3] = copy\n" +
+        "    print(sizeof([4]Head), usize(&hs[1]) - usize(&hs[0]), usize(&hs[3]) % 64)\n" +
+        "    print(hs[2].len, hs[3].tag, hs[3].len)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "@hs = private global [4 x %struct.Head] zeroinitializer, align 64"), ir)
+    assert_eq(enm_ran(src), "256 64 0\n9 4 9\n")
+
+@test("a local array of an aligned struct is a stack slot on its boundary")
+als_a_local_array_lands_on_the_boundary()
+    if !enm_ready() then return
+
+    val src = als_head() + "main()\n    var a: u8 = 1\n    var hs: [3]Head\n    hs[1].tag = 8\n" +
+        "    print(usize(&hs[0]) % 64, usize(&hs[2]) - usize(&hs[0]), hs[1].tag, a)\n"
+
+    assert(enm_says(enm_ir(src), "alloca [3 x %struct.Head], align 64"), enm_ir(src))
+    assert_eq(enm_ran(src), "0 128 8 1\n")
+
+@test("a packed and aligned struct keeps its fields end to end and pads only its end")
+als_packed_and_aligned_pads_only_the_end()
+    if !enm_ready() then return
+
+    val src = "@packed\n@align(16)\nstruct P\n    tag: u8\n    len: u32\n\nvar ps: [2]P\n\nmain()\n" +
+        "    ps[1].len = 300\n" +
+        "    print(sizeof(P), usize(&ps[1]) - usize(&ps[0]), usize(&ps[0]) % 16, ps[1].len)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%struct.P = type <{ i8, i32, [11 x i8] }>"), ir)
+    assert_eq(enm_ran(src), "16 16 0 300\n")
+
+@test("a data enum carrying an aligned struct puts its payload on the boundary")
+als_an_enum_payload_lands_on_the_boundary()
+    if !enm_ready() then return
+
+    val src = als_head() + "enum Slot\n    Empty\n    Full(h: Head)\n\nmain()\n    var a: u8 = 1\n" +
+        "    var s = Full(Head(6u8, 70u32))\n    var e: Slot = Empty\n" +
+        "    s match\n        Full(h) -> print(h.tag, h.len)\n        Empty -> print(\"empty\")\n" +
+        "    e match\n        Full(h) -> print(h.tag)\n        Empty -> print(\"empty\")\n" +
+        "    print(sizeof(Slot), alignof(Slot), usize(&s) % 64, a)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%enum.Slot = type { i32, [60 x i8], [1 x i512] }"), ir)
+    assert(enm_says(ir, "%s.addr = alloca %enum.Slot, align 64"), ir)
+    assert_eq(enm_ran(src), "6 70\nempty\n128 64 0 1\n")
+
+// -- what is left alone ---------------------------------------------------------------------------
+
+@test("a boundary the fields already give leaves the type and its storage as they were")
+als_a_boundary_that_raises_nothing_changes_nothing()
+    if !enm_ready() then return
+
+    val src = "@align(2)\nstruct Head\n    tag: u8\n    len: u32\n\nvar h: Head\n\nmain()\n" +
+        "    h.len = 4\n    print(h.len)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%struct.Head = type { i8, i32 }"), ir)
+    assert(enm_says(ir, "@h = private global %struct.Head zeroinitializer\n"), ir)
+    assert_eq(enm_ran(src), "4\n")

@@ -120,7 +120,9 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
     // A trait pointer is two words, so its empty value is not the one-word `null`.
     TNullLit(ty) -> if erased(underlying(ty)) then VZero else VNull
 
-    // A variant that carries nothing is a tag and a payload region nothing will read.
+    // A variant that carries nothing is a tag and a payload region nothing will read -- except in a
+    // simple enum, which is its underlying integer and nothing else, so its constant is the bare tag
+    // at that width: the value the program wrote, not a `{ tag, region }` pair.
     TEnumNew(en, variant, _) ->
         if variant.carries then gap_at(e, "a constant enum variant that carries a payload")
         else if variant.tag == 0 then VZero
@@ -128,6 +130,8 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
             val d = underlying(en) match
                 Enum(decl) -> decl
                 _ -> return gap_at(e, "a constant enum of something that is not an enum")
+
+            if d.simple then return VInt(from_int(long(variant.tag)))
 
             val area = payload_area(d, e.layout)
 

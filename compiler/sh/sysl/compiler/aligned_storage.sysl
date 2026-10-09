@@ -1,0 +1,486 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.math.bigint.from_int
+
+// **A boundary raised by `@align(n)` on a type, carried to every place storage of it is laid down.**
+//
+// LLVM's textual types carry no alignment: a named struct is aligned to the widest of its members,
+// and nothing can say more. So for a struct whose `@align(n)` raises its boundary, LLVM's own layout
+// and this compiler's disagree, and they disagree everywhere the type is *inside* something else --
+// `@align(64) struct Head { tag: u8, len: u32 }` is 64 bytes to `sizeof` and eight to LLVM, so a
+// `[4]Head` would stride by eight, and a struct holding a 4 KiB-aligned table would put it at offset
+// eight rather than at 4096.
+//
+// What this pass does, after every body is written:
+//
+// - **Every type that reaches such a struct by value** -- the struct itself, a struct or tuple holding
+//   one, a data enum one of whose variants does, a variant's payload aggregate -- has every gap the
+//   layout computed spelled out as `[k x i8]`, in front of a field and at the end, so the offsets and
+//   the size LLVM computes are the layout's byte for byte. Each field then begins exactly where LLVM
+//   would put it anyway: the layout's offset is a multiple of the field's boundary, which is at least
+//   the one LLVM gives its type, and both are powers of two. A `@packed` struct stays packed.
+// - **Every `alloca` and every module-level `global` of such a type states the layout's boundary**,
+//   and so does one holding an array of them, since LLVM's own is only the widest member's.
+// - **A field index into a rewritten type is renumbered** wherever an instruction names one -- a
+//   `getelementptr`, an `extractvalue`, an `insertvalue` -- and a constant aggregate of one gets its
+//   gaps as zeros.
+//
+// A program with no raised struct is handed back untouched, so its text is exactly what it was.
+//
+// **A box on the heap is not aligned by this**: its storage comes from the allocating pair, which
+// promises only what `malloc` does.
+
+// What the pass knows about one rewritten type: the definition it now has, for each of its fields
+// the original field it holds (-1 for a gap), and the boundary its storage is laid down on.
+private struct AlignedDef
+    def: IrTypeDef
+    slots: Buf[int]
+    align: int
+end AlignedDef
+
+private struct AlignPass
+    layout: TargetLayout
+    defs: Map[string, IrTypeDef]
+    rewritten: Map[string, AlignedDef]
+    reach_memo: Map[string, bool]
+end AlignPass
+
+// The module with every raised boundary carried to its storage.
+align_storage(m: IrModule, p: TProgram, l: TargetLayout) -> IrModule
+    var any = false
+
+    for i in 0..<p.structs.len()
+        p.structs.at(i) match
+            Struct(d) -> if raises_alignment(l, d) then any = true
+            _ -> ()
+
+    if !any then return m
+
+    var s = AlignPass(l, map(), map(), map())
+
+    for i in 0..<m.structs.len()
+        s.defs.put(m.structs.at(i).name, m.structs.at(i))
+
+    for i in 0..<m.enums.len()
+        s.defs.put(m.enums.at(i).name, m.enums.at(i))
+
+    for i in 0..<m.boxes.len()
+        s.defs.put(m.boxes.at(i).name, m.boxes.at(i))
+
+    for i in 0..<p.structs.len()
+        p.structs.at(i) match
+            Struct(d) -> al_plan_struct(&s, d)
+            _ -> ()
+
+    for i in 0..<p.enums.len()
+        p.enums.at(i) match
+            Enum(d) -> al_plan_enum(&s, d)
+            _ -> ()
+
+    var structs: Buf[IrTypeDef] = buf()
+
+    for i in 0..<m.structs.len()
+        structs.push(al_new_def(&s, m.structs.at(i)))
+
+    var enums: Buf[IrTypeDef] = buf()
+
+    for i in 0..<m.enums.len()
+        enums.push(al_new_def(&s, m.enums.at(i)))
+
+    var globals: Buf[IrGlobal] = buf()
+
+    for i in 0..<m.globals.len()
+        globals.push(al_global(&s, m.globals.at(i)))
+
+    var runtime: Buf[IrRuntime] = buf()
+
+    for i in 0..<m.runtime.len()
+        runtime.push(m.runtime.at(i) match
+            RtEmitted(f) -> RtEmitted(al_func(&s, f))
+            other -> other)
+
+    var funcs: Buf[IrFunc] = buf()
+
+    for i in 0..<m.funcs.len()
+        funcs.push(al_func(&s, m.funcs.at(i)))
+
+    var thunks: Buf[IrFunc] = buf()
+
+    for i in 0..<m.thunks.len()
+        thunks.push(al_func(&s, m.thunks.at(i)))
+
+    val entry: Option[IrFunc] = m.entry match
+        Some(f) -> Some(al_func(&s, f))
+        None -> None
+
+    val init: Option[IrInit] = m.init match
+        Some(it) -> Some(IrInit(al_func(&s, it.func), it.list))
+        None -> None
+
+    IrModule(m.triple, m.declares, structs, enums, m.boxes, m.imports, globals, runtime, funcs,
+             thunks, entry, m.used, init, m.module_asm)
+end align_storage
+
+// -- which types are raised, and which reach one ------------------------------------------------
+
+// Whether `@align(n)` on this struct asks for more than its fields already give it -- the one case
+// in which LLVM's layout and this compiler's part company.
+raises_alignment(l: TargetLayout, d: &StructType) -> bool
+    if d.base == TaskBase then return false
+
+    val n = d.min_align match
+        Some(k) -> k
+        None -> return false
+
+    var natural: usize = 1
+
+    if !d.packed && bitfield_ranges(d).is_none()
+        val fields = d.stored()
+
+        for i in 0..<fields.len()
+            val a = l.align(fields.at(i).1)
+
+            if a > natural then natural = a
+
+    n > natural
+end raises_alignment
+
+// Whether a value of the type holds a raised struct somewhere in its own bytes.
+private al_reaches(s: *AlignPass, t: Type) -> bool = underlying(t) match
+    Struct(d) -> al_struct_reaches(s, d)
+    Array(_, elem) -> al_reaches(s, *elem)
+    Enum(d) -> !d.simple && al_enum_reaches(s, d)
+    _ -> false
+
+private al_struct_reaches(s: *AlignPass, d: &StructType) -> bool
+    if d.base == TaskBase then return false
+
+    val key = l_render(struct_lty(d))
+
+    s.reach_memo.get(key) match
+        Some(hit) -> return hit
+        None -> ()
+
+    var answer = raises_alignment(s.layout, d)
+    val fields = d.stored()
+
+    for i in 0..<fields.len()
+        if !answer && al_reaches(s, fields.at(i).1) then answer = true
+
+    s.reach_memo.put(key, answer)
+    answer
+end al_struct_reaches
+
+private al_enum_reaches(s: *AlignPass, d: &EnumType) -> bool
+    val key = l_render(enum_lty(d))
+
+    s.reach_memo.get(key) match
+        Some(hit) -> return hit
+        None -> ()
+
+    var answer = false
+
+    for i in 0..<d.variants.len()
+        if al_variant_reaches(s, d.variants.at(i)) then answer = true
+
+    s.reach_memo.put(key, answer)
+    answer
+end al_enum_reaches
+
+private al_variant_reaches(s: *AlignPass, v: EnumVariant) -> bool
+    if !v.carries then return false
+
+    val fields = v.stored()
+
+    for i in 0..<fields.len()
+        if al_reaches(s, fields.at(i).1) then return true
+
+    false
+end al_variant_reaches
+
+// -- the new definitions -----------------------------------------------------------------------
+
+// A struct's fields at the offsets the layout gives them. A bitfield struct's one integer sits at
+// zero and occupies what LLVM allocates for it.
+private al_plan_struct(s: *AlignPass, d: &StructType)
+    if !al_struct_reaches(s, d) then return
+
+    val old = s.defs.get(l_render(struct_lty(d))) match
+        Some(x) -> x
+        None -> return
+
+    var offsets: Buf[usize] = buf()
+    var sizes: Buf[usize] = buf()
+
+    bitfield_ranges(d) match
+        Some(_) ->
+            offsets.push(0)
+
+            old.fields.at(0) match
+                LInt(bits) -> sizes.push(int_alloc(bits))
+                _ -> sizes.push(0)
+        None ->
+            val fields = d.stored()
+            var at: usize = 0
+
+            for i in 0..<fields.len()
+                val ty = fields.at(i).1
+
+                if !d.packed then at = round_up(at, s.layout.align(ty))
+
+                offsets.push(at)
+                sizes.push(s.layout.size(ty))
+                at += s.layout.size(ty)
+
+    al_lay_out(s, old, offsets, sizes, s.layout.size(Struct(d)), s.layout.align(Struct(d)))
+end al_plan_struct
+
+// A data enum: the tag, then the payload region where the layout puts it -- and before that, each
+// carrying variant's payload aggregate laid out end to end.
+private al_plan_enum(s: *AlignPass, d: &EnumType)
+    if d.simple || !al_enum_reaches(s, d) then return
+
+    for i in 0..<d.variants.len()
+        val v = d.variants.at(i)
+
+        if al_variant_reaches(s, v)
+            s.defs.get(l_render(variant_lty(d, v))) match
+                Some(old) ->
+                    val fields = v.stored()
+                    var offsets: Buf[usize] = buf()
+                    var sizes: Buf[usize] = buf()
+                    var at: usize = 0
+                    var widest: usize = 1
+
+                    for j in 0..<fields.len()
+                        val ty = fields.at(j).1
+                        val a = s.layout.align(ty)
+
+                        if a > widest then widest = a
+
+                        at = round_up(at, a)
+                        offsets.push(at)
+                        sizes.push(s.layout.size(ty))
+                        at += s.layout.size(ty)
+
+                    al_lay_out(s, old, offsets, sizes, round_up(at, widest), widest)
+                None -> ()
+
+    val old = s.defs.get(l_render(enum_lty(d))) match
+        Some(x) -> x
+        None -> return
+
+    val unit = s.layout.payload_align(d)
+    var offsets: Buf[usize] = buf()
+    var sizes: Buf[usize] = buf()
+
+    offsets.push(0)
+    sizes.push(4)
+    offsets.push(round_up(4, unit))
+    sizes.push(round_up(s.layout.payload_size(d), unit))
+
+    al_lay_out(s, old, offsets, sizes, s.layout.size(Enum(d)), s.layout.align(Enum(d)))
+end al_plan_enum
+
+// The definition with each gap written in front of the field it precedes and the end padded out to
+// the size the layout says.
+private al_lay_out(s: *AlignPass, old: IrTypeDef, offsets: Buf[usize], sizes: Buf[usize],
+                   size: usize, align: usize)
+    var fields: Buf[LType] = buf()
+    var slots: Buf[int] = buf()
+    var at: usize = 0
+
+    for i in 0..<old.fields.len()
+        if offsets.at(i) > at
+            fields.push(al_gap(offsets.at(i) - at))
+            slots.push(-1)
+
+        fields.push(old.fields.at(i))
+        slots.push(int(i))
+        at = offsets.at(i) + sizes.at(i)
+
+    if size > at
+        fields.push(al_gap(size - at))
+        slots.push(-1)
+
+    s.rewritten.put(old.name, AlignedDef(IrTypeDef(old.name, fields, old.packed), slots, int(align)))
+end al_lay_out
+
+private al_gap(bytes: usize) -> LType = LArr(int(bytes), LInt(8))
+
+private al_new_def(s: *AlignPass, d: IrTypeDef) -> IrTypeDef = s.rewritten.get(d.name) match
+    Some(r) -> r.def
+    None -> d
+
+// -- storage: the boundary each slot and each global states ------------------------------------
+
+// The boundary the layout wants for storage of this type, where LLVM's own would be less.
+private al_wanted(s: *AlignPass, t: LType) -> Option[int] = t match
+    LNamed(n) ->
+        s.rewritten.get(n) match
+            Some(r) -> if r.align > 1 then Some(r.align) else None
+            None -> None
+    LArr(_, elem) -> al_wanted(s, *elem)
+    LStruct(fs) ->
+        var best: Option[int] = None
+
+        for i in 0..<fs.len()
+            best = al_at_least(best, al_wanted(s, fs.at(i)))
+
+        best
+    _ -> None
+
+private al_at_least(given: Option[int], want: Option[int]) -> Option[int] = want match
+    Some(w) ->
+        given match
+            Some(g) -> if g >= w then Some(g) else Some(w)
+            None -> Some(w)
+    None -> given
+
+// A global this module lays down; one the linker supplies is left as it is.
+private al_global(s: *AlignPass, g: IrGlobal) -> IrGlobal = g.value match
+    Some(v) -> g with { value = Some(al_value(s, g.ty, v)), align = al_at_least(g.align, al_wanted(s, g.ty)) }
+    None -> g
+
+// -- bodies: renumbered field indices, padded constants, aligned slots --------------------------
+
+private al_func(s: *AlignPass, f: IrFunc) -> IrFunc
+    var blocks: Buf[IrBlock] = buf()
+
+    for i in 0..<f.blocks.len()
+        val b = f.blocks.at(i)
+        var instrs: Buf[Inst] = buf()
+
+        for j in 0..<b.instrs.len()
+            instrs.push(al_inst(s, b.instrs.at(j)))
+
+        val term: Option[Inst] = b.terminator match
+            Some(t) -> Some(al_inst(s, t))
+            None -> None
+
+        blocks.push(IrBlock(b.label, instrs, term))
+
+    IrFunc(f.sig, blocks)
+end al_func
+
+private al_inst(s: *AlignPass, i: Inst) -> Inst = i match
+    InAlloca(d, ty, align) -> InAlloca(d, ty, al_at_least(align, al_wanted(s, ty)))
+    InStore(ty, v, p, access, align) -> InStore(ty, al_value(s, ty, v), p, access, align)
+    InGep(d, ty, p, idx) -> InGep(d, ty, p, al_gep(s, ty, idx))
+    InExtract(d, ty, agg, idx) -> InExtract(d, ty, al_value(s, ty, agg), al_path(s, ty, idx))
+    InInsert(d, ty, agg, vty, v, idx) ->
+        InInsert(d, ty, al_value(s, ty, agg), vty, al_value(s, vty, v), al_path(s, ty, idx))
+    InSelect(d, c, ty, a, b, cty) -> InSelect(d, c, ty, al_value(s, ty, a), al_value(s, ty, b), cty)
+    InCall(d, ret, callee, args, ret_attrs, cty, fast, tail) ->
+        InCall(d, ret, callee, al_args(s, args), ret_attrs, cty, fast, tail)
+    InRet(Some(ty), Some(v)) -> InRet(Some(ty), Some(al_value(s, ty, v)))
+    other -> other
+
+private al_args(s: *AlignPass, args: Buf[IrArg]) -> Buf[IrArg]
+    var out: Buf[IrArg] = buf()
+
+    for i in 0..<args.len()
+        val a = args.at(i)
+
+        out.push(IrArg(a.ty, al_value(s, a.ty, a.value), a.attrs))
+
+    out
+end al_args
+
+// A constant aggregate of a rewritten type takes a zero for every gap.
+private al_value(s: *AlignPass, ty: LType, v: Val) -> Val = v match
+    VAgg(args) ->
+        val fixed = al_args(s, args)
+
+        ty match
+            LNamed(n) ->
+                s.rewritten.get(n) match
+                    Some(r) -> VAgg(al_padded(r, fixed))
+                    None -> VAgg(fixed)
+            _ -> VAgg(fixed)
+    VArray(elems) -> VArray(al_args(s, elems))
+    other -> other
+
+private al_padded(r: AlignedDef, fields: Buf[IrArg]) -> Buf[IrArg]
+    var out: Buf[IrArg] = buf()
+
+    for i in 0..<r.slots.len()
+        val k = r.slots.at(i)
+
+        if k < 0 then out.push(ir_arg(r.def.fields.at(i), VZero))
+        else out.push(fields.at(usize(k)))
+
+    out
+end al_padded
+
+// The fields of a named type as LLVM now has them.
+private al_fields_of(s: *AlignPass, n: string) -> Option[Buf[LType]] = s.rewritten.get(n) match
+    Some(r) -> Some(r.def.fields)
+    None ->
+        s.defs.get(n) match
+            Some(d) -> Some(d.fields)
+            None -> None
+
+// Where the `k`th original field of a named type now sits.
+private al_moved(s: *AlignPass, n: string, k: int) -> int = s.rewritten.get(n) match
+    Some(r) ->
+        var at = k
+
+        for i in 0..<r.slots.len()
+            if r.slots.at(i) == k then at = int(i)
+
+        at
+    None -> k
+
+// One step into an aggregate: the index as LLVM now numbers it, and the type it lands on.
+private al_step(s: *AlignPass, t: LType, k: int) -> (int, LType) = t match
+    LNamed(n) ->
+        val at = al_moved(s, n, k)
+
+        al_fields_of(s, n) match
+            Some(fs) -> if at >= 0 && at < int(fs.len()) then (at, fs.at(usize(at))) else (at, LVoid)
+            None -> (at, LVoid)
+    LArr(_, elem) -> (k, *elem)
+    LVec(_, elem) -> (k, *elem)
+    LStruct(fs) -> if k >= 0 && k < int(fs.len()) then (k, fs.at(usize(k))) else (k, LVoid)
+    _ -> (k, LVoid)
+
+// A `getelementptr`'s indices: the first steps over whole values of the source type, and every one
+// after it goes a level into the aggregate.
+private al_gep(s: *AlignPass, ty: LType, idx: Buf[IrArg]) -> Buf[IrArg]
+    var out: Buf[IrArg] = buf()
+    var at = ty
+
+    for i in 0..<idx.len()
+        val a = idx.at(i)
+
+        if i == 0 then out.push(a)
+        else
+            a.value match
+                VInt(v) ->
+                    val next = al_step(s, at, int(v.to_long().unwrap_or(0)))
+
+                    out.push(IrArg(a.ty, VInt(from_int(long(next.0))), a.attrs))
+                    at = next.1
+                _ ->
+                    out.push(a)
+                    at = al_step(s, at, 0).1
+
+    out
+end al_gep
+
+// An `extractvalue`'s or `insertvalue`'s path, every index a level into the aggregate.
+private al_path(s: *AlignPass, ty: LType, idx: Buf[int]) -> Buf[int]
+    var out: Buf[int] = buf()
+    var at = ty
+
+    for i in 0..<idx.len()
+        val next = al_step(s, at, idx.at(i))
+
+        out.push(next.0)
+        at = next.1
+
+    out
+end al_path
