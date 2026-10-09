@@ -1,0 +1,270 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **A pipeline over `sysl.process.sys`, built for a target with no C library.**
+//
+// `sysl.process.pipe` makes a pipe through the `sysl_proc_pipe` hook and `spawn` starts a child with
+// all three of its streams placed, through `sysl_proc_spawn`; neither names a capture file, so a
+// program that only spawns and pipes reaches no `sysl_proc_temp_path`. On a hosted POSIX target the
+// library's `sysl.process.hosted` answers the pipe hook over `pipe` and `fcntl`, under a `weak` export;
+// on a freestanding one the program answers it, and leaving it unanswered is refused by name
+// (`emit_checks.sysl`'s `check_library_hooks`, the `sysl.process.sys` row). What the hosted answers do
+// at run time is `library/sysl/process/pipe_tests.sysl`'s.
+
+private val ppe_target: string = "aarch64-freestanding"
+private val ppe_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private val ppe_script: string =
+    "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+private val ppe_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n" +
+    s"targets {\n  $ppe_target {\n    linker_script = \"link.ld\"\n    entry = \"kstart\"\n  }\n}\n"
+
+// A shell's `cat < /etc/group | wc -l`: a pipe, two children placed on it, every end closed once the
+// stage it was for has started, and both waited for.
+private val ppe_program: string = raw"""
+    import sysl.process.{Stdio, pipe, spawn}
+    import sysl.process.sys.Text
+
+    go() -> int
+        val (r, w) = pipe() match
+            Ok(ends) -> ends
+            Err(_) -> return 1
+
+        var n = 0
+        val cat = spawn("/bin/cat", stdin = Stdio.FromPath("/etc/group"), stdout = Stdio.ToFile(w))
+        var wr = w
+
+        wr.close()
+
+        val wc = spawn("/bin/wc", ["-l"], stdin = Stdio.FromFile(r))
+        var rd = r
+
+        rd.close()
+
+        if cat.is_ok() && cat.unwrap().wait().is_ok() then n += 1
+        if wc.is_ok() && wc.unwrap().wait().is_ok() then n += 2
+
+        n
+    end go
+    """
+
+// The image's start, its heap, the memory functions LLVM calls with no C library, `putchar`, `exit`,
+// and the `sysl.fs.sys` hooks a pipeline's files reach.
+private val ppe_runtime: string = raw"""
+    @export("kstart")
+    kstart() -> never
+        val n = go()
+
+        loop
+            ()
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = ptr_cast(usize(0x4100_0000))
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+
+    @export("memset")
+    mem_set(dst: *u8, c: int, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = u8(c)
+
+        dst
+
+    @export("memcpy")
+    mem_copy(dst: *u8, src: *u8, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = src[i]
+
+        dst
+
+    @export("memmove")
+    mem_move(dst: *u8, src: *u8, n: usize) -> *u8 = mem_copy(dst, src, n)
+
+    @export("memcmp")
+    mem_compare(a: *u8, b: *u8, n: usize) -> int = 0
+
+    @export("putchar")
+    k_putchar(c: int) -> int = c
+
+    @export("exit")
+    k_exit(code: int) -> never
+        loop
+            ()
+
+    @export("sysl_fs_open")
+    k_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int = -38
+
+    @export("sysl_fs_read")
+    k_read(fd: int, into: *u8, room: usize, got: *usize) -> int = -38
+
+    @export("sysl_fs_write")
+    k_write(fd: int, from: *u8, len: usize, put: *usize) -> int = -38
+
+    @export("sysl_fs_close")
+    k_close(fd: int) -> int = 0
+
+    @export("sysl_fs_seek")
+    k_seek(fd: int, offset: long, whence: int, at: *long) -> int = -29
+    """
+
+// The process hooks a pipeline reaches, answered as a kernel's calls would be: no temporary path.
+private val ppe_hooks: string = raw"""
+    @export("sysl_proc_spawn")
+    k_spawn(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, envc: usize,
+            inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int,
+            stderr_fd: int, started: *i64) -> i64 = 7
+
+    @export("sysl_proc_wait")
+    k_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int = 0
+
+    @export("sysl_proc_kill")
+    k_kill(pid: i64, signal: int) -> int = 0
+    """
+
+// The pipe hook, apart from the rest so that a test can leave it out alone.
+private val ppe_pipe_hook: string = raw"""
+    @export("sysl_proc_pipe")
+    k_pipe(read_end: *int, write_end: *int) -> int
+        read_end[0] = 3
+        write_end[0] = 4
+        0
+    """
+
+private ppe_tree(program: string) -> string
+    var files = lbr_two("main.sysl", program, "package.hocon", ppe_manifest)
+
+    files.push(("link.ld", ppe_script))
+    lbr_tree(files)
+end ppe_tree
+
+private ppe_build(p: string) -> ((int, string), string)
+    val out = lbr_temp("sysl-ppe-elf")
+
+    (lbr_cli(["sysl", "build", "--target", ppe_target, "-o", s"$out/img.elf", p]), out)
+end ppe_build
+
+private ppe_symbols(elf: string, undefined: bool) -> string
+    val ran = if undefined then capture(ppe_nm, ["-u", elf], "", [], true)
+    else capture(ppe_nm, [elf], "", [], true)
+
+    ran match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+end ppe_symbols
+
+// Whether an `llvm-nm` listing names `symbol`, as the last word of one of its lines.
+private ppe_names(listing: string, symbol: string) -> bool
+    for line in lines_of(listing)
+        if line == symbol || line.ends_with(s" $symbol") then return true
+
+    false
+end ppe_names
+
+private ppe_link_ready() -> bool
+    if !lbr_ready() then return false
+
+    val lld = capture("ld.lld", ["--version"], "", [], true) match
+        Ok(o) -> o.status.ok()
+        Err(_) -> false
+
+    if !lld then skip("ld.lld is not installed, so no image can be linked")
+    if !is_file(ppe_nm) then skip(s"there is no llvm-nm at $ppe_nm to read the image")
+
+    true
+end ppe_link_ready
+
+@test("a freestanding pipeline links with its own pipe, spawn, wait and kill hooks and no temp path")
+ppe_answered_pipeline_links()
+    if !ppe_link_ready() then return
+
+    val p = ppe_tree(ppe_program + ppe_runtime + ppe_hooks + ppe_pipe_hook)
+    val (said, out) = ppe_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = ppe_symbols(elf, false)
+
+    assert_eq(ppe_symbols(elf, true).trim(), "")
+
+    for hook in ["sysl_proc_pipe", "sysl_proc_spawn", "sysl_proc_wait", "sysl_proc_kill"]
+        assert(all.contains(s" T $hook"), all)
+
+    // A spawn captures nothing, so it names no file to capture into; and no hosted answer came along.
+    for name in ["sysl_proc_temp_path", "pipe", "fcntl", "posix_spawn", "fork", "sysl_proc_posix_pipe",
+                 "sysl_proc_posix_start"]
+        assert(!ppe_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end ppe_answered_pipeline_links
+
+@test("a freestanding pipeline with no process hooks is refused, naming the pipe hook with the rest")
+ppe_unanswered_pipe_hook_is_refused()
+    if !lbr_ready() then return
+
+    val p = ppe_tree(ppe_program + ppe_runtime)
+    val (said, out) = ppe_build(p)
+
+    assert(said.0 != 0, "built with every process hook unanswered")
+    assert(said.1.contains(s"error: this program starts or waits for a process, and '$ppe_target' " +
+        "has no operating system under it for the standard library to answer one with, so the program " +
+        "answers it: define 'sysl_proc_kill', 'sysl_proc_pipe', 'sysl_proc_spawn', 'sysl_proc_wait' " +
+        "with '@export', each taking what its 'extern' in 'sysl.process.sys' declares and answering " +
+        "a process id, a length or zero, or the code of an 'IoError' negated"), said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end ppe_unanswered_pipe_hook_is_refused
+
+@test("a freestanding program that answers every hook but the pipe's is refused for that one alone")
+ppe_only_the_pipe_hook_missing()
+    if !lbr_ready() then return
+
+    val p = ppe_tree(ppe_program + ppe_runtime + ppe_hooks)
+    val (said, out) = ppe_build(p)
+
+    assert(said.0 != 0, "built with the pipe hook unanswered")
+    assert(said.1.contains("so the program answers it: define 'sysl_proc_pipe' with '@export'"),
+           said.1)
+
+    lbr_drop([p, out])
+end ppe_only_the_pipe_hook_missing
+
+@test("on a hosted target the library answers the pipe hook under a weak export, over the C shim")
+ppe_hosted_pipe_is_weak()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.process.{Stdio, pipe, spawn}
+
+        val (r, w) = pipe().unwrap()
+
+        print(spawn("true", stdin = Stdio.FromFile(r), stdout = Stdio.ToFile(w)).is_ok())
+        """)
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
+
+    lbr_drop([p])
+    assert(said.0 == 0, said.1)
+
+    var defined = ""
+
+    for line in lines_of(said.1)
+        if line.starts_with("define ") && line.contains(" @sysl_proc_pipe(") then defined = line
+
+    assert(defined.starts_with("define weak "), s"sysl_proc_pipe: $defined")
+    assert(said.1.contains("@sysl_proc_posix_pipe("), "the hosted answer does not call the shim")
+end ppe_hosted_pipe_is_weak
