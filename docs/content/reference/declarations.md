@@ -364,8 +364,43 @@ A literal, a range, or a **variant** is a *test*, and a binding has no other arm
 test does not match, so each is refused with that as the reason. Those belong in a `match` (see
 [Patterns](../patterns/)).
 
-Like the comma form, this is **a local form**: the parts have nowhere to carry a type, so one at the
-top of a file is refused rather than becoming a quiet local of the entry point.
+**A pattern binding may state the type of the whole value**, written after the pattern as a plain
+binding writes it after the name. It is the position the value is read in, so a literal inside the
+value takes its width from it, and the parts are taken apart at the stated type:
+
+```sysl
+show()
+    val (a, b): (u64, u8) = (4000000000, 250)
+    var (lo, hi): (i16, i16) = (-1, 1)
+
+    hi = hi + 1
+
+    print(a + u64(b), lo, hi)
+
+show()
+```
+
+```output
+4000000250 -1 2
+```
+
+A value the stated type does not fit is refused in the words a plain binding's is:
+
+```sysl
+show()
+    val (c, d): (u64, u64) = (5, "x")
+
+    print(c, d)
+
+show()
+```
+
+```error
+cannot initialize the parts of this binding: declared (ulong, ulong) but the value is (ulong, string)
+```
+
+Like the comma form, this is **a local form**, so one at the top of a file is refused rather than
+becoming a quiet local of the entry point.
 
 The same pattern stands in a
 [`for` header](/reference/statements/#the-loop-variable-may-be-a-pattern), where it takes the element
