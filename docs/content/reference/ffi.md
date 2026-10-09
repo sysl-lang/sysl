@@ -465,6 +465,122 @@ Two consequences follow:
   `dlsym` asks for are found in the dynamic symbol table, which is precisely where a hidden symbol is
   not.
 
+### Exported storage
+
+[An `extern` reads a variable](#an-extern-also-declares-a-variable) C laid down; `@export` above a
+module `var` or `val` lays one down for C. It is the half of a C library's interface that is not
+calls — `errno`, `environ`, `stdin`, `optarg` are objects, and a C library written in sysl has to
+define them:
+
+```sysl build=c
+module mylib
+
+@export
+var errno: i32 = 0
+
+@export("mylib_version")
+val version: u32 = 0x0102
+
+@export
+var scratch: [64]u8
+
+@export("mylib_fail")
+fail(code: i32) -> i32
+    errno = code
+    -1
+```
+
+**The symbol is the storage**, a C data object rather than an entry in front of one: a `var` with a
+value lands in `.data`, a `var` with none starts at its type's zero in `.bss`, and a `val` is
+read-only data. There is no thunk to stand between, since an object has no calling convention, so
+`fail` above writes the very `errno` a C caller reads afterwards. The header `build-c` writes
+declares each one as C would, a `val` as `const`:
+
+```c
+extern int32_t errno;
+extern uint32_t const mylib_version;
+extern uint8_t scratch[64];
+
+int32_t mylib_fail(int32_t code);
+```
+
+**An `extern` naming the symbol elsewhere in the program is the same object.** A module that reads
+`errno` through `extern errno: i32` and the module that exports it link to one definition, as
+[a module may supply another module's `extern`](#a-module-may-supply-another-module-s-extern)
+function:
+
+```sysl
+@export("tally")
+static var count: i32 = 0
+
+extern "tally" seen: i32
+
+count += 3
+print(seen)
+```
+
+```output
+3
+```
+
+In the file a program starts in, a top-level binding is the body's local, and `static` hands it
+back to the module, as it does for every other binding there. A local has no symbol to publish — it
+is a new object on every call:
+
+```sysl
+f() -> i32
+    @export
+    var n: i32 = 0
+    n
+
+print(f())
+```
+
+```error
+'n' is a local, so it cannot be exported
+```
+
+**What it may hold is what an exported function may take, and an array too.** C declares an array
+*object* as readily as a struct, `extern uint8_t scratch[64];`, though it has no prototype passing
+one by value — so the rule a struct's field is held to is the rule here:
+
+```sysl
+module mylib
+
+@export
+val banner: string = "hello"
+```
+
+```error
+'mylib.banner' is exported as string, which C has no way to spell — exported storage is an integer, a float, a 'bool', a 'char', a pointer, a function pointer, a simple enum, or an array or struct built out of those
+```
+
+**Its value has to be [constant data](#what-constant-data-is), on every build.** A C program may
+read the object from a static initializer of its own, or from a constructor that runs before the
+archive's, so a value filled by code is one C can find unfilled — and on a bare machine nothing
+fills it at all. Leaving the value off starts it at zero, which is constant data:
+
+```sysl
+module mylib
+
+counter() -> i32 = 7
+
+@export
+var start: i32 = counter()
+```
+
+```error
+'mylib.start' is exported, so C may read it before anything of this program has run
+```
+
+The rest is the function's rules over again. The symbol is a C identifier — the declared name, or
+the one the attribute names. **A `private` one is published hidden** and left out of the header, as
+[a private export](#a-private-export) is. **A `@thread_local` one is a thread-local symbol** — C's
+`errno` is one in every real C library — declared `SYSL_THREAD_LOCAL` in the header, a macro the
+header defines as `_Thread_local` for C and `thread_local` for C++; a target with no thread-local
+storage refuses `@thread_local` whether or not it is exported. Two exports of one symbol, whether
+objects or a function and an object, are refused as two definitions of one symbol.
+
 ### Module storage, and who fills it
 
 Module storage is filled before a program's own statements run, and **a C project supplies its own
@@ -545,6 +661,35 @@ val rate: f64 = 48000.0 / 3.0
 @export
 begin() -> i32 = gain.raw + taps[0] + i32(rate)
 ```
+
+**The address of module storage is constant data too** — of a `var`, a `val` or an `extern`
+variable, and of an element or a field inside one at an index the compiler can fold. C's
+`FILE *stdout = &files[1]` is not a value anybody computes: it is a relocation, which the linker
+fills in, so the object file carries it and nothing runs — on a bare machine as anywhere:
+
+```sysl build=c target=aarch64-freestanding
+module mylib
+
+struct File
+    fd: i32
+    flags: u32
+
+var files: [3]File = [File(0, 0), File(1, 0), File(2, 0)]
+
+@export
+val stdout: *File = &files[1]
+
+val stdout_flags: *u32 = &files[1].flags
+
+@export
+fd_of_stdout() -> i32 = stdout.fd + i32(*stdout_flags)
+```
+
+Three addresses are not constants, and storage holding one stays code, filled before the program's
+statements like any other computed initializer: the address of `@thread_local` storage, which is a
+different one on every thread; an element of a view or through a pointer, which is a load before it
+is an address; and an index the array does not have, which would trap where it ran — so it is left
+to run, and trap, as it would have.
 
 **A call is constant data only when it calls a
 [`const` function](/reference/declarations/#a-const-function-runs-while-compiling)** over constant

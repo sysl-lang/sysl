@@ -251,9 +251,47 @@ check_exports_emitted(a: &Analysis, p: TProgram, own: Buf[string])
         export_signature(a, item)
 
     export_duplicates(a, exported)
-    export_names(a, exported)
+    export_names(a, exported, storage_by_symbol(p.vals))
     export_storage(a, p, exported)
+    stored_export_duplicates(a, p, exported)
 end check_exports_emitted
+
+// Exported storage claiming a symbol something else exported here claims too -- another object, or a
+// function. One symbol is one definition whichever kind each is, and the linker would say so naming
+// a symbol no sysl file spells as a duplicate; this names both declarations instead.
+private stored_export_duplicates(a: &Analysis, p: TProgram, exported: Buf[TFunc])
+    var seen: Buf[string] = buf()
+
+    for i in 0..<p.vals.len()
+        val v = p.vals.at(i)
+
+        if v.exported.is_none() then continue
+
+        val symbol = v.exported.unwrap()
+
+        if holds_string(seen, symbol) then continue
+
+        seen.push(symbol)
+
+        var claimants: Buf[string] = buf()
+
+        for j in 0..<p.vals.len()
+            if p.vals.at(j).exported == Some(symbol)
+                claimants.push(s"'${qualified_name(p.vals.at(j).symbol)}'")
+
+        for f in exported
+            if f.exported == Some(symbol) then claimants.push(s"'${qualified_name(f.name)}'")
+
+        if claimants.len() > 1
+            val d = a.tables.vals.get(v.symbol)
+
+            if d.is_some()
+                a.fault(d.unwrap().scope, d.unwrap().export.unwrap().span,
+                        s"'$symbol' is exported by ${joined_and(sorted_names(claimants))} — one " +
+                        "symbol is one definition, and the linker has no way to tell which was meant")
+            end if
+        end if
+end stored_export_duplicates
 
 // An exported function reaching **computed** module storage on a build with nowhere to fill it.
 //
@@ -661,8 +699,8 @@ end joined_list
 // A symbol claimed by two *functions* is left to `export_duplicates`, whose sentence is about the
 // linker and is the better one for that case -- hence a group having to hold a type to be reported
 // here.
-private export_names(a: &Analysis, exported: Buf[TFunc])
-    val types = header_aggregates(exported)
+private export_names(a: &Analysis, exported: Buf[TFunc], storage: Buf[TVal])
+    val types = header_aggregates(exported, storage)
 
     var names: Buf[string] = buf()
     var what: Buf[Buf[string]] = buf()
@@ -678,6 +716,9 @@ private export_names(a: &Analysis, exported: Buf[TFunc])
     for f in exported
         claim(&names, &what, f.exported.unwrap(), s"the function '${qualified_name(f.name)}'")
 
+    for v in storage
+        claim(&names, &what, v.exported.unwrap(), s"the storage '${qualified_name(v.symbol)}'")
+
     val order = sorted_names(names)
 
     for name in order
@@ -687,12 +728,20 @@ private export_names(a: &Analysis, exported: Buf[TFunc])
             // The collision is in the header rather than at either declaration, so it is told with
             // no position, as the reference tells it; the first export only orders it in the report.
             if group.len() > 1
-                val at = exported.at(0)
-
-                a.fault_unplaced(func_home(a, at.name), at.span,
-                        s"'$name' is the C name of ${joined_and(sorted_names(group))} — a header " +
+                val said = s"'$name' is the C name of ${joined_and(sorted_names(group))} — a header " +
                         "declares both in one namespace, so a C project including it would see " +
-                        "the name twice. Give each the name it should carry, '@export(\"...\")'")
+                        "the name twice. Give each the name it should carry, '@export(\"...\")'"
+
+                if !exported.is_empty()
+                    val at = exported.at(0)
+
+                    a.fault_unplaced(func_home(a, at.name), at.span, said)
+                else
+                    val d = a.tables.vals.get(storage.at(0).symbol)
+
+                    if d.is_some() then a.fault_unplaced(d.unwrap().scope, d.unwrap().span, said)
+                end if
+            end if
 end export_names
 
 private claim(names: *Buf[string], what: *Buf[Buf[string]], name: string, said: string)

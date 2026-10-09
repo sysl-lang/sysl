@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
+import sysl.math.bigint.from_int
 import sysl.text.Search
 
 // Typing the body a function's declaration is followed by, whatever the body is made of.
@@ -1645,18 +1646,30 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                 //
                 // **A call to a `const` function is run here**, and its value laid down on every
                 // target: what would have trapped at startup is refused now (`const_eval.sysl`).
-                if init.is_some() && !laid_down(init.unwrap())
+                //
+                // **An address is constant data too, but not a literal**: `&files[1]` is a relocation
+                // the linker fills in, so it is laid down as it stands rather than folded, and it is
+                // the image succeeding -- not the shape of what came back -- that says so.
+                var imaged = init.is_none() || laid_down(init.unwrap())
+
+                if !imaged
                     val run = const_val_image(cx, d.name, init.unwrap())
                     val image = if run.is_some() then run else static_image(cx, init.unwrap())
 
-                    if image.is_some() then init = image
+                    if image.is_some()
+                        init = image
+                        imaged = true
+                    end if
+                end if
 
-                val computed = init.is_some() && !laid_down(init.unwrap())
+                val computed = !imaged
 
                 if d.thread_local then check_per_thread(cx, d.span, key, computed)
 
+                if d.export.is_some() then check_exported_storage(cx, d, key, ty, computed)
+
                 out.push(TVal(key, stored, init, computed, writable, storage_align(cx, d), d.section,
-                              d.thread_local))
+                              d.thread_local, exported_storage_symbol(d), storage_hidden(d)))
 
     out
 end module_storage
@@ -1705,6 +1718,75 @@ private check_per_thread(cx: &Analyzer, span: Span, key: string, computed: bool)
                  "built from them are all values; a call is not. Leave the value off to start " +
                  "every thread at the type's zero, and do the work in each thread instead")
 end check_per_thread
+
+// What `@export` above module storage asks that plain storage does not
+// (`reference/ffi.md § Exported storage`): a symbol C can spell, a type C can declare, and a starting
+// value the object file carries.
+//
+// **The type rule is an exported function's, with the one difference storage makes**: C declares an
+// array object as readily as a struct, `extern int t[3];`, where it has no prototype passing one by
+// value -- so an array is admitted here, its element held to the same rule a field is.
+//
+// **The value has to be constant data, on every build.** A C program may read the object from its
+// own static initializers, or from a constructor of its own running before this archive's, so a
+// value filled by code is one C can see unfilled -- and on a freestanding target nothing would fill
+// it at all. An address of other module storage is constant data, being a relocation.
+private check_exported_storage(cx: &Analyzer, d: ValueDecl, key: string, ty: Type, computed: bool)
+    val e = d.export.unwrap()
+    val shown = qualified_name(key)
+
+    if e.symbol.is_some() && !c_identifier(e.symbol.unwrap())
+        cx.fault(e.span, s"'${e.symbol.unwrap()}' is not a name C can declare — an exported " +
+                 "symbol is a C identifier, so it is a letter or '_' followed by letters, digits " +
+                 "and '_'")
+        return
+    end if
+
+    if e.symbol.is_none() && !c_identifier(d.name)
+        cx.fault(e.span, s"'$shown' is not a name C can declare, so exporting it under its own " +
+                 "name would publish a symbol no C declaration could spell — name the symbol " +
+                 "instead, '@export(\"...\")'")
+        return
+    end if
+
+    if !mentions_unknown(ty) && !export_carried(ty)
+        cx.fault(e.span, s"'$shown' is exported as ${type_show(ty)}, which C has no way to spell " +
+                 s"— exported storage is ${storage_spellable()}. ${export_advice(ty)}")
+        return
+    end if
+
+    if computed
+        cx.fault(e.span, s"'$shown' is exported, so C may read it before anything of this program " +
+                 "has run — an exported object starts at the value the object file carries, and " +
+                 "this initializer is code that runs before the program's statements. Make it " +
+                 "constant data — a literal, a 'const', the address of other module storage, and " +
+                 "the arrays and structs built from those — or leave the value off to start it at " +
+                 "its type's zero and fill it from a function C calls first")
+end check_exported_storage
+
+// The shapes exported storage may take, in the sentence a refusal quotes.
+storage_spellable() -> string =
+    "an integer, a float, a 'bool', a 'char', a pointer, a function pointer, a simple enum, or an " +
+    "array or struct built out of those"
+
+// The symbol storage is published under, where it is exported at all: the one the attribute named,
+// and the declaration's own bare name where it named none.
+private exported_storage_symbol(d: ValueDecl) -> Option[string]
+    if d.export.is_none() then return None
+
+    d.export.unwrap().symbol match
+        Some(s) -> Some(s)
+        None -> Some(d.name)
+end exported_storage_symbol
+
+// Whether exported storage is published hidden: it is, where the declaration is not public, which is
+// the private export's rule (`export_hidden`).
+private storage_hidden(d: ValueDecl) -> bool
+    if d.export.is_none() then return false
+
+    d.vis match
+        Public -> false
+        _ -> true
 
 private is_zero_expr(e: TExpr) -> bool = *e.kind match
     TZero(_) -> true
@@ -1765,7 +1847,42 @@ private static_image(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
     TStructNew(decl, args) -> static_images(cx, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
     TCast(inner, to) -> cast_image(t, inner, to, cx.an.tables.layout.little_endian)
     TConstrainedCheck(value, target) -> constrained_image(cx, t, value, target)
+    TAddrOf(place, ty) -> place_image(cx, place).map(p -> TExpr(t.span, TAddrOf(p, ty)))
     _ -> if laid_down(t) then Some(t) else scalar_image(t, cx.an.tables.layout.little_endian)
+
+// **The address of module storage is constant data**, and so is the address of an element or a field
+// inside it: C's `FILE *stdout = &files[1]` is a relocation the linker fills in, so the object file
+// carries it and nothing runs. The place is handed back with each index folded to the literal it
+// comes to, which is what the emitter writes as a constant `getelementptr`.
+//
+// What is not a constant: thread-local storage, whose address is a different one on every thread; an
+// element of a view or through a pointer, which is a load before it is an address; a bitfield, which
+// has no address of its own; and an index the array does not have, which would trap where it ran and
+// so stays code that runs, and traps, as it would have.
+private place_image(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind match
+    TGlobal(symbol, _, _) ->
+        val d = cx.an.tables.vals.get(symbol)
+
+        if d.is_some() && d.unwrap().thread_local then None else Some(place)
+    TField(receiver, index, ty) ->
+        if bitfield_ranges_of(texpr_type(receiver)).is_some() then return None
+
+        place_image(cx, receiver).map(r -> TExpr(place.span, TField(r, index, ty)))
+    TIndex(receiver, index, ty) ->
+        val length = nameless(texpr_type(receiver)) match
+            Array(n, _) -> long(n)
+            _ -> return None
+
+        val at = const_fold_typed(index, cx.an.tables.layout.little_endian) match
+            Some(ConstInt(n)) -> n.to_long()
+            _ -> None
+
+        if at.is_none() || at.unwrap() < 0 || at.unwrap() >= length then return None
+
+        val folded = TExpr(index.span, TIntLit(from_int(at.unwrap()), texpr_type(index)))
+
+        place_image(cx, receiver).map(r -> TExpr(place.span, TIndex(r, folded, ty)))
+    _ -> None
 
 // A constant made into a constrained subtype. **A name-only subtype -- a `new` type, or one with no
 // range -- checks nothing**, so `PhysAddr(0)` is the constant it converts and is laid down as one. A

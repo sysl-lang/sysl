@@ -581,6 +581,7 @@ private external_global(line: string, e: Entity, hidden: bool) -> string
     var tls = ""
     var kind = ""
     var preemption = ""
+    var own_hidden = false
 
     loop
         if at >= b.len then return ""
@@ -600,9 +601,12 @@ private external_global(line: string, e: Entity, hidden: bool) -> string
         // they would reach it through the GOT.
         if word == "dso_local" then preemption = "dso_local "
 
+        // Private exported storage is defined hidden, and the units that only read it say so too.
+        if word == "hidden" then own_hidden = true
+
     val ty_end = type_end(b, at)
     val name = if hidden then spelled(e.name) else e.name
-    val vis = if hidden then "hidden " else ""
+    val vis = if hidden || own_hidden then "hidden " else ""
 
     s"@$name = external $preemption$vis$tls$kind ${line[at..<ty_end]}\n"
 end external_global
@@ -780,9 +784,12 @@ compile_object_in_units(cc: string, ir: string, obj: string, target: Target,
         Err(f) -> Err(if f.unrun then f.said else tool_failed(cc, f.code, f.said))
 end compile_object_in_units
 
-// Whether `ir` defines a hidden function. Before a module is split nothing is hidden but a private
-// `@export`'s entry (`emit_export.sysl`); the promoted locals are made hidden by the split itself.
+// Whether `ir` defines a hidden function or global. Before a module is split nothing is hidden but a
+// private `@export`'s entry (`emit_export.sysl`) and private exported storage (`emit_static.sysl`);
+// the promoted locals are made hidden by the split itself.
 private defines_hidden(ir: string) -> bool
+    if ir.contains(" = hidden ") || ir.contains(" dso_local hidden ") then return true
+
     var at: usize = 0
 
     loop

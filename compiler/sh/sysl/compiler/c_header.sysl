@@ -18,7 +18,7 @@ import sysl.text.{from_utf8_unchecked, str_builder}
 // It is here rather than inside the check that reads it because the header would ask the same
 // question -- which types land in the file -- and working that set out a second time is how the two
 // would come to disagree about what is in it.
-header_aggregates(exports: Buf[TFunc]) -> Buf[Type]
+header_aggregates(exports: Buf[TFunc], storage: Buf[TVal] = buf()) -> Buf[Type]
     var seen: Buf[Type] = buf()
     var named: Buf[Type] = buf()
 
@@ -27,6 +27,9 @@ header_aggregates(exports: Buf[TFunc]) -> Buf[Type]
             header_walk(f.params.at(j).1, &seen, &named)
 
         header_walk(f.ret_ty, &seen, &named)
+
+    for v in storage
+        header_walk(v.ty, &seen, &named)
 
     named
 end header_aggregates
@@ -134,8 +137,9 @@ private is_c_ident_byte(b: u8) -> bool =
 // `name` is what the include guard is built from -- the project's name, so two headers in one C
 // project do not collide. Anything not a C identifier is replaced, since a guard is a macro name
 // and a project may be called what it likes.
-c_header_render(funcs: Buf[TFunc], name: string) -> string
+c_header_render(funcs: Buf[TFunc], name: string, vals: Buf[TVal] = buf()) -> string
     val exports = exports_by_symbol(funcs)
+    val storage = storage_by_symbol(vals)
     val guard = s"SYSL_${header_guard_name(name)}_H"
     var out = str_builder()
 
@@ -144,6 +148,7 @@ c_header_render(funcs: Buf[TFunc], name: string) -> string
     out.push("#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n\n")
 
     if reaches_never(exports) then out.push(noreturn_macro())
+    if per_thread_storage(storage) then out.push(thread_local_macro())
 
     out.push("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
 
@@ -151,17 +156,24 @@ c_header_render(funcs: Buf[TFunc], name: string) -> string
     // dependency order -- a struct with a struct in it after what it holds -- because C needs a
     // complete type to lay a member out, and there is nothing here to forward-declare around: a
     // by-value member is the case a forward declaration does not serve.
-    val aggregates = header_aggregates(exports)
+    val aggregates = header_aggregates(exports, storage)
 
     for item in aggregates
         out.push(s"${c_aggregate_definition(item)}\n")
 
-    if exports.is_empty()
+    if exports.is_empty() && storage.is_empty()
         // A header with nothing in it is worth writing rather than refusing: a build that exported
         // nothing is a build whose author forgot the attribute, and an empty header says so where a
         // missing file would read as a step that had not run.
         out.push("/* This module exports nothing — no function in it is marked '@export'. */\n\n")
     else
+        // The objects first, as a C header writes its `extern` variables above the functions that
+        // use them.
+        for item in storage
+            out.push(s"${c_storage_declaration(item)};\n")
+
+        if !storage.is_empty() && !exports.is_empty() then out.push("\n")
+
         for item in exports
             out.push(s"${c_prototype(item)};\n")
 
@@ -198,6 +210,65 @@ exports_by_symbol(funcs: Buf[TFunc]) -> Buf[TFunc]
 end exports_by_symbol
 
 private symbol_of(f: TFunc) -> string = f.exported.unwrap_or("")
+
+// The exported module storage of a compilation, in the order the symbols sort -- the public ones
+// only, for `exports_by_symbol`'s reason.
+storage_by_symbol(vals: Buf[TVal]) -> Buf[TVal]
+    var out: Buf[TVal] = buf()
+
+    for i in 0..<vals.len()
+        if vals.at(i).exported.is_some() && !vals.at(i).export_hidden then out.push(vals.at(i))
+
+    for i in 1..<out.len()
+        var j = i
+
+        while j > 0 && out.at(j).exported.unwrap() < out.at(j - 1).exported.unwrap()
+            val held = out.at(j)
+
+            out.set(j, out.at(j - 1))
+            out.set(j - 1, held)
+            j -= 1
+
+    out
+end storage_by_symbol
+
+// One exported object as C declares it: `extern`, `const` where it is a `val` -- which C may then
+// keep in read-only memory, as the object file does -- `volatile` where the storage is, and the
+// thread-local storage class where each thread has its own. The qualifiers go on the declarator,
+// beside the name, which is where C reads them as being about the object rather than about what a
+// pointer points at: `int32_t const start`, `uint8_t * const banner`.
+c_storage_declaration(v: TVal) -> string
+    var declared = v.exported.unwrap()
+
+    if !v.writable then declared = s"const $declared"
+    if is_volatile(v.ty) then declared = s"volatile $declared"
+
+    val tls = if v.thread_local then "SYSL_THREAD_LOCAL " else ""
+
+    s"extern $tls${c_declare(v.ty, declared)}"
+end c_storage_declaration
+
+private is_volatile(t: Type) -> bool = t match
+    Volatile(_) -> true
+    _ -> false
+
+private per_thread_storage(storage: Buf[TVal]) -> bool
+    for item in storage
+        if item.thread_local then return true
+
+    false
+end per_thread_storage
+
+// C11 spells a thread-local object `_Thread_local` and C++11 `thread_local`, and a header written
+// for both says which through a macro, as it does for `noreturn`.
+private thread_local_macro() -> string =
+    "#ifndef SYSL_THREAD_LOCAL\n" +
+    "#if defined(__cplusplus)\n" +
+    "#define SYSL_THREAD_LOCAL thread_local\n" +
+    "#else\n" +
+    "#define SYSL_THREAD_LOCAL _Thread_local\n" +
+    "#endif\n" +
+    "#endif\n\n"
 
 // Whether any prototype in the header returns `never`, which is the only thing the macro below is
 // written for.

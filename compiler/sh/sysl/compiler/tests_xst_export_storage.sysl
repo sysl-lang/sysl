@@ -1,0 +1,541 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.{split, Search}
+
+// **Module storage published under a C symbol** (`reference/ffi.md § Exported storage`), and **the
+// address of module storage as constant data** (`§ What constant data is`) -- what a C library
+// written in sysl needs to define `errno`, `environ`, `stdout` and `FILE *stdout = &files[1]`.
+
+private xst_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A project whose library module `mylib` is `lib`, and whose entry file is `main`.
+private xst_project(main: string, lib: string) -> string
+    val root = make_temp_dir("sysl-xst").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    make_dir_all(s"$root/mylib").unwrap()
+    write_text(s"$root/mylib/mylib.sysl", s"module mylib\n\n$lib").unwrap()
+    root
+end xst_project
+
+// `sysl <args>` as the command line answers it: the status, and everything it said.
+private xst_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    (code, text)
+end xst_cli
+
+// What `emit-llvm` prints for a project, on `target` or the host where it is empty.
+private xst_ir(root: string, target: string) -> (int, string)
+    var hosted: [3]string = ["sysl", "emit-llvm", root]
+    var bare: [5]string = ["sysl", "emit-llvm", "--target", target, root]
+
+    if target == "" then xst_cli(hosted[..]) else xst_cli(bare[..])
+end xst_ir
+
+// The LLVM text of a library module reached from a one-line program, which must compile.
+private xst_lib_ir(lib: string, target: string) -> string
+    val root = xst_project("print(mylib.touch())\n", lib)
+    val got = xst_ir(root, target)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    got.1
+end xst_lib_ir
+
+// What a library module is refused with, reached from a one-line program.
+private xst_lib_refused(lib: string) -> string
+    val root = xst_project("print(mylib.touch())\n", lib)
+    val got = xst_ir(root, "")
+
+    remove_dir_all(root).unwrap_or(())
+    assert(got.0 != 0, s"expected a refusal, and it compiled:\n${got.1}")
+    got.1
+end xst_lib_refused
+
+// Whether some line of `text` starts with `head` and holds `part`.
+private xst_line(text: string, head: string, part: string) -> bool
+    val lines = split(text, "\n")
+
+    for i in 0..<lines.len
+        if lines[i].starts_with(head) && lines[i].contains(part) then return true
+
+    false
+end xst_line
+
+private xst_tool(name: string) -> Option[string]
+    val candidates: [2]string = [s"/opt/homebrew/opt/llvm/bin/$name", s"/usr/local/opt/llvm/bin/$name"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end xst_tool
+
+// The libc module the archive tests build: storage of every kind, and functions C calls to see it.
+// The error word is `errno` on a bare machine, where nothing else defines one; a host's C library
+// has its own, so a program linked there names it otherwise.
+private xst_libc(err: string) -> string =
+    "struct File\n    fd: i32\n    flags: u32\n\n" +
+    s"@export(\"$err\")\nvar errno: i32 = 0\n\n" +
+    "@export(\"mylib_mode\")\nvar mode: i32 = 2\n\n" +
+    "@export(\"mylib_version\")\nval version: u32 = 258\n\n" +
+    "@export\nvar scratch: [8]u8\n\n" +
+    "var files: [3]File = [File(0, 0), File(1, 7), File(2, 0)]\n\n" +
+    "@export(\"mylib_stdout\")\nval stdout_file: *File = &files[1]\n\n" +
+    "@export(\"mylib_fail\")\nfail(code: i32) -> i32\n    errno = code\n    scratch[2] = 5\n    -1\n\n" +
+    "@export(\"mylib_errno\")\nerrno_now() -> i32 = errno\n"
+
+// A project holding nothing but `mylib`, as an archive project is.
+private xst_archive_project(lib: string) -> string
+    val root = make_temp_dir("sysl-xst").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    make_dir_all(s"$root/mylib").unwrap()
+    write_text(s"$root/mylib/mylib.sysl", s"module mylib\n\n$lib").unwrap()
+    root
+end xst_archive_project
+
+// -- the grammar -----------------------------------------------------------------------------------
+
+@test("'@export' above a 'var' or a 'val' is read onto the binding, named or bare")
+xst_the_grammar_reads_it()
+    assert(pf("@export\nvar errno: i32 = 0\n").contains("(var @export errno"), pf("@export\nvar errno: i32 = 0\n"))
+    assert(pf("@export(\"v\")\nval x: u32 = 1\n").contains("(val @export(\"v\") x"), pf("@export(\"v\")\nval x: u32 = 1\n"))
+    assert(pf("@export\n@align(16)\nvar t: [4]u8\n").contains("@export @align(16) t"), pf("@export\n@align(16)\nvar t: [4]u8\n"))
+    assert(pf("@export\nstatic var n: i32 = 0\n").contains("@export n"), pf("@export\nstatic var n: i32 = 0\n"))
+end xst_the_grammar_reads_it
+
+// `private` is read before the keyword, above the annotations' declaration, and was once dropped on
+// the way to the binding -- a `@section private var` came out public.
+@test("'private' written under an annotation stays on the binding")
+xst_private_under_an_annotation_is_kept()
+    assert(pf("@export\nprivate var n: i32 = 0\n").contains("(var private @export n"), pf("@export\nprivate var n: i32 = 0\n"))
+    assert(pf("@section(\".x\")\nprivate val v: i32 = 1\n").contains("(val private @section"), pf("@section(\".x\")\nprivate val v: i32 = 1\n"))
+
+@test("a 'const' has no storage, so '@export' above one is told what it names")
+xst_not_above_a_const()
+    val said = pf_err("@export\nconst N: i32 = 1\n")
+
+    assert(said.contains("names what C sees"), said)
+    assert(said.contains("a module 'var' or 'val''s symbol"), said)
+
+@test("a binding naming several has no one object to publish")
+xst_not_above_several()
+    val said = pf_err("@export\nvar a, b = 1, 2\n")
+
+    assert(said.contains("'@export' publishes one object under one C symbol"), said)
+
+@test("'@thread_local' stands beside '@export'")
+xst_thread_local_beside_export()
+    assert(pf_err("@export\n@thread_local\nvar errno: i32 = 0\n") == "", pf_err("@export\n@thread_local\nvar errno: i32 = 0\n"))
+
+@test("and '@packed' beside it is still the struct reading")
+xst_packed_beside_it_is_refused()
+    assert(pf_err("@packed\n@export(\"x\")\nvar count: i32 = 0\n").contains("together they mark a struct"))
+
+// -- what it emits ---------------------------------------------------------------------------------
+
+private xst_kinds() -> string =
+    "@export\nvar errno: i32 = 3\n\n" +
+    "@export(\"mylib_version\")\nval version: u32 = 258\n\n" +
+    "@export\nvar scratch: [4]u8\n\n" +
+    "@export(\"mylib_hidden\")\nprivate var inner: i64 = 1\n\n" +
+    "touch() -> i32\n    errno += 1\n    inner += 1\n    errno + i32(version) + i32(scratch[0])\n"
+
+@test("a 'var' is a global under its symbol, a 'val' a constant, one with no value zero, a private one hidden")
+xst_emits_each_kind()
+    if !xst_ready() then return
+
+    val ir = xst_lib_ir(xst_kinds(), "")
+
+    assert(ir.contains("@errno = global i32 3"), ir)
+    assert(ir.contains("@mylib_version = constant i32 258"), ir)
+    assert(ir.contains("@scratch = global [4 x i8] zeroinitializer"), ir)
+    assert(ir.contains("@mylib_hidden = hidden global i64 1"), ir)
+    assert(!ir.contains("mylib$errno"), ir)
+    assert(!ir.contains("mylib$version"), ir)
+end xst_emits_each_kind
+
+@test("every read and write of it names the symbol, and nothing names the key")
+xst_reads_name_the_symbol()
+    if !xst_ready() then return
+
+    val ir = xst_lib_ir(xst_kinds(), "")
+
+    assert(ir.contains("load i32, ptr @errno"), ir)
+    assert(ir.contains("store i32 %"), ir)
+    assert(ir.contains(", ptr @errno"), ir)
+    assert(ir.contains("load i64, ptr @mylib_hidden"), ir)
+end xst_reads_name_the_symbol
+
+@test("on a bare machine it is dso_local, as every symbol there is")
+xst_bare_is_dso_local()
+    if !xst_ready() then return
+
+    val ir = xst_lib_ir(xst_kinds(), "aarch64-freestanding")
+
+    assert(ir.contains("@errno = dso_local global i32 3"), ir)
+    assert(ir.contains("@mylib_version = dso_local constant i32 258"), ir)
+    assert(ir.contains("@mylib_hidden = dso_local hidden global i64 1"), ir)
+
+@test("a '@thread_local' one is a thread-local symbol where the target has the storage")
+xst_thread_local_is_a_tls_symbol()
+    if !xst_ready() then return
+
+    val ir = xst_lib_ir("@export\n@thread_local\nvar errno: i32 = 0\n\ntouch() -> i32\n    errno += 1\n    errno\n",
+                        "")
+
+    assert(ir.contains("@errno = thread_local global i32 0"), ir)
+
+@test("and is refused where it has none, exported or not")
+xst_thread_local_refused_bare()
+    if !std_root().is_ok() then return
+
+    val root = xst_project("print(mylib.touch())\n",
+                           "@export\n@thread_local\nvar errno: i32 = 0\n\ntouch() -> i32 = errno\n")
+    val got = xst_ir(root, "aarch64-freestanding")
+
+    remove_dir_all(root).unwrap_or(())
+    assert(got.0 != 0, got.1)
+    assert(got.1.contains("cannot be '@thread_local' on 'aarch64-freestanding'"), got.1)
+end xst_thread_local_refused_bare
+
+@test("an 'extern' elsewhere naming the symbol is the same object, declared nowhere beside it")
+xst_an_extern_is_the_same_object()
+    if !xst_ready() then return
+
+    val root = xst_project("@export(\"tally\")\nstatic var count: i32 = 0\n\nextern \"tally\" seen: i32\n\n" +
+                           "count += 3\nprint(seen)\nprint(mylib.touch())\n",
+                           "extern \"tally\" other: i32\n\ntouch() -> i32 = other + 1\n")
+    val ir = xst_ir(root, "")
+
+    assert_eq(ir.0, 0, ir.1)
+    assert(ir.1.contains("@tally = global i32 0"), ir.1)
+    assert(!ir.1.contains("@tally = external"), ir.1)
+
+    var args: [5]string = ["sysl", "build", root, "-o", s"$root/exe"]
+    val built = xst_cli(args[..])
+
+    assert_eq(built.0, 0, built.1)
+
+    val ran = capture(s"$root/exe", [], "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(ran.text, "3\n4\n")
+end xst_an_extern_is_the_same_object
+
+// -- the refusals ----------------------------------------------------------------------------------
+
+@test("a type C cannot spell is refused, naming the storage and what it may be")
+xst_refuses_a_type_c_cannot_spell()
+    if !std_root().is_ok() then return
+
+    val said = xst_lib_refused("@export\nval banner: string = \"hello\"\n\ntouch() -> i32 = 1\n")
+
+    assert(said.contains("'mylib.banner' is exported as string, which C has no way to spell — exported storage is an integer"), said)
+    assert(said.contains("or an array or struct built out of those"), said)
+
+@test("an array is admitted, but its element is held to the field rule")
+xst_refuses_an_array_of_what_c_cannot_spell()
+    if !std_root().is_ok() then return
+
+    val said = xst_lib_refused("@export\nvar ns: [2]string\n\ntouch() -> i32 = 1\n")
+
+    assert(said.contains("'mylib.ns' is exported as [2]string"), said)
+    assert(said.contains("its element is string"), said)
+
+@test("a value code computes is refused: C may read the object before anything runs")
+xst_refuses_a_computed_value()
+    if !std_root().is_ok() then return
+
+    val said = xst_lib_refused("counter() -> i32 = 7\n\n@export\nvar start: i32 = counter()\n\ntouch() -> i32 = start\n")
+
+    assert(said.contains("'mylib.start' is exported, so C may read it before anything of this program has run"), said)
+
+@test("a symbol that is not a C identifier is refused")
+xst_refuses_a_symbol_c_cannot_name()
+    if !std_root().is_ok() then return
+
+    val said = xst_lib_refused("@export(\"1x\")\nvar n: i32 = 0\n\ntouch() -> i32 = n\n")
+
+    assert(said.contains("'1x' is not a name C can declare"), said)
+
+@test("and so is a declared name that is not one, with nothing naming the symbol")
+xst_refuses_a_name_c_cannot_name()
+    if !std_root().is_ok() then return
+
+    val said = xst_lib_refused("@export\nvar `my count`: i32 = 0\n\ntouch() -> i32 = `my count`\n")
+
+    assert(said.contains("is not a name C can declare, so exporting it under its own name"), said)
+
+@test("a local is refused: a symbol names one object for the whole run")
+xst_refuses_a_local()
+    if !std_root().is_ok() then return
+
+    val said = xst_lib_refused("touch() -> i32\n    @export\n    var n: i32 = 0\n    n\n")
+
+    assert(said.contains("'n' is a local, so it cannot be exported"), said)
+
+@test("in the file a program starts in, a top-level binding is the body's, and 'static' is the advice")
+xst_refuses_an_entry_file_local()
+    if !std_root().is_ok() then return
+
+    val root = xst_project("@export\nvar n: i32 = 0\n\nprint(n)\n", "touch() -> i32 = 1\n")
+    val got = xst_ir(root, "")
+
+    remove_dir_all(root).unwrap_or(())
+    assert(got.0 != 0, got.1)
+    assert(got.1.contains("'n' is a local, so it cannot be exported"), got.1)
+    assert(got.1.contains("write 'static' in front of it"), got.1)
+end xst_refuses_an_entry_file_local
+
+@test("two objects exporting one symbol are refused, naming both")
+xst_refuses_two_objects_one_symbol()
+    if !std_root().is_ok() then return
+
+    val said = xst_lib_refused("@export(\"x\")\nvar a: i32 = 0\n\n@export(\"x\")\nvar b: i32 = 0\n\ntouch() -> i32 = a + b\n")
+
+    assert(said.contains("'x' is exported by 'mylib.a' and 'mylib.b' — one symbol is one definition"), said)
+
+@test("and so are an object and a function")
+xst_refuses_an_object_and_a_function_one_symbol()
+    if !std_root().is_ok() then return
+
+    val said = xst_lib_refused("@export(\"x\")\nvar a: i32 = 0\n\n@export(\"x\")\nf() -> i32 = 1\n\ntouch() -> i32 = a + f()\n")
+
+    assert(said.contains("'x' is exported by 'mylib.a' and 'mylib.f'"), said)
+
+@test("and an object named like a struct in the header")
+xst_refuses_an_object_named_like_a_header_type()
+    if !std_root().is_ok() then return
+
+    val said = xst_lib_refused("@export(\"P\")\nstruct P\n    x: i32\n\n@export(\"P\")\nvar p: P = P(1)\n\ntouch() -> i32 = p.x\n")
+
+    assert(said.contains("'P' is the C name of"), said)
+    assert(said.contains("the storage 'mylib.p'"), said)
+
+// -- the header --------------------------------------------------------------------------------------
+
+@test("the header declares each public object extern, a 'val' const, and leaves a private one out")
+xst_the_header()
+    if !std_root().is_ok() then return
+
+    val root = xst_archive_project(xst_libc("errno") +
+                                   "\n@export(\"mylib_secret\")\nprivate var secret: i32 = 1\n\n" +
+                                   "@export(\"mylib_volatile\")\nvar flag: volatile u32\n\n" +
+                                   "@export\n@thread_local\nvar tls_errno: i32 = 0\n")
+    var args: [5]string = ["sysl", "emit-header", "--target", "aarch64-linux", root]
+    val got = xst_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+
+    val h = got.1
+
+    assert(h.contains("extern int32_t errno;\n"), h)
+    assert(h.contains("extern mylib_File * const mylib_stdout;\n"), h)
+    assert(h.contains("extern uint32_t const mylib_version;\n"), h)
+    assert(h.contains("extern uint32_t volatile mylib_volatile;\n"), h)
+    assert(h.contains("extern uint8_t scratch[8];\n"), h)
+    assert(h.contains("extern SYSL_THREAD_LOCAL int32_t tls_errno;\n"), h)
+    assert(h.contains("#define SYSL_THREAD_LOCAL _Thread_local"), h)
+    assert(h.contains("int32_t mylib_fail(int32_t code);"), h)
+    assert(!h.contains("mylib_secret"), h)
+    assert(h.index_of("extern int32_t errno;").unwrap() < h.index_of("extern uint8_t scratch[8];").unwrap(), h)
+end xst_the_header
+
+// -- C reads and writes it --------------------------------------------------------------------------
+
+private xst_c_main() -> string =
+    "#include <stdio.h>\n#include \"probe.h\"\n\n" +
+    "int main( void )\n{\n" +
+    "\tint before = mylib_err;\n" +
+    "\tint r = mylib_fail( 42 );\n" +
+    "\tmylib_err += 1;\n" +
+    "\tprintf( \"%d %d %d %d %u %d %d %u\\n\", before, r, mylib_err, mylib_errno(), mylib_version,\n" +
+    "\t        scratch[2], mylib_stdout->fd, mylib_stdout->flags );\n" +
+    "\treturn 0;\n}\n"
+
+@test("a C program linked against the archive reads, writes and sees writes to the same objects")
+xst_c_reads_and_writes_it()
+    if !xst_ready() then return
+
+    val root = xst_archive_project(xst_libc("mylib_err"))
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "-o", archive, "--header", s"$root/probe.h", root]
+    val built = xst_cli(args[..])
+
+    assert_eq(built.0, 0, built.1)
+    write_text(s"$root/main.c", xst_c_main()).unwrap()
+
+    val cc = find_clang(host_target(), None).unwrap()
+    val linked = capture(cc, ["-std=c11", "-Wall", "-Werror", s"-I$root", s"$root/main.c", archive, "-lm",
+                              "-o", s"$root/exe"], "", [], true).unwrap()
+
+    assert(linked.status.ok(), linked.text)
+
+    val ran = capture(s"$root/exe", [], "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert(ran.status.ok(), ran.text)
+    assert_eq(ran.text, "0 -1 43 43 258 5 1 7\n")
+end xst_c_reads_and_writes_it
+
+// -- a bare machine's archive -------------------------------------------------------------------------
+
+// The `llvm-nm` lines of the archive `build-c` writes for aarch64-freestanding, or None without the
+// tool.
+private xst_bare_archive(lib: string) -> Option[(string, string)]
+    val nm = xst_tool("llvm-nm")
+
+    if nm.is_none() then return None
+
+    val root = xst_archive_project(lib)
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root]
+    val built = xst_cli(args[..])
+
+    assert_eq(built.0, 0, built.1)
+
+    val listed = capture(nm.unwrap(), ["--defined-only", archive], "", [], true).unwrap()
+
+    assert(listed.status.ok(), listed.text)
+    Some((root, listed.text))
+end xst_bare_archive
+
+// Whether `nm` lists `symbol` with the type letter `kind`.
+private xst_nm_has(text: string, kind: string, symbol: string) -> bool
+    val lines = split(text, "\n")
+
+    for i in 0..<lines.len
+        val words = split(lines[i].trim(), " ")
+
+        if words.len == 3 && words[1] == kind && words[2] == symbol then return true
+
+    false
+end xst_nm_has
+
+@test("an aarch64-freestanding archive defines each object in data, bss or read-only data")
+xst_bare_archive_symbols()
+    if !xst_ready() then return
+
+    val got = xst_bare_archive(xst_libc("errno"))
+
+    if got.is_none() then skip("there is no llvm-nm to read the archive")
+
+    val text = got.unwrap().1
+
+    remove_dir_all(got.unwrap().0).unwrap_or(())
+    assert(xst_nm_has(text, "D", "mylib_mode"), text)
+    assert(xst_nm_has(text, "B", "errno"), text)
+    assert(xst_nm_has(text, "B", "scratch"), text)
+    assert(xst_nm_has(text, "R", "mylib_version"), text)
+    assert(xst_nm_has(text, "D", "mylib_stdout") || xst_nm_has(text, "R", "mylib_stdout"), text)
+    assert(xst_nm_has(text, "T", "mylib_fail"), text)
+end xst_bare_archive_symbols
+
+// -- the address of module storage is constant data ---------------------------------------------------
+
+private xst_addresses() -> string =
+    "struct File\n    fd: i32\n    flags: u32\n\n" +
+    "var files: [3]File = [File(0, 0), File(1, 7), File(2, 0)]\n" +
+    "var table: [4]i32 = [10, 20, 30, 40]\n\n" +
+    "@export(\"probe_stdout\")\nval stdout_ptr: *File = &files[1]\n" +
+    "val flags_ptr: *u32 = &files[1].flags\n" +
+    "val third: *i32 = &table[2]\n" +
+    "val whole: *[4]i32 = &table\n\n" +
+    "@export(\"probe_fd\")\nprobe_fd() -> i32 = stdout_ptr.fd + i32(*flags_ptr) + *third + (*whole)[3]\n\n" +
+    "touch() -> i32 = probe_fd()\n"
+
+@test("an address of module storage, of an element and of a field is a constant getelementptr")
+xst_addresses_are_constants()
+    if !xst_ready() then return
+
+    val ir = xst_lib_ir(xst_addresses(), "aarch64-freestanding")
+
+    assert(ir.contains("@probe_stdout = dso_local constant ptr getelementptr inbounds " +
+                       "(%struct.mylib$File, ptr @mylib$files, i64 1)\n"), ir)
+    assert(ir.contains("@mylib$flags_ptr = private constant ptr getelementptr inbounds " +
+                       "(%struct.mylib$File, ptr getelementptr inbounds (%struct.mylib$File, ptr " +
+                       "@mylib$files, i64 1), i32 0, i32 1)\n"), ir)
+    assert(ir.contains("@mylib$third = private constant ptr getelementptr inbounds (i32, ptr @mylib$table, i64 2)\n"), ir)
+    assert(ir.contains("@mylib$whole = private constant ptr @mylib$table\n"), ir)
+end xst_addresses_are_constants
+
+@test("so an archive for a bare machine reaching it builds, with no constructor and a relocation")
+xst_address_in_a_bare_archive()
+    if !xst_ready() then return
+
+    val objdump = xst_tool("llvm-objdump")
+
+    if objdump.is_none() then skip("there is no llvm-objdump to read the archive")
+
+    val root = xst_archive_project(xst_addresses())
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root]
+    val built = xst_cli(args[..])
+
+    assert_eq(built.0, 0, built.1)
+
+    val dump = capture(objdump.unwrap(), ["-rh", archive], "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert(dump.status.ok(), dump.text)
+    assert(!dump.text.contains("init_array"), dump.text)
+    assert(dump.text.contains("R_AARCH64_ABS64"), dump.text)
+end xst_address_in_a_bare_archive
+
+@test("on the host it runs, and the pointer sees a later write: it is the address, not a copy")
+xst_address_runs()
+    if !xst_ready() then return
+
+    val root = xst_project("print(mylib.touch())\nmylib.bump()\nprint(mylib.touch())\n",
+                           xst_addresses() + "\nbump()\n    files[1].fd = 5\n    table[2] = 300\n")
+
+    var args: [5]string = ["sysl", "build", root, "-o", s"$root/exe"]
+    val built = xst_cli(args[..])
+
+    assert_eq(built.0, 0, built.1)
+
+    val ran = capture(s"$root/exe", [], "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(ran.text, "78\n352\n")
+end xst_address_runs
+
+@test("an index the array does not have stays code, and a bare archive reaching it is refused")
+xst_address_out_of_range_stays_code()
+    if !std_root().is_ok() then return
+
+    val root = xst_archive_project("var table: [4]i32 = [10, 20, 30, 40]\n\nval past: *i32 = &table[4]\n\n" +
+                                   "@export(\"probe\")\nprobe() -> i32 = *past\n")
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", s"$root/probe.a", root]
+    val built = xst_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(built.0 != 0, built.1)
+    assert(built.1.contains("reaches 'mylib.past', which is module storage an initializer fills"), built.1)
+end xst_address_out_of_range_stays_code
+
+@test("the address of thread-local storage is a different one on each thread, so it stays code")
+xst_thread_local_address_stays_code()
+    if !xst_ready() then return
+
+    val ir = xst_lib_ir("@thread_local\nvar t: i32 = 0\n\nval p: *i32 = &t\n\ntouch() -> i32 = *p\n", "")
+
+    assert(ir.contains("@mylib$p = private global ptr zeroinitializer\n"), ir)
+    assert(!ir.contains("@mylib$p = private constant"), ir)

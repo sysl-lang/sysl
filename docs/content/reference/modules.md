@@ -1517,7 +1517,8 @@ print(nil.raw.len)
 
 That is `sysl.encoding.nil` exactly: the nil UUID is a module-level `val` for this reason and no
 other. [What constant data is](/reference/ffi/#what-constant-data-is) says which initializers are
-laid down that way — arrays, structs and variants over constant expressions, at any depth. A `const`
+laid down that way — arrays, structs and variants over constant expressions, at any depth, and the
+address of other module storage. A `const`
 whose *type* is a scalar and whose *value* is genuinely not constant still gets the
 older wording, which is the case it was written for and is the `size()` example below.
 
