@@ -133,25 +133,20 @@ end args_between
 
 // A `double`'s bit pattern, which is what LLVM writes a float constant as whatever its width.
 //
-// There is no such conversion in the standard library, so it is the reinterpretation `ptr_cast`
-// already licenses.
-v_float(x: real) -> Val
-    var v = x
-    val p: *i64 = ptr_cast(&v)
+// The pattern is `real.bits()`, carried as the signed number LLVM prints.
+v_float(x: real) -> Val = VFloat(signed_bits(x.bits()))
 
-    VFloat(*p)
-end v_float
+// The same eight bytes as a signed number: there is no reinterpreting integer conversion (`i64(u)`
+// is checked and refuses a value past the ceiling), so the top bit is moved by arithmetic.
+signed_bits(u: u64) -> long = if u < 0x8000000000000000 then long(u) else long(u - 0x8000000000000000) - 0x7fffffffffffffff - 1
+
+// The inverse of `signed_bits`.
+unsigned_bits(v: long) -> u64 = if v >= 0 then u64(v) else u64(v + 0x7fffffffffffffff + 1) + 0x8000000000000000
 
 // The same for a `f32` constant: the value is narrowed first and the pattern taken of the `double`
 // it widens back to, which is what LLVM's textual form for a `float` says.
 v_float32(x: real) -> Val = v_float(real(f32(x)))
 
-// The `double` a bit pattern is, which is the inverse of `v_float` and the same reinterpretation in
-// the other direction. A narrower constant is rounded through it rather than written from the
+// The `double` a bit pattern is, which is the inverse of `v_float`. A narrower constant is rounded through it rather than written from the
 // pattern, since LLVM refuses a `double` a `float` could not hold exactly.
-real_of_bits(bits: long) -> real
-    var v = bits
-    val p: *real = ptr_cast(&v)
-
-    *p
-end real_of_bits
+real_of_bits(bits: long) -> real = real.from_bits(unsigned_bits(bits))
