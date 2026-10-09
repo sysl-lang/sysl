@@ -14,6 +14,8 @@
 #
 #   cd compiler
 #   env -u SYSL_LIB sysl test . --lib "$(sh ../scripts/reference_overlay.sh)"
+#
+# `scripts/release.sh` hands its stage-1 seed the same overlay, so the seed is any earlier release.
 
 set -e
 
@@ -35,6 +37,21 @@ grep -v '^#' "$root/scripts/library_patches.tsv" | cut -f1 | while read -r file;
     [ -n "$file" ] || continue
     [ -e "$lib/$file" ] && continue
     [ -e "$root/library/$file" ] || continue
+
+    # A new FILE is not a new MODULE: a file beside sources the reference's library already has in
+    # that directory adds to a module the reference has, and the reference refuses a `--lib` root
+    # declaring a standard module. It is left out, as `tests_oracle.sysl`'s `holds_sources` leaves it.
+    # A platform directory (`sysl/fs/__posix__/errtext.c`) is its parent module's, so the parent is
+    # the one asked.
+    dir=$(dirname "$file")
+
+    case "$dir" in
+        */__*__) dir=$(dirname "$dir") ;;
+    esac
+
+    if [ "$dir" != "." ] && [ -n "$(ls "$lib/$dir" 2>/dev/null | grep -E '\.l?sysl$')" ]; then
+        continue
+    fi
 
     mkdir -p "$out/$(dirname "$file")"
     cp "$root/library/$file" "$out/$file"
