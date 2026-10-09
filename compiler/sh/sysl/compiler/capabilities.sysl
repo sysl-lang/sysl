@@ -24,6 +24,11 @@ const CapPosix: string = "posix"
 // system, and a C library is not one.
 const CapLibc: string = "libc"
 
+// **Waiting, which a module may promise never to do** (`@no_block`) and no machine supplies: it is
+// conduct and nothing else, so it is a word a narrowing is written with and never a facility. A
+// module that gave it up may reach nothing marked `@blocks` (`no_block.sysl`).
+const CapBlock: string = "block"
+
 // The capabilities there are, in the order a refusal lists them.
 capability_core() -> Buf[string]
     var out: Buf[string] = buf()
@@ -41,6 +46,7 @@ narrowed_by(word: string) -> Option[string] = word match
     "alloc" -> Some(CapHeap)
     "os" -> Some(CapOs)
     "posix" -> Some(CapPosix)
+    "block" -> Some(CapBlock)
     _ -> None
 
 // The word a narrowing is written with, for a capability named as a facility.
@@ -112,6 +118,10 @@ private check_clause(a: &Analysis, u: Program, c: CapabilityClause)
             if !is_facility(c.name)
                 // Naming what a module *does* where a facility belongs. `@requires(alloc)` is the
                 // one that happens, since the narrowing beside it is spelled that way.
+                if c.name == CapBlock
+                    a.fault(scope, c.span, block_is_conduct("'@requires'"))
+                    return
+
                 if narrowed_by(c.name).is_some() then
                     a.fault(scope, c.span, s"'${c.name}' is what a module does, not something a " +
                             "machine has — a 'requires' names the facility, so this is " +
@@ -128,6 +138,13 @@ private check_clause(a: &Analysis, u: Program, c: CapabilityClause)
                             s"'@no_${narrow_word(c.name)}'")
                 else unknown_capability(a, scope, c)
 end check_clause
+
+// **Waiting is the one narrowing with no facility behind it**, so the advice the other words get --
+// write the facility instead -- would name nothing.
+private block_is_conduct(form: string) -> string =
+    s"'block' is what a module does, not something a machine has, and no machine takes it away — " +
+    s"$form names a facility, and a module that may wait says nothing. '@no_block' is the promise " +
+    "never to wait, and '@blocks' marks a declaration that may"
 
 private unknown_capability(a: &Analysis, scope: Scope, c: CapabilityClause)
     a.fault(scope, c.span, s"no capability is called '${c.name}' — the set is 'heap', 'os', 'posix'")
@@ -627,6 +644,10 @@ private check_need_names(a: &Analysis, scope: Scope, span: Span, needs: Buf[stri
         val cap = needs.at(j)
 
         if is_facility(cap) then continue
+
+        if cap == CapBlock
+            a.fault(scope, span, block_is_conduct("'@needs'"))
+            continue
 
         if narrowed_by(cap).is_some() then
             a.fault(scope, span, s"'$cap' is what a module does, not something a machine " +
