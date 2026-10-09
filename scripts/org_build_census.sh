@@ -1,6 +1,7 @@
 #!/bin/sh
 # The org build census: every repository under `~/dev/sysl-lang` built and tested the way its own
-# author builds it, with this compiler, and every failure re-asked of the reference.
+# author builds it, with this compiler, and every failure re-asked of the reference -- the installed
+# release unless another is named.
 #
 # It runs what the repository is *actually built by* -- `sysl test .` for a package,
 # `sysl build .` for a program, `sysl build-c <dir>` for a project whose link belongs to CMake or
@@ -8,9 +9,11 @@
 #
 #   scripts/org_build_census.sh <this compiler's binary> [<reference binary>]
 #
+# The reference defaults to the installed release, `/opt/homebrew/opt/sysl/bin/sysl`.
+#
 # **Each compiler is run against its OWN library.** This compiler takes `SYSL_LIB`, defaulting to this
-# repository's `library/`; the reference takes `SYSL_ORACLE_LIB` where it is set and otherwise runs
-# with `SYSL_LIB` removed from its environment, so it finds the library installed beside it.
+# repository's `library/`; the reference runs with `SYSL_LIB` removed from its environment, so it
+# finds the library installed beside it.
 #
 # **The command that answered is printed beside every row**, and that is not decoration: a script
 # that tried `test` and fell back to `build` would print a bare `ok` for a repository whose *suite*
@@ -22,6 +25,7 @@
 #   ok (build-c <dir>)   an archive somebody else's build links
 #   ok (build-lib <t>)   a board package type-checked and compiled for its target
 #   ok (build-c <d> <t>) a board program's archive, built for its target
+#   ok (build <t>)       a kernel image, linked for its machine (`keel`)
 #   ok (type-check <t>)  the whole analysis passed and the C stopped at a header the SDK
 #                        GENERATES during a CMake configure, exactly where the reference stops
 #   FAILED               this compiler could not do it and the reference could
@@ -49,7 +53,7 @@
 set -e
 
 ours_bin=$1
-theirs_bin=${2:-sysl}
+theirs_bin=${2:-/opt/homebrew/opt/sysl/bin/sysl}
 
 if [ -z "$ours_bin" ]; then
     echo "usage: scripts/org_build_census.sh <binary> [<reference>]" >&2
@@ -62,12 +66,8 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 SYSL_LIB=$(cd "${SYSL_LIB:-$root/library}" && pwd)
 export SYSL_LIB
 
-# What `env` is handed in front of the reference: its own library named, or ours taken away.
-if [ -n "$SYSL_ORACLE_LIB" ]; then
-    theirs_env="SYSL_LIB=$SYSL_ORACLE_LIB"
-else
-    theirs_env="-u SYSL_LIB"
-fi
+# What `env` is handed in front of the reference: ours taken away, so it finds its own.
+theirs_env="-u SYSL_LIB"
 
 case $ours_bin in
     /*) ;;
@@ -101,6 +101,22 @@ limited() {
 
 org=$(dirname "$root")
 work=$(mktemp -d "${TMPDIR:-/tmp}/sysl-org-build.XXXXXX")
+
+# **`keel` is a kernel, and its image is built the way its boot test builds it** (`scripts/boot-test.sh`,
+# with no QEMU): each user program first, into `scratch/user/`, because the kernel embeds their images
+# with `.incbin` paths the assembler resolves against the repository's root -- then the kernel, from
+# that root. The programs are the script's own `user_programs` list, read rather than repeated here.
+# Run in a copy, `sh <this> <compiler>`; a `scratch/` the copy brought along is stale and removed.
+cat > "$work/keel-build.sh" <<'KEEL'
+set -e
+bin=$1
+rm -rf scratch
+mkdir -p scratch/user
+for prog in $(sed -n 's/^user_programs=(\(.*\))$/\1/p' scripts/boot-test.sh); do
+    "$bin" build --target aarch64-freestanding -o "scratch/user/$prog.elf" "user/$prog"
+done
+"$bin" build --target aarch64-freestanding -o scratch/keel.elf kernel
+KEEL
 
 ok_test=0
 ok_build=0
@@ -150,6 +166,7 @@ for dir in "$org"/*/; do
     # classification below that a stop at a generated SDK header is this row's pass.
     board=""
     board_target=""
+    kernel=""
 
     case $name in
         pico)         board=1; board_target=thumbv6m-freestanding ;;
@@ -201,6 +218,16 @@ for dir in "$org"/*/; do
     # A directory with no manifest anywhere is not a sysl project: the site, the tap, the org's
     # profile, a build tool written in Scala.
     [ -n "$command" ] || continue
+
+    # What runs the command: the compiler itself, or for `keel` the script that builds its image.
+    via=""
+
+    if [ "$name" = keel ]; then
+        kernel=1
+        via="sh $work/keel-build.sh"
+        command=""
+        label="build aarch64-freestanding"
+    fi
 
     # The two repositories that cannot be read with the bare command and can be read with flags.
     # quickjs-ng ships no `.pc` file at all, which its own manifest says in the sentence a consumer
@@ -279,7 +306,7 @@ for dir in "$org"/*/; do
     rows=$((rows + 1))
     ours_ok=0
 
-    ( cd "$here" && limited "$ours_bin" $command $flags ) > "$work/$name.out" 2>&1 || ours_ok=1
+    ( cd "$here" && limited $via "$ours_bin" $command $flags ) > "$work/$name.out" 2>&1 || ours_ok=1
 
     if [ $ours_ok -eq 0 ]; then
         case $label in
@@ -289,7 +316,7 @@ for dir in "$org"/*/; do
                 # Never `cond && (( a++ )) || (( b++ ))`: an arithmetic command reports its result
                 # as a status and `x++` yields the value before the increment, so the 0->1
                 # transition increments both counters.
-                if [ -n "$board" ]; then
+                if [ -n "$board" ] || [ -n "$kernel" ]; then
                     ok_board=$((ok_board + 1))
                 else
                     ok_build_c=$((ok_build_c + 1))
@@ -320,7 +347,7 @@ for dir in "$org"/*/; do
 
     theirs_ok=0
 
-    ( cd "$theirs" && limited env $theirs_env "$theirs_bin" $command $flags ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
+    ( cd "$theirs" && limited env $theirs_env $via "$theirs_bin" $command $flags ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
 
     # **A board row that stops where the reference stops is a PASS, and the row says so.** The
     # header is one the SDK generates during a CMake configure, so neither compiler can reach it

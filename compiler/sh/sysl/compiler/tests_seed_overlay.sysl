@@ -1,0 +1,96 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{entries, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `scripts/seed_overlay.sh`: the source root a seed compiler (the release before this one) is handed
+// to build this tree -- every module `library/` ADDS relative to the seed's library, found by diffing
+// the two trees. Each test lays a seed library and a library side by side and runs the script over
+// them, from `compiler/` as the gate does.
+
+private present(file: string) -> bool = metadata(file).is_ok()
+
+// Runs the script over `seed` and `ours`, writing the overlay into `<dir>/overlay`, and hands back
+// that directory; a script that fails is an assertion.
+private overlay(dir: string, seed: string, ours: string) -> string
+    val out = s"$dir/overlay"
+
+    capture("sh", ["../scripts/seed_overlay.sh", seed, out, ours], "", [], true) match
+        Err(_) -> assert(false, "the seed overlay script could not be run")
+        Ok(answer) -> assert(answer.status.ok(), answer.text + answer.err.unwrap_or(""))
+
+    out
+end overlay
+
+private is_empty(dir: string) -> bool = entries(dir) match
+    Err(_) -> false
+    Ok(names) -> names.len() == 0
+
+@test("the seed's overlay holds the modules library/ adds, and none it changes")
+sov_the_overlay_holds_only_added_modules()
+    val dir = make_temp_dir("sysl-sov").unwrap()
+    val seed = s"$dir/seed"
+    val ours = s"$dir/ours"
+
+    make_dir_all(s"$seed/sysl/buf").unwrap()
+    write_text(s"$seed/sysl/buf/buf.sysl", "module sysl.buf\n").unwrap()
+    make_dir_all(s"$ours/sysl/buf").unwrap()
+    make_dir_all(s"$ours/sysl/testing/__posix__").unwrap()
+    write_text(s"$ours/sysl/buf/buf.sysl", "module sysl.buf\n// changed\n").unwrap()
+    write_text(s"$ours/sysl/testing/testing.sysl", "module sysl.testing\n").unwrap()
+    write_text(s"$ours/sysl/testing/__posix__/skip.c", "int x;\n").unwrap()
+
+    val root = overlay(dir, seed, ours)
+
+    assert_eq(read_text(s"$root/sysl/testing/testing.sysl").unwrap_or(""), "module sysl.testing\n")
+    assert(present(s"$root/sysl/testing/__posix__/skip.c"), "an added module's platform directory was left out")
+    assert(!present(s"$root/sysl/buf/buf.sysl"), "a changed module reached the seed")
+    remove_dir_all(dir).unwrap_or(())
+end sov_the_overlay_holds_only_added_modules
+
+@test("a new file in a module the seed already has is not overlaid, and a new module beside it is")
+sov_a_new_file_in_an_existing_module_is_left_out()
+    val dir = make_temp_dir("sysl-sov").unwrap()
+    val seed = s"$dir/seed"
+    val ours = s"$dir/ours"
+
+    make_dir_all(s"$seed/sysl/math").unwrap()
+    write_text(s"$seed/sysl/math/math.sysl", "module sysl.math\n").unwrap()
+    make_dir_all(s"$ours/sysl/math/rational").unwrap()
+    make_dir_all(s"$ours/sysl/math/__posix__").unwrap()
+    write_text(s"$ours/sysl/math/math.sysl", "module sysl.math\n").unwrap()
+    write_text(s"$ours/sysl/math/nextafter.sysl", "module sysl.math\n").unwrap()
+    write_text(s"$ours/sysl/math/__posix__/nextafter.c", "int y;\n").unwrap()
+    write_text(s"$ours/sysl/math/rational/rational.sysl", "module sysl.math.rational\n").unwrap()
+
+    val root = overlay(dir, seed, ours)
+
+    assert(present(s"$root/sysl/math/rational/rational.sysl"), "the added module was left out")
+    assert(!present(s"$root/sysl/math/nextafter.sysl"),
+           "a file adding to sysl.math reached the seed, which refuses a --lib root declaring it")
+    assert(!present(s"$root/sysl/math/__posix__/nextafter.c"),
+           "a platform file of sysl.math reached the seed, though the module is the seed's")
+
+    remove_dir_all(s"$ours/sysl/math/rational").unwrap()
+    assert(is_empty(overlay(dir, seed, ours)), "a new file in an existing module made an overlay")
+    remove_dir_all(dir).unwrap_or(())
+end sov_a_new_file_in_an_existing_module_is_left_out
+
+@test("with nothing added the overlay is empty")
+sov_nothing_added_is_an_empty_overlay()
+    val dir = make_temp_dir("sysl-sov").unwrap()
+
+    make_dir_all(s"$dir/seed/sysl/buf").unwrap()
+    make_dir_all(s"$dir/ours/sysl/buf").unwrap()
+    write_text(s"$dir/seed/sysl/buf/buf.sysl", "module sysl.buf\n").unwrap()
+    write_text(s"$dir/ours/sysl/buf/buf.sysl", "module sysl.buf\n// changed\n").unwrap()
+
+    assert(is_empty(overlay(dir, s"$dir/seed", s"$dir/ours")), "an overlay was made with nothing added")
+
+    capture("sh", ["../scripts/seed_overlay.sh", s"$dir/missing", s"$dir/overlay", s"$dir/ours"], "", [], true) match
+        Err(_) -> assert(false, "the seed overlay script could not be run")
+        Ok(answer) -> assert(!answer.status.ok(), "a seed library that is not there made an overlay")
+
+    remove_dir_all(dir).unwrap_or(())
+end sov_nothing_added_is_an_empty_overlay

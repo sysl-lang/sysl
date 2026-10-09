@@ -25,8 +25,8 @@
 #   3. stage 1: the `sysl` on PATH (or `SYSL_RELEASE_SEED`) builds this tree against the SEED'S OWN
 #      library -- `SYSL_RELEASE_SEED_LIB`, else `<seed prefix>/share/sysl/library` -- since the
 #      release library may use forms the seed's library has not got and the seed cannot compile --
-#      plus a `--lib` overlay of the modules the release library ADDS (`reference_overlay.sh`), with
-#      `SYSL_LIB` unset as the gate runs it
+#      plus a `--lib` overlay of the modules the release library ADDS (`seed_overlay.sh`, which diffs
+#      the release library against the seed's), with `SYSL_LIB` unset as the gate runs it
 #   4. stage 2: stage 1 builds this tree against the RELEASE library; **stage 2 is what ships**
 #   5. stage 3: stage 2 builds this tree against the release library; stage 2 and stage 3 each
 #      `emit-llvm .` and the two texts must be identical -- one source, one library, so a difference
@@ -248,13 +248,13 @@ say "seed library: $seed_lib"
 say "compiler project: $proj"
 
 # Stage 1: the seed, against its own library, plus a `--lib` overlay of the modules the release
-# library ADDS (`scripts/reference_overlay.sh`; today `sysl.testing`, which the tree's tests import).
-# The release library itself is out of the seed's reach -- its changed modules use forms only this
-# compiler has -- and without the overlay the tree's imports of the added modules name nothing. An
-# empty overlay (a seed whose library already has them all) is left off the command line.
+# library ADDS (`scripts/seed_overlay.sh`, a diff of the two trees). The release library itself may be
+# out of the seed's reach -- a changed module may use forms only this compiler has -- and without the
+# overlay the tree's imports of an added module name nothing. An empty overlay (a seed whose library
+# already has them all) is left off the command line.
 build_stage1() {
     local ov
-    ov=$(sh $repo/scripts/reference_overlay.sh $seed_lib $out/seed-overlay) ||
+    ov=$(sh $repo/scripts/seed_overlay.sh $seed_lib $out/seed-overlay $library) ||
         { print "the seed overlay could not be made"; return 1 }
     local lib_args=()
     if [[ -n $(ls -A $ov) ]]; then
@@ -435,23 +435,15 @@ or download \`$asset\` below and put its \`bin/\` on your PATH; the compiler fin
 
 ## Behaviour changes (read these first)
 
-- <anything that now accepts or answers differently from bootstrap 0.0.162>
+- <anything that now accepts or answers differently from $seed_version>
 
-## What changed versus bootstrap 0.0.162
+## What changed versus $seed_version
 
 - **The compiler is written in sysl**, built by itself: stage 1 (built by $seed_version against
   its own library) built stage 2, the binary in this tarball, against the release library; stage 2
   rebuilt itself as stage 3, and stage 2 and stage 3 emit identical LLVM text for the compiler's own tree.
 - **\`sysl doc\` is built in** and renders Markdown; there is no separate \`sysl-doc\` binary.
 - <features>
-
-## Known divergences from the bootstrap
-
-- <from CLAUDE.md § Open divergences: diagnostic spans/carets anchor at the extent, not the reference's anchor>
-- \`--lib\` takes a source directory; a \`.syslib\` and \`--std-lib\` are refused by name, and \`--ar\` is not built.
-- \`dev_dependencies\` are read and refused but not resolved.
-- <a package's \`sysl = "x.y.z"\` floor: \`OnTheReleaseLine\` in manifest.sysl decides whether this version is compared against it>
-- <the \`prove\` command is not built>
 
 ## Platforms
 
