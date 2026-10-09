@@ -1,0 +1,549 @@
+module sysl.softfloat
+
+import sysl.math.Bits
+
+// IEEE binary128 arithmetic in software: the routines LLVM calls for every `f128` operation on a
+// machine with no quad-precision unit, which is every machine sysl targets.
+//
+// **They are compiler-rt's names and compiler-rt's contracts** (`__addtf3`, `__lttf2`, `__fixtfdi`
+// and the rest), because the calls are LLVM's to make and those are the names it makes them by. What
+// is different is who supplies them. A Linux link finds them in libgcc; **Apple's runtime has none**
+// -- C's `long double` is a `double` there, so nothing on a Mac asks for quad arithmetic -- and a
+// freestanding image has no runtime library at all. So the standard module carries its own, and an
+// `f128` program links on all three without asking anything of the machine.
+//
+// **Every one is exported WEAK**, as every `@export` the library defines is: where libgcc or a
+// program supplies the symbol too, the strong definition is the one kept, and two correct answers
+// never collide.
+//
+// **Rounding is to nearest, ties to even, always.** compiler-rt reads the dynamic rounding mode where
+// the machine has one; sysl never changes it, so the answer is the same and there is no register for
+// a freestanding image to have enabled.
+//
+// The routines are written on the encoding alone -- the bits of each operand as a `u128` -- and
+// never on `f128` values, since an `f128` operation here would be a call back into this file.
+
+// -- the encoding ------------------------------------------------------------------------------------
+
+private const FRACTION_BITS: int = 112
+private const BIAS: int = 16383
+private const MAX_EXPONENT: int = 0x7FFF
+
+private const IMPLICIT: u128 = 0x0001_0000_0000_0000_0000_0000_0000_0000
+private const FRACTION_MASK: u128 = 0x0000_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF
+private const SIGN: u128 = 0x8000_0000_0000_0000_0000_0000_0000_0000
+private const ABS_MASK: u128 = 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF
+private const INFINITY: u128 = 0x7FFF_0000_0000_0000_0000_0000_0000_0000
+private const QUIET: u128 = 0x0000_8000_0000_0000_0000_0000_0000_0000
+private const QUIET_NAN: u128 = 0x7FFF_8000_0000_0000_0000_0000_0000_0000
+private const LOW_64: u128 = 0xFFFF_FFFF_FFFF_FFFF
+private const ONE: u128 = 1
+private const ALL_ONES: u128 = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF
+
+private rep(x: f128) -> u128 = x.bits()
+private value(r: u128) -> f128 = f128.from_bits(r)
+
+private exponent_of(r: u128) -> int = int((r >> FRACTION_BITS) & 0x7FFF)
+
+private is_nan(abs: u128) -> bool = abs > INFINITY
+
+// Moves a subnormal's leading one up to the implicit bit, answering the exponent it then has.
+private normalize(sig: *u128) -> int
+    val shift = int((*sig).leading_zeros()) - int(IMPLICIT.leading_zeros())
+
+    *sig = *sig << shift
+    1 - shift
+end normalize
+
+// `x >> n`, with every bit shifted out folded into the lowest one: the sticky bit rounding reads.
+private shr_sticky(x: u128, n: int) -> u128
+    if n <= 0 then return x
+    if n >= 128 then return if x != 0 then 1 else 0
+
+    val lost = x << (128 - n)
+
+    (x >> n) | (if lost != 0 then 1 else 0)
+end shr_sticky
+
+// `x >> n` rounded to nearest, a tie to the even result.
+private shr_round(x: u128, n: int) -> u128
+    if n <= 0 then return x
+    if n > 128 then return 0
+
+    val q = if n == 128 then 0 else x >> n
+    val r = if n == 128 then x else x - (q << n)
+    val half = ONE << (n - 1)
+
+    if r > half || (r == half && q & 1 == 1) then q + 1 else q
+end shr_round
+
+// A result from its sign, its biased exponent and a significand with the implicit bit at 115 and
+// three bits below the last kept one -- the half bit, then two that say whether anything lies below
+// it. An exponent past the top is an infinity, one at or below zero a subnormal; a rounding that
+// carries out of the significand carries into the exponent, which is the encoding's own arithmetic.
+private round_pack(sign: u128, exponent: int, sig: u128) -> u128
+    if exponent >= MAX_EXPONENT then return INFINITY | sign
+
+    var e = exponent
+    var s = sig
+
+    if e <= 0
+        s = shr_sticky(s, 1 - e)
+        e = 0
+
+    val low = s & 7
+    var result = ((s >> 3) & FRACTION_MASK) | (u128(e) << FRACTION_BITS) | sign
+
+    if low > 4 then result += 1
+    if low == 4 then result += result & 1
+
+    result
+end round_pack
+
+// -- addition and subtraction ------------------------------------------------------------------------
+
+private add_reps(a_in: u128, b_in: u128) -> u128
+    var a = a_in
+    var b = b_in
+    val a_abs = a & ABS_MASK
+    val b_abs = b & ABS_MASK
+
+    if is_nan(a_abs) then return a | QUIET
+    if is_nan(b_abs) then return b | QUIET
+
+    if a_abs == INFINITY
+        // The two infinities of opposite signs have no sum.
+        if (a ^ b) == SIGN then return QUIET_NAN
+
+        return a
+
+    if b_abs == INFINITY then return b
+
+    if a_abs == 0
+        // Two zeros sum to a negative zero only where both are negative.
+        if b_abs == 0 then return a & b
+
+        return b
+
+    if b_abs == 0 then return a
+
+    if b_abs > a_abs
+        val t = a
+        a = b
+        b = t
+
+    var a_exp = exponent_of(a)
+    var b_exp = exponent_of(b)
+    var a_sig = a & FRACTION_MASK
+    var b_sig = b & FRACTION_MASK
+
+    if a_exp == 0 then a_exp = normalize(&a_sig)
+    if b_exp == 0 then b_exp = normalize(&b_sig)
+
+    val sign = a & SIGN
+    val subtraction = (a ^ b) & SIGN != 0
+
+    a_sig = (a_sig | IMPLICIT) << 3
+    b_sig = shr_sticky((b_sig | IMPLICIT) << 3, a_exp - b_exp)
+
+    if subtraction
+        a_sig -= b_sig
+
+        // Exact cancellation is a positive zero, rounding to nearest.
+        if a_sig == 0 then return 0
+
+        if a_sig < IMPLICIT << 3
+            val shift = int(a_sig.leading_zeros()) - int((IMPLICIT << 3).leading_zeros())
+
+            a_sig = a_sig << shift
+            a_exp -= shift
+    else
+        a_sig += b_sig
+
+        if a_sig & (IMPLICIT << 4) != 0
+            a_sig = shr_sticky(a_sig, 1)
+            a_exp += 1
+
+    round_pack(sign, a_exp, a_sig)
+end add_reps
+
+/** `a + b`. */
+@export("__addtf3")
+addtf3(a: f128, b: f128) -> f128 = value(add_reps(rep(a), rep(b)))
+
+/** `a - b`, which is `a` plus `b` with its sign turned over. */
+@export("__subtf3")
+subtf3(a: f128, b: f128) -> f128 = value(add_reps(rep(a), rep(b) ^ SIGN))
+
+// -- multiplication ----------------------------------------------------------------------------------
+
+// The 256-bit product of two 128-bit numbers, as its high and low halves, from four 64-bit products.
+private wide_multiply(a: u128, b: u128) -> (u128, u128)
+    val a0 = a & LOW_64
+    val a1 = a >> 64
+    val b0 = b & LOW_64
+    val b1 = b >> 64
+
+    val p00 = a0 * b0
+    val p01 = a0 * b1
+    val p10 = a1 * b0
+    val p11 = a1 * b1
+
+    val mid = (p00 >> 64) + (p01 & LOW_64) + (p10 & LOW_64)
+
+    (p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64), (p00 & LOW_64) | (mid << 64))
+end wide_multiply
+
+/** `a * b`. */
+@export("__multf3")
+multf3(a: f128, b: f128) -> f128
+    val ar = rep(a)
+    val br = rep(b)
+    val sign = (ar ^ br) & SIGN
+    val a_abs = ar & ABS_MASK
+    val b_abs = br & ABS_MASK
+
+    if is_nan(a_abs) then return value(ar | QUIET)
+    if is_nan(b_abs) then return value(br | QUIET)
+
+    // An infinity times anything but zero is an infinity; times zero it is not a number.
+    if a_abs == INFINITY then return value(if b_abs != 0 then INFINITY | sign else QUIET_NAN)
+    if b_abs == INFINITY then return value(if a_abs != 0 then INFINITY | sign else QUIET_NAN)
+
+    if a_abs == 0 || b_abs == 0 then return value(sign)
+
+    var a_exp = exponent_of(ar)
+    var b_exp = exponent_of(br)
+    var a_sig = ar & FRACTION_MASK
+    var b_sig = br & FRACTION_MASK
+
+    if a_exp == 0 then a_exp = normalize(&a_sig)
+    if b_exp == 0 then b_exp = normalize(&b_sig)
+
+    // Both significands are in [2^112, 2^113), so their product is in [2^224, 2^226): the top of it
+    // at bit 225 or 224, which says whether the exponents' sum needs one more.
+    val (hi, lo) = wide_multiply(a_sig | IMPLICIT, b_sig | IMPLICIT)
+
+    var exponent = a_exp + b_exp - BIAS
+
+    // Bring the leading one to bit 115 of a single word, keeping everything below as a sticky bit.
+    val top_at_225 = hi & (ONE << 97) != 0
+    val drop = if top_at_225 then 110 else 109
+
+    if top_at_225 then exponent += 1
+
+    val kept = (hi << (128 - drop)) | (lo >> drop)
+    val below = lo << (128 - drop)
+
+    value(round_pack(sign, exponent, kept | (if below != 0 then 1 else 0)))
+end multf3
+
+// -- division ----------------------------------------------------------------------------------------
+
+/** `a / b`. */
+@export("__divtf3")
+divtf3(a: f128, b: f128) -> f128
+    val ar = rep(a)
+    val br = rep(b)
+    val sign = (ar ^ br) & SIGN
+    val a_abs = ar & ABS_MASK
+    val b_abs = br & ABS_MASK
+
+    if is_nan(a_abs) then return value(ar | QUIET)
+    if is_nan(b_abs) then return value(br | QUIET)
+
+    if a_abs == INFINITY then return value(if b_abs == INFINITY then QUIET_NAN else INFINITY | sign)
+    if b_abs == INFINITY then return value(sign)
+
+    if a_abs == 0 then return value(if b_abs == 0 then QUIET_NAN else sign)
+    if b_abs == 0 then return value(INFINITY | sign)
+
+    var a_exp = exponent_of(ar)
+    var b_exp = exponent_of(br)
+    var a_sig = ar & FRACTION_MASK
+    var b_sig = br & FRACTION_MASK
+
+    if a_exp == 0 then a_exp = normalize(&a_sig)
+    if b_exp == 0 then b_exp = normalize(&b_sig)
+
+    a_sig = a_sig | IMPLICIT
+    b_sig = b_sig | IMPLICIT
+
+    var exponent = a_exp - b_exp + BIAS
+
+    // A quotient of significands below one is brought into [1, 2) before the digits are taken.
+    if a_sig < b_sig
+        a_sig = a_sig << 1
+        exponent -= 1
+
+    // One quotient bit a step, most significant first: the integer bit, the 112 kept below it and
+    // the three rounding reads, 116 in all. The remainder left over is the sticky bit.
+    var r = a_sig
+    var q: u128 = 0
+
+    for step in 0..<116
+        q = q << 1
+
+        if r >= b_sig
+            r -= b_sig
+            q = q | 1
+
+        r = r << 1
+
+    value(round_pack(sign, exponent, q | (if r != 0 then 1 else 0)))
+end divtf3
+
+// -- comparisons -------------------------------------------------------------------------------------
+
+// `-1`, `0` or `1` as `a` is below, equal to or above `b`, or `unordered` where either is a NaN. A
+// zero equals a zero whatever their signs.
+private compare(a: f128, b: f128, unordered: int) -> int
+    val ar = rep(a)
+    val br = rep(b)
+    val a_abs = ar & ABS_MASK
+    val b_abs = br & ABS_MASK
+
+    if is_nan(a_abs) || is_nan(b_abs) then return unordered
+    if a_abs == 0 && b_abs == 0 then return 0
+
+    val a_neg = ar & SIGN != 0
+    val b_neg = br & SIGN != 0
+
+    if a_neg != b_neg then return if a_neg then -1 else 1
+
+    val c = if a_abs < b_abs then -1 else if a_abs == b_abs then 0 else 1
+
+    if a_neg then -c else c
+end compare
+
+/** Zero where `a == b`, and not zero otherwise or where either is a NaN. */
+@export("__eqtf2")
+eqtf2(a: f128, b: f128) -> int = compare(a, b, 1)
+
+/** Not zero where `a != b` or either is a NaN, and zero otherwise. */
+@export("__netf2")
+netf2(a: f128, b: f128) -> int = compare(a, b, 1)
+
+/** Below zero where `a < b`; zero or above otherwise, a NaN included. */
+@export("__lttf2")
+lttf2(a: f128, b: f128) -> int = compare(a, b, 1)
+
+/** Zero or below where `a <= b`; above zero otherwise, a NaN included. */
+@export("__letf2")
+letf2(a: f128, b: f128) -> int = compare(a, b, 1)
+
+/** Above zero where `a > b`; zero or below otherwise, a NaN included. */
+@export("__gttf2")
+gttf2(a: f128, b: f128) -> int = compare(a, b, -1)
+
+/** Zero or above where `a >= b`; below zero otherwise, a NaN included. */
+@export("__getf2")
+getf2(a: f128, b: f128) -> int = compare(a, b, -1)
+
+/** Not zero where either is a NaN. */
+@export("__unordtf2")
+unordtf2(a: f128, b: f128) -> int =
+    if is_nan(rep(a) & ABS_MASK) || is_nan(rep(b) & ABS_MASK) then 1 else 0
+
+// -- to and from the narrower floats -----------------------------------------------------------------
+
+// A narrower format's encoding, widened: `fraction` bits of fraction under an exponent of `bias`
+// whose all-ones value is `top`. Every value of a narrower format is exactly a binary128 one, so
+// nothing rounds; a NaN keeps its payload at the top of the wider fraction, quiet bit and all.
+private widened(bits: u128, fraction: int, bias: int, top: int) -> u128
+    val sign = (bits >> (fraction + exponent_width(top))) & 1
+    val e =int((bits >> fraction) & u128(top))
+    val f = bits & ((ONE << fraction) - 1)
+    val signed = sign << 127
+
+    if e == top then return signed | INFINITY | (f << (FRACTION_BITS - fraction))
+
+    if e == 0
+        if f == 0 then return signed
+
+        // A subnormal: its leading one moved up to the implicit bit, the exponent going down with it.
+        val shift = int(f.leading_zeros()) - (127 - fraction)
+        val sig = f << shift
+
+        return signed | (u128(1 - bias - shift + BIAS) << FRACTION_BITS) |
+               ((sig & ((ONE << fraction) - 1)) << (FRACTION_BITS - fraction))
+
+    signed | (u128(e - bias + BIAS) << FRACTION_BITS) | (f << (FRACTION_BITS - fraction))
+end widened
+
+// How many bits an all-ones exponent of `top` is.
+private exponent_width(top: int) -> int = 32 - int(u32(top).leading_zeros())
+
+// A binary128 encoding rounded to a narrower format (`fraction`, `bias`, `top` as `widened` takes
+// them), to nearest with ties to even: an overflow is an infinity, a value below the smallest
+// subnormal's half a zero, and a NaN a quiet NaN keeping the top of its payload.
+private narrowed(r: u128, fraction: int, bias: int, top: int) -> u128
+    val sign = (r >> 127) << (fraction + exponent_width(top))
+    val abs = r & ABS_MASK
+    val infinity = u128(top) << fraction
+
+    if abs > INFINITY
+        return sign | infinity | (ONE << (fraction - 1)) | ((abs & FRACTION_MASK) >> (FRACTION_BITS - fraction))
+
+    if abs == INFINITY then return sign | infinity
+
+    // Anything at a binary128 subnormal's size is far below every narrower format's smallest value.
+    val e = exponent_of(abs)
+
+    if e == 0 then return sign
+
+    val exponent = e - BIAS + bias
+    val sig = (abs & FRACTION_MASK) | IMPLICIT
+
+    if exponent >= top then return sign | infinity
+
+    if exponent <= 0
+        // A subnormal result: the significand lands below the format's own implicit bit, and a carry
+        // out of the rounding is the smallest normal, encoded by the same arithmetic.
+        return sign | shr_round(sig, FRACTION_BITS - fraction + 1 - exponent)
+
+    val rounded = shr_round(sig, FRACTION_BITS - fraction)
+    val packed = (u128(exponent - 1) << fraction) + rounded
+
+    if packed >= infinity then return sign | infinity
+
+    sign | packed
+end narrowed
+
+/** A `double` widened, exactly. */
+@export("__extenddftf2")
+extenddftf2(x: real) -> f128 = value(widened(u128(x.bits()), 52, 1023, 0x7FF))
+
+/** An `f32` widened, exactly. */
+@export("__extendsftf2")
+extendsftf2(x: f32) -> f128 = value(widened(u128(x.bits()), 23, 127, 0xFF))
+
+/** An `f16` widened, exactly. */
+@export("__extendhftf2")
+extendhftf2(x: f16) -> f128 = value(widened(u128(x.bits()), 10, 15, 0x1F))
+
+/** Rounded to a `double`. */
+@export("__trunctfdf2")
+trunctfdf2(x: f128) -> real = real.from_bits(u64(narrowed(rep(x), 52, 1023, 0x7FF)))
+
+/** Rounded to an `f32`. */
+@export("__trunctfsf2")
+trunctfsf2(x: f128) -> f32 = f32.from_bits(u32(narrowed(rep(x), 23, 127, 0xFF)))
+
+/** Rounded to an `f16`. */
+@export("__trunctfhf2")
+trunctfhf2(x: f128) -> f16 = f16.from_bits(u16(narrowed(rep(x), 10, 15, 0x1F)))
+
+/** Rounded to a `bf16`. */
+@export("__trunctfbf2")
+trunctfbf2(x: f128) -> bf16 = bf16.from_bits(u16(narrowed(rep(x), 7, 127, 0xFF)))
+
+// -- to and from the integers ------------------------------------------------------------------------
+
+// A magnitude and a sign as binary128, rounded to nearest where the magnitude has more than 113
+// significant bits.
+private from_magnitude(m: u128, negative: bool) -> f128
+    if m == 0 then return value(0)
+
+    val width = 128 - int(m.leading_zeros())
+    var exponent = width - 1
+    var sig = if width <= 113 then m << (113 - width) else shr_round(m, width - 113)
+
+    // Rounding up from all ones carries into a 114th bit.
+    if sig >> 113 != 0
+        sig = sig >> 1
+        exponent += 1
+
+    value((if negative then SIGN else 0) | (u128(exponent + BIAS) << FRACTION_BITS) |
+          (sig & FRACTION_MASK))
+end from_magnitude
+
+// The magnitude of a signed value, the most negative one included.
+private magnitude(x: i128) -> u128 = if x >= 0 then u128(x) else u128(-(x + 1)) + 1
+
+/** An `int` as binary128, exactly. */
+@export("__floatsitf")
+floatsitf(x: int) -> f128 = from_magnitude(magnitude(i128(x)), x < 0)
+
+/** A `long` as binary128, exactly. */
+@export("__floatditf")
+floatditf(x: long) -> f128 = from_magnitude(magnitude(i128(x)), x < 0)
+
+/** An `i128` as binary128, rounded. */
+@export("__floattitf")
+floattitf(x: i128) -> f128 = from_magnitude(magnitude(x), x < 0)
+
+/** A `uint` as binary128, exactly. */
+@export("__floatunsitf")
+floatunsitf(x: uint) -> f128 = from_magnitude(u128(x), false)
+
+/** A `ulong` as binary128, exactly. */
+@export("__floatunditf")
+floatunditf(x: ulong) -> f128 = from_magnitude(u128(x), false)
+
+/** A `u128` as binary128, rounded. */
+@export("__floatuntitf")
+floatuntitf(x: u128) -> f128 = from_magnitude(x, false)
+
+// The integer part of `|x|` where it is below `2^width`, and `None` where it is not -- a NaN and an
+// infinity included. `Some(0)` is a magnitude below one.
+private truncated(r: u128, width: int) -> Option[u128]
+    val abs = r & ABS_MASK
+    val e = exponent_of(abs) - BIAS
+
+    if e < 0 then return Some(0)
+    if e >= width then return None
+
+    val sig = (abs & FRACTION_MASK) | IMPLICIT
+
+    Some(if e < FRACTION_BITS then sig >> (FRACTION_BITS - e) else sig << (e - FRACTION_BITS))
+end truncated
+
+// Toward zero into a signed integer of `width` bits, its lowest and highest values standing for
+// everything beyond them -- compiler-rt's answer for what C leaves undefined.
+private to_signed(x: f128, width: int) -> i128
+    val r = rep(x)
+    val negative = r & SIGN != 0
+
+    truncated(r, width - 1) match
+        Some(m) -> if negative then -i128(m) else i128(m)
+        None ->
+            val top = i128((ONE << (width - 1)) - 1)
+            if negative then -top - 1 else top
+end to_signed
+
+// Toward zero into an unsigned integer of `width` bits: a negative value is zero and a value past
+// the top is all ones.
+private to_unsigned(x: f128, width: int) -> u128
+    val r = rep(x)
+
+    if r & SIGN != 0 then return 0
+
+    truncated(r, width) match
+        Some(m) -> m
+        None -> if width == 128 then ALL_ONES else (ONE << width) - 1
+end to_unsigned
+
+/** Toward zero, as an `int`. */
+@export("__fixtfsi")
+fixtfsi(x: f128) -> int = int(to_signed(x, 32))
+
+/** Toward zero, as a `long`. */
+@export("__fixtfdi")
+fixtfdi(x: f128) -> long = long(to_signed(x, 64))
+
+/** Toward zero, as an `i128`. */
+@export("__fixtfti")
+fixtfti(x: f128) -> i128 = to_signed(x, 128)
+
+/** Toward zero, as a `uint`. */
+@export("__fixunstfsi")
+fixunstfsi(x: f128) -> uint = uint(to_unsigned(x, 32))
+
+/** Toward zero, as a `ulong`. */
+@export("__fixunstfdi")
+fixunstfdi(x: f128) -> ulong = ulong(to_unsigned(x, 64))
+
+/** Toward zero, as a `u128`. */
+@export("__fixunstfti")
+fixunstfti(x: f128) -> u128 = to_unsigned(x, 128)

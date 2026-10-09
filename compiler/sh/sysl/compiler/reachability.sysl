@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map, Set, set}
 
@@ -88,8 +89,62 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
                         extra.push(f)
                         more = true
 
+        // **The quad runtime is the sixth kind, and the call is LLVM's**: an `f128` operation lowers
+        // to `fadd fp128` and the back end turns it into `__addtf3`, so nothing in any body names the
+        // definition. Where a reached body computes with `f128`, the whole runtime is kept -- the
+        // linker takes the routines the code asks for and drops the rest -- and where none does it
+        // is left out, so a build that may not touch a float register never meets one.
+        if !holds_quad_runtime(extra) && reaches_quad(p, live)
+            for f in exports
+                if f.declared_in == QuadRuntimeModule && !holds_func(extra, f.name)
+                    extra.push(f)
+                    more = true
+
     live
 end walk_program
+
+// The module whose `@export`s are the binary128 routines LLVM calls.
+const QuadRuntimeModule: string = "sysl.softfloat"
+
+private holds_quad_runtime(fs: Buf[TFunc]) -> bool
+    for item in fs
+        if item.declared_in == QuadRuntimeModule then return true
+
+    false
+end holds_quad_runtime
+
+// Whether anything the walk reached holds an `f128`: a signature, a value a body computes, the
+// program's own statements or its storage. The runtime's own bodies are not asked.
+private reaches_quad(p: TProgram, live: &Live) -> bool
+    var hits: Buf[Span] = buf()
+    val sink = &hits
+    val walk = expr_walk(false, (e) -> note_quad(sink, e))
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if live.call_set.has(f.name) && f.declared_in != QuadRuntimeModule
+            if is_quad(f.ret_ty) then return true
+
+            for param in f.params
+                if is_quad(param.1) then return true
+
+            walk_stmts(f.body.stmts, walk)
+
+            if f.body.result.is_some() then walk_texpr(f.body.result.unwrap(), walk)
+
+            if !hits.is_empty() then return true
+
+    walk_stmts(p.main, walk)
+
+    for i in 0..<p.vals.len()
+        if is_quad(p.vals.at(i).ty) then return true
+
+    !hits.is_empty()
+end reaches_quad
+
+private note_quad(sink: *Buf[Span], e: TExpr)
+    if sink.is_empty() && is_quad(texpr_type(e)) then sink.push(e.span)
 
 private holds_func(fs: Buf[TFunc], name: string) -> bool
     for item in fs

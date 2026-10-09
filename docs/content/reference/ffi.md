@@ -2104,10 +2104,14 @@ c const
 'bf16' is not a width a 'c const' is measured at
 ```
 
-**`c type` below still refuses a float, and that is a different question.** A typedef is measured
-because its *width* is the configuration's to decide, and `float` and `double` are IEEE binary32 and
-binary64 on every machine sysl targets — so `f32` and `f64` by name really are the whole answer
-there. It is the value that varies, never the width.
+**`f128` is refused here too, for the opposite reason**: the measurement crosses back as a `double`,
+which holds 53 of binary128's 113 bits, so the constant would arrive with the rest made up. An `f128`
+constant is written as an `f128` literal, which is read from its text exactly.
+
+**For `float` and `double` the type is a different question from the value.** They are IEEE binary32
+and binary64 on every machine sysl targets — so `f32` and `f64` by name really are the whole answer
+there. It is the value that varies, never the width. `long double` is the one C float whose *format*
+varies, and `c type` below measures it.
 
 **The declared type may be a transparent subtype of a number**, which is what makes this block and
 `c type` below a pair rather than two features. Without `new` such a type *is* its base, so a
@@ -2330,7 +2334,45 @@ the C compiler rather than assumed:
 **A `_Bool` arrives as `bool`**, the one answer that is not an integer and is still given: C means by
 `_Bool` what sysl means by `bool`, and the two already cross as a single unsigned byte.
 
-**A type C does not describe as an integer is refused by name:**
+### `long double` — a float whose format is the machine's
+
+**A float is measured for its format.** `float` and `double` are `f32` and `f64` everywhere, so a
+typedef of one arrives as one. `long double` is the case that needs measuring: it is binary128 —
+`f128` — on AArch64 Linux and Android, a bare AArch64 machine, RISC-V and WebAssembly, and a `double`
+on Apple's arm64 and on Windows. So a binding of a `long double` function writes it once and is right
+on each:
+
+```sysl
+c type
+    LongDouble = "long double"
+
+half(x: LongDouble) -> LongDouble = x / 2.0
+
+print(half(3.0) == 1.5)
+```
+
+```output
+true
+```
+
+On x86 `long double` is the x87 80-bit extended format, which sysl has no type for, so it is refused
+there, naming the format:
+
+```sysl target=x86_64-linux
+c type
+    LongDouble = "long double"
+```
+
+```error
+is a 'long double' with 64 bits of significand on 'x86_64-linux' — the x87 extended format, which sysl has no type for
+```
+
+`f128` itself crosses to C as `fp128`, as clang passes a binary128 `long double`, and an exported
+function taking one is declared `long double` in the header — on the machines where that is what
+`long double` is. Elsewhere the export is refused, since C there has no binary128 type to spell it
+with.
+
+**A type C does not describe as an integer or a float is refused by name:**
 
 ```sysl
 c type
@@ -2341,9 +2383,9 @@ c type
 is not an integer type
 ```
 
-A float, a pointer, a struct and an array each already have an answer here — a float by name, an
-address as `*T`, a struct as an `opaque struct` — and each is better than a same-width integer
-standing in for it and losing what it was.
+A pointer, a struct and an array each already have an answer here — an address as `*T`, a struct as
+an `opaque struct` — and each is better than a same-width integer standing in for it and losing what
+it was.
 
 ## What is deliberately absent
 

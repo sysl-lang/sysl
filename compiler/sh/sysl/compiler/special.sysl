@@ -41,6 +41,7 @@ private print_one(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
     val ty = texpr_type(t)
 
     if ty == Unknown then return t
+    if is_quad(ty) then return quad_text_refused(cx, span)
 
     // **A fixed-point value renders itself**, as the shortest decimal that reads back as the same
     // value -- C has no conversion for one -- and goes out as the string that came back. A subtype
@@ -106,6 +107,14 @@ private stdout_call(cx: &Analyzer, span: Span) -> TExpr
                       declared_result(cx, f.unwrap().scope, f.unwrap().decl.ret_type,
                                       f.unwrap().decl.needs), false))
 end stdout_call
+
+// An `f128` asked to become text, which nothing yet does: C's `printf` cannot be relied on for it
+// (its `%Lf` is a `double` on Apple's arm64), and narrowing it to a `real` first would print a
+// number the program does not hold. So it is refused, saying what to write instead.
+quad_text_refused(cx: &Analyzer, span: Span) -> TExpr =
+    cx.err(span, "an 'f128' has no text form yet — rendering binary128 is not built, and " +
+           "narrowing it silently would print a different number. Convert it first: 'real(x)' is " +
+           "the nearest 'real', or 'x.bits()' the exact encoding")
 
 // Whether a value renders through a printf conversion rather than through an `impl`: the five types
 // the library has a renderer of its own for.
@@ -626,6 +635,13 @@ private va_arg_type(cx: &Analyzer, span: Span, ty: Type) -> Type
             ty
         Floating(bits, _) ->
             if bits == 64 then return ty
+
+            // A `long double` is not promoted, so the double advice below would be wrong for it.
+            if bits == 128
+                cx.fault(span, "reading an 'f128' out of a variadic argument list is not built — C " +
+                         "passes a 'long double' as itself rather than promoted, and 'va_arg' reads " +
+                         "the promoted types")
+                return ty
 
             cx.fault(span, s"a variadic argument is promoted to double, so it cannot be read as " +
                      s"${type_show(ty)} — read it as 'real' and convert")

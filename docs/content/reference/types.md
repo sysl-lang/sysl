@@ -158,8 +158,7 @@ saturates rather than wraps, unless a type is declared `wrapping`: a fixed-point
 ## Floating point is a closed set
 
 `fN` is **not** open — only real formats exist, because there is no meaningful `f37`. The set is
-`f16`, `bf16`, `f32` and `f64`, and `f128` is reserved but not lowered: writing it is a diagnostic
-saying so rather than a type you get.
+`f16`, `bf16`, `f32`, `f64` and `f128`.
 
 Only the default width gets an alias, and it is deliberately named `real` rather than `float`, because
 `float` means 32-bit to every C, C++, Rust and Java programmer and `real` promises nothing it does not
@@ -301,6 +300,59 @@ the destination.
 
 Neither format has an alias, and a literal reaches one through a suffix or through the type it is
 written into: `1.5f16`, `1.5bf16`, or `var x: bf16 = 1.5`.
+
+### `f128`, binary128
+
+`f128` is IEEE binary128: a 15-bit exponent, as wide as x87's, and 112 bits of fraction, about 34
+decimal digits where `real` has 16. It is an ordinary arithmetic type — `+ - * /`, the comparisons,
+unary minus, `f128.infinity` and `f128.nan`, and a conversion to and from every integer and float
+width — and **its literals are read from their text**, so `0.1f128` is binary128's own tenth rather
+than a double's tenth widened:
+
+```sysl
+val tenth: f128 = 0.1
+val third: f128 = 1.0 / 3.0
+
+print(third.bits() == 0x3FFD5555555555555555555555555555)
+print(real(tenth) == 0.1, tenth + 0.2 > 0.3, f128(0.1) == tenth)
+```
+
+```output
+true
+true true false
+```
+
+The last answer is the point: `f128(0.1)` widens the `double` nearest a tenth, exactly, and that is
+not the binary128 nearest a tenth. `x.bits()` is the encoding as a `u128` and `f128.from_bits(b)`
+reads one back.
+
+**No machine sysl targets has quad-precision hardware**, so every operation is a call into software
+— about a hundred times the cost of a `real` operation. The routines are compiler-rt's, by name and by
+contract (`__addtf3`, `__lttf2`, `__fixtfdi` and the rest), and the standard module carries its own
+in `sysl.softfloat`: a Mac's runtime has none, since C's `long double` is a `double` there, and a
+bare-metal image has no runtime library at all. A program, an archive or a kernel image that computes
+in `f128` is linked with them, and one that does not carries none. They round to nearest, ties to
+even, always.
+
+**An `f128` has no text form yet** — `print`, `str`, an interpolation hole and a format specifier all
+refuse it, saying what to write instead, since narrowing it silently would print a number the
+program does not hold:
+
+```sysl
+val x: f128 = 2.5
+
+print(x)
+```
+
+```error
+an 'f128' has no text form yet
+```
+
+Nor is it a [vector](/reference/vectors/) lane, a value a `const` function computes with, or a
+width a `c const` is measured at. **C's `long double` is a different question from `f128`**: it is
+binary128 on AArch64 Linux, RISC-V and WebAssembly, a `double` on Apple's arm64 and on Windows, and
+x87's 80-bit format on x86. A [`c type`](/reference/ffi/#c-type--a-width-only-the-c-compiler-can-work-out)
+measured as `"long double"` is the one spelling that matches it on every machine.
 
 ## `usize` and `isize`
 
