@@ -646,6 +646,10 @@ emit_llvm_text(path: string, named_target: Option[string],
     // else has** (`check_main_extern`).
     if links_an_image(t) then check_main_extern(done.an, pruned, image_entry_named(root, t))
 
+    // **And an `extern` naming a C runtime's initializer has nothing to name in a program**
+    // (`check_runtime_init_extern`).
+    check_runtime_init_extern(done.an, pruned, "")
+
     // **And one with no C library under it answers every library hook it reaches itself** -- a
     // filesystem's, a descriptor's (`check_library_hooks`) -- and reaches no specifier only C's
     // `snprintf` applies (`check_c_formatting`).
@@ -1464,7 +1468,13 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
     // **Which build this is is set on the tree before the checks read it**, since one of them asks
     // whether anything will fill this artifact's module storage -- and read off the default it would
     // be asking about a program that is not being built.
-    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    //
+    // **An archive naming the symbol it starts at is the C program's runtime** (`c_runtime`), which
+    // fills its storage from the function its start file calls rather than from a constructor.
+    val entry = image_entry_named(path, t)
+    val runtime = entry != "" && entry != "main"
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true,
+                                                          c_runtime = runtime }
     val promotions = post_analysis_checks(done.an, whole, program.own)
 
     explain_promotions(promotions, program, done.an)
@@ -1473,7 +1483,8 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
 
     check_library_hooks(done.an, kept)
     check_c_formatting(done.an, kept)
-    check_main_extern(done.an, kept, image_entry_named(path, t))
+    check_main_extern(done.an, kept, entry)
+    check_runtime_init_extern(done.an, kept, entry)
 
     val lowered = codegen_with_gaps(kept, t, promotions)
 

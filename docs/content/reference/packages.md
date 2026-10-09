@@ -546,7 +546,8 @@ every way into the image — the entry itself where sysl defines it, an `@export
 
 Storage that folds — literals, a struct over constants — is laid into the image and never asks;
 computed storage nothing reaches is left alone. It is the same rule `build-c` holds a freestanding
-archive to, which has no `main` of its own to fill it — a C runtime's archive included.
+archive to, which has no `main` of its own to fill it — except a C runtime's, whose start file fills
+it by calling `sysl_init_modules` (below).
 
 ### A runtime written in sysl calls `main` through an `extern`
 
@@ -647,6 +648,79 @@ An archive naming no entry, or naming `main`, is refused, with the way to declar
 an 'extern' may name 'main' in an archive only where the archive is the C program's runtime, whose entry calls it — and this archive names no entry other than 'main', so 'main' is the C program's and nothing here starts before it. A C runtime says so with 'targets.aarch64-freestanding.entry' in its package.hocon, naming the symbol it starts at
 ```
 
+### A C runtime fills its storage by calling `sysl_init_modules`
+
+A runtime has state of its own to set up before the C program runs — a heap's arena, a stream's
+buffer — and module storage computed at run time is where sysl keeps it. A program's `main` fills that
+storage and a hosted archive's constructor does; a freestanding machine has neither a `main` of the
+archive's nor a loader to walk a constructor list. **So an archive naming an `entry` defines one more
+function, `sysl_init_modules`, which fills every computed `val` the archive carries, in the order a
+`main` would, and its start file calls it before the C program's `main`.** It takes nothing and answers
+nothing, and it is defined whether or not anything needs filling, so a start file may always call it.
+
+The call is made the way `main` is called — through an `extern` naming the symbol, which the archive's
+own definition answers:
+
+```sysl
+extern "main" program_main(argc: int, argv: **u8) -> int
+extern "sysl_init_modules" init_modules()
+extern halt(code: int) -> never
+
+private sum_to(n: int) -> int
+    var total = 0
+
+    for i in 0..<n
+        total += i
+
+    total
+
+val base: int = sum_to(3)
+
+@export("libc_start")
+libc_start(argc: int, argv: **u8) -> never
+    init_modules()
+    halt(program_main(argc, argv) * 10 + base)
+```
+
+or from the start file's `asm`, as a `bl sysl_init_modules` ahead of its branch to `libc_start`.
+**Either one is what lets an export read the storage**: an export reaching computed storage is
+accepted in an archive whose start file calls `sysl_init_modules`, and refused, with the name to call,
+in one that never does:
+
+```
+'libc_start' is exported and reaches 'base', which is module storage an initializer fills before the program's own statements run. This archive is a C runtime ('targets.aarch64-freestanding.entry'), and 'sysl_init_modules' is what fills it — but nothing here calls it, so the function would read whatever the image left. Call it from the start file before the C program's 'main' — a 'bl sysl_init_modules' in its 'asm', or a call through an 'extern' naming it
+```
+
+An archive naming no entry is a library the C program calls into and still has nobody to fill its
+storage, so it is refused as before.
+
+**What the compiler can see is that the call is made, not when.** The storage reads as the image left
+it — zero, where the start file cleared `.bss` — until `sysl_init_modules` returns, so the start file
+calls it after the stack is set and `.bss` is cleared (clearing it afterwards would wipe what it
+wrote), and before anything that reads the storage: the runtime's own code ahead of the call, and an
+interrupt handler enabled before it, read zeros. Calling it twice fills the storage twice, taking a
+second count of every reference among it.
+
+Why a function the start file calls rather than the ELF `.init_array` a C runtime walks: the call is
+something the compiler can check, so the archive that forgets it is refused rather than reading zeros;
+and walking `.init_array` needs the linker script to keep the section and define its bounds, which is
+the C program's link's to say rather than the archive's.
+
+Everywhere else nothing defines the symbol, and an `extern` naming it is refused where it is written —
+in a program, whose storage `main` fills:
+
+```sysl
+extern "sysl_init_modules" init_modules()
+
+init_modules()
+```
+
+```error
+'sysl_init_modules' is defined only in a C runtime's archive — a 'build-c' archive for a freestanding machine whose package.hocon names the symbol it starts at — and this program's storage is filled by 'main'
+```
+
+and at any signature but `() -> unit`.
+
 ### What is refused
 
 - **The keys in a dependency.** How an image is linked is the program's own to say; a library's
@@ -663,7 +737,10 @@ an 'extern' may name 'main' in an archive only where the archive is the C progra
   linker's own line.
 - **A value that is not a non-empty string**, and an `entry` holding a space, a comma or `=`, when the
   file is read.
-- **Computed module storage read from an image whose entry never runs `main`** — described above.
+- **Computed module storage read from an image whose entry never runs `main`**, or from a C
+  runtime's archive whose start file never calls `sysl_init_modules` — described above.
+- **An `extern` naming `sysl_init_modules` anywhere but a C runtime's archive**, or at a signature
+  other than `() -> unit` — described above.
 - **An `extern` naming `main` where nothing else starts the image**, or at a signature other than
   C's `main` — described above.
 ## What the generated code may use of the machine

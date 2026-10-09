@@ -110,18 +110,8 @@ end gen_main
 // so two archives may each carry one: the list is `appending`, and registering the function on it is
 // also what keeps it, since nothing here calls it.
 gen_module_init(e: *Emit, p: TProgram) -> Option[IrInit]
-    start_function(e)
-    e.caller_exposed = exposed_in(buf(), None, p.vals)
-    push_temps(e)
-    push_owned(e)
-    gen_computed_vals(e, p.vals)
-    gen_alloc_count_mark(e)
-    release_all(e)
-    emit_term(e, InRet(None, None))
-
-    if has_gap(e) then return None
-
     val sig = ir_sig(module_init_symbol(), ir_fn_type(LVoid, buf())) with { linkage = LinkInternal }
+    val f = gen_init_body(e, p, sig)?
 
     // LLVM's own element type for the list: a priority, the function, and the global the entry is
     // tied to the liveness of -- nothing here, so the entry lives as long as the object does.
@@ -143,14 +133,44 @@ gen_module_init(e: *Emit, p: TProgram) -> Option[IrInit]
 
     entries.push(ir_arg(slot, VAgg(fields)))
 
-    Some(IrInit(finish_func(e, sig),
-                IrGlobal(llvm_global_ctors(), false, LArr(1, slot), Some(VArray(entries)),
-                         LinkAppending, None, None, false, false)))
+    Some(IrInit(f, IrGlobal(llvm_global_ctors(), false, LArr(1, slot), Some(VArray(entries)),
+                            LinkAppending, None, None, false, false)))
 end gen_module_init
+
+// **What a C runtime's archive gets instead of a constructor**: the same body under a symbol of its
+// own, external, for the runtime's start file to call before the C program's `main`. A freestanding
+// machine has no loader to walk a constructor list, and the start file is the one code that certainly
+// runs first -- so it is handed the job by name, as `@main` is handed it on a program
+// (`runtime_init_symbol`). It is defined whether or not anything needs filling, so a start file may
+// call it unconditionally and keep calling it as the storage grows.
+gen_runtime_init(e: *Emit, p: TProgram) -> Option[IrFunc]
+    gen_init_body(e, p, ir_sig(runtime_init_symbol(), ir_fn_type(LVoid, buf())))
+
+// The filling both share: every computed `val`, each in a region of its own, in the order `@main`
+// lays them down.
+private gen_init_body(e: *Emit, p: TProgram, sig: IrFuncSig) -> Option[IrFunc]
+    start_function(e)
+    e.caller_exposed = exposed_in(buf(), None, p.vals)
+    push_temps(e)
+    push_owned(e)
+    gen_computed_vals(e, p.vals)
+    gen_alloc_count_mark(e)
+    release_all(e)
+    emit_term(e, InRet(None, None))
+
+    if has_gap(e) then return None
+
+    Some(finish_func(e, sig))
+end gen_init_body
 
 // The constructor's symbol: a runtime helper's spelling, dots rather than the module separator, so
 // nothing a module could declare lands on it.
 module_init_symbol() -> string = "sysl.module_init"
+
+// The symbol a C runtime's start file calls to fill the archive's computed storage. It is a C name,
+// being written in the start file's `asm` or named by an `extern`, and it carries the prefix every
+// symbol sysl's own runtime C defines does.
+runtime_init_symbol() -> string = "sysl_init_modules"
 
 // Where the constructor sits among the platform's own. `65535` is the default clang gives a C
 // `__attribute__((constructor))` with no priority, so sysl's storage is filled alongside the C the

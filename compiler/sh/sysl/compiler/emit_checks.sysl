@@ -265,6 +265,11 @@ end check_exports_emitted
 // a function nobody calls and the storage would read whatever the image left -- a silent wrong answer
 // rather than a link error.
 //
+// **Except a C runtime's archive whose start file calls `sysl_init_modules`** (`c_runtime`,
+// `runtime_init_called`): the start file is code that certainly runs before the C program's `main`,
+// so the storage is filled there, as `@main` fills a program's. A runtime that never calls it is
+// refused as before, told the name to call.
+//
 // A `val` whose initializer is constant data is not looked at, being laid straight into the object
 // file -- the rule C already has for a static-storage initializer. The walk is the reachability one,
 // so the storage may be several calls down and the function that is named is the one exported.
@@ -272,6 +277,7 @@ private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
     val t = a.tables.target
 
     if !p.c_artifact || t.runs_initializers() || exported.is_empty() then return
+    if p.c_runtime && runtime_init_called(p) then return
 
     var computed: Buf[string] = buf()
 
@@ -289,7 +295,16 @@ private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
         for item in reached
             if holds_string(computed, item) then named.push(s"'${qualified_name(item)}'")
 
-        if !named.is_empty()
+        if !named.is_empty() && p.c_runtime
+            a.fault(func_home(a, f.name), f.span,
+                    s"'${qualified_name(f.name)}' is exported and reaches " +
+                    s"${joined_list(sorted_names(named))}, which is module storage an initializer " +
+                    "fills before the program's own statements run. This archive is a C runtime " +
+                    s"('targets.${t.name}.entry'), and '${runtime_init_symbol()}' is what fills it — " +
+                    "but nothing here calls it, so the function would read whatever the image left. " +
+                    "Call it from the start file before the C program's 'main' — a 'bl " +
+                    s"${runtime_init_symbol()}' in its 'asm', or a call through an 'extern' naming it")
+        else if !named.is_empty()
             a.fault(func_home(a, f.name), f.span,
                     s"'${qualified_name(f.name)}' is exported and reaches " +
                     s"${joined_list(sorted_names(named))}, which is module storage an initializer " +
@@ -399,6 +414,61 @@ check_main_extern(a: &Analysis, p: TProgram, entry: string)
                     "— the argument count and the argument vector — so an 'extern' naming it takes " +
                     s"those, where this one is '${extern_shape(x)}'")
 end check_main_extern
+
+// **An `extern` naming `sysl_init_modules` is a C runtime's call into the function that fills its
+// storage** (`gen_runtime_init`), and only an archive that is a C runtime defines one: a program's
+// storage is filled by `main`, a hosted archive's by the platform's constructor list, and a library
+// archive's by nobody, which `export_storage` refuses. Elsewhere the call would reach a symbol nothing
+// defines, so the declaration is refused where it was written; and where it is allowed it is held to
+// the signature the definition has, `() -> unit`.
+check_runtime_init_extern(a: &Analysis, p: TProgram, entry: string)
+    val t = a.tables.target
+    val sym = runtime_init_symbol()
+
+    for x in p.externs
+        if x.symbol != sym then continue
+
+        val home = a.tables.extern_scopes.get(x.name)
+
+        if home.is_none() then continue
+
+        val at = home.unwrap()
+
+        if !p.c_artifact || !p.c_runtime
+            var what = "this program's storage is filled by 'main'"
+
+            if p.c_artifact && !t.runs_initializers()
+                what = s"this archive names no entry other than 'main' ('targets.${t.name}.entry'), " +
+                    "so it is a library the C program calls into rather than the C program's runtime"
+            else if p.c_artifact
+                what = s"'${t.name}' runs the archive's constructor before the C program's 'main' " +
+                    "itself, which fills it"
+
+            a.fault(at.scope, at.span, s"'$sym' is defined only in a C runtime's archive — a " +
+                    "'build-c' archive for a freestanding machine whose package.hocon names the symbol " +
+                    s"it starts at — and $what")
+            continue
+        end if
+
+        if x.variadic || !x.params.is_empty() || !is_unit(x.ret_ty)
+            a.fault(at.scope, at.span, s"'$sym' takes nothing and answers nothing, so an 'extern' " +
+                    s"naming it is '() -> unit', where this one is '${extern_shape(x)}'")
+end check_runtime_init_extern
+
+// Whether a C runtime's start file calls `sysl_init_modules`: a module-level `asm` block naming it, or
+// a call through an `extern` naming it -- the two ways `main` is found to be called on an image.
+runtime_init_called(p: TProgram) -> bool
+    if asm_names_symbol(p.module_asm, runtime_init_symbol()) then return true
+
+    for x in p.externs
+        if x.symbol == runtime_init_symbol() then return true
+
+    false
+end runtime_init_called
+
+private is_unit(t: Type) -> bool = nameless(t) match
+    Unit -> true
+    _ -> false
 
 // Whether an `extern` is declared at the signature the program's `main` is emitted at: a 32-bit
 // signed count, a pointer, and a 32-bit signed answer -- a measured `c type` read as what it measures.
