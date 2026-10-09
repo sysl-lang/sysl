@@ -298,13 +298,15 @@ end check_crossing
 // **Two kinds of body run in another domain.** A value erased into a `&sync` object: the object may
 // be handed to another thread, and its methods run there -- a closure's body, a named function read
 // into a `&sync Fn`. A `@crossing` parameter adds nothing to that list, since everything a crossing
-// hands over that holds a count is held to being `&sync` at the call. And an interrupt handler (the
-// `interrupt` convention), which the processor enters on top of whatever was running.
+// hands over that holds a count is held to being `&sync` at the call. And an interrupt handler,
+// which the processor enters on top of whatever was running: one written in the `interrupt`
+// convention, or an ordinary function marked `@domain(interrupt)` -- the shape a vector table written
+// in assembly calls, which saves the interrupted registers itself and calls sysl as C would.
 //
 // **An `@export` is not a root**, though C may call one from anywhere: an export is how a C program,
 // a JNI activity or a board's `main` enters sysl at all, and almost always from the one thread the
 // program has. Holding every export to this would refuse every archive that keeps its state in a
-// module `var`, for a second domain nothing says exists.
+// module `var`, for a second domain nothing says exists. `@domain(interrupt)` is how one says so.
 //
 // **A `val` filled at run time is asked as a `var` is**, since reading it takes a share of the same
 // count; a `val` laid down as constant data is not, and neither is `@thread_local` storage, which is
@@ -321,6 +323,9 @@ end DomainRoot
 
 private struct DomainRoots
     list: Buf[DomainRoot]
+    // Whether anything in the program awaits a `park`, and so whether a `&Fn() -> unit` in module
+    // storage may be a waker -- which changes the advice, a waker having no atomic spelling.
+    parks: bool
 end DomainRoots
 
 // Holds the module storage every body in another domain reaches to the rule a capture is held to.
@@ -338,7 +343,7 @@ check_shared_storage(a: &Analysis, p: TProgram)
         for item in storage_reached_in_domain(p, r.funcs)
             vals.get(item.0) match
                 Some(i) ->
-                    val why = storage_complaint(a, r, p.vals.at(i), item.1)
+                    val why = storage_complaint(a, r, p.vals.at(i), item.1, roots.parks)
 
                     if why.is_some() then a.fault(r.scope, r.span, why.unwrap())
                 None -> ()
@@ -346,7 +351,7 @@ end check_shared_storage
 
 // Every erasure into a `&sync` object the program makes, and every interrupt handler it declares.
 private domain_roots(a: &Analysis, p: TProgram) -> &DomainRoots
-    val out: &DomainRoots = DomainRoots(buf())
+    val out: &DomainRoots = DomainRoots(buf(), false)
 
     var tables: Map[string, usize] = map()
 
@@ -360,13 +365,15 @@ private domain_roots(a: &Analysis, p: TProgram) -> &DomainRoots
         walk_block_stmts(f.body, expr_walk(false, e -> note_sync_erasure(out, p, tables, home, e)))
 
         if f.conv.is_some()
-            var only: Buf[string] = buf()
-
-            only.push(f.name)
-            add_root(&out.list, DomainRoot(only, home, f.span,
+            add_root(&out.list, DomainRoot(just(f.name), home, f.span,
                                            s"'${qualified_name(f.name)}' is an interrupt handler, entered " +
                                            "on top of whatever was running, so every count it reaches " +
                                            "has to be atomic — "))
+        else if f.marks.domain.is_some()
+            add_root(&out.list, DomainRoot(just(f.name), home, f.span,
+                                           s"'${qualified_name(f.name)}' is entered in the " +
+                                           s"'${f.marks.domain.unwrap()}' domain, on top of whatever was " +
+                                           "running, so every count it reaches has to be atomic — "))
         end if
 
     val entry = entry_home(a)
@@ -377,10 +384,18 @@ end domain_roots
 
 private add_root(list: *Buf[DomainRoot], r: DomainRoot) = list.push(r)
 
+private just(name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(name)
+    out
+end just
+
 // A root where `e` erases a value into a `&sync` object: the functions its table points at.
 private note_sync_erasure(out: &DomainRoots, p: TProgram, tables: Map[string, usize], home: Scope,
                           e: TExpr)
     *e.kind match
+        TPark(_) -> out.parks = true
         TErase(operand, vtable, want) ->
             val sync = want match
                 Ref(_, s) -> s
@@ -415,7 +430,8 @@ private erased_inner(t: Type) -> Type = t match
     _ -> t
 
 // Why one piece of module storage may not be reached from the root, or nothing where it may.
-private storage_complaint(a: &Analysis, r: DomainRoot, v: TVal, reader: string) -> Option[string]
+private storage_complaint(a: &Analysis, r: DomainRoot, v: TVal, reader: string,
+                          parks: bool) -> Option[string]
     if v.thread_local || (!v.writable && !v.computed) then return None
 
     val part = unshareable(v.ty)
@@ -430,6 +446,14 @@ private storage_complaint(a: &Analysis, r: DomainRoot, v: TVal, reader: string) 
     val sealed = sealed_holder(p, a, r.scope)
 
     if sealed.is_some() then return Some(r.head + subject + storage_sealed(p, sealed.unwrap(), v.ty))
+
+    if parks && p.ty == waker_type_in(a)
+        return Some(r.head + subject + storage_where(p, v.ty) + ", whose count is not. If it holds a " +
+                    "waker 'park' handed its registrar, no spelling makes that atomic: keep the waker in " +
+                    "the executor's domain — have this one signal the executor, and the executor call " +
+                    s"the waker. A callback of the program's own is held as a '&sync ${type_show(erased_inner(p.ty))}' " +
+                    "('06')")
+    end if
 
     Some(share_remedy(r.head + subject + storage_where(p, v.ty) + ", ", p.ty))
 end storage_complaint

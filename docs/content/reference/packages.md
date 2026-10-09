@@ -546,7 +546,7 @@ every way into the image — the entry itself where sysl defines it, an `@export
 
 Storage that folds — literals, a struct over constants — is laid into the image and never asks;
 computed storage nothing reaches is left alone. It is the same rule `build-c` holds a freestanding
-archive to, which has no entry at all.
+archive to, which has no `main` of its own to fill it — a C runtime's archive included.
 
 ### A runtime written in sysl calls `main` through an `extern`
 
@@ -608,8 +608,44 @@ kstart() -> int = program_main(0, null)
 an 'extern' may name 'main' only on an image that starts somewhere else, whose entry calls it — and this image names no entry of its own ('targets.aarch64-freestanding.entry'), so 'main' is where it starts
 ```
 
-An archive `build-c` writes is refused the same way, its `main` being the C program's; and an
-`extern` *variable* at `main`'s symbol is refused on every target, storage never being an entry.
+An `extern` *variable* at `main`'s symbol is refused on every target, storage never being an entry.
+
+### A C runtime written in sysl calls the C program's `main`
+
+An archive `build-c` writes is ordinarily a library a C program calls into, and the program's `main`
+is none of its business. **A C runtime is the exception** — the crt0 a C program is linked against,
+whose `_start` sets the machine up and calls the program's `main(argc, argv)`. The archive says it is
+one the way an image does, by naming the symbol it starts at:
+
+```hocon
+targets {
+  aarch64-freestanding {
+    entry = "_start"
+  }
+}
+```
+
+Then an `extern` may name `main`, and it declares the C program's — the archive defines none, and the
+link finds the one the C program brings. The signature is held to C's, as above:
+
+```sysl
+extern "main" program_main(argc: int, argv: **u8) -> int
+extern halt(code: int) -> never
+
+@export("libc_start")
+libc_start(argc: int, argv: **u8) -> never = halt(program_main(argc, argv))
+```
+
+`_start` is a few lines of module-level `asm` that set the stack and branch to `libc_start`; module
+`asm` and an `@export` are never pruned, so both are in the archive, and the linker pulls them in
+because the image's entry names `_start`. Only `entry` is read for an archive — `linker` and
+`linker_script` are the C program's link's to say.
+
+An archive naming no entry, or naming `main`, is refused, with the way to declare it:
+
+```
+an 'extern' may name 'main' in an archive only where the archive is the C program's runtime, whose entry calls it — and this archive names no entry other than 'main', so 'main' is the C program's and nothing here starts before it. A C runtime says so with 'targets.aarch64-freestanding.entry' in its package.hocon, naming the symbol it starts at
+```
 
 ### What is refused
 
