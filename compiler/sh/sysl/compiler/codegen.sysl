@@ -95,7 +95,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
-        if !f.ghost && f.exported.is_some() && !declared_elsewhere(p, f)
+        if !f.ghost && f.exported.is_some() && !f.variadic && !declared_elsewhere(p, f)
             gen_export_thunk(e, f, symbol_of(e, f.name)) match
                 Some(built) -> thunks.push(built)
                 None -> gaps.push((s"${f.name} thunk", gap_text(e)))
@@ -477,10 +477,18 @@ private record_symbols(e: *Emit, p: TProgram)
     // **Renaming the definition rather than the thunk keeps the promise the right way round**: the
     // exported symbol is the one somebody outside has written down, and a mangled key is this
     // compiler's own business.
+    //
+    // **A variadic export is the one definition emitted under its exported symbol**, with no thunk:
+    // no function can hand a C tail it was given on to another, so the definition itself has to be
+    // the entry C calls -- which the export check makes possible by admitting only parameters both
+    // conventions pass alike (`emit_checks.sysl`'s `export_signature`). A sysl call reaches it there.
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
-        if is_displaced(e, f.name) then e.symbols.push((f.name, s"${f.name}${ModuleSep}${ModuleSep}sysl"))
+        if f.variadic && f.exported.is_some()
+            e.symbols.push((f.name, f.exported.unwrap()))
+        else if is_displaced(e, f.name)
+            e.symbols.push((f.name, s"${f.name}${ModuleSep}${ModuleSep}sysl"))
 
         if f.variadic
             e.variadics.push(f.name)

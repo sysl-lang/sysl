@@ -44,8 +44,11 @@ gen_export_thunk(e: *Emit, f: TFunc, symbol: string) -> Option[IrFunc]
 
     var types: Buf[Type] = buf()
 
+    // A `va_list` parameter arrives as the one pointer C's convention names for it, and the
+    // definition takes it as that same pointer (`emit_func.sysl`'s `receive_walk`), so it is handed on
+    // untouched.
     for item in stored
-        types.push(item.1)
+        types.push(if underlying(item.1) == VaList then Ptr(VaList) else item.1)
 
     val c_type = foreign_signature(e, f.ret_ty, types, false)
 
@@ -77,7 +80,7 @@ gen_export_thunk(e: *Emit, f: TFunc, symbol: string) -> Option[IrFunc]
     var passed: Buf[IrArg] = buf()
 
     for i in 0..<stored.len()
-        passed.push(thunk_argument(e, stored.at(i).1, incoming.at(i)))
+        passed.push(thunk_argument(e, types.at(i), incoming.at(i)))
 
     gen_thunk_call(e, f, symbol, passed, sret)
 
@@ -102,7 +105,7 @@ end gen_export_thunk
 // rival (`seam_supply.sysl`): where a program answers the same seam, the program's definition is the
 // one the link keeps. Strong, the library's copy in a prebuilt standard module is a second definition
 // of the symbol, and a freestanding program answering its own filesystem could not link at all.
-private export_linkage(f: TFunc) -> IrLinkage = f.src match
+export_linkage(f: TFunc) -> IrLinkage = f.src match
     Some(s) -> if s.name.starts_with(s"$StdPrefix/") then LinkWeak else LinkDefault
     None -> LinkDefault
 

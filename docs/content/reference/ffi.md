@@ -381,7 +381,6 @@ surprise.
 | a **member** | C has no receiver to hand it. The grammar refuses this before any rule here is reached, and says so in as many words: a member takes no annotation at all ([attributes](/reference/attributes/)), so `@test` and `@pure` are as unavailable on a method |
 | a **`@ghost`** | it is erased before there is a symbol at all |
 | a **`@test`** | only `sysl test` builds one, and an export has to be in the artifact a C project links |
-| a **variadic** | what a C caller promotes into the tail is decided by the prototype it compiled against, not by this declaration. Take a `va_list` parameter, which says the same thing and is what C's own `v` variants do |
 | a symbol that is not a **C identifier** | there would be nothing a C declaration could spell |
 
 **The types are the interesting rule, and it asks what C can *declare*.** A scalar, a `*T` and a
@@ -435,6 +434,102 @@ data, so no count crosses it in either direction.
 Every refusal names the shape to write instead, because there always is one — a slice becomes the
 pointer and length C's own buffer functions already take, an array becomes a struct holding it. That
 is what makes the boundary writable rather than merely restricted.
+
+### A variadic export
+
+**An exported function may end in `...`**, which is what a C library written in sysl needs to define
+`printf`, `open(path, flags, ...)`, `fcntl` or `execl`. The body reads the tail exactly as any
+[variadic sysl definition](#variadic-functions) does, and the header declares it with C's own ellipsis:
+
+```sysl build=c
+module mylib
+
+@export("mylib_sum")
+sum(n: i32, ...) -> i32
+    var ap: va_list
+
+    va_start(ap)
+
+    var total: i32 = 0
+
+    for i in 0..<n do total += va_arg(ap)
+
+    va_end(ap)
+
+    total
+end sum
+```
+
+```c
+int32_t mylib_sum(int32_t n, ...);
+```
+
+**What arrives in the tail is what C's default argument promotions make of it**, and they are the
+same under every prototype: an integer narrower than `int` arrives as an `int`, and a `float` as a
+`double`. A sysl caller widens its tail the same way, so `va_arg` already reads only promoted types
+and refuses a narrow one with the type to read instead:
+
+```sysl
+module mylib
+
+@export
+first(n: i32, ...) -> f32
+    var ap: va_list
+
+    va_start(ap)
+
+    val x: f32 = va_arg(ap)
+
+    va_end(ap)
+
+    x
+end first
+```
+
+```error
+a variadic argument is promoted to double, so it cannot be read as f32 — read it as 'real' and convert
+```
+
+**Its named parameters and its result are scalars, pointers and simple enums.** An ordinary export's
+symbol is the entry described above, which gathers each argument out of the registers C put it in and
+then calls the definition. A variadic one cannot be such an entry, because no function can hand on a
+C tail it was given — so the definition itself is the symbol, and an aggregate, which only the entry
+could have gathered, is refused:
+
+```sysl
+module mylib
+
+struct Pair
+    a: i32
+    b: i32
+
+@export
+log(p: Pair, ...) -> i32 = p.a
+```
+
+```error
+'p' of the variadic export 'mylib.log' is mylib.Pair, an aggregate — a variadic export is the definition itself, with no thunk in front of it to gather an aggregate out of the registers C spread it across, because no function can hand on a C tail it was given. Take a pointer to it
+```
+
+The `v` twin is the other half, and an export may be that too: a [`va_list`
+parameter](#handing-a-walk-on) is received as C passes one, so a C caller hands it its own `va_list`
+and the header includes `<stdarg.h>` to spell it:
+
+```sysl build=c
+module mylib
+
+@export("mylib_vsum")
+vsum(n: i32, ap: va_list) -> i32
+    var total: i32 = 0
+
+    for i in 0..<n do total += va_arg(ap)
+
+    total
+```
+
+```c
+int32_t mylib_vsum(int32_t n, va_list ap);
+```
 
 ### A private export
 
@@ -1812,7 +1907,50 @@ print(walk(1, 2))
 ### Handing a walk on
 
 C's other half of this is `vprintf`: a function receives the tail, does not read it itself, and
-passes it to somebody who does. The parameter type is **`*va_list`**, and the call writes `&ap`:
+passes it to somebody who does. The parameter is a **`va_list`**, as C's is, and the call writes
+`&ap`:
+
+```sysl
+total(n: int, ap: va_list) -> int
+    var sum = 0
+
+    for i in 0..<n do sum += va_arg(ap)
+
+    sum
+
+relay(n: int, ...) -> int
+    var ap: va_list
+
+    va_start(ap)
+
+    val t = total(n, &ap)
+
+    va_end(ap)
+
+    t
+end relay
+
+print(relay(3, 4, 5, 6))
+```
+
+```output
+15
+```
+
+The callee walks on from wherever the caller had reached, and inside it `ap` is a walk like any
+other — `va_arg(ap)` reads it, `&ap` hands it on again, `va_copy` starts a second one from it. What
+`va_start` asks for is a tail of the function's own, so it is refused in `total`, which reads a tail
+without having one.
+
+**It is received as C receives one**, which is a different thing on every machine: the value in the
+walk's storage on Darwin arm64, the address of the caller's own storage on x86-64, the address of a
+copy the caller made on AAPCS64. That is what lets a C caller hand a sysl function its own
+`va_list`, and a libc written in sysl define `vprintf`. It is also why **the caller's walk may only
+be ended after the call**, exactly as in C: on one machine the callee has advanced it and on another
+it has not.
+
+To read on after the callee, hand the walk over **by address** instead. The parameter type is
+**`*va_list`**, the call still writes `&ap`, and the borrower advances the lender's own list:
 
 ```sysl
 report(n: int, ap: *va_list) -> int
@@ -1840,23 +1978,33 @@ print(relay(2, 4, 5))
 9
 ```
 
-**A bare `va_list` parameter is refused**, and the by-value parameter rule is why — a copy of a walk
-is not a walk:
+What the borrower consumed is gone when the lender reads on — which is what `va_copy` is for, exactly
+as in C.
+
+**The argument is the walk's address for either parameter**, and a `va_list` itself is refused there,
+since the call has no address of its own to give:
 
 ```sysl
-borrow(ap: va_list) -> int = 0
+total(ap: va_list) -> int = 0
 
-print(borrow(1))
+relay(n: int, ...) -> int
+    var ap: va_list
+
+    va_start(ap)
+
+    val t = total(ap)
+
+    va_end(ap)
+
+    t
+end relay
+
+print(relay(1, 2))
 ```
 
 ```error
-a va_list is a parameter as '*va_list', not as 'va_list' — a parameter is a by-value binding, and a copy of a walk advances nothing 'borrow''s caller can see, so the walk is handed over by address and the call writes '&ap'
+'ap' of 'total' is *va_list, but va_list was given
 ```
-
-Two things follow, and both are the point. The borrower **advances the lender's own list**, so what
-it consumed is gone when the lender reads on — which is what `va_copy` is for, exactly as in C. And
-`va_start` still asks for a tail of the function's own while `va_arg` asks only for a walk, so a
-borrower reads a tail without having one.
 
 **Returning a `va_list` is refused outright**, foreign or not:
 
@@ -1876,11 +2024,9 @@ a va_list cannot be returned from 'give' — the type names the storage a walk l
 A `*va_list` is an ordinary raw pointer and is refused nowhere — it may be returned, held in a
 field, or carried in a struct, under the memory model's rules and nobody else's.
 
-**An `extern` is written in C's spellings and takes either.** A foreign declaration transcribes a C
-header, so it says what the header says: `va_list` is C's by-value parameter, the one `vprintf`
-takes, and `*va_list` is C's `va_list *`. The refusal above is about a *sysl* body, which could do
-nothing with a copy of a walk; a foreign body is C's, and C's `vprintf` is precisely a body that
-reads one.
+**An `extern` is written in the same two spellings**, which are C's: a foreign declaration
+transcribes a C header, so `va_list` is C's by-value parameter, the one `vprintf` takes, and
+`*va_list` is C's `va_list *`.
 
 ```sysl
 extern vprintf(fmt: *u8, ap: va_list) -> i32
@@ -1903,12 +2049,11 @@ print(1)
 1
 ```
 
-**The call writes `&ap` for either spelling**, because the address is the only thing sysl has and it
-is what both are formed from. What actually crosses for the by-value one is a *target* question:
-C's `va_list` is a different type on every machine and is passed three different ways — the value in
-the storage on Darwin arm64, the storage's own address on x86-64 System V, the address of a fresh
-copy on AAPCS64. All three pass one pointer, so the difference cannot be recovered from the emitted
-types; the compiler reads it off the target it was told to build for.
+**The call writes `&ap` for either spelling, to a foreign callee as to a sysl one**, because the
+address is the only thing sysl has and it is what both are formed from. What crosses for the
+by-value one is the target's three answers above, and all three pass one pointer, so the difference
+cannot be recovered from the emitted types; the compiler reads it off the target it was told to
+build for, at the call and in the body that receives it.
 
 ### Where an ellipsis may go
 

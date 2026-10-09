@@ -97,7 +97,7 @@ private ecl_c_run(root: string, source: string, flags: []string) -> string
 
     assert(ecl_exited_zero(built.status), built.err.unwrap_or(built.text))
 
-    val ran = capture(s"$root/caller", [], "", [], true, 20).unwrap()
+    val ran = capture(s"$root/caller", [], "", [], true, 20000).unwrap()
 
     assert(ecl_exited_zero(ran.status), ran.err.unwrap_or(ran.text))
     ran.text.trim()
@@ -965,3 +965,140 @@ ecl_std_c_is_a_member()
 
     assert(ecl_holds(names, "sysl.fs.hosted.host.o"), join(names.view(), " "))
     remove_dir_all(root).unwrap_or(())
+
+// -- a variadic export, called from C -------------------------------------------------------------
+
+// A C library's own `printf` shape, its `vprintf` twin, a sysl variadic export handing its tail to
+// that twin, and one whose tail mixes C's promoted types.
+private ecl_variadic() -> string = raw"""
+    module mylib
+
+    @export("mylib_sum")
+    sum(n: i32, ...) -> i32
+        var ap: va_list
+
+        va_start(ap)
+
+        var total: i32 = 0
+
+        for i in 0..<n do total += va_arg(ap)
+
+        va_end(ap)
+
+        total
+    end sum
+
+    @export("mylib_vsum")
+    vsum(n: i32, ap: va_list) -> i32
+        var total: i32 = 0
+
+        for i in 0..<n do total += va_arg(ap)
+
+        total
+
+    @export("mylib_relay")
+    relay(n: i32, ...) -> i32
+        var ap: va_list
+
+        va_start(ap)
+
+        val t = vsum(n, &ap)
+
+        va_end(ap)
+
+        t
+    end relay
+
+    @export("mylib_mix")
+    mix(n: i32, ...) -> real
+        var ap: va_list
+
+        va_start(ap)
+
+        val a: i32 = va_arg(ap)
+        val b: i32 = va_arg(ap)
+        val c: real = va_arg(ap)
+
+        va_end(ap)
+
+        real(a + b) + c
+    end mix
+    """
+
+// A `short`, a `char` and a `float` in the tail arrive as C's default promotions leave them, which is
+// what `mix` reads; `call_v` hands its own `va_list` to the sysl twin by value, as C hands one to
+// `vprintf`.
+private ecl_variadic_caller() -> string = raw"""
+    #include <stdio.h>
+    #include <stdarg.h>
+    #include "libmylib.a.h"
+
+    static int call_v(int n, ...) {
+        va_list ap;
+        va_start(ap, n);
+        int r = mylib_vsum(n, ap);
+        va_end(ap);
+        return r;
+    }
+
+    int main(void) {
+        printf("%d %.1f %d %d\n", mylib_sum(3, 10, 20, 30), mylib_mix(3, (short)-2, (char)7, 1.5f),
+               call_v(2, 5, 6), mylib_relay(2, 40, 2));
+        return 0;
+    }
+    """
+
+@test("a variadic export is called from C, and so is the va_list twin it hands its tail to")
+ecl_a_variadic_export_called_from_c()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_variadic())
+
+    ecl_build_c(root)
+
+    val header = ecl_header(root)
+
+    assert(ecl_has(header, "int32_t mylib_sum(int32_t n, ...);"), header)
+    assert(ecl_has(header, "int32_t mylib_vsum(int32_t n, va_list ap);"), header)
+    assert(ecl_has(header, "#include <stdarg.h>"), header)
+    assert_eq(ecl_c_run(root, ecl_variadic_caller(), []), "60 6.5 11 42")
+    remove_dir_all(root).unwrap_or(())
+end ecl_a_variadic_export_called_from_c
+
+// x86-64 System V passes a `va_list` as the address of the caller's own storage, where Darwin arm64
+// passes the pointer in it -- so the same program built for the other machine is the test of the
+// other answer. Run under Rosetta, where this machine has it.
+@test("and on x86-64, where a va_list crosses as an address")
+ecl_a_variadic_export_called_from_c_on_x86_64()
+    if !ecl_ready() then return
+
+    val rosetta = capture("arch", ["-x86_64", "/usr/bin/true"], "", [], true)
+
+    if rosetta.is_err() || !ecl_exited_zero(rosetta.unwrap().status)
+        print("skipped: this machine cannot run an x86-64 program")
+        return
+    end if
+
+    val root = ecl_project(ecl_variadic())
+    val got = ecl_run(["sysl", "build-c", root, "-o", s"$root/libmylib.a", "--target", "x86_64-macos"])
+
+    assert(got.0 == 0, got.1)
+    write_text(s"$root/main.c", ecl_variadic_caller()).unwrap()
+
+    val built = capture("clang", ["-arch", "x86_64", s"$root/main.c", s"$root/libmylib.a", "-o",
+                                  s"$root/caller"], "", [], true).unwrap()
+
+    assert(ecl_exited_zero(built.status), built.err.unwrap_or(built.text))
+
+    // The timeout is in milliseconds, and Rosetta translates a binary it has not seen on the first
+    // run, which takes well over a few dozen of them.
+    val ran = capture(s"$root/caller", [], "", [], true, 60000).unwrap()
+
+    val how = ran.status match
+        Exited(code) -> s"exit $code"
+        _ -> "ended by a signal"
+
+    assert(ecl_exited_zero(ran.status), s"$how: ${ran.text} ${ran.err.unwrap_or("")}")
+    assert_eq(ran.text.trim(), "60 6.5 11 42")
+    remove_dir_all(root).unwrap_or(())
+end ecl_a_variadic_export_called_from_c_on_x86_64
