@@ -4,7 +4,7 @@
 # module `library/` ADDS (today `sysl.testing`, which the tree's tests import) rather than one it
 # changes. The reference compiles against its own library for everything else, which is the only
 # library it can compile: `library/`'s changed modules use forms only this compiler has (`sysl.buf`'s
-# slot forms). `tests_oracle.sysl`'s `reference_overlay` is the same rule, for the own-tree sweep.
+# slot forms). `tests_oracle_support.sysl`'s `reference_overlay` is the same rule.
 #
 #   scripts/reference_overlay.sh [<reference library>] [<out dir>]
 #
@@ -40,7 +40,7 @@ grep -v '^#' "$root/scripts/library_patches.tsv" | cut -f1 | while read -r file;
 
     # A new FILE is not a new MODULE: a file beside sources the reference's library already has in
     # that directory adds to a module the reference has, and the reference refuses a `--lib` root
-    # declaring a standard module. It is left out, as `tests_oracle.sysl`'s `holds_sources` leaves it.
+    # declaring a standard module. It is left out, as `tests_oracle_support.sysl`'s `holds_sources` leaves it.
     # A platform directory (`sysl/fs/__posix__/errtext.c`) is its parent module's, so the parent is
     # the one asked.
     dir=$(dirname "$file")

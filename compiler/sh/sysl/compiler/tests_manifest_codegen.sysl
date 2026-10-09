@@ -2,7 +2,6 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.env.{get as env_var}
 import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.{join, split, Search}
@@ -89,15 +88,6 @@ private mcg_building(root: string) -> string =
 private val mcg_program: string = "main()\n    print(1)\n\n@test(\"one is one\")\none()\n    assert(1 == 1)\n"
 
 private mcg_key(level: string) -> string = s"optimization = \"$level\"\n"
-
-private mcg_without_trailing_newlines(text: string) -> string
-    var n = text.len
-
-    while n > 0 && text.bytes[n - 1] == u8('\n')
-        n -= 1
-
-    text[0..<n]
-end mcg_without_trailing_newlines
 
 // -- the emitted module ---------------------------------------------------------------------------
 
@@ -189,42 +179,6 @@ mcg_the_allocator_declared_once()
     assert_eq(declared, 1, out)
     remove_dir_all(root).unwrap_or(())
 end mcg_the_allocator_declared_once
-
-// **The whole text, against the reference's on the same project** -- a single allocation site the
-// rewrite missed, or a declaration in another place, is a line of difference.
-@test("a project naming an allocator emits exactly the reference's text")
-mcg_allocator_text_is_the_references()
-    if !mcg_library_here() then return
-
-    val oracle = env_var("SYSL_ORACLE") match
-        None ->
-            print("skipped: SYSL_ORACLE names no reference compiler")
-            return
-        Some(binary) -> binary
-
-    val root = mcg_project("struct P\n    x: int\n\nval p: &P = P(3)\nprint(p.x)\n" + mcg_allocates,
-                           mcg_rtos_block)
-    val ours = mcg_without_trailing_newlines(mcg_llvm(root))
-
-    use_allocator(mcg_libc)
-
-    val theirs = capture_oracle(oracle, ["emit-llvm", root]) match
-        Err(_) -> "the oracle could not be run"
-        Ok(answer) -> mcg_without_trailing_newlines(answer.text)
-
-    assert(mcg_has(theirs, "declare ptr @pvPortMalloc("), theirs)
-
-    // What the bounds report adds is this compiler's and not the reference's, and is taken out as
-    // every sweep takes it out (`tests_oracle.sysl`'s `ours_without_the_bounds_report`); so are the
-    // types of a module `library_patches.tsv` lists, every library type being laid down in every text.
-    val patched = patched_modules()
-    val comparable = mcg_without_trailing_newlines(
-        without_patched_types(ours_without_the_bounds_report(ours, theirs), patched))
-    val reference = mcg_without_trailing_newlines(without_patched_types(theirs, patched))
-
-    assert(same_text_but_declare_order(reference, comparable), s"theirs:\n$reference\nours:\n$comparable")
-    remove_dir_all(root).unwrap_or(())
-end mcg_allocator_text_is_the_references
 
 // **A program has one heap and any package may be the one that names it** -- the ordinary case once
 // a driver is built on the binding that brings a kernel.

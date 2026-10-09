@@ -2,9 +2,7 @@
 # The org build census: every repository under `~/dev/sysl-lang` built and tested the way its own
 # author builds it, with this compiler, and every failure re-asked of the reference.
 #
-# **This is the other half of `org_resolve_census.sh` and asks a different question.** That one reads
-# each repository with both compilers and diffs the two texts, which proves the dependency layer;
-# this one runs what the repository is *actually built by* -- `sysl test .` for a package,
+# It runs what the repository is *actually built by* -- `sysl test .` for a package,
 # `sysl build .` for a program, `sysl build-c <dir>` for a project whose link belongs to CMake or
 # Gradle -- which is the org rule's own definition of done.
 #
