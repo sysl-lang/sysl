@@ -17,10 +17,26 @@ import sysl.math.bigint.from_int
 // two 64-bit reads, which takes one half from the last register and the other from the stack when a
 // single register is left -- where the convention puts the pair in two registers or wholly on the
 // stack. On both, this writes the walk out the way clang's own `va_arg` does.
+//
+// **RV32 keeps the single pointer but not every argument in it**: a 128-bit integer is wider than a
+// register pair, so the caller passes its address, and the instruction would read the address's
+// bytes as the integer.
 gen_va_arg(e: *Emit, ap: Val, ty: Type) -> Val
     if e.target.cpu == Aarch64 && e.target.os != MacOS then return aapcs64_va_arg(e, ap, ty)
     if e.target.cpu == X86_64 && e.target.os != Windows && va_wide(ty)
         return sysv_pair_va_arg(e, ap, ty)
+
+    // RV32 passes a scalar wider than two registers by address, a variadic one included, so the
+    // slot holds a pointer to the 128-bit integer rather than the integer itself.
+    if e.target.cpu == Riscv32 && va_wide(ty)
+        val at = fresh_reg(e)
+
+        emit(e, InVaArg(at, ap, LPtr))
+
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, ty), at, AccPlain, None))
+        return r
 
     val r = fresh_reg(e)
 
@@ -29,7 +45,8 @@ gen_va_arg(e: *Emit, ap: Val, ty: Type) -> Val
 end gen_va_arg
 
 // Whether a variadic argument is a 128-bit integer: sixteen bytes on a sixteen-byte boundary, which
-// is the one width that takes a register pair and the one boundary wider than a slot.
+// is the one width that takes a register pair and the one boundary wider than a slot. Every integer
+// between 64 and 128 bits is widened to it at the call, and reading one at its own width is refused.
 private va_wide(ty: Type) -> bool = ty match
     Integer(bits, _, _) -> bits == 128
     _ -> false
