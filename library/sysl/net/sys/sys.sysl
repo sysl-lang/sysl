@@ -1,0 +1,122 @@
+module sysl.net.sys
+@requires(os)
+
+// The calls `sysl.net` makes of whatever moves packets underneath it: make a socket, give it an
+// address, connect it, move bytes and datagrams through it, set the few options the module offers,
+// close it, and resolve a name.
+//
+// **Each is an `extern` naming a symbol no module here defines**, so what answers it is decided by
+// what the program is linked with (`reference/ffi.md § A module may supply another module's extern`),
+// exactly as for `sysl.fs.sys`, `sysl.io.sys` and `sysl.process.sys`:
+//
+// | linked with | what defines the symbols |
+// |---|---|
+// | a program for a hosted POSIX target | `sysl.net.hosted`, over the platform's sockets |
+// | a program for a target with no C library | the program, with an `@export` per hook it reaches |
+//
+// A freestanding program that reaches one of these and leaves it unanswered is refused when it is
+// compiled, naming the hooks it reached, rather than at the link.
+//
+// ## The shape of a hook
+//
+// **A hook answers one integer: what it did, or what went wrong** -- the contract of every `*.sys`
+// module (`sysl.fs.sys`, `sysl.io.sys`, `sysl.process.sys`).
+// Zero or more is success: a descriptor for `socket` and `accept`, a count of bytes for the four that
+// move them, how many addresses `resolve` wrote, and zero for the others. A negative answer is the
+// code of the failure negated -- the `IoError` code `sysl.fs` uses, which on a POSIX host is the
+// `errno` -- so a kernel's system call that already answers a negative error number is the hook as it
+// stands. **A target that cannot perform a call at all answers `UNSUPPORTED`** (`sysl.sys`, -38 on
+// every platform, not the host's `ENOSYS`); `-1` is `EPERM`.
+//
+// **A call stopped by a timeout answers the code of `ETIMEDOUT`** -- 60 on a BSD, 110 everywhere else,
+// the numbering a kernel without a C library writes too -- and that is what `sysl.net.timed_out`
+// recognises. A POSIX host's own `EAGAIN` is turned into it by the hosted answer.
+//
+// **An address crosses as an `Endpoint`**, a layout sysl owns rather than the platform's `sockaddr`,
+// so a supplier reads four or sixteen bytes and a port without knowing anybody's C. **A descriptor is
+// an `int`**, holding whatever the supplier handed out; it is not required to be a file's.
+
+/** An address and a port, as a hook reads and writes one.
+ *
+ * `family` is 4 or 6. An IPv4 address is the first four of `octets` and the rest are zero; an IPv6
+ * one is all sixteen, in network order -- as written, most significant first. `port` is the number
+ * itself, not byte-swapped, and `scope` is an IPv6 address's interface index (zero for none and for
+ * every IPv4 address). Laid out as C lays out the same four fields in this order: 24 bytes, no
+ * padding.
+ */
+struct Endpoint derives Eq, Hash
+    octets: [16]u8
+    scope: u32
+    port: u16
+    family: u16
+
+/** `socket`'s `kind` for a stream -- TCP. */
+const stream: int = 0
+
+/** `socket`'s `kind` for datagrams -- UDP. */
+const datagram: int = 1
+
+/** `option`'s `which` for how long a receive may wait, `value` milliseconds and zero for no limit. */
+const read_timeout: int = 0
+
+/** `option`'s `which` for how long a send may wait, `value` milliseconds and zero for no limit. */
+const write_timeout: int = 1
+
+/** `option`'s `which` for letting a listener take a port a recently stopped one held, `value` 1 or 0. */
+const reuse_address: int = 2
+
+/** A new socket of `family` (4 or 6) and `kind` (`stream` or `datagram`), answering its descriptor. */
+private[sysl] extern "sysl_net_socket" socket(family: int, kind: int) -> int
+
+/** Connects `fd` to `to`, answering zero. A datagram socket connected this way sends to `to` without
+ * naming it and receives only from it.
+ */
+private[sysl] extern "sysl_net_connect" connect(fd: int, to: *Endpoint) -> int
+
+/** Gives `fd` the local address `at`, answering zero. Port 0 asks the supplier to choose one. */
+private[sysl] extern "sysl_net_bind" bind(fd: int, at: *Endpoint) -> int
+
+/** Starts `fd` accepting connections, `backlog` of them allowed to queue, answering zero. */
+private[sysl] extern "sysl_net_listen" listen(fd: int, backlog: int) -> int
+
+/** Waits for a connection on `fd`, writing the peer's address into `peer` and answering the new
+ * connection's descriptor.
+ */
+private[sysl] extern "sysl_net_accept" accept(fd: int, peer: *Endpoint) -> int
+
+/** Writes the address `fd` is bound to into `at`, answering zero. */
+private[sysl] extern "sysl_net_local" local(fd: int, at: *Endpoint) -> int
+
+/** Sends at most `len` bytes from `from` on a connected `fd`, answering how many went. */
+private[sysl] extern "sysl_net_send" send(fd: int, from: *u8, len: usize) -> isize
+
+/** Receives at most `room` bytes into `into` from a connected `fd`, answering how many arrived --
+ * zero, on a stream, being the end of it.
+ */
+private[sysl] extern "sysl_net_recv" recv(fd: int, into: *u8, room: usize) -> isize
+
+/** Sends one datagram of `len` bytes from `from` to `to`, answering how many went. */
+private[sysl] extern "sysl_net_send_to" send_to(fd: int, from: *u8, len: usize, to: *Endpoint) -> isize
+
+/** Receives one datagram into `into`, writing its sender into `from` and answering how many of its
+ * bytes were kept; a datagram longer than `room` loses the rest.
+ */
+private[sysl] extern "sysl_net_recv_from" recv_from(fd: int, into: *u8, room: usize,
+                                                    from: *Endpoint) -> isize
+
+/** Stops reading (`how` 0), writing (1) or both (2) on `fd`, answering zero. */
+private[sysl] extern "sysl_net_shutdown" shutdown(fd: int, how: int) -> int
+
+/** Gives `fd` back, answering zero. */
+private[sysl] extern "sysl_net_close" close(fd: int) -> int
+
+/** Sets the option `which` (one of the constants above) on `fd` to `value`, answering zero. */
+private[sysl] extern "sysl_net_option" option(fd: int, which: int, value: i64) -> int
+
+/** Every address `host` (`host_len` bytes, not terminated) and `port` resolve to, best first, written
+ * into the `room` endpoints starting at `out`, answering how many were written. With `passive` 1 and
+ * `host` empty it answers the wildcard a listener binds to. A name that resolves to nothing answers
+ * the code of `ENOENT`, 2.
+ */
+private[sysl] extern "sysl_net_resolve" resolve(host: *u8, host_len: usize, port: int, passive: int,
+                                                out: *Endpoint, room: usize) -> int
