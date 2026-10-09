@@ -597,6 +597,7 @@ end without_trailing_newlines
 ours_without_the_bounds_report(ours: string, theirs: string) -> string
     val lines = lines_of(ours)
     val theirs_writes = declares_write(theirs)
+    val theirs_traps = declares_trap(theirs)
 
     var out = str_builder()
     var kept: Buf[string] = buf()
@@ -628,9 +629,21 @@ ours_without_the_bounds_report(ours: string, theirs: string) -> string
                 line.starts_with("define private ptr @sysl.bounds.num(")
             drop = true
             inside = true
+        // RULE 5: the check that a simple enum's value is one of its variants, which the reference
+        // does not make (`bounds_fail.sysl`'s `check_variant`) -- the one call at the site, a `void`
+        // call that takes no register, and the helper it calls, from the `define` line on.
+        else if line.starts_with("  call void @sysl.enum.check.")
+            drop = true
+        else if line.starts_with("define private void @sysl.enum.check.")
+            drop = true
+            inside = true
         // RULE 4: the `write` the default writes through, where the reference declares none -- the
         // default is then its only user.
         else if !theirs_writes && is_write_declaration(line)
+            drop = true
+        // RULE 5, continued: the trap the variant check's helper ends in, where nothing else of the
+        // reference's text traps.
+        else if !theirs_traps && is_trap_declaration(line)
             drop = true
         // The blank line the removed run leaves doubled: each runtime block ends in one, and a
         // section made of nothing but location constants has its own.
@@ -726,6 +739,18 @@ private declares_write(text: string) -> bool
 
     false
 end declares_write
+
+private is_trap_declaration(line: string) -> bool =
+    line.starts_with("declare ") && line.index_of(" @llvm.trap(").is_some()
+
+private declares_trap(text: string) -> bool
+    val lines = lines_of(text)
+
+    for i in 0..<lines.len()
+        if is_trap_declaration(lines.at(i)) then return true
+
+    false
+end declares_trap
 
 // Two texts that are one text but for the order of their `declare` lines, which are compared as a
 // set: every other line in place, and the same declarations, each as often.

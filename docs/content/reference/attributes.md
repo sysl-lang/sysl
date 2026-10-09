@@ -170,11 +170,16 @@ Blue 9
 | written | is | traps |
 |---|---|---|
 | `T::First` / `T::Last` | the first and last variant | no |
-| `T::Pos(v)` | a value's **0-based position** in the declaration | no |
+| `T::Pos(v)` | a value's **0-based position** in the declaration | only on a value no variant has |
 | `T::Val(i)` | the value at position `i` | on a position past the last, or below zero |
-| `T::Succ(v)` / `T::Pred(v)` | the neighbouring value | at the last / at the first |
-| `T::Image(v)` | the variant's **name**, as a `string` | no |
+| `T::Succ(v)` / `T::Pred(v)` | the neighbouring value | at the last / at the first, and on a value no variant has |
+| `T::Image(v)` | the variant's **name**, as a `string` | only on a value no variant has |
 | `T::Value(s)` | the value a name stands for | on a name no variant has |
+
+A value no variant has cannot be built — `E(n)` checks, and so does reading a
+[bitfield's enum field](#bitfields-an-in-field-in-exactly-n-bits) — so it arrives only through storage a
+`ptr_cast` or C filled. `Pos`, `Succ`, `Pred` and `Image` stop on one rather than answer for a
+variant it is not.
 
 **Position is not the discriminant, and that distinction is why `Pos` and `Val` exist.**
 Discriminants may be explicit, non-contiguous and not zero-based — `Green` above is position 1 and
@@ -1665,6 +1670,19 @@ access is written out.
 A field that is a set of named values is a **simple enum**, which is one integer and may be `volatile`
 like any other. A **data enum** may not — a tag beside a payload is more than the one access the
 qualifier promises.
+
+**Reading an enum field is the checked conversion `E(n)`**, made where the field is read. The bits
+were put there by hardware or by a cast, and a width with values no variant covers — six bits of an
+exception class with two dozen defined — can hold one of them. A value no variant has stops the
+program at the read, reporting it the way a failed [bounds check](/reference/errors/#what-traps) does,
+rather than reaching `Image` as a wrong name or a `match` as no arm at all:
+
+```text
+value 42 is not one of the enum's variants (main.sysl:12:11)
+```
+
+An enum whose variants cover every value of its width — two variants in `u1`, four in `u2` — has
+nothing to check, and its read is the shift and nothing more.
 
 **A bitfield has no byte offset**, so `offsetof` says so rather than rounding down to the byte the
 field begins in:
