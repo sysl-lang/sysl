@@ -1004,7 +1004,7 @@ f.close()
 ```
 
 ```error
-type 'Result' has no method 'close'
+type 'sysl.Result' has no method 'close'
 ```
 
 `?` inside a function that returns a `Result`, or `unwrap()` in a program that would rather stop, are
