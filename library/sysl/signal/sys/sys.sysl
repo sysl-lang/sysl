@@ -1,0 +1,89 @@
+module sysl.signal.sys
+
+// The calls `sysl.signal` makes of whatever delivers signals underneath it: put a signal in the
+// hands of a flag, say how many times it has arrived since, ignore one or give one back its default,
+// and send one.
+//
+// **Each is an `extern` naming a symbol no module here defines**, so what answers it is decided by
+// what the program is linked with (`reference/ffi.md § A module may supply another module's extern`),
+// exactly as for `sysl.process.sys`:
+//
+// | linked with | what defines the symbols |
+// |---|---|
+// | a program for a hosted POSIX target | `sysl.signal.hosted`, over `sigaction`, `kill` and `raise` |
+// | a program for a target with no C library | the program, with an `@export` per hook it reaches |
+//
+// A freestanding program that reaches one of these and leaves it unanswered is refused when it is
+// compiled, naming the hooks it reached, rather than at the link.
+//
+// ## No sysl runs inside a handler
+//
+// **What a supplier installs for `watch` is its own handler, and all it does is count.** A handler
+// runs between two instructions of whatever the program was doing, so it may not allocate, release a
+// counted reference that might reach zero, or take a lock the interrupted code holds -- which rules
+// out nearly every sysl body. So no sysl body is ever installed: the supplier's handler adds one to a
+// per-signal count with a lock-free atomic, and `arrivals` reads that count back. On a hosted target
+// the handler is four lines of C beside `sysl.signal.hosted`; on a kernel it is whatever its runtime
+// already runs when a signal is delivered.
+//
+// ## The shape of a hook
+//
+// **A hook answers one integer: what it did, or what went wrong** -- the contract of every `*.sys`
+// module. Zero or more is success: a count for `arrivals`, zero for the others. A negative answer is
+// the code of the failure negated -- the `IoError` code `sysl.fs` uses, which on a POSIX host is the
+// `errno` -- so a kernel's system call that already answers a negative error number is the hook as it
+// stands. **A target that cannot perform a call at all answers `UNSUPPORTED`** (`sysl.sys`, -38 on
+// every platform).
+//
+// **A signal is a number at the target's own numbering**, the one `sysl.signal`'s constants are
+// written in, and every hook is handed one `sysl.signal` has already checked: never zero (except to
+// `send`, where zero asks only whether `pid` could be signalled), never past the target's highest,
+// and never `KILL` or `STOP` to anything but `send`.
+
+/** What `disposition` sets a signal to: the action the system takes for it when nobody has said
+ * otherwise -- for most signals, ending the program.
+ */
+const set_default: int = 0
+
+/** What `disposition` sets a signal to: nothing at all. The signal is discarded where it arrives. */
+const set_ignored: int = 1
+
+/** What `disposition` sets a signal to: whatever it was before `watch` was first asked for it, which
+ * the supplier kept. A signal `watch` never touched is left as it is, and that is success.
+ */
+const set_restored: int = 2
+
+/** Puts `sig` in the supplier's own handler, which counts each arrival, answering zero or the
+ * failure's code negated. **The disposition it replaces is kept**, the first time only -- asked again
+ * for a signal it already handles, it changes nothing -- for `disposition(sig, set_restored)` to put
+ * back. A blocking call the signal arrives during is resumed rather than failed (`SA_RESTART`).
+ */
+@needs(os)
+private[sysl] extern "sysl_sig_watch" watch(sig: int) -> int
+
+/** How many times `sig` has arrived since the program started, counted by the handler `watch`
+ * installed -- or the failure's code negated. Only differences between two answers mean anything:
+ * the count is not reset when a signal stops being watched.
+ */
+@needs(os)
+private[sysl] extern "sysl_sig_arrivals" arrivals(sig: int) -> i64
+
+/** Sets what happens to `sig`, `how` being one of the `set_` constants, answering zero or the
+ * failure's code negated.
+ */
+@needs(os)
+private[sysl] extern "sysl_sig_disposition" disposition(sig: int, how: int) -> int
+
+/** Sends `sig` to the process or processes `pid` names, as POSIX's `kill(2)` reads it -- a process
+ * id above zero, this program's group at zero, the group `-pid` below -1 -- answering zero or the
+ * failure's code negated. A `sig` of zero sends nothing and answers whether it could have.
+ */
+@needs(os)
+private[sysl] extern "sysl_sig_send" send(pid: i64, sig: int) -> int
+
+/** Sends `sig` to the calling thread of this program, answering zero or the failure's code negated.
+ * **A signal that is not blocked has been handled before this returns** -- C's `raise` -- which is what
+ * lets a program test its own watch without a second process.
+ */
+@needs(os)
+private[sysl] extern "sysl_sig_raise" raise(sig: int) -> int

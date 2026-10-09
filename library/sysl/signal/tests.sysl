@@ -1,0 +1,197 @@
+module sysl.signal
+@requires(posix)
+@tests
+
+import sysl.fs.{IoError, make_temp_dir, read_text, remove_dir_all}
+import sysl.posix.time.sleep
+import sysl.process.{Status, capture, run, start}
+import sysl.text.{Search, parse_int}
+import sysl.time.millis
+
+// What `sysl.signal` does over `sysl.signal.sys`'s hooks on a hosted target, where
+// `sysl.signal.hosted` answers them. Every test runs in a process of its own, so a disposition one
+// sets is gone before the next begins.
+
+// This test process's own id, asked of a child: its parent is the process that started it.
+private own_pid() -> i64
+    val said = capture("sh", ["-c", "echo $PPID"]).unwrap().text
+
+    i64(parse_int(said.trim()).unwrap())
+
+// Whether `w` sees its signal within a second, for a signal another process sent.
+private arrives(w: &Watch) -> bool
+    for _ in 0..<100
+        if w.take() then return true
+
+        sleep(millis(10))
+
+    false
+end arrives
+
+// ## The numbers are the platform's
+
+@test("each named signal is the number this platform's own shell gives that name")
+sg_numbers_are_the_platforms()
+    val named = [("HUP", HUP), ("INT", INT), ("QUIT", QUIT), ("KILL", KILL), ("PIPE", PIPE),
+                 ("ALRM", ALRM), ("TERM", TERM), ("TTIN", TTIN), ("TTOU", TTOU), ("WINCH", WINCH),
+                 ("USR1", USR1), ("USR2", USR2), ("CHLD", CHLD), ("CONT", CONT), ("STOP", STOP),
+                 ("TSTP", TSTP)]
+
+    for (name, n) in named
+        val said = capture("sh", ["-c", s"kill -l $n"]).unwrap().text.trim()
+
+        assert_eq(said, name)
+end sg_numbers_are_the_platforms
+
+// ## A watch
+
+@test("a raised signal that is watched is taken once, then not again")
+sg_raised_signal_is_taken_once()
+    val w = watch(USR1).unwrap()
+
+    assert(!w.take(), "taken before it was sent")
+
+    raise(USR1).unwrap()
+
+    assert(w.take(), "the raised signal was not seen")
+    assert(!w.take(), "one arrival was taken twice")
+    assert_eq(w.signal(), USR1)
+end sg_raised_signal_is_taken_once
+
+@test("a signal sent to this program's own pid is seen by its watch")
+sg_sent_to_own_pid_is_seen()
+    val w = watch(USR1).unwrap()
+
+    send(own_pid(), USR1).unwrap()
+
+    assert(arrives(w), "the signal sent to this process never arrived")
+    assert(!w.take(), "one arrival was taken twice")
+
+@test("arrivals between two takes are one take")
+sg_arrivals_between_takes_are_one()
+    val w = watch(USR2).unwrap()
+
+    raise(USR2).unwrap()
+    raise(USR2).unwrap()
+    raise(USR2).unwrap()
+
+    assert(w.take(), "three arrivals were not seen")
+    assert(!w.take(), "three arrivals were more than one take")
+
+@test("two watches of one signal each see it")
+sg_two_watches_both_see_it()
+    val a = watch(USR1).unwrap()
+    val b = watch(USR1).unwrap()
+
+    raise(USR1).unwrap()
+
+    assert(a.take(), "the first watch did not see it")
+    assert(b.take(), "the second watch did not see it")
+    assert(!a.take() && !b.take(), "an arrival was seen twice")
+end sg_two_watches_both_see_it
+
+@test("a watch begins with nothing to take, whatever arrived under an earlier one")
+sg_new_watch_starts_clean()
+    val first = watch(USR1).unwrap()
+
+    raise(USR1).unwrap()
+
+    val second = watch(USR1).unwrap()
+
+    assert(!second.take(), "an arrival from before the watch was taken")
+    assert(first.take(), "the earlier watch lost its arrival")
+
+// ## Ignoring, and what a dropped watch gives back
+
+@test("an ignored signal sent to this program leaves it running")
+sg_ignored_signal_is_survived()
+    ignore(USR2).unwrap()
+    send(own_pid(), USR2).unwrap()
+    raise(USR2).unwrap()
+
+    // Still here, which is the claim: a USR2 left at its default ends a program.
+    sleep(millis(20))
+
+@test("dropping the last watch puts back the disposition the first one replaced")
+sg_drop_restores_what_was_there()
+    ignore(USR2).unwrap()
+
+    var w: Option[&Watch] = Some(watch(USR2).unwrap())
+
+    raise(USR2).unwrap()
+    assert(w.unwrap().take(), "the watch did not see it")
+
+    w = None
+
+    // The ignore is back: a default USR2 would end this program here.
+    raise(USR2).unwrap()
+    sleep(millis(20))
+    assert(ignore(USR2).is_ok(), "the signal is still held after its last watch went")
+end sg_drop_restores_what_was_there
+
+@test("a signal a watch is alive for cannot be ignored or reset under it")
+sg_watched_signal_is_busy()
+    val w = watch(INT).unwrap()
+
+    assert_eq(ignore(INT).unwrap_err(), IoError.Other(16))
+    assert_eq(restore_default(INT).unwrap_err(), IoError.Other(16))
+    assert_eq(w.signal(), INT)
+
+@test("an ignore is inherited by a child and a restored default is not")
+sg_ignore_and_default_reach_a_child()
+    ignore(USR2).unwrap()
+    assert_eq(capture("sh", ["-c", "kill -USR2 $$; echo alive"]).unwrap().text, "alive\n")
+
+    restore_default(USR2).unwrap()
+    assert_eq(run("sh", ["-c", "kill -USR2 $$; echo alive"]).unwrap(), Status.Signalled(USR2))
+end sg_ignore_and_default_reach_a_child
+
+// ## Another process
+
+@test("a signal sent to a started child by its pid ends it, and the status names the signal")
+sg_send_to_a_child()
+    val dir = make_temp_dir("sysl-signal").unwrap()
+    val file = s"$dir/pid"
+    val c = start("sh", ["-c", "echo $$ > " + file + "; exec sleep 5"]).unwrap()
+
+    var pid: i64 = 0
+
+    for _ in 0..<200
+        if pid == 0
+            read_text(file) match
+                Ok(t) -> pid = i64(parse_int(t.trim()).unwrap_or(0))
+                Err(_) -> ()
+
+        if pid == 0 then sleep(millis(10))
+
+    assert(pid > 0, "the child never wrote its pid")
+
+    send(pid, TERM).unwrap()
+    assert_eq(c.wait().unwrap().status, Status.Signalled(TERM))
+
+    remove_dir_all(dir)
+end sg_send_to_a_child
+
+// ## Refusals
+
+@test("a number that is no signal here, KILL and STOP are refused before anything is touched")
+sg_bad_numbers_are_refused()
+    for sig in [0, -1, KILL, STOP, 65, 1000]
+        assert_eq(watch(sig).unwrap_err(), IoError.Other(22))
+        assert_eq(ignore(sig).unwrap_err(), IoError.Other(22))
+        assert_eq(restore_default(sig).unwrap_err(), IoError.Other(22))
+
+    assert_eq(send(1, -1).unwrap_err(), IoError.Other(22))
+    assert_eq(send(1, 65).unwrap_err(), IoError.Other(22))
+    assert_eq(raise(0).unwrap_err(), IoError.Other(22))
+    assert_eq(raise(65).unwrap_err(), IoError.Other(22))
+end sg_bad_numbers_are_refused
+
+@test("a pid that names no process is ESRCH")
+sg_send_to_no_process()
+    assert_eq(send(2147483000, TERM).unwrap_err(), IoError.Other(3))
+    assert_eq(send(2147483000, 0).unwrap_err(), IoError.Other(3))
+
+@test("signal zero to this program sends nothing and answers that it could have")
+sg_signal_zero_probes()
+    assert(send(own_pid(), 0).is_ok(), "this program could not be probed")

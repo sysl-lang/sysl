@@ -1,0 +1,297 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, read_text}
+import sysl.posix.time.sleep
+import sysl.process.{Status, capture, start}
+import sysl.text.{Search, replace_all}
+import sysl.time.millis
+import sysl.testing.skip
+
+// **Watching, ignoring and sending signals over `sysl.signal.sys`, and a program answering it on a
+// target with no C library.**
+//
+// `sysl.signal` counts a watched signal through `sysl_sig_watch` and `sysl_sig_arrivals`, sets a
+// disposition through `sysl_sig_disposition`, and sends through `sysl_sig_send` and
+// `sysl_sig_raise`. On a hosted POSIX target the library's `sysl.signal.hosted` answers them over
+// `sigaction`, `kill` and `raise`, under `weak` exports; on a freestanding one the program answers
+// each hook it reaches with an `@export`, and one it leaves unanswered is refused when it is compiled
+// (`emit_checks.sysl`'s `check_library_hooks`, the `sysl.signal.sys` row). What the hosted answers do
+// at run time in one process is `library/sysl/signal/tests.sysl`'s; a signal crossing from one
+// process to another program's watch is here, the program being one this suite builds.
+
+private val sgh_target: string = "aarch64-freestanding"
+private val sgh_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private val sgh_script: string =
+    "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+private val sgh_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n" +
+    s"targets {\n  $sgh_target {\n    linker_script = \"link.ld\"\n    entry = \"kstart\"\n  }\n}\n"
+
+// A shell's four moves with signals -- interrupt watched, the terminal's stop signals ignored, a
+// child's default given back, a job sent a signal and itself one -- which between them reach every
+// hook of `sysl.signal.sys`.
+private val sgh_program: string = raw"""
+    import sysl.signal.{INT, TERM, TTOU, raise, restore_default, send, watch, ignore}
+
+    go() -> int
+        var n = 0
+
+        watch(INT) match
+            Ok(w) ->
+                raise(INT)
+
+                if w.take() then n += 1
+            Err(_) -> ()
+
+        if ignore(TTOU).is_ok() && restore_default(TTOU).is_ok() then n += 2
+        if send(7, TERM).is_ok() then n += 4
+
+        n
+    end go
+    """
+
+// What every bare image here defines for itself: its start, its heap, the memory functions LLVM calls
+// on a target with no C library, `putchar` and `exit`.
+private val sgh_runtime: string = raw"""
+    @export("kstart")
+    kstart() -> never
+        val n = go()
+
+        loop
+            ()
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = ptr_cast(usize(0x4100_0000))
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+
+    @export("memset")
+    mem_set(dst: *u8, c: int, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = u8(c)
+
+        dst
+
+    @export("memcpy")
+    mem_copy(dst: *u8, src: *u8, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = src[i]
+
+        dst
+
+    @export("memmove")
+    mem_move(dst: *u8, src: *u8, n: usize) -> *u8 = mem_copy(dst, src, n)
+
+    @export("memcmp")
+    mem_compare(a: *u8, b: *u8, n: usize) -> int = 0
+
+    @export("putchar")
+    k_putchar(c: int) -> int = c
+
+    @export("exit")
+    k_exit(code: int) -> never
+        loop
+            ()
+    """
+
+// The five hooks, answered as a kernel's signal calls and its runtime's counting handler would be.
+private val sgh_hooks: string = raw"""
+    @export("sysl_sig_watch")
+    k_watch(sig: int) -> int = 0
+
+    @export("sysl_sig_arrivals")
+    k_arrivals(sig: int) -> i64 = 0
+
+    @export("sysl_sig_disposition")
+    k_disposition(sig: int, how: int) -> int = 0
+
+    @export("sysl_sig_send")
+    k_send(pid: i64, sig: int) -> int = 0
+
+    @export("sysl_sig_raise")
+    k_raise(sig: int) -> int = 0
+    """
+
+private sgh_tree(program: string) -> string
+    var files = lbr_two("main.sysl", program, "package.hocon", sgh_manifest)
+
+    files.push(("link.ld", sgh_script))
+    lbr_tree(files)
+end sgh_tree
+
+private sgh_build(p: string) -> ((int, string), string)
+    val out = lbr_temp("sysl-sgh-elf")
+
+    (lbr_cli(["sysl", "build", "--target", sgh_target, "-o", s"$out/img.elf", p]), out)
+end sgh_build
+
+private sgh_symbols(elf: string, undefined: bool) -> string
+    val ran = if undefined then capture(sgh_nm, ["-u", elf], "", [], true)
+    else capture(sgh_nm, [elf], "", [], true)
+
+    ran match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+end sgh_symbols
+
+private sgh_link_ready() -> bool
+    if !lbr_ready() then return false
+
+    val lld = capture("ld.lld", ["--version"], "", [], true) match
+        Ok(o) -> o.status.ok()
+        Err(_) -> false
+
+    if !lld then skip("ld.lld is not installed, so no image can be linked")
+    if !is_file(sgh_nm) then skip(s"there is no llvm-nm at $sgh_nm to read the image")
+
+    true
+end sgh_link_ready
+
+// -- a bare image answering the hooks it reaches -----------------------------------------------------
+
+@test("a freestanding program that watches, ignores and sends links with only its own signal hooks")
+sgh_answered_hooks_link()
+    if !sgh_link_ready() then return
+
+    val p = sgh_tree(sgh_program + sgh_runtime + sgh_hooks)
+    val (said, out) = sgh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = sgh_symbols(elf, false)
+
+    assert_eq(sgh_symbols(elf, true).trim(), "")
+
+    // The program's own answers are the ones in the image, defined strong.
+    for hook in ["sysl_sig_watch", "sysl_sig_arrivals", "sysl_sig_disposition", "sysl_sig_send",
+                 "sysl_sig_raise"]
+        assert(all.contains(s" T $hook"), all)
+
+    // And nothing of the hosted answer came with them.
+    for name in ["sigaction", "kill", "raise", "sysl_sig_posix_watch", "sysl_sig_posix_send"]
+        assert(!all.contains(s" $name\n"), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end sgh_answered_hooks_link
+
+// -- the hooks left unanswered -------------------------------------------------------------------------
+
+@test("a freestanding program that watches with no signal hooks is refused, naming the five it reaches")
+sgh_unanswered_hooks_are_refused()
+    if !lbr_ready() then return
+
+    val p = sgh_tree(sgh_program + sgh_runtime)
+    val (said, out) = sgh_build(p)
+
+    assert(said.0 != 0, "built with every signal hook unanswered")
+    assert(said.1.contains(s"error: this program reaches 'sysl.signal', and '$sgh_target' " +
+        "has no operating system under it for the standard library to answer a signal with, so the " +
+        "program answers it: define 'sysl_sig_arrivals', 'sysl_sig_disposition', 'sysl_sig_raise', " +
+        "'sysl_sig_send', 'sysl_sig_watch' with '@export', each taking what its 'extern' in " +
+        "'sysl.signal.sys' declares and answering a count or zero, or the code of an 'IoError' " +
+        "negated"), said.1)
+
+    // Told before the link, so no linker names a symbol.
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end sgh_unanswered_hooks_are_refused
+
+// -- a hosted target -------------------------------------------------------------------------------------
+
+@test("on a hosted target the library answers the signal hooks under weak exports")
+sgh_hosted_library_answers_weakly()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.signal.{USR1, USR2, ignore, raise, restore_default, send, watch}
+
+        val w = watch(USR1).unwrap()
+
+        raise(USR1)
+        print(w.take())
+        print(ignore(USR2).is_ok() && restore_default(USR2).is_ok() && send(1, 0).is_ok())
+        """)
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
+
+    lbr_drop([p])
+    assert(said.0 == 0, said.1)
+
+    for hook in ["sysl_sig_watch", "sysl_sig_arrivals", "sysl_sig_disposition", "sysl_sig_send",
+                 "sysl_sig_raise"]
+        var defined = ""
+
+        for line in lines_of(said.1)
+            if line.starts_with("define ") && line.contains(s" @$hook(") then defined = line
+
+        assert(defined.starts_with("define weak "), s"$hook: $defined")
+    end for
+
+    assert(said.1.contains("@sysl_sig_posix_watch("), "the hosted answer does not call the shim")
+end sgh_hosted_library_answers_weakly
+
+// -- a signal from another process -------------------------------------------------------------------
+
+// A program that watches `USR1`, says it is ready in a file, and exits 0 once its watch has seen the
+// signal -- or 3 after five seconds without it. Unwatched, `USR1` would end it instead.
+private sgh_watcher(dir: string) -> string = replace_all(raw"""
+    import sysl.fs.write_text
+    import sysl.posix.time.sleep
+    import sysl.signal.{USR1, watch}
+    import sysl.time.millis
+
+    val w = watch(USR1).unwrap()
+
+    write_text("DIR/ready", "ready").unwrap()
+
+    var code = 3
+
+    for _ in 0..<500
+        if w.take()
+            code = 0
+            break
+        end if
+
+        sleep(millis(10))
+
+    exit(code)
+    """, "DIR", dir)
+
+@test("a signal another process sends is seen by a built program's watch, which then exits cleanly")
+sgh_watched_signal_from_another_process()
+    if !lbr_ready() then return
+
+    val dir = lbr_temp("sysl-sgh-run")
+    val p = lbr_program(sgh_watcher(dir))
+    val said = lbr_cli(["sysl", "build", "-o", s"$dir/watcher", p])
+
+    assert(said.0 == 0, said.1)
+
+    // The shell runs the program in the background and writes its pid; `wait` hands back its status.
+    val c = start("sh", ["-c", s"$dir/watcher & echo $$! > $dir/pid; wait $$!"]).unwrap()
+
+    for _ in 0..<500
+        if is_file(s"$dir/ready") && is_file(s"$dir/pid") then break
+
+        sleep(millis(10))
+
+    assert(is_file(s"$dir/ready"), "the watcher never said it was ready")
+
+    val pid = read_text(s"$dir/pid").unwrap().trim()
+
+    assert(capture("kill", ["-USR1", pid]).unwrap().status.ok(), "the signal could not be sent")
+    assert_eq(c.wait().unwrap().status, Status.Exited(0))
+
+    lbr_drop([p, dir])
+end sgh_watched_signal_from_another_process
