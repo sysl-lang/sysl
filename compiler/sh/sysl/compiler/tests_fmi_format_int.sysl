@@ -1,0 +1,147 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// **An integer under a specifier is rendered by `sysl.fmt.format_int`, not by C's `snprintf`, and it
+// renders what C's does** (`expr_call.sysl`'s `int_format_call`). C is the oracle: one hosted program
+// renders every case both ways — the `f"…"` hole, and `snprintf` over the same value with the same
+// specifier and an `ll` — and prints each pair that differs. The cases are each width's extremes
+// under every flag, a width, a precision, a run-time count, and each unsigned conversion over a
+// negative value, which reads it at the type's own width.
+//
+// `%b` has no C counterpart to compare with, so its cases are the library's own
+// (`library/sysl/fmt/tests.sysl`); a signed conversion of a `u64` past `i64`'s range is left out,
+// `%lld` reading those bits as negative where the hole keeps the value.
+
+private val fmi_prelude: string = raw"""
+    import sysl.text.from_utf8_unchecked
+
+    extern "snprintf" c_snprintf(out: *u8, room: usize, fmt: *u8, ...) -> int
+
+    c_i(fmt: *u8, v: i64) -> string
+        var out: [512]u8 = [0; 512]
+        val n = c_snprintf(&out[0], 512, fmt, v)
+
+        from_utf8_unchecked(out[0..<usize(n)])
+
+    c_u(fmt: *u8, v: u64) -> string
+        var out: [512]u8 = [0; 512]
+        val n = c_snprintf(&out[0], 512, fmt, v)
+
+        from_utf8_unchecked(out[0..<usize(n)])
+
+    c_n(fmt: *u8, count: int, v: i64) -> string
+        var out: [512]u8 = [0; 512]
+        val n = c_snprintf(&out[0], 512, fmt, count, v)
+
+        from_utf8_unchecked(out[0..<usize(n)])
+
+    same(ours: string, theirs: string) -> int
+        if ours == theirs then return 0
+
+        print(s"[$ours] [$theirs]")
+        1
+
+    var bad = 0
+    val w0 = -7
+    val w1 = 7
+    val p0 = -1
+    val p1 = 3
+    val q: i32 = -42
+
+    bad += same(f"${q}%${w0}d", c_n(c"%*lld", w0, i64(q)))
+    bad += same(f"${q}%${w1}d", c_n(c"%*lld", w1, i64(q)))
+    bad += same(f"${q}%0${w1}d", c_n(c"%0*lld", w1, i64(q)))
+    bad += same(f"${q}%.${p0}x", c_n(c"%.*llx", p0, i64(q) & 4294967295))
+    bad += same(f"${q}%.${p1}d", c_n(c"%.*lld", p1, i64(q)))
+    bad += same(f"${q}%08.${p0}d", c_n(c"%08.*lld", p0, i64(q)))
+    """
+
+// Each width, whether it is signed, and the values rendered at it.
+private fmi_types() -> Buf[(string, int, bool, Buf[string])]
+    var out: Buf[(string, int, bool, Buf[string])] = buf()
+
+    out.push(("i8", 8, true, fmi_list(["-128", "127", "-1", "0", "5"])))
+    out.push(("i16", 16, true, fmi_list(["-32768", "32767", "-300"])))
+    out.push(("i32", 32, true, fmi_list(["-2147483648", "2147483647", "-6", "0"])))
+    out.push(("i64", 64, true, fmi_list(["-9223372036854775807 - 1", "9223372036854775807", "-1"])))
+    out.push(("u8", 8, false, fmi_list(["255", "0", "8"])))
+    out.push(("u16", 16, false, fmi_list(["65535"])))
+    out.push(("u32", 32, false, fmi_list(["4294967295", "16"])))
+    out.push(("u64", 64, false, fmi_list(["18446744073709551615", "0", "9223372036854775808"])))
+    out
+end fmi_types
+
+private fmi_list(xs: []string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for x in xs do out.push(x)
+
+    out
+end fmi_list
+
+private val fmi_specs: [26]string = ["d", "i", "u", "x", "X", "o", "5d", "-5d", "05d", "+d", " d",
+                                     ".3d", ".0d", "#x", "#X", "#o", "08.3d", "-+8d", "#010x", "+05d",
+                                     "-#8o", "022d", ".20x", "- 6d", "#.0o", "+.0i"]
+
+// What C is handed for one case: the value, at the width the conversion reads it at.
+private fmi_c_call(spec: string, ty: string, bits: int, signed: bool, name: string) -> string
+    val letter = spec[(spec.bytes.len - 1)..]
+    val c_spec = s"%${spec[0..<(spec.bytes.len - 1)]}ll$letter"
+    val signed_conv = letter == "d" || letter == "i"
+
+    if ty == "u64" then return s"c_u(c\"$c_spec\", $name)"
+    if signed && !signed_conv && bits < 64
+        val mask = if bits == 8 then "255" else if bits == 16 then "65535" else "4294967295"
+
+        return s"c_i(c\"$c_spec\", i64($name) & $mask)"
+    end if
+
+    s"c_i(c\"$c_spec\", i64($name))"
+end fmi_c_call
+
+private fmi_program() -> string
+    var text = fmi_prelude
+    var k = 0
+
+    for t in fmi_types().view()
+        for v in t.3.view()
+            val name = s"v$k"
+
+            k += 1
+            text = text + s"val $name: ${t.0} = $v\n"
+
+            for spec in fmi_specs
+                val letter = spec[(spec.bytes.len - 1)..]
+
+                // `%lld` reads a `u64` past `i64`'s range as negative; the hole keeps the value.
+                if t.0 == "u64" && (letter == "d" || letter == "i") then continue
+
+                text = text + "bad += same(f\"" + "$" + "{" + name + "}%" + spec + "\", " +
+                       fmi_c_call(spec, t.0, t.1, t.2, name) + ")\n"
+            end for
+        end for
+    end for
+
+    text + "print(s\"mismatches $bad\")\n"
+end fmi_program
+
+@test("every integer specifier renders what C's snprintf renders, at every width's extremes")
+fmi_parity_with_snprintf()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("main.sysl", fmi_program())]), "mismatches 0\n")
+
+@test("a binary conversion renders the bits, padded and prefixed as the other conversions are")
+fmi_binary_conversion()
+    if xvr_no_library() then return
+
+    val program = raw"""
+        val n: i8 = -6
+
+        print(f"[${5}%b] [${0}%b] [${n}%b] [${255}%#b] [${5}%08b] [${5}%#010b] [${0}%#b] [${5}%-6b]")
+        """
+
+    assert_eq(xvr_ran([("main.sysl", program)]),
+              "[101] [0] [11111010] [0b11111111] [00000101] [0b00000101] [0] [101   ]\n")
