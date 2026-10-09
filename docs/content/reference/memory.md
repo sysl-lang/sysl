@@ -284,6 +284,30 @@ nothing schedules — the overwhelming case, and why the symbol is weak. Define 
 counts are already under there: with no `ldrex`/`strex` beneath it an atomic increment becomes a call
 to an `__atomic_*` the board defines, and on a two-core part that needs a hardware spinlock.
 
+**A scheduler written in sysl defines the hook with [`@export`](/reference/ffi/)**, as
+`__sysl_arc_reaper() -> *T` where `T` is a struct of the same two fields. The program's definition is
+then the only one: the compiler leaves its weak default out, and every drain calls the program's.
+
+```sysl build=c target=aarch64-freestanding
+struct Reaper
+    head: *u8
+    draining: u8
+
+// Whatever the scheduler keeps per task.
+extern "current_task_reaper" current_task_reaper() -> *Reaper
+
+@export("__sysl_arc_reaper")
+arc_reaper() -> *Reaper = current_task_reaper()
+
+struct Job
+    n: int
+
+@export("run_job")
+run_job(n: int) -> int
+    val job: &sync Job = Job(n)
+    job.n
+```
+
 The header is the same three words for every object whether or not anything weakly references it,
 which is what keeps the type-erased release path expressible at all. The cost is eight bytes on an
 allocation that already cost a `malloc`, and it lands only where the feature is used: values, fixed

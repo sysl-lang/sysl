@@ -38,6 +38,11 @@ module sh.sysl.compiler
 // one plain slot. A program with no scheduler defines nothing and gets exactly the single-list
 // behaviour it has always had; a port that *does* schedule defines the symbol over this one and
 // answers with storage belonging to the running task.
+//
+// **A port written in sysl defines it with `@export`, and then the default is not emitted at all.**
+// Weak yields to strong only between two objects, at the link; two `define`s of one name in one
+// module are refused by the IR reader before any linker sees them, and the program's own definition
+// lands in the very module this default does.
 
 // The one symbol a freestanding **port** may define to say what the running task's reaper scratch
 // is. It is a C name rather than a sysl one because whoever knows the answer is a scheduler written
@@ -51,12 +56,15 @@ reaper_slot_symbol() -> string = "__sysl_arc_reaper"
 // point is having very little memory. What *is* forced is that this agrees with the stores the
 // emitter makes into these fields: a count written as one width and read as another is not a type
 // error anywhere, it is a leak or a double free.
-arc_core(t: Target) -> string
+//
+// `reaper_exported` says the module defines `__sysl_arc_reaper` itself, so the slot is still asked
+// for but the weak default answering it is left out.
+arc_core(t: Target, reaper_exported: bool) -> string
     val tls = if t.thread_local_storage() then "thread_local " else ""
     val supplied = !t.thread_local_storage()
     val word = word_llvm(t)
 
-    val supplier = if !supplied then "" else
+    val supplier = if !supplied || reaper_exported then "" else
         s"\ndefine weak ptr @${reaper_slot_symbol()}() {\nentry:\n  ret ptr @arc.reaper.self\n}"
 
     val fetch_slot = if !supplied then "" else s"  %s = call ptr @${reaper_slot_symbol()}()\n"

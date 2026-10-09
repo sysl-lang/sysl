@@ -1,0 +1,247 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{replace_all, split, Search}
+
+// The reaper's slot hook, `__sysl_arc_reaper`, written by the program itself
+// (`reference/memory.md § On a freestanding target the worklist is asked for rather than assumed`).
+//
+// A target with no thread pointer asks the hook for the running task's drain list, and the module
+// carries a weak default answering with its one plain slot. A scheduler written in sysl defines the
+// hook with `@export`, and that definition lands in the same module as the default -- where two
+// `define`s of one name are refused by the IR reader long before a linker could let the strong one
+// win. So a module that exports the hook leaves the default out, and every drain calls the program's.
+
+private arh_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A slot of the runtime's shape, handed out by the program, which counts how often it is asked.
+private val arh_rt_hook: string =
+    "module rt\n\n" +
+    "struct Slot\n" +
+    "    head: *u8\n" +
+    "    draining: u8\n\n" +
+    "var mine: Slot = Slot(ptr_cast(0usize), 0)\n" +
+    "var asked: int = 0\n\n" +
+    "calls() -> int = asked\n\n" +
+    "@export(\"__sysl_arc_reaper\")\n" +
+    "reaper() -> *Slot\n" +
+    "    asked += 1\n" +
+    "    &mine\n"
+
+// The same module with no hook: the program then drains through the default slot.
+private val arh_rt_plain: string = "module rt\n\ncalls() -> int = 0\n"
+
+// Two `&sync` boxes whose counts reach zero -- one at the reassignment, one as the function returns --
+// so two drains ask for the slot.
+private val arh_running: string =
+    "import rt\n\n" +
+    "struct Node\n" +
+    "    v: int\n\n" +
+    "churn() -> int\n" +
+    "    var p: &sync Node = Node(1)\n" +
+    "    p = Node(2)\n" +
+    "    p.v\n\n" +
+    "val v = churn()\n" +
+    "print(v, rt.calls())\n"
+
+// The same releases with no statements, for an archive a C project links.
+private val arh_archived: string =
+    "import rt\n\n" +
+    "struct Node\n" +
+    "    v: int\n\n" +
+    "@export(\"reaper_probe\")\n" +
+    "probe() -> int\n" +
+    "    var p: &sync Node = Node(1)\n" +
+    "    p = Node(2)\n" +
+    "    p.v + rt.calls()\n"
+
+private arh_project(main: string, rt: string) -> string
+    val root = make_temp_dir("sysl-arh").unwrap()
+
+    write_text(s"$root/package.hocon", "package { name = \"probe\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    make_dir_all(s"$root/rt").unwrap()
+    write_text(s"$root/rt/rt.sysl", rt).unwrap()
+    root
+end arh_project
+
+// `sysl <args>` as the command line answers it: the status, and everything it said.
+private arh_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for i in 0..<said.len()
+        text = text + said.at(i) + "\n"
+
+    (code, text)
+end arh_cli
+
+// The whole program's LLVM text for a bare aarch64 machine, the library lowered from its source.
+private arh_bare_text(root: string) -> string
+    val got = arh_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "aarch64-freestanding", root])
+
+    assert_eq(got.0, 0, got.1)
+    got.1
+end arh_bare_text
+
+private arh_reaper() -> string = reaper_slot_symbol()
+
+// What the bare machine's code prints when this machine runs it. **Only the triple changes**: the host
+// is the same processor, so the text -- which asks the hook for its slot, there being no thread
+// pointer on the target it was written for -- runs here as written, against this machine's C library.
+// None where the host is not an aarch64 machine.
+//
+// What a run through this proves is exactly two things: that the weak default is left out when the
+// program exports the hook (the text links with one definition of it), and that every drain's request
+// for the slot reaches the program's hook (its count). It is not a board run -- nothing here is linked
+// or started the way a bare machine would be. The board proof is keel's QEMU boot, whose scheduler
+// supplies the hook per thread.
+private arh_ran_bare(root: string) -> Option[string]
+    val host = host_target()
+
+    if host.cpu != Aarch64 then return None
+
+    val cc = find_clang(host, None).unwrap()
+    val bare = target_named("aarch64-freestanding").unwrap()
+    val text = replace_all(arh_bare_text(root), s"target triple = \"${bare.triple}\"",
+                           s"target triple = \"${host.triple}\"")
+
+    write_text(s"$root/host.ll", text).unwrap()
+
+    val built = capture(cc, ["-O1", "-Wno-override-module", s"$root/host.ll", "-o", s"$root/exe"],
+                        "", [], true).unwrap()
+
+    assert(built.status.ok(), built.text)
+
+    val ran = capture(s"$root/exe", [], "", [], true).unwrap()
+
+    assert(ran.status.ok(), ran.text)
+    Some(ran.text)
+end arh_ran_bare
+
+// The lines of `llvm-nm --defined-only` over `archive` that define the reaper's slot hook, or None
+// where no llvm-nm is on this machine.
+private arh_defined_hooks(archive: string) -> Option[Buf[string]]
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-nm", "/usr/local/opt/llvm/bin/llvm-nm"]
+    var nm = ""
+
+    for i in 0..<candidates.len
+        if nm == "" && is_file(candidates[i]) then nm = candidates[i]
+
+    if nm == "" then return None
+
+    val listed = capture(nm, ["--defined-only", archive], "", [], true).unwrap()
+
+    assert(listed.status.ok(), listed.text)
+
+    var out: Buf[string] = buf()
+    val lines = split(listed.text, "\n")
+
+    for i in 0..<lines.len
+        val words = split(lines[i].trim(), " ")
+
+        if words.len == 3 && words[2] == arh_reaper() then out.push(lines[i].trim())
+
+    Some(out)
+end arh_defined_hooks
+
+// The archive `build-c` writes for a bare aarch64 machine.
+private arh_archive(root: string) -> string
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root]
+    val built = arh_cli(args[..])
+
+    assert_eq(built.0, 0, built.1)
+    archive
+end arh_archive
+
+@test("a hook the program defines with @export is defined once and declared nowhere")
+arh_exported_hook_is_defined_once()
+    if !std_root().is_ok() then return
+
+    val root = arh_project(arh_running, arh_rt_hook)
+    val out = arh_bare_text(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(out.count_of(s"\ndefine ptr @${arh_reaper()}("), 1, out)
+    assert(!out.contains(s"define weak ptr @${arh_reaper()}("), out)
+    assert(!out.contains(s"declare ptr @${arh_reaper()}("), out)
+    assert(out.contains(s"%s = call ptr @${arh_reaper()}()"), out)
+end arh_exported_hook_is_defined_once
+
+@test("a hook the program defines with @export runs, and every drain asks it for the slot")
+arh_exported_hook_is_called()
+    if !arh_ready() then return
+
+    val root = arh_project(arh_running, arh_rt_hook)
+    val got = arh_ran_bare(root)
+
+    remove_dir_all(root).unwrap_or(())
+
+    got match
+        None -> print("skipped: this machine is not an aarch64 machine")
+        Some(text) -> assert_eq(text, "2 2\n")
+end arh_exported_hook_is_called
+
+// The other side of the rule: a program that defines nothing keeps the weak default, alone, and its
+// drains go through the one slot the module carries.
+@test("a program that does not define the hook keeps the weak default and runs on it")
+arh_no_hook_is_unchanged()
+    if !arh_ready() then return
+
+    val root = arh_project(arh_running, arh_rt_plain)
+    val out = arh_bare_text(root)
+
+    assert_eq(out.count_of(s"define weak ptr @${arh_reaper()}()"), 1, out)
+    assert(!out.contains(s"\ndefine ptr @${arh_reaper()}("), out)
+    assert(!out.contains(s"declare ptr @${arh_reaper()}("), out)
+    assert(out.contains("entry:\n  ret ptr @arc.reaper.self"), out)
+
+    val got = arh_ran_bare(root)
+
+    remove_dir_all(root).unwrap_or(())
+
+    got match
+        None -> print("skipped: this machine is not an aarch64 machine")
+        Some(text) -> assert_eq(text, "2 0\n")
+end arh_no_hook_is_unchanged
+
+// An archive a C project links for a board carries the program's hook as its one, strong definition
+// of the symbol: the default is not beside it, weak or otherwise.
+@test("an aarch64-freestanding archive defines the program's hook once, strongly")
+arh_archive_defines_the_hook_once()
+    if !arh_ready() then return
+
+    val root = arh_project(arh_archived, arh_rt_hook)
+    val found = arh_defined_hooks(arh_archive(root))
+
+    remove_dir_all(root).unwrap_or(())
+
+    found match
+        None -> print("skipped: llvm-nm is not on this machine")
+        Some(lines) ->
+            assert_eq(lines.len(), 1)
+            assert(lines.at(0).contains(" T "), lines.at(0))
+end arh_archive_defines_the_hook_once
+
+// And with no hook the archive still defines the symbol exactly once, as the weak default.
+@test("an aarch64-freestanding archive with no hook defines the weak default once")
+arh_archive_without_a_hook_is_weak()
+    if !arh_ready() then return
+
+    val root = arh_project(arh_archived, arh_rt_plain)
+    val found = arh_defined_hooks(arh_archive(root))
+
+    remove_dir_all(root).unwrap_or(())
+
+    found match
+        None -> print("skipped: llvm-nm is not on this machine")
+        Some(lines) ->
+            assert_eq(lines.len(), 1)
+            assert(lines.at(0).contains(" W "), lines.at(0))
+end arh_archive_without_a_hook_is_weak
