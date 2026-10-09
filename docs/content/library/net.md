@@ -315,8 +315,9 @@ hooks, each an `extern` no module of the library defines.
 | `sysl_net_resolve(host, host_len, port, passive, out, room) -> int` | how many addresses it wrote |
 
 **Each answers zero or more for success and the `IoError` code negated for a failure** — the contract
-of `sysl.io.sys` and `sysl.process.sys` — and `sysl.net.sys.unsupported` (`-1`) for a call the target
-cannot make at all, which reaches the caller as *not supported on this target*. A call its timeout
+of every `*.sys` module (`sysl.fs.sys`, `sysl.io.sys`, `sysl.process.sys`) — and `sysl.sys.UNSUPPORTED`
+(-38 on every platform, not the host's `ENOSYS`) for a call the target cannot make at all, which
+reaches the caller as *not supported on this target*. A call its timeout
 stopped answers `ETIMEDOUT` negated (60 on a BSD, 110 everywhere else), which is what `timed_out`
 asks. **An address crosses as `sysl.net.sys.Endpoint`**: sixteen bytes in network order (an IPv4
 address in the first four), a scope, a port as the number itself, and the family — 24 bytes laid out
@@ -349,7 +350,7 @@ udp_socket(here) match
 ```
 
 ```error
-this program reaches 'sysl.net', and 'aarch64-freestanding' has no C library under it for the standard library to answer a network with, so the program answers it: define 'sysl_net_bind', 'sysl_net_socket' with '@export', each taking what its 'extern' in 'sysl.net.sys' declares and answering a descriptor, a count or zero, or the code of an 'IoError' negated
+this program reaches 'sysl.net', and 'aarch64-freestanding' has no operating system under it for the standard library to answer a network with, so the program answers it: define 'sysl_net_bind', 'sysl_net_socket' with '@export', each taking what its 'extern' in 'sysl.net.sys' declares and answering a descriptor, a count or zero, or the code of an 'IoError' negated
 ```
 
 The question is asked only of what the program reaches, so a freestanding program that builds an

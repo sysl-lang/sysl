@@ -2,6 +2,7 @@ module sysl.net.hosted
 @requires(posix)
 
 import sysl.net.sys.Endpoint
+import sysl.sys.host_status
 
 // `sysl.net.sys`'s hooks answered over a POSIX host's sockets. **Call `sysl.net` instead** -- nothing
 // here is meant to be called: each function below exists to be linked under a hook's symbol, and is
@@ -16,7 +17,9 @@ import sysl.net.sys.Endpoint
 //
 // **What only C can answer is answered by `net.c` beside this file** -- the platform's `sockaddr`
 // layouts, the socket macros and `getaddrinfo`. Each of its functions answers zero or an `errno`, and
-// the hook here negates it.
+// the hook here turns it into the
+// contract's status with `sysl.sys.host_status`: the code negated, or `UNSUPPORTED` for the host's own
+// "no such call here".
 
 #if hosted
 private extern "sysl_net_posix_socket" c_socket(family: int, kind: int, fd: *i32) -> int
@@ -38,34 +41,34 @@ private extern "sysl_net_posix_resolve" c_resolve(host: *u8, host_len: usize, po
                                                   passive: int, out: *Endpoint, room: usize,
                                                   count: *usize) -> int
 
-/** A shim's `errno` or count as a hook's answer: the count, or the code negated. */
-private counted(e: int, n: usize) -> isize = if e != 0 then -isize(e) else isize(n)
+/** A shim's `errno` or count as a hook's answer: the count, or the failure's status. */
+private counted(e: int, n: usize) -> isize = if e != 0 then isize(host_status(e)) else isize(n)
 
 @export("sysl_net_socket")
 net_socket(family: int, kind: int) -> int
     var fd: i32 = 0
     val e = c_socket(family, kind, &fd)
 
-    if e != 0 then -e else int(fd)
+    if e != 0 then host_status(e) else int(fd)
 
 @export("sysl_net_connect")
-net_connect(fd: int, to: *Endpoint) -> int = -c_connect(fd, to)
+net_connect(fd: int, to: *Endpoint) -> int = host_status(c_connect(fd, to))
 
 @export("sysl_net_bind")
-net_bind(fd: int, at: *Endpoint) -> int = -c_bind(fd, at)
+net_bind(fd: int, at: *Endpoint) -> int = host_status(c_bind(fd, at))
 
 @export("sysl_net_listen")
-net_listen(fd: int, backlog: int) -> int = -c_listen(fd, backlog)
+net_listen(fd: int, backlog: int) -> int = host_status(c_listen(fd, backlog))
 
 @export("sysl_net_accept")
 net_accept(fd: int, peer: *Endpoint) -> int
     var s: i32 = 0
     val e = c_accept(fd, peer, &s)
 
-    if e != 0 then -e else int(s)
+    if e != 0 then host_status(e) else int(s)
 
 @export("sysl_net_local")
-net_local(fd: int, at: *Endpoint) -> int = -c_local(fd, at)
+net_local(fd: int, at: *Endpoint) -> int = host_status(c_local(fd, at))
 
 @export("sysl_net_send")
 net_send(fd: int, from: *u8, len: usize) -> isize
@@ -92,18 +95,18 @@ net_recv_from(fd: int, into: *u8, room: usize, from: *Endpoint) -> isize
     counted(c_recv_from(fd, into, room, from, &n), n)
 
 @export("sysl_net_shutdown")
-net_shutdown(fd: int, how: int) -> int = -c_shutdown(fd, how)
+net_shutdown(fd: int, how: int) -> int = host_status(c_shutdown(fd, how))
 
 @export("sysl_net_close")
-net_close(fd: int) -> int = -c_close(fd)
+net_close(fd: int) -> int = host_status(c_close(fd))
 
 @export("sysl_net_option")
-net_option(fd: int, which: int, value: i64) -> int = -c_option(fd, which, value)
+net_option(fd: int, which: int, value: i64) -> int = host_status(c_option(fd, which, value))
 
 @export("sysl_net_resolve")
 net_resolve(host: *u8, host_len: usize, port: int, passive: int, out: *Endpoint, room: usize) -> int
     var n: usize = 0
     val e = c_resolve(host, host_len, port, passive, out, room, &n)
 
-    if e != 0 then -e else int(n)
+    if e != 0 then host_status(e) else int(n)
 #endif
