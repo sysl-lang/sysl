@@ -1,0 +1,226 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.text.{split, Search}
+
+// `dso_local` on a bare machine (`dso_local.sysl`): every declaration and every definition that is
+// not already local is marked, as clang marks them for the same triple, so `&` of an `extern` is the
+// address the code is running at and not the one the image was linked at. A hosted machine is left
+// exactly as it was.
+
+// -- which machines ------------------------------------------------------------------------------------
+
+@test("every freestanding ELF machine binds its symbols locally, and no hosted one does")
+dsl_which_targets()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+        val bare_elf = t.os == Freestanding && t.cpu != Wasm32 && t.cpu != Craft
+
+        assert_eq(t.symbols_bind_locally(), bare_elf, t.name)
+
+    assert(target_named("aarch64-freestanding").unwrap().symbols_bind_locally())
+    assert(target_named("thumbv6m-freestanding").unwrap().symbols_bind_locally())
+    assert(target_named("riscv64-freestanding").unwrap().symbols_bind_locally())
+    assert(target_named("x86_64-freestanding").unwrap().symbols_bind_locally())
+    assert(!target_named("wasm32-freestanding").unwrap().symbols_bind_locally())
+    assert(!target_named("craft-freestanding").unwrap().symbols_bind_locally())
+    assert(!target_named("aarch64-linux").unwrap().symbols_bind_locally())
+    assert(!host_target().symbols_bind_locally())
+end dsl_which_targets
+
+// -- the lines -----------------------------------------------------------------------------------------
+
+@test("an extern variable, an extern function and a definition are marked; local symbols are not")
+dsl_the_lines()
+    assert_eq(dso_local_line("@ext = external global i64"), "@ext = external dso_local global i64")
+    assert_eq(dso_local_line("declare void @poke(i64)"), "declare dso_local void @poke(i64)")
+    assert_eq(dso_local_line("define i64 @f(i64 %x) #99 {"), "define dso_local i64 @f(i64 %x) #99 {")
+    assert_eq(dso_local_line("@g = global i32 0"), "@g = dso_local global i32 0")
+    assert_eq(dso_local_line("@k = constant i32 7, align 4"), "@k = dso_local constant i32 7, align 4")
+    assert_eq(dso_local_line("define weak void @sysl_bounds_fail(i32 %kind) {"),
+              "define weak dso_local void @sysl_bounds_fail(i32 %kind) {")
+    assert_eq(dso_local_line("define weak_odr ptr @h() {"), "define weak_odr dso_local ptr @h() {")
+    assert_eq(dso_local_line("declare extern_weak void @maybe()"), "declare extern_weak dso_local void @maybe()")
+    assert_eq(dso_local_line("@c = external hidden global i64"), "@c = external dso_local hidden global i64")
+    assert_eq(dso_local_line("declare hidden void @m$f()"), "declare dso_local hidden void @m$f()")
+end dsl_the_lines
+
+@test("a private, internal or already-marked symbol, an intrinsic and an llvm list are left alone")
+dsl_lines_left_alone()
+    val same: [11]string = [
+        "define private void @arc.retain(ptr %p) {",
+        "define internal void @sysl.module_init() {",
+        "@s = private unnamed_addr constant [2 x i8] c\"a\\00\"",
+        "@arc.reaper.self = internal global %arc.reaper zeroinitializer",
+        "declare void @llvm.trap()",
+        "declare i1 @llvm.coro.end(ptr, i1, token)",
+        "@llvm.used = appending global [1 x ptr] [ptr @f], section \"llvm.metadata\"",
+        "@x = external dso_local global i64",
+        "declare dso_local void @y()",
+        "  %r = call i64 @f(i64 1)",
+        "target triple = \"aarch64-none-elf\""]
+
+    for i in 0..<same.len
+        assert_eq(dso_local_line(same[i]), same[i])
+end dsl_lines_left_alone
+
+@test("a whole text is marked line by line on a bare machine and untouched on a hosted one")
+dsl_whole_text()
+    val text = "target triple = \"x\"\n\n@ext = external global i64\n\ndeclare void @poke(i64)\n\n" +
+        "define i64 @f() {\nentry:\n  call void @poke(i64 1)\n  ret i64 0\n}\n"
+    val bare = bound_locally(text, target_named("aarch64-freestanding").unwrap())
+
+    assert_eq(bare, "target triple = \"x\"\n\n@ext = external dso_local global i64\n\n" +
+        "declare dso_local void @poke(i64)\n\ndefine dso_local i64 @f() {\nentry:\n  call void @poke(i64 1)\n" +
+        "  ret i64 0\n}\n")
+    assert_eq(bound_locally(text, host_target()), text)
+    assert_eq(bound_locally(text, target_named("aarch64-linux").unwrap()), text)
+    assert_eq(bound_locally(text, target_named("wasm32-freestanding").unwrap()), text)
+    assert_eq(bound_locally(text, target_named("craft-freestanding").unwrap()), text)
+end dsl_whole_text
+
+// -- what `emit-llvm` prints ---------------------------------------------------------------------------
+
+private dsl_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A program taking the address of an extern variable and calling an extern function, exported so
+// that every build keeps it.
+private dsl_main() -> string =
+    "extern ext_counter: u64\nextern ext_poke(v: u64)\n\n@export(\"probe_addr\")\nprobe_addr() -> usize\n" +
+    "    ext_poke(1)\n    usize(&ext_counter)\n"
+
+private dsl_project() -> string
+    val root = make_temp_dir("sysl-dsl").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", dsl_main()).unwrap()
+    root
+end dsl_project
+
+// `sysl <args>` as the command line answers it: the status, and everything it said.
+private dsl_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for i in 0..<said.len()
+        text = text + said.at(i) + "\n"
+
+    reset_search_paths()
+    (code, text)
+end dsl_cli
+
+// What `emit-llvm` prints for the probe on `target`, or the host where it is empty.
+private dsl_emitted(target: string) -> string
+    val root = dsl_project()
+    var hosted: [3]string = ["sysl", "emit-llvm", root]
+    var bare: [5]string = ["sysl", "emit-llvm", "--target", target, root]
+    val got = if target == "" then dsl_cli(hosted[..]) else dsl_cli(bare[..])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    got.1
+end dsl_emitted
+
+// Whether some line of `text` starts with `head` and holds `part`.
+private dsl_line(text: string, head: string, part: string) -> bool
+    val lines = split(text, "\n")
+
+    for i in 0..<lines.len
+        if lines[i].starts_with(head) && lines[i].contains(part) then return true
+
+    false
+end dsl_line
+
+@test("on aarch64-freestanding the extern variable, the extern function and the export are dso_local")
+dsl_emitted_bare()
+    if !dsl_ready() then return
+
+    val ir = dsl_emitted("aarch64-freestanding")
+
+    assert(ir.contains("@ext_counter = external dso_local global i64"), ir)
+    assert(ir.contains("declare dso_local void @ext_poke(i64)"), ir)
+    assert(dsl_line(ir, "define dso_local ", "@probe_addr("), ir)
+end dsl_emitted_bare
+
+@test("on the host nothing is marked")
+dsl_emitted_hosted()
+    if !dsl_ready() then return
+
+    val ir = dsl_emitted("")
+
+    assert(ir.contains("@ext_counter = external global i64"), ir)
+    assert(ir.contains("declare void @ext_poke(i64)"), ir)
+    assert(!ir.contains("dso_local"), ir)
+end dsl_emitted_hosted
+
+// -- the object --------------------------------------------------------------------------------------
+
+private dsl_objdump() -> Option[string]
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end dsl_objdump
+
+// Every relocation in the archive `build-c` writes for the probe on `target` that names `ext_counter`.
+private dsl_relocations(objdump: string, target: string) -> Buf[string]
+    val root = dsl_project()
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "--target", target, "-o", archive, root]
+    val built = dsl_cli(args[..])
+
+    assert_eq(built.0, 0, built.1)
+
+    var out: Buf[string] = buf()
+
+    var dump: [2]string = ["-dr", archive]
+
+    capture(objdump, dump[..]) match
+        Err(_) -> assert(false, "llvm-objdump did not run")
+        Ok(dis) ->
+            val lines = split(dis.text, "\n")
+
+            for i in 0..<lines.len
+                if lines[i].contains("R_") && lines[i].contains("ext_counter") then out.push(lines[i])
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end dsl_relocations
+
+// The relocations name the variable, none of them through the GOT, and one of them is `kind`.
+private dsl_direct(target: string, kind: string)
+    if !dsl_ready() || dsl_objdump().is_none() then return
+
+    val relocs = dsl_relocations(dsl_objdump().unwrap(), target)
+    var text = ""
+    var found = false
+
+    for i in 0..<relocs.len()
+        text = text + relocs.at(i) + "\n"
+        if relocs.at(i).contains(kind) then found = true
+
+    assert(!relocs.is_empty(), s"$target: no relocation names ext_counter")
+    assert(!text.contains("GOT"), s"$target:\n$text")
+    assert(found, s"$target, wanted $kind:\n$text")
+end dsl_direct
+
+@test("an aarch64-freestanding object reaches the extern variable by adrp/add, not through the GOT")
+dsl_object_aarch64()
+    dsl_direct("aarch64-freestanding", "R_AARCH64_ADR_PREL_PG_HI21")
+
+@test("a thumb-freestanding object reaches it directly too")
+dsl_object_thumb()
+    dsl_direct("thumb-freestanding-softfp", "R_ARM_")
+
+@test("and a riscv64-freestanding object")
+dsl_object_riscv()
+    dsl_direct("riscv64-freestanding", "R_RISCV_")
