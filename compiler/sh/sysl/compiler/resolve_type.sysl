@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int, to_string, mul as big_mul, pow as big_pow,
-                         negate as big_negate}
+                         negate as big_negate, add_long as big_add_long}
 import sysl.math.decimal.{Decimal, of as decimal_of, parse as decimal_parse}
 import sysl.text.parse_real
 import sysl.text.Search
@@ -1203,7 +1203,7 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
 
     val tag = variant_tag(e, ty)
 
-    if tag.is_some() then return Some(ConstArg(from_int(long(tag.unwrap())), ty, false))
+    if tag.is_some() then return Some(ConstArg(tag.unwrap(), ty, false))
 
     if awaits_instantiation(a, scope, e, subst) then return Some(ConstArg(from_int(0), ty, true))
 
@@ -1250,7 +1250,7 @@ end const_arg_value
 // The tag a **simple enum's variant** stands for, where the value parameter's declared type is that
 // enum. A simple enum's value IS its identity -- nothing else tells two of its variants apart -- so
 // its tag is exactly the number a type's identity wants; a data enum's is not, and gets no case.
-private variant_tag(e: Expr, ty: Type) -> Option[int]
+private variant_tag(e: Expr, ty: Type) -> Option[BigInt]
     val n = *e.kind match
         Ident(n) -> n
         _ -> return None
@@ -1818,7 +1818,7 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
     // enum's is its position, since nothing may name one. So the two are assigned by different
     // rules, and only the first of them reads what was written after the `=`.
     val cx = analyzer_for(a, home)
-    var next_tag = 0
+    var next_tag = from_int(0)
 
     for v in d.variants
         var fields: Buf[(string, Type)] = buf()
@@ -1849,13 +1849,12 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
                             if first && !const_refused_since(a, refusals) then
                                 a.fault(scope, span,
                                         s"the value of variant '${v.name}' must be a constant integer")
-                None -> tag = fitting_tag(a, scope, span, v.name, from_int(long(next_tag)),
-                                          underlying, first)
+                None -> tag = fitting_tag(a, scope, span, v.name, next_tag, underlying, first)
         else if v.value.is_some() && first
             a.fault(scope, span,
                     s"variant '${v.name}' carries data, so it cannot also have an explicit value")
 
-        next_tag = tag + 1
+        next_tag = big_add_long(tag, 1)
         made.variants.push(EnumVariant(v.name, tag, fields, !v.fields.is_empty()))
 
     // A simple enum's value *is* its identity -- there is nothing else to tell two variants apart --
@@ -1876,9 +1875,10 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
 end instantiate_enum
 
 // One discriminant, checked against the storage the `: iN` annotation pinned -- which is the whole
-// point of pinning it.
+// point of pinning it. It is kept whole: a `u64` or `u128` discriminant past `long`'s range is a
+// value like any other, and narrowing it here would make two such variants one.
 private fitting_tag(a: &Analysis, scope: Scope, span: Span, name: string, n: BigInt,
-                    underlying: Type, report: bool) -> int
+                    underlying: Type, report: bool) -> BigInt
     underlying match
         Integer(bits, signed, _) ->
             if !fits(n, bits, signed) && report
@@ -1886,7 +1886,7 @@ private fitting_tag(a: &Analysis, scope: Scope, span: Span, name: string, n: Big
                         s"fit ${type_show(underlying)}")
         _ -> ()
 
-    int(n.to_long().unwrap_or(0))
+    n
 end fitting_tag
 
 private refuse_repeated_tags(a: &Analysis, scope: Scope, span: Span, variants: Buf[EnumVariant])
