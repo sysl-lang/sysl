@@ -1,0 +1,363 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, str_builder}
+
+// Volatile module storage (`reference/memory.md § Device memory`): a module `var`, or a `static var`
+// in the file a program starts in, may be declared `volatile T` for a scalar `T`. It is the word an
+// interrupt handler writes and the program polls, so every read is one volatile load and every write
+// one volatile store. It exists only in this compiler (user-approved, 2026-10-08, from the keel
+// kernel), so nothing here was read out of the reference: the expectations are the design's.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private var vms_library_cache: Buf[Program] = buf()
+private var vms_library_read: bool = false
+
+private vms_library() -> Buf[Program]
+    if vms_library_read then return vms_library_cache
+
+    vms_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> vms_library_cache = units
+
+    vms_library_cache
+end vms_library
+
+private vms_ready() -> bool
+    if vms_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end vms_ready
+
+// The LLVM text these files lower to on the host, or every message they were refused with.
+private vms_ir_files(files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+    val library = vms_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return parsed.report.at(0).message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty()
+        var said = str_builder()
+
+        for i in 0..<done.reported.len()
+            said.push(done.reported.at(i).diag.message)
+            said.push("\n")
+
+        return said.finish()
+    end if
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end vms_ir_files
+
+private vms_ir(text: string) -> string = vms_ir_files([("main.sysl", text)])
+
+// The function named, from its `define` line to the brace that closes it.
+private vms_define(out: string, name: string) -> string
+    val lines = lines_of(out)
+    var said = str_builder()
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !inside && line.starts_with("define") && line.index_of(s"@$name(").is_some()
+            inside = true
+
+        if inside
+            if line == "}" then return said.finish()
+
+            said.push(line)
+            said.push("\n")
+
+    said.finish()
+end vms_define
+
+private vms_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+private vms_never_says(text: string, part: string) =
+    assert(!text.contains(part), s"expected no '$part' in:\n$text")
+
+// How many lines of `text` hold `part`.
+private vms_count(text: string, part: string) -> usize
+    val lines = lines_of(text)
+    var n: usize = 0
+
+    for i in 0..<lines.len()
+        if lines.at(i).contains(part) then n += 1
+
+    n
+end vms_count
+
+// What a program prints, where it runs to the end.
+private vms_ran(text: string) -> string
+    val root = make_temp_dir("sysl-vms").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"it did not exit zero: ${out.text}"
+end vms_ran
+
+private vms_tick() -> string = "static var tick: volatile u64 = 0\n"
+
+// -- every access is one volatile access ----------------------------------------------------------
+
+@test("a read of volatile module storage is one volatile load")
+vms_a_read_is_one_volatile_load()
+    if !vms_ready() then return
+
+    val out = vms_define(vms_ir(vms_tick() + "read() -> u64 = tick\nprint(read())"), "read")
+
+    vms_says(out, "load volatile i64, ptr @tick")
+    assert_eq(vms_count(out, "load "), 1)
+end vms_a_read_is_one_volatile_load
+
+@test("a write is one volatile store of the whole width")
+vms_a_write_is_one_volatile_store()
+    if !vms_ready() then return
+
+    val out = vms_define(vms_ir(vms_tick() + "go() = tick = 5\ngo()"), "go")
+
+    vms_says(out, "store volatile i64 5, ptr @tick")
+    assert_eq(vms_count(out, "store "), 1)
+end vms_a_write_is_one_volatile_store
+
+// Not atomic, and the page says so: a handler that runs between the two accesses loses its write.
+@test("a compound assignment is one volatile load and one volatile store, and nothing atomic")
+vms_a_compound_assignment_is_a_load_and_a_store()
+    if !vms_ready() then return
+
+    val out = vms_define(vms_ir(vms_tick() + "bump() = tick += 1\nbump()"), "bump")
+
+    assert_eq(vms_count(out, "load volatile i64, ptr @tick"), 1)
+    assert_eq(vms_count(out, "store volatile i64"), 1)
+    vms_never_says(out, "atomicrmw")
+end vms_a_compound_assignment_is_a_load_and_a_store
+
+@test("a module 'var' in a file of its own is volatile storage too, read from another module")
+vms_a_module_var_read_from_another_module()
+    if !vms_ready() then return
+
+    val dev = "module dev\n\nvar tick: volatile u64 = 0\n"
+    val out = vms_ir_files([("dev.sysl", dev), ("main.sysl", "import dev\n\nread() -> u64 = dev.tick\nprint(read())")])
+
+    vms_says(vms_define(out, "read"), "load volatile i64")
+end vms_a_module_var_read_from_another_module
+
+@test("while a plain module 'var' keeps the ordinary load")
+vms_a_plain_var_keeps_the_ordinary_load()
+    if !vms_ready() then return
+
+    val out = vms_define(vms_ir("static var tick: u64 = 0\nread() -> u64 = tick\nprint(read())"), "read")
+
+    vms_says(out, "load i64, ptr @tick")
+    vms_never_says(out, "volatile")
+end vms_a_plain_var_keeps_the_ordinary_load
+
+// The value a read hands back is an ordinary `u64`: it binds, compares and prints as one, and the
+// initializer is honoured.
+@test("a read is an ordinary value, and the storage starts at its initializer")
+vms_a_read_is_an_ordinary_value()
+    if !vms_ready() then return
+
+    val src = "static var tick: volatile u64 = 41\n\nbump() = tick += 1\n\nbump()\nval n = tick\n" +
+              "print(n, n < 100, tick + 1)\n"
+
+    assert_eq(vms_ran(src), "42 true 43\n")
+end vms_a_read_is_an_ordinary_value
+
+// -- the address is the address of a volatile place -----------------------------------------------
+
+@test("'&' of volatile module storage is a '*volatile T', as '&' of a volatile field is")
+vms_the_address_is_a_volatile_pointer()
+    if !vms_ready() then return
+
+    val out = vms_ir(vms_tick() + "at() -> *volatile u64 = &tick\nread() -> u64 = *at()\nprint(read())")
+
+    vms_says(vms_define(out, "at"), "ret ptr @tick")
+    vms_says(vms_define(out, "read"), "load volatile i64")
+end vms_the_address_is_a_volatile_pointer
+
+@test("so it is not an ordinary '*T'")
+vms_the_address_is_not_a_plain_pointer()
+    if !vms_ready() then return
+
+    vms_says(vms_ir(vms_tick() + "at() -> *u64 = &tick\nprint(0)"), "but its body yields *volatile ulong")
+end vms_the_address_is_not_a_plain_pointer
+
+// -- what it refuses ------------------------------------------------------------------------------
+
+@test("a 'val', which is a constant")
+vms_refuses_a_val()
+    if !vms_ready() then return
+
+    vms_says(vms_ir("static val v: volatile u32 = 1\nprint(v)"),
+             "'v' is a 'val', and a 'val' is a constant: nothing writes it once it starts, so no " +
+             "access to it can be one the program did not make, and 'volatile' has nothing to say. " +
+             "Storage an interrupt handler or a device writes is a 'var'")
+end vms_refuses_a_val
+
+@test("a struct as a whole, pointing at a struct whose fields are volatile")
+vms_refuses_a_struct()
+    if !vms_ready() then return
+
+    vms_says(vms_ir("struct T\n    a: u32\n\nstatic var t: volatile T\nprint(0)"),
+             "'volatile T' cannot be the type of 't': a volatile access is one load or one store of " +
+             "the whole width, and 'T' is a struct. Write 'volatile' on its fields instead, as " +
+             "'n: volatile u64', and declare the storage as a plain 'T'")
+end vms_refuses_a_struct
+
+@test("an array as a whole, pointing at the element spelling")
+vms_refuses_an_array()
+    if !vms_ready() then return
+
+    vms_says(vms_ir("static var b: volatile [4]u32\nprint(0)"),
+             "'volatile [4]u32' cannot be the type of 'b': a volatile access is one load or one store " +
+             "of the whole width, and an array is several. Qualify the element instead, as " +
+             "'[4]volatile u32', or declare a struct whose fields are volatile")
+end vms_refuses_an_array
+
+@test("a counted value, as a field refuses one")
+vms_refuses_a_counted_value()
+    if !vms_ready() then return
+
+    vms_says(vms_ir("static var s: volatile string\nprint(0)"),
+             "'volatile string' is not a type: the qualifier says every access is emitted exactly as written")
+end vms_refuses_a_counted_value
+
+@test("while a local is still a value, and refused as one")
+vms_a_local_is_still_refused()
+    if !vms_ready() then return
+
+    vms_says(vms_ir("f() -> u32\n    var x: volatile u32 = 1\n    x\n\nprint(f())"),
+             "'volatile u32' is the type of *storage*, and this is a value")
+end vms_a_local_is_still_refused
+
+// -- what the optimizer may not do ----------------------------------------------------------------
+
+private vms_tool(name: string, args: []const string) -> Option[string]
+    for d in [s"/opt/homebrew/opt/llvm/bin/$name", s"/usr/local/opt/llvm/bin/$name", name]
+        capture(d, args, "", [], true) match
+            Ok(r) -> if r.status.ok() then return Some(r.text)
+            Err(_) -> ()
+
+    None
+end vms_tool
+
+// The disassembly of `wait_for` in a freestanding aarch64 archive built at -O2, or None where there
+// is no llvm-objdump here.
+private vms_poll_loop(storage: string) -> Option[string]
+    val src = storage + "\n@export(\"wait_for\")\nwait_for(n: u64)\n    while tick < n do ()\n"
+    val dir = make_temp_dir("sysl-vms").unwrap()
+    val main = s"$dir/main.sysl"
+    val archive = s"$dir/libk.a"
+
+    write_text(main, src).unwrap()
+
+    build_c_archive(main, Some("aarch64-freestanding"), None, "2", Some(archive), None, (m) -> ()) match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            assert(false, s"the archive did not build:\n${failure_text(why)}")
+        Ok(_) -> ()
+
+    val listing = vms_tool("llvm-objdump", ["-d", "--no-show-raw-insn", archive])
+
+    remove_dir_all(dir).unwrap_or(())
+
+    if listing.is_none() then return None
+
+    // Only the function's own lines, from its label to the blank line ending it.
+    val lines = lines_of(listing.unwrap())
+    var said = str_builder()
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if inside && line.trim().is_empty() then break
+
+        if inside
+            said.push(line)
+            said.push("\n")
+
+        if line.contains("<wait_for>:") then inside = true
+
+    Some(said.finish())
+end vms_poll_loop
+
+// Whether a line of a listing is a branch to its own address: `b .`, a loop of one instruction.
+private vms_spins(listing: string) -> bool
+    val lines = lines_of(listing)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i).trim()
+        val colon = line.index_of(":")
+
+        if colon.is_none() then continue
+
+        val at = line[0..<colon.unwrap()]
+
+        if line.contains(s"\tb\t0x$at <") then return true
+
+    false
+end vms_spins
+
+// The finding that asked for the feature: at -O2 a poll of a plain `var` is one load hoisted out of
+// a loop that branches to itself for ever, the handler's writes never seen. A volatile one is
+// re-read every time round.
+@test("at -O2 a poll of volatile storage stays a loop that loads, where a plain 'var' spins on 'b .'")
+vms_a_poll_loop_reloads_at_o2()
+    if !vms_ready() then return
+
+    val polled = vms_poll_loop("var tick: volatile u64 = 0\n")
+    val plain = vms_poll_loop("var tick: u64 = 0\n")
+
+    if polled.is_none() || plain.is_none()
+        print("skipped: no llvm-objdump here")
+        return
+    end if
+
+    vms_says(polled.unwrap(), "ldr")
+    assert(!vms_spins(polled.unwrap()), polled.unwrap())
+    assert(vms_spins(plain.unwrap()), plain.unwrap())
+end vms_a_poll_loop_reloads_at_o2

@@ -122,6 +122,53 @@ resolve_qualified(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -
         if volatile_admits(a, scope, t.span, ty) then Volatile(ty) else Unknown
     _ -> resolve_type(a, scope, t, subst)
 
+// The type a module's own storage is declared at -- a module `var`, a `static var` or `val`.
+//
+// **A module `var` is storage named where it is declared**, so it is the fourth position a
+// `volatile` may stand: `var tick: volatile u64` is a word an interrupt handler writes and the
+// program polls, and every read of it is one volatile load and every write one volatile store. It
+// is held to the scalars a field is, since the promise is one access of the whole width. A `val` is
+// a constant -- nothing writes it once it starts -- so there is nothing for the qualifier to say.
+resolve_storage(a: &Analysis, scope: Scope, t: TypeRef, name: string, writable: bool) -> Type = *t.kind match
+    VolatileType(inner) ->
+        val ty = resolve_type(a, scope, inner, no_bindings())
+
+        if !writable
+            a.fault(scope, t.span, s"'$name' is a 'val', and a 'val' is a constant: nothing writes it once " +
+                    "it starts, so no access to it can be one the program did not make, and 'volatile' " +
+                    "has nothing to say. Storage an interrupt handler or a device writes is a 'var'")
+            return Unknown
+        end if
+
+        val written = type_text(inner)
+        val refused = storage_aggregate(ty, inner, written)
+
+        if !refused.is_empty()
+            a.fault(scope, t.span, s"'volatile $written' cannot be the type of '$name': a volatile " +
+                    "access is one load or one store of the whole width, and " + refused)
+            return Unknown
+        end if
+
+        if volatile_admits(a, scope, t.span, ty) then Volatile(ty) else Unknown
+    _ -> resolve_type(a, scope, t, no_bindings())
+
+// Why module storage of this type may not be volatile as a whole, where it is an aggregate; empty
+// where it is not. The way to write it is the register block's: a struct whose fields are qualified.
+private storage_aggregate(t: Type, inner: TypeRef, written: string) -> string = underlying(t) match
+    Struct(_) ->
+        s"'$written' is a struct. Write 'volatile' on its fields instead, as 'n: volatile u64', and " +
+        s"declare the storage as a plain '$written'"
+    Results(_) -> "a tuple is several. Declare a struct whose fields are volatile, as 'n: volatile u64'"
+    Array(n, _) ->
+        val elem = *inner.kind match
+            ArrayType(_, e, _) -> type_text(e)
+            _ -> "T"
+
+        s"an array is several. Qualify the element instead, as '[$n]volatile $elem', or declare a " +
+        "struct whose fields are volatile"
+    Vector(_, _) -> "a vector is several lanes. Declare a struct whose fields are volatile, as 'n: volatile u64'"
+    _ -> ""
+
 // **`unit` is zero-sized and still has no address**: a field, a parameter or a binding of it needs
 // none, but a `&T`, a `*T`, a slice and an array all reach what they hold through one, and there is
 // nothing there to reach. `what` names the form, quoted as the refusal quotes it.
