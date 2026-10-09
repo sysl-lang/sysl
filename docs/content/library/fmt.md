@@ -79,7 +79,28 @@ ffffffff
 ffffffffffffffff
 ```
 
-**They render integers up to 64 bits wide**, as `format_int` does; a 128-bit value is cut to its low 64.
+**Every width is exact, `u128` and `i128` included**, in an f-string hole and in these functions
+alike, because both go through `format_int`. The powers of two are done by shift and mask, and decimal
+divides in 32-bit limbs, so no 128-bit division is called:
+
+```sysl
+import sysl.fmt.hex
+
+val m: u128 = 340282366920938463463374607431768211455
+val lo: i128 = -170141183460469231731687303715884105727 - 1
+
+print(f"$m%x")
+print(f"$m%d")
+print(f"$lo%d")
+print(hex(lo))
+```
+
+```output
+ffffffffffffffffffffffffffffffff
+340282366920938463463374607431768211455
+-170141183460469231731687303715884105728
+80000000000000000000000000000000
+```
 
 **A width never truncates** — `hex(u32(0x12345), 2)` is `12345` — and a width of zero or less asks for
 no padding.

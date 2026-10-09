@@ -1326,18 +1326,6 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written:
     else if spec_is_float(c) then written_floating(ty)
     else ty == Str
 
-    // **A specifier's conversions stop at 64 bits, as C's `long long` does**, the library's
-    // `format_int` taking the value at `i128` — so a wider integer has no conversion to be applied
-    // by, and the program is sent to `str`, which renders at the value's own width.
-    if fits && spec_is_int(c)
-        val bits = core_measure("width", ty)
-
-        if bits.is_some() && bits.unwrap() > 64
-            return cx.err(span, s"'$spec' converts an integer of at most 64 bits, and has no " +
-                          s"conversion for the ${bits.unwrap()} bits of ${type_show(ty)} — render " +
-                          "it with 'str' instead")
-    end if
-
     // A compilation given no standard module still types the hole; only its lowering needs the
     // library's renderer, and `gen_format` records a gap for it there.
     if fits && spec_is_int(c) && library_key(cx, "format_int").is_some() then
@@ -1363,13 +1351,23 @@ private int_format_call(cx: &Analyzer, span: Span, v: TExpr, ty: Type, spec: str
         Integer(b, _, _) -> b
         _ -> 32
 
+    val unsigned = ty match
+        Integer(_, s, _) -> !s
+        _ -> false
+
+    // A `u128` above `i128`'s maximum crosses as a negative `i128`, which a signed conversion would
+    // print with its sign; so an unsigned 128-bit value under `%d` or `%i` is rendered as `%u`.
+    val last = spec.bytes[spec.bytes.len - 1]
+    val decimal = last == u8('d') || last == u8('i')
+    val written = if unsigned && bits == 128 && decimal then spec[0..<spec.bytes.len - 1] + "u" else spec
+
     val stars = spec_star_slots(spec)
     var next: usize = 0
     var args: Buf[TExpr] = buf()
 
     args.push(TExpr(span, TCast(v, Integer(128, true, false))))
     args.push(TExpr(span, TIntLit(from_int(long(bits)), int_type())))
-    args.push(TExpr(span, TStrLit(spec)))
+    args.push(TExpr(span, TStrLit(written)))
 
     if stars.0
         args.push(counts.at(next))

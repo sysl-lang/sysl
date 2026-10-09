@@ -14,8 +14,8 @@ import sysl.text.from_utf8_unchecked
 /** An integer rendered through a printf specifier, written here rather than handed to C's
  * `snprintf`, so a target with no C library formats `${n}%d` exactly as a hosted one does.
  *
- * `n` is the value at `i128`, which holds any integer up to 64 bits exactly, and `bits` is the width
- * of the type it came from. `spec` is the whole specifier, `%` to conversion letter; a `*` in it
+ * `n` is the value at `i128`, and `bits` is the width of the type it came from, up to 128: a `u128`
+ * above `i128`'s maximum arrives as its two's complement, which an unsigned conversion reads at `bits`. `spec` is the whole specifier, `%` to conversion letter; a `*` in it
  * reads `width` or `precision`, as C's `*` does — a negative width left-justifies at its magnitude
  * and a negative precision is as though none was written.
  *
@@ -80,34 +80,35 @@ format_int(n: i128, bits: int, spec: string, width: int, precision: int) -> stri
 
     val signed = conv == u8('d') || conv == u8('i')
     val upper = conv == u8('X')
-    val base: u64 = if conv == u8('o') then 8
+    val base: u32 = if conv == u8('o') then 8
     else if conv == u8('x') || conv == u8('X') then 16
     else if conv == u8('b') then 2
     else 10
 
     val negative = signed && n < 0
-    val mag = if negative then u64(-n)
-    else if n < 0 then u64(n + (i128(1) << bits))
-    else u64(n)
+    val mag = magnitude(n, bits, negative)
 
-    // The digits, written from the end of room for the longest: sixty-four binary ones.
-    var digits: [64]u8 = [0; 64]
-    var at: usize = 64
+    // The digits, written from the end of room for the longest: a hundred and twenty-eight binary ones.
+    var digits: [128]u8 = [0; 128]
+    var at: usize = 128
     var rest = mag
 
     if !(mag == 0 && p == 0)
         loop
-            val d = u8(rest % base)
+            // Base ten divides; the others shift and mask, so no 128-bit division is called.
+            val shift = if base == 16 then 4 else if base == 8 then 3 else 1
+            val next = if base == 10 then tenth(rest) else rest >> shift
+            val d = if base == 10 then u8(rest - next * 10) else u8(rest - (next << shift))
             val ten = if upper then u8('A') else u8('a')
 
             at -= 1
             digits[at] = if d < 10 then u8('0') + d else ten + d - 10
-            rest /= base
+            rest = next
 
             if rest == 0 then break
     end if
 
-    val count = int(64 - at)
+    val count = int(128 - at)
     var zeros = if p > count then p - count else 0
 
     if alt && base == 8 && zeros == 0 && (count == 0 || digits[at] != u8('0')) then zeros = 1
@@ -144,8 +145,8 @@ end format_int
 /** An integer in base sixteen, as the string `f"$v%x"` makes, for code that wants the text without
  * writing an `f"…"`. `width` is a minimum count of digits, padded with zeros on the left, and `upper`
  * picks `A`-`F`. A negative value reads at its own width, two's complement, so `hex(i8(-1))` is
- * `"ff"` and `hex(-1)` (an `int`) is `"ffffffff"`. There is no `0x` prefix. Like `format_int`, `hex`,
- * `binary` and `octal` render integers up to 64 bits wide; a 128-bit value is cut to its low 64.
+ * `"ff"` and `hex(-1)` (an `int`) is `"ffffffff"`. There is no `0x` prefix. Every integer
+ * width is exact, `u128` and `i128` included, with no C library and no 128-bit division.
  */
 hex[T: Integer](v: T, width: int = 0, upper: bool = false) -> string =
     radix(v, if upper then "X" else "x", width)
@@ -166,6 +167,42 @@ private radix[T: Integer](v: T, conv: string, width: int) -> string =
 // The specifier for one conversion letter and a minimum digit count: `%x`, or `%012x` for twelve.
 private radix_spec(conv: string, width: int) -> string =
     if width > 0 then "%0" + format_int(i128(width), 32, "%d", 0, -1) + conv else "%" + conv
+
+// The absolute value of a signed negative, or an unsigned conversion's reading of `n` at `bits`. Each
+// step keeps to what `i128` holds, so `i128`'s minimum and a `u128`'s maximum (which arrives as -1)
+// need no wider type.
+private magnitude(n: i128, bits: int, negative: bool) -> u128
+    if negative then return u128(-(n + 1)) + 1
+
+    if n >= 0 then return u128(n)
+
+    if bits < 128 then return u128(n + (i128(1) << bits))
+
+    // n + 2^128, as (n + 1 + (2^127 - 1)) + 2^127
+    val top = i128(1) << 126
+    val most = top - 1 + top
+
+    u128(n + 1 + most) + (u128(1) << 127)
+end magnitude
+
+// `x` divided by ten. Under sixty-four bits it is a 64-bit division; above, the number is divided as
+// four 32-bit limbs in `u64` arithmetic, so a target with no compiler runtime has no 128-bit
+// division to call.
+private tenth(x: u128) -> u128
+    if (x >> 64) == 0 then return u128(u64(x) / 10)
+
+    var r: u64 = 0
+    var out: u128 = 0
+
+    for i in 0..<4
+        val limb = u64((x >> (96 - 32 * i)) & 0xffffffff)
+        val cur = (r << 32) | limb
+
+        out = (out << 32) | u128(cur / 10)
+        r = cur % 10
+
+    out
+end tenth
 
 // `n` copies of the one-byte `s`, by doubling, so a wide field costs a handful of joins. It needs no
 // buffer that could fail and report it, which is what keeps a bare target's formatting free of
