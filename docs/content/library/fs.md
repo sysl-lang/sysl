@@ -217,7 +217,10 @@ Linux); two of them are equal when they stopped at the same byte, and one is nev
 `code()` answers for every case, not only `Other`: the named ones hand back the code they were
 recognised from, which keeps the question answerable without a second table. `message()` is a sentence
 in the terms the operation was asked in rather than in C's, and the `Display` impl is what makes
-`print(e)` say it:
+`print(e)` say it. **An `Other` says the platform's sentence for its code** — what the C library's
+`strerror_r` gives, so `EILSEQ` is "Illegal byte sequence" on macOS — and a code the library does not
+know comes back in its words for that ("Unknown error: 4242"); only a target with no `posix` C library
+under it says `error N`:
 
 ```sysl
 import sysl.fs.read_text

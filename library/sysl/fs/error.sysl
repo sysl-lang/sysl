@@ -1,6 +1,8 @@
 module sysl.fs
 @requires(os)
 
+import sysl.text.from_utf8_lossy
+
 /** What a filesystem call reports when it does not succeed, and the one number it comes from.
  *
  * `reference/errors.md § Which channel — the policy` puts this class of failure — something outside
@@ -113,7 +115,15 @@ enum IoError
         InvalidUtf8(_)   -> ilseq()
         Other(c)         -> c
 
-    /** A sentence, in the terms the operation was asked in rather than in C's. */
+    /** A sentence, in the terms the operation was asked in rather than in C's.
+     *
+     * The named cases say it in this module's words. **`Other` says it in the platform's**: the
+     * sentence its C library gives that code (`EILSEQ` is "Illegal byte sequence" on macOS), since a
+     * code no case names is one only the platform has words for, and a bare number was a thing the
+     * reader then had to go and look up. A code the library does not know comes back in the library's
+     * own words for that ("Unknown error: 4242"). A target with no `posix` C library under it says
+     * `error N`.
+     */
     message(self) -> string = self match
         NotFound          -> "no such file or directory"
         PermissionDenied  -> "permission denied"
@@ -126,8 +136,30 @@ enum IoError
         Interrupted       -> "interrupted"
         NotOpen           -> "the file is not open"
         InvalidUtf8(at)   -> f"not UTF-8 at byte $at%d"
-        Other(c)          -> f"error $c%d"
+        Other(c)          -> system_text(c)
 end IoError
+
+// The shim. Declared on every target and defined only where a `__posix__` directory supplies it; the
+// `#if posix` below is what keeps anything else from linking it.
+private[sysl] extern "sysl_fs_strerror" c_strerror(code: int, out: *u8, room: u64) -> long
+
+/** What the platform calls `code`, copied out of the buffer the C library wrote it into. `unsupported`
+ * is the one code no platform reports, and is said here rather than handed to a library that would
+ * call it an unknown error.
+ */
+#if posix
+private system_text(code: int) -> string
+    if code == unsupported_code then return "not supported on this target"
+
+    var into: [256]u8 = [0; 256]
+    val n = c_strerror(code, &into[0], 256)
+
+    if n < 0 then f"error $code%d" else from_utf8_lossy(into[0..<usize(n)])
+end system_text
+#else
+private system_text(code: int) -> string
+    if code == unsupported_code then "not supported on this target" else f"error $code%d"
+#endif
 
 /** So that a caller can say `e == NotFound` rather than `e.code() == 2`.
  *
@@ -217,4 +249,6 @@ private[sysl] why() -> IoError = from_errno(last_errno())
  * its shim is -- which is the better answer where it can be taken, since an undefined name at the
  * call site says so at compile time instead of at run time.
  */
-private[sysl] unsupported() -> IoError = Other(-1)
+private[sysl] unsupported() -> IoError = Other(unsupported_code)
+
+private const unsupported_code: int = -1

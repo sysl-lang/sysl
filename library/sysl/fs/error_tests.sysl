@@ -1,0 +1,61 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.path.join
+
+// What `IoError.message()` says for a code no case names. It used to be `error 92`, a number the reader
+// then had to look up; these hold it to the C library's own sentence, written out per platform so the
+// expected text comes from the libc's documentation rather than from the call under test.
+
+#if bsd
+private ilseq_text() -> string = "Illegal byte sequence"
+private unknown_text() -> string = "Unknown error: 4242"
+#else
+private ilseq_text() -> string = "Invalid or incomplete multibyte or wide character"
+private unknown_text() -> string = "Unknown error 4242"
+#endif
+
+@test("an Other carrying EILSEQ says the platform's sentence, not the number")
+other_says_the_platform_sentence()
+    assert_eq(Other(ilseq()).message(), ilseq_text())
+
+@test("print of an Other says the same sentence message() does")
+other_displays_the_sentence()
+    val e = Other(ilseq())
+
+    assert_eq(f"$e%s", ilseq_text())
+
+@test("a code the C library does not know comes back in its own words")
+other_unknown_code_is_libc_words()
+    assert_eq(Other(4242).message(), unknown_text())
+
+@test("the unsupported marker is not handed to the C library as an unknown error")
+unsupported_says_so()
+    assert_eq(unsupported().message(), "not supported on this target")
+
+@test("an Other from a real failing call reads as the platform's sentence")
+other_from_a_real_call()
+    val dir = "/tmp/sysl-fs-errtext"
+
+    remove_dir_all(dir) match
+        _ -> ()
+
+    make_dir(dir).unwrap()
+
+    val f = join(dir, "plain")
+
+    write_bytes(f, [u8('x')]).unwrap()
+
+    val e = read_link(f).unwrap_err()
+
+    assert_eq(e, Other(22))
+    assert_eq(e.message(), "Invalid argument")
+
+    remove_dir_all(dir).unwrap()
+end other_from_a_real_call
+
+@test("the named cases keep this module's words")
+named_cases_unchanged()
+    assert_eq(NotFound.message(), "no such file or directory")
+    assert_eq(InvalidUtf8(3).message(), "not UTF-8 at byte 3")
