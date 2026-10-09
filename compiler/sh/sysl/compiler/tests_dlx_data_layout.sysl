@@ -8,8 +8,10 @@ import sysl.text.{replace_all, split, Search}
 
 // The data layout every compiled text carries (`data_layout.sysl`), and the one printed text that
 // does not. Each machine where a missing layout changed the code is disassembled: riscv64, which split
-// every 64-bit access in two; wasm32, which encoded each one as four-byte aligned; and a Cortex-M0+,
-// whose copy called the four-byte `memcpy`.
+// every 64-bit access in two; and wasm32, which encoded each one as four-byte aligned. A Cortex-M0+
+// once witnessed it too, its copy calling the four-byte `memcpy` where the layout says eight; a
+// freestanding definition is now "no-builtins", so that copy calls no `memcpy` at all and is
+// disassembled for that instead.
 
 private dlx_ready() -> bool = std_root().is_ok() && clang_available()
 
@@ -23,7 +25,8 @@ private dlx_objdump() -> Option[string]
 end dlx_objdump
 
 // A store, a load and a copy of 64-bit words through pointers whose alignment only the type says;
-// the copy, out of a module array, is the one clang turns into a `memcpy`.
+// the copy, out of a module array, is the loop clang turns into a `memcpy` wherever builtins are
+// allowed.
 private dlx_program() -> string =
     "@export(\"poke\")\npoke(p: *u64, n: u64)\n    *p = n\n\n" +
     "@export(\"peek\")\npeek(p: *u64) -> u64 = *p\n\n" +
@@ -212,8 +215,10 @@ dlx_wasm32_accesses_are_aligned()
     assert(peek.contains("i64.load") && !peek.contains("p2align=2"), peek)
 end dlx_wasm32_accesses_are_aligned
 
-@test("on a Cortex-M0+ a copy of 64-bit words calls the eight-byte memcpy")
-dlx_thumbv6m_copy_is_eight_byte()
+// A freestanding image supplies `memcpy` itself, so its definitions are "no-builtins" and the loop
+// stays a loop: words moved in place, and no call to any `memcpy`, four-byte or eight.
+@test("on a Cortex-M0+ a copy of 64-bit words is moved in place, calling no memcpy")
+dlx_thumbv6m_copy_calls_no_memcpy()
     if !dlx_ready() then return
 
     val objdump = dlx_objdump() match
@@ -223,6 +228,9 @@ dlx_thumbv6m_copy_is_eight_byte()
     var symbols: [1]string = ["copy_table$$sysl"]
     val bodies = dlx_disassembled(objdump, "thumbv6m-freestanding", symbols[..], true)
     val copy = dlx_text(bodies.at(0))
+    val ops = dlx_mnemonics(bodies.at(0))
 
-    assert(copy.contains("__aeabi_memcpy8") && !copy.contains("__aeabi_memcpy4"), copy)
-end dlx_thumbv6m_copy_is_eight_byte
+    assert(!copy.contains("memcpy"), copy)
+    assert_eq(dlx_count(ops, "bl"), 0)
+    assert(dlx_count(ops, "ldr") >= 2 && dlx_count(ops, "str") >= 2, copy)
+end dlx_thumbv6m_copy_calls_no_memcpy

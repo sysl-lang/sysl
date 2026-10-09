@@ -1946,10 +1946,34 @@ only raise**: asking for less than the fields already need changes nothing, sinc
 The boundary travels with every value of the type the compiler lays down: a module `var` or `val`,
 a `static`, a local, an element of an array, a field of another struct — which begins on the
 boundary and raises its holder's to match — and the payload of an enum variant carrying one.
-**A value on the heap is the exception.** A box (`&T`) or a buffer takes its storage from the
-allocating pair, which promises only what `malloc` does — sixteen bytes — so a boxed value of a type
-aligned beyond that is not guaranteed its boundary, and the compiler claims no more than sixteen
-for any access through an address that might be one.
+**A value on the heap keeps it too.** A box (`&T`), a buffer or a task's frame takes its storage
+from the allocating pair, which promises only what `malloc` does — two words, sixteen bytes on a
+64-bit machine and eight on a 32-bit one — so storage of a type aligned beyond that comes from the
+aligned pair, `sysl_alloc_aligned(size, align)` and `sysl_free_aligned(p)`, and the payload is laid
+after the box's header on the boundary:
+
+```sysl
+@align(4096)
+struct Page
+    e: [512]u64
+
+var p: Page
+p.e[3] = 9
+
+val b: &Page = p
+
+print(usize(&*b) % 4096, b.e[3])
+```
+
+```output
+0 9
+```
+
+Every access through an address of the type claims its whole boundary. With libc's `malloc` and
+`free` on a POSIX system, WASI or Windows the aligned pair needs nothing from the program; anywhere
+else the program answers it,
+as [`packages.md` § A type aligned beyond what the pair promises](/reference/packages/#a-type-aligned-beyond-what-the-pair-promises)
+says.
 
 **The bound is folded rather than lexed**, so a program writes the name it already has for the number,
 and arithmetic over one works:

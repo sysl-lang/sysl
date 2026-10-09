@@ -95,6 +95,13 @@ cpu_bits(cpu: Cpu) -> usize
         Craft -> 16
 end cpu_bits
 
+// The boundary a block from the allocating pair is held to begin on, for an address `word_bits`
+// wide: two words, which is `malloc`'s own guarantee (`MALLOC_ALIGNMENT` is `2 * sizeof(size_t)`) --
+// sixteen on Apple and on glibc's and Bionic's 64-bit machines, eight on a 32-bit one. A pair a
+// manifest names is held to the same promise. A type aligned beyond it is boxed through the aligned
+// pair instead (`emit_box.sysl`).
+heap_boundary(word_bits: usize) -> usize = word_bits / 4
+
 // Whether a machine running this system has an operating system under it at all, which is what code
 // gating on a platform is usually really asking: whether there is a libc there to call.
 os_hosted(os: Os) -> bool = os_symbol(os) != "freestanding"
@@ -201,11 +208,12 @@ struct Target
     va_list: VaListAbi
     va_list_bytes: int
 
-    // The capabilities the project's manifest took away from this machine -- `heap`, `os`, `posix`
-    // -- which the registry never knows and every row starts without. **What a machine provides is
-    // read out of the manifest, not derived from the triple**, so the driver layers this on once it
-    // has read the file, and a module built for a machine that lacks one is held to it as though it
-    // had given it up itself.
+    // The capabilities the project's manifest took away from this machine -- `heap`, `os`, `posix`,
+    // `libc` -- which the registry never knows. **What a machine provides is read out of the
+    // manifest, not derived from the triple**, so the driver layers this on once it has read the
+    // file, and a module built for a machine that lacks one is held to it as though it had given it
+    // up itself. The one default the row carries is `libc` on a freestanding machine (`machine_lacks`),
+    // which a manifest has to grant rather than take away.
     lacks: Buf[string]
 
     hard_float(self) -> bool = !self.soft_float
@@ -218,10 +226,17 @@ struct Target
         false
     end lacks_capability
 
+    // Whether a C library is under the program, so a call only C answers -- `snprintf`, `memchr` --
+    // may be reached. Every "no C library" refusal asks this, never whether the machine is hosted.
+    provides_libc(self) -> bool = !self.lacks_capability(CapLibc)
+
     // How wide an address is here, which is the processor's answer and every target on one agrees.
     pointer_bits(self) -> usize = cpu_bits(self.cpu)
 
     pointer_bytes(self) -> usize = cpu_bits(self.cpu) / 8
+
+    // The boundary the allocating pair is held to answering on (`heap_boundary`).
+    heap_align(self) -> usize = heap_boundary(cpu_bits(self.cpu))
 
     // Whether a `thread_local` global means anything here. A bare machine has no thread pointer --
     // asked for one, LLVM gives it the local-exec model, whose offset is read from a register
@@ -287,10 +302,22 @@ struct Target
     end unsupported
 end Target
 
-// One registry row: a machine as the registry knows it, lacking nothing until a manifest says so.
+// One registry row: a machine as the registry knows it, lacking nothing until a manifest says so --
+// except a C library on a freestanding machine, which is the manifest's to grant.
 private row(name: string, triple: string, cpu: Cpu, os: Os, soft_float: bool, fpu: string,
             no_fpu: bool, short_enums: bool, va_list: VaListAbi, va_list_bytes: int) -> Target =
-    Target(name, triple, cpu, os, soft_float, fpu, no_fpu, short_enums, va_list, va_list_bytes, buf())
+    Target(name, triple, cpu, os, soft_float, fpu, no_fpu, short_enums, va_list, va_list_bytes,
+           machine_lacks(os))
+
+// What a machine lacks before any manifest speaks: a C library where it is freestanding, and nothing
+// else.
+machine_lacks(os: Os) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if !os_hosted(os) then out.push(CapLibc)
+
+    out
+end machine_lacks
 
 // Every target the compiler knows, in the order `sysl targets` lists them.
 //

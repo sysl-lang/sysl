@@ -788,7 +788,7 @@ b.push_int(k)
 ```
 
 ```error
-'n' of 'StrBuilder.push_int' is long, but int was given
+'n' of 'sysl.text.StrBuilder.push_int' is long, but int was given
 ```
 
 So a narrower value is written `b.push_int(long(k))` — and a caller who would rather not is
@@ -815,7 +815,7 @@ print(b.len())
 ```
 
 ```error
-'len' is a property of 'StrBuilder' — read it as 'value.len', without '()'
+'len' is a property of 'sysl.text.StrBuilder' — read it as 'value.len', without '()'
 ```
 
 ## Reading a value back: the parsers
