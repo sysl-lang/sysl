@@ -1,0 +1,59 @@
+module sysl.process
+@requires(posix)
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{IoError, from_status}
+import sysl.process.sys as psys
+import sysl.process.sys.Text
+import sysl.slices.as_ptr
+
+/** Replaces this program with `program`, run with `args`, and answers only if that failed.
+ *
+ * **On success nothing comes back**: the process goes on -- the same id, the same parent, the same
+ * open descriptors, the same working directory -- running the other program from its beginning, and
+ * nothing of this one is left to return to. What a shell's `exec` builtin, a login program and a
+ * wrapper that sets something up and then becomes its target all need.
+ *
+ * `program`, `env` and `inherit_env` mean what they mean for `run`: a name with no `/` is looked for
+ * on the `PATH` the new program will have, `env` is added to this program's environment, and with
+ * `inherit_env = false` it is the whole of it. Whatever this program has printed and not yet written
+ * out is written first, since the buffer holding it goes with the image.
+ *
+ * **The answer is an `IoError` rather than a `Result`**, there being no success to carry: `NotFound`
+ * for a program that is not there, `PermissionDenied` for one that may not be run, and this program
+ * carries on exactly as it was -- everything that can fail is checked before anything is given up.
+ *
+ * **There is no `fork` beside it, deliberately**, as Rust's and Go's standard libraries have none.
+ * A fork copies one thread of a program that may have several, mid-way through whatever the others
+ * held -- an allocator's lock, a half-written buffer -- and every count of every shared value along
+ * with it. Starting another program is `run`, `capture` or `start`; becoming one is this. A kernel's
+ * own runtime, which owns every thread and every count there is, is where a fork belongs.
+ */
+exec(program: string, args: []const string = [], env: []const Var = [],
+     inherit_env: bool = true) -> IoError
+    var argv: Buf[Text] = buf()
+
+    argv.push(Text(as_ptr(program.bytes), program.bytes.len))
+
+    for a in args do argv.push(Text(as_ptr(a.bytes), a.bytes.len))
+
+    // Each `NAME=VALUE` is made here and held in `lines` until the call is over, so no text lent
+    // below outlives what it points into.
+    var lines: Buf[string] = buf()
+
+    for v in env do lines.push(s"${v.name}=${v.value}")
+
+    var envp: Buf[Text] = buf()
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        envp.push(Text(as_ptr(line.bytes), line.bytes.len))
+
+    val e = psys.exec(as_ptr(program.bytes), program.bytes.len, as_ptr(argv.view()), argv.len(),
+                      as_ptr(envp.view()), envp.len(), if inherit_env then 1 else 0)
+
+    // A supplier answers only on failure; one that answered zero or more broke the contract, and the
+    // program it was asked to become is not running either way.
+    from_status(if e < 0 then e else -5)
+end exec

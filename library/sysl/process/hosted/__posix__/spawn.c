@@ -827,3 +827,101 @@ int sysl_proc_posix_temp_path(char *buf, size_t n) {
     close(fd);
     return 0;
 }
+
+/* Replace this program with `program`, keeping the process, its id and its descriptors. Answers only
+ * where that failed, with an `errno` -- and then this program is exactly as it was: the environment
+ * is built beside the current one rather than into it, and the program is looked for before anything
+ * is given up.
+ *
+ * **The environment and the search are `start_spawned`'s**, so `exec` and `run` agree about which
+ * program a name means and which variables it sees: inheriting, this program's own with each named
+ * variable added or replaced; not inheriting, the named ones alone; a bare name looked for on the
+ * `PATH` the new image will have -- the named one, this program's, or, where a replaced environment
+ * names none, the system's default search path.
+ *
+ * **Every output stream is flushed first.** A C library buffers standard output fully whenever it is
+ * not a terminal, and the buffer lives in the image `execve` throws away -- so text this program
+ * printed just before it became another would otherwise never be written at all.
+ */
+static int replace_image(const char *program, char *const *argv,
+                         const char *const *env_names, const char *const *env_values, int inherit) {
+#if defined(__APPLE__)
+    char **current = *_NSGetEnviron();
+#else
+    extern char **environ;
+    char **current = environ;
+#endif
+    char **made = NULL;
+    int err = 0;
+    char **env = child_environment(env_names, env_values, inherit, current, &made, &err);
+
+    if (err != 0) return err;
+
+    char dirs[1024];
+    const char *search = search_dirs(env_names, env_values, inherit, dirs, sizeof dirs);
+
+    if (!search) search = getenv("PATH");
+
+    if (!search) search = search_dirs(NULL, NULL, 0, dirs, sizeof dirs);
+
+    char where[4096];
+    const char *run = program;
+
+    if (!strchr(program, '/')) {
+        err = found_on(program, search, where, sizeof where);
+        run = where;
+    }
+
+    if (err == 0) {
+        fflush(NULL);
+        execve(run, argv, env ? env : current);
+        err = errno;
+    }
+
+    release_environment(env, made);
+    return err;
+}
+
+/* Become `program` with `argv` (`argc` texts, its own name first) and the `envc` `NAME=VALUE` texts
+ * of `envp`, answering an `errno` only where that failed. The texts are copied into C strings as
+ * `sysl_proc_posix_start` copies them, and freed on the way out of a failure; a success has no way
+ * out, the memory going with the image. */
+int sysl_proc_posix_exec(const char *program, size_t program_len,
+                         const sysl_text *argv, size_t argc, const sysl_text *envp, size_t envc,
+                         int inherit) {
+    made_strings m = { calloc(1 + argc + 2 * envc, sizeof(char *)), 0 };
+    char **args = calloc(argc + 1, sizeof(char *));
+    const char **names = calloc(envc + 1, sizeof(char *));
+    const char **values = calloc(envc + 1, sizeof(char *));
+    int e = (m.owned && args && names && values) ? 0 : ENOMEM;
+
+    const char *path = e == 0 ? keep(&m, program, program_len) : NULL;
+
+    if (!path) e = ENOMEM;
+
+    for (size_t i = 0; i < argc && e == 0; i++) {
+        args[i] = keep(&m, argv[i].ptr, argv[i].len);
+
+        if (!args[i]) e = ENOMEM;
+    }
+
+    for (size_t i = 0; i < envc && e == 0; i++) {
+        const char *at = envp[i].len > 0 ? memchr(envp[i].ptr, '=', envp[i].len) : NULL;
+        size_t name_len = at ? (size_t) (at - envp[i].ptr) : envp[i].len;
+        size_t rest = at ? envp[i].len - name_len - 1 : 0;
+
+        names[i] = keep(&m, envp[i].ptr, name_len);
+        values[i] = keep(&m, at ? at + 1 : "", rest);
+
+        if (!names[i] || !values[i]) e = ENOMEM;
+    }
+
+    if (e == 0) e = replace_image(path, args, names, values, inherit);
+
+    if (m.owned) release_strings(&m);
+
+    free(args);
+    free(names);
+    free(values);
+    return e;
+}

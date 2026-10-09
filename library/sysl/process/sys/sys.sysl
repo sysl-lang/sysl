@@ -1,9 +1,9 @@
 module sysl.process.sys
 
 // The calls `sysl.process` makes of whatever starts programs underneath it: start one, wait for it,
-// send it a signal, name a file nothing else holds for a captured stream to go into, make a pipe for
-// one child's output to be another's input, and say -- or change -- which user and group the program
-// runs as.
+// send it a signal, become one in place of this program, name a file nothing else holds for a captured
+// stream to go into, make a pipe for one child's output to be another's input, and say -- or change --
+// which user and group the program runs as.
 //
 // **Each is an `extern` naming a symbol no module here defines**, so what answers it is decided by
 // what the program is linked with (`reference/ffi.md § A module may supply another module's extern`),
@@ -22,7 +22,8 @@ module sysl.process.sys
 // **A hook answers one integer: what it did, or what went wrong** -- the contract of every `*.sys`
 // module (`sysl.fs.sys`, `sysl.io.sys`).
 // Zero or more is success: a process id for `spawn`, a length for `temp_path`, a user or group id for
-// `get_id`, zero for the others.
+// `get_id`, zero for the others -- except `exec`, whose success is never seen, the program that would
+// have read it being gone.
 // A negative answer is the code of the failure negated -- the `IoError` code `sysl.fs` uses, which on
 // a POSIX host is the `errno` -- so a kernel's system call that already answers a negative error
 // number is the hook as it stands. **A target that cannot perform a call at all answers `UNSUPPORTED`** (`sysl.sys`, -38 on every
@@ -140,3 +141,15 @@ private[sysl] extern "sysl_proc_get_id" get_id(which: int) -> i64
  * `EPERM`. A target with no users answers `UNSUPPORTED`.
  */
 private[sysl] extern "sysl_proc_set_id" set_id(which: int, id: u32) -> int
+
+/** Replaces this program with `path`, keeping its process id and its open descriptors, and answers
+ * only where that failed: the failure's code, negated. **A supplier that succeeds never returns.**
+ *
+ * `argv`, `envp`, `inherit_env` and the `PATH` search mean what they mean for `spawn` -- the vector
+ * is the new image's whole argument vector, its own name first, and a `path` with no `/` in it is
+ * looked for on the `PATH` the new image will have. Everything that can fail is checked before the
+ * image is given up, so a failure leaves the caller as it was. Whatever this program has buffered
+ * on its way to a descriptor is written out first: the image holding the buffer is about to go.
+ */
+private[sysl] extern "sysl_proc_exec" exec(path: *u8, path_len: usize, argv: *Text, argc: usize,
+                                           envp: *Text, envc: usize, inherit_env: int) -> int
