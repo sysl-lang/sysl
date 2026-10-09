@@ -17,7 +17,7 @@ module sysl.fs
 Nothing here is language, and nothing here can be given a body on a target with no filesystem under
 it: every call it makes goes through the hooks of `sysl.fs.sys`, which a hosted target's C library
 answers and a bare machine answers only if the program does
-([below](#answering-the-filesystem-on-a-target-with-no-c-library)). So the clause is not a
+([below](#answering-the-filesystem-on-a-freestanding-target)). So the clause is not a
 warning — it is a fact about which module exists, and it is checked at the **import**:
 
 ```sysl
@@ -915,7 +915,7 @@ owned would be far worse than the failure being reported. A caller needing the d
 whole or not at all copies into `make_temp_dir` and `rename`s the result into place, which is the only
 way to get atomicity from a filesystem.
 
-## Answering the filesystem on a target with no C library
+## Answering the filesystem on a freestanding target
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
 `extern` per call — `sysl_fs_open`, `_read`, `_write`, `_close`, `_seek`, `_fstat`, `_ftruncate`,
@@ -930,8 +930,10 @@ all. `UNSUPPORTED` is a constant in `sysl.sys`, -38 on every platform and delibe
 terminator; what a call produces besides its status it writes through a pointer it was handed.
 
 On a hosted target the library answers them itself, over the C library, under `weak` exports
-([a module may supply another module's extern](/reference/ffi/)). A freestanding target has no C
-library, so a program there answers each hook it reaches with an `@export` of its own:
+([a module may supply another module's extern](/reference/ffi/)). A freestanding target has no
+operating system, so a program there answers each hook it reaches with an `@export` of its own —
+**even where the manifest grants it a C library** ([`libc`](/reference/packages/#capabilities)):
+newlib's `open` and `read` are stubs the board answers, not a filesystem.
 
 ```sysl
 @export("sysl_fs_open")
@@ -942,8 +944,8 @@ k_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int = -38
 one sentence, rather than surfacing at the link as a symbol no line of the program names:
 
 ```
-error: this program reaches 'sysl.fs', and 'aarch64-freestanding' has no C library under it for the
-standard library to answer a filesystem with, so the program answers it: define 'sysl_fs_close',
+error: this program reaches 'sysl.fs', and 'aarch64-freestanding' has no operating system under it for
+the standard library to answer a filesystem with, so the program answers it: define 'sysl_fs_close',
 'sysl_fs_open', 'sysl_fs_read', 'sysl_fs_write' with '@export', each taking what its 'extern' in
 'sysl.fs.sys' declares and answering zero or the code of an 'IoError' negated
 ```

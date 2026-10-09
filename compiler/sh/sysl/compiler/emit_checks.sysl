@@ -346,8 +346,8 @@ check_image_storage(a: &Analysis, p: TProgram, own: Buf[string], entry: string)
 end check_image_storage
 
 // A module of hooks: the `extern`s a part of the standard library makes of whatever is under it, which
-// the library answers over the C library on a hosted target (`seam_supply.sysl`) and a program on a
-// target with no C library answers itself, with an `@export` per symbol.
+// the library answers over the operating system on a hosted target (`seam_supply.sysl`) and a program
+// on a freestanding target answers itself, with an `@export` per symbol.
 private struct HookModule
     // The module declaring the `extern`s.
     hooks: string
@@ -376,12 +376,18 @@ end hook_modules
 
 // **A hook the program reaches, on a target the library answers none of them for.**
 //
-// On a hosted target the library supplies every hook over the C library (`sysl.fs.hosted`,
-// `sysl.io.hosted`). A freestanding target has no C library, so no supplier is taken there and the
-// program answers the hooks with an `@export` per symbol -- and one it reached and left unanswered
-// would otherwise surface at the link as an undefined symbol named nowhere in the program's source. So
-// the hooks still unanswered after pruning are refused here, one sentence per module of hooks. The
-// walk is the reachability one: a program that never reaches a hook is not asked about it.
+// On a hosted target the library supplies every hook over the operating system (`sysl.fs.hosted`,
+// `sysl.io.hosted`). A freestanding target has no operating system, so no supplier is taken there and
+// the program answers the hooks with an `@export` per symbol -- and one it reached and left
+// unanswered would otherwise surface at the link as an undefined symbol named nowhere in the
+// program's source. So the hooks still unanswered after pruning are refused here, one sentence per
+// module of hooks. The walk is the reachability one: a program that never reaches a hook is not
+// asked about it.
+//
+// **A granted `libc` changes none of this.** newlib's `read` and `fopen` are stubs a board answers,
+// not a filesystem, so the hosted answers stay off and the hooks are still the program's -- the
+// refusal says so where the manifest granted one, since that is exactly the reader who will expect
+// otherwise.
 check_library_hooks(a: &Analysis, p: TProgram)
     if os_hosted(a.tables.target.os) || p.funcs.is_empty() then return
 
@@ -409,26 +415,73 @@ private check_hook_module(a: &Analysis, p: TProgram, m: HookModule)
             break
         end if
 
+    // Where the manifest granted a C library, the reader expects it to answer; it does not.
+    val granted = if t.provides_libc() then LibcIsNoOs else ","
+
     a.fault_unplaced(func_home(a, at.name), at.span,
-            s"this program ${m.reaches}, and '${t.name}' has no C library under it for the " +
-            s"standard library to answer ${m.answers_with} with, so the program answers it: define " +
+            s"this program ${m.reaches}, and '${t.name}' has no operating system under it for the " +
+            s"standard library to answer ${m.answers_with} with$granted so the program answers it: define " +
             s"${joined_list(sorted_names(missing))} with '@export', each taking what its 'extern' " +
             s"in '${m.hooks}' declares and answering ${m.answering}")
 end check_hook_module
+
+private const LibcIsNoOs: string =
+    " — the C library its 'libc' capability grants is not an operating system —"
+
+// **Storage on the heap of a type aligned beyond what the allocating pair promises, with nothing to
+// answer the aligned hook.**
+//
+// The lowering asks `sysl_alloc_aligned(size, align)` for such a block and gives it back through
+// `sysl_free_aligned(p)` (`emit_box.sysl`'s `heap_call`), and writes defaults for the two only
+// where the pair is libc's and the C library has an aligned allocation. Anywhere else the program
+// answers them itself, and one it left unanswered would otherwise surface at the link as an
+// undefined symbol named nowhere in its source -- so it is refused here, naming the storage, its
+// boundary and both hooks. Asked straight after the lowering that recorded it (`unaligned_heap`).
+check_aligned_heap(a: &Analysis, p: TProgram)
+    val found = unaligned_heap() match
+        Some(x) -> x
+        None -> return
+
+    val t = a.tables.target
+    val pair = s"'${malloc_symbol()}' and '${free_symbol()}'"
+
+    val no_libc = s"'${t.name}' has no C library with an aligned allocation to answer it"
+    val named = "the program named a heap of its own, so nothing but the program can say how that heap " +
+        "answers a boundary"
+    val why = if aligned_heap_has_libc(t) then named else no_libc
+
+    val msg = s"${found.0}, and the allocating pair ($pair) promises only ${t.heap_align()} — $why. " +
+        s"Define '${aligned_alloc_symbol()}(size: usize, align: usize) -> *u8' and " +
+        s"'${aligned_free_symbol()}(p: *u8)' with '@export', the first answering a block on that " +
+        "boundary and the second giving one back"
+
+    for f in p.funcs
+        if f.name == found.1
+            a.fault(func_home(a, f.name), f.span, msg)
+            return
+        end if
+
+    if p.funcs.is_empty() then return
+
+    a.fault_unplaced(func_home(a, p.funcs.at(0).name), p.funcs.at(0).span, msg)
+end check_aligned_heap
 
 // **A specifier the program reaches that only C's `snprintf` can apply, on a target with no C library
 // to supply one.**
 //
 // An integer specifier is rendered by the library's `sysl.fmt.format_int` on every target, so what
 // still goes to C is a float conversion -- a specifier or a plain hole of a float, which
-// `sysl.str.float` renders -- and a `%s` over a string, and on a freestanding target either
-// would otherwise surface at the link as an undefined `snprintf` named nowhere in the program's
-// source. So each one reached is refused here, at the specifier, naming it and the target. The walk
-// is the reachability one, so a specifier in a function nothing reaches is not asked about.
+// `sysl.str.float` renders -- and a `%s` over a string, and on a target without the `libc`
+// capability either would otherwise surface at the link as an undefined `snprintf` named nowhere in
+// the program's source. So each one reached is refused here, at the specifier, naming it and the
+// target, and saying how a manifest grants the C library a board does have. The walk is the
+// reachability one, so a specifier in a function nothing reaches is not asked about.
 check_c_formatting(a: &Analysis, p: TProgram)
     val t = a.tables.target
 
-    if os_hosted(t.os) then return
+    if t.provides_libc() then return
+
+    val grant = libc_grant_advice(t)
 
     for f in p.funcs
         var found: Buf[TExpr] = buf()
@@ -445,16 +498,26 @@ check_c_formatting(a: &Analysis, p: TProgram)
                     a.fault(func_home(a, f.name), e.span,
                             s"'$spec' is applied by C's 'snprintf', and '${t.name}' has no C library " +
                             "under it to supply one — only an integer specifier is rendered without " +
-                            "C. Render the value another way: a plain hole of a string needs no C")
+                            "C. Render the value another way: a plain hole of a string needs no C" +
+                            grant)
                 TStr(arg) ->
                     a.fault(func_home(a, f.name), e.span,
                             s"a plain hole of ${type_show(texpr_type(arg))} is rendered by C's " +
                             s"'snprintf', and '${t.name}' has no C library under it to supply one — " +
                             "only an integer is rendered without C. Render the value another way: " +
-                            "a plain hole of an integer or a string needs no C")
+                            "a plain hole of an integer or a string needs no C" + grant)
                 _ -> ()
     end for
 end check_c_formatting
+
+// The tail of every "no C library" refusal: how a manifest says the machine has one after all. A
+// call C answers is legal wherever the target's `libc` capability stands, and on a freestanding
+// target it stands only where the manifest grants it. Every such refusal asks `provides_libc`, never
+// whether the target is hosted.
+libc_grant_advice(t: Target) -> string =
+    s"; or, if '${t.name}' does have a C library under it (newlib under a Pico SDK build, " +
+    s"Zephyr, FreeRTOS), grant it in package.hocon: " +
+    s"'targets { ${t.name} { capabilities { libc = true } } }'"
 
 private note_c_format(e: TExpr, sink: *Buf[TExpr])
     *e.kind match

@@ -331,8 +331,9 @@ print(find_byte("a,b".bytes, u8(',')).unwrap(), find_byte("abc".bytes, u8('z')).
 
 That function is [what pointer difference is for](/reference/memory/): `memchr` answers *where* with
 an address, and an index is that address minus the first. It is public because a program scanning for
-a delimiter of its own wants exactly it. On a target with no C library there is no `memchr` to call,
-so there it walks the bytes, and the answer is the same.
+a delimiter of its own wants exactly it. On a freestanding target it does not ask for `memchr` —
+not even where the manifest grants a C library (`libc`), since the choice is made when the library is
+compiled for the machine — so there it walks the bytes, and the answer is the same.
 
 **An empty read ends the cursor for good.** A caller reading again past the end gets `None` every
 time rather than a second chance, which is right for the sources `read(2)` serves.
@@ -519,8 +520,9 @@ the mirror of [`ByteSink`](/library/buf/) being the only writer that keeps what 
 
 **That symmetry is what makes the freestanding story short.** `FdReader` reads through one hook,
 `sysl_io_read` in `sysl.io.sys`, and `flush` pushes standard output out through another,
-`sysl_io_flush`; on a hosted target the library answers both over C's `read` and `fflush`. A target
-with no C library answers them itself, with an `@export` each, beside the `putchar` that `print`
+`sysl_io_flush`; on a hosted target the library answers both over C's `read` and `fflush`. A
+freestanding target answers them itself — a C library its manifest grants (`libc`) being no operating
+system, it changes nothing here — with an `@export` each, beside the `putchar` that `print`
 writes through — a `read` system call is usually the whole of the first, and the second answers zero
 where nothing is held back:
 

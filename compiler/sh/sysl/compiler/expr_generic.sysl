@@ -65,15 +65,15 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
         var known: Buf[Binding] = buf()
 
         for i in 0..<authored.len()
-            known.push(Binding(authored.at(i), written_type_arg(cx, targ_exprs.at(i))))
+            known.push(Binding(authored.at(i), written_arg_for(cx, f, authored.at(i), targ_exprs.at(i))))
 
         return generic_call_with(cx, span, written, key, f, args, expected, true, known)
     end if
 
     var targs: Buf[Type] = buf()
 
-    for targ_expr in targ_exprs
-        targs.push(written_type_arg(cx, targ_expr))
+    for i in 0..<targ_exprs.len()
+        targs.push(written_arg_for(cx, f, authored.at(i), targ_exprs.at(i)))
 
     // **A BOUND IS RESOLVED WHERE IT WAS WRITTEN, WHICH IS THE DECLARATION'S SCOPE AND NOT THE
     // CALLER'S.** `sysl.math.is_power_of_two[T: Bits + Ord]` writes `Bits` bare, and a caller that
@@ -121,6 +121,23 @@ end written_generic_call
 // One type argument as a **call** writes it, which is an expression: brackets in an expression are
 // indexing, so what a reader writes between them here is read back as the type it names.
 written_type_arg(cx: &Analyzer, e: Expr) -> Type = type_arg_read(cx, e, false)
+
+// One written argument of a generic function, read against the parameter it fills: where the
+// declaration wrote `const` of a simple enum, the argument is one of its variants -- bare, the
+// parameter's type saying which enum, or qualified -- and otherwise it reads as any type argument.
+private written_arg_for(cx: &Analyzer, f: Func, name: string, e: Expr) -> Type
+    val declared = binding_named(f.decl.tvalues, name)
+
+    if declared.is_some()
+        val ty = nameless(resolve_type(cx.an, f.scope, declared.unwrap(), no_bindings()))
+
+        ty match
+            Enum(_) -> return enum_value_arg(cx.an, cx.scope, anchor_of(e), e, ty, cx.subst)
+            _ -> ()
+    end if
+
+    written_type_arg(cx, e)
+end written_arg_for
 
 // The same at an address, `&f[T]`, whose refusal advises writing the type on the binding instead,
 // there being no call to infer anything from.

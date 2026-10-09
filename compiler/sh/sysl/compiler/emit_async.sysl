@@ -50,6 +50,9 @@ struct CoroCtx
     final_label: string
     free_label: string
     out_label: string
+
+    // Whether the frame came from the aligned hook, so goes back through its free (`frame_align`).
+    aligned: bool
 end CoroCtx
 
 // The two symbols a frame's storage comes from and goes back to.
@@ -203,8 +206,18 @@ begin_coroutine(e: *Emit, f: TFunc)
     size_arg.push(ir_arg(word_lty(e), size))
 
     val mem = fresh_reg(e)
+    val boundary = frame_align(e, f)
+    val aligned = boundary > e.layout.heap_align()
 
-    coro_call(e, Some(mem), LPtr, task_alloc_symbol(), size_arg)
+    if aligned
+        size_arg.push(ir_arg(word_lty(e), VInt(from_int(long(boundary)))))
+        coro_call(e, Some(mem), LPtr, aligned_alloc_symbol(), size_arg)
+        note_aligned_heap(e, s"the frame of the task '${f.name}' asks for the $boundary-byte boundary " +
+            "a value it holds is aligned on", boundary)
+    else
+        coro_call(e, Some(mem), LPtr, task_alloc_symbol(), size_arg)
+    end if
+
     emit(e, InStore(LPtr, mem, mem_slot, AccPlain, None))
     emit_term(e, InBr("task.begin"))
     emit_label(e, "task.begin")
@@ -226,8 +239,44 @@ begin_coroutine(e: *Emit, f: TFunc)
     emit(e, InStore(word_lty(e), VInt(from_int(1)), field_addr(e, shape, promise, 2), AccPlain, None))
     emit(e, InStore(LPtr, hdl, field_addr(e, shape, promise, task_handle_field()), AccPlain, None))
 
-    e.coro = Some(CoroCtx(promise, result, id, hdl, "task.final", "task.free", "task.out"))
+    e.coro = Some(CoroCtx(promise, result, id, hdl, "task.final", "task.free", "task.out", aligned))
 end begin_coroutine
+
+// The boundary a coroutine's frame has to begin on: the widest of its parameters, its locals and
+// every value its body computes, any of which LLVM may keep in the frame across a suspension. Where
+// that is beyond what the allocating pair promises, the frame comes from the aligned hook rather
+// than `sysl_task_alloc` (whose contract is the pair's boundary), and goes back through its free.
+private frame_align(e: *Emit, f: TFunc) -> usize
+    val l = e.layout
+    var seen: Buf[usize] = buf()
+    val sink = &seen
+
+    for p in f.params
+        sink.push(l.align(p.1))
+
+    val v: &TWalk = TWalk(false, (x) -> sink.push(l.align(texpr_type(x))), (w) -> (),
+                  (s) -> frame_decl_align(l, s, sink))
+
+    walk_stmts(f.body.stmts, v)
+
+    if f.body.result.is_some() then walk_texpr(f.body.result.unwrap(), v)
+
+    var widest: usize = 1
+
+    for a in seen
+        if a > widest then widest = a
+
+    widest
+end frame_align
+
+private frame_decl_align(l: TargetLayout, s: TStmt, sink: *Buf[usize]) = s match
+    TVarDecl(_, ty, _, align) ->
+        sink.push(l.align(ty))
+
+        align match
+            Some(a) -> sink.push(a)
+            None -> ()
+    _ -> ()
 
 // What an async function's body ends with. The typed function carries the type its body was read
 // against, which is the `T` of the `Task[T]` its callers receive.
@@ -310,7 +359,7 @@ finish_coroutine(e: *Emit)
     emit(e, InIntCmp(none, IEq, LPtr, m, VNull))
     emit_term(e, InCondBr(none, c.out_label, give))
     emit_label(e, give)
-    coro_call(e, None, LVoid, task_free_symbol(), one_ptr(m))
+    coro_call(e, None, LVoid, if c.aligned then aligned_free_symbol() else task_free_symbol(), one_ptr(m))
     emit_term(e, InBr(c.out_label))
 
     emit_label(e, c.out_label)
@@ -857,8 +906,8 @@ request_task_storage(e: *Emit, p: TProgram)
 end request_task_storage
 
 // Whether the program already says what this symbol is, by exporting a function under it or by
-// declaring it `extern`.
-private claimed_symbol(e: *Emit, p: TProgram, sym: string) -> bool
+// declaring it `extern`. The aligned hook asks it too (`emit_box.sysl`).
+claimed_symbol(e: *Emit, p: TProgram, sym: string) -> bool
     for export_symbol in e.export_symbols
         if export_symbol.1 == sym then return true
 
