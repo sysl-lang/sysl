@@ -56,9 +56,103 @@ codegen_features_key() -> string
 
     if cf_general_regs_only then out = out + "-gro"
     if cf_strict_align then out = out + "-sa"
+    if cf_thread_pointer != "" then out = out + s"-tp.$cf_thread_pointer"
+    if cf_per_cpu_offset != "" then out = out + s"-pc.$cf_per_cpu_offset"
 
     out
 end codegen_features_key
+
+// -- the registers a bare image owns ----------------------------------------------------------------
+
+// **Two more settings, both naming a register the program writes itself**: `thread_pointer`, the
+// register a `@thread_local`'s local-exec offset is read from, and `per_cpu_offset`, the register
+// holding this core's offset from the `.percpu` image (`reference/attributes.md § @thread_local`,
+// `§ @per_cpu`). On a hosted machine the loader and the operating system own the thread pointer and
+// move threads between cores at will, so both are AArch64 and freestanding only.
+struct MachineRegisters
+    thread_pointer: Option[string]
+    per_cpu_offset: Option[string]
+end MachineRegisters
+
+no_machine_registers() -> MachineRegisters = MachineRegisters(None, None)
+
+// Whether `word` names a register setting a `codegen` block may hold.
+is_register_setting(word: string) -> bool = word == "thread_pointer" || word == "per_cpu_offset"
+
+// The registers either setting may name: the four software thread-ID registers, by the name
+// `mrs` and LLVM's `-mtp` both take, and the read-only one EL0 cannot write.
+private register_names() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("tpidr_el0")
+    out.push("tpidrro_el0")
+    out.push("tpidr_el1")
+    out.push("tpidr_el2")
+    out.push("tpidr_el3")
+    out
+end register_names
+
+// Why `name` cannot be what a register setting names, or nothing where it can.
+register_name_refusal(where: string, name: string) -> Option[string]
+    for known in register_names()
+        if known == name then return None
+
+    Some(s"'$where' is '$name', which is not a register a program can keep a pointer in — the " +
+         "five are 'tpidr_el0', 'tpidrro_el0', 'tpidr_el1', 'tpidr_el2' and 'tpidr_el3'")
+end register_name_refusal
+
+private var cf_thread_pointer: string = ""
+private var cf_per_cpu_offset: string = ""
+
+// The register a `@thread_local`'s offset is read from where the program owns it, or nothing.
+thread_pointer_register() -> Option[string] =
+    if cf_thread_pointer == "" then None else Some(cf_thread_pointer)
+
+// The register holding this core's offset from the `.percpu` image, or nothing.
+per_cpu_register() -> Option[string] = if cf_per_cpu_offset == "" then None else Some(cf_per_cpu_offset)
+
+use_machine_registers(r: MachineRegisters)
+    cf_thread_pointer = r.thread_pointer.unwrap_or("")
+    cf_per_cpu_offset = r.per_cpu_offset.unwrap_or("")
+end use_machine_registers
+
+// Why `r` cannot be built for `t`, or nothing where it can.
+machine_register_refusal(t: Target, r: MachineRegisters) -> Option[string]
+    var named: Buf[(string, string)] = buf()
+
+    if r.thread_pointer.is_some() then named.push(("thread_pointer", r.thread_pointer.unwrap()))
+    if r.per_cpu_offset.is_some() then named.push(("per_cpu_offset", r.per_cpu_offset.unwrap()))
+
+    for setting in named
+        if t.cpu != Aarch64
+            return Some(s"'codegen.${setting.0}' names an AArch64 register, and '${t.name}' is not " +
+                "an AArch64 machine")
+
+        if t.os != Freestanding
+            return Some(s"'codegen.${setting.0}' does not apply to '${t.name}': a hosted machine's " +
+                "operating system owns the thread registers and moves threads between cores, so " +
+                "'@thread_local' already works there and nothing the program writes would stay put")
+
+    if r.thread_pointer.is_some() && r.thread_pointer.unwrap() == r.per_cpu_offset.unwrap_or("")
+        return Some(s"'codegen.thread_pointer' and 'codegen.per_cpu_offset' both name " +
+            s"'${r.thread_pointer.unwrap()}', and one register cannot hold a thread's block and a " +
+            "core's offset at once — a thread moves between cores. Give each its own")
+
+    None
+end machine_register_refusal
+
+// What clang's `-mtp` calls the register, which is also how the back end's feature is spelled.
+private mtp_word(register: string) -> string =
+    if register == "tpidrro_el0" then "tpidrro_el0" else register[6..<register.bytes.len]
+
+// The target feature that moves the back end's thread pointer, or nothing for its default.
+private thread_pointer_feature() -> Option[string]
+    if cf_thread_pointer == "" || cf_thread_pointer == "tpidr_el0" then return None
+
+    if cf_thread_pointer == "tpidrro_el0" then return Some("+tpidrro-el0")
+
+    Some(s"+tpidr-${mtp_word(cf_thread_pointer)}")
+end thread_pointer_feature
 
 // Why `f` cannot be built for `t`, or nothing where it can.
 //
@@ -125,6 +219,10 @@ codegen_feature_flags(t: Target) -> Buf[string]
         elif t.cpu == Aarch64 || t.cpu == Riscv64 || t.cpu == Riscv32
             out.push("-mstrict-align")
 
+    // A package's carried C is compiled against the same thread pointer, so a `_Thread_local` there
+    // and a `@thread_local` here read one block.
+    if cf_thread_pointer != "" && t.cpu == Aarch64 then out.push(s"-mtp=${mtp_word(cf_thread_pointer)}")
+
     out
 end codegen_feature_flags
 
@@ -140,6 +238,11 @@ codegen_feature_attribute(t: Target) -> Option[string]
     var parts: Buf[string] = buf()
 
     if cf_strict_align && t.cpu == Aarch64 then parts.push("+strict-align")
+
+    if t.cpu == Aarch64
+        thread_pointer_feature() match
+            Some(f) -> parts.push(f)
+            None -> ()
 
     if cf_general_regs_only
         if t.cpu == Aarch64

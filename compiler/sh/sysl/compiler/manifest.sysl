@@ -124,12 +124,18 @@ struct Manifest
     // whole image, so a dependency's block is read for its shape and otherwise ignored.
     codegen: Buf[(string, bool)]
     target_codegen: Buf[(string, string, bool)]
+
+    // The same block's register settings -- `thread_pointer` and `per_cpu_offset`, each naming a
+    // register as `(setting, register)` -- and the per-target layer over them, `(target, setting,
+    // register)`. Root project only, as the flags are.
+    codegen_registers: Buf[(string, string)]
+    target_codegen_registers: Buf[(string, string, string)]
 end Manifest
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
-             buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf())
+             buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf(), buf(), buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -445,6 +451,7 @@ read_manifest(text: string) -> Result[Manifest, string]
 
     var target_capabilities: Buf[(string, string, bool)] = buf()
     var target_codegen: Buf[(string, string, bool)] = buf()
+    var target_codegen_registers: Buf[(string, string, string)] = buf()
     var targets: Buf[(string, string)] = buf()
     var images: Buf[ImageLink] = buf()
 
@@ -480,8 +487,12 @@ read_manifest(text: string) -> Result[Manifest, string]
                     Some(block) ->
                         val settings = read_codegen(block, s"targets.${named.at(i)}.codegen")?
 
-                        for j in 0..<settings.len()
-                            target_codegen.push((named.at(i), settings.at(j).0, settings.at(j).1))
+                        for j in 0..<settings.0.len()
+                            target_codegen.push((named.at(i), settings.0.at(j).0, settings.0.at(j).1))
+
+                        for j in 0..<settings.1.len()
+                            target_codegen_registers.push((named.at(i), settings.1.at(j).0,
+                                                           settings.1.at(j).1))
 
     val dependencies = read_dependencies(root, "dependencies")?
     val dev = read_dependencies(root, "dev_dependencies")?
@@ -495,9 +506,16 @@ read_manifest(text: string) -> Result[Manifest, string]
     val lto = read_lto(root)?
     val bounds_locations = read_bounds_locations(root)?
 
-    val codegen = conf_at(root, "codegen") match
-        None -> buf()
-        Some(block) -> read_codegen(block, "codegen")?
+    var codegen: Buf[(string, bool)] = buf()
+    var codegen_registers: Buf[(string, string)] = buf()
+
+    conf_at(root, "codegen") match
+        None -> ()
+        Some(block) ->
+            val settings = read_codegen(block, "codegen")?
+
+            codegen = settings.0
+            codegen_registers = settings.1
 
     val has_package = conf_at(root, "package").is_some()
     val workspace = read_workspace(root)?
@@ -516,7 +534,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
                 target_capabilities, pkg_config, headers, defines, targets, allocator, features,
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
-                images, codegen, target_codegen))
+                images, codegen, target_codegen, codegen_registers, target_codegen_registers))
 end read_manifest
 
 // The `bounds_locations` key: `true`, the default, or `false` to leave every failed bounds check's
@@ -538,23 +556,44 @@ end read_bounds_locations
 // `codegen_features.sysl` knows, `true` or `false`. **A name it does not know is refused rather than
 // warned about**, unlike a top-level key -- a misspelled `general_reg_only` would otherwise build an
 // image that touches the floating-point registers its author believed were off.
-private read_codegen(block: &Conf, where: string) -> Result[Buf[(string, bool)], string]
+//
+// **A register setting names its register as text** (`thread_pointer = "tpidr_el1"`), checked here
+// against the registers there are; whether the machine has them is the driver's question.
+private read_codegen(block: &Conf,
+                     where: string) -> Result[(Buf[(string, bool)], Buf[(string, string)]), string]
     if !conf_is_block(block)
         return Err(s"'$where' is not a block — it is written 'codegen { general_regs_only = true }'")
 
     var out: Buf[(string, bool)] = buf()
+    var registers: Buf[(string, string)] = buf()
     val keys = conf_keys(block)
 
     for i in 0..<keys.len()
-        if !is_codegen_setting(keys.at(i))
-            return Err(s"'$where.${keys.at(i)}' is not a code generation setting — the settings are " +
-                "'general_regs_only' and 'strict_align'")
+        val key = keys.at(i)
 
-        *conf_at(block, keys.at(i)).unwrap() match
-            Flag(on) -> out.push((keys.at(i), on))
-            _ -> return Err(s"'$where.${keys.at(i)}' must be true or false")
+        if is_register_setting(key)
+            val named = *conf_at(block, key).unwrap() match
+                Text(t) -> t
+                Word(w) -> w
+                _ -> return Err(s"'$where.$key' names a register, as 'tpidr_el1'")
 
-    Ok(out)
+            register_name_refusal(s"$where.$key", named) match
+                Some(why) -> return Err(why)
+                None -> ()
+
+            registers.push((key, named))
+            continue
+        end if
+
+        if !is_codegen_setting(key)
+            return Err(s"'$where.$key' is not a code generation setting — the settings are " +
+                "'general_regs_only', 'strict_align', 'thread_pointer' and 'per_cpu_offset'")
+
+        *conf_at(block, key).unwrap() match
+            Flag(on) -> out.push((key, on))
+            _ -> return Err(s"'$where.$key' must be true or false")
+
+    Ok((out, registers))
 end read_codegen
 
 // What the manifest says about one code generation setting on the machine `target`: the target's
@@ -568,6 +607,18 @@ codegen_given(m: &Manifest, target: string, setting: string) -> bool
 
     false
 end codegen_given
+
+// What the manifest says about one register setting on the machine `target`: the target's own
+// `codegen` block over the project's, and nothing where neither names one.
+codegen_register_given(m: &Manifest, target: string, setting: string) -> Option[string]
+    for row in m.target_codegen_registers
+        if row.0 == target && row.1 == setting then return Some(row.2)
+
+    for row in m.codegen_registers
+        if row.0 == setting then return Some(row.1)
+
+    None
+end codegen_register_given
 
 // The `workspace` list: the members' directories, relative to the file. **A list and nothing else**
 // -- the members are the whole of what a workspace says, and a value of any other shape was written

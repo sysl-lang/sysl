@@ -304,8 +304,8 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // **A top-level `var` is the module's storage**, wherever it was written. The one file
         // where it is a local instead is the one the program starts in, and that file's bindings
         // never reach this walk.
-        VarDecl(name, typ, init, vis, align, section, thread_local) ->
-            hoist_storage(a, scope, s.span, name, typ, vis, init, align, section, thread_local)
+        VarDecl(name, typ, init, vis, align, section, copies) ->
+            hoist_storage(a, scope, s.span, name, typ, vis, init, align, section, copies)
         // **The back end's namespace holds code, never storage**: left alone this emits
         // `@llvm.x = external global`, which the verifier refuses for a reason nobody would trace
         // back to the line that caused it.
@@ -318,7 +318,7 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
                 check_foreign_symbol(a, scope, s.span, link.unwrap_or(name), link.is_some())
 
             hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.extern_vars,
-                        "'extern' variable", None, None, None, false, link, needs)
+                        "'extern' variable", None, None, None, OneCopy, link, needs)
         ExternDecl(d) -> hoist_extern(a, scope, s.span, d)
         // A bare-arrow parameter is sugar for a bounded type parameter, and the rewrite happens
         // at the declaration so that everything after it is the generic machinery that exists.
@@ -369,7 +369,7 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
 // Module storage: a `val` that may be written to, which is what a top-level `var` declares.
 private hoist_storage(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
                       vis: Visibility, init: Option[Expr], align: Option[Expr],
-                      section: Option[string], thread_local: bool)
+                      section: Option[string], copies: Copies)
     // The rule a module `val` meets, biting harder: module storage written with `var` may have no
     // initializer at all for a type to be read off.
     if typ.is_none() then
@@ -377,7 +377,7 @@ private hoist_storage(a: &Analysis, scope: Scope, span: Span, name: string, typ:
                 s"write '$name: T'")
 
     hoist_value(a, scope, span, name, typ, vis, a.tables.vals, "'var'", init, align, section,
-                thread_local)
+                copies)
     a.tables.writable.push(file_private_key(a, scope.src.name,
                                             module_qualify(scope.module_name, name)))
 
@@ -573,7 +573,7 @@ type_name_taken(a: &Analysis, key: string, written: string) -> bool =
 private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
                     vis: Visibility, into: &Table[ValueDecl], what: string, init: Option[Expr],
                     align: Option[Expr] = None, section: Option[string] = None,
-                    thread_local: bool = false, link: Option[string] = None,
+                    copies: Copies = OneCopy, link: Option[string] = None,
                     needs: Buf[string] = buf())
     val plain = module_qualify(scope.module_name, name)
     val key = decl_key(a, scope, plain, vis)
@@ -595,7 +595,8 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
         return
     end if
 
-    into.put(key, ValueDecl(name, typ, vis, span, scope, init, align, section, thread_local,
+    into.put(key, ValueDecl(name, typ, vis, span, scope, init, align, section,
+                            copies == CopyPerThread, copies == CopyPerCpu,
                             link, needs))
     record_access(a, scope, span, key, vis)
 
