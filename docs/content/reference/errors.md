@@ -436,7 +436,7 @@ invariant.
 |---|---|
 | an out-of-bounds array or slice index | `xs[5]` on a `[3]int` |
 | an inverted or out-of-range slice range | `xs[3..1]`, `xs[0..9]` |
-| a checked cast that fails | `char(u)` on an invalid scalar, `Color(n)` on an undeclared discriminant |
+| a checked cast that fails | `char(u)` on an invalid scalar, `Color(n)` on an undeclared discriminant, a bitfield's enum field holding one |
 | an integer divide by zero | `n / 0`, `n % 0` |
 | a violated `require` or `ensure` | below |
 | a violated struct `invariant` | below |

@@ -1,0 +1,194 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{join, Search}
+
+// **A bitfield struct's enum field is held to its variants where it is read** (`bounds_fail.sysl`'s
+// `check_variant`, called from `emit_expr.sysl`'s `gen_field`). The bits were put there by hardware or
+// a cast, and a width with values no variant covers can hold one of them: unchecked, `Image` named
+// the wrong variant (an ESR exception class of 0x2a printed as `Brk`) and a `match` trapped with no
+// word. The read is now `E(n)`'s check, reporting the way a failed bounds check does before it traps.
+// `Pos`, `Succ`, `Pred` and `Image` make the same check of a value that reached them some other way.
+//
+// Every program is built at `-O0` and at the default level, as the bounds-message tests are.
+
+private bev_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The tree built at `level` and run: its status, what it printed, and what it wrote to standard error.
+private bev_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-bev").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end bev_run
+
+// At both levels, the program stops on SIGTRAP having printed `printed` and written exactly `said`.
+private bev_traps_saying(text: string, printed: string, said: string)
+    if !bev_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = bev_run(text, level)
+
+        assert_eq(err, said)
+        assert_eq(out, printed)
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state, having printed '$out'")
+end bev_traps_saying
+
+// At both levels, the program exits cleanly having printed `printed` and nothing on standard error.
+private bev_prints(text: string, printed: string)
+    if !bev_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = bev_run(text, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end bev_prints
+
+// The exception-class register of the finding: six bits of class, about two dozen defined, and two
+// declared here. `raw` holds `class` in bits 26..<32, and `body` is what the program does with it.
+private bev_esr(class: int, body: string) -> string =
+    "enum Ec: u6\n" +
+    "    Unknown = 0x00\n" +
+    "    Brk = 0x3c\n" +
+    "\n" +
+    "@packed\n" +
+    "struct Esr\n" +
+    "    low: u26\n" +
+    "    ec: Ec\n" +
+    "    high: u32\n" +
+    "\n" +
+    s"var raw: u64 = u64($class) << 26\n" +
+    "val e: *Esr = ptr_cast(&raw)\n" +
+    body
+
+// -- a field holding no variant ---------------------------------------------------------------------
+
+@test("an enum field holding no variant's value is not named as one: Image of the read traps, saying where")
+bev_image_of_a_field_holding_no_variant()
+    // Before the check this printed `Brk 42`.
+    bev_traps_saying(bev_esr(0x2a, "print(Ec::Image(e.ec), u8(e.ec))\n"),
+                     "", "value 42 is not one of the enum's variants (main.sysl:13:19)\n")
+
+@test("a direct read of an enum field holding no variant's value traps at the read, with its location")
+bev_a_direct_read_of_a_field_holding_no_variant()
+    bev_traps_saying(bev_esr(0x2a, "val c = e.ec\nprint(\"after\")\nprint(u8(c))\n"),
+                     "", "value 42 is not one of the enum's variants (main.sysl:13:11)\n")
+
+@test("a match on an enum field holding no variant's value traps at the read, saying why, not in the match")
+bev_a_match_on_a_field_holding_no_variant()
+    bev_traps_saying(bev_esr(0x2a, "print(e.ec match\n    Unknown -> \"unknown\"\n    Brk -> \"brk\")\n"),
+                     "", "value 42 is not one of the enum's variants (main.sysl:13:9)\n")
+
+@test("an enum field holding a variant's value reads as before, through Image, a conversion and a match")
+bev_a_field_holding_a_variant_reads_as_before()
+    bev_prints(bev_esr(0x3c, "print(Ec::Image(e.ec), u8(e.ec))\n" +
+                             "print(e.ec match\n    Unknown -> \"unknown\"\n    Brk -> \"brk\")\n"),
+               "Brk 60\nbrk\n")
+    bev_prints(bev_esr(0, "print(Ec::Image(e.ec), Ec::Pos(e.ec))\n"), "Unknown 0\n")
+
+@test("a write to an enum field and the read back agree, the bits beside it untouched")
+bev_a_written_field_reads_back()
+    bev_prints(bev_esr(0, "e.ec = Brk\nprint(Ec::Image(e.ec), raw >> 26)\n"), "Brk 60\n")
+
+// -- a value no variant has, arriving some other way -------------------------------------------------
+
+@test("Image of an enum value no variant has, read through a cast pointer, traps rather than naming the last")
+bev_image_of_a_cast_value()
+    bev_traps_saying("enum Color: u8\n    Red\n    Green\n    Blue\n\n" +
+                     "var raw: u8 = 9\nval p: *Color = ptr_cast(&raw)\nprint(Color::Image(*p))\n",
+                     "", "value 9 is not one of the enum's variants (main.sysl:8:20)\n")
+
+@test("Pos, Succ and Pred of an enum value no variant has trap too, and of a valid one answer as before")
+bev_pos_succ_pred_of_a_cast_value()
+    val decl = "enum Color: u8\n    Red = 2\n    Green = 5\n    Blue = 9\n\n"
+
+    bev_traps_saying(decl + "var raw: u8 = 4\nval p: *Color = ptr_cast(&raw)\nprint(Color::Pos(*p))\n",
+                     "", "value 4 is not one of the enum's variants (main.sysl:8:18)\n")
+    bev_traps_saying(decl + "var raw: u8 = 4\nval p: *Color = ptr_cast(&raw)\n" +
+                     "print(Color::Image(Color::Succ(*p)))\n",
+                     "", "value 4 is not one of the enum's variants (main.sysl:8:32)\n")
+    bev_traps_saying(decl + "var raw: u8 = 4\nval p: *Color = ptr_cast(&raw)\n" +
+                     "print(Color::Image(Color::Pred(*p)))\n",
+                     "", "value 4 is not one of the enum's variants (main.sysl:8:32)\n")
+    bev_prints(decl + "var raw: u8 = 5\nval p: *Color = ptr_cast(&raw)\n" +
+               "print(Color::Pos(*p), Color::Image(Color::Succ(*p)), Color::Image(Color::Pred(*p)))\n",
+               "1 Blue Red\n")
+
+@test("a signed enum's value is reported with its sign")
+bev_a_signed_value_is_reported_with_its_sign()
+    bev_traps_saying("enum Dir: i8\n    Back = -1\n    Ahead = 1\n\n" +
+                     "var raw: i8 = -5\nval p: *Dir = ptr_cast(&raw)\nprint(Dir::Image(*p))\n",
+                     "", "value -5 is not one of the enum's variants (main.sysl:7:18)\n")
+
+// -- what is emitted ----------------------------------------------------------------------------------
+
+private bev_emit(text: string) -> (int, string)
+    val root = make_temp_dir("sysl-bev").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "emit-llvm", s"$root/main.sysl"], (line) -> sink.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    (code, join(lines.view(), "\n"))
+end bev_emit
+
+@test("an enum whose variants cover every value of its width is read with no check at all")
+bev_a_covering_enum_has_no_check()
+    if !bev_ready() then return
+
+    val covered = bev_emit("enum Bit: u1\n    Off\n    On\n\n@packed\nstruct R\n    b: Bit\n    rest: u7\n\n" +
+                           "var raw: u8 = 1\nval r: *R = ptr_cast(&raw)\nprint(Bit::Image(r.b))\n")
+
+    assert_eq(covered.0, 0)
+    assert(!covered.1.contains("sysl.enum.check"), covered.1)
+
+    val partial = bev_emit(bev_esr(0x3c, "print(Ec::Image(e.ec))\n"))
+
+    assert_eq(partial.0, 0)
+    assert(partial.1.contains("define private void @sysl.enum.check."), partial.1)
+    assert(partial.1.contains("  call void @sysl.enum.check."), partial.1)
+end bev_a_covering_enum_has_no_check
+
+@test("the oracle sweeps take the variant check out of this compiler's text and nothing else")
+bev_the_normalisation_takes_out_the_check()
+    val theirs = "define void @f(i8 %x) {\nentry:\n  ret void\n}\n"
+    val ours = "define void @f(i8 %x) {\nentry:\n" +
+               "  call void @sysl.enum.check.m.Ec(i8 %x, ptr @.loc0)\n" +
+               "  ret void\n}\n\n" +
+               "define private void @sysl.enum.check.m.Ec(i8 %v, ptr %at) {\nentry:\n" +
+               "  br i1 true, label %ok, label %bad\nbad:\n  call void @llvm.trap()\n  unreachable\n" +
+               "ok:\n  ret void\n}\n\n" +
+               "declare void @llvm.trap()\n"
+
+    assert_eq(ours_without_the_bounds_report(ours, theirs), theirs + "\n")
+
+    // A trap the reference declares too stays, and so does any other call.
+    val trapping = theirs + "\ndeclare void @llvm.trap()\n"
+
+    assert(ours_without_the_bounds_report(trapping, trapping).contains("@llvm.trap"))
+    assert(ours_without_the_bounds_report("  call void @sysl.other(i8 %x)\n", "")
+               .contains("@sysl.other"))
+end bev_the_normalisation_takes_out_the_check

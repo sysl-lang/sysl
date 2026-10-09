@@ -24,6 +24,14 @@ gen_enum_attr(e: *Emit, kind: string, en: Type, arg: TExpr) -> Val
     val uw = lty(e, d.unwrap().underlying)
     val v = gen_expr(e, arg)
 
+    // The four asked of a value answer by comparing it against the tags, and a value no tag matches
+    // would fall to the last entry -- a wrong answer rather than none. Such a value only arrives
+    // through storage nothing checked, and it stops here as it would at `E(n)`.
+    // A value one of the checked forms just produced is one of the variants already.
+    if (kind == "Pos" || kind == "Succ" || kind == "Pred" || kind == "Image") && !made_checked(arg)
+        check_variant(e, en, v, arg.span)
+    end if
+
     kind match
         "Pos" -> chain_tested(e, l_i32(), positions(vs), uw, v, tags(vs))
         "Val" -> gen_attr_val(e, vs, uw, v)
@@ -33,6 +41,13 @@ gen_enum_attr(e: *Emit, kind: string, en: Type, arg: TExpr) -> Val
         "Value" -> gen_attr_value(e, vs, uw, v)
         other -> gap_at(e, s"the enum attribute '$other'")
 end gen_enum_attr
+
+// Whether a value came out of a form that only ever produces one of the enum's variants: `E(n)`,
+// and every attribute that answers with a value of the enum.
+private made_checked(x: TExpr) -> bool = *x.kind match
+    TEnumFromInt(_, _) -> true
+    TEnumAttr(k, _, _, _) -> k == "Succ" || k == "Pred" || k == "Val" || k == "Value"
+    _ -> false
 
 // A `select` chain over the variant list, folded from the last entry back: entry `i`'s test selects
 // entry `i`'s result, and the last entry is the default reached when nothing earlier matched --

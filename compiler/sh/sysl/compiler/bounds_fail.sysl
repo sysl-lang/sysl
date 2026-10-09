@@ -55,6 +55,7 @@ const BoundsEndSplitsChar: int = 7
 const BoundsTooWide: int = 8
 const BoundsRun: int = 9
 const BoundsCountTooWide: int = 10
+const BoundsNoVariant: int = 11
 
 // Or-ed into the form where the value in `a` -- or `b` -- is a signed integer's, widened with its
 // sign, so the message prints `-1` rather than eighteen quintillion.
@@ -74,7 +75,8 @@ private val BoundsForms: []const (string, string) = [
     ("range end %s is not on a character boundary", "b"),
     ("index does not fit in usize", ""),
     ("%s elements from index %s out of bounds for length %s", "ban"),
-    ("count does not fit in usize", "")]
+    ("count does not fit in usize", ""),
+    ("value %s is not one of the enum's variants", "a")]
 
 // -- whether locations are laid down --------------------------------------------------------------
 
@@ -166,6 +168,98 @@ bounds_kind(kind: int, a_signed: bool, b_signed: bool) -> int =
 signed_index(x: TExpr) -> bool = underlying(texpr_type(x)) match
     Integer(_, signed, _) -> signed
     _ -> false
+
+// -- a value no variant of its enum has ------------------------------------------------------------
+
+// **A simple enum read out of storage nothing checked is held to its variants before anything uses
+// it**: a bitfield struct's enum field is a run of bits the hardware or a cast filled, and a width
+// that has values no variant covers can hold one of them. Unchecked, `Image` names the wrong variant
+// and a `match` falls off its arms. This is `E(n)`'s check, made where the value is read, and it
+// reports as a failed bounds check does -- the value and where it was read -- before it traps.
+//
+// The check is one call of a `private` helper per enum, `sysl.enum.check.<enum>`, taking the value
+// at the enum's own representation and the location: one line at the site, so a body reads the same
+// around it, and nothing at all where the variants cover every value the width can hold.
+check_variant(e: *Emit, en: Type, v: Val, site: Span)
+    val d = enum_decl(en)
+
+    if d.is_none() || !d.unwrap().simple || d.unwrap().variants.is_empty() then return
+
+    val bits = lty(e, d.unwrap().underlying) match
+        LInt(b) -> b
+        _ -> return
+
+    if bits > 64 || every_value_a_variant(d.unwrap(), bits) then return
+
+    val signed = underlying(d.unwrap().underlying) match
+        Integer(_, s, _) -> s
+        _ -> false
+
+    e.traps = true
+    e.bounds_fails = true
+
+    val name = llvm_safe(s"sysl.enum.check.${mangle(underlying(en))}")
+
+    request_text(e, name, variant_check_text(name, d.unwrap(), bits, signed, e.word_bits))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LInt(bits), v))
+    args.push(ir_arg(LPtr, location_of(e, site)))
+    emit(e, ir_call(None, LVoid, VGlobal(name), args))
+end check_variant
+
+// Whether every value `bits` can hold is some variant's, which leaves nothing to check. Discriminants
+// are distinct, so counting them is enough.
+private every_value_a_variant(d: &EnumType, bits: int) -> bool
+    if bits >= 16 then return false
+
+    d.variants.len() >= usize(1) << usize(bits)
+end every_value_a_variant
+
+// The helper: the membership test at 64 bits, as `E(n)`'s is, so a signed representation compares
+// with its sign; the report through `sysl_bounds_fail` with the value widened to the word; the trap.
+private variant_check_text(name: string, d: &EnumType, bits: int, signed: bool, word_bits: int) -> string
+    val ext = if signed then "sext" else "zext"
+    val word = s"i$word_bits"
+
+    var text = s"define private void @$name(i$bits %v, ptr %at) {\nentry:\n"
+    var wide = "%v"
+
+    if bits < 64
+        text = text + s"  %w = $ext i$bits %v to i64\n"
+        wide = "%w"
+    end if
+
+    val vs = d.variants
+
+    for i in 0..<vs.len()
+        text = text + s"  %c$i = icmp eq i64 $wide, ${vs.at(i).tag}\n"
+
+    var any = "%c0"
+
+    for i in 1..<vs.len()
+        text = text + s"  %o$i = or i1 $any, %c$i\n"
+        any = s"%o$i"
+
+    var a = wide
+
+    text = text + s"  br i1 $any, label %ok, label %bad\nbad:\n"
+
+    if word_bits < 64
+        text = text + s"  %a = trunc i64 $wide to $word\n"
+        a = "%a"
+    end if
+
+    val kind = bounds_kind(BoundsNoVariant, signed, false)
+
+    text + s"  call void @${bounds_fail_symbol()}(i32 $kind, $word $a, $word 0, $word 0, ptr %at)\n" +
+        s"  call void @${llvm_trap()}()\n" +
+        "  unreachable\n" +
+        "ok:\n" +
+        "  ret void\n" +
+        "}\n"
+end variant_check_text
 
 // Where the subscript was written, as the constant the module lays down for it -- one per distinct
 // location -- or null where the build dropped locations or the body came from no file.
