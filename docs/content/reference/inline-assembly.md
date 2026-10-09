@@ -536,6 +536,98 @@ halt()
 an 'asm' block inside a function is part of that function's code
 ```
 
+## System registers and barriers
+
+On AArch64 most of a kernel's conversation with the processor is one instruction long: `mrs` to read
+a system register, `msr` to write one, and a barrier. Each would be a function of its own wrapped
+around an `asm` block with an `unavailable` arm for every other processor, since the register's name
+is part of the instruction text. Five built-in forms say it directly instead:
+
+```sysl build=c target=aarch64-freestanding
+@export("kmain")
+kmain(vectors: u64) -> u64
+    write_sysreg("vbar_el1", vectors)
+    isb()
+    write_sysreg("daifclr", 2)
+    dsb(sy)
+    dmb(ish)
+    read_sysreg("cntfrq_el0")
+```
+
+- **`read_sysreg(name) -> u64`** is `mrs`, and **`write_sysreg(name, value)`** is `msr`. The value is
+  a `u64`; a narrower one is converted with `u64(...)`.
+- **`dsb(option)`, `dmb(option)` and `isb()`** are the barriers. The option is one of the
+  architecture's twelve words — `sy`, `st`, `ld`, `ish`, `ishst`, `ishld`, `nsh`, `nshst`, `nshld`,
+  `osh`, `oshst`, `oshld` — and `isb` has only `sy`, so it takes none.
+
+They are not assembly: each becomes the LLVM intrinsic for the instruction
+(`llvm.read_volatile_register`, `llvm.write_register`, `llvm.aarch64.dsb`/`dmb`/`isb`), so the
+optimizer knows what each one does. **A read is never merged with another read or moved past a
+store**: reading `icc_iar1_el1` acknowledges an interrupt, and two reads have to be two `mrs`.
+
+**The name is spelled into the instruction, so it is known while compiling** — a string literal or a
+`const` string. It is the Arm architecture's name in any case (`CurrentEL`, `cntv_ctl_el0`), or the
+generic `s<op0>_<op1>_c<n>_c<m>_<op2>` (`s3_3_c14_c0_0`). The compiler asks the back end that will
+build the program whether it has that register **in the direction it is used** — `CurrentEL` can be
+read and not written, `icc_eoir1_el1` written and not read — so a name it does not know is refused
+here rather than by LLVM:
+
+```sysl target=aarch64-freestanding
+print(read_sysreg("esr_el9"))
+```
+
+```error
+LLVM's AArch64 back end has no system register 'esr_el9' it can read
+```
+
+```sysl target=aarch64-freestanding
+val which = "esr_el1"
+print(read_sysreg(which))
+```
+
+```error
+'read_sysreg' spells the register into the instruction, so its name has to be known while compiling
+```
+
+**A PSTATE field takes a constant.** `daifset`, `daifclr`, `spsel`, `pan`, `uao`, `dit`, `ssbs` and
+`tco` are written by `msr` from an immediate inside the instruction, so the value is a constant from 0
+to 15 (`allint` and `pm` take 0 or 1):
+
+```sysl target=aarch64-freestanding
+mask(bits: u64)
+    write_sysreg("daifset", bits)
+
+mask(2)
+```
+
+```error
+'daifset' is a PSTATE field, which 'msr' writes from an immediate inside the instruction — the value has to be a constant from 0 to 15
+```
+
+A barrier's option is a word of the instruction, not a value, so it is written at the call:
+
+```sysl target=aarch64-freestanding
+dsb(full)
+```
+
+```error
+'dsb' takes one of the architecture's options written here — sy, st, ld, ish, ishst, ishld, nsh, nshst, nshld, osh, oshst, oshld — and this is not one
+```
+
+**Every other processor refuses all five**, naming the target, so a module that uses them on AArch64
+and is also built elsewhere puts those lines behind `#if aarch64`:
+
+```sysl target=riscv64-freestanding
+print(read_sysreg("cntfrq_el0"))
+```
+
+```error
+'read_sysreg' is an AArch64 instruction, and 'riscv64-freestanding' is riscv64 — put the code that uses it behind '#if aarch64'
+```
+
+The five names are taken only where nothing else claims them: a function or a local called `isb` is
+what `isb()` calls.
+
 ## What is not here yet
 
 - **`inout`** — a read-modify-write operand. The instructions wanting one are the exchange and

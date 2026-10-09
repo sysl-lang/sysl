@@ -151,6 +151,7 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TAtomic(op, addr, ops, ordering, at, ty) -> gen_atomic(e, op, addr, ops, ordering, at, ty)
     TFence(ordering) -> gen_fence(e, ordering)
     TSlots(op, args, elem, ty) -> gen_slots(e, op, args, elem, ty)
+    TSysOp(op, name, args) -> gen_sysop(e, op, name, args)
 
     // **A call through a `*extern` pointer is a foreign call whose callee is a register.** The
     // convention is the C one on both sides -- the value came from a `&f` or from C itself and may
@@ -1715,6 +1716,56 @@ private gen_fence(e: *Emit, ordering: string) -> Val
     emit(e, InFence(atomic_ordering_of(ordering)))
     VNothing
 end gen_fence
+
+// An AArch64 system register or barrier, as the intrinsic LLVM's back end turns into the one
+// instruction. A register travels as a metadata string; a barrier's option as its CRm encoding.
+private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
+    val wide = LInt(64)
+    val meta = LNamed("metadata")
+
+    if op == "read_sysreg"
+        var params: Buf[IrParam] = buf()
+
+        params.push(ir_param(meta))
+        request_intrinsic(e, ir_sig(llvm_sysreg_read(), ir_fn_type(wide, params)))
+
+        var ops: Buf[IrArg] = buf()
+
+        ops.push(ir_arg(meta, VMetaString(name)))
+
+        val r = fresh_reg(e)
+
+        emit(e, ir_call(Some(r), wide, VGlobal(llvm_sysreg_read()), ops))
+        return r
+
+    if op == "write_sysreg"
+        val v = gen_expr(e, args.at(0))
+
+        var params: Buf[IrParam] = buf()
+
+        params.push(ir_param(meta))
+        params.push(ir_param(wide))
+        request_intrinsic(e, ir_sig(llvm_sysreg_write(), ir_fn_type(LVoid, params)))
+
+        var ops: Buf[IrArg] = buf()
+
+        ops.push(ir_arg(meta, VMetaString(name)))
+        ops.push(ir_arg(wide, v))
+        emit(e, ir_call(None, LVoid, VGlobal(llvm_sysreg_write()), ops))
+        return VNothing
+
+    val symbol = llvm_aarch64_barrier_entry(op).unwrap().base
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(LInt(32)))
+    request_intrinsic(e, ir_sig(symbol, ir_fn_type(LVoid, params)))
+
+    var ops: Buf[IrArg] = buf()
+
+    ops.push(ir_arg(LInt(32), VInt(from_int(long(barrier_option(name).unwrap_or(15))))))
+    emit(e, ir_call(None, LVoid, VGlobal(symbol), ops))
+    VNothing
+end gen_sysop
 
 // The variant a written ordering names. `SeqCst` is what an unrecognised word falls to, which cannot
 // happen: the analyzer refuses anything that is not one of the five by name, so this is the total
