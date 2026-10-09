@@ -177,7 +177,7 @@ the result to `publish_file` or `publish_dir`.
 thing; a rename refuses to replace a directory that holds anything, so the first one to finish is
 never disturbed, and the second removes its own copy and answers `Ok` — which is why the cache above
 still says `first`. Only a rename that fails with no directory at the target afterwards is reported.
-`publish_dir` is POSIX-only, since clearing away the losing copy walks a tree.
+Clearing away the losing copy walks a tree, which is written over the hooks like everything else here.
 
 ## `IoError`
 
@@ -506,13 +506,11 @@ that is not empty. A **symbolic link is unlinked rather than followed**, which i
 deleting something outside the tree it was pointed at, and a path that is not there at all is
 success — a caller tearing down after a failure should not have to know how far the failure got.
 
-**It is the one call here that POSIX decides, and `make_dir_all` beside it is not** — which reads as
-arbitrary until you ask what each needs that the other does not. `make_dir_all` climbs with
-`sysl.path.parent` and asks `exists` and `make_dir`, and every target has those. `remove_dir_all` has
-to know whether an entry is a symbolic link *without following it*, and the only reading that answers
-that is `link_metadata`, which is POSIX because a Windows reading of a filesystem entry is a
-different struct rather than this one with fields missing. Following the link instead would make the
-call portable and delete things nobody asked it to, which is the property the walk exists to have.
+**`remove_dir_all` needs one thing `make_dir_all` does not**: to know whether an entry is a symbolic
+link *without following it*, and the only reading that answers that is `link_metadata` — the `stat`
+hook asked not to follow. Following the link instead would delete things nobody asked it to, which
+is the property the walk exists to have, so a target whose `stat` hook answers `-1` gets *not
+supported on this target* back rather than a removal that guessed.
 
 ```sysl
 import sysl.fs.{make_dir_all, remove_dir_all, write_text, exists, is_dir}
@@ -948,6 +946,13 @@ standard library to answer a filesystem with, so the program answers it: define 
 
 The question is asked only of what the program reaches, so a freestanding program that never touches
 a file is asked nothing.
+
+**Every call on this page is there for such a program**, the reading ones included: `metadata`,
+`link_metadata` and `set_permissions` are one `stat` or `chmod` hook, the walk and `remove_dir_all`,
+`copy_dir_all` and `publish_dir` are `entries` and `link_metadata` with a leaf action, and
+`make_temp_dir` and `canonicalize` are the `temp_dir` and `realpath` hooks. A supplier fills `Stat`'s
+thirteen numbers in POSIX's shape and leaves zero what it has nothing to say about; a hook it answers
+`-1` comes back from these calls as `Other(-1)`, *not supported on this target*.
 
 ## What is absent, and why
 
