@@ -498,14 +498,20 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
             free_params.push(ir_param(LPtr))
             out.push(declared_sig(e, free_symbol(), ir_fn_type(LVoid, free_params)))
 
-    // The aligned hook, on the same terms -- and not where this module writes its default or the
+    // The aligned pair, on the same terms -- and not where this module writes its default or the
     // counting runtime defines it.
-    if aligned_hook_declared(e, p)
+    if aligned_hook_declared(e, p, aligned_alloc_symbol())
         var aligned_params: Buf[IrParam] = buf()
 
         aligned_params.push(ir_param(word_lty(e)))
         aligned_params.push(ir_param(word_lty(e)))
         out.push(declared_sig(e, aligned_alloc_symbol(), ir_fn_type(LPtr, aligned_params)))
+
+    if aligned_hook_declared(e, p, aligned_free_symbol())
+        var aligned_free_params: Buf[IrParam] = buf()
+
+        aligned_free_params.push(ir_param(LPtr))
+        out.push(declared_sig(e, aligned_free_symbol(), ir_fn_type(LVoid, aligned_free_params)))
 
     // The two steps a buffer's size is computed in, which are the checked forms and carry their
     // width in the **name** as well as in the signature. They are declared from the flag rather than
@@ -616,8 +622,10 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
     if !e.aligned_heap.is_empty()
         seen.push(aligned_alloc_symbol())
+        seen.push(aligned_free_symbol())
 
-        if e.requested_set.has(aligned_alloc_symbol()) then seen.push("posix_memalign")
+        for s in aligned_default_symbols(e)
+            seen.push(s)
 
     if defines_alloc_count(e)
         for s in alloc_count_symbols()
@@ -650,11 +658,11 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     out
 end declares
 
-// Whether the aligned hook is declared here: something asked for it, and it is not this module's own
-// `@export`, the default written beside it, or the counting runtime's.
-private aligned_hook_declared(e: *Emit, p: TProgram) -> bool =
-    !e.aligned_heap.is_empty() && !defines_alloc_count(e) && !emits_export(p, aligned_alloc_symbol()) &&
-        !e.requested_set.has(aligned_alloc_symbol())
+// Whether one half of the aligned pair is declared here: something asked for it, and it is not this
+// module's own `@export`, the default written beside it, or the counting runtime's.
+private aligned_hook_declared(e: *Emit, p: TProgram, sym: string) -> bool =
+    !e.aligned_heap.is_empty() && !defines_alloc_count(e) && !emits_export(p, sym) &&
+        !e.requested_set.has(sym)
 
 // A whole module as LLVM text, which is what `emit-llvm` prints.
 codegen_text(p: TProgram, t: Target) -> string = ir_print_module(codegen_module(p, t))

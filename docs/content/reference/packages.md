@@ -747,41 +747,46 @@ Both halves are said or neither is; half a pair is refused, since storage taken 
 given back to another is the one outcome worse than not building. The project's own manifest may
 declare a pair too, which covers an application with its own arena and no dependency that has one.
 
+**Whichever road the package arrived by.** A package named in `dependencies` and the same package
+handed over as a `--lib` source root declare the same thing and settle the same question — this is a
+property of the package, not of the flag that reached it.
+
 ### A type aligned beyond what the pair promises
 
 The pair is held to `malloc`'s promise: a block begins on a boundary of two words — sixteen bytes on
-a 64-bit machine, eight on a 32-bit one. A box or a buffer of a type that asks for more (an
-[`@align(n)`](/reference/attributes/#alignn--where-the-aggregate-begins) struct, or a `u128` on a
-32-bit machine) is taken from a third function instead:
+a 64-bit machine, eight on a 32-bit one. A box, a buffer or a task's frame holding a type that asks
+for more (an [`@align(n)`](/reference/attributes/#alignn--where-the-aggregate-begins) struct, or a
+`u128` on a 32-bit machine) is taken from a second pair instead:
 
 ```sysl
 @export("sysl_alloc_aligned")
 my_alloc_aligned(size: usize, align: usize) -> *u8 = ...
+
+@export("sysl_free_aligned")
+my_free_aligned(p: *u8) = ...
 ```
 
-It answers `size` bytes beginning on `align` — a power of two, larger than the pair's own boundary —
-or null, and **the block goes back through the pair's free**, like every other, so nothing that lets
-go of storage has to know which function made it.
+The first answers `size` bytes beginning on `align` — a power of two, larger than the pair's own
+boundary — or null, and the second gives such a block back; the storage's destruction hook knows
+which pair made it.
 
-On a POSIX host whose pair is libc's, the compiler writes a `weak` default over `posix_memalign`, and
-a program's own definition displaces it. Anywhere else nothing could write a default the pair's free
-would accept — a pair the manifest named, or a machine with no C library under it — so a program that
-puts such a type on the heap and does not define the hook is refused when it is compiled, naming the
-type and the hook:
+Where the allocating pair is libc's, the compiler writes `weak` defaults over the C library's own
+aligned allocation — `posix_memalign` and `free` on a POSIX system and WASI, `_aligned_malloc` and
+`_aligned_free` on Windows — and a program's own definitions displace them. Anywhere else — a pair
+the manifest named, or a machine with no C library under it — only the program knows how its heap
+answers a boundary, so a program that puts such a type on the heap and does not define both is
+refused when it is compiled, naming the storage and the two hooks:
 
 ```
 a box of 'Page' asks for the 4096-byte boundary its type is aligned on, and the allocating pair
-('img_alloc' and 'img_free') promises only 16 — 'aarch64-freestanding' has no C library whose
-'posix_memalign' could answer it. Define 'sysl_alloc_aligned(size: usize, align: usize) -> *u8'
-with '@export', answering a block on that boundary which 'img_free' gives back
+('img_alloc' and 'img_free') promises only 16 — 'aarch64-freestanding' has no C library with an
+aligned allocation to answer it. Define 'sysl_alloc_aligned(size: usize, align: usize) -> *u8'
+and 'sysl_free_aligned(p: *u8)' with '@export', the first answering a block on that boundary and
+the second giving one back
 ```
 
-A program that never puts such a type on the heap never names the hook, so a pair alone is still the
+A program that never puts such a type on the heap never names either, so a pair alone is still the
 whole of what a heap needs to supply.
-
-**Whichever road the package arrived by.** A package named in `dependencies` and the same package
-handed over as a `--lib` source root declare the same thing and settle the same question — this is a
-property of the package, not of the flag that reached it.
 
 ### The compiled standard module is built for one allocator
 

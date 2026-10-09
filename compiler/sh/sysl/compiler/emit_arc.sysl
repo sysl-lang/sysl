@@ -426,7 +426,12 @@ drop_fn(e: *Emit, payload: Type) -> Val
     // A type with a destructor needs a hook of its own even when nothing in it is counted: the walk
     // has nothing to do and the `drop` still has to be called, so the plain hook -- which is shared
     // by every payload that holds nothing -- cannot serve.
-    if !contains_counted(payload) && destructor_of(e, payload).is_none() then return plain_drop_fn(e)
+    //
+    // **Nor can it serve a payload the aligned pair made**, whose storage goes back through that
+    // pair's free (`emit_box.sysl`'s `heap_call`).
+    val plain = !contains_counted(payload) && destructor_of(e, payload).is_none()
+
+    if plain && !e.layout.beyond_heap(payload) then return plain_drop_fn(e)
 
     VGlobal(request_helper(e, s"arc.drop.${mangle(payload)}", HrDrop(payload)))
 end drop_fn
@@ -435,7 +440,7 @@ end drop_fn
 // walk, so the plain hook is enough -- it still gives the bytes back, which is the phase every box
 // needs whatever it holds.
 drop_buf_fn(e: *Emit, elem: Type) -> Val
-    if !contains_counted(elem) then return plain_drop_fn(e)
+    if !contains_counted(elem) && !e.layout.beyond_heap(elem) then return plain_drop_fn(e)
 
     VGlobal(request_helper(e, s"arc.dropbuf.${mangle(elem)}", HrDropBuf(elem)))
 end drop_buf_fn
@@ -519,7 +524,7 @@ private gen_plain_hook(e: *Emit)
     emit_label(e, over)
     emit_term(e, InRet(None, None))
     emit_label(e, give)
-    emit_free(e)
+    emit_free(e, Unit)
     emit_term(e, InRet(None, None))
 end gen_plain_hook
 
@@ -530,6 +535,15 @@ private gen_drop_hook(e: *Emit, payload: Type)
 
     emit_term(e, InCondBr(VReg("storage"), give, over))
     emit_label(e, over)
+
+    // A payload holding nothing is here only because the aligned pair made it: nothing to walk.
+    if !contains_counted(payload) && destructor_of(e, payload).is_none()
+        emit_term(e, InRet(None, None))
+        emit_label(e, give)
+        emit_free(e, payload)
+        emit_term(e, InRet(None, None))
+        return
+    end if
 
     val pa = fresh_reg(e)
 
@@ -561,7 +575,7 @@ private gen_drop_hook(e: *Emit, payload: Type)
     release_value(e, payload, v)
     emit_term(e, InRet(None, None))
     emit_label(e, give)
-    emit_free(e)
+    emit_free(e, payload)
     emit_term(e, InRet(None, None))
 end gen_drop_hook
 
@@ -572,6 +586,15 @@ private gen_drop_buf_hook(e: *Emit, elem: Type)
 
     emit_term(e, InCondBr(VReg("storage"), give, over))
     emit_label(e, over)
+
+    // Elements holding nothing are here only because the aligned pair made the buffer.
+    if !contains_counted(elem)
+        emit_term(e, InRet(None, None))
+        emit_label(e, give)
+        emit_free(e, elem)
+        emit_term(e, InRet(None, None))
+        return
+    end if
 
     val lenp = fresh_reg(e)
 
@@ -595,18 +618,22 @@ private gen_drop_buf_hook(e: *Emit, elem: Type)
     each_element_release(e, elem, data, n)
     emit_term(e, InRet(None, None))
     emit_label(e, give)
-    emit_free(e)
+    emit_free(e, elem)
     emit_term(e, InRet(None, None))
 end gen_drop_buf_hook
 
 // The one place `free` is **called**. It sits inside a hook, so it reaches a module only where that
 // module builds a box -- which is a module that has already called `malloc`, and therefore has an
-// allocator to give the bytes back to.
-private emit_free(e: *Emit)
+// allocator to give the bytes back to. Storage of a type the aligned pair made goes back through
+// that pair's free (`emit_box.sysl`'s `heap_call`).
+private emit_free(e: *Emit, held: Type)
     var args: Buf[IrArg] = buf()
 
     args.push(ir_arg(LPtr, VReg("p")))
-    emit(e, ir_call(None, LVoid, VGlobal(free_symbol()), args))
+
+    val sym = if e.layout.beyond_heap(held) then aligned_free_symbol() else free_symbol()
+
+    emit(e, ir_call(None, LVoid, VGlobal(sym), args))
 end emit_free
 
 // -- elements a buffer holds --------------------------------------------------------------------------

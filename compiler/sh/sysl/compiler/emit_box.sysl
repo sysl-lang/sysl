@@ -77,8 +77,8 @@ end allocate_box
 
 // The call that takes `size` bytes from the heap for storage of `t`: the allocating pair's, or the
 // aligned hook's where `t` asks for a boundary beyond what the pair promises (`beyond_heap`). The
-// aligned block goes back through the pair's own free, so nothing that lets go of storage has to
-// know which of the two made it.
+// aligned block goes back through the hook's own free, `sysl_free_aligned`, which the type's drop
+// hook calls (`emit_arc.sysl`'s `drop_fn`).
 //
 // `what` is how the refusal names the storage, where there is no aligned hook to call
 // (`unaligned_heap`).
@@ -90,16 +90,22 @@ private heap_call(e: *Emit, size: Val, t: Type, what: string) -> Val
     args.push(ir_arg(word_lty(e), size))
 
     if e.layout.beyond_heap(t)
-        args.push(ir_arg(word_lty(e), VInt(from_int(long(e.layout.align(t))))))
-        emit(e, ir_call(Some(p), LPtr, VGlobal(aligned_alloc_symbol()), args))
+        val a = e.layout.align(t)
 
-        if e.aligned_heap.is_empty() then
-            e.aligned_heap.push((s"$what of '${type_show(t)}'", e.self_name, e.layout.align(t)))
+        args.push(ir_arg(word_lty(e), VInt(from_int(long(a)))))
+        emit(e, ir_call(Some(p), LPtr, VGlobal(aligned_alloc_symbol()), args))
+        note_aligned_heap(e, s"$what of '${type_show(t)}' asks for the $a-byte boundary its type is " +
+            "aligned on", a)
     else
         emit(e, ir_call(Some(p), LPtr, VGlobal(malloc_symbol()), args))
 
     p
 end heap_call
+
+// Records the first storage this module took from the aligned hook: what the refusal says about it,
+// the function that made it, and the boundary.
+note_aligned_heap(e: *Emit, said: string, boundary: usize)
+    if e.aligned_heap.is_empty() then e.aligned_heap.push((said, e.self_name, boundary))
 
 private store_header_word(e: *Emit, bn: LType, p: Val, field: int, ty: LType, v: Val)
     val r = fresh_reg(e)
@@ -377,19 +383,38 @@ private array_length(ty: Type) -> int = underlying(ty) match
 
 // -- the aligned hook ----------------------------------------------------------------------------------
 
-// **Storage of a type aligned beyond what the allocating pair promises comes from a third function**,
-// `sysl_alloc_aligned(size, align)`, answering a block on that boundary which the pair's own free gives
-// back -- so a box frees itself the one way whatever made it. Where the pair is libc's and the C
-// library has `posix_memalign`, a `weak` default is written over that, and a program's own `@export`
-// (or an `extern` naming it) wins. Anywhere else -- a pair a manifest named, a machine with no C
-// library -- nothing could write a default that the pair's free gives back, so a program that makes
-// such storage without answering the hook is refused (`emit_checks.sysl`'s `check_aligned_heap`).
-// A program that never boxes such a type never names the hook at all.
+// **Storage of a type aligned beyond what the allocating pair promises comes from a second pair**:
+// `sysl_alloc_aligned(size, align)`, answering a block on that boundary or null, and
+// `sysl_free_aligned(p)`, giving one back. A box, a buffer or a task frame of such a type is made by
+// the first, and its drop hook calls the second (`emit_arc.sysl`'s `drop_fn`). Where the allocating
+// pair is libc's and the C library has an aligned allocation, `weak` defaults are written over it --
+// `posix_memalign` and `free` on a POSIX system and WASI, `_aligned_malloc` and `_aligned_free` on
+// Windows -- and a program's own `@export` (or an `extern` naming one) wins. Anywhere else -- a pair a
+// manifest named, a machine with no C library -- the program answers both, and one that makes such
+// storage without doing so is refused (`emit_checks.sysl`'s `check_aligned_heap`). A program that
+// never makes such storage never names either.
 aligned_alloc_symbol() -> string =
     if alloc_counting_active() then counted_aligned_symbol() else "sysl_alloc_aligned"
 
-// The aligned hook of a counted build, which the counting runtime defines (`alloc_count.sysl`).
+aligned_free_symbol() -> string =
+    if alloc_counting_active() then counted_aligned_free_symbol() else "sysl_free_aligned"
+
+// The aligned pair of a counted build, which the counting runtime defines (`alloc_count.sysl`).
 counted_aligned_symbol() -> string = "sysl_count_alloc_aligned"
+
+counted_aligned_free_symbol() -> string = "sysl_count_free_aligned"
+
+// Whether a C library is under this target for the aligned defaults to be written over -- the ONE
+// question the defaults and the refusal (`emit_checks.sysl`'s `check_aligned_heap`) ask about it.
+aligned_heap_has_libc(t: Target) -> bool = os_hosted(t.os)
+
+// The C library's aligned pair the defaults are written over, where there is a C library.
+c_aligned_pair(t: Target) -> Option[(string, string)]
+    if !aligned_heap_has_libc(t) then return None
+    if t.os == Windows then return Some(("_aligned_malloc", "_aligned_free"))
+
+    Some(("posix_memalign", "free"))
+end c_aligned_pair
 
 // The storage the last module lowered made through the aligned hook with nothing to answer it --
 // what it was, the function that made it, and the boundary -- or nothing. Settled by each lowering,
@@ -405,29 +430,79 @@ request_aligned_heap(e: *Emit, p: TProgram)
 
     if e.aligned_heap.is_empty() || alloc_counting_active() then return
 
-    val sym = aligned_alloc_symbol()
+    val alloc = aligned_alloc_symbol()
+    val free = aligned_free_symbol()
+    val alloc_open = !claimed_symbol(e, p, alloc)
+    val free_open = !claimed_symbol(e, p, free)
 
-    if claimed_symbol(e, p, sym) then return
+    if !alloc_open && !free_open then return
 
-    if malloc_symbol() == "malloc" && free_symbol() == "free" && e.target.has_posix_memalign()
-        val w = s"i${e.word_bits}"
+    val libc_pair = malloc_symbol() == "malloc" && free_symbol() == "free"
+    val c_pair = if libc_pair then c_aligned_pair(e.target) else None
 
-        request_helper(e, sym, HrText(
-            s"define weak ${e.target.preemption()}ptr @$sym($w %size, $w %align) {\n" +
-            "entry:\n" +
-            "  %slot = alloca ptr\n" +
-            s"  %r = call i32 @posix_memalign(ptr %slot, $w %align, $w %size)\n" +
-            "  %ok = icmp eq i32 %r, 0\n" +
-            "  br i1 %ok, label %got, label %none\n" +
-            "got:\n" +
-            "  %p = load ptr, ptr %slot\n" +
-            "  ret ptr %p\n" +
-            "none:\n" +
-            "  ret ptr null\n" +
-            "}\n\n" +
-            s"declare i32 @posix_memalign(ptr, $w, $w)\n"))
+    if c_pair.is_none()
+        unaligned = Some(e.aligned_heap.at(0))
         return
     end if
 
-    unaligned = Some(e.aligned_heap.at(0))
+    val names = c_pair.unwrap()
+    val w = s"i${e.word_bits}"
+    val pre = e.target.preemption()
+
+    if alloc_open
+        val body = if names.0 == "posix_memalign" then posix_aligned_body(w) else direct_aligned_body(names.0, w)
+
+        request_helper(e, alloc, HrText(s"define weak ${pre}ptr @$alloc($w %size, $w %align) {\n" +
+                                         "entry:\n" + body))
+    end if
+
+    // libc's `free` is already the pair's half, and declared as that; `_aligned_free` is not.
+    if free_open
+        val declared = if names.1 == "free" then "" else s"\ndeclare void @${names.1}(ptr)\n"
+
+        request_helper(e, free, HrText(s"define weak ${pre}void @$free(ptr %p) {\n" +
+                                        "entry:\n" +
+                                        s"  call void @${names.1}(ptr %p)\n" +
+                                        "  ret void\n" +
+                                        "}\n" + declared))
+    end if
 end request_aligned_heap
+
+// The aligned default's body over `posix_memalign`, which answers through an out-pointer and a code.
+private posix_aligned_body(w: string) -> string =
+    "  %slot = alloca ptr\n" +
+    s"  %r = call i32 @posix_memalign(ptr %slot, $w %align, $w %size)\n" +
+    "  %ok = icmp eq i32 %r, 0\n" +
+    "  br i1 %ok, label %got, label %none\n" +
+    "got:\n" +
+    "  %p = load ptr, ptr %slot\n" +
+    "  ret ptr %p\n" +
+    "none:\n" +
+    "  ret ptr null\n" +
+    "}\n\n" +
+    s"declare i32 @posix_memalign(ptr, $w, $w)\n"
+
+// The same over a C function that answers the block itself, `_aligned_malloc(size, align)`.
+private direct_aligned_body(name: string, w: string) -> string =
+    s"  %p = call ptr @$name($w %size, $w %align)\n" +
+    "  ret ptr %p\n" +
+    "}\n\n" +
+    s"declare ptr @$name($w, $w)\n"
+
+// The C functions the defaults call that this module declares in their text, so nothing declares
+// them twice (`codegen.sysl`'s `declares`).
+aligned_default_symbols(e: *Emit) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if e.requested_set.has(aligned_alloc_symbol())
+        c_aligned_pair(e.target) match
+            Some(names) -> out.push(names.0)
+            None -> ()
+
+    if e.requested_set.has(aligned_free_symbol())
+        c_aligned_pair(e.target) match
+            Some(names) -> if names.1 != "free" then out.push(names.1)
+            None -> ()
+
+    out
+end aligned_default_symbols
