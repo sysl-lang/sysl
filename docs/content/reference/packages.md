@@ -548,6 +548,69 @@ Storage that folds — literals, a struct over constants — is laid into the im
 computed storage nothing reaches is left alone. It is the same rule `build-c` holds a freestanding
 archive to, which has no entry at all.
 
+### A runtime written in sysl calls `main` through an `extern`
+
+The entry's job of calling `main` need not be assembly. On an image whose block names an `entry`
+other than `main`, an `extern` may name `main`, and the runtime calls the program through it as a C
+start file does — passing the argument count and vector, and handing the answer to whatever ends the
+program:
+
+```hocon
+targets {
+  aarch64-freestanding {
+    linker_script = "user.ld"
+    entry         = "_start"
+  }
+}
+```
+
+```sysl
+extern "main" program_main(argc: int, argv: **u8) -> int
+
+@export("keel_start")
+keel_start(argc: int, argv: **u8) -> never = exit(program_main(argc, argv))
+```
+
+`_start` (a few lines of module-level `asm` setting `x0` and `x1` from the stack) branches to
+`keel_start`, and the call reaches the `main` this program defines: nothing is declared beside it,
+and the call is enough to make the image carry a `main` and to count its computed storage as filled.
+
+**`main` is emitted at C's signature whatever the program declared**, so the `extern` is declared at
+it too — an `int` count (32 bits, signed), a pointer, an `int` answer (a measured `c type` such as
+`c_int` reads as what it measures). Anything else would read arguments nobody passed, and is refused:
+
+```
+'main' is defined at C's signature, '(int, **byte) -> int' — the argument count and the argument vector — so an 'extern' naming it takes those, where this one is '() -> int'
+```
+
+Everywhere else the name stays the platform's. A hosted program is started at `main` by its C
+runtime, so the `extern` is refused where it is written:
+
+```sysl
+extern "main" again(argc: int, argv: **u8) -> int
+```
+
+```error
+'main' is where the platform starts this program, so an 'extern' may not name that symbol
+```
+
+and a bare image that names no entry, or names `main` itself, starts there, so a call to it is
+refused too:
+
+```sysl target=aarch64-freestanding
+extern "main" program_main(argc: int, argv: **u8) -> int
+
+@export("kstart")
+kstart() -> int = program_main(0, null)
+```
+
+```error
+an 'extern' may name 'main' only on an image that starts somewhere else, whose entry calls it — and this image names no entry of its own ('targets.aarch64-freestanding.entry'), so 'main' is where it starts
+```
+
+An archive `build-c` writes is refused the same way, its `main` being the C program's; and an
+`extern` *variable* at `main`'s symbol is refused on every target, storage never being an entry.
+
 ### What is refused
 
 - **The keys in a dependency.** How an image is linked is the program's own to say; a library's
@@ -565,6 +628,8 @@ archive to, which has no entry at all.
 - **A value that is not a non-empty string**, and an `entry` holding a space, a comma or `=`, when the
   file is read.
 - **Computed module storage read from an image whose entry never runs `main`** — described above.
+- **An `extern` naming `main` where nothing else starts the image**, or at a signature other than
+  C's `main` — described above.
 ## What the generated code may use of the machine
 
 A kernel wants two things a program does not: code that never touches the floating-point and SIMD
