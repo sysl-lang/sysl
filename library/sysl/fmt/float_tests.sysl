@@ -1,0 +1,295 @@
+module sysl.fmt
+@tests
+
+import sysl.{float_digits, real_value}
+import sysl.text.{Search, from_utf8, repeat}
+
+// Floats under a specifier, and the shortest reading. The oracle for the specifiers is this host's
+// own `snprintf`, which `format_real` replaced and must agree with byte for byte: every comparison
+// below hands C and sysl the same value and the same specifier.
+
+private extern "snprintf" c_snprintf(buf: *u8, n: usize, fmt: *u8, ...) -> int
+
+// C's rendering of `x` under `spec`.
+private c_format(x: real, spec: string) -> string
+    var f: [40]u8 = [0; 40]
+    var out: [2048]u8 = [0; 2048]
+
+    for i in 0..<spec.bytes.len
+        f[i] = spec.bytes[i]
+
+    val n = c_snprintf(&out[0], 2048, &f[0], x)
+
+    conforming(from_utf8(out[0..<usize(n)]).unwrap(), spec)
+end c_format
+
+// **macOS's C library has one defect here, and the oracle is corrected for it rather than copied.**
+// Where `%g` rounds a tie down to the even digit, it leaves the trailing zeros in place --
+// `printf("%g", 7206205.0)` is `7.20620e+06`, and `1000005.0` is `1.00000e+06` -- though C requires
+// them dropped without `#`, and glibc drops them. So C's answer to a `%g` without `#` has its
+// fraction's trailing zeros taken off, and its width put back, before it is compared.
+private conforming(text: string, spec: string) -> string
+    val conv = spec.bytes[spec.bytes.len - 1] | 0x20
+
+    if conv != u8('g') || spec.index_of("#").is_some() then return text
+
+    val body = text.trim()
+    val e = body.index_of("e").or_else(() -> body.index_of("E")).unwrap_or(body.bytes.len)
+    var mantissa = body[0..<e]
+
+    if mantissa.index_of(".").is_some()
+        while mantissa.ends_with("0")
+            mantissa = mantissa[0..<mantissa.bytes.len - 1]
+
+        if mantissa.ends_with(".") then mantissa = mantissa[0..<mantissa.bytes.len - 1]
+    end if
+
+    val shown = mantissa + body[e..]
+    val pad = text.bytes.len - shown.bytes.len
+
+    if body.bytes.len == text.bytes.len then shown
+    elif spec.index_of("-").is_some() then shown + repeat(" ", pad)
+    else repeat(" ", pad) + shown
+end conforming
+
+// A deterministic stream of 64-bit patterns (xorshift64*).
+private struct Bits
+    state: u64
+
+    next(*self) -> u64
+        self.state ^= self.state >> 12
+        self.state ^= self.state << 25
+        self.state ^= self.state >> 27
+        self.state * 0x2545f4914f6cdd1d
+end Bits
+
+private specs() -> []string = ["%g", "%e", "%f", "%.0f", "%.1f", "%.3f", "%.17g", "%.0e", "%.1e",
+    "%.20e", "%#g", "%#.0f", "%#.0e", "%+.10e", "%010.4f", "%-12.5g", "% .2f", "%G", "%E", "%.1g",
+    "%.16e", "%.25f", "%#.3g", "%+g", "%08.3e", "%.40g"]
+
+// Each value under every specifier, C against sysl, answering how many disagreed and the first few.
+private compare_all(xs: []real) -> (int, string)
+    var bad = 0
+    var said = ""
+
+    for x in xs
+        for spec in specs()
+            val want = c_format(x, spec)
+            val got = format_real(x, spec, 0, -1)
+
+            if got != want
+                bad += 1
+
+                if bad <= 5 then said = said + f"[$spec of ${x.bits()}%x: C '$want', sysl '$got'] "
+    end for
+
+    (bad, said)
+end compare_all
+
+@test("ten thousand random bit patterns render as C renders them, under every specifier")
+random_bits_match_c()
+    var g = Bits(0x9e3779b97f4a7c15)
+    var xs: []real = [0.0; 10000]
+
+    for i in 0..<xs.len
+        xs[i] = real.from_bits(g.next())
+
+    val r = compare_all(xs)
+
+    assert(r.0 == 0, s"${r.0} disagreements: ${r.1}")
+
+@test("ordinary magnitudes, with short and long fractions, render as C renders them")
+ordinary_values_match_c()
+    var g = Bits(12345)
+    var xs: []real = [0.0; 6000]
+
+    for i in 0..<xs.len
+        val n = g.next()
+        val whole = real(n % 2000000) - 1000000.0
+        val scale = [1.0, 10.0, 100.0, 1000.0, 1e6, 1e-3, 1e-6, 1e12][usize(n >> 61)]
+
+        xs[i] = whole / scale + real((n >> 20) % 1000) / 1024.0
+
+    val r = compare_all(xs)
+
+    assert(r.0 == 0, s"${r.0} disagreements: ${r.1}")
+
+// Each half way case is exact in binary, so it is a tie in decimal, and it goes to the even digit.
+@test("a tie rounds to the even digit, at every conversion")
+ties_go_to_even()
+    assert_eq(format_real(0.125, "%.2f", 0, -1), "0.12")
+    assert_eq(format_real(0.375, "%.2f", 0, -1), "0.38")
+    assert_eq(format_real(2.5, "%.0f", 0, -1), "2")
+    assert_eq(format_real(3.5, "%.0f", 0, -1), "4")
+    assert_eq(format_real(0.5, "%.0f", 0, -1), "0")
+    assert_eq(format_real(1.5, "%.0e", 0, -1), "2e+00")
+    assert_eq(format_real(2.5, "%.0e", 0, -1), "2e+00")
+    assert_eq(format_real(1250.0, "%.2g", 0, -1), "1.2e+03")
+    assert_eq(format_real(1350.0, "%.2g", 0, -1), "1.4e+03")
+
+    val r = compare_all([0.125, 0.375, 2.5, 3.5, 0.5, 1.5, 1250.0, 1350.0, 0.0625, 1e23, 5e-324])
+
+    assert(r.0 == 0, s"${r.0} disagreements: ${r.1}")
+end ties_go_to_even
+
+@test("the extremes, the subnormals, both zeros and the non-finite values render as C renders them")
+extremes_match_c()
+    val xs: []real = [1.7976931348623157e308, -1.7976931348623157e308, 2.2250738585072014e-308,
+        2.225073858507201e-308, 5e-324, -5e-324, 1e-323, 4.9406564584124654e-320, 0.0, -0.0,
+        real.infinity, -real.infinity, real.nan, real.from_bits(0xfff8000000000000), 1.0,
+        9.999999999999999e22, 9.5, 99.95, 0.99999999, 999999.5, 9999995.0, 1e-5, 1e-4, 0.0001234,
+        123456.0, 1234567.0, 1e15, 1e16, 1e17, 9007199254740993.0, 4.35, 2.675, 1.005]
+    val r = compare_all(xs)
+
+    assert(r.0 == 0, s"${r.0} disagreements: ${r.1}")
+
+@test("a precision past seventeen digits is the exact value, out to every digit it has")
+long_precisions_match_c()
+    val xs: []real = [0.1, 1.0 / 3.0, 5e-324, 2.2250738585072014e-308, 1.7976931348623157e308,
+                      123.456, 1e-300]
+
+    for x in xs
+        for spec in ["%.60f", "%.330f", "%.1100f", "%.760e", "%.800e", "%.400g", "%#.800g"]
+            assert_eq(format_real(x, spec, 0, -1), c_format(x, spec))
+
+// The non-finite values are words, so `0` does not pad them and a NaN shows no sign.
+@test("an infinity and a NaN are words: no zero padding, and no sign on a NaN")
+non_finite_words()
+    assert_eq(format_real(real.infinity, "%08.2f", 0, -1), "     inf")
+    assert_eq(format_real(-real.infinity, "%e", 0, -1), "-inf")
+    assert_eq(format_real(real.infinity, "%+G", 0, -1), "+INF")
+    assert_eq(format_real(real.nan, "%-6f", 0, -1), "nan   ")
+    assert_eq(format_real(real.nan, "%E", 0, -1), "NAN")
+    assert_eq(format_real(-real.nan, "%+f", 0, -1), "nan")
+
+@test("flags, width and the counts a '*' reads place the field as C places it")
+float_flags_and_counts()
+    assert_eq(format_real(3.14159, "%*.*f", 10, 3),"     3.142")
+    assert_eq(format_real(3.14159, "%*.*f", -10, 3), "3.142     ")
+    assert_eq(format_real(3.14159, "%.*f", 0, -1), "3.141590")
+    assert_eq(format_real(-2.5, "%010.2f", 0, -1), "-000002.50")
+    assert_eq(format_real(2.5, "%-+8.1f", 0, -1), "+2.5    ")
+    assert_eq(format_real(7206205.0, "%g", 0, -1), "7.2062e+06")
+    assert_eq(format_real(1000005.0, "%g", 0, -1), "1e+06")
+    assert_eq(format_real(1e-5, "%g", 0, -1), "1e-05")
+    assert_eq(format_real(1e-4, "%g", 0, -1), "0.0001")
+    assert_eq(format_real(123456789.0, "%g", 0, -1), "1.23457e+08")
+    assert_eq(format_real(100000.0, "%#g", 0, -1), "100000.")
+    assert_eq(format_real(1.0, "%#.0f", 0, -1), "1.")
+    assert_eq(format_real(1e100, "%.0e", 0, -1), "1e+100")
+
+@test("an f32 renders its own value, as C renders the same value widened")
+f32_matches_c()
+    var g = Bits(777)
+
+    for _ in 0..<4000
+        val x = f32.from_bits(u32(g.next() >> 32))
+
+        for spec in ["%g", "%.9g", "%e", "%.3f", "%.50f", "%#G"]
+            assert_eq(format_f32(x, spec, 0, -1), c_format(real(x), spec))
+
+    assert_eq(format_f32(f32(0.1), "%.10f", 0, -1), "0.1000000015")
+    assert_eq(format_f32(f32.from_bits(1), "%g", 0, -1), "1.4013e-45")
+end f32_matches_c
+
+@test("float_digits rounds at a position and reports where the first digit stands")
+digits_at_a_position()
+    var into: [800]u8 = [0; 800]
+
+    // 9.96 to one decimal carries into a new first digit.
+    val v = real_value(9.96)
+    val got = float_digits(v.m, v.e, 0, -1, into[..])
+
+    assert_eq(from_utf8(into[0..<got.0]).unwrap(), "1")
+    assert_eq(got.1, 1)
+
+    // 0.0004 at three decimals is nothing, and 0.0006 is one unit there.
+    val small = real_value(0.0004)
+
+    assert_eq(float_digits(small.m, small.e, 0, -3, into[..]).0, 0)
+
+    val up = real_value(0.0006)
+    val one = float_digits(up.m, up.e, 0, -3, into[..])
+
+    assert_eq(one.0, 1)
+    assert_eq(one.1, -3)
+end digits_at_a_position
+
+// Ryu's own test vectors (d2s_test.cc and f2s_test.cc), as bit patterns, with what this library
+// spells them as: the digits are Ryu's, and the spelling `%g`'s.
+private double_vectors() -> [](u64, string) = [
+    (0x7fefffffffffffff, "1.7976931348623157e+308"), (0x0000000000000001, "5e-324"),
+    (0x0010000000000000, "2.2250738585072014e-308"), (0x000fffffffffffff, "2.225073858507201e-308"),
+    (0xc3420e3b3d1d1b2b, "-10164394343937622"), (0x00000000003a7c43, "1.8937037e-317"),
+    (0x000000005b7d4a6e, "7.58359991e-315"), (0x00000233f6a0a1a2, "1.196727936741e-311"),
+    (0x43402f0f5dd60000, "9.1106853453824e+15"), (0x434055f86e5a6ba8, "9196250238080848"),
+    (0x43e05d0a2d0fc8d2, "9.432878928764506e+18"), (0x3ff3c0ca2a5b1d5d, "1.2345678"),
+    (0x4830f0cf064dd592, "5.764607523034235e+39"), (0x4840f0cf064dd592, "1.152921504606847e+40"),
+    (0x4850f0cf064dd592, "2.305843009213694e+40"), (0x3e60000000000000, "2.9802322387695312e-08"),
+    (0x3fb999999999999a, "0.1"), (0x44b52d02c7e14af6, "1e+23"), (0x4415af1d78b58c40, "1e+20"),
+    (0x0000000000000002, "1e-323"), (0x433fffffffffffff, "9007199254740991"),
+    (0x4340000000000000, "9007199254740992"), (0x3e7ffffffff8c3b0, "1.1920928954450537e-07")]
+
+private float_vectors() -> [](u32, string) = [
+    (0x7f7fffff, "3.4028235e+38"), (0x00000001, "1e-45"), (0x00800000, "1.1754944e-38"),
+    (0x007fffff, "1.1754942e-38"), (0x6380f7a0, "4.758053e+21"), (0x4b000000, "8388608"),
+    (0x4b800000, "16777216"), (0x4c000004, "33554450"), (0x4c800b0d, "67131496"),
+    (0x00d24584, "1.9310392e-38"), (0x800000b0, "-2.47e-43"), (0x00d90b88, "1.993244e-38"),
+    (0x45803f34, "4103.9004"), (0x4fa00000, "5368709000"), (0x00333333, "4.701977e-39"),
+    (0x3a8722c3, "0.0010310042"), (0x5c800041, "2.882326e+17"), (0x15ae43fd, "7.038531e-26"),
+    (0x5d4cccfb, "9.223404e+17"), (0x4c800001, "67108870"), (0x57800ed8, "281602500000000"),
+    (0x5f000000, "9.223372e+18"), (0x700000f0, "1.5846086e+29"), (0x5f23e9ac, "1.1811161e+19"),
+    (0x5e9502f9, "5.368709e+18"), (0x5e8012b1, "4.6143166e+18"), (0x3c000028, "0.007812537"),
+    (0x60cde861, "1.18697725e+20"), (0x03aa2a50, "1.00014165e-36"), (0x43480000, "200"),
+    (0x4c000000, "33554432"), (0x3dcccccd, "0.1")]
+
+private extern "strtof" c_strtof(p: *u8, end: **u8) -> f32
+private extern "strtod" c_strtod(p: *u8, end: **u8) -> real
+
+// What C reads the text as, at both widths.
+private c_reads(text: string) -> (f32, real)
+    var b: [40]u8 = [0; 40]
+
+    for i in 0..<text.bytes.len
+        b[i] = text.bytes[i]
+
+    var end: *u8 = null
+
+    (c_strtof(&b[0], &end), c_strtod(&b[0], &end))
+end c_reads
+
+// Checked against numpy's Dragon4 over 200,000 random patterns of each width when this was written,
+// with no difference; what the suite keeps, beside Ryu's vectors, is the half a reader can see: the
+// text reads back as the same float.
+@test("the shortest reading of random reals and f32s reads back as the same value through C")
+shortest_reads_back()
+    var g = Bits(31337)
+
+    for _ in 0..<20000
+        val r = g.next()
+        val x = f32.from_bits(u32(r >> 32))
+        val y = real.from_bits(r)
+
+        if x == x
+            assert_eq(c_reads(shortest(x)).0.bits(), x.bits())
+
+        if y == y
+            assert_eq(c_reads(shortest(y)).1.bits(), y.bits())
+    end for
+end shortest_reads_back
+
+@test("Ryu's vectors read at their shortest, for a real and for an f32")
+ryu_vectors()
+    for v in double_vectors()
+        assert_eq(shortest(real.from_bits(v.0)), v.1)
+
+    for v in float_vectors()
+        assert_eq(shortest(f32.from_bits(v.0)), v.1)
+
+    assert_eq(shortest(f32(0.1)), "0.1")
+    assert_eq(shortest(real(f32(0.1))), "0.10000000149011612")
+    assert_eq(shortest(-0.0), "-0")
+    assert_eq(shortest(f32(-0.0)), "-0")
+    assert_eq(shortest(f32(real.infinity)), "inf")
+    assert_eq(shortest(f32(real.nan)), "nan")
+end ryu_vectors

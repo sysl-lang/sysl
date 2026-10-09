@@ -10,6 +10,8 @@
 module sysl.fmt
 
 import sysl.text.from_utf8_unchecked
+import sysl.buf.byte_sink
+import sysl.{FloatField, FloatValue, f32_value, real_value, shortest_f32, shortest_real, write_float_field}
 
 /** An integer rendered through a printf specifier, written here rather than handed to C's
  * `snprintf`, so a target with no C library formats `${n}%d` exactly as a hosted one does.
@@ -141,6 +143,101 @@ format_int(n: i128, bits: int, spec: string, width: int, precision: int) -> stri
 
     if left then field + run_of(" ", pad) else run_of(" ", pad) + field
 end format_int
+
+/** A float rendered through a printf specifier, written here rather than handed to C's `snprintf`,
+ * so a target with no C library formats `${x}%.3f` exactly as a hosted one does -- and a hosted one
+ * prints what it printed before.
+ *
+ * `spec` is the whole specifier, `%` to conversion letter, which is one of `f`, `e`, `g` or an upper
+ * case `F`, `E`, `G`; a `*` in it reads `width` or `precision` as `format_int`'s does. The digits are
+ * the exact value's, rounded half to even at the position the conversion names, whatever the
+ * precision -- `${0.125}%.2f` is `0.12` and `${2.5}%.0f` is `2` -- and the rest is C's, flag for
+ * flag: `%e`'s exponent has at least two digits, `%g` takes the precision as significant digits
+ * and drops trailing zeros unless `#` keeps them, `0` pads after the sign, and an infinity or a NaN
+ * is `inf` or `nan` (upper case under an upper-case letter), never padded with zeros, a NaN carrying
+ * no sign.
+ */
+format_real(x: real, spec: string, width: int, precision: int) -> string =
+    float_text(real_value(x), spec, width, precision)
+
+/** An `f32` under a printf specifier, as `format_real` renders the same value: an `f32` holds nothing
+ * a `real` cannot, so the text is the same, and it is taken apart at its own width so that no double
+ * arithmetic is asked of a machine that has only single precision.
+ */
+format_f32(x: f32, spec: string, width: int, precision: int) -> string =
+    float_text(f32_value(x), spec, width, precision)
+
+/** The fewest digits that read back as `x` -- among those, the closest to it, and a tie to the even
+ * digit -- spelled as `%g` spells a number: `0.1`, `1e+23`, `5e-324`, `-0`, `inf`, `nan`. It is the
+ * text a serializer wants, where `%g`'s six digits lose the value and seventeen print noise. The
+ * algorithm is Ryu.
+ */
+shortest(x: real) -> string
+    var buf: [32]u8
+
+    from_utf8_unchecked(buf[0..<shortest_real(x, buf[..])])
+
+/** The fewest digits that read back as the same `f32`, which is shorter than its widened `real`
+ * needs: `shortest(f32(0.1))` is `0.1`, and `shortest(real(f32(0.1)))` is `0.10000000149011612`.
+ */
+shortest(x: f32) -> string
+    var buf: [32]u8
+
+    from_utf8_unchecked(buf[0..<shortest_f32(x, buf[..])])
+
+private float_text(v: FloatValue, spec: string, width: int, precision: int) -> string
+    var sink = byte_sink()
+    var digits: [800]u8
+
+    write_float_field(&sink, v, float_field(spec, width, precision), digits[..])
+    from_utf8_unchecked(sink.text())
+
+// A float specifier's flags, width and precision, read as `format_int` reads an integer's.
+private float_field(spec: string, width: int, precision: int) -> FloatField
+    val b = spec.bytes
+    val last = b.len - 1
+    var f = FloatField(b[last], 0, -1, false, false, false, false, false)
+    var i: usize = 1
+
+    while i < last && is_flag(b[i])
+        if b[i] == u8('-') then f.left = true
+        if b[i] == u8('+') then f.plus = true
+        if b[i] == u8(' ') then f.space = true
+        if b[i] == u8('0') then f.zero = true
+        if b[i] == u8('#') then f.alt = true
+
+        i += 1
+
+    if i < last && b[i] == u8('*')
+        f.width = width
+        i += 1
+    else
+        while i < last && is_digit(b[i])
+            f.width = f.width * 10 + int(b[i] - u8('0'))
+            i += 1
+    end if
+
+    if f.width < 0
+        f.left = true
+        f.width = -f.width
+    end if
+
+    if i < last && b[i] == u8('.')
+        i += 1
+
+        if i < last && b[i] == u8('*')
+            f.prec = if precision < 0 then -1 else precision
+        else
+            f.prec = 0
+
+            while i < last && is_digit(b[i])
+                f.prec = f.prec * 10 + int(b[i] - u8('0'))
+                i += 1
+        end if
+    end if
+
+    f
+end float_field
 
 /** An integer in base sixteen, as the string `f"$v%x"` makes, for code that wants the text without
  * writing an `f"…"`. `width` is a minimum count of digits, padded with zeros on the left, and `upper`

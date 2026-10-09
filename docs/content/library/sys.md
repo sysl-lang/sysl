@@ -71,8 +71,8 @@ private[sysl] extern "cbrt"      sysl_cbrt(x: f64) -> f64
 
 **An extern's *symbol* is not qualified and cannot be.** It names something the linker already has,
 and the linker knows nothing about sysl's modules. So the sysl-side name is what had to move, and
-moving it is what keeps `putchar`, `sqrt`, `pow`, `floor`, `read`, `memchr` and `strtod` free for a
-program to declare itself:
+moving it is what keeps `putchar`, `sqrt`, `pow`, `floor`, `read` and `memchr` free for a program to
+declare itself — and a name the library has no use for, `strtod` here, is free the same way:
 
 ```sysl
 import sysl.text.cstring
@@ -100,8 +100,8 @@ hi
 3.5
 ```
 
-Those three names are the program's, bound to the same three symbols the library is bound to, and
-nothing collides. Spending seven ordinary words out of every program's namespace would have bought
+Those three names are the program's, and the first two are bound to the same symbols the library is
+bound to, and nothing collides. Spending six ordinary words out of every program's namespace would have bought
 nothing, and programs had already declared their own `sqrt` before there was a module to ask.
 
 ## The two halves
@@ -112,10 +112,8 @@ nothing, and programs had already declared their own `sqrt` before there was a m
 |---|---|
 | `sysl_stdout_write` | every buffer `print` and `prints` emit on a hosted target — one `fwrite` to `stdout`, in a line of the library's own C, since `stdout` is a macro on Darwin that no `extern` reaches |
 | `putchar` | every byte `print` and `prints` emit on a freestanding target, where the board supplies it |
-| `snprintf` | formatting a number into text |
 | `read` | `sysl.io`'s `FdReader`, and `stdin()` under it |
 | `memchr` | `find_byte`, and the line splitting built on it |
-| `strtod` | `parse_real` |
 
 **`math.sysl`** — what `sysl.math` asks of the machine and of the C mathematics library. Roots,
 exponentials and logarithms; powers and `hypot`; the circular and hyperbolic trigonometry; the four

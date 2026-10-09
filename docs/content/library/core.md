@@ -371,9 +371,9 @@ calls with a space between and a newline at the end.
 | static type | renderer | what it does |
 |---|---|---|
 | `string` | `prints` | the bytes, as they are |
-| any signed integer | `printi` | through `snprintf`'s `%lld` |
-| any unsigned integer | `printu` | through `snprintf`'s `%llu` |
-| `real`, `f32` | `printr` | through `snprintf`'s `%g` |
+| any signed integer | `printi` | its decimal digits, as `%lld` writes them, divided out in sysl |
+| any unsigned integer | `printu` | its decimal digits, as `%llu` writes them |
+| `real`, `f32` | `printr` | `%g`, correctly rounded in sysl |
 | `bool` | `printb` | `true` or `false` |
 | `char` | `printc` | UTF-8 encoded in sysl, not by C |
 | anything else | its `Display` | via `str`, which renders into a buffer |
@@ -389,7 +389,10 @@ print(1.0 / 3.0)
 ```
 
 `0.333333` rather than `0.3333333333333333` because `%g` is six significant digits by default —
-which is C's default and stays C's, since the whole of `printr` is one `snprintf` call.
+C's default, kept so that a number prints the way a C programmer expects. `printr` renders it in sysl
+([`sysl.fmt`](/library/fmt/#floats) has the rules), so it needs no C library and prints the same on a
+board as on a desktop; [`shortest`](/library/fmt/#the-shortest-reading) is the reading that keeps
+every digit the value needs.
 
 The renderers are ordinary functions and a program may call them directly. Nothing separates them,
 so this is where the space between `print`'s arguments visibly comes from — there isn't one:
@@ -414,8 +417,7 @@ putbytes("|end\n".bytes)
 ### Everything goes through one sink, and that is not incidental
 
 `putbytes` is the bottom of the whole surface. Every function above writes through it, including the
-ones that went to `snprintf` for their digits — they format into a stack buffer and then hand the
-bytes here.
+numbers — they render into a stack buffer and then hand the bytes here.
 
 Two mechanisms would mean two buffers, and output emerging in an order the program did not write.
 That is the entire reason for the shape.

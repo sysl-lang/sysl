@@ -437,14 +437,15 @@ print(str(42), str(true), str('é'), str(2.5), str("already"))
 | integer | its decimal digits, with a sign for a negative signed value |
 | `bool` | `"true"` or `"false"` |
 | `char` | the one scalar value's UTF-8 |
-| float | the same `%g` rendering `print` gives it |
+| float | the same `%g` rendering `print` gives it — six significant digits, correctly rounded |
 | `string` | itself, unchanged |
 
 Every case but a `string` allocates a fresh buffer; a `string` is returned as it is, and a `bool`
-renders to one of two immortal literals and allocates nothing. An integer is rendered without the C
-library — the digits are divided out into a scratch buffer, which is correct even for the most
-negative value because the magnitude is taken in unsigned arithmetic. A float goes through
-`snprintf`, the one case that needs libc, chosen so that `str(x)` and `print(x)` can never disagree.
+renders to one of two immortal literals and allocates nothing. Every number is rendered without the
+C library. An integer's digits are divided out into a scratch buffer, which is correct even for the
+most negative value because the magnitude is taken in unsigned arithmetic. A float goes through the
+library's [`sysl.fmt.format_real`](/library/fmt/#floats), the renderer `print` uses too, so
+`str(x)` and `print(x)` can never disagree and a board with no C library renders one the same way.
 
 **Any other type renders through `Display`.** A struct or an enum carrying an `impl` writes itself
 into a growable buffer, and the bytes that land there become the string — so `str` of a user type is
@@ -561,24 +562,32 @@ print(f"[${n}%+05d] [${n}%x] [${n}%#o] [${255}%#b] [${42}%-6u]")
 [-0006] [fa] [0372] [0b11111111] [42    ]
 ```
 
-**An integer conversion is rendered by sysl itself** (`sysl.fmt.format_int`), flag for flag as C
-renders it, so it works the same on a target with no C library. A float conversion and `%s` over a
-string are applied by C's `snprintf`, so on a target without the [`libc`](/reference/packages/#capabilities)
-capability — a freestanding one whose manifest does not grant it — a reached one is refused where it
-is written:
+**A number's conversion is rendered by sysl itself**, flag for flag as C renders it — an integer by
+`sysl.fmt.format_int`, a float by [`format_real`](/library/fmt/#floats), whose digits are the exact
+value's, rounded half to even at whatever precision is asked — so it works the same on a target with
+no C library. A float specifier, a plain hole of a float and `str` of one all build for a bare board:
 
 ```sysl target=aarch64-freestanding build=c
 @export("probe")
-probe(x: real) -> usize = f"${x}%.2f".bytes.len
+probe(x: real, y: f32) -> usize = f"${x}%.3f ${y}%e".bytes.len + s"$x".bytes.len
+```
+
+Only `%s` over a string is still applied by C's `snprintf`, so on a target without the
+[`libc`](/reference/packages/#capabilities) capability — a freestanding one whose manifest does not
+grant it — a reached one is refused where it is written:
+
+```sysl target=aarch64-freestanding build=c
+@export("probe")
+probe(s: string) -> usize = f"${s}%8s".bytes.len
 ```
 
 ```error
-'%.2f' is applied by C's 'snprintf', and 'aarch64-freestanding' has no C library under it to supply one
+'%8s' is applied by C's 'snprintf', and 'aarch64-freestanding' has no C library under it to supply one
 ```
 
 The refusal ends by naming the way out where the board does have one: `targets { aarch64-freestanding
 { capabilities { libc = true } } }` in `package.hocon`, after which the same block builds and leaves
-`snprintf` for the board's link to find.
+`snprintf` for the board's link to find. A plain hole of a string needs no C at all.
 
 **A width or a precision may be a hole of its own**, read when the line runs — C's `%*d` and `%.*f`,
 written where the digits would go. Flags stay as they are, and either count, or both, may be a hole:

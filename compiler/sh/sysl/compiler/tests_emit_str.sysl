@@ -336,27 +336,16 @@ a_char_renders_as_its_utf8_bytes()
               "}\n")
 end a_char_renders_as_its_utf8_bytes
 
-@test("str of a float goes out through snprintf, which is what print uses too")
-a_float_renders_through_c()
+@test("str of a float is the library's format_real under %g, which is what print renders too")
+a_float_renders_through_the_library()
     if no_str_library() then return
 
-    assert_eq(str_lowered(
-                  "sf(f: f64) -> string = str(f)\n" +
-                  "main() = prints(sf(1.5))\n",
-              "sf"),
-              "define { ptr, ptr, i64 } @sf(double %f.param) {\n" +
-              "entry:\n" +
-              "  %f.addr = alloca double\n" +
-              "  store double %f.param, ptr %f.addr\n" +
-              "  %t1 = load double, ptr %f.addr\n" +
-              "  %t2 = call { ptr, ptr, i64 } @sysl.str.float(double %t1)\n" +
-              "  %t3 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
-              "  call void @arc.retain_maybe(ptr %t3)\n" +
-              "  %t4 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
-              "  call void @arc.release_maybe(ptr %t4)\n" +
-              "  ret { ptr, ptr, i64 } %t2\n" +
-              "}\n")
-end a_float_renders_through_c
+    val ir = str_lowered("sf(f: f64) -> string = str(f)\n" + "main() = prints(sf(1.5))\n", "sf")
+
+    assert(ir.contains("format_real"), ir)
+    assert(!ir.contains("@sysl.str.float"), ir)
+    assert(!ir.contains("fpext"), ir)
+
 
 // An integer conversion is the library's `format_int`, handed the value at `i128` and the width of
 // its type, which is what an unsigned conversion reads it at; C's `snprintf` is not called.
@@ -399,28 +388,18 @@ a_string_specifier_goes_through_a_nul_terminated_copy()
               "}\n")
 end a_string_specifier_goes_through_a_nul_terminated_copy
 
-@test("format of a float widens to double and hands the specifier straight over")
-a_float_specifier_passes_a_double()
+@test("format of an f32 hands the f32 and the specifier to format_f32, never widening it")
+a_float_specifier_passes_the_f32()
     if no_str_library() then return
 
-    assert_eq(str_lowered(
-                  "ff(f: f32) -> string = format(f, \"%.2f\")\n" +
-                  "main() = prints(ff(1.0))\n",
-              "ff"),
-              "define { ptr, ptr, i64 } @ff(float %f.param) {\n" +
-              "entry:\n" +
-              "  %f.addr = alloca float\n" +
-              "  store float %f.param, ptr %f.addr\n" +
-              "  %t2 = load float, ptr %f.addr\n" +
-              "  %t3 = fpext float %t2 to double\n" +
-              "  %t1 = call { ptr, ptr, i64 } @sysl.str.fmt_f(ptr @.str1, double %t3)\n" +
-              "  %t4 = extractvalue { ptr, ptr, i64 } %t1, 0\n" +
-              "  call void @arc.retain_maybe(ptr %t4)\n" +
-              "  %t5 = extractvalue { ptr, ptr, i64 } %t1, 0\n" +
-              "  call void @arc.release_maybe(ptr %t5)\n" +
-              "  ret { ptr, ptr, i64 } %t1\n" +
-              "}\n")
-end a_float_specifier_passes_a_double
+    val ir = str_lowered("ff(f: f32) -> string = format(f, \"%.2f\")\n" + "main() = prints(ff(1.0))\n",
+                         "ff")
+
+    assert(ir.contains("format_f32"), ir)
+    assert(ir.contains("(float %t"), ir)
+    assert(!ir.contains("fpext"), ir)
+    assert(!ir.contains("@sysl.str.fmt_f"), ir)
+
 
 @test("a []u8 read as a string copies the bytes, since a string that could change was never validated")
 bytes_taken_as_a_string_are_copied()

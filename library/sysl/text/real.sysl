@@ -1,0 +1,552 @@
+module sysl.text
+
+import sysl.Big
+import sysl.bits_of64
+
+// Decimal text to the nearest float, correctly rounded, in sysl and with integer arithmetic only.
+//
+// **Nearly every input is one multiplication.** The first nineteen significant digits fit a `u64`
+// `w`, and the value is `w * 10^q`. Eisel and Lemire's algorithm (Lemire, "Number Parsing at a
+// Gigabyte per Second", 2021) multiplies `w` by a 128-bit approximation of `5^q` from a table, and the
+// top bits of the product are the float's significand, with an exponent read off `q` by a linear
+// formula. Mushtak and Lemire proved ("Fast Number Parsing Without Fallback", 2023) that for an exact
+// `w` the answer is always the correctly rounded one, so for up to nineteen digits there is nothing
+// more to do.
+//
+// **A longer number is bracketed.** Its first nineteen digits are a lower bound and those digits plus
+// one an upper bound; where both round to the same float, so does everything between them. Where
+// they do not, the value sits within a hair of the halfway point between two floats, and the only
+// way to say which side is to compare the whole decimal against that point exactly. That is done with
+// big integers: the decimal's digits (at most 768 of them matter, the longest a halfway point between
+// two doubles can be, and one more stands for anything non-zero after them) against the halfway
+// point's significand, each side scaled by the powers of two and five that make both integers.
+
+/** The limits of one binary format: the explicit significand's bits, the exponent bias, the biased
+ * exponent of an infinity, the powers of ten past which every `w` is zero or infinite, and the narrow
+ * range of powers in which a product can land exactly half way.
+ */
+private struct Format
+    significand: int
+    bias: int
+    infinite: int
+    smallest_ten: int
+    largest_ten: int
+    even_low: int
+    even_high: int
+
+private double_format() -> Format = Format(52, 1023, 0x7ff, -342, 308, -4, 23)
+
+private single_format() -> Format = Format(23, 127, 0xff, -64, 38, -17, 10)
+
+/** The longest prefix of `b` that reads as a `real`, the value it reads as, and how many bytes it is
+ * -- zero, and a zero value, where no prefix reads as one. This is C's `strtod`, reading what it
+ * reads: leading white space, a sign, then a decimal (`12`, `1.5`, `.5`, `1.`, with an optional
+ * exponent `e-7`), a hexadecimal float (`0x1.8p3`), `inf` or `infinity`, or `nan` with an optional
+ * `(chars)`, every letter in any case. An exponent with no digits after it is not part of the number,
+ * so `1e+` reads as `1` and takes one byte.
+ *
+ * The value is the nearest `real` to the decimal, half way to the even one, however many digits it
+ * has; past the largest finite value it is an infinity, and below half the smallest it is a zero of
+ * the written sign.
+ */
+real_prefix(b: []const u8) -> (real, usize)
+    val got = scan(b, double_format())
+
+    (real.from_bits(got.0), got.1)
+
+/** The same for an `f32`, rounded once to the nearest `f32` rather than through a `real` -- rounding
+ * twice would move a value lying near half way between two `f32`s.
+ */
+f32_prefix(b: []const u8) -> (f32, usize)
+    val got = scan(b, single_format())
+
+    (f32.from_bits(u32(got.0)), got.1)
+
+// The bits of the value and the length of the prefix, the sign bit at the format's top.
+private scan(b: []const u8, f: Format) -> (u64, usize)
+    val width = if f.bias == 1023 then 64 else 32
+    val sign_bit = u64(1) << (width - 1)
+    val infinity = u64(f.infinite) << f.significand
+    var i: usize = 0
+
+    while i < b.len && is_space(b[i])
+        i += 1
+
+    var sign: u64 = 0
+
+    if i < b.len && (b[i] == u8('+') || b[i] == u8('-'))
+        if b[i] == u8('-') then sign = sign_bit
+
+        i += 1
+    end if
+
+    if word_at(b, i, "inf")
+        val end = if word_at(b, i, "infinity") then i + 8 else i + 3
+
+        return (sign | infinity, end)
+    end if
+
+    if word_at(b, i, "nan")
+        val quiet = u64(1) << (f.significand - 1)
+        var end = i + 3
+        var payload: u64 = 0
+
+        if end < b.len && b[end] == u8('(')
+            var j = end + 1
+
+            while j < b.len && (is_alnum(b[j]) || b[j] == u8('_'))
+                j += 1
+
+            if j < b.len && b[j] == u8(')')
+                payload = nan_payload(b[end + 1..<j]) & (quiet - 1)
+                end = j + 1
+            end if
+        end if
+
+        return (sign | infinity | quiet | payload, end)
+    end if
+
+    if i + 1 < b.len && b[i] == u8('0') && (b[i + 1] | 0x20) == u8('x')
+        val hex = scan_hex(b, i + 2, f)
+
+        if hex.1 > 0 then return (sign | hex.0, hex.1)
+    end if
+
+    val got = scan_decimal(b, i, f)
+
+    if got.1 == 0 then return (0, 0)
+
+    (sign | got.0, got.1)
+end scan
+
+// A decimal from `start`: the bits of its magnitude and where it ends, or an end of zero where there
+// is no digit to read.
+private scan_decimal(b: []const u8, start: usize, f: Format) -> (u64, usize)
+    var i = start
+    var w: u64 = 0
+    var significant = 0
+    var shift = 0
+    var truncated = false
+    var first = 0
+    var any = false
+
+    while i < b.len && is_digit(b[i])
+        val d = u64(b[i] - u8('0'))
+
+        any = true
+
+        if significant > 0 || d != 0
+            if significant == 0 then first = int(i)
+
+            if significant < 19
+                w = w * 10 + d
+            else
+                shift += 1
+
+                if d != 0 then truncated = true
+            end if
+
+            significant += 1
+        end if
+
+        i += 1
+    end while
+
+    val whole_end = i
+
+    if i < b.len && b[i] == u8('.')
+        var j = i + 1
+        var fraction = false
+
+        while j < b.len && is_digit(b[j])
+            val d = u64(b[j] - u8('0'))
+
+            fraction = true
+
+            if significant > 0 || d != 0
+                if significant == 0 then first = int(j)
+
+                if significant < 19
+                    w = w * 10 + d
+                    shift -= 1
+                elif d != 0
+                    truncated = true
+
+                significant += 1
+            else
+                shift -= 1
+            end if
+
+            j += 1
+        end while
+
+        if any || fraction
+            any = true
+            i = j
+        end if
+    end if
+
+    if !any then return (0, 0)
+
+    val digits_end = i
+    var written = 0
+
+    if i < b.len && (b[i] | 0x20) == u8('e')
+        var j = i + 1
+        var negative = false
+
+        if j < b.len && (b[j] == u8('+') || b[j] == u8('-'))
+            negative = b[j] == u8('-')
+            j += 1
+        end if
+
+        if j < b.len && is_digit(b[j])
+            while j < b.len && is_digit(b[j])
+                if written < 100000 then written = written * 10 + int(b[j] - u8('0'))
+
+                j += 1
+
+            if negative then written = -written
+
+            i = j
+        end if
+    end if
+
+    if w == 0 then return (0, i)
+
+    val q = written + shift
+    var bits = eisel_lemire(w, q, f)
+
+    if truncated && eisel_lemire(w + 1, q, f) != bits
+        bits = settle(b, usize(first), whole_end, digits_end, written, bits, f)
+
+    (bits, i)
+end scan_decimal
+
+/** The float nearest `w * 10^q`, as bits with no sign, where `w` is exact. It is the computation
+ * Eisel-Lemire is, step for step as `fast_float` writes it: normalize `w`, multiply by the table's
+ * power (asking for its low half only where the high half leaves the answer in doubt), take the
+ * significand and one bit more from the top of the product, and round.
+ */
+private eisel_lemire(w: u64, q: int, f: Format) -> u64
+    if w == 0 || q < f.smallest_ten then return 0
+
+    val infinity = u64(f.infinite) << f.significand
+
+    if q > f.largest_ten then return infinity
+
+    val lz = 64 - int(bits_of64(w))
+    val ws = w << lz
+    val power = pow5_128[q + 342]
+    val first = u128(ws) * (power >> 64)
+    var high = u64(first >> 64)
+    var low = u64(first)
+    val ones: u64 = 0xffffffffffffffff
+    val mask = ones >> (f.significand + 3)
+
+    if (high & mask) == mask
+        val second = u64((u128(ws) * u128(u64(power))) >> 64)
+
+        low += second
+
+        if second > low then high += 1
+    end if
+
+    val upper = int(high >> 63)
+    val shift = upper + 64 - f.significand - 3
+    var mantissa = high >> shift
+    var power2 = ((217706 * q) >> 16) + 63 + upper - lz + f.bias
+
+    if power2 <= 0
+        // Below the normal range: shift the significand down to where the smallest exponent puts it.
+        // Rounding up may carry it back into the normal range, which its bits then say on their own.
+        if -power2 + 1 >= 64 then return 0
+
+        mantissa >>= -power2 + 1
+        mantissa += mantissa & 1
+
+        return mantissa >> 1
+    end if
+
+    // A product with nothing below the significand's rounding bit lies exactly half way, which can
+    // only happen where 5^q fits the product whole; there the tie goes to the even significand.
+    if low <= 1 && q >= f.even_low && q <= f.even_high && (mantissa & 3) == 1
+        if (mantissa << shift) == high then mantissa &= ~u64(1)
+
+    mantissa += mantissa & 1
+    mantissa >>= 1
+
+    if mantissa >= (u64(2) << f.significand)
+        mantissa = u64(1) << f.significand
+        power2 += 1
+    end if
+
+    if power2 >= f.infinite then return infinity
+
+    (u64(power2) << f.significand) | (mantissa & ((u64(1) << f.significand) - 1))
+end eisel_lemire
+
+/** The float a long decimal rounds to, given `below`, the one its first nineteen digits round to: the
+ * answer is `below` or the float after it, and which is whichever side of the halfway point between
+ * them the decimal lies on, compared exactly. A decimal on the point itself goes to the even one.
+ *
+ * `first` is the first significant digit, `whole_end` where the digits before any point end, and
+ * `digits_end` where the digits end; `written` is the exponent written after them.
+ */
+private settle(b: []const u8, first: usize, whole_end: usize, digits_end: usize, written: int,
+               below: u64, f: Format) -> u64
+    var lhs: Big[90] = Big([0; 90], 0)
+    var taken = 0
+    var chunk: u32 = 0
+    var in_chunk = 0
+    var sticky = false
+
+    // The point is somewhere among the digits; the power of ten the last one taken stands for is
+    // worked out from where the first one was.
+    var scale = if first < whole_end then int(whole_end - first) else -int(first - whole_end - 1)
+
+    for i in first..<digits_end
+        if b[i] == u8('.') then continue
+
+        if taken == 768
+            if b[i] != u8('0') then sticky = true
+
+            continue
+        end if
+
+        chunk = chunk * 10 + u32(b[i] - u8('0'))
+        in_chunk += 1
+        taken += 1
+
+        if in_chunk == 9
+            lhs.mul_small(1000000000)
+            lhs.add_small(chunk)
+            chunk = 0
+            in_chunk = 0
+        end if
+    end for
+
+    if sticky
+        chunk = chunk * 10 + 1
+        in_chunk += 1
+        taken += 1
+    end if
+
+    if in_chunk > 0
+        var ten: u32 = 1
+
+        for _ in 0..<in_chunk
+            ten *= 10
+
+        lhs.mul_small(ten)
+        lhs.add_small(chunk)
+    end if
+
+    // The decimal is lhs * 10^q2.
+    val q2 = written + scale - taken
+
+    // The halfway point is (2m + 1) * 2^(e - 1), m the significand with its hidden bit.
+    val biased = int(below >> f.significand)
+    val fraction = below & ((u64(1) << f.significand) - 1)
+    val m = if biased == 0 then fraction else fraction | (u64(1) << f.significand)
+    val e = (if biased == 0 then 1 else biased) - f.bias - f.significand
+    var rhs: Big[90] = Big([0; 90], 0)
+
+    rhs.set(2 * m + 1)
+
+    val lhs_twos = q2
+    val rhs_twos = e - 1
+
+    if q2 >= 0 then lhs.mul_pow5(q2) else rhs.mul_pow5(-q2)
+
+    if lhs_twos > rhs_twos then lhs.shl(lhs_twos - rhs_twos) else rhs.shl(rhs_twos - lhs_twos)
+
+    val c = lhs.cmp(&rhs)
+
+    if c > 0 || (c == 0 && (below & 1) == 1) then below + 1 else below
+end settle
+
+// A hexadecimal float's digits from `start`, after its `0x`: the bits of its magnitude and where it
+// ends, or an end of zero where no hexadecimal digit follows.
+private scan_hex(b: []const u8, start: usize, f: Format) -> (u64, usize)
+    var i = start
+    var m: u64 = 0
+    var exp = 0
+    var sticky = false
+    var any = false
+
+    while i < b.len && hex_value(b[i]) >= 0
+        val d = u64(hex_value(b[i]))
+
+        any = true
+
+        if (m >> 60) == 0
+            m = m * 16 + d
+        else
+            exp += 4
+
+            if d != 0 then sticky = true
+        end if
+
+        i += 1
+    end while
+
+    if i < b.len && b[i] == u8('.')
+        var j = i + 1
+        var fraction = false
+
+        while j < b.len && hex_value(b[j]) >= 0
+            val d = u64(hex_value(b[j]))
+
+            fraction = true
+
+            if (m >> 60) == 0
+                m = m * 16 + d
+                exp -= 4
+            elif d != 0
+                sticky = true
+
+            j += 1
+        end while
+
+        if any || fraction
+            any = true
+            i = j
+        end if
+    end if
+
+    if !any then return (0, 0)
+
+    if i < b.len && (b[i] | 0x20) == u8('p')
+        var j = i + 1
+        var negative = false
+        var written = 0
+
+        if j < b.len && (b[j] == u8('+') || b[j] == u8('-'))
+            negative = b[j] == u8('-')
+            j += 1
+        end if
+
+        if j < b.len && is_digit(b[j])
+            while j < b.len && is_digit(b[j])
+                if written < 100000 then written = written * 10 + int(b[j] - u8('0'))
+
+                j += 1
+
+            exp += if negative then -written else written
+            i = j
+        end if
+    end if
+
+    (round_binary(m, exp, sticky, f), i)
+end scan_hex
+
+/** The float nearest `m * 2^e`, where `sticky` says something non-zero was dropped below `m`'s last
+ * bit -- a hexadecimal float's rounding, which is binary to binary and so needs nothing but shifts.
+ */
+private round_binary(m: u64, e: int, sticky: bool, f: Format) -> u64
+    if m == 0 then return 0
+
+    val lz = 64 - int(bits_of64(m))
+    val top = m << lz
+    var biased = e - lz + 63 + f.bias
+
+    if biased >= f.infinite then return u64(f.infinite) << f.significand
+
+    // How many of the 64 bits survive: the significand and its hidden bit, or fewer below the
+    // normal range, where the exponent can go no lower.
+    var keep = f.significand + 1
+
+    if biased <= 0
+        keep = f.significand + biased
+        biased = 0
+    end if
+
+    if keep < 0 then return 0
+
+    var kept: u64 = 0
+    var up = false
+
+    if keep == 0
+        up = top > (u64(1) << 63) || (top == (u64(1) << 63) && sticky)
+    else
+        val drop = 64 - keep
+        val rest = top & ((u64(1) << drop) - 1)
+        val half = u64(1) << (drop - 1)
+
+        kept = top >> drop
+        up = rest > half || (rest == half && (sticky || (kept & 1) == 1))
+    end if
+
+    if up then kept += 1
+
+    if biased == 0
+        // A subnormal that rounded up to the smallest normal says so in its own bits.
+        return kept
+
+    if kept == (u64(2) << f.significand)
+        kept >>= 1
+        biased += 1
+    end if
+
+    if biased >= f.infinite then return u64(f.infinite) << f.significand
+
+    (u64(biased) << f.significand) | (kept & ((u64(1) << f.significand) - 1))
+end round_binary
+
+// The payload `nan(chars)` asks for: the characters read as an unsigned integer the way `strtoull`
+// reads one with no base given -- `0x` hexadecimal, a leading `0` octal, decimal otherwise -- or no
+// payload where they are not all one such number.
+private nan_payload(chars: []const u8) -> u64
+    var base: u64 = 10
+    var at: usize = 0
+
+    if chars.len > 1 && chars[0] == u8('0') && (chars[1] | 0x20) == u8('x')
+        base = 16
+        at = 2
+    elif chars.len > 0 && chars[0] == u8('0')
+        base = 8
+    end if
+
+    if at == chars.len then return 0
+
+    var v: u64 = 0
+
+    for i in at..<chars.len
+        val d = hex_value(chars[i])
+
+        if d < 0 || u64(d) >= base then return 0
+
+        v = v * base + u64(d)
+
+    v
+end nan_payload
+
+// Whether the letters at `at` are `word`, in any case.
+private word_at(b: []const u8, at: usize, word: string) -> bool
+    val w = word.bytes
+
+    if at + w.len > b.len then return false
+
+    for i in 0..<w.len
+        if (b[at + i] | 0x20) != w[i] then return false
+
+    true
+end word_at
+
+// C's `isspace` in the C locale.
+private is_space(c: u8) -> bool = c == u8(' ') || (c >= 9 && c <= 13)
+
+private is_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
+
+private is_alnum(c: u8) -> bool = is_digit(c) || ((c | 0x20) >= u8('a') && (c | 0x20) <= u8('z'))
+
+private hex_value(c: u8) -> int
+    if is_digit(c) then return int(c - u8('0'))
+
+    val l = c | 0x20
+
+    if l >= u8('a') && l <= u8('f') then return int(l - u8('a')) + 10
+
+    -1
+end hex_value

@@ -37,24 +37,53 @@ module sysl
  */
 private[sysl] shortest_real(x: real, into: []u8) -> usize
     val bits = x.bits()
-    val negative = bits >> 63 != 0
-    val biased = u32((bits >> 52) & 0x7ff)
+    val biased = int((bits >> 52) & 0x7ff)
     val fraction = bits & 0xfffffffffffff
+
+    // The significand and the exponent, less two more: the value and both edges of its interval
+    // are then `4m`, `4m + 2` and `4m - 1` or `4m - 2` times the same power of two, all integers.
+    val m2 = if biased == 0 then fraction else (u64(1) << 52) | fraction
+    val e2 = (if biased == 0 then 1 else biased) - 1023 - 52 - 2
+
+    spell_shortest(bits >> 63 != 0, biased == 0x7ff, fraction != 0, m2, e2,
+                   fraction != 0 || biased <= 1, into)
+end shortest_real
+
+/** The shortest reading of an `f32`, spelled as `shortest_real` spells a `real`: the fewest digits
+ * that read back as the same `f32`, which is usually fewer than its widened `real` needs -- `0.1f32`
+ * is `0.1` here and `0.10000000149011612` as a `real`.
+ */
+private[sysl] shortest_f32(x: f32, into: []u8) -> usize
+    val bits = x.bits()
+    val biased = int((bits >> 23) & 0xff)
+    val fraction = u64(bits & 0x7fffff)
+    val m2 = if biased == 0 then fraction else (u64(1) << 23) | fraction
+    val e2 = (if biased == 0 then 1 else biased) - 127 - 23 - 2
+
+    spell_shortest(bits >> 31 != 0, biased == 0xff, fraction != 0, m2, e2,
+                   fraction != 0 || biased <= 1, into)
+end shortest_f32
+
+// `special` is a biased exponent of all ones: an infinity, or a NaN where `nan` says so. `m2` zero
+// otherwise is a zero. `lower_half` says the neighbour below is as far away as the one above, which
+// it is except at a power of two.
+private spell_shortest(negative: bool, special: bool, nan: bool, m2: u64, e2: int, lower_half: bool,
+                       into: []u8) -> usize
     var at: usize = 0
 
-    if biased == 0x7ff && fraction != 0 then return put_text(into, 0, "nan")
+    if special && nan then return put_text(into, 0, "nan")
 
     if negative
         into[0] = u8('-')
         at = 1
 
-    if biased == 0x7ff then return put_text(into, at, "inf")
+    if special then return put_text(into, at, "inf")
 
-    if biased == 0 && fraction == 0
+    if m2 == 0
         into[at] = u8('0')
         return at + 1
 
-    val found = shortest_decimal(fraction, biased)
+    val found = shortest_decimal(m2, e2, lower_half)
     var digits: [20]u8
     val first = digits_ulong(found.0, digits[..])
     val count = digits.len - first
@@ -103,7 +132,7 @@ private[sysl] shortest_real(x: real, into: []u8) -> usize
     at = put_bytes(into, at, shown[0..<whole])
     into[at] = u8('.')
     put_bytes(into, at + 1, shown[whole..])
-end shortest_real
+end spell_shortest
 
 private put_bytes(into: []u8, at: usize, bytes: []const u8) -> usize
     for i in 0..<bytes.len
@@ -112,20 +141,12 @@ private put_bytes(into: []u8, at: usize, bytes: []const u8) -> usize
 
 private put_text(into: []u8, at: usize, text: string) -> usize = put_bytes(into, at, text.bytes)
 
-/** The fewest digits naming the double whose fraction bits and biased exponent are given, as those
- * digits and the power of ten they are scaled by: `(d, k)` reads as `d * 10^k`. The double must be
- * finite and not zero.
+/** The fewest digits naming the float `m2 * 2^(e2 + 2)`, as those digits and the power of ten they
+ * are scaled by: `(d, k)` reads as `d * 10^k`. The float must be finite and not zero; it may be a
+ * `real` or an `f32`, since the interval is worked out from `m2` and `e2` alone and the tables are
+ * wide enough for both.
  */
-private shortest_decimal(fraction: u64, biased: u32) -> (u64, int)
-    // The significand and the exponent, less two more: the value and both edges of its interval
-    // are then `4m`, `4m + 2` and `4m - 1` or `4m - 2` times the same power of two, all integers.
-    var e2: int = 1 - 1023 - 52 - 2
-    var m2 = fraction
-
-    if biased != 0
-        e2 = int(biased) - 1023 - 52 - 2
-        m2 = (u64(1) << 52) | fraction
-
+private shortest_decimal(m2: u64, e2: int, lower_half: bool) -> (u64, int)
     // A tie in the reader goes to the even significand, so an even value owns both edges.
     val accept_edges = (m2 & 1) == 0
     val mv = 4 * m2
@@ -133,7 +154,7 @@ private shortest_decimal(fraction: u64, biased: u32) -> (u64, int)
     // Below a power of two the neighbour is half as far away, so the lower edge is a quarter step
     // rather than half of one -- except at the bottom of the exponent range, where the spacing does
     // not change.
-    val mm_shift: u64 = if fraction != 0 || biased <= 1 then 1 else 0
+    val mm_shift: u64 = if lower_half then 1 else 0
 
     var vr: u64 = 0
     var vp: u64 = 0

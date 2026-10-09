@@ -270,15 +270,16 @@ scg_rendering_a_char_goes_through_the_encoder()
     assert(out.contains("call ptr @sysl.utf8(i32 %cp, ptr %buf)"), out)
     assert(out.contains("define private ptr @sysl.utf8"), out)
 
-@test("rendering a float matches print's %g through snprintf")
-scg_rendering_a_float_goes_through_snprintf()
+@test("str of a float is the library's format_real under %g, with no snprintf")
+scg_rendering_a_float_goes_through_format_real()
     if xvr_no_library() then return
 
     val out = scg_ir("print(str(1.5))\n")
 
-    assert(out.contains("define private { ptr, ptr, i64 } @sysl.str.float"), out)
-    assert(out.contains("declare i32 @snprintf(ptr, i64, ptr, ...)"), out)
+    assert(out.contains("format_real"), out)
     assert(out.contains("c\"%g\\00\""), out)
+    assert(!out.contains("@sysl.str.float"), out)
+    assert(!out.contains("@snprintf"), out)
 
 @test("a module that never renders a value emits no str helpers")
 scg_no_rendering_no_str_helpers()
@@ -313,14 +314,26 @@ scg_integer_hole_widens_by_its_own_signedness()
     assert(scg_has(unsigned, "zext i32 %t# to i128"), unsigned)
     assert(signed.contains("i32 32"), signed)
 
-@test("a float format passes the double straight through its specifier")
+@test("a float format is the library's format_real, the double and the specifier handed straight over")
 scg_a_float_format_passes_the_double_through()
     if xvr_no_library() then return
 
     val out = scg_ir("var x = 1.5\nprint(f\"${x}%.2f\")\n")
 
     assert(out.contains("c\"%.2f\\00\""), out)
-    assert(scg_has(out, "call { ptr, ptr, i64 } @sysl.str.fmt_f(ptr @.str#, double %t#)"), out)
+    assert(out.contains("format_real"), out)
+    assert(!out.contains("@sysl.str.fmt_f"), out)
+    assert(!out.contains("@snprintf"), out)
+
+@test("an f32 hole is the library's format_f32, at its own width, with no fpext")
+scg_an_f32_hole_stays_single()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var x: f32 = 1.5\nprint(f\"${x}%.3e and $x\")\n")
+
+    assert(out.contains("format_f32"), out)
+    assert(!out.contains("fpext"), out)
+    assert(!out.contains("@snprintf"), out)
 
 @test("a string format copies a NUL-terminated argument for %s")
 scg_a_string_format_copies_a_terminated_argument()

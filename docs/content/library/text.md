@@ -767,7 +767,8 @@ interchangeable and are not: a `Writer` is a sink for bytes and a builder is a p
 allocation.** The spelling without them is `push(str(n))`, which builds a whole reference-counted
 `string` — a heap object with a refcount and a deallocation hook — copies its bytes out, and drops
 it, for a value whose text is a couple of dozen bytes and is wanted only inside this buffer. A stack
-array and one `snprintf` is the same rendering with none of that.
+array and the library's own digit loop — `digits_long` for an integer, the correctly rounded `%g`
+renderer for a float — is the same rendering with none of that.
 
 They agree with `str` to the byte, and that is the property that makes the cheap path a *substitute*
 rather than a second rendering: a program that builds half a line with a builder and half with an
@@ -834,6 +835,7 @@ parse_long(s: string) -> Result[long, ParseError]
 parse_uint(s: string) -> Result[uint, ParseError]
 parse_ulong(s: string) -> Result[ulong, ParseError]
 parse_real(s: string) -> Result[real, ParseError]
+parse_f32(s: string) -> Result[f32, ParseError]
 
 parse_int_base(s: string, base: int) -> Result[int, ParseError]
 parse_long_base(s: string, base: int) -> Result[long, ParseError]
@@ -845,6 +847,7 @@ parse_long(b: []const u8) -> Result[long, ParseError]
 parse_uint(b: []const u8) -> Result[uint, ParseError]
 parse_ulong(b: []const u8) -> Result[ulong, ParseError]
 parse_real(b: []const u8) -> Result[real, ParseError]
+parse_f32(b: []const u8) -> Result[f32, ParseError]
 
 parse_int_base(b: []const u8, base: int) -> Result[int, ParseError]
 parse_long_base(b: []const u8, base: int) -> Result[long, ParseError]
@@ -921,8 +924,8 @@ Four things are visible there.
 writing and cannot be reconstructed afterwards. `"12abc"` fails at byte 2.
 
 **Trailing garbage is refused.** `"12abc"` is not `12`, and `"1.5x"` is not `1.5` — which for the
-float means checking C's end pointer, since `strtod` on its own stops where it likes and reports
-success.
+float means checking where the longest number ends, since a reader that stops where it likes and
+reports success is C's `strtod`, not a parser.
 
 **`Overflow` is relative to the type asked for.** `2147483648` is a perfectly good `long` and is not
 an `int`, so `parse_int` refuses the same text `parse_long` accepts. What the caller asked for is an
@@ -932,12 +935,60 @@ an `int`, so `parse_int` refuses the same text `parse_long` accepts. What the ca
 each somebody's convention and none is this library's; a program wanting one writes three lines that
 read as the policy they are.
 
-`parse_real` goes to C's `strtod` for the reason the float half of `str` goes to `snprintf`:
-correctly rounded decimal-to-binary conversion is hard to get right, easy to get subtly wrong, and
-the two directions must agree or a value will not survive being written and read back. It costs a
-copy, since C reads a NUL-terminated pointer and neither a `string` nor a slice carries a
-terminator — onto the stack for any text short enough to fit a buffer there, which is every float
-anybody writes and every float `str` produces, and onto the heap only for a longer run.
+### Reading a float, exactly
+
+`parse_real` returns **the `real` nearest the decimal, half way to the even one, however many digits
+it has** — and `parse_f32` the nearest `f32`, rounded once rather than through a `real`, which could
+leave a value lying near half way between two `f32`s on the wrong side. Both are written in sysl,
+with integer arithmetic only, so they allocate nothing, copy nothing and need no C library.
+
+```sysl
+import sysl.text.{parse_f32, parse_real}
+
+print(parse_real("0.1").unwrap() + parse_real("0.2").unwrap())
+print(parse_real("2.2250738585072011e-308").unwrap().bits() == 0x000fffffffffffff)
+print(parse_real("1e400").unwrap(), parse_real("-1e-400").unwrap())
+print(parse_f32("1.00000005960464477550").unwrap().bits() == 0x3f800001)
+```
+
+```output
+0.3
+true
+inf -0
+true
+```
+
+Nearly every number is one multiplication: its first nineteen digits fit a `u64`, and the
+Eisel-Lemire algorithm multiplies them by a 128-bit power of five from a table and reads the float's
+bits off the top of the product, which for an exact nineteen digits is always the correctly rounded
+answer. A longer number is bracketed by its first nineteen digits and those plus one; where the two
+round alike so does everything between them, and where they do not — the value then lies within a
+hair of the point half way between two floats — the whole decimal is compared against that point
+exactly, with big integers. The last line above is that case: one more nine would have rounded the
+other way, and rounding through a `real` first would have too.
+
+**What it reads is what `strtod` reads**: leading white space, a sign, then a decimal (`12`, `1.5`,
+`.5`, `1.`, with an exponent `e-7`), a hexadecimal float (`0x1.8p3`), `inf` or `infinity`, or `nan`
+with an optional `(payload)`, any letter in any case. A value past the largest finite one is an
+infinity and one below half the smallest is a zero, each of the sign written, as `strtod` makes them.
+
+**`real_prefix` and `f32_prefix` are `strtod` and `strtof` themselves** — the value of the longest
+prefix that reads as a float and how many bytes it took, zero where none does — for a reader that
+has more than a number in front of it, and for a C library written in sysl:
+
+```sysl
+import sysl.text.real_prefix
+
+val got = real_prefix("  -1.5e3xyz".bytes)
+
+print(got.0, got.1)
+print(real_prefix("1e+".bytes).1, real_prefix("0x1p-2".bytes).0, real_prefix("x".bytes).1)
+```
+
+```output
+-1500 8
+1 0.25 0
+```
 
 ### Each of them reads a byte slice too
 

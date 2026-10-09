@@ -1,0 +1,529 @@
+module sysl
+
+// A float written as decimal text under a printf conversion -- `%f`, `%e` and `%g` with every flag,
+// width and precision C gives them -- in sysl, with no C library underneath.
+//
+// **The answer is the exact one, correctly rounded.** A finite float is `m * 2^e` with integer `m`,
+// so its decimal expansion is finite too, and the digits printed are that expansion rounded at the
+// position the conversion asks for, half way to the even digit -- what the C libraries this module
+// replaces print. Finding them needs the whole value, so the value is held as a fraction of two big
+// integers, `r / s`, scaled until it lies in [1, 10): each digit is then the integer part of the
+// fraction, and what is left times ten is the fraction for the next one. The digit dropped first and
+// everything after it decide the rounding; a tie is a remainder of exactly half.
+//
+// A double's expansion is at most 767 significant digits and 309 whole ones, so a buffer of 800
+// always holds every digit that is not a zero, and a precision past that pads with zeros the
+// arithmetic never had to produce. The big integers are at most 1,080 bits.
+
+/** A non-negative integer in 32-bit limbs, least significant first: the arithmetic exact decimal
+ * conversion needs, in both directions, at a size fixed when it is declared, so it lives on the stack
+ * and allocates nothing.
+ *
+ * `len` counts the limbs in use and the top one is never zero, so zero is `len == 0`. Only those are
+ * read; a limb above `len` is written before anything reads it.
+ */
+private[sysl] struct Big[const N: usize]
+    limbs: [N]u32
+    len: usize
+
+    set(*self, v: u64)
+        self.len = 0
+        var x = v
+
+        while x != 0
+            self.limbs[self.len] = u32(x & 0xffffffff)
+            self.len += 1
+            x >>= 32
+    end set
+
+    is_zero(self) -> bool = self.len == 0
+
+    /** How many bits the value takes, zero for zero. */
+    bit_len(self) -> usize =
+        if self.len == 0 then 0 else (self.len - 1) * 32 + bits_of(self.limbs[self.len - 1])
+
+    /** The value times `k`. */
+    mul_small(*self, k: u32)
+        var carry: u64 = 0
+
+        for i in 0..<self.len
+            val p = u64(self.limbs[i]) * u64(k) + carry
+
+            self.limbs[i] = u32(p & 0xffffffff)
+            carry = p >> 32
+
+        if carry != 0
+            self.limbs[self.len] = u32(carry)
+            self.len += 1
+    end mul_small
+
+    /** The value plus `k`. */
+    add_small(*self, k: u32)
+        var carry = u64(k)
+        var i: usize = 0
+
+        while carry != 0
+            if i == self.len
+                self.limbs[i] = u32(carry)
+                self.len += 1
+                return
+
+            val s = u64(self.limbs[i]) + carry
+
+            self.limbs[i] = u32(s & 0xffffffff)
+            carry = s >> 32
+            i += 1
+    end add_small
+
+    /** The value times `5^n`, thirteen fives at a time -- the most a limb holds. */
+    mul_pow5(*self, n: int)
+        var left = n
+
+        while left >= 13
+            self.mul_small(1220703125)
+            left -= 13
+
+        if left > 0 then self.mul_small(small_pow5(left))
+    end mul_pow5
+
+    mul_pow10(*self, n: int)
+        self.mul_pow5(n)
+        self.shl(n)
+
+    /** The value times `2^bits`. */
+    shl(*self, bits: int)
+        if self.len == 0 || bits == 0 then return
+
+        val words = usize(bits / 32)
+        val rest = bits % 32
+        var i = self.len
+
+        if rest == 0
+            while i > 0
+                i -= 1
+                self.limbs[i + words] = self.limbs[i]
+
+            self.len += words
+        else
+            val top = self.limbs[self.len - 1] >> (32 - rest)
+
+            self.limbs[self.len + words] = top
+
+            while i > 1
+                i -= 1
+                self.limbs[i + words] = (self.limbs[i] << rest) | (self.limbs[i - 1] >> (32 - rest))
+
+            self.limbs[words] = self.limbs[0] << rest
+            self.len += words
+
+            if top != 0 then self.len += 1
+        end if
+
+        for j in 0..<words
+            self.limbs[j] = 0
+    end shl
+
+    /** -1, 0 or 1 as the value is below, equal to or above `other`. */
+    cmp(self, other: *Big[N]) -> int
+        if self.len != other.len then return if self.len < other.len then -1 else 1
+
+        var i = self.len
+
+        while i > 0
+            i -= 1
+
+            if self.limbs[i] != other.limbs[i] then return if self.limbs[i] < other.limbs[i] then -1 else 1
+
+        0
+    end cmp
+
+    /** The value less `q * other`, which must not be larger than it. */
+    sub_mul(*self, other: *Big[N], q: u32)
+        var carry: u64 = 0
+        var borrow: u64 = 0
+
+        for i in 0..<self.len
+            var take = borrow
+
+            if i < other.len
+                val p = u64(other.limbs[i]) * u64(q) + carry
+
+                carry = p >> 32
+                take += p & 0xffffffff
+            else
+                take += carry
+                carry = 0
+            end if
+
+            val cur = u64(self.limbs[i])
+
+            if cur >= take
+                self.limbs[i] = u32(cur - take)
+                borrow = 0
+            else
+                self.limbs[i] = u32(cur + 0x100000000 - take)
+                borrow = 1
+        end for
+
+        while self.len > 0 && self.limbs[self.len - 1] == 0
+            self.len -= 1
+    end sub_mul
+
+    /** The 64 bits of the value starting `shift` bits up, which must be all of what is there. */
+    window(self, shift: usize) -> u64
+        val w = shift / 32
+        val b = shift % 32
+        var acc: u128 = 0
+
+        for j in w..<w + 3
+            if j < self.len then acc |= u128(self.limbs[j]) << (32 * (j - w))
+
+        u64(acc >> b)
+    end window
+
+    /** `floor(self / other)`, which must be below ten, leaving the remainder in `self`. The quotient
+     * is estimated from the top sixty bits of both, which is never more than one or two short, and
+     * the subtraction is finished one `other` at a time.
+     */
+    digit(*self, other: *Big[N]) -> u32
+        val bits = other.bit_len()
+        val shift = if bits > 60 then bits - 60 else 0
+        val top = other.window(shift)
+        val mine = self.window(shift)
+        var q = u32(if shift == 0 then mine / top else mine / (top + 1))
+
+        if q > 0 then self.sub_mul(other, q)
+
+        while self.cmp(other) >= 0
+            self.sub_mul(other, 1)
+            q += 1
+
+        q
+    end digit
+end Big
+
+/** How many bits `x` takes. */
+private[sysl] bits_of(x: u32) -> usize
+    var n: usize = 0
+    var v = x
+
+    while v != 0
+        n += 1
+        v >>= 1
+
+    n
+end bits_of
+
+private[sysl] bits_of64(x: u64) -> usize =
+    if (x >> 32) != 0 then 32 + bits_of(u32(x >> 32)) else bits_of(u32(x))
+
+private small_pow5(n: int) -> u32
+    var p: u32 = 1
+
+    for _ in 0..<n
+        p *= 5
+
+    p
+end small_pow5
+
+/** A float taken apart: its sign, which kind of value it is, and for a finite non-zero one the
+ * integers `m` and `e` with the value `m * 2^e`.
+ */
+private[sysl] struct FloatValue
+    negative: bool
+    kind: FloatKind
+    m: u64
+    e: int
+
+private[sysl] enum FloatKind
+    Zero
+    Finite
+    Infinite
+    NotANumber
+
+private[sysl] real_value(x: real) -> FloatValue
+    val bits = x.bits()
+    val negative = bits >> 63 != 0
+    val biased = int((bits >> 52) & 0x7ff)
+    val fraction = bits & 0xfffffffffffff
+
+    if biased == 0x7ff
+        return FloatValue(negative, if fraction == 0 then Infinite else NotANumber, 0, 0)
+
+    if biased == 0
+        if fraction == 0 then return FloatValue(negative, Zero, 0, 0)
+
+        return FloatValue(negative, Finite, fraction, -1074)
+
+    FloatValue(negative, Finite, fraction | (u64(1) << 52), biased - 1075)
+end real_value
+
+private[sysl] f32_value(x: f32) -> FloatValue
+    val bits = x.bits()
+    val negative = bits >> 31 != 0
+    val biased = int((bits >> 23) & 0xff)
+    val fraction = u64(bits & 0x7fffff)
+
+    if biased == 0xff
+        return FloatValue(negative, if fraction == 0 then Infinite else NotANumber, 0, 0)
+
+    if biased == 0
+        if fraction == 0 then return FloatValue(negative, Zero, 0, 0)
+
+        return FloatValue(negative, Finite, fraction, -149)
+
+    FloatValue(negative, Finite, fraction | (u64(1) << 23), biased - 150)
+end f32_value
+
+/** The decimal digits of `m * 2^e` (`m` not zero), rounded half to even at one position, written into
+ * `into` as ASCII with no trailing zeros. It answers how many it wrote and the power of ten the first
+ * one stands for: `("125", 2)` is 125, `("125", -1)` is 0.125.
+ *
+ * The position is `significant` digits below the first, or where that is zero or less, the digit
+ * standing for `10^last`. Rounding up can carry into a new first digit -- 9.96 to one decimal is 10.0
+ * -- and the power reported is the one after the carry. A value that rounds to nothing answers no
+ * digits; one that rounds up to the position's unit answers `"1"` there.
+ *
+ * `into` holds every digit asked for that is not a zero, or 800 for any request at all.
+ */
+private[sysl] float_digits(m: u64, e: int, significant: int, last: int, into: []u8) -> (usize, int)
+    var r: Big[40] = Big([0; 40], 0)
+    var s: Big[40] = Big([0; 40], 0)
+
+    r.set(m)
+    s.set(1)
+
+    if e >= 0 then r.shl(e) else s.shl(-e)
+
+    // The power of ten of the first digit: floor(log10(v)), estimated from floor(log2(v)) and then
+    // corrected so that r / s lands in [1, 10).
+    var k = ((int(bits_of64(m)) - 1 + e) * 78913) >> 18
+
+    if k >= 0 then s.mul_pow10(k) else r.mul_pow10(-k)
+
+    while r.cmp(&s) < 0
+        r.mul_small(10)
+        k -= 1
+
+    var ten = s
+
+    ten.mul_small(10)
+
+    while r.cmp(&ten) >= 0
+        s = ten
+        ten.mul_small(10)
+        k += 1
+
+    val stop = if significant > 0 then k - significant + 1 else last
+
+    if stop > k
+        // Every digit is below the position. Only a value of at least half its unit rounds to it,
+        // which needs the first digit one place below: then v / 10^stop is r / 10s, in [0.1, 1).
+        if stop == k + 1
+            var twice = r
+
+            twice.shl(1)
+
+            if twice.cmp(&ten) > 0
+                into[0] = u8('1')
+                return (1, stop)
+        end if
+
+        return (0, stop)
+    end if
+
+    var count: usize = 0
+    var at = k
+
+    loop
+        into[count] = u8('0') + u8(r.digit(&s))
+        count += 1
+
+        if at == stop || r.is_zero() || count == into.len then break
+
+        r.mul_small(10)
+        at -= 1
+
+    if !r.is_zero()
+        var twice = r
+
+        twice.shl(1)
+
+        val c = twice.cmp(&s)
+        val odd = (into[count - 1] - u8('0')) % 2 == 1
+
+        if c > 0 || (c == 0 && odd)
+            var i = count
+            var carried = true
+
+            while i > 0 && carried
+                i -= 1
+
+                if into[i] == u8('9')
+                    into[i] = u8('0')
+                else
+                    into[i] += 1
+                    carried = false
+
+            if carried
+                into[0] = u8('1')
+                count = 1
+                k += 1
+        end if
+    end if
+
+    while count > 0 && into[count - 1] == u8('0')
+        count -= 1
+
+    (count, k)
+end float_digits
+
+/** What a float conversion was asked for: `%e`, `%f` or `%g` (or the upper-case `%E`, `%F`, `%G`),
+ * a minimum field width, a precision (-1 where none was written) and C's five flags.
+ */
+private[sysl] struct FloatField
+    conv: u8
+    width: int
+    prec: int
+    left: bool
+    plus: bool
+    space: bool
+    zero: bool
+    alt: bool
+
+/** `v` rendered under `f` into `out`, flag for flag as C renders a `double`: `%f` is fixed point, `%e`
+ * one digit, a point and an exponent of at least two digits, and `%g` whichever of the two the
+ * precision and the exponent choose, with its trailing zeros dropped unless `#` keeps them. An
+ * infinity is `inf` and a NaN `nan` (upper case under an upper-case conversion), a NaN carrying no
+ * sign, and neither is padded with zeros. `into` is where the digits are worked out; it has to hold
+ * every digit that is not a zero, which 800 always does and `precision + 1` does for `%e` and `%g`.
+ */
+private[sysl] write_float_field(out: *Writer, v: FloatValue, f: FloatField, into: []u8)
+    val conv = f.conv | 0x20
+    val upper = f.conv != conv
+
+    var sign: [1]u8 = [0]
+
+    if v.kind != NotANumber
+        sign[0] = if v.negative then u8('-') else if f.plus then u8('+') else if f.space then u8(' ') else 0
+
+    val signs = if sign[0] != 0 then 1 else 0
+
+    if v.kind == Infinite || v.kind == NotANumber
+        val word = if v.kind == Infinite then (if upper then "INF" else "inf")
+        else (if upper then "NAN" else "nan")
+        val pad = f.width - 3 - signs
+
+        if !f.left then display_fill(out, 32, pad)
+        if signs != 0 then out.write(sign[..])
+        out.write(word.bytes)
+        if f.left then display_fill(out, 32, pad)
+        return
+    end if
+
+    val prec = if f.prec < 0 then 6 else f.prec
+    var count: usize = 0
+    var k = 0
+    var fixed = conv == u8('f')
+    var frac = prec
+
+    if conv == u8('g')
+        val p = if prec == 0 then 1 else prec
+
+        if v.kind == Finite
+            val got = float_digits(v.m, v.e, p, 0, into)
+
+            count = got.0
+            k = got.1
+        end if
+
+        fixed = p > k && k >= -4
+        frac = if fixed then p - 1 - k else p - 1
+
+        if !f.alt
+            val needed = if fixed then int(count) - 1 - k else int(count) - 1
+
+            if needed < frac then frac = if needed > 0 then needed else 0
+        end if
+    elif v.kind == Finite
+        val got = if fixed then float_digits(v.m, v.e, 0, -prec, into)
+        else float_digits(v.m, v.e, prec + 1, 0, into)
+
+        count = got.0
+        k = got.1
+    end if
+
+    if count == 0 then k = 0
+
+    val point = frac > 0 || f.alt
+    var exp_text: [24]u8
+    var exp_at: usize = 24
+    var body = 0
+
+    if fixed
+        body = (if k >= 0 then k + 1 else 1) + (if point then 1 else 0) + frac
+    else
+        val magnitude = if k < 0 then -k else k
+
+        exp_at = digits_ulong(ulong(magnitude), exp_text[..])
+
+        if magnitude < 10
+            exp_at -= 1
+            exp_text[exp_at] = u8('0')
+
+        exp_at -= 1
+        exp_text[exp_at] = if k < 0 then u8('-') else u8('+')
+        exp_at -= 1
+        exp_text[exp_at] = if upper then u8('E') else u8('e')
+        body = 1 + (if point then 1 else 0) + frac + int(24 - exp_at)
+    end if
+
+    val pad = f.width - body - signs
+
+    if !f.left && !f.zero then display_fill(out, 32, pad)
+    if signs != 0 then out.write(sign[..])
+    if !f.left && f.zero then display_fill(out, 48, pad)
+
+    if fixed
+        if k >= 0 then write_positions(out, into, count, k, k, 0) else out.write("0".bytes)
+        if point then out.write(".".bytes)
+
+        write_positions(out, into, count, k, -1, -frac)
+    else
+        write_positions(out, into, count, k, k, k)
+        if point then out.write(".".bytes)
+
+        write_positions(out, into, count, k, k - 1, k - frac)
+        out.write(exp_text[exp_at..])
+    end if
+
+    if f.left then display_fill(out, 32, pad)
+end write_float_field
+
+// The digits standing for 10^hi down to 10^lo, where the first of `count` digits stands for 10^k
+// and every other position holds a zero.
+private write_positions(out: *Writer, digits: []u8, count: usize, k: int, hi: int, lo: int)
+    if hi < lo then return
+
+    var at = hi
+
+    if at > k
+        val zeros = if at - k < hi - lo + 1 then at - k else hi - lo + 1
+
+        display_fill(out, 48, zeros)
+        at -= zeros
+    end if
+
+    if at < lo then return
+
+    val first = k - at
+    var final = k - lo
+
+    if final > int(count) - 1 then final = int(count) - 1
+
+    if first <= final
+        out.write(digits[usize(first)..<usize(final + 1)])
+        at = k - final - 1
+
+    if at >= lo then display_fill(out, 48, at - lo + 1)
+end write_positions

@@ -340,59 +340,6 @@ str_int_text(bits: int, word: string, str: string) -> string
     """
 end str_int_text
 
-// A float as a string, rendered the way `print` renders one -- `snprintf` with `%g`, so the two
-// agree to the byte. A sizing call learns the length, then the digits are written into a `StrBuf` a
-// byte longer to hold the terminator `snprintf` insists on writing, which rides along uncounted
-// exactly as the NUL after a literal does. This is the one case that needs libc, and `print` already
-// does, so it adds no dependency in practice.
-str_float_text(word: string, str: string) -> string
-    val widen = counted_line(word)
-    val len = counted_name(word)
-
-    s"""
-    @sysl.str.g = private constant [3 x i8] c"%g\\00"
-
-    define private $str @sysl.str.float(double %v) {
-    entry:
-      %n = call i32 (ptr, $word, ptr, ...) @snprintf(ptr null, $word 0, ptr @sysl.str.g, double %v)
-    $widen  %cap = add $word $len, 1
-      %hend = getelementptr %arc.header, ptr null, i32 1
-      %hsize = ptrtoint ptr %hend to $word
-      %size = add $word %hsize, %cap
-    ${str_buf_header(word)}  %w = call i32 (ptr, $word, ptr, ...) @snprintf(ptr %bytes, $word %cap, ptr @sysl.str.g, double %v)
-      %v0 = insertvalue $str undef, ptr %p, 0
-      %v1 = insertvalue $str %v0, ptr %bytes, 1
-      %v2 = insertvalue $str %v1, $word $len, 2
-      ret $str %v2
-    }
-    """
-end str_float_text
-
-// A float rendered through a printf specifier, a `double` being the argument the specifier expects
-// directly. The value is measured by one `snprintf` and written by a second into a `StrBuf` a byte
-// longer, for the terminator `snprintf` insists on writing.
-str_fmt_float_text(word: string, str: string, k: usize) -> string
-    val widen = counted_line(word)
-    val len = counted_name(word)
-    val cs = count_params(k)
-
-    s"""
-    define private $str @sysl.str.fmt_f${count_suffix(k)}(ptr %fmt$cs, double %v) {
-    entry:
-      %${measured(k)} = call i32 (ptr, $word, ptr, ...) @snprintf(ptr null, $word 0, ptr %fmt$cs, double %v)
-    ${refused(k)}$widen  %cap = add $word $len, 1
-      %hend = getelementptr %arc.header, ptr null, i32 1
-      %hsize = ptrtoint ptr %hend to $word
-      %size = add $word %hsize, %cap
-    ${str_buf_header(word)}  %w = call i32 (ptr, $word, ptr, ...) @snprintf(ptr %bytes, $word %cap, ptr %fmt$cs, double %v)
-      %v0 = insertvalue $str undef, ptr %p, 0
-      %v1 = insertvalue $str %v0, ptr %bytes, 1
-      %v2 = insertvalue $str %v1, $word $len, 2
-      ret $str %v2
-    }
-    """
-end str_fmt_float_text
-
 // A string rendered through a printf `%s` specifier, so that width, precision and justification are
 // the C library's to apply. A sysl string carries a length rather than a terminator, so a
 // NUL-terminated copy is made for `snprintf` and freed after; an interior NUL therefore ends the
