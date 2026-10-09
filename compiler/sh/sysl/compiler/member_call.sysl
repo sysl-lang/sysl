@@ -1898,12 +1898,16 @@ private enum_try(cx: &Analyzer, span: Span, ty: Type, args: Buf[Expr]) -> Option
 
     val t = type_expr(cx, args.at(0), Some(d.underlying))
 
-    repr(texpr_type(t)) match
-        Integer(_, _, _) -> ()
-        _ ->
-            cx.fault(span, s"'${qualified_name(d.base)}' converts an integer, but the value has type " +
-                     s"${type_show(texpr_type(t))}")
-            return Some(bad_expr(span))
+    // Besides an integer, an enum field of a bitfield struct is taken as it is: its bits were put
+    // there by hardware or a cast, and asking whether they are a variant is the fallible read of it.
+    if !unchecked_enum_field(t, ty)
+        repr(texpr_type(t)) match
+            Integer(_, _, _) -> ()
+            _ ->
+                cx.fault(span, s"'${qualified_name(d.base)}' converts an integer, but the value has " +
+                         s"type ${type_show(texpr_type(t))}" + enum_try_hint(texpr_type(t), ty))
+                return Some(bad_expr(span))
+    end if
 
     var targs: Buf[Type] = buf()
 
@@ -1921,6 +1925,15 @@ private enum_try(cx: &Analyzer, span: Span, ty: Type, args: Buf[Expr]) -> Option
             Some(TExpr(span, TEnumTry(t, ty, opt, some.unwrap(), none.unwrap())))
         _ -> Some(bad_expr(span))
 end enum_try
+
+// A value of the enum's own type handed to `try` is one already held to its variants -- except a
+// bitfield's enum field, which is the one `try` takes -- so the refusal says which that is.
+private enum_try_hint(found: Type, en: Type) -> string
+    if repr(found) != repr(en) then return ""
+
+    " — a value of the enum is already one of its variants; only an enum field of a '@packed' " +
+        "bitfield struct, whose bits nothing has checked, is taken as it is"
+end enum_try_hint
 
 // Everything about a weak reference is behind `get()`, including whether there still is one.
 private weak_get(cx: &Analyzer, span: Span, receiver: TExpr, inner: Type, name: string,

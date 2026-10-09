@@ -1684,6 +1684,59 @@ value 42 is not one of the enum's variants (main.sysl:12:11)
 An enum whose variants cover every value of its width — two variants in `u1`, four in `u2` — has
 nothing to check, and its read is the shift and nothing more.
 
+**The fallible read is `E.try(s.field)`** — the [conversion that answers instead of
+trapping](/reference/errors/#turning-a-trap-back-into-a-value), handed the field itself. The field's
+bits are read without the check and answered for: `Some` of the variant they are, or `None`. It is
+how a kernel asks for "the exception class, if it is one I know" without declaring the field a plain
+`u6`:
+
+```sysl
+enum Ec: u6
+    Unknown = 0x00
+    Brk = 0x3c
+
+@packed
+struct Esr
+    low: u26
+    ec: Ec
+    high: u32
+
+describe(class: Option[Ec]) -> string = class match
+    Some(c) -> Ec::Image(c)
+    None -> "a class this kernel does not know"
+
+var raw: u64 = u64(0x2a) << 26
+val e: *Esr = ptr_cast(&raw)
+
+print(describe(Ec.try(e.ec)))
+
+raw = u64(0x3c) << 26
+print(describe(Ec.try(e.ec)))
+```
+
+```output
+a class this kernel does not know
+Brk
+```
+
+A signed enum's field answers by its two's-complement bits, as its read does, and where the variants
+cover the width `try` is `Some` with no test at all. Only a bitfield's enum field is taken as it is —
+a value of the enum read anywhere else has been held to its variants already:
+
+```sysl
+enum Ec: u6
+    Unknown = 0x00
+    Brk = 0x3c
+
+val c = Ec.Brk
+
+print(Ec.try(c).is_some())
+```
+
+```error
+'Ec' converts an integer, but the value has type Ec — a value of the enum is already one of its variants
+```
+
 **A bitfield has no byte offset**, so `offsetof` says so rather than rounding down to the byte the
 field begins in:
 
