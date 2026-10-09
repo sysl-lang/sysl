@@ -148,7 +148,7 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
 end parse_member_attrs
 
 private member_attr_refusal() -> string =
-    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@reads' and '@writes' — and the four about the function it lowers to, '@noinline', '@inline', '@cold' and '@no_alloc'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
+    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the four about the function it lowers to, '@noinline', '@inline', '@cold' and '@no_alloc'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
 
 // A layout annotation above a field (or any member) is about the wrong thing rather than about a
 // function: `@packed` and `@align(n)` lay out a whole struct, and `@align(n)` marks one binding's
@@ -167,7 +167,7 @@ end layout_attr_on_member
 private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
-    for word in ["crossing", "borrows", "reads", "writes", "noinline", "inline", "cold"]
+    for word in ["crossing", "borrows", "lends", "reads", "writes", "noinline", "inline", "cold"]
         if word == w then return true
 
     false
@@ -230,6 +230,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "section" then return Some(parse_section_attr(p))
     if word == "crossing" then return Some(Crossing(parse_named_list(p, "crossing")))
     if word == "borrows" then return Some(Borrows(parse_named_list(p, "borrows")))
+    if word == "lends" then return Some(Lends(parse_named_list(p, "lends")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
     if word == "noinline" then return no_inlining_args(p, NoInline, "whether a call stays a call is the whole of what it says")
     if word == "inline" then return no_inlining_args(p, Inline, "it raises what the inliner will spend on this definition rather than naming a number")
@@ -256,7 +257,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     end if
 
     // Anchored after the word, as `@ignore`'s is: the reference's point for both.
-    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
+    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)', '@lends(...)' and '@crossing(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
     skip_line(p)
     None
 end parse_attribute
@@ -339,6 +340,8 @@ end parse_named_list
 
 private named_list_refusal(word: string) -> string
     if word == "crossing" then return "'@crossing' names the parameters a value reaches another concurrency domain through, in parentheses — '@crossing(state)'. There is no empty form: a function that hands nothing across a boundary says so by not writing the annotation"
+
+    if word == "lends" then return "'@lends' names the callable parameters a function hands a pointer that is valid only during the call, in parentheses — '@lends(body)'. There is no empty form: a function that lends nothing says so by not writing the annotation"
 
     if word == "borrows" then return "'@borrows' names the parameters a trait's method promises not to keep past the call, in parentheses — '@borrows(bytes)'. There is no empty form: a method that may keep what it is handed says so by not writing the annotation"
 
@@ -530,6 +533,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Section(s) -> f.section = Some(s)
             Crossing(ns) -> f.crossing = ns
             Needs(cs) -> f.needs = cs
+            Lends(ns) -> f.marks.lends = ns
             NoInline -> f.marks.noinline = true
             Inline -> f.marks.inline = true
             Cold -> f.marks.cold = true
@@ -544,6 +548,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
         attr match
             Crossing(ns) -> m.crossing = ns
             Borrows(ns) -> m.borrows = ns
+            Lends(ns) -> m.marks.lends = ns
             Reads(ns) -> m.reads = Some(ns)
             Writes(ns) -> m.writes = Some(ns)
             NoInline -> m.marks.noinline = true
