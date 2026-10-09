@@ -1,0 +1,312 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{split, Search}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A value parameter whose type is a simple enum (`reference/generics.md § Which values`): the
+// argument is one of that enum's variants, written bare -- the parameter's declared type says which
+// enum, as an expected type does -- or qualified with the enum's name. A variant of any other enum is
+// refused naming the ones it may be, and a type no value parameter may have is refused where the
+// parameter is declared.
+
+private var evp_library_cache: Buf[Program] = buf()
+private var evp_library_read: bool = false
+
+private evp_library() -> Buf[Program]
+    if evp_library_read then return evp_library_cache
+
+    evp_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> evp_library_cache = units
+
+    evp_library_cache
+end evp_library
+
+private evp_ready() -> bool
+    if evp_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end evp_ready
+
+// How many times a report says something.
+private evp_count(text: string, part: string) -> int
+    var rest = text
+    var n = 0
+
+    loop
+        rest.index_of(part) match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + part.bytes.len..<rest.bytes.len]
+
+    n
+end evp_count
+
+private evp_ran(text: string) -> string
+    val root = make_temp_dir("sysl-enum-value-param").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end evp_ran
+
+// The report, or the LLVM text where there is nothing to report.
+private evp_emit(text: string) -> string
+    val root = make_temp_dir("sysl-enum-value-param").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end evp_emit
+
+private const evp_enums: string = "enum Level\n    Low\n    High\nenum Tide\n    Low\n    Slack\n"
+
+// -- the argument, bare and qualified ---------------------------------------------------------------
+
+@test("a qualified variant is the same value argument as the bare one")
+evp_qualified_is_the_bare_one()
+    if !evp_ready() then return
+
+    assert_eq(evp_ran(evp_enums + raw"""
+        struct Gauge[const L: Level]
+            reading: int
+        at(g: Gauge[Level.High]) -> int = g.reading
+        val g: Gauge[High] = Gauge(3)
+        val h: Gauge[Level.High] = g
+        print(at(g), at(h))
+        """), "3 3\n")
+
+@test("and a qualified variant of the other name is the other type")
+evp_qualified_other_variant_is_another_type()
+    if !evp_ready() then return
+
+    val said = evp_emit(evp_enums + raw"""
+        struct Gauge[const L: Level]
+            reading: int
+        val g: Gauge[High] = Gauge(3)
+        val h: Gauge[Level.Low] = g
+        print(h.reading)
+        """)
+
+    assert(said.index_of("cannot initialize 'h'").is_some(), said)
+    assert_eq(evp_count(said, "main.sysl:"), 1, said)
+
+@test("a function's value parameter takes a variant written as an expression, bare or qualified")
+evp_function_type_argument()
+    if !evp_ready() then return
+
+    assert_eq(evp_ran(evp_enums + raw"""
+        loud[const L: Level]() -> bool = L == High
+        print(loud[High](), loud[Level.Low](), loud[Level.High]())
+        """), "true false true\n")
+
+// -- the value inside a body, and two instantiations --------------------------------------------------
+
+@test("a member reads the variant, and two variants are two bodies")
+evp_two_variants_two_bodies()
+    if !evp_ready() then return
+
+    val src = evp_enums + raw"""
+        struct Gauge[const L: Level]
+            reading: int
+
+            alarm(self) -> bool = L == High
+        val a: Gauge[Low] = Gauge(1)
+        val b: Gauge[Level.High] = Gauge(2)
+        print(a.alarm(), b.alarm())
+        """
+
+    assert_eq(evp_ran(src), "false true\n")
+
+    val text = evp_emit(src)
+    var defines: Buf[string] = buf()
+
+    for line in split(text, "\n")
+        if line.starts_with("define") && line.index_of("alarm").is_some() then defines.push(line)
+
+    assert_eq(defines.len(), 2, text)
+    assert(defines.at(0) != defines.at(1), text)
+
+// -- a default ------------------------------------------------------------------------------------
+
+@test("a default may be a variant, bare or qualified, and a bare use takes it")
+evp_default_variant()
+    if !evp_ready() then return
+
+    assert_eq(evp_ran(evp_enums + raw"""
+        struct Quiet[const L: Level = Low]
+            n: int
+
+            alarm(self) -> bool = L == High
+        struct Loud[const L: Level = Level.High]
+            n: int
+
+            alarm(self) -> bool = L == High
+        val q: Quiet = Quiet(1)
+        val l: Loud = Loud(2)
+        val same: Quiet[Low] = q
+        print(q.alarm(), l.alarm(), same.n)
+        """), "false true 1\n")
+
+@test("and a default that is another enum's variant is refused at the default")
+evp_default_of_another_enum()
+    if !evp_ready() then return
+
+    val said = evp_emit(evp_enums + raw"""
+        struct Gauge[const L: Level = Slack]
+            n: int
+        val g: Gauge = Gauge(1)
+        print(g.n)
+        """)
+
+    assert(said.index_of("'Slack' is not a variant of Level — the default for 'L'").is_some(), said)
+
+// -- what is refused -------------------------------------------------------------------------------
+
+@test("a variant of another enum is refused, naming the variants it may be")
+evp_another_enums_variant()
+    if !evp_ready() then return
+
+    val said = evp_emit(evp_enums + raw"""
+        struct Gauge[const L: Level]
+            reading: int
+        val a: Gauge[Slack] = Gauge(1)
+        print(a.reading)
+        """)
+
+    assert(said.index_of("'Slack' is not a variant of Level — this argument stands where the " +
+                         "declaration wrote 'const' of that enum, so it is one of Low, High").is_some(), said)
+    assert_eq(evp_count(said, "main.sysl:"), 1, said)
+    assert(said.index_of("main.sysl:9:8").is_some(), said)
+
+@test("and so is one qualified with the other enum, though its own enum has a variant of its name")
+evp_qualified_with_the_other_enum()
+    if !evp_ready() then return
+
+    val said = evp_emit(evp_enums + raw"""
+        struct Gauge[const L: Level]
+            reading: int
+        val a: Gauge[Tide.Low] = Gauge(1)
+        print(a.reading)
+        """)
+
+    assert(said.index_of("'Tide.Low' is not a variant of Level").is_some(), said)
+    assert_eq(evp_count(said, "main.sysl:"), 1, said)
+
+@test("and a qualified name the enum does not have")
+evp_qualified_unknown_variant()
+    if !evp_ready() then return
+
+    val said = evp_emit(evp_enums + raw"""
+        struct Gauge[const L: Level]
+            reading: int
+        val a: Gauge[Level.Middle] = Gauge(1)
+        print(a.reading)
+        """)
+
+    assert(said.index_of("'Level.Middle' is not a variant of Level").is_some(), said)
+    assert_eq(evp_count(said, "main.sysl:"), 1, said)
+
+@test("while the enum's own name where a variant belongs is told it is a type")
+evp_the_enum_itself()
+    if !evp_ready() then return
+
+    val said = evp_emit(evp_enums + raw"""
+        struct Gauge[const L: Level]
+            reading: int
+        val a: Gauge[Level] = Gauge(1)
+        print(a.reading)
+        """)
+
+    assert(said.index_of("'Level' is a type").is_some(), said)
+    assert_eq(evp_count(said, "main.sysl:"), 1, said)
+
+@test("an enum whose variants carry values cannot be a value parameter's type, told once")
+evp_data_enum_refused()
+    if !evp_ready() then return
+
+    val said = evp_emit(raw"""
+        enum Shape
+            Dot
+            Circle(r: int)
+        struct Holder[const S: Shape]
+            n: int
+        val h: Holder[Dot] = Holder(1)
+        print(h.n)
+        """)
+
+    assert(said.index_of("'S' is a value parameter, and Shape cannot be the type of one").is_some(), said)
+    assert(said.index_of("a variant of this enum carries a value of its own").is_some(), said)
+    assert_eq(evp_count(said, "main.sysl:"), 1, said)
+    assert(said.index_of("main.sysl:4:24").is_some(), said)
+
+@test("nor can a float, on a type nothing applies")
+evp_float_refused()
+    if !evp_ready() then return
+
+    val said = evp_emit("struct H[const S: real]\n    n: int\nprint(1)\n")
+
+    assert(said.index_of("'S' is a value parameter, and real cannot be the type of one").is_some(), said)
+    assert(said.index_of("NaN").is_some(), said)
+    assert(said.index_of("main.sysl:1:19").is_some(), said)
+
+@test("nor a string, on a function or a member")
+evp_string_refused()
+    if !evp_ready() then return
+
+    val said = evp_emit("f[const S: string]() -> int = 1\nstruct T\n    n: int\n\n" +
+                        "    g[const B: string](self) -> int = 2\nprint(1)\n")
+
+    assert(said.index_of("'S' is a value parameter, and string cannot be the type of one").is_some(), said)
+    assert(said.index_of("'B' is a value parameter, and string cannot be the type of one").is_some(), said)
+    assert_eq(evp_count(said, "main.sysl:"), 2, said)
+
+@test("and a function's written argument of another enum is refused the same way")
+evp_function_argument_of_another_enum()
+    if !evp_ready() then return
+
+    val said = evp_emit(evp_enums + raw"""
+        loud[const L: Level]() -> bool = L == High
+        print(loud[Slack]())
+        """)
+
+    assert(said.index_of("'Slack' is not a variant of Level").is_some(), said)

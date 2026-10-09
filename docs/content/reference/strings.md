@@ -563,8 +563,9 @@ print(f"[${n}%+05d] [${n}%x] [${n}%#o] [${255}%#b] [${42}%-6u]")
 
 **An integer conversion is rendered by sysl itself** (`sysl.fmt.format_int`), flag for flag as C
 renders it, so it works the same on a target with no C library. A float conversion and `%s` over a
-string are applied by C's `snprintf`, so on such a target a reached one is refused where it is
-written:
+string are applied by C's `snprintf`, so on a target without the [`libc`](/reference/packages/#capabilities)
+capability — a freestanding one whose manifest does not grant it — a reached one is refused where it
+is written:
 
 ```sysl target=aarch64-freestanding build=c
 @export("probe")
@@ -574,6 +575,10 @@ probe(x: real) -> usize = f"${x}%.2f".bytes.len
 ```error
 '%.2f' is applied by C's 'snprintf', and 'aarch64-freestanding' has no C library under it to supply one
 ```
+
+The refusal ends by naming the way out where the board does have one: `targets { aarch64-freestanding
+{ capabilities { libc = true } } }` in `package.hocon`, after which the same block builds and leaves
+`snprintf` for the board's link to find.
 
 **A width or a precision may be a hole of its own**, read when the line runs — C's `%*d` and `%.*f`,
 written where the digits would go. Flags stay as they are, and either count, or both, may be a hole:

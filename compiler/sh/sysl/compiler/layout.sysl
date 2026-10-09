@@ -101,10 +101,6 @@ end LayoutMemo
 // A memo with nothing measured in it.
 layout_memo() -> &LayoutMemo = LayoutMemo(map(), map(), 0, map())
 
-// The most a pointer into the heap may be assumed aligned to: what the allocating pair promises,
-// which is `malloc`'s.
-const HeapAlign: usize = 16
-
 // The measurements one target makes.
 //
 // **It is `TargetLayout` and not `Layout`, which is the one name in this compiler that its
@@ -426,11 +422,19 @@ struct TargetLayout
     storage_align(self, t: Type) -> Option[int] =
         if self.holds_raised(t) then Some(int(self.align(t))) else None
 
-    // The boundary an access may CLAIM through an address of a value of the type. An address may be
-    // into a box, whose storage is the allocating pair's and promised only `HeapAlign`, so a raised
-    // boundary is never claimed beyond it: a claim the storage does not keep is a miscompile.
-    claim(self, t: Type) -> usize =
-        if self.holds_raised(t) && self.align(t) > HeapAlign then HeapAlign else self.align(t)
+    // The boundary an access may CLAIM through an address of a value of the type: the type's whole
+    // boundary. An address may be into a box or a buffer, and those are the heap's -- but a type
+    // aligned beyond what the allocating pair promises (`heap_align`) is boxed through the aligned
+    // hook and laid after its header on its boundary (`emit_box.sysl`, `emit_arc.sysl`'s `box_pad`),
+    // so no storage of the type is ever placed short of it.
+    claim(self, t: Type) -> usize = self.align(t)
+
+    // The boundary a block from the allocating pair begins on (`target.sysl`'s `heap_boundary`).
+    heap_align(self) -> usize = heap_boundary(self.word_bits)
+
+    // Whether a value of the type on the heap needs more than the allocating pair promises, and so
+    // the aligned hook.
+    beyond_heap(self, t: Type) -> bool = self.align(t) > self.heap_align()
 end TargetLayout
 
 // The layout a target measures with, remembering nothing: the one the analysis uses, while the
