@@ -1952,6 +1952,16 @@ print(volatile + 1)
 these elements may not be written through this handle — while `volatile` is a property of the
 *element*. A read-only device register is `[]const volatile u32`, and both words are doing work.
 
+### Memory a device reads and writes is a library type, not a qualifier
+
+`volatile` is about the device's **registers**. The memory a device reaches by DMA — a buffer, a
+descriptor ring — is ordinary memory the processor reads and writes normally; what it needs is an
+address the *device* can use and a handover that keeps the caches honest, and neither is a property
+of a place. So it is [`sysl.dma`'s `Region`](/library/dma/): it carries the device's address of its
+first byte, is made only by `adopt` from memory somebody knows to be device-reachable, and an ordinary
+`[]u8` is not one. No qualifier on `*T` or `[]T` says where storage is, because a slice's type cannot
+know whether it was cut from a stack, a heap block or a frame — the region's maker does.
+
 ## Where `defer` sits
 
 [`defer`](/reference/statements/#defer) is the model's answer for what the language does *not* own: a
@@ -2325,6 +2335,158 @@ sentence says: neither has parameters for one of them to name.
 `sysl.posix.threads.Channel[T]` is what this changed. Its `send` and `try_send` were free functions
 taking the channel by address, because the annotation had to be written on a wrapper a caller went
 through; they are methods now, so a channel's transfers and its queries read alike.
+
+## A pointer lent for one call
+
+A `*T` is a type, so once one exists it can be carried anywhere — which is exactly wrong for an
+address that is only good while something else holds still: the value inside a lock until the lock
+is released, a slot in a scratch buffer until it is reused. Returning the address and asking the
+caller to stop using it in time is a promise nothing checks.
+
+**`@lends(body)` turns it around**: the function keeps the pointer and calls `body` with it, and the
+compiler holds every body passed there to letting the pointer go before it returns. Inside, the body
+may read and write through the pointer, and hand it to a function that only uses it:
+
+```sysl
+struct Account
+    balance: int
+    edits: int
+
+    @lends(body)
+    edit[R](*self, body: *int -> R) -> R
+        self.edits += 1
+        body(&self.balance)
+end Account
+
+add_ten(n: *int)
+    *n += 10
+
+var acct = Account(100, 0)
+
+acct.edit((b) -> *b -= 30)
+acct.edit((b) -> add_ten(b))
+acct.edit(add_ten)
+
+print(acct.balance, acct.edits, acct.edit((b) -> *b * 2))
+```
+
+```output
+90 3 180
+```
+
+`sysl.posix.threads.Mutex.with` is declared this way, and its argument is the reason the annotation
+exists: an address handed out by a `lock()` stays usable after `unlock()`, and one lent to a body does
+not ([`library/threads.md § with lends the value for one call`](/library/threads/#with-lends-the-value-for-one-call)).
+
+**What the body may not do is let it out** — the ways a [view of a local array](#what-escapes)
+gets out, asked of the pointer instead: returning it, storing it anywhere but a
+local of the body, putting it in a box, and passing it to something that keeps it. Each is refused at
+the expression that does it:
+
+```sysl
+struct Cell
+    v: int
+
+    @lends(body)
+    with[R](*self, body: *int -> R) -> R = body(&self.v)
+
+var c = Cell(1)
+val p = c.with((v) -> v)
+```
+
+```error
+lends this body a pointer that is valid only until the call returns, and this one is returned
+```
+
+```sysl
+struct Cell
+    v: int
+
+    @lends(body)
+    with[R](*self, body: *int -> R) -> R = body(&self.v)
+
+var kept: *int = null
+var c = Cell(1)
+
+c.with((v) -> kept = v)
+```
+
+```error
+and this one is stored somewhere the call does not own
+```
+
+**A call is followed into the callee**, whose body says whether it keeps what it was handed — so
+`add_ten` above is fine and this is not:
+
+```sysl
+struct Cell
+    v: int
+
+    @lends(body)
+    with[R](*self, body: *int -> R) -> R = body(&self.v)
+
+struct Holder
+    p: *int
+
+keep(h: *Holder, p: *int)
+    h.p = p
+
+var h = Holder(null)
+val hp = &h
+var c = Cell(1)
+
+c.with((v) -> keep(hp, v))
+```
+
+```error
+and this one is passed to 'keep', which holds on to it
+```
+
+An `extern`, a function pointer and a trait object have no body here to ask, so a lent pointer passed
+to one is refused as kept. Converting the pointer to an integer is not following it: `usize(p)` is
+an address as a number, which is the raw tier's to answer for.
+
+**What is passed there has to be a body the compiler can read** — a closure written at the call, one
+held in a local, or a function's name. A bare-arrow parameter is a type parameter, so each call is a
+direct call of that body, which is also why a lending function costs no allocation. A closure behind a
+`&Fn` could be any body at all:
+
+```sysl
+struct Cell
+    v: int
+
+    @lends(body)
+    with[R](*self, body: *int -> R) -> R = body(&self.v)
+
+var c = Cell(1)
+val f: &Fn(*int) -> int = (v) -> *v
+
+print(c.with(f))
+```
+
+```error
+lends 'body' a pointer that is valid only during the call, so what is passed there is a closure or a function's name
+```
+
+`@lends` names parameters, each once, and each a call:
+
+```sysl
+@lends(body)
+twice(x: *int, f: *int -> int) -> int = f(x) + f(x)
+```
+
+```error
+'@lends' names 'body', which is not a parameter of 'twice' — its parameters are 'x', 'f'
+```
+
+```sysl
+@lends(x)
+twice(x: *int, f: *int -> int) -> int = f(x) + f(x)
+```
+
+```error
+'@lends' names 'x', which is not a call
+```
 
 ## Hazard summary
 

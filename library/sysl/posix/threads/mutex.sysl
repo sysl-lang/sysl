@@ -9,16 +9,20 @@ import sysl.sync.*
  *
  * A spinlock is a flag beside the data and what the data is stays the programmer's to remember. This
  * holds the `T`, and both of its fields are private -- so there is no way to reach the value that
- * does not go through `lock` or `try_lock`, and no way to build one that skips the free state. That
- * is as far as a language with no destructor can take the idea: releasing is still written, and
- * `defer m.unlock()` is how, exactly as `defer f.close()` is in `sysl.fs` and for the same reason.
+ * does not go through the lock, and no way to build one that skips the free state.
+ *
+ * **`with` is the way in**: it takes the lock, hands a closure the address of the value, and releases
+ * the lock when the closure returns. The address is lent (`@lends`), so the compiler holds the closure
+ * to letting it go -- returning it, storing it, or passing it to something that keeps it is refused,
+ * which is the one mistake a returned address could not prevent: using it after the release.
  *
  * ```
- * var p = m.lock()
- *
- * defer m.unlock()
- * *p = *p + 1
+ * m.with((n) -> *n += 1)
  * ```
+ *
+ * `lock_raw` and `unlock_raw` are the hold a block cannot express -- taken in one function and
+ * released in another, or handed from one thread to the next. Nothing ties their address to the hold,
+ * which is what the name says.
  *
  * **It is not built on `pthread_mutex_t`, and the reason is a build property rather than a
  * preference.** A caller-allocated opaque C type is one of the three things `reference/ffi.md § A
@@ -58,13 +62,37 @@ struct Mutex[T]
      */
     new(value: T) -> Mutex[T] = Mutex(0, value)
 
+    /** Takes the lock, waiting until it is free, runs `body` with the address of what it protects,
+     * releases the lock, and answers what `body` answered.
+     *
+     * The address is valid only while `body` runs, and the compiler holds `body` to that: it may read
+     * and write through the address, and pass it to a callee that only uses it, but not return it,
+     * store it, or hand it to something that keeps it (`reference/memory.md § A pointer lent for one
+     * call`). A closure is not an allocation here -- the parameter is a type parameter, so each call is
+     * a direct call of the closure's own body, and this is usable under `@no_alloc`.
+     */
+    @lends(body)
+    with[R](*self, body: *T -> R) -> R
+        self.lock_raw()
+
+        defer self.unlock_raw()
+        body(&self.value)
+
+    /** The same, if the lock is free: `Some` of what `body` answered, or `None` without waiting. */
+    @lends(body)
+    try_with[R](*self, body: *T -> R) -> Option[R]
+        if atomic_swap(&self.held, 1, Acquire) != 0 then return None
+
+        defer self.unlock_raw()
+        Some(body(&self.value))
+
     /** Takes the lock, waiting until it is free, and answers the address of what it protects.
      *
-     * The address is live until `unlock`, and holding on to it past that is the mistake this shape
-     * cannot prevent: a guard whose destruction released the lock is what Rust returns here, and
-     * sysl has no destructor to hang that on.
+     * The address is live until `unlock_raw`, and nothing ties it to the hold -- holding on to it past
+     * the release compiles. This is the hold a block cannot express, taken in one function and released
+     * in another; where the hold fits a block, `with` is the one to write.
      */
-    lock(*self) -> *T
+    lock_raw(*self) -> *T
         while atomic_swap(&self.held, 1, Acquire) != 0
             // Spin on a plain load until it looks free, then offer the processor away before trying
             // the exchange again. The load is `SpinLock`'s reason -- a read-modify-write takes the
@@ -77,17 +105,17 @@ struct Mutex[T]
         &self.value
 
     /** Takes the lock if it is free, and answers what it protects where it did. Never waits. */
-    try_lock(*self) -> Option[*T] =
+    try_lock_raw(*self) -> Option[*T] =
         if atomic_swap(&self.held, 1, Acquire) == 0 then Some(&self.value) else None
 
-    /** Releases the lock.
+    /** Releases the lock a `lock_raw` or `try_lock_raw` took.
      *
      * The `Release` is what publishes everything the holder wrote through the address it was given,
      * to whichever thread's `Acquire` takes the lock next. That pairing is the whole of what makes
      * the data safe to touch, and it is why neither of these takes an `Ordering`: a lock's orderings
      * are fixed by what a lock means.
      */
-    unlock(*self)
+    unlock_raw(*self)
         atomic_store(&self.held, 0, Release)
 
 end Mutex

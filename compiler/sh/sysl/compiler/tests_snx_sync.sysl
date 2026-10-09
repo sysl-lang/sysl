@@ -93,8 +93,10 @@ end snx_err
 // The LLVM text of the program with the library's bodies lowered beside it (nothing precompiled, as
 // `--no-std-lib` does) -- `SpinLock`'s methods are not generic, so with an artifact their bodies
 // would be declarations here and the orderings inside them unreadable.
-private snx_ir(body: string) -> string
-    val t = host_target()
+private snx_ir(body: string) -> string = snx_ir_for(body, host_target())
+
+// The same, for another machine.
+private snx_ir_for(body: string, t: Target) -> string
     var units: Buf[Program] = buf()
 
     std_root() match
@@ -119,7 +121,7 @@ private snx_ir(body: string) -> string
     if !said.is_empty() then return said.at(0).render()
 
     ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
-end snx_ir
+end snx_ir_for
 
 // Whether some line of `text` holds `before`, then a temporary (`%t<digits>`), then `after` -- the
 // shape `%t\d+` stands for in the reference's patterns, the numbers being the lowering's business.
@@ -324,6 +326,27 @@ snx_and_is_free_again_once_released() =
 snx_taking_a_free_lock_returns_leaving_it_held() =
     snx_prints("var l = SpinLock(0)\nl.lock()\nprint(l.held)\nl.unlock()\nprint(l.held)", "1\n0\n")
 
+// The scoped form: the lock is held while the body runs, free after it, and the body's answer comes
+// back. A pointer to the lock is captured, a closure capturing the lock itself holding a copy.
+@test
+snx_with_holds_for_the_body_and_answers_it() =
+    snx_prints("var l = SpinLock(0)\nval lp = &l\n" +
+               "val got = l.with(() -> lp.held * 10 + 1)\nprint(got, l.held)", "11 0\n")
+
+@test
+snx_try_with_runs_only_where_the_lock_was_free() =
+    snx_prints("var l = SpinLock(0)\nval lp = &l\n" +
+               "print(l.try_with(() -> 7).unwrap(), l.with(() -> lp.try_with(() -> 7).is_none()), l.held)",
+               "7 true 0\n")
+
+// A `return` out of the enclosing function from inside the body is not possible -- the body is a
+// closure -- so the release cannot be skipped; an early return from the body itself still releases.
+@test
+snx_with_releases_after_a_body_that_returns_early() =
+    snx_prints("var l = SpinLock(0)\n" +
+               "pick(b: bool) -> int\n    if b then return 1\n    2\n" +
+               "print(l.with(() -> pick(true)), l.with(() -> pick(false)), l.held)", "1 2 0\n")
+
 // Acquire on the way in, release on the way out: a lock's orderings are fixed by what a lock means,
 // which is why it takes no `Ordering` of its own.
 @test
@@ -351,7 +374,7 @@ snx_a_module_with_no_allocator_and_no_operating_system_builds_both_types()
         import sysl.sync.*
 
         var c = Counter(SpinLock(0), Atomic(0u32))
-        print(c.record(3u32), c.record(4u32), c.hits.load())
+        print(c.record(3u32), c.record(4u32), c.hits.load(), c.peek())
         """)
 
     make_dir_all(root + "/kern").unwrap()
@@ -370,12 +393,19 @@ snx_a_module_with_no_allocator_and_no_operating_system_builds_both_types()
                 self.lock.lock()
                 defer self.lock.unlock()
                 self.hits.add(n, Relaxed)
+
+            // The scoped form, under the same two refusals: a closure handed to a bare-arrow
+            // parameter is a direct call, so nothing here reaches the allocator.
+            peek(*self) -> u32
+                val hp = &self.hits
+
+                self.lock.with(() -> hp.load(Relaxed))
         end Counter
         """).unwrap()
 
     val out = snx_outcome_in(root)
 
-    assert_eq(out.0, "0 3 7\n")
+    assert_eq(out.0, "0 3 7 7\n")
     assert_eq(out.1, 0)
 end snx_a_module_with_no_allocator_and_no_operating_system_builds_both_types
 
@@ -431,3 +461,61 @@ snx_arithmetic_on_an_atomic_of_pointers_while_the_exchanges_on_one_work()
                          "the question the raw tier does not answer — use 'atomic_swap' or 'atomic_cas' " +
                          "to change a pointer"), out)
 end snx_arithmetic_on_an_atomic_of_pointers_while_the_exchanges_on_one_work
+
+// -- the spin-wait hint ------------------------------------------------------------------------------
+
+// `spin_hint()` is the machine's busy-wait hint and nothing else: a program calling it runs on.
+@test
+snx_spin_hint_is_callable_and_does_nothing_else()
+    snx_prints("var turns = 0\n\nwhile turns < 3\n    spin_hint()\n    turns += 1\n\nprint(turns)",
+               "3\n")
+end snx_spin_hint_is_callable_and_does_nothing_else
+
+// Each machine's own instruction, as one `asm sideeffect` -- and nothing at all on wasm.
+@test
+snx_spin_hint_is_each_machines_instruction()
+    if xvr_no_library() then return
+
+    val body = "spin_hint()"
+    val arm = snx_ir_for(body, target_named("aarch64-freestanding").unwrap())
+    val x86 = snx_ir_for(body, target_named("x86_64-linux").unwrap())
+    val rv = snx_ir_for(body, target_named("riscv32-freestanding").unwrap())
+    val thumb = snx_ir_for(body, target_named("thumbv6m-freestanding").unwrap())
+    val wasm = snx_ir_for(body, target_named("wasm32-freestanding").unwrap())
+
+    assert(snx_says(arm, "asm sideeffect \"yield\""), arm)
+    assert(snx_says(x86, "asm sideeffect \"pause\""), x86)
+    assert(snx_says(rv, "asm sideeffect \".insn i 0x0f, 0, x0, x0, 0x010\""), rv)
+    assert(snx_says(thumb, "asm sideeffect \"yield\""), thumb)
+    assert(snx_says(wasm, "spin_hint") && !snx_says(wasm, "asm sideeffect"), wasm)
+end snx_spin_hint_is_each_machines_instruction
+
+// `SpinLock.lock` hints on every round of its read-only spin, and only there: the exchange that
+// takes the lock is not delayed by it.
+@test
+snx_the_spinlock_hints_while_it_waits()
+    if xvr_no_library() then return
+
+    val out = snx_ir_for("var lk = SpinLock(0)\nlk.lock()\nlk.unlock()",
+                         target_named("aarch64-freestanding").unwrap())
+    var lock = ""
+    var inside = false
+
+    for line in split(out, "\n")
+        if line.starts_with("define ") && snx_says(line, "SpinLock.lock") then inside = true
+        elif inside && line == "}" then inside = false
+        elif inside then lock = lock + line + "\n"
+
+    assert(snx_says(lock, "spin_hint"), out)
+    assert(snx_says(lock, "load atomic i32") && snx_says(lock, "monotonic"), lock)
+end snx_the_spinlock_hints_while_it_waits
+
+@test
+snx_spin_hint_takes_nothing()
+    if xvr_no_library() then return
+
+    val out = snx_err("spin_hint(1)")
+
+    assert(snx_says(out, "error: function 'sysl.sync.spin_hint' takes 0 arguments, but 1 argument " +
+                         "was given"), out)
+end snx_spin_hint_takes_nothing

@@ -33,10 +33,23 @@ private simple_enum_bits(d: &EnumType) -> Option[int] = d.underlying match
     Integer(bits, _, _) -> Some(bits)
     _ -> None
 
+// How wide a field is as a range of a bitfield struct: an integer's or a simple enum's own bits, or,
+// for a bitfield struct held there, the sum of its own fields' widths -- the bits it uses, not the
+// whole bytes its container is rounded up to.
+range_width(t: Type) -> Option[int] = bitfield_width(t) match
+    Some(w) -> Some(w)
+    None -> underlying(t) match
+        Struct(d) -> bitfield_ranges(d) match
+            Some(ranges) -> Some(bitfield_used(ranges))
+            None -> None
+        _ -> None
+
 // The ranges a packed struct's fields occupy, where it is one whose fields are bit-sized.
 //
 // A `@packed` struct whose every field is a whole number of bytes is laid out end to end and is not
-// a bitfield container; one with a field of an odd width is.
+// a bitfield container; one with an integer or enum field of an odd width is. **Only such a field
+// decides it**: a bitfield struct held in an otherwise whole-byte `@packed` struct is a field of its
+// container's size there, and only inside a bitfield struct does it shrink to its own width.
 bitfield_ranges(s: &StructType) -> Option[Buf[BitRange]]
     if !s.packed then return None
 
@@ -47,7 +60,7 @@ bitfield_ranges(s: &StructType) -> Option[Buf[BitRange]]
     for item in fields
         bitfield_width(item.1) match
             Some(w) -> if w % 8 != 0 then any_odd = true
-            None -> all_known = false
+            None -> if range_width(item.1).is_none() then all_known = false
 
     if !any_odd || !all_known then return None
 
@@ -55,7 +68,7 @@ bitfield_ranges(s: &StructType) -> Option[Buf[BitRange]]
     var offset = 0
 
     for item in fields
-        val w = bitfield_width(item.1).unwrap()
+        val w = range_width(item.1).unwrap()
 
         out.push(BitRange(item.0, item.1, offset, w))
         offset += w
@@ -63,14 +76,20 @@ bitfield_ranges(s: &StructType) -> Option[Buf[BitRange]]
     Some(out)
 end bitfield_ranges
 
-// How wide the container holding a run of ranges is, in bits: a whole number of bytes, and never
-// fewer than one.
-bitfield_bits(ranges: Buf[BitRange]) -> int
+// How many bits a run of ranges uses, end to end.
+bitfield_used(ranges: Buf[BitRange]) -> int
     var used = 0
 
     for range in ranges
         used += range.width
 
+    used
+end bitfield_used
+
+// How wide the container holding a run of ranges is, in bits: a whole number of bytes, and never
+// fewer than one.
+bitfield_bits(ranges: Buf[BitRange]) -> int
+    val used = bitfield_used(ranges)
     val bytes = (used + 7) / 8 * 8
 
     if bytes < 8 then 8 else bytes
@@ -110,6 +129,10 @@ layout_memo() -> &LayoutMemo = LayoutMemo(map(), map(), 0, map())
 struct TargetLayout
     word_bits: usize
     memo: Option[&LayoutMemo]
+
+    // Whether memory holds a value's least significant byte first -- a property of the layout as
+    // much as a width is, and what a constant reordered by `to_be` is folded against.
+    little_endian: bool
 
     pointer_bytes(self) -> usize = self.word_bits / 8
 
@@ -439,11 +462,11 @@ end TargetLayout
 
 // The layout a target measures with, remembering nothing: the one the analysis uses, while the
 // records it measures are still being filled in.
-layout_for(t: Target) -> TargetLayout = TargetLayout(t.pointer_bits(), None)
+layout_for(t: Target) -> TargetLayout = TargetLayout(t.pointer_bits(), None, t.little_endian())
 
 // The layout a target measures with over a finished program, remembering every struct and enum it
 // has measured.
-memo_layout_for(t: Target) -> TargetLayout = TargetLayout(t.pointer_bits(), Some(layout_memo()))
+memo_layout_for(t: Target) -> TargetLayout = TargetLayout(t.pointer_bits(), Some(layout_memo()), t.little_endian())
 
 // An integer's alignment: the next power of two at or above its byte count, capped at sixteen.
 int_align(bits: int) -> usize

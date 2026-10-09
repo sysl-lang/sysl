@@ -10,7 +10,7 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@noinline`, `@inline`, `@cold`, `@no_alloc` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@lends`, `@noinline`, `@inline`, `@cold`, `@no_alloc` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@borrows` | an **annotation** on a trait's method — see [`@borrows`](/reference/traits/#a-method-may-promise-to-borrow) | the grammar |
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; the one an `extern` takes | the grammar |
@@ -67,8 +67,8 @@ covered under [modules](/reference/modules/) and [FFI](/reference/ffi/), where w
 only itself. It attaches to nothing, declares no name, and nothing can refer to one — two saying the
 same thing are two checks rather than a duplicate. It is below.
 
-**On a member, four: the ones that are about a PARAMETER.** `@crossing`, `@borrows`, `@reads` and
-`@writes` each name parameters, and a method, a property or an associated function has parameters
+**On a member, five: the ones that are about a PARAMETER.** `@crossing`, `@borrows`, `@lends`,
+`@reads` and `@writes` each name parameters, and a method, a property or an associated function has parameters
 exactly as a free function does — so there was never anything for a blanket refusal to be about in
 their case:
 
@@ -1670,8 +1670,9 @@ The rule is stated over the **integer's value** and never over memory bytes. Wri
 "the low bits of byte 0" — it would be a claim about endianness, which nothing in sysl is allowed to
 make. Written this way it costs nothing: the struct is an integer, so how it reaches memory is the
 target's ordinary byte order for an integer of that width. A wire format's byte order belongs to the
-protocol rather than to the CPU, and stays with
-[`sysl.encoding.binary`](/library/encoding/)'s `get_u16_le` and the rest.
+protocol rather than to the CPU, and a struct of whole-byte fields states it with
+[`@byte_order`](#byte_orderbig-and-byte_orderlittle-the-order-a-structs-integers-keep-their-bytes-in)
+below.
 
 **Being one integer, it goes to and from that integer with nothing in between.** `T::Bits(n)` makes
 the struct from the integer it is stored as and `x.bits` reads that integer back — the same pair a
@@ -1732,8 +1733,9 @@ the struct declares named `bits` is what `.bits` reaches, ahead of the container
 a value none of its variants has; the field is held to its variants where it is read, as one reached
 through a pointer the hardware filled is.
 
-**Every field has to be an integer.** A `bool` is not one here — its storage is a byte and its
-representation a bit — and neither is a pointer, a float or an array:
+**Every field has to be an integer** — or a simple enum, or another bitfield struct. A `bool` is not
+one here — its storage is a byte and its representation a bit — and neither is a pointer, a float or
+an array:
 
 ```sysl
 @packed
@@ -1750,8 +1752,66 @@ print(m.a)
 is one integer, and every field of it has to be one too
 ```
 
-**Nesting is the composition path**, and it costs nothing: a bitfield struct is a leaf, and an
-ordinary `@packed` struct lays one out as a field of its size.
+**A bitfield struct may be a field of another, and there it occupies its own fields' widths** — the
+bits it uses, not the whole bytes its own container rounds up to. That is how a group of flags shared
+by several registers is named once: a page descriptor's ten lower attribute bits sit at bit 2 of the
+block, the page and the stage 2 descriptor alike. A field of the inner struct is read and written
+through both containers, and `.bits` and `::Bits` of the outer one cover all of it:
+
+```sysl
+@packed
+struct Lower
+    attr: u3
+    ns: u1
+    ap: u2
+    sh: u2
+    af: u1
+    ng: u1
+
+@packed
+struct Desc
+    valid: u1
+    page: u1
+    lower: Lower
+    oa: u36
+    rest: u16
+
+var d = Desc(1, 1, Lower(5, 0, 1, 3, 1, 0), 0x12345, 0)
+
+d.lower.ap = 2
+
+print(sizeof(Desc), d.lower.attr, d.lower.ap, d.lower.sh, d.oa, d.lower.bits)
+```
+
+```output
+8 5 2 3 74565 485
+```
+
+A struct that is not one integer is refused there — an ordinary struct, or a `@packed` one whose
+fields are all whole bytes:
+
+```sysl
+struct Pt
+    x: u8
+    y: u8
+
+@packed
+struct Flags
+    on: u1
+    at: Pt
+
+val f = Flags(1, Pt(2, 3))
+
+print(f.on)
+```
+
+```error
+Pt is laid out as fields rather than as one integer — only a '@packed' struct with a field narrower than a byte nests in another, in its own fields' width
+```
+
+**What decides whether a `@packed` struct is one integer is its own integer and enum fields**, so an
+ordinary `@packed` struct whose fields are whole bytes lays a bitfield struct out as a field of its
+size, as it always has.
 
 ```sysl
 @packed
@@ -2083,6 +2143,208 @@ print(a, b)
 The bound is held to the same rule a struct's is — a power of two, folded rather than lexed, so a
 `const` or arithmetic over one is what a program writes.
 
+## `@byte_order(big)` and `@byte_order(little)` — the order a struct's integers keep their bytes in
+
+A protocol header or an on-disk record has a byte order of its own, and it is the format's rather
+than the machine's: IPv4, UDP and TCP keep the most significant byte first, on every machine that
+reads them. `@byte_order` says so once, above the struct, and every integer field of it is then
+**stored** in that order and **read and written** as an ordinary integer.
+
+```sysl
+@packed
+@byte_order(big)
+struct Udp
+    src: u16
+    dst: u16
+    len: u16
+    sum: u16
+
+var h = Udp(5353, 53, 8, 0)
+
+h.len += 4
+
+val raw: *u8 = ptr_cast(&h)
+
+print(h.src, h.dst, h.len)
+print(raw[0], raw[1], raw[4], raw[5])
+```
+
+```output
+5353 53 12
+20 233 0 12
+```
+
+`5353` is `0x14E9`, and the first byte in memory is `0x14` — the order the wire wants, though the
+machine running this is little-endian. **The struct's storage is the bytes of the format**, so a
+whole value is copied, cast over a frame, compared or handed to C exactly as those bytes, and the
+reversal happens only where a field turns into a value and back: a read, a write, a construction, a
+destructuring. On a machine whose own order is the one stated, nothing is reversed at all.
+
+`@byte_order(little)` is the other word, for a format that keeps the least significant byte first —
+most file formats, and every one written by a little-endian machine. On today's targets it reverses
+nothing, since every machine sysl targets is little-endian; it is written so the struct still means
+what it says on the first one that is not.
+
+**It is a separate axis from `@packed` and `@align(n)`**, and composes with both. A byte order says
+nothing about gaps between fields, so a header whose fields are not already on their own boundaries
+is `@packed` as well — `Udp` above is four `u16`s and would lay out the same either way.
+
+What a field may be, inside one:
+
+- **an integer of a whole number of bytes** — `u16`, `i32`, `u24` — or a fixed-point number, or a
+  simple enum (whose discriminant is the integer that is stored), or a name for any of these: these
+  are the fields whose bytes are reversed;
+- **a byte, a `bool`, or an array of either** — one byte has no order to keep;
+- **a struct that states its own `@byte_order`**, or that holds only bytes, which is how a format
+  whose fields disagree is written: two structs, one a field of the other.
+
+A field is read through the struct and nowhere else, so **its address is refused** — a `*u16` is
+read in the machine's order, and would hand every later read the bytes backwards:
+
+```sysl
+@byte_order(big)
+struct Hdr
+    len: u16
+
+var h = Hdr(1)
+val p = &h.len
+
+print(1)
+```
+
+```error
+'&' here would reach a 'ushort' inside Hdr, which is '@byte_order(big)' — the field holds its bytes most significant first whatever the machine does, and a '*ushort' is read in the machine's order. Read or write the field through the struct, which is where the order is applied, or take the address of the Hdr itself
+```
+
+A `ref` is refused in the same words, for the same reason. The address of the struct itself is
+untouched — it is an ordinary pointer to the bytes of the format, which is what a frame is.
+
+**Every other kind of field is refused, and the refusal says what to hold instead.** A float's bytes
+are put in an order through its bits:
+
+```sysl
+@byte_order(big)
+struct Sample
+    level: f32
+
+print(sizeof(Sample))
+```
+
+```error
+'Sample.level' is f32, and 'Sample' is '@byte_order(big)' — a float is put in an order through its bits, which the language does not do behind a field read. Hold it as the unsigned integer of its width and convert with '.bits()' and 'from_bits'
+```
+
+An array of wider integers has elements, which are read by index rather than as fields:
+
+```sysl
+@byte_order(big)
+struct Table
+    slots: [4]u16
+
+print(sizeof(Table))
+```
+
+```error
+'Table.slots' is [4]ushort, and 'Table' is '@byte_order(big)' — an element is reached by index rather than read as a field, and the order is applied where a field is read. Hold it as bytes, '[N]u8', or make the element a '@byte_order' struct of its own
+```
+
+A struct held as a field keeps its own order, so one that states none would be read in the
+machine's:
+
+```sysl
+struct Pair
+    a: u16
+    b: u16
+
+@byte_order(big)
+struct Outer
+    p: Pair
+
+print(sizeof(Outer))
+```
+
+```error
+'Outer.p' is Pair, and 'Outer' is '@byte_order(big)' — 'Pair' keeps its integers in the machine's order, so a field of it would be read in the wrong one. Mark it '@byte_order' too
+```
+
+An address means nothing in the memory of whatever reads the bytes:
+
+```sysl
+@byte_order(big)
+struct Link
+    next: *u8
+
+print(sizeof(Link))
+```
+
+```error
+'Link.next' is *byte, and 'Link' is '@byte_order(big)' — an address means nothing outside the memory it points into, and a struct with a byte order is laid out to be written somewhere else. Hold an offset or an index instead
+```
+
+**A bitfield struct takes one too, and the order is its container's.** Its fields are ranges of one
+integer, so the integer is what is stored in the stated order — IPv4's sixteen bits of flags and
+fragment offset are exactly this:
+
+```sysl
+@packed
+@byte_order(big)
+struct Frag
+    offset: u13
+    more: u1
+    dont: u1
+    reserved: u1
+
+@packed
+@byte_order(big)
+struct Ipv4Tail
+    ident: u16
+    frag: Frag
+    ttl: u8
+
+var t = Ipv4Tail(0x1c46, Frag(0, 0, 1, 0), 64)
+val raw: *u8 = ptr_cast(&t)
+
+print(raw[2], raw[3], t.frag.dont, t.frag.bits)
+```
+
+```output
+64 0 1 16384
+```
+
+The ranges are taken from the integer, as they are for any bitfield struct, so `dont` is bit 14 of
+`0x4000` and the wire holds `0x40 0x00`. A bitfield struct with no order of its own is refused as a
+field of one that has an order, its integer being in the machine's.
+
+The order is one of two words, and the attribute marks a struct and nothing else:
+
+```sysl
+@byte_order(middle)
+struct Odd
+    a: u16
+
+print(1)
+```
+
+```error
+'@byte_order' names the order in parentheses — '@byte_order(big)' for a network header, which keeps the most significant byte first, or '@byte_order(little)' for a format that keeps the least significant first
+```
+
+```sysl
+@byte_order(big)
+var n: u16 = 1
+
+print(n)
+```
+
+```error
+'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'sysl.math.ByteOrder' gives every whole-byte integer
+```
+
+A value that is not in a struct is put in an order with
+[`sysl.math.ByteOrder`](/library/math/)'s `to_be` and `from_be`, and a byte-ordered struct is read
+out of bytes, every `bool` and enum in it checked, with
+[`sysl.encoding.Plain`](/library/encoding/)'s `decode`.
+
 ## `@section("...")` — where a symbol lands
 
 `@align(n)` says what boundary storage begins on. `@section` says **where the storage is**, and it is
@@ -2279,6 +2541,229 @@ print(n)
 
 What a bare target uses instead is exactly this: a plain module `var` the port's scheduler answers
 for, the same shape the ownership runtime's reaper slot already takes.
+
+### On a bare AArch64 machine the program may own the thread pointer
+
+A kernel is the thing that writes the thread pointer, so on `aarch64-freestanding` the refusal above
+becomes a question: which register? The manifest answers it, and from then on `@thread_local` compiles
+to the local-exec model against that register:
+
+```hocon
+codegen {
+  thread_pointer = "tpidr_el1"
+}
+```
+
+The register is any of `tpidr_el0`, `tpidrro_el0`, `tpidr_el1`, `tpidr_el2` and `tpidr_el3`. Every
+function is compiled to read it (clang's `-mtp`), and so is a package's carried C, so a
+`_Thread_local` there and a `@thread_local` here find one block.
+
+**What the program then owes is what a loader would have done.** The linker gathers every
+thread-local into a `.tdata` image (the initial values) and a `.tbss` (the zeros), and on AArch64 a
+variable lives at the thread pointer plus 16 plus its offset in that image, the 16 bytes being reserved
+for the thread's own use. So for each thread the program sets aside 16 bytes plus the image, rounded
+to the image's alignment, copies `.tdata` in after the 16, zeroes the `.tbss` part, and writes the
+block's address to the register on every switch. A linker script names the bounds for it to copy:
+
+```text
+.tdata : { __tdata_start = .; *(.tdata .tdata.*) __tdata_end = .; }
+.tbss  : { *(.tbss .tbss.*) *(.tcommon) __tbss_end = .; }
+```
+
+A thread that never gets a block reads whatever the register points at, as it would through any
+pointer the program forgot to set. A register the machine has no use for is refused before anything
+is built:
+
+```sysl target=aarch64-freestanding
+@thread_local static var n: int = 0
+
+print(n)
+```
+
+```error
+cannot be '@thread_local' on 'aarch64-freestanding' until the program says which register holds the thread pointer
+```
+
+## `@per_cpu` — one copy per processor core
+
+`@per_cpu` gives a module `var` one copy per **core** rather than per thread: the record a scheduler
+keeps for each processor, the core's run queue, its tick count. It exists only on `aarch64-freestanding`,
+where the program owns a register to find the copy through, and the manifest names that register:
+
+```hocon
+codegen {
+  per_cpu_offset = "tpidr_el1"
+}
+```
+
+Every `@per_cpu` binding is laid down in one section, `.percpu`, and that section is the **image** each
+core's copy is made from. The register holds this core's copy's address *minus* the image's, so an
+access is the binding's address plus the register — read afresh at every access — and a core whose
+register is zero is using the image itself. A boot core can therefore use its per-core data before it
+has made any copies, provided it zeroes the register first. For the others the program copies the
+image once per core and writes each core's offset:
+
+```text
+.percpu : { __percpu_start = .; *(.percpu) __percpu_end = .; }
+```
+
+```sysl
+@per_cpu
+var ticks: u64 = 0
+
+@pinned
+tick() -> u64
+    ticks += 1
+    ticks
+```
+
+Its initializer has to be one the compiler can write down, as a `@thread_local`'s does, and it stands
+beside `@align(n)` and nothing else: the section is the storage class's own.
+
+### A per-core read is right only where the core cannot change
+
+Which copy `ticks` names depends on the core *running*, so the read is right only while the thread
+cannot move: a thread preempted between finding its core's copy and using it resumes on another core
+holding the first core's. Nothing in a function's text says whether interrupts are masked, so the
+function says it, in one of two words:
+
+- **`@pinned`** — every caller already keeps this function on one core: it runs in an interrupt
+  handler, or under a lock that masks interrupts. That is a precondition, so **a call of a `@pinned`
+  function is held to the same rule as a per-core read**, and so is taking its address.
+- **`@pins`** — the body keeps itself on one core before it gets there (it masks interrupts first,
+  and unmasks them after). Its callers are asked nothing.
+
+A `@per_cpu` binding may be named, and a `@pinned` function called, only inside a body marked one or
+the other. The words are the program's claim, as an `@export`'s symbol is — the compiler cannot see a
+register being written — but they put the claim at the function, where a reader can check it against
+the code, and they carry it up the call tree to the place that keeps the core still.
+
+The rule is not about storage, so it runs anywhere a `@pinned` function is written:
+
+```sysl
+@pinned
+depth() -> int = 3
+
+@pins
+probe() -> int
+    // The real thing masks interrupts here and restores them after.
+    depth()
+
+print(probe())
+```
+
+```output
+3
+```
+
+A closure is a body of its own and carries neither word, since it can be called after the function
+that wrote it has let the core go; nor do the entry file's statements.
+
+```sysl
+@pinned
+depth() -> int = 3
+
+print(depth())
+```
+
+```error
+'depth' is '@pinned', so every call of it has to be made where the core cannot change, and the program's statements are neither '@pinned' nor '@pins'
+```
+
+`@pinned` says the callers hold the core still and `@pins` that the body does, so one function is one
+or the other:
+
+```sysl
+@pinned
+@pins
+depth() -> int = 3
+```
+
+```error
+'@pinned' says every caller already keeps this function on one core, and '@pins' says the function does that itself before it reaches per-core storage — one body is one or the other
+```
+
+### What it refuses
+
+Anywhere but a bare AArch64 machine, the operating system moves a thread between cores whenever it
+likes, so no answer to "which core" stays true long enough to read through:
+
+```sysl
+@per_cpu
+static var ticks: u64 = 0
+
+print(ticks)
+```
+
+```error
+cannot be '@per_cpu' on
+```
+
+On `aarch64-freestanding`, until the manifest names the register:
+
+```sysl target=aarch64-freestanding
+@per_cpu
+static var ticks: u64 = 0
+
+@pins
+tick() -> u64 = ticks
+
+print(tick())
+```
+
+```error
+cannot be '@per_cpu' until the program says which register holds this core's offset
+```
+
+A copy per thread and a copy per core are two answers to one question:
+
+```sysl
+@per_cpu
+@thread_local
+static var ticks: u64 = 0
+```
+
+```error
+'@thread_local' and '@per_cpu' are two answers to how many copies one 'var' has
+```
+
+A section would move the binding out of the image the copies are taken from:
+
+```sysl
+@per_cpu
+@section(".data")
+static var ticks: u64 = 0
+```
+
+```error
+'@per_cpu' places the binding in '.percpu', the image every core's copy is made from
+```
+
+A `val` never changes, so the one copy it has is already every core's:
+
+```sysl
+@per_cpu
+static val ticks: u64 = 0
+```
+
+```error
+a per-core constant is a constant
+```
+
+A local is in one call's frame, which no other core can see:
+
+```sysl
+count() -> u64
+    @per_cpu
+    var n: u64 = 0
+    n
+
+print(count())
+```
+
+```error
+'n' is a local, and a local is already one call's
+```
 
 ## `@domain(interrupt)` — a function entered on top of whatever was running
 

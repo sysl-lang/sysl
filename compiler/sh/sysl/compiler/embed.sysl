@@ -1,0 +1,304 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, is_dir, read_bytes}
+import sysl.text.Search
+
+// A file's bytes written into the program while compiling: `embed("hello.elf")` is a `[]const u8`
+// over a constant the object file carries, as Rust's `include_bytes!` and C23's `#embed` are.
+//
+// **A relative path is read from the directory of the file that writes it**, never from wherever the
+// build was started: a source file and the data beside it move together, and the same tree has to
+// build from any directory. An absolute path is taken as written.
+//
+// **The path is a string literal and nothing else** -- not a `const`, not an interpolation. That is
+// what lets every cache that replays a build know which files it depends on without analyzing it
+// first: `embedded_inputs` below finds each one in the source text, and its bytes go into the key
+// beside the source's.
+//
+// **The bytes start on a 16-byte boundary**, which is as aligned as any scalar a target has, so a
+// header read in place from the start of an image is aligned on a machine that faults on an
+// unaligned load. `align = n` asks for more -- a page, for a blob somebody will map.
+//
+// The same rule reaches assembly: a `.incbin "file"` in an `asm` block is read from the block's own
+// file (`incbin_line`), and its bytes are keyed the same way.
+
+// The boundary embedded bytes start on where the call asks for none.
+const EmbedAlign: usize = 16
+
+// Whether a name in call position is the form. Like the system-register forms, a function or a local
+// of the name is what a call reaches: `embed` is an ordinary enough word to be somebody's own.
+embed_form(cx: &Analyzer, name: string) -> bool =
+    name == "embed" && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
+
+// `embed("path")` or `embed("path", align = n)`, analyzed.
+embed_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    var written: Option[Expr] = None
+    var align: Option[Expr] = None
+
+    for item in args
+        *item.kind match
+            NamedArg(name, value) ->
+                if name == "align" && align.is_none() then align = Some(value)
+                else
+                    return cx.err(item.span, s"'embed' takes the file's path and, optionally, " +
+                                  s"'align = n' — there is no '$name' — embed(\"logo.bin\", align = 4096)")
+            _ ->
+                if written.is_some()
+                    return cx.err(item.span, "'embed' takes one path — embed(\"logo.bin\")")
+
+                written = Some(item)
+
+    if written.is_none()
+        return cx.err(span, "'embed' takes the file's path — embed(\"logo.bin\")")
+
+    val arg = written.unwrap()
+
+    val rel = *arg.kind match
+        StrLit(s) -> s
+        _ ->
+            return cx.err(arg.span, "'embed' reads its file while compiling, and a build that is " +
+                          "replayed has to know which files it read without compiling again — so the " +
+                          "path is written as a string literal, not computed: embed(\"logo.bin\")")
+
+    val boundary = embed_boundary(cx, align)
+
+    if boundary == 0 then return bad_expr(span)
+
+    val at = beside(cx.scope.src.name, rel)
+
+    if is_dir(at)
+        return cx.err(arg.span, s"'$at' is a directory, and 'embed' takes a file")
+
+    if !exists(at)
+        return cx.err(arg.span, s"cannot embed '$rel': there is no file at '$at' — a relative path " +
+                      "is read from the directory of the file that writes it")
+
+    read_bytes(at) match
+        Ok(bytes) -> TExpr(span, TEmbed(at, bytes, int(boundary)))
+        Err(why) -> cx.err(arg.span, s"cannot embed '$at': ${why.message()}")
+end embed_call
+
+// The boundary the bytes start on: 16 where the call names none, or the constant power of two it
+// names. Zero where that was refused.
+private embed_boundary(cx: &Analyzer, align: Option[Expr]) -> usize
+    if align.is_none() then return EmbedAlign
+
+    val x = align.unwrap()
+
+    val n = const_fold(cx, x) match
+        Some(ConstInt(v)) -> v.to_long().unwrap_or(0)
+        _ ->
+            cx.fault(x.span, "'align' on 'embed' needs a constant — the boundary is part of the " +
+                     "object file, so it is fixed while compiling")
+            return 0
+
+    if n <= 0 || (n & (n - 1)) != 0 || n > (1 << 29)
+        cx.fault(x.span, s"'align = $n' is not an alignment — a boundary is a power of two, since an " +
+                 "address is aligned by having low bits clear")
+        return 0
+
+    usize(n)
+end embed_boundary
+
+// Where a path written in `file` names: from the root as written, or from the file's own directory.
+beside(file: string, written: string) -> string =
+    if written.starts_with("/") then absolute_path(written)
+    else absolute_path(join_path(parent_of(file).unwrap_or("."), written))
+
+// -- `.incbin` in an `asm` block ---------------------------------------------------------------------
+
+// One line of an `asm` block, with a `.incbin "file"`'s relative path made the absolute one beside
+// the block's own file, and a comment carrying the file's fingerprint after it.
+//
+// **The comment is what makes an edit to the file rebuild**: the instructions are compiled from their
+// text, and an object compiled before is taken from the cache by that text, so a path alone would
+// replay the bytes the file used to hold. `/* */` is the one comment every assembler LLVM has reads.
+// Any other line is returned as it was.
+incbin_line(cx: &Analyzer, span: Span, line: string) -> string
+    val found = incbin_path_in(line.bytes, 0)
+
+    if found.is_none() then return line
+
+    val from = found.unwrap().0
+    val to = found.unwrap().1
+    val rel = found.unwrap().2
+
+    val at = beside(cx.scope.src.name, rel)
+
+    if is_dir(at) || !exists(at)
+        cx.fault(span, s"cannot include '$rel' with '.incbin': there is no file at '$at' — a " +
+                 "relative path is read from the directory of the file the 'asm' block is written in")
+        return line
+
+    val bytes = read_bytes(at) match
+        Ok(b) -> b
+        Err(why) ->
+            cx.fault(span, s"cannot include '$at' with '.incbin': ${why.message()}")
+            return line
+
+    s"${line[0..<from]}$at${line[to..]} /* ${bytes_fingerprint(bytes)} */"
+end incbin_line
+
+// Every line of a block through `incbin_line`.
+incbin_lines(cx: &Analyzer, span: Span, lines: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in lines
+        out.push(incbin_line(cx, span, item))
+
+    out
+end incbin_lines
+
+// Where the path of a `.incbin "file"` in an assembler line is: the offsets of the bytes between the
+// quotes, and the path. The directive has to begin the line, after any blanks and labels' spaces.
+private incbin_path_in(b: []const u8, start: usize) -> Option[(usize, usize, string)]
+    var i = skip_blanks(b, start)
+
+    if !word_at(b, i, ".incbin") then return None
+
+    i = skip_blanks(b, i + 7)
+
+    if i >= b.len || b[i] != u8('"') then return None
+
+    val from = i + 1
+    var j = from
+
+    while j < b.len && b[j] != u8('"')
+        j += 1
+
+    if j >= b.len || j == from then return None
+
+    Some((from, j, str_cast(b[from..<j])))
+end incbin_path_in
+
+// -- what a replayed build depends on ----------------------------------------------------------------
+
+// The files a source's `embed("...")` calls and `.incbin "..."` lines read, each as its absolute path
+// and the fingerprint of its bytes -- or `absent`, which keys a build that was refused the same as
+// any other refusal. **Read from the text rather than from an analysis**, because a cache is asked
+// before anything is analyzed; that is why the path has to be a literal. A word that only looks like
+// one -- `embed(` in a comment, a function of the user's own called `embed` -- adds a file the build
+// did not need to the key, which costs a rebuild when that file changes and never a stale replay.
+embedded_inputs(file: string, text: []const u8) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+    var i: usize = 0
+
+    while i < text.len
+        val c = text[i]
+
+        if c == u8('e') && word_at(text, i, "embed") && (i == 0 || !name_byte(text[i - 1]))
+            val lit = embed_literal(text, i + 5)
+
+            if lit.is_some() then push_input(&out, file, lit.unwrap())
+        else if c == u8('.') && word_at(text, i, ".incbin")
+            val lit = quoted_after(text, skip_blanks(text, i + 7))
+
+            if lit.is_some() then push_input(&out, file, lit.unwrap())
+
+        i += 1
+
+    out
+end embedded_inputs
+
+private push_input(out: *Buf[(string, string)], file: string, written: string)
+    val at = beside(file, written)
+
+    val mark = if is_dir(at) || !exists(at) then "absent"
+    else read_bytes(at) match
+        Ok(bytes) -> bytes_fingerprint(bytes)
+        Err(_) -> "absent"
+
+    out.push((s"embed:$at", mark))
+end push_input
+
+// The path in `embed(` + blanks + a string literal, as the literal decodes, where that is what
+// follows.
+private embed_literal(b: []const u8, start: usize) -> Option[string]
+    var i = skip_space(b, start)
+
+    if i >= b.len || b[i] != u8('(') then return None
+
+    i = skip_space(b, i + 1)
+
+    // `s"..."` with no hole is the plain literal it decodes to, and is taken as one.
+    if word_at(b, i, "s\"") || word_at(b, i, "f\"") then i += 1
+
+    if word_at(b, i, "raw\"")
+        val from = i + 4
+        var j = from
+
+        while j < b.len && b[j] != u8('"')
+            j += 1
+
+        return if j < b.len then Some(str_cast(b[from..<j])) else None
+
+    quoted_after(b, i)
+end embed_literal
+
+// A path in quotes starting at `start`, on one line. Two spellings reach here: a sysl literal,
+// `"..."`, whose `\"` and `\\` are decoded; and an assembler's quotes written inside one, `\"...\"`,
+// which is how an `asm` line spells `.incbin \"file\"` and which ends at the next `\"`.
+private quoted_after(b: []const u8, start: usize) -> Option[string]
+    val escaped = start + 1 < b.len && b[start] == u8('\\') && b[start + 1] == u8('"')
+    val open = if escaped then start + 2 else start + 1
+
+    if !escaped && (start >= b.len || b[start] != u8('"')) then return None
+
+    var out: Buf[u8] = buf()
+    var j = open
+
+    loop
+        if j >= b.len || b[j] == u8('\n') then return None
+
+        val c = b[j]
+
+        if c == u8('"') then break
+
+        if c == u8('\\') && j + 1 < b.len
+            val next = b[j + 1]
+
+            if escaped && next == u8('"') then break
+
+            if next == u8('"') || next == u8('\\')
+                out.push(next)
+                j += 2
+                continue
+
+        out.push(c)
+        j += 1
+
+    Some(str_cast(out.view()))
+end quoted_after
+
+private word_at(b: []const u8, i: usize, word: string) -> bool
+    if i + word.bytes.len > b.len then return false
+
+    for k in 0..<word.bytes.len
+        if b[i + k] != word.bytes[k] then return false
+
+    true
+end word_at
+
+private name_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) ||
+    (c >= u8('0') && c <= u8('9')) || c == u8('_') || c == u8('.')
+
+private skip_blanks(b: []const u8, start: usize) -> usize
+    var i = start
+
+    while i < b.len && (b[i] == u8(' ') || b[i] == u8('\t'))
+        i += 1
+
+    i
+end skip_blanks
+
+private skip_space(b: []const u8, start: usize) -> usize
+    var i = skip_blanks(b, start)
+
+    while i < b.len && (b[i] == u8('\n') || b[i] == u8('\r') || b[i] == u8(' ') || b[i] == u8('\t'))
+        i += 1
+
+    i
+end skip_space

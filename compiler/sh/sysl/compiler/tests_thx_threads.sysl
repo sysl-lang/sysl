@@ -313,11 +313,11 @@ thx_lock_hands_back_the_address()
 
     assert_eq(thx_ran(raw"""
         var m = Mutex.new(41)
-        var p = m.lock()
+        var p = m.lock_raw()
 
         *p = *p + 1
-        m.unlock()
-        print(*m.lock())
+        m.unlock_raw()
+        print(*m.lock_raw())
         """), "42\n")
 
 @test("is taken by the first to ask and refused to the next, and free again once released")
@@ -327,10 +327,65 @@ thx_try_lock_is_taken_then_refused()
     assert_eq(thx_ran(raw"""
         var m = Mutex.new(0)
 
-        print(m.try_lock().is_some(), m.try_lock().is_none())
-        m.unlock()
-        print(m.try_lock().is_some())
+        print(m.try_lock_raw().is_some(), m.try_lock_raw().is_none())
+        m.unlock_raw()
+        print(m.try_lock_raw().is_some())
         """), "true true\ntrue\n")
+
+@test("'with' lends the value for one call, releases it after, and answers what the body did")
+thx_with_lends_and_releases()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        var m = Mutex.new(41)
+        val mp = &m
+        val got = m.with((p) ->
+            *p += 1
+            mp.try_lock_raw().is_none())
+
+        print(got, m.with((p) -> *p), m.try_lock_raw().is_some())
+        """), "true 42 true\n")
+
+@test("'try_with' runs the body only where the lock was free")
+thx_try_with_only_when_free()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        var m = Mutex.new(5)
+        val mp = &m
+
+        print(m.try_with((p) -> *p).unwrap())
+        print(m.with((p) -> mp.try_with((q) -> *q).is_none()))
+        print(m.try_with((p) -> *p * 2).unwrap())
+        """), "5\ntrue\n10\n")
+
+// The finding this closes: an address taken under the lock and used after the release compiled.
+@test("the address 'with' lends may not outlive the hold")
+thx_with_refuses_the_escaping_address()
+    if thx_no_library() then return
+
+    val out = thx_err("var m = Mutex.new(1)\nval p = m.with((n) -> n)\nprint(*p)")
+
+    assert(out.contains("'sysl.posix.threads.Mutex.with' lends this body a pointer that is valid " +
+                        "only until the call returns, and this one is returned"), out)
+
+@test("two threads incrementing through 'with' lose nothing")
+thx_two_threads_with_lose_nothing()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        bump(m: *Mutex[int])
+            for i in 0..<20000
+                m.with((n) -> *n += 1)
+
+        var m = Mutex.new(0)
+        var a = spawn(&bump, &m).unwrap()
+        var b = spawn(&bump, &m).unwrap()
+
+        a.join()
+        b.join()
+        print(m.with((n) -> *n))
+        """), "40000\n")
 
 // Twenty thousand increments each and the total is exact -- a read-modify-write split across the
 // lock is what a broken lock loses, and at this length it loses them in practice.
@@ -347,9 +402,9 @@ thx_two_threads_lose_nothing()
             var i = 0
 
             while i < j.rounds
-                var p = j.m.lock()
+                var p = j.m.lock_raw()
 
-                defer j.m.unlock()
+                defer j.m.unlock_raw()
                 *p = *p + 1
                 i = i + 1
 
@@ -359,7 +414,7 @@ thx_two_threads_lose_nothing()
 
         a.join()
         b.join()
-        print(*j.m.lock())
+        print(*j.m.lock_raw())
         """), "40000\n")
 
 @test("and the release a 'defer' writes happens at the end of its block")
@@ -371,13 +426,13 @@ thx_defer_releases_at_the_end_of_its_block()
         var i = 0
 
         while i < 3
-            var p = m.lock()
+            var p = m.lock_raw()
 
-            defer m.unlock()
+            defer m.unlock_raw()
             *p = *p + 1
             i = i + 1
 
-        print(*m.lock())
+        print(*m.lock_raw())
         """), "3\n")
 
 @test("holds an aggregate, which is what a lock is for and an atomic is not")
@@ -390,13 +445,13 @@ thx_holds_an_aggregate()
             last: int
 
         var m = Mutex.new(Ledger(0, 0))
-        var p = m.lock()
+        var p = m.lock_raw()
 
         p.hits = p.hits + 1
         p.last = 9
-        m.unlock()
+        m.unlock_raw()
 
-        var q = m.lock()
+        var q = m.lock_raw()
 
         print(q.hits, q.last)
         """), "1 9\n")
@@ -408,11 +463,11 @@ thx_works_through_a_sync_reference()
 
     assert_eq(thx_ran(raw"""
         var m: &sync Mutex[int] = Mutex.new(4)
-        var p = m.lock()
+        var p = m.lock_raw()
 
         *p = *p * 10
-        m.unlock()
-        print(*m.lock())
+        m.unlock_raw()
+        print(*m.lock_raw())
         """), "40\n")
 
 @test("more threads than the machine has processors still finish, since a waiter yields")
@@ -428,9 +483,9 @@ thx_more_threads_than_processors_finish()
             var i = 0
 
             while i < j.rounds
-                var p = j.m.lock()
+                var p = j.m.lock_raw()
 
-                defer j.m.unlock()
+                defer j.m.unlock_raw()
                 *p = *p + 1
                 i = i + 1
 
@@ -443,7 +498,7 @@ thx_more_threads_than_processors_finish()
         for t in ts
             t.join()
 
-        print(*j.m.lock())
+        print(*j.m.lock_raw())
         """), "40000\n")
 
 // An ordering is a keyword in the emitted instruction, and this machine would compute the right
@@ -453,7 +508,7 @@ thx_more_threads_than_processors_finish()
 thx_takes_with_acquire_releases_with_release()
     if thx_no_library() then return
 
-    val out = thx_ir("var m = Mutex.new(0)\nm.lock()\nm.unlock()")
+    val out = thx_ir("var m = Mutex.new(0)\nm.lock_raw()\nm.unlock_raw()")
 
     assert(thx_line_with(out, "atomicrmw xchg ptr %t", ", i32 1 acquire"), out)
     assert(thx_line_with(out, "store atomic i32 0, ptr %t", " release"), out)
@@ -528,7 +583,7 @@ thx_no_posix_may_not_reach_threads()
 
                                  guarded() -> Mutex[int] = Mutex.new(0)
                                  """),
-                             ("main.sysl", "import quiet.guarded\n\nprint(guarded().try_lock().is_some())\n")])
+                             ("main.sysl", "import quiet.guarded\n\nprint(guarded().try_lock_raw().is_some())\n")])
 
     assert(out.contains("this reaches 'sysl.posix.threads', which requires 'posix'"), out)
     assert(out.contains("'quiet' declared 'no posix'"), out)
@@ -622,7 +677,7 @@ thx_a_plain_reference_is_refused_at_the_call()
 thx_building_one_by_its_fields_is_refused()
     if thx_no_library() then return
 
-    val out = thx_err("var m = Mutex(1i32, 5)\nprint(m.try_lock().is_some())")
+    val out = thx_err("var m = Mutex(1i32, 5)\nprint(m.try_lock_raw().is_some())")
 
     assert(out.contains("the constructor names every field of 'sysl.posix.threads.Mutex' in order"), out)
     assert(out.contains("'held' is private"), out)
@@ -648,7 +703,7 @@ thx_sharing_a_lock_over_a_plain_reference()
 
         var m: &sync Mutex[&Cell] = Mutex.new(Cell(1))
 
-        print(*m.lock())
+        print(*m.lock_raw())
         """)
 
     assert(out.contains("may be reached from two domains at once"), out)

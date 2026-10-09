@@ -1,0 +1,147 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A view's read-only-ness follows the place rule (`place.sysl`'s `root_local`): `val` is a promise
+// about the NAME's own storage, so a view is read-only only where its elements ARE that storage -- a
+// `val` array, or an array inside a `val` struct value. A `val` holding a `*T`, a `&[N]T` or a `[]T`
+// holds an address, and the elements it leads to are as writable as their owner says.
+
+private vvw_skipped() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end vvw_skipped
+
+private vvw_write(text: string) -> string
+    val root = make_temp_dir("sysl-val-view").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end vvw_write
+
+private vvw_prints(text: string, printed: string)
+    val root = vvw_write(text)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert_eq(s"did not build: ${failure_text(why)}", printed)
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, printed)
+            assert_eq(shell_status(out.status), 0)
+end vvw_prints
+
+// Everything a program has to say for itself, with the temporary root taken off each path.
+private vvw_err(text: string) -> string
+    val root = vvw_write(text)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, replace_all(root, "//", "/") + "/", "")
+end vvw_err
+
+private vvw_refused(text: string, words: string, at: string)
+    val said = vvw_err(text)
+
+    assert(said.contains(words), said)
+    assert(said.contains(s" --> main.sysl:$at\n"), said)
+
+private const vvw_const_element: string =
+    "this element belongs to a '[]const int', which views elements it may not write, so there is " +
+    "nothing to assign through"
+
+private const vvw_const_view: string =
+    "a '[]const int' views elements it may not write, and a '[]int' is a licence to write them"
+
+@test("re-slicing a 'val' slice gives a view as writable as the one it was cut from")
+vvw_a_val_slice_reslices_writable()
+    if vvw_skipped() then return
+
+    vvw_prints(raw"""
+        fill(s: []int) = s[0] = 9
+        var store: [3]int = [1, 2, 3]
+        val whole: []int = store[..]
+        val part = whole[1..]
+        part[0] = 7
+        fill(whole[2..])
+        print(store[1], store[2])
+        """, "7 9\n")
+
+@test("a slice field read out of a 'val' struct value, or through a 'val' '*T' or '&T', is writable")
+vvw_a_val_structs_slice_field_is_writable()
+    if vvw_skipped() then return
+
+    vvw_prints(raw"""
+        struct H
+            xs: []int
+        fill(s: []int) = s[0] = 5
+        var store: [3]int = [1, 2, 3]
+        var other: [2]int = [1, 2]
+        val h = H(store[..])
+        fill(h.xs[2..])
+        val v = h.xs
+        v[1..][0] = 6
+        var h2 = H(store[..])
+        val hp = &h2
+        fill(hp.xs[..])
+        val r: &H = H(other[..])
+        fill(r.xs[1..])
+        print(store[0], store[1], store[2], other[1])
+        """, "5 6 5 5\n")
+
+@test("a heap array held by a 'val' gives a writable view, the name holding the box and not the elements")
+vvw_a_val_heap_array_views_writable()
+    if vvw_skipped() then return
+
+    vvw_prints(raw"""
+        fill(s: []int) = s[0] = 8
+        val heap: &[2]int = [5, 6]
+        fill(heap)
+        fill(heap[1..])
+        print(heap[0], heap[1])
+        """, "8 8\n")
+
+@test("a 'val' array standing where a writable view is asked for is still its own bytes, so it is refused")
+vvw_a_val_arrays_view_stays_const()
+    if vvw_skipped() then return
+
+    vvw_refused("fill(s: []int) = s[0] = 9\nval a: [4]int = [1, 2, 3, 4]\nfill(a)\n", vvw_const_view,
+                "3:6")
+
+@test("an array inside a 'val' struct value is the binding's storage, so its view stays read-only")
+vvw_a_val_structs_array_field_stays_const()
+    if vvw_skipped() then return
+
+    vvw_refused("struct A\n    xs: [2]int\nval h = A([1, 2])\nvar s = h.xs[..]\ns[0] = 9\n",
+                vvw_const_element, "5:1")
+
+@test("a '[]const T' re-bound by a 'val' and re-sliced stays read-only")
+vvw_a_const_source_stays_const()
+    if vvw_skipped() then return
+
+    vvw_refused("f(xs: []const int)\n    val p = xs\n    var s = p[..]\n    s[0] = 9\n",
+                vvw_const_element, "4:5")

@@ -1,0 +1,351 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{split, Search}
+
+// **Plain data read out of bytes and written back** -- `sysl.encoding.Plain`, whose membership and
+// whose two members the compiler provides (`plain.sysl`): `T.decode(bytes)` checks every `bool` and
+// enum the bytes hold, `value.encode(out)` writes zeros where the layout has padding. A struct that
+// holds an address of any kind is refused by name. `library/encoding.md § Plain data` is the spec.
+
+private pln_ready() -> bool = std_root().is_ok() && clang_available()
+
+private pln_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-pln").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end pln_run
+
+private pln_prints(text: string, printed: string)
+    if !pln_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = pln_run(text, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end pln_prints
+
+private pln_refused(text: string, message: string, line: int, col: int)
+    if !pln_ready() then return
+
+    val (_, _, err) = pln_run(text, "0")
+    val head = s"error: $message\n"
+    val at = s"/main.sysl:$line:$col\n"
+
+    assert(err.contains(head), s"expected\n$head\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end pln_refused
+
+// keel's finding, the other way round: the bytes a corrupt disk holds, viewed as a record.
+private val pln_node: string = raw"""
+    import sysl.encoding.Plain
+
+    enum Kind: u16
+        File = 1
+        Dir = 2
+
+    struct Node
+        kind: Kind
+        open: bool
+        size: u32
+
+    """
+
+@test("decode checks a bool and an enum byte, and the length, and needs no alignment of the slice")
+pln_decode_checks_the_bytes_that_can_be_wrong()
+    pln_prints(pln_node + raw"""
+        var disk: [17]u8 = [0xff; 17]
+
+        print(Node.decode(disk[..]).is_some())
+
+        disk[1] = 2
+        disk[2] = 0
+        disk[3] = 1
+
+        val n = Node.decode(disk[1..]).unwrap()
+
+        print(Kind::Image(n.kind), n.open, n.size, sizeof(Node))
+
+        disk[3] = 2
+        print(Node.decode(disk[1..]).is_none())
+
+        disk[3] = 0
+        disk[1] = 3
+        print(Node.decode(disk[1..]).is_none(), Node.decode(disk[1..<8]).is_none())
+
+        disk[1] = 1
+        print(Node.decode(disk[1..<9]).is_some(), Node.decode(disk[1..]).unwrap().open)
+        """, "false\nDir true 4294967295 8\ntrue\ntrue true\ntrue false\n")
+end pln_decode_checks_the_bytes_that_can_be_wrong
+
+@test("encode writes the value's bytes, zeros in the padding, and answers false where it is short")
+pln_encode_zeroes_padding()
+    pln_prints(pln_node + raw"""
+        struct Rows
+            rows: [3]Node
+
+        var out: [8]u8 = [0xaa; 8]
+        val n = Node(Kind.Dir, true, 0x01020304)
+
+        print(n.encode(out[..]), out[0], out[1], out[2], out[3], out[4], out[7])
+
+        var short: [7]u8 = [0xaa; 7]
+
+        print(n.encode(short[..]), short[0])
+
+        var table: [24]u8 = [0xaa; 24]
+        val rows = Rows([n, Node(Kind.File, false, 9), n])
+
+        print(rows.encode(table[..]), table[3], table[11], table[19], table[10], table[12])
+        print(Rows.decode(table[..]).unwrap().rows[1].size)
+        """, "true 2 0 1 0 4 1\nfalse 170\ntrue 0 0 0 0 9\n9\n")
+end pln_encode_zeroes_padding
+
+@test("an array of checked values is checked element by element, the last one included")
+pln_arrays_are_checked_in_a_loop()
+    pln_prints(raw"""
+        import sysl.encoding.Plain
+
+        struct Flags
+            on: [100]bool
+
+        var b: [100]u8 = [1; 100]
+
+        print(Flags.decode(b[..]).is_some())
+
+        b[99] = 2
+        print(Flags.decode(b[..]).is_none())
+
+        b[99] = 0
+        b[0] = 0x80
+        print(Flags.decode(b[..]).is_none())
+        """, "true\ntrue\ntrue\n")
+end pln_arrays_are_checked_in_a_loop
+
+@test("an enum field of a big-endian struct is checked in the struct's order")
+pln_ordered_enum_is_checked_in_order()
+    pln_prints(raw"""
+        import sysl.encoding.Plain
+
+        enum Proto: u16
+            Ip = 0x0800
+            Arp = 0x0806
+
+        @packed
+        @byte_order(big)
+        struct Eth
+            dst: [6]u8
+            src: [6]u8
+            ty: Proto
+
+        var f: [14]u8 = [0; 14]
+
+        f[12] = 0x08
+        f[13] = 0x06
+        print(Proto::Image(Eth.decode(f[..]).unwrap().ty))
+
+        f[12] = 0x06
+        f[13] = 0x08
+        print(Eth.decode(f[..]).is_none())
+
+        var back: [14]u8 = [0xff; 14]
+        val e = Eth([1, 2, 3, 4, 5, 6], [0; 6], Proto.Ip)
+
+        print(e.encode(back[..]), back[0], back[12], back[13])
+        """, "Arp\ntrue\ntrue 1 8 0\n")
+end pln_ordered_enum_is_checked_in_order
+
+@test("a scalar, an array and a generic body bounded by Plain all decode and encode")
+pln_generic_and_scalar()
+    pln_prints(raw"""
+        import sysl.encoding.Plain
+
+        first[T: Plain](b: []const u8) -> Option[T] = T.decode(b)
+
+        write[T: Plain](v: T, out: []u8) -> bool = v.encode(out)
+
+        struct P
+            a: u16
+            ok: bool
+
+        val xs: [4]u8 = [1, 0, 1, 9]
+        var o: [4]u8 = [0; 4]
+
+        print(first[P](xs[..]).is_some(), first[u16](xs[..]).unwrap())
+        print(write(u16(0x0201), o[..]), o[0], o[1], write([true, false, true], o[1..]), o[3])
+        print(f32.decode(o[..]).is_some(), u8.decode(o[0..<0]).is_none())
+        """, "true 1\ntrue 1 2 true 1\ntrue true\n")
+end pln_generic_and_scalar
+
+@test("a type's own decode is what the name reaches, and without the import there is no decode")
+pln_own_member_and_import()
+    pln_prints(raw"""
+        import sysl.encoding.Plain
+
+        struct C
+            c: u16
+
+            decode(b: []const u8) -> Option[C] = Some(C(7))
+
+        val b: [8]u8 = [0; 8]
+
+        print(C.decode(b[..]).unwrap().c)
+        """, "7\n")
+
+    pln_refused("struct C\n    c: u16\n\nval b: [8]u8 = [0; 8]\nprint(C.decode(b[..]).is_some())\n",
+                "type 'C' has no associated function 'decode'", 5, 9)
+end pln_own_member_and_import
+
+@test("a type holding an address, a char, a checked subtype or a partial byte is not plain data")
+pln_not_plain_is_refused_by_name()
+    val imp = "import sysl.encoding.Plain\n\n"
+    val bytes = "val b: [8]u8 = [0; 8]\n"
+
+    pln_refused(imp + "struct Node\n    next: &Node\n\n" + bytes + "print(Node.decode(b[..]).is_some())\n",
+                "'Node' is not plain data, so 'Plain.decode' cannot make one out of bytes: its field " +
+                "'next' is &Node — a counted reference holds an address, and an address read off a disk " +
+                "or a wire points nowhere this program allocated. Hold an offset or an index instead",
+                7, 12)
+    pln_refused(imp + "struct S\n    name: string\n\nvar s = S(\"x\")\nvar o: [32]u8 = [0; 32]\n" +
+                "print(s.encode(o[..]))\n",
+                "'S' is not plain data, so 'Plain.encode' cannot write it as bytes: its field 'name' is " +
+                "string — a string holds an address, and an address read off a disk or a wire points " +
+                "nowhere this program allocated. Hold an offset or an index instead", 8, 9)
+    pln_refused(imp + "struct C\n    c: char\n\n" + bytes + "print(C.decode(b[..]).is_some())\n",
+                "'C' is not plain data, so 'Plain.decode' cannot make one out of bytes: its field 'c' is " +
+                "char — a 'char' is a Unicode scalar value, and most of the numbers its four bytes can " +
+                "hold are not one. Hold it as a 'u32' and convert with 'char(...)', which checks it",
+                7, 9)
+    pln_refused(imp + "type Small = u8 within 1..10\n\nstruct C\n    c: Small\n\n" + bytes +
+                "print(C.decode(b[..]).is_some())\n",
+                "'C' is not plain data, so 'Plain.decode' cannot make one out of bytes: its field 'c' is " +
+                "Small — 'Small' checks the values it admits, and the check runs where a value is made " +
+                "rather than over bytes. Read the type it narrows and convert, which runs the check",
+                9, 9)
+    pln_refused(imp + "enum E\n    A(x: int)\n    B\n\n" + bytes + "print(E.decode(b[..]).is_some())\n",
+                "'E' is not plain data, so 'Plain.decode' cannot make one out of bytes: 'E' carries " +
+                "data, so which variant it is decides what its other bytes mean. Hold the tag as an " +
+                "integer field and read the payload by it", 8, 9)
+    pln_refused(imp + "struct C\n    c: u12\n\n" + bytes + "print(C.decode(b[..]).is_some())\n",
+                "'C' is not plain data, so 'Plain.decode' cannot make one out of bytes: its field 'c' is " +
+                "u12 — 'u12' is not a whole number of bytes, so some of the bits it is stored in are " +
+                "not its own", 7, 9)
+end pln_not_plain_is_refused_by_name
+
+@test("decode takes one '[]const u8' and encode one '[]u8'")
+pln_argument_refusals()
+    val imp = "import sysl.encoding.Plain\n\nstruct C\n    c: u16\n\n"
+
+    pln_refused(imp + "val b: [8]u16 = [0; 8]\nprint(C.decode(b[..]).is_some())\n",
+                "'Plain.decode' reads a '[]const byte', but the argument is []const ushort", 7, 9)
+    pln_refused(imp + "val b: [8]u8 = [0; 8]\nprint(C.decode(b[..], 2).is_some())\n",
+                "associated function 'Plain.decode' takes 1 argument, the bytes, but 2 arguments were " +
+                "given", 7, 9)
+    pln_refused(imp + "var c = C(1)\nprint(c.encode())\n",
+                "method 'Plain.encode' takes 1 argument, where the bytes go, but 0 arguments were given",
+                7, 9)
+end pln_argument_refusals
+
+// -- on a bare machine -----------------------------------------------------------------------------------
+
+// `llvm-nm`, where one is on this machine.
+private pln_nm() -> Option[string]
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-nm", "/usr/local/opt/llvm/bin/llvm-nm"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end pln_nm
+
+@test("on aarch64-freestanding a header decodes, encodes and is laid down as data, needing no libc")
+pln_freestanding_archive()
+    if !pln_ready() then return
+
+    val root = make_temp_dir("sysl-pln").unwrap()
+
+    write_text(s"$root/package.hocon", "package { name = \"probe\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/main.sysl", raw"""
+        import sysl.encoding.Plain
+        import sysl.math.ByteOrder
+
+        enum Proto: u16
+            Ip = 0x0800
+            Arp = 0x0806
+
+        @packed
+        @byte_order(big)
+        struct Eth
+            dst: [6]u8
+            src: [6]u8
+            ty: Proto
+
+        val broadcast: Eth = Eth([0xff; 6], [0; 6], Proto.Arp)
+
+        @export("probe_kind")
+        probe_kind(frame: *u8, n: usize, out: *u8) -> u32
+            Eth.decode(frame[0..<n]) match
+                Some(e) -> if !broadcast.encode(out[0..<14]) then 2 else if e.ty == Proto.Arp then 1 else 0
+                None -> u32(0x0800u16.to_be())
+        """).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val archive = s"$root/probe.a"
+    val code = run_cli(["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root],
+                       piece -> sink.push(piece))
+
+    assert_eq(code, 0, join_said(said))
+
+    pln_nm() match
+        None -> print("skipped: llvm-nm is not on this machine")
+        Some(nm) ->
+            val listed = capture(nm, ["--undefined-only", archive], "", [], true).unwrap()
+
+            assert(listed.status.ok(), listed.text)
+
+            // What the archive asks a linker for: the memory primitives LLVM may call for a copy,
+            // and nothing a C library supplies beyond them.
+            val lines = split(listed.text, "\n")
+
+            for i in 0..<lines.len
+                val words = split(lines[i].trim(), " ")
+                val name = words[words.len - 1]
+
+                if words.len >= 2 && words[0] == "U"
+                    assert(name == "memcpy" || name == "memset" || name == "memmove" ||
+                           name.starts_with("sysl") || name.starts_with("__sysl"), lines[i])
+
+    remove_dir_all(root).unwrap_or(())
+end pln_freestanding_archive
+
+private join_said(said: Buf[string]) -> string
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    text
+end join_said

@@ -376,6 +376,11 @@ end severed
 // `&o` is left alone -- a `*Outer` names the struct, so a write through it is found by the ordinary
 // walk and checked. What is refused is the pointer that drops the name on the way out.
 check_addressable(cx: &Analyzer, span: Span, place: TExpr)
+    if ordered_field(place).is_some()
+        refuse_ordered_field(cx, span, place, "'&'")
+        return
+    end if
+
     check_packed_field(cx, span, place)
 
     val cut = severed(cx, place)
@@ -392,6 +397,26 @@ check_addressable(cx: &Analyzer, span: Span, place: TExpr)
              s"clause with nothing left to re-check it against. Take the address of the $owner " +
              "itself, which keeps the invariant in its type, or make the change through a method")
 end check_addressable
+
+// `&` or `ref` of a whole-byte integer field of a `@byte_order` struct, refused.
+//
+// The field's storage holds the bytes in the order the struct states, and a `*u16` is read in the
+// machine's: the pointer would hand every later read the bytes backwards, far from the `&` that made
+// it. Read and write the field through the struct, which is where the order is known. Asked on every
+// machine, including one whose order happens to agree, so that a program does not compile here and
+// stop compiling on the next.
+refuse_ordered_field(cx: &Analyzer, span: Span, place: TExpr, form: string)
+    val s = ordered_field(place).unwrap()
+    val shown = type_show(place_type(place))
+    val owner = type_show(Struct(s))
+    val first = if s.big_endian.unwrap_or(false) then "most" else "least"
+
+    cx.fault(span, s"$form here would reach a '$shown' inside $owner, which is " +
+             s"'@byte_order(${order_word(s)})' — the field holds its bytes $first significant " +
+             s"first whatever the machine does, and a '*$shown' is read in the machine's order. Read " +
+             s"or write the field through the struct, which is where the order is applied, or take " +
+             s"the address of the $owner itself")
+end refuse_ordered_field
 
 // `&` of a field inside a `@packed` struct, refused.
 //

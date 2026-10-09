@@ -803,13 +803,37 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
     // is refused before anything is built.
     val features = CodegenFeatures(
         general_regs_only_flag() || codegen_given(manifest, t.name, "general_regs_only"),
-        strict_align_flag() || codegen_given(manifest, t.name, "strict_align"))
+        strict_align_flag() || codegen_given(manifest, t.name, "strict_align"),
+        codegen_extensions(manifest, t.name))
 
     codegen_feature_refusal(t, features) match
         Some(why) -> return Err(Refusal(why))
         None -> ()
 
+    // An extension the back end does not know is only a warning from clang, after which the build
+    // goes on without it, so each name is asked of the clang that will build the program first.
+    if !features.extensions.is_empty()
+        val clang = find_clang(t, named_cc()) match
+            Err(why) -> return Err(Refusal(s"cannot check 'codegen.extensions': $why"))
+            Ok(found) -> found
+
+        extension_refusal(t, clang, features.extensions) match
+            Some(why) -> return Err(Refusal(why))
+            None -> ()
+    end if
+
     use_codegen_features(features)
+
+    // **And which registers the program owns** (`codegen.thread_pointer`, `codegen.per_cpu_offset`),
+    // refused where the machine is not a bare AArch64 one.
+    val registers = MachineRegisters(codegen_register_given(manifest, t.name, "thread_pointer"),
+                                     codegen_register_given(manifest, t.name, "per_cpu_offset"))
+
+    machine_register_refusal(t, registers) match
+        Some(why) -> return Err(Refusal(why))
+        None -> ()
+
+    use_machine_registers(registers)
 
     // The machine as the project describes it, which is what the analysis holds a module to.
     Ok(as_declared(manifest, t))
@@ -1449,7 +1473,7 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
 
     check_library_hooks(done.an, kept)
     check_c_formatting(done.an, kept)
-    check_main_extern(done.an, kept, "")
+    check_main_extern(done.an, kept, image_entry_named(path, t))
 
     val lowered = codegen_with_gaps(kept, t, promotions)
 

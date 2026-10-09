@@ -110,7 +110,11 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
     Call(callee, args) ->
         val converted = const_conversion(cx, e.span, callee, args)
 
-        if converted.is_some() then converted else const_call(cx, e)
+        if converted.is_some() then return converted
+
+        val reordered = const_byte_order(cx, e)
+
+        if reordered.is_some() then reordered else const_call(cx, e)
 
     // `sizeof(T)` and `alignof(T)` are compile-time constants, so they fold exactly as a literal
     // does -- which is what makes them usable in an array bound and in a `const`.
@@ -667,7 +671,7 @@ end binding_is_abstract
 // width or more, a float conversion out of the integer's range, a character outside Unicode -- the
 // answer is `None`, the initializer stays code, and nothing is said. A `f32` is rounded at every step,
 // as the machine rounds it.
-const_fold_typed(t: TExpr) -> Option[Const]
+const_fold_typed(t: TExpr, little: bool) -> Option[Const]
     val ty = folded_scalar(texpr_type(t))
 
     if ty.is_none() then return None
@@ -677,21 +681,60 @@ const_fold_typed(t: TExpr) -> Option[Const]
         TBoolLit(b) -> Some(ConstBool(b))
         TStrLit(s) -> Some(ConstStr(s))
         TFloatLit(bits, _) -> Some(ConstFloat(real_of_bits(bits)))
-        TUnary(op, operand, _) -> typed_unary(op, operand, ty.unwrap())
-        TBinary(op, l, r, _) -> typed_binary(op, l, r)
-        TLogical(op, l, r) -> typed_binary(op, l, r)
+        TUnary(op, operand, _) -> typed_unary(op, operand, ty.unwrap(), little)
+        TBinary(op, l, r, _) -> typed_binary(op, l, r, little)
+        TLogical(op, l, r) -> typed_binary(op, l, r, little)
         TCompare(operands, cmps) ->
             if operands.len() == 2 && cmps.len() == 1 && cmps.at(0).dispatch.is_none() then
-                typed_binary(cmps.at(0).op, operands.at(0), operands.at(1))
+                typed_binary(cmps.at(0).op, operands.at(0), operands.at(1), little)
             else
                 None
-        TCast(inner, _) -> typed_conversion(inner, ty.unwrap())
+        TCast(inner, _) -> typed_conversion(inner, ty.unwrap(), little)
+        TIntOp(op, operand, None, width, _) -> typed_byte_order(op, operand, width, little)
         _ -> None
 
     if v.is_none() then return None
 
     held_at(v.unwrap(), ty.unwrap())
 end const_fold_typed
+
+// `x.swap_bytes()` and the four directions of `sysl.math.ByteOrder`, over a value that folds: the
+// same reversal the machine makes, so storage initialized with `ADDR.to_be()` is laid down as data
+// rather than computed before the program runs -- which a target with no loader could not do at all.
+// `little` is the target's byte order, which decides whether a direction reverses anything.
+private typed_byte_order(op: string, operand: TExpr, width: Type, little: bool) -> Option[Const]
+    val swaps = op match
+        "swap_bytes" -> true
+        "to_be" -> little
+        "from_be" -> little
+        "to_le" -> !little
+        "from_le" -> !little
+        _ -> return None
+
+    val v = const_fold_typed(operand, little)
+
+    v match
+        Some(ConstInt(n)) -> width match
+            Integer(bits, signed, _) -> if swaps then Some(ConstInt(swapped_bytes(n, bits, signed))) else v
+            _ -> None
+        _ -> None
+end typed_byte_order
+
+// The bytes of `n`, held at a width of `bits`, in the opposite order -- read back at the width's
+// signedness, so a negative `i16` reversed is the value the machine's register would hold.
+swapped_bytes(n: BigInt, bits: int, signed: bool) -> BigInt
+    var raw = wrap(n, bits, false)
+    var out = from_int(0)
+    val unit = from_int(256)
+
+    for i in 0..<(bits / 8)
+        val q = div_rem(raw, unit)
+
+        out = add(mul(out, unit), q.1)
+        raw = q.0
+
+    wrap(out, bits, signed)
+end swapped_bytes
 
 // The scalar a typed node is, where it is one this fold answers for: an integer, a `f32` or `f64`,
 // a `bool`, a `char` or a `string`, or a name for one that checks nothing. A subtype with a range or
@@ -725,8 +768,8 @@ private scalar_value(n: BigInt) -> bool =
     cmp(n, from_int(0)) >= 0 && cmp(n, from_int(0x10FFFF)) <= 0 &&
     !(cmp(n, from_int(0xD800)) >= 0 && cmp(n, from_int(0xDFFF)) <= 0)
 
-private typed_unary(op: string, operand: TExpr, ty: Type) -> Option[Const]
-    val v = const_fold_typed(operand)
+private typed_unary(op: string, operand: TExpr, ty: Type, little: bool) -> Option[Const]
+    val v = const_fold_typed(operand, little)
 
     if v.is_none() then return None
 
@@ -744,9 +787,9 @@ private typed_unary(op: string, operand: TExpr, ty: Type) -> Option[Const]
         _ -> None
 end typed_unary
 
-private typed_binary(op: string, l: TExpr, r: TExpr) -> Option[Const]
-    val a = const_fold_typed(l)
-    val b = const_fold_typed(r)
+private typed_binary(op: string, l: TExpr, r: TExpr, little: bool) -> Option[Const]
+    val a = const_fold_typed(l, little)
+    val b = const_fold_typed(r, little)
 
     if a.is_none() || b.is_none() then return None
 
@@ -812,9 +855,9 @@ end typed_int_binary
 // A written conversion between scalars, where run time converts to the same value. An integer
 // narrowed wraps, as `converted` says; a float becomes an integer only where the integer holds it,
 // so the answer never depends on what an out-of-range conversion does.
-private typed_conversion(inner: TExpr, to: Type) -> Option[Const]
+private typed_conversion(inner: TExpr, to: Type, little: bool) -> Option[Const]
     val from = folded_scalar(texpr_type(inner))
-    val v = const_fold_typed(inner)
+    val v = const_fold_typed(inner, little)
 
     if from.is_none() || v.is_none() then return None
 
