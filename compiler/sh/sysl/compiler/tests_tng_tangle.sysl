@@ -22,6 +22,9 @@ private tng_said(args: []string) -> (Buf[string], int)
 
     (lines, code)
 
+// The same, with the two channels apart: the program is standard output, everything else standard error.
+private tng_ran(args: []string) -> (int, string, string) = clx_ran(args)
+
 private tng_split(text: string) -> Buf[string]
     var out: Buf[string] = buf()
     var from: usize = 0
@@ -88,10 +91,11 @@ tng_writes_to_a_file()
         None -> return
 
     val out = s"${absolute_path(make_temp_dir("sysl-tangle-").unwrap())}/vm.sysl"
-    val (lines, code) = tng_said(["sysl", "tangle", path, "-o", out])
+    val (code, lines, err) = tng_ran(["sysl", "tangle", path, "-o", out])
 
     assert_eq(code, Fine)
-    assert_eq(lines.at(0), s"wrote $out")
+    assert_eq(lines, "")
+    assert_eq(err, s"wrote $out")
     assert(read_text(out).unwrap().contains("Thread"))
 
 @test("an ordinary program has nothing to tangle")
@@ -100,10 +104,11 @@ tng_ordinary_program()
 
     write_text(s"$dir/main.sysl", "main() = print(1)\n").unwrap()
 
-    val (lines, code) = tng_said(["sysl", "tangle", dir])
+    val (code, out, err) = tng_ran(["sysl", "tangle", dir])
 
     assert_eq(code, Failed)
-    assert_eq(lines.at(0), s"sysl: error: $dir holds no '.lsysl' files — 'tangle' reads the prose a literate source is written around, and an ordinary sysl program has none")
+    assert_eq(out, "")
+    assert_eq(err, s"sysl: error: $dir holds no '.lsysl' files — 'tangle' reads the prose a literate source is written around, and an ordinary sysl program has none")
 
 @test("a file the compiler refuses is not tangled")
 tng_refused_file()
@@ -118,10 +123,11 @@ tng_command_refuses_with_the_diagnostic()
 
     write_text(path, "Text\n\n\tprint(\"hi\")\n").unwrap()
 
-    val (lines, code) = tng_said(["sysl", "tangle", path])
+    val (code, out, err) = tng_ran(["sysl", "tangle", path])
 
     assert_eq(code, Failed)
-    assert_eq(lines.at(0), "sysl: error: error: a tab in the indentation of a literate file — what makes a line program text is four columns of indent, and a tab is as wide as whatever happens to be displaying it, so this line is code in one editor and prose in another\n" +
+    assert_eq(out, "")
+    assert_eq(err, "sysl: error: error: a tab in the indentation of a literate file — what makes a line program text is four columns of indent, and a tab is as wide as whatever happens to be displaying it, so this line is code in one editor and prose in another\n" +
         s" --> $path:3:1\n  |\n3 | \tprint(\"hi\")\n  | ^")
 
 // From the reference's IoRefusalTests: an output path under an existing FILE is refused, naming the
@@ -135,13 +141,23 @@ tng_output_under_a_file_is_refused()
     make_dir_all(s"$dir/lit").unwrap()
     write_text(s"$dir/lit/main.lsysl", "# Title\n\n```sysl\nprint(1)\n```\n").unwrap()
 
-    val (lines, code) = tng_said(["sysl", "tangle", s"$dir/lit", "-o", s"$dir/p4/main.sysl/x"])
+    val (code, out, err) = tng_ran(["sysl", "tangle", s"$dir/lit", "-o", s"$dir/p4/main.sysl/x"])
 
     assert_eq(code, Failed)
-    assert_eq(lines.at(0), s"sysl: error: cannot write $dir/p4/main.sysl/x: cannot make the directory '$dir/p4/main.sysl': a file is already there, and a directory is needed")
+    assert_eq(out, "")
+    assert_eq(err, s"sysl: error: cannot write $dir/p4/main.sysl/x: cannot make the directory '$dir/p4/main.sysl': a file is already there, and a directory is needed")
 
     // A directory woven names a directory of documents, so the refusal is about making that.
-    val (woven, status) = tng_said(["sysl", "weave", s"$dir/lit", "-o", s"$dir/p4/main.sysl/docs"])
+    val (status, woven_out, woven) = tng_ran(["sysl", "weave", s"$dir/lit", "-o", s"$dir/p4/main.sysl/docs"])
 
     assert_eq(status, Failed)
-    assert_eq(woven.at(0), s"sysl: error: cannot make the directory '$dir/p4/main.sysl': a file is already there, and a directory is needed")
+    assert_eq(woven_out, "")
+    assert_eq(woven, s"sysl: error: cannot make the directory '$dir/p4/main.sysl': a file is already there, and a directory is needed")
+
+@test("a misused tangle puts its usage on standard error and nothing on standard output")
+tng_usage_is_on_stderr()
+    val (code, out, err) = tng_ran(["sysl", "tangle"])
+
+    assert_eq(code, Misused)
+    assert_eq(out, "")
+    assert_eq(err, tangle_usage())
