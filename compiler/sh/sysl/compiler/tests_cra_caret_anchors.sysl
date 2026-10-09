@@ -2,12 +2,50 @@ module sh.sysl.compiler
 @tests
 
 import sh.sysl.parsing.*
-import sysl.text.{Search}
+import sysl.buf.{Buf, buf}
+import sysl.text.{split, Search}
 
 // **Where a refusal before analysis points, as 0.0.162 points it.** Each case is a refusal both
-// compilers make in the same words whose `-->` line or caret disagreed (the caret sweep,
-// `tests_crt_caret_sweep.sysl`); the expected place and caret are quoted from the reference's own
-// report on the same input.
+// compilers made in the same words whose `-->` line or caret once disagreed; the expected place and
+// caret are quoted from the reference's own report on the same input.
+
+// The first report of a rendered refusal: from its first `error:` line to the blank line that ends it
+// (or the next `error:`), each line without trailing spaces. Nothing where the text holds no error.
+first_report(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for line in split(text, "\n")
+        val held = line.trim_end()
+
+        if out.is_empty()
+            if held.starts_with("error: ") then out.push(held)
+        else if held == "" || held.starts_with("error: ")
+            return out
+        else
+            out.push(held)
+
+    out
+end first_report
+
+// The line and column a `-->` line names, without the file: ` --> /tmp/x/block.sysl:3:7` is `3:7`.
+// A line that is not one is answered as it stands.
+report_place(line: string) -> string
+    if !line.trim().starts_with("-->") then return line
+
+    val bytes = line.bytes
+    var colons = 0
+    var i = bytes.len
+
+    while i > 0
+        i -= 1
+
+        if bytes[i] == u8(':')
+            colons += 1
+
+            if colons == 2 then return line[i + 1..]
+
+    line
+end report_place
 
 // The `line:col` of the first report this compiler renders for a source that does not parse, and its
 // caret, as `1:9 ^`.

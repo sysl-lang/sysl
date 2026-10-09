@@ -18,8 +18,7 @@ import sysl.process.capture
 // would inherit the difference through. The manifest states no `sysl` floor, so the working
 // directory is what both stages are asked about rather than a copy edited on the way past.
 //
-// `SYSL_STAGE2` names the binary; with the variable unset the test returns at once and says so,
-// exactly as `SYSL_ORACLE` makes the differential proof skip on a machine that has no reference.
+// `SYSL_STAGE2` names the binary; with the variable unset the test returns at once and says so.
 // `SYSL_LIB` is needed too, as it is for every whole-program sweep.
 
 // Where the stage-2 binary is, or nothing where this machine has not built one.
@@ -157,3 +156,41 @@ private one_suite_report(file: string) -> Result[string, string]
 
     Ok(out)
 end one_suite_report
+
+// The library's trees, parsed once for the whole run; empty where the standard module's source is
+// not on this machine.
+private var library_cache: Buf[Program] = buf()
+private var library_read: bool = false
+
+library_units() -> Buf[Program]
+    if library_read then return library_cache
+
+    library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> library_cache = units
+
+    library_cache
+end library_units
+
+text_for(items: Buf[(string, string)], name: string) -> Option[string]
+    for i in 0..<items.len()
+        if items.at(i).0 == name then return Some(items.at(i).1)
+
+    None
+
+// The first line of two bodies that disagrees, which is what a report of a mismatch is worth.
+first_body_difference(theirs: string, ours: string) -> string
+    val a = lines_of(theirs)
+    val b = lines_of(ours)
+    val n = if a.len() < b.len() then a.len() else b.len()
+
+    for i in 0..<n
+        if a.at(i) != b.at(i)
+            return s" at line ${i + 1}: theirs '${a.at(i)}', ours '${b.at(i)}'"
+
+    s" after ${n} lines: ${a.len()} lines theirs, ${b.len()} ours"
+end first_body_difference

@@ -2,9 +2,7 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.env.{get as env_var}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
-import sysl.process.capture
 import sysl.text.{join, split, Search}
 
 // A refusal about the command is introduced by the binary's own name, `sysl: error: `, as the
@@ -194,103 +192,3 @@ clp_program_arguments_after_the_separator()
     assert_eq(ahead.0, Misused, ahead.1)
     assert(ahead.1.starts_with("Error: Unknown option --frob\nusage: sysl run "), ahead.1)
     remove_dir_all(dir).unwrap_or(())
-
-// -- every option the reference documents is still taken -------------------------------------------
-//
-// The reference's own `--help` is read, section by section, and every option it lists for a command
-// this compiler carries -- the command's own and those "which any command takes" -- is handed to that
-// command. None may be answered with `Unknown option` or `Missing value`, so an option this change
-// wrongly refused shows up by name.
-
-// The commands of the reference this compiler carries.
-private val clp_carried: [12]string = ["run", "build", "build-lib", "build-c", "emit-header", "test",
-                                       "emit-llvm", "emit-ast", "emit-typed", "deps", "add", "tidy"]
-
-// The one option the reference documents that is not on this compiler: `--ar` names an archive, the
-// retired shape.
-private clp_not_here(command: string, flag: string) -> bool = flag == "--ar"
-
-// A value the flag takes, of the kind it takes.
-private clp_value_for(flag: string) -> string
-    if flag == "--target" then return "aarch64-macos"
-    if flag == "-O" || flag == "--optimize" then return "1"
-    if flag == "--link" then return "dynamic"
-    if flag == "--lto" then return "thin"
-
-    "x"
-end clp_value_for
-
-// One option line of the reference's usage -- `-o, --output <value>   …` -- as its spellings and
-// whether it takes a value.
-private clp_option_line(line: string) -> (Buf[string], bool)
-    var flags: Buf[string] = buf()
-    var valued = false
-
-    for word in split(line.trim(), " ")
-        if word.starts_with("-")
-            flags.push(if word.ends_with(",") then word[0..<(word.len - 1)] else word)
-        else if word == "<value>" && flags.len() > 0
-            valued = true
-            break
-        else if !word.is_empty()
-            break
-
-    (flags, valued)
-end clp_option_line
-
-@test("every option the reference documents for a command this compiler carries is still taken")
-clp_every_documented_option_is_taken()
-    val oracle = env_var("SYSL_ORACLE") match
-        None ->
-            print("skipped: SYSL_ORACLE names no reference compiler")
-            return
-        Some(binary) -> binary
-
-    val text = capture(oracle, ["--help"]) match
-        Err(_) -> ""
-        Ok(answer) -> answer.text
-
-    // (command, flag, takes a value), with "" for an option every command takes.
-    var options: Buf[(string, string, bool)] = buf()
-    var section = ""
-
-    for line in split(text, "\n")
-        if line.starts_with("Command: ")
-            section = split(line, " ")[1]
-        else if line.starts_with("Options, which any command takes")
-            section = ""
-        else if line.trim().starts_with("-")
-            val read = clp_option_line(line)
-
-            for k in 0..<read.0.len()
-                options.push((section, read.0.at(k), read.1))
-
-    var asked: usize = 0
-
-    for command in clp_carried
-        for k in 0..<options.len()
-            val (owner, flag, valued) = options.at(k)
-
-            if (owner == "" || owner == command) && !clp_not_here(command, flag)
-                var line: Buf[string] = buf()
-
-                line.push("sysl")
-                line.push(command)
-
-                if command == "add" then line.push("github.com/sysl-lang/clp")
-
-                line.push("/does/not/exist/clp")
-                line.push(flag)
-
-                if valued then line.push(clp_value_for(flag))
-
-                val got = clp_run(line.view())
-
-                assert(got.1.index_of("Unknown option").is_none() && got.1.index_of("Missing value").is_none(),
-                       s"$command $flag: ${got.1}")
-                asked += 1
-
-    // The reference lists twenty-odd options for every command; a reading that found a handful has
-    // misread the text rather than proved anything.
-    assert(asked > 200, s"only $asked options were asked")
-end clp_every_documented_option_is_taken

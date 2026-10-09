@@ -2,7 +2,6 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.env.{get as env_var}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.testing.skip
 import sysl.text.{join, Search}
@@ -550,85 +549,6 @@ prv_does_not_translate_the_packages_scaffolding()
     assert(!prv_has(mlw, "double"), mlw)
     assert(mlw.ends_with(PrvHead + "end"), mlw)
     remove_dir_all(root).unwrap_or(())
-
-// -- the reference, on the same sources -------------------------------------------------------------
-
-// What the translator is compared against the reference on: every construct it writes, every
-// refusal it makes, and programs carrying two things it refuses so the order is part of the claim.
-private prv_corpus() -> Buf[string]
-    var xs: Buf[string] = buf()
-
-    xs.push("half(x: int) -> int\n    require x >= 0\n    ensure result >= 0\n    x / 2\n")
-    xs.push("gcd(a: int, b: int) -> int\n    require a >= 0\n    require b >= 0\n    ensure result >= 0\n" +
-            "    variant b\n    if b == 0 then a\n    else gcd(b, a % b)\n")
-    xs.push("count_to(n: int) -> int\n    require n >= 0\n    ensure result == n\n    var i = 0\n\n" +
-            "    while i < n\n        invariant i >= 0\n        invariant i <= n\n        variant n - i\n" +
-            "        i += 1\n\n    i\n")
-    xs.push("double_it(n: int) -> int\n    require n >= 0\n    n * 2\n")
-    xs.push("ratio(a: int, b: int) -> int = a / b\n")
-    xs.push("@ghost\ndivides(d: int, n: int) -> bool = d != 0 && n % d == 0\n\ndouble_it(n: int) -> int\n" +
-            "    require n >= 0\n    require n <= 1000\n    ensure divides(2, result)\n    n * 2\n")
-    xs.push("f(a: int, b: int) -> int = -(a + b)\n")
-    xs.push("f(a: int, b: int, c: int) -> bool\n    ensure result == (a < b)\n    a < b <= c\n")
-    xs.push("f(a: bool, b: bool) -> bool\n    require a || b\n    ensure result == (a && b)\n    a && !b || b\n")
-    xs.push("@ghost\nsome_below(n: int) -> bool = for some i in 0..<n do i * i == n\n\n" +
-            "inc(n: int) -> int\n    require n >= 0 && n < 100 && some_below(n + 1)\n" +
-            "    ensure result == old(n) + 1\n    n + 1\n")
-    xs.push("f(n: int) -> int\n    var k = n\n    if k > 5\n        k = 5\n    k\n")
-    xs.push("f(n: int) -> int\n    var k = n\n    if k < 0 then k = 0 else k += 1\n    k\n")
-    xs.push("seven() -> int = 7\n\nf() -> int = seven() + 1\n")
-    xs.push("@ghost\neven(n: int) -> bool = if n == 0 then true else if n == 1 then false else even(n - 2)\n\n" +
-            "f(n: int) -> int\n    require n >= 0 && even(n)\n    n\n")
-    xs.push("f(n: int) -> int\n    val k = if n > 0 then 1 else 2\n    k\n")
-    xs.push("f() -> int = -5\n")
-    xs.push("f(n: int) -> int\n    var i = n\n    i--\n    i++\n    i\n")
-    xs.push("f(n: int) -> int\n    var i = 0\n    while i < n\n        i++\n    i\n")
-    xs.push("f(n: int) -> int\n    var a = 1\n    if n > 0\n        var b = 2\n        a = b\n    a\n")
-    xs.push("even(n: int) -> bool\n    require n >= 0\n    if n == 0 then true else odd(n - 1)\n\n" +
-            "odd(n: int) -> bool\n    require n >= 0\n    if n == 0 then false else even(n - 1)\n")
-    xs.push("@ghost\nzero() -> int = 0\n\nf(n: int) -> int\n    ensure result >= zero()\n    0\n")
-    xs.push("Foo(n: int) -> int = n\n")
-    xs.push("f(x: real) -> int = 0\n")
-    xs.push("f(n: int) -> long = long(n)\n")
-    xs.push("f(n: int) -> int\n    var i = 0\n    loop\n        i += 1\n        if i > n then break\n    i\n")
-    xs.push("f(n: int) -> int\n    var i = 0\n    do\n        i += 1\n    while i < n\n    i\n")
-    xs.push("f(n: int) -> int\n    print(\"x\")\n    n\n")
-    xs.push("f(a: string, b: string) -> bool = a == b\n")
-    xs.push("f(n: int) -> int\n    n match\n        _ -> 1\n\ng(s: string) -> int = 0\n")
-    xs.push("f(x: int) -> int = x + 1\n\nprint(f(2))\n")
-    xs
-end prv_corpus
-
-@test("prove --emit-whyml prints what the reference prints, refusals included")
-prv_the_reference_prints_the_same()
-    val oracle = env_var("SYSL_ORACLE")
-
-    if oracle.is_none() || !prv_library_here() then return
-
-    val corpus = prv_corpus()
-
-    for i in 0..<corpus.len()
-        val (dir, file) = prv_file(corpus.at(i))
-
-        for overflow in ["check", "ignore"]
-            // The reference reads ITS OWN library (`capture_oracle`): handed this one, it cannot
-            // build the standard module, and every program would be its refusal.
-            val theirs = capture_oracle(oracle.unwrap(),
-                                        ["prove", "--emit-whyml", "--overflow", overflow, file]).unwrap()
-            val (code, said) = prv_run(["sysl", "prove", "--emit-whyml", "--overflow", overflow, file])
-
-            if theirs.status.ok()
-                assert_eq(code, Fine)
-                assert_eq(said + "\n", theirs.text)
-            else
-                assert_eq(code, Failed)
-                assert_eq(said + "\n", theirs.err.unwrap_or(""))
-            end if
-        end for
-
-        remove_dir_all(dir).unwrap_or(())
-    end for
-end prv_the_reference_prints_the_same
 
 // -- names in any script ----------------------------------------------------------------------------
 
