@@ -68,6 +68,21 @@ alloc_count_text(word: string) -> string
     declare void @free(ptr)
     declare i32 @dprintf(i32, ptr, ...)
     declare i32 @atexit(ptr)
+    declare i32 @posix_memalign(ptr, $word, $word)
+
+    define ptr @${counted_aligned_symbol()}($word %n, $word %a) {
+    entry:
+      %slot = alloca ptr
+      %r = call i32 @posix_memalign(ptr %slot, $word %a, $word %n)
+      %got = icmp eq i32 %r, 0
+      br i1 %got, label %count, label %none
+    count:
+      %was = atomicrmw add ptr @sysl.count.live, i64 1 monotonic
+      %p = load ptr, ptr %slot
+      ret ptr %p
+    none:
+      ret ptr null
+    }
 
     define ptr @sysl_count_alloc($word %n) {
     entry:
@@ -131,7 +146,8 @@ defines_alloc_count(e: *Emit) -> bool = e.requested_set.has("sysl.count")
 
 // The symbols the counting runtime states.
 alloc_count_symbols() -> []const string =
-    [counted_allocator().0, counted_allocator().1, "malloc", "free", "dprintf", "atexit"]
+    [counted_allocator().0, counted_allocator().1, counted_aligned_symbol(), "malloc", "free", "dprintf",
+     "atexit", "posix_memalign"]
 
 // What a counted program said about its heap: the net count it reported, or zero where it said
 // nothing. Read off its standard error.

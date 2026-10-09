@@ -39,7 +39,7 @@ end gen_box
 // with `own_temp`.
 open_box(e: *Emit, inner: Type) -> (Val, Val)
     val bn = box_lty(e, inner)
-    val p = allocate_box(e, bn)
+    val p = allocate_box(e, bn, inner)
 
     emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
     store_header_word(e, bn, p, 1, LPtr, drop_fn(e, inner))
@@ -53,14 +53,14 @@ open_box(e: *Emit, inner: Type) -> (Val, Val)
     var idx: Buf[IrArg] = buf()
 
     idx.push(ir_arg(l_i32(), VInt(from_int(0))))
-    idx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields())))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, inner))))))
     emit(e, InGep(slot, bn, p, idx))
     (p, slot)
 end open_box
 
 // The bytes one box occupies, asked of LLVM rather than computed here: a `getelementptr` one past
 // null, read back as an integer, is the size of what was stepped over.
-private allocate_box(e: *Emit, bn: LType) -> Val
+private allocate_box(e: *Emit, bn: LType, inner: Type) -> Val
     val end = fresh_reg(e)
 
     var idx: Buf[IrArg] = buf()
@@ -72,14 +72,34 @@ private allocate_box(e: *Emit, bn: LType) -> Val
 
     emit(e, InCast(size, CastPtrToInt, LPtr, end, word_lty(e)))
 
+    heap_call(e, size, inner, "a box")
+end allocate_box
+
+// The call that takes `size` bytes from the heap for storage of `t`: the allocating pair's, or the
+// aligned hook's where `t` asks for a boundary beyond what the pair promises (`beyond_heap`). The
+// aligned block goes back through the pair's own free, so nothing that lets go of storage has to
+// know which of the two made it.
+//
+// `what` is how the refusal names the storage, where there is no aligned hook to call
+// (`unaligned_heap`).
+private heap_call(e: *Emit, size: Val, t: Type, what: string) -> Val
     val p = fresh_reg(e)
 
     var args: Buf[IrArg] = buf()
 
     args.push(ir_arg(word_lty(e), size))
-    emit(e, ir_call(Some(p), LPtr, VGlobal(malloc_symbol()), args))
+
+    if e.layout.beyond_heap(t)
+        args.push(ir_arg(word_lty(e), VInt(from_int(long(e.layout.align(t))))))
+        emit(e, ir_call(Some(p), LPtr, VGlobal(aligned_alloc_symbol()), args))
+
+        if e.aligned_heap.is_empty() then
+            e.aligned_heap.push((s"$what of '${type_show(t)}'", e.self_name, e.layout.align(t)))
+    else
+        emit(e, ir_call(Some(p), LPtr, VGlobal(malloc_symbol()), args))
+
     p
-end allocate_box
+end heap_call
 
 private store_header_word(e: *Emit, bn: LType, p: Val, field: int, ty: LType, v: Val)
     val r = fresh_reg(e)
@@ -126,7 +146,7 @@ gen_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val)
     var hidx: Buf[IrArg] = buf()
 
     hidx.push(ir_arg(l_i32(), VInt(from_int(0))))
-    hidx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields() + 1)))))
+    hidx.push(ir_arg(l_i32(), VInt(from_int(long(buf_elems_field(e, elem))))))
     emit(e, InGep(h1, bn, VNull, hidx))
 
     val hsz = fresh_reg(e)
@@ -144,13 +164,7 @@ gen_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val)
     emit(e, InBin(fits, OpXor, l_i1(), over, VBool(true)))
     trap_unless(e, fits, "size")
 
-    val p = fresh_reg(e)
-
-    var args: Buf[IrArg] = buf()
-
-    args.push(ir_arg(word_lty(e), total.0))
-    emit(e, ir_call(Some(p), LPtr, VGlobal(malloc_symbol()), args))
-
+    val p = heap_call(e, total.0, elem, "a buffer")
     val got = fresh_reg(e)
 
     emit(e, InIntCmp(got, INe, LPtr, p, VNull))
@@ -165,7 +179,7 @@ gen_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val)
     var didx: Buf[IrArg] = buf()
 
     didx.push(ir_arg(l_i32(), VInt(from_int(0))))
-    didx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields() + 1)))))
+    didx.push(ir_arg(l_i32(), VInt(from_int(long(buf_elems_field(e, elem))))))
     emit(e, InGep(data, bn, p, didx))
     (p, data)
 end gen_buffer
@@ -360,3 +374,60 @@ end gen_promoted_decl
 private array_length(ty: Type) -> int = underlying(ty) match
     Array(n, _) -> n
     _ -> 0
+
+// -- the aligned hook ----------------------------------------------------------------------------------
+
+// **Storage of a type aligned beyond what the allocating pair promises comes from a third function**,
+// `sysl_alloc_aligned(size, align)`, answering a block on that boundary which the pair's own free gives
+// back -- so a box frees itself the one way whatever made it. Where the pair is libc's and the C
+// library has `posix_memalign`, a `weak` default is written over that, and a program's own `@export`
+// (or an `extern` naming it) wins. Anywhere else -- a pair a manifest named, a machine with no C
+// library -- nothing could write a default that the pair's free gives back, so a program that makes
+// such storage without answering the hook is refused (`emit_checks.sysl`'s `check_aligned_heap`).
+// A program that never boxes such a type never names the hook at all.
+aligned_alloc_symbol() -> string =
+    if alloc_counting_active() then counted_aligned_symbol() else "sysl_alloc_aligned"
+
+// The aligned hook of a counted build, which the counting runtime defines (`alloc_count.sysl`).
+counted_aligned_symbol() -> string = "sysl_count_alloc_aligned"
+
+// The storage the last module lowered made through the aligned hook with nothing to answer it --
+// what it was, the function that made it, and the boundary -- or nothing. Settled by each lowering,
+// and read by the driver straight after (`check_aligned_heap`).
+private var unaligned: Option[(string, string, usize)] = None
+
+unaligned_heap() -> Option[(string, string, usize)] = unaligned
+
+// The default, where one can be written; otherwise what the refusal is about. Asked once every body
+// is lowered, since that is when the module knows whether anything needed the hook.
+request_aligned_heap(e: *Emit, p: TProgram)
+    unaligned = None
+
+    if e.aligned_heap.is_empty() || alloc_counting_active() then return
+
+    val sym = aligned_alloc_symbol()
+
+    if claimed_symbol(e, p, sym) then return
+
+    if malloc_symbol() == "malloc" && free_symbol() == "free" && e.target.has_posix_memalign()
+        val w = s"i${e.word_bits}"
+
+        request_helper(e, sym, HrText(
+            s"define weak ${e.target.preemption()}ptr @$sym($w %size, $w %align) {\n" +
+            "entry:\n" +
+            "  %slot = alloca ptr\n" +
+            s"  %r = call i32 @posix_memalign(ptr %slot, $w %align, $w %size)\n" +
+            "  %ok = icmp eq i32 %r, 0\n" +
+            "  br i1 %ok, label %got, label %none\n" +
+            "got:\n" +
+            "  %p = load ptr, ptr %slot\n" +
+            "  ret ptr %p\n" +
+            "none:\n" +
+            "  ret ptr null\n" +
+            "}\n\n" +
+            s"declare i32 @posix_memalign(ptr, $w, $w)\n"))
+        return
+    end if
+
+    unaligned = Some(e.aligned_heap.at(0))
+end request_aligned_heap

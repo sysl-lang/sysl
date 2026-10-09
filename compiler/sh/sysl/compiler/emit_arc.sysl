@@ -17,6 +17,33 @@ import sysl.math.bigint.from_int
 // its elements one further on.
 header_fields() -> int = 3
 
+// The bytes laid between a box's header and its payload, so the payload begins on its type's
+// boundary: none where LLVM's own reading of the type already puts it there. A raised `@align(n)` is
+// a boundary LLVM's type does not carry, and one beyond what the allocating pair promises is one the
+// block is aligned to only through the aligned hook -- either way the payload's offset from the
+// block's start has to be a multiple of it, said here as a run of bytes.
+box_pad(e: *Emit, payload: Type) -> usize = header_pad(e, payload, usize(header_fields()))
+
+// The same for a buffer, whose header is one word longer -- the element count.
+buf_pad(e: *Emit, elem: Type) -> usize = header_pad(e, elem, usize(header_fields() + 1))
+
+private header_pad(e: *Emit, t: Type, words: usize) -> usize
+    if !e.layout.holds_raised(t) && !e.layout.beyond_heap(t) then return 0
+
+    val header = words * e.layout.pointer_bytes()
+
+    round_up(header, e.layout.align(t)) - header
+end header_pad
+
+// The field of a box's LLVM type its payload is: after the header, and after the padding where
+// there is any.
+box_payload_field(e: *Emit, payload: Type) -> int =
+    if box_pad(e, payload) > 0 then header_fields() + 1 else header_fields()
+
+// The field of a buffer's LLVM type its elements begin at.
+buf_elems_field(e: *Emit, elem: Type) -> int =
+    if buf_pad(e, elem) > 0 then header_fields() + 2 else header_fields() + 1
+
 // -- taking and giving back a share ----------------------------------------------------------------
 
 // Takes a share of everything a value refers to. A bare reference is one refcount; an aggregate
@@ -509,7 +536,7 @@ private gen_drop_hook(e: *Emit, payload: Type)
     var idx: Buf[IrArg] = buf()
 
     idx.push(ir_arg(l_i32(), VInt(from_int(0))))
-    idx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields())))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, payload))))))
     emit(e, InGep(pa, bn, VReg("p"), idx))
 
     val v = fresh_reg(e)
@@ -563,7 +590,7 @@ private gen_drop_buf_hook(e: *Emit, elem: Type)
     var didx: Buf[IrArg] = buf()
 
     didx.push(ir_arg(l_i32(), VInt(from_int(0))))
-    didx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields() + 1)))))
+    didx.push(ir_arg(l_i32(), VInt(from_int(long(buf_elems_field(e, elem))))))
     emit(e, InGep(data, bn, VReg("p"), didx))
     each_element_release(e, elem, data, n)
     emit_term(e, InRet(None, None))
@@ -665,7 +692,7 @@ box_payload_addr(e: *Emit, p: Val, ty: Type) -> Val = underlying(ty) match
         var idx: Buf[IrArg] = buf()
 
         idx.push(ir_arg(l_i32(), VInt(from_int(0))))
-        idx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields())))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, *inner))))))
         emit(e, InGep(r, box_lty(e, *inner), p, idx))
         r
     _ -> p

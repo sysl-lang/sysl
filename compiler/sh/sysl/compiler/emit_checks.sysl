@@ -386,6 +386,44 @@ check_filesystem_hooks(a: &Analysis, p: TProgram)
             "in 'sysl.fs.sys' declares and answering zero or the code of an 'IoError'")
 end check_filesystem_hooks
 
+// **Storage on the heap of a type aligned beyond what the allocating pair promises, with nothing to
+// answer the aligned hook.**
+//
+// The lowering asks `sysl_alloc_aligned(size, align)` for such a block (`emit_box.sysl`'s
+// `heap_call`) and writes a default over `posix_memalign` only where the pair is libc's and the C
+// library has one, since the block goes back through the pair's free. Anywhere else the program
+// answers the hook itself, and one it left unanswered would otherwise surface at the link as an
+// undefined symbol named nowhere in its source -- so it is refused here, naming the type, its
+// boundary and the hook. Asked straight after the lowering that recorded it (`unaligned_heap`).
+check_aligned_heap(a: &Analysis, p: TProgram)
+    val found = unaligned_heap() match
+        Some(x) -> x
+        None -> return
+
+    val t = a.tables.target
+    val pair = s"'${malloc_symbol()}' and '${free_symbol()}'"
+
+    val no_libc = s"'${t.name}' has no C library whose 'posix_memalign' could answer it"
+    val mixed = s"a block 'posix_memalign' made would be handed back to '${free_symbol()}', which did not " +
+        "make it"
+    val why = if t.has_posix_memalign() then mixed else no_libc
+
+    val msg = s"${found.0} asks for the ${found.2}-byte boundary its type is aligned on, and the " +
+        s"allocating pair ($pair) promises only ${t.heap_align()} — $why. Define " +
+        s"'${aligned_alloc_symbol()}(size: usize, align: usize) -> *u8' with '@export', answering a " +
+        s"block on that boundary which '${free_symbol()}' gives back"
+
+    for f in p.funcs
+        if f.name == found.1
+            a.fault(func_home(a, f.name), f.span, msg)
+            return
+        end if
+
+    if p.funcs.is_empty() then return
+
+    a.fault_unplaced(func_home(a, p.funcs.at(0).name), p.funcs.at(0).span, msg)
+end check_aligned_heap
+
 // **A specifier the program reaches that only C's `snprintf` can apply, on a target with no C library
 // to supply one.**
 //

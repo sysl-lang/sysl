@@ -1,0 +1,313 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **The aligned hook: a box or a buffer of a type aligned beyond what the allocating pair promises.**
+//
+// The pair promises two words -- sixteen bytes on a 64-bit machine (`target.sysl`'s
+// `heap_boundary`) -- so storage of a type asking for more is taken from
+// `sysl_alloc_aligned(size, align)` and handed back through the pair's own free, its payload laid
+// after the header on the boundary (`emit_box.sysl`'s `heap_call`, `emit_arc.sysl`'s `box_pad`). On a
+// POSIX host with libc's pair a `weak` default over `posix_memalign` answers it; anywhere else the
+// program does, and one that makes such storage without answering it is refused when it is compiled
+// (`emit_checks.sysl`'s `check_aligned_heap`). Found by the keel kernel (FINDINGS 20): a box of an
+// `@align(4096)` struct landed at an address 88 past a page.
+
+private aah_page() -> string = "@align(4096)\nstruct Page\n    e: [512]u64\n\n"
+
+private aah_line() -> string = "@align(16)\nstruct Line\n    a: u64\n\n"
+
+// -- a hosted program, libc's pair -------------------------------------------------------------------
+
+@test("a hosted box of an @align(4096) struct is on its boundary and every access claims it")
+aah_a_hosted_box_lands_on_the_boundary()
+    if !enm_ready() then return
+
+    val src = aah_page() + "main()\n    var t: Page\n    t.e[3] = 9\n    val b: &Page = t\n" +
+        "    var u: Page = *b\n    print(usize(&*b) % 4096, u.e[3], b.e[3])\n"
+    val ir = enm_ir(src)
+
+    // The header's three words and the run of bytes that puts the payload on the page.
+    assert(enm_says(ir, "%arc.Page = type { i64, ptr, i64, [4072 x i8], %struct.Page }"), ir)
+    assert(enm_says(ir, "@sysl_alloc_aligned(i64 %"), ir)
+    assert(enm_says(ir, ", i64 4096)"), ir)
+    assert(enm_says(ir, "define weak ptr @sysl_alloc_aligned("), ir)
+    assert(enm_says(ir, "call i32 @posix_memalign("), ir)
+    assert(enm_says(ir, "ptr align 4096"), ir)
+    assert_eq(enm_ran(src), "0 9 9\n")
+
+@test("a hosted buffer of an @align(4096) struct puts every element on its boundary")
+aah_a_hosted_buffer_lands_on_the_boundary()
+    if !enm_ready() then return
+
+    val src = aah_page() + "main()\n    var t: Page\n    t.e[1] = 4\n    val xs: []Page = [t, t, t]\n" +
+        "    val a: *Page = &xs[0]\n    val c: *Page = &xs[2]\n" +
+        "    print(usize(a) % 4096, usize(c) % 4096, xs[2].e[1], xs.len)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%arc.buf.Page = type { i64, ptr, i64, i64, [4064 x i8], [0 x %struct.Page] }"), ir)
+    assert_eq(enm_ran(src), "0 0 4 3\n")
+
+@test("a box of a type at the pair's boundary takes the pair, its payload still on its boundary")
+aah_a_type_at_the_threshold_takes_the_pair()
+    if !enm_ready() then return
+
+    val src = aah_line() + "main()\n    var l: Line\n    l.a = 7\n    val b: &Line = l\n" +
+        "    print(usize(&*b) % 16, b.a)\n"
+    val ir = enm_ir(src)
+
+    // Raised, so laid on its sixteen past the header's 24 -- but sixteen is what malloc promises.
+    assert(enm_says(ir, "%arc.Line = type { i64, ptr, i64, [8 x i8], %struct.Line }"), ir)
+    assert(enm_says(ir, "call ptr @malloc("), ir)
+    assert(!enm_says(ir, "sysl_alloc_aligned"), ir)
+    assert(!enm_says(ir, "posix_memalign"), ir)
+    assert_eq(enm_ran(src), "0 7\n")
+
+@test("a program boxing nothing over-aligned names neither the hook nor its default")
+aah_an_ordinary_box_is_unchanged()
+    if !enm_ready() then return
+
+    val src = "struct P\n    x: u64\n    y: u64\n\nmain()\n    val b: &P = P(1, 2)\n    print(b.x + b.y)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%arc.P = type { i64, ptr, i64, %struct.P }"), ir)
+    assert(!enm_says(ir, "sysl_alloc_aligned"), ir)
+    assert_eq(enm_ran(src), "3\n")
+
+// -- a pair the manifest named -----------------------------------------------------------------------
+
+// A hosted project whose heap is its own pair, over libc's.
+private aah_own_pair() -> string =
+    "package { name = \"own\", version = \"0.0.1\" }\nallocator {\n  alloc = \"own_alloc\"\n" +
+    "  free  = \"own_free\"\n}\n"
+
+private aah_pair_runtime() -> string =
+    "extern \"malloc\" c_malloc(n: usize) -> *u8\nextern \"free\" c_free(p: *u8)\n" +
+    "extern \"posix_memalign\" c_memalign(out: **u8, align: usize, n: usize) -> int\n\n" +
+    "@export(\"own_alloc\")\nown_alloc(n: usize) -> *u8 = c_malloc(n)\n\n" +
+    "@export(\"own_free\")\nown_free(p: *u8) = c_free(p)\n\n"
+
+private aah_project(program: string) -> string =
+    lbr_tree(lbr_two("main.sysl", program, "package.hocon", aah_own_pair()))
+
+// What a project's program prints, or what refused it.
+private aah_ran(p: string) -> string
+    val out = lbr_temp("sysl-aah-exe")
+    val said = lbr_cli(["sysl", "build", "-o", s"$out/program", p])
+
+    if said.0 != 0
+        lbr_drop([out])
+        return s"refused: ${said.1}"
+    end if
+
+    val printed = capture(s"$out/program", [], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> "the program that was built could not be run"
+
+    lbr_drop([out])
+    printed
+end aah_ran
+
+@test("a manifest-named pair still boxes an ordinary type through itself")
+aah_a_named_pair_still_works()
+    if !lbr_ready() then return
+
+    val p = aah_project(aah_pair_runtime() +
+        "struct P\n    x: u64\n\nmain()\n    val b: &P = P(41)\n    print(b.x + 1)\n")
+    val ir = lbr_text(p, [])
+
+    assert(ir.contains("call ptr @own_alloc("), ir)
+    assert(!ir.contains("sysl_alloc_aligned"), ir)
+    assert_eq(aah_ran(p), "42\n")
+    lbr_drop([p])
+
+@test("a manifest-named pair with an over-aligned box and no aligned hook is refused")
+aah_a_named_pair_needs_the_hook()
+    if !lbr_ready() then return
+
+    val p = aah_project(aah_pair_runtime() + aah_page() +
+        "main()\n    var t: Page\n    val b: &Page = t\n    print(b.e[0])\n")
+    val said = aah_ran(p)
+
+    assert(said.starts_with("refused: "), said)
+    assert(said.contains("asks for the 4096-byte boundary its type is aligned on, and the allocating " +
+        "pair ('own_alloc' and 'own_free') promises only 16 — a block 'posix_memalign' made would be " +
+        "handed back to 'own_free', which did not make it. Define 'sysl_alloc_aligned(size: usize, " +
+        "align: usize) -> *u8' with '@export', answering a block on that boundary which 'own_free' " +
+        "gives back"), said)
+    assert(said.contains("'Page'"), said)
+    lbr_drop([p])
+
+@test("a manifest-named pair answering the aligned hook boxes on the boundary through it")
+aah_a_named_pair_answering_the_hook()
+    if !lbr_ready() then return
+
+    val hook = "@export(\"sysl_alloc_aligned\")\nown_aligned(n: usize, a: usize) -> *u8\n" +
+        "    var p: *u8 = null\n    if c_memalign(&p, a, n) != 0 then return null\n    p\n\n"
+    val p = aah_project(aah_pair_runtime() + hook + aah_page() +
+        "main()\n    var t: Page\n    t.e[2] = 5\n    val b: &Page = t\n" +
+        "    print(usize(&*b) % 4096, b.e[2])\n")
+    val ir = lbr_text(p, [])
+
+    assert(ir.contains("define ptr @sysl_alloc_aligned("), ir)
+    assert(!ir.contains("define weak ptr @sysl_alloc_aligned("), ir)
+    assert_eq(aah_ran(p), "0 5\n")
+    lbr_drop([p])
+
+// -- a freestanding image ----------------------------------------------------------------------------
+
+private val aah_target: string = "aarch64-freestanding"
+private val aah_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private val aah_script: string =
+    "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+private val aah_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n" +
+    s"targets {\n  $aah_target {\n    linker_script = \"link.ld\"\n    entry = \"kstart\"\n  }\n}\n"
+
+// The image's start, its heap and the memory functions LLVM calls with no C library under it.
+private val aah_runtime: string = raw"""
+    @export("kstart")
+    kstart() -> never
+        val n = run()
+
+        loop
+            ()
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = null
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+
+    @export("memset")
+    mem_set(dst: *u8, c: int, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = u8(c)
+
+        dst
+
+    @export("memcpy")
+    mem_copy(dst: *u8, src: *u8, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = src[i]
+
+        dst
+
+    @export("memmove")
+    mem_move(dst: *u8, src: *u8, n: usize) -> *u8 = mem_copy(dst, src, n)
+
+    @export("memcmp")
+    mem_compare(a: *u8, b: *u8, n: usize) -> int = 0
+    """
+
+// What the image runs: a box of a page-sized struct, aligned to the page or not.
+private aah_run(aligned: bool) -> string = (if aligned then "@align(4096)\n" else "") + raw"""
+    struct Page
+        e: [512]u64
+
+    run() -> int
+        var t: Page
+        t.e[1] = 3
+        val b: &Page = t
+
+        int(b.e[1])
+    end run
+    """
+
+private val aah_hook: string = raw"""
+    @export("sysl_alloc_aligned")
+    img_alloc_aligned(n: usize, a: usize) -> *u8 = null
+    """
+
+private aah_image(program: string) -> string
+    var files = lbr_two("main.sysl", program, "package.hocon", aah_manifest)
+
+    files.push(("link.ld", aah_script))
+    lbr_tree(files)
+end aah_image
+
+private aah_build(p: string) -> ((int, string), string)
+    val out = lbr_temp("sysl-aah-elf")
+
+    (lbr_cli(["sysl", "build", "--target", aah_target, "-o", s"$out/img.elf", p]), out)
+end aah_build
+
+private aah_link_ready() -> bool
+    if !lbr_ready() then return false
+
+    val lld = capture("ld.lld", ["--version"], "", [], true) match
+        Ok(o) -> o.status.ok()
+        Err(_) -> false
+
+    if !lld then skip("ld.lld is not installed, so no image can be linked")
+    if !is_file(aah_nm) then skip(s"there is no llvm-nm at $aah_nm to read the image")
+
+    true
+end aah_link_ready
+
+@test("a freestanding program boxing an over-aligned type with no aligned hook is refused")
+aah_freestanding_without_the_hook_is_refused()
+    if !lbr_ready() then return
+
+    val p = aah_image(aah_runtime + aah_run(true))
+    val (said, out) = aah_build(p)
+
+    assert(said.0 != 0, "built with the aligned hook unanswered")
+    assert(said.1.contains("a box of 'Page' asks for the 4096-byte boundary its type is aligned on, " +
+        "and the allocating pair ('img_alloc' and 'img_free') promises only 16 — " +
+        s"'$aah_target' has no C library whose 'posix_memalign' could answer it. Define " +
+        "'sysl_alloc_aligned(size: usize, align: usize) -> *u8' with '@export'"), said.1)
+
+    // It is told before the link, so no linker names a symbol.
+    assert(!said.1.contains("undefined symbol"), said.1)
+    lbr_drop([p, out])
+
+@test("a freestanding program answering the aligned hook links, and its box calls the hook")
+aah_freestanding_with_the_hook_links()
+    if !aah_link_ready() then return
+
+    val p = aah_image(aah_runtime + aah_run(true) + aah_hook)
+    val (said, out) = aah_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val listing = capture(aah_nm, [s"$out/img.elf"], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+
+    assert(listing.contains(" T sysl_alloc_aligned"), listing)
+    assert(!listing.contains("posix_memalign"), listing)
+
+    val ir = lbr_cli(["sysl", "emit-llvm", "--target", aah_target, p])
+
+    assert(ir.1.contains("@sysl_alloc_aligned(i64 %"), ir.1)
+    assert(ir.1.contains(", i64 4096)"), ir.1)
+    lbr_drop([p, out])
+
+@test("a freestanding program supplying only the pair, boxing nothing over-aligned, is unchanged")
+aah_freestanding_without_over_aligned_storage_is_unchanged()
+    if !aah_link_ready() then return
+
+    val p = aah_image(aah_runtime + aah_run(false))
+    val (said, out) = aah_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val listing = capture(aah_nm, [s"$out/img.elf"], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+
+    assert(!listing.contains("sysl_alloc_aligned"), listing)
+    lbr_drop([p, out])
