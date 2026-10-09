@@ -18,40 +18,11 @@ import sysl.text.from_utf8_lossy
  * anyway.
  *
  * **The module requires `os`.** Nothing here is language, and nothing here can be given a body on a
- * target with no filesystem under it: a freestanding image has no `fopen` to call and no `errno` to
- * read. `reference/modules.md § Capabilities are a module property` reserves `os` for exactly this
- * and the clause is what says so in the one place a reader of the file will see it.
+ * target with no filesystem under it. `reference/modules.md § Capabilities are a module property`
+ * reserves `os` for exactly this and the clause is what says so in the one place a reader of the file
+ * will see it. What answers for the filesystem is `sysl.fs.sys`: the C library on a hosted target, and
+ * on one with system calls and no C library, the program.
  */
-
-// `errno` is a **function** on both platforms this builds for, not a variable -- C spells it as a
-// macro expanding to a dereference so that a threaded program gets its own -- so the binding is to
-// whatever that macro expands to rather than to a symbol called `errno`, which does not exist.
-//
-// The `#else` is glibc's spelling rather than a refusal, and deliberately: an `extern` costs nothing
-// until something links it, so a target that has neither still *compiles* this module and fails at
-// the link with the name it could not find. The alternative -- no declaration at all -- would fail
-// in the compiler, on a file the program never called into.
-//
-// **The gate is `bsd` rather than `macos`, and it always meant that** -- `__error` is what every BSD
-// libc calls this, and Darwin being the only one here made the narrower symbol look right for as
-// long as there were two hosted systems (`Os.bsd`).
-//
-// **Android's Bionic is a Linux libc that does not spell it glibc's way**: its accessor is `__errno`,
-// and it has no `__errno_location` at all, so the `#else` would leave an Android program failing at
-// the link on a name its libc never had.
-#if bsd
-private[sysl] extern "__error" errno_location() -> *i32
-#elif android
-private[sysl] extern "__errno" errno_location() -> *i32
-#else
-private[sysl] extern "__errno_location" errno_location() -> *i32
-#endif
-
-/** The number the last failed call left behind. Only meaningful straight after one that failed: a
- * call that succeeds may leave it at anything, which is why nothing here reads it unless a return
- * value already said something went wrong.
- */
-private[sysl] last_errno() -> int = errno_location()[0]
 
 // A directory that still has something in it. The one code in this set whose value differs between
 // the two libcs -- the rest are V7 Unix's, and have been the same numbers everywhere since.
@@ -225,16 +196,10 @@ private[sysl] from_errno(code: int) -> IoError
         Other(code)
 end from_errno
 
-/** What every call in this module reports with when it has just been told something failed. It reads
- * `errno` itself rather than taking one, so the reading happens at the failure instead of wherever
- * the caller got round to it -- there is nothing between the two that could overwrite it.
- *
- * It answers the **error**, not a `Result` around it, so that the call site writes `Err(why())` and
- * the type of the result comes from what receives it. A generic `failure[T]()` would have had to be
- * given its type argument at every call — `failure[usize]()` (`reference/generics.md § Writing the
- * type arguments`) — which is a word per call site to say what `Err(why())` already says.
+/** A hook's status as the `Result` the rest of the module speaks in: zero is success, and anything
+ * else is the code of the error, turned back into its case here and nowhere else (`sysl.fs.sys`).
  */
-private[sysl] why() -> IoError = from_errno(last_errno())
+private[sysl] answered(code: int) -> Result[unit, IoError] = if code != 0 then Err(from_errno(code)) else Ok(())
 
 /** What an operation reports where **this target has no way to perform it at all** -- not a failure
  * of the call, but the absence of one.
@@ -244,10 +209,9 @@ private[sysl] why() -> IoError = from_errno(last_errno())
  * code would have been worse than useless -- `ENOSYS` is 78 on macOS and 38 on Linux, and neither
  * number means anything on a target that has neither header.
  *
- * The two reachable cases are both cutting a file on a target with no `__posix__` shim beside the
- * module. Everything else here is either ISO C, which every target has, or is declared only where
- * its shim is -- which is the better answer where it can be taken, since an undefined name at the
- * call site says so at compile time instead of at run time.
+ * It is what a hook of `sysl.fs.sys` answers for a call its supplier has no way to make, and what
+ * reaches a caller as `from_errno(-1)`: a target whose C library has no `chmod`, or a program on a
+ * bare machine answering for a filesystem that has no links.
  */
 private[sysl] unsupported() -> IoError = Other(unsupported_code)
 

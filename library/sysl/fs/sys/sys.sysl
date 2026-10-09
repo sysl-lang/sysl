@@ -1,0 +1,210 @@
+module sysl.fs.sys
+@requires(os)
+
+// The calls `sysl.fs` makes of whatever is under it, at the level of a file descriptor.
+//
+// **Everything `sysl.fs` does to a filesystem goes through the `extern`s below and through nothing
+// else.** Each names a C symbol and no module here defines one, so what answers them is decided by
+// what the program is linked with (`reference/ffi.md § A module may supply another module's extern`):
+//
+// | linked with | what defines the symbols |
+// |---|---|
+// | a program for a hosted target | `sysl.fs.hosted`, over the platform's C library |
+// | a program for a target with system calls and no C library | the program, with an `@export` per hook |
+//
+// So `sysl.fs` itself names no C function, reads no `errno` and transcribes no C structure: the
+// buffering a `File` does, the reading of a whole file and the walking of a tree are written once in
+// sysl over these calls, and a target that can answer them gets all of it. A freestanding program
+// that reaches `sysl.fs` and leaves a hook it reaches unanswered is refused when it is compiled,
+// naming the hooks, rather than at the link.
+//
+// ## The shape of a hook
+//
+// **Every hook answers an `int` status: zero for success, or the code of the `IoError` it failed
+// with** -- `NotFound.code()`, `DirectoryNotEmpty.code()`, and for anything the set does not name the
+// number `Other` carries. What a call produces besides the status it writes through a pointer it was
+// handed. The status is the error's code rather than a variant because a hook is a C symbol, and an
+// enum carrying a payload is not a shape C can spell; `sysl.fs` turns the code back into the
+// `IoError` in one place. A target that cannot perform a call at all answers `-1`, which no
+// platform's error numbers use, and the caller hears "not supported on this target".
+//
+// **A path is a pointer and a length**, a sysl `string` exactly as it is: nothing is copied to put a
+// terminator after it, and a supplier that needs one -- a C library does -- makes it. A name a hook
+// writes back is the same: bytes and a count, with no terminator.
+//
+// **A descriptor is an `int` and a directory stream a `usize`**, which hold whatever the supplier
+// keeps -- a C library's `DIR *`, or a kernel's own index.
+
+/** What `sysl_fs_stat` and `sysl_fs_fstat` fill in about one filesystem entry: thirteen 64-bit
+ * numbers, in this order.
+ *
+ * `mode` carries POSIX's encoding -- the file type in the top bits (`0o170000` masks it: `0o100000`
+ * a regular file, `0o040000` a directory, `0o120000` a symbolic link) and the twelve permission bits
+ * below -- since that is what `Meta` reads. A supplier with nothing to say about a field leaves it
+ * zero. Times are seconds and nanoseconds since the Unix epoch, held apart.
+ */
+struct Stat
+    size: long
+    mode: long
+    links: long
+    uid: long
+    gid: long
+    inode: long
+    device: long
+    modified_s: long
+    modified_ns: long
+    accessed_s: long
+    accessed_ns: long
+    changed_s: long
+    changed_ns: long
+end Stat
+
+/** The bits of `sysl_fs_open`'s `flags`. They are this interface's own numbers rather than any
+ * platform's `O_*`, which differ between C libraries; a supplier translates them once.
+ *
+ * `open_read` and `open_write` may both be set, for a file opened for update. `open_create` makes the
+ * file where it is missing, `open_truncate` empties it where it is not, and `open_append` puts every
+ * write at the end of whatever the file holds at that moment.
+ */
+const open_read: u32 = 1
+const open_write: u32 = 2
+const open_create: u32 = 4
+const open_truncate: u32 = 8
+const open_append: u32 = 16
+
+/** Where `sysl_fs_seek` counts from: the start of the file, the current position, or the end. */
+const seek_start: int = 0
+const seek_current: int = 1
+const seek_end: int = 2
+
+/** What `sysl_fs_access` is asked: whether anything is at the path at all, or whether the program may
+ * read it or write it. They are POSIX's numbers for the same questions.
+ */
+const access_exists: int = 0
+const access_write: int = 2
+const access_read: int = 4
+
+// -- descriptors -------------------------------------------------------------------------------------
+
+/** Opens `path` with the `open_*` bits in `flags`, creating it with the permission bits `mode` where
+ * `open_create` makes it, and writes the descriptor to `fd`.
+ */
+@needs(os)
+private[fs] extern "sysl_fs_open" open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int
+
+/** Reads at most `room` bytes into `into` and writes how many arrived to `got`. Zero arriving is the
+ * end of the file.
+ */
+@needs(os)
+private[fs] extern "sysl_fs_read" read(fd: int, into: *u8, room: usize, got: *usize) -> int
+
+/** Writes at most `len` bytes from `from` and writes how many were taken to `put`. */
+@needs(os)
+private[fs] extern "sysl_fs_write" write(fd: int, from: *u8, len: usize, put: *usize) -> int
+
+/** Releases a descriptor. The descriptor is gone afterwards whether or not this succeeded. */
+@needs(os)
+private[fs] extern "sysl_fs_close" close(fd: int) -> int
+
+/** Moves to `offset` counted from `whence` (a `seek_*`), and writes the new position to `at`. */
+@needs(os)
+private[fs] extern "sysl_fs_seek" seek(fd: int, offset: long, whence: int, at: *long) -> int
+
+/** What is known about an open file. */
+@needs(os)
+private[fs] extern "sysl_fs_fstat" fstat(fd: int, out: *Stat) -> int
+
+/** An open file cut to `length` bytes, or extended to it with zeroes. */
+@needs(os)
+private[fs] extern "sysl_fs_ftruncate" ftruncate(fd: int, length: long) -> int
+
+// -- paths -------------------------------------------------------------------------------------------
+
+/** What is known about what `path` names, following a symbolic link where `follow` is non-zero and
+ * describing the link itself where it is zero.
+ */
+@needs(os)
+private[fs] extern "sysl_fs_stat" stat(path: *u8, len: usize, follow: int, out: *Stat) -> int
+
+/** The file at `path` cut to `length` bytes, or extended to it with zeroes. */
+@needs(os)
+private[fs] extern "sysl_fs_truncate" truncate(path: *u8, len: usize, length: long) -> int
+
+/** One directory made, with the permission bits `mode`. */
+@needs(os)
+private[fs] extern "sysl_fs_mkdir" mkdir(path: *u8, len: usize, mode: u32) -> int
+
+/** One empty directory removed. */
+@needs(os)
+private[fs] extern "sysl_fs_rmdir" rmdir(path: *u8, len: usize) -> int
+
+/** One name of a file removed. A directory is refused. */
+@needs(os)
+private[fs] extern "sysl_fs_unlink" unlink(path: *u8, len: usize) -> int
+
+/** A path moved to another name, replacing what was there. */
+@needs(os)
+private[fs] extern "sysl_fs_rename" rename(from: *u8, from_len: usize, to: *u8, to_len: usize) -> int
+
+/** Whether the question `how` (an `access_*`) has the answer yes for `path`: zero where it does. */
+@needs(os)
+private[fs] extern "sysl_fs_access" access(path: *u8, len: usize, how: int) -> int
+
+/** The twelve permission bits of what `path` names set to `mode`. */
+@needs(os)
+private[fs] extern "sysl_fs_chmod" chmod(path: *u8, len: usize, mode: u32) -> int
+
+// -- directories -------------------------------------------------------------------------------------
+
+/** A directory opened for listing, and the stream written to `dir`. */
+@needs(os)
+private[fs] extern "sysl_fs_opendir" opendir(path: *u8, len: usize, dir: *usize) -> int
+
+/** The next name in a directory stream, copied into `into`, with its length written to `got`. A
+ * length of zero is the end of the listing. `.` and `..` may be answered like any other name.
+ */
+@needs(os)
+private[fs] extern "sysl_fs_readdir" readdir(dir: usize, into: *u8, room: usize, got: *usize) -> int
+
+/** A directory stream released. */
+@needs(os)
+private[fs] extern "sysl_fs_closedir" closedir(dir: usize) -> int
+
+/** The program's current directory, copied into `into`, with its length written to `got`. */
+@needs(os)
+private[fs] extern "sysl_fs_getcwd" getcwd(into: *u8, room: usize, got: *usize) -> int
+
+/** The program's current directory moved to `path`. */
+@needs(os)
+private[fs] extern "sysl_fs_chdir" chdir(path: *u8, len: usize) -> int
+
+/** A directory nobody else can have made inside the place temporary files go, its name beginning with
+ * `prefix`, and its path copied into `into` with its length written to `got`.
+ */
+@needs(os)
+private[fs] extern "sysl_fs_temp_dir" temp_dir(prefix: *u8, len: usize, into: *u8, room: usize,
+                                               got: *usize) -> int
+
+// -- links -------------------------------------------------------------------------------------------
+
+/** A symbolic link made at `link`, holding `target` as written. */
+@needs(os)
+private[fs] extern "sysl_fs_symlink" symlink(target: *u8, target_len: usize, link: *u8,
+                                             link_len: usize) -> int
+
+/** A second name, `fresh`, for the file at `existing`. */
+@needs(os)
+private[fs] extern "sysl_fs_link" link(existing: *u8, existing_len: usize, fresh: *u8,
+                                       fresh_len: usize) -> int
+
+/** What the symbolic link at `path` holds, copied into `into`, with its length written to `got`. */
+@needs(os)
+private[fs] extern "sysl_fs_readlink" readlink(path: *u8, len: usize, into: *u8, room: usize,
+                                               got: *usize) -> int
+
+/** `path` with every `.`, `..` and symbolic link resolved, made absolute, copied into `into`, with
+ * its length written to `got`.
+ */
+@needs(os)
+private[fs] extern "sysl_fs_realpath" realpath(path: *u8, len: usize, into: *u8, room: usize,
+                                               got: *usize) -> int

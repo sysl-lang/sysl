@@ -1,23 +1,19 @@
 module sysl.fs
 @requires(os)
 
-import sysl.text.{cstring, from_utf8}
+import sysl.fs.sys
+import sysl.text.from_utf8
 
 // Symbolic and hard links, and the path the filesystem itself agrees on.
 //
 // **A path buffer is a local array here rather than a growing `Buf`**, and that is the shape to copy
-// wherever this module next binds a call that fills one. `readlink` and `getcwd` both write into
+// wherever this module next asks for a call that fills one. `readlink` and `getcwd` both write into
 // storage the caller supplies and report what they could not fit, so a caller either guesses a size
 // or asks the platform for one -- and `PATH_MAX` is a `#define`, which is among the three things
 // only C can reach. A fixed 4,096 bytes is what every Linux allows and four times what macOS does,
-// so a path this refuses is one no filesystem here can hold; the shim in `meta.c` resolves into a
+// so a path this refuses is one no filesystem here can hold; the hosted `realpath` resolves into a
 // local of exactly `PATH_MAX` and copies out, which is the same answer written where the constant
 // lives.
-
-private[sysl] extern "symlink" c_symlink(target: *u8, link: *u8) -> int
-private[sysl] extern "link" c_link(existing: *u8, fresh: *u8) -> int
-private[sysl] extern "readlink" c_readlink(path: *u8, into: *u8, room: usize) -> long
-private[sysl] extern "sysl_fs_realpath" c_realpath(path: *u8, into: *u8, room: u64) -> long
 
 /** How much storage a path answer is given. See the note at the head of this file.
  *
@@ -34,11 +30,8 @@ private const path_bytes: usize = 4096
  * the link is in, every time it is followed, rather than against wherever the program was when it
  * made the link.
  */
-symlink(target: string, link: string) -> Result[unit, IoError]
-    var a = cstring(target)
-    var b = cstring(link)
-
-    said(c_symlink(a.ptr, b.ptr))
+symlink(target: string, link: string) -> Result[unit, IoError] =
+    answered(sys.symlink(bytes_at(target), target.bytes.len, bytes_at(link), link.bytes.len))
 
 /** A second name for a file that already exists, in the same filesystem.
  *
@@ -46,11 +39,8 @@ symlink(target: string, link: string) -> Result[unit, IoError]
  * them does, which is what `Meta.links` counts. It fails across filesystems, and it fails on a
  * directory, both of which are the kernel's rules rather than this module's.
  */
-hard_link(existing: string, fresh: string) -> Result[unit, IoError]
-    var a = cstring(existing)
-    var b = cstring(fresh)
-
-    said(c_link(a.ptr, b.ptr))
+hard_link(existing: string, fresh: string) -> Result[unit, IoError] =
+    answered(sys.link(bytes_at(existing), existing.bytes.len, bytes_at(fresh), fresh.bytes.len))
 
 /** What a symbolic link points at, exactly as it was written -- which may be relative, and may name
  * nothing at all.
@@ -60,17 +50,18 @@ hard_link(existing: string, fresh: string) -> Result[unit, IoError]
  */
 read_link(path: string) -> Result[string, IoError]
     var into: [path_bytes]u8 = [0; path_bytes]
-    val n = c_readlink(cstring(path).ptr, &into[0], path_bytes)
+    var n: usize = 0
+    val code = sys.readlink(bytes_at(path), path.bytes.len, &into[0], path_bytes, &n)
 
-    if n < 0 then return Err(why())
+    if code != 0 then return Err(from_errno(code))
 
     // `readlink` does not terminate what it writes and does not report truncation -- a target that
     // filled the buffer exactly is indistinguishable from one that was cut short, so a full buffer
     // is refused rather than answered. Nothing here can grow and retry, since there is no size that
     // would be enough on a filesystem that allowed more.
-    if usize(n) >= path_bytes then return Err(name_too_long())
+    if n >= path_bytes then return Err(name_too_long())
 
-    text(into[0..<usize(n)])
+    text(into[0..<n])
 end read_link
 
 /** The path the filesystem agrees on: every `.`, every `..` and every symbolic link resolved, and
@@ -84,11 +75,12 @@ end read_link
 #if posix
 canonicalize(path: string) -> Result[string, IoError]
     var into: [path_bytes]u8 = [0; path_bytes]
-    val n = c_realpath(cstring(path).ptr, &into[0], u64(path_bytes))
+    var n: usize = 0
+    val code = sys.realpath(bytes_at(path), path.bytes.len, &into[0], path_bytes, &n)
 
-    if n < 0 then return Err(why())
+    if code != 0 then return Err(from_errno(code))
 
-    text(into[0..<usize(n)])
+    text(into[0..<n])
 end canonicalize
 #endif
 
@@ -108,6 +100,3 @@ private text(bytes: []const u8) -> Result[string, IoError]
     from_utf8(bytes) match
         Ok(s) -> Ok(s)
         Err(e) -> Err(InvalidUtf8(e.offset))
-
-/** A C call that reports success as zero. */
-private said(rc: int) -> Result[unit, IoError] = if rc != 0 then Err(why()) else Ok(())

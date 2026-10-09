@@ -2,9 +2,10 @@ module sysl.fs
 @requires(os)
 
 import sysl.env.get
+import sysl.fs.sys
 import sysl.path.{join, parent, relative_to}
-import sysl.slices.{as_mut_ptr, as_ptr}
-import sysl.text.{cstring, from_cstring}
+import sysl.slices.as_mut_ptr
+import sysl.text.from_utf8
 
 // Where the program is, where it can put something nobody else will take, and the two directory
 // operations that are loops rather than calls.
@@ -17,10 +18,6 @@ import sysl.text.{cstring, from_cstring}
 // They are also where this module and `sysl.path` meet, and the split is visible in one line:
 // `make_dir_all` asks `sysl.path.parent` where to climb to, and asks the filesystem whether it is
 // there. The first question needs no operating system and the second is nothing else.
-
-private[sysl] extern "getcwd" c_getcwd(into: *u8, room: usize) -> *u8
-private[sysl] extern "chdir" c_chdir(path: *u8) -> int
-private[sysl] extern "sysl_fs_temp_dir" c_temp_dir(prefix: *u8, into: *u8, room: usize) -> int
 
 /** How much storage a path answer is given, which `links.sysl` explains at length. */
 private const path_bytes: usize = 4096
@@ -36,10 +33,12 @@ private const path_bytes: usize = 4096
  */
 current_dir() -> Result[string, IoError]
     var into: []u8 = [0; path_bytes]
+    var n: usize = 0
+    val code = sys.getcwd(as_mut_ptr(into), into.len, &n)
 
-    if c_getcwd(as_mut_ptr(into), into.len) == null then return Err(why())
+    if code != 0 then return Err(from_errno(code))
 
-    from_cstring(as_ptr(into)) match
+    from_utf8(into[0..<n]) match
         Ok(s) -> Ok(s)
         Err(e) -> Err(InvalidUtf8(e.offset))
 end current_dir
@@ -51,7 +50,7 @@ end current_dir
  * Prefer building an absolute path. This exists because a program that drives a build, or that is
  * the shell-like thing at the top, genuinely needs it.
  */
-set_current_dir(path: string) -> Result[unit, IoError] = told(c_chdir(cstring(path).ptr))
+set_current_dir(path: string) -> Result[unit, IoError] = answered(sys.chdir(bytes_at(path), path.bytes.len))
 
 // ## Where a directory BELONGS, as against where one IS
 //
@@ -146,11 +145,12 @@ private under_home(leaf: string) -> Option[string] = home_dir().map((h) -> join(
 #if posix
 make_temp_dir(prefix: string) -> Result[string, IoError]
     var into: []u8 = [0; path_bytes]
-    val code = c_temp_dir(cstring(prefix).ptr, as_mut_ptr(into), into.len)
+    var n: usize = 0
+    val code = sys.temp_dir(bytes_at(prefix), prefix.bytes.len, as_mut_ptr(into), into.len, &n)
 
     if code != 0 then return Err(from_errno(code))
 
-    from_cstring(as_ptr(into)) match
+    from_utf8(into[0..<n]) match
         Ok(s) -> Ok(s)
         Err(e) -> Err(InvalidUtf8(e.offset))
 end make_temp_dir
@@ -272,6 +272,3 @@ copy_dir_all(from: string, to: string) -> Result[unit, IoError]
 end copy_dir_all
 
 #endif
-
-/** A C call that reports success as zero. */
-private told(rc: int) -> Result[unit, IoError] = if rc != 0 then Err(why()) else Ok(())

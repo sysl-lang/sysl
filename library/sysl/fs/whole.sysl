@@ -3,7 +3,8 @@ module sysl.fs
 
 import sysl.buf.{Buf, buf}
 import sysl.io.Reader
-import sysl.text.{cstring, from_utf8}
+import sysl.fs.sys
+import sysl.text.from_utf8
 
 // A whole file in one call, which is what most programs that touch a file want and all of what some
 // of them want.
@@ -49,7 +50,7 @@ read_bytes(path: string) -> Result[[]u8, IoError]
 
         for b in got do out.push(b)
 
-    if f.failed() then return Err(why())
+    if f.failed() then return Err(f.failure())
 
     Ok(out.view())
 end read_bytes
@@ -86,9 +87,9 @@ append_text(path: string, text: string) -> Result[unit, IoError] = append_bytes(
  * went wrong rather than the last.
  *
  * **The failure is read before the close, and that is the point of the local.** A `Writer` latches
- * rather than returning, so what went wrong is `errno` at the moment it did -- and `fclose` is a
- * call like any other, which sets `errno` to whatever *it* thought. Asking afterwards would report
- * the wrong failure for the right file.
+ * rather than returning, so what went wrong is the code the file kept at the moment it did -- and
+ * the close is a call like any other, which may fail on its own account. The write's failure is the
+ * one that explains the other.
  *
  * It takes the file by value and copies it into a local it can write through, which is safe for the
  * reason `File` exists in two pieces: the copy shares the one `FileState`, so the close below is the
@@ -100,7 +101,7 @@ private put(f: File, bytes: []const u8) -> Result[unit, IoError]
     out.write(bytes)
 
     if out.failed()
-        var stopped: Result[unit, IoError] = Err(why())
+        var stopped: Result[unit, IoError] = Err(out.failure())
 
         out.close()
         return stopped
@@ -141,9 +142,9 @@ copy_file(from: string, to: string) -> Result[unit, IoError]
 
         dst.write(got)
 
-        if dst.failed() then return Err(why())
+        if dst.failed() then return Err(dst.failure())
 
-    if src.failed() then return Err(why())
+    if src.failed() then return Err(src.failure())
 
     // The `defer` above closes it too, and closing twice is deliberately harmless -- but a close is
     // where a full disk finally reports, so a copy that did not ask would answer `Ok` for a file
@@ -158,13 +159,5 @@ end copy_file
  * it: a length past the end of the file leaves a hole that reads as zeroes and that most filesystems
  * do not store.
  */
-truncate(path: string, length: long) -> Result[unit, IoError]
-#if posix
-    if c_truncate(cstring(path).ptr, length) != 0 then Err(why()) else Ok(())
-#else
-    Err(unsupported())
-#endif
-
-// `truncate(2)` is POSIX rather than ISO C, so the declaration is here and the `#if` above is what
-// keeps a target without it from linking one that is not there.
-private extern "truncate" c_truncate(path: *u8, length: long) -> int
+truncate(path: string, length: long) -> Result[unit, IoError] =
+    answered(sys.truncate(bytes_at(path), path.bytes.len, length))

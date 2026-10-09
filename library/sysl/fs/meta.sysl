@@ -1,33 +1,15 @@
 module sysl.fs
 @requires(os)
 
-import sysl.text.cstring
+import sysl.fs.sys
 import sysl.time.Instant
 
 // What a program can learn about a path without reading what is at the end of it.
 //
-// **`stat` is the call the rest of this module was written around not having.** `path.sysl` says why
-// -- a `struct stat` is laid out differently by every platform's headers, and a transcription of one
-// is numbers nothing checks -- and it names the answer in the same breath: a shim beside the module,
-// under a per-OS directory, which reads the header and hands back what a caller wants. That is what
-// `meta.c` is. Nothing here knows an offset.
-//
-// So this file is the shape that paragraph prescribed, at the size the question turned out to need:
-// thirteen numbers rather than one. `size_of` and `is_dir` were the two questions the module could
-// answer before it, and they were the two whose answers happen to be reachable through calls whose
-// signatures are all there is to get right -- which is a fact about `fopen` and `opendir` rather than
-// about what a program wants to know.
-
-// The shim. Declared on every target and defined only where a `__posix__` directory supplies it,
-// which is the same arrangement `sysl_fs_file_size` is under: an `extern` costs nothing until
-// something links it, and the `#if posix` at each caller is what keeps anything from doing so.
-private[sysl] extern "sysl_fs_stat" c_stat(path: *u8, follow: int, out: *long) -> int
-
-/** How many numbers `sysl_fs_stat` writes. It is written here rather than in the shim's own terms
- * because the sysl side is what supplies the storage, and a mismatch would be a write past the end
- * of an array rather than a compilation failure.
- */
-private const stat_words: usize = 13
+// **`stat` is one call of `sysl.fs.sys`, and it answers thirteen numbers** -- the shape of
+// `sysl.fs.sys.Stat`, which is whatever lies under the hook filling it in, never a `struct stat`
+// transcribed: that is laid out differently by every platform's headers, and a transcription of one
+// is numbers nothing checks. Nothing here knows an offset.
 
 // The file type is the top bits of the mode, and the mask and the values are POSIX's own -- fixed
 // since V7 and identical on every system this compiler targets, which is why they are literals here
@@ -174,27 +156,10 @@ struct Meta
     same_file(self, other: Meta) -> bool = self.inode == other.inode && self.device == other.device
 end Meta
 
-/** The one place the two libcs disagree, and they disagree about a *width* rather than about a
- * meaning -- `mode_t` is 16 bits on a BSD and 32 under glibc. The gate is on whole declarations,
- * which is what conditional compilation is comfortable with, exactly as `mkdir`'s is one file away.
- */
-#if bsd
-private[sysl] extern "chmod" c_chmod(path: *u8, mode: u16) -> int
-
-private chmod_done(path: string, mode: u32) -> Result[unit, IoError] =
-    reported(c_chmod(cstring(path).ptr, u16(mode & 0o7777)))
-#else
-private[sysl] extern "chmod" c_chmod(path: *u8, mode: u32) -> int
-
-private chmod_done(path: string, mode: u32) -> Result[unit, IoError] =
-    reported(c_chmod(cstring(path).ptr, mode & 0o7777))
-#endif
-
-// **The reading surface is POSIX's, and is declared only where the shim beside it is.** `Meta` and
-// `Kind` above are plain data and exist on every target; what needs a `#if` is the four calls that
-// ask, because the shim they reach is compiled from a `__posix__` directory and there is no
-// `__windows__` one. A target with no shim gets an undefined name at the call, which says what is
-// true -- rather than a `Result` that is always an error, which would say the file was not there.
+// **The reading surface is POSIX's, and is declared only on a POSIX target.** `Meta` and `Kind` above
+// are plain data and exist on every target; what needs a `#if` is the four calls that ask. A target
+// without them gets an undefined name at the call, which says what is true -- rather than a `Result`
+// that is always an error, which would say the file was not there.
 //
 // A Windows reading would not be this shape anyway: there is no inode, no owner and no group, and
 // the permission bits are not twelve. That is a `Meta` of its own when somebody wants one.
@@ -229,21 +194,23 @@ is_link(path: string) -> bool
  * ends up `0o644` whatever it was, which is `chmod(2)`'s own meaning and the one a program that read
  * `permissions()` first is expecting.
  */
-set_permissions(path: string, mode: u32) -> Result[unit, IoError] = chmod_done(path, mode)
+set_permissions(path: string, mode: u32) -> Result[unit, IoError] =
+    answered(sys.chmod(bytes_at(path), path.bytes.len, mode & 0o7777))
 
 /** One reading, turned from thirteen numbers into the struct.
  *
- * **The array is a local and the shim writes into it**, which is the caller-supplied-storage shape
- * the whole org uses for a C structure that will not cross: there is no allocation, the size is
- * `stat_words` on both sides, and nothing outlives the call.
+ * **The reading is a local and the hook writes into it**, which is the caller-supplied-storage
+ * shape: there is no allocation, and nothing outlives the call.
  */
 private stat_of(path: string, follow: int) -> Result[Meta, IoError]
-    var raw: [stat_words]long = [0; stat_words]
+    var st = sys.Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    val code = sys.stat(bytes_at(path), path.bytes.len, follow, &st)
 
-    if c_stat(cstring(path).ptr, follow, &raw[0]) != 0 then return Err(why())
+    if code != 0 then return Err(from_errno(code))
 
-    Ok(Meta(raw[0], u32(raw[1]), u64(raw[2]), u32(raw[3]), u32(raw[4]), u64(raw[5]), u64(raw[6]),
-            at(raw[7], raw[8]), at(raw[9], raw[10]), at(raw[11], raw[12])))
+    Ok(Meta(st.size, u32(st.mode), u64(st.links), u32(st.uid), u32(st.gid), u64(st.inode),
+            u64(st.device), at(st.modified_s, st.modified_ns), at(st.accessed_s, st.accessed_ns),
+            at(st.changed_s, st.changed_ns)))
 end stat_of
 
 #endif
@@ -252,10 +219,3 @@ end stat_of
  * written twice within a second is still ordered as long as the filesystem recorded it that way.
  */
 private at(secs: long, nanos: long) -> Instant = Instant(secs * 1000000 + nanos / 1000)
-
-/** A C call that reports success as zero, as this module's `Result`. `path.sysl` has one of these
- * too and they are the same three lines; they are separate because `private` in sysl is
- * file-private, which is what keeps a helper from becoming a name every file in a module competes
- * over.
- */
-private reported(rc: int) -> Result[unit, IoError] = if rc != 0 then Err(why()) else Ok(())
