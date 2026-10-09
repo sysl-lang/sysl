@@ -16,6 +16,14 @@ const CapHeap: string = "heap"
 const CapOs: string = "os"
 const CapPosix: string = "posix"
 
+// **A C library under the program**, which is a property of the machine's MANIFEST only: no module
+// states it, so it is not among `capability_core`'s. It is provided on a hosted target and NOT on a
+// freestanding one unless the manifest grants it (`capabilities { libc = true }`), newlib under a
+// Pico SDK build being the ordinary case. It makes C's own functions -- `snprintf`, `memchr` --
+// callable and nothing more: the hosted answers to the library's hooks are about an operating
+// system, and a C library is not one.
+const CapLibc: string = "libc"
+
 // The capabilities there are, in the order a refusal lists them.
 capability_core() -> Buf[string]
     var out: Buf[string] = buf()
@@ -743,13 +751,18 @@ end blame_needs_expr
 
 private blame_needs_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, cap: string,
                         why: string)
-    val mine = least_seed(walk, own_refs(e))
+    val mine = named_reach(walk, own_refs(e))
 
     if mine.is_none() then return
     if reaches_a_seed(walk, strict_refs(e)) then return
     if refused_as_module(a, scope, e.span, cap) then return
 
-    a.fault(scope, e.span, s"this reaches '${seed_shown(a, scope, mine.unwrap())}', which needs '$cap', " +
+    // What the reader's code reached is named, and the declaration that asked for the capability
+    // after it where the two differ (`reaches.sysl`'s `named_reach`).
+    val (who, seed) = mine.unwrap()
+    val through = if who == seed then "" else s" through '${seed_shown(a, scope, seed)}'"
+
+    a.fault(scope, e.span, s"this reaches '${seed_shown(a, scope, who)}', which needs '$cap'$through, " +
             s"and $why")
 end blame_needs_one
 

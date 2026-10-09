@@ -266,7 +266,8 @@ settled_image_entry() -> string = image_entry
 // - the program is a bare image (`links_an_image`);
 // - the root manifest's block for the machine names an `entry` other than `main`;
 // - there is nothing for a `main` to do: no top-level statement, no declared `main`, and no module
-//   storage filled at run time.
+//   storage filled at run time -- and no `extern` naming `main`, which is a runtime written in sysl
+//   asking for it.
 //
 // Then nothing would call it and nothing is in it, and an image carrying it is an unused function
 // in the one kind of program that counts its bytes. **Where there is something to do, `main` is
@@ -281,8 +282,17 @@ image_emits_main(root: string, t: Target, p: TProgram) -> bool
 
     if entry == "" || entry == "main" then return true
 
-    !p.main.is_empty() || p.entry.is_some() || has_computed_val(p.vals)
+    !p.main.is_empty() || p.entry.is_some() || has_computed_val(p.vals) || calls_main(p)
 end image_emits_main
+
+// Whether the program calls `main` through an `extern` naming it -- a start file written in sysl,
+// allowed on a bare image whose entry is another symbol (`check_main_extern`).
+calls_main(p: TProgram) -> bool
+    for x in p.externs
+        if x.symbol == "main" then return true
+
+    false
+end calls_main
 
 // The symbol a bare image starts at, as the root manifest's block for this machine names it -- `""`
 // where the program is not a bare image, or its block names no entry.
@@ -305,7 +315,8 @@ end image_entry_named
 // - the image starts at `main`, or names no entry (the script's `ENTRY` is then the linker's affair);
 // - the program has a `main` of its own to run -- a top-level statement or a declared `main` -- since
 //   calling it is then the entry's documented job, and the storage is filled on the way in;
-// - a module-level `asm` block names `main`, which is a start file branching to it.
+// - a module-level `asm` block names `main`, which is a start file branching to it;
+// - an `extern` names `main` and something calls it, which is the same start file written in sysl.
 //
 // Otherwise a `main` would hold only the stores, and nothing calls it: every way into the image
 // reaching that storage is refused (`check_image_storage`). Storage no way in reaches is left alone --
@@ -314,7 +325,7 @@ image_storage_unfilled(entry: string, p: TProgram) -> bool
     if entry == "" || entry == "main" then return false
     if !p.main.is_empty() || p.entry.is_some() then return false
 
-    !asm_names_symbol(p.module_asm, "main")
+    !asm_names_symbol(p.module_asm, "main") && !calls_main(p)
 end image_storage_unfilled
 
 // Whether any line of the module-level `asm` names a symbol as a whole word -- `bl main`,
