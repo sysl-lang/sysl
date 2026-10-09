@@ -336,6 +336,41 @@ fsh_io_error_message_needs_no_snprintf()
     lbr_drop([p, out])
 end fsh_io_error_message_needs_no_snprintf
 
+// A program rendering integers through `sysl.fmt.hex`, `binary` and `octal` at three widths.
+private val fsh_hex_helpers: string = raw"""
+    import sysl.fmt.hex
+    import sysl.fmt.binary
+    import sysl.fmt.octal
+
+    run() -> int =
+        val big: u64 = 0xdeadbeef
+        val a = hex(big, 16, true)
+        val b = hex(i8(-1))
+        val c = binary(u16(5), 8)
+        val d = octal(i32(-8))
+        val w = u64(a.bytes.len + b.bytes.len + c.bytes.len + d.bytes.len)
+        int(f"$w%016x".bytes.len)
+    """
+
+@test("a freestanding program formatting through sysl.fmt.hex, binary and octal links with no libc symbol")
+fsh_hex_helpers_need_no_libc()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_hex_helpers + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    assert(!fsh_names(all, "snprintf"), "'snprintf' is in the image")
+    assert(all.contains("format_int"), all)
+
+    lbr_drop([p, out])
+end fsh_hex_helpers_need_no_libc
+
 @test("a freestanding program reaching a float or string specifier is refused at each, naming the target")
 fsh_c_specifier_is_refused()
     if !lbr_ready() then return
