@@ -111,6 +111,42 @@ private parse_struct_body(p: *Parser, decl: *StructDecl)
     if !p.accept(Dedent) then p.want("dedent")
 end parse_struct_body
 
+// The body of a `type` declaration: its members, and nothing else. A `new` type's value is its base,
+// so there is no field for a line to declare -- and one written as a field is told so, rather than
+// being read as a member missing its parameters.
+parse_type_members(p: *Parser, out: *Buf[MethodDecl], name: string)
+    val at = p.here()
+
+    p.bump()
+    p.bump()
+    p.skip_newlines()
+
+    var first = true
+
+    loop
+        if p.at(Dedent) || p.at(Eof) then break
+
+        val before = p.report.len()
+
+        if refuse_stray_member(p, first, InType) then ()
+        elif at_field(p)
+            p.fault(p.here(), s"'$name' is its base's value and holds no fields — its body declares " +
+                    "members, and a type with fields of its own is a 'struct'")
+            skip_line(p)
+        else
+            parse_member_line(p, out, InType)
+
+        if p.report.len() != before && !p.end_of_statement() then drop_line(p)
+
+        p.skip_newlines()
+
+        first = false
+
+    if !p.accept(Dedent) then p.want("dedent")
+
+    accept_end_type(p, named_type(at, name))
+end parse_type_members
+
 // `invariant cond` inside a type's body. The word is contextual, so a field called `invariant` is
 // told apart by the `:` that follows it.
 private at_invariant_clause(p: *Parser) -> bool = p.at_word("invariant") &&
