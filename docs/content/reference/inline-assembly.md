@@ -609,6 +609,45 @@ halt()
 an 'asm' block inside a function is part of that function's code
 ```
 
+### A file's bytes in the instructions
+
+**`.incbin "file"` reads its file from the directory of the source the block is written in**, as
+[`embed`](/reference/arrays/) does, and never from the directory the build was started in — the
+compiler writes the absolute path into the instructions, so the same tree assembles from anywhere.
+Where the data needs labels of its own or a section a linker script gathers, this is the form; where
+it needs only to be read, `embed("file")` is shorter. This block carries its own source:
+
+```sysl build=c target=aarch64-freestanding
+@section(".rodata.blobs")
+asm
+    [aarch64]
+        ".globl blob_start, blob_end"
+        "blob_start:"
+        ".incbin \"main.sysl\""
+        "blob_end:"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "this kernel boots on aarch64 only"
+
+extern blob_start: u8
+extern blob_end: u8
+
+@export("kmain")
+kmain() -> int = int(usize(&blob_end) - usize(&blob_start))
+```
+
+The file's bytes are in the build's keys as an embedded file's are, so an edit to it reassembles the
+block. Only the arm being built reads its file — another machine's arm may name one this build never
+made — and a file that is not there is refused while compiling, naming the path that was tried:
+
+```sysl target=aarch64-freestanding
+asm
+    [aarch64] ".incbin \"user/hello.elf\""
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+```
+
+```error
+cannot include 'user/hello.elf' with '.incbin': there is no file at '
+```
+
 ## System registers and barriers
 
 On AArch64 most of a kernel's conversation with the processor is one instruction long: `mrs` to read
