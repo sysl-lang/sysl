@@ -271,8 +271,12 @@ end multi_decl
 // part reading a field of what is above it. **A part that is not a name is checked here rather than
 // where a match arm's is**, because the question is not the one an arm asks: an arm may be
 // refutable and fall through, and a binding has nowhere to fall.
+//
+// **A stated type is the whole value's**, exactly as `val t: (u64, u64) = …` states it: it is the
+// position the value is read in, so a literal inside takes its width from it, and the parts are
+// then taken apart at the stated type rather than at whatever the value guessed.
 pattern_decl(cx: &Analyzer, span: Span, pat: Pattern, mutable: bool,
-                     value: Expr) -> Buf[TStmt]
+                     value: Expr, typ: Option[TypeRef]) -> Buf[TStmt]
     var names: Buf[string] = buf()
 
     pattern_names(&names, pat)
@@ -282,21 +286,43 @@ pattern_decl(cx: &Analyzer, span: Span, pat: Pattern, mutable: bool,
             if names.at(j) == names.at(i) then
                 cx.fault(span, s"'${names.at(i)}' is named twice in one binding")
 
-    val tv = type_expr_bare(cx, value)
+    val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
+    val tv = type_expr(cx, value, declared)
 
     if texpr_type(tv) == Never then
         cx.fault(value.span, "cannot bind a name to an expression that never returns")
 
+    val held = stated_whole(cx, span, declared, texpr_type(tv))
+
     // The whole value is held once, under a name no program can write, and every part is read out
     // of it. Reading the value expression again per part would run its side effects once each.
-    val temp = cx.bind("$parts", texpr_type(tv))
+    val temp = cx.bind("$parts", held)
     var out: Buf[TStmt] = buf()
 
-    out.push(TVarDecl(temp, texpr_type(tv), tv, None))
-    push_all(&out, bind_pattern(cx, span, pat,
-                                TExpr(value.span, TLoad(temp, texpr_type(tv))), mutable))
+    out.push(TVarDecl(temp, held, tv, None))
+    push_all(&out, bind_pattern(cx, span, pat, TExpr(value.span, TLoad(temp, held)), mutable))
     out
 end pattern_decl
+
+// The type a destructuring binding holds its value at: the stated one, where the value meets it,
+// and the value's own otherwise. A value that does not meet the stated type is refused in the
+// words a plain binding's is, and its parts are then taken apart at `unknown` so that the one
+// mistake is not reported again by every part.
+private stated_whole(cx: &Analyzer, span: Span, declared: Option[Type], got: Type) -> Type
+    if declared.is_none() then return got
+
+    val want = declared.unwrap()
+
+    if want == Unknown then return Unknown
+
+    if disagree(got, want)
+        cx.fault(span, s"cannot initialize the parts of this binding: declared ${type_show(want)} " +
+                 s"but the value is ${type_show(got)}")
+
+        return Unknown
+
+    want
+end stated_whole
 
 // Every name a pattern binds, in the order it binds them, so a repeat is reported against the whole
 // binding rather than found later as a shadow.

@@ -57,13 +57,29 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
         else_body: Option[Buf[Stmt]], expected: Option[Type], discarded: bool) -> TExpr
     val else_guesses = else_body.is_some() && guessing(cx, else_body.unwrap())
     val then_guesses = guessing(cx, then_body)
+    val else_leans = else_body.is_some() && leaning(cx, else_body.unwrap())
+    val then_leans = leaning(cx, then_body)
 
     // The `else` leads when it is the branch that knows, which is the one case it is read before
     // the condition. It reads nothing the condition binds -- an `is` binding reaches the *then*
     // branch and no further -- so it is the same reading; what moves is only which of two broken
-    // branches is complained about first.
-    val early = early_else(cx, else_body, expected, then_guesses, else_guesses, discarded)
-    val then_wants = expected.or_else(() -> early.and_then(b -> settles(b)))
+    // branches is complained about first. A *then* that knows its type only in part is led too,
+    // by an `else` that knows all of it -- but only by one that stands alone, since a nullary
+    // generic `else` is waiting for the *then* to speak.
+    val led = then_leans && else_body.is_some() && !else_leans && !else_guesses && expected.is_none()
+    var early = early_else(cx, else_body, expected, then_guesses, else_guesses, discarded)
+
+    if led then early = attempt_block(cx, else_body.unwrap(), None, discarded)
+
+    var shared: Option[Type] = None
+
+    if then_leans && else_leans && expected.is_none() && !discarded then
+        shared = shared_branch_type(cx, span, cond, then_body, else_body.unwrap(), discarded)
+
+    val early_type = early.and_then(b -> settles(b)).or_else(() -> shared)
+    val offered = if then_leans && expected.is_none() then early_type else None
+    val told = expected.or_else(() -> early.and_then(b -> settles(b)))
+    val then_wants = if offered.is_some() then None else told
 
     // **A branch may have no type of its own for a reason `guessing` cannot see.** A bare literal
     // is recognised from the syntax; a nullary generic call is invisible until it is tried. So a
@@ -73,7 +89,14 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
     var then_block = TBlock(buf(), None, Unit)
     var settled_else: Option[TBlock] = None
 
-    if then_wants.is_some() || else_body.is_none()
+    // A leaning *then* is offered the `else`'s type rather than told it, and read as a branch with
+    // nothing to go on where it does not take it.
+    val took = offered.and_then(t -> attempt_then(cx, span, cond, then_body, Some(t), discarded))
+
+    if took.is_some()
+        tc = took.unwrap().0
+        then_block = took.unwrap().1
+    elif then_wants.is_some() || else_body.is_none()
         val side = then_side(cx, span, cond, then_body, then_wants, discarded)
 
         tc = side.0
@@ -98,11 +121,28 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
     end if
 
     val t_else = else_branch(cx, else_body, early, settled_else, then_block, expected,
-                             else_guesses, then_guesses, discarded)
+                             else_guesses, then_guesses, else_leans, discarded)
     val ty = if_type(cx, span, then_block, t_else)
 
     TExpr(span, TIf(tc, then_block, t_else, ty))
 end if_expr
+
+// The type two leaning branches meet at, where both end in a tuple or an array literal and they
+// come to one -- `(n, 0)` against `(0, m)`.
+private shared_branch_type(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
+                           else_body: Buf[Stmt], discarded: bool) -> Option[Type]
+    if !shaped_value(then_body) || !shaped_value(else_body) then return None
+
+    common_offer(2, (i, want) -> trial(cx, () -> branch_reading(cx, span, cond, then_body, else_body,
+                                                                i, want, discarded)))
+end shared_branch_type
+
+// The *then* branch, read in the condition's scope, for `i` 0, and the `else` for anything else.
+private branch_reading(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
+                       else_body: Buf[Stmt], i: usize, want: Option[Type], discarded: bool) -> TBlock
+    if i == 0 then return then_side(cx, span, cond, then_body, want, discarded).1
+
+    type_value_block(cx, else_body, want, discarded)
 
 // The `else` read first, where it is the branch that knows and the *then* is the one guessing.
 private early_else(cx: &Analyzer, else_body: Option[Buf[Stmt]], expected: Option[Type],
@@ -128,7 +168,8 @@ end then_side
 
 private else_branch(cx: &Analyzer, else_body: Option[Buf[Stmt]], early: Option[TBlock],
                     settled: Option[TBlock], then_block: TBlock, expected: Option[Type],
-                    else_guesses: bool, then_guesses: bool, discarded: bool) -> Option[TBlock]
+                    else_guesses: bool, then_guesses: bool, else_leans: bool,
+                    discarded: bool) -> Option[TBlock]
     if early.is_some() then return early
     if settled.is_some() then return settled
     if else_body.is_none() then return None
@@ -138,6 +179,13 @@ private else_branch(cx: &Analyzer, else_body: Option[Buf[Stmt]], early: Option[T
                                       else None)
 
     if want.is_some() then return Some(type_value_block(cx, b, want, discarded))
+
+    // A leaning `else` is offered what the *then* settled, and read on its own where it does not
+    // take it.
+    val offered = if else_leans then settles(then_block) else None
+    val took = offered.and_then(t -> attempt_block(cx, b, Some(t), discarded))
+
+    if took.is_some() then return took
 
     // The other order, and it needs the same held-over reading: with the *then* branch the one that
     // knows, an `else` that cannot stand alone takes what the *then* settled.
@@ -296,25 +344,76 @@ private analyze_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], expected: 
     var own: Buf[Option[TArm]] = buf()
 
     for i in 0..<arms.len()
-        if guessing(cx, arms.at(i).body) then own.push(None)
-        else own.push(attempt_arm(cx, scrut, arms.at(i), None, discarded))
+        val held = guessing(cx, arms.at(i).body) || leaning(cx, arms.at(i).body)
+
+        if held then own.push(None) else own.push(attempt_arm(cx, scrut, arms.at(i), None, discarded))
 
     // The first arm that settles anything is what the held-over ones are told. Where the arms that
     // know disagree among themselves this picks one of them, and the coverage check then reports
     // that disagreement -- which is the complaint the reader is owed, rather than one about an arm
     // that only ever repeated what it was handed.
-    var want: Option[Type] = None
+    var want = first_settled(own)
 
-    for i in 0..<own.len()
-        if want.is_none() && own.at(i).is_some() then want = settles(own.at(i).unwrap().body)
+    // Where nothing that knows settled anything, arms that each know a different part -- `(n, 0)`
+    // beside `(0, m)` -- may still have one type between them, found by offering each the last.
+    if want.is_none() && !discarded then want = shared_arm_type(cx, scrut, arms, discarded)
+
+    // An arm that knows its type only in part is offered what the knowing arms settled, and where
+    // none of them settled anything it is read on its own and may settle it for the guessing ones.
+    var read: Buf[Option[TArm]] = buf()
 
     for i in 0..<arms.len()
-        own.at(i) match
+        if leaning(cx, arms.at(i).body)
+            read.push(offered_arm(cx, scrut, arms.at(i), want, discarded))
+        else
+            read.push(own.at(i))
+
+    if want.is_none() then want = first_settled(read)
+
+    for i in 0..<arms.len()
+        read.at(i) match
             Some(t) -> out.push(t)
             None -> out.push(analyze_arm(cx, scrut, arms.at(i), want, discarded))
 
     out
 end analyze_arms
+
+// The type the shaped leaning arms of a match meet at, where there are two or more of them and
+// they come to one.
+private shared_arm_type(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], discarded: bool) -> Option[Type]
+    var shaped: Buf[MatchArm] = buf()
+
+    for i in 0..<arms.len()
+        if leaning(cx, arms.at(i).body) && shaped_value(arms.at(i).body) then shaped.push(arms.at(i))
+
+    if shaped.len() < 2 then return None
+
+    common_offer(shaped.len(), (i, want) -> trial(cx, () -> analyze_arm(cx, scrut, shaped.at(i), want,
+                                                                         discarded).body))
+end shared_arm_type
+
+// What the first arm read so far that settles anything settles.
+private first_settled(arms: Buf[Option[TArm]]) -> Option[Type]
+    for i in 0..<arms.len()
+        if arms.at(i).is_some()
+            val t = settles(arms.at(i).unwrap().body)
+
+            if t.is_some() then return t
+
+    None
+end first_settled
+
+// A leaning arm read against the type its siblings settled where it takes it, and on its own where
+// it does not or where nothing was settled.
+private offered_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, want: Option[Type],
+                    discarded: bool) -> Option[TArm]
+    if want.is_some()
+        val tried = attempt_arm(cx, scrut, arm, want, discarded)
+
+        if tried.is_some() then return tried
+
+    attempt_arm(cx, scrut, arm, None, discarded)
+end offered_arm
 
 // One arm in its own scope, so pattern bindings are visible to the guard and the body.
 // Alternatives may not bind, since the body cannot know which of them matched.
@@ -1098,13 +1197,123 @@ end const_int_of
 // A branch is a block, so what is asked about is the expression it ends in: `then 1` is a `1` and
 // nothing else, and a `1` is worth what the position it stands in says it is worth. Everything else
 // knows what it is before anything asks, and is therefore what the pair takes its type *from*.
-guessing(cx: &Analyzer, stmts: Buf[Stmt]) -> bool
-    if stmts.is_empty() then return false
+guessing(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = block_value(stmts) match
+    Some(e) -> guesses(cx, e)
+    None -> false
+
+// Whether a value block's value knows its type only **in part**: a construction with a guessing
+// part somewhere inside it, beside parts that know -- `(n, 0)`, `Some(0)`, `[x, 1]`.
+//
+// Such a branch is not told its sibling's type outright, as a guessing one is, because the part
+// that knows may disagree with it. It is *offered* the type: read against it where it takes it, and
+// read on its own where it does not, so the complaint is the one about the branches disagreeing.
+leaning(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = block_value(stmts) match
+    Some(e) -> !guesses(cx, e) && leans(cx, e)
+    None -> false
+
+// The expression a value block ends in, which is what a branch's type is asked of.
+private block_value(stmts: Buf[Stmt]) -> Option[Expr]
+    if stmts.is_empty() then return None
 
     *stmts.at(stmts.len() - 1).kind match
-        ExprStmt(e) -> is_literal(e) || typed_by_position(cx, e) || every_branch_guesses(cx, e)
+        ExprStmt(e) -> Some(e)
+        _ -> None
+end block_value
+
+// Whether a value block ends in a tuple or an array literal, the two constructions whose parts a
+// sibling's type is read against one by one.
+private shaped_value(stmts: Buf[Stmt]) -> bool = block_value(stmts) match
+    Some(e) -> *e.kind match
+        Tuple(_) -> true
+        ArrayLit(_) -> true
         _ -> false
-end guessing
+    None -> false
+
+// The one type every one of `n` branches can be read at, where there is one: the first is read on
+// its own, and each is then offered the type the last reading came to, until a whole round reads
+// every branch at the type it was offered. A branch knowing a part none of the others contradicts
+// moves the type to include it; two branches knowing different things about one part never settle,
+// and then there is no such type and the branches are read as they always were.
+private common_offer(n: usize, read_at: (usize, Option[Type]) -> Option[Type]) -> Option[Type]
+    var want = read_at(0, None)
+    var rounds: usize = 0
+
+    while want.is_some() && rounds <= n
+        var moved = false
+
+        for i in 0..<n
+            if !moved
+                val got = read_at(i, want)
+
+                if got.is_none() then return None
+
+                moved = !type_eq(got.unwrap(), want.unwrap())
+
+                if moved then want = got
+
+        if !moved then return want
+
+        rounds += 1
+
+    None
+end common_offer
+
+// A reading made only to learn the type it comes to, and then thrown away whole -- registrations,
+// closures and complaints alike. A reading that complained comes to nothing.
+private trial(cx: &Analyzer, read: () -> TBlock) -> Option[Type]
+    val said = cx.an.complaints()
+    val mark = cx.an.sandboxed()
+    val t = read()
+    val refused = cx.an.complaints() > said
+
+    cx.an.release(mark)
+    cx.an.restore_complaints(said)
+
+    if refused then None else settles(t)
+end trial
+
+// Whether an expression has no type of its own. A tuple or an array literal made of nothing but
+// such parts has none either, element by element and however deeply nested: `(0, 0)` is a pair of
+// whatever its sibling says, exactly as `0` is a number of whatever its sibling says.
+private guesses(cx: &Analyzer, e: Expr) -> bool
+    if is_literal(e) || typed_by_position(cx, e) || every_branch_guesses(cx, e) then return true
+
+    *e.kind match
+        Tuple(parts) -> all_guess(cx, parts)
+        ArrayLit(parts) -> all_guess(cx, parts)
+        ArrayFill(v, _) -> guesses(cx, v)
+        _ -> false
+end guesses
+
+private all_guess(cx: &Analyzer, parts: Buf[Expr]) -> bool
+    if parts.is_empty() then return false
+
+    for part in parts
+        if !guesses(cx, part) then return false
+
+    true
+end all_guess
+
+// Whether a guessing part stands anywhere inside a construction -- a tuple, an array literal, or
+// the arguments of a call, which is how a variant and a struct are built.
+private leans(cx: &Analyzer, e: Expr) -> bool
+    if guesses(cx, e) then return true
+
+    *e.kind match
+        Tuple(parts) -> any_leans(cx, parts)
+        ArrayLit(parts) -> any_leans(cx, parts)
+        ArrayFill(v, _) -> leans(cx, v)
+        Call(_, args) -> any_leans(cx, args)
+        NamedArg(_, v) -> leans(cx, v)
+        _ -> false
+end leans
+
+private any_leans(cx: &Analyzer, parts: Buf[Expr]) -> bool
+    for part in parts
+        if leans(cx, part) then return true
+
+    false
+end any_leans
 
 // An `if` whose every branch is guessing has no type of its own either. It is what the tail of an
 // `elif` chain is, the parser nesting each `elif` into the branch before it: in

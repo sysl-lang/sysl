@@ -278,6 +278,52 @@ f(0, 1)
 if branches have different types: int and usize
 ```
 
+**The rule reaches inside a construction, part by part.** A tuple or an array literal written out
+of literals has no type of its own either, so `(0, 0)` beside a `(u64, u64)` is a pair of `u64`s,
+however deeply the tuples nest. A construction that knows only some of its parts — `(n, 0)`,
+`Some(0)` — is *offered* the type its sibling settled, and two such branches that each know a
+different part meet at the type that has both:
+
+```sysl
+pair(ok: bool) -> Result[(u64, u64), int] = if ok then Ok((3, 4)) else Err(1)
+
+ends(ok: bool) -> u64
+    val (r, w) = pair(ok) match
+        Ok(both) -> both
+        Err(_) -> (0, 0)
+
+    r + w
+
+joined(n: u8, m: u16) -> u16
+    val t = if n < 3 then (n, 1) else (0, m)
+
+    u16(t.0) + t.1
+
+print(ends(true), ends(false), joined(1, 5), joined(7, 5))
+```
+
+```output
+7 0 2 5
+```
+
+A part that cannot be what the sibling says keeps its own type, and the branches are refused as
+two that disagree:
+
+```sysl
+f(n: u64)
+    val t = n match
+        1 -> (n, n)
+        _ -> (1, "a")
+
+    print(t.0)
+
+f(1)
+```
+
+```error
+match arms have different types: (ulong, ulong) and (ulong, string)
+```
+
 **A branch with nothing to go on is tried, not refused.** A nullary generic call has no argument to
 fix its type parameter from, so a branch like `empty()` cannot be read on its own — it is held over
 until its sibling has settled something, in either order and through an `elif` chain or a `match`'s

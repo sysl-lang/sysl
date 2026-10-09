@@ -1,0 +1,223 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A branch of an `if` or an arm of a `match` built out of literals takes its type from the sibling
+// that knows, element by element: `(0, 0)` beside a `(u64, u64)` is a pair of `u64`s exactly as `0`
+// beside a `u64` is one. A construction that knows only some of its parts -- `(n, 0)`, `Some(0)` --
+// is offered the sibling's type and read on its own where it does not take it. And a destructuring
+// binding may state the type of the whole value it takes apart, as a plain binding may.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private alt_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+
+private alt_write(main: string) -> string
+    val root = make_temp_dir("sysl-alt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+
+// What the program PRINTS, or what the build had to say about it.
+private alt_ran(main: string) -> string
+    val root = alt_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end alt_ran
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private alt_refused(main: string, message: string, at: string)
+    val root = alt_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(out.starts_with(s"error: $message\n --> ") || out.starts_with(s"error: $message\n  --> "),
+           s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+
+// -- a tuple of literals takes the sibling's type -------------------------------------------------
+
+@test("a tuple of literals in a match arm takes its type from the sibling arm")
+alt_the_keel_case()
+    if alt_skip() then return
+
+    assert_eq(alt_ran("""
+        pair(ok: bool) -> Result[(u64, u64), int] = if ok then Ok((u64(3), u64(4))) else Err(1)
+
+        show(ok: bool)
+            val (r, w) = pair(ok) match
+                Ok(ends) -> ends
+                Err(_) -> (0, 0)
+
+            print(r + w)
+
+        show(true)
+        show(false)
+        """), "7\n0\n")
+
+@test("element by element, however deeply the tuples nest")
+alt_nested_tuples()
+    if alt_skip() then return
+
+    assert_eq(alt_ran("""
+        f(n: u8) -> u8
+            val t = n match
+                1 -> ((0, 1), 2)
+                _ -> ((n, n), n)
+
+            (t.0).1 + t.1
+
+        print(f(1))
+        print(f(7))
+        """), "3\n14\n")
+
+@test("an array literal arm takes the sibling's element type")
+alt_an_array_arm()
+    if alt_skip() then return
+
+    assert_eq(alt_ran("""
+        f(n: u16) -> u16
+            val a = n match
+                7 -> [n, n]
+                _ -> [0, 1]
+
+            a[0] + a[1]
+
+        print(f(7))
+        print(f(2))
+        """), "14\n1\n")
+
+@test("an if and an elif chain read the tuple branches the same way")
+alt_if_and_elif()
+    if alt_skip() then return
+
+    assert_eq(alt_ran("""
+        f(n: u8) -> u8
+            val t = if n > 3 then (n, n) else (0, 1)
+            val c = if n > 9 then (0, 0) elif n > 5 then (1, 1) else (n, n)
+
+            t.1 + c.0
+
+        print(f(7))
+        print(f(2))
+        """), "8\n3\n")
+
+// -- a construction that knows part of its type ---------------------------------------------------
+
+@test("two branches that each know a different part meet at one type")
+alt_two_sided_parts()
+    if alt_skip() then return
+
+    assert_eq(alt_ran("""
+        f(n: u8, m: u16) -> u16
+            val t = if n < 3 then (n, 1) else (0, m)
+            val u = n match
+                1 -> (n, 0)
+                2 -> (0, 0)
+                _ -> (0, m)
+
+            u16(t.0) + t.1 + u.1
+
+        print(f(7, 5))
+        print(f(1, 5))
+        """), "10\n2\n")
+
+@test("a variant built over a literal takes the sibling's type argument")
+alt_a_variant_over_a_literal()
+    if alt_skip() then return
+
+    assert_eq(alt_ran("""
+        f(n: u8) -> u8
+            val s = if n < 3 then Some(n) else Some(0)
+
+            s.unwrap()
+
+        print(f(1))
+        print(f(9))
+        """), "1\n0\n")
+
+// -- what is still refused ------------------------------------------------------------------------
+
+@test("a tuple whose part cannot be the sibling's is refused as two arms that disagree")
+alt_a_real_mismatch()
+    if alt_skip() then return
+
+    alt_refused("f(n: u64) =\n    val t = n match\n        1 -> (n, n)\n        _ -> (1, \"a\")\n    print(t.0)\n",
+                "match arms have different types: (ulong, ulong) and (ulong, string)", "2:13")
+
+@test("two branches that know different things about one part still disagree")
+alt_a_part_known_twice()
+    if alt_skip() then return
+
+    alt_refused("f(n: u8, m: u16) =\n    val w = if n < 3 then (n, 0) else (m, 0)\n    print(w.1)\n",
+                "if branches have different types: (byte, int) and (ushort, int)", "2:13")
+
+// -- a destructuring binding may state its type ---------------------------------------------------
+
+@test("a destructuring binding states the type of the whole value")
+alt_annotated_destructure()
+    if alt_skip() then return
+
+    assert_eq(alt_ran("""
+        pair(ok: bool) -> Result[(u64, u64), int] = if ok then Ok((u64(3), u64(4))) else Err(1)
+
+        f(ok: bool) -> u64
+            val (r, w): (u64, u64) = pair(ok) match
+                Ok(ends) -> ends
+                Err(_) -> (0, 0)
+            var (a, b): (u64, u8) = (4000000000, 250)
+
+            b += 1
+            a + u64(b) + r * w
+
+        print(f(true))
+        print(f(false))
+        """), "4000000263\n4000000251\n")
+
+@test("a destructuring binding whose value does not fit the stated type is refused")
+alt_annotated_destructure_refused()
+    if alt_skip() then return
+
+    alt_refused("f() =\n    val (c, d): (u64, u64) = (5, \"x\")\n    print(c)\n",
+                "cannot initialize the parts of this binding: declared (ulong, ulong) but the value " +
+                "is (ulong, string)", "2:5")
+
+@test("and a stated type the pattern cannot take apart is refused by the pattern")
+alt_annotated_destructure_wrong_shape()
+    if alt_skip() then return
+
+    alt_refused("f() =\n    val (c, d): (u64, u64, u64) = (5, 6, 7)\n    print(c)\n",
+                "this pattern takes 2 parts, and a (ulong, ulong, ulong) has 3 parts to give it", "2:5")
