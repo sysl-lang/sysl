@@ -1,0 +1,391 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, is_file, make_dir_all, make_temp_dir, read_text, write_text}
+import sysl.text.{Search, from_utf8_unchecked, replace_all}
+
+// `sysl weave`: a literate source rendered as the document it already is -- the reference's
+// `WeaveTests`, every case of it, with the reference's assertions.
+//
+// **The command is not built here yet**: it renders Markdown, and that waits on the
+// `sysl-lang/markdown` package. So every case drives the command line -- which answers the usage
+// refusal today -- and is ignored until the command exists, when each one says what it has to do.
+//
+// **The load-bearing assertion is a round trip, not a golden file**: the code in the rendered
+// document is exactly the program the compiler reads, in order. A golden document would also break
+// on every edit to the prose it quotes. It is asked of the library's own literate module,
+// `sysl.regex`, as well as of the small cases, because the small cases are the ones somebody
+// thought of.
+
+// The class the document's sysl blocks open with.
+private wvx_open() -> string = "<pre><code class=\"language-sysl\">"
+
+// A literate source written into a scratch directory, and its path.
+private wvx_source(text: string) -> string
+    val dir = absolute_path(make_temp_dir("sysl-weave").unwrap())
+    val path = s"$dir/weave${LiterateExtension}"
+
+    write_text(path, text).unwrap()
+    path
+
+// What `sysl weave` wrote for `text`, asserted to have succeeded.
+private wvx_rendered(text: string) -> string
+    val (code, out, err) = clx_ran(["sysl", "weave", wvx_source(text)])
+
+    assert(code == Fine, err)
+    out
+
+// What `sysl weave` said when it was expected to refuse: the status is not success, and standard
+// error is handed back.
+private wvx_refused(args: []string) -> string
+    val (code, _, err) = clx_ran(args)
+
+    assert(code != Fine, "the command was expected to refuse")
+    err
+
+// Every line of a text, the newlines taken off.
+private wvx_lines(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var from: usize = 0
+
+    for k in 0..<text.bytes.len
+        if text.bytes[k] == u8('\n')
+            out.push(text[from..<k])
+            from = k + 1
+
+    if from < text.bytes.len then out.push(text[from..<text.bytes.len])
+
+    out
+end wvx_lines
+
+// The lines of a text that hold something.
+private wvx_nonblank(text: string) -> Buf[string]
+    val all = wvx_lines(text)
+    var out: Buf[string] = buf()
+
+    for i in 0..<all.len()
+        if !all.at(i).trim().is_empty() then out.push(all.at(i))
+
+    out
+end wvx_nonblank
+
+// The program a literate source holds, blank lines dropped -- what the compiler is handed.
+private wvx_program(path: string, text: string) -> Buf[string]
+    val program = tangle(source_of(path, text)).unwrap()
+
+    wvx_nonblank(from_utf8_unchecked(program.bytes))
+
+// A line of rendered code read back as the program wrote it: the highlighter's spans removed, then
+// the entities undone -- `&amp;` last, so a program that itself holds `&lt;` is not turned into one
+// holding `<` by a step meant to undo a different character's escaping.
+private wvx_strip(line: string) -> string
+    var kept: Buf[u8] = buf()
+    var inside = false
+
+    for k in 0..<line.bytes.len
+        val b = line.bytes[k]
+
+        if inside
+            if b == u8('>') then inside = false
+        elif b == u8('<')
+            inside = true
+        else
+            kept.push(b)
+
+    val bare = from_utf8_unchecked(kept.view())
+    val quoted = replace_all(replace_all(bare, "&quot;", "\""), "&#39;", "'")
+
+    replace_all(replace_all(replace_all(quoted, "&lt;", "<"), "&gt;", ">"), "&amp;", "&")
+end wvx_strip
+
+// The code inside the document's sysl blocks, blank lines dropped, the markup taken back off.
+// **Written out here rather than shared with the renderer**: a helper using the renderer's own idea
+// of where a block begins would agree with it by construction, which a round trip exists to rule out.
+private wvx_coded(document: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var at: usize = 0
+    var found = 0
+
+    loop
+        val opened = document.index_of_from(wvx_open(), at)
+
+        if opened.is_none() then break
+
+        val start = opened.unwrap() + wvx_open().bytes.len
+        val closed = document.index_of_from("</code></pre>", start)
+
+        assert(closed.is_some(), "a sysl block that never closes")
+
+        val stop = closed.unwrap()
+        val lines = wvx_lines(document[start..<stop])
+
+        found += 1
+
+        for i in 0..<lines.len()
+            val bare = wvx_strip(lines.at(i))
+
+            if !bare.trim().is_empty() then out.push(bare)
+
+        at = stop
+
+    assert(found > 0, "the document holds no sysl block")
+    out
+end wvx_coded
+
+// The library's own literate module, where the library is on disk.
+private wvx_regex() -> Option[string] = std_root() match
+    Ok(root) -> Some(s"$root/sysl/regex")
+    Err(_) -> None
+
+// Every literate source of a directory, as paths.
+private wvx_literate_in(dir: string) -> Buf[string]
+    val names = entries(dir).unwrap()
+    var out: Buf[string] = buf()
+
+    for i in 0..<names.len()
+        if is_literate(names.at(i)) then out.push(s"$dir/${names.at(i)}")
+
+    out
+end wvx_literate_in
+
+// The document a source is woven into, renamed as the driver names it: its directories dropped and
+// its extension made `.html`.
+private wvx_document_name(name: string) -> string
+    var base = name
+
+    loop
+        val slash = base.index_of("/")
+
+        if slash.is_none() then break
+
+        base = base[slash.unwrap() + 1..<base.bytes.len]
+
+    s"${base[0..<base.bytes.len - LiterateExtension.bytes.len]}.html"
+end wvx_document_name
+
+// The rendered document's code is the program, line for line.
+private wvx_round_trips(path: string)
+    val (code, out, err) = clx_ran(["sysl", "weave", path])
+
+    assert(code == Fine, s"$path did not render: $err")
+    assert_slice_eq(wvx_coded(out).view(), wvx_program(path, read_text(path).unwrap()).view())
+
+@test("the program is rendered as code and the prose as prose",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_program_as_code_prose_as_prose()
+    // The four columns are gone -- they were Markdown's way of saying "code" -- and the block carries
+    // the language they could not.
+    val out = wvx_rendered("# The greeting\n\nA program of one statement.\n\n    print(\"hi\")\n")
+
+    assert(out.contains("<h1 id=\"the-greeting\">The greeting</h1>"))
+    assert(out.contains("<p>A program of one statement.</p>"))
+    assert(out.contains(wvx_open()))
+    assert_slice_eq(wvx_coded(out).view(), ["print(\"hi\")"])
+
+@test("a blank line between two program lines stays inside one block",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_a_blank_line_stays_inside_one_block()
+    // Consecutive indented lines are one block whether or not there is air between them, so a
+    // function with a paragraph break in it renders as one block rather than two.
+    val out = wvx_rendered("Text\n\n    a()\n\n    b()\n")
+
+    assert_eq(out.count_of("class=\"language-sysl\""), 1)
+    assert_slice_eq(wvx_coded(out).view(), ["a()", "b()"])
+
+@test("the source reaches the renderer verbatim, so its Markdown is its own",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_the_source_reaches_the_renderer_verbatim()
+    val out = wvx_rendered("A *word* and a [link](https://sysl.sh).\n\n| a | b |\n|---|---|\n| 1 | 2 |\n")
+
+    assert(out.contains("<em>word</em>"))
+    assert(out.contains("<a href=\"https://sysl.sh\">link</a>"))
+    assert(out.contains("<table>"))
+
+@test("mathematics reaches the reader as mathematics",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_mathematics_reaches_the_reader()
+    // The delimiters are the contract between the renderer and the KaTeX script the page links: a
+    // change to either the other did not hear about leaves the equations set as TeX source.
+    val out = wvx_rendered("The area is $\\pi r^2$, and:\n\n$$\nE = mc^2\n$$\n")
+
+    assert(out.contains("<span class=\"math inline\">\\(\\pi r^2\\)</span>"))
+    assert(out.contains("<div class=\"math display\">\\[E = mc^2\\]</div>"))
+    assert(out.contains("katex.min.js"))
+    assert(out.contains("renderMathInElement"))
+
+@test("the code is coloured by the grammar the site uses",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_the_code_is_coloured_by_the_grammar()
+    // The spans are what the document's own stylesheet colours, so a reader needs no JavaScript for
+    // code -- the runtime dependency is mathematics and only mathematics.
+    val out = wvx_rendered("Text\n\n    // a note\n    val x = \"hi\"\n")
+
+    assert(out.contains("<span class=\"hl-keyword\">val</span>"))
+    assert(out.contains("<span class=\"hl-string\">"))
+    assert(out.contains("<span class=\"hl-comment\">// a note</span>"))
+
+@test("a grammar that would not parse would cost the colouring and not the document",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_a_bad_grammar_costs_the_colouring_only()
+    // The alternative to degrading is refusing to write a document over the styling of its code, and
+    // that trade is not close: the document is written, and carries its code, whatever the grammar.
+    val out = wvx_rendered("Text\n\n    print(\"hi\")\n")
+
+    assert(out.starts_with("<!doctype html>"))
+    assert_slice_eq(wvx_coded(out).view(), ["print(\"hi\")"])
+
+@test("the document carries its own styling and stands on its own",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_the_document_stands_on_its_own()
+    val out = wvx_rendered("# Title\n\n    print(\"hi\")\n")
+
+    assert(out.starts_with("<!doctype html>"))
+    assert(out.contains("<meta charset=\"utf-8\">"))
+    assert(out.contains("<style>"))
+    // A leaf artifact: something to open, move or mail, not a directory that has to stay together.
+    assert(!out.contains("<link rel=\"stylesheet\" href=\"style.css\">"))
+
+@test("both palettes answer the same names",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_both_palettes_answer_the_same_names()
+    // A colour is named once and the dark palette re-answers it, so the rules say what a thing is
+    // rather than what colour it is, and the two cannot drift apart.
+    val out = wvx_rendered("Text\n\n    print(\"hi\")\n")
+    val names = ["--bg", "--fg", "--code-bg", "--hl-keyword", "--hl-string", "--hl-comment",
+                 "--hl-number", "--hl-type", "--hl-function", "--hl-variable", "--hl-punctuation"]
+
+    assert(out.contains("prefers-color-scheme: dark"))
+
+    for i in 0..<names.len
+        assert_eq(out.count_of(s"${names[i]}:"), 2, s"${names[i]} is defined in both palettes")
+
+@test("every class the highlighter can emit is one the stylesheet colours",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_every_highlighter_class_is_coloured()
+    // The categories are the highlighter's and the rules are the stylesheet's, so a category added
+    // there would otherwise render as unstyled text and nothing would say so.
+    val out = wvx_rendered("Text\n\n    print(\"hi\")\n")
+    val categories = ["keyword", "string", "comment", "number", "type", "function", "variable",
+                      "punctuation"]
+
+    for i in 0..<categories.len
+        assert(out.contains(s".hl-${categories[i]}"), s"hl-${categories[i]} is styled")
+
+@test("for the library module written this way",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_the_round_trip_holds_for_the_library_module()
+    // `sysl.regex` is five literate files, so this is also the multi-file case: every one is woven
+    // and every one has to hold its own program.
+    val dir = wvx_regex() match
+        Some(d) -> d
+        None -> return
+
+    val files = wvx_literate_in(dir)
+
+    assert(files.len() > 0, "sysl.regex holds no literate source")
+
+    for i in 0..<files.len()
+        wvx_round_trips(files.at(i))
+
+@test("an ordinary program has no prose to render",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_an_ordinary_program_has_no_prose()
+    // Refused rather than rendered as a document with nothing in it: a `.sysl` file is all code.
+    val dir = absolute_path(make_temp_dir("sysl-weave").unwrap())
+
+    write_text(s"$dir/plain.sysl", "print(\"hi\")\n").unwrap()
+    assert(wvx_refused(["sysl", "weave", s"$dir/plain.sysl"]).contains("ordinary sysl program"))
+
+@test("a file the compiler refuses is not woven",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_a_refused_file_is_not_woven()
+    // The reading is shared with a compilation on purpose: a document woven out of a file the
+    // compiler refuses would document a program that does not exist.
+    wvx_refused(["sysl", "weave", wvx_source("Text\n\n\tprint(\"hi\")\n")])
+
+@test("a document is named for the source it came from",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_a_document_is_named_for_its_source()
+    // Its directories are dropped, so a nested tree lands flat rather than rebuilding itself under
+    // the output directory.
+    val dir = absolute_path(make_temp_dir("sysl-weave-named").unwrap())
+
+    make_dir_all(s"$dir/tree/nested").unwrap()
+    write_text(s"$dir/tree/nested/vm${LiterateExtension}", "Text\n\n    print(\"hi\")\n").unwrap()
+
+    val (code, _, err) = clx_ran(["sysl", "weave", s"$dir/tree", "-o", s"$dir/out"])
+
+    assert(code == Fine, err)
+    assert_eq(wvx_document_name(s"vm${LiterateExtension}"), "vm.html")
+    assert(is_file(s"$dir/out/vm.html"), "the document is not named for its source")
+
+@test("to standard output when there is nowhere else",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_to_standard_output()
+    val dir = wvx_regex() match
+        Some(d) -> d
+        None -> return
+
+    val path = s"$dir/vm${LiterateExtension}"
+    val (code, out, err) = clx_ran(["sysl", "weave", path])
+
+    assert(code == Fine, err)
+    assert(out.starts_with("<!doctype html>"))
+    assert_slice_eq(wvx_coded(out).view(), wvx_program(path, read_text(path).unwrap()).view())
+
+@test("to a file when it is asked to",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_to_a_file()
+    val dir = wvx_regex() match
+        Some(d) -> d
+        None -> return
+
+    val out = s"${absolute_path(make_temp_dir("sysl-weave-").unwrap())}/vm.html"
+    val (code, _, err) = clx_ran(["sysl", "weave", s"$dir/vm${LiterateExtension}", "-o", out])
+
+    assert(code == Fine, err)
+    assert(read_text(out).unwrap().contains("class=\"language-sysl\""))
+
+@test("one document per source when the path holds several",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_one_document_per_source()
+    // A woven document is a leaf artifact somebody opens, so the unit is the file that was written --
+    // a tree rendered end to end would put five modules under one title.
+    val dir = wvx_regex() match
+        Some(d) -> d
+        None -> return
+
+    val out = s"${absolute_path(make_temp_dir("sysl-weave-tree-").unwrap())}/regex"
+    val sources = wvx_literate_in(dir)
+    val (code, _, err) = clx_ran(["sysl", "weave", dir, "-o", out])
+
+    assert(code == Fine, err)
+    assert(sources.len() > 1, "sysl.regex holds one literate source or none")
+
+    // Every source got its own document, and each one is a whole page rather than a fragment.
+    for i in 0..<sources.len()
+        val document = s"$out/${wvx_document_name(sources.at(i))}"
+
+        assert(is_file(document), s"${sources.at(i)} -> $document")
+        assert(read_text(document).unwrap().starts_with("<!doctype html>"))
+
+@test("and refuses to put several documents on one stream",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_refuses_several_documents_on_one_stream()
+    // They cannot be told apart there, and concatenating them would make one file with several
+    // `<html>` elements in it.
+    val dir = wvx_regex() match
+        Some(d) -> d
+        None -> return
+
+    assert(wvx_refused(["sysl", "weave", dir]).contains("give '-o' a directory"))
+
+@test("and refuses a tree with no literate source in it",
+      ignore: "sysl weave waits on the sysl-lang/markdown package")
+wvx_refuses_a_tree_with_no_literate_source()
+    val dir = absolute_path(make_temp_dir("sysl-weave-plain-").unwrap())
+
+    write_text(s"$dir/main.sysl", "main() = print(1)\n").unwrap()
+    assert(wvx_refused(["sysl", "weave", dir]).contains(LiterateExtension))
