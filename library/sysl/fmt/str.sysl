@@ -1,0 +1,83 @@
+module sysl.fmt
+
+import sysl.buf.buf_with_capacity
+import sysl.text.from_utf8_unchecked
+
+/** A string rendered through a `%s` specifier, written here rather than handed to C's `snprintf`, so
+ * a target with no C library pads and cuts `${s}%-6s` exactly as a hosted one does.
+ *
+ * `spec` is the whole specifier, `%` to `s`; a `*` in it reads `width` or `precision`, as C's `*`
+ * does — a negative width left-justifies at its magnitude and a negative precision is as though none
+ * was written.
+ *
+ * The rendering is C's, byte for byte. **A width and a precision count bytes, not characters**: a
+ * width is the field's minimum length in bytes, and a precision the most bytes of the text the field
+ * takes, cut where it falls even inside a character. The text ends at its first NUL byte, as a C
+ * string does. `-` pads on the right; `0` pads a right-justified field with zeros, which is what
+ * Darwin's and musl's C libraries do with a flag the C standard leaves undefined for `%s`; `+`, a
+ * space and `#` change nothing.
+ */
+format_str(s: string, spec: string, width: int, precision: int) -> string
+    val b = spec.bytes
+    val last = b.len - 1
+    var i: usize = 1
+    var left = false
+    var zero = false
+
+    while i < last && (b[i] == u8('-') || b[i] == u8('+') || b[i] == u8(' ') || b[i] == u8('0') ||
+                       b[i] == u8('#'))
+        if b[i] == u8('-') then left = true
+        if b[i] == u8('0') then zero = true
+
+        i += 1
+
+    var w = 0
+
+    if i < last && b[i] == u8('*')
+        w = width
+        i += 1
+    else
+        while i < last && b[i] >= u8('0') && b[i] <= u8('9')
+            w = w * 10 + int(b[i] - u8('0'))
+            i += 1
+    end if
+
+    if w < 0
+        left = true
+        w = -w
+    end if
+
+    var p = -1
+
+    if i < last && b[i] == u8('.')
+        i += 1
+
+        if i < last && b[i] == u8('*')
+            p = if precision < 0 then -1 else precision
+        else
+            p = 0
+
+            while i < last && b[i] >= u8('0') && b[i] <= u8('9')
+                p = p * 10 + int(b[i] - u8('0'))
+                i += 1
+        end if
+    end if
+
+    val text = s.bytes
+    var n: usize = 0
+
+    while n < text.len && text[n] != 0 && (p < 0 || n < usize(p))
+        n += 1
+
+    val pad = if w > 0 && usize(w) > n then usize(w) - n else 0
+    val fill = if zero && !left then u8('0') else u8(' ')
+    var out = buf_with_capacity(n + pad, fill)
+
+    if !left then for _ in 0..<pad do out.push(fill)
+
+    out.extend(text[0..<n])
+
+    if left then for _ in 0..<pad do out.push(fill)
+
+    from_utf8_unchecked(out.view())
+end format_str
