@@ -1,0 +1,97 @@
+module sysl.process.hosted
+@requires(posix)
+
+import sysl.process.sys.{Text, ended_exited, ended_signalled, ended_timed_out}
+
+// `sysl.process.sys`'s hooks answered over a POSIX host -- `posix_spawn`, or `fork` and `exec` where
+// the C library is too old for a child's directory to be given to `posix_spawn`. **Call
+// `sysl.process` instead** -- nothing here is meant to be called: each function below exists to be
+// linked under a hook's symbol, and is public only because an `@export` may not be `private`.
+//
+// **Nothing imports this module, and nothing has to.** A hook a program reaches is answered by the
+// library's own supplier (`reference/ffi.md § A module may supply another module's extern`), and its
+// exports are `weak`, so a program answering a hook itself is the one the link keeps. It requires
+// `posix`, so a target without POSIX never takes it, and the bodies exist only on a hosted target: a
+// freestanding one has no C library to answer with, so there the program answers the hooks it reaches,
+// and one it leaves unanswered is refused by name when it is compiled.
+//
+// **What only C can answer is answered by `spawn.c` beside this file**: decoding a wait status, the
+// window between `fork` and `exec`, `posix_spawn`'s file actions, and the `PATH` search. Each of its
+// functions answers zero or an `errno`, and the hook here negates it.
+
+#if hosted
+// `errno` is a function on every platform this builds for, spelled per C library; see
+// `sysl.fs.hosted`, which reads it the same way.
+#if bsd
+private extern "__error" errno_location() -> *i32
+#elif android
+private extern "__errno" errno_location() -> *i32
+#else
+private extern "__errno_location" errno_location() -> *i32
+#endif
+
+private extern "sysl_proc_posix_start" c_start(program: *u8, program_len: usize, argv: *Text,
+                                               argc: usize, envp: *Text, envc: usize, inherit: int,
+                                               dir: *u8, dir_len: usize, in_fd: int, out_fd: int,
+                                               err_fd: int, pid: *i32, started_ms: *i64) -> int
+
+private extern "sysl_proc_posix_wait" c_wait(pid: i32, started_ms: i64, timeout_ms: i64,
+                                             code: *i32, sig: *i32, timed_out: *i32) -> int
+
+private extern "sysl_proc_posix_temp_path" c_temp_path(into: *u8, n: usize) -> int
+
+private extern "kill" c_kill(pid: i32, sig: int) -> int
+
+private extern "strlen" c_strlen(s: *u8) -> usize
+
+@export("sysl_proc_spawn")
+proc_spawn(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, envc: usize,
+           inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int, stderr_fd: int,
+           started: *i64) -> i64
+    var pid: i32 = 0
+    val e = c_start(path, path_len, argv, argc, envp, envc, inherit_env, dir, dir_len, stdin_fd,
+                    stdout_fd, stderr_fd, &pid, started)
+
+    if e != 0 then -i64(e) else i64(pid)
+end proc_spawn
+
+@export("sysl_proc_wait")
+proc_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int
+    var code: i32 = 0
+    var sig: i32 = 0
+    var expired: i32 = 0
+    val e = c_wait(i32(pid), started, timeout_ms, &code, &sig, &expired)
+
+    if e != 0 then return -e
+
+    // Asked before the other two, because a child stopped for running too long ended by a signal and
+    // would otherwise be reported as one.
+    if expired != 0
+        how[0] = ended_timed_out
+        value[0] = 0
+    elif sig != 0
+        how[0] = ended_signalled
+        value[0] = int(sig)
+    else
+        how[0] = ended_exited
+        value[0] = int(code)
+    end if
+
+    0
+end proc_wait
+
+@export("sysl_proc_kill")
+proc_kill(pid: i64, signal: int) -> int
+    if c_kill(i32(pid), signal) == 0 then return 0
+
+    val code = errno_location()[0]
+
+    if code > 0 then -int(code) else -1
+end proc_kill
+
+@export("sysl_proc_temp_path")
+proc_temp_path(into: *u8, room: usize) -> isize
+    val e = c_temp_path(into, room)
+
+    if e != 0 then -isize(e) else isize(c_strlen(into))
+#endif
