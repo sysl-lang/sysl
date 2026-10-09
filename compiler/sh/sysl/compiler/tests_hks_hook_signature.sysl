@@ -1,0 +1,180 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **An `@export` answering an `extern` of the same compilation is held to the extern's signature.**
+//
+// A library declares a hook as an `extern` naming a symbol nothing in it defines, and a program on a
+// bare target answers it with an `@export`. The linker joins the two by name and nothing else, so an
+// answer written against last release's signature links and then reads arguments nobody passed.
+// `emit_checks.sysl`'s `exports_answer_externs` compares the two where the compiler still has both.
+
+// An archive for a bare aarch64 machine, holding `program` as its one file.
+private hks_build(program: string) -> (int, string)
+    val root = lbr_tree(lbr_two("main.sysl", program, "package.hocon",
+                                "package { name = \"hks\", version = \"0.0.1\" }\n"))
+    val archive = s"$root/hks.a"
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root]
+    val said = lbr_cli(args[..])
+
+    lbr_drop([root])
+    said
+end hks_build
+
+// The opening every refusal of this kind shares, for the export `name` and the extern `ext`.
+private hks_lead(name: string, symbol: string, ext: string) -> string =
+    s"the exported '$name' defines '$symbol', which the 'extern' '$ext' declares — so every call " +
+    "through that declaration reaches this definition, and the linker joins the two by name alone. " +
+    "They have to agree: "
+
+// -- a library hook --------------------------------------------------------------------------------
+
+@test("an export answering sysl_proc_kill with a parameter too few is refused, naming the missing one")
+hks_a_parameter_too_few_is_refused()
+    if !lbr_ready() then return
+
+    val said = hks_build(raw"""
+        import sysl.process.sys.Text
+
+        @export("sysl_proc_kill")
+        k_kill(pid: i64) -> int = 0
+        """)
+
+    assert(said.0 != 0, "built with a hook answered at the wrong signature")
+    assert(said.1.contains(hks_lead("k_kill", "sysl_proc_kill", "sysl.process.sys.kill") +
+        "this one takes 1 parameter, but 'sysl.process.sys.kill' declares 2 — the declaration also " +
+        "has 'signal: int'"), said.1)
+end hks_a_parameter_too_few_is_refused
+
+@test("an export answering a hook with a parameter too many is refused, naming the extra one")
+hks_a_parameter_too_many_is_refused()
+    if !lbr_ready() then return
+
+    val said = hks_build(raw"""
+        import sysl.process.sys.Text
+
+        @export("sysl_proc_kill")
+        k_kill(pid: i64, signal: int, group: bool) -> int = 0
+        """)
+
+    assert(said.0 != 0, "built with a hook answered at the wrong signature")
+    assert(said.1.contains("this one takes 3 parameters, but 'sysl.process.sys.kill' declares 2 — " +
+        "'group: bool' is not in the declaration"), said.1)
+end hks_a_parameter_too_many_is_refused
+
+@test("an export answering a hook with a parameter of the wrong width is refused, naming it")
+hks_a_parameter_of_the_wrong_type_is_refused()
+    if !lbr_ready() then return
+
+    val said = hks_build(raw"""
+        import sysl.process.sys.Text
+
+        @export("sysl_proc_kill")
+        k_kill(pid: i32, signal: int) -> int = 0
+        """)
+
+    assert(said.0 != 0, "built with a hook answered at the wrong signature")
+    assert(said.1.contains(hks_lead("k_kill", "sysl_proc_kill", "sysl.process.sys.kill") +
+        "its parameter 1, 'pid', is int, where 'sysl.process.sys.kill' declares 'pid: long'"), said.1)
+end hks_a_parameter_of_the_wrong_type_is_refused
+
+@test("an export answering a hook with the wrong result is refused, naming both results")
+hks_the_wrong_result_is_refused()
+    if !lbr_ready() then return
+
+    val said = hks_build(raw"""
+        import sysl.process.sys.Text
+
+        @export("sysl_proc_kill")
+        k_kill(pid: i64, signal: int) -> i64 = 0
+        """)
+
+    assert(said.0 != 0, "built with a hook answered at the wrong signature")
+    assert(said.1.contains("this one returns long, where 'sysl.process.sys.kill' returns int"), said.1)
+end hks_the_wrong_result_is_refused
+
+@test("an export answering a hook with no result where it declares one is refused")
+hks_a_missing_result_is_refused()
+    if !lbr_ready() then return
+
+    val said = hks_build(raw"""
+        import sysl.process.sys.Text
+
+        @export("sysl_proc_kill")
+        k_kill(pid: i64, signal: int) = ()
+        """)
+
+    assert(said.0 != 0, "built with a hook answered at the wrong signature")
+    assert(said.1.contains("this one returns nothing, where 'sysl.process.sys.kill' returns int"),
+           said.1)
+end hks_a_missing_result_is_refused
+
+@test("an export answering a hook at exactly its signature builds, a second name for a type included")
+hks_an_exact_answer_builds()
+    if !lbr_ready() then return
+
+    val said = hks_build(raw"""
+        import sysl.process.sys.Text
+
+        type Pid = i64
+
+        @export("sysl_proc_kill")
+        k_kill(child: Pid, sig: int) -> int = 0
+        """)
+
+    assert_eq(said.0, 0, said.1)
+end hks_an_exact_answer_builds
+
+@test("an export whose symbol no extern names is not compared with anything")
+hks_an_export_no_extern_names_is_untouched()
+    if !lbr_ready() then return
+
+    val said = hks_build(raw"""
+        import sysl.process.sys.Text
+
+        @export("hks_kill")
+        k_kill(pid: i32) -> i64 = 0
+        """)
+
+    assert_eq(said.0, 0, said.1)
+end hks_an_export_no_extern_names_is_untouched
+
+// -- the program's own seam -------------------------------------------------------------------------
+
+@test("a program's own extern and its own export of one symbol are held to the same rule")
+hks_a_programs_own_pair_is_compared()
+    if !lbr_ready() then return
+
+    val said = hks_build(raw"""
+        extern "hks_hook" hook(fd: int, n: usize) -> isize
+
+        @export("hks_hook")
+        answer(fd: int, n: u64) -> isize = 0
+
+        @export("hks_call")
+        call() -> isize = hook(1, 2)
+        """)
+
+    assert(said.0 != 0, "built with an export disagreeing with its own extern")
+    assert(said.1.contains(hks_lead("answer", "hks_hook", "hook") + "its parameter 2, 'n', is ulong, " +
+        "where 'hook' declares 'n: usize'"), said.1)
+end hks_a_programs_own_pair_is_compared
+
+@test("a program's own extern and export agreeing builds")
+hks_a_programs_own_agreeing_pair_builds()
+    if !lbr_ready() then return
+
+    val said = hks_build(raw"""
+        extern "hks_hook" hook(fd: int, n: usize) -> isize
+
+        @export("hks_hook")
+        answer(fd: int, n: usize) -> isize = 0
+
+        @export("hks_call")
+        call() -> isize = hook(1, 2)
+        """)
+
+    assert_eq(said.0, 0, said.1)
+end hks_a_programs_own_agreeing_pair_builds

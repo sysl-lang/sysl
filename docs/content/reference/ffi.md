@@ -1116,6 +1116,33 @@ Three things it does **not** do:
 **A supplier's own body is followed**, so a supplier that itself calls an `extern` some third module
 answers pulls that one in as well.
 
+### The supplier is held to the declaration's signature
+
+The linker joins a declaration and a definition by the symbol and nothing else, so a supplier
+written against last release's signature — a hook that has since gained a parameter — would link
+and then read an argument nobody passed. The compiler has both signatures in hand, so **wherever one
+compilation holds an `extern` and an `@export` of the same symbol, the export must take what the
+extern declares**: the same number of parameters, each of the same type, the same result, and
+variadic on both sides or neither. A second name for a type — an alias, a measured `c type` — counts
+as the type it names, as it does everywhere else. It is asked of every export, reached or not, and
+the refusal sits at the export, naming the declaration and the first difference:
+
+```sysl
+extern "app_wall_us" wall_us() -> long
+
+@export("app_wall_us")
+rtc_wall_us() -> int = 0
+
+print(wall_us())
+```
+
+```error
+They have to agree: this one returns int, where 'wall_us' returns long
+```
+
+An export whose symbol no `extern` names is compared with nothing — it is a definition C calls, and
+its signature is whatever it says.
+
 ### Where the declaration is compiled is where the seam is decided
 
 The standard library ships as a prebuilt artifact on a hosted target, and it was compiled whole — so

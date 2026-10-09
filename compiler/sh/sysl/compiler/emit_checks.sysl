@@ -255,7 +255,136 @@ check_exports_emitted(a: &Analysis, p: TProgram, own: Buf[string])
     export_names(a, exported, storage_by_symbol(p.vals))
     export_storage(a, p, exported)
     stored_export_duplicates(a, p, exported)
+    exports_answer_externs(a, p)
 end check_exports_emitted
+
+// An `@export` defining a symbol an `extern` in the same compilation declares.
+//
+// **This is the one place the two sides of a seam meet with their types still attached.** A module
+// declares a hook as an `extern` and some other module answers it with an `@export`; the linker joins
+// them by name alone, so a definition taking two parameters fewer than the declaration links and then
+// reads registers nobody set. The compiler has both signatures in hand, so it holds the definition to
+// the declaration.
+//
+// **Every export is asked, reached or not**: an export is a root, and a supplier whose module nothing
+// imports is exactly the one a seam keeps. What counts as the same type is what counts everywhere
+// else -- a name-only subtype (a measured `c type`, an exported alias) is its base, at any depth.
+private exports_answer_externs(a: &Analysis, p: TProgram)
+    var symbols: Buf[string] = buf()
+    var keys: Buf[string] = buf()
+
+    for i in 0..<a.tables.externs.len()
+        val key = a.tables.externs.key_at(i)
+        val symbol = extern_symbol(a.tables.externs.at(i))
+
+        if !holds_string(symbols, symbol)
+            symbols.push(symbol)
+            keys.push(key)
+
+    if symbols.is_empty() then return
+
+    for f in p.funcs
+        if f.exported.is_none() then continue
+
+        for i in 0..<symbols.len()
+            if symbols.at(i) == f.exported.unwrap() then
+                export_against_extern(a, f, keys.at(i))
+end exports_answer_externs
+
+// One export against the `extern` its symbol names, reporting the first difference.
+private export_against_extern(a: &Analysis, f: TFunc, key: string)
+    val d = a.tables.externs.get(key).unwrap()
+    val home = a.tables.extern_scopes.get(key)
+
+    if home.is_none() then return
+
+    val scope = home.unwrap().scope
+    var wants: Buf[(string, Type)] = buf()
+
+    for p in d.params
+        wants.push((p.name, if written_va_list(p.typ) then Ptr(VaList)
+                            else resolve_type(a, scope, p.typ, no_bindings())))
+
+    var answer = Unit
+
+    if d.ret_type.is_some() then answer = resolve_result(a, scope, d.ret_type.unwrap(), no_bindings())
+
+    val sym = f.exported.unwrap()
+    val ext = qualified_name(key)
+    val lead = s"the exported '${qualified_name(f.name)}' defines '$sym', which the 'extern' '$ext' " +
+        "declares — so every call through that declaration reaches this definition, and the linker " +
+        "joins the two by name alone. They have to agree: "
+    val at = func_home(a, f.name)
+    val has = f.params.len()
+    val want = wants.len()
+
+    if has < want
+        a.fault(at, f.span, lead + s"this one takes $has parameter${plural_s(has)}, but '$ext' " +
+                s"declares $want — the declaration also has ${shown_params(wants, has)}")
+        return
+    end if
+
+    if has > want
+        val verb = if has - want == 1 then "is" else "are"
+
+        a.fault(at, f.span, lead + s"this one takes $has parameter${plural_s(has)}, but '$ext' " +
+                s"declares $want — ${shown_params(written_params(a, f), want)} $verb not in the " +
+                "declaration")
+        return
+    end if
+
+    val names = written_params(a, f)
+
+    for i in 0..<has
+        val mine = f.params.at(i).1
+        val theirs = wants.at(i).1
+
+        if !type_eq(repr(mine), repr(theirs))
+            a.fault(at, f.span, lead + s"its parameter ${i + 1}, '${names.at(i).0}', is " +
+                    s"${type_show(mine)}, where '$ext' declares '${wants.at(i).0}: ${type_show(theirs)}'")
+            return
+
+    if !(no_value(f.ret_ty) && no_value(answer)) && !type_eq(repr(f.ret_ty), repr(answer))
+        a.fault(at, f.span, lead + s"this one returns ${shown_result(f.ret_ty)}, where '$ext' " +
+                s"returns ${shown_result(answer)}")
+        return
+
+    if f.variadic != d.variadic
+        var which = s"this one is variadic and '$ext' is not"
+
+        if d.variadic then which = s"'$ext' is variadic and this one is not"
+
+        a.fault(at, f.span, lead + which)
+end export_against_extern
+
+// An exported function's parameters under the names its declaration wrote, which the typed tree has
+// made unique.
+private written_params(a: &Analysis, f: TFunc) -> Buf[(string, Type)]
+    val decl = a.tables.funcs.get(f.name)
+
+    if decl.is_none() || decl.unwrap().decl.params.len() != f.params.len() then return f.params
+
+    var out: Buf[(string, Type)] = buf()
+
+    for i in 0..<f.params.len()
+        out.push((decl.unwrap().decl.params.at(i).name, f.params.at(i).1))
+
+    out
+end written_params
+
+// The parameters from `from` on, as a declaration writes them: `'pgid: i64' and 'foreground: int'`.
+private shown_params(ps: Buf[(string, Type)], from: usize) -> string
+    var out = ""
+
+    for i in from..<ps.len()
+        if i > from then out = out + (if i + 1 == ps.len() then " and " else ", ")
+
+        out = out + s"'${ps.at(i).0}: ${type_show(ps.at(i).1)}'"
+
+    out
+end shown_params
+
+private shown_result(t: Type) -> string = if t == Unit then "nothing" else type_show(t)
 
 // Exported storage claiming a symbol something else exported here claims too -- another object, or a
 // function. One symbol is one definition whichever kind each is, and the linker would say so naming
