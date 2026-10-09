@@ -667,6 +667,40 @@ targets {
 }
 ```
 
+### A processor's extensions
+
+A row names an architecture, and the code generated for it uses only what that architecture
+guarantees. `aarch64-freestanding` is Armv8.0, so every atomic read-modify-write is a
+load-exclusive/store-exclusive loop — even on a core that has Armv8.1's LSE instructions and could do
+it in one `ldadd`. A project whose cores all have more says which, in the same block:
+
+```hocon
+codegen {
+  extensions = ["lse", "rcpc"]
+}
+```
+
+Each name is the extension as LLVM names the feature — `lse`, `rcpc`, `crc` on AArch64, `popcnt` or
+`bmi2` on x86_64, `zbb` on RISC-V — and it reaches the same places the settings do: the function
+attributes (`"target-features"="+lse,+rcpc"` on aarch64 and x86_64), every clang line, the standard
+module's artifact (whose directory name ends `-ext+lse+rcpc`) and the run cache. A target's own list
+**replaces** the project's for that machine, and an empty one, `extensions = []`, takes them away.
+**It is a list rather than a setting per extension** because the set of extensions is the back end's
+and moves with every LLVM release; the compiler asks the clang that will build the program whether it
+knows each name, once per build, and refuses one it does not — clang itself would only warn and build
+without it:
+
+```text
+error: 'codegen.extensions' names 'lsee', which the aarch64 back end does not know — an extension is
+spelled as LLVM spells the feature ('lse' or 'rcpc' on AArch64, 'popcnt' on x86_64, 'zbb' on RISC-V)
+```
+
+A name is written alone: `"+lse"` is refused, every entry being an extension the code may use, and so
+is `"lse,rcpc"`, one entry naming two. Turning the processor's own features *off* is not this list's
+job — `general_regs_only` is. Where both are given, `general_regs_only` wins: an extension that brings
+the SIMD registers with it is closed again. A machine whose code LLVM does not generate (`craft`)
+refuses the list.
+
 ### Only the root project's block applies
 
 What registers an image may touch is a property of the whole image, so a dependency cannot turn them
@@ -681,6 +715,9 @@ back on under its consumer, and its own `codegen` block is ignored, as its `opti
 | Thumb | refused — build for a row with no unit | `-mno-unaligned-access` |
 | RISC-V | refused — the F and D extensions are the triple's ABI | `-mstrict-align` |
 | wasm32 | refused | refused |
+
+`extensions` applies on every machine whose code LLVM generates, as `-target-feature` on each clang
+line and, on aarch64 and x86_64, in the function attribute too.
 
 A setting a machine has no meaning for is **refused**, before anything is built, rather than
 dropped. On Thumb the floating-point unit is part of the calling convention the row names, so turning

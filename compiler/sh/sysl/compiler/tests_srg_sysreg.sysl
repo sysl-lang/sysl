@@ -320,6 +320,89 @@ srg_two_reads_stay_two()
     assert_eq(srg_body(listing.unwrap(), "ack_twice").count_of("ICC_IAR1_EL1"), 2)
 end srg_two_reads_stay_two
 
+// Where `part` first stands in `text` at or after `from`, or the length of `text` where it does not.
+private srg_at(text: string, part: string, from: usize) -> usize = text[from..].index_of(part) match
+    Some(i) -> from + i
+    None -> text.len
+
+// That `body` is a store, then `op`, then a store -- each found after the one before it.
+private srg_store_op_store(body: string, op: string)
+    val first = srg_at(body, "str\t", 0)
+    val middle = srg_at(body, op, first)
+    val last = srg_at(body, "str\t", middle)
+
+    assert(first < body.len && middle < body.len && last < body.len,
+           s"expected a store, then '$op', then a store, in:\n$body")
+    assert_eq(body.count_of("str\t"), 2)
+
+// The ordering half of the forms: the compiler keeps program order around each, so a store written
+// before one is not sunk past it, a store after is not hoisted above it, and the first of two stores
+// to one word is not dropped as dead though nothing in between reads it. What the PROCESSOR may still
+// reorder -- an `msr` is not a memory access -- is the barriers' to say, and the page says which.
+@test("no store moves across a write_sysreg, a read_sysreg or a barrier, even at -O2")
+srg_forms_keep_program_order()
+    if !srg_ready() then return
+
+    val listing = srg_disassembly(raw"""
+        var flag: u64 = 0
+
+        @export("peek")
+        peek() -> u64 = flag
+
+        @export("publish")
+        publish(core: u64)
+            flag = 1
+            write_sysreg("icc_sgi1r_el1", core)
+            flag = 2
+
+        @export("observe")
+        observe() -> u64
+            flag = 3
+            val now = read_sysreg("cntvct_el0")
+            flag = 4
+            now
+
+        @export("fence")
+        fence()
+            flag = 5
+            dsb(ishst)
+            flag = 6
+        """, "2")
+
+    if listing.is_none() then return
+
+    val text = listing.unwrap()
+
+    srg_store_op_store(srg_body(text, "publish"), "msr\tICC_SGI1R_EL1")
+    srg_store_op_store(srg_body(text, "observe"), "mrs\t")
+    srg_store_op_store(srg_body(text, "fence"), "dsb\tishst")
+end srg_forms_keep_program_order
+
+// And the control: the same two stores with nothing between them are one, which is what makes the
+// test above able to fail. The values come from a parameter: with two constants alone the surviving
+// store leaves the word holding one of two values, and LLVM narrows such a global to a flag byte
+// written by `strb`, which is a store this count would not see.
+@test("two stores with nothing between them are one at -O2")
+srg_two_stores_alone_are_one()
+    if !srg_ready() then return
+
+    val listing = srg_disassembly(raw"""
+        var flag: u64 = 0
+
+        @export("peek")
+        peek() -> u64 = flag
+
+        @export("twice")
+        twice(v: u64)
+            flag = v
+            flag = v + 1
+        """, "2")
+
+    if listing.is_none() then return
+
+    assert_eq(srg_body(listing.unwrap(), "twice").count_of("str\t"), 1)
+end srg_two_stores_alone_are_one
+
 // The disassembly of one symbol: the lines after its `<name>:` header up to the blank line ending it.
 private srg_body(listing: string, name: string) -> string
     val lines = lines_of(listing)
