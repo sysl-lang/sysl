@@ -1753,6 +1753,8 @@ private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
         emit(e, ir_call(None, LVoid, VGlobal(llvm_sysreg_write()), ops))
         return VNothing
 
+    if op == "tlbi" || op == "dc" || op == "ic" || op == "at" then return gen_maintenance(e, op, name, args)
+
     val symbol = llvm_aarch64_barrier_entry(op).unwrap().base
     var params: Buf[IrParam] = buf()
 
@@ -1765,6 +1767,33 @@ private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
     emit(e, ir_call(None, LVoid, VGlobal(symbol), ops))
     VNothing
 end gen_sysop
+
+// A maintenance instruction -- `tlbi`, `dc`, `ic`, `at` -- as one block of inline assembly, LLVM having
+// no intrinsic for most of them. The block is `sideeffect` and clobbers memory, so it is neither moved
+// across a load or store nor merged with an identical one beside it. `at` reads its answer out of
+// PAR_EL1 in the same block, behind the `isb` the architecture asks for before that read.
+private gen_maintenance(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
+    var ops: Buf[IrArg] = buf()
+
+    if !args.is_empty()
+        val v = gen_expr(e, args.at(0))
+
+        ops.push(ir_arg(lty(e, texpr_type(args.at(0))), v))
+
+    if op == "at"
+        val r = fresh_reg(e)
+
+        emit(e, InAsm(Some(r), LInt(64), "at " + name + ", $1\\0Aisb\\0Amrs $0, par_el1",
+                      "=r,r,~{memory}", ops))
+        return r
+
+    if ops.is_empty()
+        emit(e, InAsm(None, LVoid, op + " " + name, "~{memory}", ops))
+    else
+        emit(e, InAsm(None, LVoid, op + " " + name + ", $0", "r,~{memory}", ops))
+
+    VNothing
+end gen_maintenance
 
 // The variant a written ordering names. `SeqCst` is what an unrecognised word falls to, which cannot
 // happen: the analyzer refuses anything that is not one of the five by name, so this is the total
