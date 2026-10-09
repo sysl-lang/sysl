@@ -795,11 +795,24 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
     // is refused before anything is built.
     val features = CodegenFeatures(
         general_regs_only_flag() || codegen_given(manifest, t.name, "general_regs_only"),
-        strict_align_flag() || codegen_given(manifest, t.name, "strict_align"))
+        strict_align_flag() || codegen_given(manifest, t.name, "strict_align"),
+        codegen_extensions(manifest, t.name))
 
     codegen_feature_refusal(t, features) match
         Some(why) -> return Err(Refusal(why))
         None -> ()
+
+    // An extension the back end does not know is only a warning from clang, after which the build
+    // goes on without it, so each name is asked of the clang that will build the program first.
+    if !features.extensions.is_empty()
+        val clang = find_clang(t, named_cc()) match
+            Err(why) -> return Err(Refusal(s"cannot check 'codegen.extensions': $why"))
+            Ok(found) -> found
+
+        extension_refusal(t, clang, features.extensions) match
+            Some(why) -> return Err(Refusal(why))
+            None -> ()
+    end if
 
     use_codegen_features(features)
 

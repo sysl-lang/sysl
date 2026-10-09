@@ -124,12 +124,17 @@ struct Manifest
     // whole image, so a dependency's block is read for its shape and otherwise ignored.
     codegen: Buf[(string, bool)]
     target_codegen: Buf[(string, string, bool)]
+
+    // The `extensions` list of the same blocks: the project's, `None` where it names none, and each
+    // target's own, which replaces the project's for that machine.
+    extensions: Option[Buf[string]]
+    target_extensions: Buf[(string, Buf[string])]
 end Manifest
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
-             buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf())
+             buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf(), None, buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -445,6 +450,7 @@ read_manifest(text: string) -> Result[Manifest, string]
 
     var target_capabilities: Buf[(string, string, bool)] = buf()
     var target_codegen: Buf[(string, string, bool)] = buf()
+    var target_extensions: Buf[(string, Buf[string])] = buf()
     var targets: Buf[(string, string)] = buf()
     var images: Buf[ImageLink] = buf()
 
@@ -478,10 +484,13 @@ read_manifest(text: string) -> Result[Manifest, string]
                 conf_at(entry, "codegen") match
                     None -> ()
                     Some(block) ->
-                        val settings = read_codegen(block, s"targets.${named.at(i)}.codegen")?
+                        val read = read_codegen(block, s"targets.${named.at(i)}.codegen")?
+                        val settings = read.0
 
                         for j in 0..<settings.len()
                             target_codegen.push((named.at(i), settings.at(j).0, settings.at(j).1))
+
+                        if read.1.is_some() then target_extensions.push((named.at(i), read.1.unwrap()))
 
     val dependencies = read_dependencies(root, "dependencies")?
     val dev = read_dependencies(root, "dev_dependencies")?
@@ -495,8 +504,8 @@ read_manifest(text: string) -> Result[Manifest, string]
     val lto = read_lto(root)?
     val bounds_locations = read_bounds_locations(root)?
 
-    val codegen = conf_at(root, "codegen") match
-        None -> buf()
+    val codegen_read = conf_at(root, "codegen") match
+        None -> (buf(), None)
         Some(block) -> read_codegen(block, "codegen")?
 
     val has_package = conf_at(root, "package").is_some()
@@ -516,7 +525,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
                 target_capabilities, pkg_config, headers, defines, targets, allocator, features,
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
-                images, codegen, target_codegen))
+                images, codegen_read.0, target_codegen, codegen_read.1, target_extensions))
 end read_manifest
 
 // The `bounds_locations` key: `true`, the default, or `false` to leave every failed bounds check's
@@ -537,25 +546,61 @@ end read_bounds_locations
 // A `codegen` block, at the top of the file or inside a `targets.<name>` block: each setting
 // `codegen_features.sysl` knows, `true` or `false`. **A name it does not know is refused rather than
 // warned about**, unlike a top-level key -- a misspelled `general_reg_only` would otherwise build an
-// image that touches the floating-point registers its author believed were off.
-private read_codegen(block: &Conf, where: string) -> Result[Buf[(string, bool)], string]
+// image that touches the floating-point registers its author believed were off. Beside the settings,
+// the `extensions` list, or `None` where the block names none.
+private read_codegen(block: &Conf,
+                     where: string) -> Result[(Buf[(string, bool)], Option[Buf[string]]), string]
     if !conf_is_block(block)
         return Err(s"'$where' is not a block — it is written 'codegen { general_regs_only = true }'")
 
     var out: Buf[(string, bool)] = buf()
+    var extensions: Option[Buf[string]] = None
     val keys = conf_keys(block)
 
     for i in 0..<keys.len()
+        if keys.at(i) == "extensions"
+            extensions = Some(read_extensions(conf_at(block, "extensions").unwrap(), s"$where.extensions")?)
+            continue
+        end if
+
         if !is_codegen_setting(keys.at(i))
             return Err(s"'$where.${keys.at(i)}' is not a code generation setting — the settings are " +
-                "'general_regs_only' and 'strict_align'")
+                "'general_regs_only', 'strict_align' and 'extensions'")
 
         *conf_at(block, keys.at(i)).unwrap() match
             Flag(on) -> out.push((keys.at(i), on))
             _ -> return Err(s"'$where.${keys.at(i)}' must be true or false")
 
-    Ok(out)
+    Ok((out, extensions))
 end read_codegen
+
+// The `extensions` list: names, each turned on. **A name carries no sign** -- every entry is an
+// extension the code may use, so a `+` says nothing and a `-` would be a list of what it may not,
+// which is what `general_regs_only` is for. Whether the back end knows the name is asked when a
+// build is made for a machine (`codegen_features.sysl`'s `extension_refusal`), since the answer is
+// that machine's.
+private read_extensions(value: &Conf, where: string) -> Result[Buf[string], string]
+    val bad = s"'$where' is a list of the processor's extensions, as LLVM names them — " +
+        "'extensions = [\"lse\"]'"
+
+    val names = conf_list(value) match
+        None -> return Err(bad)
+        Some(xs) -> xs
+
+    for name in names
+        if name == "" then return Err(bad)
+
+        if name.starts_with("+") || name.starts_with("-")
+            return Err(s"'$where' names '$name' — write the extension alone, " +
+                s"'${name[1..<name.len]}': every name in the list is one the code may use")
+
+        if name.contains(",") || name.contains(" ")
+            return Err(s"'$where' names '$name' — one extension to an entry, as " +
+                "'extensions = [\"lse\", \"rcpc\"]'")
+    end for
+
+    Ok(names)
+end read_extensions
 
 // What the manifest says about one code generation setting on the machine `target`: the target's
 // own `codegen` block over the project's, and off where neither says anything.

@@ -89,6 +89,9 @@ print("hinted")
 hinted
 ```
 
+A program wanting the hint itself calls [`sysl.sync.spin_hint()`](/library/sync/#spin_hint), which is
+this function with RISC-V's real `pause` in place of the `nop`.
+
 **Square brackets rather than a `match` arm's `->`.** Brackets are already what sysl writes around
 things resolved at compile time — a type parameter list, `Option[T]` — and the arrow is what it
 writes between a runtime pattern and its body. An architecture is not a value being tested: the arms
@@ -741,6 +744,49 @@ dc(cisw, 0)
 ```error
 'dc' takes one of the operations written here — civac, cvac, cvau, ivac, zva — and this is not one
 ```
+
+### What the compiler orders, and what the processor still needs
+
+**The compiler keeps program order around every one of these forms.** No load or store written
+before a `read_sysreg`, a `write_sysreg`, a barrier or a maintenance form is moved after it, none
+written after is moved before it, and a store is not dropped as dead because a second one to the same
+word follows — each is treated as touching all of memory. That is the whole of what the compiler can
+promise, because it is the whole of what the compiler controls.
+
+**The processor is another matter.** An `msr` is not a memory access, so no
+[`Ordering`](/library/sync/#ordering) — `Release`, `SeqCst`, a fence — orders a store before it: the
+C11 orderings relate memory accesses to memory accesses, and an AArch64 core may let the write to
+`icc_sgi1r_el1` raise its interrupt on another core before that core can see the store the interrupt
+is about. What orders memory against a register, or against the MMU, is a `dsb`, and its option says
+what has to be complete and where:
+
+```sysl build=c target=aarch64-freestanding
+import sysl.sync.*
+
+var work: u64 = 0
+
+@export("hand_over")
+hand_over(job: u64, target: u64)
+    atomic_store(&work, job, Release)
+    dsb(ishst)
+    write_sysreg("icc_sgi1r_el1", target)
+    isb()
+```
+
+| before | the barrier | why |
+|---|---|---|
+| a store another core reads once an interrupt this write raises arrives (an SGI) | `dsb(ishst)`, then the `msr` | the store completes in the inner shareable domain before the register is written |
+| a translation-table write the MMU will walk | `dsb(ishst)`, then `isb()` | the walker reads memory, not this core's store buffer |
+| a TLB invalidate | `tlbi(...)`, then `dsb(ish)` | the invalidation completes on every core |
+| Normal memory a device must see before a write to the device | `dmb(osh)`, or `dsb(osh)` where the write is to a register | a device sits in the outer shareable domain, which `ish` does not reach |
+| a write that changes the context — `vbar_el1`, `ttbr0_el1`, `sctlr_el1` | `isb()` after it | the instructions already fetched were fetched under the old context |
+
+**So the orderings and the barriers are not two tiers of one tool.** An `Ordering` is the portable
+answer between two threads touching memory; a barrier is the answer wherever one side is not a memory
+access, and only AArch64 spells it, which is why these forms are refused on every other processor.
+The forms take no `Ordering` argument for the same reason: the instruction that does the ordering is
+the barrier, and which barrier depends on what the register's effect observes, which no ordering
+names.
 
 ### On other processors
 

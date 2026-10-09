@@ -93,8 +93,10 @@ end snx_err
 // The LLVM text of the program with the library's bodies lowered beside it (nothing precompiled, as
 // `--no-std-lib` does) -- `SpinLock`'s methods are not generic, so with an artifact their bodies
 // would be declarations here and the orderings inside them unreadable.
-private snx_ir(body: string) -> string
-    val t = host_target()
+private snx_ir(body: string) -> string = snx_ir_for(body, host_target())
+
+// The same, for another machine.
+private snx_ir_for(body: string, t: Target) -> string
     var units: Buf[Program] = buf()
 
     std_root() match
@@ -119,7 +121,7 @@ private snx_ir(body: string) -> string
     if !said.is_empty() then return said.at(0).render()
 
     ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
-end snx_ir
+end snx_ir_for
 
 // Whether some line of `text` holds `before`, then a temporary (`%t<digits>`), then `after` -- the
 // shape `%t\d+` stands for in the reference's patterns, the numbers being the lowering's business.
@@ -431,3 +433,61 @@ snx_arithmetic_on_an_atomic_of_pointers_while_the_exchanges_on_one_work()
                          "the question the raw tier does not answer — use 'atomic_swap' or 'atomic_cas' " +
                          "to change a pointer"), out)
 end snx_arithmetic_on_an_atomic_of_pointers_while_the_exchanges_on_one_work
+
+// -- the spin-wait hint ------------------------------------------------------------------------------
+
+// `spin_hint()` is the machine's busy-wait hint and nothing else: a program calling it runs on.
+@test
+snx_spin_hint_is_callable_and_does_nothing_else()
+    snx_prints("var turns = 0\n\nwhile turns < 3\n    spin_hint()\n    turns += 1\n\nprint(turns)",
+               "3\n")
+end snx_spin_hint_is_callable_and_does_nothing_else
+
+// Each machine's own instruction, as one `asm sideeffect` -- and nothing at all on wasm.
+@test
+snx_spin_hint_is_each_machines_instruction()
+    if xvr_no_library() then return
+
+    val body = "spin_hint()"
+    val arm = snx_ir_for(body, target_named("aarch64-freestanding").unwrap())
+    val x86 = snx_ir_for(body, target_named("x86_64-linux").unwrap())
+    val rv = snx_ir_for(body, target_named("riscv32-freestanding").unwrap())
+    val thumb = snx_ir_for(body, target_named("thumbv6m-freestanding").unwrap())
+    val wasm = snx_ir_for(body, target_named("wasm32-freestanding").unwrap())
+
+    assert(snx_says(arm, "asm sideeffect \"yield\""), arm)
+    assert(snx_says(x86, "asm sideeffect \"pause\""), x86)
+    assert(snx_says(rv, "asm sideeffect \".insn i 0x0f, 0, x0, x0, 0x010\""), rv)
+    assert(snx_says(thumb, "asm sideeffect \"yield\""), thumb)
+    assert(snx_says(wasm, "spin_hint") && !snx_says(wasm, "asm sideeffect"), wasm)
+end snx_spin_hint_is_each_machines_instruction
+
+// `SpinLock.lock` hints on every round of its read-only spin, and only there: the exchange that
+// takes the lock is not delayed by it.
+@test
+snx_the_spinlock_hints_while_it_waits()
+    if xvr_no_library() then return
+
+    val out = snx_ir_for("var lk = SpinLock(0)\nlk.lock()\nlk.unlock()",
+                         target_named("aarch64-freestanding").unwrap())
+    var lock = ""
+    var inside = false
+
+    for line in split(out, "\n")
+        if line.starts_with("define ") && snx_says(line, "SpinLock.lock") then inside = true
+        elif inside && line == "}" then inside = false
+        elif inside then lock = lock + line + "\n"
+
+    assert(snx_says(lock, "spin_hint"), out)
+    assert(snx_says(lock, "load atomic i32") && snx_says(lock, "monotonic"), lock)
+end snx_the_spinlock_hints_while_it_waits
+
+@test
+snx_spin_hint_takes_nothing()
+    if xvr_no_library() then return
+
+    val out = snx_err("spin_hint(1)")
+
+    assert(snx_says(out, "error: function 'sysl.sync.spin_hint' takes 0 arguments, but 1 argument " +
+                         "was given"), out)
+end snx_spin_hint_takes_nothing
