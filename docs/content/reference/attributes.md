@@ -10,7 +10,7 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@lends`, `@noinline`, `@inline`, `@cold`, `@no_alloc` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@lends`, `@noinline`, `@inline`, `@cold`, `@no_alloc`, `@no_block`, `@blocks` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@borrows` | an **annotation** on a trait's method — see [`@borrows`](/reference/traits/#a-method-may-promise-to-borrow) | the grammar |
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; the one an `extern` takes | the grammar |
@@ -89,8 +89,8 @@ print(c.send(&n))
 7
 ```
 
-Beside them a member takes the four about the function it lowers to — `@noinline`, `@inline`, `@cold`
-and `@no_alloc`. Everything else is refused, and the line is what the annotation is **about** rather
+Beside them a member takes the six about the function it lowers to — `@noinline`, `@inline`, `@cold`,
+`@no_alloc`, `@no_block` and `@blocks`. Everything else is refused, and the line is what the annotation is **about** rather
 than where it is written. "A function" in the list above means a *free* function: what `sysl test` calls, what
 recurses, what a symbol names, how a type is laid out — none of which a member supplies.
 
@@ -1282,6 +1282,162 @@ print(f())
 
 ```error
 Above a function or a method, '@no_alloc' holds that one definition instead, and this declares neither
+```
+
+## `@no_block` and `@blocks` — a path that must never wait
+
+An interrupt handler may take a completion and wake a thread, and must never sleep: sleeping there
+switches away from an exception frame with the interrupt still unacknowledged. A real-time audio
+callback is held to the same rule by a deadline rather than by a machine. **`@no_block` is that
+promise, and `@blocks` marks what breaks it.** Above a function or a method, `@no_block` says the
+definition never waits; in a file's header it says it of every body in the module. Either way it is
+checked as `@no_alloc` is, **through every call the body makes**: a call that reaches a declaration
+marked `@blocks` is refused at the smallest piece of the body that still arrives there.
+
+```sysl
+struct WaitQueue
+    n: int
+
+    @blocks
+    sleep(*self) = self.n += 1
+
+read_sector(q: *WaitQueue) -> int
+    q.sleep()
+    1
+
+@no_block
+on_irq(q: *WaitQueue) -> int = read_sector(q) + 1
+
+var q = WaitQueue(0)
+print(on_irq(&q))
+```
+
+```error
+this reaches 'read_sector', which blocks through 'WaitQueue.sleep', and 'on_irq' declared '@no_block'
+```
+
+The refusal names the call the reader wrote and, after `through`, the declaration it arrives at —
+the line to change is the first, and the reason is the second. A body that keeps the promise compiles,
+and a sibling beside it may wait as much as it likes:
+
+```sysl
+struct WaitQueue
+    n: int
+
+    @blocks
+    sleep(*self) = self.n += 1
+
+@no_block
+take(n: int) -> int = n + 1
+
+drain(q: *WaitQueue) -> int
+    q.sleep()
+    q.n
+
+var q = WaitQueue(0)
+print(take(1), drain(&q))
+```
+
+```output
+2 1
+```
+
+**Whether something waits is declared, not inferred.** A C function's waiting is invisible to the
+compiler, and a sysl loop that spins until another thread moves cannot be told from a search, so
+`@blocks` is written where the waiting is: above a function, a method, or an `extern` whose C call
+waits.
+
+```sysl
+@blocks
+extern "usleep" c_usleep(us: u32) -> int
+
+@no_block
+nap() -> int = c_usleep(10)
+
+print(nap())
+```
+
+```error
+this reaches 'c_usleep', which blocks, and 'nap' declared '@no_block'
+```
+
+**The standard library marks its own waiting operations**: `sysl.posix.time`'s `sleep` and
+`nanosleep`, `Mutex.with` and `Mutex.lock_raw`, `Thread.join`, `Channel.send` and
+`Channel.receive`, `sysl.net`'s `Socket.connect`, `accept`, `send`, `send_all` and `recv` and
+`UdpSocket.send`, `send_to`, `recv` and `recv_from`, `Child.wait`, and the hooks a blocking read or
+write of a descriptor, a file or a socket goes through — so a promised body reaches none of them,
+however many calls away. `block_on`, which drives a task to its end on the calling thread, has no
+declaration to mark and counts as blocking all the same. A generic is named as it was declared, since the type argument says nothing about
+whether it waits:
+
+```sysl
+import sysl.posix.threads.Mutex
+
+f() -> int = 1
+
+@no_block
+guarded(m: *Mutex[int]) -> int = *m.lock_raw()
+
+print(f())
+```
+
+```error
+this reaches 'sysl.posix.threads.Mutex.lock_raw', which blocks, and 'guarded' declared '@no_block'
+```
+
+A call through a trait object reaches the implementation the body erased into it, as for `@no_alloc`.
+`try_with`, `try_lock_raw`, `try_send` and `try_receive` never wait and are not marked. A spin lock is not marked
+either: it waits only as long as another core holds it, which is what an interrupt handler's own locks
+are made of.
+
+**The rules for where it stands are `@no_alloc`'s.** Directly under the header the word is the
+module's clause, and a function there answers to it; a method may promise it; a function declared
+inside another may not, being a closure. `@blocks` takes no arguments and marks a function, a method
+or an `extern` function and nothing else — an `extern` variable is read rather than called:
+
+```sysl
+f() -> int = 1
+
+@blocks
+struct P
+    x: int
+
+print(f())
+```
+
+```error
+'@blocks' says a call may wait, so it marks a function, a method or an 'extern' — and this declares none of them
+```
+
+The two above one definition contradict each other:
+
+```sysl
+f() -> int = 1
+
+@blocks
+@no_block
+g() -> int = 2
+
+print(g())
+```
+
+```error
+'@blocks' says this definition may wait and '@no_block' that it never does
+```
+
+**Waiting is conduct, not a facility.** No machine takes it away, so `@no_block` has no
+`requires` beside it the way `@no_alloc` has `requires heap`, and `@requires(block)` and
+`@needs(block)` are refused:
+
+```sysl
+@needs(block)
+f() -> int = 1
+
+print(f())
+```
+
+```error
+'block' is what a module does, not something a machine has, and no machine takes it away
 ```
 
 ## `@tailrec` — an assertion that the frame is reused
@@ -2763,6 +2919,84 @@ print(count())
 
 ```error
 'n' is a local, and a local is already one call's
+```
+
+## `@domain(interrupt)` — a function entered on top of whatever was running
+
+An [`interrupt`](/reference/ffi/) handler is a function the processor enters directly, in the frame
+it pushed. Most kernels do not write one: a **vector table in assembly** saves the interrupted
+registers itself and then calls an ordinary function, exactly as C would. That function is
+`@export`ed, and an export is how C enters sysl at all — almost always on the program's one thread —
+so nothing about it says a second domain exists.
+
+**`@domain(interrupt)` says so.** It changes nothing about how the function is called; it makes the
+function a root of the interrupt domain, held to what an `interrupt` handler is held to: every count
+it reaches, however many calls down, has to be atomic
+([memory § Module storage reached from another domain](/reference/memory/#module-storage-reached-from-another-domain)).
+
+```sysl build=c target=aarch64-freestanding
+import sysl.sync.Atomic
+
+var done: Atomic[u32] = Atomic(0)
+
+@domain(interrupt)
+@export("disk_irq")
+disk_irq()
+    done.store(1)
+
+@export("disk_wait")
+disk_wait()
+    while done.load() == 0 do ()
+```
+
+The handler and the program share one word, and every touch of it is one atomic instruction. A
+handler that reaches a counted reference instead is refused at the handler, naming what it reached:
+
+```sysl build=c target=aarch64-freestanding
+struct Request
+    sector: u64
+
+var pending: Option[&Request] = None
+
+@domain(interrupt)
+@export("disk_irq")
+disk_irq()
+    pending = None
+```
+
+```error
+'disk_irq' is entered in the 'interrupt' domain, on top of whatever was running, so every count it reaches has to be atomic — but the module storage 'pending' it reaches holds a '&Request' in its 'Some(value)', whose count is not. Hold it as a '&sync Request' ('06')
+```
+
+A **waker** is the case a kernel meets first, and it has no atomic spelling at all — see
+[async § A task that parks stays in its domain](/reference/async/#a-task-that-parks-stays-in-its-domain).
+
+### It names one domain, and `interrupt` is the one there is
+
+```sysl
+@domain(thread)
+worker() = ()
+```
+
+```error
+'thread' is not a domain a function is entered in — 'interrupt' is the one there is
+```
+
+A function the program calls itself is in the program's own domain and says so by not writing the
+annotation, so there is no empty form, and a function the processor may enter in either of two is
+entered in the stricter, so there is no list.
+
+### It is not `async`
+
+Whatever enters the function calls it directly, and calling an `async` function only makes its task:
+
+```sysl
+@domain(interrupt)
+async on_irq() = ()
+```
+
+```error
+a function entered in the 'interrupt' domain cannot be 'async': whatever enters it calls it directly, and calling an async function only makes its task, which nothing there can drive
 ```
 
 ## `#if` — gating lines before the lexer
