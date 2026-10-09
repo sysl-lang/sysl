@@ -1,7 +1,11 @@
 module sysl.fs
 @requires(os)
 
+<<<<<<< HEAD
 import sysl.fs.sys as fsys
+=======
+import sysl.sys.UNSUPPORTED
+>>>>>>> origin/census-35
 import sysl.text.from_utf8_lossy
 
 /** What a filesystem call reports when it does not succeed, and the one number it comes from.
@@ -55,6 +59,12 @@ enum IoError
     Interrupted
     NotOpen
 
+    /** The operation is not one this process may perform at all (`EPERM`, code 1) -- a different
+     * condition from `PermissionDenied`, which is a file whose mode or owner refuses this process
+     * (`EACCES`, code 13). A hook status of `-1` is this case.
+     */
+    NotPermitted
+
     /** Bytes that had to be text and are not UTF-8: a file `read_text` was asked for, a name in a
      * listing `entries` was asked for, a path the platform handed back. `offset` is the byte at which
      * the decode stopped, counted from the start of whatever was being decoded -- the file, or the one
@@ -84,6 +94,7 @@ enum IoError
         NoSpaceLeft      -> 28
         Interrupted      -> 4
         NotOpen          -> 9
+        NotPermitted     -> 1
         InvalidUtf8(_)   -> ilseq()
         Other(c)         -> c
 
@@ -109,7 +120,8 @@ enum IoError
         NoSpaceLeft       -> "no space left on the device"
         Interrupted       -> "interrupted"
         NotOpen           -> "the file is not open"
-        InvalidUtf8(at)   -> s"not UTF-8 at byte $at"
+        NotPermitted      -> "operation not permitted"
+        InvalidUtf8(at)  -> s"not UTF-8 at byte $at"
         Other(c)          -> system_text(c)
 end IoError
 
@@ -125,10 +137,15 @@ private system_text(code: int) -> string
     var into: [256]u8 = [0; 256]
     var got: usize = 0
 
-    if fsys.error_text(code, &into[0], 256, &got) == 0
+    val at: *u8 = &into[0]
+
+    // The length is the supplier's word and is held to the room it was given; the view is then taken
+    // through the pointer, so a bare image reaching this carries no bounds failure, which would ask it
+    // for a `putchar` and an `exit` merely to say what an error number means.
+    if fsys.error_text(code, at, 256, &got) == 0
         if got > 256 then got = 256
 
-        return from_utf8_lossy(into[0..<got])
+        return from_utf8_lossy(at[0..<got])
 
     agreed_words(code) match
         Some(words) -> words
@@ -248,8 +265,10 @@ impl Display for IoError
 private[sysl] from_errno(code: int) -> IoError
     if code == 2 then
         NotFound
-    elif code == 13 || code == 1 then     // EACCES, and EPERM which a caller cannot tell apart
+    elif code == 13 then
         PermissionDenied
+    elif code == 1 then
+        NotPermitted
     elif code == 17 then
         AlreadyExists
     elif code == 20 then
@@ -270,23 +289,32 @@ private[sysl] from_errno(code: int) -> IoError
         Other(code)
 end from_errno
 
-/** A hook's status as the `Result` the rest of the module speaks in: zero is success, and anything
- * else is the code of the error, turned back into its case here and nowhere else (`sysl.fs.sys`).
+/** A hook's failure status as the `IoError` it stands for, turned back into its case here and nowhere
+ * else (`sysl.fs.sys`). A status is the error's code negated, as a system call answers it, so 13 comes
+ * back as `PermissionDenied` and -1 as `EPERM`, which is `NotPermitted`. **Exactly
+ * `UNSUPPORTED` (`sysl.sys`) is the target saying it cannot do the call at all** and is
+ * `unsupported()`; no other status is.
  */
-private[sysl] answered(code: int) -> Result[unit, IoError] = if code != 0 then Err(from_errno(code)) else Ok(())
+private[sysl] from_status(status: int) -> IoError =
+    if status == UNSUPPORTED then unsupported() else from_errno(-status)
+
+/** A hook's status as the `Result` the rest of the module speaks in: zero is success, and anything
+ * else is the error's code negated, turned back into its case by `from_status`.
+ */
+private[sysl] answered(status: int) -> Result[unit, IoError] = if status != 0 then Err(from_status(status)) else Ok(())
 
 /** What an operation reports where **this target has no way to perform it at all** -- not a failure
  * of the call, but the absence of one.
  *
- * It carries **-1**, which no `errno` is: every code the platforms report is positive, so this
- * cannot be confused with one and cannot collide with a code a later platform adds. Naming a real
- * code would have been worse than useless -- `ENOSYS` is 78 on macOS and 38 on Linux, and neither
- * number means anything on a target that has neither header.
+ * It carries `sysl.sys.UNSUPPORTED`, a negative number that is no `errno` on any platform, so it
+ * cannot be confused with a code a host reports. It is deliberately not the host's `ENOSYS`, which
+ * is 78 on macOS and 38 on Linux: the contract means one thing everywhere, and the hosted suppliers
+ * translate the host's own into it.
  *
- * It is what a hook of `sysl.fs.sys` answers for a call its supplier has no way to make, and what
- * reaches a caller as `from_errno(-1)`: a target whose C library has no `chmod`, or a program on a
- * bare machine answering for a filesystem that has no links.
+ * It is what a hook of any `*.sys` module answers for a call its supplier has no way to make, and
+ * what reaches a caller as `from_status(UNSUPPORTED)`: a target whose C library has no `chmod`, or a
+ * program on a bare machine answering for a filesystem that has no links.
  */
-private[sysl] unsupported() -> IoError = Other(unsupported_code)
+private[sysl] unsupported() -> IoError = Other(UNSUPPORTED)
 
-private const unsupported_code: int = -1
+private const unsupported_code: int = UNSUPPORTED

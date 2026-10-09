@@ -224,48 +224,25 @@ enf_a_nested_helper_has_no_address() =
                 "travel beside the address is the frame it reads, and a '*extern' is one word. A " +
                 "top-level function is what has an address")
 
-@test("and may not be generic, the refusal naming the binding that made it nested")
-enf_a_nested_helper_may_not_be_generic() =
-    enf_refused("val base = 2\nscaled[T](n: T) -> int = base\nprint(str(scaled(1)))\n",
-                "error: 'scaled' reads 'base', which the entry file's statements bind, so it is a nested " +
-                "function of them, and a nested function cannot be generic — it is lowered once, into " +
-                "the frame it reads. Declaring 'base' 'static', with its type, makes it the module's and " +
-                "leaves 'scaled' an ordinary function that may be generic; otherwise take the type " +
-                "parameters off 'scaled'")
+@test("and may still be generic, instantiated at each type it is called at")
+enf_a_nested_helper_may_be_generic() =
+    enf_prints("val base = 2\nscaled[T](n: T) -> int = base\nprint(str(scaled(1) + scaled(\"x\")))\n",
+               "4\n")
 
-// The case the keel kernel met: a generic helper counting failures into a `var` of the body. The
-// refusal is the one thing said -- neither the binding it reads nor the calls to it are reported as
-// names standing for nothing.
-@test("a generic helper reading a 'var' of the body is refused once, naming the 'var'")
-enf_a_generic_helper_reading_a_var_is_refused_once()
-    if !enf_ready() then return
+// The case the keel kernel met: a generic helper counting failures into a `var` of the body.
+@test("a generic helper reading a 'var' of the body counts into it")
+enf_a_generic_helper_reading_a_var() =
+    enf_prints("var failures = 0\n\nfailed[T](r: Result[T, int])\n" +
+               "    if !r.is_ok() then failures += 1\n\n" +
+               "val r: Result[string, int] = Err(1)\nval q: Result[bool, int] = Err(2)\n" +
+               "failed(r)\nfailed(q)\nprint(failures)\n", "2\n")
 
-    val out = enf_outcome([("", "main.sysl",
-                            "var failures = 0\n\nfailed[T](r: Result[T, int])\n" +
-                            "    if !r.is_ok() then failures += 1\n\n" +
-                            "val r: Result[string, int] = Err(1)\nfailed(r)\nprint(failures)\n")])
+@test("one nested only through the sibling it calls is generic too")
+enf_a_generic_helper_calling_a_nested_one() =
+    enf_prints("var seen = 0\nnote()\n    seen += 1\n\nnoted[T](x: T) -> T\n    note()\n    x\n\n" +
+               "print(noted(1))\nprint(noted(\"a\"))\nprint(seen)\n", "1\na\n2\n")
 
-    assert(!out.1, s"it ran: ${out.0}")
-    assert(out.0.contains("error: 'failed' reads 'failures', which the entry file's statements bind, " +
-                          "so it is a nested function of them, and a nested function cannot be " +
-                          "generic — it is lowered once, into the frame it reads. Declaring " +
-                          "'failures' 'static', with its type, makes it the module's and leaves " +
-                          "'failed' an ordinary function that may be generic; otherwise take the " +
-                          "type parameters off 'failed'"), out.0)
-    assert(!out.0.contains("undefined"), out.0)
-end enf_a_generic_helper_reading_a_var_is_refused_once
-
-@test("one nested only through the sibling it calls is told which sibling")
-enf_a_generic_helper_calling_a_nested_one_is_told_which() =
-    enf_refused("var seen = 0\nnote()\n    seen += 1\n\nnoted[T](x: T) -> T\n    note()\n    x\n\n" +
-                "print(noted(1))\n",
-                "error: 'noted' calls 'note', which reads what the entry file's statements bind, so " +
-                "'noted' is a nested function of them too, and a nested function cannot be generic — " +
-                "it is lowered once, into the frame it reads. Declaring what 'note' reads 'static', " +
-                "with its type, makes it the module's and leaves 'noted' an ordinary function that " +
-                "may be generic; otherwise take the type parameters off 'noted'")
-
-@test("and the 'static' the refusal names makes it generic at as many types as it is called at")
+@test("and a 'static' binding leaves it a module function, generic at as many types as it is called at")
 enf_a_static_binding_leaves_the_helper_generic() =
     enf_prints("static var failures: int = 0\n\nfailed[T](r: Result[T, int])\n" +
                "    if !r.is_ok() then failures += 1\n\n" +

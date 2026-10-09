@@ -598,6 +598,55 @@ instantiate_func(a: &Analysis, home: Scope, f: FuncDecl, solved: Buf[Type], cons
     name
 end instantiate_func
 
+// The same for a generic NESTED function, whose instantiation is one more member of the environment
+// its group shares: the environment is the first parameter, and the parameters are read with the
+// frame's type parameters still standing for what they did where the group was written.
+//
+// `solved` answers the frame's type parameters first and the function's own after them
+// (`nested.sysl`'s `callable_decl`). **Only the function's own reach the name**: the base already
+// carries the environment's number, which no other frame shares, so two functions each declaring a
+// nested `id[T]` and calling it at `int` have two instantiations.
+instantiate_nested(a: &Analysis, base: string, g: &NestedGeneric, solved: Buf[Type]) -> string
+    val own = g.decl.tparams.len()
+    var picked: Buf[Type] = buf()
+
+    for i in (solved.len() - own)..<solved.len()
+        picked.push(solved.at(i))
+
+    val targs = nameless_all(picked)
+    val name = s"${mangled(base, targs)}${tag_of(targs)}"
+
+    a.tables.nested_generics.put(name, g)
+
+    if g.decl.const_fn then a.tables.const_fns.put(name, true)
+    if a.tables.members.func_insts.has(name) then return name
+
+    var subst: Buf[Binding] = buf()
+
+    for i in 0..<own
+        subst.push(Binding(g.decl.tparams.at(i), targs.at(i)))
+
+    for b in g.outer
+        subst.push(b)
+
+    var params: Buf[(string, Type)] = buf()
+
+    params.push(("self", Ptr(Struct(g.frame.env))))
+
+    for p in g.decl.params
+        params.push((p.name, resolve_type(a, g.frame.scope, p.typ, subst)))
+
+    var ret = Unit
+
+    if g.decl.ret_type.is_some() then
+        ret = declared_result_type(Some(resolve_result(a, g.frame.scope, g.decl.ret_type.unwrap(), subst)))
+
+    a.tables.members.func_insts.put(name, FuncSig(params, ret))
+    a.tables.members.func_substs.put(name, subst)
+    a.tables.members.pending.push(PendingInst(name, g.decl, subst, g.frame.scope))
+    name
+end instantiate_nested
+
 // A receiver's type with its view made read-only, through whatever mode the sigil asked for.
 private const_receiver(t: Type) -> Type = t match
     Ptr(inner) -> Ptr(const_receiver(*inner))

@@ -51,14 +51,15 @@ enum_membership(e: *Emit, en: Type, vt: Type, v: Val) -> Val
         Integer(b, s, _) -> (b, s)
         _ -> (64, true)
 
-    // A discriminant is a signed 64-bit number, so the comparison is made where the VALUE fits as a
-    // signed number too: at 64 bits for every source that does, and wider for a `u64` -- whose top
-    // half would otherwise read as negative and match `-1` -- or a 128-bit integer, whose high bits a
-    // narrowing to 64 would throw away.
-    val room = if signed then vbits else vbits + 1
+    // The comparison is made where the VALUE and every DISCRIMINANT both fit as signed numbers: at 64
+    // bits for every source and every tag that does, and wider for a `u64` -- whose top half would
+    // otherwise read as negative and match `-1` -- or a 128-bit integer, whose high bits a narrowing
+    // to 64 would throw away. A tag past `long` (a `u64` or `u128` enum's top values) widens it for the
+    // same reason: at 64 bits `u64::MAX` is the pattern of `-1`, which a signed source must not match.
+    val vs = d.unwrap().variants
+    val room = max_room(if signed then vbits else vbits + 1, tag_room(vs))
     val w = if room <= 64 then 64 else if room <= 128 then 128 else room
 
-    val vs = d.unwrap().variants
     val wide = convert(e, vt, Integer(w, signed, false), v)
 
     // **EVERY COMPARISON IS MADE BEFORE ANY OF THEM IS FOLDED**, which is the same rule an array
@@ -71,7 +72,7 @@ enum_membership(e: *Emit, en: Type, vt: Type, v: Val) -> Val
     for item in vs
         val eq = fresh_reg(e)
 
-        emit(e, InIntCmp(eq, IEq, LInt(w), wide, VInt(from_int(long(item.tag)))))
+        emit(e, InIntCmp(eq, IEq, LInt(w), wide, VInt(item.tag)))
         eqs.push(eq)
 
     var any = VBool(false)
@@ -81,6 +82,20 @@ enum_membership(e: *Emit, en: Type, vt: Type, v: Val) -> Val
 
     any
 end enum_membership
+
+private max_room(a: int, b: int) -> int = if a >= b then a else b
+
+// The signed width every discriminant fits in: 64 for any tag a `long` holds, which is every tag of
+// every enum below `u64` and the small ones of `u64` and 128-bit enums too.
+private tag_room(vs: Buf[EnumVariant]) -> int
+    var room = 64
+
+    for item in vs
+        if !fits(item.tag, room, true)
+            room = if fits(item.tag, 128, true) then 128 else 129
+
+    room
+end tag_room
 
 // `Colour(n)` — the checked cast. The same membership test as `try`, but a miss stops the program,
 // and the integer is then narrowed or widened into the enum's own representation: a value of
@@ -172,13 +187,12 @@ gen_enum_try(e: *Emit, value: TExpr, en: Type, opt_ty: Type, some: EnumVariant,
 end gen_enum_try
 
 enum_value(e: *Emit, en: Type, d: &EnumType, v: EnumVariant, vals: Buf[Val]) -> Val
-    if d.simple then return VInt(from_int(long(v.tag)))
+    if d.simple then return VInt(v.tag)
 
     if !v.carries
         val tagged = fresh_reg(e)
 
-        emit(e, InInsert(tagged, enum_lty(d), VUndef, l_i32(), VInt(from_int(long(v.tag))),
-                         index_list(0)))
+        emit(e, InInsert(tagged, enum_lty(d), VUndef, l_i32(), VInt(v.tag), index_list(0)))
         return tagged
 
     var payload: Val = VUndef
@@ -193,7 +207,7 @@ enum_value(e: *Emit, en: Type, d: &EnumType, v: EnumVariant, vals: Buf[Val]) -> 
 
     val slot = scratch_slot(e, enum_lty(d))
 
-    emit(e, InStore(l_i32(), VInt(from_int(long(v.tag))), slot, AccPlain, None))
+    emit(e, InStore(l_i32(), VInt(v.tag), slot, AccPlain, None))
 
     val p = payload_ptr(e, d, slot)
 

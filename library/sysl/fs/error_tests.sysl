@@ -3,6 +3,7 @@ module sysl.fs
 @tests
 
 import sysl.path.join
+import sysl.sys.{UNSUPPORTED, host_status}
 
 // What `IoError.message()` says for a code no case names. It used to be `error 92`, a number the reader
 // then had to look up; these hold it to the C library's own sentence, written out per platform so the
@@ -76,6 +77,12 @@ table_holds_family_codes_at_their_number()
     assert_eq(errno_words(ilseq()).unwrap(), "illegal byte sequence")
     assert_eq(errno_words(again()).unwrap(), "resource temporarily unavailable")
 
+@test("EPERM's words are NotPermitted's, so a supplier-less target says the same as the named case")
+table_agrees_with_not_permitted()
+    assert_eq(errno_words(NotPermitted.code()).unwrap(), NotPermitted.message())
+    assert_eq(errno_words(PermissionDenied.code()).unwrap(), PermissionDenied.message())
+    assert_eq(errno_words(NotFound.code()).unwrap(), NotFound.message())
+
 #if bsd
 @test("on a BSD, 11 is EDEADLK and the table makes no claim about it")
 table_leaves_bsd_eleven_alone()
@@ -88,3 +95,56 @@ table_answers_none_past_its_numbers()
         if code == not_empty() || code == ilseq() || code == again() then continue
 
         assert(errno_words(code).is_none(), s"$code")
+
+// -- hook statuses ---------------------------------------------------------------------------------
+
+@test("a hook status is the error's code negated, so -1 is EPERM and round-trips")
+status_eperm_round_trips()
+    assert_eq(from_status(-1).code(), 1)
+    assert(from_status(-1) == NotPermitted)
+    assert(from_status(-1) != PermissionDenied)
+    assert(from_status(-13) == PermissionDenied)
+    assert(from_status(-2) == NotFound)
+end status_eperm_round_trips
+
+@test("EPERM is NotPermitted with its own code and words; EACCES stays PermissionDenied")
+errno_eperm_is_not_eacces()
+    assert(from_errno(1) == NotPermitted)
+    assert_eq(from_errno(1).code(), 1)
+    assert_eq(from_errno(1).message(), "operation not permitted")
+    assert_eq(NotPermitted.code(), 1)
+    assert(from_errno(13) == PermissionDenied)
+    assert_eq(from_errno(13).code(), 13)
+    assert_eq(from_errno(13).message(), "permission denied")
+    assert(NotPermitted != PermissionDenied)
+end errno_eperm_is_not_eacces
+
+@test("exactly UNSUPPORTED is the target having no such call, and nothing else is")
+status_unsupported_is_exactly_one_value()
+    assert(from_status(UNSUPPORTED) == unsupported())
+    assert_eq(from_status(UNSUPPORTED).message(), "not supported on this target")
+    assert(from_status(-37) != unsupported())
+    assert(from_status(-39) != unsupported())
+    assert(from_status(-1) != unsupported())
+end status_unsupported_is_exactly_one_value
+
+#if bsd
+private host_enosys() -> int = 78
+private host_enotsup() -> int = 45
+private host_eopnotsupp() -> int = 102
+#else
+private host_enosys() -> int = 38
+private host_enotsup() -> int = 95
+private host_eopnotsupp() -> int = 95
+#endif
+
+@test("a host's own ENOSYS, ENOTSUP and EOPNOTSUPP become UNSUPPORTED; every other errno is negated")
+host_status_translates_the_hosts_unsupported()
+    assert_eq(host_status(host_enosys()), UNSUPPORTED)
+    assert_eq(host_status(host_enotsup()), UNSUPPORTED)
+    assert_eq(host_status(host_eopnotsupp()), UNSUPPORTED)
+    assert_eq(host_status(1), -1)
+    assert_eq(host_status(13), -13)
+    assert(from_status(host_status(host_enosys())) == unsupported())
+    assert(from_status(host_status(1)) == NotPermitted)
+end host_status_translates_the_hosts_unsupported
