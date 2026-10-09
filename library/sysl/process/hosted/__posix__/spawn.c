@@ -92,7 +92,12 @@ static void nap(long long ms) {
  * left alone too.
  */
 static int place(int fd, int fd_no) {
-    if (fd < 0 || fd == fd_no) return 0;
+    if (fd < 0) return 0;
+
+    /* A descriptor that already is the stream -- a pipe made while this program had that stream
+     * closed -- is the child's only if it stays open across the `exec`, and a pipe's ends are made
+     * to close there. */
+    if (fd == fd_no) return fcntl(fd, F_SETFD, 0) < 0 ? errno : 0;
 
     return dup2(fd, fd_no) < 0 ? errno : 0;
 }
@@ -548,6 +553,10 @@ static int start_spawned(const char *program, char *const *argv,
 
     for (int i = 0; i < 3 && e == 0; i++) {
         if (fds[i] >= 0 && fds[i] != i) e = posix_spawn_file_actions_adddup2(&actions, fds[i], i);
+
+        /* One that already is the stream is not copied, so it must not close at the `exec` either --
+         * which a pipe's ends are made to. A standard stream is never meant to. */
+        if (e == 0 && fds[i] == i && fcntl(i, F_SETFD, 0) < 0) e = errno;
     }
 
     for (int i = 0; i < 3 && e == 0; i++) {
@@ -759,6 +768,38 @@ int sysl_proc_posix_wait(int pid, long long started_ms, long long timeout_ms,
         *sig = 0;
     }
 
+    return 0;
+}
+
+/* A pipe whose two descriptors close when a program is started, answering zero or an `errno`.
+ *
+ * Close-on-exec is the whole of what makes a pipeline end: a child is started with every descriptor
+ * its parent has that is not so marked, so a write end left unmarked would be inherited by the child
+ * reading the other end, which would then wait for a writer that is itself. A child receives an end
+ * only as one of its three streams, where `dup2` makes a copy that is not marked.
+ *
+ * The mark is set straight after the pipe is made rather than in the same call: `pipe2` would close
+ * the window in which another thread starting a child inherits an unmarked end, but macOS has no
+ * `pipe2`, and glibc declares it only under `_GNU_SOURCE`, which would change what this file's other
+ * declarations mean.
+ */
+int sysl_proc_posix_pipe(int *read_end, int *write_end) {
+    int fds[2];
+
+    if (pipe(fds) != 0) return errno;
+
+    for (int i = 0; i < 2; i++) {
+        if (fcntl(fds[i], F_SETFD, FD_CLOEXEC) != 0) {
+            int e = errno;
+
+            close(fds[0]);
+            close(fds[1]);
+            return e;
+        }
+    }
+
+    *read_end = fds[0];
+    *write_end = fds[1];
     return 0;
 }
 
