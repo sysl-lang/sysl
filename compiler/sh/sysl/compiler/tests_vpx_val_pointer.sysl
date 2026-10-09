@@ -458,3 +458,57 @@ vpx_a_writable_pointer_through_a_view()
         print(str(p[0]))
         """, "2\n")
 end vpx_a_writable_pointer_through_a_view
+
+// ---- a local 'val' pointer is sliced as it is indexed ----
+
+// `p[i] = v` through a `val` pointer is accepted, so `p[a..<b]` is a view that may be written too:
+// the pointer's elements belong to whoever owns them, not to the binding that holds the address.
+@test("a view of a 'val' raw pointer is writable, as its subscript is")
+vpx_a_view_of_a_val_pointer_is_writable()
+    if vpx_skipped() then return
+
+    vpx_prints(raw"""
+        fill(b: []u8)
+            b[0] = 7
+        end fill
+
+        var x: u64 = 0
+        val p: *u8 = ptr_cast(&x)
+        p[1] = 9
+        fill(p[0..<8])
+        var s = p[0..<8]
+        s[2] = 5
+        print(str(u64(p[0])), str(u64(p[1])), str(u64(p[2])))
+        """, "7 9 5\n")
+end vpx_a_view_of_a_val_pointer_is_writable
+
+@test("a view of a 'val' array is still read-only: the bytes are the binding's own")
+vpx_a_view_of_a_val_array_is_read_only()
+    if vpx_skipped() then return
+
+    val said = vpx_refused(raw"""
+        fill(b: []u8)
+            b[0] = 7
+        end fill
+
+        val a: [4]u8 = [1, 2, 3, 4]
+        fill(a[0..<4])
+        """)
+
+    assert(said.contains("a '[]const byte' views elements it may not write, and a '[]byte' is a licence"), said)
+end vpx_a_view_of_a_val_array_is_read_only
+
+@test("a view of a '[]const T' stays read-only whatever binds the pointer")
+vpx_a_const_view_stays_read_only()
+    if vpx_skipped() then return
+
+    val said = vpx_refused(raw"""
+        var x: u64 = 0
+        val p: *u8 = ptr_cast(&x)
+        val c: []const u8 = p[0..<8]
+        var s = c[0..<4]
+        s[0] = 1
+        """)
+
+    assert(said.contains("views elements it may not write"), said)
+end vpx_a_const_view_stays_read_only
