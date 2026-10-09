@@ -1,0 +1,139 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The counted heap (`alloc_count.sysl`): a program built with counting on says at exit how many
+// allocations it never gave back. Every claim is about a real program built and run, because the
+// count only exists in one.
+
+private struct AlcRun
+    ok: bool
+    out: string
+    err: string
+
+private alc_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end alc_ready
+
+// The program built -- counted or not -- and run; a build that failed answers `ok` false with the
+// reason in `out`.
+private alc_run(text: string, counted: bool) -> AlcRun
+    val root = make_temp_dir("sysl-alc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(counted)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return AlcRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> AlcRun(false, "could not be started", "")
+        Ok(o) -> AlcRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end alc_run
+
+private alc_cycle() -> string = """
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    val a: &Node = Node(1, None)
+    val b: &Node = Node(2, Some(a))
+
+    a.next = Some(b)
+    print(a.v + b.v)
+    """
+
+@test("a counted program that gives everything back says nothing more than it printed")
+alc_a_clean_program_reports_nothing()
+    if !alc_ready() then return
+
+    val run = alc_run("""
+        struct Node
+            v: int
+            next: Option[&Node]
+
+        val a: &Node = Node(1, None)
+        val b: &Node = Node(2, Some(a))
+        val s = s"x${a.v}" + "y"
+
+        print(s"${b.v} $s")
+        """, true)
+
+    assert(run.ok, run.out)
+    assert(run.out == "2 x1y\n", run.out)
+    assert(run.err == "", run.err)
+    assert(alloc_count_reported(run.err) == 0)
+end alc_a_clean_program_reports_nothing
+
+@test("a counted program that leaks a cycle reports the two boxes it never gave back")
+alc_a_cycle_is_reported()
+    if !alc_ready() then return
+
+    val run = alc_run(alc_cycle(), true)
+
+    assert(run.ok, run.out)
+    assert(run.out == "3\n", run.out)
+    assert(run.err == s"sysl: 2 ${alloc_count_said()}\n", run.err)
+    assert(alloc_count_reported(run.err) == 2)
+end alc_a_cycle_is_reported
+
+@test("an uncounted build of the same leaking program reports nothing: counting is a mode")
+alc_counting_is_off_unless_asked()
+    if !alc_ready() then return
+
+    val run = alc_run(alc_cycle(), false)
+
+    assert(run.ok, run.out)
+    assert(run.err == "", run.err)
+end alc_counting_is_off_unless_asked
+
+@test("module storage is filled before the mark, so what it holds for ever is not a leak")
+alc_module_storage_is_not_counted()
+    if !alc_ready() then return
+
+    val run = alc_run("""
+        struct Node
+            v: int
+            next: Option[&Node]
+
+        static val kept: &Node = Node(7, Some(Node(8, None)))
+        static val word: string = "k" + s"${kept.v}"
+
+        print(s"${kept.v} $word")
+        """, true)
+
+    assert(run.ok, run.out)
+    assert(run.out == "7 k7\n", run.out)
+    assert(run.err == "", run.err)
+end alc_module_storage_is_not_counted
+
+@test("the report is read back as the number it states, and as zero where there is none")
+alc_the_report_reads_back()
+    assert(alloc_count_reported("") == 0)
+    assert(alloc_count_reported("something else\n") == 0)
+    assert(alloc_count_reported(s"sysl: 3 ${alloc_count_said()}\n") == 3)
+    assert(alloc_count_reported(s"noise\nsysl: 127 ${alloc_count_said()}\n") == 127)
+    assert(alloc_count_reported(s"sysl: -2 ${alloc_count_said()}\n") == -2)
+end alc_the_report_reads_back

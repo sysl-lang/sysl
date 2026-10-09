@@ -1,0 +1,158 @@
+module sh.sysl.compiler
+
+import sysl.buf.buf
+import sysl.env.{get as env_var}
+import sysl.text.Search
+
+// **Counting the heap**: a build in which every allocation the program makes is counted, and the
+// program says at exit how many it never gave back.
+//
+// What a program prints cannot show a missing release, an extra retain or a destructor that never
+// ran -- the output is the same either way. A count can: each object the reference counting frees
+// takes one off, so a program whose every count came back to zero ends where it started, and one
+// that leaked ends above it. `SYSL_COUNT_ALLOCS=1` asks for it on any command that builds a program
+// for a POSIX host; the docs sweep's leak check is its user.
+//
+// **How**: the program's heap becomes a pair this module defines in the entry module --
+// `sysl_count_alloc` and `sysl_count_free`, which count and then call libc's. Every allocation the
+// emitted code and the standard module make goes through the pair the driver settled, so swapping
+// the pair is the whole of the instrumentation; the standard module's artifact is keyed by the pair,
+// so a counted build never links an uncounted library. C a package carries calls libc directly and
+// is not counted, which is right: it gives back what it took the same way.
+//
+// **What is not a leak, and is subtracted**: module storage. A computed `val` is filled before the
+// program's own statements and never released (`gen_computed_vals`), so the count is marked once the
+// storage is filled and the report is the count at exit *less* that mark. String literals are static
+// data and were never counted at all.
+//
+// **When the report is made**: after the program's own exit path -- the mark registers it with
+// `atexit`, which Mach-O and ELF both run, where a `@llvm.global_dtors` entry is dropped by the
+// Darwin linker -- so a `main` that returned has dropped everything it held. A program that calls
+// `exit` from inside a function still holds that function's locals, and they are counted.
+//
+// The report is one line on standard error, and only when the net count is not zero -- a clean
+// program prints exactly what it printed before. The exit status is left alone.
+
+// Set by a test that builds in-process, where setting the environment would reach every other test.
+private var alloc_counting_forced: bool = false
+
+force_alloc_counting(on: bool)
+    alloc_counting_forced = on
+
+// Whether this command was asked to count: by `SYSL_COUNT_ALLOCS=1`, or by a test.
+alloc_counting_asked() -> bool =
+    alloc_counting_forced || env_var("SYSL_COUNT_ALLOCS").unwrap_or("") == "1"
+
+// The pair a counted build allocates through.
+counted_allocator() -> (string, string) = ("sysl_count_alloc", "sysl_count_free")
+
+// Whether the pair this compilation settled on is the counting one.
+alloc_counting_active() -> bool = malloc_symbol() == counted_allocator().0
+
+// The line a counted program writes when its count did not come back, without the number.
+alloc_count_said() -> string = "counted allocations still live at exit"
+
+// The pair, the mark and the report, as the entry module carries them.
+//
+// The counter is atomic because a program may allocate from several threads. The report is
+// registered first thing in `main`, so every `atexit` the program registers later runs before it.
+alloc_count_text(word: string) -> string
+    val said = s"sysl: %lld ${alloc_count_said()}"
+
+    s"""
+    @sysl.count.live = internal global i64 0
+    @sysl.count.base = internal global i64 0
+    @sysl.count.said = private constant [${said.bytes.len + 2} x i8] c"$said\\0A\\00"
+
+    declare ptr @malloc($word)
+    declare void @free(ptr)
+    declare i32 @dprintf(i32, ptr, ...)
+    declare i32 @atexit(ptr)
+
+    define ptr @sysl_count_alloc($word %n) {
+    entry:
+      %p = call ptr @malloc($word %n)
+      %got = icmp ne ptr %p, null
+      br i1 %got, label %count, label %done
+    count:
+      %was = atomicrmw add ptr @sysl.count.live, i64 1 monotonic
+      br label %done
+    done:
+      ret ptr %p
+    }
+
+    define void @sysl_count_free(ptr %p) {
+    entry:
+      %none = icmp eq ptr %p, null
+      br i1 %none, label %done, label %count
+    count:
+      %was = atomicrmw sub ptr @sysl.count.live, i64 1 monotonic
+      call void @free(ptr %p)
+      br label %done
+    done:
+      ret void
+    }
+
+    define internal void @sysl.count.mark() {
+    entry:
+      %n = load atomic i64, ptr @sysl.count.live monotonic, align 8
+      store i64 %n, ptr @sysl.count.base
+      %r = call i32 @atexit(ptr @sysl.count.report)
+      ret void
+    }
+
+    define internal void @sysl.count.report() {
+    entry:
+      %live = load atomic i64, ptr @sysl.count.live monotonic, align 8
+      %base = load i64, ptr @sysl.count.base
+      %net = sub i64 %live, %base
+      %clean = icmp eq i64 %net, 0
+      br i1 %clean, label %done, label %say
+    say:
+      %w = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @sysl.count.said, i64 %net)
+      br label %done
+    done:
+      ret void
+    }
+    """
+end alloc_count_text
+
+// The mark, emitted once module storage is filled, and the runtime it calls into.
+gen_alloc_count_mark(e: *Emit)
+    if !alloc_counting_active() then return
+
+    request_text(e, "sysl.count", alloc_count_text(s"i${e.word_bits}"))
+    emit(e, ir_call(None, LVoid, VGlobal("sysl.count.mark"), buf()))
+end gen_alloc_count_mark
+
+// Whether this module carries the counting runtime, and so defines the pair and declares `malloc`,
+// `free`, `dprintf` and `atexit` itself: nothing else may state those again.
+defines_alloc_count(e: *Emit) -> bool = e.requested_set.has("sysl.count")
+
+// The symbols the counting runtime states.
+alloc_count_symbols() -> []const string =
+    [counted_allocator().0, counted_allocator().1, "malloc", "free", "dprintf", "atexit"]
+
+// What a counted program said about its heap: the net count it reported, or zero where it said
+// nothing. Read off its standard error.
+alloc_count_reported(err: string) -> long
+    val at = err.index_of(s" ${alloc_count_said()}") match
+        Some(i) -> i
+        None -> return 0
+
+    var start = at
+
+    while start > 0 && err.bytes[start - 1] != u8(' ')
+        start -= 1
+
+    var n: long = 0
+    var negative = false
+
+    for i in start..<at
+        val b = err.bytes[i]
+
+        if b == u8('-') then negative = true
+        else n = n * 10 + long(b - u8('0'))
+
+    if negative then -n else n
+end alloc_count_reported
