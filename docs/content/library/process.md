@@ -422,13 +422,14 @@ work unchanged above them:
 | `sysl_proc_kill(pid, signal) -> int` | zero |
 | `sysl_proc_temp_path(into, room) -> isize` | the length of the path it wrote |
 
-**Each answers zero or more for success and the `IoError` code negated for a failure**, and `-1` for
-a call the target cannot make at all — the contract of `sysl.io.sys`. Text crosses as a pointer and
+**Each answers zero or more for success and the `IoError` code negated for a failure**, and
+`UNSUPPORTED` (`sysl.sys`, -38 on every platform, not the host's `ENOSYS`; `-1` is `EPERM`) for a
+call the target cannot make at all — the contract of every `*.sys` module. Text crosses as a pointer and
 a length, never a C string: `argv` and `envp` point at runs of `Text`, each a pointer and a length,
 `envp`'s entries reading `NAME=VALUE`. A descriptor of `-1` leaves the child the stream this program
 has. `wait` writes `0` into `how` for an exit (its code in `value`), `1` for a signal or a fault (its
 number), and `2` for a child it stopped at its deadline; a supplier that cannot bound a wait answers
-`-1` when handed a timeout. `sysl.process.sys`'s own comments say the rest.
+`UNSUPPORTED` when handed a timeout. `sysl.process.sys`'s own comments say the rest.
 
 A program that reaches a hook and leaves it unanswered is refused when it is compiled, naming every
 hook it reached:

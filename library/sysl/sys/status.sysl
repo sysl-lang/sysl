@@ -1,0 +1,36 @@
+module sysl.sys
+@no_alloc
+
+/** The status a hook answers when **the target cannot make that call at all** -- not a failure of
+ * the call, but the absence of one. It is the one value that means this in every `*.sys` module
+ * (`sysl.fs.sys`, `sysl.io.sys`, `sysl.process.sys`), on every platform.
+ *
+ * The contract those modules share is a system call's: zero or more is success, and a negative
+ * answer is the code of the failure negated, so `-1` is `EPERM`. This is the one negative answer that
+ * is not a code of the host's, which is why it is **-38** and not the host's own `ENOSYS`: that is
+ * 38 on Linux and 78 on macOS, and the contract has to mean one thing everywhere. A program
+ * answering a hook for a target that has no way to perform the call returns it:
+ *
+ *     @export("sysl_fs_chmod")
+ *     no_chmod(path: *u8, len: usize, mode: u32) -> int = sysl.sys.UNSUPPORTED
+ *
+ * The caller hears "not supported on this target".
+ */
+const UNSUPPORTED: int = -38
+
+#if bsd
+private const enosys: int = 78
+private const enotsup: int = 45
+private const eopnotsupp: int = 102
+#else
+private const enosys: int = 38
+private const enotsup: int = 95
+private const eopnotsupp: int = 95
+#endif
+
+/** The status a hosted supplier answers for a call that failed with the host's `errno` `code`: the
+ * code negated, except that the host's own "no such call here" -- `ENOSYS`, `ENOTSUP`, `EOPNOTSUPP` --
+ * is `UNSUPPORTED`, so the contract does not depend on which libc is underneath.
+ */
+private[sysl] host_status(code: int) -> int =
+    if code == enosys || code == enotsup || code == eopnotsupp then UNSUPPORTED else -code
