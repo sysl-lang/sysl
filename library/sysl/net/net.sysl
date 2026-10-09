@@ -1,0 +1,320 @@
+module sysl.net
+@requires(os)
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{IoError, from_errno}
+import sysl.net.sys as nsys
+import sysl.net.sys.Endpoint
+import sysl.slices.{as_mut_ptr, as_ptr}
+
+/** Blocking sockets -- a TCP stream, a UDP socket -- and the names a host resolves to.
+ *
+ * **Everything here goes through `sysl.net.sys` and through nothing else.** On a hosted POSIX target
+ * the library answers those hooks over the platform's sockets; on a target with no C library -- a
+ * kernel, a board with a network stack of its own -- the program answers them, and one it reaches and
+ * leaves unanswered is refused when it is compiled. So the module names no C function and no
+ * `sockaddr`: an `Address` is a sysl value, four or sixteen bytes and a port, built with `ipv4` or
+ * `ipv6` or handed back by `resolve`.
+ *
+ * **The vocabulary is still the sockets one** -- `socket`, `bind`, `listen`, `accept`, `connect`,
+ * `send`, `recv`, `shutdown`, `close` -- because forty years of programs and of documentation are
+ * written in it, and a reader who knows it should not have to translate.
+ *
+ * ## Blocking, and only blocking
+ *
+ * Every call here returns when its work is done. There is no event loop, no non-blocking mode and no
+ * readiness notification, and that is the line Rust draws too -- `std::net` is blocking and every
+ * async runtime is a package outside it. `sysl-lang/libuv` is where the event-loop story lives.
+ *
+ * **A timeout is the one thing a blocking call cannot do without**, because otherwise "returns when
+ * the work is done" can mean never. `read_timeout` and `write_timeout` are what bound it, and a call
+ * that hits one answers an error `timed_out` recognises.
+ *
+ * ## What is deliberately out
+ *
+ * Multicast, broadcast, unix domain sockets, non-blocking mode, and every socket option beyond the
+ * timeouts and the one a listener needs. All of them are **additive**, so leaving them out costs a
+ * later release nothing.
+ */
+
+/** Which version of the protocol an address is for. */
+enum Family derives Display
+    Ipv4
+    Ipv6
+
+/** How much of a connection is being given up. */
+enum Shutdown derives Display
+    Read
+    Write
+    Both
+
+/** Every address a host and a port resolve to, in the order the machine ranked them.
+ *
+ * **Both protocol versions are asked for and both come back.** That is what makes a program work on
+ * a v6-only network without knowing it is on one, and the *order* is the system's answer to which
+ * to prefer -- RFC 6724 says how a machine sorts them. So the ordinary client is a loop:
+ *
+ * ```
+ * for a in resolve("example.com", 80)?
+ *     var s = socket(a)?
+ *     if s.connect(a).is_ok() then break
+ *     s.close()
+ * ```
+ *
+ * A failure to resolve is reported as `NotFound`, whatever the resolver's own reason was. A numeric
+ * host -- `127.0.0.1`, `::1` -- resolves to itself, and where no resolver is wanted `ipv4` and `ipv6`
+ * build an address directly.
+ */
+resolve(host: string, port: int) -> Result[Buf[Address], IoError] = resolved(host, port, 0)
+
+/** Where a **listener** binds: the wildcard, meaning every address this machine answers on.
+ *
+ * A separate call rather than an empty host, because the same question has two answers and nothing
+ * about the arguments alone says which is wanted -- a caller that got the wrong one binds to the
+ * loopback and wonders why nobody can reach it.
+ */
+resolve_passive(port: int) -> Result[Buf[Address], IoError] = resolved("", port, 1)
+
+private resolved(host: string, port: int, passive: int) -> Result[Buf[Address], IoError]
+    var found: []Endpoint = [unspecified(); 8]
+    val n = nsys.resolve(as_ptr(host.bytes), host.bytes.len, port, passive, as_mut_ptr(found),
+                         found.len)
+
+    if n < 0 then return Err(failure(n))
+
+    var out: Buf[Address] = buf()
+
+    for i in 0..<usize(n) do out.push(Address(found[i]))
+
+    Ok(out)
+end resolved
+
+/** A connection, or something listening for one. One type, because the sockets API has one.
+ *
+ * **A socket is not closed by going out of scope.** `close` is a call, exactly as it is in C, and a
+ * program that drops one without closing it leaks a descriptor until it exits. `defer s.close()` is
+ * the idiom.
+ */
+struct Socket
+    private fd: i32
+
+    /** Connect to somewhere. The address must be of the family this socket was made for, which it
+     * is whenever the two came from the same `resolve`.
+     */
+    connect(*self, to: Address) -> Result[unit, IoError] = told(nsys.connect(int(self.fd), &to.at))
+
+    /** Take a local address, which is what a listener does before it listens. */
+    bind(*self, to: Address) -> Result[unit, IoError] = told(nsys.bind(int(self.fd), &to.at))
+
+    /** Start accepting connections, with `backlog` of them allowed to queue.
+     *
+     * 128 is `SOMAXCONN` on both hosted platforms and is what nearly everything uses; it is a default
+     * rather than a constant because the number is the caller's business.
+     */
+    listen(*self, backlog: int = 128) -> Result[unit, IoError] =
+        told(nsys.listen(int(self.fd), backlog))
+
+    /** Wait for a connection, and answer it together with where it came from. */
+    accept(*self) -> Result[(Socket, Address), IoError]
+        var peer = unspecified()
+        val s = nsys.accept(int(self.fd), &peer)
+
+        if s < 0 then Err(failure(s)) else Ok((Socket(i32(s)), Address(peer)))
+    end accept
+
+    /** Where this socket is, which is how a listener that asked for port 0 learns which port it
+     * got.
+     */
+    local(self) -> Result[Address, IoError] = local_of(self.fd)
+
+    /** Write some of `bytes`, and say how many.
+     *
+     * **A short write is not an error**: a stream moves what it can and the caller comes back for the
+     * rest. `send_all` is the loop, and is what almost every caller actually wants.
+     */
+    send(*self, bytes: []const u8) -> Result[usize, IoError]
+        if bytes.len == 0 then return Ok(0)
+
+        moved(nsys.send(int(self.fd), as_ptr(bytes), bytes.len))
+    end send
+
+    /** Every byte of `bytes`, however many calls that takes.
+     *
+     * An interrupted call is retried rather than reported: a signal arriving mid-write is not a
+     * failure of the write.
+     */
+    send_all(*self, bytes: []const u8) -> Result[unit, IoError]
+        var at: usize = 0
+
+        while at < bytes.len
+            self.send(bytes[at..<bytes.len]) match
+                Ok(n) -> at += n
+                Err(Interrupted) -> ()
+                Err(e) -> return Err(e)
+
+        Ok(())
+    end send_all
+
+    /** Read into `into`, and say how many bytes arrived.
+     *
+     * **Zero means the peer has finished writing** -- end of stream, not an error and not a timeout.
+     */
+    recv(*self, into: []u8) -> Result[usize, IoError]
+        if into.len == 0 then return Ok(0)
+
+        moved(nsys.recv(int(self.fd), as_mut_ptr(into), into.len))
+    end recv
+
+    /** Stop reading, stop writing, or stop both -- while the descriptor stays open.
+     *
+     * **`Write` is the one with a protocol behind it.** It sends the peer an end of stream, so a
+     * program that has finished asking can say so and then go on reading the answer.
+     */
+    shutdown(*self, how: Shutdown = Both) -> Result[unit, IoError] =
+        told(nsys.shutdown(int(self.fd), how match
+            Read -> 0
+            Write -> 1
+            Both -> 2))
+
+    /** Give the descriptor back. A socket closed twice is a descriptor number that may by then belong
+     * to something else, which is C's rule and is not checked here.
+     */
+    close(*self) -> Result[unit, IoError] = told(nsys.close(int(self.fd)))
+
+    /** How long a `recv` may wait before giving up, in milliseconds. Zero is no limit, which is
+     * where a socket starts.
+     */
+    read_timeout(*self, ms: int) -> Result[unit, IoError] =
+        told(nsys.option(int(self.fd), nsys.read_timeout, i64(ms)))
+
+    /** How long a `send` may wait before giving up, in milliseconds. Zero is no limit. */
+    write_timeout(*self, ms: int) -> Result[unit, IoError] =
+        told(nsys.option(int(self.fd), nsys.write_timeout, i64(ms)))
+
+    /** Let a listener take a port that a recently stopped one was using, so that a server just
+     * stopped can be started again without waiting out `TIME_WAIT`. Set it **before** `bind`.
+     */
+    reuse_address(*self, on: bool = true) -> Result[unit, IoError] =
+        told(nsys.option(int(self.fd), nsys.reuse_address, if on then 1 else 0))
+end Socket
+
+/** A stream socket of the family an address belongs to, ready to be connected or bound.
+ *
+ * The family comes from the address rather than being said separately: a socket of the wrong one
+ * cannot be connected to it, so letting the two be given apart would only make it possible to
+ * disagree.
+ */
+socket(for_address: Address) -> Result[Socket, IoError]
+    val s = nsys.socket(int(for_address.at.family), nsys.stream)
+
+    if s < 0 then Err(failure(s)) else Ok(Socket(i32(s)))
+end socket
+
+/** A datagram socket: UDP. Each `send_to` is one datagram and each `recv_from` takes one whole,
+ * with who sent it.
+ *
+ * **A datagram is not a stream.** One that is longer than the buffer it is received into loses the
+ * rest, one sent may never arrive, and two may arrive in either order. What UDP is for is exactly
+ * the exchanges that can live with that -- a query and its answer, a heartbeat, a sample -- and the
+ * calls here say nothing more than that.
+ *
+ * Not closed by going out of scope, for the reason `Socket` is not.
+ */
+struct UdpSocket
+    private fd: i32
+
+    /** Take a local address: the port this socket receives on. Port 0 asks for any free one, which
+     * `local` then names.
+     */
+    bind(*self, to: Address) -> Result[unit, IoError] = told(nsys.bind(int(self.fd), &to.at))
+
+    /** Fix where this socket talks to: `send` then goes there without naming it, and `recv` takes
+     * datagrams from there and from nowhere else.
+     */
+    connect(*self, to: Address) -> Result[unit, IoError] = told(nsys.connect(int(self.fd), &to.at))
+
+    /** Send `bytes` as one datagram to `to`, and say how many went -- all of them, or an error. An
+     * empty datagram is a datagram.
+     */
+    send_to(*self, bytes: []const u8, to: Address) -> Result[usize, IoError] =
+        moved(nsys.send_to(int(self.fd), as_ptr(bytes), bytes.len, &to.at))
+
+    /** Wait for one datagram, read as much of it as `into` holds, and answer how many bytes that
+     * was together with who sent it.
+     */
+    recv_from(*self, into: []u8) -> Result[(usize, Address), IoError]
+        var sender = unspecified()
+        val n = nsys.recv_from(int(self.fd), as_mut_ptr(into), into.len, &sender)
+
+        if n < 0 then Err(failure(int(n))) else Ok((usize(n), Address(sender)))
+    end recv_from
+
+    /** Send `bytes` as one datagram to where `connect` pointed this socket. */
+    send(*self, bytes: []const u8) -> Result[usize, IoError] =
+        moved(nsys.send(int(self.fd), as_ptr(bytes), bytes.len))
+
+    /** Wait for one datagram from where `connect` pointed this socket, and answer how many of its
+     * bytes `into` held.
+     */
+    recv(*self, into: []u8) -> Result[usize, IoError] =
+        moved(nsys.recv(int(self.fd), as_mut_ptr(into), into.len))
+
+    /** Where this socket is bound. */
+    local(self) -> Result[Address, IoError] = local_of(self.fd)
+
+    /** How long a receive may wait before giving up, in milliseconds. Zero is no limit, which is
+     * where a socket starts -- and a datagram that was lost is waited for forever without one.
+     */
+    read_timeout(*self, ms: int) -> Result[unit, IoError] =
+        told(nsys.option(int(self.fd), nsys.read_timeout, i64(ms)))
+
+    /** How long a send may wait before giving up, in milliseconds. Zero is no limit. */
+    write_timeout(*self, ms: int) -> Result[unit, IoError] =
+        told(nsys.option(int(self.fd), nsys.write_timeout, i64(ms)))
+
+    /** Give the descriptor back. */
+    close(*self) -> Result[unit, IoError] = told(nsys.close(int(self.fd)))
+end UdpSocket
+
+/** A datagram socket of the family an address belongs to, ready to be bound or connected. */
+udp_socket(for_address: Address) -> Result[UdpSocket, IoError]
+    val s = nsys.socket(int(for_address.at.family), nsys.datagram)
+
+    if s < 0 then Err(failure(s)) else Ok(UdpSocket(i32(s)))
+end udp_socket
+
+/** Whether an error is a call that ran out of its timeout rather than one that failed.
+ *
+ * It is a function rather than a case of `IoError` because the alternative is adding a variant to an
+ * error type every module in the library shares, for a condition only this one can produce.
+ */
+timed_out(e: IoError) -> bool = e.code() == timed_out_code()
+
+// `ETIMEDOUT`, which every hook answers for a call its timeout stopped (`sysl.net.sys`): 60 on a BSD,
+// 110 under Linux's numbering, which is also what a kernel without a C library writes.
+#if bsd
+private timed_out_code() -> int = 60
+#else
+private timed_out_code() -> int = 110
+#endif
+
+private local_of(fd: i32) -> Result[Address, IoError]
+    var at = unspecified()
+    val e = nsys.local(int(fd), &at)
+
+    if e < 0 then Err(failure(e)) else Ok(Address(at))
+end local_of
+
+/** A hook's negative answer as the error it stands for: `unsupported` is "not supported on this
+ * target", and anything else is the code negated.
+ */
+private failure(answer: int) -> IoError =
+    if answer == nsys.unsupported then from_errno(-1) else from_errno(-answer)
+
+/** A hook's answer as success or the error it stands for. */
+private told(answer: int) -> Result[unit, IoError] =
+    if answer < 0 then Err(failure(answer)) else Ok(())
+
+/** A hook's count as the count or the error it stands for. */
+private moved(answer: isize) -> Result[usize, IoError] =
+    if answer < 0 then Err(failure(int(answer))) else Ok(usize(answer))

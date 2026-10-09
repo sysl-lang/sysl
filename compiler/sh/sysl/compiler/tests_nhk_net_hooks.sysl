@@ -1,0 +1,339 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **Sockets over `sysl.net.sys`, and a program answering them on a target with no C library.**
+//
+// `sysl.net` makes every socket call through the `sysl_net_*` hooks. On a hosted POSIX target the
+// library's `sysl.net.hosted` answers them over the platform's sockets, under `weak` exports; on a
+// freestanding one the program answers each hook it reaches with an `@export`, and one it leaves
+// unanswered is refused when it is compiled (`emit_checks.sysl`'s `check_library_hooks`, the
+// `sysl.net.sys` row). What the hosted answers do at run time is `library/sysl/net/`'s tests.
+
+private val nhk_target: string = "aarch64-freestanding"
+private val nhk_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private val nhk_script: string =
+    "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+// An image entered at `kstart`, laid out by the script, with the program's own heap.
+private val nhk_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n" +
+    s"targets {\n  $nhk_target {\n    linker_script = \"link.ld\"\n    entry = \"kstart\"\n  }\n}\n"
+
+// keel's `udpecho` -- bind a port, take a datagram and its sender, send it back -- and a TCP exchange
+// beside it, which between them reach every hook of `sysl.net.sys`.
+private val nhk_program: string = raw"""
+    import sysl.net.{Both, ipv4, resolve, socket, udp_socket}
+    import sysl.net.sys.Endpoint
+
+    go() -> int
+        var n = 0
+        val here = ipv4(10, 0, 2, 15, 8007)
+        var into: []u8 = [0; 64]
+
+        udp_socket(here) match
+            Ok(s) ->
+                var u = s
+
+                if u.bind(here).is_ok() then n += 1
+                if u.read_timeout(10_000).is_ok() then n += 1
+
+                u.recv_from(into) match
+                    Ok((k, from)) -> if u.send_to(into[0..<k], from).is_ok() then n += 2
+                    Err(_) -> ()
+
+                val _ = u.close()
+            Err(_) -> ()
+
+        resolve("10.0.2.2", 80) match
+            Ok(addrs) ->
+                socket(addrs.at(0)) match
+                    Ok(s) ->
+                        var c = s
+
+                        if c.connect(addrs.at(0)).is_ok() && c.send_all([104, 105]).is_ok() then n += 4
+                        if c.recv(into).is_ok() then n += 8
+
+                        val _ = c.shutdown(Both)
+                        val _ = c.close()
+                    Err(_) -> ()
+            Err(_) -> ()
+
+        socket(here) match
+            Ok(s) ->
+                var l = s
+
+                if l.bind(here).is_ok() && l.listen().is_ok() && l.local().is_ok() then
+                    l.accept() match
+                        Ok((peer, _)) ->
+                            var p = peer
+                            val _ = p.close()
+                        Err(_) -> ()
+            Err(_) -> ()
+
+        n
+    end go
+    """
+
+// What every bare image here defines for itself: its start, its heap (an address that is not null,
+// so nothing after the first allocation folds away), the memory functions LLVM calls on a target with
+// no C library, `putchar` and `exit`.
+private val nhk_runtime: string = raw"""
+    @export("kstart")
+    kstart() -> never
+        val n = go()
+
+        loop
+            ()
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = ptr_cast(usize(0x4100_0000))
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+
+    @export("memset")
+    mem_set(dst: *u8, c: int, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = u8(c)
+
+        dst
+
+    @export("memcpy")
+    mem_copy(dst: *u8, src: *u8, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = src[i]
+
+        dst
+
+    @export("memmove")
+    mem_move(dst: *u8, src: *u8, n: usize) -> *u8 = mem_copy(dst, src, n)
+
+    @export("memcmp")
+    mem_compare(a: *u8, b: *u8, n: usize) -> int = 0
+
+    @export("putchar")
+    k_putchar(c: int) -> int = c
+
+    @export("exit")
+    k_exit(code: int) -> never
+        loop
+            ()
+    """
+
+// Twelve of the fourteen hooks, answered as keel's socket calls answer them: one socket table, the loopback's
+// address for every endpoint asked about, and a resolver that only knows numbers.
+private val nhk_stream_hooks: string = raw"""
+    @export("sysl_net_socket")
+    k_socket(family: int, kind: int) -> int = 3
+
+    @export("sysl_net_connect")
+    k_connect(fd: int, to: *Endpoint) -> int = 0
+
+    @export("sysl_net_bind")
+    k_bind(fd: int, at: *Endpoint) -> int = 0
+
+    @export("sysl_net_listen")
+    k_listen(fd: int, backlog: int) -> int = 0
+
+    @export("sysl_net_accept")
+    k_accept(fd: int, peer: *Endpoint) -> int = 4
+
+    @export("sysl_net_local")
+    k_local(fd: int, at: *Endpoint) -> int = 0
+
+    @export("sysl_net_send")
+    k_send(fd: int, from: *u8, len: usize) -> isize = isize(len)
+
+    @export("sysl_net_recv")
+    k_recv(fd: int, into: *u8, room: usize) -> isize = 0
+
+    @export("sysl_net_shutdown")
+    k_shutdown(fd: int, how: int) -> int = 0
+
+    @export("sysl_net_close")
+    k_close(fd: int) -> int = 0
+
+    @export("sysl_net_option")
+    k_option(fd: int, which: int, value: i64) -> int = 0
+
+    @export("sysl_net_resolve")
+    k_resolve(host: *u8, host_len: usize, port: int, passive: int, out: *Endpoint, room: usize) -> int = -1
+    """
+
+// The two a datagram server adds to the stream's twelve.
+private val nhk_datagram_hooks: string = raw"""
+    @export("sysl_net_send_to")
+    k_send_to(fd: int, from: *u8, len: usize, to: *Endpoint) -> isize = isize(len)
+
+    @export("sysl_net_recv_from")
+    k_recv_from(fd: int, into: *u8, room: usize, from: *Endpoint) -> isize = -110
+    """
+
+private val nhk_hooks: string = nhk_stream_hooks + nhk_datagram_hooks
+
+private val nhk_all_hooks: []string = ["sysl_net_accept", "sysl_net_bind", "sysl_net_close",
+    "sysl_net_connect", "sysl_net_listen", "sysl_net_local", "sysl_net_option", "sysl_net_recv",
+    "sysl_net_recv_from", "sysl_net_resolve", "sysl_net_send", "sysl_net_send_to",
+    "sysl_net_shutdown", "sysl_net_socket"]
+
+private nhk_tree(program: string) -> string
+    var files = lbr_two("main.sysl", program, "package.hocon", nhk_manifest)
+
+    files.push(("link.ld", nhk_script))
+    lbr_tree(files)
+end nhk_tree
+
+// What `sysl build` answers for the image, and where it wrote it.
+private nhk_build(p: string) -> ((int, string), string)
+    val out = lbr_temp("sysl-nhk-elf")
+
+    (lbr_cli(["sysl", "build", "--target", nhk_target, "-o", s"$out/img.elf", p]), out)
+end nhk_build
+
+private nhk_symbols(elf: string, undefined: bool) -> string
+    val ran = if undefined then capture(nhk_nm, ["-u", elf], "", [], true)
+    else capture(nhk_nm, [elf], "", [], true)
+
+    ran match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+end nhk_symbols
+
+// Whether an `llvm-nm` listing names `symbol`, as the last word of one of its lines.
+private nhk_names(listing: string, symbol: string) -> bool
+    for line in lines_of(listing)
+        if line == symbol || line.ends_with(s" $symbol") then return true
+
+    false
+end nhk_names
+
+private nhk_link_ready() -> bool
+    if !lbr_ready() then return false
+
+    val lld = capture("ld.lld", ["--version"], "", [], true) match
+        Ok(o) -> o.status.ok()
+        Err(_) -> false
+
+    if !lld then skip("ld.lld is not installed, so no image can be linked")
+    if !is_file(nhk_nm) then skip(s"there is no llvm-nm at $nhk_nm to read the image")
+
+    true
+end nhk_link_ready
+
+// -- a bare image answering the hooks it reaches -----------------------------------------------------
+
+@test("a freestanding program using UDP and TCP links with only its own network hooks")
+nhk_answered_hooks_link()
+    if !nhk_link_ready() then return
+
+    val p = nhk_tree(nhk_program + nhk_runtime + nhk_hooks)
+    val (said, out) = nhk_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = nhk_symbols(elf, false)
+
+    assert_eq(nhk_symbols(elf, true).trim(), "")
+
+    // The program's own answers are the ones in the image, defined strong.
+    for hook in nhk_all_hooks
+        assert(all.contains(s" T $hook"), all)
+
+    // And nothing of the hosted answer came with them.
+    for name in ["socket", "sendto", "recvfrom", "getaddrinfo", "setsockopt", "sysl_net_posix_socket",
+                 "sysl_net_posix_resolve"]
+        assert(!nhk_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end nhk_answered_hooks_link
+
+// -- the hooks left unanswered -------------------------------------------------------------------------
+
+@test("a freestanding program using sockets with no network hooks is refused, naming every one it reaches")
+nhk_unanswered_hooks_are_refused()
+    if !lbr_ready() then return
+
+    val p = nhk_tree(nhk_program + nhk_runtime)
+    val (said, out) = nhk_build(p)
+
+    assert(said.0 != 0, "built with every network hook unanswered")
+    assert(said.1.contains(s"error: this program reaches 'sysl.net', and '$nhk_target' has no C " +
+        "library under it for the standard library to answer a network with, so the program answers " +
+        "it: define 'sysl_net_accept', 'sysl_net_bind', 'sysl_net_close', 'sysl_net_connect', " +
+        "'sysl_net_listen', 'sysl_net_local', 'sysl_net_option', 'sysl_net_recv', " +
+        "'sysl_net_recv_from', 'sysl_net_resolve', 'sysl_net_send', 'sysl_net_send_to', " +
+        "'sysl_net_shutdown', 'sysl_net_socket' with '@export', each taking what its 'extern' in " +
+        "'sysl.net.sys' declares and answering a descriptor, a count or zero, or the code of an " +
+        "'IoError' negated"), said.1)
+
+    // Told before the link, so no linker names a symbol.
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end nhk_unanswered_hooks_are_refused
+
+@test("a freestanding program that answers some network hooks is refused for only the rest")
+nhk_partly_answered_hooks_are_refused()
+    if !lbr_ready() then return
+
+    // Every hook but `recv_from` and `send_to`, which are the two a datagram server adds to a stream.
+    val p = nhk_tree(nhk_program + nhk_runtime + nhk_stream_hooks)
+    val (said, out) = nhk_build(p)
+
+    assert(said.0 != 0, "built with two network hooks unanswered")
+    assert(said.1.contains("so the program answers it: define 'sysl_net_recv_from', " +
+        "'sysl_net_send_to' with '@export'"), said.1)
+
+    lbr_drop([p, out])
+end nhk_partly_answered_hooks_are_refused
+
+// -- a hosted target -------------------------------------------------------------------------------------
+
+@test("on a hosted target the library answers the network hooks under weak exports")
+nhk_hosted_library_answers_weakly()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.net.{ipv4, udp_socket}
+
+        val here = ipv4(127, 0, 0, 1, 0)
+        var s = udp_socket(here).unwrap()
+
+        print(s.bind(here).is_ok())
+        print(s.send_to([1], s.local().unwrap()).is_ok())
+
+        var into: []u8 = [0; 4]
+
+        print(s.recv_from(into).is_ok())
+        print(s.close().is_ok())
+        """)
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
+
+    lbr_drop([p])
+    assert(said.0 == 0, said.1)
+
+    for hook in ["sysl_net_socket", "sysl_net_bind", "sysl_net_local", "sysl_net_send_to",
+                 "sysl_net_recv_from", "sysl_net_close"]
+        var defined = ""
+
+        for line in lines_of(said.1)
+            if line.starts_with("define ") && line.contains(s" @$hook(") then defined = line
+
+        assert(defined.starts_with("define weak "), s"$hook: $defined")
+    end for
+
+    assert(said.1.contains("@sysl_net_posix_recv_from("), "the hosted answer does not call the shim")
+end nhk_hosted_library_answers_weakly

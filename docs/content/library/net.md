@@ -1,47 +1,47 @@
 ---
 title: The net module
-summary: "`sysl.posix.net` — blocking TCP and the names it resolves: `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `shutdown`, `close`, and why it mirrors POSIX rather than inventing a stream type."
+summary: "`sysl.net` — blocking TCP and UDP and the names they resolve: `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `send_to`, `recv_from`, `shutdown`, `close`; addresses as sysl values; and the hooks a target without a C library answers."
 weight: 76
 ---
 
-**Every declaration in `sysl.posix.net`, with its signature:** [the generated API page](/api/sysl-posix-net/#index). This page is the argument — what the module is for, and how its pieces fit; that one is the list.
+**Every declaration in `sysl.net`, with its signature:** [the generated API page](/api/sysl-net/#index). This page is the argument — what the module is for, and how its pieces fit; that one is the list.
 
-`sysl.posix.net` is blocking TCP: a socket, an address to give it, and the four calls that move
-bytes. It requires `posix`.
+`sysl.net` is blocking sockets: a TCP stream, a UDP socket, an address to give either, and the calls
+that move bytes. It requires `os`.
 
 ```sysl
-import sysl.posix.net.{resolve, socket}
+import sysl.net.{ipv4, resolve}
 
 val addrs = resolve("127.0.0.1", 8080).unwrap()
 
 print(addrs.len() > 0)
 print(addrs.at(0).text(), addrs.at(0).port(), addrs.at(0).family())
 print(addrs.at(0))
+print(addrs.at(0) == ipv4(127, 0, 0, 1, 8080))
 ```
 
 ```output
 true
 127.0.0.1 8080 Ipv4
 127.0.0.1:8080
+true
 ```
 
-## Why it is `sysl.posix.net` and not `sysl.net`
+## Why it is `sysl.net`, and still speaks sockets
 
 The library has two conventions, and the rule that separates them is visible in one pair:
 [`sysl.term`](/library/term/) is the portable surface sysl invented over a terminal, and
-`sysl.posix.tty` is `termios` presented as `termios`. **Everything under `sysl.posix` keeps the
-underlying API's own vocabulary.**
+`sysl.posix.tty` is `termios` presented as `termios`. **Everything under `sysl.posix` is a POSIX API
+presented as itself, and this module is not one any more**: every call it makes goes through the
+hooks of `sysl.net.sys`, which a hosted target's sockets answer and a kernel with a network stack of
+its own answers just as well, and an address is a sysl value rather than a `sockaddr`. So it is
+`sysl.net`. **It was `sysl.posix.net` until 0.1.0-alpha.6**; the names inside are the same, and moving
+a program is its `import` line.
 
-So this is `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `shutdown` and `close`,
-with those meanings and in that order, and it is deliberately **not** a `TcpStream`.
-
-**A portable `sysl.net` comes later, over this, and that order is the point rather than a
-compromise.** POSIX made every decision this module needs forty years ago, so mirroring it cannot
-guess wrong — and a module that cannot guess wrong is one that can be frozen. What a *portable*
-address is, what a portable error is, how a timeout is spelled, whether a listener is a type or a
-function: those are guesses, and they want real consumers before anything is fixed. Adding a module
-after 0.1.0 is free; only removing one is forbidden. So the safe half goes before the freeze and the
-risky half after it.
+**The vocabulary stays the sockets one** — `socket`, `bind`, `listen`, `accept`, `connect`, `send`,
+`recv`, `shutdown`, `close`, with those meanings — because forty years of programs and documentation
+are written in it, and a reader who knows it should not have to translate. It is deliberately **not**
+a `TcpStream` and a `TcpListener`: the sockets API has one type for both, and so does this.
 
 ## Blocking, and only blocking
 
@@ -51,15 +51,14 @@ readiness notification.
 **That is the line Rust draws too**, and for the same reason: `std::net` is blocking and every async
 runtime, tokio included, is a package outside the standard library. `sysl-lang/libuv` is where the
 event-loop story lives, and the two compose — a program that wants a loop uses the package, and one
-that wants a straight line uses this. So sysl's standard library having no asynchronous tier stops
-being an omission and becomes a decision with a precedent behind it.
+that wants a straight line uses this.
 
 ## A client
 
 Resolve, make a socket of the address's family, connect.
 
 ```sysl
-import sysl.posix.net.{resolve, socket, Socket}
+import sysl.net.{resolve, socket, Socket}
 
 // A listener of our own, so the page has something to connect to. Port 0 asks the machine for one
 // it has free, and `local` is what says which it gave.
@@ -126,7 +125,7 @@ and a loop that reads until zero is the whole protocol.
 then go on reading the answer. Closing would have said nothing and thrown the answer away.
 
 ```sysl
-import sysl.posix.net.{resolve, socket, Shutdown}
+import sysl.net.{resolve, socket, Shutdown}
 
 val here = resolve("127.0.0.1", 0).unwrap().at(0)
 var server = socket(here).unwrap()
@@ -172,7 +171,7 @@ Otherwise "returns when the work is done" can mean never. `read_timeout` and `wr
 it in milliseconds, and zero — where a socket starts — means no limit.
 
 ```sysl
-import sysl.posix.net.{resolve, socket, timed_out}
+import sysl.net.{resolve, socket, timed_out}
 
 val here = resolve("127.0.0.1", 0).unwrap().at(0)
 var server = socket(here).unwrap()
@@ -203,10 +202,10 @@ server.close().unwrap()
 true
 ```
 
-**`timed_out` is a function rather than a case of `IoError`.** A timed-out blocking call reports
-`EAGAIN`, which is a number and not one of that enum's named cases — and adding a variant to an error
-type every module in the library shares, for a condition only this one can produce, is a larger
-change than the question deserves.
+**`timed_out` is a function rather than a case of `IoError`.** A timed-out call reports `ETIMEDOUT`,
+which is a number and not one of that enum's named cases — and adding a variant to an error type
+every module in the library shares, for a condition only this one can produce, is a larger change
+than the question deserves.
 
 The rest of the error half is [`sysl.fs`](/library/fs/)'s `IoError`, from the same `errno` numbers as
 everywhere else. A name that will not resolve is `NotFound`, whatever the resolver's own reason was:
@@ -214,30 +213,155 @@ the `EAI_*` codes are a numbering of their own and overlap `errno`'s — `EAI_AG
 which is `ENOENT` — so passing them through would produce an error that means something else
 entirely.
 
-## An address carries the platform's bytes
+## Datagrams: `UdpSocket`
 
-`Address` holds a `sockaddr` and its length and sysl never looks inside it. A `sockaddr_in` and a
-`sockaddr_in6` are different layouts, and Darwin's carry a length byte glibc's do not, so a struct
-written in sysl would be a transcription of a layout — [the thing that compiles everywhere and is
-wrong somewhere](/reference/ffi/#a-library-may-carry-c). What crosses is the bytes; everything a
-program wants to *know* about an address it asks for.
+`udp_socket(address)` makes a datagram socket of that address's family; `bind` gives it a port to
+receive on, and then **each `send_to` is one datagram and each `recv_from` takes one whole**, with
+who sent it — which is the whole of an echo server:
 
-**`Family` is `Ipv4` and `Ipv6`, named by the version rather than by `AF_INET`'s number** — which is
-what a program must not be handed, since `AF_INET6` is 30 on Darwin and 10 under glibc. `text()` is
-the numeric form and never a name: turning an address back into a hostname is a second lookup over
-the network, which is not what a program printing what it just connected to is asking for, and is a
-thing an attacker controls the answer to.
+```sysl
+import sysl.net.{ipv4, udp_socket}
 
-Printing one brackets a v6 address — `[::1]:8080` — because a v6 address has colons in it and
-`::1:8080` cannot be read apart. It is the form the URL syntax settled on.
+val here = ipv4(127, 0, 0, 1, 0)
+var server = udp_socket(here).unwrap()
+
+server.bind(here).unwrap()
+
+val at = server.local().unwrap()
+var client = udp_socket(at).unwrap()
+
+client.bind(here).unwrap()
+client.send_to([112, 105, 110, 103], at).unwrap()
+
+var into: []u8 = [0; 64]
+val (n, from) = server.recv_from(into).unwrap()
+
+// Back to whoever asked.
+server.send_to(into[0..<n], from).unwrap()
+
+val (m, back) = client.recv_from(into).unwrap()
+
+print(n, m, into[0] == u8('p'), back == at, from == client.local().unwrap())
+
+server.close().unwrap()
+client.close().unwrap()
+```
+
+```output
+4 4 true true true
+```
+
+**A datagram is not a stream.** One longer than the buffer it is received into keeps what fits and
+loses the rest; one sent may never arrive; two may arrive in either order. UDP is for the exchanges
+that can live with that — a query and its answer, a heartbeat, a sample — and the calls say nothing
+more than that. An empty datagram is a datagram, and `recv_from` answers zero for it.
+
+`connect` on a `UdpSocket` fixes where it talks to: `send` then goes there without naming it, and
+`recv` takes datagrams from there and from nowhere else. A lost datagram is waited for forever
+unless `read_timeout` says otherwise, which is the reason a UDP client sets one.
+
+
+## An address is a sysl value
+
+`Address` is an IP address and a port: four bytes or sixteen, a port, and — for a link-local IPv6
+address — the interface it is scoped to. It compares with `==` and hashes like any other value, so a
+server can key a table on whoever sent it something. `resolve` answers addresses, and **`ipv4` and
+`ipv6` build one with no resolver at all**, which is what a program on a machine without one writes:
+
+```sysl
+import sysl.net.{ipv4, ipv6}
+
+val a = ipv4(10, 0, 2, 15, 8007)
+
+print(a, a.family(), a.octets()[3], a.with_port(7))
+print(ipv6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 443))
+print(ipv6([0xfe80, 0, 0, 0, 0, 0, 0, 1], 0, 4).text())
+print(ipv6([0, 0, 0, 0, 0, 0xffff, 0x7f00, 1], 0).text())
+```
+
+```output
+10.0.2.15:8007 Ipv4 15 10.0.2.15:7
+[2001:db8::1]:443
+fe80::1%4
+::ffff:127.0.0.1
+```
+
+`text()` is the numeric form and never a name: turning an address back into a hostname is a second
+lookup over the network, which is not what a program printing what it just connected to is asking
+for. An IPv6 address is written as RFC 5952 says every program should — lower-case hex, no leading
+zeros, the longest run of two or more zero groups as `::` — and printing one brackets it,
+`[::1]:8080`, because a v6 address has colons in it and `::1:8080` cannot be read apart.
+
+**`Family` is `Ipv4` and `Ipv6`, named by the version rather than by `AF_INET`'s number**, which is 30
+on Darwin and 10 under glibc and is the hosted answer's business. The `sockaddr` layouts — Darwin's
+carry a length byte glibc's do not — stay in that answer's C, where the header decides them.
+
+## Answering the network on a target with no C library
+
+**Everything above reaches the network through `sysl.net.sys` and through nothing else**: fourteen
+hooks, each an `extern` no module of the library defines.
+
+| hook | what it answers |
+|---|---|
+| `sysl_net_socket(family, kind) -> int` | a descriptor; `family` 4 or 6, `kind` `stream` (0) or `datagram` (1) |
+| `sysl_net_bind(fd, at) -> int`, `sysl_net_connect(fd, to) -> int` | zero |
+| `sysl_net_listen(fd, backlog) -> int` | zero |
+| `sysl_net_accept(fd, peer) -> int` | the new connection's descriptor, the peer written into `peer` |
+| `sysl_net_local(fd, at) -> int` | zero, the bound address written into `at` |
+| `sysl_net_send(fd, from, len) -> isize`, `sysl_net_recv(fd, into, room) -> isize` | a count of bytes |
+| `sysl_net_send_to(fd, from, len, to) -> isize`, `sysl_net_recv_from(fd, into, room, from) -> isize` | a count of bytes, the sender written into `from` |
+| `sysl_net_shutdown(fd, how) -> int`, `sysl_net_close(fd) -> int` | zero |
+| `sysl_net_option(fd, which, value) -> int` | zero; `read_timeout`, `write_timeout` (milliseconds) or `reuse_address` |
+| `sysl_net_resolve(host, host_len, port, passive, out, room) -> int` | how many addresses it wrote |
+
+**Each answers zero or more for success and the `IoError` code negated for a failure** — the contract
+of `sysl.io.sys` and `sysl.process.sys` — and `sysl.net.sys.unsupported` (`-1`) for a call the target
+cannot make at all, which reaches the caller as *not supported on this target*. A call its timeout
+stopped answers `ETIMEDOUT` negated (60 on a BSD, 110 everywhere else), which is what `timed_out`
+asks. **An address crosses as `sysl.net.sys.Endpoint`**: sixteen bytes in network order (an IPv4
+address in the first four), a scope, a port as the number itself, and the family — 24 bytes laid out
+as C lays out the same four fields, so a supplier reads it without knowing anybody's `sockaddr`.
+
+On a hosted target the library answers them itself, under `weak` exports
+([a module may supply another module's extern](/reference/ffi/)). A freestanding program answers
+each hook it reaches with an `@export` of its own — a kernel's UDP echo server needs six of them:
+
+```sysl
+import sysl.net.sys.Endpoint
+
+@export("sysl_net_recv_from")
+k_recv_from(fd: int, into: *u8, room: usize, from: *Endpoint) -> isize = -110
+```
+
+**A hook the program reaches and leaves unanswered is refused when it is compiled**, all of them in
+one sentence, rather than surfacing at the link as a symbol no line of the program names:
+
+```sysl target=aarch64-freestanding
+import sysl.net.{ipv4, udp_socket}
+
+val here = ipv4(10, 0, 2, 15, 8007)
+
+udp_socket(here) match
+    Ok(s) ->
+        var u = s
+        val _ = u.bind(here)
+    Err(_) -> ()
+```
+
+```error
+this program reaches 'sysl.net', and 'aarch64-freestanding' has no C library under it for the standard library to answer a network with, so the program answers it: define 'sysl_net_bind', 'sysl_net_socket' with '@export', each taking what its 'extern' in 'sysl.net.sys' declares and answering a descriptor, a count or zero, or the code of an 'IoError' negated
+```
+
+The question is asked only of what the program reaches, so a freestanding program that builds an
+`Address` and never makes a socket is asked nothing.
 
 ## What is deliberately absent
 
-UDP, multicast, unix domain sockets, non-blocking mode, and every socket option beyond the two
+Multicast, broadcast, unix domain sockets, non-blocking mode, and every socket option beyond the two
 timeouts and `reuse_address`, which is here because a listener that has just been stopped cannot
 otherwise be started again until `TIME_WAIT` runs out — a minute or two, during which the program
 looks broken.
 
 **All of them are additive**, so leaving them out costs a later release nothing, and guessing at them
-now would fix a shape before anybody has used one. That is the same reasoning that puts a portable
-`sysl.net` after the freeze rather than before it.
+now would fix a shape before anybody has used one. Each would be a hook in `sysl.net.sys` and a call
+here, which is the shape everything above already has.
