@@ -478,6 +478,34 @@ takes an `Ordering` and there is no overload that does, because **a lock's order
 what a lock means**: the exchange that takes it is an acquire, the store that frees it is a release,
 and that pairing is the whole of what makes the guarded data safe to touch.
 
+**Where the hold fits a block, `with` is the form to write**: it takes the lock, runs a closure,
+releases the lock and answers what the closure answered, so the release cannot be forgotten or
+skipped by an early `return`. `try_with` is the same without spinning, answering `None` where the
+lock was held. The closure is a direct call, so both work under `@no_alloc`:
+
+```sysl
+@no_alloc
+@no_os
+
+import sysl.sync.*
+
+var lk = SpinLock(0)
+val lp = &lk
+var count = 0
+val total = lk.with(() -> count + 41)
+val busy = lk.with(() -> lp.try_with(() -> 1).is_none())
+
+print(total, busy, lk.held)
+```
+
+```output
+41 true 0
+```
+
+`lock` and `unlock` stay for the hold a block cannot express — a scheduler's run-queue lock taken on
+one thread and released on the next, after the switch. A spinlock hands out no address, so unlike
+[`Mutex[T]`](/library/threads/#mutex-t) there is nothing the raw pair could let outlive the hold.
+
 ### Three things it will not do for you
 
 **It guards nothing by construction.** A spinlock is a flag beside the data, and what the data is

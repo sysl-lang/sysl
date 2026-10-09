@@ -46,6 +46,26 @@ struct SpinLock
     /** Takes the lock if it is free, and answers whether it did. Never spins. */
     try_lock(*self) -> bool = atomic_swap(&self.held, 1, Acquire) == 0
 
+    /** Takes the lock, runs `body`, releases the lock, and answers what `body` answered.
+     *
+     * The form to write wherever the hold fits a block: the release cannot be forgotten or skipped
+     * by an early `return`. A spinlock hands out no address, so there is nothing to lend; `lock` and
+     * `unlock` stay for the hold a block cannot express -- one a scheduler takes on one thread and
+     * releases on the next.
+     */
+    with[R](*self, body: () -> R) -> R
+        self.lock()
+
+        defer self.unlock()
+        body()
+
+    /** The same, if the lock is free: `Some` of what `body` answered, or `None` without spinning. */
+    try_with[R](*self, body: () -> R) -> Option[R]
+        if !self.try_lock() then return None
+
+        defer self.unlock()
+        Some(body())
+
     /** Releases the lock.
      *
      * Nothing checks that the releasing thread is the one that took it, or that it was held at all:
