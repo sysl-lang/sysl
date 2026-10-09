@@ -27,6 +27,7 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 |---|---|---|
 | [`sysl`](/library/core/) | the core — `Option`, `Result`, `Display`, the operator traits, `print`, `assert`, and [`exit`](/library/core/#choosing-an-exit-status) for a program that chooses its own status | — |
 | [`sysl.text`](/library/text/) | the whole text surface — validation, the character cursors, `Ascii` and `Search`, splitting and joining, `StrBuilder`, the parsers, `CString` | — |
+| [`sysl.fmt`](/library/fmt/) | integers in base sixteen, two and eight as plain functions — `hex`, `binary`, `octal` — over the renderer an `f"$v%x"` hole uses, so a bare target has them | — |
 | [`sysl.unicode`](/library/unicode/) | the Unicode Character Database — case mapping that answers for `é`, [`fold`](/library/unicode/#case-mapping-is-a-character-at-a-time-and-folding-is-not) as the comparison key, the four [normal forms](/library/unicode/#normalization-and-why-comparing-needs-it), [grapheme clusters](/library/unicode/#a-grapheme-cluster-is-the-third-answer-to-how-long-text-is), and `General_Category` | — |
 | [`sysl.regex`](/library/regex/) | POSIX Extended Regular Expressions — `regex`, `Regex`, `Match` | — |
 | [`sysl.buf`](/library/buf/) | `Buf[T]`, the growable sequence, and `ByteSink` | — |

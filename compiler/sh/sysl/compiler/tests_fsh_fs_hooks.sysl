@@ -336,6 +336,75 @@ fsh_io_error_message_needs_no_snprintf()
     lbr_drop([p, out])
 end fsh_io_error_message_needs_no_snprintf
 
+// A program rendering integers through `sysl.fmt.hex`, `binary` and `octal` at three widths.
+private val fsh_hex_helpers: string = raw"""
+    import sysl.fmt.hex
+    import sysl.fmt.binary
+    import sysl.fmt.octal
+
+    run() -> int =
+        val big: u64 = 0xdeadbeef
+        val a = hex(big, 16, true)
+        val b = hex(i8(-1))
+        val c = binary(u16(5), 8)
+        val d = octal(i32(-8))
+        val w = u64(a.bytes.len + b.bytes.len + c.bytes.len + d.bytes.len)
+        int(f"$w%016x".bytes.len)
+    """
+
+@test("a freestanding program formatting through sysl.fmt.hex, binary and octal links with no libc symbol")
+fsh_hex_helpers_need_no_libc()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_hex_helpers + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    assert(!fsh_names(all, "snprintf"), "'snprintf' is in the image")
+    assert(all.contains("format_int"), all)
+
+    lbr_drop([p, out])
+end fsh_hex_helpers_need_no_libc
+
+// A program formatting 128-bit integers in decimal and hexadecimal, through f-string holes and the
+// helpers, whose decimal path would call a compiler-runtime division if it divided at 128 bits.
+private val fsh_wide_format: string = raw"""
+    import sysl.fmt.hex
+
+    run() -> int
+        val m: u128 = 340282366920938463463374607431768211455
+        val lo: i128 = -170141183460469231731687303715884105727 - 1
+        val a = f"$m%d"
+        val b = f"$lo%d"
+        val c = f"$m%x"
+        val d = hex(lo)
+
+        int(a.bytes.len + b.bytes.len + c.bytes.len + d.bytes.len)
+    end run
+    """
+
+@test("a freestanding program formatting 128-bit integers links with no libc and no compiler-runtime symbol")
+fsh_wide_format_needs_no_runtime()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_wide_format + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    assert(!fsh_names(fsh_symbols(elf, false), "snprintf"), "'snprintf' is in the image")
+
+    lbr_drop([p, out])
+end fsh_wide_format_needs_no_runtime
+
 @test("a freestanding program reaching a float or string specifier is refused at each, naming the target")
 fsh_c_specifier_is_refused()
     if !lbr_ready() then return
