@@ -452,7 +452,7 @@ private const_conversion(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr
     val name = written.unwrap()
     val target = scalar_named(name, word_bits(cx)).or_else(() -> width_of(cx, name))
 
-    if target.is_none() then return None
+    if target.is_none() then return made_new_const(cx, callee, args.at(0))
 
     val value = const_fold(cx, args.at(0))
 
@@ -460,6 +460,18 @@ private const_conversion(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr
 
     converted(cx, span, value.unwrap(), target.unwrap())
 end const_conversion
+
+// `Ip(0x0a00_020f)` -- a `new` type made from its base. **The value is the base's, unchanged**: the
+// wrap is a change of name and not of number, so nothing narrows here, and the constant's declared
+// type is what then holds the number to the base's width and to a `within` range. A type with a
+// `where` predicate has a check only a run can make, and folds nothing.
+private made_new_const(cx: &Analyzer, callee: Expr, arg: Expr) -> Option[Const]
+    subject_named(cx, callee) match
+        Some(Constrained(d)) -> if !d.derived || d.pred_fn.is_some() then return None
+        _ -> return None
+
+    const_fold(cx, arg)
+end made_new_const
 
 private converted(cx: &Analyzer, span: Span, v: Const, target: Type) -> Option[Const] = v match
     ConstInt(n) -> target match

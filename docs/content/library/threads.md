@@ -240,9 +240,7 @@ struct Shared
 
 add_up(s: *Shared)
     for i in 0..<10000
-        s.guard.lock()
-        s.total = s.total + 1
-        s.guard.unlock()
+        s.guard.with(() -> s.total = s.total + 1)
 
 var sh = Shared(SpinLock(0), 0)
 var s1 = spawn(&add_up, &sh).unwrap()
@@ -287,8 +285,7 @@ unchecked one.
 ## `Mutex[T]`
 
 `Mutex[T]` **owns what it protects**, which is the whole difference against `SpinLock`. Both of its
-fields are private, so there is no way to reach the value that does not go through `lock` or
-`try_lock`:
+fields are private, so there is no way to reach the value that does not go through the lock:
 
 ```sysl
 import sysl.posix.threads.*
@@ -313,32 +310,25 @@ The private field does a second job: it puts the **positional constructor** out 
 import sysl.posix.threads.*
 
 var built = Mutex(0, 5)
-var p = built.lock()
 
-print(*p)
+built.with((p) -> print(*p))
 ```
 
 ```error
 the constructor names every field of 'sysl.posix.threads.Mutex' in order, and 'held' is private to 'library/sysl/posix/threads/mutex.sysl', the file that declares it — build it through an associated function of its own
 ```
 
-### `lock` answers an address, and releasing is written
+### `with` lends the value for one call
 
-Rust returns a guard whose destruction releases the lock. sysl has a
-[destructor](/reference/memory/) now and deliberately does not use it here: a destructor runs for a
-value held behind a `&T`, so a guard would mean a heap allocation per `lock` — on the one path where
-the whole point is to hold a lock for as few instructions as possible. `defer m.unlock()` is the
-idiom, the same one [`sysl.fs`](/library/fs/) uses for `close`, and for the same reason.
+`m.with(body)` takes the lock, calls `body` with the **address** of the value, releases the lock when
+`body` returns, and answers whatever `body` answered:
 
 ```sysl
 import sysl.posix.threads.*
 
 inc(m: *Mutex[i32])
     for i in 0..<10000
-        var p = m.lock()
-
-        defer m.unlock()
-        *p = *p + 1
+        m.with((n) -> *n += 1)
 
 var mx = Mutex.new(0)
 var a1 = spawn(&inc, &mx).unwrap()
@@ -347,58 +337,89 @@ var a2 = spawn(&inc, &mx).unwrap()
 a1.join()
 a2.join()
 
-var mp = mx.lock()
-
-print(*mp)
-
-mx.unlock()
+print(mx.with((n) -> *n))
 ```
 
 ```output
 20000
 ```
 
-`defer` is [block-scoped](/reference/statements/), not function-scoped, so the `defer` inside that
-loop body runs at the end of **each iteration** — which is what makes it usable for a lock taken in
-a loop at all, and is the point at which sysl's `defer` and Go's stop agreeing.
+**The address is lent, and the compiler holds the closure to giving it back.** `with` is declared
+[`@lends(body)`](/reference/memory/#a-pointer-lent-for-one-call), so a closure passed there may read
+and write through the address, and hand it to a function that only uses it, but may not let it
+outlive the call — the mistake an address returned from `lock` could never be protected from:
 
-**The mistake this shape cannot prevent** is holding on to the address past the `unlock`. Nothing
-takes it away from you, and nothing will tell you.
+```sysl
+import sysl.posix.threads.*
 
-`try_lock` never waits and answers an `Option[*T]`, which is the ordinary shape for "it might not
-have worked":
+var m = Mutex.new(1)
+val p = m.with((n) -> n)
+
+print(*p)
+```
+
+```error
+lends this body a pointer that is valid only until the call returns, and this one is returned
+```
+
+Rust answers the same question with a guard whose destruction releases the lock. A sysl
+[destructor](/reference/memory/) runs for a value behind a `&T`, so a guard would be a heap allocation
+per hold — on the one path where the point is to hold a lock for as few instructions as possible. The
+closure costs nothing: `body` is a type parameter, so each call is a direct call of that closure's own
+body, and `with` is usable under `@no_alloc`.
+
+`try_with` never waits, and answers an `Option` of what `body` answered — `None` where the lock was
+held:
 
 ```sysl
 import sysl.posix.threads.*
 
 var q = Mutex.new(5)
-var g = q.try_lock()
+val qp = &q
 
-print(g.is_some(), *g.unwrap())
-
-var again = q.try_lock()
-
-print(again.is_some())
-
-q.unlock()
-
-var third = q.try_lock()
-
-print(third.is_some())
-
-q.unlock()
+print(q.try_with((v) -> *v).unwrap())
+print(q.with((v) -> qp.try_with((w) -> *w).is_none()))
 ```
 
 ```output
-true 5
-false
+5
 true
 ```
 
-Neither `lock` nor `try_lock` takes an `Ordering`, and neither does `unlock`, because **a lock's
-orderings are fixed by what a lock means**. The exchange that takes it is an acquire and the store
-that frees it is a release, and that pairing is what publishes everything the holder wrote to
-whichever thread takes the lock next. It is the whole of what makes the data safe to touch.
+### `lock_raw` is the hold a block cannot express
+
+Some holds are not a block: a lock taken in one function and released in another, or handed from one
+thread to the next with the processor. `lock_raw` answers the address and `unlock_raw` releases it,
+and **nothing ties the address to the hold** — which is what the name says, and why `with` is the one
+to reach for wherever the hold does fit a block. `defer` is the idiom for a raw hold, as it is for
+[`sysl.fs`](/library/fs/)'s `close`:
+
+```sysl
+import sysl.posix.threads.*
+
+var m = Mutex.new(3)
+var p = m.lock_raw()
+
+*p = *p * 2
+m.unlock_raw()
+
+var g = m.try_lock_raw()
+
+print(g.is_some(), m.try_lock_raw().is_none())
+
+m.unlock_raw()
+print(m.with((v) -> *v))
+```
+
+```output
+true true
+6
+```
+
+None of these takes an `Ordering`, because **a lock's orderings are fixed by what a lock means**. The
+exchange that takes it is an acquire and the store that frees it is a release, and that pairing is
+what publishes everything the holder wrote to whichever thread takes the lock next. It is the whole of
+what makes the data safe to touch.
 
 ### It is not built on `pthread_mutex_t`
 

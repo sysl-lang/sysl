@@ -881,12 +881,13 @@ print(f64(Meters(1.0) + Feet(1.0)))
 ```
 
 A derived type does not mix with its **base** either, and no position excuses it — an initializer, an
-argument and a returned value each refuse it:
+argument and a returned value each refuse a value that already *has* the base type:
 
 ```sysl
 type Meters = new f64
 
-var q: Meters = 3.0
+val r = 3.0
+var q: Meters = r
 
 print(f64(q))
 ```
@@ -897,6 +898,40 @@ cannot initialize 'q': declared Meters but the value is real
 
 Going in either direction is a **written conversion**: `Meters(x)` wraps, `f64(m)` unwraps, and the
 wrap is where the constraint is checked.
+
+**A bare literal is the exception, because it has no type of its own to defend.** It takes its type
+from where it sits — `x + 1` reads the 1 at `x`'s width — and a `new` type's position is no different,
+so the literal is that type's value, read at the base and checked as `Meters(3.0)` would be:
+
+```sysl
+type Meters = new f64
+type PhysAddr = new u64
+
+var q: Meters = 3.0
+val p = PhysAddr(0x4000_0000)
+
+print(f64(q * 2.0), u64(p + 4096), p < 0x8000_0000)
+```
+
+```output
+6 1073745920 true
+```
+
+What stays a written conversion is a value that already has a type: `p + n` over an `n: u64` is still
+refused, since a `u64` is not an address — which is the mistake the type exists to catch. A literal
+that does not fit the base is refused at the base:
+
+```sysl
+type Ip = new u32
+
+val i: Ip = 0x1_0000_0000
+
+print(u32(i))
+```
+
+```error
+the literal 4294967296 does not fit uint
+```
 
 The payoff is a specific bug. A table-driven program has several small integers that index different
 things — a task number, a lock number, a priority level — and the mistake such a program actually
@@ -1004,7 +1039,7 @@ the one row a derivation may replace, and the operators are not.
 |---|---|---|
 | distinct type | yes | yes |
 | the base's catalogue | free; only `Display` is replaceable | nothing, write it all |
-| an operation the base does not have | impossible | ordinary |
+| an operation the base does not have | a member, or an `impl` at another argument list | ordinary |
 | an operation the base has that is now nonsense | present anyway | absent |
 | rendering as something other than the base | `override impl Display` | ordinary |
 
@@ -1014,10 +1049,84 @@ of its own**: an instant plus a duration is an instant, an instant plus an insta
 no derived scalar can be told the difference. The cost is real and was measured — a date-and-time
 library written this way needs one-field structs and five `impl` blocks per type.
 
-What has no answer today is the case in the middle: a type that wants most of its base's catalogue
-and one row of its own. `impl Add[Duration] for Instant` takes something the base could never have
-taken and touches no guarantee of `i64`'s, but it is refused because the check is on the method
-*name*, and `add` is taken.
+The case in the middle — a type that wants most of its base's catalogue and a few rows of its own —
+is a derivation with **members**, and an `impl` at an argument list the base does not have, as
+`Stamp + Span` above is.
+
+### A `new` type may declare members
+
+A body indented under a `new` type's declaration holds its members, written as a struct's are, and
+`self` is the type's value:
+
+```sysl
+type PhysAddr = new u64
+    page(self) -> u64 = u64(self) >> 12
+    offset(self) -> u64 = u64(self) & 0xfff
+    plus(self, n: u64) -> PhysAddr = self + PhysAddr(n)
+
+val p = PhysAddr(0x4020_1234)
+
+print(p.page(), p.offset(), u64(p.plus(0x1000)))
+```
+
+```output
+262657 564 1075847732
+```
+
+A generic one is written the same way, and its parameter is in scope in every member:
+
+```sysl
+struct Frame
+    sp: u64
+    pc: u64
+
+type UserPtr[T] = new u64
+    next(self) -> UserPtr[T] = self + UserPtr[T](u64(sizeof(T)))
+
+val f = UserPtr[Frame](4096)
+
+print(u64(f.next()), u64(UserPtr[u8](4096).next()))
+```
+
+```output
+4112 4097
+```
+
+The body holds **members and nothing else** — the value is the base, so there is no field for it to
+hold:
+
+```sysl
+type PhysAddr = new u64
+    raw: u64
+```
+
+```error
+'PhysAddr' is its base's value and holds no fields — its body declares members, and a type with fields of its own is a 'struct'
+```
+
+Only a `new` type has members. Without `new` the declaration is another name for its base, so a member
+written there would be a member of every value of the base:
+
+```sysl
+type Age = int within 0..150
+    older(self) -> Age = self + 1
+```
+
+```error
+'Age' is not a 'new' type, so its values are int's and a member written here would be a member of every int — 'new' after the '=' makes it a type of its own, which may have members
+```
+
+A member may add to the catalogue and may not replace it, by the rule above: one named for an
+operator's method is refused as the `impl` would be.
+
+```sysl
+type Stamp = new i64
+    add(self, o: Stamp) -> Stamp = Stamp(0)
+```
+
+```error
+'add' is how 'Add' is implemented for Stamp, and the compiler provides that — a member of this name would hide it
+```
 
 **A subtype narrows which values a type has, never which operations it has** — so what the base does
 not have, the subtype does not either, and the diagnostic names the subtype rather than the base:
@@ -1147,6 +1256,78 @@ Age has no zero value, so 'a' needs an initial value
 
 That holds whether or not the range contains zero. Making it the **type's** rule rather than the
 range's means widening a range never silently changes whether a declaration compiles somewhere else.
+
+**A `new` type that checks nothing is not constrained in that sense**, and has its base's zero. With
+no range and no predicate every value of the base is one of its own, zero included, so the rule would
+protect nothing — and an address type that could not sit in zero-filled storage could not be the type
+of an address in a table:
+
+```sysl
+type Ip = new u32
+
+struct Entry
+    valid: bool
+    ip: Ip
+
+var table: [4]Entry
+var none: Ip
+
+print(u32(table[2].ip), u32(none))
+```
+
+```output
+0 0
+```
+
+A `new` type with a range is a checking type, and the rule above is its rule:
+
+```sysl
+type Slot = new u8 within 0..<8
+
+var s: Slot
+
+print(u8(s))
+```
+
+```error
+Slot has no zero value, so 's' needs an initial value
+```
+
+### A constant may have a constrained type
+
+A constant's value is folded while compiling, so a range is settled there, once, against the folded
+number; and a constant of a `new` type is the base's constant written through the conversion — or a
+bare literal, which takes the type as anywhere else:
+
+```sysl
+type Ip = new u32
+type Slot = new u8 within 0..<8
+
+const OUR_IP: Ip = Ip(0x0a00_020f)
+const GATEWAY: Ip = 0x0a00_0202
+const LAST: Slot = 7
+
+print(u32(OUR_IP), u32(GATEWAY), u8(LAST), OUR_IP == GATEWAY)
+```
+
+```output
+167772687 167772674 7 false
+```
+
+A value the range does not admit is refused at the declaration:
+
+```sysl
+type Slot = new u8 within 0..<8
+
+const T: Slot = 9
+```
+
+```error
+'T' is 9, which Slot does not admit — it holds 0 to under 8
+```
+
+A `where` predicate is refused: it is a function run where a value is made, and a constant is folded
+into its uses rather than made anywhere.
 
 ### A violated check traps, and there is no `try`
 
