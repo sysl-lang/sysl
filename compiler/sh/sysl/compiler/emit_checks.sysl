@@ -38,6 +38,7 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
     check_tail_calls(a, p.funcs)
     check_tail_jumps(a, p)
     check_shared_storage(a, p)
+    check_pinning(a, p)
     check_exports_emitted(a, emitted, own)
     check_general_regs(a, emitted)
     promotions
@@ -384,15 +385,21 @@ check_image_storage(a: &Analysis, p: TProgram, own: Buf[string], entry: string)
 end check_image_storage
 
 // **An `extern` naming `main` is a start file's call into the program**, and a bare image whose entry
-// is a symbol of its own is the one place that call has somebody to make it: the platform starts at
-// the entry, and calling `main` -- which fills the computed storage, runs the top-level statements
-// and calls a declared `main` -- is the entry's job. Everywhere else `main` is where the platform
-// itself starts, and the declaration was refused where it was written (`check_foreign_symbol`).
+// is a symbol of its own is one place that call has somebody to make it: the platform starts at the
+// entry, and calling `main` -- which fills the computed storage, runs the top-level statements and
+// calls a declared `main` -- is the entry's job. Everywhere else `main` is where the platform itself
+// starts, and the declaration was refused where it was written (`check_foreign_symbol`).
 //
-// So on a bare image it is refused here where the manifest names no entry, or names `main` itself;
-// and where it is allowed it has to be declared at the signature `main` is emitted at -- C's
-// `(argc, argv) -> int`, which `emit_entry.sysl` gives it whatever the program declared, since a call
-// at another signature reads arguments nobody passed.
+// **A `build-c` archive is the other place, when it is the C program's runtime** -- a crt0 whose
+// `_start` sets the machine up and calls the C program's `main`. The archive says so the way an image
+// does, by naming the symbol it starts at in `targets.<machine>.entry`; the `extern` then declares the
+// C program's `main`, which the archive does not define. An archive naming no entry is a library the
+// C program calls into, and `main` is none of its business.
+//
+// So on a bare image or an archive it is refused here where the manifest names no entry, or names
+// `main` itself; and where it is allowed it has to be declared at the signature `main` is emitted at
+// -- C's `(argc, argv) -> int`, which `emit_entry.sysl` gives it whatever the program declared, since
+// a call at another signature reads arguments nobody passed.
 check_main_extern(a: &Analysis, p: TProgram, entry: string)
     val t = a.tables.target
 
@@ -405,12 +412,20 @@ check_main_extern(a: &Analysis, p: TProgram, entry: string)
 
         val at = home.unwrap()
 
-        if p.c_artifact || entry == "" || entry == "main"
+        if entry == "" || entry == "main"
+            if p.c_artifact
+                a.fault(at.scope, at.span, "an 'extern' may name 'main' in an archive only where the " +
+                        "archive is the C program's runtime, whose entry calls it — and this archive " +
+                        "names no entry other than 'main', so 'main' is the C program's and nothing here " +
+                        s"starts before it. A C runtime says so with 'targets.${t.name}.entry' in its " +
+                        "package.hocon, naming the symbol it starts at")
+                continue
+            end if
+
             var starts = s"this image names no entry of its own ('targets.${t.name}.entry'), so " +
                 "'main' is where it starts"
 
             if entry == "main" then starts = s"this image starts at 'main' ('targets.${t.name}.entry')"
-            if p.c_artifact then starts = "this archive has no entry of its own, so 'main' is the C program's"
 
             a.fault(at.scope, at.span, s"an 'extern' may name 'main' only on an image that starts " +
                     s"somewhere else, whose entry calls it — and $starts")
@@ -476,6 +491,8 @@ private hook_modules() -> Buf[HookModule]
                          "a count or zero, or the code of an 'IoError' negated"))
     rows.push(HookModule("sysl.process.sys", "sysl.process", "starts or waits for a process", "one",
                          "a process id, a length or zero, or the code of an 'IoError' negated"))
+    rows.push(HookModule("sysl.net.sys", "sysl.net", "reaches 'sysl.net'", "a network",
+                         "a descriptor, a count or zero, or the code of an 'IoError' negated"))
     rows
 end hook_modules
 

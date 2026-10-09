@@ -31,8 +31,8 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.math.complex`](sysl-math-complex/) | Complex numbers, at whichever floating-point width the program is already using. |
 | [`sysl.math.decimal`](sysl-math-decimal/) | Exact decimal arithmetic: an integer coefficient and a scale, so `0.1 + 0.2` is `0.3`. |
 | [`sysl.math.rational`](sysl-math-rational/) | Exact fractions: a numerator and a denominator, both `BigInt`s, so a third is a third. |
+| [`sysl.net`](sysl-net/) | Blocking sockets -- a TCP stream, a UDP socket -- and the names a host resolves to. |
 | [`sysl.path`](sysl-path/) | Path handling that is decided by the string alone. |
-| [`sysl.posix.net`](sysl-posix-net/) | Blocking TCP, and the names a host and a service resolve to. |
 | [`sysl.posix.rand`](sysl-posix-rand/) | A seed taken from the host, for a program that wants a different sequence on every run. |
 | [`sysl.posix.threads`](sysl-posix-threads/) | Threads of execution, and the two things a program does with one: start it, and wait for it. |
 | [`sysl.posix.time`](sysl-posix-time/) | Reading the two clocks the host keeps, which is the one thing `sysl.time` deliberately cannot do. |

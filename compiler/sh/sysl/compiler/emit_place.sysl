@@ -48,13 +48,30 @@ place_ty(x: TExpr) -> Type = *x.kind match
     TGlobal(_, declared, _) -> declared
     _ -> texpr_type(x)
 
+// Where module storage is: the global itself -- or, for `@per_cpu` storage, this core's copy: the
+// `.percpu` image's address plus the offset the program keeps in the register
+// `codegen.per_cpu_offset` names (`reference/attributes.md § @per_cpu`). The register is read at
+// every access, volatile, so a read is never carried across anything that could move the thread.
+global_address(e: *Emit, symbol: string) -> Val
+    if !e.per_cpu.has(symbol) then return VGlobal(symbol_of(e, symbol))
+
+    val offset = read_register(e, per_cpu_register().unwrap_or("tpidr_el1"))
+    val r = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(LInt(64), offset))
+    emit(e, InGep(r, LInt(8), VGlobal(symbol), idx))
+    r
+end global_address
+
 // The address of a place, as a `ptr` register or an existing slot name.
 address(e: *Emit, place: TExpr) -> Val = *place.kind match
     TLoad(name, _) -> local_slot(e, name)
 
     // A `val`'s storage is the global itself, so its address needs no instruction to compute -- it
     // is what makes indexing one reach into the table rather than copy it out first.
-    TGlobal(symbol, _, _) -> VGlobal(symbol_of(e, symbol))
+    TGlobal(symbol, _, _) -> global_address(e, symbol)
     TDeref(operand, _) -> payload_addr(e, operand)
 
     // A zero-sized field occupies nothing, so it is wherever its receiver is: the address is never

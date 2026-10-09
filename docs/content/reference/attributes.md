@@ -10,7 +10,7 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@noinline`, `@inline`, `@cold`, `@no_alloc` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@lends`, `@noinline`, `@inline`, `@cold`, `@no_alloc`, `@no_block`, `@blocks` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@borrows` | an **annotation** on a trait's method — see [`@borrows`](/reference/traits/#a-method-may-promise-to-borrow) | the grammar |
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; the one an `extern` takes | the grammar |
@@ -69,8 +69,8 @@ covered under [modules](/reference/modules/) and [FFI](/reference/ffi/), where w
 only itself. It attaches to nothing, declares no name, and nothing can refer to one — two saying the
 same thing are two checks rather than a duplicate. It is below.
 
-**On a member, four: the ones that are about a PARAMETER.** `@crossing`, `@borrows`, `@reads` and
-`@writes` each name parameters, and a method, a property or an associated function has parameters
+**On a member, five: the ones that are about a PARAMETER.** `@crossing`, `@borrows`, `@lends`,
+`@reads` and `@writes` each name parameters, and a method, a property or an associated function has parameters
 exactly as a free function does — so there was never anything for a blanket refusal to be about in
 their case:
 
@@ -91,8 +91,8 @@ print(c.send(&n))
 7
 ```
 
-Beside them a member takes the four about the function it lowers to — `@noinline`, `@inline`, `@cold`
-and `@no_alloc`. Everything else is refused, and the line is what the annotation is **about** rather
+Beside them a member takes the six about the function it lowers to — `@noinline`, `@inline`, `@cold`,
+`@no_alloc`, `@no_block` and `@blocks`. Everything else is refused, and the line is what the annotation is **about** rather
 than where it is written. "A function" in the list above means a *free* function: what `sysl test` calls, what
 recurses, what a symbol names, how a type is laid out — none of which a member supplies.
 
@@ -1284,6 +1284,162 @@ print(f())
 
 ```error
 Above a function or a method, '@no_alloc' holds that one definition instead, and this declares neither
+```
+
+## `@no_block` and `@blocks` — a path that must never wait
+
+An interrupt handler may take a completion and wake a thread, and must never sleep: sleeping there
+switches away from an exception frame with the interrupt still unacknowledged. A real-time audio
+callback is held to the same rule by a deadline rather than by a machine. **`@no_block` is that
+promise, and `@blocks` marks what breaks it.** Above a function or a method, `@no_block` says the
+definition never waits; in a file's header it says it of every body in the module. Either way it is
+checked as `@no_alloc` is, **through every call the body makes**: a call that reaches a declaration
+marked `@blocks` is refused at the smallest piece of the body that still arrives there.
+
+```sysl
+struct WaitQueue
+    n: int
+
+    @blocks
+    sleep(*self) = self.n += 1
+
+read_sector(q: *WaitQueue) -> int
+    q.sleep()
+    1
+
+@no_block
+on_irq(q: *WaitQueue) -> int = read_sector(q) + 1
+
+var q = WaitQueue(0)
+print(on_irq(&q))
+```
+
+```error
+this reaches 'read_sector', which blocks through 'WaitQueue.sleep', and 'on_irq' declared '@no_block'
+```
+
+The refusal names the call the reader wrote and, after `through`, the declaration it arrives at —
+the line to change is the first, and the reason is the second. A body that keeps the promise compiles,
+and a sibling beside it may wait as much as it likes:
+
+```sysl
+struct WaitQueue
+    n: int
+
+    @blocks
+    sleep(*self) = self.n += 1
+
+@no_block
+take(n: int) -> int = n + 1
+
+drain(q: *WaitQueue) -> int
+    q.sleep()
+    q.n
+
+var q = WaitQueue(0)
+print(take(1), drain(&q))
+```
+
+```output
+2 1
+```
+
+**Whether something waits is declared, not inferred.** A C function's waiting is invisible to the
+compiler, and a sysl loop that spins until another thread moves cannot be told from a search, so
+`@blocks` is written where the waiting is: above a function, a method, or an `extern` whose C call
+waits.
+
+```sysl
+@blocks
+extern "usleep" c_usleep(us: u32) -> int
+
+@no_block
+nap() -> int = c_usleep(10)
+
+print(nap())
+```
+
+```error
+this reaches 'c_usleep', which blocks, and 'nap' declared '@no_block'
+```
+
+**The standard library marks its own waiting operations**: `sysl.posix.time`'s `sleep` and
+`nanosleep`, `Mutex.with` and `Mutex.lock_raw`, `Thread.join`, `Channel.send` and
+`Channel.receive`, `sysl.net`'s `Socket.connect`, `accept`, `send`, `send_all` and `recv` and
+`UdpSocket.send`, `send_to`, `recv` and `recv_from`, `Child.wait`, and the hooks a blocking read or
+write of a descriptor, a file or a socket goes through — so a promised body reaches none of them,
+however many calls away. `block_on`, which drives a task to its end on the calling thread, has no
+declaration to mark and counts as blocking all the same. A generic is named as it was declared, since the type argument says nothing about
+whether it waits:
+
+```sysl
+import sysl.posix.threads.Mutex
+
+f() -> int = 1
+
+@no_block
+guarded(m: *Mutex[int]) -> int = *m.lock_raw()
+
+print(f())
+```
+
+```error
+this reaches 'sysl.posix.threads.Mutex.lock_raw', which blocks, and 'guarded' declared '@no_block'
+```
+
+A call through a trait object reaches the implementation the body erased into it, as for `@no_alloc`.
+`try_with`, `try_lock_raw`, `try_send` and `try_receive` never wait and are not marked. A spin lock is not marked
+either: it waits only as long as another core holds it, which is what an interrupt handler's own locks
+are made of.
+
+**The rules for where it stands are `@no_alloc`'s.** Directly under the header the word is the
+module's clause, and a function there answers to it; a method may promise it; a function declared
+inside another may not, being a closure. `@blocks` takes no arguments and marks a function, a method
+or an `extern` function and nothing else — an `extern` variable is read rather than called:
+
+```sysl
+f() -> int = 1
+
+@blocks
+struct P
+    x: int
+
+print(f())
+```
+
+```error
+'@blocks' says a call may wait, so it marks a function, a method or an 'extern' — and this declares none of them
+```
+
+The two above one definition contradict each other:
+
+```sysl
+f() -> int = 1
+
+@blocks
+@no_block
+g() -> int = 2
+
+print(g())
+```
+
+```error
+'@blocks' says this definition may wait and '@no_block' that it never does
+```
+
+**Waiting is conduct, not a facility.** No machine takes it away, so `@no_block` has no
+`requires` beside it the way `@no_alloc` has `requires heap`, and `@requires(block)` and
+`@needs(block)` are refused:
+
+```sysl
+@needs(block)
+f() -> int = 1
+
+print(f())
+```
+
+```error
+'block' is what a module does, not something a machine has, and no machine takes it away
 ```
 
 ## `@tailrec` — an assertion that the frame is reused
@@ -2543,6 +2699,307 @@ print(n)
 
 What a bare target uses instead is exactly this: a plain module `var` the port's scheduler answers
 for, the same shape the ownership runtime's reaper slot already takes.
+
+### On a bare AArch64 machine the program may own the thread pointer
+
+A kernel is the thing that writes the thread pointer, so on `aarch64-freestanding` the refusal above
+becomes a question: which register? The manifest answers it, and from then on `@thread_local` compiles
+to the local-exec model against that register:
+
+```hocon
+codegen {
+  thread_pointer = "tpidr_el1"
+}
+```
+
+The register is any of `tpidr_el0`, `tpidrro_el0`, `tpidr_el1`, `tpidr_el2` and `tpidr_el3`. Every
+function is compiled to read it (clang's `-mtp`), and so is a package's carried C, so a
+`_Thread_local` there and a `@thread_local` here find one block.
+
+**What the program then owes is what a loader would have done.** The linker gathers every
+thread-local into a `.tdata` image (the initial values) and a `.tbss` (the zeros), and on AArch64 a
+variable lives at the thread pointer plus 16 plus its offset in that image, the 16 bytes being reserved
+for the thread's own use. So for each thread the program sets aside 16 bytes plus the image, rounded
+to the image's alignment, copies `.tdata` in after the 16, zeroes the `.tbss` part, and writes the
+block's address to the register on every switch. A linker script names the bounds for it to copy:
+
+```text
+.tdata : { __tdata_start = .; *(.tdata .tdata.*) __tdata_end = .; }
+.tbss  : { *(.tbss .tbss.*) *(.tcommon) __tbss_end = .; }
+```
+
+A thread that never gets a block reads whatever the register points at, as it would through any
+pointer the program forgot to set. A register the machine has no use for is refused before anything
+is built:
+
+```sysl target=aarch64-freestanding
+@thread_local static var n: int = 0
+
+print(n)
+```
+
+```error
+cannot be '@thread_local' on 'aarch64-freestanding' until the program says which register holds the thread pointer
+```
+
+## `@per_cpu` — one copy per processor core
+
+`@per_cpu` gives a module `var` one copy per **core** rather than per thread: the record a scheduler
+keeps for each processor, the core's run queue, its tick count. It exists only on `aarch64-freestanding`,
+where the program owns a register to find the copy through, and the manifest names that register:
+
+```hocon
+codegen {
+  per_cpu_offset = "tpidr_el1"
+}
+```
+
+Every `@per_cpu` binding is laid down in one section, `.percpu`, and that section is the **image** each
+core's copy is made from. The register holds this core's copy's address *minus* the image's, so an
+access is the binding's address plus the register — read afresh at every access — and a core whose
+register is zero is using the image itself. A boot core can therefore use its per-core data before it
+has made any copies, provided it zeroes the register first. For the others the program copies the
+image once per core and writes each core's offset:
+
+```text
+.percpu : { __percpu_start = .; *(.percpu) __percpu_end = .; }
+```
+
+```sysl
+@per_cpu
+var ticks: u64 = 0
+
+@pinned
+tick() -> u64
+    ticks += 1
+    ticks
+```
+
+Its initializer has to be one the compiler can write down, as a `@thread_local`'s does, and it stands
+beside `@align(n)` and nothing else: the section is the storage class's own.
+
+### A per-core read is right only where the core cannot change
+
+Which copy `ticks` names depends on the core *running*, so the read is right only while the thread
+cannot move: a thread preempted between finding its core's copy and using it resumes on another core
+holding the first core's. Nothing in a function's text says whether interrupts are masked, so the
+function says it, in one of two words:
+
+- **`@pinned`** — every caller already keeps this function on one core: it runs in an interrupt
+  handler, or under a lock that masks interrupts. That is a precondition, so **a call of a `@pinned`
+  function is held to the same rule as a per-core read**, and so is taking its address.
+- **`@pins`** — the body keeps itself on one core before it gets there (it masks interrupts first,
+  and unmasks them after). Its callers are asked nothing.
+
+A `@per_cpu` binding may be named, and a `@pinned` function called, only inside a body marked one or
+the other. The words are the program's claim, as an `@export`'s symbol is — the compiler cannot see a
+register being written — but they put the claim at the function, where a reader can check it against
+the code, and they carry it up the call tree to the place that keeps the core still.
+
+The rule is not about storage, so it runs anywhere a `@pinned` function is written:
+
+```sysl
+@pinned
+depth() -> int = 3
+
+@pins
+probe() -> int
+    // The real thing masks interrupts here and restores them after.
+    depth()
+
+print(probe())
+```
+
+```output
+3
+```
+
+A closure is a body of its own and carries neither word, since it can be called after the function
+that wrote it has let the core go; nor do the entry file's statements.
+
+```sysl
+@pinned
+depth() -> int = 3
+
+print(depth())
+```
+
+```error
+'depth' is '@pinned', so every call of it has to be made where the core cannot change, and the program's statements are neither '@pinned' nor '@pins'
+```
+
+`@pinned` says the callers hold the core still and `@pins` that the body does, so one function is one
+or the other:
+
+```sysl
+@pinned
+@pins
+depth() -> int = 3
+```
+
+```error
+'@pinned' says every caller already keeps this function on one core, and '@pins' says the function does that itself before it reaches per-core storage — one body is one or the other
+```
+
+### What it refuses
+
+Anywhere but a bare AArch64 machine, the operating system moves a thread between cores whenever it
+likes, so no answer to "which core" stays true long enough to read through:
+
+```sysl
+@per_cpu
+static var ticks: u64 = 0
+
+print(ticks)
+```
+
+```error
+cannot be '@per_cpu' on
+```
+
+On `aarch64-freestanding`, until the manifest names the register:
+
+```sysl target=aarch64-freestanding
+@per_cpu
+static var ticks: u64 = 0
+
+@pins
+tick() -> u64 = ticks
+
+print(tick())
+```
+
+```error
+cannot be '@per_cpu' until the program says which register holds this core's offset
+```
+
+A copy per thread and a copy per core are two answers to one question:
+
+```sysl
+@per_cpu
+@thread_local
+static var ticks: u64 = 0
+```
+
+```error
+'@thread_local' and '@per_cpu' are two answers to how many copies one 'var' has
+```
+
+A section would move the binding out of the image the copies are taken from:
+
+```sysl
+@per_cpu
+@section(".data")
+static var ticks: u64 = 0
+```
+
+```error
+'@per_cpu' places the binding in '.percpu', the image every core's copy is made from
+```
+
+A `val` never changes, so the one copy it has is already every core's:
+
+```sysl
+@per_cpu
+static val ticks: u64 = 0
+```
+
+```error
+a per-core constant is a constant
+```
+
+A local is in one call's frame, which no other core can see:
+
+```sysl
+count() -> u64
+    @per_cpu
+    var n: u64 = 0
+    n
+
+print(count())
+```
+
+```error
+'n' is a local, and a local is already one call's
+```
+
+## `@domain(interrupt)` — a function entered on top of whatever was running
+
+An [`interrupt`](/reference/ffi/) handler is a function the processor enters directly, in the frame
+it pushed. Most kernels do not write one: a **vector table in assembly** saves the interrupted
+registers itself and then calls an ordinary function, exactly as C would. That function is
+`@export`ed, and an export is how C enters sysl at all — almost always on the program's one thread —
+so nothing about it says a second domain exists.
+
+**`@domain(interrupt)` says so.** It changes nothing about how the function is called; it makes the
+function a root of the interrupt domain, held to what an `interrupt` handler is held to: every count
+it reaches, however many calls down, has to be atomic
+([memory § Module storage reached from another domain](/reference/memory/#module-storage-reached-from-another-domain)).
+
+```sysl build=c target=aarch64-freestanding
+import sysl.sync.Atomic
+
+var done: Atomic[u32] = Atomic(0)
+
+@domain(interrupt)
+@export("disk_irq")
+disk_irq()
+    done.store(1)
+
+@export("disk_wait")
+disk_wait()
+    while done.load() == 0 do ()
+```
+
+The handler and the program share one word, and every touch of it is one atomic instruction. A
+handler that reaches a counted reference instead is refused at the handler, naming what it reached:
+
+```sysl build=c target=aarch64-freestanding
+struct Request
+    sector: u64
+
+var pending: Option[&Request] = None
+
+@domain(interrupt)
+@export("disk_irq")
+disk_irq()
+    pending = None
+```
+
+```error
+'disk_irq' is entered in the 'interrupt' domain, on top of whatever was running, so every count it reaches has to be atomic — but the module storage 'pending' it reaches holds a '&Request' in its 'Some(value)', whose count is not. Hold it as a '&sync Request' ('06')
+```
+
+A **waker** is the case a kernel meets first, and it has no atomic spelling at all — see
+[async § A task that parks stays in its domain](/reference/async/#a-task-that-parks-stays-in-its-domain).
+
+### It names one domain, and `interrupt` is the one there is
+
+```sysl
+@domain(thread)
+worker() = ()
+```
+
+```error
+'thread' is not a domain a function is entered in — 'interrupt' is the one there is
+```
+
+A function the program calls itself is in the program's own domain and says so by not writing the
+annotation, so there is no empty form, and a function the processor may enter in either of two is
+entered in the stricter, so there is no list.
+
+### It is not `async`
+
+Whatever enters the function calls it directly, and calling an `async` function only makes its task:
+
+```sysl
+@domain(interrupt)
+async on_irq() = ()
+```
+
+```error
+a function entered in the 'interrupt' domain cannot be 'async': whatever enters it calls it directly, and calling an async function only makes its task, which nothing there can drive
+```
 
 ## `#if` — gating lines before the lexer
 

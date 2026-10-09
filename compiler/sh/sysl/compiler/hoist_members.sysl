@@ -143,6 +143,14 @@ hoist_all_members(a: &Analysis, units: Buf[Program])
                                    "variant", d.members)
             _ -> ()
 
+    for i in 0..<a.tables.types.len()
+        val key = a.tables.types.key_at(i)
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            TypeOf(d) -> if !d.members.is_empty() then hoist_new_type_members(a, key, decl, d)
+            _ -> ()
+
     // The block is written back with its setters paired for the reason a declaration is: what a
     // later pass reads is the table, not the copy this walk made.
     for i in 0..<a.tables.impls.len()
@@ -306,6 +314,42 @@ hoist_type_members(a: &Analysis, key: string, scope: Scope, tparams: Buf[string]
     hoist_member_list(a, home, members)
 end hoist_type_members
 
+// The members written in a `type` declaration's body.
+//
+// **Only a `new` type takes them.** A transparent subtype is another name for its base, so a member
+// written there would be one of every value of the base; a `new` type is a type of its own, and its
+// members are filed exactly where an `impl` block for it files its own -- under the key `member_owner`
+// gives it -- so a call finds the two the same way. A generic one is filed under its declaration, as
+// a generic struct's members are, and each is made real per receiver.
+private hoist_new_type_members(a: &Analysis, key: string, decl: Decl, d: TypeDecl)
+    if !d.derived
+        a.fault(decl.scope, decl.span,
+                s"'${d.name}' is not a 'new' type, so its values are ${type_text(d.base)}'s and a " +
+                s"member written here would be a member of every ${type_text(d.base)} — 'new' after " +
+                "the '=' makes it a type of its own, which may have members")
+        return
+    end if
+
+    if !d.tp.names.is_empty()
+        hoist_type_members(a, key, decl.scope, d.tp.names, d.tp.bounds, d.tp.values, buf(), "member",
+                           d.members)
+        return
+    end if
+
+    // A declaration that was refused has no type for its members to belong to, and was told already.
+    val made = a.tables.constrained_insts.get(instance_key(key, buf()))
+
+    if made.is_none() then return
+
+    val ty = made.unwrap()
+    val subject = type_ref(span_zero(), NamedType(module_bare(spelled_key(key)), buf()))
+    val home = MemberHome(owner_key(ty), type_show(ty), member_symbol(ty), None, subject, buf(), buf(),
+                          buf(), "member", self_binding(ty), buf(), "", None, false, buf(), buf(),
+                          decl.scope, buf())
+
+    hoist_member_list(a, home, d.members)
+end hoist_new_type_members
+
 // The instantiation of a non-generic struct or enum, which was made before any member was hoisted.
 // Read from the table rather than resolved again, so a type whose own declaration was already
 // reported does not report it a second time on the way to its members.
@@ -397,6 +441,7 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl]) -> B
         // default's copy under every type that inherits it.
         if default_home(a, fd.name).is_none()
             check_crossing_names(a, home.scope, m.named_at, fd, s"${home.label}.$written")
+            check_lends_names(a, home.scope, m.named_at, fd, s"${home.label}.$written")
 
         // An inherited default is asked again under the implementing type's name, as the reference
         // asks it: the copy is a function of that type's, whose callers the message is about.

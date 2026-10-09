@@ -43,8 +43,13 @@ gen_vals(e: *Emit, vals: Buf[TVal]) -> Buf[IrGlobal]
         val name = v.exported.unwrap_or(v.symbol)
         val linkage = if exported then LinkDefault else LinkPrivate
 
+        // **A `@per_cpu` binding is the image every core's copy is made from**, so it goes in
+        // `.percpu` -- data even where it is all zeros, a named section keeping it out of `.bss` --
+        // and a linker script bounds that section for the program to copy.
+        val section = if v.per_cpu then Some(per_cpu_section()) else v.section
+
         out.push(IrGlobal(name, !(v.computed || v.writable), lty(e, v.ty), Some(init),
-                          linkage, v.section, align, v.thread_local, exported && binds_locally(e),
+                          linkage, section, align, v.thread_local, exported && binds_locally(e),
                           v.export_hidden))
 
     out
@@ -79,6 +84,9 @@ private constant_address(e: *Emit, place: TExpr) -> Val = *place.kind match
         idx.push(ir_arg(word_lty(e), VInt(at)))
         VGep(lty(e, elem), constant_address(e, receiver), idx)
     _ -> gap_at(e, "a constant address of something that is not module storage")
+
+// The section every `@per_cpu` binding's image is laid down in.
+per_cpu_section() -> string = ".percpu"
 
 // The greater of two boundaries either of which may be unstated.
 wider_align(a: Option[int], b: Option[int]) -> Option[int] = b match

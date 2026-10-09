@@ -491,8 +491,8 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
     MultiDecl(names, mutable, values) -> multi_decl(cx, stmt.span, names, mutable, values)
     PatternDecl(pat, mutable, value) -> pattern_decl(cx, stmt.span, pat, mutable, value)
 
-    VarDecl(name, typ, init, _, align, section, thread_local, export) ->
-        var_decl(cx, stmt.span, name, typ, init, align, section, thread_local, export)
+    VarDecl(name, typ, init, _, align, section, copies, export) ->
+        var_decl(cx, stmt.span, name, typ, init, align, section, copies, export)
 
     // A local `val` is a `var` that may not be assigned to again -- same frame, same lifetime, same
     // code. Only the binding differs, so the read-only half is enforced where an assignment target
@@ -633,13 +633,13 @@ push_all(out: *Buf[TStmt], xs: Buf[TStmt])
 
 private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
                  init: Option[Expr], align: Option[Expr], section: Option[string],
-                 thread_local: bool, export: Option[ExportAttr]) -> Buf[TStmt]
+                 copies: Copies, export: Option[ExportAttr]) -> Buf[TStmt]
     // One refusal per declaration, as the reference's first one ends the statement.
     if export.is_some() then no_export(cx, span, name)
     else
         no_section(cx, span, name, section)
 
-        if section.is_none() then no_thread_local(cx, span, name, thread_local)
+        if section.is_none() then no_thread_local(cx, span, name, copies)
 
     val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
 
@@ -752,8 +752,18 @@ private no_export(cx: &Analyzer, span: Span, name: string) =
 // tell module storage from a local, and this is the first place that can. A local already belongs
 // to one thread -- its storage is the frame of whichever call is running, and a frame is one
 // thread's stack -- so the attribute asks for something the declaration already has.
-private no_thread_local(cx: &Analyzer, span: Span, name: string, thread_local: bool)
-    if !thread_local then return
+private no_thread_local(cx: &Analyzer, span: Span, name: string, copies: Copies)
+    if copies == OneCopy then return
+
+    // A local is in one frame, which runs on whichever core the thread is on: a copy per core of
+    // something only one call can see has no second core to disagree with.
+    if copies == CopyPerCpu
+        cx.fault(span, s"'$name' is a local, and a local is already one call's: its storage is the " +
+                 "frame of whichever call is running, which no other core can see. '@per_cpu' " +
+                 "marks module storage, which is otherwise one object every core shares — declare " +
+                 "it outside every function for the attribute to say anything")
+        return
+    end if
 
     cx.fault(span, s"'$name' is a local, and a local is already one thread's: its storage is the " +
              "frame of whichever call is running, and every thread has a stack of its own. " +

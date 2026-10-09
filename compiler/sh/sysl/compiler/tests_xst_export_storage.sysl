@@ -201,7 +201,7 @@ xst_thread_local_is_a_tls_symbol()
 
     assert(ir.contains("@errno = thread_local global i32 0"), ir)
 
-@test("and is refused where it has none, exported or not")
+@test("and is refused on a bare machine whose manifest names no thread pointer, exported or not")
 xst_thread_local_refused_bare()
     if !std_root().is_ok() then return
 
@@ -539,3 +539,95 @@ xst_thread_local_address_stays_code()
 
     assert(ir.contains("@mylib$p = private global ptr zeroinitializer\n"), ir)
     assert(!ir.contains("@mylib$p = private constant"), ir)
+
+// -- beside the other storage a bare machine has --------------------------------------------------------
+
+// An archive project for a bare AArch64 machine whose manifest carries `codegen` -- the registers a
+// kernel owns -- and whose one module is `mylib`, with `data.bin` beside it for `embed`.
+private xst_kernel_project(codegen: string, lib: string) -> string
+    val root = xst_archive_project(lib)
+
+    write_text(s"$root/package.hocon", s"package {\n  name = \"probe\"\n}\n\ncodegen {\n$codegen}\n").unwrap()
+    write_text(s"$root/mylib/data.bin", "abcdefgh").unwrap()
+    root
+end xst_kernel_project
+
+// `emit-llvm` of a kernel project for aarch64-freestanding.
+private xst_kernel_ir(codegen: string, lib: string) -> (int, string)
+    val root = xst_kernel_project(codegen, lib)
+
+    write_text(s"$root/main.sysl", "").unwrap()
+
+    val got = xst_ir(root, "aarch64-freestanding")
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end xst_kernel_ir
+
+@test("where a bare machine's manifest names the thread pointer, an exported '@thread_local' is a TLS symbol")
+xst_thread_local_exported_bare()
+    if !xst_ready() then return
+
+    val got = xst_kernel_ir("  thread_pointer = \"tpidr_el1\"\n",
+                            "@export\n@thread_local\nvar errno: i32 = 0\n\n" +
+                            "@export(\"bump\")\nbump() -> i32\n    errno += 1\n    errno\n")
+
+    assert_eq(got.0, 0, got.1)
+    assert(got.1.contains("@errno = dso_local thread_local global i32 0\n"), got.1)
+
+@test("per-core storage is no one object, so '@export' above '@per_cpu' is refused")
+xst_per_cpu_is_not_exported()
+    assert(pf_err("@export\n@per_cpu\nstatic var ticks: u64 = 0\n").contains("could only name the '.percpu' image"))
+    assert(pf_err("@per_cpu\n@export(\"ticks\")\nstatic var ticks: u64 = 0\n").contains("could only name the '.percpu' image"))
+
+@test("the address of per-core storage is a different one on each core, so it stays code")
+xst_per_cpu_address_stays_code()
+    if !xst_ready() then return
+
+    val got = xst_kernel_ir("  per_cpu_offset = \"tpidr_el1\"\n",
+                            "@per_cpu\nvar ticks: u64 = 0\n\nval mine: *u64 = &ticks\n\n" +
+                            "@pinned\n@export(\"tick\")\ntick() -> u64 = *mine\n")
+
+    assert(!got.1.contains("@mylib$mine = private constant"), got.1)
+
+@test("an embedded file beside exported storage is data too: the archive runs no constructor")
+xst_embed_beside_exported()
+    if !xst_ready() then return
+
+    val objdump = xst_tool("llvm-objdump")
+
+    if objdump.is_none() then skip("there is no llvm-objdump to read the archive")
+
+    val root = xst_kernel_project("",
+                                  "val blob: []const u8 = embed(\"data.bin\")\n\n" +
+                                  "@export(\"blob_size\")\nval size: u32 = 8\n\n" +
+                                  "@export(\"blob_at\")\nblob_at(i: u32) -> u8 = blob[i]\n")
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root]
+    val built = xst_cli(args[..])
+
+    assert_eq(built.0, 0, built.1)
+
+    val dump = capture(objdump.unwrap(), ["-h", archive], "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert(dump.status.ok(), dump.text)
+    assert(!dump.text.contains("init_array"), dump.text)
+end xst_embed_beside_exported
+
+@test("but an embedded file is a view, and an element of a view is a load before it is an address")
+xst_embed_element_is_not_an_address()
+    if !std_root().is_ok() then return
+
+    val root = xst_kernel_project("",
+                                  "val blob: []const u8 = embed(\"data.bin\")\n\n" +
+                                  "@export(\"blob_first\")\nval first: *u8 = &blob[0]\n")
+
+    write_text(s"$root/main.sysl", "").unwrap()
+
+    val got = xst_ir(root, "aarch64-freestanding")
+
+    remove_dir_all(root).unwrap_or(())
+    assert(got.0 != 0, got.1)
+    assert(got.1.contains("'mylib.first' is exported, so C may read it before anything"), got.1)
+end xst_embed_element_is_not_an_address

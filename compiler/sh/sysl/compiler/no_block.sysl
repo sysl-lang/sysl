@@ -1,0 +1,143 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// A function, a method or a module that promised never to wait, and what that costs it.
+//
+// **`@no_block` is `@no_alloc`'s second rule asked about a different set of seeds.** Waiting is not
+// something a body *makes* -- there is no construction that blocks on its own line -- so only the
+// reaching half applies: a call out of a promised body that arrives at a declaration marked `@blocks`
+// is refused, at the smallest piece of the body that still arrives there. The walk is
+// `reaches.sysl`'s and the reporting is `no_alloc.sysl`'s `blame_block`; what differs is the seed
+// set, which is what the program and the library SAID blocks rather than anything the compiler
+// works out.
+//
+// **That is the whole contract, and it is deliberately one of declaration.** Whether a C function
+// waits is not something a compiler can see, and a sysl loop that spins until another thread moves
+// is a wait the compiler cannot tell from a search. So the library marks its waiting operations --
+// a sleep, a lock, a join, a channel's waiting transfers, a blocking read or write, a process wait
+// -- and a program marks its own (a kernel's wait queue, a driver's synchronous read).
+//
+// **The module's clause and the function's annotation are held exactly as `@no_alloc`'s are**: the
+// module's comes first, a function under it says nothing the module did not, and a generic is
+// answered for by the body it was written as rather than by any instantiation of it.
+
+// The word `@no_block` is recorded under on a function's marks: what follows `no_`.
+const NoBlockWord: string = "block"
+
+// Reports every call out of a body that promised not to block which arrives at a declaration marked
+// `@blocks`.
+check_no_block(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
+    if !any_no_block(a, funcs) then return
+
+    val graph = with_abstract_callees(a, funcs)
+    val seeds = blocking_seeds(a, graph)
+
+    val walk = reaches_over(graph, vtables, seeds)
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        // An instantiation is passed over, as `no_alloc.sysl` passes it: the generic it was made
+        // from is checked below, and a call to one is reported in the caller's body.
+        if a.tables.members.func_origin.has(f.name) then continue
+
+        val scope = func_home(a, f.name)
+        val copied = a.tables.members.default_origin.has(f.name)
+        val module_name = if copied then scope.module_name else module_of(f.name)
+        val scaffolding = test_only_file(a, scope.src.name) || runner_func(a, f.name)
+
+        block_held_to(module_name, scaffolding, a, f) match
+            Some(held) -> blame_block(a, walk, scope, f.body, held)
+            None -> ()
+
+    for f in a.tables.abstracts
+        val scope = func_home(a, f.name)
+
+        block_held_to(scope.module_name, test_only_file(a, scope.src.name), a, f) match
+            Some(held) -> blame_block(a, walk, scope, f.body, held)
+            None -> ()
+
+    // A module's storage is filled by code the module wrote, so an initializer of a module that
+    // promised not to block is held to the promise like any of its bodies.
+    for i in 0..<vals.len()
+        val v = vals.at(i)
+
+        if v.init.is_none() then continue
+
+        val module_name = module_of(v.symbol)
+        val scaffolding = holds_string(a.tables.test_only, v.symbol)
+
+        if !module_no_block(a, module_name, scaffolding) then continue
+
+        val held = Promised(module_block_why(a, module_name, scaffolding), None, buf(), true)
+        val said: &Counted = Counted(0)
+        val scope = val_home(a, v.symbol)
+
+        walk_texpr(v.init.unwrap(), TWalk(false, e -> blame_one(a, walk, scope, e, held, said),
+                                          w -> blame_write(a, walk, scope, w, held, said), st -> ()))
+end check_no_block
+
+// Whether anything in the program promised not to block. **Almost no compilation does**, and the walk
+// reads every body, so one that promised nothing pays nothing for this pass.
+private any_no_block(a: &Analysis, funcs: Buf[TFunc]) -> bool
+    for pair in a.tables.module_narrows
+        if pair.1 == CapBlock then return true
+
+    for pair in a.tables.module_test_narrows
+        if pair.1 == CapBlock then return true
+
+    for i in 0..<funcs.len()
+        if funcs.at(i).marks.gives_up(NoBlockWord) then return true
+
+    for f in a.tables.abstracts
+        if f.marks.gives_up(NoBlockWord) then return true
+
+    false
+end any_no_block
+
+// Every declaration marked `@blocks`, by the name a call to it carries: a function's or a method's
+// key, every instantiation of a marked generic included, and an `extern`'s slot -- and `block_on`,
+// the one built-in that waits.
+private blocking_seeds(a: &Analysis, graph: Buf[TFunc]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    // `block_on` waits by definition, and is a built-in no annotation can reach.
+    out.push(BlockOnKey)
+
+    for i in 0..<graph.len()
+        val f = graph.at(i)
+
+        if f.marks.blocks && !holds_string(out, f.name) then out.push(f.name)
+
+    for i in 0..<a.tables.externs.len()
+        val key = a.tables.externs.key_at(i)
+
+        if a.tables.externs.at(i).blocks && !holds_string(out, key) then out.push(key)
+
+    out
+end blocking_seeds
+
+// The promise one body answers to, or nothing where it made none -- the module's first, as
+// `no_alloc.sysl`'s `held_to` reads it.
+private block_held_to(module_name: string, scaffolding: bool, a: &Analysis,
+                      f: TFunc) -> Option[Promised]
+    if module_no_block(a, module_name, scaffolding) then
+        return Some(Promised(module_block_why(a, module_name, scaffolding), None, buf(), true))
+
+    if !f.marks.gives_up(NoBlockWord) then return None
+
+    Some(Promised(s"'${qualified_name(f.name)}' declared '@no_block'", Some(f.name), buf(), true))
+end block_held_to
+
+// Whether a module promised not to block, and the same asked of what its tests may do -- a `@tests`
+// file takes the promise back by writing nothing that keeps it, exactly as with `@no_alloc`.
+private module_no_block(a: &Analysis, module_name: string, scaffolding: bool) -> bool =
+    if scaffolding then module_tests_narrowed(a, module_name, CapBlock)
+    else module_narrowed(a, module_name, CapBlock)
+
+private module_block_why(a: &Analysis, module_name: string, scaffolding: bool) -> string
+    if scaffolding && module_tests_own_narrowing(a, module_name, CapBlock) then
+        return "this module's '@tests' file declared '@no_block'"
+
+    "this module declared '@no_block'"

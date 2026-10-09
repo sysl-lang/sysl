@@ -1665,11 +1665,13 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                 val computed = !imaged
 
                 if d.thread_local then check_per_thread(cx, d.span, key, computed)
+                if d.per_cpu then check_per_core(cx, d.span, key, computed)
 
                 if d.export.is_some() then check_exported_storage(cx, d, key, ty, computed)
 
                 out.push(TVal(key, stored, init, computed, writable, storage_align(cx, d), d.section,
-                              d.thread_local, exported_storage_symbol(d), storage_hidden(d)))
+                              d.thread_local, d.per_cpu, exported_storage_symbol(d),
+                              storage_hidden(d)))
 
     out
 end module_storage
@@ -1702,7 +1704,20 @@ private refuse_storage_slots(cx: &Analyzer, init: TExpr)
 private check_per_thread(cx: &Analyzer, span: Span, key: string, computed: bool)
     val t = cx.an.tables.target
 
-    if !t.thread_local_storage()
+    // **A bare AArch64 machine has the register, and the program may own it**: a kernel writes the
+    // thread pointer itself on every switch, so once the manifest says which register that is
+    // (`codegen.thread_pointer`), the local-exec offset is read from storage the program answers for.
+    val owned = t.cpu == Aarch64 && thread_pointer_register().is_some()
+
+    if !t.thread_local_storage() && !owned && t.cpu == Aarch64
+        cx.fault(span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}' until the " +
+                 "program says which register holds the thread pointer: there is no loader here to " +
+                 "lay a thread's storage down, so the program does it — copying the '.tdata' image " +
+                 "and zeroing '.tbss' for each thread, and writing the register on every switch. " +
+                 "Name the register in package.hocon as 'codegen { thread_pointer = \"tpidr_el1\" }' " +
+                 "('tpidr_el0', 'tpidrro_el0', 'tpidr_el2' and 'tpidr_el3' are the others), or declare " +
+                 "it as a plain module 'var' and let the scheduler answer for which thread is running")
+    else if !t.thread_local_storage() && !owned
         cx.fault(span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}': there " +
                  "is no loader and no libc on this target, so nothing lays a thread's storage down " +
                  "and nothing writes the thread pointer the offset would be read from. Declare it " +
@@ -1787,6 +1802,36 @@ private storage_hidden(d: ValueDecl) -> bool
     d.vis match
         Public -> false
         _ -> true
+end storage_hidden
+
+// What `@per_cpu` asks (`reference/attributes.md § @per_cpu`): a bare AArch64 machine whose manifest
+// names the register holding this core's offset, and an initializer the image can carry -- every
+// core's copy is made from the one `.percpu` image, so there is no per-core prologue for code to run
+// in either.
+private check_per_core(cx: &Analyzer, span: Span, key: string, computed: bool)
+    val t = cx.an.tables.target
+
+    if t.cpu != Aarch64 || t.os != Freestanding
+        cx.fault(span, s"'${qualified_name(key)}' cannot be '@per_cpu' on '${t.name}': a core's copy " +
+                 "is found through a register the program itself writes on each core, and only a " +
+                 "bare AArch64 machine ('aarch64-freestanding') has one a program owns. Anywhere " +
+                 "else the operating system moves a thread between cores whenever it likes, so no " +
+                 "answer to 'which core' stays true long enough to read through. Declare it as a " +
+                 "plain module 'var' indexed by the core's number, or as '@thread_local'")
+    else if per_cpu_register().is_none()
+        cx.fault(span, s"'${qualified_name(key)}' cannot be '@per_cpu' until the program says which " +
+                 "register holds this core's offset: each core's copy is the '.percpu' image copied " +
+                 "somewhere of the program's choosing, and the register holds that copy's address " +
+                 "minus the image's (zero on a core still using the image itself). Name it in " +
+                 "package.hocon as 'codegen { per_cpu_offset = \"tpidr_el1\" }'")
+    else if computed
+        cx.an.fault_unplaced(cx.scope, span, s"'${qualified_name(key)}' is '@per_cpu', so its value " +
+                 "has to be one the compiler can write down: every core's copy is made from the one " +
+                 "'.percpu' image in the object file rather than by code that runs per core. A " +
+                 "literal, 'null', a 'const' and the arrays and structs built from them are all " +
+                 "values; a call is not. Leave the value off to start every core at the type's " +
+                 "zero, and do the work on each core instead")
+end check_per_core
 
 private is_zero_expr(e: TExpr) -> bool = *e.kind match
     TZero(_) -> true
@@ -1855,7 +1900,8 @@ private static_image(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
 // carries it and nothing runs. The place is handed back with each index folded to the literal it
 // comes to, which is what the emitter writes as a constant `getelementptr`.
 //
-// What is not a constant: thread-local storage, whose address is a different one on every thread; an
+// What is not a constant: thread-local and per-core storage, whose address is a different one on every
+// thread or core; an
 // element of a view or through a pointer, which is a load before it is an address; a bitfield, which
 // has no address of its own; and an index the array does not have, which would trap where it ran and
 // so stays code that runs, and traps, as it would have.
@@ -1863,7 +1909,7 @@ private place_image(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind 
     TGlobal(symbol, _, _) ->
         val d = cx.an.tables.vals.get(symbol)
 
-        if d.is_some() && d.unwrap().thread_local then None else Some(place)
+        if d.is_some() && (d.unwrap().thread_local || d.unwrap().per_cpu) then None else Some(place)
     TField(receiver, index, ty) ->
         if bitfield_ranges_of(texpr_type(receiver)).is_some() then return None
 

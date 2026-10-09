@@ -578,8 +578,25 @@ the one the attribute names. **A `private` one is published hidden** and left ou
 [a private export](#a-private-export) is. **A `@thread_local` one is a thread-local symbol** — C's
 `errno` is one in every real C library — declared `SYSL_THREAD_LOCAL` in the header, a macro the
 header defines as `_Thread_local` for C and `thread_local` for C++; a target with no thread-local
-storage refuses `@thread_local` whether or not it is exported. Two exports of one symbol, whether
-objects or a function and an object, are refused as two definitions of one symbol.
+storage refuses `@thread_local` whether or not it is exported, and a bare AArch64 machine has it once
+its manifest names the thread pointer
+([`codegen.thread_pointer`](/reference/attributes/#thread_local)). **A
+[`@per_cpu`](/reference/attributes/#per_cpu--one-copy-per-processor-core) one is refused**: a symbol names one object, and per-core
+storage is a copy per core, so the only thing the symbol could name is the `.percpu` image no core
+reads or writes — a function C calls is how it reaches this core's copy:
+
+```sysl
+@export
+@per_cpu
+static var ticks: u64 = 0
+```
+
+```error
+'@export' publishes one object under a C symbol, and '@per_cpu' storage is one copy per processor core
+```
+
+Two exports of one symbol, whether objects or a function and an object, are refused as two
+definitions of one symbol.
 
 ### Module storage, and who fills it
 
@@ -686,10 +703,11 @@ fd_of_stdout() -> i32 = stdout.fd + i32(*stdout_flags)
 ```
 
 Three addresses are not constants, and storage holding one stays code, filled before the program's
-statements like any other computed initializer: the address of `@thread_local` storage, which is a
-different one on every thread; an element of a view or through a pointer, which is a load before it
-is an address; and an index the array does not have, which would trap where it ran — so it is left
-to run, and trap, as it would have.
+statements like any other computed initializer: the address of `@thread_local` or `@per_cpu`
+storage, which is a different one on every thread or core; an element of a view or through a pointer,
+which is a load before it is an address — an [`embed`](/reference/arrays/#a-files-bytes-embedded)
+included, which is a view, though the bytes it views are data; and an index the array does not have,
+which would trap where it ran — so it is left to run, and trap, as it would have.
 
 **A call is constant data only when it calls a
 [`const` function](/reference/declarations/#a-const-function-runs-while-compiling)** over constant

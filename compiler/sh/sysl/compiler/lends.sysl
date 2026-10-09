@@ -1,0 +1,215 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// `@lends(body)` -- a function that hands a callable parameter a pointer valid only while that call
+// runs, and the check that holds every body passed there to letting the pointer go.
+//
+// **It is the scoped form of a resource whose release is written in the lender.** A lock that hands
+// out `*T` from `lock()` cannot stop the address outliving `unlock()`; one that takes the work as a
+// closure, calls it with the address and releases afterwards can, provided nothing the closure does
+// carries the address past its own return. That question is the one `self_alias.sysl` already asks
+// of a `*self` method -- a fixpoint over the body's locals, then every store, box, return and call it
+// could leave through -- asked here of the closure, with each pointer it was handed as the seed.
+//
+// **The body is always one the compiler can read**: a bare-arrow parameter is a type parameter, so
+// each call instantiates the lender with the closure's own struct, and the closure's body is the
+// function filed under that struct's name. A named function passed there is its own body. Anything
+// else -- a closure behind a `&Fn`, a function pointer -- is refused at the argument, since there is
+// no one body to read.
+
+// What `@lends` may name: a parameter of the function it is written above, once, whose type is a call
+// -- written as a bare arrow, or as a type parameter bounded by one of the call traits. Settled at the
+// declaration, as `@crossing`'s names are: a misspelling would otherwise lend nothing and read exactly
+// like a rule being enforced.
+check_lends_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: string)
+    val ls = d.marks.lends
+    val ps = d.params
+
+    for i in 0..<ls.len()
+        var found: Option[Param] = None
+
+        for item in ps
+            if item.name == ls.at(i) then found = Some(item)
+
+        var twice = false
+
+        for j in 0..<i
+            if ls.at(j) == ls.at(i) then twice = true
+
+        if found.is_none()
+            var listed = ""
+
+            for j in 0..<ps.len()
+                listed = if j == 0 then s"'${ps.at(j).name}'" else s"$listed, '${ps.at(j).name}'"
+
+            val tail = if ps.is_empty() then " — it takes none" else s" — its parameters are $listed"
+
+            a.fault(scope, span, s"'@lends' names '${ls.at(i)}', which is not a parameter of " +
+                    s"'$shown'$tail")
+        else if twice
+            a.fault(scope, span, s"'@lends' names '${ls.at(i)}' twice, and a parameter is lent to " +
+                    "or it is not — the second says nothing the first does not")
+        else if !callable_param(d, found.unwrap())
+            a.fault(scope, span, s"'@lends' names '${ls.at(i)}', which is not a call — what a " +
+                    "function lends is the pointers it hands a body it calls, so the parameter is " +
+                    s"written as one, '${ls.at(i)}: *T -> R'")
+end check_lends_names
+
+// A bare arrow, before the declaration's rewrite or after it: a type parameter of this declaration
+// bounded by a call trait.
+private callable_param(d: FuncDecl, p: Param) -> bool = *p.typ.kind match
+    FnType(_, _, bare) -> bare
+    NamedType(n, _) -> holds_string(d.tparams, n) && call_bounded(d.bounds, n)
+    _ -> false
+
+private call_bounded(bounds: Buf[NamedBounds], name: string) -> bool
+    for nb in bounds
+        if nb.name == name
+            for b in nb.bounds
+                if is_call_trait(module_bare(b.name)) then return true
+
+    false
+end call_bounded
+
+// `Fn0` through the widest arity, which are the call traits a bound may name.
+private is_call_trait(name: string) -> bool
+    for n in 0..<FnMaxArity + 1
+        if name == fn_base(n) then return true
+
+    false
+end is_call_trait
+
+// What the walk over a program's calls keeps between bodies.
+struct Lending
+    funcs: Buf[TFunc]
+    index: Map[string, usize]
+
+    // A callee's answer, by `<name>|<position>`, once it is known.
+    kept: Map[string, bool]
+
+    // The answers being worked out. Asked again from inside its own walk, a callee is assumed to keep
+    // nothing -- recursion adds no way out that the walk in progress will not find for itself.
+    busy: Buf[string]
+
+    // The bodies already held to the rule, so a closure passed twice is told once.
+    checked: Buf[string]
+
+    find(self, name: string) -> Option[TFunc] = self.index.get(name) match
+        Some(i) -> Some(self.funcs.at(i))
+        None -> None
+end Lending
+
+// Holds every body handed to a `@lends` parameter, anywhere in the program, to the rule.
+check_lent_bodies(a: &Analysis, funcs: Buf[TFunc])
+    var any = false
+
+    for f in funcs
+        if !f.marks.lends.is_empty() then any = true
+
+    if !any then return
+
+    var index: Map[string, usize] = map()
+
+    for i in 0..<funcs.len()
+        if !index.has(funcs.at(i).name) then index.put(funcs.at(i).name, i)
+
+    val cx: &Lending = Lending(funcs, index, map(), buf(), buf())
+    val an = a
+
+    for f in funcs
+        val scope = func_home(a, f.name)
+
+        walk_block_stmts(f.body, expr_walk(false, e -> lent_call(an, cx, scope, e)))
+end check_lent_bodies
+
+private lent_call(a: &Analysis, cx: &Lending, scope: Scope, e: TExpr)
+    *e.kind match
+        TCall(name, args, _, _) -> lent_call_of(a, cx, scope, name, args)
+        _ -> ()
+end lent_call
+
+private lent_call_of(a: &Analysis, cx: &Lending, scope: Scope, name: string, args: Buf[TExpr])
+    val callee = cx.find(name)
+
+    if callee.is_none() || callee.unwrap().marks.lends.is_empty() then return
+
+    val lender = callee.unwrap()
+    val shown = qualified_name(a.tables.members.func_origin.get(name).unwrap_or(name))
+
+    for lent in lender.marks.lends
+        for k in 0..<lender.params.len()
+            if lender.params.at(k).0 == lent && k < args.len()
+                lent_argument(a, cx, scope, shown, lent, args.at(k))
+end lent_call_of
+
+// The body an argument at a lent parameter runs, held to letting what it is lent go.
+private lent_argument(a: &Analysis, cx: &Lending, scope: Scope, shown: string, lent: string, arg: TExpr)
+    val body: Option[(string, usize)] = texpr_type(arg) match
+        Struct(d) -> if is_closure_literal(texpr_type(arg)) then Some((s"${d.base}.call", 1)) else None
+        _ -> *arg.kind match
+            TFuncAddr(n, _, _) -> Some((n, 0))
+            _ -> None
+
+    if body.is_none()
+        a.fault(scope, arg.span, s"'$shown' lends '$lent' a pointer that is valid only during the " +
+                "call, so what is passed there is a closure or a function's name — a body the " +
+                "compiler can read to see that the pointer is let go. A closure behind a '&Fn' or a " +
+                "function pointer could be anything")
+        return
+    end if
+
+    val (name, first) = body.unwrap()
+
+    if holds_string(cx.checked, name) then return
+
+    cx.checked.push(name)
+
+    val f = cx.find(name)
+
+    if f.is_none() then return
+
+    var seeds: Buf[string] = buf()
+
+    for i in first..<f.unwrap().params.len()
+        if holds_pointer(f.unwrap().params.at(i).1) then seeds.push(f.unwrap().params.at(i).0)
+
+    if seeds.is_empty() then return
+
+    val an = a
+    val keeps: &Fn(string, usize) -> bool = (n, j) -> lent_keeps(an, cx, n, j)
+
+    lent_escapes(a, func_home(a, name), seeds, f.unwrap().body, shown, false, keeps)
+end lent_argument
+
+// Whether a callee lets the argument at a position outlive the call. A function with no body here --
+// an `extern` -- may do anything with it.
+private lent_keeps(a: &Analysis, cx: &Lending, name: string, i: usize) -> bool
+    val key = s"$name|$i"
+
+    cx.kept.get(key) match
+        Some(v) -> return v
+        None -> ()
+
+    if holds_string(cx.busy, key) then return false
+
+    val f = cx.find(name)
+
+    if f.is_none() || i >= f.unwrap().params.len() then return true
+
+    cx.busy.push(key)
+
+    var seeds: Buf[string] = buf()
+
+    seeds.push(f.unwrap().params.at(i).0)
+
+    val an = a
+    val keeps: &Fn(string, usize) -> bool = (n, j) -> lent_keeps(an, cx, n, j)
+    val out = lent_escapes(a, func_home(a, name), seeds, f.unwrap().body, "", true, keeps)
+
+    cx.busy.truncate(cx.busy.len() - 1)
+    cx.kept.put(key, out)
+    out
+end lent_keeps

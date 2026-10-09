@@ -1536,11 +1536,22 @@ That check is the one thing a constant gets that a `val` of the same type gets o
 it is what a [`c const`](/reference/ffi/) is really for: a number nobody chose — a `sizeof`, a config
 macro out of somebody else's header — held to what this program can actually do with it.
 
-A **`new` type** is refused, because reaching one from its base is a written conversion and a constant
-is the value it was written as, so there is nowhere on the line to write one. A **`where` predicate**
-is refused too, because a predicate is checked where a value is *made* and a constant is folded into
-its uses rather than made anywhere — admitting one would be a check the declaration claims and the
-program never gets.
+A **`new` type** is admitted: the value is the base's constant written through the conversion,
+`const OUR_IP: Ip = Ip(0x0a00_020f)`, or a bare literal, which takes the type where it sits. It folds
+as the base would and keeps its type at every use, and a range on it is settled here as on any
+constrained type. A **`where` predicate** is refused, because a predicate is checked where a value is
+*made* and a constant is folded into its uses rather than made anywhere — admitting one would be a
+check the declaration claims and the program never gets.
+
+```sysl
+type Even = int where value % 2 == 0
+
+const n: Even = 4
+```
+
+```error
+'n' is declared Even, whose 'where' predicate is checked where a value is made
+```
 
 **A constant expression** is a literal; a `const`; a conversion; a unary `-`, `!` or `~`; a binary
 arithmetic, bitwise, shift, or comparison operator applied to constant expressions; or **a call to
