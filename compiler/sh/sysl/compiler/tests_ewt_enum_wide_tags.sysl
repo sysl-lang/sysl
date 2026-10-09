@@ -1,0 +1,262 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{join, Search}
+
+// **A simple enum's discriminant is held whole, at any width its underlying integer has**
+// (`types.sysl`'s `EnumVariant.tag` is a `BigInt`, `resolve_type.sysl`'s `fitting_tag` keeps it). A
+// `u64` enum's `Top = 18446744073709551615` is that number everywhere a tag is read -- the checked
+// cast, `try`, a `match`, every attribute, a constant, a value parameter and the C boundary -- where it
+// used to be narrowed to a `long` and, past `long`'s range, to 0. Two variants at the top of `u64`
+// were then refused as both standing for 0; one alone silently became 0.
+//
+// `emit_enum.sysl`'s membership test widens to fit the discriminants as well as the value, so a
+// signed `-1` does not match `u64::MAX` though the two share a bit pattern at 64 bits.
+//
+// Every program is built at `-O0` and at the default level.
+
+private ewt_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The tree at `root` built at `level` and run: its status, what it printed, and standard error.
+private ewt_run_root(root: string, level: string) -> (Status, string, string)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) -> return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    capture(exe, [], "", [], true) match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end ewt_run_root
+
+// At both levels, the one-file program exits cleanly having printed `printed`.
+private ewt_prints(text: string, printed: string)
+    if !ewt_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val root = make_temp_dir("sysl-ewt").unwrap()
+
+        write_text(s"$root/main.sysl", text).unwrap()
+
+        val (state, out, err) = ewt_run_root(root, level)
+
+        remove_dir_all(root).unwrap_or(())
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end ewt_prints
+
+// Everything a one-file program has to say for itself, through the lowering.
+private ewt_err(text: string) -> string
+    val root = make_temp_dir("sysl-ewt").unwrap()
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ewt_err
+
+private ewt_has(said: string, part: string) -> bool = said.index_of(part).is_some()
+
+private ewt_top() -> string = "enum E: u64\n    Low = 1\n    Top = 18446744073709551615\n\n"
+
+// -- u64::MAX ---------------------------------------------------------------------------------------
+
+@test("a u64 enum's u64::MAX discriminant is that number through E(n), the conversion and the attributes")
+ewt_u64_max_through_the_cast_and_attributes()
+    ewt_prints(ewt_top() +
+               "val n: u64 = 18446744073709551615\nval t = E(n)\n" +
+               "print(u64(t), u64(E.Top), E::Image(t), E::Pos(t), t == E.Top)\n" +
+               "print(E::Image(E::Last), E::Image(E::Value(\"Top\")), E::Image(E::Succ(E.Low)), " +
+               "E::Image(E::Pred(t)), E::Image(E::Val(1)))\n",
+               "18446744073709551615 18446744073709551615 Top 1 true\nTop Top Top Low Top\n")
+
+@test("E.try of u64::MAX is Some(Top), and neither a signed -1 nor a 128-bit 2^65 - 1 is")
+ewt_u64_max_through_try()
+    // At 64 bits a signed -1 is u64::MAX's pattern; the comparison is made where both fit.
+    ewt_prints(ewt_top() +
+               "val n: u64 = 18446744073709551615\nval m: i64 = -1\n" +
+               "val w: u128 = (u128(1) << 65) - 1\nval x: i128 = 18446744073709551615\n" +
+               "print(E.try(n).unwrap() == E.Top, E.try(m).is_none(), E.try(w).is_none(), " +
+               "E.try(x).unwrap() == E.Top)\n",
+               "true true true true\n")
+
+@test("E(-1) from a signed source traps rather than becoming u64::MAX's variant")
+ewt_a_signed_minus_one_is_not_top()
+    if !ewt_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val root = make_temp_dir("sysl-ewt").unwrap()
+
+        write_text(s"$root/main.sysl", ewt_top() + "val m: i64 = -1\nprint(u64(E(m)))\n").unwrap()
+
+        val (state, out, _) = ewt_run_root(root, level)
+
+        remove_dir_all(root).unwrap_or(())
+        assert_eq(out, "")
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state, having printed '$out'")
+end ewt_a_signed_minus_one_is_not_top
+
+@test("a match on a u64 enum reaches the arm of u64::MAX, as a switch and as a chain")
+ewt_u64_max_through_match()
+    ewt_prints(ewt_top() +
+               "name(e: E) -> string = e match\n    Low -> \"low\"\n    Top -> \"top\"\n\n" +
+               "guarded(e: E, k: int) -> string = e match\n    Top if k > 0 -> \"top+\"\n" +
+               "    Top -> \"top\"\n    Low -> \"low\"\n\n" +
+               "val n: u64 = 18446744073709551615\n" +
+               "print(name(E(n)), name(E.Low), guarded(E(n), 1), guarded(E.Top, 0))\n",
+               "top low top+ top\n")
+
+@test("a u64::MAX variant is laid down as a constant at its full width")
+ewt_u64_max_as_a_constant()
+    ewt_prints(ewt_top() +
+               "static val keep: E = E.Top\nstatic val both: [2]E = [E.Low, E.Top]\n" +
+               "print(u64(keep), u64(both[1]), E::Image(both[1]))\n",
+               "18446744073709551615 18446744073709551615 Top\n")
+
+@test("a u64::MAX variant as a value argument is its own type, told apart from u64::MAX - 1")
+ewt_u64_max_as_a_value_argument()
+    if !ewt_ready() then return
+
+    val text = "enum E: u64\n    Next = 18446744073709551614\n    Top = 18446744073709551615\n\n" +
+               "struct Run[const M: E]\n    v: int\n\n" +
+               "impl[const M: E] Display for Run[M]\n" +
+               "    display(self, out: *Writer, fmt: FormatSpec) =\n" +
+               "        display_str(if M == Top then \"top\" else \"next\", out, fmt)\n\n" +
+               "var a: Run[Top] = Run(1)\nvar b: Run[Next] = Run(2)\n"
+
+    ewt_prints(text + "print(a, b)\n", "top next\n")
+
+    val said = ewt_err(text + "b = a\n")
+
+    assert(ewt_has(said, "Run[Next]") && ewt_has(said, "Run[Top]"), said)
+end ewt_u64_max_as_a_value_argument
+
+// -- two variants at the top of u64 ---------------------------------------------------------------
+
+@test("two variants at u64::MAX and u64::MAX - 1 are two values")
+ewt_two_top_variants_are_distinct()
+    ewt_prints("enum E: u64\n    Top = 18446744073709551615\n    Next = 18446744073709551614\n\n" +
+               "val a: u64 = 18446744073709551615\nval b: u64 = 18446744073709551614\n" +
+               "print(E::Image(E(a)), E::Image(E(b)), u64(E.Next), E.Top == E.Next, E::Pos(E(b)))\n",
+               "Top Next 18446744073709551614 false 1\n")
+
+@test("two variants written at one u64 past long's range are still refused, naming the number")
+ewt_a_repeated_wide_tag_is_refused()
+    if !ewt_ready() then return
+
+    val said = ewt_err("enum E: u64\n    A = 18446744073709551615\n    B = 18446744073709551615\n\n" +
+                       "print(u64(E.A))\n")
+
+    assert(ewt_has(said, "variants 'A' and 'B' both stand for 18446744073709551615"), said)
+end ewt_a_repeated_wide_tag_is_refused
+
+@test("a discriminant past u64::MAX is still refused as not fitting u64")
+ewt_a_tag_past_u64_is_refused()
+    if !ewt_ready() then return
+
+    val said = ewt_err("enum E: u64\n    A = 18446744073709551616\n\nprint(u64(E.A))\n")
+
+    assert(ewt_has(said, "discriminant 18446744073709551616 of variant 'A' does not fit ulong"), said)
+end ewt_a_tag_past_u64_is_refused
+
+// -- u128 -------------------------------------------------------------------------------------------
+
+@test("a u128 enum's 2^100 discriminant round-trips through E(n), try, match and the attributes")
+ewt_u128_two_to_the_hundred()
+    ewt_prints("enum Big: u128\n    Small = 1\n    Huge = 1267650600228229401496703205376\n" +
+               "    Most = 340282366920938463463374607431768211455\n\n" +
+               "kind(b: Big) -> string = b match\n    Small -> \"small\"\n    Huge -> \"huge\"\n" +
+               "    Most -> \"most\"\n\n" +
+               "val x: u128 = u128(1) << 100\nval m: u128 = 340282366920938463463374607431768211455\n" +
+               "print(u128(Big.Huge) == x, Big::Image(Big(x)), Big::Pos(Big(x)), kind(Big(x)), kind(Big(m)))\n" +
+               "print(Big.try(x + 1).is_none(), Big.try(x).unwrap() == Big.Huge, Big::Image(Big::Succ(Big.Huge)))\n" +
+               "print(u128(Big.Most) == m, Big.try(i128(-1)).is_none())\n",
+               "true Huge 1 huge most\ntrue true Most\ntrue true\n")
+
+// -- signed bases are unchanged ---------------------------------------------------------------------
+
+@test("negative discriminants on signed bases read as they always did, i64::MIN included")
+ewt_negative_discriminants_are_unchanged()
+    ewt_prints("enum S: i64\n    Least = -9223372036854775808\n    Minus = -1\n    Five = 5\n\n" +
+               "enum T: i8\n    Back = -128\n    Ahead = 127\n\n" +
+               "val m: i64 = -1\nval l: i64 = -9223372036854775808\nval wrapped: u64 = 18446744073709551488\n" +
+               "print(i64(S.Least), S::Image(S(m)), S::Image(S(l)), S::Pos(S.Five), S.try(i64(-2)).is_none())\n" +
+               "print(i8(T.Back), T::Image(T(i8(-128))), T.try(wrapped).is_none())\n",
+               "-9223372036854775808 Minus Least 2 true\n-128 Back true\n")
+
+// -- the C boundary ---------------------------------------------------------------------------------
+
+private ewt_wide_module() -> string = raw"""
+    module wide
+
+    enum E: u64
+        Low = 1
+        Top = 18446744073709551615
+
+    @export("wide_echo")
+    echo(x: E) -> E = x
+
+    extern "wide_c_round_trip" c_round_trip() -> int
+    extern "wide_c_pass" c_pass(x: E) -> E
+    """
+
+// C hands the export UINT64_MAX and checks what comes back, and passes the enum straight through.
+private ewt_wide_c() -> string = raw"""
+    #include <stdint.h>
+
+    uint64_t wide_echo(uint64_t x);
+
+    int wide_c_round_trip(void) { return wide_echo(UINT64_MAX) == UINT64_MAX && wide_echo(1) == 1; }
+
+    uint64_t wide_c_pass(uint64_t x) { return x == UINT64_MAX ? x : 0; }
+    """
+
+@test("an @export taking and returning a u64 enum carries u64::MAX across C in both directions")
+ewt_u64_max_across_c()
+    if !ewt_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val root = make_temp_dir("sysl-ewt").unwrap()
+
+        make_dir_all(s"$root/wide").unwrap()
+        write_text(s"$root/wide/lib.sysl", ewt_wide_module()).unwrap()
+        write_text(s"$root/wide/shim.c", ewt_wide_c()).unwrap()
+        write_text(s"$root/main.sysl",
+                   "import wide.*\n\nprint(c_round_trip(), u64(c_pass(Top)), E::Image(c_pass(E.Top)))\n").unwrap()
+
+        val (state, out, err) = ewt_run_root(root, level)
+
+        remove_dir_all(root).unwrap_or(())
+        assert_eq(err, "")
+        assert_eq(out, "1 18446744073709551615 Top\n")
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end ewt_u64_max_across_c
+
+@test("the emitted header spells a u64 enum's export as uint64_t at both ends")
+ewt_u64_enum_in_the_header()
+    if !ewt_ready() then return
+
+    val root = make_temp_dir("sysl-ewt").unwrap()
+
+    make_dir_all(s"$root/wide").unwrap()
+    write_text(s"$root/wide/lib.sysl", ewt_wide_module()).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(["sysl", "emit-header", root], piece -> sink.push(piece))
+    val text = join(said.view(), "\n")
+
+    remove_dir_all(root).unwrap_or(())
+    assert(code == 0, text)
+    assert(ewt_has(text, "uint64_t wide_echo(uint64_t x);"), text)
+end ewt_u64_enum_in_the_header

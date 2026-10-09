@@ -315,7 +315,7 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
                         "own operations live in, and those are code rather than storage — an " +
                         "'extern' variable names a symbol the linker resolves")
             else
-                check_foreign_symbol(a, scope, s.span, link.unwrap_or(name), link.is_some())
+                check_foreign_symbol(a, scope, s.span, link.unwrap_or(name), link.is_some(), false)
 
             hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.extern_vars,
                         "'extern' variable", None, None, None, false, link, needs)
@@ -741,7 +741,7 @@ private hoist_extern(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
     a.tables.extern_scopes.put(key, ExternHome(scope, span))
     record_access(a, scope, span, key, d.vis)
 
-    if d.link.is_some() then check_foreign_symbol(a, scope, span, d.link.unwrap(), true)
+    if d.link.is_some() then check_foreign_symbol(a, scope, span, d.link.unwrap(), true, true)
 
     check_signature_rules(a, scope, span, d.name, d.params, d.ret_type, d.variadic, true)
 end hoist_extern
@@ -750,13 +750,19 @@ end hoist_extern
 // which is what an object file's names are made of -- asked only of a link name, since a sysl name
 // is one already. **And never `main`**: this program defines that symbol, so an `extern` naming it
 // would be a declaration of the program's own entry point.
-private check_foreign_symbol(a: &Analysis, scope: Scope, span: Span, symbol: string, written: bool)
+//
+// **The one exception is a function on a bare image** (`links_an_image`), where the platform starts
+// at the manifest's `entry` and calling `main` is that entry's job -- a runtime written in sysl calls
+// it as C's start file does. Whether this image's entry is a symbol other than `main` is the
+// manifest's to say, so that half is asked once the program is lowered (`check_main_extern`).
+private check_foreign_symbol(a: &Analysis, scope: Scope, span: Span, symbol: string, written: bool,
+                             code: bool)
     if written && !is_link_symbol(symbol)
         a.fault(scope, span, s"'$symbol' is not a symbol a linker can resolve")
         return
     end if
 
-    if symbol == "main" then
+    if symbol == "main" && !(code && links_an_image(a.tables.target)) then
         a.fault(scope, span, "'main' is where the platform starts this program, so an 'extern' may " +
                 "not name that symbol")
 end check_foreign_symbol

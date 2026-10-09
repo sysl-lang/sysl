@@ -24,6 +24,14 @@ header_attr_word(w: string) -> bool
     false
 end header_attr_word
 
+// The header words that may also stand above one function or method, holding that definition (and
+// what it calls) to the promise rather than the whole module.
+//
+// **In the header the word is still the module's clause**: the header is read first, so a file whose
+// first declaration is the function writes an `import` or another declaration above it, or the
+// module's clause is what it wrote.
+fn_forgo_word(w: string) -> bool = w == "no_alloc"
+
 // The word a `@` is followed by, or `""` where it is followed by no name at all.
 attr_name(p: *Parser) -> string = p.peek_at(1) match
     Ident(n) -> n
@@ -33,7 +41,7 @@ attr_name(p: *Parser) -> string = p.peek_at(1) match
 parse_at_stmt(p: *Parser, start: Span) -> Stmt
     val word = attr_name(p)
 
-    if header_attr_word(word)
+    if header_attr_word(word) && !fn_forgo_word(word)
         p.fault(start, "this attribute belongs in the file's header, on the lines directly after 'module' and before everything else — it is a property of the whole module, not of the statements below it")
         skip_line(p)
         return stmt(start.to(p.just_taken()), Bad)
@@ -140,7 +148,7 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
 end parse_member_attrs
 
 private member_attr_refusal() -> string =
-    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@reads' and '@writes' — and the three about the function it lowers to, '@noinline', '@inline' and '@cold'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
+    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@reads' and '@writes' — and the four about the function it lowers to, '@noinline', '@inline', '@cold' and '@no_alloc'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
 
 // A layout annotation above a field (or any member) is about the wrong thing rather than about a
 // function: `@packed` and `@align(n)` lay out a whole struct, and `@align(n)` marks one binding's
@@ -154,6 +162,8 @@ private layout_attr_on_member(word: string) -> string
 end layout_attr_on_member
 
 private member_attr_word(w: string) -> bool
+    if fn_forgo_word(w) then return true
+
     for word in ["crossing", "borrows", "reads", "writes", "noinline", "inline", "cold"]
         if word == w then return true
 
@@ -225,6 +235,8 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // object gets is the back end's answer for the target, not something a program picks.
     if word == "thread_local" then return Some(ThreadLocal)
     if word == "abandons" then return no_inlining_args(p, Abandons, "a call to the function either comes back or it does not, and this says it does not")
+
+    if fn_forgo_word(word) then return Some(Forgoes(word[3..<word.len]))
 
     // `@ignore` is the spelling other test frameworks use, answered with this one's: ignoring is
     // something a test is, so it is an argument to `@test` rather than an annotation of its own.
@@ -486,6 +498,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Inline -> f.marks.inline = true
             Cold -> f.marks.cold = true
             Abandons -> f.marks.abandons = true
+            Forgoes(cap) -> f.marks.forgoes.push(cap)
             _ -> ()
 end apply_func_attrs
 
@@ -499,6 +512,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             NoInline -> m.marks.noinline = true
             Inline -> m.marks.inline = true
             Cold -> m.marks.cold = true
+            Forgoes(cap) -> m.marks.forgoes.push(cap)
             _ -> ()
 end apply_member_attrs
 
@@ -595,6 +609,11 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     // At the end of the file there is no declaration below for the annotations to be about, so
     // nothing an annotation's own sentence says is true of it: the grammar refuses it, at the word
     // after the `@`, as the reference does.
+    if p.at(Eof) && forgo_of(attrs).is_some()
+        p.fault(start, forgo_refusal(forgo_of(attrs).unwrap()))
+        return stmt(start.to(p.just_taken()), Bad)
+    end if
+
     if p.at(Eof)
         p.fault(Span(start.start + 1, start.start + 1), "an attribute expected")
         return stmt(start.to(p.just_taken()), Bad)
@@ -656,6 +675,8 @@ end has_word
 
 // The sentence a declaration that carries none of these gets, chosen by what was written above it.
 private attributed_refusal(attrs: Buf[Attr]) -> string
+    if forgo_of(attrs).is_some() then return forgo_refusal(forgo_of(attrs).unwrap())
+
     if all_are(attrs, "needs")
         return "'@needs(...)' names what reaching a declaration requires, so it marks a function or an 'extern' — and this declares neither"
 
@@ -685,6 +706,24 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
 
     "an annotation marks a function, and only a function — neither what 'sysl test' calls nor what recurses is anything a declaration of another kind supplies. '@packed', '@align(n)' and '@export(\"...\")' are the three that mark a struct instead"
 end attributed_refusal
+
+// The word of the first `@no_<cap>` above a declaration, where one was written.
+private forgo_of(attrs: Buf[Attr]) -> Option[string]
+    for attr in attrs
+        attr match
+            Forgoes(_) -> return Some(attr_word(attr))
+            _ -> ()
+
+    None
+end forgo_of
+
+// **A `@no_<cap>` below the header that marks no function is still the module's word written in the
+// wrong place**, so the header's sentence comes first -- it is what a reader who meant the module needs
+// -- and the other reading is named after it.
+private forgo_refusal(word: string) -> string =
+    "this attribute belongs in the file's header, on the lines directly after 'module' and before " +
+    "everything else — it is a property of the whole module, not of the statements below it. Above a " +
+    s"function or a method, '@$word' holds that one definition instead, and this declares neither"
 
 // The pairs that cannot describe one declaration, whichever kind it turns out to be.
 private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])

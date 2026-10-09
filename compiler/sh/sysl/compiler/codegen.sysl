@@ -153,6 +153,9 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
     // Where a frame's storage comes from, unless the program says so itself (`emit_async.sysl`).
     request_task_storage(e, p)
 
+    // And where a block on a boundary beyond the pair's comes from (`emit_box.sysl`).
+    request_aligned_heap(e, p)
+
     while made < e.queue.len()
         val what = e.queue.at(made)
         val name = e.requested.at(made)
@@ -250,6 +253,11 @@ private box_defs(e: *Emit, word_bits: int) -> Buf[IrTypeDef]
         fields.push(LInt(word_bits))
         fields.push(LPtr)
         fields.push(LInt(word_bits))
+
+        val pad = box_pad(e, boxe.1)
+
+        if pad > 0 then fields.push(LArr(int(pad), LInt(8)))
+
         fields.push(lty(e, boxe.1))
         out.push(IrTypeDef(boxe.0, fields, false))
 
@@ -260,6 +268,11 @@ private box_defs(e: *Emit, word_bits: int) -> Buf[IrTypeDef]
         fields.push(LPtr)
         fields.push(LInt(word_bits))
         fields.push(LInt(word_bits))
+
+        val pad = buf_pad(e, item.1)
+
+        if pad > 0 then fields.push(LArr(int(pad), LInt(8)))
+
         fields.push(LArr(0, lty(e, item.1)))
         out.push(IrTypeDef(item.0, fields, false))
 
@@ -489,6 +502,21 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
             free_params.push(ir_param(LPtr))
             out.push(declared_sig(e, free_symbol(), ir_fn_type(LVoid, free_params)))
 
+    // The aligned pair, on the same terms -- and not where this module writes its default or the
+    // counting runtime defines it.
+    if aligned_hook_declared(e, p, aligned_alloc_symbol())
+        var aligned_params: Buf[IrParam] = buf()
+
+        aligned_params.push(ir_param(word_lty(e)))
+        aligned_params.push(ir_param(word_lty(e)))
+        out.push(declared_sig(e, aligned_alloc_symbol(), ir_fn_type(LPtr, aligned_params)))
+
+    if aligned_hook_declared(e, p, aligned_free_symbol())
+        var aligned_free_params: Buf[IrParam] = buf()
+
+        aligned_free_params.push(ir_param(LPtr))
+        out.push(declared_sig(e, aligned_free_symbol(), ir_fn_type(LVoid, aligned_free_params)))
+
     // The two steps a buffer's size is computed in, which are the checked forms and carry their
     // width in the **name** as well as in the signature. They are declared from the flag rather than
     // asked for where they are called, so that they sit here -- among the declarations the module
@@ -596,6 +624,13 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         seen.push(malloc_symbol())
         seen.push(free_symbol())
 
+    if !e.aligned_heap.is_empty()
+        seen.push(aligned_alloc_symbol())
+        seen.push(aligned_free_symbol())
+
+        for s in aligned_default_symbols(e)
+            seen.push(s)
+
     if defines_alloc_count(e)
         for s in alloc_count_symbols()
             seen.push(s)
@@ -614,6 +649,11 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
                 Some(s) -> seen.push(s)
                 None -> ()
 
+    // **An `extern` naming `main` is a call into the entry point this text defines** -- a start file
+    // written in sysl, on a bare image that starts elsewhere (`check_main_extern`) -- so it is not
+    // declared beside the definition.
+    if p.entry_point then seen.push("main")
+
     for i in 0..<p.externs.len()
         val x = p.externs.at(i)
 
@@ -626,6 +666,12 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
     out
 end declares
+
+// Whether one half of the aligned pair is declared here: something asked for it, and it is not this
+// module's own `@export`, the default written beside it, or the counting runtime's.
+private aligned_hook_declared(e: *Emit, p: TProgram, sym: string) -> bool =
+    !e.aligned_heap.is_empty() && !defines_alloc_count(e) && !emits_export(p, sym) &&
+        !e.requested_set.has(sym)
 
 // A whole module as LLVM text, which is what `emit-llvm` prints.
 codegen_text(p: TProgram, t: Target) -> string = ir_print_module(codegen_module(p, t))
