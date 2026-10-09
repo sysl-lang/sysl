@@ -1,0 +1,231 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.text.{join, split, Search}
+
+// **On a freestanding target every definition is `"no-builtins"`, and the C a package carries is
+// compiled `-ffreestanding`** (`toolchain.sysl`'s `function_attributes` and `c_target_flags`) --
+// clang's own rule for a freestanding translation unit.
+//
+// Such an image supplies `memset`, `memcpy` and the rest itself, and a loop written to implement one
+// of them is exactly what LLVM's idiom recognition turns into a call to it: an `@export("memset")`
+// loop compiled to `b memset`, a call to itself, and a kernel that hung at its first zeroing loop. The
+// disassembly is what is asserted, since the image links either way.
+
+private nbi_row(name: string) -> Target = target_named(name).unwrap()
+
+private nbi_attrs(name: string) -> string = join(function_attributes(nbi_row(name), buf()).view(), " ")
+
+private nbi_has(xs: Buf[string], want: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == want then return true
+
+    false
+end nbi_has
+
+private nbi_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A program directory holding a manifest, `main.sysl` and, where one is given, `rt.c` beside it.
+private nbi_project(main: string, c: string) -> string
+    val root = make_temp_dir("sysl-nbi").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+
+    if c != "" then write_text(s"$root/rt.c", c).unwrap()
+
+    root
+end nbi_project
+
+private nbi_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+
+    reset_search_paths()
+    (code, join(said.view(), "\n"))
+end nbi_cli
+
+// keel's `memset`, as FINDINGS 18 quotes it.
+private val nbi_memset: string =
+    "@export(\"memset\")\nmem_set(dst: *u8, c: int, n: usize) -> *u8\n" +
+    "    for i in 0..<n\n        dst[i] = u8(c)\n    dst\n"
+
+// The same trap in C: the loop sits in a helper, which is turned into a `memset` call and then
+// inlined into `memset` itself. (LLVM leaves a loop alone in a function NAMED `memset`, so the helper
+// is what shows it.)
+private val nbi_c_memset: string =
+    "static void fill(unsigned char *p, int c, __SIZE_TYPE__ n) {\n" +
+    "    while (n--) *p++ = (unsigned char)c;\n}\n\n" +
+    "void *memset(void *d, int c, __SIZE_TYPE__ n) {\n    fill(d, c, n);\n    return d;\n}\n"
+
+// -- the rule -------------------------------------------------------------------------------------
+
+@test("every freestanding row marks its definitions no-builtins")
+nbi_every_freestanding_row()
+    val all = all_targets()
+    var asked: usize = 0
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+        val attrs = function_attributes(t, buf())
+
+        assert_eq(s"${t.name}: ${nbi_has(attrs, "\"no-builtins\"")}", s"${t.name}: ${!os_hosted(t.os)}")
+        asked += 1
+
+    assert(asked > 20, s"asked $asked rows")
+    assert_eq(nbi_attrs("aarch64-freestanding"), "nounwind \"no-builtins\"")
+end nbi_every_freestanding_row
+
+@test("a hosted row is unchanged: no no-builtins, and its C is not -ffreestanding")
+nbi_the_host_is_unchanged()
+    assert_eq(nbi_attrs("aarch64-macos"), "nounwind uwtable(sync)")
+    assert_eq(nbi_attrs("x86_64-linux"), "nounwind uwtable")
+    assert(!nbi_has(c_target_flags(nbi_row("aarch64-macos")), "-ffreestanding"), "macos")
+    assert(!nbi_has(c_target_flags(nbi_row("aarch64-linux")), "-ffreestanding"), "linux")
+    assert(!nbi_has(c_target_flags(nbi_row("wasm32-wasi")), "-ffreestanding"), "wasi")
+    assert(!nbi_has(function_attributes(host_target(), buf()), "\"no-builtins\""), "the host")
+end nbi_the_host_is_unchanged
+
+@test("the C a package carries is compiled -ffreestanding on every freestanding row")
+nbi_carried_c_is_freestanding()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        assert_eq(s"${t.name}: ${nbi_has(c_target_flags(t), "-ffreestanding")}", s"${t.name}: ${!os_hosted(t.os)}")
+
+    assert(!nbi_has(machine_flags(nbi_row("thumbv6m-freestanding")), "-ffreestanding"),
+           "the c const probe and the data layout are not handed it")
+end nbi_carried_c_is_freestanding
+
+// **The spelling is clang's**: the attribute a freestanding C translation unit's functions carry.
+@test("no-builtins is what clang gives a function under -ffreestanding, and only then")
+nbi_spelling_is_clangs()
+    if !clang_available() then return
+
+    val dir = make_temp_dir("sysl-nbi-clang").unwrap()
+    val src = s"$dir/x.c"
+
+    write_text(src, "int f(int x) { return x + 1; }\n").unwrap()
+
+    val bare = capture("clang", ["--target=aarch64-none-elf", "-ffreestanding", "-O2", "-S", "-emit-llvm",
+                                 "-o", "-", src], "", [], true).unwrap()
+    val hosted = capture("clang", ["--target=aarch64-none-elf", "-O2", "-S", "-emit-llvm", "-o", "-", src],
+                         "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(bare.status.ok() && hosted.status.ok(), "clang ran")
+    assert(bare.text.contains("\"no-builtins\""), bare.text)
+    assert(!hosted.text.contains("\"no-builtins\""), hosted.text)
+end nbi_spelling_is_clangs
+
+// -- the seam ------------------------------------------------------------------------------------
+
+@test("emit-llvm for a freestanding target shows the group with no-builtins, and the host's without")
+nbi_emit_llvm_shows_it()
+    if !nbi_ready() then return
+
+    val root = nbi_project(nbi_memset, "")
+    val bare = nbi_cli(["sysl", "emit-llvm", "--target", "aarch64-freestanding", root])
+    val host = nbi_cli(["sysl", "emit-llvm", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(bare.0, 0, bare.1)
+    assert(bare.1.contains("attributes #99 = { nounwind \"no-builtins\" }"), bare.1)
+    assert(bare.1.contains("@memset("), bare.1)
+    assert_eq(host.0, 0, host.1)
+    assert(host.1.contains("attributes #99 = { "), host.1)
+    assert(!host.1.contains("no-builtins"), host.1)
+end nbi_emit_llvm_shows_it
+
+private nbi_objdump() -> Option[string]
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end nbi_objdump
+
+// The lines of every body among `symbols` in the aarch64-freestanding archive built from `main` and
+// `c`, relocations included, so a call shows the symbol it reaches rather than an unresolved offset.
+private nbi_bodies(objdump: string, main: string, c: string, symbols: []const string) -> Buf[string]
+    val root = nbi_project(main, c)
+    val archive = s"$root/probe.a"
+    val built = nbi_cli(["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root])
+
+    assert_eq(built.0, 0, built.1)
+
+    var out: Buf[string] = buf()
+
+    capture(objdump, ["-d", "-r", "--no-show-raw-insn", "--no-leading-addr", archive]) match
+        Err(_) -> assert(false, "llvm-objdump did not run")
+        Ok(dis) ->
+            val lines = split(dis.text, "\n")
+            var inside = false
+
+            for i in 0..<lines.len
+                val line = lines[i]
+                var opens = false
+
+                for k in 0..<symbols.len
+                    if line.contains(s"<${symbols[k]}>:") then opens = true
+
+                if opens then inside = true
+                elif inside && line.trim() == "" then inside = false
+                elif inside then out.push(line)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end nbi_bodies
+
+// Whether a body is a loop of byte stores that calls no `memset`.
+private nbi_stores_and_calls_nothing(code: Buf[string]) -> (bool, bool)
+    var stores = false
+    var calls = false
+
+    for i in 0..<code.len()
+        val line = code.at(i)
+
+        if line.contains("strb") then stores = true
+        if line.contains("R_AARCH64") && line.trim().ends_with("memset") then calls = true
+
+    (stores, calls)
+end nbi_stores_and_calls_nothing
+
+@test("an exported memset loop compiles to stores on aarch64-freestanding, never to a call to memset")
+nbi_exported_memset_is_a_loop()
+    if !nbi_ready() then return
+
+    val objdump = nbi_objdump() match
+        Some(p) -> p
+        None -> return
+
+    val code = nbi_bodies(objdump, nbi_memset, "", ["memset", "mem_set"])
+    val seen = nbi_stores_and_calls_nothing(code)
+
+    assert(!code.is_empty(), "the body was found")
+    assert(seen.0, s"byte stores:\n${join(code.view(), "\n")}")
+    assert(!seen.1, s"no call to memset:\n${join(code.view(), "\n")}")
+end nbi_exported_memset_is_a_loop
+
+@test("a carried C memset whose loop is in a helper compiles to stores, never to a call to itself")
+nbi_carried_c_memset_is_a_loop()
+    if !nbi_ready() then return
+
+    val objdump = nbi_objdump() match
+        Some(p) -> p
+        None -> return
+
+    val code = nbi_bodies(objdump, "@export(\"probe_one\")\nprobe_one() -> int = 1\n", nbi_c_memset, ["memset"])
+    val seen = nbi_stores_and_calls_nothing(code)
+
+    assert(!code.is_empty(), "the body was found")
+    assert(seen.0, s"byte stores:\n${join(code.view(), "\n")}")
+    assert(!seen.1, s"no call to memset:\n${join(code.view(), "\n")}")
+end nbi_carried_c_memset_is_a_loop

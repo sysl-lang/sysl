@@ -264,6 +264,99 @@ mcg_two_heaps_are_refused()
     remove_dir_all(geom).unwrap_or(())
 end mcg_two_heaps_are_refused
 
+// -- a pair the program writes itself -------------------------------------------------------------
+
+private val mcg_own_block: string = "allocator { alloc = \"my_alloc\", free = \"my_free\" }\n"
+
+// A box and a print of it, and the count the program's own allocator kept.
+private val mcg_own_main: string =
+    "struct P\n    x: int\n\nval p: &P = P(21)\nprint(p.x * 2, heap.count > 0)\n"
+
+// **A manifest may name a pair the program defines with `@export`** -- a kernel's heap, an
+// application's own arena -- and the module then defines the pair rather than declaring it too, which
+// clang refused as `invalid redefinition of function 'my_alloc'`.
+private mcg_own_heap_project() -> string
+    val root = mcg_project(mcg_own_main, mcg_own_block)
+
+    make_dir_all(s"$root/heap").unwrap()
+    write_text(s"$root/heap/heap.sysl",
+        "module heap\n\n" +
+        "extern \"malloc\" c_malloc(n: usize) -> *u8\n" +
+        "extern \"free\" c_free(p: *u8)\n\n" +
+        "var count: int = 0\n\n" +
+        "@export(\"my_alloc\")\n" +
+        "my_alloc(n: usize) -> *u8\n" +
+        "    count += 1\n" +
+        "    c_malloc(n)\n\n" +
+        "@export(\"my_free\")\n" +
+        "my_free(p: *u8)\n" +
+        "    c_free(p)\n").unwrap()
+    root
+end mcg_own_heap_project
+
+// What the program built from `root` printed, or why it did not.
+private mcg_built_and_run(root: string) -> string
+    val exe = s"$root/out"
+    val got = mcg_run(["sysl", "build", root, "-o", exe])
+
+    use_allocator(mcg_libc)
+
+    if got.0 != 0 then return s"build failed: ${got.1}"
+
+    capture(exe, [], "", [], true) match
+        Err(_) -> "did not run"
+        Ok(answer) -> answer.text
+end mcg_built_and_run
+
+@test("a pair the program defines with @export is defined once and declared nowhere")
+mcg_own_pair_is_defined_not_declared()
+    if !mcg_library_here() then return
+
+    val root = mcg_own_heap_project()
+    val out = mcg_llvm(root)
+
+    use_allocator(mcg_libc)
+    assert_eq(out.count_of("\ndefine ptr @my_alloc("), 1, out)
+    assert_eq(out.count_of("\ndefine void @my_free("), 1, out)
+    assert(!mcg_has(out, "declare ptr @my_alloc("), out)
+    assert(!mcg_has(out, "declare void @my_free("), out)
+    assert(mcg_has(out, "call ptr @my_alloc("), out)
+    remove_dir_all(root).unwrap_or(())
+end mcg_own_pair_is_defined_not_declared
+
+@test("a pair the program defines with @export builds, and every allocation goes through it")
+mcg_own_pair_builds_and_runs()
+    if !mcg_library_here() || !clang_available() then return
+
+    val root = mcg_own_heap_project()
+
+    assert_eq(mcg_built_and_run(root), "42 true\n")
+    remove_dir_all(root).unwrap_or(())
+end mcg_own_pair_builds_and_runs
+
+// The other side of the same rule: a pair the C beside the program supplies is not defined by the
+// module, so it is still declared for the linker to find.
+@test("a pair the C beside the program defines is still declared, and builds")
+mcg_pair_in_c_is_still_declared()
+    if !mcg_library_here() || !clang_available() then return
+
+    val root = mcg_project("struct P\n    x: int\n\nval p: &P = P(21)\nprint(p.x * 2)\n", mcg_own_block)
+
+    write_text(s"$root/rt.c",
+        "#include <stdlib.h>\n\n" +
+        "void *my_alloc(size_t n) { return malloc(n); }\n" +
+        "void my_free(void *p) { free(p); }\n").unwrap()
+
+    val out = mcg_llvm(root)
+
+    use_allocator(mcg_libc)
+    assert(mcg_has(out, "declare ptr @my_alloc("), out)
+    assert(mcg_has(out, "declare void @my_free(ptr)"), out)
+    assert(!mcg_has(out, "define ptr @my_alloc("), out)
+    assert_eq(mcg_built_and_run(root), "42\n")
+    remove_dir_all(root).unwrap_or(())
+end mcg_pair_in_c_is_still_declared
+
 // -- a library artifact ---------------------------------------------------------------------------
 
 private mcg_meta(pair: (string, string)) -> string

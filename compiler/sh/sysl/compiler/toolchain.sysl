@@ -484,6 +484,15 @@ end last_section
 // every hosted system and, as clang has it, `x86_64-unknown-none-elf`. Its absence on the other
 // freestanding rows is what lets Arm mark a function `.cantunwind`. `tests_nuw_nounwind.sysl` holds
 // the table against clang's answers.
+//
+// **`"no-builtins"` on every freestanding definition, which is what clang's `-ffreestanding` gives
+// every function of a C file.** On such a machine the image itself supplies `memset`, `memcpy` and the
+// rest, and a loop written to implement one of them is exactly the loop LLVM's idiom recognition
+// turns into a call to it -- an `@export("memset")` loop compiled to `b memset`, a call to itself.
+// Marking only the functions exported under a C runtime name would not do: the loop may sit in a
+// helper the exported one calls, and the image may implement names nobody listed (`bzero`,
+// `strlen`). So the rule is clang's, for the whole program, and the C a package carries is compiled
+// `-ffreestanding` beside it (`c_target_flags`).
 function_attributes(t: Target, flags: Buf[string] = extra_cflags()) -> Buf[string]
     var out: Buf[string] = buf()
 
@@ -492,6 +501,8 @@ function_attributes(t: Target, flags: Buf[string] = extra_cflags()) -> Buf[strin
     unwind_table(t) match
         Some(u) -> out.push(u)
         None -> ()
+
+    if !os_hosted(t.os) then out.push("\"no-builtins\"")
 
     val sanitizers = sanitizer_attrs(flags)
 
@@ -682,11 +693,14 @@ end unit_flags
 
 // What a package's carried C is compiled with **because of the machine**: the unit and its
 // convention, the Arm embedded ABI's narrow enums where the row follows it, and position-independent
-// code where the output is a shared object. Each is a convention of the build the C is joining, so
-// none of them is left to whichever default this clang prefers.
+// code where the output is a shared object, and `-ffreestanding` where there is no operating system,
+// so the carried C is held to the same rule as the sysl beside it (`function_attributes`' `"no-builtins"`):
+// a `memset` the package implements is never compiled into a call to itself. Each is a convention of
+// the build the C is joining, so none of them is left to whichever default this clang prefers.
 c_target_flags(t: Target) -> Buf[string]
     var out = machine_flags(t)
 
+    if !os_hosted(t.os) then out.push("-ffreestanding")
     if t.short_enums then out.push("-fshort-enums")
     if t.position_independent() then out.push("-fPIC")
 
