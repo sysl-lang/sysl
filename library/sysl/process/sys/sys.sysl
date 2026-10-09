@@ -1,0 +1,97 @@
+module sysl.process.sys
+
+// The calls `sysl.process` makes of whatever starts programs underneath it: start one, wait for it,
+// send it a signal, and name a file nothing else holds for a captured stream to go into.
+//
+// **Each is an `extern` naming a symbol no module here defines**, so what answers it is decided by
+// what the program is linked with (`reference/ffi.md § A module may supply another module's extern`),
+// exactly as for `sysl.fs.sys` and `sysl.io.sys`:
+//
+// | linked with | what defines the symbols |
+// |---|---|
+// | a program for a hosted POSIX target | `sysl.process.hosted`, over `posix_spawn` or `fork` and `exec` |
+// | a program for a target with no C library | the program, with an `@export` per hook it reaches |
+//
+// A freestanding program that reaches one of these and leaves it unanswered is refused when it is
+// compiled, naming the hooks it reached, rather than at the link.
+//
+// ## The shape of a hook
+//
+// **A hook answers one integer: what it did, or what went wrong** -- the contract `sysl.io.sys` has.
+// Zero or more is success: a process id for `spawn`, a length for `temp_path`, zero for the others.
+// A negative answer is the code of the failure negated -- the `IoError` code `sysl.fs` uses, which on
+// a POSIX host is the `errno` -- so a kernel's system call that already answers a negative error
+// number is the hook as it stands. **A target that cannot perform a call at all answers `-1`.**
+//
+// **Text crosses as a pointer and a length, never as a C string**: a path is two parameters, and a
+// list of strings -- the argument vector, the environment -- is a pointer to the first of a run of
+// `Text` and a count. Nothing is terminated by a zero, and a supplier that wants a terminator copies.
+// The bytes belong to the caller and are only lent for the length of the call.
+//
+// **A descriptor is an `int`**, numbered as `sysl.fs.sys`'s hooks number them, and `-1` is "leave
+// this stream as it is" -- the child is given whatever this program has there.
+
+/** A run of bytes, lent: where it starts and how many there are. Laid out as C lays out a pointer
+ * followed by a `size_t`, which is what a supplier written in C reads it as.
+ */
+struct Text
+    ptr: *u8
+    len: usize
+
+/** What `wait` writes into `how` for a child that exited: `value` is its exit code. */
+const ended_exited: int = 0
+
+/** What `wait` writes into `how` for a child that a signal ended: `value` is the signal's number.
+ *
+ * **A child a kernel ended for a fault is reported this way too**, with the number POSIX raises for
+ * that fault -- 11 (`SIGSEGV`) for an address it could not touch, 4 (`SIGILL`) for an instruction it
+ * could not run, 7 (`SIGBUS`), 8 (`SIGFPE`) -- so that `Status.Signalled(11)` means what it means on
+ * every POSIX host.
+ */
+const ended_signalled: int = 1
+
+/** What `wait` writes into `how` for a child it stopped because its deadline passed. */
+const ended_timed_out: int = 2
+
+/** Starts `path` and answers the new child's process id, without waiting for it.
+ *
+ * `argv` is `argc` texts and is the child's whole argument vector, its own name first. `envp` is
+ * `envc` texts of the form `NAME=VALUE`: with `inherit_env` 1 they are added to this program's
+ * environment, a later one replacing an earlier one of the same name, and with 0 they are the child's
+ * whole environment. A `path` with no `/` in it is looked for on the `PATH` the child will have.
+ * `dir` is where the child starts, and an empty one is wherever this program is.
+ *
+ * `stdin_fd`, `stdout_fd` and `stderr_fd` become the child's descriptors 0, 1 and 2, and `-1` leaves
+ * the one this program has. The caller's own descriptors are not changed.
+ *
+ * `started` is written with the moment the child was started on whatever clock the supplier keeps,
+ * for `wait` to measure a timeout from; a supplier that keeps none writes zero.
+ */
+private[sysl] extern "sysl_proc_spawn" spawn(path: *u8, path_len: usize, argv: *Text, argc: usize,
+                                             envp: *Text, envc: usize, inherit_env: int, dir: *u8,
+                                             dir_len: usize, stdin_fd: int, stdout_fd: int,
+                                             stderr_fd: int, started: *i64) -> i64
+
+/** Waits for the child `pid` to end and reaps it, writing how it ended into `how` (one of the
+ * `ended_` constants) and `value`, and answering zero or the failure's code, negated.
+ *
+ * `timeout_ms` above zero bounds the child's life at `started + timeout_ms` on the supplier's clock:
+ * a child still running then is asked to stop (signal 15), made to after a short grace (signal 9),
+ * reaped, and reported `ended_timed_out`. Zero or less waits for as long as it takes. A deadline
+ * already past -- `started` 0 and `timeout_ms` 1 is always one -- reaps a child that has ended and
+ * stops one that has not. **A supplier that cannot bound a wait answers `-1` when handed a timeout**,
+ * and then does not block.
+ */
+private[sysl] extern "sysl_proc_wait" wait(pid: i64, started: i64, timeout_ms: i64, how: *int,
+                                           value: *int) -> int
+
+/** Sends the child `pid` the signal numbered `signal` -- POSIX's numbers: 15 asks it to stop and 9
+ * makes it -- answering zero or the failure's code, negated.
+ */
+private[sysl] extern "sysl_proc_kill" kill(pid: i64, signal: int) -> int
+
+/** Makes an empty file nothing else holds, for a child's captured stream to be written into, and
+ * writes its path into `into`, answering the path's length or the failure's code, negated. A path
+ * longer than `room` is a failure.
+ */
+private[sysl] extern "sysl_proc_temp_path" temp_path(into: *u8, room: usize) -> isize

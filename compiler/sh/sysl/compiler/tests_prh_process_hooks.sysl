@@ -1,0 +1,266 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **Starting, waiting for and signalling a child over `sysl.process.sys`, and a program answering it
+// on a target with no C library.**
+//
+// `sysl.process` starts a child through the `sysl_proc_spawn` hook, waits through `sysl_proc_wait`,
+// signals through `sysl_proc_kill` and names a capture file through `sysl_proc_temp_path`. On a hosted
+// POSIX target the library's `sysl.process.hosted` answers them over `posix_spawn` and `waitpid`,
+// under `weak` exports; on a freestanding one the program answers each hook it reaches with an
+// `@export`, and one it leaves unanswered is refused when it is compiled (`emit_checks.sysl`'s
+// `check_library_hooks`, the `sysl.process.sys` row). What the hosted answers do at run time is
+// `library/sysl/process/hooks_tests.sysl`'s.
+
+private val prh_target: string = "aarch64-freestanding"
+private val prh_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private val prh_script: string =
+    "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+// An image entered at `kstart`, laid out by the script, with the program's own heap.
+private val prh_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n" +
+    s"targets {\n  $prh_target {\n    linker_script = \"link.ld\"\n    entry = \"kstart\"\n  }\n}\n"
+
+// A shell's two moves -- a command with its output sent to a file, and a child started, signalled and
+// waited for -- which between them reach every hook of `sysl.process.sys`.
+private val prh_program: string = raw"""
+    import sysl.process.{Stdio, run, start}
+    import sysl.process.sys.Text
+
+    go() -> int
+        var n = 0
+
+        if run("/bin/ls", ["/"], stdout = Stdio.ToPath("/listing")).is_ok() then n += 1
+
+        start("/bin/spin") match
+            Ok(c) ->
+                c.kill(9)
+
+                if c.wait().is_ok() then n += 2
+            Err(_) -> ()
+
+        n
+    end go
+    """
+
+// What every bare image here defines for itself: its start, its heap (an address that is not null,
+// so nothing after the first allocation folds away), the memory functions LLVM calls on a target
+// with no C library, `putchar` and `exit`, and the five `sysl.fs.sys` hooks that writing a file and
+// reading one back reach.
+private val prh_runtime: string = raw"""
+    @export("kstart")
+    kstart() -> never
+        val n = go()
+
+        loop
+            ()
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = ptr_cast(usize(0x4100_0000))
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+
+    @export("memset")
+    mem_set(dst: *u8, c: int, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = u8(c)
+
+        dst
+
+    @export("memcpy")
+    mem_copy(dst: *u8, src: *u8, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = src[i]
+
+        dst
+
+    @export("memmove")
+    mem_move(dst: *u8, src: *u8, n: usize) -> *u8 = mem_copy(dst, src, n)
+
+    @export("memcmp")
+    mem_compare(a: *u8, b: *u8, n: usize) -> int = 0
+
+    @export("putchar")
+    k_putchar(c: int) -> int = c
+
+    @export("exit")
+    k_exit(code: int) -> never
+        loop
+            ()
+
+    @export("sysl_fs_open")
+    k_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int = -1
+
+    @export("sysl_fs_read")
+    k_read(fd: int, into: *u8, room: usize, got: *usize) -> int = -1
+
+    @export("sysl_fs_write")
+    k_write(fd: int, from: *u8, len: usize, put: *usize) -> int = -1
+
+    @export("sysl_fs_close")
+    k_close(fd: int) -> int = 0
+
+    @export("sysl_fs_unlink")
+    k_unlink(path: *u8, len: usize) -> int = -1
+    """
+
+// The four hooks, answered as a kernel's process calls would be.
+private val prh_hooks: string = raw"""
+    @export("sysl_proc_spawn")
+    k_spawn(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, envc: usize,
+            inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int,
+            stderr_fd: int, started: *i64) -> i64 = 7
+
+    @export("sysl_proc_wait")
+    k_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int = 0
+
+    @export("sysl_proc_kill")
+    k_kill(pid: i64, signal: int) -> int = 0
+
+    @export("sysl_proc_temp_path")
+    k_temp_path(into: *u8, room: usize) -> isize = -1
+    """
+
+private prh_tree(program: string) -> string
+    var files = lbr_two("main.sysl", program, "package.hocon", prh_manifest)
+
+    files.push(("link.ld", prh_script))
+    lbr_tree(files)
+end prh_tree
+
+// What `sysl build` answers for the image, and where it wrote it.
+private prh_build(p: string) -> ((int, string), string)
+    val out = lbr_temp("sysl-prh-elf")
+
+    (lbr_cli(["sysl", "build", "--target", prh_target, "-o", s"$out/img.elf", p]), out)
+end prh_build
+
+private prh_symbols(elf: string, undefined: bool) -> string
+    val ran = if undefined then capture(prh_nm, ["-u", elf], "", [], true)
+    else capture(prh_nm, [elf], "", [], true)
+
+    ran match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+end prh_symbols
+
+// Whether an `llvm-nm` listing names `symbol`, as the last word of one of its lines.
+private prh_names(listing: string, symbol: string) -> bool
+    for line in lines_of(listing)
+        if line == symbol || line.ends_with(s" $symbol") then return true
+
+    false
+end prh_names
+
+private prh_link_ready() -> bool
+    if !lbr_ready() then return false
+
+    val lld = capture("ld.lld", ["--version"], "", [], true) match
+        Ok(o) -> o.status.ok()
+        Err(_) -> false
+
+    if !lld then skip("ld.lld is not installed, so no image can be linked")
+    if !is_file(prh_nm) then skip(s"there is no llvm-nm at $prh_nm to read the image")
+
+    true
+end prh_link_ready
+
+// -- a bare image answering the hooks it reaches -----------------------------------------------------
+
+@test("a freestanding program that spawns, waits and kills links with only its own process hooks")
+prh_answered_hooks_link()
+    if !prh_link_ready() then return
+
+    val p = prh_tree(prh_program + prh_runtime + prh_hooks)
+    val (said, out) = prh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = prh_symbols(elf, false)
+
+    assert_eq(prh_symbols(elf, true).trim(), "")
+
+    // The program's own answers are the ones in the image, defined strong.
+    for hook in ["sysl_proc_spawn", "sysl_proc_wait", "sysl_proc_kill", "sysl_proc_temp_path"]
+        assert(all.contains(s" T $hook"), all)
+
+    // And nothing of the hosted answer came with them.
+    for name in ["posix_spawn", "posix_spawnp", "fork", "execvp", "waitpid", "kill", "mkstemp",
+                 "sysl_proc_posix_start", "sysl_proc_posix_wait"]
+        assert(!prh_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end prh_answered_hooks_link
+
+// -- the hooks left unanswered -------------------------------------------------------------------------
+
+@test("a freestanding program that spawns with no process hooks is refused, naming the four it reaches")
+prh_unanswered_hooks_are_refused()
+    if !lbr_ready() then return
+
+    val p = prh_tree(prh_program + prh_runtime)
+    val (said, out) = prh_build(p)
+
+    assert(said.0 != 0, "built with every process hook unanswered")
+    assert(said.1.contains(s"error: this program starts or waits for a process, and '$prh_target' " +
+        "has no C library under it for the standard library to answer one with, so the program " +
+        "answers it: define 'sysl_proc_kill', 'sysl_proc_spawn', 'sysl_proc_temp_path', " +
+        "'sysl_proc_wait' with '@export', each taking what its 'extern' in 'sysl.process.sys' " +
+        "declares and answering a process id, a length or zero, or the code of an 'IoError' negated"),
+        said.1)
+
+    // Told before the link, so no linker names a symbol; and the filesystem's hooks, answered, are
+    // not asked for.
+    assert(!said.1.contains("undefined symbol"), said.1)
+    assert(!said.1.contains("sysl.fs.sys"), said.1)
+
+    lbr_drop([p, out])
+end prh_unanswered_hooks_are_refused
+
+// -- a hosted target -------------------------------------------------------------------------------------
+
+@test("on a hosted target the library answers the process hooks under weak exports")
+prh_hosted_library_answers_weakly()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.process.{Stdio, run, start}
+
+        print(run("true", stdout = Stdio.ToPath("x")).is_ok())
+
+        val c = start("true").unwrap()
+
+        c.kill()
+        print(c.wait().is_ok())
+        """)
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
+
+    lbr_drop([p])
+    assert(said.0 == 0, said.1)
+
+    for hook in ["sysl_proc_spawn", "sysl_proc_wait", "sysl_proc_kill", "sysl_proc_temp_path"]
+        var defined = ""
+
+        for line in lines_of(said.1)
+            if line.starts_with("define ") && line.contains(s" @$hook(") then defined = line
+
+        assert(defined.starts_with("define weak "), s"$hook: $defined")
+    end for
+
+    assert(said.1.contains("@sysl_proc_posix_start("), "the hosted answer does not call the shim")
+end prh_hosted_library_answers_weakly

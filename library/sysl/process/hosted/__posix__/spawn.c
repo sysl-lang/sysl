@@ -1,6 +1,8 @@
-/* Running a child and waiting for it.
+/* Running a child and waiting for it: what `sysl.process.hosted` answers `sysl.process.sys`'s hooks
+ * with on a POSIX host. Each function exported here answers 0 or an `errno`, and the hook beside it
+ * negates that.
  *
- * This is a shim for the same reason `sysl/fs/__posix__/dirent.c` is one: what the module needs
+ * This is a shim for the same reason `sysl/fs/hosted/__posix__/paths.c` is one: what the module needs
  * from POSIX is not reachable by symbol alone. Three separate things put it here rather than in
  * sysl --
  *
@@ -82,38 +84,33 @@ static void nap(long long ms) {
     nanosleep(&want, NULL);
 }
 
-/* One of the child's streams pointed at a file the parent named. Answers an `errno`, or zero.
+/* One of the child's streams pointed at a descriptor the parent opened. Answers an `errno`, or zero.
  *
- * A path that is empty, or absent, means the stream is left alone -- so a capture of standard
- * output only, of standard error only, or of both is the same code path with a different pair of
- * arguments, and there is no combination the caller can ask for that this does not answer.
+ * A negative descriptor means the stream is left alone -- so a capture of standard output only, of
+ * standard error only, or of both is the same code path with different arguments, and there is no
+ * combination the caller can ask for that this does not answer. One that already is the stream is
+ * left alone too.
  */
-static int redirect(const char *path, int fd_no) {
-    if (!path || !path[0]) return 0;
+static int place(int fd, int fd_no) {
+    if (fd < 0 || fd == fd_no) return 0;
 
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    return dup2(fd, fd_no) < 0 ? errno : 0;
+}
 
-    if (fd < 0) return errno;
-
-    if (dup2(fd, fd_no) < 0) {
-        int e = errno;
-
-        close(fd);
-        return e;
-    }
-
-    close(fd);
-    return 0;
+/* Whether `fd` is a descriptor the parent handed over that is not one of the three a child is
+ * started with, and so is closed in the child once it has been placed. */
+static int handed(int fd) {
+    return fd > STDERR_FILENO;
 }
 
 /* Everything the child does before it becomes the other program, as one function so that the
  * caller below is a straight line. Answers an `errno`, or zero.
  *
- * It allocates nothing and opens at most one descriptor per stream, which is the constraint the
- * whole between-fork-and-exec window is written under.
+ * It allocates nothing and opens nothing, which is the constraint the whole between-fork-and-exec
+ * window is written under: the descriptors were opened by the parent.
  */
-static int child_setup(const char *const *names, const char *const *values,
-                       const char *dir, const char *out_path, const char *err_path) {
+static int child_setup(const char *const *names, const char *const *values, const char *dir,
+                       int in_fd, int out_fd, int err_fd) {
     /* `setenv` here rather than a whole `envp` handed to `execve`, so that a caller adds to the
      * environment instead of replacing it -- a child that lost PATH, HOME and TMPDIR because its
      * parent wanted to set one variable is a surprise nobody wants. This is also the one place
@@ -127,11 +124,18 @@ static int child_setup(const char *const *names, const char *const *values,
 
     if (dir && dir[0] && chdir(dir) != 0) return errno;
 
-    int e = redirect(out_path, STDOUT_FILENO);
+    int e = place(in_fd, STDIN_FILENO);
 
+    if (e == 0) e = place(out_fd, STDOUT_FILENO);
+    if (e == 0) e = place(err_fd, STDERR_FILENO);
     if (e != 0) return e;
 
-    return redirect(err_path, STDERR_FILENO);
+    /* The originals are the parent's, and the child has its copies where they belong. */
+    if (handed(in_fd)) close(in_fd);
+    if (handed(out_fd)) close(out_fd);
+    if (handed(err_fd)) close(err_fd);
+
+    return 0;
 }
 
 /* Whether the child has ended, reaping it if it has.
@@ -387,7 +391,7 @@ static const char *search_dirs(const char *const *names, const char *const *valu
 __attribute__((unused))
 static int start_forked(const char *program, char *const *argv,
                         const char *const *env_names, const char *const *env_values, int inherit,
-                        const char *dir, const char *out_path, const char *err_path,
+                        const char *dir, int in_fd, int out_fd, int err_fd,
                         int *pid_out, long long *started_ms) {
     char **env = NULL;
     char **made = NULL;
@@ -452,8 +456,8 @@ static int start_forked(const char *program, char *const *argv,
     if (pid == 0) {
         close(report[0]);
 
-        int e = inherit ? child_setup(env_names, env_values, dir, out_path, err_path)
-                        : child_setup(NULL, NULL, dir, out_path, err_path);
+        int e = inherit ? child_setup(env_names, env_values, dir, in_fd, out_fd, err_fd)
+                        : child_setup(NULL, NULL, dir, in_fd, out_fd, err_fd);
 
         if (e == 0) {
             if (inherit) execvp(program, argv);
@@ -505,12 +509,12 @@ static int start_forked(const char *program, char *const *argv,
  *
  * What the child is handed is what the `fork` path gave it, in the same order: the environment with
  * the named variables added or replaced (or, not inheriting, the named variables alone), then the
- * directory, then each stream opened onto its file. A program that cannot be run is the `errno`
+ * directory, then each stream placed onto its descriptor. A program that cannot be run is the `errno`
  * `posix_spawnp` answers, so there is nothing to reap.
  */
 static int start_spawned(const char *program, char *const *argv,
                          const char *const *env_names, const char *const *env_values, int inherit,
-                         const char *dir, const char *out_path, const char *err_path,
+                         const char *dir, int in_fd, int out_fd, int err_fd,
                          int *pid_out, long long *started_ms) {
 #if defined(__APPLE__)
     char **current = *_NSGetEnviron();
@@ -538,13 +542,21 @@ static int start_spawned(const char *program, char *const *argv,
     if (dir && dir[0]) e = posix_spawn_file_actions_addchdir_np(&actions, dir);
 #pragma clang diagnostic pop
 
-    const int opened = O_WRONLY | O_CREAT | O_TRUNC;
+    /* Each stream onto the descriptor the parent opened for it, then the originals closed in the
+     * child -- each once, since two streams may share one. */
+    const int fds[3] = { in_fd, out_fd, err_fd };
 
-    if (e == 0 && out_path && out_path[0])
-        e = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, out_path, opened, 0600);
+    for (int i = 0; i < 3 && e == 0; i++) {
+        if (fds[i] >= 0 && fds[i] != i) e = posix_spawn_file_actions_adddup2(&actions, fds[i], i);
+    }
 
-    if (e == 0 && err_path && err_path[0])
-        e = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, err_path, opened, 0600);
+    for (int i = 0; i < 3 && e == 0; i++) {
+        int seen = !handed(fds[i]);
+
+        for (int j = 0; j < i && !seen; j++) seen = fds[j] == fds[i];
+
+        if (!seen) e = posix_spawn_file_actions_addclose(&actions, fds[i]);
+    }
 
     pid_t pid = 0;
     char dirs[1024];
@@ -574,10 +586,48 @@ static int start_spawned(const char *program, char *const *argv,
 
 #endif
 
-int sysl_proc_start(const char *program, char *const *argv,
-                    const char *const *env_names, const char *const *env_values, int inherit,
-                    const char *dir, const char *out_path, const char *err_path,
-                    int *pid_out, long long *started_ms) {
+/* A run of bytes as `sysl.process.sys`'s `Text` lays it out: lent, and not terminated. */
+typedef struct {
+    const char *ptr;
+    size_t len;
+} sysl_text;
+
+/* `n` bytes at `p` as a C string of their own, or NULL where there is no memory for one. */
+static char *terminated(const char *p, size_t n) {
+    char *s = malloc(n + 1);
+
+    if (!s) return NULL;
+
+    if (n > 0) memcpy(s, p, n);
+
+    s[n] = '\0';
+    return s;
+}
+
+/* Every string `begin` made, so that one call frees them whichever way it ended. */
+typedef struct {
+    char **owned;
+    size_t count;
+} made_strings;
+
+static char *keep(made_strings *m, const char *p, size_t n) {
+    char *s = terminated(p, n);
+
+    if (s) m->owned[m->count++] = s;
+
+    return s;
+}
+
+static void release_strings(made_strings *m) {
+    for (size_t i = 0; i < m->count; i++) free(m->owned[i]);
+
+    free(m->owned);
+}
+
+static int begin(const char *program, char *const *argv,
+                 const char *const *env_names, const char *const *env_values, int inherit,
+                 const char *dir, int in_fd, int out_fd, int err_fd,
+                 int *pid_out, long long *started_ms) {
     /* **Everything this program has written, written, before anything else can write.**
      *
      * A C library buffers standard output, and it buffers it *fully* rather than by line whenever
@@ -598,15 +648,67 @@ int sysl_proc_start(const char *program, char *const *argv,
     fflush(NULL);
 
 #if SYSL_PROC_SPAWNS
-    return start_spawned(program, argv, env_names, env_values, inherit, dir, out_path, err_path,
+    return start_spawned(program, argv, env_names, env_values, inherit, dir, in_fd, out_fd, err_fd,
                          pid_out, started_ms);
 #else
-    return start_forked(program, argv, env_names, env_values, inherit, dir, out_path, err_path,
+    return start_forked(program, argv, env_names, env_values, inherit, dir, in_fd, out_fd, err_fd,
                         pid_out, started_ms);
 #endif
 }
 
-/* Wait for a child `sysl_proc_start` began, and say how it ended.
+/* Start `program` with `argv` (`argc` texts, its own name first) and the `envc` `NAME=VALUE` texts
+ * of `envp`, answering 0 having set `*pid_out` and `*started_ms`, or an `errno`.
+ *
+ * The texts are copied into C strings here, the argument vector and the two arrays `child_setup`
+ * and `child_environment` walk -- one of names, one of values, split at each entry's first `=` --
+ * and freed before this returns: the child has its own copies by then, or never started.
+ */
+int sysl_proc_posix_start(const char *program, size_t program_len,
+                          const sysl_text *argv, size_t argc, const sysl_text *envp, size_t envc,
+                          int inherit, const char *dir, size_t dir_len,
+                          int in_fd, int out_fd, int err_fd, int *pid_out, long long *started_ms) {
+    made_strings m = { calloc(2 + argc + 2 * envc, sizeof(char *)), 0 };
+    char **args = calloc(argc + 1, sizeof(char *));
+    const char **names = calloc(envc + 1, sizeof(char *));
+    const char **values = calloc(envc + 1, sizeof(char *));
+    int e = (m.owned && args && names && values) ? 0 : ENOMEM;
+
+    const char *path = e == 0 ? keep(&m, program, program_len) : NULL;
+    const char *where = e == 0 ? keep(&m, dir, dir_len) : NULL;
+
+    if (!path || !where) e = ENOMEM;
+
+    for (size_t i = 0; i < argc && e == 0; i++) {
+        args[i] = keep(&m, argv[i].ptr, argv[i].len);
+
+        if (!args[i]) e = ENOMEM;
+    }
+
+    for (size_t i = 0; i < envc && e == 0; i++) {
+        const char *at = envp[i].len > 0 ? memchr(envp[i].ptr, '=', envp[i].len) : NULL;
+        size_t name_len = at ? (size_t) (at - envp[i].ptr) : envp[i].len;
+        size_t rest = at ? envp[i].len - name_len - 1 : 0;
+
+        names[i] = keep(&m, envp[i].ptr, name_len);
+        values[i] = keep(&m, at ? at + 1 : "", rest);
+
+        if (!names[i] || !values[i]) e = ENOMEM;
+    }
+
+    if (e == 0) {
+        e = begin(path, args, names, values, inherit, where, in_fd, out_fd, err_fd, pid_out,
+                  started_ms);
+    }
+
+    if (m.owned) release_strings(&m);
+
+    free(args);
+    free(names);
+    free(values);
+    return e;
+}
+
+/* Wait for a child `sysl_proc_posix_start` began, and say how it ended.
  *
  * Returns 0 having set `*code` and `*sig`, or an `errno`.
  *
@@ -616,9 +718,13 @@ int sysl_proc_start(const char *program, char *const *argv,
  * ran out of time says nothing a caller wants to hear. **A child that had already ended is asked
  * first**, so one that finished before anybody came to wait for it is reported as it finished
  * rather than as timed out -- it did not outstay anything; its parent was simply busy.
+ *
+ * **A deadline already past is how a child nobody is going to wait for is ended**: one that has
+ * ended is only reaped -- it is a zombie until somebody asks, and asking is the whole of the cure --
+ * and one still running is stopped the way a timeout stops one.
  */
-int sysl_proc_wait(int pid, long long started_ms, int timeout_ms,
-                   int *code, int *sig, int *timed_out) {
+int sysl_proc_posix_wait(int pid, long long started_ms, long long timeout_ms,
+                         int *code, int *sig, int *timed_out) {
     *timed_out = 0;
 
     int status = 0;
@@ -656,25 +762,6 @@ int sysl_proc_wait(int pid, long long started_ms, int timeout_ms,
     return 0;
 }
 
-/* End a child nobody is going to wait for, and reap it. Answers 0, or an `errno`.
- *
- * A child that has already ended is only reaped -- it is a zombie until somebody asks, and asking
- * is the whole of the cure. One still running is stopped the way a timeout stops one, because the
- * handle that owned it is gone and so are the files it was writing into: nothing is left that could
- * read what it goes on to do.
- */
-int sysl_proc_stop(int pid) {
-    int status = 0;
-    int err = 0;
-    int ended = reaped(pid, &status, &err);
-
-    if (ended < 0) return err;
-
-    if (ended == 1) return 0;
-
-    return stop(pid, &status);
-}
-
 /* A path nothing else holds, created empty so that it stays that way, written into the caller's
  * own buffer.
  *
@@ -683,7 +770,7 @@ int sysl_proc_stop(int pid) {
  * the same name. The descriptor is closed straight away: what the caller wants is the path, to hand
  * to a child as its standard output.
  */
-int sysl_proc_temp_path(char *buf, size_t n) {
+int sysl_proc_posix_temp_path(char *buf, size_t n) {
     const char *tmp = getenv("TMPDIR");
 
     if (!tmp || !tmp[0]) tmp = "/tmp";
