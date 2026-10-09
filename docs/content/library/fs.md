@@ -1008,7 +1008,7 @@ way to get atomicity from a filesystem.
 `_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_chown`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`. Each answers an `int` by the contract every `*.sys` module has
-(`sysl.io.sys` and `sysl.process.sys` too): zero or more is success, a negative answer is the `code()`
+(`sysl.io.sys`, `sysl.process.sys`, `sysl.net.sys` and `sysl.env.sys` too): zero or more is success, a negative answer is the `code()`
 of the `IoError` it failed with, **negated** as a system call answers it (so `-1` is `EPERM` and comes back as
 `NotPermitted`, where `-13`, `EACCES`, is `PermissionDenied`), and the one status `UNSUPPORTED` means the target cannot make that call at
 all. `UNSUPPORTED` is a constant in `sysl.sys`, -38 on every platform and deliberately not the host's

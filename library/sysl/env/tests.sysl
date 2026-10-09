@@ -2,8 +2,9 @@ module sysl.env
 @requires(os)
 @tests
 
-import sysl.slices.as_mut_ptr
-import sysl.text.cstring
+import sysl.env.sys as esys
+import sysl.slices.{as_ptr, as_mut_ptr}
+
 
 // What `sysl.env` claims, asserted against whatever environment the suite happens to run in.
 //
@@ -66,12 +67,90 @@ end env_vars_agree_with_get
 // splitting is asked about directly.
 @test("an entry splits at its first =, keeps an empty value, and skips no = or bytes that are not text")
 env_entry_splits()
-    assert_eq(entry(cstring("A=b=c").ptr), Some(("A", "b=c")))
-    assert_eq(entry(cstring("EMPTY=").ptr), Some(("EMPTY", "")))
-    assert_eq(entry(cstring("=v").ptr), Some(("", "v")))
-    assert(entry(cstring("NOEQUALS").ptr) == None, "an entry with no '=' was read as a variable")
+    assert_eq(entry("A=b=c".bytes), Some(("A", "b=c")))
+    assert_eq(entry("EMPTY=".bytes), Some(("EMPTY", "")))
+    assert_eq(entry("=v".bytes), Some(("", "v")))
+    assert(entry("NOEQUALS".bytes) == None, "an entry with no '=' was read as a variable")
+    assert(entry("".bytes) == None, "an empty entry was read as a variable")
 
-    var bad: [5]u8 = [u8('A'), u8('='), 255, u8('x'), 0]
+    var bad: [4]u8 = [u8('A'), u8('='), 255, u8('x')]
 
-    assert(entry(as_mut_ptr(bad[..])) == None, "a value that is not UTF-8 was read as text")
+    assert(entry(bad[..]) == None, "a value that is not UTF-8 was read as text")
+
+    // A slice of a longer entry, so nothing past its end -- no terminator, the next entry -- is read.
+    assert_eq(entry("K=vv=more"[0..<4].bytes), Some(("K", "vv")))
 end env_entry_splits
+
+// -- the hooks, as the hosted supplier answers them ---------------------------------------------------
+
+@test("the get hook writes at most its room and says the whole length, so a short buffer is asked again")
+env_get_hook_reports_the_whole_length()
+    val value = get("PATH").unwrap()
+    var one: [1]u8 = [0]
+    var n: usize = 0
+    val name = "PATH"
+
+    assert_eq(esys.get(as_ptr(name.bytes), name.bytes.len, &one[0], 1, &n), 1)
+    assert_eq(n, value.bytes.len)
+    assert_eq(one[0], value.bytes[0])
+end env_get_hook_reports_the_whole_length
+
+@test("the get hook reads only the name's length, not up to a terminator")
+env_get_hook_reads_a_lent_name()
+    // `PATHX` cut to four bytes is `PATH`; a supplier reading to a zero would ask for `PATHX`.
+    val name = "PATHX"[0..<4]
+    var into: [8]u8 = [0; 8]
+    var n: usize = 0
+
+    assert_eq(esys.get(as_ptr(name.bytes), name.bytes.len, &into[0], 8, &n), 1)
+    assert_eq(n, get("PATH").unwrap().bytes.len)
+end env_get_hook_reads_a_lent_name
+
+@test("the get hook answers zero for a name that is not set, and leaves got alone")
+env_get_hook_unset()
+    var n: usize = 7
+    val name = absent()
+
+    assert_eq(esys.get(as_ptr(name.bytes), name.bytes.len, null, 0, &n), 0)
+    assert_eq(n, 7)
+
+@test("the count and entry hooks agree with vars, and a place past the end answers zero")
+env_count_and_entry_hooks()
+    val n = esys.count()
+
+    assert(n > 0, s"the count hook answered $n")
+
+    var into: [4]u8 = [0; 4]
+    var got: usize = 99
+
+    assert_eq(esys.entry(usize(n), &into[0], 4, &got), 0)
+    assert_eq(got, 99)
+    assert(vars().len() <= usize(n), "vars listed more than the count hook said there were")
+end env_count_and_entry_hooks
+
+@test("a value longer than the first ask is fetched whole on the second")
+env_fetched_asks_again_with_the_room_it_was_told()
+    // A stand-in hook over 1000 bytes, which counts its calls: the first ask has 256 bytes of room.
+    var calls = 0
+    val calls_at = &calls
+
+    val got = fetched((into, room, n) ->
+        *calls_at += 1
+        for i in 0..<(if room < 1000 then room else 1000)
+            into[i] = u8(i % 251)
+        *n = 1000
+        1)
+
+    val bytes = got.unwrap()
+
+    assert_eq(bytes.len, 1000)
+    assert_eq(bytes[999], u8(999 % 251))
+    assert_eq(calls, 2)
+end env_fetched_asks_again_with_the_room_it_was_told
+
+@test("a hook answering zero or a failure is no value, whatever it wrote")
+env_fetched_none_and_failure()
+    assert(fetched((into, room, n) -> 0) == None, "a hook answering zero gave a value")
+    assert(fetched((into, room, n) ->
+        *n = 3
+        -38) == None, "a hook answering UNSUPPORTED gave a value")
