@@ -561,6 +561,26 @@ asm
 `b kmain` above, through `@export("kmain")`, or a label the block defines and sysl declares
 `extern` — so `{NAME}` naming one is refused with that advice rather than read as its address.
 
+**A function only the block calls may stay `private`.** `private` is a promise about the sysl *name*
+and `@export` one about a *symbol*, so together they are a function no other file can name whose
+symbol the block still reaches. The symbol is published **hidden**: every object of the image being
+linked resolves it, and a shared library built from it does not offer it to a loader
+([a private export](/reference/ffi/#a-private-export)).
+
+```sysl build=c target=aarch64-freestanding
+@section(".text.boot")
+asm
+    [aarch64]
+        ".globl thread_start"
+        "thread_start:"
+        "mov x0, x19"
+        "bl keel_thread_entry"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+@export("keel_thread_entry")
+private thread_entry(arg: u64) -> u64 = arg + 1
+```
+
 **What only a block inside a function can mean is refused**, on every arm and not only on the one
 being built, since the mistake does not depend on the machine. An operand has no variable to be:
 

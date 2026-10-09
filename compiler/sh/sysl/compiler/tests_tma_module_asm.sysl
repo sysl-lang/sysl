@@ -701,6 +701,52 @@ tma_the_archive_carries_the_symbol()
         Some(table) -> assert(tma_any_line(table, ".text.boot", "AX", " 2048"), table)
 end tma_the_archive_carries_the_symbol
 
+// The kernel's shape: an entry only the module's own assembly calls, which is no business of any
+// importer. `private` keeps the sysl name in its file; the symbol is there, hidden, and the `bl` in
+// the block is what reaches it.
+@test("module asm calls a private export by its symbol, which the object defines global and hidden")
+tma_asm_calls_a_private_export()
+    if !tma_ready() then return
+
+    val src = raw"""
+        @section(".text.boot")
+        asm
+            [aarch64]
+                ".globl thread_start"
+                "thread_start:"
+                "mov x0, x19"
+                "bl k_thread_entry"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        @export("k_thread_entry")
+        private thread_entry(arg: u64) -> u64 = arg + 1
+        """
+    val dir = make_temp_dir("sysl-tma").unwrap()
+    val main = s"$dir/main.sysl"
+    val archive = s"$dir/libk.a"
+
+    write_text(main, src).unwrap()
+
+    build_c_archive(main, Some(tma_arm), None, "0", Some(archive), None, (m) -> ()) match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            assert(false, s"the archive did not build:\n${failure_text(why)}")
+        Ok(_) -> ()
+
+    val symbols = tma_tool("llvm-readelf", ["-s", archive])
+    val code = tma_tool("llvm-objdump", ["-dr", "--section=.text.boot", archive])
+
+    remove_dir_all(dir).unwrap_or(())
+
+    if symbols.is_none() || code.is_none()
+        print("skipped: no llvm-readelf and llvm-objdump here")
+        return
+    end if
+
+    assert(tma_any_line(symbols.unwrap(), "GLOBAL", "HIDDEN", "k_thread_entry"), symbols.unwrap())
+    assert(tma_any_line(code.unwrap(), "R_AARCH64_CALL26", "", "k_thread_entry"), code.unwrap())
+end tma_asm_calls_a_private_export
+
 @test("a constant written into the text is the instruction's immediate in the object file")
 tma_the_object_carries_the_constant()
     if !tma_ready() then return

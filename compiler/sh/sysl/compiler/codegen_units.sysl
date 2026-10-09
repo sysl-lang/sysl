@@ -744,8 +744,12 @@ compile_object_in_units(cc: string, ir: string, obj: string, target: Target,
                         level: string) -> Result[unit, string]
     // A relocatable link reads objects and not the bitcode `-flto` writes, so under it the text is
     // one unit, as a `build-c --lto` archive's always is.
+    //
+    // **A private `@export` is hidden too, and the merge would localize it** -- leaving the package's
+    // own C, compiled into objects of their own beside this one, nothing to call. Such a text is one
+    // unit, so the symbol stays a global the C project's static link resolves.
     val splits = merge_localizes_hidden(target) && settled_lto().is_none()
-    val units = if splits then codegen_units(ir.len, target) else 1
+    val units = if splits && !defines_hidden(ir) then codegen_units(ir.len, target) else 1
 
     if units < 2 then return compile_object(cc, ir, obj, target, level)
 
@@ -775,6 +779,24 @@ compile_object_in_units(cc: string, ir: string, obj: string, target: Target,
         Ok(_) -> Ok(())
         Err(f) -> Err(if f.unrun then f.said else tool_failed(cc, f.code, f.said))
 end compile_object_in_units
+
+// Whether `ir` defines a hidden function. Before a module is split nothing is hidden but a private
+// `@export`'s entry (`emit_export.sysl`); the promoted locals are made hidden by the split itself.
+private defines_hidden(ir: string) -> bool
+    var at: usize = 0
+
+    loop
+        val found = ir.index_of_from("\ndefine ", at)
+
+        if found.is_none() then return false
+
+        val start = found.unwrap() + 1
+        val name_at = ir.index_of_byte_from(u8('@'), start).unwrap_or(ir.len)
+
+        if ir[start..<name_at].contains(" hidden ") then return true
+
+        at = start
+end defines_hidden
 
 // Whether a relocatable link for `t` turns a hidden symbol into a local one: Mach-O's does, ELF's,
 // COFF's and WebAssembly's do not.
