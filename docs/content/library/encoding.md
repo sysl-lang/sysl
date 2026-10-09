@@ -159,14 +159,145 @@ Reading answers an `Option` and writing a `bool`, rather than trapping: walking 
 came from somewhere else is the ordinary use, and running off the end of one is an expected condition
 there rather than a program's mistake.
 
-**These are free functions at concrete widths, and that is exactly why they can exist.**
-[`sysl.math`](/library/math/)'s `Bits` trait deliberately has no `swap_bytes`, because every member of
-that trait must be total over every integer type and a `u24` has no byte order at all. Nothing here is
-a trait member, so nothing here reopens that — `get_u32_le` names its width, and the widths written
-are the ones with a whole number of bytes.
+**These read one integer at a time out of a slice.** A value already in hand is put in an order with
+[`sysl.math.ByteOrder`](/library/math/)'s `to_be` and `from_be`, and a record of several fields is a
+struct with [`@byte_order`](/reference/attributes/), read and written whole with `Plain` below.
 
 Unsigned only: the signed read of the same bytes is a cast at the call site, and doubling a
 twelve-function surface to spare one cast is not a trade worth making.
+
+## Plain data — a record read out of bytes, and written back
+
+A superblock, an inode, a directory entry and a protocol header are all one thing: a struct whose
+value is its bytes. `Plain` reads one out of a `[]const u8` and writes one into a `[]u8`, and **every
+byte that could be wrong is checked on the way in** — a `bool` holding anything but `0` or `1`, an enum
+holding a number none of its variants is.
+
+```sysl
+import sysl.encoding.Plain
+
+enum Kind: u16
+    File = 1
+    Dir = 2
+
+struct Node
+    kind: Kind
+    open: bool
+    size: u32
+
+var disk: [16]u8 = [0xff; 16]
+
+print(Node.decode(disk[..]).is_none())
+
+disk[0] = 2
+disk[1] = 0
+disk[2] = 1
+
+val n = Node.decode(disk[..]).unwrap()
+
+print(Kind::Image(n.kind), n.open, n.size)
+
+var out: [8]u8 = [0xaa; 8]
+
+print(n.encode(out[..]), out[2], out[3])
+```
+
+```output
+true
+Dir true 4294967295
+true 1 0
+```
+
+`0xffff` is neither variant and `0xff` is no `bool`, so the first read answers `None` rather than a
+`Node` the program cannot trust. Once the two bytes are right, every other byte is some value of its
+field, so there is nothing more to check.
+
+```sysl
+trait Plain
+    decode(b: []const u8) -> Option[Self]
+    encode(self, out: []u8) -> bool
+```
+
+- **`decode` reads the first `sizeof(T)` bytes** and leaves the rest — a header at the front of a
+  frame is the ordinary case — and answers `None` where the slice is shorter. The slice need not be
+  aligned: the bytes are copied into storage of the type's own alignment and checked there.
+- **`encode` writes zeros into padding**, so one value always encodes to the same bytes — `out[3]`
+  above is the byte between `open` and `size`, which held `0xaa` before. It answers `false`, and
+  writes nothing, where `out` is too short.
+
+**The membership is the compiler's**, as `Bits`' is: a type is plain where every part of it is an
+integer of whole bytes, a float, a fixed-point number, a `bool`, a simple enum, or an array or a struct
+of plain things. Nothing is written to join; the trait has to be imported to be reached, and a
+generic body bounded by `Plain` decodes whatever it is instantiated at. **What is shut out is named**,
+part and all:
+
+```sysl
+import sysl.encoding.Plain
+
+struct Node
+    next: &Node
+
+val b: [8]u8 = [0; 8]
+
+print(Node.decode(b[..]).is_some())
+```
+
+```error
+'Node' is not plain data, so 'Plain.decode' cannot make one out of bytes: its field 'next' is &Node — a counted reference holds an address, and an address read off a disk or a wire points nowhere this program allocated. Hold an offset or an index instead
+```
+
+A string, a slice, a pointer and a weak reference are refused in the same words. A `char` is refused
+because most of the numbers its four bytes can hold are not a Unicode scalar value, and a subtype with
+a range because its check runs where a value is made — hold the number and convert it, which runs the
+check:
+
+```sysl
+import sysl.encoding.Plain
+
+type Small = u8 within 1..10
+
+struct C
+    c: Small
+
+val b: [8]u8 = [0; 8]
+
+print(C.decode(b[..]).is_some())
+```
+
+```error
+'C' is not plain data, so 'Plain.decode' cannot make one out of bytes: its field 'c' is Small — 'Small' checks the values it admits, and the check runs where a value is made rather than over bytes. Read the type it narrows and convert, which runs the check
+```
+
+**The byte order is the struct's.** An integer field is in the machine's order unless the struct
+states one with [`@byte_order`](/reference/attributes/), and then `decode` and `encode` move the
+format's bytes and an enum field is checked in that order — an Ethernet header's EtherType arrives
+most significant byte first:
+
+```sysl
+import sysl.encoding.Plain
+
+enum Proto: u16
+    Ip = 0x0800
+    Arp = 0x0806
+
+@packed
+@byte_order(big)
+struct Eth
+    dst: [6]u8
+    src: [6]u8
+    ty: Proto
+
+var f: [14]u8 = [0; 14]
+
+f[12] = 0x08
+f[13] = 0x06
+
+print(Proto::Image(Eth.decode(f[..]).unwrap().ty))
+```
+
+```output
+Arp
+```
 
 ## UUIDs
 

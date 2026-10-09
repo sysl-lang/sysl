@@ -546,7 +546,7 @@ every way into the image — the entry itself where sysl defines it, an `@export
 
 Storage that folds — literals, a struct over constants — is laid into the image and never asks;
 computed storage nothing reaches is left alone. It is the same rule `build-c` holds a freestanding
-archive to, which has no entry at all.
+archive to, which has no `main` of its own to fill it — a C runtime's archive included.
 
 ### A runtime written in sysl calls `main` through an `extern`
 
@@ -608,8 +608,44 @@ kstart() -> int = program_main(0, null)
 an 'extern' may name 'main' only on an image that starts somewhere else, whose entry calls it — and this image names no entry of its own ('targets.aarch64-freestanding.entry'), so 'main' is where it starts
 ```
 
-An archive `build-c` writes is refused the same way, its `main` being the C program's; and an
-`extern` *variable* at `main`'s symbol is refused on every target, storage never being an entry.
+An `extern` *variable* at `main`'s symbol is refused on every target, storage never being an entry.
+
+### A C runtime written in sysl calls the C program's `main`
+
+An archive `build-c` writes is ordinarily a library a C program calls into, and the program's `main`
+is none of its business. **A C runtime is the exception** — the crt0 a C program is linked against,
+whose `_start` sets the machine up and calls the program's `main(argc, argv)`. The archive says it is
+one the way an image does, by naming the symbol it starts at:
+
+```hocon
+targets {
+  aarch64-freestanding {
+    entry = "_start"
+  }
+}
+```
+
+Then an `extern` may name `main`, and it declares the C program's — the archive defines none, and the
+link finds the one the C program brings. The signature is held to C's, as above:
+
+```sysl
+extern "main" program_main(argc: int, argv: **u8) -> int
+extern halt(code: int) -> never
+
+@export("libc_start")
+libc_start(argc: int, argv: **u8) -> never = halt(program_main(argc, argv))
+```
+
+`_start` is a few lines of module-level `asm` that set the stack and branch to `libc_start`; module
+`asm` and an `@export` are never pruned, so both are in the archive, and the linker pulls them in
+because the image's entry names `_start`. Only `entry` is read for an archive — `linker` and
+`linker_script` are the C program's link's to say.
+
+An archive naming no entry, or naming `main`, is refused, with the way to declare it:
+
+```
+an 'extern' may name 'main' in an archive only where the archive is the C program's runtime, whose entry calls it — and this archive names no entry other than 'main', so 'main' is the C program's and nothing here starts before it. A C runtime says so with 'targets.aarch64-freestanding.entry' in its package.hocon, naming the symbol it starts at
+```
 
 ### What is refused
 
@@ -667,6 +703,40 @@ targets {
 }
 ```
 
+### A processor's extensions
+
+A row names an architecture, and the code generated for it uses only what that architecture
+guarantees. `aarch64-freestanding` is Armv8.0, so every atomic read-modify-write is a
+load-exclusive/store-exclusive loop — even on a core that has Armv8.1's LSE instructions and could do
+it in one `ldadd`. A project whose cores all have more says which, in the same block:
+
+```hocon
+codegen {
+  extensions = ["lse", "rcpc"]
+}
+```
+
+Each name is the extension as LLVM names the feature — `lse`, `rcpc`, `crc` on AArch64, `popcnt` or
+`bmi2` on x86_64, `zbb` on RISC-V — and it reaches the same places the settings do: the function
+attributes (`"target-features"="+lse,+rcpc"` on aarch64 and x86_64), every clang line, the standard
+module's artifact (whose directory name ends `-ext+lse+rcpc`) and the run cache. A target's own list
+**replaces** the project's for that machine, and an empty one, `extensions = []`, takes them away.
+**It is a list rather than a setting per extension** because the set of extensions is the back end's
+and moves with every LLVM release; the compiler asks the clang that will build the program whether it
+knows each name, once per build, and refuses one it does not — clang itself would only warn and build
+without it:
+
+```text
+error: 'codegen.extensions' names 'lsee', which the aarch64 back end does not know — an extension is
+spelled as LLVM spells the feature ('lse' or 'rcpc' on AArch64, 'popcnt' on x86_64, 'zbb' on RISC-V)
+```
+
+A name is written alone: `"+lse"` is refused, every entry being an extension the code may use, and so
+is `"lse,rcpc"`, one entry naming two. Turning the processor's own features *off* is not this list's
+job — `general_regs_only` is. Where both are given, `general_regs_only` wins: an extension that brings
+the SIMD registers with it is closed again. A machine whose code LLVM does not generate (`craft`)
+refuses the list.
+
 ### Only the root project's block applies
 
 What registers an image may touch is a property of the whole image, so a dependency cannot turn them
@@ -681,6 +751,9 @@ back on under its consumer, and its own `codegen` block is ignored, as its `opti
 | Thumb | refused — build for a row with no unit | `-mno-unaligned-access` |
 | RISC-V | refused — the F and D extensions are the triple's ABI | `-mstrict-align` |
 | wasm32 | refused | refused |
+
+`extensions` applies on every machine whose code LLVM generates, as `-target-feature` on each clang
+line and, on aarch64 and x86_64, in the function attribute too.
 
 A setting a machine has no meaning for is **refused**, before anything is built, rather than
 dropped. On Thumb the floating-point unit is part of the calling convention the row names, so turning

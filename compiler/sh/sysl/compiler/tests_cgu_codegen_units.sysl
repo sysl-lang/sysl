@@ -387,6 +387,39 @@ cgu_build_c_keeps_its_header_and_symbols()
     cgu_end(dirs)
 end cgu_build_c_keeps_its_header_and_symbols
 
+// **A private `@export` is hidden, and Mach-O's relocatable merge makes a hidden symbol local** --
+// which would leave the C linked beside the archive nothing to call. A text defining one is compiled
+// as one unit (`codegen_units.sysl`'s `defines_hidden`), however many were asked for.
+@test("build-c asked for four units keeps a private export a symbol the C project's link resolves")
+cgu_build_c_keeps_a_private_export_linkable()
+    if !cgu_ready() then return
+
+    val dirs = cgu_begin()
+    val src = "@export(\"cgu_area\")\narea(w: i32, h: i32) -> i32 = w * h\n\n" +
+              "@export(\"cgu_secret\")\nprivate secret(n: i32) -> i32 = n * 3 + 1\n"
+    val c = "#include <stdio.h>\nint cgu_secret(int);\nint cgu_area(int, int);\n" +
+            "int main(void) { printf(\"%d %d\\n\", cgu_secret(4), cgu_area(2, 3)); return 0; }\n"
+
+    make_dir_all(s"${dirs.0}/lib").unwrap()
+    write_text(s"${dirs.0}/lib/lib.sysl", src).unwrap()
+    write_text(s"${dirs.0}/main.c", c).unwrap()
+    cgu_units("4")
+    build_c_archive(s"${dirs.0}/lib", None, None, DefaultOptimization, Some(s"${dirs.0}/lib.a"),
+                    Some(s"${dirs.0}/lib.h"), (m) -> ()).unwrap()
+
+    val header = read_text(s"${dirs.0}/lib.h").unwrap()
+
+    assert(header.contains("cgu_area("), header)
+    assert(!header.contains("cgu_secret"), header)
+
+    val cc = find_clang(host_target(), None).unwrap()
+    val linked = capture(cc, [s"${dirs.0}/main.c", s"${dirs.0}/lib.a", "-o", s"${dirs.0}/prog"]).unwrap()
+
+    assert(linked.status.ok(), linked.err.unwrap_or(linked.text))
+    assert_eq(cgu_output(s"${dirs.0}/prog"), "13 6\n")
+    cgu_end(dirs)
+end cgu_build_c_keeps_a_private_export_linkable
+
 @test("an edit to one function recompiles only the units whose text changed")
 cgu_an_edit_recompiles_some_units()
     if !cgu_ready() then return

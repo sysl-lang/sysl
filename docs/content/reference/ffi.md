@@ -379,7 +379,6 @@ surprise.
 |---|---|
 | a **generic** | an exported symbol is one function at one signature, so there is no way to say which instantiation the linker holds |
 | a **member** | C has no receiver to hand it. The grammar refuses this before any rule here is reached, and says so in as many words: a member takes no annotation at all ([attributes](/reference/attributes/)), so `@test` and `@pure` are as unavailable on a method |
-| a **`private`** definition | `private` gives the symbol internal linkage, which promises every caller is inside the module; an export promises the opposite |
 | a **`@ghost`** | it is erased before there is a symbol at all |
 | a **`@test`** | only `sysl test` builds one, and an export has to be in the artifact a C project links |
 | a **variadic** | what a C caller promotes into the tail is decided by the prototype it compiled against, not by this declaration. Take a `va_list` parameter, which says the same thing and is what C's own `v` variants do |
@@ -436,6 +435,35 @@ data, so no count crosses it in either direction.
 Every refusal names the shape to write instead, because there always is one — a slice becomes the
 pointer and length C's own buffer functions already take, an array becomes a struct holding it. That
 is what makes the boundary writable rather than merely restricted.
+
+### A private export
+
+`private` is **not** on that list. It is a promise about the sysl *name* — no other file may call
+it — and `@export` is one about a *symbol*, so the two say different things and both may be written.
+The definition stays file-private; the entry C calls is published **hidden**:
+
+```sysl
+@export("twice_c")
+private twice(x: i32) -> i32 = x * 2
+
+print(twice(21))
+```
+
+```output
+42
+```
+
+Hidden is exactly what an entry nobody outside the image may call wants. Every object linked into
+the image resolves it — [module `asm`](/reference/inline-assembly/#assembly-at-the-top-of-a-file)
+calling a kernel's thread entry, a package's own C calling back into it — and a shared library built
+from the image does not offer it to a loader, so nothing outside can bind to it or interpose on it.
+Two consequences follow:
+
+- **The generated header leaves it out.** A header is the API a C project is handed, and a private
+  export is not part of one.
+- **A symbol a loader looks up by name has to be public.** `SDL_main`, a JNI entry and anything
+  `dlsym` asks for are found in the dynamic symbol table, which is precisely where a hidden symbol is
+  not.
 
 ### Module storage, and who fills it
 
@@ -700,10 +728,10 @@ struct Box[T]
 a header names one type at one shape, so 'mylib.Box' cannot be generic
 ```
 
-A **`private`** struct is refused too, and not for the reason a private *definition* is — a `typedef`
-has no linkage to contradict. The visibility rule gets there first: a public declaration may not name
-a type less visible than itself and an export is public, so a private struct appears in no signature
-a header carries and there is no name in one for it to take.
+A **`private`** struct is refused. A `typedef` has no linkage, so the only thing its name could do
+is stand in a header — and a header declares only public exports, and a public declaration may not
+name a type less visible than itself. A private struct appears in no signature a header carries, so
+there is no name in one for it to take.
 
 ```sysl
 module mylib
@@ -714,7 +742,7 @@ private struct Id
 ```
 
 ```error
-'mylib.Id' is private, so no exported function may name it — an export is public
+'mylib.Id' is private, and a header declares only public exports, none of which may name it
 ```
 
 **The chosen name reaches the header and nothing else.** The emitted aggregate keeps its mangled

@@ -33,6 +33,7 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 | [`sysl.buf`](/library/buf/) | `Buf[T]`, the growable sequence, and `ByteSink` | — |
 | [`sysl.container`](/library/container/) | five containers — [`Map`](/library/container/#the-map) and [`Set`](/library/container/#the-set) over one flat probe table, [`Deque`](/library/container/#the-queue-at-both-ends), [`Heap`](/library/container/#the-priority-queue), and an immutable [`List`](/library/container/#the-immutable-list) that shares its tail | — |
 | [`sysl.container.ring`](/library/ring/) | `Ring[T]`, a queue of a **fixed** capacity over storage the caller supplies — no allocator, a full ring that answers rather than grows, and [`overwrite`](/library/ring/#overwrite-is-what-makes-it-a-ring-rather-than-a-bounded-queue) for a window over an unbounded stream | — |
+| [`sysl.dma`](/library/dma/) | `Region`, memory a device can reach by address — it carries the device's address of its first byte, a part of it is a region too, and [`to_device`/`from_device`](/library/dma/#the-handover-is-the-cache-maintenance) are the cache maintenance a handover needs | — |
 | [`sysl.io`](/library/io/) | `Reader`, `stdin()`, `lines()` and `console_lines()`, and the in-memory `bytes_reader()` / `bytes_writer()` | — |
 | [`sysl.path`](/library/path/) | a path by the string alone — `join`, `parent`, `file_name`, `extension`, `stem`, `normalize`, `relative_to`. It opens nothing | — |
 | [`sysl.fs`](/library/fs/) | what is at the end of a path — `read_text`, `write_bytes`, `metadata`, the links, `make_dir_all`, `copy_file`, `canonicalize`, and `IoError` | `os` |
@@ -46,7 +47,7 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 | [`sysl.posix.time`](/library/time/#reading-a-clock-sysl-posix-time) | the two clocks the host keeps — `now` for a wall reading, `monotonic` for measuring — the zone it is set to, and the zone database by name | `posix` |
 | [`sysl.env`](/library/env/) | the environment a program was started with — `get`, `get_or`, `is_set`, and `vars` to list it. Reading only | `os` (`vars`: `posix`) |
 | [`sysl.process`](/library/process/) | starting another program and waiting for it — `run`, `capture`, `Status`, a timeout so a child that never ends cannot hold its caller, and no shell anywhere in it | `posix` |
-| [`sysl.posix.net`](/library/net/) | blocking TCP — `resolve`, `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `shutdown`, `close`, and a timeout so a blocking call cannot wait forever | `posix` |
+| [`sysl.net`](/library/net/) | blocking TCP and UDP — `resolve`, `socket`, `udp_socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `send_to`, `recv_from`, `shutdown`, `close`, a timeout so a blocking call cannot wait forever, and addresses as values (`ipv4`, `ipv6`); answered by the program where there is no C library (`sysl.net.sys`) | `os` |
 | [`sysl.sync`](/library/sync/) | `Atomic[T]`, `SpinLock`, and the five memory orderings | — |
 | [`sysl.posix.threads`](/library/threads/) | `spawn`, `Thread.join`, `yield_now`, `Mutex[T]`, and `Channel[T]` — the bounded queue two threads hand values across | `posix` |
 | [`sysl.term`](/library/term/) | the escape sequences a terminal understands — colour, emphasis, and the screen | — |

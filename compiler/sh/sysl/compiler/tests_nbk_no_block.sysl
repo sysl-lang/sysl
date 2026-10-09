@@ -136,11 +136,45 @@ nbk_the_library_lock()
     if !nbk_ready() then return
 
     val said = nbk_err("import sysl.posix.threads.Mutex\n\n" +
-                       "@no_block\nguarded(m: *Mutex[int]) -> int = *m.lock()\n",
+                       "@no_block\nguarded(m: *Mutex[int]) -> int = *m.lock_raw()\n",
                        "print(1)\n")
 
-    nbk_check(said, "this reaches 'sysl.posix.threads.Mutex.lock', which blocks, and 'thing.guarded' " +
+    nbk_check(said, "this reaches 'sysl.posix.threads.Mutex.lock_raw', which blocks, and " +
+                    "'thing.guarded' declared '@no_block'")
+
+@test("the library's guarded 'with' is marked, and 'try_with' is not")
+nbk_the_library_with()
+    if !nbk_ready() then return
+
+    val said = nbk_err("import sysl.posix.threads.Mutex\n\n" +
+                       "@no_block\nguarded(m: *Mutex[int]) -> int = m.with(p -> *p + 1)\n\n" +
+                       "@no_block\ntried(m: *Mutex[int]) -> int = m.try_with(p -> *p + 1).unwrap_or(0)\n",
+                       "print(1)\n")
+
+    nbk_check(said, "this reaches 'sysl.posix.threads.Mutex.with', which blocks, and 'thing.guarded' " +
                     "declared '@no_block'")
+    assert(!nbk_says(said, "'thing.tried' declared"), said)
+
+@test("'block_on' waits by definition, so a '@no_block' function may not call it")
+nbk_block_on()
+    if !nbk_ready() then return
+
+    val said = nbk_err("async seven() -> int = 7\n\n@no_block\nrun() -> int = block_on(seven())\n",
+                       "print(thing.run())\n")
+
+    nbk_check(said, "this reaches 'block_on', which blocks, and 'thing.run' declared '@no_block' — " +
+                    nbk_tail())
+
+@test("a blocking socket read in 'sysl.net' is marked")
+nbk_the_library_socket()
+    if !nbk_ready() then return
+
+    val said = nbk_err("import sysl.net.Socket\n\n" +
+                       "@no_block\npoll(s: *Socket) -> usize\n    var b: [4]u8 = [0; 4]\n" +
+                       "    s.recv(b[..]).unwrap_or(0)\n",
+                       "print(1)\n")
+
+    nbk_check(said, "this reaches 'sysl.net.Socket.recv', which blocks")
 
 @test("a blocking read through the library's reader reaches its marked hook")
 nbk_the_library_read()

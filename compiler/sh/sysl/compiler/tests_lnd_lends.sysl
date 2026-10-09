@@ -1,0 +1,241 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `@lends(body)` -- a pointer handed to a body for one call, and the walk that holds the body to
+// letting it go (`lends.sysl`, `self_alias.sysl`'s lent rule). `reference/memory.md § A pointer lent
+// for one call` is the specification; every refusal here is one of its sentences.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private lnd_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-lnd").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end lnd_outcome
+
+private lnd_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = lnd_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end lnd_prints
+
+private lnd_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = lnd_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end lnd_refused
+
+// A cell lending its one field, and the sentence every escape below opens with.
+private lnd_cell() -> string = raw"""
+    struct Cell
+        v: int
+
+        @lends(body)
+        with[R](*self, body: *int -> R) -> R = body(&self.v)
+
+    var c = Cell(1)
+    """
+
+private lnd_lent() -> string =
+    "'Cell.with' lends this body a pointer that is valid only until the call returns, and this one "
+
+// -- what a body may do -----------------------------------------------------------------------------
+
+@test("a lent pointer is read and written through, and handed to a callee that only uses it")
+lnd_used_inside_and_let_go()
+    lnd_prints(raw"""
+        struct Account
+            balance: int
+            edits: int
+
+            @lends(body)
+            edit[R](*self, body: *int -> R) -> R
+                self.edits += 1
+                body(&self.balance)
+        end Account
+
+        add_ten(n: *int)
+            *n += 10
+
+        var acct = Account(100, 0)
+
+        acct.edit((b) -> *b -= 30)
+        acct.edit((b) -> add_ten(b))
+        acct.edit(add_ten)
+
+        print(acct.balance, acct.edits, acct.edit((b) -> *b * 2))
+        """, "90 3 180\n")
+
+@test("a local that holds it, a closure over it called in place, and its address as an integer")
+lnd_local_closure_and_integer_stay_inside()
+    lnd_prints(lnd_cell() + raw"""
+        val n = c.with((v) ->
+            val q = v
+            val read = () -> *q
+
+            *q += read()
+            usize(q) != 0)
+
+        print(n, c.v)
+        """, "true 2\n")
+
+// -- what it may not --------------------------------------------------------------------------------
+
+@test("returning it is refused")
+lnd_returned()
+    lnd_refused(lnd_cell() + "val p = c.with((v) -> v)\n", lnd_lent() + "is returned")
+
+@test("returning it through a local, or a struct built around it, is refused")
+lnd_returned_through_a_chain()
+    lnd_refused(lnd_cell() + raw"""
+        struct Holder
+            p: *int
+
+        val h = c.with((v) ->
+            val q = v
+
+            Holder(q))
+        """, lnd_lent() + "is returned")
+
+@test("storing it through a pointer the body was not lent is refused")
+lnd_stored_outside()
+    lnd_refused(lnd_cell() + raw"""
+        struct Holder
+            p: *int
+
+        var h = Holder(null)
+        val hp = &h
+
+        c.with((v) -> hp.p = v)
+        """, lnd_lent() + "is stored somewhere the call does not own")
+
+@test("putting it in a box is refused")
+lnd_boxed()
+    lnd_refused(lnd_cell() + raw"""
+        struct Holder
+            p: *int
+
+        c.with((v) ->
+            val h: &Holder = Holder(v)
+
+            h.p == v)
+        """, lnd_lent() + "is put on the heap")
+
+@test("passing it to a function that keeps it is refused, and the callee's body is what says so")
+lnd_passed_to_a_keeper()
+    lnd_refused(lnd_cell() + raw"""
+        struct Holder
+            p: *int
+
+        keep(h: *Holder, p: *int)
+            h.p = p
+
+        var h = Holder(null)
+        val hp = &h
+
+        c.with((v) -> keep(hp, v))
+        """, lnd_lent() + "is passed to 'keep', which holds on to it")
+
+@test("a keeper two calls down is found, and a buffer's push keeps what it is handed")
+lnd_kept_deeper()
+    lnd_refused(lnd_cell() + raw"""
+        struct Holder
+            p: *int
+
+        keep(h: *Holder, p: *int)
+            h.p = p
+
+        relay(h: *Holder, p: *int)
+            keep(h, p)
+
+        var h = Holder(null)
+        val hp = &h
+
+        c.with((v) -> relay(hp, v))
+        """, lnd_lent() + "is passed to 'relay', which holds on to it")
+    lnd_refused("import sysl.buf.{Buf, buf}\n\n" + lnd_cell() + raw"""
+        var held: Buf[*int] = buf()
+        val hb = &held
+
+        c.with((v) -> hb.push(v))
+        """, "which holds on to it")
+
+@test("an extern has no body to ask, so it keeps what it is handed")
+lnd_extern_keeps()
+    lnd_refused(lnd_cell() + raw"""
+        extern "free" c_free(p: *int)
+
+        c.with((v) -> c_free(v))
+        """, lnd_lent() + "is passed to 'c_free', which holds on to it")
+
+@test("a named function passed there is held to the rule in its own body")
+lnd_named_function_checked()
+    lnd_refused(lnd_cell() + raw"""
+        stash(p: *int) -> *int = p
+
+        val p = c.with(stash)
+        """, lnd_lent() + "is returned")
+
+@test("a closure behind a '&Fn' is refused at the argument, there being no one body to read")
+lnd_erased_closure_refused()
+    lnd_refused(lnd_cell() + raw"""
+        val f: &Fn(*int) -> int = (v) -> *v
+
+        print(c.with(f))
+        """, "'Cell.with' lends 'body' a pointer that is valid only during the call, so what is " +
+             "passed there is a closure or a function's name")
+
+// -- what `@lends` may name ------------------------------------------------------------------------
+
+@test("a name that is not a parameter, one named twice, and one that is not a call")
+lnd_names_refused()
+    lnd_refused("@lends(body)\ntwice(x: *int, f: *int -> int) -> int = f(x) + f(x)\n",
+                "'@lends' names 'body', which is not a parameter of 'twice' — its parameters are 'x', 'f'")
+    lnd_refused("@lends(f, f)\ntwice(x: *int, f: *int -> int) -> int = f(x) + f(x)\n",
+                "'@lends' names 'f' twice")
+    lnd_refused("@lends(x)\ntwice(x: *int, f: *int -> int) -> int = f(x) + f(x)\n",
+                "'@lends' names 'x', which is not a call")
+
+@test("a type parameter bounded by a call trait is a call, and so is a member's")
+lnd_names_accepted()
+    lnd_prints(raw"""
+        @lends(f)
+        apply[F: Fn1[*int, int]](x: *int, f: F) -> int = f(x)
+
+        var n = 4
+
+        print(apply(&n, (p) -> *p + 1))
+        """, "5\n")
+
+@test("'@lends' takes at least one name")
+lnd_empty_refused()
+    lnd_refused("@lends()\ntwice(x: *int, f: *int -> int) -> int = f(x)\n",
+                "'@lends' names the callable parameters a function hands a pointer")

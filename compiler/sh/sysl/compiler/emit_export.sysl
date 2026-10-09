@@ -85,7 +85,16 @@ gen_export_thunk(e: *Emit, f: TFunc, symbol: string) -> Option[IrFunc]
 
     val sig = ir_sig(f.exported.unwrap(), IrFnType(c_type.ret, declared, false, c_type.ret_attrs))
 
-    Some(finish_func(e, bound_sig(sig with { linkage = export_linkage(f) }, binds_locally(e))))
+    // **A private export is hidden** (`TFunc.export_hidden`). `private` is a promise about the sysl
+    // name and says nothing against a symbol: the definition behind the thunk stays file-private, and
+    // the thunk is what module `asm` or a package's own C calls by its exported name. Hidden says
+    // exactly that much -- every object of the image being linked resolves it, statically, and a
+    // shared object built from it does not offer it to a loader, so nothing outside the image can
+    // bind to it or interpose on it. Default visibility would publish what the author marked as
+    // nobody else's; internal would hide it from the very objects it was exported for. A symbol a
+    // loader looks up by name (`SDL_main`, a JNI entry) is the public export's job.
+    Some(finish_func(e, bound_sig(sig with { linkage = export_linkage(f), hidden = f.export_hidden },
+                                    binds_locally(e))))
 end gen_export_thunk
 
 // **The standard library's exports are `weak`.** The library exports only to answer a seam it

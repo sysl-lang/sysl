@@ -37,7 +37,7 @@ private cgf_cli(args: []string) -> (int, string)
     (code, text)
 end cgf_cli
 
-private cgf_both() -> CodegenFeatures = CodegenFeatures(true, true)
+private cgf_both() -> CodegenFeatures = CodegenFeatures(true, true, buf())
 
 private cgf_row(name: string) -> Target = target_named(name).unwrap()
 
@@ -71,13 +71,14 @@ cgf_manifest_layers()
             assert(codegen_given(m, "aarch64-macos", "strict_align"), "target's own")
 end cgf_manifest_layers
 
-@test("a setting the block does not know is refused, naming the two it does")
+@test("a setting the block does not know is refused, naming the three it does")
 cgf_unknown_setting_refused()
     read_manifest("codegen {\n  general_reg_only = true\n}\n") match
         Ok(_) -> assert(false, "a misspelled setting was accepted")
         Err(why) ->
             assert(why.contains("'codegen.general_reg_only' is not a code generation setting"), why)
-            assert(why.contains("'general_regs_only' and 'strict_align'"), why)
+            assert(why.contains("'general_regs_only', 'strict_align', 'extensions', 'thread_pointer' " +
+                "and 'per_cpu_offset'"), why)
 end cgf_unknown_setting_refused
 
 @test("a codegen setting is true or false")
@@ -112,7 +113,7 @@ end cgf_aarch64_flags_and_attribute
 cgf_x86_flags()
     val t = cgf_row("x86_64-linux")
 
-    use_codegen_features(CodegenFeatures(true, false))
+    use_codegen_features(CodegenFeatures(true, false, buf()))
 
     val flags = machine_flags(t)
     val attr = codegen_feature_attribute(t)
@@ -124,7 +125,7 @@ end cgf_x86_flags
 
 @test("Thumb and RISC-V take strict_align as a flag alone, their feature strings being the row's")
 cgf_flag_only_rows()
-    use_codegen_features(CodegenFeatures(false, true))
+    use_codegen_features(CodegenFeatures(false, true, buf()))
 
     val thumb = machine_flags(cgf_row("thumb-freestanding"))
     val riscv = machine_flags(cgf_row("riscv64-linux"))
@@ -144,7 +145,7 @@ end cgf_flag_only_rows
 
 @test("general_regs_only is refused where the unit is part of the row's convention, or absent")
 cgf_general_regs_refusals()
-    val gro = CodegenFeatures(true, false)
+    val gro = CodegenFeatures(true, false, buf())
 
     assert(codegen_feature_refusal(cgf_row("aarch64-freestanding"), gro).is_none(), "aarch64")
     assert(codegen_feature_refusal(cgf_row("aarch64-macos"), gro).is_none(), "hosted aarch64")
@@ -166,7 +167,7 @@ end cgf_general_regs_refusals
 
 @test("strict_align is refused on x86, which has no such mode, and on wasm")
 cgf_strict_align_refusals()
-    val sa = CodegenFeatures(false, true)
+    val sa = CodegenFeatures(false, true, buf())
 
     assert(codegen_feature_refusal(cgf_row("aarch64-freestanding"), sa).is_none(), "aarch64")
     assert(codegen_feature_refusal(cgf_row("thumbv6m-freestanding"), sa).is_none(), "thumb")
@@ -241,7 +242,7 @@ cgf_cache_keys_differ()
     val t = cgf_row("aarch64-freestanding")
     val plain = std_artifact_path(t, "f00d")
 
-    use_codegen_features(CodegenFeatures(true, false))
+    use_codegen_features(CodegenFeatures(true, false, buf()))
 
     val gro = std_artifact_path(t, "f00d")
 
@@ -263,7 +264,7 @@ cgf_strict_align_lays_out_the_text()
 
     val t = cgf_row("aarch64-freestanding")
 
-    use_codegen_features(CodegenFeatures(false, true))
+    use_codegen_features(CodegenFeatures(false, true, buf()))
 
     val text = laid_out("clang", t, "target triple = \"x\"\n")
 
@@ -285,8 +286,12 @@ private cgf_objdump() -> Option[string]
 end cgf_objdump
 
 // The instructions of `symbol`'s body in the archive `build-c` wrote for `extra`, one to a line.
-private cgf_disassembled(objdump: string, extra: string, symbol: string) -> Buf[string]
-    val root = cgf_project(extra, cgf_big_copy())
+private cgf_disassembled(objdump: string, extra: string, symbol: string) -> Buf[string] =
+    cgf_disassembled_of(objdump, extra, cgf_big_copy(), symbol)
+
+// The same, for a program of its own.
+private cgf_disassembled_of(objdump: string, extra: string, main: string, symbol: string) -> Buf[string]
+    val root = cgf_project(extra, main)
     val archive = s"$root/probe.a"
     var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root]
     val built = cgf_cli(args[..])
@@ -310,7 +315,7 @@ private cgf_disassembled(objdump: string, extra: string, symbol: string) -> Buf[
 
     remove_dir_all(root).unwrap_or(())
     out
-end cgf_disassembled
+end cgf_disassembled_of
 
 // How many instructions name a floating-point or SIMD register (`q`, `v`, `d`).
 private cgf_vector_uses(code: Buf[string]) -> usize
@@ -410,3 +415,170 @@ cgf_floats_only_refused_under_the_setting()
     assert_eq(got_a.0, 0)
     assert_eq(got_b.0, 0)
 end cgf_floats_only_refused_under_the_setting
+
+// -- extensions ------------------------------------------------------------------------------------
+
+private cgf_lse() -> string = "codegen {\n  extensions = [\"lse\"]\n}\n"
+
+private cgf_with(names: []const string) -> CodegenFeatures
+    var xs: Buf[string] = buf()
+
+    for name in names
+        xs.push(name)
+
+    CodegenFeatures(false, false, xs)
+end cgf_with
+
+private cgf_atomic_add() -> string =
+    "import sysl.sync.*\n\n@export(\"bump\")\nbump(p: *u64) -> u64 = atomic_add(p, 1, SeqCst)\n"
+
+@test("an extensions list is read, a target's own list replaces the project's, and an empty one clears it")
+cgf_extensions_layer()
+    val text = "codegen {\n  extensions = [\"lse\", \"rcpc\"]\n}\n\ntargets {\n  aarch64-macos {\n" +
+        "    codegen {\n      extensions = [\"crc\"]\n    }\n  }\n  aarch64-linux {\n" +
+        "    codegen {\n      extensions = []\n    }\n  }\n}\n"
+
+    read_manifest(text) match
+        Err(why) -> assert(false, why)
+        Ok(m) ->
+            val project = codegen_extensions(m, "aarch64-freestanding")
+            val own = codegen_extensions(m, "aarch64-macos")
+
+            assert_eq(project.len(), 2)
+            assert_eq(project.at(0), "lse")
+            assert_eq(project.at(1), "rcpc")
+            assert_eq(own.len(), 1)
+            assert_eq(own.at(0), "crc")
+            assert(codegen_extensions(m, "aarch64-linux").is_empty(), "an empty list takes them away")
+
+    read_manifest("package {\n  name = \"p\"\n}\n") match
+        Err(why) -> assert(false, why)
+        Ok(m) -> assert(codegen_extensions(m, "aarch64-freestanding").is_empty(), "unsaid is none")
+end cgf_extensions_layer
+
+@test("an extensions list holds bare names, one to an entry, and nothing else")
+cgf_extensions_refused_in_the_manifest()
+    read_manifest("codegen {\n  extensions = \"lse\"\n}\n") match
+        Ok(_) -> assert(false, "a string was taken as a list")
+        Err(why) -> assert(why.contains("'codegen.extensions' is a list of the processor's extensions, " +
+            "as LLVM names them — 'extensions = [\"lse\"]'"), why)
+
+    read_manifest("codegen {\n  extensions = [\"+lse\"]\n}\n") match
+        Ok(_) -> assert(false, "a signed name was accepted")
+        Err(why) -> assert(why.contains("'codegen.extensions' names '+lse' — write the extension alone, " +
+            "'lse': every name in the list is one the code may use"), why)
+
+    read_manifest("targets {\n  x {\n    codegen {\n      extensions = [\"lse,rcpc\"]\n    }\n  }\n}\n") match
+        Ok(_) -> assert(false, "two names in one entry were accepted")
+        Err(why) -> assert(why.contains("'targets.x.codegen.extensions' names 'lse,rcpc' — one extension " +
+            "to an entry"), why)
+
+    read_manifest("codegen {\n  extensions = [true]\n}\n") match
+        Ok(_) -> assert(false, "a flag was taken as a name")
+        Err(why) -> assert(why.contains("is a list of the processor's extensions"), why)
+end cgf_extensions_refused_in_the_manifest
+
+@test("an extension reaches clang as -target-feature on every machine, and the attribute where there is one")
+cgf_extensions_flags_and_attribute()
+    var lse: [1]string = ["lse"]
+
+    use_codegen_features(cgf_with(lse[..]))
+
+    val arm = machine_flags(cgf_row("aarch64-freestanding"))
+    val arm_attr = codegen_feature_attribute(cgf_row("aarch64-freestanding"))
+    val thumb = machine_flags(cgf_row("thumb-freestanding"))
+    val thumb_attr = codegen_feature_attribute(cgf_row("thumb-freestanding"))
+    val key = codegen_features_key()
+
+    var both: [2]string = ["lse", "rcpc"]
+
+    use_codegen_features(CodegenFeatures(true, true, cgf_with(both[..]).extensions))
+
+    val all_on = codegen_feature_attribute(cgf_row("aarch64-freestanding"))
+    val all_key = codegen_features_key()
+
+    var pop: [1]string = ["popcnt"]
+
+    use_codegen_features(cgf_with(pop[..]))
+
+    val x86_attr = codegen_feature_attribute(cgf_row("x86_64-linux"))
+
+    use_codegen_features(no_codegen_features())
+
+    assert_eq(arm.len(), 4)
+    assert_eq(arm.at(0), "-Xclang")
+    assert_eq(arm.at(1), "-target-feature")
+    assert_eq(arm.at(2), "-Xclang")
+    assert_eq(arm.at(3), "+lse")
+    assert_eq(arm_attr, Some("\"target-features\"=\"+lse\""))
+    assert(cgf_has(thumb, "+lse"), "Thumb takes the flag")
+    assert(thumb_attr.is_none(), "and no attribute, which would replace the row's own features")
+    assert_eq(key, "-ext+lse")
+    assert_eq(all_on, Some("\"target-features\"=\"+lse,+rcpc,+strict-align,-fp-armv8,-neon\""))
+    assert_eq(all_key, "-gro-sa-ext+lse+rcpc")
+    assert_eq(x86_attr, Some("\"target-features\"=\"+popcnt\""))
+end cgf_extensions_flags_and_attribute
+
+@test("an extension the back end does not know is refused before anything is built, naming it")
+cgf_unknown_extension_refused()
+    if !cgf_ready() then return
+
+    val root = cgf_project("codegen {\n  extensions = [\"lse\", \"lsee\"]\n}\n", cgf_atomic_add())
+    var args: [5]string = ["sysl", "emit-llvm", "--target", "aarch64-freestanding", root]
+    val got = cgf_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 1)
+    assert(got.1.contains("'codegen.extensions' names 'lsee', which the aarch64 back end does not " +
+        "know — an extension is spelled as LLVM spells the feature"), got.1)
+    assert(!got.1.contains("'lse',"), got.1)
+end cgf_unknown_extension_refused
+
+@test("emit-llvm shows a known extension in the target-features attribute")
+cgf_known_extension_reaches_the_text()
+    if !cgf_ready() then return
+
+    val root = cgf_project(cgf_lse(), cgf_atomic_add())
+    var args: [5]string = ["sysl", "emit-llvm", "--target", "aarch64-freestanding", root]
+    val got = cgf_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0)
+    assert(got.1.contains("\"target-features\"=\"+lse\""), got.1)
+end cgf_known_extension_reaches_the_text
+
+@test("extensions are refused on a machine whose code LLVM does not generate")
+cgf_extensions_refused_on_craft()
+    var lse: [1]string = ["lse"]
+    val why = codegen_feature_refusal(cgf_row("craft-freestanding"), cgf_with(lse[..]))
+
+    assert_eq(why, Some("'extensions' does not apply to 'craft-freestanding': its code is not generated " +
+        "by LLVM, whose names for a processor's extensions are what the list holds"))
+    assert(codegen_feature_refusal(cgf_row("riscv32-freestanding"), cgf_with(lse[..])).is_none(),
+           "a clang-built row is asked of its back end instead")
+end cgf_extensions_refused_on_craft
+
+@test("an atomic add is a load/store-exclusive loop by default and one ldaddal under extensions = [lse]")
+cgf_lse_makes_one_instruction()
+    if !cgf_ready() then return
+
+    val objdump = cgf_objdump() match
+        Some(p) -> p
+        None -> return
+
+    val plain = cgf_disassembled_of(objdump, "", cgf_atomic_add(), "bump$$sysl")
+    val lse = cgf_disassembled_of(objdump, cgf_lse(), cgf_atomic_add(), "bump$$sysl")
+    var plain_text = ""
+    var lse_text = ""
+
+    for line in plain
+        plain_text = plain_text + line + "\n"
+
+    for line in lse
+        lse_text = lse_text + line + "\n"
+
+    assert(plain_text.contains("ldaxr") && plain_text.contains("stlxr"), plain_text)
+    assert(!plain_text.contains("ldadd"), plain_text)
+    assert(lse_text.contains("ldaddal"), lse_text)
+    assert(!lse_text.contains("ldaxr") && !lse_text.contains("stlxr"), lse_text)
+end cgf_lse_makes_one_instruction

@@ -701,7 +701,7 @@ cannot hold.
 **`reverse_bits` is not a byte order.** The width is the receiver's, so it is a different function at
 every type.
 
-### There is deliberately no `swap_bytes`
+### There is no `swap_bytes` in `Bits`
 
 ```sysl
 import sysl.math.Bits
@@ -715,13 +715,68 @@ print(w.swap_bytes())
 type 'uint' has no method 'swap_bytes'
 ```
 
-Reversing the byte order needs a whole number of bytes and at least two, so a `u24` has no answer to
-it and a `u4` has none either. **Every member of `Bits` is total over every integer type**, because a
-`[T: Bits]` body is written once and instantiated later — a member that worked at `u32` and not at
-`u24` would turn a bound that was supposed to have *proven* an operation into a failure at somebody
-else's instantiation.
+Reversing the byte order needs a whole number of bytes, so a `u4` or a `u12` has no answer to it.
+**Every member of `Bits` is total over every integer type**, because a `[T: Bits]` body is written
+once and instantiated later — a member that worked at `u32` and not at `u12` would turn a bound that
+was supposed to have *proven* an operation into a failure at somebody else's instantiation. So the
+byte questions are a trait of their own, whose membership is the widths that have an answer.
 
-A program that means to reorder bytes has the shifts, and knows its own width while writing them.
+## `ByteOrder` — a value's bytes, and the two orders a format keeps them in
+
+```sysl
+import sysl.math.ByteOrder
+
+val n: u32 = 0x11223344
+val w: u24 = 0x010203
+
+print(n.swap_bytes() == 0x44332211, w.swap_bytes() == 0x030201, u8(7).swap_bytes())
+print(n.to_be() == n.swap_bytes(), n.to_le() == n, n.to_be().from_be() == n)
+```
+
+```output
+true true 7
+true true true
+```
+
+```sysl
+trait ByteOrder
+    swap_bytes(self) -> Self
+    to_be(self) -> Self
+    from_be(self) -> Self
+    to_le(self) -> Self
+    from_le(self) -> Self
+```
+
+**The membership is every integer whose width is a whole number of bytes** — `u8` through `u64`,
+the signed widths, `usize`, and `u24` and `u40` too, since three bytes have an order as surely as four
+do. One byte is its own reversal, so `u8` is a member and every member is total. As with `Bits`, the
+compiler provides it and the trait has to be imported to be reached.
+
+**`to_be` and `from_be` are the same reversal, and naming both is the point.** `x.to_be()` says "this
+value, about to be written most significant byte first"; `x.from_be()` says "these bytes, read off a
+big-endian wire". On a little-endian machine each is `swap_bytes`, on a big-endian one each is the value
+unchanged, and a program that names the direction reads the same on both. Every machine sysl targets
+is little-endian, so the `_le` pair is no instruction anywhere yet — it is written so the program
+still says what it means on the first machine that is not.
+
+**They fold**, so a constant written with one is a constant, and storage initialized with one is laid
+down as data — which a board with no loader needs:
+
+```sysl
+import sysl.math.ByteOrder
+
+const PORT: u16 = 0x0035u16.to_be()
+
+print(PORT)
+```
+
+```output
+13568
+```
+
+A struct whose integer fields are all in one order says so once, with
+[`@byte_order(big)`](/reference/attributes/), and is then read and written as plain integers; these
+members are for a value that is not in such a struct.
 
 ## `Magnitude` — how big, when that is not which is greater
 

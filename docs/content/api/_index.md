@@ -18,6 +18,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.container`](sysl-container/) | Five containers, each with a shape a slice and a `Buf` cannot give you. |
 | [`sysl.container.ring`](sysl-container-ring/) | A queue of a **fixed** capacity, laid over storage the caller supplies, cheap to take from at either end and needing no allocator at all. |
 | [`sysl.crypto`](sysl-crypto/) | Cryptographic hashing: the SHA-2 family, SHA-1 and MD5, HMAC over any of them, and PBKDF2. |
+| [`sysl.dma`](sysl-dma/) | Memory a device can reach by address, and the handover that makes it safe to share with one. |
 | [`sysl.encoding`](sysl-encoding/) | Bytes as text and text as bytes: hexadecimal, base64, UUIDs, and fixed-width integers at either byte order. |
 | [`sysl.env`](sysl-env/) | Reading the environment a program was started with. |
 | [`sysl.fmt`](sysl-fmt/) | What an `f"…"` hole's computed width or precision comes to — `${x}%.${n}f`, `${s}%${w}s`. |
@@ -30,8 +31,8 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.math.complex`](sysl-math-complex/) | Complex numbers, at whichever floating-point width the program is already using. |
 | [`sysl.math.decimal`](sysl-math-decimal/) | Exact decimal arithmetic: an integer coefficient and a scale, so `0.1 + 0.2` is `0.3`. |
 | [`sysl.math.rational`](sysl-math-rational/) | Exact fractions: a numerator and a denominator, both `BigInt`s, so a third is a third. |
+| [`sysl.net`](sysl-net/) | Blocking sockets -- a TCP stream, a UDP socket -- and the names a host resolves to. |
 | [`sysl.path`](sysl-path/) | Path handling that is decided by the string alone. |
-| [`sysl.posix.net`](sysl-posix-net/) | Blocking TCP, and the names a host and a service resolve to. |
 | [`sysl.posix.rand`](sysl-posix-rand/) | A seed taken from the host, for a program that wants a different sequence on every run. |
 | [`sysl.posix.threads`](sysl-posix-threads/) | Threads of execution, and the two things a program does with one: start it, and wait for it. |
 | [`sysl.posix.time`](sysl-posix-time/) | Reading the two clocks the host keeps, which is the one thing `sysl.time` deliberately cannot do. |
