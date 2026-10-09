@@ -3,13 +3,15 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.math.bigint.from_int
 import sysl.process.capture
 import sysl.text.{split, Search}
 
-// `dso_local` on a bare machine (`dso_local.sysl`): every declaration and every definition that is
-// not already local is marked, as clang marks them for the same triple, so `&` of an `extern` is the
-// address the code is running at and not the one the image was linked at. A hosted machine is left
-// exactly as it was.
+// `dso_local` on a bare machine (`IrFuncSig.dso_local`, `IrGlobal.dso_local`, set where each symbol is
+// made from `Target.symbols_bind_locally`): every declaration and every definition that is not already
+// local is marked, as clang marks them for the same triple, so `&` of an `extern` is the address the
+// code is running at and not the one the image was linked at. A hosted machine is left exactly as it
+// was.
 
 // -- which machines ------------------------------------------------------------------------------------
 
@@ -35,53 +37,61 @@ end dsl_which_targets
 
 // -- the lines -----------------------------------------------------------------------------------------
 
-@test("an extern variable, an extern function and a definition are marked; local symbols are not")
+// A function of one `i64` returning `ret`.
+private dsl_ty(ret: LType) -> IrFnType
+    var ps: Buf[IrParam] = buf()
+
+    ps.push(ir_param(LInt(64)))
+    ir_fn_type(ret, ps)
+end dsl_ty
+
+@test("the printer writes the flag after the linkage of a declaration, a definition and a global")
 dsl_the_lines()
-    assert_eq(dso_local_line("@ext = external global i64"), "@ext = external dso_local global i64")
-    assert_eq(dso_local_line("declare void @poke(i64)"), "declare dso_local void @poke(i64)")
-    assert_eq(dso_local_line("define i64 @f(i64 %x) #99 {"), "define dso_local i64 @f(i64 %x) #99 {")
-    assert_eq(dso_local_line("@g = global i32 0"), "@g = dso_local global i32 0")
-    assert_eq(dso_local_line("@k = constant i32 7, align 4"), "@k = dso_local constant i32 7, align 4")
-    assert_eq(dso_local_line("define weak void @sysl_bounds_fail(i32 %kind) {"),
-              "define weak dso_local void @sysl_bounds_fail(i32 %kind) {")
-    assert_eq(dso_local_line("define weak_odr ptr @h() {"), "define weak_odr dso_local ptr @h() {")
-    assert_eq(dso_local_line("declare extern_weak void @maybe()"), "declare extern_weak dso_local void @maybe()")
-    assert_eq(dso_local_line("@c = external hidden global i64"), "@c = external dso_local hidden global i64")
-    assert_eq(dso_local_line("declare hidden void @m$f()"), "declare dso_local hidden void @m$f()")
+    val poke = bound_sig(ir_sig("poke", dsl_ty(LVoid)), true)
+    val f = bound_sig(ir_sig("f", dsl_ty(LInt(64))), true)
+    val odr = bound_sig(ir_sig("h", dsl_ty(LPtr)) with { linkage = LinkWeakOdr }, true)
+
+    assert_eq(sig_declare(poke), "declare dso_local void @poke(i64)")
+    assert_eq(sig_define(f), "define dso_local i64 @f(i64)")
+    assert_eq(sig_define(odr), "define weak_odr dso_local ptr @h(i64)")
+    assert_eq(global_render(ir_extern_global("ext", LInt(64), true)), "@ext = external dso_local global i64")
+
+    // Unmarked, every line is what it always was.
+    assert_eq(sig_declare(bound_sig(ir_sig("poke", dsl_ty(LVoid)), false)), "declare void @poke(i64)")
+    assert_eq(sig_define(ir_sig("f", dsl_ty(LInt(64)))), "define i64 @f(i64)")
+    assert_eq(global_render(ir_extern_global("ext", LInt(64), false)), "@ext = external global i64")
 end dsl_the_lines
 
-@test("a private, internal or already-marked symbol, an intrinsic and an llvm list are left alone")
+@test("a private or internal symbol, an intrinsic and an llvm list are never written dso_local")
 dsl_lines_left_alone()
-    val same: [11]string = [
-        "define private void @arc.retain(ptr %p) {",
-        "define internal void @sysl.module_init() {",
-        "@s = private unnamed_addr constant [2 x i8] c\"a\\00\"",
-        "@arc.reaper.self = internal global %arc.reaper zeroinitializer",
-        "declare void @llvm.trap()",
-        "declare i1 @llvm.coro.end(ptr, i1, token)",
-        "@llvm.used = appending global [1 x ptr] [ptr @f], section \"llvm.metadata\"",
-        "@x = external dso_local global i64",
-        "declare dso_local void @y()",
-        "  %r = call i64 @f(i64 1)",
-        "target triple = \"aarch64-none-elf\""]
+    val private_fn = ir_sig("arc.retain", dsl_ty(LVoid)) with { linkage = LinkPrivate, dso_local = true }
+    val internal_fn = ir_sig("sysl.module_init", dsl_ty(LVoid)) with { linkage = LinkInternal, dso_local = true }
+    val stored = IrGlobal("s", true, LInt(32), Some(VInt(from_int(7))), LinkPrivate, None, None, false, true)
+    val listed = IrGlobal("llvm.used", true, LArr(1, LPtr), Some(VZero), LinkAppending, None, None, false, true)
 
-    for i in 0..<same.len
-        assert_eq(dso_local_line(same[i]), same[i])
+    assert_eq(sig_define(private_fn), "define private void @arc.retain(i64)")
+    assert_eq(sig_define(internal_fn), "define internal void @sysl.module_init(i64)")
+    assert_eq(global_render(stored), "@s = private constant i32 7")
+    assert_eq(global_render(listed), "@llvm.used = appending constant [1 x ptr] zeroinitializer")
+
+    // An intrinsic is no symbol, so asking for the mark does not give it one.
+    assert(!bound_sig(ir_sig("llvm.trap", dsl_ty(LVoid)), true).dso_local)
+    assert_eq(sig_declare(bound_sig(ir_sig("llvm.trap", dsl_ty(LVoid)), true)), "declare void @llvm.trap(i64)")
 end dsl_lines_left_alone
 
-@test("a whole text is marked line by line on a bare machine and untouched on a hosted one")
+@test("the hand-written runtime blocks say what the model says, per machine")
 dsl_whole_text()
-    val text = "target triple = \"x\"\n\n@ext = external global i64\n\ndeclare void @poke(i64)\n\n" +
-        "define i64 @f() {\nentry:\n  call void @poke(i64 1)\n  ret i64 0\n}\n"
-    val bare = bound_locally(text, target_named("aarch64-freestanding").unwrap())
+    val bare = target_named("thumbv7em-freestanding").unwrap()
 
-    assert_eq(bare, "target triple = \"x\"\n\n@ext = external dso_local global i64\n\n" +
-        "declare dso_local void @poke(i64)\n\ndefine dso_local i64 @f() {\nentry:\n  call void @poke(i64 1)\n" +
-        "  ret i64 0\n}\n")
-    assert_eq(bound_locally(text, host_target()), text)
-    assert_eq(bound_locally(text, target_named("aarch64-linux").unwrap()), text)
-    assert_eq(bound_locally(text, target_named("wasm32-freestanding").unwrap()), text)
-    assert_eq(bound_locally(text, target_named("craft-freestanding").unwrap()), text)
+    assert_eq(bare.preemption(), "dso_local ")
+    assert_eq(host_target().preemption(), "")
+    assert_eq(target_named("aarch64-linux").unwrap().preemption(), "")
+    assert_eq(target_named("wasm32-freestanding").unwrap().preemption(), "")
+    assert_eq(target_named("craft-freestanding").unwrap().preemption(), "")
+    assert(bounds_runtime(bare).starts_with("define weak dso_local void @sysl_bounds_fail("))
+    assert(arc_core(bare).contains(s"define weak dso_local ptr @${reaper_slot_symbol()}()"))
+    assert(!bounds_runtime(host_target()).contains("dso_local"))
+    assert(!arc_core(host_target()).contains("dso_local"))
 end dsl_whole_text
 
 // -- what `emit-llvm` prints ---------------------------------------------------------------------------

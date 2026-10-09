@@ -71,16 +71,20 @@ struct IrGlobal
     // the executable itself, `initial-exec` or the general dynamic form where a shared library may
     // be involved. The keyword sits after the linkage and before `global`/`constant`.
     thread_local: bool
+
+    // `dso_local`, as on a function (`IrFuncSig.dso_local`): bound inside the image, so `&` of it is
+    // where it is running rather than a GOT entry's link address.
+    dso_local: bool
 end IrGlobal
 
 // Storage this module lays down, private to it and initialized.
 ir_global(name: string, constant: bool, ty: LType, value: Val) -> IrGlobal =
-    IrGlobal(name, constant, ty, Some(value), LinkPrivate, None, None, false)
+    IrGlobal(name, constant, ty, Some(value), LinkPrivate, None, None, false, false)
 
 // Storage the linker supplies: the declaration line and nothing else, since this module lays none
-// of it down.
-ir_extern_global(name: string, ty: LType) -> IrGlobal =
-    IrGlobal(name, false, ty, None, LinkExternal, None, None, false)
+// of it down. `local` is `Target.symbols_bind_locally` -- on a bare machine it is in the same image.
+ir_extern_global(name: string, ty: LType, local: bool) -> IrGlobal =
+    IrGlobal(name, false, ty, None, LinkExternal, None, None, false, local)
 
 global_render(g: IrGlobal) -> string
     var b = str_builder()
@@ -89,6 +93,7 @@ global_render(g: IrGlobal) -> string
     b.push(llvm_safe(g.name))
     b.push(" = ")
     b.push(linkage_prefix(g.linkage))
+    if g.dso_local && preemptible(g.linkage) then b.push("dso_local ")
     if g.thread_local then b.push("thread_local ")
     b.push(if g.constant then "constant " else "global ")
     b.push(l_render(g.ty))

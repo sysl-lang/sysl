@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.text.{str_builder, StrBuilder}
+import sysl.text.{str_builder, StrBuilder, Search}
 
 // **A signature, as data.** What a parameter is, what a function type is, and what a definition or
 // a declaration line says -- with the attributes that ride on either.
@@ -186,14 +186,37 @@ struct IrFuncSig
     // is a keyword and a string attribute a quoted pair, and neither is accepted where the other
     // belongs.
     bare: Buf[string]
+
+    // `dso_local` -- the symbol is bound inside the image being linked, so LLVM reaches it directly
+    // rather than through the GOT. Set where the symbol is made, from `Target.symbols_bind_locally`;
+    // written only where the linkage leaves the symbol visible to the linker (`preemptible`), a
+    // private or internal symbol being local already.
+    dso_local: bool
 end IrFuncSig
 
 // A signature with nothing said about it beyond its name and type.
 ir_sig(name: string, ty: IrFnType) -> IrFuncSig
     var attrs: Buf[(string, string)] = buf()
 
-    IrFuncSig(name, ty, LinkDefault, None, attrs, None, buf())
+    IrFuncSig(name, ty, LinkDefault, None, attrs, None, buf(), false)
 end ir_sig
+
+// `s`, bound inside the image where `local` says the machine binds every symbol there. An `llvm.`
+// intrinsic is no symbol at all and is never marked.
+bound_sig(s: IrFuncSig, local: bool) -> IrFuncSig =
+    s with { dso_local = local && !s.name.starts_with("llvm.") }
+
+// Whether a symbol of this linkage is one the linker resolves, and so one `dso_local` says something
+// about: not a private or internal one, local already, nor the `llvm.` lists' `appending`.
+preemptible(l: IrLinkage) -> bool = l match
+    LinkPrivate -> false
+    LinkInternal -> false
+    LinkAppending -> false
+    _ -> true
+
+// The word `dso_local` puts after the linkage, with its space, or nothing.
+private preemption_word(local: bool, l: IrLinkage) -> string =
+    if local && preemptible(l) then "dso_local " else ""
 
 // The `define` line, without the brace that opens the body.
 sig_define(s: IrFuncSig) -> string
@@ -201,6 +224,7 @@ sig_define(s: IrFuncSig) -> string
 
     b.push("define ")
     b.push(linkage_prefix(s.linkage))
+    b.push(preemption_word(s.dso_local, s.linkage))
 
     s.cconv match
         Some(c) ->
@@ -233,7 +257,7 @@ end sig_define
 
 // The `declare` line, which says the type and nothing about the body there is not.
 sig_declare(s: IrFuncSig) -> string =
-    s"declare ${fn_result(s.ty)} @${llvm_safe(s.name)}(${fn_param_list(s.ty)})"
+    s"declare ${preemption_word(s.dso_local, LinkExternal)}${fn_result(s.ty)} @${llvm_safe(s.name)}(${fn_param_list(s.ty)})"
 
 // The symbol a call reaches this function by.
 sig_symbol(s: IrFuncSig) -> Val = VGlobal(s.name)
