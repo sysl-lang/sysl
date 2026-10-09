@@ -264,6 +264,7 @@ given back to the file first.
 
 ```sysl
 import sysl.fs.{open, remove_file, write_text}
+import sysl.io.Reader
 import sysl.process.{Stdio, capture}
 import sysl.text.Search
 
@@ -276,7 +277,7 @@ print(capture("sort", stdin = Stdio.FromPath(names)).unwrap().text.trim())
 
 // The first line read here, the rest by `wc`.
 var f = open(names).unwrap()
-var first: [5]u8 = [0, 0, 0, 0, 0]
+var first: [5]u8 = [0; 5]
 
 f.read(first[..])
 print(capture("wc", ["-l"], stdin = Stdio.FromFile(f)).unwrap().text.trim())

@@ -60,7 +60,8 @@ private val ppe_program: string = raw"""
     """
 
 // The image's start, its heap, the memory functions LLVM calls with no C library, `putchar`, `exit`,
-// and the `sysl.fs.sys` hooks a pipeline's files reach.
+// and the `sysl.fs.sys` hooks a pipeline's files reach -- `unlink` among them, `Child`'s destructor
+// (which removes a capture file) being kept wherever the module is reached.
 private val ppe_runtime: string = raw"""
     @export("kstart")
     kstart() -> never
@@ -119,6 +120,9 @@ private val ppe_runtime: string = raw"""
 
     @export("sysl_fs_seek")
     k_seek(fd: int, offset: long, whence: int, at: *long) -> int = -29
+
+    @export("sysl_fs_unlink")
+    k_unlink(path: *u8, len: usize) -> int = -38
     """
 
 // The process hooks a pipeline reaches, answered as a kernel's calls would be: no temporary path.
@@ -220,11 +224,12 @@ ppe_unanswered_pipe_hook_is_refused()
     val (said, out) = ppe_build(p)
 
     assert(said.0 != 0, "built with every process hook unanswered")
-    assert(said.1.contains(s"error: this program starts or waits for a process, and '$ppe_target' " +
-        "has no operating system under it for the standard library to answer one with, so the program " +
-        "answers it: define 'sysl_proc_kill', 'sysl_proc_pipe', 'sysl_proc_spawn', 'sysl_proc_wait' " +
-        "with '@export', each taking what its 'extern' in 'sysl.process.sys' declares and answering " +
-        "a process id, a length or zero, or the code of an 'IoError' negated"), said.1)
+    assert(said.1.contains(s"error: this program reaches 'sysl.process', and '$ppe_target' " +
+        "has no operating system under it for the standard library to answer a process or a user with, " +
+        "so the program answers it: define 'sysl_proc_kill', 'sysl_proc_pipe', 'sysl_proc_spawn', " +
+        "'sysl_proc_wait' with '@export', each taking what its 'extern' in 'sysl.process.sys' declares " +
+        "and answering a process id, a user or group id, a length or zero, or the code of an 'IoError' " +
+        "negated"), said.1)
     assert(!said.1.contains("undefined symbol"), said.1)
 
     lbr_drop([p, out])
