@@ -762,7 +762,9 @@ the one that is actually open is the behaviour wanted.
 **A trap runs nothing.** A trap aborts without stack cleanup, and `defer` does not qualify that: a
 broken invariant means the program's model of itself is already wrong, and running cleanup against
 that state is how a corrupt program writes its corruption to disk on the way down. `defer` releases a
-resource; it does not restore an invariant.
+resource; it does not restore an invariant. A call that leaves its frame for good while the program
+goes on — a thread ending — is the opposite case, and a function declared
+[`@abandons`](/reference/declarations/) runs its caller's deferred statements before the call.
 
 ### Why the block and not the function
 
