@@ -825,3 +825,71 @@ vns_stdlib_a_missing_variant()
     for said in [called, named]
         assert(!vns_says(said, "$"), said)
         assert(!vns_says(said, ".24"), said)
+
+// A module whose enums are imported by their variants alone, never by the enum's own name.
+private vns_pal_kinds() -> string = raw"""
+    module pal
+    enum Mode
+        Fast
+        Cut(n: int)
+    enum Maybe[T]
+        Nothing
+        Just(v: T)
+    pick(m: Mode) -> int = m match
+        Fast -> 1
+        Cut(n) -> n
+    """
+
+// **A variant imported by name is in scope as that enum's**, with nothing expected: the selector
+// binds the name, exactly as it binds a function's.
+@test("a variant imported by name reads bare with no expected type, as a value and as a constructor")
+vns_an_imported_variant_reads_bare()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran_in([("pal/pal.sysl", vns_pal_kinds()),
+                          ("main.sysl", "import pal.{Fast, Cut}\n\nval f = Fast\nval c = Cut(7)\n" +
+                                        "print(pal.pick(f), pal.pick(c))\n")]),
+              "1 7\n")
+
+@test("a variant imported by name reads bare where a type is expected, and in a pattern")
+vns_an_imported_variant_reads_bare_when_expected()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran_in([("pal/pal.sysl", vns_pal_kinds()),
+                          ("main.sysl", "import pal.{Fast, Cut}\n\nval f: pal.Mode = Fast\n" +
+                                        "val c: pal.Mode = Cut(5)\n\n" +
+                                        "size(m: pal.Mode) -> int = m match\n    Fast -> 0\n" +
+                                        "    Cut(n) -> n * 2\n\n" +
+                                        "print(size(f), size(c), pal.pick(Cut(9)))\n")]),
+              "0 10 9\n")
+
+@test("a generic enum's variant imported by name reads bare, carrying and payload-free")
+vns_an_imported_generic_variant_reads_bare()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran_in([("pal/pal.sysl", vns_pal_kinds()),
+                          ("main.sysl", "import pal.{Just, Nothing}\n\nval j = Just(3)\n" +
+                                        "val n: pal.Maybe[int] = Nothing\n\n" +
+                                        "get(m: pal.Maybe[int]) -> int = m match\n    Just(v) -> v\n" +
+                                        "    Nothing -> -1\n\n" +
+                                        "print(get(j), get(n))\n")]),
+              "3 -1\n")
+
+// Importing one variant does not import its enum's other variants.
+@test("a variant imported by name brings none of its siblings")
+vns_an_imported_variant_brings_no_siblings()
+    if !vns_ready() then return
+
+    vns_refused(vns_err_in([("pal/pal.sysl", vns_pal_kinds()),
+                            ("main.sysl", "import pal.{Fast}\n\nval c = Cut(2)\nprint(pal.pick(c))\n")]),
+                "undefined function 'Cut'",
+                "main.sysl:3:9")
+
+// The library's own case: `IoError`'s variants imported by name, the enum itself never named.
+@test("the library's IoError variants imported by name read bare")
+vns_library_variants_imported_by_name()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran("import sysl.fs.{InvalidUtf8, NotFound}\n\nval e = InvalidUtf8(3)\n" +
+                      "val n = NotFound\nprint(e)\nprint(n)\n"),
+              "not UTF-8 at byte 3\nno such file or directory\n")
