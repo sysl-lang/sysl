@@ -214,11 +214,17 @@ end RecvMode
 // three, so `any` does not count it. An async function's written result has already been made
 // `Task[T]` by the parser (`async_result`), so every caller reads the task; only its own body reads
 // the `T` (`body_result`).
+//
+// `domain` is `@domain(...)`: the concurrency domain the function is entered in, where that is not
+// the program's own -- `interrupt` for a handler a vector table written in assembly calls. It changes
+// nothing about how the function is called; it makes the function a root of that domain for every
+// check that asks what crosses one (`sharing.sysl`'s `domain_roots`).
 struct FuncMarks
     noinline: bool
     cold: bool
     inline: bool
     async_at: Option[Span]
+    domain: Option[string]
 
     // Whether any of the three was written.
     any(self) -> bool = self.noinline || self.cold || self.inline
@@ -227,7 +233,7 @@ struct FuncMarks
 end FuncMarks
 
 // A definition nothing was said about.
-no_marks() -> FuncMarks = FuncMarks(false, false, false, None)
+no_marks() -> FuncMarks = FuncMarks(false, false, false, None, None)
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -365,6 +371,7 @@ enum Attr
     Export(attr: ExportAttr)
     Section(name: string)
     Crossing(names: Buf[string])
+    Domain(name: string)
     Borrows(names: Buf[string])
     Needs(caps: Buf[string])
     NoInline
@@ -387,6 +394,7 @@ attr_word(a: Attr) -> string = a match
     Export(_) -> "export"
     Section(_) -> "section"
     Crossing(_) -> "crossing"
+    Domain(_) -> "domain"
     Borrows(_) -> "borrows"
     Needs(_) -> "needs"
     NoInline -> "noinline"

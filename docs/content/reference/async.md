@@ -1057,6 +1057,37 @@ print(block_on(waits()))
 a closure shared between two domains may be called from either, so every count it captures has to be atomic — but the 'w' it captures is the waker 'park' handed its registrar, a '&Fn() -> unit' belonging to the domain whose executor steps the task, and no spelling makes it atomic. Keep the waker in that domain: let the other domain — an interrupt, another thread — signal the executor, and have the executor call the waker
 ```
 
+**The interrupt that completes the request is the other domain a kernel meets**, and the shape it
+writes first is a waker parked in module storage and called from the handler. Marked
+[`@domain(interrupt)`](/reference/attributes/#domain-interrupt-a-function-entered-on-top-of-whatever-was-running),
+the handler is held to what it reaches, and the waker is what it reaches:
+
+```sysl build=c target=aarch64-freestanding
+var on_complete: Option[&Fn() -> unit] = None
+
+arm(wake: &Fn() -> unit)
+    on_complete = Some(wake)
+
+@domain(interrupt)
+@export("disk_irq")
+disk_irq()
+    on_complete match
+        Some(wake) -> wake()
+        None -> ()
+
+async read_sector(n: u64) -> u64
+    await park(arm)
+    n * 2
+```
+
+```error
+'disk_irq' is entered in the 'interrupt' domain, on top of whatever was running, so every count it reaches has to be atomic — but the module storage 'on_complete' it reaches holds a '&Fn() -> unit' in its 'Some(value)', whose count is not. If it holds a waker 'park' handed its registrar, no spelling makes that atomic: keep the waker in the executor's domain — have this one signal the executor, and the executor call the waker. A callback of the program's own is held as a '&sync Fn() -> unit' ('06')
+```
+
+What the handler may do is what an `Atomic` word or a `&sync` object allows: set a flag the executor
+reads, or push the request's number onto a ring the executor drains — and the executor, back in its
+own domain, calls the waker.
+
 `yield_now` makes no waker, so a task that only yields crosses — `checksum` above is one.
 
 ## Where the executors live

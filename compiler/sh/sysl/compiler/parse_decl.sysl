@@ -515,8 +515,9 @@ async_result(written: Option[TypeRef], at: Span) -> Option[TypeRef]
 end async_result
 
 // **What C calls directly cannot be async**: calling an async function only makes its task, and C
-// has nothing to drive one with. An `@export`, an interrupt handler and any other foreign calling
-// convention (only `interrupt` exists) are all called that way. Each is refused at the `async` word.
+// has nothing to drive one with. An `@export`, an interrupt handler, any other foreign calling
+// convention (only `interrupt` exists) and a function `@domain(...)` says another domain enters are
+// all called that way. Each is refused at the `async` word.
 private refuse_foreign_async(p: *Parser, at: Span, d: FuncDecl)
     if d.exported.is_some()
         p.fault(at, "an '@export'ed function cannot be 'async': C calls it directly, and calling an " +
@@ -528,6 +529,15 @@ private refuse_foreign_async(p: *Parser, at: Span, d: FuncDecl)
     if d.conv.is_some()
         p.fault(at, "an interrupt handler cannot be 'async': the hardware calls it directly, and " +
                 "calling an async function only makes its task, which nothing there can drive")
+        return
+    end if
+
+    // `@domain(interrupt)` keeps the ordinary convention, so it is called the way any function is --
+    // but by a vector table's stub, which has no executor to hand a task to either.
+    if d.marks.domain.is_some()
+        p.fault(at, s"a function entered in the '${d.marks.domain.unwrap()}' domain cannot be 'async': " +
+                "whatever enters it calls it directly, and calling an async function only makes its " +
+                "task, which nothing there can drive")
     end if
 end refuse_foreign_async
 
