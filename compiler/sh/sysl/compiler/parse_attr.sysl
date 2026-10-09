@@ -30,7 +30,7 @@ end header_attr_word
 // **In the header the word is still the module's clause**: the header is read first, so a file whose
 // first declaration is the function writes an `import` or another declaration above it, or the
 // module's clause is what it wrote.
-fn_forgo_word(w: string) -> bool = w == "no_alloc"
+fn_forgo_word(w: string) -> bool = w == "no_alloc" || w == "no_block"
 
 // The word a `@` is followed by, or `""` where it is followed by no name at all.
 attr_name(p: *Parser) -> string = p.peek_at(1) match
@@ -103,6 +103,7 @@ parse_attr_list(p: *Parser) -> Buf[Attr]
         p.skip_newlines()
 
     refuse_duplicates(p, out, "declaration")
+    refuse_blocks_beside_no_block(p, out)
     out
 end parse_attr_list
 
@@ -144,11 +145,12 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
         p.skip_newlines()
 
     refuse_duplicates(p, out, "member")
+    refuse_blocks_beside_no_block(p, out)
     out
 end parse_member_attrs
 
 private member_attr_refusal() -> string =
-    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the four about the function it lowers to, '@noinline', '@inline', '@cold' and '@no_alloc'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
+    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
 
 // A layout annotation above a field (or any member) is about the wrong thing rather than about a
 // function: `@packed` and `@align(n)` lay out a whole struct, and `@align(n)` marks one binding's
@@ -167,7 +169,7 @@ end layout_attr_on_member
 private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
-    for word in ["crossing", "borrows", "lends", "reads", "writes", "noinline", "inline", "cold"]
+    for word in ["crossing", "borrows", "lends", "reads", "writes", "noinline", "inline", "cold", "blocks"]
         if word == w then return true
 
     false
@@ -181,6 +183,12 @@ private refuse_duplicates(p: *Parser, attrs: Buf[Attr], what: string)
                 p.fault(p.here(), s"'@${attr_word(attrs.at(i))}' is written twice above one ${what}, and it says nothing the once does not")
                 return
 end refuse_duplicates
+
+// `@blocks` says the definition may wait and `@no_block` that it never does, so the two above one
+// definition are a contradiction rather than a stricter promise.
+private refuse_blocks_beside_no_block(p: *Parser, attrs: Buf[Attr])
+    if any_is(attrs, "blocks") && any_is(attrs, "no_block") then
+        p.fault(p.here(), "'@blocks' says this definition may wait and '@no_block' that it never does, so the two cannot both be true — a definition that waits is marked '@blocks', and one that promises not to keeps to the promise")
 
 private refuse_hash_attr(p: *Parser, at: Span)
     p.bump()
@@ -247,6 +255,10 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "pinned" then return Some(Pinned)
     if word == "pins" then return Some(Pins)
     if fn_forgo_word(word) then return Some(Forgoes(word[3..<word.len]))
+
+    // `@blocks` takes no parentheses: what it says is that a call may wait, and how long is not a
+    // number the declaration has.
+    if word == "blocks" then return no_inlining_args(p, Blocks, "how long a call may wait is not a number a declaration has")
 
     // `@ignore` is the spelling other test frameworks use, answered with this one's: ignoring is
     // something a test is, so it is an argument to `@test` rather than an annotation of its own.
@@ -540,6 +552,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Pinned -> f.marks.pinned = true
             Pins -> f.marks.pins = true
             Forgoes(cap) -> f.marks.forgoes.push(cap)
+            Blocks -> f.marks.blocks = true
             _ -> ()
 end apply_func_attrs
 
@@ -557,6 +570,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Pinned -> m.marks.pinned = true
             Pins -> m.marks.pins = true
             Forgoes(cap) -> m.marks.forgoes.push(cap)
+            Blocks -> m.marks.blocks = true
             _ -> ()
 end apply_member_attrs
 
@@ -640,13 +654,14 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         return placed_asm(parse_asm(p, at), attrs)
     end if
 
-    // `@needs(...)` is the one annotation an `extern` takes -- it is the declaration the annotation
-    // exists for, every other having a body the compiler reads instead.
+    // `@needs(...)` and `@blocks` are the two annotations an `extern` takes -- it is the declaration
+    // they exist for, every other having a body the compiler reads instead.
     refuse_async_extern(p)
 
     if p.at_kw("extern")
         refuse_unless(p, at, attrs, "extern")
-        return from_first(start, parse_extern_decl(p, at, vis, capabilities_of(attrs)))
+        return from_first(start, parse_extern_decl(p, at, vis, capabilities_of(attrs),
+                                                   any_is(attrs, "blocks")))
     end if
 
     // A `type` names a scalar or a pointer for a generated header, which is the struct's request made
@@ -709,7 +724,7 @@ private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)
 private may_carry(form: string, a: Attr) -> bool
     if form == "struct" then return is_layout(a) || attr_word(a) == "export"
     if form == "binding" then return is_storage(a)
-    if form == "extern" then return attr_word(a) == "needs"
+    if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "blocks"
 
     !is_layout(a) && attr_word(a) != "borrows"
 end may_carry
@@ -717,6 +732,9 @@ end may_carry
 // The sentence a declaration that carries none of these gets, chosen by what was written above it.
 private attributed_refusal(attrs: Buf[Attr]) -> string
     if forgo_of(attrs).is_some() then return forgo_refusal(forgo_of(attrs).unwrap())
+
+    if all_are(attrs, "blocks")
+        return "'@blocks' says a call may wait, so it marks a function, a method or an 'extern' — and this declares none of them"
 
     if all_are(attrs, "byte_order")
         return "'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'sysl.math.ByteOrder' gives every whole-byte integer"
@@ -989,6 +1007,14 @@ private all_are(attrs: Buf[Attr], word: string) -> bool
 
     true
 end all_are
+
+// Whether any annotation in the set is written with this word.
+private any_is(attrs: Buf[Attr], word: string) -> bool
+    for attr in attrs
+        if attr_word(attr) == word then return true
+
+    false
+end any_is
 
 // The capabilities a set of annotations names, flattened.
 private capabilities_of(attrs: Buf[Attr]) -> Buf[string]
