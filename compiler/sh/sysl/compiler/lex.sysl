@@ -197,7 +197,15 @@ private lex_from(start: Scanner) -> Result[Lexed, Diagnostic]
                 return Err(error(point(margin),
                     "only tabs or spaces (but not both on a given line) may be used for indentation"))
 
-            emit_dent(&out, lay.line(ind.columns), point(line_end), point(s.offset), started)
+            val dent = lay.line(ind.columns)
+
+            dent match
+                Ragged(levels) ->
+                    if !continues_an_if(&s, &out, levels, ind.columns)
+                        return Err(error(point(s.offset), ragged_line(lay, ind.columns)))
+                _ -> ()
+
+            emit_dent(&out, dent, point(line_end), point(s.offset), started)
 
             started = true
             at_line_head = false
@@ -242,10 +250,8 @@ end lex_from
 // preceded by the newline that ended the header, and each block a line closes is followed by the
 // newline that ends the statement outside it.
 //
-// A **ragged** line -- one less indented than the line above and matching no level still open -- is
-// not a lexical error. It closes the innermost block and carries on at the nearest level below it,
-// exactly as the bootstrap does, and what goes wrong is reported by whichever rule the line then
-// fails to satisfy.
+// A **ragged** line reaches it only as the one exception `continues_an_if` allows, and closes the
+// blocks it came down through like any shallower line.
 private emit_dent(out: *Buf[Spanned[Tok]], d: Dent, ended: Span, at: Span, started: bool)
     d match
         Same ->
@@ -257,6 +263,92 @@ private emit_dent(out: *Buf[Spanned[Tok]], d: Dent, ended: Span, at: Span, start
         Shallower(levels) -> close_levels(out, levels, ended, at, started)
         Ragged(levels) -> close_levels(out, levels, ended, at, started)
 end emit_dent
+
+// The refusal of a **ragged** line -- one less indented than the line above it and lined up with no
+// block still open -- named by the two margins it fell between.
+//
+// **It is refused rather than read at the nearest level below it**, because the reader meant one of
+// the two margins and the layout cannot know which: carrying on at the outer one turned a body pulled
+// back by two columns into a statement of the enclosing block, and the complaint, when there was one,
+// landed lines away from the mistake (`reference/lexical.md § A dedent goes back to a margin that is still open`).
+private ragged_line(lay: Layout, column: usize) -> string
+    val outer = if lay.margin() == 0 then "the left margin" else s"the one indented ${lay.margin()}"
+
+    s"a line indented ${column} columns lines up with no open block: it sits between the block indented ${lay.left_margin()} and ${outer} \u{2014} indent it to one of the two"
+
+// Whether a ragged line is an `else` or an `elif` lined up exactly under the `if` it continues --
+// the one ragged line that is not refused:
+//
+//     val sign = if n < 0 then
+//                    "negative"
+//                else "not negative"
+//
+// **The `if` has to be in the statement the line continues**, so the walk goes back through the
+// tokens already emitted and stops at the newline that began that statement: the first one at the
+// level the line returns to that neither opens a block nor comes before another `else` or `elif`.
+// Inside the blocks the line closed it looks at every `if`, however deeply nested, since an `if`
+// written on a `then` line's continuation sits there too.
+private continues_an_if(s: *Scanner, out: *Buf[Spanned[Tok]], levels: usize, column: usize) -> bool
+    if !word_ahead(s, "else") && !word_ahead(s, "elif") then return false
+
+    var depth: usize = 0
+    var crossed: usize = 0
+    var i = out.len()
+
+    while i > 0
+        i -= 1
+
+        val t = out.at(i)
+
+        t.value match
+            Dedent -> depth += 1
+            Indent ->
+                if depth > 0 then depth -= 1 else crossed += 1
+                if crossed > levels then return false
+            Newline ->
+                if depth == 0 && crossed >= levels && statement_boundary(out, i) then return false
+            Keyword(w) ->
+                if w == "if" && column_at(s.src, t.span.start) == column then return true
+            _ -> ()
+
+    false
+end continues_an_if
+
+// Whether the newline at `i` ends a statement rather than leading into a block or into another
+// branch of the same `if`.
+private statement_boundary(out: *Buf[Spanned[Tok]], i: usize) -> bool
+    if i + 1 >= out.len() then return true
+
+    out.at(i + 1).value match
+        Indent -> false
+        Dedent -> false
+        Keyword(w) -> w != "else" && w != "elif"
+        _ -> true
+end statement_boundary
+
+// Whether the cursor is at this word, and not at a longer name beginning with it.
+private word_ahead(s: *Scanner, word: string) -> bool
+    if !s.starts_with(word.bytes) then return false
+
+    s.peek_at(word.bytes.len) match
+        Some(c) -> !is_ident_cont(c)
+        None -> true
+
+// The column of a byte offset, counted in characters from the start of its line as an indentation
+// is (a tab is one column).
+private column_at(src: []const u8, offset: usize) -> usize
+    var start = offset
+
+    while start > 0 && src[start - 1] != u8('\n')
+        start -= 1
+
+    var n: usize = 0
+
+    for k in start..<offset
+        if src[k] & 0xC0 != 0x80 then n += 1
+
+    n
+end column_at
 
 private close_levels(out: *Buf[Spanned[Tok]], levels: usize, ended: Span, at: Span, started: bool)
     if started then out.push(Spanned(Newline, ended))

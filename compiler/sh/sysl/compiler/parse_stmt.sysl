@@ -54,18 +54,22 @@ private parse_loop_else(p: *Parser) -> Option[Buf[Stmt]]
 end parse_loop_else
 
 private parse_while_expr(p: *Parser, at: Span, label: Option[string]) -> Expr
+    open_construct(p, "while", at)
+
     val cond = parse_expr(p)
     val body = parse_body(p, "do")
     val otherwise = parse_loop_else(p)
 
-    accept_end_marker(p, "while")
+    accept_end_marker(p, "while", "'while'")
     expr(at.to(p.just_taken()), While(label, cond, body, otherwise))
 end parse_while_expr
 
 private parse_loop_expr(p: *Parser, at: Span, label: Option[string]) -> Expr
+    open_construct(p, "loop", at)
+
     val body = parse_body(p, "do")
 
-    accept_end_marker(p, "loop")
+    accept_end_marker(p, "loop", "'loop'")
     expr(at.to(p.just_taken()), Loop(label, body))
 end parse_loop_expr
 
@@ -185,6 +189,7 @@ end parse_quantifier
 // There is no label and no `else`, because there is no loop at run time for a `break` to leave or
 // for an `else` to follow.
 private parse_const_for(p: *Parser, at: Span) -> Expr
+    open_construct(p, "for", at)
     p.bump()
 
     val name = p.name() match
@@ -196,11 +201,13 @@ private parse_const_for(p: *Parser, at: Span) -> Expr
     val iter = parse_expr(p)
     val body = parse_body(p, "do")
 
-    accept_end_marker(p, "for")
+    accept_end_marker(p, "for", "'for'")
     expr(at.to(p.just_taken()), ConstFor(name, iter, body))
 end parse_const_for
 
 private parse_c_for(p: *Parser, at: Span, label: Option[string]) -> Expr
+    open_construct(p, "for", at)
+
     var init: Option[Stmt] = None
     var cond: Option[Expr] = None
     var step: Option[Stmt] = None
@@ -218,7 +225,7 @@ private parse_c_for(p: *Parser, at: Span, label: Option[string]) -> Expr
     val body = parse_body(p, "do")
     val otherwise = parse_loop_else(p)
 
-    accept_end_marker(p, "for")
+    accept_end_marker(p, "for", "'for'")
     expr(at.to(p.just_taken()), CFor(label, init, cond, step, body, otherwise))
 end parse_c_for
 
@@ -233,6 +240,8 @@ private parse_for_clause(p: *Parser) -> Stmt
 end parse_for_clause
 
 private parse_for_in(p: *Parser, at: Span, label: Option[string]) -> Expr
+    open_construct(p, "for", at)
+
     val binder = p.here()
     var name = ""
     var pat: Option[Pattern] = None
@@ -253,7 +262,7 @@ private parse_for_in(p: *Parser, at: Span, label: Option[string]) -> Expr
     var body = parse_body(p, "do")
     val otherwise = parse_loop_else(p)
 
-    accept_end_marker(p, "for")
+    accept_end_marker(p, "for", "'for'")
 
     // **A pattern is desugared into the binding the reader would otherwise have written.** The loop
     // names a temporary no program can write, and the body opens with the pattern bound to it -- so
@@ -313,7 +322,7 @@ end at_destructuring
 
 // How tightly a multi-assignment's targets are read: above assignment, so that the `=` after the
 // last of them is the one the whole list takes rather than one target's own.
-private const TargetPower: u8 = 6
+private const TargetPower: u16 = 6
 
 // Whether a token can begin a statement.
 //
@@ -524,9 +533,11 @@ private parse_val_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
     if p.accept_kw(":") then typ = Some(parse_type(p))
 
     p.expect_kw("=")
+    open_construct(p, name, start)
 
     val value = lift_placeholders(parse_initializer(p))
 
+    accept_end_marker(p, name, s"'val ${name}'")
     stmt(start.to(p.just_taken()), ValDecl(name, typ, value, vis, None, None))
 end parse_val_decl
 
@@ -541,7 +552,10 @@ parse_var_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
     var init: Option[Expr] = None
 
     if p.accept_kw(":") then typ = Some(parse_type(p))
-    if p.accept_kw("=") then init = Some(lift_placeholders(parse_initializer(p)))
+    if p.accept_kw("=")
+        open_construct(p, name, start)
+        init = Some(lift_placeholders(parse_initializer(p)))
+        accept_end_marker(p, name, s"'var ${name}'")
 
     stmt(start.to(p.just_taken()), VarDecl(name, typ, init, vis, None, None, false))
 end parse_var_decl
