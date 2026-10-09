@@ -1,6 +1,7 @@
 module sysl.fs
 @requires(os)
 
+import sysl.sys.UNSUPPORTED
 import sysl.text.from_utf8_lossy
 
 /** What a filesystem call reports when it does not succeed, and the one number it comes from.
@@ -196,23 +197,32 @@ private[sysl] from_errno(code: int) -> IoError
         Other(code)
 end from_errno
 
-/** A hook's status as the `Result` the rest of the module speaks in: zero is success, and anything
- * else is the code of the error, turned back into its case here and nowhere else (`sysl.fs.sys`).
+/** A hook's failure status as the `IoError` it stands for, turned back into its case here and nowhere
+ * else (`sysl.fs.sys`). A status is the error's code negated, as a system call answers it, so 13 comes
+ * back as `PermissionDenied` and -1 as `EPERM`, which is `PermissionDenied` too. **Exactly
+ * `UNSUPPORTED` (`sysl.sys`) is the target saying it cannot do the call at all** and is
+ * `unsupported()`; no other status is.
  */
-private[sysl] answered(code: int) -> Result[unit, IoError] = if code != 0 then Err(from_errno(code)) else Ok(())
+private[sysl] from_status(status: int) -> IoError =
+    if status == UNSUPPORTED then unsupported() else from_errno(-status)
+
+/** A hook's status as the `Result` the rest of the module speaks in: zero is success, and anything
+ * else is the error's code negated, turned back into its case by `from_status`.
+ */
+private[sysl] answered(status: int) -> Result[unit, IoError] = if status != 0 then Err(from_status(status)) else Ok(())
 
 /** What an operation reports where **this target has no way to perform it at all** -- not a failure
  * of the call, but the absence of one.
  *
- * It carries **-1**, which no `errno` is: every code the platforms report is positive, so this
- * cannot be confused with one and cannot collide with a code a later platform adds. Naming a real
- * code would have been worse than useless -- `ENOSYS` is 78 on macOS and 38 on Linux, and neither
- * number means anything on a target that has neither header.
+ * It carries `sysl.sys.UNSUPPORTED`, a negative number that is no `errno` on any platform, so it
+ * cannot be confused with a code a host reports. It is deliberately not the host's `ENOSYS`, which
+ * is 78 on macOS and 38 on Linux: the contract means one thing everywhere, and the hosted suppliers
+ * translate the host's own into it.
  *
- * It is what a hook of `sysl.fs.sys` answers for a call its supplier has no way to make, and what
- * reaches a caller as `from_errno(-1)`: a target whose C library has no `chmod`, or a program on a
- * bare machine answering for a filesystem that has no links.
+ * It is what a hook of any `*.sys` module answers for a call its supplier has no way to make, and
+ * what reaches a caller as `from_status(UNSUPPORTED)`: a target whose C library has no `chmod`, or a
+ * program on a bare machine answering for a filesystem that has no links.
  */
-private[sysl] unsupported() -> IoError = Other(unsupported_code)
+private[sysl] unsupported() -> IoError = Other(UNSUPPORTED)
 
-private const unsupported_code: int = -1
+private const unsupported_code: int = UNSUPPORTED

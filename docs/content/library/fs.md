@@ -509,7 +509,7 @@ success — a caller tearing down after a failure should not have to know how fa
 **`remove_dir_all` needs one thing `make_dir_all` does not**: to know whether an entry is a symbolic
 link *without following it*, and the only reading that answers that is `link_metadata` — the `stat`
 hook asked not to follow. Following the link instead would delete things nobody asked it to, which
-is the property the walk exists to have, so a target whose `stat` hook answers `-1` gets *not
+is the property the walk exists to have, so a target whose `stat` hook answers `UNSUPPORTED` gets *not
 supported on this target* back rather than a removal that guessed.
 
 ```sysl
@@ -921,8 +921,12 @@ way to get atomicity from a filesystem.
 `extern` per call — `sysl_fs_open`, `_read`, `_write`, `_close`, `_seek`, `_fstat`, `_ftruncate`,
 `_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
-`_realpath`. Each answers an `int`: zero, or the `code()` of the `IoError` it failed with, `-1`
-meaning the target cannot make that call at all. A path crosses as a pointer and a length, with no
+`_realpath`. Each answers an `int` by the contract every `*.sys` module has
+(`sysl.io.sys` and `sysl.process.sys` too): zero or more is success, a negative answer is the `code()`
+of the `IoError` it failed with, **negated** as a system call answers it (so `-1` is `EPERM` and comes back as
+`PermissionDenied`), and the one status `UNSUPPORTED` means the target cannot make that call at
+all. `UNSUPPORTED` is a constant in `sysl.sys`, -38 on every platform and deliberately not the host's
+`ENOSYS`, which hosted suppliers translate into it. A path crosses as a pointer and a length, with no
 terminator; what a call produces besides its status it writes through a pointer it was handed.
 
 On a hosted target the library answers them itself, over the C library, under `weak` exports
@@ -933,7 +937,7 @@ newlib's `open` and `read` are stubs the board answers, not a filesystem.
 
 ```sysl
 @export("sysl_fs_open")
-k_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int = -1
+k_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int = -38
 ```
 
 **A hook the program reaches and leaves unanswered is refused when it is compiled**, all of them in
@@ -943,7 +947,7 @@ one sentence, rather than surfacing at the link as a symbol no line of the progr
 error: this program reaches 'sysl.fs', and 'aarch64-freestanding' has no operating system under it for
 the standard library to answer a filesystem with, so the program answers it: define 'sysl_fs_close',
 'sysl_fs_open', 'sysl_fs_read', 'sysl_fs_write' with '@export', each taking what its 'extern' in
-'sysl.fs.sys' declares and answering zero or the code of an 'IoError'
+'sysl.fs.sys' declares and answering zero or the code of an 'IoError' negated
 ```
 
 The question is asked only of what the program reaches, so a freestanding program that never touches
@@ -954,7 +958,9 @@ a file is asked nothing.
 `copy_dir_all` and `publish_dir` are `entries` and `link_metadata` with a leaf action, and
 `make_temp_dir` and `canonicalize` are the `temp_dir` and `realpath` hooks. A supplier fills `Stat`'s
 thirteen numbers in POSIX's shape and leaves zero what it has nothing to say about; a hook it answers
-`-1` comes back from these calls as `Other(-1)`, *not supported on this target*.
+`UNSUPPORTED` comes back from these calls as *not supported on this target*. The one exception is
+the permission step of `copy_dir_all`: a target whose `chmod` answers `UNSUPPORTED` has no permission bits, so
+there is nothing to carry and the copy goes on; any other error from it still fails the copy.
 
 ## What is absent, and why
 
