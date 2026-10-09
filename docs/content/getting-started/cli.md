@@ -306,8 +306,11 @@ exist on the target.
 sysl emit-llvm hello.sysl
 ```
 
-The IR to stdout, the same text `run` and `build` hand to clang. Nothing is assembled and no
-toolchain is needed for it.
+The IR to stdout, the same text `run` and `build` hand to clang but for one line: the printed
+module's header is `target triple` alone, while the text clang compiles also carries the target's
+`target datalayout`, asked of that clang. Without it LLVM would read every 64-bit access the text
+leaves unannotated as four-byte aligned, which on a machine with no unaligned access (riscv64) splits
+each one in two. Nothing is assembled and no toolchain is needed for it.
 
 ### `emit-ast`
 
