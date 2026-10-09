@@ -47,7 +47,29 @@ literate_shift(src: Source) -> usize = if is_literate(src.name) then LiterateInd
 tangle(src: Source) -> Result[Source, Diagnostic]
     if !is_literate(src.name) then return Ok(src)
 
+    val program = program_lines(src)?
     var out = str_builder()
+
+    for line in 1..src.line_count()
+        if line > 1 then out.push_char('\n')
+
+        if program.at(line - 1)
+            val text = from_utf8_unchecked(src.line_text(line))
+
+            out.push(text[LiterateIndent..<text.len])
+
+    Ok(source_of(src.name, out.finish()))
+end tangle
+
+// Which lines of a literate file are program text, one answer per line in order -- or the first
+// thing wrong with the file.
+//
+// **This is the one reading of the format**, and both halves of a literate system ask it: `tangle`
+// keeps the lines it answers `true` for, and `weave` sets exactly those lines as the program's code
+// and renders every other line as the document's prose. Two readings could disagree about a line,
+// and a woven document would then show a program the compiler does not read.
+program_lines(src: Source) -> Result[Buf[bool], Diagnostic]
+    var out: Buf[bool] = buf()
     var fence = ""
     var fence_at: usize = 0
     var list_margin: usize = 0
@@ -56,14 +78,13 @@ tangle(src: Source) -> Result[Source, Diagnostic]
     for line in 1..src.line_count()
         val text = from_utf8_unchecked(src.line_text(line))
 
-        if line > 1 then out.push_char('\n')
-
         // Inside an illustration. It ends at a line whose own fence is at least as long as the one
         // that opened it and made of the same character, which is Markdown's rule and matters here
         // for one reason: a fenced block may quote a fence, and the longer opener is how.
         if fence != ""
             if closes_fence(text, fence) then fence = ""
 
+            out.push(false)
             continue
         end if
 
@@ -84,16 +105,20 @@ tangle(src: Source) -> Result[Source, Diagnostic]
         // blank line does not end one -- a list may be written with air between its items.
         if in_list && bare != "" && margin <= list_margin then in_list = false
 
-        if in_list then continue
+        if in_list
+            out.push(false)
+            continue
+        end if
 
         if margin < LiterateIndent && opens_fence(bare)
             fence = fence_run(bare)
             fence_at = line
+            out.push(false)
             continue
         end if
 
         if margin >= LiterateIndent
-            out.push(text[LiterateIndent..<text.len])
+            out.push(true)
             continue
         end if
 
@@ -105,6 +130,8 @@ tangle(src: Source) -> Result[Source, Diagnostic]
             list_margin = margin
         end if
 
+        out.push(false)
+
     // Markdown lets an unclosed fence run to the end of the document, and for a document that is
     // the harmless reading. For a *program* it means every declaration below the opening fence is
     // quietly not compiled, and what the reader is told is that something further up is incomplete.
@@ -112,8 +139,8 @@ tangle(src: Source) -> Result[Source, Diagnostic]
         return Err(error(point(src.line_span(fence_at).start),
             "this fence is never closed, so everything below it is an illustration and none of it is compiled — close it, or indent the lines that are meant to run"))
 
-    Ok(source_of(src.name, out.finish()))
-end tangle
+    Ok(out)
+end program_lines
 
 // How many bytes of blanks a line opens with. Every one of them is a space, a tab having been
 // refused above, so the count is also the column the line's content begins at.
