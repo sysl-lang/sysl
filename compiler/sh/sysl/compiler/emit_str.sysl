@@ -266,12 +266,11 @@ gen_from_bytes(e: *Emit, arg: TExpr) -> Val
 end gen_from_bytes
 
 // **`format(x, spec)`** -- one value rendered through a printf specifier, into a fresh owning string.
-// A float is widened to a `double` and handed to `snprintf` with the specifier; a string is copied
-// NUL-terminated and handed to `snprintf` as a `%s`, so width, precision and justification are C's
-// to apply. The result is always a fresh buffer this statement owns. **An integer never arrives
-// here**: the analysis sends it to the library's `sysl.fmt.format_int` (`expr_call.sysl`'s
-// `int_format_call`), so an integer specifier needs no C library — and on a target with none, a
-// reached float or string specifier is refused (`emit_checks.sysl`'s `check_c_formatting`).
+// A float is widened to a `double` and handed to `snprintf` with the specifier. The result is always
+// a fresh buffer this statement owns. **An integer or a string never arrives here**: the analysis
+// sends them to the library's `sysl.fmt.format_int` and `sysl.fmt.format_str` (`expr_call.sysl`'s
+// `int_format_call` and `str_format_call`), so neither needs a C library — and on a target with none,
+// a reached float specifier is refused (`emit_checks.sysl`'s `check_c_formatting`).
 //
 // **A count read at run time is one more `i32` before the value**, which is where C's `*` reads it,
 // and is handed to a helper of its own per number of counts -- so a specifier written out in full
@@ -280,6 +279,7 @@ gen_format(e: *Emit, arg: TExpr, spec: string, counts: Buf[TExpr]) -> Val
     val c = spec_conversion(spec)
 
     if spec_is_int(c) then return gap_at(e, "an integer specifier, with no 'sysl.fmt.format_int' to render it")
+    if spec_is_str(c) then return gap_at(e, "a string specifier, with no 'sysl.fmt.format_str' to render it")
 
     e.heap = true
     e.uses_snprintf = true
@@ -295,17 +295,6 @@ gen_format(e: *Emit, arg: TExpr, spec: string, counts: Buf[TExpr]) -> Val
 
     for n in counts.view()
         args.push(ir_arg(LInt(32), gen_expr(e, n)))
-
-    if spec_is_str(c)
-        val fn = request_text(e, s"sysl.str.fmt_s$suffix",
-                              str_fmt_str_text(word_llvm_of(e), str_llvm(e), k))
-        val parts = str_bytes(e, gen_expr(e, arg))
-
-        args.push(ir_arg(LPtr, parts.0))
-        args.push(ir_arg(word_lty(e), parts.1))
-        emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
-        return r
-    end if
 
     val fn = request_text(e, s"sysl.str.fmt_f$suffix",
                           str_fmt_float_text(word_llvm_of(e), str_llvm(e), k))
