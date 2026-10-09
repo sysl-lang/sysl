@@ -1,0 +1,289 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{join, Search, split}
+
+// **`E.try(s.field)` is the fallible read of a bitfield struct's enum field** (`member_call.sysl`'s
+// `enum_try`, lowered by `emit_enum.sysl`'s `gen_enum_try` through `bitfield_field_bits`). The plain
+// read `s.field` is the checked conversion and traps on bits no variant has; handed to `E.try`, the
+// field's bits are read unchecked and answered for -- `Some(variant)` or `None`, never a trap. Before
+// it, a kernel wanting "the exception class, if it is one I know" had to declare the field a plain
+// `u6` and call `E.try` on that.
+//
+// The same file holds `E.try`'s own edges: a source too wide for a signed 64-bit comparison -- a `u64`
+// past `i64::MAX`, a 128-bit integer -- is compared where it fits rather than wrapped into a variant.
+//
+// Every program is built at `-O0` and at the default level.
+
+private etf_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The tree built at `level` and run: its status, what it printed, and what it wrote to standard error.
+private etf_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-etf").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end etf_run
+
+// At both levels, the program exits cleanly having printed `printed` and nothing on standard error.
+private etf_prints(text: string, printed: string)
+    if !etf_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = etf_run(text, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end etf_prints
+
+// `sysl <args>` as the command line answers it: the status, and everything it said.
+private etf_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+
+    (code, join(said.view(), "\n"))
+end etf_cli
+
+// The exception-class register of keel's finding 9: six bits of class, about two dozen defined by
+// the architecture, two declared here. `raw` holds `class` in bits 26..<32.
+private etf_esr(class: int, body: string) -> string =
+    "enum Ec: u6\n" +
+    "    Unknown = 0x00\n" +
+    "    Brk = 0x3c\n" +
+    "\n" +
+    "@packed\n" +
+    "struct Esr\n" +
+    "    low: u26\n" +
+    "    ec: Ec\n" +
+    "    high: u32\n" +
+    "\n" +
+    "named(o: Option[Ec]) -> string = o match\n" +
+    "    Some(c) -> Ec::Image(c)\n" +
+    "    None -> \"none\"\n" +
+    "\n" +
+    s"var raw: u64 = u64($class) << 26 | 0x3ff_ffff\n" +
+    "val e: *Esr = ptr_cast(&raw)\n" +
+    body
+
+// -- the fallible read of a bitfield's enum field ---------------------------------------------------
+
+@test("E.try of a bitfield's enum field holding no variant's pattern is None, and nothing traps")
+etf_an_invalid_pattern_is_none()
+    // The plain read of the same field traps (`bev_a_direct_read_of_a_field_holding_no_variant`).
+    etf_prints(etf_esr(0x2a, "print(named(Ec.try(e.ec)), Ec.try(e.ec).is_none())\nprint(\"after\")\n"),
+               "none true\nafter\n")
+
+@test("E.try of a bitfield's enum field holding a variant's pattern is Some of that variant")
+etf_a_valid_pattern_is_some()
+    etf_prints(etf_esr(0x3c, "print(named(Ec.try(e.ec)))\n"), "Brk\n")
+    etf_prints(etf_esr(0, "print(named(Ec.try(e.ec)))\n"), "Unknown\n")
+
+@test("E.try of a bitfield field reads only its own bits, the fields beside it set")
+etf_the_neighbours_do_not_leak_in()
+    // `raw` has every bit below the class set and bits 32.. are `high`; neither reaches the answer.
+    etf_prints(etf_esr(0x3c, "raw = raw | 0xffff_ffff_0000_0000\nprint(named(Ec.try(e.ec)), e.high)\n"),
+               "Brk 4294967295\n")
+
+@test("E.try of a signed enum field with written negative discriminants answers by its two's-complement bits")
+etf_a_signed_written_field()
+    val decl = "enum Sg: i3\n    Low = -4\n    Mid = 1\n\n" +
+               "@packed\nstruct R\n    a: u2\n    s: Sg\n    b: u3\n\n" +
+               "shown(o: Option[Sg]) -> string = o match\n    Some(c) -> Sg::Image(c)\n    None -> \"none\"\n\n" +
+               "var raw: u8 = 0\nval r: *R = ptr_cast(&raw)\n"
+
+    // 0b100 is -4 (Low), 0b001 is 1 (Mid), 0b011 is 3 and 0b111 is -1: no variant's.
+    etf_prints(decl + "for bits in [0b100u8, 0b001, 0b011, 0b111]\n" +
+               "    raw = bits << 2 | 0b11 | 0b111 << 5\n" +
+               "    print(shown(Sg.try(r.s)))\n",
+               "Low\nMid\nnone\nnone\n")
+
+@test("E.try of a field whose enum covers its whole width is Some with no test at all")
+etf_a_covering_field_has_no_check()
+    if !etf_ready() then return
+
+    val text = "enum Mode: u2\n    A\n    B\n    C\n    D\n\n" +
+               "@packed\nstruct R\n    m: Mode\n    rest: u6\n\n" +
+               "shown(o: Option[Mode]) -> string = o match\n    Some(c) -> Mode::Image(c)\n    None -> \"none\"\n\n" +
+               "var raw: u8 = 0b1111_1110\nval r: *R = ptr_cast(&raw)\n" +
+               "print(shown(Mode.try(r.m)))\n"
+
+    etf_prints(text, "C\n")
+
+    val root = make_temp_dir("sysl-etf").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val (code, ir) = etf_cli(["sysl", "emit-llvm", s"$root/main.sysl"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 0, ir)
+    assert(!ir.contains("sysl.enum.check"), ir)
+    assert(!ir.contains("try.none"), ir)
+    assert(!ir.contains("try.some"), ir)
+end etf_a_covering_field_has_no_check
+
+@test("E.try of a field with values no variant covers tests the bits and takes no checked read")
+etf_a_partial_field_is_tested_not_checked()
+    if !etf_ready() then return
+
+    val root = make_temp_dir("sysl-etf").unwrap()
+
+    // No `Image` here: it holds its own argument to the variants, which is a check of its own.
+    write_text(s"$root/main.sysl", etf_esr(0x3c, "print(Ec.try(e.ec).is_some())\n")).unwrap()
+
+    val (code, ir) = etf_cli(["sysl", "emit-llvm", s"$root/main.sysl"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 0, ir)
+    assert(ir.contains("try.none"), ir)
+    assert(!ir.contains("call void @sysl.enum.check."), ir)
+end etf_a_partial_field_is_tested_not_checked
+
+// The undefined symbols `llvm-nm -u` lists over `archive`, or None where no llvm-nm is on this machine.
+private etf_undefined(archive: string) -> Option[Buf[string]]
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-nm", "/usr/local/opt/llvm/bin/llvm-nm"]
+    var nm = ""
+
+    for i in 0..<candidates.len
+        if nm == "" && is_file(candidates[i]) then nm = candidates[i]
+
+    if nm == "" then return None
+
+    val listed = capture(nm, ["-u", archive], "", [], true).unwrap()
+
+    assert(listed.status.ok(), listed.text)
+
+    var out: Buf[string] = buf()
+    val lines = split(listed.text, "\n")
+
+    // An archive's listing names each member with a trailing colon; the rest are symbols.
+    for i in 0..<lines.len
+        val line = lines[i].trim()
+
+        if line != "" && !line.ends_with(":") then out.push(line)
+
+    Some(out)
+end etf_undefined
+
+@test("an aarch64-freestanding archive using E.try on a bitfield field needs no allocator and no C library")
+etf_freestanding_needs_nothing()
+    if !etf_ready() then return
+
+    val root = make_temp_dir("sysl-etf").unwrap()
+
+    write_text(s"$root/package.hocon", "package { name = \"probe\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/main.sysl",
+               "enum Ec: u6\n    Unknown = 0x00\n    Brk = 0x3c\n\n" +
+               "@packed\nstruct Esr\n    low: u26\n    ec: Ec\n    high: u32\n\n" +
+               "@export(\"classify\")\nclassify(e: *Esr) -> u8 = Ec.try(e.ec) match\n" +
+               "    Some(Brk) -> 1\n    Some(Unknown) -> 2\n    None -> 0\n").unwrap()
+
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root]
+    val built = etf_cli(args[..])
+
+    assert_eq(built.0, 0, built.1)
+
+    etf_undefined(archive) match
+        Some(names) -> assert_eq(join(names.view(), " "), "")
+        None -> print("skipped: llvm-nm is not on this machine")
+
+    remove_dir_all(root).unwrap_or(())
+end etf_freestanding_needs_nothing
+
+// -- what E.try refuses -------------------------------------------------------------------------------
+
+@test("E.try of a value of the enum that is not a bitfield's field is refused, saying which one it takes")
+etf_a_plain_enum_value_is_refused()
+    if !etf_ready() then return
+
+    // A local of the enum, and an enum field of an ordinary struct: both already held to the variants.
+    for handed in ["c", "p.ec"]
+        val root = make_temp_dir("sysl-etf").unwrap()
+
+        write_text(s"$root/main.sysl",
+                   "enum Ec: u6\n    Unknown = 0x00\n    Brk = 0x3c\n\n" +
+                   "struct Plain\n    ec: Ec\n\n" +
+                   "val c = Ec.Brk\nval p = Plain(Ec.Unknown)\n" +
+                   s"print(Ec.try($handed).is_some())\n").unwrap()
+
+        val (code, said) = etf_cli(["sysl", "build", s"$root/main.sysl", "-o", s"$root/built"])
+
+        remove_dir_all(root).unwrap_or(())
+        assert(code != 0, said)
+        assert(said.contains("'Ec' converts an integer, but the value has type Ec — a value of the enum " +
+                             "is already one of its variants; only an enum field of a '@packed' " +
+                             "bitfield struct, whose bits nothing has checked, is taken as it is"), said)
+        assert(said.contains("main.sysl:10:10"), said)
+end etf_a_plain_enum_value_is_refused
+
+@test("E.try of a bitfield field of another enum is refused as a value of the wrong type")
+etf_another_enums_field_is_refused()
+    if !etf_ready() then return
+
+    val root = make_temp_dir("sysl-etf").unwrap()
+
+    write_text(s"$root/main.sysl",
+               "enum Ec: u6\n    Unknown = 0x00\n    Brk = 0x3c\n\n" +
+               "enum Other: u6\n    One = 1\n\n" +
+               "@packed\nstruct Esr\n    low: u26\n    ec: Ec\n    high: u32\n\n" +
+               "var raw: u64 = 0\nval e: *Esr = ptr_cast(&raw)\n" +
+               "print(Other.try(e.ec).is_some())\n").unwrap()
+
+    val (code, said) = etf_cli(["sysl", "build", s"$root/main.sysl", "-o", s"$root/built"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(code != 0, said)
+    assert(said.contains("'Other' converts an integer, but the value has type Ec"), said)
+    assert(!said.contains("already one of its variants"), said)
+end etf_another_enums_field_is_refused
+
+// -- E.try's own edges ----------------------------------------------------------------------------------
+
+@test("E.try of a u64 past i64::MAX does not match a negative discriminant")
+etf_a_wide_unsigned_does_not_wrap()
+    // Compared at 64 bits, 18446744073709551615 and -1 were one bit pattern and `Back` was the answer.
+    etf_prints("enum Dir: i8\n    Back = -1\n    Ahead = 1\n\n" +
+               "val m: u64 = 18446744073709551615\nval one: u64 = 1\n" +
+               "print(Dir.try(m).is_some(), Dir.try(one).is_some())\n",
+               "false true\n")
+
+@test("E.try of a 128-bit integer compares all of it, its sign included")
+etf_a_128_bit_source_is_compared_whole()
+    // Narrowed to 64 bits, 2^64 + 1 lost its high half and matched `Ahead`.
+    etf_prints("enum Dir: i8\n    Back = -1\n    Ahead = 1\n\n" +
+               "val x: u128 = (u128(1) << 64) + 1\nval y: i128 = -1\nval z: i128 = (i128(1) << 64) - 1\n" +
+               "print(Dir.try(x).is_some(), Dir.try(y).is_some(), Dir.try(z).is_some())\n",
+               "false true false\n")
+
+@test("Dir(n), the checked cast, makes the same whole comparison and traps on a u64 past i64::MAX")
+etf_the_checked_cast_does_not_wrap_either()
+    if !etf_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, _) = etf_run("enum Dir: i8\n    Back = -1\n    Ahead = 1\n\n" +
+                                      "val m: u64 = 18446744073709551615\nprint(i8(Dir(m)))\n", level)
+
+        assert_eq(out, "")
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state, having printed '$out'")
+end etf_the_checked_cast_does_not_wrap_either
