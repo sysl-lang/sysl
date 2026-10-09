@@ -489,8 +489,35 @@ private declared_needs(a: &Analysis, cap: string) -> Buf[string]
         if !holds_string(out, key) && needs_capability(a.tables.externs.at(i).needs, cap) then
             out.push(key)
 
+    // **An `extern` variable is seeded by its C symbol**, which is the name a read of it carries in
+    // the typed tree. Two declarations of one symbol are one piece of storage, so a `@needs` on
+    // either is a statement about that storage.
+    for i in 0..<a.tables.extern_vars.len()
+        val v = a.tables.extern_vars.at(i)
+        val symbol = extern_var_symbol(v)
+
+        if !holds_string(out, symbol) && needs_capability(v.needs, cap) then out.push(symbol)
+
     out
 end declared_needs
+
+// The name a diagnostic gives a seed: a function's key, or the `extern` variable whose symbol it is,
+// qualified as its declaration is. Where several declare the symbol, the one the referring scope can
+// name is the one it was written through, and a declaration of the program's own beats the library's.
+private seed_shown(a: &Analysis, scope: Scope, seed: string) -> string
+    var fallback: Option[string] = None
+
+    for i in 0..<a.tables.extern_vars.len()
+        val v = a.tables.extern_vars.at(i)
+        val key = a.tables.extern_vars.key_at(i)
+
+        if extern_var_symbol(v) != seed || v.needs.is_empty() then continue
+        if reachable_key(a, key, scope) then return qualified_name(key)
+
+        if fallback.is_none() || !from_library(a, v.scope) then fallback = Some(key)
+
+    qualified_name(fallback.unwrap_or(seed))
+end seed_shown
 
 // Says that the body about to be read is `d`'s, for the edges it makes; hands back what was said
 // before, which `leave_reaching` puts back. A body read while another is open -- an instantiation
@@ -591,19 +618,28 @@ private check_needs_names(a: &Analysis)
     for i in 0..<a.tables.funcs.len()
         val f = a.tables.funcs.at(i)
 
-        for j in 0..<f.decl.needs.len()
-            val cap = f.decl.needs.at(j)
+        check_need_names(a, f.scope, f.span, f.decl.needs)
 
-            if is_facility(cap) then continue
+    for i in 0..<a.tables.extern_vars.len()
+        val v = a.tables.extern_vars.at(i)
 
-            if narrowed_by(cap).is_some() then
-                a.fault(f.scope, f.span, s"'$cap' is what a module does, not something a machine " +
-                        "has — a '@needs' names the facility, so this is " +
-                        s"'@needs(${narrowed_by(cap).unwrap()})'")
-            else
-                a.fault(f.scope, f.span, s"no capability is called '$cap' — the set is 'heap', " +
-                        "'os', 'posix'")
+        check_need_names(a, v.scope, v.span, v.needs)
 end check_needs_names
+
+private check_need_names(a: &Analysis, scope: Scope, span: Span, needs: Buf[string])
+    for j in 0..<needs.len()
+        val cap = needs.at(j)
+
+        if is_facility(cap) then continue
+
+        if narrowed_by(cap).is_some() then
+            a.fault(scope, span, s"'$cap' is what a module does, not something a machine " +
+                    "has — a '@needs' names the facility, so this is " +
+                    s"'@needs(${narrowed_by(cap).unwrap()})'")
+        else
+            a.fault(scope, span, s"no capability is called '$cap' — the set is 'heap', " +
+                    "'os', 'posix'")
+end check_need_names
 
 // Whether a module is without a capability -- because it gave the capability up, or because the
 // target it is being built for never had it.
@@ -725,7 +761,7 @@ private blame_needs_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, ca
     if mine.is_none() then return
     if reaches_a_seed(walk, strict_refs(e)) then return
 
-    a.fault(scope, e.span, s"this reaches '${qualified_name(mine.unwrap())}', which needs '$cap', " +
+    a.fault(scope, e.span, s"this reaches '${seed_shown(a, scope, mine.unwrap())}', which needs '$cap', " +
             s"and $why")
 end blame_needs_one
 

@@ -318,7 +318,7 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // **The back end's namespace holds code, never storage**: left alone this emits
         // `@llvm.x = external global`, which the verifier refuses for a reason nobody would trace
         // back to the line that caused it.
-        ExternVarDecl(name, typ, link, vis) ->
+        ExternVarDecl(name, typ, link, vis, needs) ->
             if is_intrinsic_name(link.unwrap_or(name))
                 a.fault(scope, s.span, s"'${link.unwrap_or(name)}' is in the namespace the back end's " +
                         "own operations live in, and those are code rather than storage — an " +
@@ -327,7 +327,7 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
                 check_foreign_symbol(a, scope, s.span, link.unwrap_or(name), link.is_some())
 
             hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.extern_vars,
-                        "'extern' variable", None, None, None, false, link)
+                        "'extern' variable", None, None, None, false, link, needs)
         ExternDecl(d) -> hoist_extern(a, scope, s.span, d)
         // A bare-arrow parameter is sugar for a bounded type parameter, and the rewrite happens
         // at the declaration so that everything after it is the generic machinery that exists.
@@ -590,7 +590,8 @@ type_name_taken(a: &Analysis, key: string, written: string) -> bool =
 private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
                     vis: Visibility, into: &Table[ValueDecl], what: string, init: Option[Expr],
                     align: Option[Expr] = None, section: Option[string] = None,
-                    thread_local: bool = false, link: Option[string] = None)
+                    thread_local: bool = false, link: Option[string] = None,
+                    needs: Buf[string] = buf())
     val plain = module_qualify(scope.module_name, name)
     val key = decl_key(a, scope, plain, vis)
     val holder = if contested(a, scope, vis, key) then value_name_holder(a, key) else None
@@ -612,7 +613,7 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
     end if
 
     into.put(key, ValueDecl(name, typ, vis, span, scope, init, align, section, thread_local,
-                            link))
+                            link, needs))
     record_access(a, scope, span, key, vis)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
@@ -1273,7 +1274,7 @@ private note_wider(a: &Analysis, scope: Scope, s: Stmt)
         ConstDecl(name, _, _, vis) -> note_wider_name(a, scope, name, vis)
         ValDecl(name, _, _, vis, _, _) -> note_wider_name(a, scope, name, vis)
         VarDecl(name, _, _, vis, _, _, _) -> note_wider_name(a, scope, name, vis)
-        ExternVarDecl(name, _, _, vis) -> note_wider_name(a, scope, name, vis)
+        ExternVarDecl(name, _, _, vis, _) -> note_wider_name(a, scope, name, vis)
         ExternDecl(d) -> note_wider_name(a, scope, d.name, d.vis)
         FuncDecl(d) -> note_wider_name(a, scope, d.name, d.vis)
         StaticDecl(inner) -> note_wider(a, scope, inner)

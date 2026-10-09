@@ -24,8 +24,17 @@ struct Refs
     erased: Buf[string]
     sites: Buf[(string, int)]
 
+    // The module storage a tree reads, writes or takes the address of, by the symbol it is laid down
+    // or declared under. Storage has no body to follow, so a name here is a leaf of the walk -- but
+    // an `extern` variable may carry a `@needs(...)`, and reaching it is then what a capability is
+    // asked about.
+    globals: Buf[string]
+
     call(*self, name: string)
         if name != "" && !holds_string(self.calls, name) then self.calls.push(name)
+
+    global(*self, symbol: string)
+        if !holds_string(self.globals, symbol) then self.globals.push(symbol)
 
     erase(*self, name: string)
         if !holds_string(self.erased, name) then self.erased.push(name)
@@ -37,7 +46,7 @@ struct Refs
         self.sites.push((trait_name, slot))
 end Refs
 
-no_refs() -> &Refs = Refs(buf(), buf(), buf())
+no_refs() -> &Refs = Refs(buf(), buf(), buf(), buf())
 
 // What ONE node names, without descending: the calls it makes and the table it erased into.
 //
@@ -50,6 +59,7 @@ node_refs(out: &Refs, e: TExpr)
 
         // Taking a function's address is a use of it exactly as calling it is.
         TFuncAddr(name, _, _) -> out.call(name)
+        TGlobal(symbol, _, _) -> out.global(symbol)
         TTry(_, _, _, _, _, _, convert) -> if convert.is_some() then out.call(convert.unwrap())
         TStructInvCheck(_, _, inv_fn) -> out.call(inv_fn)
         TRecheck(_, _, _, inv_fn) -> out.call(inv_fn)
@@ -245,6 +255,10 @@ private take_refs(refs: &Refs, called: *Buf[string], called_seen: *Set[string],
         if called_seen.add(refs.calls.at(i))
             called.push(refs.calls.at(i))
             queue.push(refs.calls.at(i))
+
+    // Storage is reached and never followed: it has no body, so it is not queued.
+    for i in 0..<refs.globals.len()
+        if called_seen.add(refs.globals.at(i)) then called.push(refs.globals.at(i))
 end take_refs
 
 private drain_calls(r: &Reaches, called: *Buf[string], called_seen: *Set[string],
