@@ -1,0 +1,169 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **A string under a specifier is rendered by `sysl.fmt.format_str`, not by C's `snprintf`, and it
+// renders what C's does** (`expr_call.sysl`'s `library_format_call`). C is the oracle: one hosted program
+// renders every case both ways — the `f"…"` hole, and `snprintf` over a NUL-terminated copy with the
+// same specifier — and prints each pair that differs. A width and a precision count bytes, so the
+// cases include multibyte text, where a precision cuts inside a character exactly as C's does; a
+// string that is a slice of a longer one, with no terminator after it; an interior NUL, which ends a
+// C string; and run-time counts, negative ones included.
+
+private val fms_prelude: string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.slices.as_ptr
+    import sysl.text.from_utf8_unchecked
+
+    extern "snprintf" c_snprintf(out: *u8, room: usize, fmt: *u8, ...) -> int
+
+    terminated(s: string) -> Buf[u8]
+        var b: Buf[u8] = buf()
+
+        for x in s.bytes do b.push(x)
+
+        b.push(0)
+        b
+    end terminated
+
+    c_s(fmt: *u8, s: string) -> string
+        var out: [512]u8 = [0; 512]
+        val t = terminated(s)
+        val n = c_snprintf(&out[0], 512, fmt, as_ptr(t.view()))
+
+        from_utf8_unchecked(out[0..<usize(n)])
+    end c_s
+
+    c_n(fmt: *u8, count: int, s: string) -> string
+        var out: [512]u8 = [0; 512]
+        val t = terminated(s)
+        val n = c_snprintf(&out[0], 512, fmt, count, as_ptr(t.view()))
+
+        from_utf8_unchecked(out[0..<usize(n)])
+    end c_n
+
+    c_wp(fmt: *u8, w: int, p: int, s: string) -> string
+        var out: [512]u8 = [0; 512]
+        val t = terminated(s)
+        val n = c_snprintf(&out[0], 512, fmt, w, p, as_ptr(t.view()))
+
+        from_utf8_unchecked(out[0..<usize(n)])
+    end c_wp
+
+    same(ours: string, theirs: string) -> int
+        if ours == theirs then return 0
+
+        print(s"[$ours] [$theirs]")
+        1
+    end same
+
+    var bad = 0
+    val nul: [5]u8 = [97, 0, 98, 99, 100]
+    val v0 = "ab"
+    val v1 = ""
+    val v2 = "héllo"
+    val v3 = "日本語"
+    val v4 = "abcdefgh"[0..<5]
+    val v5 = from_utf8_unchecked(nul[..])
+    val n0 = -7
+    val n1 = 0
+    val n2 = 7
+    val p0 = -1
+    val p1 = 0
+    val p2 = 2
+    val p3 = 5
+    """
+
+private val fms_values: [6]string = ["v0", "v1", "v2", "v3", "v4", "v5"]
+
+private val fms_specs: [22]string = ["s", "5s", "-5s", "05s", "-05s", "0-5s", "+5s", " 5s", "#5s",
+                                     ".0s", ".1s", ".2s", ".3s", ".4s", ".10s", "8.2s", "-8.4s",
+                                     "1s", "08.3s", "20s", "-12.7s", "12.5s"]
+
+private val fms_counts: [3]string = ["n0", "n1", "n2"]
+
+private val fms_precisions: [4]string = ["p0", "p1", "p2", "p3"]
+
+private fms_program() -> string
+    var text = fms_prelude
+    val open = "$" + "{"
+
+    for v in fms_values
+        for spec in fms_specs
+            text = text + "bad += same(f\"" + open + v + "}%" + spec + "\", c_s(c\"%" + spec + "\", " +
+                   v + "))\n"
+
+        for w in fms_counts
+            text = text + "bad += same(f\"" + open + v + "}%" + open + w + "}s\", c_n(c\"%*s\", " + w +
+                   ", " + v + "))\n"
+            text = text + "bad += same(f\"" + open + v + "}%-" + open + w + "}s\", c_n(c\"%-*s\", " +
+                   w + ", " + v + "))\n"
+
+            for p in fms_precisions
+                text = text + "bad += same(f\"" + open + v + "}%" + open + w + "}." + open + p +
+                       "}s\", c_wp(c\"%*.*s\", " + w + ", " + p + ", " + v + "))\n"
+        end for
+
+        for p in fms_precisions
+            text = text + "bad += same(f\"" + open + v + "}%." + open + p + "}s\", c_n(c\"%.*s\", " +
+                   p + ", " + v + "))\n"
+    end for
+
+    text + "print(s\"mismatches $bad\")\n"
+end fms_program
+
+@test("every string specifier renders what C's snprintf renders, byte for byte, multibyte text included")
+fms_parity_with_snprintf()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("main.sysl", fms_program())]), "mismatches 0\n")
+
+@test("a width counts bytes and a precision cuts bytes, as C's do")
+fms_width_and_precision_count_bytes()
+    if xvr_no_library() then return
+
+    val program = raw"""
+        val s = "héllo"
+        val t = "ab"
+
+        print(f"[${t}%-6s] [${t}%6s] [${s}%7s] [${s}%.3s] [${s}%-8.3s] [${t}%05s] [${t}%.1s]")
+        """
+
+    assert_eq(xvr_ran([("main.sysl", program)]),
+              "[ab    ] [    ab] [ héllo] [hé] [hé     ] [000ab] [a]\n")
+
+// The program keel's `ls -l` wanted to write: a runtime string padded to a column.
+private val fms_padded: string = raw"""
+    @export("probe")
+    probe(n: int) -> usize
+        val s = str(n)
+
+        f"[${s}%-6s]".bytes.len + f"[${s}%.${n}s]".bytes.len
+    """
+
+@test("a freestanding archive padding a runtime string builds, and leaves no snprintf for its link")
+fms_freestanding_pad_needs_no_snprintf()
+    if !lbr_ready() then return
+
+    val nm = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+    if !is_file(nm) then skip(s"there is no llvm-nm at $nm to read the archive")
+
+    val root = lbr_tree(lbr_one("main.sysl", fms_padded))
+    val archive = s"$root/probe.a"
+    val built = lbr_cli(["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root])
+
+    assert_eq(built.0, 0, built.1)
+
+    val undefined = capture(nm, ["-u", archive], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+
+    lbr_drop([root])
+    assert(!undefined.contains("llvm-nm could not be run"), undefined)
+    assert(!undefined.contains("snprintf"), undefined)
+end fms_freestanding_pad_needs_no_snprintf

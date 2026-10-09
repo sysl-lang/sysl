@@ -33,40 +33,6 @@ private str_buf_header(word: string) -> string
       %bytes = getelementptr %arc.header, ptr %p, i32 1
     """
 
-// How `snprintf`'s answer becomes a length.
-//
-// It reports in an `int` and a string's length is a `usize`, so on a 64-bit machine there is a
-// widening to write and on a 32-bit one the two are already the same integer -- where
-// `sext i32 %n to i32` is not an instruction at all. So this answers with the line to emit, which
-// may be empty, and the name to read afterwards, which may be the original.
-private counted_line(word: string) -> string =
-    if word == "i32" then "" else s"  %n64 = sext i32 %n to $word\n"
-
-private counted_name(word: string) -> string = if word == "i32" then "%n" else "%n64"
-
-// The counts a specifier reads at run time, as parameters and as the same names passed on: one
-// `i32` per `*`, ahead of the value, which is where C's `*` reads them.
-private count_params(k: usize) -> string
-    var out = ""
-
-    for i in 0..<k
-        out = out + s", i32 %c$i"
-
-    out
-end count_params
-
-private count_suffix(k: usize) -> string = if k == 0 then "" else s".$k"
-
-// **A count read at run time can ask for more than `snprintf` can answer**: a field past `INT_MAX`
-// bytes is refused with a negative result, which read as a length would size the buffer at nothing
-// and the string at everything. So where there are counts the answer is measured into `%raw` and a
-// refusal becomes an empty field; a specifier written out in full keeps the line it always had.
-private measured(k: usize) -> string = if k == 0 then "n" else "raw"
-
-private refused(k: usize) -> string =
-    if k == 0 then ""
-    else "  %short = icmp slt i32 %raw, 0\n  %n = select i1 %short, i32 0, i32 %raw\n"
-
 // Writing bytes out. `putchar` is declared here rather than beside `printf` because a module that
 // never prints a string never needs it.
 //
@@ -339,50 +305,6 @@ str_int_text(bits: int, word: string, str: string) -> string
     }
     """
 end str_int_text
-
-// A string rendered through a printf `%s` specifier, so that width, precision and justification are
-// the C library's to apply. A sysl string carries a length rather than a terminator, so a
-// NUL-terminated copy is made for `snprintf` and freed after; an interior NUL therefore ends the
-// field, which is exactly `%s`'s own rule.
-str_fmt_str_text(word: string, str: string, k: usize) -> string
-    val widen = counted_line(word)
-    val len = counted_name(word)
-    val cs = count_params(k)
-
-    s"""
-    define private $str @sysl.str.fmt_s${count_suffix(k)}(ptr %fmt$cs, ptr %src, $word %len) {
-    entry:
-      %ccap = add $word %len, 1
-      %cstr = call ptr @${malloc_symbol()}($word %ccap)
-      br label %ccond
-    ccond:
-      %i = phi $word [ 0, %entry ], [ %inext, %cbody ]
-      %more = icmp ult $word %i, %len
-      br i1 %more, label %cbody, label %cdone
-    cbody:
-      %sp = getelementptr i8, ptr %src, $word %i
-      %sb = load i8, ptr %sp
-      %dp = getelementptr i8, ptr %cstr, $word %i
-      store i8 %sb, ptr %dp
-      %inext = add $word %i, 1
-      br label %ccond
-    cdone:
-      %nulp = getelementptr i8, ptr %cstr, $word %len
-      store i8 0, ptr %nulp
-      %${measured(k)} = call i32 (ptr, $word, ptr, ...) @snprintf(ptr null, $word 0, ptr %fmt$cs, ptr %cstr)
-    ${refused(k)}$widen  %cap = add $word $len, 1
-      %hend = getelementptr %arc.header, ptr null, i32 1
-      %hsize = ptrtoint ptr %hend to $word
-      %size = add $word %hsize, %cap
-    ${str_buf_header(word)}  %w = call i32 (ptr, $word, ptr, ...) @snprintf(ptr %bytes, $word %cap, ptr %fmt$cs, ptr %cstr)
-      call void @${free_symbol()}(ptr %cstr)
-      %v0 = insertvalue $str undef, ptr %p, 0
-      %v1 = insertvalue $str %v0, ptr %bytes, 1
-      %v2 = insertvalue $str %v1, $word $len, 2
-      ret $str %v2
-    }
-    """
-end str_fmt_str_text
 
 // Whether a byte offset falls between characters rather than inside one. The caller has already
 // checked that the offset is within the string, so this only has to look at the byte it names: a

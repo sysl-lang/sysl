@@ -451,8 +451,9 @@ private hook_modules() -> Buf[HookModule]
                          "zero or the code of an 'IoError' negated"))
     rows.push(HookModule("sysl.io.sys", "sysl.io", "reads or flushes a descriptor", "one",
                          "a count or zero, or the code of an 'IoError' negated"))
-    rows.push(HookModule("sysl.process.sys", "sysl.process", "starts or waits for a process", "one",
-                         "a process id, a length or zero, or the code of an 'IoError' negated"))
+    rows.push(HookModule("sysl.process.sys", "sysl.process", "reaches 'sysl.process'",
+                         "a process or a user", "a process id, a user or group id, a length or " +
+                         "zero, or the code of an 'IoError' negated"))
     rows.push(HookModule("sysl.net.sys", "sysl.net", "reaches 'sysl.net'", "a network",
                          "a descriptor, a count or zero, or the code of an 'IoError' negated"))
     rows
@@ -549,58 +550,6 @@ check_aligned_heap(a: &Analysis, p: TProgram)
 
     a.fault_unplaced(func_home(a, p.funcs.at(0).name), p.funcs.at(0).span, msg)
 end check_aligned_heap
-
-// **A specifier the program reaches that only C's `snprintf` can apply, on a target with no C library
-// to supply one.**
-//
-// A number is rendered by the library on every target -- an integer specifier by `sysl.fmt.format_int`,
-// a float one, a plain hole of a float and `str` of one by `format_real` and `format_f32` -- so what
-// still goes to C is a `%s` over a string, and on a target without the `libc` capability it would
-// otherwise surface at the link as an undefined `snprintf` named nowhere in the program's source. So
-// each one reached is refused here, at the specifier, naming it and the target, and saying how a
-// manifest grants the C library a board does have. The walk is the reachability one, so a specifier
-// in a function nothing reaches is not asked about.
-check_c_formatting(a: &Analysis, p: TProgram)
-    val t = a.tables.target
-
-    if t.provides_libc() then return
-
-    val grant = libc_grant_advice(t)
-
-    for f in p.funcs
-        var found: Buf[TExpr] = buf()
-        val sink = &found
-
-        walk_stmts(f.body.stmts, expr_walk(false, (e) -> note_c_format(e, sink)))
-
-        if f.body.result.is_some() then
-            walk_texpr(f.body.result.unwrap(), expr_walk(false, (e) -> note_c_format(e, sink)))
-
-        for e in found.view()
-            *e.kind match
-                TFormat(_, spec, _) ->
-                    a.fault(func_home(a, f.name), e.span,
-                            s"'$spec' is applied by C's 'snprintf', and '${t.name}' has no C library " +
-                            "under it to supply one — only a number's specifier is rendered without " +
-                            "C. Render the value another way: a plain hole of a string needs no C" +
-                            grant)
-                _ -> ()
-    end for
-end check_c_formatting
-
-// The tail of every "no C library" refusal: how a manifest says the machine has one after all. A
-// call C answers is legal wherever the target's `libc` capability stands, and on a freestanding
-// target it stands only where the manifest grants it. Every such refusal asks `provides_libc`, never
-// whether the target is hosted.
-libc_grant_advice(t: Target) -> string =
-    s"; or, if '${t.name}' does have a C library under it (newlib under a Pico SDK build, " +
-    s"Zephyr, FreeRTOS), grant it in package.hocon: " +
-    s"'targets { ${t.name} { capabilities { libc = true } } }'"
-
-private note_c_format(e: TExpr, sink: *Buf[TExpr])
-    *e.kind match
-        TFormat(_, _, _) -> sink.push(e)
-        _ -> ()
 
 // Whether a function of the program defines `symbol` with an `@export`.
 private exported_here(p: TProgram, symbol: string) -> bool

@@ -548,9 +548,9 @@ format '%s' expects a string, but the value has type int
 
 `%d %i %x %X %o %u %b` want an integer, `%f %e %g %E %G` a float, and `%s` a string. An unsigned
 conversion reads the value at its own width — `%x` of an `i32 -1` is `ffffffff`, of a `u8 255` is
-`ff` — while `%d` keeps the value's sign; `%b` is binary, and `#` gives it a `0b`. A string is
-copied NUL-terminated so that C's `%s` can apply width and precision, which means an interior NUL
-ends the field there, as it does for any `%s`.
+`ff` — while `%d` keeps the value's sign; `%b` is binary, and `#` gives it a `0b`. Under `%s` a
+width and a precision count **bytes**, as C's do, and an interior NUL ends the field there, as it
+does for any `%s`.
 
 ```sysl
 val n: i8 = -6
@@ -562,32 +562,31 @@ print(f"[${n}%+05d] [${n}%x] [${n}%#o] [${255}%#b] [${42}%-6u]")
 [-0006] [fa] [0372] [0b11111111] [42    ]
 ```
 
-**A number's conversion is rendered by sysl itself**, flag for flag as C renders it — an integer by
-`sysl.fmt.format_int`, a float by [`format_real`](/library/fmt/#floats), whose digits are the exact
-value's, rounded half to even at whatever precision is asked — so it works the same on a target with
-no C library. A float specifier, a plain hole of a float and `str` of one all build for a bare board:
+```sysl
+val name = "zoë"
+val cut = 2
+
+print(f"[${name}%-6s] [${name}%6s] [${name}%.${cut}s] [${name}%-8.${cut}s]")
+```
+
+```output
+[zoë  ] [  zoë] [zo] [zo      ]
+```
+
+**Every conversion is rendered by sysl itself**, flag for flag as C renders it — an integer by
+`sysl.fmt.format_int`, a string by `sysl.fmt.format_str`, a float by
+[`format_real`](/library/fmt/#floats), whose digits are the exact value's, rounded half to even at
+whatever precision is asked — so a specifier works the same on a target with no C library. An
+integer, a string and a float specifier, a plain hole of a float and `str` of one all build for a
+bare board, with no `snprintf` for its link to find:
 
 ```sysl target=aarch64-freestanding build=c
 @export("probe")
-probe(x: real, y: f32) -> usize = f"${x}%.3f ${y}%e".bytes.len + s"$x".bytes.len
+probe(n: int, x: real, y: f32) -> usize
+    val s = if n > 0 then "up" else "down"
+
+    f"[${n}%-6d] [${s}%8s] ${x}%.3f ${y}%e".bytes.len + s"$x".bytes.len + str(y).bytes.len
 ```
-
-Only `%s` over a string is still applied by C's `snprintf`, so on a target without the
-[`libc`](/reference/packages/#capabilities) capability — a freestanding one whose manifest does not
-grant it — a reached one is refused where it is written:
-
-```sysl target=aarch64-freestanding build=c
-@export("probe")
-probe(s: string) -> usize = f"${s}%8s".bytes.len
-```
-
-```error
-'%8s' is applied by C's 'snprintf', and 'aarch64-freestanding' has no C library under it to supply one
-```
-
-The refusal ends by naming the way out where the board does have one: `targets { aarch64-freestanding
-{ capabilities { libc = true } } }` in `package.hocon`, after which the same block builds and leaves
-`snprintf` for the board's link to find. A plain hole of a string needs no C at all.
 
 **A width or a precision may be a hole of its own**, read when the line runs — C's `%*d` and `%.*f`,
 written where the digits would go. Flags stay as they are, and either count, or both, may be a hole:

@@ -412,6 +412,8 @@ private record_symbols(e: *Emit, p: TProgram)
 
         e.foreigns.push(x.name)
 
+        if x.abandons then e.abandoning.add(x.name)
+
         if x.variadic
             e.variadics.push(x.name)
             e.variadic_types.push((x.name, foreign_signature(e, x.ret_ty, x.params, true)))
@@ -422,6 +424,8 @@ private record_symbols(e: *Emit, p: TProgram)
         f.exported match
             Some(sym) -> e.export_symbols.push((f.name, sym))
             None -> ()
+
+        if f.marks.abandons then e.abandoning.add(f.name)
 
         // A sysl definition's tail is named the way a foreign one's is: a call to it names the whole
         // function type, since the argument list alone does not say where the declared parameters
@@ -539,16 +543,6 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         out.push(declared_sig(e,llvm_with_overflow("mul", false, w), ir_fn_type(both, overflow_params)))
         out.push(declared_sig(e,llvm_with_overflow("add", false, w), ir_fn_type(both, overflow_params)))
 
-    // C's own formatting, which a float and a specifier are rendered through. Its size argument is
-    // the machine's word rather than eight bytes, and it is open at the end.
-    if e.uses_snprintf
-        var pr_params: Buf[IrParam] = buf()
-
-        pr_params.push(ir_param(LPtr))
-        pr_params.push(ir_param(word_lty(e)))
-        pr_params.push(ir_param(LPtr))
-        out.push(declared_sig(e,"snprintf", IrFnType(l_i32(), pr_params, true, no_ir_attrs())))
-
     // The test dispatcher's one dependency, and the only thing in a test build that is not also in
     // an ordinary one. It is declared from the shape of the program rather than from a flag set
     // while emitting, because the entry point is emitted after this list is read.
@@ -610,8 +604,8 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     // a library lowered whole lands both, and the definition is the stronger statement to keep -- a
     // caller reaching the `extern` resolves to it exactly as the linker would have. **And an
     // `extern` may name something this module already declares for itself**: the library binds
-    // `snprintf` under its own name and a body that renders a float asks for the same symbol, which
-    // is one function and must be one line.
+    // `write` under its own name and a body that reports a bounds trap asks for the same symbol,
+    // which is one function and must be one line.
     //
     // **Only an export this module EMITS counts**: a supplier a prebuilt standard module already
     // compiled is in the program with its thunk in the artifact, so the symbol an `extern` names
@@ -634,8 +628,6 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     if defines_alloc_count(e)
         for s in alloc_count_symbols()
             seen.push(s)
-
-    if e.uses_snprintf then seen.push("snprintf")
 
     if p.entry_point && !p.tests.is_empty() then seen.push("strcmp")
 

@@ -180,10 +180,9 @@ exponent digits, and never a trailing zero or point. Reading any of them back is
 
 ## They are the f-string's renderer, so a bare target has them too
 
-An integer specifier is rendered by `sysl.fmt.format_int` and a float by `format_real`, both written
-in sysl, and `hex`, `binary` and `octal` only compose a specifier and call one. Nothing here asks for
-`snprintf`, so a freestanding image that reaches `hex` links with no C library symbol, as one that
-writes `f"$v%016x"` or `f"${x}%.3f"` does — the float renderer is integer arithmetic throughout, so it
-asks a machine with no double-precision unit for nothing it cannot do either. Only `%s` over a string
-still needs the C library, and is refused on a target without one — unless the manifest grants the
-target its [`libc`](/reference/packages/#capabilities), as a Pico SDK build's newlib does.
+An integer specifier is rendered by `sysl.fmt.format_int`, a string one by `format_str` and a float
+one by `format_real`, all written in sysl, and `hex`, `binary` and `octal` only compose a specifier
+and call one. Nothing here asks for `snprintf`, so a freestanding image that reaches `hex` links with
+no C library symbol, as one that writes `f"$v%016x"`, `f"${s}%-8s"` or `f"${x}%.3f"` does — the float
+renderer is integer arithmetic throughout, so it asks a machine with no double-precision unit for
+nothing it cannot do either. No specifier is refused for want of a C library.

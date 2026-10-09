@@ -1406,8 +1406,7 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written:
     val c = spec_conversion(spec)
 
     // A conversion says what kind of value it renders, and a value of another kind is a mistake in
-    // the specifier rather than something to convert: `%d` is applied by C's formatting, which
-    // reads whatever bytes the argument put in the slot.
+    // the specifier rather than something to convert: `%d` over a float would silently truncate it.
     val fits = if spec_is_int(c) then written_integer(ty)
     else if spec_is_float(c) then written_floating(ty)
     else ty == Str
@@ -1419,6 +1418,9 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written:
 
     if fits && spec_is_float(c) && library_key(cx, "format_real").is_some() then
         return float_format_call(cx, span, v, spec, counts)
+
+    if fits && spec_is_str(c) && library_key(cx, "format_str").is_some() then
+        return library_format_call(cx, span, "format_str", one_arg(v), spec, counts)
 
     if fits then return TExpr(span, TFormat(v, spec, counts))
 
@@ -1450,25 +1452,12 @@ private int_format_call(cx: &Analyzer, span: Span, v: TExpr, ty: Type, spec: str
     val decimal = last == u8('d') || last == u8('i')
     val written = if unsigned && bits == 128 && decimal then spec[0..<spec.bytes.len - 1] + "u" else spec
 
-    val stars = spec_star_slots(spec)
-    var next: usize = 0
-    var args: Buf[TExpr] = buf()
+    var lead: Buf[TExpr] = buf()
 
-    args.push(TExpr(span, TCast(v, Integer(128, true, false))))
-    args.push(TExpr(span, TIntLit(from_int(long(bits)), int_type())))
-    args.push(TExpr(span, TStrLit(written)))
+    lead.push(TExpr(span, TCast(v, Integer(128, true, false))))
+    lead.push(TExpr(span, TIntLit(from_int(long(bits)), int_type())))
 
-    if stars.0
-        args.push(counts.at(next))
-        next += 1
-    else
-        args.push(TExpr(span, TIntLit(from_int(0), int_type())))
-    end if
-
-    if stars.1 then args.push(counts.at(next))
-    else args.push(TExpr(span, TIntLit(from_int(-1), int_type())))
-
-    library_result_call_of(cx, span, "format_int", args)
+    library_format_call(cx, span, "format_int", lead, written, counts)
 end int_format_call
 
 // **A float is rendered by the library's `format_real` or `format_f32`, never by C's `snprintf`** --
@@ -1484,11 +1473,24 @@ private float_format_call(cx: &Analyzer, span: Span, v: TExpr, spec: string,
         _ -> false
 
     val to = if single then Floating(32, false) else real_type()
+    val value = if type_eq(ty, to) then v else TExpr(span, TCast(v, to))
+
+    library_format_call(cx, span, if single then "format_f32" else "format_real", one_arg(value), spec,
+                        counts)
+end float_format_call
+
+// **Every specifier lowers to one call of a library renderer** -- `format_int`, `format_str`,
+// `format_real` or `format_f32` -- taking the value (and, for an integer, its width) ahead of the
+// specifier as written and its two counts. A count written as `*` is the hole read beside the value;
+// one not written is `0` for the width and `-1` for the precision, which is how a renderer tells an
+// absent field from an empty one. So `${s}%-6s`, `${n}%08x` and `${x}%.3f` mean the same on a target
+// with no C library as on a hosted one.
+private library_format_call(cx: &Analyzer, span: Span, renderer: string, lead: Buf[TExpr], spec: string,
+                            counts: Buf[TExpr]) -> TExpr
     val stars = spec_star_slots(spec)
     var next: usize = 0
-    var args: Buf[TExpr] = buf()
+    var args = lead
 
-    args.push(if type_eq(ty, to) then v else TExpr(span, TCast(v, to)))
     args.push(TExpr(span, TStrLit(spec)))
 
     if stars.0
@@ -1501,8 +1503,16 @@ private float_format_call(cx: &Analyzer, span: Span, v: TExpr, spec: string,
     if stars.1 then args.push(counts.at(next))
     else args.push(TExpr(span, TIntLit(from_int(-1), int_type())))
 
-    library_result_call_of(cx, span, if single then "format_f32" else "format_real", args)
-end float_format_call
+    library_result_call_of(cx, span, renderer, args)
+end library_format_call
+
+// One argument, as the list a renderer's call starts from.
+private one_arg(v: TExpr) -> Buf[TExpr]
+    var out: Buf[TExpr] = buf()
+
+    out.push(v)
+    out
+end one_arg
 
 // Whether a value of `t` is a float of any width.
 private float_valued(t: Type) -> bool = underlying(t) match
