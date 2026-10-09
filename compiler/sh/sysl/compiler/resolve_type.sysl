@@ -6,7 +6,7 @@ import sysl.math.bigint.{BigInt, from_int, to_string, mul as big_mul, pow as big
                          negate as big_negate}
 import sysl.math.decimal.{Decimal, of as decimal_of, parse as decimal_parse}
 import sysl.text.parse_real
-import sysl.text.Search
+import sysl.text.{join, Search}
 
 // A written type, resolved to the type it means.
 //
@@ -1201,11 +1201,33 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
         return Some(ConstArg(folded.unwrap(), ty, names_stand_in(e, subst)))
     end if
 
-    val tag = variant_tag(e, ty)
+    val tag = variant_tag(a, scope, e, ty)
 
     if tag.is_some() then return Some(ConstArg(from_int(long(tag.unwrap())), ty, false))
 
     if awaits_instantiation(a, scope, e, subst) then return Some(ConstArg(from_int(0), ty, true))
+
+    // A parameter whose declared type no value parameter may have was refused at the declaration,
+    // and that is the one mistake: its arguments stand at zero, as a refused argument's do.
+    if value_type_refusal(nameless(ty)).is_some() then return Some(ConstArg(from_int(0), ty, true))
+
+    // A simple enum's parameter takes one of ITS variants; any other name -- another enum's
+    // variant, qualified or bare, or a word naming nothing -- is refused with the list it chooses from.
+    ty match
+        Enum(d) ->
+            val named = variant_named(e)
+
+            if d.simple && named.is_some() && lookup_type_key(a, scope, named.unwrap().1).is_none()
+                var names: Buf[string] = buf()
+
+                for v in d.variants do names.push(v.name)
+
+                a.fault(scope, span, s"'${expr_text(e)}' is not a variant of ${type_show(ty)} — $what " +
+                        s"stands where the declaration wrote 'const' of that enum, so it is one of " +
+                        join(names.view(), ", "))
+                return None
+            end if
+        _ -> ()
 
     // A name that turns out to be a TYPE is the likely mistake in this position, and gets its own
     // sentence: `Buf[int]` reads as a list of types until the declaration says otherwise.
@@ -1222,6 +1244,11 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
     a.fault(scope, span, "a value argument must be a constant — a literal, or a 'const' naming one")
     None
 end value_arg
+
+// A value argument written as an expression -- `f[High]()` on a generic function -- at the simple
+// enum its parameter was declared as.
+enum_value_arg(a: &Analysis, scope: Scope, span: Span, e: Expr, ty: Type, subst: Buf[Binding]) -> Type =
+    value_arg(a, scope, span, type_ref(e.span, ValueArgType(e)), ty, subst).unwrap_or(Unknown)
 
 // A value parameter's default, read as the argument it stands in for -- at the type the declaration
 // wrote for the parameter, under the arguments already fixed to its left.
@@ -1250,20 +1277,54 @@ end const_arg_value
 // The tag a **simple enum's variant** stands for, where the value parameter's declared type is that
 // enum. A simple enum's value IS its identity -- nothing else tells two of its variants apart -- so
 // its tag is exactly the number a type's identity wants; a data enum's is not, and gets no case.
-private variant_tag(e: Expr, ty: Type) -> Option[int]
-    val n = *e.kind match
-        Ident(n) -> n
-        _ -> return None
+//
+// The variant may be bare -- the parameter's type says which enum, as an expected type does for an
+// ordinary value -- or qualified with the enum's own name; a qualifier naming any other type is no
+// variant of this one.
+private variant_tag(a: &Analysis, scope: Scope, e: Expr, ty: Type) -> Option[int]
+    val named = variant_named(e)
+
+    if named.is_none() then return None
+
+    val (qualifier, n) = named.unwrap()
 
     ty match
         Enum(d) ->
             if !d.simple then return None
+
+            if qualifier.is_some()
+                lookup_type_key(a, scope, qualifier.unwrap()) match
+                    Some(k) -> if k != d.base then return None
+                    None -> return None
+            end if
 
             val v = d.variant(n)
 
             if v.is_some() then Some(v.unwrap().tag) else None
         _ -> None
 end variant_tag
+
+// A value argument shaped like a variant: `High`, `Level.High` (a type argument's dotted name, one
+// string) or the same written as a field of a name. The enum's name, where one was written, and the
+// variant's.
+private variant_named(e: Expr) -> Option[(Option[string], string)] =
+    *e.kind match
+        Ident(n) ->
+            n.last_index_of(".") match
+                Some(i) -> Some((Some(n[0..<i]), n[i + 1..<n.bytes.len]))
+                None -> Some((None, n))
+        Field(r, n, _) ->
+            *r.kind match
+                Ident(q) -> Some((Some(q), n))
+                _ -> None
+        _ -> None
+
+// The words a variant-shaped argument was written as, for a refusal to quote.
+private expr_text(e: Expr) -> string =
+    variant_named(e) match
+        Some((Some(q), n)) -> s"$q.$n"
+        Some((None, n)) -> n
+        None -> "this argument"
 
 // A nominal declaration's type parameters and the ones of them it wrote a `const` type for.
 private declared_values(a: &Analysis, key: string) -> (Buf[string], Buf[TypeBinding]) =

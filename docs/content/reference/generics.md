@@ -1239,6 +1239,72 @@ print(b.room())
 1
 ```
 
+A **simple enum** — one whose variants carry nothing — gives a parameter that takes one of its
+variants. The parameter's declared type says which enum, so the variant is written bare, exactly as
+it is where an expected type names the enum; `Level.High` names the same value:
+
+```sysl
+enum Level
+    Low
+    High
+
+struct Gauge[const L: Level = Low]
+    reading: int
+
+    alarm(self) -> bool = L == High
+
+var quiet: Gauge = Gauge(3)
+var loud: Gauge[High] = Gauge(9)
+var same: Gauge[Level.High] = loud
+
+print(quiet.alarm(), loud.alarm(), same.reading)
+```
+
+```output
+false true 9
+```
+
+`Gauge[Low]` and `Gauge[High]` are two types, and the default makes a bare `Gauge` the first.
+A variant of any other enum is not a value of this one, bare or qualified:
+
+```sysl
+enum Level
+    Low
+    High
+
+enum Tide
+    Low
+    Slack
+
+struct Gauge[const L: Level]
+    reading: int
+
+var g: Gauge[Slack] = Gauge(1)
+print(g.reading)
+```
+
+```error
+'Slack' is not a variant of Level
+```
+
+An enum whose variants carry values cannot be a value parameter's type — its value is more than the
+tag a symbol can spell — and neither can a float or a string:
+
+```sysl
+enum Shape
+    Dot
+    Circle(r: int)
+
+struct Holder[const S: Shape]
+    n: int
+
+print(1)
+```
+
+```error
+'S' is a value parameter, and Shape cannot be the type of one
+```
+
 Floats are excluded: `NaN != NaN` under the ordinary comparison, which would make a type unequal to
 itself. Strings are excluded until two spellings of one text are one value.
 
