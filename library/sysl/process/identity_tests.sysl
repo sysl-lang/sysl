@@ -1,0 +1,95 @@
+module sysl.process
+@requires(posix)
+@tests
+
+import sysl.fs.{IoError, make_temp_dir, metadata, remove_dir_all, set_owner, write_text}
+import sysl.testing.skip
+
+// Who the program is, over `sysl.process.sys`'s `get_id` and `set_id` hooks as `sysl.process.hosted`
+// answers them, checked against what the filesystem says of a file the program made and against
+// `id`, the system's own answer. The refusals are the unprivileged ones, so the suite skips them when
+// it is run as user 0.
+
+private id_of(flag: string) -> u32
+    val out = capture("id", [flag]).unwrap()
+
+    assert(out.status.ok(), s"id $flag failed")
+
+    var n: u32 = 0
+
+    for b in out.text.bytes
+        if b >= u8('0') && b <= u8('9') then n = n * 10 + u32(b - u8('0'))
+
+    n
+end id_of
+
+@test("user and group are the effective ids the system reports, and the real ones match them")
+id_answers_what_id_says()
+    assert_eq(user(), id_of("-u"))
+    assert_eq(group(), id_of("-g"))
+    assert_eq(real_user(), id_of("-ru"))
+    assert_eq(real_group(), id_of("-rg"))
+
+@test("a file the program made is its own: Meta.owner == user()")
+id_owns_what_it_makes()
+    val dir = make_temp_dir("sysl-proc-id").unwrap()
+    val path = s"$dir/mine"
+
+    write_text(path, "x").unwrap()
+
+    val m = metadata(path).unwrap()
+
+    assert(m.owner == user(), s"owner ${m.owner}, user ${user()}")
+
+    // And it may be given to the owner it has, which is the one change nobody needs privilege for.
+    set_owner(path, user(), m.group).unwrap()
+    assert_eq(metadata(path).unwrap().owner, user())
+
+    remove_dir_all(dir)
+end id_owns_what_it_makes
+
+@test("a file given to root by a program that is not root is refused with NotPermitted")
+id_chown_to_root_is_refused()
+    if user() == 0 then skip("run as root, so giving a file away is allowed")
+
+    val dir = make_temp_dir("sysl-proc-id").unwrap()
+    val path = s"$dir/mine"
+
+    write_text(path, "x").unwrap()
+
+    val refused = set_owner(path, 0, metadata(path).unwrap().group)
+
+    assert_eq(metadata(path).unwrap().owner, user())
+    remove_dir_all(dir)
+
+    refused match
+        Ok(_) -> assert(false, "a file was given to root")
+        Err(e) -> assert_eq(e, IoError.NotPermitted)
+end id_chown_to_root_is_refused
+
+@test("set_user and set_group to the ids the program already has succeed and change nothing")
+id_set_to_itself()
+    val u = user()
+    val g = group()
+
+    set_group(g).unwrap()
+    set_user(u).unwrap()
+
+    assert_eq(user(), u)
+    assert_eq(group(), g)
+
+@test("set_user and set_group to root from a program that is not root are refused with NotPermitted")
+id_set_to_root_is_refused()
+    if user() == 0 then skip("run as root, so becoming root is allowed")
+
+    set_user(0) match
+        Ok(_) -> assert(false, "the program became root")
+        Err(e) -> assert_eq(e, IoError.NotPermitted)
+
+    if real_group() != 0
+        set_group(0) match
+            Ok(_) -> assert(false, "the program joined group 0")
+            Err(e) -> assert_eq(e, IoError.NotPermitted)
+
+    assert(user() != 0, "the refusal changed the user anyway")
+end id_set_to_root_is_refused
