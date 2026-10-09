@@ -1,0 +1,387 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.{Stdio, capture}
+import sysl.text.Search
+import sysl.testing.skip
+
+// **Process groups and the terminal over `sysl.process.sys`.**
+//
+// `sysl.process` starts a child in a group through the `sysl_proc_spawn` hook's `pgid` and
+// `foreground`, and asks and sets the terminal's foreground group and its own group through
+// `sysl_proc_tcgetpgrp`, `sysl_proc_tcsetpgrp` and `sysl_proc_getpgrp`. On a hosted POSIX target the
+// library's `sysl.process.hosted` answers them under `weak` exports; on a freestanding one the program
+// answers each it reaches, and one left unanswered is refused by name (`emit_checks.sysl`'s
+// `check_library_hooks`, the `sysl.process.sys` row). What the hosted answers do without a terminal is
+// `library/sysl/process/group_tests.sysl`'s; what they do WITH one is the last test here, which runs a
+// program under a terminal of its own (`script`), since the test runner has none.
+
+private val pgr_target: string = "aarch64-freestanding"
+private val pgr_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private val pgr_script: string =
+    "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+private val pgr_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n" +
+    s"targets {\n  $pgr_target {\n    linker_script = \"link.ld\"\n    entry = \"kstart\"\n  }\n}\n"
+
+// A shell's job: a child in a group of its own, given the terminal as it starts, waited for, and the
+// terminal taken back.
+private val pgr_program: string = raw"""
+    import sysl.process.{Group, foreground_group, process_group, set_foreground_group, spawn}
+    import sysl.process.sys.Text
+
+    go() -> int
+        val me = process_group()
+        var n = 0
+
+        spawn("/bin/spin", group = Group.New, foreground = true) match
+            Ok(job) ->
+                if job.wait().is_ok() then n += 1
+            Err(_) -> return 1
+
+        if set_foreground_group(me).is_ok() then n += 2
+        if foreground_group() == Ok(me) then n += 4
+
+        n
+    end go
+    """
+
+// The image's start, its heap, the memory functions LLVM calls with no C library, `putchar`, `exit`,
+// and the `sysl.fs.sys` hooks the module's files reach.
+private val pgr_runtime: string = raw"""
+    @export("kstart")
+    kstart() -> never
+        val n = go()
+
+        loop
+            ()
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = ptr_cast(usize(0x4100_0000))
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+
+    @export("memset")
+    mem_set(dst: *u8, c: int, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = u8(c)
+
+        dst
+
+    @export("memcpy")
+    mem_copy(dst: *u8, src: *u8, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = src[i]
+
+        dst
+
+    @export("memmove")
+    mem_move(dst: *u8, src: *u8, n: usize) -> *u8 = mem_copy(dst, src, n)
+
+    @export("memcmp")
+    mem_compare(a: *u8, b: *u8, n: usize) -> int = 0
+
+    @export("putchar")
+    k_putchar(c: int) -> int = c
+
+    @export("exit")
+    k_exit(code: int) -> never
+        loop
+            ()
+
+    @export("sysl_fs_open")
+    k_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int = -38
+
+    @export("sysl_fs_read")
+    k_read(fd: int, into: *u8, room: usize, got: *usize) -> int = -38
+
+    @export("sysl_fs_write")
+    k_write(fd: int, from: *u8, len: usize, put: *usize) -> int = -38
+
+    @export("sysl_fs_close")
+    k_close(fd: int) -> int = 0
+
+    @export("sysl_fs_seek")
+    k_seek(fd: int, offset: long, whence: int, at: *long) -> int = -29
+
+    @export("sysl_fs_unlink")
+    k_unlink(path: *u8, len: usize) -> int = -38
+    """
+
+// The hooks a job reaches that were there before groups: a spawn taking the group and the terminal
+// as a kernel's spawn call with a group flag would, a wait and a kill.
+private val pgr_spawn_hooks: string = raw"""
+    @export("sysl_proc_spawn")
+    k_spawn(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, envc: usize,
+            inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int,
+            stderr_fd: int, started: *i64, pgid: i64, foreground: int) -> i64 = 7
+
+    @export("sysl_proc_wait")
+    k_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int = 0
+
+    @export("sysl_proc_kill")
+    k_kill(pid: i64, signal: int) -> int = 0
+    """
+
+// The three hooks process groups added, answered as a console that keeps one foreground group.
+private val pgr_group_hooks: string = raw"""
+    @export("sysl_proc_getpgrp")
+    k_getpgrp() -> i64 = 1
+
+    @export("sysl_proc_tcgetpgrp")
+    k_tcgetpgrp() -> i64 = 1
+
+    @export("sysl_proc_tcsetpgrp")
+    k_tcsetpgrp(pgid: i64) -> int = 0
+    """
+
+private pgr_tree(program: string) -> string
+    var files = lbr_two("main.sysl", program, "package.hocon", pgr_manifest)
+
+    files.push(("link.ld", pgr_script))
+    lbr_tree(files)
+end pgr_tree
+
+private pgr_build(p: string) -> ((int, string), string)
+    val out = lbr_temp("sysl-pgr-elf")
+
+    (lbr_cli(["sysl", "build", "--target", pgr_target, "-o", s"$out/img.elf", p]), out)
+end pgr_build
+
+private pgr_symbols(elf: string, undefined: bool) -> string
+    val ran = if undefined then capture(pgr_nm, ["-u", elf], "", [], true)
+    else capture(pgr_nm, [elf], "", [], true)
+
+    ran match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+end pgr_symbols
+
+// Whether an `llvm-nm` listing names `symbol`, as the last word of one of its lines.
+private pgr_names(listing: string, symbol: string) -> bool
+    for line in lines_of(listing)
+        if line == symbol || line.ends_with(s" $symbol") then return true
+
+    false
+end pgr_names
+
+private pgr_link_ready() -> bool
+    if !lbr_ready() then return false
+
+    val lld = capture("ld.lld", ["--version"], "", [], true) match
+        Ok(o) -> o.status.ok()
+        Err(_) -> false
+
+    if !lld then skip("ld.lld is not installed, so no image can be linked")
+    if !is_file(pgr_nm) then skip(s"there is no llvm-nm at $pgr_nm to read the image")
+
+    true
+end pgr_link_ready
+
+@test("a freestanding job links with its own spawn, wait, kill and three group hooks, nothing hosted")
+pgr_answered_group_hooks_link()
+    if !pgr_link_ready() then return
+
+    val p = pgr_tree(pgr_program + pgr_runtime + pgr_spawn_hooks + pgr_group_hooks)
+    val (said, out) = pgr_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = pgr_symbols(elf, false)
+
+    assert_eq(pgr_symbols(elf, true).trim(), "")
+
+    for hook in ["sysl_proc_spawn", "sysl_proc_wait", "sysl_proc_kill", "sysl_proc_getpgrp",
+                 "sysl_proc_tcgetpgrp", "sysl_proc_tcsetpgrp"]
+        assert(all.contains(s" T $hook"), all)
+
+    for name in ["getpgrp", "tcgetpgrp", "tcsetpgrp", "setpgid", "posix_spawn", "fork",
+                 "sysl_proc_posix_start", "sysl_proc_posix_tcgetpgrp", "sysl_proc_posix_tcsetpgrp"]
+        assert(!pgr_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end pgr_answered_group_hooks_link
+
+@test("a freestanding job with no process hooks is refused, naming the three group hooks with the rest")
+pgr_unanswered_group_hooks_are_refused()
+    if !lbr_ready() then return
+
+    val p = pgr_tree(pgr_program + pgr_runtime)
+    val (said, out) = pgr_build(p)
+
+    assert(said.0 != 0, "built with every process hook unanswered")
+    assert(said.1.contains(s"error: this program reaches 'sysl.process', and '$pgr_target' " +
+        "has no operating system under it for the standard library to answer a process or a user with, " +
+        "so the program answers it: define 'sysl_proc_getpgrp', 'sysl_proc_kill', 'sysl_proc_spawn', " +
+        "'sysl_proc_tcgetpgrp', 'sysl_proc_tcsetpgrp', 'sysl_proc_wait' with '@export'"), said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end pgr_unanswered_group_hooks_are_refused
+
+@test("a freestanding program answering every hook but the group ones is refused for those three alone")
+pgr_only_the_group_hooks_missing()
+    if !lbr_ready() then return
+
+    val p = pgr_tree(pgr_program + pgr_runtime + pgr_spawn_hooks)
+    val (said, out) = pgr_build(p)
+
+    assert(said.0 != 0, "built with the group hooks unanswered")
+    assert(said.1.contains("so the program answers it: define 'sysl_proc_getpgrp', " +
+                           "'sysl_proc_tcgetpgrp', 'sysl_proc_tcsetpgrp' with '@export'"), said.1)
+
+    lbr_drop([p, out])
+end pgr_only_the_group_hooks_missing
+
+// **Reachability decides**: a program that starts children but never asks about groups or the
+// terminal reaches none of the three, so a kernel that has no groups is not made to answer them.
+@test("a freestanding program that never asks about groups is not asked to answer their hooks")
+pgr_group_hooks_only_where_reached()
+    if !pgr_link_ready() then return
+
+    val plain = raw"""
+        import sysl.process.spawn
+        import sysl.process.sys.Text
+
+        go() -> int
+            spawn("/bin/true") match
+                Ok(job) -> if job.wait().is_ok() then 0 else 1
+                Err(_) -> 2
+        """
+    val p = pgr_tree(plain + pgr_runtime + pgr_spawn_hooks)
+    val (said, out) = pgr_build(p)
+
+    assert(said.0 == 0, said.1)
+    assert_eq(pgr_symbols(s"$out/img.elf", true).trim(), "")
+
+    lbr_drop([p, out])
+end pgr_group_hooks_only_where_reached
+
+@test("on a hosted target the library answers the three group hooks under weak exports, over C")
+pgr_hosted_group_hooks_are_weak()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.process.{Group, foreground_group, process_group, set_foreground_group, spawn}
+
+        print(process_group())
+        print(foreground_group().is_ok())
+        print(set_foreground_group(1).is_ok())
+        print(spawn("true", group = Group.New, foreground = true).is_ok())
+        """)
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
+
+    lbr_drop([p])
+    assert(said.0 == 0, said.1)
+
+    for hook in ["sysl_proc_getpgrp", "sysl_proc_tcgetpgrp", "sysl_proc_tcsetpgrp", "sysl_proc_spawn"]
+        var defined = ""
+
+        for line in lines_of(said.1)
+            if line.starts_with("define ") && line.contains(s" @$hook(") then defined = line
+
+        assert(defined.starts_with("define weak "), s"$hook: $defined")
+
+    for shim in ["@getpgrp(", "@sysl_proc_posix_tcgetpgrp(", "@sysl_proc_posix_tcsetpgrp("]
+        assert(said.1.contains(shim), s"the hosted answer does not call $shim")
+end pgr_hosted_group_hooks_are_weak
+
+// The program the terminal test runs: a job given the terminal reports, through `ps`, its group and
+// the terminal's foreground group from inside itself; a job NOT given it reports the same two, which
+// is the control; then the terminal is taken back.
+private val pgr_job: string = raw"""
+    import sysl.process.{Group, foreground_group, process_group, set_foreground_group, spawn}
+
+    val me = process_group()
+    val ask = "echo $1 $(ps -o pgid= -o tpgid= -p $$)"
+
+    print(s"start ${foreground_group() == Ok(me)}")
+
+    val job = spawn("sh", ["-c", ask, "sh", "given"], group = Group.New, foreground = true).unwrap()
+
+    job.wait().unwrap()
+    print(s"back ${set_foreground_group(me).is_ok()} ${foreground_group() == Ok(me)}")
+
+    val plain = spawn("sh", ["-c", ask, "sh", "plain"], group = Group.New).unwrap()
+
+    plain.wait().unwrap()
+    print(s"still ${foreground_group() == Ok(me)}")
+    """
+
+// The two numbers after `word` on a line of `text`, as written.
+private pgr_pair(text: string, word: string) -> (string, string)
+    for line in lines_of(text)
+        val at = line.index_of(s"$word ")
+
+        if at.is_none() then continue
+
+        var parts: Buf[string] = buf()
+        var lo = at.unwrap() + word.bytes.len
+        var i = lo
+
+        while i <= line.bytes.len
+            val digit = i < line.bytes.len && line.bytes[i] >= u8('0') && line.bytes[i] <= u8('9')
+
+            if !digit
+                if i > lo then parts.push(line[lo..<i])
+
+                lo = i + 1
+            end if
+
+            i += 1
+        end while
+
+        if parts.len() == 2 then return (parts.at(0), parts.at(1))
+    end for
+
+    ("", "")
+end pgr_pair
+
+@test("under a terminal, a foreground job is the terminal's foreground group from inside itself")
+pgr_foreground_under_a_terminal()
+    if !lbr_ready() then return
+    if !is_file("/usr/bin/script") then skip("there is no script(1) to give the program a terminal")
+
+    val p = lbr_program(pgr_job)
+    val out = lbr_temp("sysl-pgr-job")
+    val exe = s"$out/job"
+    val built = lbr_cli(["sysl", "build", "-o", exe, p])
+
+    assert(built.0 == 0, built.1)
+
+    val uname = capture("uname").unwrap().text.trim()
+    // script(1) sets its own terminal up from its standard input's, which has to be a file or a
+    // terminal: under a test runner whose input is a socket it refuses (`tcgetattr`).
+    val quiet = Stdio.FromPath("/dev/null")
+    val ran = if uname == "Darwin" then capture("/usr/bin/script", ["-q", "/dev/null", exe], timeout = 30000,
+                                                stdin = quiet).unwrap()
+    else capture("/usr/bin/script", ["-q", "-e", "-c", exe, "/dev/null"], timeout = 30000, stdin = quiet).unwrap()
+    val text = ran.text
+
+    lbr_drop([p, out])
+    assert(ran.status.ok(), s"${ran.status}: $text")
+    assert(text.contains("start true"), text)
+
+    val (gpgid, gfore) = pgr_pair(text, "given")
+
+    assert(gpgid.len > 0 && gpgid == gfore, text)
+    assert(text.contains("back true true"), text)
+
+    // The control: started in a group of its own but not given the terminal, the job sees this
+    // program's group in the foreground -- so the test above can tell the two apart.
+    val (ppgid, pfore) = pgr_pair(text, "plain")
+
+    assert(ppgid.len > 0 && pfore.len > 0 && ppgid != pfore, text)
+    assert(text.contains("still true"), text)
+end pgr_foreground_under_a_terminal

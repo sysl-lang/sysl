@@ -2,8 +2,9 @@ module sysl.process.sys
 
 // The calls `sysl.process` makes of whatever starts programs underneath it: start one, wait for it,
 // send it a signal, become one in place of this program, name a file nothing else holds for a captured
-// stream to go into, make a pipe for one child's output to be another's input, and say -- or change --
-// which user and group the program runs as.
+// stream to go into, make a pipe for one child's output to be another's input, say -- or change --
+// which user and group the program runs as, and say which process group it is in and which group its
+// terminal is giving its keys to.
 //
 // **Each is an `extern` naming a symbol no module here defines**, so what answers it is decided by
 // what the program is linked with (`reference/ffi.md § A module may supply another module's extern`),
@@ -72,11 +73,25 @@ const ended_timed_out: int = 2
  *
  * `started` is written with the moment the child was started on whatever clock the supplier keeps,
  * for `wait` to measure a timeout from; a supplier that keeps none writes zero.
+ *
+ * `pgid` is the process group the child is started in: `group_inherit` (-1) leaves it in this
+ * program's, `group_new` (0) makes it the leader of a group of its own, numbered by its pid, and a
+ * number above zero joins that existing group. `foreground` 1 makes the child's group the controlling
+ * terminal's foreground group **before the child's program runs**, so that a key typed as it starts
+ * reaches the child rather than this program; it is only ever asked with a `pgid` that is not
+ * `group_inherit`. A supplier with no terminal to give answers the failure, and starts nothing.
  */
 private[sysl] extern "sysl_proc_spawn" spawn(path: *u8, path_len: usize, argv: *Text, argc: usize,
                                              envp: *Text, envc: usize, inherit_env: int, dir: *u8,
                                              dir_len: usize, stdin_fd: int, stdout_fd: int,
-                                             stderr_fd: int, started: *i64) -> i64
+                                             stderr_fd: int, started: *i64, pgid: i64,
+                                             foreground: int) -> i64
+
+/** What `spawn` is handed as `pgid` to leave the child in this program's process group. */
+const group_inherit: i64 = -1
+
+/** What `spawn` is handed as `pgid` to make the child the leader of a new group, numbered by its pid. */
+const group_new: i64 = 0
 
 /** Waits for the child `pid` to end and reaps it, writing how it ended into `how` (one of the
  * `ended_` constants) and `value`, and answering zero or the failure's code, negated.
@@ -153,3 +168,22 @@ private[sysl] extern "sysl_proc_set_id" set_id(which: int, id: u32) -> int
  */
 private[sysl] extern "sysl_proc_exec" exec(path: *u8, path_len: usize, argv: *Text, argc: usize,
                                            envp: *Text, envc: usize, inherit_env: int) -> int
+
+/** The process group this program is in: its number, which is above zero, or the failure's code
+ * negated. It is POSIX's `getpgrp`, which cannot fail; a target with no process groups answers
+ * `UNSUPPORTED`.
+ */
+private[sysl] extern "sysl_proc_getpgrp" getpgrp() -> i64
+
+/** The foreground process group of the program's **controlling terminal** -- the terminal its session
+ * belongs to, whatever its standard streams have been pointed at -- or the failure's code negated. A
+ * program with no controlling terminal answers that failure (`ENXIO`, 6, on a POSIX host).
+ */
+private[sysl] extern "sysl_proc_tcgetpgrp" tcgetpgrp() -> i64
+
+/** The controlling terminal's foreground group made `pgid`, answering zero or the failure's code
+ * negated. **It succeeds from a background group too**: a supplier holds back the stop signal a
+ * background process's `tcsetpgrp` would otherwise earn (`SIGTTOU`), as a shell does when it takes the
+ * terminal back after a job.
+ */
+private[sysl] extern "sysl_proc_tcsetpgrp" tcsetpgrp(pgid: i64) -> int

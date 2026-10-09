@@ -1,0 +1,179 @@
+module sysl.process
+@requires(posix)
+@tests
+
+import sysl.fs.{IoError, exists, make_temp_dir, remove_dir_all}
+import sysl.text.Search
+import sysl.testing.skip
+
+// Process groups and the terminal, asserted against what the kernel says: `ps` run by a shell the
+// test started reports the shell's own pid, group and terminal, so a group is checked where it lives
+// rather than in this module's bookkeeping.
+//
+// The test runner has no controlling terminal, so here the terminal is only ever refused. That a
+// child's group really is the terminal's foreground from its first instruction is
+// `compiler/sh/sysl/compiler/tests_pgr_process_groups.sysl`'s, which runs a program under a terminal of
+// its own.
+
+// What `sh -c "ps ..."` printed about itself, as numbers: the shell's pid and its process group.
+private gr_ids(text: string) -> (int, int)
+    var found: [2]int = [0, 0]
+    var count = 0
+    var n = 0
+    var inside = false
+
+    for b in text.bytes
+        if b >= u8('0') && b <= u8('9')
+            n = n * 10 + int(b - u8('0'))
+            inside = true
+        elif inside
+            assert(count < 2, s"ps printed '$text'")
+            found[count] = n
+            count += 1
+            n = 0
+            inside = false
+        end if
+
+    assert(count == 2 && !inside, s"ps printed '$text'")
+    (found[0], found[1])
+end gr_ids
+
+// The shell's pid and group, asked of `ps` by the shell itself.
+private gr_ask(group: Group) -> (int, int)
+    val out = capture("sh", ["-c", "ps -o pid= -o pgid= -p $$"], group = group).unwrap()
+
+    assert(out.status.ok(), s"ps failed: ${out.text}")
+    gr_ids(out.text)
+end gr_ask
+
+// A scratch file a child would create if it ran, and the directory to drop.
+private gr_marker() -> (string, string)
+    val d = make_temp_dir("sysl-proc-groups").unwrap()
+
+    (d, s"$d/ran")
+end gr_marker
+
+// ## Which group a child starts in
+
+@test("a child started in a new group leads it: its pgid is its pid, and not this program's group")
+new_group_is_led_by_the_child()
+    val (pid, pgid) = gr_ask(Group.New)
+
+    assert_eq(pgid, pid)
+    assert(pgid != process_group(), "the child is still in this program's group")
+
+@test("a child left where it is shares this program's group, and says so")
+inherit_shares_the_group()
+    val (pid, pgid) = gr_ask(Group.Inherit)
+
+    assert(pid != pgid, "the shell leads a group it was never asked to")
+    assert_eq(pgid, process_group())
+
+    val s = spawn("true").unwrap()
+
+    assert_eq(s.group(), process_group())
+    s.wait().unwrap()
+
+@test("a child joins the group another child leads, and both handles name it")
+join_lands_in_the_group()
+    val leader = spawn("sleep", ["5"], group = Group.New).unwrap()
+    val g = leader.group()
+
+    assert(g > 0 && g != process_group(), s"a new group numbered $g")
+
+    val out = capture("sh", ["-c", "ps -o pid= -o pgid= -p $$"], group = Group.Join(g)).unwrap()
+    val (pid, pgid) = gr_ids(out.text)
+
+    assert_eq(pgid, g)
+    assert(pid != g, "the joining shell is not the leader")
+
+    val c = start("true", group = Group.Join(g)).unwrap()
+
+    assert_eq(c.group(), g)
+    c.wait().unwrap()
+
+    leader.kill(9).unwrap()
+    assert_eq(leader.wait().unwrap(), Status.Signalled(9))
+end join_lands_in_the_group
+
+@test("Child.group answers the new group's number, which is the child's own pid")
+child_group_is_its_pid()
+    val c = start("sh", ["-c", "ps -o pid= -o pgid= -p $$"], group = Group.New).unwrap()
+    val g = c.group()
+    val (pid, pgid) = gr_ids(c.wait().unwrap().text)
+
+    assert_eq(g, pid)
+    assert_eq(g, pgid)
+
+@test("joining a group that is no longer there is NotPermitted, and starts nothing")
+join_a_gone_group()
+    val s = spawn("true", group = Group.New).unwrap()
+    val g = s.group()
+
+    s.wait().unwrap()
+
+    val (d, marker) = gr_marker()
+    val r = run("sh", ["-c", s"touch $marker"], group = Group.Join(g))
+
+    assert_eq(r, Err(IoError.NotPermitted))
+    assert(!exists(marker), "the child ran")
+    remove_dir_all(d).unwrap()
+
+@test("a group named by a number that is not above zero is refused before anything starts")
+join_names_a_group()
+    for bad in [0, -1, -4242]
+        assert_eq(run("true", group = Group.Join(bad)), Err(IoError.Other(22)))
+        assert(spawn("true", group = Group.Join(bad)).is_err(), s"Join($bad) started a child")
+        assert(start("true", group = Group.Join(bad)).is_err(), s"Join($bad) started a child")
+
+// ## The terminal
+
+@test("foreground with the child left in this program's group is refused before anything starts")
+foreground_needs_a_group()
+    val (d, marker) = gr_marker()
+    val touch = s"touch $marker"
+
+    assert_eq(run("sh", ["-c", touch], foreground = true), Err(IoError.Other(22)))
+    assert(spawn("sh", ["-c", touch], foreground = true).is_err(), "spawn started it")
+    assert(capture("sh", ["-c", touch], foreground = true).is_err(), "capture started it")
+    assert(start("sh", ["-c", touch], group = Group.Inherit, foreground = true).is_err(),
+           "start started it")
+    assert(!exists(marker), "a child ran")
+    remove_dir_all(d).unwrap()
+end foreground_needs_a_group
+
+// **`ENXIO` from opening the controlling terminal**, the same 6 on macOS and Linux, and answered before
+// anything is forked -- so the call comes back rather than leaving a child waiting on a terminal.
+@test("a foreground child with no controlling terminal is the terminal's error, and nothing runs")
+foreground_without_a_terminal()
+    if foreground_group().is_ok() then skip("this run has a controlling terminal")
+
+    val (d, marker) = gr_marker()
+    val touch = s"touch $marker"
+
+    assert_eq(run("sh", ["-c", touch], group = Group.New, foreground = true), Err(IoError.Other(6)))
+    assert(spawn("sh", ["-c", touch], group = Group.New, foreground = true).is_err(), "spawn")
+    assert(!exists(marker), "a child ran")
+
+    val leader = spawn("sleep", ["5"], group = Group.New).unwrap()
+    val joined = run("true", group = Group.Join(leader.group()), foreground = true)
+
+    assert_eq(joined, Err(IoError.Other(6)))
+    leader.kill(9).unwrap()
+    leader.wait().unwrap()
+    remove_dir_all(d).unwrap()
+end foreground_without_a_terminal
+
+@test("with no controlling terminal there is no foreground group to ask about or to set")
+no_terminal_no_foreground_group()
+    if foreground_group().is_ok() then skip("this run has a controlling terminal")
+
+    assert_eq(foreground_group(), Err(IoError.Other(6)))
+    assert_eq(set_foreground_group(process_group()).unwrap_err(), IoError.Other(6))
+
+@test("this program's own group is a number above zero, the one ps reports for it")
+own_group_is_above_zero()
+    val g = process_group()
+
+    assert(g > 0, s"process_group() is $g")
+    assert_eq(gr_ask(Group.Inherit).1, g)

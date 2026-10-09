@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -108,14 +109,54 @@ static int handed(int fd) {
     return fd > STDERR_FILENO;
 }
 
+/* The terminal `tty` made to give its keys to process group `pgid`, answering 0 or an `errno`.
+ *
+ * **`SIGTTOU` is held back for the length of the call**, which is what a shell does: a process outside
+ * the terminal's foreground group that changes it is otherwise stopped by that signal, and a shell
+ * taking the terminal back after a job -- or a child handing it to its own new group -- is exactly such
+ * a process. Blocked, POSIX lets the change through and sends nothing. The thread's own mask is what
+ * changes, and it is put back as it was, so a signal the program itself blocks stays blocked.
+ */
+static int handed_terminal(int tty, pid_t pgid) {
+    sigset_t ttou;
+    sigset_t was;
+
+    sigemptyset(&ttou);
+    sigaddset(&ttou, SIGTTOU);
+
+    int e = pthread_sigmask(SIG_BLOCK, &ttou, &was);
+
+    if (e != 0) return e;
+
+    int r = tcsetpgrp(tty, pgid) == 0 ? 0 : errno;
+
+    (void) pthread_sigmask(SIG_SETMASK, &was, NULL);
+    return r;
+}
+
+/* The child put in its process group and, where `tty` is a terminal's descriptor rather than -1, that
+ * group made the terminal's foreground -- both before anything else the child does, so the program it
+ * becomes runs from its first instruction where a shell's job control expects it. `pgid` is -1 to stay
+ * in the parent's group, 0 for a group of its own, or the group to join. Answers 0 or an `errno`. */
+static int child_group(int pgid, int tty) {
+    if (pgid < 0) return 0;
+    if (setpgid(0, pgid) != 0) return errno;
+
+    return tty < 0 ? 0 : handed_terminal(tty, getpgrp());
+}
+
 /* Everything the child does before it becomes the other program, as one function so that the
  * caller below is a straight line. Answers an `errno`, or zero.
  *
  * It allocates nothing and opens nothing, which is the constraint the whole between-fork-and-exec
- * window is written under: the descriptors were opened by the parent.
+ * window is written under: the descriptors were opened by the parent, the terminal's among them.
  */
 static int child_setup(const char *const *names, const char *const *values, const char *dir,
-                       int in_fd, int out_fd, int err_fd) {
+                       int in_fd, int out_fd, int err_fd, int pgid, int tty) {
+    int grouped = child_group(pgid, tty);
+
+    if (grouped != 0) return grouped;
+
     /* `setenv` here rather than a whole `envp` handed to `execve`, so that a caller adds to the
      * environment instead of replacing it -- a child that lost PATH, HOME and TMPDIR because its
      * parent wanted to set one variable is a surprise nobody wants. This is also the one place
@@ -392,12 +433,21 @@ static const char *search_dirs(const char *const *names, const char *const *valu
  * child may not allocate, and `setenv` can only add. The program is looked for here too, on the
  * directories `search_dirs` names, so a program that is not there is answered before anything is
  * forked, exactly as `posix_spawn` answers it on the other path.
+ *
+ * **A group and a terminal are set from both sides of the fork**, as a shell sets them: the child does
+ * it before anything else (`child_group`), and the parent does it again the moment `fork` returns. The
+ * child's is what makes the program run where it should from its first instruction; the parent's is
+ * what makes the group exist, and the terminal be its, however the two processes are scheduled -- and
+ * a refusal the parent earns because the child has already done it (or already become the program,
+ * `EACCES`) is no failure. **What fails a start is the child's**, reported through the pipe like a
+ * failed exec; the terminal is then handed back to whichever group had it, since the group it was
+ * given to has just ended. `tty` is -1 unless the group is to be the foreground.
  */
 __attribute__((unused))
 static int start_forked(const char *program, char *const *argv,
                         const char *const *env_names, const char *const *env_values, int inherit,
                         const char *dir, int in_fd, int out_fd, int err_fd,
-                        int *pid_out, long long *started_ms) {
+                        int *pid_out, long long *started_ms, int pgid, int tty) {
     char **env = NULL;
     char **made = NULL;
     char where[4096];
@@ -443,6 +493,9 @@ static int start_forked(const char *program, char *const *argv,
         return e;
     }
 
+    /* Who has the terminal now, to give it back to if the child never becomes the program. */
+    pid_t had = tty >= 0 ? tcgetpgrp(tty) : -1;
+
     pid_t pid = fork();
 
     /* The clock starts here, so the timeout covers the child's whole life rather than only the
@@ -461,8 +514,8 @@ static int start_forked(const char *program, char *const *argv,
     if (pid == 0) {
         close(report[0]);
 
-        int e = inherit ? child_setup(env_names, env_values, dir, in_fd, out_fd, err_fd)
-                        : child_setup(NULL, NULL, dir, in_fd, out_fd, err_fd);
+        int e = inherit ? child_setup(env_names, env_values, dir, in_fd, out_fd, err_fd, pgid, tty)
+                        : child_setup(NULL, NULL, dir, in_fd, out_fd, err_fd, pgid, tty);
 
         if (e == 0) {
             if (inherit) execvp(program, argv);
@@ -482,6 +535,14 @@ static int start_forked(const char *program, char *const *argv,
     close(report[1]);
     release_environment(env, made);
 
+    if (pgid >= 0) {
+        pid_t group = pgid == 0 ? pid : pgid;
+
+        (void) setpgid(pid, group);
+
+        if (tty >= 0) (void) handed_terminal(tty, group);
+    }
+
     int child_errno = 0;
     ssize_t got = read(report[0], &child_errno, sizeof child_errno);
 
@@ -493,6 +554,9 @@ static int start_forked(const char *program, char *const *argv,
         int status = 0;
 
         (void) wait_out(pid, &status);
+
+        if (tty >= 0 && had > 0) (void) handed_terminal(tty, had);
+
         return child_errno;
     }
 
@@ -515,12 +579,14 @@ static int start_forked(const char *program, char *const *argv,
  * What the child is handed is what the `fork` path gave it, in the same order: the environment with
  * the named variables added or replaced (or, not inheriting, the named variables alone), then the
  * directory, then each stream placed onto its descriptor. A program that cannot be run is the `errno`
- * `posix_spawnp` answers, so there is nothing to reap.
+ * `posix_spawnp` answers, so there is nothing to reap. A process group is `POSIX_SPAWN_SETPGROUP`,
+ * set in the child before it runs, exactly as `child_group` sets it; a group that is also to have the
+ * terminal takes the `fork` path instead, `posix_spawn` having no portable way to hand one over.
  */
 static int start_spawned(const char *program, char *const *argv,
                          const char *const *env_names, const char *const *env_values, int inherit,
                          const char *dir, int in_fd, int out_fd, int err_fd,
-                         int *pid_out, long long *started_ms) {
+                         int *pid_out, long long *started_ms, int pgid) {
 #if defined(__APPLE__)
     char **current = *_NSGetEnviron();
 #else
@@ -567,6 +633,20 @@ static int start_spawned(const char *program, char *const *argv,
         if (!seen) e = posix_spawn_file_actions_addclose(&actions, fds[i]);
     }
 
+    posix_spawnattr_t attr;
+    posix_spawnattr_t *attrs = NULL;
+
+    if (e == 0 && pgid >= 0) {
+        e = posix_spawnattr_init(&attr);
+
+        if (e == 0) {
+            attrs = &attr;
+            e = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+        }
+
+        if (e == 0) e = posix_spawnattr_setpgroup(&attr, pgid);
+    }
+
     pid_t pid = 0;
     char dirs[1024];
     const char *child_path = search_dirs(env_names, env_values, inherit, dirs, sizeof dirs);
@@ -576,12 +656,14 @@ static int start_spawned(const char *program, char *const *argv,
 
         e = found_on(program, child_path, where, sizeof where);
 
-        if (e == 0) e = posix_spawn(&pid, where, &actions, NULL, argv, env);
+        if (e == 0) e = posix_spawn(&pid, where, &actions, attrs, argv, env);
     } else if (e == 0) {
-        e = posix_spawnp(&pid, program, &actions, NULL, argv, env ? env : current);
+        e = posix_spawnp(&pid, program, &actions, attrs, argv, env ? env : current);
     }
 
     long long started_at = now_ms();
+
+    if (attrs) posix_spawnattr_destroy(attrs);
 
     posix_spawn_file_actions_destroy(&actions);
     release_environment(env, made);
@@ -633,10 +715,22 @@ static void release_strings(made_strings *m) {
     free(m->owned);
 }
 
+/* The controlling terminal, opened by name: the terminal this program's session belongs to, whatever
+ * its standard streams have been pointed at. A program with none is refused here with `ENXIO`. It
+ * closes when a program is started, so a child holds it only for as long as it is setting itself up. */
+static int controlling_terminal(int *fd) {
+    int t = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+
+    if (t < 0) return errno;
+
+    *fd = t;
+    return 0;
+}
+
 static int begin(const char *program, char *const *argv,
                  const char *const *env_names, const char *const *env_values, int inherit,
                  const char *dir, int in_fd, int out_fd, int err_fd,
-                 int *pid_out, long long *started_ms) {
+                 int *pid_out, long long *started_ms, int pgid, int foreground) {
     /* **Everything this program has written, written, before anything else can write.**
      *
      * A C library buffers standard output, and it buffers it *fully* rather than by line whenever
@@ -656,12 +750,26 @@ static int begin(const char *program, char *const *argv,
      */
     fflush(NULL);
 
+    /* A group that is to have the terminal is started by `fork`, which is the one path that can hand
+     * it over in the child before the program runs. With no terminal nothing is started at all. */
+    if (foreground && pgid >= 0) {
+        int tty = -1;
+        int e = controlling_terminal(&tty);
+
+        if (e != 0) return e;
+
+        e = start_forked(program, argv, env_names, env_values, inherit, dir, in_fd, out_fd, err_fd,
+                         pid_out, started_ms, pgid, tty);
+        close(tty);
+        return e;
+    }
+
 #if SYSL_PROC_SPAWNS
     return start_spawned(program, argv, env_names, env_values, inherit, dir, in_fd, out_fd, err_fd,
-                         pid_out, started_ms);
+                         pid_out, started_ms, pgid);
 #else
     return start_forked(program, argv, env_names, env_values, inherit, dir, in_fd, out_fd, err_fd,
-                        pid_out, started_ms);
+                        pid_out, started_ms, pgid, -1);
 #endif
 }
 
@@ -675,7 +783,8 @@ static int begin(const char *program, char *const *argv,
 int sysl_proc_posix_start(const char *program, size_t program_len,
                           const sysl_text *argv, size_t argc, const sysl_text *envp, size_t envc,
                           int inherit, const char *dir, size_t dir_len,
-                          int in_fd, int out_fd, int err_fd, int *pid_out, long long *started_ms) {
+                          int in_fd, int out_fd, int err_fd, int *pid_out, long long *started_ms,
+                          int pgid, int foreground) {
     made_strings m = { calloc(2 + argc + 2 * envc, sizeof(char *)), 0 };
     char **args = calloc(argc + 1, sizeof(char *));
     const char **names = calloc(envc + 1, sizeof(char *));
@@ -706,7 +815,7 @@ int sysl_proc_posix_start(const char *program, size_t program_len,
 
     if (e == 0) {
         e = begin(path, args, names, values, inherit, where, in_fd, out_fd, err_fd, pid_out,
-                  started_ms);
+                  started_ms, pgid, foreground);
     }
 
     if (m.owned) release_strings(&m);
@@ -923,5 +1032,36 @@ int sysl_proc_posix_exec(const char *program, size_t program_len,
     free(args);
     free(names);
     free(values);
+    return e;
+}
+
+/* The controlling terminal's foreground process group, written into `*pgid`; 0 or an `errno` --
+ * `ENXIO` for a program with no controlling terminal. */
+int sysl_proc_posix_tcgetpgrp(int *pgid) {
+    int tty = -1;
+    int e = controlling_terminal(&tty);
+
+    if (e != 0) return e;
+
+    pid_t g = tcgetpgrp(tty);
+
+    e = g < 0 ? errno : 0;
+    close(tty);
+
+    if (e == 0) *pgid = (int) g;
+
+    return e;
+}
+
+/* The controlling terminal's foreground made process group `pgid`, from the foreground or from the
+ * background alike (`handed_terminal`); 0 or an `errno`. */
+int sysl_proc_posix_tcsetpgrp(int pgid) {
+    int tty = -1;
+    int e = controlling_terminal(&tty);
+
+    if (e != 0) return e;
+
+    e = handed_terminal(tty, (pid_t) pgid);
+    close(tty);
     return e;
 }

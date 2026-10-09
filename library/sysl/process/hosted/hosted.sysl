@@ -38,7 +38,8 @@ private extern "__errno_location" errno_location() -> *i32
 private extern "sysl_proc_posix_start" c_start(program: *u8, program_len: usize, argv: *Text,
                                                argc: usize, envp: *Text, envc: usize, inherit: int,
                                                dir: *u8, dir_len: usize, in_fd: int, out_fd: int,
-                                               err_fd: int, pid: *i32, started_ms: *i64) -> int
+                                               err_fd: int, pid: *i32, started_ms: *i64,
+                                               pgid: i32, foreground: int) -> int
 
 private extern "sysl_proc_posix_wait" c_wait(pid: i32, started_ms: i64, timeout_ms: i64,
                                              code: *i32, sig: *i32, timed_out: *i32) -> int
@@ -52,10 +53,10 @@ private extern "strlen" c_strlen(s: *u8) -> usize
 @export("sysl_proc_spawn")
 proc_spawn(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, envc: usize,
            inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int, stderr_fd: int,
-           started: *i64) -> i64
+           started: *i64, pgid: i64, foreground: int) -> i64
     var pid: i32 = 0
     val e = c_start(path, path_len, argv, argc, envp, envc, inherit_env, dir, dir_len, stdin_fd,
-                    stdout_fd, stderr_fd, &pid, started)
+                    stdout_fd, stderr_fd, &pid, started, i32(pgid), foreground)
 
     if e != 0 then i64(host_status(int(e))) else i64(pid)
 end proc_spawn
@@ -154,4 +155,26 @@ proc_exec(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, env
     val e = c_exec(path, path_len, argv, argc, envp, envc, inherit_env)
 
     if e != 0 then host_status(int(e)) else -5
+
+// `getpgrp` cannot fail. The two terminal calls are C's because the controlling terminal is opened by
+// name and `SIGTTOU` is held back around the change with a signal set, whose type is the C library's.
+private extern "getpgrp" c_getpgrp() -> i32
+private extern "sysl_proc_posix_tcgetpgrp" c_tcgetpgrp(pgid: *i32) -> int
+private extern "sysl_proc_posix_tcsetpgrp" c_tcsetpgrp(pgid: i32) -> int
+
+@export("sysl_proc_getpgrp")
+proc_getpgrp() -> i64 = i64(c_getpgrp())
+
+@export("sysl_proc_tcgetpgrp")
+proc_tcgetpgrp() -> i64
+    var pgid: i32 = 0
+    val e = c_tcgetpgrp(&pgid)
+
+    if e != 0 then i64(host_status(e)) else i64(pgid)
+
+@export("sysl_proc_tcsetpgrp")
+proc_tcsetpgrp(pgid: i64) -> int
+    val e = c_tcsetpgrp(i32(pgid))
+
+    if e != 0 then host_status(e) else 0
 #endif

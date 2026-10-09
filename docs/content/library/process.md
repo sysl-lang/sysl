@@ -605,18 +605,92 @@ hold have to be given back first. `exec` is the other kind: on success nothing o
 on at all, its memory going with its image the way an `exit`'s does, and on failure it returns like
 any call. Its result is `IoError` and not `never` for that reason.
 
+## Process groups and the terminal
+
+**A shell's job is a process group, and a terminal gives its keys to one group at a time.** Ctrl-C is
+a `SIGINT` to every process in the terminal's *foreground* group and to nothing else, so a shell starts
+each job in a group of its own and hands that group the terminal. `run`, `capture`, `start` and
+`spawn` all take the two, last, so every call written before them keeps its meaning:
+
+| parameter | what it says |
+|---|---|
+| `group: Group = Inherit` | `Inherit` leaves the child in this program's group; `New` makes it the leader of a group of its own, numbered by its pid; `Join(pgid)` puts it in an existing group |
+| `foreground: bool = false` | the child's group is made the controlling terminal's foreground **before the child's program runs** |
+
+`Spawned.group()` and `Child.group()` answer the group a child was started in, which is what a later
+stage of a pipeline `Join`s — so the whole pipeline is one job — and `process_group()` answers this
+program's own:
+
+```sysl
+import sysl.process.{Group, capture, process_group, spawn}
+import sysl.text.Search
+
+val job = spawn("sleep", ["5"], group = Group.New).unwrap()
+val stage = capture("sh", ["-c", "ps -o pgid= -p $$"], group = Group.Join(job.group())).unwrap()
+
+print(job.group() != process_group())
+print(stage.text.trim() == s"${job.group()}")
+
+job.kill(9).unwrap()
+```
+
+```output
+true
+true
+```
+
+**"Before the child's program runs" is the whole of `foreground`.** A shell that started the job and
+then called `tcsetpgrp` itself would leave a window in which the job runs and the shell still has the
+terminal, and a Ctrl-C typed in it goes to the shell. So the terminal is handed over twice, as a shell
+does it: by the child, before it becomes the program, and by this program the moment the child exists
+— whichever runs first, the job has the terminal from its first instruction. When the job ends or
+stops, the shell takes the terminal back with `set_foreground_group`, which works from the background
+too (the stop signal a background process would earn for it, `SIGTTOU`, is held back for the call):
+
+```
+val job = spawn(program, args, group = Group.New, foreground = true)?
+val how = job.wait()?
+
+set_foreground_group(process_group())?
+```
+
+`foreground_group()` answers which group has the terminal now. **The terminal is the program's
+*controlling* terminal** — the one its session belongs to, whatever its standard streams have been
+pointed at — so a program with none (started by a service manager, a test runner, a pipe from another
+machine) is refused where it asks: `foreground_group()`, `set_foreground_group(…)` and a `spawn` with
+`foreground = true` all answer `Other(6)`, POSIX's `ENXIO`, and the `spawn` starts nothing. Handing the
+terminal to the group this program is already in has no meaning, so `foreground = true` with `Inherit`
+is refused before anything starts, as is a `Join` of a number that is not above zero:
+
+```sysl
+import sysl.process.{Group, run}
+
+print(run("true", foreground = true).unwrap_err().code())
+print(run("true", group = Group.Join(0)).unwrap_err().code())
+```
+
+```output
+22
+22
+```
+
+A group that does not exist, or that belongs to another session, is `NotPermitted`. **What the child
+does with its signals is its own**: a shell that ignores `SIGINT` for itself has to see that its jobs do
+not inherit that, since an ignored signal stays ignored across the start of a program.
+
 ## On a target with no C library
 
-Everything the module asks of the machine goes through eight hooks in `sysl.process.sys` — start a
+Everything the module asks of the machine goes through eleven hooks in `sysl.process.sys` — start a
 program, make a pipe, wait for it, send it a signal, become one in place of this program, name a file
-for a captured stream, and read or change who the program is. On a hosted POSIX target
+for a captured stream, read or change who the program is, and say which process group it is in and
+which group has its terminal. On a hosted POSIX target
 the library answers them; **on a target with no C library the program answers each one it reaches
 with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `start`, `spawn`,
 `pipe` and `exec` work unchanged above them:
 
 | hook | what it answers |
 |---|---|
-| `sysl_proc_spawn(path, path_len, argv, argc, envp, envc, inherit_env, dir, dir_len, stdin_fd, stdout_fd, stderr_fd, started) -> i64` | the child's process id |
+| `sysl_proc_spawn(path, path_len, argv, argc, envp, envc, inherit_env, dir, dir_len, stdin_fd, stdout_fd, stderr_fd, started, pgid, foreground) -> i64` | the child's process id, the child started in group `pgid` (-1 this program's, 0 a new one, above zero that one) and, with `foreground` 1, that group given the terminal before the child's program runs |
 | `sysl_proc_pipe(read_end, write_end) -> int` | zero, having written the two descriptors, each closing when a program is started |
 | `sysl_proc_wait(pid, started, timeout_ms, how, value) -> int` | zero, having written how it ended |
 | `sysl_proc_kill(pid, signal) -> int` | zero |
@@ -624,6 +698,9 @@ with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `s
 | `sysl_proc_get_id(which) -> i64` | the id: `which` is `id_user` 0 or `id_group` 1 (effective), `id_real_user` 2 or `id_real_group` 3 |
 | `sysl_proc_set_id(which, id: u32) -> int` | zero, having made the program act as user or group `id` (`which` 0 or 1) |
 | `sysl_proc_exec(path, path_len, argv, argc, envp, envc, inherit_env) -> int` | only a failure: a success does not return |
+| `sysl_proc_getpgrp() -> i64` | the program's process group |
+| `sysl_proc_tcgetpgrp() -> i64` | the controlling terminal's foreground group |
+| `sysl_proc_tcsetpgrp(pgid) -> int` | zero, having given the terminal to `pgid`, from the background too |
 
 **Each answers zero or more for success and the `IoError` code negated for a failure**, and
 `UNSUPPORTED` (`sysl.sys`, -38 on every platform, not the host's `ENOSYS`; `-1` is `EPERM`) for a
@@ -633,7 +710,10 @@ a length, never a C string: `argv` and `envp` point at runs of `Text`, each a po
 has. `wait` writes `0` into `how` for an exit (its code in `value`), `1` for a signal or a fault (its
 number), and `2` for a child it stopped at its deadline; a supplier that cannot bound a wait answers
 `UNSUPPORTED` when handed a timeout. A target with no users answers `get_id` and `set_id` with
-`UNSUPPORTED`, and a refused `set_id` answers `-1`, `EPERM`, which comes back as `NotPermitted`.
+`UNSUPPORTED`, and a refused `set_id` answers `-1`, `EPERM`, which comes back as `NotPermitted`. A
+target with no process groups answers the three group hooks with `UNSUPPORTED` (and `process_group()`
+is then 0); **they are reached only by a program that asks about groups or the terminal**, so a kernel
+without them answers nothing it does not have.
 **`kill` and `wait` are reached by any program that reaches the module**, `Child`'s destructor being
 kept wherever `sysl.process` is, so a program asking only who it is answers those two as well.
 `sysl.process.sys`'s own comments say the rest.
@@ -664,9 +744,10 @@ program is `run`, `capture` or `start`; becoming one is `exec`; and the two toge
 fork is wanted for on a hosted system. **A kernel's own runtime keeps its fork** — keel's user
 runtime has one beside its `execve` — because it owns every thread and every count there is.
 
-**Process *supervision*.** A running child can be held — that is `start` — and sent a signal, but no
-pid is handed out and no process group is made. That covers what a build
-tool, an installer or a command-line front end does, including one running several compilers at once.
+**Process *supervision*.** A running child can be held — that is `start` — sent a signal, and started
+in a process group a shell can hand the terminal to, but no pid is handed out. That covers what a build
+tool, an installer, a command-line front end or a shell's job control does, including one running
+several compilers at once.
 A program that wants to supervise children wants a different surface, and it would belong under
 `sysl.posix`, where a binding goes when it *is* POSIX rather than merely implemented with it.
 
