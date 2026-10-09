@@ -1952,6 +1952,16 @@ print(volatile + 1)
 these elements may not be written through this handle — while `volatile` is a property of the
 *element*. A read-only device register is `[]const volatile u32`, and both words are doing work.
 
+### Memory a device reads and writes is a library type, not a qualifier
+
+`volatile` is about the device's **registers**. The memory a device reaches by DMA — a buffer, a
+descriptor ring — is ordinary memory the processor reads and writes normally; what it needs is an
+address the *device* can use and a handover that keeps the caches honest, and neither is a property
+of a place. So it is [`sysl.dma`'s `Region`](/library/dma/): it carries the device's address of its
+first byte, is made only by `adopt` from memory somebody knows to be device-reachable, and an ordinary
+`[]u8` is not one. No qualifier on `*T` or `[]T` says where storage is, because a slice's type cannot
+know whether it was cut from a stack, a heap block or a frame — the region's maker does.
+
 ## Where `defer` sits
 
 [`defer`](/reference/statements/#defer) is the model's answer for what the language does *not* own: a

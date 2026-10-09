@@ -1,0 +1,202 @@
+module sysl.dma
+@tests
+
+import sysl.slices.as_mut_ptr
+
+/** What a region promises. The device's address is the thing a mistake would corrupt, so every
+ * test that cuts a region asserts the bus address of the result against the one it came from, and
+ * every refusal is a test of its own -- a part, a lookup or an overlay that answered instead of
+ * panicking would hand a device memory the region does not cover.
+ *
+ * The bus base is far from the storage's own address on purpose, so a bus address computed from the
+ * processor's pointer instead of from the region is a different number and fails.
+ */
+
+private const Bus: u64 = 0x8000_0000
+
+@test("a region answers its length, its bus address and its bytes")
+region_reads_back()
+    var store: [64]u8 = [0; 64]
+    val r = adopt(as_mut_ptr(store[..]), Bus, 64)
+
+    assert_eq(r.len(), 64)
+    assert(!r.is_empty())
+    assert_eq(r.bus(), Bus)
+    assert(!r.is_coherent())
+
+    r.bytes()[3] = 7
+    assert_eq(store[3], 7)
+    assert_eq(r.bytes().len, 64)
+end region_reads_back
+
+@test("a part keeps the device's address in step with the processor's")
+part_moves_both_addresses()
+    var store: [64]u8 = [0; 64]
+    val r = adopt(as_mut_ptr(store[..]), Bus, 64, coherent = true)
+    val p = r.part(16, 8)
+
+    assert_eq(p.len(), 8)
+    assert_eq(p.bus(), Bus + 16)
+    assert(p.is_coherent())
+
+    p.bytes()[0] = 9
+    assert_eq(store[16], 9)
+end part_moves_both_addresses
+
+@test("a part of a part keeps counting from the region's bus address")
+nested_parts()
+    var store: [64]u8 = [0; 64]
+    val r = adopt(as_mut_ptr(store[..]), Bus, 64)
+    val a = r.part(8, 16)
+    val nested = a.part(4, 4)
+
+    assert_eq(nested.bus(), Bus + 12)
+    assert_eq(nested.len(), 4)
+
+    nested.bytes()[0] = 5
+    assert_eq(store[12], 5)
+end nested_parts
+
+@test("a part may end exactly at the region's end, and an empty one at either end")
+part_edges()
+    var store: [32]u8 = [0; 32]
+    val r = adopt(as_mut_ptr(store[..]), Bus, 32)
+
+    assert_eq(r.part(24, 8).bus(), Bus + 24)
+    assert(r.part(32, 0).is_empty())
+    assert_eq(r.part(32, 0).bus(), Bus + 32)
+    assert(r.part(0, 0).is_empty())
+end part_edges
+
+@test(should_trap)
+part_past_the_end_panics()
+    var store: [32]u8 = [0; 32]
+    val r = adopt(as_mut_ptr(store[..]), Bus, 32)
+
+    r.part(24, 9)
+
+@test(should_trap)
+part_starting_past_the_end_panics()
+    var store: [32]u8 = [0; 32]
+    val r = adopt(as_mut_ptr(store[..]), Bus, 32)
+
+    r.part(33, 0)
+
+@test(should_trap)
+part_of_a_part_past_its_end_panics()
+    var store: [64]u8 = [0; 64]
+    val r = adopt(as_mut_ptr(store[..]), Bus, 64)
+
+    r.part(8, 16).part(12, 8)
+
+struct Header
+    kind: u32
+    reserved: u32
+    sector: u64
+
+@test("an overlay is the struct at that byte, and bus_of finds its fields")
+overlay_and_bus_of()
+    var store: [64]u64 = [0; 64]
+    val r = adopt(ptr_cast(as_mut_ptr(store[..])), Bus, 512)
+    val h: *Header = r.at(16)
+
+    h.sector = 42
+    assert_eq(store[3], 42)
+
+    assert_eq(r.bus_of(h), Bus + 16)
+    assert_eq(r.bus_of(&h.sector), Bus + 24)
+    assert_eq(r.part(16, 16).bus_of(&h.sector), Bus + 24)
+end overlay_and_bus_of
+
+@test("an overlay may end exactly at the region's end")
+overlay_at_the_end()
+    var store: [8]u64 = [0; 8]
+    val r = adopt(ptr_cast(as_mut_ptr(store[..])), Bus, 64)
+    val h: *Header = r.at(48)
+
+    assert_eq(r.bus_of(h), Bus + 48)
+
+@test(should_trap)
+overlay_that_does_not_fit_panics()
+    var store: [8]u64 = [0; 8]
+    val r = adopt(ptr_cast(as_mut_ptr(store[..])), Bus, 64)
+    val h: *Header = r.at(56)
+
+    h.kind = 1
+
+@test(should_trap)
+misaligned_overlay_panics()
+    var store: [8]u64 = [0; 8]
+    val r = adopt(ptr_cast(as_mut_ptr(store[..])), Bus, 64)
+    val h: *Header = r.at(4)
+
+    h.kind = 1
+
+@test(should_trap)
+bus_of_outside_the_region_panics()
+    var store: [64]u8 = [0; 64]
+    var other: [64]u8 = [0; 64]
+    val r = adopt(as_mut_ptr(store[..]), Bus, 64)
+
+    r.bus_of(&other[0])
+
+@test(should_trap)
+bus_of_straddling_the_end_panics()
+    var store: [8]u64 = [0; 8]
+    val r = adopt(ptr_cast(as_mut_ptr(store[..])), Bus, 64)
+    val wide: *Header = ptr_cast(&store[7])
+
+    r.bus_of(wide)
+
+@test("a handover in either direction leaves the bytes as they were")
+handover_keeps_the_bytes()
+    var store: [256]u8 = [0; 256]
+    val r = adopt(as_mut_ptr(store[..]), Bus, 256)
+
+    for i in 0..<256
+        r.bytes()[i] = u8(i)
+
+    r.part(3, 197).to_device()
+    r.part(3, 197).from_device()
+    r.part(256, 0).to_device()
+    adopt(as_mut_ptr(store[..]), Bus, 256, coherent = true).to_device()
+
+    for i in 0..<256
+        assert_eq(store[i], u8(i))
+end handover_keeps_the_bytes
+
+/** A source over a fixed arena, handing out one region at a time -- the shape of a kernel's frame
+ * allocator, and enough to show a driver allocating without knowing whose memory it is.
+ */
+struct Arena
+    base: *u8
+    room: usize
+    taken: bool
+
+impl Source for Arena
+    take(*self, len: usize) -> Option[Region]
+        if self.taken || len > self.room then return None
+
+        self.taken = true
+        Some(adopt(self.base, Bus, len))
+
+    give(*self, r: Region)
+        assert_eq(r.bus(), Bus)
+        self.taken = false
+
+private ring_for[S: Source](src: *S) -> Option[Region] = src.take(128)
+
+@test("a driver allocates through a source and gives the region back")
+source_round_trip()
+    var store: [256]u8 = [0; 256]
+    var arena = Arena(as_mut_ptr(store[..]), 256, false)
+
+    val r = ring_for(&arena).unwrap()
+    assert_eq(r.len(), 128)
+    assert_eq(r.bus(), Bus)
+    assert(ring_for(&arena).is_none())
+
+    arena.give(r)
+    assert(ring_for(&arena).is_some())
+    assert(arena.take(512).is_none())
+end source_round_trip
