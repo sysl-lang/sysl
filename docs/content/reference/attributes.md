@@ -1629,8 +1629,9 @@ the struct declares named `bits` is what `.bits` reaches, ahead of the container
 a value none of its variants has; the field is held to its variants where it is read, as one reached
 through a pointer the hardware filled is.
 
-**Every field has to be an integer.** A `bool` is not one here — its storage is a byte and its
-representation a bit — and neither is a pointer, a float or an array:
+**Every field has to be an integer** — or a simple enum, or another bitfield struct. A `bool` is not
+one here — its storage is a byte and its representation a bit — and neither is a pointer, a float or
+an array:
 
 ```sysl
 @packed
@@ -1647,8 +1648,66 @@ print(m.a)
 is one integer, and every field of it has to be one too
 ```
 
-**Nesting is the composition path**, and it costs nothing: a bitfield struct is a leaf, and an
-ordinary `@packed` struct lays one out as a field of its size.
+**A bitfield struct may be a field of another, and there it occupies its own fields' widths** — the
+bits it uses, not the whole bytes its own container rounds up to. That is how a group of flags shared
+by several registers is named once: a page descriptor's ten lower attribute bits sit at bit 2 of the
+block, the page and the stage 2 descriptor alike. A field of the inner struct is read and written
+through both containers, and `.bits` and `::Bits` of the outer one cover all of it:
+
+```sysl
+@packed
+struct Lower
+    attr: u3
+    ns: u1
+    ap: u2
+    sh: u2
+    af: u1
+    ng: u1
+
+@packed
+struct Desc
+    valid: u1
+    page: u1
+    lower: Lower
+    oa: u36
+    rest: u16
+
+var d = Desc(1, 1, Lower(5, 0, 1, 3, 1, 0), 0x12345, 0)
+
+d.lower.ap = 2
+
+print(sizeof(Desc), d.lower.attr, d.lower.ap, d.lower.sh, d.oa, d.lower.bits)
+```
+
+```output
+8 5 2 3 74565 485
+```
+
+A struct that is not one integer is refused there — an ordinary struct, or a `@packed` one whose
+fields are all whole bytes:
+
+```sysl
+struct Pt
+    x: u8
+    y: u8
+
+@packed
+struct Flags
+    on: u1
+    at: Pt
+
+val f = Flags(1, Pt(2, 3))
+
+print(f.on)
+```
+
+```error
+Pt is laid out as fields rather than as one integer — only a '@packed' struct with a field narrower than a byte nests in another, in its own fields' width
+```
+
+**What decides whether a `@packed` struct is one integer is its own integer and enum fields**, so an
+ordinary `@packed` struct whose fields are whole bytes lays a bitfield struct out as a field of its
+size, as it always has.
 
 ```sysl
 @packed

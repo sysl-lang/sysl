@@ -1905,9 +1905,10 @@ end refuse_repeated_tags
 // since an address is aligned by having low bits clear, and it has to be settled while compiling.
 // **A `@packed` struct with a field narrower than a byte IS one integer**, its fields ranges of it,
 // so every field has to be an integer too -- a pointer, a float or a `bool` (an `i1` whose storage
-// is a byte) has no bit range to occupy. Nesting is the answer and costs nothing: an outer `@packed`
-// struct lays a bitfield struct out as an ordinary field of its size. A struct one of whose fields
-// did not resolve has been complained about already, and is left alone.
+// is a byte) has no bit range to occupy. A bitfield struct is one integer too, so it may be a field
+// of another, where it occupies its own fields' widths; an ordinary `@packed` struct lays one out as a
+// field of its size. A struct one of whose fields did not resolve has been complained about already,
+// and is left alone.
 private check_bitfields(a: &Analysis, scope: Scope, span: Span, s: &StructType)
     if !s.packed then return
 
@@ -1926,14 +1927,22 @@ private check_bitfields(a: &Analysis, scope: Scope, span: Span, s: &StructType)
     val name = type_show(Struct(s))
 
     for item in stored
-        if bitfield_width(item.1).is_none()
+        if range_width(item.1).is_none()
             val shown = type_show(item.1)
 
             a.fault(scope, span, s"'$name.${item.0}' is $shown, and '$name' is '@packed' with a " +
                     "field narrower than a byte — so it is one integer, and every field of it has to be " +
-                    "one too. Put the narrow fields in a '@packed' struct of their own and hold that " +
-                    s"here: it lays out identically and leaves $shown what it is")
+                    "one too: an integer, a simple enum, or a bitfield struct. " + unfit_advice(item.1, shown))
 end check_bitfields
+
+// What to do about a field a bitfield struct cannot hold. A struct is the case worth its own words,
+// being the one that reads as though nesting should work: only a struct that is itself one integer
+// nests, in its own width.
+private unfit_advice(t: Type, shown: string) -> string = underlying(t) match
+    Struct(_) -> s"$shown is laid out as fields rather than as one integer — only a '@packed' struct " +
+        "with a field narrower than a byte nests in another, in its own fields' width"
+    _ -> "Put the narrow fields in a '@packed' struct of their own and hold that here: it lays out " +
+        s"identically and leaves $shown what it is"
 
 private aligned_to(a: &Analysis, scope: Scope, span: Span, written: string,
                    asked: Option[Expr]) -> Option[usize]
