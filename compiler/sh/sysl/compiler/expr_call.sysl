@@ -412,6 +412,19 @@ private applied_type_call(cx: &Analyzer, span: Span, bracket: Span, name: string
 
             cx.err(bracket, s"'$name' is an enum, so it is not built by calling its name — a variant " +
                    s"is what carries a value, as '$name[…].Name(…)'")
+        // `UserPtr[Frame](n)`: a `new` type at the arguments written, converted to as the type
+        // with no parameters would be.
+        TypeOf(d) ->
+            if d.tp.names.is_empty() || !is_phantom_new(d) then
+                return cx.err(span, "this is not something that can be called")
+
+            val decl = cx.an.tables.types.get(key).unwrap()
+            val made = instantiate_named_subtype(cx.an, cx.scope, bracket, name, key, d, decl.scope,
+                                                 targs)
+
+            if type_eq(made, Unknown) then return bad_expr(span)
+
+            into_subtype(cx, span, made, name, args)
         _ -> cx.err(span, "this is not something that can be called")
 end applied_type_call
 
@@ -604,7 +617,7 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
                         Some(other) -> return convert_call(cx, span, name, other, args)
                         None -> ()
 
-                return constrained_call(cx, span, tkey.unwrap(), name, args)
+                return constrained_call(cx, span, tkey.unwrap(), name, args, expected)
             _ -> ()
 
     if !shadowed
@@ -1440,7 +1453,29 @@ private behind_alias(cx: &Analyzer, key: string) -> Option[Type] =
     cx.an.tables.constrained_insts.get(key)
 
 private constrained_call(cx: &Analyzer, span: Span, key: string, written: string,
-                         args: Buf[Expr]) -> TExpr
+                         args: Buf[Expr], expected: Option[Type]) -> TExpr
+    // **A `new` type with parameters takes them from where the value goes**, as a generic struct's
+    // constructor does: `val p: UserPtr[Frame] = UserPtr(n)`. With nothing there to say, the reader
+    // writes them.
+    val decl = cx.an.tables.types.get(key)
+
+    if decl.is_some()
+        decl.unwrap().kind match
+            TypeOf(d) ->
+                if !d.tp.names.is_empty() && is_phantom_new(d)
+                    val fits = expected match
+                        Some(Constrained(c)) -> c.generic == key
+                        _ -> false
+
+                    if !fits then
+                        return cx.err(span, s"'$written' takes type parameters, and nothing here " +
+                                      s"says what they are — write them, as '$written[…](…)'")
+
+                    return into_subtype(cx, span, expected.unwrap(), written, args)
+                end if
+            _ -> ()
+    end if
+
     val inst = cx.an.tables.constrained_insts.get(instance_key(key, buf()))
 
     if inst.is_none() then

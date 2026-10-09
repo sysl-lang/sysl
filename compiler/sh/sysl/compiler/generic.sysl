@@ -34,6 +34,8 @@ subst_params(a: &Analysis, t: Type, subst: Buf[Binding]) -> Type
             else if is_tuple(d) then Struct(registered_tuple(a, subst_list(a, d.targs, subst)))
             else reinstantiate(a, d.base, subst_list(a, d.targs, subst))
         Enum(d) -> if d.targs.is_empty() then t else reinstantiate(a, d.base, subst_list(a, d.targs, subst))
+        Constrained(d) ->
+            if d.targs.is_empty() then t else reinstantiate(a, d.generic, subst_list(a, d.targs, subst))
         Ptr(inner) -> Ptr(subst_params(a, *inner, subst))
         Ref(inner, sync) -> Ref(subst_params(a, *inner, subst), sync)
         Weak(inner) -> Weak(subst_params(a, *inner, subst))
@@ -132,6 +134,7 @@ reinstantiate_at(a: &Analysis, site: Scope, span: Span, key: string, targs: Buf[
     d.kind match
         StructOf(sd) -> instantiate_struct(a, site, span, key, key, sd, d.scope, targs)
         EnumOf(ed) -> instantiate_enum(a, site, span, key, key, ed, d.scope, targs)
+        TypeOf(td) -> instantiate_named_subtype(a, site, span, key, key, td, d.scope, targs)
         _ -> Unknown
 end reinstantiate_at
 
@@ -342,6 +345,12 @@ private unify_named(a: &Analysis, scope: Scope, n: string, arg_refs: Buf[TypeRef
                     unify(a, scope, arg_refs.at(i), d.targs.at(i), tparams, sub)
         Enum(d) ->
             if d.base == key.unwrap() && d.targs.len() == arg_refs.len()
+                for i in 0..<arg_refs.len()
+                    unify(a, scope, arg_refs.at(i), d.targs.at(i), tparams, sub)
+        // A `new` type's parameters are read back off the arguments it was applied to, which is
+        // all a phantom parameter is there for: `read[T](p: UserPtr[T])` at a `UserPtr[Frame]`.
+        Constrained(d) ->
+            if d.generic == key.unwrap() && d.targs.len() == arg_refs.len()
                 for i in 0..<arg_refs.len()
                     unify(a, scope, arg_refs.at(i), d.targs.at(i), tparams, sub)
         // A trait applied to arguments binds them the way a generic type does -- what a trait cannot
