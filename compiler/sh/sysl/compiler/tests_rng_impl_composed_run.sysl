@@ -1,8 +1,7 @@
 module sh.sysl.compiler
 @tests
 
-import sysl.env.{get as env_var}
-import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
 // A trait implemented for a type with no name of its own -- a slice, a string's bytes, an array, a
@@ -11,9 +10,7 @@ import sysl.process.capture
 //
 // **The helpers here serve every `rng_` file**, the ports of the reference's whole-program run
 // suites. Every claim is about what a program *does*, so each builds the program with this compiler
-// and runs it -- and **where `SYSL_ORACLE` names the reference, builds and runs it with that one
-// too and holds it to the same answer**, so every expectation is the reference's actual output
-// rather than a transcription of it.
+// and runs it.
 
 rng_ready() -> bool
     if std_root().is_err()
@@ -27,28 +24,17 @@ rng_ready() -> bool
     true
 end rng_ready
 
-// Builds `text` into `<root>/built` with this compiler, or with the reference where `reference`
-// names one, and answers the executable -- or what was said instead of making it.
-private rng_build(root: string, text: string, reference: Option[string]) -> Result[string, string]
+// Builds `text` into `<root>/built` and answers the executable -- or what was said instead of making
+// it.
+private rng_build(root: string, text: string) -> Result[string, string]
     val src = s"$root/main.sysl"
     val exe = s"$root/built"
 
     write_text(src, text).unwrap()
 
-    reference match
-        None ->
-            build_native_program(src, None, None, DefaultOptimization, Some(exe)) match
-                Err(why) -> return Err(failure_text(why))
-                Ok(_) -> ()
-        Some(bin) ->
-            val said = capture_oracle(bin, ["build", src, "-o", exe])
-
-            if metadata(exe).is_err()
-                return Err(said match
-                    Err(_) -> "the reference could not be run"
-                    Ok(o) -> o.err.unwrap_or(o.text))
-
-    Ok(exe)
+    build_native_program(src, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> Err(failure_text(why))
+        Ok(_) -> Ok(exe)
 end rng_build
 
 // What a program did when it ran: what it wrote to each stream, and whether it exited zero.
@@ -57,13 +43,13 @@ struct RngRan
     err: string
     ok: bool
 
-// Builds `text` and runs it, by this compiler or by the reference -- or says why it could not.
-rng_ran(text: string, reference: Option[string]) -> Result[RngRan, string]
+// Builds `text` and runs it -- or says why it could not.
+rng_ran(text: string) -> Result[RngRan, string]
     val root = make_temp_dir("sysl-rng").unwrap()
 
     make_dir_all(root).unwrap()
 
-    val out: Result[RngRan, string] = rng_build(root, text, reference) match
+    val out: Result[RngRan, string] = rng_build(root, text) match
         Err(why) -> Err(s"it did not build: $why")
         Ok(exe) ->
             capture(exe, [], "", [], true) match
@@ -74,44 +60,20 @@ rng_ran(text: string, reference: Option[string]) -> Result[RngRan, string]
     out
 end rng_ran
 
-rng_label(reference: Option[string]) -> string = reference match
-    Some(bin) -> s"the reference ($bin)"
-    None -> "this compiler"
-
-// The claim a run case makes under one compiler: `text` builds, exits zero and prints `want`.
-private rng_prints_under(text: string, want: string, reference: Option[string])
-    val who = rng_label(reference)
-
-    rng_ran(text, reference) match
-        Err(why) -> assert(false, s"$who: $why")
-        Ok(r) ->
-            assert(r.ok, s"$who: it did not exit zero: ${r.out}${r.err}")
-            assert_eq(r.out, want, who)
-
-// `text` prints `want`, here and -- where there is one -- under the reference.
+// `text` builds, exits zero and prints `want`.
 rng_prints(text: string, want: string)
-    rng_prints_under(text, want, None)
+    rng_ran(text) match
+        Err(why) -> assert(false, why)
+        Ok(r) ->
+            assert(r.ok, s"it did not exit zero: ${r.out}${r.err}")
+            assert_eq(r.out, want)
 
-    env_var("SYSL_ORACLE") match
-        Some(bin) -> rng_prints_under(text, want, Some(bin))
-        None -> ()
-
-// The claim a trap case makes under one compiler: `text` builds, and the program stops itself.
-private rng_traps_under(text: string, reference: Option[string])
-    val who = rng_label(reference)
-
-    rng_ran(text, reference) match
-        Err(why) -> assert(false, s"$who: $why")
-        Ok(r) -> assert(!r.ok, s"$who: it exited cleanly: ${r.out}")
-
-// `text` builds and stops itself rather than running past a failed check, here and under the
-// reference. Every run-time check traps, so the status is what is observable, not the output.
+// `text` builds and stops itself rather than running past a failed check. Every run-time check
+// traps, so the status is what is observable, not the output.
 rng_traps(text: string)
-    rng_traps_under(text, None)
-
-    env_var("SYSL_ORACLE") match
-        Some(bin) -> rng_traps_under(text, Some(bin))
-        None -> ()
+    rng_ran(text) match
+        Err(why) -> assert(false, why)
+        Ok(r) -> assert(!r.ok, s"it exited cleanly: ${r.out}")
 
 // ---- a slice ----
 

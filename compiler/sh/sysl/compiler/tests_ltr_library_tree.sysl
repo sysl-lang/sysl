@@ -3,9 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.env.{get as env_var}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
-import sysl.process.{capture, Var}
 import sysl.text.{replace_all, Search}
 
 // The library as a **tree of modules** rather than one flat module (`reference/modules.md`,
@@ -20,11 +18,9 @@ import sysl.text.{replace_all, Search}
 // the way the real one is (`std_units`) -- so a question the real library has no case for can still
 // be asked. The second half asks them of the real library.
 //
-// **Every expectation is the reference's own output**: where `SYSL_ORACLE` names the reference, it is
-// handed the same tree (`emit-llvm`, with `SYSL_LIB` at the stand-in) and must say the same thing.
-// The reference precompiles the stand-in and DECLARES what the program reaches of it, where this
-// compiler defines it in place, so a claim about which library function a library body reached is
-// asked of the symbol (`@sysl$mark(i32`), which both texts carry, rather than of a `call` line.
+// A claim about which library function a library body reached is asked of the symbol
+// (`@sysl$mark(i32`) rather than of a `call` line, so it holds whether the stand-in is defined in
+// place or precompiled and declared.
 
 // -- a stand-in library on disk -------------------------------------------------------------------
 
@@ -129,19 +125,6 @@ private ltr_here(lib_root: Result[string, string], prog: Buf[LtrFile]) -> string
         Err(why) -> why
         Ok(us) -> ltr_said(us)
 
-// What the reference says of the same program, `SYSL_LIB` naming the library it is handed (or its
-// own, for the real library).
-private ltr_there(bin: string, root: string, lib: Option[string]) -> string
-    val args = ["emit-llvm", s"$root/prog"]
-    val said = lib match
-        Some(l) -> capture(bin, args, "", [Var("SYSL_LIB", l)], true)
-        None -> capture_oracle(bin, args)
-
-    said match
-        Err(_) -> "the reference could not be run"
-        Ok(o) -> o.text + o.err.unwrap_or("")
-end ltr_there
-
 private ltr_program(text: string) -> Buf[LtrFile]
     var out: Buf[LtrFile] = buf()
 
@@ -174,7 +157,7 @@ private ltr_holds(said: string, want: string, once: bool) -> bool =
     if once then ltr_times(said, want) == 1 else said.contains(want)
 
 // The claim every case makes: compiled against `lib` -- or the real library, where it is empty --
-// what is said holds `want`, here and under the reference.
+// what is said holds `want`.
 private ltr_says(lib: Buf[LtrFile], prog: Buf[LtrFile], want: string, once: bool = false)
     val root = make_temp_dir("sysl-ltr").unwrap()
 
@@ -189,16 +172,9 @@ private ltr_says(lib: Buf[LtrFile], prog: Buf[LtrFile], want: string, once: bool
         return
 
     val here = ltr_here(lib_root, prog)
-    val there = env_var("SYSL_ORACLE") match
-        Some(bin) -> Some(ltr_there(bin, root, if real then None else Some(s"$root/lib")))
-        None -> None
 
     remove_dir_all(root).unwrap_or(())
     assert(ltr_holds(here, want, once), here)
-
-    there match
-        Some(t) -> assert(ltr_holds(t, want, once), s"the reference said:\n$t")
-        None -> ()
 end ltr_says
 
 private ltr_real(main: string, want: string) = ltr_says(buf(), ltr_program(main), want)

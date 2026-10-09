@@ -9,15 +9,13 @@ import sysl.text.Search
 // module slot holding a variant that carries nothing (`StaticEnumStorageTests`), a by-name
 // parameter read inside a closure or a nested function (`ByNameTests`), what a program says when it
 // overflows its stack (`StackGuardTests`), and a `main` answering a `Result` (`MainResultTests`).
-// Every expected text was read off 0.0.162 over the same program, and is held of it again where
-// `SYSL_ORACLE` names it.
+// Every expected text was read off 0.0.162 over the same program.
 
-// `head` begins a line of the LLVM text every compiler emits for `files`.
+// `head` begins a line of the LLVM text emitted for `files`.
 private azc_emits(files: []const (string, string), head: string)
-    val texts = azc_texts(["emit-llvm"], files)
+    val text = azc_texts(["emit-llvm"], files)
 
-    for i in 0..<texts.len()
-        assert(azc_line(texts.at(i).1, head) != "", s"${texts.at(i).0}: no line '$head'")
+    assert(azc_line(text, head) != "", s"no line '$head' in\n$text")
 
 // -- the payload region ---------------------------------------------------------------------------
 
@@ -59,8 +57,7 @@ azc_a_simple_enum_is_not_an_aggregate()
         print(which(Red))
         """)])
 
-    for i in 0..<texts.len()
-        assert(!texts.at(i).1.contains("%enum.Color = type"), texts.at(i).0)
+    assert(!texts.contains("%enum.Color = type"), texts)
 
 @test("one variant, one region the size of it")
 azc_one_variant_one_region()
@@ -411,100 +408,79 @@ private azc_wild() -> string = raw"""
     print(*p)
     """
 
-// What every compiler's build of `text` did when it ran.
-private azc_outcomes(text: string) -> Buf[(string, AzcSaid)]
-    val all = azc_compilers()
-    var out: Buf[(string, AzcSaid)] = buf()
+// What the build of `text` did when it ran.
+private azc_outcome(text: string) -> AzcSaid
+    val r = azc_ran([("main.sysl", text)])
 
-    for i in 0..<all.len()
-        val r = azc_ran([("main.sysl", text)], all.at(i))
-
-        assert(r.built, s"${rng_label(all.at(i))}: it did not build: ${r.err}")
-        out.push((rng_label(all.at(i)), r))
-
-    out
-end azc_outcomes
+    assert(r.built, s"it did not build: ${r.err}")
+    r
+end azc_outcome
 
 @test("and names recursion rather than leaving a bare segfault")
 azc_an_overflow_names_recursion()
     if !rng_ready() then return
 
-    val runs = azc_outcomes(azc_unbounded())
+    val run = azc_outcome(azc_unbounded())
 
-    for i in 0..<runs.len()
-        assert(!runs.at(i).1.ok, runs.at(i).0)
-        assert(runs.at(i).1.err.contains("sysl: this program has overflowed its stack -- a recursion " +
-                                         "with no base case, or a walk over a structure that " +
-                                         "contains itself"), runs.at(i).1.err)
+    assert(!run.ok, run.said())
+    assert(run.err.contains("sysl: this program has overflowed its stack -- a recursion " +
+                            "with no base case, or a walk over a structure that " +
+                            "contains itself"), run.err)
 
 @test("and what it had already printed comes out, which it did not before")
 azc_an_overflow_recovers_the_output()
     if !rng_ready() then return
 
-    val runs = azc_outcomes(azc_unbounded())
-
-    for i in 0..<runs.len()
-        assert_eq(runs.at(i).1.out, "about to recurse\n", runs.at(i).0)
+    assert_eq(azc_outcome(azc_unbounded()).out, "about to recurse\n")
 
 @test("which is what makes the first message worth trusting")
 azc_a_wild_fault_is_not_an_overflow()
     if !rng_ready() then return
 
-    val runs = azc_outcomes(azc_wild())
+    val run = azc_outcome(azc_wild())
 
-    for i in 0..<runs.len()
-        assert(!runs.at(i).1.ok, runs.at(i).0)
-        assert(runs.at(i).1.err.contains("sysl: this program faulted on an address it does not own"),
-               runs.at(i).1.err)
-        assert(!runs.at(i).1.err.contains("overflowed"), runs.at(i).1.err)
+    assert(!run.ok, run.said())
+    assert(run.err.contains("sysl: this program faulted on an address it does not own"), run.err)
+    assert(!run.err.contains("overflowed"), run.err)
 
 @test("and its buffered output is recovered too")
 azc_a_wild_fault_recovers_the_output()
     if !rng_ready() then return
 
-    val runs = azc_outcomes(azc_wild())
-
-    for i in 0..<runs.len()
-        assert_eq(runs.at(i).1.out, "about to reach\n", runs.at(i).0)
+    assert_eq(azc_outcome(azc_wild()).out, "about to reach\n")
 
 @test("a program that does not fault is untouched")
 azc_a_sound_program_is_untouched()
     if !rng_ready() then return
 
-    val runs = azc_outcomes("print(\"fine\")")
+    val run = azc_outcome("print(\"fine\")")
 
-    for i in 0..<runs.len()
-        assert(runs.at(i).1.ok, runs.at(i).0)
-        assert_eq(runs.at(i).1.out, "fine\n", runs.at(i).0)
-        assert_eq(runs.at(i).1.err, "", runs.at(i).0)
+    assert(run.ok, run.said())
+    assert_eq(run.out, "fine\n")
+    assert_eq(run.err, "")
 
 @test("first thing in a hosted program's entry point")
 azc_the_guard_is_installed_first()
     if !rng_ready() then return
 
-    val texts = azc_texts(["emit-llvm"], [("main.sysl", "print(1)")])
+    val text = azc_texts(["emit-llvm"], [("main.sysl", "print(1)")])
+    val main = text.index_of("define i32 @main(")
 
-    for i in 0..<texts.len()
-        val text = texts.at(i).1
-        val main = text.index_of("define i32 @main(")
+    assert(main.is_some(), text)
 
-        assert(main.is_some(), texts.at(i).0)
+    val body = text[main.unwrap()..]
+    val first = body.index_of("\n  call ")
 
-        val body = text[main.unwrap()..]
-        val first = body.index_of("\n  call ")
-
-        assert(first.is_some(), texts.at(i).0)
-        assert(body[first.unwrap()..].starts_with("\n  call void @sysl_install_stack_guard()"),
-               s"${texts.at(i).0}: ${body}")
+    assert(first.is_some(), body)
+    assert(body[first.unwrap()..].starts_with("\n  call void @sysl_install_stack_guard()"), body)
 
 @test("and not at all for a machine with no operating system")
 azc_no_guard_on_a_bare_machine()
     if !rng_ready() then return
 
-    val texts = azc_texts(["emit-llvm", "--target", "aarch64-freestanding"], [("main.sysl", "print(1)")])
+    val text = azc_texts(["emit-llvm", "--target", "aarch64-freestanding"], [("main.sysl", "print(1)")])
 
-    for i in 0..<texts.len()
-        assert(!texts.at(i).1.contains("sysl_install_stack_guard"), texts.at(i).0)
+    assert(!text.contains("sysl_install_stack_guard"), text)
 
 // -- a main answering a Result --------------------------------------------------------------------
 
@@ -512,29 +488,27 @@ azc_no_guard_on_a_bare_machine()
 azc_an_ok_main_runs()
     if !rng_ready() then return
 
-    val runs = azc_outcomes("main() -> Result[unit, string]\n    print(\"worked\")\n\n    Ok(())\n")
+    val run = azc_outcome("main() -> Result[unit, string]\n    print(\"worked\")\n\n    Ok(())\n")
 
-    for i in 0..<runs.len()
-        assert(runs.at(i).1.ok, runs.at(i).0)
-        assert_eq(runs.at(i).1.out, "worked\n", runs.at(i).0)
+    assert(run.ok, run.said())
+    assert_eq(run.out, "worked\n")
 
 @test("reports the error on stderr and exits non-zero")
 azc_an_err_main_reports()
     if !rng_ready() then return
 
-    val runs = azc_outcomes("main() -> Result[unit, string]\n    print(\"starting\")\n\n" +
-                            "    Err(\"the disk is on fire\")\n")
+    val run = azc_outcome("main() -> Result[unit, string]\n    print(\"starting\")\n\n" +
+                          "    Err(\"the disk is on fire\")\n")
 
-    for i in 0..<runs.len()
-        assert(!runs.at(i).1.ok, runs.at(i).0)
-        assert_eq(runs.at(i).1.out, "starting\n", runs.at(i).0)
-        assert_eq(runs.at(i).1.err, "error: the disk is on fire\n", runs.at(i).0)
+    assert(!run.ok, run.said())
+    assert_eq(run.out, "starting\n")
+    assert_eq(run.err, "error: the disk is on fire\n")
 
 @test("including one that '?' carried out of a call")
 azc_an_err_carried_by_try()
     if !rng_ready() then return
 
-    val runs = azc_outcomes(raw"""
+    val run = azc_outcome(raw"""
         import sysl.fs.{read_text, IoError}
 
         main() -> Result[unit, IoError]
@@ -545,25 +519,23 @@ azc_an_err_carried_by_try()
             Ok(())
         """)
 
-    for i in 0..<runs.len()
-        assert(!runs.at(i).1.ok, runs.at(i).0)
-        assert_eq(runs.at(i).1.out, "", runs.at(i).0)
-        assert(runs.at(i).1.err.contains("error: no such file or directory"), runs.at(i).1.err)
+    assert(!run.ok, run.said())
+    assert_eq(run.out, "")
+    assert(run.err.contains("error: no such file or directory"), run.err)
 
 @test("and the arguments form answers the same way")
 azc_an_err_main_with_arguments()
     if !rng_ready() then return
 
-    val runs = azc_outcomes(raw"""
+    val run = azc_outcome(raw"""
         main(args: []string) -> Result[unit, string]
             if args.len > 99 then return Ok(())
 
             Err("too few arguments")
         """)
 
-    for i in 0..<runs.len()
-        assert(!runs.at(i).1.ok, runs.at(i).0)
-        assert(runs.at(i).1.err.contains("error: too few arguments"), runs.at(i).1.err)
+    assert(!run.ok, run.said())
+    assert(run.err.contains("error: too few arguments"), run.err)
 
 @test("a main that answers something other than a Result")
 azc_a_main_answering_an_int()

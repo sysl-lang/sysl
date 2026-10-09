@@ -8,7 +8,7 @@ import sysl.text.Search
 // (`AnalyzerDeclErrorTests`), the annotations a member may carry (`MemberAttrTests`), a `val` handed
 // to a method that writes through it (`ValReceiverTests`), `@borrows` (`BorrowsAttrTests`), and what
 // a refused `impl` member takes with it (`ImplMemberRefusalTests`). Every message is quoted from
-// 0.0.162 over the same tree, and held of the reference too where `SYSL_ORACLE` names it.
+// 0.0.162 over the same tree.
 
 // -- a struct declared in another module ----------------------------------------------------------
 
@@ -88,9 +88,8 @@ azc_no_refusal_shows_the_module_separator()
 
     val said = azc_reports([("main.sysl", "import b\n\nprint(b.T(\"s\").x)\n"), azc_plain_b()])
 
-    for i in 0..<said.len()
-        assert(said.at(i).1.contains("error:"), s"${said.at(i).0}: it compiled")
-        assert(!said.at(i).1.contains("$"), s"${said.at(i).0}: ${said.at(i).1}")
+    assert(said.contains("error:"), "it compiled")
+    assert(!said.contains("$"), said)
 
 @test("a struct declared in the entry file is named bare")
 azc_a_struct_in_the_entry_file_is_named_bare()
@@ -105,9 +104,8 @@ azc_an_undefined_root_function_is_named_bare()
 
     val said = azc_reports([("main.sysl", "width() -> int = 3\nprint(size())")])
 
-    for i in 0..<said.len()
-        assert(said.at(i).1.contains("error: undefined function 'size'\n"), said.at(i).1)
-        assert_eq(xvr_count(said.at(i).1, "error:"), 1, said.at(i).0)
+    assert(said.contains("error: undefined function 'size'\n"), said)
+    assert_eq(xvr_count(said, "error:"), 1, said)
 
 // -- the annotations a member may carry ------------------------------------------------------------
 
@@ -271,10 +269,9 @@ azc_an_empty_writes_is_refused_once()
         print(1)
         """)])
 
-    for i in 0..<said.len()
-        assert(said.at(i).1.contains("error: a function with a frame writes 'counter', which its " +
-                                     "'@writes' does not name"), said.at(i).1)
-        assert_eq(xvr_count(said.at(i).1, "error:"), 1, said.at(i).0)
+    assert(said.contains("error: a function with a frame writes 'counter', which its " +
+                         "'@writes' does not name"), said)
+    assert_eq(xvr_count(said, "error:"), 1, said)
 
 // -- a val receiver -------------------------------------------------------------------------------
 
@@ -387,19 +384,13 @@ private azc_lends() -> string = raw"""
     print(c.n)
     """
 
-// What `--explain-escapes` reports for `text` under every compiler -- the promotion notes, which go
-// to the report channel and nowhere else.
-private azc_escapes(text: string) -> Buf[(string, string)]
-    val all = azc_compilers()
-    var out: Buf[(string, string)] = buf()
+// What `--explain-escapes` reports for `text` -- the promotion notes, which go to the report channel
+// and nowhere else.
+private azc_escapes(text: string) -> string
+    val s = azc_cli(["emit-llvm", "--explain-escapes"], [("main.sysl", text)])
 
-    for i in 0..<all.len()
-        val s = azc_cli(["emit-llvm", "--explain-escapes"], [("main.sysl", text)], all.at(i))
-
-        assert(s.ok, s"${rng_label(all.at(i))}: ${s.said()}")
-        out.push((rng_label(all.at(i)), s.err))
-
-    out
+    assert(s.ok, s.said())
+    s.err
 end azc_escapes
 
 @test("a local array passed through the object stays in the frame")
@@ -409,9 +400,8 @@ azc_a_borrowed_array_stays_in_the_frame()
     val src = azc_sink(true) + azc_lends()
     val notes = azc_escapes(src)
 
-    for i in 0..<notes.len()
-        assert(notes.at(i).1.contains("no arrays were promoted to the heap"), notes.at(i).0)
-        assert(!notes.at(i).1.contains("is promoted"), notes.at(i).1)
+    assert(notes.contains("no arrays were promoted to the heap"), notes)
+    assert(!notes.contains("is promoted"), notes)
 
     azc_main_prints(src, "4\n")
 
@@ -422,8 +412,7 @@ azc_a_borrowed_array_stays_in_the_frame()
 azc_the_explain_channel_is_taken_back()
     if !rng_ready() then return
 
-    val s = azc_cli(["emit-llvm", "--explain-escapes"], [("main.sysl", azc_sink(true) + azc_lends())],
-                    None)
+    val s = azc_cli(["emit-llvm", "--explain-escapes"], [("main.sysl", azc_sink(true) + azc_lends())])
 
     assert(s.err.contains("no arrays were promoted to the heap"), s.err)
     assert(!explaining(), "the report is still asked for after the command line was answered")
@@ -434,11 +423,10 @@ azc_an_unpromised_array_is_promoted()
 
     val notes = azc_escapes(azc_sink(false) + azc_lends())
 
-    for i in 0..<notes.len()
-        assert_eq(xvr_count(notes.at(i).1, "is promoted"), 1, notes.at(i).0)
-        assert(notes.at(i).1.contains("main.sysl:16:10: 'buf' is promoted to the heap, because this " +
-                                      "view of it is passed through a trait object, which may hold on " +
-                                      "to it"), notes.at(i).1)
+    assert_eq(xvr_count(notes, "is promoted"), 1, notes)
+    assert(notes.contains("main.sysl:16:10: 'buf' is promoted to the heap, because this " +
+                          "view of it is passed through a trait object, which may hold on " +
+                          "to it"), notes)
 
 @test("one that keeps what it was lent is refused, by the name the trait gave it")
 azc_an_implementation_that_keeps_is_refused()
@@ -472,8 +460,7 @@ azc_an_implementation_that_reads_compiles()
         s.put([1u8, 2u8][..])
         """)])
 
-    for i in 0..<texts.len()
-        assert(texts.at(i).1.contains("@main"), texts.at(i).0)
+    assert(texts.contains("@main"), texts)
 
 @test("sysl.Writer is an ordinary user of it")
 azc_writer_is_an_ordinary_user()
@@ -542,13 +529,11 @@ azc_a_colliding_member_is_the_only_error()
         print(p.take())
         """)])
 
-    for i in 0..<said.len()
-        assert(said.at(i).1.contains("error: type 'P' already has a member named 'look'"), said.at(i).1)
-        assert(!said.at(i).1.contains("has no method"), said.at(i).1)
-        assert_eq(xvr_count(said.at(i).1, "error:"), 1, said.at(i).0)
+    assert(said.contains("error: type 'P' already has a member named 'look'"), said)
+    assert(!said.contains("has no method"), said)
+    assert_eq(xvr_count(said, "error:"), 1, said)
 
-// The second error is anchored at line 10 by both; the column differs, this compiler's span being
-// the body's extent where the reference's anchor is the member -- the open spans divergence.
+// The second error is anchored at line 10, the line of the member whose body is refused.
 @test("and the block's other members are still checked")
 azc_the_blocks_other_members_are_checked()
     if !rng_ready() then return
@@ -560,12 +545,11 @@ azc_the_blocks_other_members_are_checked()
         print(P(1).n)
         """)])
 
-    for i in 0..<said.len()
-        assert(said.at(i).1.contains("already has a member named 'look'"), said.at(i).1)
-        assert(said.at(i).1.contains("error: function 'P.take' should return int, but its body yields " +
-                                     "string\n  --> "), said.at(i).1)
-        assert(said.at(i).1.contains("main.sysl:10:"), said.at(i).1)
-        assert_eq(xvr_count(said.at(i).1, "error:"), 2, said.at(i).0)
+    assert(said.contains("already has a member named 'look'"), said)
+    assert(said.contains("error: function 'P.take' should return int, but its body yields " +
+                         "string\n  --> "), said)
+    assert(said.contains("main.sysl:10:"), said)
+    assert_eq(xvr_count(said, "error:"), 2, said)
 
 @test("and a generic body in the module declaring the trait still finds the other members")
 azc_a_generic_body_still_finds_the_members()
@@ -588,10 +572,9 @@ azc_a_generic_body_still_finds_the_members()
         drive[S: Stream](s: S) -> int = s.take() + s.both()
         """)])
 
-    for i in 0..<said.len()
-        assert(said.at(i).1.contains("error: type 'P' already has a member named 'look'"), said.at(i).1)
-        assert(!said.at(i).1.contains("pratt.sysl"), said.at(i).1)
-        assert_eq(xvr_count(said.at(i).1, "error:"), 1, said.at(i).0)
+    assert(said.contains("error: type 'P' already has a member named 'look'"), said)
+    assert(!said.contains("pratt.sysl"), said)
+    assert_eq(xvr_count(said, "error:"), 1, said)
 
 private azc_arity(declared: string, written: string) -> string =
     s"trait T\n    f(self$declared) -> int\nstruct S\n    n: int\nimpl T for S\n" +

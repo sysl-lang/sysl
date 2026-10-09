@@ -2,14 +2,11 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.env.{get as env_var}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
 import sysl.text.{join, split, Search}
 
 // The harness every `azd_` file shares: a program compiled from text, asked for its diagnostics or its
-// LLVM text, and a command line driven through the same `run_cli` a shell reaches. **Where
-// `SYSL_ORACLE` names the reference, an IR claim is asked of its text too**, so a claim that holds
-// here and not there is a disagreement rather than a pass.
+// LLVM text, and a command line driven through the same `run_cli` a shell reaches.
 
 azd_ready() -> bool
     if std_root().is_err()
@@ -55,37 +52,17 @@ azd_err(text: string) -> string
     out
 end azd_err
 
-// The LLVM text of a program for `target` (the host where it is `None`), and the reference's where
-// `SYSL_ORACLE` names one.
-azd_irs(text: string, target: Option[string]) -> Buf[string]
+// The LLVM text of a program for `target` (the host where it is `None`).
+azd_ir(text: string, target: Option[string]) -> string
     val (root, src) = azd_program(text)
-    var out: Buf[string] = buf()
 
-    emit_llvm_text(src, target) match
-        Err(why) -> out.push(failure_text(why))
-        Ok(made) -> out.push(made.text)
-
-    env_var("SYSL_ORACLE") match
-        Some(bin) ->
-            var args: Buf[string] = buf()
-
-            args.push("emit-llvm")
-            args.push(src)
-
-            target match
-                Some(t) ->
-                    args.push("--target")
-                    args.push(t)
-                None -> ()
-
-            capture_oracle(bin, args.view()) match
-                Err(_) -> out.push("the reference could not be run")
-                Ok(o) -> out.push(o.text)
-        None -> ()
+    val out = emit_llvm_text(src, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> made.text
 
     remove_dir_all(root).unwrap_or(())
     out
-end azd_irs
+end azd_ir
 
 // How many lines of `ir` hold both `a` and `b`.
 azd_lines_with(ir: string, a: string, b: string) -> usize

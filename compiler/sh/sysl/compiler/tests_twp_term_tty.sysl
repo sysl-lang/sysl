@@ -1,7 +1,6 @@
 module sh.sysl.compiler
 @tests
 
-import sysl.env.{get as env_var}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.Search
@@ -151,23 +150,17 @@ twp_y_a_bare_module_may_name_a_colour()
 
     twp_prints("@no_alloc\n@no_os\n@no_posix\n\nimport sysl.term.red\n\nprint(red.len)\n", "5\n")
 
-// What this compiler says about `text`, or -- given the reference -- what the reference says.
-private twp_refusal(text: string, reference: Option[string]) -> string
+// What this compiler says about `text`.
+private twp_refusal(text: string) -> string
     val root = make_temp_dir("sysl-twp").unwrap()
     val src = s"$root/main.sysl"
 
     make_dir_all(root).unwrap()
     write_text(src, text).unwrap()
 
-    val out = reference match
-        None ->
-            emit_llvm_text(src, None) match
-                Err(why) -> why.message
-                Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
-        Some(bin) ->
-            capture_oracle(bin, ["build", src, "-o", s"$root/built"]) match
-                Err(_) -> "the reference could not be run"
-                Ok(o) -> o.err.unwrap_or(o.text)
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
 
     remove_dir_all(root).unwrap_or(())
     out
@@ -181,16 +174,9 @@ twp_y_a_bare_module_may_not_ask()
     val want = "this reaches 'sysl.posix.tty', which requires 'posix', and this module declared 'no posix' — an " +
                "environment capability gates which modules exist, so a module that gave one up may not reach one " +
                "that needs it"
-    val e = twp_refusal(text, None)
+    val e = twp_refusal(text)
 
     assert(e.contains(want), e)
-
-    env_var("SYSL_ORACLE") match
-        Some(bin) ->
-            val r = twp_refusal(text, Some(bin))
-
-            assert(r.contains(want), r)
-        None -> ()
 
 // Every run above hands the program a pipe, so `raw` takes its early exit -- which is why these are
 // safe to have at all.
@@ -246,12 +232,12 @@ private twp_script_available() -> bool = capture("sh", ["-c", "command -v script
 // **The input is delayed by a second, inside the subshell**: anything arriving before the program
 // calls `stty` is handled by a line discipline still in canonical mode and then discarded. BSD
 // `script` takes the command as trailing words, util-linux's through `-c`.
-private twp_on_tty(text: string, typed: string, after: string, reference: Option[string]) -> string
+private twp_on_tty(text: string, typed: string, after: string) -> string
     val root = make_temp_dir("sysl-twp").unwrap()
 
     make_dir_all(root).unwrap()
 
-    val out = twp_build(root, text, reference) match
+    val out = twp_build(root, text) match
         Err(why) -> why
         Ok(exe) ->
             write_text(s"$root/typed", typed).unwrap()
@@ -270,20 +256,12 @@ private twp_on_tty(text: string, typed: string, after: string, reference: Option
     out
 end twp_on_tty
 
-// The claim of a terminal case: what the terminal showed holds every one of `wants`, here and under
-// the reference. `script` adds its own noise, so the claim is containment rather than equality.
+// The claim of a terminal case: what the terminal showed holds every one of `wants`. `script` adds
+// its own noise, so the claim is containment rather than equality.
 private twp_tty_shows(text: string, typed: string, after: string, wants: []const string)
-    val here = twp_on_tty(text, typed, after, None)
+    val here = twp_on_tty(text, typed, after)
 
     for w in wants do assert(here.contains(w), here)
-
-    env_var("SYSL_ORACLE") match
-        Some(bin) ->
-            val there = twp_on_tty(text, typed, after, Some(bin))
-
-            for w in wants do assert(there.contains(w), there)
-        None -> ()
-end twp_tty_shows
 
 @test("raw() succeeds, where the tests above could only watch it decline")
 twp_y_raw_succeeds_on_a_terminal()

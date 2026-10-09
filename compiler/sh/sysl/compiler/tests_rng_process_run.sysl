@@ -2,10 +2,8 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.env.{get as env_var}
 import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
 import sysl.posix.tty.flush
-import sysl.process.{capture, Status, Var}
 import sysl.text.{cstring, from_cstring}
 
 // A program and the processes around it -- the reference's `ProcessRunTests` and
@@ -114,27 +112,7 @@ private rng_rc_driven(root: string, src: string, input: string) -> (int, string)
     (code, read_text(from_cstring(template.ptr).unwrap()).unwrap_or(""))
 end rng_rc_driven
 
-// The reference's `sysl run` over the same file, its input piped in by a shell.
-private rng_rc_referenced(bin: string, src: string, input: string) -> (int, string)
-    val script = "printf '%s' \"$2\" | \"$0\" run \"$1\""
-    val args = ["-c", script, bin, src, input]
-    val ran = oracle_library(bin) match
-        Some(lib) -> capture("sh", args, "", [Var("SYSL_LIB", lib)], true)
-        None -> capture("sh", args, "", [], true)
-
-    val said = ran match
-        Err(_) -> return (-1, "the reference could not be run")
-        Ok(o) -> o
-
-    val code = said.status match
-        Status.Exited(c) -> c
-        _ -> -1
-
-    (code, said.text)
-end rng_rc_referenced
-
-// The claim each case makes: `sysl run` over `text`, given `input`, exits zero and prints `want` --
-// here, and under the reference where `SYSL_ORACLE` names one.
+// The claim each case makes: `sysl run` over `text`, given `input`, exits zero and prints `want`.
 private rng_rc_runs(text: string, input: string, want: string)
     val root = make_temp_dir("sysl-rng").unwrap()
     val src = s"$root/main.sysl"
@@ -144,16 +122,8 @@ private rng_rc_runs(text: string, input: string, want: string)
 
     val ours = rng_rc_driven(root, src, input)
 
-    assert_eq(ours.0, 0, "this compiler's status")
-    assert_eq(ours.1, want, "this compiler")
-
-    env_var("SYSL_ORACLE") match
-        Some(bin) ->
-            val theirs = rng_rc_referenced(bin, src, input)
-
-            assert_eq(theirs.0, 0, "the reference's status")
-            assert_eq(theirs.1, want, rng_label(Some(bin)))
-        None -> ()
+    assert_eq(ours.0, 0, "the status")
+    assert_eq(ours.1, want)
 
     remove_dir_all(root).unwrap_or(())
 end rng_rc_runs

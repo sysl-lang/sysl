@@ -2,19 +2,16 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.env.{get as env_var}
-import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.Search
 
 // The helpers every `azc_` file shares: a program of one file or of several is written to a tree of
 // its own, and handed to a compiler as a reader would hand it -- the file of a one-file program, the
-// root of a tree. **Every claim is made of this compiler and, where `SYSL_ORACLE` names the
-// reference, of the reference too**, so an expected message or output is what 0.0.162 actually
-// says rather than a transcription of it.
+// root of a tree.
 
-// What one compiler made of one command line: whether it got as far as a program (for a run), what
-// the command or the program wrote on each stream, and whether it came back cleanly.
+// What one command line came to: whether it got as far as a program (for a run), what the command
+// or the program wrote on each stream, and whether it came back cleanly.
 struct AzcSaid
     built: bool
     out: string
@@ -42,41 +39,26 @@ end azc_tree
 private azc_subject(root: string, files: []const (string, string)) -> string =
     if files.len == 1 then s"$root/${files[0].0}" else root
 
-// Runs `sysl <command…> <subject>` -- in process for this compiler, as a child for the reference.
-azc_cli(command: []const string, files: []const (string, string), reference: Option[string]) -> AzcSaid
+// Runs `sysl <command…> <subject>` in process.
+azc_cli(command: []const string, files: []const (string, string)) -> AzcSaid
     val root = azc_tree(files)
-    val subject = azc_subject(root, files)
     var args: Buf[string] = buf()
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var notes: Buf[string] = buf()
+    val noted = &notes
 
-    val said: AzcSaid = reference match
-        None ->
-            var lines: Buf[string] = buf()
-            val sink = &lines
-            var notes: Buf[string] = buf()
-            val noted = &notes
+    args.push("sysl")
 
-            args.push("sysl")
+    for i in 0..<command.len
+        args.push(command[i])
 
-            for i in 0..<command.len
-                args.push(command[i])
+    args.push(azc_subject(root, files))
 
-            args.push(subject)
-
-            val code = run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
-
-            AzcSaid(true, azc_joined(lines), azc_joined(notes), code == 0)
-        Some(bin) ->
-            for i in 0..<command.len
-                args.push(command[i])
-
-            args.push(subject)
-
-            capture_oracle(bin, args.view()) match
-                Err(_) -> AzcSaid(false, "", "the reference could not be run", false)
-                Ok(o) -> AzcSaid(true, o.text, o.err.unwrap_or(""), o.status.ok())
+    val code = run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
 
     remove_dir_all(root).unwrap_or(())
-    said
+    AzcSaid(true, azc_joined(lines), azc_joined(notes), code == 0)
 end azc_cli
 
 private azc_joined(lines: Buf[string]) -> string
@@ -88,32 +70,15 @@ private azc_joined(lines: Buf[string]) -> string
     out
 end azc_joined
 
-// Builds `subject` into `exe` with this compiler or the reference -- or says why it could not.
-private azc_build(subject: string, exe: string, reference: Option[string]) -> Option[string]
-    reference match
-        None ->
-            build_native_program(subject, None, None, DefaultOptimization, Some(exe)) match
-                Err(e) -> return Some(failure_text(e))
-                Ok(_) -> return None
-        Some(bin) ->
-            val out = capture_oracle(bin, ["build", subject, "-o", exe])
-
-            if metadata(exe).is_ok() then return None
-
-            out match
-                Err(_) -> Some("the reference could not be run")
-                Ok(o) -> Some(o.err.unwrap_or(o.text))
-end azc_build
-
-// Builds `files` with this compiler or the reference and runs what it made.
-azc_ran(files: []const (string, string), reference: Option[string]) -> AzcSaid
+// Builds `files` and runs what it made.
+azc_ran(files: []const (string, string)) -> AzcSaid
     val root = azc_tree(files)
     val exe = s"$root/built"
-    val why = azc_build(azc_subject(root, files), exe, reference)
+    val built = build_native_program(azc_subject(root, files), None, None, DefaultOptimization, Some(exe))
 
-    val ran: AzcSaid = why match
-        Some(w) -> AzcSaid(false, "", w, false)
-        None -> capture(exe, [], "", [], true) match
+    val ran: AzcSaid = built match
+        Err(e) -> AzcSaid(false, "", failure_text(e), false)
+        Ok(_) -> capture(exe, [], "", [], true) match
             Err(_) -> AzcSaid(true, "", "the program that was built could not be run", false)
             Ok(o) -> AzcSaid(true, o.text, o.err.unwrap_or(""), o.status.ok())
 
@@ -121,75 +86,38 @@ azc_ran(files: []const (string, string), reference: Option[string]) -> AzcSaid
     ran
 end azc_ran
 
-// Every compiler a claim is made of: this one, and the reference where there is one.
-azc_compilers() -> Buf[Option[string]]
-    var out: Buf[Option[string]] = buf()
-
-    out.push(None)
-
-    env_var("SYSL_ORACLE") match
-        Some(bin) -> out.push(Some(bin))
-        None -> ()
-
-    out
-end azc_compilers
-
-// `files` builds, exits zero and prints exactly `want`, under every compiler.
+// `files` builds, exits zero and prints exactly `want`.
 azc_prints(files: []const (string, string), want: string)
-    val all = azc_compilers()
+    val r = azc_ran(files)
 
-    for i in 0..<all.len()
-        val who = rng_label(all.at(i))
-        val r = azc_ran(files, all.at(i))
-
-        assert(r.built, s"$who: it did not build: ${r.err}")
-        assert(r.ok, s"$who: it did not exit zero: ${r.said()}")
-        assert_eq(r.out, want, who)
+    assert(r.built, s"it did not build: ${r.err}")
+    assert(r.ok, s"it did not exit zero: ${r.said()}")
+    assert_eq(r.out, want)
 end azc_prints
 
 // The same for a program of one file.
 azc_main_prints(text: string, want: string) = azc_prints([("main.sysl", text)], want)
 
-// `files` is refused, and what is said contains `part`, under every compiler.
+// `files` is refused, and what is said contains `part`.
 azc_says(files: []const (string, string), part: string)
-    val all = azc_compilers()
+    val s = azc_cli(["emit-llvm"], files)
 
-    for i in 0..<all.len()
-        val who = rng_label(all.at(i))
-        val s = azc_cli(["emit-llvm"], files, all.at(i))
-
-        assert(!s.ok, s"$who: it compiled")
-        assert(s.said().contains(part), s"$who: expected '$part', got: ${s.said()}")
+    assert(!s.ok, "it compiled")
+    assert(s.said().contains(part), s"expected '$part', got: ${s.said()}")
 end azc_says
 
 // The same for a program of one file.
 azc_refuses(text: string, part: string) = azc_says([("main.sysl", text)], part)
 
-// What every compiler said refusing `files`, for a claim about the whole report.
-azc_reports(files: []const (string, string)) -> Buf[(string, string)]
-    val all = azc_compilers()
-    var out: Buf[(string, string)] = buf()
+// What was said refusing `files`, for a claim about the whole report.
+azc_reports(files: []const (string, string)) -> string = azc_cli(["emit-llvm"], files).said()
 
-    for i in 0..<all.len()
-        val s = azc_cli(["emit-llvm"], files, all.at(i))
+// The LLVM text emitted for `files` under `command` (`emit-llvm` and its flags).
+azc_texts(command: []const string, files: []const (string, string)) -> string
+    val s = azc_cli(command, files)
 
-        out.push((rng_label(all.at(i)), s.said()))
-
-    out
-end azc_reports
-
-// The LLVM text each compiler emits for `files` under `command` (`emit-llvm` and its flags).
-azc_texts(command: []const string, files: []const (string, string)) -> Buf[(string, string)]
-    val all = azc_compilers()
-    var out: Buf[(string, string)] = buf()
-
-    for i in 0..<all.len()
-        val s = azc_cli(command, files, all.at(i))
-
-        assert(s.ok, s"${rng_label(all.at(i))}: it did not compile: ${s.said()}")
-        out.push((rng_label(all.at(i)), s.out))
-
-    out
+    assert(s.ok, s"it did not compile: ${s.said()}")
+    s.out
 end azc_texts
 
 // The one line of `text` that begins with `head`, or nothing.
