@@ -173,6 +173,10 @@ lfb_two_files_of_one_module_reach_each_other()
         Some(r) -> r
 
     val units = std_units(root, host_target()).unwrap()
+    var modules: Buf[string] = buf()
+
+    for u in units
+        modules.push(module_of_unit(u))
 
     for u in units
         if u.src.name == "library/sysl/write.sysl" then assert_eq(lfb_traits(u), "Writer")
@@ -183,8 +187,17 @@ lfb_two_files_of_one_module_reach_each_other()
         for j in 0..<u.body.len()
             *u.body.at(j).kind match
                 ImportDecl(d) ->
-                    // A bare path names the module with the imported name still on the end.
-                    val keep = if d.selectors.is_empty() && !d.wildcard then d.path.len() - 1 else d.path.len()
+                    // A bare path names the module with the imported name still on the end --
+                    // unless the whole path is a module, which is imported as itself
+                    // (`import sysl.fs.sys as fsys` in `sysl.fs` names its submodule, not itself).
+                    val whole = join(d.path.view(), ".")
+                    var is_module = false
+
+                    for m in modules
+                        if m == whole then is_module = true
+
+                    val bare = d.selectors.is_empty() && !d.wildcard && !is_module
+                    val keep = if bare then d.path.len() - 1 else d.path.len()
                     var named: Buf[string] = buf()
 
                     for k in 0..<keep do named.push(d.path.at(k))

@@ -37,6 +37,7 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
 
     check_tail_calls(a, p.funcs)
     check_tail_jumps(a, p)
+    check_shared_storage(a, p)
     check_exports_emitted(a, emitted, own)
     check_general_regs(a, emitted)
     promotions
@@ -344,47 +345,76 @@ check_image_storage(a: &Analysis, p: TProgram, own: Buf[string], entry: string)
                 "is laid straight into the image")
 end check_image_storage
 
-// The module whose `extern`s are the calls `sysl.fs` makes of a filesystem, and which a program on a
-// target with no C library answers itself.
-private const filesystem_hooks: string = "sysl.fs.sys"
+// A module of hooks: the `extern`s a part of the standard library makes of whatever is under it, which
+// the library answers over the C library on a hosted target (`seam_supply.sysl`) and a program on a
+// target with no C library answers itself, with an `@export` per symbol.
+private struct HookModule
+    // The module declaring the `extern`s.
+    hooks: string
+    // The library modules whose functions reach them, a prefix: the report is ordered among the
+    // others by the first of these the program reached.
+    users: string
+    // What the program was doing, what the library would have answered with, and what each hook
+    // answers -- the three clauses of the refusal that are this module's own.
+    reaches: string
+    answers_with: string
+    answering: string
+end HookModule
 
-// **A hook of `sysl.fs.sys` the program reaches, on a target the library answers none of them for.**
+// Every module of hooks the library declares. A new one is a row here and nothing else.
+private hook_modules() -> Buf[HookModule]
+    var rows: Buf[HookModule] = buf()
+
+    rows.push(HookModule("sysl.fs.sys", "sysl.fs", "reaches 'sysl.fs'", "a filesystem",
+                         "zero or the code of an 'IoError'"))
+    rows.push(HookModule("sysl.io.sys", "sysl.io", "reads or flushes a descriptor", "one",
+                         "a count or zero, or the code of an 'IoError' negated"))
+    rows.push(HookModule("sysl.process.sys", "sysl.process", "starts or waits for a process", "one",
+                         "a process id, a length or zero, or the code of an 'IoError' negated"))
+    rows
+end hook_modules
+
+// **A hook the program reaches, on a target the library answers none of them for.**
 //
-// On a hosted target `sysl.fs.hosted` supplies every hook over the C library. A freestanding target
-// has no C library, so that module is never taken there and the program answers the hooks with an
-// `@export` per symbol -- and one it reached and left unanswered would otherwise surface at the link
-// as an undefined symbol named nowhere in the program's source. So the hooks still unanswered after
-// pruning are refused here, all of them in one sentence. The walk is the reachability one: a program
-// that never reaches `sysl.fs` reaches none of its hooks and is not asked about any.
-check_filesystem_hooks(a: &Analysis, p: TProgram)
+// On a hosted target the library supplies every hook over the C library (`sysl.fs.hosted`,
+// `sysl.io.hosted`). A freestanding target has no C library, so no supplier is taken there and the
+// program answers the hooks with an `@export` per symbol -- and one it reached and left unanswered
+// would otherwise surface at the link as an undefined symbol named nowhere in the program's source. So
+// the hooks still unanswered after pruning are refused here, one sentence per module of hooks. The
+// walk is the reachability one: a program that never reaches a hook is not asked about it.
+check_library_hooks(a: &Analysis, p: TProgram)
+    if os_hosted(a.tables.target.os) || p.funcs.is_empty() then return
+
+    for m in hook_modules()
+        check_hook_module(a, p, m)
+end check_library_hooks
+
+private check_hook_module(a: &Analysis, p: TProgram, m: HookModule)
     val t = a.tables.target
-
-    if os_hosted(t.os) then return
-
     var missing: Buf[string] = buf()
 
     for x in p.externs
-        if module_of(x.name) != filesystem_hooks || exported_here(p, x.symbol) then continue
+        if module_of(x.name) != m.hooks || exported_here(p, x.symbol) then continue
         if !holds_string(missing, s"'${x.symbol}'") then missing.push(s"'${x.symbol}'")
 
-    if missing.is_empty() || p.funcs.is_empty() then return
+    if missing.is_empty() then return
 
     // The report has no position, the complaint being about the program as a whole; a function of
-    // `sysl.fs` the program reached only orders it among the others.
+    // the hooks' users the program reached only orders it among the others.
     var at = p.funcs.at(0)
 
     for f in p.funcs
-        if module_of(f.name).starts_with("sysl.fs")
+        if module_of(f.name).starts_with(m.users)
             at = f
             break
         end if
 
     a.fault_unplaced(func_home(a, at.name), at.span,
-            s"this program reaches 'sysl.fs', and '${t.name}' has no C library under it for the " +
-            "standard library to answer a filesystem with, so the program answers it: define " +
+            s"this program ${m.reaches}, and '${t.name}' has no C library under it for the " +
+            s"standard library to answer ${m.answers_with} with, so the program answers it: define " +
             s"${joined_list(sorted_names(missing))} with '@export', each taking what its 'extern' " +
-            "in 'sysl.fs.sys' declares and answering zero or the code of an 'IoError'")
-end check_filesystem_hooks
+            s"in '${m.hooks}' declares and answering ${m.answering}")
+end check_hook_module
 
 // **Storage on the heap of a type aligned beyond what the allocating pair promises, with nothing to
 // answer the aligned hook.**

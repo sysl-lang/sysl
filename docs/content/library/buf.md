@@ -514,7 +514,9 @@ c_free(ptr_cast(o))
 ```
 
 `Map`, `Deque`, `Set` and `Heap` behave the same way and each has its own `release()`
-([containers](/library/container/)).
+([containers](/library/container/)). A plain `&T` field in such storage is emptied the same way by
+the built-in `release(o.field)`
+([memory](/reference/memory/#storage-the-compiler-did-not-lay-out-may-not-hold-a-counted-value)).
 
 ## Capacity, and what it costs
 

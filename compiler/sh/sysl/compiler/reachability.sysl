@@ -176,6 +176,70 @@ vals_reached_from(p: TProgram, f: TFunc) -> Buf[string]
     reached_from(p, func_index(p), root).vals
 end vals_reached_from
 
+// The module storage code running in another concurrency domain reaches from `roots`, each with the
+// first function found reading it -- the walk `sharing.sysl`'s `check_shared_storage` holds a `&sync`
+// body and an interrupt handler to.
+//
+// **A dynamic call is answered only with the tables the walk itself erased a value into**, not with
+// every table for the trait as `reached_from` answers it. Anything a body in the other domain can call
+// through an object reached it as that object, and an object arrives there in one of two ways: made
+// inside the domain, which is an erasure this walk sees, or handed across as a `&sync` object, whose
+// own erasure is a root of the check already. Answering with every table would charge a job with the
+// storage every closure in the program reads.
+storage_reached_in_domain(p: TProgram, roots: Buf[string]) -> Buf[(string, string)]
+    val index = func_index(p)
+    val none = p.funcs.len()
+    val seen = no_reached()
+
+    var tables: Map[string, usize] = map()
+
+    for i in 0..<p.vtables.len()
+        tables.put(p.vtables.at(i).name, i)
+
+    var queue: Buf[string] = buf()
+    var out: Buf[(string, string)] = buf()
+
+    for item in roots
+        if add_call(seen, item) then queue.push(item)
+
+    while !queue.is_empty()
+        val name = queue.at(queue.len() - 1)
+
+        queue.truncate(queue.len() - 1)
+
+        var at = index.first.get_or(name, none)
+
+        while at < none
+            val f = p.funcs.at(at)
+            val refs = domain_refs(f)
+
+            for v in refs.vals
+                if add_val(seen, v) then out.push((v, f.name))
+
+            for t in refs.erased
+                if add_erased(seen, t)
+                    tables.get(t) match
+                        Some(k) ->
+                            for slot in p.vtables.at(k).slots
+                                if add_call(seen, slot.target) then queue.push(slot.target)
+                        None -> ()
+
+            for c in refs.calls
+                if add_call(seen, c) then queue.push(c)
+
+            at = index.next.at(at)
+
+    out
+end storage_reached_in_domain
+
+// What one body names, as `body_refs` reads it, but with a dynamic call left unanswered.
+private domain_refs(f: TFunc) -> &Live
+    val out = no_reached()
+
+    walk_block_stmts(f.body, TWalk(true, e -> take_node(out, e), w -> take_write(out, w), s -> ()))
+    out
+end domain_refs
+
 // The module storage an initializer reads, directly or through anything it calls -- which is what
 // settles the order computed storage is filled in. It is asked while the analysis is still running,
 // so there is no program yet, only the bodies typed so far and the tables built for them.

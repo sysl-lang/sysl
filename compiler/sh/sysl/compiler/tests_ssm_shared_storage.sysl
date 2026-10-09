@@ -1,0 +1,222 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Module storage reached from another concurrency domain (`sharing.sysl`'s `check_shared_storage`):
+// a body erased into a `&sync` object, or an interrupt handler, may not reach a module `var` whose
+// count is not atomic -- the rule a closure's captures are held to, asked of what it names instead of
+// what it captured, and as far down the calls as the storage is.
+//
+// **The reference compiler has no such check** (its capture check stopped at module storage, keel
+// FINDINGS 22), so the messages are the design's own, worded as the capture refusal is worded.
+
+private var ssm_library_names: Buf[string] = buf()
+private var ssm_library_units: Buf[Buf[Program]] = buf()
+
+// The library as one machine reads it, read once per machine.
+private ssm_library(t: Target) -> Buf[Program]
+    for i in 0..<ssm_library_names.len()
+        if ssm_library_names.at(i) == t.name then return ssm_library_units.at(i)
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    ssm_library_names.push(t.name)
+    ssm_library_units.push(out)
+    out
+end ssm_library
+
+private ssm_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+// The first thing a program in module `demo` is refused with on a machine, or nothing where it is
+// accepted -- the analysis and every check made on the way to lowering.
+private ssm_err_on(machine: string, text: string) -> string
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+
+    for item in ssm_library(t)
+        units.push(item)
+
+    val parsed = parse(source_of("test.sysl", "module demo\n\n" + text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), true)
+    val early = ssm_first_of(done.reported)
+
+    if early != "" then return early
+
+    var own: Buf[string] = buf()
+
+    own.push("")
+    own.push("demo")
+
+    post_analysis_checks(done.an, program_of(done, done.main_module), own)
+    ssm_first_of(done.an.diagnostics())
+end ssm_err_on
+
+private ssm_err(text: string) -> string = ssm_err_on(host_target().name, text)
+
+private ssm_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end ssm_first_of
+
+private ssm_cell() -> string = "struct Cell\n    n: u64\n\n"
+
+private ssm_closure_head() -> string =
+    "a closure shared between two domains may be called from either, so every count it reaches has " +
+    "to be atomic — "
+
+private ssm_hold() -> string = "whose count is not. Hold it as a '&sync demo.Cell' ('06')"
+
+@test("a '&sync Fn' reading a module 'var' holding a '&T' is refused at the closure")
+ssm_sync_closure_reading_a_counted_var_is_refused()
+    if !ssm_ready() then return
+
+    assert_eq(ssm_err(ssm_cell() + raw"""
+        var direct: &Cell = Cell(0)
+
+        run()
+            val job: &sync Fn() -> unit = () -> direct.n += 1
+            job()
+        """),
+        ssm_closure_head() + "but the module storage 'demo.direct' it reaches is a '&demo.Cell', " + ssm_hold())
+end ssm_sync_closure_reading_a_counted_var_is_refused
+
+@test("and so is one that reaches it through a function it calls, which the message names")
+ssm_transitive_read_is_refused()
+    if !ssm_ready() then return
+
+    assert_eq(ssm_err(ssm_cell() + raw"""
+        var shared: Option[&Cell] = None
+
+        touch_shared()
+            shared match
+                Some(c) -> c.n += 1
+                None -> ()
+
+        run()
+            val job: &sync Fn() -> unit = () -> touch_shared()
+            job()
+        """),
+        ssm_closure_head() + "but the module storage 'demo.shared' it reaches, which 'demo.touch_shared' " +
+        "reads, holds a '&demo.Cell' in its 'Some(value)', " + ssm_hold())
+end ssm_transitive_read_is_refused
+
+@test("a named function read into a '&sync Fn' is held to what its body reaches")
+ssm_named_function_is_refused()
+    if !ssm_ready() then return
+
+    assert_eq(ssm_err(ssm_cell() + raw"""
+        var direct: &Cell = Cell(0)
+
+        bump()
+            direct.n += 1
+
+        run()
+            val job: &sync Fn() -> unit = bump
+            job()
+        """),
+        ssm_closure_head() + "but the module storage 'demo.direct' it reaches, which 'demo.bump' reads, " +
+        "is a '&demo.Cell', " + ssm_hold())
+end ssm_named_function_is_refused
+
+@test("a module 'Buf' is refused in the words a container's unnameable core gets")
+ssm_buf_var_is_refused()
+    if !ssm_ready() then return
+
+    assert_eq(ssm_err(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var lines: Buf[string] = buf()
+
+        run()
+            val job: &sync Fn() -> unit = () -> lines.push("x")
+            job()
+        """),
+        ssm_closure_head() + "but the module storage 'demo.lines' it reaches is a 'sysl.buf.Buf[string]', " +
+        "which is shared through a count that is not atomic, and no spelling of it can cross into a " +
+        "'&sync' ('06')")
+end ssm_buf_var_is_refused
+
+@test("a module scalar, 'Atomic', '&sync T', raw pointer and '@thread_local' are all reachable")
+ssm_crossable_storage_is_accepted()
+    if !ssm_ready() then return
+
+    assert_eq(ssm_err(ssm_cell() + raw"""
+        import sysl.sync.Atomic
+
+        var count: u64 = 0
+        var hits: Atomic[u64] = Atomic(0)
+        var safe: Option[&sync Cell] = None
+        var raw: *Cell = null
+        @thread_local
+        var mine: u64 = 0
+
+        run()
+            val job: &sync Fn() -> unit = () ->
+                count += 1
+                hits.add(1)
+                mine += 1
+                safe match
+                    Some(c) -> c.n += 1
+                    None -> ()
+                if raw != null then raw.n += 1
+            job()
+        """), "")
+end ssm_crossable_storage_is_accepted
+
+@test("a counted 'var' no other domain reaches is accepted, a plain '&Fn' included")
+ssm_unreached_var_is_accepted()
+    if !ssm_ready() then return
+
+    assert_eq(ssm_err(ssm_cell() + raw"""
+        var direct: &Cell = Cell(0)
+        var count: u64 = 0
+
+        run()
+            direct.n += 1
+
+            val local: &Fn() -> unit = () -> direct.n += 1
+            val job: &sync Fn() -> unit = () -> count += 1
+
+            local()
+            job()
+        """), "")
+end ssm_unreached_var_is_accepted
+
+@test("an interrupt handler reaching a counted module 'var' is refused at the handler")
+ssm_interrupt_handler_is_refused()
+    if !ssm_ready() then return
+
+    assert_eq(ssm_err_on("x86_64-linux", ssm_cell() + raw"""
+        struct Frame
+            ip: u64
+
+        var direct: &Cell = Cell(0)
+
+        interrupt fault(f: *Frame)
+            direct.n += 1
+        """),
+        "'demo.fault' is an interrupt handler, entered on top of whatever was running, so every count " +
+        "it reaches has to be atomic — but the module storage 'demo.direct' it reaches is a " +
+        "'&demo.Cell', " + ssm_hold())
+end ssm_interrupt_handler_is_refused

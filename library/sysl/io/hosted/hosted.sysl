@@ -1,0 +1,58 @@
+module sysl.io.hosted
+
+// `sysl.io.sys`'s hooks answered over the platform's C library, which is what every hosted target
+// links. **Call `sysl.io` and `sysl.flush` instead** -- nothing here is meant to be called: each
+// function below exists to be linked under a hook's symbol, and is public only because an `@export`
+// may not be `private`.
+//
+// **Nothing imports this module, and nothing has to.** A hook a program reaches is answered by the
+// library's own supplier (`reference/ffi.md § A module may supply another module's extern`), and its
+// exports are `weak`, so a program answering a hook itself is the one the link keeps. The bodies exist
+// only on a hosted target: a freestanding one has no C library to answer with, so there the program
+// answers the hooks it reaches, and one it leaves unanswered is refused by name when it is compiled.
+//
+// **No capability clause, unlike `sysl.fs.hosted`.** Standard input and output are not the
+// filesystem, and a hosted program that gave `os` away has always been able to read its input and
+// flush its output; requiring `os` here would leave such a program linking against nothing.
+
+#if hosted
+// `errno` is a function on every platform this builds for, spelled per C library; see
+// `sysl.fs.hosted`, which reads it the same way.
+#if bsd
+private extern "__error" errno_location() -> *i32
+#elif android
+private extern "__errno" errno_location() -> *i32
+#else
+private extern "__errno_location" errno_location() -> *i32
+#endif
+
+private extern "read" c_read(fd: int, into: *u8, n: usize) -> isize
+private extern "write" c_write(fd: int, from: *u8, n: usize) -> isize
+
+// `NULL` flushes every open output stream rather than naming one: naming `stdout` itself would need an
+// `extern` variable, and `stdout` is a `#define` on Darwin that no `extern` reaches.
+private extern "fflush" c_fflush(stream: *u8) -> int
+
+/** The code a failed call left behind, negated: what a hook answers for a failure.
+ * Asked straight after the call, so nothing can have overwritten it.
+ */
+private failure() -> isize
+    val code = errno_location()[0]
+
+    if code > 0 then -isize(code) else -1
+
+@export("sysl_io_read")
+io_read(fd: int, into: *u8, room: usize) -> isize
+    val k = c_read(fd, into, room)
+
+    if k < 0 then failure() else k
+
+@export("sysl_io_write")
+io_write(fd: int, from: *u8, len: usize) -> isize
+    val k = c_write(fd, from, len)
+
+    if k < 0 then failure() else k
+
+@export("sysl_io_flush")
+io_flush(fd: int) -> int = if c_fflush(null) == 0 then 0 else int(failure())
+#endif

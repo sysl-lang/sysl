@@ -1962,9 +1962,6 @@ first(p: Pair[int]) -> int = p.0
 alias 'Pair' takes 2 type arguments, but 1 type argument was given
 ```
 
-Only an alias takes parameters. A `new`, `within` or `where` type is one type of its own, so writing
-it with a parameter list is refused.
-
 Adding `new` makes it a genuinely distinct type, and `within` and `where` add checked bounds:
 
 ```sysl
@@ -1983,6 +1980,66 @@ print(f64(d) * 2.0, u8(s))
 
 `new`, `within` and `where` are contextual words, so a function or field may still be named `where`.
 See [errors and contracts](/reference/errors/) for what a bound costs and when it is checked.
+
+### A `new` type may take parameters
+
+A `new` type may take type parameters too, and they are **phantom**: the base is still a scalar, so
+`UserPtr[Frame]` and `UserPtr[u8]` are both laid out as a `u64` — and are two types, neither of which
+passes for the other or for the `u64`. What the parameter buys is that a function can read it back. A
+conversion names the arguments, or takes them from where the value goes, and `u64(p)` reads the base
+back as for any `new` type:
+
+```sysl
+struct Frame
+    sp: u64
+    pc: u64
+
+type UserPtr[T] = new u64
+
+size_at[T](p: UserPtr[T]) -> usize = sizeof(T)
+
+next[T](p: UserPtr[T]) -> UserPtr[T] = UserPtr[T](u64(p) + u64(sizeof(T)))
+
+val f = UserPtr[Frame](4096)
+val b: UserPtr[u8] = UserPtr(4096)
+
+print(size_at(f), size_at(b), u64(next(f)), u64(next(b)))
+```
+
+```output
+16 1 4112 4097
+```
+
+The argument is part of the type, so one written where another is wanted is refused:
+
+```sysl
+struct Frame
+    sp: u64
+
+type UserPtr[T] = new u64
+
+take(p: UserPtr[Frame]) -> u64 = u64(p)
+
+print(take(UserPtr[u8](1)))
+```
+
+```error
+'p' of 'take' is UserPtr[Frame], but UserPtr[byte] was given
+```
+
+An argument that is only a second name for a type — a measured `c type`, an exported alias — is that
+type here as everywhere, so `UserPtr[Word]` over `@export type Word = u64` is `UserPtr[u64]`.
+
+**Only a plain `new` type takes parameters.** A `within`, `where` or `wrapping` type is one check, and
+an `@export` type one name in a header, so there is nothing for an argument to fill:
+
+```sysl
+type Slot[T] = new u8 within 0..<8
+```
+
+```error
+'Slot' takes type parameters, and only a transparent alias or a plain 'new' type may
+```
 
 ## Traits, impls, and externs
 

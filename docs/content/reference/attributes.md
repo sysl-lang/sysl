@@ -1570,6 +1570,65 @@ target's ordinary byte order for an integer of that width. A wire format's byte 
 protocol rather than to the CPU, and stays with
 [`sysl.encoding.binary`](/library/encoding/)'s `get_u16_le` and the rest.
 
+**Being one integer, it goes to and from that integer with nothing in between.** `T::Bits(n)` makes
+the struct from the integer it is stored as and `x.bits` reads that integer back — the same pair a
+[fixed-point](/reference/fixed-point/) type has, and for the same reason: neither converts anything,
+both read one set of bits at another type. A system register read whole is decoded in one step:
+
+```sysl
+@packed
+struct Esr
+    iss: u25
+    il: u1
+    ec: u6
+    iss2: u5
+    res0: u27
+
+val e = Esr::Bits(0xF2000000)
+
+print(e.ec, e.il, e.iss, e.bits)
+print((e with { iss = 7 }).bits)
+```
+
+```output
+60 1 0 4060086272
+4060086279
+```
+
+**The integer is the struct's own: unsigned, and as wide as its container** — the fields' widths
+added and rounded up to whole bytes, so `Esr` is a `u64` and a struct of 3 and 21 bits a `u24`. A
+literal takes that type from where it sits; a value of any other width or signedness is refused
+rather than widened, narrowed or reinterpreted, since that would be a second conversion hidden inside
+the first:
+
+```sysl
+@packed
+struct Esr
+    iss: u25
+    il: u1
+    ec: u6
+    iss2: u5
+    res0: u27
+
+val low: u32 = 0x3c
+
+print(Esr::Bits(low).ec)
+```
+
+```error
+'Esr::Bits' takes the ulong 'Esr' is stored as, not uint
+```
+
+`Esr(raw)` is not the spelling because it is already the constructor, which takes one value per
+field — and a bitfield struct of a single field would make it mean two things. Only a bitfield struct
+has `::Bits`: an ordinary struct, and a `@packed` one whose fields are all whole bytes, are laid out
+as fields rather than as one integer, and `P::Bits(n)` on one is refused saying so. A field or member
+the struct declares named `bits` is what `.bits` reaches, ahead of the container.
+
+**Nothing is checked on the way in.** The bits are taken as they are, so an enum-typed field may hold
+a value none of its variants has; the field is held to its variants where it is read, as one reached
+through a pointer the hardware filled is.
+
 **Every field has to be an integer.** A `bool` is not one here — its storage is a byte and its
 representation a bit — and neither is a pointer, a float or an array:
 
@@ -1683,6 +1742,59 @@ value 42 is not one of the enum's variants (main.sysl:12:11)
 
 An enum whose variants cover every value of its width — two variants in `u1`, four in `u2` — has
 nothing to check, and its read is the shift and nothing more.
+
+**The fallible read is `E.try(s.field)`** — the [conversion that answers instead of
+trapping](/reference/errors/#turning-a-trap-back-into-a-value), handed the field itself. The field's
+bits are read without the check and answered for: `Some` of the variant they are, or `None`. It is
+how a kernel asks for "the exception class, if it is one I know" without declaring the field a plain
+`u6`:
+
+```sysl
+enum Ec: u6
+    Unknown = 0x00
+    Brk = 0x3c
+
+@packed
+struct Esr
+    low: u26
+    ec: Ec
+    high: u32
+
+describe(class: Option[Ec]) -> string = class match
+    Some(c) -> Ec::Image(c)
+    None -> "a class this kernel does not know"
+
+var raw: u64 = u64(0x2a) << 26
+val e: *Esr = ptr_cast(&raw)
+
+print(describe(Ec.try(e.ec)))
+
+raw = u64(0x3c) << 26
+print(describe(Ec.try(e.ec)))
+```
+
+```output
+a class this kernel does not know
+Brk
+```
+
+A signed enum's field answers by its two's-complement bits, as its read does, and where the variants
+cover the width `try` is `Some` with no test at all. Only a bitfield's enum field is taken as it is —
+a value of the enum read anywhere else has been held to its variants already:
+
+```sysl
+enum Ec: u6
+    Unknown = 0x00
+    Brk = 0x3c
+
+val c = Ec.Brk
+
+print(Ec.try(c).is_some())
+```
+
+```error
+'Ec' converts an integer, but the value has type Ec — a value of the enum is already one of its variants
+```
 
 **A bitfield has no byte offset**, so `offsetof` says so rather than rounding down to the byte the
 field begins in:

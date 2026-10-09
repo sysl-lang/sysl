@@ -2,6 +2,8 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.math.bigint.to_string
+import sysl.text.str_builder
 
 // Inline assembly: which arm this target is built for, and what each operand names.
 //
@@ -45,9 +47,10 @@ end type_asm
 //
 // The arms are checked exactly as a function's are -- named processors, one arm each, every processor
 // answered -- so a block missing an architecture is found on the build that has one. What is refused
-// in addition is everything that talks to surrounding code, because there is none: an operand, a
-// `clobbers` line and a `{name}` placeholder, in EVERY arm, the mistake being the same whichever
-// machine is being built for.
+// in addition is everything that talks to surrounding code, because there is none: an operand and a
+// `clobbers` line, in EVERY arm, the mistake being the same whichever machine is being built for. A
+// `{NAME}` is not an operand here but a constant, written into the text as its decimal value
+// (`with_constants`); it too is checked in every arm.
 check_module_asm(a: &Analysis, units: Buf[Program])
     for unit in units
         for j in 0..<unit.body.len()
@@ -69,14 +72,20 @@ private type_module_asm(cx: &Analyzer, span: Span, arms: Buf[AsmArm], section: O
     check_no_overlap(cx, arms)
     check_exhaustive(cx, span, arms)
 
+    val here = cpu_symbol(cx.an.tables.target.cpu)
+    var written_here: Buf[string] = buf()
+
     for item in arms
         item.body match
             AsmCode(lines, operands, clobbers) ->
-                refuse_module_operands(cx, item.span, lines, operands, clobbers)
+                refuse_module_operands(cx, item.span, operands, clobbers)
+
+                val written = with_constants(cx, item.span, lines)
+
+                if takes(item, here) then written_here = written
             AsmUnavailable(_) -> ()
 
     val boundary_at = boundary(cx, "asm", align)
-    val here = cpu_symbol(cx.an.tables.target.cpu)
     val arm = arm_for(arms, here)
 
     if arm.is_none() then return None
@@ -85,13 +94,13 @@ private type_module_asm(cx: &Analyzer, span: Span, arms: Buf[AsmArm], section: O
         AsmUnavailable(reason) ->
             cx.fault(arm.unwrap().span, s"this operation has no answer on $here: $reason")
             None
-        AsmCode(lines, _, _) -> Some(TModuleAsm(lines, section, boundary_at, scaffolding, home))
+        AsmCode(_, _, _) -> Some(TModuleAsm(written_here, section, boundary_at, scaffolding, home))
 end type_module_asm
 
 // What only a block inside a function can mean. Each refusal says what to write instead, since the
 // reader's intent -- reaching a value, or keeping a register -- has a spelling at module level too.
-private refuse_module_operands(cx: &Analyzer, span: Span, lines: Buf[string],
-                               operands: Buf[AsmOperand], clobbers: Buf[string])
+private refuse_module_operands(cx: &Analyzer, span: Span, operands: Buf[AsmOperand],
+                               clobbers: Buf[string])
     for item in operands
         cx.fault(item.span, s"'${item.name}' cannot be an operand here: an " +
                  "'asm' block at the top of a file is outside every function, so there is no " +
@@ -104,24 +113,103 @@ private refuse_module_operands(cx: &Analyzer, span: Span, lines: Buf[string],
                  "destroys, and a block at the top of a file has no code around it — nothing runs " +
                  "it in the middle of a function. Delete the line; whatever calls into these " +
                  "instructions keeps its own registers by the calling convention")
+end refuse_module_operands
+
+// **A `{NAME}` in a block at the top of a file is a constant written into the text.** There is no
+// code around the block to hand a register over, but a `const` is a number while compiling, so it can
+// be laid into the instructions as its decimal value -- which is how a frame size or a field offset
+// the assembly shares with a struct is written once, as `sizeof` or `offsetof`, rather than as a
+// literal kept in step by hand. A doubled brace stays doubled, the emitter collapsing it, so it still
+// means one brace for the assembler. A line whose constant was refused keeps the placeholder as
+// written, the build stopping at the refusal anyway.
+private with_constants(cx: &Analyzer, span: Span, lines: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
 
     for item in lines
-        var names: Buf[string] = buf()
+        out.push(line_with_constants(cx, span, item))
 
-        placeholders(&names, item)
+    out
+end with_constants
 
-        for j in 0..<names.len()
-            cx.fault(span, s"'{${names.at(j)}}' names an operand, and an 'asm' block at the top " +
-                     "of a file has none. Write '{{' and '}}' for a brace the assembler is to see")
-end refuse_module_operands
+// One line with each `{NAME}` replaced. It is copied in runs cut only at a brace, so a cut never lands
+// inside a character the line spells in more than one byte.
+private line_with_constants(cx: &Analyzer, span: Span, line: string) -> string
+    val b = line.bytes
+    var s = str_builder()
+    var from: usize = 0
+    var i: usize = 0
+
+    while i < b.len
+        if (b[i] == u8('{') || b[i] == u8('}')) && i + 1 < b.len && b[i + 1] == b[i]
+            i = i + 2
+        else if b[i] == u8('{')
+            var j = i + 1
+
+            while j < b.len && b[j] != u8('}')
+                j = j + 1
+
+            if j < b.len
+                s.push(line[from..<i])
+                s.push(constant_text(cx, span, line[i + 1..<j]))
+                i = j + 1
+                from = i
+            else
+                i = i + 1
+        else
+            i = i + 1
+
+    s.push(line[from..<b.len])
+    s.finish()
+end line_with_constants
+
+// The decimal text a `{NAME}` stands for, or -- where the name is not an integer constant -- a
+// refusal saying what it is instead, and the placeholder unchanged.
+private constant_text(cx: &Analyzer, span: Span, name: string) -> string
+    val kept = s"{$name}"
+
+    const_of_name(cx, name) match
+        Some(c) -> c match
+            ConstInt(n) -> return to_string(n)
+            _ ->
+                cx.fault(span, s"'{$name}' is ${const_kind(c)}, and only an integer constant can be " +
+                         "written into the instructions, as its decimal value")
+                return kept
+        None -> ()
+
+    if lookup_value_key(cx, cx.an.tables.consts, name).is_some()
+        cx.fault(span, s"'{$name}' names a constant whose value is not settled while compiling, so " +
+                 "there is no number to write into the instructions")
+    else if lookup_value_key(cx, cx.an.tables.vals, name).is_some() ||
+            lookup_value_key(cx, cx.an.tables.extern_vars, name).is_some()
+        cx.fault(span, s"'{$name}' is not a constant: it names storage, whose value exists only " +
+                 "while the program runs, and the text of an 'asm' block at the top of a file is " +
+                 "settled while compiling. Declare it 'const' to write its value here, or name the " +
+                 "storage's symbol in the instructions, '@export'ing it")
+    else if cx.an.tables.funcs.has(module_qualify(cx.scope.module_name, name))
+        cx.fault(span, s"'{$name}' is not a constant: it names a function. Name the function's " +
+                 "symbol in the instructions instead, '@export'ing it")
+    else
+        cx.fault(span, s"'{$name}' names no constant: an 'asm' block at the top of a file writes " +
+                 "a 'const' in scope as '{NAME}', and nothing here is called that. Write '{{' and " +
+                 "'}}' for a brace the assembler is to see")
+
+    kept
+end constant_text
 
 private arm_for(arms: Buf[AsmArm], here: string) -> Option[AsmArm]
     for arm in arms
-        for j in 0..<arm.archs.len()
-            if arm.archs.at(j) == here then return Some(arm)
+        if takes(arm, here) then return Some(arm)
 
     None
 end arm_for
+
+// Whether this arm is the one a build for `here` takes.
+private takes(arm: AsmArm, here: string) -> bool
+    for j in 0..<arm.archs.len()
+        if arm.archs.at(j) == here then return true
+
+    false
+end takes
 
 // A processor name outside the closed set is a mistake rather than a machine nobody has heard of.
 // That is `#if`'s rule and it is here for `#if`'s reason: a name reading as "some other processor"

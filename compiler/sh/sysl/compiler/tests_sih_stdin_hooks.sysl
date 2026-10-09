@@ -1,0 +1,276 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **Standard input and `flush` over `sysl.io.sys`, and a program answering it on a target with no C
+// library.**
+//
+// `sysl.io`'s `FdReader` reads through the `sysl_io_read` hook and `sysl.flush` flushes through
+// `sysl_io_flush`. On a hosted target the library's `sysl.io.hosted` answers them over C's `read` and
+// `fflush`, under `weak` exports; on a freestanding one the program answers each hook it reaches with
+// an `@export`, one it leaves unanswered is refused when it is compiled (`emit_checks.sysl`'s
+// `check_library_hooks`), and a line is found without `memchr`.
+
+private val sih_target: string = "aarch64-freestanding"
+private val sih_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private val sih_script: string =
+    "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+// An image entered at `kstart`, laid out by the script, with the program's own heap.
+private val sih_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n" +
+    s"targets {\n  $sih_target {\n    linker_script = \"link.ld\"\n    entry = \"kstart\"\n  }\n}\n"
+
+// What every bare image here defines for itself: its start, its heap and the four memory functions
+// LLVM calls on a target with no C library.
+private val sih_runtime: string = raw"""
+    @export("kstart")
+    kstart() -> never
+        val n = run()
+
+        loop
+            ()
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = null
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+
+    @export("memset")
+    mem_set(dst: *u8, c: int, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = u8(c)
+
+        dst
+
+    @export("memcpy")
+    mem_copy(dst: *u8, src: *u8, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = src[i]
+
+        dst
+
+    @export("memmove")
+    mem_move(dst: *u8, src: *u8, n: usize) -> *u8 = mem_copy(dst, src, n)
+
+    @export("memcmp")
+    mem_compare(a: *u8, b: *u8, n: usize) -> int = 0
+    """
+
+// A program reading standard input a line at a time and then flushing, which reaches the read hook and
+// the flush hook and nothing else of `sysl.io.sys`.
+private val sih_reads_lines: string = raw"""
+    import sysl.io.{lines, stdin}
+
+    run() -> int
+        var input = stdin()
+        var n = 0
+
+        for line in lines(&input)
+            n += int(line.bytes.len)
+
+        flush()
+        n
+    end run
+    """
+
+// The two hooks that program reaches, answered as an empty input would be -- beside the `putchar` and
+// `exit` a freestanding program supplies for `print` and `panic`, which a cursor's failure paths reach.
+private val sih_hooks: string = raw"""
+    @export("putchar")
+    k_putchar(c: int) -> int = c
+
+    @export("exit")
+    k_exit(code: int) -> never
+        loop
+            ()
+
+    @export("sysl_io_read")
+    k_read(fd: int, into: *u8, room: usize) -> isize = 0
+
+    @export("sysl_io_flush")
+    k_flush(fd: int) -> int = 0
+    """
+
+private sih_tree(program: string) -> string
+    var files = lbr_two("main.sysl", program, "package.hocon", sih_manifest)
+
+    files.push(("link.ld", sih_script))
+    lbr_tree(files)
+end sih_tree
+
+// What `sysl build` answers for the image, and where it wrote it.
+private sih_build(p: string) -> ((int, string), string)
+    val out = lbr_temp("sysl-sih-elf")
+
+    (lbr_cli(["sysl", "build", "--target", sih_target, "-o", s"$out/img.elf", p]), out)
+end sih_build
+
+private sih_symbols(elf: string, undefined: bool) -> string
+    val ran = if undefined then capture(sih_nm, ["-u", elf], "", [], true)
+    else capture(sih_nm, [elf], "", [], true)
+
+    ran match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+end sih_symbols
+
+// Whether an `llvm-nm` listing names `symbol`, as the last word of one of its lines.
+private sih_names(listing: string, symbol: string) -> bool
+    for line in lines_of(listing)
+        if line == symbol || line.ends_with(s" $symbol") then return true
+
+    false
+end sih_names
+
+private sih_link_ready() -> bool
+    if !lbr_ready() then return false
+
+    val lld = capture("ld.lld", ["--version"], "", [], true) match
+        Ok(o) -> o.status.ok()
+        Err(_) -> false
+
+    if !lld then skip("ld.lld is not installed, so no image can be linked")
+    if !is_file(sih_nm) then skip(s"there is no llvm-nm at $sih_nm to read the image")
+
+    true
+end sih_link_ready
+
+// -- a bare image answering the hooks it reaches -----------------------------------------------------
+
+@test("a freestanding program reading stdin lines and flushing links with only its own hooks")
+sih_answered_hooks_link()
+    if !sih_link_ready() then return
+
+    val p = sih_tree(sih_reads_lines + sih_runtime + sih_hooks)
+    val (said, out) = sih_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = sih_symbols(elf, false)
+
+    assert_eq(sih_symbols(elf, true).trim(), "")
+
+    // The program's own answers are the ones in the image, defined strong.
+    assert(all.contains(" T sysl_io_read"), all)
+    assert(all.contains(" T sysl_io_flush"), all)
+
+    for name in ["read", "memchr", "fflush", "write", "__errno_location", "__error", "__errno"]
+        assert(!sih_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end sih_answered_hooks_link
+
+// -- the hooks left unanswered -------------------------------------------------------------------------
+
+@test("a freestanding program reading stdin with no hooks is refused, naming the two it reaches")
+sih_unanswered_hooks_are_refused()
+    if !lbr_ready() then return
+
+    val p = sih_tree(sih_reads_lines + sih_runtime)
+    val (said, out) = sih_build(p)
+
+    assert(said.0 != 0, "built with both hooks unanswered")
+    assert(said.1.contains(s"this program reads or flushes a descriptor, and '$sih_target' has no C " +
+        "library under it for the standard library to answer one with, so the program answers it: " +
+        "define 'sysl_io_flush', 'sysl_io_read' with '@export', each taking what its 'extern' in " +
+        "'sysl.io.sys' declares and answering a count or zero, or the code of an 'IoError' negated"),
+        said.1)
+
+    // The write hook is declared and not reached, so it is not asked for; and it is told before the
+    // link, so no linker names a symbol.
+    assert(!said.1.contains("sysl_io_write"), said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end sih_unanswered_hooks_are_refused
+
+@test("a freestanding program that only flushes is asked for the flush hook alone")
+sih_flush_alone_names_flush_alone()
+    if !lbr_ready() then return
+
+    val p = sih_tree(raw"""
+        run() -> int
+            flush()
+            0
+        """ + sih_runtime)
+    val (said, out) = sih_build(p)
+
+    assert(said.0 != 0, "built with the flush hook unanswered")
+    assert(said.1.contains("define 'sysl_io_flush' with '@export'"), said.1)
+    assert(!said.1.contains("sysl_io_read"), said.1)
+
+    lbr_drop([p, out])
+end sih_flush_alone_names_flush_alone
+
+// -- a hosted target -------------------------------------------------------------------------------------
+
+@test("on a hosted target the library answers the stdin and flush hooks under weak exports")
+sih_hosted_library_answers_weakly()
+    if !lbr_ready() then return
+
+    val p = lbr_program(sih_reads_lines + "\nprint(run())\n")
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
+
+    lbr_drop([p])
+    assert(said.0 == 0, said.1)
+
+    var read_line = ""
+    var flush_line = ""
+
+    for line in lines_of(said.1)
+        if line.starts_with("define ") && line.contains(" @sysl_io_read(") then read_line = line
+        if line.starts_with("define ") && line.contains(" @sysl_io_flush(") then flush_line = line
+
+    assert(read_line.starts_with("define weak "), read_line)
+    assert(flush_line.starts_with("define weak "), flush_line)
+    assert(said.1.contains("declare i64 @read(i32, ptr, i64)"), "the hosted answer does not call read")
+end sih_hosted_library_answers_weakly
+
+@test("a hosted program reading piped stdin lines reads them as it always did")
+sih_hosted_piped_stdin_is_unchanged()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.io.{lines, stdin}
+
+        var input = stdin()
+        var seen = ""
+
+        for line in lines(&input)
+            seen = seen + line + "|"
+
+        print(seen, input.failed())
+        flush()
+        """)
+    val out_dir = lbr_temp("sysl-sih-exe")
+
+    lbr_hand([])
+
+    val made = build_native_program(p, None, None, DefaultOptimization, Some(s"$out_dir/program"))
+
+    lbr_hand([])
+    assert(made.is_ok(), "the program did not build")
+
+    val ran = capture("sh", ["-c", s"printf 'one\\ntwo\\r\\n\\nthree' | '${made.unwrap()}'"], "", [], true)
+
+    assert(ran.is_ok(), "the program could not be run")
+    assert_eq(ran.unwrap().text, "one|two||three| false\n")
+
+    remove_dir_all(out_dir).unwrap_or(())
+    lbr_drop([p])
+end sih_hosted_piped_stdin_is_unchanged

@@ -229,7 +229,7 @@ cannot be forgotten rather than merely being unwise to forget.
 
 The one place a `&T` reads as null is storage the language did not lay out and the program zeroed —
 [below](#storage-the-compiler-did-not-lay-out-may-not-hold-a-counted-value), with `is_null`, the raw
-tier's question for it.
+tier's question for it, and `release`, the way such a field is emptied again.
 
 ### What a heap object costs
 
@@ -1660,21 +1660,45 @@ s.item = Item("a")
 
 print(is_null(s.item), s.item.label)
 
-val empty: *Slot = ptr_cast(c_calloc(1, sizeof(Slot)))
+release(s.item)
 
-s.item = empty.item
+print(is_null(s.item))
 
 c_free(ptr_cast(s))
-c_free(ptr_cast(empty))
 ```
 
 ```output
 true
 false a
+true
 ```
 
 The storage is still the program's to free, and freeing it releases nothing: a counted field there is
-given back by assigning over it, or — for a container — by its `release()`, before the block goes.
+given back before the block goes, and **`release(place)` is how** — `is_null`'s other half. It gives
+back the share the `&T` place held, running the destructor when that was the last one, and leaves the
+place naming nothing, exactly as the zeroed storage started; nothing is allocated, which is why a
+finalizer calls it rather than assigning a fresh value it would only lose. A place released twice gives
+back nothing the second time, and one released may be assigned again. A container gives its share back
+through its own `release()` member, and an `Option` or a `weak T` is emptied by assigning `None`, so
+`release` is refused on those — and on anything that is not a place, or not a counted reference at all:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Holder
+    names: Buf[string]
+
+val h = Holder(buf())
+
+release(h.names)
+```
+
+```error
+'release' gives back what a '&T' place holds, and sysl.buf.Buf[string] gives its share back through its own member — call '.release()' on it
+```
+
+Like `is_null`, it is a form the compiler answers only where nothing else claims the name: a function
+or a local called `release` is what a call reaches.
 
 **Keep an index, a raw pointer, or a copy instead.** An arena of nodes linked by index is the
 ordinary answer, and it costs nothing a box was buying:
@@ -2159,6 +2183,39 @@ safe to mutate** — that still wants a `Mutex`.
 
 A `&T` held in a `@thread_local` is *not* a domain crossing and needs no `&sync`, the storage
 belonging to one thread by construction.
+
+### Module storage reached from another domain
+
+A closure erased into a `&sync Fn` is asked about what it captures — and equally about the **module
+storage it reaches**, however many calls down. A module `var` is one object the whole program shares,
+so a count in it that is not atomic is the race a capture would have been:
+
+```sysl
+struct Cell
+    n: int
+
+static var shared: &Cell = Cell(1)
+
+bump()
+    shared.n += 1
+
+val job: &sync Fn() -> unit = () -> bump()
+
+job()
+print(shared.n)
+```
+
+```error
+a closure shared between two domains may be called from either, so every count it reaches has to be atomic — but the module storage 'shared' it reaches, which 'bump' reads, is a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
+```
+
+Hold it as a `&sync Cell` and the program prints `2`. What may be reached is what may be captured: a
+scalar, an `Atomic`, a `&sync T`, a raw pointer, and anything in `@thread_local` storage, which is
+one copy per thread; a `val` laid down as constant data is not asked either. Two kinds of body are
+held to it — whatever is erased into a `&sync` object (a closure, a named function read into a
+`&sync Fn`), and an `interrupt` handler, which the processor enters on top of whatever was running.
+**An `@export` is not**: it is how C enters sysl at all, almost always on the program's one thread,
+and nothing says a second domain exists.
 
 ### `@crossing` — where the rule is asked
 
