@@ -102,7 +102,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
 
     for i in 0..<p.extern_vars.len()
         declared_globals.push(ir_extern_global(p.extern_vars.at(i).symbol,
-                                               lty(e, p.extern_vars.at(i).ty)))
+                                               lty(e, p.extern_vars.at(i).ty), binds_locally(e)))
 
     // A library has no entry point. Emitting one would put a second `main` in every program that
     // linked against it, which the linker reports as a duplicate symbol and nothing else explains.
@@ -361,7 +361,7 @@ private imported_sigs(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         val f = p.funcs.at(i)
 
         if declared_elsewhere(p, f)
-            out.push(ir_sig(symbol_of(e, f.name),
+            out.push(declared_sig(e,symbol_of(e, f.name),
                             sysl_fn_type(e, defined_result(f), f.params, f.variadic, None)))
 
     out
@@ -447,6 +447,11 @@ private is_displaced(e: *Emit, name: string) -> bool
     false
 end is_displaced
 
+// A function this module declares and something else defines, `dso_local` where the machine binds
+// every symbol inside the one image (an intrinsic never is: `bound_sig`).
+private declared_sig(e: *Emit, name: string, ty: IrFnType) -> IrFuncSig =
+    bound_sig(ir_sig(name, ty), binds_locally(e))
+
 // The declarations the module turned out to need: LLVM's own first, then the `extern`s, then the
 // intrinsics a body asked for by name.
 //
@@ -460,7 +465,7 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     val bounds_prints = e.bounds_fails && bounds_default_prints(e.target) &&
         !emits_export(p, bounds_fail_symbol())
 
-    if e.traps then out.push(ir_sig(llvm_trap(), ir_fn_type(LVoid, no_params())))
+    if e.traps then out.push(declared_sig(e,llvm_trap(), ir_fn_type(LVoid, no_params())))
 
     coro_declares(e, &out)
 
@@ -473,13 +478,13 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
             var alloc_params: Buf[IrParam] = buf()
 
             alloc_params.push(ir_param(word_lty(e)))
-            out.push(ir_sig(malloc_symbol(), ir_fn_type(LPtr, alloc_params)))
+            out.push(declared_sig(e, malloc_symbol(), ir_fn_type(LPtr, alloc_params)))
 
         if !emits_export(p, free_symbol())
             var free_params: Buf[IrParam] = buf()
 
             free_params.push(ir_param(LPtr))
-            out.push(ir_sig(free_symbol(), ir_fn_type(LVoid, free_params)))
+            out.push(declared_sig(e, free_symbol(), ir_fn_type(LVoid, free_params)))
 
     // The two steps a buffer's size is computed in, which are the checked forms and carry their
     // width in the **name** as well as in the signature. They are declared from the flag rather than
@@ -500,8 +505,8 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
         val both = LStruct(pair_fields)
 
-        out.push(ir_sig(llvm_with_overflow("mul", false, w), ir_fn_type(both, overflow_params)))
-        out.push(ir_sig(llvm_with_overflow("add", false, w), ir_fn_type(both, overflow_params)))
+        out.push(declared_sig(e,llvm_with_overflow("mul", false, w), ir_fn_type(both, overflow_params)))
+        out.push(declared_sig(e,llvm_with_overflow("add", false, w), ir_fn_type(both, overflow_params)))
 
     // C's own formatting, which a float and a specifier are rendered through. Its size argument is
     // the machine's word rather than eight bytes, and it is open at the end.
@@ -511,7 +516,7 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         pr_params.push(ir_param(LPtr))
         pr_params.push(ir_param(word_lty(e)))
         pr_params.push(ir_param(LPtr))
-        out.push(ir_sig("snprintf", IrFnType(l_i32(), pr_params, true, no_ir_attrs())))
+        out.push(declared_sig(e,"snprintf", IrFnType(l_i32(), pr_params, true, no_ir_attrs())))
 
     // The test dispatcher's one dependency, and the only thing in a test build that is not also in
     // an ordinary one. It is declared from the shape of the program rather than from a flag set
@@ -521,7 +526,7 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
         cmp_params.push(ir_param(LPtr))
         cmp_params.push(ir_param(LPtr))
-        out.push(ir_sig("strcmp", ir_fn_type(l_i32(), cmp_params)))
+        out.push(declared_sig(e,"strcmp", ir_fn_type(l_i32(), cmp_params)))
 
     // What the dispatcher tells the runner with, and only where there is a hook for it to say
     // anything about. It is the same primitive the library prints with, at the signature the
@@ -532,22 +537,22 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         write_params.push(ir_param(l_i32()))
         write_params.push(ir_param(LPtr))
         write_params.push(ir_param(word_lty(e)))
-        out.push(ir_sig("write", ir_fn_type(word_lty(e), write_params)))
+        out.push(declared_sig(e,"write", ir_fn_type(word_lty(e), write_params)))
 
     // The varargs walk: the pair a `...` body always writes, and the duplication it may not.
     if e.uses_varargs
         var walk_params: Buf[IrParam] = buf()
 
         walk_params.push(ir_param(LPtr))
-        out.push(ir_sig(llvm_va_start(), ir_fn_type(LVoid, walk_params)))
-        out.push(ir_sig(llvm_va_end(), ir_fn_type(LVoid, walk_params)))
+        out.push(declared_sig(e,llvm_va_start(), ir_fn_type(LVoid, walk_params)))
+        out.push(declared_sig(e,llvm_va_end(), ir_fn_type(LVoid, walk_params)))
 
     if e.uses_va_copy
         var dup_params: Buf[IrParam] = buf()
 
         dup_params.push(ir_param(LPtr))
         dup_params.push(ir_param(LPtr))
-        out.push(ir_sig(llvm_va_copy(), ir_fn_type(LVoid, dup_params)))
+        out.push(declared_sig(e,llvm_va_copy(), ir_fn_type(LVoid, dup_params)))
 
     if e.uses_memcpy
         var copy_params: Buf[IrParam] = buf()
@@ -556,14 +561,14 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         copy_params.push(ir_param(LPtr))
         copy_params.push(ir_param(LInt(64)))
         copy_params.push(ir_param(l_i1()))
-        out.push(ir_sig(memcpy_symbol(), ir_fn_type(LVoid, copy_params)))
+        out.push(declared_sig(e,memcpy_symbol(), ir_fn_type(LVoid, copy_params)))
 
     // What a call site was told its callee's `ensure` established (`contract_assume.sysl`).
     if e.uses_assume
         var fact_params: Buf[IrParam] = buf()
 
         fact_params.push(ir_param(l_i1()))
-        out.push(ir_sig(llvm_assume(), ir_fn_type(LVoid, fact_params)))
+        out.push(declared_sig(e,llvm_assume(), ir_fn_type(LVoid, fact_params)))
 
     // **A symbol this module has already stated is not stated again**, whether the first statement
     // was a declaration or a definition: LLVM refuses a second `declare` of a name at a signature of
@@ -607,7 +612,7 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
         if !holds(seen, x.symbol)
             seen.push(x.symbol)
-            out.push(ir_sig(x.symbol, foreign_signature(e, x.ret_ty, x.params, x.variadic)))
+            out.push(declared_sig(e,x.symbol, foreign_signature(e, x.ret_ty, x.params, x.variadic)))
 
     for i in 0..<e.sat_decls.len()
         out.push(e.sat_decls.at(i))

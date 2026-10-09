@@ -121,6 +121,16 @@ does not carry over either — a `val` is refused a `&T` because nothing would e
 `extern` variable may name whatever the other side laid down, because releasing it was never this
 program's job.
 
+**On a bare machine its address is where it is now, as a module variable's is.** A freestanding
+image is linked statically and nothing can come from a shared library, so every symbol a program
+names — an `extern` variable, an `extern` function and the program's own definitions — is marked
+local to the image, as clang marks them for the same triple, and `&` reaches each one directly
+(`adrp`/`add` on aarch64) rather than through a table of addresses. Code that runs before the MMU is
+on, at an address other than the one the image was linked at, therefore gets the address it is
+running at for `&__bss_start` exactly as it does for `&pool`. A hosted machine is different on
+purpose: there the symbol may live in a shared library, and it is reached the way the platform's
+loader requires.
+
 ### Naming the symbol separately
 
 A string before the name is what the linker resolves; the identifier after it is what the program
