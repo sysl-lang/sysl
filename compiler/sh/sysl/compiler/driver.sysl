@@ -672,9 +672,29 @@ emit_llvm_text(path: string, named_target: Option[string],
 
     // Read back out of the analysis rather than off the snapshot the body pass answered with: the
     // checks above have just added to it.
-    Ok(Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1,
-              link_required(program.units), roots.archives))
+    val report = errors_of(done.an.diagnostics())
+
+    say_warnings(report, done.an)
+
+    Ok(Emitted(ir_print_module(lowered.0), report, lowered.1, link_required(program.units),
+               roots.archives))
 end emit_llvm_text
+
+// The warnings of a compilation that succeeded, each a note on its own, in source order.
+//
+// **They are said on every successful compilation**, unlike the promotions `--explain-escapes`
+// reports, which answer a question somebody asked. A warning is the compiler saying the program
+// compiles and is probably not what was meant -- a constructor handing back a type with a `Drop` by
+// value, whose destructor nothing will ever run -- and one nobody sees has done nothing. A
+// compilation that failed says only its errors, as the reference does.
+private say_warnings(report: Buf[Placed], an: &Analysis)
+    if !report.is_empty() then return
+
+    val warned = an.warnings()
+
+    for i in 0..<warned.len()
+        say_note(warning_report(warned.at(i)))
+end say_warnings
 
 // Two lists of symbols as one, the first's order kept, in a buffer of its own.
 private joined_names(a: Buf[string], b: Buf[string]) -> Buf[string]
@@ -1414,7 +1434,11 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
     val kept = prune(strip_tests(whole), program.own)
     val lowered = codegen_with_gaps(kept, t, promotions)
 
-    Ok(LoweredForC(Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1,
+    val report = errors_of(done.an.diagnostics())
+
+    say_warnings(report, done.an)
+
+    Ok(LoweredForC(Emitted(ir_print_module(lowered.0), report, lowered.1,
                            link_required(program.units), buf()),
                    exports_by_symbol(kept.funcs)))
 end lower_for_c
