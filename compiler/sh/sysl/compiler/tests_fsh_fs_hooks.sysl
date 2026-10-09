@@ -1,0 +1,356 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **`sysl.fs` over `sysl.fs.sys`, and a program answering it on a target with no C library.**
+//
+// Every call `sysl.fs` makes of a filesystem is an `extern` of `sysl.fs.sys`. On a hosted target the
+// library's `sysl.fs.hosted` answers them, under exports that are `weak` so a program's own answer
+// displaces them at the link; on a freestanding one the program answers them with an `@export` per
+// hook, and one it reaches and leaves unanswered is refused when it is compiled, naming every such
+// hook (`emit_checks.sysl`'s `check_filesystem_hooks`). A program that never reaches `sysl.fs` is
+// asked about none of them.
+
+private val fsh_target: string = "aarch64-freestanding"
+private val fsh_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private val fsh_script: string =
+    "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+// An image entered at `kstart`, laid out by the script, with the program's own heap.
+private val fsh_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n" +
+    s"targets {\n  $fsh_target {\n    linker_script = \"link.ld\"\n    entry = \"kstart\"\n  }\n}\n"
+
+// What every bare image here defines for itself: its start, its heap and the four memory functions
+// LLVM calls on a target with no C library.
+private val fsh_runtime: string = raw"""
+    @export("kstart")
+    kstart() -> never
+        val n = run()
+
+        loop
+            ()
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = null
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+
+    @export("memset")
+    mem_set(dst: *u8, c: int, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = u8(c)
+
+        dst
+
+    @export("memcpy")
+    mem_copy(dst: *u8, src: *u8, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = src[i]
+
+        dst
+
+    @export("memmove")
+    mem_move(dst: *u8, src: *u8, n: usize) -> *u8 = mem_copy(dst, src, n)
+
+    @export("memcmp")
+    mem_compare(a: *u8, b: *u8, n: usize) -> int = 0
+    """
+
+// One `@export` per hook of `sysl.fs.sys`, by symbol, each answering "not supported".
+private fsh_hooks(left_out: []string) -> string
+    var rows: Buf[(string, string)] = buf()
+
+    rows.push(("open", "path: *u8, len: usize, flags: u32, mode: u32, fd: *int"))
+    rows.push(("read", "fd: int, into: *u8, room: usize, got: *usize"))
+    rows.push(("write", "fd: int, from: *u8, len: usize, put: *usize"))
+    rows.push(("close", "fd: int"))
+    rows.push(("seek", "fd: int, offset: long, whence: int, at: *long"))
+    rows.push(("fstat", "fd: int, out: *Stat"))
+    rows.push(("ftruncate", "fd: int, length: long"))
+    rows.push(("stat", "path: *u8, len: usize, follow: int, out: *Stat"))
+    rows.push(("truncate", "path: *u8, len: usize, length: long"))
+    rows.push(("mkdir", "path: *u8, len: usize, mode: u32"))
+    rows.push(("rmdir", "path: *u8, len: usize"))
+    rows.push(("unlink", "path: *u8, len: usize"))
+    rows.push(("rename", "from: *u8, from_len: usize, to: *u8, to_len: usize"))
+    rows.push(("access", "path: *u8, len: usize, how: int"))
+    rows.push(("chmod", "path: *u8, len: usize, mode: u32"))
+    rows.push(("opendir", "path: *u8, len: usize, dir: *usize"))
+    rows.push(("readdir", "dir: usize, into: *u8, room: usize, got: *usize"))
+    rows.push(("closedir", "dir: usize"))
+    rows.push(("getcwd", "into: *u8, room: usize, got: *usize"))
+    rows.push(("chdir", "path: *u8, len: usize"))
+    rows.push(("temp_dir", "prefix: *u8, len: usize, into: *u8, room: usize, got: *usize"))
+    rows.push(("symlink", "target: *u8, target_len: usize, link: *u8, link_len: usize"))
+    rows.push(("link", "existing: *u8, existing_len: usize, fresh: *u8, fresh_len: usize"))
+    rows.push(("readlink", "path: *u8, len: usize, into: *u8, room: usize, got: *usize"))
+    rows.push(("realpath", "path: *u8, len: usize, into: *u8, room: usize, got: *usize"))
+
+    var out = ""
+
+    for row in rows
+        var kept = true
+
+        for name in left_out
+            if name == row.0 then kept = false
+
+        if kept then out = out + s"@export(\"sysl_fs_${row.0}\")\nk_${row.0}(${row.1}) -> int = -1\n\n"
+
+    out
+end fsh_hooks
+
+// A program reaching most of `sysl.fs`'s surface, so that most of the hooks are reached.
+private val fsh_uses_fs: string = raw"""
+    import sysl.fs.{read_text, write_text, entries, exists, is_dir, make_dir, remove_dir, remove_file}
+    import sysl.fs.{rename, size_of, current_dir, set_current_dir, symlink, hard_link, read_link}
+    import sysl.fs.{truncate, open}
+    import sysl.fs.sys.Stat
+
+    run() -> int
+        var n = 0
+
+        if write_text("/a", "x").is_ok() then n += 1
+        if read_text("/a").is_ok() then n += 1
+        if entries("/").is_ok() then n += 1
+        if exists("/a") then n += 1
+        if is_dir("/") then n += 1
+        if make_dir("/d").is_ok() then n += 1
+        if remove_dir("/d").is_ok() then n += 1
+        if remove_file("/a").is_ok() then n += 1
+        if rename("/a", "/b").is_ok() then n += 1
+        if size_of("/b").is_ok() then n += 1
+        if current_dir().is_ok() then n += 1
+        if set_current_dir("/").is_ok() then n += 1
+        if symlink("/b", "/c").is_ok() then n += 1
+        if hard_link("/b", "/e").is_ok() then n += 1
+        if read_link("/c").is_ok() then n += 1
+        if truncate("/b", 0).is_ok() then n += 1
+
+        open("/b") match
+            Ok(f) ->
+                var g = f
+
+                if g.seek(1).is_ok() then n += 1
+                if g.tell().is_ok() then n += 1
+                if g.truncate(0).is_ok() then n += 1
+                if g.close().is_ok() then n += 1
+            Err(_) -> ()
+
+        n
+    end run
+    """
+
+// A program reading one file, which reaches four hooks: open, read, write (a buffer is drained
+// before a read) and close.
+private val fsh_reads_a_file: string = raw"""
+    import sysl.fs.read_text
+    import sysl.fs.sys.Stat
+
+    run() -> int = read_text("/hello.txt") match
+        Ok(s) -> int(s.bytes.len)
+        Err(_) -> -1
+    """
+
+private fsh_tree(program: string) -> string =
+    lbr_tree(fsh_files(program, fsh_manifest))
+
+private fsh_files(program: string, manifest: string) -> Buf[(string, string)]
+    var files = lbr_two("main.sysl", program, "package.hocon", manifest)
+
+    files.push(("link.ld", fsh_script))
+    files
+end fsh_files
+
+// What `sysl build` answers for the image, and where it wrote it.
+private fsh_build(p: string) -> ((int, string), string)
+    val out = lbr_temp("sysl-fsh-elf")
+
+    (lbr_cli(["sysl", "build", "--target", fsh_target, "-o", s"$out/img.elf", p]), out)
+end fsh_build
+
+private fsh_lld_present() -> bool = capture("ld.lld", ["--version"], "", [], true) match
+    Ok(o) -> o.status.ok()
+    Err(_) -> false
+
+private fsh_symbols(elf: string, undefined: bool) -> string
+    val args = if undefined then ["-u", elf] else [elf]
+
+    capture(fsh_nm, args, "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+end fsh_symbols
+
+// Whether an `llvm-nm` listing names `symbol`, as the last word of one of its lines.
+private fsh_names(listing: string, symbol: string) -> bool
+    val lines = lines_of(listing)
+
+    for line in lines
+        if line == symbol || line.ends_with(s" $symbol") then return true
+
+    false
+end fsh_names
+
+private fsh_link_ready() -> bool
+    if !lbr_ready() then return false
+    if !fsh_lld_present() then skip("ld.lld is not installed, so no image can be linked")
+    if !is_file(fsh_nm) then skip(s"there is no llvm-nm at $fsh_nm to read the image")
+
+    true
+end fsh_link_ready
+
+// -- a bare image answering every hook ---------------------------------------------------------------
+
+@test("a freestanding program answering every hook links, with no C library symbol in the image")
+fsh_every_hook_answered_links()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_uses_fs + fsh_runtime + fsh_hooks([]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+
+    // The program's own answers are the ones in the image, defined strong.
+    assert(all.contains(" T sysl_fs_open"), all)
+    assert(all.contains(" T sysl_fs_readdir"), all)
+
+    for name in ["fopen", "fread", "fwrite", "fclose", "open", "read", "write", "close", "lseek",
+                 "opendir", "readdir", "closedir", "stat", "lstat", "fstat", "getcwd", "mkdtemp",
+                 "realpath", "__errno_location", "__error", "__errno", "sysl_fs_host_open",
+                 "sysl_fs_host_stat"]
+        assert(!fsh_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end fsh_every_hook_answered_links
+
+// -- a hook left unanswered ----------------------------------------------------------------------------
+
+@test("a freestanding program leaving a hook it reaches unanswered is refused, naming every such hook")
+fsh_unanswered_hooks_are_refused()
+    if !lbr_ready() then return
+
+    val p = fsh_tree(fsh_reads_a_file + fsh_runtime + fsh_hooks(["read", "close"]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 != 0, "built with two hooks unanswered")
+    assert(said.1.contains(s"this program reaches 'sysl.fs', and '$fsh_target' has no C library " +
+        "under it for the standard library to answer a filesystem with, so the program answers it: " +
+        "define 'sysl_fs_close', 'sysl_fs_read' with '@export', each taking what its 'extern' in " +
+        "'sysl.fs.sys' declares and answering zero or the code of an 'IoError'"), said.1)
+
+    // It is told before the link, so no linker names a symbol.
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end fsh_unanswered_hooks_are_refused
+
+@test("the refusal names only the hooks reached, and none the program answered")
+fsh_refusal_names_only_what_is_reached()
+    if !lbr_ready() then return
+
+    val p = fsh_tree(fsh_reads_a_file + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 != 0, "built with no hook answered")
+    assert(said.1.contains("define 'sysl_fs_close', 'sysl_fs_open', 'sysl_fs_read', 'sysl_fs_write' with"),
+           said.1)
+    assert(!said.1.contains("sysl_fs_mkdir"), said.1)
+
+    lbr_drop([p, out])
+end fsh_refusal_names_only_what_is_reached
+
+// -- a bare image that never touches a file ------------------------------------------------------------
+
+@test("a freestanding program that never reaches sysl.fs builds as it did, asked about no hook")
+fsh_no_filesystem_no_question()
+    if !fsh_link_ready() then return
+
+    val program = raw"""
+        run() -> int = 7
+        """
+    val p = fsh_tree(program + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+    assert(!said.1.contains("sysl.fs"), said.1)
+    assert(!fsh_symbols(s"$out/img.elf", false).contains("sysl_fs_"), "a hook is in the image")
+
+    lbr_drop([p, out])
+end fsh_no_filesystem_no_question
+
+// -- a hosted target -------------------------------------------------------------------------------------
+
+// The LLVM text of a one-file program for a hosted machine with no prebuilt standard module here, so
+// the library's bodies are lowered beside the program's.
+private fsh_hosted_text(program: string) -> string
+    val p = lbr_program(program)
+    val text = emit_llvm_text(p, Some("x86_64-linux")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    lbr_drop([p])
+    text
+end fsh_hosted_text
+
+// The `define` line of `symbol` in `text`, or `""` where there is none.
+private fsh_define(text: string, symbol: string) -> string
+    val lines = lines_of(text)
+
+    for line in lines
+        if line.starts_with("define ") && line.contains(s" @$symbol(") then return line
+
+    ""
+end fsh_define
+
+@test("on a hosted target the library answers the hooks, under weak exports, and reads errno itself")
+fsh_hosted_library_answers_weakly()
+    if !lbr_ready() then return
+
+    val text = fsh_hosted_text(raw"""
+        import sysl.fs.read_text
+
+        print(read_text("/etc/hosts").is_ok())
+        """)
+
+    assert(!text.starts_with("refused"), text)
+    assert(fsh_define(text, "sysl_fs_open").starts_with("define weak "), fsh_define(text, "sysl_fs_open"))
+    assert(fsh_define(text, "sysl_fs_read").starts_with("define weak "), fsh_define(text, "sysl_fs_read"))
+    assert(text.contains("declare ptr @__errno_location()"), "the hosted answer does not read errno")
+end fsh_hosted_library_answers_weakly
+
+@test("a program's own export stays strong beside the library's weak ones")
+fsh_a_programs_export_is_strong()
+    if !lbr_ready() then return
+
+    val text = fsh_hosted_text(raw"""
+        import sysl.fs.read_text
+
+        @export("mine")
+        mine(n: int) -> int = n + 1
+
+        print(read_text("/etc/hosts").is_ok(), mine(1))
+        """)
+
+    val mine = fsh_define(text, "mine")
+
+    assert(!mine.is_empty(), text)
+    assert(!mine.contains(" weak "), mine)
+    assert(fsh_define(text, "sysl_fs_open").starts_with("define weak "), "the library's open is not weak")
+end fsh_a_programs_export_is_strong
