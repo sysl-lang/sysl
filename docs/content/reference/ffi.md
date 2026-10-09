@@ -1554,6 +1554,13 @@ an ABI primitive that no sysl body could implement, so there is nothing to put i
 is the line the "no functions built into the compiler" rule actually draws — no program could write
 `va_arg`.
 
+**The walk is the target's C walk, every class of argument included.** On most machines a `va_list`
+is one pointer bumped past each slot; on AArch64 outside Apple's platforms it is a five-field
+structure keeping the general registers, the vector registers and the stack apart, and on x86-64
+System V a 128-bit integer travels as a register pair or not at all. `va_arg` reads each one where
+the machine's C compiler would, so a function reads the same arguments at `aarch64-linux` or
+`aarch64-freestanding` as it does here.
+
 **`va_arg` reads its type from context, or from the brackets.** C writes the type as a second
 argument, which is not a thing a sysl expression can hold; here it comes from the place the value is
 read into — `var v: int = va_arg(ap)`, `total += va_arg(ap)`, `take(va_arg(ap))` — the same place
