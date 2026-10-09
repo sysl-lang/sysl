@@ -287,7 +287,10 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
 
                         if !zero_sized(decl.fields.at(i).1) then vals.push(v)
 
-                    emit(e, InStore(container_lty(ranges), build_bits(e, ranges, vals), dest,
+                    val c = reordered(e, container_reversal(decl, e.target.little_endian()),
+                                      build_bits(e, ranges, vals))
+
+                    emit(e, InStore(container_lty(ranges), c, dest,
                                     AccPlain, None))
                 None ->
                     for i in 0..<args.len()
@@ -300,7 +303,15 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
                             idx.push(ir_arg(l_i32(), VInt(from_int(long(struct_field_index(e.layout, decl,
                                                                                             decl.slot(i)))))))
                             emit(e, InGep(p, struct_lty(decl), dest, idx))
-                            gen_borrowed_into(e, p, args.at(i))
+
+                            val ft = decl.fields.at(i).1
+                            val bits = reversed_width(decl, ft, e.target.little_endian())
+
+                            // A reversed field is an integer, so it is stored as the bytes it is.
+                            if bits > 0 then
+                                emit(e, InStore(lty(e, ft), swap_bytes_of(e, bits, gen_expr(e, args.at(i))),
+                                                p, AccPlain, None))
+                            else gen_borrowed_into(e, p, args.at(i))
 
         TArrayLit(elems, array_ty) ->
             val elem = element(array_ty).unwrap_or(int_type())
@@ -814,7 +825,7 @@ emit_inv_check(e: *Emit, v: Val, d: &StructType, inv_fn: string)
             val c = fresh_reg(e)
 
             emit(e, InExtract(c, struct_lty(d), v, index_list(0)))
-            c
+            reordered(e, container_reversal(d, e.target.little_endian()), c)
 
     var args: Buf[IrArg] = buf()
 
@@ -828,7 +839,7 @@ emit_inv_check(e: *Emit, v: Val, d: &StructType, inv_fn: string)
                     val t = fresh_reg(e)
 
                     emit(e, InExtract(t, struct_lty(d), v, index_list(struct_field_index(e.layout, d, d.slot(i)))))
-                    t
+                    reordered(e, reversed_width(d, ft, e.target.little_endian()), t)
 
             args.push(ir_arg(lty(e, ft), r))
 

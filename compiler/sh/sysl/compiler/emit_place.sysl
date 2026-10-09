@@ -282,20 +282,30 @@ bit_place(place: TExpr) -> Option[(TExpr, Buf[BitRange], BitRange)] = *place.kin
         None -> None
     _ -> None
 
-// What is in the place now -- one load of the container and a shift for a bitfield.
+// What is in the place now -- one load of the container and a shift for a bitfield, and the bytes
+// reversed for a field of a `@byte_order` struct whose order is not the machine's.
 load_place(e: *Emit, place: TExpr, p: Val) -> Val = bit_place(place) match
     Some(b) -> read_bits(e, b.1, b.2, load_container(e, b.1, b.0, p))
     None ->
         val t = fresh_reg(e)
 
         emit(e, InLoad(t, lty(e, texpr_type(place)), p, place_access(e, place), None))
-        t
+        reordered(e, place_reversal(e, place), t)
+
+// The width a place's value is reversed at between the value and its storage, or `0`.
+place_reversal(e: *Emit, place: TExpr) -> int = *place.kind match
+    TField(receiver, index, _) -> field_reversal(texpr_type(receiver), index, e.target.little_endian())
+    _ -> 0
+
+// A value with its bytes reversed at `bits`, or the value itself at `0`. A reversal is its own
+// inverse, so the one function turns storage into a value and a value into storage.
+reordered(e: *Emit, bits: int, v: Val) -> Val = if bits == 0 then v else swap_bytes_of(e, bits, v)
 
 private load_container(e: *Emit, ranges: Buf[BitRange], receiver: TExpr, addr: Val) -> Val
     val t = fresh_reg(e)
 
     emit(e, InLoad(t, container_lty(ranges), addr, access_of(place_ty(receiver)), None))
-    t
+    reordered(e, container_reversal_of(texpr_type(receiver), e.target.little_endian()), t)
 end load_container
 
 // Puts `v` in the place, giving up whatever was there at the address.
@@ -311,20 +321,27 @@ store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) = bit_place
     Some(b) ->
         val acc = access_of(place_ty(b.0))
         val c = load_container(e, b.1, b.0, p)
+        val back = container_reversal_of(texpr_type(b.0), e.target.little_endian())
 
-        emit(e, InStore(container_lty(b.1), write_bits(e, b.1, b.2, c, v), p, acc, None))
+        emit(e, InStore(container_lty(b.1), reordered(e, back, write_bits(e, b.1, b.2, c, v)), p, acc,
+                        None))
     None ->
         val ty = texpr_type(place)
         val acc = place_access(e, place)
+        val bits = place_reversal(e, place)
 
-        cur match
-            None -> store_into(e, ty, p, v, acc)
-            Some(old) ->
-                if contains_counted(ty)
-                    retain_value(e, ty, v)
-                    emit(e, InStore(lty(e, ty), v, p, acc, None))
-                    release_value(e, ty, old)
-                else emit(e, InStore(lty(e, ty), v, p, acc, None))
+        // A reversed field holds an integer, which carries no count, so the bytes are all there is.
+        if bits > 0
+            emit(e, InStore(lty(e, ty), swap_bytes_of(e, bits, v), p, acc, None))
+        else
+            cur match
+                None -> store_into(e, ty, p, v, acc)
+                Some(old) ->
+                    if contains_counted(ty)
+                        retain_value(e, ty, v)
+                        emit(e, InStore(lty(e, ty), v, p, acc, None))
+                        release_value(e, ty, old)
+                    else emit(e, InStore(lty(e, ty), v, p, acc, None))
 
 // Writes `v` into the storage at `p`. A slot that holds a count takes one for the value arriving
 // and lets go of the one leaving, **in that order**, so assigning something to itself never briefly

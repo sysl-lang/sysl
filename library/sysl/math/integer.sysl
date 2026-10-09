@@ -53,12 +53,12 @@ trait Signed
  * **unsigned** widths too -- a bit pattern is a bit pattern, and `01` already gives `&`, `|`, `^`,
  * `~` and the shifts to every integer at either signedness.
  *
- * **What is deliberately not here is `swap_bytes`.** Reversing the byte order needs a whole number
- * of bytes and at least two, so a `u24` has no answer to it and a `u4` has none either. Every
- * member of this trait is total over every integer type, because a `[T: Bits]` body is written once
- * and instantiated later: a member that worked at `u32` and not at `u24` would turn a bound that
- * was supposed to have proven an operation into a failure at somebody else's instantiation. A
- * program that means to reorder bytes has the shifts, and knows its own width while writing them.
+ * **What is deliberately not here is `swap_bytes`**, which is `ByteOrder`'s below. Reversing the
+ * byte order needs a whole number of bytes, so a `u4` or a `u12` has no answer to it. Every member
+ * of this trait is total over every integer type, because a `[T: Bits]` body is written once and
+ * instantiated later: a member that worked at `u32` and not at `u12` would turn a bound that was
+ * supposed to have proven an operation into a failure at somebody else's instantiation. So the byte
+ * questions are a trait of their own, whose membership is the widths that have an answer.
  */
 trait Bits
 
@@ -122,6 +122,39 @@ trait Bits
      */
     rotate_left(self, n: u32) -> Self
     rotate_right(self, n: u32) -> Self
+
+/** A value's bytes, and the two orders they are written to a file or a wire in.
+ *
+ * **The membership is every integer whose width is a whole number of bytes**: `u8` through `u64`,
+ * `i16`, `usize`, and `u24` and `u40` too, since three bytes have an order as surely as four do. A
+ * `u4` or a `u12` is not a member, there being no byte to reverse it by, which is why these are not
+ * `Bits`' members (that trait's members answer at every width). One byte is its own reversal, so
+ * every member is total and `u8.swap_bytes()` is the value it was asked of.
+ *
+ * **`to_be` and `from_be` are the same reversal, and naming both is the point.** `x.to_be()` says
+ * "this value, about to be written most significant byte first", `x.from_be()` says "these bytes,
+ * read off a big-endian wire" -- on a little-endian machine each is `swap_bytes`, on a big-endian one
+ * each is the value unchanged, and a program that names the direction reads the same on both. The
+ * `_le` pair is the mirror. Every machine sysl targets today is little-endian, so the `_le` pair is
+ * no instruction anywhere yet; it is written so the program still says what it means on the first
+ * machine that is not.
+ *
+ * A struct whose fields are all in one order says so once, with `@byte_order(big)`, and is read and
+ * written as plain integers (`reference/attributes.md § @byte_order`) -- these are for a value that
+ * is not in a struct, or a struct whose fields disagree.
+ */
+trait ByteOrder
+
+    /** The bytes in the opposite order: `0x1234u16.swap_bytes()` is `0x3412`. */
+    swap_bytes(self) -> Self
+
+    /** This value as the bytes a big-endian reader expects to find, and back again. */
+    to_be(self) -> Self
+    from_be(self) -> Self
+
+    /** This value as the bytes a little-endian reader expects to find, and back again. */
+    to_le(self) -> Self
+    from_le(self) -> Self
 
 // The arithmetic above the operators: raising to a power, the two divisors, and the two questions
 // about powers of two.

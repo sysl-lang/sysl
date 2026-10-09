@@ -519,15 +519,19 @@ gen_int_op(e: *Emit, op: string, operand: TExpr, amount: Option[TExpr], width: T
         // `x.bits` and `T::Bits(n)` on a bitfield struct: the struct is its container wrapped in a
         // one-member aggregate, so the reinterpretation is that member taken out or put in -- a
         // value, with no slot in memory to pass it through.
+        //
+        // A `@byte_order` bitfield struct holds its container reversed, and the integer `.bits` reads
+        // is the one the ranges are taken from -- so it is reversed on the way out and back on the way in.
         "bitfield_bits" ->
             val r = fresh_reg(e)
 
             emit(e, InExtract(r, lty(e, texpr_type(operand)), v, index_list(0)))
-            r
+            reordered(e, container_reversal_of(texpr_type(operand), e.target.little_endian()), r)
         "bitfield_from_bits" ->
             val r = fresh_reg(e)
+            val stored = reordered(e, container_reversal_of(ty, e.target.little_endian()), v)
 
-            emit(e, InInsert(r, lty(e, ty), VUndef, ll, v, index_list(0)))
+            emit(e, InInsert(r, lty(e, ty), VUndef, ll, stored, index_list(0)))
             r
 
         // `x < 0 ? -x : x`, and the negation is the wrapping one the language's own `-` is -- so at
@@ -591,8 +595,44 @@ gen_int_op(e: *Emit, op: string, operand: TExpr, amount: Option[TExpr], width: T
                           rotation_args(v, rotate_by(e, n.unwrap_or(VZero), amount_type(amount),
                                                      bits)), false)
 
+        // The byte order: one reversal, and the four directions are each it or nothing, by which
+        // order the target's memory is in.
+        "swap_bytes" -> swap_bytes_of(e, bits, v)
+        "to_be" -> if e.target.little_endian() then swap_bytes_of(e, bits, v) else v
+        "from_be" -> if e.target.little_endian() then swap_bytes_of(e, bits, v) else v
+        "to_le" -> if e.target.little_endian() then v else swap_bytes_of(e, bits, v)
+        "from_le" -> if e.target.little_endian() then v else swap_bytes_of(e, bits, v)
+
         _ -> gap_at(e, s"the integer operation '$op'")
 end gen_int_op
+
+// The bytes of an integer `bits` wide in the opposite order.
+//
+// One byte is its own reversal. An even number of bytes is LLVM's `bswap`, which accepts nothing
+// else; an odd number above one -- a `u24`, a `u40` -- is reversed one byte wider and shifted back
+// down, the byte added at the bottom arriving at the top where the shift drops it.
+swap_bytes_of(e: *Emit, bits: int, v: Val) -> Val
+    if bits <= 8 then return v
+
+    val ll = LInt(bits)
+
+    if bits % 16 == 0 then return bit_intrinsic(e, "bswap", ll, one_value(v), false)
+
+    val wide = LInt(bits + 8)
+    val up = fresh_reg(e)
+
+    emit(e, InCast(up, CastZExt, ll, v, wide))
+
+    val swapped = bit_intrinsic(e, "bswap", wide, one_value(up), false)
+    val down = fresh_reg(e)
+
+    emit(e, InBin(down, OpLShr, wide, swapped, VInt(from_int(8))))
+
+    val r = fresh_reg(e)
+
+    emit(e, InCast(r, CastTrunc, wide, down, ll))
+    r
+end swap_bytes_of
 
 // The bits counted at the operand's own width, then resized to the `u32` the count is answered in. A
 // count is at most the width, so narrowing one from a type wider than 32 bits cannot lose anything.
