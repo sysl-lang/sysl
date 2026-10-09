@@ -174,7 +174,8 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
     // The hand-written blocks go in front of the generated ones, and which of them the module needs
     // is settled only once every helper has been written -- a helper is as much a reason to hold the
     // runtime as a body is.
-    var helpers = runtime_bundles(e, t, emits_export(p, bounds_fail_symbol()))
+    var helpers = runtime_bundles(e, t, emits_export(p, bounds_fail_symbol()),
+                                  emits_export(p, reaper_slot_symbol()))
 
     for i in 0..<built_helpers.len()
         helpers.push(built_helpers.at(i))
@@ -266,11 +267,16 @@ end box_defs
 
 // The parts of the runtime the module turned out to need, each a hand-written template and so
 // reachable to anything that is not LLVM only by name.
-private runtime_bundles(e: *Emit, t: Target, bounds_overridden: bool) -> Buf[IrRuntime]
+//
+// The reaper's slot hook is the same arrangement as the bounds report: a module whose own `@export`
+// defines `__sysl_arc_reaper` gets the runtime without the weak default, and every drain calls the
+// program's definition.
+private runtime_bundles(e: *Emit, t: Target, bounds_overridden: bool,
+                        reaper_overridden: bool) -> Buf[IrRuntime]
     var out: Buf[IrRuntime] = buf()
 
     if e.char_buf then out.push(RtTemplate("sysl.utf8", utf8_encoder()))
-    if e.heap then out.push(RtTemplate("arc.core", arc_core(t)))
+    if e.heap then out.push(RtTemplate("arc.core", arc_core(t, reaper_overridden)))
     if e.sync_heap then out.push(RtTemplate("arc.atomic", arc_atomic(t)))
     if e.maybe_heap then out.push(RtTemplate("arc.maybe", arc_maybe()))
     if e.weak_heap then out.push(RtTemplate("arc.weak", arc_weak(t)))
