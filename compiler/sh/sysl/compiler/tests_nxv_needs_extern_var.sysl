@@ -1,0 +1,162 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+import sysl.text.Search
+
+// `@needs(...)` above an `extern` VARIABLE: the declaration says what reaching the storage requires,
+// and a module without it is refused at every read, write and address taken -- the rule an `extern`
+// function's `@needs` is held to at its call (`tests_dcp_decl_capability.sysl`). Before, the parser
+// read the annotation and dropped it, so the storage was reached unchallenged.
+
+private nxv_ready() -> bool = std_root().is_ok() && clang_available()
+
+private nxv_tree(files: [](string, string)) -> string
+    var b: Buf[(string, string)] = buf()
+
+    for i in 0..<files.len
+        b.push(files[i])
+
+    lbr_tree(b)
+end nxv_tree
+
+// What `sysl build` says about a tree, and its status.
+private nxv_built(root: string) -> (int, string)
+    val got = lbr_cli(["sysl", "build", root])
+
+    remove_dir_all(root).unwrap_or(())
+    got
+
+// What `emit-llvm` makes of a tree, or why it refused.
+private nxv_ir(root: string) -> string
+    reset_search_paths()
+
+    val text = emit_llvm_text(root, None) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    remove_dir_all(root).unwrap_or(())
+    text
+end nxv_ir
+
+// Whether a report holds a diagnostic: its message, where it points, and the line it quotes.
+private nxv_says(out: string, message: string, at: string, line: string) -> bool =
+    out.contains(s"error: $message") && out.contains(s" --> $at") && out.contains(line)
+
+private nxv_sys() -> string = "module sys\n\n@needs(posix)\nextern environ: **u8\n"
+
+private nxv_no_posix() -> string =
+    "this reaches 'sys.environ', which needs 'posix', and this module declared '@no_posix'"
+
+@test("the annotation is kept on the declaration, in the test spelling")
+nxv_the_annotation_is_kept()
+    assert_eq(pf("@needs(posix)\nextern environ: **u8\n"),
+              "(extern-var @needs(posix) environ : (ptr (ptr u8)))")
+    assert_eq(pf("@needs(posix)\nprivate extern \"environ\" env: **u8\n"),
+              "(extern-var private @needs(posix) \"environ\" env : (ptr (ptr u8)))")
+
+@test("and in the AST printer's, as a field of the node")
+nxv_the_ast_printer_shows_it()
+    val parsed = parse(source_of("<t>", "@needs(posix)\nextern environ: **u8\n"))
+
+    assert(parsed.ok(), "the declaration parses")
+
+    val text = emit_ast(parsed.program, false)
+
+    assert(text.contains("needs: [\"posix\"]"), text)
+end nxv_the_ast_printer_shows_it
+
+@test("a module that gave the capability up is refused at the read")
+nxv_refused_at_the_read()
+    if !nxv_ready() then return
+
+    val root = nxv_tree([("sys/a.sysl", nxv_sys()),
+                         ("main.sysl", "@no_posix\n\nprint(sys.environ == null)\n")])
+    val (code, out) = nxv_built(root)
+
+    assert_eq(code, 1, out)
+    assert(nxv_says(out, nxv_no_posix(), s"$root/main.sysl:3:11", "3 | print(sys.environ == null)"), out)
+end nxv_refused_at_the_read
+
+@test("and at the address taken")
+nxv_refused_at_the_address()
+    if !nxv_ready() then return
+
+    val root = nxv_tree([("sys/a.sysl", nxv_sys()),
+                         ("main.sysl", "@no_posix\n\nvar p = &sys.environ\nprint(*p == null)\n")])
+    val (code, out) = nxv_built(root)
+
+    assert_eq(code, 1, out)
+    assert(nxv_says(out, nxv_no_posix(), s"$root/main.sysl:3:14", "3 | var p = &sys.environ"), out)
+end nxv_refused_at_the_address
+
+@test("and at the write")
+nxv_refused_at_the_write()
+    if !nxv_ready() then return
+
+    val root = nxv_tree([("sys/a.sysl", nxv_sys()),
+                         ("main.sysl", "@no_posix\n\nsys.environ = null\nprint(1)\n")])
+    val (code, out) = nxv_built(root)
+
+    assert_eq(code, 1, out)
+    assert(nxv_says(out, nxv_no_posix(), s"$root/main.sysl:3:5", "3 | sys.environ = null"), out)
+end nxv_refused_at_the_write
+
+@test("and through a function that reads it, where the caret goes to the call")
+nxv_refused_through_a_reader()
+    if !nxv_ready() then return
+
+    val root = nxv_tree([("sys/a.sysl", "module sys\n\n@needs(posix)\nprivate extern environ: **u8\n\n" +
+                                         "empty() -> bool = environ == null\n"),
+                         ("main.sysl", "@no_posix\n\nprint(sys.empty())\n")])
+    val (code, out) = nxv_built(root)
+
+    assert_eq(code, 1, out)
+    assert(nxv_says(out, nxv_no_posix(), s"$root/main.sysl:3:11", "3 | print(sys.empty())"), out)
+end nxv_refused_through_a_reader
+
+@test("while a module that has the capability reads it exactly as before")
+nxv_allowed_where_the_capability_holds()
+    if !nxv_ready() then return
+
+    val text = nxv_ir(nxv_tree([("sys/a.sysl", nxv_sys()),
+                                ("main.sysl", "print(sys.environ == null)\n")]))
+
+    assert(text.contains("@environ = external global ptr\n"), text)
+end nxv_allowed_where_the_capability_holds
+
+@test("a capability nothing has heard of is refused on a variable as on a function")
+nxv_an_unknown_capability()
+    if !nxv_ready() then return
+
+    val root = nxv_tree([("main.sysl", "@needs(files)\nextern environ: **u8\nprint(environ == null)\n")])
+    val (code, out) = nxv_built(root)
+
+    assert_eq(code, 1, out)
+    assert(nxv_says(out, "no capability is called 'files' — the set is 'heap', 'os', 'posix'",
+                    s"$root/main.sysl:1:1", "1 | @needs(files)"), out)
+end nxv_an_unknown_capability
+
+@test("sysl.env.vars, whose 'environ' carries the annotation, still lists the environment")
+nxv_env_vars_still_works()
+    if !nxv_ready() then return
+
+    val root = nxv_tree([("main.sysl", "import sysl.env.vars\n\nprint(vars().len() > 0)\n")])
+    val out_dir = lbr_temp("sysl-nxv-exe")
+
+    reset_search_paths()
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "true\n")
+end nxv_env_vars_still_works
