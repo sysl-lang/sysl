@@ -407,8 +407,8 @@ private docs_line(name: string, t: DocsTally) -> string =
 
 // Where a run leaves its report, for a reader who wants the numbers rather than a verdict: the test
 // runner shows what a passing test says to nobody.
-private docs_record(report: Buf[string])
-    val where = env_var("SYSL_DOCS_SUMMARY")
+private docs_record(report: Buf[string], named_by: string = "SYSL_DOCS_SUMMARY")
+    val where = env_var(named_by)
 
     if where.is_none() then return
 
@@ -538,3 +538,212 @@ the_sites_pages_run_here()
 
     assert(bad.is_empty(), docs_first_twenty(bad))
 end the_sites_pages_run_here
+
+// -- the heap a runnable block gives back -----------------------------------------------------------
+
+// What the output comparison above cannot see: a missing release, an extra retain, a destructor that
+// never runs. None of them changes what a program prints, so every runnable block is built again
+// with the heap counted (`alloc_count.sysl`) and has to end with nothing it allocated still live.
+
+// A block that ends with allocations live ON PURPOSE: where it is, exactly how many it holds, and
+// why. The count is exact rather than "some", so a real leak added to an excused block still turns
+// the sweep red.
+struct DocsLeakExcuse
+    page: string
+    nth: int
+    live: long
+    why: string
+
+// Every excuse. A listed block that comes back with any other count, or that is not on its page any
+// more, fails the sweep, so the list cannot outlive what it excuses.
+docs_leak_excuses() -> Buf[DocsLeakExcuse]
+    var out: Buf[DocsLeakExcuse] = buf()
+
+    // Module storage assigned after the program began still holds its value at exit, and module
+    // storage is never released: the count is what the storage holds, not something lost.
+    val held = "a 'static var' still holds it at exit, and module storage is never released"
+
+    out.push(DocsLeakExcuse("reference/async.md", 26, 3, s"$held -- the timer's waker"))
+    out.push(DocsLeakExcuse("reference/async.md", 27, 4, s"$held -- the two wakers 'kept' collected"))
+    out.push(DocsLeakExcuse("reference/async.md", 28, 2, s"$held -- the interrupt's waker"))
+    out.push(DocsLeakExcuse("reference/modules.md", 46, 1, s"$held -- the last string 'set' made"))
+    out.push(DocsLeakExcuse("reference/memory.md", 47, 1, s"$held -- the digest 'record' made"))
+
+    // The page's own subject: freeing raw storage releases nothing, so the box a counted field there
+    // still names is never given back -- the prose says to assign over it first, and the block shows
+    // what happens when nothing does.
+    out.push(DocsLeakExcuse("reference/memory.md", 52, 1, "c_free of calloc'd storage releases " +
+                            "nothing, so the 'Item' its field still names is never given back"))
+
+    out
+end docs_leak_excuses
+
+private docs_excuse_of(excuses: Buf[DocsLeakExcuse], b: DocsBlock) -> Option[usize]
+    for k in 0..<excuses.len()
+        if excuses.at(k).page == b.page && excuses.at(k).nth == b.nth then return Some(k)
+
+    None
+end docs_excuse_of
+
+// The net count a block's program reported at exit, or why there is no count: a block that does not
+// build or does not finish cleanly is the output sweep's to report, and a program that stopped
+// partway still holds its frames.
+private docs_live_at_exit(src: string, exe: string) -> Result[long, string]
+    build_native_program(src, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> return Err(failure_text(why))
+        Ok(_) -> ()
+
+    capture(exe, [], "", [], true) match
+        Err(_) -> Err("the program could not be started")
+        Ok(said) ->
+            if !said.status.ok() then return Err(s"it exited with ${shell_status(said.status)}")
+
+            Ok(alloc_count_reported(said.err.unwrap_or("")))
+end docs_live_at_exit
+
+@test("every runnable sysl block the site shows gives back every allocation it made")
+the_sites_programs_give_back_their_heap()
+    val asked = env_var("SYSL_DOCS").unwrap_or("") == "1" ||
+        env_var("SYSL_DOCS_LEAKS").unwrap_or("") == "1"
+
+    if !asked
+        print("skipped: neither SYSL_DOCS nor SYSL_DOCS_LEAKS is set, so the site's heap was not counted")
+        return
+    end if
+
+    val root = docs_root()
+
+    if root == "" || std_root().is_err() || !clang_available()
+        print("skipped: no pages, no library or no toolchain on this machine")
+        return
+    end if
+
+    val dir = make_temp_dir("sysl-leaks").unwrap()
+    val src = s"$dir/main.sysl"
+    val exe = s"$dir/program"
+    val pages = docs_pages(root)
+    val excuses = docs_leak_excuses()
+
+    var excused_found: Buf[bool] = buf()
+
+    for k in 0..<excuses.len()
+        excused_found.push(false)
+
+    var report: Buf[string] = buf()
+    var bad: Buf[string] = buf()
+    var checked = 0
+    var leaking = 0
+    var excused = 0
+    var uncounted = 0
+
+    force_alloc_counting(true)
+
+    for p in 0..<pages.len()
+        val short = docs_short(root, pages.at(p))
+        val blocks = docs_blocks(short, read_text(pages.at(p)).unwrap_or(""))
+
+        for i in 0..<blocks.len()
+            val b = blocks.at(i)
+
+            if b.claim != DocsClaim.PagePrints || b.archive || b.target != "" then continue
+
+            val placed = docs_placed(dir, b.source)
+            var at = src
+
+            if placed.is_some() then at = placed.unwrap()
+            else write_text(src, b.source).unwrap()
+
+            val counted = docs_live_at_exit(at, exe)
+
+            if placed.is_some() then remove_dir_all(s"$dir/tree").unwrap_or(())
+
+            val where = s"${b.page}, sysl block ${b.nth}"
+            val excuse = docs_excuse_of(excuses, b)
+
+            counted match
+                Err(_) -> uncounted += 1
+                Ok(n) ->
+                    checked += 1
+
+                    if excuse.is_some() then excused_found.set(excuse.unwrap(), true)
+
+                    if n != 0 then report.push(s"$where: $n live at exit")
+
+                    if excuse.is_some()
+                        val x = excuses.at(excuse.unwrap())
+
+                        if n == x.live
+                            excused += 1
+                        else
+                            bad.push(s"$where: excused at ${x.live} live (${x.why}), but it ended " +
+                                     s"with $n -- a change to its heap, or a stale excuse")
+                    else if n != 0
+                        leaking += 1
+                        bad.push(s"$where: $n ${alloc_count_said()}")
+
+    force_alloc_counting(false)
+    remove_dir_all(dir).unwrap_or(())
+
+    // An excuse is only checked where the run reached its page, so a narrowed run checks the ones on
+    // the pages it read.
+    for k in 0..<excuses.len()
+        val page = excuses.at(k).page
+        var read = false
+
+        for p in 0..<pages.len()
+            if docs_short(root, pages.at(p)) == page then read = true
+
+        if read && !excused_found.at(k)
+            bad.push(s"$page, sysl block ${excuses.at(k).nth}: excused, but no such runnable block " +
+                     "counted there")
+
+    report.push("")
+    report.push(s"-- every page: $checked counted, ${checked - leaking - excused} clean, $leaking " +
+                s"leaking, $excused excused, $uncounted not counted (the output sweep's to report)")
+
+    for i in 0..<report.len()
+        print(report.at(i))
+
+    report.push("")
+
+    for i in 0..<bad.len()
+        report.push(bad.at(i))
+
+    docs_record(report, "SYSL_DOCS_LEAKS_SUMMARY")
+
+    if env_var("SYSL_DOCS_ONLY").unwrap_or("") == ""
+        assert(checked >= 800, s"the pages showed the runnable blocks the count is owed: only $checked")
+
+    assert(bad.is_empty(), docs_first_twenty(bad))
+end the_sites_programs_give_back_their_heap
+
+@test("every leak excuse names a runnable block on a page that exists, a count and a reason")
+the_leak_excuses_name_real_blocks()
+    val root = docs_root()
+
+    if root == ""
+        print("skipped: no pages at '../docs/content' (run from 'compiler/') or at what SYSL_SITE names")
+        return
+    end if
+
+    val excuses = docs_leak_excuses()
+
+    assert(!excuses.is_empty())
+
+    for k in 0..<excuses.len()
+        val x = excuses.at(k)
+        val blocks = docs_blocks(x.page, read_text(s"$root/${x.page}").unwrap_or(""))
+        var found = false
+
+        for i in 0..<blocks.len()
+            val b = blocks.at(i)
+
+            if b.nth == x.nth
+                found = true
+                assert(b.claim == DocsClaim.PagePrints && !b.archive && b.target == "",
+                       s"${x.page}, sysl block ${x.nth} is not a runnable block")
+
+        assert(found, s"${x.page} has no sysl block ${x.nth}")
+        assert(x.live != 0, s"${x.page}, sysl block ${x.nth} is excused for leaking nothing")
+        assert(x.why != "", s"${x.page}, sysl block ${x.nth} is excused with no reason")
+end the_leak_excuses_name_real_blocks
