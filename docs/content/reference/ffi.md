@@ -521,6 +521,13 @@ statements like any other computed one — so on a freestanding archive it is re
 than given a value the program would never have computed. A `f32` is rounded after every operation,
 as the machine rounds it, so `val g: f32 = 16777216.0 + 1.0 + 1.0` holds `16777216`.
 
+**A conversion to a constrained type is constant data when what it converts is.** A `new` type, or
+any subtype with no range, checks nothing, so `PhysAddr(0)` over `type PhysAddr = new u64` is the
+constant `0` — alone, or as the fields of a struct built from such conversions. A range is checked
+while compiling: a value it admits is laid down, and one it does not is refused before anything runs
+(*"200 is not a value 'Age' admits"*). A `where` predicate is a function, so storage behind one stays
+code, filled and checked before the program's statements.
+
 #### The one case with nowhere to fill
 
 **A freestanding target has no loader.** Nothing walks `.init_array` on bare metal unless the image's
