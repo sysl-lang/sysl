@@ -20,15 +20,22 @@ end Stmt
 // **The five biggest declarations carry a struct rather than a long variant.** `FuncDecl` alone has
 // twenty-two fields, and a variant with twenty-two positional arguments is a form nobody can read at
 // a construction site; the struct is named for the node and the variant holds one of it.
+// How many copies of a module `var` the program has: one, one per thread (`@thread_local`), or one
+// per processor core (`@per_cpu`).
+enum Copies
+    OneCopy
+    CopyPerThread
+    CopyPerCpu
+
 enum StmtKind
     // `import a.b.{c, d as e}`, `import a.b.*`, `import a.b as c`.
     ImportDecl(decl: ImportDecl)
 
-    // `var name: T = init`. `thread_local` is `@thread_local` -- one copy of this storage per thread
-    // rather than one for the program, the third fact about where the storage lives beside the
-    // boundary and the section.
+    // `var name: T = init`. `copies` is `@thread_local` or `@per_cpu` -- one copy of this storage per
+    // thread or per processor core rather than one for the program, the third fact about where the
+    // storage lives beside the boundary and the section.
     VarDecl(name: string, typ: Option[TypeRef], init: Option[Expr], vis: Visibility,
-            align: Option[Expr], section: Option[string], thread_local: bool)
+            align: Option[Expr], section: Option[string], copies: Copies)
 
     // `const NAME: T = value` -- settled while compiling, so the type is not optional.
     ConstDecl(name: string, typ: TypeRef, value: Expr, vis: Visibility)
@@ -227,6 +234,13 @@ struct FuncMarks
     async_at: Option[Span]
     forgoes: Buf[string]
 
+    // `@pinned` and `@pins` (`reference/attributes.md § @per_cpu`): the body runs where the core
+    // cannot change under it -- because every caller already holds it there, or because the body
+    // itself masks what could move it before it reaches `@per_cpu` storage. Neither reaches the
+    // `define` line; `pinning.sysl` reads them.
+    pinned: bool
+    pins: bool
+
     // Whether any of the three was written.
     any(self) -> bool = self.noinline || self.cold || self.inline
 
@@ -242,7 +256,7 @@ struct FuncMarks
 end FuncMarks
 
 // A definition nothing was said about.
-no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf())
+no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, false)
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -387,6 +401,9 @@ enum Attr
     Inline
     Cold
     ThreadLocal
+    PerCpu
+    Pinned
+    Pins
     // `@no_alloc` above a function or a method: the capability it gives up, as the word after `no_`.
     Forgoes(cap: string)
 end Attr
@@ -412,6 +429,9 @@ attr_word(a: Attr) -> string = a match
     Inline -> "inline"
     Cold -> "cold"
     ThreadLocal -> "thread_local"
+    PerCpu -> "per_cpu"
+    Pinned -> "pinned"
+    Pins -> "pins"
     Forgoes(cap) -> s"no_$cap"
 
 // A foreign function's declaration.

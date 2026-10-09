@@ -2542,6 +2542,229 @@ print(n)
 What a bare target uses instead is exactly this: a plain module `var` the port's scheduler answers
 for, the same shape the ownership runtime's reaper slot already takes.
 
+### On a bare AArch64 machine the program may own the thread pointer
+
+A kernel is the thing that writes the thread pointer, so on `aarch64-freestanding` the refusal above
+becomes a question: which register? The manifest answers it, and from then on `@thread_local` compiles
+to the local-exec model against that register:
+
+```hocon
+codegen {
+  thread_pointer = "tpidr_el1"
+}
+```
+
+The register is any of `tpidr_el0`, `tpidrro_el0`, `tpidr_el1`, `tpidr_el2` and `tpidr_el3`. Every
+function is compiled to read it (clang's `-mtp`), and so is a package's carried C, so a
+`_Thread_local` there and a `@thread_local` here find one block.
+
+**What the program then owes is what a loader would have done.** The linker gathers every
+thread-local into a `.tdata` image (the initial values) and a `.tbss` (the zeros), and on AArch64 a
+variable lives at the thread pointer plus 16 plus its offset in that image, the 16 bytes being reserved
+for the thread's own use. So for each thread the program sets aside 16 bytes plus the image, rounded
+to the image's alignment, copies `.tdata` in after the 16, zeroes the `.tbss` part, and writes the
+block's address to the register on every switch. A linker script names the bounds for it to copy:
+
+```text
+.tdata : { __tdata_start = .; *(.tdata .tdata.*) __tdata_end = .; }
+.tbss  : { *(.tbss .tbss.*) *(.tcommon) __tbss_end = .; }
+```
+
+A thread that never gets a block reads whatever the register points at, as it would through any
+pointer the program forgot to set. A register the machine has no use for is refused before anything
+is built:
+
+```sysl target=aarch64-freestanding
+@thread_local static var n: int = 0
+
+print(n)
+```
+
+```error
+cannot be '@thread_local' on 'aarch64-freestanding' until the program says which register holds the thread pointer
+```
+
+## `@per_cpu` — one copy per processor core
+
+`@per_cpu` gives a module `var` one copy per **core** rather than per thread: the record a scheduler
+keeps for each processor, the core's run queue, its tick count. It exists only on `aarch64-freestanding`,
+where the program owns a register to find the copy through, and the manifest names that register:
+
+```hocon
+codegen {
+  per_cpu_offset = "tpidr_el1"
+}
+```
+
+Every `@per_cpu` binding is laid down in one section, `.percpu`, and that section is the **image** each
+core's copy is made from. The register holds this core's copy's address *minus* the image's, so an
+access is the binding's address plus the register — read afresh at every access — and a core whose
+register is zero is using the image itself. A boot core can therefore use its per-core data before it
+has made any copies, provided it zeroes the register first. For the others the program copies the
+image once per core and writes each core's offset:
+
+```text
+.percpu : { __percpu_start = .; *(.percpu) __percpu_end = .; }
+```
+
+```sysl
+@per_cpu
+var ticks: u64 = 0
+
+@pinned
+tick() -> u64
+    ticks += 1
+    ticks
+```
+
+Its initializer has to be one the compiler can write down, as a `@thread_local`'s does, and it stands
+beside `@align(n)` and nothing else: the section is the storage class's own.
+
+### A per-core read is right only where the core cannot change
+
+Which copy `ticks` names depends on the core *running*, so the read is right only while the thread
+cannot move: a thread preempted between finding its core's copy and using it resumes on another core
+holding the first core's. Nothing in a function's text says whether interrupts are masked, so the
+function says it, in one of two words:
+
+- **`@pinned`** — every caller already keeps this function on one core: it runs in an interrupt
+  handler, or under a lock that masks interrupts. That is a precondition, so **a call of a `@pinned`
+  function is held to the same rule as a per-core read**, and so is taking its address.
+- **`@pins`** — the body keeps itself on one core before it gets there (it masks interrupts first,
+  and unmasks them after). Its callers are asked nothing.
+
+A `@per_cpu` binding may be named, and a `@pinned` function called, only inside a body marked one or
+the other. The words are the program's claim, as an `@export`'s symbol is — the compiler cannot see a
+register being written — but they put the claim at the function, where a reader can check it against
+the code, and they carry it up the call tree to the place that keeps the core still.
+
+The rule is not about storage, so it runs anywhere a `@pinned` function is written:
+
+```sysl
+@pinned
+depth() -> int = 3
+
+@pins
+probe() -> int
+    // The real thing masks interrupts here and restores them after.
+    depth()
+
+print(probe())
+```
+
+```output
+3
+```
+
+A closure is a body of its own and carries neither word, since it can be called after the function
+that wrote it has let the core go; nor do the entry file's statements.
+
+```sysl
+@pinned
+depth() -> int = 3
+
+print(depth())
+```
+
+```error
+'depth' is '@pinned', so every call of it has to be made where the core cannot change, and the program's statements are neither '@pinned' nor '@pins'
+```
+
+`@pinned` says the callers hold the core still and `@pins` that the body does, so one function is one
+or the other:
+
+```sysl
+@pinned
+@pins
+depth() -> int = 3
+```
+
+```error
+'@pinned' says every caller already keeps this function on one core, and '@pins' says the function does that itself before it reaches per-core storage — one body is one or the other
+```
+
+### What it refuses
+
+Anywhere but a bare AArch64 machine, the operating system moves a thread between cores whenever it
+likes, so no answer to "which core" stays true long enough to read through:
+
+```sysl
+@per_cpu
+static var ticks: u64 = 0
+
+print(ticks)
+```
+
+```error
+cannot be '@per_cpu' on
+```
+
+On `aarch64-freestanding`, until the manifest names the register:
+
+```sysl target=aarch64-freestanding
+@per_cpu
+static var ticks: u64 = 0
+
+@pins
+tick() -> u64 = ticks
+
+print(tick())
+```
+
+```error
+cannot be '@per_cpu' until the program says which register holds this core's offset
+```
+
+A copy per thread and a copy per core are two answers to one question:
+
+```sysl
+@per_cpu
+@thread_local
+static var ticks: u64 = 0
+```
+
+```error
+'@thread_local' and '@per_cpu' are two answers to how many copies one 'var' has
+```
+
+A section would move the binding out of the image the copies are taken from:
+
+```sysl
+@per_cpu
+@section(".data")
+static var ticks: u64 = 0
+```
+
+```error
+'@per_cpu' places the binding in '.percpu', the image every core's copy is made from
+```
+
+A `val` never changes, so the one copy it has is already every core's:
+
+```sysl
+@per_cpu
+static val ticks: u64 = 0
+```
+
+```error
+a per-core constant is a constant
+```
+
+A local is in one call's frame, which no other core can see:
+
+```sysl
+count() -> u64
+    @per_cpu
+    var n: u64 = 0
+    n
+
+print(count())
+```
+
+```error
+'n' is a local, and a local is already one call's
+```
+
 ## `#if` — gating lines before the lexer
 
 Everything a target decides is a fact the *compiler* reads about the machine. `#if` is the one place
