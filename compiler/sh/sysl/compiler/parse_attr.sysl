@@ -704,8 +704,9 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     end if
 
     // A layout beside `@export` marks a struct and only a struct: a `type` takes `@export` alone,
-    // and a function or a binding lays nothing out.
-    if has_export(attrs) && has_layout(attrs) && all_layout_or_export(attrs)
+    // and a function lays nothing out. A binding takes `@align(n)` beside it, and the rest of the
+    // pair is refused below with the binding's own rule.
+    if has_export(attrs) && has_layout(attrs) && all_layout_or_export(attrs) && !storage
         p.fault(start, "'@packed' and '@align(n)' lay out a struct and '@export(\"...\")' names one in a generated header, so together they mark a struct — and this declares none")
         skip_line(p)
         return stmt(start.to(p.just_taken()), Bad)
@@ -715,7 +716,7 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     // and between them they are what a binding may carry.
     if storage
         refuse_unless(p, at, attrs, "binding")
-        return from_first(start, placed(p, parse_stmt_at(p, false), attrs))
+        return from_first(start, placed(p, parse_stmt_at(p, false), attrs, vis))
     end if
 
     // `@section("...")` and `@align(n)` above an `asm` block place instructions written at the top of
@@ -804,7 +805,7 @@ private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)
 
 private may_carry(form: string, a: Attr) -> bool
     if form == "struct" then return is_layout(a) || attr_word(a) == "export"
-    if form == "binding" then return is_storage(a)
+    if form == "binding" then return is_storage(a) || attr_word(a) == "export"
     if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "blocks" ||
         attr_word(a) == "abandons"
 
@@ -840,7 +841,7 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
         return "'@section(\"...\")' places one object in a linker section, so it marks a 'var', a 'val' or a function — a 'const' is folded into every use and has no storage to place, and an 'extern' names something this program does not define"
 
     if all_are(attrs, "export")
-        return "'@export' names what C sees — a function's symbol, or the name a struct's or a type's 'typedef' carries in a generated header — and this declares none of them. A simple enum is spelled as the integer it is, so it has no name in the header to choose, and an 'extern' names something this program does not define"
+        return "'@export' names what C sees — a function's symbol, a module 'var' or 'val''s symbol, or the name a struct's or a type's 'typedef' carries in a generated header — and this declares none of them. A 'const' is folded into every use and has no storage to name, a simple enum is spelled as the integer it is, so it has no name in the header to choose, and an 'extern' names something this program does not define"
 
     // The layout pair beside the name settles which kind was meant: `@packed` cannot mark a function,
     // so the group together can only be about a struct and the refusal need not offer the function
@@ -935,14 +936,14 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     end if
 
     // `@thread_local` marks a binding and only a binding, so the only annotations it may stand beside
-    // are the other two about storage.
+    // are the other ones about storage -- the two that place it and the one that names it for C.
     if per_thread(attrs) && per_core(attrs)
         p.fault(p.here(), "'@thread_local' and '@per_cpu' are two answers to how many copies one 'var' has — one per thread, or one per processor core — so they cannot stand above the same binding. Pick the one the program means: a thread moves between cores, and a core runs many threads")
         return
     end if
 
     if per_thread(attrs) && !all_storage(attrs)
-        p.fault(p.here(), "'@thread_local' gives one 'var' a copy per thread, so the only annotations it stands beside are the other two about storage — '@align(n)' and '@section(\"...\")'. The rest mark a function or a type, and neither is storage a thread could have its own of")
+        p.fault(p.here(), "'@thread_local' gives one 'var' a copy per thread, so the only annotations it stands beside are the others about storage — '@align(n)', '@section(\"...\")' and '@export'. The rest mark a function or a type, and neither is storage a thread could have its own of")
         return
     end if
 
@@ -950,6 +951,13 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     // linker script bounds -- so `@align(n)` is the only other storage annotation it may stand beside.
     if per_core(attrs) && has_section(attrs)
         p.fault(p.here(), "'@per_cpu' places the binding in '.percpu', the image every core's copy is made from, so '@section(\"...\")' would move it out of the block the copies are taken from. Leave the section off; '@align(n)' is the one other annotation it stands beside")
+        return
+    end if
+
+    // A C symbol names one object, and per-core storage is no one object: the symbol would name the
+    // image the copies are made from, which no core reads or writes.
+    if per_core(attrs) && has_word(attrs, "export")
+        p.fault(p.here(), "'@export' publishes one object under a C symbol, and '@per_cpu' storage is one copy per processor core — the symbol could only name the '.percpu' image the copies are made from, which no core reads or writes. Export a function that reads this core's copy instead")
         return
     end if
 
@@ -1064,7 +1072,7 @@ end has_word
 
 private all_storage(attrs: Buf[Attr]) -> bool
     for attr in attrs
-        if !is_storage(attr) then return false
+        if !is_storage(attr) && attr_word(attr) != "export" then return false
 
     true
 end all_storage
@@ -1150,7 +1158,10 @@ end exported_type
 
 // `@align(n)`, `@section("...")` and `@thread_local` folded onto whichever binding they were written
 // above, reaching through the `static` wrapper to the declaration inside it.
-private placed(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
+//
+// **The visibility was read before the keyword was**, above the binding's own reading, so it is
+// handed in and put back on the binding: `@export private var x` is a private `x`.
+private placed(p: *Parser, s: Stmt, attrs: Buf[Attr], written: Visibility) -> Stmt
     var align: Option[Expr] = None
     var section: Option[string] = None
     val copies = if per_thread(attrs) then CopyPerThread
@@ -1170,17 +1181,21 @@ private placed(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
         return s
     end if
 
+    var export: Option[ExportAttr] = None
+
     for attr in attrs
         attr match
             Align(n) -> align = Some(n)
             Section(name) -> section = Some(name)
+            Export(e) -> export = Some(e)
             _ -> ()
 
     *s.kind match
-        ValDecl(n, t, v, vis, _, _) -> stmt(s.span, ValDecl(n, t, v, vis, align, section))
-        VarDecl(n, t, v, vis, _, _, _) ->
-            stmt(s.span, VarDecl(n, t, v, vis, align, section, copies))
-        StaticDecl(inner) -> stmt(s.span, StaticDecl(placed(p, inner, attrs)))
+        ValDecl(n, t, v, vis, _, _, _) ->
+            stmt(s.span, ValDecl(n, t, v, either_vis(written, vis), align, section, export))
+        VarDecl(n, t, v, vis, _, _, _, _) ->
+            stmt(s.span, VarDecl(n, t, v, either_vis(written, vis), align, section, copies, export))
+        StaticDecl(inner) -> stmt(s.span, StaticDecl(placed(p, inner, attrs, written)))
 
         // **Both annotations are about one object**, so a binding that names several has nothing for
         // them to be about. The refusal names the annotation rather than the binding, since the
@@ -1189,6 +1204,12 @@ private placed(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
         PatternDecl(_, _, _) -> refuse_several(p, s, attrs)
         _ -> s
 end placed
+
+// The visibility written in front of the annotations' declaration, where one was, and the binding's
+// own reading otherwise.
+private either_vis(written: Visibility, own: Visibility) -> Visibility = written match
+    Public -> own
+    _ -> written
 
 // `@section("...")` and `@align(n)` folded onto the `asm` block they were written above, which is
 // module-level wherever it stands: an annotated block inside a function is refused by the analysis
@@ -1216,6 +1237,7 @@ private refuse_several(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
     var about = "'@align(n)' is the boundary one object's storage begins on"
 
     if !all_are(attrs, "align") then about = "'@section(\"...\")' places one object"
+    if has_export(attrs) then about = "'@export' publishes one object under one C symbol"
 
     p.fault(Span(s.span.end, s.span.end), s"${about}, and a binding that names several has " +
         "no one object for it to be about \u{2014} declare them on lines of their own")
@@ -1226,7 +1248,7 @@ end refuse_several
 // `static` wrapper. A comma list and a pattern are `var`s too, refused a line later for naming
 // several.
 private holds_a_var(s: Stmt) -> bool = *s.kind match
-    VarDecl(_, _, _, _, _, _, _) -> true
+    VarDecl(_, _, _, _, _, _, _, _) -> true
     MultiDecl(_, mutable, _) -> mutable
     PatternDecl(_, mutable, _) -> mutable
     StaticDecl(inner) -> holds_a_var(inner)

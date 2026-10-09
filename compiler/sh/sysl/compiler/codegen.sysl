@@ -105,9 +105,13 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
     // body has been written.
     var declared_globals: Buf[IrGlobal] = buf()
 
+    // An `extern` variable this program's own exported storage answers is that storage, laid down
+    // below -- a module supplying another module's `extern`, as a function may -- so it is not
+    // declared beside its own definition.
     for i in 0..<p.extern_vars.len()
-        declared_globals.push(ir_extern_global(p.extern_vars.at(i).symbol,
-                                               lty(e, p.extern_vars.at(i).ty), binds_locally(e)))
+        if !stores_export(p, p.extern_vars.at(i).symbol)
+            declared_globals.push(ir_extern_global(p.extern_vars.at(i).symbol,
+                                                   lty(e, p.extern_vars.at(i).ty), binds_locally(e)))
 
     // A library has no entry point. Emitting one would put a second `main` in every program that
     // linked against it, which the linker reports as a duplicate symbol and nothing else explains.
@@ -392,13 +396,22 @@ private imported_sigs(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     out
 end imported_sigs
 
+// Whether this program's own module storage is exported under `symbol`.
+stores_export(p: TProgram, symbol: string) -> bool
+    for i in 0..<p.vals.len()
+        if p.vals.at(i).exported == Some(symbol) then return true
+
+    false
+end stores_export
+
 // The symbols this module places by hand and nothing in it reads, which is what keeps a section a
 // linker script gathers from being discarded.
 private used_of(p: TProgram, funcs: Buf[IrFunc]) -> Option[IrGlobal]
     var names: Buf[string] = buf()
 
     for i in 0..<p.vals.len()
-        if p.vals.at(i).section.is_some() then names.push(p.vals.at(i).symbol)
+        if p.vals.at(i).section.is_some()
+            names.push(p.vals.at(i).exported.unwrap_or(p.vals.at(i).symbol))
 
     for i in 0..<funcs.len()
         if funcs.at(i).sig.section.is_some() then names.push(funcs.at(i).sig.name)
@@ -414,6 +427,17 @@ private gap_text(e: *Emit) -> string = e.gap match
 // a link name of its own, a definition displaced by an export that claimed its name, and the entry
 // point, which is defined under a name of the compiler's.
 private record_symbols(e: *Emit, p: TProgram)
+    // **Exported storage is laid down under the symbol C names**, and every read, write and address
+    // of it names that symbol too -- one object, so there is no thunk to stand between the two the
+    // way there is for a function. A storage key is `module$name`, or a root module's bare name, and
+    // no function shares a key with storage, so the one list serves both.
+    for i in 0..<p.vals.len()
+        val v = p.vals.at(i)
+
+        v.exported match
+            Some(sym) -> if sym != v.symbol then e.symbols.push((v.symbol, sym))
+            None -> ()
+
     for i in 0..<p.externs.len()
         val x = p.externs.at(i)
 

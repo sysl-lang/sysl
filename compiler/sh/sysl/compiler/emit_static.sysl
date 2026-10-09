@@ -35,16 +35,55 @@ gen_vals(e: *Emit, vals: Buf[TVal]) -> Buf[IrGlobal]
 
         val align = wider_align(own, e.layout.storage_align(v.ty))
 
+        // **Exported storage is a C data object**: laid down under its symbol with the linkage a
+        // definition has by default, a `val` read-only and so in `.rodata`, a `var` with no value in
+        // `.bss`, and a private one hidden as a private function's entry is. Everything else is the
+        // module's own and stays private.
+        val exported = v.exported.is_some()
+        val name = v.exported.unwrap_or(v.symbol)
+        val linkage = if exported then LinkDefault else LinkPrivate
+
         // **A `@per_cpu` binding is the image every core's copy is made from**, so it goes in
         // `.percpu` -- data even where it is all zeros, a named section keeping it out of `.bss` --
         // and a linker script bounds that section for the program to copy.
         val section = if v.per_cpu then Some(per_cpu_section()) else v.section
 
-        out.push(IrGlobal(v.symbol, !(v.computed || v.writable), lty(e, v.ty), Some(init),
-                          LinkPrivate, section, align, v.thread_local, false))
+        out.push(IrGlobal(name, !(v.computed || v.writable), lty(e, v.ty), Some(init),
+                          linkage, section, align, v.thread_local, exported && binds_locally(e),
+                          v.export_hidden))
 
     out
 end gen_vals
+
+// The address of a place in module storage, as a constant: the global itself, then one
+// `getelementptr` per step inside it -- a field by its LLVM index, an element by its number. The
+// analysis handed every index over as a literal the array has.
+private constant_address(e: *Emit, place: TExpr) -> Val = *place.kind match
+    TGlobal(symbol, _, _) -> VGlobal(symbol_of(e, symbol))
+    TField(receiver, index, ty) ->
+        if zero_sized(ty) then return constant_address(e, receiver)
+
+        val rty = texpr_type(receiver)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(field_index_of(e, rty, index))))))
+        VGep(lty(e, rty), constant_address(e, receiver), idx)
+    TIndex(receiver, index, _) ->
+        val elem = nameless(texpr_type(receiver)) match
+            Array(_, el) -> *el
+            _ -> return gap_at(e, "a constant address inside something that is not an array")
+
+        val at = *index.kind match
+            TIntLit(n, _) -> n
+            _ -> return gap_at(e, "a constant address at an index that is not a literal")
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(word_lty(e), VInt(at)))
+        VGep(lty(e, elem), constant_address(e, receiver), idx)
+    _ -> gap_at(e, "a constant address of something that is not module storage")
 
 // The section every `@per_cpu` binding's image is laid down in.
 per_cpu_section() -> string = ".percpu"
@@ -69,7 +108,7 @@ gen_used(names: Buf[string]) -> Option[IrGlobal]
         elems.push(ir_arg(LPtr, VGlobal(item)))
 
     Some(IrGlobal(llvm_used(), false, LArr(int(names.len()), LPtr), Some(VArray(elems)),
-                  LinkAppending, Some(llvm_metadata_section()), None, false, false))
+                  LinkAppending, Some(llvm_metadata_section()), None, false, false, false))
 end gen_used
 
 // A constant integer with its bytes reversed at `bits`, for a field of a `@byte_order` struct laid
@@ -165,6 +204,10 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
     // the object file rather than stored into it by a prologue.
     TCast(v, _) -> VIntToPtr(lty_of(e, v), constant_value(e, v))
 
+    // The address of module storage, or of a place inside it: a relocation the linker fills in,
+    // written as a constant `getelementptr` over the global (`analyze_body.sysl`'s `place_image`).
+    TAddrOf(place, _) -> constant_address(e, place)
+
     // A trait pointer is two words, so its empty value is not the one-word `null`.
     TNullLit(ty) -> if erased(underlying(ty)) then VZero else VNull
 
@@ -213,7 +256,7 @@ constant_table(e: *Emit, t: TExpr, ty: Type) -> Val
     val image = constant_value(e, t)
 
     e.globals.push(IrGlobal(name, true, lty(e, ty), Some(image), LinkPrivate, None,
-                            Some(int(e.layout.align(ty))), false, false))
+                            Some(int(e.layout.align(ty))), false, false, false))
     VGlobal(name)
 end constant_table
 
@@ -269,7 +312,7 @@ embed_const(e: *Emit, file: string, bytes: []u8, align: int) -> Val
         val image = if data.is_empty() then VZero else VBytes(data)
 
         e.globals.push(IrGlobal(name, true, LArr(int(data.len()), LInt(8)), Some(image), LinkPrivate,
-                                None, Some(align), false, false))
+                                None, Some(align), false, false, false))
 
     var fields: Buf[IrArg] = buf()
 

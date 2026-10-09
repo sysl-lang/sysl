@@ -491,14 +491,14 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
     MultiDecl(names, mutable, values) -> multi_decl(cx, stmt.span, names, mutable, values)
     PatternDecl(pat, mutable, value) -> pattern_decl(cx, stmt.span, pat, mutable, value)
 
-    VarDecl(name, typ, init, _, align, section, copies) ->
-        var_decl(cx, stmt.span, name, typ, init, align, section, copies)
+    VarDecl(name, typ, init, _, align, section, copies, export) ->
+        var_decl(cx, stmt.span, name, typ, init, align, section, copies, export)
 
     // A local `val` is a `var` that may not be assigned to again -- same frame, same lifetime, same
     // code. Only the binding differs, so the read-only half is enforced where an assignment target
     // is checked rather than here.
-    ValDecl(name, typ, value, _, align, section) ->
-        val_decl(cx, stmt.span, name, typ, value, align, section)
+    ValDecl(name, typ, value, _, align, section, export) ->
+        val_decl(cx, stmt.span, name, typ, value, align, section, export)
 
     RefDecl(name, place) -> ref_decl(cx, stmt.span, name, place)
 
@@ -633,11 +633,13 @@ push_all(out: *Buf[TStmt], xs: Buf[TStmt])
 
 private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
                  init: Option[Expr], align: Option[Expr], section: Option[string],
-                 copies: Copies) -> Buf[TStmt]
-    no_section(cx, span, name, section)
-
+                 copies: Copies, export: Option[ExportAttr]) -> Buf[TStmt]
     // One refusal per declaration, as the reference's first one ends the statement.
-    if section.is_none() then no_thread_local(cx, span, name, copies)
+    if export.is_some() then no_export(cx, span, name)
+    else
+        no_section(cx, span, name, section)
+
+        if section.is_none() then no_thread_local(cx, span, name, copies)
 
     val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
 
@@ -665,8 +667,9 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
 end var_decl
 
 private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], value: Expr,
-                 align: Option[Expr], section: Option[string]) -> Buf[TStmt]
-    no_section(cx, span, name, section)
+                 align: Option[Expr], section: Option[string],
+                 export: Option[ExportAttr]) -> Buf[TStmt]
+    if export.is_some() then no_export(cx, span, name) else no_section(cx, span, name, section)
 
     val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
     val ti = type_expr(cx, value, declared)
@@ -735,6 +738,15 @@ private no_section(cx: &Analyzer, span: Span, name: string, section: Option[stri
              s"\"${section.unwrap()}\" — its storage is the frame of whichever call is running, " +
              "and a section is a region of the image the linker decides once. Declare it as " +
              "module storage, outside every function, for a section to be about")
+
+// `@export` above a **local**, refused for `no_section`'s reason: a symbol names one object for the
+// whole run, and a local is a new object every call. In the file the program starts in, a top-level
+// binding is the body's local, and `static` is what hands it back to the module.
+private no_export(cx: &Analyzer, span: Span, name: string) =
+    cx.fault(span, s"'$name' is a local, so it cannot be exported — a C symbol names one object " +
+             "for the whole run, and a local is a new one on every call, in the frame of whichever " +
+             "call is running. Declare it as module storage, outside every function; in the file " +
+             "the program starts in, write 'static' in front of it")
 
 // `@thread_local` above a **local**, refused here for `no_section`'s reason: the grammar cannot
 // tell module storage from a local, and this is the first place that can. A local already belongs
@@ -990,8 +1002,8 @@ private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
         Defer(_) ->
             Some("'defer' schedules a statement, and scheduling a scheduling has " +
                  "nothing to run: write the statement itself after this 'defer'")
-        VarDecl(_, _, _, _, _, _, _) -> Some(deferred_declaration())
-        ValDecl(_, _, _, _, _, _) -> Some(deferred_declaration())
+        VarDecl(_, _, _, _, _, _, _, _) -> Some(deferred_declaration())
+        ValDecl(_, _, _, _, _, _, _) -> Some(deferred_declaration())
         MultiDecl(_, _, _) -> Some(deferred_declaration())
         ConstDecl(_, _, _, _) -> Some(deferred_declaration())
         _ -> None

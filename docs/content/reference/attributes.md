@@ -16,6 +16,7 @@ has a name and a spelling of its own:
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; with `@abandons`, one of the two an `extern` takes | the grammar |
 | `@packed`, `@align(n)`, `@section("...")` | an **annotation** — where the declaration under it is laid out, or where it lands | the grammar |
 | `@export("...")` on a `struct` | an **annotation** — the name the type carries in a generated C header | the grammar |
+| `@export("...")` on a module `var` or `val` | an **annotation** — the C symbol the storage is published under | the grammar |
 | `@no_alloc`, `@requires`, `@link`, `@include`, `@tests` | an **annotation** — a fact about the whole file, in its header | the grammar |
 | `@assert` | an **annotation** that describes nothing but itself — a condition settled while compiling | the analyzer, once |
 | `#if` | a **directive** — a gate on lines | a pass before the lexer |
@@ -54,7 +55,8 @@ what the declaration does. `@packed` and `@align(n)` lay out a struct — no int
 boundary the aggregate begins on — and `@align(n)` marks one binding's storage as well.
 `@section("...")` marks a binding **or** a function, and says which linker section it lands in. All
 three are below. The fourth is `@export`, which on a struct names the type in a generated C header
-rather than placing it, and is on the [FFI](/reference/ffi/) page with the other half of itself.
+rather than placing it, and on a module `var` or `val` publishes the storage under a C symbol; both
+are on the [FFI](/reference/ffi/#exported-storage) page with the other half of themselves.
 
 **On the file** there are five, in its header directly below `module` and before everything else:
 `@no_alloc` and its siblings, `@requires(...)`, `@link("...")`, `@include("...")`, and `@tests`. The
@@ -3219,7 +3221,7 @@ because the trees a library ships are now a per-target answer.
 
 | absent | why |
 |---|---|
-| a general annotation mechanism | the set is closed: `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)`, `@crossing(...)`, `@noinline`, `@inline`, `@cold`, `@setup`, `@teardown`, `@setup_all` and `@teardown_all` on a free function, `@packed`, `@align(n)` and `@export("...")` on a struct, `@section("...")` on a binding or a function, `@section("...")` and `@align(n)` on an `asm` block at the top of a file, `@no_<capability>`, `@requires`, `@link`, `@include` and `@tests` on a file, and `@assert` on nothing at all. Each was designed and added on its own evidence; there is no way to write one the compiler does not already know |
+| a general annotation mechanism | the set is closed: `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads(...)`, `@writes(...)`, `@crossing(...)`, `@noinline`, `@inline`, `@cold`, `@setup`, `@teardown`, `@setup_all` and `@teardown_all` on a free function, `@packed`, `@align(n)` and `@export("...")` on a struct, `@export("...")` on a module binding, `@section("...")` on a binding or a function, `@section("...")` and `@align(n)` on an `asm` block at the top of a file, `@no_<capability>`, `@requires`, `@link`, `@include` and `@tests` on a file, and `@assert` on nothing at all. Each was designed and added on its own evidence; there is no way to write one the compiler does not already know |
 | `@naked`, a function with no frame | code that must run before there is a stack — a reset entry, a vector table — is an [`asm` block at the top of a file](/reference/inline-assembly/), which is not a function and so has no frame to leave out |
 | bitfield syntax | there is nothing to write: inside `@packed` an `iN` field already occupies exactly N bits, so a five-bit register field is `u5` and needs no `: 5` beside it. The open integer family does the work C's declarator syntax was invented for |
 | `#define`, or any project-supplied symbol | the `#if` vocabulary is derived from the target and closed, which is what makes an unknown symbol an error rather than a false |
