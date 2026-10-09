@@ -55,6 +55,12 @@ enum IoError
     Interrupted
     NotOpen
 
+    /** The operation is not one this process may perform at all (`EPERM`, code 1) -- a different
+     * condition from `PermissionDenied`, which is a file whose mode or owner refuses this process
+     * (`EACCES`, code 13). A hook status of `-1` is this case.
+     */
+    NotPermitted
+
     /** Bytes that had to be text and are not UTF-8: a file `read_text` was asked for, a name in a
      * listing `entries` was asked for, a path the platform handed back. `offset` is the byte at which
      * the decode stopped, counted from the start of whatever was being decoded -- the file, or the one
@@ -84,6 +90,7 @@ enum IoError
         NoSpaceLeft      -> 28
         Interrupted      -> 4
         NotOpen          -> 9
+        NotPermitted     -> 1
         InvalidUtf8(_)   -> ilseq()
         Other(c)         -> c
 
@@ -107,7 +114,8 @@ enum IoError
         NoSpaceLeft       -> "no space left on the device"
         Interrupted       -> "interrupted"
         NotOpen           -> "the file is not open"
-        InvalidUtf8(at)   -> s"not UTF-8 at byte $at"
+        NotPermitted      -> "operation not permitted"
+        InvalidUtf8(at)  -> s"not UTF-8 at byte $at"
         Other(c)          -> system_text(c)
 end IoError
 
@@ -175,8 +183,10 @@ impl Display for IoError
 private[sysl] from_errno(code: int) -> IoError
     if code == 2 then
         NotFound
-    elif code == 13 || code == 1 then     // EACCES, and EPERM which a caller cannot tell apart
+    elif code == 13 then
         PermissionDenied
+    elif code == 1 then
+        NotPermitted
     elif code == 17 then
         AlreadyExists
     elif code == 20 then
@@ -199,7 +209,7 @@ end from_errno
 
 /** A hook's failure status as the `IoError` it stands for, turned back into its case here and nowhere
  * else (`sysl.fs.sys`). A status is the error's code negated, as a system call answers it, so 13 comes
- * back as `PermissionDenied` and -1 as `EPERM`, which is `PermissionDenied` too. **Exactly
+ * back as `PermissionDenied` and -1 as `EPERM`, which is `NotPermitted`. **Exactly
  * `UNSUPPORTED` (`sysl.sys`) is the target saying it cannot do the call at all** and is
  * `unsupported()`; no other status is.
  */

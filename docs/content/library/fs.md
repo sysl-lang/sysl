@@ -193,6 +193,7 @@ enum IoError
     NoSpaceLeft
     Interrupted
     NotOpen
+    NotPermitted
     InvalidUtf8(offset: usize)
     Other(code: int)
 
@@ -210,6 +211,9 @@ guess that compiled.
 **The cases are the ones a program branches on, and everything else arrives as `Other` carrying the
 number.** A library that mapped every `errno` to a name of its own would be a table nobody could keep
 current and a program could not extend — and the number is what a reader looks up anyway.
+
+**`NotPermitted` is `EPERM` (code 1) and `PermissionDenied` is `EACCES` (13)**, and they are not one case: the
+first is an operation this process may not perform at all, the second a file whose mode or owner refuses it.
 
 **`InvalidUtf8` is the one case no `errno` produces.** It is what `read_text`, `entries`, `read_link`,
 `canonicalize`, `current_dir` and `make_temp_dir` answer when bytes that had to be text are not UTF-8,
@@ -924,7 +928,7 @@ way to get atomicity from a filesystem.
 `_realpath`. Each answers an `int` by the contract every `*.sys` module has
 (`sysl.io.sys` and `sysl.process.sys` too): zero or more is success, a negative answer is the `code()`
 of the `IoError` it failed with, **negated** as a system call answers it (so `-1` is `EPERM` and comes back as
-`PermissionDenied`), and the one status `UNSUPPORTED` means the target cannot make that call at
+`NotPermitted`, where `-13`, `EACCES`, is `PermissionDenied`), and the one status `UNSUPPORTED` means the target cannot make that call at
 all. `UNSUPPORTED` is a constant in `sysl.sys`, -38 on every platform and deliberately not the host's
 `ENOSYS`, which hosted suppliers translate into it. A path crosses as a pointer and a length, with no
 terminator; what a call produces besides its status it writes through a pointer it was handed.
