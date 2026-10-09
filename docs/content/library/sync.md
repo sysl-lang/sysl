@@ -42,6 +42,7 @@ anything to schedule.
 | `Ordering` | the five C11 orderings — `Relaxed`, `Acquire`, `Release`, `AcqRel`, `SeqCst` |
 | `Atomic[T]` | one word, and the nine operations that touch it indivisibly |
 | `SpinLock` | mutual exclusion held by spinning rather than by sleeping |
+| `spin_hint()` | the processor's own instruction for "this loop is waiting" |
 
 This is the `*T` tier of concurrency in the same sense `*T` is the unsafe tier of memory: nothing
 here is checked, everything is greppable, and it is how a kernel is written. What sits above it —
@@ -157,8 +158,9 @@ print(a.load(Relaxed))
 undefined name 'Relaxed'
 ```
 
-`import sysl.sync.*` is therefore the ordinary way to reach this module — there are seven names in
-it, five of them are orderings, and a program using the sixth almost always wants some of the five.
+`import sysl.sync.*` is therefore the ordinary way to reach this module — there are eight names in
+it, five of them are orderings, and a program using `Atomic` or `SpinLock` almost always wants some
+of the five.
 
 ### A fence has no wrapper, and the omission is deliberate
 
@@ -180,6 +182,24 @@ a fence is nothing but its ordering, so 'Relaxed' would ask for a barrier that o
 A wrapper taking an `Ordering` would need a `Relaxed` arm, and the only two things that arm could do
 are call a form that refuses it or quietly do nothing. Softening that diagnostic is worse than
 writing the form out, so the form is what a program writes.
+
+### What no ordering reaches
+
+**The five orderings relate memory accesses to memory accesses, and nothing else.** A kernel also
+orders memory against things that are not accesses: a write to a system register that raises an
+interrupt on another core, a translation-table walk, a TLB invalidation, a device in a wider
+shareability domain than the cores. No ordering — `SeqCst` and `atomic_fence(SeqCst)` included —
+says any of those, and on AArch64 the answer is a barrier, `dsb(ishst)` before the register write
+and the rest: [System registers and
+barriers](/reference/inline-assembly/#what-the-compiler-orders-and-what-the-processor-still-needs)
+has the table. The compiler keeps program order around those forms; the barrier is what makes the
+processor keep it too.
+
+**Which instructions an atomic becomes is the build's, not the call's.** An AArch64 core with the
+LSE extension does a read-modify-write in one instruction (`ldadd`, `swp`, `cas`), and without it in
+a load-exclusive/store-exclusive loop; an Armv8.0 row assumes the loop, and a project whose cores all
+have LSE says so in its manifest, `codegen { extensions = ["lse"] }`
+([packages](/reference/packages/#a-processors-extensions)). The orderings mean the same either way.
 
 ## `Atomic[T]`
 
@@ -478,6 +498,34 @@ takes an `Ordering` and there is no overload that does, because **a lock's order
 what a lock means**: the exchange that takes it is an acquire, the store that frees it is a release,
 and that pairing is the whole of what makes the guarded data safe to touch.
 
+**Where the hold fits a block, `with` is the form to write**: it takes the lock, runs a closure,
+releases the lock and answers what the closure answered, so the release cannot be forgotten or
+skipped by an early `return`. `try_with` is the same without spinning, answering `None` where the
+lock was held. The closure is a direct call, so both work under `@no_alloc`:
+
+```sysl
+@no_alloc
+@no_os
+
+import sysl.sync.*
+
+var lk = SpinLock(0)
+val lp = &lk
+var count = 0
+val total = lk.with(() -> count + 41)
+val busy = lk.with(() -> lp.try_with(() -> 1).is_none())
+
+print(total, busy, lk.held)
+```
+
+```output
+41 true 0
+```
+
+`lock` and `unlock` stay for the hold a block cannot express — a scheduler's run-queue lock taken on
+one thread and released on the next, after the switch. A spinlock hands out no address, so unlike
+[`Mutex[T]`](/library/threads/#mutex-t) there is nothing the raw pair could let outlive the hold.
+
 ### Three things it will not do for you
 
 **It guards nothing by construction.** A spinlock is a flag beside the data, and what the data is
@@ -511,13 +559,64 @@ while atomic_swap(&self.held, 1, Acquire) != 0
     var busy = atomic_load(&self.held, Relaxed)
 
     while busy != 0
+        spin_hint()
         busy = atomic_load(&self.held, Relaxed)
 ```
 
 A read-modify-write has to take the cache line exclusively every time round, so waiters spinning on
 the exchange itself fight each other for the line — and worse, they fight the holder trying to write
 the release, which is the one thread whose progress everybody is waiting on. A relaxed load spins in
-a shared line and costs nobody anything.
+a shared line and costs nobody anything, and [`spin_hint()`](#spin_hint) on each round tells the
+processor that is what it is doing.
+
+## `spin_hint`
+
+Every machine with a pipeline worth the name has an instruction meaning "this loop is waiting for
+another processor": `yield` on AArch64 and Thumb, `pause` on x86 and on RISC-V. `spin_hint()` is that
+instruction and nothing else, so it belongs in the body of every busy-wait:
+
+```sysl
+import sysl.sync.*
+
+var ready = Atomic(0)
+var rounds = 0
+
+ready.store(1, Release)
+
+while ready.load(Acquire) == 0
+    spin_hint()
+    rounds += 1
+
+print(rounds)
+```
+
+```output
+0
+```
+
+What it buys depends on the core: a core sharing its pipeline with another hardware thread hands that
+thread the cycles, a hypervisor may run another virtual processor, and an x86 core stops filling its
+pipeline with speculative loads it will have to throw away when the line finally changes. Where it
+means nothing it costs a few cycles. RISC-V's `pause` belongs to the Zihintpause extension and is
+encoded as a fence that orders nothing, so a core without the extension runs it harmlessly; a wasm
+module has no such instruction, and there the call is empty.
+
+**It is not a wait.** Nothing sleeps and no event is awaited — the loop still loads the word it is
+waiting on. AArch64's `wfe` does sleep until the line changes, but only when the load in the loop is a
+load-exclusive that arms the monitor, which `atomic_load` is not; a kernel that wants it writes that
+loop in [assembly](/reference/inline-assembly/).
+
+It takes nothing:
+
+```sysl
+import sysl.sync.*
+
+spin_hint(4)
+```
+
+```error
+function 'sysl.sync.spin_hint' takes 0 arguments, but 1 argument was given
+```
 
 ## What is not here
 

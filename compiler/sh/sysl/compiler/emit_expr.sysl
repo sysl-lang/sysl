@@ -23,6 +23,9 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     // nothing at run time and there is nothing for the statement around it to release.
     TStrLit(s) -> string_value(e, s)
 
+    // An embedded file is a constant on the same terms: its owner is null.
+    TEmbed(file, bytes, align) -> embed_const(e, file, bytes, align)
+
     // Rendering a value. A `string` is itself and everything else lands in a fresh buffer, which is
     // why only the second case is a temporary the statement owns.
     TStr(arg) ->
@@ -80,9 +83,10 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         r
 
     TGlobal(symbol, ty, _) ->
+        val at = global_address(e, symbol)
         val r = fresh_reg(e)
 
-        emit(e, InLoad(r, lty(e, ty), VGlobal(symbol), access_of(ty), None))
+        emit(e, InLoad(r, lty(e, ty), at, access_of(ty), None))
         r
 
     TDeref(operand, ty) ->
@@ -118,7 +122,9 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         own_at(e, slot, texpr_type(value))
         slot
 
-    TField(receiver, index, ty) -> gen_field(e, x, receiver, index, ty)
+    TField(receiver, index, ty) ->
+        reordered(e, field_reversal(texpr_type(receiver), index, e.target.little_endian()),
+                  gen_field(e, x, receiver, index, ty))
 
     TIndex(receiver, index, ty) ->
         val p = element_addr(e, receiver, index, x.span)
@@ -359,6 +365,8 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TEnumFromInt(value, en) -> gen_enum_from_int(e, value, en)
 
     TEnumTry(value, en, opt_ty, some, none) -> gen_enum_try(e, value, en, opt_ty, some, none)
+    TDecode(bytes, subject, opt_ty, some, none) -> gen_decode(e, bytes, subject, opt_ty, some, none)
+    TEncode(value, out) -> gen_encode(e, value, out)
 
     TStructNew(decl, args) ->
         if e.layout.indirect(Struct(decl)) then return through_slot(e, x)
@@ -408,7 +416,8 @@ bitfield_field_bits(e: *Emit, receiver: TExpr, index: int, ranges: Buf[BitRange]
     read_bits(e, ranges, ranges.at(s), c)
 end bitfield_field_bits
 
-// A field read.
+// A field read, as the bytes its storage holds -- a field of a `@byte_order` struct is reversed into
+// a value by the caller, which is the one place that knows the read is a read.
 //
 // A **bitfield** is read out of its container, and the container is reached the way the *receiver*
 // is: at its address where it has one, so that a field of a `volatile` register block is one
@@ -457,9 +466,10 @@ end gen_field
 
 private container_read(e: *Emit, receiver: TExpr, rty: Type, ct: LType, acc: IrAccess,
                        at_address: bool) -> Val
-    if at_address then return loaded_container(e, receiver, ct, acc)
+    val c = if at_address then loaded_container(e, receiver, ct, acc)
+    else extracted_container(e, receiver, rty)
 
-    extracted_container(e, receiver, rty)
+    reordered(e, container_reversal_of(rty, e.target.little_endian()), c)
 end container_read
 
 private loaded_container(e: *Emit, receiver: TExpr, ct: LType, acc: IrAccess) -> Val
@@ -478,12 +488,13 @@ private extracted_container(e: *Emit, receiver: TExpr, rty: Type) -> Val
     t
 end extracted_container
 
-// Whether a node names storage rather than a value, which is what says `address` can walk to it.
+// Whether a node names storage rather than a value, which is what says `address` can walk to it. A
+// field of a bitfield struct is a range of bits and has none.
 has_address(x: TExpr) -> bool = *x.kind match
     TLoad(_, _) -> true
     TGlobal(_, _, _) -> true
     TDeref(_, _) -> true
-    TField(receiver, _, _) -> has_address(receiver)
+    TField(receiver, _, _) -> bitfield_ranges_of(texpr_type(receiver)).is_none() && has_address(receiver)
     TIndex(_, _, _) -> true
     _ -> false
 
@@ -1065,7 +1076,8 @@ private gen_struct_new(e: *Emit, decl: &StructType, args: Buf[TExpr]) -> Val
 
                 if !zero_sized(decl.fields.at(i).1) then vals.push(v)
 
-            val c = build_bits(e, ranges, vals)
+            val c = reordered(e, container_reversal(decl, e.target.little_endian()),
+                              build_bits(e, ranges, vals))
             val r = fresh_reg(e)
 
             emit(e, InInsert(r, struct_lty(decl), VUndef, container_lty(ranges), c, index_list(0)))
@@ -1082,8 +1094,10 @@ private gen_struct_new(e: *Emit, decl: &StructType, args: Buf[TExpr]) -> Val
     for i in 0..<vals.len()
         if !zero_sized(decl.fields.at(i).1)
             val r = fresh_reg(e)
+            val stored = reordered(e, reversed_width(decl, decl.fields.at(i).1, e.target.little_endian()),
+                                   vals.at(i))
 
-            emit(e, InInsert(r, struct_lty(decl), acc, lty(e, decl.fields.at(i).1), vals.at(i),
+            emit(e, InInsert(r, struct_lty(decl), acc, lty(e, decl.fields.at(i).1), stored,
                              index_list(struct_field_index(e.layout, decl, decl.slot(i)))))
             acc = r
 
@@ -1725,6 +1739,24 @@ end gen_fence
 
 // An AArch64 system register or barrier, as the intrinsic LLVM's back end turns into the one
 // instruction. A register travels as a metadata string; a barrier's option as its CRm encoding.
+// One read of a system register, as `read_sysreg` makes it: volatile, so two reads are two `mrs`
+// even where nothing between them looks like a write.
+read_register(e: *Emit, name: string) -> Val
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(LNamed("metadata")))
+    request_intrinsic(e, ir_sig(llvm_sysreg_read(), ir_fn_type(LInt(64), params)))
+
+    var ops: Buf[IrArg] = buf()
+
+    ops.push(ir_arg(LNamed("metadata"), VMetaString(name)))
+
+    val r = fresh_reg(e)
+
+    emit(e, ir_call(Some(r), LInt(64), VGlobal(llvm_sysreg_read()), ops))
+    r
+end read_register
+
 private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
     val wide = LInt(64)
     val meta = LNamed("metadata")

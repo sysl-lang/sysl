@@ -27,7 +27,7 @@ blank_method(at: Span, name: string) -> MethodDecl =
 
 blank_struct(name: string) -> StructDecl =
     StructDecl(name, buf(), buf(), buf(), buf(), buf(), Public, buf(), false, buf(), false, None,
-        None, buf())
+        None, buf(), None)
 
 blank_enum(name: string) -> EnumDecl =
     EnumDecl(name, buf(), None, buf(), buf(), buf(), Public, buf(), buf(), buf())
@@ -515,8 +515,9 @@ async_result(written: Option[TypeRef], at: Span) -> Option[TypeRef]
 end async_result
 
 // **What C calls directly cannot be async**: calling an async function only makes its task, and C
-// has nothing to drive one with. An `@export`, an interrupt handler and any other foreign calling
-// convention (only `interrupt` exists) are all called that way. Each is refused at the `async` word.
+// has nothing to drive one with. An `@export`, an interrupt handler, any other foreign calling
+// convention (only `interrupt` exists) and a function `@domain(...)` says another domain enters are
+// all called that way. Each is refused at the `async` word.
 private refuse_foreign_async(p: *Parser, at: Span, d: FuncDecl)
     if d.exported.is_some()
         p.fault(at, "an '@export'ed function cannot be 'async': C calls it directly, and calling an " +
@@ -528,6 +529,15 @@ private refuse_foreign_async(p: *Parser, at: Span, d: FuncDecl)
     if d.conv.is_some()
         p.fault(at, "an interrupt handler cannot be 'async': the hardware calls it directly, and " +
                 "calling an async function only makes its task, which nothing there can drive")
+        return
+    end if
+
+    // `@domain(interrupt)` keeps the ordinary convention, so it is called the way any function is --
+    // but by a vector table's stub, which has no executor to hand a task to either.
+    if d.marks.domain.is_some()
+        p.fault(at, s"a function entered in the '${d.marks.domain.unwrap()}' domain cannot be 'async': " +
+                "whatever enters it calls it directly, and calling an async function only makes its " +
+                "task, which nothing there can drive")
     end if
 end refuse_foreign_async
 
@@ -707,7 +717,11 @@ end parse_func_body
 //
 // **An `extern` declares no type parameters**: there is no body to monomorphize, and a foreign
 // symbol is one function at one signature.
-parse_extern_decl(p: *Parser, start: Span, vis: Visibility, needs: Buf[string]) -> Stmt
+//
+// `blocks` is a `@blocks` written above it, which only a function may carry: a variable is read
+// rather than called, and reading one waits for nothing.
+parse_extern_decl(p: *Parser, start: Span, vis: Visibility, needs: Buf[string],
+                  blocks: bool = false) -> Stmt
     p.bump()
 
     var link: Option[string] = None
@@ -717,6 +731,12 @@ parse_extern_decl(p: *Parser, start: Span, vis: Visibility, needs: Buf[string]) 
             p.bump()
             link = Some(v)
         _ -> ()
+
+    if blocks && (p.at_kw("var") || p.kw_at(1, ":"))
+        p.fault(start, extern_var_blocks())
+        skip_line(p)
+        return stmt(start.to(p.just_taken()), Bad)
+    end if
 
     if p.at_kw("var") then return parse_extern_var(p, start, vis, link, needs)
 
@@ -761,8 +781,12 @@ parse_extern_decl(p: *Parser, start: Span, vis: Visibility, needs: Buf[string]) 
     if p.accept_kw("->") then ret = Some(parse_type(p))
 
     stmt(start.to(p.just_taken()), ExternDecl(ExternDecl(name, params, ret, variadic, link, vis,
-        needs)))
+        needs, blocks)))
 end parse_extern_decl
+
+private extern_var_blocks() -> string =
+    "'@blocks' says a call may wait, so it marks a function, a method or an 'extern' function — an " +
+    "'extern' variable is read rather than called, and reading one waits for nothing"
 
 private parse_extern_var(p: *Parser, start: Span, vis: Visibility, link: Option[string],
                          needs: Buf[string]) -> Stmt
@@ -808,8 +832,14 @@ parse_type_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
     if p.at_word("within") then range = Some(parse_within(p))
     if p.accept_word("where") then pred = Some(parse_expr(p))
 
+    // A body indented under the declaration holds its members, as a struct's does. Whether the
+    // declaration may have any is the analysis's question: only a `new` type is a type of its own.
+    var members: Buf[MethodDecl] = buf()
+
+    if p.block_ahead() then parse_type_members(p, &members, name)
+
     stmt(start.to(p.just_taken()), TypeDecl(TypeDecl(name, base, derived, range, pred, vis, false, None,
-                                                      wrapping, tp)))
+                                                      wrapping, tp, members)))
 end parse_type_decl
 
 private parse_within(p: *Parser) -> RangeBound

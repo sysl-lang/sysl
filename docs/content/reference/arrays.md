@@ -275,6 +275,62 @@ That is the case a `const` could never have served: a constant is folded into it
 address, so there is nothing to index at `i`. A raw pointer may be held for the same reason a
 literal may — it counts nothing, so there is no release to write.
 
+### A file's bytes, embedded
+
+A table somebody else made is often a file — an image, a font, a program a kernel carries before it
+has a disk. **`embed("path")` is that file's bytes, read while compiling, as a `[]const u8`** over a
+constant the object file carries, as `include_bytes!` is in Rust and `#embed` in C. This program is
+`main.sysl`, and embeds itself:
+
+```sysl
+// hello, from the file itself
+val me = embed("main.sysl")
+
+print(str_cast(me[3..<8]), me[0] == u8('/'))
+```
+
+```output
+hello true
+```
+
+- **A relative path is read from the directory of the file that writes it**, never from wherever the
+  build was started, so a source file and the data beside it move together and the tree builds from
+  any directory. An absolute path is taken as written.
+- **The bytes start on a 16-byte boundary**, as aligned as any scalar a target has, so a header read
+  in place from the start of an image is aligned even on a machine that faults on an unaligned load.
+  `embed("disk.img", align = 4096)` asks for more; the boundary is a constant power of two.
+- **It is constant data**, so a `val` holding one is laid down rather than filled by code — a module
+  with no allocator and no entry point, a kernel's, may hold one — and a file embedded in several
+  places is laid down once.
+- **The build depends on the file**: its bytes are in the key of every cache that replays a build,
+  so an edit to it is a different program, exactly as an edit to the source is.
+- `embed` is a form only where nothing else claims the name: a function or a local called `embed` is
+  what a call reaches.
+
+A file that is not there is refused while compiling, naming the path that was tried:
+
+```sysl
+print(embed("logo.bin").len)
+```
+
+```error
+cannot embed 'logo.bin': there is no file at '
+```
+
+**The path is a string literal and nothing else.** A build that is replayed has to know which files
+it read without being compiled again, and a literal is what can be found in the source text; a
+`const` or a computed string is refused:
+
+```sysl
+val name = "logo.bin"
+
+print(embed(name).len)
+```
+
+```error
+'embed' reads its file while compiling, and a build that is replayed has to know which files it read without compiling again — so the path is written as a string literal, not computed
+```
+
 ## Storage sized while running
 
 Every form so far fixes its length in the type, and that is the one thing a program reading a file
@@ -735,10 +791,11 @@ views elements it may not write, so there is nothing to assign through
 Two writable views are untouched — nothing is read-only, so there is nothing to meet — and a form with
 only one branch keeps that branch's view whichever it is.
 
-**What produces one.** Slicing a `val`, since read-only storage gives a read-only view — and so is
-a `val` array standing where a view is asked for, which is the same rule reached without the
-brackets. `s.bytes`, whose elements are a string's own and may be a literal's. Re-slicing one,
-because a bit a second subscript dropped would make `xs[..]` the way around `xs`. And a buffer
+**What produces one.** Slicing a `val` array, since read-only storage gives a read-only view — and so
+is a `val` array standing where a view is asked for, which is the same rule reached without the
+brackets. An array inside a `val` struct value is the binding's storage too. `s.bytes`, whose
+elements are a string's own and may be a literal's. Re-slicing one, because a bit a second subscript
+dropped would make `xs[..]` the way around `xs`. And a buffer
 literal written where one is wanted, since storage an expression makes has no other holder to
 disagree with it.
 
@@ -758,6 +815,31 @@ print(readonly(a), first(a))
 
 ```output
 3 1
+```
+
+**A `val` holding an address is not read-only storage of elements.** `val` is a promise about the
+name's own bytes, and a `*T`, a `&[N]T` or a `[]T` is an address: the elements it leads to belong to
+whoever laid them down, so a view taken through one is exactly as writable as that owner allows.
+
+```sysl
+fill(s: []int, v: int)
+    for i in 0..<s.len do s[i] = v
+
+var store = [1, 2, 3, 4]
+
+val p: *int = &store[0]
+val whole: []int = store[..]
+val heap: &[2]int = [5, 6]
+
+fill(p[0..<1], 7)
+fill(whole[2..], 8)
+fill(heap, 9)
+
+print(store[0], store[3], heap[1])
+```
+
+```output
+7 8 9
 ```
 
 **What it does not refuse is `&`.** `&xs[0]` is a `*T` the moment it is written, which is the tier

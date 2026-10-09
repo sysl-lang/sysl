@@ -147,6 +147,11 @@ core_numeric(method: string) -> Option[string] = method match
     "reverse_bits" -> Some("Bits")
     "rotate_left" -> Some("Bits")
     "rotate_right" -> Some("Bits")
+    "swap_bytes" -> Some("ByteOrder")
+    "to_be" -> Some("ByteOrder")
+    "from_be" -> Some("ByteOrder")
+    "to_le" -> Some("ByteOrder")
+    "from_le" -> Some("ByteOrder")
     _ -> None
 
 // The compiler-provided members that have **no receiver** -- a trait, and the whole number its one
@@ -217,6 +222,10 @@ catalog_key(a: &Analysis, spelling: string) -> Option[string]
 end catalog_key
 
 core_builtin(trait_name: string, subject: Type) -> bool
+    // **Plain data is a question about every part of a type**, a struct's fields included, so it is
+    // asked of the type as written and answered by walking it (`plain.sysl`) rather than by a row.
+    if trait_name == "Plain" then return is_plain(subject)
+
     // The two identities are the one pair here that is a **value** rather than an operation, and
     // that is what decides their domain: every other row promises something a type can *do*, so it
     // is asked at the operator's subject and a subtype inherits it, while these promise a particular
@@ -271,6 +280,14 @@ core_builtin(trait_name: string, subject: Type) -> bool
         // instantiation the bound was supposed to have proven.
         "Bits" -> is_integer(t)
 
+        // The byte surface is the widths that have bytes to reorder: a whole number of them, one
+        // included. This is the one row that asks about a width, and it is a trait of its own for
+        // the reason it asks -- folded into `Bits`, it would make that bound promise a `u12` an
+        // operation it has no answer to.
+        "ByteOrder" -> t match
+            Integer(bits, _, _) -> bits % 8 == 0
+            _ -> false
+
         // **Every integer type, and nothing else -- the family named by what it ranges over.** This
         // is the membership a *blanket* implementation is written over, which is the whole reason it
         // exists: `impl[T: Integer] Display for T` says once, in source, what no finite list of
@@ -323,14 +340,16 @@ core_family_provides(trait_name: string, bound: string) -> bool
 end core_family_provides
 
 // The types that answer for a closed family, chosen so that every axis the memberships distinguish
-// has one on each side of it. For the integers that axis is the **sign** and nothing else -- no row
-// above asks about a width -- so a signed one and an unsigned one are exact rather than a sample.
+// has one on each side of it. For the integers those axes are the **sign** and, for `ByteOrder`
+// alone, whether the width is a **whole number of bytes** -- so a signed and an unsigned whole-byte
+// width and one narrower than a byte are exact rather than a sample.
 private core_witnesses(bound: string) -> Buf[Type]
     var out: Buf[Type] = buf()
 
     if bound == "Integer"
         out.push(int_type())
         out.push(byte_type())
+        out.push(Integer(4, false, false))
 
     out
 end core_witnesses

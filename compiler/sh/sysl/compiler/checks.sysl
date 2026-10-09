@@ -22,11 +22,13 @@ whole_program_checks(a: &Analysis, units: Buf[Program], funcs: Buf[TFunc], vals:
     check_module_graph(a)
     check_gated_modules(a, funcs, vals, reached_vtables(a))
     check_no_alloc(a, funcs, vals, reached_vtables(a))
+    check_no_block(a, funcs, vals, reached_vtables(a))
     check_decl_capabilities(a, funcs, vals, reached_vtables(a))
     check_purity(a, funcs, reached_externs(a))
     check_const_fns(a, funcs, vals, reached_externs(a))
     check_frames(a, funcs, reached_externs(a))
     check_self_aliasing(a, funcs)
+    check_lent_bodies(a, funcs)
     check_test_scope(a, funcs)
     check_task_crossings(a, funcs)
 end whole_program_checks
@@ -483,19 +485,19 @@ private check_type_export(a: &Analysis, key: string, at: Decl, d: TypeDecl, e: E
                 "use — name it instead, '@export(\"...\")'")
 
     if !is_public(d.vis) then
-        a.fault(at.scope, e.span, s"'${qualified_name(key)}' is private, so no exported function " +
-                "may name it — an export is public, and a declaration may not be more visible " +
-                "than the types it names. No header can carry this type at all, so there is no " +
-                "name in one for it to take")
+        a.fault(at.scope, e.span, s"'${qualified_name(key)}' is private, and a header declares " +
+                "only public exports, none of which may name it — a declaration may not be more " +
+                "visible than the types it names. No header can carry this type at all, so " +
+                "there is no name in one for it to take")
 end check_type_export
 
 // Refuses a C name a header could not declare, or a struct that has no one name to give.
 //
 // **The rules are the function's, arrived at from a different direction.** A symbol and a type name
 // are both spellings a C reader writes, so what C can name is the same question -- but a `typedef`
-// has no linkage, so `private` is not the contradiction here that it is on a function. It is
-// refused anyway, and for a reason worth reading: the visibility rule already stops a public
-// declaration naming a type less visible than itself, and an exported function is public.
+// has no linkage, so `private` would be a statement about nothing but the header. It is refused,
+// and for a reason worth reading: the header declares only public exports, and the visibility rule
+// already stops a public declaration naming a type less visible than itself.
 private check_struct_export(a: &Analysis, key: string, at: Decl, d: StructDecl, e: ExportAttr)
     if e.symbol.is_some() && !c_identifier(e.symbol.unwrap()) then
         a.fault(at.scope, e.span, s"'${e.symbol.unwrap()}' is not a name C can declare — a type's " +
@@ -510,10 +512,10 @@ private check_struct_export(a: &Analysis, key: string, at: Decl, d: StructDecl, 
                 "use — name it instead, '@export(\"...\")'")
 
     if !is_public(d.vis) then
-        a.fault(at.scope, e.span, s"'${qualified_name(key)}' is private, so no exported function " +
-                "may name it — an export is public, and a declaration may not be more visible " +
-                "than the types it names. No header can carry this type at all, so there is no " +
-                "name in one for it to take")
+        a.fault(at.scope, e.span, s"'${qualified_name(key)}' is private, and a header declares " +
+                "only public exports, none of which may name it — a declaration may not be more " +
+                "visible than the types it names. No header can carry this type at all, so " +
+                "there is no name in one for it to take")
 
     // Generic is refused for the reason an exported generic function is, and the argument is even
     // shorter here: every instantiation is a struct of its own, so one written name would be
@@ -556,12 +558,10 @@ private check_export(a: &Analysis, key: string, f: Func, e: ExportAttr)
                 "instantiation the linker holds. Export a wrapper per instantiation, each naming " +
                 "its own symbol")
 
-    // `private` emits the symbol internal, which is the promise that every caller is inside this
-    // module. An export is the opposite promise, and a definition cannot make both.
-    if !is_public(f.decl.vis) then
-        a.fault(f.scope, e.span, s"'${qualified_name(key)}' is private, which promises every caller " +
-                "is inside its own module — and an export promises the opposite. A definition " +
-                "cannot make both claims")
+    // **`private` is not refused**: it is a promise about the sysl NAME, and an export is a promise
+    // about a symbol. A private export keeps the name file-private and publishes the symbol hidden,
+    // for the linker of the image it lands in -- module `asm` or a package's own C calling back in
+    // (`emit_export.sysl`).
 
     if f.decl.ghost then
         a.fault(f.scope, e.span, s"'${qualified_name(key)}' is '@ghost', so it is erased before " +

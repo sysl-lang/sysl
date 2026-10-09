@@ -291,7 +291,8 @@ end import_name
 // A name the compiler answers itself, which no module declares however the import spells its home.
 private imports_a_form(name: string) -> bool =
     special_form_word(name) || atomic_operands(name).is_some() || name == "atomic_fence" ||
-    slot_form_word(name) || name == "is_null" || name == "release" || sysreg_form_word(name)
+    slot_form_word(name) || name == "is_null" || name == "release" || sysreg_form_word(name) ||
+    name == "embed"
 
 // What an import may not be called here, and whether it may be called this.
 //
@@ -684,6 +685,7 @@ private resolve_signatures(a: &Analysis)
 
         check_bound_names(a, f.scope, f.decl.name, f.decl.bounds)
         check_crossing_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
+        check_lends_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
 
         // **A GENERIC SIGNATURE IS READ AT STAND-INS, AND WHAT THAT READING BUILDS IS NOT A TYPE THE
         // PROGRAM HAS.** `spawn[T](…) -> Option[Thread]` names an `Option[Thread]` at every
@@ -1168,17 +1170,16 @@ private check_const_named(a: &Analysis, v: ValueDecl, span: Span, written: strin
                     "'val', which is laid into the object file as constant data")
         EnumOf(_) -> a.fault(v.scope, span, s"a constant is a scalar, and $written is not — " +
                              s"'${v.name}'")
+        // **A `new` type is a scalar too**: its value is its base's, so `const OUR_IP: Ip =
+        // Ip(0x0a00_020f)` is the base constant written through the conversion, folded as the base's
+        // would be, and keeps the type at every use.
+        //
+        // **A predicate is a function checked where a value is MADE**, and a constant is folded into
+        // its uses rather than made anywhere -- so admitting one would be a check the declaration
+        // claims and the program never gets. A `within` range is a comparison against a number
+        // already in hand, and is settled once the value is folded.
         TypeOf(d) ->
-            if d.derived then
-                a.fault(v.scope, span,
-                        s"'${v.name}' is declared $written, which is a 'new' type — reaching one " +
-                        "from its base is a written conversion, and a constant is the value it is " +
-                        "written as, so there is nowhere here to write it")
-            // **A predicate is a function checked where a value is MADE**, and a constant is
-            // folded into its uses rather than made anywhere -- so admitting one would be a check
-            // the declaration claims and the program never gets. A `within` range is a comparison
-            // against a number already in hand, and is settled once the value is folded.
-            elif d.pred.is_some() then
+            if d.pred.is_some() then
                 a.fault(v.scope, span,
                         s"'${v.name}' is declared $written, whose 'where' predicate is checked where " +
                         "a value is made — and a constant is folded into its uses rather than made " +

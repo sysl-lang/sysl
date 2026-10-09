@@ -1,0 +1,146 @@
+module sysl.net
+@requires(os)
+
+import sysl.net.sys.Endpoint
+
+/** Somewhere a socket can be connected to, bound to, or sent a datagram: an IP address and a port.
+ *
+ * **It is a sysl value, not the platform's bytes.** Four bytes and a port, or sixteen and a port,
+ * compared with `==` and hashed like any other value; what a `sockaddr_in` looks like on this
+ * machine is the hosted answer's business and nobody else's. Built by `ipv4` and `ipv6`, or handed
+ * back by `resolve`, `accept` and `recv_from`.
+ */
+struct Address derives Eq, Hash
+    private[net] at: Endpoint
+
+    /** Which protocol version this is for. */
+    family(self) -> Family = if self.at.family == 6 then Ipv6 else Ipv4
+
+    /** The port. */
+    port(self) -> int = int(self.at.port)
+
+    /** The address's bytes, most significant first: all sixteen of an IPv6 one, and the first four
+     * of an IPv4 one with the rest zero.
+     */
+    octets(self) -> [16]u8 = self.at.octets
+
+    /** The same address at another port -- where a reply goes, or a second service on one host. */
+    with_port(self, port: u16) -> Address
+        var e = self.at
+
+        e.port = port
+        Address(e)
+    end with_port
+
+    /** The numeric form, as a person writes it -- `127.0.0.1`, or `::1`, or `fe80::1%4` with the
+     * interface an IPv6 address is scoped to.
+     *
+     * **Numeric, never a name.** Turning an address back into a hostname is a second lookup over the
+     * network, which is not what a program printing what it just connected to is asking for. An IPv6
+     * address is written the way RFC 5952 says every program should: lower-case hex, no leading
+     * zeros, the longest run of two or more zero groups as `::`, and an IPv4-mapped one as
+     * `::ffff:1.2.3.4`.
+     */
+    text(self) -> string
+        val o = self.at.octets
+
+        if self.at.family != 6 then return dotted(o, 0)
+
+        var mapped = o[10] == 255 && o[11] == 255
+
+        for i in 0..<10 do if o[i] != 0 then mapped = false
+
+        val body = if mapped then "::ffff:" + dotted(o, 12) else groups_text(o)
+
+        if self.at.scope != 0 then body + "%" + str(self.at.scope) else body
+    end text
+end Address
+
+/** So that printing one says where it is rather than how it is stored: `127.0.0.1:8080`, and
+ * `[::1]:8080` -- the brackets are not decoration, a v6 address having colons in it, so `::1:8080`
+ * cannot be read apart. It is the form the URL syntax settled on.
+ */
+impl Display for Address
+    display(self, out: *Writer, fmt: FormatSpec)
+        val text = self.family() match
+            Ipv6 -> f"[${self.text()}]:${self.port()}%d"
+            Ipv4 -> f"${self.text()}:${self.port()}%d"
+
+        display_str(text, out, fmt)
+end Address
+
+/** The IPv4 address `a.b.c.d` at `port`. `ipv4(127, 0, 0, 1, 8080)` is the loopback, and
+ * `ipv4(0, 0, 0, 0, port)` the wildcard a listener binds to.
+ */
+ipv4(a: u8, b: u8, c: u8, d: u8, port: u16) -> Address
+    var o: [16]u8 = [0; 16]
+
+    o[0] = a
+    o[1] = b
+    o[2] = c
+    o[3] = d
+
+    Address(Endpoint(o, 0, port, 4))
+end ipv4
+
+/** The IPv6 address of eight 16-bit `groups`, as written left to right, at `port` -- `::1` is
+ * `[0, 0, 0, 0, 0, 0, 0, 1]`. `scope` is the interface a link-local address belongs to, and zero
+ * for none.
+ */
+ipv6(groups: [8]u16, port: u16, scope: u32 = 0) -> Address
+    var o: [16]u8 = [0; 16]
+
+    for i in 0..<8
+        o[2 * i] = u8(groups[i] >> 8)
+        o[2 * i + 1] = u8(groups[i] & 255)
+
+    Address(Endpoint(o, scope, port, 6))
+end ipv6
+
+/** An endpoint nothing has filled in yet, for a hook to write into. */
+private[sysl] unspecified() -> Endpoint = Endpoint([0; 16], 0, 0, 4)
+
+/** Four bytes from `from` as `a.b.c.d`. */
+private dotted(o: [16]u8, from: usize) -> string =
+    s"${o[from]}.${o[from + 1]}.${o[from + 2]}.${o[from + 3]}"
+
+/** Sixteen bytes as RFC 5952's eight groups, the longest run of two or more zero groups -- the first,
+ * where two are as long -- written `::`.
+ */
+private groups_text(o: [16]u8) -> string
+    var g: [8]int = [0; 8]
+
+    for i in 0..<8 do g[i] = int(o[2 * i]) * 256 + int(o[2 * i + 1])
+
+    var best_at = 8
+    var best_len = 1
+    var i = 0
+
+    while i < 8
+        var j = i
+
+        while j < 8 && g[j] == 0 do j += 1
+
+        if j - i > best_len
+            best_at = i
+            best_len = j - i
+
+        i = if j > i then j else i + 1
+    end while
+
+    var out = ""
+    var after_group = false
+
+    for k in 0..<8
+        if k == best_at
+            out = out + "::"
+            after_group = false
+        elif k < best_at || k >= best_at + best_len
+            if after_group then out = out + ":"
+
+            out = out + f"${g[k]}%x"
+            after_group = true
+    end for
+
+    out
+end groups_text
