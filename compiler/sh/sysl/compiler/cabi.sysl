@@ -179,11 +179,12 @@ private c_aapcs64(l: TargetLayout, t: Type, size: int, mac_os: bool) -> CShape
 
     c_hfa(l, ls) match
         // Away from Darwin the convention says how far to align a floating aggregate that runs out
-        // of registers and lands on the stack. Darwin's variant does not ask for it.
+        // of registers and lands on the stack. Darwin's variant does not ask for it. A quad member's
+        // slot is sixteen bytes rather than eight, as its own alignment is.
         Some(both) ->
             var attrs: Buf[IrAttr] = buf()
 
-            if !mac_os then attrs.push(AttrAlignStack(8))
+            if !mac_os then attrs.push(AttrAlignStack(if l_render(both.0) == "fp128" then 16 else 8))
 
             var passed: Buf[IrParam] = buf()
 
@@ -260,6 +261,12 @@ private c_sysv(l: TargetLayout, t: Type, size: int) -> CShape
     if size > 16 || c_misaligned(l, t, 0) then return CsMemory
 
     val ls = c_leaves(l, t)
+
+    // A `__float128` is one SSE register on its own -- the SSE and SSEUP classes of both eightbytes
+    // -- so an aggregate that is nothing but one travels as it does, and it fills all sixteen bytes.
+    for item in ls
+        if is_quad(item.1) then return c_alike(l_one(LFloat(128, false)))
+
     var pieces: Buf[LType] = buf()
 
     for i in 0..<((size + 7) / 8)
@@ -383,8 +390,10 @@ private c_riscv(l: TargetLayout, t: Type, size: int, hard_float: bool, xlen: int
     var fps = 0
     var ints = 0
 
+    // A floating member counts only where a floating register holds it: `D` registers are eight bytes,
+    // so a `long double` -- binary128 -- travels as integers like any other sixteen bytes.
     for item in ls
-        if c_floating(item) then fps += 1
+        if c_floating(item) && l.size(item) <= 8 then fps += 1
         if c_integral(item) && int(l.size(item)) <= xlen then ints += 1
 
     if hard_float && ls.len() <= 2 && fps >= 1 && fps + ints == int(ls.len())

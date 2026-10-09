@@ -40,6 +40,7 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
     check_shared_storage(a, p)
     check_pinning(a, p)
     check_exports_emitted(a, emitted, own)
+    check_quad_externs(a, emitted)
     check_general_regs(a, emitted)
     promotions
 end checks_before_lowering
@@ -797,20 +798,97 @@ end claimants_of
 // opposite: each ABI says which registers a struct arrives in, LLVM applies no rule of its own, and
 // passing one by value would be a corrupt call rather than a link error — which is why it is
 // refused here instead of lowered hopefully.
+//
+// **A type an earlier refusal left unsettled is passed over**: it shows as `?`, and the mistake was
+// already reported where the type was written, so a second complaint about the same parameter would
+// be about the compiler's state rather than the program.
 private export_signature(a: &Analysis, f: TFunc)
     val scope = func_home(a, f.name)
+    val target = a.tables.target
 
     for p in f.params
+        if mentions_unknown(p.1) then continue
+
         if !export_crosses(p.1)
             a.fault(scope, f.span, s"'${p.0}' of the exported '${qualified_name(f.name)}' is " +
                     s"${type_show(p.1)}, which C has no way to spell — an exported function takes " +
                     s"${export_spellable()}. ${export_advice(p.1)}")
+        else if holds_quad(p.1) && !quad_spelled_here(f, target)
+            a.fault(scope, f.span, s"'${p.0}' of the exported '${qualified_name(f.name)}' is " +
+                    s"${type_show(p.1)}, ${quad_unspellable(target)}")
 
-    if !no_value(f.ret_ty) && !export_crosses(f.ret_ty)
+    if no_value(f.ret_ty) || mentions_unknown(f.ret_ty) then return
+
+    if !export_crosses(f.ret_ty)
         a.fault(scope, f.span, s"the exported '${qualified_name(f.name)}' returns " +
                 s"${type_show(f.ret_ty)}, which C has no way to spell — an exported function " +
                 s"returns that or nothing at all. ${export_advice(f.ret_ty)}")
+    else if holds_quad(f.ret_ty) && !quad_spelled_here(f, target)
+        a.fault(scope, f.span, s"the exported '${qualified_name(f.name)}' returns " +
+                s"${type_show(f.ret_ty)}, ${quad_unspellable(target)}")
 end export_signature
+
+// An `extern` whose signature holds an `f128`, on a machine where C has no binary128 type -- the
+// export refusal read the other way. The C function it names was compiled by a C compiler, and on
+// that machine no C compiler wrote a function taking or answering binary128, so the call would hand
+// it sixteen bytes in registers it reads as something else.
+//
+// It is asked of the externs the program reached, as the exports are of the ones it emits: a
+// declaration nothing calls is never declared to LLVM and binds the program to nothing.
+check_quad_externs(a: &Analysis, p: TProgram)
+    val t = a.tables.target
+
+    if c_long_double_is_quad(t) then return
+
+    for x in p.externs
+        val home = a.tables.extern_scopes.get(x.name)
+        val decl = a.tables.externs.get(x.name)
+
+        if home.is_none() || decl.is_none() then continue
+
+        val at = home.unwrap()
+        val d = decl.unwrap()
+
+        for i in 0..<x.params.len()
+            val ty = x.params.at(i)
+
+            if mentions_unknown(ty) || !holds_quad(ty) then continue
+
+            val name = if i < d.params.len() then d.params.at(i).name else s"parameter ${i + 1}"
+
+            a.fault(at.scope, at.span, s"'$name' of the 'extern' '${d.name}' is ${type_show(ty)}, " +
+                    quad_unspellable(t))
+
+        if !mentions_unknown(x.ret_ty) && holds_quad(x.ret_ty)
+            a.fault(at.scope, at.span, s"the 'extern' '${d.name}' returns ${type_show(x.ret_ty)}, " +
+                    quad_unspellable(t))
+end check_quad_externs
+
+// Whether an `f128` in `f`'s signature is something C on `t` can call it with. The quad runtime's
+// routines are the exception: LLVM is their only caller, and it passes `fp128` the same way on every
+// machine whatever C calls its `long double`.
+private quad_spelled_here(f: TFunc, t: Target) -> bool =
+    c_long_double_is_quad(t) || f.declared_in == QuadRuntimeModule
+
+// Why an `f128` has no C spelling on `t`, as the tail of a refusal.
+private quad_unspellable(t: Target) -> string =
+    s"and C on '${t.name}' has no binary128 type to spell it with — its 'long double' is " +
+    s"${c_long_double_kind(t)} there. A 'c type' measured as \"long double\" is the type that " +
+    "matches C's on every machine"
+
+// Whether an `f128` is anywhere in what crosses: itself, or a field of a struct passed by value.
+private holds_quad(t: Type) -> bool
+    if is_quad(t) then return true
+
+    repr(t) match
+        Struct(d) ->
+            for item in d.stored()
+                if holds_quad(item.1) then return true
+
+            false
+        Array(_, elem) -> holds_quad(*elem)
+        _ -> false
+end holds_quad
 
 // Two definitions exporting one symbol.
 //
@@ -898,7 +976,10 @@ export_crosses(t: Type) -> bool = repr(t) match
     other -> export_carried(other)
 
 // The same question at a **field**, which admits the one thing a signature does not.
+//
+// A type an earlier refusal left unsettled is let through: its mistake has been told once already.
 export_carried(t: Type) -> bool = repr(t) match
+    Unknown -> true
     Integer(_, _, _) -> true
     Fixed(_, _, _) -> true
     Floating(_, _) -> true
@@ -986,6 +1067,7 @@ end struct_advice
 typedefable(t: Type) -> bool = t match
     Constrained(d) -> typedefable(d.base)
     _ -> repr(t) match
+        Unknown -> true
         Integer(_, _, _) -> true
         Fixed(_, _, _) -> true
         Floating(_, _) -> true

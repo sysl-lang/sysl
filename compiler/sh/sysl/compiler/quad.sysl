@@ -1,0 +1,191 @@
+module sh.sysl.compiler
+
+import sysl.math.bigint.{BigInt, from_int, from_u64, to_u64, negate, cmp as big_cmp, add as big_add,
+                         sub as big_sub, mul as big_mul, pow as big_pow, div_rem_floor, is_odd, shl,
+                         shr, bit_length}
+
+// `f128` constants: IEEE binary128, worked out while compiling.
+//
+// **A constant of the type is rounded once, from the exact value its text spells.** A `double` holds
+// 53 bits of significand and binary128 holds 113, so reading `0.1f128` through a `double` would hand
+// the program the double's tenth -- right to sixteen digits and wrong after them. The value here is
+// the rational number the digits write, and the rounding is to nearest with ties to even, the one a
+// decimal written in source has always meant.
+//
+// An encoding is two words, `(hi, lo)`: the sign, the 15-bit exponent and the top 48 bits of the
+// fraction in `hi`, the other 64 bits of the fraction in `lo`.
+
+// Whether a value of `t` is held as binary128 -- `f128` itself, or a subtype over it.
+is_quad(t: Type) -> bool = underlying(t) match
+    Floating(bits, _) -> bits == 128
+    _ -> false
+
+// The routines `sysl.softfloat` exports under compiler-rt's names, which LLVM calls for `f128`.
+private val QuadRoutines: []const string = [
+    "addtf3", "subtf3", "multf3", "divtf3", "eqtf2", "netf2", "lttf2", "letf2", "gttf2", "getf2",
+    "unordtf2", "extenddftf2", "extendsftf2", "extendhftf2", "trunctfdf2", "trunctfsf2", "trunctfhf2",
+    "trunctfbf2", "floatsitf", "floatditf", "floattitf", "floatunsitf", "floatunditf", "floatuntitf",
+    "fixtfsi", "fixtfdi", "fixtfti", "fixunstfsi", "fixunstfdi", "fixunstfti"]
+
+// **A program that names `f128` reaches the quad runtime**, though no body of it calls a routine by
+// name: the calls are LLVM's, made after this compiler has finished. So the routines are reached here,
+// where the type is, which is what types their bodies in a build that compiles the standard module
+// from source -- an archive, an image -- and what `reachability.sysl` keeps.
+note_quad_runtime(a: &Analysis)
+    for name in QuadRoutines
+        val key = module_qualify(QuadRuntimeModule, name)
+
+        if a.tables.funcs.has(key) then a.uses(key)
+end note_quad_runtime
+
+// Whether C's `long double` is binary128 on `t` -- which is when `f128` and it are one type, and a
+// header may spell one as the other.
+//
+// **It is the C compiler's answer, written down per machine** (`__LDBL_MANT_DIG__` is 113 on these
+// and on no other row; `tests_quad.sysl` asks clang for every row and compares): AAPCS64 away from
+// Apple and Microsoft, RISC-V at both widths, and WebAssembly. Apple's arm64 and Windows made it a
+// `double`; 32-bit Arm has no wider format; x86 has its own 80-bit extended one.
+c_long_double_is_quad(t: Target) -> bool = t.cpu match
+    Aarch64 -> t.os != MacOS && t.os != Windows
+    Riscv64 -> true
+    Riscv32 -> true
+    Wasm32 -> true
+    _ -> false
+
+// What C's `long double` is on `t`, as a refusal names it.
+c_long_double_kind(t: Target) -> string =
+    if c_long_double_is_quad(t) then "binary128"
+    else if (t.cpu == X86_64 && t.os != Windows) || t.cpu == X86 then "the x87 80-bit extended format"
+    else "a 'double'"
+
+// The exponent bias, and the largest and smallest exponents a normal value has.
+private const QuadBias: int = 16383
+private const QuadMaxExp: int = 16383
+private const QuadMinExp: int = -16382
+
+// The bits of fraction below the leading one.
+private const QuadFraction: int = 112
+
+// The pattern of an infinity, and of the quiet NaN `f128.nan` reads as.
+quad_infinity(negative: bool) -> (u64, u64) = (quad_sign(negative) | 0x7FFF000000000000, 0)
+
+quad_nan() -> (u64, u64) = (0x7FFF800000000000, 0)
+
+// The same value with its sign bit turned over: what `-x` is for every pattern, zero and NaN
+// included.
+quad_negated(hi: u64, lo: u64) -> (u64, u64) = (hi ^ 0x8000000000000000, lo)
+
+private quad_sign(negative: bool) -> u64 = if negative then 0x8000000000000000 else 0
+
+// A `double` constant as the binary128 constant of the same value, for a position typed `fp128`.
+quad_val(v: Val) -> Val = v match
+    VFloat(bits) ->
+        val (hi, lo) = quad_of_double(unsigned_bits(bits))
+        VQuad(hi, lo)
+    _ -> v
+
+// The encoding of a literal's canonical text, or `None` where the text is not a number -- which the
+// lexer never hands on.
+quad_of_text(text: string) -> Option[(u64, u64)] = exact_of_text(text) match
+    Some((coef, exp)) -> Some(quad_of_decimal(coef, exp))
+    None -> None
+
+// `coef × 10^exp`, rounded to binary128.
+//
+// **A decimal exponent far past the format's range is settled before any power is taken**: the
+// largest finite value is about 1.19e4932 and the smallest subnormal about 6.5e-4966, so a value
+// whose digits and exponent put it a few decades beyond either end is an infinity or a zero without
+// a number of a hundred thousand digits being built to say so.
+quad_of_decimal(coef: BigInt, exp: int) -> (u64, u64)
+    val negative = coef.sign() < 0
+    val m = if negative then negate(coef) else coef
+
+    if m.is_zero() then return (quad_sign(negative), 0)
+
+    // A decimal digit is a little over 3.3 bits, so this never claims more digits than there are.
+    val digits = int(bit_length(m) * 30103 / 100000) + 1
+
+    if exp + digits > 4940 then return quad_infinity(negative)
+    if exp + digits < -4970 then return (quad_sign(negative), 0)
+
+    if exp >= 0 then return quad_of_ratio(negative, big_mul(m, big_pow(from_int(10), usize(exp))),
+                                          from_int(1))
+
+    quad_of_ratio(negative, m, big_pow(from_int(10), usize(-exp)))
+end quad_of_decimal
+
+// A `double`'s pattern, widened. Every `double` is exactly a binary128 value, so nothing rounds: a
+// NaN keeps its payload in the top of the wider fraction, quiet bit and all.
+quad_of_double(bits: u64) -> (u64, u64)
+    val negative = bits >= 0x8000000000000000
+    val biased = int((bits >> 52) & 0x7FF)
+    val fraction = bits & 0x000FFFFFFFFFFFFF
+
+    if biased == 0x7FF
+        if fraction == 0 then return quad_infinity(negative)
+
+        return (quad_sign(negative) | 0x7FFF000000000000 | (fraction >> 4), fraction << 60)
+
+    if biased == 0 && fraction == 0 then return (quad_sign(negative), 0)
+
+    // A subnormal double is `fraction × 2^-1074`, a normal one `(2^52 + fraction) × 2^(biased-1075)`.
+    val m = if biased == 0 then from_u64(fraction) else from_u64(fraction | 0x0010000000000000)
+    val e2 = if biased == 0 then -1074 else biased - 1075
+
+    if e2 >= 0 then quad_of_ratio(negative, shl(m, usize(e2)), from_int(1))
+    else quad_of_ratio(negative, m, shl(from_int(1), usize(-e2)))
+end quad_of_double
+
+// `num / den`, both positive, rounded to nearest with ties to even and given `negative`'s sign.
+//
+// The value lies in `[2^e, 2^(e+1))`; the significand is the value scaled so that `2^e` lands on
+// `2^112`, and a value below the smallest normal is scaled as if it were at that exponent, which is
+// exactly what makes it come out subnormal.
+private quad_of_ratio(negative: bool, num: BigInt, den: BigInt) -> (u64, u64)
+    var e = int(bit_length(num)) - int(bit_length(den))
+
+    // `bit_length` puts the value within one binade; one comparison says which side of `2^e` it is.
+    val below = if e >= 0 then big_cmp(num, shl(den, usize(e))) < 0
+    else big_cmp(shl(num, usize(-e)), den) < 0
+
+    if below then e -= 1
+
+    if e > QuadMaxExp then return quad_infinity(negative)
+
+    var at = if e < QuadMinExp then QuadMinExp else e
+    val scale = QuadFraction - at
+
+    var q = if scale >= 0 then rounded_ratio(shl(num, usize(scale)), den)
+    else rounded_ratio(num, shl(den, usize(-scale)))
+
+    val one = shl(from_int(1), usize(QuadFraction))
+
+    // Rounding up from just below a power of two carries into the next binade.
+    if big_cmp(q, shl(one, 1)) >= 0
+        q = shr(q, 1)
+        at += 1
+
+    if at > QuadMaxExp then return quad_infinity(negative)
+
+    // A significand below the hidden bit is a subnormal: exponent field zero, fraction as it stands.
+    val normal = big_cmp(q, one) >= 0
+    val biased = if normal then at + QuadBias else 0
+    val fraction = if normal then big_sub(q, one) else q
+
+    val hi_fraction = shr(fraction, 64)
+    val lo = to_u64(big_sub(fraction, shl(hi_fraction, 64))).unwrap_or(0)
+    val hi = to_u64(hi_fraction).unwrap_or(0)
+
+    (quad_sign(negative) | (u64(biased) << 48) | hi, lo)
+end quad_of_ratio
+
+// `num / den` rounded to the nearest integer, a tie to the even one.
+private rounded_ratio(num: BigInt, den: BigInt) -> BigInt
+    val (q, r) = div_rem_floor(num, den)
+
+    if r.is_zero() then return q
+
+    val c = big_cmp(big_mul(r, from_int(2)), den)
+
+    if c > 0 || (c == 0 && is_odd(q)) then big_add(q, from_int(1)) else q
+end rounded_ratio

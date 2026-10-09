@@ -1,0 +1,687 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.text.{split, Search}
+import sysl.math.bigint.from_int
+
+// `f128`, IEEE binary128: its constants (`quad.sysl`), its arithmetic through the library's
+// `sysl.softfloat`, its conversions, its C boundary and its refusals.
+//
+// **Every expected encoding was read off LLVM's own APFloat** -- clang for `aarch64-linux`, folding
+// the same `long double` expression and printing the constant -- rather than off this compiler, so a
+// rounding mistake here and there could not agree with itself.
+
+private qd_ready() -> bool = std_root().is_ok() && clang_available()
+
+// What a program in a project directory prints, built for the host.
+private qd_build_run(root: string) -> string
+    val exe = s"$root/built"
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end qd_build_run
+
+private qd_run(text: string) -> string
+    val root = make_temp_dir("sysl-qd").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    qd_build_run(root)
+end qd_run
+
+// A program lowered in process for `target` or the host, the library read from source -- a machine
+// other than this one has no sysroot here to build the standard module's C against. The answer is
+// `Err` with every diagnostic, or `Ok` with the LLVM text.
+private qd_lowered(target: Option[string], text: string) -> Result[string, string]
+    val t = target match
+        Some(name) -> target_named(name).unwrap()
+        None -> host_target()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("main.sysl", text))
+
+    if !parsed.ok() then return Err(parsed.report.at(0).message)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val errors = errors_of(done.an.diagnostics())
+
+    if !errors.is_empty() then return Err(analysis_report(errors))
+
+    Ok(ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0))
+end qd_lowered
+
+// Every diagnostic a program earns, through the lowering, for `target` or the host.
+private qd_err_for(target: Option[string], text: string) -> string = qd_lowered(target, text) match
+    Err(why) -> why
+    Ok(_) -> ""
+
+// The host's, through the driver as `sysl emit-llvm` runs it.
+private qd_err(text: string) -> string
+    val root = make_temp_dir("sysl-qd").unwrap()
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end qd_err
+
+// The LLVM text of a program that must compile.
+private qd_ir_for(target: Option[string], text: string) -> string = qd_lowered(target, text) match
+    Err(why) -> s"did not compile: $why"
+    Ok(ir) -> ir
+
+private qd_has(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+private qd_lacks(text: string, part: string) = assert(!text.contains(part), s"did not expect '$part' in:\n$text")
+
+// `sysl <args>`: the status and everything it said.
+private qd_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    (code, text)
+end qd_cli
+
+// -- constants, worked out while compiling ---------------------------------------------------------
+
+private qd_text(text: string) -> (u64, u64) = quad_of_text(text).unwrap()
+
+@test("a literal is rounded once from its exact decimal, to nearest and ties to even")
+qd_a_literal_is_rounded_once_from_its_text()
+    assert_eq(qd_text("1.0"), (0x3FFF000000000000, 0))
+    assert_eq(qd_text("0.1"), (0x3FFB999999999999, 0x999999999999999A))
+    assert_eq(qd_text("0.3"), (0x3FFD333333333333, 0x3333333333333333))
+    assert_eq(qd_text("123456789012345678901234567890.0"), (0x405F8EE90FF6C373, 0xE0EE4E3F0AD20000))
+    // (2^53 + 1)^2 needs 107 bits and binary128 has 113, so it is exact where a double is not.
+    assert_eq(qd_text("81129638414606699710187514626049.0"),(0x4069000000000000, 0x1000000000000040))
+
+@test("the ends of the range: the largest finite value, the smallest subnormal, and past both")
+qd_the_ends_of_the_range()
+    assert_eq(qd_text("1.18973149535723176508575932662800702e4932"), (0x7FFEFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF))
+    assert_eq(qd_text("6.475175119438025110924438958227646552e-4966"), (0, 1))
+    assert_eq(qd_text("1.2e4932"), quad_infinity(false))
+    assert_eq(qd_text("1e5000"), quad_infinity(false))
+    // Below half the smallest subnormal is zero; just above it rounds up to the subnormal.
+    assert_eq(qd_text("3e-4966"), (0, 0))
+    assert_eq(qd_text("4e-4966"), (0, 1))
+    assert_eq(qd_text("1e-99999"), (0, 0))
+    assert_eq(qd_text("0.0"), (0, 0))
+
+@test("a double widens exactly, a NaN keeping its payload and a subnormal its value")
+qd_a_double_widens_exactly()
+    assert_eq(quad_of_double(0x3FB999999999999A), (0x3FFB999999999999, 0xA000000000000000))
+    assert_eq(quad_of_double(0x8000000000000000), (0x8000000000000000, 0))
+    assert_eq(quad_of_double(0xFFF0000000000000), quad_infinity(true))
+    assert_eq(quad_of_double(0x7FF8000000000001), (0x7FFF800000000000, 0x1000000000000000))
+    // The smallest subnormal double, 2^-1074, is a normal binary128.
+    assert_eq(quad_of_double(1), (0x3BCD000000000000, 0))
+
+@test("a negative decimal carries the sign, and negating turns only the sign bit")
+qd_signs()
+    assert_eq(quad_of_decimal(from_int(-25), -1), (0xC000400000000000, 0))
+    assert_eq(quad_negated(0, 0), (0x8000000000000000, 0))
+
+@test("C's long double is binary128 exactly where clang says its significand is 113 bits")
+qd_long_double_agrees_with_clang()
+    if !clang_available() then return
+
+    val targets = all_targets()
+
+    for t in targets
+        if t.cpu == Craft then continue
+
+        val cc = find_clang(t, None)
+
+        if cc.is_err() then continue
+
+        val said = capture(cc.unwrap(),[s"--target=${t.triple}", "-dM", "-E", "-x", "c", "/dev/null"], "", [], true)
+
+        said match
+            Err(_) -> ()
+            Ok(out) ->
+                val quad = out.text.contains("__LDBL_MANT_DIG__ 113")
+
+                assert(quad == c_long_double_is_quad(t), s"${t.name}: clang says quad is $quad")
+
+// -- arithmetic, run ---------------------------------------------------------------------------------
+
+@test("arithmetic on the host is binary128, bit for bit")
+qd_arithmetic_is_bit_exact()
+    if !qd_ready() then return
+
+    val out = qd_run(raw"""
+        add(a: f128, b: f128) -> f128 = a + b
+
+        val tenth: f128 = 0.1
+        val two_tenths: f128 = 0.2
+        val three: f128 = 3.0
+        val one: f128 = 1.0
+        val tiny: f128 = 1e-30
+        val big: f128 = 1.18973149535723176508575932662800702e4932
+        val least_normal: f128 = 3.3621031431120935062626778173217526e-4932
+
+        print(add(tenth, two_tenths).bits() == 0x3FFD3333333333333333333333333334)
+        print((tenth * three).bits() == 0x3FFD3333333333333333333333333334)
+        print((one / three).bits() == 0x3FFD5555555555555555555555555555)
+        print((2.0 / 7.0f128).bits() == 0x3FFD2492492492492492492492492492)
+        print((one - tiny).bits() == 0x3FFEFFFFFFFFFFFFFFFFFFFFFFFFD76F)
+        print((least_normal / 2.0).bits() == 0x00008000000000000000000000000000)
+        print((1e-4940f128 * 1e10).bits() == 0x0005DBE4814FD831CB3A37F39DB01C40)
+        print((big * 2.0).bits() == f128.infinity.bits())
+        print((-tenth).bits() == 0xBFFB999999999999999999999999999A)
+        print((0.0f128 * -1.0).bits() == 0x80000000000000000000000000000000)
+        """)
+
+    assert_eq(out, "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n")
+
+// -- the runtime against LLVM's APFloat, at every bit --------------------------------------------
+//
+// **The last bit of a binary128 result is what a check through `double` cannot see**, since narrowing
+// throws it away. So a few hundred operand pairs are folded twice: by clang, as `long double`
+// constants for AArch64 Linux, where APFloat rounds them; and by a program on this machine, through
+// an exported function LLVM cannot see into, so `sysl.softfloat` rounds them. Every result is
+// compared whole.
+
+// A binary128 pattern as a C hexadecimal floating literal, which spells it exactly.
+private qd_hex_literal(hi: u64, lo: u64) -> string
+    val sign = if hi >> 63 == 1 then "-" else ""
+    val e = int((hi >> 48) & 0x7FFF)
+    val frac = s"${hex_upper(hi & 0xFFFFFFFFFFFF, 12)}${hex_upper(lo, 16)}"
+
+    if e == 0 then s"${sign}0x0.${frac}p-16382L" else s"${sign}0x1.${frac}p${e - 16383}L"
+end qd_hex_literal
+
+// Operand pairs: random fractions under exponents near one another and far apart, both signs, and a
+// few subnormals -- every route through the rounding.
+private qd_operands() -> Buf[(u64, u64, u64, u64)]
+    var out: Buf[(u64, u64, u64, u64)] = buf()
+    var s: u64 = 0x9E3779B97F4A7C15
+
+    for i in 0..<240
+        s = s * 6364136223846793005 + 1442695040888963407
+        val a_lo = s
+        s = s * 6364136223846793005 + 1442695040888963407
+        val b_lo = s
+        s = s * 6364136223846793005 + 1442695040888963407
+        val r = s
+
+        val a_exp: u64 = if i % 17 == 0 then 0 else 16383 + (r & 0xFF) - 128
+        val gap: u64 = if i % 3 == 0 then (r >> 8) & 0x3 else (r >> 8) & 0x7F
+        val b_exp: u64 = if i % 19 == 0 then 0 else a_exp + gap
+        val a_hi = ((r << 20) & 0x8000000000000000) | (a_exp << 48) | ((r >> 16) & 0xFFFFFFFFFFFF)
+        val b_hi = ((r << 1) & 0x8000000000000000) | (b_exp << 48) | ((r * 31) & 0xFFFFFFFFFFFF)
+
+        out.push((a_hi, a_lo, b_hi, b_lo))
+
+    out
+end qd_operands
+
+@test("every bit of + - * / agrees with LLVM's APFloat, over pairs near and far, subnormals included")
+qd_every_bit_agrees_with_apfloat()
+    if !qd_ready() then return
+
+    val pairs = qd_operands()
+    val ops = ["+", "-", "*", "/"]
+    var c = ""
+    var calls = ""
+
+    for i in 0..<pairs.len()
+        val p = pairs.at(i)
+        val a = qd_hex_literal(p.0, p.1)
+        val b = qd_hex_literal(p.2, p.3)
+
+        for k in 0..<4
+            c = c + s"long double r_${i}_$k = $a ${ops[k]} $b;\n"
+            calls = calls + s"print(op($k, 0x${hex_upper(p.0, 16)}${hex_upper(p.1, 16)}, " +
+                    s"0x${hex_upper(p.2, 16)}${hex_upper(p.3, 16)}))\n"
+
+    // APFloat's answers: each global as LLVM prints it, `0xL` and the LOW half first.
+    val root = make_temp_dir("sysl-qd").unwrap()
+
+    write_text(s"$root/oracle.c", c).unwrap()
+
+    val folded = capture(find_clang(host_target(), None).unwrap(),
+                         ["--target=aarch64-unknown-linux-gnu", "-S", "-emit-llvm", "-o", "-", s"$root/oracle.c"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    var expected: Buf[string] = buf()
+
+    folded match
+        Err(_) -> assert(false, "clang did not run")
+        Ok(out) ->
+            val lines = split(out.text, "\n")
+
+            for i in 0..<lines.len
+                val line = lines[i]
+                val at = line.index_of("fp128 ")
+
+                if line.starts_with("@r_") && at.is_some()
+                    val v = line[(at.unwrap() + 6)..<line.bytes.len]
+                    val value = split(v, ",")[0]
+
+                    expected.push(value)
+
+    assert_eq(expected.len(), pairs.len() * 4)
+
+    val program = raw"""
+        @export("qd_op")
+        @noinline
+        op(k: int, a: u128, b: u128) -> u128
+            val x = f128.from_bits(a)
+            val y = f128.from_bits(b)
+            val r = if k == 0 then x + y else if k == 1 then x - y else if k == 2 then x * y else x / y
+            r.bits()
+
+        """
+
+    val printed = split(qd_run(program + calls), "\n")
+    var compared: usize = 0
+    var wrong: Buf[string] = buf()
+
+    for i in 0..<expected.len()
+        val want = expected.at(i)
+
+        // A value APFloat prints in decimal is one that reads back from six digits -- a zero, an
+        // infinity, a small integer -- and is checked by the named tests rather than parsed here.
+        if !want.starts_with("0xL") then continue
+
+        val lo = u128(parse_hex(want[3..<19]))
+        val hi = u128(parse_hex(want[19..<35]))
+        val got = printed[i]
+
+        compared += 1
+
+        if got != str((hi << 64) | lo) then wrong.push(s"#$i ${ops[i % 4]}: want $want, got $got")
+
+    assert(compared > pairs.len() * 3, s"only $compared of ${expected.len()} could be compared")
+    assert(wrong.is_empty(), s"${wrong.len()} disagree, the first: ${if wrong.is_empty() then "" else wrong.at(0)}")
+
+private parse_hex(digits: string) -> u64
+    var out: u64 = 0
+
+    for i in 0..<digits.bytes.len
+        val b = digits.bytes[i]
+        val d = if b >= u8('0') && b <= u8('9') then u64(b - u8('0'))
+        else if b >= u8('A') && b <= u8('F') then u64(b - u8('A')) + 10
+        else u64(b - u8('a')) + 10
+
+        out = (out << 4) | d
+
+    out
+end parse_hex
+
+@test("comparisons: ordered, a NaN unordered with itself, and the two zeros equal")
+qd_comparisons()
+    if !qd_ready() then return
+
+    val out = qd_run(raw"""
+        val a: f128 = 0.1
+        val b: f128 = 0.2
+        val n = f128.nan
+        val inf = f128.infinity
+
+        print(a < b, a <= b, b > a, b >= a, a == a, a != b)
+        print(n == n, n != n, n < a, n > a, -inf < a, a < inf)
+        print(-0.0f128 == 0.0, 0.1f128 + 0.2 == 0.3, 0.1f128 + 0.2 > 0.3)
+        """)
+
+    assert_eq(out, "true true true true true true\nfalse true false false true true\ntrue false true\n")
+
+@test("infinity minus infinity, and zero divided by zero, are NaN; one divided by zero is infinity")
+qd_the_special_cases()
+    if !qd_ready() then return
+
+    val out = qd_run(raw"""
+        val inf = f128.infinity
+        val zero: f128 = 0.0
+        val x = inf - inf
+        val y = zero / zero
+
+        print(x != x, y != y, (1.0f128 / zero) == inf, (-1.0f128 / zero) == -inf, inf * zero != inf * zero)
+        """)
+
+    assert_eq(out, "true true true true true\n")
+
+@test("conversions to and from every float width are exact one way and rounded the other")
+qd_float_conversions()
+    if !qd_ready() then return
+
+    val out = qd_run(raw"""
+        val d: real = 0.1
+        val q = f128(d)
+        val f: f32 = 1.5
+        val h: f16 = 0.25
+        val b: bf16 = 2.0
+
+        print(q.bits() == 0x3FFB999999999999A000000000000000)
+        print(real(0.1f128) == 0.1, f32(0.1f128) == f32(0.1), f16(0.25f128) == h, bf16(2.0f128) == b)
+        print(f128(f) == 1.5, f128(h) == 0.25, f128(b) == 2.0)
+        print(real(1e400f128) == real.infinity, real(1e-400f128) == 0.0)
+        print(real(f128.nan) != real(f128.nan))
+        """)
+
+    assert_eq(out, "true\ntrue true true true\ntrue true true\ntrue true\ntrue\n")
+
+@test("conversions to and from the integers, the 128-bit ones included, saturating at the ends")
+qd_integer_conversions()
+    if !qd_ready() then return
+
+    val out = qd_run(raw"""
+        val big: i128 = 170141183460469231731687303715884105727
+        val n: long = -9007199254740993
+        val u: u128 = 340282366920938463463374607431768211455
+
+        print(f128(big).bits() == 0x407E0000000000000000000000000000)
+        print(i64(f128(n)) == n, f128(n) == -9007199254740993.0)
+        print(f128(u).bits() == 0x407F0000000000000000000000000000)
+        print(int(2.75f128), int(-2.75f128), i128(1e30f128), u64(-5.0f128))
+        print(int(1e40f128), int(-1e40f128), u8(300.0f128), int(f128.nan))
+        print(i128(1e39f128) == big, u128(1e39f128) == u)
+        """)
+
+    assert_eq(out, "true\ntrue true\ntrue\n2 -2 1000000000000000000000000000000 0\n" +
+                   "2147483647 -2147483648 255 0\ntrue true\n")
+
+@test("a module val, a const, a within range and a struct field hold an f128")
+qd_storage()
+    if !qd_ready() then return
+
+    val out = qd_run(raw"""
+        const third: f128 = 0.333333333333333333333333333333333333
+        static val tenth: f128 = 0.1
+
+        type Frac = f128 within 0.0..1.0
+
+        struct Pair
+            a: f128
+            b: f128
+
+        val p = Pair(tenth, third)
+        val u: Frac = 0.5
+
+        print(tenth.bits() == 0x3FFB999999999999999999999999999A, third.bits() == 0x3FFD5555555555555555555555555555)
+        print((p.a + p.b) > 0.4, u == 0.5)
+        """)
+
+    assert_eq(out, "true true\ntrue true\n")
+
+@test("a value outside an f128 within range traps")
+qd_within_traps()
+    if !qd_ready() then return
+
+    val out = qd_run(raw"""
+        type Frac = f128 within 0.0..1.0
+
+        check(x: f128) -> Frac = Frac(x)
+
+        print(check(1.5) > 0.0)
+        """)
+
+    assert(out.starts_with("exited badly"), out)
+
+// -- the C boundary ----------------------------------------------------------------------------------
+
+@test("an f128 crosses to C as fp128, as clang passes a binary128 long double")
+qd_crosses_as_fp128()
+    val text = "extern \"half\" half(x: f128) -> f128\n\n@export(\"twice\")\ntwice(x: f128) -> f128 = half(x) * 4.0\n"
+
+    for machine in ["aarch64-linux", "riscv64-linux", "aarch64-freestanding"]
+        val ir = qd_ir_for(Some(machine), text)
+
+        // A bare machine's declarations are `dso_local`, so the shape is matched after the word.
+        qd_has(ir, "fp128 @half(fp128")
+        qd_has(ir, "fp128 @twice(fp128")
+
+@test("an HFA of binary128 travels in Q registers, a sixteen-byte stack slot apart")
+qd_an_hfa_of_quads()
+    val ir = qd_ir_for(Some("aarch64-linux"),
+                       "struct H\n    a: f128\n    b: f128\n\nextern \"g\" g(h: H) -> f128\n\n" +
+                       "print(g(H(1.0, 2.0)) > 0.0)\n")
+
+    qd_has(ir, "[2 x fp128] alignstack(16)")
+
+@test("C's long double, measured: a double on the host, binary128 on AArch64 Linux, refused on x86")
+qd_long_double_is_measured()
+    if !clang_available() then return
+
+    val text = "c type\n    LongDouble = \"long double\"\n\nextern \"sqrtl\" sqrtl(x: LongDouble) -> LongDouble\n\n" +
+               "print(sqrtl(4.0) > 1.0)\n"
+
+    qd_has(qd_ir_for(Some("aarch64-linux"), text), "declare fp128 @sqrtl(fp128")
+    qd_has(qd_ir_for(Some("aarch64-macos"), text), "declare double @sqrtl(double")
+    qd_has(qd_err_for(Some("x86_64-linux"), text),
+           "is a 'long double' with 64 bits of significand on 'x86_64-linux' — the x87 extended format")
+
+@test("an extern and an export taking C's long double, called from C on the host")
+qd_long_double_round_trip_with_c()
+    if !qd_ready() then return
+
+    val root = make_temp_dir("sysl-qd").unwrap()
+
+    make_dir_all(s"$root/p").unwrap()
+    write_text(s"$root/main.sysl", "print(p.check())\n").unwrap()
+    write_text(s"$root/p/p.sysl", raw"""
+        module p
+
+        c type
+            LongDouble = "long double"
+
+        extern "c_half_of_twice" c_half_of_twice(x: LongDouble) -> LongDouble
+
+        @export("sysl_twice")
+        twice(x: LongDouble) -> LongDouble = x * 2.0
+
+        check() -> bool = c_half_of_twice(0.75) == 0.75 && twice(1.25) == 2.5
+        """).unwrap()
+    write_text(s"$root/p/probe.c",
+               "long double sysl_twice(long double);\n" +
+               "long double c_half_of_twice(long double x) { return sysl_twice(x) / 2.0L; }\n").unwrap()
+
+    assert_eq(qd_build_run(root), "true\n")
+
+@test("an exported f128 is refused where C's long double is not binary128, and spelled one where it is")
+qd_export_is_spelled_or_refused()
+    if !clang_available() then return
+
+    val text = "@export(\"twice\")\ntwice(x: f128) -> f128 = x * 2.0\n"
+    val said = qd_err_for(Some("aarch64-macos"), text)
+
+    qd_has(said, "'x' of the exported 'twice' is f128, and C on 'aarch64-macos' has no binary128 type")
+    qd_has(said, "the exported 'twice' returns f128, and C on 'aarch64-macos'")
+    qd_has(said, "its 'long double' is a 'double' there")
+    assert_eq(qd_err_for(Some("aarch64-linux"), text), "")
+
+    val root = make_temp_dir("sysl-qd").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val shown = qd_cli(["sysl", "emit-header", "--target", "aarch64-linux", s"$root/main.sysl"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(shown.0, 0)
+    qd_has(shown.1, "long double twice(long double x);")
+
+@test("an extern taking an f128 is refused where C's long double is not binary128")
+qd_extern_param_is_refused()
+    val text = "extern \"half\" half(x: f128) -> real\n\nprint(half(1.0))\n"
+    val said = qd_err_for(Some("aarch64-macos"), text)
+
+    qd_has(said, "'x' of the 'extern' 'half' is f128, and C on 'aarch64-macos' has no binary128 type " +
+           "to spell it with — its 'long double' is a 'double' there")
+    qd_has(qd_err_for(Some("x86_64-linux"), text), "its 'long double' is the x87 80-bit extended format there")
+    assert_eq(qd_err_for(Some("aarch64-linux"), text), "")
+
+@test("an extern answering an f128 is refused where C's long double is not binary128")
+qd_extern_result_is_refused()
+    val text = "extern \"third\" third() -> f128\n\nprint(real(third()) > 0.0)\n"
+    val said = qd_err_for(Some("aarch64-macos"), text)
+
+    qd_has(said, "the 'extern' 'third' returns f128, and C on 'aarch64-macos' has no binary128 type")
+    qd_lacks(said, "of the 'extern' 'third'")
+    assert_eq(qd_err_for(Some("riscv64-linux"), text), "")
+
+@test("an extern taking a struct with an f128 field by value is refused the same way")
+qd_extern_struct_field_is_refused()
+    val text = "struct H\n    a: f128\n    b: real\n\nextern \"g\" g(h: H) -> real\n\nprint(g(H(1.0, 2.0)))\n"
+    val said = qd_err_for(Some("aarch64-macos"), text)
+
+    qd_has(said, "'h' of the 'extern' 'g' is ")
+    qd_has(said, ", and C on 'aarch64-macos' has no binary128 type")
+    assert_eq(qd_err_for(Some("aarch64-linux"), text), "")
+
+@test("an extern over f128 that nothing calls binds the program to nothing, and is not refused")
+qd_an_uncalled_quad_extern_is_not_refused()
+    assert_eq(qd_err_for(Some("aarch64-macos"), "extern \"half\" half(x: f128) -> f128\n\nprint(1)\n"), "")
+
+// -- the runtime, on a bare machine -----------------------------------------------------------------
+
+private qd_nm() -> Option[string]
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-nm", "/usr/local/opt/llvm/bin/llvm-nm"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end qd_nm
+
+// What `llvm-nm <flags>` says of an `aarch64-freestanding` archive of `main`: `-u` the symbols it
+// leaves undefined, `-g --defined-only` the ones it defines.
+private qd_archive_symbols(nm: string, main: string, flags: []string) -> string
+    val root = make_temp_dir("sysl-qd").unwrap()
+    val archive = s"$root/probe.a"
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+
+    val built = qd_cli(["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root])
+
+    assert(built.0 == 0, built.1)
+
+    var args: Buf[string] = buf()
+
+    for i in 0..<flags.len
+        args.push(flags[i])
+
+    args.push(archive)
+
+    val listed = capture(nm, args.view()) match
+        Err(_) -> "llvm-nm did not run"
+        Ok(out) -> out.text
+
+    remove_dir_all(root).unwrap_or(())
+    listed
+end qd_archive_symbols
+
+// A compiler-rt binary128 routine's name: `__` and a `tf` in it (`__addtf3`, `__fixtfdi`, `__lttf2`).
+private qd_soft_quad_names(listing: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val lines = split(listing, "\n")
+
+    for i in 0..<lines.len
+        val words = split(lines[i].trim(), " ")
+        val name = words[words.len - 1]
+
+        if name.starts_with("__") && name.contains("tf") then out.push(name)
+
+    out
+end qd_soft_quad_names
+
+private qd_quad_mix() -> string = raw"""
+    @export("mix")
+    mix(a: long, b: long) -> long
+        val x = f128(a) / f128(b) * 3.0 + 0.5
+        val y = real(x)
+        long(x) + (if f128(a) < f128(b) then 1 else 0) + long(f128(y) - x)
+    """
+
+@test("a bare-metal archive computing in f128 carries its own runtime, and leaves no compiler-rt symbol undefined")
+qd_a_bare_archive_needs_no_compiler_rt()
+    if !qd_ready() then return
+
+    val nm = qd_nm()
+
+    if nm.is_none() then return
+
+    val undefined = qd_archive_symbols(nm.unwrap(), qd_quad_mix(), ["-u"])
+
+    assert(qd_soft_quad_names(undefined).is_empty(), s"undefined:\n$undefined")
+
+    val defined = qd_archive_symbols(nm.unwrap(), qd_quad_mix(), ["-g", "--defined-only"])
+
+    for name in ["__addtf3", "__multf3", "__divtf3", "__floatditf", "__fixtfdi", "__lttf2", "__trunctfdf2"]
+        qd_has(defined, name)
+
+@test("and an archive that computes in no f128 carries none of the runtime")
+qd_an_archive_without_f128_carries_no_runtime()
+    if !qd_ready() then return
+
+    val nm = qd_nm()
+
+    if nm.is_none() then return
+
+    val defined = qd_archive_symbols(nm.unwrap(), "@export(\"mix\")\nmix(a: long, b: long) -> long = a + b\n",
+                                     ["-g", "--defined-only"])
+
+    assert(qd_soft_quad_names(defined).is_empty(), s"defined:\n$defined")
+
+// -- refusals ---------------------------------------------------------------------------------------
+
+@test("an f128 has no text form yet, and says what to write instead")
+qd_no_text_form()
+    if !qd_ready() then return
+
+    for program in ["val x: f128 = 1.0\nprint(x)\n", "val x: f128 = 1.0\nval s = str(x)\n",
+                    "val x: f128 = 1.0\nval s = s\"$x\"\n", "val x: f128 = 1.0\nval s = f\"${x}%.3f\"\n"]
+        qd_has(qd_err(program), "an 'f128' has no text form yet")
+
+@test("a const function, a c const, a vector lane and va_arg each refuse f128 by name")
+qd_the_other_refusals()
+    if !qd_ready() then return
+
+    qd_has(qd_err("const half(x: f128) -> f128 = x / 2.0\n"), "'f128' values are not evaluated while compiling yet")
+    qd_has(qd_err("c const\n    pi: f128 = \"3.14\"\n"), "'f128' is not a width a 'c const' is measured at")
+    qd_has(qd_err("val v: <2>f128 = [1.0, 2.0]\n"), "f128")
+    qd_has(qd_err("f(n: int, ...) -> f128\n    var ap: va_list\n    va_start(ap)\n    val x = va_arg[f128](ap)\n    va_end(ap)\n    x\n"),
+           "reading an 'f128' out of a variadic argument list is not built")
+
+@test("an export refused for an unsettled type says so once, not again as '?' (FINDINGS 62c)")
+qd_an_unknown_type_is_not_refused_twice()
+    if !qd_ready() then return
+
+    val said = qd_err("@export(\"f\")\nf(x: Nope) -> Nope = x\n\nstruct S\n    a: Nope\n\n@export(\"g\")\ng(s: *S) -> int = 1\n")
+
+    qd_has(said, "unknown type 'Nope'")
+    qd_lacks(said, "which C has no way to spell")
+    qd_lacks(said, "is ?")

@@ -1,0 +1,144 @@
+module sysl.softfloat
+@tests
+
+import sysl.rand.{Rng, rng}
+
+// The binary128 routines, called by name.
+//
+// **The oracle for the arithmetic is the machine's own `double` unit.** binary128 carries 113 bits
+// and a `double` 53, and 113 >= 2 * 53 + 2 -- which is exactly the condition under which rounding a
+// sum, difference, product or quotient to binary128 and then to a `double` gives the same `double` as
+// rounding it once (Figueroa's theorem). So `real(q(a) op q(b)) == a op b` holds bit for bit for
+// every pair of doubles, and thousands of random pairs, subnormals and the ends of the range included,
+// are checked against hardware that had nothing to do with this file. The named encodings were read
+// off LLVM's APFloat.
+
+private q(x: real) -> f128 = extenddftf2(x)
+private d(x: f128) -> real = trunctfdf2(x)
+private same(a: real, b: real) -> bool = a.bits() == b.bits() || (a != a && b != b)
+
+// A double drawn over its whole encoding: every exponent, both signs, subnormals, infinities, NaNs.
+private any_double(g: *Rng) -> real = real.from_bits(g.next_u64())
+
+@test("+ - * / of random doubles, widened, agree with the double unit after narrowing")
+random_pairs_agree_with_hardware()
+    var g = rng(128, 7)
+
+    for step in 0..<4000
+        val a = any_double(&g)
+        val b = any_double(&g)
+
+        assert(same(d(addtf3(q(a), q(b))), a + b), s"$a + $b")
+        assert(same(d(subtf3(q(a), q(b))), a - b), s"$a - $b")
+        assert(same(d(multf3(q(a), q(b))), a * b), s"$a * $b")
+        assert(same(d(divtf3(q(a), q(b))), a / b), s"$a / $b")
+
+@test("and so do pairs close in magnitude, where subtraction cancels")
+random_near_pairs_agree_with_hardware()
+    var g = rng(129, 7)
+
+    for step in 0..<4000
+        val a = any_double(&g)
+        val b = real.from_bits(a.bits() ^ (g.next_u64() & 0xFFFF))
+
+        assert(same(d(addtf3(q(a), q(-b))), a - b), s"$a - $b")
+        assert(same(d(divtf3(q(a), q(b))), a / b), s"$a / $b")
+
+@test("comparisons agree with the double unit, NaN and the two zeros included")
+random_comparisons_agree_with_hardware()
+    var g = rng(130, 7)
+
+    for step in 0..<4000
+        val a = if step % 7 == 0 then 0.0 else any_double(&g)
+        val b = if step % 11 == 0 then -0.0 else any_double(&g)
+
+        assert((lttf2(q(a), q(b)) < 0) == (a < b), s"$a < $b")
+        assert((letf2(q(a), q(b)) <= 0) == (a <= b), s"$a <= $b")
+        assert((gttf2(q(a), q(b)) > 0) == (a > b), s"$a > $b")
+        assert((getf2(q(a), q(b)) >= 0) == (a >= b), s"$a >= $b")
+        assert((eqtf2(q(a), q(b)) == 0) == (a == b), s"$a == $b")
+        assert((netf2(q(a), q(b)) != 0) == (a != b), s"$a != $b")
+        assert((unordtf2(q(a), q(b)) != 0) == (a != a || b != b), s"$a unordered $b")
+
+@test("to and from the integers agree with the double unit where a double holds the value")
+random_integers_agree_with_hardware()
+    var g = rng(131, 7)
+
+    for step in 0..<4000
+        val n = i64(g.next_u64() >> (1 + g.next_u64() % 63))
+        val m = if step % 2 == 0 then n else -n
+
+        assert(d(floatditf(m)) == real(m), s"$m")
+        assert(fixtfdi(floatditf(m)) == m, s"$m")
+        assert(fixtfsi(floatditf(m)) == int(real(m)), s"$m")
+
+        val x = any_double(&g)
+
+        if x == x && x > -9.0e18 && x < 9.0e18 then assert(fixtfdi(q(x)) == long(x), s"$x")
+
+@test("named encodings, read off LLVM's APFloat")
+named_encodings()
+    val one = extenddftf2(1.0)
+    val three = extenddftf2(3.0)
+
+    assert(divtf3(one, three).bits() == 0x3FFD5555555555555555555555555555)
+    assert(floattitf(170141183460469231731687303715884105727).bits() == 0x407E0000000000000000000000000000)
+    assert(floatuntitf(340282366920938463463374607431768211455).bits() == 0x407F0000000000000000000000000000)
+    assert(fixtfti(f128.from_bits(0x407E0000000000000000000000000000)) == 170141183460469231731687303715884105727)
+    assert(fixunstfti(f128.from_bits(0x407F0000000000000000000000000000)) == 340282366920938463463374607431768211455)
+    assert(fixunstfdi(extenddftf2(-1.0)) == 0)
+
+@test("a NaN operand comes back quiet with its payload, and the invalid operations make one")
+nans()
+    val signalling = f128.from_bits(0x7FFF0000000000000000000000000001)
+    val inf = f128.from_bits(0x7FFF0000000000000000000000000000)
+    val zero = f128.from_bits(0)
+
+    assert(addtf3(signalling, one_q()).bits() == 0x7FFF8000000000000000000000000001)
+    assert(subtf3(inf, inf).bits() == 0x7FFF8000000000000000000000000000)
+    assert(multf3(inf, zero).bits() == 0x7FFF8000000000000000000000000000)
+    assert(divtf3(zero, zero).bits() == 0x7FFF8000000000000000000000000000)
+
+private one_q() -> f128 = extenddftf2(1.0)
+
+@test("subnormals: the least normal halved, and the least subnormal halved to zero, ties to even")
+subnormals()
+    val least_normal = f128.from_bits(0x00010000000000000000000000000000)
+    val least = f128.from_bits(1)
+    val half = extenddftf2(0.5)
+
+    assert(multf3(least_normal, half).bits() == 0x00008000000000000000000000000000)
+    assert(multf3(least, half).bits() == 0)
+    assert(multf3(f128.from_bits(3), half).bits() == 2)
+    assert(addtf3(least, least).bits() == 2)
+
+@test("every narrower format: a round trip through binary128 is exact")
+narrow_round_trips()
+    for i in 0..<65536
+        val h = f16.from_bits(u16(i))
+        val back = trunctfhf2(extendhftf2(h))
+
+        assert(back.bits() == h.bits() || (h != h && back != back), s"f16 $i")
+
+        val b = bf16.from_bits(u16(i))
+        val bb = trunctfbf2(extenddftf2(real(b)))
+
+        assert(bb.bits() == b.bits() || (b != b && bb != bb), s"bf16 $i")
+
+    var g = rng(132, 7)
+
+    for step in 0..<4000
+        val f = f32.from_bits(u32(g.next_u64() >> 32))
+        val back = trunctfsf2(extendsftf2(f))
+
+        assert(back.bits() == f.bits() || (f != f && back != back), s"f32 ${f.bits()}")
+
+@test("narrowing to f32 and f16 rounds as the double unit rounds the same double")
+narrowing_matches_hardware()
+    var g = rng(133, 7)
+
+    for step in 0..<4000
+        val x = any_double(&g)
+
+        assert(same(real(trunctfsf2(q(x))), real(f32(x))), s"f32 $x")
+        assert(same(real(trunctfhf2(q(x))), real(f16(x))), s"f16 $x")

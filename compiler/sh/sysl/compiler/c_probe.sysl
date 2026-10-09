@@ -466,9 +466,20 @@ end probe_text
 
 // The `_Generic` association list, and the numbering the answers are read back with. `0` is the
 // `default` arm, which is every type this feature does not resolve.
+//
+// **A `long double` answers with its format folded into the number**: its size does not say what it
+// is -- sixteen bytes is binary128 on AArch64 Linux and the x87 extended format, padded, on x86-64 --
+// so the arm is `LongDoubleKind` plus the significand's digits, which C states in
+// `__LDBL_MANT_DIG__`: 53 for a `double`, 64 for x87, 113 for binary128.
 private generic_arms() -> string =
     " _Bool: 1, char: 2, signed char: 3, unsigned char: 4, short: 5, unsigned short: 6, int: 7," +
-    " unsigned int: 8, long: 9, unsigned long: 10, long long: 11, unsigned long long: 12, default: 0"
+    " unsigned int: 8, long: 9, unsigned long: 10, long long: 11, unsigned long long: 12," +
+    s" float: $FloatKind, double: $DoubleKind, long double: $LongDoubleKind + __LDBL_MANT_DIG__," +
+    " default: 0"
+
+private const FloatKind: int = 13
+private const DoubleKind: int = 14
+private const LongDoubleKind: int = 1000
 
 // A header as C spells it. A name already carrying its own `<…>` or `"…"` is passed through, so
 // `@include("<stdint.h>")` reaches a system header and `@include("qcbor.h")` reaches one beside the
@@ -663,6 +674,14 @@ private floating_kind(a: &Analysis, at: Scope, c: CConstDecl, bits: int, name: s
                 "widths that read back without guessing are 'f32' and 'f64'")
         return KnownNow(32, true, false, name)
 
+    // The measurement crosses back as a `double`, so a binary128 constant would arrive with a
+    // double's 53 bits and the rest made up.
+    if bits == 128
+        a.fault(at, c.span, s"'$name' is not a width a 'c const' is measured at — the value comes " +
+                "back through a 'double', which holds 53 of binary128's 113 bits of significand. " +
+                "Write the constant as an 'f128' literal")
+        return KnownNow(32, true, false, name)
+
     KnownNow(bits, true, true, name)
 end floating_kind
 
@@ -682,7 +701,7 @@ private plain_width(name: string) -> Option[Type]
     val bits = int(number_of(name[1..<b.len], 10))
 
     if b[0] == u8('f')
-        if bits == 16 || bits == 32 || bits == 64 then return Some(Floating(bits, false))
+        if bits == 16 || bits == 32 || bits == 64 || bits == 128 then return Some(Floating(bits, false))
 
         return None
 
@@ -963,14 +982,28 @@ private measured_type(a: &Analysis, at: Scope, t: CTypeDecl, m: CMeasured, char_
     // *is* what C means by it.
     if m.kind == 1 then return alias_to(t, "bool")
 
+    // A float is measured for its FORMAT, which is fixed for `float` and `double` and is the
+    // machine's for `long double`: a `double` on Apple's arm64 and on Windows, binary128 on AArch64
+    // Linux and RISC-V, and on x86 a format sysl has no type for.
+    if m.kind == FloatKind then return alias_to(t, "f32")
+    if m.kind == DoubleKind || m.kind == LongDoubleKind + 53 then return alias_to(t, "f64")
+    if m.kind == LongDoubleKind + 113 then return alias_to(t, "f128")
+
+    if m.kind > LongDoubleKind
+        a.fault(at, t.span, s"the C compiler says '${t.c}' is a 'long double' with " +
+                s"${m.kind - LongDoubleKind} bits of significand on '${a.tables.target.name}' — the " +
+                "x87 extended format, which sysl has no type for. Its 'long double' is binary128 " +
+                "('f128') on AArch64 Linux, RISC-V and WebAssembly and a 'double' on Apple's arm64")
+        return alias_to(t, "f64")
+
     integer_kind(m, char_signed) match
         Some(found) -> alias_to(t, s"${if found.1 then "i" else "u"}${found.0}")
         None ->
             a.fault(at, t.span, s"the C compiler says '${t.c}' is not an integer type, " +
-                    "and a 'c type' names an integer — what comes back from one is a width and a " +
-                    "signedness, which a float, a pointer, a struct or an array has not got. An " +
-                    "address is written '*T', a float by name, and a struct arrives as an " +
-                    "'opaque struct'")
+                    "and a 'c type' names an integer or a float — what comes back from one is a " +
+                    "width and a signedness, or a floating-point format, which a pointer, a struct " +
+                    "or an array has not got. An address is written '*T', and a struct arrives as " +
+                    "an 'opaque struct'")
             alias_to(t, "int")
 end measured_type
 

@@ -58,6 +58,10 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
             emit(e, InCast(r, CastFPTrunc, LFloat(64, false), VFloat(bits), lty(e, ty)))
             r
 
+    // An `f128` constant is written as its own encoding: there is no `double` it could be widened
+    // from without losing the bits a `double` does not have.
+    TQuadLit(hi, lo, _) -> VQuad(hi, lo)
+
     // A constrained operand converts from its base representation.
     TCast(operand, ty) -> convert(e, underlying(texpr_type(operand)), ty, gen_expr(e, operand))
 
@@ -922,16 +926,19 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
 
             base match
                 // A float range is compared at `double` whatever the width, the ends being `double`
-                // constants: a narrower value is widened first, which is exact.
+                // constants: a narrower value is widened first, which is exact. An `f128` is the one
+                // width a `double` cannot hold, so it is compared as itself, against ends rounded to
+                // binary128 from their decimals.
                 Floating(bits, _) ->
-                    val wide = real_type()
-                    val x = if bits == 64 then v else cast_to(e, CastFPExt, base, wide, v)
+                    val quad = bits == 128
+                    val wide = if quad then base else real_type()
+                    val x = if bits == 64 || quad then v else cast_to(e, CastFPExt, base, wide, v)
 
                     // An infinite end is still compared: `x >= -infinity` is false for a NaN alone,
                     // which is the whole of what `-infinity..infinity` refuses.
                     d.lo match
                         Some(lo) ->
-                            trap_unless(e, compare_value(e, ">=", wide, x, VFloat(end_bits(lo))),
+                            trap_unless(e, compare_value(e, ">=", wide, x, end_value(lo, quad)),
                                         "within")
                         None -> ()
 
@@ -939,7 +946,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                         Some(hi) ->
                             val op = if d.exclusive_hi then "<" else "<="
 
-                            trap_unless(e, compare_value(e, op, wide, x, VFloat(end_bits(hi))),
+                            trap_unless(e, compare_value(e, op, wide, x, end_value(hi, quad)),
                                         "within")
                         None -> ()
                 // A fixed-point range is compared on the raw value, each end brought to the scale
@@ -1482,7 +1489,7 @@ zero_of(e: *Emit, ty: Type) -> Val
     underlying(ty) match
         Integer(_, _, _) -> VInt(from_int(0))
         Fixed(_, _, _) -> VInt(from_int(0))
-        Floating(_, _) -> v_float(0.0)
+        Floating(bits, _) -> if bits == 128 then VQuad(0, 0) else v_float(0.0)
         Char -> VInt(from_int(0))
         Bool -> VInt(from_int(0))
         Ptr(_) -> if erased(underlying(ty)) then VZero else VNull
@@ -1508,6 +1515,19 @@ decimal_int(d: Decimal) -> BigInt = rescale(d, 0, Rounding.Down).coefficient()
 private end_bits(r: RangeEnd) -> long = r match
     EndAt(d) -> double_bits(str(d))
     EndInfinite(negative) -> if negative then NegInfinityBits else InfinityBits
+
+// A float range's end as the constant it is compared against: a `double`, or binary128 for `f128`.
+private end_value(r: RangeEnd, quad: bool) -> Val
+    if !quad then return VFloat(end_bits(r))
+
+    val (hi, lo) = r match
+        EndAt(d) ->
+            val (coef, exp) = exact_of_decimal(d)
+            quad_of_decimal(coef, exp)
+        EndInfinite(negative) -> quad_infinity(negative)
+
+    VQuad(hi, lo)
+end end_value
 
 // -- `?` --------------------------------------------------------------------------------------------
 
