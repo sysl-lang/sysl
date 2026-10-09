@@ -644,7 +644,7 @@ float and is copied whole is not a float use; reading the field out is.
 
 ## Capabilities
 
-**Whether the machine has a heap, an operating system or POSIX is a project engineering
+**Whether the machine has a heap, an operating system, POSIX or a C library is a project engineering
 decision, and this is where it is stated.** The compiler's registry of targets deliberately carries no
 capabilities: a target's ABI is measured and its capabilities are policy, so the ABI is the registry's
 and the policy is yours.
@@ -656,7 +656,8 @@ capabilities { heap = false }
 That is the project's own statement and it applies to **every** target the project builds for. A
 capability the file does not mention is provided — the prior is that a machine can do everything,
 which is what every build had before there was a file to say otherwise, so what a config records is
-what a machine *cannot* do.
+what a machine *cannot* do. The one exception is `libc` on a freestanding target, which the file
+grants rather than takes away ([below](#libc-the-one-a-freestanding-target-starts-without)).
 
 **A target block layers over it, per capability, for the one machine that differs:**
 
@@ -697,6 +698,31 @@ belongs.
 
 For compatibility with packages already published, `alloc` is still accepted in this file and read as
 `heap`. Write `heap`.
+
+### `libc`, the one a freestanding target starts without
+
+The fourth capability is **a C library under the program**, and it is the exception to the prior
+above: a hosted target has one, and a freestanding target does **not** until the file grants it.
+Whether a board has one is the build's business, not the triple's — a Pico SDK build links newlib, as
+Zephyr and FreeRTOS builds link theirs, while a bare image links nothing — so the project says so:
+
+```hocon
+targets {
+  thumb-freestanding-softfp { capabilities { libc = true } }
+}
+```
+
+What it makes legal is **C's own functions** and nothing more. A float conversion, a `%s` and a plain
+hole of a float are rendered by C's `snprintf`, so without the capability each one a program reaches
+is refused where it is written ([formatted strings](/reference/strings/)); with it they build, and
+`snprintf` is left for the board's link to find.
+
+**It is not an operating system**, and the library's hooks are about one. newlib's `read` and `fopen`
+are stubs a board answers, not a filesystem, so a program reaching [`sysl.fs`](/library/fs/) or
+reading a descriptor through [`sysl.io`](/library/io/) still answers their hooks with its own
+`@export`s, `libc` granted or not — the refusal says so where it was. No module states `libc`; it is
+a statement about the machine, written in this file and nowhere else, and like the others it is part
+of the run cache's key.
 
 ## One heap, and the package that names it
 

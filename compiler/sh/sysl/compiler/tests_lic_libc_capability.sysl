@@ -1,0 +1,150 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{is_file, write_text}
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **`libc`: a C library under the program, granted by the manifest where a freestanding board has
+// one.**
+//
+// A float conversion, a `%s` and a plain hole of a float are rendered by C's `snprintf`, so on a
+// target without the capability each one reached is refused where it is written
+// (`emit_checks.sysl`'s `check_c_formatting`). A hosted target has it; a freestanding one has it only
+// where `package.hocon` grants it -- `targets { <t> { capabilities { libc = true } } }`, which is what
+// a Pico SDK build linking newlib says. Granting it makes C's own functions reachable and nothing
+// more: the library's hooks are about an operating system, so a program reaching `sysl.fs` still
+// answers them itself.
+
+private val lic_target: string = "aarch64-freestanding"
+private val lic_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private val lic_name: string = "package { name = \"probe\", version = \"0.1.0\" }\n"
+
+private val lic_granted: string =
+    s"targets {\n  $lic_target {\n    capabilities { libc = true }\n  }\n}\n"
+
+// A float specifier and a plain hole of a float, both reached from an export.
+private val lic_floats: string = raw"""
+    @export("probe")
+    probe(x: real) -> usize = f"${x}%.2f".bytes.len + s"$x".bytes.len
+    """
+
+// A program reading one file, which reaches `sysl.fs`'s hooks and answers none of them.
+private val lic_reads_a_file: string = raw"""
+    import sysl.fs.read_text
+
+    @export("probe")
+    probe() -> int = read_text("/hello.txt") match
+        Ok(s) -> int(s.bytes.len)
+        Err(_) -> -1
+    """
+
+private lic_project(program: string, config: string) -> string =
+    lbr_tree(lbr_two("main.sysl", program, "package.hocon", lic_name + config))
+
+// What `sysl build-c` answers for the project, and the archive it was asked to write.
+private lic_build_c(root: string) -> ((int, string), string)
+    val archive = s"$root/probe.a"
+
+    (lbr_cli(["sysl", "build-c", "--target", lic_target, "-o", archive, root]), archive)
+end lic_build_c
+
+// The symbols an archive leaves for its linker to find, one per line.
+private lic_undefined(archive: string) -> string = capture(lic_nm, ["-u", archive], "", [], true) match
+    Ok(o) -> o.text
+    Err(_) -> "llvm-nm could not be run"
+
+private lic_names(listing: string, symbol: string) -> bool
+    for line in lines_of(listing)
+        val word = line.trim()
+
+        if word == symbol || word.ends_with(s" $symbol") then return true
+
+    false
+end lic_names
+
+@test("without libc, a freestanding float specifier and float hole are refused, saying how to grant one")
+lic_no_libc_refuses_floats()
+    if !lbr_ready() then return
+
+    val root = lic_project(lic_floats, "")
+    val (said, _) = lic_build_c(root)
+
+    lbr_drop([root])
+    assert(said.0 != 0, "built a float specifier with no C library")
+    assert(said.1.contains(s"'%.2f' is applied by C's 'snprintf', and '$lic_target' has no C library " +
+        "under it to supply one"), said.1)
+    assert(said.1.contains(s"a plain hole of real is rendered by C's 'snprintf', and '$lic_target' " +
+        "has no C library under it to supply one"), said.1)
+    assert(said.1.contains(s"grant it in package.hocon: 'targets { $lic_target { capabilities { " +
+        "libc = true } } }'"), said.1)
+end lic_no_libc_refuses_floats
+
+@test("with libc granted for the target, the float specifier and hole build, and snprintf is left to the link")
+lic_granted_libc_builds_floats()
+    if !lbr_ready() then return
+    if !is_file(lic_nm) then skip(s"there is no llvm-nm at $lic_nm to read the archive")
+
+    val root = lic_project(lic_floats, lic_granted)
+    val (said, archive) = lic_build_c(root)
+
+    assert(said.0 == 0, said.1)
+
+    val undefined = lic_undefined(archive)
+
+    lbr_drop([root])
+    assert(lic_names(undefined, "snprintf") || lic_names(undefined, "_snprintf"), undefined)
+end lic_granted_libc_builds_floats
+
+@test("a C library granted is not an operating system: a program reaching sysl.fs still answers the hooks")
+lic_granted_libc_still_wants_hooks()
+    if !lbr_ready() then return
+
+    val root = lic_project(lic_reads_a_file, lic_granted)
+    val (said, _) = lic_build_c(root)
+
+    lbr_drop([root])
+    assert(said.0 != 0, "built with the filesystem's hooks unanswered")
+    assert(said.1.contains(s"this program reaches 'sysl.fs', and '$lic_target' has no operating " +
+        "system under it for the standard library to answer a filesystem with — the C library its " +
+        "'libc' capability grants is not an operating system — so the program answers it: define "),
+        said.1)
+end lic_granted_libc_still_wants_hooks
+
+@test("on a hosted target nothing changes: a float hole and specifier run and print")
+lic_hosted_is_unchanged()
+    if !lbr_ready() then return
+
+    val root = lic_project(raw"""
+        val x = 1.5
+
+        print(f"${x}%.2f $x")
+        """, "")
+    val printed = lbr_run(root, [])
+
+    lbr_drop([root])
+    assert_eq(printed, "1.50 1.5\n")
+end lic_hosted_is_unchanged
+
+@test("the run cache keys a freestanding build with libc granted apart from one without")
+lic_libc_changes_the_key()
+    if !std_root().is_ok() then return
+
+    val root = lic_project("print(1)\n", "")
+    val without = run_cache_key_for("run", root, Some(lic_target), DefaultOptimization, None)
+
+    write_text(s"$root/package.hocon", lic_name + lic_granted).unwrap()
+
+    val with_libc = run_cache_key_for("run", root, Some(lic_target), DefaultOptimization, None)
+
+    write_text(s"$root/package.hocon", lic_name + "capabilities { libc = true }\n").unwrap()
+
+    val project_wide = run_cache_key_for("run", root, Some(lic_target), DefaultOptimization, None)
+
+    lbr_drop([root])
+    assert(without.is_some() && with_libc.is_some() && project_wide.is_some())
+    assert(without.unwrap() != with_libc.unwrap(), "granting libc is a different program")
+    assert_eq(project_wide.unwrap(), with_libc.unwrap())
+end lic_libc_changes_the_key

@@ -110,4 +110,6 @@ no padding.
 An integer specifier is rendered by `sysl.fmt.format_int`, written in sysl, and these functions only
 compose the specifier and call it. Nothing here asks for `snprintf`, so a freestanding image that
 reaches `hex` links with no C library symbol, as one that writes `f"$v%016x"` does. A float specifier
-is different: it still needs the C library and is refused on a target without one.
+is different: it still needs the C library and is refused on a target without one — unless the
+manifest grants the target its [`libc`](/reference/packages/#capabilities), as a Pico SDK build's
+newlib does.

@@ -201,11 +201,12 @@ struct Target
     va_list: VaListAbi
     va_list_bytes: int
 
-    // The capabilities the project's manifest took away from this machine -- `heap`, `os`, `posix`
-    // -- which the registry never knows and every row starts without. **What a machine provides is
-    // read out of the manifest, not derived from the triple**, so the driver layers this on once it
-    // has read the file, and a module built for a machine that lacks one is held to it as though it
-    // had given it up itself.
+    // The capabilities the project's manifest took away from this machine -- `heap`, `os`, `posix`,
+    // `libc` -- which the registry never knows. **What a machine provides is read out of the
+    // manifest, not derived from the triple**, so the driver layers this on once it has read the
+    // file, and a module built for a machine that lacks one is held to it as though it had given it
+    // up itself. The one default the row carries is `libc` on a freestanding machine (`machine_lacks`),
+    // which a manifest has to grant rather than take away.
     lacks: Buf[string]
 
     hard_float(self) -> bool = !self.soft_float
@@ -217,6 +218,10 @@ struct Target
 
         false
     end lacks_capability
+
+    // Whether a C library is under the program, so a call only C answers -- `snprintf`, `memchr` --
+    // may be reached. Every "no C library" refusal asks this, never whether the machine is hosted.
+    provides_libc(self) -> bool = !self.lacks_capability(CapLibc)
 
     // How wide an address is here, which is the processor's answer and every target on one agrees.
     pointer_bits(self) -> usize = cpu_bits(self.cpu)
@@ -287,10 +292,22 @@ struct Target
     end unsupported
 end Target
 
-// One registry row: a machine as the registry knows it, lacking nothing until a manifest says so.
+// One registry row: a machine as the registry knows it, lacking nothing until a manifest says so --
+// except a C library on a freestanding machine, which is the manifest's to grant.
 private row(name: string, triple: string, cpu: Cpu, os: Os, soft_float: bool, fpu: string,
             no_fpu: bool, short_enums: bool, va_list: VaListAbi, va_list_bytes: int) -> Target =
-    Target(name, triple, cpu, os, soft_float, fpu, no_fpu, short_enums, va_list, va_list_bytes, buf())
+    Target(name, triple, cpu, os, soft_float, fpu, no_fpu, short_enums, va_list, va_list_bytes,
+           machine_lacks(os))
+
+// What a machine lacks before any manifest speaks: a C library where it is freestanding, and nothing
+// else.
+machine_lacks(os: Os) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if !os_hosted(os) then out.push(CapLibc)
+
+    out
+end machine_lacks
 
 // Every target the compiler knows, in the order `sysl targets` lists them.
 //
