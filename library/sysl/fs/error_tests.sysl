@@ -3,6 +3,7 @@ module sysl.fs
 @tests
 
 import sysl.path.join
+import sysl.sys.{UNSUPPORTED, host_status}
 
 // What `IoError.message()` says for a code no case names. It used to be `error 92`, a number the reader
 // then had to look up; these hold it to the C library's own sentence, written out per platform so the
@@ -59,3 +60,43 @@ end other_from_a_real_call
 named_cases_unchanged()
     assert_eq(NotFound.message(), "no such file or directory")
     assert_eq(InvalidUtf8(3).message(), "not UTF-8 at byte 3")
+
+// -- hook statuses ---------------------------------------------------------------------------------
+
+@test("a hook status is the error's code negated, so -1 is EPERM and round-trips")
+status_eperm_round_trips()
+    assert_eq(from_status(-1).code(), PermissionDenied.code())
+    assert(from_status(-1) == PermissionDenied)
+    assert(from_status(-13) == PermissionDenied)
+    assert(from_status(-2) == NotFound)
+end status_eperm_round_trips
+
+@test("exactly UNSUPPORTED is the target having no such call, and nothing else is")
+status_unsupported_is_exactly_one_value()
+    assert(from_status(UNSUPPORTED) == unsupported())
+    assert_eq(from_status(UNSUPPORTED).message(), "not supported on this target")
+    assert(from_status(-37) != unsupported())
+    assert(from_status(-39) != unsupported())
+    assert(from_status(-1) != unsupported())
+end status_unsupported_is_exactly_one_value
+
+#if bsd
+private host_enosys() -> int = 78
+private host_enotsup() -> int = 45
+private host_eopnotsupp() -> int = 102
+#else
+private host_enosys() -> int = 38
+private host_enotsup() -> int = 95
+private host_eopnotsupp() -> int = 95
+#endif
+
+@test("a host's own ENOSYS, ENOTSUP and EOPNOTSUPP become UNSUPPORTED; every other errno is negated")
+host_status_translates_the_hosts_unsupported()
+    assert_eq(host_status(host_enosys()), UNSUPPORTED)
+    assert_eq(host_status(host_enotsup()), UNSUPPORTED)
+    assert_eq(host_status(host_eopnotsupp()), UNSUPPORTED)
+    assert_eq(host_status(1), -1)
+    assert_eq(host_status(13), -13)
+    assert(from_status(host_status(host_enosys())) == unsupported())
+    assert(from_status(host_status(1)) == PermissionDenied)
+end host_status_translates_the_hosts_unsupported

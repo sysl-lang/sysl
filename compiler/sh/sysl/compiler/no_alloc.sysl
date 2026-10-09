@@ -379,14 +379,15 @@ private blame_block(a: &Analysis, walk: &Reaches, scope: Scope, b: TBlock, held:
 
         if one.is_some()
             first_span_of(stmt) match
-                Some(at) -> reaches_fault(a, walk, scope, at, refs, one.unwrap(), held)
+                Some(at) -> reaches_fault(a, walk, scope, at, refs, (one.unwrap(), one.unwrap()), held)
                 None -> ()
             return
 
     val start = if b.stmts.is_empty() then None else first_span_of(b.stmts.at(0))
     val at = if start.is_some() then start else b.result.map(r -> r.span)
 
-    if at.is_some() then reaches_fault(a, walk, scope, at.unwrap(), all, whole.unwrap(), held)
+    if at.is_some()
+        reaches_fault(a, walk, scope, at.unwrap(), all, (whole.unwrap(), whole.unwrap()), held)
 end blame_block
 
 // Everything one statement names, following nothing.
@@ -411,26 +412,31 @@ private struct FirstSpan
 private first_seen(found: &FirstSpan, e: TExpr)
     if found.span.is_none() then found.span = Some(e.span)
 
-private reaches_fault(a: &Analysis, walk: &Reaches, scope: Scope, at: Span, refs: &Refs, who: string,
-                      held: Held)
+// `named.0` is what the reader's code reached and `named.1` the allocating function that makes it
+// allocate; where the two differ, the second is said after the first as the reason.
+private reaches_fault(a: &Analysis, walk: &Reaches, scope: Scope, at: Span, refs: &Refs,
+                      named: (string, string), held: Held)
+    val (who, seed) = named
     val far = qualified_name(handle_side(a, who))
+    val through = if who == seed then "" else s" through '${qualified_name(handle_side(a, seed))}'"
 
     if held.func.is_none()
-        a.fault(scope, at, s"this reaches '$far', which makes heap storage, and ${held.why} — an " +
-                "allocator-free module may only call what is allocator-free itself")
+        a.fault(scope, at, s"this reaches '$far', which makes heap storage$through, and ${held.why} " +
+                "— an allocator-free module may only call what is allocator-free itself")
         return
     end if
 
     // **A function's refusal says what is made and by which calls**: the far end is somebody else's
     // code, often in somebody else's module, and the line to change is in the middle of the chain as
-    // often as at either end of it.
+    // often as at either end of it. Where the way runs through a trait object there is no chain of
+    // names to quote, and the seed is said as the module's refusal says it.
     var what = "heap storage"
 
     for item in held.made
-        if item.0 == who then what = item.1
+        if item.0 == seed then what = item.1
 
-    val chain = call_path(walk, refs, who)
-    var route = ""
+    val chain = call_path(walk, refs, seed)
+    var route = through
 
     if chain.len() > 1
         route = s", by the call path '${qualified_name(held.func.unwrap())}'"
@@ -464,18 +470,19 @@ private handle_side(a: &Analysis, who: string) -> string
 end handle_side
 
 // The core a handle holds, with the handle's own base: a struct of one field, that field a counted
-// reference to another struct.
+// reference to another struct -- which is not itself a handle. A struct wrapping a `Buf` (`ByteSink`)
+// has that shape too, `Buf` being a reference, but `Buf` is what a program writes and never a core.
 private held_core(t: Type) -> Option[(string, string)] = t match
     Struct(d) if d.fields.len() == 1 -> d.fields.at(0).1 match
         Ref(inner, _) -> *inner match
-            Struct(c) -> Some((d.base, c.base))
+            Struct(c) -> if held_core(*inner).is_some() then None else Some((d.base, c.base))
             _ -> None
         _ -> None
     _ -> None
 
 private blame_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, held: Held, said: &Counted)
     val own = own_refs(e)
-    val mine = least_seed(walk, own)
+    val mine = named_reach(walk, own)
 
     if mine.is_none() then return
     if reaches_a_seed(walk, strict_refs(e)) then return
@@ -492,7 +499,7 @@ private blame_write(a: &Analysis, walk: &Reaches, scope: Scope, w: TWrite, held:
 
     write_refs(out, w)
 
-    val mine = least_seed(walk, out)
+    val mine = named_reach(walk, out)
 
     if mine.is_none() then return
 

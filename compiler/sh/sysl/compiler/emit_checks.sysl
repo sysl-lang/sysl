@@ -345,6 +345,73 @@ check_image_storage(a: &Analysis, p: TProgram, own: Buf[string], entry: string)
                 "is laid straight into the image")
 end check_image_storage
 
+// **An `extern` naming `main` is a start file's call into the program**, and a bare image whose entry
+// is a symbol of its own is the one place that call has somebody to make it: the platform starts at
+// the entry, and calling `main` -- which fills the computed storage, runs the top-level statements
+// and calls a declared `main` -- is the entry's job. Everywhere else `main` is where the platform
+// itself starts, and the declaration was refused where it was written (`check_foreign_symbol`).
+//
+// So on a bare image it is refused here where the manifest names no entry, or names `main` itself;
+// and where it is allowed it has to be declared at the signature `main` is emitted at -- C's
+// `(argc, argv) -> int`, which `emit_entry.sysl` gives it whatever the program declared, since a call
+// at another signature reads arguments nobody passed.
+check_main_extern(a: &Analysis, p: TProgram, entry: string)
+    val t = a.tables.target
+
+    for x in p.externs
+        if x.symbol != "main" then continue
+
+        val home = a.tables.extern_scopes.get(x.name)
+
+        if home.is_none() then continue
+
+        val at = home.unwrap()
+
+        if p.c_artifact || entry == "" || entry == "main"
+            var starts = s"this image names no entry of its own ('targets.${t.name}.entry'), so " +
+                "'main' is where it starts"
+
+            if entry == "main" then starts = s"this image starts at 'main' ('targets.${t.name}.entry')"
+            if p.c_artifact then starts = "this archive has no entry of its own, so 'main' is the C program's"
+
+            a.fault(at.scope, at.span, s"an 'extern' may name 'main' only on an image that starts " +
+                    s"somewhere else, whose entry calls it — and $starts")
+            continue
+        end if
+
+        if !c_main_shape(x)
+            a.fault(at.scope, at.span, "'main' is defined at C's signature, '(int, **byte) -> int' " +
+                    "— the argument count and the argument vector — so an 'extern' naming it takes " +
+                    s"those, where this one is '${extern_shape(x)}'")
+end check_main_extern
+
+// Whether an `extern` is declared at the signature the program's `main` is emitted at: a 32-bit
+// signed count, a pointer, and a 32-bit signed answer -- a measured `c type` read as what it measures.
+private c_main_shape(x: TExtern) -> bool
+    if x.variadic || x.params.len() != 2 then return false
+
+    is_c_int(x.params.at(0)) && is_raw_pointer(x.params.at(1)) && is_c_int(x.ret_ty)
+end c_main_shape
+
+private is_c_int(t: Type) -> bool = nameless(t) match
+    Integer(bits, signed, _) -> bits == 32 && signed
+    _ -> false
+
+private is_raw_pointer(t: Type) -> bool = nameless(t) match
+    Ptr(_) -> true
+    _ -> false
+
+private extern_shape(x: TExtern) -> string
+    var parts: Buf[string] = buf()
+
+    for ty in x.params
+        parts.push(type_show(ty))
+
+    if x.variadic then parts.push("...")
+
+    s"(${joined_list(parts)}) -> ${type_show(x.ret_ty)}"
+end extern_shape
+
 // A module of hooks: the `extern`s a part of the standard library makes of whatever is under it, which
 // the library answers over the operating system on a hosted target (`seam_supply.sysl`) and a program
 // on a freestanding target answers itself, with an `@export` per symbol.
@@ -366,7 +433,7 @@ private hook_modules() -> Buf[HookModule]
     var rows: Buf[HookModule] = buf()
 
     rows.push(HookModule("sysl.fs.sys", "sysl.fs", "reaches 'sysl.fs'", "a filesystem",
-                         "zero or the code of an 'IoError'"))
+                         "zero or the code of an 'IoError' negated"))
     rows.push(HookModule("sysl.io.sys", "sysl.io", "reads or flushes a descriptor", "one",
                          "a count or zero, or the code of an 'IoError' negated"))
     rows.push(HookModule("sysl.process.sys", "sysl.process", "starts or waits for a process", "one",

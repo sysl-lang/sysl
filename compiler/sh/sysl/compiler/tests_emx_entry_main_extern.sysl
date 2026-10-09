@@ -1,0 +1,267 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **An `extern` naming `main` is a start file's call into the program** (`check_main_extern`): on a
+// bare image whose manifest names an entry other than `main`, a runtime written in sysl declares
+// `extern "main"` at C's `(int, **u8) -> int` and calls it, the call reaching the `main` this program
+// defines rather than a declaration beside it. Everywhere else the name stays refused.
+
+private val emx_target: string = "aarch64-freestanding"
+
+private emx_manifest(lines: string) -> string =
+    s"package { name = \"img\", version = \"0.0.1\" }\ntargets {\n  $emx_target {\n$lines  }\n}\n"
+
+private val emx_script: string =
+    "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+private emx_entry_manifest(entry: string) -> string =
+    emx_manifest(s"    linker_script = \"link.ld\"\n    entry = \"$entry\"\n")
+
+// A runtime's start, declaring `main` at this signature: it calls the program's `main` through
+// `body`, which leaves a `code` behind, and parks.
+private emx_start_with(signature: string, body: string) -> string =
+    s"extern \"main\" program_main$signature\n\n@export(\"kstart\")\n" +
+    s"kstart() -> never\n    $body\n\n    loop\n        code += 1\n"
+
+private val emx_start: string =
+    emx_start_with("(argc: int, argv: **u8) -> int", "var code = program_main(0, null)")
+
+// A project of these files, with the script beside them.
+private emx_tree(files: Buf[(string, string)]) -> string
+    var all = files
+
+    all.push(("link.ld", emx_script))
+    lbr_tree(all)
+end emx_tree
+
+private emx_image(program: string, manifest: string) -> string =
+    emx_tree(lbr_two("main.sysl", program, "package.hocon", manifest))
+
+private emx_text(project: string) -> string = emit_llvm_text(project, Some(emx_target)) match
+    Err(why) -> s"refused: ${failure_text(why)}"
+    Ok(emitted) -> if emitted.report.is_empty() then emitted.text else analysis_report(emitted.report)
+
+private emx_report(project: string, target: Option[string]) -> string =
+    emit_llvm_text(project, target) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> if emitted.report.is_empty() then "" else analysis_report(emitted.report)
+
+private emx_lines_with(text: string, head: string, word: string) -> int
+    var n = 0
+
+    for line in lines_of(text)
+        if line.starts_with(head) && line.contains(word) then n += 1
+
+    n
+end emx_lines_with
+
+private val emx_no_entry_refusal: string =
+    "an 'extern' may name 'main' only on an image that starts somewhere else, whose entry calls it"
+
+// -- what is allowed ----------------------------------------------------------------------------------
+
+@test("a runtime's extern naming main calls the main this image defines, and declares none")
+emx_runtime_calls_the_defined_main()
+    if !lbr_ready() then return
+
+    val p = emx_image(emx_start + "\nprint_nothing() = ()\n\nprint_nothing()\n", emx_entry_manifest("kstart"))
+    val text = emx_text(p)
+
+    assert(!text.starts_with("refused"), text)
+    assert_eq(emx_lines_with(text, "define ", "@main("), 1, text)
+    assert_eq(emx_lines_with(text, "declare ", "@main("), 0, text)
+    assert(text.contains("call i32 @main(i32 0, ptr null)"), text)
+    lbr_drop([p])
+end emx_runtime_calls_the_defined_main
+
+@test("an image whose only reason for a main is the runtime's call still gets one")
+emx_the_call_alone_keeps_main()
+    if !lbr_ready() then return
+
+    val p = emx_image(emx_start, emx_entry_manifest("kstart"))
+    val text = emx_text(p)
+
+    assert(!text.starts_with("refused"), text)
+    assert_eq(emx_lines_with(text, "define ", "@main("), 1, text)
+    lbr_drop([p])
+end emx_the_call_alone_keeps_main
+
+@test("computed storage the entry reads is filled, because the entry runs main")
+emx_the_call_fills_storage()
+    if !lbr_ready() then return
+
+    val start = "import tables\n\n" +
+        emx_start_with("(argc: int, argv: **u8) -> int", "var code = program_main(0, null) + tables.read()")
+    var files = lbr_two("main.sysl", start, "package.hocon", emx_entry_manifest("kstart"))
+
+    files.push(("tables/tables.sysl",
+                "module tables\n\ndouble(x: int) -> int = x * 2\n\nval N: int = double(3)\n\nread() -> int = N\n"))
+
+    val p = emx_tree(files)
+
+    assert_eq(emx_report(p, Some(emx_target)), "")
+    lbr_drop([p])
+end emx_the_call_fills_storage
+
+@test("a measured c int and any raw pointer are the signature too")
+emx_any_pointer_is_argv()
+    if !lbr_ready() then return
+
+    val start = emx_start_with("(argc: int, argv: *u64) -> int", "var code = program_main(0, null)")
+    val p = emx_image(start, emx_entry_manifest("kstart"))
+
+    assert_eq(emx_report(p, Some(emx_target)), "")
+    lbr_drop([p])
+end emx_any_pointer_is_argv
+
+// -- what is refused ----------------------------------------------------------------------------------
+
+@test("an image whose entry is main may not name it, the call starting the program again")
+emx_refused_when_the_entry_is_main()
+    if !lbr_ready() then return
+
+    val p = emx_image(emx_start, emx_entry_manifest("main"))
+    val said = emx_report(p, Some(emx_target))
+
+    assert(said.contains(emx_no_entry_refusal + " — and this image starts at 'main' " +
+                         "('targets.aarch64-freestanding.entry')"), said)
+    assert(said.contains("main.sysl:1:1"), said)
+    lbr_drop([p])
+end emx_refused_when_the_entry_is_main
+
+@test("and neither may an image that names no entry, main then being where it starts")
+emx_refused_without_an_entry()
+    if !lbr_ready() then return
+
+    val p = emx_image(emx_start, emx_manifest("    linker_script = \"link.ld\"\n"))
+    val said = emx_report(p, Some(emx_target))
+
+    assert(said.contains(emx_no_entry_refusal + " — and this image names no entry of its own " +
+                         "('targets.aarch64-freestanding.entry'), so 'main' is where it starts"), said)
+    lbr_drop([p])
+end emx_refused_without_an_entry
+
+@test("an extern naming main at another signature is refused, quoting both")
+emx_refused_at_another_signature()
+    if !lbr_ready() then return
+
+    val start = emx_start_with("() -> int", "var code = program_main()")
+    val p = emx_image(start, emx_entry_manifest("kstart"))
+    val said = emx_report(p, Some(emx_target))
+
+    assert(said.contains("'main' is defined at C's signature, '(int, **byte) -> int' — the argument count " +
+                         "and the argument vector — so an 'extern' naming it takes those, where this " +
+                         "one is '() -> int'"), said)
+    lbr_drop([p])
+end emx_refused_at_another_signature
+
+@test("a variadic one, or one answering nothing, is not C's main either")
+emx_refused_variadic_or_unit()
+    if !lbr_ready() then return
+
+    val variadic = emx_start_with("(argc: int, argv: **u8, ...) -> int", "var code = program_main(0, null)")
+    val unit = emx_start_with("(argc: int, argv: **u8)", "program_main(0, null)\n    var code = 0")
+    val p = emx_image(variadic, emx_entry_manifest("kstart"))
+    val q = emx_image(unit, emx_entry_manifest("kstart"))
+
+    assert(emx_report(p, Some(emx_target)).contains("where this one is '(int, **byte, ...) -> int'"),
+           emx_report(p, Some(emx_target)))
+    assert(emx_report(q, Some(emx_target)).contains("where this one is '(int, **byte) -> unit'"),
+           emx_report(q, Some(emx_target)))
+    lbr_drop([p, q])
+end emx_refused_variadic_or_unit
+
+@test("an extern variable at main's symbol stays refused on an image, storage never being an entry")
+emx_extern_variable_still_refused()
+    if !lbr_ready() then return
+
+    val p = emx_image("extern \"main\" entry_word: u32\n\n" + emx_start, emx_entry_manifest("kstart"))
+    val said = emx_report(p, Some(emx_target))
+
+    assert(said.contains("'main' is where the platform starts this program, so an 'extern' may not name " +
+                         "that symbol"), said)
+    lbr_drop([p])
+end emx_extern_variable_still_refused
+
+@test("a hosted program is refused where the extern is written, whatever its signature")
+emx_hosted_refused_at_the_declaration()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("main.sysl",
+                             "extern \"main\" again(argc: int, argv: **u8) -> int\n\nprint(1)\n",
+                             "package.hocon", "package { name = \"h\", version = \"0.0.1\" }\n"))
+    val said = emx_report(p, None)
+
+    assert(said.contains("'main' is where the platform starts this program, so an 'extern' may not name " +
+                         "that symbol"), said)
+    assert(said.contains("main.sysl:1:1"), said)
+    lbr_drop([p])
+end emx_hosted_refused_at_the_declaration
+
+@test("an archive for a bare machine is refused, its main being the C program's")
+emx_archive_refused()
+    if !lbr_ready() then return
+
+    val program = "extern \"main\" program_main(argc: int, argv: **u8) -> int\n\n@export(\"kstart\")\n" +
+        "kstart() -> int = program_main(0, null)\n"
+    val p = lbr_tree(lbr_two("main.sysl", program, "package.hocon",
+                             "package { name = \"arc\", version = \"0.0.1\" }\n"))
+    var args: [7]string = ["sysl", "build-c", "--target", emx_target, "-o", s"$p/probe.a", p]
+    val built = lbr_cli(args[..])
+
+    assert(built.0 != 0, built.1)
+    assert(built.1.contains(emx_no_entry_refusal + " — and this archive has no entry of its own, so " +
+                            "'main' is the C program's"), built.1)
+    lbr_drop([p])
+end emx_archive_refused
+
+// -- the image ----------------------------------------------------------------------------------------
+
+private val emx_objdump_candidates: [2]string =
+    ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+private emx_objdump() -> string
+    for c in emx_objdump_candidates
+        if is_file(c) then return c
+
+    ""
+end emx_objdump
+
+private emx_lld_present() -> bool = capture("ld.lld", ["--version"], "", [], true) match
+    Ok(o) -> o.status.ok()
+    Err(_) -> false
+
+@test("sysl build links the image, and the entry's code branches to main")
+emx_links_and_branches_to_main()
+    if !lbr_ready() then return
+    if !emx_lld_present() then skip("ld.lld is not installed, so no image can be linked")
+
+    val objdump = emx_objdump()
+
+    if objdump == "" then skip("there is no llvm-objdump to read the image")
+
+    val p = emx_image(emx_start + "\nprint_nothing() = ()\n\nprint_nothing()\n", emx_entry_manifest("kstart"))
+    val out = lbr_temp("sysl-emx-elf")
+    val said = lbr_cli(["sysl", "build", "--target", emx_target, "-O0", "-o", s"$out/img.elf", p])
+
+    assert(said.0 == 0, said.1)
+
+    val dis = capture(objdump, ["-d", "--disassemble-symbols=kstart$$sysl", s"$out/img.elf"], "", [], true).unwrap()
+
+    assert(dis.status.ok(), dis.text)
+    assert(dis.text.contains("<kstart$$sysl>:"), dis.text)
+    assert(dis.text.contains("bl\t") && dis.text.contains("<main>"), dis.text)
+
+    val table = capture(objdump, ["-t", s"$out/img.elf"], "", [], true).unwrap()
+
+    assert(table.text.contains(" main\n"), table.text)
+    lbr_drop([p, out])
+end emx_links_and_branches_to_main

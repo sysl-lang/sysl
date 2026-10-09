@@ -36,7 +36,7 @@ private const file_mode: u32 = 0o666
 /** `EIO`: what a descriptor that took nothing and reported nothing wrong is answered with, since a
  * write that makes no progress would otherwise be retried for ever.
  */
-private const stalled: int = 5
+private const stalled: int = -5
 
 /** The handle itself, and everything that is true of it beyond the descriptor.
  *
@@ -49,7 +49,8 @@ private const stalled: int = 5
  *
  * The buffer holds one direction at a time. Reading, `held[at..<filled]` is what arrived and has not
  * been handed out; writing, `held[0..<pending]` is what was written and has not been handed over.
- * `fault` is the code of the last thing that went wrong, zero while nothing has, and `ended` says a
+ * `fault` is the status of the last thing that went wrong (a code, negated, as a hook answers it),
+ * zero while nothing has, and `ended` says a
  * read has run off the end since the position was last set.
  */
 struct FileState
@@ -123,7 +124,7 @@ struct File
         var at: long = 0
         val code = fsys.seek(self.inner.fd, 0, fsys.seek_current, &at)
 
-        if code != 0 then return Err(from_errno(code))
+        if code != 0 then return Err(from_status(code))
 
         // The descriptor is past what was read ahead and short of what is still buffered.
         Ok(at + long(self.inner.pending) - long(self.inner.filled - self.inner.at))
@@ -135,7 +136,7 @@ struct File
 
         val written = drain(self.inner)
 
-        if written != 0 then return Err(from_errno(written))
+        if written != 0 then return Err(from_status(written))
 
         self.inner.at = 0
         self.inner.filled = 0
@@ -159,12 +160,12 @@ struct File
 
         val written = drain(self.inner)
 
-        if written != 0 then return Err(from_errno(written))
+        if written != 0 then return Err(from_status(written))
 
         var st = fsys.Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         val code = fsys.fstat(self.inner.fd, &st)
 
-        if code != 0 then Err(from_errno(code)) else Ok(st.size)
+        if code != 0 then Err(from_status(code)) else Ok(st.size)
     end size
 
     /** Whether a read has already run off the end. It answers about reads that **happened**, so it is
@@ -193,13 +194,13 @@ struct File
 
         val written = drain(self.inner)
 
-        if written != 0 then return Err(from_errno(written))
+        if written != 0 then return Err(from_status(written))
 
         answered(fsys.ftruncate(self.inner.fd, length))
     end truncate
 
     /** What went wrong, for a caller that has just been told by `failed` that something did. */
-    private[sysl] failure(*self) -> IoError = from_errno(self.inner.fault)
+    private[sysl] failure(*self) -> IoError = from_status(self.inner.fault)
 end File
 
 /** Hands everything buffered for writing to the descriptor, and answers zero or the code of what
@@ -278,7 +279,7 @@ impl Reader for File
         // what it had done was close it too early.
         if s.shut
             s.bad = true
-            s.fault = NotOpen.code()
+            s.fault = -NotOpen.code()
             return into[0..<0]
         end if
 
@@ -355,7 +356,7 @@ impl Writer for File
 
         if s.shut
             s.bad = true
-            s.fault = NotOpen.code()
+            s.fault = -NotOpen.code()
             return
         end if
 
@@ -423,7 +424,7 @@ private opened(path: string, flags: u32) -> Result[File, IoError]
     var fd = 0
     val code = fsys.open(as_ptr(path.bytes), path.bytes.len, flags, file_mode, &fd)
 
-    if code != 0 then return Err(from_errno(code))
+    if code != 0 then return Err(from_status(code))
 
     Ok(File(FileState(fd, false, false, 0, false, false, [0; 0], 0, 0, 0)))
 end opened
