@@ -255,7 +255,7 @@ with no words on a machine with no C library — so a kernel whose error numbers
 what they mean, and one that never thought about it is asked nothing.
 
 **A code the supplier has no words for goes to the library's own table, and only then to `error
-N`.** The table holds the numbers every platform agrees on and nothing past them: V7 Unix's 1 to 34,
+N`** — and words that are not UTF-8 count as none. The table holds the numbers every platform agrees on and nothing past them: V7 Unix's 1 to 34,
 which have meant the same thing on every Unix since (11 aside, which a BSD spends on `EDEADLK`), and
 `EAGAIN`, `ENOTEMPTY` and `EILSEQ` at this target's own number. A table claiming more would put
 Linux's words to a BSD's codes. So on a bare machine `EBUSY` says "device or resource busy" with no
