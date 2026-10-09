@@ -1710,6 +1710,14 @@ The size rounds up as well as the start, so an array keeps every element on the 
 only raise**: asking for less than the fields already need changes nothing, since lowering is what
 `@packed` is for and a type that under-promised would be unsound to pass around.
 
+The boundary travels with every value of the type the compiler lays down: a module `var` or `val`,
+a `static`, a local, an element of an array, a field of another struct — which begins on the
+boundary and raises its holder's to match — and the payload of an enum variant carrying one.
+**A value on the heap is the exception.** A box (`&T`) or a buffer takes its storage from the
+allocating pair, which promises only what `malloc` does — sixteen bytes — so a boxed value of a type
+aligned beyond that is not guaranteed its boundary, and the compiler claims no more than sixteen
+for any access through an address that might be one.
+
 **The bound is folded rather than lexed**, so a program writes the name it already has for the number,
 and arithmetic over one works:
 

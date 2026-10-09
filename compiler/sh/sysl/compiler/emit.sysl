@@ -237,6 +237,11 @@ struct Emit
     src: Option[Source]
     bounds_fails: bool
     locs: Buf[string]
+
+    // The boundary each named LLVM type holding a raised `@align(n)` is stored on, by its name: a
+    // stack slot is created from an LLVM type, and this is how it states the boundary
+    // (`slot_align`, filled by `note_raised_types`).
+    raised_types: Map[string, int]
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -392,7 +397,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          false, boxes, bufs, requested, requested_set, queue, temps, temp_marks, owned_slots, owned_marks, defers,
          defer_marks, set(), relaid, promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
          set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None, None, false,
-         None, false, buf())
+         None, false, buf(), map())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -475,10 +480,37 @@ emit(e: *Emit, i: Inst)
 // Emits a stack slot into the function's entry block rather than where it is needed. Every name is
 // unique within a function, so hoisting is safe -- and it keeps a slot inside a loop from growing
 // the stack on every iteration.
+//
+// A slot of a type holding a raised `@align(n)` is created on that boundary, LLVM's own being only
+// the widest member's.
 emit_alloca(e: *Emit, name: Val, ty: LType, align: Option[int]) -> Val
-    e.prologue.push(InAlloca(name, ty, align))
+    e.prologue.push(InAlloca(name, ty, wider_align(align, slot_align(e, ty))))
     name
 end emit_alloca
+
+// The boundary a raised `@align(n)` asks of a slot of this LLVM type, where it asks one.
+slot_align(e: *Emit, ty: LType) -> Option[int] = ty match
+    LNamed(n) -> e.raised_types.get(n)
+    LArr(_, elem) -> slot_align(e, *elem)
+    _ -> None
+
+// Records the boundary of every struct and data enum of the program that holds a raised
+// `@align(n)`, under the name LLVM knows it by.
+note_raised_types(e: *Emit, p: TProgram)
+    for i in 0..<p.structs.len()
+        p.structs.at(i) match
+            Struct(d) ->
+                if e.layout.struct_holds_raised(d)
+                    e.raised_types.put(l_render(struct_lty(d)), int(e.layout.align(Struct(d))))
+            _ -> ()
+
+    for i in 0..<p.enums.len()
+        p.enums.at(i) match
+            Enum(d) ->
+                if !d.simple && e.layout.enum_holds_raised(d)
+                    e.raised_types.put(l_render(enum_lty(d)), int(e.layout.align(Enum(d))))
+            _ -> ()
+end note_raised_types
 
 // A slot with whatever boundary the type it holds already asks for.
 alloca(e: *Emit, name: Val, ty: LType) -> Val = emit_alloca(e, name, ty, None)

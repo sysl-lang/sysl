@@ -213,20 +213,22 @@ end rarely
 // A zero-sized field holds no reference, so it is skipped by the test already -- but the index has
 // to be the slot it landed in rather than the one it was written at, or a field after one would be
 // walked at the wrong offset.
-private each_value(e: *Emit, fields: Buf[(string, Type)], aggregate: LType, value: Val, retain: bool)
+private each_value(e: *Emit, fields: Buf[(string, Type)], aggregate: LType, gaps: Option[Gaps], value: Val,
+                   retain: bool)
     for i in 0..<fields.len()
         val fty = fields.at(i).1
 
         if contains_counted(fty)
             val f = fresh_reg(e)
 
-            emit(e, InExtract(f, aggregate, value, index_list(int(field_slot(fields, i)))))
+            emit(e, InExtract(f, aggregate, value, index_list(llvm_index(gaps, field_slot(fields, i)))))
             arc_value(e, fty, f, retain)
 end each_value
 
 // The same over an aggregate at an address, reaching each member with `getelementptr` instead of
 // lifting it out of an aggregate the caller would have had to materialize first.
-private each_slot(e: *Emit, fields: Buf[(string, Type)], aggregate: LType, base: Val, retain: bool)
+private each_slot(e: *Emit, fields: Buf[(string, Type)], aggregate: LType, gaps: Option[Gaps], base: Val,
+                  retain: bool)
     for i in 0..<fields.len()
         val fty = fields.at(i).1
 
@@ -236,14 +238,14 @@ private each_slot(e: *Emit, fields: Buf[(string, Type)], aggregate: LType, base:
             var idx: Buf[IrArg] = buf()
 
             idx.push(ir_arg(l_i32(), VInt(from_int(0))))
-            idx.push(ir_arg(l_i32(), VInt(from_int(long(field_slot(fields, i))))))
+            idx.push(ir_arg(l_i32(), VInt(from_int(long(llvm_index(gaps, field_slot(fields, i)))))))
             emit(e, InGep(f, aggregate, base, idx))
             walk_at(e, fty, f, retain)
 end each_slot
 
 // The body of `arc.copy.T` / `arc.dispose.T`: the walk over a value of `T` held in `%v`.
 private walk_value(e: *Emit, ty: Type, v: Val, retain: bool) = underlying(ty) match
-    Struct(d) -> each_value(e, d.fields, struct_lty(d), v, retain)
+    Struct(d) -> each_value(e, d.fields, struct_lty(d), struct_gaps(e.layout, d), v, retain)
 
     // An array is walked with a loop rather than an unrolled chain: the element count is a
     // compile-time constant, but it can be very large, and the code for one element is not.
@@ -263,7 +265,7 @@ private walk_value(e: *Emit, ty: Type, v: Val, retain: bool) = underlying(ty) ma
 
 // The body of `arc.copy_at.T` / `arc.dispose_at.T`: the walk over a `T` at `%p`.
 private walk_slot(e: *Emit, ty: Type, p: Val, retain: bool) = underlying(ty) match
-    Struct(d) -> each_slot(e, d.fields, struct_lty(d), p, retain)
+    Struct(d) -> each_slot(e, d.fields, struct_lty(d), struct_gaps(e.layout, d), p, retain)
 
     Array(n, elem) -> arc_array(e, *elem, p, VInt(from_int(long(n))), retain, false)
 
@@ -338,9 +340,11 @@ private arc_enum(e: *Emit, d: &EnumType, tag: Val, value: Val, p: Val, retain: b
             emit_term(e, InCondBr(is, hit_l, next_l))
             emit_label(e, hit_l)
 
-            if at then each_slot(e, variant.fields, variant_lty(d, variant), payload_ptr(e, d, p),
+            val gaps = variant_gaps(e.layout, variant)
+
+            if at then each_slot(e, variant.fields, variant_lty(d, variant), gaps, payload_ptr(e, d, p),
                                  retain)
-            else each_value(e, variant.fields, variant_lty(d, variant),
+            else each_value(e, variant.fields, variant_lty(d, variant), gaps,
                             enum_payload(e, d, variant, value), retain)
 
             emit_term(e, InBr(end_l))

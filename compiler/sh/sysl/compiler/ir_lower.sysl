@@ -106,9 +106,12 @@ type_llvm(t: Type, word_bits: int) -> Option[string] = type_lty(t, word_bits) ma
 // rather than as a bare `iM` is what keeps every site that reaches into a struct -- an alloca, a
 // by-value parameter, a load of the whole of one -- on the one shape.
 //
-// `@align` is not written here. A type carries no alignment in LLVM's textual form: the boundary is
-// stated where storage is created, which is what an alloca and a global carry.
-struct_type_def(d: &StructType, word_bits: int) -> Option[IrTypeDef]
+// A type carries no alignment in LLVM's textual form, so `@align(n)` cannot be written onto it: the
+// boundary is stated where storage is created, which is what an alloca and a global carry. **Where
+// the boundary is raised, the GAPS are written here instead** (`gapped_fields`), so LLVM's offsets
+// and size are the layout's wherever the type is held.
+struct_type_def(d: &StructType, l: TargetLayout) -> Option[IrTypeDef]
+    val word_bits = int(l.word_bits)
     var fields: Buf[LType] = buf()
 
     bitfield_ranges(d) match
@@ -118,11 +121,163 @@ struct_type_def(d: &StructType, word_bits: int) -> Option[IrTypeDef]
 
             for i in 0..<stored.len()
                 type_lty(stored.at(i).1, word_bits) match
-                    Some(l) -> fields.push(l)
+                    Some(t) -> fields.push(t)
                     None -> return None
 
-    Some(IrTypeDef(s"%struct.${mangled(d.base, d.targs)}", fields, d.packed))
+    val name = s"%struct.${mangled(d.base, d.targs)}"
+
+    struct_gaps(l, d) match
+        Some(g) -> Some(IrTypeDef(name, gapped_fields(fields, g), d.packed))
+        None -> Some(IrTypeDef(name, fields, d.packed))
 end struct_type_def
+
+// -- the gaps a raised boundary writes out -------------------------------------------------------
+//
+// A struct whose `@align(n)` asks for more than its fields give it is laid out by `TargetLayout` with
+// gaps LLVM knows nothing of: in front of a field that holds one, and at the end. For every type
+// holding such a struct (`holds_raised`) each gap is written as `[k x i8]`. Each field then begins
+// exactly where LLVM would put it anyway -- the layout's offset is a multiple of the field's
+// boundary, which is at least the one LLVM gives its type, and both are powers of two -- so the
+// definition stays an ordinary one, and a `@packed` struct stays packed.
+//
+// What the gaps cost is that a field's LLVM index is no longer its stored position, so **every index
+// into a struct, a variant's payload or a data enum is asked of `llvm_index`**, and a constant of
+// one carries a zero for each gap (`gapped_values`).
+
+// Where each stored field of a run begins, how many bytes it takes, and the size of the whole.
+struct Gaps
+    offsets: Buf[usize]
+    sizes: Buf[usize]
+    size: usize
+end Gaps
+
+// A struct's gaps, where it holds a raised boundary. A bitfield struct's one integer sits at zero
+// and takes what LLVM allocates for it.
+struct_gaps(l: TargetLayout, d: &StructType) -> Option[Gaps]
+    if !l.struct_holds_raised(d) then return None
+
+    var offsets: Buf[usize] = buf()
+    var sizes: Buf[usize] = buf()
+
+    bitfield_ranges(d) match
+        Some(ranges) ->
+            offsets.push(0)
+            sizes.push(int_alloc(bitfield_bits(ranges)))
+        None ->
+            val fields = d.stored()
+            var at: usize = 0
+
+            for i in 0..<fields.len()
+                val ty = fields.at(i).1
+
+                if !d.packed then at = round_up(at, l.align(ty))
+
+                offsets.push(at)
+                sizes.push(l.size(ty))
+                at += l.size(ty)
+
+    Some(Gaps(offsets, sizes, l.size(Struct(d))))
+end struct_gaps
+
+// A carrying variant's payload aggregate: its fields end to end, as `TargetLayout` lays one.
+variant_gaps(l: TargetLayout, v: EnumVariant) -> Option[Gaps]
+    if !l.variant_holds_raised(v) then return None
+
+    val fields = v.stored()
+    var offsets: Buf[usize] = buf()
+    var sizes: Buf[usize] = buf()
+    var at: usize = 0
+    var widest: usize = 1
+
+    for i in 0..<fields.len()
+        val ty = fields.at(i).1
+        val a = l.align(ty)
+
+        if a > widest then widest = a
+
+        at = round_up(at, a)
+        offsets.push(at)
+        sizes.push(l.size(ty))
+        at += l.size(ty)
+
+    Some(Gaps(offsets, sizes, round_up(at, widest)))
+end variant_gaps
+
+// A data enum: the tag, and the payload region where the layout puts it.
+enum_gaps(l: TargetLayout, d: &EnumType) -> Option[Gaps]
+    if d.simple || !l.enum_holds_raised(d) then return None
+
+    val unit = l.payload_align(d)
+    var offsets: Buf[usize] = buf()
+    var sizes: Buf[usize] = buf()
+
+    offsets.push(0)
+    sizes.push(4)
+    offsets.push(round_up(4, unit))
+    sizes.push(round_up(l.payload_size(d), unit))
+    Some(Gaps(offsets, sizes, l.size(Enum(d))))
+end enum_gaps
+
+// Whether a gap goes in front of the `k`th field (and, at `k` == the field count, at the end).
+private gap_before(g: Gaps, k: usize) -> usize
+    val end_of_previous = if k == 0 then 0 else g.offsets.at(k - 1) + g.sizes.at(k - 1)
+    val start = if k < g.offsets.len() then g.offsets.at(k) else g.size
+
+    if start > end_of_previous then start - end_of_previous else 0
+end gap_before
+
+private gap_lty(bytes: usize) -> LType = LArr(int(bytes), LInt(8))
+
+// **The one answer to "where is stored field `k` in LLVM's numbering"**: its position, plus one for
+// each gap in front of it and in front of any field before it.
+llvm_index(g: Option[Gaps], k: usize) -> int = g match
+    Some(gaps) ->
+        var at = int(k)
+
+        for j in 0..<k + 1
+            if j < gaps.offsets.len() && gap_before(gaps, j) > 0 then at += 1
+
+        at
+    None -> int(k)
+
+// A definition's fields with each gap written in.
+gapped_fields(fields: Buf[LType], g: Gaps) -> Buf[LType]
+    var out: Buf[LType] = buf()
+
+    for k in 0..<fields.len() + 1
+        val gap = gap_before(g, k)
+
+        if gap > 0 then out.push(gap_lty(gap))
+        if k < fields.len() then out.push(fields.at(k))
+
+    out
+end gapped_fields
+
+// A constant's fields with a zero for each gap.
+gapped_values(values: Buf[IrArg], g: Option[Gaps]) -> Buf[IrArg]
+    val gaps = g match
+        Some(x) -> x
+        None -> return values
+
+    var out: Buf[IrArg] = buf()
+
+    for k in 0..<values.len() + 1
+        val gap = gap_before(gaps, k)
+
+        if gap > 0 then out.push(ir_arg(gap_lty(gap), VZero))
+        if k < values.len() then out.push(values.at(k))
+
+    out
+end gapped_values
+
+// The index of a struct's `k`th stored field.
+struct_field_index(l: TargetLayout, d: &StructType, k: usize) -> int = llvm_index(struct_gaps(l, d), k)
+
+// The index of a variant payload's `k`th stored field.
+variant_field_index(l: TargetLayout, v: EnumVariant, k: usize) -> int = llvm_index(variant_gaps(l, v), k)
+
+// The index of a data enum's payload region, behind its tag.
+enum_payload_index(l: TargetLayout, d: &EnumType) -> int = llvm_index(enum_gaps(l, d), 1)
 
 // A data enum's definitions: one aggregate per variant that carries something, and then the enum
 // itself.
@@ -147,14 +302,24 @@ enum_type_defs(d: &EnumType, l: TargetLayout) -> Buf[IrTypeDef]
                     Some(t) -> fields.push(t)
                     None -> whole = false
 
-            if whole then out.push(ir_type_def(l_render(variant_lty(d, v)), fields))
+            if whole
+                val laid = variant_gaps(l, v) match
+                    Some(g) -> gapped_fields(fields, g)
+                    None -> fields
+
+                out.push(ir_type_def(l_render(variant_lty(d, v)), laid))
 
     val area = payload_area(d, l)
     var body: Buf[LType] = buf()
 
     body.push(LInt(32))
     body.push(LArr(area.1, area.0))
-    out.push(ir_type_def(l_render(enum_lty(d)), body))
+
+    val laid = enum_gaps(l, d) match
+        Some(g) -> gapped_fields(body, g)
+        None -> body
+
+    out.push(ir_type_def(l_render(enum_lty(d)), laid))
     out
 end enum_type_defs
 
