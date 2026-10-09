@@ -682,3 +682,65 @@ fsh_unsupported_hook_is_an_io_error()
               "still there: true\ncanonicalize: not supported on this target\ntrue\n")
     lbr_drop([p])
 end fsh_unsupported_hook_is_an_io_error
+
+@test("copy_dir_all on a target whose chmod hook answers -1 copies the tree and carries nothing")
+fsh_copy_dir_all_without_permission_bits()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.{make_temp_dir, make_dir_all, write_text, read_text, copy_dir_all, remove_dir_all, is_dir}
+        import sysl.path.join
+
+        @export("sysl_fs_chmod")
+        no_chmod(path: *u8, len: usize, mode: u32) -> int = -1
+
+        val d = make_temp_dir("fsh").unwrap()
+        val from = join(d, "src")
+        val to = join(d, "dst")
+
+        make_dir_all(join(from, "a/b")).unwrap()
+        write_text(join(from, "top"), "1").unwrap()
+        write_text(join(from, "a/b/deep"), "2").unwrap()
+
+        copy_dir_all(from, to) match
+            Ok(_) -> print("copied")
+            Err(e) -> print(s"copy: $e")
+
+        print(is_dir(join(to, "a/b")))
+        print(read_text(join(to, "top")).unwrap())
+        print(read_text(join(to, "a/b/deep")).unwrap())
+
+        remove_dir_all(d).unwrap()
+        """)
+
+    assert_eq(lbr_run(p, []), "copied\ntrue\n1\n2\n")
+    lbr_drop([p])
+end fsh_copy_dir_all_without_permission_bits
+
+@test("copy_dir_all still fails when the chmod hook answers a real error")
+fsh_copy_dir_all_chmod_real_error_fails()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.{make_temp_dir, make_dir_all, write_text, copy_dir_all, remove_dir_all}
+        import sysl.path.join
+
+        @export("sysl_fs_chmod")
+        deny_chmod(path: *u8, len: usize, mode: u32) -> int = -13
+
+        val d = make_temp_dir("fsh").unwrap()
+        val from = join(d, "src")
+
+        make_dir_all(from).unwrap()
+        write_text(join(from, "top"), "1").unwrap()
+
+        copy_dir_all(from, join(d, "dst")) match
+            Ok(_) -> print("copied")
+            Err(e) -> print(s"copy failed: ${e.code()}")
+
+        remove_dir_all(d).unwrap()
+        """)
+
+    assert_eq(lbr_run(p, []), "copy failed: -13\n")
+    lbr_drop([p])
+end fsh_copy_dir_all_chmod_real_error_fails

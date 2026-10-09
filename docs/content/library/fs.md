@@ -952,7 +952,9 @@ a file is asked nothing.
 `copy_dir_all` and `publish_dir` are `entries` and `link_metadata` with a leaf action, and
 `make_temp_dir` and `canonicalize` are the `temp_dir` and `realpath` hooks. A supplier fills `Stat`'s
 thirteen numbers in POSIX's shape and leaves zero what it has nothing to say about; a hook it answers
-`-1` comes back from these calls as `Other(-1)`, *not supported on this target*.
+`-1` comes back from these calls as `Other(-1)`, *not supported on this target*. The one exception is
+the permission step of `copy_dir_all`: a target whose `chmod` answers `-1` has no permission bits, so
+there is nothing to carry and the copy goes on; any other error from it still fails the copy.
 
 ## What is absent, and why
 

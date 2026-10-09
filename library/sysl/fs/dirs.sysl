@@ -229,7 +229,9 @@ end remove_dir_all
  *
  * **Permissions are carried**, which is where this differs from `copy_file` -- an executable copied
  * with that one stops being executable, and this org copies build inputs. A symbolic link is copied
- * *as a link*, pointing wherever it pointed, which may be nothing and may be outside the tree.
+ * *as a link*, pointing wherever it pointed, which may be nothing and may be outside the tree. A
+ * target whose `chmod` is unsupported has no permission bits to carry, and the copy goes on without
+ * them; any other error from setting them fails the copy.
  *
  * **A failure part way through leaves what it has already written.** Nothing here removes a tree on
  * the way out, because it cannot know whether the destination existed before it started, and
@@ -265,7 +267,11 @@ copy_dir_all(from: string, to: string) -> Result[unit, IoError]
 
             copy_file(e.path, dst)?
 
-        set_permissions(dst, e.meta.permissions())?
+        // A target whose filesystem has no permission bits answers `chmod` as unsupported; there is
+        // nothing to carry there, so that one answer is not a failure. Any other error is.
+        set_permissions(dst, e.meta.permissions()) match
+            Err(err) -> if err != unsupported() then return Err(err)
+            Ok(_) -> ()
 
     Ok(())
 end copy_dir_all
