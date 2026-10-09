@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, is_file}
 import sysl.process.capture
@@ -38,39 +39,61 @@ private qd_run(text: string) -> string
     qd_build_run(root)
 end qd_run
 
+// A program lowered in process for `target` or the host, the library read from source -- a machine
+// other than this one has no sysroot here to build the standard module's C against. The answer is
+// `Err` with every diagnostic, or `Ok` with the LLVM text.
+private qd_lowered(target: Option[string], text: string) -> Result[string, string]
+    val t = target match
+        Some(name) -> target_named(name).unwrap()
+        None -> host_target()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("main.sysl", text))
+
+    if !parsed.ok() then return Err(parsed.report.at(0).message)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val errors = errors_of(done.an.diagnostics())
+
+    if !errors.is_empty() then return Err(analysis_report(errors))
+
+    Ok(ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0))
+end qd_lowered
+
 // Every diagnostic a program earns, through the lowering, for `target` or the host.
-private qd_err_for(target: Option[string], text: string) -> string
+private qd_err_for(target: Option[string], text: string) -> string = qd_lowered(target, text) match
+    Err(why) -> why
+    Ok(_) -> ""
+
+// The host's, through the driver as `sysl emit-llvm` runs it.
+private qd_err(text: string) -> string
     val root = make_temp_dir("sysl-qd").unwrap()
     val src = s"$root/main.sysl"
 
     write_text(src, text).unwrap()
 
-    val out = emit_llvm_text(src, target) match
+    val out = emit_llvm_text(src, None) match
         Err(why) -> why.message
         Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
 
     remove_dir_all(root).unwrap_or(())
     out
-end qd_err_for
-
-private qd_err(text: string) -> string = qd_err_for(None, text)
+end qd_err
 
 // The LLVM text of a program that must compile.
-private qd_ir_for(target: Option[string], text: string) -> string
-    val root = make_temp_dir("sysl-qd").unwrap()
-    val src = s"$root/main.sysl"
-
-    write_text(src, text).unwrap()
-
-    val out = emit_llvm_text(src, target) match
-        Err(why) -> s"did not compile: ${why.message}"
-        Ok(made) ->
-            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
-            else made.text
-
-    remove_dir_all(root).unwrap_or(())
-    out
-end qd_ir_for
+private qd_ir_for(target: Option[string], text: string) -> string = qd_lowered(target, text) match
+    Err(why) -> s"did not compile: $why"
+    Ok(ir) -> ir
 
 private qd_has(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
 
@@ -101,7 +124,7 @@ qd_a_literal_is_rounded_once_from_its_text()
     assert_eq(qd_text("0.3"), (0x3FFD333333333333, 0x3333333333333333))
     assert_eq(qd_text("123456789012345678901234567890.0"), (0x405F8EE90FF6C373, 0xE0EE4E3F0AD20000))
     // (2^53 + 1)^2 needs 107 bits and binary128 has 113, so it is exact where a double is not.
-    assert_eq(qd_text("81129638414606717783830213328897.0"), (0x4069000000000000, 0x1000000000000040))
+    assert_eq(qd_text("81129638414606699710187514626049.0"),(0x4069000000000000, 0x1000000000000040))
 
 @test("the ends of the range: the largest finite value, the smallest subnormal, and past both")
 qd_the_ends_of_the_range()
@@ -243,7 +266,7 @@ qd_every_bit_agrees_with_apfloat()
             calls = calls + s"print(op($k, 0x${hex_upper(p.0, 16)}${hex_upper(p.1, 16)}, " +
                     s"0x${hex_upper(p.2, 16)}${hex_upper(p.3, 16)}))\n"
 
-    // APFloat's answers: each global as LLVM prints it, `f0x` and the high half first.
+    // APFloat's answers: each global as LLVM prints it, `0xL` and the LOW half first.
     val root = make_temp_dir("sysl-qd").unwrap()
 
     write_text(s"$root/oracle.c", c).unwrap()
@@ -292,10 +315,10 @@ qd_every_bit_agrees_with_apfloat()
 
         // A value APFloat prints in decimal is one that reads back from six digits -- a zero, an
         // infinity, a small integer -- and is checked by the named tests rather than parsed here.
-        if !want.starts_with("f0x") then continue
+        if !want.starts_with("0xL") then continue
 
-        val hi = u128(parse_hex(want[3..<19]))
-        val lo = u128(parse_hex(want[19..<35]))
+        val lo = u128(parse_hex(want[3..<19]))
+        val hi = u128(parse_hex(want[19..<35]))
         val got = printed[i]
 
         compared += 1
@@ -437,7 +460,8 @@ qd_crosses_as_fp128()
     for machine in ["aarch64-linux", "riscv64-linux", "aarch64-freestanding"]
         val ir = qd_ir_for(Some(machine), text)
 
-        qd_has(ir, "declare fp128 @half(fp128")
+        // A bare machine's declarations are `dso_local`, so the shape is matched after the word.
+        qd_has(ir, "fp128 @half(fp128")
         qd_has(ir, "fp128 @twice(fp128")
 
 @test("an HFA of binary128 travels in Q registers, a sixteen-byte stack slot apart")

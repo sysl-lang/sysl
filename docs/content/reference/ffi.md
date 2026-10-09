@@ -2358,13 +2358,13 @@ true
 On x86 `long double` is the x87 80-bit extended format, which sysl has no type for, so it is refused
 there, naming the format:
 
-```sysl target=x86_64-linux
+```sysl target=x86_64-freestanding
 c type
     LongDouble = "long double"
 ```
 
 ```error
-is a 'long double' with 64 bits of significand on 'x86_64-linux' — the x87 extended format, which sysl has no type for
+is a 'long double' with 64 bits of significand on 'x86_64-freestanding' — the x87 extended format, which sysl has no type for
 ```
 
 `f128` itself crosses to C as `fp128`, as clang passes a binary128 `long double`, and an exported
