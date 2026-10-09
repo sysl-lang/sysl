@@ -120,6 +120,8 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
         if !member_attr_word(word)
             if word == "assert"
                 p.fault(at, "'@assert' stands where a declaration stands, and a type's body holds its members — write it beside the type rather than inside it, where 'sizeof' and 'offsetof' still name what it is about")
+            else if word == "align" || word == "packed"
+                p.fault(at, layout_attr_on_member(word))
             else
                 p.fault(at, member_attr_refusal())
 
@@ -139,6 +141,17 @@ end parse_member_attrs
 
 private member_attr_refusal() -> string =
     "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@reads' and '@writes' — and the three about the function it lowers to, '@noinline', '@inline' and '@cold'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
+
+// A layout annotation above a field (or any member) is about the wrong thing rather than about a
+// function: `@packed` and `@align(n)` lay out a whole struct, and `@align(n)` marks one binding's
+// storage. A field begins on its own type's boundary, so one that needs a wider boundary takes a type
+// declared with it -- the boundary travels with every value of that type, fields included.
+private layout_attr_on_member(word: string) -> string
+    if word == "packed"
+        return "'@packed' says how a struct's fields are laid out, so it stands above the struct — a field or another member has no fields of its own to pack"
+
+    "'@align(n)' is the boundary a whole struct begins on, or one 'var' or 'val''s storage, so it stands above the struct or the binding — a field begins on its own type's boundary, so a field that needs a wider one takes a type declared '@align(n)', which carries the boundary to every value of it, a field included"
+end layout_attr_on_member
 
 private member_attr_word(w: string) -> bool
     for word in ["crossing", "borrows", "reads", "writes", "noinline", "inline", "cold"]

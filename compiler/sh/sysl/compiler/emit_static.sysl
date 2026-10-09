@@ -28,15 +28,26 @@ gen_vals(e: *Emit, vals: Buf[TVal]) -> Buf[IrGlobal]
 
         val init = val_init(e, v)
 
-        val align = v.align match
+        // The binding's own `@align(n)`, or the boundary its type raises -- the greater of the two.
+        val own: Option[int] = v.align match
             Some(n) -> Some(int(n))
             None -> None
+
+        val align = wider_align(own, e.layout.storage_align(v.ty))
 
         out.push(IrGlobal(v.symbol, !(v.computed || v.writable), lty(e, v.ty), Some(init),
                           LinkPrivate, v.section, align, v.thread_local, false))
 
     out
 end gen_vals
+
+// The greater of two boundaries either of which may be unstated.
+wider_align(a: Option[int], b: Option[int]) -> Option[int] = b match
+    Some(y) ->
+        a match
+            Some(x) -> if x >= y then Some(x) else Some(y)
+            None -> Some(y)
+    None -> a
 
 // `@llvm.used` -- the symbols this module places by hand and nothing in it reads. It is what keeps
 // the feature from compiling, linking and placing nothing: a table gathered by a linker script has
@@ -111,7 +122,8 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
 
             if !zero_sized(ft) then fields.push(ir_arg(lty(e, ft), constant_value(e, args.at(i))))
 
-        VAgg(fields)
+        // A raised boundary's gaps are fields of the definition, so they are zeros here.
+        VAgg(gapped_values(fields, struct_gaps(e.layout, decl)))
 
     // A device address written as a number: `inttoptr` is a constant expression, so the pointer is in
     // the object file rather than stored into it by a prologue.
@@ -120,7 +132,9 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
     // A trait pointer is two words, so its empty value is not the one-word `null`.
     TNullLit(ty) -> if erased(underlying(ty)) then VZero else VNull
 
-    // A variant that carries nothing is a tag and a payload region nothing will read.
+    // A variant that carries nothing is a tag and a payload region nothing will read -- except in a
+    // simple enum, which is its underlying integer and nothing else, so its constant is the bare tag
+    // at that width: the value the program wrote, not a `{ tag, region }` pair.
     TEnumNew(en, variant, _) ->
         if variant.carries then gap_at(e, "a constant enum variant that carries a payload")
         else if variant.tag == 0 then VZero
@@ -129,13 +143,15 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
                 Enum(decl) -> decl
                 _ -> return gap_at(e, "a constant enum of something that is not an enum")
 
+            if d.simple then return VInt(from_int(long(variant.tag)))
+
             val area = payload_area(d, e.layout)
 
             var fields: Buf[IrArg] = buf()
 
             fields.push(ir_arg(l_i32(), VInt(from_int(long(variant.tag)))))
             fields.push(ir_arg(LArr(area.1, area.0), VZero))
-            VAgg(fields)
+            VAgg(gapped_values(fields, enum_gaps(e.layout, d)))
 
     _ -> gap_at(e, s"a constant ${texpr_kind_name(t)}")
 

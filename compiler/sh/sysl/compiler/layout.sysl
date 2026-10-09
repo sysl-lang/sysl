@@ -93,10 +93,17 @@ struct LayoutMemo
     structs: Map[usize, (&StructType, usize, usize)]
     enums: Map[usize, (&EnumType, usize, usize)]
     computed: usize
+
+    // Whether a struct or enum record holds a raised boundary in its own bytes (`holds_raised`).
+    raised: Map[usize, bool]
 end LayoutMemo
 
 // A memo with nothing measured in it.
-layout_memo() -> &LayoutMemo = LayoutMemo(map(), map(), 0)
+layout_memo() -> &LayoutMemo = LayoutMemo(map(), map(), 0, map())
+
+// The most a pointer into the heap may be assumed aligned to: what the allocating pair promises,
+// which is `malloc`'s.
+const HeapAlign: usize = 16
 
 // The measurements one target makes.
 //
@@ -319,6 +326,112 @@ struct TargetLayout
     end enum_size
 
     private enum_align(self, e: &EnumType) -> usize = max_usize(4, self.payload_align(e))
+
+    // -- a boundary `@align(n)` raises -------------------------------------------------------------
+    //
+    // LLVM's textual types carry no alignment: a named struct is aligned to the widest of its members
+    // and nothing can say more. So where `@align(n)` asks for more than a struct's fields give it,
+    // LLVM's layout and this one part company -- everywhere the type is held, not only at its own
+    // storage. `ir_lower.sysl` writes the gaps out for every type that holds one (`gapped_fields`),
+    // and storage of one states the boundary where it is created.
+
+    // Whether `@align(n)` on this struct asks for more than its fields already give it.
+    raises(self, d: &StructType) -> bool
+        if d.base == TaskBase then return false
+
+        val n = d.min_align match
+            Some(k) -> k
+            None -> return false
+
+        var natural: usize = 1
+
+        if !d.packed && bitfield_ranges(d).is_none()
+            val fields = d.stored()
+
+            for i in 0..<fields.len()
+                natural = max_usize(natural, self.align(fields.at(i).1))
+
+        n > natural
+    end raises
+
+    // Whether a value of the type holds a raised struct anywhere in its own bytes -- the struct
+    // itself, a struct, tuple or array holding one, a data enum one of whose variants does.
+    holds_raised(self, t: Type) -> bool = underlying(t) match
+        Struct(d) -> self.struct_holds_raised(d)
+        Array(_, elem) -> self.holds_raised(*elem)
+        Enum(d) -> !d.simple && self.enum_holds_raised(d)
+        _ -> false
+
+    struct_holds_raised(self, d: &StructType) -> bool
+        if d.base == TaskBase then return false
+
+        val p: *StructType = &*d
+        val key = usize(p)
+
+        self.memo match
+            Some(m) ->
+                m.raised.get(key) match
+                    Some(hit) -> return hit
+                    None -> ()
+            None -> ()
+
+        var answer = self.raises(d)
+        val fields = d.stored()
+
+        for i in 0..<fields.len()
+            if !answer && self.holds_raised(fields.at(i).1) then answer = true
+
+        self.memo match
+            Some(m) -> m.raised.put(key, answer)
+            None -> ()
+
+        answer
+    end struct_holds_raised
+
+    enum_holds_raised(self, d: &EnumType) -> bool
+        val p: *EnumType = &*d
+        val key = usize(p)
+
+        self.memo match
+            Some(m) ->
+                m.raised.get(key) match
+                    Some(hit) -> return hit
+                    None -> ()
+            None -> ()
+
+        var answer = false
+
+        for i in 0..<d.variants.len()
+            if self.variant_holds_raised(d.variants.at(i)) then answer = true
+
+        self.memo match
+            Some(m) -> m.raised.put(key, answer)
+            None -> ()
+
+        answer
+    end enum_holds_raised
+
+    variant_holds_raised(self, v: EnumVariant) -> bool
+        if !v.carries then return false
+
+        val fields = v.stored()
+
+        for i in 0..<fields.len()
+            if self.holds_raised(fields.at(i).1) then return true
+
+        false
+    end variant_holds_raised
+
+    // The boundary storage of the type is CREATED on -- a slot or a global -- where LLVM's own would
+    // be less: only a type holding a raised struct needs saying.
+    storage_align(self, t: Type) -> Option[int] =
+        if self.holds_raised(t) then Some(int(self.align(t))) else None
+
+    // The boundary an access may CLAIM through an address of a value of the type. An address may be
+    // into a box, whose storage is the allocating pair's and promised only `HeapAlign`, so a raised
+    // boundary is never claimed beyond it: a claim the storage does not keep is a miscompile.
+    claim(self, t: Type) -> usize =
+        if self.holds_raised(t) && self.align(t) > HeapAlign then HeapAlign else self.align(t)
 end TargetLayout
 
 // The layout a target measures with, remembering nothing: the one the analysis uses, while the

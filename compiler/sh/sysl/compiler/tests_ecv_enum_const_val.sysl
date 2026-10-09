@@ -1,0 +1,85 @@
+module sh.sysl.compiler
+@tests
+
+// **A module `val` holding an enum variant is constant data at every variant position.** A simple
+// enum is its underlying integer (`reference/types.md § Enums`), so its constant is the bare tag at
+// that width -- it was written as a data enum's `{ tag, region }` pair, which clang refuses
+// ("constant expression type mismatch") for every variant but the first, the first being a
+// `zeroinitializer` either way. Found by the keel kernel (FINDINGS 15).
+//
+// Every test builds and runs the program, so clang accepting the text is part of each.
+
+private ecv_wide() -> string = "enum Wide\n    A\n    B\n    C\n\n"
+
+@test("a simple enum's 'val' is its tag at every variant position")
+ecv_every_variant_position()
+    if !enm_ready() then return
+
+    val src = ecv_wide() + "val VA: Wide = A\nval VB: Wide = B\nval VC: Wide = C\n\nmain()\n" +
+        "    print(Wide::Image(VA), Wide::Image(VB), Wide::Image(VC))\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "@VB = private constant i32 1\n"), ir)
+    assert(enm_says(ir, "@VC = private constant i32 2\n"), ir)
+    assert_eq(enm_ran(src), "A B C\n")
+
+@test("a simple enum inside a struct 'val' is its tag")
+ecv_inside_a_struct()
+    if !enm_ready() then return
+
+    val src = ecv_wide() + "struct P2\n    w: Wide\n    n: u8\n\nval W: P2 = P2(C, 4u8)\n\nmain()\n" +
+        "    print(Wide::Image(W.w), W.n)\n"
+
+    assert(enm_says(enm_ir(src), "@W = private constant %struct.P2 { i32 2, i8 4 }"), enm_ir(src))
+    assert_eq(enm_ran(src), "C 4\n")
+
+@test("an enum with an underlying type is its tag at that width")
+ecv_an_underlying_width()
+    if !enm_ready() then return
+
+    val src = "enum Access: u2\n    No\n    Rw\n    Ro\n\nval BARE: Access = Ro\nval RW: Access = Rw\n\n" +
+        "main()\n    print(Access::Image(BARE), Access::Image(RW))\n"
+
+    assert(enm_says(enm_ir(src), "@RW = private constant i2 1\n"), enm_ir(src))
+    assert_eq(enm_ran(src), "Ro Rw\n")
+
+@test("a variant's written discriminant is the constant, not its position")
+ecv_a_written_discriminant()
+    if !enm_ready() then return
+
+    val src = "enum Gap\n    A = 5\n    B = 10\n\nval G: Gap = B\n\nmain()\n    print(Gap::Image(G))\n"
+
+    assert(enm_says(enm_ir(src), "@G = private constant i32 10\n"), enm_ir(src))
+    assert_eq(enm_ran(src), "B\n")
+
+@test("an array 'val' of enum variants is constant data")
+ecv_an_array_of_variants()
+    if !enm_ready() then return
+
+    val src = ecv_wide() + "val ROW: [3]Wide = [C, A, B]\n\nmain()\n" +
+        "    print(Wide::Image(ROW[0]), Wide::Image(ROW[1]), Wide::Image(ROW[2]))\n"
+
+    // The first variant is the zero value, which LLVM takes at any type.
+    assert(enm_says(enm_ir(src), "@ROW = private constant [3 x i32] [i32 2, i32 zeroinitializer, i32 1]"),
+           enm_ir(src))
+    assert_eq(enm_ran(src), "C A B\n")
+
+@test("a data enum's later variant that carries nothing is a tag and an empty region")
+ecv_a_data_enum_later_variant()
+    if !enm_ready() then return
+
+    val src = "enum Shape\n    Circle(r: int)\n    Dot\n    Empty\n\nval E: Shape = Empty\n\nmain()\n" +
+        "    E match\n        Empty -> print(\"empty\")\n        _ -> print(\"other\")\n"
+
+    assert(enm_says(enm_ir(src), "@E = private constant %enum.Shape { i32 2, "), enm_ir(src))
+    assert_eq(enm_ran(src), "empty\n")
+
+@test("a variant that carries a payload is filled before the program runs")
+ecv_a_payload_variant()
+    if !enm_ready() then return
+
+    val src = "enum Shape\n    Dot\n    Circle(r: int)\n\nval S: Shape = Circle(5)\n\nmain()\n" +
+        "    S match\n        Circle(r) -> print(r)\n        Dot -> print(\"dot\")\n"
+
+    assert(enm_says(enm_ir(src), "@S = private global %enum.Shape zeroinitializer"), enm_ir(src))
+    assert_eq(enm_ran(src), "5\n")

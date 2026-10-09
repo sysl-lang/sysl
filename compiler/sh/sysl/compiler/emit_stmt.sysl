@@ -297,7 +297,8 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
                             var idx: Buf[IrArg] = buf()
 
                             idx.push(ir_arg(l_i32(), VInt(from_int(0))))
-                            idx.push(ir_arg(l_i32(), VInt(from_int(long(decl.slot(i))))))
+                            idx.push(ir_arg(l_i32(), VInt(from_int(long(struct_field_index(e.layout, decl,
+                                                                                            decl.slot(i)))))))
                             emit(e, InGep(p, struct_lty(decl), dest, idx))
                             gen_borrowed_into(e, p, args.at(i))
 
@@ -306,7 +307,7 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
 
             if is_constant_table(elems)
                 emit_memcpy(e, dest, constant_table(e, x, array_ty), int(e.layout.size(array_ty)),
-                            int(e.layout.align(array_ty)))
+                            int(e.layout.claim(array_ty)))
                 return
 
             for i in 0..<elems.len()
@@ -340,7 +341,8 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
 
                                     idx.push(ir_arg(l_i32(), VInt(from_int(0))))
                                     idx.push(ir_arg(l_i32(),
-                                                    VInt(from_int(long(variant.slot(i))))))
+                                                    VInt(from_int(long(variant_field_index(e.layout, variant,
+                                                                                           variant.slot(i)))))))
                                     emit(e, InGep(p, variant_lty(d, variant), base, idx))
                                     gen_borrowed_into(e, p, args.at(i))
                 None -> store_through_value(e, dest, x, ty)
@@ -358,7 +360,7 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
         _ ->
             if has_address(x)
                 emit_memcpy(e, dest, address(e, x), int(e.layout.size(ty)),
-                            int(e.layout.align(ty)))
+                            int(e.layout.claim(ty)))
             else store_through_value(e, dest, x, ty)
 end gen_borrowed_into
 
@@ -705,8 +707,8 @@ gen_variant_at_call(e: *Emit, staged: Buf[(int, Val)])
             val addr = VReg(s"${p.0}.addr")
 
             if s.0 == StagedSlot
-                emit_memcpy(e, keep, addr, int(e.layout.size(p.1)), int(e.layout.align(p.1)))
-                emit_memcpy(e, addr, s.1, int(e.layout.size(p.1)), int(e.layout.align(p.1)))
+                emit_memcpy(e, keep, addr, int(e.layout.size(p.1)), int(e.layout.claim(p.1)))
+                emit_memcpy(e, addr, s.1, int(e.layout.size(p.1)), int(e.layout.claim(p.1)))
             else
                 val old = fresh_reg(e)
 
@@ -727,7 +729,7 @@ gen_variant_at_call(e: *Emit, staged: Buf[(int, Val)])
         val addr = VReg(s"${sv.0}.addr")
 
         if e.layout.indirect(sv.1)
-            emit_memcpy(e, addr, sv.2, int(e.layout.size(sv.1)), int(e.layout.align(sv.1)))
+            emit_memcpy(e, addr, sv.2, int(e.layout.size(sv.1)), int(e.layout.claim(sv.1)))
         else
             val back = fresh_reg(e)
 
@@ -830,7 +832,7 @@ emit_inv_check(e: *Emit, v: Val, d: &StructType, inv_fn: string)
                 None ->
                     val t = fresh_reg(e)
 
-                    emit(e, InExtract(t, struct_lty(d), v, index_list(int(d.slot(i)))))
+                    emit(e, InExtract(t, struct_lty(d), v, index_list(struct_field_index(e.layout, d, d.slot(i)))))
                     t
 
             args.push(ir_arg(lty(e, ft), r))
