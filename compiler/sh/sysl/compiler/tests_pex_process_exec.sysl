@@ -1,0 +1,230 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.Search
+
+// **`sysl.process.exec`: a program replacing itself with another, over the `sysl_proc_exec` hook.**
+//
+// On a hosted POSIX target the library's `sysl.process.hosted` answers the hook over `execve`, under a
+// `weak` export; on a freestanding one the program answers it with an `@export`, and one that reaches
+// `exec` and leaves the hook unanswered is refused when it is compiled (`emit_checks.sysl`'s
+// `check_library_hooks`, the `sysl.process.sys` row). What a failed `exec` answers in-process is
+// `library/sysl/process/exec_tests.sysl`'s; a success can only be watched from outside, so the hosted
+// cases here build a child program that calls it and read what the child became.
+
+private val pex_target: string = "aarch64-freestanding"
+private val pex_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+// What the program a build of `text` makes writes to its standard output -- a file here, not a
+// terminal, so a C library buffers it fully.
+private pex_ran(text: string) -> string
+    val p = lbr_program(text)
+    val out = lbr_run(p, [])
+
+    lbr_drop([p])
+    out
+end pex_ran
+
+// -- a hosted target ----------------------------------------------------------------------------------
+
+@test("a program that execs echo becomes echo, and the call never comes back")
+pex_exec_becomes_the_program()
+    if !lbr_ready() then return
+
+    assert_eq(pex_ran(raw"""
+        import sysl.process.exec
+
+        val e = exec("/bin/echo", ["hi"])
+
+        print("came back:", e)
+        """), "hi\n")
+end pex_exec_becomes_the_program
+
+// The buffer holding this line is in the image `execve` discards, so without a flush first it is lost
+// whenever standard output is not a terminal.
+@test("what a program printed before it execs is written out first")
+pex_exec_flushes_first()
+    if !lbr_ready() then return
+
+    assert_eq(pex_ran(raw"""
+        import sysl.process.exec
+
+        print("before")
+
+        val e = exec("/bin/echo", ["after"])
+
+        print("came back:", e)
+        """), "before\nafter\n")
+end pex_exec_flushes_first
+
+@test("a bare name is looked for on PATH, as run looks for one")
+pex_exec_searches_path()
+    if !lbr_ready() then return
+
+    assert_eq(pex_ran(raw"""
+        import sysl.process.exec
+
+        val e = exec("echo", ["found on the path"])
+
+        print("came back:", e)
+        """), "found on the path\n")
+end pex_exec_searches_path
+
+@test("with inherit_env = false the new program sees exactly the variables it was given")
+pex_exec_replaces_environment()
+    if !lbr_ready() then return
+
+    assert_eq(pex_ran(raw"""
+        import sysl.process.{Var, exec}
+
+        val e = exec("/usr/bin/env", env = [Var("PEX", "yes"), Var("PEX", "twice")],
+                     inherit_env = false)
+
+        print("came back:", e)
+        """), "PEX=twice\n")
+end pex_exec_replaces_environment
+
+@test("an added variable joins this program's environment for the new program")
+pex_exec_adds_to_environment()
+    if !lbr_ready() then return
+
+    val out = pex_ran(raw"""
+        import sysl.process.{Var, exec}
+
+        val e = exec("/usr/bin/env", env = [Var("SYSL_PEX_ADDED", "1")])
+
+        print("came back:", e)
+        """)
+
+    assert(out.contains("SYSL_PEX_ADDED=1\n"), out)
+    assert(out.contains("PATH="), out)
+end pex_exec_adds_to_environment
+
+@test("a program that execs something missing is told NotFound and carries on")
+pex_exec_missing_carries_on()
+    if !lbr_ready() then return
+
+    assert_eq(pex_ran(raw"""
+        import sysl.fs.IoError
+        import sysl.process.exec
+
+        print(exec("sysl-no-such-program") == IoError.NotFound)
+        print("carried on")
+        """), "true\ncarried on\n")
+end pex_exec_missing_carries_on
+
+@test("on a hosted target the library answers the exec hook under a weak export")
+pex_hosted_library_answers_weakly()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.process.exec
+
+        print(exec("true"))
+        """)
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
+
+    lbr_drop([p])
+    assert(said.0 == 0, said.1)
+
+    var defined = ""
+
+    for line in lines_of(said.1)
+        if line.starts_with("define ") && line.contains(" @sysl_proc_exec(") then defined = line
+
+    assert(defined.starts_with("define weak "), defined)
+    assert(said.1.contains("@sysl_proc_posix_exec("), "the hosted answer does not call the shim")
+end pex_hosted_library_answers_weakly
+
+// -- a target with no C library -----------------------------------------------------------------------
+
+// A login program's last move, for an archive a kernel's C or assembly links.
+private val pex_program: string = raw"""
+    import sysl.process.exec
+    import sysl.process.sys.Text
+
+    @export("become_shell")
+    become_shell() -> int = int(exec("/bin/sh", ["-l"]).code())
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = ptr_cast(usize(0x4100_0000))
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+    """
+
+// What reaching `sysl.process` at all costs beside: `Child`'s destructor is a root wherever its module
+// is reached, and it waits for, stops and removes the capture file of a child -- so a program using
+// only `exec` still answers these, as a kernel with process calls does anyway.
+private val pex_child_hooks: string = raw"""
+    @export("sysl_proc_wait")
+    k_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int = -38
+
+    @export("sysl_proc_kill")
+    k_kill(pid: i64, signal: int) -> int = -38
+
+    @export("sysl_fs_unlink")
+    k_unlink(path: *u8, len: usize) -> int = -38
+    """
+
+// The hook, answered as a kernel's `execve` would answer one that failed.
+private val pex_hook: string = raw"""
+    @export("sysl_proc_exec")
+    k_exec(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, envc: usize,
+           inherit_env: int) -> int = -2
+    """
+
+private val pex_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n"
+
+private pex_tree(program: string) -> string = lbr_tree(lbr_two("main.sysl", program, "package.hocon",
+                                                                pex_manifest))
+
+private pex_build_c(root: string) -> (int, string) =
+    lbr_cli(["sysl", "build-c", "--target", pex_target, "-o", s"$root/img.a", root])
+
+@test("a freestanding archive that execs carries the program's own exec hook and nothing hosted")
+pex_freestanding_answers_the_hook()
+    if !lbr_ready() then return
+
+    val root = pex_tree(pex_program + pex_child_hooks + pex_hook)
+    val said = pex_build_c(root)
+
+    assert(said.0 == 0, said.1)
+
+    if !is_file(pex_nm)
+        lbr_drop([root])
+        return
+    end if
+
+    val listed = capture(pex_nm, [s"$root/img.a"], "", [], true).unwrap()
+
+    lbr_drop([root])
+    assert(listed.status.ok(), listed.text)
+    assert(listed.text.contains(" T sysl_proc_exec"), listed.text)
+    assert(listed.text.contains(" T become_shell"), listed.text)
+
+    for name in ["sysl_proc_posix_exec", "execve", "execvp", "fork"]
+        for line in lines_of(listed.text)
+            assert(!line.ends_with(s" $name"), s"'$name' is in the archive: $line")
+end pex_freestanding_answers_the_hook
+
+@test("a freestanding program that execs with no exec hook is refused, naming it")
+pex_unanswered_hook_is_refused()
+    if !lbr_ready() then return
+
+    val root = pex_tree(pex_program + pex_child_hooks)
+    val said = pex_build_c(root)
+
+    lbr_drop([root])
+    assert(said.0 != 0, "built with the exec hook unanswered")
+    assert(said.1.contains(s"error: this program starts, waits for or becomes a process, and '$pex_target' " +
+        "has no operating system under it for the standard library to answer one with, so the program " +
+        "answers it: define 'sysl_proc_exec' with '@export', each taking what its 'extern' in " +
+        "'sysl.process.sys' declares"), said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+    assert(!said.1.contains("sysl.fs.sys"), said.1)
+end pex_unanswered_hook_is_refused

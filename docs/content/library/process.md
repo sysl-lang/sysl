@@ -1,6 +1,6 @@
 ---
 title: The process module
-summary: "`sysl.process` — starting another program and waiting for it: `run`, `capture`, `start` and `Child`, `Status`, how long a child may take, and why there is no shell anywhere in it."
+summary: "`sysl.process` — starting another program and waiting for it: `run`, `capture`, `start` and `Child`, `Status`, how long a child may take, `exec` to become another program, and why there is no shell or `fork` anywhere in it."
 weight: 74
 ---
 
@@ -35,7 +35,7 @@ It requires `posix`. On a hosted target the whole of the mechanism is `posix_spa
 `execvp` — the `PATH` search below is `execvp`'s own — and neither exists outside POSIX: a hosted
 target that is not POSIX has no way to start a program. WASI preview1 is the case that made that
 visible, having files and a clock and no way to spawn at all. **A target with no C library can still
-start one, if the program says how** — a kernel with its own process calls answers the module's four
+start one, if the program says how** — a kernel with its own process calls answers the module's five
 hooks itself, [below](#on-a-target-with-no-c-library).
 
 ## A program that fails is not a failure
@@ -407,13 +407,63 @@ A timeout costs nothing to have and is worth setting wherever the child is somet
 program you wrote: `run` and `capture` with no bound are the right calls for a build you are
 watching, and the wrong ones for a tool that has hung on somebody's machine once already.
 
+## Becoming another program
+
+**`exec` replaces this program with another, in the same process**, and answers only if that failed:
+the process keeps its id, its parent, its open descriptors and its working directory, and runs the
+other program from its beginning. It is what a shell's `exec` builtin is, and what a login program or
+a wrapper that sets something up and then becomes its target needs. `program`, `env` and
+`inherit_env` mean what they mean for `run`, the `PATH` search included.
+
+```sysl
+import sysl.process.exec
+
+print("about to become echo")
+
+val e = exec("echo", ["now I am echo"])
+
+print("still here:", e)
+```
+
+```output
+about to become echo
+now I am echo
+```
+
+**What this program printed is written out first.** Its output buffer lives in the image `exec`
+throws away, so the line above would otherwise be lost whenever standard output is not a terminal —
+which is exactly when somebody is reading a log of it.
+
+**The answer is an `IoError` rather than a `Result`**, a success having nothing to carry and no one
+to carry it to. Everything that can fail is checked before anything is given up, so on a failure this
+program goes on exactly as it was:
+
+```sysl
+import sysl.process.exec
+
+print(exec("sysl-no-such-program"))
+print("and this program carries on")
+```
+
+```output
+no such file or directory
+and this program carries on
+```
+
+**It is not `@abandons`.** That annotation is for a call after which the *program* goes on without
+the frames below it — a thread's exit, a jump back to a saved context — so the counts those frames
+hold have to be given back first. `exec` is the other kind: on success nothing of this program goes
+on at all, its memory going with its image the way an `exit`'s does, and on failure it returns like
+any call. Its result is `IoError` and not `never` for that reason.
+
 ## On a target with no C library
 
-Everything the module asks of the machine goes through four hooks in `sysl.process.sys` — start a
-program, wait for it, send it a signal, name a file for a captured stream. On a hosted POSIX target
+Everything the module asks of the machine goes through five hooks in `sysl.process.sys` — start a
+program, wait for it, send it a signal, become one in place of this program, name a file for a
+captured stream. On a hosted POSIX target
 the library answers them; **on a target with no C library the program answers each one it reaches
-with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `start` and `Child`
-work unchanged above them:
+with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `start`, `Child`
+and `exec` work unchanged above them:
 
 | hook | what it answers |
 |---|---|
@@ -421,6 +471,7 @@ work unchanged above them:
 | `sysl_proc_wait(pid, started, timeout_ms, how, value) -> int` | zero, having written how it ended |
 | `sysl_proc_kill(pid, signal) -> int` | zero |
 | `sysl_proc_temp_path(into, room) -> isize` | the length of the path it wrote |
+| `sysl_proc_exec(path, path_len, argv, argc, envp, envc, inherit_env) -> int` | only a failure: a success does not return |
 
 **Each answers zero or more for success and the `IoError` code negated for a failure**, and
 `UNSUPPORTED` (`sysl.sys`, -38 on every platform, not the host's `ENOSYS`; `-1` is `EPERM`) for a
@@ -435,14 +486,27 @@ A program that reaches a hook and leaves it unanswered is refused when it is com
 hook it reached:
 
 ```
-error: this program starts or waits for a process, and 'aarch64-freestanding' has no C library under
-it for the standard library to answer one with, so the program answers it: define 'sysl_proc_kill',
-'sysl_proc_spawn', 'sysl_proc_temp_path', 'sysl_proc_wait' with '@export', each taking what its
-'extern' in 'sysl.process.sys' declares and answering a process id, a length or zero, or the code of
-an 'IoError' negated
+error: this program starts, waits for or becomes a process, and 'aarch64-freestanding' has no C
+library under it for the standard library to answer one with, so the program answers it: define
+'sysl_proc_kill', 'sysl_proc_spawn', 'sysl_proc_temp_path', 'sysl_proc_wait' with '@export', each
+taking what its 'extern' in 'sysl.process.sys' declares and answering a process id, a length or
+zero, or the code of an 'IoError' negated
 ```
 
+**A program that only calls `exec` still answers `sysl_proc_wait`, `sysl_proc_kill` and
+`sysl.fs.sys`'s `sysl_fs_unlink`**: `Child`'s destructor is kept wherever the module is reached, and
+it waits for a child, stops one, and removes the file its output was captured into. A kernel with
+process calls answers those anyway; one without may answer them `UNSUPPORTED`.
+
 ## What is not here
+
+**`fork`.** Rust's standard library has none and Go's offers only a fork that execs at once, for the
+same reason: a fork copies one thread of a program that may have several, mid-way through whatever
+the others held — an allocator's lock, a half-written buffer — together with every count of every
+shared value, and a reference-counted runtime has no way to make that copy safe. Starting another
+program is `run`, `capture` or `start`; becoming one is `exec`; and the two together cover what a
+fork is wanted for on a hosted system. **A kernel's own runtime keeps its fork** — keel's user
+runtime has one beside its `execve` — because it owns every thread and every count there is.
 
 **Process *supervision*.** A running child can be held — that is `start` — and sent a signal, but no
 pid is handed out and no process group is made. That covers what a build

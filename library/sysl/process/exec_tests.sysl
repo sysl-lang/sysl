@@ -1,0 +1,39 @@
+module sysl.process
+@requires(posix)
+@tests
+
+import sysl.env.is_set
+import sysl.fs.IoError
+
+// What `exec` promises when it fails, which is the only half a test can watch from inside: it comes
+// back, with the reason, and leaves this program as it was. The other half -- a success never coming
+// back, and the new program writing what this one printed first -- is a child's to show, and the
+// compiler's suite builds one (`tests_pex_process_exec.sysl`).
+
+@test("exec of a program that is not there is NotFound")
+exec_missing_is_not_found()
+    assert_eq(exec("/sysl-no-such-dir/sysl-no-such-program"), IoError.NotFound)
+
+@test("exec of a bare name nothing on PATH answers to is NotFound")
+exec_missing_bare_name_is_not_found()
+    assert_eq(exec("sysl-no-such-program", ["x"]), IoError.NotFound)
+
+@test("exec of a bare name under a replaced environment is NotFound, not run from this PATH")
+exec_missing_under_replaced_env()
+    assert_eq(exec("sysl-no-such-program", env = [Var("A", "1")], inherit_env = false),
+              IoError.NotFound)
+
+@test("exec of a file that may not be run is PermissionDenied")
+exec_not_executable_is_permission_denied()
+    assert_eq(exec("/etc/hosts"), IoError.PermissionDenied)
+
+// The variables are built for the new image beside this program's own, never into it, so a failure
+// leaves nothing set that the call was asked to set.
+@test("a failed exec leaves this program's environment untouched")
+exec_failure_leaves_environment()
+    assert(!is_set("SYSL_PEX_ONLY_FOR_THE_CHILD"))
+
+    val e = exec("sysl-no-such-program", env = [Var("SYSL_PEX_ONLY_FOR_THE_CHILD", "1")])
+
+    assert_eq(e, IoError.NotFound)
+    assert(!is_set("SYSL_PEX_ONLY_FOR_THE_CHILD"))
