@@ -37,11 +37,11 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
 
     var key = keys.at(0)
 
-    for i in 0..<keys.len()
-        val f = cx.an.tables.funcs.get(keys.at(i))
+    for item in keys
+        val f = cx.an.tables.funcs.get(item)
 
         if f.is_some() && authored_tparams(f.unwrap().decl.tparams).len() == targ_exprs.len() then
-            key = keys.at(i)
+            key = item
 
     val f = cx.an.tables.funcs.get(key).unwrap()
     val decl = f.decl
@@ -72,8 +72,8 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
 
     var targs: Buf[Type] = buf()
 
-    for i in 0..<targ_exprs.len()
-        targs.push(written_type_arg(cx, targ_exprs.at(i)))
+    for targ_expr in targ_exprs
+        targs.push(written_type_arg(cx, targ_expr))
 
     // **A BOUND IS RESOLVED WHERE IT WAS WRITTEN, WHICH IS THE DECLARATION'S SCOPE AND NOT THE
     // CALLER'S.** `sysl.math.is_power_of_two[T: Bits + Ord]` writes `Bits` bare, and a caller that
@@ -146,8 +146,8 @@ private type_arg_read(cx: &Analyzer, e: Expr, at_address: bool) -> Type = *e.kin
     Tuple(parts) ->
         var written: Buf[TypeRef] = buf()
 
-        for i in 0..<parts.len()
-            written.push(written_type_ref(cx, parts.at(i), at_address))
+        for item in parts
+            written.push(written_type_ref(cx, item, at_address))
 
         resolve_type(cx.an, cx.scope, type_ref(e.span, TupleType(written, false)), cx.subst)
     // A dotted path is one name to the type grammar, so `mod.Box` is read as the word it is.
@@ -246,9 +246,7 @@ private applied_type_ref(cx: &Analyzer, span: Span, head: Expr, inner: Buf[Expr]
 
     var refs: Buf[TypeRef] = buf()
 
-    for i in 0..<inner.len()
-        val arg = inner.at(i)
-
+    for arg in inner
         *arg.kind match
             Ident(n) -> refs.push(named_type(arg.span, n))
             Unary(op, _) if op == "*" || op == "&" -> refs.push(written_type_ref(cx, arg, at_address))
@@ -301,8 +299,8 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
                               decl.bounds, slots, known, expected, decl.needs)
     var param_refs: Buf[TypeRef] = buf()
 
-    for i in 0..<decl.params.len()
-        param_refs.push(decl.params.at(i).typ)
+    for param in decl.params
+        param_refs.push(param.typ)
 
     val covered = enter_signature(cx.an, decl.needs)
     val targs = solve(cx.an, f.scope, cx.scope, span, key, decl.tparams, param_refs, prov.tys, decl.ret_type,
@@ -311,8 +309,8 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
     leave_reaching(cx.an, covered)
 
     if !report
-        for i in 0..<targs.len()
-            if targs.at(i) == Unknown
+        for targ in targs
+            if targ == Unknown
                 cx.fault(span, "not inferable")
                 return bad_expr(span)
 
@@ -320,8 +318,8 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
     // The mistake that left it unknown has been reported where it was made -- or deliberately
     // suppressed as a consequence of one -- and a body made real at `?` would complain again from
     // inside the declaration, about a line the reader did not write.
-    for i in 0..<targs.len()
-        if targs.at(i) == Unknown
+    for targ in targs
+        if targ == Unknown
             voice_unknown_args(cx, slots, prov)
             return bad_expr(span)
         end if
@@ -401,8 +399,8 @@ end generic_call_with
 authored_tparams(tparams: Buf[string]) -> Buf[string]
     var out: Buf[string] = buf()
 
-    for i in 0..<tparams.len()
-        if !is_call_bound(tparams.at(i)) then out.push(tparams.at(i))
+    for tparam in tparams
+        if !is_call_bound(tparam) then out.push(tparam)
 
     out
 end authored_tparams
@@ -411,8 +409,8 @@ end authored_tparams
 private not_bound(names: Buf[string], known: Buf[Binding]) -> Buf[string]
     var out: Buf[string] = buf()
 
-    for i in 0..<names.len()
-        if bound_type(known, names.at(i)).is_none() then out.push(names.at(i))
+    for item in names
+        if bound_type(known, item).is_none() then out.push(item)
 
     out
 end not_bound
@@ -502,8 +500,7 @@ end becomes_slice
 private unsettleable(d: FuncDecl) -> Buf[string]
     var out: Buf[string] = buf()
 
-    for i in 0..<d.tparams.len()
-        val tp = d.tparams.at(i)
+    for tp in d.tparams
         var one: Buf[string] = buf()
 
         one.push(tp)
@@ -568,8 +565,8 @@ end Provisional
 left_to_default(slots: Buf[Option[Expr]]) -> Buf[bool]
     var out: Buf[bool] = buf()
 
-    for i in 0..<slots.len()
-        out.push(slots.at(i).is_none())
+    for slot in slots
+        out.push(slot.is_none())
 
     out
 
@@ -640,13 +637,13 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
     // a call whose closure knows what it takes.
     var param_refs: Buf[TypeRef] = buf()
 
-    for i in 0..<params.len()
-        param_refs.push(params.at(i).typ)
+    for param in params
+        param_refs.push(param.typ)
 
     var sub: Buf[Binding] = buf()
 
-    for i in 0..<known.len()
-        sub.push(known.at(i))
+    for item in known
+        sub.push(item)
 
     for i in 0..<param_refs.len()
         if i < tys.len() && !soft.at(i) then
@@ -692,8 +689,7 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
         // a detail: it is part of the symbol. An argument ready at the start of a round has nothing
         // unsolved in what it takes, so reading it against what the round started with loses
         // nothing.
-        for i in 0..<pending.len()
-            val at = pending.at(i)
+        for at in pending
             val want = held_want(cx, scope, params.at(at).typ, tparams, bounds, sub)
 
             if want.is_none() then later.push(at)
@@ -727,8 +723,7 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
     // closure that states its own parameter types says what they settle, and one that states none is
     // told so at the closure, the leftmost first. Leaving it unread left the call with nothing to
     // lower and nothing said about why.
-    for i in 0..<pending.len()
-        val at = pending.at(i)
+    for at in pending
         val reader = arg_reader(cx, span, scope, slots.at(at).is_none())
         val t = type_expr(reader, written.at(at).unwrap(), None)
 
@@ -829,15 +824,15 @@ private expr_mentions(e: Expr, names: Buf[string]) -> bool = *e.kind match
         operands.len() == 2 && (expr_mentions(operands.at(0), names) ||
                                 expr_mentions(operands.at(1), names))
     Call(_, args) ->
-        for i in 0..<args.len()
-            if expr_mentions(args.at(i), names) then return true
+        for item in args
+            if expr_mentions(item, names) then return true
 
         false
     _ -> false
 
 any_ref_mentions(ts: Buf[TypeRef], names: Buf[string]) -> bool
-    for i in 0..<ts.len()
-        if ref_mentions(ts.at(i), names) then return true
+    for item in ts
+        if ref_mentions(item, names) then return true
 
     false
 end any_ref_mentions
@@ -867,8 +862,8 @@ private written_arg(e: Expr) -> Expr = *e.kind match
 private unsolved_names(tparams: Buf[string], known: Buf[Binding]) -> Buf[string]
     var out: Buf[string] = buf()
 
-    for i in 0..<tparams.len()
-        if bound_type(known, tparams.at(i)).is_none() then out.push(tparams.at(i))
+    for tparam in tparams
+        if bound_type(known, tparam).is_none() then out.push(tparam)
 
     out
 end unsolved_names
@@ -923,9 +918,9 @@ private call_shape(cx: &Analyzer, scope: Scope, ptype: TypeRef, tparams: Buf[str
             if !args.is_empty() then return applied_call_shape(cx, scope, name, args)
             if !holds_string(tparams, name) then return applied_call_shape(cx, scope, name, args)
 
-            for i in 0..<bounds.len()
-                if bounds.at(i).name == name
-                    val bs = bounds.at(i).bounds
+            for item in bounds
+                if item.name == name
+                    val bs = item.bounds
 
                     for j in 0..<bs.len()
                         val found = applied_call_shape(cx, scope, bs.at(j).name, bs.at(j).args)

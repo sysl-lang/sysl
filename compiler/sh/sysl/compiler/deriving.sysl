@@ -38,8 +38,7 @@ private fnv_prime() -> string = "100000001b3"
 derived_units(a: &Analysis, units: Buf[Program]) -> Buf[Program]
     var out: Buf[Program] = buf()
 
-    for i in 0..<units.len()
-        val unit = units.at(i)
+    for unit in units
         val scope = scope_of_unit(a, unit)
         var body: Buf[Stmt] = buf()
         var grew = false
@@ -87,8 +86,8 @@ private derived_blocks(a: &Analysis, scope: Scope, s: Stmt) -> Buf[Stmt]
 
             val made = one_derivation(entry, simple, s)
 
-            for j in 0..<made.len()
-                out.push(made.at(j))
+            for item in made
+                out.push(item)
 
     out
 end derived_blocks
@@ -148,8 +147,8 @@ end derives_problem
 
 // Whether no variant carries anything, which is what makes the value its own discriminant.
 private simple_sum(vs: Buf[EnumVariantDecl]) -> bool
-    for i in 0..<vs.len()
-        if !vs.at(i).fields.is_empty() then return false
+    for item in vs
+        if !item.fields.is_empty() then return false
 
     true
 end simple_sum
@@ -189,17 +188,17 @@ private one_derivation(entry: BoundRef, simple: string, s: Stmt) -> Buf[Stmt]
     for i in 0..<declared_bounds(s).len()
         bounds.push(declared_bounds(s).at(i))
 
-    for i in 0..<tparams.len()
-        if !has_binding(tvalues, tparams.at(i))
+    for tparam in tparams
+        if !has_binding(tvalues, tparam)
             var bs: Buf[BoundRef] = buf()
 
             bs.push(BoundRef(at, entry.name, buf()))
-            bounds.push(NamedBounds(tparams.at(i), bs))
+            bounds.push(NamedBounds(tparam, bs))
 
     var targs: Buf[TypeRef] = buf()
 
-    for i in 0..<tparams.len()
-        targs.push(TypeRef(at, NamedType(tparams.at(i), buf())))
+    for tparam in tparams
+        targs.push(TypeRef(at, NamedType(tparam, buf())))
 
     val subject = TypeRef(at, NamedType(name, targs))
     var method = eq_method(at, s)
@@ -251,8 +250,8 @@ private fields_of(s: Stmt) -> Buf[string] = *s.kind match
     StructDecl(d) ->
         var out: Buf[string] = buf()
 
-        for i in 0..<d.fields.len()
-            out.push(d.fields.at(i).name)
+        for item in d.fields
+            out.push(item.name)
 
         out
     _ -> buf()
@@ -359,13 +358,13 @@ private u64_of(at: Span, digits: string) -> Expr = expr(at, IntLit(digits, 16, "
 private both_arms(at: Span, vs: Buf[EnumVariantDecl], same_eq: bool) -> Buf[MatchArm]
     var arms: Buf[MatchArm] = buf()
 
-    for i in 0..<vs.len()
+    for item in vs
         var pair: Buf[Pattern] = buf()
 
-        pair.push(variant_pattern(at, vs.at(i), "l"))
-        pair.push(variant_pattern(at, vs.at(i), "r"))
+        pair.push(variant_pattern(at, item, "l"))
+        pair.push(variant_pattern(at, item, "r"))
 
-        val body = if same_eq then same_variant_eq(at, vs.at(i)) else same_variant_ord(at, vs.at(i))
+        val body = if same_eq then same_variant_eq(at, item) else same_variant_ord(at, item)
 
         arms.push(arm_of(at, pattern_of(at, TuplePattern(pair)), body))
 
@@ -417,9 +416,9 @@ private eq_method(at: Span, s: Stmt) -> MethodDecl
     else
         val fields = fields_of(s)
 
-        for i in 0..<fields.len()
-            body.push(guard_stmt(at, compare(at, "!=", self_field(at, fields.at(i)),
-                                             rhs_field(at, fields.at(i))), false))
+        for item in fields
+            body.push(guard_stmt(at, compare(at, "!=", self_field(at, item),
+                                             rhs_field(at, item)), false))
 
         body.push(stmt(at, ExprStmt(expr(at, BoolLit(true)))))
 
@@ -449,11 +448,11 @@ private ord_method(at: Span, s: Stmt) -> MethodDecl
     if !is_sum(s)
         val fields = fields_of(s)
 
-        for i in 0..<fields.len()
-            body.push(guard_stmt(at, compare(at, "<", self_field(at, fields.at(i)),
-                                             rhs_field(at, fields.at(i))), true))
-            body.push(guard_stmt(at, compare(at, "<", rhs_field(at, fields.at(i)),
-                                             self_field(at, fields.at(i))), false))
+        for item in fields
+            body.push(guard_stmt(at, compare(at, "<", self_field(at, item),
+                                             rhs_field(at, item)), true))
+            body.push(guard_stmt(at, compare(at, "<", rhs_field(at, item),
+                                             self_field(at, item)), false))
 
         body.push(stmt(at, ExprStmt(expr(at, BoolLit(false)))))
     else if simple_sum(variants_of(s))
@@ -508,8 +507,8 @@ private hash_method(at: Span, s: Stmt) -> MethodDecl
     if !is_sum(s)
         val fields = fields_of(s)
 
-        for i in 0..<fields.len()
-            body.push(mix_in(at, call_of(at, field_of(at, self_field(at, fields.at(i)), "hash"),
+        for item in fields
+            body.push(mix_in(at, call_of(at, field_of(at, self_field(at, item), "hash"),
                                          no_args())))
     else
         // The **tag is mixed first**, so two variants carrying equal payloads are different keys --
@@ -524,8 +523,7 @@ private hash_method(at: Span, s: Stmt) -> MethodDecl
         if !simple_sum(vs)
             var arms: Buf[MatchArm] = buf()
 
-            for i in 0..<vs.len()
-                val v = vs.at(i)
+            for v in vs
                 var inner: Buf[Stmt] = buf()
 
                 if v.fields.is_empty() then inner.push(stmt(at, ExprStmt(expr(at, UnitLit))))
@@ -580,9 +578,9 @@ private display_literal_method(at: Span, name: string, s: Stmt) -> MethodDecl
         val vs = variants_of(s)
         var arms: Buf[MatchArm] = buf()
 
-        for i in 0..<vs.len()
-            arms.push(arm_of(at, any_of(at, vs.at(i)),
-                             one_stmt_of(stmt(at, ExprStmt(expr(at, StrLit(vs.at(i).name)))))))
+        for item in vs
+            arms.push(arm_of(at, any_of(at, item),
+                             one_stmt_of(stmt(at, ExprStmt(expr(at, StrLit(item.name)))))))
 
         text = expr(at, MatchExpr(ident(at, "self"), arms))
     end if
@@ -617,8 +615,8 @@ private renderer_decl(at: Span, name: string, tparams: Buf[string], bounds: Buf[
         val fields = fields_of(s)
         var parts: Buf[Expr] = buf()
 
-        for i in 0..<fields.len()
-            parts.push(field_of(at, ident(at, subject_param()), fields.at(i)))
+        for item in fields
+            parts.push(field_of(at, ident(at, subject_param()), item))
 
         body = writes_of(at, name, parts)
     else
@@ -627,8 +625,7 @@ private renderer_decl(at: Span, name: string, tparams: Buf[string], bounds: Buf[
         val vs = variants_of(s)
         var arms: Buf[MatchArm] = buf()
 
-        for i in 0..<vs.len()
-            val v = vs.at(i)
+        for v in vs
             var parts: Buf[Expr] = buf()
 
             for j in 0..<v.fields.len()
@@ -640,8 +637,8 @@ private renderer_decl(at: Span, name: string, tparams: Buf[string], bounds: Buf[
 
     var targs: Buf[TypeRef] = buf()
 
-    for i in 0..<tparams.len()
-        targs.push(TypeRef(at, NamedType(tparams.at(i), buf())))
+    for tparam in tparams
+        targs.push(TypeRef(at, NamedType(tparam, buf())))
 
     var params: Buf[Param] = buf()
 

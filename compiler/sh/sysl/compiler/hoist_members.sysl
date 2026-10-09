@@ -121,8 +121,8 @@ hoist_all_members(a: &Analysis, units: Buf[Program])
             StructOf(d) ->
                 var names: Buf[string] = buf()
 
-                for j in 0..<d.fields.len()
-                    names.push(d.fields.at(j).name)
+                for item in d.fields
+                    names.push(item.name)
 
                 hoist_type_members(a, key, decl.scope, d.tparams, d.bounds, d.tvalues, names,
                                    "field", d.members)
@@ -136,8 +136,8 @@ hoist_all_members(a: &Analysis, units: Buf[Program])
             EnumOf(d) ->
                 var names: Buf[string] = buf()
 
-                for j in 0..<d.variants.len()
-                    names.push(d.variants.at(j).name)
+                for item in d.variants
+                    names.push(item.name)
 
                 hoist_type_members(a, key, decl.scope, d.tparams, d.bounds, d.tvalues, names,
                                    "variant", d.members)
@@ -173,8 +173,7 @@ private drain_deferred_bounds(a: &Analysis)
     // by the time this one is asked.
     var refused: Buf[bool] = buf()
 
-    for i in 0..<held.len()
-        val d = held.at(i)
+    for d in held
         val quiet = d.after.is_some() && d.after.unwrap() < refused.len() && refused.at(d.after.unwrap())
 
         refused.push(!check_param_bounds(a, d.scope, d.span, d.what, d.tparams, d.bounds, d.targs,
@@ -202,16 +201,15 @@ check_param_bounds(a: &Analysis, scope: Scope, span: Span, what: string, tparams
 
     var subst: Buf[Binding] = buf()
 
-    for i in 0..<seed.len()
-        subst.push(seed.at(i))
+    for item in seed
+        subst.push(item)
 
     for i in 0..<tparams.len()
         if i < targs.len() then subst.push(Binding(tparams.at(i), targs.at(i)))
 
     var met = true
 
-    for i in 0..<bounds.len()
-        val nb = bounds.at(i)
+    for nb in bounds
         val arg = bound_type(subst, nb.name)
 
         if arg.is_some() && arg.unwrap() != Unknown
@@ -287,8 +285,8 @@ hoist_type_members(a: &Analysis, key: string, scope: Scope, tparams: Buf[string]
 
     var arg_refs: Buf[TypeRef] = buf()
 
-    for i in 0..<tparams.len()
-        arg_refs.push(named_type(span_zero(), tparams.at(i)))
+    for tparam in tparams
+        arg_refs.push(named_type(span_zero(), tparam))
 
     // The receiver is written as the type's **bare** name applied to its own parameters, and read in
     // the declaring file's own terms -- a key holds the module separator, which is not something a
@@ -333,11 +331,11 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl]) -> B
     val inherited = trait_properties(a, home.from_trait)
     val paired = pair_setters(a, home.scope, members, home.label, inherited)
 
-    for i in 0..<paired.len()
+    for item in paired
         // A bare-arrow parameter is sugar for a bounded type parameter, and a member writes the
         // sugar wherever a function does -- so `map(self, f: A -> B)` asks for a callable it can
         // call directly rather than for one in a counted box.
-        val m = with_member_call_bounds(paired.at(i))
+        val m = with_member_call_bounds(item)
         val filed = m.name + home.alt
 
         // A member's parameters and its type's are two lists that end up in one signature, so a name
@@ -488,9 +486,7 @@ end hoist_member_list
 // complaint points at the bound rather than at the declaration carrying it, because that is the text
 // that is wrong.
 check_bound_names(a: &Analysis, scope: Scope, what: string, bounds: Buf[NamedBounds])
-    for i in 0..<bounds.len()
-        val nb = bounds.at(i)
-
+    for nb in bounds
         for j in 0..<nb.bounds.len()
             val written = nb.bounds.at(j)
             val key = lookup_trait_key(a, scope, written.name)
@@ -665,9 +661,7 @@ pair_setters(a: &Analysis, scope: Scope, members: Buf[MethodDecl], label: string
 
                 var ps: Buf[Param] = buf()
 
-                for j in 0..<m.params.len()
-                    val p = m.params.at(j)
-
+                for p in m.params
                     ps.push(Param(p.span, p.name, ret.unwrap(), p.vis, p.default, p.by_name, p.rest))
 
                 fixed.params = ps
@@ -677,8 +671,8 @@ pair_setters(a: &Analysis, scope: Scope, members: Buf[MethodDecl], label: string
 end pair_setters
 
 private unpaired_setter(m: MethodDecl) -> bool
-    for i in 0..<m.params.len()
-        *m.params.at(i).typ.kind match
+    for param in m.params
+        *param.typ.kind match
             NamedType(n, _) -> if n == SetterValue then return true
             _ -> ()
 
@@ -687,12 +681,12 @@ end unpaired_setter
 
 private property_result(members: Buf[MethodDecl], inherited: Buf[MethodDecl],
                         name: string) -> Option[TypeRef]
-    for i in 0..<inherited.len()
-        if inherited.at(i).is_property && inherited.at(i).name == name then
-            return inherited.at(i).ret_type
+    for item in inherited
+        if item.is_property && item.name == name then
+            return item.ret_type
 
-    for i in 0..<members.len()
-        if members.at(i).is_property && members.at(i).name == name then return members.at(i).ret_type
+    for item in members
+        if item.is_property && item.name == name then return item.ret_type
 
     None
 end property_result
@@ -709,8 +703,8 @@ private trait_properties(a: &Analysis, from: Option[string]) -> Buf[MethodDecl]
 
     val ms = d.unwrap().methods
 
-    for i in 0..<ms.len()
-        out.push(ms.at(i))
+    for item in ms
+        out.push(item)
 
     out
 end trait_properties
@@ -755,40 +749,40 @@ synthesize(a: &Analysis, home: MemberHome, m: MethodDecl) -> FuncDecl
 
     if recv.is_some() then params.push(recv.unwrap())
 
-    for i in 0..<m.params.len()
-        params.push(m.params.at(i))
+    for param in m.params
+        params.push(param)
 
     var tparams: Buf[string] = buf()
 
-    for i in 0..<home.tparams.len()
-        tparams.push(home.tparams.at(i))
+    for tparam in home.tparams
+        tparams.push(tparam)
 
-    for i in 0..<m.tparams.len()
-        tparams.push(m.tparams.at(i))
+    for tparam in m.tparams
+        tparams.push(tparam)
 
     var bounds: Buf[NamedBounds] = buf()
 
-    for i in 0..<home.bounds.len()
-        bounds.push(home.bounds.at(i))
+    for item in home.bounds
+        bounds.push(item)
 
-    for i in 0..<m.bounds.len()
-        bounds.push(m.bounds.at(i))
+    for item in m.bounds
+        bounds.push(item)
 
     var tvalues: Buf[TypeBinding] = buf()
 
-    for i in 0..<home.tvalues.len()
-        tvalues.push(home.tvalues.at(i))
+    for tvalue in home.tvalues
+        tvalues.push(tvalue)
 
-    for i in 0..<m.tvalues.len()
-        tvalues.push(m.tvalues.at(i))
+    for tvalue in m.tvalues
+        tvalues.push(tvalue)
 
     var tpacks: Buf[string] = buf()
 
-    for i in 0..<home.tpacks.len()
-        tpacks.push(home.tpacks.at(i))
+    for tpack in home.tpacks
+        tpacks.push(tpack)
 
-    for i in 0..<m.tpacks.len()
-        tpacks.push(m.tpacks.at(i))
+    for tpack in m.tpacks
+        tpacks.push(tpack)
 
     // The three annotations a member may carry are about its **parameters**, so they cross to the
     // lowered function unchanged -- the receiver is prepended in front of them and the names they
@@ -862,11 +856,11 @@ abstract_subst(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: Buf[Nam
                tvalues: Buf[TypeBinding], tpacks: Buf[string], outer: Buf[Binding]) -> Buf[Binding]
     var plain: Buf[Binding] = buf()
 
-    for i in 0..<outer.len()
-        plain.push(outer.at(i))
+    for item in outer
+        plain.push(item)
 
-    for i in 0..<tparams.len()
-        plain.push(Binding(tparams.at(i), Abstract(tparams.at(i), buf())))
+    for tparam in tparams
+        plain.push(Binding(tparam, Abstract(tparam, buf())))
 
     // **The first pass is scaffolding and says nothing.** It reads every bound against siblings that
     // are still bound-free, so a bound naming a projection off one -- `Fn2[S::Token, *S, N]`, which
@@ -892,8 +886,8 @@ end abstract_subst
 // `resolve_bound` asks only of the arguments that name no parameter, its stand-ins being scaffolding.
 private check_own_trait_args(a: &Analysis, scope: Scope, tparams: Buf[string],
                              bounds: Buf[NamedBounds], settled: Buf[Binding])
-    for i in 0..<bounds.len()
-        val refs = bounds.at(i).bounds
+    for item in bounds
+        val refs = item.bounds
 
         for j in 0..<refs.len()
             val r = refs.at(j)
@@ -927,11 +921,10 @@ private bounded_pass(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: B
                      others: Buf[Binding]) -> Buf[Binding]
     var out: Buf[Binding] = buf()
 
-    for i in 0..<outer.len()
-        out.push(outer.at(i))
+    for item in outer
+        out.push(item)
 
-    for i in 0..<tparams.len()
-        val tp = tparams.at(i)
+    for tp in tparams
         val written = binding_named(tvalues, tp)
 
         // A **value parameter** stands in as a zero rather than as a type. It is not a type, so
@@ -964,8 +957,8 @@ private bounds_at(a: &Analysis, scope: Scope, bounds: Buf[NamedBounds], tp: stri
                   others: Buf[Binding], self_name: string) -> Buf[Bound]
     var out: Buf[Bound] = buf()
 
-    for i in 0..<bounds.len()
-        if bounds.at(i).name == tp
+    for item in bounds
+        if item.name == tp
             var here: Buf[Binding] = buf()
 
             for j in 0..<others.len()
@@ -974,7 +967,7 @@ private bounds_at(a: &Analysis, scope: Scope, bounds: Buf[NamedBounds], tp: stri
             here.push(Binding(tp, Abstract(tp, buf())))
 
             val terms = bound_terms(here, tp, Abstract(self_name, buf()))
-            val refs = bounds.at(i).bounds
+            val refs = item.bounds
 
             for j in 0..<refs.len()
                 out.push(resolve_bound(a, scope, refs.at(j).span, refs.at(j), terms))
@@ -984,8 +977,8 @@ end bounds_at
 
 // The bounds a declaration wrote on one of its parameters, as a bound list.
 bounds_written_on(bounds: Buf[NamedBounds], tp: string) -> Buf[BoundRef]
-    for i in 0..<bounds.len()
-        if bounds.at(i).name == tp then return bounds.at(i).bounds
+    for item in bounds
+        if item.name == tp then return item.bounds
 
     buf()
 end bounds_written_on

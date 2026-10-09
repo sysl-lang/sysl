@@ -30,8 +30,8 @@ no_bindings() -> Buf[Binding] = buf()
 
 // What a name stands for in a set of bindings.
 bound_type(subst: Buf[Binding], name: string) -> Option[Type]
-    for i in 0..<subst.len()
-        if subst.at(i).name == name then return Some(subst.at(i).ty)
+    for item in subst
+        if item.name == name then return Some(item.ty)
 
     None
 end bound_type
@@ -282,8 +282,8 @@ end resolve_ptr
 resolve_list(a: &Analysis, scope: Scope, ts: Buf[TypeRef], subst: Buf[Binding]) -> Buf[Type]
     var out: Buf[Type] = buf()
 
-    for i in 0..<ts.len()
-        out.push(resolve_type(a, scope, ts.at(i), subst))
+    for item in ts
+        out.push(resolve_type(a, scope, item, subst))
 
     out
 end resolve_list
@@ -473,9 +473,9 @@ end negative_extent
 private const_arg_names(subst: Buf[Binding]) -> Buf[string]
     var out: Buf[string] = buf()
 
-    for i in 0..<subst.len()
-        subst.at(i).ty match
-            ConstArg(_, _, _) -> out.push(subst.at(i).name)
+    for item in subst
+        item.ty match
+            ConstArg(_, _, _) -> out.push(item.name)
             _ -> ()
 
     out
@@ -567,9 +567,7 @@ end under_type_arg
 cycle_check(a: &Analysis, scope: Scope, span: Span, key: string) -> bool
     var found = false
 
-    for i in 0..<a.resolving.len()
-        val at = a.resolving.at(i)
-
+    for at in a.resolving
         if at.0 == key && a.indirection <= at.1 && a.type_arg_depth <= at.2
             a.fault(scope, span,
                     s"type '${qualified_name(instance_base(key))}' contains itself, so it has no " +
@@ -606,8 +604,8 @@ substituted(a: &Analysis, scope: Scope, span: Span, t: Type) -> Type
 
     var cut = false
 
-    for i in 0..<found.len()
-        if cycle_check(a, scope, span, found.at(i)) then cut = true
+    for item in found
+        if cycle_check(a, scope, span, item) then cut = true
 
     if cut then Unknown else t
 end substituted
@@ -629,8 +627,8 @@ private reached_by_value(a: &Analysis, t: Type, seen: *Buf[string], found: *Buf[
             else if !holds_string(*seen, key)
                 seen.push(key)
 
-                for i in 0..<d.fields.len()
-                    reached_by_value(a, d.fields.at(i).1, seen, found)
+                for item in d.fields
+                    reached_by_value(a, item.1, seen, found)
         Enum(d) ->
             val key = instance_key(d.base, d.targs)
 
@@ -639,9 +637,7 @@ private reached_by_value(a: &Analysis, t: Type, seen: *Buf[string], found: *Buf[
             else if !holds_string(*seen, key)
                 seen.push(key)
 
-                for i in 0..<d.variants.len()
-                    val v = d.variants.at(i)
-
+                for v in d.variants
                     for j in 0..<v.fields.len()
                         reached_by_value(a, v.fields.at(j).1, seen, found)
         Array(_, elem) -> reached_by_value(a, *elem, seen, found)
@@ -649,8 +645,8 @@ private reached_by_value(a: &Analysis, t: Type, seen: *Buf[string], found: *Buf[
         _ -> ()
 
 private is_resolving(a: &Analysis, key: string) -> bool
-    for i in 0..<a.resolving.len()
-        if a.resolving.at(i).0 == key then return true
+    for item in a.resolving
+        if item.0 == key then return true
 
     false
 end is_resolving
@@ -1012,11 +1008,11 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
         var positional: Buf[TypeRef] = buf()
         var named: Buf[(string, Type)] = buf()
 
-        for i in 0..<args.len()
-            *args.at(i).kind match
+        for item in args
+            *item.kind match
                 AssocArgType(bound, inner) ->
                     named.push((bound, resolve_type(a, scope, inner, subst)))
-                _ -> positional.push(args.at(i))
+                _ -> positional.push(item)
 
         return object_of(a, scope, span, name, key.unwrap(), d.unwrap(),
                          resolve_list(a, scope, positional, subst), named, sigil)
@@ -1458,8 +1454,7 @@ private type_key_of(a: &Analysis, scope: Scope, name: string) -> Option[string]
     // reader may name, so a type it keeps is simply not there.
     var kept: Option[string] = None
 
-    for i in 0..<im.wildcards.len()
-        val at = im.wildcards.at(i)
+    for at in im.wildcards
         val key = module_qualify(at, name)
 
         if a.tables.types.has(key)
@@ -1600,8 +1595,8 @@ private filled_targs(a: &Analysis, scope: Scope, span: Span, key: string, home: 
 
     var filled: Buf[Type] = buf()
 
-    for i in 0..<targs.len()
-        filled.push(targs.at(i))
+    for targ in targs
+        filled.push(targ)
 
     for i in filled.len()..<tparams.len()
         var here: Buf[Binding] = buf()
@@ -1654,10 +1649,10 @@ private applied_bounds(a: &Analysis, scope: Scope, span: Span, key: string, home
     if bounds.is_empty() || tparams.len() != targs.len() then return (false, None)
     if span.start == 0 && span.end == 0 then return (false, None)
 
-    for i in 0..<targs.len()
-        if targs.at(i) == Unknown then return (false, None)
+    for targ in targs
+        if targ == Unknown then return (false, None)
 
-        targs.at(i) match
+        targ match
             Abstract(_, _) -> ()
             other -> if mentions_abstract(other) then return (false, None)
 
@@ -1738,9 +1733,7 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     // refusal is the arguments', made where they were written (see `applied_bounds`).
     val outer = enter_fields(a, checked)
 
-    for i in 0..<d.fields.len()
-        val f = d.fields.at(i)
-
+    for f in d.fields
         made.fields.push((f.name, resolve_qualified(a, home, f.typ, subst)))
 
     leave_fields(a, outer)
@@ -1782,8 +1775,8 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
 
     var simple = true
 
-    for i in 0..<d.variants.len()
-        if !d.variants.at(i).fields.is_empty() then simple = false
+    for item in d.variants
+        if !item.fields.is_empty() then simple = false
 
     // Whether this is the first instantiation of the declaration, which is what the complaints about
     // what was WRITTEN are held against: a discriminant is an integer in the source and no type
@@ -1827,8 +1820,7 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
     val cx = analyzer_for(a, home)
     var next_tag = 0
 
-    for i in 0..<d.variants.len()
-        val v = d.variants.at(i)
+    for v in d.variants
         var fields: Buf[(string, Type)] = buf()
 
         // Quiet where the arguments were refused, as a struct's fields are.
@@ -1877,8 +1869,8 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
     a.tables.in_progress.remove(inst)
     a.tables.enum_insts.put(inst, ty)
 
-    for i in 0..<made.variants.len()
-        a.tables.variant_names.put(made.variants.at(i).name, true)
+    for item in made.variants
+        a.tables.variant_names.put(item.name, true)
 
     ty
 end instantiate_enum
@@ -1922,10 +1914,10 @@ private check_bitfields(a: &Analysis, scope: Scope, span: Span, s: &StructType)
     val stored = s.stored()
     var narrow = false
 
-    for i in 0..<stored.len()
-        if underlying(stored.at(i).1) == Unknown then return
+    for item in stored
+        if underlying(item.1) == Unknown then return
 
-        bitfield_width(stored.at(i).1) match
+        bitfield_width(item.1) match
             Some(w) -> if w % 8 != 0 then narrow = true
             None -> ()
 
@@ -1933,11 +1925,11 @@ private check_bitfields(a: &Analysis, scope: Scope, span: Span, s: &StructType)
 
     val name = type_show(Struct(s))
 
-    for i in 0..<stored.len()
-        if bitfield_width(stored.at(i).1).is_none()
-            val shown = type_show(stored.at(i).1)
+    for item in stored
+        if bitfield_width(item.1).is_none()
+            val shown = type_show(item.1)
 
-            a.fault(scope, span, s"'$name.${stored.at(i).0}' is $shown, and '$name' is '@packed' with a " +
+            a.fault(scope, span, s"'$name.${item.0}' is $shown, and '$name' is '@packed' with a " +
                     "field narrower than a byte — so it is one integer, and every field of it has to be " +
                     "one too. Put the narrow fields in a '@packed' struct of their own and hold that " +
                     s"here: it lays out identically and leaves $shown what it is")
@@ -2059,8 +2051,8 @@ private too_many_bare(key: string, d: TraitDecl, declared: Buf[AssocDecl], given
     for i in 0..<d.tparams.len()
         whole.push("…")
 
-    for i in 0..<declared.len()
-        val n = declared.at(i).name
+    for item in declared
+        val n = item.name
 
         fixes.push(s"$n = …")
         whole.push(s"$n = …")
@@ -2087,11 +2079,11 @@ end too_many_bare
 private joined_assocs(a: Buf[(string, Type)], b: Buf[(string, Type)]) -> Buf[(string, Type)]
     var out: Buf[(string, Type)] = buf()
 
-    for i in 0..<a.len()
-        out.push(a.at(i))
+    for item in a
+        out.push(item)
 
-    for i in 0..<b.len()
-        out.push(b.at(i))
+    for item in b
+        out.push(item)
 
     out
 end joined_assocs

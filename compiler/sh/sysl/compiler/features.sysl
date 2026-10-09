@@ -73,8 +73,8 @@ end reset_feature_request
 current_feature_request() -> FeatureRequest
     var named: Buf[string] = buf()
 
-    for i in 0..<fr_features.len()
-        named.push(fr_features.at(i))
+    for fr_feature in fr_features
+        named.push(fr_feature)
 
     FeatureRequest(named, fr_no_default, fr_all)
 end current_feature_request
@@ -145,8 +145,8 @@ feature_closure(declared: &Buf[(string, Buf[string])], asked: &Buf[string],
     var seen: Buf[string] = buf()
     var queue: Buf[string] = buf()
 
-    for i in 0..<asked.len()
-        queue.push(asked.at(i))
+    for item in asked
+        queue.push(item)
 
     var at: usize = 0
 
@@ -161,8 +161,8 @@ feature_closure(declared: &Buf[(string, Buf[string])], asked: &Buf[string],
 
         val next = implied_features(declared, deps, name)
 
-        for j in 0..<next.len()
-            queue.push(next.at(j))
+        for item in next
+            queue.push(item)
 
     seen
 end feature_closure
@@ -175,9 +175,7 @@ end feature_closure
 root_enabled(m: &Manifest, r: &FeatureRequest, testing: bool) -> Result[Buf[string], string]
     if r.all || (testing && request_silent(r)) then return Ok(declared_features(m))
 
-    for i in 0..<r.features.len()
-        val asked = r.features.at(i)
-
+    for asked in r.features
         if !feature_named(m.features, asked)
             val declared = declared_features(m)
             val tail = if declared.is_empty() then ", and this manifest declares none"
@@ -188,8 +186,8 @@ root_enabled(m: &Manifest, r: &FeatureRequest, testing: bool) -> Result[Buf[stri
 
     var asked: Buf[string] = buf()
 
-    for i in 0..<r.features.len()
-        asked.push(r.features.at(i))
+    for item in r.features
+        asked.push(item)
 
     if !r.no_default then asked.push("default")
 
@@ -200,8 +198,8 @@ end root_enabled
 private declared_features(m: &Manifest) -> Buf[string]
     var out: Buf[string] = buf()
 
-    for i in 0..<m.features.len()
-        out.push(m.features.at(i).0)
+    for item in m.features
+        out.push(item.0)
 
     out
 end declared_features
@@ -209,8 +207,8 @@ end declared_features
 private quoted_names(names: Buf[string]) -> string
     var parts: Buf[string] = buf()
 
-    for i in 0..<names.len()
-        parts.push(s"'${names.at(i)}'")
+    for item in names
+        parts.push(s"'${item}'")
 
     join(parts.view(), ", ")
 end quoted_names
@@ -227,10 +225,10 @@ end quoted_names
 active_dependencies(m: &Manifest, enabled: &Buf[string]) -> Buf[Dependency]
     var turned_on: Buf[string] = buf()
 
-    for i in 0..<m.features.len()
-        if !holds_string(*enabled, m.features.at(i).0) then continue
+    for item in m.features
+        if !holds_string(*enabled, item.0) then continue
 
-        val members = m.features.at(i).1
+        val members = item.1
 
         for j in 0..<members.len()
             val member = members.at(j)
@@ -244,9 +242,7 @@ active_dependencies(m: &Manifest, enabled: &Buf[string]) -> Buf[Dependency]
 
     var out: Buf[Dependency] = buf()
 
-    for i in 0..<m.dependencies.len()
-        val dep = m.dependencies.at(i)
-
+    for dep in m.dependencies
         if !dep.optional || holds_string(turned_on, dep.label) then out.push(dep)
 
     out
@@ -259,8 +255,8 @@ end active_dependencies
 dependency_requests(m: &Manifest, enabled: &Buf[string]) -> Buf[(string, string, string)]
     var out: Buf[(string, string, string)] = buf()
 
-    for i in 0..<m.features.len()
-        val (name, members) = m.features.at(i)
+    for item in m.features
+        val (name, members) = item
 
         if !holds_string(*enabled, name) then continue
 
@@ -284,8 +280,8 @@ end pruned_manifest
 
 // The features one package has enabled, or none where nothing has reached it.
 enabled_of(enabled: &Buf[(string, Buf[string])], canonical: string) -> Buf[string]
-    for i in 0..<enabled.len()
-        if enabled.at(i).0 == canonical then return enabled.at(i).1
+    for item in enabled
+        if item.0 == canonical then return item.1
 
     buf()
 end enabled_of
@@ -307,9 +303,7 @@ enabled_from(packages: &Buf[ResolvedPackage], roots: Buf[(string, Manifest)],
     var out: Buf[(string, Buf[string])] = buf()
     val consumers = consumers_of(packages, pruned_roots(roots, enabled), enabled)
 
-    for t in 0..<packages.len()
-        val target = packages.at(t)
-
+    for target in packages
         if is_root_package(target) then continue
 
         var asked = no_asking()
@@ -332,9 +326,7 @@ enabled_from(packages: &Buf[ResolvedPackage], roots: Buf[(string, Manifest)],
         val (dir, theirs) = roots.at(r)
         var asked = no_asking()
 
-        for c in 0..<consumers.len()
-            val consumer = consumers.at(c)
-
+        for consumer in consumers
             for d in 0..<consumer.deps.len()
                 val dep = consumer.deps.at(d)
 
@@ -368,9 +360,7 @@ private asking(into: *Asking, who: string, dep: &Dependency, target: &Manifest) 
 
     if dep.default_features then into.wants_default = true
 
-    for f in 0..<dep.features.len()
-        val feature = dep.features.at(f)
-
+    for feature in dep.features
         if !feature_named(target.features, feature)
             return Err(no_such_feature(who, dep, feature, declared_features(target)))
 
@@ -383,8 +373,8 @@ end asking
 // `<dependency>/<feature>` members, held to the features the target declares as an entry's are.
 private asking_through(into: *Asking, who: string, dep: &Dependency,
                        through: &Buf[(string, string, string)], target: &Manifest) -> Result[unit, string]
-    for i in 0..<through.len()
-        val (label, feature, from) = through.at(i)
+    for item in through
+        val (label, feature, from) = item
 
         if label != dep.label then continue
 
@@ -409,8 +399,8 @@ end no_such_dependency_feature
 private asked_closure(asked: Asking, target: &Manifest) -> Buf[string]
     var named: Buf[string] = buf()
 
-    for i in 0..<asked.named.len()
-        named.push(asked.named.at(i))
+    for item in asked.named
+        named.push(item)
 
     if asked.wants_default then named.push("default")
 
@@ -429,15 +419,14 @@ private consumers_of(packages: &Buf[ResolvedPackage], roots: Buf[(string, Manife
                      enabled: &Buf[(string, Buf[string])]) -> Buf[Consumer]
     var out: Buf[Consumer] = buf()
 
-    for p in 0..<packages.len()
-        val consumer = packages.at(p)
+    for consumer in packages
         val on = enabled_of(enabled, consumer.canonical)
 
         out.push(Consumer(consumer_named(consumer), consumer.manifest.dependencies,
                           dependency_requests(consumer.manifest, on)))
 
-    for r in 0..<roots.len()
-        val (dir, m) = roots.at(r)
+    for item in roots
+        val (dir, m) = item
         val on = enabled_of(enabled, lib_root_key(dir))
 
         out.push(Consumer(s"the source root '$dir'", m.dependencies, dependency_requests(m, on)))
@@ -463,9 +452,9 @@ same_enabled(a: &Buf[(string, Buf[string])], b: &Buf[(string, Buf[string])]) -> 
     enabled_within(a, b) && enabled_within(b, a)
 
 private enabled_within(a: &Buf[(string, Buf[string])], b: &Buf[(string, Buf[string])]) -> bool
-    for i in 0..<a.len()
-        val theirs = enabled_of(b, a.at(i).0)
-        val mine = a.at(i).1
+    for item in a
+        val theirs = enabled_of(b, item.0)
+        val mine = item.1
 
         if theirs.len() != mine.len() then return false
 
@@ -479,8 +468,8 @@ end enabled_within
 feature_symbols(enabled: &Buf[string]) -> Buf[string]
     var out: Buf[string] = buf()
 
-    for i in 0..<enabled.len()
-        out.push(feature_symbol(enabled.at(i)))
+    for item in enabled
+        out.push(feature_symbol(item))
 
     out
 end feature_symbols
@@ -501,9 +490,7 @@ check_dev_imports(units: &Buf[Program], dev: &Buf[string]) -> Result[unit, Buf[D
 
     var found: Buf[Diagnostic] = buf()
 
-    for u in 0..<units.len()
-        val unit = units.at(u)
-
+    for unit in units
         if unit.test_only then continue
 
         for s in 0..<unit.body.len()

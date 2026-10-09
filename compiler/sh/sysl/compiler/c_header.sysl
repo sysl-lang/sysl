@@ -22,9 +22,7 @@ header_aggregates(exports: Buf[TFunc]) -> Buf[Type]
     var seen: Buf[Type] = buf()
     var named: Buf[Type] = buf()
 
-    for i in 0..<exports.len()
-        val f = exports.at(i)
-
+    for f in exports
         for j in 0..<f.params.len()
             header_walk(f.params.at(j).1, &seen, &named)
 
@@ -60,15 +58,15 @@ private header_aggregate(r: Type, seen: *Buf[Type], named: *Buf[Type])
             if !d.opaque
                 val fields = d.stored()
 
-                for i in 0..<fields.len()
-                    header_walk(fields.at(i).1, seen, named)
+                for item in fields
+                    header_walk(item.1, seen, named)
 
             named.push(r)
         Array(_, elem) -> header_walk(*elem, seen, named)
         Ptr(inner) -> header_walk(*inner, seen, named)
         CFn(params, ret) ->
-            for i in 0..<params.len()
-                header_walk(params.at(i), seen, named)
+            for param in params
+                header_walk(param, seen, named)
 
             header_walk(*ret, seen, named)
         _ -> ()
@@ -76,8 +74,8 @@ end header_aggregate
 
 // Whether the walk meets `t` for the first time, recording it where it does.
 private first_sight(t: Type, seen: *Buf[Type]) -> bool
-    for i in 0..<seen.len()
-        if type_eq(seen.at(i), t) then return false
+    for item in seen
+        if type_eq(item, t) then return false
 
     seen.push(t)
     true
@@ -155,8 +153,8 @@ c_header_render(funcs: Buf[TFunc], name: string) -> string
     // by-value member is the case a forward declaration does not serve.
     val aggregates = header_aggregates(exports)
 
-    for i in 0..<aggregates.len()
-        out.push(s"${c_aggregate_definition(aggregates.at(i))}\n")
+    for item in aggregates
+        out.push(s"${c_aggregate_definition(item)}\n")
 
     if exports.is_empty()
         // A header with nothing in it is worth writing rather than refusing: a build that exported
@@ -164,8 +162,8 @@ c_header_render(funcs: Buf[TFunc], name: string) -> string
         // missing file would read as a step that had not run.
         out.push("/* This module exports nothing — no function in it is marked '@export'. */\n\n")
     else
-        for i in 0..<exports.len()
-            out.push(s"${c_prototype(exports.at(i))};\n")
+        for item in exports
+            out.push(s"${c_prototype(item)};\n")
 
         out.push("\n")
 
@@ -201,8 +199,8 @@ private symbol_of(f: TFunc) -> string = f.exported.unwrap_or("")
 // Whether any prototype in the header returns `never`, which is the only thing the macro below is
 // written for.
 private reaches_never(exports: Buf[TFunc]) -> bool
-    for i in 0..<exports.len()
-        if is_never_type(exports.at(i).ret_ty) then return true
+    for item in exports
+        if is_never_type(item.ret_ty) then return true
 
     false
 end reaches_never
@@ -271,8 +269,8 @@ private c_aggregate_definition(t: Type) -> string = t match
         var fields = ""
         val stored = d.stored()
 
-        for i in 0..<stored.len()
-            fields += s"\t${c_declare(stored.at(i).1, stored.at(i).0)};\n"
+        for item in stored
+            fields += s"\t${c_declare(item.1, item.0)};\n"
 
         s"typedef struct {\n$fields} ${c_name(t)};\n"
     _ -> ""

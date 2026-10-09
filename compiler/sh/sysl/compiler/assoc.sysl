@@ -23,8 +23,8 @@ traits_declaring(a: &Analysis, member: string) -> Buf[string]
         if d.is_some()
             val assocs = d.unwrap().assocs
 
-            for j in 0..<assocs.len()
-                if assocs.at(j).name == member then out.push(a.tables.types.key_at(i))
+            for assoc in assocs
+                if assoc.name == member then out.push(a.tables.types.key_at(i))
 
     out
 end traits_declaring
@@ -40,15 +40,15 @@ impl_assoc(a: &Analysis, ti: TraitImpl, member: string, targs: Buf[Type]) -> Opt
     for i in 0..<ti.tparams.len()
         if i < targs.len() then sub.push(Binding(ti.tparams.at(i), targs.at(i)))
 
-    for i in 0..<ti.assocs.len()
-        if ti.assocs.at(i).0 == member then return Some(subst_params(a, ti.assocs.at(i).1, sub))
+    for assoc in ti.assocs
+        if assoc.0 == member then return Some(subst_params(a, assoc.1, sub))
 
     // A block that supplies the type through a `some` result answers with what its body turned out
     // to produce once that has been settled -- and with a **stand-in** before it has, which is the
     // state conformance sees. Nothing is decided from the stand-in: the two signatures compared are
     // the trait's `Self::Item` and the block's, and both get the same answer whichever it is.
-    for i in 0..<ti.opaque.len()
-        val (name, func, standin) = ti.opaque.at(i)
+    for item in ti.opaque
+        val (name, func, standin) = item
 
         if name != member then continue
 
@@ -80,8 +80,8 @@ assoc_bounds_of(a: &Analysis, b: Bound, ad: AssocDecl, assoc_self: Type) -> Buf[
 
     subst.push(Binding("Self", assoc_self))
 
-    for i in 0..<ad.bounds.len()
-        out.push(resolve_bound(a, scope, ad.bounds.at(i).span, ad.bounds.at(i), subst))
+    for item in ad.bounds
+        out.push(resolve_bound(a, scope, item.span, item, subst))
 
     out
 end assoc_bounds_of
@@ -108,8 +108,7 @@ private abstract_assoc(a: &Analysis, subject: Type, name: string, bounds: Buf[Bo
     for i in 0..<bounds.len()
         val closure = trait_closure(a, bounds.at(i), self_binding(subject))
 
-        for j in 0..<closure.len()
-            val b = closure.at(j)
+        for b in closure
             val d = trait_decl_at(a, b.name)
 
             if d.is_some()
@@ -190,12 +189,12 @@ end declared_blanket_assoc
 
 // Whether a parameter bounded by `bounds` is in the closed family a blanket block's subject is.
 private covers_family(family: Buf[Bound], bounds: Buf[Bound]) -> bool
-    for i in 0..<family.len()
-        val spelling = library_spelling(family.at(i).name)
+    for item in family
+        val spelling = library_spelling(item.name)
 
         if spelling.is_some() && core_closed(spelling.unwrap())
             for j in 0..<bounds.len()
-                if bounds.at(j).name == family.at(i).name then return true
+                if bounds.at(j).name == item.name then return true
 
     false
 end covers_family
@@ -224,16 +223,16 @@ private blanket_assoc(a: &Analysis, subject: Type, name: string, bounds: Buf[Bou
         val key = bs.key_at(i)
         var covered = false
 
-        for j in 0..<bounds.len()
-            if bounds.at(j).name == bs.at(i) then covered = true
+        for item in bounds
+            if item.name == bs.at(i) then covered = true
 
         if covered
             var targs: Buf[Type] = buf()
 
             targs.push(subject)
 
-            for j in 0..<names.len()
-                val rows = impls_of(a, names.at(j), key)
+            for item in names
+                val rows = impls_of(a, item, key)
 
                 for k in 0..<rows.len()
                     val found = impl_assoc(a, rows.at(k), member, targs)
@@ -244,8 +243,8 @@ private blanket_assoc(a: &Analysis, subject: Type, name: string, bounds: Buf[Bou
 end blanket_assoc
 
 private push_distinct(hits: *Buf[Type], t: Type)
-    for i in 0..<hits.len()
-        if type_eq(hits.at(i), t) then return
+    for hit in hits
+        if type_eq(hit, t) then return
 
     hits.push(t)
 
@@ -269,8 +268,8 @@ private concrete_assoc(a: &Analysis, t: Type, member: string) -> Result[Type, st
 
     val shapes = shape_owners(t)
 
-    for i in 0..<shapes.len()
-        keys.push(shapes.at(i))
+    for item in shapes
+        keys.push(item)
 
     val blankets = blanket_owners(a, t)
 
@@ -280,15 +279,15 @@ private concrete_assoc(a: &Analysis, t: Type, member: string) -> Result[Type, st
     var found_traits: Buf[string] = buf()
     var found_types: Buf[Type] = buf()
 
-    for i in 0..<names.len()
+    for item in names
         for j in 0..<keys.len()
-            val rows = impls_of(a, names.at(i), keys.at(j).0)
+            val rows = impls_of(a, item, keys.at(j).0)
 
             for k in 0..<rows.len()
                 val supplied = impl_assoc(a, rows.at(k), member, keys.at(j).1)
 
                 if supplied.is_some()
-                    push_distinct_name(&found_traits, names.at(i))
+                    push_distinct_name(&found_traits, item)
                     push_distinct(&found_types, supplied.unwrap())
 
     if found_traits.is_empty()
@@ -324,8 +323,8 @@ private concrete_assoc(a: &Analysis, t: Type, member: string) -> Result[Type, st
 end concrete_assoc
 
 private push_distinct_name(xs: *Buf[string], n: string)
-    for i in 0..<xs.len()
-        if xs.at(i) == n then return
+    for item in xs
+        if item == n then return
 
     xs.push(n)
 
@@ -397,13 +396,13 @@ private declared_assoc(a: &Analysis, t: Type, member: string,
                 val subject = declared_subject(a, im)
 
                 if subject.is_some()
-                    for j in 0..<keys.len()
-                        if keys.at(j).0 == subject.unwrap().0 &&
-                           keys.at(j).1.len() == subject.unwrap().1.len()
+                    for item in keys
+                        if item.0 == subject.unwrap().0 &&
+                           item.1.len() == subject.unwrap().1.len()
                             var subst: Buf[Binding] = buf()
 
                             for k in 0..<subject.unwrap().1.len()
-                                subst.push(Binding(subject.unwrap().1.at(k), keys.at(j).1.at(k)))
+                                subst.push(Binding(subject.unwrap().1.at(k), item.1.at(k)))
 
                             subst.push(Binding("Self", t))
                             push_distinct(&hits,
@@ -413,8 +412,8 @@ private declared_assoc(a: &Analysis, t: Type, member: string,
 end declared_assoc
 
 private written_assoc(d: ImplDecl, member: string) -> Option[TypeRef]
-    for i in 0..<d.assocs.len()
-        if d.assocs.at(i).name == member then return Some(d.assocs.at(i).typ)
+    for assoc in d.assocs
+        if assoc.name == member then return Some(assoc.typ)
 
     None
 end written_assoc
@@ -446,8 +445,8 @@ private declared_subject(a: &Analysis, im: Impl) -> Option[(string, Buf[string])
 
             var names: Buf[string] = buf()
 
-            for i in 0..<arg_refs.len()
-                *arg_refs.at(i).kind match
+            for arg_ref in arg_refs
+                *arg_ref.kind match
                     NamedType(n, inner) ->
                         if inner.is_empty() && holds_string(im.decl.tparams, n) then names.push(n)
                     _ -> ()
@@ -488,8 +487,8 @@ assoc_type(a: &Analysis, scope: Scope, span: Span, subject: Type, member: string
         // read under: the object forgot its type, and what it wrote down in its place is exactly
         // this.
         Trait(_, _, assocs) ->
-            for i in 0..<assocs.len()
-                if assocs.at(i).0 == member then return assocs.at(i).1
+            for assoc in assocs
+                if assoc.0 == member then return assoc.1
 
             a.fault(scope, span, s"'${type_show(subject)}' does not say what '$member' is, so a " +
                     s"slot naming 'Self::$member' has no signature — write it as " +
@@ -514,8 +513,8 @@ assoc_type_opt(a: &Analysis, subject: Type, member: string) -> Option[Type]
     subject match
         Abstract(n, bounds) -> abstract_assoc(a, subject, n, bounds, member)
         Trait(_, _, assocs) ->
-            for i in 0..<assocs.len()
-                if assocs.at(i).0 == member then return Some(assocs.at(i).1)
+            for assoc in assocs
+                if assoc.0 == member then return Some(assoc.1)
 
             None
         _ ->
@@ -531,9 +530,9 @@ end assoc_type_opt
 callable_of(a: &Analysis, t: Type) -> Option[Bound]
     receiver_type(t) match
         Abstract(_, bounds) ->
-            for i in 0..<bounds.len()
-                if fn_parts(bounds.at(i).name, bounds.at(i).args).is_some() then
-                    return Some(bounds.at(i))
+            for item in bounds
+                if fn_parts(item.name, item.args).is_some() then
+                    return Some(item)
 
             None
         Trait(n, args, _) ->

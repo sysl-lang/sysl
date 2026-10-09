@@ -149,8 +149,8 @@ private c_shape(l: TargetLayout, t: Type, target: Target) -> CShape
 private c_alike(pieces: Buf[LType]) -> CShape
     var passed: Buf[IrParam] = buf()
 
-    for i in 0..<pieces.len()
-        passed.push(ir_param(pieces.at(i)))
+    for piece in pieces
+        passed.push(ir_param(piece))
 
     CsRegisters(if pieces.len() == 1 then pieces.at(0) else LStruct(pieces), passed)
 end c_alike
@@ -268,10 +268,10 @@ private c_sysv(l: TargetLayout, t: Type, size: int) -> CShape
 
         var here: Buf[(usize, Type)] = buf()
 
-        for j in 0..<ls.len()
-            val off = int(ls.at(j).0)
+        for item in ls
+            val off = int(item.0)
 
-            if off < hi && off + int(l.size(ls.at(j).1)) > lo then here.push(ls.at(j))
+            if off < hi && off + int(l.size(item.1)) > lo then here.push(item)
 
         if !here.is_empty() && c_all_floating_pairs(here) then pieces.push(c_floating_chunk(l, here))
         else pieces.push(c_integer_chunk(l, ls, lo, hi, size))
@@ -298,8 +298,8 @@ private c_struct_misaligned(l: TargetLayout, d: &StructType, at: int) -> bool
     var bad = false
     val fields = d.stored()
 
-    for i in 0..<fields.len()
-        val f = fields.at(i).1
+    for field in fields
+        val f = field.1
 
         if !d.packed then off = int(round_up(usize(off), l.align(f)))
         if off % int(l.align(f)) != 0 || c_misaligned(l, f, off) then bad = true
@@ -315,8 +315,8 @@ end c_struct_misaligned
 private c_floating_chunk(l: TargetLayout, here: Buf[(usize, Type)]) -> LType
     var kinds: Buf[LType] = buf()
 
-    for i in 0..<here.len()
-        val k = c_lty(l, underlying(here.at(i).1))
+    for item in here
+        val k = c_lty(l, underlying(item.1))
 
         if !c_holds_lty(kinds, k) then kinds.push(k)
 
@@ -334,8 +334,8 @@ private c_integer_chunk(l: TargetLayout, ls: Buf[(usize, Type)], lo: int, hi: in
                         size: int) -> LType
     var starts: Option[Type] = None
 
-    for i in 0..<ls.len()
-        if starts.is_none() && int(ls.at(i).0) == lo then starts = Some(ls.at(i).1)
+    for item in ls
+        if starts.is_none() && int(item.0) == lo then starts = Some(item.1)
 
     // Clamped to what is left of the aggregate, because a member's *allocation* may be wider than
     // the storage it occupies here: a bitfield struct's three-byte container is an `i24`, whose
@@ -347,8 +347,8 @@ private c_integer_chunk(l: TargetLayout, ls: Buf[(usize, Type)], lo: int, hi: in
     val edge = min_int(lo + 8, size)
     var alone = true
 
-    for i in 0..<ls.len()
-        val off = int(ls.at(i).0)
+    for item in ls
+        val off = int(item.0)
 
         if off >= lo + width && off < edge then alone = false
 
@@ -383,16 +383,14 @@ private c_riscv(l: TargetLayout, t: Type, size: int, hard_float: bool, xlen: int
     var fps = 0
     var ints = 0
 
-    for i in 0..<ls.len()
-        if c_floating(ls.at(i)) then fps += 1
-        if c_integral(ls.at(i)) && int(l.size(ls.at(i))) <= xlen then ints += 1
+    for item in ls
+        if c_floating(item) then fps += 1
+        if c_integral(item) && int(l.size(item)) <= xlen then ints += 1
 
     if hard_float && ls.len() <= 2 && fps >= 1 && fps + ints == int(ls.len())
         var pieces: Buf[LType] = buf()
 
-        for i in 0..<ls.len()
-            val m = ls.at(i)
-
+        for m in ls
             pieces.push(if c_floating(m) then c_lty(l, m) else LInt(int(l.size(m)) * 8))
 
         return c_alike(pieces)
@@ -475,8 +473,8 @@ private c_walk(l: TargetLayout, t: Type, at: usize, acc: *Buf[(usize, Type)])
                 var off = at
                 val fields = d.stored()
 
-                for i in 0..<fields.len()
-                    val f = fields.at(i).1
+                for field in fields
+                    val f = field.1
 
                     off = round_up(off, l.align(f))
                     c_walk(l, f, off, acc)
@@ -553,15 +551,15 @@ private c_integral(t: Type) -> bool = underlying(t) match
     _ -> false
 
 private c_all_addresses(ls: Buf[Type]) -> bool
-    for i in 0..<ls.len()
-        if !c_address(ls.at(i)) then return false
+    for item in ls
+        if !c_address(item) then return false
 
     true
 end c_all_addresses
 
 private c_all_floating_pairs(here: Buf[(usize, Type)]) -> bool
-    for i in 0..<here.len()
-        if !c_floating(here.at(i).1) then return false
+    for item in here
+        if !c_floating(item.1) then return false
 
     true
 end c_all_floating_pairs
@@ -570,15 +568,15 @@ private c_leaf_types(l: TargetLayout, t: Type) -> Buf[Type]
     val ls = c_leaves(l, t)
     var out: Buf[Type] = buf()
 
-    for i in 0..<ls.len()
-        out.push(underlying(ls.at(i).1))
+    for item in ls
+        out.push(underlying(item.1))
 
     out
 end c_leaf_types
 
 private c_holds_lty(xs: Buf[LType], x: LType) -> bool
-    for i in 0..<xs.len()
-        if l_render(xs.at(i)) == l_render(x) then return true
+    for item in xs
+        if l_render(item) == l_render(x) then return true
 
     false
 end c_holds_lty

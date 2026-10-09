@@ -66,15 +66,15 @@ holds_task(t: Type) -> bool = t match
     _ -> false
 
 private fields_hold_task(fields: Buf[(string, Type)]) -> bool
-    for i in 0..<fields.len()
-        if holds_task(fields.at(i).1) then return true
+    for field in fields
+        if holds_task(field.1) then return true
 
     false
 end fields_hold_task
 
 private variants_hold_task(variants: Buf[EnumVariant]) -> bool
-    for i in 0..<variants.len()
-        if fields_hold_task(variants.at(i).fields) then return true
+    for item in variants
+        if fields_hold_task(item.fields) then return true
 
     false
 end variants_hold_task
@@ -110,8 +110,8 @@ end BodyValues
 private body_values(a: &Analysis, f: TFunc) -> &BodyValues
     var params: Buf[string] = buf()
 
-    for i in 0..<f.params.len()
-        params.push(f.params.at(i).0)
+    for param in f.params
+        params.push(param.0)
 
     val out: &BodyValues = BodyValues(params, table(), buf(), a.crossing_params.get(f.name).unwrap_or(buf()))
 
@@ -214,8 +214,8 @@ end crossed_load
 private extended(path: Buf[string], name: string) -> Buf[string]
     var out: Buf[string] = buf()
 
-    for i in 0..<path.len()
-        out.push(path.at(i))
+    for item in path
+        out.push(item)
 
     out.push(name)
     out
@@ -243,8 +243,7 @@ end TaskFrame
 private frame_of(f: TFunc) -> &TaskFrame
     val out: &TaskFrame = TaskFrame(buf(), false)
 
-    for i in 0..<f.params.len()
-        val p = f.params.at(i)
+    for p in f.params
         val desc = if p.0 == "self" then "its receiver" else s"its parameter '${p.0}'"
 
         out.hold(desc, p.1, Some(TExpr(span_zero(), TLoad(p.0, p.1))))
@@ -296,10 +295,10 @@ private scan_node(out: &TaskFrame, e: TExpr)
         TMatch(scrutinee, arms, _) ->
             var held = false
 
-            for i in 0..<arms.len()
-                scan_block(out, arms.at(i).body)
+            for arm in arms
+                scan_block(out, arm.body)
 
-                if block_awaits(arms.at(i).body) then held = true
+                if block_awaits(arm.body) then held = true
 
             if held
                 hold_value(out, "the value it matches", scrutinee)
@@ -369,8 +368,8 @@ private hold_value(out: &TaskFrame, desc: string, e: TExpr)
 end hold_value
 
 private hold_subjects(out: &TaskFrame, terms: Buf[TCondTerm])
-    for i in 0..<terms.len()
-        terms.at(i) match
+    for item in terms
+        item match
             TCondIs(subject, _, _) ->
                 hold_value(out, "the value it matches", subject)
                 hold_inner(out, subject)
@@ -378,8 +377,8 @@ private hold_subjects(out: &TaskFrame, terms: Buf[TCondTerm])
 end hold_subjects
 
 private hold_all(out: &TaskFrame, stmts: Buf[TStmt])
-    for i in 0..<stmts.len()
-        stmts.at(i) match
+    for stmt in stmts
+        stmt match
             TVarDecl(name, ty, _, _) -> hold_local(out, name, ty)
             _ -> ()
 end hold_all
@@ -390,8 +389,8 @@ private temp_desc() -> string = "a value computed before an 'await' in the same 
 
 // The temporaries each statement of `stmts`, and what the list yields, holds across an `await`.
 private list_temps(out: &TaskFrame, stmts: Buf[TStmt], result: Option[TExpr])
-    for i in 0..<stmts.len()
-        stmts.at(i) match
+    for stmt in stmts
+        stmt match
             TVarDecl(_, _, init, _) -> order_temps(out, init)
             TExprStmt(e) -> order_temps(out, e)
             TRefDecl(_, _, place) -> order_temps(out, place)
@@ -448,8 +447,8 @@ private order_temps(out: &TaskFrame, e: TExpr)
         _ ->
             val kids = children(e)
 
-            for i in 0..<kids.len()
-                order_temps(out, kids.at(i))
+            for kid in kids
+                order_temps(out, kid)
 
             var later = false
 
@@ -462,8 +461,8 @@ private order_temps(out: &TaskFrame, e: TExpr)
 end order_temps
 
 private term_temps(out: &TaskFrame, terms: Buf[TCondTerm])
-    for i in 0..<terms.len()
-        terms.at(i) match
+    for item in terms
+        item match
             TCondTest(c) -> order_temps(out, c)
             TCondIs(subject, _, _) -> order_temps(out, subject)
 end term_temps
@@ -497,8 +496,8 @@ private hold_inner(out: &TaskFrame, e: TExpr)
         _ ->
             val kids = children(e)
 
-            for i in 0..<kids.len()
-                hold_temps(out, kids.at(i))
+            for kid in kids
+                hold_temps(out, kid)
 end hold_inner
 
 // The operands of `e`, in the order the walk visits them. The walk is outermost first, so the first
@@ -617,8 +616,7 @@ end task_answer
 private frame_holding(w: &World, f: TFunc, ctx: &Ctx, visiting: Buf[string]) -> Option[&Holding]
     val frame = frame_of(f)
 
-    for i in 0..<frame.members.len()
-        val m = frame.members.at(i)
+    for m in frame.members
         val part = unshareable(m.ty)
 
         if part.is_some() then return Some(HeldPart(m.desc, part.unwrap(), m.ty))
@@ -744,8 +742,7 @@ check_task_crossings(a: &Analysis, funcs: Buf[TFunc])
 
     var said: Buf[(string, usize, usize)] = buf()
 
-    for i in 0..<a.task_crossings.len()
-        val c = a.task_crossings.at(i)
+    for c in a.task_crossings
         val at = (c.scope.src.name, c.span.start, c.span.end)
 
         if said_at(said, at) then continue
@@ -779,9 +776,7 @@ check_task_crossings(a: &Analysis, funcs: Buf[TFunc])
 end check_task_crossings
 
 private said_at(said: Buf[(string, usize, usize)], at: (string, usize, usize)) -> bool
-    for i in 0..<said.len()
-        val s = said.at(i)
-
+    for s in said
         if s.0 == at.0 && s.1 == at.1 && s.2 == at.2 then return true
 
     false

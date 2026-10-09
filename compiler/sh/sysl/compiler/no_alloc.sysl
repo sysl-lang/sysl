@@ -95,11 +95,11 @@ allocates(e: TExpr) -> Option[string] = *e.kind match
 check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
     var any = machine_has_no_heap(a)
 
-    for i in 0..<a.tables.module_narrows.len()
-        if a.tables.module_narrows.at(i).1 == CapHeap then any = true
+    for module_narrow in a.tables.module_narrows
+        if module_narrow.1 == CapHeap then any = true
 
-    for i in 0..<a.tables.module_test_narrows.len()
-        if a.tables.module_test_narrows.at(i).1 == CapHeap then any = true
+    for module_test_narrow in a.tables.module_test_narrows
+        if module_test_narrow.1 == CapHeap then any = true
 
     // Lazily, because building the call graph walks every body in the program: a compilation with
     // no clause anywhere -- which is almost all of them -- should pay nothing at all for this pass.
@@ -108,8 +108,8 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
     var seeds: Buf[string] = buf()
     val graph = with_abstract_callees(a, funcs)
 
-    for i in 0..<graph.len()
-        if first_allocation(graph.at(i).body).is_some() then seeds.push(graph.at(i).name)
+    for item in graph
+        if first_allocation(item.body).is_some() then seeds.push(item.name)
 
     val walk = reaches_over(graph, vtables, seeds)
 
@@ -163,8 +163,7 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
     // place the two part company: a member of a structural type is hoisted under a bare
     // `tuple.display`, whose key names no module -- so reading the key puts the library's own tuple
     // renderer in the anonymous module, which is the program's.
-    for i in 0..<a.tables.abstracts.len()
-        val f = a.tables.abstracts.at(i)
+    for f in a.tables.abstracts
         val scope = func_home(a, f.name)
         val module_name = scope.module_name
         val scaffolding = test_only_file(a, scope.src.name)
@@ -227,9 +226,7 @@ private with_abstract_callees(a: &Analysis, funcs: Buf[TFunc]) -> Buf[TFunc]
     for i in 0..<a.tables.abstracts.len()
         val calls = refs_of_block(a.tables.abstracts.at(i).body).calls
 
-        for j in 0..<calls.len()
-            val c = calls.at(j)
-
+        for c in calls
             if holds_string(named, c) || !c.contains("{") then continue
 
             for k in 0..<keys.len()
@@ -286,9 +283,7 @@ struct Skipped
     inside: Buf[(usize, usize)]
 
     covers(self, span: Span) -> bool
-        for i in 0..<self.inside.len()
-            val at = self.inside.at(i)
-
+        for at in self.inside
             if span.start >= at.0 && span.end <= at.1 then return true
 
         false
@@ -332,11 +327,11 @@ private blame_block(a: &Analysis, walk: &Reaches, scope: Scope, b: TBlock, why: 
 
     if whole.is_none() then return
 
-    for i in 0..<b.stmts.len()
-        val one = least_seed(walk, refs_of_stmt(b.stmts.at(i)))
+    for stmt in b.stmts
+        val one = least_seed(walk, refs_of_stmt(stmt))
 
         if one.is_some()
-            first_span_of(b.stmts.at(i)) match
+            first_span_of(stmt) match
                 Some(at) -> reaches_fault(a, scope, at, one.unwrap(), why)
                 None -> ()
             return

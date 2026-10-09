@@ -60,8 +60,8 @@ gather_imports(a: &Analysis, p: Program) -> Imports
     // module's own -- a module does not import itself, and a module *below* it still does.
     if here != AutoImportedModule then wildcards.push(AutoImportedModule)
 
-    for i in 0..<body.len()
-        *body.at(i).kind match
+    for item in body
+        *item.kind match
             ImportDecl(d) -> read_import(a, &names, &modules, &wildcards,
                                          in_package(a, p.pkg, joined(d.path, ".")), d)
             _ -> ()
@@ -69,9 +69,7 @@ gather_imports(a: &Analysis, p: Program) -> Imports
     // **A module auto-imported beside the standard one is offered once**, however the file also
     // names it: `import demo.*` over an auto-imported `demo` is the same wildcard, not a second offer
     // of every name in it. It is conditional on the module being in the compilation at all.
-    for i in 0..<a.also_auto_imported.len()
-        val m = a.also_auto_imported.at(i)
-
+    for m in a.also_auto_imported
         if m != here && holds_string(a.tables.modules, m) && !holds_string(wildcards, m) then
             wildcards.push(m)
 
@@ -107,8 +105,7 @@ read_import(a: &Analysis, names: *Buf[(string, string)], modules: *Buf[(string, 
     // **A selector may name a module beneath the path rather than a member of it**, which is the same
     // import `import a.b.c` would have made -- so it binds the module, and a directory holding no
     // source of its own can still have its sub-modules listed.
-    for i in 0..<d.selectors.len()
-        val s = d.selectors.at(i)
+    for s in d.selectors
         val sub = s"$path.${s.name}"
 
         if a.tables.has_module(sub) then modules.push((selector_bound(s), sub))
@@ -165,33 +162,33 @@ hoist_units(a: &Analysis, units: Buf[Program])
 
     // Which files said `@tests`, recorded before anything is registered: what a `@tests` file
     // declares is scaffolding, and that is asked of every declaration below.
-    for i in 0..<units.len()
-        if units.at(i).test_only
-            a.tables.test_only_files.push(units.at(i).src.name)
-            note_test_file_types(a, units.at(i))
+    for item in units
+        if item.test_only
+            a.tables.test_only_files.push(item.src.name)
+            note_test_file_types(a, item)
 
     // **Every module name is registered before a single scope is built**, because a scope reads its
     // file's import paths through the package layer and that layer asks which paths lead anywhere.
     // Registering as the scopes were made answered that question against a half-filled table, so a
     // file's import of a module declared further down the list was read as naming nothing.
-    for i in 0..<units.len()
-        val name = module_of_unit(units.at(i))
+    for item in units
+        val name = module_of_unit(item)
 
         if !a.tables.has_module(name) then a.tables.modules.push(name)
 
-        val prefix = units.at(i).pkg.prefix
+        val prefix = item.pkg.prefix
 
         if prefix != "" &&!holds_string(a.tables.package_prefixes, prefix)
             a.tables.package_prefixes.push(prefix)
 
         // The project's own modules and every source root's, which a dependency's file may not
         // reach by writing their names (`in_package`).
-        val projects = prefix == "" && !units.at(i).src.name.starts_with(s"$StdPrefix/")
+        val projects = prefix == "" && !item.src.name.starts_with(s"$StdPrefix/")
 
         if projects && !holds_string(a.tables.project_modules, name) then a.tables.project_modules.push(name)
 
-    for i in 0..<units.len()
-        scopes.push(scope_of_unit(a, units.at(i)))
+    for item in units
+        scopes.push(scope_of_unit(a, item))
 
     // The reserved shape is refused before anything is registered, so a declaration that tried to
     // take one is answered by that rather than by the consequences of a name the rest of the
@@ -203,11 +200,11 @@ hoist_units(a: &Analysis, units: Buf[Program])
         val body = units.at(i).body
         val is_entry = a.tables.entry_src != "" && units.at(i).src.name == a.tables.entry_src
 
-        for j in 0..<body.len()
-            if is_entry && entry_binding(body.at(j)) &&
-                    !belongs_to_module(body.at(j), a.tables.entry_captures) then continue
+        for item in body
+            if is_entry && entry_binding(item) &&
+                    !belongs_to_module(item, a.tables.entry_captures) then continue
 
-            val taken = reserved_in(body.at(j))
+            val taken = reserved_in(item)
 
             for k in 0..<taken.len()
                 a.fault(scopes.at(i), taken.at(k).2, refuse_reserved(taken.at(k).0, taken.at(k).1))
@@ -220,10 +217,10 @@ hoist_units(a: &Analysis, units: Buf[Program])
         val body = units.at(i).body
         val is_entry = a.tables.entry_src != "" && units.at(i).src.name == a.tables.entry_src
 
-        for j in 0..<body.len()
-            if is_entry && !belongs_to_module(body.at(j), a.tables.entry_captures) then continue
+        for item in body
+            if is_entry && !belongs_to_module(item, a.tables.entry_captures) then continue
 
-            note_wider(a, scopes.at(i), body.at(j))
+            note_wider(a, scopes.at(i), item)
 
     for i in 0..<units.len()
         val body = units.at(i).body
@@ -260,9 +257,7 @@ private entry_binding(s: Stmt) -> bool = *s.kind match
 // implementation could only take it or replace it whole, and a trait is the wrong place to write a
 // constant every type shares.
 private check_trait_defaults(a: &Analysis, scope: Scope, d: TraitDecl)
-    for i in 0..<d.methods.len()
-        val m = d.methods.at(i)
-
+    for m in d.methods
         if m.recv_mode().is_none() && m.is_static && !m.body.is_empty()
             a.fault(scope, m.span,
                     s"'${d.name}.${m.name}' is a property of the type, so a default body would " +
@@ -287,14 +282,10 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
             check_trait_defaults(a, scope, d)
         TypeDecl(d) -> hoist_type_name(a, scope, s.span, d.name, d.vis, TypeOf(d))
         CTypeBlock(ts) ->
-            for i in 0..<ts.len()
-                val t = ts.at(i)
-
+            for t in ts
                 hoist_type_name(a, scope, t.span, t.name, t.vis, CTypeOf(t))
         CConstBlock(cs) ->
-            for i in 0..<cs.len()
-                val c = cs.at(i)
-
+            for c in cs
                 hoist_value(a, scope, c.span, c.name, Some(c.typ), c.vis, a.tables.consts,
                             "constant", None)
         ConstDecl(name, typ, value, vis) ->
@@ -416,24 +407,16 @@ private record_members_access(a: &Analysis, scope: Scope, key: string, written: 
                               vis: Visibility, kind: DeclKind)
     kind match
         StructOf(d) ->
-            for i in 0..<d.fields.len()
-                val f = d.fields.at(i)
-
+            for f in d.fields
                 record_member_access(a, scope, key, written, vis, f.name, f.vis, f.span)
 
-            for i in 0..<d.members.len()
-                val m = d.members.at(i)
-
+            for m in d.members
                 record_member_access(a, scope, key, written, vis, m.name, m.vis, m.span)
         EnumOf(d) ->
-            for i in 0..<d.members.len()
-                val m = d.members.at(i)
-
+            for m in d.members
                 record_member_access(a, scope, key, written, vis, m.name, m.vis, m.span)
         TraitOf(d) ->
-            for i in 0..<d.methods.len()
-                val m = d.methods.at(i)
-
+            for m in d.methods
                 record_member_access(a, scope, key, written, vis, m.name, Public, m.span)
         _ -> ()
 end record_members_access
@@ -511,8 +494,8 @@ private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vi
 
     kind match
         EnumOf(d) ->
-            for i in 0..<d.variants.len()
-                a.tables.variant_names.put(d.variants.at(i).name, true)
+            for item in d.variants
+                a.tables.variant_names.put(item.name, true)
 
             check_variants_free(a, scope, span, d)
         _ -> ()
@@ -546,8 +529,8 @@ end check_no_module_of_that_name
 // the enum is the declaration that gives the name its second meaning, and the refusal is its own.
 // The first variant that clashes is the one reported.
 private check_variants_free(a: &Analysis, scope: Scope, span: Span, d: EnumDecl)
-    for i in 0..<d.variants.len()
-        val v = d.variants.at(i).name
+    for item in d.variants
+        val v = item.name
         val holder = variant_value_holder(a, module_qualify(scope.module_name, v))
 
         if holder.is_some()
@@ -726,8 +709,8 @@ private hoist_extern(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
     val siblings = extern_overloads(a, base)
     var clash = false
 
-    for i in 0..<siblings.len()
-        val other = a.tables.externs.get(siblings.at(i)).unwrap()
+    for item in siblings
+        val other = a.tables.externs.get(item).unwrap()
 
         if !clash && extern_symbol(other) == extern_symbol(d) then
             a.fault(scope, span, s"'${d.name}' is already declared as an 'extern' for the symbol " +
@@ -737,8 +720,8 @@ private hoist_extern(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
                     "address and 'ptr_cast' it where the other signature is wanted")
             clash = true
 
-    for i in 0..<siblings.len()
-        val other = a.tables.externs.get(siblings.at(i)).unwrap()
+    for item in siblings
+        val other = a.tables.externs.get(item).unwrap()
 
         if same_params(d.params, other.params) then
             a.fault(scope, span, s"function '${d.name}' is already declared" +
@@ -868,13 +851,13 @@ check_pack_spellings(a: &Analysis, scope: Scope, span: Span, tparams: Buf[string
     for i in 0..<values.len()
         names.push(values.at(i).name)
 
-    for i in 0..<tparams.len()
-        if !has_binding(values, tparams.at(i)) then types.push(tparams.at(i))
+    for tparam in tparams
+        if !has_binding(values, tparam) then types.push(tparam)
 
     val lengths = LengthNames(names, types)
 
-    for i in 0..<params.len()
-        walk_pack_spellings(a, scope, span, tparams, packs, lengths, params.at(i).typ)
+    for param in params
+        walk_pack_spellings(a, scope, span, tparams, packs, lengths, param.typ)
 
     if ret.is_some() then walk_pack_spellings(a, scope, span, tparams, packs, lengths, ret.unwrap())
 end check_pack_spellings
@@ -889,8 +872,8 @@ private walk_pack_spellings(a: &Analysis, scope: Scope, span: Span, tparams: Buf
                             packs: Buf[string], lengths: LengthNames, t: TypeRef)
     *t.kind match
         NamedType(_, args) ->
-            for i in 0..<args.len()
-                walk_pack_spellings(a, scope, span, tparams, packs, lengths, args.at(i))
+            for arg in args
+                walk_pack_spellings(a, scope, span, tparams, packs, lengths, arg)
         PtrType(inner) -> walk_pack_spellings(a, scope, span, tparams, packs, lengths, inner)
         RefType(inner, _) -> walk_pack_spellings(a, scope, span, tparams, packs, lengths, inner)
         WeakType(inner) -> walk_pack_spellings(a, scope, span, tparams, packs, lengths, inner)
@@ -920,21 +903,21 @@ private walk_pack_spellings(a: &Analysis, scope: Scope, span: Span, tparams: Buf
                     _ -> ()
             end if
 
-            for i in 0..<parts.len()
-                walk_pack_spellings(a, scope, span, tparams, packs, lengths, parts.at(i))
+            for item in parts
+                walk_pack_spellings(a, scope, span, tparams, packs, lengths, item)
         // A pack reached anywhere else is one written outside the tuple that is the only place for it.
         PackType(n) ->
             declared_pack(a, scope, span, tparams, packs, n)
             a.fault(scope, span, s"'..$n' is a type pack and not a type — the only place one may be " +
                     s"written is inside a tuple, as '(..$n)'")
         FnType(ps, r, _) ->
-            for i in 0..<ps.len()
-                walk_pack_spellings(a, scope, span, tparams, packs, lengths, ps.at(i))
+            for item in ps
+                walk_pack_spellings(a, scope, span, tparams, packs, lengths, item)
 
             walk_pack_spellings(a, scope, span, tparams, packs, lengths, r)
         CFnType(ps, r) ->
-            for i in 0..<ps.len()
-                walk_pack_spellings(a, scope, span, tparams, packs, lengths, ps.at(i))
+            for item in ps
+                walk_pack_spellings(a, scope, span, tparams, packs, lengths, item)
 
             walk_pack_spellings(a, scope, span, tparams, packs, lengths, r)
         AssocType(base, _) -> walk_pack_spellings(a, scope, span, tparams, packs, lengths, base)
@@ -983,8 +966,8 @@ private value_params_in(e: Expr, names: Buf[string], out: *Buf[string])
                 value_params_in(operands.at(1), names, out)
             end if
         Call(_, args) ->
-            for i in 0..<args.len()
-                value_params_in(args.at(i), names, out)
+            for arg in args
+                value_params_in(arg, names, out)
         _ -> ()
 end value_params_in
 
@@ -1099,8 +1082,8 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
 
     var clash = false
 
-    for i in 0..<siblings.len()
-        val other = a.tables.funcs.get(siblings.at(i))
+    for item in siblings
+        val other = a.tables.funcs.get(item)
 
         if other.is_some() then
             if same_params(d.params, other.unwrap().decl.params) then
@@ -1119,8 +1102,8 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
     val key = if siblings.is_empty() then base else s"$base.${siblings.len() + 1}"
     var set: Buf[string] = buf()
 
-    for i in 0..<siblings.len()
-        set.push(siblings.at(i))
+    for item in siblings
+        set.push(item)
 
     set.push(key)
     a.tables.overloads.put(base, set)
@@ -1266,11 +1249,11 @@ private note_wider(a: &Analysis, scope: Scope, s: Stmt)
         TraitDecl(d) -> note_wider_name(a, scope, d.name, d.vis)
         TypeDecl(d) -> note_wider_name(a, scope, d.name, d.vis)
         CTypeBlock(ts) ->
-            for i in 0..<ts.len()
-                note_wider_name(a, scope, ts.at(i).name, ts.at(i).vis)
+            for item in ts
+                note_wider_name(a, scope, item.name, item.vis)
         CConstBlock(cs) ->
-            for i in 0..<cs.len()
-                note_wider_name(a, scope, cs.at(i).name, cs.at(i).vis)
+            for item in cs
+                note_wider_name(a, scope, item.name, item.vis)
         ConstDecl(name, _, _, vis) -> note_wider_name(a, scope, name, vis)
         ValDecl(name, _, _, vis, _, _) -> note_wider_name(a, scope, name, vis)
         VarDecl(name, _, _, vis, _, _, _) -> note_wider_name(a, scope, name, vis)
@@ -1366,8 +1349,8 @@ end overlapping_lists
 private required(ps: Buf[Param]) -> usize
     var n: usize = 0
 
-    for i in 0..<ps.len()
-        if ps.at(i).default.is_none() then n += 1
+    for item in ps
+        if item.default.is_none() then n += 1
 
     n
 end required
@@ -1409,8 +1392,8 @@ end indistinguishable_lists
 // a `new` type. A transparent alias is left out, since it is another spelling of a type declared
 // somewhere else.
 private note_test_file_types(a: &Analysis, unit: Program)
-    for j in 0..<unit.body.len()
-        val name = *unit.body.at(j).kind match
+    for item in unit.body
+        val name = *item.kind match
             StructDecl(d) -> d.name
             EnumDecl(d) -> d.name
             TraitDecl(d) -> d.name
@@ -1441,8 +1424,8 @@ private impl_subject_local(a: &Analysis, src: string, d: ImplDecl) -> bool = *d.
 // and no build but a test build keeps it.
 // Whether a file is one that said `@tests`, which is what makes everything it declares scaffolding.
 test_only_file(a: &Analysis, name: string) -> bool
-    for i in 0..<a.tables.test_only_files.len()
-        if a.tables.test_only_files.at(i) == name then return true
+    for item in a.tables.test_only_files
+        if item == name then return true
 
     false
 end test_only_file
