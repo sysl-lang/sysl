@@ -1,0 +1,86 @@
+module sh.sysl.compiler
+@tests
+
+// End markers: which constructs take one, and the three refusals that keep a marker from drifting
+// from what it claims to close (the end-marker sections of `reference/declarations.md` and
+// `reference/statements.md`).
+
+// -- what takes a marker ---------------------------------------------------------------------------
+
+@test("a 'match' takes 'end match' under its arms, and parses as it does without one")
+emk_end_match_closes_the_arms()
+    assert_eq(pf("val r = n match\n    0 -> 1\n    _ -> 2\nend match\n"),
+              pf("val r = n match\n    0 -> 1\n    _ -> 2\n"))
+    assert_eq(pf("n match\n    0 -> print(0)\n    _ -> print(1)\nend match\nprint(2)\n"),
+              pf("n match\n    0 -> print(0)\n    _ -> print(1)\nprint(2)\n"))
+
+@test("a block-bodied 'val' or 'var' takes 'end' and its name")
+emk_end_name_closes_a_binding()
+    assert_eq(pf("val x =\n    val y = 1\n    y\nend x\n"), pf("val x =\n    val y = 1\n    y\n"))
+    assert_eq(pf("var x =\n    val y = 1\n    y\nend x\n"), pf("var x =\n    val y = 1\n    y\n"))
+    assert_eq(pf("val k = n match\n    0 -> 1\n    _ -> 2\nend k\n"), pf("val k = n match\n    0 -> 1\n    _ -> 2\n"))
+
+@test("a marker naming an enclosing construct opened on the same line is that construct's")
+emk_a_marker_for_a_construct_on_the_same_line()
+    assert_eq(pf("val k = if w then n match\n    0 -> 1\n    _ -> 2\nend if\n"),
+              pf("val k = if w then n match\n    0 -> 1\n    _ -> 2\n"))
+    assert_eq(pf("val k = if w then n match\n    0 -> 1\n    _ -> 2\nend k\n"),
+              pf("val k = if w then n match\n    0 -> 1\n    _ -> 2\n"))
+
+@test("'end' stays an ordinary name: 'end match' with arms under it is a 'match' over it")
+emk_end_is_still_a_name()
+    assert_eq(pf("val end = 1\nend match\n    0 -> print(0)\n    _ -> print(1)\n"),
+              "(val end 1) (match end (arm 0 -> (call print 0)) (arm _ -> (call print 1)))")
+    assert_eq(pf_err("while c\n    print(1)\nend += 1\n"), "")
+    assert_eq(pf_err("var end = 3\nend -= 1\n"), "")
+
+// -- a marker naming another construct -------------------------------------------------------------
+
+@test("a marker naming another construct is refused, naming both")
+emk_a_mismatched_marker_names_both()
+    assert_eq(pf_err("while c\n    print(1)\nend for\n"),
+              "'end for' cannot close the 'while' above it \u{2014} its marker is 'end while'")
+    assert_eq(pf_at("while c\n    print(1)\nend for\n"), "3:1")
+    assert_eq(pf_err("n match\n    0 -> print(0)\n    _ -> print(1)\nend if\n"),
+              "'end if' cannot close the 'match' above it \u{2014} its marker is 'end match'")
+    assert_eq(pf_err("for x in xs\n    print(x)\nend loop\n"),
+              "'end loop' cannot close the 'for' above it \u{2014} its marker is 'end for'")
+
+@test("a mismatched marker is taken, so the line after it is read as what it is")
+emk_a_mismatched_marker_is_taken()
+    assert_eq(pf_lines("while c\n    print(1)\nend for\nprint(2)\n").len(), 1)
+
+@test("a marker naming a construct whose block is still open is refused by the inner one")
+emk_a_marker_for_a_construct_still_open()
+    assert_eq(pf_err("if c\n    while d\n        print(1)\n    end if\n"),
+              "'end if' cannot close the 'while' above it \u{2014} its marker is 'end while'")
+
+@test("a binding's marker names its binding, and another name is refused naming both")
+emk_a_binding_marker_names_the_binding()
+    assert_eq(pf_err("val x =\n    1\nend y\n"),
+              "'end y' cannot close the 'val x' above it \u{2014} its marker is 'end x'")
+    assert_eq(pf_err("var x =\n    1\nend while\n"),
+              "'end while' cannot close the 'var x' above it \u{2014} its marker is 'end x'")
+
+@test("a statement's marker under a declaration is refused as another declaration's name is")
+emk_a_statement_marker_under_a_declaration()
+    assert_eq(pf_err("f()\n    print(1)\nend while\n"), "'end while' does not match 'f'")
+
+// -- a marker after a one-line form ----------------------------------------------------------------
+
+@test("a marker after a one-line form is refused: there is no block for it to close")
+emk_no_marker_after_a_one_liner()
+    assert_eq(pf_err("if c then print(1)\nend if\n"),
+              "'end if' has no block to close \u{2014} the 'if' above it ends on a one-line form, which takes no marker")
+    assert_eq(pf_err("while c do print(1)\nend while\n"),
+              "'end while' has no block to close \u{2014} the 'while' above it ends on a one-line form, which takes no marker")
+    assert_eq(pf_err("for x in xs do print(x)\nend for\n"),
+              "'end for' has no block to close \u{2014} the 'for' above it ends on a one-line form, which takes no marker")
+    assert_eq(pf_err("val x = 1\nend x\n"),
+              "'end x' has no block to close \u{2014} the 'val x' above it ends on a one-line form, which takes no marker")
+
+@test("an 'if' whose last branch is written on one line ends on a one-line form")
+emk_a_one_line_last_branch()
+    assert_eq(pf_err("if c\n    print(1)\nelse print(2)\nend if\n"),
+              "'end if' has no block to close \u{2014} the 'if' above it ends on a one-line form, which takes no marker")
+    assert_eq(pf_err("if c then print(1)\nelse\n    print(2)\nend if\n"), "")

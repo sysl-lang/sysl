@@ -2018,8 +2018,79 @@ everywhere and checked when written, so it cannot drift from the thing it claims
 The one place it is **required** is a struct with no fields, where it is the only thing distinguishing
 a body that is deliberately empty from one that was meant to be there.
 
+A **binding whose value is an indented block** takes one too, naming the binding — `end x` after a
+`val x =` or a `var x =` — and so does one whose value ends in a block, such as a `match`:
+
+```sysl
+classify(n: int) -> string
+    val kind = n match
+        0 -> "zero"
+        _ -> "some"
+    end kind
+
+    kind
+
+print(classify(0))
+```
+
+```output
+zero
+```
+
+**A marker that names something else is refused, naming both** — a declaration's `end Name` under
+another declaration, a statement's marker under a declaration, or another name under a binding:
+
+```sysl
+total(xs: []int) -> int
+    var sum = 0
+
+    for x in xs
+        sum += x
+
+    sum
+end while
+
+print(total([1, 2]))
+```
+
+```error
+'end while' does not match 'total'
+```
+
+```sysl
+var limit =
+    val base = 10
+
+    base * 2
+end bound
+
+print(limit)
+```
+
+```error
+'end bound' cannot close the 'var limit' above it — its marker is 'end limit'
+```
+
+**A marker closes a block, so one after a value written on one line is refused** — there is nothing
+for it to close, and it would only add clutter:
+
+```sysl
+val x = 1
+end x
+
+print(x)
+```
+
+```error
+'end x' has no block to close — the 'val x' above it ends on a one-line form, which takes no marker
+```
+
+The statements' own markers — `end if`, `end while`, `end for`, `end loop` and `end match` — are on
+[statements](/reference/statements/), under the same rules.
+
 `end` is a **soft** word: it is an ordinary identifier everywhere except immediately before a name or
-a construct keyword, so `end` stays usable as a variable.
+a construct keyword, so `end` stays usable as a variable — `end match` with arms indented under it is a
+`match` over a binding called `end`.
 
 ---
 

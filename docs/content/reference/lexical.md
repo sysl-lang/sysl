@@ -907,6 +907,48 @@ print(count(4))
 10
 ```
 
+### A dedent goes back to a margin that is still open
+
+**A line less indented than the one above it has to line up with a block that is still open**, and it
+closes every block indented deeper than it. A line that lines up with none of them — a body pulled back
+to a column between two open margins, usually after moving code — is refused, naming the two margins it
+fell between:
+
+```sysl
+check(n: int)
+    if n > 0
+        print("positive")
+      print("checked")
+```
+
+```error
+a line indented 6 columns lines up with no open block: it sits between the block indented 8 and the one indented 4 — indent it to one of the two
+```
+
+It is refused rather than read at the nearer margin because the layout cannot know which of the two was
+meant, and the two readings are different programs: at column 8 the second `print` runs only for a
+positive `n`, at column 4 it runs for every one. An `end` marker is a line like any other and is held to
+the same rule. A tab counts as one column.
+
+The same holds for an `else` written under its `if` when the `if` sits to the right of a `=`: the `if`'s
+column is no block's margin. Put the `else` at the statement's margin, or open the value as a block of
+its own:
+
+```sysl
+sign(n: int) -> string
+    val word =
+        if n < 0 then "negative"
+        else "not negative"
+
+    word
+
+print(sign(-3))
+```
+
+```output
+negative
+```
+
 ### Brackets suspend the rule
 
 Inside `(`, `[` or `{`, layout stops applying until the bracket closes — so an argument list, an array

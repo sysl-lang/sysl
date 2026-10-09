@@ -111,8 +111,77 @@ positive
 ```
 
 `end` is a **soft** word — an ordinary identifier everywhere except immediately before a construct
-keyword — so `end` remains usable as a name. The same marker closes `while`, `for`, `loop`, a struct
-and an enum.
+keyword — so `end` remains usable as a name. The same marker closes `while`, `for`, `loop` and
+`match` here, and a struct, an enum and a block-bodied `val` or `var` on
+[declarations](/reference/declarations/).
+
+**A marker is checked where it is written, so one naming another construct is refused, naming both:**
+
+```sysl
+var n = 3
+
+while n > 0
+    n -= 1
+end for
+```
+
+```error
+'end for' cannot close the 'while' above it — its marker is 'end while'
+```
+
+**A marker closes an indented block, so one after a one-line form is refused** — a one-liner has no
+block for it to close, and the marker would only be clutter. A construct whose *last* part is written
+on one line ends on a one-line form too, whatever came before it:
+
+```sysl
+var n = 3
+
+if n > 0 then print("positive")
+end if
+```
+
+```error
+'end if' has no block to close — the 'if' above it ends on a one-line form, which takes no marker
+```
+
+**Where two constructs open on one line, their blocks close together, and the marker is the outer
+one's to write** — the `match` below ends the `if`'s body as well as its own arms, so `end if` closes
+both:
+
+```sysl
+report(wide: bool, n: int)
+    if wide then n match
+        0 -> print("none")
+        _ -> print("some")
+    end if
+
+report(true, 0)
+report(true, 5)
+```
+
+```output
+none
+some
+```
+
+A `match` takes `end match` under its arms in the same way:
+
+```sysl
+tier(n: int) -> string
+    val name = n match
+        0 -> "bronze"
+        1 -> "silver"
+        _ -> "gold"
+    end match
+
+    name
+
+print(tier(1))
+```
+
+```output
+silver
+```
 
 ## `match`
 

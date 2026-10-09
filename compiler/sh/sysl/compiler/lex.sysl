@@ -197,7 +197,13 @@ private lex_from(start: Scanner) -> Result[Lexed, Diagnostic]
                 return Err(error(point(margin),
                     "only tabs or spaces (but not both on a given line) may be used for indentation"))
 
-            emit_dent(&out, lay.line(ind.columns), point(line_end), point(s.offset), started)
+            val dent = lay.line(ind.columns)
+
+            dent match
+                Ragged(_) -> return Err(error(point(s.offset), ragged_line(lay, ind.columns)))
+                _ -> ()
+
+            emit_dent(&out, dent, point(line_end), point(s.offset), started)
 
             started = true
             at_line_head = false
@@ -242,10 +248,7 @@ end lex_from
 // preceded by the newline that ended the header, and each block a line closes is followed by the
 // newline that ends the statement outside it.
 //
-// A **ragged** line -- one less indented than the line above and matching no level still open -- is
-// not a lexical error. It closes the innermost block and carries on at the nearest level below it,
-// exactly as the bootstrap does, and what goes wrong is reported by whichever rule the line then
-// fails to satisfy.
+// A **ragged** line never reaches it: `lex_from` refuses it first (`ragged_line`).
 private emit_dent(out: *Buf[Spanned[Tok]], d: Dent, ended: Span, at: Span, started: bool)
     d match
         Same ->
@@ -257,6 +260,18 @@ private emit_dent(out: *Buf[Spanned[Tok]], d: Dent, ended: Span, at: Span, start
         Shallower(levels) -> close_levels(out, levels, ended, at, started)
         Ragged(levels) -> close_levels(out, levels, ended, at, started)
 end emit_dent
+
+// The refusal of a **ragged** line -- one less indented than the line above it and lined up with no
+// block still open -- named by the two margins it fell between.
+//
+// **It is refused rather than read at the nearest level below it**, because the reader meant one of
+// the two margins and the layout cannot know which: carrying on at the outer one turned a body pulled
+// back by two columns into a statement of the enclosing block, and the complaint, when there was one,
+// landed lines away from the mistake (`reference/lexical.md § A dedent goes back to a margin that is still open`).
+private ragged_line(lay: Layout, column: usize) -> string
+    val outer = if lay.margin() == 0 then "the left margin" else s"the one indented ${lay.margin()}"
+
+    s"a line indented ${column} columns lines up with no open block: it sits between the block indented ${lay.left_margin()} and ${outer} \u{2014} indent it to one of the two"
 
 private close_levels(out: *Buf[Spanned[Tok]], levels: usize, ended: Span, at: Span, started: bool)
     if started then out.push(Spanned(Newline, ended))
