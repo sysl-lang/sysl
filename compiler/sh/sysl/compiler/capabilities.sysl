@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Set, set}
+import sysl.text.Search
 
 // What a module says it needs of a machine, and what it gives up in exchange.
 //
@@ -746,10 +747,27 @@ private blame_needs_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, ca
 
     if mine.is_none() then return
     if reaches_a_seed(walk, strict_refs(e)) then return
+    if refused_as_module(a, scope, e.span, cap) then return
 
     a.fault(scope, e.span, s"this reaches '${seed_shown(a, scope, mine.unwrap())}', which needs '$cap', " +
             s"and $why")
 end blame_needs_one
+
+// Whether `check_gated_modules` already refused a reference inside `span` for `cap`.
+//
+// **One reference is one mistake, told in the words of what the program named.** A gated library
+// module keeps its `@needs` on the externs of a private hook module (`sysl.fs.sys`), so a call of
+// `sysl.fs.exists` on a machine without `os` reaches both the module and the hook; the module's
+// refusal names what the reader wrote, and the hook's would name a declaration they cannot see.
+private refused_as_module(a: &Analysis, scope: Scope, span: Span, cap: string) -> bool
+    val said = s"which requires '$cap'"
+
+    for d in a.found
+        if d.src.name == scope.src.name && d.diag.span.start >= span.start &&
+                d.diag.span.start < span.end && d.diag.message.contains(said) then return true
+
+    false
+end refused_as_module
 
 // -- what a module that gave up an environment capability may not reach ----------------------------
 

@@ -482,18 +482,31 @@ vlt_a_literal_handed_to_the_heap() =
 // A constant `val` skips the initializer order entirely, and it skips every check that would have
 // run in one. Both are correct only if nothing that *needs* either has become constant.
 
-// A value that has to be checked is code, whatever it looks like. The load-bearing assertion is the
-// out-of-range one, an in-range value reading back either way.
+// A value that has to be checked is code, whatever it looks like -- unless the compiler can check it
+// itself. A field over a constant is converted while compiling, so an in-range one is laid down as
+// data and an out-of-range one is a compile error; a field over a computed value is filled at
+// startup, and its check runs there. The load-bearing assertion is the computed out-of-range one.
 @test("a struct 'val' with a constrained field is filled by code, so the field's check still runs")
 vlt_a_constrained_field_is_filled_by_code()
     if !vlt_ready() then return
 
     val head = "type Age = int within 0..150\nstruct P\n    age: Age\nend P\n"
-    val out = vlt_ir(head + "static val p: P = P(40)\nprint(p.age)")
+    val computed = head + "years(n: int) -> int = n * 2\n"
+    val out = vlt_ir(computed + "static val p: P = P(years(20))\nprint(p.age)")
 
     vlt_has(out, "@p = private global %struct.P zeroinitializer")
     vlt_has_not(out, "@p = private constant")
-    assert(vlt_exits(head + "static val p: P = P(200)\nprint(p.age)"))
+    assert(vlt_exits(computed + "static val p: P = P(years(100))\nprint(p.age)"))
+
+@test("a struct 'val' whose constrained field is a constant is checked while compiling")
+vlt_a_constant_constrained_field_is_checked_at_compile_time()
+    if !vlt_ready() then return
+
+    val head = "type Age = int within 0..150\nstruct P\n    age: Age\nend P\n"
+
+    vlt_has(vlt_ir(head + "static val p: P = P(40)\nprint(p.age)"), "@p = private constant %struct.P { i32 40 }")
+    vlt_has(vlt_ir(head + "static val p: P = P(200)\nprint(p.age)"),
+            "200 is not a value 'Age' admits — module storage over a constant is laid down while compiling")
 
 // A constant `val` is readable before any initializer runs, so a computed one may read it -- the
 // ordering graph is over the computed ones, and a constant is already there.
