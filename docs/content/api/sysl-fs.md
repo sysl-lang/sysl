@@ -680,6 +680,7 @@ enum IoError
     NoSpaceLeft
     Interrupted
     NotOpen
+    NotPermitted
     InvalidUtf8(offset: usize)
     Other(code: int)
 ```

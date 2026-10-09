@@ -642,6 +642,10 @@ emit_llvm_text(path: string, named_target: Option[string],
     // (`image_storage_unfilled`).
     check_image_storage(done.an, pruned, program.own, image_entry_named(root, t))
 
+    // **And an `extern` naming `main` is a start file's call, which only an image starting somewhere
+    // else has** (`check_main_extern`).
+    if links_an_image(t) then check_main_extern(done.an, pruned, image_entry_named(root, t))
+
     // **And one with no C library under it answers every library hook it reaches itself** -- a
     // filesystem's, a descriptor's (`check_library_hooks`) -- and reaches no specifier only C's
     // `snprintf` applies (`check_c_formatting`).
@@ -672,6 +676,10 @@ emit_llvm_text(path: string, named_target: Option[string],
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(linked.precompiled,
                                                                            roots.precompiled) },
                                     t, promotions)
+
+    // **And one that put a type aligned beyond the pair's promise on the heap answers the aligned
+    // hook**, where nothing writes it a default (`check_aligned_heap`).
+    check_aligned_heap(done.an, kept)
 
     // Read back out of the analysis rather than off the snapshot the body pass answered with: the
     // checks above have just added to it.
@@ -1454,8 +1462,11 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
 
     check_library_hooks(done.an, kept)
     check_c_formatting(done.an, kept)
+    check_main_extern(done.an, kept, "")
 
     val lowered = codegen_with_gaps(kept, t, promotions)
+
+    check_aligned_heap(done.an, kept)
 
     val report = errors_of(done.an.diagnostics())
 
@@ -1865,6 +1876,9 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(precompiled,
                                                                            roots.precompiled) },
                                     t, promotions)
+
+    check_aligned_heap(done.an, kept)
+
     val emitted = Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1,
                           link_required(program.units), roots.archives)
 

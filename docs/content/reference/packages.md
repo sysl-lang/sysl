@@ -548,6 +548,69 @@ Storage that folds — literals, a struct over constants — is laid into the im
 computed storage nothing reaches is left alone. It is the same rule `build-c` holds a freestanding
 archive to, which has no entry at all.
 
+### A runtime written in sysl calls `main` through an `extern`
+
+The entry's job of calling `main` need not be assembly. On an image whose block names an `entry`
+other than `main`, an `extern` may name `main`, and the runtime calls the program through it as a C
+start file does — passing the argument count and vector, and handing the answer to whatever ends the
+program:
+
+```hocon
+targets {
+  aarch64-freestanding {
+    linker_script = "user.ld"
+    entry         = "_start"
+  }
+}
+```
+
+```sysl
+extern "main" program_main(argc: int, argv: **u8) -> int
+
+@export("keel_start")
+keel_start(argc: int, argv: **u8) -> never = exit(program_main(argc, argv))
+```
+
+`_start` (a few lines of module-level `asm` setting `x0` and `x1` from the stack) branches to
+`keel_start`, and the call reaches the `main` this program defines: nothing is declared beside it,
+and the call is enough to make the image carry a `main` and to count its computed storage as filled.
+
+**`main` is emitted at C's signature whatever the program declared**, so the `extern` is declared at
+it too — an `int` count (32 bits, signed), a pointer, an `int` answer (a measured `c type` such as
+`c_int` reads as what it measures). Anything else would read arguments nobody passed, and is refused:
+
+```
+'main' is defined at C's signature, '(int, **byte) -> int' — the argument count and the argument vector — so an 'extern' naming it takes those, where this one is '() -> int'
+```
+
+Everywhere else the name stays the platform's. A hosted program is started at `main` by its C
+runtime, so the `extern` is refused where it is written:
+
+```sysl
+extern "main" again(argc: int, argv: **u8) -> int
+```
+
+```error
+'main' is where the platform starts this program, so an 'extern' may not name that symbol
+```
+
+and a bare image that names no entry, or names `main` itself, starts there, so a call to it is
+refused too:
+
+```sysl target=aarch64-freestanding
+extern "main" program_main(argc: int, argv: **u8) -> int
+
+@export("kstart")
+kstart() -> int = program_main(0, null)
+```
+
+```error
+an 'extern' may name 'main' only on an image that starts somewhere else, whose entry calls it — and this image names no entry of its own ('targets.aarch64-freestanding.entry'), so 'main' is where it starts
+```
+
+An archive `build-c` writes is refused the same way, its `main` being the C program's; and an
+`extern` *variable* at `main`'s symbol is refused on every target, storage never being an entry.
+
 ### What is refused
 
 - **The keys in a dependency.** How an image is linked is the program's own to say; a library's
@@ -565,6 +628,8 @@ archive to, which has no entry at all.
 - **A value that is not a non-empty string**, and an `entry` holding a space, a comma or `=`, when the
   file is read.
 - **Computed module storage read from an image whose entry never runs `main`** — described above.
+- **An `extern` naming `main` where nothing else starts the image**, or at a signature other than
+  C's `main` — described above.
 ## What the generated code may use of the machine
 
 A kernel wants two things a program does not: code that never touches the floating-point and SIMD
@@ -681,7 +746,7 @@ float and is copied whole is not a float use; reading the field out is.
 
 ## Capabilities
 
-**Whether the machine has a heap, an operating system or POSIX is a project engineering
+**Whether the machine has a heap, an operating system, POSIX or a C library is a project engineering
 decision, and this is where it is stated.** The compiler's registry of targets deliberately carries no
 capabilities: a target's ABI is measured and its capabilities are policy, so the ABI is the registry's
 and the policy is yours.
@@ -693,7 +758,8 @@ capabilities { heap = false }
 That is the project's own statement and it applies to **every** target the project builds for. A
 capability the file does not mention is provided — the prior is that a machine can do everything,
 which is what every build had before there was a file to say otherwise, so what a config records is
-what a machine *cannot* do.
+what a machine *cannot* do. The one exception is `libc` on a freestanding target, which the file
+grants rather than takes away ([below](#libc-the-one-a-freestanding-target-starts-without)).
 
 **A target block layers over it, per capability, for the one machine that differs:**
 
@@ -734,6 +800,34 @@ belongs.
 
 For compatibility with packages already published, `alloc` is still accepted in this file and read as
 `heap`. Write `heap`.
+
+### `libc`, the one a freestanding target starts without
+
+The fourth capability is **a C library under the program**, and it is the exception to the prior
+above: a hosted target has one, and a freestanding target does **not** until the file grants it.
+Whether a board has one is the build's business, not the triple's — a Pico SDK build links newlib, as
+Zephyr and FreeRTOS builds link theirs, while a bare image links nothing — so the project says so:
+
+```hocon
+targets {
+  thumb-freestanding-softfp { capabilities { libc = true } }
+}
+```
+
+What it makes legal is **C's own functions** and nothing more. A float conversion, a `%s` and a plain
+hole of a float are rendered by C's `snprintf`, so without the capability each one a program reaches
+is refused where it is written ([formatted strings](/reference/strings/)); with it they build, and
+`snprintf` is left for the board's link to find. The same goes for storage aligned beyond what the
+allocating pair promises: where `libc` stands and the pair is libc's own, `sysl_alloc_aligned` and
+`sysl_free_aligned` default to `posix_memalign` and `free`; where it does not, the program defines
+them.
+
+**It is not an operating system**, and the library's hooks are about one. newlib's `read` and `fopen`
+are stubs a board answers, not a filesystem, so a program reaching [`sysl.fs`](/library/fs/) or
+reading a descriptor through [`sysl.io`](/library/io/) still answers their hooks with its own
+`@export`s, `libc` granted or not — the refusal says so where it was. No module states `libc`; it is
+a statement about the machine, written in this file and nowhere else, and like the others it is part
+of the run cache's key.
 
 ## One heap, and the package that names it
 
@@ -787,6 +881,43 @@ declare a pair too, which covers an application with its own arena and no depend
 **Whichever road the package arrived by.** A package named in `dependencies` and the same package
 handed over as a `--lib` source root declare the same thing and settle the same question — this is a
 property of the package, not of the flag that reached it.
+
+### A type aligned beyond what the pair promises
+
+The pair is held to `malloc`'s promise: a block begins on a boundary of two words — sixteen bytes on
+a 64-bit machine, eight on a 32-bit one. A box, a buffer or a task's frame holding a type that asks
+for more (an [`@align(n)`](/reference/attributes/#alignn--where-the-aggregate-begins) struct, or a
+`u128` on a 32-bit machine) is taken from a second pair instead:
+
+```sysl
+@export("sysl_alloc_aligned")
+my_alloc_aligned(size: usize, align: usize) -> *u8 = ...
+
+@export("sysl_free_aligned")
+my_free_aligned(p: *u8) = ...
+```
+
+The first answers `size` bytes beginning on `align` — a power of two, larger than the pair's own
+boundary — or null, and the second gives such a block back; the storage's destruction hook knows
+which pair made it.
+
+Where the allocating pair is libc's, the compiler writes `weak` defaults over the C library's own
+aligned allocation — `posix_memalign` and `free` on a POSIX system and WASI, `_aligned_malloc` and
+`_aligned_free` on Windows — and a program's own definitions displace them. Anywhere else — a pair
+the manifest named, or a machine with no C library under it — only the program knows how its heap
+answers a boundary, so a program that puts such a type on the heap and does not define both is
+refused when it is compiled, naming the storage and the two hooks:
+
+```
+a box of 'Page' asks for the 4096-byte boundary its type is aligned on, and the allocating pair
+('img_alloc' and 'img_free') promises only 16 — 'aarch64-freestanding' has no C library with an
+aligned allocation to answer it. Define 'sysl_alloc_aligned(size: usize, align: usize) -> *u8'
+and 'sysl_free_aligned(p: *u8)' with '@export', the first answering a block on that boundary and
+the second giving one back
+```
+
+A program that never puts such a type on the heap never names either, so a pair alone is still the
+whole of what a heap needs to supply.
 
 ### The compiled standard module is built for one allocator
 
