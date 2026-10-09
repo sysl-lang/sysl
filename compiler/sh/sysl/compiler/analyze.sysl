@@ -45,15 +45,12 @@ end analyze_decls_of
 private refuse_library_modules(a: &Analysis, units: Buf[Program])
     var carried: Buf[string] = buf()
 
-    for i in 0..<units.len()
-        val u = units.at(i)
-
+    for u in units
         if library_file(a, u) then carried.push(module_of_unit(u))
 
     if carried.is_empty() then return
 
-    for i in 0..<units.len()
-        val u = units.at(i)
+    for u in units
         val name = module_of_unit(u)
 
         if u.src.name.starts_with(s"$StdPrefix/") || !holds_string(carried, name) then continue
@@ -108,8 +105,8 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
 
     var scopes: Buf[Scope] = buf()
 
-    for i in 0..<units.len()
-        scopes.push(scope_of_unit(a, units.at(i)))
+    for item in units
+        scopes.push(scope_of_unit(a, item))
 
     // Every declaration exists now, so what an `import` claimed a module declares can be looked up.
     for i in 0..<units.len()
@@ -187,10 +184,10 @@ end read_decls
 private check_imports(a: &Analysis, scope: Scope, body: Buf[Stmt])
     var taken: Buf[string] = buf()
 
-    for i in 0..<body.len()
-        *body.at(i).kind match
+    for item in body
+        *item.kind match
             ImportDecl(d) ->
-                val said = import_refusals(a, scope, body.at(i).span, d, &taken)
+                val said = import_refusals(a, scope, item.span, d, &taken)
 
                 for k in 0..<said.len()
                     a.fault(scope, said.at(k).0, said.at(k).1)
@@ -227,8 +224,7 @@ import_refusals(a: &Analysis, scope: Scope, span: Span, d: ImportDecl,
             out.push((span, s"no module is called '$written'"))
             return out
 
-        for i in 0..<d.selectors.len()
-            val s = d.selectors.at(i)
+        for s in d.selectors
             val sub = s"$path.${s.name}"
 
             // A selector list points at the selector, which is the word that has to go.
@@ -322,8 +318,8 @@ rewind_registered(into: &Table[Type], mark: usize)
     for i in mark..<into.len()
         made.push(into.key_at(i))
 
-    for i in 0..<made.len()
-        into.remove(made.at(i))
+    for item in made
+        into.remove(item)
 
 // Records that a module reached into another, which is what resolving a name to a key *makes*.
 //
@@ -450,8 +446,8 @@ offered_by(a: &Analysis, scope: Scope, name: string, has: &Fn(string) -> bool) -
 
     if bound.is_some() && has(bound.unwrap()) then return out
 
-    for i in 0..<im.wildcards.len()
-        val key = module_qualify(im.wildcards.at(i), name)
+    for item in im.wildcards
+        val key = module_qualify(item, name)
 
         if !holds_string(out, key) && has(key) && reachable_key(a, key, scope) then out.push(key)
 
@@ -472,8 +468,8 @@ answering_imports(a: &Analysis, scope: Scope, name: string, has: &Fn(string) -> 
 
         if bound.is_some() && has(bound.unwrap()) then return im
 
-        for j in 0..<im.wildcards.len()
-            val key = module_qualify(im.wildcards.at(j), name)
+        for item in im.wildcards
+            val key = module_qualify(item, name)
 
             if has(key) && reachable_key(a, key, scope) then return im
 
@@ -510,8 +506,8 @@ enum_of_variant(a: &Analysis, key: string) -> Option[string]
         if module_of(a.tables.types.key_at(i)) == here then
             decl.kind match
                 EnumOf(e) ->
-                    for j in 0..<e.variants.len()
-                        if e.variants.at(j).name == name then
+                    for item in e.variants
+                        if item.name == name then
                             return Some(a.tables.types.key_at(i))
                 _ -> ()
 
@@ -702,8 +698,7 @@ private resolve_signatures(a: &Analysis)
 
         val covered = enter_signature(a, d.needs)
 
-        for j in 0..<d.params.len()
-            val p = d.params.at(j)
+        for p in d.params
             val t = resolve_type(a, scope, p.typ, no_bindings())
 
             if !vector_said && is_vector(t)
@@ -827,8 +822,8 @@ stand_ins(a: &Analysis, scope: Scope, tparams: Buf[string],
           tvalues: Buf[TypeBinding]) -> Buf[Binding]
     var out: Buf[Binding] = buf()
 
-    for i in 0..<tparams.len()
-        out.push(Binding(tparams.at(i), stand_in(a, scope, tparams.at(i), tvalues)))
+    for tparam in tparams
+        out.push(Binding(tparam, stand_in(a, scope, tparam, tvalues)))
 
     out
 end stand_ins
@@ -853,8 +848,8 @@ private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string],
 
     a.settled = subst
 
-    for i in 0..<params.len()
-        resolve_type(a, scope, params.at(i).typ, subst)
+    for param in params
+        resolve_type(a, scope, param.typ, subst)
 
     val result = if ret.is_some() then Some(resolve_result(a, scope, ret.unwrap(), subst)) else None
 
@@ -874,8 +869,8 @@ check_crossing_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown:
     for i in 0..<c.len()
         var declared = false
 
-        for j in 0..<ps.len()
-            if ps.at(j).name == c.at(i) then declared = true
+        for item in ps
+            if item.name == c.at(i) then declared = true
 
         var twice = false
 
@@ -902,8 +897,7 @@ end check_crossing_names
 // free to keep what it likes, and the call sites counting on the exemption quietly go back to
 // promoting. The receiver is not among them -- a receiver is borrowed or not by its declared mode.
 private check_borrow_names(a: &Analysis, scope: Scope, span: Span, owner: string, ms: Buf[MethodDecl])
-    for k in 0..<ms.len()
-        val m = ms.at(k)
+    for m in ms
         val b = m.borrows
 
         for i in 0..<b.len()
@@ -979,8 +973,7 @@ private resolve_members(a: &Analysis, scope: Scope, owner: string, tparams: Buf[
     a.settled = joined_bindings(subst, buf())
     subst.push(Binding("Self", self_type(a, scope, owner, tparams, bounds)))
 
-    for i in 0..<members.len()
-        val m = members.at(i)
+    for m in members
         val generic = !shape && !with_member_call_bounds(m).tparams.is_empty()
         val own = if generic then Some(registration_mark(a)) else None
 
@@ -1004,11 +997,11 @@ end resolve_members
 private joined_names(outer: Buf[string], own: Buf[string]) -> Buf[string]
     var out: Buf[string] = buf()
 
-    for i in 0..<outer.len()
-        out.push(outer.at(i))
+    for item in outer
+        out.push(item)
 
-    for i in 0..<own.len()
-        out.push(own.at(i))
+    for item in own
+        out.push(item)
 
     out
 end joined_names
@@ -1016,11 +1009,11 @@ end joined_names
 joined_values(outer: Buf[TypeBinding], own: Buf[TypeBinding]) -> Buf[TypeBinding]
     var out: Buf[TypeBinding] = buf()
 
-    for i in 0..<outer.len()
-        out.push(outer.at(i))
+    for item in outer
+        out.push(item)
 
-    for i in 0..<own.len()
-        out.push(own.at(i))
+    for item in own
+        out.push(item)
 
     out
 end joined_values
@@ -1058,8 +1051,8 @@ private resolve_method(a: &Analysis, scope: Scope, m: MethodDecl, outer: Buf[Bin
 
     a.restore_complaints(mark)
 
-    for i in 0..<outer.len()
-        subst.push(outer.at(i))
+    for item in outer
+        subst.push(item)
 
     for i in 0..<m.tparams.len()
         val tp = m.tparams.at(i)
@@ -1076,8 +1069,8 @@ private resolve_method(a: &Analysis, scope: Scope, m: MethodDecl, outer: Buf[Bin
 
     a.settled = joined_bindings(before, own)
 
-    for i in 0..<m.params.len()
-        resolve_type(a, scope, m.params.at(i).typ, subst)
+    for param in m.params
+        resolve_type(a, scope, param.typ, subst)
 
     if m.ret_type.is_some() then resolve_result(a, scope, m.ret_type.unwrap(), subst)
 
@@ -1101,8 +1094,8 @@ private self_type(a: &Analysis, scope: Scope, owner: string, tparams: Buf[string
     val stood = abstract_subst(a, scope, tparams, bounds, buf(), buf(), buf())
     var targs: Buf[Type] = buf()
 
-    for i in 0..<tparams.len()
-        targs.push(bound_type(stood, tparams.at(i)).unwrap_or(Abstract(tparams.at(i), buf())))
+    for tparam in tparams
+        targs.push(bound_type(stood, tparam).unwrap_or(Abstract(tparam, buf())))
 
     decl.unwrap().kind match
         StructOf(d) -> instantiate_struct(a, decl.unwrap().scope, decl.unwrap().span, d.name, owner,
@@ -1217,9 +1210,7 @@ private check_exposed_types(a: &Analysis)
 
         decl.kind match
             StructOf(d) ->
-                for j in 0..<d.fields.len()
-                    val f = d.fields.at(j)
-
+                for f in d.fields
                     // **A field carries its own reach**, so it is named as one and asked at its
                     // own -- a private field reaches exactly as far as the type it names, and there
                     // is nothing there to find.
@@ -1228,9 +1219,7 @@ private check_exposed_types(a: &Analysis)
 
                 check_exposed_members(a, decl.scope, d.name, d.vis, d.members, d.tparams)
             EnumOf(d) ->
-                for j in 0..<d.variants.len()
-                    val v = d.variants.at(j)
-
+                for v in d.variants
                     for k in 0..<v.fields.len()
                         val f = v.fields.at(k)
 
@@ -1244,9 +1233,7 @@ private check_exposed_types(a: &Analysis)
                 // **A required trait is the sharpest case of the rule**: implementing the trait means
                 // implementing that one as well, so a requirement the implementer cannot name leaves
                 // the trait unimplementable from outside.
-                for j in 0..<d.supers.len()
-                    val s = d.supers.at(j)
-
+                for s in d.supers
                     check_exposed_name(a, decl.scope, d.name, d.vis, "the trait it requires", s.name,
                                        s.span, d.tparams)
             _ -> ()
@@ -1268,9 +1255,7 @@ end check_exposed_defaults
 
 private exposed_defaults(a: &Analysis, scope: Scope, label: string, vis: Visibility,
                          tparams: Buf[string], tdefaults: Buf[TypeBinding])
-    for i in 0..<tdefaults.len()
-        val b = tdefaults.at(i)
-
+    for b in tdefaults
         check_exposed(a, scope, label, vis, s"the default for '${b.name}'", b.typ, tparams)
 end exposed_defaults
 
@@ -1293,8 +1278,7 @@ private check_exposed_storage(a: &Analysis, from: &Table[ValueDecl])
 
 private check_exposed_members(a: &Analysis, scope: Scope, owner: string, owner_vis: Visibility,
                               ms: Buf[MethodDecl], tparams: Buf[string])
-    for i in 0..<ms.len()
-        val m = ms.at(i)
+    for m in ms
         var skip: Buf[string] = buf()
 
         for j in 0..<tparams.len()
@@ -1314,15 +1298,12 @@ private check_exposed_signature(a: &Analysis, scope: Scope, label: string, vis: 
                                 skip: Buf[string])
     if is_private_reach(vis) then return
 
-    for i in 0..<params.len()
-        val p = params.at(i)
-
+    for p in params
         check_exposed(a, scope, label, vis, s"parameter '${p.name}'", p.typ, skip)
 
     if ret.is_some() then check_exposed(a, scope, label, vis, "its result", ret.unwrap(), skip)
 
-    for i in 0..<bounds.len()
-        val nb = bounds.at(i)
+    for nb in bounds
         val what = s"the bound on '${nb.name}'"
 
         for j in 0..<nb.bounds.len()
@@ -1340,8 +1321,8 @@ private check_exposed(a: &Analysis, scope: Scope, label: string, vis: Visibility
 
     names_in(&names, t, skip)
 
-    for i in 0..<names.len()
-        check_exposed_name(a, scope, label, vis, what, names.at(i).0, names.at(i).1, skip)
+    for item in names
+        check_exposed_name(a, scope, label, vis, what, item.0, item.1, skip)
 
 private check_exposed_name(a: &Analysis, scope: Scope, label: string, vis: Visibility, what: string,
                            name: string, span: Span, skip: Buf[string])
@@ -1413,8 +1394,8 @@ names_in(out: *Buf[(string, Span)], t: TypeRef, skip: Buf[string])
         NamedType(name, args) ->
             if !holds(skip, name) then out.push((name, t.span))
 
-            for i in 0..<args.len()
-                names_in(out, args.at(i), skip)
+            for arg in args
+                names_in(out, arg, skip)
         PtrType(inner) -> names_in(out, inner, skip)
         RefType(inner, _) -> names_in(out, inner, skip)
         WeakType(inner) -> names_in(out, inner, skip)
@@ -1422,24 +1403,24 @@ names_in(out: *Buf[(string, Span)], t: TypeRef, skip: Buf[string])
         ArrayType(_, elem, _) -> names_in(out, elem, skip)
         VectorType(_, elem) -> names_in(out, elem, skip)
         TupleType(parts, _) ->
-            for i in 0..<parts.len()
-                names_in(out, parts.at(i), skip)
+            for item in parts
+                names_in(out, item, skip)
         FnType(params, ret, _) ->
-            for i in 0..<params.len()
-                names_in(out, params.at(i), skip)
+            for param in params
+                names_in(out, param, skip)
 
             names_in(out, ret, skip)
         CFnType(params, ret) ->
-            for i in 0..<params.len()
-                names_in(out, params.at(i), skip)
+            for param in params
+                names_in(out, param, skip)
 
             names_in(out, ret, skip)
         AssocArgType(_, inner) -> names_in(out, inner, skip)
         _ -> ()
 
 private holds(xs: Buf[string], name: string) -> bool
-    for i in 0..<xs.len()
-        if xs.at(i) == name then return true
+    for item in xs
+        if item == name then return true
 
     false
 end holds
@@ -1460,8 +1441,8 @@ decl_diagnostics(text: string) -> Buf[string]
     analyze_decls_of(parsed.program, host_target()) match
         Ok(_) -> ()
         Err(ds) ->
-            for i in 0..<ds.len()
-                out.push(ds.at(i).diag.message)
+            for item in ds
+                out.push(item.diag.message)
 
     out
 end decl_diagnostics
@@ -1490,8 +1471,8 @@ resolve_written(text: string, written: string) -> (Type, Buf[string])
     val answer = resolve_type(a, scope_of_unit(a, parsed.program), t.value, no_bindings())
     val ds = a.diagnostics()
 
-    for i in 0..<ds.len()
-        messages.push(ds.at(i).diag.message)
+    for item in ds
+        messages.push(item.diag.message)
 
     (answer, messages)
 end resolve_written

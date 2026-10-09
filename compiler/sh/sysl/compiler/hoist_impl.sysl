@@ -285,9 +285,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                                       self_binding(subject))
     var assocs: Buf[(string, Type)] = buf()
 
-    for i in 0..<block.assocs.len()
-        val bind = block.assocs.at(i)
-
+    for bind in block.assocs
         if !declares_assoc(tr, bind.name) then
             a.fault(scope, bind.span, s"trait '${qualified_name(block.trait_name)}' declares no associated type " +
                     s"'${bind.name}', so this 'impl' has nothing to supply — the trait is where one " +
@@ -306,8 +304,8 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     val opaque_members = opaque_bindings(tr, im.decl)
     var opaque: Buf[(string, string, string)] = buf()
 
-    for i in 0..<opaque_members.len()
-        val (aname, m) = opaque_members.at(i)
+    for opaque_member in opaque_members
+        val (aname, m) = opaque_member
 
         opaque.push((aname, s"${home.symbol}.${m.name}${home.alt}", s"${home.key}::$aname"))
 
@@ -315,9 +313,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // members are not lowered. Everything below reads a signature written in terms the block never
     // settled, so what would come back is one mistake reported as several -- and the reader is owed
     // the one that names the missing line.
-    for i in 0..<tr.assocs.len()
-        val ad = tr.assocs.at(i)
-
+    for ad in tr.assocs
         if !holds_assoc(assocs, ad.name) && !holds_opaque(opaque, ad.name)
             a.fault(scope, span, s"'${home.label}' does not implement " +
                     s"'${qualified_name(block.trait_name)}': the associated type '${ad.name}' is " +
@@ -330,8 +326,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // **An associated type is named without its trait**, so a second trait bringing a name the type
     // already has from another is refused at the block that makes the collision -- not later, at
     // whichever projection first reads the name and finds two answers.
-    for i in 0..<tr.assocs.len()
-        val ad = tr.assocs.at(i)
+    for ad in tr.assocs
         val others = traits_declaring(a, ad.name)
 
         for j in 0..<others.len()
@@ -348,8 +343,8 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     val wkey = if written.is_empty() then "" else Bound(key.unwrap(), written).key()
     var rows: Buf[TraitImpl] = buf()
 
-    for i in 0..<already.len()
-        rows.push(already.at(i))
+    for item in already
+        rows.push(item)
 
     rows.push(TraitImpl(block, span, scope, written, wkey, home.alt, home.tparams,
                         !home.tparams.is_empty() && !home.bounds.is_empty(), assocs, opaque))
@@ -368,15 +363,13 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     var super_subst: Buf[Binding] = buf()
     val super_self = self_binding(subject)
 
-    for i in 0..<super_self.len()
-        super_subst.push(super_self.at(i))
+    for item in super_self
+        super_subst.push(item)
 
     for i in 0..<tr.tparams.len()
         if i < bound.args.len() then super_subst.push(Binding(tr.tparams.at(i), bound.args.at(i)))
 
-    for i in 0..<tr.supers.len()
-        val s = tr.supers.at(i)
-
+    for s in tr.supers
         a.tables.super_checks.push(SuperCheck(home.label, module_show(block.trait_name),
                                               resolve_bound(a, scope, s.span, s, super_subst),
                                               subject, span, scope, ""))
@@ -387,8 +380,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // the bound was written.
     val tscope = trait_scope_of(a, key.unwrap())
 
-    for i in 0..<block.assocs.len()
-        val bind = block.assocs.at(i)
+    for bind in block.assocs
         val supplied = assoc_supplied(assocs, bind.name)
 
         if supplied.is_none() then continue
@@ -435,23 +427,23 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // **The origin is the trait's KEY and the member, never the name the block spelled the trait
     // by**: it is what finds the trait's own file for the copy to be read in, and a block may have
     // written `Show` after an import or `a.Show` with none.
-    for i in 0..<inherited.len()
+    for item in inherited
         a.tables.members.default_origin.put(
-            s"${home.symbol}.${inherited.at(i).name}${home.alt}",
-            s"${key.unwrap()}.${inherited.at(i).name}")
+            s"${home.symbol}.${item.name}${home.alt}",
+            s"${key.unwrap()}.${item.name}")
 
     // A member the trait does not declare is not one the type gains: the block was told it may not
     // define it, and a member filed anyway would have its body read and answer a call by its name.
     var supplied: Buf[MethodDecl] = buf()
 
-    for i in 0..<block.methods.len()
-        if trait_method(tr, block.methods.at(i).name).is_none() then continue
+    for item in block.methods
+        if trait_method(tr, item.name).is_none() then continue
 
-        refuse_impl_defaults(a, scope, block.trait_name, block.methods.at(i))
-        supplied.push(with_trait_defaults(tr, block.methods.at(i)))
+        refuse_impl_defaults(a, scope, block.trait_name, item)
+        supplied.push(with_trait_defaults(tr, item))
 
-    for i in 0..<inherited.len()
-        supplied.push(inherited.at(i))
+    for item in inherited
+        supplied.push(item)
 
     // **An implemented trait member makes its module depend on the standard one**, which is a
     // measured fact about the reference rather than a rule any chapter states: an `impl` block that
@@ -475,8 +467,8 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         val ad = assoc_decl_named(tr, aname)
         var fd: Option[FuncDecl] = None
 
-        for j in 0..<lowered.len()
-            if lowered.at(j).name == func then fd = Some(lowered.at(j))
+        for item in lowered
+            if item.name == func then fd = Some(item)
 
         val promised = *m.ret_type.unwrap().kind match
             SomeType(bs) -> bs
@@ -497,9 +489,7 @@ end hoist_impl
 private opaque_bindings(tr: TraitDecl, written: ImplDecl) -> Buf[(string, MethodDecl)]
     var out: Buf[(string, MethodDecl)] = buf()
 
-    for i in 0..<written.methods.len()
-        val m = written.methods.at(i)
-
+    for m in written.methods
         if m.ret_type.is_none() then continue
 
         val is_some = *m.ret_type.unwrap().kind match
@@ -521,15 +511,15 @@ private opaque_bindings(tr: TraitDecl, written: ImplDecl) -> Buf[(string, Method
 end opaque_bindings
 
 private holds_opaque(opaque: Buf[(string, string, string)], name: string) -> bool
-    for i in 0..<opaque.len()
-        if opaque.at(i).0 == name then return true
+    for item in opaque
+        if item.0 == name then return true
 
     false
 end holds_opaque
 
 private assoc_decl_named(tr: TraitDecl, name: string) -> Option[AssocDecl]
-    for i in 0..<tr.assocs.len()
-        if tr.assocs.at(i).name == name then return Some(tr.assocs.at(i))
+    for item in tr.assocs
+        if item.name == name then return Some(item)
 
     None
 end assoc_decl_named
@@ -545,9 +535,7 @@ check_impl_supers(a: &Analysis)
 
     a.tables.super_checks = buf()
 
-    for i in 0..<held.len()
-        val c = held.at(i)
-
+    for c in held
         if satisfies(a, c.sup, c.subject) then continue
 
         if c.assoc != ""
@@ -588,9 +576,7 @@ check_impl_overrides(a: &Analysis)
 
     a.tables.override_checks = buf()
 
-    for i in 0..<held.len()
-        val c = held.at(i)
-
+    for c in held
         if overridden(a, c.bound, c.subject, shape_owners(c.subject)) then continue
         if overridden(a, c.bound, c.subject, blanket_owners(a, c.subject)) then continue
 
@@ -601,8 +587,8 @@ end check_impl_overrides
 
 // Whether one of `owners` implements `bound` for `subject`.
 private overridden(a: &Analysis, bound: Bound, subject: Type, owners: Buf[(string, Buf[Type])]) -> bool
-    for i in 0..<owners.len()
-        if impl_at(a, bound, owners.at(i).0, subject, owners.at(i).1).is_some() then return true
+    for item in owners
+        if impl_at(a, bound, item.0, subject, item.1).is_some() then return true
 
     false
 
@@ -615,8 +601,8 @@ private held_by_another(a: &Analysis, tr: TraitDecl, owner: string, trait_key: s
                         call_trait: bool, alt: string) -> bool
     if call_trait then return false
 
-    for i in 0..<tr.methods.len()
-        val held = a.tables.members.from_trait.get(member_key_of(owner, tr.methods.at(i).name + alt))
+    for item in tr.methods
+        val held = a.tables.members.from_trait.get(member_key_of(owner, item.name + alt))
 
         if held.is_some() && held.unwrap() != trait_key then return true
 
@@ -667,17 +653,17 @@ private stand_in_args(a: &Analysis, scope: Scope, home: MemberHome) -> Buf[Type]
     var out: Buf[Type] = buf()
     val subst = abstract_subst(a, scope, home.tparams, home.bounds, home.tvalues, home.tpacks, buf())
 
-    for i in 0..<home.tparams.len()
-        val found = bound_type(subst, home.tparams.at(i))
+    for tparam in home.tparams
+        val found = bound_type(subst, tparam)
 
-        out.push(found.unwrap_or(Abstract(home.tparams.at(i), buf())))
+        out.push(found.unwrap_or(Abstract(tparam, buf())))
 
     out
 end stand_in_args
 
 private declares_assoc(tr: TraitDecl, name: string) -> bool
-    for i in 0..<tr.assocs.len()
-        if tr.assocs.at(i).name == name then return true
+    for item in tr.assocs
+        if item.name == name then return true
 
     false
 end declares_assoc
@@ -685,22 +671,22 @@ end declares_assoc
 private count_assoc(block: ImplDecl, name: string) -> usize
     var n: usize = 0
 
-    for i in 0..<block.assocs.len()
-        if block.assocs.at(i).name == name then n += 1
+    for item in block.assocs
+        if item.name == name then n += 1
 
     n
 end count_assoc
 
 private assoc_supplied(assocs: Buf[(string, Type)], name: string) -> Option[Type]
-    for i in 0..<assocs.len()
-        if assocs.at(i).0 == name then return Some(assocs.at(i).1)
+    for item in assocs
+        if item.0 == name then return Some(item.1)
 
     None
 end assoc_supplied
 
 private holds_assoc(assocs: Buf[(string, Type)], name: string) -> bool
-    for i in 0..<assocs.len()
-        if assocs.at(i).0 == name then return true
+    for item in assocs
+        if item.0 == name then return true
 
     false
 end holds_assoc
@@ -755,8 +741,8 @@ private defaults_mention_self(tr: TraitDecl) -> bool
 
     names.push("Self")
 
-    for i in 0..<tr.tdefaults.len()
-        if ref_mentions(tr.tdefaults.at(i).typ, names) then return true
+    for tdefault in tr.tdefaults
+        if ref_mentions(tdefault.typ, names) then return true
 
     false
 end defaults_mention_self
@@ -811,10 +797,10 @@ impl_bound(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, tr: TraitDec
                                         self_binding(subject))
 
     // Asked of what the block **wrote**, not of what the defaults filled in.
-    for i in 0..<block.tparams.len()
-        if holds_string(tr.tparams, block.tparams.at(i)) then
+    for tparam in block.tparams
+        if holds_string(tr.tparams, tparam) then
             a.fault(scope, span, s"trait '${qualified_name(block.trait_name)}' already declares a type " +
-                    s"parameter '${block.tparams.at(i)}', so this 'impl' cannot declare one of that " +
+                    s"parameter '${tparam}', so this 'impl' cannot declare one of that " +
                     "name")
 
     // The block's own parameters are final here, each carrying what the block asked of it.
@@ -868,15 +854,15 @@ nominal_of(a: &Analysis, key: string) -> Option[(Buf[string], Buf[string], strin
         StructOf(d) ->
             var names: Buf[string] = buf()
 
-            for i in 0..<d.fields.len()
-                names.push(d.fields.at(i).name)
+            for item in d.fields
+                names.push(item.name)
 
             Some((d.tparams, names, "field"))
         EnumOf(d) ->
             var names: Buf[string] = buf()
 
-            for i in 0..<d.variants.len()
-                names.push(d.variants.at(i).name)
+            for item in d.variants
+                names.push(item.name)
 
             Some((d.tparams, names, "variant"))
         _ -> None
@@ -1029,10 +1015,10 @@ end trimmed
 closed_bound(a: &Analysis, scope: Scope, span: Span, ty: Type, bounds: Buf[Bound]) -> Option[string]
     var closed: Buf[string] = buf()
 
-    for i in 0..<bounds.len()
-        val spelling = library_spelling(bounds.at(i).name)
+    for item in bounds
+        val spelling = library_spelling(item.name)
 
-        if spelling.is_some() && core_closed(spelling.unwrap()) then closed.push(bounds.at(i).name)
+        if spelling.is_some() && core_closed(spelling.unwrap()) then closed.push(item.name)
 
     if closed.is_empty()
         // Any other parameter stands for any type at all, so the block would be saying how every
@@ -1046,8 +1032,8 @@ closed_bound(a: &Analysis, scope: Scope, span: Span, ty: Type, bounds: Buf[Bound
     if closed.len() > 1
         var shown: Buf[string] = buf()
 
-        for i in 0..<closed.len()
-            shown.push(s"'${qualified_name(closed.at(i))}'")
+        for item in closed
+            shown.push(s"'${qualified_name(item)}'")
 
         a.fault(scope, span, s"'${type_show(ty)}' is bounded by ${conjoin(shown)}, and each of " +
                 "those names a family — so it is not one family this 'impl' covers, and there is " +
@@ -1152,14 +1138,14 @@ impl_args(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, key: string,
                 s"${supplied_phrase(arg_refs.len(), "type argument")}")
         return names
 
-    for i in 0..<arg_refs.len()
-        val own: Option[string] = *arg_refs.at(i).kind match
+    for arg_ref in arg_refs
+        val own: Option[string] = *arg_ref.kind match
             NamedType(n, as_written) ->
                 if as_written.is_empty() && holds_string(block.tparams, n) then Some(n) else None
             _ -> None
 
         if own.is_none()
-            fix_refused(a, scope, span, arg_refs.at(i), module_show(key))
+            fix_refused(a, scope, span, arg_ref, module_show(key))
             return names
 
         names.push(own.unwrap())
@@ -1184,8 +1170,8 @@ private check_argument_names(a: &Analysis, scope: Scope, span: Span, block: Impl
 
     var missing: Buf[string] = buf()
 
-    for i in 0..<block.tparams.len()
-        if !holds_string(names, block.tparams.at(i)) then missing.push(block.tparams.at(i))
+    for tparam in block.tparams
+        if !holds_string(names, tparam) then missing.push(tparam)
 
     if !missing.is_empty() then
         a.fault(scope, span, s"'${joined(missing, "', '")}' is declared by this 'impl' but does not " +
@@ -1210,11 +1196,11 @@ private shape_args(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, ty: 
         if !shapes.is_empty()
             val matched = shapes.at(0).1
 
-            for i in 0..<matched.len()
-                matched.at(i) match
+            for item in matched
+                item match
                     Abstract(n, _) ->
                         if !holds_string(block.tparams, n)
-                            element_fixed(a, scope, span, matched.at(i), shape)
+                            element_fixed(a, scope, span, item, shape)
                             return names
                         end if
 
@@ -1273,8 +1259,8 @@ opened_results(a: &Analysis, scope: Scope, trait_key: string, tr: TraitDecl,
                block: ImplDecl) -> Buf[MethodDecl]
     var out: Buf[MethodDecl] = buf()
 
-    for i in 0..<block.methods.len()
-        var m = block.methods.at(i)
+    for item in block.methods
+        var m = item
         val opened = opened_result_of(a, scope, trait_key, tr, m)
 
         if opened.is_some() then m.ret_type = opened
@@ -1341,8 +1327,8 @@ private bounds_shown(bs: Buf[BoundRef]) -> string
 end bounds_shown
 
 trait_method(tr: TraitDecl, name: string) -> Option[MethodDecl]
-    for i in 0..<tr.methods.len()
-        if tr.methods.at(i).name == name then return Some(tr.methods.at(i))
+    for item in tr.methods
+        if item.name == name then return Some(item)
 
     None
 end trait_method
@@ -1351,8 +1337,8 @@ end trait_method
 // block writes of its own is refused rather than silently ignored -- through a trait object there is
 // no implementation to read one off.
 private refuse_impl_defaults(a: &Analysis, scope: Scope, trait_name: string, m: MethodDecl)
-    for i in 0..<m.params.len()
-        val d = m.params.at(i).default
+    for param in m.params
+        val d = param.default
 
         if d.is_some() then
             a.fault(scope, d.unwrap().span, "a member of an 'impl' block declares no default — a " +
@@ -1404,8 +1390,8 @@ private check_coherence(a: &Analysis, scope: Scope, span: Span, block: ImplDecl,
 
     roots.push(block.for_type)
 
-    for i in 0..<block.trait_args.len()
-        roots.push(block.trait_args.at(i))
+    for trait_arg in block.trait_args
+        roots.push(trait_arg)
 
     val subject = subject_homes(a, scope, roots)
 
@@ -1467,8 +1453,8 @@ private subject_homes(a: &Analysis, scope: Scope, roots: Buf[TypeRef]) -> Buf[st
     var out: Buf[string] = buf()
     var work: Buf[TypeRef] = buf()
 
-    for i in 0..<roots.len()
-        work.push(roots.at(i))
+    for item in roots
+        work.push(item)
 
     var at: usize = 0
 
@@ -1486,8 +1472,8 @@ private subject_homes(a: &Analysis, scope: Scope, roots: Buf[TypeRef]) -> Buf[st
 
                 if !holds_string(out, home) then out.push(home)
 
-                for i in 0..<args.len()
-                    work.push(args.at(i))
+                for item in args
+                    work.push(item)
             PtrType(inner) -> work.push(inner)
             RefType(inner, _) -> work.push(inner)
             WeakType(inner) -> work.push(inner)
@@ -1503,22 +1489,22 @@ private subject_homes(a: &Analysis, scope: Scope, roots: Buf[TypeRef]) -> Buf[st
             TupleType(parts, _) ->
                 if !holds_string(out, library_whose()) then out.push(library_whose())
 
-                for i in 0..<parts.len()
-                    work.push(parts.at(i))
+                for item in parts
+                    work.push(item)
             // A function type is the library's `Fn` trait over its parts, and a function pointer
             // belongs to no module -- either way the parts are what is asked.
             FnType(params, ret, _) ->
                 if !holds_string(out, library_whose()) then out.push(library_whose())
 
-                for i in 0..<params.len()
-                    work.push(params.at(i))
+                for param in params
+                    work.push(param)
 
                 work.push(ret)
             CFnType(params, ret) ->
                 if !holds_string(out, library_whose()) then out.push(library_whose())
 
-                for i in 0..<params.len()
-                    work.push(params.at(i))
+                for param in params
+                    work.push(param)
 
                 work.push(ret)
             // A value names no type, so it declares nothing and gives a block no home; a pack is the

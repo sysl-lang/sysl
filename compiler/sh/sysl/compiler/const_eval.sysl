@@ -231,15 +231,15 @@ private mentions_const_call(a: &Analysis, e: Expr) -> bool = *e.kind match
 
         if w.is_some() && names_const_fn(a, w.unwrap()) then return true
 
-        for i in 0..<args.len()
-            if mentions_const_call(a, args.at(i)) then return true
+        for arg in args
+            if mentions_const_call(a, arg) then return true
 
         false
     Unary(_, operand) -> mentions_const_call(a, operand)
     Binary(_, l, r) -> mentions_const_call(a, l) || mentions_const_call(a, r)
     Compare(operands, _) ->
-        for i in 0..<operands.len()
-            if mentions_const_call(a, operands.at(i)) then return true
+        for item in operands
+            if mentions_const_call(a, item) then return true
 
         false
     _ -> false
@@ -261,8 +261,8 @@ end calls_const_fn
 private call_site_key(cx: &Analyzer, at: Span) -> string
     var out = s"${cx.scope.src.name}:${at.start}"
 
-    for i in 0..<cx.subst.len()
-        out = out + s";${cx.subst.at(i).name}=${type_show(cx.subst.at(i).ty)}"
+    for item in cx.subst
+        out = out + s";${item.name}=${type_show(item.ty)}"
 
     out
 end call_site_key
@@ -322,9 +322,9 @@ private trial_body(a: &Analysis, name: string) -> Option[TFunc]
     else
         val lowered = a.tables.members.lowered
 
-        for i in 0..<lowered.len()
-            if typed.is_none() && lowered.at(i).name == name then
-                typed = Some(analyze_instance(a, name, lowered.at(i)))
+        for item in lowered
+            if typed.is_none() && item.name == name then
+                typed = Some(analyze_instance(a, name, item))
     end if
 
     val clean = a.complaints() == mark
@@ -758,8 +758,8 @@ end eval_rest
 // Expressions run in turn for their effects.
 @noinline
 private seq(r: &EvRun, exprs: Buf[TExpr]) -> Flow
-    for i in 0..<exprs.len()
-        val f = eval(r, exprs.at(i))
+    for expr in exprs
+        val f = eval(r, expr)
 
         f match
             EvGave(_) -> ()
@@ -821,8 +821,8 @@ private global_value(r: &EvRun, at: Span, symbol: string, ty: Type, writable: bo
 
     val ev = r.a.evaluation
 
-    for i in 0..<ev.vals_reading.len()
-        if ev.vals_reading.at(i) == symbol then
+    for item in ev.vals_reading
+        if item == symbol then
             return refuse_form(r, at, s"'$shown' is read while its own value is being worked out")
 
     ev.vals_reading.push(symbol)
@@ -1088,8 +1088,8 @@ private call(r: &EvRun, at: Span, name: string, args: Buf[TExpr], results: bool)
 
     var vals: Buf[Const] = buf()
 
-    for i in 0..<args.len()
-        eval_value(r, args.at(i)) match
+    for arg in args
+        eval_value(r, arg) match
             Ok(v) -> vals.push(v)
             Err(f) -> return f
 
@@ -1119,8 +1119,8 @@ private callee(r: &EvRun, at: Span, name: string) -> Option[&TFunc]
 
     // The loop is found inside the reading of the body, which is a trial whose complaints are taken
     // back -- so it is told as one a thrown-away trial keeps.
-    for i in 0..<ev.typing.len()
-        if ev.typing.at(i) == name
+    for item in ev.typing
+        if item == name
             r.a.bound_fault(here(r), at, s"${r.subject} cannot be computed while compiling: the body of " +
                             s"'${qualified_name(name)}' is being read, and reading it needs ${r.subject}, " +
                             "which is worked out by running that body")
@@ -1193,8 +1193,8 @@ end run_call
 @noinline
 private entered(r: &EvRun, at: Span, name: string, vals: Buf[Const], f: &TFunc,
                 key: string) -> Result[&EvFrame, Flow]
-    for i in 0..<f.params.len()
-        val why = unheld(f.params.at(i).1)
+    for param in f.params
+        val why = unheld(param.1)
 
         if why.is_some() then return Err(refuse_form(r, at, why.unwrap()))
 
@@ -1264,8 +1264,8 @@ private preconditions(r: &EvRun, at: Span, f: &TFunc, measured: bool, before: Op
                              s"${value_text(before.unwrap(), texpr_type(f.variant.unwrap()))}"))
     end if
 
-    for i in 0..<f.requires.len()
-        val clause = f.requires.at(i).cond
+    for item in f.requires
+        val clause = item.cond
 
         if !names_ghost(r.a, clause)
             eval_bool(r, clause) match
@@ -1274,8 +1274,8 @@ private preconditions(r: &EvRun, at: Span, f: &TFunc, measured: bool, before: Op
                     return Some(trap(r, clause.span, s"a 'require' of '${qualified_name(f.name)}' failed"))
                 Err(fl) -> return Some(fl)
 
-    for i in 0..<f.olds.len()
-        eval_value(r, f.olds.at(i)) match
+    for item in f.olds
+        eval_value(r, item) match
             Ok(v) -> frame.olds.push(v)
             Err(fl) -> return Some(fl)
 
@@ -1287,8 +1287,8 @@ end preconditions
 private postconditions(r: &EvRun, f: &TFunc, result: Option[Const]) -> Option[Flow]
     r.frames.at(r.frames.len() - 1).result = result
 
-    for i in 0..<f.ensures.len()
-        val clause = f.ensures.at(i).cond
+    for item in f.ensures
+        val clause = item.cond
 
         if !names_ghost(r.a, clause)
             eval_bool(r, clause) match
@@ -1354,8 +1354,8 @@ private block(r: &EvRun, b: TBlock) -> Flow
 end block
 
 private stmts(r: &EvRun, list: Buf[TStmt]) -> Flow
-    for i in 0..<list.len()
-        val f = ev_stmt(r, list.at(i))
+    for item in list
+        val f = ev_stmt(r, item)
 
         f match
             EvNone -> ()
@@ -1619,8 +1619,7 @@ end write
 private ev_multi_assign(r: &EvRun, writes: Buf[TWrite]) -> Flow
     var landing: Buf[(string, Const)] = buf()
 
-    for i in 0..<writes.len()
-        val w = writes.at(i)
+    for w in writes
         val name = local_place(w.place)
 
         if name.is_none() || !w.check.is_empty() || r.frames.is_empty() then return no_place(r, w.place)
@@ -1647,8 +1646,8 @@ private ev_multi_assign(r: &EvRun, writes: Buf[TWrite]) -> Flow
                 None -> return out
         end if
 
-    for i in 0..<landing.len()
-        assign(r, landing.at(i).0, landing.at(i).1)
+    for item in landing
+        assign(r, item.0, item.1)
 
     EvNone
 end ev_multi_assign
@@ -1658,8 +1657,8 @@ end ev_multi_assign
 // Whether every term of a condition holds, binding what its patterns bind.
 @noinline
 private ev_holds(r: &EvRun, terms: Buf[TCondTerm]) -> Result[bool, Flow]
-    for i in 0..<terms.len()
-        terms.at(i) match
+    for item in terms
+        item match
             TCondTest(c) ->
                 eval_bool(r, c) match
                     Ok(true) -> ()
@@ -1749,8 +1748,7 @@ end ev_match
 // The body of the first arm whose pattern takes the value and whose guard holds, its bindings made.
 @noinline
 private chosen_arm(r: &EvRun, arms: Buf[TArm], v: Const) -> Result[Option[TBlock], Flow]
-    for i in 0..<arms.len()
-        val arm = arms.at(i)
+    for arm in arms
         var hit = false
 
         for j in 0..<arm.patterns.len()

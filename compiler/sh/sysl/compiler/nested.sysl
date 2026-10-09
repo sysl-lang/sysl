@@ -54,15 +54,15 @@ nested_ident(e: Expr) -> Option[string] = *e.kind match
 lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt]
     var names: Buf[string] = buf()
 
-    for i in 0..<group.len()
-        names.push(group.at(i).name)
+    for item in group
+        names.push(item.name)
 
     // **A refusal ends the lowering.** What a nested function may not be is a property of the
     // declaration, so a group holding one is not a group: binding the names anyway would report the
     // one mistake and then everything that followed from a body nothing could analyze. The names are
     // remembered instead, so a call to one says nothing more than the refusal already did.
-    for i in 0..<group.len()
-        if refuse_nested_shape(cx, span, group.at(i), names)
+    for item in group
+        if refuse_nested_shape(cx, span, item, names)
             for j in 0..<names.len()
                 cx.refused_nested.push(names.at(j))
 
@@ -72,8 +72,7 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
     // group are bound here and are not free in each other's bodies.
     var captured: Buf[string] = buf()
 
-    for i in 0..<group.len()
-        val d = group.at(i)
+    for d in group
         var bound: Buf[string] = buf()
 
         for j in 0..<names.len()
@@ -94,11 +93,11 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
 
     var fields: Buf[(string, Type)] = buf()
 
-    for i in 0..<captured.len()
+    for item in captured
         // The field holds the **address** of the enclosing variable, not a copy of it. That is what
         // makes a nested function assigning to one of the block's locals assign to the block's
         // local, which is the thing the form exists for.
-        fields.push((captured.at(i), Ptr(cx.lookup(captured.at(i)).unwrap().ty)))
+        fields.push((item, Ptr(cx.lookup(item).unwrap().ty)))
 
     val base = env_base(cx.an.env_count)
 
@@ -118,8 +117,7 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
     // so there is nothing here to infer and nothing to wait for.
     var lowered: Buf[string] = buf()
 
-    for i in 0..<group.len()
-        val d = group.at(i)
+    for d in group
         val fname = s"${mangle(env)}.${d.name}"
 
         lowered.push(fname)
@@ -166,8 +164,8 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
     // variable rather than of a copy of it.
     var addresses: Buf[TExpr] = buf()
 
-    for i in 0..<captured.len()
-        val place = capture_source(cx, span, captured.at(i))
+    for item in captured
+        val place = capture_source(cx, span, item)
 
         addresses.push(TExpr(span, TAddrOf(place, Ptr(place_type(place)))))
 
@@ -187,8 +185,8 @@ private refuse_nested_shape(cx: &Analyzer, span: Span, d: FuncDecl, names: Buf[s
 
     var seen = 0
 
-    for i in 0..<names.len()
-        if names.at(i) == d.name then seen += 1
+    for item in names
+        if item == d.name then seen += 1
 
     if seen > 1
         cx.fault(span, s"'${d.name}' is already declared in this block")
@@ -213,8 +211,8 @@ private generic_nested_refusal(cx: &Analyzer, d: FuncDecl) -> string
     if cx.await_site == AwaitInEntry && holds_string(group, d.name)
         var bindings: Buf[string] = buf()
 
-        for i in 0..<cx.block_declares.len()
-            bindings.push(cx.block_declares.at(i).name)
+        for block_declare in cx.block_declares
+            bindings.push(block_declare.name)
 
         val why = entry_capture_of(d, bindings, group)
 
@@ -250,11 +248,10 @@ group_needs(group: Buf[FuncDecl], candidates: Buf[string]) -> Buf[string]
     var out: Buf[string] = buf()
     var names: Buf[string] = buf()
 
-    for i in 0..<group.len()
-        names.push(group.at(i).name)
+    for item in group
+        names.push(item.name)
 
-    for i in 0..<group.len()
-        val d = group.at(i)
+    for d in group
         var bound: Buf[string] = buf()
 
         for j in 0..<names.len()
@@ -278,8 +275,8 @@ block_binds(s: Stmt, out: *Buf[string])
         ValDecl(n, _, _, _, _, _) -> out.push(n)
         RefDecl(n, _) -> out.push(n)
         MultiDecl(ns, _, _) ->
-            for i in 0..<ns.len()
-                out.push(ns.at(i))
+            for item in ns
+                out.push(item)
         PatternDecl(p, _, _) -> pattern_names(out, p)
         _ -> ()
 
@@ -294,8 +291,8 @@ struct BlockBind
 // is where a name it could not reach would have been bound, so its bindings are what a use inside
 // it is measured against.
 carry_declares(cx: &Analyzer, inner: &Analyzer)
-    for i in 0..<cx.block_declares.len()
-        inner.block_declares.push(cx.block_declares.at(i))
+    for block_declare in cx.block_declares
+        inner.block_declares.push(block_declare)
 
     inner.carried_declares = inner.block_declares.len()
 
@@ -359,10 +356,10 @@ private nested_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
 
     params.push((inner.bind("self", self_ty), self_ty))
 
-    for i in 0..<d.params.len()
-        val ty = resolve_type(cx.an, cx.scope, d.params.at(i).typ, cx.subst)
+    for param in d.params
+        val ty = resolve_type(cx.an, cx.scope, param.typ, cx.subst)
 
-        params.push((inner.bind(d.params.at(i).name, ty), ty))
+        params.push((inner.bind(param.name, ty), ty))
 
     for i in 0..<captured.len()
         val stored = st.fields.at(i).1
@@ -385,8 +382,8 @@ private nested_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     // A sibling is in scope throughout the group, so a body may call one written below it. What a
     // body does *not* reach is a nested function of the frame around it, and remembering their
     // names is what lets that be said rather than reported as a name standing for nothing.
-    for i in 0..<siblings.len()
-        inner.nested.push(siblings.at(i))
+    for item in siblings
+        inner.nested.push(item)
 
     carry_outer_nested(cx, inner, siblings)
     carry_declares(cx, inner)
@@ -432,21 +429,19 @@ no_siblings() -> Buf[(string, &Nested)] = buf()
 
 // The nested functions of the frame around a body, which that body may not reach.
 carry_outer_nested(cx: &Analyzer, inner: &Analyzer, siblings: Buf[(string, &Nested)])
-    for i in 0..<cx.nested.len()
-        val name = cx.nested.at(i).0
+    for item in cx.nested
+        val name = item.0
 
         if !named_sibling(siblings, name) && !holds_string(inner.outer_nested, name) then
             inner.outer_nested.push(name)
 
-    for i in 0..<cx.outer_nested.len()
-        val name = cx.outer_nested.at(i)
-
+    for name in cx.outer_nested
         if !named_sibling(siblings, name) && !holds_string(inner.outer_nested, name) then
             inner.outer_nested.push(name)
 
 private named_sibling(siblings: Buf[(string, &Nested)], name: string) -> bool
-    for i in 0..<siblings.len()
-        if siblings.at(i).0 == name then return true
+    for item in siblings
+        if item.0 == name then return true
 
     false
 end named_sibling
@@ -491,8 +486,8 @@ call_nested(cx: &Analyzer, span: Span, n: &Nested, written: string, args: Buf[Ex
 
     if refused.is_some() then return refused.unwrap()
 
-    for i in 0..<given.len()
-        supplied.push(given.at(i))
+    for item in given
+        supplied.push(item)
 
     for i in slots.len()..<args.len()
         supplied.push(type_expr(cx, args.at(i), None))

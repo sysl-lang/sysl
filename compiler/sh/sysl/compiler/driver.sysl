@@ -86,8 +86,8 @@ std_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
 
     var units: Buf[Program] = buf()
 
-    for i in 0..<files.len()
-        val parsed = parse(files.at(i).src, t)
+    for item in files
+        val parsed = parse(item.src, t)
 
         if !parsed.ok() then return Err(Reported(parse_report(parsed)))
 
@@ -124,8 +124,7 @@ private lib_root_units(t: Target, fetched: &PackageSources) -> Result[Buf[Progra
     var out: Buf[Program] = buf()
     val libs = lib_roots()
 
-    for i in 0..<libs.len()
-        val given = libs.at(i)
+    for given in libs
         val found = collect(given, Some(t.os)) match
             Err(e) -> return Err(said(Refusal(e.message)))
             Ok(f) -> f
@@ -168,9 +167,7 @@ end lib_root_units
 private lib_roots_present() -> Result[unit, Failure]
     val libs = lib_roots()
 
-    for i in 0..<libs.len()
-        val given = libs.at(i)
-
+    for given in libs
         if is_artifact(given) then return Err(said(Refusal(syslib_named_refusal(given))))
 
         if !exists(given)
@@ -183,8 +180,8 @@ end lib_roots_present
 private modules_written(units: Buf[Program]) -> Buf[string]
     var out: Buf[string] = buf()
 
-    for i in 0..<units.len()
-        val name = module_written(units.at(i))
+    for item in units
+        val name = module_written(item)
 
         if !holds_string(out, name) then out.push(name)
 
@@ -209,14 +206,14 @@ private location_roots_of(root: string, packages: Buf[string]) -> Buf[(string, s
 
     val handed = lib_roots()
 
-    for i in 0..<handed.len()
-        out.push((absolute_path(handed.at(i)) + "/", ""))
+    for item in handed
+        out.push((absolute_path(item) + "/", ""))
 
-    for i in 0..<packages.len()
-        val dir = absolute_path(packages.at(i)) + "/"
+    for item in packages
+        val dir = absolute_path(item) + "/"
 
         if fetched_under == "" || !bytes_at(dir, 0, fetched_under)
-            out.push((dir, basename(packages.at(i)) + "/"))
+            out.push((dir, basename(item) + "/"))
 
     out
 end location_roots_of
@@ -262,8 +259,8 @@ adopt_owning_package(root: string)
         Some(pkg) ->
             val libs = lib_roots()
 
-            for i in 0..<libs.len()
-                if libs.at(i) == pkg || absolute_path(libs.at(i)) == pkg then return
+            for item in libs
+                if item == pkg || absolute_path(item) == pkg then return
 
             add_lib_root(pkg)
 end adopt_owning_package
@@ -300,8 +297,8 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     // The files, in the order the walk found them, which is the order the compiler reads them in.
     trace(s"${mine.len()} source file(s) under $path")
 
-    for i in 0..<mine.len()
-        trace(s"  read ${mine.at(i).src.name}")
+    for item in mine
+        trace(s"  read ${item.src.name}")
 
     // What each `--lib` named, read before anything is resolved on its account: a root that is not
     // there is a mistake on the command line, and says so ahead of whatever the graph would.
@@ -324,8 +321,8 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
         Err(why) -> return Err(said(Refusal(why)))
         Ok(u) -> u
 
-    for i in 0..<std.len()
-        units.push(std.at(i))
+    for item in std
+        units.push(item)
 
     // Then the packages -- the graph resolved, fetched, and read off disk. They join the compilation
     // once the project's own modules are known, below, which is what decides whose tests are read.
@@ -336,16 +333,16 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
 
     var theirs: Buf[Program] = buf()
 
-    for i in 0..<fetched.units.len()
-        theirs.push(fetched.units.at(i))
+    for item in fetched.units
+        theirs.push(item)
 
     // Then the source roots. **Their modules are not the project's own**: `own` is what decides
     // whose tests a test build keeps, so a root's tests run exactly where the project declares the
     // same module and nowhere else.
     // A root's files read an import line through the project's table, which is where its own
     // manifest's `dependencies` were bound -- a root's modules being filed under the project's names.
-    for i in 0..<handed.len()
-        var unit = handed.at(i)
+    for item in handed
+        var unit = item
 
         unit.pkg = Packaging("", fetched.root_mounts, true, unit.pkg.manifest, unit.pkg.name,
                              unit.pkg.version)
@@ -369,8 +366,8 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     var mine_units: Buf[Program] = buf()
     var unparsed: Buf[string] = buf()
 
-    for i in 0..<mine.len()
-        val parsed = parse(mine.at(i).src, t, fetched.root_features)
+    for item in mine
+        val parsed = parse(item.src, t, fetched.root_features)
 
         if !parsed.ok() then unparsed.push(parse_report(parsed))
         else mine_units.push(parsed.program)
@@ -392,21 +389,19 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
 
     if !dev_refused.is_empty() then return Err(Reported(analysis_report(dev_refused)))
 
-    for i in 0..<mine_units.len()
-        own.push(module_written(mine_units.at(i)))
+    for mine_unit in mine_units
+        own.push(module_written(mine_unit))
 
     // What the compilation was handed goes in with its scaffolding already out, unless the project
     // declares the same module (`handed_source`).
-    for i in 0..<theirs.len()
-        val unit = theirs.at(i)
-
+    for unit in theirs
         if holds_string(own, module_written(unit)) then units.push(unit)
         else handed_source(unit) match
             Some(kept) -> units.push(kept)
             None -> ()
 
-    for i in 0..<mine_units.len()
-        var unit = mine_units.at(i)
+    for mine_unit in mine_units
+        var unit = mine_unit
 
         unit.pkg = mine_pkg
         units.push(unit)
@@ -435,9 +430,7 @@ private handed_source(unit: Program) -> Option[Program]
 
     var kept: Buf[Stmt] = buf()
 
-    for i in 0..<unit.body.len()
-        val s = unit.body.at(i)
-
+    for s in unit.body
         val scaffolding = *s.kind match
             FuncDecl(f) -> f.test.is_some() || f.hook.is_some()
             _ -> false
@@ -515,16 +508,16 @@ private dev_import_reports(units: Buf[Program], dev: Buf[string]) -> Buf[Placed]
 
     if dev.is_empty() then return out
 
-    for i in 0..<units.len()
+    for item in units
         var one: Buf[Program] = buf()
 
-        one.push(units.at(i))
+        one.push(item)
 
         check_dev_imports(one, dev) match
             Ok(_) -> ()
             Err(found) ->
                 for j in 0..<found.len()
-                    out.push(placed_at(units.at(i).src, found.at(j)))
+                    out.push(placed_at(item.src, found.at(j)))
 
     out
 end dev_import_reports
@@ -696,8 +689,8 @@ private say_warnings(report: Buf[Placed], an: &Analysis)
 
     val warned = an.warnings()
 
-    for i in 0..<warned.len()
-        say_note(warning_report(warned.at(i)))
+    for item in warned
+        say_note(warning_report(item))
 end say_warnings
 
 // Two lists of symbols as one, the first's order kept, in a buffer of its own.
@@ -718,9 +711,7 @@ private explain_promotions(pr: Promotions, program: Compilation, an: &Analysis)
     // The files of the modules the program declared, which is what a note is about.
     var files: Buf[string] = buf()
 
-    for i in 0..<program.units.len()
-        val unit = program.units.at(i)
-
+    for unit in program.units
         for j in 0..<program.own.len()
             if program.own.at(j) == module_written(unit)
                 files.push(unit.src.name)
@@ -728,10 +719,10 @@ private explain_promotions(pr: Promotions, program: Compilation, an: &Analysis)
 
     var lines: Buf[string] = buf()
 
-    for i in 0..<pr.notes.len()
+    for item in pr.notes
         for j in 0..<files.len()
-            if files.at(j) == pr.notes.at(i).0
-                lines.push(pr.notes.at(i).1)
+            if files.at(j) == item.0
+                lines.push(item.1)
                 break
 
     explain_escapes(lines)
@@ -844,8 +835,8 @@ build_level(path: string, given: Option[string], manifest_lto: bool = true) -> R
 
     manifest_at(root) match
         Ok(m) ->
-            for i in 0..<m.warnings.len()
-                say_note(m.warnings.at(i))
+            for item in m.warnings
+                say_note(item)
 
             settle_lto(if manifest_lto then m.lto else None)
             Ok(given.unwrap_or(m.optimization.unwrap_or(DefaultOptimization)))
@@ -877,8 +868,8 @@ private heap_refusal(path: string, t: Target) -> Result[unit, Refusal]
     val manifest = manifest_at(root)?
     var wants = false
 
-    for i in 0..<manifest.requires.len()
-        if manifest.requires.at(i) == "heap" then wants = true
+    for item in manifest.requires
+        if item == "heap" then wants = true
 
     if !wants then return Ok(())
 
@@ -904,10 +895,10 @@ end heap_refusal
 // The first who named the pair chosen -- the project ahead of its packages, as the claims are
 // gathered -- and `None` where nobody did, the pair then being libc's.
 private first_claimant(claims: Buf[(string, (string, string))], pair: (string, string)) -> Option[string]
-    for i in 0..<claims.len()
-        val named = claims.at(i).1
+    for item in claims
+        val named = item.1
 
-        if named.0 == pair.0 && named.1 == pair.1 then return Some(claims.at(i).0)
+        if named.0 == pair.0 && named.1 == pair.1 then return Some(item.0)
 
     None
 end first_claimant
@@ -921,10 +912,10 @@ private allocator_claims(root: string, m: Manifest) -> Buf[(string, (string, str
 
     val trees = handed_trees(root, m)
 
-    for i in 0..<trees.len()
-        manifest_at(trees.at(i).dir) match
+    for item in trees
+        manifest_at(item.dir) match
             Ok(theirs) -> theirs.allocator match
-                Some(pair) -> claims.push((trees.at(i).who, pair))
+                Some(pair) -> claims.push((item.who, pair))
                 None -> ()
             Err(_) -> ()
 
@@ -993,8 +984,8 @@ end typed_program
 // has that type. It has no layout to emit, so it is left out here rather than reaching a back end
 // that would have to invent one.
 private emitted_body(f: TFunc) -> bool
-    for i in 0..<f.params.len()
-        if mentions_abstract(f.params.at(i).1) then return false
+    for param in f.params
+        if mentions_abstract(param.1) then return false
 
     !mentions_abstract(f.ret_ty)
 end emitted_body
@@ -1223,8 +1214,8 @@ private pkg_config_names(path: string) -> Buf[string]
     pkg_config_needs(path, true) match
         Err(_) -> ()
         Ok(needs) ->
-            for i in 0..<needs.len()
-                val pc = needs.at(i).pc
+            for item in needs
+                val pc = item.pc
                 var seen = false
 
                 for j in 0..<names.len()
@@ -1278,8 +1269,7 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
         Ok(library) -> library
         Err(_) -> ""
 
-    for i in 0..<trees.len()
-        val root = trees.at(i)
+    for root in trees
         val is_std = root == std_tree
         var built: Buf[string] = buf()
 
@@ -1345,8 +1335,8 @@ private reached_std_objects(archiver: string, built: Buf[string], others: Buf[st
     // leaves undefined: either can be asking for one of these objects.
     var named = ir_globals(ir)
 
-    for i in 0..<others.len()
-        object_symbols(nm, others.at(i), t.os == MacOS) match
+    for item in others
+        object_symbols(nm, item, t.os == MacOS) match
             Err(_) -> return built
             Ok(found) ->
                 for j in 0..<found.wanted.len()
@@ -1374,9 +1364,9 @@ private defines_refusal(project: string, tree: string, why: string) -> string
 
             // A package is named; a source root is not, its manifest being read where it stands as
             // the project's is.
-            for i in 0..<trees.len()
-                if trees.at(i).dir == tree && !trees.at(i).from_lib
-                    return s"'${trees.at(i).who}': $said"
+            for item in trees
+                if item.dir == tree && !item.from_lib
+                    return s"'${item.who}': $said"
 
             said
 end defines_refusal
@@ -1393,8 +1383,8 @@ private c_trees_of(path: string) -> Buf[string]
         Ok(m) ->
             val roots = handed_trees(root, m)
 
-            for i in 0..<roots.len()
-                trees.push(roots.at(i).dir)
+            for item in roots
+                trees.push(item.dir)
         Err(_) -> ()
 
     std_root() match
@@ -1661,10 +1651,10 @@ build_library_of(path: string, named_target: Option[string],
     // against, and what it depends on reaches `build-lib` as a root of its own.
     val libs = lib_roots()
 
-    for i in 0..<libs.len()
-        if !is_directory(libs.at(i)) then continue
+    for item in libs
+        if !is_directory(item) then continue
 
-        val theirs = manifest_of_package(libs.at(i)) match
+        val theirs = manifest_of_package(item) match
             Err(why) -> return Err(said(Refusal(why)))
             Ok(got) -> got
 
@@ -1678,7 +1668,7 @@ build_library_of(path: string, named_target: Option[string],
             labels = labels + s"'${theirs.dependencies.at(j).label}'"
 
         return Err(said(Refusal(s"build-lib compiles the trees it is given and fetches nothing, so " +
-            s"the source root '${libs.at(i)}' has its dependencies reach it through --lib rather " +
+            s"the source root '${item}' has its dependencies reach it through --lib rather " +
             s"than through 'dependencies' — supply $labels as --lib <dir> too")))
 
     // The two requirements a command line answers, asked before anything is compiled: a package
@@ -1690,9 +1680,7 @@ build_library_of(path: string, named_target: Option[string],
     // **A library is reached by naming its module**, so a file of the tree that declares none sits in
     // the anonymous root module: no program could write a path to what it declares, and its keys would
     // be the consuming program's own.
-    for i in 0..<c.units.len()
-        val u = c.units.at(i)
-
+    for u in c.units
         if u.module_name.is_none() && !u.src.name.starts_with(s"$StdPrefix/")
             return Err(said(Refusal(s"a library is reached by naming its module, and ${u.src.name} " +
                 "is in none — put the library's files in a directory under the root it is built from")))
@@ -1957,8 +1945,8 @@ private native_objects(clang: string, path: string, exe: string, t: Target,
         // The project's own C that nothing compiles is named here, where the rest is gathered.
         val strays = stray_c_warnings(path)
 
-        for i in 0..<strays.len()
-            eprints(s"sysl: warning: ${strays.at(i)}\n")
+        for item in strays
+            eprints(s"sysl: warning: ${item}\n")
     end if
 
     // And every package this project takes and every source root it was handed, which carry their
@@ -1971,8 +1959,8 @@ private native_objects(clang: string, path: string, exe: string, t: Target,
         Ok(m) ->
             val roots = handed_trees(root, m)
 
-            for i in 0..<roots.len()
-                trees.push(roots.at(i).dir)
+            for item in roots
+                trees.push(item.dir)
         Err(_) -> ()
 
     // And the standard module's, where it is compiled from source rather than linked from an
@@ -1986,17 +1974,17 @@ private native_objects(clang: string, path: string, exe: string, t: Target,
     var objects: Buf[string] = buf()
     var n = 0
 
-    for i in 0..<trees.len()
-        val found = c_sources(trees.at(i), Some(t.os)) match
+    for item in trees
+        val found = c_sources(item, Some(t.os)) match
             Err(e) -> return Err(Refusal(e.message))
             Ok(cs) -> cs
 
-        val declared: &Manifest = manifest_at(trees.at(i)).unwrap_or(empty_manifest())
+        val declared: &Manifest = manifest_at(item).unwrap_or(empty_manifest())
 
         carried_defines(declared, found) match
             Err(why) ->
                 discard_objects(objects)
-                return Err(Refusal(defines_refusal(root, trees.at(i), why)))
+                return Err(Refusal(defines_refusal(root, item, why)))
             Ok(_) -> ()
 
         for j in 0..<found.len()
@@ -2036,20 +2024,18 @@ private pkg_config_needs(path: string, roots: bool) -> Result[Buf[LibNeed], Refu
 
     val trees = handed_trees(root, mine)
 
-    for i in 0..<trees.len()
-        if trees.at(i).from_lib && !roots then continue
+    for item in trees
+        if item.from_lib && !roots then continue
 
-        manifest_at(trees.at(i).dir) match
+        manifest_at(item.dir) match
             Err(_) -> ()
-            Ok(m) -> add_needs(&out, trees.at(i).who, m)
+            Ok(m) -> add_needs(&out, item.who, m)
 
     Ok(out)
 end pkg_config_needs
 
 private add_needs(out: *Buf[LibNeed], who: string, m: Manifest)
-    for i in 0..<m.pkg_config.len()
-        val row = m.pkg_config.at(i)
-
+    for row in m.pkg_config
         out.push(LibNeed(who, row.0, row.1))
 
 // One package's declared need of headers it does not carry: who declared it, the name a consumer
@@ -2076,20 +2062,18 @@ header_needs(path: string, roots: bool = true) -> Result[Buf[HeaderNeed], Refusa
 
     val trees = handed_trees(root, mine)
 
-    for i in 0..<trees.len()
-        if trees.at(i).from_lib && !roots then continue
+    for item in trees
+        if item.from_lib && !roots then continue
 
-        manifest_at(trees.at(i).dir) match
+        manifest_at(item.dir) match
             Err(_) -> ()
-            Ok(m) -> add_header_needs(&out, trees.at(i).who, m)
+            Ok(m) -> add_header_needs(&out, item.who, m)
 
     Ok(out)
 end header_needs
 
 private add_header_needs(out: *Buf[HeaderNeed], who: string, m: Manifest)
-    for i in 0..<m.headers.len()
-        val row = m.headers.at(i)
-
+    for row in m.headers
         out.push(HeaderNeed(who, row.0, row.1, row.2))
 
 // The header requirements answered by an environment variable the package named, taken as the
@@ -2104,9 +2088,7 @@ private add_header_needs(out: *Buf[HeaderNeed], who: string, m: Manifest)
 // somebody naming the root directory; treating it as a path would hand clang an empty `-I` and fail
 // somewhere with no connection to the variable.
 answer_headers_from_env(needs: Buf[HeaderNeed])
-    for i in 0..<needs.len()
-        val need = needs.at(i)
-
+    for need in needs
         if need.env != "" && !supplied_include(need.name)
             env_var(need.env) match
                 None -> ()
@@ -2175,8 +2157,8 @@ private supplied_or_refused(path: string, t: Target, roots: bool = true,
 
     var declared: Buf[string] = buf()
 
-    for i in 0..<needs.len()
-        declared.push(needs.at(i).pc)
+    for item in needs
+        declared.push(item.pc)
 
     // **A name that matches nothing here may be gated off rather than misspelt**, and only the build
     // with every feature on can tell the two apart -- so that build is resolved for a stray name and
@@ -2200,8 +2182,8 @@ private supplied_or_refused(path: string, t: Target, roots: bool = true,
 
     val gated = static_gated(mode, declared, could)
 
-    for i in 0..<gated.len()
-        link_note(s"link: '${gated.at(i)}' is required only under a feature this build leaves off, " +
+    for item in gated
+        link_note(s"link: '${item}' is required only under a feature this build leaves off, " +
             "so there is nothing of it to link")
 
     probe_libs(needs, t, mode) match
@@ -2232,13 +2214,13 @@ private linkable_names(path: string, roots: bool) -> Result[Buf[string], Refusal
 
     var out: Buf[string] = buf()
 
-    for i in 0..<mine.pkg_config.len()
-        out.push(mine.pkg_config.at(i).0)
+    for item in mine.pkg_config
+        out.push(item.0)
 
     val dirs = all_feature_trees(root, mine, roots)?
 
-    for i in 0..<dirs.len()
-        manifest_at(dirs.at(i)) match
+    for item in dirs
+        manifest_at(item) match
             Err(_) -> ()
             Ok(m) ->
                 for j in 0..<m.pkg_config.len()
@@ -2248,5 +2230,5 @@ private linkable_names(path: string, roots: bool) -> Result[Buf[string], Refusal
 end linkable_names
 
 private discard_objects(objects: Buf[string])
-    for i in 0..<objects.len()
-        remove_file(objects.at(i))
+    for item in objects
+        remove_file(item)

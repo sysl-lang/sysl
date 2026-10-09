@@ -208,8 +208,8 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
 
     var fields: Buf[(string, Type)] = buf()
 
-    for i in 0..<captured.len()
-        fields.push((captured.at(i), cx.lookup(captured.at(i)).unwrap().ty))
+    for item in captured
+        fields.push((item, cx.lookup(item).unwrap().ty))
 
     val base = closure_base(cx.an.closure_count)
 
@@ -236,8 +236,8 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     // does, and the reason capture needed no rule of its own.
     var args: Buf[TExpr] = buf()
 
-    for i in 0..<captured.len()
-        args.push(capture_source(cx, span, captured.at(i)))
+    for item in captured
+        args.push(capture_source(cx, span, item))
 
     TExpr(span, TStructNew(st, args))
 end lower_closure
@@ -399,8 +399,8 @@ private register_call_trait(cx: &Analyzer, span: Span, st: &StructType, ptypes: 
 
     var args: Buf[Type] = buf()
 
-    for i in 0..<ptypes.len()
-        args.push(ptypes.at(i))
+    for ptype in ptypes
+        args.push(ptype)
 
     args.push(ret)
 
@@ -484,8 +484,8 @@ private captures(cx: &Analyzer, body: Buf[Stmt], bound: Buf[string]) -> Buf[stri
 private read_block(keep: &Fn(string) -> bool, stmts: Buf[Stmt], bound: Buf[string], found: *Buf[string])
     var here = copied(bound)
 
-    for i in 0..<stmts.len()
-        read_stmt(keep, stmts.at(i), &here, found)
+    for item in stmts
+        read_stmt(keep, item, &here, found)
 end read_block
 
 private read_stmt(keep: &Fn(string) -> bool, s: Stmt, bound: *Buf[string], found: *Buf[string])
@@ -509,8 +509,8 @@ private read_stmt(keep: &Fn(string) -> bool, s: Stmt, bound: *Buf[string], found
         MultiDecl(names, _, values) ->
             read_each(keep, values, *bound, found)
 
-            for i in 0..<names.len()
-                bound.push(names.at(i))
+            for item in names
+                bound.push(item)
         PatternDecl(pat, _, value) ->
             read_expr(keep, value, *bound, found)
             pattern_binds_into(pat, bound)
@@ -529,8 +529,8 @@ private read_stmt(keep: &Fn(string) -> bool, s: Stmt, bound: *Buf[string], found
         FuncDecl(d) ->
             var inner = copied(*bound)
 
-            for i in 0..<d.params.len()
-                inner.push(d.params.at(i).name)
+            for param in d.params
+                inner.push(param.name)
 
             read_block(keep, d.body, inner, found)
             bound.push(d.name)
@@ -538,8 +538,8 @@ private read_stmt(keep: &Fn(string) -> bool, s: Stmt, bound: *Buf[string], found
 end read_stmt
 
 private read_each(keep: &Fn(string) -> bool, es: Buf[Expr], bound: Buf[string], found: *Buf[string])
-    for i in 0..<es.len()
-        read_expr(keep, es.at(i), bound, found)
+    for item in es
+        read_expr(keep, item, bound, found)
 
 private read_opt(keep: &Fn(string) -> bool, e: Option[Expr], bound: Buf[string], found: *Buf[string])
     e match
@@ -563,8 +563,8 @@ private read_expr(keep: &Fn(string) -> bool, e: Expr, bound: Buf[string], found:
         Lambda(ps, b, _) ->
             var inner = copied(bound)
 
-            for i in 0..<ps.len()
-                inner.push(ps.at(i).name)
+            for item in ps
+                inner.push(item.name)
 
             read_block(keep, b, inner, found)
         BlockArg(b) ->
@@ -602,8 +602,8 @@ private read_expr(keep: &Fn(string) -> bool, e: Expr, bound: Buf[string], found:
         WithExpr(base, fields, _) ->
             read_expr(keep, base, bound, found)
 
-            for i in 0..<fields.len()
-                read_expr(keep, fields.at(i).value, bound, found)
+            for item in fields
+                read_expr(keep, item.value, bound, found)
         TryExpr(inner) -> read_expr(keep, inner, bound, found)
         AwaitExpr(inner) -> read_expr(keep, inner, bound, found)
         Tuple(elements) -> read_each(keep, elements, bound, found)
@@ -619,8 +619,7 @@ private read_expr(keep: &Fn(string) -> bool, e: Expr, bound: Buf[string], found:
         MatchExpr(scrutinee, arms) ->
             read_expr(keep, scrutinee, bound, found)
 
-            for i in 0..<arms.len()
-                val arm = arms.at(i)
+            for arm in arms
                 var inner = copied(bound)
 
                 for j in 0..<arm.patterns.len()
@@ -695,14 +694,14 @@ pattern_binds_into(p: Pattern, out: *Buf[string])
             out.push(name)
             pattern_binds_into(inner, out)
         VariantPattern(_, args) ->
-            for i in 0..<args.len()
-                pattern_binds_into(args.at(i), out)
+            for arg in args
+                pattern_binds_into(arg, out)
         TuplePattern(args) ->
-            for i in 0..<args.len()
-                pattern_binds_into(args.at(i), out)
+            for arg in args
+                pattern_binds_into(arg, out)
         StructPattern(_, fields) ->
-            for i in 0..<fields.len()
-                pattern_binds_into(fields.at(i).pat, out)
+            for item in fields
+                pattern_binds_into(item.pat, out)
         _ -> ()
 end pattern_binds_into
 
@@ -716,29 +715,29 @@ private pattern_reads(keep: &Fn(string) -> bool, p: Pattern, bound: Buf[string],
                 found.push(name)
         BindPattern(_, inner) -> pattern_reads(keep, inner, bound, found)
         VariantPattern(_, args) ->
-            for i in 0..<args.len()
-                pattern_reads(keep, args.at(i), bound, found)
+            for arg in args
+                pattern_reads(keep, arg, bound, found)
         TuplePattern(args) ->
-            for i in 0..<args.len()
-                pattern_reads(keep, args.at(i), bound, found)
+            for arg in args
+                pattern_reads(keep, arg, bound, found)
         StructPattern(_, fields) ->
-            for i in 0..<fields.len()
-                pattern_reads(keep, fields.at(i).pat, bound, found)
+            for item in fields
+                pattern_reads(keep, item.pat, bound, found)
         _ -> ()
 end pattern_reads
 
 private copied(xs: Buf[string]) -> Buf[string]
     var out: Buf[string] = buf()
 
-    for i in 0..<xs.len()
-        out.push(xs.at(i))
+    for item in xs
+        out.push(item)
 
     out
 end copied
 
 private names_hold(xs: Buf[string], name: string) -> bool
-    for i in 0..<xs.len()
-        if xs.at(i) == name then return true
+    for item in xs
+        if item == name then return true
 
     false
 end names_hold
@@ -800,9 +799,7 @@ private call_bounds(tparams: Buf[string],
     var bounds: Buf[NamedBounds] = buf()
     var out: Buf[Param] = buf()
 
-    for i in 0..<params.len()
-        val p = params.at(i)
-
+    for p in params
         *p.typ.kind match
             FnType(fparams, ret, bare) ->
                 if !bare
@@ -829,11 +826,11 @@ private call_bounds(tparams: Buf[string],
 
     var all: Buf[string] = buf()
 
-    for i in 0..<tparams.len()
-        all.push(tparams.at(i))
+    for tparam in tparams
+        all.push(tparam)
 
-    for i in 0..<added.len()
-        all.push(added.at(i))
+    for item in added
+        all.push(item)
 
     Some((all, out, bounds))
 end call_bounds
@@ -841,11 +838,11 @@ end call_bounds
 private joined_bounds(outer: Buf[NamedBounds], added: Buf[NamedBounds]) -> Buf[NamedBounds]
     var out: Buf[NamedBounds] = buf()
 
-    for i in 0..<outer.len()
-        out.push(outer.at(i))
+    for item in outer
+        out.push(item)
 
-    for i in 0..<added.len()
-        out.push(added.at(i))
+    for item in added
+        out.push(item)
 
     out
 end joined_bounds
@@ -856,8 +853,8 @@ end joined_bounds
 with_trait_call_bounds(d: TraitDecl) -> TraitDecl
     var methods: Buf[MethodDecl] = buf()
 
-    for i in 0..<d.methods.len()
-        methods.push(with_member_call_bounds(d.methods.at(i)))
+    for item in d.methods
+        methods.push(with_member_call_bounds(item))
 
     TraitDecl(d.name, d.tparams, methods, d.bounds, d.supers, d.vis, d.tdefaults, d.assocs, d.tvalues)
 end with_trait_call_bounds
@@ -880,8 +877,8 @@ with_enum_call_bounds(d: EnumDecl) -> EnumDecl
 private lowered_members(ms: Buf[MethodDecl]) -> Buf[MethodDecl]
     var out: Buf[MethodDecl] = buf()
 
-    for i in 0..<ms.len()
-        out.push(with_member_call_bounds(ms.at(i)))
+    for item in ms
+        out.push(with_member_call_bounds(item))
 
     out
 end lowered_members

@@ -130,8 +130,7 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     // (`seam_supply.sysl`).
     var supply = seam_supply()
 
-    for i in 0..<units.len()
-        val unit = units.at(i)
+    for unit in units
         val scope = scope_of_unit(a, unit)
         val library = from_library(a, scope)
         val is_entry = a.tables.entry_src != "" && unit.src.name == a.tables.entry_src
@@ -206,8 +205,7 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     // with members would otherwise put every one of them into every program.
     val lowered = a.tables.members.lowered
 
-    for i in 0..<lowered.len()
-        val m = lowered.at(i)
+    for m in lowered
         val home = a.tables.members.decl_scope.get(m.name).unwrap_or(empty_scope())
 
         // **A copy of a default the trait refused is not read again.** The body is one body, so its
@@ -247,10 +245,10 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
 
         val bodies = held.take_reached(a.funcs_used())
 
-        for i in 0..<bodies.len()
+        for bodie in bodies
             reached = true
 
-            val at = bodies.at(i)
+            val at = bodie
 
             if at.member.is_some() then
                 funcs.push(analyze_instance(a, at.name, at.member.unwrap()))
@@ -270,8 +268,8 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     // The `call` bodies the closures lowered to, after everything a program declared: a closure has
     // no declaration of its own to sit beside, and one lowered while a later body was typed would
     // otherwise land in the middle of the list.
-    for i in 0..<a.closure_funcs.len()
-        funcs.push(a.closure_funcs.at(i))
+    for closure_func in a.closure_funcs
+        funcs.push(closure_func)
 
     // What a program is held to once everything it reaches has been typed. It runs here rather than
     // per body because every one of these questions is about the whole compilation.
@@ -331,9 +329,7 @@ end with_entry_body
 private entry_body(a: &Analysis, units: Buf[Program]) -> (Buf[TStmt], string)
     if a.tables.entry_src == "" then return (buf(), ModuleRoot)
 
-    for i in 0..<units.len()
-        val unit = units.at(i)
-
+    for unit in units
         if unit.src.name != a.tables.entry_src then continue
 
         val scope = scope_of_unit(a, unit)
@@ -391,8 +387,7 @@ private type_lowered(a: &Analysis, funcs: *Buf[TFunc], held: *HeldQueue[HeldBody
 // they make real lands there -- `sizeof(Pair)` in a one-file program puts `Pair` after the library's
 // types, where the same assert in a module puts its type ahead of them.
 check_top_level_asserts(a: &Analysis, units: Buf[Program], entry: bool)
-    for i in 0..<units.len()
-        val unit = units.at(i)
+    for unit in units
         val is_entry = a.tables.entry_src != "" && unit.src.name == a.tables.entry_src
 
         if is_entry != entry then continue
@@ -477,8 +472,7 @@ private drain_pending(a: &Analysis, funcs: *Buf[TFunc])
 
         a.tables.members.pending = buf()
 
-        for i in 0..<work.len()
-            val job = work.at(i)
+        for job in work
             val cx = analyzer_for(a, job.scope)
 
             cx.subst = job.subst
@@ -519,8 +513,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
 
     var params: Buf[(string, Type)] = buf()
 
-    for i in 0..<d.params.len()
-        val p = d.params.at(i)
+    for p in d.params
         val ty = resolve_type(a, scope, p.typ, no_bindings())
         val unique = cx.bind(p.name, ty)
 
@@ -571,8 +564,8 @@ end analyze_body
 
 // Whether the declaration wrote the parameter `name` by name (`x: -> T`).
 private written_by_name(d: FuncDecl, name: string) -> bool
-    for i in 0..<d.params.len()
-        if d.params.at(i).name == name && d.params.at(i).by_name then return true
+    for param in d.params
+        if param.name == name && param.by_name then return true
 
     false
 
@@ -593,8 +586,7 @@ owner_of(a: &Analysis, name: string, scope: Scope) -> string =
 // not license, and a call that disagrees with the *trait's* signature rather than with any one
 // implementation's.
 private check_generic_bodies(a: &Analysis, units: Buf[Program])
-    for i in 0..<units.len()
-        val unit = units.at(i)
+    for unit in units
         val scope = scope_of_unit(a, unit)
         val is_entry = a.tables.entry_src != "" && unit.src.name == a.tables.entry_src
 
@@ -661,9 +653,7 @@ end check_trait_default_bodies
 
 // One trait's, each in the terms of the file that wrote it.
 private check_defaults_of(a: &Analysis, scope: Scope, key: string, td: TraitDecl)
-    for i in 0..<td.methods.len()
-        val m = td.methods.at(i)
-
+    for m in td.methods
         // A static property carrying one is refused where the trait is hoisted, and reading the body
         // would say a second thing about a declaration that is already wrong.
         if m.body.is_empty() || (m.recv_mode().is_none() && m.is_static) then continue
@@ -683,25 +673,25 @@ private trait_default_decl(td: TraitDecl, m: MethodDecl) -> FuncDecl
 
     if recv.is_some() then params.push(recv.unwrap())
 
-    for i in 0..<m.params.len()
-        params.push(m.params.at(i))
+    for param in m.params
+        params.push(param)
 
     var tparams: Buf[string] = buf()
 
     tparams.push("Self")
 
-    for i in 0..<td.tparams.len()
-        tparams.push(td.tparams.at(i))
+    for tparam in td.tparams
+        tparams.push(tparam)
 
-    for i in 0..<m.tparams.len()
-        tparams.push(m.tparams.at(i))
+    for tparam in m.tparams
+        tparams.push(tparam)
 
     // The trait applied to its own parameters, which is what a bound on `Self` has to say for an
     // `Add[T]` to give `self.value() + x` the result the trait promised.
     var args: Buf[TypeRef] = buf()
 
-    for i in 0..<td.tparams.len()
-        args.push(named_type(m.span, td.tparams.at(i)))
+    for tparam in td.tparams
+        args.push(named_type(m.span, tparam))
 
     var on_self: Buf[BoundRef] = buf()
 
@@ -711,11 +701,11 @@ private trait_default_decl(td: TraitDecl, m: MethodDecl) -> FuncDecl
 
     bounds.push(NamedBounds("Self", on_self))
 
-    for i in 0..<td.bounds.len()
-        bounds.push(td.bounds.at(i))
+    for item in td.bounds
+        bounds.push(item)
 
-    for i in 0..<m.bounds.len()
-        bounds.push(m.bounds.at(i))
+    for item in m.bounds
+        bounds.push(item)
 
     FuncDecl(s"${td.name}.${m.name}", tparams, params, m.ret_type, m.body, bounds, m.variadic, File,
              buf(), joined_values(td.tvalues, m.tvalues), m.tpacks, None, None, None, false, false,
@@ -766,9 +756,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     cx.at_definition = true
     remember_bounds(cx, d)
 
-    for i in 0..<d.params.len()
-        val p = d.params.at(i)
-
+    for p in d.params
         val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst))
 
         if p.by_name then cx.by_name.push(unique)
@@ -793,8 +781,8 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     val body = body_block(cx, statements_from(d.body, split), ret)
     var params: Buf[(string, Type)] = buf()
 
-    for i in 0..<d.params.len()
-        params.push((d.params.at(i).name, resolve_type(a, scope, d.params.at(i).typ, subst)))
+    for param in d.params
+        params.push((param.name, resolve_type(a, scope, param.typ, subst)))
 
     a.settled = settled_before
     a.release(trial)
@@ -860,9 +848,7 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
     cx.owner = owner_of(a, d.name, scope)
     remember_bounds(cx, d)
 
-    for i in 0..<d.params.len()
-        val p = d.params.at(i)
-
+    for p in d.params
         val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst))
 
         if p.by_name then cx.by_name.push(unique)
@@ -912,8 +898,8 @@ rewind_instantiations(a: &Analysis, queued: usize, tables: usize, structs: usize
     for i in tables..<a.tables.members.vtables.len()
         made.push(a.tables.members.vtables.key_at(i))
 
-    for i in 0..<made.len()
-        a.tables.members.vtables.remove(made.at(i))
+    for item in made
+        a.tables.members.vtables.remove(item)
 
     // And the records a reading made real, on the same terms: a type is one a program lays out
     // because something in it asked for one, and a reading nobody kept asked for nothing.
@@ -937,9 +923,7 @@ private remember_bounds(cx: &Analyzer, d: FuncDecl)
 
     var held: Buf[(string, string)] = buf()
 
-    for i in 0..<d.params.len()
-        val p = d.params.at(i)
-
+    for p in d.params
         *p.typ.kind match
             NamedType(w, args) ->
                 if args.is_empty() && named_bounds_of(d.bounds, w).is_some() then held.push((p.name, w))
@@ -951,8 +935,8 @@ end remember_bounds
 // The bounds a declaration wrote for one of its type parameters, and nothing for a name that is not
 // one of them.
 named_bounds_of(bounds: Buf[NamedBounds], written: string) -> Option[Buf[BoundRef]]
-    for i in 0..<bounds.len()
-        if bounds.at(i).name == written then return Some(bounds.at(i).bounds)
+    for item in bounds
+        if item.name == written then return Some(item.bounds)
 
     None
 end named_bounds_of
@@ -1253,12 +1237,12 @@ func_key(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> string
     val plain = file_private_key(a, scope.src.name, module_qualify(scope.module_name, d.name))
     val keys = overload_keys(a, plain)
 
-    for i in 0..<keys.len()
-        val f = a.tables.funcs.get(keys.at(i))
+    for item in keys
+        val f = a.tables.funcs.get(item)
 
         if f.is_some() && f.unwrap().span.start == span.start &&
                 f.unwrap().scope.src.name == scope.src.name then
-            return keys.at(i)
+            return item
 
     plain
 end func_key
@@ -1299,8 +1283,8 @@ stmt_diagnostics_for(text: string, t: Target) -> Buf[string]
 
     val done = analyze_bodies(units, t)
 
-    for i in 0..<done.reported.len()
-        out.push(done.reported.at(i).diag.message)
+    for item in done.reported
+        out.push(item.diag.message)
 
     out
 end stmt_diagnostics_for
@@ -1461,8 +1445,8 @@ end binding_type
 // The type a run of statements binds a name at, looking into the blocks a statement carries so that
 // a binding made inside a loop or a branch is reachable too.
 private binding_in(stmts: Buf[TStmt], name: string) -> Option[Type]
-    for i in 0..<stmts.len()
-        stmts.at(i) match
+    for stmt in stmts
+        stmt match
             TVarDecl(bound, ty, _, _) -> if bound == name then return Some(ty)
             TRefDecl(bound, ty, _) -> if bound == name then return Some(ty)
             TExprStmt(e) ->
@@ -1506,8 +1490,8 @@ private binding_in_expr(e: TExpr, name: string) -> Option[Type] = *e.kind match
 
 // A condition's terms, since an `is` binds into the branch the test guards.
 private binding_in_cond(cond: Buf[TCondTerm], name: string) -> Option[Type]
-    for i in 0..<cond.len()
-        cond.at(i) match
+    for item in cond
+        item match
             TCondIs(_, patterns, _) ->
                 val found = pattern_binding(patterns, name)
 
@@ -1518,8 +1502,8 @@ private binding_in_cond(cond: Buf[TCondTerm], name: string) -> Option[Type]
 end binding_in_cond
 
 private binding_in_exprs(xs: Buf[TExpr], name: string) -> Option[Type]
-    for i in 0..<xs.len()
-        val found = binding_in_expr(xs.at(i), name)
+    for item in xs
+        val found = binding_in_expr(item, name)
 
         if found.is_some() then return found
 
@@ -1542,12 +1526,12 @@ private binding_in_opt_block(b: Option[TBlock], name: string) -> Option[Type]
 end binding_in_opt_block
 
 private binding_in_arms(arms: Buf[TArm], name: string) -> Option[Type]
-    for i in 0..<arms.len()
-        val bound = pattern_binding(arms.at(i).patterns, name)
+    for item in arms
+        val bound = pattern_binding(item.patterns, name)
 
         if bound.is_some() then return bound
 
-        val found = binding_in_block(arms.at(i).body, name)
+        val found = binding_in_block(item.body, name)
 
         if found.is_some() then return found
 
@@ -1556,8 +1540,8 @@ end binding_in_arms
 
 // The type one of a run of patterns binds a name at, which is what an arm's capture asks.
 private pattern_binding(ps: Buf[TPattern], name: string) -> Option[Type]
-    for i in 0..<ps.len()
-        val found = pattern_binds_name(ps.at(i), name)
+    for item in ps
+        val found = pattern_binds_name(item, name)
 
         if found.is_some() then return found
 
@@ -1742,8 +1726,8 @@ private laid_down(t: TExpr) -> bool = *t.kind match
     _ -> false
 
 private all_laid_down(xs: Buf[TExpr]) -> bool
-    for i in 0..<xs.len()
-        if !laid_down(xs.at(i)) then return false
+    for item in xs
+        if !laid_down(item) then return false
 
     true
 end all_laid_down
@@ -1815,8 +1799,8 @@ end cast_image
 private static_images(cx: &Analyzer, xs: Buf[TExpr]) -> Option[Buf[TExpr]]
     var out: Buf[TExpr] = buf()
 
-    for i in 0..<xs.len()
-        val x = static_image(cx, xs.at(i))
+    for item in xs
+        val x = static_image(cx, item)
 
         if x.is_none() then return None
 

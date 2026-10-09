@@ -30,8 +30,8 @@ type_asm(cx: &Analyzer, span: Span, arms: Buf[AsmArm]) -> TStmt
         AsmCode(lines, operands, clobbers) ->
             var bound: Buf[TAsmOperand] = buf()
 
-            for i in 0..<operands.len()
-                val one = bind_operand(cx, operands.at(i))
+            for item in operands
+                val one = bind_operand(cx, item)
 
                 if one.is_some() then bound.push(one.unwrap())
 
@@ -49,9 +49,7 @@ end type_asm
 // `clobbers` line and a `{name}` placeholder, in EVERY arm, the mistake being the same whichever
 // machine is being built for.
 check_module_asm(a: &Analysis, units: Buf[Program])
-    for i in 0..<units.len()
-        val unit = units.at(i)
-
+    for unit in units
         for j in 0..<unit.body.len()
             val s = unit.body.at(j)
 
@@ -70,10 +68,10 @@ private type_module_asm(cx: &Analyzer, span: Span, arms: Buf[AsmArm], section: O
     check_no_overlap(cx, arms)
     check_exhaustive(cx, span, arms)
 
-    for i in 0..<arms.len()
-        arms.at(i).body match
+    for item in arms
+        item.body match
             AsmCode(lines, operands, clobbers) ->
-                refuse_module_operands(cx, arms.at(i).span, lines, operands, clobbers)
+                refuse_module_operands(cx, item.span, lines, operands, clobbers)
             AsmUnavailable(_) -> ()
 
     val boundary_at = boundary(cx, "asm", align)
@@ -93,8 +91,8 @@ end type_module_asm
 // reader's intent -- reaching a value, or keeping a register -- has a spelling at module level too.
 private refuse_module_operands(cx: &Analyzer, span: Span, lines: Buf[string],
                                operands: Buf[AsmOperand], clobbers: Buf[string])
-    for i in 0..<operands.len()
-        cx.fault(operands.at(i).span, s"'${operands.at(i).name}' cannot be an operand here: an " +
+    for item in operands
+        cx.fault(item.span, s"'${item.name}' cannot be an operand here: an " +
                  "'asm' block at the top of a file is outside every function, so there is no " +
                  "variable for an operand to be and no code around the block to hand one over. " +
                  "Name a symbol in the instructions instead — module storage the program " +
@@ -106,10 +104,10 @@ private refuse_module_operands(cx: &Analyzer, span: Span, lines: Buf[string],
                  "it in the middle of a function. Delete the line; whatever calls into these " +
                  "instructions keeps its own registers by the calling convention")
 
-    for i in 0..<lines.len()
+    for item in lines
         var names: Buf[string] = buf()
 
-        placeholders(&names, lines.at(i))
+        placeholders(&names, item)
 
         for j in 0..<names.len()
             cx.fault(span, s"'{${names.at(j)}}' names an operand, and an 'asm' block at the top " +
@@ -117,9 +115,7 @@ private refuse_module_operands(cx: &Analyzer, span: Span, lines: Buf[string],
 end refuse_module_operands
 
 private arm_for(arms: Buf[AsmArm], here: string) -> Option[AsmArm]
-    for i in 0..<arms.len()
-        val arm = arms.at(i)
-
+    for arm in arms
         for j in 0..<arm.archs.len()
             if arm.archs.at(j) == here then return Some(arm)
 
@@ -132,16 +128,16 @@ end arm_for
 private check_arch_names(cx: &Analyzer, arms: Buf[AsmArm])
     val all = all_cpus()
 
-    for i in 0..<arms.len()
-        for j in 0..<arms.at(i).archs.len()
-            val name = arms.at(i).archs.at(j)
+    for item in arms
+        for j in 0..<item.archs.len()
+            val name = item.archs.at(j)
             var known = false
 
             for k in 0..<all.len()
                 if cpu_symbol(all.at(k)) == name then known = true
 
             if !known then
-                cx.fault(arms.at(i).span, s"'$name' is not a processor — ${cpu_names(all)} is what " +
+                cx.fault(item.span, s"'$name' is not a processor — ${cpu_names(all)} is what " +
                          "there is")
 
 private cpu_names(all: Buf[Cpu]) -> string
@@ -160,16 +156,16 @@ end cpu_names
 private check_no_overlap(cx: &Analyzer, arms: Buf[AsmArm])
     var seen: Buf[string] = buf()
 
-    for i in 0..<arms.len()
-        for j in 0..<arms.at(i).archs.len()
-            val name = arms.at(i).archs.at(j)
+    for item in arms
+        for j in 0..<item.archs.len()
+            val name = item.archs.at(j)
             var have = false
 
             for k in 0..<seen.len()
                 if seen.at(k) == name then have = true
 
             if have then
-                cx.fault(arms.at(i).span, s"'$name' already has an arm above this one, so there " +
+                cx.fault(item.span, s"'$name' already has an arm above this one, so there " +
                          "is no saying which of them answers for it")
             else
                 seen.push(name)
@@ -181,8 +177,8 @@ private check_exhaustive(cx: &Analyzer, span: Span, arms: Buf[AsmArm])
     val all = all_cpus()
     var missing: Buf[string] = buf()
 
-    for i in 0..<all.len()
-        val name = cpu_symbol(all.at(i))
+    for item in all
+        val name = cpu_symbol(item)
 
         if name != "x86"
             var covered = false
@@ -309,10 +305,10 @@ private check_no_double_binding(cx: &Analyzer, operands: Buf[AsmOperand])
 // at worst untidy, and at best is how a value is kept alive across a block.
 private check_placeholders(cx: &Analyzer, span: Span, lines: Buf[string],
                            operands: Buf[AsmOperand])
-    for i in 0..<lines.len()
+    for item in lines
         var names: Buf[string] = buf()
 
-        placeholders(&names, lines.at(i))
+        placeholders(&names, item)
 
         for j in 0..<names.len()
             var declared = false

@@ -46,13 +46,13 @@ end BlockGroup
 open_group(cx: &Analyzer, stmts: Buf[Stmt]) -> BlockGroup
     var pending: Buf[FuncDecl] = buf()
 
-    for i in 0..<cx.pending_nested.len()
-        pending.push(cx.pending_nested.at(i))
+    for item in cx.pending_nested
+        pending.push(item)
 
     var needs: Buf[string] = buf()
 
-    for i in 0..<cx.pending_needs.len()
-        needs.push(cx.pending_needs.at(i))
+    for pending_need in cx.pending_needs
+        needs.push(pending_need)
 
     val was = BlockGroup(pending, needs, cx.awaiting_needs, cx.nested.len(),
                          cx.block_declares.len())
@@ -64,13 +64,13 @@ end open_group
 close_group(cx: &Analyzer, was: BlockGroup)
     cx.pending_nested.truncate(0)
 
-    for i in 0..<was.pending.len()
-        cx.pending_nested.push(was.pending.at(i))
+    for item in was.pending
+        cx.pending_nested.push(item)
 
     cx.pending_needs.truncate(0)
 
-    for i in 0..<was.needs.len()
-        cx.pending_needs.push(was.needs.at(i))
+    for need in was.needs
+        cx.pending_needs.push(need)
 
     cx.awaiting_needs = was.awaiting
     cx.nested.truncate(was.in_view)
@@ -80,8 +80,8 @@ close_group(cx: &Analyzer, was: BlockGroup)
 open_block_group(cx: &Analyzer, stmts: Buf[Stmt])
     cx.pending_nested.truncate(0)
 
-    for i in 0..<stmts.len()
-        *stmts.at(i).kind match
+    for item in stmts
+        *item.kind match
             FuncDecl(d) -> cx.pending_nested.push(with_call_bounds(d))
             _ -> ()
 
@@ -94,8 +94,7 @@ open_block_group(cx: &Analyzer, stmts: Buf[Stmt])
     var binds: Buf[string] = buf()
     var begun = false
 
-    for i in 0..<stmts.len()
-        val s = stmts.at(i)
+    for s in stmts
         val mark = binds.len()
 
         block_binds(s, &binds)
@@ -111,8 +110,8 @@ open_block_group(cx: &Analyzer, stmts: Buf[Stmt])
 
     val needs = group_needs(cx.pending_nested, binds)
 
-    for i in 0..<needs.len()
-        cx.pending_needs.push(needs.at(i))
+    for need in needs
+        cx.pending_needs.push(need)
 
     cx.awaiting_needs = false
 end open_block_group
@@ -131,21 +130,21 @@ settle_needs(cx: &Analyzer, span: Span, s: Stmt) -> Buf[TStmt]
 
         var left: Buf[string] = buf()
 
-        for i in 0..<cx.pending_needs.len()
-            if !holds_string(bound, cx.pending_needs.at(i)) then left.push(cx.pending_needs.at(i))
+        for pending_need in cx.pending_needs
+            if !holds_string(bound, pending_need) then left.push(pending_need)
 
         cx.pending_needs.truncate(0)
 
-        for i in 0..<left.len()
-            cx.pending_needs.push(left.at(i))
+        for item in left
+            cx.pending_needs.push(item)
 
     if !cx.awaiting_needs || !cx.pending_needs.is_empty() || cx.pending_nested.is_empty() then
         return buf()
 
     var group: Buf[FuncDecl] = buf()
 
-    for i in 0..<cx.pending_nested.len()
-        group.push(cx.pending_nested.at(i))
+    for item in cx.pending_nested
+        group.push(item)
 
     cx.pending_nested.truncate(0)
     cx.awaiting_needs = false
@@ -184,8 +183,8 @@ type_block_body(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
 
     var out: Buf[TStmt] = buf()
 
-    for i in 0..<stmts.len()
-        push_all(&out, recover_stmt(cx, stmts.at(i)))
+    for item in stmts
+        push_all(&out, recover_stmt(cx, item))
 
     TBlock(out, None, if last == TrailingJump then Never else Unit)
 end type_block_body
@@ -313,8 +312,8 @@ end checked_loop
 open_loop(cx: &Analyzer, span: Span, expected: Option[Type],
           label: Option[string]) -> &LoopCtx
     if label.is_some()
-        for i in 0..<cx.loops.len()
-            if cx.loops.at(i).label == label then
+        for item in cx.loops
+            if item.label == label then
                 cx.fault(span, s"label '${label.unwrap()} is already in scope")
     end if
 
@@ -323,8 +322,8 @@ open_loop(cx: &Analyzer, span: Span, expected: Option[Type],
 
     kept.push(ctx)
 
-    for i in 0..<cx.loops.len()
-        kept.push(cx.loops.at(i))
+    for item in cx.loops
+        kept.push(item)
 
     cx.loops = kept
     ctx
@@ -348,8 +347,8 @@ close_loop(cx: &Analyzer, ctx: &LoopCtx)
 loop_result_type(cx: &Analyzer, span: Span, ctx: &LoopCtx, else_block: Option[TBlock]) -> Type
     var tys: Buf[Type] = buf()
 
-    for i in 0..<ctx.break_tys.len()
-        tys.push(ctx.break_tys.at(i))
+    for break_ty in ctx.break_tys
+        tys.push(break_ty)
 
     tys.push(if else_block.is_none() then Unit else else_block.unwrap().ty)
 
@@ -404,8 +403,8 @@ private meet_all(tys: Buf[Type]) -> Option[Type]
 end meet_all
 
 private first_value(tys: Buf[Type]) -> Type
-    for i in 0..<tys.len()
-        if !no_value(tys.at(i)) then return tys.at(i)
+    for item in tys
+        if !no_value(item) then return item
 
     Unit
 end first_value
@@ -414,8 +413,8 @@ end first_value
 private type_list_show(tys: Buf[Type]) -> string
     var seen: Buf[string] = buf()
 
-    for i in 0..<tys.len()
-        val text = type_show(tys.at(i))
+    for item in tys
+        val text = type_show(item)
         var have = false
 
         for j in 0..<seen.len()
@@ -574,8 +573,8 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
         else
             var group: Buf[FuncDecl] = buf()
 
-            for i in 0..<cx.pending_nested.len()
-                group.push(cx.pending_nested.at(i))
+            for item in cx.pending_nested
+                group.push(item)
 
             cx.pending_nested.truncate(0)
             lower_nested_group(cx, stmt.span, group)
@@ -610,8 +609,8 @@ private one(s: TStmt) -> Buf[TStmt]
 end one
 
 push_all(out: *Buf[TStmt], xs: Buf[TStmt])
-    for i in 0..<xs.len()
-        out.push(xs.at(i))
+    for item in xs
+        out.push(item)
 
 // -- the bindings ---------------------------------------------------------------------------------
 
@@ -810,8 +809,8 @@ private block_import(cx: &Analyzer, span: Span, d: ImportDecl) -> TStmt
     var taken = block_imported(cx)
     val said = import_refusals(cx.an, cx.scope, span, d, &taken)
 
-    for i in 0..<said.len()
-        cx.fault(said.at(i).0, said.at(i).1)
+    for item in said
+        cx.fault(item.0, item.1)
 
     // A refused import costs itself and no more, so the rest of the block is still read.
     if said.is_empty()

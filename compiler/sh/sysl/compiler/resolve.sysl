@@ -237,8 +237,7 @@ end WorkspaceSelection
 workspace_selection(ws: &Workspace, sums: Sums, cache: string) -> Result[WorkspaceSelection, string]
     var state = new_resolve_state(sums, buf(), root_packages()?, buf(), true)
 
-    for i in 0..<ws.members.len()
-        val mb = ws.members.at(i)
+    for mb in ws.members
         val m = resolving_local_paths(mb.manifest, mb.dir)
         var all: Buf[Dependency] = buf()
         var paths: Buf[Dependency] = buf()
@@ -261,8 +260,8 @@ workspace_selection(ws: &Workspace, sums: Sums, cache: string) -> Result[Workspa
 
     var read: Buf[(string, Release)] = buf()
 
-    for i in 0..<state.manifests.len()
-        read.push((state.manifests.at(i).coordinate, state.manifests.at(i).version.unwrap()))
+    for item in state.manifests
+        read.push((item.coordinate, item.version.unwrap()))
 
     Ok(WorkspaceSelection(state.selected, state.claims, state.sums, state.changed, read))
 end workspace_selection
@@ -274,16 +273,15 @@ end workspace_selection
 private with_workspace_answer(g: *Graph, s: &WorkspaceSelection)
     if s.changed then g.sums_changed = true
 
-    for i in 0..<s.read.len()
+    for item in s.read
         var seen = false
 
         for j in 0..<g.read.len()
-            if g.read.at(j).0 == s.read.at(i).0 && g.read.at(j).1 == s.read.at(i).1 then seen = true
+            if g.read.at(j).0 == item.0 && g.read.at(j).1 == item.1 then seen = true
 
-        if !seen then g.read.push(s.read.at(i))
+        if !seen then g.read.push(item)
 
-    for i in 0..<s.claims.len()
-        val c = s.claims.at(i)
+    for c in s.claims
         var used = false
         var seen = false
 
@@ -320,11 +318,11 @@ private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string
     // Its claims are the project's to answer for, and a listing says so.
     var declared: Buf[Dependency] = buf()
 
-    for i in 0..<config.dependencies.len()
-        declared.push(config.dependencies.at(i))
+    for dependencie in config.dependencies
+        declared.push(dependencie)
 
-    for i in 0..<roots.len()
-        val theirs = roots.at(i).1.dependencies
+    for item in roots
+        val theirs = item.1.dependencies
 
         read_locals(theirs, &state, cache)?
         demanding(&state, root_asker(config), theirs)
@@ -340,8 +338,8 @@ private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string
 
     packages.push(ResolvedPackage("", root, config, root_table, None))
 
-    for i in 0..<settled.len()
-        var p = settled.at(i)
+    for item in settled
+        var p = item
 
         p.imports = table_of(package_owner(p), p.root, p.manifest.dependencies, state)?
         packages.push(p)
@@ -350,9 +348,7 @@ private resolve_once(root: string, written: &Manifest, sums: Sums, cache: string
 
     var read: Buf[(string, Release)] = buf()
 
-    for i in 0..<state.manifests.len()
-        val had = state.manifests.at(i)
-
+    for had in state.manifests
         read.push((had.coordinate, had.version.unwrap()))
 
     Ok(Graph(packages, state.claims, state.sums, state.changed, enabled, read))
@@ -411,9 +407,7 @@ end check_floors
 // release-line version even while a development build makes no claim against its own
 // (`on_the_release_line`).
 dependency_floor_refusal(packages: &Buf[ResolvedPackage], compiler: string) -> Option[string]
-    for i in 0..<packages.len()
-        val p = packages.at(i)
-
+    for p in packages
         if is_root_package(p) then continue
 
         check_floor(package_named(p), p.manifest.floor, compiler) match
@@ -431,11 +425,11 @@ end dependency_floor_refusal
 // that was passed over has its manifest dropped on purpose. So a claim recomputed from the finished
 // graph can only ever find the one that won, which is the half nobody needed to be told.
 private demanding(state: *ResolveState, asker: string, deps: &Buf[Dependency])
-    for i in 0..<deps.len()
+    for item in deps
         // A coordinate a source root stands in for takes no part in selection at all.
-        if stand_in_for(*state, deps.at(i)).is_some() then continue
+        if stand_in_for(*state, item).is_some() then continue
 
-        deps.at(i).origin match
+        item.origin match
             Git(coordinate, asked) ->
                 state.claims.push(Claim(coordinate, asker, asked))
 
@@ -465,9 +459,7 @@ end demanding
 // What a claim of `asked` on `coordinate` is selected at: the workspace's version where that is
 // higher, and the claim itself everywhere else.
 private floor_of(state: &ResolveState, coordinate: string, asked: Release) -> Release
-    for i in 0..<state.floors.len()
-        val floor = state.floors.at(i)
-
+    for floor in state.floors
         if floor.0 == coordinate && release_before(asked, floor.1) then return floor.1
 
     asked
@@ -475,8 +467,8 @@ end floor_of
 
 // The version selection settled on for a coordinate, where it has settled on one.
 private selected_version(state: &ResolveState, coordinate: string) -> Option[Release]
-    for i in 0..<state.selected.len()
-        if state.selected.at(i).0 == coordinate then return Some(state.selected.at(i).1)
+    for item in state.selected
+        if item.0 == coordinate then return Some(item.1)
 
     None
 end selected_version
@@ -509,9 +501,7 @@ end with_fetch
 // which is a build that works for its author and nobody else.
 private read_locals(deps: &Buf[Dependency], state: *ResolveState,
                     cache: string) -> Result[unit, string]
-    for i in 0..<deps.len()
-        val dep = deps.at(i)
-
+    for dep in deps
         if is_git_dependency(dep) then continue
 
         // The project and a source root, or two roots, naming one directory under one label is one
@@ -546,9 +536,7 @@ private already_local(state: &ResolveState, dep: &Dependency) -> bool
     val canonical = dependency_canonical(dep)
     val dir = dependency_dir(dep).unwrap_or("")
 
-    for i in 0..<state.locals.len()
-        val had = state.locals.at(i)
-
+    for had in state.locals
         if had.canonical == canonical && had.dir == dir then return true
 
     false
@@ -561,10 +549,10 @@ root_packages() -> Result[Buf[(string, Manifest)], string]
     var out: Buf[(string, Manifest)] = buf()
     val libs = lib_roots()
 
-    for i in 0..<libs.len()
-        if !is_directory(libs.at(i)) then continue
+    for item in libs
+        if !is_directory(item) then continue
 
-        out.push((libs.at(i), manifest_of_package(libs.at(i))?))
+        out.push((item, manifest_of_package(item)?))
 
     Ok(out)
 end root_packages
@@ -574,8 +562,8 @@ end root_packages
 pruned_roots(roots: Buf[(string, Manifest)], enabled: &Buf[(string, Buf[string])]) -> Buf[(string, Manifest)]
     var out: Buf[(string, Manifest)] = buf()
 
-    for i in 0..<roots.len()
-        val (dir, m) = roots.at(i)
+    for item in roots
+        val (dir, m) = item
 
         out.push((dir, pruned_manifest(m, enabled, lib_root_key(dir))))
 
@@ -590,10 +578,10 @@ wants_graph(m: &Manifest) -> bool
 
     val libs = lib_roots()
 
-    for i in 0..<libs.len()
-        if !is_directory(libs.at(i)) then continue
+    for item in libs
+        if !is_directory(item) then continue
 
-        manifest_of_package(libs.at(i)) match
+        manifest_of_package(item) match
             Ok(theirs) -> if !theirs.dependencies.is_empty() then return true
             Err(_) -> return true
 
@@ -618,8 +606,8 @@ private select_versions(state: *ResolveState, cache: string) -> Result[unit, str
         val theirs = if state.everything then read
         else pruned_manifest(read, state.enabled, canonical_prefix(coordinate))
 
-        for j in 0..<theirs.dependencies.len()
-            if !is_git_dependency(theirs.dependencies.at(j))
+        for dependencie in theirs.dependencies
+            if !is_git_dependency(dependencie)
                 return Err(s"$coordinate ${release_tag(version)} has a path dependency, which " +
                     "only means something in the project it was written in")
 
@@ -633,8 +621,7 @@ end select_versions
 private unread_pair(state: &ResolveState) -> Option[(string, Release)]
     var best: Option[(string, Release)] = None
 
-    for i in 0..<state.selected.len()
-        val entry = state.selected.at(i)
+    for entry in state.selected
         var read = false
 
         for j in 0..<state.manifests.len()
@@ -659,8 +646,7 @@ private materialize(state: &ResolveState) -> Buf[ResolvedPackage]
 
     val coordinates = sorted_labels(selected_coordinates(state))
 
-    for i in 0..<coordinates.len()
-        val name = coordinates.at(i)
+    for name in coordinates
         val version = selected_version(state, name).unwrap()
 
         for j in 0..<state.manifests.len()
@@ -672,17 +658,17 @@ private materialize(state: &ResolveState) -> Buf[ResolvedPackage]
 
     var labels: Buf[string] = buf()
 
-    for i in 0..<state.locals.len()
-        labels.push(state.locals.at(i).canonical)
+    for item in state.locals
+        labels.push(item.canonical)
 
     val ordered = sorted_labels(labels)
 
-    for i in 0..<ordered.len()
+    for item in ordered
         for j in 0..<state.locals.len()
             val had = state.locals.at(j)
 
-            if had.canonical == ordered.at(i)
-                out.push(ResolvedPackage(ordered.at(i), had.dir, had.manifest, buf(), None))
+            if had.canonical == item
+                out.push(ResolvedPackage(item, had.dir, had.manifest, buf(), None))
 
     out
 end materialize
@@ -690,8 +676,8 @@ end materialize
 private selected_coordinates(state: &ResolveState) -> Buf[string]
     var out: Buf[string] = buf()
 
-    for i in 0..<state.selected.len()
-        out.push(state.selected.at(i).0)
+    for item in state.selected
+        out.push(item.0)
 
     out
 end selected_coordinates
@@ -718,8 +704,8 @@ private table_of(owner: string, owner_root: string, deps: &Buf[Dependency],
     var table = declared_table(owner, owner_root, deps, state)?
     val indirect = inherited(deps, state)?
 
-    for i in 0..<indirect.len()
-        val dep = plain_dependency(indirect.at(i).label, indirect.at(i).origin, None)
+    for item in indirect
+        val dep = plain_dependency(item.label, item.origin, None)
         val dir = their_root(dep, state)?
         val added = bindings_of(dep, dir) match
             Err(why) -> return Err(s"$owner: $why")
@@ -730,8 +716,8 @@ private table_of(owner: string, owner_root: string, deps: &Buf[Dependency],
 
     var out: Buf[(string, string)] = buf()
 
-    for i in 0..<table.len()
-        out.push((table.at(i).written, table.at(i).canonical))
+    for item in table
+        out.push((item.written, item.canonical))
 
     Ok(out)
 end table_of
@@ -748,8 +734,7 @@ private declared_table(owner: string, owner_root: string, deps: &Buf[Dependency]
                        state: &ResolveState) -> Result[Buf[MountedName], string]
     var table: Buf[MountedName] = buf()
 
-    for i in 0..<deps.len()
-        val dep = deps.at(i)
+    for dep in deps
         val standing = stand_in_for(state, dep)
         val standing_dir = if standing.is_some() then standing.unwrap().0 else ""
 
@@ -785,9 +770,7 @@ private stand_in_bindings(dep: &Dependency, dir: string) -> Result[Buf[MountedNa
         Err(e) -> return Err(e.message)
         Ok(m) -> m
 
-    for i in 0..<modules.len()
-        val m = modules.at(i)
-
+    for m in modules
         dep.mount match
             Some(mount) -> out.push(MountedName(package_qualify(mount, m), m, owner))
             None -> out.push(MountedName(m, m, owner))
@@ -809,8 +792,8 @@ private inherited(deps: &Buf[Dependency], state: &ResolveState) -> Result[Buf[De
     var seen: Buf[string] = buf()
     var out: Buf[Dependency] = buf()
 
-    for i in 0..<deps.len()
-        queue.push(deps.at(i))
+    for item in deps
+        queue.push(item)
 
     var at: usize = 0
 
@@ -822,8 +805,8 @@ private inherited(deps: &Buf[Dependency], state: &ResolveState) -> Result[Buf[De
 
         var already = false
 
-        for i in 0..<seen.len()
-            if seen.at(i) == canonical then already = true
+        for item in seen
+            if item == canonical then already = true
 
         if already then continue
 
@@ -837,21 +820,21 @@ private inherited(deps: &Buf[Dependency], state: &ResolveState) -> Result[Buf[De
         if standing.is_some()
             val root_deps = standing.unwrap().1.dependencies
 
-            for i in 0..<root_deps.len()
-                queue.push(root_deps.at(i))
+            for root_dep in root_deps
+                queue.push(root_dep)
 
             continue
         end if
 
         val theirs = their_manifest(dep, state)?
 
-        for i in 0..<theirs.dependencies.len()
-            queue.push(theirs.dependencies.at(i))
+        for dependencie in theirs.dependencies
+            queue.push(dependencie)
 
         var declared = false
 
-        for i in 0..<deps.len()
-            if dependency_canonical(deps.at(i)) == canonical then declared = true
+        for item in deps
+            if dependency_canonical(item) == canonical then declared = true
 
         if !declared then out.push(dep)
 
@@ -881,8 +864,8 @@ private inherit(owner: string, owner_root: string, table: Buf[MountedName], bind
 
         if had.owner == mine then return Ok(table)
 
-        for j in 0..<declared.len()
-            if dependency_canonical(declared.at(j)) == had.owner then return Ok(table)
+        for item in declared
+            if dependency_canonical(item) == had.owner then return Ok(table)
 
         return Err(s"$owner: '$local' and '${had.written}' cannot both be imported — " +
             s"${same_library(had.owner, mine)}, and both arrived through something else this " +
@@ -893,8 +876,8 @@ private inherit(owner: string, owner_root: string, table: Buf[MountedName], bind
         Err(e) -> return Err(e.message)
         Ok(m) -> m
 
-    for i in 0..<ours.len()
-        if module_overlap(ours.at(i), local) then return Ok(table)
+    for our in ours
+        if module_overlap(our, local) then return Ok(table)
 
     // A source root's modules stand at the project's own level, so they are offered the name first
     // on the same terms.
@@ -929,9 +912,7 @@ private their_entry(dep: &Dependency, state: &ResolveState) -> Result[ReadPackag
                 None -> return Err(s"'$coordinate' was never selected")
                 Some(v) -> v
 
-            for i in 0..<state.manifests.len()
-                val had = state.manifests.at(i)
-
+            for had in state.manifests
                 if had.coordinate == coordinate && had.version.unwrap() == version
                     return Ok(had)
 
@@ -940,8 +921,8 @@ private their_entry(dep: &Dependency, state: &ResolveState) -> Result[ReadPackag
         _ ->
             val canonical = dependency_canonical(dep)
 
-            for i in 0..<state.locals.len()
-                if state.locals.at(i).canonical == canonical then return Ok(state.locals.at(i))
+            for item in state.locals
+                if item.canonical == canonical then return Ok(item)
 
             Err(s"'${dep.label}' was never read")
 end their_entry
@@ -979,8 +960,8 @@ bindings_of(dep: &Dependency, dir: string) -> Result[Buf[MountedName], string]
         return Err(s"'${dep.label}' has no modules — a package is a tree of directories holding " +
             "source, each of them a module, and there is nothing here to import")
 
-    for i in 0..<modules.len()
-        out.push(MountedName(modules.at(i), package_qualify(canonical, modules.at(i)), canonical))
+    for item in modules
+        out.push(MountedName(item, package_qualify(canonical, item), canonical))
 
     Ok(out)
 end bindings_of
@@ -1006,9 +987,7 @@ private no_collision(owner: string, owner_root: string, table: &Buf[MountedName]
                      dep: &Dependency, standing: string) -> Result[unit, string]
     val mine = dependency_canonical(dep)
 
-    for i in 0..<table.len()
-        val had = table.at(i)
-
+    for had in table
         if module_overlap(had.written, local) && had.owner != mine
             return Err(s"$owner: '$local' and '${had.written}' cannot both be imported — " +
                 s"${same_library(had.owner, mine)}. Give one of them a 'mount' in $ManifestName " +
@@ -1021,8 +1000,8 @@ private no_collision(owner: string, owner_root: string, table: &Buf[MountedName]
         Err(e) -> return Err(e.message)
         Ok(m) -> m
 
-    for i in 0..<ours.len()
-        if module_overlap(ours.at(i), local)
+    for our in ours
+        if module_overlap(our, local)
             return Err(s"$owner: '$local' is both a module of this project and one $mine offers — " +
                 "give the dependency a 'mount' to say what it is called here")
 
@@ -1059,13 +1038,13 @@ private root_claiming(owner: string, local: string, standing: string = "") -> Op
 
     val libs = lib_roots()
 
-    for i in 0..<libs.len()
-        if !standing.is_empty() && libs.at(i) == standing then continue
+    for item in libs
+        if !standing.is_empty() && item == standing then continue
 
-        val theirs = package_modules(libs.at(i)).unwrap_or(buf())
+        val theirs = package_modules(item).unwrap_or(buf())
 
         for j in 0..<theirs.len()
-            if module_overlap(theirs.at(j), local) then return Some(libs.at(i))
+            if module_overlap(theirs.at(j), local) then return Some(item)
 
     None
 end root_claiming
@@ -1130,8 +1109,8 @@ manifest_of_package(root: string) -> Result[Manifest, string]
         Err(why) -> return Err(s"$root: $why")
         Ok(got) -> got
 
-    for i in 0..<m.warnings.len()
-        eprints(s"$root: ${m.warnings.at(i)}\n")
+    for warning in m.warnings
+        eprints(s"$root: ${warning}\n")
 
     bind_members(resolving_local_paths(m, root), root)
 end manifest_of_package
@@ -1187,11 +1166,11 @@ with_dev_dependencies(m: &Manifest) -> Manifest
 
     var all: Buf[Dependency] = buf()
 
-    for i in 0..<m.dependencies.len()
-        all.push(m.dependencies.at(i))
+    for dependencie in m.dependencies
+        all.push(dependencie)
 
-    for i in 0..<m.dev_dependencies.len()
-        all.push(m.dev_dependencies.at(i))
+    for dev_dependency in m.dev_dependencies
+        all.push(dev_dependency)
 
     out.dependencies = all
     out
@@ -1209,9 +1188,7 @@ private dev_module_paths(m: &Manifest, graph: &Graph) -> Buf[string]
 
     var canonicals: Buf[string] = buf()
 
-    for i in 0..<graph.packages.len()
-        val p = graph.packages.at(i)
-
+    for p in graph.packages
         if !is_root_package(p) then continue
 
         for j in 0..<p.manifest.dependencies.len()
@@ -1236,8 +1213,8 @@ end dev_module_paths
 
 // The symbols one `--lib` root's files are gated by.
 lib_feature_symbols(s: &PackageSources, dir: string) -> Buf[string]
-    for i in 0..<s.lib_features.len()
-        if s.lib_features.at(i).0 == dir then return s.lib_features.at(i).1
+    for lib_feature in s.lib_features
+        if lib_feature.0 == dir then return lib_feature.1
 
     buf()
 end lib_feature_symbols
@@ -1266,8 +1243,8 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
             Err(why) -> return Err(said(Refusal(why)))
             Ok(got) -> got
 
-        for i in 0..<roots.len()
-            val (dir, theirs) = roots.at(i)
+        for item in roots
+            val (dir, theirs) = item
             var asked: Buf[string] = buf()
 
             asked.push("default")
@@ -1283,13 +1260,11 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
 
     if feature_testing() then out.dev_modules = dev_module_paths(m, graph)
 
-    for i in 0..<libs.len()
-        out.lib_features.push((libs.at(i),
-                               feature_symbols(enabled_of(graph.features, lib_root_key(libs.at(i))))))
+    for item in libs
+        out.lib_features.push((item,
+                               feature_symbols(enabled_of(graph.features, lib_root_key(item)))))
 
-    for i in 0..<graph.packages.len()
-        val p = graph.packages.at(i)
-
+    for p in graph.packages
         if is_root_package(p)
             out.root_mounts = p.imports
             out.root_features = feature_symbols(enabled_of(graph.features, ""))
@@ -1382,17 +1357,15 @@ all_feature_trees(root: string, m: &Manifest, roots: bool) -> Result[Buf[string]
             Err(why) -> return Err(Refusal(why))
             Ok(got) -> got
 
-        for i in 0..<graph.packages.len()
-            val p = graph.packages.at(i)
-
+        for p in graph.packages
             if !is_root_package(p) then out.push(p.root)
     end if
 
     if roots
         val libs = lib_roots()
 
-        for i in 0..<libs.len()
-            out.push(libs.at(i))
+        for item in libs
+            out.push(item)
     end if
 
     Ok(out)
@@ -1440,17 +1413,15 @@ handed_trees(root: string, m: &Manifest) -> Buf[Handed]
         resolved_graph(root, m) match
             Err(_) -> ()
             Ok(graph) ->
-                for i in 0..<graph.packages.len()
-                    val p = graph.packages.at(i)
-
+                for p in graph.packages
                     if !is_root_package(p)
                         out.push(Handed(p.canonical, p.root, false, p.version.is_some()))
     end if
 
     val libs = lib_roots()
 
-    for i in 0..<libs.len()
-        out.push(Handed(libs.at(i), libs.at(i), true, false))
+    for item in libs
+        out.push(Handed(item, item, true, false))
 
     out
 end handed_trees

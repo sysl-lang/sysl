@@ -187,8 +187,8 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     // `print(n)` in the branch the misplaced `is` guards is written against a name that is right
     // there, and reporting it as undefined would be a second cause for one mistake.
     IsPattern(_, patterns, _) ->
-        for i in 0..<patterns.len()
-            pattern_binds_into(patterns.at(i), &cx.refused_is)
+        for item in patterns
+            pattern_binds_into(item, &cx.refused_is)
 
         cx.err(e.span, "'is' tests a pattern in the condition of an 'if' or a 'while', and nowhere " +
                "else — its binding is live from here to the end of the condition and through the " +
@@ -563,9 +563,9 @@ private const_parameter(cx: &Analyzer, span: Span, name: string,
             Enum(d) ->
                 val n = v.to_long().unwrap_or(-1)
 
-                for i in 0..<d.variants.len()
-                    if long(d.variants.at(i).tag) == n then
-                        return named_variant_expr(cx, span, d.variants.at(i).name, Some(*ty))
+                for item in d.variants
+                    if long(item.tag) == n then
+                        return named_variant_expr(cx, span, item.name, Some(*ty))
 
                 Some(cx.err(span, s"'$name' stands for no variant of ${type_show(*ty)}"))
             Bool -> Some(TExpr(span, TBoolLit(v != from_int(0))))
@@ -594,9 +594,9 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
     // what every `c const` block in a binding is -- was an undefined name naming the module.
     val qualified = module_qualified_keys(cx, name)
 
-    for i in 0..<qualified.len()
-        if from.has(qualified.at(i)) && reachable_key(cx.an, qualified.at(i), cx.scope) then
-            return Some(qualified.at(i))
+    for item in qualified
+        if from.has(item) && reachable_key(cx.an, item, cx.scope) then
+            return Some(item)
 
     // This file's own file-private declaration of the spelling comes before the module's plain key,
     // where a sibling file took that one first.
@@ -617,8 +617,8 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
 
     var found: Option[string] = None
 
-    for i in 0..<im.wildcards.len()
-        val key = module_qualify(im.wildcards.at(i), name)
+    for item in im.wildcards
+        val key = module_qualify(item, name)
 
         if found.is_none() && from.has(key) && reachable_key(cx.an, key, cx.scope) then
             found = Some(key)
@@ -637,8 +637,8 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
     // **A path to a declaration its file made private still names it**, so the reader is told it is
     // private rather than that the module in front of the dot is undefined.
     if found.is_none()
-        for i in 0..<qualified.len()
-            if from.has(qualified.at(i)) then return Some(qualified.at(i))
+        for item in qualified
+            if from.has(item) then return Some(item)
 
     found
 end value_key_of
@@ -682,9 +682,7 @@ end const_expr
 // the loop reported when the walk that first found it was one a trial took back. Either way it
 // counts as a refusal, so the reader says nothing of its own about a value that is not constant.
 const_cycle_at(cx: &Analyzer, key: string) -> bool
-    for i in 0..<cx.an.const_cycles.len()
-        val known = cx.an.const_cycles.at(i)
-
+    for known in cx.an.const_cycles
         if known.0 == key
             tell_const_cycle(cx.an, known.1, known.2)
             return true
@@ -695,8 +693,8 @@ const_cycle_at(cx: &Analyzer, key: string) -> bool
     val round = const_loop(cx.an, key)
     val message = s"constant '${qualified_name(key)}' is defined in terms of itself: ${loop_from(round, 0)}"
 
-    for i in 0..<round.len()
-        cx.an.const_cycles.push((round.at(i), key, message))
+    for item in round
+        cx.an.const_cycles.push((item, key, message))
 
     tell_const_cycle(cx.an, key, message)
     true
@@ -716,9 +714,7 @@ private const_loop(a: &Analysis, key: string) -> Buf[string]
     var out: Buf[string] = buf()
     var seen = false
 
-    for i in 0..<a.consts_in_progress.len()
-        val at = a.consts_in_progress.at(i)
-
+    for at in a.consts_in_progress
         if at == key then seen = true
 
         if seen then out.push(at)
@@ -787,8 +783,8 @@ private const_literal(span: Span, v: Const, ty: Type) -> Option[TExpr] = v match
 
 // Whether a name that stands for module storage is one a program may write to.
 private writable_key(cx: &Analyzer, key: string) -> bool
-    for i in 0..<cx.an.tables.writable.len()
-        if cx.an.tables.writable.at(i) == key then return true
+    for item in cx.an.tables.writable
+        if item == key then return true
 
     false
 end writable_key
@@ -855,8 +851,8 @@ end variant_expr
 
 // Whether a name was bound by an `is` refused earlier in the statement being read.
 private refused_is_name(cx: &Analyzer, name: string) -> bool
-    for i in 0..<cx.refused_is.len()
-        if cx.refused_is.at(i) == name then return true
+    for refused_i in cx.refused_is
+        if refused_i == name then return true
 
     false
 end refused_is_name
@@ -892,8 +888,8 @@ private variant_in_scope(cx: &Analyzer, base: string, name: string) -> bool
     val key = module_qualify(owner, name)
     val im = answering_imports(cx.an, cx.scope, name, k -> k == key)
 
-    for i in 0..<im.wildcards.len()
-        if im.wildcards.at(i) == owner then return true
+    for item in im.wildcards
+        if item == owner then return true
 
     imported_variant_enum(cx, name) match
         Some(owner) -> owner == base
@@ -1053,8 +1049,8 @@ private own_variant_name(cx: &Analyzer, name: string) -> bool
 end own_variant_name
 
 private declares_variant(ed: EnumDecl, name: string) -> bool
-    for i in 0..<ed.variants.len()
-        if ed.variants.at(i).name == name then return true
+    for item in ed.variants
+        if item.name == name then return true
 
     false
 end declares_variant
@@ -1114,9 +1110,9 @@ private unsettled_variant(cx: &Analyzer, name: string, expected: Option[Type]) -
             EnumOf(e) ->
                 if !e.tparams.is_empty() && reachable_key(cx.an, key, cx.scope) &&
                         variant_visible_here(cx, key, name)
-                    for j in 0..<e.variants.len()
-                        if e.variants.at(j).name == name &&
-                                e.variants.at(j).fields.is_empty() then
+                    for item in e.variants
+                        if item.name == name &&
+                                item.fields.is_empty() then
                             return Some(e.tparams.at(0))
             _ -> ()
 
@@ -1129,8 +1125,8 @@ visible_here(cx: &Analyzer, key: string) -> bool
 
     if owner == cx.scope.module_name then return true
 
-    for i in 0..<cx.scope.imports.wildcards.len()
-        if cx.scope.imports.wildcards.at(i) == owner then return true
+    for item in cx.scope.imports.wildcards
+        if item == owner then return true
 
     false
 end visible_here
@@ -1534,9 +1530,7 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type]) -> 
     var own: Buf[Option[TExpr]] = buf()
     var refused_before = false
 
-    for i in 0..<operands.len()
-        val e = operands.at(i)
-
+    for e in operands
         if is_literal(e) || typed_by_position(cx, e) then own.push(None)
         else
             val t = attempt_operand(cx, e, expected)
@@ -1669,8 +1663,8 @@ private meet_views(taken: Type, read: Buf[Option[TExpr]]) -> Type
         Slice(elem, read_only) ->
             if read_only then return taken
 
-            for i in 0..<read.len()
-                read.at(i) match
+            for item in read
+                item match
                     Some(t) -> if type_eq(texpr_type(t), Slice(*elem, true)) then
                                    return Slice(*elem, true)
                     None -> ()
@@ -1723,9 +1717,9 @@ private generic_variant_in_reach(cx: &Analyzer, name: string, carrying: bool) ->
             EnumOf(d) ->
                 if !d.tparams.is_empty() && reachable_key(cx.an, key, cx.scope) &&
                         variant_visible_here(cx, key, name)
-                    for j in 0..<d.variants.len()
-                        if d.variants.at(j).name == name &&
-                           d.variants.at(j).fields.is_empty() != carrying
+                    for item in d.variants
+                        if item.name == name &&
+                           item.fields.is_empty() != carrying
                             return true
             _ -> ()
 
@@ -1765,9 +1759,7 @@ private inner_of(t: Type) -> Type = t match
 private block_as_array(cx: &Analyzer, span: Span, body: Buf[Stmt], expected: Option[Type]) -> TExpr
     var elements: Buf[Expr] = buf()
 
-    for i in 0..<body.len()
-        val s = body.at(i)
-
+    for s in body
         *s.kind match
             ExprStmt(inner) ->
                 if block_line_is_a_loop(inner)

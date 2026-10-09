@@ -83,9 +83,7 @@ private capability_of(c: CapabilityClause) -> string = c.direction match
 // **The library's own headers are read and not checked.** They were checked when the library was
 // built, so a complaint here would point at a file the program's author did not write.
 read_capabilities(a: &Analysis, units: Buf[Program])
-    for i in 0..<units.len()
-        val unit = units.at(i)
-
+    for unit in units
         if !from_library(a, scope_of_unit(a, unit))
             for j in 0..<unit.capabilities.len()
                 check_clause(a, unit, unit.capabilities.at(j))
@@ -229,9 +227,7 @@ end check_module_agreement
 private agree_within(a: &Analysis, units: Buf[Program], module_name: string, scaffolding: bool)
     var first: Option[Program] = None
 
-    for i in 0..<units.len()
-        val unit = units.at(i)
-
+    for unit in units
         if from_library(a, scope_of_unit(a, unit)) then continue
         if module_of_unit(unit) != module_name || unit.test_only != scaffolding then continue
 
@@ -273,8 +269,7 @@ end disagreement_span
 private clauses_written(u: Program) -> string
     var out: Buf[string] = buf()
 
-    for i in 0..<u.capabilities.len()
-        val c = u.capabilities.at(i)
+    for c in u.capabilities
         val d = c.direction match
             Requires -> "requires"
             Narrows -> "narrows"
@@ -284,8 +279,8 @@ private clauses_written(u: Program) -> string
     val sorted = sort_names(out)
     var joined = ""
 
-    for i in 0..<sorted.len()
-        joined = joined + sorted.at(i) + ";"
+    for item in sorted
+        joined = joined + item + ";"
 
     joined
 end clauses_written
@@ -341,25 +336,19 @@ record_capabilities(a: &Analysis, units: Buf[Program])
         if scaffolding.is_some()
             record_module_tests(a, module_name, shipped, scaffolding.unwrap())
         else
-            for j in 0..<a.tables.module_narrows.len()
-                val pair = a.tables.module_narrows.at(j)
-
+            for pair in a.tables.module_narrows
                 if pair.0 == module_name then a.tables.module_test_narrows.push(pair)
 end record_capabilities
 
 private first_file_of(units: Buf[Program], module_name: string, tests: bool) -> Option[Program]
-    for i in 0..<units.len()
-        val unit = units.at(i)
-
+    for unit in units
         if module_of_unit(unit) == module_name && unit.test_only == tests then return Some(unit)
 
     None
 end first_file_of
 
 private record_module(a: &Analysis, module_name: string, u: Program)
-    for i in 0..<u.capabilities.len()
-        val c = u.capabilities.at(i)
-
+    for c in u.capabilities
         if !enforceable(c) then continue
 
         val spread = implied_by(c)
@@ -407,9 +396,7 @@ private record_module_tests(a: &Analysis, module_name: string, shipped: Option[P
     var taken_back: Buf[string] = buf()
     var narrowed: Buf[string] = buf()
 
-    for i in 0..<u.capabilities.len()
-        val c = u.capabilities.at(i)
-
+    for c in u.capabilities
         if !enforceable(c) then continue
 
         val spread = implied_by(c)
@@ -420,16 +407,14 @@ private record_module_tests(a: &Analysis, module_name: string, shipped: Option[P
                 Narrows -> narrowed.push(spread.at(j))
 
     // What the module gave up, less what the scaffolding took back.
-    for i in 0..<a.tables.module_narrows.len()
-        val pair = a.tables.module_narrows.at(i)
-
+    for pair in a.tables.module_narrows
         if pair.0 == module_name && !holds_string(taken_back, pair.1) &&
                 !holds_string(narrowed, pair.1) then
             a.tables.module_test_narrows.push(pair)
 
-    for i in 0..<narrowed.len()
-        a.tables.module_test_narrows.push((module_name, narrowed.at(i)))
-        a.tables.module_test_own.push((module_name, narrowed.at(i)))
+    for item in narrowed
+        a.tables.module_test_narrows.push((module_name, item))
+        a.tables.module_test_own.push((module_name, item))
 end record_module_tests
 
 // A clause's capability and the ones that come with it, in whichever direction it points.
@@ -464,8 +449,8 @@ module_tests_own_narrowing(a: &Analysis, module_name: string, cap: string) -> bo
     holds_pair(a.tables.module_test_own, module_name, cap)
 
 private holds_pair(pairs: Buf[(string, string)], a: string, b: string) -> bool
-    for i in 0..<pairs.len()
-        if pairs.at(i).0 == a && pairs.at(i).1 == b then return true
+    for item in pairs
+        if item.0 == a && item.1 == b then return true
 
     false
 end holds_pair
@@ -509,8 +494,8 @@ private covered_by(written: Buf[string]) -> Buf[string]
     var needs: Buf[string] = buf()
     val core = capability_core()
 
-    for i in 0..<core.len()
-        if needs_capability(written, core.at(i)) then needs.push(core.at(i))
+    for item in core
+        if needs_capability(written, item) then needs.push(item)
 
     needs
 end covered_by
@@ -563,18 +548,18 @@ note_body_covers(a: &Analysis, name: string)
 
 // Whether the body lowered under `name` is one whose declaration covers `cap`.
 private body_covers(a: &Analysis, name: string, cap: string) -> bool
-    for i in 0..<a.tables.body_covers.len()
-        if a.tables.body_covers.at(i).0 == name && holds_string(a.tables.body_covers.at(i).1, cap) then
+    for body_cover in a.tables.body_covers
+        if body_cover.0 == name && holds_string(body_cover.1, cap) then
             return true
 
     false
 end body_covers
 
 private needs_capability(needs: Buf[string], cap: string) -> bool
-    for i in 0..<needs.len()
-        if !is_facility(needs.at(i)) then continue
+    for need in needs
+        if !is_facility(need) then continue
 
-        val spread = capability_closure(needs.at(i))
+        val spread = capability_closure(need)
 
         if holds_string(spread, cap) then return true
 
@@ -591,9 +576,7 @@ private check_needs_names(a: &Analysis)
     for i in 0..<a.tables.funcs.len()
         val f = a.tables.funcs.at(i)
 
-        for j in 0..<f.decl.needs.len()
-            val cap = f.decl.needs.at(j)
-
+        for cap in f.decl.needs
             if is_facility(cap) then continue
 
             if narrowed_by(cap).is_some() then
@@ -655,8 +638,7 @@ check_decl_capabilities(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtable
 
     // One walk per capability rather than one per declaration: what a reader has to change is the
     // reference, and a reference refused for two capabilities at once is one line with one fix.
-    for c in 0..<core.len()
-        val cap = core.at(c)
+    for cap in core
         val seeds = declared_needs(a, cap)
 
         // Almost every compilation writes no `@needs` at all, and the walk reads every body -- so
@@ -755,9 +737,7 @@ private is_environment(cap: string) -> bool = cap == CapOs || cap == CapPosix
 private environment_requirements(a: &Analysis) -> Buf[(string, string)]
     var out: Buf[(string, string)] = buf()
 
-    for i in 0..<a.tables.module_requires.len()
-        val pair = a.tables.module_requires.at(i)
-
+    for pair in a.tables.module_requires
         if is_environment(pair.1) && !holds_pair(out, pair.0, pair.1) then out.push(pair)
 
     var grew = true
@@ -765,9 +745,7 @@ private environment_requirements(a: &Analysis) -> Buf[(string, string)]
     while grew
         grew = false
 
-        for i in 0..<a.tables.capability_refs.len()
-            val r = a.tables.capability_refs.at(i)
-
+        for r in a.tables.capability_refs
             if r.scaffolding || !r.charges() then continue
 
             for k in 0..<out.len()
@@ -797,9 +775,7 @@ private effective_needs(a: &Analysis, r: CapabilityRef) -> Buf[string]
     var lifted: Option[Buf[string]] = None
     var named_only = false
 
-    for i in 0..<a.tables.capability_refs.len()
-        val u = a.tables.capability_refs.at(i)
-
+    for u in a.tables.capability_refs
         if u.from != r.from || u.to != r.to || u.imported || u.scaffolding then continue
 
         // A use that only names a type runs nothing, so it is a use that covers everything.
@@ -822,14 +798,14 @@ private effective_needs(a: &Analysis, r: CapabilityRef) -> Buf[string]
 
     var out: Buf[string] = buf()
 
-    for i in 0..<r.needs.len()
-        out.push(r.needs.at(i))
+    for need in r.needs
+        out.push(need)
 
     if lifted.is_some()
         val more = lifted.unwrap()
 
-        for i in 0..<more.len()
-            if !holds_string(out, more.at(i)) then out.push(more.at(i))
+        for item in more
+            if !holds_string(out, item) then out.push(item)
 
     out
 end effective_needs
@@ -850,9 +826,7 @@ private refused_for(a: &Analysis, e: CapabilityRef, needed: Buf[(string, string)
     val ours = !from_library(a, e.scope) && !holds_string(a.tables.supplied_modules, e.from)
     val covers = effective_needs(a, e)
 
-    for i in 0..<core.len()
-        val cap = core.at(i)
-
+    for cap in core
         if !is_environment(cap) || holds_string(covers, cap) then continue
         if !holds_pair(needed, e.to, cap) then continue
         if module_narrowed(a, e.from, cap) then return Some(cap)
@@ -871,8 +845,8 @@ end refused_for
 check_gated_modules(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
     var any = false
 
-    for i in 0..<a.tables.module_narrows.len()
-        if is_environment(a.tables.module_narrows.at(i).1) then any = true
+    for module_narrow in a.tables.module_narrows
+        if is_environment(module_narrow.1) then any = true
 
     if a.tables.target.lacks_capability(CapOs) || a.tables.target.lacks_capability(CapPosix) then
         any = true
@@ -959,8 +933,8 @@ private destructor_holders(a: &Analysis, drops: Buf[string]) -> Buf[string]
 
     if drops.is_empty() then return out
 
-    for i in 0..<drops.len()
-        out.push(drops.at(i))
+    for drop in drops
+        out.push(drop)
 
     val tables = [a.tables.struct_insts, a.tables.enum_insts]
 
@@ -1019,8 +993,8 @@ private holds_destructor(t: Type, drops: Buf[string], seen: *Buf[string]) -> boo
 
             seen.push(d.name())
 
-            for i in 0..<d.variants.len()
-                if fields_hold(d.variants.at(i).fields, drops, seen) then return true
+            for item in d.variants
+                if fields_hold(item.fields, drops, seen) then return true
 
             false
         Ref(inner, _) -> holds_destructor(*inner, drops, seen)
@@ -1029,16 +1003,16 @@ private holds_destructor(t: Type, drops: Buf[string], seen: *Buf[string]) -> boo
         Slice(elem, _) -> holds_destructor(*elem, drops, seen)
         Constrained(d) -> holds_destructor(d.base, drops, seen)
         Pack(elems) ->
-            for i in 0..<elems.len()
-                if holds_destructor(elems.at(i), drops, seen) then return true
+            for item in elems
+                if holds_destructor(item, drops, seen) then return true
 
             false
         _ -> false
 end holds_destructor
 
 private fields_hold(fields: Buf[(string, Type)], drops: Buf[string], seen: *Buf[string]) -> bool
-    for i in 0..<fields.len()
-        if holds_destructor(fields.at(i).1, drops, seen) then return true
+    for item in fields
+        if holds_destructor(item.1, drops, seen) then return true
 
     false
 end fields_hold
@@ -1053,9 +1027,7 @@ end fields_hold
 private note_call_refs(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
     var known: Set[string] = set()
 
-    for i in 0..<a.tables.capability_refs.len()
-        val r = a.tables.capability_refs.at(i)
-
+    for r in a.tables.capability_refs
         if r.charges() && !r.imported then known.add(ref_terms(r.from, r.to, r.needs, r.scaffolding))
 
     for i in 0..<funcs.len()
@@ -1089,15 +1061,15 @@ end note_call_refs
 // Records one charging reference per kind of use an edge has not yet seen, at the first call making it.
 private charge_calls(a: &Analysis, known: *Set[string], from: string, scope: Scope, needs: Buf[string],
                      scaffolding: bool, calls: Buf[(string, Span)])
-    for j in 0..<calls.len()
-        val to = home_module(a, calls.at(j).0)
+    for item in calls
+        val to = home_module(a, item.0)
 
         if to == from || to == ModuleRoot || !a.tables.has_module(to) then continue
 
         // An edge already charged on the same terms gains nothing from the call.
         if !known.add(ref_terms(from, to, needs, scaffolding)) then continue
 
-        a.tables.capability_refs.push(CapabilityRef(from, to, scope, calls.at(j).1, needs, scaffolding,
+        a.tables.capability_refs.push(CapabilityRef(from, to, scope, item.1, needs, scaffolding,
                                                     false, "", false))
 end charge_calls
 
@@ -1106,14 +1078,14 @@ end charge_calls
 private note_calls(sink: *Buf[(string, Span)], vtables: Buf[TVtable], e: TExpr)
     val refs = own_refs(e)
 
-    for i in 0..<refs.calls.len()
-        sink.push((refs.calls.at(i), e.span))
+    for item in refs.calls
+        sink.push((item, e.span))
 
-    for i in 0..<refs.erased.len()
+    for item in refs.erased
         for k in 0..<vtables.len()
             val t = vtables.at(k)
 
-            if t.name != refs.erased.at(i) then continue
+            if t.name != item then continue
 
             for m in 0..<t.slots.len()
                 sink.push((t.slots.at(m).target, e.span))
@@ -1125,8 +1097,8 @@ private ref_terms(from: string, to: string, needs: Buf[string], scaffolding: boo
     val core = capability_core()
     var out = s"$from\t$to\t" + (if scaffolding then "tests" else "ships")
 
-    for i in 0..<core.len()
-        if holds_string(needs, core.at(i)) then out = out + "\t" + core.at(i)
+    for item in core
+        if holds_string(needs, item) then out = out + "\t" + item
 
     out
 end ref_terms
@@ -1143,8 +1115,8 @@ end home_module
 
 // What the declaration a body was read under covers, which is what reaching it is charged with.
 private body_needs(a: &Analysis, name: string) -> Buf[string]
-    for i in 0..<a.tables.body_covers.len()
-        if a.tables.body_covers.at(i).0 == name then return a.tables.body_covers.at(i).1
+    for body_cover in a.tables.body_covers
+        if body_cover.0 == name then return body_cover.1
 
     buf()
 end body_needs

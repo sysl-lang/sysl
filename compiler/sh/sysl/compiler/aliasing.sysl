@@ -97,8 +97,7 @@ checked_zero(cx: &Analyzer, span: Span, ty: Type) -> TExpr
 
     var checks: Buf[TStmt] = buf()
 
-    for i in 0..<owes.len()
-        val s = owes.at(i)
+    for s in owes
         val check = TExpr(span, TStructInvCheck(TExpr(span, TZero(Struct(s))), s, inv_fn_for(cx.an, s)))
 
         checks.push(TExprStmt(check))
@@ -113,13 +112,13 @@ private zero_owes(a: &Analysis, t: Type, out: *Buf[&StructType])
             if bears_invariants(a, s.base)
                 var seen = false
 
-                for i in 0..<out.len()
-                    if out.at(i).name() == s.name() then seen = true
+                for item in out
+                    if item.name() == s.name() then seen = true
 
                 if !seen then out.push(s)
 
-            for i in 0..<s.fields.len()
-                zero_owes(a, s.fields.at(i).1, out)
+            for item in s.fields
+                zero_owes(a, item.1, out)
         Array(n, e) -> if n > 0 then zero_owes(a, *e, out)
         _ -> ()
 
@@ -153,8 +152,8 @@ private sever_walk(cx: &Analyzer, e: TExpr, below: Buf[string],
 
                         path.push(d.fields.at(usize(i)).0)
 
-                        for k in 0..<below.len()
-                            path.push(below.at(k))
+                        for item in below
+                            path.push(item)
 
                         if bears_invariants(a, d.base) then out.push((d, path))
 
@@ -192,21 +191,21 @@ private inv_reads(a: &Analysis, base: string) -> Buf[Buf[string]]
     val d = decl.unwrap()
     var fields: Buf[string] = buf()
 
-    for i in 0..<d.fields.len()
-        fields.push(d.fields.at(i).name)
+    for item in d.fields
+        fields.push(item.name)
 
     var opaque = false
 
-    for i in 0..<d.invariants.len()
-        collect_reads(d.invariants.at(i), fields, &out, &opaque)
+    for item in d.invariants
+        collect_reads(item, fields, &out, &opaque)
 
     if opaque
         var all: Buf[Buf[string]] = buf()
 
-        for i in 0..<fields.len()
+        for item in fields
             var one: Buf[string] = buf()
 
-            one.push(fields.at(i))
+            one.push(item)
             all.push(one)
 
         return all
@@ -236,8 +235,8 @@ private collect_reads(e: Expr, fields: Buf[string], out: *Buf[Buf[string]], opaq
 
         chain_indices(e, &indices)
 
-        for i in 0..<indices.len()
-            collect_reads(indices.at(i), fields, out, opaque)
+        for indice in indices
+            collect_reads(indice, fields, out, opaque)
 
         return
 
@@ -245,8 +244,8 @@ private collect_reads(e: Expr, fields: Buf[string], out: *Buf[Buf[string]], opaq
 
     clause_kids(e, &kids)
 
-    for i in 0..<kids.len()
-        collect_reads(kids.at(i), fields, out, opaque)
+    for kid in kids
+        collect_reads(kid, fields, out, opaque)
 
 // The path a clause expression names, when it is a place rooted at one of the struct's fields.
 private clause_path(fields: Buf[string], e: Expr) -> Option[Buf[string]] = *e.kind match
@@ -331,8 +330,8 @@ private clause_kids(e: Expr, out: *Buf[Expr])
         _ -> ()
 
 private push_all(xs: Buf[Expr], out: *Buf[Expr])
-    for i in 0..<xs.len()
-        out.push(xs.at(i))
+    for item in xs
+        out.push(item)
 
 private push_opt(x: Option[Expr], out: *Buf[Expr])
     if x.is_some() then out.push(x.unwrap())
@@ -361,9 +360,9 @@ private severed(cx: &Analyzer, place: TExpr) -> Option[(&StructType, Buf[string]
     val a = cx.an
     val below = severing(cx, place)
 
-    for i in 0..<below.len()
-        val s = below.at(i).0
-        val path = below.at(i).1
+    for item in below
+        val s = item.0
+        val path = item.1
         val reads = inv_reads(a, s.base)
 
         for j in 0..<reads.len()
@@ -479,9 +478,7 @@ end check_sliceable
 check_invariant_reads(a: &Analysis, scope: Scope, span: Span, d: StructDecl, fields: &StructType)
     if d.invariants.is_empty() then return
 
-    for i in 0..<fields.fields.len()
-        val f = fields.fields.at(i)
-
+    for f in fields.fields
         if volatile_in(f.1)
             a.fault(scope, span, s"'${d.name}' holds the register '${f.0}', so it carries no " +
                     "invariant — a check reads every field of the struct, so one written over the " +
@@ -492,11 +489,11 @@ check_invariant_reads(a: &Analysis, scope: Scope, span: Span, d: StructDecl, fie
 
     var names: Buf[string] = buf()
 
-    for i in 0..<d.fields.len()
-        names.push(d.fields.at(i).name)
+    for item in d.fields
+        names.push(item.name)
 
-    for i in 0..<d.invariants.len()
-        clause_walk(a, scope, d.invariants.at(i).span, d.invariants.at(i), names, fields)
+    for item in d.invariants
+        clause_walk(a, scope, item.span, item, names, fields)
 
 // A clause read step by step, refusing the step that leaves the struct's own storage.
 private clause_walk(a: &Analysis, scope: Scope, span: Span, e: Expr, names: Buf[string],
@@ -508,8 +505,8 @@ private clause_walk(a: &Analysis, scope: Scope, span: Span, e: Expr, names: Buf[
 
         chain_indices(e, &indices)
 
-        for i in 0..<indices.len()
-            clause_walk(a, scope, span, indices.at(i), names, fields)
+        for indice in indices
+            clause_walk(a, scope, span, indice, names, fields)
 
         return
 
@@ -517,8 +514,8 @@ private clause_walk(a: &Analysis, scope: Scope, span: Span, e: Expr, names: Buf[
 
     clause_kids(e, &kids)
 
-    for i in 0..<kids.len()
-        clause_walk(a, scope, span, kids.at(i), names, fields)
+    for kid in kids
+        clause_walk(a, scope, span, kid, names, fields)
 
 // The type a chain step lands on, refusing the step that reads through a hop.
 private stepped(a: &Analysis, scope: Scope, span: Span, e: Expr,

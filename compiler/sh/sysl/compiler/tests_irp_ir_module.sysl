@@ -20,8 +20,8 @@ irp_module_for(files: []const (string, string), t: Target) -> Result[IrModule, s
         Ok(root) -> std_units(root, t) match
             Err(why) -> return Err(why)
             Ok(lib) ->
-                for i in 0..<lib.len()
-                    units.push(lib.at(i))
+                for item in lib
+                    units.push(item)
 
     for i in 0..<files.len
         val parsed = parse(source_of(files[i].0, files[i].1))
@@ -66,9 +66,7 @@ end irp_find
 private irp_instrs(f: IrFunc) -> Buf[Inst]
     var out: Buf[Inst] = buf()
 
-    for i in 0..<f.blocks.len()
-        val b = f.blocks.at(i)
-
+    for b in f.blocks
         for j in 0..<b.instrs.len()
             out.push(b.instrs.at(j))
 
@@ -114,18 +112,18 @@ irp_mod_function()
     var times = false
     val all = irp_instrs(f)
 
-    for i in 0..<all.len()
-        all.at(i) match
+    for item in all
+        item match
             InBin(_, OpMul, _, _, b) -> if v_render(b) == "2" then times = true
             _ -> ()
 
     assert(times, "the multiplication by 2")
 
     // Every block ends somewhere, which is the one thing a consumer must not have to work out.
-    for i in 0..<f.blocks.len()
-        val t = f.blocks.at(i).terminator
+    for item in f.blocks
+        val t = item.terminator
 
-        assert(t.is_some() && inst_terminates(t.unwrap()), f.blocks.at(i).label)
+        assert(t.is_some() && inst_terminates(t.unwrap()), item.label)
 end irp_mod_function
 
 // The entry point is its own field rather than one of `funcs`, because a library has none.
@@ -137,8 +135,8 @@ irp_mod_call_symbol()
     val all = irp_instrs(main)
     var called = false
 
-    for i in 0..<all.len()
-        all.at(i) match
+    for item in all
+        item match
             InCall(_, _, VGlobal(n), _, _, _, _, _) -> if n == "twice" then called = true
             _ -> ()
 
@@ -146,8 +144,8 @@ irp_mod_call_symbol()
 end irp_mod_call_symbol
 
 private irp_find_struct(m: IrModule, name: string) -> Option[IrTypeDef]
-    for i in 0..<m.structs.len()
-        if m.structs.at(i).name == name then return Some(m.structs.at(i))
+    for item in m.structs
+        if item.name == name then return Some(item)
 
     None
 end irp_find_struct
@@ -173,8 +171,8 @@ irp_mod_packed()
     assert(irp_find_struct(m, "%struct.Raw").unwrap().packed, "packed")
 
 private irp_global_in(m: IrModule, section: string) -> Option[IrGlobal]
-    for i in 0..<m.globals.len()
-        if m.globals.at(i).section.unwrap_or("") == section then return Some(m.globals.at(i))
+    for item in m.globals
+        if item.section.unwrap_or("") == section then return Some(item)
 
     None
 end irp_global_in
@@ -200,8 +198,8 @@ irp_mod_placed_storage()
 
     used.value match
         Some(VArray(refs)) ->
-            for i in 0..<refs.len()
-                if v_render(refs.at(i).value) == v_render(VGlobal(g.name)) then listed = true
+            for item in refs
+                if v_render(item.value) == v_render(VGlobal(g.name)) then listed = true
         _ -> ()
 
     assert(listed, "@llvm.used names the placed global")
@@ -210,8 +208,8 @@ end irp_mod_placed_storage
 private irp_storage(ty: string, init: string, elem: LType, len: int) -> Option[Val]
     val m = irp_with_module(s"module m\n\nvar cells: [$len]$ty = $init\n", "print(m.cells[0])\n")
 
-    for i in 0..<m.globals.len()
-        if irp_lt(m.globals.at(i).ty, LArr(len, elem)) then return m.globals.at(i).value
+    for item in m.globals
+        if irp_lt(item.ty, LArr(len, elem)) then return item.value
 
     None
 end irp_storage
@@ -230,8 +228,8 @@ irp_mod_zero_fill()
         Some(VArray(elems)) ->
             assert_eq(elems.len(), 4)
 
-            for i in 0..<elems.len()
-                assert_eq(v_render(elems.at(i).value), "7")
+            for item in elems
+                assert_eq(v_render(item.value), "7")
         _ -> assert(false, "a non-zero fill collapsed")
 
 // A float is zero at bit pattern zero alone, so an array of `-0.0` is not a zero fill.
@@ -262,9 +260,7 @@ irp_mod_string_bytes()
 
     var found = false
 
-    for i in 0..<m.globals.len()
-        val g = m.globals.at(i)
-
+    for g in m.globals
         g.value match
             Some(VBytes(bs)) -> if irp_lt(g.ty, LArr(4, LInt(8))) && irp_same_bytes(bs, utf8) then found = true
             _ -> ()
@@ -294,8 +290,8 @@ irp_mod_sret()
     var noalias = false
     var sret = false
 
-    for i in 0..<out.attrs.len()
-        out.attrs.at(i) match
+    for attr in out.attrs
+        attr match
             AttrNoAlias -> noalias = true
             AttrSRet(t) -> if irp_lt(t, LNamed("%struct.Big")) then sret = true
             _ -> ()
@@ -316,8 +312,8 @@ irp_mod_runtime()
     var templates = ""
     var emitted = 0
 
-    for i in 0..<m.runtime.len()
-        m.runtime.at(i) match
+    for item in m.runtime
+        item match
             RtTemplate(n, _) ->
                 assert(n != "", "every template is named")
                 templates = templates + n + " "
@@ -334,8 +330,8 @@ irp_mod_extern()
     val m = irp_module("extern f(a: int, b: real, c: bool) -> u8\nprint(f(1, 2.0, true))\n")
     var d: Option[IrFuncSig] = None
 
-    for i in 0..<m.declares.len()
-        if m.declares.at(i).name == "f" then d = Some(m.declares.at(i))
+    for declare in m.declares
+        if declare.name == "f" then d = Some(declare)
 
     val s = d.unwrap()
 

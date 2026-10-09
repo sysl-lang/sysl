@@ -71,11 +71,11 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
     while more
         live = reached_from(p, index, roots_of(p, entries, extra))
 
-        for i in 0..<entries.len()
-            add_call(live, entries.at(i).name)
+        for entrie in entries
+            add_call(live, entrie.name)
 
-        for i in 0..<extra.len()
-            add_call(live, extra.at(i).name)
+        for item in extra
+            add_call(live, item.name)
 
         more = false
 
@@ -83,9 +83,7 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
             val x = p.externs.at(i)
 
             if live.call_set.has(x.name)
-                for j in 0..<exports.len()
-                    val f = exports.at(j)
-
+                for f in exports
                     if f.exported == Some(x.symbol) && !holds_func(extra, f.name)
                         extra.push(f)
                         more = true
@@ -94,8 +92,8 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
 end walk_program
 
 private holds_func(fs: Buf[TFunc], name: string) -> bool
-    for i in 0..<fs.len()
-        if fs.at(i).name == name then return true
+    for item in fs
+        if item.name == name then return true
 
     false
 end holds_func
@@ -115,8 +113,8 @@ private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
     for i in 0..<p.vtables.len()
         val t = p.vtables.at(i)
 
-        for j in 0..<t.slots.len()
-            add_call(out, t.slots.at(j).target)
+        for item in t.slots
+            add_call(out, item.target)
 
     p.entry match
         Some(en) ->
@@ -131,11 +129,11 @@ private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
                 None -> ()
         None -> ()
 
-    for i in 0..<entries.len()
-        add_call(out, entries.at(i).name)
+    for entrie in entries
+        add_call(out, entrie.name)
 
-    for i in 0..<extra.len()
-        add_call(out, extra.at(i).name)
+    for item in extra
+        add_call(out, item.name)
 
     out
 end roots_of
@@ -226,11 +224,11 @@ private take_all(out: &Live, from: &Live, queue: *Buf[string])
     for i in 0..<from.vals.len()
         add_val(out, from.vals.at(i))
 
-    for i in 0..<from.erased.len()
-        add_erased(out, from.erased.at(i))
+    for item in from.erased
+        add_erased(out, item)
 
-    for i in 0..<from.calls.len()
-        if add_call(out, from.calls.at(i)) then queue.push(from.calls.at(i))
+    for item in from.calls
+        if add_call(out, item) then queue.push(item)
 end take_all
 
 // Every function of a compilation that reads module storage, directly or through anything it calls.
@@ -261,8 +259,8 @@ storage_reaching(p: TProgram) -> Buf[string]
 
         if !refs.vals.is_empty() then reaches.set(i, true)
 
-        for k in 0..<refs.calls.len()
-            index.get(refs.calls.at(k)) match
+        for item in refs.calls
+            index.get(item) match
                 None -> ()
                 Some(j) -> edges.push((i, j))
 
@@ -271,9 +269,7 @@ storage_reaching(p: TProgram) -> Buf[string]
     while moved
         moved = false
 
-        for e in 0..<edges.len()
-            val edge = edges.at(e)
-
+        for edge in edges
             if reaches.at(edge.1) && !reaches.at(edge.0)
                 reaches.set(edge.0, true)
                 moved = true
@@ -315,8 +311,8 @@ gap_closure(p: TProgram, gapped: Buf[string]) -> Buf[string]
 
         val refs = body_refs(p, p.funcs.at(i))
 
-        for k in 0..<refs.calls.len()
-            index.get(refs.calls.at(k)) match
+        for item in refs.calls
+            index.get(item) match
                 None -> ()
                 Some(j) -> edges.push((i, j))
 
@@ -325,9 +321,7 @@ gap_closure(p: TProgram, gapped: Buf[string]) -> Buf[string]
     while moved
         moved = false
 
-        for e in 0..<edges.len()
-            val edge = edges.at(e)
-
+        for edge in edges
             if absent.at(edge.1) && !deferred.at(edge.0)
                 deferred.set(edge.0, true)
                 moved = true
@@ -349,14 +343,14 @@ private body_refs(p: TProgram, f: TFunc) -> &Live
     walk_block_stmts(f.body, TWalk(true, e -> take_node_of(p, out, e), w -> take_write(out, w),
                                    s -> ()))
 
-    for i in 0..<f.requires.len()
-        walk_texpr(f.requires.at(i).cond, expr_walk(true, e -> take_node_of(p, out, e)))
+    for item in f.requires
+        walk_texpr(item.cond, expr_walk(true, e -> take_node_of(p, out, e)))
 
-    for i in 0..<f.ensures.len()
-        walk_texpr(f.ensures.at(i).cond, expr_walk(true, e -> take_node_of(p, out, e)))
+    for item in f.ensures
+        walk_texpr(item.cond, expr_walk(true, e -> take_node_of(p, out, e)))
 
-    for i in 0..<f.olds.len()
-        walk_texpr(f.olds.at(i), expr_walk(true, e -> take_node_of(p, out, e)))
+    for item in f.olds
+        walk_texpr(item, expr_walk(true, e -> take_node_of(p, out, e)))
 
     out
 end body_refs
@@ -387,8 +381,8 @@ private node_names(out: &Live, e: TExpr, tables: Option[Buf[TVtable]])
             if check.is_some() then take_predicate(out, check.unwrap())
         TIncDec(_, _, _, _, check) -> if check.is_some() then take_predicate(out, check.unwrap())
         TCompare(_, cmps) ->
-            for i in 0..<cmps.len()
-                take_dispatch(out, cmps.at(i).dispatch)
+            for cmp in cmps
+                take_dispatch(out, cmp.dispatch)
         TErase(_, vtable, _) -> add_erased(out, vtable)
         TVCall(receiver, slot, _, _, _) -> take_dynamic(out, tables, texpr_type(receiver), slot)
         TRender(value, method, _, slot) ->
@@ -400,8 +394,8 @@ end node_names
 private take_write(out: &Live, w: TWrite)
     take_dispatch(out, w.dispatch)
 
-    for i in 0..<w.check.len()
-        add_call(out, w.check.at(i).inv_fn)
+    for item in w.check
+        add_call(out, item.inv_fn)
 
     if w.constraint.is_some() then take_predicate(out, w.constraint.unwrap())
 end take_write
@@ -427,9 +421,7 @@ private take_dynamic(out: &Live, tables: Option[Buf[TVtable]], recv: Type, slot:
 
     val ts = tables.unwrap()
 
-    for i in 0..<ts.len()
-        val t = ts.at(i)
-
+    for t in ts
         if t.trait_name == name.unwrap() && usize(slot) < t.slots.len()
             add_call(out, t.slots.at(usize(slot)).target)
 end take_dynamic
@@ -467,8 +459,8 @@ entry_points(p: TProgram, own: Buf[string]) -> Buf[TFunc]
 
     var destructors: Set[string] = set()
 
-    for i in 0..<p.destructors.len()
-        destructors.add(p.destructors.at(i).1)
+    for item in p.destructors
+        destructors.add(item.1)
 
     var out: Buf[TFunc] = buf()
 
@@ -515,8 +507,8 @@ private reached_modules(p: TProgram, own: Buf[string]) -> Option[Set[string]]
     var order: Buf[string] = buf()
     var reached: Set[string] = set()
 
-    for i in 0..<own.len()
-        add_module(&order, &reached, own.at(i))
+    for item in own
+        add_module(&order, &reached, item)
 
     // **A supplied file with no module header is in the root module and is therefore treated as the
     // program's own**, since the root module is the one name two trees can share -- the answer that
@@ -530,9 +522,9 @@ private reached_modules(p: TProgram, own: Buf[string]) -> Option[Set[string]]
 
         i += 1
 
-        for j in 0..<p.module_deps.len()
-            if p.module_deps.at(j).0 == from
-                val to = p.module_deps.at(j).1
+        for module_dep in p.module_deps
+            if module_dep.0 == from
+                val to = module_dep.1
 
                 for k in 0..<to.len()
                     add_module(&order, &reached, to.at(k))
@@ -585,16 +577,16 @@ tests_only(p: TProgram, own: Buf[string]) -> TProgram
     val entries = entry_points(kept, own)
     val root = roots_of(kept, entries, buf())
 
-    for i in 0..<kept.tests.len()
-        add_call(root, kept.tests.at(i).func)
+    for item in kept.tests
+        add_call(root, item.func)
 
-    for i in 0..<kept.hooks.len()
-        add_call(root, kept.hooks.at(i).func)
+    for item in kept.hooks
+        add_call(root, item.func)
 
     val live = reached_from(kept, func_index(kept), root)
 
-    for i in 0..<entries.len()
-        add_call(live, entries.at(i).name)
+    for entrie in entries
+        add_call(live, entrie.name)
 
     var externs: Buf[TExtern] = buf()
 
@@ -626,21 +618,21 @@ private without_program_entry(p: TProgram) -> TProgram =
 strip_tests(p: TProgram) -> TProgram
     var gone: Set[string] = set()
 
-    for i in 0..<p.tests.len()
-        gone.add(p.tests.at(i).func)
+    for item in p.tests
+        gone.add(item.func)
 
-    for i in 0..<p.hooks.len()
-        gone.add(p.hooks.at(i).func)
+    for item in p.hooks
+        gone.add(item.func)
 
-    for i in 0..<p.test_only.len()
-        gone.add(p.test_only.at(i))
+    for item in p.test_only
+        gone.add(item)
 
     // An `asm` block a `@tests` file wrote is scaffolding too. It names nothing, so it is told by
     // where it was written rather than by a name in `gone`.
     var kept_asm: Buf[TModuleAsm] = buf()
 
-    for i in 0..<p.module_asm.len()
-        if !p.module_asm.at(i).scaffolding then kept_asm.push(p.module_asm.at(i))
+    for item in p.module_asm
+        if !item.scaffolding then kept_asm.push(item)
 
     val program = if kept_asm.len() == p.module_asm.len() then p
     else p with { module_asm = kept_asm }
@@ -671,19 +663,17 @@ strip_handed(p: TProgram, own: Buf[string]) -> TProgram
     var gone: Set[string] = set()
     var kept: Buf[string] = buf()
 
-    for i in 0..<p.tests.len()
-        sort_by_owner(p.tests.at(i).func, own, &gone, &kept)
+    for item in p.tests
+        sort_by_owner(item.func, own, &gone, &kept)
 
-    for i in 0..<p.hooks.len()
-        sort_by_owner(p.hooks.at(i).func, own, &gone, &kept)
+    for item in p.hooks
+        sort_by_owner(item.func, own, &gone, &kept)
 
     if gone.is_empty() then return p
 
     val reached = reached_by(p, kept)
 
-    for i in 0..<p.test_only.len()
-        val name = p.test_only.at(i)
-
+    for name in p.test_only
         if !reached.call_set.has(name) && !reached.val_set.has(name) then gone.add(name)
 
     without_scaffolding(p, gone)
@@ -704,8 +694,8 @@ private reached_by(p: TProgram, entries: Buf[string]) -> &Live
     loop
         val root = no_reached()
 
-        for i in 0..<entries.len()
-            add_call(root, entries.at(i))
+        for entrie in entries
+            add_call(root, entrie)
 
         for i in 0..<p.vals.len()
             val v = p.vals.at(i)
@@ -750,18 +740,18 @@ private without_scaffolding(p: TProgram, gone: Set[string]) -> TProgram
 
     var tests: Buf[TTest] = buf()
 
-    for i in 0..<p.tests.len()
-        if !gone.has(p.tests.at(i).func) then tests.push(p.tests.at(i))
+    for item in p.tests
+        if !gone.has(item.func) then tests.push(item)
 
     var hooks: Buf[THook] = buf()
 
-    for i in 0..<p.hooks.len()
-        if !gone.has(p.hooks.at(i).func) then hooks.push(p.hooks.at(i))
+    for item in p.hooks
+        if !gone.has(item.func) then hooks.push(item)
 
     var only: Buf[string] = buf()
 
-    for i in 0..<p.test_only.len()
-        if !gone.has(p.test_only.at(i)) then only.push(p.test_only.at(i))
+    for item in p.test_only
+        if !gone.has(item) then only.push(item)
 
     TProgram(p.structs, p.enums, vtables, externs, vals, funcs, p.main, p.entry, p.precompiled,
              p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
@@ -770,8 +760,8 @@ private without_scaffolding(p: TProgram, gone: Set[string]) -> TProgram
 end without_scaffolding
 
 private fills_a_slot(gone: Set[string], t: TVtable) -> bool
-    for i in 0..<t.slots.len()
-        if gone.has(t.slots.at(i).target) then return true
+    for item in t.slots
+        if gone.has(item.target) then return true
 
     false
 end fills_a_slot

@@ -50,15 +50,15 @@ struct Promotions
     for_func(self, name: string) -> Buf[string]
         if name == "" then return self.in_main
 
-        for i in 0..<self.by_func.len()
-            if self.by_func.at(i).0 == name then return self.by_func.at(i).1
+        for item in self.by_func
+            if item.0 == name then return item.1
 
         buf()
     end for_func
 
     holds_temp(self, at: Span) -> bool
-        for i in 0..<self.temporaries.len()
-            if self.temporaries.at(i) == at then return true
+        for temporarie in self.temporaries
+            if temporarie == at then return true
 
         false
     end holds_temp
@@ -169,20 +169,20 @@ end temp_view
 private join_views(a: EView, b: EView) -> EView
     var out = no_view()
 
-    for i in 0..<a.named.len()
-        push_name(&out.named, a.named.at(i))
+    for item in a.named
+        push_name(&out.named, item)
 
-    for i in 0..<b.named.len()
-        push_name(&out.named, b.named.at(i))
+    for item in b.named
+        push_name(&out.named, item)
 
     // A temporary is one root however many times a value reaches it, exactly as a name is: the
     // fixpoint in `walk_seeded` joins a binding's view with itself every round, and a list that grew
     // there would never compare equal to the round before.
-    for i in 0..<a.temps.len()
-        if !holds_temp_span(out.temps, a.temps.at(i).0) then out.temps.push(a.temps.at(i))
+    for temp in a.temps
+        if !holds_temp_span(out.temps, temp.0) then out.temps.push(temp)
 
-    for i in 0..<b.temps.len()
-        if !holds_temp_span(out.temps, b.temps.at(i).0) then out.temps.push(b.temps.at(i))
+    for temp in b.temps
+        if !holds_temp_span(out.temps, temp.0) then out.temps.push(temp)
 
     out.anonymous = a.anonymous || b.anonymous
     out
@@ -217,8 +217,8 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
 
         if !w.promoted.is_empty() then out.by_func.push((f.name, w.promoted))
 
-        for j in 0..<w.temps.len()
-            out.temporaries.push(w.temps.at(j).0)
+        for temp in w.temps
+            out.temporaries.push(temp.0)
 
     val mw = walk_body(p, keeps, p.main, None, true)
 
@@ -227,8 +227,8 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
     report_body(a, p, entry, None, mw)
     note_promotions(&out.notes, entry, mw)
 
-    for j in 0..<mw.temps.len()
-        out.temporaries.push(mw.temps.at(j).0)
+    for temp in mw.temps
+        out.temporaries.push(temp.0)
 
     out.in_main = mw.promoted
     out
@@ -237,9 +237,7 @@ end check_escapes
 // One line per array a body moved, at the view that moved it. A temporary is not named here: what
 // the report answers is which *declaration* allocates, and a temporary has none to point at.
 private note_promotions(into: *Buf[(string, string)], home: Scope, w: EscapeWalk)
-    for i in 0..<w.sites.len()
-        val site = w.sites.at(i)
-
+    for site in w.sites
         if site.name != ""
             val at = home.src.locate(site.at.start)
             val line = s"${home.src.name}:${at.line}:${at.col + literate_shift(home.src)}: " +
@@ -316,9 +314,7 @@ private settle_summaries(p: TProgram, keeps: &KeptParams)
                 keeps.pairs.add((fi, j))
                 grew = true
 
-        for k in 0..<keeps.asked.len()
-            val callee = keeps.asked.at(k)
-
+        for callee in keeps.asked
             if edges.add((callee, fi))
                 var list = callers.get_or(callee, buf())
 
@@ -331,9 +327,7 @@ private settle_summaries(p: TProgram, keeps: &KeptParams)
         callers.get(fi) match
             None -> ()
             Some(list) ->
-                for k in 0..<list.len()
-                    val c = list.at(k)
-
+                for c in list
                     if !queued.at(c)
                         queued.set(c, true)
                         queue.push(c)
@@ -429,9 +423,9 @@ private bind_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, changed: &Coun
     // A multi-assignment's arms are stores, and one landing in a plain local binds that local to
     // what it was given for the same reason a single one does.
     TMultiAssign(writes) ->
-        for i in 0..<writes.len()
-            *writes.at(i).place.kind match
-                TLoad(name, _) -> bind_view(p, keeps, w, changed, name, writes.at(i).value)
+        for write in writes
+            *write.place.kind match
+                TLoad(name, _) -> bind_view(p, keeps, w, changed, name, write.value)
                 _ -> ()
     _ -> ()
 
@@ -448,8 +442,8 @@ private bind_view(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, changed: &Cou
 end bind_view
 
 private confined_of(w: &EscapeWalk, name: string) -> EView
-    for i in 0..<w.confined.len()
-        if w.confined.at(i).0 == name then return w.confined.at(i).1
+    for item in w.confined
+        if item.0 == name then return item.1
 
     no_view()
 end confined_of
@@ -489,14 +483,14 @@ private check_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, s: TStmt) = s
     // Each arm is a store, so each is walked as one: a view that lands anywhere but a plain local of
     // this body has left it, exactly as it would after a single `=`.
     TMultiAssign(writes) ->
-        for i in 0..<writes.len()
-            escaping(p, keeps, w, writes.at(i).value)
+        for write in writes
+            escaping(p, keeps, w, write.value)
 
-            *writes.at(i).place.kind match
-                TLoad(_, _) -> escaping(p, keeps, w, writes.at(i).place)
+            *write.place.kind match
+                TLoad(_, _) -> escaping(p, keeps, w, write.place)
                 _ ->
-                    if views(p, keeps, w, writes.at(i).value).non_empty()
-                        gets_out(p, keeps, w, writes.at(i).value,
+                    if views(p, keeps, w, write.value).non_empty()
+                        gets_out(p, keeps, w, write.value,
                                  "is stored somewhere the frame does not own")
 
     // A `break value` carries the value out of the loop; walk it for the escape sites it may
@@ -564,9 +558,9 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
     // program compiled it -- so the worst is assumed of every argument, exactly as this analysis
     // assumes it of an `extern`.
     TCallPtr(_, args, _, _) ->
-        for i in 0..<args.len()
-            if views(p, keeps, w, args.at(i)).non_empty()
-                gets_out(p, keeps, w, args.at(i),
+        for arg in args
+            if views(p, keeps, w, arg).non_empty()
+                gets_out(p, keeps, w, arg,
                          "is passed through a function pointer, which may hold on to it")
     _ -> ()
 
@@ -585,9 +579,7 @@ private view_anchor(at: TExpr) -> Span = *at.kind match
 private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how: string)
     val v = views(p, keeps, w, at)
 
-    for i in 0..<v.named.len()
-        val name = v.named.at(i)
-
+    for name in v.named
         if !holds_string(w.promoted, name)
             w.sites.push(EscapeSite(name, "", view_anchor(at), how))
             w.promoted.push(name)
@@ -595,9 +587,7 @@ private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how
     // A temporary is promoted like a named array and is reported like one under `no alloc`, since
     // what it costs there is the same allocation. It has no name a reader wrote, so it is named for
     // what it is.
-    for i in 0..<v.temps.len()
-        val t = v.temps.at(i)
-
+    for t in v.temps
         if !holds_temp_span(w.temps, t.0)
             w.sites.push(EscapeSite("", t.1, t.0, how))
             w.temps.push(t)
@@ -616,15 +606,15 @@ private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how
 end gets_out
 
 private holds_temp_span(temps: Buf[(Span, string)], at: Span) -> bool
-    for i in 0..<temps.len()
-        if temps.at(i).0 == at then return true
+    for temp in temps
+        if temp.0 == at then return true
 
     false
 end holds_temp_span
 
 private holds_index(xs: Buf[usize], i: usize) -> bool
-    for k in 0..<xs.len()
-        if xs.at(k) == i then return true
+    for item in xs
+        if item == i then return true
 
     false
 end holds_index
@@ -650,15 +640,15 @@ carries_view(t: Type) -> bool = t match
     _ -> false
 
 private fields_carry_view(fields: Buf[(string, Type)]) -> bool
-    for i in 0..<fields.len()
-        if carries_view(fields.at(i).1) then return true
+    for item in fields
+        if carries_view(item.1) then return true
 
     false
 end fields_carry_view
 
 private variants_carry_view(vs: Buf[EnumVariant]) -> bool
-    for i in 0..<vs.len()
-        if fields_carry_view(vs.at(i).fields) then return true
+    for item in vs
+        if fields_carry_view(item.fields) then return true
 
     false
 end variants_carry_view
@@ -731,8 +721,8 @@ private views_value(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -
     TMatch(_, arms, _) ->
         var out = no_view()
 
-        for i in 0..<arms.len()
-            out = join_views(out, block_value_view(p, keeps, w, arms.at(i).body))
+        for item in arms
+            out = join_views(out, block_value_view(p, keeps, w, item.body))
 
         out
 
@@ -751,8 +741,8 @@ private views_value(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -
 private any_view(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, xs: Buf[TExpr]) -> EView
     var out = no_view()
 
-    for i in 0..<xs.len()
-        out = join_views(out, views(p, keeps, w, xs.at(i)))
+    for item in xs
+        out = join_views(out, views(p, keeps, w, item))
 
     out
 end any_view
@@ -795,8 +785,8 @@ private array_root(w: &EscapeWalk, base: TExpr) -> EView = *base.kind match
     _ -> unnamed_view()
 
 private ref_place(w: &EscapeWalk, name: string) -> Option[TExpr]
-    for i in 0..<w.ref_of.len()
-        if w.ref_of.at(i).0 == name then return Some(w.ref_of.at(i).1)
+    for item in w.ref_of
+        if item.0 == name then return Some(item.1)
 
     None
 end ref_place
@@ -953,8 +943,7 @@ private refuse_no_alloc(a: &Analysis, p: TProgram, scope: Scope, who: Option[str
         refuse_aligned(a, scope, w)
         return
 
-    for i in 0..<w.sites.len()
-        val site = w.sites.at(i)
+    for site in w.sites
         val subject = if site.name == "" then site.what else s"'${site.name}'"
 
         a.fault(scope, site.at,
@@ -977,9 +966,7 @@ end refuse_no_alloc
 private refuse_aligned(a: &Analysis, scope: Scope, w: EscapeWalk)
     if w.aligned.is_empty() then return
 
-    for i in 0..<w.sites.len()
-        val site = w.sites.at(i)
-
+    for site in w.sites
         if site.name == "" then continue
 
         val asked = alignment_asked(w.aligned, site.name)
@@ -995,18 +982,18 @@ private refuse_aligned(a: &Analysis, scope: Scope, w: EscapeWalk)
 end refuse_aligned
 
 private alignment_asked(asked: Buf[(string, usize)], name: string) -> Option[usize]
-    for i in 0..<asked.len()
-        if asked.at(i).0 == name then return Some(asked.at(i).1)
+    for item in asked
+        if item.0 == name then return Some(item.1)
 
     None
 end alignment_asked
 
 private is_test_func(p: TProgram, name: string) -> bool
-    for i in 0..<p.tests.len()
-        if p.tests.at(i).func == name then return true
+    for item in p.tests
+        if item.func == name then return true
 
-    for i in 0..<p.hooks.len()
-        if p.hooks.at(i).func == name then return true
+    for hook in p.hooks
+        if hook.func == name then return true
 
     false
 end is_test_func
@@ -1024,9 +1011,7 @@ private refuse_borrowed(a: &Analysis, p: TProgram, keeps: &KeptParams)
     for i in 0..<p.vtables.len()
         val vt = p.vtables.at(i)
 
-        for j in 0..<vt.slots.len()
-            val slot = vt.slots.at(j)
-
+        for slot in vt.slots
             for k in 0..<slot.borrows.len()
                 val at = slot.borrows.at(k).0
                 val pname = slot.borrows.at(k).1
@@ -1080,8 +1065,8 @@ private borrows_of(p: TProgram, ty: Type, slot: int) -> Buf[usize]
 
         val s = vt.slots.at(usize(slot))
 
-        for k in 0..<s.borrows.len()
-            if s.borrows.at(k).0 > 0 then out.push(s.borrows.at(k).0 - 1)
+        for item in s.borrows
+            if item.0 > 0 then out.push(item.0 - 1)
 
         return out
 

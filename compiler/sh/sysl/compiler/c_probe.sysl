@@ -57,8 +57,8 @@ end CGlobal
 
 // Whether any file of this compilation asks a question of the C compiler.
 c_probe_wanted(units: Buf[Program]) -> bool
-    for i in 0..<units.len()
-        val body = units.at(i).body
+    for item in units
+        val body = item.body
 
         for j in 0..<body.len()
             *body.at(j).kind match
@@ -76,9 +76,7 @@ c_probe_lower(a: &Analysis, units: Buf[Program], t: Target) -> Buf[Program]
 
     var out: Buf[Program] = buf()
 
-    for i in 0..<units.len()
-        val unit = units.at(i)
-
+    for unit in units
         // **A probe is a C compilation, so a file carrying one asks for headers.** A file that also
         // declares `@requires(posix)` has said which machines it is for, and a freestanding target
         // is not one of them -- there is no `<regex.h>` for a bare Cortex-M and no reason there
@@ -99,9 +97,7 @@ end c_probe_lower
 private unmeasurable(unit: Program, t: Target) -> bool
     val machine = inherent_capabilities(t)
 
-    for i in 0..<unit.capabilities.len()
-        val c = unit.capabilities.at(i)
-
+    for c in unit.capabilities
         c.direction match
             Requires ->
                 val needed = capability_closure(c.name)
@@ -119,8 +115,8 @@ private lower_unit(a: &Analysis, unit: Program, t: Target) -> Program
     var consts: Buf[CConstDecl] = buf()
     var types: Buf[CTypeDecl] = buf()
 
-    for i in 0..<unit.body.len()
-        *unit.body.at(i).kind match
+    for item in unit.body
+        *item.kind match
             CConstBlock(cs) ->
                 for j in 0..<cs.len()
                     consts.push(cs.at(j))
@@ -161,9 +157,7 @@ private lower_unit(a: &Analysis, unit: Program, t: Target) -> Program
     var next_const: usize = 0
     var next_type: usize = 0
 
-    for i in 0..<unit.body.len()
-        val s = unit.body.at(i)
-
+    for s in unit.body
         *s.kind match
             CConstBlock(cs) ->
                 for j in 0..<cs.len()
@@ -219,8 +213,8 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     // measured, and an enum's width is what half of these blocks are asking about.
     val machine = machine_flags(t)
 
-    for i in 0..<machine.len()
-        args.push(machine.at(i))
+    for item in machine
+        args.push(item)
 
     if t.short_enums then args.push("-fshort-enums")
 
@@ -240,16 +234,16 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     // on this machine could have found it: `pkg-config` speaks for the host.
     val given = supplied_cflags()
 
-    for i in 0..<given.len()
-        args.push(given.at(i))
+    for item in given
+        args.push(item)
 
     // **And a binding whose header is the installed library's needs to be told where that is.**
     // `uv.h` is not beside `libuv.sysl`; it is wherever this machine put libuv, which is the one
     // thing the package's `pkg_config` block was written to find out.
     val probed = probe_cflags_for(unit.src.name)
 
-    for i in 0..<probed.len()
-        args.push(probed.at(i))
+    for item in probed
+        args.push(item)
 
     args.push("-o")
     args.push("-")
@@ -293,9 +287,9 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
 
     var char_signed = false
 
-    for i in 0..<globals.len()
-        if globals.at(i).index == 0 && globals.at(i).ty == "char-signed"
-            char_signed = decimal_of(globals.at(i).operand) != 0
+    for item in globals
+        if item.index == 0 && item.ty == "char-signed"
+            char_signed = decimal_of(item.operand) != 0
 
     Some((values, measured, char_signed))
 end measure
@@ -321,8 +315,8 @@ private probe_cflags_for(file: string) -> Buf[string]
         Some(root) -> manifest_at(root) match
             Err(_) -> return out
             Ok(m) ->
-                for i in 0..<m.pkg_config.len()
-                    pkg_config_query(m.pkg_config.at(i).0) match
+                for item in m.pkg_config
+                    pkg_config_query(item.0) match
                         Err(_) -> ()
                         Ok(answer) ->
                             for j in 0..<answer.cflags.len()
@@ -340,11 +334,11 @@ private probe_cflags_for(file: string) -> Buf[string]
                 // header. Two files there with different macros give their union.
                 val dir = parent_of(file).unwrap_or("")
 
-                for i in 0..<m.defines.len()
-                    val declared = join_path(root, m.defines.at(i).0)
+                for define in m.defines
+                    val declared = join_path(root, define.0)
 
                     if parent_of(declared).unwrap_or("") == dir
-                        val macros = m.defines.at(i).1
+                        val macros = define.1
 
                         for j in 0..<macros.len()
                             var seen = false
@@ -442,8 +436,8 @@ private probe_text(unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
                    types: Buf[CTypeDecl]) -> string
     var out = str_builder()
 
-    for i in 0..<unit.includes.len()
-        out.push(s"#include ${quoted_header(unit.includes.at(i).header)}\n")
+    for item in unit.includes
+        out.push(s"#include ${quoted_header(item.header)}\n")
 
     for i in 0..<consts.len()
         val carrier = plan.at(i) match
@@ -496,8 +490,8 @@ private read_globals(ir: string) -> Buf[CGlobal]
     var out: Buf[CGlobal] = buf()
     val lines = lines_of(ir)
 
-    for i in 0..<lines.len()
-        val words = probe_words(lines.at(i))
+    for item in lines
+        val words = probe_words(item)
 
         if words.len() < 5 then continue
         if !words.at(0).starts_with("@") then continue
@@ -548,9 +542,7 @@ end numbered
 private marked(globals: Buf[CGlobal], marker: string, index: usize) -> Option[CGlobal]
     val want = if marker == KindMarker then "kind-" else if marker == SizeMarker then "size-" else ""
 
-    for i in 0..<globals.len()
-        val g = globals.at(i)
-
+    for g in globals
         if g.index == index && g.ty.starts_with(want) && g.ty != "char-signed"
             if want != "" || (g.ty == "i64" || g.ty == "double") then return Some(g)
 
@@ -639,8 +631,8 @@ private declared_type(a: &Analysis, unit: Program, c: CConstDecl,
 
         var base: Option[TypeRef] = None
 
-        for i in 0..<unit.body.len()
-            *unit.body.at(i).kind match
+        for item in unit.body
+            *item.kind match
                 TypeDecl(d) -> if base.is_none() && d.name == name then base = Some(d.base)
                 _ -> ()
 
