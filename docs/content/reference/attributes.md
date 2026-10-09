@@ -89,8 +89,8 @@ print(c.send(&n))
 7
 ```
 
-Beside them a member takes the four about the function it lowers to — `@noinline`, `@inline`, `@cold`
-and `@no_alloc`. Everything else is refused, and the line is what the annotation is **about** rather
+Beside them a member takes the six about the function it lowers to — `@noinline`, `@inline`, `@cold`,
+`@no_alloc`, `@no_block` and `@blocks`. Everything else is refused, and the line is what the annotation is **about** rather
 than where it is written. "A function" in the list above means a *free* function: what `sysl test` calls, what
 recurses, what a symbol names, how a type is laid out — none of which a member supplies.
 
@@ -1282,6 +1282,160 @@ print(f())
 
 ```error
 Above a function or a method, '@no_alloc' holds that one definition instead, and this declares neither
+```
+
+## `@no_block` and `@blocks` — a path that must never wait
+
+An interrupt handler may take a completion and wake a thread, and must never sleep: sleeping there
+switches away from an exception frame with the interrupt still unacknowledged. A real-time audio
+callback is held to the same rule by a deadline rather than by a machine. **`@no_block` is that
+promise, and `@blocks` marks what breaks it.** Above a function or a method, `@no_block` says the
+definition never waits; in a file's header it says it of every body in the module. Either way it is
+checked as `@no_alloc` is, **through every call the body makes**: a call that reaches a declaration
+marked `@blocks` is refused at the smallest piece of the body that still arrives there.
+
+```sysl
+struct WaitQueue
+    n: int
+
+    @blocks
+    sleep(*self) = self.n += 1
+
+read_sector(q: *WaitQueue) -> int
+    q.sleep()
+    1
+
+@no_block
+on_irq(q: *WaitQueue) -> int = read_sector(q) + 1
+
+var q = WaitQueue(0)
+print(on_irq(&q))
+```
+
+```error
+this reaches 'read_sector', which blocks through 'WaitQueue.sleep', and 'on_irq' declared '@no_block'
+```
+
+The refusal names the call the reader wrote and, after `through`, the declaration it arrives at —
+the line to change is the first, and the reason is the second. A body that keeps the promise compiles,
+and a sibling beside it may wait as much as it likes:
+
+```sysl
+struct WaitQueue
+    n: int
+
+    @blocks
+    sleep(*self) = self.n += 1
+
+@no_block
+take(n: int) -> int = n + 1
+
+drain(q: *WaitQueue) -> int
+    q.sleep()
+    q.n
+
+var q = WaitQueue(0)
+print(take(1), drain(&q))
+```
+
+```output
+2 1
+```
+
+**Whether something waits is declared, not inferred.** A C function's waiting is invisible to the
+compiler, and a sysl loop that spins until another thread moves cannot be told from a search, so
+`@blocks` is written where the waiting is: above a function, a method, or an `extern` whose C call
+waits.
+
+```sysl
+@blocks
+extern "usleep" c_usleep(us: u32) -> int
+
+@no_block
+nap() -> int = c_usleep(10)
+
+print(nap())
+```
+
+```error
+this reaches 'c_usleep', which blocks, and 'nap' declared '@no_block'
+```
+
+**The standard library marks its own waiting operations**: `sysl.posix.time`'s `sleep` and
+`nanosleep`, `Mutex.lock`, `Thread.join`, `Channel.send` and `Channel.receive`, a `Socket`'s
+`connect`, `accept`, `send`, `send_all` and `recv`, `Child.wait`, and the hooks a blocking read or
+write of a descriptor or a file goes through — so a promised body reaches none of them, however many
+calls away. A generic is named as it was declared, since the type argument says nothing about
+whether it waits:
+
+```sysl
+import sysl.posix.threads.Mutex
+
+f() -> int = 1
+
+@no_block
+guarded(m: *Mutex[int]) -> int = *m.lock()
+
+print(f())
+```
+
+```error
+this reaches 'sysl.posix.threads.Mutex.lock', which blocks, and 'guarded' declared '@no_block'
+```
+
+A call through a trait object reaches the implementation the body erased into it, as for `@no_alloc`.
+`try_lock`, `try_send` and `try_receive` never wait and are not marked. A spin lock is not marked
+either: it waits only as long as another core holds it, which is what an interrupt handler's own locks
+are made of.
+
+**The rules for where it stands are `@no_alloc`'s.** Directly under the header the word is the
+module's clause, and a function there answers to it; a method may promise it; a function declared
+inside another may not, being a closure. `@blocks` takes no arguments and marks a function, a method
+or an `extern` function and nothing else — an `extern` variable is read rather than called:
+
+```sysl
+f() -> int = 1
+
+@blocks
+struct P
+    x: int
+
+print(f())
+```
+
+```error
+'@blocks' says a call may wait, so it marks a function, a method or an 'extern' — and this declares none of them
+```
+
+The two above one definition contradict each other:
+
+```sysl
+f() -> int = 1
+
+@blocks
+@no_block
+g() -> int = 2
+
+print(g())
+```
+
+```error
+'@blocks' says this definition may wait and '@no_block' that it never does
+```
+
+**Waiting is conduct, not a facility.** No machine takes it away, so `@no_block` has no
+`requires` beside it the way `@no_alloc` has `requires heap`, and `@requires(block)` and
+`@needs(block)` are refused:
+
+```sysl
+@needs(block)
+f() -> int = 1
+
+print(f())
+```
+
+```error
+'block' is what a module does, not something a machine has, and no machine takes it away
 ```
 
 ## `@tailrec` — an assertion that the frame is reused

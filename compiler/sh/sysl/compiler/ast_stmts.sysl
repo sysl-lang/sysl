@@ -220,12 +220,16 @@ end RecvMode
 // carry the promise to where the whole-program check reads it. It holds the word after `no_`
 // (`"alloc"`), one entry per capability the definition gives up, and is not one of the optimizer's
 // three either.
+//
+// `blocks` is `@blocks`, the other side of `@no_block`: this definition may wait -- sleep, take a
+// lock, read a device -- so every promise not to block is refused a way here (`no_block.sysl`).
 struct FuncMarks
     noinline: bool
     cold: bool
     inline: bool
     async_at: Option[Span]
     forgoes: Buf[string]
+    blocks: bool
 
     // Whether any of the three was written.
     any(self) -> bool = self.noinline || self.cold || self.inline
@@ -242,7 +246,7 @@ struct FuncMarks
 end FuncMarks
 
 // A definition nothing was said about.
-no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf())
+no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false)
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -388,6 +392,8 @@ enum Attr
     ThreadLocal
     // `@no_alloc` above a function or a method: the capability it gives up, as the word after `no_`.
     Forgoes(cap: string)
+    // `@blocks` above a function, a method or an `extern`: reaching it may wait.
+    Blocks
 end Attr
 
 // The word an attribute is written as, which is what a complaint about it names.
@@ -411,6 +417,7 @@ attr_word(a: Attr) -> string = a match
     Cold -> "cold"
     ThreadLocal -> "thread_local"
     Forgoes(cap) -> s"no_$cap"
+    Blocks -> "blocks"
 
 // A foreign function's declaration.
 struct ExternDecl
@@ -421,6 +428,8 @@ struct ExternDecl
     link: Option[string]
     vis: Visibility
     needs: Buf[string]
+    // `@blocks` above it: the C function may wait, so a promise not to block may not reach it.
+    blocks: bool
 end ExternDecl
 
 // A struct declaration: its fields, the methods written under it, and what the attributes said.

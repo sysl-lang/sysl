@@ -1,0 +1,272 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@no_block` and `@blocks` (`reference/attributes.md § @no_block`): a promise never to wait, on a
+// module, a function or a method, checked through every call the body makes against the
+// declarations marked as waiting -- a function, a method, an `extern`, and the library's own waiting
+// operations.
+//
+// **In the header the word is the module's**, so a fixture holding a function-level promise puts a
+// declaration above it, as `tests_fna_fn_no_alloc.sysl`'s do.
+
+private var nbk_library_checked: bool = false
+private var nbk_library_there: bool = false
+
+private nbk_ready() -> bool
+    if !nbk_library_checked
+        nbk_library_checked = true
+        nbk_library_there = std_root().is_ok()
+
+    if !nbk_library_there
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end nbk_ready
+
+private nbk_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+private nbk_check(said: string, part: string) = assert(nbk_says(said, part), said)
+
+// A project: `thing/a.sysl` holding the text given, under `module thing`, and a main calling into it.
+private nbk_write(thing: string, main: string) -> string
+    val root = make_temp_dir("sysl-no-block").unwrap()
+
+    make_dir_all(s"$root/thing").unwrap()
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/thing/a.sysl", s"module thing\n\n$thing").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    root
+end nbk_write
+
+// Everything the project has to say for itself, the lowering included.
+private nbk_err(thing: string, main: string) -> string
+    val root = nbk_write(thing, main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end nbk_err
+
+// What the project prints, or what the build had to say about it.
+private nbk_ran(thing: string, main: string) -> string
+    val root = nbk_write(thing, main)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end nbk_ran
+
+private nbk_tail() -> string = "a function that may not block may only call what never does"
+
+// A wait queue whose `sleep` is marked as waiting, and a driver read that waits on it: keel's
+// interrupt path, reduced.
+private const nbk_queue: string =
+    "struct WaitQueue\n    n: int\n\n    @blocks\n    sleep(*self) = self.n += 1\n\n" +
+    "read_sector(q: *WaitQueue) -> int\n    q.sleep()\n    1\n\n"
+
+@test("a '@no_block' function reaching a '@blocks' method through a callee is refused, naming both")
+nbk_through_a_callee()
+    if !nbk_ready() then return
+
+    val said = nbk_err(nbk_queue + "@no_block\non_irq(q: *WaitQueue) -> int = read_sector(q) + 1\n",
+                       "var q = thing.WaitQueue(0)\nprint(thing.on_irq(&q))\n")
+
+    nbk_check(said, "this reaches 'thing.read_sector', which blocks through 'thing.WaitQueue.sleep', " +
+                    "and 'thing.on_irq' declared '@no_block' — " + nbk_tail())
+    nbk_check(said, "thing/a.sysl:14:")
+
+@test("a call straight to a '@blocks' declaration names it alone")
+nbk_a_direct_call()
+    if !nbk_ready() then return
+
+    val said = nbk_err(nbk_queue + "@no_block\non_irq(q: *WaitQueue)\n    q.sleep()\n",
+                       "var q = thing.WaitQueue(0)\nthing.on_irq(&q)\n")
+
+    nbk_check(said, "this reaches 'thing.WaitQueue.sleep', which blocks, and 'thing.on_irq' declared " +
+                    "'@no_block' — " + nbk_tail())
+
+@test("'@blocks' on an 'extern' marks a C call that waits")
+nbk_an_extern()
+    if !nbk_ready() then return
+
+    val said = nbk_err("@blocks\nextern \"usleep\" c_usleep(us: u32) -> int\n\n" +
+                       "@no_block\nnap() -> int = c_usleep(1)\n",
+                       "print(thing.nap())\n")
+
+    nbk_check(said, "this reaches 'thing.c_usleep', which blocks, and 'thing.nap' declared " +
+                    "'@no_block' — " + nbk_tail())
+
+@test("the library's sleep is marked, so a '@no_block' function may not reach it")
+nbk_the_library_sleep()
+    if !nbk_ready() then return
+
+    val said = nbk_err("import sysl.posix.time.nanosleep\n\n" +
+                       "@no_block\nnap() -> long = nanosleep(1)\n",
+                       "print(thing.nap())\n")
+
+    nbk_check(said, "this reaches 'sysl.posix.time.nanosleep', which blocks, and 'thing.nap' declared " +
+                    "'@no_block' — " + nbk_tail())
+
+@test("the library's mutex lock is marked, and a generic is named as it was declared")
+nbk_the_library_lock()
+    if !nbk_ready() then return
+
+    val said = nbk_err("import sysl.posix.threads.Mutex\n\n" +
+                       "@no_block\nguarded(m: *Mutex[int]) -> int = *m.lock()\n",
+                       "print(1)\n")
+
+    nbk_check(said, "this reaches 'sysl.posix.threads.Mutex.lock', which blocks, and 'thing.guarded' " +
+                    "declared '@no_block'")
+
+@test("a blocking read through the library's reader reaches its marked hook")
+nbk_the_library_read()
+    if !nbk_ready() then return
+
+    val said = nbk_err("import sysl.io.{stdin, Reader}\n\n" +
+                       "@no_block\nfirst() -> usize\n    var b: [4]u8 = [0; 4]\n" +
+                       "    var r = stdin()\n    r.read(b[..]).len\n",
+                       "print(thing.first())\n")
+
+    nbk_check(said, "which blocks")
+    nbk_check(said, "'thing.first' declared '@no_block'")
+
+@test("a promise that is kept compiles and runs, and a sibling may block")
+nbk_a_kept_promise()
+    if !nbk_ready() then return
+
+    assert_eq(nbk_ran(nbk_queue + "@no_block\nadd(n: int) -> int = n + 1\n\n" +
+                      "sibling(q: *WaitQueue) -> int = read_sector(q) + 1\n",
+                      "var q = thing.WaitQueue(0)\nprint(thing.add(1), thing.sibling(&q), q.n)\n"),
+              "2 2 1\n")
+
+@test("a method may promise it, and is held to it")
+nbk_a_method()
+    if !nbk_ready() then return
+
+    val said = nbk_err(nbk_queue + "struct Driver\n    q: WaitQueue\n\n    @no_block\n" +
+                       "    poll(*self) -> int = read_sector(&self.q)\n",
+                       "var d = thing.Driver(thing.WaitQueue(0))\nprint(d.poll())\n")
+
+    nbk_check(said, "'thing.Driver.poll' declared '@no_block' — " + nbk_tail())
+
+@test("in the header it is the module's clause, and holds every body in the module")
+nbk_the_module_clause()
+    if !nbk_ready() then return
+
+    val said = nbk_err("@no_block\n\n" + nbk_queue + "on_irq(q: *WaitQueue) -> int = read_sector(q)\n",
+                       "var q = thing.WaitQueue(0)\nprint(thing.on_irq(&q))\n")
+
+    nbk_check(said, "this reaches 'thing.WaitQueue.sleep', which blocks, and this module declared " +
+                    "'@no_block' — a module that may not block may only call what never does")
+    nbk_check(said, "this reaches 'thing.read_sector', which blocks through 'thing.WaitQueue.sleep', " +
+                    "and this module declared '@no_block'")
+
+@test("a call through a trait object reaches the implementation it was erased from")
+nbk_through_a_trait_object()
+    if !nbk_ready() then return
+
+    val said = nbk_err("trait Waits\n    wait(*self)\n\nstruct Q\n    n: int\n\nimpl Waits for Q\n" +
+                       "    @blocks\n    wait(*self) = self.n += 1\n\n" +
+                       "@no_block\nrun(q: *Q)\n    val w: *Waits = q\n    w.wait()\n",
+                       "var q = thing.Q(0)\nthing.run(&q)\n")
+
+    nbk_check(said, "which blocks")
+    nbk_check(said, "'thing.run' declared '@no_block'")
+
+@test("'@blocks' beside '@no_block' on one definition is refused")
+nbk_both_on_one()
+    if !nbk_ready() then return
+
+    val said = nbk_err("f() -> int = 1\n\n@blocks\n@no_block\ng() -> int = 2\n", "print(thing.g())\n")
+
+    nbk_check(said, "'@blocks' says this definition may wait and '@no_block' that it never does")
+
+@test("'@blocks' above a struct is refused, naming what it marks")
+nbk_blocks_above_a_struct()
+    if !nbk_ready() then return
+
+    val said = nbk_err("f() -> int = 1\n\n@blocks\nstruct P\n    x: int\n", "print(1)\n")
+
+    nbk_check(said, "'@blocks' says a call may wait, so it marks a function, a method or an 'extern' — " +
+                    "and this declares none of them")
+
+@test("'@blocks' above a field is refused, a field never being called")
+nbk_blocks_above_a_field()
+    if !nbk_ready() then return
+
+    val said = nbk_err("struct P\n    @blocks\n    x: int\n", "print(1)\n")
+
+    nbk_check(said, "'@blocks' says a call may wait, so it stands above a method or an associated " +
+                    "function — a field and a variant are never called")
+
+@test("'@blocks' above an 'extern' variable is refused")
+nbk_blocks_above_an_extern_variable()
+    if !nbk_ready() then return
+
+    val said = nbk_err("@blocks\nextern errno: int\n", "print(1)\n")
+
+    nbk_check(said, "an 'extern' variable is read rather than called, and reading one waits for nothing")
+
+@test("'@blocks' takes no arguments")
+nbk_blocks_takes_no_arguments()
+    if !nbk_ready() then return
+
+    val said = nbk_err("@blocks(10)\nf() -> int = 1\n", "print(thing.f())\n")
+
+    nbk_check(said, "'@blocks' takes no arguments")
+
+@test("'@no_block' inside another function is refused, the inner one being a closure")
+nbk_a_nested_function()
+    if !nbk_ready() then return
+
+    val said = nbk_err("outer(n: int) -> int\n    @no_block\n    inner(k: int) -> int = k + n\n\n" +
+                       "    inner(1)\n",
+                       "print(thing.outer(3))\n")
+
+    nbk_check(said, "'@no_block' holds a top-level function or a method, and 'inner' is declared " +
+                    "inside another function")
+
+@test("'@requires(block)' and '@needs(block)' are refused, blocking being conduct and no facility")
+nbk_block_is_no_facility()
+    if !nbk_ready() then return
+
+    val required = nbk_err("@requires(block)\n\nf() -> int = 1\n", "print(thing.f())\n")
+
+    nbk_check(required, "'block' is what a module does, not something a machine has, and no machine " +
+                        "takes it away — '@requires' names a facility")
+
+    val needed = nbk_err("@needs(block)\nf() -> int = 1\n", "print(thing.f())\n")
+
+    nbk_check(needed, "'@needs' names a facility, and a module that may wait says nothing")
+
+@test("a module's '@no_block' written twice is refused as any repeated clause is")
+nbk_the_clause_twice()
+    if !nbk_ready() then return
+
+    val said = nbk_err("@no_block\n@no_block\n\nf() -> int = 1\n", "print(thing.f())\n")
+
+    nbk_check(said, "'block' is declared twice")
