@@ -2160,6 +2160,39 @@ safe to mutate** — that still wants a `Mutex`.
 A `&T` held in a `@thread_local` is *not* a domain crossing and needs no `&sync`, the storage
 belonging to one thread by construction.
 
+### Module storage reached from another domain
+
+A closure erased into a `&sync Fn` is asked about what it captures — and equally about the **module
+storage it reaches**, however many calls down. A module `var` is one object the whole program shares,
+so a count in it that is not atomic is the race a capture would have been:
+
+```sysl
+struct Cell
+    n: int
+
+static var shared: &Cell = Cell(1)
+
+bump()
+    shared.n += 1
+
+val job: &sync Fn() -> unit = () -> bump()
+
+job()
+print(shared.n)
+```
+
+```error
+a closure shared between two domains may be called from either, so every count it reaches has to be atomic — but the module storage 'shared' it reaches, which 'bump' reads, is a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
+```
+
+Hold it as a `&sync Cell` and the program prints `2`. What may be reached is what may be captured: a
+scalar, an `Atomic`, a `&sync T`, a raw pointer, and anything in `@thread_local` storage, which is
+one copy per thread; a `val` laid down as constant data is not asked either. Two kinds of body are
+held to it — whatever is erased into a `&sync` object (a closure, a named function read into a
+`&sync Fn`), and an `interrupt` handler, which the processor enters on top of whatever was running.
+**An `@export` is not**: it is how C enters sysl at all, almost always on the program's one thread,
+and nothing says a second domain exists.
+
 ### `@crossing` — where the rule is asked
 
 The rule above says *what* may cross. **`@crossing` says where**: it is the annotation a facility
