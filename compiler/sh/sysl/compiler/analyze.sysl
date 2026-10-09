@@ -706,6 +706,11 @@ private resolve_signatures(a: &Analysis)
 
         if !generic then runner_result(a, f, result)
 
+        if f.decl.marks.abandons
+            check_abandons_signature(a, f.scope, f.span, f.decl.name, generic,
+                                     resolved_params(a, f.scope, f.decl.params, generic),
+                                     result.unwrap_or(Unit))
+
         if generic
             a.release(trial)
             rewind_registered(a.tables.struct_insts, structs)
@@ -719,9 +724,13 @@ private resolve_signatures(a: &Analysis)
         var vector_said = false
 
         val covered = enter_signature(a, d.needs)
+        var resolved: Buf[(string, Type)] = buf()
+        var answer = Unit
 
         for p in d.params
             val t = resolve_type(a, scope, p.typ, no_bindings())
+
+            resolved.push((p.name, t))
 
             if !vector_said && is_vector(t)
                 extern_vector_fault(a, key, s"'${p.name}' of the 'extern' '${d.name}' is ${type_show(t)}, " +
@@ -734,6 +743,8 @@ private resolve_signatures(a: &Analysis)
         if d.ret_type.is_some()
             val t = resolve_result(a, scope, d.ret_type.unwrap(), no_bindings())
 
+            answer = t
+
             if !vector_said && is_vector(t) then
                 extern_vector_fault(a, key, s"the 'extern' '${d.name}' returns ${type_show(t)}, and how " +
                                     "a vector comes back from a C function differs by target and by " +
@@ -743,6 +754,11 @@ private resolve_signatures(a: &Analysis)
         end if
 
         leave_reaching(a, covered)
+
+        if d.abandons
+            val home = a.tables.extern_scopes.get(key).unwrap()
+
+            check_abandons_signature(a, home.scope, home.span, d.name, false, resolved, answer)
 
     // **Module storage is deliberately absent from this, and its written type is resolved where the
     // storage itself is read.** Resolving it here would make every type a module's storage names

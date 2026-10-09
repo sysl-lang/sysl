@@ -1,6 +1,6 @@
 ---
 title: The process module
-summary: "`sysl.process` — starting another program and waiting for it: `run`, `capture`, `start` and `Child`, `Status`, how long a child may take, and why there is no shell anywhere in it."
+summary: "`sysl.process` — starting another program and waiting for it: `run`, `capture`, `start` and `Child`, `spawn` and `pipe` for a pipeline, `Status`, how long a child may take, why there is no shell anywhere in it, and which user the program runs as."
 weight: 74
 ---
 
@@ -8,7 +8,8 @@ weight: 74
 
 `sysl.process` starts another program and waits for what it does. Two functions: `run`, which lets
 the child share this program's streams, and `capture`, which collects what it wrote — and a third,
-`start`, for when the waiting should come [later](#starting-now-waiting-later).
+`start`, for when the waiting should come [later](#starting-now-waiting-later) — and `spawn` and
+`pipe`, which are what a [pipeline](#a-pipeline) is built from.
 
 ```sysl
 import sysl.process.{run, capture}
@@ -35,8 +36,9 @@ It requires `posix`. On a hosted target the whole of the mechanism is `posix_spa
 `execvp` — the `PATH` search below is `execvp`'s own — and neither exists outside POSIX: a hosted
 target that is not POSIX has no way to start a program. WASI preview1 is the case that made that
 visible, having files and a clock and no way to spawn at all. **A target with no C library can still
-start one, if the program says how** — a kernel with its own process calls answers the module's four
-hooks itself, [below](#on-a-target-with-no-c-library).
+start one, if the program says how** — a kernel with its own process calls answers the module's
+hooks itself, [below](#on-a-target-with-no-c-library). The module also says
+[which user the program is](#who-the-program-is).
 
 ## A program that fails is not a failure
 
@@ -253,6 +255,47 @@ the child's output follows it rather than landing in the middle of it — `betwe
 the file's buffer when `sh` started. A path that cannot be opened is an error before anything is
 started, and nothing is run.
 
+## A child's standard input
+
+`run`, `capture` and `start` take a `stdin` too, the same `Stdio` read the other way: `FromPath` opens
+a file for the child to read, a shell's `<`, and `FromFile` hands over a file this program has open —
+the child reading on from where this program stopped, what this program's buffer had read ahead being
+given back to the file first.
+
+```sysl
+import sysl.fs.{open, remove_file, write_text}
+import sysl.io.Reader
+import sysl.process.{Stdio, capture}
+import sysl.text.Search
+
+val names = "process-page-names.txt"
+
+write_text(names, "pear\napple\nfig\n").unwrap()
+
+// `sort < names`.
+print(capture("sort", stdin = Stdio.FromPath(names)).unwrap().text.trim())
+
+// The first line read here, the rest by `wc`.
+var f = open(names).unwrap()
+var first: [5]u8 = [0; 5]
+
+f.read(first[..])
+print(capture("wc", ["-l"], stdin = Stdio.FromFile(f)).unwrap().text.trim())
+f.close().unwrap()
+remove_file(names)
+```
+
+```output
+apple
+fig
+pear
+2
+```
+
+**The direction is part of each name**, and a stream handed the wrong one is refused with
+`Other(22)` (`EINVAL`) before anything is opened or started: `ToPath` as an input would empty the very
+file the child was meant to read, and `FromPath` as an output would open one it cannot write.
+
 ## Starting now, waiting later
 
 `start` is `capture` with the wait taken out. It takes the same arguments meaning the same things, and
@@ -407,20 +450,130 @@ A timeout costs nothing to have and is worth setting wherever the child is somet
 program you wrote: `run` and `capture` with no bound are the right calls for a build you are
 watching, and the wrong ones for a tool that has hung on somebody's machine once already.
 
+## A pipeline
+
+`a | b` is two children started before either is waited for, with a pipe between them. `pipe()` makes
+one — the end its bytes are read from, then the end they are written into, both ordinary `File`s — and
+`spawn` starts a program with each of its three streams wherever its `Stdio` says, neither waiting nor
+collecting: it answers a `Spawned`, whose `wait` answers a `Status` and reads no file. Here is `echo hi
+| tr a-z A-Z`, with `tr`'s output read back through a second pipe:
+
+```sysl
+import sysl.io.read_all_text
+import sysl.process.{Stdio, pipe, spawn}
+
+val (r1, w1) = pipe().unwrap()
+val (r2, w2) = pipe().unwrap()
+
+val echo = spawn("echo", ["hi"], stdout = Stdio.ToFile(w1)).unwrap()
+var a = w1
+
+a.close().unwrap()
+
+val tr = spawn("tr", ["a-z", "A-Z"], stdin = Stdio.FromFile(r1), stdout = Stdio.ToFile(w2)).unwrap()
+
+for f in [r1, w2]
+    var g = f
+
+    g.close().unwrap()
+
+var back = r2
+
+print(read_all_text(&back).unwrap())
+print(echo.wait().unwrap())
+print(tr.wait().unwrap())
+```
+
+```output
+HI
+
+exited
+exited
+```
+
+**Who closes what is the whole of making a pipeline end.** A file handed to `spawn` as `ToFile` or
+`FromFile` stays open and stays this program's, the child having a copy of its own by the time `spawn`
+returns; a file `spawn` opened for a path it closes itself. For a pipe, closing this program's copy is
+not tidiness: a reader sees the end of its input only when no write end is open anywhere, so the write
+end is closed as soon as the stage writing into it has started — above, `tr` would otherwise wait for
+ever on an `echo` long finished, because *this* program could still write. A writer whose reader has
+gone is told so (`SIGPIPE`, which `wait` reports as `Signalled(13)`) only once every read end is
+closed, so the read end goes as soon as its stage has started too.
+
+**A pipe's ends are never inherited by accident.** Each is made to close when a program is started,
+and reaches a child only as the stream it was handed as — so `tr` above holds no copy of its own write
+end, which would be a writer it waits for and never hears from.
+
+Like a `Child`, a `Spawned` dropped without being waited for is ended and reaped there and then, so a
+pipeline abandoned halfway leaves no stage running and no zombie; `spawn` takes `dir`, `env`,
+`timeout` and `inherit_env` meaning what they mean for `run`, the `timeout` kept by `wait`.
+
+## Who the program is
+
+**`user()` and `group()` answer the ids the program acts as**, as `u32`s — the type
+[`sysl.fs`'s `Meta.owner` and `Meta.group`](/library/fs/#who-owns-it) already have, so whether a file
+is the program's own is one comparison:
+
+```sysl
+import sysl.fs.{write_text, metadata, remove_file}
+import sysl.process.{user, group, real_user, real_group}
+
+val path = "/tmp/sysl-process-doc-id.txt"
+
+write_text(path, "mine").unwrap()
+
+print(metadata(path).unwrap().owner == user())
+print(user() == real_user(), group() == real_group())
+
+remove_file(path).unwrap()
+```
+
+```output
+true
+true true
+```
+
+**They are the *effective* ids** — the ones a filesystem checks a permission against and makes a new
+file's owner, which is what a program asking "who am I" is asking. `real_user()` and `real_group()`
+are who *started* it, and differ only in a program that changed who it acts as: one installed
+set-user-ID, or one that called `set_user`. A target that keeps one user per process answers the same
+number for both, and **a target with no users at all answers 0 for every one** — its filesystem
+leaves `Meta.owner` zero for the same reason, so `Meta.owner == user()` still says yes.
+
+`set_user(id)` and `set_group(id)` are POSIX's `setuid` and `setgid`, and **privileged**: a program
+acting as user 0 becomes `id` for good — real, effective and saved together, so the privilege is given
+up rather than set aside — and any other may only move between the ids it already has. Anything else
+is `NotPermitted`. **A program giving up root calls `set_group` first**: once it is no longer user 0 it
+may not change its group either.
+
+```
+import sysl.process.{set_group, set_user}
+
+set_group(100)?
+set_user(1000)?
+```
+
+Mapping a number to a name — `/etc/passwd`, `/etc/group` — is not here: that is a system database, and
+a program that reads one reads the system's own.
+
 ## On a target with no C library
 
-Everything the module asks of the machine goes through four hooks in `sysl.process.sys` — start a
-program, wait for it, send it a signal, name a file for a captured stream. On a hosted POSIX target
+Everything the module asks of the machine goes through seven hooks in `sysl.process.sys` — start a
+program, make a pipe, wait for it, send it a signal, name a file for a captured stream, and read or
+change who the program is. On a hosted POSIX target
 the library answers them; **on a target with no C library the program answers each one it reaches
-with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `start` and `Child`
-work unchanged above them:
+with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `start`, `spawn` and
+`pipe` work unchanged above them:
 
 | hook | what it answers |
 |---|---|
 | `sysl_proc_spawn(path, path_len, argv, argc, envp, envc, inherit_env, dir, dir_len, stdin_fd, stdout_fd, stderr_fd, started) -> i64` | the child's process id |
+| `sysl_proc_pipe(read_end, write_end) -> int` | zero, having written the two descriptors, each closing when a program is started |
 | `sysl_proc_wait(pid, started, timeout_ms, how, value) -> int` | zero, having written how it ended |
 | `sysl_proc_kill(pid, signal) -> int` | zero |
 | `sysl_proc_temp_path(into, room) -> isize` | the length of the path it wrote |
+| `sysl_proc_get_id(which) -> i64` | the id: `which` is `id_user` 0 or `id_group` 1 (effective), `id_real_user` 2 or `id_real_group` 3 |
+| `sysl_proc_set_id(which, id: u32) -> int` | zero, having made the program act as user or group `id` (`which` 0 or 1) |
 
 **Each answers zero or more for success and the `IoError` code negated for a failure**, and
 `UNSUPPORTED` (`sysl.sys`, -38 on every platform, not the host's `ENOSYS`; `-1` is `EPERM`) for a
@@ -429,17 +582,21 @@ a length, never a C string: `argv` and `envp` point at runs of `Text`, each a po
 `envp`'s entries reading `NAME=VALUE`. A descriptor of `-1` leaves the child the stream this program
 has. `wait` writes `0` into `how` for an exit (its code in `value`), `1` for a signal or a fault (its
 number), and `2` for a child it stopped at its deadline; a supplier that cannot bound a wait answers
-`UNSUPPORTED` when handed a timeout. `sysl.process.sys`'s own comments say the rest.
+`UNSUPPORTED` when handed a timeout. A target with no users answers `get_id` and `set_id` with
+`UNSUPPORTED`, and a refused `set_id` answers `-1`, `EPERM`, which comes back as `NotPermitted`.
+**`kill` and `wait` are reached by any program that reaches the module**, `Child`'s destructor being
+kept wherever `sysl.process` is, so a program asking only who it is answers those two as well.
+`sysl.process.sys`'s own comments say the rest.
 
 A program that reaches a hook and leaves it unanswered is refused when it is compiled, naming every
 hook it reached:
 
 ```
-error: this program starts or waits for a process, and 'aarch64-freestanding' has no C library under
-it for the standard library to answer one with, so the program answers it: define 'sysl_proc_kill',
-'sysl_proc_spawn', 'sysl_proc_temp_path', 'sysl_proc_wait' with '@export', each taking what its
-'extern' in 'sysl.process.sys' declares and answering a process id, a length or zero, or the code of
-an 'IoError' negated
+error: this program reaches 'sysl.process', and 'aarch64-freestanding' has no operating system under
+it for the standard library to answer a process or a user with, so the program answers it: define
+'sysl_proc_kill', 'sysl_proc_spawn', 'sysl_proc_temp_path', 'sysl_proc_wait' with '@export', each
+taking what its 'extern' in 'sysl.process.sys' declares and answering a process id, a user or group
+id, a length or zero, or the code of an 'IoError' negated
 ```
 
 ## What is not here

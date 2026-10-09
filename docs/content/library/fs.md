@@ -43,7 +43,7 @@ decides which modules exist at all — there is no half of `sysl.fs` that works 
 |---|---|---|
 | whole file | `read_text`, `read_bytes`, `write_text`, `write_bytes`, `append_text`, `append_bytes`, `write_text_atomic`, `write_bytes_atomic` | storage the size of the file — allocates by nature |
 | open file | `open`, `create`, `append`, `open_update`, `create_update`, and `File`'s members | a buffer the caller already has |
-| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
+| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
 
 **Reading a whole file *is* asking for storage the size of the file**, so the top tier could not have
 been written any other way. Keeping it apart from `File` is what lets the middle tier stay honest:
@@ -225,8 +225,8 @@ recognised from, which keeps the question answerable without a second table. `me
 in the terms the operation was asked in rather than in C's, and the `Display` impl is what makes
 `print(e)` say it. **An `Other` says the platform's sentence for its code** — what the C library's
 `strerror_r` gives, so `EILSEQ` is "Illegal byte sequence" on macOS — and a code the library does not
-know comes back in its words for that ("Unknown error: 4242"); only a target with no `posix` C library
-under it says `error N`:
+know comes back in its words for that ("Unknown error: 4242"). A target with no C library says what
+[the words for an error number](#the-words-for-an-error-number) below give:
 
 ```sysl
 import sysl.fs.read_text
@@ -244,6 +244,52 @@ refused: no such file or directory 2
 read is the hosted answer to `sysl.fs.sys`'s hooks, straight after the C call that failed, and what
 crosses back is the number; `sysl.fs` turns it into an `IoError` once. A `File` that latches a
 failure keeps the code it failed with, so a close afterwards cannot overwrite it.
+
+### The words for an error number
+
+**An `Other`'s words are asked of whatever answers the filesystem**, through one more hook of
+`sysl.fs.sys`, `sysl_fs_error_text(code, into, room, got) -> int`: zero having copied the words into
+`into` and their length to `got`, anything else having none to give. **It is the one hook a program
+never has to answer** — the library answers it on every target, over `strerror_r` on a POSIX host and
+with no words on a machine with no C library — so a kernel whose error numbers are its own can say
+what they mean, and one that never thought about it is asked nothing.
+
+**A code the supplier has no words for goes to the library's own table, and only then to `error
+N`** — and words that are not UTF-8 count as none. The table holds the numbers every platform agrees on and nothing past them: V7 Unix's 1 to 34,
+which have meant the same thing on every Unix since (11 aside, which a BSD spends on `EDEADLK`), and
+`EAGAIN`, `ENOTEMPTY` and `EILSEQ` at this target's own number. A table claiming more would put
+Linux's words to a BSD's codes. So on a bare machine `EBUSY` says "device or resource busy" with no
+help from anybody. A hosted target that is not POSIX numbers its errors its own way and is not given
+the table.
+
+A program's own answer displaces the library's, here on a host as on a board — so `16`, which it
+declines, comes from the table rather than from the C library:
+
+```sysl
+import sysl.fs.IoError
+
+@export("sysl_fs_error_text")
+words(code: int, into: *u8, room: usize, got: *usize) -> int
+    if code != 77 then return -1
+
+    val w = "the disk is resting"
+
+    for i in 0..<w.bytes.len do into[i] = w.bytes[i]
+
+    *got = w.bytes.len
+    0
+end words
+
+print(IoError.Other(77).message())
+print(IoError.Other(16).message())
+print(IoError.Other(4242).message())
+```
+
+```output
+the disk is resting
+device or resource busy
+error 4242
+```
 
 ## `File`
 
@@ -576,6 +622,42 @@ behaviour available.
 
 `Meta.same_file` is the inode and the device together, which is what says two paths name one file.
 Neither identifies a file on its own: inode numbers are reused, and are unique only within a device.
+
+### Who owns it
+
+**`Meta.owner` and `Meta.group` are `u32`s, the type [`sysl.process.user()`](/library/process/#who-the-program-is)
+answers**, so "is this file mine" is one comparison with nothing converted on either side.
+`set_owner(path, owner, group)` is the writing half, beside `set_permissions` and over one `chown`:
+it sets both, so a program changing only one passes the other as `metadata` read it.
+
+```sysl
+import sysl.fs.{write_text, metadata, set_owner, remove_file}
+import sysl.process.user
+
+val path = "/tmp/sysl-fs-doc-owner.txt"
+
+write_text(path, "mine").unwrap()
+
+val m = metadata(path).unwrap()
+
+print(m.owner == user())
+
+set_owner(path, m.owner, m.group).unwrap()
+print(metadata(path).unwrap().owner == m.owner)
+
+remove_file(path).unwrap()
+```
+
+```output
+true
+true
+```
+
+**Giving a file away is privileged**, as `chown(2)` makes it: a program not acting as user 0 that
+hands one to somebody else is refused with `NotPermitted`. Giving a file to the owner and group it
+already has is the one change anybody may make. A symbolic link is followed, as `set_permissions`
+follows one, and there is no variant that changes the link itself, there being none for its
+permissions either. A target whose filesystem has no owners answers *not supported on this target*.
 
 ### Links, and the path the filesystem agrees on
 
@@ -923,7 +1005,7 @@ way to get atomicity from a filesystem.
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
 `extern` per call — `sysl_fs_open`, `_read`, `_write`, `_close`, `_seek`, `_fstat`, `_ftruncate`,
-`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_opendir`,
+`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_chown`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`. Each answers an `int` by the contract every `*.sys` module has
 (`sysl.io.sys` and `sysl.process.sys` too): zero or more is success, a negative answer is the `code()`
@@ -958,7 +1040,7 @@ The question is asked only of what the program reaches, so a freestanding progra
 a file is asked nothing.
 
 **Every call on this page is there for such a program**, the reading ones included: `metadata`,
-`link_metadata` and `set_permissions` are one `stat` or `chmod` hook, the walk and `remove_dir_all`,
+`link_metadata`, `set_permissions` and `set_owner` are one `stat`, `chmod` or `chown` hook, the walk and `remove_dir_all`,
 `copy_dir_all` and `publish_dir` are `entries` and `link_metadata` with a leaf action, and
 `make_temp_dir` and `canonicalize` are the `temp_dir` and `realpath` hooks. A supplier fills `Stat`'s
 thirteen numbers in POSIX's shape and leaves zero what it has nothing to say about; a hook it answers

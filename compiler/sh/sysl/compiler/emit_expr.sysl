@@ -169,7 +169,7 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     // call to a named `extern`, and the two go through one function. A driver whose transport is a
     // struct of function pointers is the shape that wants it.
     TCallPtr(callee, args, _, ty) ->
-        gen_foreign_call(e, foreign_result(e, ty), gen_expr(e, callee), args, ty)
+        gen_foreign_call(e, foreign_result(e, ty), gen_expr(e, callee), args, ty, false)
 
     // An address is the C-callable entry rather than the definition, since a `*extern` may only
     // hold something C can call.
@@ -1188,7 +1188,7 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
         val form = foreign_result(e, ty)
 
         return gen_foreign_call(e, CallForm(form.ret, form.ret_attrs, variadic_type_of(e, name)),
-                                VGlobal(symbol_of(e, name)), args, ty)
+                                VGlobal(symbol_of(e, name)), args, ty, e.abandoning.has(name))
 
     var arg_vals: Buf[IrArg] = buf()
     val staged = staged_args(e, args, &arg_vals, e.inert.has(name))
@@ -1197,6 +1197,12 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
     // It sits before the call rather than inside the callee, which is what lets it be made out of
     // values already in hand.
     if checks_variant(e, name) then gen_variant_at_call(e, staged)
+
+    // **A call to an `@abandons` function is this frame's last act, so the frame ends before it**:
+    // what it deferred runs and what it owns is given back, exactly as a `return` would, once the
+    // arguments are in hand. None of them carries a count (`abandons.sysl` refuses the parameter), so
+    // nothing the call reads is let go here.
+    if e.abandoning.has(name) then release_all(e)
 
     // A sysl definition's tail is named the way a foreign one's is: by the callee's whole function
     // type, since the argument list alone does not say where the declared parameters stop.

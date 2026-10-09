@@ -405,7 +405,7 @@ fsh_wide_format_needs_no_runtime()
     lbr_drop([p, out])
 end fsh_wide_format_needs_no_runtime
 
-@test("a freestanding program reaching a float or string specifier is refused at each, naming the target")
+@test("a freestanding program reaching a float specifier is refused at it, naming the target")
 fsh_c_specifier_is_refused()
     if !lbr_ready() then return
 
@@ -421,13 +421,13 @@ fsh_c_specifier_is_refused()
 
     assert(said.0 != 0, "built with a float specifier and no C library")
 
-    for spec in ["%.2f", "%5s"]
-        assert(said.1.contains(s"'$spec' is applied by C's 'snprintf', and '$fsh_target' has no C " +
-            "library under it to supply one — only an integer specifier is rendered without C"),
-            said.1)
+    assert(said.1.contains(s"'%.2f' is applied by C's 'snprintf', and '$fsh_target' has no C " +
+        "library under it to supply one — only an integer or a string specifier is rendered " +
+        "without C"), said.1)
 
-    // The integer specifier is not one of them, and nothing reached the link.
+    // The integer and the string specifier are not refused, and nothing reached the link.
     assert(!said.1.contains("'%03d'"), said.1)
+    assert(!said.1.contains("'%5s'"), said.1)
     assert(!said.1.contains("undefined symbol"), said.1)
 
     lbr_drop([p, out])
@@ -682,6 +682,112 @@ fsh_unsupported_hook_is_an_io_error()
               "still there: true\ncanonicalize: not supported on this target\ntrue\n")
     lbr_drop([p])
 end fsh_unsupported_hook_is_an_io_error
+
+// -- the words for an error number -----------------------------------------------------------------------
+//
+// `IoError.message` asks `sysl_fs_error_text` for a code no case names, and the library answers it on
+// every target (`sysl.fs.errtext`, which requires nothing): over `strerror_r` on a POSIX host, with no
+// words anywhere else, after which `sysl.fs`'s own table of the agreed numbers speaks. So it is the one
+// hook a program never has to answer, and one it does answer displaces the library's.
+
+// A supplier with words for its own 77 and none for anything else.
+private val fsh_own_words: string = raw"""
+    @export("sysl_fs_error_text")
+    own_words(code: int, into: *u8, room: usize, got: *usize) -> int
+        if code != 77 then return -1
+
+        val w = "the disk is resting"
+
+        for i in 0..<w.bytes.len do into[i] = w.bytes[i]
+
+        *got = w.bytes.len
+        0
+    end own_words
+    """
+
+@test("a freestanding program reaching IoError.message is not asked for words, and the library's answer links")
+fsh_error_text_is_answered_by_the_library()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_says_why + fsh_runtime + fsh_hooks([]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+    assert(!said.1.contains("sysl_fs_error_text"), said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    assert(fsh_names(all, "sysl_fs_error_text"), all)
+    assert(all.contains("errno_words"), all)
+
+    for name in ["sysl_fs_strerror", "strerror_r", "strerror"]
+        assert(!fsh_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end fsh_error_text_is_answered_by_the_library
+
+@test("a freestanding program's own sysl_fs_error_text is the one in the image, defined strong")
+fsh_error_text_a_programs_own_is_taken()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_says_why + fsh_runtime + fsh_hooks([]) + fsh_own_words)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    assert(all.contains(" T sysl_fs_error_text"), all)
+
+    lbr_drop([p, out])
+end fsh_error_text_a_programs_own_is_taken
+
+@test("a program's words displace the C library's; a code it declines falls to the table, then 'error N'")
+fsh_error_text_words_then_table_then_number()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.IoError
+
+        """ + fsh_own_words + raw"""
+
+        print(IoError.Other(77).message())
+        print(IoError.Other(16).message())
+        print(IoError.Other(4242).message())
+        """)
+
+    assert_eq(lbr_run(p, []),
+              "the disk is resting\ndevice or resource busy\nerror 4242\n")
+    lbr_drop([p])
+end fsh_error_text_words_then_table_then_number
+
+@test("words that are not UTF-8, or a length past the room, are no words: the table speaks instead")
+fsh_error_text_bad_words_fall_to_the_table()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.IoError
+
+        @export("sysl_fs_error_text")
+        bad_words(code: int, into: *u8, room: usize, got: *usize) -> int
+            into[0] = 104
+            into[1] = 255
+            into[2] = 105
+            *got = if code == 16 then 3 else room + 100
+            0
+        end bad_words
+
+        print(IoError.Other(16).message())
+        print(IoError.Other(4242).message())
+        """)
+
+    assert_eq(lbr_run(p, []), "device or resource busy\nerror 4242\n")
+    lbr_drop([p])
+end fsh_error_text_bad_words_fall_to_the_table
 
 @test("copy_dir_all on a target whose chmod hook answers UNSUPPORTED copies the tree and carries nothing")
 fsh_copy_dir_all_without_permission_bits()

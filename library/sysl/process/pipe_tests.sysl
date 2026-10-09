@@ -1,0 +1,301 @@
+module sysl.process
+@requires(posix)
+@tests
+
+import sysl.fs.{File, IoError, create, exists, make_temp_dir, open, read_text, remove_dir_all,
+               write_text}
+import sysl.io.{Reader, read_all_text}
+import sysl.posix.time.monotonic
+import sysl.text.Search
+import sysl.time.whole_millis
+
+// What a pipeline needs of this module, asserted against real programs: a child's standard input
+// (`FromFile`, `FromPath`), a pipe (`pipe`), and a start that neither waits nor captures (`spawn`).
+
+// Whether a pid still names a process -- a running child or a zombie -- asked of the kernel itself.
+private extern "kill" pt_signal(pid: i32, sig: int) -> int
+
+// A directory of this test's own, for the files a child reads.
+private pt_scratch() -> string = make_temp_dir("sysl-proc-pipes").unwrap()
+
+// Everything left to read on `f`, which is then closed.
+private pt_drained(f: File) -> string
+    var g = f
+    val text = read_all_text(&g).unwrap()
+
+    g.close().unwrap()
+    text
+end pt_drained
+
+// ## A pipeline
+
+// `echo hi | tr a-z A-Z`, with `tr`'s output read back through a second pipe: two children started
+// before either is waited for, and every end this program held closed once the stage it was for had
+// started -- the closes being what lets `tr` see its input end and this program see `tr`'s.
+@test("echo hi | tr a-z A-Z is two spawns joined by a pipe, read back through a pipe")
+pt_echo_into_tr()
+    val (r1, w1) = pipe().unwrap()
+    val (r2, w2) = pipe().unwrap()
+
+    val echo = spawn("echo", ["hi"], stdout = Stdio.ToFile(w1)).unwrap()
+
+    var a = w1
+    a.close().unwrap()
+
+    val tr = spawn("tr", ["a-z", "A-Z"], stdin = Stdio.FromFile(r1),
+                   stdout = Stdio.ToFile(w2)).unwrap()
+
+    var b = r1
+    b.close().unwrap()
+
+    var c = w2
+    c.close().unwrap()
+
+    assert_eq(pt_drained(r2), "HI\n")
+    assert_eq(echo.wait().unwrap(), Status.Exited(0))
+    assert_eq(tr.wait().unwrap(), Status.Exited(0))
+end pt_echo_into_tr
+
+// The end a child reads from is not inherited by a child started while this program still holds the
+// write end: if it were, `cat` would hold a write end of its own input and never see it end, and the
+// timeout would answer `TimedOut` instead of the exit.
+@test("a pipe's ends reach a child only as the stream they were handed as")
+pt_ends_are_not_inherited()
+    val (r, w) = pipe().unwrap()
+    val (back, out) = pipe().unwrap()
+
+    val cat = spawn("cat", timeout = 5000, stdin = Stdio.FromFile(r),
+                    stdout = Stdio.ToFile(out)).unwrap()
+
+    var a = r
+    a.close().unwrap()
+
+    var o = out
+    o.close().unwrap()
+
+    var g = w
+    g.write("through\n".bytes)
+    g.close().unwrap()
+
+    assert_eq(pt_drained(back), "through\n")
+    assert_eq(cat.wait().unwrap(), Status.Exited(0))
+end pt_ends_are_not_inherited
+
+// Three stages, as a shell runs `printf … | sort | head -n 1`.
+@test("a three-stage pipeline runs every stage at once and ends")
+pt_three_stages()
+    val (r1, w1) = pipe().unwrap()
+    val (r2, w2) = pipe().unwrap()
+    val (r3, w3) = pipe().unwrap()
+
+    val first = spawn("printf", ["pear\\napple\\nfig\\n"], stdout = Stdio.ToFile(w1)).unwrap()
+    val second = spawn("sort", stdin = Stdio.FromFile(r1), stdout = Stdio.ToFile(w2)).unwrap()
+    val third = spawn("head", ["-n", "1"], stdin = Stdio.FromFile(r2),
+                      stdout = Stdio.ToFile(w3)).unwrap()
+
+    for f in [w1, r1, w2, r2, w3]
+        var g = f
+
+        g.close().unwrap()
+
+    assert_eq(pt_drained(r3), "apple\n")
+
+    for s in [first, second, third]
+        assert_eq(s.wait().unwrap(), Status.Exited(0))
+end pt_three_stages
+
+// ## A child's standard input
+
+@test("a child's standard input from a path is that file")
+pt_stdin_from_path()
+    val dir = pt_scratch()
+
+    write_text(s"$dir/in.txt", "one\ntwo\nthree\n").unwrap()
+
+    val out = capture("wc", ["-l"], stdin = Stdio.FromPath(s"$dir/in.txt")).unwrap()
+
+    assert_eq(out.text.trim(), "3")
+    remove_dir_all(dir)
+end pt_stdin_from_path
+
+// A file this program has already read from: the child starts where this program stopped, including
+// the bytes this program's buffer took ahead and never handed out.
+@test("a child's standard input from an open file starts where this program stopped reading")
+pt_stdin_from_open_file()
+    val dir = pt_scratch()
+
+    write_text(s"$dir/in.txt", "abcdefgh").unwrap()
+
+    var f = open(s"$dir/in.txt").unwrap()
+    var first: [3]u8 = [0, 0, 0]
+
+    assert_eq(f.read(first[..]).len, 3)
+
+    val out = capture("cat", stdin = Stdio.FromFile(f)).unwrap()
+
+    assert_eq(out.text, "defgh")
+    assert(!f.closed(), "a file handed as FromFile stays the caller's")
+    f.close().unwrap()
+    remove_dir_all(dir)
+end pt_stdin_from_open_file
+
+@test("run takes a standard input, and the child reads it")
+pt_run_with_stdin()
+    val dir = pt_scratch()
+
+    write_text(s"$dir/in.txt", "hello\n").unwrap()
+
+    val st = run("tr", ["a-z", "A-Z"], stdin = Stdio.FromPath(s"$dir/in.txt"),
+                 stdout = Stdio.ToPath(s"$dir/out.txt")).unwrap()
+
+    assert_eq(st, Status.Exited(0))
+    assert_eq(read_text(s"$dir/out.txt").unwrap(), "HELLO\n")
+
+    // And a program that reads its input to decide how it ends answers from what it read.
+    write_text(s"$dir/empty.txt", "").unwrap()
+    assert_eq(run("grep", ["x"], stdin = Stdio.FromPath(s"$dir/empty.txt")).unwrap(),
+              Status.Exited(1))
+    remove_dir_all(dir)
+end pt_run_with_stdin
+
+@test("start takes a standard input, and wait answers what it wrote")
+pt_start_with_stdin()
+    val dir = pt_scratch()
+
+    write_text(s"$dir/in.txt", "b\na\n").unwrap()
+
+    val c = start("sort", stdin = Stdio.FromPath(s"$dir/in.txt")).unwrap()
+
+    assert_eq(c.wait().unwrap().text, "a\nb\n")
+    remove_dir_all(dir)
+end pt_start_with_stdin
+
+// ## Spawned
+
+@test("spawn's wait answers a status, and waiting again answers the same")
+pt_spawn_wait_answers_status()
+    val s = spawn("sh", ["-c", "exit 3"]).unwrap()
+
+    assert_eq(s.wait().unwrap(), Status.Exited(3))
+    assert_eq(s.wait().unwrap(), Status.Exited(3))
+    assert(s.kill(9).is_ok(), "a child already waited for answers Ok and is not signalled")
+
+    val k = spawn("sleep", ["5"]).unwrap()
+
+    k.kill(9).unwrap()
+    assert_eq(k.wait().unwrap(), Status.Signalled(9))
+
+    val t = spawn("sleep", ["5"], timeout = 100).unwrap()
+
+    assert_eq(t.wait().unwrap(), Status.TimedOut)
+end pt_spawn_wait_answers_status
+
+private pt_abandoned() -> i32
+    val s = spawn("sleep", ["30"]).unwrap()
+
+    s.pid
+
+@test("a spawned child dropped without being waited for is ended and reaped")
+pt_dropped_spawn_is_reaped()
+    val t0 = monotonic()
+    val pid = pt_abandoned()
+
+    assert(pt_signal(pid, 0) != 0, s"pid $pid survived its handle")
+    assert(whole_millis(monotonic() - t0) < 3000, "dropping waited the child out")
+end pt_dropped_spawn_is_reaped
+
+// ## What is refused
+
+@test("a program that is not there fails to spawn, and its pipe ends are still the caller's")
+pt_spawn_missing_program()
+    val (r, w) = pipe().unwrap()
+    val e = spawn("sysl-no-such-program-anywhere-on-this-machine", stdout = Stdio.ToFile(w))
+
+    assert(e.is_err(), "a missing program spawned")
+    assert_eq(e.unwrap_err(), IoError.NotFound)
+
+    // Nothing was started, so closing the write end is the end of the pipe at once.
+    var g = w
+    g.close().unwrap()
+    assert_eq(pt_drained(r), "")
+end pt_spawn_missing_program
+
+@test("a closed pipe end is refused as NotOpen before anything starts")
+pt_closed_end_is_refused()
+    val (r, w) = pipe().unwrap()
+    var a = r
+
+    a.close().unwrap()
+    assert_eq(spawn("cat", stdin = Stdio.FromFile(r)).unwrap_err(), IoError.NotOpen)
+
+    var b = w
+
+    b.close().unwrap()
+    assert_eq(run("echo", ["x"], stdout = Stdio.ToFile(w)).unwrap_err(), IoError.NotOpen)
+end pt_closed_end_is_refused
+
+// The reader gone, a writer is told so: `SIGPIPE` ends it, which a status reports as the signal.
+@test("a child writing into a pipe nobody reads any more is ended by SIGPIPE")
+pt_writer_with_no_reader()
+    val (r, w) = pipe().unwrap()
+    var a = r
+
+    a.close().unwrap()
+
+    val yes = spawn("yes", timeout = 5000, stdout = Stdio.ToFile(w)).unwrap()
+    var b = w
+
+    b.close().unwrap()
+    assert_eq(yes.wait().unwrap(), Status.Signalled(13))
+end pt_writer_with_no_reader
+
+// What has to be read through a pipe that cannot give back what this program read ahead.
+@test("a pipe this program has read ahead of is refused as a child's input")
+pt_read_ahead_pipe_is_refused()
+    val (r, w) = pipe().unwrap()
+    var g = w
+
+    g.write("abcdef".bytes)
+    g.close().unwrap()
+
+    var f = r
+    var one: [1]u8 = [0]
+
+    assert_eq(f.read(one[..]).len, 1)
+    assert_eq(spawn("cat", stdin = Stdio.FromFile(f)).unwrap_err(), IoError.Other(29))
+    f.close().unwrap()
+end pt_read_ahead_pipe_is_refused
+
+// A direction is part of each name: an output given an input is refused before anything opens, so the
+// file a `ToPath` names is neither made nor emptied.
+@test("a stream handed the wrong direction is refused, and nothing is opened")
+pt_wrong_direction()
+    val dir = pt_scratch()
+
+    write_text(s"$dir/keep.txt", "kept").unwrap()
+
+    assert_eq(run("cat", stdin = Stdio.ToPath(s"$dir/keep.txt")).unwrap_err(), IoError.Other(22))
+    assert_eq(read_text(s"$dir/keep.txt").unwrap(), "kept")
+
+    assert_eq(run("echo", stdout = Stdio.FromPath(s"$dir/keep.txt")).unwrap_err(), IoError.Other(22))
+    assert_eq(spawn("echo", stderr = Stdio.FromPath(s"$dir/new.txt")).unwrap_err(),
+              IoError.Other(22))
+    assert(!exists(s"$dir/new.txt"), "a refused stream opened its path")
+
+    val f = create(s"$dir/out.txt").unwrap()
+
+    assert_eq(spawn("cat", stdin = Stdio.ToFile(f)).unwrap_err(), IoError.Other(22))
+    assert_eq(spawn("echo", stdout = Stdio.FromFile(f)).unwrap_err(), IoError.Other(22))
+
+    var g = f
+
+    g.close().unwrap()
+    remove_dir_all(dir)
+end pt_wrong_direction
+
+// A path that cannot be read is an error before anything is started.
+@test("a standard input from a path that is not there is NotFound, and nothing is run")
+pt_stdin_missing_path()
+    val e = run("cat", stdin = Stdio.FromPath("/sysl-no-such-input-anywhere"))
+
+    assert_eq(e.unwrap_err(), IoError.NotFound)

@@ -8,6 +8,7 @@ import sysl.process.sys as psys
 import sysl.process.sys.Text
 import sysl.slices.{as_ptr, as_mut_ptr}
 import sysl.text.from_utf8
+import sysl.fs.{adopted, open}
 
 /** Starting another program and waiting for what it does.
  *
@@ -26,7 +27,8 @@ import sysl.text.from_utf8
  * all, and Windows was already the same case with nobody building for it.
  *
  * **Everything it asks of the machine goes through the hooks of `sysl.process.sys`** -- start a
- * program, wait for it, signal it, name a file for a captured stream -- which the library answers
+ * program, wait for it, signal it, name a file for a captured stream, and read or change which user
+ * and group the program runs as (`identity.sysl`) -- which the library answers
  * over POSIX on a hosted target and a program answers itself, with an `@export` per hook, on a
  * target with no C library: a kernel with its own process calls, whose shell can then be written
  * with this module.
@@ -38,6 +40,12 @@ import sysl.text.from_utf8
  * suits it. A `Child` can be sent a signal, and that is the one piece of a *supervisor* here: no pid
  * is handed out and no process group is made. A program that wants those wants a different surface
  * and can have one under `sysl.posix` when something actually needs it.
+ *
+ * **A pipeline is `spawn` and `pipe`.** `spawn` starts a program with its three streams wherever the
+ * caller says and neither waits nor captures, answering a `Spawned` whose `wait` answers a `Status`
+ * and reads no file; `pipe` makes the two ends one child writes into and another reads from. Every
+ * stage is started first and every stage waited for after, which is the one order a pipe allows --
+ * and the reason `capture` does not use one.
  *
  * **The one thing a call that waits cannot do without is a way to stop waiting.** "Runs a program
  * and waits for it" says nothing about a program that never ends, and a caller with no bound has no
@@ -150,21 +158,35 @@ struct Output
     text: string
     err: Option[string]
 
-/** Where one of a child's output streams goes, for `run`.
+/** Where one of a child's streams goes, or comes from.
  *
  * `Inherit` is where this program's own goes, which is what a build or an install whose output a
  * person is watching wants. `ToFile` is a file this program already has open -- opened with
- * `sysl.fs.create` to start it afresh or `sysl.fs.append` to add to it -- and whatever this program
- * had buffered on its way there is handed over first, so the child's output follows it rather than
- * landing in the middle of it; the file stays open, and stays the caller's to close. `ToPath` is a
- * file named by its path, made empty first, or made if it is not there: a shell's `>`.
+ * `sysl.fs.create` to start it afresh or `sysl.fs.append` to add to it, or a pipe's write end -- and
+ * whatever this program had buffered on its way there is handed over first, so the child's output
+ * follows it rather than landing in the middle of it. `ToPath` is a file named by its path, made empty
+ * first, or made if it is not there: a shell's `>`.
  *
- * Both streams may be pointed at one file, and then they share it as a shell's `>f 2>&1` does.
+ * **Standard input reads the other two**: `FromFile` is a file this program has open -- opened with
+ * `sysl.fs.open`, or a pipe's read end -- which the child reads from where this program stopped
+ * reading; what this program had read ahead into its buffer and not yet taken is given back to the file
+ * first, and a pipe, which cannot take it back, is refused rather than losing it. `FromPath` is a file
+ * named by its path, opened for reading: a shell's `<`.
+ *
+ * **The direction is part of the name, and a stream handed the wrong one is refused** with `Other(22)`
+ * (`EINVAL`) before anything is started -- `ToPath` as an input would empty the file the child was
+ * meant to read, and `FromPath` as an output would open one it cannot write.
+ *
+ * **A `ToFile` or `FromFile` file stays open and stays the caller's to close**, the child having a copy
+ * of its own by the time the call returns; a file this module opened for a path is closed again. Both
+ * output streams may be pointed at one file, and then they share it as a shell's `>f 2>&1` does.
  */
 enum Stdio
     Inherit
     ToFile(file: File)
     ToPath(path: string)
+    FromFile(file: File)
+    FromPath(path: string)
 
 /** The text `s` lent, as the hooks take it. */
 private lent(s: string) -> Text = Text(as_ptr(s.bytes), s.bytes.len)
@@ -182,7 +204,7 @@ private failure(answer: i64) -> IoError = from_status(int(answer))
  * and the child has its own copies of them by then too.
  */
 private begun(program: string, args: []const string, env: []const Var, inherit_env: bool,
-              dir: string, out_fd: int, err_fd: int) -> Result[(i32, i64), IoError]
+              dir: string, in_fd: int, out_fd: int, err_fd: int) -> Result[(i32, i64), IoError]
     var argv: Buf[Text] = buf()
 
     argv.push(lent(program))
@@ -202,7 +224,7 @@ private begun(program: string, args: []const string, env: []const Var, inherit_e
     var at: i64 = 0
     val pid = psys.spawn(as_ptr(program.bytes), program.bytes.len, as_ptr(argv.view()), argv.len(),
                          as_ptr(envp.view()), envp.len(), if inherit_env then 1 else 0,
-                         as_ptr(dir.bytes), dir.bytes.len, -1, out_fd, err_fd, &at)
+                         as_ptr(dir.bytes), dir.bytes.len, in_fd, out_fd, err_fd, &at)
 
     if pid < 0 then return Err(failure(pid))
 
@@ -243,60 +265,83 @@ private stop(pid: i32)
     end if
 end stop
 
-/** The descriptor `s` names for a child's stream, `-1` for "this program's own", and the file this
- * call opened for it, which it closes once the child has its copy.
+/** `EINVAL`: what a stream handed the wrong direction is refused with -- the code POSIX gives an
+ * argument that is not one a call can take.
  */
-private opened(s: Stdio) -> Result[(int, Option[File]), IoError]
+private const misdirected: int = 22
+
+/** The descriptor `s` names for one of a child's streams, `-1` for "this program's own". `input` says
+ * whether it is standard input. A file opened here for a path is pushed onto `made`, for the caller to
+ * close once the child has its copy.
+ */
+private opened(s: Stdio, input: bool, made: *Buf[File]) -> Result[int, IoError]
     s match
-        Inherit -> Ok((-1, None))
+        Inherit -> Ok(-1)
         ToFile(f) ->
+            if input then return Err(IoError.Other(misdirected))
+
             var g = f
 
             if g.closed() then return Err(NotOpen)
 
             g.flush()?
-            Ok((g.inner.fd, None))
+            Ok(g.inner.fd)
         ToPath(p) ->
+            if input then return Err(IoError.Other(misdirected))
+
             val g = create(p)?
 
-            Ok((g.inner.fd, Some(g)))
-end opened
+            made.push(g)
+            Ok(g.inner.fd)
+        FromFile(f) ->
+            if !input then return Err(IoError.Other(misdirected))
 
-/** Closes a file `opened` opened, whatever became of the child it was opened for. */
-private release(made: Option[File])
-    made match
-        Some(f) ->
             var g = f
 
-            g.close()
-        None -> ()
+            if g.closed() then return Err(NotOpen)
 
-/** `begun`, with the child's two output streams sent where `stdout` and `stderr` say. A file opened
- * here is handed over and closed again whatever became of the child: the child holds its own copy by
- * then.
+            // What was read ahead and not taken goes back, so the child starts where this program
+            // stopped. Asking where that is answers ESPIPE for a pipe, which cannot take bytes back.
+            if g.inner.filled > g.inner.at then g.seek(g.tell()?)?
+
+            g.flush()?
+            Ok(g.inner.fd)
+        FromPath(p) ->
+            if !input then return Err(IoError.Other(misdirected))
+
+            val g = open(p)?
+
+            made.push(g)
+            Ok(g.inner.fd)
+end opened
+
+/** `begun`, with the child's three streams where `stdin`, `stdout` and `stderr` say. */
+private placed(program: string, args: []const string, env: []const Var, inherit_env: bool,
+               dir: string, stdin: Stdio, stdout: Stdio, stderr: Stdio,
+               made: *Buf[File]) -> Result[(i32, i64), IoError]
+    val in_fd = opened(stdin, true, made)?
+    val out_fd = opened(stdout, false, made)?
+    val err_fd = opened(stderr, false, made)?
+
+    begun(program, args, env, inherit_env, dir, in_fd, out_fd, err_fd)
+end placed
+
+/** `placed`, and every file it opened closed again whatever became of the child: the child holds its
+ * own copy by then, and one that never started needs none.
  */
 private begun_to(program: string, args: []const string, env: []const Var, inherit_env: bool,
-                 dir: string, stdout: Stdio, stderr: Stdio) -> Result[(i32, i64), IoError]
-    val (out_fd, out_made) = opened(stdout)?
-    val err = opened(stderr)
+                 dir: string, stdin: Stdio, stdout: Stdio,
+                 stderr: Stdio) -> Result[(i32, i64), IoError]
+    var made: Buf[File] = buf()
+    val began = placed(program, args, env, inherit_env, dir, stdin, stdout, stderr, &made)
 
-    if err.is_err()
-        release(out_made)
-        return Err(err.unwrap_err())
+    for i in 0..<made.len()
+        var g = made.at(i)
 
-    val (err_fd, err_made) = err.unwrap()
-    val began = begun(program, args, env, inherit_env, dir, out_fd, err_fd)
+        g.close()
 
-    release(out_made)
-    release(err_made)
     began
 end begun_to
-
-private started(program: string, args: []const string, env: []const Var, inherit_env: bool,
-                dir: string, timeout: int, stdout: Stdio, stderr: Stdio) -> Result[Status, IoError]
-    val (pid, at) = begun_to(program, args, env, inherit_env, dir, stdout, stderr)?
-
-    ended(pid, at, timeout)
 
 /** Run a program, wait for it, and say how it ended.
  *
@@ -313,13 +358,17 @@ private started(program: string, args: []const string, env: []const Var, inherit
  *
  * `env` is added to this program's environment, unless `inherit_env` is `false`, in which case it
  * is the child's whole environment -- see `Var` for which `PATH` the program is then looked for on.
- * It is the last parameter but two rather than beside `env` so that a call already passing `stderr`
+ * It is the last parameter but three rather than beside `env` so that a call already passing `stderr`
  * or `timeout` by position keeps meaning what it meant.
  *
  * `stdout` and `stderr` say where the child's two output streams go -- this program's own by
  * default, or a file (`Stdio`): `run("ls", ["/"], stdout = ToPath("listing.txt"))` is a shell's
- * `ls / > listing.txt`. A file this call opened is closed before it returns, and one that cannot be
- * opened is an error before anything is started.
+ * `ls / > listing.txt`. `stdin` says where its input comes from -- `FromPath("names.txt")` is a
+ * shell's `< names.txt`, and `FromFile` a file or a pipe's read end this program has open. It is the
+ * last parameter for the same reason `inherit_env` is not beside `env`. A file this call opened is
+ * closed before it returns, and one that cannot be opened is an error before anything is started.
+ *
+ * It is `spawn` followed at once by `wait`, and is written as exactly that.
  *
  * The error half is for a child that could not be *started*: a program that is not there reports
  * `NotFound`, one that is not executable reports `PermissionDenied`. **A program that ran and
@@ -330,8 +379,8 @@ private started(program: string, args: []const string, env: []const Var, inherit
  */
 run(program: string, args: []const string = [], dir: string = "",
     env: []const Var = [], timeout: int = 0, inherit_env: bool = true, stdout: Stdio = Inherit,
-    stderr: Stdio = Inherit) -> Result[Status, IoError] =
-    started(program, args, env, inherit_env, dir, timeout, stdout, stderr)
+    stderr: Stdio = Inherit, stdin: Stdio = Inherit) -> Result[Status, IoError] =
+    spawn(program, args, dir, env, timeout, inherit_env, stdin, stdout, stderr)?.wait()
 
 /** Run a program, wait for it, and collect what it wrote to its standard output.
  *
@@ -358,14 +407,16 @@ run(program: string, args: []const string = [], dir: string = "",
  * The files are removed before this returns, whether the child succeeded or not.
  *
  * `env` and `inherit_env` mean what they mean for `run`: added to this program's environment by
- * default, the whole of the child's with `inherit_env = false`.
+ * default, the whole of the child's with `inherit_env = false`. So does `stdin`: this program's own
+ * input by default, or a file the child reads (`FromPath`, `FromFile`).
  *
  * It is `start` followed at once by `wait`, and is written as exactly that, so the two can never
  * come to answer differently.
  */
 capture(program: string, args: []const string = [], dir: string = "", env: []const Var = [],
-        stderr: bool = false, timeout: int = 0, inherit_env: bool = true) -> Result[Output, IoError]
-    val child = start(program, args, dir, env, stderr, timeout, inherit_env)?
+        stderr: bool = false, timeout: int = 0, inherit_env: bool = true,
+        stdin: Stdio = Inherit) -> Result[Output, IoError]
+    val child = start(program, args, dir, env, stderr, timeout, inherit_env, stdin)?
 
     child.wait()
 end capture
@@ -472,7 +523,8 @@ impl Drop for Child
  * stopped for outstaying it while somebody is waiting for it, or when its `Child` is dropped.
  */
 start(program: string, args: []const string = [], dir: string = "", env: []const Var = [],
-      stderr: bool = false, timeout: int = 0, inherit_env: bool = true) -> Result[&Child, IoError]
+      stderr: bool = false, timeout: int = 0, inherit_env: bool = true,
+      stdin: Stdio = Inherit) -> Result[&Child, IoError]
     val out_path = temp_path()?
     val err_path = if stderr then temp_path() else Ok("")
 
@@ -484,7 +536,7 @@ start(program: string, args: []const string = [], dir: string = "", env: []const
 
     val err_to = if stderr then Stdio.ToPath(e) else Stdio.Inherit
 
-    begun_to(program, args, env, inherit_env, dir, Stdio.ToPath(out_path), err_to) match
+    begun_to(program, args, env, inherit_env, dir, stdin, Stdio.ToPath(out_path), err_to) match
         Ok((pid, at)) -> Ok(Child(pid, at, timeout, out_path, e, None))
         Err(x) ->
             remove_file(out_path)
@@ -493,6 +545,115 @@ start(program: string, args: []const string = [], dir: string = "", env: []const
 
             Err(x)
 end start
+
+/** A pipe: the end its bytes are read from, then the end they are written into.
+ *
+ * Both are ordinary `File`s, so this program can read or write one itself as well as hand it to a
+ * child with `FromFile` or `ToFile`. Neither is inherited by a child except as the stream it was
+ * handed as -- each end closes when a program is started, and the child gets its own copy where it was
+ * asked for -- so a child never holds an end of a pipe it was not given.
+ *
+ * **Every end has to be closed for a pipeline to finish, this program's copies included.** A reader
+ * sees the end of its input only when no write end is open anywhere, and a writer whose reader has
+ * gone is told so (`SIGPIPE`, or `EPIPE` from the write) only when no read end is: so close the write
+ * end as soon as the stage that writes into it has started, and the read end as soon as the stage that
+ * reads from it has. A write end this program still holds is a reader waiting for ever.
+ */
+pipe() -> Result[(File, File), IoError]
+    var r = -1
+    var w = -1
+
+    val e = psys.pipe(&r, &w)
+
+    if e != 0 then return Err(failure(i64(e)))
+
+    Ok((adopted(r), adopted(w)))
+end pipe
+
+/** A child that `spawn` started and that nothing has waited for yet.
+ *
+ * **It owns the child and nothing else** -- no file, no buffer -- so `wait` answers a `Status` and
+ * reads nothing. What the child wrote went where its `Stdio` said: a file, a pipe this program reads,
+ * or this program's own stream.
+ *
+ * Like `Child`, it is reached only through a `&Spawned`, and **dropping one that was never waited for
+ * ends and reaps the child there and then** -- one that had finished is reaped, and one still running
+ * is asked to stop, made to after a short grace, and reaped -- so a pipeline abandoned halfway leaves
+ * no zombie and no stage running on.
+ */
+struct Spawned
+    private[process] pid: i32
+    private began: i64
+    private timeout: int
+    private answer: Option[Result[Status, IoError]]
+
+    /** Waits for the child to end and says how it ended, as `run` would have.
+     *
+     * A child that outstays its `timeout` (measured from when it was started) is stopped here and is
+     * `TimedOut`; one that finished before anybody came to wait is reported as it finished. Waiting
+     * again answers what the first wait answered.
+     */
+    @blocks
+    wait(*self) -> Result[Status, IoError]
+        self.answer match
+            Some(r) -> return r
+            None -> ()
+
+        val r = ended(self.pid, self.began, self.timeout)
+
+        self.answer = Some(r)
+        r
+    end wait
+
+    /** Sends the child the signal numbered `signal`, as `Child.kill` does: 15 asks it to stop and 9
+     * makes it, and a child already waited for is not signalled.
+     */
+    kill(*self, signal: int = 15) -> Result[unit, IoError]
+        if self.answer.is_some() then return Ok(())
+
+        val e = psys.kill(i64(self.pid), signal)
+
+        if e != 0 then Err(failure(i64(e))) else Ok(())
+    end kill
+end Spawned
+
+impl Drop for Spawned
+    drop(self)
+        if self.answer.is_none() then stop(self.pid)
+
+/** Start a program with its three streams where the caller says, and answer it without waiting for it
+ * or collecting anything.
+ *
+ * `stdin`, `stdout` and `stderr` are each a `Stdio`: this program's own stream by default, a file named
+ * by its path (`FromPath` for the input, `ToPath` for an output), or a file this program has open
+ * (`FromFile`, `ToFile`) -- a pipe's end among them, which is what makes this the call a pipeline is
+ * built from. `echo hi | tr a-z A-Z` is two of them:
+ *
+ *     val (r, w) = pipe()?
+ *     val echo = spawn("echo", ["hi"], stdout = ToFile(w))?
+ *     w.close()
+ *     val tr = spawn("tr", ["a-z", "A-Z"], stdin = FromFile(r))?
+ *     r.close()
+ *     echo.wait()?
+ *     tr.wait()?
+ *
+ * **Who closes what.** A file this call opened for a path it closes again before it returns. A file
+ * handed in as `ToFile` or `FromFile` stays open and stays the caller's: the child has a copy of its
+ * own by the time this returns, so the caller's copy is free to close -- and for a pipe it must be, or
+ * the stage reading it never sees its input end (see `pipe`).
+ *
+ * `dir`, `env`, `timeout` and `inherit_env` mean what they mean for `run`; `timeout` is kept by `wait`.
+ * The error half is for a child that could not be started -- `NotFound` for a program that is not
+ * there, a stream handed the wrong direction refused before anything starts (`Stdio`) -- and a program
+ * that ran and failed is a `Status` at the wait.
+ */
+spawn(program: string, args: []const string = [], dir: string = "", env: []const Var = [],
+      timeout: int = 0, inherit_env: bool = true, stdin: Stdio = Inherit, stdout: Stdio = Inherit,
+      stderr: Stdio = Inherit) -> Result[&Spawned, IoError]
+    val (pid, at) = begun_to(program, args, env, inherit_env, dir, stdin, stdout, stderr)?
+
+    Ok(Spawned(pid, at, timeout, None))
+end spawn
 
 /** A file nothing else holds, made empty, for a child to write one of its streams into. */
 private temp_path() -> Result[string, IoError]

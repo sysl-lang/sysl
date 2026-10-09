@@ -1417,6 +1417,9 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written:
     if fits && spec_is_int(c) && library_key(cx, "format_int").is_some() then
         return int_format_call(cx, span, v, ty, spec, counts)
 
+    if fits && spec_is_str(c) && library_key(cx, "format_str").is_some() then
+        return str_format_call(cx, span, v, spec, counts)
+
     if fits then return TExpr(span, TFormat(v, spec, counts))
 
     if spec_is_str(c) && !scalar_render(ty) && renders_itself(cx, ty) then
@@ -1467,6 +1470,30 @@ private int_format_call(cx: &Analyzer, span: Span, v: TExpr, ty: Type, spec: str
 
     library_result_call_of(cx, span, "format_int", args)
 end int_format_call
+
+// **A string under a specifier is rendered by the library's `format_str`, never by C's `snprintf`**,
+// so `${s}%-6s` pads and cuts the same on a target with no C library as on a hosted one. The string
+// and the specifier cross as written, and a `*` reads the width or the precision handed beside them.
+private str_format_call(cx: &Analyzer, span: Span, v: TExpr, spec: string, counts: Buf[TExpr]) -> TExpr
+    val stars = spec_star_slots(spec)
+    var next: usize = 0
+    var args: Buf[TExpr] = buf()
+
+    args.push(v)
+    args.push(TExpr(span, TStrLit(spec)))
+
+    if stars.0
+        args.push(counts.at(next))
+        next += 1
+    else
+        args.push(TExpr(span, TIntLit(from_int(0), int_type())))
+    end if
+
+    if stars.1 then args.push(counts.at(next))
+    else args.push(TExpr(span, TIntLit(from_int(-1), int_type())))
+
+    library_result_call_of(cx, span, "format_str", args)
+end str_format_call
 
 // Which of a specifier's two counts is a `*` read at run time: the width, the precision, or both.
 private spec_star_slots(spec: string) -> (bool, bool)

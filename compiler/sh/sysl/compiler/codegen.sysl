@@ -139,6 +139,15 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
             Some(built) -> init = Some(built)
             None -> gaps.push((module_init_symbol(), gap_text(e)))
 
+    // **A C runtime's archive fills the same storage from a function its start file calls by name**
+    // (`gen_runtime_init`), a freestanding machine walking no constructor list.
+    if p.c_artifact && p.c_runtime
+        set_promoted(e, pr.for_func(""))
+
+        gen_runtime_init(e, p) match
+            Some(built) -> funcs.push(built)
+            None -> gaps.push((runtime_init_symbol(), gap_text(e)))
+
     // The tables come after the bodies because a table only exists for a type something erased, and
     // it may ask for an adapter, which the drain below is what emits.
     var vtables: Buf[IrGlobal] = buf()
@@ -412,6 +421,8 @@ private record_symbols(e: *Emit, p: TProgram)
 
         e.foreigns.push(x.name)
 
+        if x.abandons then e.abandoning.add(x.name)
+
         if x.variadic
             e.variadics.push(x.name)
             e.variadic_types.push((x.name, foreign_signature(e, x.ret_ty, x.params, true)))
@@ -422,6 +433,8 @@ private record_symbols(e: *Emit, p: TProgram)
         f.exported match
             Some(sym) -> e.export_symbols.push((f.name, sym))
             None -> ()
+
+        if f.marks.abandons then e.abandoning.add(f.name)
 
         // A sysl definition's tail is named the way a foreign one's is: a call to it names the whole
         // function type, since the argument list alone does not say where the declared parameters
@@ -654,6 +667,10 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     // declared beside the definition. In a C runtime's archive there is no definition here, and the
     // `extern` is declared: the `main` it reaches is the C program's.
     if p.entry_point then seen.push("main")
+
+    // **And an `extern` naming the runtime's initializer is a call into the definition this text
+    // carries** (`gen_runtime_init`), on the one artifact that has one.
+    if p.c_artifact && p.c_runtime then seen.push(runtime_init_symbol())
 
     for i in 0..<p.externs.len()
         val x = p.externs.at(i)

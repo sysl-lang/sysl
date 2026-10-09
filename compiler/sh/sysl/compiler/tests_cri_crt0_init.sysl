@@ -1,0 +1,352 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.{capture, Status}
+import sysl.text.Search
+import sysl.testing.skip
+
+// **A C runtime's archive fills its computed storage from `sysl_init_modules`** (`gen_runtime_init`):
+// a `build-c` archive for a freestanding machine whose manifest names the symbol it starts at defines
+// that function, external, and its start file calls it before the C program's `main` -- from its
+// `asm`, or through an `extern` naming it. Storage an export reaches is then accepted
+// (`export_storage`); a runtime that never calls it, and an archive naming no entry, are refused.
+
+private val cri_target: string = "aarch64-freestanding"
+
+private cri_manifest(lines: string) -> string =
+    "package { name = \"crt\", version = \"0.0.1\" }\n" +
+    "codegen {\n  general_regs_only = true\n  strict_align = true\n}\n" +
+    s"targets {\n  $cri_target {\n$lines  }\n}\n"
+
+private val cri_entry: string = "    entry = \"_start\"\n"
+
+// A crt0 whose `_start` sets the stack and calls `crt_start` with a count and a vector; `crt_exit`
+// leaves through semihosting's exit with the code in `w0`. `init` is the start's own call to the
+// initializer, if it makes one, written before it branches.
+private cri_start_asm(init: string) -> string = raw"""
+    asm
+        [aarch64]
+            ".globl _start"
+            "_start:"
+            "ldr x9, =__stack_top"
+            "mov sp, x9"
+    """ + init + raw"""
+            "mov x0, #2"
+            "adr x1, crt_argv"
+            "bl crt_start"
+            "b ."
+            ".balign 8"
+            "crt_argv: .quad crt_arg0, crt_arg1, 0"
+            "crt_arg0: .asciz \"prog\""
+            "crt_arg1: .asciz \"hello\""
+            ".balign 4"
+            ".globl crt_exit"
+            "crt_exit:"
+            "sub sp, sp, #16"
+            "mov x9, #0x26"
+            "movk x9, #2, lsl #16"
+            "stp x9, x0, [sp]"
+            "mov x1, sp"
+            "mov x0, #0x20"
+            "hlt #0xf000"
+            "b ."
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+    """
+
+// Storage computed at run time -- a loop no constant folds -- that the runtime's export reads.
+private val cri_storage: string = raw"""
+    private sum_to(n: int) -> int
+        var total = 0
+
+        for i in 0..<n
+            total += i
+
+        total
+
+    val base: int = sum_to(3)
+
+    extern "main" program_main(argc: int, argv: **u8) -> int
+    extern crt_exit(code: int) -> never
+    """
+
+// The runtime calling the initializer through an `extern`, then the C program's `main`, leaving with
+// `main`'s answer times ten plus the computed `base`.
+private val cri_extern_program: string = cri_start_asm("") + cri_storage + raw"""
+    extern "sysl_init_modules" init_modules()
+
+    @export("crt_start")
+    crt_start(argc: int, argv: **u8) -> never
+        init_modules()
+        crt_exit(program_main(argc, argv) * 10 + base)
+    """
+
+// The same, the start file's `asm` making the call instead.
+private val cri_asm_program: string =
+    cri_start_asm("        \"bl sysl_init_modules\"\n") + cri_storage + raw"""
+    @export("crt_start")
+    crt_start(argc: int, argv: **u8) -> never = crt_exit(program_main(argc, argv) * 10 + base)
+    """
+
+// The same, and nothing calls the initializer.
+private val cri_uncalled_program: string = cri_start_asm("") + cri_storage + raw"""
+    @export("crt_start")
+    crt_start(argc: int, argv: **u8) -> never = crt_exit(program_main(argc, argv) * 10 + base)
+    """
+
+private cri_archive(p: string) -> (int, string)
+    var args: [7]string = ["sysl", "build-c", "--target", cri_target, "-o", s"$p/crt.a", p]
+
+    lbr_cli(args[..])
+end cri_archive
+
+private val cri_objdump_candidates: [2]string =
+    ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+private cri_objdump() -> string
+    for c in cri_objdump_candidates
+        if is_file(c) then return c
+
+    ""
+end cri_objdump
+
+// The archive's symbol table line naming `name`, or `""`.
+private cri_symbol(p: string, name: string) -> string
+    val objdump = cri_objdump()
+
+    if objdump == "" then skip("there is no llvm-objdump to read the archive")
+
+    val table = capture(objdump, ["-t", s"$p/crt.a"], "", [], true).unwrap()
+
+    assert(table.status.ok(), table.text)
+
+    for line in lines_of(table.text)
+        if line.ends_with(s" $name") then return line
+
+    ""
+end cri_symbol
+
+private cri_defined(line: string) -> bool = line != "" && !line.contains("*UND*")
+
+@test("a runtime calling sysl_init_modules through an extern may read computed storage, and defines it")
+cri_extern_call_fills_storage()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("main.sysl", cri_extern_program, "package.hocon", cri_manifest(cri_entry)))
+    val built = cri_archive(p)
+
+    assert(built.0 == 0, built.1)
+
+    val init = cri_symbol(p, "sysl_init_modules")
+
+    // Defined once, global: the call through the `extern` reaches it rather than a declaration.
+    assert(cri_defined(init), init)
+    assert(init.contains(" g "), init)
+    lbr_drop([p])
+end cri_extern_call_fills_storage
+
+@test("a start file branching to sysl_init_modules from its asm counts as the call")
+cri_asm_call_fills_storage()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("main.sysl", cri_asm_program, "package.hocon", cri_manifest(cri_entry)))
+    val built = cri_archive(p)
+
+    assert(built.0 == 0, built.1)
+    assert(cri_defined(cri_symbol(p, "sysl_init_modules")), built.1)
+    lbr_drop([p])
+end cri_asm_call_fills_storage
+
+@test("a runtime that never calls sysl_init_modules is refused, told the name to call")
+cri_uncalled_refused()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("main.sysl", cri_uncalled_program, "package.hocon", cri_manifest(cri_entry)))
+    val built = cri_archive(p)
+
+    assert(built.0 != 0, built.1)
+    assert(built.1.contains("'crt_start' is exported and reaches 'base', which is module storage an " +
+                            "initializer fills before the program's own statements run. This archive " +
+                            "is a C runtime ('targets.aarch64-freestanding.entry'), and " +
+                            "'sysl_init_modules' is what fills it — but nothing here calls it, so the " +
+                            "function would read whatever the image left. Call it from the start file " +
+                            "before the C program's 'main' — a 'bl sysl_init_modules' in its 'asm', or " +
+                            "a call through an 'extern' naming it"), built.1)
+    lbr_drop([p])
+end cri_uncalled_refused
+
+@test("an archive naming no entry still refuses computed storage an export reaches")
+cri_no_entry_still_refused()
+    if !lbr_ready() then return
+
+    val program = raw"""
+        private sum_to(n: int) -> int
+            var total = 0
+
+            for i in 0..<n
+                total += i
+
+            total
+
+        val base: int = sum_to(3)
+
+        @export("read_base")
+        read_base() -> int = base
+        """
+    val p = lbr_tree(lbr_two("main.sysl", program, "package.hocon", cri_manifest("")))
+    val built = cri_archive(p)
+
+    assert(built.0 != 0, built.1)
+    assert(built.1.contains("'read_base' is exported and reaches 'base', which is module storage an " +
+                            "initializer fills before the program's own statements run. This artifact " +
+                            "has no entry point to fill it in"), built.1)
+    lbr_drop([p])
+end cri_no_entry_still_refused
+
+@test("a runtime with no computed storage still defines sysl_init_modules, so its start may always call it")
+cri_defined_without_storage()
+    if !lbr_ready() then return
+
+    val program = cri_start_asm("        \"bl sysl_init_modules\"\n") + raw"""
+        extern "main" program_main(argc: int, argv: **u8) -> int
+        extern crt_exit(code: int) -> never
+
+        @export("crt_start")
+        crt_start(argc: int, argv: **u8) -> never = crt_exit(program_main(argc, argv))
+        """
+    val p = lbr_tree(lbr_two("main.sysl", program, "package.hocon", cri_manifest(cri_entry)))
+    val built = cri_archive(p)
+
+    assert(built.0 == 0, built.1)
+    assert(cri_defined(cri_symbol(p, "sysl_init_modules")), built.1)
+    lbr_drop([p])
+end cri_defined_without_storage
+
+@test("an archive naming no entry defines no sysl_init_modules, and an extern naming it is refused")
+cri_extern_refused_in_a_library_archive()
+    if !lbr_ready() then return
+
+    val program = "extern \"sysl_init_modules\" init_modules()\n\n@export(\"setup\")\n" +
+        "setup()\n    init_modules()\n"
+    val p = lbr_tree(lbr_two("main.sysl", program, "package.hocon", cri_manifest("")))
+    val built = cri_archive(p)
+
+    assert(built.0 != 0, built.1)
+    assert(built.1.contains("'sysl_init_modules' is defined only in a C runtime's archive — a " +
+                            "'build-c' archive for a freestanding machine whose package.hocon names " +
+                            "the symbol it starts at — and this archive names no entry other than " +
+                            "'main' ('targets.aarch64-freestanding.entry'), so it is a library the C " +
+                            "program calls into rather than the C program's runtime"), built.1)
+    assert(built.1.contains("main.sysl:1:1"), built.1)
+    lbr_drop([p])
+end cri_extern_refused_in_a_library_archive
+
+@test("a program's extern naming sysl_init_modules is refused, main filling its storage")
+cri_extern_refused_in_a_program()
+    if !lbr_ready() then return
+
+    val program = "extern \"sysl_init_modules\" init_modules()\n\ninit_modules()\n"
+    val p = lbr_tree(lbr_two("main.sysl", program, "package.hocon",
+                             "package { name = \"prog\", version = \"0.0.1\" }\n"))
+    val said = emit_llvm_text(p, None) match
+        Err(why) -> failure_text(why)
+        Ok(emitted) -> analysis_report(emitted.report)
+
+    assert(said.contains("'sysl_init_modules' is defined only in a C runtime's archive — a " +
+                         "'build-c' archive for a freestanding machine whose package.hocon names the " +
+                         "symbol it starts at — and this program's storage is filled by 'main'"), said)
+    lbr_drop([p])
+end cri_extern_refused_in_a_program
+
+@test("an extern naming sysl_init_modules at another signature is refused, quoting it")
+cri_extern_refused_at_another_signature()
+    if !lbr_ready() then return
+
+    val program = cri_start_asm("") + cri_storage + raw"""
+        extern "sysl_init_modules" init_modules(n: int) -> int
+
+        @export("crt_start")
+        crt_start(argc: int, argv: **u8) -> never
+            val ignored = init_modules(0)
+
+            crt_exit(program_main(argc, argv) * 10 + base + ignored)
+        """
+    val p = lbr_tree(lbr_two("main.sysl", program, "package.hocon", cri_manifest(cri_entry)))
+    val built = cri_archive(p)
+
+    assert(built.0 != 0, built.1)
+    assert(built.1.contains("'sysl_init_modules' takes nothing and answers nothing, so an 'extern' " +
+                            "naming it is '() -> unit', where this one is '(int) -> int'"), built.1)
+    lbr_drop([p])
+end cri_extern_refused_at_another_signature
+
+// The C program the runtime starts: 4 where it was handed `prog hello`, 1 otherwise.
+private val cri_c_program: string =
+    "static int same(const char *a, const char *b) {\n" +
+    "    while (*a && *a == *b) { a++; b++; }\n    return *a == *b;\n}\n" +
+    "int main(int argc, char **argv) { return argc == 2 && same(argv[1], \"hello\") ? 4 : 1; }\n"
+
+private val cri_crt_script: string =
+    "ENTRY(_start)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss : { *(.bss .bss.*) *(COMMON) }\n    . = ALIGN(16);\n    . += 0x10000;\n" +
+    "    __stack_top = .;\n}\n"
+
+private cri_tool_runs(program: string) -> bool = capture(program, ["--version"], "", [], true, 10000) match
+    Ok(o) -> o.status.ok()
+    Err(_) -> false
+
+private cri_tool(program: string, args: []string) -> string = capture(program, args, "", [], true, 120000) match
+    Err(_) -> s"'$program' could not be started"
+    Ok(o) -> if o.status.ok() then "" else s"$program: ${o.text}${o.err.unwrap_or("")}"
+
+// Links the C program against the runtime's archive and runs it, answering the exit code.
+private cri_run(program: string) -> int
+    val cc = find_clang(target_named(cri_target).unwrap(), None) match
+        Err(why) -> skip(s"no clang here has a back end for $cri_target: $why")
+        Ok(found) -> found
+
+    var files = lbr_two("main.sysl", program, "package.hocon", cri_manifest(cri_entry))
+
+    files.push(("c/prog.c", cri_c_program))
+    files.push(("c/link.ld", cri_crt_script))
+
+    val p = lbr_tree(files)
+    val built = cri_archive(p)
+
+    assert(built.0 == 0, built.1)
+
+    var compile: [8]string = ["--target=aarch64-none-elf", "-ffreestanding", "-nostdlib",
+                              "-mgeneral-regs-only", "-O1", "-c", s"$p/c/prog.c", s"-o$p/prog.o"]
+    val compiled = cri_tool(cc, compile[..])
+
+    assert(compiled == "", compiled)
+
+    var link: [6]string = ["-T", s"$p/c/link.ld", s"$p/prog.o", s"$p/crt.a", "-o", s"$p/prog.elf"]
+    val linked = cri_tool("ld.lld", link[..])
+
+    assert(linked == "", linked)
+
+    var qemu: [10]string = ["-M", "virt", "-cpu", "cortex-a72", "-nographic", "-semihosting-config",
+                            "enable=on,target=native", "-kernel", s"$p/prog.elf", "-no-reboot"]
+    val ran = capture("qemu-system-aarch64", qemu[..], "", [], true, 20000).unwrap()
+
+    lbr_drop([p])
+
+    ran.status match
+        Exited(c) -> c
+        _ -> -1
+end cri_run
+
+@test("under QEMU the runtime's computed storage holds its value before the C program's main runs")
+cri_the_computed_value_reaches_the_c_program()
+    if !lbr_ready() then return
+    if !cri_tool_runs("ld.lld") then skip("ld.lld is not installed, so no image can be linked")
+    if !cri_tool_runs("qemu-system-aarch64") then skip("qemu-system-aarch64 is not installed")
+
+    // 4 from `main`, times ten, plus `base` = 0 + 1 + 2 -- which reads 40 where nothing filled it.
+    assert_eq(cri_run(cri_extern_program), 43)
+    assert_eq(cri_run(cri_asm_program), 43)
+end cri_the_computed_value_reaches_the_c_program
