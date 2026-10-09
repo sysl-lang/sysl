@@ -112,3 +112,38 @@ cra_override_marking_at_the_name()
 
     assert_eq(emitted_place(bodied + "    size(self) -> int = self.w\n\nprint(Box(1).size())\n"),
               "8:5 ^^^^^^^^^^^^^^^^^^^^^^^^^^")
+
+// A constant whose value is a call: r162 `--> 3:21`, `^^^^` under the callee rather than the call.
+@test("anchors: a constant's value that is not constant is refused at the call's callee")
+cra_constant_value_at_the_callee()
+    if !azd_ready() then return
+
+    assert_eq(emitted_place("size() -> int = 4\n\nconst called: int = size()\n\nprint(called)\n"),
+              "3:21 ^^^^")
+
+// A constant of a struct type: r162 `--> 4:1`, under the whole declaration rather than its type.
+@test("anchors: a constant of a struct type is refused at its declaration")
+cra_constant_storage_at_the_declaration()
+    if !azd_ready() then return
+
+    assert_eq(emitted_place("struct Id\n    raw: [16]u8\n\nconst nil: Id = Id([0; 16])\n\nprint(1)\n"),
+              "4:1 ^^^^^^^^^^^^^^^^^^^^^^^^^^^")
+
+// An attribute handed the wrong operand: r162 `--> 3:11`, `^^` under the `::`.
+@test("anchors: an attribute's operand of the wrong type is refused at the '::'")
+cra_attribute_operand_at_the_colons()
+    if !azd_ready() then return
+
+    assert_eq(emitted_place("type Slot = new u8 within 0..<8\n\nprint(Slot::Valid(Slot(3)))\n"),
+              "3:11 ^^")
+
+// A computed '@thread_local' value: r162 prints the message alone, with no `-->` line.
+@test("anchors: a computed '@thread_local' value is refused with no position")
+cra_thread_local_unplaced()
+    if !azd_ready() then return
+
+    val program = azd_program("next() -> int = 42\n\n@thread_local static var n: int = next()\n\nprint(n)\n")
+    val r = first_report(azd_cli(["sysl", "emit-typed", "--no-spans", program.1]).1)
+
+    assert_eq(r.len(), 1)
+    assert(r.at(0).starts_with("error: 'n' is '@thread_local', so its value has to be one"), r.at(0))

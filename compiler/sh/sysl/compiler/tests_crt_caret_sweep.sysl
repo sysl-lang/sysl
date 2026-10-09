@@ -45,8 +45,62 @@ deliberate(theirs: string, ours: string) -> Option[string]
     if ours.starts_with("error: a 'within' bound may not be NaN")
         return Some("a 'within' bound at 'nan' -- 'nan' is a constant here alone (wnf_)")
 
+    // The same pair from the other side: a bound at `infinity` is a constant here and none there.
+    if theirs.starts_with("error: a 'within' bound has to be a constant")
+        return Some("a 'within' bound at 'infinity' -- a constant here alone (wnf_)")
+
+    // Fixed point (`iWqF`, `uWqF`, `qN`) is a type here alone (`fx_`), so 0.0.162 knows no such type
+    // and this compiler refuses the width or the literal instead.
+    if theirs.starts_with("error: unknown type '") && fixed_spelling(theirs[21..])
+        return Some("a fixed-point type -- a type here alone (fixed.sysl)")
+
+    // A call refused in a constant is told how it could have been one -- `const` functions exist
+    // here alone (`cfn_`) -- so the message is the reference's and the advice after it.
+    if ours.starts_with(theirs) && ours.contains("is not 'const'")
+        return Some("a constant's call, advised to be 'const' -- const functions are here alone (cfn_)")
+
+    // A function named `infinity` or `nan` hides a built-in constant here (`wnf_`), and the refusal
+    // of it as a value says which.
+    if ours.starts_with(theirs) && ours.contains("The built-in constant this declaration hides")
+        return Some("a function hiding a built-in constant -- 'infinity'/'nan' are here alone (wnf_)")
+
+    // An `impl` in a `@tests` file over a type that file declares is allowed here (`tfx_`), and one
+    // over any other type is refused in words that say so.
+    if ours.starts_with("error: an 'impl' block in a file that said")
+        return Some("an 'impl' in a '@tests' file -- allowed here for the file's own types (tfx_)")
+
     None
 end deliberate
+
+// Whether a quoted type name, up to its closing quote, is a fixed-point spelling: `q` and digits, or
+// `i`/`u`, digits, `q`, digits.
+fixed_spelling(quoted: string) -> bool
+    val stop = quoted.index_of("'").unwrap_or(quoted.bytes.len)
+    val b = quoted.bytes
+    var i: usize = 0
+
+    if stop > 0 && (b[0] == u8('i') || b[0] == u8('u'))
+        i = 1
+
+        while i < stop && b[i] >= u8('0') && b[i] <= u8('9')
+            i += 1
+
+        if i == 1 then return false
+    end if
+
+    if i >= stop || b[i] != u8('q') then return false
+
+    i += 1
+
+    if i == stop then return false
+
+    while i < stop
+        if b[i] < u8('0') || b[i] > u8('9') then return false
+
+        i += 1
+
+    true
+end fixed_spelling
 
 // The first report of a rendered refusal: from its first `error:` line to the blank line that ends it
 // (or the next `error:`), each line without trailing spaces. Nothing where the text holds no error.
@@ -277,6 +331,21 @@ crt_a_deliberate_divergence_is_excused()
     assert_eq(found.differing, 0)
     assert_eq(found.excused, 1)
     assert(found.excused_reports.contains("nan: a 'within' bound at 'nan'"), found.excused_reports)
+
+@test("carets: a fixed-point spelling is told from any other type name")
+crt_fixed_spellings()
+    assert(fixed_spelling("i32q0'"), "i32q0")
+    assert(fixed_spelling("u16q8' rest"), "u16q8")
+    assert(fixed_spelling("q31'"), "q31")
+    assert(!fixed_spelling("Point'"), "Point")
+    assert(!fixed_spelling("iq3'"), "iq3")
+    assert(!fixed_spelling("q'"), "q")
+    assert(deliberate("error: unknown type 'q31'", "error: the literal 1.0 does not fit q31").is_some(), "q31")
+    assert(deliberate("error: unknown type 'Pt'", "error: something else").is_none(), "Pt")
+    assert(deliberate("error: x is not a constant expression",
+                      "error: x is not a constant expression — 'f' is not 'const', so").is_some(), "cfn")
+    assert(deliberate("error: x is not a constant expression",
+                      "error: x is not a constant expression, unlike before").is_none(), "other tail")
 
 @test("carets: the C compiler's own lines quoted into a message are not compared, the rest is")
 crt_quoted_clang_output_is_skipped()

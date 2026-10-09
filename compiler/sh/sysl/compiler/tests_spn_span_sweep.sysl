@@ -380,16 +380,56 @@ private read_differently(text: string, listed: Buf[OnlyHere]) -> bool = self_hos
     Some(c) -> read_otherwise(c)
     None -> false
 
+// **A library module `scripts/library_patches.tsv` lists is left out**, as the other sweeps excuse
+// it: it holds forms written after 0.0.162, which that compiler may read otherwise (`sysl.env`'s
+// `private extern environ` is a public name to it).
 private ast_spans_tree(binary: string, root: string, found: *SpanTally)
+    val patched = patched_modules()
+
     for item in walk(root)
         item match
             Err(_) -> ()
             Ok(entry) ->
-                if span_source(entry.path)
+                if span_source(entry.path) && !patched_library_file(entry.path, patched)
                     read_text(entry.path) match
                         Err(_) -> ()
                         Ok(text) -> ast_spans_one(binary, entry.path, text, entry.path, found)
 end ast_spans_tree
+
+// Whether a file of the in-repo library belongs to a module `library_patches.tsv` lists.
+patched_library_file(file: string, patched: Buf[string]) -> bool
+    if !file.starts_with("../library/") then return false
+
+    val name = module_of_file(file[11..])
+
+    for i in 0..<patched.len()
+        if patched.at(i) == name then return true
+
+    false
+end patched_library_file
+
+// `sysl/env/env.sysl` is `sysl.env`: the directories, joined with dots.
+private module_of_file(place: string) -> string
+    val parts = split(place, "/")
+    var out = str_builder()
+
+    for i in 0..<parts.len - 1
+        if i > 0 then out.push(".")
+
+        out.push(parts[i])
+
+    out.finish()
+end module_of_file
+
+@test("spans: a file of a patched library module is told from the rest")
+spn_a_patched_file_is_told()
+    var patched: Buf[string] = buf()
+
+    patched.push("sysl.env")
+
+    assert(patched_library_file("../library/sysl/env/env.sysl", patched), "sysl.env")
+    assert(!patched_library_file("../library/sysl/fs/fs.sysl", patched), "sysl.fs")
+    assert(!patched_library_file("sh/sysl/compiler/env.sysl", patched), "not the library")
 
 @test("spans: emit-ast with spans differs from the reference no more than the ratchet allows")
 spn_the_ast_spans_hold_the_ratchet()
