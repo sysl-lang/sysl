@@ -1730,15 +1730,16 @@ in front of it.
 This is the rule everything else follows from. `regs.status` above has type `u32` — not
 `volatile u32` — because what a load hands back is a number, and a number is not somewhere a device
 can write. What is qualified is the **place**, and the qualifier lives in the three types that name a
-place somebody else owns:
+place somebody else owns, and on the one declaration that names storage where it stands:
 
 | written | what is qualified |
 |---|---|
 | `status: volatile u32` | a struct field |
 | `bank: [4]volatile u32` | an element — a GPIO bank |
 | `p: *volatile u32` | a pointee — the lone register |
+| `var tick: volatile u64` | a module's own storage — a word an interrupt handler writes |
 
-Everywhere else the type being written is the type of a **value**: what a `var` holds, what a
+Everywhere else the type being written is the type of a **value**: what a local `var` holds, what a
 parameter receives, what a function hands back, what a type argument stands for.
 
 ```sysl
@@ -1752,7 +1753,64 @@ print(x)
 ```
 
 The diagnostic says which spelling was wanted, because a program that writes `var x: volatile u32`
-almost always meant `*volatile u32`.
+in a body almost always meant `*volatile u32`.
+
+### Module storage shared with an interrupt handler
+
+A module `var` — or a `static var` in the file a program starts in — **is** storage, named where it
+is declared, so it may be `volatile`. It is how a kernel or a bare-metal program shares a word with
+an interrupt handler before anything heavier exists: the handler writes it, the program polls it, and
+the poll has to read memory every time round.
+
+```sysl build=c target=aarch64-freestanding
+var ticks: volatile u64 = 0
+
+@export("on_timer")
+on_timer()
+    ticks += 1
+
+@export("wait_for")
+wait_for(n: u64)
+    while ticks < n do ()
+```
+
+Every read of `ticks` is one volatile load and every write one volatile store, of the whole width.
+At `-O2` the loop in `wait_for` stays a loop that loads `ticks` each time round; with a plain `var`
+the optimizer is entitled to load it once and branch to itself for ever, since nothing in the program
+it can see writes it. What a read hands back is an ordinary `u64`, and `&ticks` is a
+`*volatile u64`, exactly as `&` of a volatile field is.
+
+**`ticks += 1` is a volatile load and then a volatile store — it is NOT atomic.** An interrupt taken
+between the two, whose handler writes `ticks` as well, loses that write. That is fine where only the
+handler writes and the program only reads, which is the shape above; where both sides write, or two
+cores share the word, the tool is `Atomic[T]` from `sysl.sync`, and the qualifier says nothing about
+ordering against another core.
+
+The type is held to what a field is held to — a scalar or a raw pointer — since the promise is one
+access of the whole width. A struct is refused as a whole, and the refusal points at the spelling
+that works, a struct whose fields are volatile:
+
+```sysl target=aarch64-freestanding
+struct Counts
+    ticks: u64
+    irqs: u64
+
+static var counts: volatile Counts
+```
+
+```error
+'volatile Counts' cannot be the type of 'counts': a volatile access is one load or one store of the whole width, and 'Counts' is a struct. Write 'volatile' on its fields instead, as 'n: volatile u64', and declare the storage as a plain 'Counts'
+```
+
+A `val` is refused: it is a constant, so nothing can write it behind the program's back.
+
+```sysl target=aarch64-freestanding
+val limit: volatile u64 = 3
+```
+
+```error
+'limit' is a 'val', and a 'val' is a constant: nothing writes it once it starts, so no access to it can be one the program did not make, and 'volatile' has nothing to say. Storage an interrupt handler or a device writes is a 'var'
+```
 
 **Per field, not per aggregate.** C also allows `volatile struct Uart`; sysl does not, and the block
 above shows why. `baud` is a shadow value the driver keeps in ordinary memory beside the registers,
