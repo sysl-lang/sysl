@@ -1,0 +1,67 @@
+module sysl.process
+@requires(posix)
+
+import sysl.fs.{IoError, from_status}
+import sysl.sys.UNSUPPORTED
+import sysl.process.sys as psys
+
+// Which user and group the program runs as, and changing them.
+//
+// **An id is a `u32`, the type `sysl.fs.Meta.owner` and `Meta.group` already have**, so "is this file
+// mine" is one comparison, `metadata(p)?.owner == user()`, with nothing converted on either side.
+// POSIX's `uid_t` and `gid_t` are 32 bits unsigned on every C library this builds for.
+//
+// **`user()` and `group()` are the EFFECTIVE ids**: the ones a filesystem checks a permission against
+// and makes a new file's owner, which is what a program asking "who am I" is almost always asking. The
+// real ids -- who started the program -- are `real_user()` and `real_group()`, and differ only in a
+// program that changed who it acts as (set-user-ID, or `set_user`). A target that keeps one user per
+// process answers the same number for both.
+//
+// **A target with no users at all answers as user 0 and group 0.** Its filesystem leaves `Meta.owner`
+// zero for the same reason (`sysl.fs.sys.Stat` is zero where a supplier has nothing to say), so
+// `Meta.owner == user()` still answers the question the program asked: everything is its own.
+
+/** A `get_id` answer as the id it carries: a negative one is either `UNSUPPORTED`, a target with no
+ * users, which is user 0's, or a supplier that broke the contract -- POSIX gives these calls no error
+ * at all, so there is no `IoError` to hand back.
+ */
+private id_answer(answer: i64, which: string) -> u32
+    if answer >= 0 then return u32(answer)
+    if answer == i64(UNSUPPORTED) then return 0
+
+    panic(s"sysl.process: the 'sysl_proc_get_id' hook failed with $answer asked for the $which")
+end id_answer
+
+/** The user the program acts as: the effective user id, the one a filesystem checks a permission
+ * against and makes a new file's owner. Compare it with `sysl.fs.Meta.owner` to ask whether a file is
+ * the program's own.
+ */
+user() -> u32 = id_answer(psys.get_id(psys.id_user), "user")
+
+/** The group the program acts as: the effective group id, compared with `sysl.fs.Meta.group`. */
+group() -> u32 = id_answer(psys.get_id(psys.id_group), "group")
+
+/** The user who started the program: the real user id. It is `user()` unless the program changed
+ * who it acts as -- it is set-user-ID, or it called `set_user`.
+ */
+real_user() -> u32 = id_answer(psys.get_id(psys.id_real_user), "real user")
+
+/** The group of the user who started the program: the real group id. */
+real_group() -> u32 = id_answer(psys.get_id(psys.id_real_group), "real group")
+
+/** The program made to act as user `id`, as POSIX's `setuid`. **It is privileged**: a program acting
+ * as user 0 becomes `id` for good -- real, effective and saved ids together, so the privilege is
+ * given up rather than set aside -- and any other program may only move between the ids it already
+ * has. Anything else is `NotPermitted`.
+ *
+ * A program giving up user 0 for another user calls `set_group` FIRST: once it is no longer user 0
+ * it may not change its group either.
+ */
+set_user(id: u32) -> Result[unit, IoError] = changed(psys.set_id(psys.id_user, id))
+
+/** The program made to act as group `id`, as POSIX's `setgid`, with `set_user`'s rule: a program
+ * acting as user 0 may take any group, and any other only one it already has.
+ */
+set_group(id: u32) -> Result[unit, IoError] = changed(psys.set_id(psys.id_group, id))
+
+private changed(code: int) -> Result[unit, IoError] = if code >= 0 then Ok(()) else Err(from_status(code))
