@@ -1,0 +1,322 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, cmp, from_int}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// AArch64's system registers and barriers, as five forms: `read_sysreg("cntfrq_el0")`,
+// `write_sysreg("daif", v)`, `dsb(sy)`, `dmb(ish)` and `isb()`.
+//
+// **These are intrinsics, not assembly.** A register read is LLVM's `read_volatile_register`, a write
+// its `write_register`, a barrier `llvm.aarch64.dsb`/`dmb`/`isb` -- so the optimizer sees a call it
+// knows the effects of, and a module that is AArch64's says so once, with `#if aarch64`, instead of
+// writing an `unavailable` arm for every other processor at every register.
+//
+// **A read is the VOLATILE one.** `llvm.read_register` only reads memory as far as LLVM is concerned,
+// so two reads of `icc_iar1_el1` with no store between them are folded into one -- and that register
+// acknowledges an interrupt each time it is read. `read_volatile_register` is what clang's own
+// `__builtin_arm_rsr64` lowers to.
+//
+// **The register's name is checked against the back end that will compile it**, by compiling one
+// call to that back end: LLVM's table of AArch64 system registers is not something this compiler
+// carries, it moves with every LLVM release, and the clang the build will use is the only authority
+// on what that clang accepts. Each name is asked once per compilation, in the direction it is used
+// (`CurrentEL` reads and does not write; `icc_eoir1_el1` writes and does not read).
+//
+// **The PSTATE fields are the one table here** -- `daifclr`, `spsel` and the rest are written by
+// `msr` from an immediate in the instruction rather than from a register, so LLVM accepts them only
+// with a constant operand, crashes outright on a run-time one, and quietly keeps the low four bits of
+// a constant too wide for the field. The ten names and their ranges are the Arm architecture's
+// (`MSR (immediate)`), and a value is held to them here.
+
+// Whether a name in call position is one of these forms. Like the atomics, a function or a local of
+// the name is what a call reaches -- `isb` is short enough to be somebody's own function -- and the
+// form applies only where nothing else claims it.
+sysreg_form(cx: &Analyzer, name: string) -> bool =
+    sysreg_form_word(name) && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
+
+// The five words, whether or not anything claims them.
+sysreg_form_word(name: string) -> bool =
+    name == "read_sysreg" || name == "write_sysreg" || name == "dsb" || name == "dmb" ||
+    name == "isb"
+
+// One of the forms, analyzed.
+sysreg_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
+    val target = cx.an.tables.target
+    val here = cpu_symbol(target.cpu)
+
+    // Refused before anything else is asked, since nothing else about the call can be right on a
+    // machine without the instruction.
+    if here != "aarch64"
+        return cx.err(span, s"'$name' is an AArch64 instruction, and '${target.name}' is $here — put " +
+                      "the code that uses it behind '#if aarch64'")
+
+    if name == "read_sysreg" then return read_call(cx, span, args)
+    if name == "write_sysreg" then return write_call(cx, span, args)
+
+    barrier_call(cx, span, name, args)
+end sysreg_call
+
+// `read_sysreg("esr_el1")` -- the register's value, as a `u64`.
+private read_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 1
+        return cx.err(span, "'read_sysreg' takes one argument, the register's name — " +
+                      "read_sysreg(\"cntfrq_el0\")")
+
+    val reg = register_name(cx, "read_sysreg", args.at(0))
+
+    if reg == "" then return bad_expr(span)
+
+    val refusal = probe_register(cx, "read", reg, None)
+
+    if refusal.is_some() then return cx.err(args.at(0).span, refusal.unwrap())
+
+    TExpr(span, TSysOp("read_sysreg", reg, buf()))
+end read_call
+
+// `write_sysreg("vbar_el1", base)` -- a `u64` into the register, or a constant into a PSTATE field.
+private write_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 2
+        return cx.err(span, "'write_sysreg' takes two arguments, the register's name and the u64 " +
+                      "to write — write_sysreg(\"vbar_el1\", base)")
+
+    val reg = register_name(cx, "write_sysreg", args.at(0))
+    val wide = Integer(64, false, false)
+
+    if reg == "" then return bad_expr(span)
+
+    var values: Buf[TExpr] = buf()
+
+    val field = pstate_limit(reg)
+
+    if field.is_some()
+        val limit = field.unwrap()
+        val n = const_fold(cx, args.at(1)) match
+            Some(ConstInt(v)) -> v
+            _ ->
+                return cx.err(args.at(1).span, s"'$reg' is a PSTATE field, which 'msr' writes from " +
+                              "an immediate inside the instruction — the value has to be a constant " +
+                              s"from 0 to $limit")
+
+        if cmp(n, from_int(0)) < 0 || cmp(n, from_int(long(limit))) > 0
+            return cx.err(args.at(1).span, s"'$reg' is a PSTATE field that holds 0 to $limit, " +
+                          s"and this constant does not fit")
+
+        values.push(TExpr(args.at(1).span, TIntLit(n, wide)))
+    else
+        val v = type_expr(cx, args.at(1), Some(wide))
+
+        if texpr_type(v) == Unknown then return bad_expr(span)
+
+        if underlying(texpr_type(v)) != wide
+            return cx.err(args.at(1).span, s"'write_sysreg' writes a u64, and this value is a " +
+                          s"${type_show(texpr_type(v))} — convert it with u64(...)")
+
+        values.push(v)
+
+    val refusal = probe_register(cx, "write", reg, field)
+
+    if refusal.is_some() then return cx.err(args.at(0).span, refusal.unwrap())
+
+    TExpr(span, TSysOp("write_sysreg", reg, values))
+end write_call
+
+// The name a register is written as: a string the compiler knows, a literal or a `const`, of the
+// characters a register's name is made of. `""` once refused.
+private register_name(cx: &Analyzer, form: string, arg: Expr) -> string
+    val folded = const_fold(cx, arg)
+
+    val name = folded match
+        Some(ConstStr(s)) -> s
+        Some(_) ->
+            cx.fault(arg.span, s"'$form' takes the register's name as a string — " +
+                     s"$form(\"cntfrq_el0\")")
+            return ""
+        None ->
+            cx.fault(arg.span, s"'$form' spells the register into the instruction, so its name has " +
+                     "to be known while compiling — a string literal or a 'const', not a value " +
+                     "computed at run time")
+            return ""
+
+    if !register_shaped(name)
+        cx.fault(arg.span, s"'$name' is not a system register's name — a name is letters, digits " +
+                 "and '_', as 'cntfrq_el0' or the generic 's3_3_c14_c0_0'")
+        return ""
+
+    name
+end register_name
+
+private register_shaped(name: string) -> bool
+    if name.bytes.len == 0 then return false
+
+    for i in 0..<name.bytes.len
+        val b = name.bytes[i]
+        val letter = (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z'))
+        val digit = b >= u8('0') && b <= u8('9')
+
+        if !letter && !digit && b != u8('_') then return false
+
+    true
+end register_shaped
+
+// The largest value a PSTATE field takes, where the name is one -- `MSR (immediate)`'s fields. The
+// instruction's immediate is four bits; `ALLINT` and `PM` are single bits the architecture reserves
+// the rest of the field for.
+private pstate_limit(name: string) -> Option[int]
+    val wide = ["spsel", "daifset", "daifclr", "pan", "uao", "dit", "ssbs", "tco"]
+
+    for i in 0..<wide.len
+        if same_letters(name, wide[i]) then return Some(15)
+
+    if same_letters(name, "allint") || same_letters(name, "pm") then return Some(1)
+
+    None
+end pstate_limit
+
+// Whether two names are the same apart from case, which is how the assembler reads a register.
+private same_letters(a: string, b: string) -> bool
+    if a.bytes.len != b.bytes.len then return false
+
+    for i in 0..<a.bytes.len
+        if lower_byte(a.bytes[i]) != lower_byte(b.bytes[i]) then return false
+
+    true
+end same_letters
+
+private lower_byte(b: u8) -> u8 = if b >= u8('A') && b <= u8('Z') then b + 32 else b
+
+// `dsb(sy)`, `dmb(ish)`, `isb()`. The option is a word of the instruction -- the shareability domain
+// and the accesses ordered -- read as written rather than as a value, so a run-time choice cannot
+// reach an encoding that has to be fixed when the instruction is.
+private barrier_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
+    if name == "isb"
+        if !args.is_empty()
+            return cx.err(span, "'isb' takes no option — 'sy' is the only one the architecture " +
+                          "defines, and it is what 'isb()' is")
+
+        return TExpr(span, TSysOp("isb", "sy", buf()))
+
+    if args.len() != 1
+        return cx.err(span, s"'$name' takes one option, the domain and the accesses it orders — " +
+                      s"$name(sy) for the whole system")
+
+    val word = *args.at(0).kind match
+        Ident(w) -> w
+        _ -> ""
+
+    if barrier_option(word).is_none()
+        return cx.err(args.at(0).span, s"'$name' takes one of the architecture's options written " +
+                      s"here — ${barrier_words()} — and this is not one")
+
+    TExpr(span, TSysOp(name, word, buf()))
+end barrier_call
+
+// The twelve options and their encodings, the instruction's CRm field: the domain in the top two
+// bits (outer, non-, inner shareable, full system) and the accesses in the bottom two (loads,
+// stores, both).
+barrier_option(word: string) -> Option[int]
+    val words = barrier_word_list()
+    val codes = [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15]
+
+    for i in 0..<words.len
+        if words[i] == word then return Some(codes[i])
+
+    None
+end barrier_option
+
+private barrier_word_list() -> []const string =
+    ["oshld", "oshst", "osh", "nshld", "nshst", "nsh", "ishld", "ishst", "ish", "ld", "st", "sy"]
+
+private barrier_words() -> string =
+    "sy, st, ld, ish, ishst, ishld, nsh, nshst, nshld, osh, oshst, oshld"
+
+// -- asking the back end ---------------------------------------------------------------------------
+
+// What each probe answered this compilation, keyed by the clang, the triple, the direction and the
+// name: `""` where the back end took the register, the refusal where it did not.
+private var sysreg_answers: Buf[(string, string)] = buf()
+
+// Why the back end will not take `name` in `direction`, or `None` where it will. A PSTATE field is
+// asked with the constant form the call will have.
+private probe_register(cx: &Analyzer, direction: string, name: string,
+                       field: Option[int]) -> Option[string]
+    val t = cx.an.tables.target
+
+    val clang = find_clang(t, None) match
+        Err(why) -> return Some(s"cannot check the register's name: $why")
+        Ok(found) -> found
+
+    val key = s"$clang|${t.triple}|$direction|$name"
+
+    for i in 0..<sysreg_answers.len()
+        if sysreg_answers.at(i).0 == key
+            val said = sysreg_answers.at(i).1
+
+            return if said == "" then None else Some(said)
+
+    val answer = ask_clang(clang, t, direction, name, field.is_some())
+
+    sysreg_answers.push((key, answer))
+
+    if answer == "" then None else Some(answer)
+end probe_register
+
+// One function holding the one access, compiled for the target. `""` where it compiled.
+private ask_clang(clang: string, t: Target, direction: string, name: string, field: bool) -> string
+    val dir = make_temp_dir("sysl-sysreg") match
+        Err(_) -> return "cannot make a directory to check the register's name in"
+        Ok(made) -> made
+
+    val src = join_path(dir, "probe.ll")
+
+    write_text(src, probe_text(direction, name, field)) match
+        Err(_) ->
+            remove_dir_all(dir).unwrap_or(())
+            return s"cannot write $src"
+        Ok(_) -> ()
+
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${t.triple}")
+    args.push("-S")
+    args.push("-o")
+    args.push("-")
+    args.push(src)
+
+    val said = capture(clang, args.view(), "", [], true)
+
+    remove_dir_all(dir).unwrap_or(())
+
+    said match
+        Err(_) -> s"cannot run '$clang' to check the register's name"
+        Ok(got) ->
+            if got.status.ok() then ""
+            else if direction == "read"
+                s"LLVM's AArch64 back end has no system register '$name' it can read — the name " +
+                    "is the Arm architecture's (any case), or the generic 's<op0>_<op1>_c<n>_c<m>_<op2>'"
+            else
+                s"LLVM's AArch64 back end has no system register '$name' it can write — it may be " +
+                    "read-only, or the name is not the Arm architecture's (any case) or the generic " +
+                    "'s<op0>_<op1>_c<n>_c<m>_<op2>'"
+end ask_clang
+
+// The probe's text: the access exactly as `emit_expr.sysl` writes it.
+private probe_text(direction: string, name: string, field: bool) -> string
+    val reg = s"metadata !{!\"$name\"}"
+
+    if direction == "read"
+        return s"define i64 @probe() {\n  %v = call i64 @${llvm_sysreg_read()}($reg)\n  ret i64 %v\n}\n" +
+            s"declare i64 @${llvm_sysreg_read()}(metadata)\n"
+
+    val value = if field then "i64 0" else "i64 %v"
+
+    s"define void @probe(i64 %v) {\n  call void @${llvm_sysreg_write()}($reg, $value)\n  ret void\n}\n" +
+        s"declare void @${llvm_sysreg_write()}(metadata, i64)\n"
+end probe_text
+
+// The intrinsics' names at the one width a system register has.
+llvm_sysreg_read() -> string = llvm_read_volatile_register_entry().at([LInt(64)])
+
+llvm_sysreg_write() -> string = llvm_write_register_entry().at([LInt(64)])

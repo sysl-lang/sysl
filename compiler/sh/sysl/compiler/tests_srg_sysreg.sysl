@@ -1,0 +1,465 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// AArch64's system registers and barriers (`reference/inline-assembly.md § System registers and
+// barriers`): `read_sysreg`, `write_sysreg`, `dsb`, `dmb` and `isb`, lowered to LLVM intrinsics and
+// refused on every other processor. They exist only in this compiler, so the expectations are the
+// design's, and the encodings and instructions are the Arm architecture's, read back off
+// llvm-objdump.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private var srg_library_names: Buf[string] = buf()
+private var srg_library_units: Buf[Buf[Program]] = buf()
+
+// The library as one machine reads it, read once per machine.
+private srg_library(t: Target) -> Buf[Program]
+    for i in 0..<srg_library_names.len()
+        if srg_library_names.at(i) == t.name then return srg_library_units.at(i)
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    srg_library_names.push(t.name)
+    srg_library_units.push(out)
+    out
+end srg_library
+
+private srg_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+// The program's own errors, leaving out anything the library had to say.
+private srg_own(said: Buf[Placed]) -> Buf[Placed]
+    var out: Buf[Placed] = buf()
+    val errs = errors_of(said)
+
+    for i in 0..<errs.len()
+        if !errs.at(i).src.name.starts_with("library/") then out.push(errs.at(i))
+
+    out
+end srg_own
+
+// What a program came to on a machine: the whole report it was refused with, or nothing and its LLVM
+// text.
+private srg_build(text: string, machine: string) -> (string, string)
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+    val library = srg_library(t)
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return (parsed.report.at(0).message, "")
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), true)
+    val early = srg_own(done.reported)
+
+    if !early.is_empty() then return (analysis_report(early), "")
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = srg_own(done.an.diagnostics())
+
+    if !late.is_empty() then return (analysis_report(late), "")
+
+    ("", ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0))
+end srg_build
+
+private srg_ir(text: string) -> string
+    val b = srg_build(text, srg_arm)
+
+    assert(b.0 == "", s"expected the program to compile for $srg_arm, and it was refused:\n${b.0}")
+    b.1
+
+// The LLVM text of a program that reaches all five forms, built for aarch64 whatever the host is, or
+// the refusal -- `tests_irp_llvm_registry.sysl`'s census of what the compiler emits reads it.
+srg_every_form_ir() -> string
+    val b = srg_build("write_sysreg(\"daif\", read_sysreg(\"daif\"))\ndsb(sy)\ndmb(ish)\nisb()\n", srg_arm)
+
+    if b.0 != "" then b.0 else b.1
+end srg_every_form_ir
+
+private srg_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+// That a report holds this one diagnostic at this position.
+private srg_refused(report: string, message: string, line: int, col: int)
+    val head = s"error: $message"
+    val at = s" --> main.sysl:$line:$col\n"
+
+    assert(report.contains(head), s"expected\n$head\nin\n$report")
+    assert(report.contains(at), s"expected\n$at\nin\n$report")
+    assert_eq(report.count_of("error: "), 1)
+
+// That a program is refused for this machine, with one diagnostic holding `part`.
+private srg_refuses(machine: string, text: string, part: string)
+    val report = srg_build(text, machine).0
+
+    assert(report.contains(part), s"expected a refusal holding\n$part\nin\n$report")
+    assert_eq(report.count_of("error: "), 1)
+
+private val srg_arm: string = "aarch64-freestanding"
+
+// -- what the forms become ------------------------------------------------------------------------
+
+@test("read_sysreg is the volatile register read, the name a metadata string, the value a u64")
+srg_read_is_the_volatile_intrinsic()
+    if !srg_ready() then return
+
+    val ir = srg_ir(raw"""
+        val f: u64 = read_sysreg("cntfrq_el0")
+        print(f)
+        """)
+
+    srg_says(ir, "call i64 @llvm.read_volatile_register.i64(metadata !{!\"cntfrq_el0\"})")
+    srg_says(ir, "declare i64 @llvm.read_volatile_register.i64(metadata)")
+end srg_read_is_the_volatile_intrinsic
+
+@test("write_sysreg hands the register's name and the u64 to llvm.write_register")
+srg_write_is_write_register()
+    if !srg_ready() then return
+
+    val ir = srg_ir(raw"""
+        set_vbar(base: u64)
+            write_sysreg("vbar_el1", base)
+
+        set_vbar(0x4008_1000)
+        """)
+
+    srg_says(ir, "call void @llvm.write_register.i64(metadata !{!\"vbar_el1\"}, i64 %")
+    srg_says(ir, "declare void @llvm.write_register.i64(metadata, i64)")
+end srg_write_is_write_register
+
+@test("a PSTATE field is written with its constant in the call, which is the immediate form")
+srg_pstate_takes_a_constant()
+    if !srg_ready() then return
+
+    val ir = srg_ir(raw"""
+        const irq_bit: u64 = 2
+        write_sysreg("daifclr", irq_bit)
+        write_sysreg("DAIFSet", 15)
+        """)
+
+    srg_says(ir, "call void @llvm.write_register.i64(metadata !{!\"daifclr\"}, i64 2)")
+    srg_says(ir, "call void @llvm.write_register.i64(metadata !{!\"DAIFSet\"}, i64 15)")
+end srg_pstate_takes_a_constant
+
+@test("a register's name may be a 'const' string")
+srg_a_const_name()
+    if !srg_ready() then return
+
+    val ir = srg_ir(raw"""
+        const syndrome: string = "esr_el1"
+        print(read_sysreg(syndrome))
+        """)
+
+    srg_says(ir, "@llvm.read_volatile_register.i64(metadata !{!\"esr_el1\"})")
+end srg_a_const_name
+
+@test("every barrier option is the architecture's CRm encoding, and isb is sy")
+srg_barrier_encodings()
+    if !srg_ready() then return
+
+    val ir = srg_ir(raw"""
+        dsb(oshld)
+        dsb(oshst)
+        dsb(osh)
+        dsb(nshld)
+        dsb(nshst)
+        dsb(nsh)
+        dmb(ishld)
+        dmb(ishst)
+        dmb(ish)
+        dmb(ld)
+        dmb(st)
+        dmb(sy)
+        isb()
+        """)
+
+    srg_says(ir, "call void @llvm.aarch64.dsb(i32 1)")
+    srg_says(ir, "call void @llvm.aarch64.dsb(i32 2)")
+    srg_says(ir, "call void @llvm.aarch64.dsb(i32 3)")
+    srg_says(ir, "call void @llvm.aarch64.dsb(i32 5)")
+    srg_says(ir, "call void @llvm.aarch64.dsb(i32 6)")
+    srg_says(ir, "call void @llvm.aarch64.dsb(i32 7)")
+    srg_says(ir, "call void @llvm.aarch64.dmb(i32 9)")
+    srg_says(ir, "call void @llvm.aarch64.dmb(i32 10)")
+    srg_says(ir, "call void @llvm.aarch64.dmb(i32 11)")
+    srg_says(ir, "call void @llvm.aarch64.dmb(i32 13)")
+    srg_says(ir, "call void @llvm.aarch64.dmb(i32 14)")
+    srg_says(ir, "call void @llvm.aarch64.dmb(i32 15)")
+    srg_says(ir, "call void @llvm.aarch64.isb(i32 15)")
+    srg_says(ir, "declare void @llvm.aarch64.dsb(i32)")
+    srg_says(ir, "declare void @llvm.aarch64.dmb(i32)")
+    srg_says(ir, "declare void @llvm.aarch64.isb(i32)")
+end srg_barrier_encodings
+
+@test("a function of the name is what a call reaches: the forms yield to a declaration")
+srg_a_declaration_takes_the_name()
+    if !srg_ready() then return
+
+    val ir = srg_ir(raw"""
+        isb() -> int = 3
+        print(isb())
+        """)
+
+    assert(!ir.contains("llvm.aarch64.isb"), ir)
+end srg_a_declaration_takes_the_name
+
+@test("behind '#if aarch64' a module builds for every other processor")
+srg_behind_the_conditional()
+    if !srg_ready() then return
+
+    val b = srg_build(raw"""
+        #if aarch64
+        dsb(sy)
+        print(read_sysreg("cntfrq_el0"))
+        #endif
+        print(1)
+        """, "x86_64-linux")
+
+    assert(b.0 == "", b.0)
+    assert(!b.1.contains("llvm.aarch64"), b.1)
+end srg_behind_the_conditional
+
+// -- what the machine runs ------------------------------------------------------------------------
+
+private srg_tool(name: string, args: []const string) -> Option[string]
+    for d in [s"/opt/homebrew/opt/llvm/bin/$name", s"/usr/local/opt/llvm/bin/$name", name]
+        capture(d, args, "", [], true) match
+            Ok(r) -> if r.status.ok() then return Some(r.text)
+            Err(_) -> ()
+
+    None
+end srg_tool
+
+// The disassembly of a freestanding archive built from `src` at `opt`, or `None` with no objdump.
+private srg_disassembly(src: string, opt: string) -> Option[string]
+    val dir = make_temp_dir("sysl-srg").unwrap()
+    val main = s"$dir/main.sysl"
+    val archive = s"$dir/libk.a"
+
+    write_text(main, src).unwrap()
+
+    build_c_archive(main, Some(srg_arm), None, opt, Some(archive), None, (m) -> ()) match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            assert(false, s"the archive did not build:\n${failure_text(why)}")
+        Ok(_) -> ()
+
+    val listing = srg_tool("llvm-objdump", ["-d", archive])
+
+    remove_dir_all(dir).unwrap_or(())
+
+    if listing.is_none() then print("skipped: no llvm-objdump here")
+
+    listing
+end srg_disassembly
+
+@test("an aarch64-freestanding archive holds mrs, msr, msr-immediate, dsb sy, dmb ish and isb")
+srg_the_archive_holds_the_instructions()
+    if !srg_ready() then return
+
+    val listing = srg_disassembly(raw"""
+        @export("kmain")
+        kmain(base: u64) -> u64
+            write_sysreg("vbar_el1", base)
+            isb()
+            write_sysreg("daifclr", 2)
+            dsb(sy)
+            dmb(ish)
+            read_sysreg("cntfrq_el0")
+        """, "0")
+
+    if listing.is_none() then return
+
+    val text = listing.unwrap()
+
+    srg_says(text, "msr\tVBAR_EL1, x")
+    srg_says(text, "isb")
+    srg_says(text, "msr\tDAIFClr, #0x2")
+    srg_says(text, "dsb\tsy")
+    srg_says(text, "dmb\tish")
+    srg_says(text, "mrs\tx")
+    srg_says(text, ", CNTFRQ_EL0")
+end srg_the_archive_holds_the_instructions
+
+@test("two reads are two mrs even optimized: acknowledging an interrupt is a read with an effect")
+srg_two_reads_stay_two()
+    if !srg_ready() then return
+
+    val listing = srg_disassembly(raw"""
+        @export("ack_twice")
+        ack_twice() -> u64 = read_sysreg("icc_iar1_el1") + read_sysreg("icc_iar1_el1")
+        """, "2")
+
+    if listing.is_none() then return
+
+    assert_eq(srg_body(listing.unwrap(), "ack_twice").count_of("ICC_IAR1_EL1"), 2)
+end srg_two_reads_stay_two
+
+// The disassembly of one symbol: the lines after its `<name>:` header up to the blank line ending it.
+private srg_body(listing: string, name: string) -> string
+    val lines = lines_of(listing)
+    var out = ""
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.ends_with(s"<$name>:")
+            inside = true
+        elif inside && line.trim() == ""
+            inside = false
+        elif inside
+            out = out + line + "\n"
+
+    out
+end srg_body
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("a name the back end has no register for is refused at the name, not by LLVM")
+srg_unknown_name()
+    if !srg_ready() then return
+
+    srg_refused(srg_build("print(read_sysreg(\"bogus_el1\"))\n", srg_arm).0,
+                "LLVM's AArch64 back end has no system register 'bogus_el1' it can read", 1, 19)
+end srg_unknown_name
+
+@test("a register is checked in the direction it is used: CurrentEL reads and icc_eoir1_el1 writes")
+srg_direction_is_checked()
+    if !srg_ready() then return
+
+    assert_eq(srg_build("print(read_sysreg(\"CurrentEL\"))\n", srg_arm).0, "")
+    assert_eq(srg_build("write_sysreg(\"icc_eoir1_el1\", 27)\n", srg_arm).0, "")
+
+    srg_refuses(srg_arm, "write_sysreg(\"CurrentEL\", 4)\n",
+                "no system register 'CurrentEL' it can write — it may be read-only")
+    srg_refuses(srg_arm, "print(read_sysreg(\"icc_eoir1_el1\"))\n",
+                "no system register 'icc_eoir1_el1' it can read")
+end srg_direction_is_checked
+
+@test("the generic s<op0>_<op1>_c<n>_c<m>_<op2> spelling is a name the back end takes")
+srg_generic_name()
+    if !srg_ready() then return
+
+    val ir = srg_ir("print(read_sysreg(\"s3_3_c14_c0_0\"))\n")
+
+    srg_says(ir, "metadata !{!\"s3_3_c14_c0_0\"}")
+end srg_generic_name
+
+@test("a name computed at run time is refused: it is spelled into the instruction")
+srg_non_literal_name()
+    if !srg_ready() then return
+
+    srg_refused(srg_build(raw"""
+        val which = "esr_el1"
+        print(read_sysreg(which))
+        """, srg_arm).0,
+                "'read_sysreg' spells the register into the instruction, so its name has to be " +
+                "known while compiling", 2, 19)
+end srg_non_literal_name
+
+@test("a name that is not a string, or not shaped like a register's, is refused")
+srg_name_shape()
+    if !srg_ready() then return
+
+    srg_refuses(srg_arm, "print(read_sysreg(5))\n", "'read_sysreg' takes the register's name as a string")
+    srg_refuses(srg_arm, "print(read_sysreg(\"esr_el1\\\"})\"))\n",
+                "is not a system register's name — a name is letters, digits and '_'")
+    srg_refuses(srg_arm, "print(read_sysreg(\"\"))\n", "is not a system register's name")
+end srg_name_shape
+
+@test("every form is refused on a processor that is not aarch64, naming the target")
+srg_wrong_target()
+    if !srg_ready() then return
+
+    srg_refused(srg_build("print(read_sysreg(\"cntfrq_el0\"))\n", "x86_64-linux").0,
+                "'read_sysreg' is an AArch64 instruction, and 'x86_64-linux' is x86_64 — put the code " +
+                "that uses it behind '#if aarch64'", 1, 7)
+    srg_refuses("riscv64-freestanding", "write_sysreg(\"daif\", 0)\n",
+                "'write_sysreg' is an AArch64 instruction, and 'riscv64-freestanding' is riscv64")
+    srg_refuses("thumbv6m-freestanding", "dsb(sy)\n", "'dsb' is an AArch64 instruction")
+    srg_refuses("wasm32-freestanding", "dmb(ish)\n", "'dmb' is an AArch64 instruction")
+    srg_refuses("x86_64-linux", "isb()\n", "'isb' is an AArch64 instruction")
+end srg_wrong_target
+
+@test("write_sysreg takes a u64, and a narrower value is refused with the conversion to write")
+srg_wrong_value_type()
+    if !srg_ready() then return
+
+    srg_refused(srg_build(raw"""
+        set(x: u32)
+            write_sysreg("vbar_el1", x)
+        set(1)
+        """, srg_arm).0,
+                "'write_sysreg' writes a u64, and this value is a uint — convert it with u64(...)", 2, 30)
+    srg_refuses(srg_arm, "write_sysreg(\"vbar_el1\", true)\n", "'write_sysreg' writes a u64")
+end srg_wrong_value_type
+
+@test("the forms are held to their arity")
+srg_arity()
+    if !srg_ready() then return
+
+    srg_refuses(srg_arm, "print(read_sysreg())\n", "'read_sysreg' takes one argument, the register's name")
+    srg_refuses(srg_arm, "write_sysreg(\"daif\")\n", "'write_sysreg' takes two arguments")
+    srg_refuses(srg_arm, "dsb()\n", "'dsb' takes one option")
+    srg_refuses(srg_arm, "isb(sy)\n", "'isb' takes no option")
+end srg_arity
+
+@test("a PSTATE field takes a constant that fits it, since the value is the instruction's immediate")
+srg_pstate_refusals()
+    if !srg_ready() then return
+
+    srg_refused(srg_build(raw"""
+        mask(m: u64)
+            write_sysreg("daifset", m)
+        mask(2)
+        """, srg_arm).0,
+                "'daifset' is a PSTATE field, which 'msr' writes from an immediate inside the " +
+                "instruction — the value has to be a constant from 0 to 15", 2, 29)
+    srg_refuses(srg_arm, "write_sysreg(\"daifclr\", 16)\n",
+                "'daifclr' is a PSTATE field that holds 0 to 15, and this constant does not fit")
+    srg_refuses(srg_arm, "write_sysreg(\"PAN\", 99)\n", "holds 0 to 15")
+end srg_pstate_refusals
+
+@test("a barrier's option is one of the architecture's twelve words, written at the call")
+srg_barrier_option_refused()
+    if !srg_ready() then return
+
+    srg_refused(srg_build("dsb(full)\n", srg_arm).0,
+                "'dsb' takes one of the architecture's options written here — sy, st, ld, ish, " +
+                "ishst, ishld, nsh, nshst, nshld, osh, oshst, oshld — and this is not one", 1, 5)
+    srg_refuses(srg_arm, "dmb(15)\n", "'dmb' takes one of the architecture's options")
+    srg_refuses(srg_arm, "dmb(SY)\n", "'dmb' takes one of the architecture's options")
+end srg_barrier_option_refused
+
+@test("an import naming one of the forms is told it is a built-in form")
+srg_import_names_a_form()
+    if !srg_ready() then return
+
+    srg_refuses(srg_arm, "import sysl.isb\nisb()\n", "'isb' is a built-in form rather than a member of any module")
+end srg_import_names_a_form

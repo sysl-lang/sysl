@@ -105,6 +105,19 @@ private coro_ops() -> []const string =
 llvm_library_floats() -> []const string =
     ["llvm.ceil", "llvm.copysign", "llvm.fabs", "llvm.floor", "llvm.round", "llvm.sqrt", "llvm.trunc"]
 
+// An AArch64 system register read or written, by the name its metadata operand carries
+// (`sysreg.sysl`). The read is the volatile one, which LLVM may not fold or move.
+llvm_read_volatile_register_entry() -> LlvmIntrinsic = LlvmIntrinsic("llvm.read_volatile_register")
+
+llvm_write_register_entry() -> LlvmIntrinsic = LlvmIntrinsic("llvm.write_register")
+
+// AArch64's three barriers, each taking its option's encoding.
+llvm_aarch64_barrier_entry(op: string) -> Result[LlvmIntrinsic, string] =
+    if contains_name(barrier_ops(), op) then Ok(LlvmIntrinsic(s"llvm.aarch64.$op"))
+    else Err(s"no AArch64 barrier '$op' is declared; there are 'dsb', 'dmb' and 'isb'")
+
+private barrier_ops() -> []const string = ["dsb", "dmb", "isb"]
+
 // -- the reserved globals ---------------------------------------------------------------------------
 
 // The list the platform's loader runs before `main`.
@@ -143,6 +156,9 @@ llvm_callable() -> Buf[string]
     push_family(&out, bit_ops(), "llvm.")
     push_family(&out, reduce_ops(), "llvm.vector.reduce.")
     push_family(&out, coro_ops(), "llvm.coro.")
+    push_family(&out, barrier_ops(), "llvm.aarch64.")
+    out.push(llvm_read_volatile_register_entry().base)
+    out.push(llvm_write_register_entry().base)
 
     for i in 0..<sat_ops().len
         out.push(s"llvm.${sat_ops()[i]}.sat")
