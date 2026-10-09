@@ -377,7 +377,7 @@ tma_an_operand_is_refused()
     val report = tma_err(tma_arm, src)
 
     tma_says(report, "'n' cannot be an operand here: an 'asm' block at the top of a file is outside every function")
-    tma_says(report, "'{n}' names an operand, and an 'asm' block at the top of a file has none")
+    tma_says(report, "'{n}' names no constant")
 end tma_an_operand_is_refused
 
 @test("an operand is refused in an arm this build does not choose, too")
@@ -417,7 +417,7 @@ tma_clobbers_is_refused()
     tma_refused(tma_err(tma_arm, src), "'clobbers' tells the code around an 'asm' block which registers it destroys", 2, 5, 1)
 end tma_clobbers_is_refused
 
-@test("a placeholder is refused, and the doubled brace is offered")
+@test("a placeholder naming no constant is refused, in an arm this build does not choose too, and the doubled brace is offered")
 tma_a_placeholder_is_refused()
     if !tma_ready() then return
 
@@ -429,8 +429,117 @@ tma_a_placeholder_is_refused()
         print(1)
         """
 
-    tma_refused(tma_err(tma_arm, src), "'{lr}' names an operand, and an 'asm' block at the top of a file has none. Write '{{' and '}}'", 2, 5, 1)
+    tma_refused(tma_err(tma_arm, src), "'{lr}' names no constant: an 'asm' block at the top of a file writes a 'const' in scope as '{NAME}', and nothing here is called that. Write '{{' and '}}' for a brace the assembler is to see", 2, 5, 1)
 end tma_a_placeholder_is_refused
+
+// -- constants written into the text --------------------------------------------------------------
+
+@test("a 'const' written '{NAME}' is laid into the text as its decimal value")
+tma_a_constant_is_written_as_its_value()
+    if !tma_ready() then return
+
+    val src = raw"""
+        const FRAME: usize = 272
+        const BACK: int = -16
+
+        asm
+            [aarch64]
+                "sub sp, sp, #{FRAME}"
+                "stp x0, x1, [sp, #{BACK}]!"
+                "add sp, sp, #{FRAME} // {{FRAME}} is a brace pair"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(1)
+        """
+    val arm = tma_ir(tma_arm, src)
+
+    tma_says(arm, "module asm \"sub sp, sp, #272\"\nmodule asm \"stp x0, x1, [sp, #-16]!\"\n")
+    tma_says(arm, "module asm \"add sp, sp, #272 // {FRAME} is a brace pair\"\n")
+end tma_a_constant_is_written_as_its_value
+
+@test("'sizeof' and 'offsetof' constants are written as the numbers they fold to")
+tma_layout_constants()
+    if !tma_ready() then return
+
+    val src = raw"""
+        struct Frame
+            regs: [30]u64
+            elr: u64
+            spsr: u64
+
+        const FRAME: usize = sizeof(Frame)
+        const ELR: usize = offsetof(Frame, elr)
+        const SPSR: usize = offsetof(Frame, spsr)
+
+        asm
+            [aarch64]
+                "sub sp, sp, #{FRAME}"
+                "str x0, [sp, #{ELR}]"
+                "str x1, [sp, #{SPSR}]"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(1)
+        """
+
+    tma_says(tma_ir(tma_arm, src),
+             "module asm \"sub sp, sp, #256\"\nmodule asm \"str x0, [sp, #240]\"\nmodule asm \"str x1, [sp, #248]\"\n")
+end tma_layout_constants
+
+@test("a placeholder naming storage is refused: its value exists only while the program runs")
+tma_storage_is_not_a_constant()
+    if !tma_ready() then return
+
+    val src = raw"""
+        static var depth: u64 = 0
+
+        asm
+            [aarch64] "mov x0, #{depth}"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(depth)
+        """
+
+    tma_refused(tma_err(tma_arm, src), "'{depth}' is not a constant: it names storage, whose value exists only while the program runs, and the text of an 'asm' block at the top of a file is settled while compiling. Declare it 'const' to write its value here, or name the storage's symbol in the instructions, '@export'ing it", 4, 5, 1)
+end tma_storage_is_not_a_constant
+
+@test("a placeholder naming a function is refused, and its symbol is offered")
+tma_a_function_is_not_a_constant()
+    if !tma_ready() then return
+
+    val src = raw"""
+        handler() -> int = 7
+
+        asm
+            [aarch64] "bl {handler}"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(handler())
+        """
+
+    tma_refused(tma_err(tma_arm, src), "'{handler}' is not a constant: it names a function. Name the function's symbol in the instructions instead, '@export'ing it", 4, 5, 1)
+end tma_a_function_is_not_a_constant
+
+@test("a placeholder naming a constant that is not an integer is refused")
+tma_a_non_integer_constant()
+    if !tma_ready() then return
+
+    val src = raw"""
+        const NAME: string = "keel"
+        const ON: bool = true
+
+        asm
+            [aarch64]
+                ".ascii {NAME}"
+                "mov x0, #{ON}"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        print(1)
+        """
+    val report = tma_err(tma_arm, src)
+
+    tma_refused(report, "'{NAME}' is a string, and only an integer constant can be written into the instructions, as its decimal value", 5, 5, 2)
+    tma_says(report, "'{ON}' is a boolean, and only an integer constant can be written into the instructions, as its decimal value")
+end tma_a_non_integer_constant
 
 @test("'unavailable' carries its reason to the processor that has none")
 tma_unavailable_carries_its_reason()
@@ -591,6 +700,58 @@ tma_the_archive_carries_the_symbol()
         None -> ()
         Some(table) -> assert(tma_any_line(table, ".text.boot", "AX", " 2048"), table)
 end tma_the_archive_carries_the_symbol
+
+@test("a constant written into the text is the instruction's immediate in the object file")
+tma_the_object_carries_the_constant()
+    if !tma_ready() then return
+
+    val src = raw"""
+        struct Frame
+            regs: [30]u64
+            elr: u64
+            spsr: u64
+
+        const FRAME: usize = sizeof(Frame) + 16
+        const ELR: usize = offsetof(Frame, elr)
+
+        @section(".text.boot")
+        asm
+            [aarch64]
+                ".globl entry"
+                "entry:"
+                "sub sp, sp, #{FRAME}"
+                "str x0, [sp, #{ELR}]"
+                "b ."
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+        @export("kmain")
+        kmain() -> int = 7
+        """
+    val dir = make_temp_dir("sysl-tma").unwrap()
+    val main = s"$dir/main.sysl"
+    val archive = s"$dir/libk.a"
+
+    write_text(main, src).unwrap()
+
+    build_c_archive(main, Some(tma_arm), None, "0", Some(archive), None, (m) -> ()) match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            assert(false, s"the archive did not build:\n${failure_text(why)}")
+        Ok(_) -> ()
+
+    val code = tma_tool("llvm-objdump", ["-d", "--section=.text.boot", archive])
+
+    remove_dir_all(dir).unwrap_or(())
+
+    if code.is_none()
+        print("skipped: no llvm-objdump here")
+        return
+    end if
+
+    // 256 + 16 and 240, which llvm-objdump prints in hexadecimal.
+    assert(tma_any_line(code.unwrap(), "sub", "sp, sp", "#0x110"), code.unwrap())
+    assert(tma_any_line(code.unwrap(), "str", "x0, [sp", "#0xf0]"), code.unwrap())
+end tma_the_object_carries_the_constant
 
 // Whether a line of a listing holds the first two texts and ends with the third.
 private tma_any_line(listing: string, a: string, b: string, last: string) -> bool

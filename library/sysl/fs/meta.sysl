@@ -156,14 +156,13 @@ struct Meta
     same_file(self, other: Meta) -> bool = self.inode == other.inode && self.device == other.device
 end Meta
 
-// **The reading surface is POSIX's, and is declared only on a POSIX target.** `Meta` and `Kind` above
-// are plain data and exist on every target; what needs a `#if` is the four calls that ask. A target
-// without them gets an undefined name at the call, which says what is true -- rather than a `Result`
-// that is always an error, which would say the file was not there.
-//
-// A Windows reading would not be this shape anyway: there is no inode, no owner and no group, and
-// the permission bits are not twelve. That is a `Meta` of its own when somebody wants one.
-#if posix
+// **The reading surface is declared wherever `sysl.fs` is**, because it is written over `sysl.fs.sys`
+// alone: `metadata` and `link_metadata` are one `stat` hook into the thirteen numbers of
+// `sysl.fs.sys.Stat`, and `set_permissions` one `chmod` hook. Whoever supplies those hooks -- a C
+// library on a hosted target, a program's own `@export`s on a bare one -- fills POSIX's shape, and
+// leaves zero what it has nothing to say about. A supplier that cannot answer a hook at all answers
+// `-1`, and the call reports `Other(-1)`, "not supported on this target", rather than the file being
+// missing.
 
 /** Everything one `stat` answers about what a path names, following symbolic links.
  *
@@ -212,8 +211,6 @@ private stat_of(path: string, follow: int) -> Result[Meta, IoError]
             u64(st.device), at(st.modified_s, st.modified_ns), at(st.accessed_s, st.accessed_ns),
             at(st.changed_s, st.changed_ns)))
 end stat_of
-
-#endif
 
 /** A POSIX timestamp as an `Instant`. The nanoseconds are divided rather than dropped, so a file
  * written twice within a second is still ordered as long as the filesystem recorded it that way.

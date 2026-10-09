@@ -436,7 +436,7 @@ invariant.
 |---|---|
 | an out-of-bounds array or slice index | `xs[5]` on a `[3]int` |
 | an inverted or out-of-range slice range | `xs[3..1]`, `xs[0..9]` |
-| a checked cast that fails | `char(u)` on an invalid scalar, `Color(n)` on an undeclared discriminant, a bitfield's enum field holding one |
+| a checked cast that fails | `char(u)` on an invalid scalar, `Color(n)` on an undeclared discriminant, a bitfield's enum field holding one — each enum form has a fallible twin, `Color.try(n)` and `Color.try(s.field)`, [below](#turning-a-trap-back-into-a-value) |
 | an integer divide by zero | `n / 0`, `n % 0` |
 | a violated `require` or `ensure` | below |
 | a violated struct `invariant` | below |
@@ -585,6 +585,35 @@ byte 9 is not a Color
 
 `Color(9)` would have trapped. `Color.try(9)` hands back a `None` this function turns into a reason,
 and the byte off the wire stops being a bug in the program and starts being a value it handles.
+
+**The same form reads a bitfield's enum field fallibly.** Reading the field is the checked cast and
+traps on bits no variant has; handed to `try` as it is, the field's bits are read unchecked and
+answered for:
+
+```sysl
+enum Ec: u6
+    Unknown = 0x00
+    Brk = 0x3c
+
+@packed
+struct Esr
+    low: u26
+    ec: Ec
+    high: u32
+
+var raw: u64 = u64(0x2a) << 26
+val e: *Esr = ptr_cast(&raw)
+
+print(Ec.try(e.ec).is_none())
+```
+
+```output
+true
+```
+
+[`attributes.md`](/reference/attributes/#bitfields-an-in-field-in-exactly-n-bits) has the field
+rule. A value of the enum read anywhere else is already one of its variants, so `try` takes an
+integer or such a field and nothing else.
 
 For a constrained type the equivalent is `T::Valid`, below.
 

@@ -331,7 +331,8 @@ print(find_byte("a,b".bytes, u8(',')).unwrap(), find_byte("abc".bytes, u8('z')).
 
 That function is [what pointer difference is for](/reference/memory/): `memchr` answers *where* with
 an address, and an index is that address minus the first. It is public because a program scanning for
-a delimiter of its own wants exactly it.
+a delimiter of its own wants exactly it. On a target with no C library there is no `memchr` to call,
+so there it walks the bytes, and the answer is the same.
 
 **An empty read ends the cursor for good.** A caller reading again past the end gets `None` every
 time rather than a second chance, which is right for the sources `read(2)` serves.
@@ -516,10 +517,27 @@ if r.failed() then print("input ended badly")
 zero, and `fd_reader(fd)` takes any other. `FdReader` is the **only** reader the library supplies —
 the mirror of [`ByteSink`](/library/buf/) being the only writer that keeps what it is given.
 
-**That symmetry is what makes the freestanding story two functions long.** The seams a target with no
-C library replaces are exactly `putbytes`' body and `FdReader.read`'s. Swap those two for a `write`
-and a `read` syscall and everything above them is unchanged: every renderer, every `Display`, the
-whole of `lines`, and every `impl Reader` a program wrote for itself.
+**That symmetry is what makes the freestanding story short.** `FdReader` reads through one hook,
+`sysl_io_read` in `sysl.io.sys`, and `flush` pushes standard output out through another,
+`sysl_io_flush`; on a hosted target the library answers both over C's `read` and `fflush`. A target
+with no C library answers them itself, with an `@export` each, beside the `putchar` that `print`
+writes through — a `read` system call is usually the whole of the first, and the second answers zero
+where nothing is held back:
+
+```sysl
+@export("sysl_io_read")
+console_read(fd: int, into: *u8, room: usize) -> isize = 0
+
+@export("sysl_io_flush")
+console_flush(fd: int) -> int = 0
+```
+
+Each answers what it did — a count of bytes, or zero — or the code of what went wrong, negated, so a
+kernel call that already answers a negative error number is the hook as it stands. **A hook the program
+reaches and leaves unanswered is refused when it is compiled**, naming every such hook and only those
+it reaches, rather than surfacing at the link as a symbol nobody wrote. Everything above the hooks is
+unchanged: every renderer, every `Display`, the whole of `lines`, and every `impl Reader` a program
+wrote for itself.
 
 ---
 

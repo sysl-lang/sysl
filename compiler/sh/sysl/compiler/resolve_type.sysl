@@ -2232,10 +2232,12 @@ end instantiate_named_subtype
 // so `type L[T] = Option[L[T]]` comes round to `L[T]` again and is refused rather than unrolled.
 private instantiate_generic_alias(a: &Analysis, scope: Scope, span: Span, key: string, d: TypeDecl,
                                   home: Scope, written_targs: Buf[Type]) -> Type
-    if !is_plain_alias(d) || !d.tp.packs.is_empty() then return Unknown
+    val phantom = is_phantom_new(d)
+
+    if (!is_plain_alias(d) && !phantom) || !d.tp.packs.is_empty() then return Unknown
 
     if !check_arity(a, scope, span, qualified_name(key), d.tp.names, d.tp.defaults, written_targs,
-                    "alias") then
+                    if phantom then "type" else "alias") then
         return Unknown
 
     val fill = filled_targs(a, scope, span, key, home, d.tp.names, d.tp.defaults, d.tp.values,
@@ -2246,6 +2248,8 @@ private instantiate_generic_alias(a: &Analysis, scope: Scope, span: Span, key: s
     val targs = fill.unwrap()
 
     val checked = applied_bounds(a, scope, span, key, home, d.tp.names, d.tp.bounds, targs)
+
+    if phantom then return applied_new_type(a, scope, span, key, d, home, targs)
 
     val inst = instance_key(key, targs)
     val already = a.tables.constrained_insts.get(inst)
@@ -2275,6 +2279,44 @@ private instantiate_generic_alias(a: &Analysis, scope: Scope, span: Span, key: s
     a.tables.constrained_insts.put(inst, made)
     made
 end instantiate_generic_alias
+
+// A `new` type declared with parameters, at these arguments: **a type of its own per application,
+// laid out as its base**. The parameters are phantom -- the base is a scalar, so nothing in the layout
+// mentions them -- and what they buy is typing: `UserPtr[Frame]` will not pass where a `UserPtr[u8]`
+// is wanted, and a generic function reads `T` back off a `UserPtr[T]` (`unify_named`).
+//
+// **The instantiation is keyed on the arguments made nameless**, as a struct's is, so a name that is
+// only a second spelling of a type does not split it: `UserPtr[Size]` over a measured `Size` is
+// `UserPtr[u64]`. A `new` argument is a type of its own and keeps its own instantiation.
+private applied_new_type(a: &Analysis, scope: Scope, span: Span, key: string, d: TypeDecl, home: Scope,
+                         targs: Buf[Type]) -> Type
+    val args = nameless_all(targs)
+    val inst = instance_key(key, args)
+    val already = a.tables.constrained_insts.get(inst)
+
+    if already.is_some() then return already.unwrap()
+
+    // A base that names the type itself comes round to this application again, and is refused where
+    // it is declared rather than followed until the stack runs out.
+    if a.tables.broken.get(inst).is_some()
+        a.fault(home, declared_at(a, key, span), s"'${d.name}' is defined in terms of itself")
+        return Unknown
+    end if
+
+    a.tables.broken.put(inst, true)
+
+    val base = resolve_type(a, home, d.base, bindings_for(d.tp.names, args))
+
+    a.tables.broken.remove(inst)
+
+    // A base that is not a scalar was refused where the declaration was read (`read_generic_alias`).
+    if type_eq(base, Unknown) || !scalar_base(base) then return Unknown
+
+    val made = constrained_applied(inst, key, args, base)
+
+    a.tables.constrained_insts.put(inst, made)
+    made
+end applied_new_type
 
 // The number a written range end stands for, where it settles at all. A `within` may be written over
 // floats as well as integers, so a decimal literal is read as the text it is -- `0.1` the decimal
@@ -2354,7 +2396,7 @@ private declared_at(a: &Analysis, key: string, fallback: Span) -> Span = a.table
     None -> fallback
 
 // The bases a subtype may narrow or derive from.
-private scalar_base(t: Type) -> bool = underlying(t) match
+scalar_base(t: Type) -> bool = underlying(t) match
     Integer(_, _, _) -> true
     Floating(_, _) -> true
     Fixed(_, _, _) -> true
@@ -2677,6 +2719,13 @@ end folds_to_nan
 // interchangeable with its base in both directions, as before.
 is_plain_alias(d: TypeDecl) -> bool =
     !d.derived && d.range.is_none() && d.pred.is_none() && !d.from_c && d.cname.is_none() &&
+        d.wrapping.is_none()
+
+// Whether a declaration is a `new` type and nothing more -- no range, no `where`, no `wrapping`, no
+// `@export` -- which is the one kind besides a transparent alias that may take type parameters: it
+// checks nothing, so an argument has no range or check to disagree with, and it names no header type.
+is_phantom_new(d: TypeDecl) -> bool =
+    d.derived && d.range.is_none() && d.pred.is_none() && !d.from_c && d.cname.is_none() &&
         d.wrapping.is_none()
 
 // Whether a declaration is an alias a C header is asked to declare as a `typedef`.

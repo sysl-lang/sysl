@@ -229,7 +229,7 @@ cannot be forgotten rather than merely being unwise to forget.
 
 The one place a `&T` reads as null is storage the language did not lay out and the program zeroed —
 [below](#storage-the-compiler-did-not-lay-out-may-not-hold-a-counted-value), with `is_null`, the raw
-tier's question for it.
+tier's question for it, and `release`, the way such a field is emptied again.
 
 ### What a heap object costs
 
@@ -1660,21 +1660,45 @@ s.item = Item("a")
 
 print(is_null(s.item), s.item.label)
 
-val empty: *Slot = ptr_cast(c_calloc(1, sizeof(Slot)))
+release(s.item)
 
-s.item = empty.item
+print(is_null(s.item))
 
 c_free(ptr_cast(s))
-c_free(ptr_cast(empty))
 ```
 
 ```output
 true
 false a
+true
 ```
 
 The storage is still the program's to free, and freeing it releases nothing: a counted field there is
-given back by assigning over it, or — for a container — by its `release()`, before the block goes.
+given back before the block goes, and **`release(place)` is how** — `is_null`'s other half. It gives
+back the share the `&T` place held, running the destructor when that was the last one, and leaves the
+place naming nothing, exactly as the zeroed storage started; nothing is allocated, which is why a
+finalizer calls it rather than assigning a fresh value it would only lose. A place released twice gives
+back nothing the second time, and one released may be assigned again. A container gives its share back
+through its own `release()` member, and an `Option` or a `weak T` is emptied by assigning `None`, so
+`release` is refused on those — and on anything that is not a place, or not a counted reference at all:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Holder
+    names: Buf[string]
+
+val h = Holder(buf())
+
+release(h.names)
+```
+
+```error
+'release' gives back what a '&T' place holds, and sysl.buf.Buf[string] gives its share back through its own member — call '.release()' on it
+```
+
+Like `is_null`, it is a form the compiler answers only where nothing else claims the name: a function
+or a local called `release` is what a call reaches.
 
 **Keep an index, a raw pointer, or a copy instead.** An arena of nodes linked by index is the
 ordinary answer, and it costs nothing a box was buying:

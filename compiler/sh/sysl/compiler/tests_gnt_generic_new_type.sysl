@@ -1,0 +1,154 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// `type UserPtr[T] = new u64` -- a `new` type that takes type parameters (`reference/declarations.md
+// § Type declarations`). The parameters are phantom: they make `UserPtr[Frame]` and `UserPtr[u8]` two
+// types, and change nothing about how either is laid out, which is the base's. A range, a `where`,
+// `wrapping` or `@export` still takes none.
+
+// Everything a one-file program has to say for itself, taken through the lowering.
+private gnt_err(text: string) -> string
+    val root = make_temp_dir("sysl-gnt").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gnt_err
+
+// The LLVM text of a program that must compile.
+private gnt_ir(text: string) -> string
+    val root = make_temp_dir("sysl-gnt").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gnt_ir
+
+private gnt_refuses(text: string, part: string)
+    val said = gnt_err(text)
+
+    assert(said.index_of(part).is_some(), s"expected '$part', got: $said")
+
+private gnt_decls() -> string = raw"""
+    struct Frame
+        sp: u64
+        pc: u64
+
+    type UserPtr[T] = new u64
+
+    """
+
+// ---- declaring one, and converting both ways ------------------------------------------------------
+
+@test("a 'new' type takes a parameter, and converts from and to its base")
+gnt_declare_and_convert()
+    if !twp_ready() then return
+
+    twp_prints(gnt_decls() + "val p = UserPtr[Frame](4096)\nval q: UserPtr[u8] = UserPtr(8192)\n" +
+               "print(u64(p), u64(q))\n", "4096 8192\n")
+
+@test("a call with nothing to say what the parameter is, is refused")
+gnt_bare_call_is_refused() =
+    gnt_refuses(gnt_decls() + "val p = UserPtr(4096)\n",
+                "'UserPtr' takes type parameters, and nothing here says what they are — write them, " +
+                "as 'UserPtr[…](…)'")
+
+// ---- the argument is part of the type --------------------------------------------------------------
+
+@test("a UserPtr[A] is refused where a UserPtr[B] is wanted")
+gnt_other_argument_is_refused() =
+    gnt_refuses(gnt_decls() + "take(p: UserPtr[Frame]) -> u64 = u64(p)\n\n" +
+                "print(take(UserPtr[u8](1)))\n",
+                "'p' of 'take' is UserPtr[Frame], but UserPtr[byte] was given")
+
+@test("nor is it its base, in either direction")
+gnt_base_is_refused() =
+    gnt_refuses(gnt_decls() + "take(p: UserPtr[Frame]) -> u64 = u64(p)\n\nval n: u64 = 1\n\n" +
+                "print(take(n))\n",
+                "'p' of 'take' is UserPtr[Frame], but ulong was given")
+
+@test("an argument that is only a second name for a type is that type")
+gnt_name_only_argument_is_its_base()
+    if !twp_ready() then return
+
+    twp_prints(gnt_decls() + "@export\ntype Word = u64\n\ntake(p: UserPtr[u64]) -> u64 = u64(p)\n\n" +
+               "print(take(UserPtr[Word](7)))\n", "7\n")
+
+// ---- generic functions over one --------------------------------------------------------------------
+
+@test("a generic function reads T back off a UserPtr[T], once per argument")
+gnt_generic_infers_t()
+    if !twp_ready() then return
+
+    twp_prints(gnt_decls() +
+               "size_at[T](p: UserPtr[T]) -> usize = sizeof(T)\n\n" +
+               "next[T](p: UserPtr[T]) -> UserPtr[T] = UserPtr[T](u64(p) + u64(sizeof(T)))\n\n" +
+               "val f = UserPtr[Frame](4096)\nval b = UserPtr[u8](4096)\n" +
+               "print(size_at(f), size_at(b), u64(next(f)), u64(next(b)))\n",
+               "16 1 4112 4097\n")
+
+@test("a generic function's bound is held at the argument a UserPtr[T] carries")
+gnt_generic_bound_is_held() =
+    gnt_refuses(gnt_decls() + "show[T: Display](p: UserPtr[T]) -> u64 = u64(p)\n\n" +
+                "print(show(UserPtr[Frame](1)))\n",
+                "requires its type parameter 'T' to implement 'sysl.Display', but Frame does not")
+
+@test("a bound on the type's own parameter is held where it is applied")
+gnt_own_bound_is_held() =
+    gnt_refuses("struct Frame\n    sp: u64\n\ntype Shown[T: Display] = new u64\n\n" +
+                "f(p: Shown[Frame]) -> u64 = u64(p)\n",
+                "'Shown' requires its type parameter 'T' to implement 'sysl.Display', but Frame does not")
+
+// ---- what may take one -----------------------------------------------------------------------------
+
+@test("a range or a 'where' on a 'new' type still takes no parameter")
+gnt_range_and_where_are_refused()
+    val why = "takes type parameters, and only a transparent alias or a plain 'new' type may"
+
+    gnt_refuses("type Slot[T] = new u8 within 0..<8\n", s"'Slot' $why")
+    gnt_refuses("type Even[T] = new int where value % 2 == 0\n", s"'Even' $why")
+    gnt_refuses("type Acc[T] = new i64q61 wrapping\n", s"'Acc' $why")
+end gnt_range_and_where_are_refused
+
+@test("a pack parameter on a 'new' type is refused")
+gnt_pack_is_refused() =
+    gnt_refuses("type U[..A] = new u64\n",
+                "'U' is a 'new' type, and a 'new' type's parameter stands for one type — '..A' would " +
+                "stand for a list of them")
+
+@test("the base is still a scalar, and is not the parameter")
+gnt_base_must_be_scalar()
+    gnt_refuses("type U[T] = new [4]u8\n",
+                "a constrained subtype's base must be an integer, a float, or 'char', not [4]byte")
+    gnt_refuses("type U[T] = new T\n",
+                "a constrained subtype's base must be an integer, a float, or 'char', not T")
+end gnt_base_must_be_scalar
+
+// ---- the layout is the base's ----------------------------------------------------------------------
+
+@test("a UserPtr[Frame] is an i64 in the IR, with no wrapper")
+gnt_ir_is_the_base()
+    val ir = gnt_ir(gnt_decls() + "@export(\"gnt_pass\")\npass(p: UserPtr[Frame]) -> UserPtr[Frame] = p\n")
+
+    assert(ir.index_of("i64 @gnt_pass(i64").is_some(), s"expected an i64 signature, got: $ir")
+    assert(ir.index_of("UserPtr").is_none(), s"expected no named wrapper type, got: $ir")
+end gnt_ir_is_the_base
