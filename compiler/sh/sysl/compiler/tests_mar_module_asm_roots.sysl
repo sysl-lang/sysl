@@ -1,0 +1,187 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **A module whose top-of-file `asm` is laid down is reached** (`reachability.sysl`'s
+// `reached_modules`), so its `@export`s are roots whether or not any file imports it. The block is
+// never pruned and calls by symbol: a runtime listed in a manifest and never imported carries a
+// `_start` doing `bl rt_finish`, and with the export pruned the image calls what it does not define.
+// A module with exports and no `asm` that nothing imports is left as it was -- its exports pruned --
+// and so is every hosted build.
+
+private val mar_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+private val mar_target: string = "aarch64-freestanding"
+
+private val mar_script: string =
+    "ENTRY(_start)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+// The runtime: `_start` in a top-of-file block, calling an export of the same module by its symbol.
+private val mar_rt: string = raw"""
+    module rt
+
+    @section(".text.boot")
+    asm
+        [aarch64]
+            ".globl _start"
+            "_start:"
+            "bl rt_finish"
+            "b ."
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+    @export("rt_finish")
+    rt_finish() -> int = 0
+    """
+
+// A member with an export and no `asm`.
+private val mar_spare: string = "module spare\n\n@export(\"spare_unused\")\nspare_unused() -> int = 3\n"
+
+private mar_package(name: string, rest: string) -> string =
+    s"package { name = \"$name\", version = \"0.1.0\" }\n$rest"
+
+private mar_image_block() -> string =
+    s"targets {\n  $mar_target {\n    linker_script = \"link.ld\"\n    entry = \"_start\"\n  }\n}\n"
+
+// A workspace of `app`, which depends on `rt` and `spare` by name, `rt` and `spare`; `app`'s program
+// is `program`, and `image` gives it the freestanding target block and its script.
+private mar_workspace(program: string, image: bool) -> string
+    var files: Buf[(string, string)] = buf()
+    val deps = "dependencies { rt { workspace = true }, spare { workspace = true } }\n"
+
+    files.push(("package.hocon", "workspace = [\"app\", \"rt\", \"spare\"]\n"))
+    files.push(("rt/package.hocon", mar_package("rt", "")))
+    files.push(("rt/rt/rt.sysl", mar_rt))
+    files.push(("spare/package.hocon", mar_package("spare", "")))
+    files.push(("spare/spare/spare.sysl", mar_spare))
+    files.push(("app/package.hocon", mar_package("app", if image then deps + mar_image_block() else deps)))
+    files.push(("app/main.sysl", program))
+
+    if image then files.push(("app/link.ld", mar_script))
+
+    lbr_tree(files)
+end mar_workspace
+
+private mar_lld_present() -> bool = capture("ld.lld", ["--version"], "", [], true) match
+    Ok(o) -> o.status.ok()
+    Err(_) -> false
+
+private mar_image_ready() -> bool
+    if !lbr_ready() then return false
+    if !mar_lld_present() then skip("ld.lld is not installed, so no image can be linked")
+    if !is_file(mar_nm) then skip(s"there is no llvm-nm at $mar_nm to read the image")
+
+    true
+end mar_image_ready
+
+// The symbol table of the image `app` links to, or the build's refusal.
+private mar_image_symbols(ws: string) -> (int, string)
+    val out = lbr_temp("sysl-mar-elf")
+    val said = lbr_cli(["sysl", "build", "--target", mar_target, "-o", s"$out/img.elf", s"$ws/app"])
+
+    if said.0 != 0
+        lbr_drop([out])
+        return said
+    end if
+
+    val names = capture(mar_nm, [s"$out/img.elf"], "", [], true).unwrap()
+
+    lbr_drop([out])
+    (0, names.text)
+end mar_image_symbols
+
+private val mar_functions: string = "@export(\"app_entry\")\napp_entry() -> int = 1\n"
+
+@test("a runtime listed but not imported keeps the exports its own asm calls, and the image links")
+mar_listed_runtime_links()
+    if !mar_image_ready() then return
+
+    val ws = mar_workspace(mar_functions, true)
+    val got = mar_image_symbols(ws)
+
+    assert(got.0 == 0, got.1)
+    assert(got.1.contains(" T rt_finish\n"), got.1)
+    assert(got.1.contains(" T _start\n"), got.1)
+    lbr_drop([ws])
+end mar_listed_runtime_links
+
+@test("imported, the same runtime links exactly as before")
+mar_imported_runtime_links()
+    if !mar_image_ready() then return
+
+    val ws = mar_workspace("import rt\n\n" + mar_functions, true)
+    val got = mar_image_symbols(ws)
+
+    assert(got.0 == 0, got.1)
+    assert(got.1.contains(" T rt_finish\n"), got.1)
+    assert(got.1.contains(" T _start\n"), got.1)
+    lbr_drop([ws])
+end mar_imported_runtime_links
+
+@test("a listed module with exports and no asm that nothing imports still has them pruned")
+mar_no_asm_still_pruned()
+    if !mar_image_ready() then return
+
+    val ws = mar_workspace(mar_functions, true)
+    val got = mar_image_symbols(ws)
+
+    assert(got.0 == 0, got.1)
+    assert(!got.1.contains("spare_unused"), got.1)
+    lbr_drop([ws])
+
+    val imported = mar_workspace("import spare\n\n" + mar_functions, true)
+    val kept = mar_image_symbols(imported)
+
+    assert(kept.0 == 0, kept.1)
+    assert(kept.1.contains(" T spare_unused\n"), kept.1)
+    lbr_drop([imported])
+end mar_no_asm_still_pruned
+
+// A hosted build of a workspace with no `asm` anywhere: what it prints, and the LLVM text pruning
+// left. The text, not the executable's symbols: a hosted link dead-strips an export nothing calls
+// whether or not pruning kept it.
+private mar_hosted(program: string) -> (string, string)
+    var files = lbr_two("package.hocon", "workspace = [\"app\", \"spare\"]\n",
+                        "spare/package.hocon", mar_package("spare", ""))
+
+    files.push(("spare/spare/spare.sysl", mar_spare))
+    files.push(("app/package.hocon", mar_package("app", "dependencies { spare { workspace = true } }\n")))
+    files.push(("app/main.sysl", program))
+
+    val ws = lbr_tree(files)
+    val out = lbr_temp("sysl-mar-exe")
+    val said = lbr_cli(["sysl", "build", "-o", s"$out/program", s"$ws/app"])
+
+    if said.0 != 0
+        lbr_drop([ws, out])
+        return (s"refused: ${said.1}", "")
+    end if
+
+    val ran = capture(s"$out/program", [], "", [], true).unwrap()
+    val text = emit_llvm_text(s"$ws/app", None) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    lbr_drop([ws, out])
+    (ran.text, text)
+end mar_hosted
+
+@test("a hosted build is unchanged: an export nobody imports is pruned, an imported one is kept")
+mar_hosted_unchanged()
+    if !lbr_ready() then return
+
+    val alone = mar_hosted("print(1)\n")
+
+    assert_eq(alone.0, "1\n")
+    assert(!alone.1.contains("spare_unused"), alone.1)
+
+    val imported = mar_hosted("import spare\n\nprint(2)\n")
+
+    assert_eq(imported.0, "2\n")
+    assert(imported.1.contains("@spare_unused("), imported.1)
+end mar_hosted_unchanged
