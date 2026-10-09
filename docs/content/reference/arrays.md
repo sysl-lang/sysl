@@ -737,8 +737,9 @@ only one branch keeps that branch's view whichever it is.
 
 **What produces one.** Slicing a `val` array, since read-only storage gives a read-only view — and so
 is a `val` array standing where a view is asked for, which is the same rule reached without the
-brackets. An array inside a `val` struct value is the binding's storage too. `s.bytes`, whose elements are a string's own and may be a literal's. Re-slicing one,
-because a bit a second subscript dropped would make `xs[..]` the way around `xs`. And a buffer
+brackets. An array inside a `val` struct value is the binding's storage too. `s.bytes`, whose
+elements are a string's own and may be a literal's. Re-slicing one, because a bit a second subscript
+dropped would make `xs[..]` the way around `xs`. And a buffer
 literal written where one is wanted, since storage an expression makes has no other holder to
 disagree with it.
 
