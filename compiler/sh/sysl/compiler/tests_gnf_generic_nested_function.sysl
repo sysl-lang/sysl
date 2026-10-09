@@ -1,0 +1,306 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A nested function may be generic (`reference/generics.md § A nested function may be generic`): it
+// takes type parameters, bounds and the bare-arrow sugar exactly as a top-level function does, each
+// call instantiating it, and every instantiation is one more member of the environment its group
+// shares -- so it reads and writes the frame's variables as any nested function does.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private gnf_root(main: string) -> string
+    val root = make_temp_dir("sysl-gnf").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end gnf_root
+
+// What the program printed and the status it left with; a failure to build is its message and `-1`.
+private gnf_outcome(main: string) -> (string, int)
+    val root = gnf_root(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end gnf_outcome
+
+private gnf_prints(main: string, want: string)
+    if xvr_no_library() then return
+
+    val out = gnf_outcome(main)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+// Everything the analysis said about the program, or its LLVM text where it said nothing.
+private gnf_said(main: string) -> string
+    val root = gnf_root(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gnf_said
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private gnf_refused(main: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val out = gnf_said(main)
+
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end gnf_refused
+
+// -- what it does -----------------------------------------------------------------------------------
+
+@test("a generic nested function captures, and is instantiated at each type it is called at")
+gnf_captures_at_two_instantiations() = gnf_prints(raw"""
+    outer() -> int
+        var total = 0
+
+        noted[T](x: T, n: int) -> T
+            total += n
+            x
+
+        print(noted("a", 2))
+        print(noted(true, 3))
+        print(noted("b", 4))
+        total
+
+    print(outer())
+    """, "a\ntrue\nb\n9\n")
+
+@test("two generic nested functions of a group call each other, at more than one type")
+gnf_mutual_recursion_in_a_group() = gnf_prints(raw"""
+    outer() -> int
+        var calls = 0
+
+        even[T](x: T, n: int) -> bool
+            calls += 1
+            if n == 0 then true else odd(x, n - 1)
+
+        odd[T](x: T, n: int) -> bool
+            calls += 1
+            if n == 0 then false else even(x, n - 1)
+
+        print(even("s", 4))
+        print(odd(1.5, 4))
+        calls
+
+    print(outer())
+    """, "true\nfalse\n10\n")
+
+@test("a plain sibling calls a generic one written below it, and the generic one calls back")
+gnf_a_plain_sibling_and_a_generic_one() = gnf_prints(raw"""
+    outer() -> string
+        var base = 100
+
+        bump(n: int) -> string = twice(n) + "!"
+
+        twice[T: Display](x: T) -> string = s"$x$x"
+
+        bumped[T](x: T) -> string = bump(base)
+
+        print(twice(1.5))
+        bumped("x")
+
+    print(outer())
+    """, "1.51.5\n100100!\n")
+
+@test("a generic nested function recurses at its own instantiation")
+gnf_recursion_at_one_instantiation() = gnf_prints(raw"""
+    outer() -> int
+        val base = 10
+
+        count[T](x: T, n: int) -> int = if n == 0 then base else count(x, n - 1) + 1
+
+        count("s", 3) + count(2.5, 1)
+
+    print(outer())
+    """, "24\n")
+
+@test("a bound is what the body may use, and the bound's member answers at each instantiation")
+gnf_a_bound_licenses_the_body() = gnf_prints(raw"""
+    outer() -> string
+        val sep = "/"
+
+        joined[T: Display](a: T, b: T) -> string = s"$a$sep$b"
+
+        joined(1, 2) + " " + joined(true, false)
+
+    print(outer())
+    """, "1/2 true/false\n")
+
+@test("a bare-arrow parameter makes a nested function generic, and the closure is read at its bound")
+gnf_bare_arrow_sugar() = gnf_prints(raw"""
+    outer() -> int
+        var base = 100
+
+        twice(f: int -> int, x: int) -> int = f(f(x)) + base
+
+        base += 1
+        twice(n -> n * 3, 2) + twice(n -> n + 1, 0)
+
+    print(outer())
+    """, "222\n")
+
+@test("a type argument nothing in a call settles is written out, as for a top-level generic")
+gnf_a_written_type_argument() = gnf_prints(raw"""
+    outer() -> usize
+        val extra: usize = 1
+
+        sized[T]() -> usize = sizeof(T) + extra
+
+        sized[u32]() + sized[u8]()
+
+    print(outer())
+    """, "7\n")
+
+@test("a generic nested function's parameters may name the frame's own type parameters")
+gnf_reads_the_frames_type_parameter() = gnf_prints(raw"""
+    wrap[U: Display](u: U) -> int
+        var seen = 0
+
+        pair[T: Display](t: T, v: U) -> string
+            seen += 1
+            s"$v:$t"
+
+        print(pair(5, u))
+        print(pair("s", u))
+        seen
+
+    print(wrap(true))
+    print(wrap(2.5))
+    """, "true:5\ntrue:s\n2\n2.5:5\n2.5:s\n2\n")
+
+@test("a nested type parameter of the frame's spelling is the nearer one")
+gnf_a_nested_parameter_shadows_the_frames() = gnf_prints(raw"""
+    wrap[T](t: T) -> string
+        same[T: Display](x: T) -> string = s"$x"
+
+        same(42)
+
+    print(wrap("ignored"))
+    """, "42\n")
+
+@test("the entry file's helper may be generic and read what the statements bind")
+gnf_an_entry_file_helper() = gnf_prints(raw"""
+    var failures = 0
+
+    failed[T](r: Result[T, int])
+        if !r.is_ok() then failures += 1
+
+    val r: Result[string, int] = Err(1)
+    val q: Result[bool, int] = Ok(true)
+    failed(r)
+    failed(q)
+    failed(r)
+    print(failures)
+    """, "2\n")
+
+@test("two functions each declaring a nested generic of one name instantiate it apart")
+gnf_two_frames_one_name() = gnf_prints(raw"""
+    first() -> int
+        val k = 10
+
+        pick[T](x: T) -> int = k
+
+        pick(1)
+
+    second() -> int
+        val k = 20
+
+        pick[T](x: T) -> int = k * 2
+
+        pick(1)
+
+    print(first())
+    print(second())
+    """, "10\n40\n")
+
+// -- what it refuses --------------------------------------------------------------------------------
+
+@test("a type argument that does not meet the bound is refused at the call")
+gnf_a_bound_refusal() = gnf_refused(raw"""
+    struct P
+        x: int
+
+    outer() -> string
+        show[T: Display](x: T) -> string = s"$x"
+
+        show(P(1))
+
+    print(outer())
+    """, "'show' requires its type parameter 'T' to implement 'sysl.Display', but P does not",
+         "7:5")
+
+@test("a parameter nothing in the call settles has to be written out")
+gnf_an_unsettleable_parameter() = gnf_refused(raw"""
+    outer() -> usize
+        sized[T]() -> usize = sizeof(T)
+
+        sized()
+
+    print(outer())
+    """, "'T' is in neither the parameters of 'sized' nor its result, so nothing in this call says " +
+         "what it should be — write it out, as 'sized[…](…)'", "4:5")
+
+@test("a written list the nested function does not take is refused")
+gnf_a_list_on_a_plain_nested_function() = gnf_refused(raw"""
+    outer() -> int
+        one(x: int) -> int = x
+
+        one[int](1)
+
+    print(outer())
+    """, "'one' is not generic, so it has no type arguments to write — the call is 'one(…)'", "4:8")
+
+@test("a written list of the wrong length is refused, naming the parameters")
+gnf_a_list_of_the_wrong_length() = gnf_refused(raw"""
+    outer() -> int
+        two[A, B](a: A, b: B) -> int = 1
+
+        two[int](1, 2)
+
+    print(outer())
+    """, "'two' takes 2 type arguments ('A', 'B'), and 1 was written", "4:8")
+
+@test("a body is read where it is written, so a mistake no type argument could repair is said there")
+gnf_a_body_is_checked_at_its_definition() = gnf_refused(raw"""
+    outer() -> int
+        nope[T](x: T) -> int = undefined_thing
+
+        1
+
+    print(outer())
+    """, "undefined name 'undefined_thing'", "2:28")
+
+@test("and a member no bound licenses is refused there too, as a top-level generic's is")
+gnf_an_unlicensed_member_at_the_definition() = gnf_refused(raw"""
+    outer() -> int
+        lacks[T](x: T) -> int = x.frob()
+
+        1
+
+    print(outer())
+    """, "no trait declares a method 'frob', so no bound on 'T' could license this call", "2:31")
