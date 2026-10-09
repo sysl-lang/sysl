@@ -1660,7 +1660,12 @@ s.item = Item("a")
 
 print(is_null(s.item), s.item.label)
 
+val empty: *Slot = ptr_cast(c_calloc(1, sizeof(Slot)))
+
+s.item = empty.item
+
 c_free(ptr_cast(s))
+c_free(ptr_cast(empty))
 ```
 
 ```output
