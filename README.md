@@ -2,10 +2,8 @@
 
 The sysl compiler, written in sysl.
 
-**This is the compiler that will ship as `sysl`.** Until it can build itself it is built by the
-[bootstrap compiler](https://github.com/sysl-lang/sysl-bootstrap), which is written in Scala and
-remains the reference: the two are checked against the same programs, and where they disagree the
-bootstrap decides until this one has earned the last word. The language is specified by the pages
+**This is the compiler that ships as `sysl`.** It builds itself; the Scala bootstrap compiler
+(`sysl-lang/sysl-bootstrap`) is retired and archived. The language is specified by the pages
 in `docs/content/`, which [sysl.sh](https://sysl.sh) publishes from a release tag.
 
 ## The layout

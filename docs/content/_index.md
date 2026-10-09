@@ -59,7 +59,7 @@ start using it.
 
 ## Getting in touch
 
-**Bugs and questions belong on [GitHub](https://github.com/sysl-lang/sysl-bootstrap/issues)**, where the answer
+**Bugs and questions belong on [GitHub](https://github.com/sysl-lang/sysl/issues)**, where the answer
 is visible to whoever asks next.
 
 For anything else — [hello@sysl.sh](mailto:hello@sysl.sh).
