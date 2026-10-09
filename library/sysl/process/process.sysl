@@ -204,7 +204,8 @@ private failure(answer: i64) -> IoError = from_status(int(answer))
  * and the child has its own copies of them by then too.
  */
 private begun(program: string, args: []const string, env: []const Var, inherit_env: bool,
-              dir: string, in_fd: int, out_fd: int, err_fd: int) -> Result[(i32, i64), IoError]
+              dir: string, in_fd: int, out_fd: int, err_fd: int, pgid: i64,
+              foreground: bool) -> Result[(i32, i64), IoError]
     var argv: Buf[Text] = buf()
 
     argv.push(lent(program))
@@ -224,7 +225,8 @@ private begun(program: string, args: []const string, env: []const Var, inherit_e
     var at: i64 = 0
     val pid = psys.spawn(as_ptr(program.bytes), program.bytes.len, as_ptr(argv.view()), argv.len(),
                          as_ptr(envp.view()), envp.len(), if inherit_env then 1 else 0,
-                         as_ptr(dir.bytes), dir.bytes.len, in_fd, out_fd, err_fd, &at)
+                         as_ptr(dir.bytes), dir.bytes.len, in_fd, out_fd, err_fd, &at, pgid,
+                         if foreground then 1 else 0)
 
     if pid < 0 then return Err(failure(pid))
 
@@ -317,23 +319,24 @@ end opened
 
 /** `begun`, with the child's three streams where `stdin`, `stdout` and `stderr` say. */
 private placed(program: string, args: []const string, env: []const Var, inherit_env: bool,
-               dir: string, stdin: Stdio, stdout: Stdio, stderr: Stdio,
+               dir: string, stdin: Stdio, stdout: Stdio, stderr: Stdio, pgid: i64, foreground: bool,
                made: *Buf[File]) -> Result[(i32, i64), IoError]
     val in_fd = opened(stdin, true, made)?
     val out_fd = opened(stdout, false, made)?
     val err_fd = opened(stderr, false, made)?
 
-    begun(program, args, env, inherit_env, dir, in_fd, out_fd, err_fd)
+    begun(program, args, env, inherit_env, dir, in_fd, out_fd, err_fd, pgid, foreground)
 end placed
 
 /** `placed`, and every file it opened closed again whatever became of the child: the child holds its
  * own copy by then, and one that never started needs none.
  */
 private begun_to(program: string, args: []const string, env: []const Var, inherit_env: bool,
-                 dir: string, stdin: Stdio, stdout: Stdio,
-                 stderr: Stdio) -> Result[(i32, i64), IoError]
+                 dir: string, stdin: Stdio, stdout: Stdio, stderr: Stdio, pgid: i64,
+                 foreground: bool) -> Result[(i32, i64), IoError]
     var made: Buf[File] = buf()
-    val began = placed(program, args, env, inherit_env, dir, stdin, stdout, stderr, &made)
+    val began = placed(program, args, env, inherit_env, dir, stdin, stdout, stderr, pgid, foreground,
+                       &made)
 
     for i in 0..<made.len()
         var g = made.at(i)
@@ -368,6 +371,10 @@ end begun_to
  * last parameter for the same reason `inherit_env` is not beside `env`. A file this call opened is
  * closed before it returns, and one that cannot be opened is an error before anything is started.
  *
+ * `group` is the process group the child is started in and `foreground` whether that group is given
+ * the controlling terminal before the child's program runs -- see `Group`, and `foreground_group` for
+ * taking the terminal back. Both come last so that every call written before them keeps its meaning.
+ *
  * It is `spawn` followed at once by `wait`, and is written as exactly that.
  *
  * The error half is for a child that could not be *started*: a program that is not there reports
@@ -379,8 +386,10 @@ end begun_to
  */
 run(program: string, args: []const string = [], dir: string = "",
     env: []const Var = [], timeout: int = 0, inherit_env: bool = true, stdout: Stdio = Inherit,
-    stderr: Stdio = Inherit, stdin: Stdio = Inherit) -> Result[Status, IoError] =
-    spawn(program, args, dir, env, timeout, inherit_env, stdin, stdout, stderr)?.wait()
+    stderr: Stdio = Inherit, stdin: Stdio = Inherit, group: Group = Inherit,
+    foreground: bool = false) -> Result[Status, IoError] =
+    spawn(program, args, dir, env, timeout, inherit_env, stdin, stdout, stderr, group,
+          foreground)?.wait()
 
 /** Run a program, wait for it, and collect what it wrote to its standard output.
  *
@@ -408,15 +417,18 @@ run(program: string, args: []const string = [], dir: string = "",
  *
  * `env` and `inherit_env` mean what they mean for `run`: added to this program's environment by
  * default, the whole of the child's with `inherit_env = false`. So does `stdin`: this program's own
- * input by default, or a file the child reads (`FromPath`, `FromFile`).
+ * input by default, or a file the child reads (`FromPath`, `FromFile`). And `group` and `foreground`:
+ * the process group the child starts in, and whether it is given the terminal (`Group`).
  *
  * It is `start` followed at once by `wait`, and is written as exactly that, so the two can never
  * come to answer differently.
  */
 capture(program: string, args: []const string = [], dir: string = "", env: []const Var = [],
         stderr: bool = false, timeout: int = 0, inherit_env: bool = true,
-        stdin: Stdio = Inherit) -> Result[Output, IoError]
-    val child = start(program, args, dir, env, stderr, timeout, inherit_env, stdin)?
+        stdin: Stdio = Inherit, group: Group = Inherit,
+        foreground: bool = false) -> Result[Output, IoError]
+    val child = start(program, args, dir, env, stderr, timeout, inherit_env, stdin, group,
+                      foreground)?
 
     child.wait()
 end capture
@@ -447,6 +459,12 @@ struct Child
     private out_path: string
     private err_path: string
     private answer: Option[Result[Output, IoError]]
+    private pgid: i64
+
+    /** The process group the child was started in: its own pid for `Group.New`, the joined group's
+     * number for `Join`, and this program's for `Inherit`. A `Join` of a later child names it.
+     */
+    group(self) -> int = group_of(self.pgid, self.pid)
 
     /** Wait for the child to end, and answer what `capture` would have answered for it.
      *
@@ -524,7 +542,9 @@ impl Drop for Child
  */
 start(program: string, args: []const string = [], dir: string = "", env: []const Var = [],
       stderr: bool = false, timeout: int = 0, inherit_env: bool = true,
-      stdin: Stdio = Inherit) -> Result[&Child, IoError]
+      stdin: Stdio = Inherit, group: Group = Inherit,
+      foreground: bool = false) -> Result[&Child, IoError]
+    val pgid = group_request(group, foreground)?
     val out_path = temp_path()?
     val err_path = if stderr then temp_path() else Ok("")
 
@@ -536,8 +556,9 @@ start(program: string, args: []const string = [], dir: string = "", env: []const
 
     val err_to = if stderr then Stdio.ToPath(e) else Stdio.Inherit
 
-    begun_to(program, args, env, inherit_env, dir, stdin, Stdio.ToPath(out_path), err_to) match
-        Ok((pid, at)) -> Ok(Child(pid, at, timeout, out_path, e, None))
+    begun_to(program, args, env, inherit_env, dir, stdin, Stdio.ToPath(out_path), err_to, pgid,
+             foreground) match
+        Ok((pid, at)) -> Ok(Child(pid, at, timeout, out_path, e, None, pgid))
         Err(x) ->
             remove_file(out_path)
 
@@ -586,6 +607,12 @@ struct Spawned
     private began: i64
     private timeout: int
     private answer: Option[Result[Status, IoError]]
+    private pgid: i64
+
+    /** The process group the child was started in, as `Child.group` answers it: what a later stage of
+     * a pipeline `Join`s, and what `set_foreground_group` hands the terminal to.
+     */
+    group(self) -> int = group_of(self.pgid, self.pid)
 
     /** Waits for the child to end and says how it ended, as `run` would have.
      *
@@ -643,16 +670,22 @@ impl Drop for Spawned
  * the stage reading it never sees its input end (see `pipe`).
  *
  * `dir`, `env`, `timeout` and `inherit_env` mean what they mean for `run`; `timeout` is kept by `wait`.
+ * `group` and `foreground` say which process group the child starts in and whether that group is
+ * given the terminal before the child's program runs (`Group`); `foreground` with `Group.Inherit` is
+ * refused before anything starts, `Other(22)`, the terminal being this program's group's already.
  * The error half is for a child that could not be started -- `NotFound` for a program that is not
- * there, a stream handed the wrong direction refused before anything starts (`Stdio`) -- and a program
- * that ran and failed is a `Status` at the wait.
+ * there, a stream handed the wrong direction refused before anything starts (`Stdio`), a terminal
+ * there is none of -- and a program that ran and failed is a `Status` at the wait.
  */
 spawn(program: string, args: []const string = [], dir: string = "", env: []const Var = [],
       timeout: int = 0, inherit_env: bool = true, stdin: Stdio = Inherit, stdout: Stdio = Inherit,
-      stderr: Stdio = Inherit) -> Result[&Spawned, IoError]
-    val (pid, at) = begun_to(program, args, env, inherit_env, dir, stdin, stdout, stderr)?
+      stderr: Stdio = Inherit, group: Group = Inherit,
+      foreground: bool = false) -> Result[&Spawned, IoError]
+    val pgid = group_request(group, foreground)?
+    val (pid, at) = begun_to(program, args, env, inherit_env, dir, stdin, stdout, stderr, pgid,
+                             foreground)?
 
-    Ok(Spawned(pid, at, timeout, None))
+    Ok(Spawned(pid, at, timeout, None, pgid))
 end spawn
 
 /** A file nothing else holds, made empty, for a child to write one of its streams into. */

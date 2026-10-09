@@ -1,0 +1,92 @@
+module sysl.process
+@requires(posix)
+
+import sysl.fs.{IoError, from_status}
+import sysl.sys.UNSUPPORTED
+import sysl.process.sys as psys
+
+// Process groups and the terminal: what a shell's job control is made of.
+//
+// **A job is a process group, and the terminal gives its keys to one group at a time.** Ctrl-C is a
+// `SIGINT` to every process in the terminal's foreground group, and nothing else hears it. So a shell
+// starts each job in a group of its own (`Group.New`, every later stage of a pipeline `Join`ing the
+// first) and makes that group the foreground -- and it has to do so **before the job's program runs**,
+// or a Ctrl-C typed as the job starts goes to the shell. `foreground = true` on `spawn` and the rest
+// does it in the child before its program runs and in this program straight after, which is the
+// window a shell that called `tcsetpgrp` itself after starting the job would leave open. When the job
+// ends or stops, the shell takes the terminal back with `set_foreground_group(process_group())`.
+
+/** Which process group a child is started in.
+ *
+ * `Inherit`, the default, leaves it in this program's group, so the terminal's keys reach both
+ * alike. `New` makes it the leader of a group of its own, numbered by its process id -- a job. `Join`
+ * puts it in an existing group, `pgid` being that group's number: a later stage of a pipeline joins the
+ * group its first stage leads, so the whole pipeline is one job.
+ */
+enum Group
+    Inherit
+    New
+    Join(pgid: int)
+
+/** `EINVAL`: what a group request that names no group is refused with, before anything starts. */
+private const no_group: int = 22
+
+/** What the `spawn` hook is handed for `group` and `foreground`, or the refusal of a request that
+ * cannot be made: the terminal given to a child that stays in this program's group would be given to
+ * this program, which already has it or is not entitled to it; and `Join` names a group by a number
+ * above zero.
+ */
+private[process] group_request(group: Group, foreground: bool) -> Result[i64, IoError]
+    group match
+        Inherit ->
+            if foreground then return Err(IoError.Other(no_group))
+
+            Ok(psys.group_inherit)
+        New -> Ok(psys.group_new)
+        Join(g) -> if g > 0 then Ok(i64(g)) else Err(IoError.Other(no_group))
+end group_request
+
+/** The group number a child started with `request` is in, `pid` being its process id: its own for a
+ * new group, the joined one's, or -- left where it was -- this program's, asked only when wanted.
+ */
+private[process] group_of(request: i64, pid: i32) -> int
+    if request == psys.group_new then return int(pid)
+    if request > 0 then return int(request)
+
+    process_group()
+end group_of
+
+/** The process group this program is in. It is a number above zero; **a target with no process
+ * groups answers zero**, as it answers user 0 for `user()`, everything there being one group.
+ */
+process_group() -> int
+    val g = psys.getpgrp()
+
+    if g >= 0 then return int(g)
+    if g == i64(UNSUPPORTED) then return 0
+
+    panic(s"sysl.process: the 'sysl_proc_getpgrp' hook failed with $g")
+end process_group
+
+/** The process group the controlling terminal gives its keys to -- the foreground job.
+ *
+ * The controlling terminal is the one this program's session belongs to, whatever its standard
+ * streams have been pointed at. **A program with none -- started by a service manager, a test runner,
+ * anything not sitting at a terminal -- is an error**: `Other(6)` on a POSIX host, `ENXIO`.
+ */
+foreground_group() -> Result[int, IoError]
+    val g = psys.tcgetpgrp()
+
+    if g < 0 then Err(from_status(int(g))) else Ok(int(g))
+
+/** The controlling terminal made to give its keys to process group `pgid`.
+ *
+ * **It works from the background too**, which is what a shell needs: once a foreground job ends or
+ * stops, the shell is a background process of its own terminal, and taking the terminal back is
+ * `set_foreground_group(process_group())`. A group that does not exist, or belongs to another
+ * session, is `NotPermitted`; a program with no controlling terminal is `foreground_group`'s error.
+ */
+set_foreground_group(pgid: int) -> Result[unit, IoError]
+    val e = psys.tcsetpgrp(i64(pgid))
+
+    if e != 0 then Err(from_status(e)) else Ok(())
