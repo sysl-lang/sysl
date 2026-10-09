@@ -7,7 +7,9 @@ import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
 // AArch64's system registers and barriers, as five forms: `read_sysreg("cntfrq_el0")`,
-// `write_sysreg("daif", v)`, `dsb(sy)`, `dmb(ish)` and `isb()`.
+// `write_sysreg("daif", v)`, `dsb(sy)`, `dmb(ish)` and `isb()` -- and the cache, TLB and address
+// translation maintenance a kernel issues, as four more: `tlbi(vae1is, page)`, `dc(civac, addr)`,
+// `ic(iallu)` and `at(s1e1r, va)`.
 //
 // **These are intrinsics, not assembly.** A register read is LLVM's `read_volatile_register`, a write
 // its `write_register`, a barrier `llvm.aarch64.dsb`/`dmb`/`isb` -- so the optimizer sees a call it
@@ -37,10 +39,14 @@ import sysl.process.capture
 sysreg_form(cx: &Analyzer, name: string) -> bool =
     sysreg_form_word(name) && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
 
-// The five words, whether or not anything claims them.
+// The nine words, whether or not anything claims them.
 sysreg_form_word(name: string) -> bool =
     name == "read_sysreg" || name == "write_sysreg" || name == "dsb" || name == "dmb" ||
-    name == "isb"
+    name == "isb" || maintenance_form(name)
+
+// The four maintenance forms, each an instruction whose first operand is a word of a closed set.
+private maintenance_form(name: string) -> bool =
+    name == "tlbi" || name == "dc" || name == "ic" || name == "at"
 
 // One of the forms, analyzed.
 sysreg_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
@@ -55,6 +61,7 @@ sysreg_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
 
     if name == "read_sysreg" then return read_call(cx, span, args)
     if name == "write_sysreg" then return write_call(cx, span, args)
+    if maintenance_form(name) then return maintenance_call(cx, span, name, args)
 
     barrier_call(cx, span, name, args)
 end sysreg_call
@@ -231,6 +238,128 @@ private barrier_word_list() -> []const string =
 
 private barrier_words() -> string =
     "sy, st, ld, ish, ishst, ishld, nsh, nshst, nshld, osh, oshst, oshld"
+
+// -- maintenance: tlbi, dc, ic, at -----------------------------------------------------------------
+
+// `tlbi(vmalle1is)`, `tlbi(vae1is, page)`, `dc(civac, addr)`, `ic(iallu)`, `ic(ivau, addr)`,
+// `at(s1e1r, va)`. The operation is a word of the instruction, read as written as a barrier's option
+// is, and whether it takes a register is the operation's, so the arity is checked against the word.
+// `at` answers PAR_EL1 -- the translation it asked for is the only reason to issue one, and reading
+// the answer correctly needs an `isb` between the two that is easy to leave out.
+private maintenance_call(cx: &Analyzer, span: Span, form: string, args: Buf[Expr]) -> TExpr
+    if args.is_empty() || args.len() > 2
+        return cx.err(span, s"'$form' takes the operation and, where the operation reads one, its " +
+                      s"register operand — ${maintenance_example(form)}")
+
+    val word = *args.at(0).kind match
+        Ident(w) -> w
+        _ -> ""
+
+    val takes = maintenance_operand(form, word)
+
+    if takes.is_none()
+        return cx.err(args.at(0).span, s"'$form' takes one of the operations written here — " +
+                      s"${maintenance_words(form)} — and this is not one")
+
+    if takes.unwrap() && args.len() == 1
+        return cx.err(span, s"'$form($word)' takes a register operand, ${operand_noun(form)} — " +
+                      s"$form($word, ${operand_name(form)})")
+
+    if !takes.unwrap() && args.len() == 2
+        return cx.err(args.at(1).span, s"'$form($word)' takes no register operand — write $form($word)")
+
+    var operands: Buf[TExpr] = buf()
+
+    if args.len() == 2
+        val v = type_expr(cx, args.at(1), Some(Integer(64, false, false)))
+        val ty = texpr_type(v)
+
+        if ty == Unknown then return bad_expr(span)
+
+        if !operand_fits(form, underlying(ty))
+            val wanted = if form == "tlbi" then "a u64" else "an address, a u64 or a raw pointer"
+
+            return cx.err(args.at(1).span, s"'$form($word)' takes $wanted, and this value is a " +
+                          s"${type_show(ty)} — convert it with u64(...)")
+
+        operands.push(v)
+
+    TExpr(span, TSysOp(form, word, operands))
+end maintenance_call
+
+// Whether a value may be the register operand: a 64-bit unsigned integer always, and a raw pointer
+// where the operand is an address. `tlbi`'s is not one -- it packs a page number and an ASID.
+private operand_fits(form: string, ty: Type) -> bool = ty match
+    Integer(bits, sg, _) -> bits == 64 && !sg
+    Ptr(_) -> form != "tlbi"
+    _ -> false
+
+// Whether `word` is one of `form`'s operations, and if so whether it takes a register.
+private maintenance_operand(form: string, word: string) -> Option[bool]
+    val ops = maintenance_ops(form)
+
+    for i in 0..<ops.len()
+        if ops.at(i).0 == word then return Some(ops.at(i).1)
+
+    None
+end maintenance_operand
+
+// The operations of each form a kernel issues, with whether each reads a register: the TLB by all
+// entries, by address, by ASID, by address in every ASID, and each of those for the last level only
+// and across the inner shareable domain; the data cache by address to the point of coherency or
+// unification, and zeroing a block; the instruction cache whole or by address; and the four stage-1
+// translations, EL1 and EL0, read and write.
+private maintenance_ops(form: string) -> Buf[(string, bool)]
+    var ops: Buf[(string, bool)] = buf()
+
+    if form == "tlbi"
+        for w in ["vmalle1", "vmalle1is"]
+            ops.push((w, false))
+
+        for w in ["vae1", "vae1is", "vale1", "vale1is", "aside1", "aside1is", "vaae1", "vaae1is",
+                  "vaale1", "vaale1is"]
+            ops.push((w, true))
+    elif form == "dc"
+        for w in ["civac", "cvac", "cvau", "ivac", "zva"]
+            ops.push((w, true))
+    elif form == "ic"
+        for w in ["iallu", "ialluis"]
+            ops.push((w, false))
+
+        ops.push(("ivau", true))
+    else
+        for w in ["s1e1r", "s1e1w", "s1e0r", "s1e0w"]
+            ops.push((w, true))
+
+    ops
+end maintenance_ops
+
+// The operations of a form, as a diagnostic lists them.
+private maintenance_words(form: string) -> string
+    val ops = maintenance_ops(form)
+    var out = ""
+
+    for i in 0..<ops.len()
+        out = if i == 0 then ops.at(i).0 else out + ", " + ops.at(i).0
+
+    out
+end maintenance_words
+
+private maintenance_example(form: string) -> string =
+    if form == "tlbi" then "tlbi(vmalle1is) or tlbi(vae1is, page)"
+    else if form == "dc" then "dc(civac, addr)"
+    else if form == "ic" then "ic(iallu) or ic(ivau, addr)"
+    else "at(s1e1r, va)"
+
+private operand_noun(form: string) -> string =
+    if form == "tlbi" then "the u64 naming the page, the ASID or both"
+    else if form == "at" then "the virtual address to translate"
+    else "the address"
+
+private operand_name(form: string) -> string =
+    if form == "tlbi" then "page"
+    else if form == "at" then "va"
+    else "addr"
 
 // -- asking the back end ---------------------------------------------------------------------------
 
