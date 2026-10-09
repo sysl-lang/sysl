@@ -127,6 +127,9 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
         if d.variadic && d.params.is_empty() then
             cx.fault(d.at, s"'${d.name}' needs at least one named parameter before '...'")
 
+        // A generic one has a signature per instantiation, registered where a call settles it.
+        if !d.tparams.is_empty() then continue
+
         var params: Buf[(string, Type)] = buf()
 
         params.push(("self", Ptr(env)))
@@ -151,9 +154,28 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
         inside.push((d.name, Nested(lowered.at(i), inner_self, d.variadic, d.params, d.at)))
         cx.nested.push((d.name, Nested(lowered.at(i), here, d.variadic, d.params, d.at)))
 
+    // **A generic one is kept as a template until a call asks for it**, which is the whole of how a
+    // nested function comes to be generic: each instantiation is one more member of the same
+    // environment, read in the frame taken here. Every template is filed before any body is read, so
+    // a sibling written above one may call it.
+    val frame = nested_frame(cx, span, st, captured, inside)
+
     for i in 0..<group.len()
-        cx.an.closure_funcs.push(nested_body(cx, span, st, lowered.at(i), captured, group.at(i),
-                                             inside))
+        val d = group.at(i)
+
+        if !d.tparams.is_empty()
+            cx.an.tables.nested_generics.put(lowered.at(i),
+                                             NestedGeneric(d, unshadowed(cx.subst, d.tparams), frame))
+
+    for i in 0..<group.len()
+        val d = group.at(i)
+        val generic = cx.an.tables.nested_generics.get(lowered.at(i))
+
+        if !d.tparams.is_empty() && generic.is_some()
+            check_nested_definition(cx.an, generic.unwrap(), lowered.at(i))
+        else
+            cx.an.closure_funcs.push(nested_body_in(cx.an, frame, lowered.at(i), d, cx.subst,
+                                                    cx.at_definition))
 
     // The environment holds addresses, so nothing in it is counted and nothing is copied: it is a
     // row of pointers into the frame it was built in, which is sound exactly because a nested
@@ -192,51 +214,8 @@ private refuse_nested_shape(cx: &Analyzer, span: Span, d: FuncDecl, names: Buf[s
         cx.fault(span, s"'${d.name}' is already declared in this block")
         return true
 
-    if !d.tparams.is_empty()
-        cx.fault(span, generic_nested_refusal(cx, d))
-        return true
-
     false
 end refuse_nested_shape
-
-// Why a nested function may not be generic, said in the terms of how it came to be nested.
-//
-// **A function at the top of the entry file is nested only because of what it reads**, so there the
-// refusal names that -- the body's binding, or the sibling it calls that reads one -- and the
-// `static` that would make the binding the module's and leave the function an ordinary one, generic
-// if it says so. Written inside any other body, a function is nested by where it stands.
-private generic_nested_refusal(cx: &Analyzer, d: FuncDecl) -> string
-    val group = cx.an.tables.entry_captures
-
-    if cx.await_site == AwaitInEntry && holds_string(group, d.name)
-        var bindings: Buf[string] = buf()
-
-        for block_declare in cx.block_declares
-            bindings.push(block_declare.name)
-
-        val why = entry_capture_of(d, bindings, group)
-
-        if why.is_some()
-            val name = why.unwrap().0
-            val binding = why.unwrap().1
-            val cost = "and a nested function cannot be generic — it is lowered once, into the frame " +
-                       "it reads."
-
-            if binding then
-                return s"'${d.name}' reads '$name', which the entry file's statements bind, so it is " +
-                       s"a nested function of them, $cost Declaring '$name' 'static', with its type, " +
-                       s"makes it the module's and leaves '${d.name}' an ordinary function that may " +
-                       s"be generic; otherwise take the type parameters off '${d.name}'"
-
-            return s"'${d.name}' calls '$name', which reads what the entry file's statements bind, so " +
-                   s"'${d.name}' is a nested function of them too, $cost Declaring what '$name' reads " +
-                   s"'static', with its type, makes it the module's and leaves '${d.name}' an " +
-                   s"ordinary function that may be generic; otherwise take the type parameters off " +
-                   s"'${d.name}'"
-
-    s"'${d.name}' is declared inside a function body and cannot be generic — the type arguments " +
-        "would have nowhere to come from, since nothing outside the body calls it"
-end generic_nested_refusal
 
 // What the group reads from **this** block, whether or not it has been bound yet.
 //
@@ -335,21 +314,37 @@ end not_yet_bound
 // parameter stands for, and the name `__FUNCTION__` answers with. What it does not keep is the
 // enclosing function's scope stack: a body is analyzed against per-function state, and every part of
 // that belongs to the function being interrupted.
-private nested_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
-                    captured: Buf[string], d: FuncDecl,
-                    siblings: Buf[(string, &Nested)]) -> TFunc
-    val inner = analyzer_for(cx.an, cx.scope)
+private nested_body_in(a: &Analysis, f: &NestedFrame, fname: string, d: FuncDecl,
+                       subst: Buf[Binding], at_definition: bool) -> TFunc
+    val span = f.span
+    val inner = analyzer_for(a, f.scope)
 
-    inner.subst = cx.subst
-    inner.at_definition = cx.at_definition
-    inner.func_name = cx.func_name
-    inner.decl_name = cx.decl_name
+    inner.subst = subst
+    inner.at_definition = at_definition
+    inner.func_name = f.func_name
+    inner.decl_name = f.decl_name
     inner.in_variadic = d.variadic
     inner.bind_site = Some(span)
-    note_body_covers(cx.an, fname)
-    inner.owner = nested_owner(cx)
+    note_body_covers(a, fname)
+    inner.owner = f.owner
 
-    val env = Struct(st)
+    // A generic one's bounds say which trait's member a name on its parameters meant, as a top-level
+    // generic's do -- beside whatever the frame's own signature promised.
+    if !d.tparams.is_empty()
+        remember_bounds(inner, d)
+
+        var bounds: Buf[NamedBounds] = buf()
+
+        for nb in d.bounds
+            bounds.push(nb)
+
+        for nb in f.tbounds
+            bounds.push(nb)
+
+        inner.tbounds = bounds
+    end if
+
+    val env = Struct(f.env)
     val self_ty = Ptr(env)
 
     var params: Buf[(string, Type)] = buf()
@@ -357,38 +352,44 @@ private nested_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     params.push((inner.bind("self", self_ty), self_ty))
 
     for param in d.params
-        val ty = resolve_type(cx.an, cx.scope, param.typ, cx.subst)
+        val ty = resolve_type(a, f.scope, param.typ, subst)
 
         params.push((inner.bind(param.name, ty), ty))
 
-    for i in 0..<captured.len()
-        val stored = st.fields.at(i).1
+    for i in 0..<f.captured.len()
+        val stored = f.env.fields.at(i).1
         val field = TExpr(span, TField(TExpr(span, TDeref(TExpr(span, TLoad("self", self_ty)), env)),
-                                       int(st.slot(i)), stored))
+                                       int(f.env.slot(i)), stored))
 
         // The environment holds the address of the frame's own variable, so what the name reaches is
         // the variable itself -- one dereference further, and a place, which is what lets a nested
         // function assign to it.
         val reached = stored match
             Ptr(pointee) ->
-                (bind_capture(cx, inner, captured.at(i), *pointee), TExpr(span, TDeref(field, *pointee)))
-            _ -> (bind_capture(cx, inner, captured.at(i), stored), field)
+                (bind_capture(inner, f.locals.at(i), f.captured.at(i), *pointee),
+                 TExpr(span, TDeref(field, *pointee)))
+            _ -> (bind_capture(inner, f.locals.at(i), f.captured.at(i), stored), field)
 
         // A by-name parameter of the frame is one in the nested function too: a read calls it.
-        if reads_by_name(cx, captured.at(i)) then inner.by_name.push(reached.0)
+        if f.by_name.at(i) then inner.by_name.push(reached.0)
 
         inner.captured.push(reached)
 
     // A sibling is in scope throughout the group, so a body may call one written below it. What a
     // body does *not* reach is a nested function of the frame around it, and remembering their
     // names is what lets that be said rather than reported as a name standing for nothing.
-    for item in siblings
+    for item in f.siblings
         inner.nested.push(item)
 
-    carry_outer_nested(cx, inner, siblings)
-    carry_declares(cx, inner)
+    for name in f.outer_nested
+        inner.outer_nested.push(name)
 
-    val written = d.ret_type.map(w -> resolve_result(cx.an, cx.scope, w, cx.subst))
+    for declared in f.declares
+        inner.block_declares.push(declared)
+
+    inner.carried_declares = inner.block_declares.len()
+
+    val written = d.ret_type.map(w -> resolve_result(a, f.scope, w, subst))
     val ret = body_result(d, declared_result_type(written))
 
     inner.ret_ty = Some(ret)
@@ -404,21 +405,135 @@ private nested_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     if ret != Unit && block.result.is_some() && disagree(block.ty, ret) then
         inner.fault(decl_anchor(d), closure_disagreement(ret, block.ty))
 
-    cx.an.tables.homes.put(fname, cx.scope)
+    a.tables.homes.put(fname, f.scope)
 
-    if d.const_fn then cx.an.tables.const_fns.put(fname, true)
+    if d.const_fn then a.tables.const_fns.put(fname, true)
 
     TFunc(span, fname, params, ret, block, d.variadic, contract.0, contract.1, contract.2, true,
           None, false, contract.3, false, false, None, None, None, None, no_marks(), inner.owner,
-          d.const_fn, Some(cx.scope.src), false)
-end nested_body
+          d.const_fn, Some(f.scope.src), false)
+end nested_body_in
+
+// What a nested function's body is read against, taken from the frame where its group is written.
+//
+// **It is taken once, there, and kept.** A generic one's bodies are read where a call asks for them,
+// after the block has moved on, while what each capture is, what the block binds and which nested
+// functions a body may not reach are facts about the place the group was written.
+struct NestedFrame
+    span: Span
+    scope: Scope
+    tbounds: Buf[NamedBounds]
+    func_name: string
+    decl_name: string
+    owner: string
+    env: &StructType
+    captured: Buf[string]
+    locals: Buf[Option[Local]]
+    by_name: Buf[bool]
+    siblings: Buf[(string, &Nested)]
+    outer_nested: Buf[string]
+    declares: Buf[BlockBind]
+end NestedFrame
+
+private nested_frame(cx: &Analyzer, span: Span, st: &StructType, captured: Buf[string],
+                     siblings: Buf[(string, &Nested)]) -> &NestedFrame
+    var locals: Buf[Option[Local]] = buf()
+    var by_name: Buf[bool] = buf()
+
+    for name in captured
+        locals.push(cx.lookup(name))
+        by_name.push(reads_by_name(cx, name))
+
+    var declares: Buf[BlockBind] = buf()
+
+    for declared in cx.block_declares
+        declares.push(declared)
+
+    var tbounds: Buf[NamedBounds] = buf()
+
+    for nb in cx.tbounds
+        tbounds.push(nb)
+
+    NestedFrame(span, cx.scope, tbounds, cx.func_name, cx.decl_name, nested_owner(cx), st,
+                captured, locals, by_name, siblings, outer_nested_of(cx, siblings), declares)
+end nested_frame
+
+// A generic nested function, kept until a call settles its type parameters: the declaration, what
+// the frame's own type parameters stand for (less any it shadows), and the frame its bodies are read
+// in. It is filed under the function's name and under each instantiation's.
+struct NestedGeneric
+    decl: FuncDecl
+    outer: Buf[Binding]
+    frame: &NestedFrame
+
+// One instantiation's body, which the queue of instantiations asks for as it asks for a top-level
+// generic's.
+nested_instance_body(a: &Analysis, g: &NestedGeneric, name: string, subst: Buf[Binding]) -> TFunc =
+    nested_body_in(a, g.frame, name, g.decl, subst, false)
+
+// A generic nested function's body read once where it is written, its type parameters standing for
+// themselves -- the reading a top-level generic gets at its definition -- and everything it
+// registered taken back, the instantiations being what the program gets.
+private check_nested_definition(a: &Analysis, g: &NestedGeneric, fname: string)
+    val d = g.decl
+
+    if d.body.is_empty() then return
+
+    val mark = a.complaints()
+    val trial = a.sandboxed()
+    val queued = a.tables.members.pending.len()
+    val tables = a.tables.members.vtables.len()
+    val structs = a.tables.struct_insts.len()
+    val enums = a.tables.enum_insts.len()
+    val constrained = a.tables.constrained_insts.len()
+    val lowered = a.closure_count
+    val made = a.closure_funcs.len()
+    val subst = abstract_subst(a, g.frame.scope, d.tparams, d.bounds, d.tvalues, d.tpacks, g.outer)
+    val settled_before = a.settled
+
+    a.settled = joined_bindings(subst, buf())
+    nested_body_in(a, g.frame, fname, d, subst, true)
+    a.settled = settled_before
+    a.release(trial)
+    a.restore_complaints(mark)
+    rewind_instantiations(a, queued, tables, structs, enums, constrained)
+    a.closure_count = lowered
+    a.closure_funcs.truncate(made)
+end check_nested_definition
+
+// What a frame's type parameters stand for, less the ones a nested declaration names again: its own
+// parameter of the spelling is the nearer binding.
+private unshadowed(subst: Buf[Binding], tparams: Buf[string]) -> Buf[Binding]
+    var out: Buf[Binding] = buf()
+
+    for b in subst
+        if !holds_string(tparams, b.name) then out.push(b)
+
+    out
+end unshadowed
+
+// The declaration a call to a generic nested function is solved against: the frame's type
+// parameters stand in front of its own, each already answered, so a parameter written in the frame's
+// terms is read in them.
+private callable_decl(g: &NestedGeneric) -> FuncDecl
+    var names: Buf[string] = buf()
+
+    for b in g.outer
+        if !holds_string(names, b.name) then names.push(b.name)
+
+    for name in g.decl.tparams
+        names.push(name)
+
+    var d = g.decl
+
+    d.tparams = names
+    d
+end callable_decl
 
 // Binds a capture in the nested function's own scope under the promise the frame made about it: the
 // environment reaches the variable itself, so a `val` (or a pattern's binding) is written once here
 // exactly as it is in the frame, and a write to it is refused in the frame's words.
-private bind_capture(cx: &Analyzer, inner: &Analyzer, name: string, ty: Type) -> string
-    val local = cx.lookup(name)
-
+private bind_capture(inner: &Analyzer, local: Option[Local], name: string, ty: Type) -> string
     if local.is_some() && local.unwrap().from_pattern then return inner.bind_pattern(name, ty)
     if local.is_some() && local.unwrap().read_only then return inner.bind_read_only(name, ty)
 
@@ -429,15 +544,20 @@ no_siblings() -> Buf[(string, &Nested)] = buf()
 
 // The nested functions of the frame around a body, which that body may not reach.
 carry_outer_nested(cx: &Analyzer, inner: &Analyzer, siblings: Buf[(string, &Nested)])
-    for item in cx.nested
-        val name = item.0
+    for name in outer_nested_of(cx, siblings)
+        if !holds_string(inner.outer_nested, name) then inner.outer_nested.push(name)
 
-        if !named_sibling(siblings, name) && !holds_string(inner.outer_nested, name) then
-            inner.outer_nested.push(name)
+private outer_nested_of(cx: &Analyzer, siblings: Buf[(string, &Nested)]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in cx.nested
+        if !named_sibling(siblings, item.0) && !holds_string(out, item.0) then out.push(item.0)
 
     for name in cx.outer_nested
-        if !named_sibling(siblings, name) && !holds_string(inner.outer_nested, name) then
-            inner.outer_nested.push(name)
+        if !named_sibling(siblings, name) && !holds_string(out, name) then out.push(name)
+
+    out
+end outer_nested_of
 
 private named_sibling(siblings: Buf[(string, &Nested)], name: string) -> bool
     for item in siblings
@@ -448,8 +568,14 @@ end named_sibling
 
 // `f(a)` where `f` is one of the block's nested functions: a call on the receiver the body already
 // has, with the arguments a reader wrote after it.
-call_nested(cx: &Analyzer, span: Span, n: &Nested, written: string, args: Buf[Expr]) -> TExpr
+call_nested(cx: &Analyzer, span: Span, n: &Nested, written: string, args: Buf[Expr],
+            expected: Option[Type]) -> TExpr
     note_reference(cx, span, cx.scope.src, n.declared, written)
+
+    val generic = cx.an.tables.nested_generics.get(n.fname)
+
+    if generic.is_some() then
+        return generic_nested_call(cx, span, n, generic.unwrap(), written, args, expected, buf())
 
     val sig = cx.an.tables.members.func_insts.get(n.fname)
 
@@ -495,3 +621,47 @@ call_nested(cx: &Analyzer, span: Span, n: &Nested, written: string, args: Buf[Ex
     cx.an.uses(n.fname)
     TExpr(span, TCall(n.fname, supplied, sig.unwrap().ret, false))
 end call_nested
+
+// `f(a)` where `f` is a generic nested function: solved and instantiated as a top-level generic's
+// call is, its instantiation one more member of the environment the call is made on. `known` is what
+// a written type-argument list already answered.
+private generic_nested_call(cx: &Analyzer, span: Span, n: &Nested, g: &NestedGeneric, written: string,
+                            args: Buf[Expr], expected: Option[Type], known: Buf[Binding]) -> TExpr
+    var answered: Buf[Binding] = buf()
+
+    for b in known
+        answered.push(b)
+
+    for b in g.outer
+        answered.push(b)
+
+    generic_call_with(cx, span, written, written, Func(callable_decl(g), n.declared, g.frame.scope), args,
+                      expected, true, answered, Some(n))
+end generic_nested_call
+
+// `f[A](a)` where `f` is a nested function: the list fills the parameters it wrote, as it does for a
+// top-level generic, and the arguments settle the rest.
+written_nested_call(cx: &Analyzer, span: Span, n: &Nested, written: string, targ_exprs: Buf[Expr],
+                    args: Buf[Expr], expected: Option[Type]) -> TExpr
+    note_reference(cx, span, cx.scope.src, n.declared, written)
+
+    val generic = cx.an.tables.nested_generics.get(n.fname)
+
+    if generic.is_none() then
+        return cx.err(span, s"'$written' is not generic, so it has no type arguments to write — " +
+                      s"the call is '$written(…)'")
+
+    val authored = authored_tparams(generic.unwrap().decl.tparams)
+
+    if authored.len() != targ_exprs.len() then
+        return cx.err(span, s"'$written' takes ${quantity(authored.len(), "type argument")} " +
+                      s"(${quoted_names(authored)}), and ${targ_exprs.len()} " +
+                      s"${if targ_exprs.len() == 1 then "was" else "were"} written")
+
+    var known: Buf[Binding] = buf()
+
+    for i in 0..<authored.len()
+        known.push(Binding(authored.at(i), written_type_arg(cx, targ_exprs.at(i))))
+
+    generic_nested_call(cx, span, n, generic.unwrap(), written, args, expected, known)
+end written_nested_call

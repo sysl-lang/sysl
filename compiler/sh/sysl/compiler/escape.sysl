@@ -212,7 +212,7 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
         val w = walk_body(p, keeps, f.body.stmts, f.body.result, true)
         val home = func_home(a, f.name)
 
-        report_body(a, p, home, Some(f.name), w)
+        report_body(a, p, home, Some(f.name), f.marks.gives_up("alloc"), w)
         note_promotions(&out.notes, home, w)
 
         if !w.promoted.is_empty() then out.by_func.push((f.name, w.promoted))
@@ -224,7 +224,7 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
 
     val entry = entry_home(a)
 
-    report_body(a, p, entry, None, mw)
+    report_body(a, p, entry, None, false, mw)
     note_promotions(&out.notes, entry, mw)
 
     for temp in mw.temps
@@ -903,12 +903,16 @@ end ExprList
 
 // Everything one body's walk earns: the escape with nowhere to go, and the promotions a module that
 // gave the allocator up or a declaration that asked for a boundary cannot have.
-private report_body(a: &Analysis, p: TProgram, scope: Scope, who: Option[string], w: EscapeWalk)
+//
+// `own_promise` is whether the function itself carries `@no_alloc`, which holds its promotions to the
+// same refusal its module's clause would.
+private report_body(a: &Analysis, p: TProgram, scope: Scope, who: Option[string], own_promise: bool,
+                    w: EscapeWalk)
     w.refusal match
         Some(r) -> a.fault(scope, r.0, r.1)
         None -> ()
 
-    refuse_no_alloc(a, p, scope, who, w)
+    refuse_no_alloc(a, p, scope, who, own_promise, w)
 end report_body
 
 // A promotion in a module that declared `no alloc`, said as the refusal it is there.
@@ -917,7 +921,8 @@ end report_body
 // quietly moves. A module that gave the allocator up has nowhere for it to move to, so the same fact
 // has to be reported, and it is reported against the view that leaves the frame rather than against
 // the array: the array is fine, and what the reader has to change is where its contents go.
-private refuse_no_alloc(a: &Analysis, p: TProgram, scope: Scope, who: Option[string], w: EscapeWalk)
+private refuse_no_alloc(a: &Analysis, p: TProgram, scope: Scope, who: Option[string],
+                        own_promise: bool, w: EscapeWalk)
     // Both refusals are about a site, so a body that promoted nothing has nothing to answer for --
     // and is not worth asking whether it is a test, which is a search over every test the program has.
     if w.sites.is_empty() then return
@@ -939,16 +944,19 @@ private refuse_no_alloc(a: &Analysis, p: TProgram, scope: Scope, who: Option[str
     // wrote nothing is being held to its module's line and that is the line to go and read.
     val theirs = scaffolding && !holds_string(p.no_alloc_modules, module_name)
 
-    if !narrowed
+    if !narrowed && !own_promise
         refuse_aligned(a, scope, w)
         return
+
+    val promised = if narrowed then (if theirs then "this module's '@tests' file" else "this module")
+    else s"'${qualified_name(who.unwrap_or(""))}'"
 
     for site in w.sites
         val subject = if site.name == "" then site.what else s"'${site.name}'"
 
         a.fault(scope, site.at,
             s"this view of $subject ${site.how}, so the array would move to the heap to outlive " +
-            s"the frame — and ${if theirs then "this module's '@tests' file" else "this module"} " +
+            s"the frame — and $promised " +
             "declared '@no_alloc', so there is nothing to move it into. Keep the view inside the " +
             "frame, or take the storage from a caller as a '[]T' parameter, which is already " +
             "wherever its owner put it")

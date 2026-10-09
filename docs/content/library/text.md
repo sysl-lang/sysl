@@ -676,12 +676,13 @@ print(join(words, "-"))
 ```
 
 ```error
-this reaches 'sysl.buf.Buf.grow.byte', which makes heap storage, and this module declared '@no_alloc'
+this reaches 'sysl.text.join', which makes heap storage through 'sysl.buf.Buf.grow.byte', and this module declared '@no_alloc'
 ```
 
-That diagnostic names `sysl.buf`, three calls down, because [`alloc` is checked on what a module
-*calls*](/reference/modules/) rather than on which modules it depends on — the standard library is
-exactly why. It names `grow` rather than `extend` for the same reason `push` is never named: the
+That diagnostic names `join`, the call the program wrote, and `sysl.buf`, three calls down, as the
+reason, because [`alloc` is checked on what a module *calls*](/reference/modules/) rather than on
+which modules it depends on — the standard library is exactly why. The reason is `grow` rather than
+`extend` for the same reason `push` is never the one: the
 allocating path — the allocation, the copy, and the release of what it replaced — is shared, out of
 line, behind `Buf`'s own `grow`, and that is the call `alloc` actually reaches. Inferring it per
 module would put the whole of `sysl.text` on one side of a line that runs through the middle of it.

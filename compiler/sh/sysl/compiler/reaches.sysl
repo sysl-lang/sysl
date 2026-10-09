@@ -277,6 +277,61 @@ end drain_calls
 // Whether this tree arrives at a seed at all.
 reaches_a_seed(r: &Reaches, refs: &Refs) -> bool = !reached_seeds(r, refs).is_empty()
 
+// The calls by which a tree arrives at one seed: the function it calls first, each that one calls in
+// turn, and the seed last -- the shortest such chain, so a message quoting it names no detour.
+//
+// **Ordinary calls only.** A way that runs through a trait object is opened by an erasure in one body
+// and a call in another, which is not a chain of names a reader could follow; there the answer is
+// empty and the message names the seed alone.
+call_path(r: &Reaches, root: &Refs, seed: string) -> Buf[string]
+    var names: Buf[string] = buf()
+    var parents: Buf[Option[usize]] = buf()
+    var seen: Set[string] = set()
+
+    for item in root.calls
+        if seen.add(item)
+            names.push(item)
+            parents.push(None)
+
+    var i: usize = 0
+
+    while i < names.len()
+        val name = names.at(i)
+
+        if name == seed then return chain_to(names, parents, i)
+
+        summary_of(r, name) match
+            Some(body) ->
+                for item in body.calls
+                    if seen.add(item)
+                        names.push(item)
+                        parents.push(Some(i))
+            None -> ()
+
+        i += 1
+
+    buf()
+end call_path
+
+// The chain a breadth-first walk recorded, read back from where it ended to where it began.
+private chain_to(names: Buf[string], parents: Buf[Option[usize]], last: usize) -> Buf[string]
+    var backwards: Buf[string] = buf()
+    var at: Option[usize] = Some(last)
+
+    while at.is_some()
+        val k = at.unwrap()
+
+        backwards.push(names.at(k))
+        at = parents.at(k)
+
+    var out: Buf[string] = buf()
+
+    for j in 0..<backwards.len()
+        out.push(backwards.at(backwards.len() - 1 - j))
+
+    out
+end chain_to
+
 // The **least** seed a tree reaches by name, which is what a diagnostic names: the site is what the
 // reader has to change, and a message that varied between runs would be a poor thing to assert on.
 least_seed(r: &Reaches, refs: &Refs) -> Option[string]
@@ -286,3 +341,39 @@ least_seed(r: &Reaches, refs: &Refs) -> Option[string]
 
     Some(sort_names(found).at(0))
 end least_seed
+
+// What a node's refusal names: the name the node itself WROTE that arrives at a seed, and the seed
+// it arrives at -- `(callee, seed)`, the two the same where what was written is a seed itself.
+//
+// **The reader is told about what they reached, not about what that reached in turn.** A library
+// function rendering through an internal helper is the function the program called; naming the
+// helper sends the reader to a declaration they never wrote and may not be able to see. Among the
+// node's own names the least that arrives is taken, and for it the least seed it arrives at, so the
+// answer is the same on every run. A node whose only way there is a dynamic call -- a slot, an
+// erasure -- names no function of its own, and is told the least seed as before.
+named_reach(r: &Reaches, refs: &Refs) -> Option[(string, string)]
+    var names: Buf[string] = buf()
+
+    for item in refs.calls
+        names.push(item)
+
+    for item in refs.globals
+        names.push(item)
+
+    for name in sort_names(names)
+        if holds_string(r.seeds, name) then return Some((name, name))
+
+        val one = no_refs()
+
+        if holds_string(refs.calls, name) then one.call(name) else one.global(name)
+
+        val seed = least_seed(r, one)
+
+        if seed.is_some() then return Some((name, seed.unwrap()))
+
+    val seed = least_seed(r, refs)
+
+    if seed.is_none() then return None
+
+    Some((seed.unwrap(), seed.unwrap()))
+end named_reach

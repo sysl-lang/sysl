@@ -17,6 +17,33 @@ import sysl.math.bigint.from_int
 // its elements one further on.
 header_fields() -> int = 3
 
+// The bytes laid between a box's header and its payload, so the payload begins on its type's
+// boundary: none where LLVM's own reading of the type already puts it there. A raised `@align(n)` is
+// a boundary LLVM's type does not carry, and one beyond what the allocating pair promises is one the
+// block is aligned to only through the aligned hook -- either way the payload's offset from the
+// block's start has to be a multiple of it, said here as a run of bytes.
+box_pad(e: *Emit, payload: Type) -> usize = header_pad(e, payload, usize(header_fields()))
+
+// The same for a buffer, whose header is one word longer -- the element count.
+buf_pad(e: *Emit, elem: Type) -> usize = header_pad(e, elem, usize(header_fields() + 1))
+
+private header_pad(e: *Emit, t: Type, words: usize) -> usize
+    if !e.layout.holds_raised(t) && !e.layout.beyond_heap(t) then return 0
+
+    val header = words * e.layout.pointer_bytes()
+
+    round_up(header, e.layout.align(t)) - header
+end header_pad
+
+// The field of a box's LLVM type its payload is: after the header, and after the padding where
+// there is any.
+box_payload_field(e: *Emit, payload: Type) -> int =
+    if box_pad(e, payload) > 0 then header_fields() + 1 else header_fields()
+
+// The field of a buffer's LLVM type its elements begin at.
+buf_elems_field(e: *Emit, elem: Type) -> int =
+    if buf_pad(e, elem) > 0 then header_fields() + 2 else header_fields() + 1
+
 // -- taking and giving back a share ----------------------------------------------------------------
 
 // Takes a share of everything a value refers to. A bare reference is one refcount; an aggregate
@@ -334,7 +361,7 @@ private arc_enum(e: *Emit, d: &EnumType, tag: Val, value: Val, p: Val, retain: b
             val next_l = fresh_label(e, "arc.next")
             val is = fresh_reg(e)
 
-            emit(e, InIntCmp(is, IEq, l_i32(), tag, VInt(from_int(long(variant.tag)))))
+            emit(e, InIntCmp(is, IEq, l_i32(), tag, VInt(variant.tag)))
             emit_term(e, InCondBr(is, hit_l, next_l))
             emit_label(e, hit_l)
 
@@ -399,7 +426,12 @@ drop_fn(e: *Emit, payload: Type) -> Val
     // A type with a destructor needs a hook of its own even when nothing in it is counted: the walk
     // has nothing to do and the `drop` still has to be called, so the plain hook -- which is shared
     // by every payload that holds nothing -- cannot serve.
-    if !contains_counted(payload) && destructor_of(e, payload).is_none() then return plain_drop_fn(e)
+    //
+    // **Nor can it serve a payload the aligned pair made**, whose storage goes back through that
+    // pair's free (`emit_box.sysl`'s `heap_call`).
+    val plain = !contains_counted(payload) && destructor_of(e, payload).is_none()
+
+    if plain && !e.layout.beyond_heap(payload) then return plain_drop_fn(e)
 
     VGlobal(request_helper(e, s"arc.drop.${mangle(payload)}", HrDrop(payload)))
 end drop_fn
@@ -408,7 +440,7 @@ end drop_fn
 // walk, so the plain hook is enough -- it still gives the bytes back, which is the phase every box
 // needs whatever it holds.
 drop_buf_fn(e: *Emit, elem: Type) -> Val
-    if !contains_counted(elem) then return plain_drop_fn(e)
+    if !contains_counted(elem) && !e.layout.beyond_heap(elem) then return plain_drop_fn(e)
 
     VGlobal(request_helper(e, s"arc.dropbuf.${mangle(elem)}", HrDropBuf(elem)))
 end drop_buf_fn
@@ -492,7 +524,7 @@ private gen_plain_hook(e: *Emit)
     emit_label(e, over)
     emit_term(e, InRet(None, None))
     emit_label(e, give)
-    emit_free(e)
+    emit_free(e, Unit)
     emit_term(e, InRet(None, None))
 end gen_plain_hook
 
@@ -504,12 +536,21 @@ private gen_drop_hook(e: *Emit, payload: Type)
     emit_term(e, InCondBr(VReg("storage"), give, over))
     emit_label(e, over)
 
+    // A payload holding nothing is here only because the aligned pair made it: nothing to walk.
+    if !contains_counted(payload) && destructor_of(e, payload).is_none()
+        emit_term(e, InRet(None, None))
+        emit_label(e, give)
+        emit_free(e, payload)
+        emit_term(e, InRet(None, None))
+        return
+    end if
+
     val pa = fresh_reg(e)
 
     var idx: Buf[IrArg] = buf()
 
     idx.push(ir_arg(l_i32(), VInt(from_int(0))))
-    idx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields())))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, payload))))))
     emit(e, InGep(pa, bn, VReg("p"), idx))
 
     val v = fresh_reg(e)
@@ -534,7 +575,7 @@ private gen_drop_hook(e: *Emit, payload: Type)
     release_value(e, payload, v)
     emit_term(e, InRet(None, None))
     emit_label(e, give)
-    emit_free(e)
+    emit_free(e, payload)
     emit_term(e, InRet(None, None))
 end gen_drop_hook
 
@@ -545,6 +586,15 @@ private gen_drop_buf_hook(e: *Emit, elem: Type)
 
     emit_term(e, InCondBr(VReg("storage"), give, over))
     emit_label(e, over)
+
+    // Elements holding nothing are here only because the aligned pair made the buffer.
+    if !contains_counted(elem)
+        emit_term(e, InRet(None, None))
+        emit_label(e, give)
+        emit_free(e, elem)
+        emit_term(e, InRet(None, None))
+        return
+    end if
 
     val lenp = fresh_reg(e)
 
@@ -563,23 +613,27 @@ private gen_drop_buf_hook(e: *Emit, elem: Type)
     var didx: Buf[IrArg] = buf()
 
     didx.push(ir_arg(l_i32(), VInt(from_int(0))))
-    didx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields() + 1)))))
+    didx.push(ir_arg(l_i32(), VInt(from_int(long(buf_elems_field(e, elem))))))
     emit(e, InGep(data, bn, VReg("p"), didx))
     each_element_release(e, elem, data, n)
     emit_term(e, InRet(None, None))
     emit_label(e, give)
-    emit_free(e)
+    emit_free(e, elem)
     emit_term(e, InRet(None, None))
 end gen_drop_buf_hook
 
 // The one place `free` is **called**. It sits inside a hook, so it reaches a module only where that
 // module builds a box -- which is a module that has already called `malloc`, and therefore has an
-// allocator to give the bytes back to.
-private emit_free(e: *Emit)
+// allocator to give the bytes back to. Storage of a type the aligned pair made goes back through
+// that pair's free (`emit_box.sysl`'s `heap_call`).
+private emit_free(e: *Emit, held: Type)
     var args: Buf[IrArg] = buf()
 
     args.push(ir_arg(LPtr, VReg("p")))
-    emit(e, ir_call(None, LVoid, VGlobal(free_symbol()), args))
+
+    val sym = if e.layout.beyond_heap(held) then aligned_free_symbol() else free_symbol()
+
+    emit(e, ir_call(None, LVoid, VGlobal(sym), args))
 end emit_free
 
 // -- elements a buffer holds --------------------------------------------------------------------------
@@ -665,7 +719,7 @@ box_payload_addr(e: *Emit, p: Val, ty: Type) -> Val = underlying(ty) match
         var idx: Buf[IrArg] = buf()
 
         idx.push(ir_arg(l_i32(), VInt(from_int(0))))
-        idx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields())))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, *inner))))))
         emit(e, InGep(r, box_lty(e, *inner), p, idx))
         r
     _ -> p
