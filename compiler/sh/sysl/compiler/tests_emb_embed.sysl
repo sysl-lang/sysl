@@ -1,0 +1,373 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_bytes, write_text}
+import sysl.text.{Search, split}
+
+// `embed("file")` and `.incbin "file"` (`embed.sysl`, `reference/arrays.md § A file's bytes, embedded`,
+// `reference/inline-assembly.md § A file's bytes in the instructions`): a file read while compiling,
+// from the directory of the source that names it, refused by name when it is not there, and keyed
+// into every cache that replays a build.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private emb_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A project holding `main.sysl` and the other files named, each written under the root.
+private emb_project(main: string, files: []const (string, string)) -> string
+    val root = runner_project("main.sysl", main)
+
+    for i in 0..<files.len
+        emb_put(root, files[i].0, files[i].1)
+
+    root
+end emb_project
+
+private emb_put(root: string, name: string, text: string)
+    val at = s"$root/$name"
+
+    parent_of(at) match
+        Some(dir) -> make_dir_all(dir).unwrap()
+        None -> ()
+
+    write_text(at, text).unwrap()
+end emb_put
+
+// What the program exits with, run from the compiler's own directory rather than the project's.
+private emb_ran(root: string) -> int = run_native_program(root, None, None, DefaultOptimization, buf()) match
+    Ok(code) -> code
+    Err(why) -> panic(s"the run was refused: ${failure_text(why)}")
+
+// The LLVM text of a project for a machine, or what it was refused with.
+private emb_llvm(root: string, machine: Option[string]) -> (string, string) =
+    emit_llvm_text(root, machine) match
+        Err(why) -> (why.message, "")
+        Ok(made) ->
+            if !made.report.is_empty() then (analysis_report(made.report), "")
+            else ("", made.text)
+
+// The refusal a project earns; empty where it compiled.
+private emb_refusal(main: string, files: []const (string, string)) -> string
+    val root = emb_project(main, files)
+    val got = emb_llvm(root, None)
+
+    remove_dir_all(root).unwrap_or(())
+    got.0
+end emb_refusal
+
+// How many lines of a text hold a phrase.
+private emb_count(text: string, phrase: string) -> usize
+    var n: usize = 0
+
+    for line in split(text, "\n")
+        if line.contains(phrase) then n += 1
+
+    n
+end emb_count
+
+// -- the bytes ------------------------------------------------------------------------------------
+
+@test("embed yields the file's bytes, every one, a zero among them")
+emb_the_bytes_arrive()
+    if !emb_ready() then return
+
+    val main =
+        "val b = embed(\"data/blob.bin\")\n" +
+        "val ok = b.len == 5 && b[0] == 104 && b[2] == 0 && b[4] == 255\n" +
+        "exit(if ok then 42 else 1)\n"
+
+    val root = runner_project("main.sysl", main)
+
+    make_dir_all(s"$root/data").unwrap()
+    write_bytes(s"$root/data/blob.bin", [104, 105, 0, 7, 255]).unwrap()
+
+    val code = emb_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 42)
+end emb_the_bytes_arrive
+
+@test("a relative path is read beside the file that writes it, not where the build started")
+emb_relative_to_the_writing_file()
+    if !emb_ready() then return
+
+    val root = emb_project(
+        "import assets.greeting\n\nexit(int(greeting().len))\n",
+        [("assets/assets.sysl", "module assets\n\ngreeting() -> []const u8 = embed(\"hello.txt\")\n"),
+         ("assets/hello.txt", "hello, world"),
+         ("hello.txt", "the root's own, which is not the one meant")])
+
+    val code = emb_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 12, "the file beside assets.sysl, not the one at the root")
+end emb_relative_to_the_writing_file
+
+@test("an absolute path is taken as written")
+emb_an_absolute_path()
+    if !emb_ready() then return
+
+    val other = runner_project("blob.txt", "four")
+    val root = runner_project("main.sysl", s"exit(int(embed(\"$other/blob.txt\").len))\n")
+    val code = emb_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(other).unwrap_or(())
+    assert_eq(code, 4)
+end emb_an_absolute_path
+
+@test("a module val holding an embedded file is laid down, not filled by the entry point")
+emb_a_module_val_is_laid_down()
+    if !emb_ready() then return
+
+    val root = emb_project(
+        "import assets.image\n\nprint(image.len)\n",
+        [("assets/assets.sysl", "module assets\n\nval image: []const u8 = embed(\"image.bin\")\n"),
+         ("assets/image.bin", "ABC")])
+
+    val got = emb_llvm(root, Some("aarch64-freestanding"))
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, "")
+    assert(got.1.contains("private constant [3 x i8] c\"ABC\", align 16"), got.1)
+    assert(got.1.contains("{ ptr null, ptr @.embed."), "the val's initializer names the bytes")
+end emb_a_module_val_is_laid_down
+
+@test("the bytes start on 16 bytes unless align asks for more")
+emb_the_boundary()
+    if !emb_ready() then return
+
+    val main =
+        "import sysl.slices.as_ptr\n\n" +
+        "val a = embed(\"x.bin\")\n" +
+        "val b = embed(\"x.bin\", align = 4096)\n" +
+        "exit(if usize(as_ptr(a)) % 16 == 0 && usize(as_ptr(b)) % 4096 == 0 then 7 else 1)\n"
+
+    val root = emb_project(main, [("x.bin", "x")])
+    val text = emb_llvm(root, None).1
+    val code = emb_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 7)
+    assert(text.contains("c\"x\", align 16"), text)
+    assert(text.contains("c\"x\", align 4096"), text)
+end emb_the_boundary
+
+@test("an empty file is an empty view")
+emb_an_empty_file()
+    if !emb_ready() then return
+
+    val root = emb_project("exit(int(embed(\"none.bin\").len) + 3)\n", [("none.bin", "")])
+    val text = emb_llvm(root, None).1
+    val code = emb_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 3)
+    assert(text.contains("[0 x i8] zeroinitializer, align 16"), text)
+end emb_an_empty_file
+
+@test("a file embedded in two places is laid down once")
+emb_one_file_is_laid_down_once()
+    if !emb_ready() then return
+
+    val main =
+        "first() -> []const u8 = embed(\"x.bin\")\n" +
+        "second() -> []const u8 = embed(\"./x.bin\")\n" +
+        "exit(int(first().len + second().len))\n"
+
+    val root = emb_project(main, [("x.bin", "abcd")])
+    val text = emb_llvm(root, None).1
+    val code = emb_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 8)
+    assert_eq(emb_count(text, "c\"abcd\""), 1, text)
+end emb_one_file_is_laid_down_once
+
+@test("a function of the program's own called embed is what a call reaches")
+emb_yields_to_a_declaration()
+    if !emb_ready() then return
+
+    val root = runner_project("main.sysl", "embed(s: string) -> int = 9\n\nexit(embed(\"nothing here\"))\n")
+    val code = emb_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 9)
+end emb_yields_to_a_declaration
+
+// -- the cache ------------------------------------------------------------------------------------
+
+@test("an edit to an embedded file is a different program to the run cache")
+emb_an_edit_rebuilds()
+    if !emb_ready() then return
+
+    val cache = make_temp_dir("sysl-emb-cache").unwrap()
+
+    use_run_cache_dir(Some(cache))
+
+    val root = emb_project("exit(int(embed(\"n.txt\")[0]))\n", [("n.txt", "A")])
+    val first = emb_ran(root)
+
+    emb_put(root, "n.txt", "B")
+
+    val second = emb_ran(root)
+
+    use_run_cache_dir(None)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
+    assert_eq(first, 65)
+    assert_eq(second, 66, "the second run read the file again rather than replaying the first")
+end emb_an_edit_rebuilds
+
+@test("the files a source embeds are found in its text, in every spelling a literal takes")
+emb_inputs_are_found_in_the_text()
+    val dir = make_temp_dir("sysl-emb-inputs").unwrap()
+
+    write_text(s"$dir/a.bin", "a").unwrap()
+    write_text(s"$dir/b.bin", "b").unwrap()
+    write_text(s"$dir/c.bin", "c").unwrap()
+    write_text(s"$dir/d.bin", "d").unwrap()
+
+    val text =
+        "val a = embed(\"a.bin\")\n" +
+        "val b = embed( raw\"b.bin\" )\n" +
+        "val c = embed(\n    s\"c.bin\", align = 64)\n" +
+        "asm\n    [aarch64] \".incbin \\\"d.bin\\\"\"\n" +
+        "val e = myembed(\"e.bin\")\n" +
+        "val f = embed(\"missing.bin\")\n"
+
+    val got = embedded_inputs(s"$dir/main.sysl", text.bytes)
+
+    remove_dir_all(dir).unwrap_or(())
+
+    var names: Buf[string] = buf()
+
+    for item in got
+        names.push(basename(item.0))
+
+    assert_eq(names.len(), 5)
+    assert_eq(names.at(0), "a.bin")
+    assert_eq(names.at(1), "b.bin")
+    assert_eq(names.at(2), "c.bin")
+    assert_eq(names.at(3), "d.bin")
+    assert_eq(names.at(4), "missing.bin")
+    assert_eq(got.at(4).1, "absent")
+    assert(got.at(0).1 != got.at(1).1, "each by its own bytes")
+end emb_inputs_are_found_in_the_text
+
+// -- the refusals ---------------------------------------------------------------------------------
+
+@test("a file that is not there is refused, naming the path tried")
+emb_refuses_a_missing_file()
+    if !emb_ready() then return
+
+    val said = emb_refusal("print(embed(\"nope.bin\").len)\n", [])
+
+    assert(said.contains("cannot embed 'nope.bin': there is no file at '/"), said)
+    assert(said.contains("/nope.bin' — a relative path is read from the directory of the file"), said)
+end emb_refuses_a_missing_file
+
+@test("a directory is refused")
+emb_refuses_a_directory()
+    if !emb_ready() then return
+
+    val said = emb_refusal("print(embed(\"sub\").len)\n", [("sub/x.txt", "x")])
+
+    assert(said.contains("/sub' is a directory, and 'embed' takes a file"), said)
+end emb_refuses_a_directory
+
+@test("a path that is not a literal is refused, since a replayed build could not see it")
+emb_refuses_a_computed_path()
+    if !emb_ready() then return
+
+    val said = emb_refusal("val n = \"x.bin\"\nprint(embed(n).len)\n", [("x.bin", "x")])
+
+    assert(said.contains("so the path is written as a string literal, not computed"), said)
+end emb_refuses_a_computed_path
+
+@test("an alignment that is not a constant power of two is refused")
+emb_refuses_a_bad_boundary()
+    if !emb_ready() then return
+
+    val three = emb_refusal("print(embed(\"x.bin\", align = 3).len)\n", [("x.bin", "x")])
+    val running = emb_refusal("var n = 8\nprint(embed(\"x.bin\", align = n).len)\n", [("x.bin", "x")])
+
+    assert(three.contains("'align = 3' is not an alignment — a boundary is a power of two"), three)
+    assert(running.contains("'align' on 'embed' needs a constant"), running)
+end emb_refuses_a_bad_boundary
+
+@test("embed takes one path and nothing but align beside it")
+emb_refuses_other_arguments()
+    if !emb_ready() then return
+
+    val none = emb_refusal("print(embed().len)\n", [])
+    val two = emb_refusal("print(embed(\"a\", \"b\").len)\n", [])
+    val named = emb_refusal("print(embed(\"a\", size = 2).len)\n", [])
+
+    assert(none.contains("'embed' takes the file's path — embed(\"logo.bin\")"), none)
+    assert(two.contains("'embed' takes one path"), two)
+    assert(named.contains("there is no 'size'"), named)
+end emb_refuses_other_arguments
+
+// -- `.incbin` --------------------------------------------------------------------------------------
+
+private val emb_incbin_program: string =
+    "@section(\".rodata.blobs\")\n" +
+    "asm\n" +
+    "    [aarch64]\n" +
+    "        \".globl blob_start, blob_end\"\n" +
+    "        \"blob_start:\"\n" +
+    "        \".incbin \\\"bin/blob.bin\\\"\"\n" +
+    "        \"blob_end:\"\n" +
+    "    [x86_64]\n" +
+    "        \".incbin \\\"not/built/here.bin\\\"\"\n" +
+    "    [thumb, riscv64, riscv32, craft, wasm32] unavailable \"aarch64 only\"\n\n" +
+    "@export(\"kmain\")\n" +
+    "kmain() -> int = 0\n"
+
+@test("a .incbin is read beside the asm block's file, whatever directory the build ran in")
+emb_incbin_is_read_beside_the_file()
+    if !emb_ready() then return
+
+    val root = emb_project(emb_incbin_program, [("bin/blob.bin", "BLOB")])
+    val text = emb_llvm(root, Some("aarch64-freestanding"))
+
+    // An archive, so the assembler really reads the file: the build runs from the compiler's
+    // directory, where `bin/blob.bin` is not.
+    val built = build_c_archive(root, Some("aarch64-freestanding"), None, DefaultOptimization,
+                                Some(s"$root/out.a"), None, (m) -> ())
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(text.0, "")
+    assert(text.1.contains(s".incbin \\22${absolute_path(root)}/bin/blob.bin\\22 /* "), text.1)
+    assert(built.is_ok(), "the assembler found the file")
+end emb_incbin_is_read_beside_the_file
+
+@test("an edit to a .incbin file changes the instructions' text, so no cached object is replayed")
+emb_incbin_edit_changes_the_text()
+    if !emb_ready() then return
+
+    val root = emb_project(emb_incbin_program, [("bin/blob.bin", "BLOB")])
+    val before = emb_llvm(root, Some("aarch64-freestanding")).1
+
+    emb_put(root, "bin/blob.bin", "BLOC")
+
+    val after = emb_llvm(root, Some("aarch64-freestanding")).1
+
+    remove_dir_all(root).unwrap_or(())
+    assert(before.contains(".incbin"), before)
+    assert(before != after)
+end emb_incbin_edit_changes_the_text
+
+@test("a .incbin file that is not there is refused, naming the path tried")
+emb_incbin_refuses_a_missing_file()
+    if !emb_ready() then return
+
+    val root = emb_project(emb_incbin_program, [])
+    val said = emb_llvm(root, Some("aarch64-freestanding")).0
+
+    remove_dir_all(root).unwrap_or(())
+    assert(said.contains("cannot include 'bin/blob.bin' with '.incbin': there is no file at '"), said)
+    assert(!said.contains("not/built/here.bin"), "another machine's arm is not read")
+end emb_incbin_refuses_a_missing_file

@@ -96,6 +96,9 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
     // value a constant expression rather than something a prologue has to build.
     TStrLit(s) -> string_const(e, s)
 
+    // The same three words over the file's bytes.
+    TEmbed(file, bytes, align) -> embed_const(e, file, bytes, align)
+
     // **`[0; N]` is one word, not N of them.** `zeroinitializer` is what LLVM takes for an aggregate
     // whose every bit is zero, and writing the elements out instead costs the whole array in the
     // module's text for an output that never grows.
@@ -218,6 +221,7 @@ private is_constant_image(t: TExpr) -> bool = *t.kind match
     TBoolLit(_) -> true
     TFloatLit(_, ty) -> ty == real_type() || ty == Floating(32, false)
     TStrLit(_) -> true
+    TEmbed(_, _, _) -> true
     TNullLit(_) -> true
     TArrayLit(items, _) -> all_constant(items)
     TStructNew(decl, args) -> bitfield_ranges_of(Struct(decl)).is_none() && all_constant(args)
@@ -239,6 +243,40 @@ string_const(e: *Emit, s: string) -> Val
     fields.push(ir_arg(word_lty(e), VInt(from_int(long(s.bytes.len)))))
     VAgg(fields)
 end string_const
+
+// An embedded file as a value: the owner nothing frees, its bytes, and how many there are.
+//
+// **The bytes are laid down once per file and boundary**, however many places name them -- a generic
+// instantiated three times, or two functions embedding one image, would otherwise carry the image
+// three times. The global's name is made from the path, so a second use finds the first.
+embed_const(e: *Emit, file: string, bytes: []u8, align: int) -> Val
+    val name = s".embed.${bytes_fingerprint(file.bytes)}.$align"
+
+    if !has_global(e, name)
+        var data: Buf[u8] = buf()
+
+        for b in bytes do data.push(b)
+
+        // An empty file is an array of nothing, which LLVM takes as zeros rather than as `c""`.
+        val image = if data.is_empty() then VZero else VBytes(data)
+
+        e.globals.push(IrGlobal(name, true, LArr(int(data.len()), LInt(8)), Some(image), LinkPrivate,
+                                None, Some(align), false, false))
+
+    var fields: Buf[IrArg] = buf()
+
+    fields.push(ir_arg(LPtr, VNull))
+    fields.push(ir_arg(LPtr, VGlobal(name)))
+    fields.push(ir_arg(word_lty(e), VInt(from_int(long(bytes.len)))))
+    VAgg(fields)
+end embed_const
+
+private has_global(e: *Emit, name: string) -> bool
+    for g in e.globals
+        if g.name == name then return true
+
+    false
+end has_global
 
 // Whether a constant is every bit zero, which is the one thing `zeroinitializer` may stand for. A
 // float is zero at bit pattern zero alone, so `-0.0` -- whose sign bit is set -- is correctly not
