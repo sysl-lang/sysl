@@ -297,6 +297,77 @@ private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
                     "make the initializer constant data, which is laid straight into the object file")
 end export_storage
 
+// **A bare image that starts at a symbol of its own and never runs `main`** -- the same refusal as
+// `export_storage`, for a linked image rather than an archive. Computed storage is filled by `main`;
+// `image_storage_unfilled` says when nothing will call it, and then every way into the image's sysl
+// code that reaches such storage is refused, naming the entry. A way in is what code outside the
+// program's own calls can start: the entry itself where sysl defines it, an `@export`, and a function
+// a `@section` or a calling convention places for something else to jump to. The walk is the
+// reachability one, so the storage may be several calls down.
+check_image_storage(a: &Analysis, p: TProgram, own: Buf[string], entry: string)
+    if p.c_artifact || !image_storage_unfilled(entry, p) then return
+
+    var computed: Buf[string] = buf()
+
+    for i in 0..<p.vals.len()
+        if p.vals.at(i).computed then computed.push(p.vals.at(i).symbol)
+
+    if computed.is_empty() then return
+
+    val t = a.tables.target
+    val ways = image_ways_in(p, own, entry)
+
+    for i in 0..<ways.len()
+        val f = ways.at(i)
+        val reached = vals_reached_from(p, f)
+
+        var named: Buf[string] = buf()
+
+        for k in 0..<reached.len()
+            if holds_string(computed, reached.at(k)) then named.push(s"'${qualified_name(reached.at(k))}'")
+
+        if named.is_empty() then continue
+
+        var how = "is placed for code outside the program to enter"
+
+        if f.exported.is_some() then how = "is exported"
+        if f.name == entry || f.exported == Some(entry) then how = "starts the image"
+
+        a.fault(func_home(a, f.name), f.span,
+                s"'${qualified_name(f.name)}' $how and reaches ${joined_list(sorted_names(named))}, " +
+                "which is module storage an initializer fills before the program's own statements " +
+                s"run. 'main' is what fills it, and this image starts at '$entry' " +
+                s"('targets.${t.name}.entry'), which never calls 'main' — so the function would read " +
+                "whatever the image left. Build the value where it is used instead: a local, a " +
+                "struct built once and handed to what reads it, or, for a table of functions, a " +
+                "'match' that dispatches on the index; or make the initializer constant data, which " +
+                "is laid straight into the image")
+end check_image_storage
+
+// The functions code outside the program's own calls can start, on an image entered at `entry`.
+private image_ways_in(p: TProgram, own: Buf[string], entry: string) -> Buf[TFunc]
+    val points = entry_points(p, own)
+
+    var out: Buf[TFunc] = buf()
+
+    for i in 0..<points.len()
+        val f = points.at(i)
+
+        if f.conv.is_some() || f.exported.is_some() || f.section.is_some() then out.push(f)
+
+    // The entry, where sysl defines it under its own name: a root-module function's symbol is its name.
+    var listed = false
+
+    for i in 0..<out.len()
+        if out.at(i).name == entry then listed = true
+
+    if !listed
+        for i in 0..<p.funcs.len()
+            if p.funcs.at(i).name == entry then out.push(p.funcs.at(i))
+
+    out
+end image_ways_in
+
 // Names joined the way a sentence lists them after a colon: with commas and nothing else.
 private joined_list(xs: Buf[string]) -> string
     var out = ""

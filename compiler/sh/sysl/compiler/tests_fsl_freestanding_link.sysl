@@ -205,6 +205,149 @@ fsl_main_kept_without_an_entry()
     lbr_drop([bare, named])
 end fsl_main_kept_without_an_entry
 
+// -- storage `main` fills, on an image whose entry never runs it ---------------------------------------
+
+// A module holding storage whose initializer is a call, which does not fold, and a reader of it.
+private val fsl_computed_store: string =
+    "module tables\n\ndouble(x: int) -> int = x * 2\n\nval N: int = double(3)\n\nread() -> int = N\n"
+
+// The same storage over a constructor of literals, which folds into the image.
+private val fsl_folded_store: string =
+    "module tables\n\nstruct Q\n    raw: int\n\nval N: Q = Q(3 * 2)\n\nread() -> int = N.raw\n"
+
+// A start that reads the table, and never returns.
+private val fsl_reading_start: string =
+    "import tables\n\n@export(\"kstart\")\nkstart() -> never\n    var n = tables.read()\n\n" +
+    "    loop\n        n += 1\n"
+
+private fsl_store_tree(program: string, store: string, manifest: string) -> string
+    var files = lbr_two("main.sysl", program, "package.hocon", manifest)
+
+    files.push(("tables/tables.sysl", store))
+    files.push(("link.ld", fsl_script))
+    lbr_tree(files)
+end fsl_store_tree
+
+// What the analysis said of a project built for this machine: `""` where it said nothing.
+private fsl_report(project: string, target: Option[string]) -> string =
+    emit_llvm_text(project, target) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> if emitted.report.is_empty() then "" else analysis_report(emitted.report)
+
+private fsl_storage_refusal(func: string, how: string) -> string =
+    s"'$func' $how and reaches 'tables.N', which is module storage an initializer fills before the " +
+    "program's own statements run. 'main' is what fills it, and this image starts at 'kstart' " +
+    "('targets.aarch64-freestanding.entry'), which never calls 'main' — so the function would read " +
+    "whatever the image left. Build the value where it is used instead: a local, a struct built once " +
+    "and handed to what reads it, or, for a table of functions, a 'match' that dispatches on the " +
+    "index; or make the initializer constant data, which is laid straight into the image"
+
+@test("an image whose entry never runs main may not read storage main fills, naming the entry")
+fsl_unfilled_storage_refused()
+    if !lbr_ready() then return
+
+    val p = fsl_store_tree(fsl_reading_start, fsl_computed_store, fsl_ok_manifest())
+    val said = fsl_report(p, Some(fsl_target))
+
+    assert(said.contains(fsl_storage_refusal("kstart", "starts the image")), said)
+    lbr_drop([p])
+end fsl_unfilled_storage_refused
+
+@test("and neither may an export the entry's code reaches by its symbol")
+fsl_unfilled_storage_refused_for_an_export()
+    if !lbr_ready() then return
+
+    val program = "import tables\n\n" + fsl_functions + "\n@export(\"helper\")\nhelper() -> int = tables.read()\n"
+    val p = fsl_store_tree(program, fsl_computed_store, fsl_ok_manifest())
+    val said = fsl_report(p, Some(fsl_target))
+
+    assert(said.contains(fsl_storage_refusal("helper", "is exported")), said)
+    assert(!said.contains("'kstart' starts the image"), said)
+    lbr_drop([p])
+end fsl_unfilled_storage_refused_for_an_export
+
+@test("storage that folds is laid into the image, and the image still gets no main")
+fsl_folded_storage_is_fine()
+    if !lbr_ready() then return
+
+    val p = fsl_store_tree(fsl_reading_start, fsl_folded_store, fsl_ok_manifest())
+    val text = fsl_text(p)
+
+    assert_eq(fsl_report(p, Some(fsl_target)), "")
+    assert(!fsl_defines_main(text), "a main nothing calls")
+    lbr_drop([p])
+end fsl_folded_storage_is_fine
+
+@test("a constant made into a new type, alone or in a struct, folds and needs no main")
+fsl_new_type_storage_is_fine()
+    if !lbr_ready() then return
+
+    val store = "module tables\n\ntype Addr = new u64\n\nstruct Maps\n    a: Addr\n    b: Addr\n\n" +
+                "var root: Addr = Addr(0)\nval maps: Maps = Maps(Addr(0), Addr(4096))\n\n" +
+                "read() -> int = int(u64(root) + u64(maps.b))\n"
+    val p = fsl_store_tree(fsl_reading_start, store, fsl_ok_manifest())
+
+    assert_eq(fsl_report(p, Some(fsl_target)), "")
+    assert(!fsl_defines_main(fsl_text(p)), "a main filling storage that folds")
+    lbr_drop([p])
+end fsl_new_type_storage_is_fine
+
+@test("computed storage no way in reaches is left alone, its main emitted as before")
+fsl_unreached_storage_is_fine()
+    if !lbr_ready() then return
+
+    val program = "import tables\n\n" + fsl_functions + "\nunused() -> int = tables.read()\n"
+    val p = fsl_store_tree(program, fsl_computed_store, fsl_ok_manifest())
+
+    assert_eq(fsl_report(p, Some(fsl_target)), "")
+    lbr_drop([p])
+end fsl_unreached_storage_is_fine
+
+@test("an entry that branches to main, or a program with statements of its own, fills it")
+fsl_storage_filled_where_main_runs()
+    if !lbr_ready() then return
+
+    val start_file = "asm\n    [aarch64]\n        \".globl _start\"\n        \"_start:\"\n" +
+                     "        \"bl main\"\n        \"bl kstart\"\n" +
+                     "    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable \"aarch64 only\"\n\n"
+    val asm_main = fsl_store_tree(start_file + fsl_reading_start, fsl_computed_store, fsl_ok_manifest())
+    val statements = fsl_store_tree(fsl_reading_start + "\nprint(1)\n", fsl_computed_store, fsl_ok_manifest())
+
+    assert_eq(fsl_report(asm_main, Some(fsl_target)), "")
+    assert(fsl_defines_main(fsl_text(asm_main)), "the start file's main is not there")
+    assert_eq(fsl_report(statements, Some(fsl_target)), "")
+    lbr_drop([asm_main, statements])
+end fsl_storage_filled_where_main_runs
+
+@test("an entry named main, or none, and a hosted build, are unchanged")
+fsl_storage_unchanged_without_an_entry_of_its_own()
+    if !lbr_ready() then return
+
+    val named = fsl_store_tree(fsl_reading_start, fsl_computed_store, fsl_manifest("    entry = \"main\"\n"))
+    val hosted = fsl_store_tree(fsl_reading_start, fsl_computed_store, fsl_ok_manifest())
+
+    assert_eq(fsl_report(named, Some(fsl_target)), "")
+    assert_eq(fsl_report(hosted, None), "")
+    lbr_drop([named, hosted])
+end fsl_storage_unchanged_without_an_entry_of_its_own
+
+@test("a symbol in the module asm is a whole word, so kmain and main_loop do not name main")
+fsl_asm_names_main_as_a_word()
+    var blocks: Buf[TModuleAsm] = buf()
+    var lines: Buf[string] = buf()
+
+    lines.push("ldr x1, =kmain")
+    lines.push("b main_loop")
+    blocks.push(TModuleAsm(lines, None, None, false))
+
+    assert(!asm_names_symbol(blocks, "main"), "a longer symbol read as main")
+
+    lines.push("bl main")
+    blocks.push(TModuleAsm(lines, None, None, false))
+
+    assert(asm_names_symbol(blocks, "main"), "bl main")
+end fsl_asm_names_main_as_a_word
+
 // -- a real link -----------------------------------------------------------------------------------
 
 private val fsl_readelf: string = "/opt/homebrew/opt/llvm/bin/llvm-readelf"

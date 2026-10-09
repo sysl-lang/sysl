@@ -531,6 +531,23 @@ Where there *is* something to do, `main` is emitted whatever the entry is, and c
 entry's job — a `_start` that sets the stack up and branches to `main` is the ordinary shape of a C
 runtime's start file.
 
+**Emitting `main` is not running it, and computed storage is where the difference is silent.** A
+module `val` whose initializer does not fold — a table of function addresses, a call, a constructor
+of a `new` type — is filled by the first stores in `main`. On an image whose `entry` is a symbol of
+its own, the storage counts as filled only where something will run `main`: the program has
+top-level statements or a declared `main` (calling it is then the entry's job), or a module-level
+`asm` block names `main`, as a start file branching to it does. Otherwise nothing fills it, and
+every way into the image — the entry itself where sysl defines it, an `@export`, a function a
+`@section` or a calling convention places — that reaches such storage is refused, naming the entry:
+
+```
+'kstart' starts the image and reaches 'tables.N', which is module storage an initializer fills before the program's own statements run. 'main' is what fills it, and this image starts at 'kstart' ('targets.aarch64-freestanding.entry'), which never calls 'main' — so the function would read whatever the image left. Build the value where it is used instead: a local, a struct built once and handed to what reads it, or, for a table of functions, a 'match' that dispatches on the index; or make the initializer constant data, which is laid straight into the image
+```
+
+Storage that folds — literals, a struct over constants — is laid into the image and never asks;
+computed storage nothing reaches is left alone. It is the same rule `build-c` holds a freestanding
+archive to, which has no entry at all.
+
 ### What is refused
 
 - **The keys in a dependency.** How an image is linked is the program's own to say; a library's
@@ -547,6 +564,7 @@ runtime's start file.
   linker's own line.
 - **A value that is not a non-empty string**, and an `entry` holding a space, a comma or `=`, when the
   file is read.
+- **Computed module storage read from an image whose entry never runs `main`** — described above.
 ## What the generated code may use of the machine
 
 A kernel wants two things a program does not: code that never touches the floating-point and SIMD
