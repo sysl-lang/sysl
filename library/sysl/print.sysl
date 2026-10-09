@@ -1,6 +1,7 @@
 module sysl
 
-import sysl.sys.{sysl_fflush, sysl_putchar, sysl_snprintf, sysl_stdout_write, sysl_write}
+import sysl.io.sys.fd_flush
+import sysl.sys.{sysl_putchar, sysl_snprintf, sysl_stdout_write, sysl_write}
 
 /** The printing surface, which lives in the library rather than in the compiler. `print(a, b, c)` is
  * a desugaring onto these one-value functions, chosen by each argument's static type, so the
@@ -14,9 +15,9 @@ import sysl.sys.{sysl_fflush, sysl_putchar, sysl_snprintf, sysl_stdout_write, sy
  * shares that buffer, and one queue is what keeps the two in order.
  *
  * A freestanding target has no stdio, so there it writes a byte at a time through the `putchar` the
- * board supplies. That is also one of the two functions such a target has to replace: swap its body
- * for a `write` syscall, and `FdReader.read`'s for a `read` one, and the whole surface above both is
- * unchanged.
+ * board supplies. That is also one of the two things such a target has to supply: answer `putchar`
+ * with a `write` syscall, and `sysl.io.sys`'s `fd_read` hook with a `read` one, and the whole surface
+ * above both is unchanged.
  *
  * A short `fwrite` is looped over, and one that wrote nothing ends the loop -- the stream has failed,
  * and there is nowhere left to report that to.
@@ -70,15 +71,17 @@ prints(s: string) = putbytes(s.bytes)
  * still runs -- can otherwise sit on everything already printed until the process ends, because
  * `putbytes` writes through C's buffered `stdout`. This is the call that pushes it out early.
  *
- * `fflush(NULL)` runs underneath, which flushes every open output stream rather than naming one --
+ * It goes through `sysl.io.sys`'s `fd_flush` hook for descriptor 1. On a hosted target the library
+ * answers it with `fflush(NULL)`, which flushes every open output stream rather than naming one --
  * `stdout` is a `#define` on Darwin (`reference/ffi.md § An extern also declares a variable`), so an
  * `extern` naming it by pointer would not link there, and flushing everything costs nothing a program
- * would notice, since there is normally only the one stream open to flush.
+ * would notice, since there is normally only the one stream open to flush. A target with no C library
+ * answers the hook itself. It answers zero, or a negative number where the flush failed.
  *
  * `eprints` needs no matching call: `eputbytes` writes with a raw `write(2)`, which keeps no buffer
  * of its own to hold anything back.
  */
-flush() = sysl_fflush(null)
+flush() = fd_flush(1)
 
 /** The other stream, which is where a program's diagnostics belong.
  *

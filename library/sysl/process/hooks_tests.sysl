@@ -1,0 +1,131 @@
+module sysl.process
+@requires(posix)
+@tests
+
+import sysl.fs.{IoError, append, create, make_temp_dir, read_text, remove_dir_all}
+
+// What `sysl.process` does over `sysl.process.sys`'s hooks on a hosted target, where
+// `sysl.process.hosted` answers them: a signal sent to a started child, and a child's output streams
+// sent to a file. The tests beside this file are the evidence that everything else is as it was.
+
+// A directory of this test's own, for the files a child writes into.
+private scratch() -> string = make_temp_dir("sysl-proc-hooks").unwrap()
+
+// ## A signal of the caller's choosing
+
+@test("a started child that is sent signal 9 reports it was killed, not an exit code")
+hk_killed_child_reports_the_signal()
+    val c = start("sleep", ["5"]).unwrap()
+
+    assert(c.kill(9).is_ok(), "the signal could not be sent")
+    assert_eq(c.wait().unwrap().status, Status.Signalled(9))
+
+@test("the default signal asks a child to stop, and the status names it")
+hk_default_signal_is_terminate()
+    val c = start("sleep", ["5"]).unwrap()
+
+    c.kill().unwrap()
+    assert_eq(c.wait().unwrap().status, Status.Signalled(15))
+
+@test("a child already waited for is not signalled again")
+hk_waited_child_is_not_signalled()
+    val c = start("true").unwrap()
+
+    assert_eq(c.wait().unwrap().status, Status.Exited(0))
+    assert(c.kill(9).is_ok(), "a finished child answers Ok")
+    assert_eq(c.wait().unwrap().status, Status.Exited(0))
+
+// ## Output to a file
+
+@test("a child's standard output sent to a path is in the file, and not captured anywhere else")
+hk_stdout_to_a_path()
+    val dir = scratch()
+    val listing = s"$dir/out.txt"
+
+    assert_eq(run("echo", ["to a file"], stdout = Stdio.ToPath(listing)).unwrap(), Status.Exited(0))
+    assert_eq(read_text(listing).unwrap(), "to a file\n")
+
+    // A second run starts the file afresh, as a shell's `>` does.
+    run("echo", ["again"], stdout = Stdio.ToPath(listing)).unwrap()
+    assert_eq(read_text(listing).unwrap(), "again\n")
+
+    remove_dir_all(dir)
+end hk_stdout_to_a_path
+
+@test("standard error goes to its own file and standard output is left alone")
+hk_stderr_to_a_path()
+    val dir = scratch()
+    val errs = s"$dir/err.txt"
+
+    val s = run("sh", ["-c", "echo kept >&2; exit 4"], stderr = Stdio.ToPath(errs)).unwrap()
+
+    assert_eq(s, Status.Exited(4))
+    assert_eq(read_text(errs).unwrap(), "kept\n")
+
+    remove_dir_all(dir)
+end hk_stderr_to_a_path
+
+@test("an open file takes what was buffered first, then both streams, and stays open")
+hk_both_streams_to_an_open_file()
+    val dir = scratch()
+    val log = s"$dir/log.txt"
+    var f = create(log).unwrap()
+
+    f.write("before\n".bytes)
+    run("sh", ["-c", "echo out; echo err >&2"], stdout = Stdio.ToFile(f),
+        stderr = Stdio.ToFile(f)).unwrap()
+
+    assert(!f.closed(), "the caller's file was closed for it")
+
+    f.close().unwrap()
+    assert_eq(read_text(log).unwrap(), "before\nout\nerr\n")
+
+    // Appending keeps what is there.
+    var g = append(log).unwrap()
+
+    run("echo", ["more"], stdout = Stdio.ToFile(g)).unwrap()
+    g.close().unwrap()
+    assert_eq(read_text(log).unwrap(), "before\nout\nerr\nmore\n")
+
+    remove_dir_all(dir)
+end hk_both_streams_to_an_open_file
+
+@test("a path that cannot be opened is an error and nothing is started")
+hk_unopenable_path_starts_nothing()
+    val dir = scratch()
+    val marker = s"$dir/ran"
+
+    val r = run("touch", [marker], stdout = Stdio.ToPath(s"$dir/no/such/dir/out.txt"))
+
+    assert(r.is_err(), "an unopenable file was not refused")
+    assert_eq(r.unwrap_err(), IoError.NotFound)
+    assert(read_text(marker).is_err(), "the child ran although its output had nowhere to go")
+
+    remove_dir_all(dir)
+end hk_unopenable_path_starts_nothing
+
+@test("a closed file is refused as NotOpen")
+hk_closed_file_is_refused()
+    val dir = scratch()
+    var f = create(s"$dir/x.txt").unwrap()
+
+    f.close().unwrap()
+    assert_eq(run("true", stdout = Stdio.ToFile(f)).unwrap_err(), IoError.NotOpen)
+
+    remove_dir_all(dir)
+end hk_closed_file_is_refused
+
+// ## What was there before
+
+@test("spawning, capturing and the default streams answer as they did before the hooks")
+hk_spawn_and_capture_unchanged()
+    assert_eq(run("true").unwrap(), Status.Exited(0))
+    assert_eq(run("false").unwrap(), Status.Exited(1))
+    assert_eq(capture("echo", ["unchanged"]).unwrap().text, "unchanged\n")
+
+    val out = capture("sh", ["-c", "echo a; echo b >&2"], stderr = true).unwrap()
+
+    assert_eq(out.text, "a\n")
+    assert_eq(out.err.unwrap_or("none"), "b\n")
+    assert_eq(run("sysl-no-such-program-anywhere").unwrap_err(), IoError.NotFound)
+end hk_spawn_and_capture_unchanged

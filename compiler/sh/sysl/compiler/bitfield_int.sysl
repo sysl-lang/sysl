@@ -1,0 +1,84 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// A bitfield struct and the integer it is: `T::Bits(n)` makes one from that integer and `x.bits`
+// reads it back.
+//
+// **A `@packed` struct whose fields are bit ranges IS one unsigned integer** (`layout.sysl`'s
+// `bitfield_ranges`), so neither direction converts anything: the value is the container, and the
+// two forms only change which type the same bits are read at. They are fixed point's two spellings
+// for the same reinterpretation (`fixed.sysl`'s `fixed_attr` and `fixed_bits_of`), and they are not
+// a conversion call `Esr(raw)` because that spelling is already the field constructor -- a bitfield
+// struct of one field would make it mean two things.
+//
+// **The integer is exactly the container's type**, `u<width>` with the width a whole number of
+// bytes: a literal takes that type from the position, and a value of any other width or signedness
+// is refused rather than widened or narrowed, which would be a second conversion hidden in the first.
+//
+// **Nothing is checked on the way in.** An enum-typed field may hold a value no variant has once the
+// bits came from outside; the field read is what holds it to its variants, as it is for a struct
+// reached through a pointer the hardware filled.
+
+// The unsigned integer a bitfield struct is stored as, where it is one.
+bitfield_storage(d: &StructType) -> Option[Type] = bitfield_ranges(d) match
+    Some(ranges) -> Some(Integer(bitfield_bits(ranges), false, false))
+    None -> None
+
+// `T::Attr(...)` on a struct: `Bits` for a bitfield struct, and a refusal saying which kind of
+// struct has it otherwise.
+struct_attr(cx: &Analyzer, span: Span, written: string, d: &StructType, attr: string,
+            args: Buf[Expr]) -> TExpr
+    val storage = bitfield_storage(d)
+
+    if storage.is_none()
+        if attr == "Bits"
+            return cx.err(span, s"'$written' is not a bitfield struct, so '$written::Bits' has no " +
+                          "integer to make it from — only a '@packed' struct with a field narrower " +
+                          "than a byte is one integer")
+
+        return cx.err(span, s"'${type_show(Struct(d))}' has no type attributes")
+    end if
+
+    if attr != "Bits" then
+        return cx.err(span, s"'$written' has no attribute '$attr' — a bitfield struct answers " +
+                      s"'$written::Bits'")
+
+    if args.len() != 1 then return cx.err(span, s"'$written::Bits' takes exactly one argument")
+
+    // Making one writes every field at once, so it is held to what the constructor is.
+    if !layout_known(cx.an, cx.scope, span, d.base, qualified_name(d.base)) then
+        return bad_expr(span)
+
+    every_field_visible(cx, span, d, s"'$written::Bits'",
+                        "build it through an associated function of its own")
+
+    val raw_ty = storage.unwrap()
+    val x = type_expr(cx, args.at(0), Some(raw_ty))
+    val xt = texpr_type(x)
+
+    if xt == Unknown then return x
+
+    if disagree(xt, raw_ty) then
+        return cx.err(args.at(0).span, s"'$written::Bits' takes the ${type_show(raw_ty)} " +
+                      s"'$written' is stored as, not ${type_show(xt)} — a value of another width is " +
+                      s"converted first, as '${type_show(raw_ty)}(x)'")
+
+    TExpr(span, TIntOp("bitfield_from_bits", x, None, raw_ty, Struct(d)))
+end struct_attr
+
+// `x.bits` on a bitfield struct: the whole container, read as the integer it is. `None` where the
+// struct is not one, or declares a member of that name itself, which is then what `.bits` reaches.
+bitfield_bits_read(cx: &Analyzer, span: Span, value: TExpr, d: &StructType) -> Option[TExpr]
+    val storage = bitfield_storage(d)
+
+    if storage.is_none() || has_member(cx.an, Struct(d), "bits") then return None
+
+    // Reading every bit is reading every field.
+    every_field_visible(cx, span, d, "'.bits'", "read the fields it may reach instead")
+
+    val raw_ty = storage.unwrap()
+
+    Some(TExpr(span, TIntOp("bitfield_bits", value, None, raw_ty, raw_ty)))
+end bitfield_bits_read

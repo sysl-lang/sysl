@@ -461,3 +461,201 @@ srg_import_names_a_form()
 
     srg_refuses(srg_arm, "import sysl.isb\nisb()\n", "'isb' is a built-in form rather than a member of any module")
 end srg_import_names_a_form
+
+// -- maintenance: tlbi, dc, ic, at -----------------------------------------------------------------
+
+// The operations a kernel issues, as the design lists them: those taking no register, then those
+// that read one.
+private val srg_tlbi_bare: [2]string = ["vmalle1", "vmalle1is"]
+private val srg_tlbi_reg: [10]string = ["vae1", "vae1is", "vale1", "vale1is", "aside1", "aside1is",
+                                        "vaae1", "vaae1is", "vaale1", "vaale1is"]
+private val srg_dc_reg: [5]string = ["civac", "cvac", "cvau", "ivac", "zva"]
+private val srg_ic_bare: [2]string = ["iallu", "ialluis"]
+private val srg_at_reg: [4]string = ["s1e1r", "s1e1w", "s1e0r", "s1e0w"]
+
+// A function issuing every operation, each register operand the parameter `v`, under `head`.
+private srg_every_maintenance_op(head: string) -> string
+    var text = head + "go(v: u64) -> u64\n"
+
+    for w in srg_tlbi_bare
+        text = text + s"    tlbi($w)\n"
+
+    for w in srg_tlbi_reg
+        text = text + s"    tlbi($w, v)\n"
+
+    for w in srg_dc_reg
+        text = text + s"    dc($w, v)\n"
+
+    for w in srg_ic_bare
+        text = text + s"    ic($w)\n"
+
+    text = text + "    ic(ivau, v)\n    var par: u64 = 0\n"
+
+    for w in srg_at_reg
+        text = text + s"    par = par + at($w, v)\n"
+
+    text + "    par\n"
+end srg_every_maintenance_op
+
+@test("every maintenance operation is one sideeffect asm clobbering memory, its register as $0")
+srg_maintenance_is_inline_asm()
+    if !srg_ready() then return
+
+    val ir = srg_ir(srg_every_maintenance_op("") + "print(go(4096))\n")
+
+    for w in srg_tlbi_bare
+        srg_says(ir, s"call void asm sideeffect \"tlbi $w\", \"~{memory}\"()")
+
+    for w in srg_tlbi_reg
+        srg_says(ir, s"call void asm sideeffect \"tlbi $w, $$0\", \"r,~{memory}\"(i64 ")
+
+    for w in srg_dc_reg
+        srg_says(ir, s"call void asm sideeffect \"dc $w, $$0\", \"r,~{memory}\"(i64 ")
+
+    for w in srg_ic_bare
+        srg_says(ir, s"call void asm sideeffect \"ic $w\", \"~{memory}\"()")
+
+    srg_says(ir, "call void asm sideeffect \"ic ivau, $0\", \"r,~{memory}\"(i64 ")
+
+    for w in srg_at_reg
+        srg_says(ir, s"call i64 asm sideeffect \"at $w, $$1\\0Aisb\\0Amrs $$0, par_el1\", " +
+                 "\"=r,r,~{memory}\"(i64 ")
+end srg_maintenance_is_inline_asm
+
+@test("an address may be a raw pointer, which reaches the asm as a ptr")
+srg_maintenance_takes_a_pointer()
+    if !srg_ready() then return
+
+    val ir = srg_ir(raw"""
+        clean(p: *u64) -> u64
+            dc(civac, p)
+            ic(ivau, p)
+            at(s1e1w, p)
+        print(clean(null))
+        """)
+
+    srg_says(ir, "call void asm sideeffect \"dc civac, $0\", \"r,~{memory}\"(ptr ")
+    srg_says(ir, "call void asm sideeffect \"ic ivau, $0\", \"r,~{memory}\"(ptr ")
+    srg_says(ir, "call i64 asm sideeffect \"at s1e1w, $1")
+end srg_maintenance_takes_a_pointer
+
+@test("an aarch64-freestanding archive holds tlbi vae1is, dc civac, ic iallu and at s1e1r, and every operation assembles")
+srg_maintenance_in_the_archive()
+    if !srg_ready() then return
+
+    val listing = srg_disassembly(srg_every_maintenance_op("@export(\"go\")\n"), "0")
+
+    if listing.is_none() then return
+
+    // The whole listing: at -O0 the exported `go` is a thunk calling the body under its own symbol.
+    val text = listing.unwrap()
+
+    srg_says(text, "tlbi\tvae1is, x")
+    srg_says(text, "dc\tcivac, x")
+    srg_says(text, "ic\tiallu")
+    srg_says(text, "at\ts1e1r, x")
+    srg_says(text, "mrs\tx")
+    srg_says(text, ", PAR_EL1")
+    assert_eq(text.count_of("\ttlbi\t"), 12)
+    assert_eq(text.count_of("\tdc\t"), 5)
+    assert_eq(text.count_of("\tic\t"), 3)
+    assert_eq(text.count_of("\tat\ts1e"), 4)
+end srg_maintenance_in_the_archive
+
+@test("two identical tlbi, and two identical ic, stay two at -O2")
+srg_two_tlbi_stay_two()
+    if !srg_ready() then return
+
+    val listing = srg_disassembly(raw"""
+        @export("flush_twice")
+        flush_twice(page: u64)
+            tlbi(vae1is, page)
+            tlbi(vae1is, page)
+            ic(iallu)
+            ic(iallu)
+        """, "2")
+
+    if listing.is_none() then return
+
+    val body = srg_body(listing.unwrap(), "flush_twice")
+
+    assert_eq(body.count_of("tlbi\tvae1is"), 2)
+    assert_eq(body.count_of("ic\tiallu"), 2)
+end srg_two_tlbi_stay_two
+
+@test("a maintenance form is refused on a processor that is not aarch64, naming the target")
+srg_maintenance_wrong_target()
+    if !srg_ready() then return
+
+    srg_refused(srg_build("tlbi(vmalle1)\n", "x86_64-linux").0,
+                "'tlbi' is an AArch64 instruction, and 'x86_64-linux' is x86_64 — put the code " +
+                "that uses it behind '#if aarch64'", 1, 1)
+    srg_refuses("riscv64-freestanding", "dc(civac, 0)\n",
+                "'dc' is an AArch64 instruction, and 'riscv64-freestanding' is riscv64")
+    srg_refuses("thumbv6m-freestanding", "ic(iallu)\n", "'ic' is an AArch64 instruction")
+    srg_refuses("wasm32-freestanding", "print(at(s1e1r, 0))\n", "'at' is an AArch64 instruction")
+end srg_maintenance_wrong_target
+
+@test("an operation outside a form's closed set is refused, listing the set")
+srg_maintenance_unknown_op()
+    if !srg_ready() then return
+
+    srg_refused(srg_build("tlbi(alle1)\n", srg_arm).0,
+                "'tlbi' takes one of the operations written here — vmalle1, vmalle1is, vae1, vae1is, " +
+                "vale1, vale1is, aside1, aside1is, vaae1, vaae1is, vaale1, vaale1is — and this is not one",
+                1, 6)
+    srg_refuses(srg_arm, "dc(cisw, 0)\n",
+                "'dc' takes one of the operations written here — civac, cvac, cvau, ivac, zva — and this is not one")
+    srg_refuses(srg_arm, "ic(IALLU)\n",
+                "'ic' takes one of the operations written here — iallu, ialluis, ivau — and this is not one")
+    srg_refuses(srg_arm, "print(at(s12e1r, 0))\n",
+                "'at' takes one of the operations written here — s1e1r, s1e1w, s1e0r, s1e0w — and this is not one")
+    srg_refuses(srg_arm, "tlbi(\"vmalle1\")\n", "'tlbi' takes one of the operations written here")
+end srg_maintenance_unknown_op
+
+@test("whether an operation reads a register is the operation's, and a wrong arity is refused")
+srg_maintenance_arity()
+    if !srg_ready() then return
+
+    srg_refused(srg_build("tlbi(vae1is)\n", srg_arm).0,
+                "'tlbi(vae1is)' takes a register operand, the u64 naming the page, the ASID or both — " +
+                "tlbi(vae1is, page)", 1, 1)
+    srg_refused(srg_build("tlbi(vmalle1is, 1)\n", srg_arm).0,
+                "'tlbi(vmalle1is)' takes no register operand — write tlbi(vmalle1is)", 1, 17)
+    srg_refuses(srg_arm, "dc(civac)\n", "'dc(civac)' takes a register operand, the address — dc(civac, addr)")
+    srg_refuses(srg_arm, "ic(iallu, 0)\n", "'ic(iallu)' takes no register operand")
+    srg_refuses(srg_arm, "ic(ivau)\n", "'ic(ivau)' takes a register operand, the address")
+    srg_refuses(srg_arm, "print(at(s1e1r))\n",
+                "'at(s1e1r)' takes a register operand, the virtual address to translate — at(s1e1r, va)")
+    srg_refuses(srg_arm, "tlbi()\n", "'tlbi' takes the operation and, where the operation reads one, its " +
+                "register operand — tlbi(vmalle1is) or tlbi(vae1is, page)")
+    srg_refuses(srg_arm, "dc(civac, 0, 1)\n", "'dc' takes the operation and")
+end srg_maintenance_arity
+
+@test("a maintenance operand is a u64 (or, for an address, a raw pointer), and anything else is refused")
+srg_maintenance_operand_type()
+    if !srg_ready() then return
+
+    srg_refused(srg_build(raw"""
+        flush(x: u32)
+            tlbi(vae1, x)
+        flush(1)
+        """, srg_arm).0,
+                "'tlbi(vae1)' takes a u64, and this value is a uint — convert it with u64(...)", 2, 16)
+    srg_refuses(srg_arm, "flush(p: *u8)\n    tlbi(vae1, p)\nflush(null)\n", "'tlbi(vae1)' takes a u64")
+    srg_refuses(srg_arm, "dc(civac, true)\n",
+                "'dc(civac)' takes an address, a u64 or a raw pointer, and this value is a bool")
+end srg_maintenance_operand_type
+
+@test("the maintenance forms yield to a declaration of their name")
+srg_maintenance_yields()
+    if !srg_ready() then return
+
+    val ir = srg_ir(raw"""
+        at(i: int, j: int) -> int = i + j
+        tlbi(x: int) -> int = x
+        print(at(1, 2) + tlbi(3))
+        """)
+
+    assert(!ir.contains("asm sideeffect"), ir)
+end srg_maintenance_yields

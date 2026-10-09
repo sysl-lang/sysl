@@ -286,7 +286,7 @@ end import_name
 // A name the compiler answers itself, which no module declares however the import spells its home.
 private imports_a_form(name: string) -> bool =
     special_form_word(name) || atomic_operands(name).is_some() || name == "atomic_fence" ||
-    slot_form_word(name) || name == "is_null" || sysreg_form_word(name)
+    slot_form_word(name) || name == "is_null" || name == "release" || sysreg_form_word(name)
 
 // What an import may not be called here, and whether it may be called this.
 //
@@ -573,21 +573,30 @@ private resolve_named_subtypes(a: &Analysis)
             _ -> ()
 
 // A generic alias has no type of its own to make until it is applied, so what is checked here is the
-// declaration: only a transparent alias may take parameters, and its right-hand side is read at
-// stand-ins -- the way a generic function's signature is -- so a name it gets wrong is reported
-// whether or not anything applies it. What that reading registers is taken back, as a generic
+// declaration: only a transparent alias or a plain `new` type may take parameters, and its right-hand
+// side is read at stand-ins -- the way a generic function's signature is -- so a name it gets wrong is
+// reported whether or not anything applies it. What that reading registers is taken back, as a generic
 // signature's is: the stand-ins are not types the program has.
+//
+// **A `new` type's parameters are phantom** (`type UserPtr[T] = new u64`): its base is still a
+// scalar, so the arguments change which type it is and never how it is laid out. A range, a `where`,
+// `wrapping` or `@export` is still refused one: each is one check or one header name, and an argument
+// would have nothing in it to fill.
 private read_generic_alias(a: &Analysis, scope: Scope, span: Span, d: TypeDecl)
-    if !is_plain_alias(d)
-        a.fault(scope, span, s"'${d.name}' takes type parameters, and only a transparent alias may — " +
-                "a 'new', 'within', 'where', 'wrapping' or '@export' type is one type of its own, " +
-                "with one range, one check and one name in a header, so there is nothing for an " +
-                "argument to fill")
+    val phantom = is_phantom_new(d)
+
+    if !is_plain_alias(d) && !phantom
+        a.fault(scope, span, s"'${d.name}' takes type parameters, and only a transparent alias or a " +
+                "plain 'new' type may — a 'within', 'where', 'wrapping' or '@export' type is one " +
+                "type of its own, with one range, one check and one name in a header, so there is " +
+                "nothing for an argument to fill")
         return
     end if
 
     if !d.tp.packs.is_empty()
-        a.fault(scope, span, s"'${d.name}' is an alias, and an alias's parameter stands for one type " +
+        val what = if phantom then "a 'new' type, and a 'new' type's" else "an alias, and an alias's"
+
+        a.fault(scope, span, s"'${d.name}' is $what parameter stands for one type " +
                 s"— '..${d.tp.packs.at(0)}' would stand for a list of them")
         return
     end if
@@ -602,13 +611,19 @@ private read_generic_alias(a: &Analysis, scope: Scope, span: Span, d: TypeDecl)
     val before = a.settled
 
     a.settled = subst
-    resolve_type(a, scope, d.base, subst)
+    val base = resolve_type(a, scope, d.base, subst)
     a.settled = before
 
     a.release(trial)
     rewind_registered(a.tables.struct_insts, structs)
     rewind_registered(a.tables.enum_insts, enums)
     rewind_registered(a.tables.constrained_insts, constrained)
+
+    // What a `new` type is laid out as does not depend on its arguments, so its base is held to the
+    // rule every `new` type's is, here, once.
+    if phantom && !type_eq(base, Unknown) && !scalar_base(base) then
+        a.fault(scope, span, "a constrained subtype's base must be an integer, a float, or 'char', " +
+                s"not ${type_show(base)}")
 end read_generic_alias
 
 // Whether following a named subtype's base leads back to the name itself.

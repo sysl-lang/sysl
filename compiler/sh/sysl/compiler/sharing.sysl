@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 
 // What an object reached through an atomic reference may contain.
 //
@@ -285,3 +286,177 @@ private check_crossing(cx: &Analyzer, arg: TExpr, pname: string, shown: string, 
     if why.is_some() then cx.fault(arg.span, why.unwrap())
     else note_task_crossing(cx, arg.span, CrossArg(subject), arg)
 end check_crossing
+
+// -- module storage, reached from another domain ----------------------------------------------------
+
+// **What a closure captures is asked at the closure; what it reaches through module storage is asked
+// here**, over the whole program, because storage is named rather than captured and may be several
+// calls down. A module `var` is one object every domain shares, so a count in it that is not atomic
+// is the race a capture would have been -- touched by the body in the other domain and by whatever
+// the rest of the program does with it.
+//
+// **Two kinds of body run in another domain.** A value erased into a `&sync` object: the object may
+// be handed to another thread, and its methods run there -- a closure's body, a named function read
+// into a `&sync Fn`. A `@crossing` parameter adds nothing to that list, since everything a crossing
+// hands over that holds a count is held to being `&sync` at the call. And an interrupt handler (the
+// `interrupt` convention), which the processor enters on top of whatever was running.
+//
+// **An `@export` is not a root**, though C may call one from anywhere: an export is how a C program,
+// a JNI activity or a board's `main` enters sysl at all, and almost always from the one thread the
+// program has. Holding every export to this would refuse every archive that keeps its state in a
+// module `var`, for a second domain nothing says exists.
+//
+// **A `val` filled at run time is asked as a `var` is**, since reading it takes a share of the same
+// count; a `val` laid down as constant data is not, and neither is `@thread_local` storage, which is
+// one copy per thread.
+
+// Where a body that runs in another domain begins: the functions it starts at, where the refusal is
+// placed, and the opening of the sentence that refuses it.
+private struct DomainRoot
+    funcs: Buf[string]
+    scope: Scope
+    span: Span
+    head: string
+end DomainRoot
+
+private struct DomainRoots
+    list: Buf[DomainRoot]
+end DomainRoots
+
+// Holds the module storage every body in another domain reaches to the rule a capture is held to.
+check_shared_storage(a: &Analysis, p: TProgram)
+    val roots = domain_roots(a, p)
+
+    if roots.list.is_empty() then return
+
+    var vals: Map[string, usize] = map()
+
+    for i in 0..<p.vals.len()
+        vals.put(p.vals.at(i).symbol, i)
+
+    for r in roots.list
+        for item in storage_reached_in_domain(p, r.funcs)
+            vals.get(item.0) match
+                Some(i) ->
+                    val why = storage_complaint(a, r, p.vals.at(i), item.1)
+
+                    if why.is_some() then a.fault(r.scope, r.span, why.unwrap())
+                None -> ()
+end check_shared_storage
+
+// Every erasure into a `&sync` object the program makes, and every interrupt handler it declares.
+private domain_roots(a: &Analysis, p: TProgram) -> &DomainRoots
+    val out: &DomainRoots = DomainRoots(buf())
+
+    var tables: Map[string, usize] = map()
+
+    for i in 0..<p.vtables.len()
+        tables.put(p.vtables.at(i).name, i)
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+        val home = func_home(a, f.name)
+
+        walk_block_stmts(f.body, expr_walk(false, e -> note_sync_erasure(out, p, tables, home, e)))
+
+        if f.conv.is_some()
+            var only: Buf[string] = buf()
+
+            only.push(f.name)
+            add_root(&out.list, DomainRoot(only, home, f.span,
+                                           s"'${qualified_name(f.name)}' is an interrupt handler, entered " +
+                                           "on top of whatever was running, so every count it reaches " +
+                                           "has to be atomic — "))
+        end if
+
+    val entry = entry_home(a)
+
+    walk_stmts(p.main, expr_walk(false, e -> note_sync_erasure(out, p, tables, entry, e)))
+    out
+end domain_roots
+
+private add_root(list: *Buf[DomainRoot], r: DomainRoot) = list.push(r)
+
+// A root where `e` erases a value into a `&sync` object: the functions its table points at.
+private note_sync_erasure(out: &DomainRoots, p: TProgram, tables: Map[string, usize], home: Scope,
+                          e: TExpr)
+    *e.kind match
+        TErase(operand, vtable, want) ->
+            val sync = want match
+                Ref(_, s) -> s
+                _ -> false
+
+            if !sync then return
+
+            val at = tables.get(vtable)
+
+            if at.is_none() then return
+
+            var funcs: Buf[string] = buf()
+
+            for slot in p.vtables.at(at.unwrap()).slots
+                funcs.push(slot.target)
+
+            val inner = erased_inner(texpr_type(operand))
+            var head = "a closure shared between two domains may be called from either, so every count " +
+                       "it reaches has to be atomic — "
+
+            if !is_closure_literal(inner)
+                head = s"a '${type_show(want)}' may be called from two domains at once, so every count " +
+                       s"its '${type_show(inner)}' reaches has to be atomic — "
+
+            add_root(&out.list, DomainRoot(funcs, home, e.span, head))
+        _ -> ()
+end note_sync_erasure
+
+// The type a value was before it was boxed for an object.
+private erased_inner(t: Type) -> Type = t match
+    Ref(inner, _) -> *inner
+    _ -> t
+
+// Why one piece of module storage may not be reached from the root, or nothing where it may.
+private storage_complaint(a: &Analysis, r: DomainRoot, v: TVal, reader: string) -> Option[string]
+    if v.thread_local || (!v.writable && !v.computed) then return None
+
+    val part = unshareable(v.ty)
+
+    if part.is_none() then return None
+
+    val p = part.unwrap()
+    var subject = s"but the module storage '${qualified_name(v.symbol)}' it reaches"
+
+    if !holds_string(r.funcs, reader) then subject = subject + s", which '${qualified_name(reader)}' reads,"
+
+    val sealed = sealed_holder(p, a, r.scope)
+
+    if sealed.is_some() then return Some(r.head + subject + storage_sealed(p, sealed.unwrap(), v.ty))
+
+    Some(share_remedy(r.head + subject + storage_where(p, v.ty) + ", ", p.ty))
+end storage_complaint
+
+// Which part of the storage is in the way: the storage itself, something it holds directly, or
+// something a named path inside it reaches.
+private storage_where(p: Unshareable, whole: Type) -> string
+    val shown = type_show(p.ty)
+
+    if p.path.is_empty() && p.ty == whole then return s" is a '$shown'"
+    if p.path.is_empty() then return s" holds a '$shown'"
+
+    s" holds a '$shown' in its '${joined(p.path, ".")}'"
+end storage_where
+
+// The same, where the count in the way lives in a container whose core the reader cannot name.
+private storage_sealed(p: Unshareable, holder: Type, whole: Type) -> string
+    var steps: Buf[string] = buf()
+
+    for i in 0..<p.path.len() - 1
+        steps.push(p.path.at(i))
+
+    val shown = type_show(holder)
+    val rest = sealed_rest()
+
+    if steps.is_empty() && holder == whole then return s" is a '$shown', which is $rest"
+    if steps.is_empty() then return s" holds a '$shown', which is $rest"
+
+    s" holds a '$shown' in its '${joined(steps, ".")}', which is $rest"
+end storage_sealed

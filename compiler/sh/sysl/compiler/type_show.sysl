@@ -82,7 +82,8 @@ type_show(t: Type) -> string = t match
     Results(parts) -> show_list(parts.targs)
     Struct(d) -> struct_show(d)
     Enum(d) -> qualified(module_show(d.base), d.targs)
-    Constrained(d) -> module_show(d.name)
+    Constrained(d) ->
+        if d.targs.is_empty() then module_show(d.name) else qualified(module_show(d.generic), d.targs)
     _ -> friendly_name(t) match
         Some(name) -> name
         None -> canonical_name(t)
@@ -270,7 +271,13 @@ mangle(t: Type) -> string = t match
     // `Buf[u64]`'s instantiation. A type that checks anything — a range, a `where`, or `new` — is a
     // type of its own and mangles under its name: `conv[Small]` traps on what `conv[int]` returns,
     // so a shared name would let whichever was met first stand in for the other.
-    Constrained(d) -> if name_only(d) then mangle(d.base) else mangled(d.name, buf())
+    //
+    // A `new` type declared with parameters mangles under its declaration and its arguments, as a
+    // generic struct does: `UserPtr[Frame]` and `UserPtr[u8]` are two types and two symbols.
+    Constrained(d) ->
+        if name_only(d) then mangle(d.base)
+        else if !d.targs.is_empty() then mangled(d.generic, d.targs)
+        else mangled(d.name, buf())
     _ -> type_show(t)
 
 private mangle_list(ts: Buf[Type]) -> string

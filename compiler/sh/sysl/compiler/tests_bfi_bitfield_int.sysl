@@ -1,0 +1,340 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{join, Search}
+
+// **A bitfield struct goes to and from the integer it is** (`bitfield_int.sysl`): `T::Bits(n)` makes
+// one from exactly its container's unsigned type and `x.bits` reads the container back, both a value
+// with no memory between them. `attributes.md § Bitfields` is the spec.
+
+private bfi_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The tree built at `level` and run: its status, what it printed, and what it wrote to standard error
+// -- the refusal, where the build was refused.
+private bfi_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-bfi").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end bfi_run
+
+// At both levels, the program exits cleanly having printed `printed` and nothing on standard error.
+private bfi_prints(text: string, printed: string)
+    if !bfi_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = bfi_run(text, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end bfi_prints
+
+// The program is refused with exactly one diagnostic, this message at this position.
+private bfi_refused(text: string, message: string, line: int, col: int)
+    if !bfi_ready() then return
+
+    val (_, _, err) = bfi_run(text, "0")
+    val head = s"error: $message\n"
+    val at = s"/main.sysl:$line:$col\n"
+
+    assert(err.contains(head), s"expected\n$head\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end bfi_refused
+
+// ESR_EL1 as the keel finding declared it: five fields filling exactly 64 bits.
+private val bfi_esr: string = raw"""
+    @packed
+    struct Esr
+        iss: u25
+        il: u1
+        ec: u6
+        iss2: u5
+        res0: u27
+
+    """
+
+// -- the round trip ----------------------------------------------------------------------------------
+
+@test("T::Bits then .bits gives back every bit of the integer, and the fields read the ranges of it")
+bfi_round_trip_keeps_every_bit()
+    bfi_prints(bfi_esr + raw"""
+        var kept = 0
+
+        for i in 0..<64
+            val raw = u64(1) << i
+
+            if Esr::Bits(raw).bits == raw then kept += 1
+
+        val v: u64 = 0xDEADBEEFCAFEF00D
+        val e = Esr::Bits(v)
+
+        print(kept, e.bits == v)
+        print(e.iss == u25(v & 0x1FFFFFF), e.il == u1((v >> 25) & 1), e.ec == u6((v >> 26) & 63),
+              e.iss2 == u5((v >> 32) & 31), e.res0 == u27(v >> 37))
+        print(Esr::Bits(0xFFFFFFFFFFFFFFFF).bits, Esr::Bits(0).bits)
+        print(Esr(1, 1, 0x3c, 0, 0).bits)
+        """, "64 true\ntrue true true true true\n18446744073709551615 0\n4060086273\n")
+end bfi_round_trip_keeps_every_bit
+
+@test("a container narrower than a word is its own width: three and twenty-one bits are a u24")
+bfi_a_u24_container_round_trips()
+    bfi_prints(raw"""
+        @packed
+        struct Small
+            a: u3
+            b: u21
+
+        val raw: u24 = 0xABCDEF
+        val s = Small::Bits(raw)
+
+        print(s.bits, s.a, s.b, sizeof(Small))
+        """, "11259375 7 1407421 3\n")
+end bfi_a_u24_container_round_trips
+
+@test("a struct reached through a pointer gives up its bits whole, and a written field is in them")
+bfi_bits_through_a_pointer_and_after_a_write()
+    bfi_prints(bfi_esr + raw"""
+        var word: u64 = 0
+        val p: *Esr = ptr_cast(&word)
+
+        p.ec = 0x3c
+        print(p.bits, word)
+
+        var e = Esr::Bits(0)
+
+        e.il = 1
+        print(e.bits)
+        """, "4026531840 4026531840\n33554432\n")
+end bfi_bits_through_a_pointer_and_after_a_write
+
+// -- an enum field is checked where it is read -------------------------------------------------------
+
+private val bfi_ec: string = raw"""
+    enum Ec: u6
+        Unknown = 0x00
+        Brk = 0x3c
+
+    @packed
+    struct Syndrome
+        low: u26
+        ec: Ec
+        high: u32
+
+    """
+
+@test("making a struct from bits holding no variant of an enum field checks nothing, and .bits is untouched")
+bfi_bits_with_an_unnamed_enum_value_are_not_checked()
+    bfi_prints(bfi_ec + "val s = Syndrome::Bits(u64(0x2a) << 26)\n\nprint(s.bits, s.low, s.high)\n",
+               "2818572288 0 0\n")
+end bfi_bits_with_an_unnamed_enum_value_are_not_checked
+
+@test("the enum field of a struct made from bits is held to its variants at the read")
+bfi_the_enum_field_is_checked_at_the_read()
+    if !bfi_ready() then return
+
+    val text = bfi_ec + "val s = Syndrome::Bits(u64(0x2a) << 26)\n\nprint(Ec::Image(s.ec))\n"
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = bfi_run(text, level)
+
+        assert_eq(out, "")
+        assert_eq(err, "value 42 is not one of the enum's variants (main.sysl:13:19)\n")
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state")
+end bfi_the_enum_field_is_checked_at_the_read
+
+// -- what is emitted ----------------------------------------------------------------------------------
+
+private bfi_emit(text: string) -> (int, string)
+    val root = make_temp_dir("sysl-bfi").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "emit-llvm", s"$root/main.sysl"], (line) -> sink.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    (code, join(lines.view(), "\n"))
+end bfi_emit
+
+// The text of the one function whose `define` line names `symbol`, up to its closing brace.
+private bfi_body(ir: string, symbol: string) -> string
+    val lines = lines_of(ir)
+    var out: Buf[string] = buf()
+    var inside = false
+
+    for line in lines
+        if !inside && line.starts_with("define ") && line.contains(symbol) then inside = true
+
+        if inside
+            out.push(line)
+
+            if line == "}" then return join(out.view(), "\n")
+
+    join(out.view(), "\n")
+end bfi_body
+
+@test("both directions are a value: an insertvalue and an extractvalue, with no slot, store or load")
+bfi_no_memory_round_trip()
+    if !bfi_ready() then return
+
+    val (code, ir) = bfi_emit(bfi_esr + raw"""
+        decode(raw: u64) -> Esr = Esr::Bits(raw)
+
+        encode(e: Esr) -> u64 = e.bits
+
+        pass_raw(raw: u64) -> u64 = raw
+
+        pass_esr(e: Esr) -> Esr = e
+
+        print(encode(decode(7)), pass_raw(1), pass_esr(Esr::Bits(2)).bits)
+        """)
+
+    assert_eq(code, 0)
+
+    val made = bfi_body(ir, "@decode(")
+    val read = bfi_body(ir, "@encode(")
+
+    // The conversion is one instruction on the value the parameter holds ...
+    assert(made.contains(" = load i64, ptr %raw.addr\n  %t2 = insertvalue %struct.Esr undef, i64 %t1, 0\n" +
+                         "  ret %struct.Esr %t2"), made)
+    assert(read.contains(" = load %struct.Esr, ptr %e.addr\n  %t2 = extractvalue %struct.Esr %t1, 0\n" +
+                         "  ret i64 %t2"), read)
+
+    // ... and touches memory exactly as often as handing the parameter straight back does: the slot
+    // every parameter has, and nothing for the conversion.
+    for pair in [(made, bfi_body(ir, "@pass_raw(")), (read, bfi_body(ir, "@pass_esr("))]
+        for word in ["alloca", " load ", "store "]
+            assert_eq(pair.0.count_of(word), pair.1.count_of(word))
+end bfi_no_memory_round_trip
+
+// -- a register read whole, on the machine that has it -----------------------------------------------
+
+// The program's LLVM text for aarch64-freestanding, or the report it was refused with.
+private bfi_arm(text: string) -> (string, string)
+    val t = target_named("aarch64-freestanding").unwrap()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return (parsed.report.at(0).message, "")
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), true)
+    val early = errors_of(done.reported)
+
+    if !early.is_empty() then return (analysis_report(early), "")
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = errors_of(done.an.diagnostics())
+
+    if !late.is_empty() then return (analysis_report(late), "")
+
+    ("", ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0))
+end bfi_arm
+
+// The text up to the first space: the register an instruction line defines.
+private bfi_first_word(line: string) -> string
+    for i in 0..<line.bytes.len
+        if line.bytes[i] == u8(' ') then return line[0..<i]
+
+    line
+end bfi_first_word
+
+@test("on aarch64-freestanding a register read by read_sysreg goes straight into the struct")
+bfi_a_system_register_converts_straight_in()
+    if std_root().is_err() then return
+
+    val (refused, ir) = bfi_arm(bfi_esr + raw"""
+        decode() -> Esr = Esr::Bits(read_sysreg("esr_el1"))
+
+        print(decode().ec)
+        """)
+
+    assert_eq(refused, "")
+
+    val body = bfi_body(ir, "@decode(")
+    var reg = ""
+
+    for line in lines_of(body)
+        if line.contains("@llvm.read_volatile_register.i64(metadata !{!\"esr_el1\"})") then
+            reg = bfi_first_word(line.trim())
+
+    assert(reg.starts_with("%"), body)
+    assert(body.contains(s"insertvalue %struct.Esr undef, i64 $reg, 0"), body)
+    assert(!body.contains("alloca"), body)
+end bfi_a_system_register_converts_straight_in
+
+// -- the refusals -------------------------------------------------------------------------------------
+
+@test("T::Bits refuses an integer of another width, naming the one the struct is stored as")
+bfi_another_width_is_refused()
+    bfi_refused(bfi_esr + "val low: u32 = 0x3c\n\nprint(Esr::Bits(low).ec)\n",
+                "'Esr::Bits' takes the ulong 'Esr' is stored as, not uint — a value of another " +
+                "width is converted first, as 'ulong(x)'", 11, 17)
+end bfi_another_width_is_refused
+
+@test("T::Bits refuses a signed integer of the container's own width")
+bfi_a_signed_integer_is_refused()
+    bfi_refused(bfi_esr + "val w: i64 = 1\n\nprint(Esr::Bits(w).ec)\n",
+                "'Esr::Bits' takes the ulong 'Esr' is stored as, not long — a value of another " +
+                "width is converted first, as 'ulong(x)'", 11, 17)
+end bfi_a_signed_integer_is_refused
+
+@test("a struct that is not a bitfield struct has no ::Bits, a packed one of whole bytes included")
+bfi_a_struct_that_is_not_one_integer_has_no_bits()
+    bfi_refused("struct P\n    a: u8\n    b: u8\n\nprint(P::Bits(1).a)\n",
+                "'P' is not a bitfield struct, so 'P::Bits' has no integer to make it from — only " +
+                "a '@packed' struct with a field narrower than a byte is one integer", 5, 8)
+    bfi_refused("@packed\nstruct Q\n    a: u8\n    b: u16\n\nprint(Q::Bits(1).a)\n",
+                "'Q' is not a bitfield struct, so 'Q::Bits' has no integer to make it from — only " +
+                "a '@packed' struct with a field narrower than a byte is one integer", 6, 8)
+end bfi_a_struct_that_is_not_one_integer_has_no_bits
+
+@test("a bitfield struct answers ::Bits and no other attribute, with exactly one argument")
+bfi_other_attributes_are_refused()
+    bfi_refused(bfi_esr + "print(Esr::Max)\n",
+                "'Esr' has no attribute 'Max' — a bitfield struct answers 'Esr::Bits'", 9, 10)
+    bfi_refused(bfi_esr + "print(Esr::Bits(1, 2).ec)\n", "'Esr::Bits' takes exactly one argument",
+                9, 10)
+end bfi_other_attributes_are_refused
+
+@test(".bits on a struct that is not a bitfield struct is a missing property, and a declared field wins")
+bfi_bits_on_another_struct()
+    bfi_refused("struct P\n    a: u8\n\nval p = P(1)\n\nprint(p.bits)\n",
+                "'P' has no field or property 'bits'", 6, 9)
+    bfi_prints("@packed\nstruct F\n    bits: u3\n    rest: u5\n\nprint(F::Bits(0xFF).bits)\n", "7\n")
+end bfi_bits_on_another_struct
