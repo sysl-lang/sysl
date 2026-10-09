@@ -1,0 +1,246 @@
+module sysl.net
+@requires(posix)
+@tests
+
+import sysl.fs.IoError
+import sysl.net.sys.Endpoint
+
+// Datagrams over the loopback, and an address as a value built without a resolver.
+//
+// **One thread again, and it can be**: a datagram sent to a bound socket on the loopback is queued
+// by the kernel before `send_to` returns, so a test sends and then receives with no second thread
+// and no timing assumption. The port is always 0 and always asked back, as in `tests.sysl`.
+
+/** A datagram socket on the loopback, on whatever port was free, and the address it is at. */
+private bound() -> (UdpSocket, Address)
+    val here = ipv4(127, 0, 0, 1, 0)
+    var s = udp_socket(here).unwrap()
+
+    s.bind(here).unwrap()
+    (s, s.local().unwrap())
+end bound
+
+// ## Datagrams
+
+@test("a datagram sent to a bound socket arrives whole, with who sent it")
+udp_round_trip()
+    var (a, at_a) = bound()
+    var (b, at_b) = bound()
+
+    assert_eq(b.send_to([112, 105, 110, 103], at_a).unwrap(), 4)
+
+    var into: []u8 = [0; 16]
+    val (n, from) = a.recv_from(into).unwrap()
+
+    assert_eq(n, 4)
+    assert_eq(into[0], u8('p'))
+    assert_eq(into[3], u8('g'))
+    assert_eq(from, at_b)
+
+    // And the answer goes back to whoever asked, which is the whole of an echo server.
+    a.send_to([112, 111, 110, 103], from).unwrap()
+
+    val (m, back) = b.recv_from(into).unwrap()
+
+    assert_eq(m, 4)
+    assert_eq(into[1], u8('o'))
+    assert_eq(back, at_a)
+
+    a.close().unwrap()
+    b.close().unwrap()
+end udp_round_trip
+
+@test("each send is one datagram, received one at a time and in their own lengths")
+udp_datagrams_keep_their_edges()
+    var (a, at_a) = bound()
+    var (b, _) = bound()
+
+    b.send_to([1, 2, 3], at_a).unwrap()
+    b.send_to([4], at_a).unwrap()
+
+    var into: []u8 = [0; 16]
+
+    assert_eq(a.recv_from(into).unwrap().0, 3)
+    assert_eq(a.recv_from(into).unwrap().0, 1)
+    assert_eq(into[0], 4)
+
+    a.close().unwrap()
+    b.close().unwrap()
+end udp_datagrams_keep_their_edges
+
+@test("an empty datagram is a datagram, and a receive answers zero for it")
+udp_empty_datagram()
+    var (a, at_a) = bound()
+    var (b, at_b) = bound()
+
+    assert_eq(b.send_to([], at_a).unwrap(), 0)
+
+    var into: []u8 = [0; 4]
+    val (n, from) = a.recv_from(into).unwrap()
+
+    assert_eq(n, 0)
+    assert_eq(from, at_b)
+
+    a.close().unwrap()
+    b.close().unwrap()
+end udp_empty_datagram
+
+@test("a datagram longer than the buffer keeps what fits and loses the rest")
+udp_long_datagram_is_cut()
+    var (a, at_a) = bound()
+    var (b, _) = bound()
+
+    b.send_to([1, 2, 3, 4, 5, 6], at_a).unwrap()
+    b.send_to([7], at_a).unwrap()
+
+    var into: []u8 = [0; 2]
+
+    assert_eq(a.recv_from(into).unwrap().0, 2)
+    assert_eq(into[1], 2)
+
+    // The rest of the first is gone, not waiting: the next receive is the next datagram.
+    assert_eq(a.recv_from(into).unwrap().0, 1)
+    assert_eq(into[0], 7)
+
+    a.close().unwrap()
+    b.close().unwrap()
+end udp_long_datagram_is_cut
+
+@test("a connected datagram socket sends without naming the peer and hears only from it")
+udp_connected()
+    var (a, at_a) = bound()
+    var (b, at_b) = bound()
+    var (other, _) = bound()
+
+    b.connect(at_a).unwrap()
+    a.connect(at_b).unwrap()
+
+    // A stranger's datagram is dropped by `a`'s connection rather than delivered.
+    other.send_to([9], at_a).unwrap()
+
+    assert_eq(b.send([5, 6]).unwrap(), 2)
+
+    var into: []u8 = [0; 8]
+
+    assert_eq(a.recv(into).unwrap(), 2)
+    assert_eq(into[0], 5)
+
+    a.send([7]).unwrap()
+    assert_eq(b.recv(into).unwrap(), 1)
+    assert_eq(into[0], 7)
+
+    a.close().unwrap()
+    b.close().unwrap()
+    other.close().unwrap()
+end udp_connected
+
+@test("a receive nobody sends to gives up at its timeout, and says that is what happened")
+udp_read_timeout()
+    var (a, _) = bound()
+
+    a.read_timeout(50).unwrap()
+
+    var into: []u8 = [0; 8]
+    val e = a.recv_from(into).unwrap_err()
+
+    assert(timed_out(e), s"expected a timeout, got $e")
+
+    a.close().unwrap()
+end udp_read_timeout
+
+@test("a datagram socket closed twice is told so the second time")
+udp_close_twice()
+    var (a, _) = bound()
+
+    a.close().unwrap()
+    assert_eq(a.close().unwrap_err(), IoError.NotOpen)
+
+@test("a socket bound to port 0 is told the port it was given")
+udp_bound_port_is_named()
+    var (a, at) = bound()
+
+    assert(at.port() > 0, "port 0 came back as 0")
+    assert_eq(at.text(), "127.0.0.1")
+
+    a.close().unwrap()
+end udp_bound_port_is_named
+
+@test("a datagram over IPv6's loopback round-trips where the machine has one")
+udp_v6_round_trip()
+    val here = ipv6([0, 0, 0, 0, 0, 0, 0, 1], 0)
+    var a = udp_socket(here).unwrap()
+
+    // A machine with IPv6 switched off refuses the bind; nothing about the module is then in doubt.
+    if a.bind(here).is_err()
+        val _ = a.close()
+        return
+    end if
+
+    val at = a.local().unwrap()
+
+    assert_eq(at.family(), Ipv6)
+    assert(a.send_to([42], at).is_ok(), "a datagram to itself")
+
+    var into: []u8 = [0; 4]
+    val (n, from) = a.recv_from(into).unwrap()
+
+    assert_eq(n, 1)
+    assert_eq(into[0], 42)
+    assert_eq(from, at)
+
+    a.close().unwrap()
+end udp_v6_round_trip
+
+// ## An address built by hand
+
+@test("ipv4 builds the address resolve answers for the same text")
+ipv4_matches_resolve()
+    assert_eq(ipv4(127, 0, 0, 1, 8080), resolve("127.0.0.1", 8080).unwrap().at(0))
+    assert(ipv4(127, 0, 0, 1, 8080) != ipv4(127, 0, 0, 1, 8081), "the port is part of the value")
+    assert(ipv4(10, 0, 2, 15, 7) != ipv4(10, 0, 2, 16, 7), "and so is every byte")
+
+@test("an IPv4 address reads back its parts")
+ipv4_parts()
+    val a = ipv4(192, 168, 1, 254, 53)
+
+    assert_eq(a.text(), "192.168.1.254")
+    assert_eq(a.port(), 53)
+    assert_eq(a.family(), Ipv4)
+    assert_eq(a.octets()[3], 254)
+    assert_eq(a.octets()[4], 0)
+    assert_eq(str(a), "192.168.1.254:53")
+    assert_eq(a.with_port(54).port(), 54)
+    assert_eq(str(ipv4(0, 0, 0, 0, 0)), "0.0.0.0:0")
+
+@test("ipv6 builds the address resolve answers for the same text")
+ipv6_matches_resolve()
+    resolve("::1", 9) match
+        Ok(addrs) -> assert_eq(ipv6([0, 0, 0, 0, 0, 0, 0, 1], 9), addrs.at(0))
+        Err(_) -> ()
+
+@test("an IPv6 address is written as RFC 5952 says")
+ipv6_text()
+    assert_eq(ipv6([0, 0, 0, 0, 0, 0, 0, 1], 0).text(), "::1")
+    assert_eq(ipv6([0, 0, 0, 0, 0, 0, 0, 0], 0).text(), "::")
+    assert_eq(ipv6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 0).text(), "2001:db8::1")
+    assert_eq(ipv6([0xfe80, 0, 0, 0, 0, 0, 0, 1], 0, 4).text(), "fe80::1%4")
+
+    // One zero group is not shortened, and of two equal runs the first is.
+    assert_eq(ipv6([0x2001, 0xdb8, 0, 1, 1, 1, 1, 1], 0).text(), "2001:db8:0:1:1:1:1:1")
+    assert_eq(ipv6([0x2001, 0, 0, 1, 0, 0, 1, 1], 0).text(), "2001::1:0:0:1:1")
+
+    // The longer run wins wherever it is, and a run at the end ends the text.
+    assert_eq(ipv6([1, 0, 0, 2, 0, 0, 0, 0], 0).text(), "1:0:0:2::")
+    assert_eq(ipv6([0xABCD, 0x0f, 0, 0, 0, 0, 0, 0xffff], 0).text(), "abcd:f::ffff")
+
+    // An IPv4-mapped address keeps its dotted tail.
+    assert_eq(ipv6([0, 0, 0, 0, 0, 0xffff, 0x7f00, 1], 0).text(), "::ffff:127.0.0.1")
+    assert_eq(str(ipv6([0, 0, 0, 0, 0, 0, 0, 1], 8080)), "[::1]:8080")
+end ipv6_text
+
+@test("an endpoint is the 24-byte layout a supplier written in C reads")
+endpoint_layout()
+    assert_eq(sizeof(Endpoint), 24)
+    assert_eq(offsetof(Endpoint, scope), 16)
+    assert_eq(offsetof(Endpoint, port), 20)
+    assert_eq(offsetof(Endpoint, family), 22)

@@ -25,6 +25,29 @@ scalar_wanted(t: Type) -> Type = repr(t) match
 // The value a written integer literal denotes.
 literal_value(digits: string, base: int) -> BigInt = parse_radix(digits, base).unwrap_or(from_int(0))
 
+// The `new` type a position wants a bare literal to be, where it wants one.
+//
+// **A literal has no type of its own to defend, so it is the `new` type's value as readily as its
+// base's**: `p + 4096` over a `PhysAddr` reads the 4096 as a `PhysAddr`, exactly as `x + 1` reads the
+// 1 at `x`'s width, and `var q: Meters = 3.0` is three metres. What stays a written conversion is a
+// value that already HAS a type -- a `u64` is not a `PhysAddr` -- which is the mistake a `new` type
+// exists to catch. A qualifier is seen through, as `repr` sees it; a vector's lane is not, a lane
+// being filled by a splat of the base.
+private new_type_wanted(expected: Option[Type]) -> Option[Type] = expected match
+    Some(t) -> repr(t) match
+        Constrained(d) -> if d.derived then Some(Constrained(d)) else None
+        _ -> None
+    None -> None
+
+private base_of_new(t: Type) -> Type = t match
+    Constrained(d) -> d.base
+    other -> other
+
+// The literal, read at the base, made into the `new` type the way the type's own name makes one: so
+// a type that checks anything checks it here, at the literal, as `Slot(9)` would.
+private made_new(span: Span, lit: TExpr, target: Type) -> TExpr =
+    if texpr_type(lit) == Unknown then lit else TExpr(span, TConstrainedCheck(lit, target))
+
 // An integer literal takes its type from its suffix, else from the type the context expects, else
 // `int`. The default is never magnitude-dependent: a value too large for the type it landed in is
 // an error asking for a suffix, not a silent widening.
@@ -34,6 +57,12 @@ literal_value(digits: string, base: int) -> BigInt = parse_radix(digits, base).u
 // is not `volatile` even where the field it is about to fill is.
 int_literal(cx: &Analyzer, span: Span, value: BigInt, suffix: string,
             expected: Option[Type]) -> TExpr
+    val made = if suffix == "" then new_type_wanted(expected) else None
+
+    if made.is_some() then
+        return made_new(span, int_literal(cx, span, value, suffix, Some(base_of_new(made.unwrap()))),
+                        made.unwrap())
+
     // A whole number written where a fixed-point value is wanted is that value, `1` at `i32q16`
     // being one -- converted exactly and held to the format's range as a decimal literal is.
     val fixed = if suffix != "" then fixed_suffixed(cx, span, suffix) else fixed_wanted(expected)
@@ -85,6 +114,12 @@ end expected_int
 // `real` is wanted is a type error, not a silent conversion.
 float_literal(cx: &Analyzer, span: Span, text: string, suffix: string,
               expected: Option[Type]) -> TExpr
+    val made = if suffix == "" then new_type_wanted(expected) else None
+
+    if made.is_some() then
+        return made_new(span, float_literal(cx, span, text, suffix, Some(base_of_new(made.unwrap()))),
+                        made.unwrap())
+
     // At a fixed-point type the literal is read from its TEXT, exactly, and never through a double.
     val fixed = if suffix != "" then fixed_suffixed(cx, span, suffix) else fixed_wanted(expected)
 

@@ -30,7 +30,7 @@ end header_attr_word
 // **In the header the word is still the module's clause**: the header is read first, so a file whose
 // first declaration is the function writes an `import` or another declaration above it, or the
 // module's clause is what it wrote.
-fn_forgo_word(w: string) -> bool = w == "no_alloc"
+fn_forgo_word(w: string) -> bool = w == "no_alloc" || w == "no_block"
 
 // The word a `@` is followed by, or `""` where it is followed by no name at all.
 attr_name(p: *Parser) -> string = p.peek_at(1) match
@@ -103,6 +103,7 @@ parse_attr_list(p: *Parser) -> Buf[Attr]
         p.skip_newlines()
 
     refuse_duplicates(p, out, "declaration")
+    refuse_blocks_beside_no_block(p, out)
     out
 end parse_attr_list
 
@@ -144,11 +145,12 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
         p.skip_newlines()
 
     refuse_duplicates(p, out, "member")
+    refuse_blocks_beside_no_block(p, out)
     out
 end parse_member_attrs
 
 private member_attr_refusal() -> string =
-    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@reads' and '@writes' — and the four about the function it lowers to, '@noinline', '@inline', '@cold' and '@no_alloc'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
+    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@lends', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
 
 // A layout annotation above a field (or any member) is about the wrong thing rather than about a
 // function: `@packed` and `@align(n)` lay out a whole struct, and `@align(n)` marks one binding's
@@ -167,7 +169,7 @@ end layout_attr_on_member
 private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
-    for word in ["crossing", "borrows", "reads", "writes", "noinline", "inline", "cold"]
+    for word in ["crossing", "borrows", "lends", "reads", "writes", "noinline", "inline", "cold", "blocks"]
         if word == w then return true
 
     false
@@ -181,6 +183,12 @@ private refuse_duplicates(p: *Parser, attrs: Buf[Attr], what: string)
                 p.fault(p.here(), s"'@${attr_word(attrs.at(i))}' is written twice above one ${what}, and it says nothing the once does not")
                 return
 end refuse_duplicates
+
+// `@blocks` says the definition may wait and `@no_block` that it never does, so the two above one
+// definition are a contradiction rather than a stricter promise.
+private refuse_blocks_beside_no_block(p: *Parser, attrs: Buf[Attr])
+    if any_is(attrs, "blocks") && any_is(attrs, "no_block") then
+        p.fault(p.here(), "'@blocks' says this definition may wait and '@no_block' that it never does, so the two cannot both be true — a definition that waits is marked '@blocks', and one that promises not to keeps to the promise")
 
 private refuse_hash_attr(p: *Parser, at: Span)
     p.bump()
@@ -229,7 +237,9 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "export" then return Some(parse_export_attr(p, at))
     if word == "section" then return Some(parse_section_attr(p))
     if word == "crossing" then return Some(Crossing(parse_named_list(p, "crossing")))
+    if word == "domain" then return parse_domain_attr(p)
     if word == "borrows" then return Some(Borrows(parse_named_list(p, "borrows")))
+    if word == "lends" then return Some(Lends(parse_named_list(p, "lends")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
     if word == "noinline" then return no_inlining_args(p, NoInline, "whether a call stays a call is the whole of what it says")
     if word == "inline" then return no_inlining_args(p, Inline, "it raises what the inliner will spend on this definition rather than naming a number")
@@ -239,7 +249,17 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // object gets is the back end's answer for the target, not something a program picks.
     if word == "thread_local" then return Some(ThreadLocal)
 
+    // `@per_cpu` takes none either: which register finds the core's copy is the manifest's
+    // `codegen.per_cpu_offset`, a fact about the image rather than about one binding. `@pinned` and
+    // `@pins` are claims about a body with nothing to qualify them.
+    if word == "per_cpu" then return Some(PerCpu)
+    if word == "pinned" then return Some(Pinned)
+    if word == "pins" then return Some(Pins)
     if fn_forgo_word(word) then return Some(Forgoes(word[3..<word.len]))
+
+    // `@blocks` takes no parentheses: what it says is that a call may wait, and how long is not a
+    // number the declaration has.
+    if word == "blocks" then return no_inlining_args(p, Blocks, "how long a call may wait is not a number a declaration has")
 
     // `@ignore` is the spelling other test frameworks use, answered with this one's: ignoring is
     // something a test is, so it is an argument to `@test` rather than an annotation of its own.
@@ -250,7 +270,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     end if
 
     // Anchored after the word, as `@ignore`'s is: the reference's point for both.
-    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
+    p.fault(p.here(), s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)', '@lends(...)', '@crossing(...)' and '@domain(...)' mark a function, '@packed', '@align(n)' and '@byte_order(...)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
     skip_line(p)
     None
 end parse_attribute
@@ -331,8 +351,85 @@ private parse_named_list(p: *Parser, word: string) -> Buf[string]
     out
 end parse_named_list
 
+// The domains a function may say it is entered in. One today; the annotation is a name rather than a
+// bare word so that a second (a signal handler, a second core's own loop) is a row here and not a
+// new spelling.
+private const InterruptDomain: string = "interrupt"
+
+private known_domains() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(InterruptDomain)
+    out
+end known_domains
+
+// `@domain(interrupt)` -- the concurrency domain a function is entered in. **It names exactly one**:
+// a function entered in two domains at once is entered in whichever is the stricter, and there is
+// only one to name. What is refused is told what the domains are, as an unknown annotation is told
+// what the annotations are.
+private parse_domain_attr(p: *Parser) -> Option[Attr]
+    if !p.accept_kw("(") || p.at_kw(")")
+        p.fault(p.here(), named_list_refusal("domain"))
+        skip_line(p)
+        return None
+    end if
+
+    val at = p.here()
+    val name = p.peek() match
+        Ident(n) -> n
+        QuotedIdent(n) -> n
+        _ -> ""
+
+    if name == ""
+        p.fault(at, named_list_refusal("domain"))
+        skip_line(p)
+        return None
+    end if
+
+    p.bump()
+
+    if p.at_kw(",")
+        p.fault(p.here(), "'@domain' names the one domain a function is entered in — a function " +
+                "the processor may enter in either of two is entered in the stricter, so name that one")
+        skip_line(p)
+        return None
+    end if
+
+    p.expect_kw(")")
+
+    val known = known_domains()
+
+    if !holds_string(known, name)
+        val which = if known.len() == 1 then s"${quoted_list(known)} is the one there is"
+        else s"a function may name ${quoted_list(known)}"
+
+        p.fault(at, s"'$name' is not a domain a function is entered in — $which, for a function a " +
+                "vector table or a trap stub calls on top of whatever was running. A function the program " +
+                "calls itself is in the program's own domain, and says so by not writing the annotation")
+        return None
+    end if
+
+    Some(Domain(name))
+end parse_domain_attr
+
+// `'a'`, `'a' and 'b'`, `'a', 'b' and 'c'`.
+private quoted_list(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + (if i == names.len() - 1 then " and " else ", ")
+
+        out = out + s"'${names.at(i)}'"
+
+    out
+end quoted_list
+
 private named_list_refusal(word: string) -> string
     if word == "crossing" then return "'@crossing' names the parameters a value reaches another concurrency domain through, in parentheses — '@crossing(state)'. There is no empty form: a function that hands nothing across a boundary says so by not writing the annotation"
+
+    if word == "domain" then return "'@domain' names the domain a function is entered in, in parentheses — '@domain(interrupt)' for a handler a vector table calls, on top of whatever was running. There is no empty form: a function in the program's own domain says so by not writing the annotation"
+
+    if word == "lends" then return "'@lends' names the callable parameters a function hands a pointer that is valid only during the call, in parentheses — '@lends(body)'. There is no empty form: a function that lends nothing says so by not writing the annotation"
 
     if word == "borrows" then return "'@borrows' names the parameters a trait's method promises not to keep past the call, in parentheses — '@borrows(bytes)'. There is no empty form: a method that may keep what it is handed says so by not writing the annotation"
 
@@ -523,11 +620,16 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Export(e) -> f.exported = Some(e)
             Section(s) -> f.section = Some(s)
             Crossing(ns) -> f.crossing = ns
+            Domain(d) -> f.marks.domain = Some(d)
             Needs(cs) -> f.needs = cs
+            Lends(ns) -> f.marks.lends = ns
             NoInline -> f.marks.noinline = true
             Inline -> f.marks.inline = true
             Cold -> f.marks.cold = true
+            Pinned -> f.marks.pinned = true
+            Pins -> f.marks.pins = true
             Forgoes(cap) -> f.marks.forgoes.push(cap)
+            Blocks -> f.marks.blocks = true
             _ -> ()
 end apply_func_attrs
 
@@ -536,12 +638,16 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
         attr match
             Crossing(ns) -> m.crossing = ns
             Borrows(ns) -> m.borrows = ns
+            Lends(ns) -> m.marks.lends = ns
             Reads(ns) -> m.reads = Some(ns)
             Writes(ns) -> m.writes = Some(ns)
             NoInline -> m.marks.noinline = true
             Inline -> m.marks.inline = true
             Cold -> m.marks.cold = true
+            Pinned -> m.marks.pinned = true
+            Pins -> m.marks.pins = true
             Forgoes(cap) -> m.marks.forgoes.push(cap)
+            Blocks -> m.marks.blocks = true
             _ -> ()
 end apply_member_attrs
 
@@ -573,6 +679,12 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     // storage, so a declaration that lays none down has nothing for it to be about.
     if per_thread(attrs) && !storage
         p.fault(start, "'@thread_local' gives one 'var' a copy per thread, and this declares no storage at all — a 'const' is folded into every use, an 'extern' names storage this program does not lay down, and a function is code every thread runs the one copy of")
+        skip_line(p)
+        return stmt(start.to(p.just_taken()), Bad)
+    end if
+
+    if per_core(attrs) && !storage
+        p.fault(start, "'@per_cpu' gives one 'var' a copy per processor core, and this declares no storage at all — a 'const' is folded into every use, an 'extern' names storage this program does not lay down, and a function is code every core runs the one copy of")
         skip_line(p)
         return stmt(start.to(p.just_taken()), Bad)
     end if
@@ -619,13 +731,14 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         return placed_asm(parse_asm(p, at), attrs)
     end if
 
-    // `@needs(...)` is the one annotation an `extern` takes -- it is the declaration the annotation
-    // exists for, every other having a body the compiler reads instead.
+    // `@needs(...)` and `@blocks` are the two annotations an `extern` takes -- it is the declaration
+    // they exist for, every other having a body the compiler reads instead.
     refuse_async_extern(p)
 
     if p.at_kw("extern")
         refuse_unless(p, at, attrs, "extern")
-        return from_first(start, parse_extern_decl(p, at, vis, capabilities_of(attrs)))
+        return from_first(start, parse_extern_decl(p, at, vis, capabilities_of(attrs),
+                                                   any_is(attrs, "blocks")))
     end if
 
     // A `type` names a scalar or a pointer for a generated header, which is the struct's request made
@@ -688,7 +801,7 @@ private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)
 private may_carry(form: string, a: Attr) -> bool
     if form == "struct" then return is_layout(a) || attr_word(a) == "export"
     if form == "binding" then return is_storage(a)
-    if form == "extern" then return attr_word(a) == "needs"
+    if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "blocks"
 
     !is_layout(a) && attr_word(a) != "borrows"
 end may_carry
@@ -696,6 +809,9 @@ end may_carry
 // The sentence a declaration that carries none of these gets, chosen by what was written above it.
 private attributed_refusal(attrs: Buf[Attr]) -> string
     if forgo_of(attrs).is_some() then return forgo_refusal(forgo_of(attrs).unwrap())
+
+    if all_are(attrs, "blocks")
+        return "'@blocks' says a call may wait, so it marks a function, a method or an 'extern' — and this declares none of them"
 
     if all_are(attrs, "byte_order")
         return "'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'sysl.math.ByteOrder' gives every whole-byte integer"
@@ -812,8 +928,32 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
 
     // `@thread_local` marks a binding and only a binding, so the only annotations it may stand beside
     // are the other two about storage.
+    if per_thread(attrs) && per_core(attrs)
+        p.fault(p.here(), "'@thread_local' and '@per_cpu' are two answers to how many copies one 'var' has — one per thread, or one per processor core — so they cannot stand above the same binding. Pick the one the program means: a thread moves between cores, and a core runs many threads")
+        return
+    end if
+
     if per_thread(attrs) && !all_storage(attrs)
         p.fault(p.here(), "'@thread_local' gives one 'var' a copy per thread, so the only annotations it stands beside are the other two about storage — '@align(n)' and '@section(\"...\")'. The rest mark a function or a type, and neither is storage a thread could have its own of")
+        return
+    end if
+
+    // `@per_cpu` owns its section -- every core's copy is made from the one `.percpu` image, which a
+    // linker script bounds -- so `@align(n)` is the only other storage annotation it may stand beside.
+    if per_core(attrs) && has_section(attrs)
+        p.fault(p.here(), "'@per_cpu' places the binding in '.percpu', the image every core's copy is made from, so '@section(\"...\")' would move it out of the block the copies are taken from. Leave the section off; '@align(n)' is the one other annotation it stands beside")
+        return
+    end if
+
+    if per_core(attrs) && !all_storage(attrs)
+        p.fault(p.here(), "'@per_cpu' gives one 'var' a copy per processor core, so the only other annotation it stands beside is '@align(n)'. The rest mark a function or a type, and neither is storage a core could have its own of")
+        return
+    end if
+
+    // `@pinned` says the callers hold the core still; `@pins` says the body does. One body cannot be
+    // both, and a function that is either is code rather than storage.
+    if has_word(attrs, "pinned") && has_word(attrs, "pins")
+        p.fault(p.here(), "'@pinned' says every caller already keeps this function on one core, and '@pins' says the function does that itself before it reaches per-core storage — one body is one or the other. '@pins' is the one that asks nothing of its callers")
         return
     end if
 
@@ -829,7 +969,7 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     // whichever kind the declaration turns out to be would give. `@section` is in neither camp, and
     // a set of nothing but layout and `@export("...")` is a struct's C name beside its layout. A set
     // holding `@thread_local` is a binding's, settled by the rule above.
-    if has_layout(attrs) && !per_thread(attrs) && !all_layout_or_export(attrs) && marks_a_function(attrs)
+    if has_layout(attrs) && !per_thread(attrs) && !per_core(attrs) && !all_layout_or_export(attrs) && marks_a_function(attrs)
         p.fault(p.here(), "'@packed' and '@align' describe a layout and the rest mark a function, so they cannot stand above one declaration — a struct has no body to be tail-recursive or pure in, and a function has no fields to lay out")
 end refuse_impossible_pairs
 
@@ -863,6 +1003,7 @@ private is_storage(a: Attr) -> bool = a match
     Align(_) -> true
     Section(_) -> true
     ThreadLocal -> true
+    PerCpu -> true
     _ -> false
 
 private has_export(attrs: Buf[Attr]) -> bool
@@ -901,12 +1042,17 @@ private all_layout_or_export(attrs: Buf[Attr]) -> bool
 end all_layout_or_export
 
 // Whether a set of annotations asks for one copy per thread.
-private per_thread(attrs: Buf[Attr]) -> bool
+private per_thread(attrs: Buf[Attr]) -> bool = has_word(attrs, "thread_local")
+
+// Whether a set of annotations asks for one copy per processor core.
+private per_core(attrs: Buf[Attr]) -> bool = has_word(attrs, "per_cpu")
+
+private has_word(attrs: Buf[Attr], word: string) -> bool
     for attr in attrs
-        if attr_word(attr) == "thread_local" then return true
+        if attr_word(attr) == word then return true
 
     false
-end per_thread
+end has_word
 
 private all_storage(attrs: Buf[Attr]) -> bool
     for attr in attrs
@@ -938,6 +1084,14 @@ private all_are(attrs: Buf[Attr], word: string) -> bool
 
     true
 end all_are
+
+// Whether any annotation in the set is written with this word.
+private any_is(attrs: Buf[Attr], word: string) -> bool
+    for attr in attrs
+        if attr_word(attr) == word then return true
+
+    false
+end any_is
 
 // The capabilities a set of annotations names, flattened.
 private capabilities_of(attrs: Buf[Attr]) -> Buf[string]
@@ -991,13 +1145,20 @@ end exported_type
 private placed(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
     var align: Option[Expr] = None
     var section: Option[string] = None
-    val thread_local = per_thread(attrs)
+    val copies = if per_thread(attrs) then CopyPerThread
+    else if per_core(attrs) then CopyPerCpu
+    else OneCopy
 
     // `@thread_local` is the one of the three that chooses between the two keywords, so it is
     // answered before the shared "names several" rule: a reader who wrote it above a `val` has a
     // mistake about what the attribute is for, whatever the count of names.
-    if thread_local && !holds_a_var(s)
+    if copies == CopyPerThread && !holds_a_var(s)
         p.fault(Span(s.span.end, s.span.end), "'@thread_local' gives one 'var' a copy per thread, and a 'val' never changes — so the one copy every 'val' already has is every thread's, and a per-thread constant is a constant. Write it above a 'var' if the threads need to disagree")
+        return s
+    end if
+
+    if copies == CopyPerCpu && !holds_a_var(s)
+        p.fault(Span(s.span.end, s.span.end), "'@per_cpu' gives one 'var' a copy per processor core, and a 'val' never changes — so the one copy every 'val' already has is every core's, and a per-core constant is a constant. Write it above a 'var' if the cores need to disagree")
         return s
     end if
 
@@ -1010,7 +1171,7 @@ private placed(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
     *s.kind match
         ValDecl(n, t, v, vis, _, _) -> stmt(s.span, ValDecl(n, t, v, vis, align, section))
         VarDecl(n, t, v, vis, _, _, _) ->
-            stmt(s.span, VarDecl(n, t, v, vis, align, section, thread_local))
+            stmt(s.span, VarDecl(n, t, v, vis, align, section, copies))
         StaticDecl(inner) -> stmt(s.span, StaticDecl(placed(p, inner, attrs)))
 
         // **Both annotations are about one object**, so a binding that names several has nothing for

@@ -157,6 +157,10 @@ repr(t: Type) -> Type = t match
 name_only(d: &ConstrainedType) -> bool =
     !d.derived && d.lo.is_none() && d.hi.is_none() && d.pred_fn.is_none()
 
+// Whether a subtype **checks nothing** -- no range and no predicate -- so every value of its base is
+// one of its own. A `new` type that is only `new` is one, and so is every name-only subtype.
+constraint_free(d: &ConstrainedType) -> bool = d.lo.is_none() && d.hi.is_none() && d.pred_fn.is_none()
+
 // The type with every name-only constrained type in it replaced by its base, at any depth. This is
 // the identity such a name has everywhere the language checks types -- agreement (through `repr`),
 // and the key an instantiation is filed under -- so `Buf[H]` and `Buf[u64]` are one instantiation and
@@ -392,11 +396,13 @@ has_zero(t: Type) -> bool = t match
     Array(_, elem) -> has_zero(*elem)
     Vector(_, elem) -> has_zero(*elem)
     Struct(d) -> every_field_has_zero(d.fields)
-    // A constrained subtype has none, whether or not its range holds a zero: the rule is the type's,
-    // so widening or narrowing a range never changes whether a declaration elsewhere compiles, and
-    // writing `= 0` is the produce site that says the value was meant (`reference/errors.md § Where
-    // a constraint is checked`). A plain alias never reaches here, being resolved to its base.
-    Constrained(_) -> false
+    // A subtype that CHECKS something has none, whether or not its range holds a zero: the rule is
+    // the type's, so widening or narrowing a range never changes whether a declaration elsewhere
+    // compiles, and writing `= 0` is the produce site that says the value was meant
+    // (`reference/errors.md § Where a constraint is checked`). One that checks nothing -- a plain
+    // `new` type, a measured `c type` -- admits every value of its base, zero included, and has its
+    // base's. A plain alias never reaches here, being resolved to its base.
+    Constrained(d) -> constraint_free(d) && has_zero(d.base)
     other -> zero_sized(other)
 
 private every_field_has_zero(fields: Buf[(string, Type)]) -> bool
