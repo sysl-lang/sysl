@@ -714,6 +714,8 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
 
     if null_test_form(cx, name) then return Some(null_test_call(cx, span, args))
 
+    if release_form(cx, name) then return Some(release_call(cx, span, args))
+
     None
 end special_form
 
@@ -760,6 +762,63 @@ private null_test_fault(t: Type) -> Option[string] = t match
     Unknown -> None
     other -> Some(s"'is_null' asks whether a reference names nothing, and ${type_show(other)} is " +
                   "not a reference — a '*T' is compared with 'null' directly")
+
+// `release(place)` -- the counted reference a `&T` place holds given back where it stands, and the
+// place left naming nothing, as zeroed storage does. It is `is_null`'s other half: a `&T` field in
+// storage the language did not initialise has to be emptied before the storage is freed or reused,
+// and assigning a fresh value would make one only to lose it. A function or a local of the name is
+// what a call reaches, and the form applies only where nothing else claims it.
+release_form(cx: &Analyzer, name: string) -> bool =
+    name == "release" && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
+
+// **It is an assignment of the empty reference and nothing else**, so everything an assignment owes
+// is owed here too: the place is held to being writable, the share it held is given back -- running
+// the destructor when that was the last one -- and a struct whose invariant reads the field re-checks
+// it. The type is asked about first, since a value that is no reference is the more useful thing to
+// hear about than one that has no address. What it yields is `unit`, never the emptied reference.
+private release_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 1 then
+        return cx.err(span, "'release' takes exactly one value, the place holding the reference to " +
+                      "give back")
+
+    val t = type_expr_bare(cx, args.at(0))
+    val ty = texpr_type(t)
+
+    if ty == Unknown then return bad_expr(span)
+
+    val fault = release_fault(cx, ty)
+
+    if fault.is_some() then return cx.err(span, fault.unwrap())
+
+    val place = require_place(cx, t, args.at(0), "'release'", true, Some(span))
+    var writes: Buf[TExpr] = buf()
+
+    writes.push(rechecked(cx, span, place, TExpr(span, TStore(place, TExpr(span, TZero(ty)), ty))))
+    TExpr(span, TSeq(writes))
+end release_call
+
+// What 'release' may not be given. Each of the near misses already has its own way to be emptied, and
+// the refusal names it rather than only saying what the value is not.
+private release_fault(cx: &Analyzer, t: Type) -> Option[string] = underlying(t) match
+    Ref(_, _) -> None
+    Weak(_) -> Some("'release' gives back the count a '&T' holds, and a weak reference holds none " +
+                    "to give — assign 'None' to empty it")
+    Enum(d) ->
+        if d.base == library_key("Option") then
+            return Some(s"'release' gives back what a '&T' place holds, and ${type_show(t)} is an " +
+                        "'Option' — assign 'None', which gives back what it held and allocates nothing")
+
+        not_a_reference(cx, t)
+    Unknown -> None
+    _ -> not_a_reference(cx, t)
+
+private not_a_reference(cx: &Analyzer, t: Type) -> Option[string]
+    if has_member(cx.an, t, "release") then
+        return Some(s"'release' gives back what a '&T' place holds, and ${type_show(t)} gives its " +
+                    "share back through its own member — call '.release()' on it")
+
+    Some(s"'release' gives back what a '&T' place holds, and ${type_show(t)} is not a counted " +
+         "reference — there is no share in it to give back")
 
 // `ptr_cast(p)` and `ptr_cast[T](p)` -- an address read as a pointer to some type, which is either
 // the type the position gives it or the one written in the brackets.
@@ -834,7 +893,7 @@ private is_trait_type(t: Type) -> bool = t match
 // none either, and saying so is better than reporting the name as uncallable.
 private special_form_name(cx: &Analyzer, name: string) -> bool =
     special_form_word(name) || atomic_form(cx, name) || task_form(cx, name) || slot_form(cx, name) ||
-    null_test_form(cx, name) || sysreg_form(cx, name)
+    null_test_form(cx, name) || release_form(cx, name) || sysreg_form(cx, name)
 
 // The words the compiler answers itself, the atomics aside: a form belongs to no module, so an import
 // naming one is told so rather than that the module lacks it.
