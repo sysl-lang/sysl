@@ -323,13 +323,15 @@ private scan_terms(a: &Analysis, cx: &Abandoning, terms: Buf[TCondTerm], held: s
 end scan_terms
 
 // What the frame holds once `x` has been evaluated: a counted value read straight out of a local is
-// the local's own count, which the block already says; anything else counted is a temporary.
+// the local's own count, which the block already says, and a string literal is static data with no
+// count to give back; anything else counted is a temporary.
 private with_temp(held: string, x: TExpr) -> string
     if held != "" then return held
     if !contains_counted(texpr_type(x)) then return ""
 
     *x.kind match
         TLoad(_, _) -> ""
+        TStrLit(_) -> ""
         _ -> "a counted temporary the enclosing expression is still holding"
 end with_temp
 
@@ -397,7 +399,12 @@ private made_a_value(cx: &Abandoning, name: string) -> string
 
     s"'${qualified_name(name)}' can reach a call that abandons every frame below it, and a call through a value cannot be followed there, so whoever calls this value could hold a count across it unseen — call it by name"
 
-private erased_refusal(cx: &Abandoning, name: string) -> string =
+// A closure is erased into a `&Fn` the same way a type is erased into its trait, and its name is a
+// counter nobody wrote, so it is said in the closure's own words.
+private erased_refusal(cx: &Abandoning, name: string) -> string
+    if mentions_closure(name)
+        return "this closure can reach a call that abandons every frame below it, and a call through a value cannot be followed there, so whoever calls it could hold a count across it unseen — call what it calls by name"
+
     s"'${qualified_name(name)}' can reach a call that abandons every frame below it, and a call through a trait object cannot be followed there, so whoever calls through this object could hold a count across it unseen — call it on the type itself"
 
 private async_refusal(name: string) -> string =

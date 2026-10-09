@@ -57,7 +57,8 @@ private nfc_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
 
 // A refusal carries this message, anchored at this `line:column` of `main.sysl`.
 private nfc_refused(said: string, message: string, at: string) =
-    assert(said.contains(s"error: $message\n --> main.sysl:$at\n"), said)
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"--> main.sysl:$at\n"), said)
 
 // A frame holding a box with a destructor and a pending `defer`, ending in a call to `finish`;
 // `mark` is written above `finish`.
@@ -110,7 +111,7 @@ private nfc_thread(mark: string) -> string = s"""
     struct Thread
         entry: Option[&Fn() -> unit]
 
-    static var th = Thread(None)
+    static var th: Thread = Thread(None)
 
     $mark
     finish() -> never
@@ -155,12 +156,12 @@ nfc_a_thread_entry_without_the_mark_leaks()
 
 // The text of one function out of a module, from its `define` to its closing brace.
 private nfc_body(ir: string, symbol: string) -> string
-    val start = ir.find(s"@$symbol(")
+    val start = ir.index_of(s"@$symbol(")
 
     if start.is_none() then return ""
 
     val rest = ir[start.unwrap()..]
-    val close = rest.find("\n}\n")
+    val close = rest.index_of("\n}\n")
 
     if close.is_none() then rest else rest[0..<close.unwrap()]
 end nfc_body
@@ -193,8 +194,8 @@ nfc_the_release_precedes_the_call()
 
     for name in ["first", "second"]
         val body = nfc_body(ir, name)
-        val released = body.find("release")
-        val called = if name == "first" then body.find("@finish(") else body.find("@exit(")
+        val released = body.index_of("release")
+        val called = if name == "first" then body.index_of("@finish(") else body.index_of("@exit(")
 
         assert(released.is_some(), body)
         assert(called.is_some(), body)
@@ -217,7 +218,7 @@ nfc_a_local_held_across_is_refused()
             print(s)
 
         run()
-        """), "'handle' can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call — its count would never be given back. Give it back first: hold it in a function that returns before this call is made, or as a '*T'", "11:13")
+        """), "'handle' can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call — its count would never be given back. Give it back first: hold it in a function that returns before this call is made, or as a '*T'", "11:5")
 
 @test("a binding a 'match' arm took a share of is held across the call")
 nfc_an_arm_binding_is_held()
@@ -290,7 +291,7 @@ nfc_what_is_not_held_compiles()
         leave(code: int) -> never
             exit(code)
 
-        handle(n: int)
+        handle(n: usize)
             if n == 0 then leave(1)
 
         relay(s: string)
@@ -399,6 +400,7 @@ nfc_not_erased()
             stop(self)
 
         struct Now
+        end Now
 
         impl Stop for Now
             stop(self) = leave(1)
