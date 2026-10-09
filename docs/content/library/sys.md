@@ -38,7 +38,7 @@ print(sysl.sys.sysl_sqrt(2.0))
 ```
 
 And the glob import above is worth looking at twice, because it is **not itself refused** — it
-succeeds, and brings in nothing:
+succeeds, and every name it brings into view is refused where it is used:
 
 ```sysl
 import sysl.sys.*
@@ -47,7 +47,7 @@ print(sysl_putchar(104))
 ```
 
 ```error
-undefined function 'sysl_putchar'
+'sysl.sys.sysl_putchar' is private to module 'sysl'
 ```
 
 `private[sysl]` means *the module `sysl` and its whole subtree*, so every other part of the standard
