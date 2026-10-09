@@ -2,6 +2,7 @@ module sysl.process.hosted
 @requires(posix)
 
 import sysl.process.sys.{Text, ended_exited, ended_signalled, ended_timed_out}
+import sysl.sys.host_status
 
 // `sysl.process.sys`'s hooks answered over a POSIX host -- `posix_spawn`, or `fork` and `exec` where
 // the C library is too old for a child's directory to be given to `posix_spawn`. **Call
@@ -52,7 +53,7 @@ proc_spawn(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, en
     val e = c_start(path, path_len, argv, argc, envp, envc, inherit_env, dir, dir_len, stdin_fd,
                     stdout_fd, stderr_fd, &pid, started)
 
-    if e != 0 then -i64(e) else i64(pid)
+    if e != 0 then i64(host_status(int(e))) else i64(pid)
 end proc_spawn
 
 @export("sysl_proc_wait")
@@ -62,7 +63,7 @@ proc_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> in
     var expired: i32 = 0
     val e = c_wait(i32(pid), started, timeout_ms, &code, &sig, &expired)
 
-    if e != 0 then return -e
+    if e != 0 then return host_status(int(e))
 
     // Asked before the other two, because a child stopped for running too long ended by a signal and
     // would otherwise be reported as one.
@@ -86,12 +87,12 @@ proc_kill(pid: i64, signal: int) -> int
 
     val code = errno_location()[0]
 
-    if code > 0 then -int(code) else -1
+    if code > 0 then host_status(code) else -5
 end proc_kill
 
 @export("sysl_proc_temp_path")
 proc_temp_path(into: *u8, room: usize) -> isize
     val e = c_temp_path(into, room)
 
-    if e != 0 then -isize(e) else isize(c_strlen(into))
+    if e != 0 then isize(host_status(int(e))) else isize(c_strlen(into))
 #endif

@@ -81,7 +81,7 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             if cx.lookup(name).is_none()
                 val inner = cx.nested_of(name)
 
-                if inner.is_some() then return call_nested(cx, span, inner.unwrap(), name, args)
+                if inner.is_some() then return call_nested(cx, span, inner.unwrap(), name, args, expected)
 
                 val early = call_before_the_group(cx, span, name)
 
@@ -107,7 +107,7 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             val name = written_name_of(head)
 
             if name.is_some() && cx.lookup(name.unwrap()).is_none() &&
-               names_a_function(cx, name.unwrap())
+               (names_a_function(cx, name.unwrap()) || cx.nested_of(name.unwrap()).is_some())
                 var targs: Buf[Expr] = buf()
 
                 targs.push(one)
@@ -380,6 +380,13 @@ private written_call(cx: &Analyzer, span: Span, head: Expr, bracket: Span, targs
     val name = written_name_of(head)
 
     if name.is_none() then return cx.err(span, "this is not something that can be called")
+
+    // A nested function stands in front of the module's names, as it does in a call without a list.
+    if cx.lookup(name.unwrap()).is_none()
+        val inner = cx.nested_of(name.unwrap())
+
+        if inner.is_some() then
+            return written_nested_call(cx, span, inner.unwrap(), name.unwrap(), targs, args, expected)
 
     // A type wearing the same brackets: `Pair[int, string](1, "a")` names its instantiation as
     // plainly as an annotation on what receives it would.

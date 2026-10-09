@@ -154,6 +154,11 @@ private cap_header() -> string =
     "this attribute belongs in the file's header, on the lines directly after 'module' and before " +
     "everything else — it is a property of the whole module, not of the statements below it"
 
+// The refusal of a call to `called`, which allocates through `seed` rather than in its own body.
+private cap_reaches_through(called: string, seed: string) -> string =
+    s"this reaches '$called', which makes heap storage through '$seed', and this module declared " +
+    "'@no_alloc' — an allocator-free module may only call what is allocator-free itself"
+
 private cap_reaches(what: string) -> string =
     s"this reaches '$what', which makes heap storage, and this module declared '@no_alloc' — an " +
     "allocator-free module may only call what is allocator-free itself"
@@ -864,7 +869,7 @@ cap_a_call_into_a_function_that_allocates()
                                          "text(b: []const u8) -> string = line_text(b).unwrap_or(\"\")\n"),
                                "var bytes: [2]u8 = [104u8, 105u8]\nprint(thing.text(bytes[0..<2]))\n"))
 
-    cap_check(said, cap_reaches("sysl.text.from_utf8"))
+    cap_check(said, cap_reaches_through("sysl.io.line_text", "sysl.text.from_utf8"))
     cap_check(said, "thing/a.sysl:6:33")
 
 private cap_bytes_main(call: string) -> string = s"var bytes: [2]u8 = [104u8, 105u8]\nprint($call)\n"
@@ -879,7 +884,7 @@ cap_every_call_that_reaches_one_is_named()
                                          "    var x = line_text(a).unwrap_or(\"\")\n    var y = line_text(b).unwrap_or(\"\")\n    x.len + y.len\n"),
                                cap_bytes_main("thing.two(bytes[0..<2], bytes[0..<2])")))
 
-    assert_eq(cap_lines_saying(said, cap_reaches("sysl.text.from_utf8")), 2)
+    assert_eq(cap_lines_saying(said, cap_reaches_through("sysl.io.line_text", "sysl.text.from_utf8")), 2)
     cap_check(said, "thing/a.sysl:7:13")
     cap_check(said, "thing/a.sysl:8:13")
 
@@ -893,7 +898,7 @@ cap_one_call_reached_through_several_nodes()
                                cap_bytes_main("thing.one(bytes[0..<2])")))
 
     assert_eq(cap_lines_saying(said, "which makes heap storage"), 1)
-    cap_check(said, cap_reaches("sysl.text.from_utf8"))
+    cap_check(said, cap_reaches_through("sysl.io.line_text", "sysl.text.from_utf8"))
     cap_check(said, "thing/a.sysl:6:31")
 
 @test("and printing, which an allocator-free module does constantly, is not")

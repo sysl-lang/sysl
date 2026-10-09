@@ -1113,6 +1113,50 @@ dictionary passed at runtime.
 - **Recursion is fine.** A recursive generic function recurses at a *fixed* instantiation, so it
   monomorphizes like any other.
 
+### A nested function may be generic
+
+A function declared inside a body takes type parameters, bounds and the bare-arrow sugar exactly as a
+top-level one does, and each call instantiates it the same way. What it adds is the frame: every
+instantiation is one more function over the environment its block shares, so each reads and writes
+the body's variables as any nested function does.
+
+```sysl
+tally() -> int
+    var total = 0
+
+    noted[T: Display](x: T, n: int) -> string
+        total += n
+        s"$x"
+
+    print(noted("a", 2), noted(true, 3), noted(1.5, 4))
+    total
+
+print(tally())
+```
+
+```output
+a true 1.5
+9
+```
+
+Two bodies may each declare a nested generic of one name: an instantiation is named for the frame it
+belongs to as well as for its type arguments, so the two are never one function. A type argument the
+call cannot settle is written out, `sized[u32]()`, and a bound is held at the call:
+
+```sysl
+struct Point
+    x: int
+
+describe() -> string
+    shown[T: Display](x: T) -> string = s"<$x>"
+
+    shown(Point(1))
+```
+
+```error
+'shown' requires its type parameter 'T' to implement 'sysl.Display', but Point does not
+```
+
 ## Variance does not arise
 
 There is no variance question in sysl, by construction. Variance is about when `G[A]` may stand in for
@@ -1237,6 +1281,72 @@ print(b.room())
 ```output
 5
 1
+```
+
+A **simple enum** — one whose variants carry nothing — gives a parameter that takes one of its
+variants. The parameter's declared type says which enum, so the variant is written bare, exactly as
+it is where an expected type names the enum; `Level.High` names the same value:
+
+```sysl
+enum Level
+    Low
+    High
+
+struct Gauge[const L: Level = Low]
+    reading: int
+
+    alarm(self) -> bool = L == High
+
+var quiet: Gauge = Gauge(3)
+var loud: Gauge[High] = Gauge(9)
+var same: Gauge[Level.High] = loud
+
+print(quiet.alarm(), loud.alarm(), same.reading)
+```
+
+```output
+false true 9
+```
+
+`Gauge[Low]` and `Gauge[High]` are two types, and the default makes a bare `Gauge` the first.
+A variant of any other enum is not a value of this one, bare or qualified:
+
+```sysl
+enum Level
+    Low
+    High
+
+enum Tide
+    Low
+    Slack
+
+struct Gauge[const L: Level]
+    reading: int
+
+var g: Gauge[Slack] = Gauge(1)
+print(g.reading)
+```
+
+```error
+'Slack' is not a variant of Level
+```
+
+An enum whose variants carry values cannot be a value parameter's type — its value is more than the
+tag a symbol can spell — and neither can a float or a string:
+
+```sysl
+enum Shape
+    Dot
+    Circle(r: int)
+
+struct Holder[const S: Shape]
+    n: int
+
+print(1)
+```
+
+```error
+'S' is a value parameter, and Shape cannot be the type of one
 ```
 
 Floats are excluded: `NaN != NaN` under the ordinary comparison, which would make a type unequal to
