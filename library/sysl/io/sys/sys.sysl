@@ -1,0 +1,43 @@
+module sysl.io.sys
+
+// The calls the byte surface makes of whatever is under it, at the level of a file descriptor:
+// `sysl.io`'s `FdReader` reads through `fd_read`, and `sysl.flush` pushes standard output out through
+// `fd_flush`.
+//
+// **Each is an `extern` naming a symbol no module here defines**, so what answers it is decided by
+// what the program is linked with (`reference/ffi.md § A module may supply another module's extern`),
+// exactly as for `sysl.fs.sys`:
+//
+// | linked with | what defines the symbols |
+// |---|---|
+// | a program for a hosted target | `sysl.io.hosted`, over the platform's C library |
+// | a program for a target with no C library | the program, with an `@export` per hook it reaches |
+//
+// A freestanding program that reaches one of these and leaves it unanswered is refused when it is
+// compiled, naming the hooks it reached, rather than at the link.
+//
+// ## The shape of a hook
+//
+// **A hook answers one integer: what it did, or what went wrong.** Zero or more is success -- the
+// number of bytes `fd_read` or `fd_write` moved, and zero for `fd_flush` -- and a negative answer is
+// the code of the failure negated: the `IoError` code `sysl.fs` uses, which on a POSIX host is the
+// `errno`. So a kernel's system call that already answers a negative error number is the hook as it
+// stands. A target that cannot perform a call at all answers `-1`.
+//
+// **A descriptor is an `int`**: 0 is standard input, 1 standard output and 2 standard error, as a
+// program is started with them; anything else is whatever the supplier handed out.
+
+/** Reads at most `room` bytes from `fd` into `into`, answering how many arrived -- zero being the end
+ * of the input -- or the failure's code, negated.
+ */
+private[sysl] extern "sysl_io_read" fd_read(fd: int, into: *u8, room: usize) -> isize
+
+/** Writes at most `len` bytes from `from` to `fd`, answering how many were taken or the failure's
+ * code, negated.
+ */
+private[sysl] extern "sysl_io_write" fd_write(fd: int, from: *u8, len: usize) -> isize
+
+/** Pushes out whatever is being held back on its way to `fd`, answering zero or the failure's code,
+ * negated. A supplier keeping no buffer answers zero and does nothing.
+ */
+private[sysl] extern "sysl_io_flush" fd_flush(fd: int) -> int

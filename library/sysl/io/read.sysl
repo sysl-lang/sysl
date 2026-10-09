@@ -1,7 +1,8 @@
 module sysl.io
 
 import sysl.buf.{Buf, buf}
-import sysl.sys.{sysl_memchr, sysl_read}
+import sysl.io.sys.fd_read
+import sysl.sys.sysl_memchr
 import sysl.text.{from_utf8, Utf8Error}
 
 /** The input half of the byte surface, and the line cursor over it.
@@ -72,17 +73,29 @@ end LineEnding
 /** A line is found with `memchr` rather than a byte loop because libc's reads a word at a time and
  * sysl's could not. This is the whole of what pointer difference is for: `memchr` answers *where*
  * with an address, and an index is that address minus the first.
+ *
+ * **A target with no C library walks the bytes instead, because there is nothing to call** -- the
+ * same trade `sysl.slices.copy` makes, and for the same reason: a `memchr` reached from here would be
+ * an undefined symbol at the link of every freestanding program that reads a line.
  */
 find_byte(b: []const u8, c: u8) -> Option[usize]
+#if hosted
     if b.len == 0 then return None
 
     var hit = sysl_memchr(&b[0], int(c), b.len)
 
     if hit == null then None else Some(usize(hit - &b[0]))
+#else
+    for i in 0..<b.len
+        if b[i] == c then return Some(i)
 
-/** A reader over a file descriptor -- one of the two places a freestanding target has to substitute
- * its own body, the other being `putbytes`. Swap this for a `read` syscall and the whole surface
- * above it is unchanged.
+    None
+#endif
+
+/** A reader over a file descriptor, through `sysl.io.sys`'s `read` hook -- which a hosted target's
+ * library answers over C's `read`, and a target with no C library answers with an `@export` of its
+ * own, a `read` system call usually being the whole of it. Whichever answers, the surface above it is
+ * unchanged.
  */
 struct FdReader
     fd: int
@@ -96,7 +109,7 @@ impl Reader for FdReader
     read(*self, into: []u8) -> []const u8
         if into.len == 0 then return into
 
-        var k = sysl_read(self.fd, &into[0], into.len)
+        var k = fd_read(self.fd, &into[0], into.len)
 
         if k < 0 then self.bad = true
         if k <= 0 then return into[0..<0]
