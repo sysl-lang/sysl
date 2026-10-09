@@ -264,9 +264,10 @@ end bounds_check
 // -- reading and writing through a place -------------------------------------------------------------
 
 // Where a write to this place goes: a bitfield's **container**, since the field itself has no
-// address at all, and the place's own otherwise.
+// address at all, and the place's own otherwise. A field of a bitfield struct that is itself a field
+// of one has no address either, so the walk goes on out to the outermost container.
 place_addr(e: *Emit, place: TExpr) -> Val = bit_place(place) match
-    Some(p) -> address(e, p.0)
+    Some(p) -> place_addr(e, p.0)
     None -> address(e, place)
 
 // A place that is a bit range of a bitfield struct: the receiver holding the container, the struct's
@@ -284,12 +285,25 @@ bit_place(place: TExpr) -> Option[(TExpr, Buf[BitRange], BitRange)] = *place.kin
 
 // What is in the place now -- one load of the container and a shift for a bitfield.
 load_place(e: *Emit, place: TExpr, p: Val) -> Val = bit_place(place) match
-    Some(b) -> read_bits(e, b.1, b.2, load_container(e, b.1, b.0, p))
+    Some(b) -> read_bits(e, b.1, b.2, container_at(e, b.1, b.0, p))
     None ->
         val t = fresh_reg(e)
 
         emit(e, InLoad(t, lty(e, texpr_type(place)), p, place_access(e, place), None))
         t
+
+// The container a bitfield's receiver is, where `addr` is the outermost container's address: loaded
+// from there, or, where the receiver is itself a field of a bitfield struct, read out of its own
+// container first.
+private container_at(e: *Emit, ranges: Buf[BitRange], receiver: TExpr, addr: Val) -> Val
+    if bit_place(receiver).is_none() then return load_container(e, ranges, receiver, addr)
+
+    val inner = load_place(e, receiver, addr)
+    val t = fresh_reg(e)
+
+    emit(e, InExtract(t, lty(e, texpr_type(receiver)), inner, index_list(0)))
+    t
+end container_at
 
 private load_container(e: *Emit, ranges: Buf[BitRange], receiver: TExpr, addr: Val) -> Val
     val t = fresh_reg(e)
@@ -306,9 +320,20 @@ store_place(e: *Emit, place: TExpr, p: Val, v: Val) = store_over(e, place, p, v,
 //
 // A bitfield needs neither: every field of a bitfield struct is an integer, so nothing there carries
 // a count. **Its container is re-read here** rather than reused, because two arms of one statement
-// may be two fields of one container and the second has to see what the first left behind.
+// may be two fields of one container and the second has to see what the first left behind. A field
+// of a bitfield struct held in another is a write of the inner container back into the outer one.
 store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) = bit_place(place) match
     Some(b) ->
+        if bit_place(b.0).is_some()
+            val rty = lty(e, texpr_type(b.0))
+            val c = container_at(e, b.1, b.0, p)
+            val inner = fresh_reg(e)
+
+            emit(e, InInsert(inner, rty, VUndef, container_lty(b.1), write_bits(e, b.1, b.2, c, v),
+                             index_list(0)))
+            store_over(e, b.0, p, inner, None)
+            return
+
         val acc = access_of(place_ty(b.0))
         val c = load_container(e, b.1, b.0, p)
 
@@ -393,11 +418,46 @@ private shifted_down(e: *Emit, r: BitRange, c: Val, ct: LType) -> Val
     t
 end shifted_down
 
+// A field's value as the bits of its range: an integer or an enum already is, and a bitfield struct
+// held here is its container taken out of its aggregate and cut to the width its fields use.
+private range_of(e: *Emit, r: BitRange, v: Val) -> Val = bitfield_ranges_of(r.ty) match
+    None -> v
+    Some(inner) ->
+        val bits = bitfield_bits(inner)
+        val c = fresh_reg(e)
+
+        emit(e, InExtract(c, lty(e, r.ty), v, index_list(0)))
+
+        if bits == r.width then return c
+
+        val t = fresh_reg(e)
+
+        emit(e, InCast(t, CastTrunc, LInt(bits), c, LInt(r.width)))
+        t
+
+// The bits of a range as the field's own value -- the inverse of `range_of`: a bitfield struct held
+// here is widened back to its container and wrapped in its aggregate.
+private field_of(e: *Emit, r: BitRange, raw: Val) -> Val = bitfield_ranges_of(r.ty) match
+    None -> raw
+    Some(inner) ->
+        val bits = bitfield_bits(inner)
+        val wide =
+            if bits == r.width then raw
+            else
+                val t = fresh_reg(e)
+
+                emit(e, InCast(t, CastZExt, LInt(r.width), raw, LInt(bits)))
+                t
+        val out = fresh_reg(e)
+
+        emit(e, InInsert(out, lty(e, r.ty), VUndef, LInt(bits), wide, index_list(0)))
+        out
+
 // A field's value widened to the container and shifted to where it belongs.
 place_bits(e: *Emit, ranges: Buf[BitRange], r: BitRange, v: Val) -> Val
     val ct = container_lty(ranges)
 
-    val wide = widened_to(e, ranges, r, v, ct)
+    val wide = widened_to(e, ranges, r, range_of(e, r, v), ct)
 
     if r.offset == 0 then return wide
 
@@ -415,12 +475,12 @@ read_bits(e: *Emit, ranges: Buf[BitRange], r: BitRange, c: Val) -> Val
 
     val shifted = shifted_down(e, r, c, ct)
 
-    if r.width == bitfield_bits(ranges) then return shifted
+    if r.width == bitfield_bits(ranges) then return field_of(e, r, shifted)
 
     val t = fresh_reg(e)
 
     emit(e, InCast(t, CastTrunc, ct, shifted, LInt(r.width)))
-    t
+    field_of(e, r, t)
 end read_bits
 
 // The container `c` with one range replaced by `v` -- the read-modify-write a bitfield write is,
