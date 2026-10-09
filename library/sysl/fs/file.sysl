@@ -2,7 +2,7 @@ module sysl.fs
 @requires(os)
 
 import sysl.io.Reader
-import sysl.fs.sys
+import sysl.fs.sys as fsys
 import sysl.slices.{as_ptr, copy}
 
 // An open file, and the two directions it can be read and written in.
@@ -111,7 +111,7 @@ struct File
         // so a retry would be closing a number that may by then be somebody else's.
         self.inner.shut = true
 
-        val released = sys.close(self.inner.fd)
+        val released = fsys.close(self.inner.fd)
 
         answered(if written != 0 then written else released)
     end close
@@ -121,7 +121,7 @@ struct File
         if self.inner.shut then return Err(NotOpen)
 
         var at: long = 0
-        val code = sys.seek(self.inner.fd, 0, sys.seek_current, &at)
+        val code = fsys.seek(self.inner.fd, 0, fsys.seek_current, &at)
 
         if code != 0 then return Err(from_errno(code))
 
@@ -143,7 +143,7 @@ struct File
 
         var at: long = 0
 
-        answered(sys.seek(self.inner.fd, to, sys.seek_start, &at))
+        answered(fsys.seek(self.inner.fd, to, fsys.seek_start, &at))
     end seek
 
     /** How many bytes the file holds.
@@ -161,8 +161,8 @@ struct File
 
         if written != 0 then return Err(from_errno(written))
 
-        var st = sys.Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-        val code = sys.fstat(self.inner.fd, &st)
+        var st = fsys.Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        val code = fsys.fstat(self.inner.fd, &st)
 
         if code != 0 then Err(from_errno(code)) else Ok(st.size)
     end size
@@ -195,7 +195,7 @@ struct File
 
         if written != 0 then return Err(from_errno(written))
 
-        answered(sys.ftruncate(self.inner.fd, length))
+        answered(fsys.ftruncate(self.inner.fd, length))
     end truncate
 
     /** What went wrong, for a caller that has just been told by `failed` that something did. */
@@ -213,7 +213,7 @@ private drain(s: &FileState) -> int
     while done < s.pending && code == 0
         var put: usize = 0
 
-        code = sys.write(s.fd, &s.held[done], s.pending - done, &put)
+        code = fsys.write(s.fd, &s.held[done], s.pending - done, &put)
 
         if code == 0 && put == 0 then code = stalled
 
@@ -236,7 +236,7 @@ private unread(s: &FileState) -> int
 
     var at: long = 0
 
-    sys.seek(s.fd, -long(ahead), sys.seek_current, &at)
+    fsys.seek(s.fd, -long(ahead), fsys.seek_current, &at)
 end unread
 
 /** The buffer, made the first time the file needs one. */
@@ -311,12 +311,12 @@ impl Reader for File
             // A request at least as large as the buffer goes straight to the descriptor; a smaller
             // one fills the buffer and is served from it.
             if into.len - got >= buffer_bytes
-                code = sys.read(s.fd, &into[got], into.len - got, &n)
+                code = fsys.read(s.fd, &into[got], into.len - got, &n)
                 got += n
             else
                 var b = buffer(s)
 
-                code = sys.read(s.fd, &b[0], b.len, &n)
+                code = fsys.read(s.fd, &b[0], b.len, &n)
 
                 s.at = 0
                 s.filled = n
@@ -373,7 +373,7 @@ impl Writer for File
             while done < bytes.len && code == 0
                 var put: usize = 0
 
-                code = sys.write(s.fd, &bytes[done], bytes.len - done, &put)
+                code = fsys.write(s.fd, &bytes[done], bytes.len - done, &put)
 
                 if code == 0 && put == 0 then code = stalled
 
@@ -397,23 +397,23 @@ end File
  * becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
  * `append` writes at the end of whatever is there, making the file if it is not.
  */
-open(path: string) -> Result[File, IoError] = opened(path, sys.open_read)
+open(path: string) -> Result[File, IoError] = opened(path, fsys.open_read)
 
 create(path: string) -> Result[File, IoError] =
-    opened(path, sys.open_write | sys.open_create | sys.open_truncate)
+    opened(path, fsys.open_write | fsys.open_create | fsys.open_truncate)
 
 append(path: string) -> Result[File, IoError] =
-    opened(path, sys.open_write | sys.open_create | sys.open_append)
+    opened(path, fsys.open_write | fsys.open_create | fsys.open_append)
 
 /** A file opened for reading **and** writing, which the three above cannot express between them: each
  * update mode is a different answer to "and what about what is already there", and naming them apart
  * is what keeps a caller from having to know that one fails on a missing file while the other empties
  * one that exists.
  */
-open_update(path: string) -> Result[File, IoError] = opened(path, sys.open_read | sys.open_write)
+open_update(path: string) -> Result[File, IoError] = opened(path, fsys.open_read | fsys.open_write)
 
 create_update(path: string) -> Result[File, IoError] =
-    opened(path, sys.open_read | sys.open_write | sys.open_create | sys.open_truncate)
+    opened(path, fsys.open_read | fsys.open_write | fsys.open_create | fsys.open_truncate)
 
 /** The flags are a constant at every call above, which is also why this is private: a program wanting
  * a combination the five names do not cover is asking for the platform's `open`, and that is a good
@@ -421,7 +421,7 @@ create_update(path: string) -> Result[File, IoError] =
  */
 private opened(path: string, flags: u32) -> Result[File, IoError]
     var fd = 0
-    val code = sys.open(as_ptr(path.bytes), path.bytes.len, flags, file_mode, &fd)
+    val code = fsys.open(as_ptr(path.bytes), path.bytes.len, flags, file_mode, &fd)
 
     if code != 0 then return Err(from_errno(code))
 

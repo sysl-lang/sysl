@@ -186,9 +186,10 @@ private fsh_lld_present() -> bool = capture("ld.lld", ["--version"], "", [], tru
     Err(_) -> false
 
 private fsh_symbols(elf: string, undefined: bool) -> string
-    val args = if undefined then ["-u", elf] else [elf]
+    val ran = if undefined then capture(fsh_nm, ["-u", elf], "", [], true)
+    else capture(fsh_nm, [elf], "", [], true)
 
-    capture(fsh_nm, args, "", [], true) match
+    ran match
         Ok(o) -> o.text
         Err(_) -> "llvm-nm could not be run"
 end fsh_symbols
@@ -297,16 +298,14 @@ end fsh_no_filesystem_no_question
 
 // -- a hosted target -------------------------------------------------------------------------------------
 
-// The LLVM text of a one-file program for a hosted machine with no prebuilt standard module here, so
-// the library's bodies are lowered beside the program's.
+// The LLVM text of a one-file program for a hosted machine, compiled with the library's bodies lowered
+// beside the program's (`--no-std-lib`), which needs no C library for that machine here.
 private fsh_hosted_text(program: string) -> string
     val p = lbr_program(program)
-    val text = emit_llvm_text(p, Some("x86_64-linux")) match
-        Err(why) -> s"refused: ${failure_text(why)}"
-        Ok(emitted) -> emitted.text
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
 
     lbr_drop([p])
-    text
+    if said.0 != 0 then s"refused: ${said.1}" else said.1
 end fsh_hosted_text
 
 // The `define` line of `symbol` in `text`, or `""` where there is none.

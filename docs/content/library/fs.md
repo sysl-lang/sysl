@@ -15,7 +15,9 @@ module sysl.fs
 ```
 
 Nothing here is language, and nothing here can be given a body on a target with no filesystem under
-it: a freestanding image has no `fopen` to call and no `errno` to read. So the clause is not a
+it: every call it makes goes through the hooks of `sysl.fs.sys`, which a hosted target's C library
+answers and a bare machine answers only if the program does
+([below](#answering-the-filesystem-on-a-target-with-no-c-library)). So the clause is not a
 warning — it is a fact about which module exists, and it is checked at the **import**:
 
 ```sysl
@@ -234,10 +236,10 @@ read_text("/tmp/sysl-fs-doc-missing.txt") match
 refused: no such file or directory 2
 ```
 
-**`errno` is read at the failure, not wherever the caller got round to asking.** Every call in the
-module reports with a private `why()` that reads it on the spot, because there is nothing between the
-two that could overwrite it — and `fclose` is a call like any other, which sets `errno` to whatever
-*it* thought.
+**`errno` is read at the failure, not wherever the caller got round to asking.** The one place it is
+read is the hosted answer to `sysl.fs.sys`'s hooks, straight after the C call that failed, and what
+crosses back is the number; `sysl.fs` turns it into an `IoError` once. A `File` that latches a
+failure keeps the code it failed with, so a close afterwards cannot overwrite it.
 
 ## `File`
 
@@ -262,16 +264,14 @@ open_update(path: string) -> Result[File, IoError]   // read and write; fails if
 create_update(path: string) -> Result[File, IoError] // read and write; empties what was there
 ```
 
-**A `File` is C's buffered `FILE *`, not a file descriptor, and that is the load-bearing choice.** A
-descriptor would mean `open(2)`, and `open(2)` means `O_CREAT`, `O_TRUNC` and `O_APPEND` — three
-constants whose values differ between platforms and which nothing in the program could check.
-`fopen` takes a **mode string**, which C standardises, so the same three intentions cross the boundary
-as text that is right everywhere. The five functions above are named for what they *mean* rather than
-for the mode string each becomes.
-
-The buffering comes with it, and is the second reason: a `Writer` that reached the operating system
-once per `write` would make rendering into a file cost a system call per fragment, and
-[the rendering surface](/library/core/) writes in fragments.
+**A `File` is a descriptor from `sysl.fs.sys` with a buffer in front of it, and the buffer is
+written in sysl.** A `Writer` that reached the operating system once per `write` would make rendering
+into a file cost a system call per fragment, and [the rendering surface](/library/core/) writes in
+fragments — so small writes collect until they are worth a call, small reads are served from one
+larger one, and a read or write as large as the buffer goes straight through. A position, a size, a
+read after a write and a write after a read all answer as though nothing were held back. The five
+functions above are named for what they *mean* rather than for the flags each becomes; `O_CREAT` and
+its siblings differ between C libraries, and are translated once, by the hosted answer to the hooks.
 
 What is given up is the descriptor itself. A program that needs one — to poll it, to hand it to a
 child — should say `open(2)` for itself, which is what [`sysl.io`](/library/io/)'s `FdReader` is
@@ -764,15 +764,10 @@ remove_dir_all(dir).unwrap()
 4 only
 ```
 
-**This is the one thing in the module answered by C rather than by a bare `extern`.** `readdir` hands
-back a `struct dirent` whose name field sits at an offset the two platforms disagree about, which is
-the transcription the rest of the module refuses — so a four-line shim returns the `char *` and
-nothing in sysl learns the layout. It sits in a `__posix__` directory
-([modules](/reference/modules/)), which is what keeps it off a target with no directories to list.
-
-**One file rather than one per system**, and the shim's own reason for existing is why: the two
-platforms disagree about the layout, the shim is what settles that, and so the shim itself is the
-same text on both. What it needs is a POSIX system to run on, which is exactly what `__posix__` says.
+**A listing is three hooks — open, next name, close — and the next name arrives as bytes and a
+length.** `readdir` hands back a `struct dirent` whose name field sits at an offset the platforms
+disagree about, which is the transcription the module refuses; the hosted answer reads it in a shim
+beside it, where the header decides the layout, and nothing in sysl learns it.
 
 ### Walking a tree
 
@@ -922,11 +917,43 @@ owned would be far worse than the failure being reported. A caller needing the d
 whole or not at all copies into `make_temp_dir` and `rename`s the result into place, which is the only
 way to get atomicity from a filesystem.
 
+## Answering the filesystem on a target with no C library
+
+**Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
+`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_close`, `_seek`, `_fstat`, `_ftruncate`,
+`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_opendir`,
+`_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
+`_realpath`. Each answers an `int`: zero, or the `code()` of the `IoError` it failed with, `-1`
+meaning the target cannot make that call at all. A path crosses as a pointer and a length, with no
+terminator; what a call produces besides its status it writes through a pointer it was handed.
+
+On a hosted target the library answers them itself, over the C library, under `weak` exports
+([a module may supply another module's extern](/reference/ffi/)). A freestanding target has no C
+library, so a program there answers each hook it reaches with an `@export` of its own:
+
+```sysl
+@export("sysl_fs_open")
+k_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int = -1
+```
+
+**A hook the program reaches and leaves unanswered is refused when it is compiled**, all of them in
+one sentence, rather than surfacing at the link as a symbol no line of the program names:
+
+```
+error: this program reaches 'sysl.fs', and 'aarch64-freestanding' has no C library under it for the
+standard library to answer a filesystem with, so the program answers it: define 'sysl_fs_close',
+'sysl_fs_open', 'sysl_fs_read', 'sysl_fs_write' with '@export', each taking what its 'extern' in
+'sysl.fs.sys' declares and answering zero or the code of an 'IoError'
+```
+
+The question is asked only of what the program reaches, so a freestanding program that never touches
+a file is asked nothing.
+
 ## What is absent, and why
 
 **Anything `stat` would answer used to be**, and it is not any more: `metadata` is that call, and the
-`struct stat` it comes back in stays in a shim under `__posix__` where the header decides the layout,
-with thirteen numbers crossing rather than a transcription. That is the shape this section always
+`struct stat` it comes back in stays in the hosted answer's shim, where the header decides the layout,
+with thirteen numbers — `sysl.fs.sys.Stat` — crossing rather than a transcription. That is the shape this section always
 prescribed, arrived at the day something needed it.
 
 The rule the whole module is written under is one sentence: **a question that can be answered by a
