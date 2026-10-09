@@ -23,7 +23,7 @@ the path is standing on.
 | `sysl emit-ast <path>` | print one file's untyped parse tree, as deterministic text |
 | `sysl emit-typed <path>` | print one module's typed tree, as deterministic text |
 | `sysl emit-header <path>` | print the C header for what a module exports |
-| `sysl weave <path>` | render a literate source as an HTML document — *not yet in this compiler* |
+| `sysl weave <path>` | render a literate source as an HTML document |
 | `sysl tangle <path>` | print the program a literate source holds |
 | `sysl deps <path>` | print the dependency graph the project resolves to |
 | `sysl add <coordinate>` | add a dependency to the project's manifest |
@@ -36,13 +36,10 @@ the path is standing on.
 A subcommand is required; sysl with none says so on stderr, with its usage, and exits 2.
 
 A word that is not one of these is refused on stderr, naming the commands there are, and exits 2.
-Every command is sysl's own — nothing is looked for on the `PATH`.
-
-**One of these is not in this compiler yet**: `weave`. It is described below as it will work, and
-until it is added it is refused as any other word that names no command is:
+Every command is sysl's own — nothing is looked for on the `PATH`:
 
 ```text
-sysl: error: 'weave' is not a sysl command — the commands are run, build, build-lib, build-c, emit-header, tangle, test, emit-llvm, emit-ast, emit-typed, prove, deps, add, vendor, tidy, doc, targets
+sysl: error: 'wave' is not a sysl command — the commands are run, build, build-lib, build-c, emit-header, weave, tangle, test, emit-llvm, emit-ast, emit-typed, prove, deps, add, vendor, tidy, doc, targets
 ```
 
 **What a command was run for goes to stdout, and everything it says about the run goes to stderr** —
@@ -346,26 +343,49 @@ error, exits non-zero and prints the ordinary diagnostic instead, with nothing o
 
 ### `weave`
 
-*Not yet in this compiler — it answers "'weave' is not a sysl command". What follows is the command
-as it will be.*
-
 ```bash
-sysl weave guide/slab/slab.lsysl -o slab.html
+sysl weave library/sysl/regex/vm.lsysl -o vm.html
 sysl weave library/sysl/regex -o documents/
 ```
 
-A **literate** source rendered as an HTML document. A `.lsysl` file is a Markdown document whose
-four-column-indented part is the program, which is what makes one readable with nothing rendering it
-— and an indented code block carries no *language*, so nothing can highlight it. `weave` tells the
-renderer that an indented block is sysl, which is the whole of the transformation: the source reaches
-the renderer exactly as written, and prose, tables, illustrations and heading levels are its own
-business.
+`weave [-o <path>] <path>`. A **literate** source rendered as an HTML document. A `.lsysl` file is a
+Markdown document whose four-column-indented part is the program, which is what makes one readable
+with nothing rendering it — and an indented code block carries no *language*, so nothing can
+highlight it. `weave` sets exactly the lines the compiler reads as program text as sysl code, one
+block through any blank lines between them, and renders every other line as Markdown: prose, tables,
+illustrations and heading levels are the document's own business.
+
+The Markdown is [`sysl-lang/markdown`](https://github.com/sysl-lang/markdown)'s: CommonMark 0.31.2
+with what GitHub renders — tables, strikethrough, bare links, task lists, footnotes, emoji
+shortcodes, alerts (`> [!NOTE]`), mathematics as `$…$` and `$$…$$`, and mermaid diagrams — and every
+heading given GitHub's id, so `# The greeting` is `<h1 id="the-greeting">`. The whole file is one
+document, so a link reference defined anywhere in the prose reaches a link anywhere else, and a
+program block between them closes whatever paragraph, list or quote was open. Raw HTML passes
+through, under GitHub's tag filter.
 
 What comes out is one file that opens by itself. It carries its own styling, in a light and a dark
-palette; its code is coloured by the same grammar this site highlights with; and its mathematics is
-set by KaTeX, which the page links. That last is the one thing a woven document needs the network
-for — the prose and the code are markup in the file, so a document read offline loses its equations
-to TeX source and nothing else.
+palette; its code — every block whose language is sysl, so an illustration fenced as `sysl` too — is
+coloured by keyword, type, function, string, number, comment and punctuation, the keywords being the
+lexer's own reserved words; and its mathematics is set by KaTeX, which the page links. That last is
+the one thing a woven document needs the network for — the prose and the code are markup in the
+file, so a document read offline loses its equations to TeX source and nothing else.
+
+```text
+$ cat greeting.lsysl
+# The greeting
+
+A program of one statement.
+
+    print("hi")
+$ sysl weave greeting.lsysl
+<!doctype html>
+…
+<h1 id="the-greeting">The greeting</h1>
+<p>A program of one statement.</p>
+<pre><code class="language-sysl"><span class="hl-function">print</span><span class="hl-punctuation">(</span><span class="hl-string">&quot;hi&quot;</span><span class="hl-punctuation">)</span>
+</code></pre>
+…
+```
 
 The output goes to standard output, or to what `-o` names. **A path holding several literate sources
 writes one document each**, and `-o` then names a directory: a woven document is something somebody
