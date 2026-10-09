@@ -142,7 +142,6 @@ private under_home(leaf: string) -> Option[string] = home_dir().map((h) -> join(
  * **Removing it is the caller's**, and `remove_dir_all` is the call: nothing here runs at the end of
  * a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
  */
-#if posix
 make_temp_dir(prefix: string) -> Result[string, IoError]
     var into: []u8 = [0; path_bytes]
     var n: usize = 0
@@ -154,7 +153,6 @@ make_temp_dir(prefix: string) -> Result[string, IoError]
         Ok(s) -> Ok(s)
         Err(e) -> Err(InvalidUtf8(e.offset))
 end make_temp_dir
-#endif
 
 /** Every directory on the path made, from the topmost one that is missing down.
  *
@@ -184,17 +182,12 @@ make_dir_all(path: string) -> Result[unit, IoError]
         Err(e) -> Err(e)
 end make_dir_all
 
-// **`remove_dir_all` is posix-only and `make_dir_all` above it is not**, which looks arbitrary and
-// is the one call each needs that the other does not. `make_dir_all` climbs with `sysl.path.parent`
-// and asks `exists` and `make_dir`, all of which every target has. `remove_dir_all` has to know
-// whether an entry is a symbolic link *without following it*, and the only reading in the library
-// that answers that is `link_metadata` -- which `meta.sysl` gates on `posix`, because a Windows
-// reading of a filesystem entry is a different struct rather than the same one with fields missing.
-//
-// Following the link instead is not an option worth taking to keep the function portable: the whole
-// point of the test is that a link pointing out of the tree is unlinked rather than walked into, so
-// a version without it deletes things nobody asked it to.
-#if posix
+// **`remove_dir_all` has to know whether an entry is a symbolic link *without following it***, and
+// the only reading in the library that answers that is `link_metadata`, one `stat` hook of
+// `sysl.fs.sys`. Following the link instead is not an option: the whole point of the test is that a
+// link pointing out of the tree is unlinked rather than walked into, so a version without it deletes
+// things nobody asked it to. A target whose `stat` hook answers `-1` therefore gets "not supported on
+// this target" from it, never a removal that guessed.
 
 /** A directory and everything under it removed.
  *
@@ -211,7 +204,13 @@ end make_dir_all
  * to know how far the failure got.
  */
 remove_dir_all(path: string) -> Result[unit, IoError]
-    if !exists(path) && !is_link(path) then return Ok(())
+    // A target that cannot read an entry without following it cannot say whether anything is there,
+    // and that is reported rather than taken for "nothing to remove".
+    val linked = link_metadata(path) match
+        Ok(m) -> m.is_link()
+        Err(e) -> if e == unsupported() then return Err(e) else false
+
+    if !exists(path) && !linked then return Ok(())
 
     for item in walk(path).bottom_up()
         val e = item?
@@ -270,5 +269,3 @@ copy_dir_all(from: string, to: string) -> Result[unit, IoError]
 
     Ok(())
 end copy_dir_all
-
-#endif
