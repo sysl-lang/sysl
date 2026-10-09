@@ -533,7 +533,9 @@ console_flush(fd: int) -> int = 0
 ```
 
 Each answers what it did — a count of bytes, or zero — or the code of what went wrong, negated, so a
-kernel call that already answers a negative error number is the hook as it stands. **A hook the program
+kernel call that already answers a negative error number is the hook as it stands; `-1` means the
+target cannot make the call at all. That is the contract of every hook module (`sysl.fs.sys` and
+`sysl.process.sys` answer the same way). **A hook the program
 reaches and leaves unanswered is refused when it is compiled**, naming every such hook and only those
 it reaches, rather than surfacing at the link as a symbol nobody wrote. Everything above the hooks is
 unchanged: every renderer, every `Display`, the whole of `lines`, and every `impl Reader` a program

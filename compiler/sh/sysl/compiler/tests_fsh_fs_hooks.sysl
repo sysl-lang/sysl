@@ -254,7 +254,7 @@ fsh_unanswered_hooks_are_refused()
     assert(said.1.contains(s"this program reaches 'sysl.fs', and '$fsh_target' has no C library " +
         "under it for the standard library to answer a filesystem with, so the program answers it: " +
         "define 'sysl_fs_close', 'sysl_fs_read' with '@export', each taking what its 'extern' in " +
-        "'sysl.fs.sys' declares and answering zero or the code of an 'IoError'"), said.1)
+        "'sysl.fs.sys' declares and answering zero or the code of an 'IoError' negated"), said.1)
 
     // It is told before the link, so no linker names a symbol.
     assert(!said.1.contains("undefined symbol"), said.1)
@@ -741,6 +741,46 @@ fsh_copy_dir_all_chmod_real_error_fails()
         remove_dir_all(d).unwrap()
         """)
 
-    assert_eq(lbr_run(p, []), "copy failed: -13\n")
+    assert_eq(lbr_run(p, []), "copy failed: 13\n")
     lbr_drop([p])
 end fsh_copy_dir_all_chmod_real_error_fails
+
+@test("one hook from each of fs, process and io answering -13 surfaces as the same permission-denied error")
+fsh_one_negated_contract_across_hook_modules()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.{remove_file, PermissionDenied}
+        import sysl.io.{stdin, Reader}
+        import sysl.process.run
+        import sysl.process.sys.Text
+
+        @export("sysl_fs_unlink")
+        deny_unlink(path: *u8, len: usize) -> int = -13
+
+        @export("sysl_proc_spawn")
+        deny_spawn(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, envc: usize,
+                   inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int,
+                   stderr_fd: int, started: *i64) -> i64 = -13
+
+        @export("sysl_io_read")
+        deny_read(fd: int, into: *u8, room: usize) -> isize = -13
+
+        remove_file("x") match
+            Ok(_) -> print("fs answered")
+            Err(e) -> print(s"fs: ${e.code()} ${e == PermissionDenied}")
+
+        run("x") match
+            Ok(_) -> print("process answered")
+            Err(e) -> print(s"process: ${e.code()} ${e == PermissionDenied}")
+
+        var input = stdin()
+        var room: [4]u8 = [0; 4]
+
+        input.read(room[..])
+        print(s"io failed: ${input.failed()}")
+        """)
+
+    assert_eq(lbr_run(p, []), "fs: 13 true\nprocess: 13 true\nio failed: true\n")
+    lbr_drop([p])
+end fsh_one_negated_contract_across_hook_modules

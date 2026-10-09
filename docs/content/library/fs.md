@@ -921,8 +921,10 @@ way to get atomicity from a filesystem.
 `extern` per call — `sysl_fs_open`, `_read`, `_write`, `_close`, `_seek`, `_fstat`, `_ftruncate`,
 `_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
-`_realpath`. Each answers an `int`: zero, or the `code()` of the `IoError` it failed with, `-1`
-meaning the target cannot make that call at all. A path crosses as a pointer and a length, with no
+`_realpath`. Each answers an `int` by the contract every `*.sys` module has
+(`sysl.io.sys` and `sysl.process.sys` too): zero or more is success, a negative answer is the `code()`
+of the `IoError` it failed with, **negated** as a system call answers it, and `-1` means the target
+cannot make that call at all. A path crosses as a pointer and a length, with no
 terminator; what a call produces besides its status it writes through a pointer it was handed.
 
 On a hosted target the library answers them itself, over the C library, under `weak` exports
@@ -941,7 +943,7 @@ one sentence, rather than surfacing at the link as a symbol no line of the progr
 error: this program reaches 'sysl.fs', and 'aarch64-freestanding' has no C library under it for the
 standard library to answer a filesystem with, so the program answers it: define 'sysl_fs_close',
 'sysl_fs_open', 'sysl_fs_read', 'sysl_fs_write' with '@export', each taking what its 'extern' in
-'sysl.fs.sys' declares and answering zero or the code of an 'IoError'
+'sysl.fs.sys' declares and answering zero or the code of an 'IoError' negated
 ```
 
 The question is asked only of what the program reaches, so a freestanding program that never touches
