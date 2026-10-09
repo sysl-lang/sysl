@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.from_int
+import sysl.text.Search
 
 // **The C-callable entry an `@export` publishes.**
 //
@@ -82,10 +83,19 @@ gen_export_thunk(e: *Emit, f: TFunc, symbol: string) -> Option[IrFunc]
 
     if has_gap(e) then return None
 
-    Some(finish_func(e, bound_sig(ir_sig(f.exported.unwrap(),
-                                         IrFnType(c_type.ret, declared, false, c_type.ret_attrs)),
-                                  binds_locally(e))))
+    val sig = ir_sig(f.exported.unwrap(), IrFnType(c_type.ret, declared, false, c_type.ret_attrs))
+
+    Some(finish_func(e, bound_sig(sig with { linkage = export_linkage(f) }, binds_locally(e))))
 end gen_export_thunk
+
+// **The standard library's exports are `weak`.** The library exports only to answer a seam it
+// declares -- `sysl_wall_us`, the hooks of `sysl.fs.sys` -- and its answer is the fallback, never a
+// rival (`seam_supply.sysl`): where a program answers the same seam, the program's definition is the
+// one the link keeps. Strong, the library's copy in a prebuilt standard module is a second definition
+// of the symbol, and a freestanding program answering its own filesystem could not link at all.
+private export_linkage(f: TFunc) -> IrLinkage = f.src match
+    Some(s) -> if s.name.starts_with(s"$StdPrefix/") then LinkWeak else LinkDefault
+    None -> LinkDefault
 
 // The LLVM name of each incoming parameter, grouped by the sysl parameter it belongs to -- one name
 // for most, several where the convention hands an aggregate over in more than one register.

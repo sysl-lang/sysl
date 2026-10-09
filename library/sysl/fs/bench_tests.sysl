@@ -1,0 +1,232 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get
+import sysl.io.{Reader, lines}
+import sysl.text.from_utf8
+import sysl.time.monotonic
+
+// **A `File`'s buffer is written in sysl, and it has to be as fast as C's was.** Each check here runs
+// one workload twice -- through `sysl.fs`, and through C's buffered `FILE *` the way `sysl.fs` used to
+// -- and compares the best of several rounds of each. The C half is the yardstick because it is what
+// the module was before, measured on the same machine in the same run, so the comparison needs no
+// figure written down from somewhere else.
+//
+// **The bound is loose by default and tight on request.** A suite runs alongside other work, and one
+// round stolen by another process is enough to move a ratio on a shared machine, so an ordinary run
+// asks only that nothing has become several times slower -- which is what a buffering mistake costs,
+// a call per byte being hundreds of times slower rather than ten per cent. `SYSL_FS_BENCH=1` holds
+// each workload to within ten per cent of C's, and is meant for a run of these four alone
+// (`--filter "as fast as"`): beside the rest of the suite, the other tests' processes steal rounds.
+
+private extern "fopen" bench_fopen(path: *u8, mode: *u8) -> *u8
+private extern "fread" bench_fread(p: *u8, size: usize, n: usize, f: *u8) -> usize
+private extern "fwrite" bench_fwrite(p: *u8, size: usize, n: usize, f: *u8) -> usize
+private extern "fclose" bench_fclose(f: *u8) -> int
+
+private val bench_file: string = "/tmp/sysl-fs-bench"
+
+private const bench_rounds: usize = 7
+
+// The text every workload writes and reads: 4 MiB of short lines.
+private bench_line() -> string = "the quick brown fox jumps over the lazy dog, again: 0123456789ab\n"
+
+private bench_text() -> string
+    var out: Buf[u8] = buf()
+    val line = bench_line()
+
+    while out.len() < 4194304
+        for b in line.bytes do out.push(b)
+
+    str_cast(out.view())
+end bench_text
+
+/** C's buffered stream as a `Reader`, which is how `File` was built before it was built here. */
+private struct Stdio
+    h: *u8
+
+impl Fallible for Stdio
+    override failed(*self) -> bool = false
+
+impl Reader for Stdio
+    read(*self, into: []u8) -> []const u8
+        if into.len == 0 then return into
+
+        into[0..<bench_fread(&into[0], 1, into.len, self.h)]
+
+private stdio_write_text(text: string)
+    val h = bench_fopen(c"/tmp/sysl-fs-bench", c"wb")
+
+    bench_fwrite(&text.bytes[0], 1, text.bytes.len, h)
+    bench_fclose(h)
+end stdio_write_text
+
+private stdio_small_writes()
+    val h = bench_fopen(c"/tmp/sysl-fs-bench", c"wb")
+    val line = bench_line()
+
+    for i in 0..<65536 do bench_fwrite(&line.bytes[0], 1, line.bytes.len, h)
+
+    bench_fclose(h)
+end stdio_small_writes
+
+// What `read_text` was: chunks from the stream, grown into a buffer, decoded at the end.
+private stdio_read_text() -> usize
+    var s = Stdio(bench_fopen(c"/tmp/sysl-fs-bench", c"rb"))
+    var out: Buf[u8] = buf()
+    var chunk: []u8 = [0; 8192]
+
+    loop
+        val got = s.read(chunk)
+
+        if got.len == 0 then break
+
+        for b in got do out.push(b)
+
+    bench_fclose(s.h)
+
+    from_utf8(out.view()) match
+        Ok(t) -> t.bytes.len
+        Err(_) -> 0
+end stdio_read_text
+
+private stdio_lines() -> usize
+    var s = Stdio(bench_fopen(c"/tmp/sysl-fs-bench", c"rb"))
+    var n: usize = 0
+
+    for l in lines(&s) do n += 1
+
+    bench_fclose(s.h)
+    n
+end stdio_lines
+
+private ours_small_writes()
+    var f = create(bench_file).unwrap()
+    val line = bench_line()
+
+    for i in 0..<65536 do f.write(line.bytes)
+
+    f.close().unwrap()
+end ours_small_writes
+
+private ours_lines() -> usize
+    var f = open(bench_file).unwrap()
+    var n: usize = 0
+
+    for l in lines(&f) do n += 1
+
+    f.close().unwrap()
+    n
+end ours_lines
+
+// The ratio a run is held to, in hundredths.
+private bench_bound() -> long = if get("SYSL_FS_BENCH").unwrap_or("") == "1" then 110 else 300
+
+private bench_holds(what: string, ours: long, theirs: long)
+    val bound = bench_bound()
+
+    print(f"$what: sysl.fs $ours%d us, C stdio $theirs%d us")
+    assert(ours * 100 <= theirs * bound,
+           f"$what took $ours%d us through sysl.fs and $theirs%d us through C's stdio")
+end bench_holds
+
+@test("writing a whole file of a few MB is as fast as C's stdio")
+bench_write_text()
+    val text = bench_text()
+
+    var ours: long = 1000000000
+    var theirs: long = 1000000000
+
+    for r in 0..<bench_rounds
+        val t0 = monotonic().us
+
+        for i in 0..<4 do write_text(bench_file, text).unwrap()
+
+        val t1 = monotonic().us
+
+        for i in 0..<4 do stdio_write_text(text)
+
+        val t2 = monotonic().us
+
+        if t1 - t0 < ours then ours = t1 - t0
+        if t2 - t1 < theirs then theirs = t2 - t1
+
+    bench_holds("write_text of 4 MiB, four times", ours, theirs)
+    remove_file(bench_file).unwrap()
+end bench_write_text
+
+@test("many small writes are as fast as C's stdio")
+bench_small_writes()
+    var ours: long = 1000000000
+    var theirs: long = 1000000000
+
+    for r in 0..<bench_rounds
+        val t0 = monotonic().us
+
+        ours_small_writes()
+
+        val t1 = monotonic().us
+
+        stdio_small_writes()
+
+        val t2 = monotonic().us
+
+        if t1 - t0 < ours then ours = t1 - t0
+        if t2 - t1 < theirs then theirs = t2 - t1
+
+    bench_holds("65536 writes of one line", ours, theirs)
+    remove_file(bench_file).unwrap()
+end bench_small_writes
+
+@test("reading a whole file of a few MB is as fast as C's stdio")
+bench_read_text()
+    write_text(bench_file, bench_text()).unwrap()
+
+    var ours: long = 1000000000
+    var theirs: long = 1000000000
+    var sizes: (usize, usize) = (0, 0)
+
+    for r in 0..<bench_rounds
+        val t0 = monotonic().us
+        val a = read_text(bench_file).unwrap().bytes.len
+        val t1 = monotonic().us
+        val b = stdio_read_text()
+        val t2 = monotonic().us
+
+        sizes = (a, b)
+
+        if t1 - t0 < ours then ours = t1 - t0
+        if t2 - t1 < theirs then theirs = t2 - t1
+
+    assert_eq(sizes.0, sizes.1)
+    bench_holds("read_text of 4 MiB", ours, theirs)
+    remove_file(bench_file).unwrap()
+end bench_read_text
+
+@test("reading a few MB a line at a time is as fast as C's stdio")
+bench_lines()
+    write_text(bench_file, bench_text()).unwrap()
+
+    var ours: long = 1000000000
+    var theirs: long = 1000000000
+    var counts: (usize, usize) = (0, 0)
+
+    for r in 0..<bench_rounds
+        val t0 = monotonic().us
+        val a = ours_lines()
+        val t1 = monotonic().us
+        val b = stdio_lines()
+        val t2 = monotonic().us
+
+        counts = (a, b)
+
+        if t1 - t0 < ours then ours = t1 - t0
+        if t2 - t1 < theirs then theirs = t2 - t1
+
+    assert_eq(counts.0, counts.1)
+    assert(counts.0 > 60000, "the lines were not all read")
+    bench_holds("lines over 4 MiB", ours, theirs)
+    remove_file(bench_file).unwrap()
+end bench_lines

@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.text.Search
 
 // **The seam between the analyzer and the lowering**: what a program has to be true of before any of
 // it is emitted, over and above what typing it asked.
@@ -342,6 +343,56 @@ check_image_storage(a: &Analysis, p: TProgram, own: Buf[string], entry: string)
                 "'match' that dispatches on the index; or make the initializer constant data, which " +
                 "is laid straight into the image")
 end check_image_storage
+
+// The module whose `extern`s are the calls `sysl.fs` makes of a filesystem, and which a program on a
+// target with no C library answers itself.
+private const filesystem_hooks: string = "sysl.fs.sys"
+
+// **A hook of `sysl.fs.sys` the program reaches, on a target the library answers none of them for.**
+//
+// On a hosted target `sysl.fs.hosted` supplies every hook over the C library. A freestanding target
+// has no C library, so that module is never taken there and the program answers the hooks with an
+// `@export` per symbol -- and one it reached and left unanswered would otherwise surface at the link
+// as an undefined symbol named nowhere in the program's source. So the hooks still unanswered after
+// pruning are refused here, all of them in one sentence. The walk is the reachability one: a program
+// that never reaches `sysl.fs` reaches none of its hooks and is not asked about any.
+check_filesystem_hooks(a: &Analysis, p: TProgram)
+    val t = a.tables.target
+
+    if os_hosted(t.os) then return
+
+    var missing: Buf[string] = buf()
+
+    for x in p.externs
+        if module_of(x.name) != filesystem_hooks || exported_here(p, x.symbol) then continue
+        if !holds_string(missing, s"'${x.symbol}'") then missing.push(s"'${x.symbol}'")
+
+    if missing.is_empty() || p.funcs.is_empty() then return
+
+    // The report has no position, the complaint being about the program as a whole; a function of
+    // `sysl.fs` the program reached only orders it among the others.
+    var at = p.funcs.at(0)
+
+    for f in p.funcs
+        if module_of(f.name).starts_with("sysl.fs")
+            at = f
+            break
+        end if
+
+    a.fault_unplaced(func_home(a, at.name), at.span,
+            s"this program reaches 'sysl.fs', and '${t.name}' has no C library under it for the " +
+            "standard library to answer a filesystem with, so the program answers it: define " +
+            s"${joined_list(sorted_names(missing))} with '@export', each taking what its 'extern' " +
+            "in 'sysl.fs.sys' declares and answering zero or the code of an 'IoError'")
+end check_filesystem_hooks
+
+// Whether a function of the program defines `symbol` with an `@export`.
+private exported_here(p: TProgram, symbol: string) -> bool
+    for f in p.funcs
+        if f.exported == Some(symbol) then return true
+
+    false
+end exported_here
 
 // The functions code outside the program's own calls can start, on an image entered at `entry`.
 private image_ways_in(p: TProgram, own: Buf[string], entry: string) -> Buf[TFunc]

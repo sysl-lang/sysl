@@ -2,79 +2,31 @@ module sysl.fs
 @requires(os)
 
 import sysl.buf.{Buf, buf}
-import sysl.text.{cstring, from_utf8}
+import sysl.fs.sys as fsys
+import sysl.slices.as_ptr
+import sysl.text.from_utf8
 
 // What a program can ask and change about a path without opening what is at the end of it.
 //
-// **Everything here is reached by symbol alone -- no header is included and no C structure is
-// transcribed** -- which is the constraint the whole module is written under and the reason the
-// surface stops where it does. `stat` would answer more of these questions in one call, and its
-// answer arrives in a `struct stat` that each platform's headers lay out differently; a program
-// holding a transcription of one is holding numbers nothing checks, and being wrong about them
-// reads the wrong bytes rather than failing. So a question that can be answered by a call whose
-// signature is all there is to get right is answered here, and one that cannot is absent. `size_of`
-// opens and seeks for exactly this reason.
-//
-// **Listing a directory was the one thing genuinely missing, and it is answered now** -- `readdir`
-// hands back a `struct dirent` whose name field sits at an offset the platforms disagree about,
-// which is exactly the transcription refused above. What answers it is a shim: a `.c` beside this
-// file returns the `char *` and nothing here learns the layout. It sits under a per-OS directory so
-// that it is absent on a target with no directories to list, which is what lets this module go on
-// being compiled for every target.
-//
-// That is the shape to reach for wherever this module still stops. A question C can answer in three
-// lines is answered by C; one that would need a structure transcribed into sysl is still not
-// answered at all.
-
-private[sysl] extern "access" c_access(path: *u8, mode: int) -> int
-private[sysl] extern "unlink" c_unlink(path: *u8) -> int
-private[sysl] extern "rmdir" c_rmdir(path: *u8) -> int
-private[sysl] extern "rename" c_rename(from: *u8, to: *u8) -> int
-// A directory stream, which is C's `DIR` and has no layout anybody here knows -- the storage is
-// libc's and its shape differs by platform. `opaque struct` is how that is said (`reference/ffi.md
-// § opaque`): it gives `*Dir` a type of its own, so the handle cannot be crossed with the `*u8`
-// paths declared beside it, and it withholds a layout there was never one to publish.
-private[sysl] opaque struct Dir
-
-private[sysl] extern "opendir" c_opendir(path: *u8) -> *Dir
-private[sysl] extern "closedir" c_closedir(d: *Dir) -> int
-
-// The next name in a directory stream, or null at the end of it. This is the module's own shim
-// rather than libc's `readdir`, and the difference is the whole of why listing a directory is
-// possible here at all: `readdir` answers with a `struct dirent`, and the shim answers with the one
-// field a caller wants.
-private[sysl] extern "sysl_fs_dir_next" c_dir_next(d: *Dir) -> *u8
-
-// `mode_t` is the one argument in this file whose width the two libcs disagree about, and the
-// declaration says so rather than passing the wider one and leaving the callee to ignore the top
-// half. The gate is on whole declarations, which is what conditional compilation is comfortable
-// with -- a call site cannot be half-written twice.
-//
-// **Sixteen bits is every BSD's answer rather than Darwin's**, which is why this gates on `bsd`:
-// getting it wrong is silent, since a width the callee ignores the top half of appears to work.
-#if bsd
-private[sysl] extern "mkdir" c_mkdir(path: *u8, mode: u16) -> int
-
-private made_dir(p: *u8) -> int = c_mkdir(p, u16(dir_mode()))
-#else
-private[sysl] extern "mkdir" c_mkdir(path: *u8, mode: u32) -> int
-
-private made_dir(p: *u8) -> int = c_mkdir(p, u32(dir_mode()))
-#endif
-
-/** What `access` is being asked. POSIX fixes all four numbers, and they are named here so that no
- * call below reads as a bare integer.
- */
-private f_ok() -> int = 0
-private r_ok() -> int = 4
-private w_ok() -> int = 2
+// Every question here is one call of `sysl.fs.sys`, which takes the path as the bytes it is -- no
+// terminator is put after it on this side -- and answers a status this file turns into a `Result`.
+// Whatever lies under those calls, a C library or a kernel, this file learns nothing about it: no
+// structure is transcribed and no platform constant is named.
 
 /** The permissions a new directory asks for -- 0o777, which the process umask narrows to whatever
  * the environment has decided new directories should be. Asking for less here would override that
  * decision rather than defer to it, which is the wrong way round: a program that wants a private
  * directory says so, and one that does not should get the machine's answer.
  */
-private dir_mode() -> int = 511
+private const dir_mode: u32 = 0o777
+
+/** How many bytes one listed name is given. A name is a single path component, which no filesystem
+ * here lets run past 255 bytes; a longer one is refused by the call rather than cut short.
+ */
+private const name_room: usize = 1024
+
+/** A path as the two halves `sysl.fs.sys` takes it in. */
+private[sysl] bytes_at(path: string) -> *u8 = as_ptr(path.bytes)
 
 /** Whether there is anything at all at this path.
  *
@@ -83,22 +35,21 @@ private dir_mode() -> int = 511
  * be told from absence without a second call whose answer would already be stale, and every caller
  * that matters -- one about to open the file -- gets the truth from the open.
  */
-exists(path: string) -> bool = c_access(cstring(path).ptr, f_ok()) == 0
+exists(path: string) -> bool = fsys.access(bytes_at(path), path.bytes.len, fsys.access_exists) == 0
 
-readable(path: string) -> bool = c_access(cstring(path).ptr, r_ok()) == 0
+readable(path: string) -> bool = fsys.access(bytes_at(path), path.bytes.len, fsys.access_read) == 0
 
-writable(path: string) -> bool = c_access(cstring(path).ptr, w_ok()) == 0
+writable(path: string) -> bool = fsys.access(bytes_at(path), path.bytes.len, fsys.access_write) == 0
 
-/** Whether the path names a directory, asked by opening it as one. `DIR *` is opaque, so this needs
- * nothing about the platform beyond the two symbols -- which is what makes it the one question about
- * a path's *kind* the module can answer honestly.
+/** Whether the path names a directory, asked by opening it as one -- which follows a symbolic link,
+ * as every other question here does.
  */
 is_dir(path: string) -> bool
-    var d = c_opendir(cstring(path).ptr)
+    var d: usize = 0
 
-    if d == null then return false
+    if fsys.opendir(bytes_at(path), path.bytes.len, &d) != 0 then return false
 
-    c_closedir(d)
+    fsys.closedir(d)
     true
 end is_dir
 
@@ -137,35 +88,37 @@ end entries
  * decode should become. The bytes are a copy, so they outlive the listing.
  */
 entry_bytes(path: string) -> Result[Buf[[]u8], IoError]
-    var d = c_opendir(cstring(path).ptr)
+    var d: usize = 0
+    val opened = fsys.opendir(bytes_at(path), path.bytes.len, &d)
 
-    if d == null then return Err(why())
+    if opened != 0 then return Err(from_errno(opened))
 
-    defer c_closedir(d)
+    defer fsys.closedir(d)
 
     var names: Buf[[]u8] = buf()
-    var next = c_dir_next(d)
+    var into: [name_room]u8
 
-    while next != null
+    loop
         var n: usize = 0
+        val code = fsys.readdir(d, &into[0], name_room, &n)
 
-        while next[n] != 0
-            n += 1
+        if code != 0 then return Err(from_errno(code))
+        if n == 0 then break
 
-        if !dots(next, n)
+        if !dots(into[0..<n])
             var name: []u8 = [0; n]
 
-            for i in 0..<n do name[i] = next[i]
+            for i in 0..<n do name[i] = into[i]
 
             names.push(name)
-
-        next = c_dir_next(d)
+        end if
 
     Ok(names)
 end entry_bytes
 
 /** Whether a name is `.` or `..`, asked of the bytes before anything is copied. */
-private dots(p: *u8, n: usize) -> bool = p[0] == u8('.') && (n == 1 || (n == 2 && p[1] == u8('.')))
+private dots(name: []const u8) -> bool =
+    name[0] == u8('.') && (name.len == 1 || (name.len == 2 && name[1] == u8('.')))
 
 /** One listed name as text, or `InvalidUtf8` at the offset within it where it stops being UTF-8. */
 private[sysl] name_text(name: []const u8) -> Result[string, IoError]
@@ -195,37 +148,25 @@ end size_of
  * separators, and where a separator *is* is a question about paths rather than about the
  * filesystem, which this module does not answer.
  */
-make_dir(path: string) -> Result[unit, IoError] = done(made_dir(cstring(path).ptr))
+make_dir(path: string) -> Result[unit, IoError] = answered(fsys.mkdir(bytes_at(path), path.bytes.len, dir_mode))
 
 /** Removes a file, and refuses a directory rather than removing it: `unlink` is the call that draws
  * that line, where C's own `remove` quietly does either. Two names for two intentions is what lets
  * a program that meant one of them find out it had the other.
  */
-remove_file(path: string) -> Result[unit, IoError] = done(c_unlink(cstring(path).ptr))
+remove_file(path: string) -> Result[unit, IoError] = answered(fsys.unlink(bytes_at(path), path.bytes.len))
 
 /** Removes a directory, which has to be empty. A directory with anything in it reports
  * `DirectoryNotEmpty` -- the one error code in the set whose number the two platforms disagree
  * about, which is why `error.sysl` reads it through a call rather than a literal.
  */
-remove_dir(path: string) -> Result[unit, IoError] = done(c_rmdir(cstring(path).ptr))
+remove_dir(path: string) -> Result[unit, IoError] = answered(fsys.rmdir(bytes_at(path), path.bytes.len))
 
 /** Moves a path to another name, replacing whatever was at the destination.
  *
  * It is one operation as far as anything watching is concerned when both paths are on the same
  * filesystem, and it fails rather than copying when they are not -- which is `rename(2)`'s contract
  * and worth knowing, since a program moving a file across devices has to read and write it itself.
- *
- * The two copies are named rather than written into the call, because a `cstring` temporary lives
- * for the statement it appears in and this statement needs both of them alive at once.
  */
-rename(from: string, to: string) -> Result[unit, IoError]
-    var a = cstring(from)
-    var b = cstring(to)
-
-    done(c_rename(a.ptr, b.ptr))
-
-/** A C call that reports success as zero, as the `Result` the rest of the module speaks in. It reads
- * `errno` here rather than taking a code, so the read happens at the failure -- there is nothing
- * between the two that could overwrite it.
- */
-private done(rc: int) -> Result[unit, IoError] = if rc != 0 then Err(why()) else Ok(())
+rename(from: string, to: string) -> Result[unit, IoError] =
+    answered(fsys.rename(bytes_at(from), from.bytes.len, bytes_at(to), to.bytes.len))

@@ -1,0 +1,219 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.io.{Reader, lines}
+
+// What a `File`'s own buffer promises: that holding bytes back, and reading ahead, is never visible.
+// A position, a size, a read after a write and a write after a read all answer as though every byte
+// went to the file the moment it was written and came from it the moment it was read.
+
+private buf_path(name: string) -> string = "/tmp/sysl-fs-buffer-" + name
+
+private buf_ignore(r: Result[unit, IoError]) = ()
+
+// A file of `n` bytes, each the low byte of its own offset, so any byte read from the wrong place
+// shows as the wrong number.
+private counted(n: usize) -> []u8
+    var out: []u8 = [0; n]
+
+    for i in 0..<n do out[i] = u8(i & 255)
+
+    out
+end counted
+
+@test("many small writes arrive whole and in order")
+small_writes_arrive_in_order()
+    val path = buf_path("small")
+    var f = create(path).unwrap()
+
+    for i in 0..<5000
+        f.write(f"$i%d,".bytes)
+
+    f.close().unwrap()
+
+    var want = ""
+
+    for i in 0..<5000
+        want = want + f"$i%d,"
+
+    assert_eq(read_text(path).unwrap(), want)
+    buf_ignore(remove_file(path))
+end small_writes_arrive_in_order
+
+@test("tell and size count what is still held back, and reads count what was read ahead")
+tell_and_size_see_through_the_buffer()
+    val path = buf_path("tell")
+    var f = create_update(path).unwrap()
+
+    defer f.close()
+
+    f.write("hello".bytes)
+
+    assert_eq(f.tell().unwrap(), 5)
+    assert_eq(f.size().unwrap(), 5)
+
+    f.seek(1).unwrap()
+
+    var two: [2]u8 = [0, 0]
+
+    assert_eq(f.read(two[..]).len, 2)
+    assert_eq(two[0], u8('e'))
+    assert_eq(f.tell().unwrap(), 3)
+
+    buf_ignore(remove_file(path))
+end tell_and_size_see_through_the_buffer
+
+@test("a write after a read lands where the read stopped, not where the read ahead did")
+write_after_read_lands_in_place()
+    val path = buf_path("rw")
+
+    write_bytes(path, counted(20000)).unwrap()
+
+    var f = open_update(path).unwrap()
+    var three: [3]u8 = [0, 0, 0]
+
+    assert_eq(f.read(three[..]).len, 3)
+
+    f.write("XY".bytes)
+    f.close().unwrap()
+
+    val back = read_bytes(path).unwrap()
+
+    assert_eq(back.len, 20000)
+    assert_eq(back[2], 2)
+    assert_eq(back[3], u8('X'))
+    assert_eq(back[4], u8('Y'))
+    assert_eq(back[5], 5)
+    assert_eq(back[19999], u8(19999 & 255))
+
+    buf_ignore(remove_file(path))
+end write_after_read_lands_in_place
+
+@test("a read after a write sees the bytes the write held back")
+read_after_write_sees_them()
+    val path = buf_path("wr")
+    var f = create_update(path).unwrap()
+
+    defer f.close()
+
+    f.write("abcdef".bytes)
+    f.seek(2).unwrap()
+
+    var four: [4]u8 = [0, 0, 0, 0]
+
+    assert_eq(f.read(four[..]).len, 4)
+    assert_eq(four[0], u8('c'))
+    assert_eq(four[3], u8('f'))
+    assert(!f.at_end())
+
+    assert_eq(f.read(four[..]).len, 0)
+    assert(f.at_end())
+
+    buf_ignore(remove_file(path))
+end read_after_write_sees_them
+
+@test("reads smaller and larger than the buffer, interleaved, hand back the file in order")
+mixed_read_sizes_stay_in_order()
+    val path = buf_path("mixed")
+    val n: usize = 70000
+
+    write_bytes(path, counted(n)).unwrap()
+
+    var f = open(path).unwrap()
+
+    defer f.close()
+
+    var small: [7]u8 = [0; 7]
+    var large: []u8 = [0; 20000]
+    var seen: usize = 0
+    var turn = 0
+
+    loop
+        val got = if turn % 2 == 0 then f.read(small[..]) else f.read(large)
+
+        if got.len == 0 then break
+
+        for i in 0..<got.len do assert_eq(got[i], u8((seen + i) & 255))
+
+        seen += got.len
+        turn += 1
+
+    assert_eq(seen, n)
+    assert(!f.failed())
+
+    buf_ignore(remove_file(path))
+end mixed_read_sizes_stay_in_order
+
+@test("a path is its bytes and its length: a path cut out of a longer string names the shorter file")
+a_path_is_its_length_not_a_terminator()
+    val long = "/tmp/sysl-fs-buffer-cutEXTRA"
+    val path = long[0..<23]
+
+    buf_ignore(remove_file(path))
+    buf_ignore(remove_file(long))
+
+    write_text(path, "cut").unwrap()
+
+    assert(exists("/tmp/sysl-fs-buffer-cut"))
+    assert(!exists(long))
+    assert_eq(read_text("/tmp/sysl-fs-buffer-cut").unwrap(), "cut")
+
+    buf_ignore(remove_file(path))
+end a_path_is_its_length_not_a_terminator
+
+@test("a path longer than any filesystem here allows is refused as too long, not truncated")
+an_overlong_path_is_refused()
+    var p = "/tmp/"
+
+    while p.len < 5000
+        p = p + "x"
+
+    write_text(p, "x") match
+        Ok(_) -> assert(false, "an overlong path was written")
+        Err(e) -> assert(e != NotFound, "an overlong path read as a missing one")
+end an_overlong_path_is_refused
+
+@test("lines over a file buffered here read every line")
+lines_over_a_buffered_file()
+    val path = buf_path("lines")
+    var f = create(path).unwrap()
+
+    for i in 0..<3000
+        f.write(f"line $i%d\n".bytes)
+
+    f.close().unwrap()
+
+    var g = open(path).unwrap()
+
+    defer g.close()
+
+    var count = 0
+
+    for l in lines(&g)
+        assert_eq(l, f"line $count%d")
+        count += 1
+
+    assert_eq(count, 3000)
+
+    buf_ignore(remove_file(path))
+end lines_over_a_buffered_file
+
+@test("a file closed twice, and written after closing, says NotOpen rather than writing anywhere")
+written_after_close_is_not_open()
+    val path = buf_path("closed")
+    var f = create(path).unwrap()
+
+    f.write("a".bytes)
+    f.close().unwrap()
+    f.close().unwrap()
+
+    f.write("b".bytes)
+
+    assert(f.failed())
+    assert_eq(f.failure(), NotOpen)
+    assert_eq(read_text(path).unwrap(), "a")
+
+    buf_ignore(remove_file(path))
+end written_after_close_is_not_open

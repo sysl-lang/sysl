@@ -2,74 +2,67 @@ module sysl.fs
 @requires(os)
 
 import sysl.io.Reader
-import sysl.text.cstring
+import sysl.fs.sys as fsys
+import sysl.slices.{as_ptr, copy}
 
 // An open file, and the two directions it can be read and written in.
 //
-// **It is bound to C's buffered `FILE *` rather than to a file descriptor**, and that is the load-
-// bearing choice in this file. A descriptor would mean `open(2)`, and `open(2)` means `O_CREAT`,
-// `O_TRUNC` and `O_APPEND` -- three constants whose values differ between the two platforms this
-// builds for and which nothing in the program could check. `fopen` takes a *mode string*, which C
-// standardises, so the same three intentions cross the boundary as text that is right everywhere.
-// The buffering comes with it, which is the second reason: a `Writer` that reached the operating
-// system once per `write` would make rendering into a file cost a system call per fragment, and
-// the rendering surface writes in fragments (`library/core.md § Rendering to a sink`).
+// **It is a file descriptor from `sysl.fs.sys` with a buffer in front of it, and the buffer is
+// written here.** A `Writer` that reached the operating system once per `write` would make rendering
+// into a file cost a call per fragment, and the rendering surface writes in fragments (`library/core.md
+// § Rendering to a sink`) -- so small writes collect until there are enough of them to be worth a
+// call, and small reads are served out of one larger one. A read or a write at least as large as the
+// buffer goes straight through, there being nothing a copy into the buffer would save.
 //
-// What is given up is the descriptor itself. A program that needs one -- to poll it, to pass it to a
+// It used to be C's buffered `FILE *`, which is the same arrangement written in a C library. Writing it
+// here is what lets a target that has system calls and no C library at all -- which answers
+// `sysl.fs.sys` and nothing more -- have a `File` that behaves exactly as a host's does.
+//
+// The descriptor itself is not handed out. A program that needs one -- to poll it, to pass it to a
 // child -- is not served here and should say `open(2)` for itself, which is what `sysl.io`'s
 // `FdReader` is already shaped for. The two live side by side on purpose: `Reader` is about bytes
 // arriving, not about where a program got its handle.
 
-private[sysl] extern "fopen" c_fopen(path: *u8, mode: *u8) -> *u8
-private[sysl] extern "fclose" c_fclose(f: *u8) -> int
-private[sysl] extern "fread" c_fread(p: *u8, size: usize, n: usize, f: *u8) -> usize
-private[sysl] extern "fwrite" c_fwrite(p: *u8, size: usize, n: usize, f: *u8) -> usize
-private[sysl] extern "fflush" c_fflush(f: *u8) -> int
-// **`isize` and not `long`, and the difference is the machine rather than the spelling.** C's `long`
-// is a *pointer-width* type on every target sysl builds for -- 64 bits on the LP64 desktops, 32 on
-// wasm32 and on the 32-bit boards -- while sysl's `long` is 64 bits everywhere by definition. Naming
-// sysl's here made the declaration disagree with the libc on every 32-bit target, which most linkers
-// accept silently; `wasm-ld` checks signatures and said so. The surface below still speaks `long`,
-// which is what a caller wants to hold an offset in, and the conversion happens at the call.
-private[sysl] extern "fseek" c_fseek(f: *u8, off: isize, whence: int) -> int
-private[sysl] extern "ftell" c_ftell(f: *u8) -> isize
-private[sysl] extern "ferror" c_ferror(f: *u8) -> int
-private[sysl] extern "feof" c_feof(f: *u8) -> int
-
-// The module's own shim, beside this file under a per-OS directory. It takes the `FILE *` the rest
-// of these do and answers `st_size`, so `struct stat` never crosses.
-//
-// Declared on every target and defined only where a directory supplies it. An `extern` costs nothing
-// until something links it, which is the same reason `error.sysl` declares an `errno` accessor it
-// cannot define everywhere — and the `#if` at `size` is what keeps anything from linking this where
-// no shim was compiled.
-private[sysl] extern "sysl_fs_file_size" c_file_size(f: *u8) -> long
-
-// The other shim beside it, and the reason it is one rather than an `ftruncate` binding: a `File` is
-// C's *buffered* handle, so bytes a program has written may still be in the buffer, and cutting
-// underneath them would put them back afterwards past the length that was asked for. The shim
-// flushes first, which is a fact about `FILE *` and belongs where the header is.
-private[sysl] extern "sysl_fs_file_truncate" c_file_truncate(f: *u8, length: long) -> int
-
-/** Where a seek counts from. C standardises the three names and every platform has agreed on the
- * three values since V7, but the *names* are what the calls below read, so a reader never has to
- * know which is which.
+/** How many bytes a file holds back before handing them over, and asks for at once when a caller
+ * asks for fewer.
  */
-private seek_set() -> int = 0
-private seek_end() -> int = 2
+private const buffer_bytes: usize = 8192
 
-/** The handle itself, and the two things that are true of it beyond the pointer.
+/** The permission bits a created file asks for -- `0o666`, which the process umask narrows to
+ * whatever the environment has decided new files should be, exactly as C's `fopen` asks.
+ */
+private const file_mode: u32 = 0o666
+
+/** `EIO`: what a descriptor that took nothing and reported nothing wrong is answered with, since a
+ * write that makes no progress would otherwise be retried for ever.
+ */
+private const stalled: int = 5
+
+/** The handle itself, and everything that is true of it beyond the descriptor.
  *
- * It is a struct of its own -- rather than the three fields sitting directly in `File` -- because of
- * what `File` has to survive being copied. A struct is a value here, so a `File` handed to a
- * function is a second `File`, and if it held the pointer directly then closing either would leave
- * the other holding a handle C has freed. Every copy sharing **one** `FileState` is what makes
- * `close` answerable at all: it is written once, and every copy sees it.
+ * It is a struct of its own -- rather than these fields sitting directly in `File` -- because of
+ * what `File` has to survive being copied. A struct is a value here, so a `File` handed to a function
+ * is a second `File`, and if it held the descriptor and the buffer directly then closing either would
+ * leave the other writing into a descriptor that was released, and the two would disagree about what
+ * was buffered. Every copy sharing **one** `FileState` is what makes `close` answerable at all: it is
+ * written once, and every copy sees it.
+ *
+ * The buffer holds one direction at a time. Reading, `held[at..<filled]` is what arrived and has not
+ * been handed out; writing, `held[0..<pending]` is what was written and has not been handed over.
+ * `fault` is the code of the last thing that went wrong, zero while nothing has, and `ended` says a
+ * read has run off the end since the position was last set.
  */
 struct FileState
-    handle: *u8
+    fd: int
     bad: bool
     shut: bool
+    fault: int
+    ended: bool
+    erred: bool
+    held: []u8
+    at: usize
+    filled: usize
+    pending: usize
 
 /** A file that is open, or that was.
  *
@@ -77,97 +70,101 @@ struct FileState
  * no destructor, so nothing runs at the end of a scope that the scope did not say. What the shared
  * state above buys is that saying it *twice* is harmless rather than a use-after-free, which is the
  * mistake a value type would otherwise make easy. Dropping a `File` without closing it leaks the
- * handle until the program exits, the same as in C.
+ * descriptor until the program exits, and loses whatever was still buffered.
  */
 struct File
     inner: &FileState
 
     closed(*self) -> bool = self.inner.shut
 
-    /** **Every member below asks this first, and none of them may be dropped.** `fclose` releases the
-     * handle, so the pointer this struct holds afterwards names storage C has freed, and reaching it
-     * is a use-after-free rather than a call that fails. The flag is what stands between a program
-     * that closed a file too early and undefined behaviour, and the answer it produces instead is
-     * `NotOpen` -- which is `EBADF`, the code the operating system reports for the same mistake made
-     * one layer down.
+    /** Hands over what is buffered.
+     *
+     * **Every member below asks whether the file is closed first, and none of them may be dropped.**
+     * `close` releases the descriptor, so the number this struct holds afterwards names nothing --
+     * or, once the operating system has handed it out again, somebody else's file. The flag is what
+     * stands between a program that closed a file too early and that, and the answer it produces
+     * instead is `NotOpen` -- which is `EBADF`, the code the operating system reports for the same
+     * mistake made one layer down.
      */
     flush(*self) -> Result[unit, IoError]
         if self.inner.shut then return Err(NotOpen)
 
-        if c_fflush(self.inner.handle) != 0 then Err(why()) else Ok(())
+        answered(drain(self.inner))
 
-    /** Releases the handle, flushing what is still buffered.
+    /** Releases the descriptor, handing over what is still buffered.
      *
      * **It is idempotent**, and the second call is not merely tolerated -- it is the case `defer`
      * creates. A function that closes on one path and defers the close for the others reaches the
      * end having done both, and the alternative would be for every such function to carry a flag
      * this can carry once.
      *
-     * A failure here is a real one: the flush it performs is where a full disk finally reports, so a
-     * program that cares about its output checks this and not only the writes.
+     * A failure here is a real one: handing over what was buffered is where a full disk finally
+     * reports, so a program that cares about its output checks this and not only the writes. The
+     * first failure is the one reported.
      */
     close(*self) -> Result[unit, IoError]
         if self.inner.shut then return Ok(())
 
-        // Set before the call, not after: a failed `fclose` has released the handle all the same,
-        // so a retry would be the use-after-free this flag exists to prevent.
+        val written = drain(self.inner)
+
+        // Set before the call, not after: a failed close has released the descriptor all the same,
+        // so a retry would be closing a number that may by then be somebody else's.
         self.inner.shut = true
 
-        if c_fclose(self.inner.handle) != 0 then Err(why()) else Ok(())
+        val released = fsys.close(self.inner.fd)
+
+        answered(if written != 0 then written else released)
     end close
 
     /** Where the next read or write will happen, in bytes from the start. */
     tell(*self) -> Result[long, IoError]
         if self.inner.shut then return Err(NotOpen)
 
-        var at = c_ftell(self.inner.handle)
+        var at: long = 0
+        val code = fsys.seek(self.inner.fd, 0, fsys.seek_current, &at)
 
-        if at < 0 then Err(why()) else Ok(long(at))
+        if code != 0 then return Err(from_errno(code))
+
+        // The descriptor is past what was read ahead and short of what is still buffered.
+        Ok(at + long(self.inner.pending) - long(self.inner.filled - self.inner.at))
     end tell
 
     /** Moves to an absolute offset, which also clears the end-of-file mark. */
     seek(*self, to: long) -> Result[unit, IoError]
         if self.inner.shut then return Err(NotOpen)
 
-        if c_fseek(self.inner.handle, isize(to), seek_set()) != 0 then Err(why()) else Ok(())
+        val written = drain(self.inner)
+
+        if written != 0 then return Err(from_errno(written))
+
+        self.inner.at = 0
+        self.inner.filled = 0
+        self.inner.ended = false
+
+        var at: long = 0
+
+        answered(fsys.seek(self.inner.fd, to, fsys.seek_start, &at))
+    end seek
 
     /** How many bytes the file holds.
      *
-     * **It asks, where it used to measure.** This was a seek to the end and back — four calls, and a
-     * position temporarily somewhere the caller did not put it — because the alternative was `fstat`
-     * and `struct stat` is laid out differently by every platform's headers, which is the
-     * transcription this module refuses. A shim reads the header and one field crosses, so the
-     * refusal costs nothing here any more.
-     *
-     * What that fixes beyond the call count: the old shape **moved the position and put it back**,
-     * so a failure between the two left it at the end of the file, and nothing else in the module
-     * could disturb a caller's position at all. It also asks about the **open file** rather than
-     * about a path, so nothing can be renamed or replaced underneath the answer.
-     * **The seek is kept for the systems with no shim**, which is `#if` doing what it is for: one
-     * choice between two implementations, on a target fact. `sysl.fs` requires `os` and not `posix`,
-     * so `x86_64-windows` reaches this module and has no `__windows__` directory to take a shim from
-     * — and `fseek`/`ftell` are ISO C, so the old path goes on working there exactly as it did.
+     * **It asks the open file, where it once measured** -- a seek to the end and back, four calls and
+     * a position temporarily somewhere the caller did not put it, so a failure between the two left
+     * it at the end of the file. Asking about the **open file** rather than about a path also means
+     * nothing can be renamed or replaced underneath the answer. What is still buffered is handed over
+     * first, so the answer counts every byte the program has written.
      */
     size(*self) -> Result[long, IoError]
         if self.inner.shut then return Err(NotOpen)
 
-#if posix
-        val n = c_file_size(self.inner.handle)
+        val written = drain(self.inner)
 
-        if n < 0 then Err(why()) else Ok(n)
-#else
-        var here = c_ftell(self.inner.handle)
+        if written != 0 then return Err(from_errno(written))
 
-        if here < 0 then return Err(why())
-        if c_fseek(self.inner.handle, 0, seek_end()) != 0 then return Err(why())
+        var st = fsys.Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        val code = fsys.fstat(self.inner.fd, &st)
 
-        var n = c_ftell(self.inner.handle)
-
-        if n < 0 then return Err(why())
-        if c_fseek(self.inner.handle, here, seek_set()) != 0 then return Err(why())
-
-        Ok(long(n))
-#endif
+        if code != 0 then Err(from_errno(code)) else Ok(st.size)
     end size
 
     /** Whether a read has already run off the end. It answers about reads that **happened**, so it is
@@ -177,7 +174,7 @@ struct File
      * A closed file answers `true`, since nothing more will arrive from it and a loop asking this
      * should stop rather than spin.
      */
-    at_end(*self) -> bool = self.inner.shut || c_feof(self.inner.handle) != 0
+    at_end(*self) -> bool = self.inner.shut || self.inner.ended
 
     /** The file cut to a length, or extended to one with zeroes -- the one thing this surface could
      * not do, having `seek` and `size` and no way to change what is there.
@@ -187,19 +184,67 @@ struct File
      * the length it meant and goes on from where it was. A position now past the end of the file is
      * legal and a write there leaves a hole, exactly as a seek past the end always did.
      *
-     * Anything still buffered is flushed first, so the length means what the caller meant at the
-     * moment they said it rather than what it meant once the buffer next drained.
+     * Anything still buffered is handed over first, so the length means what the caller meant at the
+     * moment they said it rather than what it meant once the buffer next drained -- bytes cut
+     * underneath a buffer would otherwise come back afterwards, past the length that was asked for.
      */
     truncate(*self, length: long) -> Result[unit, IoError]
         if self.inner.shut then return Err(NotOpen)
 
-#if posix
-        if c_file_truncate(self.inner.handle, length) != 0 then Err(why()) else Ok(())
-#else
-        Err(unsupported())
-#endif
+        val written = drain(self.inner)
+
+        if written != 0 then return Err(from_errno(written))
+
+        answered(fsys.ftruncate(self.inner.fd, length))
     end truncate
+
+    /** What went wrong, for a caller that has just been told by `failed` that something did. */
+    private[sysl] failure(*self) -> IoError = from_errno(self.inner.fault)
 end File
+
+/** Hands everything buffered for writing to the descriptor, and answers zero or the code of what
+ * stopped it. What could not be handed over is dropped either way: keeping it would only have it
+ * fail again at every later call.
+ */
+private drain(s: &FileState) -> int
+    var done: usize = 0
+    var code = 0
+
+    while done < s.pending && code == 0
+        var put: usize = 0
+
+        code = fsys.write(s.fd, &s.held[done], s.pending - done, &put)
+
+        if code == 0 && put == 0 then code = stalled
+
+        done += put
+
+    s.pending = 0
+    code
+end drain
+
+/** Gives up what was read ahead and not handed out, moving the descriptor back to where the program
+ * thinks it is -- which is what a write has to start from. Zero, or the code of what stopped it.
+ */
+private unread(s: &FileState) -> int
+    val ahead = s.filled - s.at
+
+    s.at = 0
+    s.filled = 0
+
+    if ahead == 0 then return 0
+
+    var at: long = 0
+
+    fsys.seek(s.fd, -long(ahead), fsys.seek_current, &at)
+end unread
+
+/** The buffer, made the first time the file needs one. */
+private buffer(s: &FileState) -> []u8
+    if s.held.len == 0 then s.held = [0; buffer_bytes]
+
+    s.held
+end buffer
 
 /** Whether anything has gone wrong on this file since it was opened. It latches, so it is worth
  * asking once after a run of writes rather than after each -- which is the whole reason the surface
@@ -220,24 +265,81 @@ impl Fallible for File
  * An empty answer means the end of the input and nothing more. Whether the input ended *badly* is
  * what `failed` reports, and the two are separate questions because a caller that does not care
  * should not have to ask -- the same split `FdReader` makes.
+ *
+ * **It fills `into` unless the file ends first**, as C's `fread` did, so a short answer is the end of
+ * the file or a failure and never merely a slow device.
  */
 impl Reader for File
     read(*self, into: []u8) -> []const u8
+        val s = self.inner
+
         // Reading a closed file latches rather than answering quietly empty: an empty read means the
         // end of the input, and a program told that would conclude it had read the whole file when
         // what it had done was close it too early.
-        if self.inner.shut then
-            self.inner.bad = true
+        if s.shut
+            s.bad = true
+            s.fault = NotOpen.code()
             return into[0..<0]
+        end if
 
         if into.len == 0 then return into
 
-        var got = c_fread(&into[0], 1, into.len, self.inner.handle)
+        // A failure after some bytes had already arrived was held back so that they could be handed
+        // out; it is told now, as an empty read.
+        if s.erred
+            s.erred = false
+            s.bad = true
+            return into[0..<0]
+        end if
 
-        // `fread` reports a short count for the end of the file and for a failure alike, so the
-        // error flag is the only thing that tells them apart, and it is asked only when nothing
-        // arrived -- a partial read that hit the end is not a failure.
-        if got == 0 && c_ferror(self.inner.handle) != 0 then self.inner.bad = true
+        val written = drain(s)
+
+        if written != 0
+            s.bad = true
+            s.fault = written
+            return into[0..<0]
+        end if
+
+        var got = copy(into, s.held[s.at..<s.filled])
+
+        s.at += got
+
+        while got < into.len
+            var n: usize = 0
+            var code = 0
+
+            // A request at least as large as the buffer goes straight to the descriptor; a smaller
+            // one fills the buffer and is served from it.
+            if into.len - got >= buffer_bytes
+                code = fsys.read(s.fd, &into[got], into.len - got, &n)
+                got += n
+            else
+                var b = buffer(s)
+
+                code = fsys.read(s.fd, &b[0], b.len, &n)
+
+                s.at = 0
+                s.filled = n
+
+                val taken = copy(into[got..], b[0..<n])
+
+                s.at = taken
+                got += taken
+            end if
+
+            if code != 0
+                s.fault = code
+
+                if got == 0 then s.bad = true else s.erred = true
+
+                break
+            end if
+
+            if n == 0
+                s.ended = true
+                break
+            end if
+        end while
 
         into[0..<got]
     end read
@@ -249,43 +351,79 @@ end File
  */
 impl Writer for File
     write(*self, bytes: []const u8)
-        if self.inner.shut
-            self.inner.bad = true
-        elif bytes.len > 0
-            var put = c_fwrite(&bytes[0], 1, bytes.len, self.inner.handle)
+        val s = self.inner
 
-            if put < bytes.len then self.inner.bad = true
+        if s.shut
+            s.bad = true
+            s.fault = NotOpen.code()
+            return
+        end if
+
+        if bytes.len == 0 then return
+
+        var code = unread(s)
+
+        // What does not fit beside what is already held is worth handing over first; and a write as
+        // large as the buffer then goes straight through rather than being copied into it.
+        if code == 0 && s.pending + bytes.len > buffer_bytes then code = drain(s)
+
+        if code == 0 && bytes.len >= buffer_bytes
+            var done: usize = 0
+
+            while done < bytes.len && code == 0
+                var put: usize = 0
+
+                code = fsys.write(s.fd, &bytes[done], bytes.len - done, &put)
+
+                if code == 0 && put == 0 then code = stalled
+
+                done += put
+        elif code == 0
+            var b = buffer(s)
+
+            s.pending += copy(b[s.pending..], bytes)
+
+            if s.pending == b.len then code = drain(s)
+        end if
+
+        if code != 0
+            s.bad = true
+            s.fault = code
+        end if
     end write
 end File
 
-/** The three ways a program opens a file, named for what it means rather than for the mode string it
+/** The three ways a program opens a file, named for what it means rather than for the flags it
  * becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
  * `append` writes at the end of whatever is there, making the file if it is not.
  */
-open(path: string) -> Result[File, IoError] = opened(path, c"rb")
+open(path: string) -> Result[File, IoError] = opened(path, fsys.open_read)
 
-create(path: string) -> Result[File, IoError] = opened(path, c"wb")
+create(path: string) -> Result[File, IoError] =
+    opened(path, fsys.open_write | fsys.open_create | fsys.open_truncate)
 
-append(path: string) -> Result[File, IoError] = opened(path, c"ab")
+append(path: string) -> Result[File, IoError] =
+    opened(path, fsys.open_write | fsys.open_create | fsys.open_append)
 
 /** A file opened for reading **and** writing, which the three above cannot express between them: each
- * of C's update modes is a different answer to "and what about what is already there", and naming
- * them apart is what keeps a caller from having to know that `"r+"` fails on a missing file while
- * `"w+"` empties one that exists.
+ * update mode is a different answer to "and what about what is already there", and naming them apart
+ * is what keeps a caller from having to know that one fails on a missing file while the other empties
+ * one that exists.
  */
-open_update(path: string) -> Result[File, IoError] = opened(path, c"r+b")
+open_update(path: string) -> Result[File, IoError] = opened(path, fsys.open_read | fsys.open_write)
 
-create_update(path: string) -> Result[File, IoError] = opened(path, c"w+b")
+create_update(path: string) -> Result[File, IoError] =
+    opened(path, fsys.open_read | fsys.open_write | fsys.open_create | fsys.open_truncate)
 
-/** The mode string is a literal at every call above, so it costs no allocation and there is no
- * direction from a `string` into one -- which is also why this is private. A program wanting a mode
- * the four names do not cover is asking for C's spelling, and that is a good thing to have to say
- * out loud with an `extern` of its own.
+/** The flags are a constant at every call above, which is also why this is private: a program wanting
+ * a combination the five names do not cover is asking for the platform's `open`, and that is a good
+ * thing to have to say out loud with an `extern` of its own.
  */
-private opened(path: string, mode: *u8) -> Result[File, IoError]
-    var h = c_fopen(cstring(path).ptr, mode)
+private opened(path: string, flags: u32) -> Result[File, IoError]
+    var fd = 0
+    val code = fsys.open(as_ptr(path.bytes), path.bytes.len, flags, file_mode, &fd)
 
-    if h == null then return Err(why())
+    if code != 0 then return Err(from_errno(code))
 
-    Ok(File(FileState(h, false, false)))
+    Ok(File(FileState(fd, false, false, 0, false, false, [0; 0], 0, 0, 0)))
 end opened
