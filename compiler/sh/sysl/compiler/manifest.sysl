@@ -148,12 +148,18 @@ manifest_refusal(why: string) -> string =
     if why.starts_with(s"$ManifestName:") then why else s"$ManifestName: $why"
 
 // The capabilities a machine of this name provides, which is what the manifest says about it: the
-// target's own block over the project's, and provided where neither says anything.
+// target's own block over the project's, and what the machine has before any file speaks where
+// neither says anything.
 manifest_provides(m: &Manifest, target: string) -> Buf[string]
     var out: Buf[string] = buf()
+    val machine = target_resolved(target) match
+        Ok(t) -> machine_lacks(t.os)
+        Err(_) -> buf()
 
     for i in 0..<CoreCapabilities.len
-        if capability_given(m, target, CoreCapabilities[i]) then out.push(CoreCapabilities[i])
+        val cap = CoreCapabilities[i]
+
+        if capability_given(m, target, cap, !holds_string(machine, cap)) then out.push(cap)
 
     out
 end manifest_provides
@@ -204,7 +210,7 @@ private target_provides(m: &Manifest, t: Target) -> Buf[string]
     for i in 0..<CoreCapabilities.len
         val cap = CoreCapabilities[i]
 
-        if capability_given(m, t.name, cap) then out.push(cap)
+        if capability_given(m, t.name, cap, standing(t, cap)) then out.push(cap)
 
     out
 end target_provides
@@ -215,26 +221,32 @@ as_declared(m: &Manifest, t: Target) -> Target
     var lacks: Buf[string] = buf()
 
     for i in 0..<CoreCapabilities.len
-        if !capability_given(m, t.name, CoreCapabilities[i]) then lacks.push(CoreCapabilities[i])
+        val cap = CoreCapabilities[i]
+
+        if !capability_given(m, t.name, cap, standing(t, cap)) then lacks.push(cap)
 
     t with { lacks = lacks }
 end as_declared
 
-// The three a project may take away, which are the ones that gate whether a whole module exists at
-// all. `heap` changes what the language allows and the other two gate which of the standard
-// module's modules a program may name.
-val CoreCapabilities: []const string = ["heap", "os", "posix"]
+// The four a manifest speaks about. `heap` changes what the language allows, `os` and `posix` gate
+// which of the standard module's modules a program may name, and `libc` whether C's own functions
+// may be reached -- the one a freestanding machine starts without, so a manifest grants it there.
+val CoreCapabilities: []const string = ["heap", "os", "posix", "libc"]
+
+// Whether a capability stands on this machine before any manifest speaks.
+private standing(t: Target, cap: string) -> bool = !holds_string(machine_lacks(t.os), cap)
 
 // Whether the manifest leaves a capability standing: the target's own word first, then the
-// project's, and standing where neither says anything.
-private capability_given(m: &Manifest, target: string, cap: string) -> bool
+// project's, and `otherwise` -- what the machine has by being the machine it is -- where neither
+// says anything.
+private capability_given(m: &Manifest, target: string, cap: string, otherwise: bool) -> bool
     for row in m.target_capabilities
         if row.0 == target && row.1 == cap then return row.2
 
     for capabilitie in m.capabilities
         if capabilitie.0 == cap then return capabilitie.1
 
-    true
+    otherwise
 end capability_given
 
 // Refuses a project whose manifest asks for a compiler newer than the one in hand.
@@ -618,7 +630,7 @@ private is_core_capability(name: string) -> bool
 end is_core_capability
 
 private not_a_capability(written: string, where: string) -> string =
-    s"'$written' in '$where' is not a capability — the set is 'heap', 'os', 'posix'"
+    s"'$written' in '$where' is not a capability — the set is 'heap', 'os', 'posix', 'libc'"
 
 // A `capabilities` block, the project's or one target's: each name one of the three, and each value
 // a flag. **A misspelled name is refused rather than ignored**, since a `treads = false` that did
@@ -666,8 +678,7 @@ private read_requires(root: &Conf) -> Result[Buf[string], string]
             Flag(false) -> return Err(
                 s"'requires { $cap = false }' says nothing — 'requires' is what this package needs " +
                 s"its host to have. To say the machine has no $cap, write it in the project's own " +
-                s"'capabilities { $cap = false }'; to say a module does not use it, write " +
-                s"'${no_capability_mark(cap)}' in that module's files")
+                s"'capabilities { $cap = false }'" + module_mark_advice(cap))
             _ -> return Err(s"'requires.$written' must be true or false")
 
     var out: Buf[string] = buf()
@@ -684,9 +695,15 @@ private read_requires(root: &Conf) -> Result[Buf[string], string]
     Ok(out)
 end read_requires
 
-// The attribute a module writes to say it does without a capability.
-private no_capability_mark(cap: string) -> string =
-    if cap == "heap" then "@no_alloc" else s"@no_$cap"
+// The attribute a module writes to say it does without a capability, as the tail of the refusal
+// above -- `libc` has none, being a statement about the machine that no module makes.
+private module_mark_advice(cap: string) -> string
+    if cap == CapLibc then return ""
+
+    val mark = if cap == "heap" then "@no_alloc" else s"@no_$cap"
+
+    s"; to say a module does not use it, write '$mark' in that module's files"
+end module_mark_advice
 
 // The `allocator` block: the pair a program's storage comes from, named by a package that knows it
 // (`reference/packages.md § One heap, and the package that names it`).
