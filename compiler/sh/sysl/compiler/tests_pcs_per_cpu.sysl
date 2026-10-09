@@ -1,0 +1,396 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.text.Search
+
+// Per-core and per-thread storage a bare AArch64 image owns (`reference/attributes.md § @per_cpu`,
+// `§ @thread_local`): the manifest's `codegen.thread_pointer` and `codegen.per_cpu_offset`, what
+// `@per_cpu` lays down and how it is reached, and the `@pinned` / `@pins` rule that says where a reach
+// is right. Each is asserted where a reader meets it -- the tree, the manifest, the refusal, the LLVM
+// text and the disassembled archive.
+
+private pcs_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A project holding `main.sysl` and a manifest with `extra` after its `package` block.
+private pcs_project(extra: string, main: string) -> string
+    val root = make_temp_dir("sysl-pcs").unwrap()
+
+    write_text(s"$root/package.hocon", s"package {\n  name = \"probe\"\n}\n\n$extra").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    root
+end pcs_project
+
+// `sysl <args>` as the command line answers it, every setting it left behind put back.
+private pcs_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    use_codegen_features(no_codegen_features())
+    use_machine_registers(no_machine_registers())
+    (code, text)
+end pcs_cli
+
+// `emit-llvm` of `main` for `target` under the manifest text `extra`.
+private pcs_emit(target: string, extra: string, main: string) -> (int, string)
+    val root = pcs_project(extra, main)
+    var args: [5]string = ["sysl", "emit-llvm", "--target", target, root]
+    val got = pcs_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end pcs_emit
+
+// The same for aarch64-freestanding, `main` being module `k`'s one file: a project whose code is all
+// declarations, as an image's is, with nothing that runs at the top.
+private pcs_bare(extra: string, main: string) -> (int, string) = pcs_in("aarch64-freestanding", extra, main)
+
+private pcs_in(target: string, extra: string, main: string) -> (int, string)
+    val root = pcs_project(extra, "")
+
+    make_dir_all(s"$root/k").unwrap()
+    write_text(s"$root/k/k.sysl", s"module k\n\n$main").unwrap()
+
+    var args: [5]string = ["sysl", "emit-llvm", "--target", target, root]
+    val got = pcs_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end pcs_in
+
+private pcs_offset() -> string = "codegen {\n  per_cpu_offset = \"tpidr_el1\"\n}\n"
+
+private pcs_tp() -> string = "codegen {\n  thread_pointer = \"tpidr_el0\"\n}\n"
+
+// A core's tick count, read and written by a function every caller keeps on one core.
+private pcs_ticks(mark: string) -> string =
+    s"@per_cpu\nvar ticks: u64 = 0\n\n${mark}@export(\"tick\")\ntick() -> u64\n    ticks += 1\n    ticks\n"
+
+// -- the tree --------------------------------------------------------------------------------------------
+
+@test("'@per_cpu' lands on the 'var' it was written above, and the tree says so only there")
+pcs_the_mark_lands()
+    val r = parse(source_of("t.sysl", "@per_cpu\nstatic var n: int = 1\nstatic var m: int = 2\n"))
+
+    assert(r.ok(), "it parses")
+
+    val t = emit_ast(r.program, false)
+
+    assert(t.contains("perCpu: true"), t)
+    assert_eq(t.count_of("perCpu"), 1)
+    assert(t.contains("threadLocal: false"), t)
+
+@test("it composes with '@align(n)' and nothing else about storage")
+pcs_composes_with_align()
+    assert_eq(pf_err("@per_cpu\n@align(64)\nstatic var n: int = 1\n"), "")
+    assert(pf_err("@per_cpu\n@section(\".data\")\nstatic var n: int = 1\n").contains("places the binding in '.percpu'"))
+
+@test("a 'val', a 'const' and a function are refused, each for what it is")
+pcs_what_it_may_not_mark()
+    assert(pf_err("@per_cpu\nstatic val n: int = 1\n").contains("a per-core constant is a constant"))
+    assert(pf_err("@per_cpu\nconst N: int = 4\n").contains("declares no storage at all"))
+    assert(pf_err("@per_cpu\nf() = ()\n").contains("declares no storage at all"))
+    assert(pf_err("@per_cpu\n@cold\nstatic var n: int = 1\n").contains("'@align(n)'"))
+
+@test("one copy per thread and one per core are two answers, so the two are not written together")
+pcs_not_beside_thread_local()
+    assert(pf_err("@per_cpu\n@thread_local\nstatic var n: int = 1\n").contains("two answers to how many copies"))
+
+@test("'@pinned' and '@pins' mark a function and not both at once")
+pcs_pinned_and_pins_marks()
+    assert_eq(pf_err("@pinned\nf() = ()\n"), "")
+    assert_eq(pf_err("@pins\nf() = ()\n"), "")
+    assert(pf_err("@pinned\n@pins\nf() = ()\n").contains("one body is one or the other"))
+    assert(pf_err("@pinned\nstatic var n: int = 1\n") != "")
+
+// -- the manifest ----------------------------------------------------------------------------------------
+
+@test("a register setting is read as a name, the target's own block layering over the project's")
+pcs_manifest_reads_registers()
+    val root = pcs_project("codegen {\n  per_cpu_offset = \"tpidr_el1\"\n}\ntargets {\n  " +
+                           "aarch64-freestanding {\n    codegen {\n      thread_pointer = \"tpidr_el0\"\n" +
+                           "    }\n  }\n}\n", "")
+
+    manifest_at(root) match
+        Err(why) -> assert(false, why.message)
+        Ok(m) ->
+            assert(codegen_register_given(m, "aarch64-freestanding", "per_cpu_offset").unwrap_or("") == "tpidr_el1")
+            assert(codegen_register_given(m, "aarch64-freestanding", "thread_pointer").unwrap_or("") == "tpidr_el0")
+            assert(codegen_register_given(m, "aarch64-macos", "thread_pointer").is_none())
+
+    remove_dir_all(root).unwrap_or(())
+
+@test("a register the machine has no such use for is refused by name, as is a value that is not one")
+pcs_manifest_refuses_bad_registers()
+    val root = pcs_project("codegen {\n  thread_pointer = \"x18\"\n}\n", "")
+
+    manifest_at(root) match
+        Err(why) -> assert(why.message.contains("'codegen.thread_pointer' is 'x18'"), why.message)
+        Ok(_) -> assert(false, "x18 was accepted")
+
+    remove_dir_all(root).unwrap_or(())
+
+    val flag = pcs_project("codegen {\n  per_cpu_offset = true\n}\n", "")
+
+    manifest_at(flag) match
+        Err(why) -> assert(why.message.contains("names a register"), why.message)
+        Ok(_) -> assert(false, "a flag was accepted as a register")
+
+    remove_dir_all(flag).unwrap_or(())
+
+@test("the settings are refused off a bare AArch64 machine, and one register is not both")
+pcs_register_refusals()
+    val both = MachineRegisters(Some("tpidr_el1"), Some("tpidr_el1"))
+    val one = MachineRegisters(Some("tpidr_el1"), None)
+    val bare = target_named("aarch64-freestanding").unwrap()
+
+    assert(machine_register_refusal(bare, one).is_none())
+    assert(machine_register_refusal(bare, both).unwrap_or("").contains("cannot hold a thread's block and a core's offset"))
+    assert(machine_register_refusal(target_named("thumb-freestanding").unwrap(), one).unwrap_or("").contains("is not an AArch64 machine"))
+    assert(machine_register_refusal(target_named("aarch64-macos").unwrap(), one).unwrap_or("").contains("a hosted machine's operating system owns"))
+
+@test("a build for a machine the register means nothing on is refused before anything is built")
+pcs_refused_at_the_cli()
+    if !pcs_ready() then return
+
+    val got = pcs_emit("thumb-freestanding", pcs_offset(), "")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("'codegen.per_cpu_offset' names an AArch64 register"), got.1)
+
+@test("clang is told -mtp, every function carries the feature, and the cache key names the register")
+pcs_thread_pointer_flags()
+    val bare = target_named("aarch64-freestanding").unwrap()
+
+    use_machine_registers(MachineRegisters(Some("tpidr_el1"), Some("tpidrro_el0")))
+
+    val flags = codegen_feature_flags(bare)
+    val attribute = codegen_feature_attribute(bare).unwrap_or("")
+    val key = codegen_features_key()
+
+    use_machine_registers(no_machine_registers())
+
+    var mtp = false
+
+    for f in flags
+        if f == "-mtp=el1" then mtp = true
+
+    assert(mtp, "-mtp=el1 is on the line")
+    assert(attribute.contains("+tpidr-el1"), attribute)
+    assert(key.contains("-tp.tpidr_el1") && key.contains("-pc.tpidrro_el0"), key)
+    assert_eq(codegen_features_key(), "")
+
+// -- @thread_local on a bare AArch64 machine -------------------------------------------------------------
+
+@test("'@thread_local' on aarch64-freestanding asks which register the program keeps the pointer in")
+pcs_thread_local_needs_the_register()
+    if !pcs_ready() then return
+
+    val got = pcs_bare("", "@thread_local\nvar n: u64 = 0\n\n@export(\"bump\")\nbump() -> u64\n    n += 1\n    n\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("until the program says which register holds the thread pointer"), got.1)
+    assert(got.1.contains("codegen { thread_pointer = \"tpidr_el1\" }"), got.1)
+
+@test("and once the manifest names it, the storage is thread-local and the functions say which register")
+pcs_thread_local_with_the_register()
+    if !pcs_ready() then return
+
+    val got = pcs_bare("codegen {\n  thread_pointer = \"tpidr_el1\"\n}\n",
+                       "@thread_local\nvar n: u64 = 5\n\n@export(\"bump\")\nbump() -> u64\n    n += 1\n    n\n")
+
+    assert_eq(got.0, 0)
+    assert(got.1.contains("thread_local global i64 5"), got.1)
+    assert(got.1.contains("+tpidr-el1"), got.1)
+
+@test("another bare machine keeps the refusal it had, a register setting there being refused first")
+pcs_other_bare_machines_still_refuse()
+    if !pcs_ready() then return
+
+    val got = pcs_in("riscv32-freestanding", "",
+                       "@thread_local\nvar n: u32 = 0\n\n@export(\"bump\")\nbump() -> u32\n    n += 1\n    n\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("let the port's scheduler answer for which task is running"), got.1)
+
+// -- @per_cpu ----------------------------------------------------------------------------------------------
+
+@test("'@per_cpu' is refused anywhere but a bare AArch64 machine, naming the one that has it")
+pcs_per_cpu_only_on_bare_aarch64()
+    if !pcs_ready() then return
+
+    val got = pcs_in("riscv64-freestanding", "", pcs_ticks("@pinned\n"))
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("'k.ticks' cannot be '@per_cpu' on 'riscv64-freestanding'"), got.1)
+    assert(got.1.contains("('aarch64-freestanding')"), got.1)
+
+@test("and there it asks which register holds the core's offset")
+pcs_per_cpu_needs_the_register()
+    if !pcs_ready() then return
+
+    val got = pcs_bare("", pcs_ticks("@pinned\n"))
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("until the program says which register holds this core's offset"), got.1)
+
+@test("the image is laid down in .percpu, and every access is the image plus the register, read afresh")
+pcs_per_cpu_lowering()
+    if !pcs_ready() then return
+
+    val got = pcs_bare(pcs_offset(), pcs_ticks("@pinned\n"))
+
+    assert_eq(got.0, 0)
+    assert(got.1.contains("section \".percpu\""), got.1)
+    assert(got.1.contains("call i64 @llvm.read_volatile_register.i64(metadata !{!\"tpidr_el1\"})"), got.1)
+    assert(got.1.contains("getelementptr i8, ptr @"), got.1)
+
+    // `+=` and the read after it are two accesses, so the register is read twice.
+    assert(got.1.count_of("@llvm.read_volatile_register.i64(metadata !{!\"tpidr_el1\"})") >= 2, got.1)
+
+@test("a zero image is data in .percpu, not .bss, so a linker script's bounds take it in")
+pcs_zero_image_is_data()
+    if !pcs_ready() then return
+
+    val got = pcs_bare(pcs_offset(), "@per_cpu\nvar slot: [4]u64\n\n@pinned\n@export(\"first\")\nfirst() -> u64 = slot[0]\n")
+
+    assert_eq(got.0, 0)
+    assert(got.1.contains("zeroinitializer, section \".percpu\""), got.1)
+
+@test("an initializer that is code is refused, every core's copy being made from the one image")
+pcs_computed_initializer()
+    if !pcs_ready() then return
+
+    val got = pcs_bare(pcs_offset(), "seed() -> u64 = 4\n\n@per_cpu\nvar n: u64 = seed()\n\n" +
+                       "@pinned\n@export(\"read\")\nread() -> u64 = n\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("is '@per_cpu', so its value has to be one the compiler can write down"), got.1)
+
+@test("a local cannot be per-core, being one call's already")
+pcs_a_local_is_refused()
+    if !pcs_ready() then return
+
+    val got = pcs_bare(pcs_offset(), "@export(\"f\")\nf() -> u64\n    @per_cpu\n    var n: u64 = 0\n    n\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("'n' is a local, and a local is already one call's"), got.1)
+
+// -- @pinned and @pins ------------------------------------------------------------------------------------
+
+@test("a reach from a body that said neither is refused at the reach, naming both remedies")
+pcs_unpinned_read_refused()
+    if !pcs_ready() then return
+
+    val got = pcs_bare(pcs_offset(), pcs_ticks(""))
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("is '@per_cpu', so which copy it names is decided by the core running"), got.1)
+    assert(got.1.contains("and 'k.tick' is neither '@pinned' nor '@pins'"), got.1)
+
+@test("'@pins' answers for its own body, and its callers are asked nothing")
+pcs_pins_answers_for_itself()
+    if !pcs_ready() then return
+
+    val got = pcs_bare(pcs_offset(), pcs_ticks("@pins\n") + "\n@export(\"twice\")\ntwice() -> u64 = tick() + tick()\n")
+
+    assert_eq(got.0, 0)
+
+@test("a call of a '@pinned' function is a reach of its own, from '@pins' fine and from neither refused")
+pcs_pinned_calls()
+    if !pcs_ready() then return
+
+    val base = "@per_cpu\nvar ticks: u64 = 0\n\n@pinned\nbump() -> u64\n    ticks += 1\n    ticks\n\n"
+    val ok = pcs_bare(pcs_offset(), base + "@pins\n@export(\"tick\")\ntick() -> u64 = bump()\n")
+    val bad = pcs_bare(pcs_offset(), base + "@export(\"tick\")\ntick() -> u64 = bump()\n")
+
+    assert_eq(ok.0, 0)
+    assert_eq(bad.0, 1)
+    assert(bad.1.contains("'k.bump' is '@pinned', so every call of it has to be made where the core cannot change"), bad.1)
+
+@test("the rule needs no per-core storage to bite: '@pinned' is a precondition on any target")
+pcs_pinned_on_the_host()
+    if !pcs_ready() then return
+
+    val got = pcs_emit(host_target().name, "", "@pinned\nwork() -> int = 1\n\nprint(work())\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("and the program's statements are neither '@pinned' nor '@pins'"), got.1)
+
+@test("taking a '@pinned' function's address is refused outside a pinned body, the address being callable anywhere")
+pcs_pinned_address()
+    if !pcs_ready() then return
+
+    val got = pcs_emit(host_target().name, "",
+                       "@pinned\nwork() -> int = 1\n\nvar a = &work\nprint(a())\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("its address can be called from anywhere"), got.1)
+
+@test("a closure written in a pinned body is a body of its own, and is refused")
+pcs_closure_is_its_own_body()
+    if !pcs_ready() then return
+
+    val got = pcs_bare(pcs_offset(), "@per_cpu\nvar ticks: u64 = 0\n\n" +
+                       "@pinned\n@export(\"later\")\nlater() -> u64\n    val f = () -> ticks\n    f()\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("this closure, which may run after its writer let the core go"), got.1)
+
+// -- the image ---------------------------------------------------------------------------------------------
+
+private pcs_objdump() -> Option[string]
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end pcs_objdump
+
+// The archive `build-c` wrote for `main` under `extra`, disassembled with its relocations.
+private pcs_disassembled(objdump: string, extra: string, main: string) -> string
+    val root = pcs_project(extra, main)
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root]
+    val built = pcs_cli(args[..])
+
+    assert_eq(built.0, 0)
+
+    var out = ""
+
+    capture(objdump, ["-dr", archive]) match
+        Err(_) -> assert(false, "llvm-objdump did not run")
+        Ok(dis) -> out = dis.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end pcs_disassembled
+
+@test("in the archive a per-core read is an mrs of the named register, and a thread-local is local-exec off the other")
+pcs_archive_reads_the_registers()
+    if !pcs_ready() then return
+
+    val objdump = pcs_objdump() match
+        Some(p) -> p
+        None ->
+            print("skipped: there is no llvm-objdump on this machine")
+            return
+
+    val manifest = "codegen {\n  per_cpu_offset = \"tpidr_el1\"\n  thread_pointer = \"tpidr_el0\"\n}\n"
+    val main = pcs_ticks("@pinned\n") + "\n@thread_local\nvar mine: u64 = 0\n\n" +
+               "@export(\"own\")\nown() -> u64\n    mine += 1\n    mine\n"
+    val dis = pcs_disassembled(objdump, manifest, main)
+
+    assert(dis.contains("mrs") && dis.contains("TPIDR_EL1"), dis)
+    assert(dis.contains("TPIDR_EL0"), dis)
+    assert(dis.contains("R_AARCH64_TLSLE_ADD_TPREL_HI12"), dis)

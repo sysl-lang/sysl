@@ -321,7 +321,7 @@ private with_entry_body(funcs: Buf[TFunc], started: (Buf[TStmt], string)) -> Buf
 
     out.push(TFunc(span_zero(), entry_check_name(started.1), buf(), Unit,
                    TBlock(started.0, None, Unit), false, buf(), buf(), buf(), false, None, false,
-                   None, false, false, None, None, None, None, no_marks(), started.1, false, None))
+                   None, false, false, None, None, None, None, no_marks(), started.1, false, None, false))
 
     out
 end with_entry_body
@@ -566,7 +566,8 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
           contract.2, file_local(d.vis), d.conv, d.tailrec, contract.3, d.pure, d.ghost,
           frame_symbols(cx, span, name, d.reads, "reads"),
           frame_symbols(cx, span, name, d.writes, "writes"),
-          exported_symbol(d), d.section, d.marks, cx.owner, d.const_fn, Some(scope.src))
+          exported_symbol(d), d.section, d.marks, cx.owner, d.const_fn, Some(scope.src),
+          export_hidden(d))
 end analyze_body
 
 // Whether the declaration wrote the parameter `name` by name (`x: -> T`).
@@ -812,7 +813,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     a.tables.homes.put(d.name, scope)
     a.tables.abstracts.push(TFunc(span_zero(), d.name, params, ret, body, d.variadic, buf(), buf(),
                                   buf(), true, d.conv, false, None, d.pure, d.ghost, None, None,
-                                  None, None, no_marks(), cx.owner, d.const_fn, Some(scope.src)))
+                                  None, None, no_marks(), cx.owner, d.const_fn, Some(scope.src), false))
 end check_abstract_body
 
 // What a `some` member's body produces, read speculatively and taken back: the one reading that
@@ -978,7 +979,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
 
     if sig.is_none() then return TFunc(span_zero(), name, buf(), Unit, empty_block(), false, buf(),
                                        buf(), buf(), false, None, false, None, false, false, None,
-                                       None, None, None, no_marks(), cx.owner, false, None)
+                                       None, None, None, no_marks(), cx.owner, false, None, false)
 
     remember_bounds(cx, d)
 
@@ -1034,7 +1035,8 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
           d.conv, d.tailrec, contract.3, d.pure, d.ghost,
           frame_symbols(cx, span, name, d.reads, "reads"),
           frame_symbols(cx, span, name, d.writes, "writes"),
-          exported_symbol(d), d.section, d.marks, cx.owner, d.const_fn, Some(cx.scope.src))
+          exported_symbol(d), d.section, d.marks, cx.owner, d.const_fn, Some(cx.scope.src),
+          export_hidden(d))
 end analyze_instance_in
 
 // The key a declaration was filed under, for a diagnostic naming the declaration an instantiation
@@ -1265,6 +1267,14 @@ private exported_symbol(d: FuncDecl) -> Option[string]
 
     Some(d.name)
 end exported_symbol
+
+// Whether an export's symbol is hidden: it is, where the declaration is not public (`TFunc`).
+private export_hidden(d: FuncDecl) -> bool
+    if d.exported.is_none() then return false
+
+    d.vis match
+        Public -> false
+        _ -> true
 
 // -- what a test asks ------------------------------------------------------------------------------
 
@@ -1644,9 +1654,10 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                 val computed = init.is_some() && !laid_down(init.unwrap())
 
                 if d.thread_local then check_per_thread(cx, d.span, key, computed)
+                if d.per_cpu then check_per_core(cx, d.span, key, computed)
 
                 out.push(TVal(key, stored, init, computed, writable, storage_align(cx, d), d.section,
-                              d.thread_local))
+                              d.thread_local, d.per_cpu))
 
     out
 end module_storage
@@ -1679,7 +1690,20 @@ private refuse_storage_slots(cx: &Analyzer, init: TExpr)
 private check_per_thread(cx: &Analyzer, span: Span, key: string, computed: bool)
     val t = cx.an.tables.target
 
-    if !t.thread_local_storage()
+    // **A bare AArch64 machine has the register, and the program may own it**: a kernel writes the
+    // thread pointer itself on every switch, so once the manifest says which register that is
+    // (`codegen.thread_pointer`), the local-exec offset is read from storage the program answers for.
+    val owned = t.cpu == Aarch64 && thread_pointer_register().is_some()
+
+    if !t.thread_local_storage() && !owned && t.cpu == Aarch64
+        cx.fault(span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}' until the " +
+                 "program says which register holds the thread pointer: there is no loader here to " +
+                 "lay a thread's storage down, so the program does it — copying the '.tdata' image " +
+                 "and zeroing '.tbss' for each thread, and writing the register on every switch. " +
+                 "Name the register in package.hocon as 'codegen { thread_pointer = \"tpidr_el1\" }' " +
+                 "('tpidr_el0', 'tpidrro_el0', 'tpidr_el2' and 'tpidr_el3' are the others), or declare " +
+                 "it as a plain module 'var' and let the scheduler answer for which thread is running")
+    else if !t.thread_local_storage() && !owned
         cx.fault(span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}': there " +
                  "is no loader and no libc on this target, so nothing lays a thread's storage down " +
                  "and nothing writes the thread pointer the offset would be read from. Declare it " +
@@ -1695,6 +1719,35 @@ private check_per_thread(cx: &Analyzer, span: Span, key: string, computed: bool)
                  "built from them are all values; a call is not. Leave the value off to start " +
                  "every thread at the type's zero, and do the work in each thread instead")
 end check_per_thread
+
+// What `@per_cpu` asks (`reference/attributes.md § @per_cpu`): a bare AArch64 machine whose manifest
+// names the register holding this core's offset, and an initializer the image can carry -- every
+// core's copy is made from the one `.percpu` image, so there is no per-core prologue for code to run
+// in either.
+private check_per_core(cx: &Analyzer, span: Span, key: string, computed: bool)
+    val t = cx.an.tables.target
+
+    if t.cpu != Aarch64 || t.os != Freestanding
+        cx.fault(span, s"'${qualified_name(key)}' cannot be '@per_cpu' on '${t.name}': a core's copy " +
+                 "is found through a register the program itself writes on each core, and only a " +
+                 "bare AArch64 machine ('aarch64-freestanding') has one a program owns. Anywhere " +
+                 "else the operating system moves a thread between cores whenever it likes, so no " +
+                 "answer to 'which core' stays true long enough to read through. Declare it as a " +
+                 "plain module 'var' indexed by the core's number, or as '@thread_local'")
+    else if per_cpu_register().is_none()
+        cx.fault(span, s"'${qualified_name(key)}' cannot be '@per_cpu' until the program says which " +
+                 "register holds this core's offset: each core's copy is the '.percpu' image copied " +
+                 "somewhere of the program's choosing, and the register holds that copy's address " +
+                 "minus the image's (zero on a core still using the image itself). Name it in " +
+                 "package.hocon as 'codegen { per_cpu_offset = \"tpidr_el1\" }'")
+    else if computed
+        cx.an.fault_unplaced(cx.scope, span, s"'${qualified_name(key)}' is '@per_cpu', so its value " +
+                 "has to be one the compiler can write down: every core's copy is made from the one " +
+                 "'.percpu' image in the object file rather than by code that runs per core. A " +
+                 "literal, 'null', a 'const' and the arrays and structs built from them are all " +
+                 "values; a call is not. Leave the value off to start every core at the type's " +
+                 "zero, and do the work on each core instead")
+end check_per_core
 
 private is_zero_expr(e: TExpr) -> bool = *e.kind match
     TZero(_) -> true
@@ -1716,6 +1769,7 @@ private laid_down(t: TExpr) -> bool = *t.kind match
     TFloatLit(_, _) -> true
     TBoolLit(_) -> true
     TStrLit(_) -> true
+    TEmbed(_, _, _) -> true
     TNullLit(_) -> true
     TArrayLit(elems, _) -> all_laid_down(elems)
     TArrayFill(value, _) -> laid_down(value)
@@ -1752,9 +1806,9 @@ private static_image(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
     TArrayLit(elems, ty) -> static_images(cx, elems).map(xs -> TExpr(t.span, TArrayLit(xs, ty)))
     TArrayFill(value, ty) -> static_image(cx, value).map(x -> TExpr(t.span, TArrayFill(x, ty)))
     TStructNew(decl, args) -> static_images(cx, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
-    TCast(inner, to) -> cast_image(t, inner, to)
+    TCast(inner, to) -> cast_image(t, inner, to, cx.an.tables.layout.little_endian)
     TConstrainedCheck(value, target) -> constrained_image(cx, t, value, target)
-    _ -> if laid_down(t) then Some(t) else scalar_image(t)
+    _ -> if laid_down(t) then Some(t) else scalar_image(t, cx.an.tables.layout.little_endian)
 
 // A constant made into a constrained subtype. **A name-only subtype -- a `new` type, or one with no
 // range -- checks nothing**, so `PhysAddr(0)` is the constant it converts and is laid down as one. A
@@ -1773,7 +1827,7 @@ private constrained_image(cx: &Analyzer, t: TExpr, value: TExpr, target: Type) -
     if inner.is_none() then return None
 
     if d.lo.is_some() || d.hi.is_some()
-        val v = const_fold_typed(inner.unwrap())
+        val v = const_fold_typed(inner.unwrap(), cx.an.tables.layout.little_endian)
 
         if v.is_none() then return None
 
@@ -1790,15 +1844,15 @@ end constrained_image
 
 // A conversion: to a scalar it is folded like any other operator, and to a pointer it is a device
 // address -- written as arithmetic over constants, it is still one number.
-private cast_image(t: TExpr, inner: TExpr, to: Type) -> Option[TExpr]
+private cast_image(t: TExpr, inner: TExpr, to: Type, little: bool) -> Option[TExpr]
     val pointerish = to match
         Ptr(_) -> true
         CFn(_, _) -> true
         _ -> false
 
-    if !pointerish then return scalar_image(t)
+    if !pointerish then return scalar_image(t, little)
 
-    const_fold_typed(inner) match
+    const_fold_typed(inner, little) match
         Some(ConstInt(n)) -> Some(TExpr(t.span, TCast(TExpr(inner.span, TIntLit(n, texpr_type(inner))), to)))
         _ -> None
 end cast_image
@@ -1817,8 +1871,8 @@ private static_images(cx: &Analyzer, xs: Buf[TExpr]) -> Option[Buf[TExpr]]
 end static_images
 
 // A scalar initializer as the literal it folds to.
-private scalar_image(t: TExpr) -> Option[TExpr]
-    val v = const_fold_typed(t)
+private scalar_image(t: TExpr, little: bool) -> Option[TExpr]
+    val v = const_fold_typed(t, little)
 
     if v.is_none() then return None
 

@@ -1,0 +1,91 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+import sysl.text.Search
+
+// **Where `@per_cpu` storage may be reached** (`reference/attributes.md § @per_cpu`).
+//
+// A `@per_cpu` binding is found through a register that says which core is running, so a read of one
+// is right only while the thread cannot move: preempted between finding the copy and using it, the
+// thread resumes on another core holding the first core's copy. Nothing in the tree can see whether
+// interrupts are masked or preemption is off, so the program says it, on the function:
+//
+// - **`@pinned`** -- every caller already keeps this function on one core. It is a precondition, so
+//   a call of one is itself a reach, held to the same rule.
+// - **`@pins`** -- the body keeps itself on one core before it reaches per-core storage (it masks
+//   interrupts first, say). Its callers are asked nothing.
+//
+// What is checked is that every reach -- naming a `@per_cpu` binding, calling a `@pinned` function,
+// or taking its address -- sits in a body that carries one of the two. The claims themselves are the
+// program's, as an `@export`'s symbol is: the compiler cannot see a register being written.
+//
+// **A closure is a body of its own and carries neither**, since it may be called after the function
+// that wrote it has let the core go; the entry file's statements carry neither either.
+
+// Every reach of per-core state from a body that has not said it is pinned.
+check_pinning(a: &Analysis, p: TProgram)
+    var per_cpu: Set[string] = set()
+
+    for v in p.vals
+        if v.per_cpu then per_cpu.add(v.symbol)
+
+    var pinned: Set[string] = set()
+
+    for f in p.funcs
+        if f.marks.pinned then pinned.add(f.name)
+
+    if per_cpu.is_empty() && pinned.is_empty() then return
+
+    for f in p.funcs
+        if !f.marks.pinned && !f.marks.pins
+            reaches_in(a, func_home(a, f.name), body_named(f.name), f.body.stmts, f.body.result,
+                       per_cpu, pinned)
+
+    reaches_in(a, entry_home(a), "the program's statements are", p.main, None, per_cpu, pinned)
+end check_pinning
+
+// How a refusal names the body it is about, verb and all.
+private body_named(name: string) -> string
+    if name.contains("$closure") then return "this closure, which may run after its writer let the core go, is"
+
+    s"'${qualified_name(name)}' is"
+end body_named
+
+private reaches_in(a: &Analysis, home: Scope, who: string, stmts: Buf[TStmt], tail: Option[TExpr],
+                   per_cpu: Set[string], pinned: Set[string])
+    var found: Buf[(Span, string)] = buf()
+    val sink = &found
+
+    val walk = expr_walk(true, (e) -> note_reach(sink, per_cpu, pinned, e))
+
+    walk_stmts(stmts, walk)
+
+    if tail.is_some() then walk_texpr(tail.unwrap(), walk)
+
+    for item in found
+        a.fault(home, item.0, s"${item.1}, and $who neither '@pinned' nor '@pins'. Mark it " +
+                "'@pinned' if every caller already keeps it on one core (interrupts masked, " +
+                "preemption off), or '@pins' if its own body does that before it gets here")
+end reaches_in
+
+// What one expression reaches, said as the first half of the refusal.
+private note_reach(sink: *Buf[(Span, string)], per_cpu: Set[string], pinned: Set[string], e: TExpr)
+    *e.kind match
+        TGlobal(symbol, _, _) ->
+            if per_cpu.has(symbol)
+                sink.push((e.span, s"'${qualified_name(symbol)}' is '@per_cpu', so which copy it " +
+                           "names is decided by the core running — right only while the thread " +
+                           "cannot be moved to another between finding the copy and using it"))
+        TCall(name, _, _, _) ->
+            if pinned.has(name)
+                sink.push((e.span, s"'${qualified_name(name)}' is '@pinned', so every call of it has " +
+                           "to be made where the core cannot change"))
+        TFuncAddr(name, _, _) ->
+            if pinned.has(name)
+                sink.push((e.span, s"'${qualified_name(name)}' is '@pinned', and its address can be " +
+                           "called from anywhere, so taking it is a call made where the core cannot " +
+                           "change"))
+        _ -> ()
+end note_reach

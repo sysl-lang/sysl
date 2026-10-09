@@ -1,0 +1,180 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `@byte_order(big)` and `@byte_order(little)` -- a struct whose integer fields keep their bytes in a
+// stated order rather than the machine's (`reference/attributes.md § @byte_order`).
+//
+// **The struct's storage IS the bytes a file or a wire holds**, and that is the whole design: a copy,
+// a `*T` cast over a frame, a `memcpy` into a block all move those bytes untouched, and only the two
+// places a field turns into a value and back -- a read and a write of the field -- reverse anything.
+// So the reversal is in the lowering of a field read, of a store through a field place, of a
+// construction and of a destructuring, and nowhere else; a struct handed to C or copied as a whole is
+// handed over as the format has it.
+//
+// A field is reversed where its type is a whole number of bytes, more than one, of something that is
+// one integer: an `iN`/`uN`, a fixed-point number, a simple enum (its discriminant), and a name for
+// any of those. A byte, a `bool` and an array of bytes have no order to keep. Everything else is
+// refused at the declaration, so nothing downstream has to ask what a reversed float would mean.
+
+// The width, in bits, a field of this type is reversed at inside a byte-ordered struct, or `0` where
+// it is stored as written -- one byte, or something that is not one integer.
+ordered_width(t: Type) -> int = underlying(t) match
+    Integer(bits, _, _) -> if bits > 8 && bits % 8 == 0 then bits else 0
+    Fixed(bits, _, _) -> if bits > 8 && bits % 8 == 0 then bits else 0
+    Enum(d) -> if d.simple then ordered_width(d.underlying) else 0
+    _ -> 0
+
+// The width a field of `s` is reversed at on a machine of this order, or `0` where its bytes are
+// already the ones the machine reads. A `@byte_order(big)` struct reverses on a little-endian
+// machine, a `@byte_order(little)` one on a big-endian machine, and a struct with no order never.
+//
+// A bitfield struct's fields are ranges of its container, which is what is reversed
+// (`container_reversal`), so none of them is reversed on its own.
+reversed_width(s: &StructType, t: Type, little: bool) -> int = s.big_endian match
+    Some(big) -> if big == little && bitfield_ranges(s).is_none() then ordered_width(t) else 0
+    None -> 0
+
+// The same, for the `index`th field of a receiver of type `rty` -- what every lowering of a field
+// access asks, through whatever qualifies the receiver.
+field_reversal(rty: Type, index: int, little: bool) -> int = underlying(rty) match
+    Struct(d) ->
+        if index >= 0 && usize(index) < d.fields.len() then reversed_width(d, d.fields.at(usize(index)).1, little)
+        else 0
+    _ -> 0
+
+// The width a **bitfield** struct's container is reversed at on this machine, or `0`. Its fields are
+// ranges of one integer, so the order is the container's: read, the container is reversed into the
+// integer the ranges are taken from, and written, the integer is reversed back into storage.
+container_reversal(s: &StructType, little: bool) -> int = s.big_endian match
+    Some(big) -> if big == little then container_width(s) else 0
+    None -> 0
+
+// The same, asked of a type.
+container_reversal_of(t: Type, little: bool) -> int = underlying(t) match
+    Struct(d) -> container_reversal(d, little)
+    _ -> 0
+
+private container_width(s: &StructType) -> int = bitfield_ranges(s) match
+    Some(ranges) -> if bitfield_bits(ranges) > 8 then bitfield_bits(ranges) else 0
+    None -> 0
+
+// Whether any field of `s` is reversed at all on this machine, which is what a lowering that writes
+// fields where they will stay -- a constant image, a result built in its caller's slot -- has to ask
+// before it lays a value down untouched.
+reverses_any(s: &StructType, little: bool) -> bool
+    for item in s.fields
+        if reversed_width(s, item.1, little) > 0 then return true
+
+    false
+end reverses_any
+
+// Whether a place is a field whose bytes are in an order stated by its struct -- the storage a pointer
+// or a `ref` would have to be read through the struct to make sense of. Asked whatever this machine's
+// order is, since a program whose `&` compiles here and is refused on the next machine is not
+// portable.
+ordered_field(place: TExpr) -> Option[&StructType] = *place.kind match
+    TField(receiver, _, ty) -> underlying(texpr_type(receiver)) match
+        Struct(s) -> if s.big_endian.is_some() && ordered_width(ty) > 0 then Some(s) else None
+        _ -> None
+    _ -> None
+
+// The word `@byte_order` was written with.
+order_word(s: &StructType) -> string = if s.big_endian.unwrap_or(false) then "big" else "little"
+
+// **What a byte-ordered struct may hold**, checked once its fields are resolved. Each refusal names
+// the field and says what to hold instead, since every one of them has a spelling that works.
+check_byte_order(a: &Analysis, scope: Scope, span: Span, s: &StructType)
+    if s.big_endian.is_none() then return
+
+    val name = type_show(Struct(s))
+    val order = order_word(s)
+
+    // A bitfield struct is one integer, a whole number of bytes, so the order is its container's and
+    // its fields are ranges that are not asked about.
+    if bitfield_ranges(s).is_some() then return
+
+    for item in s.fields
+        // A generic struct is read once with its parameters standing in for themselves, and that
+        // reading says nothing about a field whose type is one: each instantiation is checked with
+        // the types it was given.
+        if underlying(item.1) == Unknown || mentions_abstract(item.1) then return
+
+        ordered_field_refusal(item.1) match
+            Some(why) ->
+                a.fault(scope, span, s"'$name.${item.0}' is ${type_show(item.1)}, and '$name' is " +
+                        s"'@byte_order($order)' — $why")
+                return
+            None -> ()
+end check_byte_order
+
+// Why a field of this type cannot keep a stated byte order, or nothing where it can.
+private ordered_field_refusal(t: Type) -> Option[string] = underlying(t) match
+    Integer(bits, _, _) -> if bits % 8 == 0 then None else Some(partial_bytes())
+    Fixed(bits, _, _) -> if bits % 8 == 0 then None else Some(partial_bytes())
+    Bool -> None
+    Unit -> None
+    Enum(d) ->
+        if !d.simple then
+            Some("an enum that carries data is a tag beside a payload rather than one integer, so there " +
+                 "is no one value to put in an order. Hold the tag as an integer field and the payload " +
+                 "as fields of their own")
+        else ordered_field_refusal(d.underlying)
+    Floating(_, _) ->
+        Some("a float is put in an order through its bits, which the language does not do behind a " +
+             "field read. Hold it as the unsigned integer of its width and convert with '.bits()' and " +
+             "'from_bits'")
+    Char ->
+        Some("a 'char' is a Unicode scalar value rather than a number of a width. Hold it as a 'u32' " +
+             "and convert with 'char(...)', which checks it")
+    Array(_, elem) ->
+        if ordered_width(*elem) > 0 then
+            Some("an element is reached by index rather than read as a field, and the order is applied " +
+                 "where a field is read. Hold it as bytes, '[N]u8', or make the element a " +
+                 "'@byte_order' struct of its own")
+        else ordered_field_refusal(*elem)
+    Struct(d) ->
+        if d.big_endian.is_some() then None
+        else if order_neutral(Struct(d)) then None
+        else if bitfield_ranges(d).is_some() then
+            Some(s"'${type_show(Struct(d))}' is a bitfield struct, one integer in the machine's order, " +
+                 "so its ranges would be taken from the wrong one. Mark it '@byte_order' too, which " +
+                 "orders that integer")
+        else
+            Some(s"'${type_show(Struct(d))}' keeps its integers in the machine's order, so a field of " +
+                 "it would be read in the wrong one. Mark it '@byte_order' too")
+    _ ->
+        Some("an address means nothing outside the memory it points into, and a struct with a byte " +
+             "order is laid out to be written somewhere else. Hold an offset or an index instead")
+
+private partial_bytes() -> string =
+    "a value that is not a whole number of bytes has no byte order to keep. Widen it to the whole " +
+        "bytes it occupies, or hold the bits in a '@packed' struct of their own"
+
+// Whether a type holds nothing whose bytes have an order -- every scalar in it one byte wide, or kept
+// by a struct that states its own.
+order_neutral(t: Type) -> bool
+    underlying(t) match
+        Integer(bits, _, _) -> bits <= 8
+        Fixed(bits, _, _) -> bits <= 8
+        Bool -> true
+        Unit -> true
+        Enum(d) -> d.simple && order_neutral(d.underlying)
+        Array(_, elem) -> order_neutral(*elem)
+        Struct(d) -> d.big_endian.is_some() || fields_neutral(d)
+        _ -> false
+end order_neutral
+
+// A struct with no order of its own is neutral where everything it holds is -- a bitfield struct where
+// its one container is a byte.
+private fields_neutral(d: &StructType) -> bool
+    bitfield_ranges(d) match
+        Some(ranges) -> return bitfield_bits(ranges) <= 8
+        None -> ()
+
+    for item in d.fields
+        if !order_neutral(item.1) then return false
+
+    true
+end fields_neutral

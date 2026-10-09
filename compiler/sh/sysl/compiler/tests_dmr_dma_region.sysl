@@ -1,0 +1,91 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `sysl.dma` (`library/dma.md`): a `Region` carries the device's address of its memory, and its
+// handover is the cache maintenance. The library's own suite proves the arithmetic on the host; what
+// it cannot see is the maintenance, since no host test observes a cache. So these build the module
+// for the machines a driver runs on and read the instructions back off llvm-objdump: on AArch64 the
+// handover is `dc civac` over the lines and `dsb sy`, with the line size read from CTR_EL0; on any
+// other processor the module still builds, and issues no maintenance at all.
+
+private dmr_tool(name: string, args: []const string) -> Option[string]
+    for d in [s"/opt/homebrew/opt/llvm/bin/$name", s"/usr/local/opt/llvm/bin/$name", name]
+        capture(d, args, "", [], true) match
+            Ok(r) -> if r.status.ok() then return Some(r.text)
+            Err(_) -> ()
+
+    None
+end dmr_tool
+
+// The disassembly of a freestanding archive built from `src` for `machine`, or `None` where there is
+// no standard module's source or no objdump to read it with.
+private dmr_disassembly(src: string, machine: string) -> Option[string]
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+
+    val dir = make_temp_dir("sysl-dmr").unwrap()
+    val main = s"$dir/main.sysl"
+    val archive = s"$dir/libk.a"
+
+    write_text(main, src).unwrap()
+
+    build_c_archive(main, Some(machine), None, "2", Some(archive), None, (m) -> ()) match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            assert(false, s"the archive did not build for $machine:\n${failure_text(why)}")
+        Ok(_) -> ()
+
+    val listing = dmr_tool("llvm-objdump", ["-d", archive])
+
+    remove_dir_all(dir).unwrap_or(())
+
+    if listing.is_none() then print("skipped: no llvm-objdump here")
+
+    listing
+end dmr_disassembly
+
+private val dmr_driver: string = raw"""
+    import sysl.dma
+
+    @export("submit")
+    submit(r: dma.Region, doorbell: *volatile u32) -> u64
+        r.to_device()
+        *doorbell = 1
+        r.bus()
+
+    @export("complete")
+    complete(r: dma.Region) -> u8
+        r.from_device()
+        r.bytes()[0]
+    """
+
+@test("on aarch64 the handover is dc civac over the lines, then dsb sy, the line read from CTR_EL0")
+dmr_aarch64_handover_is_maintenance()
+    val listing = dmr_disassembly(dmr_driver, "aarch64-freestanding")
+
+    if listing.is_none() then return
+
+    val text = listing.unwrap()
+
+    assert(text.contains("dc\tcivac, x"), s"expected dc civac in:\n$text")
+    assert(text.contains("dsb\tsy"), s"expected dsb sy in:\n$text")
+    assert(text.contains(", CTR_EL0"), s"expected a read of CTR_EL0 in:\n$text")
+end dmr_aarch64_handover_is_maintenance
+
+@test("on another processor the module builds and the handover issues no maintenance")
+dmr_riscv_handover_is_a_fence()
+    val listing = dmr_disassembly(dmr_driver, "riscv64-freestanding")
+
+    if listing.is_none() then return
+
+    val text = listing.unwrap()
+
+    assert(text.contains("<submit>:"), s"expected submit in:\n$text")
+    assert(text.contains("fence"), s"expected a fence in:\n$text")
+    assert(!text.contains("cbo."), s"expected no cache-block operation in:\n$text")
+end dmr_riscv_handover_is_a_fence

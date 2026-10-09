@@ -3,14 +3,15 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.fs.is_file
-import sysl.process.capture
+import sysl.process.{capture, Status}
 import sysl.text.Search
 import sysl.testing.skip
 
 // **An `extern` naming `main` is a start file's call into the program** (`check_main_extern`): on a
 // bare image whose manifest names an entry other than `main`, a runtime written in sysl declares
 // `extern "main"` at C's `(int, **u8) -> int` and calls it, the call reaching the `main` this program
-// defines rather than a declaration beside it. Everywhere else the name stays refused.
+// defines rather than a declaration beside it. A `build-c` archive naming an entry is a C runtime, and
+// there the same `extern` declares the C program's `main`. Everywhere else the name stays refused.
 
 private val emx_target: string = "aarch64-freestanding"
 
@@ -206,7 +207,96 @@ emx_hosted_refused_at_the_declaration()
     lbr_drop([p])
 end emx_hosted_refused_at_the_declaration
 
-@test("an archive for a bare machine is refused, its main being the C program's")
+// -- the C runtime's archive ---------------------------------------------------------------------------
+
+// A crt0 written in sysl: `_start` sets the stack, hands `crt_start` an argument count and vector, and
+// `crt_start` calls the C program's `main` and leaves through semihosting's exit, answering
+// `main`'s answer times ten plus the count.
+private val emx_crt_program: string = raw"""
+    asm
+        [aarch64]
+            ".globl _start"
+            "_start:"
+            "ldr x9, =__stack_top"
+            "mov sp, x9"
+            "mov x0, #2"
+            "adr x1, crt_argv"
+            "bl crt_start"
+            "b ."
+            ".balign 8"
+            "crt_argv: .quad crt_arg0, crt_arg1, 0"
+            "crt_arg0: .asciz \"prog\""
+            "crt_arg1: .asciz \"hello\""
+            ".balign 4"
+            ".globl crt_exit"
+            "crt_exit:"
+            "sub sp, sp, #16"
+            "mov x9, #0x26"
+            "movk x9, #2, lsl #16"
+            "stp x9, x0, [sp]"
+            "mov x1, sp"
+            "mov x0, #0x20"
+            "hlt #0xf000"
+            "b ."
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+    extern "main" program_main(argc: int, argv: **u8) -> int
+    extern crt_exit(code: int) -> never
+
+    @export("crt_start")
+    crt_start(argc: int, argv: **u8) -> never = crt_exit(program_main(argc, argv) * 10 + argc)
+    """
+
+private emx_crt_manifest(lines: string) -> string =
+    "package { name = \"crt\", version = \"0.0.1\" }\n" +
+    "codegen {\n  general_regs_only = true\n  strict_align = true\n}\n" +
+    s"targets {\n  $emx_target {\n$lines  }\n}\n"
+
+// The archive `build-c` writes of a project, and what the command said.
+private emx_archive(p: string) -> (int, string)
+    var args: [7]string = ["sysl", "build-c", "--target", emx_target, "-o", s"$p/crt.a", p]
+
+    lbr_cli(args[..])
+end emx_archive
+
+// The line of a symbol table naming `name`, or `""`.
+private emx_symbol(table: string, name: string) -> string
+    for line in lines_of(table)
+        if line.ends_with(s" $name") then return line
+
+    ""
+end emx_symbol
+
+@test("an archive naming its entry is the C runtime, and its extern declares the C program's main")
+emx_archive_with_an_entry_calls_the_c_main()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("main.sysl", emx_crt_program, "package.hocon",
+                             emx_crt_manifest("    entry = \"_start\"\n")))
+    val built = emx_archive(p)
+
+    assert(built.0 == 0, built.1)
+
+    val objdump = emx_objdump()
+
+    if objdump == "" then skip("there is no llvm-objdump to read the archive")
+
+    val table = capture(objdump, ["-t", s"$p/crt.a"], "", [], true).unwrap()
+
+    assert(table.status.ok(), table.text)
+
+    // The start is in the archive, and so is what it calls; `main` is the C program's, undefined here.
+    val start = emx_symbol(table.text, "_start")
+    val crt_start = emx_symbol(table.text, "crt_start")
+    val main = emx_symbol(table.text, "main")
+
+    assert(start != "" && !start.contains("*UND*"), table.text)
+    assert(crt_start != "" && !crt_start.contains("*UND*"), table.text)
+    assert(main.contains("*UND*"), table.text)
+    lbr_drop([p])
+end emx_archive_with_an_entry_calls_the_c_main
+
+@test("an archive for a bare machine naming no entry is refused, its main being the C program's")
 emx_archive_refused()
     if !lbr_ready() then return
 
@@ -214,14 +304,96 @@ emx_archive_refused()
         "kstart() -> int = program_main(0, null)\n"
     val p = lbr_tree(lbr_two("main.sysl", program, "package.hocon",
                              "package { name = \"arc\", version = \"0.0.1\" }\n"))
-    var args: [7]string = ["sysl", "build-c", "--target", emx_target, "-o", s"$p/probe.a", p]
-    val built = lbr_cli(args[..])
+    val built = emx_archive(p)
 
     assert(built.0 != 0, built.1)
-    assert(built.1.contains(emx_no_entry_refusal + " — and this archive has no entry of its own, so " +
-                            "'main' is the C program's"), built.1)
+    assert(built.1.contains("an 'extern' may name 'main' in an archive only where the archive is the C " +
+                            "program's runtime, whose entry calls it — and this archive names no entry " +
+                            "other than 'main', so 'main' is the C program's and nothing here starts " +
+                            "before it. A C runtime says so with 'targets.aarch64-freestanding.entry' " +
+                            "in its package.hocon, naming the symbol it starts at"), built.1)
+    assert(built.1.contains("main.sysl:1:1"), built.1)
     lbr_drop([p])
 end emx_archive_refused
+
+@test("and so is an archive whose entry is main, which is the C program's own symbol")
+emx_archive_entry_main_refused()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("main.sysl", emx_crt_program, "package.hocon",
+                             emx_crt_manifest("    entry = \"main\"\n")))
+    val built = emx_archive(p)
+
+    assert(built.0 != 0, built.1)
+    assert(built.1.contains("this archive names no entry other than 'main'"), built.1)
+    lbr_drop([p])
+end emx_archive_entry_main_refused
+
+// The C program the runtime starts: 4 where it was handed `prog hello`, 1 otherwise.
+private val emx_c_program: string =
+    "static int same(const char *a, const char *b) {\n" +
+    "    while (*a && *a == *b) { a++; b++; }\n    return *a == *b;\n}\n" +
+    "int main(int argc, char **argv) { return argc == 2 && same(argv[1], \"hello\") ? 4 : 1; }\n"
+
+private val emx_crt_script: string =
+    "ENTRY(_start)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss : { *(.bss .bss.*) *(COMMON) }\n    . = ALIGN(16);\n    . += 0x10000;\n" +
+    "    __stack_top = .;\n}\n"
+
+private emx_tool_runs(program: string) -> bool = capture(program, ["--version"], "", [], true, 10000) match
+    Ok(o) -> o.status.ok()
+    Err(_) -> false
+
+// One tool run, answering what it said where it failed.
+private emx_tool(program: string, args: []string) -> string = capture(program, args, "", [], true, 120000) match
+    Err(_) -> s"'$program' could not be started"
+    Ok(o) -> if o.status.ok() then "" else s"$program: ${o.text}${o.err.unwrap_or("")}"
+
+@test("a C program linked against the sysl runtime's archive starts at its _start and runs main")
+emx_the_c_program_runs_under_qemu()
+    if !lbr_ready() then return
+    if !emx_lld_present() then skip("ld.lld is not installed, so no image can be linked")
+    if !emx_tool_runs("qemu-system-aarch64") then skip("qemu-system-aarch64 is not installed")
+
+    val cc = find_clang(target_named(emx_target).unwrap(), None) match
+        Err(why) -> skip(s"no clang here has a back end for $emx_target: $why")
+        Ok(found) -> found
+
+    var files = lbr_two("main.sysl", emx_crt_program, "package.hocon",
+                        emx_crt_manifest("    entry = \"_start\"\n"))
+
+    files.push(("c/prog.c", emx_c_program))
+    files.push(("c/link.ld", emx_crt_script))
+
+    val p = lbr_tree(files)
+    val built = emx_archive(p)
+
+    assert(built.0 == 0, built.1)
+
+    var compile: [8]string = ["--target=aarch64-none-elf", "-ffreestanding", "-nostdlib",
+                              "-mgeneral-regs-only", "-O1", "-c", s"$p/c/prog.c", s"-o$p/prog.o"]
+    val compiled = emx_tool(cc, compile[..])
+
+    assert(compiled == "", compiled)
+
+    var link: [6]string = ["-T", s"$p/c/link.ld", s"$p/prog.o", s"$p/crt.a", "-o", s"$p/prog.elf"]
+    val linked = emx_tool("ld.lld", link[..])
+
+    assert(linked == "", linked)
+
+    var qemu: [10]string = ["-M", "virt", "-cpu", "cortex-a72", "-nographic", "-semihosting-config",
+                            "enable=on,target=native", "-kernel", s"$p/prog.elf", "-no-reboot"]
+    val ran = capture("qemu-system-aarch64", qemu[..], "", [], true, 20000).unwrap()
+
+    // 4 from `main`, seen with `prog hello`, times ten, plus the count of two.
+    val code = ran.status match
+        Exited(c) -> c
+        _ -> -1
+
+    assert_eq(code, 42, s"${ran.text}${ran.err.unwrap_or("")}")
+    lbr_drop([p])
+end emx_the_c_program_runs_under_qemu
 
 // -- the image ----------------------------------------------------------------------------------------
 

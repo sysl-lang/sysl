@@ -129,6 +129,30 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
         EvQuiet -> None
 end const_call
 
+// `ADDR.to_be()` written straight into a `const`: one of `sysl.math.ByteOrder`'s members over a value
+// that folds. The call is typed in a trial -- the receiver's width is what the reversal is at, and
+// only the typed tree knows it -- and folded at the target's order.
+const_byte_order(cx: &Analyzer, e: Expr) -> Option[Const]
+    val callee = *e.kind match
+        Call(c, args) -> if args.is_empty() then c else return None
+        _ -> return None
+
+    val op = *callee.kind match
+        Field(_, name, _) -> name
+        _ -> return None
+
+    if op != "swap_bytes" && op != "to_be" && op != "from_be" && op != "to_le" && op != "from_le"
+        return None
+
+    val typed = typed_call(cx, e, None)
+
+    if typed.is_none() then return None
+
+    *typed.unwrap().kind match
+        TIntOp(_, _, _, _, _) -> const_fold_typed(typed.unwrap(), cx.an.tables.layout.little_endian)
+        _ -> None
+end const_byte_order
+
 // A float constant whose initializer calls a `const` function, evaluated over the tree typed at the
 // constant's own type -- so a `f32` is rounded at every operation, as it would be at run time, rather
 // than worked out in `f64` the way the untyped fold works. Says nothing where it stops: the untyped
@@ -750,6 +774,7 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TArrayFill(_, _) -> refuse_form(r, e.span, "an array is not evaluated while compiling yet")
         TField(_, _, _) -> refuse_form(r, e.span, "a field is not evaluated while compiling yet")
         TIndex(_, _, _) -> refuse_form(r, e.span, "an element is not evaluated while compiling yet")
+        TIntOp(op, operand, None, width, _) -> byte_order(r, e.span, op, operand, width)
         TIntOp(op, _, _, _, _) ->
             refuse_form(r, e.span, s"'$op' is not evaluated while compiling yet")
         _ -> refuse_form(r, e.span, s"'${texpr_kind_name(e)}' is not evaluated while compiling yet")
@@ -976,6 +1001,31 @@ private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
             if is_trap_text(message) then trap(r, at, message)
             else refuse_form(r, at, s"$message is not evaluated while compiling yet")
 end cast
+
+// `sysl.math.ByteOrder`'s members, which reorder the bytes of a value already in hand -- the one
+// family of compiler-provided members a constant is computed with. The direction is the target's,
+// read off the layout every constant is folded against.
+@noinline
+private byte_order(r: &EvRun, at: Span, op: string, operand: TExpr, width: Type) -> Flow
+    val little = r.a.tables.layout.little_endian
+    val swaps = op match
+        "swap_bytes" -> true
+        "to_be" -> little
+        "from_be" -> little
+        "to_le" -> !little
+        "from_le" -> !little
+        _ -> return refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+
+    val v = eval_value(r, operand) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    v match
+        ConstInt(n) -> width match
+            Integer(bits, signed, _) -> EvGave(if swaps then ConstInt(swapped_bytes(n, bits, signed)) else v)
+            _ -> refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+        _ -> refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+end byte_order
 
 // The ends of a `within` range, as the numbers the checks compare against.
 private int_end(e: RangeEnd) -> BigInt = decimal_int(finite_end(e))

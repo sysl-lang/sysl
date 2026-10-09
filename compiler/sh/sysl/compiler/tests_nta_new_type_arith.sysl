@@ -1,0 +1,325 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A `new` type as an address or an identity (`reference/errors.md § new is what makes it a type`): a
+// bare literal takes the type where it sits, the declaration's body declares members, a `new` type
+// that checks nothing has its base's zero, and a constant may be of one. A type that checks something
+// -- a `within` range, a `where` predicate -- keeps having no zero.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private nta_root(main: string) -> string
+    val root = make_temp_dir("sysl-nta").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end nta_root
+
+// What the program printed and the status it left with; a failure to build is its message and `-1`.
+private nta_outcome(main: string) -> (string, int)
+    val root = nta_root(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end nta_outcome
+
+private nta_prints(main: string, want: string)
+    if xvr_no_library() then return
+
+    val out = nta_outcome(main)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+// Everything the analysis said about the program, or its LLVM text where it said nothing.
+private nta_said(main: string) -> string
+    val root = nta_root(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end nta_said
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private nta_refused(main: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val out = nta_said(main)
+
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end nta_refused
+
+// -- a literal takes the type ---------------------------------------------------------------------
+
+@test("a bare literal is a new type's value in arithmetic, a comparison, an initializer and a compound")
+nta_a_literal_takes_the_new_type() = nta_prints(raw"""
+    type PhysAddr = new u64
+    type Meters = new f64
+
+    val p = PhysAddr(0x4000_0000)
+    var q: Meters = 3.0
+    var m: PhysAddr = 16
+
+    m += 16
+    m++
+
+    print(u64(p + 4096), u64(4096 + p), p < 0x8000_0000, p == 0x4000_0000)
+    print(f64(q * 2.0), u64(m))
+    """, "1073745920 1073745920 true true\n6 33\n")
+
+@test("an extension at another argument list still takes a typed offset, and the literal takes the type")
+nta_an_extension_beside_the_literal() = nta_prints(raw"""
+    type PhysAddr = new u64
+
+    impl Add[u64] for PhysAddr
+        add(self, n: u64) -> PhysAddr = PhysAddr(u64(self) + n)
+
+    val p = PhysAddr(4096)
+    val n: u64 = 8
+
+    print(u64(p + n), u64(p + 8))
+    """, "4104 4104\n")
+
+@test("a literal at a new type with a range is checked as the conversion is")
+nta_a_literal_at_a_range_is_checked() = nta_prints(raw"""
+    type Slot = new u8 within 0..<8
+
+    val s: Slot = 5
+
+    print(u8(s))
+    """, "5\n")
+
+@test("and one outside the range traps, as 'Slot(9)' does")
+nta_a_literal_outside_the_range_traps()
+    if xvr_no_library() then return
+
+    val out = nta_outcome("type Slot = new u8 within 0..<8\nval s: Slot = 9\nprint(u8(s))\n")
+
+    assert_eq(out.1, 133)
+
+@test("a value that already has the base type is still a written conversion")
+nta_a_base_value_is_still_refused() = nta_refused(raw"""
+    type PhysAddr = new u64
+
+    val p = PhysAddr(1)
+    val n: u64 = 4
+
+    print(u64(p + n))
+    """, "'+' needs matching types, got PhysAddr and ulong", "6:15")
+
+@test("a literal that does not fit the base is refused at the base")
+nta_a_literal_too_wide_for_the_base() = nta_refused("type Ip = new u32\nval i: Ip = 0x1_0000_0000\nprint(u32(i))\n",
+                                                    "the literal 4294967296 does not fit uint", "2:13")
+
+// -- members --------------------------------------------------------------------------------------
+
+@test("a new type's body declares its members, and a member reaches self and other members")
+nta_members_on_a_new_type() = nta_prints(raw"""
+    type PhysAddr = new u64
+        page(self) -> u64 = u64(self) >> 12
+        plus(self, n: u64) -> PhysAddr = self + PhysAddr(n)
+        is_aligned(self) -> bool = self & 0xfff == 0
+        next_page(self) -> PhysAddr = self.plus(4096)
+
+    val p = PhysAddr(8192)
+
+    print(p.page(), u64(p.plus(4096)), p.is_aligned(), PhysAddr(8193).is_aligned(), p.next_page().page())
+    """, "2 12288 true false 3\n")
+
+@test("a generic new type's members see its parameter, and each instantiation is its own")
+nta_members_on_a_generic_new_type() = nta_prints(raw"""
+    struct Frame
+        sp: u64
+        pc: u64
+
+    type UserPtr[T] = new u64
+        next(self) -> UserPtr[T] = self + UserPtr[T](u64(sizeof(T)))
+        size(self) -> usize = sizeof(T)
+
+    val f = UserPtr[Frame](4096)
+    var z: UserPtr[u8]
+
+    print(u64(f.next()), f.size(), u64(z.next()), u64(f + 16))
+    """, "4112 16 1 4112\n")
+
+@test("only a new type has members")
+nta_a_transparent_subtype_has_no_members() = nta_refused(raw"""
+    type Age = int within 0..150
+        older(self) -> Age = self + 1
+
+    print(1)
+    """, "'Age' is not a 'new' type, so its values are int's and a member written here would be a " +
+         "member of every int — 'new' after the '=' makes it a type of its own, which may have members",
+         "1:1")
+
+@test("a new type's body holds no fields")
+nta_a_body_holds_no_fields() = nta_refused(raw"""
+    type PhysAddr = new u64
+        raw: u64
+
+    print(1)
+    """, "'PhysAddr' is its base's value and holds no fields — its body declares members, and a type " +
+         "with fields of its own is a 'struct'", "2:5")
+
+@test("a member may not take an operator's method name")
+nta_a_member_may_not_hide_an_operator() = nta_refused(raw"""
+    type Stamp = new i64
+        add(self, o: Stamp) -> Stamp = Stamp(0)
+
+    print(1)
+    """, "'add' is how 'Add' is implemented for Stamp, and the compiler provides that — a member of " +
+         "this name would hide it", "2:5")
+
+@test("two members of one name are refused as a struct's are")
+nta_two_members_of_one_name() = nta_refused(raw"""
+    type Stamp = new i64
+        f(self) -> int = 1
+        f(self) -> int = 2
+
+    print(1)
+    """, "type 'Stamp' already has a member named 'f'", "3:5")
+
+// -- zero -----------------------------------------------------------------------------------------
+
+@test("a new type that checks nothing has its base's zero, in a field, an array and a binding")
+nta_a_plain_new_type_has_a_zero() = nta_prints(raw"""
+    type Ip = new u32
+
+    struct Entry
+        valid: bool
+        ip: Ip
+
+    var table: [4]Entry
+    var none: Ip
+
+    print(u32(table[2].ip), u32(none), table[3].valid)
+    """, "0 0 false\n")
+
+@test("a new type with a range still has no zero")
+nta_a_ranged_new_type_has_no_zero() = nta_refused("type Slot = new u8 within 0..<8\nvar s: Slot\nprint(u8(s))\n",
+                                                  "Slot has no zero value, so 's' needs an initial value", "2:1")
+
+@test("and a struct holding one has none either")
+nta_a_struct_of_a_ranged_new_type_has_no_zero() = nta_refused(
+    "type Slot = new u8 within 0..<8\nstruct H\n    s: Slot\nvar h: H\nprint(1)\n",
+    "H has no zero value, so 'h' needs an initial value", "4:1")
+
+// -- constants ------------------------------------------------------------------------------------
+
+@test("a constant of a new type is its base's constant through the conversion, or a bare literal")
+nta_a_constant_of_a_new_type() = nta_prints(raw"""
+    type Ip = new u32
+    type Slot = new u8 within 0..<8
+
+    struct Frame
+        sp: u64
+
+    type UserPtr[T] = new u64
+
+    const OUR_IP: Ip = Ip(0x0a00_020f)
+    const GATEWAY: Ip = 0x0a00_0202
+    const LAST: Slot = 7
+    const NULL_FRAME: UserPtr[Frame] = 0
+
+    print(u32(OUR_IP), u32(GATEWAY), u8(LAST), u64(NULL_FRAME), OUR_IP == GATEWAY, OUR_IP == 0x0a00_020f)
+    """, "167772687 167772674 7 0 false true\n")
+
+@test("a constant of a new type folds to the number, so no code runs to fill it")
+nta_a_new_type_constant_folds() = nta_said_has(raw"""
+    type Ip = new u32
+
+    const OUR_IP: Ip = Ip(0x0a00_020f)
+
+    struct Entry
+        ip: Ip
+
+    var table: [8]Entry
+
+    table[1].ip = OUR_IP
+    print(u32(table[1].ip))
+    """, "store i32 167772687")
+
+// The keel shape: an address table in module storage of a bare-metal archive, zero-filled with no
+// initializer, and a well-known address as a constant -- nothing for a loader to run.
+@test("a freestanding archive holds a zero-filled table of a new type and a constant of one")
+nta_a_freestanding_archive_of_a_new_type()
+    if xvr_no_library() || !clang_available() then return
+
+    val root = nta_root(raw"""
+        type Ip = new u32
+
+        const OUR_IP: Ip = Ip(0x0a00_020f)
+
+        struct Entry
+            valid: bool
+            ip: Ip
+
+        var table: [8]Entry
+
+        @export("lookup")
+        lookup(i: u32) -> u32
+            table[1].ip = OUR_IP
+            u32(table[i].ip)
+        """)
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", root + "/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 0, text)
+end nta_a_freestanding_archive_of_a_new_type
+
+private nta_said_has(main: string, want: string)
+    if xvr_no_library() then return
+
+    val out = nta_said(main)
+
+    assert(!out.starts_with("error"), out)
+    assert(out.index_of(want).is_some(), s"expected '$want' in: $out")
+
+@test("a constant outside a new type's range is refused at the declaration")
+nta_a_constant_outside_the_range() = nta_refused("type Slot = new u8 within 0..<8\nconst T: Slot = Slot(9)\nprint(u8(T))\n",
+                                                 "'T' is 9, which Slot does not admit — it holds 0 to under 8",
+                                                 "2:17")
+
+@test("a constant through the conversion is held to the base's width")
+nta_a_constant_too_wide_for_the_base() = nta_refused(
+    "type Ip = new u32\nconst I: Ip = Ip(0x1_0000_0000)\nprint(u32(I))\n",
+    "'I' does not fit uint: 4294967296", "2:15")
+
+@test("a constant of a new type with a 'where' predicate is still refused")
+nta_a_predicate_constant_is_refused()
+    if xvr_no_library() then return
+
+    val out = nta_said("type Even = new int where value % 2 == 0\nconst E: Even = Even(4)\nprint(int(E))\n")
+
+    assert(out.index_of("'E' is declared Even, whose 'where' predicate is checked where a value is made").is_some(),
+           out)

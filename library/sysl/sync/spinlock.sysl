@@ -40,11 +40,32 @@ struct SpinLock
             var busy = atomic_load(&self.held, Relaxed)
 
             while busy != 0
+                spin_hint()
                 busy = atomic_load(&self.held, Relaxed)
     end lock
 
     /** Takes the lock if it is free, and answers whether it did. Never spins. */
     try_lock(*self) -> bool = atomic_swap(&self.held, 1, Acquire) == 0
+
+    /** Takes the lock, runs `body`, releases the lock, and answers what `body` answered.
+     *
+     * The form to write wherever the hold fits a block: the release cannot be forgotten or skipped
+     * by an early `return`. A spinlock hands out no address, so there is nothing to lend; `lock` and
+     * `unlock` stay for the hold a block cannot express -- one a scheduler takes on one thread and
+     * releases on the next.
+     */
+    with[R](*self, body: () -> R) -> R
+        self.lock()
+
+        defer self.unlock()
+        body()
+
+    /** The same, if the lock is free: `Some` of what `body` answered, or `None` without spinning. */
+    try_with[R](*self, body: () -> R) -> Option[R]
+        if !self.try_lock() then return None
+
+        defer self.unlock()
+        Some(body())
 
     /** Releases the lock.
      *
@@ -56,3 +77,27 @@ struct SpinLock
         atomic_store(&self.held, 0, Release)
 
 end SpinLock
+
+/** Tells the processor that the loop around this call is waiting for another processor to change
+ * something, and does nothing else.
+ *
+ * Each machine has an instruction for exactly this: `yield` on AArch64 and Thumb, `pause` on x86 and
+ * on RISC-V (Zihintpause, encoded so that a core without the extension runs it as a fence that
+ * orders nothing). A core that shares its pipeline with another hardware thread gives that thread
+ * the cycles, a hypervisor may run another virtual processor, and an x86 core stops its speculative
+ * loads from filling the pipeline it then has to flush when the line changes. It costs a handful of
+ * cycles where it means nothing, so it belongs in the body of every busy-wait — `SpinLock.lock`
+ * calls it on each round of its read-only spin.
+ *
+ * **It is not a wait.** Nothing sleeps, no event is awaited, and the loop still has to load the
+ * word it is waiting on; AArch64's `wfe`, which does sleep until the exclusive monitor sees the line
+ * change, needs that load to be a load-exclusive, which is a kernel's own loop to write. A wasm
+ * module has no such instruction, and there it is nothing at all.
+ */
+spin_hint()
+    asm
+        [x86_64, x86]      "pause"
+        [aarch64, thumb]   "yield"
+        [riscv64, riscv32] ".insn i 0x0f, 0, x0, x0, 0x010"
+        [craft]            "nop"
+        [wasm32]
