@@ -1326,18 +1326,22 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written:
     else if spec_is_float(c) then written_floating(ty)
     else ty == Str
 
-    // **C's formatting stops at a `long long`, so a wider integer has no conversion to be applied
-    // by.** The value would be widened into a slot the conversion does not read, and what came out
-    // would be the low half of it rather than a refusal — so the program is sent to `str`, which
-    // renders at the value's own width.
+    // **A specifier's conversions stop at 64 bits, as C's `long long` does**, the library's
+    // `format_int` taking the value at `i128` — so a wider integer has no conversion to be applied
+    // by, and the program is sent to `str`, which renders at the value's own width.
     if fits && spec_is_int(c)
         val bits = core_measure("width", ty)
 
         if bits.is_some() && bits.unwrap() > 64
-            return cx.err(span, s"'$spec' is applied by C's formatting, which has no conversion " +
-                          s"for the ${bits.unwrap()} bits of ${type_show(ty)} — render it with " +
-                          "'str' instead")
+            return cx.err(span, s"'$spec' converts an integer of at most 64 bits, and has no " +
+                          s"conversion for the ${bits.unwrap()} bits of ${type_show(ty)} — render " +
+                          "it with 'str' instead")
     end if
+
+    // A compilation given no standard module still types the hole; only its lowering needs the
+    // library's renderer, and `gen_format` records a gap for it there.
+    if fits && spec_is_int(c) && library_key(cx, "format_int").is_some() then
+        return int_format_call(cx, span, v, ty, spec, counts)
 
     if fits then return TExpr(span, TFormat(v, spec, counts))
 
@@ -1347,6 +1351,52 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written:
     cx.err(span, s"format '$spec' expects ${spec_expects(c)}, but the value has type " +
            type_show(ty))
 end format_call
+
+// **An integer under a specifier is rendered by the library's `format_int`, never by C's
+// `snprintf`**, so `${n}%08x` means the same on a target with no C library as on a hosted one. The
+// value crosses at `i128`, which holds any integer up to 64 bits exactly, beside the width of the
+// type it came from, which an unsigned conversion reads it at; the specifier crosses as written, and
+// a `*` in it reads the width or the precision handed over beside it.
+private int_format_call(cx: &Analyzer, span: Span, v: TExpr, ty: Type, spec: string,
+                        counts: Buf[TExpr]) -> TExpr
+    val bits = ty match
+        Integer(b, _, _) -> b
+        _ -> 32
+
+    val stars = spec_star_slots(spec)
+    var next: usize = 0
+    var args: Buf[TExpr] = buf()
+
+    args.push(TExpr(span, TCast(v, Integer(128, true, false))))
+    args.push(TExpr(span, TIntLit(from_int(long(bits)), int_type())))
+    args.push(TExpr(span, TStrLit(spec)))
+
+    if stars.0
+        args.push(counts.at(next))
+        next += 1
+    else
+        args.push(TExpr(span, TIntLit(from_int(0), int_type())))
+    end if
+
+    if stars.1 then args.push(counts.at(next))
+    else args.push(TExpr(span, TIntLit(from_int(-1), int_type())))
+
+    library_result_call_of(cx, span, "format_int", args)
+end int_format_call
+
+// Which of a specifier's two counts is a `*` read at run time: the width, the precision, or both.
+private spec_star_slots(spec: string) -> (bool, bool)
+    var width = false
+    var precision = false
+    var after_dot = false
+
+    for ch in spec.chars
+        if ch == '.' then after_dot = true
+        if ch == '*' && after_dot then precision = true
+        if ch == '*' && !after_dot then width = true
+
+    (width, precision)
+end spec_star_slots
 
 // A width or a precision computed by a hole -- the `n` in `${x}%.${n}f` -- read as the count C's
 // `*` takes.

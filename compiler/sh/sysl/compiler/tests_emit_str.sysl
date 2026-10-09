@@ -358,27 +358,21 @@ a_float_renders_through_c()
               "}\n")
 end a_float_renders_through_c
 
-@test("format with an unsigned conversion widens as unsigned and prints through a %ll form")
+// An integer conversion is the library's `format_int`, handed the value at `i128` and the width of
+// its type, which is what an unsigned conversion reads it at; C's `snprintf` is not called.
+@test("format with an integer conversion calls format_int with the value and its width")
 an_unsigned_specifier_reads_the_value_at_its_own_width()
     if no_str_library() then return
 
-    assert_eq(str_lowered(
-                  "fx(n: u32) -> string = format(n, \"%x\")\n" +
-                  "main() = prints(fx(1))\n",
-              "fx"),
-              "define { ptr, ptr, i64 } @fx(i32 %n.param) {\n" +
-              "entry:\n" +
-              "  %n.addr = alloca i32\n" +
-              "  store i32 %n.param, ptr %n.addr\n" +
-              "  %t2 = load i32, ptr %n.addr\n" +
-              "  %t3 = zext i32 %t2 to i64\n" +
-              "  %t1 = call { ptr, ptr, i64 } @sysl.str.fmt_i(ptr @.str1, i64 %t3)\n" +
-              "  %t4 = extractvalue { ptr, ptr, i64 } %t1, 0\n" +
-              "  call void @arc.retain_maybe(ptr %t4)\n" +
-              "  %t5 = extractvalue { ptr, ptr, i64 } %t1, 0\n" +
-              "  call void @arc.release_maybe(ptr %t5)\n" +
-              "  ret { ptr, ptr, i64 } %t1\n" +
-              "}\n")
+    val out = str_lowered("fx(n: u32) -> string = format(n, \"%x\")\n" +
+                          "main() = prints(fx(1))\n",
+                          "fx")
+
+    assert(out.contains("zext i32 ") && out.contains(" to i128"), out)
+    assert(out.contains("format_int"), out)
+    assert(out.contains("i32 32"), out)
+    assert(!out.contains("snprintf"), out)
+    assert(!out.contains("fmt_i"), out)
 end an_unsigned_specifier_reads_the_value_at_its_own_width
 
 @test("format of a string hands C a terminated copy so width and justification are C's")

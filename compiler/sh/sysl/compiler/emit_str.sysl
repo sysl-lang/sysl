@@ -266,19 +266,25 @@ gen_from_bytes(e: *Emit, arg: TExpr) -> Val
 end gen_from_bytes
 
 // **`format(x, spec)`** -- one value rendered through a printf specifier, into a fresh owning string.
-// A numeric value is widened and handed to `snprintf` with the C form of the specifier; a string is
-// copied NUL-terminated and handed to `snprintf` as a `%s`, so width, precision and justification
-// are C's to apply. The result is always a fresh buffer this statement owns.
+// A float is widened to a `double` and handed to `snprintf` with the specifier; a string is copied
+// NUL-terminated and handed to `snprintf` as a `%s`, so width, precision and justification are C's
+// to apply. The result is always a fresh buffer this statement owns. **An integer never arrives
+// here**: the analysis sends it to the library's `sysl.fmt.format_int` (`expr_call.sysl`'s
+// `int_format_call`), so an integer specifier needs no C library — and on a target with none, a
+// reached float or string specifier is refused (`emit_checks.sysl`'s `check_c_formatting`).
 //
 // **A count read at run time is one more `i32` before the value**, which is where C's `*` reads it,
 // and is handed to a helper of its own per number of counts -- so a specifier written out in full
 // emits exactly what it did before there were any.
 gen_format(e: *Emit, arg: TExpr, spec: string, counts: Buf[TExpr]) -> Val
+    val c = spec_conversion(spec)
+
+    if spec_is_int(c) then return gap_at(e, "an integer specifier, with no 'sysl.fmt.format_int' to render it")
+
     e.heap = true
     e.uses_snprintf = true
 
-    val c = spec_conversion(spec)
-    val fmt = string_global(e, c_format(spec))
+    val fmt = string_global(e, spec)
     val r = fresh_reg(e)
     val k = counts.len()
     val suffix = if k == 0 then "" else s".$k"
@@ -301,42 +307,14 @@ gen_format(e: *Emit, arg: TExpr, spec: string, counts: Buf[TExpr]) -> Val
         return r
     end if
 
-    if spec_is_float(c)
-        val fn = request_text(e, s"sysl.str.fmt_f$suffix",
-                              str_fmt_float_text(word_llvm_of(e), str_llvm(e), k))
-        val v = convert(e, underlying(texpr_type(arg)), real_type(), gen_expr(e, arg))
+    val fn = request_text(e, s"sysl.str.fmt_f$suffix",
+                          str_fmt_float_text(word_llvm_of(e), str_llvm(e), k))
+    val v = convert(e, underlying(texpr_type(arg)), real_type(), gen_expr(e, arg))
 
-        args.push(ir_arg(LFloat(64, false), v))
-        emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
-        return r
-    end if
-
-    // A signed conversion widens by the value's own signedness, so a decimal keeps its value; an
-    // unsigned one reads the bits as unsigned, so `%x` shows exactly the value's own width. Both end
-    // at 64 bits and print through a `%ll...`.
-    val fn = request_text(e, s"sysl.str.fmt_i$suffix",
-                          str_fmt_int_text(word_llvm_of(e), str_llvm(e), k))
-    val from = underlying(texpr_type(arg))
-    val bits = int_bits_of(from)
-    val v =
-        if spec_is_signed_int(c) then convert(e, from, Integer(64, int_signed_of(from), false), gen_expr(e, arg))
-        else
-            val unsigned = convert(e, from, Integer(bits, false, false), gen_expr(e, arg))
-
-            convert(e, Integer(bits, false, false), Integer(64, false, false), unsigned)
-
-    args.push(ir_arg(LInt(64), v))
+    args.push(ir_arg(LFloat(64, false), v))
     emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
     r
 end gen_format
-
-private int_bits_of(t: Type) -> int = t match
-    Integer(bits, _, _) -> bits
-    _ -> 32
-
-private int_signed_of(t: Type) -> bool = t match
-    Integer(_, signed, _) -> signed
-    _ -> true
 
 // -- a printf-style specifier ----------------------------------------------------------------------
 
@@ -361,9 +339,7 @@ spec_stars(spec: string) -> usize
     n
 end spec_stars
 
-spec_is_int(c: char) -> bool = one_of("diouxX", c)
-
-spec_is_signed_int(c: char) -> bool = c == 'd' || c == 'i'
+spec_is_int(c: char) -> bool = one_of("diouxXb", c)
 
 spec_is_float(c: char) -> bool = one_of("eEfgG", c)
 
@@ -428,16 +404,6 @@ private is_spec_flag(c: u8) -> bool =
 
 private is_spec_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
 
-// The C format string for the same specifier. An integer conversion is fed a 64-bit value, so its
-// conversion gains the `ll` length modifier; a float (a `double`) and a string (a C pointer) pass
-// through unchanged.
-c_format(spec: string) -> string
-    val c = spec_conversion(spec)
-
-    if !spec_is_int(c) then return spec
-
-    s"${spec[0..<(spec.bytes.len - 1)]}ll$c"
-end c_format
 
 // -- rendering into a buffer -------------------------------------------------------------------------
 

@@ -296,6 +296,92 @@ fsh_no_filesystem_no_question()
     lbr_drop([p, out])
 end fsh_no_filesystem_no_question
 
+// -- formatting with no C library ----------------------------------------------------------------------
+//
+// An integer specifier is rendered by the library's `sysl.fmt.format_int`, so a bare image formats
+// one with no `snprintf` to call; a float specifier or a `%s` over a string still needs C's, and on a
+// target with none a reached one is refused where it is written (`emit_checks.sysl`'s
+// `check_c_formatting`).
+
+// A program reading a file and saying why it could not, which reaches `IoError.message`, and
+// formatting integers under specifiers on the way.
+private val fsh_says_why: string = raw"""
+    import sysl.fs.read_text
+    import sysl.fs.sys.Stat
+
+    run() -> int = read_text("/hello.txt") match
+        Ok(s) -> int(s.bytes.len) + int(f"${s.bytes.len}%08x|${int(s.bytes.len) - 9}%+5d".bytes.len)
+        Err(e) -> int(e.message().bytes.len)
+    """
+
+@test("a freestanding program printing an IoError and integer specifiers links with no snprintf")
+fsh_io_error_message_needs_no_snprintf()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_says_why + fsh_runtime + fsh_hooks([]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    assert(!fsh_names(all, "snprintf"), "'snprintf' is in the image")
+
+    // What the program reached is in the image: the sentence an error says, and the integer renderer.
+    assert(all.contains("IoError.message"), all)
+    assert(all.contains("format_int"), all)
+
+    lbr_drop([p, out])
+end fsh_io_error_message_needs_no_snprintf
+
+@test("a freestanding program reaching a float or string specifier is refused at each, naming the target")
+fsh_c_specifier_is_refused()
+    if !lbr_ready() then return
+
+    val program = raw"""
+        run() -> int
+            val s = "ab"
+
+            int(f"${1.5}%.2f".bytes.len) + int(f"${s}%5s".bytes.len) + int(f"${7}%03d".bytes.len)
+        end run
+        """
+    val p = fsh_tree(program + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 != 0, "built with a float specifier and no C library")
+
+    for spec in ["%.2f", "%5s"]
+        assert(said.1.contains(s"'$spec' is applied by C's 'snprintf', and '$fsh_target' has no C " +
+            "library under it to supply one — only an integer specifier is rendered without C"),
+            said.1)
+
+    // The integer specifier is not one of them, and nothing reached the link.
+    assert(!said.1.contains("'%03d'"), said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end fsh_c_specifier_is_refused
+
+@test("a float specifier nothing reaches is not asked about, and the image links")
+fsh_unreached_c_specifier_builds()
+    if !fsh_link_ready() then return
+
+    val program = raw"""
+        private unused(x: real) -> string = f"${x}%.2f"
+
+        run() -> int = int(f"${42}%-6d".bytes.len)
+        """
+    val p = fsh_tree(program + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+    assert_eq(fsh_symbols(s"$out/img.elf", true).trim(), "")
+
+    lbr_drop([p, out])
+end fsh_unreached_c_specifier_builds
+
 // -- a hosted target -------------------------------------------------------------------------------------
 
 // The LLVM text of a one-file program for a hosted machine, compiled with the library's bodies lowered

@@ -1,12 +1,168 @@
-/** What an `f"…"` hole's computed width or precision comes to — `${x}%.${n}f`, `${s}%${w}s`.
+/** What an `f"…"` hole's computed width or precision comes to — `${x}%.${n}f`, `${s}%${w}s` — and
+ * what an integer under a specifier renders as — `${n}%08x`.
  *
  * A program does not call these; the compiler does, at a specifier whose width or precision is a
- * hole of its own. They read a count the way C's `*` does, which is the one rule both halves of a
- * specifier follow: a value C formats is handed the count, and a type rendering itself through
- * `Display` is handed the `FormatSpec` the same count makes.
+ * hole of its own, and at every integer conversion. They read a count the way C's `*` does, which is
+ * the one rule both halves of a specifier follow: a value C formats is handed the count, and a type
+ * rendering itself through `Display` is handed the `FormatSpec` the same count makes.
  */
 
 module sysl.fmt
+
+import sysl.text.from_utf8_unchecked
+
+/** An integer rendered through a printf specifier, written here rather than handed to C's
+ * `snprintf`, so a target with no C library formats `${n}%d` exactly as a hosted one does.
+ *
+ * `n` is the value at `i128`, which holds any integer up to 64 bits exactly, and `bits` is the width
+ * of the type it came from. `spec` is the whole specifier, `%` to conversion letter; a `*` in it
+ * reads `width` or `precision`, as C's `*` does — a negative width left-justifies at its magnitude
+ * and a negative precision is as though none was written.
+ *
+ * The rendering is C's, flag for flag: a precision is a minimum count of digits, and a precision of
+ * zero renders a zero as nothing; `0` pads with zeros after the sign and the base prefix, and gives
+ * way to `-` or to a precision; `+` and a space mark a non-negative signed value; `#` puts a leading
+ * zero on an octal and `0x`, `0X` or `0b` on a non-zero hexadecimal or binary. A signed conversion
+ * (`d`, `i`) keeps the value's sign, and an unsigned one (`u`, `o`, `x`, `X`, `b`) reads the value at
+ * its own width, so `%x` of an `i32 -1` is `ffffffff` and of a `u8 255` is `ff`.
+ */
+format_int(n: i128, bits: int, spec: string, width: int, precision: int) -> string
+    val b = spec.bytes
+    val last = b.len - 1
+    val conv = b[last]
+    var i: usize = 1
+    var left = false
+    var plus = false
+    var space = false
+    var zero = false
+    var alt = false
+
+    while i < last && is_flag(b[i])
+        if b[i] == u8('-') then left = true
+        if b[i] == u8('+') then plus = true
+        if b[i] == u8(' ') then space = true
+        if b[i] == u8('0') then zero = true
+        if b[i] == u8('#') then alt = true
+
+        i += 1
+
+    var w = 0
+
+    if i < last && b[i] == u8('*')
+        w = width
+        i += 1
+    else
+        while i < last && is_digit(b[i])
+            w = w * 10 + int(b[i] - u8('0'))
+            i += 1
+    end if
+
+    if w < 0
+        left = true
+        w = -w
+    end if
+
+    var p = -1
+
+    if i < last && b[i] == u8('.')
+        i += 1
+
+        if i < last && b[i] == u8('*')
+            p = if precision < 0 then -1 else precision
+        else
+            p = 0
+
+            while i < last && is_digit(b[i])
+                p = p * 10 + int(b[i] - u8('0'))
+                i += 1
+        end if
+    end if
+
+    val signed = conv == u8('d') || conv == u8('i')
+    val upper = conv == u8('X')
+    val base: u64 = if conv == u8('o') then 8
+    else if conv == u8('x') || conv == u8('X') then 16
+    else if conv == u8('b') then 2
+    else 10
+
+    val negative = signed && n < 0
+    val mag = if negative then u64(-n)
+    else if n < 0 then u64(n + (i128(1) << bits))
+    else u64(n)
+
+    // The digits, written from the end of room for the longest: sixty-four binary ones.
+    var digits: [64]u8 = [0; 64]
+    var at: usize = 64
+    var rest = mag
+
+    if !(mag == 0 && p == 0)
+        loop
+            val d = u8(rest % base)
+            val ten = if upper then u8('A') else u8('a')
+
+            at -= 1
+            digits[at] = if d < 10 then u8('0') + d else ten + d - 10
+            rest /= base
+
+            if rest == 0 then break
+    end if
+
+    val count = int(64 - at)
+    var zeros = if p > count then p - count else 0
+
+    if alt && base == 8 && zeros == 0 && (count == 0 || digits[at] != u8('0')) then zeros = 1
+
+    // The sign and the base's prefix, which zeros pad after and spaces pad before.
+    var head: [3]u8 = [0; 3]
+    var h: usize = 0
+
+    if negative || (signed && (plus || space))
+        head[0] = if negative then u8('-') else if plus then u8('+') else u8(' ')
+        h = 1
+    end if
+
+    if alt && mag != 0 && (base == 16 || base == 2)
+        head[h] = u8('0')
+        head[h + 1] = if base == 2 then u8('b') else conv
+        h += 2
+    end if
+
+    val body = int(h) + zeros + count
+    var pad = if w > body then w - body else 0
+
+    if zero && !left && p < 0
+        zeros += pad
+        pad = 0
+    end if
+
+    val field = from_utf8_unchecked(head[0..<h]) + run_of("0", zeros) +
+        from_utf8_unchecked(digits[at..])
+
+    if left then field + run_of(" ", pad) else run_of(" ", pad) + field
+end format_int
+
+// `n` copies of the one-byte `s`, by doubling, so a wide field costs a handful of joins. It needs no
+// buffer that could fail and report it, which is what keeps a bare target's formatting free of
+// anything it would have to supply.
+private run_of(s: string, n: int) -> string
+    var out = ""
+    var piece = s
+    var k = n
+
+    while k > 0
+        if k % 2 == 1 then out = out + piece
+
+        k /= 2
+
+        if k > 0 then piece = piece + piece
+
+    out
+end run_of
+
+private is_flag(c: u8) -> bool =
+    c == u8('-') || c == u8('+') || c == u8('0') || c == u8(' ') || c == u8('#')
+
+private is_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
 
 /** A count as the `int` C's `*` reads, saturated at `int`'s range rather than wrapped into it.
  *

@@ -545,10 +545,35 @@ print(f"${n}%s")
 format '%s' expects a string, but the value has type int
 ```
 
-`%d %i %x %X %o %u` want an integer, `%f %e %g %E %G` a float, and `%s` a string. An unsigned
+`%d %i %x %X %o %u %b` want an integer, `%f %e %g %E %G` a float, and `%s` a string. An unsigned
 conversion reads the value at its own width — `%x` of an `i32 -1` is `ffffffff`, of a `u8 255` is
-`ff` — while `%d` keeps the value's sign. A string is copied NUL-terminated so that C's `%s` can
-apply width and precision, which means an interior NUL ends the field there, as it does for any `%s`.
+`ff` — while `%d` keeps the value's sign; `%b` is binary, and `#` gives it a `0b`. A string is
+copied NUL-terminated so that C's `%s` can apply width and precision, which means an interior NUL
+ends the field there, as it does for any `%s`.
+
+```sysl
+val n: i8 = -6
+
+print(f"[${n}%+05d] [${n}%x] [${n}%#o] [${255}%#b] [${42}%-6u]")
+```
+
+```output
+[-0006] [fa] [0372] [0b11111111] [42    ]
+```
+
+**An integer conversion is rendered by sysl itself** (`sysl.fmt.format_int`), flag for flag as C
+renders it, so it works the same on a target with no C library. A float conversion and `%s` over a
+string are applied by C's `snprintf`, so on such a target a reached one is refused where it is
+written:
+
+```sysl target=aarch64-freestanding build=c
+@export("probe")
+probe(x: real) -> usize = f"${x}%.2f".bytes.len
+```
+
+```error
+'%.2f' is applied by C's 'snprintf', and 'aarch64-freestanding' has no C library under it to supply one
+```
 
 **A width or a precision may be a hole of its own**, read when the line runs — C's `%*d` and `%.*f`,
 written where the digits would go. Flags stay as they are, and either count, or both, may be a hole:
