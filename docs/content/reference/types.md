@@ -787,7 +787,9 @@ about the alias at all.
 
 When you want a genuinely distinct type — one the compiler will not let you confuse with its base —
 that is a **constrained type**, written with `new`, and it is covered under
-[contracts](/tour/contracts/).
+[contracts](/tour/contracts/). A `new` type may take type parameters that change which type it is
+and not how it is laid out — `UserPtr[Frame]` and `UserPtr[u8]` over `type UserPtr[T] = new u64` are
+two types, both a `u64` underneath ([declarations](/reference/declarations/)).
 
 ## Function types
 

@@ -474,7 +474,7 @@ down by themselves, once, in the order the files were read.
   script, the processor and sysl code reach. sysl reaches one through an `extern`.
 - **`$` is an ordinary character** — there are no operands for it to mark — and **a doubled brace
   is still a literal one**, so `push {{lr}}` means the same thing at the top of a file as inside a
-  function.
+  function. A single brace pair is a constant, below.
 - **It is never left out.** Nothing in the program names a block, so reachability has nothing to
   ask of one: every block in every file of the build is laid down, including in a `build-c` archive.
   A block in a [`@tests` file](/reference/attributes/) is scaffolding, and only a test build carries
@@ -487,6 +487,79 @@ so whatever follows is back where it was. As everywhere else the name is the tar
 the assembler gives the section its flags from that name — `.text.boot` is code — so a section of
 code is named under `.text`. `@align(n)` begins the block on an `n`-byte boundary, inside the section
 when there is one; `n` is a constant power of two. Those two are the only annotations a block takes.
+
+### A constant is written into the text
+
+There are no operands at the top of a file, but there are constants: **`{NAME}` names a `const` in
+scope, and the compiler writes its value into the instructions as a decimal number.** That is how a
+layout the assembly shares with a struct is stated once. The entry code of an exception reserves a
+frame and saves registers at its offsets; written with `sizeof` and `offsetof`, a field added to
+`Frame` moves the assembly with it:
+
+```sysl build=c target=aarch64-freestanding
+struct Frame
+    regs: [30]u64
+    elr: u64
+    spsr: u64
+
+const FRAME: usize = sizeof(Frame)
+const ELR: usize = offsetof(Frame, elr)
+
+@section(".text.vectors")
+asm
+    [aarch64]
+        ".globl trap_entry"
+        "trap_entry:"
+        "sub sp, sp, #{FRAME}"
+        "stp x0, x1, [sp]"
+        "mrs x0, elr_el1"
+        "str x0, [sp, #{ELR}]"
+        "b ."
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "this kernel boots on aarch64 only"
+
+extern "trap_entry" trap_entry()
+
+@export("kmain")
+kmain() -> int = 0
+```
+
+The assembler reads `sub sp, sp, #256` and `str x0, [sp, #240]`. **Only an integer constant is
+written** — a literal, a `const`, `sizeof`, `alignof`, `offsetof`, or the arithmetic over them,
+anything a `const` may be — and a name that is anything else is refused, in every arm. Storage has a
+value only while the program runs:
+
+```sysl target=aarch64-freestanding
+static var depth: u64 = 0
+
+asm
+    [aarch64] "mov x0, #{depth}"
+    [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+print(depth)
+```
+
+```error
+'{depth}' is not a constant: it names storage, whose value exists only while the program runs
+```
+
+A string, a `bool`, a `char` or a float is not a number the instructions can take, and a name that
+reaches nothing is most likely a brace meant for the assembler, so the refusal offers the doubled
+one:
+
+```sysl target=aarch64-freestanding
+asm
+    [aarch64] "nop"
+    [thumb] "push {lr}"
+    [x86_64, riscv64, riscv32, craft, wasm32] "nop"
+```
+
+```error
+'{lr}' names no constant: an 'asm' block at the top of a file writes a 'const' in scope as '{NAME}', and nothing here is called that. Write '{{' and '}}' for a brace the assembler is to see
+```
+
+**A symbol needs no placeholder.** A function or storage is reached by the name the linker knows —
+`b kmain` above, through `@export("kmain")`, or a label the block defines and sysl declares
+`extern` — so `{NAME}` naming one is refused with that advice rather than read as its address.
 
 **What only a block inside a function can mean is refused**, on every arm and not only on the one
 being built, since the mistake does not depend on the machine. An operand has no variable to be:
@@ -614,8 +687,65 @@ dsb(full)
 'dsb' takes one of the architecture's options written here — sy, st, ld, ish, ishst, ishld, nsh, nshst, nshld, osh, oshst, oshld — and this is not one
 ```
 
-**Every other processor refuses all five**, naming the target, so a module that uses them on AArch64
-and is also built elsewhere puts those lines behind `#if aarch64`:
+### Cache, TLB and translation maintenance
+
+Changing a translation table, or writing code into memory, takes the maintenance instructions as
+well as the barriers. Four more forms issue them:
+
+```sysl build=c target=aarch64-freestanding
+@export("remap")
+remap(entry: *u64, page: u64, va: u64) -> u64
+    dc(civac, entry)
+    dsb(ish)
+    tlbi(vae1is, page)
+    dsb(ish)
+    ic(iallu)
+    isb()
+    at(s1e1r, va)
+```
+
+- **`tlbi(op)` and `tlbi(op, value)`** invalidate TLB entries: `vmalle1` and `vmalle1is` every
+  entry, taking no operand; `vae1`, `vale1`, `aside1`, `vaae1` and `vaale1`, each also with an `is`
+  suffix for the inner shareable domain, read a `u64` packing the page number, the ASID or both, as
+  the architecture lays them out.
+- **`dc(op, addr)`** is the data cache by address: `civac`, `cvac`, `cvau`, `ivac`, and `zva`, which
+  zeroes a block.
+- **`ic(op)` and `ic(op, addr)`** are the instruction cache: `iallu` and `ialluis` invalidate it
+  whole, `ivau` by address.
+- **`at(op, va) -> u64`** asks the MMU to translate `va` — `s1e1r`, `s1e1w`, `s1e0r` or `s1e0w`, a
+  stage-1 translation as EL1 or EL0 would read or write — and answers PAR_EL1, with bit 0 set where
+  the translation faulted. It is `at`, then `isb()`, then `read_sysreg("par_el1")`, issued together
+  so the barrier the read needs cannot be left out.
+
+An address may be a `u64` or a raw pointer; `tlbi`'s operand is not an address, so it is a `u64`
+only. Each form is one block of inline assembly (LLVM has intrinsics for almost none of them), and it
+clobbers memory: **it is never moved past a load or store, and two identical ones are never merged
+into one**.
+
+The operation is a word of the instruction, written at the call as a barrier's option is, and
+whether it reads a register is the operation's. Leaving the operand off one that reads it, or adding
+one to an operation that takes none, is refused:
+
+```sysl target=aarch64-freestanding
+tlbi(vae1is)
+```
+
+```error
+'tlbi(vae1is)' takes a register operand, the u64 naming the page, the ASID or both — tlbi(vae1is, page)
+```
+
+```sysl target=aarch64-freestanding
+dc(cisw, 0)
+```
+
+```error
+'dc' takes one of the operations written here — civac, cvac, cvau, ivac, zva — and this is not one
+```
+
+### On other processors
+
+**Every other processor refuses all nine forms**, naming the target, so a module that uses them on
+AArch64 and is also built elsewhere puts those lines behind `#if aarch64`:
 
 ```sysl target=riscv64-freestanding
 print(read_sysreg("cntfrq_el0"))
@@ -625,8 +755,8 @@ print(read_sysreg("cntfrq_el0"))
 'read_sysreg' is an AArch64 instruction, and 'riscv64-freestanding' is riscv64 — put the code that uses it behind '#if aarch64'
 ```
 
-The five names are taken only where nothing else claims them: a function or a local called `isb` is
-what `isb()` calls.
+The nine names are taken only where nothing else claims them: a function or a local called `isb` or
+`at` is what `isb()` or `at(...)` calls.
 
 ## What is not here yet
 

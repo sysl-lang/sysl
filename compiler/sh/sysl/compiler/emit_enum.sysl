@@ -47,12 +47,19 @@ enum_membership(e: *Emit, en: Type, vt: Type, v: Val) -> Val
 
     if d.is_none() then return VBool(false)
 
-    val signed = vt match
-        Integer(_, s, _) -> s
-        _ -> true
+    val (vbits, signed) = vt match
+        Integer(b, s, _) -> (b, s)
+        _ -> (64, true)
+
+    // A discriminant is a signed 64-bit number, so the comparison is made where the VALUE fits as a
+    // signed number too: at 64 bits for every source that does, and wider for a `u64` -- whose top
+    // half would otherwise read as negative and match `-1` -- or a 128-bit integer, whose high bits a
+    // narrowing to 64 would throw away.
+    val room = if signed then vbits else vbits + 1
+    val w = if room <= 64 then 64 else if room <= 128 then 128 else room
 
     val vs = d.unwrap().variants
-    val wide = convert(e, vt, Integer(64, signed, false), v)
+    val wide = convert(e, vt, Integer(w, signed, false), v)
 
     // **EVERY COMPARISON IS MADE BEFORE ANY OF THEM IS FOLDED**, which is the same rule an array
     // literal and a bitfield struct are written to: the operands come first and the chain that
@@ -64,7 +71,7 @@ enum_membership(e: *Emit, en: Type, vt: Type, v: Val) -> Val
     for item in vs
         val eq = fresh_reg(e)
 
-        emit(e, InIntCmp(eq, IEq, LInt(64), wide, VInt(from_int(long(item.tag)))))
+        emit(e, InIntCmp(eq, IEq, LInt(w), wide, VInt(from_int(long(item.tag)))))
         eqs.push(eq)
 
     var any = VBool(false)
@@ -90,6 +97,21 @@ gen_enum_from_int(e: *Emit, value: TExpr, en: Type) -> Val
     convert(e, vt, ed.unwrap().underlying, v)
 end gen_enum_from_int
 
+// The receiver, field index and bit ranges of an enum field read out of a bitfield struct -- `s.ec`
+// where `ec: Ec` -- which is the one place a value of an enum's type can hold a pattern no variant
+// has. `E.try` takes such a field as it is (`member_call.sysl`'s `enum_try`) and reads its bits here.
+unchecked_field_parts(t: TExpr) -> Option[(TExpr, int, Buf[BitRange])] = *t.kind match
+    TField(receiver, index, ty) -> repr(ty) match
+        Enum(_) -> bitfield_ranges_of(texpr_type(receiver)) match
+            Some(ranges) -> Some((receiver, index, ranges))
+            None -> None
+        _ -> None
+    _ -> None
+
+// Whether `t` is such a field, of the enum `en` itself.
+unchecked_enum_field(t: TExpr, en: Type) -> bool =
+    unchecked_field_parts(t).is_some() && repr(texpr_type(t)) == repr(en)
+
 // `Colour.try(n)` — the fallible conversion. The membership test picks the branch: a match builds
 // `Some(n as Colour)` and a miss builds `None`, so the result is an ordinary `Option[Colour]` whose
 // element carries no count and whose merge slot needs no ownership bookkeeping.
@@ -100,8 +122,28 @@ gen_enum_try(e: *Emit, value: TExpr, en: Type, opt_ty: Type, some: EnumVariant,
 
     if d.is_none() || ed.is_none() then return gap_at(e, "a try whose option is not an enum")
 
-    val vt = repr(texpr_type(value))
-    val v = gen_expr(e, value)
+    // An enum field of a bitfield struct is read as its bits, unchecked: answering whether they are a
+    // variant is what was asked, so the read's own check would stop the program before the answer.
+    val (vt, v) = unchecked_field_parts(value) match
+        Some((receiver, index, ranges)) ->
+            (repr(ed.unwrap().underlying), bitfield_field_bits(e, receiver, index, ranges))
+        None -> (repr(texpr_type(value)), gen_expr(e, value))
+
+    var carried: Buf[Val] = buf()
+
+    // Where the value is already at the enum's own representation and the variants cover every
+    // pattern it can hold, there is nothing to ask: the answer is `Some`, with no test and no branch.
+    if vt == repr(ed.unwrap().underlying)
+        val bits = lty(e, vt) match
+            LInt(b) -> b
+            _ -> 64
+
+        if bits <= 64 && every_value_a_variant(ed.unwrap(), bits)
+            carried.push(v)
+            return enum_value(e, opt_ty, d.unwrap(), some, carried)
+        end if
+    end if
+
     val ok = enum_membership(e, en, vt, v)
     val slot = alloca(e, fresh_reg(e), lty(e, opt_ty))
     val some_l = fresh_label(e, "try.some")
@@ -110,9 +152,6 @@ gen_enum_try(e: *Emit, value: TExpr, en: Type, opt_ty: Type, some: EnumVariant,
 
     emit_term(e, InCondBr(ok, some_l, none_l))
     emit_label(e, some_l)
-
-    var carried: Buf[Val] = buf()
-
     carried.push(convert(e, vt, ed.unwrap().underlying, v))
     emit(e, InStore(lty(e, opt_ty), enum_value(e, opt_ty, d.unwrap(), some, carried), slot, AccPlain,
                     None))

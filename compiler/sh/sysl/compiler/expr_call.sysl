@@ -412,6 +412,19 @@ private applied_type_call(cx: &Analyzer, span: Span, bracket: Span, name: string
 
             cx.err(bracket, s"'$name' is an enum, so it is not built by calling its name — a variant " +
                    s"is what carries a value, as '$name[…].Name(…)'")
+        // `UserPtr[Frame](n)`: a `new` type at the arguments written, converted to as the type
+        // with no parameters would be.
+        TypeOf(d) ->
+            if d.tp.names.is_empty() || !is_phantom_new(d) then
+                return cx.err(span, "this is not something that can be called")
+
+            val decl = cx.an.tables.types.get(key).unwrap()
+            val made = instantiate_named_subtype(cx.an, cx.scope, bracket, name, key, d, decl.scope,
+                                                 targs)
+
+            if type_eq(made, Unknown) then return bad_expr(span)
+
+            into_subtype(cx, span, made, name, args)
         _ -> cx.err(span, "this is not something that can be called")
 end applied_type_call
 
@@ -604,7 +617,7 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
                         Some(other) -> return convert_call(cx, span, name, other, args)
                         None -> ()
 
-                return constrained_call(cx, span, tkey.unwrap(), name, args)
+                return constrained_call(cx, span, tkey.unwrap(), name, args, expected)
             _ -> ()
 
     if !shadowed
@@ -714,6 +727,8 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
 
     if null_test_form(cx, name) then return Some(null_test_call(cx, span, args))
 
+    if release_form(cx, name) then return Some(release_call(cx, span, args))
+
     None
 end special_form
 
@@ -760,6 +775,63 @@ private null_test_fault(t: Type) -> Option[string] = t match
     Unknown -> None
     other -> Some(s"'is_null' asks whether a reference names nothing, and ${type_show(other)} is " +
                   "not a reference — a '*T' is compared with 'null' directly")
+
+// `release(place)` -- the counted reference a `&T` place holds given back where it stands, and the
+// place left naming nothing, as zeroed storage does. It is `is_null`'s other half: a `&T` field in
+// storage the language did not initialise has to be emptied before the storage is freed or reused,
+// and assigning a fresh value would make one only to lose it. A function or a local of the name is
+// what a call reaches, and the form applies only where nothing else claims it.
+release_form(cx: &Analyzer, name: string) -> bool =
+    name == "release" && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
+
+// **It is an assignment of the empty reference and nothing else**, so everything an assignment owes
+// is owed here too: the place is held to being writable, the share it held is given back -- running
+// the destructor when that was the last one -- and a struct whose invariant reads the field re-checks
+// it. The type is asked about first, since a value that is no reference is the more useful thing to
+// hear about than one that has no address. What it yields is `unit`, never the emptied reference.
+private release_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 1 then
+        return cx.err(span, "'release' takes exactly one value, the place holding the reference to " +
+                      "give back")
+
+    val t = type_expr_bare(cx, args.at(0))
+    val ty = texpr_type(t)
+
+    if ty == Unknown then return bad_expr(span)
+
+    val fault = release_fault(cx, ty)
+
+    if fault.is_some() then return cx.err(span, fault.unwrap())
+
+    val place = require_place(cx, t, args.at(0), "'release'", true, Some(span))
+    var writes: Buf[TExpr] = buf()
+
+    writes.push(rechecked(cx, span, place, TExpr(span, TStore(place, TExpr(span, TZero(ty)), ty))))
+    TExpr(span, TSeq(writes))
+end release_call
+
+// What 'release' may not be given. Each of the near misses already has its own way to be emptied, and
+// the refusal names it rather than only saying what the value is not.
+private release_fault(cx: &Analyzer, t: Type) -> Option[string] = underlying(t) match
+    Ref(_, _) -> None
+    Weak(_) -> Some("'release' gives back the count a '&T' holds, and a weak reference holds none " +
+                    "to give — assign 'None' to empty it")
+    Enum(d) ->
+        if d.base == library_key("Option") then
+            return Some(s"'release' gives back what a '&T' place holds, and ${type_show(t)} is an " +
+                        "'Option' — assign 'None', which gives back what it held and allocates nothing")
+
+        not_a_reference(cx, t)
+    Unknown -> None
+    _ -> not_a_reference(cx, t)
+
+private not_a_reference(cx: &Analyzer, t: Type) -> Option[string]
+    if has_member(cx.an, t, "release") then
+        return Some(s"'release' gives back what a '&T' place holds, and ${type_show(t)} gives its " +
+                    "share back through its own member — call '.release()' on it")
+
+    Some(s"'release' gives back what a '&T' place holds, and ${type_show(t)} is not a counted " +
+         "reference — there is no share in it to give back")
 
 // `ptr_cast(p)` and `ptr_cast[T](p)` -- an address read as a pointer to some type, which is either
 // the type the position gives it or the one written in the brackets.
@@ -834,7 +906,7 @@ private is_trait_type(t: Type) -> bool = t match
 // none either, and saying so is better than reporting the name as uncallable.
 private special_form_name(cx: &Analyzer, name: string) -> bool =
     special_form_word(name) || atomic_form(cx, name) || task_form(cx, name) || slot_form(cx, name) ||
-    null_test_form(cx, name) || sysreg_form(cx, name)
+    null_test_form(cx, name) || release_form(cx, name) || sysreg_form(cx, name)
 
 // The words the compiler answers itself, the atomics aside: a form belongs to no module, so an import
 // naming one is told so rather than that the module lacks it.
@@ -1326,18 +1398,6 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string, written:
     else if spec_is_float(c) then written_floating(ty)
     else ty == Str
 
-    // **A specifier's conversions stop at 64 bits, as C's `long long` does**, the library's
-    // `format_int` taking the value at `i128` — so a wider integer has no conversion to be applied
-    // by, and the program is sent to `str`, which renders at the value's own width.
-    if fits && spec_is_int(c)
-        val bits = core_measure("width", ty)
-
-        if bits.is_some() && bits.unwrap() > 64
-            return cx.err(span, s"'$spec' converts an integer of at most 64 bits, and has no " +
-                          s"conversion for the ${bits.unwrap()} bits of ${type_show(ty)} — render " +
-                          "it with 'str' instead")
-    end if
-
     // A compilation given no standard module still types the hole; only its lowering needs the
     // library's renderer, and `gen_format` records a gap for it there.
     if fits && spec_is_int(c) && library_key(cx, "format_int").is_some() then
@@ -1363,13 +1423,23 @@ private int_format_call(cx: &Analyzer, span: Span, v: TExpr, ty: Type, spec: str
         Integer(b, _, _) -> b
         _ -> 32
 
+    val unsigned = ty match
+        Integer(_, s, _) -> !s
+        _ -> false
+
+    // A `u128` above `i128`'s maximum crosses as a negative `i128`, which a signed conversion would
+    // print with its sign; so an unsigned 128-bit value under `%d` or `%i` is rendered as `%u`.
+    val last = spec.bytes[spec.bytes.len - 1]
+    val decimal = last == u8('d') || last == u8('i')
+    val written = if unsigned && bits == 128 && decimal then spec[0..<spec.bytes.len - 1] + "u" else spec
+
     val stars = spec_star_slots(spec)
     var next: usize = 0
     var args: Buf[TExpr] = buf()
 
     args.push(TExpr(span, TCast(v, Integer(128, true, false))))
     args.push(TExpr(span, TIntLit(from_int(long(bits)), int_type())))
-    args.push(TExpr(span, TStrLit(spec)))
+    args.push(TExpr(span, TStrLit(written)))
 
     if stars.0
         args.push(counts.at(next))
@@ -1440,7 +1510,29 @@ private behind_alias(cx: &Analyzer, key: string) -> Option[Type] =
     cx.an.tables.constrained_insts.get(key)
 
 private constrained_call(cx: &Analyzer, span: Span, key: string, written: string,
-                         args: Buf[Expr]) -> TExpr
+                         args: Buf[Expr], expected: Option[Type]) -> TExpr
+    // **A `new` type with parameters takes them from where the value goes**, as a generic struct's
+    // constructor does: `val p: UserPtr[Frame] = UserPtr(n)`. With nothing there to say, the reader
+    // writes them.
+    val decl = cx.an.tables.types.get(key)
+
+    if decl.is_some()
+        decl.unwrap().kind match
+            TypeOf(d) ->
+                if !d.tp.names.is_empty() && is_phantom_new(d)
+                    val fits = expected match
+                        Some(Constrained(c)) -> c.generic == key
+                        _ -> false
+
+                    if !fits then
+                        return cx.err(span, s"'$written' takes type parameters, and nothing here " +
+                                      s"says what they are — write them, as '$written[…](…)'")
+
+                    return into_subtype(cx, span, expected.unwrap(), written, args)
+                end if
+            _ -> ()
+    end if
+
     val inst = cx.an.tables.constrained_insts.get(instance_key(key, buf()))
 
     if inst.is_none() then

@@ -391,6 +391,23 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
 
     _ -> gap_at(e, texpr_kind_name(x))
 
+// One field of a bitfield struct lifted out of its container, and nothing more: an enum field's bits
+// are not held to its variants here. `gen_field` holds them; `E.try(s.field)` answers instead.
+bitfield_field_bits(e: *Emit, receiver: TExpr, index: int, ranges: Buf[BitRange]) -> Val
+    val rty = texpr_type(receiver)
+    val acc = access_of(place_ty(receiver))
+    val ct = container_lty(ranges)
+    val at_address = has_address(receiver) && (e.layout.indirect(rty) || volatile_in(place_ty(receiver)))
+
+    val c = container_read(e, receiver, rty, ct, acc, at_address)
+
+    val s = underlying(rty) match
+        Struct(d) -> d.slot(usize(index))
+        _ -> usize(index)
+
+    read_bits(e, ranges, ranges.at(s), c)
+end bitfield_field_bits
+
 // A field read.
 //
 // A **bitfield** is read out of its container, and the container is reached the way the *receiver*
@@ -410,17 +427,7 @@ private gen_field(e: *Emit, x: TExpr, receiver: TExpr, index: int, ty: Type) -> 
 
     bitfield_ranges_of(rty) match
         Some(ranges) ->
-            val acc = access_of(place_ty(receiver))
-            val ct = container_lty(ranges)
-            val at_address = has_address(receiver) && (e.layout.indirect(rty) || volatile_in(place_ty(receiver)))
-
-            val c = container_read(e, receiver, rty, ct, acc, at_address)
-
-            val s = underlying(rty) match
-                Struct(d) -> d.slot(usize(index))
-                _ -> usize(index)
-
-            val bits = read_bits(e, ranges, ranges.at(s), c)
+            val bits = bitfield_field_bits(e, receiver, index, ranges)
 
             // An enum field is bits nothing has checked, so it is held to its variants here.
             check_variant(e, ty, bits, x.span)
@@ -1753,6 +1760,8 @@ private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
         emit(e, ir_call(None, LVoid, VGlobal(llvm_sysreg_write()), ops))
         return VNothing
 
+    if op == "tlbi" || op == "dc" || op == "ic" || op == "at" then return gen_maintenance(e, op, name, args)
+
     val symbol = llvm_aarch64_barrier_entry(op).unwrap().base
     var params: Buf[IrParam] = buf()
 
@@ -1765,6 +1774,33 @@ private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
     emit(e, ir_call(None, LVoid, VGlobal(symbol), ops))
     VNothing
 end gen_sysop
+
+// A maintenance instruction -- `tlbi`, `dc`, `ic`, `at` -- as one block of inline assembly, LLVM having
+// no intrinsic for most of them. The block is `sideeffect` and clobbers memory, so it is neither moved
+// across a load or store nor merged with an identical one beside it. `at` reads its answer out of
+// PAR_EL1 in the same block, behind the `isb` the architecture asks for before that read.
+private gen_maintenance(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
+    var ops: Buf[IrArg] = buf()
+
+    if !args.is_empty()
+        val v = gen_expr(e, args.at(0))
+
+        ops.push(ir_arg(lty(e, texpr_type(args.at(0))), v))
+
+    if op == "at"
+        val r = fresh_reg(e)
+
+        emit(e, InAsm(Some(r), LInt(64), "at " + name + ", $1\\0Aisb\\0Amrs $0, par_el1",
+                      "=r,r,~{memory}", ops))
+        return r
+
+    if ops.is_empty()
+        emit(e, InAsm(None, LVoid, op + " " + name, "~{memory}", ops))
+    else
+        emit(e, InAsm(None, LVoid, op + " " + name + ", $0", "r,~{memory}", ops))
+
+    VNothing
+end gen_maintenance
 
 // The variant a written ordering names. `SeqCst` is what an unrecognised word falls to, which cannot
 // happen: the analyzer refuses anything that is not one of the five by name, so this is the total

@@ -336,6 +336,75 @@ fsh_io_error_message_needs_no_snprintf()
     lbr_drop([p, out])
 end fsh_io_error_message_needs_no_snprintf
 
+// A program rendering integers through `sysl.fmt.hex`, `binary` and `octal` at three widths.
+private val fsh_hex_helpers: string = raw"""
+    import sysl.fmt.hex
+    import sysl.fmt.binary
+    import sysl.fmt.octal
+
+    run() -> int =
+        val big: u64 = 0xdeadbeef
+        val a = hex(big, 16, true)
+        val b = hex(i8(-1))
+        val c = binary(u16(5), 8)
+        val d = octal(i32(-8))
+        val w = u64(a.bytes.len + b.bytes.len + c.bytes.len + d.bytes.len)
+        int(f"$w%016x".bytes.len)
+    """
+
+@test("a freestanding program formatting through sysl.fmt.hex, binary and octal links with no libc symbol")
+fsh_hex_helpers_need_no_libc()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_hex_helpers + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    assert(!fsh_names(all, "snprintf"), "'snprintf' is in the image")
+    assert(all.contains("format_int"), all)
+
+    lbr_drop([p, out])
+end fsh_hex_helpers_need_no_libc
+
+// A program formatting 128-bit integers in decimal and hexadecimal, through f-string holes and the
+// helpers, whose decimal path would call a compiler-runtime division if it divided at 128 bits.
+private val fsh_wide_format: string = raw"""
+    import sysl.fmt.hex
+
+    run() -> int
+        val m: u128 = 340282366920938463463374607431768211455
+        val lo: i128 = -170141183460469231731687303715884105727 - 1
+        val a = f"$m%d"
+        val b = f"$lo%d"
+        val c = f"$m%x"
+        val d = hex(lo)
+
+        int(a.bytes.len + b.bytes.len + c.bytes.len + d.bytes.len)
+    end run
+    """
+
+@test("a freestanding program formatting 128-bit integers links with no libc and no compiler-runtime symbol")
+fsh_wide_format_needs_no_runtime()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_wide_format + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    assert(!fsh_names(fsh_symbols(elf, false), "snprintf"), "'snprintf' is in the image")
+
+    lbr_drop([p, out])
+end fsh_wide_format_needs_no_runtime
+
 @test("a freestanding program reaching a float or string specifier is refused at each, naming the target")
 fsh_c_specifier_is_refused()
     if !lbr_ready() then return
@@ -495,3 +564,121 @@ fsh_a_programs_export_is_strong()
     assert(!mine.contains(" weak "), mine)
     assert(fsh_define(text, "sysl_fs_open").starts_with("define weak "), "the library's open is not weak")
 end fsh_a_programs_export_is_strong
+
+// -- the reading surface, the walk and what is built on them ---------------------------------------------
+
+// A program reaching every call written over `stat`, `chmod`, the directory hooks, `temp_dir` and
+// `realpath`: the metadata readings, the walk and the three callers of it, the temporary directory and
+// the canonical path. These were `#if posix` though written over the hooks alone, so a bare program
+// answering every hook got an undefined name at each.
+private val fsh_reads_the_tree: string = raw"""
+    import sysl.fs.{metadata, link_metadata, set_permissions, walk, remove_dir_all, copy_dir_all}
+    import sysl.fs.{make_temp_dir, canonicalize, publish_dir}
+    import sysl.fs.sys.Stat
+
+    run() -> int
+        var n = 0
+
+        metadata("/a") match
+            Ok(m) -> if m.is_dir() then n += 1
+            Err(_) -> ()
+
+        if link_metadata("/a").is_ok() then n += 1
+        if set_permissions("/a", 0o600).is_ok() then n += 1
+
+        for item in walk("/")
+            if item.is_ok() then n += 1
+
+        if remove_dir_all("/d").is_ok() then n += 1
+        if copy_dir_all("/d", "/e").is_ok() then n += 1
+        if make_temp_dir("t").is_ok() then n += 1
+        if canonicalize("/a/../b").is_ok() then n += 1
+        if publish_dir("/p", "/q").is_ok() then n += 1
+
+        n
+    end run
+
+    // A walk indexes a `Buf`, whose bounds failure prints and exits, so the image says where a
+    // character goes and what ending the program is -- as a kernel does.
+    @export("putchar")
+    put_char(c: int) -> int = c
+
+    @export("exit")
+    stop(code: int) -> never
+        loop
+            ()
+    """
+
+@test("a freestanding program answering the hooks has metadata, the walk, remove_dir_all and canonicalize")
+fsh_reading_surface_links_freestanding()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_reads_the_tree + fsh_runtime + fsh_hooks([]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+
+    for name in ["stat", "chmod", "opendir", "readdir", "closedir", "rmdir", "unlink", "temp_dir", "realpath"]
+        assert(all.contains(s" T sysl_fs_$name"), s"'sysl_fs_$name' is not the program's: $all")
+
+    for name in ["stat", "lstat", "chmod", "opendir", "readdir", "realpath", "mkdtemp", "__errno_location",
+                 "__error", "sysl_fs_host_stat"]
+        assert(!fsh_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end fsh_reading_surface_links_freestanding
+
+@test("a hook answering -1 reaches metadata, the walk, remove_dir_all and canonicalize as 'not supported'")
+fsh_unsupported_hook_is_an_io_error()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.{metadata, link_metadata, walk, remove_dir_all, canonicalize, make_temp_dir}
+        import sysl.fs.{is_dir, remove_dir}
+        import sysl.fs.sys.Stat
+
+        @export("sysl_fs_stat")
+        no_stat(path: *u8, len: usize, follow: int, out: *Stat) -> int = -1
+
+        @export("sysl_fs_realpath")
+        no_realpath(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int = -1
+
+        val d = make_temp_dir("fsh").unwrap()
+
+        metadata(d) match
+            Ok(_) -> print("metadata answered")
+            Err(e) -> print(s"metadata: $e")
+
+        link_metadata(d) match
+            Ok(_) -> print("link_metadata answered")
+            Err(e) -> print(s"link_metadata: $e")
+
+        for item in walk(d)
+            item match
+                Ok(_) -> print("walk answered")
+                Err(e) -> print(s"walk: $e")
+
+        remove_dir_all(d) match
+            Ok(_) -> print("remove_dir_all answered")
+            Err(e) -> print(s"remove_dir_all: $e")
+
+        print(s"still there: ${is_dir(d)}")
+
+        canonicalize(d) match
+            Ok(_) -> print("canonicalize answered")
+            Err(e) -> print(s"canonicalize: $e")
+
+        print(remove_dir(d).is_ok())
+        """)
+
+    assert_eq(lbr_run(p, []),
+              "metadata: not supported on this target\nlink_metadata: not supported on this target\n" +
+              "walk: not supported on this target\nremove_dir_all: not supported on this target\n" +
+              "still there: true\ncanonicalize: not supported on this target\ntrue\n")
+    lbr_drop([p])
+end fsh_unsupported_hook_is_an_io_error

@@ -1,0 +1,281 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `release(place)`: the counted reference a `&T` place holds given back where it stands, and the
+// place left naming nothing -- what a finalizer for raw storage calls on a reference field, as it
+// calls `.release()` on a container. Every claim is about a real program built and run, at both
+// levels, since the share given back is only observable in one.
+
+// What a one-file program prints, built at `level` and run, with how it ended on the last line.
+private rrf_ran_at(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-rrf").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Signalled(n) -> s"${out.text}signal $n\n"
+            Exited(n) -> s"${out.text}exit $n\n"
+            _ -> s"${out.text}timed out\n"
+end rrf_ran_at
+
+private rrf_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end rrf_ready
+
+// The program prints `want` unoptimized and optimized alike.
+private rrf_both(text: string, want: string)
+    if !rrf_ready() then return
+
+    assert_eq(rrf_ran_at(text, "0"), want)
+    assert_eq(rrf_ran_at(text, DefaultOptimization), want)
+end rrf_both
+
+// Every diagnostic a one-file program earned, one to a line, or its emitted text when it earned none.
+private rrf_refused(text: string) -> string
+    val root = make_temp_dir("sysl-rrf").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"refused: ${why.message}"
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rrf_refused
+
+private rrf_calloc() -> string = raw"""
+    extern "calloc" c_calloc(n: usize, size: usize) -> *u8
+    extern "free" c_free(p: *u8)
+
+    struct Noisy
+        n: int
+
+    impl Drop for Noisy
+        drop(self)
+            print("drop", self.n)
+
+    struct Holder
+        r: &Noisy
+
+    """
+
+@test("releasing the last share of a reference field runs the destructor once and leaves the field empty")
+rrf_the_last_share_runs_the_destructor()
+    rrf_both(rrf_calloc() + raw"""
+        val p: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))
+        p.r = Noisy(1)
+        print("before", is_null(p.r))
+        release(p.r)
+        print("after", is_null(p.r))
+        release(p.r)
+        print("again", is_null(p.r))
+        c_free(ptr_cast(p))
+        print("freed")
+        """, "before false\ndrop 1\nafter true\nagain true\nfreed\nexit 0\n")
+end rrf_the_last_share_runs_the_destructor
+
+@test("releasing a reference field another name still shares gives back one count and runs nothing")
+rrf_another_share_keeps_the_object()
+    rrf_both(rrf_calloc() + raw"""
+        main()
+            val p: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))
+            p.r = Noisy(2)
+
+            if true
+                val keep = p.r
+                release(p.r)
+                print("released", is_null(p.r), keep.n)
+
+            print("scope gone")
+            c_free(ptr_cast(p))
+        """, "released true 2\ndrop 2\nscope gone\nexit 0\n")
+end rrf_another_share_keeps_the_object
+
+@test("a released field takes a fresh assignment, and that one is given back in its turn")
+rrf_the_emptied_field_is_reused()
+    rrf_both(rrf_calloc() + raw"""
+        val p: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))
+        p.r = Noisy(3)
+        release(p.r)
+        p.r = Noisy(4)
+        print("reused", p.r.n)
+        release(p.r)
+        c_free(ptr_cast(p))
+        print("freed")
+        """, "drop 3\nreused 4\ndrop 4\nfreed\nexit 0\n")
+end rrf_the_emptied_field_is_reused
+
+@test("a reference to a trait in raw storage is released through the table it was erased with")
+rrf_a_trait_object_field_is_released()
+    rrf_both(rrf_calloc() + raw"""
+        trait Speak
+            say(self) -> int
+
+        impl Speak for Noisy
+            say(self) -> int = self.n
+
+        struct Voices
+            v: &Speak
+
+        val p: *Voices = ptr_cast(c_calloc(1, sizeof(Voices)))
+        p.v = Noisy(5)
+        print("says", p.v.say())
+        release(p.v)
+        print("released")
+        c_free(ptr_cast(p))
+        """, "says 5\ndrop 5\nreleased\nexit 0\n")
+end rrf_a_trait_object_field_is_released
+
+@test("a local 'var' holding a reference is released where it stands and its scope gives back nothing more")
+rrf_a_local_var_is_released()
+    rrf_both(rrf_calloc() + raw"""
+        main()
+            var r: &Noisy = Noisy(6)
+            release(r)
+            print("released", is_null(r))
+        """, "drop 6\nreleased true\nexit 0\n")
+end rrf_a_local_var_is_released
+
+// -- the counted heap -----------------------------------------------------------------------------
+
+// The program built with counting on and run: what it printed on standard output and on standard error.
+private rrf_counted(text: string) -> (string, string)
+    val root = make_temp_dir("sysl-rrf").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("could not be started", "")
+        Ok(o) -> (o.text, o.err.unwrap_or(""))
+end rrf_counted
+
+private rrf_finalizer(releases: bool) -> string =
+    rrf_calloc() + raw"""
+    val p: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))
+    p.r = Noisy(7)
+    """ + (if releases then "release(p.r)\n" else "") + "c_free(ptr_cast(p))\nprint(\"done\")\n"
+
+@test("a finalizer that releases its reference field ends the counted heap at nothing live")
+rrf_the_counted_heap_ends_empty()
+    if !rrf_ready() then return
+
+    val ran = rrf_counted(rrf_finalizer(true))
+
+    assert_eq(ran.0, "drop 7\ndone\n")
+    assert(!ran.1.contains("still live"), ran.1)
+
+@test("the same finalizer freeing the storage without the release leaves the object live, and says so")
+rrf_without_the_release_the_object_leaks()
+    if !rrf_ready() then return
+
+    val ran = rrf_counted(rrf_finalizer(false))
+
+    assert_eq(ran.0, "done\n")
+    assert(ran.1.contains("counted allocations still live at exit"), ran.1)
+
+// -- what it refuses ------------------------------------------------------------------------------
+
+@test("release is refused on a value that is not a counted reference")
+rrf_a_value_is_refused()
+    if !rrf_ready() then return
+
+    val said = rrf_refused("var x = 3\nrelease(x)\n")
+
+    assert(said.contains("'release' gives back what a '&T' place holds, and int is not a counted " +
+                         "reference"), said)
+
+@test("release points a container at its own member, an Option at None, and a weak reference at None")
+rrf_the_near_misses_name_their_own_way()
+    if !rrf_ready() then return
+
+    val said = rrf_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Node
+            v: int
+
+        var b: Buf[int] = buf()
+        var o: Option[&Node] = Some(Node(1))
+        val n: &Node = Node(2)
+        var w: weak Node = n
+
+        release(b)
+        release(o)
+        release(w)
+        """)
+
+    assert(said.contains("gives its share back through its own member — call '.release()' on it"), said)
+    assert(said.contains("is an 'Option' — assign 'None'"), said)
+    assert(said.contains("a weak reference holds none to give — assign 'None' to empty it"), said)
+
+@test("release is refused on what has no address, and on a binding written once")
+rrf_a_non_place_is_refused()
+    if !rrf_ready() then return
+
+    val said = rrf_refused(raw"""
+        struct Node
+            v: int
+
+        make() -> &Node = Node(1)
+
+        val n: &Node = Node(2)
+
+        release(make())
+        release(n)
+        release()
+        """)
+
+    assert(said.contains("'release' needs a variable, a field, an element, or a dereference — " +
+                         "something with an address"), said)
+    assert(said.contains("a 'val' is written once, so 'release' has nothing to write through"), said)
+    assert(said.contains("'release' takes exactly one value, the place holding the reference to give back"),
+           said)
+
+@test("a function of the name is what a call reaches")
+rrf_a_function_named_release_wins()
+    rrf_both("release(n: int) -> int = n - 1\n\nprint(release(2))\n", "1\nexit 0\n")
