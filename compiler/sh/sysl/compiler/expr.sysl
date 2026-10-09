@@ -1004,7 +1004,7 @@ variant_homes(cx: &Analyzer, name: string) -> Buf[string]
         cx.an.tables.types.at(i).kind match
             EnumOf(ed) ->
                 if declares_variant(ed, name) && reachable_key(cx.an, key, cx.scope) &&
-                        visible_here(cx, key) then
+                        variant_visible_here(cx, key, name) then
                     homes.push(key)
 
                     if module_of(key) == cx.scope.module_name then own = true
@@ -1106,7 +1106,7 @@ private unsettled_variant(cx: &Analyzer, name: string, expected: Option[Type]) -
         cx.an.tables.types.at(i).kind match
             EnumOf(e) ->
                 if !e.tparams.is_empty() && reachable_key(cx.an, key, cx.scope) &&
-                        visible_here(cx, key)
+                        variant_visible_here(cx, key, name)
                     for j in 0..<e.variants.len()
                         if e.variants.at(j).name == name &&
                                 e.variants.at(j).fields.is_empty() then
@@ -1127,6 +1127,17 @@ visible_here(cx: &Analyzer, key: string) -> bool
 
     false
 end visible_here
+
+// Whether a bare variant name reads out of the enum `key` here: the enum's module is one this file
+// reads names out of unqualified, or the variant itself was imported by name from it --
+// `import sysl.fs.{NotFound}` makes a bare `NotFound` the `IoError` variant, with no expected type
+// needed, exactly as importing a function by name makes a bare call reach it.
+private variant_visible_here(cx: &Analyzer, key: string, name: string) -> bool
+    if visible_here(cx, key) then return true
+
+    imported_variant_enum(cx, name) match
+        Some(owner) -> owner == key
+        None -> false
 
 // -- what the compiler answers for itself --------------------------------------------------------
 
@@ -1704,7 +1715,7 @@ private generic_variant_in_reach(cx: &Analyzer, name: string, carrying: bool) ->
         cx.an.tables.types.at(i).kind match
             EnumOf(d) ->
                 if !d.tparams.is_empty() && reachable_key(cx.an, key, cx.scope) &&
-                        visible_here(cx, key)
+                        variant_visible_here(cx, key, name)
                     for j in 0..<d.variants.len()
                         if d.variants.at(j).name == name &&
                            d.variants.at(j).fields.is_empty() != carrying
