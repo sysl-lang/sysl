@@ -1,0 +1,146 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// The warning about a declaration handing back a type with a `Drop` by value, said where somebody
+// can see it: on the command line (`reference/memory.md § A constructor for a type with a destructor
+// returns &T`). The analysis has raised it all along; these hold the commands to printing it.
+//
+// **Every rendering quoted was read out of the reference** (`sysl` 0.0.162) on the same programs:
+// `run`, `build` and `emit-llvm` print each warning on standard error, one under the next with no
+// blank line between, on every compilation that succeeds; a compilation that fails says only its
+// errors.
+
+// What one command line came to: the status, each line said on the output channel, each note, and
+// the file the program was written to. The directory is removed. `None` without the library.
+private drw_run(command: string, text: string) -> Option[(int, Buf[string], Buf[string], string)]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-drw").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val file = s"$root/main.sysl"
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push(command)
+
+    // A build's executable goes inside the directory that is removed, never beside the suite.
+    if command == "build"
+        args.push("-o")
+        args.push(s"$root/main")
+    end if
+
+    args.push(file)
+
+    val code = run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    Some((code, lines, notes, file))
+end drw_run
+
+// The page's own example, with a statement for the program to run.
+private drw_encoder() -> string =
+    "struct Encoder\n    state: *u8\n\nimpl Drop for Encoder\n    drop(self) = print(\"closing\")\n\n"
+
+private drw_bad() -> string = "open_bad() -> Result[Encoder, string] = Ok(Encoder(null))"
+
+private drw_good() -> string = "open_good() -> Result[&Encoder, string] = Ok(Encoder(null))"
+
+private drw_carets(n: usize) -> string
+    var out = ""
+
+    for i in 0..<n
+        out = out + "^"
+
+    out
+end drw_carets
+
+// The whole report the reference prints for `open_bad` on line 7 of `file`.
+private drw_open_bad_report(file: string) -> string =
+    "warning: 'open_bad' hands back 'Encoder' by value, and 'Encoder' has a 'Drop' — a destructor " +
+    "runs when a box's count reaches zero, so nothing here will ever call it. Return '&Encoder' " +
+    "instead, or take the resource apart before returning it\n" +
+    s" --> $file:7:1\n  |\n7 | ${drw_bad()}\n  | ${drw_carets(drw_bad().bytes.len)}"
+
+@test("emit-llvm prints the page's warning on standard error, and the text on standard output")
+drw_emit_llvm_says_the_pages_warning()
+    drw_run("emit-llvm", drw_encoder() + drw_bad() + "\n" + drw_good() + "\nprint(1)\n") match
+        None -> ()
+        Some((code, lines, notes, file)) ->
+            assert_eq(code, Fine)
+            assert_eq(notes.len(), usize(1), s"noted ${notes.len()}")
+            assert_eq(notes.at(0), drw_open_bad_report(file))
+            assert(lines.at(0).starts_with("target triple"), lines.at(0))
+end drw_emit_llvm_says_the_pages_warning
+
+@test("a build that warns still builds, and says the warning")
+drw_build_says_the_warning()
+    drw_run("build", drw_encoder() + drw_bad() + "\n" + drw_good() + "\nprint(1)\n") match
+        None -> ()
+        Some((code, _, notes, file)) ->
+            assert_eq(code, Fine)
+
+            // A build may say other things on the same channel; the warning is said once.
+            var warned: Buf[string] = buf()
+
+            for i in 0..<notes.len()
+                if notes.at(i).starts_with("warning:") then warned.push(notes.at(i))
+
+            assert_eq(warned.len(), usize(1), s"warned ${warned.len()} of ${notes.len()}")
+            assert_eq(warned.at(0), drw_open_bad_report(file))
+end drw_build_says_the_warning
+
+@test("a constructor handing back the box says nothing")
+drw_a_boxed_return_says_nothing()
+    drw_run("emit-llvm", drw_encoder() + "\n" + drw_good() + "\nprint(1)\n") match
+        None -> ()
+        Some((code, _, notes, _)) ->
+            assert_eq(code, Fine)
+            assert_eq(notes.len(), usize(0), s"noted ${notes.len()}")
+end drw_a_boxed_return_says_nothing
+
+@test("two warnings are two notes, in source order")
+drw_two_warnings_in_source_order()
+    val text = raw"""
+        struct Thing
+            n: int
+
+        impl Drop for Thing
+            drop(self) = print("d")
+
+        make(n: int) -> Thing = Thing(n)
+
+        pair(n: int) -> (int, Thing) = (n, Thing(n))
+
+        print(1)
+        """
+
+    drw_run("emit-llvm", text) match
+        None -> ()
+        Some((code, _, notes, _)) ->
+            assert_eq(code, Fine)
+            assert_eq(notes.len(), usize(2), s"noted ${notes.len()}")
+            assert(notes.at(0).starts_with("warning: 'make' hands back 'Thing' by value"), notes.at(0))
+            assert(notes.at(1).starts_with("warning: 'pair' hands back 'Thing' by value"), notes.at(1))
+end drw_two_warnings_in_source_order
+
+@test("a compilation that fails says only its errors")
+drw_a_refused_program_says_no_warning()
+    drw_run("emit-llvm", drw_encoder() + drw_bad() + "\nval t: int = \"x\"\n") match
+        None -> ()
+        Some((code, _, notes, _)) ->
+            assert(code != Fine, "the program is refused")
+
+            for i in 0..<notes.len()
+                assert(!notes.at(i).contains("hands back"), notes.at(i))
+end drw_a_refused_program_says_no_warning
