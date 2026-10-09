@@ -2223,9 +2223,31 @@ Hold it as a `&sync Cell` and the program prints `2`. What may be reached is wha
 scalar, an `Atomic`, a `&sync T`, a raw pointer, and anything in `@thread_local` storage, which is
 one copy per thread; a `val` laid down as constant data is not asked either. Two kinds of body are
 held to it — whatever is erased into a `&sync` object (a closure, a named function read into a
-`&sync Fn`), and an `interrupt` handler, which the processor enters on top of whatever was running.
-**An `@export` is not**: it is how C enters sysl at all, almost always on the program's one thread,
-and nothing says a second domain exists.
+`&sync Fn`), and an interrupt handler, which the processor enters on top of whatever was running —
+one written in the `interrupt` convention, or an ordinary function marked
+[`@domain(interrupt)`](/reference/attributes/#domain-interrupt-a-function-entered-on-top-of-whatever-was-running),
+the shape a vector table written in assembly calls. **A bare `@export` is not**: it is how C enters
+sysl at all, almost always on the program's one thread, and nothing says a second domain exists until
+`@domain` does:
+
+```sysl build=c target=aarch64-freestanding
+struct Cell
+    n: int
+
+var shared: &Cell = Cell(1)
+
+@domain(interrupt)
+@export("on_timer")
+on_timer()
+    shared.n += 1
+```
+
+```error
+'on_timer' is entered in the 'interrupt' domain, on top of whatever was running, so every count it reaches has to be atomic — but the module storage 'shared' it reaches is a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
+```
+
+Without the annotation the same archive builds, and the race it describes is the reader's to know
+about.
 
 ### `@crossing` — where the rule is asked
 

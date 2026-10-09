@@ -220,3 +220,175 @@ ssm_interrupt_handler_is_refused()
         "it reaches has to be atomic — but the module storage 'demo.direct' it reaches is a " +
         "'&demo.Cell', " + ssm_hold())
 end ssm_interrupt_handler_is_refused
+
+// `@domain(interrupt)`: an ordinary function a vector table written in assembly calls -- the
+// aarch64 shape, where nothing about the calling convention says an interrupt enters it (keel
+// FINDINGS 38). It is a root exactly as an `interrupt` handler is.
+
+private ssm_domain_head(name: string) -> string =
+    s"'demo.$name' is entered in the 'interrupt' domain, on top of whatever was running, so every " +
+    "count it reaches has to be atomic — "
+
+private ssm_arm() -> string = "aarch64-freestanding"
+
+@test("an '@export' marked '@domain(interrupt)' reaching a counted module 'var' is refused at it")
+ssm_domain_export_is_refused()
+    if !ssm_ready() then return
+
+    assert_eq(ssm_err_on(ssm_arm(), ssm_cell() + raw"""
+        var direct: &Cell = Cell(0)
+
+        @domain(interrupt)
+        @export("disk_irq")
+        disk_irq()
+            direct.n += 1
+        """),
+        ssm_domain_head("disk_irq") + "but the module storage 'demo.direct' it reaches is a " +
+        "'&demo.Cell', " + ssm_hold())
+end ssm_domain_export_is_refused
+
+@test("the same '@export' without '@domain' is accepted, an export being the program's own domain")
+ssm_bare_export_is_accepted()
+    if !ssm_ready() then return
+
+    assert_eq(ssm_err_on(ssm_arm(), ssm_cell() + raw"""
+        var direct: &Cell = Cell(0)
+
+        @export("disk_irq")
+        disk_irq()
+            direct.n += 1
+        """), "")
+end ssm_bare_export_is_accepted
+
+@test("a '@domain(interrupt)' function is held to what it reaches through the calls it makes")
+ssm_domain_reaches_through_calls()
+    if !ssm_ready() then return
+
+    val out = ssm_err_on(ssm_arm(), ssm_cell() + raw"""
+        var direct: &Cell = Cell(0)
+
+        bump()
+            direct.n += 1
+
+        @domain(interrupt)
+        @export("disk_irq")
+        disk_irq()
+            bump()
+        """)
+
+    assert(out.starts_with(ssm_domain_head("disk_irq")), out)
+    assert(out.contains("'demo.direct'"), out)
+end ssm_domain_reaches_through_calls
+
+@test("a '@domain(interrupt)' function may reach a scalar, an 'Atomic' and a '&sync T'")
+ssm_domain_crossable_storage_is_accepted()
+    if !ssm_ready() then return
+
+    assert_eq(ssm_err_on(ssm_arm(), ssm_cell() + raw"""
+        import sysl.sync.Atomic
+
+        var done: Atomic[u32] = Atomic(0)
+        var ticks: u64 = 0
+        var shared: &sync Cell = Cell(0)
+
+        @domain(interrupt)
+        @export("disk_irq")
+        disk_irq()
+            done.store(1)
+            ticks += 1
+            shared.n += 1
+        """), "")
+end ssm_domain_crossable_storage_is_accepted
+
+@test("a waker parked in module storage and called from a '@domain(interrupt)' handler is refused with the waker's advice")
+ssm_domain_waker_is_refused()
+    if !ssm_ready() then return
+
+    assert_eq(ssm_err_on(ssm_arm(), raw"""
+        var on_complete: Option[&Fn() -> unit] = None
+
+        arm(wake: &Fn() -> unit)
+            on_complete = Some(wake)
+
+        @domain(interrupt)
+        @export("disk_irq")
+        disk_irq()
+            on_complete match
+                Some(wake) -> wake()
+                None -> ()
+
+        async read_sector(n: u64) -> u64
+            await park(arm)
+            n * 2
+        """),
+        ssm_domain_head("disk_irq") + "but the module storage 'demo.on_complete' it reaches holds a " +
+        "'&Fn() -> unit' in its 'Some(value)', whose count is not. If it holds a waker 'park' handed " +
+        "its registrar, no spelling makes that atomic: keep the waker in the executor's domain — have " +
+        "this one signal the executor, and the executor call the waker. A callback of the program's " +
+        "own is held as a '&sync Fn() -> unit' ('06')")
+end ssm_domain_waker_is_refused
+
+@test("a plain callback in module storage, with no 'park' in the program, gets the ordinary advice")
+ssm_domain_callback_without_park()
+    if !ssm_ready() then return
+
+    assert_eq(ssm_err_on(ssm_arm(), raw"""
+        var on_complete: Option[&Fn() -> unit] = None
+
+        @domain(interrupt)
+        @export("disk_irq")
+        disk_irq()
+            on_complete match
+                Some(f) -> f()
+                None -> ()
+        """),
+        ssm_domain_head("disk_irq") + "but the module storage 'demo.on_complete' it reaches holds a " +
+        "'&Fn() -> unit' in its 'Some(value)', whose count is not. Hold it as a '&sync Fn() -> unit' ('06')")
+end ssm_domain_callback_without_park
+
+@test("'@domain' names a known domain, and an unknown one is told which there are")
+ssm_domain_unknown_is_refused()
+    assert_eq(ssm_err("@domain(thread)\nworker() = ()\n"),
+              "'thread' is not a domain a function is entered in — 'interrupt' is the one there is, for a " +
+              "function a vector table or a trap stub calls on top of whatever was running. A function the " +
+              "program calls itself is in the program's own domain, and says so by not writing the annotation")
+end ssm_domain_unknown_is_refused
+
+@test("'@domain' has no empty or bare form")
+ssm_domain_empty_is_refused()
+    val bare = ssm_err("@domain\nworker() = ()\n")
+    val empty = ssm_err("@domain()\nworker() = ()\n")
+
+    assert(bare.starts_with("'@domain' names the domain a function is entered in, in parentheses"), bare)
+    assert(empty.starts_with("'@domain' names the domain a function is entered in, in parentheses"), empty)
+end ssm_domain_empty_is_refused
+
+@test("'@domain' names one domain, not a list")
+ssm_domain_list_is_refused()
+    val out = ssm_err("@domain(interrupt, interrupt)\nworker() = ()\n")
+
+    assert(out.starts_with("'@domain' names the one domain a function is entered in"), out)
+end ssm_domain_list_is_refused
+
+@test("a '@domain(interrupt)' function cannot be 'async'")
+ssm_domain_async_is_refused()
+    assert_eq(ssm_err("@domain(interrupt)\nasync on_irq() = ()\n"),
+              "a function entered in the 'interrupt' domain cannot be 'async': whatever enters it calls it " +
+              "directly, and calling an async function only makes its task, which nothing there can drive")
+end ssm_domain_async_is_refused
+
+@test("'@domain' is about a free function: a member and a struct refuse it")
+ssm_domain_on_a_member_or_struct_is_refused()
+    val member = ssm_err("struct S\n    n: int\n\n    @domain(interrupt)\n    tick(self) = ()\n")
+    val st = ssm_err("@domain(interrupt)\nstruct S\n    n: int\n")
+
+    assert(member.starts_with("the only annotations a member may carry"), member)
+    assert(st != "", st)
+end ssm_domain_on_a_member_or_struct_is_refused
+
+@test("'@domain' written twice is refused as any repeated annotation is")
+ssm_domain_twice_is_refused()
+    val out = ssm_err("@domain(interrupt)\n@domain(interrupt)\nworker() = ()\n")
+
+    assert(out.contains("'@domain' is written twice"), out)
+end ssm_domain_twice_is_refused

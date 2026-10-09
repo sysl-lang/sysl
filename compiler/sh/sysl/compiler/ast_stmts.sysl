@@ -227,12 +227,22 @@ end RecvMode
 // carry the promise to where the whole-program check reads it. It holds the word after `no_`
 // (`"alloc"`), one entry per capability the definition gives up, and is not one of the optimizer's
 // three either.
+//
+// `blocks` is `@blocks`, the other side of `@no_block`: this definition may wait -- sleep, take a
+// lock, read a device -- so every promise not to block is refused a way here (`no_block.sysl`).
+//
+// `domain` is `@domain(...)`: the concurrency domain the function is entered in, where that is not
+// the program's own -- `interrupt` for a handler a vector table written in assembly calls. It changes
+// nothing about how the function is called; it makes the function a root of that domain for every
+// check that asks what crosses one (`sharing.sysl`'s `domain_roots`).
 struct FuncMarks
     noinline: bool
     cold: bool
     inline: bool
     async_at: Option[Span]
     forgoes: Buf[string]
+    blocks: bool
+    domain: Option[string]
 
     // `@pinned` and `@pins` (`reference/attributes.md § @per_cpu`): the body runs where the core
     // cannot change under it -- because every caller already holds it there, or because the body
@@ -261,7 +271,7 @@ struct FuncMarks
 end FuncMarks
 
 // A definition nothing was said about.
-no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, false, buf())
+no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, None, false, false, buf())
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -400,6 +410,7 @@ enum Attr
     Export(attr: ExportAttr)
     Section(name: string)
     Crossing(names: Buf[string])
+    Domain(name: string)
     Borrows(names: Buf[string])
     Lends(names: Buf[string])
     Needs(caps: Buf[string])
@@ -412,6 +423,8 @@ enum Attr
     Pins
     // `@no_alloc` above a function or a method: the capability it gives up, as the word after `no_`.
     Forgoes(cap: string)
+    // `@blocks` above a function, a method or an `extern`: reaching it may wait.
+    Blocks
 end Attr
 
 // The word an attribute is written as, which is what a complaint about it names.
@@ -429,6 +442,7 @@ attr_word(a: Attr) -> string = a match
     Export(_) -> "export"
     Section(_) -> "section"
     Crossing(_) -> "crossing"
+    Domain(_) -> "domain"
     Borrows(_) -> "borrows"
     Lends(_) -> "lends"
     Needs(_) -> "needs"
@@ -440,6 +454,7 @@ attr_word(a: Attr) -> string = a match
     Pinned -> "pinned"
     Pins -> "pins"
     Forgoes(cap) -> s"no_$cap"
+    Blocks -> "blocks"
 
 // A foreign function's declaration.
 struct ExternDecl
@@ -450,6 +465,8 @@ struct ExternDecl
     link: Option[string]
     vis: Visibility
     needs: Buf[string]
+    // `@blocks` above it: the C function may wait, so a promise not to block may not reach it.
+    blocks: bool
 end ExternDecl
 
 // A struct declaration: its fields, the methods written under it, and what the attributes said.
@@ -506,7 +523,8 @@ end RangeBound
 // name a generated C header gives the type in a `typedef`. `wrapping` is where the word was written
 // in `type Acc = new i64q61 wrapping`: a fixed-point type whose arithmetic wraps rather than
 // saturates. `tp` is the bracketed parameter list a generic alias takes -- `type Pair[A, B] = (A, B)`
-// -- and is empty for every other declaration.
+// -- and is empty for every other declaration. `members` is the body indented under a `new` type,
+// which declares its methods as a struct's body does; every other declaration has none.
 struct TypeDecl
     name: string
     base: TypeRef
@@ -518,6 +536,7 @@ struct TypeDecl
     cname: Option[ExportAttr]
     wrapping: Option[Span]
     tp: TypeParams
+    members: Buf[MethodDecl]
 end TypeDecl
 
 // One associated type a trait requires: `type Item: Display`.
