@@ -83,9 +83,10 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         r
 
     TGlobal(symbol, ty, _) ->
+        val at = global_address(e, symbol)
         val r = fresh_reg(e)
 
-        emit(e, InLoad(r, lty(e, ty), VGlobal(symbol), access_of(ty), None))
+        emit(e, InLoad(r, lty(e, ty), at, access_of(ty), None))
         r
 
     TDeref(operand, ty) ->
@@ -1738,6 +1739,24 @@ end gen_fence
 
 // An AArch64 system register or barrier, as the intrinsic LLVM's back end turns into the one
 // instruction. A register travels as a metadata string; a barrier's option as its CRm encoding.
+// One read of a system register, as `read_sysreg` makes it: volatile, so two reads are two `mrs`
+// even where nothing between them looks like a write.
+read_register(e: *Emit, name: string) -> Val
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(LNamed("metadata")))
+    request_intrinsic(e, ir_sig(llvm_sysreg_read(), ir_fn_type(LInt(64), params)))
+
+    var ops: Buf[IrArg] = buf()
+
+    ops.push(ir_arg(LNamed("metadata"), VMetaString(name)))
+
+    val r = fresh_reg(e)
+
+    emit(e, ir_call(Some(r), LInt(64), VGlobal(llvm_sysreg_read()), ops))
+    r
+end read_register
+
 private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
     val wide = LInt(64)
     val meta = LNamed("metadata")

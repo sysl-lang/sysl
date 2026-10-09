@@ -47,7 +47,7 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 | [`sysl.posix.time`](/library/time/#reading-a-clock-sysl-posix-time) | the two clocks the host keeps — `now` for a wall reading, `monotonic` for measuring — the zone it is set to, and the zone database by name | `posix` |
 | [`sysl.env`](/library/env/) | the environment a program was started with — `get`, `get_or`, `is_set`, and `vars` to list it. Reading only | `os` (`vars`: `posix`) |
 | [`sysl.process`](/library/process/) | starting another program and waiting for it — `run`, `capture`, `Status`, a timeout so a child that never ends cannot hold its caller, and no shell anywhere in it | `posix` |
-| [`sysl.posix.net`](/library/net/) | blocking TCP — `resolve`, `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `shutdown`, `close`, and a timeout so a blocking call cannot wait forever | `posix` |
+| [`sysl.net`](/library/net/) | blocking TCP and UDP — `resolve`, `socket`, `udp_socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `send_to`, `recv_from`, `shutdown`, `close`, a timeout so a blocking call cannot wait forever, and addresses as values (`ipv4`, `ipv6`); answered by the program where there is no C library (`sysl.net.sys`) | `os` |
 | [`sysl.sync`](/library/sync/) | `Atomic[T]`, `SpinLock`, and the five memory orderings | — |
 | [`sysl.posix.threads`](/library/threads/) | `spawn`, `Thread.join`, `yield_now`, `Mutex[T]`, and `Channel[T]` — the bounded queue two threads hand values across | `posix` |
 | [`sysl.term`](/library/term/) | the escape sequences a terminal understands — colour, emphasis, and the screen | — |
