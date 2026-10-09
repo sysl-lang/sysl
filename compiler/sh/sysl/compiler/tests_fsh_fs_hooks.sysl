@@ -382,6 +382,62 @@ fsh_unreached_c_specifier_builds()
     lbr_drop([p, out])
 end fsh_unreached_c_specifier_builds
 
+@test("a freestanding program reaching a plain hole of a float is refused, naming the type and the target")
+fsh_float_hole_is_refused()
+    if !lbr_ready() then return
+
+    val program = raw"""
+        run() -> int
+            val x: f64 = 1.5
+
+            int(s"$x".bytes.len) + int(f"${7}%03d".bytes.len)
+        end run
+        """
+    val p = fsh_tree(program + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 != 0, "built with a float hole and no C library")
+    assert(said.1.contains("a plain hole of real is rendered by C's 'snprintf', and " +
+        s"'$fsh_target' has no C library under it to supply one — only an integer is rendered " +
+        "without C. Render the value another way: a plain hole of an integer or a string needs no C"),
+        said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end fsh_float_hole_is_refused
+
+@test("a plain float hole nothing reaches is not asked about, and the image links")
+fsh_unreached_float_hole_builds()
+    if !fsh_link_ready() then return
+
+    val program = raw"""
+        private unused(x: f64) -> string = s"$x"
+
+        run() -> int = int(f"${42}%-6d".bytes.len)
+        """
+    val p = fsh_tree(program + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+    assert_eq(fsh_symbols(s"$out/img.elf", true).trim(), "")
+
+    lbr_drop([p, out])
+end fsh_unreached_float_hole_builds
+
+@test("on a hosted target a plain float hole is unchanged: it runs and prints")
+fsh_hosted_float_hole_prints()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        val x: f64 = 1.5
+
+        print(s"v=$x")
+        """)
+
+    assert_eq(lbr_run(p, []), "v=1.5\n")
+    lbr_drop([p])
+end fsh_hosted_float_hole_prints
+
 // -- a hosted target -------------------------------------------------------------------------------------
 
 // The LLVM text of a one-file program for a hosted machine, compiled with the library's bodies lowered

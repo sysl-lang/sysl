@@ -390,7 +390,8 @@ end check_filesystem_hooks
 // to supply one.**
 //
 // An integer specifier is rendered by the library's `sysl.fmt.format_int` on every target, so what
-// still goes to C is a float conversion and a `%s` over a string, and on a freestanding target either
+// still goes to C is a float conversion -- a specifier or a plain hole of a float, which
+// `sysl.str.float` renders -- and a `%s` over a string, and on a freestanding target either
 // would otherwise surface at the link as an undefined `snprintf` named nowhere in the program's
 // source. So each one reached is refused here, at the specifier, naming it and the target. The walk
 // is the reachability one, so a specifier in a function nothing reaches is not asked about.
@@ -415,6 +416,12 @@ check_c_formatting(a: &Analysis, p: TProgram)
                             s"'$spec' is applied by C's 'snprintf', and '${t.name}' has no C library " +
                             "under it to supply one — only an integer specifier is rendered without " +
                             "C. Render the value another way: a plain hole of a string needs no C")
+                TStr(arg) ->
+                    a.fault(func_home(a, f.name), e.span,
+                            s"a plain hole of ${type_show(texpr_type(arg))} is rendered by C's " +
+                            s"'snprintf', and '${t.name}' has no C library under it to supply one — " +
+                            "only an integer is rendered without C. Render the value another way: " +
+                            "a plain hole of an integer or a string needs no C")
                 _ -> ()
     end for
 end check_c_formatting
@@ -422,7 +429,13 @@ end check_c_formatting
 private note_c_format(e: TExpr, sink: *Buf[TExpr])
     *e.kind match
         TFormat(_, _, _) -> sink.push(e)
+        TStr(arg) -> if is_float_type(texpr_type(arg)) then sink.push(e)
         _ -> ()
+
+// Whether a value of `t` is rendered through C's `snprintf` when it is a plain hole.
+private is_float_type(t: Type) -> bool = underlying(t) match
+    Floating(_, _) -> true
+    _ -> false
 
 // Whether a function of the program defines `symbol` with an `@export`.
 private exported_here(p: TProgram, symbol: string) -> bool
