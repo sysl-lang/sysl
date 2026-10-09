@@ -1,0 +1,224 @@
+module sysl.text
+@tests
+
+import sysl.{FloatField, f32_value, float_digits, real_value, write_float_field}
+import sysl.buf.{Buf, buf, byte_sink}
+
+// `x` as text: at its shortest under `s`, or under a printf conversion at a precision. This module
+// cannot import `sysl.fmt`, which imports it, so the root module's renderers are called directly.
+private written(x: real, conv: u8, prec: int) -> string
+    var sink = byte_sink()
+    var digits: [800]u8 = [0; 800]
+
+    if conv == u8('s')
+        display_real_shortest(x, &sink, FormatSpec(0, -1, false))
+    else
+        write_float_field(&sink, real_value(x), FloatField(conv, 0, prec, false, false, false, false,
+                                                           false), digits[..])
+
+    from_utf8(sink.text()).unwrap()
+end written
+
+// Reading floats back. The oracle is this host's `strtod` and `strtof`, which `real_prefix` and
+// `f32_prefix` replaced: each comparison hands both the same bytes and asks for the same value, bit
+// for bit, and the same length read.
+
+private extern "strtod" c_strtod(p: *u8, end: **u8) -> real
+private extern "strtof" c_strtof(p: *u8, end: **u8) -> f32
+
+// C's reading of `text`: the bits and how many bytes it took.
+private c_read(text: string) -> (u64, usize)
+    var b: Buf[u8] = buf()
+
+    b.extend(text.bytes)
+    b.push(0)
+
+    var end: *u8 = null
+    val p = &b.view()[0]
+    val v = c_strtod(p, &end)
+
+    (v.bits(), usize(end) - usize(p))
+end c_read
+
+private c_read_f32(text: string) -> (u32, usize)
+    var b: Buf[u8] = buf()
+
+    b.extend(text.bytes)
+    b.push(0)
+
+    var end: *u8 = null
+    val p = &b.view()[0]
+    val v = c_strtof(p, &end)
+
+    (v.bits(), usize(end) - usize(p))
+end c_read_f32
+
+// Both readings of `text` against C's, answering a description of the first disagreement.
+private disagreement(text: string) -> Option[string]
+    val want = c_read(text)
+    val got = real_prefix(text.bytes)
+
+    if got.0.bits() != want.0 || got.1 != want.1
+        return Some(f"'$text': C ${want.0}%x after ${want.1}, sysl ${got.0.bits()}%x after ${got.1}")
+
+    val want32 = c_read_f32(text)
+    val got32 = f32_prefix(text.bytes)
+
+    if got32.0.bits() != want32.0 || got32.1 != want32.1
+        return Some(f"'$text' as f32: C ${want32.0}%x after ${want32.1}, sysl ${got32.0.bits()}%x " +
+                    f"after ${got32.1}")
+    None
+end disagreement
+
+private check_all(texts: []string)
+    var bad = 0
+    var said = ""
+
+    for t in texts
+        disagreement(t) match
+            Some(d) ->
+                bad += 1
+
+                if bad <= 5 then said = said + d + " "
+            None -> ()
+
+    assert(bad == 0, s"$bad disagreements: $said")
+end check_all
+
+// A deterministic stream of 64-bit patterns (xorshift64*).
+private struct Bits
+    state: u64
+
+    next(*self) -> u64
+        self.state ^= self.state >> 12
+        self.state ^= self.state << 25
+        self.state ^= self.state >> 27
+        self.state * 0x2545f4914f6cdd1d
+end Bits
+
+@test("random doubles, written at the shortest, at seventeen digits and at twenty-five, read as C reads them")
+random_texts_match_c()
+    var g = Bits(0x243f6a8885a308d3)
+    var texts: Buf[string] = buf()
+
+    for _ in 0..<4000
+        val x = real.from_bits(g.next())
+
+        texts.push(written(x, u8('s'), 0))
+        texts.push(written(x, u8('g'), 17))
+        texts.push(written(x, u8('e'), 25))
+        texts.push(written(x, u8('g'), 6))
+
+    check_all(texts.view())
+
+// The halfway point between two adjacent floats has a finite decimal expansion, and it is exactly the
+// input on which rounding has to look at every digit: on it, the even neighbour; one digit past it
+// either way, the nearer one.
+private halfway(m: u64, e: int) -> string
+    var into: [800]u8 = [0; 800]
+    val got = float_digits(2 * m + 1, e - 1, 0, -2000, into[..])
+    val digits = from_utf8(into[0..<got.0]).unwrap()
+
+    s"0.${digits}e${got.1 + 1}"
+
+private nudged(text: string, up: bool) -> string
+    val e = text.index_of("e").unwrap()
+    val head = text[0..<e]
+
+    if up then head + "0000000000000000000001" + text[e..] else nudge_down(head) + text[e..]
+
+// The decimal one unit lower in its last place, its last digit never zero.
+private nudge_down(head: string) -> string
+    val last = head.bytes[head.bytes.len - 1]
+
+    head[0..<head.bytes.len - 1] + str(char(u32(last) - 1)) + "9999999999999999999"
+
+@test("a decimal exactly half way between two doubles, and a hair either side, rounds as C rounds it")
+halfway_points_match_c()
+    var g = Bits(99)
+    var texts: Buf[string] = buf()
+
+    for _ in 0..<1500
+        val v = real_value(real.from_bits(g.next() >> 1))
+
+        if v.kind != Finite then continue
+
+        val h = halfway(v.m, v.e)
+
+        texts.push(h)
+        texts.push(nudged(h, true))
+        texts.push(nudged(h, false))
+
+    check_all(texts.view())
+end halfway_points_match_c
+
+@test("a decimal half way between two f32s rounds once, to the even one")
+f32_halfway_points_match_c()
+    var g = Bits(4242)
+    var texts: Buf[string] = buf()
+
+    for _ in 0..<3000
+        val v = f32_value(f32.from_bits(u32(g.next() >> 33)))
+
+        if v.kind != Finite then continue
+
+        val h = halfway(v.m, v.e)
+
+        texts.push(h)
+        texts.push(nudged(h, true))
+        texts.push(nudged(h, false))
+
+    check_all(texts.view())
+end f32_halfway_points_match_c
+
+// Eisel and Lemire's hard cases and the ones fast_float carries, with the classic
+// strtod-breakers: a value that once hung Java and PHP, the edges of the subnormal range, and long
+// digit strings whose last digit decides the answer.
+@test("the classic hard inputs read as C reads them")
+classic_inputs_match_c()
+    check_all(["2.2250738585072011e-308", "2.2250738585072012e-308", "2.2250738585072014e-308",
+        "4.9406564584124654e-324", "2.4703282292062327e-324", "2.4703282292062328e-324",
+        "1.7976931348623157e308", "1.7976931348623158e308", "1.7976931348623159e308", "1e308",
+        "1e309", "1e-400", "1e-323", "9007199254740993", "9007199254740993.0000000000000000001",
+        "9007199254740992.9999999999999999999", "1.00000000000000011102230246251565404236316680908203125",
+        "1.00000000000000011102230246251565404236316680908203124",
+        "1.00000000000000011102230246251565404236316680908203126",
+        "7.3177701707893310e+15", "3.0e-44", "1.4e-45", "7.0e-46", "7.1e-46", "3.4028235e38",
+        "3.40282357e38", "3.4028236e38", "1.17549435e-38", "0.1", "0.2", "0.3", "1e23", "8.589973e9",
+        "4.951760157141521e+27", "5.e-324", "123456789012345678901234567890",
+        "1.234567890123456789012345678901234567890e-10", "0.000000000000000000000000000001",
+        "18446744073709551615", "18446744073709551616", "1e22", "1e23", "9.5e-5", "6.2e-8",
+        "-0", "+0", "0e999999", "0.0e-999999", "1e-99999999999", "1e99999999999", "-1e-400"])
+
+    val long = "0." + repeat("1", 800)
+    val nines = "9." + repeat("9", 900) + "e-308"
+
+    check_all([long, nines, repeat("1", 400), repeat("1", 400) + "e-450",
+               "0." + repeat("0", 340) + "247032822920623272", "2." + repeat("0", 1000) + "1"])
+end classic_inputs_match_c
+
+@test("the grammar is strtod's, and so is where the reading stops")
+grammar_matches_c()
+    check_all(["", " ", "x", ".", "+", "-", "+.", ".e1", "1.", ".5", "+.5", "-1.5e3xyz", "  \t\n42",
+        "1e", "1e+", "1e-x", "1.5x", "inf", "INF", "infinity", "Infinity", "infin", "-inf", "nan",
+        "NaN", "nan(123)", "nan(abc_9)", "nan(0x10)", "nan(017)", "nan(0x)", "nan()", "nan(", "nan(x", "-nan", "0x", "0x1", "0x1p", "0x1p3",
+        "0x1.8p3", "0X1.8P-3", "0x.8p1", "0x1p-1074", "0x1p-1075", "0x1.0000000000001p-1075",
+        "0x1.fffffffffffff8p1023", "0x1.fffffffffffff7p1023", "0x123456789abcdef0123p0",
+        "0x1.000000000000080000001p0", "0x1.00000000000008p0", "0x1.00000000000018p0", "0xg",
+        "00012", "0.00012e+3", "12e-2", "1_000", "١", "1.2.3", "1e5e5"])
+
+@test("parse_real and parse_f32 refuse what is left over, and read an f32 once rounded")
+parse_strictly()
+    assert_eq(parse_real("1.5").unwrap(), 1.5)
+    assert_eq(str(parse_real("1.5x").unwrap_err()), "not a digit at byte 3")
+    assert_eq(str(parse_real("").unwrap_err()), "no digits to read")
+    assert_eq(str(parse_real("x").unwrap_err()), "not a digit at byte 0")
+    assert_eq(parse_real("1e999").unwrap(), real.infinity)
+    assert_eq(parse_f32("0.1").unwrap(), f32(0.1))
+    assert_eq(parse_f32("3.4028236e38").unwrap(), f32(real.infinity))
+    assert_eq(str(parse_f32("1.5 ").unwrap_err()), "not a digit at byte 3")
+
+    // 1 + 2^-24 + 2^-60 lies just above half way between two f32s; through a real it would round to
+    // the half way point first and then to the even f32, which is the wrong one.
+    assert_eq(parse_f32("1.00000005960464477550").unwrap().bits(), 0x3f800001)
+end parse_strictly

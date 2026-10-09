@@ -927,13 +927,11 @@ targets {
 }
 ```
 
-What it makes legal is **C's own functions** and nothing more. A float conversion, a `%s` and a plain
-hole of a float are rendered by C's `snprintf`, so without the capability each one a program reaches
-is refused where it is written ([formatted strings](/reference/strings/)); with it they build, and
-`snprintf` is left for the board's link to find. The same goes for storage aligned beyond what the
-allocating pair promises: where `libc` stands and the pair is libc's own, `sysl_alloc_aligned` and
-`sysl_free_aligned` default to `posix_memalign` and `free`; where it does not, the program defines
-them.
+What it makes legal is **C's own functions** and nothing more. Text needs no C library either way:
+every [formatted string](/reference/strings/) specifier, and every integer and float written or read,
+is rendered in sysl. What it does decide is storage aligned beyond what the allocating pair promises:
+where `libc` stands and the pair is libc's own, `sysl_alloc_aligned` and `sysl_free_aligned` default
+to `posix_memalign` and `free`; where it does not, the program defines them.
 
 **It is not an operating system**, and the library's hooks are about one. newlib's `read` and `fopen`
 are stubs a board answers, not a filesystem, so a program reaching [`sysl.fs`](/library/fs/) or

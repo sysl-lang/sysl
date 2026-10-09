@@ -298,10 +298,9 @@ end fsh_no_filesystem_no_question
 
 // -- formatting with no C library ----------------------------------------------------------------------
 //
-// An integer specifier is rendered by the library's `sysl.fmt.format_int`, so a bare image formats
-// one with no `snprintf` to call; a float specifier or a `%s` over a string still needs C's, and on a
-// target with none a reached one is refused where it is written (`emit_checks.sysl`'s
-// `check_c_formatting`).
+// Every specifier is rendered by the library -- an integer one by `sysl.fmt.format_int`, a `%s` by
+// `format_str`, a float in every form by `format_real` and `format_f32` -- so a bare image formats
+// anything with no `snprintf` to call, and no specifier is refused for want of a C library.
 
 // A program reading a file and saying why it could not, which reaches `IoError.message`, and
 // formatting integers under specifiers on the way.
@@ -405,9 +404,9 @@ fsh_wide_format_needs_no_runtime()
     lbr_drop([p, out])
 end fsh_wide_format_needs_no_runtime
 
-@test("a freestanding program reaching a float specifier is refused at it, naming the target")
-fsh_c_specifier_is_refused()
-    if !lbr_ready() then return
+@test("a freestanding program reaching a float, a string and an integer specifier links with no snprintf")
+fsh_every_specifier_needs_no_libc()
+    if !fsh_link_ready() then return
 
     val program = raw"""
         run() -> int
@@ -415,83 +414,88 @@ fsh_c_specifier_is_refused()
 
             int(f"${1.5}%.2f".bytes.len) + int(f"${s}%5s".bytes.len) + int(f"${7}%03d".bytes.len)
         end run
-        """
-    val p = fsh_tree(program + fsh_runtime)
-    val (said, out) = fsh_build(p)
 
-    assert(said.0 != 0, "built with a float specifier and no C library")
+        // The text is written into a `Buf`, whose report of a container never given storage prints
+        // and exits, so the image says where a character goes and what ending the program is.
+        @export("putchar")
+        put_char(c: int) -> int = c
 
-    assert(said.1.contains(s"'%.2f' is applied by C's 'snprintf', and '$fsh_target' has no C " +
-        "library under it to supply one — only an integer or a string specifier is rendered " +
-        "without C"), said.1)
-
-    // The integer and the string specifier are not refused, and nothing reached the link.
-    assert(!said.1.contains("'%03d'"), said.1)
-    assert(!said.1.contains("'%5s'"), said.1)
-    assert(!said.1.contains("undefined symbol"), said.1)
-
-    lbr_drop([p, out])
-end fsh_c_specifier_is_refused
-
-@test("a float specifier nothing reaches is not asked about, and the image links")
-fsh_unreached_c_specifier_builds()
-    if !fsh_link_ready() then return
-
-    val program = raw"""
-        private unused(x: real) -> string = f"${x}%.2f"
-
-        run() -> int = int(f"${42}%-6d".bytes.len)
+        @export("exit")
+        stop(code: int) -> never
+            loop
+                ()
         """
     val p = fsh_tree(program + fsh_runtime)
     val (said, out) = fsh_build(p)
 
     assert(said.0 == 0, said.1)
-    assert_eq(fsh_symbols(s"$out/img.elf", true).trim(), "")
+    assert(!said.1.contains("is applied by C's 'snprintf'"), said.1)
+
+    val elf = s"$out/img.elf"
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    assert(!fsh_names(fsh_symbols(elf, false), "snprintf"), "'snprintf' is in the image")
 
     lbr_drop([p, out])
-end fsh_unreached_c_specifier_builds
+end fsh_every_specifier_needs_no_libc
 
-@test("a freestanding program reaching a plain hole of a float is refused, naming the type and the target")
-fsh_float_hole_is_refused()
-    if !lbr_ready() then return
+// A program turning floats into text every way there is, and text back into floats: a specifier at
+// each width, a plain hole, `str` and a parse at each width.
+private val fsh_floats: string = raw"""
+    import sysl.text.{parse_f32, parse_real}
 
-    val program = raw"""
-        run() -> int
-            val x: f64 = 1.5
+    run() -> int
+        val x: f64 = 1.5
+        val y: f32 = 0.25
+        val back = parse_real("2.5e-3") match
+            Ok(v) -> v
+            Err(_) -> 0.0
+        val narrow = parse_f32("0.1") match
+            Ok(v) -> v
+            Err(_) -> f32(0.0)
+        val text = f"${x}%.3f ${y}%e ${back}%g" + s" $x $y " + str(narrow)
 
-            int(s"$x".bytes.len) + int(f"${7}%03d".bytes.len)
-        end run
-        """
-    val p = fsh_tree(program + fsh_runtime)
-    val (said, out) = fsh_build(p)
+        int(text.bytes.len)
+    end run
 
-    assert(said.0 != 0, "built with a float hole and no C library")
-    assert(said.1.contains("a plain hole of real is rendered by C's 'snprintf', and " +
-        s"'$fsh_target' has no C library under it to supply one — only an integer is rendered " +
-        "without C. Render the value another way: a plain hole of an integer or a string needs no C"),
-        said.1)
-    assert(!said.1.contains("undefined symbol"), said.1)
+    // The digits are written into a `Buf`, whose report of a container never given storage prints
+    // and exits, so the image says where a character goes and what ending the program is -- as a
+    // kernel does.
+    @export("putchar")
+    put_char(c: int) -> int = c
 
-    lbr_drop([p, out])
-end fsh_float_hole_is_refused
+    @export("exit")
+    stop(code: int) -> never
+        loop
+            ()
+    """
 
-@test("a plain float hole nothing reaches is not asked about, and the image links")
-fsh_unreached_float_hole_builds()
+@test("a freestanding program rendering and reading floats links with no snprintf and no strtod")
+fsh_floats_need_no_libc()
     if !fsh_link_ready() then return
 
-    val program = raw"""
-        private unused(x: f64) -> string = s"$x"
-
-        run() -> int = int(f"${42}%-6d".bytes.len)
-        """
-    val p = fsh_tree(program + fsh_runtime)
+    val p = fsh_tree(fsh_floats + fsh_runtime)
     val (said, out) = fsh_build(p)
 
     assert(said.0 == 0, said.1)
-    assert_eq(fsh_symbols(s"$out/img.elf", true).trim(), "")
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+
+    for c in ["snprintf", "strtod", "strtof"]
+        assert(!fsh_names(all, c), s"'$c' is in the image")
+
+    // What the program reached is in the image: the renderer both widths share and the two readers.
+    // (`format_f32` is a one-line wrapper over the shared `float_text` and is inlined into its caller,
+    // so it is not asked for by name.)
+    assert(all.contains("float_text"), all)
+    assert(all.contains("real_prefix"), all)
+    assert(all.contains("f32_prefix"), all)
 
     lbr_drop([p, out])
-end fsh_unreached_float_hole_builds
+end fsh_floats_need_no_libc
 
 @test("on a hosted target a plain float hole is unchanged: it runs and prints")
 fsh_hosted_float_hole_prints()

@@ -151,8 +151,8 @@ Without one the two are the same, which is the common case and stays the default
 exists because **a symbol's spelling belongs to whoever exported it**: it may be shaped nothing like
 sysl, it may be a name the program wants for something of its own, and — the case that forced it —
 a declaration in the *library* would otherwise spend that name out of every program's namespace. The
-standard library renders integers and floats through `snprintf`, and a program that declares
-`snprintf` itself must not collide with it.
+standard library writes through `putchar` on a board, and a program that declares `putchar` itself
+must not collide with it.
 
 The case where nothing else would do at all is a header macro. What C calls `stdout` is a `#define`,
 and the symbol behind it is `__stdoutp` on Darwin and `stdout` elsewhere — so `extern "__stdoutp"

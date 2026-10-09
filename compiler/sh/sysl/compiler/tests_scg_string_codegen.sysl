@@ -270,15 +270,16 @@ scg_rendering_a_char_goes_through_the_encoder()
     assert(out.contains("call ptr @sysl.utf8(i32 %cp, ptr %buf)"), out)
     assert(out.contains("define private ptr @sysl.utf8"), out)
 
-@test("rendering a float matches print's %g through snprintf")
-scg_rendering_a_float_goes_through_snprintf()
+@test("str of a float is the library's format_real under %g, with no snprintf")
+scg_rendering_a_float_goes_through_format_real()
     if xvr_no_library() then return
 
     val out = scg_ir("print(str(1.5))\n")
 
-    assert(out.contains("define private { ptr, ptr, i64 } @sysl.str.float"), out)
-    assert(out.contains("declare i32 @snprintf(ptr, i64, ptr, ...)"), out)
+    assert(out.contains("format_real"), out)
     assert(out.contains("c\"%g\\00\""), out)
+    assert(!out.contains("@sysl.str.float"), out)
+    assert(!out.contains("@snprintf"), out)
 
 @test("a module that never renders a value emits no str helpers")
 scg_no_rendering_no_str_helpers()
@@ -313,14 +314,26 @@ scg_integer_hole_widens_by_its_own_signedness()
     assert(scg_has(unsigned, "zext i32 %t# to i128"), unsigned)
     assert(signed.contains("i32 32"), signed)
 
-@test("a float format passes the double straight through its specifier")
+@test("a float format is the library's format_real, the double and the specifier handed straight over")
 scg_a_float_format_passes_the_double_through()
     if xvr_no_library() then return
 
     val out = scg_ir("var x = 1.5\nprint(f\"${x}%.2f\")\n")
 
     assert(out.contains("c\"%.2f\\00\""), out)
-    assert(scg_has(out, "call { ptr, ptr, i64 } @sysl.str.fmt_f(ptr @.str#, double %t#)"), out)
+    assert(out.contains("format_real"), out)
+    assert(!out.contains("@sysl.str.fmt_f"), out)
+    assert(!out.contains("@snprintf"), out)
+
+@test("an f32 hole is the library's format_f32, at its own width, with no fpext")
+scg_an_f32_hole_stays_single()
+    if xvr_no_library() then return
+
+    val out = scg_ir("var x: f32 = 1.5\nprint(f\"${x}%.3e and $x\")\n")
+
+    assert(out.contains("format_f32"), out)
+    assert(!out.contains("fpext"), out)
+    assert(!out.contains("@snprintf"), out)
 
 @test("a string format is the library's format_str, not a copy handed to snprintf")
 scg_a_string_format_is_format_str()
@@ -332,13 +345,14 @@ scg_a_string_format_is_format_str()
     assert(out.contains("$format_str("), out)
     assert(!out.contains("@sysl.str.fmt_s"), out)
 
-@test("snprintf is declared once even when a float str and a format share it")
-scg_snprintf_is_declared_once()
+@test("a float str and a float format share the library's renderer and declare no snprintf")
+scg_float_str_and_format_declare_no_snprintf()
     if xvr_no_library() then return
 
     val out = scg_ir("var x = 1.5\nprint(str(x), f\"${x}%.1f\")\n")
 
-    assert_eq(xvr_count(out, "declare i32 @snprintf"), 1)
+    assert(out.contains("format_real"), out)
+    assert_eq(xvr_count(out, "@snprintf"), 0)
 
 // The library's 64-bit integer renderers write their own digits (`digits_long`, `digits_ulong`)
 // rather than calling `snprintf`, which parsed a format string on every call. Each body is asserted

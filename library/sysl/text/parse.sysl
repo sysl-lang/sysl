@@ -1,8 +1,5 @@
 module sysl.text
 
-import sysl.sys.sysl_strtod
-import sysl.slices.copy
-
 // Reading a value back out of text -- the direction `str(x)` does not go.
 //
 // **The library rendered and did not read.** `str`, `Display`, the format specifiers and the whole
@@ -197,57 +194,33 @@ end parse_uint
 
 parse_uint(s: string) -> Result[uint, ParseError] = parse_uint(s.bytes)
 
-/** A floating-point value, through the C library.
+/** A floating-point value, correctly rounded, read in sysl (`real.sysl`) -- so it allocates nothing,
+ * copies nothing and needs no C library.
  *
- * It goes to `strtod` for the reason the float half of `str` goes to `snprintf`: correctly rounded
- * decimal-to-binary conversion is a hard algorithm to get right and an easy one to get subtly
- * wrong, and the two directions must agree or a value will not survive being written and read back.
- * Writing it in sysl waits for a target with no C library, which is the same condition
- * `reference/strings.md § Rendering a value` puts on the rendering half.
- *
- * **It costs a copy and usually not an allocation**, because `strtod` reads a NUL-terminated
- * pointer and neither a slice nor a `string` carries a terminator. The copy goes into a buffer on
- * the stack for any text short enough to fit one, which is every float anybody writes and every
- * float `str` produces; longer input falls back to the heap rather than being refused, since a
- * decimal expansion may legitimately run to hundreds of digits and every one of them can move the
- * last bit of the result.
- *
- * The end pointer is what turns C's lenient parse into this library's strict one: `strtod` stops at
- * the first byte it cannot use and reports where, so anything left over is trailing garbage and
- * `"1.5x"` is refused rather than read as `1.5`.
+ * It reads what C's `strtod` reads, through `real_prefix`, and the prefix's length is what makes it
+ * strict where `strtod` is lenient: `strtod` stops at the first byte it cannot use, so anything left
+ * over is trailing garbage and `"1.5x"` is refused rather than read as `1.5`. A value past the
+ * largest finite one is an infinity, as `strtod` makes it.
  */
 parse_real(b: []const u8) -> Result[real, ParseError]
     if b.len == 0 then return Err(Empty)
 
-    // One less than the buffer, because the terminator needs the last byte.
-    var scratch: [128]u8
+    val got = real_prefix(b)
 
-    if b.len < scratch.len
-        copy(scratch[..], b)
-        scratch[b.len] = 0
-        read_real(&scratch[0], b.len)
-    else
-        var room: []u8 = [0; b.len + 1]
-
-        copy(room, b)
-        read_real(&room[0], b.len)
+    if got.1 < b.len then Err(BadDigit(got.1)) else Ok(got.0)
 end parse_real
 
 parse_real(s: string) -> Result[real, ParseError] = parse_real(s.bytes)
 
-/** The call itself and the strictness check, shared by the two copies above.
- *
- * It takes a pointer rather than either buffer because the buffers have different lifetimes and
- * only one of them may exist: a stack array handed to a helper would be a pointer into a frame that
- * has gone, so the copy has to happen in the frame that returns and only the call can be lifted.
+/** An `f32`, read as `parse_real` reads a `real` and rounded once, to the nearest `f32` -- never
+ * through a `real`, whose rounding could leave a value on the wrong side of half way.
  */
-private read_real(p: *u8, n: usize) -> Result[real, ParseError]
-    var end: *u8 = null
-    var v = sysl_strtod(p, &end)
-    var used = usize(end) - usize(p)
+parse_f32(b: []const u8) -> Result[f32, ParseError]
+    if b.len == 0 then return Err(Empty)
 
-    if used == 0 then return Err(BadDigit(0))
-    if used < n then return Err(BadDigit(used))
+    val got = f32_prefix(b)
 
-    Ok(v)
-end read_real
+    if got.1 < b.len then Err(BadDigit(got.1)) else Ok(got.0)
+end parse_f32
+
+parse_f32(s: string) -> Result[f32, ParseError] = parse_f32(s.bytes)

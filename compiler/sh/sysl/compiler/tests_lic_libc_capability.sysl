@@ -9,13 +9,13 @@ import sysl.testing.skip
 // **`libc`: a C library under the program, granted by the manifest where a freestanding board has
 // one.**
 //
-// A float conversion and a plain hole of a float are rendered by C's `snprintf`, so on a
-// target without the capability each one reached is refused where it is written
-// (`emit_checks.sysl`'s `check_c_formatting`). A hosted target has it; a freestanding one has it only
-// where `package.hocon` grants it -- `targets { <t> { capabilities { libc = true } } }`, which is what
-// a Pico SDK build linking newlib says. Granting it makes C's own functions reachable and nothing
-// more: the library's hooks are about an operating system, so a program reaching `sysl.fs` still
-// answers them itself.
+// No specifier needs it -- every one is rendered by the library, so a string and a float format on a
+// bare target with no `snprintf` to call. What it still decides is C's own functions a program asks
+// for, such as the `posix_memalign` an over-aligned box defaults to. A hosted target has it; a
+// freestanding one has it only where `package.hocon` grants it -- `targets { <t> { capabilities {
+// libc = true } } }`, which is what a Pico SDK build linking newlib says. Granting it makes C's own
+// functions reachable and nothing more: the library's hooks are about an operating system, so a
+// program reaching `sysl.fs` still answers them itself.
 
 private val lic_target: string = "aarch64-freestanding"
 private val lic_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
@@ -25,10 +25,33 @@ private val lic_name: string = "package { name = \"probe\", version = \"0.1.0\" 
 private val lic_granted: string =
     s"targets {\n  $lic_target {\n    capabilities { libc = true }\n  }\n}\n"
 
-// A float specifier and a plain hole of a float, both reached from an export.
-private val lic_floats: string = raw"""
+// A string specifier, reached from an export.
+private val lic_strings: string = raw"""
     @export("probe")
-    probe(x: real) -> usize = f"${x}%.2f".bytes.len + s"$x".bytes.len
+    probe(n: int) -> usize
+        val s = if n > 0 then "pos" else "neg"
+
+        f"${s}%8s".bytes.len
+    """
+
+// Every way a float becomes text or text a float: a specifier at each width, a plain hole, `str`,
+// `print` and a parse -- none of which asks C for anything.
+private val lic_floats: string = raw"""
+    import sysl.text.{parse_f32, parse_real}
+
+    @export("probe")
+    probe(x: real, y: f32) -> usize
+        print(x, y)
+
+        val back = parse_real("2.5") match
+            Ok(v) -> v
+            Err(_) -> 0.0
+
+        val narrow = parse_f32("0.1") match
+            Ok(v) -> v
+            Err(_) -> f32(0.0)
+
+        f"${x}%.3f ${y}%e".bytes.len + s"$x $y".bytes.len + str(back).bytes.len + str(narrow).bytes.len
     """
 
 // A program reading one file, which reaches `sysl.fs`'s hooks and answers none of them.
@@ -65,29 +88,12 @@ private lic_names(listing: string, symbol: string) -> bool
     false
 end lic_names
 
-@test("without libc, a freestanding float specifier and float hole are refused, saying how to grant one")
-lic_no_libc_refuses_floats()
-    if !lbr_ready() then return
-
-    val root = lic_project(lic_floats, "")
-    val (said, _) = lic_build_c(root)
-
-    lbr_drop([root])
-    assert(said.0 != 0, "built a float specifier with no C library")
-    assert(said.1.contains(s"'%.2f' is applied by C's 'snprintf', and '$lic_target' has no C library " +
-        "under it to supply one"), said.1)
-    assert(said.1.contains(s"a plain hole of real is rendered by C's 'snprintf', and '$lic_target' " +
-        "has no C library under it to supply one"), said.1)
-    assert(said.1.contains(s"grant it in package.hocon: 'targets { $lic_target { capabilities { " +
-        "libc = true } } }'"), said.1)
-end lic_no_libc_refuses_floats
-
-@test("with libc granted for the target, the float specifier and hole build, and snprintf is left to the link")
-lic_granted_libc_builds_floats()
+@test("without libc, a freestanding string specifier builds, and the archive asks for no snprintf")
+lic_no_libc_builds_strings()
     if !lbr_ready() then return
     if !is_file(lic_nm) then skip(s"there is no llvm-nm at $lic_nm to read the archive")
 
-    val root = lic_project(lic_floats, lic_granted)
+    val root = lic_project(lic_strings, "")
     val (said, archive) = lic_build_c(root)
 
     assert(said.0 == 0, said.1)
@@ -95,8 +101,29 @@ lic_granted_libc_builds_floats()
     val undefined = lic_undefined(archive)
 
     lbr_drop([root])
-    assert(lic_names(undefined, "snprintf") || lic_names(undefined, "_snprintf"), undefined)
-end lic_granted_libc_builds_floats
+    assert(!lic_names(undefined, "snprintf") && !lic_names(undefined, "_snprintf"), undefined)
+end lic_no_libc_builds_strings
+
+@test("without libc, every float conversion builds, and the archive asks for no snprintf or strtod")
+lic_no_libc_builds_floats()
+    if !lbr_ready() then return
+    if !is_file(lic_nm) then skip(s"there is no llvm-nm at $lic_nm to read the archive")
+
+    val root = lic_project(lic_floats, "")
+    val (said, archive) = lic_build_c(root)
+
+    assert(said.0 == 0, said.1)
+
+    val undefined = lic_undefined(archive)
+
+    lbr_drop([root])
+
+    for c in ["snprintf", "strtod", "strtof", "printf", "sprintf"]
+        assert(!lic_names(undefined, c) && !lic_names(undefined, "_" + c), undefined)
+
+    // The float renderer is in the archive rather than left out: the probe reaches it.
+    assert(!lic_names(undefined, "sysl.fmt$format_real"), undefined)
+end lic_no_libc_builds_floats
 
 @test("a C library granted is not an operating system: a program reaching sysl.fs still answers the hooks")
 lic_granted_libc_still_wants_hooks()

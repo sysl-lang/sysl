@@ -223,20 +223,11 @@ private gen_int_str(e: *Emit, arg: TExpr, bits: int, signed: bool) -> Val
     r
 end gen_int_str
 
-private gen_float_str(e: *Emit, arg: TExpr, from: Type) -> Val
-    e.heap = true
-    e.uses_snprintf = true
-
-    val fn = request_text(e, "sysl.str.float", str_float_text(word_llvm_of(e), str_llvm(e)))
-    val v = convert(e, from, real_type(), gen_expr(e, arg))
-    val r = fresh_reg(e)
-
-    var args: Buf[IrArg] = buf()
-
-    args.push(ir_arg(LFloat(64, false), v))
-    emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
-    r
-end gen_float_str
+// **A float never arrives here**: the analysis sends `str` of one, and a plain hole, to the library's
+// `sysl.fmt.format_real` (`expr_call.sysl`'s `float_format_call`), which renders it in sysl. Only a
+// compilation given no standard module reaches this, and it has nothing to render the float with.
+private gen_float_str(e: *Emit, arg: TExpr, from: Type) -> Val =
+    gap_at(e, "str of a float, with no 'sysl.fmt.format_real' to render it")
 
 // The copy every rendering finishes through, asked for wherever one is.
 request_from_bytes(e: *Emit) -> string =
@@ -266,43 +257,18 @@ gen_from_bytes(e: *Emit, arg: TExpr) -> Val
 end gen_from_bytes
 
 // **`format(x, spec)`** -- one value rendered through a printf specifier, into a fresh owning string.
-// A float is widened to a `double` and handed to `snprintf` with the specifier. The result is always
-// a fresh buffer this statement owns. **An integer or a string never arrives here**: the analysis
-// sends them to the library's `sysl.fmt.format_int` and `sysl.fmt.format_str` (`expr_call.sysl`'s
-// `int_format_call` and `str_format_call`), so neither needs a C library — and on a target with none,
-// a reached float specifier is refused (`emit_checks.sysl`'s `check_c_formatting`).
-//
-// **A count read at run time is one more `i32` before the value**, which is where C's `*` reads it,
-// and is handed to a helper of its own per number of counts -- so a specifier written out in full
-// emits exactly what it did before there were any.
+// **Every specifier is the library's to render, so none is lowered here**: the analysis sends an
+// integer to `sysl.fmt.format_int`, a string to `sysl.fmt.format_str` and a float to `format_real`
+// or `format_f32` (`expr_call.sysl`'s `library_format_call`), so a specifier renders the same on a
+// target with no C library as on a hosted one. What arrives here is a specifier the analysis found
+// no renderer for -- a library too old to carry one -- and it is left out as a gap naming the
+// renderer it wanted.
 gen_format(e: *Emit, arg: TExpr, spec: string, counts: Buf[TExpr]) -> Val
     val c = spec_conversion(spec)
 
-    if spec_is_int(c) then return gap_at(e, "an integer specifier, with no 'sysl.fmt.format_int' to render it")
-    if spec_is_str(c) then return gap_at(e, "a string specifier, with no 'sysl.fmt.format_str' to render it")
-
-    e.heap = true
-    e.uses_snprintf = true
-
-    val fmt = string_global(e, spec)
-    val r = fresh_reg(e)
-    val k = counts.len()
-    val suffix = if k == 0 then "" else s".$k"
-
-    var args: Buf[IrArg] = buf()
-
-    args.push(ir_arg(LPtr, fmt))
-
-    for n in counts.view()
-        args.push(ir_arg(LInt(32), gen_expr(e, n)))
-
-    val fn = request_text(e, s"sysl.str.fmt_f$suffix",
-                          str_fmt_float_text(word_llvm_of(e), str_llvm(e), k))
-    val v = convert(e, underlying(texpr_type(arg)), real_type(), gen_expr(e, arg))
-
-    args.push(ir_arg(LFloat(64, false), v))
-    emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
-    r
+    if spec_is_int(c) then gap_at(e, "an integer specifier, with no 'sysl.fmt.format_int' to render it")
+    else if spec_is_float(c) then gap_at(e, "a float specifier, with no 'sysl.fmt.format_real' to render it")
+    else gap_at(e, "a string specifier, with no 'sysl.fmt.format_str' to render it")
 end gen_format
 
 // -- a printf-style specifier ----------------------------------------------------------------------

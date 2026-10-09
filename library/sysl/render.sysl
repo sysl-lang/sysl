@@ -1,7 +1,5 @@
 module sysl
 
-import sysl.sys.sysl_snprintf
-
 // What the built-in types render as -- the sink counterpart of the `print*` family.
 //
 // These are the same renderings written into a `*Writer` instead of into standard output, and in
@@ -147,14 +145,24 @@ private[sysl] digits_long(n: long, into: []u8) -> usize
     into[at] = u8('-')
     at
 
+/** A float as `%g` renders it -- six significant digits by default, correctly rounded, in whichever of
+ * fixed point and an exponent `%g` picks -- with the precision read as the count of significant
+ * digits, at most forty. `float_text.sysl` does the rounding, in sysl, so this needs no C library.
+ */
 display_real(x: real, out: *Writer, fmt: FormatSpec)
-    var buf: [64]u8
-    var p = fmt.prec
-    if p < 0 then p = 6
-    if p > 40 then p = 40
-    var k = sysl_snprintf(&buf[0], 64, c"%.*g", p, x)
-    display_pad(buf[0..<usize(k)], out, fmt)
-end display_real
+    var digits: [48]u8
+    val p = if fmt.prec > 40 then 40 else fmt.prec
+
+    write_float_field(out, real_value(x), FloatField(u8('g'), fmt.width, p, fmt.left, false, false,
+                                                     false, false), digits[..])
+
+/** An `f32` the way `display_real` renders it, taken apart at its own width rather than widened. */
+display_f32(x: f32, out: *Writer, fmt: FormatSpec)
+    var digits: [48]u8
+    val p = if fmt.prec > 40 then 40 else fmt.prec
+
+    write_float_field(out, f32_value(x), FloatField(u8('g'), fmt.width, p, fmt.left, false, false,
+                                                    false, false), digits[..])
 
 /** A `real` written in the fewest digits that read back as the same number, which is what a
  * serializer needs and what `display_real` cannot give it.
@@ -175,6 +183,14 @@ display_real_shortest(x: real, out: *Writer, fmt: FormatSpec)
     var buf: [32]u8
 
     display_pad(buf[0..<shortest_real(x, buf[..])], out, fmt)
+
+/** An `f32` in the fewest digits that read back as the same `f32` -- `0.1` for `f32(0.1)`, where the
+ * same value widened to a `real` needs seventeen.
+ */
+display_f32_shortest(x: f32, out: *Writer, fmt: FormatSpec)
+    var buf: [32]u8
+
+    display_pad(buf[0..<shortest_f32(x, buf[..])], out, fmt)
 
 display_bool(b: bool, out: *Writer, fmt: FormatSpec) = display_str(if b then "true" else "false", out, fmt)
 
