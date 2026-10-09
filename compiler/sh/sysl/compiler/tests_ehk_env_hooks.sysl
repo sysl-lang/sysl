@@ -1,0 +1,292 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.{Var, capture}
+import sysl.text.Search
+import sysl.testing.skip
+
+// **The environment over `sysl.env.sys`, and a program answering it on a target with no C library.**
+//
+// `sysl.env` reads every variable through the `sysl_env_*` hooks. On a hosted target the library's
+// `sysl.env.hosted` answers them over `getenv` and `environ`, under `weak` exports; on a freestanding
+// one the program answers each hook it reaches with an `@export`, and one it leaves unanswered is
+// refused when it is compiled (`emit_checks.sysl`'s `check_library_hooks`, the `sysl.env.sys` row)
+// rather than at the link, where the symbols missing were C's `getenv` and `environ`.
+
+private val ehk_target: string = "aarch64-freestanding"
+private val ehk_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+// keel's `/bin/env` and the shell's starting variables: one name asked about, one tested for, and the
+// whole list -- which between them reach all three hooks.
+private val ehk_program: string = raw"""
+    import sysl.env.{get, is_set, vars}
+
+    @export("probe_env")
+    probe_env() -> int
+        var n = 0
+
+        if is_set("HOME") then n += 1
+
+        get("USER") match
+            Some(v) -> n += int(v.bytes.len)
+            None -> ()
+
+        for (name, value) in vars()
+            n += int(name.bytes.len + value.bytes.len)
+
+        n
+    end probe_env
+    """
+
+// Only `get`, which reaches one hook and not the two a listing needs.
+private val ehk_get_only: string = raw"""
+    import sysl.env.get_or
+
+    @export("probe_env")
+    probe_env() -> int = int(get_or("HOME", "/").bytes.len)
+    """
+
+// An environment of two variables, answered as a kernel answers from the vector it laid after argv.
+private val ehk_get_hook: string = raw"""
+    private ehk_var(i: usize) -> string = if i == 0 then "HOME=/root" else "USER=keel"
+
+    private ehk_lend(text: string, into: *u8, room: usize, got: *usize)
+        val n = text.bytes.len
+
+        for i in 0..<(if n < room then n else room)
+            into[i] = text.bytes[i]
+
+        *got = n
+    end ehk_lend
+
+    @export("sysl_env_get")
+    k_get(name: *u8, name_len: usize, into: *u8, room: usize, got: *usize) -> int
+        for i in 0usize..<2
+            val v = ehk_var(i)
+
+            if v.bytes.len <= name_len || v.bytes[name_len] != u8('=') then continue
+
+            var same = true
+
+            for k in 0..<name_len
+                if v.bytes[k] != name[k] then same = false
+
+            if same
+                ehk_lend(v[name_len + 1..<v.bytes.len], into, room, got)
+                return 1
+        end for
+
+        0
+    end k_get
+    """
+
+private val ehk_list_hooks: string = raw"""
+    @export("sysl_env_count")
+    k_count() -> isize = 2
+
+    @export("sysl_env_entry")
+    k_entry(i: usize, into: *u8, room: usize, got: *usize) -> int
+        if i >= 2 then return 0
+
+        ehk_lend(ehk_var(i), into, room, got)
+        1
+    """
+
+private val ehk_hooks: string = ehk_get_hook + ehk_list_hooks
+
+private ehk_tree(program: string) -> string =
+    lbr_tree(lbr_two("main.sysl", program, "package.hocon",
+                     "package { name = \"probe\", version = \"0.1.0\" }\n"))
+
+// What `sysl build-c` answers for the tree on `target`, and the archive it wrote.
+private ehk_archive(p: string, target: string) -> ((int, string), string)
+    val archive = s"$p/probe.a"
+
+    (lbr_cli(["sysl", "build-c", "--target", target, "-o", archive, p]), archive)
+end ehk_archive
+
+// The symbols an archive's members leave undefined, as `llvm-nm -u` lists them.
+private ehk_undefined(archive: string) -> string =
+    capture(ehk_nm, ["-u", archive], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+
+// Whether an `llvm-nm` listing names `symbol`, as the last word of one of its lines.
+private ehk_names(listing: string, symbol: string) -> bool
+    for line in lines_of(listing)
+        val t = line.trim()
+
+        if t == symbol || t.ends_with(s" $symbol") || t == s"_$symbol" || t.ends_with(s" _$symbol")
+            return true
+    end for
+
+    false
+end ehk_names
+
+private ehk_nm_ready() -> bool
+    if !lbr_ready() then return false
+    if !is_file(ehk_nm) then skip(s"there is no llvm-nm at $ehk_nm to read the archive")
+
+    true
+end ehk_nm_ready
+
+// -- a bare archive answering the hooks it reaches ---------------------------------------------------
+
+@test("a freestanding archive answering the env hooks leaves neither getenv nor environ undefined")
+ehk_answered_hooks_archive()
+    if !ehk_nm_ready() then return
+
+    val p = ehk_tree(ehk_program + ehk_hooks)
+    val (said, archive) = ehk_archive(p, ehk_target)
+
+    assert(said.0 == 0, said.1)
+
+    val undefined = ehk_undefined(archive)
+
+    for name in ["getenv", "environ", "sysl_env_get", "sysl_env_count", "sysl_env_entry"]
+        assert(!ehk_names(undefined, name), s"'$name' is undefined in the archive:\n$undefined")
+
+    lbr_drop([p])
+end ehk_answered_hooks_archive
+
+@test("the same archive built for a host leaves getenv and environ for the C library to answer")
+ehk_hosted_archive_names_libc()
+    // The control for the test above: the listing it reads can name both, and does where the
+    // library's hosted answer is the one taken.
+    if !ehk_nm_ready() then return
+
+    val p = ehk_tree(ehk_program)
+    val (said, archive) = ehk_archive(p, "aarch64-macos")
+
+    assert(said.0 == 0, said.1)
+
+    val undefined = ehk_undefined(archive)
+
+    assert(ehk_names(undefined, "getenv"), undefined)
+    assert(ehk_names(undefined, "environ"), undefined)
+
+    lbr_drop([p])
+end ehk_hosted_archive_names_libc
+
+// -- the hooks left unanswered -------------------------------------------------------------------------
+
+@test("a freestanding program reading its environment with no env hooks is refused, naming every one")
+ehk_unanswered_hooks_are_refused()
+    if !lbr_ready() then return
+
+    val p = ehk_tree(ehk_program)
+    val (said, _) = ehk_archive(p, ehk_target)
+
+    assert(said.0 != 0, "built with every env hook unanswered")
+    assert(said.1.contains(s"error: this program reads its environment, and '$ehk_target' has no " +
+        "operating system under it for the standard library to answer one with, so the program " +
+        "answers it: define 'sysl_env_count', 'sysl_env_entry', 'sysl_env_get' with '@export', each " +
+        "taking what its 'extern' in 'sysl.env.sys' declares and answering a count, one or zero, or " +
+        "the code of an 'IoError' negated"), said.1)
+
+    // Told before any C, so nothing names libc's symbols.
+    assert(!said.1.contains("getenv"), said.1)
+    assert(!said.1.contains("environ'"), said.1)
+
+    lbr_drop([p])
+end ehk_unanswered_hooks_are_refused
+
+@test("a freestanding program that answers get alone is refused for only the two vars reaches")
+ehk_partly_answered_hooks_are_refused()
+    if !lbr_ready() then return
+
+    val p = ehk_tree(ehk_program + ehk_get_hook)
+    val (said, _) = ehk_archive(p, ehk_target)
+
+    assert(said.0 != 0, "built with two env hooks unanswered")
+    assert(said.1.contains("so the program answers it: define 'sysl_env_count', 'sysl_env_entry' " +
+        "with '@export'"), said.1)
+
+    lbr_drop([p])
+end ehk_partly_answered_hooks_are_refused
+
+@test("a freestanding program that only gets a variable is asked for the get hook and nothing else")
+ehk_only_the_reached_hook_is_asked_for()
+    if !lbr_ready() then return
+
+    val p = ehk_tree(ehk_get_only)
+    val (said, _) = ehk_archive(p, ehk_target)
+
+    assert(said.0 != 0, "built with the get hook unanswered")
+    assert(said.1.contains("so the program answers it: define 'sysl_env_get' with '@export'"), said.1)
+
+    lbr_drop([p])
+end ehk_only_the_reached_hook_is_asked_for
+
+// -- a hosted target -------------------------------------------------------------------------------------
+
+@test("on a hosted target the library answers the env hooks under weak exports, over getenv")
+ehk_hosted_library_answers_weakly()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.env.{get, vars}
+
+        print(get("PATH") != None)
+        print(vars().len() > 0)
+        """)
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
+
+    lbr_drop([p])
+    assert(said.0 == 0, said.1)
+
+    for hook in ["sysl_env_get", "sysl_env_count", "sysl_env_entry"]
+        var defined = ""
+
+        for line in lines_of(said.1)
+            if line.starts_with("define ") && line.contains(s" @$hook(") then defined = line
+
+        assert(defined.starts_with("define weak "), s"$hook: $defined")
+    end for
+
+    assert(said.1.contains("@getenv("), "the hosted answer does not call getenv")
+    assert(said.1.contains("@environ"), "the hosted answer does not read environ")
+end ehk_hosted_library_answers_weakly
+
+@test("on a hosted target every sysl.env call reads the environment the process was started with")
+ehk_hosted_environment_round_trips()
+    if !lbr_ready() then return
+
+    // Started with exactly these four variables, so the answers are known: a value longer than the
+    // library's first ask of 256 bytes, an empty one, and no PATH at all.
+    val p = lbr_program(raw"""
+        import sysl.env.{get, get_or, is_set, vars}
+
+        print(get("HOME"))
+        print(get_or("USER", "nobody"))
+        print(is_set("PATH"))
+        print(get("PATH"))
+        print(is_set("EMPTY"))
+        print(get("EMPTY"))
+        print(get("LONG").unwrap().bytes.len)
+
+        for (name, value) in vars()
+            print(s"$name ${value.bytes.len}")
+        """)
+    val out_dir = lbr_temp("sysl-ehk-exe")
+    val long = "0123456789".repeat(30)
+    var env: Buf[Var] = buf()
+
+    env.push(Var("HOME", "/root"))
+    env.push(Var("USER", "keel"))
+    env.push(Var("EMPTY", ""))
+    env.push(Var("LONG", long))
+
+    val said = build_native_program(p, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", env.view(), true, 0, false) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    lbr_drop([p, out_dir])
+    assert_eq(said, "Some(/root)\nkeel\nfalse\nNone\ntrue\nSome()\n300\n" +
+                    "HOME 5\nUSER 4\nEMPTY 0\nLONG 300\n")
+end ehk_hosted_environment_round_trips

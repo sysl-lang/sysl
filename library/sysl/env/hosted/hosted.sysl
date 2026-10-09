@@ -1,0 +1,104 @@
+module sysl.env.hosted
+@requires(os)
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_ptr
+import sysl.sys.UNSUPPORTED
+
+// `sysl.env.sys`'s hooks answered over the platform's C library. **Call `sysl.env` instead** --
+// nothing here is meant to be called: each function below exists to be linked under a hook's symbol,
+// and is public only because a private export's symbol is hidden.
+//
+// **Nothing imports this module, and nothing has to.** A hook a program reaches is answered by the
+// library's own supplier (`reference/ffi.md § A module may supply another module's extern`), and its
+// exports are `weak`, so a program answering a hook itself is the one the link keeps. It requires
+// `os`, so a freestanding target never takes it: there the program answers the hooks it reaches, and
+// one it leaves unanswered is refused by name when it is compiled.
+//
+// **`get` is `getenv`, which is ISO C, and is answered on every hosted target.** `count` and `entry`
+// read `environ`, which POSIX declares and ISO C does not, so on a hosted target without POSIX they
+// answer `UNSUPPORTED` -- and `sysl.env.vars`, their one caller, carries `@needs(posix)` so a program
+// is told at its call rather than handed an empty list.
+//
+// **Neither C call reports a failure through `errno`** -- `getenv` answers null for a name that is not
+// set, and `environ` is read rather than called -- so no answer here is a host code for
+// `sysl.sys.host_status` to translate: each is one, zero, a count, or `UNSUPPORTED`.
+
+#if hosted
+private extern "getenv" c_getenv(name: *u8) -> *u8
+
+#if posix
+private extern environ: **u8
+#endif
+
+/** The bytes of the C string at `p`, up to its terminating zero. */
+private c_length(p: *u8) -> usize
+    var n: usize = 0
+
+    while p[n] != 0
+        n += 1
+
+    n
+
+/** The C string at `p` written into the caller's `room` bytes at `into`, its whole length into `got`. */
+private lend(p: *u8, into: *u8, room: usize, got: *usize)
+    val n = c_length(p)
+    val k = if n < room then n else room
+
+    for i in 0..<k
+        into[i] = p[i]
+
+    *got = n
+end lend
+
+@export("sysl_env_get")
+supply_get(name: *u8, name_len: usize, into: *u8, room: usize, got: *usize) -> int
+    // `getenv` wants a terminated name; a name holding a zero byte is none C could have set.
+    var c: Buf[u8] = buf()
+
+    for i in 0..<name_len
+        if name[i] == 0 then return 0
+        c.push(name[i])
+
+    c.push(0)
+
+    val p = c_getenv(as_ptr(c.view()))
+
+    if p == null then return 0
+
+    lend(p, into, room, got)
+    1
+end supply_get
+
+@export("sysl_env_count")
+supply_count() -> isize
+#if posix
+    var n: usize = 0
+
+    while environ[n] != null
+        n += 1
+
+    isize(n)
+#else
+    isize(UNSUPPORTED)
+#endif
+end supply_count
+
+@export("sysl_env_entry")
+supply_entry(i: usize, into: *u8, room: usize, got: *usize) -> int
+#if posix
+    // Walked to rather than indexed, so a place past the end is answered rather than read.
+    for k in 0..<i
+        if environ[k] == null then return 0
+
+    val p = environ[i]
+
+    if p == null then return 0
+
+    lend(p, into, room, got)
+    1
+#else
+    UNSUPPORTED
+#endif
+end supply_entry
+#endif

@@ -65,7 +65,7 @@ a module that has given `posix` up is refused at the call.
 **The value is everything after the first `=`**, so `A=b=c` is `("A", "b=c")`; `VAR=` is kept as
 `("VAR", "")`, a set-to-empty variable being set. An entry with no `=` names nothing and is passed
 over, and so is one that is not UTF-8 — `get`'s answer to the same bytes. Both halves are copied out of
-`environ`, whose storage a later `setenv` from C may move.
+what the environment lends, whose storage a later `setenv` from C may move.
 
 ## Unset, empty, and not text are three different answers
 
@@ -92,6 +92,54 @@ writing, and offering the same gun here would undo that.
 
 A program that genuinely needs to hand a *child* a different environment wants that at the spawn,
 which belongs to a process module and not to this one.
+
+## Answering the environment on a target with no C library
+
+**Everything above reads the environment through `sysl.env.sys` and through nothing else**: three
+hooks, each an `extern` no module of the library defines.
+
+| hook | what it answers |
+|---|---|
+| `sysl_env_get(name, name_len, into, room, got) -> int` | one where the name is set, its value written into `into` and the value's length into `got`; zero where it is not |
+| `sysl_env_count() -> isize` | how many variables there are |
+| `sysl_env_entry(i, into, room, got) -> int` | one, the `i`-th variable's `NAME=value` bytes written into `into` and their length into `got`; zero past the last |
+
+**Text crosses as a pointer and a length, never as a C string**: a name is lent as `name` and
+`name_len`, and what a hook hands back it writes into the caller's `room` bytes at `into`, with the
+**whole** length in `got` — more than `room` meaning only the first `room` bytes were written, and the
+library asks again with the room it was told. Like every `*.sys` module's (`sysl.fs.sys`,
+`sysl.io.sys`, `sysl.process.sys`, `sysl.net.sys`), each hook answers zero or more for success, the
+`IoError` code negated for a failure, and `sysl.sys.UNSUPPORTED` (-38) for a call the target cannot
+make at all.
+
+On a hosted target the library answers them itself, under `weak` exports
+([a module may supply another module's extern](/reference/ffi/)): `get` over `getenv` everywhere, and
+`count` and `entry` over `environ` where there is POSIX — `UNSUPPORTED` where there is not, which is
+why `vars` carries `@needs(posix)`. A kernel answers them from the vector it laid after a process's
+arguments, with an `@export` per hook its program reaches:
+
+```sysl
+@export("sysl_env_count")
+k_count() -> isize = 0
+```
+
+**A hook the program reaches and leaves unanswered is refused when it is compiled**, all of them in one
+sentence, rather than surfacing at the link as C's `getenv` and `environ`, which no line of the program
+names:
+
+```sysl target=aarch64-freestanding
+import sysl.env.{get, vars}
+
+val home = get("HOME")
+val all = vars()
+```
+
+```error
+this program reads its environment, and 'aarch64-freestanding' has no operating system under it for the standard library to answer one with, so the program answers it: define 'sysl_env_count', 'sysl_env_entry', 'sysl_env_get' with '@export', each taking what its 'extern' in 'sysl.env.sys' declares and answering a count, one or zero, or the code of an 'IoError' negated
+```
+
+The question is asked only of what the program reaches, so one that calls `get` and never `vars` is
+asked for `sysl_env_get` alone.
 
 ## Who asks
 

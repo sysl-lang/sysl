@@ -1,0 +1,48 @@
+module sysl.env.sys
+
+// The calls `sysl.env` makes of whatever holds the environment underneath it: what one name is set
+// to, how many variables there are, and the one at a given place.
+//
+// **Each is an `extern` naming a symbol no module here defines**, so what answers it is decided by
+// what the program is linked with (`reference/ffi.md § A module may supply another module's extern`),
+// exactly as for `sysl.fs.sys`, `sysl.io.sys`, `sysl.process.sys` and `sysl.net.sys`:
+//
+// | linked with | what defines the symbols |
+// |---|---|
+// | a program for a hosted target | `sysl.env.hosted`, over `getenv` and, where there is POSIX, `environ` |
+// | a program for a target with no C library | the program, with an `@export` per hook it reaches |
+//
+// A freestanding program that reaches one of these and leaves it unanswered is refused when it is
+// compiled, naming the hooks it reached, rather than at the link -- where it would have named C's
+// `getenv` and `environ`, which no line of the program mentions.
+//
+// ## The shape of a hook
+//
+// **A hook answers one integer: what it did, or what went wrong** -- the contract of every `*.sys`
+// module. Zero or more is success: a count for `count`, and for `get` and `entry` one where there is
+// something to write and zero where there is not -- a name that is not set, a place past the end. A
+// negative answer is the code of the failure negated, and **a target that cannot perform a call at all
+// answers `UNSUPPORTED`** (`sysl.sys`, -38 on every platform) -- which is what a hosted target with no
+// POSIX answers for `count` and `entry`, C alone having no way to list the names.
+//
+// **Text crosses as a pointer and a length, never as a C string.** A name is lent as two parameters,
+// and a value or an entry is written into the caller's `room` bytes at `into`, with its whole length
+// written into `got` -- **the whole length, even where it is more than `room`**, in which case only the
+// first `room` bytes are written and the caller asks again with more. Nothing is terminated by a zero.
+
+/** What `name` (`name_len` bytes, lent) is set to: one where it is set, its value's bytes written
+ * into `into` and the value's whole length into `got`; zero where it is not set, and `got` untouched.
+ * Set-to-empty is one with a length of zero.
+ */
+private[sysl] extern "sysl_env_get" get(name: *u8, name_len: usize, into: *u8, room: usize,
+                                        got: *usize) -> int
+
+/** How many variables the environment holds. */
+private[sysl] extern "sysl_env_count" count() -> isize
+
+/** The variable at place `i`, counting from zero in the order the environment holds them, as the
+ * `NAME=value` bytes C keeps it as: one, written into `into` and its whole length into `got`; zero
+ * where there is no variable at that place, and `got` untouched. The library asks for the places below
+ * what `count` answered.
+ */
+private[sysl] extern "sysl_env_entry" entry(i: usize, into: *u8, room: usize, got: *usize) -> int
