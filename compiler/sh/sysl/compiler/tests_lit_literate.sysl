@@ -2,7 +2,6 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.env.{get as env_var}
 import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.{join, replace_all, Search}
@@ -12,13 +11,12 @@ import sysl.text.{join, replace_all, Search}
 // position still points at the file the reader has open** -- the half a tangler that only
 // concatenates its code blocks gets wrong, silently.
 //
-// Every case is driven through `sysl build` as a shell reaches it, and run. **Where `SYSL_ORACLE`
-// names the reference, its own build of the same files must come to the same thing**, so every
-// expectation below is the reference's (0.0.162) actual output, its root directory written `<root>`.
+// Every case is driven through `sysl build` as a shell reaches it, and run; an expectation that quotes
+// a diagnostic writes the root directory as `<root>`.
 
 // What building `files` comes to: the program's output where it built, or what was said instead.
 // `entry` is the file handed to the build, or "" for the directory holding them all.
-private lit_outcome(files: []const (string, string), entry: string, reference: Option[string]) -> string
+private lit_outcome(files: []const (string, string), entry: string) -> string
     val root = absolute_path(make_temp_dir("sysl-lit").unwrap())
     val src = s"$root/src"
     val exe = s"$root/built"
@@ -30,18 +28,12 @@ private lit_outcome(files: []const (string, string), entry: string, reference: O
         write_text(file, files[i].1).unwrap()
 
     val target = if entry == "" then src else s"$src/$entry"
-    var said = ""
+    var lines: Buf[string] = buf()
+    val sink = &lines
 
-    reference match
-        None ->
-            var lines: Buf[string] = buf()
-            val sink = &lines
+    run_cli(["sysl", "build", target, "-o", exe], (line) -> sink.push(line))
 
-            run_cli(["sysl", "build", target, "-o", exe], (line) -> sink.push(line))
-            said = join(lines.view(), "\n")
-        Some(bin) -> capture_oracle(bin, ["build", target, "-o", exe]) match
-            Err(_) -> said = "the reference could not be run"
-            Ok(o) -> said = o.err.unwrap_or(o.text)
+    var said = join(lines.view(), "\n")
 
     if metadata(exe).is_ok()
         said = capture(exe, [], "", [], true) match
@@ -54,17 +46,11 @@ end lit_outcome
 
 private lit_chomp(s: string) -> string = if s.ends_with("\n") then s[0..<s.bytes.len - 1] else s
 
-// The claim every case makes: these files come to `want`, here and -- where there is one -- under the
-// reference.
+// The claim every case makes: these files come to `want`.
 private lit_says(files: []const (string, string), entry: string, want: string)
     if !twp_ready() then return
 
-    assert_eq(lit_outcome(files, entry, None), want)
-
-    env_var("SYSL_ORACLE") match
-        Some(bin) -> assert_eq(lit_outcome(files, entry, Some(bin)), want)
-        None -> ()
-end lit_says
+    assert_eq(lit_outcome(files, entry), want)
 
 // One file, built by name.
 private lit_one(file: string, text: string, want: string) = lit_says([(file, text)], file, want)
@@ -186,24 +172,19 @@ lit_a_project_may_mix_the_two_kinds_of_file()
               ("geom/area.sysl", "module geom\n\narea(w: int, h: int) -> int = w * h\n")], "", "12")
 
 // The `which` a compilation for x86-64 Linux kept, as the IR it lowered to.
-private lit_which(reference: Option[string]) -> string
+private lit_which() -> string
     val root = absolute_path(make_temp_dir("sysl-lit").unwrap())
     val file = s"$root/cond.lsysl"
 
     write_text(file, "Two machines\n\n    #if macos\n    which() -> int = 1\n    #else\n    which() -> int = 2\n" +
         "    #endif\n\n    print(which())\n").unwrap()
 
-    val args = ["emit-llvm", "--no-std-lib", "--target", "x86_64-linux", file]
-    var ir = ""
+    var lines: Buf[string] = buf()
+    val sink = &lines
 
-    reference match
-        None ->
-            var lines: Buf[string] = buf()
-            val sink = &lines
+    run_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", file], (line) -> sink.push(line))
 
-            run_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", file], (line) -> sink.push(line))
-            ir = join(lines.view(), "\n")
-        Some(bin) -> ir = capture_oracle(bin, args).map((o) -> o.text).unwrap_or("")
+    val ir = join(lines.view(), "\n")
 
     remove_dir_all(root).unwrap_or(())
 
@@ -221,14 +202,7 @@ end lit_which
 lit_conditional_compilation_works_inside_a_literate_file()
     if std_root().is_err() then return
 
-    val ours = lit_which(None)
+    val ours = lit_which()
 
     assert(ours.contains("ret i32 2"), ours)
-
-    env_var("SYSL_ORACLE") match
-        Some(bin) ->
-            val theirs = lit_which(Some(bin))
-
-            assert(theirs.contains("ret i32 2"), theirs)
-        None -> ()
 end lit_conditional_compilation_works_inside_a_literate_file

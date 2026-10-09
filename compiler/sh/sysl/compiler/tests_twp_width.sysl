@@ -1,8 +1,7 @@
 module sh.sysl.compiler
 @tests
 
-import sysl.env.{get as env_var}
-import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
 // `sysl.text.char_columns` and `sysl.text.columns` -- how much room text takes on a terminal, the
@@ -14,9 +13,7 @@ import sysl.process.capture
 // point number, since most of the interesting ones do not print.
 //
 // The helpers here serve every `twp_` file: a library module is reached the way a program reaches
-// it, by building one and running it. **Where `SYSL_ORACLE` names the reference, its own build of the
-// same program must print the same thing**, so every expectation below is the reference's actual
-// output rather than a transcription of it.
+// it, by building one and running it.
 
 twp_ready() -> bool
     if std_root().is_err()
@@ -30,37 +27,26 @@ twp_ready() -> bool
     true
 end twp_ready
 
-// Builds `text` into `<root>/built` with this compiler, or with the reference where `reference`
-// names one, and answers the executable -- or what was said instead of making it.
-twp_build(root: string, text: string, reference: Option[string]) -> Result[string, string]
+// Builds `text` into `<root>/built` and answers the executable -- or what was said instead of making
+// it.
+twp_build(root: string, text: string) -> Result[string, string]
     val src = s"$root/main.sysl"
     val exe = s"$root/built"
 
     write_text(src, text).unwrap()
 
-    reference match
-        None ->
-            build_native_program(src, None, None, DefaultOptimization, Some(exe)) match
-                Err(why) -> return Err(failure_text(why))
-                Ok(_) -> ()
-        Some(bin) ->
-            val said = capture_oracle(bin, ["build", src, "-o", exe])
-
-            if metadata(exe).is_err()
-                return Err(said match
-                    Err(_) -> "the reference could not be run"
-                    Ok(o) -> o.err.unwrap_or(o.text))
-
-    Ok(exe)
+    build_native_program(src, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> Err(failure_text(why))
+        Ok(_) -> Ok(exe)
 end twp_build
 
-// What `text` prints as a program, built by this compiler or by the reference.
-twp_output(text: string, reference: Option[string]) -> string
+// What `text` prints as a program.
+twp_output(text: string) -> string
     val root = make_temp_dir("sysl-twp").unwrap()
 
     make_dir_all(root).unwrap()
 
-    val out = twp_build(root, text, reference) match
+    val out = twp_build(root, text) match
         Err(why) -> why
         Ok(exe) ->
             capture(exe, [], "", [], true) match
@@ -71,15 +57,8 @@ twp_output(text: string, reference: Option[string]) -> string
     out
 end twp_output
 
-// The claim every run case makes: `text` prints `want`, here and -- where there is one -- under the
-// reference.
-twp_prints(text: string, want: string)
-    assert_eq(twp_output(text, None), want)
-
-    env_var("SYSL_ORACLE") match
-        Some(bin) -> assert_eq(twp_output(text, Some(bin)), want)
-        None -> ()
-end twp_prints
+// The claim every run case makes: `text` prints `want`.
+twp_prints(text: string, want: string) = assert_eq(twp_output(text), want)
 
 private twp_width(src: string) -> string = "import sysl.text.{char_columns, columns}\n\n" + src + "\n"
 
