@@ -279,7 +279,7 @@ print(from_real(real.nan()).is_none(), to_string(from_real(-2.7).expect("finite"
 ```
 
 ```output
-1e+30
+1000000000000000000000000000000
 1000000000000000019884624838656
 true
 true -2

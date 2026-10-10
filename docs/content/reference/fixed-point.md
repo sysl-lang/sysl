@@ -187,7 +187,7 @@ print(a, b, c, real(d))
 ```
 
 ```output
-0.75 0.99997 -1 0.0833435
+0.75 0.99997 -1 0.083343505859375
 ```
 
 The other way round has no meaning a scale could give it, so an integer divided by a fixed-point value
