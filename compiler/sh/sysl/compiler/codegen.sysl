@@ -584,20 +584,13 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         out.push(declared_sig(e,llvm_with_overflow("mul", false, w), ir_fn_type(both, overflow_params)))
         out.push(declared_sig(e,llvm_with_overflow("add", false, w), ir_fn_type(both, overflow_params)))
 
-    // The test dispatcher's one dependency, and the only thing in a test build that is not also in
-    // an ordinary one. It is declared from the shape of the program rather than from a flag set
-    // while emitting, because the entry point is emitted after this list is read.
-    if p.entry_point && !p.tests.is_empty()
-        var cmp_params: Buf[IrParam] = buf()
-
-        cmp_params.push(ir_param(LPtr))
-        cmp_params.push(ir_param(LPtr))
-        out.push(declared_sig(e,"strcmp", ir_fn_type(l_i32(), cmp_params)))
-
     // What the dispatcher tells the runner with, and only where there is a hook for it to say
     // anything about. It is the same primitive the library prints with, at the signature the
-    // standard module already binds it at.
-    if dispatcher_marks(p) || bounds_prints
+    // standard module already binds it at. **A program exporting `write` itself is answered by its
+    // own definition**, as the library's `extern` already is, and a `declare` beside that `define`
+    // is `invalid redefinition of function`. (The dispatcher picks a test with a comparison of its
+    // own, `emit_entry.sysl`'s `test_named_text`, so a test build declares no `strcmp`.)
+    if (dispatcher_marks(p) || bounds_prints) && !emits_export(p, "write")
         var write_params: Buf[IrParam] = buf()
 
         write_params.push(ir_param(l_i32()))
@@ -669,8 +662,6 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     if defines_alloc_count(e)
         for s in alloc_count_symbols()
             seen.push(s)
-
-    if p.entry_point && !p.tests.is_empty() then seen.push("strcmp")
 
     if dispatcher_marks(p) || bounds_prints then seen.push("write")
 
