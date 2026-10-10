@@ -60,11 +60,7 @@ end prune
 private walk_program(p: TProgram, own: Buf[string]) -> &Live
     val entries = entry_points(p, own)
     val index = func_index(p)
-
-    var exports: Buf[TFunc] = buf()
-
-    for i in 0..<p.funcs.len()
-        if p.funcs.at(i).exported.is_some() then exports.push(p.funcs.at(i))
+    val exports = exports_of(p)
 
     var extra: Buf[TFunc] = buf()
     var live = no_reached()
@@ -82,28 +78,48 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
 
         more = destructors_reached(p, index, live, scan, &extra)
 
-        for i in 0..<p.externs.len()
-            val x = p.externs.at(i)
-
-            if live.call_set.has(x.name)
-                for f in exports
-                    if f.exported == Some(x.symbol) && !holds_func(extra, f.name)
-                        extra.push(f)
-                        more = true
-
-        // **The quad runtime is the sixth kind, and the call is LLVM's**: an `f128` operation lowers
-        // to `fadd fp128` and the back end turns it into `__addtf3`, so nothing in any body names the
-        // definition. Where a reached body computes with `f128`, the whole runtime is kept -- the
-        // linker takes the routines the code asks for and drops the rest -- and where none does it
-        // is left out, so a build that may not touch a float register never meets one.
-        if !holds_quad_runtime(extra) && reaches_quad(p, live)
-            for f in exports
-                if f.declared_in == QuadRuntimeModule && !holds_func(extra, f.name)
-                    extra.push(f)
-                    more = true
+        if suppliers_reached(p, live, exports, &extra) then more = true
 
     live
 end walk_program
+
+// The `@export`s the walk so far makes roots although nothing names them, added to `extra`; true where
+// one was new. **A test build asks this too** (`tests_only`): a test reaching `sysl.env.vars` reaches
+// the `sysl_env_count` extern, and only this rule keeps `sysl.env.hosted`'s answer to it.
+private suppliers_reached(p: TProgram, live: &Live, exports: Buf[TFunc], extra: *Buf[TFunc]) -> bool
+    var more = false
+
+    for i in 0..<p.externs.len()
+        val x = p.externs.at(i)
+
+        if live.call_set.has(x.name)
+            for f in exports
+                if f.exported == Some(x.symbol) && !holds_func(*extra, f.name)
+                    extra.push(f)
+                    more = true
+
+    // **The quad runtime is the sixth kind, and the call is LLVM's**: an `f128` operation lowers
+    // to `fadd fp128` and the back end turns it into `__addtf3`, so nothing in any body names the
+    // definition. Where a reached body computes with `f128`, the whole runtime is kept -- the
+    // linker takes the routines the code asks for and drops the rest -- and where none does it
+    // is left out, so a build that may not touch a float register never meets one.
+    if !holds_quad_runtime(*extra) && reaches_quad(p, live)
+        for f in exports
+            if f.declared_in == QuadRuntimeModule && !holds_func(*extra, f.name)
+                extra.push(f)
+                more = true
+
+    more
+end suppliers_reached
+
+// Every `@export` of the program, the candidates `suppliers_reached` looks among.
+private exports_of(p: TProgram) -> Buf[TFunc]
+    var exports: Buf[TFunc] = buf()
+
+    for i in 0..<p.funcs.len()
+        if p.funcs.at(i).exported.is_some() then exports.push(p.funcs.at(i))
+
+    exports
 
 // The module whose `@export`s are the binary128 routines LLVM calls.
 const QuadRuntimeModule: string = "sysl.softfloat"
@@ -830,6 +846,7 @@ tests_only(p: TProgram, own: Buf[string]) -> TProgram
     val entries = entry_points(kept, own)
     val index = func_index(kept)
     val scan = type_scan()
+    val exports = exports_of(kept)
 
     var extra: Buf[TFunc] = buf()
     var live = no_reached()
@@ -853,6 +870,8 @@ tests_only(p: TProgram, own: Buf[string]) -> TProgram
             add_call(live, item.name)
 
         more = destructors_reached(kept, index, live, scan, &extra)
+
+        if suppliers_reached(kept, live, exports, &extra) then more = true
 
     var externs: Buf[TExtern] = buf()
 
