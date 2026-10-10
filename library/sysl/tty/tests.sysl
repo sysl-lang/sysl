@@ -1,0 +1,50 @@
+module sysl.tty
+@requires(os)
+@tests
+
+// What the terminal-mode states are made of, and what they promise where there is no terminal.
+//
+// The suite's standard input is a pipe, so nothing here can change a terminal; the compiler's
+// `tests_sth_sleep_tty_hooks.sysl` runs programs on one made by `script`. What can be asserted here is
+// the mapping each state is -- which settings it changes and which it leaves as found -- and that
+// every entry point answers the absence of a terminal rather than pretending.
+
+private found_here() -> Mode = Mode(true, true, true, false, false, 4, 9)
+
+@test("hidden turns echo and signals off and leaves line editing and everything else as found")
+hidden_keeps_lines()
+    val h = hidden_of(found_here())
+
+    assert(!h.echo && !h.signals, "echo and signals should be off")
+    assert(h.canonical, "a password is still read a line at a time")
+    assert(!h.output && !h.crlf, "the output settings are the ones found")
+    assert(h.min == 4 && h.time == 9, "min and time are the ones found")
+end hidden_keeps_lines
+
+@test("raw turns line editing, echo and signals off, and asserts output processing and min 1 time 0")
+raw_is_cbreak()
+    val r = raw_of(found_here())
+
+    assert(!r.echo && !r.canonical && !r.signals, "echo, lines and signals should be off")
+    assert(r.output && r.crlf, "output processing is asserted rather than kept")
+    assert(r.min == 1 && r.time == 0, "a read waits for one byte and no longer")
+end raw_is_cbreak
+
+@test("hidden after raw is the found mode with echo off, not raw's with lines turned back on")
+states_derive_from_the_found_mode()
+    val f = found_here()
+
+    assert(hidden_of(f) == hidden_of(hidden_of(f)), "hidden is the same however often it is asked")
+    assert(raw_of(f).min != hidden_of(f).min, "each state is made from what was found")
+end states_derive_from_the_found_mode
+
+@test("with no terminal on standard input every entry point says so and nothing is changed")
+no_terminal_answers()
+    assert(mode() == None, "a pipe has no mode")
+    assert(!raw(), "raw should answer false where there is no terminal")
+    assert(!hidden(), "hidden should answer false where there is no terminal")
+    assert(!set_mode(found_here()), "set_mode should answer false where there is no terminal")
+
+    cooked()
+    cooked()
+end no_terminal_answers

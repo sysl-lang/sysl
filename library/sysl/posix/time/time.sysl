@@ -1,7 +1,7 @@
 module sysl.posix.time
 @requires(posix, libc)
 
-import sysl.time.{Instant, Duration, micros, whole_micros}
+import sysl.time.{Instant, Duration, micros}
 
 /** Reading the two clocks the host keeps, which is the one thing `sysl.time` deliberately cannot do.
  *
@@ -96,18 +96,20 @@ monotonic() -> Duration = micros(c_monotonic_us())
 
 // ## Waiting
 //
-// **`sysl.time` cannot carry these for the reason the header of this file gives about `now`**:
-// `nanosleep(2)` is asking an operating system for something, and a capability requirement is
-// module-wide. `sysl-lang/pico2` has a `sleep` of its own over the SDK's `sleep_us`, with this
-// signature, so the same line reads the same on a board and on a host — which is the point of the
-// `Duration` rather than a count in a unit the caller has to remember.
+// **`sysl.time.sleep` is the wait, and this module answers its seam on a host** (`supply_sleep_us` at
+// the foot of the file), so a program that waits through `sysl.time` runs unchanged on a board whose
+// package answers the same seam over its timer. `sleep` here is that same function under the name
+// this module has always had for it; `nanosleep` below stays this module's own, being the one wait a
+// `Duration` cannot name.
 
-/** Wait for `d`, however many attempts that takes.
+/** Wait for `d`, however many attempts that takes -- `sysl.time.sleep`, which waits through the seam
+ * this module answers on a host.
  *
  * **A signal cuts a wait short, and this one carries on.** `nanosleep(2)` returns early with `EINTR`
  * and the time still owed, so a wait written as one call is a wait that is quietly shorter than it
  * asked for whenever anything arrives -- which is exactly when a test that depends on it starts
- * looking flaky. This retries with the remainder until nothing is left.
+ * looking flaky. The seam answers the remainder and `sysl.time.sleep` asks again for it until nothing
+ * is left.
  *
  * **It answers nothing, because there is nothing left to say**: it returns when the time has passed.
  * A caller that wants to *know* it was interrupted wants `nanosleep` below.
@@ -118,11 +120,7 @@ monotonic() -> Duration = micros(c_monotonic_us())
  * `sleep(0.s)` is not a way to offer the processor to something else.
  */
 @blocks
-sleep(d: Duration)
-    var left = whole_micros(d) * 1000
-
-    while left > 0
-        left = c_nanosleep(left)
+sleep(d: Duration) = sysl.time.sleep(d)
 
 /** Wait for `nanos` nanoseconds, and answer how many were still owed when it stopped.
  *
@@ -144,9 +142,10 @@ nanosleep(nanos: long) -> long = c_nanosleep(nanos)
 
 // ## Answering `sysl.time`'s seam
 //
-// `sysl.time` declares `sysl_wall_us` and `sysl_monotonic_us` and defines neither, so a program that
-// writes the portable `sysl.time.now()` needs somebody to. On a host that is this module, and these
-// two lines are the whole of it (`library/sysl/time/clock.sysl` carries the argument).
+// `sysl.time` declares `sysl_wall_us`, `sysl_monotonic_us` and `sysl_sleep_us` and defines none of
+// them, so a program that writes the portable `sysl.time.now()` or `sysl.time.sleep` needs somebody
+// to. On a host that is this module, and the three functions below are the whole of it
+// (`library/sysl/time/clock.sysl` carries the argument).
 //
 // **Nothing here changes for a caller.** `now` and `monotonic` above are the same functions they
 // were, imported and called the same way, and a host program that names this module directly needs
@@ -186,3 +185,15 @@ supply_wall_us() -> long = c_realtime_us()
  */
 @export("sysl_monotonic_us")
 supply_monotonic_us() -> long = c_monotonic_us()
+
+/** Answers `sysl.time`'s sleep seam: one `nanosleep(2)` of `us` microseconds, answering the
+ * microseconds still owed when it stopped. **Call `sleep` instead** -- this exists to be linked.
+ *
+ * A remainder is rounded up to the next microsecond, so an interrupted wait is never reported as
+ * finished while a fraction of one is still owed.
+ */
+@export("sysl_sleep_us")
+supply_sleep_us(us: long) -> long
+    val left = c_nanosleep(us * 1000)
+
+    (left + 999) / 1000

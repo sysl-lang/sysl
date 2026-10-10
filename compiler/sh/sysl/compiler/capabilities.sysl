@@ -946,14 +946,38 @@ private refused_for(a: &Analysis, e: CapabilityRef, needed: Buf[(string, string)
     val ours = !from_library(a, e.scope) && !holds_string(a.tables.supplied_modules, e.from)
     val covers = effective_needs(a, e)
 
+    // A missing C library is the pair's refusal rather than its own where the pair is what is
+    // wanted, since granting one would not help.
+    val posix_c = ours && wants_posix_c(a, e, needed, covers)
+
     for cap in core
         if !is_environment(cap) || holds_string(covers, cap) then continue
         if !holds_pair(needed, e.to, cap) then continue
         if module_narrowed(a, e.from, cap) then return Some(cap)
+        if ours && a.tables.target.lacks_capability(cap) && cap == CapLibc && posix_c then return Some(CapPosixC)
         if ours && a.tables.target.lacks_capability(cap) then return Some(cap)
+
+    if posix_c then return Some(CapPosixC)
 
     None
 end refused_for
+
+// **`posix` and `libc` together ask for a POSIX system's own C library**, and no manifest can grant
+// that to a machine that is not one. Each is grantable on its own -- a kernel answering POSIX's hooks
+// is `posix` with no C library, and newlib under a board is `libc` with no POSIX system -- so a target
+// can say yes to both while having neither of the things a module requiring the pair calls by name:
+// `nanosleep`, `tcsetattr`, `pthread_create`, and the C a `sysl.posix` module carries under its
+// `__posix__` directory, which is compiled for a POSIX operating system and nowhere else. Asked of the
+// machine, which is what decides whether those exist, rather than of what its manifest says.
+private const CapPosixC: string = "posix+libc"
+
+private wants_posix_c(a: &Analysis, e: CapabilityRef, needed: Buf[(string, string)],
+                      covers: Buf[string]) -> bool
+    if os_posix(a.tables.target.os) then return false
+    if holds_string(covers, CapPosix) || holds_string(covers, CapLibc) then return false
+
+    holds_pair(needed, e.to, CapPosix) && holds_pair(needed, e.to, CapLibc)
+end wants_posix_c
 
 // Reports every reference into a module that requires an environment capability the reaching module
 // gave up.
@@ -969,7 +993,7 @@ check_gated_modules(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: B
         if is_environment(module_narrow.1) then any = true
 
     if a.tables.target.lacks_capability(CapOs) || a.tables.target.lacks_capability(CapPosix) ||
-            a.tables.target.lacks_capability(CapLibc) then
+            a.tables.target.lacks_capability(CapLibc) || !os_posix(a.tables.target.os) then
         any = true
 
     // Nothing narrowed anything and the machine has everything, which is almost every compilation:
@@ -1019,12 +1043,14 @@ check_gated_modules(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: B
 
         val e = first.unwrap().0
         val cap = first.unwrap().1
-        val why = if module_narrowed(a, e.from, cap) then gave_it_up(e.from, cap)
+        val why = if cap == CapPosixC then not_a_posix_system(a)
+        elif module_narrowed(a, e.from, cap) then gave_it_up(e.from, cap)
         else target_lacks_it(a, cap)
         val what = if e.dies then s"a '${qualified_name(e.named)}' can die here, and its destructor"
         else "this"
+        val wanted = if cap == CapPosixC then "'posix' and 'libc'" else s"'$cap'"
 
-        a.fault(e.scope, e.span, s"$what reaches '${qualified_name(e.to)}', which requires '$cap', and $why")
+        a.fault(e.scope, e.span, s"$what reaches '${qualified_name(e.to)}', which requires $wanted, and $why")
 end check_gated_modules
 
 // -- a type is charged for the code it runs -------------------------------------------------------
@@ -1250,6 +1276,16 @@ private gave_it_up(from: string, cap: string) -> string
     s"$here declared 'no $cap' — an environment capability gates which modules exist, so a " +
         "module that gave one up may not reach one that needs it"
 end gave_it_up
+
+// Why an edge into a module requiring `posix` and `libc` is refused on a machine that is not a POSIX
+// operating system, whatever its manifest grants (`wants_posix_c`).
+private not_a_posix_system(a: &Analysis) -> string =
+    s"'${a.tables.target.name}' is not a POSIX operating system — the two together are a POSIX " +
+        "system's own C library, and what a manifest grants on it is neither: 'posix' is hooks a " +
+        "program answers and 'libc' a C library without a POSIX system's calls, so this reference " +
+        "cannot be made on this machine. 'sysl.time' and 'sysl.tty' wait, read the clock and " +
+        "change a terminal " +
+        "through hooks a board or a kernel answers"
 
 // Why an edge is refused where the machine never had the capability.
 private target_lacks_it(a: &Analysis, cap: string) -> string

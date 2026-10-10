@@ -940,20 +940,43 @@ environment behaving as POSIX says, and `libc` is a library of C functions to li
 [`sysl.fs`](/library/fs/) or reading a descriptor through [`sysl.io`](/library/io/) still answers
 their hooks with its own `@export`s, `libc` granted or not — the refusal says so where it was.
 
-**A module that calls C by symbol requires `libc`**, and every module under `sysl.posix` does —
-`nanosleep`, `pthread_create`, `isatty` and `getentropy` are functions to link, as well as POSIX's
-behaviour, so each is `@requires(posix, libc)`. A program reaching one on a freestanding target is
-refused at the reference, before any C, rather than at the link:
+**A module that calls C by symbol requires `libc`**, and so does a declaration — `@needs(libc)` on
+an `extern`. A program reaching one on a freestanding target is refused at the reference, before any
+C, rather than at the link:
+
+```sysl target=aarch64-freestanding
+@needs(libc)
+extern "strlen" c_strlen(s: *u8) -> usize
+
+@export("count")
+count(s: *u8) -> usize = c_strlen(s)
+```
+
+```error
+which needs 'libc', and 'aarch64-freestanding' does not provide it — a freestanding target starts without a C library, so either this reference cannot be made on this machine or 'package.hocon' grants one with 'capabilities { libc = true }'
+```
+
+**Every module under `sysl.posix` requires `posix` and `libc` together, and the pair is a POSIX
+system's own C library** — `nanosleep`, `pthread_create`, `tcsetattr` and `getentropy` to link, and
+the C a `sysl.posix` module carries under its `__posix__` directory, which is compiled for a POSIX
+operating system and nowhere else. A board's newlib is a C library and a kernel answering hooks is
+POSIX's behaviour, and neither is that. So a module requiring both is refused on any machine that is
+not a POSIX operating system however its manifest is written — `libc = true` granted or not — at the
+reference, rather than at a link naming a symbol no line of the program contains:
 
 ```sysl target=aarch64-freestanding
 import sysl.posix.time.nanosleep
 
-nanosleep(1000)
+@export("tick")
+tick() -> long = nanosleep(1000)
 ```
 
 ```error
-this reaches 'sysl.posix.time', which requires 'libc', and 'aarch64-freestanding' does not provide it — a freestanding target starts without a C library, so either this reference cannot be made on this machine or 'package.hocon' grants one with 'capabilities { libc = true }'
+this reaches 'sysl.posix.time', which requires 'posix' and 'libc', and 'aarch64-freestanding' is not a POSIX operating system
 ```
+
+The waiting, the clocks and the terminal modes a board wants are [`sysl.time`](/library/time/)'s and
+[`sysl.tty`](/library/term/)'s, which go through hooks the board answers.
 
 **The modules whose every call goes through a hook require only what the hooks are about** — the
 answer underneath is the one that may need a C library, and a kernel answering them needs none:
@@ -962,7 +985,9 @@ answer underneath is the one that may need a C library, and a kernel answering t
 |---|---|---|
 | `sysl.fs`, `sysl.env`, `sysl.signal`, `sysl.net` | `os` | `os, libc` (`sysl.fs`, `sysl.env`); `posix, libc` (`sysl.signal`, `sysl.net`) |
 | `sysl.process` | `posix` | `posix, libc` |
+| `sysl.tty` | `os` | `os, libc` |
 | `sysl.io` | nothing | `libc` |
+| `sysl.time` | nothing — its clocks and `sleep` are seams | `posix, libc` (`sysl.posix.time`) |
 | `sysl.posix.time`, `.tty`, `.threads`, `.rand` | `posix, libc` | — |
 
 So a bare program answering `sysl.env`'s or `sysl.process`'s hooks builds with no C library, and the

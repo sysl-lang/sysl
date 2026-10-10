@@ -1,0 +1,59 @@
+module sysl.tty.sys
+
+// The calls `sysl.tty` makes of whatever owns the terminal underneath it: what mode a terminal is in,
+// and putting it in another.
+//
+// **Each is an `extern` naming a symbol no module here defines**, so what answers it is decided by
+// what the program is linked with (`reference/ffi.md § A module may supply another module's extern`),
+// exactly as for `sysl.env.sys` and the other `*.sys` modules:
+//
+// | linked with | what defines the symbols |
+// |---|---|
+// | a program for a hosted POSIX target | `sysl.tty.hosted`, over `tcgetattr` and `tcsetattr` |
+// | a program for a target with no C library | the program, with an `@export` per hook it reaches |
+//
+// A freestanding program that reaches one of these and leaves it unanswered is refused when it is
+// compiled, naming the hooks it reached, rather than at the link.
+//
+// ## The shape of a hook
+//
+// **A hook answers one integer: zero, or the code of the failure negated** -- the contract of every
+// `*.sys` module. A descriptor that is not a terminal answers `ENOTTY` negated, and **a target that
+// cannot change a terminal's mode at all answers `UNSUPPORTED`** (`sysl.sys`, -38 on every platform).
+//
+// **The mode crosses as a `Mode` behind a pointer**, a record of the few settings a program asks
+// about rather than a platform's `struct termios`, which is laid out differently everywhere. An
+// answerer reads its own terminal's settings into it, and writes back from it **only** what it
+// names: every other setting the terminal has is left exactly as it was found.
+
+/** The settings of a terminal a program changes, each named for what it does rather than for the
+ * POSIX flag that does it.
+ *
+ * - `echo` -- typed characters are shown as they arrive (`ECHO`).
+ * - `canonical` -- input is released a whole line at a time, with the line editing the terminal
+ *   does itself (`ICANON`); off, every byte is released as it arrives.
+ * - `signals` -- Ctrl-C and its kin become signals rather than bytes (`ISIG`).
+ * - `output` -- what is written is processed on its way out at all (`OPOST`).
+ * - `crlf` -- a `\n` written goes out as `\r\n` (`ONLCR`), which only means something with `output`.
+ * - `min` and `time` -- with `canonical` off, how many bytes a read waits for and how many tenths of
+ *   a second it waits (`VMIN`, `VTIME`).
+ */
+struct Mode derives Eq
+    echo: bool
+    canonical: bool
+    signals: bool
+    output: bool
+    crlf: bool
+    min: u8
+    time: u8
+end Mode
+
+/** The mode the terminal at descriptor `fd` is in, written into `into`: zero, or the code of the
+ * failure negated.
+ */
+private[sysl] extern "sysl_tty_get" get(fd: int, into: *Mode) -> int
+
+/** Puts the terminal at descriptor `fd` into `mode`, changing what the record names and nothing
+ * else: zero, or the code of the failure negated.
+ */
+private[sysl] extern "sysl_tty_set" set(fd: int, mode: *Mode) -> int

@@ -1,6 +1,7 @@
 module sysl.time
 
-// Reading a clock without naming one: the two symbols a program asks for and something else defines.
+// Reading a clock and waiting on one without naming either: the three symbols a program asks for and
+// something else defines.
 //
 // **`sysl.time` cannot read a clock and this file does not change that.** It declares two `extern`s
 // and defines neither, which costs the module nothing -- an `extern` is a name and a signature, so
@@ -60,6 +61,17 @@ module sysl.time
 private extern "sysl_wall_us" c_wall_us() -> long
 private extern "sysl_monotonic_us" c_mono_us() -> long
 
+// ## Waiting is the third seam, and it answers what is still owed
+//
+// A board that can be read but not waited on is half a clock, so `sleep` goes through a seam of its
+// own beside the two readings, answered the same way -- `sysl.posix.time` over `nanosleep(2)` on a
+// host, a board's or a kernel's own package over its timer. **It takes microseconds and answers the
+// microseconds still owed**: zero when the whole wait passed, more when something cut it short (a
+// signal, on a host). The loop that waits out the remainder is `sleep`'s, below, so an answerer does
+// one wait and reports honestly rather than each one writing its own retry.
+@blocks
+private extern "sysl_sleep_us" c_sleep_us(us: long) -> long
+
 /** The wall clock: where whatever is keeping time thinks it is on the timeline.
  *
  * **Two readings of this may differ by anything at all**, including a negative amount, because it is
@@ -79,3 +91,22 @@ now() -> Instant = Instant(c_wall_us())
  * difference from `now` and the reason a measurement wants this one.
  */
 monotonic() -> Duration = micros(c_mono_us())
+
+/** Wait for `d`, however many attempts that takes.
+ *
+ * **An interrupted wait carries on**: whatever answers the seam reports the time still owed, and this
+ * asks again for exactly that until nothing is left, so a signal arriving on a host makes the wait no
+ * shorter. It answers nothing, because it returns when the time has passed.
+ *
+ *     sleep(millis(50))
+ *
+ * A duration of zero or less returns at once without asking anything. `sysl.posix.time.sleep` is this
+ * same function, and `sysl.posix.time.nanosleep` is the one to reach for where a wait shorter than a
+ * microsecond, or the interruption itself, matters.
+ */
+@blocks
+sleep(d: Duration)
+    var left = whole_micros(d)
+
+    while left > 0
+        left = c_sleep_us(left)

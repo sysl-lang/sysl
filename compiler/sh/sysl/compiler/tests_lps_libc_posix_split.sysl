@@ -42,29 +42,36 @@ private val lps_libc_advice: string =
 
 // -- a module that calls C by symbol ------------------------------------------------------------------
 
-@test("a freestanding program reaching sysl.posix.time is refused at compile time, naming libc")
+// It needs a POSIX system's C library, so the refusal names the pair rather than advising a
+// `libc = true` that would not admit it.
+@test("a freestanding program reaching sysl.posix.time is refused at compile time, naming posix and libc")
 lps_posix_time_needs_libc()
     if !lbr_ready() then return
 
     val said = lps_build(lps_sleeps, lps_package, lps_target)
 
     assert(said.0 != 0, "built sysl.posix.time with no C library")
-    assert(said.1.contains(s"error: this reaches 'sysl.posix.time', which requires 'libc', and " +
-        s"'$lps_target' $lps_libc_advice"), said.1)
+    assert(said.1.contains(s"error: this reaches 'sysl.posix.time', which requires 'posix' and " +
+        s"'libc', and '$lps_target' is not a POSIX operating system"), said.1)
+    assert(!said.1.contains("capabilities { libc = true }"), said.1)
     assert(said.1.contains("main.sysl:1:1"), said.1)
 
     // Told before any C, so the shim's symbol is never what the reader sees.
     assert(!said.1.contains("sysl_posix_time_nanosleep"), said.1)
 end lps_posix_time_needs_libc
 
-@test("granting libc in the target block re-admits sysl.posix.time")
-lps_libc_granted_readmits()
+// Its C is compiled for a POSIX operating system and nowhere else, so `libc = true` alone would have
+// let a board's link fail on `sysl_posix_time_nanosleep` (`tests_sth_sleep_tty_hooks.sysl`).
+@test("granting libc in the target block does not re-admit sysl.posix.time, the target not being POSIX")
+lps_libc_granted_is_not_posix()
     if !lbr_ready() then return
 
     val said = lps_build(lps_sleeps, lps_with("libc = true"), lps_target)
 
-    assert(said.0 == 0, said.1)
-end lps_libc_granted_readmits
+    assert(said.0 != 0, "built sysl.posix.time on a freestanding target")
+    assert(said.1.contains("which requires 'posix' and 'libc', and 'aarch64-freestanding' is not a " +
+                           "POSIX operating system"), said.1)
+end lps_libc_granted_is_not_posix
 
 @test("a hosted target builds the same program unchanged")
 lps_hosted_unchanged()

@@ -39,7 +39,7 @@ module sysl.posix.threads
 ```
 
 **What is here is pthreads**, which is the whole claim and the reason the module lives under
-`sysl.posix` beside [`sysl.posix.tty`](/library/term/#taking-the-terminal-over-sysl-posix-tty-raw) and
+`sysl.posix` beside [`sysl.posix.tty`](/library/term/#whether-to-write-escapes-at-all-sysl-posix-tty) and
 [`sysl.posix.rand`](/library/rand/). A module in that namespace is one a freestanding target does not
 get, and the path is enough to know it without opening the file.
 

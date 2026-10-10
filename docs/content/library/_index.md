@@ -52,7 +52,8 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 | [`sysl.sync`](/library/sync/) | `Atomic[T]`, `SpinLock`, and the five memory orderings | — |
 | [`sysl.posix.threads`](/library/threads/) | `spawn`, `Thread.join`, `yield_now`, `Mutex[T]`, and `Channel[T]` — the bounded queue two threads hand values across | `posix` |
 | [`sysl.term`](/library/term/) | the escape sequences a terminal understands — colour, emphasis, and the screen | — |
-| [`sysl.posix.tty`](/library/term/#whether-to-write-escapes-at-all-sysl-posix-tty) | whether to write them at all — `is_tty`, `color_wanted`, `color`, `color_err` — and taking the terminal over: `raw`, `cooked`, `flush`, `tty_writer` | `posix` |
+| [`sysl.posix.tty`](/library/term/#whether-to-write-escapes-at-all-sysl-posix-tty) | whether to write them at all — `is_tty`, `color_wanted`, `color`, `color_err` — and the host's half of taking the terminal over: `flush`, `tty_writer`, and `sysl.tty`'s `raw`, `hidden` and `cooked` under this module's names | `posix` |
+| [`sysl.tty`](/library/term/#taking-the-terminal-over-sysl-tty) | a terminal's mode — `raw`, `hidden` for a password, `cooked`, and `mode`/`set_mode` over a `Mode`; answered by the program where there is no C library (`sysl.tty.sys`) | `os` |
 | [`sysl.term.edit`](/library/term/#reading-a-line-sysl-term-edit) | a line editor for a terminal with no line discipline — echo, editing, history, over a `Reader` and a `Writer` | — |
 | [`sysl.slices`](/library/slices/) | what a program does *to* a `[]T` — searching, comparing, `reverse`, `copy`, two sorts that neither allocate, `binary_search`, and `as_ptr` for a C binding | — |
 | [`sysl.seq`](/library/seq/) | what a program asks *of* a sequence — `map`, `filter`, `fold`, `any`, `all`, `find`, `position`, `count_where`, `each`, `flat_map`, on a slice or a `Buf` alike | — |

@@ -841,10 +841,10 @@ Both require `posix`.
 
 ### Waiting
 
-Asking to be put to sleep is asking the operating system for something, so `sleep` is here for the
-same reason `now` is rather than beside `Duration`. It takes a `Duration`, which is what makes the
-line read the same on a host and on a board — `sysl-lang/pico2` has a `sleep` of its own over the
-SDK's timer, with this signature.
+`sleep` here is [`sysl.time.sleep`](#the-portable-spelling-sysl-time-now), which waits through a
+seam this module answers over `nanosleep` on a host — so the same line waits on a board whose package
+answers the seam over its timer. It takes a `Duration`, which is what makes the line read the same in
+both places.
 
 ```sysl
 import sysl.posix.time.{monotonic, sleep}
@@ -864,8 +864,9 @@ true
 **A signal cuts a wait short, and `sleep` carries on.** The system call it is built on returns early
 when anything arrives, handing back the time still owed — so a wait written as one call is quietly
 shorter than it asked for whenever a program has a handler installed, which is exactly when a test
-that depends on it starts looking flaky. `sleep` retries with the remainder until nothing is left,
-and answers nothing, because by the time it returns there is nothing left to say.
+that depends on it starts looking flaky. The seam answers that remainder and `sleep` asks again for
+it until nothing is left, and answers nothing, because by the time it returns there is nothing left
+to say.
 
 A duration of zero or less returns at once. That is not the same as yielding: `sleep(0.s)` is not a
 way to offer the processor to something else.
@@ -965,6 +966,29 @@ the same source between the two is a change to `package.hocon` rather than to an
 The mechanism is the general one — [a module may supply another module's
 `extern`](/reference/ffi/#a-module-may-supply-another-module-s-extern) — and a supplier is an ordinary
 `@export` of `sysl_wall_us` or `sysl_monotonic_us` answering a `long` of microseconds.
+
+**Waiting is the third seam.** `sysl.time.sleep(d)` asks `sysl_sleep_us(us: long) -> long` to wait,
+and the answer is the microseconds still owed — zero when the whole wait passed — which `sleep` asks
+for again until nothing is left. A host answers it over `nanosleep`; a board or a kernel answers it
+over its timer, in the same shape — here a board whose timer is a counter, built as the archive its C
+project links:
+
+```sysl build=c target=aarch64-freestanding
+import sysl.time.{sleep, millis}
+
+var asked: long = 0
+
+@export("sysl_sleep_us")
+board_sleep(us: long) -> long
+    asked += us
+    0
+
+@export("pause")
+pause() = sleep(millis(3))
+```
+
+A freestanding program that waits and answers none of it builds too, and its archive leaves
+`sysl_sleep_us` for the board's own link to answer, exactly as it leaves the two clocks.
 
 **Both spellings are right and neither is deprecated.** A program that is only ever going to run on a
 host imports `sysl.posix.time` and calls `now` directly, which needs no linker cooperation at all; a

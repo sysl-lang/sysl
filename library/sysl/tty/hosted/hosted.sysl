@@ -1,0 +1,79 @@
+module sysl.tty.hosted
+@requires(os, libc)
+
+import sysl.sys.{UNSUPPORTED, host_status}
+import sysl.tty.sys.Mode
+
+// `sysl.tty.sys`'s hooks answered over the platform's C library. **Call `sysl.tty` instead** --
+// nothing here is meant to be called: each exported function exists to be linked under a hook's
+// symbol, and is public only because a private export's symbol is hidden.
+//
+// **Nothing imports this module, and nothing has to.** A hook a program reaches is answered by the
+// library's own supplier (`reference/ffi.md § A module may supply another module's extern`), and its
+// exports are `weak`, so a program answering a hook itself is the one the link keeps. It requires `os`
+// and `libc`, so a freestanding target never takes it: there the program answers the hooks it
+// reaches, and one it leaves unanswered is refused by name when it is compiled.
+//
+// **`termios` is POSIX's, so on a hosted target without POSIX both hooks answer `UNSUPPORTED`.** The
+// C beside this file keeps `struct termios` on its side and hands back one packed integer each way
+// (`packed` and `unpacked` below are the whole of the agreement); it is also where the terminal that
+// was found is saved and put back at exit, which is why a program on a host needs no exit hook of its
+// own.
+
+private const echo_bit: int = 1
+private const canonical_bit: int = 2
+private const signals_bit: int = 4
+private const output_bit: int = 8
+private const crlf_bit: int = 16
+
+/** A mode as the C beside this file takes it: the five flags in the low byte, `min` in the next and
+ * `time` in the one after.
+ */
+private[sysl] packed(m: Mode) -> int
+    var bits = 0
+
+    if m.echo then bits = bits | echo_bit
+    if m.canonical then bits = bits | canonical_bit
+    if m.signals then bits = bits | signals_bit
+    if m.output then bits = bits | output_bit
+    if m.crlf then bits = bits | crlf_bit
+
+    bits | (int(m.min) << 8) | (int(m.time) << 16)
+end packed
+
+/** The mode a packed integer from the C beside this file names. */
+private[sysl] unpacked(p: int) -> Mode =
+    Mode((p & echo_bit) != 0, (p & canonical_bit) != 0, (p & signals_bit) != 0,
+         (p & output_bit) != 0, (p & crlf_bit) != 0, u8((p >> 8) & 0xff), u8((p >> 16) & 0xff))
+
+#if hosted
+#if posix
+private extern "sysl_tty_hosted_get" c_get(fd: int) -> int
+private extern "sysl_tty_hosted_set" c_set(fd: int, mode: int) -> int
+#endif
+
+@export("sysl_tty_get")
+supply_get(fd: int, into: *Mode) -> int
+#if posix
+    val p = c_get(fd)
+
+    if p < 0 then return host_status(-p)
+
+    *into = unpacked(p)
+    0
+#else
+    UNSUPPORTED
+#endif
+end supply_get
+
+@export("sysl_tty_set")
+supply_set(fd: int, mode: *Mode) -> int
+#if posix
+    val rc = c_set(fd, packed(*mode))
+
+    if rc < 0 then host_status(-rc) else 0
+#else
+    UNSUPPORTED
+#endif
+end supply_set
+#endif

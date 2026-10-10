@@ -163,20 +163,30 @@ overrides the descriptor without overriding the user's `NO_COLOR`, and that is e
 turns colour off whatever it contains, so `NO_COLOR=0` means no colour, while set-and-empty does not.
 A program reading it as a boolean and looking for `"1"` has misread the convention.
 
-## Taking the terminal over — `sysl.posix.tty.raw`
+## Taking the terminal over — `sysl.tty`
 
 A terminal at a shell is in **cooked** mode: the kernel's line discipline echoes what is typed,
 honours backspace, and hands the program a whole line at Enter. That is why `sysl.io.console_lines`
 is all a hosted program usually needs — something else is doing the editing.
 
-`raw()` puts that out of the way, so a program sees each keystroke as it is typed.
+`raw()` puts that out of the way, so a program sees each keystroke as it is typed, and `hidden()`
+keeps the lines and stops the echo, which is what a password prompt wants.
 
 | name | does |
 |---|---|
 | `raw()` | cbreak mode — keystrokes arrive as typed, nothing is echoed. **Answers whether it worked** |
-| `cooked()` | puts back what `raw` changed, and only that |
-| `flush()` | pushes out what C is holding — a prompt with no newline after it |
-| `tty_writer()` | standard output as a sink that flushes what it is given |
+| `hidden()` | password mode — whole lines with the terminal's own editing, nothing echoed. **Answers whether it worked** |
+| `cooked()` | puts back the mode the terminal was in before the first `raw` or `hidden`, and only what they changed |
+| `mode()`, `set_mode(m)` | the terminal's `Mode` — `echo`, `canonical`, `signals`, `output`, `crlf`, `min`, `time` — read and written |
+| `flush()` | (`sysl.posix.tty`) pushes out what C is holding — a prompt with no newline after it |
+| `tty_writer()` | (`sysl.posix.tty`) standard output as a sink that flushes what it is given |
+
+**`sysl.tty` asks for no C library.** Every call goes through the two hooks of `sysl.tty.sys`,
+`sysl_tty_get` and `sysl_tty_set` over a `Mode`, answered over `termios` on a host and by the program
+— a kernel, a board's console — with an `@export` where there is no C library; a freestanding program
+that changes a terminal and answers neither is refused when it is compiled, naming both.
+`sysl.posix.tty`'s `raw`, `hidden` and `cooked` are these same functions under the names that module
+has always had.
 
 **`raw()` answering `false` is not an error — it is the other situation.** With input redirected from
 a file or a pipe there is no terminal to change, and an editor is the wrong facility anyway: nothing
@@ -206,36 +216,47 @@ a pipe
 That output is the point rather than an accident, exactly as above: this page's programs run with
 their input closed, so `raw()` declines and the cooked path is what runs.
 
-### What it sets, and the one thing it gives up
+### What each sets, and the one thing both give up
 
-`-icanon -echo -isig opost onlcr`. Output translation is **asserted rather than assumed** — nothing
-here turns it off, so leaving it out looked safe, and a terminal that arrives without it makes every
-`print` stair-step down the screen while the editor's own output looks fine.
+`raw` is `-icanon -echo -isig opost onlcr min 1 time 0`, and `hidden` is `-echo -isig` with
+everything else as it was found. Both are made from the mode the first of them found, so moving from
+one to the other is never a drift. Output translation is **asserted rather than assumed** in `raw` —
+nothing here turns it off, so leaving it out looked safe, and a terminal that arrives without it makes
+every `print` stair-step down the screen while the editor's own output looks fine.
 
-**Signals go, and that is a choice rather than a limitation.** Leaving `isig` alone would keep Ctrl-C
-interrupting, which reads like a feature for a REPL. It used not to be available at all: a program
-interrupted in cbreak mode must restore the terminal from a signal handler, and restoring meant
-allocating a command string and forking a shell, neither of which is async-signal-safe — so the
-handler deadlocked rather than tidying up. That was a fact about `stty`, and restoring is now one
-`tcsetattr` on a saved struct, which POSIX lists as async-signal-safe. The handler is still not
-written, because `-isig` means there is no signal to catch and every exit is an ordinary one.
-Ctrl-C arrives as **byte 3** for the editor instead.
+**Signals go, in both, and that is a choice rather than a limitation.** Leaving `isig` alone would
+keep Ctrl-C interrupting, which reads like a feature for a REPL — and a program interrupted with echo
+off leaves a shell that shows nothing as it is typed. With `-isig` Ctrl-C arrives as **byte 3**
+instead, so every way out of the program is an ordinary exit; `getpass(3)` turns signals off for the
+same reason.
 
 What that costs is worth saying plainly: a program that has stopped responding can no longer be
 interrupted from its own terminal, and the escape is `kill` from another one. What it buys is that
 the terminal is never left broken, and that a hosted program behaves exactly like one on a board —
 which never had signals to disable.
 
-**It is `termios`, through a shim, and it used to be `stty` through `system`.** `struct termios` is
-caller-allocated and laid out differently on every platform, which is the transcription the library
-refuses — so the structure stays in C and a file descriptor is all that crosses. The shim sits in a
-per-OS directory ([modules](/reference/modules/)), which is what keeps a `#include <termios.h>` away
-from a target that has no terminal to configure.
+**On a host the terminal is put back at exit even without `cooked()`.** The hosted answer is
+`termios` through a shim beside `sysl.tty.hosted` — `struct termios` is caller-allocated and laid out
+differently on every platform, so it stays in C and a descriptor and a packed `Mode` are all that
+cross — and its first change saves the whole `struct termios` it found and registers `atexit` to put
+it back. `cooked` restores **what was actually there**: exactly the settings `Mode` names, as they
+were found, and nothing it never changed. **A freestanding program gets no exit hook from the
+library**, there being no C library to register one with: it calls `cooked()` on its way out, and a
+kernel that keeps a terminal's mode past a process keeps whatever it was left in.
 
-Three things follow: no shell is forked to set two flags; `cooked` restores **what was actually
-there**, from a saved struct, where naming `icanon echo isig` to put back would restore a different
-terminal from the one it found; and it works when standard input is not the shell's, since the shim
-is handed a descriptor where `stty` acted on whatever it inherited.
+```sysl
+import sysl.tty
+
+if tty.hidden()
+    print("reading a password")
+    tty.cooked()
+else
+    print("no terminal: nothing to hide")
+```
+
+```output
+no terminal: nothing to hide
+```
 
 ## Reading a line — `sysl.term.edit`
 
