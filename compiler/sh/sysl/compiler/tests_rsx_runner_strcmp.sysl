@@ -1,0 +1,111 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// **The test runner depends on no C name a package may export.** The dispatcher picked a test with
+// libc's `strcmp` and a test build declared it, so a package defining `@export("strcmp")` -- a
+// freestanding runtime's string functions are exactly that -- built with `build-c` and failed
+// `sysl test` with clang's `invalid redefinition of function 'strcmp'`; had it linked, the runner
+// would have asked the package's own export which test to run. The dispatcher now compares with a
+// private function of its own (`emit_entry.sysl`'s `test_named_text`). `write`, which the dispatcher
+// writes its phase marks with, is declared only where the program does not define it.
+
+// A package of one module, `sh.rsx`: `code` beside it, and one `@tests` file.
+private rsx_package(code: string, tests: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-rsx").unwrap())
+
+    make_dir_all(s"$root/sh/rsx").unwrap()
+    write_text(s"$root/package.hocon", "package { name = \"rsx\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/sh/rsx/code.sysl", "module sh.rsx\n\n" + code).unwrap()
+    write_text(s"$root/sh/rsx/tests.sysl", "module sh.rsx\n@tests\n\n" + tests).unwrap()
+    root
+end rsx_package
+
+private rsx_strcmp_code() -> string = raw"""
+    @export("strcmp")
+    c_strcmp(a: *u8, b: *u8) -> i32
+        var i: usize = 0
+
+        loop
+            if a[i] != b[i] then return if a[i] < b[i] then -1 else 1
+            if a[i] == 0 then return 0
+
+            i += 1
+    """
+
+@test("a package exporting strcmp runs its tests, each found by its own name")
+rsx_a_package_exporting_strcmp_runs_its_tests()
+    if std_root().is_err() then return
+
+    val tests = raw"""
+        @test("one")
+        one() = assert(true)
+
+        @test("two")
+        two() = assert(1 + 1 == 2)
+        """
+    val root = rsx_package(rsx_strcmp_code(), tests)
+    val (code, out, err) = clx_ran(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine)
+    assert(out.contains("2 passed, 0 failed"), s"$out$err")
+end rsx_a_package_exporting_strcmp_runs_its_tests
+
+// The dispatcher compared names with the export it was testing: a test of the export itself, by a
+// name the export would have answered wrongly, still has to be the test that runs.
+@test("the package's own strcmp is what its tests call, and the runner does not")
+rsx_the_exported_strcmp_is_the_packages()
+    if std_root().is_err() then return
+
+    val tests = raw"""
+        extern "strcmp" c_cmp(a: *u8, b: *u8) -> i32
+
+        @test("the export orders")
+        orders() =
+            assert(c_cmp(as_ptr("ab\u{0}".bytes), as_ptr("ac\u{0}".bytes)) < 0)
+
+        @test("the export agrees")
+        agrees() = assert(c_cmp(as_ptr("ab\u{0}".bytes), as_ptr("ab\u{0}".bytes)) == 0)
+        """
+    val root = rsx_package(rsx_strcmp_code(), "import sysl.slices.as_ptr\n\n" + tests)
+    val (code, out, err) = clx_ran(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine)
+    assert(out.contains("2 passed, 0 failed"), s"$out$err")
+end rsx_the_exported_strcmp_is_the_packages
+
+// `write` is what the dispatcher reports a `@setup` returning with, so a module with one declared it
+// beside the package's own definition. Unlike a comparison it has no private stand-in -- it is the
+// system's -- so the package's own `write` is what the mark goes through, as the library's printing
+// already does: this one writes nothing, and the build linking and the test being reported is the
+// claim, not its verdict.
+@test("a package exporting write builds its tests behind a setup hook and reports them")
+rsx_a_package_exporting_write_runs_its_tests()
+    if std_root().is_err() then return
+
+    val code_text = raw"""
+        @export("write")
+        c_write(fd: int, p: *u8, n: usize) -> isize = isize(n)
+        """
+    val tests = raw"""
+        private var seen: int = 0
+
+        @setup
+        prep() =
+            seen = 1
+
+        @test("set up")
+        set_up() = assert(seen == 1)
+        """
+    val root = rsx_package(code_text, tests)
+    val (code, out, err) = clx_ran(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(!err.contains("invalid redefinition"), err)
+    assert(!err.contains("clang failed"), err)
+    assert(out.contains("set up"), s"$out$err")
+end rsx_a_package_exporting_write_runs_its_tests

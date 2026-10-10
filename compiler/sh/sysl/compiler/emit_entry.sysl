@@ -273,8 +273,8 @@ gen_test_main(e: *Emit, p: TProgram) -> Option[IrFunc]
     emit(e, InLoad(want, LPtr, slot, AccPlain, None))
 
     // Each arm compares the wanted name against one test's key and calls it on a match. The keys are
-    // interned with the terminator `strcmp` reads to, which an ordinary sysl string constant does
-    // not carry: a `string` knows its own length and has never had a use for one.
+    // interned with the terminator the comparison reads to, which an ordinary sysl string constant
+    // does not carry: a `string` knows its own length and has never had a use for one.
     for t in p.tests
         val run = fresh_label(e, "test.run")
         val next = fresh_label(e, "test.next")
@@ -331,19 +331,51 @@ gen_test_main(e: *Emit, p: TProgram) -> Option[IrFunc]
 end gen_test_main
 
 private dispatch_on(e: *Emit, want: Val, key: string, run: string, next: string)
-    val cmp = fresh_reg(e)
+    val named = request_text(e, test_named_symbol(), test_named_text(s"i${e.word_bits}"))
+    val hit = fresh_reg(e)
 
     var args: Buf[IrArg] = buf()
 
     args.push(ir_arg(LPtr, want))
     args.push(ir_arg(LPtr, string_global(e, key + "\u{0}")))
-    emit(e, ir_call(Some(cmp), l_i32(), VGlobal("strcmp"), args))
-
-    val hit = fresh_reg(e)
-
-    emit(e, InIntCmp(hit, IEq, l_i32(), cmp, VInt(from_int(0))))
+    emit(e, ir_call(Some(hit), l_i1(), VGlobal(named), args))
     emit_term(e, InCondBr(hit, run, next))
 end dispatch_on
+
+// The comparison the dispatcher picks a test with: whether two terminated names are the same bytes.
+//
+// **It is the module's own and `private`, never C's `strcmp`**: a package may `@export("strcmp")` --
+// a freestanding runtime's string functions are exactly that -- and a `declare` of the name beside
+// that `define` is `invalid redefinition of function`; were it to link, the runner would be asking
+// the package's own export which test to run. A name the program cannot write cannot collide.
+test_named_symbol() -> string = "sysl.test.named"
+
+test_named_text(word: string) -> string
+    s"""
+    define private i1 @sysl.test.named(ptr %a, ptr %b) {
+    entry:
+      br label %cond
+    cond:
+      %i = phi $word [ 0, %entry ], [ %next, %step ]
+      %pa = getelementptr i8, ptr %a, $word %i
+      %pb = getelementptr i8, ptr %b, $word %i
+      %ba = load i8, ptr %pa
+      %bb = load i8, ptr %pb
+      %same = icmp eq i8 %ba, %bb
+      br i1 %same, label %more, label %differ
+    more:
+      %ended = icmp eq i8 %ba, 0
+      br i1 %ended, label %equal, label %step
+    step:
+      %next = add $word %i, 1
+      br label %cond
+    equal:
+      ret i1 true
+    differ:
+      ret i1 false
+    }
+    """
+end test_named_text
 
 // One byte to standard error, saying how far the dispatcher has got.
 //
