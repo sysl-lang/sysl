@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
-import sysl.container.{Map, map}
+import sysl.container.{Map, map, Set}
 
 // What an object reached through an atomic reference may contain.
 //
@@ -355,6 +355,11 @@ end check_crossing
 // **A `val` filled at run time is asked as a `var` is**, since reading it takes a share of the same
 // count; a `val` laid down as constant data is not, and neither is `@thread_local` storage, which is
 // one copy per thread.
+//
+// **Nor is `@main_thread` storage**, whose declaration promises what this walk cannot see: that the
+// body in the other domain only ever runs on the main thread. The promise is checked where it can
+// be, at run time -- every access from a body `bodies_in_other_domains` names traps unless it is
+// made on the main thread.
 
 // Where a body that runs in another domain begins: the functions it starts at, where the refusal is
 // placed, and the opening of the sentence that refuses it.
@@ -468,6 +473,51 @@ private note_sync_erasure(out: &DomainRoots, p: TProgram, tables: Map[string, us
         _ -> ()
 end note_sync_erasure
 
+// Every body that may run in another domain: the functions a `&sync` object's table points at and
+// the interrupt handlers, with everything they reach -- `check_shared_storage`'s roots and walk,
+// answered with the bodies rather than the storage. It is where an access to `@main_thread` storage
+// is checked at run time.
+bodies_in_other_domains(p: TProgram) -> Set[string]
+    val roots: &RootNames = RootNames(buf())
+
+    var tables: Map[string, usize] = map()
+
+    for i in 0..<p.vtables.len()
+        tables.put(p.vtables.at(i).name, i)
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        walk_block_stmts(f.body, expr_walk(false, e -> note_sync_targets(roots, p, tables, e)))
+
+        if f.conv.is_some() || f.marks.domain.is_some() then roots.names.push(f.name)
+
+    walk_stmts(p.main, expr_walk(false, e -> note_sync_targets(roots, p, tables, e)))
+    funcs_reached_in_domain(p, roots.names)
+end bodies_in_other_domains
+
+private struct RootNames
+    names: Buf[string]
+end RootNames
+
+// The functions a table points at, where `e` erases a value into a `&sync` object.
+private note_sync_targets(out: &RootNames, p: TProgram, tables: Map[string, usize], e: TExpr)
+    *e.kind match
+        TErase(_, vtable, want) ->
+            val sync = want match
+                Ref(_, s) -> s
+                _ -> false
+
+            if !sync then return
+
+            tables.get(vtable) match
+                Some(k) ->
+                    for slot in p.vtables.at(k).slots
+                        out.names.push(slot.target)
+                None -> ()
+        _ -> ()
+end note_sync_targets
+
 // The type a value was before it was boxed for an object.
 private erased_inner(t: Type) -> Type = t match
     Ref(inner, _) -> *inner
@@ -476,7 +526,7 @@ private erased_inner(t: Type) -> Type = t match
 // Why one piece of module storage may not be reached from the root, or nothing where it may.
 private storage_complaint(a: &Analysis, r: DomainRoot, v: TVal, reader: string,
                           parks: bool) -> Option[string]
-    if v.thread_local then return None
+    if v.thread_local || v.main_thread then return None
 
     val part = if !v.writable && !v.computed then laid_unshareable(v.ty) else unshareable(v.ty)
 

@@ -1,0 +1,68 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **`@main_thread` storage, checked where the analysis took the program's word for it.**
+//
+// The annotation promises that only the program's main thread reaches a binding, which is what lets a
+// body in another domain -- a `&sync` closure, an interrupt handler -- name storage whose counts are
+// not atomic (`sharing.sysl`'s `storage_complaint`). The analysis cannot see the promise kept, so each
+// access from such a body asks at run time: unless the thread making it is the main one, the access
+// reports the storage it was about through `sysl_main_thread_fail` and traps, the way a failed bounds
+// check reports and traps.
+//
+// **The question is the C runtime's** (`library/sysl/__posix__/mainthread.c`): `pthread_main_np` on
+// Darwin and a thread id equal to the process id on Linux and Android. Both name the thread the
+// process began on, which needs nothing recorded at start-up -- so a `build-c` archive, whose `main`
+// is a C project's, answers the same as a program does.
+//
+// **The check is kept in every build.** What the optimizer may do is clang's, decided after this text
+// is written, so the emitted body cannot tell a debug build from an optimized one; and the check
+// costs a call only in the bodies that may run elsewhere, never in the ones the program runs itself.
+
+// The C function that answers whether the calling thread is the main one, nonzero where it is.
+main_thread_query_symbol() -> string = "sysl_on_main_thread"
+
+// The C function a failed check reports through, handed the storage's name.
+main_thread_fail_symbol() -> string = "sysl_main_thread_fail"
+
+// Whether a target's accesses are checked: one with POSIX threads, which is where the runtime's
+// question has an answer. A freestanding target refuses the annotation outright; Windows and WASI take
+// it as the promise it is, unchecked.
+main_thread_checked(t: Target) -> bool = t.os match
+    MacOS -> true
+    Linux -> true
+    Android -> true
+    _ -> false
+
+// Traps unless the calling thread is the main one, having first said which storage was reached.
+main_thread_unless(e: *Emit, symbol: string)
+    e.traps = true
+
+    var fail_params: Buf[IrParam] = buf()
+
+    fail_params.push(ir_param(LPtr))
+    request_intrinsic(e, ir_sig(main_thread_query_symbol(), ir_fn_type(l_i32(), no_params())))
+    request_intrinsic(e, ir_sig(main_thread_fail_symbol(), ir_fn_type(LVoid, fail_params)))
+
+    val answer = fresh_reg(e)
+    val ok = fresh_reg(e)
+
+    emit(e, ir_call(Some(answer), l_i32(), VGlobal(main_thread_query_symbol()), no_ir_args()))
+    emit(e, InIntCmp(ok, INe, l_i32(), answer, VInt(from_int(0))))
+
+    val ok_l = fresh_label(e, "main_thread.ok")
+    val bad_l = fresh_label(e, "main_thread.bad")
+
+    emit_term(e, InCondBr(ok, ok_l, bad_l))
+    emit_label(e, bad_l)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, c_text_of(e, qualified_name(symbol))))
+    emit(e, ir_call(None, LVoid, VGlobal(main_thread_fail_symbol()), args))
+    emit(e, ir_call(None, LVoid, VGlobal(llvm_trap()), no_ir_args()))
+    emit_term(e, InUnreachable)
+    emit_label(e, ok_l)
+end main_thread_unless

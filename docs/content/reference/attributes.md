@@ -2803,6 +2803,87 @@ print(n)
 cannot be '@thread_local' on 'aarch64-freestanding' until the program says which register holds the thread pointer
 ```
 
+## `@main_thread` — storage only the main thread reaches
+
+A body that may run on another thread — a closure held as a `&sync Fn`, a named function read into
+one — may not reach module storage whose counts are not atomic, since the rest of the program could be
+touching the same counts at the same moment:
+
+```sysl
+struct Counter
+    n: int
+
+static var counter: &Counter = Counter(0)
+
+val bump: &sync Fn() -> unit = () -> counter.n += 1
+
+bump()
+```
+
+```error
+a closure shared between two domains may be called from either, so every count it reaches has to be atomic — but the module storage 'counter' it reaches is a '&Counter'
+```
+
+Some programs know something the compiler cannot see: that a callable typed `&sync` because it *may*
+cross is in fact only ever called on the main thread. An interpreter's builtins are the usual case —
+the table is shared with worker threads, but the builtins that touch the main machine run on the main
+thread alone. `@main_thread` above a module `var` or `val` writes that promise down, and the refusal
+above stops:
+
+```sysl
+struct Counter
+    n: int
+
+@main_thread
+static var counter: &Counter = Counter(0)
+
+val bump: &sync Fn() -> unit = () -> counter.n += 1
+
+bump()
+bump()
+print(counter.n)
+```
+
+```output
+2
+```
+
+**The promise is checked where it can be, at run time.** Each access to `@main_thread` storage from a
+body that may run in another domain first asks whether the thread making it is the one the process
+began on; where it is not, the program writes `'counter' is @main_thread storage and was reached from
+another thread` to standard error and traps, as a failed bounds check does. The question is answered
+without anything recorded at start-up, so an archive a C program links answers it too. The program's
+own code — the entry file, a function no `&sync` body reaches — is not checked, and reads the storage
+exactly as it reads any module `var`. The check is kept in every build, and is there only on a target
+with POSIX threads.
+
+It marks one object every thread could otherwise reach, so it is refused above a local (already one
+call's), above a `const`, an `extern` or a function (no storage), and beside `@thread_local` or
+`@per_cpu` (two answers to who reaches the binding):
+
+```sysl
+@main_thread
+@thread_local
+static var n: int = 0
+```
+
+```error
+'@main_thread' and '@thread_local' are two answers to who reaches one binding — the main thread alone, or each thread its own copy — so they cannot stand above the same one. '@thread_local' already keeps every copy to one thread; '@main_thread' is for the one object the whole program shares
+```
+
+A freestanding target has no threads for one to be the main one:
+
+```sysl target=thumbv7em-freestanding
+@main_thread
+static var n: int = 0
+
+print(n)
+```
+
+```error
+'n' cannot be '@main_thread' on 'thumbv7em-freestanding': the promise is that only the program's main thread reaches it, and a freestanding target has no threads for one to be the main one
+```
+
 ## `@per_cpu` — one copy per processor core
 
 `@per_cpu` gives a module `var` one copy per **core** rather than per thread: the record a scheduler

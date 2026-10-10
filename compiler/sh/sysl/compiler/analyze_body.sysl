@@ -1671,11 +1671,12 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
                 if d.thread_local then check_per_thread(cx, d.span, key, ty, computed, init)
                 if d.per_cpu then check_per_core(cx, d.span, key, ty, computed, init)
+                if d.main_thread then check_main_thread(cx, d.span, key)
 
                 if d.export.is_some() then check_exported_storage(cx, d, key, ty, computed)
 
                 out.push(TVal(key, stored, init, computed, writable, storage_align(cx, d), d.section,
-                              d.thread_local, d.per_cpu, exported_storage_symbol(d),
+                              d.thread_local, d.per_cpu, d.main_thread, exported_storage_symbol(d),
                               storage_hidden(d)))
 
     out
@@ -1951,6 +1952,21 @@ private check_per_core(cx: &Analyzer, span: Span, key: string, ty: Type, compute
         end if
     end if
 end check_per_core
+
+// `@main_thread` asks a target to have threads, one of which is the program's main one. A bare
+// machine has none: what runs beside the program there is an interrupt handler, entered on top of
+// whatever was running, so "the main thread" names nothing a handler could be told apart from.
+private check_main_thread(cx: &Analyzer, span: Span, key: string)
+    val t = cx.an.tables.target
+
+    if t.os != Freestanding then return
+
+    cx.fault(span, s"'${qualified_name(key)}' cannot be '@main_thread' on '${t.name}': the promise " +
+             "is that only the program's main thread reaches it, and a freestanding target has no " +
+             "threads for one to be the main one — what runs beside the program there is an " +
+             "interrupt handler, entered on top of whatever was running. Keep what a handler " +
+             "touches in 'Atomic' storage instead")
+end check_main_thread
 
 private is_zero_expr(e: TExpr) -> bool = *e.kind match
     TZero(_) -> true

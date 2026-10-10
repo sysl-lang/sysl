@@ -20,12 +20,14 @@ end Stmt
 // **The five biggest declarations carry a struct rather than a long variant.** `FuncDecl` alone has
 // twenty-two fields, and a variant with twenty-two positional arguments is a form nobody can read at
 // a construction site; the struct is named for the node and the variant holds one of it.
-// How many copies of a module `var` the program has: one, one per thread (`@thread_local`), or one
-// per processor core (`@per_cpu`).
+// How many copies of a module binding the program has, and who reaches them: one, one per thread
+// (`@thread_local`), one per processor core (`@per_cpu`) -- or one that only the program's main
+// thread reaches (`@main_thread`), which is a promise about who reads it rather than a second copy.
 enum Copies
     OneCopy
     CopyPerThread
     CopyPerCpu
+    MainThreadOnly
 
 enum StmtKind
     // `import a.b.{c, d as e}`, `import a.b.*`, `import a.b as c`.
@@ -54,9 +56,11 @@ enum StmtKind
     // `static` in front of a binding: one copy for the program rather than one per call.
     StaticDecl(inner: Stmt)
 
-    // `val name: T = value`.
+    // `val name: T = value`. `copies` is `OneCopy`, or `MainThreadOnly` under `@main_thread` -- the
+    // two answers a binding that never changes can give.
     ValDecl(name: string, typ: Option[TypeRef], value: Expr, vis: Visibility,
-            align: Option[Expr], section: Option[string], export: Option[ExportAttr])
+            align: Option[Expr], section: Option[string], copies: Copies,
+            export: Option[ExportAttr])
 
     // `ref name = place` -- another name for storage that already exists.
     RefDecl(name: string, place: Expr)
@@ -432,6 +436,8 @@ enum Attr
     ThreadLocal
     Abandons
     PerCpu
+    // `@main_thread` above module storage: only the program's main thread reaches it.
+    MainThread
     Pinned
     Pins
     // `@no_alloc` above a function or a method: the capability it gives up, as the word after `no_`.
@@ -466,6 +472,7 @@ attr_word(a: Attr) -> string = a match
     ThreadLocal -> "thread_local"
     Abandons -> "abandons"
     PerCpu -> "per_cpu"
+    MainThread -> "main_thread"
     Pinned -> "pinned"
     Pins -> "pins"
     Forgoes(cap) -> s"no_$cap"
