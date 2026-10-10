@@ -69,10 +69,11 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 **The split is by capability, not by taste**, and the namespace is the column written into the path.
 `sysl.fs` is `requires os`, because a filesystem is something the environment either has or does not
 — and files exist on operating systems that are not POSIX, which is why it is the one gated module
-that does *not* sit under `sysl.posix`. **Everything under `sysl.posix` is `requires posix` and
+that does *not* sit under `sysl.posix`. **Everything under `sysl.posix` is `requires posix, libc` and
 nothing else**: threads because pthreads is what they are, `tty` because `isatty` and `termios` are,
 `rand` because entropy comes from the kernel, `time` because `clock_gettime` is a call into
-it. So a module a target cannot support is not one that
+it — and `libc` because each of them calls those functions by symbol, so it needs a C library to
+link against as well as POSIX's behaviour. So a module a target cannot support is not one that
 fails to link — it is one a [capability clause](/reference/modules/) will not let that program import
 in the first place, and now one you can spot by its name.
 

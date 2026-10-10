@@ -933,12 +933,42 @@ is rendered in sysl. What it does decide is storage aligned beyond what the allo
 where `libc` stands and the pair is libc's own, `sysl_alloc_aligned` and `sysl_free_aligned` default
 to `posix_memalign` and `free`; where it does not, the program defines them.
 
-**It is not an operating system**, and the library's hooks are about one. newlib's `read` and `fopen`
-are stubs a board answers, not a filesystem, so a program reaching [`sysl.fs`](/library/fs/) or
-reading a descriptor through [`sysl.io`](/library/io/) still answers their hooks with its own
-`@export`s, `libc` granted or not — the refusal says so where it was. No module states `libc`; it is
-a statement about the machine, written in this file and nowhere else, and like the others it is part
-of the run cache's key.
+**It is not an operating system, and it is not POSIX.** The three say different things: `os` is a
+machine with an environment to hand a program (files, variables, processes), `posix` is that
+environment behaving as POSIX says, and `libc` is a library of C functions to link against. newlib's
+`read` and `fopen` are stubs a board answers, not a filesystem, so a program reaching
+[`sysl.fs`](/library/fs/) or reading a descriptor through [`sysl.io`](/library/io/) still answers
+their hooks with its own `@export`s, `libc` granted or not — the refusal says so where it was.
+
+**A module that calls C by symbol requires `libc`**, and every module under `sysl.posix` does —
+`nanosleep`, `pthread_create`, `isatty` and `getentropy` are functions to link, as well as POSIX's
+behaviour, so each is `@requires(posix, libc)`. A program reaching one on a freestanding target is
+refused at the reference, before any C, rather than at the link:
+
+```sysl target=aarch64-freestanding
+import sysl.posix.time.nanosleep
+
+nanosleep(1000)
+```
+
+```error
+this reaches 'sysl.posix.time', which requires 'libc', and 'aarch64-freestanding' does not provide it — a freestanding target starts without a C library, so either this reference cannot be made on this machine or 'package.hocon' grants one with 'capabilities { libc = true }'
+```
+
+**The modules whose every call goes through a hook require only what the hooks are about** — the
+answer underneath is the one that may need a C library, and a kernel answering them needs none:
+
+| module | requires | its hosted answer requires |
+|---|---|---|
+| `sysl.fs`, `sysl.env`, `sysl.signal`, `sysl.net` | `os` | `os, libc` (`sysl.fs`, `sysl.env`); `posix, libc` (`sysl.signal`, `sysl.net`) |
+| `sysl.process` | `posix` | `posix, libc` |
+| `sysl.io` | nothing | `libc` |
+| `sysl.posix.time`, `.tty`, `.threads`, `.rand` | `posix, libc` | — |
+
+So a bare program answering `sysl.env`'s or `sysl.process`'s hooks builds with no C library, and the
+library's own hosted answer is taken only where `libc` stands. A program's own module may state it
+too, `@requires(libc)` on a file or `@needs(libc)` on an `extern`; there is no `@no_libc`, a module
+that calls no C saying nothing. Like the others it is part of the run cache's key.
 
 ## One heap, and the package that names it
 

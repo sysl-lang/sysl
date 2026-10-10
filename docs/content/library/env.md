@@ -26,9 +26,11 @@ false
 true
 ```
 
-It requires `os` — not `posix`. `getenv` is ISO C rather than a POSIX addition, so any target with a
-C library and a process environment can answer it, and filing it under the stronger capability would
-have made the module unreachable on a machine that has an operating system and is not POSIX.
+It requires `os` — not `posix`, and not `libc`. Every read goes through the hooks
+[below](#answering-the-environment-on-a-target-with-no-c-library), so what the module needs is whatever answers them: a C
+library's `getenv` on a hosted target, a kernel's own `@export`s on a bare one. Filing it under a
+stronger capability would have made the module unreachable on a machine that has an operating system
+and is not POSIX, or has no C library.
 
 ## Every variable at once
 
@@ -57,10 +59,10 @@ true
 true
 ```
 
-**It is the one function here that needs `posix`**, and carries `@needs(posix)` on its own: C can
-answer what one name is set to, and only POSIX's `environ` can say which names there are. The module
-stays at `os`, so `get` still works where there is a C library and no POSIX, and a caller of `vars` in
-a module that has given `posix` up is refused at the call.
+**It needs nothing `get` does not**: it reads through two hooks of its own, `sysl_env_count` and
+`sysl_env_entry`. On a hosted target their answer is POSIX's `environ` — ISO C can say what one name
+is set to and not which names there are — so a hosted target without POSIX answers an empty list. A
+kernel answering the two hooks lists its own environment with no POSIX and no C library anywhere.
 
 **The value is everything after the first `=`**, so `A=b=c` is `("A", "b=c")`; `VAR=` is kept as
 `("VAR", "")`, a set-to-empty variable being set. An entry with no `=` names nothing and is passed
@@ -114,8 +116,8 @@ make at all.
 
 On a hosted target the library answers them itself, under `weak` exports
 ([a module may supply another module's extern](/reference/ffi/)): `get` over `getenv` everywhere, and
-`count` and `entry` over `environ` where there is POSIX — `UNSUPPORTED` where there is not, which is
-why `vars` carries `@needs(posix)`. A kernel answers them from the vector it laid after a process's
+`count` and `entry` over `environ` where there is POSIX — `UNSUPPORTED` where there is not, which
+`vars` reads as an empty list. A kernel answers them from the vector it laid after a process's
 arguments, with an `@export` per hook its program reaches:
 
 ```sysl

@@ -30,11 +30,12 @@ which modules exist for it, so a program that cannot spawn is a program whose au
 name — and the `sysl.sync` import on the line above is untouched, which is the split working exactly
 as it is meant to.
 
-The module declares **one** requirement, and the namespace it sits in says the same thing twice over:
+The module declares **two** requirements, POSIX's behaviour and a C library to call it through, and
+the namespace it sits in says the first one twice over:
 
 ```
 module sysl.posix.threads
-@requires(posix)
+@requires(posix, libc)
 ```
 
 **What is here is pthreads**, which is the whole claim and the reason the module lives under

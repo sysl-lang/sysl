@@ -1,0 +1,226 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// **`posix` is behaviour and `libc` is something to link against**, and a module states each it needs.
+//
+// The `sysl.posix.*` modules call C by symbol (`nanosleep`, `pthread_create`, `isatty`), so they are
+// `@requires(posix, libc)`, and a freestanding target -- which starts without a C library -- refuses a
+// program reaching one at the reference rather than at the link. The modules whose every call goes
+// through hooks a kernel may answer (`sysl.env`, `sysl.process`) require only `os` or `posix`, so a
+// bare program answering their hooks builds with no C library; only their `.hosted` answers require
+// `libc`. `capabilities.sysl` gates `libc` as it gates `os` and `posix`.
+
+private val lps_target: string = "aarch64-freestanding"
+
+private val lps_package: string = "package { name = \"probe\", version = \"0.1.0\" }\n"
+
+private lps_with(capabilities: string) -> string =
+    lps_package + s"targets {\n  $lps_target { capabilities { $capabilities } }\n}\n"
+
+private val lps_sleeps: string = raw"""
+    import sysl.posix.time.nanosleep
+
+    @export("tick")
+    tick() -> long = nanosleep(1000)
+    """
+
+// What `sysl build-c` answers for a program and its manifest on `target`.
+private lps_build(program: string, manifest: string, target: string) -> (int, string)
+    val p = lbr_tree(lbr_two("main.sysl", program, "package.hocon", manifest))
+    val said = lbr_cli(["sysl", "build-c", "--target", target, "-o", s"$p/probe.a", p])
+
+    lbr_drop([p])
+    said
+end lps_build
+
+private val lps_libc_advice: string =
+    "does not provide it — a freestanding target starts without a C library, so either this " +
+    "reference cannot be made on this machine or 'package.hocon' grants one with " +
+    "'capabilities { libc = true }'"
+
+// -- a module that calls C by symbol ------------------------------------------------------------------
+
+@test("a freestanding program reaching sysl.posix.time is refused at compile time, naming libc")
+lps_posix_time_needs_libc()
+    if !lbr_ready() then return
+
+    val said = lps_build(lps_sleeps, lps_package, lps_target)
+
+    assert(said.0 != 0, "built sysl.posix.time with no C library")
+    assert(said.1.contains(s"error: this reaches 'sysl.posix.time', which requires 'libc', and " +
+        s"'$lps_target' $lps_libc_advice"), said.1)
+    assert(said.1.contains("main.sysl:1:1"), said.1)
+
+    // Told before any C, so the shim's symbol is never what the reader sees.
+    assert(!said.1.contains("sysl_posix_time_nanosleep"), said.1)
+end lps_posix_time_needs_libc
+
+@test("granting libc in the target block re-admits sysl.posix.time")
+lps_libc_granted_readmits()
+    if !lbr_ready() then return
+
+    val said = lps_build(lps_sleeps, lps_with("libc = true"), lps_target)
+
+    assert(said.0 == 0, said.1)
+end lps_libc_granted_readmits
+
+@test("a hosted target builds the same program unchanged")
+lps_hosted_unchanged()
+    if !lbr_ready() then return
+
+    val said = lps_build(lps_sleeps, lps_package, "aarch64-macos")
+
+    assert(said.0 == 0, said.1)
+end lps_hosted_unchanged
+
+@test("a hosted target whose manifest takes libc away is refused in the plain words")
+lps_hosted_libc_taken_away()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("main.sysl", lps_sleeps, "package.hocon",
+                             lps_package + "capabilities { libc = false }\n"))
+    val said = lbr_cli(["sysl", "build-c", "--target", "aarch64-macos", "-o", s"$p/probe.a", p])
+
+    lbr_drop([p])
+
+    assert(said.0 != 0, "built sysl.posix.time with libc taken away")
+    assert(said.1.contains("this reaches 'sysl.posix.time', which requires 'libc', and " +
+        "'aarch64-macos' does not provide it — a target's capabilities are what 'package.hocon' " +
+        "declares"), said.1)
+end lps_hosted_libc_taken_away
+
+// -- modules answered through hooks need no C library ------------------------------------------------
+
+private val lps_env_program: string = raw"""
+    import sysl.env.{get, vars}
+
+    @export("probe_env")
+    probe_env() -> int
+        var n = 0
+
+        if get("HOME").is_some() then n += 1
+
+        for (name, value) in vars()
+            n += int(name.bytes.len + value.bytes.len)
+
+        n
+    end probe_env
+
+    @export("sysl_env_get")
+    k_get(name: *u8, name_len: usize, into: *u8, room: usize, got: *usize) -> int = 0
+
+    @export("sysl_env_count")
+    k_count() -> isize = 0
+
+    @export("sysl_env_entry")
+    k_entry(i: usize, into: *u8, room: usize, got: *usize) -> int = 0
+    """
+
+@test("a freestanding program listing its environment through the hooks needs neither libc nor posix")
+lps_env_vars_without_posix()
+    // keel's case: a kernel answering the env hooks, its manifest saying the machine is not POSIX.
+    // `vars` reaches nothing POSIX on such a machine -- `environ` is the hosted answer's, not its.
+    if !lbr_ready() then return
+
+    val said = lps_build(lps_env_program, lps_with("posix = false"), lps_target)
+
+    assert(said.0 == 0, said.1)
+    assert(!said.1.contains("needs 'posix'"), said.1)
+end lps_env_vars_without_posix
+
+private val lps_process_program: string = raw"""
+    import sysl.process.{real_user, user}
+
+    @export("probe_user")
+    probe_user() -> int = if user() == real_user() then 1 else 0
+
+    @export("sysl_proc_get_id")
+    k_get_id(which: int) -> i64 = 1000
+    """
+
+@test("a freestanding program asking sysl.process through its hooks is not refused for libc")
+lps_process_hooks_without_libc()
+    if !lbr_ready() then return
+
+    val said = lps_build(lps_process_program, lps_package, lps_target)
+
+    assert(said.0 == 0, said.1)
+end lps_process_hooks_without_libc
+
+@test("sysl.process still requires posix, so a manifest saying the machine is not POSIX is refused")
+lps_process_still_requires_posix()
+    if !lbr_ready() then return
+
+    val said = lps_build(lps_process_program, lps_with("posix = false"), lps_target)
+
+    assert(said.0 != 0, "built sysl.process on a machine declared not POSIX")
+    assert(said.1.contains("this reaches 'sysl.process', which requires 'posix'"), said.1)
+    assert(!said.1.contains("requires 'libc'"), said.1)
+end lps_process_still_requires_posix
+
+// -- a program's own module states libc ----------------------------------------------------------------
+
+@test("a program's own @requires(libc) is refused on a freestanding target and met with it granted")
+lps_own_requires_libc()
+    if !lbr_ready() then return
+
+    val program = "@requires(libc)\n\n@export(\"one\")\none() -> int = 1\n"
+    val refused = lps_build(program, lps_package, lps_target)
+
+    assert(refused.0 != 0, "built a module requiring libc with no C library")
+    assert(refused.1.contains(s"this module requires 'libc', and '$lps_target' does not provide " +
+        "it — a freestanding target starts without a C library, so either the module cannot be " +
+        "built for this machine or 'package.hocon' grants one with 'capabilities { libc = true }'"),
+        refused.1)
+
+    val granted = lps_build(program, lps_with("libc = true"), lps_target)
+
+    assert(granted.0 == 0, granted.1)
+end lps_own_requires_libc
+
+@test("@needs(libc) is a capability, and reaching it on a freestanding target is refused")
+lps_needs_libc()
+    if !lbr_ready() then return
+
+    val program = raw"""
+        @needs(libc)
+        extern "strlen" c_strlen(s: *u8) -> usize
+
+        @export("count")
+        count(s: *u8) -> usize = c_strlen(s)
+        """
+    val said = lps_build(program, lps_package, lps_target)
+
+    assert(said.0 != 0, "built a call of a @needs(libc) extern with no C library")
+    assert(said.1.contains(s"which needs 'libc', and '$lps_target' $lps_libc_advice"), said.1)
+    assert(!said.1.contains("no capability is called 'libc'"), said.1)
+
+    val granted = lps_build(program, lps_with("libc = true"), lps_target)
+
+    assert(granted.0 == 0, granted.1)
+end lps_needs_libc
+
+@test("@no_libc is refused: a C library is the machine's, and no module gives it up")
+lps_no_libc_is_refused()
+    if !lbr_ready() then return
+
+    val said = lps_build("@no_libc\n\n@export(\"one\")\none() -> int = 1\n", lps_package, "aarch64-macos")
+
+    assert(said.0 != 0, "accepted @no_libc")
+    assert(said.1.contains("'@no_libc' promises nothing a module can keep or break — a C library " +
+        "is the machine's, and a module that calls no C says nothing"), said.1)
+end lps_no_libc_is_refused
+
+@test("an unknown capability's refusal lists libc in the set")
+lps_unknown_capability_lists_libc()
+    if !lbr_ready() then return
+
+    val said = lps_build("@requires(sockets)\n\n@export(\"one\")\none() -> int = 1\n", lps_package,
+                         "aarch64-macos")
+
+    assert(said.0 != 0, "accepted @requires(sockets)")
+    assert(said.1.contains("no capability is called 'sockets' — the set is 'heap', 'os', 'posix', " +
+        "'libc'"), said.1)
+end lps_unknown_capability_lists_libc

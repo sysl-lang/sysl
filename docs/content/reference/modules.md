@@ -543,13 +543,16 @@ the one file this does not reach, for the reason it is dropped by every build bu
 
 The other direction is `@requires(...)`, which takes a **list** because a module often needs more
 than one capability at once — the POSIX regex binding is `@requires(heap, posix)`, since a `regex_t`
-is caller-allocated and `regcomp` is POSIX.
+is caller-allocated and `regcomp` is POSIX. **`posix` is behaviour and `libc` is something to link
+against**, and a module calling C by symbol states both: `sysl.posix.time` is
+`@requires(posix, libc)`, while `sysl.process`, whose every call goes through hooks a kernel may
+answer, is `@requires(posix)` alone (`reference/packages.md` § [`libc`](/reference/packages/#libc-the-one-a-freestanding-target-starts-without)).
 
 **The heap has two names, and they say different things.** The capability is `heap` and the clause
 that gives it up is `@no_alloc`:
 
-- **`heap` names a facility** — whether the machine being built for *has* one. It sits beside `os`
-  and `posix`, and it is what a project states in
+- **`heap` names a facility** — whether the machine being built for *has* one. It sits beside `os`,
+  `posix` and `libc`, and it is what a project states in
   [`package.hocon`](/reference/packages/#capabilities), because whether there is a heap is a project
   engineering decision.
 - **`@no_alloc` names conduct** — a promise this module's code does not *allocate*, and so does not
@@ -587,8 +590,9 @@ Two of the capabilities are checked differently, and the difference is worth kno
   would put the whole of `sysl` on one side of a line that runs through the middle of it, since
   `print` allocates nothing and `from_utf8` does — so the inferred half is asked of **what a module
   calls** rather than of which modules it depends on.
-- **`os` and `posix` are exactly the declaration**, since they gate which modules *exist* rather than
-  what the language allows. The edge the rule is stated over is the **reference** graph rather than
+- **`os`, `posix` and `libc` are exactly the declaration**, since they gate which modules *exist*
+  rather than what the language allows. `libc` is the one no module gives up — there is no
+  `@no_libc`, a module that calls no C saying nothing. The edge the rule is stated over is the **reference** graph rather than
   the import graph, which is load-bearing: a qualified path reaches another module with no import at
   all, so a rule about imports would have missed the shorter of the two ways to write the mistake.
 

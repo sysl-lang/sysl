@@ -96,7 +96,8 @@ true
 
 It answers an `Option` rather than trapping: a program that cannot get entropy usually has a
 reasonable fallback — a fixed seed and a line in its log saying so — and a library that aborted would
-take that choice away. It requires `posix`.
+take that choice away. It requires `posix` and `libc`: `getentropy` is called by symbol, so a C
+library has to be there to link against.
 
 ### Key material is `entropy_from_os`, and it is not the generator
 

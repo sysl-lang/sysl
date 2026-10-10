@@ -16,12 +16,17 @@ const CapHeap: string = "heap"
 const CapOs: string = "os"
 const CapPosix: string = "posix"
 
-// **A C library under the program**, which is a property of the machine's MANIFEST only: no module
-// states it, so it is not among `capability_core`'s. It is provided on a hosted target and NOT on a
+// **A C library under the program, to link against.** It is provided on a hosted target and NOT on a
 // freestanding one unless the manifest grants it (`capabilities { libc = true }`), newlib under a
-// Pico SDK build being the ordinary case. It makes C's own functions -- `snprintf`, `memchr` --
-// callable and nothing more: the hosted answers to the library's hooks are about an operating
-// system, and a C library is not one.
+// Pico SDK build being the ordinary case. It makes C's own functions -- `snprintf`, `nanosleep`,
+// `pthread_create` -- callable and nothing more: an operating system is `os` and its conventions are
+// `posix`, and a C library is neither.
+//
+// **A module requires it where it calls C by symbol** (`@requires(posix, libc)` on `sysl.posix.time`),
+// and it gates which modules exist exactly as `os` and `posix` do -- a program reaching such a module
+// on a machine without a C library is refused at the reference rather than at the link. The modules
+// whose hooks a kernel may answer (`sysl.process`, `sysl.env`, `sysl.fs`) do not require it; only
+// their `.hosted` answers do. There is no `@no_libc`: a module that calls no C says nothing.
 const CapLibc: string = "libc"
 
 // **Waiting, which a module may promise never to do** (`@no_block`) and no machine supplies: it is
@@ -36,6 +41,7 @@ capability_core() -> Buf[string]
     out.push(CapHeap)
     out.push(CapOs)
     out.push(CapPosix)
+    out.push(CapLibc)
     out
 end capability_core
 
@@ -55,7 +61,8 @@ narrow_word(cap: string) -> string = cap match
     _ -> cap
 
 // Whether a name is a facility a machine supplies.
-is_facility(name: string) -> bool = name == CapHeap || name == CapOs || name == CapPosix
+is_facility(name: string) -> bool =
+    name == CapHeap || name == CapOs || name == CapPosix || name == CapLibc
 
 // The environment capabilities a machine has by being the machine it is: an operating system unless
 // it is freestanding, POSIX where the system's conventions are. **It is physical and deliberately
@@ -129,6 +136,14 @@ private check_clause(a: &Analysis, u: Program, c: CapabilityClause)
                 else unknown_capability(a, scope, c)
         Narrows ->
             if narrowed_by(c.name).is_none()
+                // A C library is the one facility no conduct answers to: a module either calls C by
+                // symbol, and requires it, or does not and says nothing.
+                if c.name == CapLibc
+                    a.fault(scope, c.span, "'@no_libc' promises nothing a module can keep or break — a " +
+                            "C library is the machine's, and a module that calls no C says nothing. " +
+                            "A machine without one is 'capabilities { libc = false }' in 'package.hocon'")
+                    return
+
                 // The mirror image: naming the facility where the conduct belongs. `@no_heap` is
                 // what a reader writes once, having seen `heap` in the config.
                 if is_facility(c.name) then
@@ -147,7 +162,8 @@ private block_is_conduct(form: string) -> string =
     "never to wait, and '@blocks' marks a declaration that may"
 
 private unknown_capability(a: &Analysis, scope: Scope, c: CapabilityClause)
-    a.fault(scope, c.span, s"no capability is called '${c.name}' — the set is 'heap', 'os', 'posix'")
+    a.fault(scope, c.span, s"no capability is called '${c.name}' — the set is 'heap', 'os', 'posix', " +
+            "'libc'")
 
 // Refuses a file that says the same thing about one capability twice, and one that says both things
 // about it.
@@ -406,13 +422,25 @@ private unmet_by_target(a: &Analysis, module_name: string, u: Program, c: Capabi
     if !a.tables.target.lacks_capability(cap) then return
     if supplied_unit(a, u) then return
 
+    // A build OF the library analyzes it whole on every target, and a module this machine cannot
+    // run is still compiled into the artifact: it is refused where a program reaches it.
+    if holds_string(a.producing, u.src.name) then return
+
     val who = if module_name == ModuleRoot then "this module" else s"'$module_name'"
 
+    val tail = if cap == CapLibc && !os_hosted(a.tables.target.os) then libc_advice("the module cannot be built for this machine")
+    else "a target's capabilities are what 'package.hocon' declares, so either the module cannot " +
+         "be built for this machine or the config is understating it"
+
     a.fault(scope_of_unit(a, u), c.span,
-            s"$who requires '$cap', and '${a.tables.target.name}' does not provide it — a " +
-            "target's capabilities are what 'package.hocon' declares, so either the module cannot " +
-            "be built for this machine or the config is understating it")
+            s"$who requires '$cap', and '${a.tables.target.name}' does not provide it — $tail")
 end unmet_by_target
+
+// What to do about a C library a freestanding machine started without: it is the one capability a
+// manifest grants rather than takes away, so the advice names the line that grants it.
+private libc_advice(otherwise: string) -> string =
+    "a freestanding target starts without a C library, so either " + otherwise + " or " +
+        "'package.hocon' grants one with 'capabilities { libc = true }'"
 
 // The tests' set is the module's own with the scaffolding's changes folded in, per capability: a
 // `@tests` file writing no clause records the module's, one that requires a capability takes it back
@@ -655,7 +683,7 @@ private check_need_names(a: &Analysis, scope: Scope, span: Span, needs: Buf[stri
                     s"'@needs(${narrowed_by(cap).unwrap()})'")
         else
             a.fault(scope, span, s"no capability is called '$cap' — the set is 'heap', " +
-                    "'os', 'posix'")
+                    "'os', 'posix', 'libc'")
 end check_need_names
 
 // Whether a module is without a capability -- because it gave the capability up, or because the
@@ -693,7 +721,7 @@ private why_lacking(a: &Analysis, module_name: string, cap: string, scaffolding:
 
     if narrowed then return s"$here declared '@no_$word'"
 
-    target_lacks_it(a)
+    target_lacks_it(a, cap)
 end why_lacking
 
 // Refuses a `@needs(...)` naming something that is not a capability, and reports every reference
@@ -805,14 +833,14 @@ end refused_as_module
 
 // -- what a module that gave up an environment capability may not reach ----------------------------
 
-// The two capabilities that gate whether a MODULE exists, as against what a body may do.
+// The three capabilities that gate whether a MODULE exists, as against what a body may do.
 //
 // `heap` changes what the *language* allows, so it is checked at each construction that makes heap
 // storage and at each call arriving at one -- it has to be, the standard module being one module of
-// which half allocates. `os` and `posix` gate which modules exist at all, which is a statement about
-// a module rather than about any declaration in it: a program either may name `sysl.fs` or may not,
-// and every declaration in that module is equally out of reach.
-private is_environment(cap: string) -> bool = cap == CapOs || cap == CapPosix
+// which half allocates. `os`, `posix` and `libc` gate which modules exist at all, which is a
+// statement about a module rather than about any declaration in it: a program either may name
+// `sysl.fs` or may not, and every declaration in that module is equally out of reach.
+private is_environment(cap: string) -> bool = cap == CapOs || cap == CapPosix || cap == CapLibc
 
 // What each module needs an operating system for: its own clause plus everything it reaches.
 //
@@ -940,7 +968,8 @@ check_gated_modules(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: B
     for module_narrow in a.tables.module_narrows
         if is_environment(module_narrow.1) then any = true
 
-    if a.tables.target.lacks_capability(CapOs) || a.tables.target.lacks_capability(CapPosix) then
+    if a.tables.target.lacks_capability(CapOs) || a.tables.target.lacks_capability(CapPosix) ||
+            a.tables.target.lacks_capability(CapLibc) then
         any = true
 
     // Nothing narrowed anything and the machine has everything, which is almost every compilation:
@@ -990,7 +1019,8 @@ check_gated_modules(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: B
 
         val e = first.unwrap().0
         val cap = first.unwrap().1
-        val why = if module_narrowed(a, e.from, cap) then gave_it_up(e.from, cap) else target_lacks_it(a)
+        val why = if module_narrowed(a, e.from, cap) then gave_it_up(e.from, cap)
+        else target_lacks_it(a, cap)
         val what = if e.dies then s"a '${qualified_name(e.named)}' can die here, and its destructor"
         else "this"
 
@@ -1222,7 +1252,16 @@ private gave_it_up(from: string, cap: string) -> string
 end gave_it_up
 
 // Why an edge is refused where the machine never had the capability.
-private target_lacks_it(a: &Analysis) -> string =
-    s"'${a.tables.target.name}' does not provide it — a target's capabilities are what " +
+private target_lacks_it(a: &Analysis, cap: string) -> string
+    val target = a.tables.target
+
+    // A hosted machine has a C library and a manifest took it away; only a freestanding one started
+    // without.
+    if cap == CapLibc && !os_hosted(target.os) then
+        return s"'${target.name}' does not provide it — " +
+            libc_advice("this reference cannot be made on this machine")
+
+    s"'${target.name}' does not provide it — a target's capabilities are what " +
         "'package.hocon' declares, so either this reference cannot be made on this machine or the " +
         "config is understating it"
+end target_lacks_it
