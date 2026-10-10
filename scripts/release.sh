@@ -24,9 +24,10 @@
 #      two in step -- and commit it
 #   3. stage 1: the `sysl` on PATH (or `SYSL_RELEASE_SEED`) builds this tree against the SEED'S OWN
 #      library -- `SYSL_RELEASE_SEED_LIB`, else `<seed prefix>/share/sysl/library` -- since the
-#      release library may use forms the seed's library has not got and the seed cannot compile --
-#      plus a `--lib` overlay of the modules the release library ADDS (`seed_overlay.sh`, which diffs
-#      the release library against the seed's), with `SYSL_LIB` unset as the gate runs it
+#      release library may use forms the seed's library has not got and the seed cannot compile, with
+#      `SYSL_LIB` unset as the gate runs it; only if that fails, again with a `--lib` overlay of the
+#      modules the release library ADDS (`seed_overlay.sh`, which diffs the release library against
+#      the seed's)
 #   4. stage 2: stage 1 builds this tree against the RELEASE library; **stage 2 is what ships**
 #   5. stage 3: stage 2 builds this tree against the release library; stage 2 and stage 3 each
 #      `emit-llvm .` and the two texts must be identical -- one source, one library, so a difference
@@ -247,27 +248,26 @@ say "seed: $seed ($seed_version)"
 say "seed library: $seed_lib"
 say "compiler project: $proj"
 
-# Stage 1: the seed, against its own library, plus a `--lib` overlay of the modules the release
-# library ADDS (`scripts/seed_overlay.sh`, a diff of the two trees). The release library itself may be
-# out of the seed's reach -- a changed module may use forms only this compiler has -- and without the
-# overlay the tree's imports of an added module name nothing. An empty overlay (a seed whose library
-# already has them all) is left off the command line.
+# Stage 1: the seed, against its own library -- the gate's form, tried first. Only where that fails is a
+# `--lib` overlay of the modules the release library ADDS (`scripts/seed_overlay.sh`, a diff of the two
+# trees) handed over too: the tree may import an added module, which the seed's library has not got. The
+# overlay is the second try and never the first because an added module is new library code, free to use
+# forms only this compiler has (`@blocks`), which the seed refuses even where the tree imports none of it.
 build_stage1() {
+    # `SYSL_LIB` unset, so the seed finds the library beside itself. Only a library named outright
+    # (`SYSL_RELEASE_SEED_LIB`, a seed with none beside it) is handed over.
+    local lib_env=(-u SYSL_LIB)
+    [[ -n ${SYSL_RELEASE_SEED_LIB:-} ]] && lib_env=(SYSL_LIB=$seed_lib)
+
+    print -r -- "seed overlay: none (the gate's form, tried first)"
+    heavy $proj env $lib_env $seed build . $opt -o $out/stage1 && return 0
+
     local ov
     ov=$(sh $repo/scripts/seed_overlay.sh $seed_lib $out/seed-overlay $library) ||
         { print "the seed overlay could not be made"; return 1 }
-    local lib_args=()
-    if [[ -n $(ls -A $ov) ]]; then
-        lib_args=(--lib $ov)
-        print -r -- "seed overlay: $ov -- $(cd $ov && find . -type f | sort | tr '\n' ' ')"
-    else
-        print -r -- "seed overlay: none (the seed's library has every module the tree adds)"
-    fi
-    # The gate's form: `SYSL_LIB` unset, so the seed finds the library beside itself. Only a library
-    # named outright (`SYSL_RELEASE_SEED_LIB`, a seed with none beside it) is handed over.
-    local lib_env=(-u SYSL_LIB)
-    [[ -n ${SYSL_RELEASE_SEED_LIB:-} ]] && lib_env=(SYSL_LIB=$seed_lib)
-    heavy $proj env $lib_env $seed build . $lib_args $opt -o $out/stage1
+    [[ -n $(ls -A $ov) ]] || { print "the seed's library has every module the tree adds; stage 1 failed on its own"; return 1 }
+    print -r -- "seed overlay: $ov -- $(cd $ov && find . -type f | sort | tr '\n' ' ')"
+    heavy $proj env $lib_env $seed build . --lib $ov $opt -o $out/stage1
 }
 
 if (( reuse_stage1 )); then
