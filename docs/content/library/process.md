@@ -699,12 +699,86 @@ true
 survived
 ```
 
+**A background job is asked, not waited for.** A shell prints its next prompt while `cmd &` runs, and
+before each one it asks every job whether it has ended: `try_wait`, on a `Spawned` and on a `Child`
+alike, answers `None` while the child runs and how it ended once it has. The call that sees the end
+reaps the child and remembers the answer, so a later `wait` or `try_wait` answers the same at once,
+and dropping the handle stops nothing — the pid is the kernel's to hand out again by then. A `timeout`
+is still `wait`'s to enforce; `try_wait` only asks.
+
+```sysl
+import sysl.process.{Group, spawn}
+import sysl.posix.time.sleep
+import sysl.time.*
+
+val job = spawn("sleep", ["0.2"], group = Group.New).unwrap()
+
+print(job.try_wait().unwrap().is_none())
+
+var ended = job.try_wait().unwrap()
+
+while ended.is_none()
+    sleep(10.ms)
+    ended = job.try_wait().unwrap()
+
+print(ended.unwrap())
+print(job.wait().unwrap() == ended.unwrap())
+```
+
+```output
+true
+exited
+true
+```
+
+**A job-control shell starts by putting itself in a group of its own**, so that a Ctrl-C at its
+prompt reaches its group alone rather than whatever started it; `set_process_group()` does that —
+POSIX's `setpgid(0, 0)`, the program made the leader of a group numbered by its own pid — and
+`set_foreground_group(process_group())` then takes the terminal. `set_process_group(pgid)` moves the
+program into an existing group of its session instead.
+
+```sysl
+import sysl.process.{capture, process_group, set_process_group}
+import sysl.text.Search
+
+set_process_group().unwrap()
+
+val me = capture("sh", ["-c", "ps -o ppid= -p $$"]).unwrap().text.trim()
+
+print(me == s"${process_group()}")
+```
+
+```output
+true
+```
+
+**A login program goes one step further for the shell it starts: `new_session()`**, POSIX's `setsid`,
+makes the program the leader of a new session and of a new group in it, with no controlling terminal
+— the next terminal it opens becomes that session's — and answers the session's id, which is its pid
+and the new group's number. Only a program that does not already lead a group may: one that does,
+because a shell started it with `Group.New` or because it called `set_process_group()`, is
+`NotPermitted` and stays where it was.
+
+```sysl
+import sysl.fs.IoError
+import sysl.process.{new_session, set_process_group}
+
+set_process_group().unwrap()
+
+print(new_session().unwrap_err() == IoError.NotPermitted)
+```
+
+```output
+true
+```
+
 ## On a target with no C library
 
-Everything the module asks of the machine goes through eleven hooks in `sysl.process.sys` — start a
-program, make a pipe, wait for it, send it a signal, become one in place of this program, name a file
-for a captured stream, read or change who the program is, and say which process group it is in and
-which group has its terminal. On a hosted POSIX target
+Everything the module asks of the machine goes through fourteen hooks in `sysl.process.sys` — start a
+program, make a pipe, wait for it or ask whether it has ended, send it a signal, become one in place of
+this program, name a file for a captured stream, read or change who the program is, say which process
+group it is in and which group has its terminal, and move it to a group or a session of its own. On a
+hosted POSIX target
 the library answers them; **on a target with no C library the program answers each one it reaches
 with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `start`, `spawn`,
 `pipe` and `exec` work unchanged above them:
@@ -714,6 +788,7 @@ with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `s
 | `sysl_proc_spawn(path, path_len, argv, argc, envp, envc, inherit_env, dir, dir_len, stdin_fd, stdout_fd, stderr_fd, started, pgid, foreground) -> i64` | the child's process id, the child started in group `pgid` (-1 this program's, 0 a new one, above zero that one) and, with `foreground` 1, that group given the terminal before the child's program runs |
 | `sysl_proc_pipe(read_end, write_end) -> int` | zero, having written the two descriptors, each closing when a program is started |
 | `sysl_proc_wait(pid, started, timeout_ms, how, value) -> int` | zero, having written how it ended |
+| `sysl_proc_poll(pid, how, value) -> int` | zero while the child runs, without waiting; one once it has ended, having reaped it and written how |
 | `sysl_proc_kill(pid, signal) -> int` | zero |
 | `sysl_proc_temp_path(into, room) -> isize` | the length of the path it wrote |
 | `sysl_proc_get_id(which) -> i64` | the id: `which` is `id_user` 0 or `id_group` 1 (effective), `id_real_user` 2 or `id_real_group` 3 |
@@ -722,6 +797,8 @@ with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `s
 | `sysl_proc_getpgrp() -> i64` | the program's process group |
 | `sysl_proc_tcgetpgrp() -> i64` | the controlling terminal's foreground group |
 | `sysl_proc_tcsetpgrp(pgid) -> int` | zero, having given the terminal to `pgid`, from the background too |
+| `sysl_proc_setpgid(pgid) -> int` | zero, having moved the program into group `pgid`, or with 0 into a new group it leads |
+| `sysl_proc_setsid() -> i64` | the new session's id, having made the program the leader of a new session and group |
 
 **Each answers zero or more for success and the `IoError` code negated for a failure**, and
 `UNSUPPORTED` (`sysl.sys`, -38 on every platform, not the host's `ENOSYS`; `-1` is `EPERM`) for a
@@ -732,9 +809,11 @@ has. `wait` writes `0` into `how` for an exit (its code in `value`), `1` for a s
 number), and `2` for a child it stopped at its deadline; a supplier that cannot bound a wait answers
 `UNSUPPORTED` when handed a timeout. A target with no users answers `get_id` and `set_id` with
 `UNSUPPORTED`, and a refused `set_id` answers `-1`, `EPERM`, which comes back as `NotPermitted`. A
-target with no process groups answers the three group hooks with `UNSUPPORTED` (and `process_group()`
-is then 0); **they are reached only by a program that asks about groups or the terminal**, so a kernel
-without them answers nothing it does not have.
+target with no process groups answers the five group and session hooks with `UNSUPPORTED` (and
+`process_group()` is then 0); **they are reached only by a program that asks about groups, sessions or
+the terminal**, so a kernel without them answers nothing it does not have. `poll` is reached only by
+`try_wait`, and writes `how` and `value` as `wait` does, never `2`; a supplier that cannot ask without
+blocking answers `UNSUPPORTED`.
 **`kill` and `wait` are reached by any program that reaches the module**, `Child`'s destructor being
 kept wherever `sysl.process` is, so a program asking only who it is answers those two as well.
 `sysl.process.sys`'s own comments say the rest.
@@ -747,7 +826,7 @@ error: this program reaches 'sysl.process', and 'aarch64-freestanding' has no op
 it for the standard library to answer a process or a user with, so the program answers it: define
 'sysl_proc_kill', 'sysl_proc_spawn', 'sysl_proc_temp_path', 'sysl_proc_wait' with '@export', each
 taking what its 'extern' in 'sysl.process.sys' declares and answering a process id, a user or group
-id, a length or zero, or the code of an 'IoError' negated
+id, a length, one or zero, or the code of an 'IoError' negated
 ```
 
 **A program answers only the hooks it reaches.** One that only calls `exec` answers `sysl_proc_exec`

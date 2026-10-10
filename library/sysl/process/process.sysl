@@ -250,6 +250,22 @@ private ended(pid: i32, at: i64, timeout: int) -> Result[Status, IoError]
     Ok(Status.Exited(value))
 end ended
 
+/** Whether a child `begun` started has ended, without waiting for it: `None` while it runs, and how
+ * it ended -- the child reaped -- once it has.
+ */
+private polled(pid: i32) -> Result[Option[Status], IoError]
+    var how = 0
+    var value = 0
+
+    val e = psys.poll(i64(pid), &how, &value)
+
+    if e < 0 then return Err(failure(i64(e)))
+    if e == 0 then return Ok(None)
+    if how == psys.ended_signalled then return Ok(Some(Status.Signalled(value)))
+
+    Ok(Some(Status.Exited(value)))
+end polled
+
 /** End a child nobody is going to wait for, and reap it.
  *
  * A deadline already past is what the wait hook is handed, so a child that has ended is only reaped
@@ -482,11 +498,29 @@ struct Child
             Some(r) -> return r
             None -> ()
 
-        val status = ended(self.pid, self.began, self.timeout)
+        self.finished(ended(self.pid, self.began, self.timeout))
 
-        // Read and removed whatever happened, so that a failed child leaves nothing behind. The
-        // read is attempted first because a child that wrote something and then failed still
-        // wrote it.
+    /** Whether the child has ended, **without waiting for it**: `Ok(None)` while it runs, and once it
+     * has ended, what `wait` would have answered -- the same `Output`, its files read and removed.
+     *
+     * The child is reaped at that moment, so from then on `wait` and `try_wait` both answer the same
+     * `Output` again, and dropping the `Child` stops nothing. **It does not enforce `timeout`**: a
+     * child running past its deadline is still `None` here, and `wait` is what stops it.
+     */
+    try_wait(*self) -> Result[Option[Output], IoError]
+        self.answer match
+            Some(r) -> return r.map((o) -> Some(o))
+            None -> ()
+
+        polled(self.pid)? match
+            Some(s) -> self.finished(Ok(s)).map((o) -> Some(o))
+            None -> Ok(None)
+    end try_wait
+
+    // What the child left, once it has ended: read and removed whatever happened, so that a failed
+    // child leaves nothing behind. The read is attempted first because a child that wrote something
+    // and then failed still wrote it.
+    private finished(*self, status: Result[Status, IoError]) -> Result[Output, IoError]
         val text = read_text(self.out_path)
         val asked = self.err_path.len > 0
         val errs = if asked then Some(read_text(self.err_path).unwrap_or("")) else None
@@ -497,7 +531,7 @@ struct Child
 
         self.answer = Some(r)
         r
-    end wait
+    end finished
 
     /** Sends the child the signal numbered `signal` -- 15, the default, asks it to stop, and 9 makes
      * it -- without waiting for it; `wait` then answers `Signalled` with the number, if the signal
@@ -631,6 +665,27 @@ struct Spawned
         self.answer = Some(r)
         r
     end wait
+
+    /** Whether the child has ended, **without waiting for it** -- what a shell asks of every
+     * background job before it prints a prompt. `Ok(None)` while the child runs; once it has ended,
+     * `Some` of how it ended, as `wait` would have said.
+     *
+     * The child is reaped at that moment and its status remembered, so from then on `wait` and
+     * `try_wait` both answer that same status at once, and dropping the `Spawned` stops nothing -- the
+     * pid is the kernel's to hand out again. **It does not enforce `timeout`**: a child running past
+     * its deadline is still `None` here, and `wait` is what stops it.
+     */
+    try_wait(*self) -> Result[Option[Status], IoError]
+        self.answer match
+            Some(r) -> return r.map((s) -> Some(s))
+            None -> ()
+
+        val r = polled(self.pid)?
+
+        if r.is_some() then self.answer = Some(Ok(r.unwrap()))
+
+        Ok(r)
+    end try_wait
 
     /** Sends the child the signal numbered `signal`, as `Child.kill` does: 15 asks it to stop and 9
      * makes it, and a child already waited for is not signalled.

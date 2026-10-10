@@ -68,6 +68,33 @@ process_group() -> int
     panic(s"sysl.process: the 'sysl_proc_getpgrp' hook failed with $g")
 end process_group
 
+/** This program moved into process group `pgid` -- or, with zero, the default, made the leader of a
+ * group of its own, numbered by its process id.
+ *
+ * **It is the first thing a job-control shell does**: in a group of its own, a Ctrl-C at its prompt
+ * goes to the shell's group alone rather than to whatever started it, and
+ * `set_foreground_group(process_group())` then gives it the terminal. A program that already leads
+ * its group is left as it is. A group in another session, and a program that leads a session (a login
+ * shell after `new_session`), are `NotPermitted`.
+ */
+set_process_group(pgid: int = 0) -> Result[unit, IoError]
+    val e = psys.setpgid(i64(pgid))
+
+    if e != 0 then Err(from_status(e)) else Ok(())
+
+/** This program made the leader of a new session and of a new process group in it, answering the
+ * new session's id -- its own process id, and the new group's number.
+ *
+ * **The new session has no controlling terminal**, which is the point: it is what a login program
+ * does in the child it starts a shell in, so that the terminal the shell then opens becomes that
+ * session's. A program that already leads a process group -- a job a shell started with `Group.New`,
+ * or one that called `set_process_group()` -- is `NotPermitted`, and stays where it was.
+ */
+new_session() -> Result[int, IoError]
+    val sid = psys.setsid()
+
+    if sid < 0 then Err(from_status(int(sid))) else Ok(int(sid))
+
 /** The process group the controlling terminal gives its keys to -- the foreground job.
  *
  * The controlling terminal is the one this program's session belongs to, whatever its standard

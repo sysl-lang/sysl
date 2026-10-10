@@ -1,0 +1,464 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.Search
+
+// **The calls a job-control shell makes of `sysl.process` beyond starting a job**: asking a background
+// job whether it has ended without waiting for it (`Spawned.try_wait`, `Child.try_wait`, over the
+// `sysl_proc_poll` hook), putting the shell in a group of its own (`set_process_group`, over
+// `sysl_proc_setpgid`) and starting a session (`new_session`, over `sysl_proc_setsid`).
+//
+// The hosted cases build a program and run it, since each call changes the process that makes it --
+// a new group or session in the test's own process would outlive the test. The freestanding cases
+// build an archive for a bare machine, where the program answers the hooks itself and one it leaves
+// unanswered, or answers at the wrong signature, is refused when it is compiled.
+
+private val jcc_target: string = "aarch64-freestanding"
+private val jcc_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+// What a one-file program prints.
+private jcc_ran(text: string) -> string
+    val p = lbr_program(text)
+    val out = lbr_run(p, [])
+
+    lbr_drop([p])
+    out
+end jcc_ran
+
+// -- try_wait on a hosted target --------------------------------------------------------------------
+
+@test("try_wait answers None while a child runs and its status once it has exited, then again")
+jcc_try_wait_none_then_exited()
+    if !lbr_ready() then return
+
+    assert_eq(jcc_ran(raw"""
+        import sysl.process.spawn
+        import sysl.posix.time.sleep
+        import sysl.time.*
+
+        val job = spawn("sleep", ["0.3"]).unwrap()
+
+        print(job.try_wait().unwrap().is_none())
+
+        var ended = job.try_wait().unwrap()
+        var rounds = 0
+
+        while ended.is_none() && rounds < 1000
+            sleep(10.ms)
+            rounds += 1
+            ended = job.try_wait().unwrap()
+
+        print(ended.unwrap(), rounds > 0)
+        print(job.try_wait().unwrap().unwrap())
+        print(job.wait().unwrap())
+        """), "true\nexited true\nexited\nexited\n")
+end jcc_try_wait_none_then_exited
+
+@test("a child a signal ended is Signalled through try_wait, and a later kill signals nothing")
+jcc_try_wait_signalled()
+    if !lbr_ready() then return
+
+    assert_eq(jcc_ran(raw"""
+        import sysl.process.{Group, spawn}
+        import sysl.posix.time.sleep
+        import sysl.time.*
+
+        val job = spawn("sleep", ["100"], group = Group.New).unwrap()
+
+        print(job.try_wait().unwrap().is_none())
+        job.kill(9).unwrap()
+
+        var ended = job.try_wait().unwrap()
+        var rounds = 0
+
+        while ended.is_none() && rounds < 1000
+            sleep(10.ms)
+            rounds += 1
+            ended = job.try_wait().unwrap()
+
+        print(ended.unwrap())
+        print(job.kill(15).is_ok())
+        print(job.try_wait().unwrap().unwrap(), job.wait().unwrap())
+        """), "true\nkilled by signal 9\ntrue\nkilled by signal 9 killed by signal 9\n")
+end jcc_try_wait_signalled
+
+@test("Child.try_wait answers the Output wait would have, once, and the same again after")
+jcc_child_try_wait()
+    if !lbr_ready() then return
+
+    assert_eq(jcc_ran(raw"""
+        import sysl.process.start
+        import sysl.posix.time.sleep
+        import sysl.time.*
+
+        val c = start("sh", ["-c", "sleep 0.3; echo hi; exit 3"]).unwrap()
+
+        print(c.try_wait().unwrap().is_none())
+
+        var ended = c.try_wait().unwrap()
+        var rounds = 0
+
+        while ended.is_none() && rounds < 1000
+            sleep(10.ms)
+            rounds += 1
+            ended = c.try_wait().unwrap()
+
+        val o = ended.unwrap()
+
+        print(o.status, o.text.len, c.try_wait().unwrap().unwrap().text.len, c.wait().unwrap().status)
+        """), "true\nexited 3 3 3 exited 3\n")
+end jcc_child_try_wait
+
+// The process hooks a program answers for itself on a hosted target, its own export taking the
+// place of the library's weak one: a kill and a wait that only count.
+private val jcc_counting_hooks: string = raw"""
+    module counts
+
+    var kills: int = 0
+    var waits: int = 0
+
+    @export("sysl_proc_kill")
+    k_kill(pid: i64, signal: int) -> int
+        kills += 1
+        0
+
+    @export("sysl_proc_wait")
+    k_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int
+        waits += 1
+        how[0] = 0
+        value[0] = 0
+        0
+
+    seen() -> string = s"$kills $waits"
+    """
+
+@test("a Spawned that try_wait reaped stops nothing when dropped, where an unwaited one is stopped")
+jcc_reaped_drop_stops_nothing()
+    if !lbr_ready() then return
+
+    val main = raw"""
+        import counts.seen
+        import sysl.process.spawn
+        import sysl.posix.time.sleep
+        import sysl.time.*
+
+        reap_by_polling()
+            val job = spawn("true").unwrap()
+            var rounds = 0
+
+            while job.try_wait().unwrap().is_none() && rounds < 1000
+                sleep(10.ms)
+                rounds += 1
+
+        leave_unwaited()
+            val job = spawn("true").unwrap()
+
+        reap_by_polling()
+        print(seen())
+        leave_unwaited()
+        print(seen())
+        """
+    var files = lbr_two("main.sysl", main, "counts/counts.sysl", jcc_counting_hooks)
+
+    files.push(("package.hocon", "package { name = \"jcc\", version = \"0.0.1\" }\n"))
+
+    val root = lbr_tree(files)
+    val out = lbr_run(root, [])
+
+    lbr_drop([root])
+    assert_eq(out, "0 0\n0 1\n")
+end jcc_reaped_drop_stops_nothing
+
+// -- set_process_group and new_session on a hosted target -----------------------------------------
+
+// The program's own pid, as the shell it starts reports its parent: `ps` asked by the shell itself.
+private val jcc_own_pid: string = "capture(\"sh\", [\"-c\", \"ps -o ppid= -p $$\"]).unwrap().text.trim()"
+
+@test("set_process_group() makes the program the leader of a group numbered by its own pid")
+jcc_set_process_group_leads()
+    if !lbr_ready() then return
+
+    assert_eq(jcc_ran(raw"""
+        import sysl.fs.IoError
+        import sysl.process.{capture, process_group, set_process_group}
+        import sysl.text.Search
+
+        """ + s"val me = $jcc_own_pid\n" + raw"""
+        val before = process_group()
+
+        print(me != s"$before")
+        print(set_process_group().is_ok(), me == s"${process_group()}")
+        print(set_process_group().is_ok(), me == s"${process_group()}")
+        print(set_process_group(before).is_ok(), process_group() == before)
+        print(set_process_group(-1).unwrap_err() == IoError.Other(22))
+        """), "true\ntrue true\ntrue true\ntrue true\ntrue\n")
+end jcc_set_process_group_leads
+
+@test("new_session answers a new id, the program's pid and group, and leaves no terminal")
+jcc_new_session()
+    if !lbr_ready() then return
+
+    assert_eq(jcc_ran(raw"""
+        import sysl.fs.IoError
+        import sysl.process.{capture, foreground_group, new_session, process_group, set_process_group}
+        import sysl.text.Search
+
+        """ + s"val me = $jcc_own_pid\n" + raw"""
+        val sid = new_session().unwrap()
+
+        print(me == s"$sid", sid == process_group())
+        print(foreground_group().unwrap_err() == IoError.Other(6))
+        print(new_session().unwrap_err() == IoError.NotPermitted)
+        print(set_process_group().unwrap_err() == IoError.NotPermitted)
+        """), "true true\ntrue\ntrue\ntrue\n")
+end jcc_new_session
+
+@test("a program leading its group may not start a session, and stays in its group")
+jcc_leader_has_no_new_session()
+    if !lbr_ready() then return
+
+    assert_eq(jcc_ran(raw"""
+        import sysl.fs.IoError
+        import sysl.process.{new_session, process_group, set_process_group}
+
+        set_process_group().unwrap()
+
+        val g = process_group()
+
+        print(new_session().unwrap_err() == IoError.NotPermitted, process_group() == g)
+        """), "true true\n")
+end jcc_leader_has_no_new_session
+
+@test("on a hosted target the library answers poll, setpgid and setsid under weak exports")
+jcc_hosted_answers_weakly()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.process.{new_session, set_process_group, spawn}
+
+        val job = spawn("true").unwrap()
+
+        print(job.try_wait().is_ok())
+        print(set_process_group().is_ok(), new_session().is_ok())
+        """)
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
+
+    lbr_drop([p])
+    assert(said.0 == 0, said.1)
+
+    for hook in ["sysl_proc_poll", "sysl_proc_setpgid", "sysl_proc_setsid"]
+        var defined = ""
+
+        for line in lines_of(said.1)
+            if line.starts_with("define ") && line.contains(s" @$hook(") then defined = line
+
+        assert(defined.starts_with("define weak "), s"$hook: $defined")
+
+    assert(said.1.contains("@sysl_proc_posix_poll("), "the hosted poll does not call the shim")
+end jcc_hosted_answers_weakly
+
+// -- a target with no C library -------------------------------------------------------------------
+
+private val jcc_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n"
+
+// A shell's background job, asked about before a prompt, for an archive a kernel links.
+private val jcc_program: string = raw"""
+    import sysl.process.spawn
+    import sysl.process.sys.Text
+
+    @export("job_done")
+    job_done() -> int
+        spawn("/bin/sleep", ["5"]) match
+            Ok(job) -> if job.try_wait().is_ok() then 0 else 1
+            Err(_) -> 2
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = ptr_cast(usize(0x4100_0000))
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+    """
+
+// The hooks a job reached before `try_wait`, and the filesystem's, as a kernel would answer them.
+private val jcc_job_hooks: string = raw"""
+    @export("sysl_proc_spawn")
+    k_spawn(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, envc: usize,
+            inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int,
+            stderr_fd: int, started: *i64, pgid: i64, foreground: int) -> i64 = 7
+
+    @export("sysl_proc_wait")
+    k_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int = 0
+
+    @export("sysl_proc_kill")
+    k_kill(pid: i64, signal: int) -> int = 0
+
+    @export("sysl_fs_open")
+    k_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int = -38
+
+    @export("sysl_fs_read")
+    k_read(fd: int, into: *u8, room: usize, got: *usize) -> int = -38
+
+    @export("sysl_fs_write")
+    k_write(fd: int, from: *u8, len: usize, put: *usize) -> int = -38
+
+    @export("sysl_fs_close")
+    k_close(fd: int) -> int = 0
+
+    @export("sysl_fs_seek")
+    k_seek(fd: int, offset: long, whence: int, at: *long) -> int = -29
+
+    @export("sysl_fs_unlink")
+    k_unlink(path: *u8, len: usize) -> int = -38
+    """
+
+// `poll`, answered as a kernel's `wait` with `WNOHANG` answers for a child still running.
+private val jcc_poll_hook: string = raw"""
+    @export("sysl_proc_poll")
+    k_poll(pid: i64, how: *int, value: *int) -> int = 0
+    """
+
+// A shell's first move and a login program's, for an archive.
+private val jcc_group_program: string = raw"""
+    import sysl.process.{new_session, set_process_group}
+    import sysl.process.sys.Text
+
+    @export("own_group")
+    own_group() -> int = if set_process_group().is_ok() then 0 else 1
+
+    @export("own_session")
+    own_session() -> int = new_session().unwrap_or(-1)
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = ptr_cast(usize(0x4100_0000))
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+    """
+
+private val jcc_group_hooks: string = raw"""
+    @export("sysl_proc_setpgid")
+    k_setpgid(pgid: i64) -> int = 0
+
+    @export("sysl_proc_setsid")
+    k_setsid() -> i64 = 1
+    """
+
+private jcc_build_c(program: string) -> (int, string, string)
+    val root = lbr_tree(lbr_two("main.sysl", program, "package.hocon", jcc_manifest))
+    val said = lbr_cli(["sysl", "build-c", "--target", jcc_target, "-o", s"$root/img.a", root])
+
+    (said.0, said.1, root)
+end jcc_build_c
+
+// The lead every refusal of a missing process hook shares on this target.
+private val jcc_missing: string =
+    s"error: this program reaches 'sysl.process', and '$jcc_target' has no operating system under " +
+    "it for the standard library to answer a process or a user with, so the program answers it: define "
+
+@test("a freestanding program that reaches try_wait without answering sysl_proc_poll is refused, naming it")
+jcc_unanswered_poll_is_refused()
+    if !lbr_ready() then return
+
+    val (code, said, root) = jcc_build_c(jcc_program + jcc_job_hooks)
+
+    lbr_drop([root])
+    assert(code != 0, "built with the poll hook unanswered")
+    assert(said.contains(jcc_missing + "'sysl_proc_poll' with '@export'"), said)
+    assert(!said.contains("undefined symbol"), said)
+end jcc_unanswered_poll_is_refused
+
+@test("a freestanding program answering sysl_proc_poll builds, and carries its own answer")
+jcc_answered_poll_builds()
+    if !lbr_ready() then return
+
+    val (code, said, root) = jcc_build_c(jcc_program + jcc_job_hooks + jcc_poll_hook)
+
+    assert(code == 0, said)
+
+    if is_file(jcc_nm)
+        val listed = capture(jcc_nm, [s"$root/img.a"], "", [], true).unwrap()
+
+        assert(listed.text.contains(" T sysl_proc_poll"), listed.text)
+        assert(!listed.text.contains("sysl_proc_posix_poll"), listed.text)
+        assert(!listed.text.contains("waitpid"), listed.text)
+    end if
+
+    lbr_drop([root])
+end jcc_answered_poll_builds
+
+@test("a freestanding program that sets its group and session with neither hook answered is refused")
+jcc_unanswered_group_hooks_are_refused()
+    if !lbr_ready() then return
+
+    val (code, said, root) = jcc_build_c(jcc_group_program)
+
+    lbr_drop([root])
+    assert(code != 0, "built with the group hooks unanswered")
+    assert(said.contains(jcc_missing + "'sysl_proc_setpgid', 'sysl_proc_setsid' with '@export'"), said)
+end jcc_unanswered_group_hooks_are_refused
+
+@test("a freestanding program answering setpgid and setsid builds, needing no other process hook")
+jcc_answered_group_hooks_build()
+    if !lbr_ready() then return
+
+    val (code, said, root) = jcc_build_c(jcc_group_program + jcc_group_hooks)
+
+    lbr_drop([root])
+    assert(code == 0, said)
+end jcc_answered_group_hooks_build
+
+// -- the three hooks held to their signatures ------------------------------------------------------
+
+private jcc_wrong(hook: string) -> string
+    val (code, said, root) = jcc_build_c(raw"""
+        import sysl.process.sys.Text
+
+        """ + hook + raw"""
+
+        @export("img_alloc")
+        img_alloc(n: usize) -> *u8 = ptr_cast(usize(0x4100_0000))
+
+        @export("img_free")
+        img_free(p: *u8) = ()
+        """)
+
+    lbr_drop([root])
+    assert(code != 0, "built with a hook answered at the wrong signature")
+    said
+end jcc_wrong
+
+@test("an export answering sysl_proc_poll without the value it writes is refused, naming it")
+jcc_poll_signature_is_held()
+    if !lbr_ready() then return
+
+    val said = jcc_wrong("@export(\"sysl_proc_poll\")\nk_poll(pid: i64, how: *int) -> int = 0\n")
+
+    assert(said.contains("the exported 'k_poll' defines 'sysl_proc_poll', which the 'extern' " +
+                         "'sysl.process.sys.poll' declares"), said)
+    assert(said.contains("this one takes 2 parameters, but 'sysl.process.sys.poll' declares 3 — the " +
+                         "declaration also has 'value: *int'"), said)
+end jcc_poll_signature_is_held
+
+@test("an export answering sysl_proc_setpgid with a 32-bit group is refused, naming the parameter")
+jcc_setpgid_signature_is_held()
+    if !lbr_ready() then return
+
+    val said = jcc_wrong("@export(\"sysl_proc_setpgid\")\nk_setpgid(pgid: i32) -> int = 0\n")
+
+    assert(said.contains("its parameter 1, 'pgid', is int, where 'sysl.process.sys.setpgid' declares " +
+                         "'pgid: long'"), said)
+end jcc_setpgid_signature_is_held
+
+@test("an export answering sysl_proc_setsid with a 32-bit id is refused, naming both results")
+jcc_setsid_signature_is_held()
+    if !lbr_ready() then return
+
+    val said = jcc_wrong("@export(\"sysl_proc_setsid\")\nk_setsid() -> int = 1\n")
+
+    assert(said.contains("this one returns int, where 'sysl.process.sys.setsid' returns long"), said)
+end jcc_setsid_signature_is_held
