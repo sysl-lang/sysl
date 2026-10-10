@@ -2290,7 +2290,7 @@ value:
 
 ```sysl
 import sysl.container.{map, Map}
-import sysl.posix.threads.Mutex
+import sysl.threads.Mutex
 
 static var names: Mutex[Map[string, int]] = Mutex.new(map())
 
@@ -2314,7 +2314,7 @@ one inside, and is refused:
 
 ```sysl
 import sysl.container.{map, Map}
-import sysl.posix.threads.Mutex
+import sysl.threads.Mutex
 
 static var names: Mutex[Map[string, string]] = Mutex.new(map())
 
@@ -2322,7 +2322,7 @@ print(names.with((t) -> t.get("a").unwrap_or("none")))
 ```
 
 ```error
-'sysl.posix.threads.Mutex.with' answers a value out of the 'value' it guards, and once the guard is let go that value is shared with whoever holds it next, so every count it reaches has to be atomic — but this answers a 'string', which may share its bytes' count with the guarded one. Answer a fresh string instead — '.copy()' inside the closure gives the string an owner of its own, and a literal is immortal
+'sysl.threads.Mutex.with' answers a value out of the 'value' it guards, and once the guard is let go that value is shared with whoever holds it next, so every count it reaches has to be atomic — but this answers a 'string', which may share its bytes' count with the guarded one. Answer a fresh string instead — '.copy()' inside the closure gives the string an owner of its own, and a literal is immortal
 ```
 
 `t.get("a").unwrap_or("none").copy()` is accepted, and so is the `Map` itself held as a `&sync
@@ -2336,7 +2336,7 @@ value from the field to the store, so that one is the reader's to know about.
 
 The rule above says *what* may cross. **`@crossing` says where**: it is the annotation a facility
 writes above the function that hands a value to another domain, naming the parameters it hands it
-through. `sysl.posix.threads.spawn` is declared with one, and so is any package binding a scheduler
+through. `sysl.threads.spawn` is declared with one, and so is any package binding a scheduler
 of its own:
 
 ```sysl
@@ -2415,7 +2415,7 @@ the only annotations a member may carry are the ones about a parameter
 The three are refused above a **field** and above a **variant** for a different reason, which the
 sentence says: neither has parameters for one of them to name.
 
-`sysl.posix.threads.Channel[T]` is what this changed. Its `send` and `try_send` were free functions
+`sysl.threads.Channel[T]` is what this changed. Its `send` and `try_send` were free functions
 taking the channel by address, because the annotation had to be written on a wrapper a caller went
 through; they are methods now, so a channel's transfers and its queries read alike.
 
@@ -2457,7 +2457,7 @@ print(acct.balance, acct.edits, acct.edit((b) -> *b * 2))
 90 3 180
 ```
 
-`sysl.posix.threads.Mutex.with` is declared this way, and its argument is the reason the annotation
+`sysl.threads.Mutex.with` is declared this way, and its argument is the reason the annotation
 exists: an address handed out by a `lock()` stays usable after `unlock()`, and one lent to a body does
 not ([`library/threads.md § with lends the value for one call`](/library/threads/#with-lends-the-value-for-one-call)).
 

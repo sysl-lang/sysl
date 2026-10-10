@@ -254,8 +254,34 @@ image_link_flags() -> Buf[string]
         out.push(s"-Wl,--entry=$image_entry")
         out.push(s"-Wl,--defsym=__sysl_entry=$image_entry")
 
+    for line in tls_template_symbols()
+        out.push(s"-Wl,--defsym=$line")
+
     out
 end image_link_flags
+
+// **The thread-local template, named for `sysl.threads`** -- where the `.tdata` image starts, where
+// its initialized bytes end, where the zeroed `.tbss` after them ends, and the larger alignment of the
+// two -- so a thread the library starts gets its `@thread_local` storage laid out of the image the
+// linker made, at the offsets it made them at, and a kernel answering the spawn hook only writes the
+// thread pointer (`library/sysl/threads/threads.sysl`'s `template`).
+//
+// **Every expression asks `SIZEOF` first**, which lld answers zero for a section that is not there
+// where `ADDR` and `ALIGNOF` refuse one: an image with no thread-local storage, or with only one of
+// the two sections, links, and one with none gets all four at zero. No comma appears in any of them,
+// since the driver's `-Wl,` splits there.
+tls_template_symbols() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    val data_align = "(SIZEOF(.tdata) ? ALIGNOF(.tdata) : 1)"
+    val bss_align = "(SIZEOF(.tbss) ? ALIGNOF(.tbss) : 1)"
+
+    out.push("__sysl_tls_data=SIZEOF(.tdata) ? ADDR(.tdata) : (SIZEOF(.tbss) ? ADDR(.tbss) : 0)")
+    out.push("__sysl_tls_data_end=SIZEOF(.tdata) ? ADDR(.tdata) + SIZEOF(.tdata) : __sysl_tls_data")
+    out.push("__sysl_tls_end=SIZEOF(.tbss) ? ADDR(.tbss) + SIZEOF(.tbss) : __sysl_tls_data_end")
+    out.push(s"__sysl_tls_align=$data_align > $bss_align ? $data_align : $bss_align")
+    out
+end tls_template_symbols
 
 // The entry the settled link names, which is what a failed link's refusal is read against.
 settled_image_entry() -> string = image_entry

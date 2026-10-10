@@ -1,0 +1,242 @@
+module sysl.threads.hosted
+@requires(os, libc)
+
+import sysl.sys.{UNSUPPORTED, host_status}
+
+// `sysl.threads.sys`'s hooks answered over the platform's C library. **Call `sysl.threads` instead**
+// -- nothing here is meant to be called: each function below exists to be linked under a hook's
+// symbol, and is public only because a private export's symbol is hidden.
+//
+// **Nothing imports this module, and nothing has to.** A hook a program reaches is answered by the
+// library's own supplier (`reference/ffi.md § A module may supply another module's extern`), and its
+// exports are `weak`, so a program answering a hook itself is the one the link keeps. It requires
+// `os` and `libc`, so a freestanding target never takes it: there the program answers the hooks it
+// reaches, and one it leaves unanswered is refused by name when it is compiled.
+//
+// **The threads are pthreads, and the futex is the platform's own**:
+//
+// | | threads | `sysl_futex_wait` / `sysl_futex_wake` |
+// |---|---|---|
+// | Linux, Android | pthreads | `futex(2)`, private, through `syscall` |
+// | macOS | pthreads | `os_sync_wait_on_address` and `os_sync_wake_by_address_{any,all}` (macOS 14.4) |
+// | anything else hosted | `UNSUPPORTED` | `UNSUPPORTED` |
+//
+// **A thread's `@thread_local` storage is the C library's here**: pthreads lays each thread's block
+// down and writes the thread pointer itself, so the `tls` a spawn is handed is null and ignored.
+
+#if hosted
+#if bsd
+private extern "__error" errno_location() -> *i32
+#elif android
+private extern "__errno" errno_location() -> *i32
+#else
+private extern "__errno_location" errno_location() -> *i32
+#endif
+
+/** The code the last failed call left behind, negated as a hook answers it. */
+private failed() -> int = host_status(int(*errno_location()))
+
+// -- threads --------------------------------------------------------------------------------------
+
+#if posix
+// **A `pthread_t` is one word on every platform this builds for** -- a pointer on Darwin, an
+// `unsigned long` under glibc and musl -- so it is held in the `u64` word the library keeps.
+private extern "pthread_create" c_pthread_create(t: *u64, attr: *u8, body: *extern(*u8) -> *u8,
+                                                 arg: *u8) -> int
+private extern "pthread_join" c_pthread_join(t: u64, result: **u8) -> int
+private extern "pthread_self" c_pthread_self() -> u64
+private extern "sched_yield" c_sched_yield() -> int
+private extern "pthread_attr_init" c_attr_init(attr: *u8) -> int
+private extern "pthread_attr_destroy" c_attr_destroy(attr: *u8) -> int
+private extern "pthread_attr_setstack" c_attr_setstack(attr: *u8, stack: *u8, size: usize) -> int
+
+// **A `pthread_attr_t` is a caller-allocated C struct whose size is in a header** -- 64 bytes on
+// Darwin and under glibc on aarch64, 56 under glibc on x86-64 and under musl. Nothing here reads a
+// field of it, so what it needs is room, and this is twice the largest.
+private const ATTR_WORDS: usize = 16
+
+// **macOS refuses a stack that is not page-aligned at both ends**, and its pages are 16 KiB on Apple
+// silicon; Linux takes any 16-aligned one. Trimming to the larger page serves both.
+private const STACK_PAGE: usize = 16384
+#endif
+
+@export("sysl_thread_spawn")
+supply_spawn(entry: *extern(*u8) -> unit, arg: *u8, stack: *u8, stack_len: usize, tls: *u8,
+             tid: *u64) -> int
+#if posix
+    // A body declared `-> unit` is called by pthreads as though it returned a `void *`; nothing reads
+    // what it leaves in the register, `supply_join` passing no place for it.
+    val body: *extern(*u8) -> *u8 = ptr_cast(entry)
+
+    if stack == null
+        val e = c_pthread_create(tid, null, body, arg)
+
+        return if e == 0 then 0 else host_status(e)
+
+    var attr: [ATTR_WORDS]u64 = [0; ATTR_WORDS]
+    val a: *u8 = ptr_cast(&attr[0])
+
+    val lo = (usize(stack) + STACK_PAGE - 1) / STACK_PAGE * STACK_PAGE
+    val hi = (usize(stack) + stack_len) / STACK_PAGE * STACK_PAGE
+
+    if hi <= lo then return -22
+
+    var e = c_attr_init(a)
+
+    if e != 0 then return host_status(e)
+
+    e = c_attr_setstack(a, ptr_cast(lo), hi - lo)
+
+    if e == 0 then e = c_pthread_create(tid, a, body, arg)
+
+    c_attr_destroy(a)
+
+    if e == 0 then 0 else host_status(e)
+#else
+    UNSUPPORTED
+#endif
+end supply_spawn
+
+@export("sysl_thread_join")
+supply_join(tid: *u64) -> int
+#if posix
+    val e = c_pthread_join(*tid, null)
+
+    if e == 0 then 0 else host_status(e)
+#else
+    UNSUPPORTED
+#endif
+end supply_join
+
+@export("sysl_thread_self")
+supply_self() -> u64
+#if posix
+    c_pthread_self()
+#else
+    0
+#endif
+end supply_self
+
+@export("sysl_thread_yield")
+supply_yield() -> int
+#if posix
+    if c_sched_yield() == 0 then 0 else failed()
+#else
+    UNSUPPORTED
+#endif
+end supply_yield
+
+// -- the futex ------------------------------------------------------------------------------------
+
+#if macos
+// `os/os_sync_wait_on_address.h`. The flags are the `_NONE` of each, and the clock is
+// `OS_CLOCK_MACH_ABSOLUTE_TIME`, against which the timeout is a relative count of nanoseconds.
+private extern "os_sync_wait_on_address" c_wait_on(addr: *u32, value: u64, size: usize,
+                                                   flags: u32) -> int
+private extern "os_sync_wait_on_address_with_timeout" c_wait_on_for(addr: *u32, value: u64,
+                                                                    size: usize, flags: u32,
+                                                                    clock: u32, ns: u64) -> int
+private extern "os_sync_wake_by_address_any" c_wake_any(addr: *u32, size: usize, flags: u32) -> int
+private extern "os_sync_wake_by_address_all" c_wake_all(addr: *u32, size: usize, flags: u32) -> int
+
+private const MACH_ABSOLUTE_CLOCK: u32 = 32
+private const ETIMEDOUT: i32 = 60
+private const ENOENT: i32 = 2
+
+@export("sysl_futex_wait")
+supply_futex_wait(addr: *u32, expected: u32, timeout_ns: i64) -> int
+    val r = if timeout_ns < 0 then c_wait_on(addr, u64(expected), 4, 0)
+    else c_wait_on_for(addr, u64(expected), 4, 0, MACH_ABSOLUTE_CLOCK, u64(timeout_ns))
+
+    if r >= 0 then return 0
+
+    val e = *errno_location()
+
+    // An interrupted or spurious return is a zero the caller re-checks, as on Linux.
+    if e == ETIMEDOUT then 1 else if e == 4 then 0 else host_status(int(e))
+end supply_futex_wait
+
+@export("sysl_futex_wake")
+supply_futex_wake(addr: *u32, n: int) -> int
+    var woken = 0
+
+    if n >= 2147483647
+        if c_wake_all(addr, 4, 0) == 0 then return 0
+    else
+        // One wake per waiter asked for, stopping at the first that found nobody.
+        while woken < n
+            if c_wake_any(addr, 4, 0) != 0 then break
+            woken += 1
+
+        return woken
+    end if
+
+    // Nobody waiting is not a failure; it is a wake that had nothing to do.
+    if *errno_location() == ENOENT then 0 else failed()
+end supply_futex_wake
+
+#elif linux
+@export("sysl_futex_wait")
+supply_futex_wait(addr: *u32, expected: u32, timeout_ns: i64) -> int = linux_wait(addr, expected, timeout_ns)
+
+@export("sysl_futex_wake")
+supply_futex_wake(addr: *u32, n: int) -> int = linux_wake(addr, n)
+
+#elif android
+@export("sysl_futex_wait")
+supply_futex_wait(addr: *u32, expected: u32, timeout_ns: i64) -> int = linux_wait(addr, expected, timeout_ns)
+
+@export("sysl_futex_wake")
+supply_futex_wake(addr: *u32, n: int) -> int = linux_wake(addr, n)
+
+#else
+@export("sysl_futex_wait")
+supply_futex_wait(addr: *u32, expected: u32, timeout_ns: i64) -> int = UNSUPPORTED
+
+@export("sysl_futex_wake")
+supply_futex_wake(addr: *u32, n: int) -> int = UNSUPPORTED
+#endif
+
+#if posix
+// Linux's `futex(2)` by number, which differs per processor; `syscall` is how a C program without
+// glibc's wrapper reaches it, and glibc has none.
+private extern "syscall" c_syscall(n: long, ...) -> long
+
+#if aarch64
+private const SYS_FUTEX: long = 98
+#elif riscv64
+private const SYS_FUTEX: long = 98
+#elif x86_64
+private const SYS_FUTEX: long = 202
+#else
+private const SYS_FUTEX: long = 240
+#endif
+
+private const FUTEX_WAIT_PRIVATE: long = 128
+private const FUTEX_WAKE_PRIVATE: long = 129
+
+// A relative timeout, as `FUTEX_WAIT` reads one: `struct timespec`, two `long`s on every Linux this
+// builds for.
+private struct Timespec
+    sec: long
+    nsec: long
+
+private linux_wait(addr: *u32, expected: u32, timeout_ns: i64) -> int
+    var ts = Timespec(long(timeout_ns / 1000000000), long(timeout_ns % 1000000000))
+    val at: *Timespec = if timeout_ns < 0 then null else &ts
+
+    if c_syscall(SYS_FUTEX, addr, FUTEX_WAIT_PRIVATE, long(expected), at) == 0 then return 0
+
+    val e = *errno_location()
+
+    // EAGAIN (the word had already changed) and EINTR are returns the caller re-checks; ETIMEDOUT is
+    // the time running out.
+    if e == 110 then 1 else if e == 11 || e == 4 then 0 else host_status(int(e))
+end linux_wait
+
+private linux_wake(addr: *u32, n: int) -> int
+    val r = c_syscall(SYS_FUTEX, addr, FUTEX_WAKE_PRIVATE, long(n))
+
+    if r >= 0 then int(r) else failed()
+#endif
+#endif

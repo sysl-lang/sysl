@@ -1,0 +1,477 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.text.Search
+import sysl.testing.skip
+
+// **Threads over `sysl.threads.sys`, a program answering it on a target with no C library, and the
+// thread-local template every bare image's link names.**
+//
+// `sysl.threads` starts, joins and names threads through the `sysl_thread_*` hooks and sleeps through
+// the `sysl_futex_*` pair. On a hosted target `sysl.threads.hosted` answers them over pthreads and the
+// platform's futex; on a freestanding one the program answers each hook it reaches with an `@export`,
+// and one it leaves unanswered is refused when it is compiled (`emit_checks.sysl`'s
+// `check_library_hooks`, the `sysl.threads.sys` row) rather than at the link, where the symbols missing
+// were pthreads'. A bare image's link defines `__sysl_tls_data`, `__sysl_tls_data_end`,
+// `__sysl_tls_end` and `__sysl_tls_align` (`image_link.sysl`'s `tls_template_symbols`), which
+// `sysl.threads` lays each new thread's `@thread_local` block out of.
+
+private val thk_target: string = "aarch64-freestanding"
+private val thk_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+// A lock, a condition variable, a channel and a thread: every hook reached.
+private val thk_program: string = raw"""
+    import sysl.threads.{Condvar, Mutex, channel, current, spawn, yield_now}
+
+    private struct State
+        m: Mutex[int]
+        cv: Condvar
+
+    private work(s: *State) -> unit
+        s.m.with((n) -> *n += 1)
+        s.cv.notify_all()
+
+    @export("probe_threads")
+    probe_threads() -> int
+        var s = State(Mutex.new(0), Condvar.new())
+
+        spawn(&work, &s) match
+            Some(t) -> t.join()
+            None -> return -1
+
+        var slots: [2]int = [0; 2]
+        var ch = channel(slots[..])
+
+        ch.try_send(int(current().id))
+        yield_now()
+        s.m.with((n) -> *n)
+    end probe_threads
+    """
+
+// The six hooks, answered as a kernel's stubs would be: enough to link, nothing to run.
+private val thk_hooks: string = raw"""
+    @export("sysl_thread_spawn")
+    k_spawn(entry: *extern(*u8) -> unit, arg: *u8, stack: *u8, stack_len: usize, tls: *u8,
+            tid: *u64) -> int
+        *tid = 2
+        0
+    end k_spawn
+
+    @export("sysl_thread_join")
+    k_join(tid: *u64) -> int = 0
+
+    @export("sysl_thread_self")
+    k_self() -> u64 = 1
+
+    @export("sysl_thread_yield")
+    k_yield() -> int = 0
+
+    @export("sysl_futex_wait")
+    k_wait(addr: *u32, expected: u32, timeout_ns: i64) -> int = 0
+
+    @export("sysl_futex_wake")
+    k_wake(addr: *u32, n: int) -> int = 0
+    """
+
+private thk_tree(program: string) -> string =
+    lbr_tree(lbr_two("main.sysl", program, "package.hocon",
+                     "package { name = \"probe\", version = \"0.1.0\" }\n"))
+
+// What `sysl build-c` answers for the tree on `target`, and the archive it wrote.
+private thk_archive(p: string, target: string) -> ((int, string), string)
+    val archive = s"$p/probe.a"
+
+    (lbr_cli(["sysl", "build-c", "--target", target, "-o", archive, p]), archive)
+end thk_archive
+
+private thk_nm_of(args: []string) -> string = capture(thk_nm, args, "", [], true) match
+    Ok(o) -> o.text
+    Err(_) -> "llvm-nm could not be run"
+
+// Whether an `llvm-nm` listing names `symbol`, as the last word of one of its lines.
+private thk_names(listing: string, symbol: string) -> bool
+    for line in lines_of(listing)
+        val t = line.trim()
+
+        if t == symbol || t.ends_with(s" $symbol") || t == s"_$symbol" || t.ends_with(s" _$symbol")
+            return true
+    end for
+
+    false
+end thk_names
+
+private thk_nm_ready() -> bool
+    if !lbr_ready() then return false
+    if !is_file(thk_nm) then skip(s"there is no llvm-nm at $thk_nm to read the archive")
+
+    true
+end thk_nm_ready
+
+private val thk_libc_names: []const string = ["pthread_create", "pthread_join", "pthread_self",
+    "pthread_attr_init", "pthread_attr_setstack", "sched_yield", "syscall",
+    "os_sync_wait_on_address", "os_sync_wake_by_address_any", "os_sync_wake_by_address_all"]
+
+private val thk_hook_names: []const string = ["sysl_thread_spawn", "sysl_thread_join",
+    "sysl_thread_self", "sysl_thread_yield", "sysl_futex_wait", "sysl_futex_wake"]
+
+// -- the link line ----------------------------------------------------------------------------------
+
+private thk_line(name: string) -> Buf[string] =
+    link_command("clang", "prog.ll", buf(), "prog", target_named(name).unwrap(), DefaultOptimization,
+                 buf(), no_probe())
+
+private thk_defsyms(line: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in line
+        if item.starts_with("-Wl,--defsym=__sysl_tls_") then out.push(item)
+
+    out
+end thk_defsyms
+
+@test("a bare image's link names the thread-local template in four symbols, with no comma in any")
+thk_link_line_names_the_template()
+    reset_search_paths()
+
+    val named = thk_defsyms(thk_line(thk_target))
+
+    assert_eq(named.len(), 4)
+
+    for item in named
+        assert(!item[4..<item.bytes.len].contains(","), item)
+
+    assert(named.at(0).starts_with("-Wl,--defsym=__sysl_tls_data=SIZEOF(.tdata) ? ADDR(.tdata)"),
+           named.at(0))
+    assert(named.at(3).starts_with("-Wl,--defsym=__sysl_tls_align="), named.at(3))
+end thk_link_line_names_the_template
+
+@test("a hosted link names no template: the C library lays each thread's storage")
+thk_hosted_link_names_none()
+    reset_search_paths()
+
+    assert(thk_defsyms(thk_line("aarch64-macos")).is_empty(), "a hosted link defines the template")
+    assert(thk_defsyms(thk_line("x86_64-linux")).is_empty(), "a hosted link defines the template")
+end thk_hosted_link_names_none
+
+// -- a bare archive answering the hooks it reaches ---------------------------------------------------
+
+@test("a freestanding archive answering the thread hooks leaves no pthreads or futex symbol undefined")
+thk_answered_hooks_archive()
+    if !thk_nm_ready() then return
+
+    val p = thk_tree(thk_program + thk_hooks)
+    val (said, archive) = thk_archive(p, thk_target)
+
+    assert(said.0 == 0, said.1)
+
+    val undefined = thk_nm_of(["-u", archive])
+
+    for name in thk_libc_names
+        assert(!thk_names(undefined, name), s"'$name' is undefined in the archive:\n$undefined")
+
+    for name in thk_hook_names
+        assert(!thk_names(undefined, name), s"'$name' is undefined in the archive:\n$undefined")
+
+    // The template is the linker's to name, so an archive leaves it for the C project's link.
+    assert(thk_names(undefined, "__sysl_tls_data"), undefined)
+
+    lbr_drop([p])
+end thk_answered_hooks_archive
+
+@test("the same program built for a host leaves pthreads for the C library to answer")
+thk_hosted_archive_names_pthreads()
+    // The control for the test above: the listing it reads can name pthreads, and does where the
+    // library's hosted answer is the one taken.
+    if !thk_nm_ready() then return
+
+    val p = thk_tree(thk_program)
+    val (said, archive) = thk_archive(p, "aarch64-macos")
+
+    assert(said.0 == 0, said.1)
+
+    val undefined = thk_nm_of(["-u", archive])
+
+    assert(thk_names(undefined, "pthread_create"), undefined)
+    assert(thk_names(undefined, "os_sync_wait_on_address"), undefined)
+    assert(!thk_names(undefined, "__sysl_tls_data"), undefined)
+
+    lbr_drop([p])
+end thk_hosted_archive_names_pthreads
+
+@test("a freestanding program starting a thread with no thread hooks is refused, naming every one")
+thk_unanswered_hooks_are_refused()
+    if !lbr_ready() then return
+
+    val p = thk_tree(thk_program)
+    val (said, _) = thk_archive(p, thk_target)
+
+    assert(said.0 != 0, "built with every thread hook unanswered")
+    assert(said.1.contains(s"error: this program reaches 'sysl.threads', and '$thk_target' has no " +
+        "operating system under it for the standard library to answer a thread or a futex with, so " +
+        "the program answers it: define 'sysl_futex_wait', 'sysl_futex_wake', 'sysl_thread_join', " +
+        "'sysl_thread_self', 'sysl_thread_spawn', 'sysl_thread_yield' with '@export', each taking " +
+        "what its 'extern' in 'sysl.threads.sys' declares and answering zero, a count or an id, or a " +
+        "failure's code negated"), said.1)
+
+    assert(!said.1.contains("pthread"), said.1)
+
+    lbr_drop([p])
+end thk_unanswered_hooks_are_refused
+
+@test("a program that only takes a lock is asked for the futex pair and nothing else")
+thk_only_the_reached_hooks_are_asked_for()
+    if !lbr_ready() then return
+
+    val p = thk_tree(raw"""
+        import sysl.threads.Mutex
+
+        @export("probe_lock")
+        probe_lock() -> int
+            var m = Mutex.new(1)
+
+            m.with((n) -> *n)
+        """)
+    val (said, _) = thk_archive(p, thk_target)
+
+    assert(said.0 != 0, "built with the futex hooks unanswered")
+    assert(said.1.contains("so the program answers it: define 'sysl_futex_wait', 'sysl_futex_wake' " +
+        "with '@export'"), said.1)
+
+    lbr_drop([p])
+end thk_only_the_reached_hooks_are_asked_for
+
+// -- an image: the template as the linker laid it ------------------------------------------------------
+
+private val thk_image_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n" +
+    "codegen {\n  thread_pointer = \"tpidr_el0\"\n}\n" +
+    s"targets {\n  $thk_target {\n    entry = \"kstart\"\n  }\n}\n"
+
+private val thk_image_runtime: string = raw"""
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = null
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+
+    @export("memset")
+    mem_set(dst: *u8, c: int, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = u8(c)
+
+        dst
+
+    @export("memcpy")
+    mem_copy(dst: *u8, src: *u8, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = src[i]
+
+        dst
+
+    @export("memmove")
+    mem_move(dst: *u8, src: *u8, n: usize) -> *u8 = mem_copy(dst, src, n)
+
+    @export("memcmp")
+    mem_compare(a: *u8, b: *u8, n: usize) -> int = 0
+    """
+
+// An 8-byte initialized thread-local and 32 zeroed bytes, 16-aligned, read by a spawned thread.
+// The storage sits in a module of its own, the image's root file being functions alone.
+private val thk_image_module: string = raw"""
+    module tl
+
+    @thread_local
+    var tick: u64 = 7
+
+    @thread_local
+    @align(16)
+    var spare: [4]u64 = [0; 4]
+
+    @export("tl_bump")
+    bump(n: *u64) -> unit
+        tick += *n
+        spare[usize(*n) % 4] = tick
+        *n = spare[usize(tick) % 4]
+    """
+
+private val thk_image_program: string = raw"""
+    import sysl.threads.spawn
+    import tl.bump
+
+    @export("kstart")
+    kstart() -> never
+        var n: u64 = 1
+
+        // Called here too: the spawn stub never calls its entry, and a body nothing calls would
+        // take its storage out of the image with it.
+        bump(&n)
+        spawn(&bump, &n)
+
+        loop
+            ()
+    """
+
+// The value `llvm-nm` gives a symbol, as a number; -1 where it lists none.
+private thk_value(listing: string, symbol: string) -> long
+    for line in lines_of(listing)
+        val t = line.trim()
+
+        if t.ends_with(s" $symbol")
+            var v: long = 0
+
+            for c in t.bytes
+                if c == u8(' ') then break
+
+                val d = if c >= u8('a') then long(c - u8('a')) + 10 else long(c - u8('0'))
+
+                v = v * 16 + d
+            end for
+
+            return v
+        end if
+    end for
+
+    -1
+end thk_value
+
+private thk_image(program: string) -> (int, string, string)
+    var files = lbr_two("main.sysl", program + thk_hooks + thk_image_runtime, "package.hocon",
+                        thk_image_manifest)
+
+    files.push(("tl/tl.sysl", thk_image_module))
+
+    val p = lbr_tree(files)
+    val out = lbr_temp("sysl-thk-elf")
+    val said = lbr_cli(["sysl", "build", "--target", thk_target, "-o", s"$out/img.elf", p])
+    val listing = if said.0 == 0 then thk_nm_of([s"$out/img.elf"]) else said.1
+
+    lbr_drop([p, out])
+    (said.0, said.1, listing)
+end thk_image
+
+@test("a bare image's template symbols bound its .tdata and .tbss as the linker laid them")
+thk_image_template_is_the_linker_s()
+    if !thk_nm_ready() then return
+    if !is_file("/opt/homebrew/bin/ld.lld") then skip("ld.lld is not installed, so no image can be linked")
+
+    val (code, said, listing) = thk_image(thk_image_program)
+
+    assert(code == 0, said)
+
+    val data = thk_value(listing, "__sysl_tls_data")
+    val data_end = thk_value(listing, "__sysl_tls_data_end")
+    val end_at = thk_value(listing, "__sysl_tls_end")
+    val align = thk_value(listing, "__sysl_tls_align")
+
+    assert(data > 0, listing)
+    assert_eq(data_end - data, 8)
+    assert(end_at - data >= 40, listing)
+    assert_eq(align, 16)
+end thk_image_template_is_the_linker_s
+
+@test("an image with no thread-local storage gets all four at zero, and still links")
+thk_image_without_tls()
+    if !thk_nm_ready() then return
+    if !is_file("/opt/homebrew/bin/ld.lld") then skip("ld.lld is not installed, so no image can be linked")
+
+    val (code, said, listing) = thk_image(raw"""
+        import sysl.threads.spawn
+
+        private bump(n: *u64) -> unit
+            *n += 1
+
+        @export("kstart")
+        kstart() -> never
+            var n: u64 = 1
+
+            spawn(&bump, &n)
+
+            loop
+                ()
+        """)
+
+    assert(code == 0, said)
+    assert_eq(thk_value(listing, "__sysl_tls_data"), 0)
+    assert_eq(thk_value(listing, "__sysl_tls_end"), 0)
+    assert_eq(thk_value(listing, "__sysl_tls_align"), 1)
+end thk_image_without_tls
+
+// -- a generic alias that only renames ---------------------------------------------------------------
+
+@test("an associated function is reached through a generic alias that only renames its type")
+thk_generic_alias_associated_call()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        struct Box[T]
+            v: T
+
+            new(v: T) -> Box[T] = Box(v)
+
+        type B[T] = Box[T]
+        type C[T] = B[T]
+
+        val a = B.new(5)
+        val b = C.new("five")
+        val c: B[int] = B[int](6)
+
+        print(a.v, b.v, c.v)
+        """)
+    val said = lbr_run(p, [])
+
+    lbr_drop([p])
+    assert_eq(said, "5 five 6\n")
+end thk_generic_alias_associated_call
+
+@test("an alias that fixes a parameter is not the type it names, and its bare name stands for nothing")
+thk_generic_alias_that_fixes_is_not_followed()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        struct Pair[A, B]
+            a: A
+            b: B
+
+            new(a: A, b: B) -> Pair[A, B] = Pair(a, b)
+
+        type Keyed[B] = Pair[string, B]
+
+        val k = Keyed.new("k", 1)
+
+        print(k.b)
+        """)
+    val said = lbr_cli(["sysl", "run", p])
+
+    lbr_drop([p])
+    assert(said.0 != 0, said.1)
+    assert(said.1.contains("undefined name 'Keyed'"), said.1)
+end thk_generic_alias_that_fixes_is_not_followed
+
+@test("a written list after a renaming alias is refused as it is after the type itself")
+thk_generic_alias_written_list()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        struct Box[T]
+            v: T
+
+            new(v: T) -> Box[T] = Box(v)
+
+        type B[T] = Box[T]
+
+        val a = B[int].new(5)
+
+        print(a.v)
+        """)
+    val said = lbr_cli(["sysl", "run", p])
+
+    lbr_drop([p])
+    assert(said.0 != 0, said.1)
+    assert(said.1.contains("'B' cannot be given type arguments where 'new' is selected from it"), said.1)
+end thk_generic_alias_written_list

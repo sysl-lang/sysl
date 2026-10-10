@@ -1379,7 +1379,7 @@ declaration to mark and counts as blocking all the same. A generic is named as i
 whether it waits:
 
 ```sysl
-import sysl.posix.threads.Mutex
+import sysl.threads.Mutex
 
 f() -> int = 1
 
@@ -1390,7 +1390,7 @@ print(f())
 ```
 
 ```error
-this reaches 'sysl.posix.threads.Mutex.lock_raw', which blocks, and 'guarded' declared '@no_block'
+this reaches 'sysl.threads.Mutex.lock_raw', which blocks, and 'guarded' declared '@no_block'
 ```
 
 A call through a trait object reaches the implementation the body erased into it, as for `@no_alloc`.
@@ -2630,7 +2630,7 @@ It marks a `var` and nothing else. A `val` and a `const` never change, so the on
 is every thread's.
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 @thread_local static var n: int = 0
 
@@ -2697,7 +2697,7 @@ C's `static _Thread_local Vm *vm = &main_vm;` is. Every thread starts pointing a
 each can then point its own copy somewhere else without the others seeing it:
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 struct Vm
     id: int
@@ -2777,16 +2777,21 @@ The register is any of `tpidr_el0`, `tpidrro_el0`, `tpidr_el1`, `tpidr_el2` and 
 function is compiled to read it (clang's `-mtp`), and so is a package's carried C, so a
 `_Thread_local` there and a `@thread_local` here find one block.
 
-**What the program then owes is what a loader would have done.** The linker gathers every
-thread-local into a `.tdata` image (the initial values) and a `.tbss` (the zeros), and on AArch64 a
-variable lives at the thread pointer plus 16 plus its offset in that image, the 16 bytes being reserved
-for the thread's own use. So for each thread the program sets aside 16 bytes plus the image, rounded
-to the image's alignment, copies `.tdata` in after the 16, zeroes the `.tbss` part, and writes the
-block's address to the register on every switch. A linker script names the bounds for it to copy:
+**What the program then owes is what a loader would have done, and the library does most of it.** The
+linker gathers every thread-local into a `.tdata` image (the initial values) and a `.tbss` (the zeros),
+and on AArch64 a variable lives at the thread pointer plus 16 plus its offset in that image, the 16
+bytes being reserved for the thread's own use. Every bare image's link names that template —
+`__sysl_tls_data`, `__sysl_tls_data_end`, `__sysl_tls_end` and `__sysl_tls_align` — so
+`sysl.threads.spawn` lays each thread it starts out of it and hands the block's address to the spawn
+hook (`library/threads.md § On a target with no C library`), and the program's part is the register: a
+kernel writes it on every switch. The first thread is the one the library did not start, so the
+program lays its block itself, `sysl.threads.tls_room()` bytes set aside and `tls_place` answering what
+the register should hold:
 
 ```text
-.tdata : { __tdata_start = .; *(.tdata .tdata.*) __tdata_end = .; }
-.tbss  : { *(.tbss .tbss.*) *(.tcommon) __tbss_end = .; }
+var block: [256]u8 = [0; 256]            // at least tls_room()
+val tp = tls_place(block[..]).unwrap()   // copies .tdata, zeroes .tbss
+write_sysreg("tpidr_el0", u64(usize(tp)))
 ```
 
 A thread that never gets a block reads whatever the register points at, as it would through any

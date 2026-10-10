@@ -1,0 +1,82 @@
+module sysl.threads
+@requires(os)
+
+import sysl.sync.*
+import sysl.threads.sys as tsys
+
+/** A place for threads to sleep until another says something has changed: a condition variable.
+ *
+ * **It is a sequence number**, bumped by every `notify_one` and `notify_all`. A waiter reads the number
+ * while it still holds the lock, lets the lock go, and sleeps in `sysl_futex_wait` only while the
+ * number is still the one it read -- so a notification sent between the release and the sleep changes
+ * the number, the futex finds it changed, and the waiter does not sleep through it. That is the whole
+ * of what makes a condition variable correct, and it needs no queue of its own.
+ *
+ * **A wait can end with nothing having changed** -- a spurious wake, a notification meant for another
+ * waiter -- so the condition is always re-checked in a loop, as with every condition variable:
+ *
+ * ```
+ * val state = m.lock_raw()
+ *
+ * while !state.ready
+ *     cv.wait(&m)
+ *
+ * m.unlock_raw()
+ * ```
+ */
+struct Condvar
+
+    // The number every notification bumps, and the futex word a waiter sleeps on.
+    private seq: Atomic[u32]
+
+    /** A condition variable nobody is waiting on. */
+    new() -> Condvar = Condvar(Atomic(0))
+
+    /** Releases `m`, which the caller holds, sleeps until notified, and takes `m` again before
+     * answering. The caller re-checks its condition: the wait may end with nothing changed.
+     */
+    @blocks
+    wait[T](*self, m: *Mutex[T])
+        val seen = self.seq.load(Relaxed)
+
+        m.unlock_raw()
+        tsys.futex_wait(&self.seq.v, seen, -1)
+        m.lock_raw()
+    end wait
+
+    /** `wait`, for at most `ns` nanoseconds: answers `false` where the time ran out first. Either
+     * way `m` is held again when it answers.
+     */
+    @blocks
+    wait_for[T](*self, m: *Mutex[T], ns: i64) -> bool
+        val seen = self.seq.load(Relaxed)
+
+        m.unlock_raw()
+
+        val r = tsys.futex_wait(&self.seq.v, seen, ns)
+
+        m.lock_raw()
+        r != tsys.TIMED_OUT
+    end wait_for
+
+    /** `wait` over a bare `Lock`, which the caller holds. */
+    @blocks
+    wait_raw(*self, l: *Lock)
+        val seen = self.seq.load(Relaxed)
+
+        l.unlock()
+        tsys.futex_wait(&self.seq.v, seen, -1)
+        l.lock()
+    end wait_raw
+
+    /** Wakes one waiter, if there is one. */
+    notify_one(*self)
+        self.seq.add(1, Release)
+        tsys.futex_wake(&self.seq.v, 1)
+
+    /** Wakes every waiter. */
+    notify_all(*self)
+        self.seq.add(1, Release)
+        tsys.futex_wake(&self.seq.v, tsys.WAKE_ALL)
+
+end Condvar

@@ -132,7 +132,7 @@ offer rather than part of the language.
 | `sysl.math` | `max`, `min`, `pi`, the float functions, the integer traits `Signed` and `Bits`, and the integer arithmetic above them — `pow`, `gcd`, `lcm`, `divmod`, `is_power_of_two`, `next_power_of_two` |
 | `sysl.regex` | POSIX Extended Regular Expressions — `regex`, `Regex`, `Match` |
 | `sysl.sync` | `Atomic[T]`, `SpinLock`, and the five memory orderings — requires nothing |
-| `sysl.posix.threads` | `spawn`, `Thread.join`, `yield_now`, and `Mutex[T]` |
+| `sysl.threads` | `spawn`, `Thread.join`, `yield_now`, `Mutex[T]`, `Condvar` and `Channel[T]` |
 | `sysl.args` | command-line options — `Scan`, `Cli`, and `args_of` for a raw `argv` |
 | `sysl.sys` | the platform seam — what a freestanding target replaces |
 
