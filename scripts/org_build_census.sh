@@ -175,6 +175,7 @@ for dir in "$org"/*/; do
         ogol-pico)    board=1; board_target=thumbv6m-freestanding ;;
         ogol-pico2)   board=1; board_target=thumb-freestanding-softfp ;;
         solder-pico2) board=1; board_target=thumb-freestanding-softfp ;;
+        musicbox-pico) board=1; board_target=thumb-freestanding-softfp ;;
         zephyr|zephyr-demo)
             rows=$((rows + 1))
             setup=$((setup + 1))
@@ -201,9 +202,15 @@ for dir in "$org"/*/; do
         if [ -n "$entry" ]; then
             command="build ."
             label="build"
-        else
+        elif grep -rlE --include="*.sysl" --include="*.lsysl" '^@test\b' "$dir" > /dev/null 2>&1; then
             command="test ."
             label="test"
+        else
+            # A package with no `@test` function has no suite to run: `sysl test .` answers
+            # "no '@test' functions in .", which says nothing about whether it builds. Its analysis
+            # is what can be asked, and `build-lib` runs all of it.
+            command="build-lib ."
+            label="build-lib"
         fi
     else
         for manifest in "$dir"*/package.hocon; do
@@ -297,11 +304,13 @@ for dir in "$org"/*/; do
     fi
 
     # **Read out of a copy**, because a build records what it fetched in `sysl.sum` and a census has
-    # no business writing into a repository it does not own.
+    # no business writing into a repository it does not own. **The copy is the files git knows of,
+    # tracked or not yet added, and never the ignored ones**: a scratch directory a session left
+    # behind can hold a file nobody may read, and tar then stops short of the files after it.
     here=$work/$name
     rm -rf "$here"
     mkdir -p "$here"
-    ( cd "$dir" && tar cf - --exclude .git . ) | ( cd "$here" && tar xf - )
+    ( cd "$dir" && git ls-files -z -co --exclude-standard | tar cf - --null -T - ) | ( cd "$here" && tar xf - )
 
     rows=$((rows + 1))
     ours_ok=0
@@ -312,6 +321,7 @@ for dir in "$org"/*/; do
         case $label in
             test) ok_test=$((ok_test + 1)) ;;
             build) ok_build=$((ok_build + 1)) ;;
+            build-lib) ok_typecheck=$((ok_typecheck + 1)) ;;
             *)
                 # Never `cond && (( a++ )) || (( b++ ))`: an arithmetic command reports its result
                 # as a status and `x++` yields the value before the increment, so the 0->1
@@ -343,7 +353,7 @@ for dir in "$org"/*/; do
     theirs=$work/$name.reference
     rm -rf "$theirs"
     mkdir -p "$theirs"
-    ( cd "$dir" && tar cf - --exclude .git . ) | ( cd "$theirs" && tar xf - )
+    ( cd "$dir" && git ls-files -z -co --exclude-standard | tar cf - --null -T - ) | ( cd "$theirs" && tar xf - )
 
     theirs_ok=0
 

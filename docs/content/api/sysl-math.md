@@ -20,7 +20,7 @@ name, and each says in its own header why it is not part of this one.
 
 ## Index
 
-[`e`](#e) [`ln10`](#ln10) [`ln2`](#ln2) [`pi`](#pi) [`sqrt2`](#sqrt2) [`tau`](#tau) [`approx_eq`](#approx_eq) [`approx_eq_rel`](#approx_eq_rel) [`assert_approx_eq`](#assert_approx_eq) [`assert_approx_eq_rel`](#assert_approx_eq_rel) [`checked_add`](#checked_add) [`checked_mul`](#checked_mul) [`checked_sub`](#checked_sub) [`clamp`](#clamp) [`divmod`](#divmod) [`gcd`](#gcd) [`infinity`](#infinity) [`is_power_of_two`](#is_power_of_two) [`lcm`](#lcm) [`max`](#max) [`min`](#min) [`nan`](#nan) [`next_power_of_two`](#next_power_of_two) [`overflowing_add`](#overflowing_add) [`overflowing_mul`](#overflowing_mul) [`overflowing_sub`](#overflowing_sub) [`pow`](#pow) [`Bits`](#bits) [`Float`](#float) [`Magnitude`](#magnitude) [`Signed`](#signed) [Float for bf16](#float-for-bf16) [Float for f16](#float-for-f16) [Float for f32](#float-for-f32) [Float for real](#float-for-real) [Magnitude for f32](#magnitude-for-f32) [Magnitude for real](#magnitude-for-real) [Magnitude for T](#magnitude-for-t)
+[`e`](#e) [`ln10`](#ln10) [`ln2`](#ln2) [`pi`](#pi) [`sqrt2`](#sqrt2) [`tau`](#tau) [`approx_eq`](#approx_eq) [`approx_eq_rel`](#approx_eq_rel) [`assert_approx_eq`](#assert_approx_eq) [`assert_approx_eq_rel`](#assert_approx_eq_rel) [`checked_add`](#checked_add) [`checked_mul`](#checked_mul) [`checked_sub`](#checked_sub) [`clamp`](#clamp) [`divmod`](#divmod) [`gcd`](#gcd) [`infinity`](#infinity) [`is_power_of_two`](#is_power_of_two) [`lcm`](#lcm) [`max`](#max) [`min`](#min) [`nan`](#nan) [`next_power_of_two`](#next_power_of_two) [`nextafter`](#nextafter) [`nextafter`](#nextafter-1) [`overflowing_add`](#overflowing_add) [`overflowing_mul`](#overflowing_mul) [`overflowing_sub`](#overflowing_sub) [`pow`](#pow) [`ulp`](#ulp) [`ulp`](#ulp-1) [`Bits`](#bits) [`ByteOrder`](#byteorder) [`Float`](#float) [`Magnitude`](#magnitude) [`Signed`](#signed) [Float for bf16](#float-for-bf16) [Float for f16](#float-for-f16) [Float for f32](#float-for-f32) [Float for real](#float-for-real) [Magnitude for f32](#magnitude-for-f32) [Magnitude for real](#magnitude-for-real) [Magnitude for T](#magnitude-for-t)
 
 ## Constants
 
@@ -312,6 +312,28 @@ question a generic body has no way to put -- the shift is performed and the resu
 against zero: a signed shift that has reached the sign bit comes back negative, and an unsigned
 one never does.
 
+### `nextafter`
+
+```sysl
+nextafter(x: real, y: real) -> real
+```
+
+The `real` after `x` in the direction of `y`: the closest value to `x` that is not `x`, on
+`y`'s side of it.
+
+A NaN in either argument answers a NaN; equal arguments answer `y` (so `nextafter(-0.0, 0.0)`
+is `0.0`); from a zero the answer is the smallest subnormal carrying the sign of `y`; and the
+largest finite value stepping outward answers infinity, as an infinity stepping inward answers
+the largest finite value.
+
+### `nextafter`
+
+```sysl
+nextafter(x: f32, y: f32) -> f32
+```
+
+The `f32` after `x` in the direction of `y`; see the `real` form for the edges.
+
 ### `overflowing_add`
 
 ```sysl
@@ -380,6 +402,27 @@ exponent has no answer among the integers, and saying so in the type is better t
 `pow(2, 64)` at `int` is `0`, arrived at honestly: the doubling that overflows is a `*` like any
 other. A program that needs to know writes the check it needs.
 
+### `ulp`
+
+```sysl
+ulp(x: real) -> real
+```
+
+The gap between `|x|` and the next representable magnitude: the value of the last place.
+
+It is `2^-1074` at zero and throughout the subnormals, doubles at each power of two, and is
+infinity at an infinity and NaN at a NaN. At the largest finite value there is no finite
+magnitude above to measure to, so the answer is the gap below it -- the width of that binade's
+last place, as Java's `Math.ulp` answers -- rather than infinity.
+
+### `ulp`
+
+```sysl
+ulp(x: f32) -> f32
+```
+
+The value of the last place of an `f32`; see the `real` form for the edges.
+
 ## Traits
 
 ### `Bits`
@@ -410,12 +453,12 @@ so there is no finite list of widths to write an `impl` for. Unlike `Signed`, th
 **unsigned** widths too -- a bit pattern is a bit pattern, and `01` already gives `&`, `|`, `^`,
 `~` and the shifts to every integer at either signedness.
 
-**What is deliberately not here is `swap_bytes`.** Reversing the byte order needs a whole number
-of bytes and at least two, so a `u24` has no answer to it and a `u4` has none either. Every
-member of this trait is total over every integer type, because a `[T: Bits]` body is written once
-and instantiated later: a member that worked at `u32` and not at `u24` would turn a bound that
-was supposed to have proven an operation into a failure at somebody else's instantiation. A
-program that means to reorder bytes has the shifts, and knows its own width while writing them.
+**What is deliberately not here is `swap_bytes`**, which is `ByteOrder`'s below. Reversing the
+byte order needs a whole number of bytes, so a `u4` or a `u12` has no answer to it. Every member
+of this trait is total over every integer type, because a `[T: Bits]` body is written once and
+instantiated later: a member that worked at `u32` and not at `u12` would turn a bound that was
+supposed to have proven an operation into a failure at somebody else's instantiation. So the byte
+questions are a trait of their own, whose membership is the widths that have an answer.
 
 | Member | Signature | Description |
 |---|---|---|
@@ -429,6 +472,45 @@ program that means to reorder bytes has the shifts, and knows its own width whil
 | `reverse_bits` | `reverse_bits(self) -> Self` | The bits in the opposite order: the lowest becomes the highest. |
 | `rotate_left` | `rotate_left(self, n: u32) -> Self` | Rotate: the bits shifted off one end arrive at the other. |
 | `rotate_right` | `rotate_right(self, n: u32) -> Self` |  |
+
+### `ByteOrder`
+
+```sysl
+trait ByteOrder
+    swap_bytes(self) -> Self
+    to_be(self) -> Self
+    from_be(self) -> Self
+    to_le(self) -> Self
+    from_le(self) -> Self
+```
+
+A value's bytes, and the two orders they are written to a file or a wire in.
+
+**The membership is every integer whose width is a whole number of bytes**: `u8` through `u64`,
+`i16`, `usize`, and `u24` and `u40` too, since three bytes have an order as surely as four do. A
+`u4` or a `u12` is not a member, there being no byte to reverse it by, which is why these are not
+`Bits`' members (that trait's members answer at every width). One byte is its own reversal, so
+every member is total and `u8.swap_bytes()` is the value it was asked of.
+
+**`to_be` and `from_be` are the same reversal, and naming both is the point.** `x.to_be()` says
+"this value, about to be written most significant byte first", `x.from_be()` says "these bytes,
+read off a big-endian wire" -- on a little-endian machine each is `swap_bytes`, on a big-endian one
+each is the value unchanged, and a program that names the direction reads the same on both. The
+`_le` pair is the mirror. Every machine sysl targets today is little-endian, so the `_le` pair is
+no instruction anywhere yet; it is written so the program still says what it means on the first
+machine that is not.
+
+A struct whose fields are all in one order says so once, with `@byte_order(big)`, and is read and
+written as plain integers (`reference/attributes.md § @byte_order`) -- these are for a value that
+is not in a struct, or a struct whose fields disagree.
+
+| Member | Signature | Description |
+|---|---|---|
+| `swap_bytes` | `swap_bytes(self) -> Self` | The bytes in the opposite order: `0x1234u16.swap_bytes()` is `0x3412`. |
+| `to_be` | `to_be(self) -> Self` | This value as the bytes a big-endian reader expects to find, and back again. |
+| `from_be` | `from_be(self) -> Self` |  |
+| `to_le` | `to_le(self) -> Self` | This value as the bytes a little-endian reader expects to find, and back again. |
+| `from_le` | `from_le(self) -> Self` |  |
 
 ### `Float`
 

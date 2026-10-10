@@ -119,7 +119,7 @@ yield_now() -> bool
 Offers the processor to whatever else is ready to run, and answers whether the system took it.
 
 This is a **hint**, not a wait: a thread that yields is still runnable and may be given the
-processor straight back. What it is for is the spin in `Mutex.lock`, where the thread holding the
+processor straight back. What it is for is the spin in `Mutex.lock_raw`, where the thread holding the
 lock may not be running at all and nothing else will make it so.
 
 ## Types
@@ -194,16 +194,25 @@ Mutex[T]` draws against `SpinLock`.
 
 A spinlock is a flag beside the data and what the data is stays the programmer's to remember. This
 holds the `T`, and both of its fields are private -- so there is no way to reach the value that
-does not go through `lock` or `try_lock`, and no way to build one that skips the free state. That
-is as far as a language with no destructor can take the idea: releasing is still written, and
-`defer m.unlock()` is how, exactly as `defer f.close()` is in `sysl.fs` and for the same reason.
+does not go through the lock, and no way to build one that skips the free state.
+
+**`with` is the way in**: it takes the lock, hands a closure the address of the value, and releases
+the lock when the closure returns. The address is lent (`@lends`), so the compiler holds the closure
+to letting it go -- returning it, storing it, or passing it to something that keeps it is refused,
+which is the one mistake a returned address could not prevent: using it after the release.
 
 ```
-var p = m.lock()
-
-defer m.unlock()
-*p = *p + 1
+m.with((n) -> *n += 1)
 ```
+
+`lock_raw` and `unlock_raw` are the hold a block cannot express -- taken in one function and
+released in another, or handed from one thread to the next. Nothing ties their address to the hold,
+which is what the name says.
+
+**`@guards(value)` is what lets one cross into a `&sync`** whatever it holds (`reference/memory.md §
+A guarded value crosses with its lock`): sharing the lock does not share the value, and what leaves
+through `with` or `try_with` is held to the `&sync` rule instead -- an `int` or a `.copy()` of a
+string, not the `Map` or a string still sharing the guarded one's count.
 
 **It is not built on `pthread_mutex_t`, and the reason is a build property rather than a
 preference.** A caller-allocated opaque C type is one of the three things `reference/ffi.md § A
@@ -226,9 +235,11 @@ context switch per attempt where a futex would cost none.
 | Member | Signature | Description |
 |---|---|---|
 | `new` | `new(value: T) -> Mutex[T]` | Builds a free lock around a value. |
-| `lock` | `lock(*self) -> *T` | Takes the lock, waiting until it is free, and answers the address of what it protects. |
-| `try_lock` | `try_lock(*self) -> Option[*T]` | Takes the lock if it is free, and answers what it protects where it did. |
-| `unlock` | `unlock(*self)` | Releases the lock. |
+| `with` | `with[R](*self, body: *T -> R) -> R` | Takes the lock, waiting until it is free, runs `body` with the address of what it protects, releases the lock, and answers what `body` answered. |
+| `try_with` | `try_with[R](*self, body: *T -> R) -> Option[R]` | The same, if the lock is free: `Some` of what `body` answered, or `None` without waiting. |
+| `lock_raw` | `lock_raw(*self) -> *T` | Takes the lock, waiting until it is free, and answers the address of what it protects. |
+| `try_lock_raw` | `try_lock_raw(*self) -> Option[*T]` | Takes the lock if it is free, and answers what it protects where it did. |
+| `unlock_raw` | `unlock_raw(*self)` | Releases the lock a `lock_raw` or `try_lock_raw` took. |
 
 ### `Thread`
 

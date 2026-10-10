@@ -73,6 +73,19 @@ The elements are let go of when the *last* name for the buffer dies, or earlier,
 **It has no zero value.** A buffer is a box, and a box is made by somebody, so `var b: Buf[int]`
 with nothing after it is refused -- write `= buf()`.
 
+**A `Buf` in storage the program zeroed itself is EMPTY until it is assigned.** A `calloc`ed block,
+a collector's arena or any other memory the language did not initialise holds a handle naming no
+buffer at all. Every reader answers as an empty buffer does -- `len()` is 0, `view()` is empty,
+`at` reports the index past the end, `for` visits nothing, `copy()` makes a fresh empty buffer --
+and assigning `buf()` into it gives it storage. What cannot work is growing it in place: a member
+that adds an element (`push`, `extend`, `insert`) is handed the handle by value and has nowhere to
+put a buffer it made, so it panics, saying so, rather than adding to nothing.
+
+**`release()` is the way back to that state without allocating**: it lets go of this name's share
+of the buffer -- the elements go when the last name does -- and leaves the handle naming nothing,
+as zeroed storage does. It is what a finalizer for raw storage calls, where assigning `buf()` would
+make a fresh buffer that is lost when the storage is freed.
+
 The bounds-checked members panic rather than returning an `Option`, which is the same bargain
 `unwrap` makes -- an index past the end is a mistake in the program, not a value it meant to
 handle -- while `pop` returns one, because taking from an empty sequence is a question a caller
@@ -81,6 +94,7 @@ asks on purpose.
 | Member | Signature | Description |
 |---|---|---|
 | `elems` | `elems -> []T` | The storage, spare capacity included -- for a reader that wants the address of an element, as `&b.elems[i]` is. |
+| `count` | `count -> usize` | How many elements there are -- `len()` under the name the field had. |
 | `len` | `len(self) -> usize` |  |
 | `cap` | `cap(self) -> usize` |  |
 | `is_empty` | `is_empty(self) -> bool` |  |
@@ -95,6 +109,7 @@ asks on purpose.
 | `remove` | `remove(self, i: usize) -> T` |  |
 | `copy` | `copy(self) -> Buf[T]` | A second buffer holding the same elements, sized to them -- the one way to get a buffer that is not this one, every other way of handing a `Buf` on handing on this one. |
 | `view` | `view(self) -> []T` | The elements as a slice, which is what everything reading a `Buf` in bulk goes through. |
+| `release` | `release(*self)` | This name's share of the buffer given back, and the handle left naming nothing -- the state zeroed storage starts in, where every reader answers as an empty buffer does. |
 
 ### `ByteSink`
 

@@ -17,7 +17,7 @@ a field of anything. What the bytes *mean* belongs to whatever asked for them.
 
 ## Index
 
-[`nil`](#nil) [`base64_decode`](#base64_decode) [`base64_decoded_len`](#base64_decoded_len) [`base64_encode`](#base64_encode) [`base64_string`](#base64_string) [`get_u16_be`](#get_u16_be) [`get_u16_le`](#get_u16_le) [`get_u32_be`](#get_u32_be) [`get_u32_le`](#get_u32_le) [`get_u64_be`](#get_u64_be) [`get_u64_le`](#get_u64_le) [`hex_decode`](#hex_decode) [`hex_decoded_len`](#hex_decoded_len) [`hex_encode`](#hex_encode) [`hex_string`](#hex_string) [`of_bytes`](#of_bytes) [`parse`](#parse) [`put_u16_be`](#put_u16_be) [`put_u16_le`](#put_u16_le) [`put_u32_be`](#put_u32_be) [`put_u32_le`](#put_u32_le) [`put_u64_be`](#put_u64_be) [`put_u64_le`](#put_u64_le) [`to_string`](#to_string) [`v4`](#v4) [`v4_of`](#v4_of) [`v7`](#v7) [`Alphabet`](#alphabet) [`DecodeError`](#decodeerror) [`Uuid`](#uuid) [Display for DecodeError](#display-for-decodeerror) [Display for Uuid](#display-for-uuid)
+[`nil`](#nil) [`base64_decode`](#base64_decode) [`base64_decoded_len`](#base64_decoded_len) [`base64_encode`](#base64_encode) [`base64_string`](#base64_string) [`get_u16_be`](#get_u16_be) [`get_u16_le`](#get_u16_le) [`get_u32_be`](#get_u32_be) [`get_u32_le`](#get_u32_le) [`get_u64_be`](#get_u64_be) [`get_u64_le`](#get_u64_le) [`hex_decode`](#hex_decode) [`hex_decoded_len`](#hex_decoded_len) [`hex_encode`](#hex_encode) [`hex_string`](#hex_string) [`of_bytes`](#of_bytes) [`parse`](#parse) [`put_u16_be`](#put_u16_be) [`put_u16_le`](#put_u16_le) [`put_u32_be`](#put_u32_be) [`put_u32_le`](#put_u32_le) [`put_u64_be`](#put_u64_be) [`put_u64_le`](#put_u64_le) [`to_string`](#to_string) [`v4`](#v4) [`v4_of`](#v4_of) [`v7`](#v7) [`Alphabet`](#alphabet) [`DecodeError`](#decodeerror) [`Uuid`](#uuid) [`Plain`](#plain) [Display for DecodeError](#display-for-decodeerror) [Display for Uuid](#display-for-uuid)
 
 ## Values
 
@@ -365,6 +365,44 @@ bits sees all of them.
 | `version` | `version(self) -> u8` | Which of RFC 9562's versions this claims to be: the high four bits of byte 6. |
 | `variant` | `variant(self) -> u8` | Which family of layouts byte 8 puts this in -- `1` for RFC 9562's, which is what everything generated here is, and what any UUID a reader is likely to meet is. |
 | `is_nil` | `is_nil(self) -> bool` | Whether every byte is zero -- the nil UUID, which RFC 9562 defines as the value that names nothing. |
+
+## Traits
+
+### `Plain`
+
+```sysl
+trait Plain
+    decode(b: []const u8) -> Option[Self]
+    encode(self, out: []u8) -> bool
+```
+
+A type whose value is its bytes and nothing else, read out of them and written back.
+
+**The membership is the compiler's**, as `sysl.math.Bits`' is: a type is plain where every part of
+it is an integer of whole bytes, a float, a fixed-point number, a `bool`, a simple enum, or an array
+or a struct of plain things. Nothing is written to join -- a superblock, an inode or a protocol
+header declared as an ordinary struct already is one. What is shut out is whatever means something
+only inside the running program: a pointer, a counted reference, a string, a slice. A `char` and a
+subtype with a range are out too, their rule being about values rather than bytes; hold the number
+and convert it, which runs the check.
+
+**`decode` is the checked direction.** It answers `None` where the slice is shorter than the type,
+and where a byte that could be wrong is: a `bool` holding anything but `0` or `1`, an enum holding a
+number none of its variants is. Every other byte is some value of its field, so there is nothing to
+check there. It reads the first `sizeof(T)` bytes and leaves the rest -- a header at the front of a
+frame is the ordinary case -- and needs no alignment of the slice.
+
+**`encode` writes zeros into padding**, so one value always encodes to the same bytes. It answers
+`false`, and writes nothing, where the slice is shorter than the type.
+
+**The byte order is the struct's.** An integer field is written in the machine's order unless the
+struct says otherwise with `@byte_order(big)` or `@byte_order(little)`, and then it is in that order
+on every machine (`reference/attributes.md § @byte_order`).
+
+| Member | Signature | Description |
+|---|---|---|
+| `decode` | `decode(b: []const u8) -> Option[Self]` | The value the front of `b` holds, or `None` where `b` is short or holds a byte no value of the type has. |
+| `encode` | `encode(self, out: []u8) -> bool` | This value's bytes at the front of `out`, or `false` where `out` is too short to hold them. |
 
 ## Implementations
 

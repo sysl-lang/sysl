@@ -1,7 +1,8 @@
 module sh.sysl.compiler
 @tests
 
-import sysl.fs.{make_dir_all, read_text, remove_dir_all, set_permissions, write_text}
+import sysl.process.{run, Exited}
+import sysl.fs.{AlreadyExists, NotFound, NotPermitted, PermissionDenied, make_dir_all, read_text, remove_dir_all, set_permissions, write_text}
 
 // The reference's `IoRefusalTests`: a path the filesystem refuses is answered with `sysl: error: …`
 // naming the path and what was wrong with it, at status 1 -- never a bare "cannot write", which leaves
@@ -70,6 +71,43 @@ azd_io_directory_under_an_unwritable_one()
                    s"sysl: error: cannot make the directory '$dir/locked/sub': '$dir/locked' is not writable")
     azd_io_drop(dir, [])
 end azd_io_directory_under_an_unwritable_one
+
+@test("a refusal for want of permission is EACCES and EPERM alike, and nothing else")
+azd_io_permission_refusals_are_told()
+    assert(refused_for_permission(PermissionDenied))
+    assert(refused_for_permission(NotPermitted))
+    assert(!refused_for_permission(NotFound))
+    assert(!refused_for_permission(AlreadyExists))
+end azd_io_permission_refusals_are_told
+
+// EPERM is provoked with the immutable flag, which only macOS and the BSDs have: the directory's mode
+// still allows the write and the kernel refuses the new entry with EPERM, not EACCES.
+@test("when a directory has to be made under one that EPERM refuses")
+azd_io_directory_under_an_immutable_one()
+    if !azd_ready() then return
+
+    val dir = azd_io_scratch()
+    val locked = s"$dir/immutable"
+
+    make_dir_all(locked).unwrap()
+
+    val flagged = run("chflags", ["uchg", locked]) match
+        Ok(st) -> st.ok()
+        Err(_) -> false
+
+    if !flagged
+        azd_io_drop(dir, [])
+        return
+
+    make_dir_all(s"$locked/sub") match
+        Err(e) -> assert(e == NotPermitted)
+        Ok(_) -> assert(false)
+
+    azd_io_refused(["sysl", "build-c", s"$dir/p4", "-o", s"$locked/sub/lib.a"],
+                   s"sysl: error: cannot make the directory '$locked/sub': '$locked' is not writable")
+    run("chflags", ["nouchg", locked]).unwrap_or(Exited(0))
+    azd_io_drop(dir, [])
+end azd_io_directory_under_an_immutable_one
 
 @test("when a file has to be written there")
 azd_io_file_in_an_unwritable_directory()

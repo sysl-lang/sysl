@@ -20,7 +20,7 @@ were the middle.
 
 ## Index
 
-[`esink`](#esink) [`sink`](#sink) [`assert`](#assert) [`assert_eq`](#assert_eq) [`assert_slice_eq`](#assert_slice_eq) [`cpu`](#cpu) [`cpu_count`](#cpu_count) [`display_bool`](#display_bool) [`display_char`](#display_char) [`display_digits`](#display_digits) [`display_fill`](#display_fill) [`display_int`](#display_int) [`display_pad`](#display_pad) [`display_real`](#display_real) [`display_real_shortest`](#display_real_shortest) [`display_str`](#display_str) [`display_uint`](#display_uint) [`encode_utf8`](#encode_utf8) [`eprints`](#eprints) [`eputbytes`](#eputbytes) [`flush`](#flush) [`hash_bool`](#hash_bool) [`hash_str`](#hash_str) [`hash_u128`](#hash_u128) [`hash_u64`](#hash_u64) [`os`](#os) [`panic`](#panic) [`printb`](#printb) [`printc`](#printc) [`printi`](#printi) [`printr`](#printr) [`prints`](#prints) [`printu`](#printu) [`putbytes`](#putbytes) [`stderr`](#stderr) [`stdout`](#stdout) [`exit`](#exit) [`Counting`](#counting) [`Cpu`](#cpu-1) [`FormatSpec`](#formatspec) [`Option`](#option) [`Os`](#os-1) [`Range`](#range) [`Result`](#result) [`Stderr`](#stderr-1) [`Stdout`](#stdout-1) [`Add`](#add) [`BitAnd`](#bitand) [`BitOr`](#bitor) [`BitXor`](#bitxor) [`Display`](#display) [`Div`](#div) [`Drop`](#drop) [`Eq`](#eq) [`Fallible`](#fallible) [`Fn0`](#fn0) [`Fn1`](#fn1) [`Fn2`](#fn2) [`Fn3`](#fn3) [`Fn4`](#fn4) [`From`](#from) [`Hash`](#hash) [`Index`](#index) [`IndexSet`](#indexset) [`Integer`](#integer) [`Iterate`](#iterate) [`Mul`](#mul) [`Neg`](#neg) [`Not`](#not) [`One`](#one) [`Ord`](#ord) [`Rem`](#rem) [`Shl`](#shl) [`Shr`](#shr) [`Sub`](#sub) [`Walk`](#walk) [`Writer`](#writer) [`Zero`](#zero) [Display for (..A)](#display-for-a) [Display for []T](#display-for-t) [Display for [N]T](#display-for-nt) [Display for bf16](#display-for-bf16) [Display for bool](#display-for-bool) [Display for char](#display-for-char) [Display for f16](#display-for-f16) [Display for f32](#display-for-f32) [Display for Option[T]](#display-for-optiont) [Display for real](#display-for-real) [Display for Result[T, E]](#display-for-resultt-e) [Display for string](#display-for-string) [Display for T](#display-for-t-1) [Eq for (..A)](#eq-for-a) [Eq for []T](#eq-for-t) [Eq for [N]T](#eq-for-nt) [Eq for Option[T]](#eq-for-optiont) [Eq for Result[T, E]](#eq-for-resultt-e) [Fallible for Counting](#fallible-for-counting) [Fallible for Stderr](#fallible-for-stderr) [Fallible for Stdout](#fallible-for-stdout) [Hash for (..A)](#hash-for-a) [Hash for [N]T](#hash-for-nt) [Hash for bool](#hash-for-bool) [Hash for char](#hash-for-char) [Hash for string](#hash-for-string) [Hash for T](#hash-for-t) [Iterate for Range[T]](#iterate-for-ranget) [One for bf16](#one-for-bf16) [One for f16](#one-for-f16) [One for f32](#one-for-f32) [One for real](#one-for-real) [Ord for (..A)](#ord-for-a) [Ord for []T](#ord-for-t) [Ord for [N]T](#ord-for-nt) [Writer for Counting](#writer-for-counting) [Writer for Stderr](#writer-for-stderr) [Writer for Stdout](#writer-for-stdout) [Zero for bf16](#zero-for-bf16) [Zero for f16](#zero-for-f16) [Zero for f32](#zero-for-f32) [Zero for real](#zero-for-real)
+[`esink`](#esink) [`sink`](#sink) [`assert`](#assert) [`assert_eq`](#assert_eq) [`assert_slice_eq`](#assert_slice_eq) [`cpu`](#cpu) [`cpu_count`](#cpu_count) [`display_bf16`](#display_bf16) [`display_bool`](#display_bool) [`display_char`](#display_char) [`display_digits`](#display_digits) [`display_f128`](#display_f128) [`display_f128_shortest`](#display_f128_shortest) [`display_f16`](#display_f16) [`display_f32`](#display_f32) [`display_f32_shortest`](#display_f32_shortest) [`display_fill`](#display_fill) [`display_int`](#display_int) [`display_pad`](#display_pad) [`display_real`](#display_real) [`display_real_shortest`](#display_real_shortest) [`display_str`](#display_str) [`display_uint`](#display_uint) [`encode_utf8`](#encode_utf8) [`eprints`](#eprints) [`eputbytes`](#eputbytes) [`flush`](#flush) [`hash_bool`](#hash_bool) [`hash_str`](#hash_str) [`hash_u128`](#hash_u128) [`hash_u64`](#hash_u64) [`os`](#os) [`panic`](#panic) [`printb`](#printb) [`printbf16`](#printbf16) [`printc`](#printc) [`printf16`](#printf16) [`printf32`](#printf32) [`printi`](#printi) [`printq`](#printq) [`printr`](#printr) [`prints`](#prints) [`printu`](#printu) [`putbytes`](#putbytes) [`stderr`](#stderr) [`stdout`](#stdout) [`exit`](#exit) [`Counting`](#counting) [`Cpu`](#cpu-1) [`FormatSpec`](#formatspec) [`Option`](#option) [`Os`](#os-1) [`Range`](#range) [`Result`](#result) [`Stderr`](#stderr-1) [`Stdout`](#stdout-1) [`Add`](#add) [`BitAnd`](#bitand) [`BitOr`](#bitor) [`BitXor`](#bitxor) [`Display`](#display) [`Div`](#div) [`Drop`](#drop) [`Eq`](#eq) [`Fallible`](#fallible) [`FloatBits`](#floatbits) [`Fn0`](#fn0) [`Fn1`](#fn1) [`Fn2`](#fn2) [`Fn3`](#fn3) [`Fn4`](#fn4) [`From`](#from) [`Hash`](#hash) [`Index`](#index) [`IndexSet`](#indexset) [`Integer`](#integer) [`Iterate`](#iterate) [`Mul`](#mul) [`Neg`](#neg) [`Not`](#not) [`One`](#one) [`Ord`](#ord) [`Rem`](#rem) [`Shl`](#shl) [`Shr`](#shr) [`Sub`](#sub) [`Walk`](#walk) [`Writer`](#writer) [`Zero`](#zero) [Display for (..A)](#display-for-a) [Display for []T](#display-for-t) [Display for [N]T](#display-for-nt) [Display for bf16](#display-for-bf16) [Display for bool](#display-for-bool) [Display for char](#display-for-char) [Display for f128](#display-for-f128) [Display for f16](#display-for-f16) [Display for f32](#display-for-f32) [Display for Option[T]](#display-for-optiont) [Display for real](#display-for-real) [Display for Result[T, E]](#display-for-resultt-e) [Display for string](#display-for-string) [Display for T](#display-for-t-1) [Eq for (..A)](#eq-for-a) [Eq for []T](#eq-for-t) [Eq for [N]T](#eq-for-nt) [Eq for Option[T]](#eq-for-optiont) [Eq for Result[T, E]](#eq-for-resultt-e) [Fallible for Counting](#fallible-for-counting) [Fallible for Stderr](#fallible-for-stderr) [Fallible for Stdout](#fallible-for-stdout) [FloatBits for bf16](#floatbits-for-bf16) [FloatBits for f128](#floatbits-for-f128) [FloatBits for f16](#floatbits-for-f16) [FloatBits for f32](#floatbits-for-f32) [FloatBits for real](#floatbits-for-real) [Hash for (..A)](#hash-for-a) [Hash for [N]T](#hash-for-nt) [Hash for bool](#hash-for-bool) [Hash for char](#hash-for-char) [Hash for string](#hash-for-string) [Hash for T](#hash-for-t) [Iterate for Range[T]](#iterate-for-ranget) [One for bf16](#one-for-bf16) [One for f16](#one-for-f16) [One for f32](#one-for-f32) [One for real](#one-for-real) [Ord for (..A)](#ord-for-a) [Ord for []T](#ord-for-t) [Ord for [N]T](#ord-for-nt) [Writer for Counting](#writer-for-counting) [Writer for Stderr](#writer-for-stderr) [Writer for Stdout](#writer-for-stdout) [Zero for bf16](#zero-for-bf16) [Zero for f16](#zero-for-f16) [Zero for f32](#zero-for-f32) [Zero for real](#zero-for-real)
 
 ## Values
 
@@ -103,6 +103,15 @@ by it should not have to say so. **It needs an operating system to ask, and says
 that has given up `os` is refused at the call. Where there is no POSIX `sysconf` to ask -- a
 freestanding image, WASI -- the answer is that one.
 
+### `display_bf16`
+
+```sysl
+display_bf16(x: bf16, out: *Writer, fmt: FormatSpec)
+```
+
+A `bf16` the way `display_real` renders a `real`, in the digits a `bf16` needs; under a precision
+it widens, exactly, and is `%g`'s.
+
 ### `display_bool`
 
 ```sysl
@@ -120,6 +129,53 @@ display_char(ch: char, out: *Writer, fmt: FormatSpec)
 ```sysl
 display_digits(text: []const u8, out: *Writer, fmt: FormatSpec)
 ```
+
+### `display_f128`
+
+```sysl
+display_f128(x: f128, out: *Writer, fmt: FormatSpec)
+```
+
+An `f128` as `print`, `str` and a plain hole render it: `display_real`'s rule at binary128's width,
+the fewest digits that read back as the same `f128`, set out positionally. A precision is a count of
+significant digits, as `display_real` reads one, at most forty.
+
+### `display_f128_shortest`
+
+```sysl
+display_f128_shortest(x: f128, out: *Writer, fmt: FormatSpec)
+```
+
+An `f128` in the fewest digits that read back as the same `f128` -- `0.1` for `0.1f128`, and the
+thirty-odd digits a value that needs them has. It is binary128's own reading, never a `real`'s: no
+digit of it passes through a narrower float.
+
+### `display_f16`
+
+```sysl
+display_f16(x: f16, out: *Writer, fmt: FormatSpec)
+```
+
+An `f16` the way `display_real` renders a `real`, in the digits an `f16` needs; under a precision
+it widens, exactly, and is `%g`'s.
+
+### `display_f32`
+
+```sysl
+display_f32(x: f32, out: *Writer, fmt: FormatSpec)
+```
+
+An `f32` the way `display_real` renders a `real`, taken apart at its own width rather than widened:
+`0.1` for `f32(0.1)`, the digits an `f32` needs and not the seventeen its widened value would.
+
+### `display_f32_shortest`
+
+```sysl
+display_f32_shortest(x: f32, out: *Writer, fmt: FormatSpec)
+```
+
+An `f32` in the fewest digits that read back as the same `f32` -- `0.1` for `f32(0.1)`, where the
+same value widened to a `real` needs seventeen.
 
 ### `display_fill`
 
@@ -157,6 +213,15 @@ display_pad(text: []const u8, out: *Writer, fmt: FormatSpec)
 ```sysl
 display_real(x: real, out: *Writer, fmt: FormatSpec)
 ```
+
+A float as `print`, `str` and a plain hole render it, which is what Rust's `{}` writes for the same
+value: the fewest digits that read back as the same `real`, set out positionally -- `0.1`, `1`,
+`100000000000000000000`, `0.0000001` -- never an exponent and never a trailing `.0`, with `-0`,
+`inf`, `-inf` and `NaN`. A width pads it.
+
+A precision asks for `%g` instead -- that many significant digits, correctly rounded, in whichever
+of fixed point and an exponent `%g` picks, at most forty. Both are worked out in sysl, so neither
+needs a C library or an allocator.
 
 ### `display_real_shortest`
 
@@ -257,10 +322,12 @@ they complete, output piped into another program, a test runner reading a child'
 still runs -- can otherwise sit on everything already printed until the process ends, because
 `putbytes` writes through C's buffered `stdout`. This is the call that pushes it out early.
 
-`fflush(NULL)` runs underneath, which flushes every open output stream rather than naming one --
+It goes through `sysl.io.sys`'s `fd_flush` hook for descriptor 1. On a hosted target the library
+answers it with `fflush(NULL)`, which flushes every open output stream rather than naming one --
 `stdout` is a `#define` on Darwin (`reference/ffi.md § An extern also declares a variable`), so an
 `extern` naming it by pointer would not link there, and flushing everything costs nothing a program
-would notice, since there is normally only the one stream open to flush.
+would notice, since there is normally only the one stream open to flush. A target with no C library
+answers the hook itself. It answers zero, or a negative number where the flush failed.
 
 `eprints` needs no matching call: `eputbytes` writes with a raw `write(2)`, which keeps no buffer
 of its own to hold anything back.
@@ -353,6 +420,12 @@ Caught by the `@no_alloc` test that already existed.
 printb(b: bool)
 ```
 
+### `printbf16`
+
+```sysl
+printbf16(x: bf16)
+```
+
 ### `printc`
 
 ```sysl
@@ -362,18 +435,37 @@ printc(ch: char)
 A `char` is encoded rather than handed to `snprintf`, which has no conversion that takes a code
 point.
 
+### `printf16`
+
+```sysl
+printf16(x: f16)
+```
+
+### `printf32`
+
+```sysl
+printf32(x: f32)
+```
+
 ### `printi`
 
 ```sysl
 printi(n: long)
 ```
 
-The integers render in sysl, through `digits_long` and `digits_ulong` beside `display_int`. The
-float still leans on `snprintf`, which is formatting rather than I/O. What it prints is `%g`'s six
-significant digits, correctly rounded, and rounding to a precision the caller chose needs exact
-arithmetic over the whole value -- a different job from `shortest_real`'s, which finds the fewest
-digits and never rounds to a count it was given -- so it waits until there is a reason, such as a
-target without a C library.
+Every number renders in sysl: the integers through `digits_long` and `digits_ulong` beside
+`display_int`, each float at its own width through its `Display` -- the fewest digits that read
+back as the same value, set out positionally, as Rust's `{}` writes them (`shortest.sysl`). Nothing
+here is formatting by C, so a target with no C library prints a float exactly as a hosted one does.
+
+### `printq`
+
+```sysl
+printq(x: f128)
+```
+
+An `f128`, in the fewest digits that read back as the same `f128` -- rendered at its own width, so
+it allocates nothing and asks for no C library either.
 
 ### `printr`
 
@@ -411,9 +503,9 @@ stdio rather than a raw `write(1, ...)` because C in the same program writing th
 shares that buffer, and one queue is what keeps the two in order.
 
 A freestanding target has no stdio, so there it writes a byte at a time through the `putchar` the
-board supplies. That is also one of the two functions such a target has to replace: swap its body
-for a `write` syscall, and `FdReader.read`'s for a `read` one, and the whole surface above both is
-unchanged.
+board supplies. That is also one of the two things such a target has to supply: answer `putchar`
+with a `write` syscall, and `sysl.io.sys`'s `fd_read` hook with a `read` one, and the whole surface
+above both is unchanged.
 
 A short `fwrite` is looped over, and one that wrote nothing ends the loop -- the stream has failed,
 and there is nowhere left to report that to.
@@ -808,6 +900,36 @@ this to answer the second.
 | Member | Signature | Description |
 |---|---|---|
 | `failed` | `failed(*self) -> bool` |  |
+
+### `FloatBits`
+
+```sysl
+trait FloatBits
+    type Word
+    bits(self) -> Self::Word
+    from_bits(b: Self::Word) -> Self
+```
+
+A float's IEEE 754 encoding, as the unsigned integer of the same width.
+
+**This is a reinterpretation, not a conversion.** `u64(1.0)` is `1`, the value carried across;
+`1.0.bits()` is `0x3ff0000000000000`, the sign, exponent and fraction exactly as the machine lays
+them out. Nothing is rounded and nothing is refused in either direction: every pattern is some
+float, and every float -- a negative zero, an infinity, a NaN with whatever payload it carries --
+comes back from `from_bits` as the same bits it went out as.
+
+**The associated type is why this is a trait.** Each width answers with the integer of its own
+width -- `u64` for `real`, `u32` for `f32`, `u16` for the two half widths -- so a body generic over
+the trait can take a value apart and put it back together without knowing which width it holds.
+
+It is in the standard module rather than beside `Float`, because the code that wants it is the
+code below the mathematics: a decimal printer, a hash of a float, a `nextafter` written on the
+encoding because a freestanding target has no libm to ask.
+
+| Member | Signature | Description |
+|---|---|---|
+| `bits` | `bits(self) -> Self::Word` | The encoding of `self`, sign bit highest. |
+| `from_bits` | `from_bits(b: Self::Word) -> Self` | The float whose encoding is `b`. |
 
 ### `Fn0`
 
@@ -1212,6 +1334,15 @@ impl Display for bool
 impl Display for char
 ```
 
+### Display for f128
+
+```sysl
+impl Display for f128
+```
+
+An `f128` renders at its own width too: narrowing to a `real` would print a number the program
+does not hold.
+
 ### Display for f16
 
 ```sysl
@@ -1224,13 +1355,9 @@ impl Display for f16
 impl Display for f32
 ```
 
-The narrower floats widen on the way in, which is what the lowering did for them before: one
-renderer per kind rather than one per type, and `%g` is written against a `double`.
-
-Widening is exact at all three widths -- a `real` holds every value any of them can -- so what is
-rendered is the value the narrower type actually holds, not an approximation of it. That is why
-`f16`'s nearest tenth prints as something other than a tenth: the digits are the ones the width
-really has.
+Every float renders at its own width, in the fewest digits that read back as the same value of
+that type -- what Rust's `{}` writes -- so `f32(0.1)` and `f16(0.1)` both print `0.1`, the digits
+their own width needs, rather than the longer reading of the value widened to a `real`.
 
 ### Display for Option[T]
 
@@ -1350,6 +1477,36 @@ impl Fallible for Stderr
 
 ```sysl
 impl Fallible for Stdout
+```
+
+### FloatBits for bf16
+
+```sysl
+impl FloatBits for bf16
+```
+
+### FloatBits for f128
+
+```sysl
+impl FloatBits for f128
+```
+
+### FloatBits for f16
+
+```sysl
+impl FloatBits for f16
+```
+
+### FloatBits for f32
+
+```sysl
+impl FloatBits for f32
+```
+
+### FloatBits for real
+
+```sysl
+impl FloatBits for real
 ```
 
 ### Hash for (..A)

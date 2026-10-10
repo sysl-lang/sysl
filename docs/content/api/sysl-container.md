@@ -252,6 +252,7 @@ on purpose.
 | `pop_back` | `pop_back(self) -> Option[T]` |  |
 | `clear` | `clear(self)` | The elements dropped and the head put back at the start. |
 | `copy` | `copy(self) -> Deque[T]` | A second deque holding the same elements in the same order, the front put back at the start of its storage -- the one way to get a deque that is not this one, every other way of handing a `Deque` on handing on this one. |
+| `release` | `release(*self)` | This name's share of the ring given back, and the handle left naming nothing -- the state zeroed storage starts in, where every reader answers as an empty deque does. |
 
 ### `DequeCursor`
 
@@ -305,6 +306,7 @@ is read in order, and it is the only way that answers truthfully.
 | `push` | `push(self, v: T)` | An element added, then carried up past every parent it is smaller than. |
 | `pop` | `pop(self) -> Option[T]` | The smallest element removed and returned. |
 | `clear` | `clear(self)` |  |
+| `release` | `release(*self)` | The buffer underneath given back without allocating, as `Buf.release` does -- for a heap in storage the program zeroed itself, which answers as empty until it is assigned. |
 
 ### `List`
 
@@ -389,6 +391,7 @@ entry the other's count never learned of.
 | `remove` | `remove(self, k: K) -> bool` | A key taken out, answering whether it was there. |
 | `clear` | `clear(self)` | Every entry dropped and the table let go entirely; see `MapCore.clear`. |
 | `copy` | `copy(self) -> Map[K, V]` | A second map holding the same entries, its table sized to them -- the one way to get a map that is not this one, every other way of handing a `Map` on handing on this one. |
+| `release` | `release(*self)` | This name's share of the table given back, and the handle left naming nothing -- the state zeroed storage starts in, where every reader answers as an empty map does. |
 
 ### `Set`
 
@@ -422,6 +425,7 @@ the key is in the map at all.
 | `add` | `add(self, k: K) -> bool` | A key put in, answering whether it was **new**. |
 | `remove` | `remove(self, k: K) -> bool` | A key taken out, answering whether it was there. |
 | `clear` | `clear(self)` |  |
+| `release` | `release(*self)` | The map underneath given back without allocating, as `Map.release` does -- for a set in storage the program zeroed itself, which answers as empty until it is assigned. |
 
 ### `SetCursor`
 

@@ -19,7 +19,7 @@ that `ẞ` lower-cases to `ß`, and it is the other module that does.
 
 ## Index
 
-[`char_columns`](#char_columns) [`char_from_u32`](#char_from_u32) [`char_indices`](#char_indices) [`chars_of`](#chars_of) [`cluster_columns`](#cluster_columns) [`columns`](#columns) [`contains_fold`](#contains_fold) [`cstring`](#cstring) [`ends_with_fold`](#ends_with_fold) [`eq_fold`](#eq_fold) [`fields`](#fields) [`from_cstring`](#from_cstring) [`from_utf8`](#from_utf8) [`from_utf8_lossy`](#from_utf8_lossy) [`from_utf8_unchecked`](#from_utf8_unchecked) [`grapheme_columns`](#grapheme_columns) [`is_char_boundary`](#is_char_boundary) [`join`](#join) [`parse_bool`](#parse_bool) [`parse_bool`](#parse_bool-1) [`parse_int`](#parse_int) [`parse_int`](#parse_int-1) [`parse_int_base`](#parse_int_base) [`parse_int_base`](#parse_int_base-1) [`parse_long`](#parse_long) [`parse_long`](#parse_long-1) [`parse_long_base`](#parse_long_base) [`parse_long_base`](#parse_long_base-1) [`parse_real`](#parse_real) [`parse_real`](#parse_real-1) [`parse_uint`](#parse_uint) [`parse_uint`](#parse_uint-1) [`parse_ulong`](#parse_ulong) [`parse_ulong`](#parse_ulong-1) [`parse_ulong_base`](#parse_ulong_base) [`parse_ulong_base`](#parse_ulong_base-1) [`repeat`](#repeat) [`replace_all`](#replace_all) [`split`](#split) [`starts_with_fold`](#starts_with_fold) [`str_builder`](#str_builder) [`str_builder_with_capacity`](#str_builder_with_capacity) [`str_view`](#str_view) [`to_lower`](#to_lower) [`to_upper`](#to_upper) [`CharIndices`](#charindices) [`Chars`](#chars) [`CString`](#cstring-1) [`ParseError`](#parseerror) [`StrBuilder`](#strbuilder) [`Utf8Error`](#utf8error) [`Ascii`](#ascii) [`Search`](#search) [Ascii for char](#ascii-for-char) [Ascii for u8](#ascii-for-u8) [Display for ParseError](#display-for-parseerror) [Iterate for CharIndices](#iterate-for-charindices) [Iterate for Chars](#iterate-for-chars) [Search for []const u8](#search-for-const-u8) [Search for string](#search-for-string)
+[`char_columns`](#char_columns) [`char_from_u32`](#char_from_u32) [`char_indices`](#char_indices) [`chars_of`](#chars_of) [`cluster_columns`](#cluster_columns) [`columns`](#columns) [`contains_fold`](#contains_fold) [`cstring`](#cstring) [`ends_with_fold`](#ends_with_fold) [`eq_fold`](#eq_fold) [`f128_prefix`](#f128_prefix) [`f32_prefix`](#f32_prefix) [`fields`](#fields) [`from_cstring`](#from_cstring) [`from_utf8`](#from_utf8) [`from_utf8_lossy`](#from_utf8_lossy) [`from_utf8_unchecked`](#from_utf8_unchecked) [`grapheme_columns`](#grapheme_columns) [`is_char_boundary`](#is_char_boundary) [`join`](#join) [`parse_bool`](#parse_bool) [`parse_bool`](#parse_bool-1) [`parse_f128`](#parse_f128) [`parse_f128`](#parse_f128-1) [`parse_f32`](#parse_f32) [`parse_f32`](#parse_f32-1) [`parse_int`](#parse_int) [`parse_int`](#parse_int-1) [`parse_int_base`](#parse_int_base) [`parse_int_base`](#parse_int_base-1) [`parse_long`](#parse_long) [`parse_long`](#parse_long-1) [`parse_long_base`](#parse_long_base) [`parse_long_base`](#parse_long_base-1) [`parse_real`](#parse_real) [`parse_real`](#parse_real-1) [`parse_uint`](#parse_uint) [`parse_uint`](#parse_uint-1) [`parse_ulong`](#parse_ulong) [`parse_ulong`](#parse_ulong-1) [`parse_ulong_base`](#parse_ulong_base) [`parse_ulong_base`](#parse_ulong_base-1) [`real_prefix`](#real_prefix) [`repeat`](#repeat) [`replace_all`](#replace_all) [`split`](#split) [`starts_with_fold`](#starts_with_fold) [`str_builder`](#str_builder) [`str_builder_with_capacity`](#str_builder_with_capacity) [`str_view`](#str_view) [`to_lower`](#to_lower) [`to_upper`](#to_upper) [`CharIndices`](#charindices) [`Chars`](#chars) [`CString`](#cstring-1) [`ParseError`](#parseerror) [`StrBuilder`](#strbuilder) [`Utf8Error`](#utf8error) [`Ascii`](#ascii) [`Search`](#search) [Ascii for char](#ascii-for-char) [Ascii for u8](#ascii-for-u8) [Display for ParseError](#display-for-parseerror) [Iterate for CharIndices](#iterate-for-charindices) [Iterate for Chars](#iterate-for-chars) [Search for []const u8](#search-for-const-u8) [Search for string](#search-for-string)
 
 ## Functions
 
@@ -152,6 +152,31 @@ normalization pass -- `sysl.unicode.fold` says why.
 **There is no locale in it.** The one common casualty is Turkish, where a dotless `ı` and an `i`
 are different letters and this reports them as the same; a program that has to make that
 distinction has a notion of locale that this library does not.
+
+### `f128_prefix`
+
+```sysl
+f128_prefix(b: []const u8) -> (f128, usize)
+```
+
+The longest prefix of `b` that reads as an `f128`, the value it reads as, and how many bytes it is
+-- what `real_prefix` reads, spelled the same way, rounded once to binary128 rather than through a
+`real`, whose 53 bits would leave sixty of the 113 wrong.
+
+**The answer is exact, and found the slow way**: the decimal's digits are one big integer and the
+power of ten another, and their ratio is divided out bit by bit to one bit past the significand,
+the remainder saying whether anything is left below it. Up to 11,600 significant digits are read
+into the integer -- more than the 11,563 the longest half-way point between two binary128 values
+has -- and any digit past them that is not a zero is remembered, which is all a tie needs to know.
+
+### `f32_prefix`
+
+```sysl
+f32_prefix(b: []const u8) -> (f32, usize)
+```
+
+The same for an `f32`, rounded once to the nearest `f32` rather than through a `real` -- rounding
+twice would move a value lying near half way between two `f32`s.
 
 ### `fields`
 
@@ -311,6 +336,37 @@ as the policy they are.
 parse_bool(s: string) -> Result[bool, ParseError]
 ```
 
+### `parse_f128`
+
+```sysl
+parse_f128(b: []const u8) -> Result[f128, ParseError]
+```
+
+An `f128`, read as `parse_real` reads a `real` and rounded once, to the nearest binary128 value --
+never through a `real`, which would keep 53 of its 113 bits. Every text `str` writes for an `f128`
+reads back as the same `f128`.
+
+### `parse_f128`
+
+```sysl
+parse_f128(s: string) -> Result[f128, ParseError]
+```
+
+### `parse_f32`
+
+```sysl
+parse_f32(b: []const u8) -> Result[f32, ParseError]
+```
+
+An `f32`, read as `parse_real` reads a `real` and rounded once, to the nearest `f32` -- never
+through a `real`, whose rounding could leave a value on the wrong side of half way.
+
+### `parse_f32`
+
+```sysl
+parse_f32(s: string) -> Result[f32, ParseError]
+```
+
 ### `parse_int`
 
 ```sysl
@@ -383,24 +439,13 @@ parse_long_base(s: string, base: int) -> Result[long, ParseError]
 parse_real(b: []const u8) -> Result[real, ParseError]
 ```
 
-A floating-point value, through the C library.
+A floating-point value, correctly rounded, read in sysl (`real.sysl`) -- so it allocates nothing,
+copies nothing and needs no C library.
 
-It goes to `strtod` for the reason the float half of `str` goes to `snprintf`: correctly rounded
-decimal-to-binary conversion is a hard algorithm to get right and an easy one to get subtly
-wrong, and the two directions must agree or a value will not survive being written and read back.
-Writing it in sysl waits for a target with no C library, which is the same condition
-`reference/strings.md § Rendering a value` puts on the rendering half.
-
-**It costs a copy and usually not an allocation**, because `strtod` reads a NUL-terminated
-pointer and neither a slice nor a `string` carries a terminator. The copy goes into a buffer on
-the stack for any text short enough to fit one, which is every float anybody writes and every
-float `str` produces; longer input falls back to the heap rather than being refused, since a
-decimal expansion may legitimately run to hundreds of digits and every one of them can move the
-last bit of the result.
-
-The end pointer is what turns C's lenient parse into this library's strict one: `strtod` stops at
-the first byte it cannot use and reports where, so anything left over is trailing garbage and
-`"1.5x"` is refused rather than read as `1.5`.
+It reads what C's `strtod` reads, through `real_prefix`, and the prefix's length is what makes it
+strict where `strtod` is lenient: `strtod` stops at the first byte it cannot use, so anything left
+over is trailing garbage and `"1.5x"` is refused rather than read as `1.5`. A value past the
+largest finite one is an infinity, as `strtod` makes it.
 
 ### `parse_real`
 
@@ -450,6 +495,23 @@ answer -- wrap, clamp or refuse -- and refusing at the first byte is the one tha
 ```sysl
 parse_ulong_base(s: string, base: int) -> Result[ulong, ParseError]
 ```
+
+### `real_prefix`
+
+```sysl
+real_prefix(b: []const u8) -> (real, usize)
+```
+
+The longest prefix of `b` that reads as a `real`, the value it reads as, and how many bytes it is
+-- zero, and a zero value, where no prefix reads as one. This is C's `strtod`, reading what it
+reads: leading white space, a sign, then a decimal (`12`, `1.5`, `.5`, `1.`, with an optional
+exponent `e-7`), a hexadecimal float (`0x1.8p3`), `inf` or `infinity`, or `nan` with an optional
+`(chars)`, every letter in any case. An exponent with no digits after it is not part of the number,
+so `1e+` reads as `1` and takes one byte.
+
+The value is the nearest `real` to the decimal, half way to the even one, however many digits it
+has; past the largest finite value it is an infinity, and below half the smallest it is a zero of
+the written sign.
 
 ### `repeat`
 
@@ -695,7 +757,7 @@ piece once and grows geometrically.
 | `push_char` | `push_char(*self, c: char)` | A character's bytes, through the library's one encoder rather than `string(c)` -- which would allocate a whole string per character only to copy its bytes back out. |
 | `push_int` | `push_int(*self, n: long)` | The numbers, rendered straight into the buffer. |
 | `push_uint` | `push_uint(*self, n: ulong)` |  |
-| `push_real` | `push_real(*self, x: real)` | `%g`, so that a float gathered into a builder reads the same as the one `str` and `print` would have produced. |
+| `push_real` | `push_real(*self, x: real)` | The rendering `str` and `print` give a float, so that a float gathered into a builder reads the same as theirs. |
 | `push_bool` | `push_bool(*self, b: bool)` | Two immortal literals, so this allocates nothing either -- and it is here rather than left to the caller so that the set of things a builder takes without a `str` is the set `str` itself renders directly. |
 | `clear` | `clear(*self)` |  |
 | `finish` | `finish(self) -> string` | Every byte that went in came from a `string` or from `push_char`, so what is held is well-formed by construction and there is nothing left to validate. |

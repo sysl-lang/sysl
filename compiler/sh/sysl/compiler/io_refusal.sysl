@@ -1,6 +1,6 @@
 module sh.sysl.compiler
 
-import sysl.fs.{IoError, PermissionDenied, is_file, make_dir_all}
+import sysl.fs.{IoError, NotPermitted, PermissionDenied, is_file, make_dir_all}
 
 // A path the filesystem refuses, said as an answer rather than a failure: the path the reader gave,
 // then what was wrong with it. Each is the reader's or the environment's path, so each refusal names
@@ -8,6 +8,11 @@ import sysl.fs.{IoError, PermissionDenied, is_file, make_dir_all}
 
 // `'<path>': <why>`, the platform's reason in the terms the operation was asked in.
 io_refusal(path: string, e: IoError) -> string = s"'$path': ${e.message()}"
+
+// Whether the platform refused for want of permission: `PermissionDenied` (EACCES) where the
+// directory's mode forbids it, `NotPermitted` (EPERM) where something other than the mode does -- an
+// immutable flag, a protected location, a sticky directory.
+refused_for_permission(e: IoError) -> bool = e == PermissionDenied || e == NotPermitted
 
 // Why a directory cannot be made at `dir`, or nothing where it is there or has been made.
 //
@@ -31,7 +36,7 @@ directory_refusal(dir: string) -> Option[string]
     make_dir_all(dir) match
         Ok(_) -> None
         Err(e) ->
-            if e == PermissionDenied && is_directory(at)
+            if refused_for_permission(e) && is_directory(at)
                 Some(s"cannot make the directory '$dir': '$at' is not writable")
             else Some(s"cannot make the directory '$dir': ${e.message()}")
 end directory_refusal

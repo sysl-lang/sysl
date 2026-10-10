@@ -20,7 +20,31 @@ them exactly as much as a hosted one that shares it with a thread.
 
 ## Index
 
-[`Atomic`](#atomic) [`Ordering`](#ordering) [`SpinLock`](#spinlock)
+[`spin_hint`](#spin_hint) [`Atomic`](#atomic) [`Ordering`](#ordering) [`SpinLock`](#spinlock)
+
+## Functions
+
+### `spin_hint`
+
+```sysl
+spin_hint()
+```
+
+Tells the processor that the loop around this call is waiting for another processor to change
+something, and does nothing else.
+
+Each machine has an instruction for exactly this: `yield` on AArch64 and Thumb, `pause` on x86 and
+on RISC-V (Zihintpause, encoded so that a core without the extension runs it as a fence that
+orders nothing). A core that shares its pipeline with another hardware thread gives that thread
+the cycles, a hypervisor may run another virtual processor, and an x86 core stops its speculative
+loads from filling the pipeline it then has to flush when the line changes. It costs a handful of
+cycles where it means nothing, so it belongs in the body of every busy-wait — `SpinLock.lock`
+calls it on each round of its read-only spin.
+
+**It is not a wait.** Nothing sleeps, no event is awaited, and the loop still has to load the
+word it is waiting on; AArch64's `wfe`, which does sleep until the exclusive monitor sees the line
+change, needs that load to be a load-exclusive, which is a kernel's own loop to write. A wasm
+module has no such instruction, and there it is nothing at all.
 
 ## Types
 
@@ -127,4 +151,6 @@ pointers, where a type that owned its contents would have nothing coherent to ow
 |---|---|---|
 | `lock` | `lock(*self)` | Takes the lock, spinning until it is free. |
 | `try_lock` | `try_lock(*self) -> bool` | Takes the lock if it is free, and answers whether it did. |
+| `with` | `with[R](*self, body: () -> R) -> R` | Takes the lock, runs `body`, releases the lock, and answers what `body` answered. |
+| `try_with` | `try_with[R](*self, body: () -> R) -> Option[R]` | The same, if the lock is free: `Some` of what `body` answered, or `None` without spinning. |
 | `unlock` | `unlock(*self)` | Releases the lock. |

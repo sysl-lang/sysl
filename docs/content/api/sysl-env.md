@@ -22,6 +22,14 @@ answer it.
 a caller of `vars` is asked for `posix` -- `get` keeps working on a target with a C library and no
 POSIX.
 
+## Answered by whatever is underneath
+
+**Every read goes through the hooks of `sysl.env.sys`** -- `sysl_env_get`, `sysl_env_count` and
+`sysl_env_entry` -- and through nothing else, as `sysl.fs` goes through `sysl.fs.sys`. On a hosted
+target `sysl.env.hosted` answers them over `getenv` and `environ`; on a target with no C library the
+program answers the ones it reaches with `@export`s, a kernel handing its process the environment it
+was started with, and one it leaves unanswered is refused by name when it is compiled.
+
 ## Reading only
 
 **Nothing here sets a variable, and that is a decision rather than an omission.** `setenv` mutates
@@ -98,5 +106,6 @@ an `=` and a value can. `VAR=` is kept as `("VAR", "")`, set-to-empty being a va
 as `is_set` says. An entry with no `=` at all names nothing and is passed over, and so is one whose
 name or value is not UTF-8, which is `get`'s answer to the same bytes.
 
-**Both halves are copied out**: what `environ` points at is the process's own storage, and a later
-`setenv` from C may move or free it, so nothing returned here is a view of it.
+**Both halves are copied out**: what the hook lends is the process's own storage, and a later
+`setenv` from C may move or free it, so nothing returned here is a view of it. A target that cannot
+list its environment (its `sysl_env_count` answering a failure) answers an empty list.

@@ -81,6 +81,10 @@ A line is found with `memchr` rather than a byte loop because libc's reads a wor
 sysl's could not. This is the whole of what pointer difference is for: `memchr` answers *where*
 with an address, and an index is that address minus the first.
 
+**A target with no C library walks the bytes instead, because there is nothing to call** -- the
+same trade `sysl.slices.copy` makes, and for the same reason: a `memchr` reached from here would be
+an undefined symbol at the link of every freestanding program that reads a line.
+
 ### `line_text`
 
 ```sysl
@@ -210,9 +214,10 @@ struct FdReader
     bad: bool
 ```
 
-A reader over a file descriptor -- one of the two places a freestanding target has to substitute
-its own body, the other being `putbytes`. Swap this for a `read` syscall and the whole surface
-above it is unchanged.
+A reader over a file descriptor, through `sysl.io.sys`'s `read` hook -- which a hosted target's
+library answers over C's `read`, and a target with no C library answers with an `@export` of its
+own, a `read` system call usually being the whole of it. Whichever answers, the surface above it is
+unchanged.
 
 ### `LineEnding`
 
@@ -269,7 +274,7 @@ caller wanting to read again past the end gets `None` every time rather than a s
 |---|---|---|
 | `error` | `error(self) -> Option[Utf8Error]` | Why `getline` stopped before the input ended: the line at the cursor was not UTF-8, and the error's `offset` is into that line, not into the stream. |
 | `line_end` | `line_end(self, b: []const u8) -> Option[usize]` | Where the next line ends in `b`, which is the whole of what the policy decides. |
-| `getline` | `getline(*self) -> Option[string]` | The next line, or nothing once the input has ended -- **or once a line was not text.** |
+| `getline` | `getline(*self) -> Option[string]` | The next line, or nothing once the input has ended -- **or once a line was not text.** A line that is not UTF-8 ends the cursor for good rather than stopping the program: `getline` answers `None` there and on every call after, and `error()` says which byte of that line it was. |
 | `try_getline` | `try_getline(*self) -> Option[Result[string, Utf8Error]]` | The whole of the line-finding, so that the two forms cannot come to disagree about where a line ends. |
 | `held_line` | `held_line(*self) -> Result[string, Utf8Error]` |  |
 | `refill` | `refill(*self)` |  |

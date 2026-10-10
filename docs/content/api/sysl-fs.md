@@ -20,7 +20,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`exists`](#exists) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`metadata`](#metadata) [`open`](#open) [`open_update`](#open_update) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Reader for File](#reader-for-file) [Writer for File](#writer-for-file)
+[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`metadata`](#metadata) [`open`](#open) [`open_update`](#open_update) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Reader for File](#reader-for-file) [Writer for File](#writer-for-file)
 
 ## Functions
 
@@ -67,6 +67,14 @@ the program's identity.
 canonicalize(path: string) -> Result[string, IoError]
 ```
 
+The path the filesystem agrees on: every `.`, every `..` and every symbolic link resolved, and
+the answer absolute.
+
+**This is not `sysl.path.normalize`, and the difference is a security bug when it is not known.**
+`normalize` is string surgery and touches no disk; where `a/b` is a link to `/elsewhere`,
+`a/b/../c` normalizes to `a/c` and canonicalizes to `/c` -- two different files. Every path so far
+has to exist, which is the price of the real answer and is also a useful check in itself.
+
 ### `config_dir`
 
 ```sysl
@@ -98,7 +106,9 @@ replacing something. `make_dir_all` is idempotent, so the merge half is simply w
 
 **Permissions are carried**, which is where this differs from `copy_file` -- an executable copied
 with that one stops being executable, and this org copies build inputs. A symbolic link is copied
-*as a link*, pointing wherever it pointed, which may be nothing and may be outside the tree.
+*as a link*, pointing wherever it pointed, which may be nothing and may be outside the tree. A
+target whose `chmod` is unsupported has no permission bits to carry, and the copy goes on without
+them; any other error from setting them fails the copy.
 
 **A failure part way through leaves what it has already written.** Nothing here removes a tree on
 the way out, because it cannot know whether the destination existed before it started, and
@@ -250,9 +260,8 @@ to treat it as absent.
 is_dir(path: string) -> bool
 ```
 
-Whether the path names a directory, asked by opening it as one. `DIR *` is opaque, so this needs
-nothing about the platform beyond the two symbols -- which is what makes it the one question about
-a path's *kind* the module can answer honestly.
+Whether the path names a directory, asked by opening it as one -- which follows a symbolic link,
+as every other question here does.
 
 ### `is_file`
 
@@ -320,6 +329,17 @@ level is attempted exactly once. A component that exists and is **not** a direct
 make_temp_dir(prefix: string) -> Result[string, IoError]
 ```
 
+A directory that did not exist a moment ago and that nobody else can take, made inside whatever
+`TMPDIR` names -- or `/tmp` where it names nothing.
+
+**It is created, not merely named**, which is the whole point: inventing a path and then making it
+leaves a gap between the two in which somebody else on a shared `/tmp` can take the name, and that
+somebody is not necessarily friendly. The prefix is for a human reading a directory listing and is
+not what makes the name unique.
+
+**Removing it is the caller's**, and `remove_dir_all` is the call: nothing here runs at the end of
+a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
+
 ### `metadata`
 
 ```sysl
@@ -338,7 +358,7 @@ make and the reason this answers a `Result` rather than an `Option`: "there is n
 open(path: string) -> Result[File, IoError]
 ```
 
-The three ways a program opens a file, named for what it means rather than for the mode string it
+The three ways a program opens a file, named for what it means rather than for the flags it
 becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
 `append` writes at the end of whatever is there, making the file if it is not.
 
@@ -349,9 +369,9 @@ open_update(path: string) -> Result[File, IoError]
 ```
 
 A file opened for reading **and** writing, which the three above cannot express between them: each
-of C's update modes is a different answer to "and what about what is already there", and naming
-them apart is what keeps a caller from having to know that `"r+"` fails on a missing file while
-`"w+"` empties one that exists.
+update mode is a different answer to "and what about what is already there", and naming them apart
+is what keeps a caller from having to know that one fails on a missing file while the other empties
+one that exists.
 
 ### `pending_name`
 
@@ -370,6 +390,20 @@ says which entry it was going to become.
 ```sysl
 publish_dir(pending: string, target: string) -> Result[unit, IoError]
 ```
+
+Moves a finished directory from `pending` onto `target` -- unless another writer got there first.
+
+**Losing that race is success, not failure.** Two writers of one entry are building the same thing,
+and the one that finished first has already put a whole directory there; a rename refuses to
+replace a directory that holds anything, so the winner is never disturbed. The loser removes its own
+copy and answers as though it had written the one that is there. Only a rename that failed with no
+directory at `target` afterwards is reported.
+
+**An empty directory at `target` is replaced**, which is `rename(2)`'s rule and is not a race being
+lost: nothing was published there.
+
+Clearing away the losing copy is `remove_dir_all`, which walks a tree over the hooks, so this exists
+wherever `sysl.fs` does.
 
 ### `publish_file`
 
@@ -482,9 +516,6 @@ It is one operation as far as anything watching is concerned when both paths are
 filesystem, and it fails rather than copying when they are not -- which is `rename(2)`'s contract
 and worth knowing, since a program moving a file across devices has to read and write it itself.
 
-The two copies are named rather than written into the call, because a `cstring` temporary lives
-for the statement it appears in and this statement needs both of them alive at once.
-
 ### `set_current_dir`
 
 ```sysl
@@ -497,6 +528,20 @@ in the program, and puts it back only if it remembers to.
 
 Prefer building an absolute path. This exists because a program that drives a build, or that is
 the shell-like thing at the top, genuinely needs it.
+
+### `set_owner`
+
+```sysl
+set_owner(path: string, owner: u32, group: u32) -> Result[unit, IoError]
+```
+
+The owner and group of what `path` names set to exactly `owner` and `group` -- the two numbers
+`Meta.owner` and `Meta.group` read back, and `sysl.process.user()` and `group()` answer. Both are
+set; a program changing only one passes the other as `metadata` read it.
+
+**Giving a file away is privileged**: a program not acting as user 0 is refused with `NotPermitted`,
+`chown(2)`'s own rule. A symbolic link is followed, as `set_permissions` follows one. A target
+whose filesystem has no owners reports `unsupported()`.
 
 ### `set_permissions`
 
@@ -636,13 +681,13 @@ A file that is open, or that was.
 no destructor, so nothing runs at the end of a scope that the scope did not say. What the shared
 state above buys is that saying it *twice* is harmless rather than a use-after-free, which is the
 mistake a value type would otherwise make easy. Dropping a `File` without closing it leaks the
-handle until the program exits, the same as in C.
+descriptor until the program exits, and loses whatever was still buffered.
 
 | Member | Signature | Description |
 |---|---|---|
 | `closed` | `closed(*self) -> bool` |  |
-| `flush` | `flush(*self) -> Result[unit, IoError]` | *Every member below asks this first, and none of them may be dropped.** `fclose` releases the handle, so the pointer this struct holds afterwards names storage C has freed, and reaching it is a use-after-free rather than a call that fails. |
-| `close` | `close(*self) -> Result[unit, IoError]` | Releases the handle, flushing what is still buffered. |
+| `flush` | `flush(*self) -> Result[unit, IoError]` | Hands over what is buffered. |
+| `close` | `close(*self) -> Result[unit, IoError]` | Releases the descriptor, handing over what is still buffered. |
 | `tell` | `tell(*self) -> Result[long, IoError]` | Where the next read or write will happen, in bytes from the start. |
 | `seek` | `seek(*self, to: long) -> Result[unit, IoError]` | Moves to an absolute offset, which also clears the end-of-file mark. |
 | `size` | `size(*self) -> Result[long, IoError]` | How many bytes the file holds. |
@@ -653,18 +698,32 @@ handle until the program exits, the same as in C.
 
 ```sysl
 struct FileState
-    handle: *u8
+    fd: int
     bad: bool
     shut: bool
+    fault: int
+    ended: bool
+    erred: bool
+    held: []u8
+    at: usize
+    filled: usize
+    pending: usize
 ```
 
-The handle itself, and the two things that are true of it beyond the pointer.
+The handle itself, and everything that is true of it beyond the descriptor.
 
-It is a struct of its own -- rather than the three fields sitting directly in `File` -- because of
-what `File` has to survive being copied. A struct is a value here, so a `File` handed to a
-function is a second `File`, and if it held the pointer directly then closing either would leave
-the other holding a handle C has freed. Every copy sharing **one** `FileState` is what makes
-`close` answerable at all: it is written once, and every copy sees it.
+It is a struct of its own -- rather than these fields sitting directly in `File` -- because of
+what `File` has to survive being copied. A struct is a value here, so a `File` handed to a function
+is a second `File`, and if it held the descriptor and the buffer directly then closing either would
+leave the other writing into a descriptor that was released, and the two would disagree about what
+was buffered. Every copy sharing **one** `FileState` is what makes `close` answerable at all: it is
+written once, and every copy sees it.
+
+The buffer holds one direction at a time. Reading, `held[at..<filled]` is what arrived and has not
+been handed out; writing, `held[0..<pending]` is what was written and has not been handed over.
+`fault` is the status of the last thing that went wrong (a code, negated, as a hook answers it),
+zero while nothing has, and `ended` says a
+read has run off the end since the position was last set.
 
 ### `IoError`
 
@@ -844,6 +903,11 @@ are the same condition wearing two spellings, and `from_errno` never produces th
 on the shape instead would make an error that came from a platform sysl does not have a named case
 for unequal to itself after a round trip through a number.
 
+**`InvalidUtf8` is the exception, because its payload is not a code**: two of them are equal when
+they stopped at the same byte, and one is never equal to anything else -- `from_errno` cannot
+produce it, so there is no second spelling for it to agree with, and comparing it on `code()` would
+make `InvalidUtf8(3) == InvalidUtf8(40)`.
+
 ### Eq for Kind
 
 ```sysl
@@ -890,6 +954,9 @@ Reading bytes out of a file is the `Reader` of `sysl.io`, whole and unmodified, 
 An empty answer means the end of the input and nothing more. Whether the input ended *badly* is
 what `failed` reports, and the two are separate questions because a caller that does not care
 should not have to ask -- the same split `FdReader` makes.
+
+**It fills `into` unless the file ends first**, as C's `fread` did, so a short answer is the end of
+the file or a failure and never merely a slow device.
 
 ### Writer for File
 
