@@ -1,0 +1,379 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.Search
+
+// `@main_thread` above module storage (`reference/attributes.md § @main_thread`): the promise that only
+// the program's main thread reaches a binding, which lets a body that may run in another domain --
+// a `&sync` closure, a named function read into a `&sync Fn` -- name storage whose counts are not
+// atomic. Each access from such a body is checked at run time (`main_thread.sysl`), and the
+// annotation is refused wherever it could not be about one object every thread could reach.
+
+private var mts_library_names: Buf[string] = buf()
+private var mts_library_units: Buf[Buf[Program]] = buf()
+
+// The library as one machine reads it, read once per machine.
+private mts_library(t: Target) -> Buf[Program]
+    for i in 0..<mts_library_names.len()
+        if mts_library_names.at(i) == t.name then return mts_library_units.at(i)
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    mts_library_names.push(t.name)
+    mts_library_units.push(out)
+    out
+end mts_library
+
+private mts_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+// The first thing a program in module `demo` is refused with on a machine, or nothing where it is
+// accepted -- the analysis and every check made on the way to lowering.
+private mts_err_on(machine: string, text: string) -> string
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+
+    for item in mts_library(t)
+        units.push(item)
+
+    val parsed = parse(source_of("test.sysl", "module demo\n\n" + text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), true)
+    val early = mts_first_of(done.reported)
+
+    if early != "" then return early
+
+    var own: Buf[string] = buf()
+
+    own.push("")
+    own.push("demo")
+
+    post_analysis_checks(done.an, program_of(done, done.main_module), own)
+    mts_first_of(done.an.diagnostics())
+end mts_err_on
+
+private mts_err(text: string) -> string = mts_err_on(host_target().name, text)
+
+private mts_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end mts_first_of
+
+private mts_cell() -> string = "struct Cell\n    n: u64\n\n"
+
+// The LLVM text of a one-file program for the host, lowered the way the driver lowers it.
+private mts_ir(text: string) -> string
+    var units: Buf[Program] = buf()
+
+    for item in mts_library(host_target())
+        units.push(item)
+
+    val parsed = parse(source_of("main.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end mts_ir
+
+// One function's text out of a module's, from its `define` line to the closing brace.
+private mts_body(ir: string, head: string) -> string
+    val at = ir.index_of(head)
+
+    if at.is_none() then return ""
+
+    val rest = ir[at.unwrap()..<ir.bytes.len]
+    val end_at = rest.index_of("\n}\n")
+
+    if end_at.is_none() then return rest
+
+    rest[0..<end_at.unwrap()]
+end mts_body
+
+// A one-file program built at `level` and run: its status, what it printed, and its standard error.
+private mts_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-mts").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end mts_run
+
+private mts_can_run() -> bool
+    if !mts_ready() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+
+// A program whose `&sync` job reaches `@main_thread` storage, called once on the main thread and
+// then, where `spawned` says so, from a thread of its own.
+private mts_program(spawned: bool) -> string
+    val tail = if spawned then "spawn(&go, &job).unwrap().join()\nprint(\"not reached\")\n" else ""
+
+    raw"""
+    import sysl.posix.threads.spawn
+
+    struct Cell
+        n: int
+
+    @main_thread
+    static var cell: &Cell = Cell(0)
+
+    struct Job
+        run: &sync Fn() -> unit
+
+    go(j: *Job) = j.run()
+
+    var job = Job(() -> cell.n += 1)
+
+    job.run()
+    print(cell.n)
+    """ + tail
+end mts_program
+
+// -- what the annotation lets a body in another domain reach ------------------------------------------
+
+@test("a '&sync Fn' reaching '@main_thread' storage holding a '&T' is accepted")
+mts_sync_closure_is_accepted()
+    if !mts_ready() then return
+
+    assert_eq(mts_err(mts_cell() + raw"""
+        @main_thread
+        var direct: &Cell = Cell(0)
+
+        run()
+            val job: &sync Fn() -> unit = () -> direct.n += 1
+            job()
+        """), "")
+end mts_sync_closure_is_accepted
+
+@test("without the annotation the same closure is refused, as before")
+mts_without_the_annotation_it_is_refused()
+    if !mts_ready() then return
+
+    val e = mts_err(mts_cell() + raw"""
+        var direct: &Cell = Cell(0)
+
+        run()
+            val job: &sync Fn() -> unit = () -> direct.n += 1
+            job()
+        """)
+
+    assert(e.starts_with("a closure shared between two domains may be called from either"), e)
+    assert(e.contains("'demo.direct'"), e)
+end mts_without_the_annotation_it_is_refused
+
+@test("a named function read into a '&sync Fn' reaches it through a call, and its address is taken")
+mts_named_function_through_a_call_is_accepted()
+    if !mts_ready() then return
+
+    // slate's shape: the main thread's machine in module storage, a per-thread pointer for any other.
+    val head = "struct Vm\n    cell: &Cell\n\n"
+    val shape = raw"""
+        private var main_vm: Vm = Vm(Cell(0))
+
+        @thread_local
+        private var the_vm: *Vm = null
+
+        current() -> *Vm = if the_vm == null then &main_vm else the_vm
+
+        bump()
+            current().cell.n += 1
+
+        run()
+            val job: &sync Fn() -> unit = bump
+            job()
+        """
+    val plain = mts_err(mts_cell() + head + shape)
+
+    assert(plain.contains("'demo.main_vm'"), plain)
+    assert_eq(mts_err(mts_cell() + head + "@main_thread\n" + shape), "")
+end mts_named_function_through_a_call_is_accepted
+
+@test("a '@main_thread' 'val' filled at run time is accepted where a plain one is refused")
+mts_a_val_is_accepted()
+    if !mts_ready() then return
+
+    val reach = raw"""
+        val shared: &Cell = Cell(0)
+
+        run()
+            val job: &sync Fn() -> unit = () -> shared.n += 1
+            job()
+        """
+    val plain = mts_err(mts_cell() + reach)
+
+    assert(plain.contains("'demo.shared'"), plain)
+    assert_eq(mts_err(mts_cell() + "@main_thread\n" + reach), "")
+end mts_a_val_is_accepted
+
+// -- where it is refused ------------------------------------------------------------------------------
+
+@test("above a 'const', an 'extern' or a function there is no storage for the promise to be about")
+mts_no_storage_is_refused()
+    for text in ["@main_thread\nconst N: int = 4\nprint(N)", "@main_thread\nextern errno: int\nprint(errno)",
+                 "@main_thread\nf() -> int = 1\nprint(f())"]
+        assert(pf_err(text).starts_with("'@main_thread' promises that only the program's main thread " +
+                                        "reaches one 'var' or 'val', and this declares no storage at all"),
+               pf_err(text))
+end mts_no_storage_is_refused
+
+@test("beside '@thread_local' or '@per_cpu' it is a second answer to who reaches the binding")
+mts_beside_a_per_copy_annotation_is_refused()
+    val tl = pf_err("@main_thread\n@thread_local\nstatic var n: int = 1\nprint(n)")
+
+    assert(tl.starts_with("'@main_thread' and '@thread_local' are two answers to who reaches one binding"), tl)
+    assert(tl.contains("each thread its own copy"), tl)
+
+    val pc = pf_err("@per_cpu\n@main_thread\nstatic var n: int = 1\nprint(n)")
+
+    assert(pc.starts_with("'@main_thread' and '@per_cpu' are two answers"), pc)
+    assert(pc.contains("each processor core its own copy"), pc)
+end mts_beside_a_per_copy_annotation_is_refused
+
+@test("beside an annotation about a function it is refused, and beside '@align' it is not")
+mts_beside_a_function_annotation_is_refused()
+    val e = pf_err("@main_thread\n@pure\nstatic var n: int = 1\nprint(n)")
+
+    assert(e.starts_with("'@main_thread' is a promise about one 'var' or 'val', so the only annotations"), e)
+    assert_eq(pf_err("@main_thread\n@align(64)\nstatic var n: int = 1\nprint(n)"), "")
+end mts_beside_a_function_annotation_is_refused
+
+@test("above a binding that names several it has no one object to be about")
+mts_several_names_are_refused()
+    val e = pf_err("@main_thread\nstatic var a, b = 1, 2\nprint(a)")
+
+    assert(e.starts_with("'@main_thread' is a promise about one object, and a binding that names several"), e)
+
+@test("above a local it is refused: a local is one call's, and no other thread reaches it")
+mts_a_local_is_refused()
+    if !mts_ready() then return
+
+    for keyword in ["var", "val"]
+        val e = mts_err(s"f() -> int\n    @main_thread\n    $keyword n: int = 1\n    n\n")
+
+        assert(e.starts_with("'n' is a local, and a local is already one thread's"), e)
+        assert(e.contains("'@main_thread' marks module storage"), e)
+end mts_a_local_is_refused
+
+@test("on a freestanding target there are no threads for one to be the main one")
+mts_freestanding_is_refused()
+    if !mts_ready() then return
+
+    val e = mts_err_on("aarch64-freestanding", "@main_thread\nvar n: u64 = 0\n")
+
+    assert(e.starts_with("'demo.n' cannot be '@main_thread' on 'aarch64-freestanding': the promise is " +
+                         "that only the program's main thread reaches it, and a freestanding target " +
+                         "has no threads"), e)
+end mts_freestanding_is_refused
+
+// -- what the back end makes of it --------------------------------------------------------------------
+
+@test("the '&sync' body checks the thread before the access, and the program's own code does not")
+mts_only_the_other_domain_checks()
+    if !mts_ready() then return
+
+    val ir = mts_ir(raw"""
+        struct Cell
+            n: int
+
+        @main_thread
+        static var cell: &Cell = Cell(0)
+
+        peek() -> int = cell.n
+
+        val job: &sync Fn() -> unit = () -> cell.n += 1
+
+        job()
+        print(peek())
+        """)
+
+    assert(ir.contains("declare i32 @sysl_on_main_thread()"), ir)
+
+    val call = "call i32 @sysl_on_main_thread()"
+    val first = ir.index_of(call)
+
+    assert(first.is_some(), ir)
+    assert(ir[first.unwrap() + call.bytes.len..<ir.bytes.len].index_of(call).is_none(), ir)
+    assert(!mts_body(ir, "@peek(").contains("sysl_on_main_thread"), ir)
+    assert(!mts_body(ir, "define i32 @main(").contains("sysl_on_main_thread"), ir)
+    assert(ir.contains("call void @sysl_main_thread_fail(ptr @.loc"), ir)
+end mts_only_the_other_domain_checks
+
+@test("storage nothing marked is reached with no check at all")
+mts_unmarked_storage_is_unchecked()
+    if !mts_ready() then return
+
+    val ir = mts_ir("static var n: u64 = 0\n\nval job: &sync Fn() -> u64 = () -> n\n\nprint(job())\n")
+
+    assert(!ir.contains("sysl_on_main_thread"), ir)
+
+// -- what the program does ----------------------------------------------------------------------------
+
+@test("reached from the main thread, the '&sync' job runs as any closure does")
+mts_main_thread_access_runs()
+    if !mts_can_run() then return
+
+    val (state, printed, err) = mts_run(mts_program(false), DefaultOptimization)
+
+    assert(state == Status.Exited(0), s"stopped with $state: $err")
+    assert_eq(printed, "1\n")
+end mts_main_thread_access_runs
+
+@test("reached from a spawned thread, the access traps and names the storage")
+mts_another_thread_traps()
+    if !mts_can_run() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, _, err) = mts_run(mts_program(true), level)
+
+        assert_eq(err, "'cell' is @main_thread storage and was reached from another thread\n")
+        assert(state != Status.Exited(0), s"-O$level exited zero")
+end mts_another_thread_traps

@@ -255,6 +255,9 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // `codegen.per_cpu_offset`, a fact about the image rather than about one binding. `@pinned` and
     // `@pins` are claims about a body with nothing to qualify them.
     if word == "per_cpu" then return Some(PerCpu)
+
+    // `@main_thread` takes none: which thread is the main one is the program's, not the binding's.
+    if word == "main_thread" then return Some(MainThread)
     if word == "pinned" then return Some(Pinned)
     if word == "pins" then return Some(Pins)
     if fn_forgo_word(word) then return Some(Forgoes(word[3..<word.len]))
@@ -694,6 +697,12 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         return stmt(start.to(p.just_taken()), Bad)
     end if
 
+    if main_only(attrs) && !storage
+        p.fault(start, "'@main_thread' promises that only the program's main thread reaches one 'var' or 'val', and this declares no storage at all — a 'const' is folded into every use and holds nothing to race on, an 'extern' names storage this program does not lay down, and a function is code any thread may run")
+        skip_line(p)
+        return stmt(start.to(p.just_taken()), Bad)
+    end if
+
     if p.at_kw("struct") || (p.at_word("opaque") && p.kw_at(1, "struct"))
         // **`@packed`, `@align(n)` and `@export("...")` are the three that mark a struct**, and
         // anything else above one is about a function that is not here.
@@ -948,6 +957,21 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
         return
     end if
 
+    // `@main_thread` is about the one copy a binding already has, so beside an annotation that makes
+    // several copies it would be a promise about none of them in particular.
+    if main_only(attrs) && (per_thread(attrs) || per_core(attrs))
+        val other = if per_thread(attrs) then "@thread_local" else "@per_cpu"
+        val each = if per_thread(attrs) then "thread" else "processor core"
+
+        p.fault(p.here(), s"'@main_thread' and '$other' are two answers to who reaches one binding — the main thread alone, or each $each its own copy — so they cannot stand above the same one. '$other' already keeps every copy to one $each; '@main_thread' is for the one object the whole program shares")
+        return
+    end if
+
+    if main_only(attrs) && !all_storage(attrs)
+        p.fault(p.here(), "'@main_thread' is a promise about one 'var' or 'val', so the only annotations it stands beside are the others about storage — '@align(n)', '@section(\"...\")' and '@export'. The rest mark a function or a type, and neither is storage a thread could reach")
+        return
+    end if
+
     if per_thread(attrs) && !all_storage(attrs)
         p.fault(p.here(), "'@thread_local' gives one 'var' a copy per thread, so the only annotations it stands beside are the others about storage — '@align(n)', '@section(\"...\")' and '@export'. The rest mark a function or a type, and neither is storage a thread could have its own of")
         return
@@ -991,7 +1015,8 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     // whichever kind the declaration turns out to be would give. `@section` is in neither camp, and
     // a set of nothing but layout and `@export("...")` is a struct's C name beside its layout. A set
     // holding `@thread_local` is a binding's, settled by the rule above.
-    if has_layout(attrs) && !per_thread(attrs) && !per_core(attrs) && !all_layout_or_export(attrs) && marks_a_function(attrs)
+    if has_layout(attrs) && !per_thread(attrs) && !per_core(attrs) && !main_only(attrs) &&
+            !all_layout_or_export(attrs) && marks_a_function(attrs)
         p.fault(p.here(), "'@packed' and '@align' describe a layout and the rest mark a function, so they cannot stand above one declaration — a struct has no body to be tail-recursive or pure in, and a function has no fields to lay out")
 end refuse_impossible_pairs
 
@@ -1026,6 +1051,7 @@ private is_storage(a: Attr) -> bool = a match
     Section(_) -> true
     ThreadLocal -> true
     PerCpu -> true
+    MainThread -> true
     _ -> false
 
 private has_export(attrs: Buf[Attr]) -> bool
@@ -1068,6 +1094,9 @@ private per_thread(attrs: Buf[Attr]) -> bool = has_word(attrs, "thread_local")
 
 // Whether a set of annotations asks for one copy per processor core.
 private per_core(attrs: Buf[Attr]) -> bool = has_word(attrs, "per_cpu")
+
+// Whether a set of annotations promises that only the main thread reaches the binding.
+private main_only(attrs: Buf[Attr]) -> bool = has_word(attrs, "main_thread")
 
 private has_word(attrs: Buf[Attr], word: string) -> bool
     for attr in attrs
@@ -1202,6 +1231,7 @@ private placed(p: *Parser, s: Stmt, attrs: Buf[Attr], written: Visibility) -> St
     var section: Option[string] = None
     val copies = if per_thread(attrs) then CopyPerThread
     else if per_core(attrs) then CopyPerCpu
+    else if main_only(attrs) then MainThreadOnly
     else OneCopy
 
     // `@thread_local` is the one of the three that chooses between the two keywords, so it is
@@ -1227,8 +1257,8 @@ private placed(p: *Parser, s: Stmt, attrs: Buf[Attr], written: Visibility) -> St
             _ -> ()
 
     *s.kind match
-        ValDecl(n, t, v, vis, _, _, _) ->
-            stmt(s.span, ValDecl(n, t, v, either_vis(written, vis), align, section, export))
+        ValDecl(n, t, v, vis, _, _, _, _) ->
+            stmt(s.span, ValDecl(n, t, v, either_vis(written, vis), align, section, copies, export))
         VarDecl(n, t, v, vis, _, _, _, _) ->
             stmt(s.span, VarDecl(n, t, v, either_vis(written, vis), align, section, copies, export))
         StaticDecl(inner) -> stmt(s.span, StaticDecl(placed(p, inner, attrs, written)))
@@ -1274,6 +1304,7 @@ private refuse_several(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
 
     if !all_are(attrs, "align") then about = "'@section(\"...\")' places one object"
     if has_export(attrs) then about = "'@export' publishes one object under one C symbol"
+    if main_only(attrs) then about = "'@main_thread' is a promise about one object"
 
     p.fault(Span(s.span.end, s.span.end), s"${about}, and a binding that names several has " +
         "no one object for it to be about \u{2014} declare them on lines of their own")

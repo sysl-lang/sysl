@@ -498,8 +498,8 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
     // A local `val` is a `var` that may not be assigned to again -- same frame, same lifetime, same
     // code. Only the binding differs, so the read-only half is enforced where an assignment target
     // is checked rather than here.
-    ValDecl(name, typ, value, _, align, section, export) ->
-        val_decl(cx, stmt.span, name, typ, value, align, section, export)
+    ValDecl(name, typ, value, _, align, section, copies, export) ->
+        val_decl(cx, stmt.span, name, typ, value, align, section, copies, export)
 
     RefDecl(name, place) -> ref_decl(cx, stmt.span, name, place)
 
@@ -668,9 +668,13 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
 end var_decl
 
 private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], value: Expr,
-                 align: Option[Expr], section: Option[string],
+                 align: Option[Expr], section: Option[string], copies: Copies,
                  export: Option[ExportAttr]) -> Buf[TStmt]
-    if export.is_some() then no_export(cx, span, name) else no_section(cx, span, name, section)
+    if export.is_some() then no_export(cx, span, name)
+    else
+        no_section(cx, span, name, section)
+
+        if section.is_none() then no_thread_local(cx, span, name, copies)
 
     val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
     val ti = type_expr(cx, value, declared)
@@ -763,6 +767,16 @@ private no_thread_local(cx: &Analyzer, span: Span, name: string, copies: Copies)
                  "frame of whichever call is running, which no other core can see. '@per_cpu' " +
                  "marks module storage, which is otherwise one object every core shares — declare " +
                  "it outside every function for the attribute to say anything")
+        return
+    end if
+
+    // A local is reached only by the call that made it, so the promise that only the main thread
+    // reaches it is already kept by whichever thread runs the call.
+    if copies == MainThreadOnly
+        cx.fault(span, s"'$name' is a local, and a local is already one thread's: its storage is the " +
+                 "frame of whichever call is running, which no other thread reaches. '@main_thread' " +
+                 "marks module storage, which is otherwise one object every thread could reach — " +
+                 "declare it outside every function for the promise to be about something")
         return
     end if
 
@@ -1004,7 +1018,7 @@ private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
             Some("'defer' schedules a statement, and scheduling a scheduling has " +
                  "nothing to run: write the statement itself after this 'defer'")
         VarDecl(_, _, _, _, _, _, _, _) -> Some(deferred_declaration())
-        ValDecl(_, _, _, _, _, _, _) -> Some(deferred_declaration())
+        ValDecl(_, _, _, _, _, _, _, _) -> Some(deferred_declaration())
         MultiDecl(_, _, _) -> Some(deferred_declaration())
         ConstDecl(_, _, _, _) -> Some(deferred_declaration())
         _ -> None

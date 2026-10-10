@@ -42,6 +42,11 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
 
     for v in p.vals
         if v.per_cpu then e.per_cpu.add(v.symbol)
+        if v.main_thread then e.main_thread.add(v.symbol)
+
+    // Which bodies check that they are on the main thread before reaching `@main_thread` storage: the
+    // ones that may run in another domain, on a target with a thread to ask about.
+    if !e.main_thread.is_empty() && main_thread_checked(t) then e.off_main = bodies_in_other_domains(p)
 
     set_promotions(e, pr)
 
@@ -80,9 +85,15 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
         if !f.ghost && !declared_elsewhere(p, f)
             set_promoted(e, pr.for_func(f.name))
 
+            e.main_thread_checks = e.off_main.has(f.name)
+
             gen_function(e, f) match
                 Some(built) -> funcs.push(built)
                 None -> gaps.push((f.name, gap_text(e)))
+
+    // What is written from here on -- the thunks, the entry point, the helpers -- runs where its
+    // caller does, and the caller's body is the one that checked.
+    e.main_thread_checks = false
 
     // The C-callable entry each `@export` publishes, in front of the definition it calls. Every one
     // of them is built after the definitions, which is the order the reference's text has them in.
