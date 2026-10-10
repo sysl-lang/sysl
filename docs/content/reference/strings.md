@@ -437,15 +437,16 @@ print(str(42), str(true), str('é'), str(2.5), str("already"))
 | integer | its decimal digits, with a sign for a negative signed value |
 | `bool` | `"true"` or `"false"` |
 | `char` | the one scalar value's UTF-8 |
-| float | the same `%g` rendering `print` gives it — six significant digits, correctly rounded |
+| float | the rendering `print` gives it — the fewest digits that read back at its own width, positionally, as Rust's `{}` writes them |
 | `string` | itself, unchanged |
 
 Every case but a `string` allocates a fresh buffer; a `string` is returned as it is, and a `bool`
 renders to one of two immortal literals and allocates nothing. Every number is rendered without the
 C library. An integer's digits are divided out into a scratch buffer, which is correct even for the
 most negative value because the magnitude is taken in unsigned arithmetic. A float goes through the
-library's [`sysl.fmt.format_real`](/library/fmt/#floats), the renderer `print` uses too, so
-`str(x)` and `print(x)` can never disagree and a board with no C library renders one the same way.
+library's [`sysl.fmt.format_real_plain`](/library/fmt/#floats) (or its sibling at the float's width),
+whose digits are the ones `print` writes, so `str(x)` and `print(x)` can never disagree and a board
+with no C library renders one the same way.
 
 **Any other type renders through `Display`.** A struct or an enum carrying an `impl` writes itself
 into a growable buffer, and the bytes that land there become the string — so `str` of a user type is

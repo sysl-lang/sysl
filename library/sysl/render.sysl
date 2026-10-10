@@ -145,24 +145,53 @@ private[sysl] digits_long(n: long, into: []u8) -> usize
     into[at] = u8('-')
     at
 
-/** A float as `%g` renders it -- six significant digits by default, correctly rounded, in whichever of
- * fixed point and an exponent `%g` picks -- with the precision read as the count of significant
- * digits, at most forty. `float_text.sysl` does the rounding, in sysl, so this needs no C library.
+/** A float as `print`, `str` and a plain hole render it, which is what Rust's `{}` writes for the same
+ * value: the fewest digits that read back as the same `real`, set out positionally -- `0.1`, `1`,
+ * `100000000000000000000`, `0.0000001` -- never an exponent and never a trailing `.0`, with `-0`,
+ * `inf`, `-inf` and `NaN`. A width pads it.
+ *
+ * A precision asks for `%g` instead -- that many significant digits, correctly rounded, in whichever
+ * of fixed point and an exponent `%g` picks, at most forty. Both are worked out in sysl, so neither
+ * needs a C library or an allocator.
  */
 display_real(x: real, out: *Writer, fmt: FormatSpec)
+    if fmt.prec < 0
+        plain_real(x, out, fmt)
+        return
+
     var digits: [48]u8
     val p = if fmt.prec > 40 then 40 else fmt.prec
 
     write_float_field(out, real_value(x), FloatField(u8('g'), fmt.width, p, fmt.left, false, false,
                                                      false, false), digits[..])
+end display_real
 
-/** An `f32` the way `display_real` renders it, taken apart at its own width rather than widened. */
+/** An `f32` the way `display_real` renders a `real`, taken apart at its own width rather than widened:
+ * `0.1` for `f32(0.1)`, the digits an `f32` needs and not the seventeen its widened value would.
+ */
 display_f32(x: f32, out: *Writer, fmt: FormatSpec)
+    if fmt.prec < 0
+        plain_f32(x, out, fmt)
+        return
+
     var digits: [48]u8
     val p = if fmt.prec > 40 then 40 else fmt.prec
 
     write_float_field(out, f32_value(x), FloatField(u8('g'), fmt.width, p, fmt.left, false, false,
                                                     false, false), digits[..])
+end display_f32
+
+/** An `f16` the way `display_real` renders a `real`, in the digits an `f16` needs; under a precision
+ * it widens, exactly, and is `%g`'s.
+ */
+display_f16(x: f16, out: *Writer, fmt: FormatSpec)
+    if fmt.prec < 0 then plain_f16(x, out, fmt) else display_real(real(x), out, fmt)
+
+/** A `bf16` the way `display_real` renders a `real`, in the digits a `bf16` needs; under a precision
+ * it widens, exactly, and is `%g`'s.
+ */
+display_bf16(x: bf16, out: *Writer, fmt: FormatSpec)
+    if fmt.prec < 0 then plain_bf16(x, out, fmt) else display_real(real(x), out, fmt)
 
 /** A `real` written in the fewest digits that read back as the same number, which is what a
  * serializer needs and what `display_real` cannot give it.
@@ -201,13 +230,13 @@ display_f128_shortest(x: f128, out: *Writer, fmt: FormatSpec)
 
     display_pad(buf[0..<shortest_quad(x, buf[..])], out, fmt)
 
-/** An `f128` as `print`, `str` and a plain hole render it: the shortest reading that comes back as the
- * same value, since a type kept for its thirty-four digits is not served by `%g`'s six. A precision is
- * a count of significant digits, as `display_real` reads one, at most forty.
+/** An `f128` as `print`, `str` and a plain hole render it: `display_real`'s rule at binary128's width,
+ * the fewest digits that read back as the same `f128`, set out positionally. A precision is a count of
+ * significant digits, as `display_real` reads one, at most forty.
  */
 display_f128(x: f128, out: *Writer, fmt: FormatSpec)
     if fmt.prec < 0
-        display_f128_shortest(x, out, fmt)
+        plain_quad(x, out, fmt)
         return
 
     var digits: [48]u8

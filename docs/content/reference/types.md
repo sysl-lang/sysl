@@ -335,8 +335,8 @@ in `f128` is linked with them, and one that does not carries none. They round to
 even, always.
 
 **`print`, `str` and a plain interpolation hole write an `f128` in the fewest digits that read back as
-it** — never narrowed to a `real`, which would print a number the program does not hold, and never
-`%g`'s six digits, which would throw away the twenty-eight the type was chosen for. A format
+it**, positionally, as every float prints — never narrowed to a `real`, which would print a number the
+program does not hold. A format
 specifier renders the exact value's digits, correctly rounded at the precision it asks for, as it
 does for a `real`. All of it is the standard module's own arithmetic, so it needs no C library and
 works on a bare machine:

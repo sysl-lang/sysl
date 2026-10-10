@@ -1,0 +1,187 @@
+module sysl.text
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The plain rendering of the floats Rust has no stable `Display` for -- `f16`, `bf16` and `f128` --
+// held to the rule `print` follows for every width, Rust's `{}`: the text is positional, it reads back
+// as the same value at the type's own width, and no decimal one significant digit shorter does.
+// `f32` and `real` are held to Rust's own output, in `sysl/display_oracle_tests.sysl`.
+//
+// A half-width value is read back through `parse_real` and narrowed. That rounds twice, which is safe
+// here: every decimal tried has at most six significant digits, and none of them lies close enough
+// to a half-way point between two `f16`s or two `bf16`s for the first rounding to land on one.
+
+// The significant digits `s` writes -- no sign, no point, no zeros either side -- and the power of ten
+// the first of them stands for.
+private shape(s: string) -> (string, int)
+    val b = s.bytes
+    val at: usize = if b[0] == u8('-') then 1 else 0
+    var dot = at
+
+    while dot < b.len && b[dot] != u8('.')
+        dot += 1
+
+    var digits: Buf[u8] = buf()
+
+    for i in at..<b.len
+        if b[i] != u8('.') then digits.push(b[i])
+
+    var point = int(dot - at) - 1
+    var first: usize = 0
+
+    while first + 1 < digits.len() && digits.at(first) == u8('0')
+        first += 1
+        point -= 1
+
+    var last = digits.len()
+
+    while last > first + 1 && digits.at(last - 1) == u8('0')
+        last -= 1
+
+    (from_utf8_unchecked(digits.view()[first..<last]), point)
+end shape
+
+// `digits` scaled so that the first stands for `10^point`, as text any reader takes.
+private scaled(digits: string, point: int) -> string = "0." + digits + "e" + str(point + 1)
+
+// The two decimals one significant digit shorter than `digits` that bracket it: the digits cut, and
+// the digits cut and stepped up by one in their last place.
+private shorter(digits: string, point: int) -> (string, string)
+    val cut = digits.bytes[0..<digits.bytes.len - 1]
+    var up: Buf[u8] = buf()
+
+    up.extend(cut)
+
+    var i = up.len()
+    var carry = true
+
+    while carry && i > 0
+        i -= 1
+
+        if up.at(i) == u8('9')
+            up.set(i, u8('0'))
+        else
+            up.set(i, up.at(i) + 1)
+            carry = false
+
+    val low = scaled(from_utf8_unchecked(cut), point)
+
+    if carry then return (low, scaled("1", point + 1))
+
+    (low, scaled(from_utf8_unchecked(up.view()), point))
+end shorter
+
+// What every plain rendering owes, whatever the width: positional, and no shorter decimal reads back.
+private holds(s: string, reads: &Fn(string) -> bool)
+    assert(reads(s), s"'$s' does not read back")
+
+    for c in s.bytes
+        assert(c != u8('e') && c != u8('E'), s"'$s' has an exponent")
+
+    val found = shape(s)
+
+    if found.0.bytes.len < 2 then return
+
+    val near = shorter(found.0, found.1)
+
+    assert(!reads(near.0), s"'$s' is not the shortest: '${near.0}' reads back too")
+    assert(!reads(near.1), s"'$s' is not the shortest: '${near.1}' reads back too")
+end holds
+
+private reads_f16(bits: u16) -> &Fn(string) -> bool = (t) -> parse_real(t) match
+    Ok(r) -> f16(r).bits() == bits
+    Err(_) -> false
+
+@test("every finite f16 prints positionally in the fewest digits that read back as it")
+pft_every_f16()
+    for b in 0..<0x7c00
+        val x = f16.from_bits(u16(b))
+
+        holds(str(x), reads_f16(u16(b)))
+        holds(str(-x), reads_f16(u16(b) | 0x8000))
+
+private reads_bf16(bits: u16) -> &Fn(string) -> bool = (t) -> parse_real(t) match
+    Ok(r) -> bf16(r).bits() == bits
+    Err(_) -> false
+
+@test("every finite bf16 prints positionally in the fewest digits that read back as it")
+pft_every_bf16()
+    for b in 0..<0x7f80
+        holds(str(bf16.from_bits(u16(b))), reads_bf16(u16(b)))
+
+@test("the half-width floats: the words, and the values a reader checks by eye")
+pft_half_width_words()
+    assert_eq(str(f16.from_bits(0x8000)), "-0")
+    assert_eq(str(f16.from_bits(0x7c00)), "inf")
+    assert_eq(str(f16.from_bits(0xfc00)), "-inf")
+    assert_eq(str(f16.from_bits(0x7e00)), "NaN")
+    assert_eq(str(f16(0.1)), "0.1")
+    assert_eq(str(f16(1.0)), "1")
+    // The largest f16 is 65504, and the gap above it is 32, so 65500 already reads back as it.
+    assert_eq(str(f16(65504.0)), "65500")
+    assert_eq(str(f16.from_bits(1)), "0.00000006")
+    assert_eq(str(bf16.from_bits(0x8000)), "-0")
+    assert_eq(str(bf16.from_bits(0x7fc0)), "NaN")
+    assert_eq(str(bf16(0.1)), "0.1")
+    assert_eq(str(bf16(256.0)), "256")
+end pft_half_width_words
+
+private reads_f128(bits: u128) -> &Fn(string) -> bool = (t) -> parse_f128(t) match
+    Ok(q) -> q.bits() == bits
+    Err(_) -> false
+
+private holds_f128(bits: u128) = holds(str(f128.from_bits(bits)), reads_f128(bits))
+
+@test("an f128 prints positionally in the fewest digits that read back as it, at both ends too")
+pft_f128_powers()
+    // Every 97th power of two, subnormals to the largest, and the values beside each.
+    var k = -16494
+
+    while k <= 16383
+        var bits = u128(k + 16383) << 112
+
+        if k < -16382 then bits = u128(1) << (k + 16494)
+
+        holds_f128(bits)
+        holds_f128(bits + 1)
+        if bits > 1 then holds_f128(bits - 1)
+        k += 97
+
+    holds_f128(0x7ffeffffffffffffffffffffffffffff)
+    holds_f128(0x0000ffffffffffffffffffffffffffff)
+end pft_f128_powers
+
+@test("random f128 bit patterns print in the fewest digits that read back")
+pft_f128_random()
+    var state: u64 = 0x9e3779b97f4a7c15
+    var done = 0
+
+    while done < 300
+        state ^= state << 13
+        state ^= state >> 7
+        state ^= state << 17
+        val high = state
+        state ^= state << 13
+        state ^= state >> 7
+        state ^= state << 17
+
+        val bits = (u128(high) << 64) | u128(state)
+
+        if (bits >> 112) & 0x7fff != 0x7fff
+            holds_f128(bits)
+            done += 1
+end pft_f128_random
+
+@test("an f128 at the values a reader checks by eye")
+pft_f128_words()
+    assert_eq(str(0.1f128), "0.1")
+    assert_eq(str(1.0f128), "1")
+    assert_eq(str(1e40f128), "10000000000000000000000000000000000000000")
+    assert_eq(str(1e-7f128), "0.0000001")
+    assert_eq(str(-0.0f128), "-0")
+    assert_eq(str(f128.from_bits(0x7fff0000000000000000000000000000)), "inf")
+    assert_eq(str(f128.from_bits(0xffff0000000000000000000000000000)), "-inf")
+    assert_eq(str(f128.from_bits(0x7fff8000000000000000000000000000)), "NaN")
+    assert_eq(str(f128.from_bits(1)).bytes.len, 4968)
+end pft_f128_words

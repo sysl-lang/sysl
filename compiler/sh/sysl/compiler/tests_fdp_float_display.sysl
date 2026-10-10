@@ -1,0 +1,55 @@
+module sh.sysl.compiler
+@tests
+
+// **A float prints as Rust's `{}` prints it, at every width and by every road**: `print`, `str`, a
+// bare interpolation hole and a value's `Display` all write the fewest digits that read back as the
+// same value of its own type, set out positionally -- never an exponent, a whole number with no
+// `.0`, `-0`, `inf`, `-inf` and `NaN`. A specifier keeps its C meaning. The expected text is what
+// `rustc` prints for the same values; the library's own suite holds the digits to a table of Rust's
+// output (`library/sysl/display_oracle_tests.sysl`), and these hold the compiler to reaching them.
+
+private fdp_output(program: string) -> string
+    val p = lbr_program(program)
+    val out = lbr_run(p, [])
+
+    lbr_drop([p])
+    out
+end fdp_output
+
+@test("print writes a float of every width as Rust's Display does")
+fdp_print_every_width()
+    if !lbr_ready() then return
+
+    val out = fdp_output(raw"""
+        val third: f32 = f32(1.0) / f32(3.0)
+
+        print(1.0, 1e20, 1e-7, -0.0, 0.1 + 0.2, 123456789012345680.0)
+        print(f32(0.1), third, f32(16777216.0))
+        print(f16(0.1), bf16(0.1), 0.1f128, 1e40f128)
+        print(infinity, -infinity, nan)
+        """)
+
+    assert_eq(out, "1 100000000000000000000 0.0000001 -0 0.30000000000000004 123456789012345680\n" +
+                   "0.1 0.33333334 16777216\n" +
+                   "0.1 0.1 0.1 10000000000000000000000000000000000000000\n" +
+                   "inf -inf NaN\n")
+end fdp_print_every_width
+
+@test("str, a bare hole and a generic Display write what print does, and a specifier keeps C's meaning")
+fdp_str_holes_and_display()
+    if !lbr_ready() then return
+
+    val out = fdp_output(raw"""
+        show[T: Display](x: T) -> string = str(x)
+
+        val x = 1e21
+        val y: f32 = 0.1
+        val h: f16 = 0.25
+
+        print(str(x), s"[$x] [${y}] [$h]", show(y), show(2.5e-8))
+        print(f"${x}%g ${y}%.3f")
+        """)
+
+    assert_eq(out, "1000000000000000000000 [1000000000000000000000] [0.1] [0.25] 0.1 0.000000025\n" +
+                   "1e+21 0.100\n")
+end fdp_str_holes_and_display

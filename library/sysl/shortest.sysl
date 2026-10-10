@@ -64,6 +64,154 @@ private[sysl] shortest_f32(x: f32, into: []u8) -> usize
                    fraction != 0 || biased <= 1, into)
 end shortest_f32
 
+/** A `real` the way `print`, `str` and a plain hole write it, which is what Rust's `{}` writes: the
+ * fewest digits that read back as the same `real` -- the closest of those, and of two equally close
+ * the larger -- set out positionally, never an exponent, a whole number with no `.0`, and `-0`,
+ * `inf`, `-inf` and `NaN` for the values that are not ordinary numbers. The digits go straight to `out`, so `1e300` costs no buffer three hundred bytes wide.
+ */
+private[sysl] plain_real(x: real, out: *Writer, fmt: FormatSpec)
+    val bits = x.bits()
+    val biased = int((bits >> 52) & 0x7ff)
+    val fraction = bits & 0xfffffffffffff
+    val m2 = if biased == 0 then fraction else (u64(1) << 52) | fraction
+    val e2 = (if biased == 0 then 1 else biased) - 1023 - 52 - 2
+
+    plain_binary(bits >> 63 != 0, biased == 0x7ff, fraction != 0, m2, e2,
+                 fraction != 0 || biased <= 1, out, fmt)
+end plain_real
+
+/** An `f32` written as `plain_real` writes a `real`, with the digits an `f32` needs: `0.1` for
+ * `f32(0.1)`, where the same value widened needs seventeen.
+ */
+private[sysl] plain_f32(x: f32, out: *Writer, fmt: FormatSpec)
+    val bits = x.bits()
+    val biased = int((bits >> 23) & 0xff)
+    val fraction = u64(bits & 0x7fffff)
+    val m2 = if biased == 0 then fraction else (u64(1) << 23) | fraction
+    val e2 = (if biased == 0 then 1 else biased) - 127 - 23 - 2
+
+    plain_binary(bits >> 31 != 0, biased == 0xff, fraction != 0, m2, e2,
+                 fraction != 0 || biased <= 1, out, fmt)
+end plain_f32
+
+/** An `f16` written as `plain_real` writes a `real`, in the digits an `f16` needs. */
+private[sysl] plain_f16(x: f16, out: *Writer, fmt: FormatSpec)
+    val bits = x.bits()
+    val biased = int((bits >> 10) & 0x1f)
+    val fraction = u64(bits & 0x3ff)
+    val m2 = if biased == 0 then fraction else (u64(1) << 10) | fraction
+    val e2 = (if biased == 0 then 1 else biased) - 15 - 10 - 2
+
+    plain_binary(bits >> 15 != 0, biased == 0x1f, fraction != 0, m2, e2,
+                 fraction != 0 || biased <= 1, out, fmt)
+end plain_f16
+
+/** A `bf16` written as `plain_real` writes a `real`, in the digits a `bf16` needs. */
+private[sysl] plain_bf16(x: bf16, out: *Writer, fmt: FormatSpec)
+    val bits = x.bits()
+    val biased = int((bits >> 7) & 0xff)
+    val fraction = u64(bits & 0x7f)
+    val m2 = if biased == 0 then fraction else (u64(1) << 7) | fraction
+    val e2 = (if biased == 0 then 1 else biased) - 127 - 7 - 2
+
+    plain_binary(bits >> 15 != 0, biased == 0xff, fraction != 0, m2, e2,
+                 fraction != 0 || biased <= 1, out, fmt)
+end plain_bf16
+
+// The arguments are `spell_shortest`'s, the text going to a writer rather than into a buffer.
+private plain_binary(negative: bool, special: bool, nan: bool, m2: u64, e2: int, lower_half: bool,
+                     out: *Writer, fmt: FormatSpec)
+    if special && nan
+        display_pad("NaN".bytes, out, fmt)
+        return
+
+    if special
+        display_pad((if negative then "-inf" else "inf").bytes, out, fmt)
+        return
+
+    if m2 == 0
+        display_pad((if negative then "-0" else "0").bytes, out, fmt)
+        return
+
+    val found = shortest_decimal(m2, e2, lower_half, true)
+    var digits: [20]u8
+    val first = digits_ulong(found.0, digits[..])
+    val count = digits.len - first
+
+    write_plain(out, negative, digits[first..], found.1 + int(count) - 1, fmt)
+end plain_binary
+
+/** `shown`, the digits of a decimal whose first stands for `10^point`, written to `out` positionally
+ * and padded to the width `fmt` asks for: `0.` and zeros in front of a number below one, zeros behind
+ * a whole number that has fewer digits than places, and a point only where a digit follows it.
+ * Trailing zeros in `shown` are dropped first, since a digit string read as a value may carry them.
+ *
+ * A short result is gathered and written once; a long one -- a binary128 near either end of its range
+ * runs to thousands of characters -- goes out in pieces, so no buffer has to be as wide as the
+ * longest number a float can name.
+ */
+private[sysl] write_plain(out: *Writer, negative: bool, shown: []const u8, point: int, fmt: FormatSpec)
+    var count = shown.len
+
+    while count > 1 && shown[count - 1] == u8('0')
+        count -= 1
+
+    val digits = shown[0..<count]
+    val whole = point + 1
+    val sign = if negative then 1 else 0
+    var length = sign + int(count) + 1
+
+    if point < 0 then length = sign + 1 - point + int(count)
+    if point >= 0 && int(count) <= whole then length = sign + whole
+
+    if length <= 64
+        var buf: [64]u8
+        var at: usize = 0
+
+        if negative
+            buf[0] = u8('-')
+            at = 1
+
+        if point < 0
+            at = put_text(buf[..], at, "0.")
+            for _ in 0..<-point - 1
+                buf[at] = u8('0')
+                at += 1
+            at = put_bytes(buf[..], at, digits)
+        elif int(count) <= whole
+            at = put_bytes(buf[..], at, digits)
+            for _ in int(count)..<whole
+                buf[at] = u8('0')
+                at += 1
+        else
+            at = put_bytes(buf[..], at, digits[0..<usize(whole)])
+            buf[at] = u8('.')
+            at = put_bytes(buf[..], at + 1, digits[usize(whole)..])
+
+        display_pad(buf[0..<at], out, fmt)
+        return
+
+    var pad = fmt.width - length
+
+    if pad < 0 then pad = 0
+    if !fmt.left then display_fill(out, 32, pad)
+    if negative then out.write("-".bytes)
+
+    if point < 0
+        out.write("0.".bytes)
+        display_fill(out, 48, -point - 1)
+        out.write(digits)
+    elif int(count) <= whole
+        out.write(digits)
+        display_fill(out, 48, whole - int(count))
+    else
+        out.write(digits[0..<usize(whole)])
+        out.write(".".bytes)
+        out.write(digits[usize(whole)..])
+
+    if fmt.left then display_fill(out, 32, pad)
+end write_plain
+
 // `special` is a biased exponent of all ones: an infinity, or a NaN where `nan` says so. `m2` zero
 // otherwise is a zero. `lower_half` says the neighbour below is as far away as the one above, which
 // it is except at a power of two.
@@ -83,7 +231,7 @@ private spell_shortest(negative: bool, special: bool, nan: bool, m2: u64, e2: in
         into[at] = u8('0')
         return at + 1
 
-    val found = shortest_decimal(m2, e2, lower_half)
+    val found = shortest_decimal(m2, e2, lower_half, false)
     var digits: [20]u8
     val first = digits_ulong(found.0, digits[..])
     val count = digits.len - first
@@ -153,10 +301,14 @@ private put_text(into: []u8, at: usize, text: string) -> usize = put_bytes(into,
 
 /** The fewest digits naming the float `m2 * 2^(e2 + 2)`, as those digits and the power of ten they
  * are scaled by: `(d, k)` reads as `d * 10^k`. The float must be finite and not zero; it may be a
- * `real` or an `f32`, since the interval is worked out from `m2` and `e2` alone and the tables are
- * wide enough for both.
+ * `real`, an `f32` or one of the half-width floats, since the interval is worked out from `m2` and
+ * `e2` alone and the tables are wide enough for all of them.
+ *
+ * Two decimals of the fewest digits can be equally close to the value -- `1805974.25` as an `f32`
+ * is as near `1805974.2` as `1805974.3`. `ties_up` takes the larger, which is Rust's rule and what
+ * `print` follows; without it the even digit wins, which is JavaScript's and Python's.
  */
-private shortest_decimal(m2: u64, e2: int, lower_half: bool) -> (u64, int)
+private shortest_decimal(m2: u64, e2: int, lower_half: bool, ties_up: bool) -> (u64, int)
     // A tie in the reader goes to the even significand, so an even value owns both edges.
     val accept_edges = (m2 & 1) == 0
     val mv = 4 * m2
@@ -238,8 +390,8 @@ private shortest_decimal(m2: u64, e2: int, lower_half: bool) -> (u64, int)
                 vm /= 10
                 removed += 1
 
-        // Exactly half way, to the even digit.
-        if vr_zeros && last_removed == 5 && vr % 2 == 0 then last_removed = 4
+        // Exactly half way: to the even digit, or up where the caller asked for Rust's rule.
+        if !ties_up && vr_zeros && last_removed == 5 && vr % 2 == 0 then last_removed = 4
 
         val round_up = (vr == vm && (!accept_edges || !vm_zeros)) || last_removed >= 5
         output = vr + (if round_up then 1 else 0)

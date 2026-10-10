@@ -45,9 +45,9 @@ print(sqrt2, ln2, ln10)
 1.41421 0.693147 2.30259
 ```
 
-Those are the full-precision values printed by `%g`'s six significant digits, which is what
-[`print`](/library/core/) does with a float. The constants themselves carry every digit a `real`
-holds.
+Each is printed in the fewest digits that read back as it, which is what
+[`print`](/library/core/#rendering-to-standard-output) does with a float — every digit a `real`
+holds, and no more.
 
 **All six are `real`**, which is the width they are correct to and the width arithmetic reaches for
 unless a program says otherwise. An `f32` program writes `f32(pi)`: the conversion is a constant the

@@ -38,10 +38,35 @@ private[sysl] shortest_quad(x: f128, into: []u8) -> usize
         return at + 1
 
     var digits: [40]u8
-    val found = quad_shortest_digits(v.m, v.e, digits[..])
+    val found = quad_shortest_digits(v.m, v.e, digits[..], false)
 
     spell_digits(into, at, digits[0..<found.0], found.1)
 end shortest_quad
+
+/** An `f128` the way `print`, `str` and a plain hole write it -- `plain_real`'s rule at binary128's
+ * width: the fewest digits that read back as the same `f128`, set out positionally. Near either end of
+ * the range that is thousands of characters, which go straight to `out`.
+ */
+private[sysl] plain_quad(x: f128, out: *Writer, fmt: FormatSpec)
+    val v = quad_value(x)
+
+    if v.kind == NotANumber
+        display_pad("NaN".bytes, out, fmt)
+        return
+
+    if v.kind == Infinite
+        display_pad((if v.negative then "-inf" else "inf").bytes, out, fmt)
+        return
+
+    if v.kind == Zero
+        display_pad((if v.negative then "-0" else "0").bytes, out, fmt)
+        return
+
+    var digits: [40]u8
+    val found = quad_shortest_digits(v.m, v.e, digits[..], true)
+
+    write_plain(out, v.negative, digits[0..<found.0], found.1, fmt)
+end plain_quad
 
 private quad_word(into: []u8, at: usize, word: string) -> usize
     for i in 0..<word.bytes.len
@@ -51,9 +76,10 @@ private quad_word(into: []u8, at: usize, word: string) -> usize
 end quad_word
 
 /** The fewest digits naming `m * 2^e` (finite, not zero), written into `into`, and the power of ten the
- * first of them stands for.
+ * first of them stands for. Of two equally close readings `ties_up` takes the larger, Rust's rule,
+ * and otherwise the one ending in an even digit.
  */
-private quad_shortest_digits(m: u128, e: int, into: []u8) -> (usize, int)
+private quad_shortest_digits(m: u128, e: int, into: []u8, ties_up: bool) -> (usize, int)
     var r: Big[QuadLimbs] = Big([0; QuadLimbs], 0)
     var s = r
     var up = r
@@ -152,7 +178,7 @@ private quad_shortest_digits(m: u128, e: int, into: []u8) -> (usize, int)
 
                 val c = doubled.cmp(&s)
 
-                if c > 0 || (c == 0 && d % 2 == 1) then d += 1
+                if c > 0 || (c == 0 && (ties_up || d % 2 == 1)) then d += 1
             elif high_hit
                 d += 1
             end if

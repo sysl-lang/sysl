@@ -373,7 +373,8 @@ calls with a space between and a newline at the end.
 | `string` | `prints` | the bytes, as they are |
 | any signed integer | `printi` | its decimal digits, as `%lld` writes them, divided out in sysl |
 | any unsigned integer | `printu` | its decimal digits, as `%llu` writes them |
-| `real`, `f32` | `printr` | `%g`, correctly rounded in sysl |
+| `real` | `printr` | the fewest digits that read back, positionally — Rust's `{}` |
+| `f32`, `f16`, `bf16`, `f128` | `printf32`, `printf16`, `printbf16`, `printq` | the same rule at the float's own width |
 | `bool` | `printb` | `true` or `false` |
 | `char` | `printc` | UTF-8 encoded in sysl, not by C |
 | anything else | its `Display` | via `str`, which renders into a buffer |
@@ -385,14 +386,32 @@ print(1.0 / 3.0)
 
 ```output
 42 3.5 true é text 7
-0.333333
+0.3333333333333333
 ```
 
-`0.333333` rather than `0.3333333333333333` because `%g` is six significant digits by default —
-C's default, kept so that a number prints the way a C programmer expects. `printr` renders it in sysl
-([`sysl.fmt`](/library/fmt/#floats) has the rules), so it needs no C library and prints the same on a
-board as on a desktop; [`shortest`](/library/fmt/#the-shortest-reading) is the reading that keeps
-every digit the value needs.
+**A float prints exactly as Rust's `{}` (its `Display`) prints the same value at the same width**:
+the fewest decimal digits that read back as that value of that type — the closest of those, and of
+two equally close the larger — written out positionally. There is never an exponent and a whole
+number has no `.0`; `-0`, `inf`, `-inf` and `NaN` name the rest. The same rule is what `str`, a bare
+interpolation hole and a float's `Display` write, so a number reads the same whichever of them it
+went through.
+
+```sysl
+print(1e20, 1e-7, 1.0, -0.0, 0.1 + 0.2)
+print(f32(0.1), f32(1.0) / f32(3.0), f16(0.1))
+```
+
+```output
+100000000000000000000 0.0000001 1 -0 0.30000000000000004
+0.1 0.33333334 0.1
+```
+
+Each width is read at its own width: `f32(0.1)` is `0.1`, the digits an `f32` needs, though the same
+value widened to a `real` needs seventeen. The digits are found in sysl and written straight to the
+output, so printing a float needs no C library and no allocator and prints the same on a board as on
+a desktop. A specifier — `${x}%.3f`, `${x}%g` — keeps its C meaning
+([`sysl.fmt`](/library/fmt/#floats) has the rules), and [`shortest`](/library/fmt/#the-shortest-reading)
+is the same digits in `%g`'s spelling, exponent and all.
 
 The renderers are ordinary functions and a program may call them directly. Nothing separates them,
 so this is where the space between `print`'s arguments visibly comes from — there isn't one:
@@ -763,7 +782,9 @@ values needing the most care were the ones a module without an allocator could n
 #### The shortest rendering that survives a round trip
 
 A precision is a count of significant digits, so any fixed one is a choice between losing the value
-and printing digits nobody asked for:
+and printing digits nobody asked for. With no precision, `display_real` writes the fewest digits
+that read back, positionally — Rust's `{}`, what `print` and `str` write — and `display_real_shortest`
+is the same digits in `%g`'s spelling:
 
 ```sysl
 import sysl.buf.byte_sink
@@ -792,21 +813,21 @@ prints("\n")
 ```
 
 ```output
-3.14159 3.1415926535897931 3.141592653589793
+3.141592653589793 3.1415926535897931 3.141592653589793
 0.10000000000000001 0.1
 4.9406564584124654e-324 5e-324
 ```
 
-Six is a reasonable thing to show a person and a broken thing to serialize; seventeen keeps every
-value and spells `0.1` with noise on the end. **What a document wants is neither**, and the answer
-has been the same since Steele and White: the shortest text that parses back to the number you
-started with.
+Six digits lose the value; seventeen keep every value and spell `0.1` with noise on the end. **What
+a document wants is neither**, and the answer has been the same since Steele and White: the shortest
+text that parses back to the number you started with.
 
 The digits are found by Ryu, directly from the value's bit pattern rather than by asking a formatter
 for one precision after another. It decomposes `x` into its significand and exponent, works out the
 interval of decimal values that round back to `x`, and returns the shortest string inside that
-interval — the one closest to `x` when more than one string is equally short, and the one ending in
-an even digit on an exact tie. No reader is called and no precision is climbed: the same arithmetic
+interval — the one closest to `x` when more than one string is equally short, and on an exact tie
+the one ending in an even digit (JavaScript's and Python's rule; the plain rendering `print` uses takes
+the larger of the two, as Rust does). No reader is called and no precision is climbed: the same arithmetic
 settles every value in one pass, so a subnormal like `5e-324`, the smallest positive `real`, needs no
 different treatment from `0.5` or `3.141592653589793` — it comes out of the same interval
 construction, at whatever length is actually shortest rather than a length a fixed search happened to
@@ -825,8 +846,9 @@ format's reader would take as an integer is that format's problem, which is why
 no decimal reading never compares equal to anything, so an infinity or a NaN falls out of both
 searches and renders as `%g` spells it at seventeen digits.
 
-**`str` is unchanged and stays at six.** This is the other rendering being available at all, not a
-new default: changing `str` would alter the output of every program that prints a number.
+**`str` writes the same digits positionally.** `display_real_shortest` is for a format whose grammar
+has an exponent and wants it used: `str(1e23)` is `100000000000000000000000`, where this writes
+`1e+23`.
 
 ### One padder, and why
 
