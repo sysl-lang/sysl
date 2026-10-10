@@ -1,0 +1,316 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.text.Search
+
+// A `@thread_local` or `@per_cpu` initializer that is the address of other module storage
+// (`reference/attributes.md § @thread_local`): the address of ordinary storage -- or of a field of
+// it, or of an element at a constant index -- is a relocation the linker fills in once, so it is a
+// value the per-thread image carries, exactly the set ordinary storage lays down as data. The address
+// of storage that is itself one copy per thread or per core is a different address on every copy,
+// and is refused saying so; and an initializer that was refused on its own is not refused a second
+// time for being computed.
+
+private tga_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A project holding `main.sysl`, and a manifest with `extra` after its `package` block.
+private tga_project(extra: string, main: string) -> string
+    val root = make_temp_dir("sysl-tga").unwrap()
+
+    write_text(s"$root/package.hocon", s"package {\n  name = \"probe\"\n}\n\n$extra").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    root
+end tga_project
+
+// `sysl <args>` as the command line answers it, every setting it left behind put back.
+private tga_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    use_codegen_features(no_codegen_features())
+    use_machine_registers(no_machine_registers())
+    (code, text)
+end tga_cli
+
+// `emit-llvm` of a program for the host.
+private tga_emit(main: string) -> (int, string)
+    val root = tga_project("", main)
+    var args: [3]string = ["sysl", "emit-llvm", root]
+    val got = tga_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end tga_emit
+
+// `emit-llvm` for aarch64-freestanding under the manifest text `extra`, `main` being module `k`'s
+// one file: an image's code is all declarations, with nothing that runs at the top.
+private tga_bare(extra: string, main: string) -> (int, string)
+    val root = tga_project(extra, "")
+
+    make_dir_all(s"$root/k").unwrap()
+    write_text(s"$root/k/k.sysl", s"module k\n\n$main").unwrap()
+
+    var args: [5]string = ["sysl", "emit-llvm", "--target", "aarch64-freestanding", root]
+    val got = tga_cli(args[..])
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end tga_bare
+
+// What a program built from `main` prints, or why it did not run to the end.
+private tga_ran(main: string) -> string
+    val root = tga_project("", main)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"it did not exit zero: ${out.text}"
+end tga_ran
+
+private tga_vm() -> string = "import sysl.posix.threads.*\n\nstruct Vm\n    id: int\n\n"
+
+// -- what is laid down ------------------------------------------------------------------------------
+
+@test("a thread-local starting at another global's address is that address in the image")
+tga_the_image_holds_the_address()
+    if !tga_ready() then return
+
+    val got = tga_emit(tga_vm() + "static var main_vm: Vm = Vm(1)\n\n" +
+                       "@thread_local\nstatic var current: *Vm = &main_vm\n\nprint(current.id)\n")
+
+    assert_eq(got.0, 0)
+    assert(got.1.contains("@current = private thread_local global ptr @main_vm"), got.1)
+
+@test("a field of it and an element at a constant index are addresses too, as ordinary storage's are")
+tga_a_field_and_an_element()
+    if !tga_ready() then return
+
+    val got = tga_emit("struct Pair\n    a: int\n    b: int\n\n" +
+                       "static var pair: Pair = Pair(1, 2)\nstatic var table: [4]int = [1, 2, 3, 4]\n\n" +
+                       "@thread_local\nstatic var second: *int = &pair.b\n\n" +
+                       "@thread_local\nstatic var third: *int = &table[2]\n\n" +
+                       "print(*second, *third)\n")
+
+    assert_eq(got.0, 0)
+    assert(got.1.contains("@second = private thread_local global ptr getelementptr"), got.1)
+    assert(got.1.contains("@third = private thread_local global ptr getelementptr"), got.1)
+
+@test("addresses inside an array the image carries are each a relocation")
+tga_an_array_of_addresses()
+    if !tga_ready() then return
+
+    val got = tga_emit("static var first: int = 1\nstatic var second: int = 2\n\n" +
+                       "@thread_local\nstatic var both: [2]*int = [&first, &second]\n\n" +
+                       "print(*both[0] + *both[1])\n")
+
+    assert_eq(got.0, 0)
+    assert(got.1.contains("@both = private thread_local global [2 x ptr] [ptr @first, ptr @second]"), got.1)
+
+// -- what it does -----------------------------------------------------------------------------------
+
+// The discriminating run: both threads start at main's storage, and a worker repointing its own copy
+// leaves main's where it was. A shared pointer would leave main reading the worker's `Vm`; one
+// starting at zero would leave the worker's first read a null.
+@test("main and a spawned thread both start at main's storage, and each repoints only its own copy")
+tga_each_thread_starts_at_main_storage()
+    if !tga_ready() then return
+
+    assert_eq(tga_ran(tga_vm() + "static var main_vm: Vm = Vm(1)\n\n" +
+                      "@thread_local\nstatic var current: *Vm = &main_vm\n\n" +
+                      "worker(seen: *int)\n    var mine = Vm(2)\n\n" +
+                      "    *seen = if current == &main_vm then current.id else -1\n" +
+                      "    current = &mine\n    *seen = *seen * 10 + current.id\n\n" +
+                      "var seen = 0\n\nspawn(&worker, &seen).unwrap().join()\n\n" +
+                      "print(seen, current == &main_vm, current.id)\n"),
+              "12 true 1\n")
+
+@test("a write through the pointer reaches main's storage from whichever thread made it")
+tga_a_write_through_reaches_main_storage()
+    if !tga_ready() then return
+
+    assert_eq(tga_ran(tga_vm() + "static var main_vm: Vm = Vm(1)\n\n" +
+                      "@thread_local\nstatic var current: *Vm = &main_vm\n\n" +
+                      "worker(unused: *int)\n    current.id = 7\n\n" +
+                      "spawn(&worker, null).unwrap().join()\n\nprint(main_vm.id)\n"),
+              "7\n")
+
+// -- what is refused --------------------------------------------------------------------------------
+
+@test("the address of another thread-local is refused, being a different one on every thread")
+tga_the_address_of_a_thread_local_is_refused()
+    if !tga_ready() then return
+
+    val got = tga_emit("@thread_local\nstatic var count: int = 0\n\n" +
+                       "@thread_local\nstatic var counter: *int = &count\n\nprint(*counter)\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("'counter' is '@thread_local', so its value has to be one the compiler can " +
+                          "write down, and the address of 'count' is not one: 'count' is " +
+                          "'@thread_local' too, so its address is a different one on every thread"), got.1)
+    assert(got.1.contains("The address of ordinary module storage is a value."), got.1)
+
+@test("and so is the address of a field of one, inside an array the initializer builds")
+tga_a_field_of_a_thread_local_inside_an_array()
+    if !tga_ready() then return
+
+    val got = tga_emit("struct Pair\n    a: int\n    b: int\n\n" +
+                       "@thread_local\nstatic var pair: Pair = Pair(1, 2)\n\n" +
+                       "@thread_local\nstatic var both: [1]*int = [&pair.b]\n\nprint(*both[0])\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("the address of 'pair' is not one: 'pair' is '@thread_local' too"), got.1)
+
+@test("a call is still refused, and its refusal now names the address among the values")
+tga_a_call_is_still_refused()
+    if !tga_ready() then return
+
+    val got = tga_emit("next() -> int = 42\n\n@thread_local\nstatic var n: int = next()\n\nprint(n)\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("A literal, 'null', a 'const', the address of other module storage and the " +
+                          "arrays and structs built from them are all values; a call is not."), got.1)
+
+@test("a pointer conversion of an address is code for ordinary storage, so it is code here too")
+tga_a_pointer_conversion_is_not_a_value()
+    if !tga_ready() then return
+
+    val got = tga_emit(tga_vm() + "static var main_vm: Vm = Vm(1)\n\n" +
+                       "@thread_local\nstatic var raw: *u8 = ptr_cast(&main_vm)\n\nprint(raw != null)\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("'raw' is '@thread_local', so its value has to be one the compiler can write down: every thread"), got.1)
+
+@test("an address of something with no name to reach is refused once, as the name it could not find")
+tga_an_undefined_name_is_refused_once()
+    if !tga_ready() then return
+
+    val got = tga_emit(tga_vm() + "var local_vm = Vm(1)\n\n" +
+                       "@thread_local\nstatic var current: *Vm = &local_vm\n\nprint(current != null)\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("undefined name 'local_vm'"), got.1)
+    assert(!got.1.contains("is '@thread_local', so its value"), got.1)
+
+// -- a bare machine -------------------------------------------------------------------------------
+
+@test("on a bare AArch64 machine the thread-local image carries the relocation too")
+tga_bare_thread_local()
+    if !tga_ready() then return
+
+    val got = tga_bare("codegen {\n  thread_pointer = \"tpidr_el1\"\n}\n",
+                       "struct Vm\n    id: u64\n\nvar main_vm: Vm = Vm(1)\n\n" +
+                       "@thread_local\nvar current: *Vm = &main_vm\n\n" +
+                       "@export(\"current_id\")\ncurrent_id() -> u64 = current.id\n")
+
+    assert_eq(got.0, 0)
+    assert(got.1.contains("thread_local global ptr @k$main_vm"), got.1)
+
+@test("and a per-core image does, in .percpu, while the address of another per-core copy is refused")
+tga_bare_per_cpu()
+    if !tga_ready() then return
+
+    val offset = "codegen {\n  per_cpu_offset = \"tpidr_el1\"\n}\n"
+    val good = tga_bare(offset, "var table: [4]u64\n\n@per_cpu\nvar mine: *u64 = &table[1]\n\n" +
+                                "@pinned\n@export(\"peek\")\npeek() -> u64 = *mine\n")
+
+    assert_eq(good.0, 0)
+    assert(good.1.contains("@k$mine = private global ptr getelementptr inbounds (i64, ptr @k$table, " +
+                           "i64 1), section \".percpu\""), good.1)
+
+    val bad = tga_bare(offset, "@per_cpu\nvar ticks: u64 = 0\n\n@per_cpu\nvar mine: *u64 = &ticks\n\n" +
+                               "@pinned\n@export(\"peek\")\npeek() -> u64 = *mine\n")
+
+    assert_eq(bad.0, 1)
+    assert(bad.1.contains("'k.mine' is '@per_cpu', so its value has to be one the compiler can write " +
+                          "down, and the address of 'k.ticks' is not one: 'k.ticks' is '@per_cpu' " +
+                          "too, so its address is a different one on every core"), bad.1)
+
+private tga_objdump() -> Option[string]
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end tga_objdump
+
+// The relocations of the archive `build-c` writes for module `k` under `extra`.
+private tga_relocations(objdump: string, extra: string, main: string) -> string
+    val root = tga_project(extra, "")
+
+    make_dir_all(s"$root/k").unwrap()
+    write_text(s"$root/k/k.sysl", s"module k\n\n$main").unwrap()
+
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root]
+    val built = tga_cli(args[..])
+
+    assert_eq(built.0, 0)
+
+    var out = ""
+
+    capture(objdump, ["-r", archive]) match
+        Err(_) -> assert(false, "llvm-objdump did not run")
+        Ok(dis) -> out = dis.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tga_relocations
+
+// What the linker is handed: the per-thread and per-core images each carry an absolute relocation
+// against the storage the address names, so whatever copies an image for a thread or a core copies an
+// address the linker has already filled in.
+@test("in the archive each image carries an absolute relocation against the storage it points at")
+tga_archive_relocations()
+    if !tga_ready() then return
+
+    val objdump = tga_objdump() match
+        Some(p) -> p
+        None ->
+            print("skipped: there is no llvm-objdump on this machine")
+            return
+
+    val manifest = "codegen {\n  per_cpu_offset = \"tpidr_el1\"\n  thread_pointer = \"tpidr_el0\"\n}\n"
+    val out = tga_relocations(objdump, manifest,
+                              "struct Vm\n    id: u64\n\nvar main_vm: Vm = Vm(1)\nvar table: [4]u64\n\n" +
+                              "@thread_local\nvar current: *Vm = &main_vm\n\n" +
+                              "@per_cpu\nvar mine: *u64 = &table[1]\n\n" +
+                              "@export(\"switch_to\")\nswitch_to(v: *Vm)\n    current = v\n\n" +
+                              "@export(\"current_id\")\ncurrent_id() -> u64 = current.id\n\n" +
+                              "@pinned\n@export(\"peek\")\npeek() -> u64 = *mine\n")
+
+    assert(tga_section(out, "[.tdata").contains("R_AARCH64_ABS64") &&
+           tga_section(out, "[.tdata").contains("main_vm"), out)
+    assert(tga_section(out, "[.percpu]").contains("R_AARCH64_ABS64          .bss..Lk$table+0x8"), out)
+
+// The relocation records `llvm-objdump -r` printed for the first section whose header holds `head`,
+// up to the blank line that ends them.
+private tga_section(out: string, head: string) -> string
+    val at = out.index_of(s"RELOCATION RECORDS FOR $head")
+
+    if at.is_none() then return ""
+
+    val rest = out[at.unwrap()..]
+    val end_at = rest.index_of("\n\n")
+
+    if end_at.is_none() then rest else rest[0..<end_at.unwrap()]
+end tga_section
