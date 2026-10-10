@@ -1936,6 +1936,45 @@ print(printf(null, i256(1)))
 cannot be passed to '...' — C passes an integer wider than 128 bits by address
 ```
 
+**A [`c type`](#c-type-a-width-only-the-c-compiler-can-work-out) is read as what C measured it
+as**, the same way it is passed. `long` is four bytes on a 32-bit Arm machine and eight on an LP64
+one, so `va_arg` into a `Long` reads whichever the target says, which is what a `printf` taking `%ld`,
+`%lu` or `%zu` needs:
+
+```sysl
+@include("<stddef.h>")
+
+c type
+    Long = "long"
+    Size = "size_t"
+
+pair(n: int, ...) -> string
+    var ap: va_list
+
+    va_start(ap)
+
+    val a: Long = va_arg(ap)
+    val b: Size = va_arg(ap)
+
+    va_end(ap)
+    s"$a $b"
+end pair
+
+val a: Long = -5
+val b: Size = 42
+
+print(pair(2, a, b))
+```
+
+```output
+-5 42
+```
+
+Any other name for a type that checks nothing — `new int`, say — is read as its base too. A measured
+type whose base would be refused is refused under its own name (a `short` is promoted, a `float`
+becomes a `double`), and so is a subtype with a range or a predicate, since C hands back a bare value
+the check would never see.
+
 **`va_arg` reads its type from context, or from the brackets.** C writes the type as a second
 argument, which is not a thing a sysl expression can hold; here it comes from the place the value is
 read into — `var v: int = va_arg(ap)`, `total += va_arg(ap)`, `take(va_arg(ap))` — the same place

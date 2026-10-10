@@ -626,36 +626,57 @@ end va_list_arg
 
 // What a variadic argument may be read as. C promotes every one of them, so the narrow types are
 // refused with the type to read instead rather than being read at a width the caller never sent.
+//
+// A subtype that checks nothing -- a measured `c type` above all -- is read as its base is, at the
+// width the base has on the target being built for, which is the rule the passing side follows
+// (`expr_call.sysl`'s `tail_peeled`): `long` is read as four bytes on a 32-bit Arm machine and eight
+// on an LP64 one. A subtype with a range or a predicate is refused, since C hands back a bare value
+// its check would never see. What is refused is quoted as the program wrote it.
 private va_arg_type(cx: &Analyzer, span: Span, ty: Type) -> Type
+    va_readable(cx, span, ty, ty)
+    ty
+end va_arg_type
+
+private va_readable(cx: &Analyzer, span: Span, ty: Type, written: Type)
     ty match
+        Constrained(d) ->
+            if constraint_free(d)
+                va_readable(cx, span, d.base, written)
+                return
+
+            cx.fault(span, s"a variadic argument cannot be read as ${type_show(written)} — it checks " +
+                     s"its values, and C hands back a bare ${type_show(underlying(d.base))} that " +
+                     "check would never see; read it as that and convert")
         Integer(bits, signed, _) ->
-            if (bits >= 32 && bits <= 64) || bits == 128 then return ty
+            if (bits >= 32 && bits <= 64) || bits == 128 then return
 
             if bits < 32
                 cx.fault(span, s"a variadic argument is promoted to at least 32 bits, so it cannot be " +
-                         s"read as ${type_show(ty)} — read it as " +
+                         s"read as ${va_shown(ty, written)} — read it as " +
                          s"${if signed then "'int'" else "'uint'"} and convert")
             else if bits < 128
                 cx.fault(span, s"a variadic argument wider than 64 bits is promoted to 128, so it cannot " +
-                         s"be read as ${type_show(ty)} — read it as " +
+                         s"be read as ${va_shown(ty, written)} — read it as " +
                          s"${if signed then "'i128'" else "'u128'"} and convert")
             else
                 cx.fault(span, s"a variadic argument is at most 128 bits wide, so it cannot be read as " +
-                         s"${type_show(ty)} — C passes a wider integer by address")
-            ty
+                         s"${va_shown(ty, written)} — C passes a wider integer by address")
         Floating(bits, _) ->
             // A binary128 value is not promoted -- C passes a `long double` and a `__float128` as
             // itself -- so it is read at its own width, by the walk `emit_va_arg.sysl` writes for it.
-            if bits == 64 || bits == 128 then return ty
+            if bits == 64 || bits == 128 then return
 
             cx.fault(span, s"a variadic argument is promoted to double, so it cannot be read as " +
-                     s"${type_show(ty)} — read it as 'real' and convert")
-            ty
-        Char -> ty
-        Ptr(_) -> ty
-        CFn(_, _) -> ty
+                     s"${va_shown(ty, written)} — read it as 'real' and convert")
+        Char -> return
+        Ptr(_) -> return
+        CFn(_, _) -> return
         other ->
-            cx.fault(span, s"a variadic argument cannot be read as ${type_show(other)} — it may " +
-                     "be an integer, a real, a char, a raw pointer, or the address of a function")
-            ty
-end va_arg_type
+            cx.fault(span, s"a variadic argument cannot be read as ${va_shown(other, written)} — it " +
+                     "may be an integer, a real, a char, a raw pointer, or the address of a function, " +
+                     "or a type that is one of those under another name, such as a 'c type'")
+end va_readable
+
+// The type a refusal quotes: as written, with what it turned out to be beside it where the two differ.
+private va_shown(ty: Type, written: Type) -> string =
+    if ty == written then type_show(ty) else s"${type_show(written)} (${type_show(ty)} here)"
