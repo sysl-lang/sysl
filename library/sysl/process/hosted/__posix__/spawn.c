@@ -134,15 +134,56 @@ static int handed_terminal(int tty, pid_t pgid) {
     return r;
 }
 
+/* The signals a job-control shell takes for itself and gives back to every job it starts: the
+ * terminal's three keys (`SIGINT`, `SIGQUIT`, `SIGTSTP`), the two a background read or write earns
+ * (`SIGTTIN`, `SIGTTOU`), and `SIGCHLD`, which a shell often handles and a job should not inherit
+ * an opinion about. A disposition of "ignored" survives `exec`, so without this a shell that ignores
+ * Ctrl-C for itself starts jobs Ctrl-C cannot stop. */
+static const int job_signals[] = { SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU, SIGCHLD };
+
+#define SYSL_PROC_JOB_SIGNALS ((int) (sizeof job_signals / sizeof job_signals[0]))
+
+/* The set `job_signals` names, for `posix_spawnattr_setsigdefault`. */
+static void job_signal_set(sigset_t *set) {
+    sigemptyset(set);
+
+    for (int i = 0; i < SYSL_PROC_JOB_SIGNALS; i++) sigaddset(set, job_signals[i]);
+}
+
+/* Every job signal at its default disposition and the signal mask emptied, in a forked child before
+ * it becomes the program -- the `fork` path's half of what `POSIX_SPAWN_SETSIGDEF` and
+ * `POSIX_SPAWN_SETSIGMASK` do on the other. Only async-signal-safe calls. Answers 0 or an `errno`. */
+static int job_signals_reset(void) {
+    struct sigaction dfl;
+
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+
+    for (int i = 0; i < SYSL_PROC_JOB_SIGNALS; i++) {
+        if (sigaction(job_signals[i], &dfl, NULL) != 0) return errno;
+    }
+
+    sigset_t none;
+
+    sigemptyset(&none);
+    return sigprocmask(SIG_SETMASK, &none, NULL) == 0 ? 0 : errno;
+}
+
 /* The child put in its process group and, where `tty` is a terminal's descriptor rather than -1, that
  * group made the terminal's foreground -- both before anything else the child does, so the program it
  * becomes runs from its first instruction where a shell's job control expects it. `pgid` is -1 to stay
- * in the parent's group, 0 for a group of its own, or the group to join. Answers 0 or an `errno`. */
+ * in the parent's group, 0 for a group of its own, or the group to join. A child started in a group
+ * is a job, so it is also handed the job signals at their defaults and an empty mask, after the
+ * terminal is (the hand-over holds `SIGTTOU` back, which only an ignored or blocked one allows).
+ * Answers 0 or an `errno`. */
 static int child_group(int pgid, int tty) {
     if (pgid < 0) return 0;
     if (setpgid(0, pgid) != 0) return errno;
 
-    return tty < 0 ? 0 : handed_terminal(tty, getpgrp());
+    int e = tty < 0 ? 0 : handed_terminal(tty, getpgrp());
+
+    return e != 0 ? e : job_signals_reset();
 }
 
 /* Everything the child does before it becomes the other program, as one function so that the
@@ -580,7 +621,8 @@ static int start_forked(const char *program, char *const *argv,
  * the named variables added or replaced (or, not inheriting, the named variables alone), then the
  * directory, then each stream placed onto its descriptor. A program that cannot be run is the `errno`
  * `posix_spawnp` answers, so there is nothing to reap. A process group is `POSIX_SPAWN_SETPGROUP`,
- * set in the child before it runs, exactly as `child_group` sets it; a group that is also to have the
+ * set in the child before it runs, exactly as `child_group` sets it, with the job signals reset by
+ * `POSIX_SPAWN_SETSIGDEF` and the mask cleared by `POSIX_SPAWN_SETSIGMASK`; a group that is also to have the
  * terminal takes the `fork` path instead, `posix_spawn` having no portable way to hand one over.
  */
 static int start_spawned(const char *program, char *const *argv,
@@ -641,10 +683,22 @@ static int start_spawned(const char *program, char *const *argv,
 
         if (e == 0) {
             attrs = &attr;
-            e = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+            e = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF |
+                                                POSIX_SPAWN_SETSIGMASK);
         }
 
         if (e == 0) e = posix_spawnattr_setpgroup(&attr, pgid);
+
+        /* A job: the job signals at their defaults and nothing blocked, as `child_group` does on the
+         * `fork` path. */
+        sigset_t defaults;
+        sigset_t none;
+
+        job_signal_set(&defaults);
+        sigemptyset(&none);
+
+        if (e == 0) e = posix_spawnattr_setsigdefault(&attr, &defaults);
+        if (e == 0) e = posix_spawnattr_setsigmask(&attr, &none);
     }
 
     pid_t pid = 0;

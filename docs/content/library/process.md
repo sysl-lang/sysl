@@ -674,9 +674,30 @@ print(run("true", group = Group.Join(0)).unwrap_err().code())
 22
 ```
 
-A group that does not exist, or that belongs to another session, is `NotPermitted`. **What the child
-does with its signals is its own**: a shell that ignores `SIGINT` for itself has to see that its jobs do
-not inherit that, since an ignored signal stays ignored across the start of a program.
+A group that does not exist, or that belongs to another session, is `NotPermitted`.
+
+**A child started in a group is a job, and a job starts with the job-control signals at their
+defaults.** A shell ignores `SIGINT`, `SIGQUIT`, `SIGTSTP`, `SIGTTIN` and `SIGTTOU` for itself, so that
+Ctrl-C and Ctrl-Z reach the job rather than the shell — and an ignored signal stays ignored across the
+start of a program. So with `New` or `Join(…)` the child begins its program with those five and
+`SIGCHLD` at their default dispositions and nothing blocked, as a job-control shell's own children do.
+`Inherit` changes nothing: a child that is not a job keeps whatever this program gave it.
+
+```sysl
+import sysl.process.{Group, Status, capture, run}
+import sysl.signal.{INT, ignore}
+import sysl.text.Search
+
+ignore(INT).unwrap()
+
+print(run("sh", ["-c", "kill -INT $$"], group = Group.New).unwrap() == Status.Signalled(INT))
+print(capture("sh", ["-c", "kill -INT $$; echo survived"]).unwrap().text.trim())
+```
+
+```output
+true
+survived
+```
 
 ## On a target with no C library
 
