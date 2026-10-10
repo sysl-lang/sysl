@@ -1,10 +1,10 @@
 module sysl.process.sys
 
 // The calls `sysl.process` makes of whatever starts programs underneath it: start one, wait for it,
-// send it a signal, become one in place of this program, name a file nothing else holds for a captured
-// stream to go into, make a pipe for one child's output to be another's input, say -- or change --
-// which user and group the program runs as, and say which process group it is in and which group its
-// terminal is giving its keys to.
+// ask whether it has ended without waiting, send it a signal, become one in place of this program, name
+// a file nothing else holds for a captured stream to go into, make a pipe for one child's output to be
+// another's input, say -- or change -- which user and group the program runs as, say -- or change --
+// which process group and session it is in, and which group its terminal is giving its keys to.
 //
 // **Each is an `extern` naming a symbol no module here defines**, so what answers it is decided by
 // what the program is linked with (`reference/ffi.md § A module may supply another module's extern`),
@@ -22,8 +22,8 @@ module sysl.process.sys
 //
 // **A hook answers one integer: what it did, or what went wrong** -- the contract of every `*.sys`
 // module (`sysl.fs.sys`, `sysl.io.sys`).
-// Zero or more is success: a process id for `spawn`, a length for `temp_path`, a user or group id for
-// `get_id`, zero for the others -- except `exec`, whose success is never seen, the program that would
+// Zero or more is success: a process id for `spawn` and `setsid`, a length for `temp_path`, a user or
+// group id for `get_id`, one or zero for `poll`, zero for the others -- except `exec`, whose success is never seen, the program that would
 // have read it being gone.
 // A negative answer is the code of the failure negated -- the `IoError` code `sysl.fs` uses, which on
 // a POSIX host is the `errno` -- so a kernel's system call that already answers a negative error
@@ -115,6 +115,14 @@ const group_new: i64 = 0
 private[sysl] extern "sysl_proc_wait" wait(pid: i64, started: i64, timeout_ms: i64, how: *int,
                                            value: *int) -> int
 
+/** Asks whether the child `pid` has ended, **without waiting for it**: zero while it is still running,
+ * and one once it has ended -- reaped, with how it ended written into `how` and `value` as `wait`
+ * writes them (`ended_exited` or `ended_signalled`; never `ended_timed_out`, nothing here having a
+ * deadline) -- or the failure's code, negated. It is POSIX's `waitpid(pid, WNOHANG)`. A supplier that
+ * cannot ask without blocking answers `UNSUPPORTED`, and does not block.
+ */
+private[sysl] extern "sysl_proc_poll" poll(pid: i64, how: *int, value: *int) -> int
+
 /** Sends the child `pid` the signal numbered `signal` -- POSIX's numbers: 15 asks it to stop and 9
  * makes it -- answering zero or the failure's code, negated.
  */
@@ -195,3 +203,17 @@ private[sysl] extern "sysl_proc_tcgetpgrp" tcgetpgrp() -> i64
  * terminal back after a job.
  */
 private[sysl] extern "sysl_proc_tcsetpgrp" tcsetpgrp(pgid: i64) -> int
+
+/** This program moved into process group `pgid`, or -- with zero -- made the leader of a new group
+ * numbered by its own process id, answering zero or the failure's code negated. It is POSIX's
+ * `setpgid(0, pgid)`: a group in another session, and a program that leads a session, are `-1`,
+ * `EPERM`. A target with no process groups answers `UNSUPPORTED`.
+ */
+private[sysl] extern "sysl_proc_setpgid" setpgid(pgid: i64) -> int
+
+/** This program made the leader of a new session, and of a new process group in it, with no
+ * controlling terminal, answering the new session's id -- which is the program's process id, and the
+ * new group's number -- or the failure's code negated. It is POSIX's `setsid`: a program that already
+ * leads a process group is `-1`, `EPERM`. A target with no sessions answers `UNSUPPORTED`.
+ */
+private[sysl] extern "sysl_proc_setsid" setsid() -> i64

@@ -86,6 +86,29 @@ proc_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> in
     0
 end proc_wait
 
+private extern "sysl_proc_posix_poll" c_poll(pid: i32, ended: *i32, code: *i32, sig: *i32) -> int
+
+@export("sysl_proc_poll")
+proc_poll(pid: i64, how: *int, value: *int) -> int
+    var ended: i32 = 0
+    var code: i32 = 0
+    var sig: i32 = 0
+    val e = c_poll(i32(pid), &ended, &code, &sig)
+
+    if e != 0 then return host_status(e)
+    if ended == 0 then return 0
+
+    if sig != 0
+        how[0] = ended_signalled
+        value[0] = int(sig)
+    else
+        how[0] = ended_exited
+        value[0] = int(code)
+    end if
+
+    1
+end proc_poll
+
 @export("sysl_proc_kill")
 proc_kill(pid: i64, signal: int) -> int
     if c_kill(i32(pid), signal) == 0 then return 0
@@ -177,4 +200,18 @@ proc_tcsetpgrp(pgid: i64) -> int
     val e = c_tcsetpgrp(i32(pgid))
 
     if e != 0 then host_status(e) else 0
+
+// Both are plain calls on every C library this builds for, and `pid_t` is 32 bits on each.
+private extern "setpgid" c_setpgid(pid: i32, pgid: i32) -> int
+private extern "setsid" c_setsid() -> i32
+
+@export("sysl_proc_setpgid")
+proc_setpgid(pgid: i64) -> int
+    if c_setpgid(0, i32(pgid)) == 0 then 0 else host_status(errno_location()[0])
+
+@export("sysl_proc_setsid")
+proc_setsid() -> i64
+    val sid = c_setsid()
+
+    if sid >= 0 then i64(sid) else i64(host_status(errno_location()[0]))
 #endif

@@ -1,0 +1,49 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **A method that exists at no level is missing, whatever the receiver is reached through.**
+//
+// A call reaches through one level of indirection, as selection does, and a receiver with more than
+// that is told to write the rest out (`member_call.sysl`'s `no_such_method`). That advice is only
+// worth giving where writing the rest out would find something: a method the type at the bottom does
+// not have either is reported as missing, in the ordinary words, of that type.
+
+private mnx_only(text: string) -> string
+    val said = trait_diagnostics(text)
+
+    if said.is_empty() then "" else said.at(0)
+end mnx_only
+
+private mnx_point() -> string = "struct P\n    x: int\n\n    area(self) -> int = 1\n"
+
+@test("a method missing behind a '&T' is told missing, not to be reached through another level")
+mnx_missing_behind_a_counted_reference()
+    assert_eq(mnx_only(mnx_point() + "\nf(p: &P) -> int = p.nope()\n"), "type 'P' has no method 'nope'")
+
+@test("a method missing behind a '*T' is told missing too")
+mnx_missing_behind_a_pointer()
+    assert_eq(mnx_only(mnx_point() + "\nf(p: *P) -> int = p.nope()\n"), "type 'P' has no method 'nope'")
+
+@test("a method missing behind two levels is told missing, of the type at the bottom")
+mnx_missing_behind_two_levels()
+    assert_eq(mnx_only(mnx_point() + "\nf(p: **P) -> int = p.nope()\n"), "type 'P' has no method 'nope'")
+    assert_eq(mnx_only(mnx_point() + "\nf(p: *&P) -> int = p.nope()\n"), "type 'P' has no method 'nope'")
+
+@test("a method the bottom type has, behind two levels, is still told to write the rest out")
+mnx_present_behind_two_levels()
+    assert_eq(mnx_only(mnx_point() + "\nf(p: **P) -> int = p.area()\n"),
+              "a method call reaches through one level of indirection and **P has more, so the " +
+              "rest is written: '(*x).area(…)' calls 'area' on the *P it leaves")
+
+@test("and three levels with the method at the bottom says so too, rather than calling it missing")
+mnx_present_behind_three_levels()
+    assert(mnx_only(mnx_point() + "\nf(p: ***P) -> int = p.area()\n").starts_with(
+           "a method call reaches through one level of indirection and ***P has more"), "missing")
+
+@test("a method behind one level is reached, so the program has nothing to say")
+mnx_present_behind_one_level()
+    assert_eq(mnx_only(mnx_point() + "\nf(p: &P) -> int = p.area()\n"), "")
+    assert_eq(mnx_only(mnx_point() + "\nf(p: *P) -> int = p.area()\n"), "")

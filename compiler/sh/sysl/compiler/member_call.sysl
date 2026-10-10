@@ -1723,13 +1723,19 @@ private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, ba
 
     if through_field.is_some() then return through_field.unwrap()
 
-    // A call reaches through one level of indirection and only one, exactly as selection does. A
-    // receiver still carrying a mode after that has more than the shorthand walks, and the complaint
-    // below would name what is *left* -- a type the reader never wrote.
-    texpr_type(receiver) match
-        Ptr(_) -> return indirection_message(cx, span, receiver, rty, name)
-        Ref(_, _) -> return indirection_message(cx, span, receiver, rty, name)
-        _ -> ()
+    // A call reaches through one level of indirection and only one, exactly as selection does. What
+    // that level leaves is `rty`, so a `rty` still carrying a mode had more than the shorthand walks
+    // -- and where the type under it has the method, the reader is told to write the rest out. Where
+    // it has none either, the method is simply missing, and that is said of the type at the bottom,
+    // the one the reader meant: no dereference written would find it.
+    val bottom = innermost(rty)
+
+    if bottom != rty
+        if has_method_named(cx, bottom, name) then
+            return indirection_message(cx, span, receiver, rty, name)
+
+        return cx.err(span, s"type '${member_key(cx.an, bottom, name).0}' has no method '$name'")
+    end if
 
     // A member the compiler provides, written with parentheses it does not take.
     if builtin_member(rty, name) then
@@ -1738,6 +1744,18 @@ private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, ba
 
     cx.err(span, s"type '$base' has no method '$name'")
 end no_such_method
+
+// Whether `t` itself has a method of `name` a call could reach, declared or one the compiler provides.
+private has_method_named(cx: &Analyzer, t: Type, name: string) -> bool
+    val key = member_key(cx.an, t, name).0
+
+    has_member_at(cx.an, key, name) || cx.an.tables.members.alts.has(member_key_of(key, name))
+
+// The type under every level of indirection.
+private innermost(t: Type) -> Type
+    val under = receiver_type(t)
+
+    if under == t then t else innermost(under)
 
 private indirection_message(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type,
                             name: string) -> TExpr =

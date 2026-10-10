@@ -246,6 +246,20 @@ static int reaped(pid_t pid, int *status, int *err) {
     }
 }
 
+/* A wait status read as an exit code or a signal's number, the other being zero. */
+static void decoded(int status, int *code, int *sig) {
+    if (WIFEXITED(status)) {
+        *code = WEXITSTATUS(status);
+        *sig = 0;
+    } else if (WIFSIGNALED(status)) {
+        *code = 0;
+        *sig = WTERMSIG(status);
+    } else {
+        *code = 0;
+        *sig = 0;
+    }
+}
+
 /* Wait for the child for as long as it takes. Answers 0, or an `errno`. */
 static int wait_out(pid_t pid, int *status) {
     while (waitpid(pid, status, 0) < 0) {
@@ -920,15 +934,29 @@ int sysl_proc_posix_wait(int pid, long long started_ms, long long timeout_ms,
         }
     }
 
-    if (WIFEXITED(status)) {
-        *code = WEXITSTATUS(status);
-        *sig = 0;
-    } else if (WIFSIGNALED(status)) {
+    decoded(status, code, sig);
+
+    return 0;
+}
+
+/* Whether the child `pid` has ended, without waiting for it: `*ended` is 1 once it has -- reaped, how
+ * it ended decoded into `*code` and `*sig` as the wait above decodes it -- and 0 while it still runs.
+ * Answers zero or an `errno`.
+ */
+int sysl_proc_posix_poll(int pid, int *ended, int *code, int *sig) {
+    int status = 0;
+    int err = 0;
+    int r = reaped(pid, &status, &err);
+
+    if (r < 0) return err;
+
+    *ended = r;
+
+    if (r == 0) {
         *code = 0;
-        *sig = WTERMSIG(status);
+        *sig = 0;
     } else {
-        *code = 0;
-        *sig = 0;
+        decoded(status, code, sig);
     }
 
     return 0;
