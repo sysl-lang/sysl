@@ -188,6 +188,9 @@ nobody outside may name is not one whose variants they may construct.
 **A name a file may not reach is not a candidate for it.** Resolution passes over one and goes on
 through the file's imports rather than stopping there — a file that wrote `import util.width` said
 which `width` it meant, and a sibling file's private helper of that name is not an answer to it.
+That holds whatever kind of declaration each one is: `import n.LIMIT` naming a variant of an enum
+in `n` is what `LIMIT` means in that file, beside a sibling's `private const LIMIT`, while a sibling's
+*public* `LIMIT` is the module's own name and still answers first.
 Where nothing else answers at all, the restriction is then reported, because at that point it is the
 whole story and a better one than an undefined name.
 

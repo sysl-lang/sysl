@@ -593,6 +593,74 @@ rlb_a_private_struct_does_not_shadow_a_variant()
                                              "    Square(x) -> x * x\n")]),
               "7 25\n")
 
+// -- an imported variant beside a sibling's private name -------------------------------------------
+
+// A name a file may not reach is no candidate for it, and an import by name is what the file said it
+// meant -- whichever kind of declaration the import names. An enum variant is in no storage table, so
+// the sibling's private constant was found first and the import refused for it.
+private vip_errno() -> (string, string) =
+    ("n/n.sysl", "module n\nenum Errno: i64\n    EPERM = 1\n    LIMIT = 7\n")
+
+private vip_reader() -> (string, string) =
+    ("m/b.sysl", "module m\nimport n.LIMIT\nsecond() -> int = int(i64(LIMIT))\n")
+
+@test("an imported variant is not refused for a sibling file's private constant of its name")
+vip_an_imported_variant_beside_a_private_constant()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.first(), m.second())\n"), vip_errno(),
+                       ("m/a.sysl", "module m\nprivate const LIMIT: int = 2\nfirst() -> int = LIMIT\n"),
+                       vip_reader()]),
+              "2 7\n")
+
+@test("nor for a sibling file's private module 'val'")
+vip_an_imported_variant_beside_a_private_val()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.first(), m.second())\n"), vip_errno(),
+                       ("m/a.sysl", "module m\nprivate val LIMIT: int = 2\nfirst() -> int = LIMIT\n"),
+                       vip_reader()]),
+              "2 7\n")
+
+@test("nor for a sibling file's private function")
+vip_an_imported_variant_beside_a_private_function()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.first(), m.second())\n"), vip_errno(),
+                       ("m/a.sysl", "module m\nprivate LIMIT() -> int = 2\nfirst() -> int = LIMIT()\n"),
+                       vip_reader()]),
+              "2 7\n")
+
+@test("nor for a sibling file's private struct")
+vip_an_imported_variant_beside_a_private_struct()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.first(), m.second())\n"), vip_errno(),
+                       ("m/a.sysl", "module m\nprivate struct LIMIT\n    x: int\nfirst() -> int = LIMIT(2).x\n"),
+                       vip_reader()]),
+              "2 7\n")
+
+// The module's own PUBLIC declaration is a candidate in every file of it, and a program's own name
+// answers before an import's whichever kind each is (`reference/modules.md § Resolution`).
+@test("a sibling file's public constant still answers before the imported variant")
+vip_a_public_constant_beats_the_imported_variant()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.first(), m.second())\n"), vip_errno(),
+                       ("m/a.sysl", "module m\nconst LIMIT: int = 2\nfirst() -> int = LIMIT\n"),
+                       vip_reader()]),
+              "2 2\n")
+
+// With nothing imported the sibling's private name is the whole story, and is still reported.
+@test("without the import the sibling's private constant is still refused as private")
+vip_without_the_import_the_private_constant_is_refused()
+    if rlb_no_library() then return
+
+    val out = rlb_err([("m/a.sysl", "module m\nprivate const LIMIT: int = 2\nfirst() -> int = LIMIT\n"),
+                       ("m/b.sysl", "module m\nsecond() -> int = LIMIT\n")])
+
+    assert(out.contains("'m.LIMIT' is private to 'm/a.sysl', the file that declares it"), out)
+
 // How many times a report says something.
 private rlb_times(text: string, needle: string) -> usize
     var seen: usize = 0
