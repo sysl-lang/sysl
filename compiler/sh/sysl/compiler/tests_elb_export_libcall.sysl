@@ -1,0 +1,247 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.text.{join, split, Search}
+
+// **A compilation that defines a C runtime name is compiled as C's `-fno-builtin` compiles a
+// translation unit, on a hosted target too** (`toolchain.sysl`'s `defines_libcall` and
+// `function_attributes`).
+//
+// LLVM's loop idioms turn a byte loop into a call to `memset`, `strlen` or `bzero`, and the guard that
+// stops a function becoming a call to itself compares the function's LLVM name -- `$c_strlen` -- never
+// the symbol an `@export` publishes. So on aarch64-macos `@export("strlen")` compiled to a bare `ret`
+// and `@export("memset")` to `b _memset`, a call to itself, with no diagnostic. The disassembly is
+// asserted first and a C program linked against the archive second, so a regression fails rather than
+// hanging in the recursion.
+
+private elb_ready() -> bool = std_root().is_ok() && clang_available()
+
+private elb_has(xs: Buf[string], want: string) -> bool
+    for item in xs
+        if item == want then return true
+
+    false
+end elb_has
+
+private elb_project(main: string) -> string
+    val root = make_temp_dir("sysl-elb").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    root
+end elb_project
+
+private elb_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+
+    reset_search_paths()
+    (code, join(said.view(), "\n"))
+end elb_cli
+
+private elb_objdump() -> Option[string]
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end elb_objdump
+
+// The cstd finding's three routines: a length, a fill and a copy whose tail is a zero fill.
+private val elb_runtime: string =
+    "@export(\"strlen\")\nc_strlen(s: *u8) -> usize\n    var n: usize = 0\n    while s[n] != 0 do n += 1\n    n\n\n" +
+    "@export(\"memset\")\nc_memset(dst: *u8, c: i32, n: usize) -> *u8\n" +
+    "    for i in 0..<n do dst[i] = u8(c)\n    dst\n\n" +
+    "@export(\"strncpy\")\nc_strncpy(dst: *u8, src: *u8, n: usize) -> *u8\n    var i: usize = 0\n" +
+    "    while i < n && src[i] != 0\n        dst[i] = src[i]\n        i += 1\n" +
+    "    while i < n\n        dst[i] = 0\n        i += 1\n    dst\n"
+
+// The same fill under a name C's runtime does not own.
+private val elb_ordinary: string =
+    "@export(\"fill_bytes\")\nfill_bytes(dst: *u8, c: i32, n: usize) -> *u8\n" +
+    "    for i in 0..<n do dst[i] = u8(c)\n    dst\n"
+
+private val elb_driver: string =
+    "#include <stddef.h>\n" +
+    "size_t strlen(const char *);\nvoid *memset(void *, int, size_t);\n" +
+    "char *strncpy(char *, const char *, size_t);\n\n" +
+    "int main(void) {\n    char b[16];\n" +
+    "    if (strlen(\"hello\") != 5) return 1;\n" +
+    "    if (memset(b, 'x', sizeof b) != b || b[0] != 'x' || b[15] != 'x') return 2;\n" +
+    "    strncpy(b, \"ab\", sizeof b);\n" +
+    "    if (b[0] != 'a' || b[1] != 'b' || b[2] != 0 || b[15] != 0) return 3;\n" +
+    "    return 0;\n}\n"
+
+// The host archive built from `main` in `root`, and its disassembly, relocations included.
+private elb_disassembled(objdump: string, root: string) -> (string, string)
+    val archive = s"$root/probe.a"
+    val built = elb_cli(["sysl", "build-c", "-o", archive, root])
+
+    assert_eq(built.0, 0, built.1)
+
+    capture(objdump, ["-d", "-r", "--no-show-raw-insn", "--no-leading-addr", archive]) match
+        Err(_) ->
+            assert(false, "llvm-objdump did not run")
+            (archive, "")
+        Ok(dis) -> (archive, dis.text)
+end elb_disassembled
+
+// The lines of the body labelled exactly `symbol` (Mach-O's leading underscore included).
+private elb_body(dis: string, symbol: string) -> string
+    val lines = split(dis, "\n")
+    var out: Buf[string] = buf()
+    var inside = false
+
+    for i in 0..<lines.len
+        val line = lines[i]
+
+        if line.ends_with(s"<$symbol>:") then inside = true
+        elif inside && line.trim() == "" then inside = false
+        elif inside then out.push(line)
+
+    join(out.view(), "\n")
+end elb_body
+
+// Whether a body reaches any of `names` through a relocation -- the whole symbol, so `_c_strlen` is
+// not `_strlen`.
+private elb_calls(body: string, names: []const string) -> bool
+    val lines = split(body, "\n")
+
+    for i in 0..<lines.len
+        val line = lines[i].trim()
+
+        for k in 0..<names.len
+            if line.contains("RELOC") && (line.ends_with(s"\t${names[k]}") || line.ends_with(s" ${names[k]}"))
+                return true
+
+    false
+end elb_calls
+
+private elb_dump(dis: string, symbol: string) -> string
+    val all = split(dis, "\n")
+    var out: Buf[string] = buf()
+
+    for i in 0..<all.len
+        if all[i].contains(symbol) then out.push(all[i])
+
+    join(out.view(), "\n")
+end elb_dump
+
+// -- the rule -------------------------------------------------------------------------------------
+
+@test("the C runtime names are recognised, a math name with its f and l forms, and nothing else")
+elb_libcall_names()
+    assert(is_libcall_name("memset"), "memset")
+    assert(is_libcall_name("strlen"), "strlen")
+    assert(is_libcall_name("bzero"), "bzero")
+    assert(is_libcall_name("calloc"), "calloc")
+    assert(is_libcall_name("sqrt"), "sqrt")
+    assert(is_libcall_name("sqrtf"), "sqrtf")
+    assert(is_libcall_name("powl"), "powl")
+    assert(!is_libcall_name(""), "the empty name")
+    assert(!is_libcall_name("fill_bytes"), "fill_bytes")
+    assert(!is_libcall_name("sqrtx"), "sqrtx")
+    assert(!is_libcall_name("memsets"), "memsets")
+end elb_libcall_names
+
+@test("a text defining a runtime name is found, quoted or bare; a declare or a call of one is not")
+elb_defines_libcall()
+    assert(defines_libcall("target triple = \"x\"\n\ndefine i64 @strlen(ptr %c.0) #99 {\n  ret i64 0\n}\n"),
+           "a bare define")
+    assert(defines_libcall("define ptr @\"memset\"(ptr %a, i32 %b, i64 %c) {\n}\n"), "a quoted define")
+    assert(!defines_libcall("declare ptr @memset(ptr, i32, i64)\n\ndefine void @m$f() {\n" +
+                            "  call ptr @memset(ptr null, i32 0, i64 0)\n  ret void\n}\n"),
+           "only declared and called")
+    assert(!defines_libcall("define void @m$strlen_of() {\n  ret void\n}\n"), "a name holding one")
+    assert(!defines_libcall(""), "an empty text")
+end elb_defines_libcall
+
+@test("a hosted row takes no-builtins exactly when the compilation defines a runtime name")
+elb_hosted_attributes()
+    val host = target_named("aarch64-macos").unwrap()
+
+    assert(elb_has(function_attributes(host, buf(), true), "\"no-builtins\""), "with a libcall")
+    assert(!elb_has(function_attributes(host, buf(), false), "\"no-builtins\""), "without one")
+    assert(for_clang("define i64 @strlen(ptr %s) {\n  ret i64 0\n}\n", host)
+           .contains("attributes #99 = { nounwind uwtable(sync) \"no-builtins\" }"), "for_clang over a strlen")
+    assert(!for_clang("define i64 @m$len(ptr %s) {\n  ret i64 0\n}\n", host).contains("no-builtins"),
+           "for_clang over an ordinary name")
+end elb_hosted_attributes
+
+// -- the seam ------------------------------------------------------------------------------------
+
+@test("emit-llvm on the host marks a compilation exporting strlen no-builtins, and one exporting fill_bytes not")
+elb_emit_llvm_shows_it()
+    if !elb_ready() then return
+
+    val runtime = elb_project(elb_runtime)
+    val ordinary = elb_project(elb_ordinary)
+    val marked = elb_cli(["sysl", "emit-llvm", runtime])
+    val plain = elb_cli(["sysl", "emit-llvm", ordinary])
+
+    remove_dir_all(runtime).unwrap_or(())
+    remove_dir_all(ordinary).unwrap_or(())
+    assert_eq(marked.0, 0, marked.1)
+    assert(marked.1.contains("\"no-builtins\" }"), marked.1)
+    assert_eq(plain.0, 0, plain.1)
+    assert(plain.1.contains("attributes #99 = { "), plain.1)
+    assert(!plain.1.contains("no-builtins"), plain.1)
+end elb_emit_llvm_shows_it
+
+@test("exported strlen, memset and strncpy are loops on the host, and a C program linked to them runs")
+elb_exported_runtime_is_real()
+    if !elb_ready() then return
+
+    val objdump = elb_objdump() match
+        Some(p) -> p
+        None -> return
+
+    val root = elb_project(elb_runtime)
+    val made = elb_disassembled(objdump, root)
+    val dis = made.1
+    val len_body = elb_body(dis, "_strlen") + "\n" + elb_body(dis, "_c_strlen")
+    val set_body = elb_body(dis, "_memset") + "\n" + elb_body(dis, "_c_memset")
+    val cpy_body = elb_body(dis, "_strncpy") + "\n" + elb_body(dis, "_c_strncpy")
+
+    assert(len_body.contains("ldrb"), s"strlen reads bytes:\n${elb_dump(dis, "strlen")}\n$len_body")
+    assert(!elb_calls(len_body, ["_strlen"]), s"strlen calls no strlen:\n$len_body")
+    assert(set_body.contains("strb"), s"memset stores bytes:\n$set_body")
+    assert(!elb_calls(set_body, ["_memset", "_bzero"]), s"memset calls no memset:\n$set_body")
+    assert(!elb_calls(cpy_body, ["_memset", "_bzero", "_strncpy"]), s"the zero fill is a loop:\n$cpy_body")
+
+    val driver = s"$root/driver.c"
+    val exe = s"$root/driver"
+
+    write_text(driver, elb_driver).unwrap()
+
+    val linked = capture("clang", ["-fno-builtin", "-O1", driver, made.0, "-o", exe], "", [], true).unwrap()
+
+    assert(linked.status.ok(), linked.text)
+
+    val ran = capture(exe, []).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert(ran.status.ok(), s"the driver's checks: ${ran.text}")
+end elb_exported_runtime_is_real
+
+@test("a fill exported under an ordinary name keeps its builtins and becomes a call to memset")
+elb_ordinary_export_keeps_builtins()
+    if !elb_ready() then return
+
+    val objdump = elb_objdump() match
+        Some(p) -> p
+        None -> return
+
+    val root = elb_project(elb_ordinary)
+    val dis = elb_disassembled(objdump, root).1
+    val body = elb_body(dis, "_fill_bytes") + "\n" + elb_body(dis, "_$fill_bytes") + "\n" +
+               elb_body(dis, "_fill_bytes$$sysl")
+
+    remove_dir_all(root).unwrap_or(())
+    assert(elb_calls(body, ["_memset"]), s"the loop is LLVM's memset:\n${elb_dump(dis, "fill_bytes")}\n$body")
+end elb_ordinary_export_keeps_builtins

@@ -368,6 +368,37 @@ convention and puts it in the registers named, and an entry in classifies the sa
 back. One classifier answers both directions, so what a binding calls and what it exports cannot
 disagree about the same struct.
 
+### Exporting a C runtime name
+
+**A program that exports a name C's runtime owns — `memset`, `memcpy`, `strlen`, `bzero`, `calloc`,
+`sqrt` and the rest of what the optimizer may call on its own — is compiled as C's `-fno-builtin`
+compiles a translation unit, on every target.** The optimizer recognises a byte loop as the routine
+it implements and replaces it with a call to that routine, and the only thing that stops a function
+becoming a call to *itself* is its name. The name the optimizer sees is the definition's, never the
+symbol the export publishes, so without the rule this `strlen` would compile to a call to `strlen`,
+which is this function:
+
+```sysl
+import sysl.slices.as_ptr
+
+@export("strlen")
+c_strlen(s: *u8) -> usize
+    var n: usize = 0
+    while s[n] != 0 do n += 1
+    n
+
+val word: [6]u8 = [104, 101, 108, 108, 111, 0]
+print(c_strlen(as_ptr(word[..])))
+```
+
+```output
+5
+```
+
+The whole program loses the builtins, not only the exported function, because the loop may sit in a
+helper the export calls. A program exporting no such name keeps them all. A freestanding target
+already compiles every definition this way, the image supplying the runtime itself.
+
 ### What an exported function may be
 
 The boundary is a **facade**: one file whose job is the export surface, where the signatures are
