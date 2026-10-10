@@ -997,7 +997,7 @@ property of the package, not of the flag that reached it.
 
 The pair is held to `malloc`'s promise: a block begins on a boundary of two words — sixteen bytes on
 a 64-bit machine, eight on a 32-bit one. A box, a buffer or a task's frame holding a type that asks
-for more (an [`@align(n)`](/reference/attributes/#alignn--where-the-aggregate-begins) struct, or a
+for more (an [`@align(n)`](/reference/attributes/#align-n-where-the-aggregate-begins) struct, or a
 `u128` on a 32-bit machine) is taken from a second pair instead:
 
 ```sysl

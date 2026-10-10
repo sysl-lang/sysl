@@ -675,8 +675,8 @@ the one the attribute names. **A `private` one is published hidden** and left ou
 header defines as `_Thread_local` for C and `thread_local` for C++; a target with no thread-local
 storage refuses `@thread_local` whether or not it is exported, and a bare AArch64 machine has it once
 its manifest names the thread pointer
-([`codegen.thread_pointer`](/reference/attributes/#thread_local)). **A
-[`@per_cpu`](/reference/attributes/#per_cpu--one-copy-per-processor-core) one is refused**: a symbol names one object, and per-core
+([`codegen.thread_pointer`](/reference/attributes/#thread-local)). **A
+[`@per_cpu`](/reference/attributes/#per-cpu-one-copy-per-processor-core) one is refused**: a symbol names one object, and per-core
 storage is a copy per core, so the only thing the symbol could name is the `.percpu` image no core
 reads or writes — a function C calls is how it reaches this core's copy:
 
@@ -800,7 +800,7 @@ fd_of_stdout() -> i32 = stdout.fd + i32(*stdout_flags)
 Three addresses are not constants, and storage holding one stays code, filled before the program's
 statements like any other computed initializer: the address of `@thread_local` or `@per_cpu`
 storage, which is a different one on every thread or core; an element of a view or through a pointer,
-which is a load before it is an address — an [`embed`](/reference/arrays/#a-files-bytes-embedded)
+which is a load before it is an address — an [`embed`](/reference/arrays/#a-file-s-bytes-embedded)
 included, which is a view, though the bytes it views are data; and an index the array does not have,
 which would trap where it ran — so it is left to run, and trap, as it would have.
 

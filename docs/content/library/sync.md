@@ -199,7 +199,7 @@ processor keep it too.
 LSE extension does a read-modify-write in one instruction (`ldadd`, `swp`, `cas`), and without it in
 a load-exclusive/store-exclusive loop; an Armv8.0 row assumes the loop, and a project whose cores all
 have LSE says so in its manifest, `codegen { extensions = ["lse"] }`
-([packages](/reference/packages/#a-processors-extensions)). The orderings mean the same either way.
+([packages](/reference/packages/#a-processor-s-extensions)). The orderings mean the same either way.
 
 ## `Atomic[T]`
 
@@ -566,7 +566,7 @@ while atomic_swap(&self.held, 1, Acquire) != 0
 A read-modify-write has to take the cache line exclusively every time round, so waiters spinning on
 the exchange itself fight each other for the line — and worse, they fight the holder trying to write
 the release, which is the one thread whose progress everybody is waiting on. A relaxed load spins in
-a shared line and costs nobody anything, and [`spin_hint()`](#spin_hint) on each round tells the
+a shared line and costs nobody anything, and [`spin_hint()`](#spin-hint) on each round tells the
 processor that is what it is doing.
 
 ## `spin_hint`

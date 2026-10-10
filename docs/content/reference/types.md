@@ -397,11 +397,11 @@ true 3.597739657143681911483769068908388
 ```
 
 A `c const` may be declared `f128`, and it is measured as a `long double`, every bit of it kept
-([ffi](/reference/ffi/#c-const--a-value-only-the-c-compiler-can-work-out)); and an `f128` passes
+([ffi](/reference/ffi/#c-const-a-value-only-the-c-compiler-can-work-out)); and an `f128` passes
 through a variadic `...` and is read back with `va_arg`, by each machine's own convention. It is
 not a [vector](/reference/vectors/) lane. **C's `long double` is a different question from `f128`**:
 it is binary128 on AArch64 Linux, RISC-V and WebAssembly, a `double` on Apple's arm64 and on
-Windows, and x87's 80-bit format on x86. A [`c type`](/reference/ffi/#c-type--a-width-only-the-c-compiler-can-work-out)
+Windows, and x87's 80-bit format on x86. A [`c type`](/reference/ffi/#c-type-a-width-only-the-c-compiler-can-work-out)
 measured as `"long double"` is the one spelling that matches it on every machine.
 
 ## `usize` and `isize`

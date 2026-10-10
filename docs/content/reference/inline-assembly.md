@@ -89,7 +89,7 @@ print("hinted")
 hinted
 ```
 
-A program wanting the hint itself calls [`sysl.sync.spin_hint()`](/library/sync/#spin_hint), which is
+A program wanting the hint itself calls [`sysl.sync.spin_hint()`](/library/sync/#spin-hint), which is
 this function with RISC-V's real `pause` in place of the `nop`.
 
 **Square brackets rather than a `match` arm's `->`.** Brackets are already what sysl writes around

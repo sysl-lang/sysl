@@ -1835,7 +1835,7 @@ The rule is stated over the **integer's value** and never over memory bytes. Wri
 make. Written this way it costs nothing: the struct is an integer, so how it reaches memory is the
 target's ordinary byte order for an integer of that width. A wire format's byte order belongs to the
 protocol rather than to the CPU, and a struct of whole-byte fields states it with
-[`@byte_order`](#byte_orderbig-and-byte_orderlittle-the-order-a-structs-integers-keep-their-bytes-in)
+[`@byte_order`](#byte-order-big-and-byte-order-little-the-order-a-struct-s-integers-keep-their-bytes-in)
 below.
 
 **Being one integer, it goes to and from that integer with nothing in between.** `T::Bits(n)` makes
