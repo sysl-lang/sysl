@@ -576,12 +576,23 @@ keel_start(argc: int, argv: **u8) -> never = exit(program_main(argc, argv))
 `keel_start`, and the call reaches the `main` this program defines: nothing is declared beside it,
 and the call is enough to make the image carry a `main` and to count its computed storage as filled.
 
-**`main` is emitted at C's signature whatever the program declared**, so the `extern` is declared at
-it too — an `int` count (32 bits, signed), a pointer, an `int` answer (a measured `c type` such as
-`c_int` reads as what it measures). Anything else would read arguments nobody passed, and is refused:
+**On an image, `main` is emitted at C's signature whatever the program declared**, so the `extern` is
+declared at it too — an `int` count (32 bits, signed), a pointer, an `int` answer (a measured `c type`
+such as `c_int` reads as what it measures). Anything else would read arguments nobody passed, and is
+refused:
 
 ```
 'main' is defined at C's signature, '(int, **byte) -> int' — the argument count and the argument vector — so an 'extern' naming it takes those, where this one is '() -> int'
+```
+
+**In a `build-c` archive naming an `entry`, `main` is the C program's, and C accepts three shapes of
+it**: `int main(void)`, `int main(int, char **)` and `int main(int, char **, char **)`, the last
+taking the environment that every Unix start file passes beside the vector. The `extern` takes
+whichever the program was written with — `() -> int`, `(argc: int, argv: **u8) -> int` or
+`(argc: int, argv: **u8, envp: **u8) -> int` — and any other shape is refused, naming all three:
+
+```
+'main' is C's, and C accepts three signatures for it — '() -> int', '(int, **byte) -> int' and '(int, **byte, **byte) -> int', the argument count, the argument vector and the environment — so an 'extern' naming it takes one of those, where this one is '(int) -> int'
 ```
 
 Everywhere else the name stays the platform's. A hosted program is started at `main` by its C

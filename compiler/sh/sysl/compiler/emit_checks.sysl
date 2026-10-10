@@ -543,8 +543,10 @@ end check_image_storage
 //
 // So on a bare image or an archive it is refused here where the manifest names no entry, or names
 // `main` itself; and where it is allowed it has to be declared at the signature `main` is emitted at
-// -- C's `(argc, argv) -> int`, which `emit_entry.sysl` gives it whatever the program declared, since
-// a call at another signature reads arguments nobody passed.
+// -- on an image C's `(argc, argv) -> int`, which `emit_entry.sysl` gives it whatever the program
+// declared, since a call at another signature reads arguments nobody passed; in an archive, where
+// `main` is the C program's, any of the three shapes C allows: no arguments, `(argc, argv)` or
+// `(argc, argv, envp)`.
 check_main_extern(a: &Analysis, p: TProgram, entry: string)
     val t = a.tables.target
 
@@ -577,10 +579,22 @@ check_main_extern(a: &Analysis, p: TProgram, entry: string)
             continue
         end if
 
-        if !c_main_shape(x)
-            a.fault(at.scope, at.span, "'main' is defined at C's signature, '(int, **byte) -> int' " +
-                    "— the argument count and the argument vector — so an 'extern' naming it takes " +
-                    s"those, where this one is '${extern_shape(x)}'")
+        // A C program's `main` is one of C's three shapes, and an archive's runtime calls whichever the
+        // program wrote. An image defines its own `main` at the two-argument shape, so a call there is
+        // held to that one.
+        if c_main_shape(x, p.c_artifact) then continue
+
+        if p.c_artifact
+            a.fault(at.scope, at.span, "'main' is C's, and C accepts three signatures for it — " +
+                    "'() -> int', '(int, **byte) -> int' and '(int, **byte, **byte) -> int', the " +
+                    "argument count, the argument vector and the environment — so an 'extern' " +
+                    s"naming it takes one of those, where this one is '${extern_shape(x)}'")
+            continue
+        end if
+
+        a.fault(at.scope, at.span, "'main' is defined at C's signature, '(int, **byte) -> int' " +
+                "— the argument count and the argument vector — so an 'extern' naming it takes " +
+                s"those, where this one is '${extern_shape(x)}'")
 end check_main_extern
 
 // **An `extern` naming `sysl_init_modules` is a C runtime's call into the function that fills its
@@ -640,10 +654,19 @@ private is_unit(t: Type) -> bool = nameless(t) match
 
 // Whether an `extern` is declared at the signature the program's `main` is emitted at: a 32-bit
 // signed count, a pointer, and a 32-bit signed answer -- a measured `c type` read as what it measures.
-private c_main_shape(x: TExtern) -> bool
-    if x.variadic || x.params.len() != 2 then return false
+// `c_owned` is a `main` that is the C program's, which may also take no arguments or the environment.
+private c_main_shape(x: TExtern, c_owned: bool) -> bool
+    if x.variadic || !is_c_int(x.ret_ty) then return false
 
-    is_c_int(x.params.at(0)) && is_raw_pointer(x.params.at(1)) && is_c_int(x.ret_ty)
+    val n = x.params.len()
+
+    if n == 0 then return c_owned
+    if n < 2 || n > 3 || (n == 3 && !c_owned) then return false
+
+    for i in 1..<n
+        if !is_raw_pointer(x.params.at(i)) then return false
+
+    is_c_int(x.params.at(0))
 end c_main_shape
 
 private is_c_int(t: Type) -> bool = nameless(t) match
