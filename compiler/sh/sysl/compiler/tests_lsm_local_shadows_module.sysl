@@ -1,0 +1,131 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.Buf
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+import sysl.text.Search
+
+// **A value binding shadows a module an import named after it.** `import db.c` binds `c` to the
+// module, and a local, a parameter or a captured binding called `c` is nearer than the import, so
+// `c.status()` is the method on the value and not the module's function -- in a call, a field read,
+// an assignment, and a closure's body alike (`reference/modules.md § Resolution`). Storage the
+// reader's own module declares is nearer than an import too, an unqualified name being looked for
+// in the module before the file's imports.
+
+private lsm_db() -> string =
+    "module db.c\n\n" +
+    "status(h: int) -> int = h + 100\n\n" +
+    "val level: int = 7\n\n" +
+    "struct Conn\n    n: int\n    level: int\n\n    status(self) -> int = self.n\n"
+
+private lsm_files(main: string) -> Buf[(string, string, string)]
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    fs.push(("db.c", "c.sysl", lsm_db()))
+    fs
+end lsm_files
+
+// What the program prints with the status it exited under, or what the build said instead.
+private lsm_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true, 20000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Exited(code) -> out.text + "[exit " + str(code) + "]"
+            _ -> out.text + "[did not exit]"
+end lsm_out
+
+private lsm_prelude() -> string =
+    "import db.c\n\n" +
+    "conn(n: int) -> c.Conn = c.Conn(n, n + 1)\n\n"
+
+@test("a local named like an imported module is what a method call is made on")
+lsm_method_call_on_a_local()
+    if im_can_run() then return
+
+    assert_eq(lsm_out(lsm_files(lsm_prelude() +
+                                "run()\n    var c = conn(3)\n    print(c.status())\n\nrun()\n")),
+              "3\n[exit 0]")
+
+@test("a field read and a write through the local reach the value, not the module's storage")
+lsm_field_read_and_write()
+    if im_can_run() then return
+
+    assert_eq(lsm_out(lsm_files(lsm_prelude() +
+                                "run()\n    var c = conn(3)\n    print(c.level)\n" +
+                                "    c.level = 9\n    print(c.level)\n\nrun()\n")),
+              "4\n9\n[exit 0]")
+
+@test("a parameter named like the module shadows it, the type position still naming the module")
+lsm_parameter()
+    if im_can_run() then return
+
+    assert_eq(lsm_out(lsm_files(lsm_prelude() +
+                                "show(c: c.Conn) -> int = c.status() + c.level\n\n" +
+                                "print(show(conn(3)))\n")),
+              "7\n[exit 0]")
+
+@test("the local handed on as a value, captured by a closure, and shadowed again in a block")
+lsm_value_closure_and_block()
+    if im_can_run() then return
+
+    assert_eq(lsm_out(lsm_files(lsm_prelude() +
+                                "twice(f: &Fn() -> int) -> int = f() + f()\n\n" +
+                                "id(x: c.Conn) -> c.Conn = x\n\n" +
+                                "run()\n    val c = conn(3)\n    print(id(c).status())\n" +
+                                "    print(twice(() -> c.status()))\n" +
+                                "    if c.n > 0\n        val c = conn(5)\n        print(c.status())\n" +
+                                "    print(c.status())\n\nrun()\n")),
+              "3\n6\n5\n3\n[exit 0]")
+
+@test("where nothing shadows it the module is reached, before and after a local of its name")
+lsm_module_reached_when_nothing_shadows()
+    if im_can_run() then return
+
+    assert_eq(lsm_out(lsm_files(lsm_prelude() +
+                                "f() -> int = c.status(1) + c.level\n\n" +
+                                "run()\n    print(c.status(1))\n    var c = conn(3)\n    print(c.status())\n\n" +
+                                "print(f())\nrun()\n")),
+              "108\n101\n3\n[exit 0]")
+
+private lsm_module_storage(init: string) -> Buf[(string, string, string)]
+    var fs = lsm_files("app.run()\n")
+
+    fs.push(("app", "a.sysl", "module app\n\nimport db.c\n\n" +
+                              s"val c: c.Conn = $init\n\n" +
+                              "run()\n    print(c.status())\n    print(c.level)\n"))
+    fs
+end lsm_module_storage
+
+@test("storage the reader's own module declares is nearer than an import of its name")
+lsm_module_storage_beats_the_import()
+    if im_can_run() then return
+
+    var fs = lsm_module_storage("make()")
+
+    fs.push(("app", "b.sysl", "module app\n\nimport db.c.Conn\n\nmake() -> Conn = Conn(3, 4)\n"))
+    assert_eq(lsm_out(fs), "3\n4\n[exit 0]")
+
+@test("so in that module's file the import's name reads the storage, and the module is not reached")
+lsm_module_storage_hides_the_module()
+    if im_can_run() then return
+
+    val said = lsm_out(lsm_module_storage("c.Conn(3, 4)"))
+
+    assert_eq(said.contains("type 'db.c.Conn' has no method 'Conn'"), true, said)

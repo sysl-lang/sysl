@@ -622,7 +622,7 @@ end generic_variant_named
 // The key of a constant, a `val` or a module `var` a `Field` chain spells as a module path, where the
 // declaration exists and is out of this file's reach.
 private module_value_out_of_reach(cx: &Analyzer, receiver: Expr, name: string) -> Option[string]
-    val dotted = module_path(receiver, name)
+    val dotted = module_path(cx, receiver, name)
 
     if dotted.is_none() then return None
 
@@ -640,7 +640,7 @@ private names_storage(cx: &Analyzer, k: string) -> bool =
 
 // A `Field` chain that spells a module path rather than a member read.
 through_module(cx: &Analyzer, receiver: Expr, name: string) -> Option[string]
-    val dotted = module_path(receiver, name)
+    val dotted = module_path(cx, receiver, name)
 
     if dotted.is_none() then return None
 
@@ -657,10 +657,10 @@ end through_module
 private module_key_of(cx: &Analyzer, written: string) -> string =
     module_qualify(cx.scope.module_name, written)
 
-private module_path(receiver: Expr, name: string) -> Option[string] = *receiver.kind match
-    Ident(head) -> Some(s"$head.$name")
-    Field(inner, mid, _) -> module_path(inner, mid).map(head -> s"$head.$name")
-    _ -> None
+// The path a `Field` chain spells, where nothing binds its head as a value -- a local, a parameter or
+// a captured binding shadows a module of its spelling, so `c.level` over a local `c` reads the field.
+private module_path(cx: &Analyzer, receiver: Expr, name: string) -> Option[string] =
+    dotted_name_written(cx, receiver).map(head -> s"$head.$name")
 
 // A bare variant reached through the module that declares it. A file that wrote `import <module>`
 // bound the module's own name and none of the names in it, so `inflate.BadBlock` is the whole of
@@ -764,10 +764,26 @@ end module_owner
 // **A dotted path is one name to the type grammar**, so `sdl3.PixelFormat` names a type the way
 // `PixelFormat` does; a file that wrote `import <module>` bound the module's name and none of the
 // names in it, so this is the only spelling it has for them.
+//
+// **A value binds the head wherever it was declared nearer than the import** -- a local, a parameter
+// or a captured binding, and storage the reader's own module declares, which an unqualified name finds
+// before the file's imports (`reference/modules.md § Resolution`).
 dotted_name_written(cx: &Analyzer, e: Expr) -> Option[string] = *e.kind match
-    Ident(head) -> if cx.lookup(head).is_none() then Some(head) else None
+    Ident(head) -> if cx.lookup(head).is_none() && !own_storage(cx, head) then Some(head) else None
     Field(inner, name, _) -> dotted_name_written(cx, inner).map(head -> s"$head.$name")
     _ -> None
+
+// Whether the reader's own module declares storage of this spelling the reader may reach -- this
+// file's file-private slot first, then the module's plain key.
+private own_storage(cx: &Analyzer, name: string) -> bool
+    val plain = module_qualify(cx.scope.module_name, name)
+    val here = file_private_key(cx.an, cx.scope.src.name, plain)
+
+    for k in [here, plain]
+        if names_storage(cx, k) && reachable_key(cx.an, k, cx.scope) then return true
+
+    false
+end own_storage
 
 // **What a type declares of its own is looked up through `lookup_trait_member`**, which reads the
 // member tables the `impl` blocks and the type declarations were hoisted into. It lives in

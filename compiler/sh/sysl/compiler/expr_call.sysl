@@ -104,7 +104,7 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
         // and is re-read here where the name is one a generic declares -- and only where nothing
         // nearer holds the name: a local shadowing the function is what is indexed.
         Index(head, one, open) ->
-            val name = written_name_of(head)
+            val name = written_name_of(cx, head)
 
             if name.is_some() && cx.lookup(name.unwrap()).is_none() &&
                (names_a_function(cx, name.unwrap()) || cx.nested_of(name.unwrap()).is_some())
@@ -191,7 +191,7 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                 return type_args_at_selection(cx, span, on_type_args.unwrap().0,
                                               on_type_args.unwrap().1, member, args)
 
-            val dotted = module_path_of(receiver, member)
+            val dotted = module_path_of(cx, receiver, member)
 
             if dotted.is_some() && names_a_function(cx, dotted.unwrap()) then
                 return named_call(cx, span, callee, dotted.unwrap(), args, expected)
@@ -351,7 +351,7 @@ private local_head(cx: &Analyzer, e: Expr) -> bool = *e.kind match
 // function nor a type reached through a module, which a dotted path is asked about first.
 private written_method(cx: &Analyzer, head: Expr) -> Option[(Expr, string)] = *head.kind match
     Field(recv, member, _) ->
-        val dotted = module_path_of(recv, member)
+        val dotted = module_path_of(cx, recv, member)
 
         if dotted.is_some() && (names_a_function(cx, dotted.unwrap()) ||
                                 lookup_type_key(cx.an, cx.scope, dotted.unwrap()).is_some()) then
@@ -370,14 +370,14 @@ private written_member_call(cx: &Analyzer, span: Span, recv: Expr, member: strin
 end written_member_call
 
 // The name a written type application was made on, where it is one a call could be written through.
-private written_name_of(head: Expr) -> Option[string] = *head.kind match
+private written_name_of(cx: &Analyzer, head: Expr) -> Option[string] = *head.kind match
     Ident(n) -> Some(n)
-    Field(inner, name, _) -> module_path_of(inner, name)
+    Field(inner, name, _) -> module_path_of(cx, inner, name)
     _ -> None
 
 private written_call(cx: &Analyzer, span: Span, head: Expr, bracket: Span, targs: Buf[Expr],
                      args: Buf[Expr], expected: Option[Type]) -> TExpr
-    val name = written_name_of(head)
+    val name = written_name_of(cx, head)
 
     if name.is_none() then return cx.err(span, "this is not something that can be called")
 
@@ -439,7 +439,7 @@ end applied_type_call
 // module that declares it -- as the key it is filed under and the spelling a refusal quotes back. A
 // local of the name stands in front, since then the brackets are a subscript.
 generic_type_head(cx: &Analyzer, head: Expr) -> Option[(string, string)]
-    val written = written_name_of(head)
+    val written = written_name_of(cx, head)
 
     if written.is_none() || local_head(cx, head) then return None
 
@@ -519,10 +519,12 @@ end type_args_at_selection
 // means.
 no_written_targs() -> Buf[Type] = buf()
 
-private module_path_of(receiver: Expr, name: string) -> Option[string] = *receiver.kind match
-    Ident(head) -> Some(s"$head.$name")
-    Field(inner, mid, _) -> module_path_of(inner, mid).map(head -> s"$head.$name")
-    _ -> None
+// The dotted path a call's receiver and member spell, where nothing binds its head as a value: **a
+// local, a parameter or a captured binding shadows a module of its spelling**
+// (`reference/modules.md § Resolution`), so `c.status()` over a local `c` is a method call even in a
+// file that imported a module whose last segment is `c`.
+private module_path_of(cx: &Analyzer, receiver: Expr, name: string) -> Option[string] =
+    dotted_name_written(cx, receiver).map(head -> s"$head.$name")
 
 // **An `extern` is one too**, and leaving it out is what sent `c.surface_destroy(h)` down the
 // member-call road: the receiver `c` is a module rather than a value, so reading it as one reports

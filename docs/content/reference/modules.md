@@ -332,6 +332,31 @@ neither are the root module's, which have no path to be reached by at all.
 **Resolution is innermost-first.** A local binding shadows an imported name; the fully-qualified path
 is always available to break a tie or reach a name deliberately not imported.
 
+**That includes the name an import binds a module to.** A local, a parameter or a captured binding
+spelled like a module's last segment is the nearer binding, so a dot after it reads a member of the
+value — a method call, a field, a write through it — and never the module's function of that name.
+Storage the file's own module declares is nearer than an import in the same way.
+
+```sysl
+import sysl.math
+
+struct Range
+    lo: int
+    hi: int
+
+    max(self) -> int = self.hi
+
+val math = Range(1, 9)
+
+print(math.max())
+print(sysl.math.max(3, 4))
+```
+
+```output
+9
+4
+```
+
 **The three steps rank a name by where it was written, not by what kind of thing it is.** A function,
 a `const`, a module-level `val`, an `extern` variable and an enum variant are different kinds of
 declaration, and a bare name may be any of them — a program's own answers before an import's, and an
