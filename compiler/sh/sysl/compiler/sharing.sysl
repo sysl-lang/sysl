@@ -56,7 +56,11 @@ private share_walk(t: Type, path: Buf[string], holder: Option[Type],
     Array(_, elem) -> share_walk(*elem, path, holder, laid)
 
     Constrained(d) -> share_walk(d.base, path, holder, laid)
-    Struct(d) -> share_walk_fields(d.fields, path, "", t, laid)
+
+    // **A guarded field is not shared by sharing its struct**: `@guards(value)` promises that the
+    // struct's own members are the only way to it, and those hold whatever leaves through them to
+    // this same rule at the call (`guarded_results`), so the walk leaves it out.
+    Struct(d) -> share_walk_fields(unguarded(d), path, "", t, laid)
 
     // A data enum shares one payload region, so every variant's fields are reachable from it.
     Enum(d) -> share_walk_variants(d.variants, path, t, laid)
@@ -77,6 +81,36 @@ private share_walk_fields(fields: Buf[(string, Type)], path: Buf[string],
 
     None
 end share_walk_fields
+
+// A struct's fields less the ones it guards.
+private unguarded(d: &StructType) -> Buf[(string, Type)]
+    if d.guarded.is_empty() then return d.fields
+
+    var out: Buf[(string, Type)] = buf()
+
+    for item in d.fields
+        if !holds_string(d.guarded, item.0) then out.push(item)
+
+    out
+end unguarded
+
+// The part of a guarded field that may not be shared, or nothing where every guarded field of `d`
+// reaches only atomic counts -- in which case nothing a member hands out of it can carry one.
+guarded_unshareable(d: &StructType) -> Option[Unshareable]
+    for item in d.fields
+        if holds_string(d.guarded, item.0)
+            val found = share_walk(item.1, just_field(item.0), None, false)
+
+            if found.is_some() then return found
+
+    None
+end guarded_unshareable
+
+private just_field(name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(name)
+    out
 
 private share_walk_variants(variants: Buf[EnumVariant], path: Buf[string],
                             holder: Type, laid: bool) -> Option[Unshareable]

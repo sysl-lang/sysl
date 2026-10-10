@@ -1,0 +1,191 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// What may leave a struct through the members that guard one of its fields.
+//
+// **`@guards(value)` above a struct says its own members are the only way to `value`** -- the field
+// is file-private and the struct's members take a lock (or whatever the struct is) before they touch
+// it. That is what lets a `Mutex[Map[string, int]]` cross into a `&sync` while the `Map` inside it
+// could not: `sharing.sysl`'s walk leaves a guarded field out, so sharing the lock does not share
+// what it guards.
+//
+// **The other half of the bargain is checked here, at each call of such a member.** A value a member
+// hands back has left the guard, and the lock is let go by the time the caller holds it, so whatever
+// counts it shares with the guarded value are touched from two domains at once -- the same race the
+// walk was spared, one call later. So what a call answers is held to the `&sync` rule a capture is:
+// an `int`, a `bool`, a `*T`, a `&sync T` pass on their type alone. A value whose type carries a
+// count that is not atomic passes only where the body that made it can be read and every way it
+// answers is **fresh** -- a string literal (immortal), a `.copy()` of a string (which allocates an
+// owner of its own and copies the bytes), or a branch, a block, a variant or a struct built of those.
+//
+// **The rule fires only where the guarded field itself reaches such a count**: a `Mutex[int]` hands
+// nothing out that could share one.
+//
+// **What this does not see**: a body that STORES something read out of the guarded value somewhere
+// that outlives the call -- a module `var`, a `Buf` reached through a captured pointer -- has let it
+// leave too, and no walk here follows a counted value from the field to the store. Module storage
+// reached from another domain is still held to `sharing.sysl`'s own rule where it is reached.
+
+// Holds every call of a member that guards a field to letting nothing shared leave through it.
+check_guarded_results(a: &Analysis, funcs: Buf[TFunc])
+    var index: Map[string, usize] = map()
+    var any = false
+
+    for i in 0..<funcs.len()
+        if !index.has(funcs.at(i).name) then index.put(funcs.at(i).name, i)
+        if guard_of(funcs.at(i)).is_some() then any = true
+
+    if !any then return
+
+    val an = a
+
+    for f in funcs
+        val scope = func_home(a, f.name)
+        val own = guard_of(f)
+
+        walk_block_stmts(f.body, expr_walk(false, e -> guarded_call(an, funcs, index, scope, own, e)))
+end check_guarded_results
+
+// The guarding struct a member is a member of, where its receiver is one that guards a field.
+private guard_of(f: TFunc) -> Option[&StructType]
+    if f.params.is_empty() || f.params.at(0).0 != "self" then return None
+
+    guarding(f.params.at(0).1)
+
+private guarding(t: Type) -> Option[&StructType] = t match
+    Ptr(inner) -> guarding(*inner)
+    Ref(inner, _) -> guarding(*inner)
+    Struct(d) -> if d.guarded.is_empty() then None else Some(d)
+    _ -> None
+
+private guarded_call(a: &Analysis, funcs: Buf[TFunc], index: Map[string, usize], scope: Scope,
+                     own: Option[&StructType], e: TExpr)
+    *e.kind match
+        TCall(name, args, ty, _) -> guarded_result(a, funcs, index, scope, own, e, name, args, ty)
+        _ -> ()
+
+private guarded_result(a: &Analysis, funcs: Buf[TFunc], index: Map[string, usize], scope: Scope,
+                       own: Option[&StructType], e: TExpr, name: string, args: Buf[TExpr], ty: Type)
+    val at = index.get(name)
+
+    if at.is_none() then return
+
+    val guard = guard_of(funcs.at(at.unwrap()))
+
+    if guard.is_none() then return
+
+    val d = guard.unwrap()
+
+    // A guarding struct's members call one another inside the guard, which is where they may.
+    if own.is_some() && own.unwrap().base == d.base then return
+
+    val inside = guarded_unshareable(d)
+
+    if inside.is_none() then return
+
+    val leaving = unshareable(ty)
+
+    if leaving.is_none() then return
+
+    val body = answering_body(funcs, index, args)
+
+    if body.is_some() && answers_fresh(body.unwrap()) then return
+
+    val shown = qualified_name(a.tables.members.func_origin.get(name).unwrap_or(name))
+
+    a.fault(scope, e.span, guarded_complaint(shown, inside.unwrap(), leaving.unwrap(), ty))
+end guarded_result
+
+// The body that makes what a call answers: the closure or named function handed to it.
+private answering_body(funcs: Buf[TFunc], index: Map[string, usize], args: Buf[TExpr]) -> Option[TFunc]
+    for arg in args
+        val named: Option[string] = texpr_type(arg) match
+            Struct(d) -> if is_closure_literal(texpr_type(arg)) then Some(s"${d.base}.call") else None
+            _ -> *arg.kind match
+                TFuncAddr(n, _, _) -> Some(n)
+                _ -> None
+
+        if named.is_some()
+            val at = index.get(named.unwrap())
+
+            if at.is_some() then return Some(funcs.at(at.unwrap()))
+    end for
+
+    None
+end answering_body
+
+// Whether every way a body answers is a value made fresh, sharing no count with anything.
+private answers_fresh(f: TFunc) -> bool
+    var fresh = fresh_block(f.body)
+    val sink = &fresh
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> fresh_return(sink, s)))
+    fresh
+
+private fresh_return(sink: *bool, s: TStmt)
+    s match
+        TReturn(v) -> if v.is_some() && !fresh_value(v.unwrap()) then *sink = false
+        _ -> ()
+
+private fresh_block(b: TBlock) -> bool = b.result match
+    Some(r) -> fresh_value(r)
+    None -> true
+
+// A value that shares no count that is not atomic: one whose type carries none, a literal, a copy of
+// a string, or something built of those.
+private fresh_value(e: TExpr) -> bool
+    if unshareable(texpr_type(e)).is_none() then return true
+
+    *e.kind match
+        TStrLit(_) -> true
+        TFromBytes(_) -> true
+        TIf(_, then_block, else_block, _) ->
+            fresh_block(then_block) && (else_block.is_none() || fresh_block(else_block.unwrap()))
+        TMatch(_, arms, _) -> fresh_arms(arms)
+        TBlockExpr(b) -> fresh_block(b)
+        TEnumNew(_, _, parts) -> all_fresh(parts)
+        TStructNew(_, parts) -> all_fresh(parts)
+        _ -> false
+end fresh_value
+
+private fresh_arms(arms: Buf[TArm]) -> bool
+    for arm in arms
+        if !fresh_block(arm.body) then return false
+
+    true
+
+private all_fresh(parts: Buf[TExpr]) -> bool
+    for part in parts
+        if !fresh_value(part) then return false
+
+    true
+
+// What a call answering something shared out of a guard is told: what left, what it reaches, and the
+// spelling that makes it fresh.
+private guarded_complaint(shown: string, inside: Unshareable, p: Unshareable, whole: Type) -> string
+    val field = inside.path.at(0)
+    val head = s"'$shown' answers a value out of the '$field' it guards, and once the guard is let go " +
+               "that value is shared with whoever holds it next, so every count it reaches has to be " +
+               "atomic — "
+
+    head + s"${leaving_where(p, whole)}, ${leaving_remedy(p.ty)}"
+end guarded_complaint
+
+private leaving_where(p: Unshareable, whole: Type) -> string
+    if p.path.is_empty() && p.ty == whole then return s"but this answers a '${type_show(p.ty)}'"
+
+    if p.path.is_empty() then return s"but this answers a '${type_show(whole)}' holding a '${type_show(p.ty)}'"
+
+    s"but this answers a '${type_show(whole)}', whose '${joined(p.path, ".")}' reaches a '${type_show(p.ty)}'"
+
+private leaving_remedy(ty: Type) -> string
+    if ty == Str
+        return "which may share its bytes' count with the guarded one. Answer a fresh string " +
+               "instead — '.copy()' inside the closure gives the string an owner of its own, and a " +
+               "literal is immortal"
+
+    "whose count is not atomic. Answer what the caller needs from it — a count, a flag, a " +
+    "'.copy()' of a string — rather than the value itself"
+end leaving_remedy

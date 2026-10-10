@@ -691,10 +691,23 @@ thx_reading_the_value_without_the_lock()
 
     assert(out.contains("field 'value' of 'sysl.posix.threads.Mutex' is private"), out)
 
-// The `&sync` rule reaches through the new type without knowing anything about it: a
-// `Mutex[&Cell]` has a plain counted reference among its fields however deep.
-@test("and sharing one that guards a non-atomically counted reference")
+// `Mutex[T]` guards its `value` (`@guards(value)`), so sharing the lock does not share the `&Cell`
+// inside it: the `&sync` is formed, and what is held instead is what leaves through `with`.
+@test("sharing one that guards a non-atomically counted reference, which is read through 'with'")
 thx_sharing_a_lock_over_a_plain_reference()
+    if thx_no_library() then return
+
+    assert_eq(thx_ran(raw"""
+        struct Cell
+            v: int
+
+        var m: &sync Mutex[&Cell] = Mutex.new(Cell(1))
+
+        print(m.with((c) -> (*c).v))
+        """), "1\n")
+
+@test("and answering the guarded '&Cell' itself out of 'with' is refused at the call")
+thx_answering_the_guarded_reference_is_refused()
     if thx_no_library() then return
 
     val out = thx_err(raw"""
@@ -703,11 +716,11 @@ thx_sharing_a_lock_over_a_plain_reference()
 
         var m: &sync Mutex[&Cell] = Mutex.new(Cell(1))
 
-        print(*m.lock_raw())
+        print(m.with((c) -> *c).v)
         """)
 
-    assert(out.contains("may be reached from two domains at once"), out)
-    assert(out.contains("its 'value' reaches a '&Cell', whose count is not. Hold it as a '&sync Cell'"), out)
+    assert(out.contains("'sysl.posix.threads.Mutex.with' answers a value out of the 'value' it guards"), out)
+    assert(out.contains("but this answers a '&Cell'"), out)
 
 // A thread body is C's shape and a callable is not; the two differ by one character, so the
 // diagnostic names the `&`.

@@ -240,6 +240,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "domain" then return parse_domain_attr(p)
     if word == "borrows" then return Some(Borrows(parse_named_list(p, "borrows")))
     if word == "lends" then return Some(Lends(parse_named_list(p, "lends")))
+    if word == "guards" then return Some(Guards(parse_named_list(p, "guards")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
     if word == "noinline" then return no_inlining_args(p, NoInline, "whether a call stays a call is the whole of what it says")
     if word == "inline" then return no_inlining_args(p, Inline, "it raises what the inliner will spend on this definition rather than naming a number")
@@ -431,6 +432,8 @@ private named_list_refusal(word: string) -> string
     if word == "domain" then return "'@domain' names the domain a function is entered in, in parentheses — '@domain(interrupt)' for a handler a vector table calls, on top of whatever was running. There is no empty form: a function in the program's own domain says so by not writing the annotation"
 
     if word == "lends" then return "'@lends' names the callable parameters a function hands a pointer that is valid only during the call, in parentheses — '@lends(body)'. There is no empty form: a function that lends nothing says so by not writing the annotation"
+
+    if word == "guards" then return "'@guards' names the fields a struct's own members are the only way into, in parentheses — '@guards(value)'. There is no empty form: a struct that guards nothing says so by not writing the annotation"
 
     if word == "borrows" then return "'@borrows' names the parameters a trait's method promises not to keep past the call, in parentheses — '@borrows(bytes)'. There is no empty form: a method that may keep what it is handed says so by not writing the annotation"
 
@@ -698,9 +701,9 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
 
         val hidden = p.at_word("opaque")
 
-        if hidden then return from_first(start, laid_out(parse_opaque_struct(p, at, vis), attrs))
+        if hidden then return from_first(start, laid_out(p, at, parse_opaque_struct(p, at, vis), attrs))
 
-        return from_first(start, laid_out(parse_struct_decl(p, at, vis, false), attrs))
+        return from_first(start, laid_out(p, at, parse_struct_decl(p, at, vis, false), attrs))
     end if
 
     // A layout beside `@export` marks a struct and only a struct: a `type` takes `@export` alone,
@@ -804,12 +807,12 @@ private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)
             return
 
 private may_carry(form: string, a: Attr) -> bool
-    if form == "struct" then return is_layout(a) || attr_word(a) == "export"
+    if form == "struct" then return is_layout(a) || attr_word(a) == "export" || attr_word(a) == "guards"
     if form == "binding" then return is_storage(a) || attr_word(a) == "export"
     if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "blocks" ||
         attr_word(a) == "abandons"
 
-    !is_layout(a) && attr_word(a) != "borrows"
+    !is_layout(a) && attr_word(a) != "borrows" && attr_word(a) != "guards"
 end may_carry
 
 // The sentence a declaration that carries none of these gets, chosen by what was written above it.
@@ -821,6 +824,9 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
 
     if all_are(attrs, "byte_order")
         return "'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'sysl.math.ByteOrder' gives every whole-byte integer"
+
+    if any_is(attrs, "guards")
+        return "'@guards(...)' names the fields a struct's own members are the only way into, so it can only mark a struct — and this declares none"
 
     if all_are(attrs, "needs")
         return "'@needs(...)' names what reaching a declaration requires, so it marks a function or an 'extern' — and this declares neither"
@@ -1123,8 +1129,8 @@ private capabilities_of(attrs: Buf[Attr]) -> Buf[string]
     out
 end capabilities_of
 
-// The layout pair and the C name, folded onto the struct they were written above.
-private laid_out(s: Stmt, attrs: Buf[Attr]) -> Stmt
+// The layout pair, the C name and the guarded fields, folded onto the struct they were written above.
+private laid_out(p: *Parser, at: Span, s: Stmt, attrs: Buf[Attr]) -> Stmt
     *s.kind match
         StructDecl(d) ->
             var decl = d
@@ -1135,11 +1141,41 @@ private laid_out(s: Stmt, attrs: Buf[Attr]) -> Stmt
                     Align(n) -> decl.alignment = Some(n)
                     ByteOrder(big) -> decl.byte_order = Some(big)
                     Export(e) -> decl.cname = Some(e)
+                    Guards(ns) -> decl.guards = guarded_fields(p, at, decl, ns)
                     _ -> ()
 
             stmt(s.span, StructDecl(decl))
         _ -> s
 end laid_out
+
+// The fields `@guards(...)` names, each held to being one the struct declares and keeps `private`.
+//
+// **A guarded field is a promise that the struct's own members are the only way to its value**, which
+// is what lets sharing the struct leave the value out (`reference/memory.md § A guarded value crosses with its lock`). A
+// field anyone may read is a way in that goes round the members, so it cannot be guarded.
+private guarded_fields(p: *Parser, at: Span, d: StructDecl, names: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for name in names
+        var found: Option[Param] = None
+
+        for f in d.fields
+            if f.name == name then found = Some(f)
+
+        if found.is_none()
+            p.fault(at, s"'@guards($name)' names a field of '${d.name}', and '${d.name}' declares no field '$name'")
+        else if !file_private(found.unwrap().vis)
+            p.fault(at, s"'@guards($name)' promises that '${d.name}''s own members are the only way to '$name', and a field visible beyond this file is a way round them — declare it 'private'")
+        else
+            out.push(name)
+    end for
+
+    out
+end guarded_fields
+
+private file_private(v: Visibility) -> bool = v match
+    File -> true
+    _ -> false
 
 // The C name `@export` gives a `type` in a generated header.
 private exported_type(s: Stmt, attrs: Buf[Attr]) -> Stmt

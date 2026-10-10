@@ -1,0 +1,352 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{replace_all, Search}
+
+// A guarded value crosses with its lock (`guarded.sysl`, `sharing.sysl`'s `unguarded`):
+// `@guards(value)` on `Mutex[T]` leaves the value out of what sharing the lock shares, so a
+// `Mutex[Map[string, int]]` in module storage is reachable from a `&sync` closure, and what leaves
+// through `with`/`try_with` is held to the `&sync` rule at the call instead -- a fresh value passes,
+// one still sharing the guarded value's counts is refused.
+
+// What a program built from these files does: what it printed, and whether it built, ran and exited
+// zero. A refused build answers the driver's whole report.
+private mgr_outcome(files: []const (string, string)) -> (string, bool)
+    val root = make_temp_dir("sysl-mgr").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end mgr_outcome
+
+private mgr_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+private mgr_ran(files: []const (string, string)) -> string
+    val out = mgr_outcome(files)
+
+    if !out.1 then return s"it did not run to the end: ${out.0}"
+
+    out.0
+
+private mgr_err(files: []const (string, string)) -> string
+    val out = mgr_outcome(files)
+
+    if out.1 then return s"it was not refused, and printed: ${out.0}"
+
+    out.0
+
+private mgr_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+// A message holds the words, or the test says what it held instead.
+private mgr_says(said: string, words: string)
+    if !said.contains(words) then assert_eq(said, words)
+
+private mgr_head() -> string =
+    "'sysl.posix.threads.Mutex.with' answers a value out of the 'value' it guards, and once the " +
+    "guard is let go that value is shared with whoever holds it next, so every count it reaches " +
+    "has to be atomic — "
+
+private mgr_table_module() -> string = raw"""
+    module m
+
+    import sysl.container.{map, Map}
+    import sysl.posix.threads.Mutex
+
+    var names: Mutex[Map[string, int]] = Mutex.new(map())
+
+    lookup(s: string) -> int = names.with((t) -> t.get(s).unwrap_or(0))
+    """
+
+@test("a module 'Mutex' over a 'Map' is reached from a '&sync' closure, and the int it answers runs")
+mgr_the_guarded_table_crosses_as_module_storage()
+    if !mgr_ready() then return
+
+    assert_eq(mgr_ran([("m/m.sysl", mgr_table_module()), ("main.sysl", raw"""
+        import m.lookup
+
+        val job: &sync Fn() -> unit = () -> print(lookup("a"))
+
+        job()
+        """)]), "0\n")
+end mgr_the_guarded_table_crosses_as_module_storage
+
+@test("a 'with' answering the guarded 'Map' itself is refused at the call")
+mgr_answering_the_map_is_refused()
+    if !mgr_ready() then return
+
+    mgr_says(mgr_err(mgr_main(raw"""
+        import sysl.container.{map, Map}
+        import sysl.posix.threads.Mutex
+
+        var names: Mutex[Map[string, int]] = Mutex.new(map())
+
+        val all = names.with((t) -> *t)
+        print(all.len())
+        """)), mgr_head() + "but this answers a 'sysl.container.Map[string, int]', whose 'core' " +
+        "reaches a '&sysl.container.MapCore[string, int]', whose count is not atomic. Answer what the " +
+        "caller needs from it — a count, a flag, a '.copy()' of a string — rather than the value itself")
+end mgr_answering_the_map_is_refused
+
+@test("a string read out of the guarded 'Map' is refused, naming '.copy()'")
+mgr_a_shared_string_is_refused()
+    if !mgr_ready() then return
+
+    mgr_says(mgr_err(mgr_main(raw"""
+        import sysl.container.{map, Map}
+        import sysl.posix.threads.Mutex
+
+        var names: Mutex[Map[string, string]] = Mutex.new(map())
+
+        print(names.with((t) -> t.get("a").unwrap_or("none")))
+        """)), mgr_head() + "but this answers a 'string', which may share its bytes' count with the " +
+        "guarded one. Answer a fresh string instead — '.copy()' inside the closure gives the string " +
+        "an owner of its own, and a literal is immortal")
+end mgr_a_shared_string_is_refused
+
+@test("and the same string taken with '.copy()' inside the closure is accepted and runs")
+mgr_a_copied_string_is_accepted()
+    if !mgr_ready() then return
+
+    assert_eq(mgr_ran(mgr_main(raw"""
+        import sysl.container.{map, Map}
+        import sysl.posix.threads.Mutex
+
+        var names: Mutex[Map[string, string]] = Mutex.new(map())
+
+        names.with((t) -> t.put("a", "alpha"))
+        print(names.with((t) -> t.get("a").unwrap_or("none").copy()))
+        """)), "alpha\n")
+end mgr_a_copied_string_is_accepted
+
+@test("'try_with' is held to the same rule, its 'Option' of a shared string refused")
+mgr_try_with_is_held_too()
+    if !mgr_ready() then return
+
+    mgr_says(mgr_err(mgr_main(raw"""
+        import sysl.container.{map, Map}
+        import sysl.posix.threads.Mutex
+
+        var names: Mutex[Map[string, string]] = Mutex.new(map())
+
+        print(names.try_with((t) -> t.get("a").unwrap_or("none")).is_some())
+        """)), "'sysl.posix.threads.Mutex.try_with' answers a value out of the 'value' it guards")
+end mgr_try_with_is_held_too
+
+private mgr_registry(element: string) -> string = replace_all(mgr_registry_text(), "ELEMENT", element)
+
+private mgr_registry_text() -> string = raw"""
+    module reg
+
+    import sysl.buf.{Buf, buf}
+    import sysl.container.{map, Map}
+    import sysl.posix.threads.Mutex
+
+    struct Registry
+        names: Buf[string]
+        ids: Map[string, int]
+
+    var registry: Mutex[Registry] = Mutex.new(Registry(buf(), map()))
+
+    register(name: string) = registry.with((r) -> r.names.push(name))
+
+    name_of(f: u32) -> string =
+        registry.with((r) -> if f == 0u32 || usize(f) > r.names.len() then "(unregistered)" else ELEMENT)
+    """
+
+@test("a registry's name read out of a guarded 'Buf[string]' with '.copy()' crosses and runs")
+mgr_the_registry_with_a_copy_runs()
+    if !mgr_ready() then return
+
+    assert_eq(mgr_ran([("reg/reg.sysl", mgr_registry("r.names.at(usize(f) - 1).copy()")), ("main.sysl", raw"""
+        import reg.{name_of, register}
+
+        register("alpha")
+
+        val job: &sync Fn() -> unit = () -> print(name_of(1))
+
+        job()
+        print(name_of(0))
+        """)]), "alpha\n(unregistered)\n")
+end mgr_the_registry_with_a_copy_runs
+
+@test("and the same element answered without the copy is refused at the 'with'")
+mgr_the_registry_without_a_copy_is_refused()
+    if !mgr_ready() then return
+
+    mgr_says(mgr_err([("reg/reg.sysl", mgr_registry("r.names.at(usize(f) - 1)")), ("main.sysl", raw"""
+        import reg.name_of
+
+        print(name_of(0))
+        """)]), mgr_head() + "but this answers a 'string', which may share its bytes' count")
+end mgr_the_registry_without_a_copy_is_refused
+
+@test("a 'Mutex' over a 'Map' captured by a '&sync' closure is accepted and runs")
+mgr_a_captured_mutex_crosses()
+    if !mgr_ready() then return
+
+    assert_eq(mgr_ran(mgr_main(raw"""
+        import sysl.container.{map, Map}
+        import sysl.posix.threads.Mutex
+
+        val m: &sync Mutex[Map[string, int]] = Mutex.new(map())
+
+        m.with((t) -> t.put("a", 7))
+
+        val job: &sync Fn() -> unit = () -> print(m.with((t) -> t.get("a").unwrap_or(0)))
+
+        job()
+        """)), "7\n")
+end mgr_a_captured_mutex_crosses
+
+@test("a struct holding a 'Map' in a field it does not guard is still refused in the old words")
+mgr_an_unguarded_field_is_still_refused()
+    if !mgr_ready() then return
+
+    mgr_says(mgr_err([("m/m.sysl", raw"""
+        module m
+
+        import sysl.container.{map, Map}
+
+        struct Table
+            names: Map[string, int]
+
+        var table: Table = Table(map())
+
+        size() -> usize = table.names.len()
+        """), ("main.sysl", raw"""
+        import m.size
+
+        val job: &sync Fn() -> unit = () -> print(size())
+
+        job()
+        """)]), "in its 'names', which is shared through a count that is not atomic, and no spelling " +
+        "of it can cross into a '&sync'")
+end mgr_an_unguarded_field_is_still_refused
+
+private mgr_own_lock(answer: string) -> string = replace_all(mgr_own_lock_text(), "ANSWER", answer)
+
+private mgr_own_lock_text() -> string = raw"""
+    module m
+
+    import sysl.buf.{Buf, buf}
+
+    @guards(items)
+    struct Shelf
+        private items: Buf[string]
+
+        new() -> Shelf = Shelf(buf())
+
+        count(*self) -> usize = self.items.len()
+
+        all(*self) -> Buf[string] = self.items
+
+    var shelf: Shelf = Shelf.new()
+
+    answer() -> usize = ANSWER
+    """
+
+@test("a struct of a program's own opts in with '@guards', and crosses into a '&sync'")
+mgr_an_own_guarded_struct_crosses()
+    if !mgr_ready() then return
+
+    assert_eq(mgr_ran([("m/m.sysl", mgr_own_lock("shelf.count()")), ("main.sysl", raw"""
+        import m.answer
+
+        val job: &sync Fn() -> unit = () -> print(answer())
+
+        job()
+        """)]), "0\n")
+end mgr_an_own_guarded_struct_crosses
+
+@test("and its member answering the guarded 'Buf' is refused at the call")
+mgr_an_own_guarded_member_answering_the_field_is_refused()
+    if !mgr_ready() then return
+
+    mgr_says(mgr_err([("m/m.sysl", mgr_own_lock("shelf.all().len()")), ("main.sysl", raw"""
+        import m.answer
+
+        print(answer())
+        """)]), "'m.Shelf.all' answers a value out of the 'items' it guards")
+end mgr_an_own_guarded_member_answering_the_field_is_refused
+
+@test("'@guards' naming a field the struct does not declare is refused")
+mgr_guarding_a_missing_field_is_refused()
+    if !mgr_ready() then return
+
+    mgr_says(mgr_err(mgr_main(raw"""
+        @guards(value)
+        struct Lock
+            private held: int
+
+        print(Lock(0).held)
+        """)), "'@guards(value)' names a field of 'Lock', and 'Lock' declares no field 'value'")
+end mgr_guarding_a_missing_field_is_refused
+
+@test("'@guards' naming a public field is refused, the field being a way round the members")
+mgr_guarding_a_public_field_is_refused()
+    if !mgr_ready() then return
+
+    mgr_says(mgr_err(mgr_main(raw"""
+        @guards(value)
+        struct Lock
+            value: int
+
+        print(Lock(0).value)
+        """)), "'@guards(value)' promises that 'Lock''s own members are the only way to 'value', and " +
+        "a field visible beyond this file is a way round them — declare it 'private'")
+end mgr_guarding_a_public_field_is_refused
+
+@test("'@guards' above a function is refused, since only a struct has fields to guard")
+mgr_guards_above_a_function_is_refused()
+    if !mgr_ready() then return
+
+    mgr_says(mgr_err(mgr_main(raw"""
+        @guards(x)
+        f(x: int) -> int = x
+
+        print(f(1))
+        """)), "'@guards(...)' names the fields a struct's own members are the only way into, so it " +
+        "can only mark a struct — and this declares none")
+end mgr_guards_above_a_function_is_refused
+
+@test("'@guards' with nothing in its parentheses is refused")
+mgr_empty_guards_is_refused()
+    if !mgr_ready() then return
+
+    mgr_says(mgr_err(mgr_main(raw"""
+        @guards()
+        struct Lock
+            private held: int
+
+        print(1)
+        """)), "'@guards' names the fields a struct's own members are the only way into, in " +
+        "parentheses — '@guards(value)'")
+end mgr_empty_guards_is_refused
