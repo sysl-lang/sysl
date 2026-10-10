@@ -1650,13 +1650,18 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                 // **An address is constant data too, but not a literal**: `&files[1]` is a relocation
                 // the linker fills in, so it is laid down as it stands rather than folded, and it is
                 // the image succeeding -- not the shape of what came back -- that says so.
-                var imaged = init.is_none() || laid_down(init.unwrap())
+                //
+                // **A `val` over a slice literal is constant data too**: the elements are laid down as
+                // a static array and the view over it has no owner, as a string literal's has none.
+                // A `var` keeps building its view at startup, being storage the program reassigns.
+                var imaged = init.is_none() || (laid_down(init.unwrap()) &&
+                                                !(writable && builds_view(init.unwrap())))
 
                 if !imaged
                     val run = const_val_image(cx, d.name, init.unwrap())
                     val image = if run.is_some() then run else static_image(cx, init.unwrap())
 
-                    if image.is_some()
+                    if image.is_some() && !(writable && builds_view(image.unwrap()))
                         init = image
                         imaged = true
                     end if
@@ -1858,6 +1863,7 @@ private laid_down(t: TExpr) -> bool = *t.kind match
     TNullLit(_) -> true
     TArrayLit(elems, _) -> all_laid_down(elems)
     TArrayFill(value, _) -> laid_down(value)
+    TBufLit(elems, _) -> all_laid_down(elems)
     TStructNew(_, args) -> all_laid_down(args)
     TEnumNew(_, variant, _) -> !variant.carries
     TCast(inner, to) ->
@@ -1878,6 +1884,23 @@ private all_laid_down(xs: Buf[TExpr]) -> bool
     true
 end all_laid_down
 
+// Whether an initializer laid down as data would build a view: a slice literal, anywhere inside the
+// arrays and structs it is made of.
+private builds_view(t: TExpr) -> bool = *t.kind match
+    TBufLit(_, _) -> true
+    TArrayLit(elems, _) -> any_builds_view(elems)
+    TArrayFill(value, _) -> builds_view(value)
+    TStructNew(_, args) -> any_builds_view(args)
+    TConstrainedCheck(value, _) -> builds_view(value)
+    _ -> false
+
+private any_builds_view(xs: Buf[TExpr]) -> bool
+    for item in xs
+        if builds_view(item) then return true
+
+    false
+end any_builds_view
+
 // **Constant data**: an initializer whose every scalar is a constant expression -- what a `const`
 // may be written as, `reference/modules.md § const — a value` -- and the arrays, structs and variants
 // carrying nothing that are built from them, written back as the literals they come to so the
@@ -1890,6 +1913,7 @@ end all_laid_down
 private static_image(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
     TArrayLit(elems, ty) -> static_images(cx, elems).map(xs -> TExpr(t.span, TArrayLit(xs, ty)))
     TArrayFill(value, ty) -> static_image(cx, value).map(x -> TExpr(t.span, TArrayFill(x, ty)))
+    TBufLit(elems, ty) -> static_images(cx, elems).map(xs -> TExpr(t.span, TBufLit(xs, ty)))
     TStructNew(decl, args) -> static_images(cx, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
     TCast(inner, to) -> cast_image(t, inner, to, cx.an.tables.layout.little_endian)
     TConstrainedCheck(value, target) -> constrained_image(cx, t, value, target)

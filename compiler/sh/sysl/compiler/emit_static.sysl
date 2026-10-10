@@ -182,6 +182,10 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
 
         VArray(elems)
 
+    // A slice over literals: its elements laid down as an array of their own, and the view over them
+    // with no owner -- the three words a string literal is, so nothing ever counts it.
+    TBufLit(items, slice_ty) -> view_const(e, items, slice_ty)
+
     // A struct constant lists its fields in the order the type declares them, and skips the ones that
     // occupy nothing -- the initializer has to match the type this module emitted.
     TStructNew(decl, args) ->
@@ -296,6 +300,37 @@ string_const(e: *Emit, s: string) -> Val
     fields.push(ir_arg(word_lty(e), VInt(from_int(long(s.bytes.len)))))
     VAgg(fields)
 end string_const
+
+// A slice literal as a value: the owner nothing frees, its elements, and how many there are. **The
+// elements are read-only data only where the view is**: a `[]T` is written through wherever it is
+// held, a `val` included, so its array goes in writable data -- still never counted and never freed.
+private view_const(e: *Emit, items: Buf[TExpr], slice_ty: Type) -> Val
+    if items.is_empty() then return VZero
+
+    val ety = element(slice_ty).unwrap_or(int_type())
+    val read_only = underlying(slice_ty) match
+        Slice(_, ro) -> ro
+        _ -> false
+
+    var elems: Buf[IrArg] = buf()
+
+    for item in items
+        elems.push(ir_arg(lty(e, ety), constant_value(e, item)))
+
+    e.table_id += 1
+
+    val name = s".view${e.table_id}"
+
+    e.globals.push(IrGlobal(name, read_only, LArr(int(items.len()), lty(e, ety)), Some(VArray(elems)),
+                            LinkPrivate, None, e.layout.storage_align(ety), false, false, false))
+
+    var fields: Buf[IrArg] = buf()
+
+    fields.push(ir_arg(LPtr, VNull))
+    fields.push(ir_arg(LPtr, VGlobal(name)))
+    fields.push(ir_arg(word_lty(e), VInt(from_int(long(items.len())))))
+    VAgg(fields)
+end view_const
 
 // An embedded file as a value: the owner nothing frees, its bytes, and how many there are.
 //

@@ -32,24 +32,34 @@ struct Unshareable
 end Unshareable
 
 // The part of a type that may not be shared, or nothing where every count it reaches is atomic.
-unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None)
+unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false)
 
-private share_walk(t: Type, path: Buf[string], holder: Option[Type]) -> Option[Unshareable] = t match
-    Ref(_, sync) -> if sync then None else Some(Unshareable(path, t, holder))
+// The same question of storage **laid down as data**, whose every view and string is a literal's
+// and whose every reference is its type's empty one: no owner, so no count to keep. What can still come to hold one is a view written through -- a
+// `[]T` in a `val` -- since a store into it puts there whatever the program made, so its elements
+// are asked as ordinary values are.
+laid_unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, true)
+
+private share_walk(t: Type, path: Buf[string], holder: Option[Type],
+                   laid: bool) -> Option[Unshareable] = t match
+    Ref(_, sync) -> if sync || laid then None else Some(Unshareable(path, t, holder))
     Ptr(_) -> None
-    Weak(_) -> Some(Unshareable(path, t, holder))
-    Slice(_, _) -> Some(Unshareable(path, t, holder))
-    Str -> Some(Unshareable(path, t, holder))
+    Weak(_) -> if laid then None else Some(Unshareable(path, t, holder))
+    Slice(elem, read_only) ->
+        if !laid then Some(Unshareable(path, t, holder))
+        else if read_only then None
+        else share_walk(*elem, path, holder, false)
+    Str -> if laid then None else Some(Unshareable(path, t, holder))
 
     // An array *is* its elements, so sharing one shares each of them; the path stops at the field,
     // since naming the element is what the reported type already does.
-    Array(_, elem) -> share_walk(*elem, path, holder)
+    Array(_, elem) -> share_walk(*elem, path, holder, laid)
 
-    Constrained(d) -> share_walk(d.base, path, holder)
-    Struct(d) -> share_walk_fields(d.fields, path, "", t)
+    Constrained(d) -> share_walk(d.base, path, holder, laid)
+    Struct(d) -> share_walk_fields(d.fields, path, "", t, laid)
 
     // A data enum shares one payload region, so every variant's fields are reachable from it.
-    Enum(d) -> share_walk_variants(d.variants, path, t)
+    Enum(d) -> share_walk_variants(d.variants, path, t, laid)
 
     // A type parameter promises nothing about its counts, and nothing is decided here: the
     // instantiation resolves this type again with an argument in its place, and that is where the
@@ -58,10 +68,10 @@ private share_walk(t: Type, path: Buf[string], holder: Option[Type]) -> Option[U
     _ -> None
 
 private share_walk_fields(fields: Buf[(string, Type)], path: Buf[string],
-                          prefix: string, holder: Type) -> Option[Unshareable]
+                          prefix: string, holder: Type, laid: bool) -> Option[Unshareable]
     for item in fields
         val named = if prefix == "" then item.0 else s"$prefix(${item.0})"
-        val found = share_walk(item.1, extended_path(path, named), Some(holder))
+        val found = share_walk(item.1, extended_path(path, named), Some(holder), laid)
 
         if found.is_some() then return found
 
@@ -69,9 +79,9 @@ private share_walk_fields(fields: Buf[(string, Type)], path: Buf[string],
 end share_walk_fields
 
 private share_walk_variants(variants: Buf[EnumVariant], path: Buf[string],
-                            holder: Type) -> Option[Unshareable]
+                            holder: Type, laid: bool) -> Option[Unshareable]
     for item in variants
-        val found = share_walk_fields(item.fields, path, item.name, holder)
+        val found = share_walk_fields(item.fields, path, item.name, holder, laid)
 
         if found.is_some() then return found
 
@@ -432,9 +442,9 @@ private erased_inner(t: Type) -> Type = t match
 // Why one piece of module storage may not be reached from the root, or nothing where it may.
 private storage_complaint(a: &Analysis, r: DomainRoot, v: TVal, reader: string,
                           parks: bool) -> Option[string]
-    if v.thread_local || (!v.writable && !v.computed) then return None
+    if v.thread_local then return None
 
-    val part = unshareable(v.ty)
+    val part = if !v.writable && !v.computed then laid_unshareable(v.ty) else unshareable(v.ty)
 
     if part.is_none() then return None
 
