@@ -1,0 +1,69 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// `general_regs_only` asks only what the program REACHES (`codegen_features.sysl`'s
+// `check_general_regs`). The standard module's `@export`s are typed in every compilation --
+// `sysl.softfloat`'s binary128 routines take a `real` and call `bits` on it -- so a check over the
+// typed program refused every freestanding build under the setting over library code it never emits.
+
+private gro_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A freestanding archive project under `general_regs_only` whose one file is `main`, built with
+// `build-c`: the status, and everything the command said.
+private gro_build(main: string) -> (int, string)
+    val root = make_temp_dir("sysl-gro").unwrap()
+
+    write_text(s"$root/package.hocon",
+               "package {\n  name = \"probe\"\n}\n\ncodegen {\n  general_regs_only = true\n}\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", s"$root/p.a", root]
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args[..], piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    use_codegen_features(no_codegen_features())
+    remove_dir_all(root).unwrap_or(())
+    (code, text)
+end gro_build
+
+@test("a general_regs_only program printing an integer and a string builds, the library's float code unreached")
+gro_integer_and_string_print_builds()
+    if !gro_ready() then return
+
+    val got = gro_build("@export(\"kmain\")\nkmain() -> int\n    print(42)\n    print(\"hi\")\n    0\n")
+
+    assert(!got.1.contains("general-purpose registers"), got.1)
+    assert_eq(got.0, 0)
+end gro_integer_and_string_print_builds
+
+@test("a general_regs_only program touching no float at all builds")
+gro_no_float_builds()
+    if !gro_ready() then return
+
+    val got = gro_build("@export(\"kmain\")\nkmain() -> int = 7\n")
+
+    assert(!got.1.contains("float_bits.sysl"), got.1)
+    assert_eq(got.0, 0)
+end gro_no_float_builds
+
+@test("a general_regs_only program printing a float is refused at its own line")
+gro_float_print_refused_at_the_program()
+    if !gro_ready() then return
+
+    val got = gro_build("@export(\"kmain\")\nkmain() -> int\n    print(1.5)\n    0\n")
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains("'kmain' computes with 'real' here, and this build keeps to the " +
+                          "general-purpose registers"), got.1)
+    assert(got.1.contains("main.sysl:3:"), got.1)
+end gro_float_print_refused_at_the_program
