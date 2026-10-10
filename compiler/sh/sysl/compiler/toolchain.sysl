@@ -486,7 +486,14 @@ end last_section
 // helper the exported one calls, and the image may implement names nobody listed (`bzero`,
 // `strlen`). So the rule is clang's, for the whole program, and the C a package carries is compiled
 // `-ffreestanding` beside it (`c_target_flags`).
-function_attributes(t: Target, flags: Buf[string] = extra_cflags()) -> Buf[string]
+//
+// **`libcalls` says the compilation itself defines a C runtime name** (`defines_libcall`), and then
+// a hosted target is marked the same way -- C's `-fno-builtin` for the translation unit. The trap is
+// the freestanding one: an `@export("strlen")` loop became a `ret` and an `@export("memset")` loop a
+// `b _memset`, because LLVM recognises a function as the routine it is implementing by its *LLVM*
+// name (`mylib$c_strlen`), never by the symbol the export publishes. A compilation defining no such
+// name keeps every builtin.
+function_attributes(t: Target, flags: Buf[string] = extra_cflags(), libcalls: bool = false) -> Buf[string]
     var out: Buf[string] = buf()
 
     out.push("nounwind")
@@ -495,7 +502,7 @@ function_attributes(t: Target, flags: Buf[string] = extra_cflags()) -> Buf[strin
         Some(u) -> out.push(u)
         None -> ()
 
-    if !os_hosted(t.os) then out.push("\"no-builtins\"")
+    if !os_hosted(t.os) || libcalls then out.push("\"no-builtins\"")
 
     val sanitizers = sanitizer_attrs(flags)
 
@@ -529,7 +536,83 @@ unwind_table(t: Target) -> Option[string] = t.triple match
 // The text clang is handed for a module built for `t`: every definition marked with the function
 // attributes. Wherever IR is written for clang it goes through here, and `emit-llvm` prints it, so a
 // reader sees exactly what was compiled.
-for_clang(ir: string, t: Target) -> string = sanitized(ir, function_attributes(t))
+//
+// `libcalls` is asked of the WHOLE text: a codegen unit is a part of it, and a helper in one unit
+// doing a byte loop for a `memset` defined in another recurses just the same.
+for_clang(ir: string, t: Target) -> string = for_clang_unit(ir, t, defines_libcall(ir))
+
+// `for_clang` over one codegen unit, with `libcalls` asked of the text the unit was cut from.
+for_clang_unit(ir: string, t: Target, libcalls: bool) -> string =
+    sanitized(ir, function_attributes(t, extra_cflags(), libcalls))
+
+// Whether `ir` defines a function under a name LLVM may synthesise a call to (`is_libcall_name`) --
+// an `@export` publishing one, or a root-module function whose own symbol is one.
+defines_libcall(ir: string) -> bool
+    var at: usize = 0
+
+    loop
+        if ir[at..<ir.bytes.len].starts_with("define ") && is_libcall_name(defined_symbol(ir, at))
+            return true
+
+        val next = ir.index_of_byte_from(u8('\n'), at)
+
+        if next.is_none() then return false
+
+        at = next.unwrap() + 1
+end defines_libcall
+
+// The symbol a `define` line starting at `at` names, its quotes taken off; empty where the line
+// holds none.
+private defined_symbol(ir: string, at: usize) -> string
+    val end_of_line = ir.index_of_byte_from(u8('\n'), at).unwrap_or(ir.bytes.len)
+    val sigil = ir.index_of_byte_from(u8('@'), at).unwrap_or(end_of_line)
+
+    if sigil >= end_of_line then return ""
+
+    val open = ir.index_of_byte_from(u8('('), sigil).unwrap_or(end_of_line)
+    val name = ir[(sigil + 1)..<open]
+
+    if name.starts_with("\"") && name.ends_with("\"") && name.bytes.len >= 2 then name[1..<(name.bytes.len - 1)]
+    else name
+end defined_symbol
+
+// **The names LLVM's optimizer may write a call to on its own**, from what `TargetLibraryInfo` lets
+// it emit: loop idioms become `memset`/`memcpy`/`memmove`/`bzero`/`strlen`/`memcmp`/`bcmp`, a
+// `malloc` followed by a zeroing becomes `calloc`, `printf` becomes `puts`, and an expression of the
+// right shape becomes the libm routine. A program defining one of them and compiled with the
+// builtins on is one whose definition may be turned into a call to itself, so `function_attributes`
+// takes the builtins away for the whole compilation, as C's `-fno-builtin` does for a translation
+// unit. A math name is listed once and stands for its `f` and `l` forms too.
+is_libcall_name(name: string) -> bool
+    if name == "" then return false
+
+    for item in runtime_libcalls()
+        if item == name then return true
+
+    for item in math_libcalls()
+        if item == name || s"${item}f" == name || s"${item}l" == name then return true
+
+    false
+end is_libcall_name
+
+private runtime_libcalls() -> []const string =
+    ["memset", "memset_pattern4", "memset_pattern8", "memset_pattern16", "memcpy", "mempcpy", "memccpy",
+     "memmove", "memcmp", "bcmp", "bzero", "memchr", "memrchr", "strlen", "strnlen", "wcslen", "strcpy",
+     "stpcpy", "strncpy", "stpncpy", "strcat", "strncat", "strcmp", "strncmp", "strchr", "strrchr",
+     "strstr", "strspn", "strcspn", "strpbrk", "strdup", "strndup", "strtol", "strtoul", "strtoll",
+     "strtoull", "atoi", "atol", "atoll", "abs", "labs", "llabs", "ffs", "ffsl", "ffsll", "fls", "flsl",
+     "flsll", "isdigit", "isascii", "toascii", "malloc", "calloc", "realloc", "free", "aligned_alloc",
+     "posix_memalign", "putchar", "puts", "printf", "sprintf", "snprintf", "fprintf", "fputc", "fputs",
+     "fwrite", "fputc_unlocked", "fwrite_unlocked", "fputs_unlocked", "__memcpy_chk", "__memmove_chk",
+     "__memset_chk", "__strcpy_chk", "__stpcpy_chk", "__strncpy_chk", "__strlen_chk", "__bzero",
+     "__sincos_stret", "__sincospi_stret"]
+
+private math_libcalls() -> []const string =
+    ["sqrt", "fabs", "floor", "ceil", "trunc", "round", "roundeven", "rint", "nearbyint", "lround",
+     "llround", "lrint", "llrint", "fmin", "fmax", "fmod", "copysign", "exp", "exp2", "exp10", "expm1",
+     "log", "log2", "log10", "log1p", "logb", "pow", "sin", "cos", "tan", "sinh", "cosh", "tanh", "asin",
+     "acos", "atan", "atan2", "sincos", "sinpi", "cospi", "cbrt", "hypot", "ldexp", "frexp", "modf",
+     "ilogb", "scalbn"]
 
 private split_on_space(text: string) -> Buf[string]
     var out: Buf[string] = buf()
@@ -954,7 +1037,7 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
     if units > 1
         split_module(ir, units) match
             Some(parts) ->
-                val made = compile_units(cc, parts, exe, target, level, false)?
+                val made = compile_units(cc, parts, exe, target, level, false, defines_libcall(ir))?
                 var rest: Buf[string] = buf()
 
                 for i in 1..<made.len()
