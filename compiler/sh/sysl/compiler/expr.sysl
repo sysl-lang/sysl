@@ -509,6 +509,11 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
     // reader, to the library's function of that name.
     if own_variant_name(cx, name) then return variant_expr(cx, span, name, expected)
 
+    // **A variant this file imported by name is asked before a function no file here may reach** --
+    // a sibling file's private function of the spelling is no candidate, and the import said which
+    // name was meant.
+    if imported_variant(cx, name) then return variant_expr(cx, span, name, expected)
+
     // A declared function standing where a callable is wanted is one, with nothing captured. It is
     // asked for only where the context says a callable, so a bare function name anywhere else is
     // still the mistake it was. **An `extern` is a declared function too**, and the closure made of
@@ -621,7 +626,13 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
         if found.is_none() && from.has(key) && reachable_key(cx.an, key, cx.scope) then
             found = Some(key)
 
-    if found.is_none() && from.has(here) then return Some(here)
+    // **A name this file imported by name is not refused for a sibling's private one**: the sibling's
+    // is no candidate here, and the import -- an enum variant, say, which no storage table holds --
+    // is what the spelling means, answered further on by whichever lookup holds it.
+    val imported = cx.scope.imports.name_key(name).is_some()
+
+    if found.is_none() && from.has(here) && (!imported || reachable_key(cx.an, here, cx.scope)) then
+        return Some(here)
 
     // This file's slot may hold a declaration that is no storage at all (its own private struct),
     // leaving a sibling's private value under the plain key -- which is still found, only to be
@@ -629,7 +640,8 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
     val plain = module_qualify(cx.scope.module_name, name)
     val own_storage = a_consts(cx).has(here) || a_vals(cx).has(here) || a_extern_vars(cx).has(here)
 
-    if found.is_none() && !own_storage && from.has(plain) && !reachable_key(cx.an, plain, cx.scope) then
+    if found.is_none() && !own_storage && !imported && from.has(plain) &&
+       !reachable_key(cx.an, plain, cx.scope) then
         return Some(plain)
 
     // **A path to a declaration its file made private still names it**, so the reader is told it is
@@ -1033,6 +1045,25 @@ variant_homes(cx: &Analyzer, name: string) -> Buf[string]
 
     nearest
 end variant_homes
+
+// Whether this file imported the name by name as an enum variant, and no function of the spelling
+// is one the file may reach -- the module's own public function still answers first.
+private imported_variant(cx: &Analyzer, name: string) -> bool
+    val bound = cx.scope.imports.name_key(name)
+
+    if bound.is_none() || enum_of_variant(cx.an, bound.unwrap()).is_none() then return false
+
+    val ext = extern_key(cx, name)
+
+    if ext.is_some() && reachable_key(cx.an, ext.unwrap(), cx.scope) then return false
+
+    val keys = function_keys(cx, name)
+
+    for i in 0..<keys.len()
+        if reachable_key(cx.an, keys.at(i), cx.scope) then return false
+
+    true
+end imported_variant
 
 // Whether the module being read declares the name as an enum variant, and declares no function of
 // that name itself. A module that declares both is left as it was, so the duplicate is still reported
