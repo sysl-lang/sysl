@@ -2253,6 +2253,34 @@ on_timer()
 Without the annotation the same archive builds, and the race it describes is the reader's to know
 about.
 
+**A `val` over a slice literal is constant data**, so it crosses. Its elements are laid down as an
+array in the object file and the view over them has no owner, exactly as a string literal's view has
+none — there is no count in it to race on, and nothing runs at startup to build it:
+
+```sysl
+static val colors: []const string = ["red", "green"]
+
+known(c: string) -> bool
+    for x in colors
+        if x == c then return true
+
+    false
+
+val job: &sync Fn() -> unit = () -> print(known("green"))
+
+job()
+```
+
+```output
+true
+```
+
+The elements have to be laid down themselves — literals, and the arrays, structs and views built
+from them. A `val` over a call is filled at startup with a counted owner like any other, and is
+refused as a `var` would be. A `[]T` without `const` can be written through, so its array goes in
+writable data, and a closure shared between domains may reach it only where its elements hold no
+count: a store into a `[]string` puts a heap string there.
+
 ### `@crossing` — where the rule is asked
 
 The rule above says *what* may cross. **`@crossing` says where**: it is the annotation a facility

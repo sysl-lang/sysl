@@ -277,3 +277,25 @@ sdt_the_values_are_the_run_time_values()
     assert_eq(sdt_prints([("m/defs.sysl", defs), ("main.sysl", main)]),
               "1288490188\n12884901888\n16777216\n44\n16 -5 -1\ntrue\n-1288490188\n")
 end sdt_the_values_are_the_run_time_values
+
+// A `val` over a slice literal is constant data too (`tests_svw_static_view.sysl`): the elements and
+// the ownerless view over them are in the object file, so a freestanding archive may read one.
+@test("a 'val' over a slice literal is laid down for a freestanding archive")
+svw_a_view_over_literals_is_laid_down_freestanding()
+    if sdt_no_library(target_named("thumbv6m-freestanding").unwrap()) then return
+
+    val out = sdt_freestanding("val Ws: []const u32 = [3, 4]\n\n" +
+                               "@export(\"main\")\nmain_entry() -> int = int(Ws[0] + Ws[1])\n")
+
+    sdt_laid_down(out, "@Ws = private constant { ptr, ptr, i32 } { ptr null, ptr @.view")
+    assert(out.contains("private constant [2 x i32] [i32 3, i32 4]"), out)
+end svw_a_view_over_literals_is_laid_down_freestanding
+
+@test("a 'val' over a call building a slice is still refused by a freestanding archive")
+svw_a_view_over_a_call_is_refused_freestanding()
+    if sdt_no_library(target_named("thumbv6m-freestanding").unwrap()) then return
+
+    assert_eq(sdt_freestanding("ws() -> []const u32 = [3, 4]\n\nval Ws: []const u32 = ws()\n\n" +
+                               "@export(\"main\")\nmain_entry() -> int = int(Ws[0])\n"),
+              sdt_refusal("Ws"))
+end svw_a_view_over_a_call_is_refused_freestanding

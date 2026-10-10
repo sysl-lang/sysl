@@ -1,0 +1,173 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// **A module `val` over a slice literal is constant data** (`analyze_body.sysl`'s `laid_down`,
+// `emit_static.sysl`'s `view_const`): its elements are laid down as a static array and the view over
+// them has no owner, the three words a string literal is. Nothing runs at startup to build it, a
+// freestanding archive may read it, and -- holding no count -- a closure shared between two domains
+// may reach it (`reference/memory.md § Module storage from another domain`). A `var` still builds its
+// view at startup, and a `val` over a call is still computed.
+
+private svw_things(init: string) -> (string, string) =
+    ("m/m.sysl", "module m\n\nval Things: []const string = " + init + "\n\n" +
+                 "has(s: string) -> bool\n    for t in Things\n        if t == s then return true\n" +
+                 "    false\n")
+
+private svw_main() -> (string, string) =
+    ("main.sysl", "import m.has\n\nval job: &sync Fn() -> unit = () -> print(has(\"a\"))\njob()\n")
+
+// The lines `emit-typed` prints for one piece of module storage, from its symbol to the next.
+private svw_storage(typed: string, symbol: string) -> string
+    val at = typed.index_of(s"symbol: \"$symbol\"")
+
+    if at.is_none() then return ""
+
+    val rest = typed[at.unwrap()..]
+
+    rest.index_of("- TVal") match
+        Some(n) -> rest[0..<n]
+        None -> rest
+end svw_storage
+
+// Whether any instruction of `ir` stores to `global`.
+private svw_stores_to(ir: string, global: string) -> bool
+    var rest = ir
+
+    loop
+        val line = rest.index_of("\n") match
+            Some(n) -> rest[0..<n]
+            None -> rest
+
+        if line.contains("store ") && line.contains(global) then return true
+
+        rest.index_of("\n") match
+            Some(n) -> rest = rest[n + 1..]
+            None -> return false
+end svw_stores_to
+
+@test("a '&sync Fn' may reach a module 'val' over string literals, and the program runs")
+svw_a_val_over_literals_crosses_into_a_sync_closure()
+    azc_prints([svw_things("[\"a\", \"b\"]"), svw_main()], "true\n")
+end svw_a_val_over_literals_crosses_into_a_sync_closure
+
+@test("the storage is not computed: emit-typed says so")
+svw_the_storage_is_not_computed()
+    val typed = azc_texts(["emit-typed"], [svw_things("[\"a\", \"b\"]"), svw_main()])
+    val shown = svw_storage(typed, "m$Things")
+
+    assert(shown.contains("computed: false"), typed)
+end svw_the_storage_is_not_computed
+
+@test("the elements are a constant array, the view a constant over it, and nothing stores to it")
+svw_the_global_is_a_constant_with_no_startup_store()
+    val ir = azc_texts(["emit-llvm"], [svw_things("[\"a\", \"b\"]"), svw_main()])
+    val global = azc_line(ir, "@m$Things = ")
+
+    assert(global.contains("private constant { ptr, ptr, i64 } { ptr null, ptr @.view"), ir)
+    assert(global.ends_with(", i64 2 }"), global)
+    assert(azc_line(ir, "@.view").contains("private constant [2 x { ptr, ptr, i64 }]"), ir)
+    assert(!svw_stores_to(ir, "@m$Things"), ir)
+end svw_the_global_is_a_constant_with_no_startup_store
+
+@test("an empty slice literal is the empty view, laid down as zeros")
+svw_an_empty_literal_is_laid_down()
+    val ir = azc_texts(["emit-llvm"], [svw_things("[]"), svw_main()])
+
+    assert(azc_line(ir, "@m$Things = ").contains("private constant { ptr, ptr, i64 } zeroinitializer"), ir)
+end svw_an_empty_literal_is_laid_down
+
+@test("structs of strings, and views of views, are laid down too, and cross")
+svw_nested_elements_are_laid_down()
+    val m = raw"""
+        module m
+
+        struct Row
+            name: string
+            n: int
+
+        val Rows: []const Row = [Row("a", 1), Row("bb", 2)]
+        val Grid: []const []const int = [[1, 2], [3]]
+
+        total() -> int
+            var sum = 0
+
+            for r in Rows
+                sum += r.n + int(r.name.bytes.len)
+
+            for row in Grid
+                for x in row
+                    sum += x
+
+            sum
+        """
+    val main = "import m.total\n\nval job: &sync Fn() -> unit = () -> print(total())\njob()\n"
+
+    azc_prints([("m/m.sysl", m), ("main.sysl", main)], "12\n")
+
+    val typed = azc_texts(["emit-typed"], [("m/m.sysl", m), ("main.sysl", main)])
+
+    assert(svw_storage(typed, "m$Rows").contains("computed: false"), typed)
+    assert(svw_storage(typed, "m$Grid").contains("computed: false"), typed)
+end svw_nested_elements_are_laid_down
+
+@test("a 'val' over a call is still computed, and still refused under '&sync' in the same words")
+svw_a_val_over_a_call_is_still_refused()
+    val files = [svw_things("names()\n\nnames() -> []const string = [\"a\", \"b\"]"), svw_main()]
+
+    azc_says(files, "a closure shared between two domains may be called from either, so every count " +
+             "it reaches has to be atomic — but the module storage 'm.Things' it reaches, which " +
+             "'m.has' reads, is a '[]const string', which owns its elements through a count that is " +
+             "not atomic. A literal's elements are immortal and would be safe to share, but nothing in " +
+             "the type says whether these are, so a shared object holds no view at all ('06')")
+
+    assert(svw_storage(azc_texts(["emit-typed"], files), "m$Things").contains("computed: true"), "computed")
+end svw_a_val_over_a_call_is_still_refused
+
+@test("a 'var' over a slice literal still builds its view at startup")
+svw_a_var_is_unchanged()
+    val m = "module m\n\nvar Things: []const string = [\"a\", \"b\"]\n\nfirst() -> string = Things[0]\n"
+    val main = "import m.first\n\nprint(first())\n"
+
+    azc_prints([("m/m.sysl", m), ("main.sysl", main)], "a\n")
+    val typed = azc_texts(["emit-typed"], [("m/m.sysl", m), ("main.sysl", main)])
+
+    assert(svw_storage(typed, "m$Things").contains("computed: true"), typed)
+end svw_a_var_is_unchanged
+
+@test("a writable '[]T' 'val' is laid down in writable data, and a write through it lands")
+svw_a_writable_view_is_writable_data()
+    val m = raw"""
+        module m
+
+        val Counts: []int = [1, 2, 3]
+
+        bump(i: usize) -> int
+            Counts[i] += 10
+            Counts[i]
+        """
+    val main = "import m.bump\n\nval job: &sync Fn() -> unit = () -> print(bump(1))\njob()\n"
+    val files = [("m/m.sysl", m), ("main.sysl", main)]
+
+    azc_prints(files, "12\n")
+
+    val ir = azc_texts(["emit-llvm"], files)
+
+    assert(azc_line(ir, "@.view").contains("private global [3 x i32] [i32 1, i32 2, i32 3]"), ir)
+end svw_a_writable_view_is_writable_data
+
+@test("a writable view whose elements hold a count is still refused under '&sync'")
+svw_a_writable_view_of_strings_is_refused()
+    val m = raw"""
+        module m
+
+        val Names: []string = ["a", "b"]
+
+        first() -> string = Names[0]
+        """
+    val main = "import m.first\n\nval job: &sync Fn() -> unit = () -> print(first())\njob()\n"
+
+    azc_says([("m/m.sysl", m), ("main.sysl", main)],
+             "but the module storage 'm.Names' it reaches, which 'm.first' reads,")
+end svw_a_writable_view_of_strings_is_refused
