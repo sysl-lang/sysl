@@ -1,0 +1,59 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// **Per-thread storage of a type with no zero is advised toward a spelling that compiles.** A
+// `@thread_local` value has to be one the object file can carry, and leaving it off starts every
+// thread at the type's zero — advice only a type WITH a zero can follow. A struct holding a `Map`
+// has none, so both refusals point at the form that does: an `Option[&T]` starting at `None`, built
+// the first time each thread reaches it.
+
+// A program declaring `Tally` (a struct over a `Map`, which has no zero) and the line given.
+private tlz_tally(line: string) -> string =
+    "import sysl.container.{Map, map}\n\nstruct Tally\n    counts: Map[string, int]\n\n" + line +
+        "\n\nprint(1)\n"
+
+// Everything `emit-typed` said about a program.
+private tlz_said(text: string) -> string = azd_cli(["sysl", "emit-typed", "--no-spans", azd_program(text).1]).1
+
+@test("tlz: a call initializer of a no-zero type is not told to leave the value off")
+tlz_call_initializer_names_the_option()
+    if !azd_ready() then return
+
+    val said = tlz_said(tlz_tally("@thread_local static var tally: Tally = Tally(map())"))
+
+    assert(said.contains("'tally' is '@thread_local', so its value has to be one"), said)
+    assert(!said.contains("Leave the value off"), said)
+    assert(said.contains("Tally has no zero to start at, so hold it as an 'Option[&Tally]' starting " +
+        "at 'None' and build it the first time each thread reaches it"), said)
+
+@test("tlz: a no-zero '@thread_local' with no initializer is told the 'Option[&T]' spelling")
+tlz_no_initializer_names_the_option()
+    if !azd_ready() then return
+
+    val said = tlz_said(tlz_tally("@thread_local static var tally: Tally"))
+
+    assert(said.contains("'tally' needs a value: storage with no initializer starts at its type's zero"), said)
+    assert(said.contains("a reference and an enum need one, so a '@thread_local' one is held as an " +
+        "'Option[&Tally]' starting at 'None' and built the first time each thread reaches it"), said)
+
+@test("tlz: a type with a zero is still told to leave the value off")
+tlz_zero_type_keeps_the_advice()
+    if !azd_ready() then return
+
+    val text = "struct Pair\n    a: int\n    b: int\n\nmake() -> Pair = Pair(1, 2)\n\n" +
+        "@thread_local static var p: Pair = make()\n\nprint(p.a)\n"
+    val said = azd_cli(["sysl", "emit-typed", "--no-spans", azd_program(text).1]).1
+
+    assert(said.contains("a call is not. Leave the value off to start every thread at the type's " +
+        "zero, and do the work in each thread instead"), said)
+    assert(!said.contains("Option[&"), said)
+
+@test("tlz: an 'Option[&T]' starting at 'None' is accepted as per-thread storage")
+tlz_option_reference_compiles()
+    if !azd_ready() then return
+
+    val said = tlz_said(tlz_tally("@thread_local static var tally: Option[&Tally] = None"))
+
+    assert(!said.contains("error:"), said)

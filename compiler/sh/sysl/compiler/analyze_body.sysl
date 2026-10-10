@@ -1621,7 +1621,7 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                     cx.fault(d.span, s"'$shown' needs a value: storage with no initializer starts at its " +
                         s"type's zero, and ${type_show(ty)} has none — the same rule a local with no " +
                         "initializer is held to. A 'string' and a slice both start empty and need no " +
-                        "value written; a reference and an enum need one")
+                        s"value written; a reference and an enum need one${built_on_first_use(d, ty)}")
                 else if !zero_sized(ty) && has_zero(ty)
                     // A zero that holds a struct carrying clauses is checked as a construction is,
                     // which makes it an initializer that runs rather than an image the object file
@@ -1669,8 +1669,8 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
                 val computed = !imaged
 
-                if d.thread_local then check_per_thread(cx, d.span, key, computed)
-                if d.per_cpu then check_per_core(cx, d.span, key, computed)
+                if d.thread_local then check_per_thread(cx, d.span, key, ty, computed)
+                if d.per_cpu then check_per_core(cx, d.span, key, ty, computed)
 
                 if d.export.is_some() then check_exported_storage(cx, d, key, ty, computed)
 
@@ -1706,7 +1706,7 @@ private refuse_storage_slots(cx: &Analyzer, init: TExpr)
 // the keyword, and a freestanding one silently gets the local-exec model, whose offset is read from
 // a register nothing on a bare machine has written -- so the alternative to this refusal is a
 // program that reads a wild address.
-private check_per_thread(cx: &Analyzer, span: Span, key: string, computed: bool)
+private check_per_thread(cx: &Analyzer, span: Span, key: string, ty: Type, computed: bool)
     val t = cx.an.tables.target
 
     // **A bare AArch64 machine has the register, and the program may own it**: a kernel writes the
@@ -1735,9 +1735,42 @@ private check_per_thread(cx: &Analyzer, span: Span, key: string, computed: bool)
                  "the compiler can write down: every thread gets a copy of the initial value, and " +
                  "the copies are made from a single image in the object file rather than by code " +
                  "that runs per thread. A literal, 'null', a 'const' and the arrays and structs " +
-                 "built from them are all values; a call is not. Leave the value off to start " +
-                 "every thread at the type's zero, and do the work in each thread instead")
+                 s"built from them are all values; a call is not. ${per_copy_advice(ty, true)}")
 end check_per_thread
+
+// What a `@thread_local` or `@per_cpu` value that cannot be written down is to be instead. Where the
+// type has a zero, every copy starts there and the work is done per copy; where it has none, leaving
+// the value off is refused in its turn, so the advice is the spelling that has a zero of its own --
+// a reference held in an `Option`, `None` until each copy's first use builds it.
+private per_copy_advice(ty: Type, thread: bool) -> string
+    val copy = if thread then "thread" else "core"
+    val place = if thread then "in each thread" else "on each core"
+
+    if has_zero(ty)
+        return s"Leave the value off to start every $copy at the type's zero, and do the work " +
+            s"$place instead"
+
+    s"${type_show(ty)} has no zero to start at, so hold it as an '${held_optionally(ty)}' " +
+        s"starting at 'None' and build it the first time each $copy reaches it"
+end per_copy_advice
+
+// The `Option` a value with no zero is held in until it is built: a reference as it is, anything else
+// behind one.
+private held_optionally(ty: Type) -> string = ty match
+    Ref(_, _) -> s"Option[${type_show(ty)}]"
+    _ -> s"Option[&${type_show(ty)}]"
+
+// The tail the no-initializer refusal carries for per-thread and per-core storage, which has the
+// `Option` spelling to turn to; ordinary storage is told only that it needs a value.
+private built_on_first_use(d: ValueDecl, ty: Type) -> string
+    if !d.thread_local && !d.per_cpu then return ""
+
+    val attr = if d.thread_local then "@thread_local" else "@per_cpu"
+    val copy = if d.thread_local then "thread" else "core"
+
+    s", so a '$attr' one is held as an '${held_optionally(ty)}' starting at 'None' and built the " +
+        s"first time each $copy reaches it"
+end built_on_first_use
 
 // What `@export` above module storage asks that plain storage does not
 // (`reference/ffi.md § Exported storage`): a symbol C can spell, a type C can declare, and a starting
@@ -1780,9 +1813,17 @@ private check_exported_storage(cx: &Analyzer, d: ValueDecl, key: string, ty: Typ
                  "has run — an exported object starts at the value the object file carries, and " +
                  "this initializer is code that runs before the program's statements. Make it " +
                  "constant data — a literal, a 'const', the address of other module storage, and " +
-                 "the arrays and structs built from those — or leave the value off to start it at " +
-                 "its type's zero and fill it from a function C calls first")
+                 s"the arrays and structs built from those${exported_zero_advice(ty)}")
 end check_exported_storage
+
+// Leaving an exported object's value off is advice only where its type has a zero to start at; one
+// with none (a simple enum) would be refused for needing a value in its turn.
+private exported_zero_advice(ty: Type) -> string
+    if has_zero(ty)
+        return " — or leave the value off to start it at its type's zero and fill it from a " +
+            "function C calls first"
+
+    s", since ${type_show(ty)} has no zero to start it at"
 
 // The shapes exported storage may take, in the sentence a refusal quotes.
 storage_spellable() -> string =
@@ -1813,7 +1854,7 @@ end storage_hidden
 // names the register holding this core's offset, and an initializer the image can carry -- every
 // core's copy is made from the one `.percpu` image, so there is no per-core prologue for code to run
 // in either.
-private check_per_core(cx: &Analyzer, span: Span, key: string, computed: bool)
+private check_per_core(cx: &Analyzer, span: Span, key: string, ty: Type, computed: bool)
     val t = cx.an.tables.target
 
     if t.cpu != Aarch64 || t.os != Freestanding
@@ -1834,8 +1875,7 @@ private check_per_core(cx: &Analyzer, span: Span, key: string, computed: bool)
                  "has to be one the compiler can write down: every core's copy is made from the one " +
                  "'.percpu' image in the object file rather than by code that runs per core. A " +
                  "literal, 'null', a 'const' and the arrays and structs built from them are all " +
-                 "values; a call is not. Leave the value off to start every core at the type's " +
-                 "zero, and do the work on each core instead")
+                 s"values; a call is not. ${per_copy_advice(ty, false)}")
 end check_per_core
 
 private is_zero_expr(e: TExpr) -> bool = *e.kind match
