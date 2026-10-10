@@ -1,0 +1,155 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{split, Search}
+
+// `va_arg` reading a measured `c type` (`special.sysl`'s `va_readable`, `emit_va_arg.sysl`'s
+// `gen_va_arg`). A `c type` went INTO a `...` tail as its base, and reading one back out was refused
+// as though it were not a scalar at all -- so a C-shaped `printf` could not take `%ld`. It is read at
+// the width the target measured, which is four bytes for `long` on a 32-bit Arm machine and eight on
+// an LP64 one; a checking subtype, a narrow measured integer, a `float` and a `_Bool` stay refused.
+
+private vct_types() -> string = raw"""
+    @include("<stddef.h>")
+    @include("<stdint.h>")
+
+    c type
+        Long  = "long"
+        ULong = "unsigned long"
+        Size  = "size_t"
+        LLong = "long long"
+        Diff  = "ptrdiff_t"
+        IMax  = "intmax_t"
+        Dbl   = "double"
+    """
+
+private vct_reader(name: string, ty: string) -> string =
+    s"$name(n: int, ...) -> $ty\n" +
+    "    var ap: va_list\n" +
+    "    va_start(ap)\n" +
+    s"    val v: $ty = va_arg(ap)\n" +
+    "    va_end(ap)\n" +
+    "    v\n" +
+    s"end $name\n"
+
+private vct_program() -> string =
+    vct_types() +
+    vct_reader("read_long", "Long") +
+    vct_reader("read_ulong", "ULong") +
+    vct_reader("read_size", "Size") +
+    vct_reader("read_llong", "LLong") +
+    vct_reader("read_diff", "Diff") +
+    vct_reader("read_imax", "IMax") +
+    vct_reader("read_dbl", "Dbl")
+
+@test("every integer 'c type' a printf needs reads back through '...' at its measured width")
+vct_measured_integers_read_back()
+    if !enm_ready() then return
+
+    val text = vct_program() + raw"""
+        val neg: Long = -7
+        val big: Long = 5000000000
+        val ul: ULong = 4294967301
+        val sz: Size = 41
+        val ll: LLong = -9000000000
+        val d: Diff = -3
+        val m: IMax = 123456789012
+        val r: Dbl = 2.5
+
+        print(read_long(1, neg))
+        print(read_long(1, big))
+        print(read_ulong(1, ul))
+        print(read_size(1, sz))
+        print(read_llong(1, ll))
+        print(read_diff(1, d))
+        print(read_imax(1, m))
+        print(read_dbl(1, r))
+        """
+
+    assert_eq(enm_ran(text), "-7\n5000000000\n4294967301\n41\n-9000000000\n-3\n123456789012\n2.5\n")
+
+// The text of the program at `target`, with `call` printed so that what it defines is reached.
+private vct_ir(target: string, call: string) -> string = cab_ir_for(target, vct_program() + s"\nprint($call)\n")
+
+private vct_define(ir: string, symbol: string) -> string
+    for item in func_texts(ir)
+        if item.0 == symbol then return item.1
+
+    s"nothing defines '$symbol' in:\n$ir"
+end vct_define
+
+// The line of a lowered body that reads the next argument with LLVM's instruction.
+private vct_va_arg_line(body: string) -> string
+    for line in split(body, "\n")
+        if line.contains("va_arg ptr") then return line.trim()
+
+    s"no va_arg instruction in:\n$body"
+end vct_va_arg_line
+
+@test("on a 32-bit Arm machine 'long' is read as four bytes and 'long long' as eight")
+vct_thumb_reads_the_measured_width()
+    if !enm_ready() then return
+
+    val ir = vct_ir("thumb-freestanding", "read_long(1, Long(1)) + Long(read_llong(1, LLong(2))) + " +
+                    "Long(read_size(1, Size(3)))")
+    val long_read = vct_va_arg_line(vct_define(ir, "read_long"))
+    val llong_read = vct_va_arg_line(vct_define(ir, "read_llong"))
+    val size_read = vct_va_arg_line(vct_define(ir, "read_size"))
+
+    assert(long_read.ends_with(", i32"), long_read)
+    assert(llong_read.ends_with(", i64"), llong_read)
+    assert(size_read.ends_with(", i32"), size_read)
+
+    // And on an LP64 machine the same source reads eight.
+    val host_read = vct_va_arg_line(vct_define(vct_ir("aarch64-macos", "read_long(1, Long(1))"), "read_long"))
+
+    assert(host_read.ends_with(", i64"), host_read)
+
+@test("an AAPCS64 machine walks a measured 'long' through the general registers and a 'double' through the vector ones")
+vct_aapcs64_walks_by_the_base_class()
+    if !enm_ready() then return
+
+    val ir = vct_ir("aarch64-linux", "read_long(1, Long(1)) + Long(read_dbl(1, Dbl(2.0)))")
+    val long_body = vct_define(ir, "read_long")
+    val dbl_body = vct_define(ir, "read_dbl")
+
+    assert(!long_body.contains("va_arg ptr"), long_body)
+    // `__gr_offs` at 24 for the integer, `__vr_offs` at 28 for the double.
+    assert(long_body.contains("i64 24") && !long_body.contains("i64 28"), long_body)
+    assert(dbl_body.contains("i64 28"), dbl_body)
+
+private vct_read_as(decls: string, ty: string) -> string = decls + vct_reader("first", ty) + "print(first(0))\n"
+
+@test("a measured type that is not a promoted width is refused under its own name")
+vct_unreadable_measured_types_are_refused()
+    if !enm_ready() then return
+
+    val narrow = azd_err(vct_read_as("c type\n    Short = \"short\"\n\n", "Short"))
+
+    assert(narrow.contains("a variadic argument is promoted to at least 32 bits, so it cannot be read as " +
+                           "Short (short here) — read it as 'int' and convert"), narrow)
+
+    val flt = azd_err(vct_read_as("c type\n    Flt = \"float\"\n\n", "Flt"))
+
+    assert(flt.contains("a variadic argument is promoted to double, so it cannot be read as Flt (f32 here)"),
+           flt)
+
+    val flag = azd_err(vct_read_as("c type\n    Flag = \"_Bool\"\n\n", "Flag"))
+
+    assert(flag.contains("a variadic argument cannot be read as"), flag)
+    assert(flag.contains("such as a 'c type'"), flag)
+
+@test("a subtype that checks its values is refused, naming the base to read")
+vct_a_checking_subtype_is_refused()
+    if !enm_ready() then return
+
+    val said = azd_err(vct_read_as("type Age = int within 0..150\n\n", "Age"))
+
+    assert(said.contains("a variadic argument cannot be read as Age — it checks its values, and C hands " +
+                         "back a bare int that check would never see; read it as that and convert"), said)
+
+@test("a name-only subtype of a promoted width reads as its base")
+vct_a_name_only_subtype_reads()
+    if !enm_ready() then return
+
+    assert_eq(azd_err(vct_read_as("type Count = new int\n\n", "Count")), "")
