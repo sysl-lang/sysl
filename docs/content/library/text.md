@@ -767,13 +767,13 @@ interchangeable and are not: a `Writer` is a sink for bytes and a builder is a p
 allocation.** The spelling without them is `push(str(n))`, which builds a whole reference-counted
 `string` — a heap object with a refcount and a deallocation hook — copies its bytes out, and drops
 it, for a value whose text is a couple of dozen bytes and is wanted only inside this buffer. A stack
-array and the library's own digit loop — `digits_long` for an integer, the correctly rounded `%g`
-renderer for a float — is the same rendering with none of that.
+array and the library's own digit loop — `digits_long` for an integer, the shortest-digits renderer
+for a float — is the same rendering with none of that.
 
 They agree with `str` to the byte, and that is the property that makes the cheap path a *substitute*
 rather than a second rendering: a program that builds half a line with a builder and half with an
-interpolation must not be able to tell which half a number came through. `push_real` is `%g` for the
-same reason.
+interpolation must not be able to tell which half a number came through. `push_real` writes what
+`str` writes for the same reason.
 
 They take `long` and `ulong` rather than one member per width — the bargain the `print` family
 makes. [Overloading](/reference/declarations/) would give a set of members one *name*; it would not
@@ -952,7 +952,7 @@ print(parse_f32("1.00000005960464477550").unwrap().bits() == 0x3f800001)
 ```
 
 ```output
-0.3
+0.30000000000000004
 true
 inf -0
 true

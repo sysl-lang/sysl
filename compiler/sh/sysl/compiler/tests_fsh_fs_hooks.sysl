@@ -497,6 +497,43 @@ fsh_floats_need_no_libc()
     lbr_drop([p, out])
 end fsh_floats_need_no_libc
 
+// Every width printed plainly, which is Rust's `{}` rendering, written straight to the sink: on a
+// target with no C library it needs neither `snprintf` nor an allocator for the digits.
+private val fsh_plain_floats: string = raw"""
+    run() -> int
+        print(1e300, f32(0.1), f16(0.5), bf16(0.5), 0.1f128)
+
+        int(str(f16(0.25)).bytes.len + str(bf16(0.25)).bytes.len + str(1.5f128).bytes.len)
+    end run
+
+    @export("putchar")
+    put_char(c: int) -> int = c
+
+    @export("exit")
+    stop(code: int) -> never
+        loop
+            ()
+    """
+
+@test("a freestanding program printing every float width plainly links with no snprintf")
+fsh_plain_floats_need_no_libc()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_plain_floats + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    assert(!fsh_names(all, "snprintf"), "'snprintf' is in the image")
+    assert(all.contains("write_plain"), all)
+
+    lbr_drop([p, out])
+end fsh_plain_floats_need_no_libc
+
 @test("on a hosted target a plain float hole is unchanged: it runs and prints")
 fsh_hosted_float_hole_prints()
     if !lbr_ready() then return

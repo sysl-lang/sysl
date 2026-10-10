@@ -23,14 +23,13 @@ print(0.1 + 0.2, 0.1 + 0.2 == 0.3)
 
 ```output
 0.3 true
-0.3 false
+0.30000000000000004 false
 ```
 
-**Look at the second line rather than the first.** The float sum *renders* as `0.3` — sysl's real
-rendering rounds for display — and is not equal to `0.3`, because it is
-`0.30000000000000004` and always was. So the error is invisible in the output and real in every
-comparison, which is the worst way round: a program can print a plausible total for a year before
-anybody sums a column and finds it short.
+**Look at the second line rather than the first.** The float sum is `0.30000000000000004` and always
+was — `print` writes the digits that read back as it, so they show — and it is not equal to `0.3`.
+Nothing about the sum is wrong as binary arithmetic; it is the wrong arithmetic for money, and the
+difference lands in every comparison and every total.
 
 It accumulates, too:
 
@@ -50,7 +49,7 @@ print(to_string(exact), exact == from_int(10))
 ```
 
 ```output
-10 false
+9.99999999999998 false
 10.00 true
 ```
 

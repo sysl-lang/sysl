@@ -107,8 +107,11 @@ no padding.
 
 ## Floats
 
-A float under `%f`, `%e` or `%g` — and in a plain hole, and through `str`, which are `%g` — is rendered
-by `format_real`, or `format_f32` for an `f32`, flag for flag as C's `printf` renders a `double`:
+A float under `%f`, `%e` or `%g` is rendered by `format_real`, or `format_f32` for an `f32`, flag for
+flag as C's `printf` renders a `double`. A plain hole and `str` are not a specifier: they write what
+`print` writes, which is what Rust's `{}` writes — the fewest digits that read back, set out
+positionally ([`print`](/library/core/#rendering-to-standard-output) has the rule) — through
+`format_real_plain` and its siblings at each width:
 
 ```sysl
 val x = 3.14159265358979
@@ -152,7 +155,8 @@ is `1.00000e+06` — and `format_real` writes `1e+06`, as glibc does.
 `%g`'s six digits lose a value, and seventeen print noise after one that needed fewer. What a
 serializer wants is **the fewest digits that read back as the same float**, and `shortest` gives
 it — among those, the one nearest the value, and a tie to the even digit, which is the reading
-JavaScript and Python print. The algorithm is Ryu. An `f32` is read at its own width, so it is
+JavaScript and Python print. They are the digits `print` and `str` write too, spelled here with
+`%g`'s exponent where they set them out positionally. The algorithm is Ryu. An `f32` is read at its own width, so it is
 usually shorter than the same value widened:
 
 ```sysl
@@ -177,6 +181,7 @@ exponent digits, and never a trailing zero or point. Reading any of them back is
 | `format_real(x, spec, width, precision)` | a `real` under a printf specifier; `width` and `precision` are what a `*` reads |
 | `format_f32(x, spec, width, precision)` | the same for an `f32`, taken apart at its own width |
 | `shortest(x)` | the fewest digits that read back as `x`, a `real` or an `f32` |
+| `format_real_plain(x)` | a `real` as `str` and a plain hole write it: Rust's `{}`; `format_f32_plain`, `format_f16_plain`, `format_bf16_plain` and `format_f128_plain` at the other widths |
 
 ## They are the f-string's renderer, so a bare target has them too
 

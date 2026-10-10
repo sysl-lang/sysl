@@ -27,7 +27,7 @@ print(u.count_ones(), u.rotate_left(1u32))
 ```
 
 ```output
-1.41421 3.14159 3
+1.4142135623730951 3.141592653589793 3
 3 22
 ```
 
@@ -41,13 +41,13 @@ print(sqrt2, ln2, ln10)
 ```
 
 ```output
-3.14159 6.28319 2.71828
-1.41421 0.693147 2.30259
+3.141592653589793 6.283185307179586 2.718281828459045
+1.4142135623730951 0.6931471805599453 2.302585092994046
 ```
 
-Those are the full-precision values printed by `%g`'s six significant digits, which is what
-[`print`](/library/core/) does with a float. The constants themselves carry every digit a `real`
-holds.
+Each is printed in the fewest digits that read back as it, which is what
+[`print`](/library/core/#rendering-to-standard-output) does with a float — every digit a `real`
+holds, and no more.
 
 **All six are `real`**, which is the width they are correct to and the width arithmetic reaches for
 unless a program says otherwise. An `f32` program writes `f32(pi)`: the conversion is a constant the
@@ -162,7 +162,7 @@ var h: f16 = 9.0
 var b: bf16 = 9.0
 
 print(h.sqrt(), b.sqrt())
-print(f16.max_value(), bf16.epsilon())
+print(real(f16.max_value()), real(bf16.epsilon()))
 ```
 
 ```output
@@ -172,7 +172,8 @@ print(f16.max_value(), bf16.epsilon())
 
 The constants are each width's own, and they are where the two sixteen-bit formats differ most: the
 largest finite `f16` is 65504, while `bf16` reaches as far as an `f32` and gives up significand to do
-it.
+it. They are widened to print every digit they hold, since `print` writes the fewest digits that read
+back at a value's own width — and for the largest `f16` that is `65500`.
 
 ```sysl
 import sysl.math.{Float, tau, e}
@@ -192,11 +193,11 @@ print(quarter.sin(), quarter.cos())
 ```
 
 ```output
-1.41421 2
+1.4142135623730951 2
 1 4
 2 3 4
 1024 5
-1 6.12323e-17
+1 0.00000000000000006123233995736766
 ```
 
 Four of those lines are decisions rather than arithmetic.
@@ -287,9 +288,9 @@ print(neg.asinh(), below.acosh().is_nan(), outside.atanh().is_nan())
 ```
 
 ```output
-1.1752 1.54308 0.761594
+1.1752011936438014 1.5430806348152437 0.7615941559557649
 1 2 0.5
--1.81845 true true
+-1.8184464592320668 true true
 ```
 
 **The three inverses are the ones with domains.** `acosh` wants an argument of at least one, `atanh`
@@ -314,8 +315,8 @@ print(f.sqrt(), f32.pi(), f32.epsilon())
 ```
 
 ```output
-2.22045e-16 1.79769e+308
-1.41421 3.14159 1.19209e-07
+0.0000000000000002220446049250313 179769313486231570000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+1.4142135 3.1415927 0.00000011920929
 ```
 
 **These are members with no receiver, reached through the type**, and they are what makes the defaults

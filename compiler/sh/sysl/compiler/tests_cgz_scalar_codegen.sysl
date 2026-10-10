@@ -203,12 +203,28 @@ cgz_printing_widens_to_the_renderer()
 
     val n = cgz_main("var n: long = 9\nprint(n)\n")
     val u = cgz_main("var u: ulong = 9\nprint(u)\n")
-    val f = cgz_main("var f: f32 = 1.5\nprint(f)\n")
+    val r = cgz_main("var r: real = 1.5\nprint(r)\n")
 
     assert(n.contains("call void @sysl$printi(i64 %t"), n)
     assert(u.contains("call void @sysl$printu(i64 %t"), u)
-    assert(f.contains("call void @sysl$printr(double %t"), f)
+    assert(r.contains("call void @sysl$printr(double %t"), r)
 end cgz_printing_widens_to_the_renderer
+
+// A float is the exception: the digits that read back are a property of the width, so widening an
+// `f32` to a `real` would print `0.10000000149011612` for `f32(0.1)`.
+@test("printing a float calls the renderer of its own width, with no widening")
+cgz_printing_a_float_keeps_its_width()
+    if xvr_no_library() then return
+
+    val f = cgz_main("var f: f32 = 1.5\nprint(f)\n")
+    val h = cgz_main("var h: f16 = 1.5\nprint(h)\n")
+    val b = cgz_main("var b: bf16 = 1.5\nprint(b)\n")
+
+    assert(f.contains("call void @sysl$printf32(float %t"), f)
+    assert(h.contains("call void @sysl$printf16(half %t"), h)
+    assert(b.contains("call void @sysl$printbf16(bfloat %t"), b)
+    assert(!f.contains("fpext"), f)
+end cgz_printing_a_float_keeps_its_width
 
 @test("the renderer a value reaches carries the matching conversion")
 cgz_the_renderer_carries_the_conversion()
@@ -220,8 +236,9 @@ cgz_the_renderer_carries_the_conversion()
 
     assert(unsigned.contains("@sysl$digits_ulong("), unsigned)
     assert(signed.contains("@sysl$digits_long("), signed)
-    // A float is rendered by the library's own `%g` in sysl, so no C format string is laid down.
-    assert(real.contains("call void @sysl$write_float_field("), real)
+    // A float is rendered by the library's own shortest-digits writer in sysl, so no C format string
+    // is laid down.
+    assert(real.contains("call void @sysl$write_plain("), real)
     assert(!real.contains("@snprintf("), real)
 
 // Encoding a code point is sysl in the library, not a runtime helper the compiler emits. The module

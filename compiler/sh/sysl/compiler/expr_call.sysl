@@ -715,13 +715,11 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
 
         val v = type_expr_bare(cx, args.at(0))
 
-        // An `f128` is the one float `str` writes in the fewest digits that read back, rather than
-        // `%g`'s six: a program holds the type for the digits past a `real`'s.
-        if is_quad(texpr_type(v)) then
-            return Some(library_result_call(cx, span, "format_f128_shortest", at_quad(span, v)))
+        // A float is written as Rust's `{}` writes it, at its own width: the fewest digits that read
+        // back as a value of that type, set out positionally (`sysl.fmt.format_real_plain`).
+        val plain = plain_float_call(cx, span, v)
 
-        if float_valued(texpr_type(v)) && library_key(cx, "format_real").is_some() then
-            return Some(float_format_call(cx, span, v, "%g", buf()))
+        if plain.is_some() then return plain
 
         if scalar_render(texpr_type(v)) then return Some(TExpr(span, TStr(v)))
 
@@ -1527,10 +1525,25 @@ private one_arg(v: TExpr) -> Buf[TExpr]
     out
 end one_arg
 
-// Whether a value of `t` is a float of any width.
-private float_valued(t: Type) -> bool = underlying(t) match
-    Floating(_, _) -> true
-    _ -> false
+// `str` of a float: the library's plain renderer for its width, the value crossing at that width so
+// that its digits are the ones the width needs. None where the value is not a float.
+private plain_float_call(cx: &Analyzer, span: Span, v: TExpr) -> Option[TExpr]
+    val ty = texpr_type(v)
+
+    val at: (string, Type) = underlying(ty) match
+        Floating(32, _) -> ("format_f32_plain", Floating(32, false))
+        Floating(16, true) -> ("format_bf16_plain", Floating(16, true))
+        Floating(16, _) -> ("format_f16_plain", Floating(16, false))
+        Floating(128, _) -> ("format_f128_plain", Floating(128, false))
+        Floating(_, _) -> ("format_real_plain", real_type())
+        _ -> ("", Unknown)
+
+    if at.0 == "" then return None
+
+    val value = if type_eq(ty, at.1) then v else TExpr(span, TCast(v, at.1))
+
+    Some(library_result_call(cx, span, at.0, value))
+end plain_float_call
 
 // Which of a specifier's two counts is a `*` read at run time: the width, the precision, or both.
 private spec_star_slots(spec: string) -> (bool, bool)

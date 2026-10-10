@@ -258,20 +258,25 @@ var h: f16 = 0.1
 var b: bf16 = 0.1
 
 print(h, b)
+print(real(h), real(b))
 
 var big: f16 = 65504.0
 var wide: bf16 = 65504.0
 
-print(big * 2.0, wide * 2.0)
+print(big * 2.0, real(wide * 2.0))
 ```
 
 ```output
-0.0999756 0.100098
+0.1 0.1
+0.0999755859375 0.10009765625
 inf 131072
 ```
 
-Neither prints a tenth, because neither holds one — what prints is the value the format really has,
-since rendering widens to `real` and that is exact at every width.
+Both print `0.1`, because `print` writes the fewest digits that read back as the value **at its own
+width**, and `0.1` reads back as each format's nearest tenth. Neither holds a tenth, though, and the
+two nearest are different numbers: widened to a `real`, which is exact at every width, each shows
+every digit it really has. (`wide * 2.0` is widened for the same reason — at `bf16`'s width the
+shortest reading of 131072 is `131000`.)
 
 `f16` and `bf16` are also the one pair where **neither conversion is a widening or a narrowing**. It
 is still written as an ordinary conversion:
@@ -283,15 +288,15 @@ print(f16(b))
 ```
 
 ```output
-0.100098
+0.1001
 ```
 
 That answer is `bf16`'s tenth rather than `f16`'s, which is the point: a conversion carries the value
 the source actually holds, and here `f16` has room for it exactly — its ten bits of significand hold
-`bf16`'s seven with nothing left to round. The other direction rounds, since seven bits do not hold
-what ten need: `bf16(h)`, with `h` still the `f16` tenth from above, prints `0.100098` too rather than
-`h`'s own `0.0999756`, because that value has no exact seven-bit reading and the nearest one is
-`bf16`'s own tenth.
+`bf16`'s seven with nothing left to round — and can tell it from its own tenth, so it takes four
+digits to name. The other direction rounds, since seven bits do not hold what ten need: `bf16(h)`,
+with `h` still the `f16` tenth from above, is `bf16`'s own tenth (`0.10009765625` widened) rather than
+`h`'s `0.0999755859375`, because that value has no exact seven-bit reading.
 
 `sysl.math`'s [`Float`](/library/math/) trait covers both, so `sqrt`, `floor`, `pi` and the rest reach
 them by the same spelling they reach `real` by. libm has no entry point at sixteen bits, so those
@@ -335,8 +340,8 @@ in `f128` is linked with them, and one that does not carries none. They round to
 even, always.
 
 **`print`, `str` and a plain interpolation hole write an `f128` in the fewest digits that read back as
-it** — never narrowed to a `real`, which would print a number the program does not hold, and never
-`%g`'s six digits, which would throw away the twenty-eight the type was chosen for. A format
+it**, positionally, as every float prints — never narrowed to a `real`, which would print a number the
+program does not hold. A format
 specifier renders the exact value's digits, correctly rounded at the precision it asks for, as it
 does for a `real`. All of it is the standard module's own arithmetic, so it needs no C library and
 works on a bare machine:
