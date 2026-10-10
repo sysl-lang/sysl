@@ -2618,8 +2618,9 @@ print(a, b)
 thread reading the name reads its own storage, and `&name` answers the address of the copy belonging
 to the thread that took it.
 
-The initializer has to be a value the compiler can write down — a literal, `null`, a `const`, or an
-array or struct built from those — or left off, which starts every thread at the type's zero. That is
+The initializer has to be a value the compiler can write down — a literal, `null`, a `const`, the
+address of other module storage, or an array or struct built from those — or left off, which starts
+every thread at the type's zero. That is
 the one rule the attribute adds, and it follows from what a per-thread copy is: the copies are made
 from a single image in the object file, because a thread started halfway through a run never passes
 through the prologue an ordinary module `var` is filled by. A call as an initializer would fill exactly
@@ -2685,7 +2686,61 @@ print(n)
 ```
 
 ```error
-'n' is '@thread_local', so its value has to be one the compiler can write down: every thread gets a copy of the initial value, and the copies are made from a single image in the object file rather than by code that runs per thread. A literal, 'null', a 'const' and the arrays and structs built from them are all values; a call is not. Leave the value off to start every thread at the type's zero, and do the work in each thread instead
+'n' is '@thread_local', so its value has to be one the compiler can write down: every thread gets a copy of the initial value, and the copies are made from a single image in the object file rather than by code that runs per thread. A literal, 'null', a 'const', the address of other module storage and the arrays and structs built from them are all values; a call is not. Leave the value off to start every thread at the type's zero, and do the work in each thread instead
+```
+
+### It may start at the address of other module storage
+
+The address of an ordinary module `var` or `val` — or of a field of one, or of an element at a
+constant index — is a relocation the linker fills in once, so it is a value the image can carry, as
+C's `static _Thread_local Vm *vm = &main_vm;` is. Every thread starts pointing at the same storage, and
+each can then point its own copy somewhere else without the others seeing it:
+
+```sysl
+import sysl.posix.threads.*
+
+struct Vm
+    id: int
+
+static var main_vm: Vm = Vm(1)
+
+@thread_local static var current: *Vm = &main_vm
+
+worker(seen: *int)
+    var mine = Vm(2)
+
+    *seen = current.id
+    current = &mine
+    *seen = *seen * 10 + current.id
+
+var seen = 0
+
+spawn(&worker, &seen).unwrap().join()
+
+print(seen)
+print(current.id)
+```
+
+```output
+12
+1
+```
+
+The worker starts at main's `Vm`, repoints its own copy at a `Vm` of its own, and reads `2` through it;
+main's copy was never touched, so it still reads `1`.
+
+**The address of another `@thread_local` is not a value**, being a different address on every thread:
+
+```sysl
+@thread_local static var count: int = 0
+
+@thread_local static var counter: *int = &count
+
+print(*counter)
+```
+
+```error
+'counter' is '@thread_local', so its value has to be one the compiler can write down, and the address of 'count' is not one: 'count' is '@thread_local' too, so its address is a different one on every thread, and no single image in the object file can hold it. The address of ordinary module storage is a value. Leave the value off to start every thread at the type's zero, and do the work in each thread instead
 ```
 
 ### A target with no thread-local storage refuses it by name

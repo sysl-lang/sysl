@@ -1669,8 +1669,8 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
                 val computed = !imaged
 
-                if d.thread_local then check_per_thread(cx, d.span, key, ty, computed)
-                if d.per_cpu then check_per_core(cx, d.span, key, ty, computed)
+                if d.thread_local then check_per_thread(cx, d.span, key, ty, computed, init)
+                if d.per_cpu then check_per_core(cx, d.span, key, ty, computed, init)
 
                 if d.export.is_some() then check_exported_storage(cx, d, key, ty, computed)
 
@@ -1706,7 +1706,8 @@ private refuse_storage_slots(cx: &Analyzer, init: TExpr)
 // the keyword, and a freestanding one silently gets the local-exec model, whose offset is read from
 // a register nothing on a bare machine has written -- so the alternative to this refusal is a
 // program that reads a wild address.
-private check_per_thread(cx: &Analyzer, span: Span, key: string, ty: Type, computed: bool)
+private check_per_thread(cx: &Analyzer, span: Span, key: string, ty: Type, computed: bool,
+                         init: Option[TExpr])
     val t = cx.an.tables.target
 
     // **A bare AArch64 machine has the register, and the program may own it**: a kernel writes the
@@ -1730,13 +1731,76 @@ private check_per_thread(cx: &Analyzer, span: Span, key: string, ty: Type, compu
                  "running, which is what the ownership runtime's reaper slot does")
     // A computed initial value is a fact about how the program lays its storage down, told with no
     // position, as the reference tells it.
-    else if computed
-        cx.an.fault_unplaced(cx.scope, span, s"'${qualified_name(key)}' is '@thread_local', so its value has to be one " +
-                 "the compiler can write down: every thread gets a copy of the initial value, and " +
-                 "the copies are made from a single image in the object file rather than by code " +
-                 "that runs per thread. A literal, 'null', a 'const' and the arrays and structs " +
-                 s"built from them are all values; a call is not. ${per_copy_advice(ty, true)}")
+    else if computed && refusable(init)
+        val copied = per_copy_address(cx, init.unwrap())
+
+        if copied.is_some()
+            cx.an.fault_unplaced(cx.scope, span, s"'${qualified_name(key)}' is '@thread_local', so its " +
+                     "value has to be one the compiler can write down, and " +
+                     s"${copied.unwrap()} ${per_copy_advice(ty, true)}")
+        else
+            cx.an.fault_unplaced(cx.scope, span, s"'${qualified_name(key)}' is '@thread_local', so its value has to be one " +
+                     "the compiler can write down: every thread gets a copy of the initial value, and " +
+                     "the copies are made from a single image in the object file rather than by code " +
+                     "that runs per thread. A literal, 'null', a 'const', the address of other module " +
+                     "storage and the arrays and structs built from them are all values; a call is " +
+                     s"not. ${per_copy_advice(ty, true)}")
+        end if
+    end if
 end check_per_thread
+
+// An initializer that was itself refused has said what is wrong with it, and its being computed is
+// the refusal's consequence rather than a second mistake.
+private refusable(init: Option[TExpr]) -> bool =
+    init.is_none() || !mentions_unknown(texpr_type(init.unwrap()))
+
+// Where a per-thread or per-core initializer takes the address of storage that is itself one copy per
+// thread or per core, the sentence saying why that is not a value: the address of module storage is a
+// relocation the linker fills in once, and this one is a different address on every thread or core.
+// The walk follows the shapes `static_image` lays down, so it finds the address wherever an image
+// would have carried it.
+private per_copy_address(cx: &Analyzer, t: TExpr) -> Option[string] = *t.kind match
+    TAddrOf(place, _) ->
+        val root = storage_root(place)
+
+        if root.is_none() then return None
+
+        val d = cx.an.tables.vals.get(root.unwrap())
+
+        if d.is_none() || !(d.unwrap().thread_local || d.unwrap().per_cpu) then return None
+
+        val attr = if d.unwrap().thread_local then "@thread_local" else "@per_cpu"
+        val copy = if d.unwrap().thread_local then "thread" else "core"
+        val name = qualified_name(root.unwrap())
+
+        Some(s"the address of '$name' is not one: '$name' is '$attr' too, so its address is a " +
+             s"different one on every $copy, and no single image in the object file can hold it. The " +
+             "address of ordinary module storage is a value.")
+    TArrayLit(elems, _) -> first_per_copy_address(cx, elems)
+    TBufLit(elems, _) -> first_per_copy_address(cx, elems)
+    TStructNew(_, args) -> first_per_copy_address(cx, args)
+    TArrayFill(value, _) -> per_copy_address(cx, value)
+    TConstrainedCheck(value, _) -> per_copy_address(cx, value)
+    TCast(inner, _) -> per_copy_address(cx, inner)
+    _ -> None
+
+private first_per_copy_address(cx: &Analyzer, xs: Buf[TExpr]) -> Option[string]
+    for item in xs
+        val found = per_copy_address(cx, item)
+
+        if found.is_some() then return found
+
+    None
+end first_per_copy_address
+
+// The module storage a place is part of: the storage itself, a field of it or an element of it.
+private storage_root(place: TExpr) -> Option[string] = *place.kind match
+    TGlobal(symbol, _, _) -> Some(symbol)
+    TField(receiver, _, _) -> storage_root(receiver)
+    TIndex(receiver, _, _) -> nameless(texpr_type(receiver)) match
+        Array(_, _) -> storage_root(receiver)
+        _ -> None
+    _ -> None
 
 // What a `@thread_local` or `@per_cpu` value that cannot be written down is to be instead. Where the
 // type has a zero, every copy starts there and the work is done per copy; where it has none, leaving
@@ -1854,7 +1918,8 @@ end storage_hidden
 // names the register holding this core's offset, and an initializer the image can carry -- every
 // core's copy is made from the one `.percpu` image, so there is no per-core prologue for code to run
 // in either.
-private check_per_core(cx: &Analyzer, span: Span, key: string, ty: Type, computed: bool)
+private check_per_core(cx: &Analyzer, span: Span, key: string, ty: Type, computed: bool,
+                       init: Option[TExpr])
     val t = cx.an.tables.target
 
     if t.cpu != Aarch64 || t.os != Freestanding
@@ -1870,12 +1935,21 @@ private check_per_core(cx: &Analyzer, span: Span, key: string, ty: Type, compute
                  "somewhere of the program's choosing, and the register holds that copy's address " +
                  "minus the image's (zero on a core still using the image itself). Name it in " +
                  "package.hocon as 'codegen { per_cpu_offset = \"tpidr_el1\" }'")
-    else if computed
-        cx.an.fault_unplaced(cx.scope, span, s"'${qualified_name(key)}' is '@per_cpu', so its value " +
-                 "has to be one the compiler can write down: every core's copy is made from the one " +
-                 "'.percpu' image in the object file rather than by code that runs per core. A " +
-                 "literal, 'null', a 'const' and the arrays and structs built from them are all " +
-                 s"values; a call is not. ${per_copy_advice(ty, false)}")
+    else if computed && refusable(init)
+        val copied = per_copy_address(cx, init.unwrap())
+
+        if copied.is_some()
+            cx.an.fault_unplaced(cx.scope, span, s"'${qualified_name(key)}' is '@per_cpu', so its " +
+                     "value has to be one the compiler can write down, and " +
+                     s"${copied.unwrap()} ${per_copy_advice(ty, false)}")
+        else
+            cx.an.fault_unplaced(cx.scope, span, s"'${qualified_name(key)}' is '@per_cpu', so its value " +
+                     "has to be one the compiler can write down: every core's copy is made from the one " +
+                     "'.percpu' image in the object file rather than by code that runs per core. A " +
+                     "literal, 'null', a 'const', the address of other module storage and the arrays " +
+                     s"and structs built from them are all values; a call is not. ${per_copy_advice(ty, false)}")
+        end if
+    end if
 end check_per_core
 
 private is_zero_expr(e: TExpr) -> bool = *e.kind match
