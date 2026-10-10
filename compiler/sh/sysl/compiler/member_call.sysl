@@ -341,13 +341,65 @@ private generic_subject(cx: &Analyzer, span: Span, receiver: Expr, name: string,
 
     if written.is_none() then return None
 
-    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+    val written_key = lookup_type_key(cx.an, cx.scope, written.unwrap())
 
-    if key.is_none() then return None
-    if concrete_instance(cx.an, key.unwrap()).is_some() then return None
+    if written_key.is_none() then return None
 
-    generic_subject_of(cx, span, key.unwrap(), name, args, expected)
+    val key = renamed_generic(cx, written_key.unwrap())
+
+    if concrete_instance(cx.an, key).is_some() then return None
+
+    generic_subject_of(cx, span, key, name, args, expected)
 end generic_subject
+
+// **A generic alias that only renames answers for the type it names** -- `type Mutex[T] = m.Mutex[T]`,
+// every parameter handed through in the order it was declared -- so `Mutex.new(0)` is `m.Mutex.new(0)`
+// (`reference/declarations.md § Type declarations`: the two spellings are interchangeable). The key of
+// the named type where `key` is such an alias, followed through a chain of them; `key` itself where it
+// is not one. An alias that fixes, drops or reorders a parameter is left as it is: there is no one
+// generic type its bare name stands for.
+renamed_generic(cx: &Analyzer, key: string) -> string
+    var at = key
+
+    for _ in 0..<16
+        val declared = cx.an.tables.types.get(at)
+
+        if declared.is_none() then return at
+
+        val d = declared.unwrap().kind match
+            TypeOf(t) -> t
+            _ -> return at
+
+        if d.derived || d.range.is_some() || d.pred.is_some() || d.tp.names.is_empty() then return at
+
+        val named = *d.base.kind match
+            NamedType(n, targs) -> if passes_through(targs, d.tp.names) then Some(n) else None
+            _ -> None
+
+        if named.is_none() then return at
+
+        val next = lookup_type_key(cx.an, declared.unwrap().scope, named.unwrap())
+
+        if next.is_none() || next.unwrap() == at then return at
+
+        at = next.unwrap()
+
+    at
+end renamed_generic
+
+// Whether written type arguments are exactly `names`, each a bare parameter, in order.
+private passes_through(targs: Buf[TypeRef], names: Buf[string]) -> bool
+    if targs.len() != names.len() then return false
+
+    for i in 0..<targs.len()
+        val same = *targs.at(i).kind match
+            NamedType(n, inner) -> n == names.at(i) && inner.is_empty()
+            _ -> false
+
+        if !same then return false
+
+    true
+end passes_through
 
 // The same, for a generic type already known by its key -- which is where a leading dot arrives,
 // its type being the expected one rather than a name somebody wrote.

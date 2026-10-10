@@ -30,10 +30,10 @@ print(hits.load(), guard.held)
 1 0
 ```
 
-That is the whole reason this module exists apart from [`sysl.posix.threads`](/library/threads/). A word the
+That is the whole reason this module exists apart from [`sysl.threads`](/library/threads/). A word the
 processor can touch indivisibly is something a bare machine has; a *thread* is not, because creating
 one needs a scheduler underneath. A module's capability requirement is module-wide, so putting one
-type that needed `posix` in here would have taken `Atomic[T]` out of reach of the allocator, the
+type that needed `os` in here would have taken `Atomic[T]` out of reach of the allocator, the
 scheduler, and the interrupt handler — the three pieces of code that need a lock before there is
 anything to schedule.
 
@@ -46,7 +46,7 @@ anything to schedule.
 
 This is the `*T` tier of concurrency in the same sense `*T` is the unsafe tier of memory: nothing
 here is checked, everything is greppable, and it is how a kernel is written. What sits above it —
-`Mutex[T]`, `spawn`, and the crossing rule — is on the [`sysl.posix.threads`](/library/threads/) page.
+`Mutex[T]`, `spawn`, and the crossing rule — is on the [`sysl.threads`](/library/threads/) page.
 
 ## `Ordering`
 
@@ -633,12 +633,12 @@ atomic is a spelling the compiler checks, and it lives on [memory](/reference/me
 any alias — so `&sync Mutex[T]` and `&sync Atomic[i32]` are how shared mutable state is actually
 reached.
 
-**The channel is [`sysl.posix.threads`](/library/threads/#channel-t)**, not this module, and the split
-is the one everything else here follows: a channel has to *wait*, so it needs a scheduler to yield to,
+**The channel is [`sysl.threads`](/library/threads/#channel-t)**, not this module, and the split
+is the one everything else here follows: a channel has to *wait*, so it needs a scheduler to sleep on,
 and this module requires nothing. What it is for is the message-passing half of the model — where the
 rule about which values may cross a domain boundary is asked of a **value** rather than of an address,
 which is the one place on that rule where the question was specification with nothing asking it.
 
 ---
 
-Next: [`sysl.posix.threads`](/library/threads/) — spawning, joining, and the mutex above the spinlock.
+Next: [`sysl.threads`](/library/threads/) — spawning, joining, and the mutex above the spinlock.

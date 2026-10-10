@@ -7,7 +7,7 @@ import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.{Search, str_builder}
 
-// `sysl.posix.threads` -- starting a thread, waiting for one, and the lock that owns what it
+// `sysl.threads` -- starting a thread, waiting for one, and the lock that owns what it
 // protects. These are the programs in which a sysl program has two threads in it, so the per-thread
 // reaper worklist, the lock and the atomic reference count stop being claims about emitted text.
 //
@@ -44,7 +44,7 @@ private thx_no_library() -> bool
     false
 end thx_no_library
 
-private thx_importing() -> string = "import sysl.sync.*\nimport sysl.posix.threads.*\n\n"
+private thx_importing() -> string = "import sysl.sync.*\nimport sysl.threads.*\n\n"
 
 // The LLVM text of a one-file program, lowered the way the driver lowers it.
 private thx_ir(text: string) -> string
@@ -209,7 +209,7 @@ thx_the_body_is_on_a_thread_of_its_own()
 
     assert_eq(thx_ran(raw"""
         struct Seen
-            caller: usize
+            caller: u64
             same: bool
 
         look(s: *Seen)
@@ -366,7 +366,7 @@ thx_with_refuses_the_escaping_address()
 
     val out = thx_err("var m = Mutex.new(1)\nval p = m.with((n) -> n)\nprint(*p)")
 
-    assert(out.contains("'sysl.posix.threads.Mutex.with' lends this body a pointer that is valid " +
+    assert(out.contains("'sysl.threads.Mutex.with' lends this body a pointer that is valid " +
                         "only until the call returns, and this one is returned"), out)
 
 @test("two threads incrementing through 'with' lose nothing")
@@ -502,17 +502,16 @@ thx_more_threads_than_processors_finish()
         """), "40000\n")
 
 // An ordering is a keyword in the emitted instruction, and this machine would compute the right
-// total whichever one was written. The reference emits `%t3 = atomicrmw xchg ptr %t2, i32 1 acquire`,
-// `store atomic i32 0, ptr %t2 release, align 4` and `%t7 = load atomic i32, ptr %t6 monotonic`.
+// total whichever one was written, so the test reads the instructions themselves.
 @test("takes with an acquire and releases with a release")
 thx_takes_with_acquire_releases_with_release()
     if thx_no_library() then return
 
     val out = thx_ir("var m = Mutex.new(0)\nm.lock_raw()\nm.unlock_raw()")
 
-    assert(thx_line_with(out, "atomicrmw xchg ptr %t", ", i32 1 acquire"), out)
-    assert(thx_line_with(out, "store atomic i32 0, ptr %t", " release"), out)
-    assert(thx_line_with(out, "load atomic i32, ptr %t", " monotonic"), out)
+    // The futex lock: a compare-exchange from free takes it, an exchange back to free releases it.
+    assert(thx_line_with(out, "cmpxchg ptr %t", " acquire acquire"), out)
+    assert(thx_line_with(out, "atomicrmw xchg ptr %t", " release"), out)
 
 // -- the atomic refcount moves the way the chapter says ----------------------------------------------
 
@@ -579,11 +578,11 @@ thx_no_posix_may_not_reach_threads()
                                  module quiet
                                  @no_posix
 
-                                 import sysl.posix.threads.Mutex
+                                 import sysl.posix.threads.yield_now
 
-                                 guarded() -> Mutex[int] = Mutex.new(0)
+                                 step() -> bool = yield_now()
                                  """),
-                             ("main.sysl", "import quiet.guarded\n\nprint(guarded().try_lock_raw().is_some())\n")])
+                             ("main.sysl", "import quiet.step\n\nprint(step())\n")])
 
     assert(out.contains("this reaches 'sysl.posix.threads', which requires 'posix'"), out)
     assert(out.contains("'quiet' declared 'no posix'"), out)
@@ -677,10 +676,10 @@ thx_a_plain_reference_is_refused_at_the_call()
 thx_building_one_by_its_fields_is_refused()
     if thx_no_library() then return
 
-    val out = thx_err("var m = Mutex(1i32, 5)\nprint(m.try_lock_raw().is_some())")
+    val out = thx_err("var m = Mutex(Lock.new(), 5)\nprint(m.try_lock_raw().is_some())")
 
-    assert(out.contains("the constructor names every field of 'sysl.posix.threads.Mutex' in order"), out)
-    assert(out.contains("'held' is private"), out)
+    assert(out.contains("the constructor names every field of 'sysl.threads.Mutex' in order"), out)
+    assert(out.contains("'lock' is private"), out)
     assert(out.contains("associated function"), out)
 
 @test("reading what it protects without taking it")
@@ -689,7 +688,7 @@ thx_reading_the_value_without_the_lock()
 
     val out = thx_err("var m = Mutex.new(5)\nprint(m.value)")
 
-    assert(out.contains("field 'value' of 'sysl.posix.threads.Mutex' is private"), out)
+    assert(out.contains("field 'value' of 'sysl.threads.Mutex' is private"), out)
 
 // `Mutex[T]` guards its `value` (`@guards(value)`), so sharing the lock does not share the `&Cell`
 // inside it: the `&sync` is formed, and what is held instead is what leaves through `with`.
@@ -719,7 +718,7 @@ thx_answering_the_guarded_reference_is_refused()
         print(m.with((c) -> *c).v)
         """)
 
-    assert(out.contains("'sysl.posix.threads.Mutex.with' answers a value out of the 'value' it guards"), out)
+    assert(out.contains("'sysl.threads.Mutex.with' answers a value out of the 'value' it guards"), out)
     assert(out.contains("but this answers a '&Cell'"), out)
 
 // A thread body is C's shape and a callable is not; the two differ by one character, so the

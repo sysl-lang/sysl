@@ -1,0 +1,342 @@
+module sysl.threads
+@requires(os)
+
+import sysl.slices.{as_mut_ptr, copy, fill}
+import sysl.threads.sys as tsys
+
+/** Threads of execution, and the two things a program does with one: start it, and wait for it --
+ * with the lock, the condition variable and the channel threads share things through.
+ *
+ * **This module asks for `os` and nothing more.** A thread is something an operating system's
+ * scheduler gives a program, and what starts one is whatever answers the hooks of
+ * `sysl.threads.sys` -- pthreads on a hosted target, a kernel's own `@export`s over `clone` and
+ * `futex` on a bare one, which needs neither POSIX nor a C library. `sysl.sync` stays below it,
+ * requiring nothing: an atomic word is something a bare machine has whether or not anything
+ * schedules threads on it.
+ *
+ * `sysl.posix.threads` is the same API under its older name, kept for the programs that import it.
+ *
+ * ## Answered by whatever is underneath
+ *
+ * **Every thread is started, joined and named through the hooks** -- `sysl_thread_spawn`,
+ * `sysl_thread_join`, `sysl_thread_self` and `sysl_thread_yield` -- and **every wait sleeps on the
+ * futex pair**, `sysl_futex_wait` and `sysl_futex_wake`. `Lock`, `Mutex[T]`, `Condvar` and
+ * `Channel[T]` are written once, here, over `sysl.sync.Atomic[u32]` and those two hooks; nothing in
+ * them is a C type.
+ *
+ * ## The library owns the stack, and the compiler owns the thread-local storage
+ *
+ * **`spawn` makes one allocation per thread** holding the thread's id word, its block of
+ * `@thread_local` storage and its stack, and `join` gives it back. A program with no heap starts a
+ * thread on storage of its own with `spawn_on`. **The thread-local block is laid out from the
+ * program's own template** -- the `.tdata` image and the `.tbss` size the linker made, which the
+ * compiler's link names -- so a kernel answering `sysl_thread_spawn` only writes the thread pointer.
+ * On a hosted target the C library lays each thread's storage itself and `spawn` passes the system no
+ * stack, pthreads taking its own.
+ *
+ * A **domain** is a thread (`reference/memory.md § Crossing a concurrency domain`), so everything
+ * this module starts is a new one. `spawn` hands the new thread an **address**, and what is at that
+ * address is then shared by two threads and needs a `Mutex[T]` beside it, or an `Atomic[T]` below.
+ * **`spawn` is marked `@crossing(arg)`**, so every count the state reaches has to be atomic and the
+ * compiler says so at the call (`reference/memory.md § @crossing`).
+ */
+
+/** A thread that has been started, and may be waited for.
+ *
+ * It is a handle rather than the thread: copying one copies the handle, and joining either copy
+ * joins the one thread. Joining **twice** is not checked here -- the second join would give the
+ * thread's storage back a second time -- for the reason `SpinLock.unlock` gives about the releasing
+ * thread: the word it would take to notice is paid by every correct program. A thread never joined
+ * keeps its storage for the rest of the program.
+ */
+struct Thread
+
+    /** The thread's id as the system numbers it: the `pthread_t` on a hosted target, the kernel's
+     * thread id on a bare one. It is what `current().id` answers inside the thread.
+     */
+    id: u64
+
+    // The word the spawn hook keeps the id in for the thread's whole life, which a kernel clears when
+    // the thread ends; null where the thread was started with no word of the library's to keep --
+    // `spawn` on a hosted target, and `current()`.
+    private word: *u64
+
+    // The one allocation `spawn` made for the thread's word, thread-local block and stack, which
+    // `join` gives back; null where the storage was the program's (`spawn_on`) or there was none.
+    private room: *Room
+
+    /** Waits for the thread to finish, and answers whether it was waited for.
+     *
+     * The value the body returned is **not** carried back, and the omission is the crossing rule
+     * rather than an oversight: a result coming out of another domain is a value crossing a
+     * boundary (`reference/memory.md § Crossing a concurrency domain`), which is what a channel is
+     * for. A body that has something to say writes it through the address it was given.
+     */
+    @blocks
+    join(self) -> bool
+        var id = self.id
+        val word = if self.word == null then &id else self.word
+
+        if tsys.join(word) != 0 then return false
+
+        if self.room != null then release(self.room)
+
+        true
+    end join
+
+end Thread
+
+// The storage `spawn` makes for one thread, kept alive by its own reference until `join` drops it --
+// so a handle that is copied, or dropped without being joined, never frees a stack a thread is still
+// running on.
+private struct Room
+    bytes: []u8
+    me: Option[&Room]
+
+private release(r: *Room)
+    r.me = None
+
+/** The stack `spawn` gives a thread where nothing else is asked for: 64 KiB. */
+const DEFAULT_STACK: usize = 65536
+
+/** Starts `body` on a new thread, with `arg` as the address it is handed.
+ *
+ * **On a bare target the library makes the thread's storage**: one allocation of `stack` bytes plus
+ * the thread's id word and its block of `@thread_local` storage, given back by `join`. On a hosted
+ * target nothing is allocated and `stack` is not used: pthreads makes the thread's stack, and the C
+ * library its thread-local storage.
+ *
+ * **The body is a `*extern`, not a callable** (`reference/ffi.md § A function's address`): it is
+ * what every system's thread start takes, and a closure would have to be boxed for the new thread to
+ * reach it. A package with an allocator is free to take a `&sync Fn` and call it from a body of its
+ * own -- `sh.sysl.libuv`'s thread pool does, and the capture check holds such a closure to the
+ * crossing rule capture by capture.
+ *
+ * **`T` is inferred from the body**, so `spawn(&work, &state)` is the whole of the call. An address
+ * is always written, `null` included -- and `null` is the one thing that cannot be, since it takes
+ * its type from its context and the context here is the `T` being inferred.
+ *
+ * **`@crossing(arg)` is what holds a caller to the rule about what may reach another domain.** A
+ * `*T` is on the crossable list because *it* carries no count, which says nothing about the object at
+ * the far end -- and the object at the far end is what the new thread gets. The annotation is what
+ * asks the compiler to look through it, so a state holding a plain `&T` is refused here rather than
+ * racing later.
+ */
+@crossing(arg)
+spawn[T](body: *extern(*T) -> unit, arg: *T, stack: usize = DEFAULT_STACK) -> Option[Thread]
+#if freestanding
+    val r: &Room = Room([0; stack + 64 + tls_room()], None)
+
+    val started = start_on(r.bytes, ptr_cast(body), ptr_cast(arg)) match
+        Some(t) -> t
+        None -> return None
+
+    r.me = Some(r)
+    Some(Thread(started.id, started.word, &*r))
+#else
+    var id: u64 = 0
+
+    if tsys.spawn(ptr_cast(body), ptr_cast(arg), null, 0, null, &id) != 0 then return None
+
+    Some(Thread(id, null, null))
+#endif
+end spawn
+
+/** Starts `body` on a new thread whose storage is `stack`, which the program owns.
+ *
+ * What a program with no heap writes: the slice holds the thread's id word, its block of
+ * `@thread_local` storage and, in what is left, its stack -- so it has to outlive the thread, which is
+ * the contract `spawn(&body, &state)` already has with whatever `state` points at. A module-level
+ * `static var` of bytes, or a local of a `main` that joins before it returns, is the usual owner.
+ *
+ * It answers `None` where the slice leaves no stack once the word and the thread-local block are
+ * laid in it, and where the system would not start the thread. On a hosted target the stack is handed
+ * to pthreads, which asks for at least its `PTHREAD_STACK_MIN` -- 16 KiB on macOS, 128 KiB under glibc
+ * on aarch64 -- and is trimmed to whole 16 KiB pages first.
+ */
+@crossing(arg)
+spawn_on[T](stack: []u8, body: *extern(*T) -> unit, arg: *T) -> Option[Thread] =
+    start_on(stack, ptr_cast(body), ptr_cast(arg))
+
+// The thread's word, thread-local block and stack laid out of `room`, and the thread started on them.
+private start_on(room: []u8, body: *extern(*u8) -> unit, arg: *u8) -> Option[Thread]
+    val base = usize(as_mut_ptr(room))
+    val word_at = up(base, 16) - base
+
+    if word_at + 16 > room.len then return None
+
+    val word: *u64 = ptr_cast(base + word_at)
+
+    *word = 0
+
+    val tls_at = word_at + 16
+    val tls_len = tls_room()
+
+    if tls_at + tls_len > room.len then return None
+
+    val tls = tls_place(room[tls_at..<tls_at + tls_len]) match
+        Some(p) -> p
+        None -> return None
+
+    val lo = up(base + tls_at + tls_len, 16)
+    val hi = (base + room.len) / 16 * 16
+
+    if hi <= lo then return None
+
+    if tsys.spawn(body, arg, ptr_cast(lo), hi - lo, tls, word) != 0 then return None
+
+    Some(Thread(*word, word, null))
+end start_on
+
+/** Offers the processor to whatever else is ready to run, and answers whether the system took it.
+ *
+ * This is a **hint**, not a wait: a thread that yields is still runnable and may be given the
+ * processor straight back.
+ */
+yield_now() -> bool = tsys.yield_now() == 0
+
+/** The calling thread's own handle, which is what a body compares against to learn it is not the
+ * thread that spawned it. It cannot be joined: a thread waiting for itself would wait for ever.
+ */
+current() -> Thread = Thread(tsys.self_id(), null, null)
+
+// -- the thread-local template --------------------------------------------------------------------
+
+/** How many bytes one thread's block of `@thread_local` storage needs, slack for its alignment
+ * included -- zero where the program has none, and **always zero on a hosted target**, where the C
+ * library lays each thread's block down itself.
+ *
+ * It is what a program running a thread `spawn` did not start -- its first one, on a bare target --
+ * sets aside before laying the block with `tls_place`.
+ */
+tls_room() -> usize
+#if freestanding
+    room_for(template())
+#else
+    0
+#endif
+end tls_room
+
+/** Lays one thread's block of `@thread_local` storage out in `room` -- the template's initialized
+ * bytes copied, the rest zeroed -- and answers the value the thread pointer holds while that thread
+ * runs.
+ *
+ * `Some(null)` where there is nothing to lay: the program has no thread-local storage, or the target
+ * is hosted and the C library lays it. `None` where `room` is smaller than `tls_room()`.
+ *
+ * **The layout is the processor's ABI for local-exec access, at the offsets the linker computed**: on
+ * AArch64 the pointer is the start of a 16-byte control block the storage follows at its alignment; on
+ * x86-64 the storage ends at the pointer, whose first word holds its own address; elsewhere the
+ * storage starts at the pointer. The pointer is aligned to the storage's alignment in each.
+ */
+tls_place(room: []u8) -> Option[*u8]
+#if freestanding
+    laid(template(), room)
+#else
+    Some(null)
+#endif
+end tls_place
+
+private up(n: usize, align: usize) -> usize = (n + align - 1) / align * align
+
+// One thread's block, as `laid` lays it around a thread pointer aligned to `align`: `before` bytes
+// below the pointer and `after` from it on, the template's `size` bytes of storage starting `image_at`
+// bytes above the block's low end -- the first `data` of them copied from `image`, the rest zero.
+// `self_word` says the pointer's first word holds its own address, as x86-64's does.
+private[threads] struct Template
+    image: usize
+    data: usize
+    size: usize
+    align: usize
+    before: usize
+    after: usize
+    image_at: usize
+    self_word: bool
+
+// **The offsets are the ones lld writes into every local-exec access**, the segment's start taken
+// modulo its alignment included: lld does not round the segment's start down, so a template whose
+// first section is less aligned than its last sits that many bytes further from the pointer. Each
+// takes the template as the linker named it: where it starts, how many of its bytes are initialized,
+// how many it has in all, and the segment's alignment.
+
+// AArch64 (variant 1): the pointer is a 16-byte control block, the storage after it at its alignment.
+private[threads] variant_one(image: usize, data: usize, size: usize, wanted: usize) -> Template
+    val align = if wanted > 16 then wanted else 16
+    val image_at = up(16, wanted) + image % wanted
+
+    Template(image, data, size, align, 0, image_at + size, image_at, false)
+end variant_one
+
+// x86-64 (variant 2): the storage ends at the pointer, which holds its own address in its first word.
+private[threads] variant_two(image: usize, data: usize, size: usize, wanted: usize) -> Template
+    val align = if wanted > 8 then wanted else 8
+    val span = size + (wanted - (image + size) % wanted) % wanted
+
+    Template(image, data, size, align, span, 8, 0, true)
+end variant_two
+
+// RISC-V and the rest: the storage starts at the pointer.
+private[threads] at_pointer(image: usize, data: usize, size: usize, wanted: usize) -> Template
+    val align = if wanted > 16 then wanted else 16
+
+    Template(image, data, size, align, 0, image % wanted + size, image % wanted, false)
+end at_pointer
+
+// The room one block needs, slack for aligning the pointer included; zero for an empty template.
+private[threads] room_for(t: Template) -> usize = if t.size == 0 then 0 else t.before + t.after + t.align
+
+// The block laid in `room`, and the thread pointer it answers to: `Some(null)` for an empty template,
+// `None` where `room` is too small.
+private[threads] laid(t: Template, room: []u8) -> Option[*u8]
+    if t.size == 0 then return Some(null)
+
+    if room.len < room_for(t) then return None
+
+    val base = usize(as_mut_ptr(room))
+    val at = up(base + t.before, t.align) - base
+    val low = at - t.before
+    val image = low + t.image_at
+
+    fill(room[low..<at + t.after], 0)
+
+    val source: *u8 = ptr_cast(t.image)
+
+    copy(room[image..<image + t.data], source[0..<t.data])
+
+    val tp: *u8 = ptr_cast(base + at)
+
+    if t.self_word
+        val word: *usize = ptr_cast(tp)
+
+        *word = usize(tp)
+    end if
+
+    Some(tp)
+end laid
+
+#if freestanding
+// **The template is the linker's**: the four symbols every bare image's link defines
+// (`--defsym`, `image_link.sysl`) -- where the `.tdata` image starts, where its initialized bytes end,
+// where the zeroed `.tbss` part ends, and the larger of the two sections' alignments, as an absolute
+// value. A program with no thread-local storage gets all four at zero.
+private extern "__sysl_tls_data" tls_data: u8
+private extern "__sysl_tls_data_end" tls_data_end: u8
+private extern "__sysl_tls_end" tls_end: u8
+private extern "__sysl_tls_align" tls_align: u8
+
+// The program's template, laid out for this machine's thread pointer.
+private template() -> Template
+    val image = usize(&tls_data)
+    val size = usize(&tls_end) - image
+    val data = usize(&tls_data_end) - image
+    val wanted = if usize(&tls_align) > 0 then usize(&tls_align) else 1
+
+#if aarch64
+    variant_one(image, data, size, wanted)
+#elif x86_64
+    variant_two(image, data, size, wanted)
+#else
+    at_pointer(image, data, size, wanted)
+#endif
+end template
+#endif

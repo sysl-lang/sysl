@@ -1,0 +1,391 @@
+module sysl.threads
+@requires(os)
+@tests
+
+import sysl.slices.as_mut_ptr
+import sysl.sync.*
+
+// What a channel promises, checked where it can be checked deterministically — which is most of it,
+// since the ring and the closing rule are single-threaded facts and only the blocking is not.
+//
+// **The cases with more than one thread are bounded rather than timed**: each one does a fixed amount
+// of work and ends, so a machine under load makes it slower and never makes it fail.
+
+@test("an empty channel answers its capacity and nothing else")
+empty_channel() -> unit
+    var slots: [4]int = [0; 4]
+    var ch = channel(slots[..])
+
+    assert_eq(ch.capacity(), 4)
+    assert_eq(ch.len(), 0)
+    assert(!ch.is_closed())
+    assert(ch.try_receive() == None)
+
+@test("values come out in the order they went in")
+channel_is_a_queue() -> unit
+    var slots: [4]int = [0; 4]
+    var ch = channel(slots[..])
+
+    assert(ch.try_send(1))
+    assert(ch.try_send(2))
+    assert(ch.try_send(3))
+    assert_eq(ch.len(), 3)
+
+    assert(ch.try_receive() == Some(1))
+    assert(ch.try_receive() == Some(2))
+    assert(ch.try_receive() == Some(3))
+    assert(ch.try_receive() == None)
+
+// The ring is what this is about: filling it, draining it and filling it again has to walk past the
+// end of the storage and back to the start, which is where an off-by-one lives.
+@test("the ring wraps, so a channel used past its capacity keeps its order")
+channel_wraps() -> unit
+    var slots: [3]int = [0; 3]
+    var ch = channel(slots[..])
+
+    for i in 0..<10
+        assert(ch.try_send(i))
+        assert(ch.try_receive() == Some(i))
+
+    assert(ch.try_send(100))
+    assert(ch.try_send(200))
+    assert(ch.try_send(300))
+    assert(!ch.try_send(400))
+    assert(ch.try_receive() == Some(100))
+    assert(ch.try_send(400))
+    assert(ch.try_receive() == Some(200))
+    assert(ch.try_receive() == Some(300))
+    assert(ch.try_receive() == Some(400))
+
+@test("a full channel refuses a value it cannot hold")
+channel_is_bounded() -> unit
+    var slots: [2]int = [0; 2]
+    var ch = channel(slots[..])
+
+    assert(ch.try_send(1))
+    assert(ch.try_send(2))
+    assert(!ch.try_send(3))
+    assert_eq(ch.len(), 2)
+
+// Closing says no more will arrive, not that what arrived is discarded — which is the rule that
+// makes a receiver's loop terminate without losing the tail.
+@test("a closed channel drains before it answers nothing")
+closing_drains() -> unit
+    var slots: [4]int = [0; 4]
+    var ch = channel(slots[..])
+
+    assert(ch.try_send(1))
+    assert(ch.try_send(2))
+    ch.close()
+
+    assert(ch.is_closed())
+    assert(!ch.try_send(3))
+    assert(ch.receive() == Some(1))
+    assert(ch.receive() == Some(2))
+    assert(ch.receive() == None)
+
+@test("closing twice is harmless")
+closing_twice() -> unit
+    var slots: [1]int = [0; 1]
+    var ch = channel(slots[..])
+
+    ch.close()
+    ch.close()
+    assert(ch.is_closed())
+    assert(ch.receive() == None)
+
+private struct Feed
+    ch: Channel[int]
+
+private feeder(f: *Feed) -> unit
+    for i in 1..20
+        f.ch.send(i)
+
+    f.ch.close()
+
+// The ring holds two and twenty values go through it, so the producer really does sleep on a full
+// channel and really is woken — a channel that never filled would pass this while doing nothing the
+// type is for.
+@test("a value put in on one thread comes out on another")
+channel_crosses_threads() -> unit
+    var slots: [2]int = [0; 2]
+    var f = Feed(channel(slots[..]))
+    var running = spawn(&feeder, &f) match
+        Some(t) -> t
+        None -> return
+
+    var total = 0
+
+    loop
+        f.ch.receive() match
+            Some(v) -> total += v
+            None -> break
+
+    // 1 + 2 + ... + 20, since a sysl range written `a..b` includes both ends
+    assert_eq(total, 210)
+    assert(running.join())
+
+// -- the futex lock --------------------------------------------------------------------------------
+
+private struct Counter
+    m: Mutex[int]
+    rounds: int
+
+private add_many(c: *Counter) -> unit
+    for _ in 0..<c.rounds
+        c.m.with((n) -> *n += 1)
+
+// **The test the lock exists for**: eight threads each add to one count fifty thousand times, so
+// they meet on the lock constantly and the contended path -- the word at two, a sleeper woken by
+// `unlock` -- is taken over and over. A lock that let two holders in loses increments, and one that
+// lost a wake never finishes.
+@test("eight threads adding under one Mutex lose nothing")
+mutex_under_contention() -> unit
+    var c = Counter(Mutex.new(0), 50000)
+    var threads: [8]Option[Thread] = [None; 8]
+
+    for i in 0..<8
+        threads[i] = spawn(&add_many, &c)
+
+    for i in 0..<8
+        threads[i] match
+            Some(t) -> assert(t.join())
+            None -> assert(false, "a thread did not start")
+
+    assert_eq(c.m.with((n) -> *n), 400000)
+
+@test("try_with does not wait for a held lock")
+try_with_does_not_wait() -> unit
+    var m = Mutex.new(5)
+    val p = m.lock_raw()
+
+    assert(m.try_with((n) -> *n) == None)
+    assert(m.try_lock_raw() == None)
+    m.unlock_raw()
+    assert(m.try_with((n) -> *n) == Some(5))
+    assert_eq(*p, 5)
+
+@test("a Lock is free, then held, then free again")
+lock_states() -> unit
+    var l = Lock.new()
+
+    assert(l.try_lock())
+    assert(!l.try_lock())
+    l.unlock()
+    assert(l.try_lock())
+    l.unlock()
+
+// -- the condition variable ------------------------------------------------------------------------
+
+private struct Rally
+    m: Mutex[int]
+    turn: Condvar
+    rounds: int
+
+// The serve: waits for the count to be odd, makes it even.
+private returner(r: *Rally) -> unit
+    for _ in 0..<r.rounds
+        val n = r.m.lock_raw()
+
+        while *n % 2 == 0
+            r.turn.wait(&r.m)
+
+        *n += 1
+        r.m.unlock_raw()
+        r.turn.notify_all()
+
+// **A ping-pong is the condition variable's own test**: each side sleeps until the other has moved,
+// twenty thousand times, so a notification lost between a waiter's release and its sleep hangs the
+// test rather than slipping past it.
+@test("two threads take turns through a Condvar")
+condvar_ping_pong() -> unit
+    var r = Rally(Mutex.new(0), Condvar.new(), 20000)
+    var other = spawn(&returner, &r) match
+        Some(t) -> t
+        None -> return
+
+    for _ in 0..<r.rounds
+        val n = r.m.lock_raw()
+
+        while *n % 2 == 1
+            r.turn.wait(&r.m)
+
+        *n += 1
+        r.m.unlock_raw()
+        r.turn.notify_all()
+
+    assert(other.join())
+    assert_eq(r.m.with((n) -> *n), 40000)
+
+@test("a wait with a time runs out when nobody notifies")
+condvar_times_out() -> unit
+    var m = Mutex.new(0)
+    var cv = Condvar.new()
+
+    m.lock_raw()
+    assert(!cv.wait_for(&m, 1000000))
+    assert(m.try_lock_raw() == None)
+    m.unlock_raw()
+
+// -- starting a thread ------------------------------------------------------------------------------
+
+private struct Seen
+    id: u64
+    value: int
+
+@thread_local
+private var per_thread: int = 41
+
+private look(s: *Seen) -> unit
+    s.id = current().id
+    s.value = per_thread
+    per_thread = 7
+
+@test("a thread is not the one that started it, and its id is the one spawn answered")
+thread_ids() -> unit
+    var s = Seen(0, 0)
+    val t = spawn(&look, &s).unwrap()
+
+    assert(t.join())
+    assert(s.id == t.id)
+    assert(s.id != current().id)
+
+// **The thread-local check**: the new thread reads the initial value, not the value this thread has
+// since written, and its write does not reach this thread's copy.
+@test("a spawned thread starts from the @thread_local's initial value")
+thread_local_starts_fresh() -> unit
+    per_thread = 99
+
+    var s = Seen(0, 0)
+
+    assert(spawn(&look, &s).unwrap().join())
+    assert_eq(s.value, 41)
+    assert_eq(per_thread, 99)
+    per_thread = 41
+
+@test("spawn_on runs a thread on storage the program owns")
+spawn_on_a_given_stack() -> unit
+    var room: [262144]u8 = [0; 262144]
+    var s = Seen(0, 0)
+    val t = spawn_on(room[..], &look, &s).unwrap()
+
+    assert(t.join())
+    assert_eq(s.value, 41)
+    assert(s.id == t.id)
+
+@test("spawn_on refuses storage with no room for a stack")
+spawn_on_too_small() -> unit
+    var room: [8]u8 = [0; 8]
+    var s = Seen(0, 0)
+
+    assert(spawn_on(room[..], &look, &s).is_none())
+
+@test("a hosted target lays no thread-local block of its own")
+hosted_tls_is_the_c_library_s() -> unit
+    assert_eq(tls_room(), 0)
+
+    var room: [16]u8 = [0; 16]
+
+    assert(tls_place(room[..]) == Some(null))
+
+// -- the thread-local layout, at lld's own offsets ---------------------------------------------------
+//
+// A bare target lays every block out of the template its link names, and nothing on a host runs that
+// path -- so the arithmetic is checked here against what lld wrote into real local-exec accesses: an
+// `int` initialized to 7 and a 32-aligned `long` after it in `.tbss`, the segment 32-aligned with its
+// start 12 bytes past a boundary, which lld does not round down. Linked for AArch64, the `int` was
+// read at the thread pointer plus 0x2c and the `long` at plus 0x40.
+
+private thk_template_bytes(src: []u8) -> usize
+    val base = usize(as_mut_ptr(src))
+    val image = (base + 31) / 32 * 32 + 12
+    val w: *i32 = ptr_cast(image)
+
+    *w = 7
+    image
+end thk_template_bytes
+
+private thk_i32_at(at: usize) -> i32
+    val p: *i32 = ptr_cast(at)
+
+    *p
+end thk_i32_at
+
+private thk_u64_at(at: usize) -> u64
+    val p: *u64 = ptr_cast(at)
+
+    *p
+end thk_u64_at
+
+@test("an AArch64 block puts the storage where lld's offsets read it, the segment's skew included")
+thk_variant_one_matches_lld()
+    var src: [128]u8 = [0; 128]
+    val image = thk_template_bytes(src[..])
+    val t = variant_one(image, 4, 0x1c, 32)
+    var room: [256]u8 = [0xAA; 256]
+    val tp = usize(laid(t, room[..]).unwrap())
+
+    assert_eq(tp % 32, 0)
+    assert_eq(thk_i32_at(tp + 0x2c), 7)
+    assert_eq(thk_u64_at(tp + 0x40), 0)
+
+    // The control block is the thread's own, and zeroed with the rest.
+    assert_eq(thk_u64_at(tp), 0)
+    assert_eq(thk_u64_at(tp + 8), 0)
+
+@test("and with the segment's start on its boundary, the storage begins 32 bytes up")
+thk_variant_one_aligned()
+    var src: [128]u8 = [0; 128]
+    val image = thk_template_bytes(src[..]) - 12
+    val w: *i32 = ptr_cast(image)
+
+    *w = 9
+
+    val t = variant_one(image, 4, 0x28, 32)
+    var room: [256]u8 = [0xAA; 256]
+    val tp = usize(laid(t, room[..]).unwrap())
+
+    assert_eq(thk_i32_at(tp + 0x20), 9)
+    assert_eq(thk_u64_at(tp + 0x40), 0)
+
+@test("an x86-64 block ends at the pointer, which holds its own address")
+thk_variant_two_matches_lld()
+    var src: [128]u8 = [0; 128]
+    val image = thk_template_bytes(src[..])
+    val t = variant_two(image, 4, 0x1c, 32)
+    var room: [256]u8 = [0xAA; 256]
+    val tp = usize(laid(t, room[..]).unwrap())
+
+    // lld: the offset is the address less the segment's start, its size, and the padding that leaves
+    // the pointer aligned -- 0 - 0x1c - 24 for the int.
+    assert_eq(tp % 32, 0)
+    assert_eq(thk_i32_at(tp - 52), 7)
+    assert(thk_u64_at(tp) == u64(tp))
+
+@test("a RISC-V block starts at the pointer, the skew kept")
+thk_at_pointer_matches_lld()
+    var src: [128]u8 = [0; 128]
+    val image = thk_template_bytes(src[..])
+    val t = at_pointer(image, 4, 0x1c, 32)
+    var room: [256]u8 = [0xAA; 256]
+    val tp = usize(laid(t, room[..]).unwrap())
+
+    assert_eq(thk_i32_at(tp + 12), 7)
+
+@test("a block is refused room smaller than it needs, and an empty template needs none")
+thk_room_is_checked()
+    var src: [128]u8 = [0; 128]
+    val t = variant_one(thk_template_bytes(src[..]), 4, 0x1c, 32)
+    var small: [64]u8 = [0; 64]
+
+    assert(room_for(t) > 64)
+    assert(laid(t, small[..]).is_none())
+
+    val empty = variant_one(0, 0, 0, 1)
+
+    assert_eq(room_for(empty), 0)
+    assert(laid(empty, small[..]) == Some(null))
+
+@test("yield_now is answered")
+yield_answers() -> unit
+    assert(yield_now())

@@ -1,20 +1,20 @@
 ---
-title: sysl.posix.threads
-summary: Starting a thread, waiting for one, and the mutex above the spinlock — the half of concurrency that needs a scheduler.
+title: sysl.threads
+summary: Starting a thread, waiting for one, and the lock, condition variable and channel above the spinlock — the half of concurrency that needs a scheduler.
 weight: 80
 ---
 
-**Every declaration in `sysl.posix.threads`, with its signature:** [the generated API page](/api/sysl-posix-threads/#index). This page is the argument — what the module is for, and how its pieces fit; that one is the list.
+**Every declaration in `sysl.threads`, with its signature:** [the generated API page](/api/sysl-threads/#index). This page is the argument — what the module is for, and how its pieces fit; that one is the list.
 
-`sysl.posix.threads` is where the capability lands. Everything on the [`sysl.sync`](/library/sync/) page is
+`sysl.threads` is where the capability lands. Everything on the [`sysl.sync`](/library/sync/) page is
 reachable from a module that has given up its allocator and its operating system; nothing here is,
 because creating a thread needs a scheduler underneath it.
 
 ```sysl
-@no_posix
+@no_os
 
 import sysl.sync.*
-import sysl.posix.threads.spawn
+import sysl.threads.spawn
 
 var a = Atomic(0)
 
@@ -22,7 +22,7 @@ print(a.load())
 ```
 
 ```error
-this reaches 'sysl.posix.threads', which requires 'posix', and this module declared 'no posix' — an environment capability gates which modules exist, so a module that gave one up may not reach one that needs it
+this reaches 'sysl.threads', which requires 'os', and this module declared 'no os'
 ```
 
 Note where that lands: **at the import**, not at the call. A capability a module has given up decides
@@ -30,38 +30,37 @@ which modules exist for it, so a program that cannot spawn is a program whose au
 name — and the `sysl.sync` import on the line above is untouched, which is the split working exactly
 as it is meant to.
 
-The module declares **two** requirements, POSIX's behaviour and a C library to call it through, and
-the namespace it sits in says the first one twice over:
+The module asks for an operating system and **nothing more** — not POSIX, not a C library:
 
 ```
-module sysl.posix.threads
-@requires(posix, libc)
+module sysl.threads
+@requires(os)
 ```
 
-**What is here is pthreads**, which is the whole claim and the reason the module lives under
-`sysl.posix` beside [`sysl.posix.tty`](/library/term/#whether-to-write-escapes-at-all-sysl-posix-tty) and
-[`sysl.posix.rand`](/library/rand/). A module in that namespace is one a freestanding target does not
-get, and the path is enough to know it without opening the file.
-
-There was a fourth capability, `threads`, and it was **removed rather than renamed**. It gated this
-one module, and it read as a claim that the compiler tracks whether a scheduler exists — which it
-does not, and which nothing in the library was gated on. **A board running FreeRTOS or Zephyr has
-threads and no POSIX**: it does not reach this module, and it binds its own kernel as a package,
-because no capability could have made `pthread_create` appear on it. So `@no_threads` is now an
-unknown capability, and the three that remain are `heap`, `os` and `posix`.
+**A thread is something a scheduler gives a program, and what starts one is whatever answers the
+hooks** of `sysl.threads.sys`, as `sysl.fs` reaches files through `sysl.fs.sys`. On a hosted target the
+library answers them itself, over pthreads and the platform's futex; on a target with no C library a
+kernel answers them with an `@export` each, over its own `clone` and `futex` — see [On a target with
+no C library](#on-a-target-with-no-c-library). `sysl.posix.threads` is the same API under the name it
+had when it was pthreads by symbol, kept for the programs that import it.
 
 | name | what it is |
 |---|---|
 | `spawn(body, arg)` | starts a thread, answering `Option[Thread]` |
+| `spawn_on(stack, body, arg)` | the same, on storage the program owns |
 | `Thread.join` | waits for one, answering whether it waited |
 | `current()` | the calling thread's own handle |
 | `yield_now()` | offers the processor away — a hint, not a wait |
+| `Lock` | a sleeping lock that guards nothing of its own |
 | `Mutex[T]` | mutual exclusion that owns what it protects |
+| `Condvar` | sleeping until another thread says something changed |
+| `Channel[T]` | a bounded queue two threads hand values across |
+| `tls_room()`, `tls_place(room)` | one thread's block of `@thread_local` storage, laid by hand |
 
 ## `spawn` takes an address, not a callable
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 struct Job
     input: i32
@@ -83,13 +82,14 @@ print(job.input, job.output)
 ```
 
 `&square` is the address of a named function, and the parameter's type is `*extern(*T) -> unit` —
-C's own shape, because `pthread_create` is underneath. **A closure will not do**, and the refusal is
+C's own shape, because what is underneath is a system's thread start: `pthread_create` on a hosted
+target, a kernel's `clone` on a bare one. **A closure will not do**, and the refusal is
 worth seeing in both of the ways a reader will hit it. Written bare, the argument has nothing to
 infer its parameter type from, because `T` is what is being inferred:
 
 ```sysl
 import sysl.sync.*
-import sysl.posix.threads.*
+import sysl.threads.*
 
 var counter = Atomic(0)
 var c = spawn(a -> a.add(1), &counter)
@@ -105,7 +105,7 @@ Write the type in and the real mismatch surfaces:
 
 ```sysl
 import sysl.sync.*
-import sysl.posix.threads.*
+import sysl.threads.*
 
 var counter = Atomic(0)
 var c = spawn((a: *Atomic[i32]) -> a.add(1), &counter)
@@ -114,7 +114,7 @@ print(c.is_some())
 ```
 
 ```error
-'body' of 'sysl.posix.threads.spawn' is *extern(*sysl.sync.Atomic[int]) -> unit, but a closure was given
+'body' of 'sysl.threads.spawn' is *extern(*sysl.sync.Atomic[int]) -> unit, but a closure was given
 ```
 
 Two reasons, and neither is a limitation waiting to be lifted. A closure would have to be **boxed**
@@ -130,7 +130,7 @@ C's shape happens once, inside. A body with nothing of its own writes `null`, an
 otherwise have had to invent is one the *body's* own signature already gave:
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 quiet(state: *int)
     print("nothing to read")
@@ -151,15 +151,48 @@ asking for the type rather than a guess.
 
 It answers a `bool` — whether it waited — and nothing else. That is the crossing rule rather than an
 oversight: **a result coming out of another domain is a value crossing a boundary**, which is what a
-channel is for, and the channel is not written. So a body that has something to say writes it
-through the address it was given, which is what the `Job` above does.
+[channel](#channel-t) is for. So a body that has something to say writes it through the address it was
+given, or sends it, which is what the `Job` above does.
 
 The `Thread` value is a **handle rather than the thread**. Copying one copies the handle, and
-joining either copy joins the one thread; joining **twice** is undefined in POSIX and is not checked
-here, for the same reason `SpinLock.unlock` checks nothing — the word it would take to notice is
-paid by every correct program. The `id` field is public so that a program can hand it to a POSIX
-call this module does not wrap, such as `pthread_detach` or a scheduling parameter, since the
-alternative is a wrapper per call.
+joining either copy joins the one thread; joining **twice** is not checked — the second join would give
+the thread's storage back a second time — for the same reason `SpinLock.unlock` checks nothing: the
+word it would take to notice is paid by every correct program. A thread never joined keeps its storage
+for the rest of the program. The `id` field is public: the `pthread_t` on a hosted target, which a
+program can hand to a POSIX call this module does not wrap, and the kernel's thread id on a bare one.
+
+### The library owns the stack
+
+**`spawn` makes one allocation per thread** — its id word, its block of `@thread_local` storage, and
+its stack, 64 KiB unless the call asks for another size — and `join` gives it back. On a hosted target
+nothing is allocated: pthreads makes the stack and the C library the thread-local block. A program with
+no heap starts a thread on storage of its own with `spawn_on`, which lays the same three things out of
+a slice it is handed:
+
+```sysl
+import sysl.threads.*
+
+static var stack: [262144]u8 = [0; 262144]
+
+shout(n: *int)
+    *n *= 2
+
+var n = 21
+
+spawn_on(stack[..], &shout, &n).unwrap().join()
+
+print(n)
+```
+
+```output
+42
+```
+
+The slice has to outlive the thread — the contract `spawn(&body, &state)` already has with whatever
+`state` points at. On a hosted target the stack is handed to pthreads, which asks for at least its
+`PTHREAD_STACK_MIN` (16 KiB on macOS, 128 KiB under glibc on aarch64) and is trimmed to whole 16 KiB
+pages first; a slice with no room left once the word and the thread-local block are laid answers
+`None`.
 
 ## Sharing the thing at the address
 
@@ -175,7 +208,7 @@ another concurrency domain ([memory](/reference/memory/)). It is why the state a
 annotation is what asks the compiler to look through it at the object that actually crossed.
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 struct Cell
     n: int
@@ -193,7 +226,7 @@ print(spawn(&look, &st).is_some())
 ```
 
 ```error
-what 'arg' of 'sysl.posix.threads.spawn' points at reaches another concurrency domain, so every count inside it has to be atomic
+what 'arg' of 'sysl.threads.spawn' points at reaches another concurrency domain, so every count inside it has to be atomic
 ```
 
 A plain `&Cell` has a **non-atomic** count, so two threads retaining it is exactly the race the model
@@ -206,7 +239,7 @@ above the wrapper it already has, and gets the same refusal at its own callers' 
 
 ```sysl
 import sysl.sync.*
-import sysl.posix.threads.*
+import sysl.threads.*
 
 bump(a: *Atomic[i32])
     for i in 0..<10000
@@ -233,7 +266,7 @@ field beside the data, and remembering that `total` is what `guard` guards is th
 
 ```sysl
 import sysl.sync.*
-import sysl.posix.threads.*
+import sysl.threads.*
 
 struct Shared
     guard: SpinLock
@@ -260,7 +293,7 @@ print(sh.total)
 ### Take the atomic away and it is a race
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 racy(p: *i32)
     for i in 0..<100000
@@ -289,7 +322,7 @@ unchecked one.
 fields are private, so there is no way to reach the value that does not go through the lock:
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 var m = Mutex.new(7)
 
@@ -297,7 +330,7 @@ print(m.value)
 ```
 
 ```error
-field 'value' of 'sysl.posix.threads.Mutex' is private to 'library/sysl/posix/threads/mutex.sysl', the file that declares it
+field 'value' of 'sysl.threads.Mutex' is private to 'library/sysl/threads/mutex.sysl', the file that declares it
 ```
 
 Private is the entirety of what "owns" means here. With `value` public, reading it would be an
@@ -308,15 +341,15 @@ The private field does a second job: it puts the **positional constructor** out 
 `Mutex.new` is the only way in and there is no way to build one that starts out held.
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
-var built = Mutex(0, 5)
+var built = Mutex(Lock.new(), 5)
 
 built.with((p) -> print(*p))
 ```
 
 ```error
-the constructor names every field of 'sysl.posix.threads.Mutex' in order, and 'held' is private to 'library/sysl/posix/threads/mutex.sysl', the file that declares it — build it through an associated function of its own
+the constructor names every field of 'sysl.threads.Mutex' in order, and 'lock' is private to 'library/sysl/threads/mutex.sysl', the file that declares it — build it through an associated function of its own
 ```
 
 ### `with` lends the value for one call
@@ -325,7 +358,7 @@ the constructor names every field of 'sysl.posix.threads.Mutex' in order, and 'h
 `body` returns, and answers whatever `body` answered:
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 inc(m: *Mutex[i32])
     for i in 0..<10000
@@ -351,7 +384,7 @@ and write through the address, and hand it to a function that only uses it, but 
 outlive the call — the mistake an address returned from `lock` could never be protected from:
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 var m = Mutex.new(1)
 val p = m.with((n) -> n)
@@ -373,7 +406,7 @@ body, and `with` is usable under `@no_alloc`.
 held:
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 var q = Mutex.new(5)
 val qp = &q
@@ -396,7 +429,7 @@ to reach for wherever the hold does fit a block. `defer` is the idiom for a raw 
 [`sysl.fs`](/library/fs/)'s `close`:
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 var m = Mutex.new(3)
 var p = m.lock_raw()
@@ -422,44 +455,88 @@ exchange that takes it is an acquire and the store that frees it is a release, a
 what publishes everything the holder wrote to whichever thread takes the lock next. It is the whole of
 what makes the data safe to touch.
 
-### It is not built on `pthread_mutex_t`
+### It is a futex lock written in sysl, not a `pthread_mutex_t`
 
-The reason is a **build property rather than a preference**, and it is worth spelling out because it
-is the same argument that keeps the standard library buildable for targets nobody has tried yet.
+The lock under `Mutex[T]` is a `Lock`: one `Atomic[u32]` and the two futex hooks, **the classic
+three-state lock**. The word is zero when free, one when held, and two when held with somebody asleep
+on it; an uncontended take and release are one atomic operation each and never reach the system, a
+contended take marks the word two and sleeps in `sysl_futex_wait`, and only a release that finds a
+two calls `sysl_futex_wake`. **A waiter sleeps** — it neither spins nor yields — so a contended lock
+costs nothing while it waits.
 
-A caller-allocated opaque C type is one of the three things the
-[compilation model](/reference/ffi/) names as reachable from C and from nothing else. Its size lives
-in a header, and it differs both between platforms and between two libcs on the *same* platform —
-64 bytes on Darwin, 40 under glibc on x86-64, 48 on aarch64, 40 again under musl. `#if` can ask
-which operating system this is, but **not which libc**. So a transcribed byte count would compile
-everywhere and be checked nowhere, which is precisely the failure that section is about.
+A `pthread_mutex_t` was never the answer, and the reason is a **build property**: its size lives in
+a header and differs between two libcs on the *same* platform — 64 bytes on Darwin, 40 under glibc on
+x86-64, 48 on aarch64, 40 again under musl — and the standard library reads no header. The futex is
+what every system that has threads keeps underneath its own mutex, so it is one word the library
+lays out itself, and the same `Lock` runs on a kernel answering the hooks as on a hosted target.
 
-The way to read a header is C, and the standard library deliberately includes none: it reaches libc
-by symbol alone, which is what lets it go on building for any target the toolchain can lower for.
+`Lock` is public for the hold `Mutex[T]` does not express — a lock beside data the program names
+itself, as `SpinLock` is, for code that may sleep:
 
 ```sysl
-private[sysl] extern "pthread_create" c_pthread_create(
-    t: *usize,
-    attr: *u8,
-    body: *extern(*u8) -> *u8,
-    arg: *u8,
-) -> int
-private[sysl] extern "pthread_join" c_pthread_join(t: usize, result: **u8) -> int
+import sysl.threads.*
+
+var l = Lock.new()
+
+print(l.try_lock(), l.try_lock())
+l.unlock()
+print(l.try_lock())
 ```
 
-Every one of those is a **scalar** handle or an address. A `pthread_t` is one word on both platforms
-this builds for — a pointer on Darwin, an `unsigned long` under glibc — and `usize` is the spelling
-that is both. Transcribing that is safe in a way transcribing a *layout* is not, and it is the only
-transcription in the module.
+```output
+true false
+true
+```
 
-So `Mutex[T]` is three atomic operations and a yield: an acquiring exchange to take it, a relaxed
-load between attempts, and a releasing store to free it. **What that costs is a context switch per
-contended attempt**, where a futex would cost none. A futex-backed mutex is what a binding library
-carrying its own C shim would add; it is not something the standard library can reach.
+## `Condvar`
 
-The spin is not `SpinLock`'s, either. A failed exchange **gives the processor up** rather than
-turning round again, so a waiter cannot starve the holder the way a pure spin can on one core, and
-the hold may be as long as it likes. What it does not do is *sleep*: there is no wait queue.
+**A place to sleep until another thread says something changed.** It is a sequence number every
+`notify_one` and `notify_all` bumps: a waiter reads it while it still holds the lock, lets the lock go
+and sleeps only while the number is still the one it read — so a notification sent between the release
+and the sleep is never slept through. A wait may end with nothing changed, so the condition is
+re-checked in a loop, as with every condition variable:
+
+```sysl
+import sysl.threads.*
+
+struct Rally
+    m: Mutex[int]
+    turn: Condvar
+
+answer(r: *Rally)
+    for i in 0..<3
+        val n = r.m.lock_raw()
+
+        while *n % 2 == 0
+            r.turn.wait(&r.m)
+
+        *n += 1
+        r.m.unlock_raw()
+        r.turn.notify_all()
+
+var r = Rally(Mutex.new(0), Condvar.new())
+var t = spawn(&answer, &r).unwrap()
+
+for i in 0..<3
+    val n = r.m.lock_raw()
+
+    while *n % 2 == 1
+        r.turn.wait(&r.m)
+
+    *n += 1
+    r.m.unlock_raw()
+    r.turn.notify_all()
+
+t.join()
+print(r.m.with((n) -> *n))
+```
+
+```output
+6
+```
+
+`wait_for(&m, ns)` is the same with a limit, answering `false` where the time ran out first, and
+`wait_raw(&lock)` waits over a bare `Lock`.
 
 ## `Channel[T]`
 
@@ -470,7 +547,7 @@ whose far end both threads are looking at. A channel is the other shape: a value
 thread and comes out on another, and the two are never looking at one object.
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 var slots: [4]int = [0; 4]
 var ch = channel(slots[..])
@@ -503,7 +580,7 @@ and its capacity is a number the program chose. The storage has to outlive every
 channel, which is the contract `spawn(&body, &state)` already has with whatever `state` points at.
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 struct Feed
     ch: Channel[int]
@@ -549,7 +626,7 @@ That left a channel's queries as methods and its transfers as functions, which i
 reader had to learn and no longer has to.
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 struct Node
     n: int
@@ -564,12 +641,11 @@ print(ch.send(Node(1)))
 reaches another concurrency domain, so every count inside it has to be atomic
 ```
 
-### A waiter yields rather than sleeps
+### A waiter sleeps
 
-There is no wait queue in this module, so a full `send` and an empty `receive` give the processor up
-and try again — the same trade `Mutex` makes, and for the same reason. That costs a context switch
-per attempt where a futex would cost none; it is a scheduler call rather than a spin, so a waiter
-cannot starve the thread it is waiting for.
+A full `send` sleeps on one `Condvar` and an empty `receive` on the other, each woken by the transfer
+that makes room or brings a value, and `close` wakes both — so a waiter costs nothing while it waits,
+and is not woken for a transfer that cannot help it.
 
 ### The ring is a pointer, and that is the crossing rule
 
@@ -594,7 +670,7 @@ is at `spawn`.
 ## `yield_now` and `current`
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 print(yield_now())
 
@@ -610,11 +686,41 @@ true
 ```
 
 `yield_now` is a **hint, not a wait**. A thread that yields is still runnable and may be handed the
-processor straight back; what it is for is the spin in `Mutex.lock`, where the thread holding the
-lock may not be running at all and nothing else in the loop would make it so. It answers whether the
-system took the offer.
+processor straight back. It answers whether the system took the offer.
 
-`current()` is what a body compares against to learn that it is not the thread that spawned it.
+`current()` is what a body compares against to learn that it is not the thread that spawned it. Its
+`id` is the one `spawn` answered for the thread; it cannot be joined, a thread waiting for itself
+waiting for ever.
+
+## On a target with no C library
+
+**Everything above is written over six hooks**, the `extern`s of `sysl.threads.sys` — the shape
+`sysl.fs.sys` and `sysl.env.sys` already have. On a hosted target `sysl.threads.hosted` answers them
+over pthreads and the platform's futex (`futex(2)` on Linux and Android, `os_sync_wait_on_address` on
+macOS 14.4 and later); a program for a target with no C library answers each one it reaches with an
+`@export`, and one it leaves unanswered is refused when it is compiled, naming it:
+
+| hook | answers | over Linux's numbers |
+|---|---|---|
+| `sysl_thread_spawn(entry, arg, stack, stack_len, tls, tid: *u64) -> int` | zero, after writing the id to `*tid` | `clone` with `CLONE_SETTLS`, `CLONE_PARENT_SETTID` and `CLONE_CHILD_CLEARTID` on `tid`; the child calls `entry(arg)` then `exit` |
+| `sysl_thread_join(tid: *u64) -> int` | zero once the thread is off its stack | `futex(FUTEX_WAIT)` on `tid` until the kernel has cleared it |
+| `sysl_thread_self() -> u64` | the running thread's id | `gettid` |
+| `sysl_thread_yield() -> int` | zero | `sched_yield` |
+| `sysl_futex_wait(addr: *u32, expected: u32, timeout_ns: i64) -> int` | zero on any return the caller re-checks, one where the time ran out | `futex(FUTEX_WAIT_PRIVATE)` |
+| `sysl_futex_wake(addr: *u32, n: int) -> int` | how many it woke | `futex(FUTEX_WAKE_PRIVATE)` |
+
+**The stack and the thread-local block are the library's to lay out.** `spawn` hands the hook a
+16-aligned stack and, in `tls`, the value the thread pointer holds while the thread runs, the block
+behind it already laid out of the program's template: every bare image's link names the template's
+bounds (`__sysl_tls_data`, `__sysl_tls_data_end`, `__sysl_tls_end`, `__sysl_tls_align`), and the
+library copies the initialized part and zeroes the rest at the offsets the linker wrote into every
+access. So a kernel's spawn hook only writes the register — `CLONE_SETTLS`. The first thread is the
+one the library did not start; a program with `@thread_local` storage lays its block itself with
+`tls_room()` and `tls_place(room)` ([`@thread_local`](/reference/attributes/#on-a-bare-aarch64-machine-the-program-may-own-the-thread-pointer)).
+On a hosted target `tls` is always null: the C library lays every thread's storage down itself.
+
+**A `build-c` archive leaves the four template symbols undefined**: the link that makes the image is
+the C project's, and it defines them — with the same `--defsym`s, or in its linker script.
 
 ## Threads and tasks
 
@@ -629,7 +735,7 @@ other — `spawn`'s `@crossing(arg)` asks of the task's frame what it asks of ev
 address, and the thread runs it with an executor of its own:
 
 ```sysl
-import sysl.posix.threads.spawn
+import sysl.threads.spawn
 
 struct Job
     t: Task[int]
@@ -668,7 +774,7 @@ refused inside a plain struct — the rule is
 **Note the import.** This module's `yield_now` is the *thread's* — a hint to the system that answers
 a `bool` — and the task's `yield_now` is a form the compiler supplies, so the module's declaration is
 the nearer name wherever the module is imported whole; awaiting it is refused, the refusal naming
-`sysl.posix.threads.yield_now` as what shadowed the task form. A file that runs tasks imports what it
+`sysl.threads.yield_now` as what shadowed the task form. A file that runs tasks imports what it
 uses from here by name, as the program above imports `spawn`.
 
 **What a task changes is where interleaving can happen.** Two tasks driven by one executor run on one

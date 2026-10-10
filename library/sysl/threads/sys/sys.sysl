@@ -1,0 +1,103 @@
+module sysl.threads.sys
+@requires(os)
+
+// The calls `sysl.threads` makes of whatever schedules threads underneath it: start one on a stack it
+// was handed, wait for one to end, name the running one, offer the processor away, and the futex pair
+// a lock and a condition variable written in sysl sleep and wake through.
+//
+// **Each is an `extern` naming a symbol no module here defines**, so what answers it is decided by
+// what the program is linked with (`reference/ffi.md § A module may supply another module's extern`),
+// exactly as for `sysl.env.sys` and `sysl.process.sys`:
+//
+// | linked with | what defines the symbols |
+// |---|---|
+// | a program for a hosted target | `sysl.threads.hosted`, over pthreads and the platform's futex |
+// | a program for a target with no C library | the program, with an `@export` per hook it reaches |
+//
+// A freestanding program that reaches one of these and leaves it unanswered is refused when it is
+// compiled, naming the hooks it reached, rather than at the link -- where it would have named
+// `pthread_create`, which no line of the program mentions.
+//
+// ## The shape of a hook
+//
+// **A hook answers one integer: what it did, or what went wrong** -- the contract of every `*.sys`
+// module. Zero or more is success; a negative answer is the code of the failure negated, so a
+// kernel's system call that already answers a negative error number is the hook as it stands; and a
+// target that cannot perform a call at all answers `UNSUPPORTED` (`sysl.sys`, -38 on every platform).
+//
+// ## Over Linux's `clone` and `futex`
+//
+// The six are shaped so that a program over Linux's calls answers each with one system call, or a
+// short loop over one:
+//
+// | hook | over |
+// |---|---|
+// | `sysl_thread_spawn` | `clone(CLONE_VM \| CLONE_FS \| CLONE_FILES \| CLONE_SIGHAND \| CLONE_THREAD \| CLONE_SYSVSEM \| CLONE_SETTLS \| CLONE_PARENT_SETTID \| CLONE_CHILD_CLEARTID, stack + stack_len, tid, tls, tid)`, the child calling `entry(arg)` and then `exit` |
+// | `sysl_thread_join` | `futex(FUTEX_WAIT)` on the word at `tid` until the kernel has cleared it |
+// | `sysl_thread_self` | `gettid` |
+// | `sysl_thread_yield` | `sched_yield` |
+// | `sysl_futex_wait` | `futex(FUTEX_WAIT_PRIVATE)` |
+// | `sysl_futex_wake` | `futex(FUTEX_WAKE_PRIVATE)` |
+
+/** Starts a thread running `entry(arg)`, and answers zero where it started.
+ *
+ * **`stack` is `stack_len` bytes the thread runs on**, 16-aligned at both ends, the thread's stack
+ * pointer starting at `stack + stack_len` and growing down. It is the library's, laid out of one
+ * allocation `sysl.threads.spawn` makes or of the slice a program handed `spawn_on`, and it is not
+ * given back until `sysl_thread_join` has answered. A **null** `stack` means the library supplied none
+ * and the hook takes the system's own -- what the hosted answer does for `spawn`.
+ *
+ * **`tls` is what the thread pointer holds while the new thread runs**: the library has already laid
+ * the thread's `@thread_local` storage out behind it, copied from the program's template
+ * (`sysl.threads.tls_room`), so the hook only writes the register -- `CLONE_SETTLS` over `clone`. It
+ * is null where the program has no thread-local storage, and **on a hosted target it is always null
+ * and ignored**: the C library lays each thread's storage down itself, and the thread pointer is its
+ * to write.
+ *
+ * **`tid` is a word the library keeps for the thread's whole life**, zero when this is called. The
+ * hook writes the thread's id there before it answers -- nonzero, and on a system whose ids are 32
+ * bits wide, zero-extended -- and is free to keep using the word afterwards: over `clone` the kernel
+ * clears its low 32 bits when the thread ends (`CLONE_CHILD_CLEARTID`), which is what
+ * `sysl_thread_join` waits for. On a hosted target it holds the `pthread_t`.
+ *
+ * When `entry` returns the thread ends; the hook's own code after the call is the place to say so to
+ * the system (`exit` over Linux's numbers, which ends the one thread).
+ */
+private[sysl] extern "sysl_thread_spawn" spawn(entry: *extern(*u8) -> unit, arg: *u8, stack: *u8,
+                                               stack_len: usize, tls: *u8, tid: *u64) -> int
+
+/** Waits for the thread `sysl_thread_spawn` started with this `tid` word to end, and answers zero
+ * once it has. The library calls it once per thread and then gives the thread's stack back, so it
+ * must not answer before the thread is off that stack: over `clone` that is the kernel clearing the
+ * word, and the answer is a loop of `futex(FUTEX_WAIT)` on it while it is not zero.
+ */
+private[sysl] extern "sysl_thread_join" join(tid: *u64) -> int
+
+/** The running thread's id: the same number `sysl_thread_spawn` wrote into its `tid` word. */
+private[sysl] extern "sysl_thread_self" self_id() -> u64
+
+/** Offers the processor to another ready thread; zero, or a failure. A hint, never a wait. */
+private[sysl] extern "sysl_thread_yield" yield_now() -> int
+
+/** Sleeps while the 32-bit word at `addr` holds `expected`, for at most `timeout_ns` nanoseconds where
+ * that is not negative and for as long as it takes where it is.
+ *
+ * **It answers zero whenever it returns without the time running out** -- woken by
+ * `sysl_futex_wake`, finding the word already changed, interrupted, or for no reason at all -- and
+ * **`TIMED_OUT` (one)** where the time ran out. The caller re-reads the word either way, so a spurious
+ * zero costs one more trip round its loop and never a wrong answer. A negative answer is a failure.
+ * Comparing the word and going to sleep are one step, which is the whole of what makes the pair
+ * usable: a wake between the caller's last look and the sleep is not lost.
+ */
+private[sysl] extern "sysl_futex_wait" futex_wait(addr: *u32, expected: u32, timeout_ns: i64) -> int
+
+/** Wakes up to `n` threads asleep in `sysl_futex_wait` on the word at `addr` -- every one of them
+ * where `n` is `WAKE_ALL` -- and answers how many it woke where it can say, zero where it cannot.
+ */
+private[sysl] extern "sysl_futex_wake" futex_wake(addr: *u32, n: int) -> int
+
+/** What `sysl_futex_wait` answers when its time ran out. */
+private[sysl] const TIMED_OUT: int = 1
+
+/** The `n` that asks `sysl_futex_wake` to wake every waiter: `INT_MAX`, as Linux's own callers pass. */
+private[sysl] const WAKE_ALL: int = 2147483647

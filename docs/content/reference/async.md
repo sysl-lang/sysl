@@ -694,12 +694,12 @@ poll(t: Task[unit]) -> bool = step(t, 1)
 
 `block_on`, `step`, `park` and `yield_now` are names the compiler supplies, not reserved words, so a
 program's own declaration of one is the nearer name and is called as written. **That includes an
-import**: `sysl.posix.threads` declares a `yield_now` of its own — the thread's — so a file that
+import**: `sysl.threads` declares a `yield_now` of its own — the thread's — so a file that
 imports that module whole is handed the thread's, and awaiting it is awaiting a `bool`. The refusal
 says whose `yield_now` the call became:
 
 ```sysl
-import sysl.posix.threads.*
+import sysl.threads.*
 
 async blink()
     await yield_now()
@@ -708,11 +708,11 @@ block_on(blink())
 ```
 
 ```error
-'await' needs a Task, which is what calling an 'async' function hands back, but this value is bool — the 'yield_now' called here resolved to 'sysl.posix.threads.yield_now', declared in 'sysl.posix.threads', and a declaration of that name stands in front of the task form 'yield_now(…)', so the task form is shadowed
+'await' needs a Task, which is what calling an 'async' function hands back, but this value is bool — the 'yield_now' called here resolved to 'sysl.threads.yield_now', declared in 'sysl.threads', and a declaration of that name stands in front of the task form 'yield_now(…)', so the task form is shadowed
 ```
 
 A local of the same name shadows the task form the same way, and is named as a local binding.
-Import what the file uses by name — `import sysl.posix.threads.spawn` — and the task's `yield_now` is
+Import what the file uses by name — `import sysl.threads.spawn` — and the task's `yield_now` is
 the one in scope.
 
 ## A task's frame is on the heap
@@ -865,7 +865,7 @@ the frame holds, the question it asks of what a closure captures when that closu
 A task of scalars crosses, and runs on the other thread while this one runs its own:
 
 ```sysl
-import sysl.posix.threads.spawn
+import sysl.threads.spawn
 
 struct Job
     t: Task[int]
@@ -900,7 +900,7 @@ The same hand-over is refused once the frame holds a `string`, whose bytes are o
 that is not atomic. The refusal names the function and the parameter:
 
 ```sysl
-import sysl.posix.threads.spawn
+import sysl.threads.spawn
 
 struct Job
     t: Task[int]

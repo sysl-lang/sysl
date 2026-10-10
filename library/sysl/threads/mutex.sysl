@@ -1,8 +1,55 @@
-module sysl.posix.threads
-@no_alloc
-@requires(posix, libc)
+module sysl.threads
+@requires(os)
 
 import sysl.sync.*
+import sysl.threads.sys as tsys
+
+/** A lock that sleeps, and guards nothing of its own: the classic three-state futex lock.
+ *
+ * **The word is zero when free, one when held, and two when held with a thread asleep on it**, so an
+ * uncontended `lock` and `unlock` are one atomic operation each and never reach the system, and only
+ * an `unlock` that may have a sleeper to wake calls `sysl_futex_wake`. A waiter sleeps in
+ * `sysl_futex_wait` rather than spinning or yielding, so a contended lock costs nothing while it waits.
+ *
+ * It is what `Mutex[T]` and `Channel[T]` are built on, and it is public for the hold neither of them
+ * expresses: a lock beside data the program names itself, as `SpinLock` is, for code that may sleep.
+ */
+struct Lock
+
+    // 0 free, 1 held, 2 held and contended. The futex word: its address is what a waiter sleeps on.
+    private state: Atomic[u32]
+
+    /** A free lock. */
+    new() -> Lock = Lock(Atomic(0))
+
+    /** Takes the lock, sleeping until it is free. */
+    @blocks
+    lock(*self)
+        var seen = self.state.cas(0, 1, Acquire)
+
+        if seen == 0 then return
+
+        // Contended: mark the word as having a sleeper before sleeping, so the holder's `unlock`
+        // knows to wake somebody -- and take the lock in the same exchange where it came free.
+        if seen != 2 then seen = self.state.swap(2, Acquire)
+
+        while seen != 0
+            tsys.futex_wait(&self.state.v, 2, -1)
+            seen = self.state.swap(2, Acquire)
+    end lock
+
+    /** Takes the lock if it is free, and answers whether it did. Never waits. */
+    try_lock(*self) -> bool = self.state.cas(0, 1, Acquire) == 0
+
+    /** Releases the lock, waking one sleeper where there may be one.
+     *
+     * The `Release` publishes everything the holder wrote to whichever thread's `Acquire` takes the
+     * lock next.
+     */
+    unlock(*self)
+        if self.state.swap(0, Release) == 2 then tsys.futex_wake(&self.state.v, 1)
+
+end Lock
 
 /** Mutual exclusion that **owns what it protects**, which is the difference `library/threads.md §
  * Mutex[T]` draws against `SpinLock`.
@@ -21,7 +68,7 @@ import sysl.sync.*
  * ```
  *
  * `lock_raw` and `unlock_raw` are the hold a block cannot express -- taken in one function and
- * released in another, or handed from one thread to the next. Nothing ties their address to the hold,
+ * released in another, or held across a `Condvar.wait`. Nothing ties their address to the hold,
  * which is what the name says.
  *
  * **`@guards(value)` is what lets one cross into a `&sync`** whatever it holds (`reference/memory.md §
@@ -29,44 +76,29 @@ import sysl.sync.*
  * through `with` or `try_with` is held to the `&sync` rule instead -- an `int` or a `.copy()` of a
  * string, not the `Map` or a string still sharing the guarded one's count.
  *
- * **It is not built on `pthread_mutex_t`, and the reason is a build property rather than a
- * preference.** A caller-allocated opaque C type is one of the three things `reference/ffi.md § A
- * library may carry C` names as reachable from C and from nothing else: its size is in a header, it
- * differs between the platforms and between two libcs on the *same* platform -- 64 bytes on Darwin,
- * 40 under glibc on x86-64, 48 on aarch64, 40 again under musl -- and `#if` can ask which operating
- * system this is but not which libc. Transcribing a bound would compile everywhere and be checked
- * nowhere, which is precisely the failure that section is about. The way to read a header is C, and
- * the standard library deliberately includes none: it reaches libc by symbol alone, which is what
- * lets it go on building for any target the toolchain can lower for. So the lock is three atomic
- * operations and a yield, and a binding library that carries its own C shim is where a futex-backed
- * one belongs.
- *
- * **What that costs is a waiter's processor for one scheduling quantum at a time.** The spin is not
- * `SpinLock`'s -- a failed exchange gives the processor up rather than turning round again -- so a
- * waiter cannot starve the holder the way a pure spin can on one core, and the hold may be as long as
- * it likes. What it does not do is *sleep*: there is no wait queue, so a contended lock costs a
- * context switch per attempt where a futex would cost none.
+ * **The lock is a `Lock`, written in sysl over an `Atomic[u32]` and the futex hooks**, not a
+ * `pthread_mutex_t`: a caller-allocated C struct's size is in a header and differs between libcs on
+ * one platform, and the futex is what every system that has threads has underneath its own mutex. A
+ * waiter sleeps; it neither spins nor yields.
  */
 @guards(value)
 struct Mutex[T]
 
-    // Zero when free, one when held. Private, unlike `SpinLock.held`: a spinlock guards something the
-    // programmer names, so its flag is theirs to look at, and this one guards a field of its own
-    // struct that nothing outside can see anyway.
-    private held: i32
+    // The lock. Private for the reason the value is: everything the type promises is that the two
+    // are only ever reached together.
+    private lock: Lock
 
     // What the lock protects. Private is the whole of what "owns" means here -- with it public,
-    // `m.value` would be an unsynchronized read of the thing the type exists to synchronize, and the
-    // type would be a spinlock with a suggestion attached.
+    // `m.value` would be an unsynchronized read of the thing the type exists to synchronize.
     private value: T
 
     /** Builds a free lock around a value.
      *
      * The positional constructor names every field in order (`reference/declarations.md §
      * Structs`), so a private field is what makes this the only way in from outside -- which is
-     * what keeps `held` starting at zero.
+     * what keeps the lock starting free.
      */
-    new(value: T) -> Mutex[T] = Mutex(0, value)
+    new(value: T) -> Mutex[T] = Mutex(Lock.new(), value)
 
     /** Takes the lock, waiting until it is free, runs `body` with the address of what it protects,
      * releases the lock, and answers what `body` answered.
@@ -88,7 +120,7 @@ struct Mutex[T]
     /** The same, if the lock is free: `Some` of what `body` answered, or `None` without waiting. */
     @lends(body)
     try_with[R](*self, body: *T -> R) -> Option[R]
-        if atomic_swap(&self.held, 1, Acquire) != 0 then return None
+        if !self.lock.try_lock() then return None
 
         defer self.unlock_raw()
         Some(body(&self.value))
@@ -101,20 +133,11 @@ struct Mutex[T]
      */
     @blocks
     lock_raw(*self) -> *T
-        while atomic_swap(&self.held, 1, Acquire) != 0
-            // Spin on a plain load until it looks free, then offer the processor away before trying
-            // the exchange again. The load is `SpinLock`'s reason -- a read-modify-write takes the
-            // cache line exclusively every time round, so waiters spinning on the exchange fight the
-            // holder trying to write the release. The **yield** is this type's own: the holder may
-            // not be running at all, and nothing else in the loop would make it so.
-            while atomic_load(&self.held, Relaxed) != 0
-                yield_now()
-
+        self.lock.lock()
         &self.value
 
     /** Takes the lock if it is free, and answers what it protects where it did. Never waits. */
-    try_lock_raw(*self) -> Option[*T] =
-        if atomic_swap(&self.held, 1, Acquire) == 0 then Some(&self.value) else None
+    try_lock_raw(*self) -> Option[*T] = if self.lock.try_lock() then Some(&self.value) else None
 
     /** Releases the lock a `lock_raw` or `try_lock_raw` took.
      *
@@ -123,7 +146,6 @@ struct Mutex[T]
      * the data safe to touch, and it is why neither of these takes an `Ordering`: a lock's orderings
      * are fixed by what a lock means.
      */
-    unlock_raw(*self)
-        atomic_store(&self.held, 0, Release)
+    unlock_raw(*self) = self.lock.unlock()
 
 end Mutex
