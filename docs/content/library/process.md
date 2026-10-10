@@ -619,7 +619,8 @@ each job in a group of its own and hands that group the terminal. `run`, `captur
 
 `Spawned.group()` and `Child.group()` answer the group a child was started in, which is what a later
 stage of a pipeline `Join`s — so the whole pipeline is one job — and `process_group()` answers this
-program's own:
+program's own; `pid()` on either answers the child's own process id, the number `kill` and a wait by
+pid name, which for a pipeline's later stages differs from the group's:
 
 ```sysl
 import sysl.process.{Group, capture, process_group, spawn}

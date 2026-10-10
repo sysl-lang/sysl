@@ -469,7 +469,7 @@ end capture
  * end on its own and `wait` reads what it wrote afterwards, in whatever order the caller chooses.
  */
 struct Child
-    private[process] pid: i32
+    private[process] id: i32
     private began: i64
     private timeout: int
     private out_path: string
@@ -480,7 +480,12 @@ struct Child
     /** The process group the child was started in: its own pid for `Group.New`, the joined group's
      * number for `Join`, and this program's for `Inherit`. A `Join` of a later child names it.
      */
-    group(self) -> int = group_of(self.pgid, self.pid)
+    group(self) -> int = group_of(self.pgid, self.id)
+
+    /** The process id of this child: the number `kill` and a wait by pid name. Where `group` is the
+     * first stage's, this is its own.
+     */
+    pid(self) -> int = int(self.id)
 
     /** Wait for the child to end, and answer what `capture` would have answered for it.
      *
@@ -498,7 +503,7 @@ struct Child
             Some(r) -> return r
             None -> ()
 
-        self.finished(ended(self.pid, self.began, self.timeout))
+        self.finished(ended(self.id, self.began, self.timeout))
 
     /** Whether the child has ended, **without waiting for it**: `Ok(None)` while it runs, and once it
      * has ended, what `wait` would have answered -- the same `Output`, its files read and removed.
@@ -512,7 +517,7 @@ struct Child
             Some(r) -> return r.map((o) -> Some(o))
             None -> ()
 
-        polled(self.pid)? match
+        polled(self.id)? match
             Some(s) -> self.finished(Ok(s)).map((o) -> Some(o))
             None -> Ok(None)
     end try_wait
@@ -543,7 +548,7 @@ struct Child
     kill(*self, signal: int = 15) -> Result[unit, IoError]
         if self.answer.is_some() then return Ok(())
 
-        val e = psys.kill(i64(self.pid), signal)
+        val e = psys.kill(i64(self.id), signal)
 
         if e != 0 then Err(failure(i64(e))) else Ok(())
     end kill
@@ -557,7 +562,7 @@ end Child
 impl Drop for Child
     drop(self)
         if self.answer.is_none()
-            stop(self.pid)
+            stop(self.id)
             self.release_files()
 
 /** Start a program and answer it as a `Child`, without waiting for it.
@@ -637,7 +642,7 @@ end pipe
  * no zombie and no stage running on.
  */
 struct Spawned
-    private[process] pid: i32
+    private[process] id: i32
     private began: i64
     private timeout: int
     private answer: Option[Result[Status, IoError]]
@@ -646,7 +651,13 @@ struct Spawned
     /** The process group the child was started in, as `Child.group` answers it: what a later stage of
      * a pipeline `Join`s, and what `set_foreground_group` hands the terminal to.
      */
-    group(self) -> int = group_of(self.pgid, self.pid)
+    group(self) -> int = group_of(self.pgid, self.id)
+
+    /** The process id of this stage: the number `kill` and a wait by pid name. `spawn` returns one
+     * `Spawned` per stage, so the last stage's is what a shell prints for `cmd &` and keeps in `$!`;
+     * `group` is the first stage's.
+     */
+    pid(self) -> int = int(self.id)
 
     /** Waits for the child to end and says how it ended, as `run` would have.
      *
@@ -660,7 +671,7 @@ struct Spawned
             Some(r) -> return r
             None -> ()
 
-        val r = ended(self.pid, self.began, self.timeout)
+        val r = ended(self.id, self.began, self.timeout)
 
         self.answer = Some(r)
         r
@@ -680,7 +691,7 @@ struct Spawned
             Some(r) -> return r.map((s) -> Some(s))
             None -> ()
 
-        val r = polled(self.pid)?
+        val r = polled(self.id)?
 
         if r.is_some() then self.answer = Some(Ok(r.unwrap()))
 
@@ -693,7 +704,7 @@ struct Spawned
     kill(*self, signal: int = 15) -> Result[unit, IoError]
         if self.answer.is_some() then return Ok(())
 
-        val e = psys.kill(i64(self.pid), signal)
+        val e = psys.kill(i64(self.id), signal)
 
         if e != 0 then Err(failure(i64(e))) else Ok(())
     end kill
@@ -701,7 +712,7 @@ end Spawned
 
 impl Drop for Spawned
     drop(self)
-        if self.answer.is_none() then stop(self.pid)
+        if self.answer.is_none() then stop(self.id)
 
 /** Start a program with its three streams where the caller says, and answer it without waiting for it
  * or collecting anything.
