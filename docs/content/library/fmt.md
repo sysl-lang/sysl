@@ -176,10 +176,56 @@ reach that far, at least two
 exponent digits, and never a trailing zero or point. Reading any of them back is
 [`sysl.text.parse_real`](/library/text/#reading-a-value-back-the-parsers), which is exact too.
 
+### Writing one without allocating
+
+`format_real` answers a string, which a program that may not allocate — an `@no_alloc` module, a C
+library's own `printf` — cannot take. **`write_real` writes the same text to any `Writer`**, working
+the digits out in a scratch the caller lends, so it allocates nothing. Its specifier is a whole printf
+conversion, `%a` and `%A` included, and an `l` or `L` before the letter is read and ignored, so a C
+format's own specifier can be handed over as it stands:
+
+```sysl
+import sysl.fmt.{write_real, float_scratch_len, Short}
+
+var scratch: [float_scratch_len]u8
+
+write_real(0.1, stdout(), "[%.17g] [%a] [%+010.2Le]", 0, -1, scratch[..]) match
+    Err(why) -> print(why)
+    Ok(_) -> print("")
+
+for spec in ["%.17g", "%a", "%+010.2Le", "%#.0e", "%9.3f"]
+    write_real(0.1, stdout(), spec, 0, -1, scratch[..]).unwrap()
+    print("")
+
+write_real(0.1, stdout(), "%.40f", 0, -1, scratch[0..<16]) match
+    Err(Short(needed)) -> print(f"short: $needed bytes would do")
+    _ -> print("")
+```
+
+```output
+not a float conversion
+0.10000000000000001
+0x1.999999999999ap-4
++01.00e-01
+1.e-01
+    0.100
+short: 41 bytes would do
+```
+
+**`float_scratch_len` bytes are always enough** — the longest exact `real` runs to 767 significant
+digits — and most requests need far fewer: `%.17g` needs seventeen, and `%a`, an infinity, a NaN and
+a zero need none. A scratch too short is refused with `Short` **before anything is written**, naming a
+length that would do; a specifier that is not one float conversion is `BadSpec`. `%a` writes a first
+digit of 1 for every value but zero, a subnormal included (`0x1p-1074`), and rounds a fraction half to
+even, as glibc and musl do. `write_f32` and `write_f128` are the same at the other widths, and an
+`f128`'s scratch is `f128_scratch_len`.
+
 | | |
 |---|---|
 | `format_real(x, spec, width, precision)` | a `real` under a printf specifier; `width` and `precision` are what a `*` reads |
 | `format_f32(x, spec, width, precision)` | the same for an `f32`, taken apart at its own width |
+| `write_real(x, out, spec, width, precision, scratch)` | the same text written to a `*Writer`, allocating nothing; `write_f32` and `write_f128` at the other widths |
+| `float_scratch_len`, `f128_scratch_len` | scratch lengths that are always enough |
 | `shortest(x)` | the fewest digits that read back as `x`, a `real` or an `f32` |
 | `format_real_plain(x)` | a `real` as `str` and a plain hole write it: Rust's `{}`; `format_f32_plain`, `format_f16_plain`, `format_bf16_plain` and `format_f128_plain` at the other widths |
 

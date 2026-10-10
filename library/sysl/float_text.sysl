@@ -443,8 +443,8 @@ private decimal_digits[const N: usize](r: *Big[N], s: *Big[N], m: u128, e: int, 
     (count, k)
 end decimal_digits
 
-/** What a float conversion was asked for: `%e`, `%f` or `%g` (or the upper-case `%E`, `%F`, `%G`),
- * a minimum field width, a precision (-1 where none was written) and C's five flags.
+/** What a float conversion was asked for: `%e`, `%f`, `%g` or `%a` (or the upper-case `%E`, `%F`,
+ * `%G`, `%A`), a minimum field width, a precision (-1 where none was written) and C's five flags.
  */
 private[sysl] struct FloatField
     conv: u8
@@ -460,8 +460,9 @@ private[sysl] struct FloatField
  * one digit, a point and an exponent of at least two digits, and `%g` whichever of the two the
  * precision and the exponent choose, with its trailing zeros dropped unless `#` keeps them. An
  * infinity is `inf` and a NaN `nan` (upper case under an upper-case conversion), a NaN carrying no
- * sign, and neither is padded with zeros. `into` is where the digits are worked out; it has to hold
- * every digit that is not a zero, which 800 always does and `precision + 1` does for `%e` and `%g`.
+ * sign, and neither is padded with zeros. `%a` is `write_hex_field`'s. `into` is where the digits are
+ * worked out; it has to hold `float_scratch_need(v, f)` bytes, which 800 always is for a `real` or an
+ * `f32` and 11,600 for an `f128`.
  */
 private[sysl] write_float_field(out: *Writer, v: FloatValue, f: FloatField, into: []u8)
     val conv = f.conv | 0x20
@@ -485,6 +486,10 @@ private[sysl] write_float_field(out: *Writer, v: FloatValue, f: FloatField, into
         if f.left then display_fill(out, 32, pad)
         return
     end if
+
+    if conv == u8('a')
+        write_hex_field(out, v, f, sign[0], upper)
+        return
 
     val prec = if f.prec < 0 then 6 else f.prec
     var count: usize = 0
@@ -564,6 +569,112 @@ private[sysl] write_float_field(out: *Writer, v: FloatValue, f: FloatField, into
 
     if f.left then display_fill(out, 32, pad)
 end write_float_field
+
+/** How many bytes of `into` `write_float_field` needs to render `v` under `f` -- an upper bound on the
+ * digits it works out: the precision's count for `%e` and `%g`, the places from the first digit down
+ * to the precision's for `%f`, and never more than the exact value has, so 800 is enough for any
+ * request of a `real` or an `f32` and 11,600 of an `f128`. A zero, an infinity, a NaN and every `%a`
+ * need none.
+ */
+private[sysl] float_scratch_need(v: FloatValue, f: FloatField) -> usize
+    val conv = f.conv | 0x20
+
+    if v.kind != Finite || conv == u8('a') then return 0
+
+    val bits = long(bits_of128(v.m))
+    val e = long(v.e)
+    val prec = if f.prec < 0 then long(6) else long(f.prec)
+
+    // 78914 / 2^18 is log10(2) from above and 183231 / 2^18 log10(5), so `top` is at least the power
+    // of ten of the first digit, and `held` at least the count of significant digits m * 2^e has.
+    val top = (((bits + e) * 78914) >> 18) + 1
+    val held = if e >= 0 then top + 1 else ((bits * 78914) >> 18) + ((-e * 183231) >> 18) + 3
+
+    var asked = prec + 1
+
+    if conv == u8('g') then asked = if prec == 0 then 1 else prec
+    if conv == u8('f') then asked = top + prec + 1
+
+    val need = if asked < held then asked else held
+
+    if need < 1 then 1 else usize(need)
+end float_scratch_need
+
+// `%a`: `v` as a hexadecimal significand and a binary exponent, C's `[-]0xh.hhhp±d`. The first digit is
+// 1 for every value but zero, a subnormal included, and the fraction is every hexadecimal digit the
+// value holds -- or, under a precision, that many digits rounded half to even, a carry out of the
+// fraction making the first digit 2. `0` pads after the `0x`, as C's does.
+private write_hex_field(out: *Writer, v: FloatValue, f: FloatField, sign: u8, upper: bool)
+    var lead: u128 = 0
+    var frac: u128 = 0
+    var held = 0
+    var exp = 0
+
+    if v.kind == Finite
+        val n = int(bits_of128(v.m)) - 1
+
+        held = (n + 3) / 4
+        lead = 1
+        frac = (v.m - (u128(1) << n)) << (4 * held - n)
+        exp = v.e + n
+    end if
+
+    var shown = if f.prec < 0 then held else f.prec
+
+    if f.prec < 0
+        while shown > 0 && ((frac >> (4 * (held - shown))) & 0xF) == 0
+            shown -= 1
+    elif shown < held
+        val drop = 4 * (held - shown)
+        val rest = frac & ((u128(1) << drop) - 1)
+        val half = u128(1) << (drop - 1)
+
+        frac = frac >> drop
+        held = shown
+
+        val odd = ((if shown == 0 then lead else frac) & 1) == 1
+
+        if rest > half || (rest == half && odd)
+            frac += 1
+
+            if frac == u128(1) << (4 * shown)
+                frac = 0
+                lead += 1
+        end if
+    end if
+
+    val point = shown > 0 || f.alt
+    val hex = if upper then "0123456789ABCDEF" else "0123456789abcdef"
+    var exp_text: [24]u8
+    var exp_at = digits_ulong(ulong(if exp < 0 then -exp else exp), exp_text[..])
+
+    exp_at -= 1
+    exp_text[exp_at] = if exp < 0 then u8('-') else u8('+')
+    exp_at -= 1
+    exp_text[exp_at] = if upper then u8('P') else u8('p')
+
+    var head: [3]u8 = [u8('0'), if upper then u8('X') else u8('x'), hex.bytes[usize(lead)]]
+    var digits: [32]u8
+    val written = if shown < held then shown else held
+
+    for i in 0..<written
+        digits[i] = hex.bytes[usize((frac >> (4 * (held - 1 - i))) & 0xF)]
+
+    var sign_text: [1]u8 = [sign]
+    val signs = if sign != 0 then 1 else 0
+    val pad = f.width - signs - 3 - (if point then 1 else 0) - shown - int(24 - exp_at)
+
+    if !f.left && !f.zero then display_fill(out, 32, pad)
+    if signs != 0 then out.write(sign_text[..])
+    out.write(head[0..<2])
+    if !f.left && f.zero then display_fill(out, 48, pad)
+    out.write(head[2..])
+    if point then out.write(".".bytes)
+    out.write(digits[0..<usize(written)])
+    display_fill(out, 48, shown - written)
+    out.write(exp_text[exp_at..])
+    if f.left then display_fill(out, 32, pad)
+end write_hex_field
 
 // The digits standing for 10^hi down to 10^lo, where the first of `count` digits stands for 10^k
 // and every other position holds a zero.

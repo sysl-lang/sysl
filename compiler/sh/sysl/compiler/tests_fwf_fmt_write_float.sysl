@@ -1,0 +1,51 @@
+module sh.sysl.compiler
+@tests
+
+// `sysl.fmt.write_real` is the float rendering a program that may not allocate can call: a module
+// declaring `@no_alloc` reaches it, writes through `stdout()` with scratch on its own stack, and is
+// refused for `format_real`, which answers a string. The helpers are `tests_enm_enum_run.sysl`'s.
+
+@test("an @no_alloc program writes a float exactly with write_real")
+fwf_no_alloc_program_writes_a_float()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        @no_alloc
+
+        import sysl.fmt.{write_real, write_f32, BadSpec, Short}
+
+        var scratch: [32]u8
+
+        write_real(0.1, stdout(), "%.17g", 0, -1, scratch[..]).unwrap()
+        print("")
+        write_real(-2.5, stdout(), "%+012.3a", 0, -1, scratch[..]).unwrap()
+        print("")
+        write_f32(f32(0.1), stdout(), "%-14e", 0, -1, scratch[..]).unwrap()
+        print("|")
+
+        write_real(0.1, stdout(), "%.40f", 0, -1, scratch[..]) match
+            Err(Short(n)) -> print(n)
+            Err(BadSpec) -> print("bad")
+            Ok(_) -> print("wrote")
+
+        write_real(0.1, stdout(), "%d", 0, -1, scratch[..]) match
+            Err(BadSpec) -> print("bad")
+            _ -> print("other")
+        """), "0.10000000000000001\n-0x01.400p+1\n1.000000e-01  |\n41\nbad\n")
+end fwf_no_alloc_program_writes_a_float
+
+@test("and the same program is refused format_real, which makes a string")
+fwf_no_alloc_refuses_format_real()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        @no_alloc
+
+        import sysl.fmt.format_real
+
+        shown() -> string = format_real(0.1, "%.17g", 0, -1)
+        """)
+
+    assert(enm_says(said, "this reaches 'sysl.fmt.format_real', which makes heap storage") &&
+           enm_says(said, "and this module declared '@no_alloc'"), said)
+end fwf_no_alloc_refuses_format_real
